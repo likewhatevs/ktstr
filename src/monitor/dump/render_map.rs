@@ -2187,6 +2187,14 @@ pub(super) fn render_map(ctx: &RenderMapCtx<'_>, info: &BpfMapInfo) -> FailureDu
         | BPF_MAP_TYPE_XSKMAP
         | BPF_MAP_TYPE_REUSEPORT_SOCKARRAY => {
             out.fd_array = Some(render_fd_array_slots(accessor, info));
+            if fd_map_is_hash_shaped(info.map_type) {
+                out.error = Some(
+                    "fd-array dump does not walk hash-shaped FD maps \
+                     (SOCKHASH/DEVMAP_HASH/HASH_OF_MAPS); populated \
+                     count is unavailable for these"
+                        .into(),
+                );
+            }
         }
         // Every other map type (transient containers,
         // sub-structures the dump path doesn't yet decode) maps to
@@ -2522,23 +2530,33 @@ pub(super) fn render_stack_traces(
 /// Walk an FD-array's `bpf_array.ptrs[]` flex array and report
 /// populated indices.
 ///
+/// True for FD-map types whose slots live in a hash table (SOCKHASH,
+/// DEVMAP_HASH, HASH_OF_MAPS) rather than the contiguous
+/// `bpf_array.ptrs` flex array. [`render_fd_array_slots`] cannot walk
+/// these; [`render_map`] surfaces the gap in `out.error`.
+pub(super) fn fd_map_is_hash_shaped(map_type: u32) -> bool {
+    matches!(
+        map_type,
+        BPF_MAP_TYPE_SOCKHASH | BPF_MAP_TYPE_DEVMAP_HASH | BPF_MAP_TYPE_HASH_OF_MAPS
+    )
+}
+
 /// FD-array families (PROG_ARRAY, PERF_EVENT_ARRAY, CGROUP_ARRAY,
-/// ARRAY_OF_MAPS, HASH_OF_MAPS, DEVMAP*, SOCKMAP*, CPUMAP, XSKMAP,
+/// ARRAY_OF_MAPS, DEVMAP, SOCKMAP, CPUMAP, XSKMAP,
 /// REUSEPORT_SOCKARRAY) all share the `bpf_array.ptrs` layout: each
 /// slot is `sizeof(void *)` (8 bytes on 64-bit). Non-zero = populated.
 /// The dump reports populated count + indices (truncated to
 /// [`MAX_FD_ARRAY_INDICES`]).
 ///
 /// HASH_OF_MAPS and SOCKHASH/DEVMAP_HASH are hash-shaped, not array-
-/// shaped — but the underlying slot storage uses the same `void *`
-/// pointer layout. The accurate walk for those is `iter_hash_map`
-/// followed by per-element fd resolution; today the dump path treats
-/// them like the array variants and walks `bpf_array.ptrs` which only
-/// works for the strictly-array families. The hash variants land here
-/// as a no-op (max_entries reads but slots empty); operators see
-/// `populated: 0` which truthfully reports "this dump path doesn't
-/// walk hash-shaped FD maps." The error string makes the limitation
-/// explicit.
+/// shaped: their slots do not live in the contiguous `bpf_array.ptrs`
+/// flex array this walker reads, so scanning it would report a false
+/// `populated: 0` indistinguishable from a genuinely empty array map.
+/// [`fd_map_is_hash_shaped`] detects them, the walker returns
+/// immediately with `scanned: 0`, and [`render_map`] sets `out.error`
+/// so operators see the dump path does not walk these. Accurate
+/// support would walk the hash table (`iter_hash_map`) and resolve
+/// each element's fd pointer.
 pub(super) fn render_fd_array_slots(
     accessor: &GuestMemMapAccessor<'_>,
     info: &BpfMapInfo,
@@ -2555,17 +2573,10 @@ pub(super) fn render_fd_array_slots(
     let mut indices: Vec<u32> = Vec::new();
 
     // For hash-shaped FD maps, bpf_array layout doesn't apply — the
-    // ptrs flex array isn't the right slot home. iter_hash_map is the
-    // accurate walker but doesn't currently surface the per-element
-    // fd pointer side. Treating these as "fd_array with populated=0"
-    // is misleading; bail without scanning so the consumer doesn't
-    // get a false negative. Distinct hash-shaped types: SOCKHASH,
-    // DEVMAP_HASH, HASH_OF_MAPS.
-    let hash_shaped = matches!(
-        info.map_type,
-        BPF_MAP_TYPE_SOCKHASH | BPF_MAP_TYPE_DEVMAP_HASH | BPF_MAP_TYPE_HASH_OF_MAPS
-    );
-    if hash_shaped {
+    // ptrs flex array isn't the right slot home. Bail without scanning
+    // (scanned: 0) rather than report a false populated: 0; render_map
+    // sets out.error so the gap is explicit. See fd_map_is_hash_shaped.
+    if fd_map_is_hash_shaped(info.map_type) {
         return FailureDumpFdArray {
             populated: 0,
             scanned: 0,

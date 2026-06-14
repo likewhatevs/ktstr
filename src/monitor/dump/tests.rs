@@ -2172,6 +2172,28 @@ fn pinned_error_local_storage_truncation() {
     );
 }
 
+/// `fd-array dump does not walk hash-shaped FD maps (...)` is set by
+/// the FD-array arm via [`super::render_map::fd_map_is_hash_shaped`]
+/// when the map is SOCKHASH / DEVMAP_HASH / HASH_OF_MAPS — those store
+/// slots in a hash table, not the `bpf_array.ptrs` flex array the
+/// walker reads. Pins the wire-stable diagnostic so a log scraper sees
+/// a stable shape; `render_map_hash_shaped_fd_map_sets_error` verifies
+/// the producer actually emits it.
+#[test]
+fn pinned_error_fd_array_hash_shaped() {
+    // Reproduce the production literal (same line continuation) so a
+    // rephrasing in dump/render_map.rs trips.
+    let rendered: String = "fd-array dump does not walk hash-shaped FD maps \
+         (SOCKHASH/DEVMAP_HASH/HASH_OF_MAPS); populated \
+         count is unavailable for these"
+        .into();
+    assert_eq!(
+        rendered,
+        "fd-array dump does not walk hash-shaped FD maps (SOCKHASH/DEVMAP_HASH/HASH_OF_MAPS); populated count is unavailable for these",
+        "fd-array hash-shaped error string drifted from pin",
+    );
+}
+
 // -- Per-node NUMA stats wire shape -------------------------------
 //
 // The live walker is a follow-up; this section pins the wire
@@ -5615,6 +5637,100 @@ fn render_fd_array_populated_indices() {
         !fa.indices_truncated,
         "populated == indices.len() must NOT set indices_truncated",
     );
+}
+
+/// `fd_map_is_hash_shaped` flags exactly the three hash-table-shaped
+/// FD-map types and nothing else.
+#[test]
+fn fd_map_is_hash_shaped_flags_only_hash_families() {
+    use super::super::bpf_map::{
+        BPF_MAP_TYPE_ARRAY_OF_MAPS, BPF_MAP_TYPE_DEVMAP, BPF_MAP_TYPE_DEVMAP_HASH,
+        BPF_MAP_TYPE_HASH_OF_MAPS, BPF_MAP_TYPE_PROG_ARRAY, BPF_MAP_TYPE_SOCKHASH,
+        BPF_MAP_TYPE_SOCKMAP,
+    };
+    use super::render_map::fd_map_is_hash_shaped;
+    assert!(fd_map_is_hash_shaped(BPF_MAP_TYPE_SOCKHASH));
+    assert!(fd_map_is_hash_shaped(BPF_MAP_TYPE_DEVMAP_HASH));
+    assert!(fd_map_is_hash_shaped(BPF_MAP_TYPE_HASH_OF_MAPS));
+    // Array-shaped FD families are not hash-shaped.
+    assert!(!fd_map_is_hash_shaped(BPF_MAP_TYPE_PROG_ARRAY));
+    assert!(!fd_map_is_hash_shaped(BPF_MAP_TYPE_SOCKMAP));
+    assert!(!fd_map_is_hash_shaped(BPF_MAP_TYPE_DEVMAP));
+    assert!(!fd_map_is_hash_shaped(BPF_MAP_TYPE_ARRAY_OF_MAPS));
+}
+
+/// `render_map` surfaces the unwalkable-gap `error` for a hash-shaped
+/// FD map (SOCKHASH) so an operator can tell "this dump path can't walk
+/// hash-shaped FD maps" apart from "genuinely empty array map" — both
+/// otherwise render `fd_array.populated == 0`. The direct-walker bail
+/// (`scanned == 0`) is covered by `render_fd_array_hash_shaped_returns_empty`.
+#[test]
+fn render_map_hash_shaped_fd_map_sets_error() {
+    let page_offset = crate::monitor::symbols::DEFAULT_PAGE_OFFSET;
+    let buf = vec![0u8; 0x4000];
+    // SAFETY: buf is a live local Vec<u8> outliving the GuestMem use.
+    let mem =
+        unsafe { super::super::reader::GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
+    let kernel = super::super::guest::GuestKernel::new_for_test(
+        std::sync::Arc::new(mem),
+        std::collections::HashMap::new(),
+        page_offset,
+        0,
+        false,
+    );
+    let kernel_ref = unsafe { &*(&kernel as *const _) };
+    let offsets = crate::monitor::btf_offsets::BpfMapOffsets::EMPTY;
+    let accessor =
+        super::super::bpf_map::GuestMemMapAccessor::new_for_test(kernel_ref, &offsets, 0);
+    let (name_bytes, name_len) = name_from_str("test_sockhash");
+    let info = super::super::bpf_map::BpfMapInfo {
+        map_pa: 0,
+        map_kva: pa_to_kva(0x1000, page_offset),
+        name_bytes,
+        name_len,
+        map_type: super::super::bpf_map::BPF_MAP_TYPE_SOCKHASH,
+        map_flags: 0,
+        key_size: 4,
+        value_size: 4,
+        // Large max_entries: a scanning walker would report on these;
+        // the bail must ignore the count entirely.
+        max_entries: 1024,
+        value_kva: None,
+        btf_kva: 0,
+        btf_value_type_id: 0,
+        btf_vmlinux_value_type_id: 0,
+        btf_key_type_id: 0,
+    };
+    let arena_page_index = super::render_map::ArenaPageIndex::new();
+    let sdt_alloc_metas: Vec<super::render_map::SdtAllocMeta> = Vec::new();
+    let ctx = super::render_map::RenderMapCtx {
+        accessor: &accessor,
+        btf: None,
+        num_cpus: 1,
+        arena_offsets: None,
+        shared_arena: None,
+        arena_page_index: &arena_page_index,
+        sdt_alloc_metas: &sdt_alloc_metas,
+        cast_map: None,
+        arena_slot_index: None,
+        cross_btf_fwd_index: None,
+        scx_static_index: None,
+        alloc_size_types: &[],
+        rendered_slot_addrs: None,
+    };
+    let rendered = super::render_map::render_map(&ctx, &info);
+    let err = rendered
+        .error
+        .expect("hash-shaped FD map must surface the unwalkable-gap error");
+    assert!(
+        err.contains("hash-shaped FD maps"),
+        "error must name the limitation; got: {err}",
+    );
+    let fd = rendered
+        .fd_array
+        .expect("fd_array slot is still populated (with scanned: 0)");
+    assert_eq!(fd.scanned, 0);
+    assert_eq!(fd.populated, 0);
 }
 
 /// HASH-shaped FD families (SOCKHASH / DEVMAP_HASH / HASH_OF_MAPS)
