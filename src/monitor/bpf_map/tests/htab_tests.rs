@@ -402,6 +402,119 @@ fn iter_htab_entries_multi_bucket() {
     assert_eq!(entries[0].1, val_bytes);
 }
 
+// -- walk_htab defensive caps (iter_htab_entries) --
+//
+// These bound the host renderer against a torn read or an
+// offset-resolution bug producing a garbage n_buckets / NULL
+// buckets pointer / oversized key|value — not against a hostile
+// guest. Mirror of the local_storage cap coverage
+// (local_storage_tests.rs bucket-cap + value-size-cap tests).
+
+/// n_buckets exactly at the safety cap still walks: the guard is
+/// `n_buckets > HTAB_BUCKETS_MAX` (strict), so HTAB_BUCKETS_MAX
+/// itself must iterate and surface the single bucket-0 entry.
+/// Pins the off-by-one: a regression to `>=` would drop this entry.
+#[test]
+fn iter_htab_entries_n_buckets_at_cap_walks() {
+    let key = 7u32.to_ne_bytes();
+    let val = 0xABCD_u64.to_ne_bytes();
+    let (mut buf, page_offset, map, offsets) = setup_htab_direct(4, 8, &[(&key, &val)], 4);
+    // Override n_buckets to exactly HTAB_BUCKETS_MAX (htab_pa==0).
+    let htab = test_htab_offsets();
+    buf[htab.htab_n_buckets..htab.htab_n_buckets + 4]
+        .copy_from_slice(&super::super::htab::HTAB_BUCKETS_MAX.to_ne_bytes());
+    // SAFETY: buf is a live local buffer whose storage outlives mem.
+    let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
+    let entries = iter_htab_entries(&lookup_ctx(&mem, 0, page_offset, &offsets, false), &map);
+    assert_eq!(
+        entries.len(),
+        1,
+        "n_buckets == HTAB_BUCKETS_MAX must still walk (strict `>` guard)"
+    );
+    assert_eq!(entries[0].0, key);
+    assert_eq!(entries[0].1, val);
+}
+
+/// n_buckets one past the cap bails before walking. A corrupted
+/// (uninitialized) n_buckets read could reach u32::MAX; the cap
+/// stops it. With the cap removed, the bucket-0 entry would be
+/// returned (len 1) — so the empty assertion truly pins the cap.
+#[test]
+fn iter_htab_entries_n_buckets_over_cap_returns_empty() {
+    let key = 7u32.to_ne_bytes();
+    let val = 0xABCD_u64.to_ne_bytes();
+    let (mut buf, page_offset, map, offsets) = setup_htab_direct(4, 8, &[(&key, &val)], 4);
+    let htab = test_htab_offsets();
+    buf[htab.htab_n_buckets..htab.htab_n_buckets + 4]
+        .copy_from_slice(&(super::super::htab::HTAB_BUCKETS_MAX + 1).to_ne_bytes());
+    // SAFETY: buf is a live local buffer whose storage outlives mem.
+    let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
+    let entries = iter_htab_entries(&lookup_ctx(&mem, 0, page_offset, &offsets, false), &map);
+    assert!(
+        entries.is_empty(),
+        "n_buckets > HTAB_BUCKETS_MAX must short-circuit before walking"
+    );
+}
+
+/// A NULL buckets pointer (uninitialized/torn read of
+/// bpf_htab.buckets) bails. Without the `buckets_kva == 0` guard,
+/// bucket 0's KVA would translate to PAGE_OFFSET+0 (the htab struct
+/// itself) and the walker would read garbage as a chain head.
+#[test]
+fn iter_htab_entries_null_buckets_returns_empty() {
+    let key = 7u32.to_ne_bytes();
+    let val = 0xABCD_u64.to_ne_bytes();
+    let (mut buf, page_offset, map, offsets) = setup_htab_direct(4, 8, &[(&key, &val)], 4);
+    // Override bpf_htab.buckets to NULL (htab_pa==0).
+    let htab = test_htab_offsets();
+    buf[htab.htab_buckets..htab.htab_buckets + 8].copy_from_slice(&0u64.to_ne_bytes());
+    // SAFETY: buf is a live local buffer whose storage outlives mem.
+    let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
+    let entries = iter_htab_entries(&lookup_ctx(&mem, 0, page_offset, &offsets, false), &map);
+    assert!(
+        entries.is_empty(),
+        "NULL bpf_htab.buckets must short-circuit"
+    );
+}
+
+/// value_size declared past MAX_VALUE_SIZE short-circuits before the
+/// bucket walk, so the per-element `Vec::with_capacity(value_size)`
+/// never attempts a >16 MiB allocation. The cap reads
+/// `map.value_size` (the BpfMapInfo field), so override the struct.
+#[test]
+fn iter_htab_entries_value_size_cap_returns_empty() {
+    let key = 7u32.to_ne_bytes();
+    let val = 0xABCD_u64.to_ne_bytes();
+    let (buf, page_offset, mut map, offsets) = setup_htab_direct(4, 8, &[(&key, &val)], 4);
+    map.value_size = (super::super::MAX_VALUE_SIZE + 1) as u32;
+    // SAFETY: buf is a live local buffer whose storage outlives mem.
+    let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
+    let entries = iter_htab_entries(&lookup_ctx(&mem, 0, page_offset, &offsets, false), &map);
+    assert!(
+        entries.is_empty(),
+        "value_size > MAX_VALUE_SIZE must short-circuit before walking/allocating"
+    );
+}
+
+/// key_size declared past MAX_VALUE_SIZE short-circuits identically,
+/// bounding the per-element key `Vec::with_capacity(key_size)`. The
+/// cap (`key_size > MAX_VALUE_SIZE`) is the key-side twin of the
+/// value-size guard and is checked on the same line.
+#[test]
+fn iter_htab_entries_key_size_cap_returns_empty() {
+    let key = 7u32.to_ne_bytes();
+    let val = 0xABCD_u64.to_ne_bytes();
+    let (buf, page_offset, mut map, offsets) = setup_htab_direct(4, 8, &[(&key, &val)], 4);
+    map.key_size = (super::super::MAX_VALUE_SIZE + 1) as u32;
+    // SAFETY: buf is a live local buffer whose storage outlives mem.
+    let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
+    let entries = iter_htab_entries(&lookup_ctx(&mem, 0, page_offset, &offsets, false), &map);
+    assert!(
+        entries.is_empty(),
+        "key_size > MAX_VALUE_SIZE must short-circuit before walking/allocating"
+    );
+}
+
 // -- read_percpu_array_value tests --
 
 /// Build a buffer simulating a percpu array map with `num_cpus` CPUs
@@ -1648,4 +1761,130 @@ fn iter_percpu_htab_entries_spans_nonadjacent_frames() {
     assert_eq!(entries[0].0, key);
     assert_eq!(entries[0].1.len(), 1);
     assert_eq!(entries[0].1[0].as_deref(), Some(expected.as_slice()));
+}
+
+// -- walk_htab defensive caps (iter_percpu_htab_entries) --
+//
+// iter_percpu_htab_entries shares walk_htab with iter_htab_entries,
+// so the same caps apply; mirror each across the percpu entry point.
+// setup_percpu_htab_direct hardcodes n_buckets = 4 in the buffer at
+// the htab_n_buckets offset (htab_pa == 0), so overrides target the
+// same buffer/struct fields as the plain-hash group.
+
+/// n_buckets one past the cap bails before walking (percpu path).
+#[test]
+fn iter_percpu_htab_entries_n_buckets_over_cap_returns_empty() {
+    let key = 0xAAu32.to_ne_bytes();
+    let cpu0 = 0x1234u64.to_ne_bytes();
+    let (mut buf, page_offset, map, offsets, per_cpu_offsets) =
+        setup_percpu_htab_direct(4, 8, 1, &[(key.to_vec(), vec![cpu0.to_vec()])]);
+    let htab = test_htab_offsets();
+    buf[htab.htab_n_buckets..htab.htab_n_buckets + 4]
+        .copy_from_slice(&(super::super::htab::HTAB_BUCKETS_MAX + 1).to_ne_bytes());
+    // SAFETY: buf is a live local buffer whose storage outlives mem.
+    let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
+    let entries = iter_percpu_htab_entries(
+        &lookup_ctx(&mem, 0, page_offset, &offsets, false),
+        &map,
+        &per_cpu_offsets,
+    );
+    assert!(
+        entries.is_empty(),
+        "n_buckets > HTAB_BUCKETS_MAX must short-circuit (percpu path)"
+    );
+}
+
+/// n_buckets exactly at the cap still walks (percpu path): pins the
+/// strict-`>` boundary, surfacing the single bucket-0 entry.
+#[test]
+fn iter_percpu_htab_entries_n_buckets_at_cap_walks() {
+    let key = 0xAAu32.to_ne_bytes();
+    let cpu0 = 0x1234u64.to_ne_bytes();
+    let (mut buf, page_offset, map, offsets, per_cpu_offsets) =
+        setup_percpu_htab_direct(4, 8, 1, &[(key.to_vec(), vec![cpu0.to_vec()])]);
+    let htab = test_htab_offsets();
+    buf[htab.htab_n_buckets..htab.htab_n_buckets + 4]
+        .copy_from_slice(&super::super::htab::HTAB_BUCKETS_MAX.to_ne_bytes());
+    // SAFETY: buf is a live local buffer whose storage outlives mem.
+    let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
+    let entries = iter_percpu_htab_entries(
+        &lookup_ctx(&mem, 0, page_offset, &offsets, false),
+        &map,
+        &per_cpu_offsets,
+    );
+    assert_eq!(
+        entries.len(),
+        1,
+        "n_buckets == HTAB_BUCKETS_MAX must still walk (percpu, strict `>` guard)"
+    );
+    assert_eq!(entries[0].0, key);
+    assert_eq!(entries[0].1[0].as_ref().unwrap(), &cpu0);
+}
+
+/// NULL buckets pointer bails (percpu path).
+#[test]
+fn iter_percpu_htab_entries_null_buckets_returns_empty() {
+    let key = 0xAAu32.to_ne_bytes();
+    let cpu0 = 0x1234u64.to_ne_bytes();
+    let (mut buf, page_offset, map, offsets, per_cpu_offsets) =
+        setup_percpu_htab_direct(4, 8, 1, &[(key.to_vec(), vec![cpu0.to_vec()])]);
+    let htab = test_htab_offsets();
+    buf[htab.htab_buckets..htab.htab_buckets + 8].copy_from_slice(&0u64.to_ne_bytes());
+    // SAFETY: buf is a live local buffer whose storage outlives mem.
+    let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
+    let entries = iter_percpu_htab_entries(
+        &lookup_ctx(&mem, 0, page_offset, &offsets, false),
+        &map,
+        &per_cpu_offsets,
+    );
+    assert!(
+        entries.is_empty(),
+        "NULL bpf_htab.buckets must short-circuit (percpu path)"
+    );
+}
+
+/// value_size past MAX_VALUE_SIZE short-circuits (percpu path). The
+/// percpu extractor reads value_size from `map.value_size`, and the
+/// cap is checked in walk_htab against `map.value_size` before the
+/// walk.
+#[test]
+fn iter_percpu_htab_entries_value_size_cap_returns_empty() {
+    let key = 0xAAu32.to_ne_bytes();
+    let cpu0 = 0x1234u64.to_ne_bytes();
+    let (buf, page_offset, mut map, offsets, per_cpu_offsets) =
+        setup_percpu_htab_direct(4, 8, 1, &[(key.to_vec(), vec![cpu0.to_vec()])]);
+    map.value_size = (super::super::MAX_VALUE_SIZE + 1) as u32;
+    // SAFETY: buf is a live local buffer whose storage outlives mem.
+    let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
+    let entries = iter_percpu_htab_entries(
+        &lookup_ctx(&mem, 0, page_offset, &offsets, false),
+        &map,
+        &per_cpu_offsets,
+    );
+    assert!(
+        entries.is_empty(),
+        "value_size > MAX_VALUE_SIZE must short-circuit (percpu path)"
+    );
+}
+
+/// key_size past MAX_VALUE_SIZE short-circuits (percpu path),
+/// bounding the per-element key allocation.
+#[test]
+fn iter_percpu_htab_entries_key_size_cap_returns_empty() {
+    let key = 0xAAu32.to_ne_bytes();
+    let cpu0 = 0x1234u64.to_ne_bytes();
+    let (buf, page_offset, mut map, offsets, per_cpu_offsets) =
+        setup_percpu_htab_direct(4, 8, 1, &[(key.to_vec(), vec![cpu0.to_vec()])]);
+    map.key_size = (super::super::MAX_VALUE_SIZE + 1) as u32;
+    // SAFETY: buf is a live local buffer whose storage outlives mem.
+    let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
+    let entries = iter_percpu_htab_entries(
+        &lookup_ctx(&mem, 0, page_offset, &offsets, false),
+        &map,
+        &per_cpu_offsets,
+    );
+    assert!(
+        entries.is_empty(),
+        "key_size > MAX_VALUE_SIZE must short-circuit (percpu path)"
+    );
 }
