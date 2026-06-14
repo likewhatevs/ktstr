@@ -1318,7 +1318,16 @@ impl VirtioConsole {
                 {
                     events.push(c);
                 }
-                match q.add_used(mem, head, total) {
+                // c_ovq buffers are device-readable (guest->host control
+                // messages); per virtio v1.2 §2.7.8.2 the used-element
+                // `len` counts bytes written to the device-WRITABLE
+                // portion, which is 0 for a readable-only chain. The
+                // guest's __send_control_msg discards this len, so 0 is
+                // both spec-correct and guest-harmless; it also makes
+                // every readable-consume add_used in this file uniformly
+                // 0 (data TX, reset-drain, c_ivq). `total` (bytes
+                // consumed) is retained for the diagnostic trace below.
+                match q.add_used(mem, head, 0) {
                     Ok(()) => any_published = true,
                     Err(e) => {
                         tracing::warn!(
@@ -2799,6 +2808,60 @@ mod tests {
         assert!(
             irq_count > 0,
             "irq_evt counter must be non-zero after signal_used",
+        );
+    }
+
+    /// c_ovq (control-TX, guest->host) chain: the published used-element
+    /// `len` must be 0, not the bytes-consumed count. virtio v1.2
+    /// §2.7.8.2: used `len` counts bytes written to the device-WRITABLE
+    /// portion; a c_ovq buffer is device-readable, so the spec-pure len
+    /// is 0. Before the fix `process_control_tx` published `total` (bytes
+    /// read), so seeding a readable chain with VC_CONTROL_SIZE bytes
+    /// makes this assertion fail on the old behaviour — pinning the
+    /// regression. Chain-level: drives the real `process_control_tx` via
+    /// QUEUE_NOTIFY on C_OVQ (wire_console_queue_to_mock ends at S_OK, so
+    /// the DRIVER_OK gate is satisfied).
+    #[test]
+    fn control_tx_publishes_zero_used_len() {
+        let mut dev = VirtioConsole::new();
+        let mem = make_chain_test_mem();
+        let mock = MockSplitQueue::create(&mem, GuestAddress(0), 16);
+        let data_addr = GuestAddress(0x10000);
+        // A full VirtioConsoleControl (id, event, value = 8 bytes) so the
+        // chain carries VC_CONTROL_SIZE device-readable bytes → pre-fix
+        // `total` would be 8.
+        let ctrl: [u8; VC_CONTROL_SIZE] = [2, 0, 0, 0, 6, 0, 1, 0];
+        mem.write_slice(&ctrl, data_addr)
+            .expect("plant control msg");
+        let descs = [RawDescriptor::from(SplitDescriptor::new(
+            data_addr.0,
+            VC_CONTROL_SIZE as u32,
+            0,
+            0,
+        ))];
+        mock.build_desc_chain(&descs).expect("build chain");
+        dev.set_mem(mem.clone());
+        wire_console_queue_to_mock(&mut dev, &mock, C_OVQ as u32);
+
+        write_reg(&mut dev, VIRTIO_MMIO_QUEUE_NOTIFY, C_OVQ as u32);
+
+        // Exactly one completion.
+        let used_idx: u16 = mem
+            .read_obj(mock.used_addr().checked_add(2).unwrap())
+            .expect("read used.idx");
+        assert_eq!(used_idx, 1, "c_ovq chain must be add_used'd exactly once");
+        // The used-element `len` MUST be 0 (device-readable control-TX
+        // buffer). used-ring layout: used_addr + 4 (flags+idx) + 4 (id) =
+        // +8 for the first entry's `len`. Pre-fix this published `total`
+        // (VC_CONTROL_SIZE = 8).
+        let used_elem_len: u32 = mem
+            .read_obj(mock.used_addr().checked_add(8).unwrap())
+            .expect("read used elem 0 len");
+        assert_eq!(
+            used_elem_len, 0,
+            "c_ovq add_used len must be 0 (device-readable control-TX \
+             buffer, virtio v1.2 §2.7.8.2); pre-fix it published the \
+             bytes-consumed total",
         );
     }
 
