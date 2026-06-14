@@ -50,7 +50,7 @@ const INITRD_ADDR: u64 = 0x800_0000; // 128 MiB
 /// the overlay path reaches `mmap` with a valid alignment regardless
 /// of host page size.
 #[cfg(target_arch = "aarch64")]
-fn aarch64_initrd_addr(memory_mib: u32, total_cpus: u32, initrd_max_size: u64) -> u64 {
+fn aarch64_initrd_addr(memory_mib: u32, total_cpus: u32, initrd_max_size: u64) -> Result<u64> {
     // Ceiling is the PVTIME carve base, NOT the FDT address. setup_pvtime
     // registers the per-vCPU steal-time IPAs in [pvtime_base, fdt_addr) and
     // write_memory shrinks the advertised /memory to END at pvtime_base. An
@@ -66,13 +66,35 @@ fn aarch64_initrd_addr(memory_mib: u32, total_cpus: u32, initrd_max_size: u64) -
     let ceiling = aarch64::fdt::pvtime_base(memory_mib, total_cpus);
     let page_size = host_page_size();
     let mask = !(page_size - 1);
-    // Place initrd just below the PVTIME carve, host-page-aligned.
-    let load_addr = (ceiling - initrd_max_size) & mask;
-    assert!(
+    // Place initrd just below the PVTIME carve, host-page-aligned. Use
+    // checked_sub: a compressed initramfs larger than the advertised RAM
+    // span [DRAM_START, pvtime_base) would otherwise wrap the u64 (debug:
+    // panic; release with overflow-checks off: a near-u64::MAX value that
+    // would PASS the >= DRAM_START check and advertise a bogus
+    // linux,initrd-start). The min-memory budget sizes RAM for the
+    // tmpfs/init constraint, not for 'initrd fits below pvtime_base', so
+    // this bound is payload-reachable. The initrd must reside entirely
+    // within advertised RAM: an initrd above pvtime_base is outside the
+    // advertised /memory and the guest kernel never memblock-reserves it
+    // (see this function's header comment).
+    let load_addr = ceiling
+        .checked_sub(initrd_max_size)
+        .map(|top| top & mask)
+        .with_context(|| {
+            format!(
+                "compressed initrd ({initrd_max_size} bytes) exceeds the \
+                 RAM span below the PVTIME carve (pvtime_base={ceiling:#x}): \
+                 reduce initramfs size or increase VM memory"
+            )
+        })?;
+    anyhow::ensure!(
         load_addr >= kvm::DRAM_START,
-        "initrd load address underflows DRAM_START"
+        "initrd load address {load_addr:#x} underflows DRAM_START {:#x} \
+         (compressed initrd {initrd_max_size} bytes, pvtime_base {ceiling:#x}): \
+         reduce initramfs size or increase VM memory",
+        kvm::DRAM_START,
     );
-    load_addr
+    Ok(load_addr)
 }
 
 /// Host page size in bytes. Reads from `sysconf(_SC_PAGESIZE)` once
@@ -1490,7 +1512,7 @@ impl KtstrVm {
             memory_mib,
             self.topology.total_cpus(),
             compressed_size as u64,
-        );
+        )?;
         let size = self.compress_and_load_initrd(vm, base_bytes, &suffix, &key, load_addr)?;
         Ok((Some(load_addr), Some(size)))
     }
@@ -1562,7 +1584,7 @@ impl KtstrVm {
             memory_mib,
             self.topology.total_cpus(),
             compressed_size as u64,
-        );
+        )?;
 
         let size = self.compress_and_load_initrd(vm, base_bytes, &suffix, &key, load_addr)?;
         Ok((Some(load_addr), Some(size)))
@@ -1727,7 +1749,7 @@ mod tests {
             let pvt = pvtime_base(mem, cpus);
             // A near-max initrd that still fits below the carve.
             let max = pvt - DRAM_START - (1 << 20);
-            let load = aarch64_initrd_addr(mem, cpus, max);
+            let load = aarch64_initrd_addr(mem, cpus, max).expect("near-max initrd must fit");
             assert!(
                 load >= DRAM_START,
                 "initrd underflows DRAM_START (mem={mem} cpus={cpus} load={load:#x})"
@@ -1738,6 +1760,50 @@ mod tests {
                 load + max
             );
         }
+    }
+
+    /// An initramfs whose compressed size exceeds the advertised RAM span
+    /// `[DRAM_START, pvtime_base)` must produce a clean `Err`, never a
+    /// panic and never a wrapped (near-`u64::MAX`) load address that would
+    /// silently pass the `>= DRAM_START` check. The initrd must reside
+    /// entirely within advertised RAM (above pvtime_base it is outside the
+    /// advertised /memory and the guest never memblock-reserves it);
+    /// firecracker (`initrd_load_addr`) and cloud-hypervisor
+    /// (`initramfs_load_addr`) likewise return an error/None in this case
+    /// instead of panicking or returning a bogus address. The min-memory
+    /// budget sizes RAM for the tmpfs/init constraint, not for
+    /// 'initrd fits below the PVTIME carve', so this bound is reachable on
+    /// a payload-controlled (large) initramfs.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn aarch64_initrd_oversized_returns_err_not_panic_or_wrap() {
+        use crate::vmm::{aarch64::fdt::pvtime_base, kvm::DRAM_START};
+        for &(mem, cpus) in &[(512u32, 2u32), (512, 8), (2048, 256), (4096, 512)] {
+            let pvt = pvtime_base(mem, cpus);
+            // One MiB larger than the ENTIRE advertised span below the
+            // carve: ceiling.checked_sub(oversized) cannot land at or above
+            // DRAM_START, so the function must report an error rather than
+            // wrap. On the pre-fix code this input either panics (debug,
+            // unchecked sub) or wraps to a huge value that passes the
+            // assert (release) — both wrong.
+            let oversized = (pvt - DRAM_START) + (1 << 20);
+            let result = aarch64_initrd_addr(mem, cpus, oversized);
+            assert!(
+                result.is_err(),
+                "oversized initrd must Err (mem={mem} cpus={cpus} \
+                 oversized={oversized:#x} pvt={pvt:#x}), got {result:?}"
+            );
+        }
+        // Total underflow: an initrd larger than pvtime_base itself drives
+        // the raw subtraction past zero. checked_sub must catch it as Err,
+        // never panic, never wrap.
+        let (mem, cpus) = (512u32, 2u32);
+        let pvt = pvtime_base(mem, cpus);
+        let huge = pvt + (1 << 20);
+        assert!(
+            aarch64_initrd_addr(mem, cpus, huge).is_err(),
+            "initrd larger than pvtime_base must Err (huge={huge:#x} pvt={pvt:#x})"
+        );
     }
 
     /// `Filesystem::Raw` disks emit no auto-mount cmdline tokens.
