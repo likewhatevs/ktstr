@@ -2345,7 +2345,11 @@ mod tests {
             let mut v = Verdict::new();
             lhs.ratio_within(&mut v, &rhs, 0.0, 1.0);
             let r = v.into_result();
-            assert!(!r.is_pass(), "NaN lhs must not silently pass: {:?}", r.outcomes);
+            assert!(
+                !r.is_pass(),
+                "NaN lhs must not silently pass: {:?}",
+                r.outcomes
+            );
         }
         // NaN denominator (passes the rhs==0 guard, since NaN != 0.0).
         {
@@ -2356,7 +2360,11 @@ mod tests {
             let mut v = Verdict::new();
             lhs.ratio_within(&mut v, &rhs, 0.0, 1.0);
             let r = v.into_result();
-            assert!(!r.is_pass(), "NaN rhs must not silently pass: {:?}", r.outcomes);
+            assert!(
+                !r.is_pass(),
+                "NaN rhs must not silently pass: {:?}",
+                r.outcomes
+            );
         }
     }
 
@@ -3282,7 +3290,8 @@ mod tests {
             r.outcomes,
         );
         assert!(
-            r.failure_details().any(|d| d.message.contains("non-finite")),
+            r.failure_details()
+                .any(|d| d.message.contains("non-finite")),
             "expected a non-finite failure detail: {:?}",
             r.failure_details().collect::<Vec<_>>(),
         );

@@ -2757,9 +2757,8 @@ fn cast_build_btf(types: &[CastSynType], strings: &[u8]) -> Vec<u8> {
                 // Member::bitfield_size returns Some.
                 type_section.extend_from_slice(&name_off.to_le_bytes());
                 let vlen = members.len() as u32;
-                let info = ((CAST_BTF_KIND_STRUCT << 24) & 0x1f00_0000)
-                    | (vlen & 0xffff)
-                    | (1u32 << 31);
+                let info =
+                    ((CAST_BTF_KIND_STRUCT << 24) & 0x1f00_0000) | (vlen & 0xffff) | (1u32 << 31);
                 type_section.extend_from_slice(&info.to_le_bytes());
                 type_section.extend_from_slice(&size.to_le_bytes());
                 for m in members {
@@ -3042,10 +3041,7 @@ fn render_bitfield_signed_int_base_decodes_negative() {
     let v = render_value(&btf, 2, &[0x0F, 0x00, 0x00, 0x00]);
     assert_eq!(
         sole_member_value(&v),
-        &RenderedValue::Int {
-            bits: 4,
-            value: -1,
-        }
+        &RenderedValue::Int { bits: 4, value: -1 }
     );
 }
 
@@ -3089,10 +3085,7 @@ fn render_bitfield_signed_enum_base_decodes_negative_int() {
     let v = render_value(&btf, 2, &[0xFF, 0x00, 0x00, 0x00]);
     assert_eq!(
         sole_member_value(&v),
-        &RenderedValue::Int {
-            bits: 8,
-            value: -1,
-        }
+        &RenderedValue::Int { bits: 8, value: -1 }
     );
 }
 
@@ -3133,10 +3126,7 @@ fn render_bitfield_signed_enum64_base_decodes_negative_int() {
     let v = render_value(&btf, 2, &[0xFF, 0, 0, 0, 0, 0, 0, 0]);
     assert_eq!(
         sole_member_value(&v),
-        &RenderedValue::Int {
-            bits: 8,
-            value: -1,
-        }
+        &RenderedValue::Int { bits: 8, value: -1 }
     );
 }
 
@@ -9621,7 +9611,10 @@ fn cpumask_kptr_member_chases_to_cpu_list() {
             deref_skipped_reason.is_none(),
             "valid cpumask must not skip ({name}): {deref_skipped_reason:?}"
         );
-        assert!(cast_annotation.is_none(), "kptr branch leaves cast_annotation None ({name})");
+        assert!(
+            cast_annotation.is_none(),
+            "kptr branch leaves cast_annotation None ({name})"
+        );
         match deref.as_deref() {
             Some(RenderedValue::CpuList { cpus }) => {
                 assert_eq!(cpus, "0-1,3", "decoded cpu set ({name})")
@@ -9683,7 +9676,10 @@ fn cpumask_kptr_plausibility_gate_rejects_freed_slab_pattern() {
     else {
         panic!("mask field must render as Ptr; got {:?}", members[0].value);
     };
-    assert!(deref.is_none(), "freed-slab pattern must not decode to a CpuList");
+    assert!(
+        deref.is_none(),
+        "freed-slab pattern must not decode to a CpuList"
+    );
     assert!(
         deref_skipped_reason
             .as_deref()

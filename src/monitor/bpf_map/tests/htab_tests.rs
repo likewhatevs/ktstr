@@ -1490,7 +1490,10 @@ fn plant_multipage_percpu_value(
 ) -> (u64, Vec<u8>) {
     const POISON: u8 = 0xCC;
     let n_pages = value_size.div_ceil(0x1000);
-    assert!(value_size > 0x1000 && n_pages >= 2, "multipage helper needs >= 2 pages");
+    assert!(
+        value_size > 0x1000 && n_pages >= 2,
+        "multipage helper needs >= 2 pages"
+    );
     assert_eq!(frames.len(), n_pages, "one frame PA per page");
     let pgd_pa = pt_base_pa;
     let pud_pa = pt_base_pa + 0x1000;
@@ -1560,7 +1563,12 @@ fn read_percpu_value_bytes_spans_nonadjacent_frames() {
     let value_size = 0x1800usize;
     let mut buf = vec![0u8; 0x10000];
     let (cr3_pa, expected) = plant_multipage_percpu_value(
-        &mut buf, value_kva, value_size, 0x1000, &[0x6000, 0x9000], &[],
+        &mut buf,
+        value_kva,
+        value_size,
+        0x1000,
+        &[0x6000, 0x9000],
+        &[],
     );
     // SAFETY: buf is a live local buffer whose storage outlives mem.
     let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
@@ -1713,10 +1721,22 @@ fn iter_percpu_htab_entries_spans_nonadjacent_frames() {
         b[pa as usize..pa as usize + 8].copy_from_slice(&v.to_ne_bytes());
     };
     // bpf_htab fields.
-    w32(&mut buf, htab_pa + offsets.map_type as u64, BPF_MAP_TYPE_PERCPU_HASH);
+    w32(
+        &mut buf,
+        htab_pa + offsets.map_type as u64,
+        BPF_MAP_TYPE_PERCPU_HASH,
+    );
     w32(&mut buf, htab_pa + offsets.key_size as u64, 4);
-    w32(&mut buf, htab_pa + offsets.value_size as u64, value_size as u32);
-    w64(&mut buf, htab_pa + htab.htab_buckets as u64, pa_to_kva(buckets_pa));
+    w32(
+        &mut buf,
+        htab_pa + offsets.value_size as u64,
+        value_size as u32,
+    );
+    w64(
+        &mut buf,
+        htab_pa + htab.htab_buckets as u64,
+        pa_to_kva(buckets_pa),
+    );
     w32(&mut buf, htab_pa + htab.htab_n_buckets as u64, 1);
     // Bucket 0 head → elem; other buckets absent (n_buckets = 1).
     w64(
@@ -1732,7 +1752,12 @@ fn iter_percpu_htab_entries_spans_nonadjacent_frames() {
     w64(&mut buf, elem_pa + value_off_in_elem, cpu_kva); // percpu base
 
     let (cr3_pa, expected) = plant_multipage_percpu_value(
-        &mut buf, cpu_kva, value_size, 0x40000, &[0x50000, 0x53000], &[],
+        &mut buf,
+        cpu_kva,
+        value_size,
+        0x40000,
+        &[0x50000, 0x53000],
+        &[],
     );
     // SAFETY: buf is a live local buffer whose storage outlives mem.
     let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };

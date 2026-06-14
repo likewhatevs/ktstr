@@ -737,7 +737,8 @@ mod tests {
         // One more redistributor would overrun the device window.
         const {
             assert!(
-                GIC_REDIST_BASE + (MAX_VCPUS as u64 + 1) * GIC_REDIST_SIZE_PER_CPU > SERIAL_MMIO_BASE
+                GIC_REDIST_BASE + (MAX_VCPUS as u64 + 1) * GIC_REDIST_SIZE_PER_CPU
+                    > SERIAL_MMIO_BASE
             )
         };
     }

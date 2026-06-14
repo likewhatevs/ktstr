@@ -6172,9 +6172,7 @@ fn render_map_hash_truncates_at_cap() {
             idx as u32,
         );
         // Value at htab_elem_size_base + round_up(key_size, 8).
-        let val_off = elem_pa
-            + htab.htab_elem_size_base as u64
-            + ((key_size as u64 + 7) & !7);
+        let val_off = elem_pa + htab.htab_elem_size_base as u64 + ((key_size as u64 + 7) & !7);
         write_u32(&mut buf, val_off, (idx as u32).wrapping_mul(7));
     }
     // SAFETY: buf is a live local Vec<u8> outliving the GuestMem use.
@@ -6283,8 +6281,7 @@ fn render_map_local_storage_truncates_at_cap() {
     let elem_stride: u64 = 64; // > elem_sdata + sdata_data + value_size (24+0+4)
     let ls_start: u64 = 0x40_0000;
     let ls_stride: u64 = 64;
-    let buf_size =
-        ls_start as usize + n_elems * ls_stride as usize + 0x1000;
+    let buf_size = ls_start as usize + n_elems * ls_stride as usize + 0x1000;
     let mut buf = vec![0u8; buf_size];
     let write_u32 = |buf: &mut Vec<u8>, pa: u64, val: u32| {
         let off = pa as usize;

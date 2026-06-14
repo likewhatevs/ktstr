@@ -986,11 +986,7 @@ fn read_kva_bytes(ctx: &AccessorCtx<'_>, target_kva: u64, len: usize) -> Option<
 /// explicitly (`cpu_pa + value_size <= mem.size()`) is subsumed:
 /// [`GuestMem::read_bytes`] returns 0 for a PA past `mem.size()`, so
 /// `bytes_filled != len` drops the slot to `None`.
-fn read_percpu_value_bytes(
-    ctx: &AccessorCtx<'_>,
-    target_kva: u64,
-    len: usize,
-) -> Option<Vec<u8>> {
+fn read_percpu_value_bytes(ctx: &AccessorCtx<'_>, target_kva: u64, len: usize) -> Option<Vec<u8>> {
     read_kva_bytes_with(
         ctx.mem,
         |kva| {

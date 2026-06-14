@@ -2525,13 +2525,8 @@ fn concrete_accessor_find_array_map_vs_trait_find_map_diverge_on_non_array() {
     // SAFETY: buf is a live local buffer whose backing storage
     // outlives the GuestMem use.
     let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
-    let kernel = GuestKernel::new_for_test(
-        Arc::new(mem),
-        HashMap::new(),
-        page_offset,
-        cr3_pa,
-        false,
-    );
+    let kernel =
+        GuestKernel::new_for_test(Arc::new(mem), HashMap::new(), page_offset, cr3_pa, false);
     let accessor = GuestMemMapAccessor::new_for_test(&kernel, &offsets, idr_kva);
 
     // Inherent ARRAY-only method: HASH map with this suffix is
@@ -2555,8 +2550,8 @@ fn concrete_accessor_find_array_map_vs_trait_find_map_diverge_on_non_array() {
     assert_eq!(arr.name(), "mitosis.bss");
     assert_eq!(arr.map_type, BPF_MAP_TYPE_ARRAY);
     assert!(arr.value_kva.is_some());
-    let arr_trait =
-        BpfMapAccessor::find_map(&accessor, "mitosis.bss").expect("trait find_map matches ARRAY too");
+    let arr_trait = BpfMapAccessor::find_map(&accessor, "mitosis.bss")
+        .expect("trait find_map matches ARRAY too");
     assert_eq!(arr_trait.name(), "mitosis.bss");
 }
 

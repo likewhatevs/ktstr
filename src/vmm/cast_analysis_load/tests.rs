@@ -4142,7 +4142,13 @@ fn cached_cast_analysis_concurrent_callers_share_one_oncelock_init() {
 
 const MOV_R1_CODE: u8 = super::BPF_MOV64_IMM_CODE;
 fn call_insn() -> BpfInsn {
-    BpfInsn::new(super::cast_analysis_load_consts::BPF_JMP_CALL_CODE, 0, 0, 0, 0)
+    BpfInsn::new(
+        super::cast_analysis_load_consts::BPF_JMP_CALL_CODE,
+        0,
+        0,
+        0,
+        0,
+    )
 }
 
 /// `MOV r1, imm` directly before the call → recovered.
