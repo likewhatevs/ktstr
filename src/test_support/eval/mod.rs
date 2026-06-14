@@ -310,16 +310,6 @@ pub(crate) const ERR_NO_TEST_FUNCTION_OUTPUT: &str =
 /// and `eval_crash_message_from_field`.
 pub(crate) const ERR_GUEST_CRASHED_PREFIX: &str = "guest crashed:";
 
-/// Write a skip sidecar for `entry`, logging to stderr on failure
-/// without propagating the error. Used at six sites — the four in
-/// [`run_ktstr_test_inner`] (the wrapper's catch-all that fires
-/// for any pre-VM-build ResourceContention, the performance_mode
-/// gate, and the two `ResourceContention` arms at VM build + VM
-/// run) and the two in `super::dispatch` (performance_mode gates
-/// at the plain-run entry points) — all of which must record the
-/// skip for stats tooling but cannot meaningfully handle a
-/// sidecar-write failure beyond logging it. The skip itself is
-/// still valid; only post-run stats tooling loses visibility.
 /// Combine the conditional and unconditional `post_vm` failure
 /// signals. When both callbacks fail in the same run, surface
 /// BOTH errors in a single chained message so a debugging
@@ -522,6 +512,16 @@ pub(crate) fn invoke_post_vm_callback(
     }
 }
 
+/// Write a skip sidecar for `entry`, logging to stderr on failure
+/// without propagating the error. Used at six sites — the four in
+/// [`run_ktstr_test_inner`] (the wrapper's catch-all that fires
+/// for any pre-VM-build ResourceContention, the performance_mode
+/// gate, and the two `ResourceContention` arms at VM build + VM
+/// run) and the two in `super::dispatch` (performance_mode gates
+/// at the plain-run entry points) — all of which must record the
+/// skip for stats tooling but cannot meaningfully handle a
+/// sidecar-write failure beyond logging it. The skip itself is
+/// still valid; only post-run stats tooling loses visibility.
 pub(crate) fn record_skip_sidecar(entry: &KtstrTestEntry) {
     if let Err(e) = write_skip_sidecar(entry) {
         // Dual-emit at warn level: an unwritten skip sidecar costs
