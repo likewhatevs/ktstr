@@ -333,6 +333,47 @@ enum CtprofCommand {
 /// positional path (one snapshot rather than baseline+candidate)
 /// and the absence of any delta/percentage flags — show renders
 /// one value per (group, metric) cell, no diff math.
+/// Grouping axis for `ktstr ctprof show`. Show-specific
+/// subset of [`ctprof_compare::GroupBy`] that OMITS the
+/// compare-only `All` variant: `All` renders as a hierarchical
+/// cgroup -> pcomm -> comm tree (the compound-key grouping in
+/// [`ctprof_compare`]'s `build_groups` + the `write_primary_all`
+/// tree renderer), and `write_show` carries no equivalent
+/// hierarchy machinery. Modeling the show axis as its own
+/// value-enum makes `--group-by all` unrepresentable: clap
+/// rejects it at parse time with a possible-values list rather
+/// than accepting a value `write_show` would panic on. The
+/// four variants map 1:1 onto their [`ctprof_compare::GroupBy`]
+/// counterparts via [`From`], and the kebab-case clap tokens
+/// (`pcomm`, `cgroup`, `comm`, `comm-exact`) match the compare
+/// subcommand's spelling for the same axes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum ShowGroupBy {
+    /// Group by process name (`pcomm`). See
+    /// [`ctprof_compare::GroupBy::Pcomm`].
+    Pcomm,
+    /// Group by cgroup path. See
+    /// [`ctprof_compare::GroupBy::Cgroup`].
+    Cgroup,
+    /// Group by thread-name pattern. See
+    /// [`ctprof_compare::GroupBy::Comm`].
+    Comm,
+    /// Group by literal thread name. See
+    /// [`ctprof_compare::GroupBy::CommExact`].
+    CommExact,
+}
+
+impl From<ShowGroupBy> for ctprof_compare::GroupBy {
+    fn from(g: ShowGroupBy) -> Self {
+        match g {
+            ShowGroupBy::Pcomm => ctprof_compare::GroupBy::Pcomm,
+            ShowGroupBy::Cgroup => ctprof_compare::GroupBy::Cgroup,
+            ShowGroupBy::Comm => ctprof_compare::GroupBy::Comm,
+            ShowGroupBy::CommExact => ctprof_compare::GroupBy::CommExact,
+        }
+    }
+}
+
 #[derive(Debug, clap::Args)]
 pub struct CtprofShowArgs {
     /// Snapshot path (`.ctprof.zst`) from `ktstr ctprof capture -o`.
@@ -345,8 +386,8 @@ pub struct CtprofShowArgs {
     /// aggregates threads by NAME PATTERN under the same
     /// token-based normalizer; `comm-exact` is a synonym for
     /// `comm --no-thread-normalize` on the thread axis only.
-    #[arg(long, value_enum, default_value_t = ctprof_compare::GroupBy::Pcomm, help_heading = "Grouping")]
-    pub group_by: ctprof_compare::GroupBy,
+    #[arg(long, value_enum, default_value_t = ShowGroupBy::Pcomm, help_heading = "Grouping")]
+    pub group_by: ShowGroupBy,
     /// Glob patterns that collapse dynamic cgroup path segments —
     /// same shape as
     /// `ktstr ctprof compare --cgroup-flatten`. Repeatable.
@@ -737,13 +778,20 @@ fn run_show(args: &CtprofShowArgs) -> Result<i32> {
     let metrics = ctprof_compare::parse_metrics(&args.metrics)
         .with_context(|| format!("parse --metrics {:?}", args.metrics))?;
 
+    // Convert the show-specific grouping axis into the shared
+    // `ctprof_compare::GroupBy` once at the boundary. `ShowGroupBy`
+    // omits the compare-only `All` variant, so this conversion
+    // never produces `GroupBy::All` and the downstream
+    // `write_show` `All` arm stays unreachable.
+    let group_by: ctprof_compare::GroupBy = args.group_by.into();
+
     // Mirror run_compare's pre-load warning: explicit
     // `--sections cgroup-stats` (or any other cgroup-only
     // section) under a non-cgroup `--group-by` would render
     // zero rows for that section silently. Surface a
     // diagnostic before the snapshot load so the operator sees
     // it immediately.
-    ctprof_compare::warn_cgroup_only_sections_under_non_cgroup(&sections, args.group_by);
+    ctprof_compare::warn_cgroup_only_sections_under_non_cgroup(&sections, group_by);
 
     let snap = ktstr::ctprof::CtprofSnapshot::load(&args.snapshot)
         .with_context(|| format!("load snapshot {}", args.snapshot.display()))?;
@@ -752,7 +800,7 @@ fn run_show(args: &CtprofShowArgs) -> Result<i32> {
     let _ = write_show(
         &mut out,
         &snap,
-        args.group_by,
+        group_by,
         &args.cgroup_flatten,
         args.no_thread_normalize,
         args.no_cg_normalize,
@@ -1970,7 +2018,7 @@ mod tests {
                     args.snapshot,
                     std::path::PathBuf::from("/tmp/snap.ctprof.zst")
                 );
-                assert_eq!(args.group_by, ctprof_compare::GroupBy::Pcomm);
+                assert_eq!(args.group_by, ShowGroupBy::Pcomm);
                 assert!(args.cgroup_flatten.is_empty());
                 assert!(!args.no_thread_normalize);
                 assert!(!args.no_cg_normalize);
@@ -1980,6 +2028,105 @@ mod tests {
                 assert!(args.sort_by.is_empty());
             }
             _ => panic!("expected Ctprof/Show"),
+        }
+    }
+
+    /// `ktstr ctprof show --group-by all` must be REJECTED at clap
+    /// parse time. `all` is a compare-only axis (it renders as a
+    /// cgroup -> pcomm -> comm tree via `write_primary_all`); show
+    /// has no hierarchy renderer, so `write_show`'s `GroupBy::All`
+    /// arm is `unreachable!()`. Before the fix, `CtprofShowArgs`
+    /// reused the full `GroupBy` value-enum, clap accepted `all`,
+    /// and `run_show` -> `write_show` panicked on the unreachable
+    /// arm. Modeling the show axis as `ShowGroupBy` (no `All`)
+    /// makes the value unrepresentable: clap fails the parse with a
+    /// possible-values diagnostic instead. This test fails (parse
+    /// succeeds) on the pre-fix code and passes after.
+    #[test]
+    fn parse_ctprof_show_group_by_all_is_rejected() {
+        let parsed = Cli::try_parse_from([
+            "ktstr",
+            "ctprof",
+            "show",
+            "/tmp/snap.ctprof.zst",
+            "--group-by",
+            "all",
+        ]);
+        // `let Err` rather than `expect_err`/`unwrap_err`: those
+        // require the Ok type (`Cli`) to be `Debug`, which it is not.
+        let Err(err) = parsed else {
+            panic!(
+                "`--group-by all` is a compare-only axis with no show \
+                 renderer; it must be rejected at parse time, not \
+                 accepted and panicked on in write_show"
+            );
+        };
+        // clap's invalid-value error for a value-enum carries the
+        // offending token and the accepted set; assert on the
+        // offending value so the message is operator-actionable.
+        let msg = err.to_string();
+        assert!(
+            msg.contains("all"),
+            "rejection message must name the invalid value `all`, got: {msg}",
+        );
+    }
+
+    /// Every axis show DOES support parses into the matching
+    /// `ShowGroupBy` variant. Companion to the `all`-rejection
+    /// test: pins that narrowing the value-enum did not also drop
+    /// a legitimate axis. A regression that, say, removed
+    /// `CommExact` from `ShowGroupBy` would surface here as a
+    /// parse failure for `comm-exact`.
+    #[test]
+    fn parse_ctprof_show_group_by_supported_axes() {
+        for (token, expected) in [
+            ("pcomm", ShowGroupBy::Pcomm),
+            ("cgroup", ShowGroupBy::Cgroup),
+            ("comm", ShowGroupBy::Comm),
+            ("comm-exact", ShowGroupBy::CommExact),
+        ] {
+            let parsed = Cli::try_parse_from([
+                "ktstr",
+                "ctprof",
+                "show",
+                "/tmp/snap.ctprof.zst",
+                "--group-by",
+                token,
+            ])
+            .unwrap_or_else(|e| panic!("`--group-by {token}` must parse: {e}"));
+            match parsed.command {
+                Command::Ctprof {
+                    command: CtprofCommand::Show(args),
+                } => assert_eq!(
+                    args.group_by, expected,
+                    "`--group-by {token}` must parse to {expected:?}",
+                ),
+                _ => panic!("expected Ctprof/Show for `--group-by {token}`"),
+            }
+        }
+    }
+
+    /// Every `ShowGroupBy` variant converts to the matching
+    /// `ctprof_compare::GroupBy` and NONE maps to `All`. Pins the
+    /// `From<ShowGroupBy>` boundary `run_show` relies on: because
+    /// the conversion can never yield `GroupBy::All`, the
+    /// `unreachable!()` arm in `write_show` is genuinely
+    /// unreachable on the show path.
+    #[test]
+    fn show_group_by_converts_to_compare_group_by_without_all() {
+        for (show, expected) in [
+            (ShowGroupBy::Pcomm, ctprof_compare::GroupBy::Pcomm),
+            (ShowGroupBy::Cgroup, ctprof_compare::GroupBy::Cgroup),
+            (ShowGroupBy::Comm, ctprof_compare::GroupBy::Comm),
+            (ShowGroupBy::CommExact, ctprof_compare::GroupBy::CommExact),
+        ] {
+            let got: ctprof_compare::GroupBy = show.into();
+            assert_eq!(got, expected, "{show:?} must convert to {expected:?}");
+            assert_ne!(
+                got,
+                ctprof_compare::GroupBy::All,
+                "no ShowGroupBy variant may convert to GroupBy::All",
+            );
         }
     }
 
@@ -2008,7 +2155,7 @@ mod tests {
             Command::Ctprof {
                 command: CtprofCommand::Show(args),
             } => {
-                assert_eq!(args.group_by, ctprof_compare::GroupBy::Comm);
+                assert_eq!(args.group_by, ShowGroupBy::Comm);
                 assert_eq!(
                     args.cgroup_flatten,
                     vec!["/kubepods/*/workload".to_string()]
