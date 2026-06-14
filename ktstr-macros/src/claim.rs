@@ -4,9 +4,9 @@
 //! `claim_<field_name>` method per public scalar field (returning
 //! `ClaimBuilder<'_, FieldType>`), plus container-typed accessors:
 //!
-//!   * `BTreeSet<T>` fields → `claim_<field_name>(&mut self, s: &Struct)
+//!   * `BTreeSet<T>` fields → `claim_<field_name>(&self, verdict: &mut Verdict)
 //!     -> SetClaim<'_, T>`, dispatched through `Verdict::claim_set`.
-//!   * `Vec<T>` fields → `claim_<field_name>(&mut self, s: &Struct)
+//!   * `Vec<T>` fields → `claim_<field_name>(&self, verdict: &mut Verdict)
 //!     -> SeqClaim<'_, T>`, dispatched through `Verdict::claim_seq`.
 //!   * `BTreeMap<K, V>` / `HashMap<K, V>` fields → SKIPPED (no claim
 //!     surface for maps in v1; users reach for `claim!(verdict,
@@ -22,9 +22,11 @@
 //!
 //! The generated trait is named `<StructName>Claim` with the same
 //! visibility as the input struct. The single
-//! `impl <StructName>Claim for ::ktstr::assert::Verdict` lives in the
-//! same expansion so callers only need `use ::ktstr::prelude::*` (which
-//! re-exports the trait) to bring the methods into scope.
+//! `impl <StructName>Claim for <StructName>` lives in the same
+//! expansion (the methods take `&self` on the stats struct plus a
+//! `&mut Verdict` accumulator argument), so callers only need
+//! `use ::ktstr::prelude::*` (which re-exports the trait) to bring the
+//! methods into scope.
 //!
 //! Label source: every method body is `verdict.claim(stringify!(field),
 //! ...)` — the label is the field's source-text identifier. Renaming

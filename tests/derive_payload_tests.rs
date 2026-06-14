@@ -83,6 +83,28 @@ fn derive_payload_full_grammar() {
     assert_eq!(FIO_FULL.metrics[3].unit, "");
 }
 
+/// `TargetValue` accepts negative and integer-valued targets. A
+/// negative literal parses as `Expr::Unary(Neg, Lit)` (never a bare
+/// `Lit`) and an integer is `Lit::Int`; both coerce to f64. Pins the
+/// derive fix — previously these were rejected with a misleading
+/// "must be a float literal" error.
+#[derive(ktstr::Payload)]
+#[payload(binary = "tgt", output = Json)]
+#[metric(name = "signed_delta", polarity = TargetValue(-1.5))]
+#[metric(name = "zero_target", polarity = TargetValue(0))]
+#[allow(dead_code)]
+struct TargetValuePayload;
+
+#[test]
+fn derive_payload_target_value_negative_and_integer() {
+    assert_eq!(TARGET_VALUE.metrics.len(), 2);
+    assert_eq!(
+        TARGET_VALUE.metrics[0].polarity,
+        Polarity::TargetValue(-1.5)
+    );
+    assert_eq!(TARGET_VALUE.metrics[1].polarity, Polarity::TargetValue(0.0));
+}
+
 /// `output = LlmExtract` (bare-ident shorthand) resolves to
 /// `LlmExtract(None)`.
 #[derive(ktstr::Payload)]
@@ -309,8 +331,13 @@ struct BenchWithIncludesPayload;
 
 #[test]
 fn derive_payload_include_files_registered_in_order() {
+    // The derive auto-injects the `binary` spec as the first
+    // include_files entry (payload.rs `include_files.insert(0, binary)`),
+    // so `#[payload(binary = "X")]` packages X without a separate
+    // `#[include_files("X")]`. The user-declared helpers follow in
+    // source order.
     assert_eq!(
         BENCH_WITH_INCLUDES.include_files,
-        &["bench-helper", "config.json"],
+        &["bench_with_includes", "bench-helper", "config.json"],
     );
 }

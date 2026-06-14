@@ -429,12 +429,12 @@ fn polarity_from_expr(expr: &syn::Expr) -> syn::Result<proc_macro2::TokenStream>
         syn::Expr::Call(call) => {
             let ident = match &*call.func {
                 syn::Expr::Path(ep) => ep.path.get_ident().ok_or_else(|| {
-                    syn::Error::new_spanned(expr, "expected `TargetValue(<float>)`")
+                    syn::Error::new_spanned(expr, "expected `TargetValue(<numeric>)`")
                 })?,
                 _ => {
                     return Err(syn::Error::new_spanned(
                         expr,
-                        "expected `TargetValue(<float>)`",
+                        "expected `TargetValue(<numeric>)`",
                     ));
                 }
             };
@@ -449,23 +449,43 @@ fn polarity_from_expr(expr: &syn::Expr) -> syn::Result<proc_macro2::TokenStream>
             if call.args.len() != 1 {
                 return Err(syn::Error::new_spanned(
                     expr,
-                    "TargetValue takes exactly one float literal argument",
+                    "TargetValue takes exactly one numeric literal argument",
                 ));
             }
             let arg = &call.args[0];
-            let lit = match arg {
-                syn::Expr::Lit(syn::ExprLit {
-                    lit: syn::Lit::Float(lf),
-                    ..
-                }) => lf,
-                _ => {
-                    return Err(syn::Error::new_spanned(
-                        arg,
-                        "TargetValue argument must be a float literal (e.g. 42.0)",
-                    ));
+            // `Polarity::TargetValue(f64)` accepts any finite value,
+            // including negatives and integer-valued targets. A negative
+            // literal parses as `Expr::Unary(Neg, Lit)`, never a bare
+            // `Lit`, and an integer literal is `Lit::Int` — accept all
+            // three forms and coerce to f64.
+            let numeric_lit = |lit: &syn::Lit| -> Option<proc_macro2::TokenStream> {
+                match lit {
+                    syn::Lit::Float(lf) => Some(quote! { #lf }),
+                    syn::Lit::Int(li) => Some(quote! { #li as f64 }),
+                    _ => None,
                 }
             };
-            Ok(quote! { ::ktstr::test_support::Polarity::TargetValue(#lit) })
+            let value_ts = match arg {
+                syn::Expr::Lit(syn::ExprLit { lit, .. }) => numeric_lit(lit),
+                syn::Expr::Unary(syn::ExprUnary {
+                    op: syn::UnOp::Neg(_),
+                    expr: inner,
+                    ..
+                }) => match &**inner {
+                    syn::Expr::Lit(syn::ExprLit { lit, .. }) => {
+                        numeric_lit(lit).map(|t| quote! { -(#t) })
+                    }
+                    _ => None,
+                },
+                _ => None,
+            };
+            let Some(value_ts) = value_ts else {
+                return Err(syn::Error::new_spanned(
+                    arg,
+                    "TargetValue argument must be a numeric literal (e.g. 42.0, -1.5, 0)",
+                ));
+            };
+            Ok(quote! { ::ktstr::test_support::Polarity::TargetValue(#value_ts) })
         }
         _ => Err(syn::Error::new_spanned(
             expr,
