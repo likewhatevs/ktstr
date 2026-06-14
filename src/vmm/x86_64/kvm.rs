@@ -1450,6 +1450,46 @@ mod tests {
     }
 
     #[test]
+    fn raw_fd_set_gsi_routing_with_msi_route_succeeds() {
+        // Cross-check: the hand-encoded ioctl 0x4008_AE6A hits
+        // KVM_SET_GSI_ROUTING. A wrong direction bit, _IOC_SIZE, or a
+        // typo in the constant fails at runtime — ENOTTY (wrong
+        // number) or EINVAL (wrong direction/size) — surfacing as Err
+        // here. This is the only one of the three hand-encoded raw-fd
+        // ioctls without a cross-check (the two clock siblings are
+        // covered above); a wrong encoding would otherwise fail
+        // silently on the split-irqchip device-MSI-routing path (no
+        // IRQ delivery → guest hang on first device use), surfaced only
+        // by `routing_failures` at runtime.
+        let topo = Topology {
+            llcs: 1,
+            cores_per_llc: 1,
+            threads_per_core: 1,
+            numa_nodes: 1,
+            nodes: None,
+            distances: None,
+        };
+        let vm = KtstrKvm::new(topo, 64, false).unwrap();
+        let raw_fd = vm.vm_fd.as_raw_fd();
+        // KVM_SET_GSI_ROUTING is a whole-table replace; install one
+        // valid MSI route. This small topology uses the in-kernel
+        // irqchip (split-irqchip engages only above MAX_XAPIC_ID), and
+        // an MSI route is valid under either irqchip mode — the ioctl
+        // encoding under test is irqchip-mode-independent.
+        let routing = build_device_msi_routing(&[(
+            0u32,
+            MsiRoute {
+                address_lo: 0xFEE0_0000,
+                address_hi: 0,
+                data: 0x0000_0040,
+            },
+        )])
+        .expect("build one-MSI-route routing");
+        super::kvm_set_gsi_routing_via_raw_fd(raw_fd, &routing)
+            .expect("raw KVM_SET_GSI_ROUTING with one MSI route");
+    }
+
+    #[test]
     fn performance_mode_with_hlt_disable_succeeds() {
         // performance_mode issues two separate enable_cap calls:
         // PAUSE (always succeeds) then HLT (may be rejected by
