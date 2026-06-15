@@ -575,3 +575,135 @@ fn rx_poison_signal_sequence_sets_needs_reset_and_int_config() {
         0,
     );
 }
+
+// ---------------------------------------------------------------------------
+// add_used failure (NOT poison) — the transient used-ring-GPA-unmapped
+// path. Distinct from the avail.idx poison above: an add_used failure
+// bumps a per-queue failure counter and does NOT set NEEDS_RESET, so a
+// later kick can retry if the guest re-binds the used ring (device.rs
+// process_tx_loopback / try_loopback_to_rx add_used Err arms). Forced
+// deterministically by programming the queue's used ring at a GPA beyond
+// the mapped guest region — the device stores the programmed used-ring
+// GPA without validating it's mapped, and vm-memory rejects the
+// used-ring write at add_used time.
+// ---------------------------------------------------------------------------
+
+/// A used-ring GPA beyond the 1 MiB guest region; any used-ring write
+/// here fails — the deterministic stand-in for the "used-ring address
+/// likely unmapped" condition the add_used Err arms handle.
+const UNMAPPED_USED: u64 = 0x20_0000; // 2 MiB, outside [0, GUEST_MEM_SIZE)
+
+/// Build a fixture programming the RX and TX used-ring GPAs explicitly
+/// (descriptor tables, avail rings, and buffers stay at the mapped
+/// `*_BASE` addresses). Pointing a used ring at [`UNMAPPED_USED`] makes
+/// that queue's `add_used` fail deterministically while the other queue
+/// completes normally.
+fn build_fixture_used_rings(rx_used: u64, tx_used: u64) -> (VirtioNet, GuestMemoryMmap) {
+    let mem = GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), GUEST_MEM_SIZE)])
+        .expect("create add_used-failure test guest mem");
+    let mut dev = VirtioNet::new(NetConfig::default());
+    dev.set_mem(mem.clone());
+    init_until_features_ok(&mut dev);
+    // RX queue (idx 0).
+    write_reg(&mut dev, VIRTIO_MMIO_QUEUE_SEL, RXQ as u32);
+    write_reg(&mut dev, VIRTIO_MMIO_QUEUE_NUM, QUEUE_SIZE as u32);
+    write_reg(&mut dev, VIRTIO_MMIO_QUEUE_DESC_LOW, RX_DESC_BASE as u32);
+    write_reg(&mut dev, VIRTIO_MMIO_QUEUE_AVAIL_LOW, RX_AVAIL_BASE as u32);
+    write_reg(&mut dev, VIRTIO_MMIO_QUEUE_USED_LOW, rx_used as u32);
+    write_reg(&mut dev, VIRTIO_MMIO_QUEUE_READY, 1);
+    // TX queue (idx 1).
+    write_reg(&mut dev, VIRTIO_MMIO_QUEUE_SEL, TXQ as u32);
+    write_reg(&mut dev, VIRTIO_MMIO_QUEUE_NUM, QUEUE_SIZE as u32);
+    write_reg(&mut dev, VIRTIO_MMIO_QUEUE_DESC_LOW, TX_DESC_BASE as u32);
+    write_reg(&mut dev, VIRTIO_MMIO_QUEUE_AVAIL_LOW, TX_AVAIL_BASE as u32);
+    write_reg(&mut dev, VIRTIO_MMIO_QUEUE_USED_LOW, tx_used as u32);
+    write_reg(&mut dev, VIRTIO_MMIO_QUEUE_READY, 1);
+    write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_OK);
+    (dev, mem)
+}
+
+/// TX `add_used` fails (TX used ring unmapped) while the RX-side
+/// loopback delivery succeeds. The device must bump
+/// `tx_add_used_failures`, must NOT bump `tx_packets` (a completion the
+/// guest never observes), and must NOT poison the queue — an add_used
+/// failure is a transient used-ring mapping problem, not a structural
+/// avail.idx violation (device.rs process_tx_loopback add_used Err arm).
+/// `rx_packets` bumps because the loopback delivered the frame into the
+/// RX queue BEFORE the TX add_used ran: the compound case where
+/// `rx_packets` legitimately exceeds `tx_packets`.
+#[test]
+fn tx_add_used_failure_bumps_counter_not_packets_no_poison() {
+    let (mut dev, mem) = build_fixture_used_rings(RX_USED_BASE, UNMAPPED_USED);
+    place_tx_chain(&mem);
+    place_rx_chain(&mem);
+
+    write_reg(&mut dev, VIRTIO_MMIO_QUEUE_NOTIFY, TXQ as u32);
+
+    assert_eq!(
+        dev.counters().tx_add_used_failures(),
+        1,
+        "an unmapped TX used ring must bump tx_add_used_failures exactly once",
+    );
+    assert_eq!(
+        dev.counters().tx_packets(),
+        0,
+        "a failed TX add_used must NOT bump tx_packets — the guest never \
+         observes the completion",
+    );
+    assert_eq!(
+        dev.counters().rx_packets(),
+        1,
+        "the loopback delivered into the RX queue before the TX add_used \
+         failed — rx_packets bumps (compound rx > tx case)",
+    );
+    assert_eq!(
+        read_reg(&dev, VIRTIO_MMIO_STATUS) & VIRTIO_CONFIG_S_NEEDS_RESET,
+        0,
+        "an add_used failure must NOT poison the queue (no NEEDS_RESET)",
+    );
+    assert_eq!(
+        dev.counters().invalid_avail_idx_count(),
+        0,
+        "an add_used failure is not an avail.idx poison",
+    );
+}
+
+/// Symmetric RX side: RX `add_used` fails (RX used ring unmapped) while
+/// the TX `add_used` succeeds. `rx_add_used_failures` bumps,
+/// `rx_packets` does NOT (the RX completion the guest never observes),
+/// `tx_packets` DOES (TX used ring mapped), and the queue is NOT
+/// poisoned. The mirror of the TX case — the compound `tx > rx` side.
+#[test]
+fn rx_add_used_failure_bumps_counter_not_packets_no_poison() {
+    let (mut dev, mem) = build_fixture_used_rings(UNMAPPED_USED, TX_USED_BASE);
+    place_tx_chain(&mem);
+    place_rx_chain(&mem);
+
+    write_reg(&mut dev, VIRTIO_MMIO_QUEUE_NOTIFY, TXQ as u32);
+
+    assert_eq!(
+        dev.counters().rx_add_used_failures(),
+        1,
+        "an unmapped RX used ring must bump rx_add_used_failures exactly once",
+    );
+    assert_eq!(
+        dev.counters().rx_packets(),
+        0,
+        "a failed RX add_used must NOT bump rx_packets",
+    );
+    assert_eq!(
+        dev.counters().tx_packets(),
+        1,
+        "the TX add_used succeeded (TX used ring mapped) — tx_packets bumps",
+    );
+    assert_eq!(
+        read_reg(&dev, VIRTIO_MMIO_STATUS) & VIRTIO_CONFIG_S_NEEDS_RESET,
+        0,
+        "an add_used failure must NOT poison the queue (no NEEDS_RESET)",
+    );
+    assert_eq!(
+        dev.counters().invalid_avail_idx_count(),
+        0,
+        "an add_used failure is not an avail.idx poison",
+    );
+}
