@@ -198,6 +198,20 @@ mod handlers;
 // extends the type that lives in `device.rs`. `mod handlers;`
 // alone wires the file into the build.
 
+mod control;
+mod lifecycle;
+// `control.rs` adds an `impl VirtioBlk` block (MMIO/FSM dispatch +
+// reset/respawn/pause); `lifecycle.rs` holds the worker stop/join free
+// helpers (join_worker_with_timeout, the timeout consts,
+// JoinWithTimeoutOutcome, panic_payload_str) + `impl Drop for VirtioBlk`.
+// Both were split out of device.rs for the 2000-line ceiling. The impl
+// block needs no re-export; the `lifecycle` glob re-exports the join
+// helpers so the cfg(test) atomics/fsm test sub-files and `control`'s
+// reset/respawn reach them via `super::*` (the same way they reached the
+// helpers when they lived in device.rs behind `pub(crate) use device::*`).
+#[allow(unused_imports)]
+pub(crate) use lifecycle::*;
+
 mod drain;
 // `pub(crate) use drain::*;` exposes `DrainOutcome` and
 // `drain_bracket_impl` to `worker.rs` (which references both via
