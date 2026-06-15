@@ -39,7 +39,7 @@ use virtio_queue::Error as VirtioQueueError;
 use virtio_queue::{QueueOwnedT, QueueT};
 
 use super::{
-    BlkQueue, BlkWorkerState, ChainDescriptor, NUM_QUEUES, REQ_QUEUE, VIRTIO_BLK_OUTHDR_SIZE,
+    Backing, BlkQueue, BlkWorkerState, ChainDescriptor, NUM_QUEUES, REQ_QUEUE, VIRTIO_BLK_OUTHDR_SIZE,
     VIRTIO_BLK_SECTOR_SIZE, VIRTIO_BLK_SEG_MAX, VIRTIO_BLK_SIZE_MAX, VirtioBlk, VirtioBlkOutHdr,
     publish_completion,
 };
@@ -848,9 +848,8 @@ pub(crate) fn drain_bracket_impl(
             // Sector-granular transfer requirement. virtio-v1.2
             // §5.2.6 defines T_IN/T_OUT in terms of sector-aligned
             // transfers; a sub-sector data length is malformed.
-            // firecracker rejects this in
-            // src/vmm/src/devices/virtio/block/virtio/request.rs
-            // (Request::parse). A buggy or malicious guest that
+            // firecracker rejects this in `Request::parse`. A buggy
+            // or malicious guest that
             // submits e.g. 513 bytes would otherwise reach
             // handle_read_impl/handle_write_impl, which compute
             // offsets in 512-byte units but transfer arbitrary
@@ -897,7 +896,7 @@ pub(crate) fn drain_bracket_impl(
             // `self.read_only` field, NOT against re-read guest
             // memory. The header was read once into `hdr` above and
             // not consulted again — no TOCTOU.
-            let backing = &state.backing;
+            let backing: &dyn Backing = &*state.backing;
             let counters = state.counters.as_ref();
             let cap_bytes = state.capacity_bytes;
             let read_only = state.read_only;

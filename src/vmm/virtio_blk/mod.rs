@@ -85,15 +85,16 @@
 //! # Backing-speed caveat
 //!
 //! Backend IO is synchronous within `drain_bracket_impl`:
-//! `handle_read_impl` / `handle_write_impl` call
-//! `FileExt::read_at` / `write_at` (`pread64` / `pwrite64`) and
-//! `handle_flush_impl` calls `File::sync_data` (`fdatasync`).
-//! There is no `io_uring` and no second-tier async queue — the
-//! worker serializes requests through the backing fd one at a
-//! time.
+//! `handle_read_vectored_impl` / `handle_write_vectored_impl` issue
+//! a single `preadv` / `pwritev` over the chain's data segments (a
+//! short positive write retries to completion; a short read is
+//! treated as EOF and the tail zero-padded) and `handle_flush_impl`
+//! calls `Backing::sync_data` (`fdatasync`). There is no `io_uring`
+//! and no second-tier async queue — the worker serializes requests
+//! through the backing one at a time.
 //!
 //! This is fine when the backing is **fast** — tmpfs (the
-//! `tempfile()` default) or warm page cache — where pread / pwrite
+//! `tempfile()` default) or warm page cache — where preadv / pwritev
 //! return in sub-microsecond time and fdatasync is a no-op
 //! (`noop_fsync`). With slow backing (cold page cache on spinning
 //! media, network-mounted file, fdatasync forcing real journal
@@ -204,6 +205,14 @@ mod drain;
 // the test sub-files. The lib build references both via these
 // paths, so the glob is consumed without `#[allow(unused_imports)]`.
 pub(crate) use drain::*;
+
+mod backing;
+// `Backing` (the storage seam) + `advance_iovecs` (the write
+// retry-loop helper). device.rs holds a `Box<dyn Backing>` and the
+// vectored-IO handlers call the trait methods; the test sub-files
+// inject fault-injecting mock `Backing` impls. Referenced via
+// `super::Backing` / `super::advance_iovecs`.
+pub(crate) use backing::*;
 
 #[cfg(test)]
 mod testing;

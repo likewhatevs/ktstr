@@ -11,12 +11,14 @@
 //! caveat — lives there.
 
 pub(crate) use std::fs::File;
-// `AsRawFd` is required by the vectored read/write helpers below
-// to extract the raw fd for `libc::preadv` / `libc::pwritev`. The
-// `worker.rs` consumer separately re-uses it (cfg(not(test)) only)
-// for `EventFd::write` accounting; we hoist it to unconditional
-// import so the vectored helpers compile in both `cfg(test)` and
-// production.
+// `AsRawFd` for the eventfd raw-fd plumbing (stop_fd / kick_fd
+// `as_raw_fd` in the worker-engine drop and respawn paths), which is
+// `cfg(not(test))` (the test build uses the inline engine and has no
+// worker fds). The backing's vectored IO no longer needs it — that
+// routes through the `Backing` trait's `preadv`/`pwritev` (the
+// impl-for-File holds the `as_raw_fd` call) rather than a raw fd at
+// the call site.
+#[cfg(not(test))]
 pub(crate) use std::os::unix::io::AsRawFd;
 pub(crate) use std::sync::Arc;
 pub(crate) use std::sync::OnceLock;
@@ -71,6 +73,7 @@ pub(crate) use vm_memory::{ByteValued, Bytes, GuestAddress, GuestMemory, GuestMe
 // `VirtioBlkCounters` lives in `counters.rs`; reach it via `super::*`
 // (sourced from `mod.rs`'s `pub(crate) use counters::*;`).
 use super::VirtioBlkCounters;
+use super::{Backing, advance_iovecs};
 // `EpollEvent` / `EventSet` are re-exported because tests for the
 // always-compiled `worker_dispatch_event` helper construct EventSet
 // values directly via `super::*`, and the helper itself accepts an
@@ -161,6 +164,22 @@ pub(crate) const VIRTIO_BLK_SIZE_MAX: u32 = 1 << 20;
 /// there trip in test/debug builds if a future change ever breaks
 /// that bound.
 const IOV_MAX: usize = 1024;
+
+/// Cap on consecutive `EINTR` re-issues of a single blk vectored IO
+/// (`preadv`/`pwritev`) before giving up with `S_IOERR`. `EINTR` on a
+/// buffered regular-file path implies a PENDING FATAL signal (the
+/// wait is `TASK_KILLABLE`, so only `SIGKILL`/group-exit interrupts),
+/// which does NOT clear — an unbounded retry would spin until the task
+/// is reaped, delaying the freeze-rendezvous failure dump. 16 is
+/// generous for any (rare) catchable-signal case while bounding the
+/// fatal-signal spin to a handful of iterations.
+///
+/// Divergence (we get this right): firecracker / vm-memory's
+/// `retry_eintr!` loops on `EINTR` UNBOUNDED — on a pending fatal
+/// signal that is a latent spin. We bound it: a spinning IO thread
+/// delays the freeze-rendezvous dump (the project's vCPU-blocking
+/// budget).
+const MAX_EINTR_RETRIES: u32 = 16;
 
 /// Device serial number returned by `VIRTIO_BLK_T_GET_ID`. Per
 /// virtio-v1.2 §5.2.6.4 (and `virtio_blk.h` `VIRTIO_BLK_ID_BYTES`)
@@ -430,7 +449,7 @@ pub(crate) fn publish_completion<Q: QueueT>(
 pub(crate) struct BlkWorkerState {
     /// Backing file. The worker reads and writes sectors via
     /// `pread`/`pwrite` and never inspects the on-disk contents.
-    pub(crate) backing: File,
+    pub(crate) backing: Box<dyn Backing>,
     /// Token-bucket for ops/sec.
     pub(crate) ops_bucket: TokenBucket,
     /// Token-bucket for bytes/sec.
@@ -911,7 +930,11 @@ impl VirtioBlk {
         let counters = Arc::new(VirtioBlkCounters::default());
 
         let state = BlkWorkerState {
-            backing,
+            // Wrap the production `File` in the `Backing` seam (unsizing
+            // coercion `Box<File>` -> `Box<dyn Backing>`). Tests swap
+            // `state.backing` for a fault-injecting mock to exercise
+            // the write retry / IOERR paths a real File rarely hits.
+            backing: Box::new(backing),
             ops_bucket,
             bytes_bucket,
             all_descs_scratch: Vec::with_capacity(VIRTIO_BLK_SEG_MAX as usize + 2),
@@ -1241,14 +1264,12 @@ impl VirtioBlk {
     /// scratch→guest) into one syscall reading directly into guest
     /// memory.
     ///
-    /// Mirrors the cloud-hypervisor `block::Request::execute_async`
-    /// vectored read path
-    /// (cloud-hypervisor/block/src/lib.rs `iovecs.push(...)` then
-    /// `read_vectored`): one iovec per `VolatileSlice` produced by
-    /// `mem.get_slices(addr, len)`. `get_slices` handles fragmentation
-    /// when a descriptor's `[addr, addr+len)` range spans a guest
-    /// memory region boundary — each contiguous host range becomes
-    /// its own iovec entry.
+    /// Mirrors cloud-hypervisor's `block::Request::execute_async`
+    /// vectored read path: one iovec per `VolatileSlice` produced by
+    /// `mem.get_slices(addr, len)`, then a single vectored read.
+    /// `get_slices` handles fragmentation when a descriptor's
+    /// `[addr, addr+len)` range spans a guest memory region boundary —
+    /// each contiguous host range becomes its own iovec entry.
     ///
     /// `data_len` and `sector` are pre-validated by the caller
     /// (`drain_bracket_impl`): SIZE_MAX, SEG_MAX, sub-sector,
@@ -1285,7 +1306,7 @@ impl VirtioBlk {
     /// can hold a concurrent mutable borrow of the queues vec.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn handle_read_vectored_impl(
-        backing: &File,
+        backing: &dyn Backing,
         capacity_bytes: u64,
         counters: &VirtioBlkCounters,
         mem: &GuestMemoryMmap,
@@ -1403,9 +1424,11 @@ impl VirtioBlk {
             // a `VolatileSlice` produced by `mem.get_slices(...)`
             // and the corresponding `PtrGuardMut` is alive in
             // `_guards` for the duration of this call, keeping the
-            // backing pointer valid). `backing.as_raw_fd()` borrows
-            // the `File` which the caller (`drain_bracket_impl`)
-            // owns for the duration of the drain.
+            // backing pointer valid) — this upholds the
+            // `Backing::preadv` precondition that each `iov_base` is
+            // valid for `iov_len` bytes across the call. The backing
+            // (`&dyn Backing`) is borrowed from the `BlkWorkerState`
+            // the caller (`drain_bracket_impl`) owns for the drain.
             //
             // `iovecs.len()` is structurally bounded at <= 256 — a
             // quarter of Linux's `IOV_MAX` (UIO_MAXIOV = 1024) — so
@@ -1438,21 +1461,53 @@ impl VirtioBlk {
             // (constructed in `with_options`) so it cannot exceed
             // `i64::MAX` for any realistic disk size and fits in
             // `off_t` losslessly.
-            let r = unsafe {
-                libc::preadv(
-                    backing.as_raw_fd(),
-                    iovecs.as_ptr(),
-                    iovecs.len() as libc::c_int,
-                    base_offset as libc::off_t,
-                )
-            };
-            if r < 0 {
-                let e = std::io::Error::last_os_error();
-                tracing::warn!(sector, %e, "virtio-blk preadv error");
-                counters.record_io_error();
-                return (VIRTIO_BLK_S_IOERR as u8, 1);
+            // Retry ONLY a signal-interrupted read (`Err(Interrupted)`,
+            // 0 bytes transferred). A short POSITIVE return is EOF for a
+            // regular file (a thin/truncated backing shorter than the
+            // advertised capacity) — NOT a signal — so it exits the loop
+            // and the short-read pad below zero-fills the `[n..data_len)`
+            // tail. This is asymmetric to the write path: a read returns
+            // at EOF, whereas a write must retry a short-positive to
+            // completion. (read(2): a catchable-signal interrupt with 0
+            // bytes yields `-EINTR` (Err); a partial-then-signal yields
+            // the positive count, indistinguishable from EOF and treated
+            // as EOF — retrying an at-EOF read would spin.)
+            // Divergence: firecracker errors a short read
+            // (`read_exact_volatile` → UnexpectedEof → S_IOERR); we
+            // zero-pad it as EOF — the more lenient regular-file-EOF
+            // choice, matching qemu's short-read `iov_memset` pad.
+            let mut eintr_retries: u32 = 0;
+            loop {
+                // SAFETY: each iovec base points at live guest memory
+                // held by `_guards` for this call; `iovecs.len()` is
+                // structurally <= IOV_MAX (see the bound derivation
+                // above).
+                match unsafe { backing.preadv(&iovecs, base_offset) } {
+                    Ok(n) => break n as u64,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                        // EINTR here is a pending FATAL signal (the read
+                        // waits TASK_KILLABLE; a fatal signal does not
+                        // clear), so re-issue is bounded to avoid
+                        // spinning a dying IO thread — see
+                        // MAX_EINTR_RETRIES.
+                        eintr_retries += 1;
+                        if eintr_retries > MAX_EINTR_RETRIES {
+                            tracing::warn!(
+                                sector,
+                                "virtio-blk preadv: EINTR retry cap hit (pending fatal signal?); failing"
+                            );
+                            counters.record_io_error();
+                            return (VIRTIO_BLK_S_IOERR as u8, 1);
+                        }
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::warn!(sector, %e, "virtio-blk preadv error");
+                        counters.record_io_error();
+                        return (VIRTIO_BLK_S_IOERR as u8, 1);
+                    }
+                }
             }
-            r as u64
         };
 
         // Short-read pad: zero-fill the unfilled `[n..data_len)`
@@ -1541,14 +1596,19 @@ impl VirtioBlk {
     /// would have `pwritev` read from a buffer the spec marked
     /// device-only-writable from the driver's perspective).
     ///
-    /// Short-write handling: `pwritev` may return `n < data_len`,
-    /// e.g. on ENOSPC mid-write or a hostile-FS short-write
-    /// signal. Both partial-write (`n < data_len`) and outright
-    /// error (`r < 0`) collapse to S_IOERR + an `io_errors` bump,
-    /// matching the per-segment behavior in
-    /// `Self::handle_write_impl` (which rejects on the first
-    /// `Ok(n)` where `n < seg.len`). The host backing-file
-    /// distress signal is preserved.
+    /// Short-write handling: `pwritev` may return `0 < n < data_len`
+    /// (e.g. ENOSPC mid-write or a signal-interrupted partial). A
+    /// short POSITIVE write is recoverable forward progress, so the
+    /// loop advances the iovecs past `n` and re-issues the remainder
+    /// until the full `data_len` lands — matching the kernel's
+    /// `generic_perform_write` copy loop. Only `Ok(0)` (zero forward
+    /// progress) or a hard `Err` is a genuine failure → S_IOERR + an
+    /// `io_errors` bump; `Err(Interrupted)` is retried up to
+    /// `MAX_EINTR_RETRIES`. This DIVERGES from the cfg(test)
+    /// per-segment `Self::handle_write_impl`, which rejects on the
+    /// first short `Ok(n)` — the single-shot reject was a
+    /// guest-data-integrity bug (a completable write failed the
+    /// guest's bio).
     ///
     /// Counter taxonomy is preserved exactly:
     /// - `record_write(total_written)`: bytes accepted by the
@@ -1560,7 +1620,7 @@ impl VirtioBlk {
     /// [`Self::handle_read_vectored_impl`].
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn handle_write_vectored_impl(
-        backing: &File,
+        backing: &dyn Backing,
         capacity_bytes: u64,
         counters: &VirtioBlkCounters,
         mem: &GuestMemoryMmap,
@@ -1660,43 +1720,95 @@ impl VirtioBlk {
             return (VIRTIO_BLK_S_OK as u8, 1);
         }
 
-        // SAFETY: identical to the preadv site above. iovecs is
-        // built from live `PtrGuard`s held in `_guards`; the
-        // backing fd is valid for the call (caller owns the File).
-        // `iovecs.len() <= 256 < IOV_MAX (1024)` by the same
-        // structural bound derived at the preadv SAFETY comment
-        // (SEG_MAX 128 * at most 2 region-straddles per <= 1 MiB
-        // segment over >= 1 MiB regions), so `pwritev` never sees
-        // `iovcnt > IOV_MAX`.
-        let r = unsafe {
-            libc::pwritev(
-                backing.as_raw_fd(),
-                iovecs.as_ptr(),
-                iovecs.len() as libc::c_int,
-                base_offset as libc::off_t,
-            )
-        };
-        if r < 0 {
-            let e = std::io::Error::last_os_error();
-            tracing::warn!(sector, %e, "virtio-blk pwritev error");
-            counters.record_io_error();
-            return (VIRTIO_BLK_S_IOERR as u8, 1);
-        }
-        let total_written = r as u64;
-        if total_written != data_len {
-            // Partial write (`n < data_len`): same failure semantic
-            // as `handle_write_impl`'s per-segment short-write arm.
-            // The guest's request was not fulfilled in full and
-            // there is no retry path inside the device — surface
-            // S_IOERR and let the guest's blk-mq layer decide.
-            tracing::warn!(
-                sector,
-                total_written,
-                data_len,
-                "virtio-blk pwritev short write"
+        // Retry-to-completion. A SHORT positive write (`0 < n <
+        // remaining`) is recoverable forward progress — `pwritev` may
+        // transfer fewer bytes than requested on ENOSPC mid-write or a
+        // signal-interrupted partial — so advance the iovecs past `n`
+        // and re-issue the remainder until the full `data_len` lands.
+        // Only `Ok(0)` (zero forward progress, e.g. immediate ENOSPC)
+        // or a hard `Err` is a genuine failure → S_IOERR. The prior
+        // single-pwritev returned S_IOERR on ANY short write, failing
+        // the guest's bio for a write the device could have completed —
+        // a guest-data-integrity bug. Asymmetric to the read path
+        // (short positive read = EOF).
+        //
+        // Reference behavior (matches + intentional divergences):
+        //   - kernel `generic_perform_write` (mm/filemap.c): MATCH —
+        //     the page-copy loop advances the iter and re-copies until
+        //     the byte count drains; a short write is recoverable
+        //     progress returned as a positive partial.
+        //   - firecracker `write_all_volatile` (vm-memory): MATCH —
+        //     loops `offset(n)` past each short write until the buffer
+        //     is empty; `Ok(0)` → WriteZero.
+        //   - qemu file-posix: also retries to completion, but via a
+        //     DIFFERENT mechanism — it abandons the vectored syscall on
+        //     a short return and linearizes into a bounce buffer
+        //     (`handle_aiocb_rw_linear` loops; returns EINVAL if a
+        //     write is still short). We advance the iovecs and re-issue
+        //     `pwritev` directly — same goal, no bounce-buffer copy.
+        //   - cloud-hypervisor and libkrun: a silent-truncation bug we
+        //     do NOT mirror — both accept a short positive write as
+        //     success (cloud-hypervisor's block completion handler
+        //     treats any `result >= 0` as S_OK with the partial byte
+        //     count as `used.len`; libkrun's `consume` runs the write
+        //     callback once, no retry), truncating the guest's write.
+        let mut remaining: &mut [libc::iovec] = &mut iovecs;
+        let mut off = base_offset;
+        let mut total_written: u64 = 0;
+        let mut eintr_retries: u32 = 0;
+        loop {
+            // SAFETY: each iovec base points at live guest memory held
+            // by `_guards` for this call (`_guards` outlives the loop);
+            // `remaining.len()` only shrinks from the
+            // structurally-bounded initial `iovecs.len()` (<= IOV_MAX),
+            // so iovcnt stays in range.
+            let n = match unsafe { backing.pwritev(remaining, off) } {
+                Ok(0) => {
+                    tracing::warn!(
+                        sector,
+                        total_written,
+                        data_len,
+                        "virtio-blk pwritev made zero forward progress; failing"
+                    );
+                    counters.record_io_error();
+                    return (VIRTIO_BLK_S_IOERR as u8, 1);
+                }
+                Ok(n) => n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                    // EINTR here is a pending FATAL signal (the write
+                    // path returns -EINTR under fatal_signal_pending; a
+                    // fatal signal does not clear), so bound the
+                    // re-issue to avoid spinning a dying IO thread and
+                    // delaying the freeze dump — see MAX_EINTR_RETRIES.
+                    eintr_retries += 1;
+                    if eintr_retries > MAX_EINTR_RETRIES {
+                        tracing::warn!(
+                            sector,
+                            "virtio-blk pwritev: EINTR retry cap hit (pending fatal signal?); failing"
+                        );
+                        counters.record_io_error();
+                        return (VIRTIO_BLK_S_IOERR as u8, 1);
+                    }
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!(sector, %e, "virtio-blk pwritev error");
+                    counters.record_io_error();
+                    return (VIRTIO_BLK_S_IOERR as u8, 1);
+                }
+            };
+            total_written += n as u64;
+            off += n as u64;
+            if total_written == data_len {
+                break;
+            }
+            // total_written < data_len ⇒ n < the remaining iovec bytes,
+            // so `advance_iovecs` returns a non-empty slice.
+            remaining = advance_iovecs(remaining, n);
+            debug_assert!(
+                !remaining.is_empty(),
+                "virtio-blk pwritev: iovecs exhausted at {total_written} of {data_len} bytes"
             );
-            counters.record_io_error();
-            return (VIRTIO_BLK_S_IOERR as u8, 1);
         }
         counters.record_write(total_written);
         // used_len: 1 (status byte only — write data is not

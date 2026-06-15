@@ -171,9 +171,7 @@ fn process_requests_full_write_chain() {
     // payload — proves the chain dispatched to handle_write_impl
     // and the pwrite landed.
     let mut readback = [0u8; 512];
-    f_for_verify
-        .read_at(&mut readback, 512)
-        .expect("read backing");
+    FileExt::read_at(&f_for_verify, &mut readback, 512).expect("read backing");
     assert!(
         readback.iter().all(|&b| b == 0xCD),
         "backing file at sector 1 must hold the 0xCD payload after write",
@@ -193,6 +191,369 @@ fn process_requests_full_write_chain() {
     assert_eq!(c.writes_completed.load(Ordering::Relaxed), 1);
     assert_eq!(c.bytes_written.load(Ordering::Relaxed), 512);
     assert_eq!(c.io_errors.load(Ordering::Relaxed), 0);
+}
+
+// ----------------------------------------------------------------
+// Fault-injecting Backing — covers the vectored-IO retry arms that a
+// real tmpfs File almost never triggers. A regular file's pwritev
+// returns the full count or a hard error; it does not short-write or
+// return EINTR on tmpfs. These mocks force those arms so the retry
+// loops in handle_write_vectored_impl / handle_read_vectored_impl
+// (the guest-data-integrity short-write fix and the EINTR bound) are
+// exercised through the real process_requests chain path.
+// ----------------------------------------------------------------
+
+/// A `Backing` wrapping a real `File` that injects vectored-IO faults.
+/// `cfg(test)` inline-engine use only (single-threaded), so the
+/// interior `Cell` fault counters need no synchronization.
+struct FaultBacking {
+    inner: File,
+    /// Number of `pwritev` calls that write only HALF the first iovec
+    /// (a genuine short positive return) before completing normally.
+    write_partials: std::cell::Cell<u32>,
+    /// `pwritev` always returns `Ok(0)` — zero forward progress.
+    write_zero: bool,
+    /// Number of `preadv` calls returning `Err(EINTR)` before
+    /// completing normally.
+    read_eintrs: std::cell::Cell<u32>,
+    /// `preadv`/`pwritev` always return `Err(EINTR)` — exercises the
+    /// `MAX_EINTR_RETRIES` cap.
+    eintr_forever: bool,
+}
+
+impl FaultBacking {
+    fn write_partial_then_complete(inner: File, partials: u32) -> Self {
+        Self {
+            inner,
+            write_partials: std::cell::Cell::new(partials),
+            write_zero: false,
+            read_eintrs: std::cell::Cell::new(0),
+            eintr_forever: false,
+        }
+    }
+    fn write_zero_progress(inner: File) -> Self {
+        Self {
+            inner,
+            write_partials: std::cell::Cell::new(0),
+            write_zero: true,
+            read_eintrs: std::cell::Cell::new(0),
+            eintr_forever: false,
+        }
+    }
+    fn read_eintr_then_complete(inner: File, eintrs: u32) -> Self {
+        Self {
+            inner,
+            write_partials: std::cell::Cell::new(0),
+            write_zero: false,
+            read_eintrs: std::cell::Cell::new(eintrs),
+            eintr_forever: false,
+        }
+    }
+    fn eintr_forever(inner: File) -> Self {
+        Self {
+            inner,
+            write_partials: std::cell::Cell::new(0),
+            write_zero: false,
+            read_eintrs: std::cell::Cell::new(0),
+            eintr_forever: true,
+        }
+    }
+}
+
+impl Backing for FaultBacking {
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+        Backing::read_at(&self.inner, buf, offset)
+    }
+    fn write_at(&self, buf: &[u8], offset: u64) -> std::io::Result<usize> {
+        Backing::write_at(&self.inner, buf, offset)
+    }
+    fn sync_data(&self) -> std::io::Result<()> {
+        Backing::sync_data(&self.inner)
+    }
+    unsafe fn preadv(&self, iovs: &[libc::iovec], offset: u64) -> std::io::Result<usize> {
+        if self.eintr_forever {
+            return Err(std::io::Error::from_raw_os_error(libc::EINTR));
+        }
+        if self.read_eintrs.get() > 0 {
+            self.read_eintrs.set(self.read_eintrs.get() - 1);
+            return Err(std::io::Error::from_raw_os_error(libc::EINTR));
+        }
+        // SAFETY: forwards the caller's iovec-validity precondition
+        // unchanged to the inner File's preadv.
+        unsafe { Backing::preadv(&self.inner, iovs, offset) }
+    }
+    unsafe fn pwritev(&self, iovs: &[libc::iovec], offset: u64) -> std::io::Result<usize> {
+        if self.eintr_forever {
+            return Err(std::io::Error::from_raw_os_error(libc::EINTR));
+        }
+        if self.write_zero {
+            return Ok(0);
+        }
+        if self.write_partials.get() > 0 && !iovs.is_empty() && iovs[0].iov_len > 1 {
+            self.write_partials.set(self.write_partials.get() - 1);
+            // Write only HALF the first iovec — a genuine short positive
+            // return that forces the retry loop to advance iov_base
+            // mid-iovec (the bug-prone advance_iovecs partial trim).
+            let first = iovs[0];
+            let partial = libc::iovec {
+                iov_base: first.iov_base,
+                iov_len: first.iov_len / 2,
+            };
+            // SAFETY: `partial` aliases the first caller iovec's base
+            // with a SHORTER length (half < iov_len), so it stays within
+            // the validated region; forwards the validity precondition.
+            return unsafe { Backing::pwritev(&self.inner, std::slice::from_ref(&partial), offset) };
+        }
+        // SAFETY: forwards the caller's validity precondition unchanged.
+        unsafe { Backing::pwritev(&self.inner, iovs, offset) }
+    }
+}
+
+/// A backing that short-writes the data segment once (writes half,
+/// returns a short positive count) must RETRY the remainder and land
+/// the FULL payload — not give up with IOERR. Pins the guest-data-
+/// integrity short-write retry-to-completion fix: a short positive
+/// `pwritev` is recoverable forward progress (the kernel's
+/// `generic_perform_write` copy loop likewise re-issues), so a
+/// half-completed write must finish, not corrupt the guest's data by
+/// reporting success with only half written.
+#[test]
+fn process_requests_write_chain_short_write_retries_to_completion() {
+    let cap = 4096u64;
+    let f = make_backed_file_with_pattern(cap, 0x00);
+    let f_for_verify = f.try_clone().expect("clone backing for verify");
+    let fault_inner = f.try_clone().expect("clone backing for fault mock");
+    let mut dev = VirtioBlk::new(f, cap, DiskThrottle::default());
+    // Inject the fault backing: one partial write, then complete.
+    dev.worker.state_mut().backing =
+        Box::new(FaultBacking::write_partial_then_complete(fault_inner, 1));
+    let mem = make_chain_test_mem();
+    let mock = MockSplitQueue::create(&mem, GuestAddress(0), 16);
+    let header_addr = GuestAddress(0x4000);
+    let data_addr = GuestAddress(0x5000);
+    let status_addr = GuestAddress(0x6000);
+    write_blk_header(&mem, header_addr, VIRTIO_BLK_T_OUT, 1);
+    let payload = vec![0xCDu8; 512];
+    mem.write_slice(&payload, data_addr).expect("plant payload");
+    let descs = [
+        RawDescriptor::from(SplitDescriptor::new(
+            header_addr.0,
+            VIRTIO_BLK_OUTHDR_SIZE as u32,
+            0,
+            0,
+        )),
+        RawDescriptor::from(SplitDescriptor::new(data_addr.0, 512, 0, 0)),
+        RawDescriptor::from(SplitDescriptor::new(
+            status_addr.0,
+            1,
+            VRING_DESC_F_WRITE as u16,
+            0,
+        )),
+    ];
+    mock.build_desc_chain(&descs).expect("build chain");
+    dev.set_mem(mem.clone());
+    wire_device_to_mock(&mut dev, &mock);
+    write_reg(&mut dev, VIRTIO_MMIO_QUEUE_NOTIFY, REQ_QUEUE as u32);
+
+    // The FULL 512-byte payload must have landed at sector 1 despite
+    // the mid-write short return.
+    let mut readback = [0u8; 512];
+    FileExt::read_at(&f_for_verify, &mut readback, 512).expect("read backing");
+    assert!(
+        readback.iter().all(|&b| b == 0xCD),
+        "full payload must land after a short-write retry, not a half-write",
+    );
+    let mut status_buf = [0u8; 1];
+    mem.read_slice(&mut status_buf, status_addr).unwrap();
+    assert_eq!(
+        status_buf[0], VIRTIO_BLK_S_OK as u8,
+        "short-then-complete write is S_OK",
+    );
+    let used_idx: u16 = mem
+        .read_obj(mock.used_addr().checked_add(2).unwrap())
+        .expect("read used.idx");
+    assert_eq!(used_idx, 1);
+    let c = dev.counters();
+    assert_eq!(c.writes_completed.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        c.bytes_written.load(Ordering::Relaxed),
+        512,
+        "bytes_written counts the full payload, not the partial first write",
+    );
+    assert_eq!(c.io_errors.load(Ordering::Relaxed), 0);
+}
+
+/// A backing whose `pwritev` makes ZERO forward progress (`Ok(0)`) is
+/// a genuine failure — the write handler must give up with S_IOERR
+/// rather than spin, bump `io_errors`, and NOT count a completion or
+/// any bytes. The (failed) completion is still published so the guest
+/// observes the IOERR status.
+#[test]
+fn process_requests_write_chain_zero_progress_is_ioerr() {
+    let cap = 4096u64;
+    let f = make_backed_file_with_pattern(cap, 0x00);
+    let fault_inner = f.try_clone().expect("clone backing for fault mock");
+    let mut dev = VirtioBlk::new(f, cap, DiskThrottle::default());
+    dev.worker.state_mut().backing = Box::new(FaultBacking::write_zero_progress(fault_inner));
+    let mem = make_chain_test_mem();
+    let mock = MockSplitQueue::create(&mem, GuestAddress(0), 16);
+    let header_addr = GuestAddress(0x4000);
+    let data_addr = GuestAddress(0x5000);
+    let status_addr = GuestAddress(0x6000);
+    write_blk_header(&mem, header_addr, VIRTIO_BLK_T_OUT, 1);
+    let payload = vec![0xCDu8; 512];
+    mem.write_slice(&payload, data_addr).expect("plant payload");
+    let descs = [
+        RawDescriptor::from(SplitDescriptor::new(
+            header_addr.0,
+            VIRTIO_BLK_OUTHDR_SIZE as u32,
+            0,
+            0,
+        )),
+        RawDescriptor::from(SplitDescriptor::new(data_addr.0, 512, 0, 0)),
+        RawDescriptor::from(SplitDescriptor::new(
+            status_addr.0,
+            1,
+            VRING_DESC_F_WRITE as u16,
+            0,
+        )),
+    ];
+    mock.build_desc_chain(&descs).expect("build chain");
+    dev.set_mem(mem.clone());
+    wire_device_to_mock(&mut dev, &mock);
+    write_reg(&mut dev, VIRTIO_MMIO_QUEUE_NOTIFY, REQ_QUEUE as u32);
+
+    let mut status_buf = [0u8; 1];
+    mem.read_slice(&mut status_buf, status_addr).unwrap();
+    assert_eq!(
+        status_buf[0], VIRTIO_BLK_S_IOERR as u8,
+        "zero-progress write is S_IOERR",
+    );
+    // The IOERR status byte wrote successfully, so add_used publishes
+    // the completion — the guest must see the failure.
+    let used_idx: u16 = mem
+        .read_obj(mock.used_addr().checked_add(2).unwrap())
+        .expect("read used.idx");
+    assert_eq!(used_idx, 1);
+    let c = dev.counters();
+    assert_eq!(c.io_errors.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        c.writes_completed.load(Ordering::Relaxed),
+        0,
+        "a failed write is not a completion",
+    );
+    assert_eq!(c.bytes_written.load(Ordering::Relaxed), 0);
+}
+
+/// A backing whose `preadv` returns EINTR twice before completing must
+/// RETRY (a catchable-signal interrupt yields `Err(Interrupted)` with
+/// zero transfer) and deliver the data — S_OK, not IOERR.
+#[test]
+fn process_requests_read_chain_eintr_retries_to_completion() {
+    let cap = 4096u64;
+    let f = make_backed_file_with_pattern(cap, 0xAB);
+    let fault_inner = f.try_clone().expect("clone backing for fault mock");
+    let mut dev = VirtioBlk::new(f, cap, DiskThrottle::default());
+    dev.worker.state_mut().backing =
+        Box::new(FaultBacking::read_eintr_then_complete(fault_inner, 2));
+    let mem = make_chain_test_mem();
+    let mock = MockSplitQueue::create(&mem, GuestAddress(0), 16);
+    let header_addr = GuestAddress(0x4000);
+    let data_addr = GuestAddress(0x5000);
+    let status_addr = GuestAddress(0x6000);
+    write_blk_header(&mem, header_addr, VIRTIO_BLK_T_IN, 0);
+    let descs = [
+        RawDescriptor::from(SplitDescriptor::new(
+            header_addr.0,
+            VIRTIO_BLK_OUTHDR_SIZE as u32,
+            0,
+            0,
+        )),
+        RawDescriptor::from(SplitDescriptor::new(
+            data_addr.0,
+            512,
+            VRING_DESC_F_WRITE as u16,
+            0,
+        )),
+        RawDescriptor::from(SplitDescriptor::new(
+            status_addr.0,
+            1,
+            VRING_DESC_F_WRITE as u16,
+            0,
+        )),
+    ];
+    mock.build_desc_chain(&descs).expect("build chain");
+    dev.set_mem(mem.clone());
+    wire_device_to_mock(&mut dev, &mock);
+    write_reg(&mut dev, VIRTIO_MMIO_QUEUE_NOTIFY, REQ_QUEUE as u32);
+
+    let mut data_buf = [0u8; 512];
+    mem.read_slice(&mut data_buf, data_addr).unwrap();
+    assert!(
+        data_buf.iter().all(|&b| b == 0xAB),
+        "data delivered after the EINTR retries",
+    );
+    let mut status_buf = [0u8; 1];
+    mem.read_slice(&mut status_buf, status_addr).unwrap();
+    assert_eq!(status_buf[0], VIRTIO_BLK_S_OK as u8);
+    let c = dev.counters();
+    assert_eq!(c.reads_completed.load(Ordering::Relaxed), 1);
+    assert_eq!(c.bytes_read.load(Ordering::Relaxed), 512);
+    assert_eq!(c.io_errors.load(Ordering::Relaxed), 0);
+}
+
+/// A backing whose `preadv` ALWAYS returns EINTR must give up with
+/// S_IOERR after `MAX_EINTR_RETRIES` — the bound prevents an unbounded
+/// spin when a pending FATAL signal keeps interrupting (a fatal signal
+/// does not clear, so re-issue would never succeed and a spinning IO
+/// thread would delay the freeze-rendezvous failure dump).
+#[test]
+fn process_requests_read_chain_eintr_forever_hits_retry_cap() {
+    let cap = 4096u64;
+    let f = make_backed_file_with_pattern(cap, 0xAB);
+    let fault_inner = f.try_clone().expect("clone backing for fault mock");
+    let mut dev = VirtioBlk::new(f, cap, DiskThrottle::default());
+    dev.worker.state_mut().backing = Box::new(FaultBacking::eintr_forever(fault_inner));
+    let mem = make_chain_test_mem();
+    let mock = MockSplitQueue::create(&mem, GuestAddress(0), 16);
+    let header_addr = GuestAddress(0x4000);
+    let data_addr = GuestAddress(0x5000);
+    let status_addr = GuestAddress(0x6000);
+    write_blk_header(&mem, header_addr, VIRTIO_BLK_T_IN, 0);
+    let descs = [
+        RawDescriptor::from(SplitDescriptor::new(
+            header_addr.0,
+            VIRTIO_BLK_OUTHDR_SIZE as u32,
+            0,
+            0,
+        )),
+        RawDescriptor::from(SplitDescriptor::new(
+            data_addr.0,
+            512,
+            VRING_DESC_F_WRITE as u16,
+            0,
+        )),
+        RawDescriptor::from(SplitDescriptor::new(
+            status_addr.0,
+            1,
+            VRING_DESC_F_WRITE as u16,
+            0,
+        )),
+    ];
+    mock.build_desc_chain(&descs).expect("build chain");
+    dev.set_mem(mem.clone());
+    wire_device_to_mock(&mut dev, &mock);
+    write_reg(&mut dev, VIRTIO_MMIO_QUEUE_NOTIFY, REQ_QUEUE as u32);
+
+    let mut status_buf = [0u8; 1];
+    mem.read_slice(&mut status_buf, status_addr).unwrap();
+    assert_eq!(
+        status_buf[0], VIRTIO_BLK_S_IOERR as u8,
+        "unbounded EINTR fails with S_IOERR after the retry cap",
+    );
+    let c = dev.counters();
+    assert_eq!(c.io_errors.load(Ordering::Relaxed), 1);
+    assert_eq!(c.reads_completed.load(Ordering::Relaxed), 0);
 }
 
 /// All-zero-length data segments on a T_OUT chain: the chain HAS
