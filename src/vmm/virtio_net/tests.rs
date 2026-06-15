@@ -13,6 +13,7 @@
 //! chain's bytes plus the device's counter state to verify both the
 //! header invariant and the byte-echo correctness.
 
+use super::counters::*;
 use super::device::*;
 use crate::vmm::net_config::NetConfig;
 

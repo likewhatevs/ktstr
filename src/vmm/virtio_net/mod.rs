@@ -82,6 +82,8 @@
 
 mod device;
 
+mod counters;
+
 #[cfg(test)]
 mod tests;
 
@@ -104,4 +106,9 @@ mod tests_proptest;
 // for those names only.
 #[allow(unused_imports)]
 pub(crate) use device::*;
-pub use device::{VIRTIO_MMIO_SIZE, VirtioNet, VirtioNetCounters, VirtioNetCountersSnapshot};
+// `counters` holds VirtioNetCounters + its snapshot, split out of device.rs;
+// device.rs and the cfg(test) sub-files reach them via `super::counters::…`.
+// The `pub use` below preserves the crate::vmm::virtio_net::VirtioNetCounters
+// path for upstream re-exports (vmm/mod.rs, lib.rs).
+pub use counters::{VirtioNetCounters, VirtioNetCountersSnapshot};
+pub use device::{VIRTIO_MMIO_SIZE, VirtioNet};
