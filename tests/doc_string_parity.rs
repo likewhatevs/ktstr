@@ -6,7 +6,7 @@
 
 const TROUBLESHOOTING_MD: &str = include_str!("../doc/guide/src/troubleshooting.md");
 
-const RUST_INIT_RS: &str = include_str!("../src/vmm/rust_init.rs");
+const TOPOLOGY_RS: &str = include_str!("../src/vmm/rust_init/topology.rs");
 
 /// The troubleshooting.md "send_sys_rdy timeout" section documents
 /// the WARN emitted by `send_sys_rdy_with_retry` when the budget
@@ -18,17 +18,17 @@ fn troubleshooting_send_sys_rdy_doc_matches_emit_fmt() {
     // Source-side: the WARN must contain the message text and the
     // published docs URL.
     assert!(
-        RUST_INIT_RS.contains("send_sys_rdy failed within boot budget"),
-        "src/vmm/rust_init.rs must emit a WARN containing \
+        TOPOLOGY_RS.contains("send_sys_rdy failed within boot budget"),
+        "src/vmm/rust_init/topology.rs must emit a WARN containing \
          `send_sys_rdy failed within boot budget`; if you rewrote \
          the WARN, update doc/guide/src/troubleshooting.md and this \
          test in the same change",
     );
     assert!(
-        RUST_INIT_RS.contains(
+        TOPOLOGY_RS.contains(
             "https://likewhatevs.github.io/ktstr/guide/troubleshooting.html#send_sys_rdy-timeout"
         ),
-        "src/vmm/rust_init.rs must emit the published docs URL \
+        "src/vmm/rust_init/topology.rs must emit the published docs URL \
          `https://likewhatevs.github.io/ktstr/guide/troubleshooting.html#send_sys_rdy-timeout`; \
          a repo-source path is not clickable from a VM dmesg",
     );
@@ -45,8 +45,8 @@ fn troubleshooting_send_sys_rdy_doc_matches_emit_fmt() {
         "vcpus",
     ] {
         assert!(
-            RUST_INIT_RS.contains(field),
-            "src/vmm/rust_init.rs must emit the `{field}` structured \
+            TOPOLOGY_RS.contains(field),
+            "src/vmm/rust_init/topology.rs must emit the `{field}` structured \
              field in the send_sys_rdy WARN; troubleshooting.md \
              documents it",
         );
