@@ -224,7 +224,10 @@ mod tests_proptest;
 mod tests_atomics;
 
 #[cfg(test)]
-mod tests_drain;
+mod tests_drain_chain;
+
+#[cfg(test)]
+mod tests_drain_throttle;
 
 #[cfg(test)]
 mod tests_drain_validation;
