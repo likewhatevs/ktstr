@@ -2026,8 +2026,16 @@ mod tests {
 
     #[test]
     fn srat_memory_split_remainder() {
-        // 257 MiB / 3 nodes: NumaMemoryLayout divides MiB first.
-        // per_node_mib = 257/3 = 85, last = 257 - 85*2 = 87.
+        // 257 MiB / 3 nodes, snapped to 2 MiB hugepages by
+        // NumaMemoryLayout: KVM installs a 2 MiB EPT entry only when a
+        // node slot's base/end GPA are 2 MiB-congruent, so the split is
+        // hugepage-aligned rather than dividing raw MiB (see
+        // hugepage_even_split_mib). total_hp = 257/2 = 128; base =
+        // 128/3 = 42 hp/node; extra = 128 % 3 = 2, so the first two
+        // nodes get 43 hp (86 MiB) and the last node gets 42 hp plus
+        // the 1 MiB sub-hugepage tail (85 MiB). The first nodes absorb
+        // the extra hugepages; the last node absorbs the sub-2 MiB
+        // remainder, so the last node is SMALLER than the others.
         let memory_mib = 257u32;
         let mem = test_mem(memory_mib);
         let topo = Topology {
@@ -2039,10 +2047,8 @@ mod tests {
             distances: None,
         };
         let mem_bytes = (memory_mib as u64) << 20;
-        let per_node_mib = memory_mib / 3;
-        let per_node = (per_node_mib as u64) << 20;
-        let last = (memory_mib - per_node_mib * 2) as u64;
-        let last_bytes = last << 20;
+        let first_two = 86u64 << 20; // 43 hugepages each
+        let last_bytes = 85u64 << 20; // 42 hugepages + 1 MiB tail
         let l = test_setup(&mem, &topo, memory_mib);
         let srat = read_table(&mem, l.srat_addr);
         let entries = walk_srat_entries(&srat);
@@ -2053,8 +2059,8 @@ mod tests {
             let length = u64::from_le_bytes(data[16..24].try_into().unwrap());
             if i < 2 {
                 assert_eq!(
-                    length, per_node,
-                    "node {i}: expected {per_node}, got {length}"
+                    length, first_two,
+                    "node {i}: expected {first_two}, got {length}"
                 );
             } else {
                 assert_eq!(
@@ -2062,8 +2068,10 @@ mod tests {
                     "last node: expected {last_bytes}, got {length}"
                 );
                 assert!(
-                    length > per_node,
-                    "last node should be larger due to remainder"
+                    length < first_two,
+                    "last node should be smaller — it absorbs the \
+                     sub-2 MiB tail while the first nodes get the extra \
+                     hugepages"
                 );
             }
             total += length;
