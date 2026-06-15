@@ -1149,7 +1149,6 @@ mod reloc;
 #[allow(unused_imports)]
 pub(crate) use reloc::*;
 
-/// Merge `from` into `into`. Coalesces conflicting `(source, offset)`
 /// Find a section by exact name. Returns the section index, or `None`
 /// if no section matches. Uses `shdr_strtab.get_at` directly to avoid
 /// pulling section data when only the index is needed.

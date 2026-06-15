@@ -45,8 +45,8 @@ pub(crate) type PerCpuHashEntries = Vec<(Vec<u8>, Vec<Option<Vec<u8>>>)>;
 /// [`AccessorCtx::iter_max`]. A corrupted `next` pointer that forms a
 /// cycle is bounded here so a hash-bucket or local-storage walk can't
 /// spin the freeze hot path until the rendezvous timeout. Shared by
-/// the bucket walker [`htab::walk_htab`] and the local-storage walker
-/// [`local_storage::iter_local_storage_entries`].
+/// the bucket walker `htab::walk_htab` and the local-storage walker
+/// `local_storage::iter_local_storage_entries`.
 pub(crate) const MAP_WALK_ITER_MAX: usize = 1_000_000;
 
 /// Maximum chain entries a walker materializes into its result `Vec`

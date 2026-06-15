@@ -12522,9 +12522,8 @@ impl KtstrVm {
                 Err(_) => return Vec::new(),
             };
         // Trait method — `BpfProgAccessor::struct_ops_progs` is in
-        // scope at the call site via the `use monitor::bpf_prog::*`
-        // glob (see top of file); calling it on the concrete type
-        // dispatches statically.
+        // scope via the local `use monitor::bpf_prog::BpfProgAccessor`
+        // below; calling it on the concrete type dispatches statically.
         use monitor::bpf_prog::BpfProgAccessor;
         accessor.struct_ops_progs()
     }

@@ -8,7 +8,7 @@
 //! binary.
 //!
 //! Fixtures are byte arrays built in-test with the
-//! [`Elf64Builder`] helper — minimal ELF64 little-endian, only
+//! `build_elf64` helper — minimal ELF64 little-endian, only
 //! the fields the cast loader inspects (section headers, the
 //! shstrtab, `.bpf.objs`, `.BTF`, `.BTF.ext`, `SHF_EXECINSTR`
 //! PROGBITS sections, and an optional `.symtab`/`.strtab`
