@@ -1,0 +1,318 @@
+use super::*;
+use crate::sync::MutexExt;
+
+// ─── SYNTHETIC-TOPOLOGY OFFSET CONVENTION ────────────────────
+//
+// Tests in this module that touch real `/tmp/ktstr-llc-*.lock`
+// files choose LLC indices in the 90000..=99999 range to avoid
+// collision with any real host's LLC count (modern server
+// sockets top out around 1024 LLCs). Per-test offsets are
+// subdivided by 100:
+//   90000-90999: acquire_resource_locks / per-CPU path tests
+//   91000-91999: acquire_cpu_locks tests
+//   92000-92999: reserved
+//   93000-93999: acquire_llc_plan (none-cap, EX-peer, SH-peer)
+//                — each sub-test picks its own sub-range
+//                (93000-93099, 93100-93199, …) so leaked state
+//                from a panicking prior test doesn't cross-
+//                contaminate.
+//   94000-94099: acquire_llc_plan cross-node spill (mems union
+//                invariant, I1).
+//   94100-99999: reserved for future LLC-level tests.
+// Tests that build a HostTopology in memory but do NOT touch
+// real /tmp paths use small indices (0, 1, 2, …) because no
+// cross-process collision is possible.
+//
+// When adding a new test that flocks under /tmp, pick an
+// unused 100-entry sub-range in 90000-99999 and document the
+// claim in a comment at the test site so the next author
+// doesn't accidentally re-use it.
+// ─────────────────────────────────────────────────────────────
+
+/// Collect the distinct host NUMA node IDs the given CPUs belong
+/// to. Tests that assert "these N CPUs all live on one NUMA node"
+/// (or span two) route through this helper so the CPU → node
+/// lookup and the single-CPU default stay in one place rather
+/// than duplicating the same closure across every assertion
+/// site.
+fn numa_nodes_for_cpus(topo: &HostTopology, cpus: &[usize]) -> std::collections::BTreeSet<usize> {
+    cpus.iter()
+        .map(|c| topo.cpu_to_node.get(c).copied().unwrap_or(0))
+        .collect()
+}
+
+// -- synthetic topology mapping tests --
+
+/// Backwards-compat helper: builds a synthetic HostTopology from
+/// LLC-group CPU lists, assigning each group to a NUMA node equal
+/// to its positional index (LLC 0 → node 0, LLC 1 → node 1, …).
+/// Delegates to [`HostTopology::new_for_tests`].
+///
+/// Kept as a thin wrapper so the many existing call sites that
+/// pass only CPU lists (no explicit NUMA info) don't have to
+/// thread node ids through their parameter lists.
+fn synthetic_topo(groups: Vec<Vec<usize>>) -> HostTopology {
+    let tagged: Vec<(Vec<usize>, usize)> = groups
+        .into_iter()
+        .enumerate()
+        .map(|(node, cpus)| (cpus, node))
+        .collect();
+    HostTopology::new_for_tests(&tagged)
+}
+
+// -- NUMA-aware pinning tests --
+
+/// Backwards-compat helper: builds a synthetic HostTopology from
+/// `(numa_node, cpu_list)` pairs. Delegates to
+/// [`HostTopology::new_for_tests`], flipping the tuple order to
+/// `(cpus, node)` so the underlying constructor presents a
+/// consistent `(cpus, node)` shape to callers that build pairs
+/// directly.
+fn synthetic_topo_numa(groups: Vec<(usize, Vec<usize>)>) -> HostTopology {
+    let tagged: Vec<(Vec<usize>, usize)> = groups
+        .into_iter()
+        .map(|(node, cpus)| (cpus, node))
+        .collect();
+    HostTopology::new_for_tests(&tagged)
+}
+
+/// RAII guard for a per-test LLC lockfile path prefix. Installs
+/// a `{tempdir}/llc-` prefix into [`LLC_LOCK_PREFIX_OVERRIDE`]
+/// on construction and unsets it on Drop. Two parallel tests
+/// using this guard each get their own tempdir, so their
+/// `acquire_llc_plan` lockfiles can't collide. Eliminates the
+/// 90K+ empty `LlcGroup` padding that earlier tests used to
+/// sidestep collision with real host LLC indices.
+///
+/// Uses [`tempfile::TempDir`] so cleanup runs via RAII on panic
+/// — a panicking test can't leak `/tmp` lockfiles into other
+/// test runs.
+struct LlcLockPrefixGuard {
+    _dir: tempfile::TempDir,
+}
+
+impl LlcLockPrefixGuard {
+    fn new() -> Self {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let prefix = format!("{}/llc-", dir.path().display());
+        LLC_LOCK_PREFIX_OVERRIDE.with(|p| *p.borrow_mut() = Some(prefix));
+        LlcLockPrefixGuard { _dir: dir }
+    }
+}
+
+impl Drop for LlcLockPrefixGuard {
+    fn drop(&mut self) {
+        LLC_LOCK_PREFIX_OVERRIDE.with(|p| *p.borrow_mut() = None);
+    }
+}
+
+/// RAII guard for a per-test CPU lockfile path prefix. Mirrors
+/// [`LlcLockPrefixGuard`] for the CPU-lock side of the
+/// `acquire_resource_locks` path. See that struct's doc for the
+/// per-test-tempdir + panic-safe-cleanup rationale.
+struct CpuLockPrefixGuard {
+    _dir: tempfile::TempDir,
+}
+
+impl CpuLockPrefixGuard {
+    fn new() -> Self {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let prefix = format!("{}/cpu-", dir.path().display());
+        CPU_LOCK_PREFIX_OVERRIDE.with(|p| *p.borrow_mut() = Some(prefix));
+        CpuLockPrefixGuard { _dir: dir }
+    }
+}
+
+impl Drop for CpuLockPrefixGuard {
+    fn drop(&mut self) {
+        CPU_LOCK_PREFIX_OVERRIDE.with(|p| *p.borrow_mut() = None);
+    }
+}
+
+/// RAII bundle that installs BOTH [`LlcLockPrefixGuard`] AND
+/// [`CpuLockPrefixGuard`] in one call. Used by any test that hits
+/// both LLC and CPU lockfile families — `acquire_resource_locks`
+/// (LLC + per-CPU), `acquire_cpu_locks` (CPU + the LLC shared lock
+/// from `acquire_llc_shared_locks`), or any future helper that
+/// composes the two. Each test gets its own per-tempdir prefix for
+/// both lockfile families, so cross-run / cross-process
+/// collisions on `/tmp/ktstr-llc-*.lock` and `/tmp/ktstr-cpu-*.lock`
+/// cannot occur. When in doubt about which guard to pick, default
+/// to this bundle — over-provisioning a tempdir is cheap and is
+/// always safe; under-provisioning leaks production-path test
+/// collisions.
+struct LockPrefixesGuard {
+    _cpu: CpuLockPrefixGuard,
+    _llc: LlcLockPrefixGuard,
+}
+
+impl LockPrefixesGuard {
+    fn new() -> Self {
+        LockPrefixesGuard {
+            _cpu: CpuLockPrefixGuard::new(),
+            _llc: LlcLockPrefixGuard::new(),
+        }
+    }
+}
+
+/// RAII guard for a per-test override of
+/// [`host_allowed_cpus`]'s return value via
+/// [`ALLOWED_CPUS_OVERRIDE`]. Lets tests pin the 30%-default and
+/// allowed-cpu filtering math to a known input regardless of
+/// what the CI runner's real sched_getaffinity returns. Unset on
+/// Drop so a panicking test cannot leak state across the suite.
+struct AllowedCpusGuard;
+
+impl AllowedCpusGuard {
+    fn new(cpus: Vec<usize>) -> Self {
+        ALLOWED_CPUS_OVERRIDE.with(|p| *p.borrow_mut() = Some(cpus));
+        AllowedCpusGuard
+    }
+}
+
+impl Drop for AllowedCpusGuard {
+    fn drop(&mut self) {
+        ALLOWED_CPUS_OVERRIDE.with(|p| *p.borrow_mut() = None);
+    }
+}
+
+/// Destructure a `LockOutcome::Acquired { llc_offset, locks }` or
+/// panic with a stable diagnostic on `Unavailable`. `ctx` is an
+/// optional site-specific clause that the panic message inlines
+/// after "expected Acquired" with a single leading space:
+/// `None` produces `"expected Acquired, got Unavailable: ..."`,
+/// `Some("in cargo-test mode")` produces
+/// `"expected Acquired in cargo-test mode, got Unavailable: ..."`.
+/// The helper owns the space-prefix so callers cannot accidentally
+/// produce `"expected Acquiredfoo"` by forgetting it.
+///
+/// See [`expect_unavailable`] for tests that expect the
+/// `Unavailable` branch instead.
+fn unwrap_acquired(outcome: LockOutcome, ctx: Option<&str>) -> (usize, Vec<std::os::fd::OwnedFd>) {
+    match outcome {
+        LockOutcome::Acquired { llc_offset, locks } => (llc_offset, locks),
+        LockOutcome::Unavailable(reason) => {
+            let suffix = ctx.map(|c| format!(" {c}")).unwrap_or_default();
+            panic!("expected Acquired{suffix}, got Unavailable: {reason}")
+        }
+    }
+}
+
+/// Destructure a `LockOutcome::Unavailable(reason)` for tests that
+/// EXPECT the unavailable branch and assert on the reason string.
+/// Panics on `Acquired`. `ctx` follows the same convention as
+/// [`unwrap_acquired`]: `None` produces
+/// `"expected Unavailable, got Acquired"`,
+/// `Some("while lock is held")` produces
+/// `"expected Unavailable while lock is held, got Acquired"`.
+fn expect_unavailable(outcome: LockOutcome, ctx: Option<&str>) -> String {
+    match outcome {
+        LockOutcome::Unavailable(reason) => reason,
+        LockOutcome::Acquired { .. } => {
+            let suffix = ctx.map(|c| format!(" {c}")).unwrap_or_default();
+            panic!("expected Unavailable{suffix}, got Acquired")
+        }
+    }
+}
+
+// ---------------------------------------------------------------
+// CpuCap — construction, env resolution, acquire-time bounding
+// ---------------------------------------------------------------
+
+/// Serialize KTSTR_CPU_CAP env-var mutation across test threads.
+/// std::env::set_var is process-wide (unsafe in edition 2024);
+/// parallel tests would race if each mutated the same variable
+/// without coordination. Every env-touching test below takes
+/// this mutex for the duration of the test body.
+fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+    use std::sync::{Mutex, OnceLock};
+    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    // `lock().unwrap()` would panic on poison from an earlier
+    // panicking test, cascading failures. Recover by taking the
+    // inner guard — the test that panicked already failed; the
+    // current test's env cleanup still runs.
+    ENV_LOCK.get_or_init(|| Mutex::new(())).lock_unpoisoned()
+}
+
+/// RAII guard for scoped `std::env::set_var` mutation inside a
+/// test. On construction sets the variable to `value`; on Drop
+/// removes it regardless of whether the test body panicked or
+/// returned early. Pairs with [`env_lock`] — callers take the
+/// mutex first, then mint the guard, so two env-touching tests
+/// never observe each other's intermediate state.
+///
+/// Replaces the bare `unsafe { set_var(..) } ... unsafe {
+/// remove_var(..) }` pairs that appeared in every env-set test:
+/// an early return or panic between the set and the remove used
+/// to leak the env var into subsequent tests serialized on the
+/// same mutex. `Drop` closes that leak.
+struct EnvGuard {
+    name: &'static str,
+}
+
+impl EnvGuard {
+    /// Set `name=value` under the assumed-held `env_lock` mutex.
+    /// The caller must have taken `env_lock()` before calling
+    /// this constructor — `EnvGuard` does NOT take the mutex
+    /// itself because some tests need to interleave multiple
+    /// guards (e.g. set, read, remove, re-set) within a single
+    /// lock scope.
+    fn set(name: &'static str, value: &str) -> Self {
+        // SAFETY: caller holds the env_lock mutex; edition 2024
+        // set_var is unsafe-marked because it races with reads
+        // from other threads, but the mutex serializes every
+        // env-touching test so no other test is reading
+        // concurrently.
+        unsafe {
+            std::env::set_var(name, value);
+        }
+        EnvGuard { name }
+    }
+
+    /// Remove `name` under the assumed-held `env_lock` mutex.
+    /// Symmetric helper for tests that want to start from a
+    /// known-unset state without first creating a set-and-drop
+    /// guard.
+    fn remove(name: &'static str) -> Self {
+        // SAFETY: caller holds the env_lock mutex; see set().
+        unsafe {
+            std::env::remove_var(name);
+        }
+        EnvGuard { name }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        // SAFETY: guard lifetime is bounded by env_lock held by
+        // the test that constructed it. Drop runs before the
+        // mutex guard is released, so the remove_var happens
+        // under the same mutex as the matching set_var.
+        unsafe {
+            std::env::remove_var(self.name);
+        }
+    }
+}
+
+// ---------------------------------------------------------------
+// NUMA primitives — host_llcs_by_numa_node / with_capacity /
+// sorted_by_distance
+// ---------------------------------------------------------------
+
+/// Backwards-compat helper: forwards to
+/// [`HostTopology::new_for_tests`]. Kept so existing tests that
+/// reference `synth_host_topo` don't need to be renamed in lock-
+/// step with the consolidation — the single authoritative
+/// constructor is `new_for_tests`, this and
+/// [`synthetic_topo`] / [`synthetic_topo_numa`] are thin adapters
+/// over it.
+fn synth_host_topo(groups: &[(Vec<usize>, usize)]) -> HostTopology {
+    HostTopology::new_for_tests(groups)
+}
+
+// Test groups extracted from the original flat tests.rs; the helper fns
+// and RAII scaffolding structs above stay here so every group reaches
+// them as a child module via `use super::*`.
+mod pinning;
+mod locking;
+mod planning;
