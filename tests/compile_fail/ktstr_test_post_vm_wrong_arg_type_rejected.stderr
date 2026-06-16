@@ -18,4 +18,7 @@ help: the type constructed contains `for<'a> fn(&'a str) -> Result<(), anyhow::E
    |                                           this argument influences the type of `Some`
 note: tuple variant defined here
   --> $RUST/core/src/option.rs
+   |
+   |     Some(#[stable(feature = "rust1", since = "1.0.0")] T),
+   |     ^^^^
    = note: this error originates in the attribute macro `ktstr_test` (in Nightly builds, run with -Z macro-backtrace for more info)
