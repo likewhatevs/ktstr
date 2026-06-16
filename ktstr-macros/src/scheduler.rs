@@ -943,7 +943,7 @@ pub(crate) fn validate_exactly_one_source(
 
 /// Validate a single `kernel_builtin_enable` or `kernel_builtin_disable`
 /// command string against the grammar accepted by the guest
-/// interpreter at `src/vmm/rust_init.rs`'s `exec_shell_line`. Anything
+/// interpreter at `src/vmm/rust_init/dump.rs`'s `exec_shell_line`. Anything
 /// else (`>>`, pipes, `;`, variable expansion, sysctl -w, etc.) silently
 /// no-ops at runtime, so the macro rejects up-front. Accepted shapes:
 ///
@@ -994,7 +994,7 @@ fn validate_kernel_builtin_cmd(elem: &syn::Expr, cmd: &str, slot: &str) -> syn::
                      `{cmd}` is missing the ` > ` (space-greater-space) \
                      redirect — the guest interpreter requires \
                      `echo VALUE > /path` with literal spaces around \
-                     `>` (`exec_shell_line` in `src/vmm/rust_init.rs` \
+                     `>` (`exec_shell_line` in `src/vmm/rust_init/dump.rs` \
                      uses `split_once(\" > \")`)."
                 ),
             ));

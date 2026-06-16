@@ -110,7 +110,7 @@ pub struct VmResult {
     pub kvm_stats: Option<KvmStatsTotals>,
     /// Crash message extracted from COM2 output via
     /// `crate::test_support::extract_panic_message`. The guest
-    /// panic hook in `rust_init.rs` writes `PANIC: <info>\n<bt>\n`
+    /// panic hook in `rust_init/init.rs` writes `PANIC: <info>\n<bt>\n`
     /// to `/dev/ttyS1` synchronously inside `KVM_RUN`, so the host
     /// captures the full backtrace in `output` even when the guest
     /// is wedged. `None` when no `PANIC:`-prefixed line was seen.

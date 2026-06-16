@@ -159,7 +159,7 @@ static BULK_PORT_FD: std::sync::OnceLock<std::sync::Mutex<Option<std::fs::File>>
 /// any subsequent open of the same port. A write-only open would
 /// block a later read-only open needed by `request_snapshot`'s
 /// reply reader. The port-2 stats relay already uses O_RDWR
-/// (rust_init.rs `start_sched_stats_relay`).
+/// (rust_init/relay.rs `start_sched_stats_relay`).
 fn try_open_bulk_port() -> Option<std::fs::File> {
     std::fs::OpenOptions::new()
         .read(true)

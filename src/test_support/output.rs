@@ -28,7 +28,7 @@
 //! - [`extract_kernel_version`] reads the `Linux version X.Y.Z ...`
 //!   line from boot output.
 //! - [`extract_panic_message`] pulls the guest's `PANIC:` line (the
-//!   Rust panic hook in `rust_init.rs` still writes these to COM2
+//!   Rust panic hook in `rust_init/init.rs` still writes these to COM2
 //!   because the panic hook cannot block on virtio backpressure;
 //!   every other guest stream now travels over the bulk port).
 //! - [`classify_init_stage`] walks the bucketed lifecycle phase
@@ -329,7 +329,7 @@ pub(crate) fn extract_kernel_version(console: &str) -> Option<String> {
 /// Extract the panic message from guest COM2 output.
 ///
 /// Looks for a line whose trimmed form starts with `PANIC:` (the
-/// prefix the guest panic hook in `rust_init.rs` writes verbatim).
+/// prefix the guest panic hook in `rust_init/init.rs` writes verbatim).
 /// Returns the text after the prefix with leading whitespace
 /// trimmed; returns `None` when no panic line is present.
 ///
@@ -339,7 +339,7 @@ pub(crate) fn extract_kernel_version(console: &str) -> Option<String> {
 /// happened to mention the literal text "PANIC:" inside an info
 /// message ("expected PANIC: from this test") would be
 /// misclassified as the panic line. Guest panic-hook output is
-/// always emitted at the start of a line in `rust_init.rs`, so
+/// always emitted at the start of a line in `rust_init/init.rs`, so
 /// the prefix anchor is always satisfied for genuine panics.
 pub(crate) fn extract_panic_message(output: &str) -> Option<&str> {
     output
@@ -1594,7 +1594,7 @@ ktstr-5678 [002] 0.500: sched_ext_dump: scheduler[2] unrelated event from cpu 2
         // SchedulerDied / SchedulerNotAttached without a preceding
         // PayloadStarting frame mean init ran but the workload was
         // never entered — the scheduler-setup phase failed before
-        // PayloadStarting could fire (rust_init.rs force_reboot
+        // PayloadStarting could fire (rust_init/process.rs force_reboot
         // paths at the SchedulerDied / SchedulerNotAttached arms
         // never reach the workload-launch site). The stage is
         // STAGE_INIT_STARTED_NO_PAYLOAD, not the deeper
@@ -1670,7 +1670,7 @@ ktstr-5678 [002] 0.500: sched_ext_dump: scheduler[2] unrelated event from cpu 2
     }
 
     /// Mid-line `PANIC:` occurrences must NOT match. The guest's
-    /// panic hook in `rust_init.rs` always emits the prefix at the
+    /// panic hook in `rust_init/init.rs` always emits the prefix at the
     /// start of a line; a console log that incidentally contains
     /// the literal `PANIC:` somewhere inside a longer info message
     /// must not be misclassified as the panic. The previous
@@ -1687,7 +1687,7 @@ ktstr-5678 [002] 0.500: sched_ext_dump: scheduler[2] unrelated event from cpu 2
     }
 
     /// Whitespace-prefixed panic lines DO match — the guest panic
-    /// hook is anchored at column 0 in `rust_init.rs`, but COM2
+    /// hook is anchored at column 0 in `rust_init/init.rs`, but COM2
     /// transports can insert framing whitespace; the trim before
     /// `strip_prefix` keeps matching robust against that.
     #[test]

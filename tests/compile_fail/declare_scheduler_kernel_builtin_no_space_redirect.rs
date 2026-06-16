@@ -1,5 +1,5 @@
 // Macro must match guest interpreter exactly. `exec_shell_line` at
-// src/vmm/rust_init.rs uses `split_once(" > ")` (literal space-
+// src/vmm/rust_init/dump.rs uses `split_once(" > ")` (literal space-
 // greater-space substring). `echo 1>/path` (no spaces around `>`)
 // passes a permissive split but the runtime silently no-ops it.
 // Macro rejects at expand time to prevent that runtime mismatch.

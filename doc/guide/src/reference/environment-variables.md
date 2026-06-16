@@ -116,7 +116,7 @@ configuration; listed here for debugging.
 | `KTSTR_COLS` | Host terminal column count, used to size the guest pty when available. |
 | `KTSTR_ROWS` | Host terminal row count, used to size the guest pty when available. |
 | `KTSTR_GUEST_INIT` | Process-internal marker set by the guest init (`ktstr-init`) via `std::env::set_var` — NOT a host-emitted cmdline token. Read via `std::env::var_os` by `src/workload/spawn` to detect re-entrant worker spawns under PID-1 init. |
-| `KTSTR_DISK0_FS` / `KTSTR_DISK0_MOUNT` / `KTSTR_DISK0_RO` | Disk-attach metadata (fs type, mount point, ro flag) emitted by `src/vmm/setup.rs` when `#[ktstr_test(disk = ...)]` is set and consumed by `src/vmm/rust_init.rs` to mount the virtio-blk backing inside the guest. |
+| `KTSTR_DISK0_FS` / `KTSTR_DISK0_MOUNT` / `KTSTR_DISK0_RO` | Disk-attach metadata (fs type, mount point, ro flag) emitted by `src/vmm/setup.rs` when `#[ktstr_test(disk = ...)]` is set and consumed by `src/vmm/rust_init/mounts.rs` to mount the virtio-blk backing inside the guest. |
 
 Guest↔host signaling uses bulk-port TLV frames on the virtio-console
 port-1 channel — `MSG_TYPE_TEST_RESULT` (test verdict),

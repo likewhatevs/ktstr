@@ -176,7 +176,7 @@ pub(crate) enum CellParentCgroupArg<'a> {
 /// non-trivial, and contains no `..` components that would normalize
 /// back to (or escape) `/sys/fs/cgroup`.
 ///
-/// The downstream consumer at `vmm/rust_init.rs::create_per_test_cgroup`
+/// The downstream consumer at `vmm/rust_init/mounts.rs::create_cgroup_from_file`
 /// concatenates the value to `/sys/fs/cgroup` and mkdirs the result.
 /// A value like `/foo/..` produces `/sys/fs/cgroup/foo/..` which the
 /// kernel canonicalizes back to `/sys/fs/cgroup` — corrupting the host
@@ -204,7 +204,7 @@ pub(crate) enum CellParentCgroupArg<'a> {
 ///
 /// Both validation arms (host-side fail-fast in
 /// `runtime::append_base_sched_args`, guest-side defense in
-/// `vmm/rust_init.rs::create_per_test_cgroup`) share this predicate
+/// `vmm/rust_init/mounts.rs::create_cgroup_from_file`) share this predicate
 /// so the host gate and the guest-side defense-in-depth stay aligned.
 pub(crate) fn cell_parent_path_is_valid(path: &str) -> bool {
     if !path.starts_with('/') {

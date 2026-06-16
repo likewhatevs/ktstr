@@ -12269,7 +12269,7 @@ impl KtstrVm {
         }
 
         // Extract crash message from COM2 output. The guest panic
-        // hook in `rust_init.rs` writes `PANIC: <info>\n<bt>\n` to
+        // hook in `rust_init/init.rs` writes `PANIC: <info>\n<bt>\n` to
         // `/dev/ttyS1`; the host-side parser
         // [`crate::test_support::extract_panic_message`] strips the
         // prefix and returns the trimmed remainder.
