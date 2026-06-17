@@ -4,7 +4,9 @@
 //! tests pin the exact message templates so operators grepping
 //! stderr can keep stable anchors, and the numeric formatting
 //! (step N of M, `{:.1}s`). The structural detection path —
-//! matching on `DetailKind::SchedulerDied` — is exercised in
+//! matching on the scheduler-liveness `DetailKind` variants
+//! (`SchedulerCrashed` / `SchedulerExitedCleanly` /
+//! `SchedulerDiedUnknownReason`) — is exercised in
 //! `crate::test_support::eval` tests directly; the message format is kept stable
 //! here purely as a human-readable contract.
 

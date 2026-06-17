@@ -1872,10 +1872,12 @@ fn evaluate_vm_result(
             } else {
                 String::new()
             };
-            // Structural filter for the console-dump gate: match on
-            // `DetailKind::SchedulerDied` only. Every scheduler-exit
-            // emit site in this crate tags its `AssertDetail` with
-            // that variant (see the ops.rs / scenario/mod.rs call
+            // Structural filter for the console-dump gate: match on the
+            // three scheduler-liveness `DetailKind` variants
+            // (`SchedulerCrashed` / `SchedulerExitedCleanly` /
+            // `SchedulerDiedUnknownReason`) below. Every scheduler-exit
+            // emit site in this crate tags its `AssertDetail` with one
+            // of those variants (see the ops.rs / scenario/mod.rs call
             // sites plus the `format_sched_died_*` helpers in
             // `assert.rs`), so filtering by kind is sufficient — the
             // prior `is_scheduler_death()` prefix-match fallback was
