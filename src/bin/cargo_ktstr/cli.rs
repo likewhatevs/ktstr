@@ -81,8 +81,23 @@ pub(crate) enum KtstrCommand {
         /// skipped because release sets `panic = "abort"` (see
         /// `Cargo.toml [profile.release]`). Tests gated on
         /// `#[cfg(debug_assertions)]` also skip.
+        ///
+        /// `--release` builds BOTH the harness/test binary AND the
+        /// scheduler-under-test release; use `--release-scheduler` to
+        /// build only the scheduler release while keeping the harness on
+        /// the dev profile.
         #[arg(long)]
         release: bool,
+        /// Build the scheduler-under-test (a `SchedulerSpec::Discover`
+        /// package) with the release profile while keeping the
+        /// harness/test binary on its current (dev) profile. Decouples
+        /// the scheduler's optimization from the harness's assertion
+        /// thresholds + `panic`/`catch_unwind` behavior — the right
+        /// setting for a perf test that wants an optimized scheduler but
+        /// normal harness behavior. Implied by `--release` (which builds
+        /// everything release); sets `KTSTR_SCHEDULER_PROFILE=release`.
+        #[arg(long)]
+        release_scheduler: bool,
         /// Arguments passed through to cargo nextest run.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
@@ -118,6 +133,12 @@ pub(crate) enum KtstrCommand {
         /// skipped because release sets `panic = "abort"`.
         #[arg(long)]
         release: bool,
+        /// Build the scheduler-under-test release while keeping the
+        /// harness on the dev profile (see `cargo ktstr test
+        /// --release-scheduler`). Implied by `--release`; sets
+        /// `KTSTR_SCHEDULER_PROFILE=release`.
+        #[arg(long)]
+        release_scheduler: bool,
         /// Arguments passed through to cargo llvm-cov nextest.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,

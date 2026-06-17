@@ -114,6 +114,7 @@ fn assert_passthrough_args(subcommand: &str, passthrough: &[&str]) {
             no_perf_mode,
             no_skip_mode,
             release,
+            release_scheduler,
             args,
         } => {
             assert!(
@@ -131,6 +132,10 @@ fn assert_passthrough_args(subcommand: &str, passthrough: &[&str]) {
             assert!(
                 !release,
                 "bare `--` passthrough must not spuriously set --release",
+            );
+            assert!(
+                !release_scheduler,
+                "bare `--` passthrough must not spuriously set --release-scheduler",
             );
             assert_eq!(args, expected);
         }
@@ -139,6 +144,7 @@ fn assert_passthrough_args(subcommand: &str, passthrough: &[&str]) {
             no_perf_mode,
             no_skip_mode,
             release,
+            release_scheduler,
             args,
         } => {
             assert!(
@@ -156,6 +162,10 @@ fn assert_passthrough_args(subcommand: &str, passthrough: &[&str]) {
             assert!(
                 !release,
                 "bare `--` passthrough must not spuriously set --release",
+            );
+            assert!(
+                !release_scheduler,
+                "bare `--` passthrough must not spuriously set --release-scheduler",
             );
             assert_eq!(args, expected);
         }
@@ -241,6 +251,36 @@ fn parse_test_with_release_flag() {
     assert!(release, "`--release` must set `release=true`");
 }
 
+/// `--release-scheduler` on `test` parses to `KtstrCommand::Test {
+/// release_scheduler: true, .. }` so `run_test` exports
+/// `KTSTR_SCHEDULER_PROFILE=release` (building the scheduler-under-test
+/// release while the harness stays on the dev profile). It is
+/// INDEPENDENT of `--release` — passing only `--release-scheduler` must
+/// leave `release=false` so the harness/test binary stays dev.
+#[test]
+fn parse_test_with_release_scheduler_flag() {
+    let Cargo {
+        command: CargoSub::Ktstr(k),
+    } = Cargo::try_parse_from(["cargo", "ktstr", "test", "--release-scheduler"])
+        .unwrap_or_else(|e| panic!("{e}"));
+    let KtstrCommand::Test {
+        release,
+        release_scheduler,
+        ..
+    } = k.command
+    else {
+        panic!("expected Test");
+    };
+    assert!(
+        release_scheduler,
+        "`--release-scheduler` must set release_scheduler=true"
+    );
+    assert!(
+        !release,
+        "`--release-scheduler` alone must NOT set --release (the harness stays dev)"
+    );
+}
+
 /// Pin `trailing_var_arg` args forwarded verbatim after `--`.
 #[test]
 fn parse_test_with_passthrough_args() {
@@ -300,6 +340,7 @@ fn parse_nextest_alias_with_kernel_and_no_perf_mode() {
         no_perf_mode,
         no_skip_mode,
         release,
+        release_scheduler,
         args,
     } = k.command
     else {
@@ -309,6 +350,10 @@ fn parse_nextest_alias_with_kernel_and_no_perf_mode() {
     assert!(no_perf_mode);
     assert!(!no_skip_mode);
     assert!(!release, "bare invocation must default --release to false");
+    assert!(
+        !release_scheduler,
+        "bare invocation must default --release-scheduler to false"
+    );
     assert!(args.is_empty());
 }
 
@@ -342,6 +387,30 @@ fn parse_coverage_with_release_flag() {
         panic!("expected Coverage");
     };
     assert!(release, "`--release` must set `release=true`");
+}
+
+/// `--release-scheduler` on `coverage` parses independently of
+/// `--release` (mirrors `parse_test_with_release_scheduler_flag` for
+/// the Coverage variant — both flags are settable on both subcommands).
+#[test]
+fn parse_coverage_with_release_scheduler_flag() {
+    let Cargo {
+        command: CargoSub::Ktstr(k),
+    } = Cargo::try_parse_from(["cargo", "ktstr", "coverage", "--release-scheduler"])
+        .unwrap_or_else(|e| panic!("{e}"));
+    let KtstrCommand::Coverage {
+        release,
+        release_scheduler,
+        ..
+    } = k.command
+    else {
+        panic!("expected Coverage");
+    };
+    assert!(
+        release_scheduler,
+        "`--release-scheduler` must set release_scheduler=true on coverage"
+    );
+    assert!(!release, "`--release-scheduler` alone must NOT set --release");
 }
 
 /// Pin `trailing_var_arg` args forwarded verbatim after `--`.
@@ -379,6 +448,7 @@ fn parse_coverage_with_kernel_and_no_perf_mode() {
         no_perf_mode,
         no_skip_mode,
         release,
+        release_scheduler,
         args,
     } = k.command
     else {
@@ -388,6 +458,10 @@ fn parse_coverage_with_kernel_and_no_perf_mode() {
     assert!(no_perf_mode);
     assert!(!no_skip_mode);
     assert!(!release, "bare invocation must default --release to false");
+    assert!(
+        !release_scheduler,
+        "bare invocation must default --release-scheduler to false"
+    );
     assert_eq!(args, vec!["--workspace"]);
 }
 
