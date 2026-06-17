@@ -65,6 +65,30 @@ fn periodic_fires_with_explicit_cell_parent_cgroup(
         hold: HoldSpec::FULL,
     }];
     let mut result = execute_steps(ctx, steps)?;
+    // Telemetry-decoupled-from-assertions symptom pin: this scenario
+    // configures NO worker check (execute_steps passes none), yet 64 workers
+    // ran. Per-cgroup telemetry is pure measurement and MUST populate
+    // regardless of whether any worker-check assertion was requested.
+    // Pre-fix collect_handles gated stats.cgroups population behind
+    // checks.has_worker_checks(), so this came back [] despite the workload
+    // running — the empty-cgroups symptom. This is NOT
+    // --cell-parent-specific; the cell-parent layout is incidental here.
+    anyhow::ensure!(
+        !result.stats.cgroups.is_empty(),
+        "per-cgroup telemetry empty (stats.cgroups == []) with no worker \
+         check configured, despite 64 workers running — telemetry must not be \
+         gated behind assertions",
+    );
+    anyhow::ensure!(
+        result.stats.cgroups.iter().any(|c| c.num_workers > 0),
+        "a populated cgroup must report a non-zero worker count; got {:?}",
+        result
+            .stats
+            .cgroups
+            .iter()
+            .map(|c| c.num_workers)
+            .collect::<Vec<_>>(),
+    );
     result.note(
         "6s workload with --cell-parent-cgroup explicit + workload_root_cgroup match + 64 workers",
     );

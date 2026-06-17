@@ -1857,6 +1857,11 @@ fn evaluate_vm_result(
                 .map(|r| format!("\n\n--- auto-repro ---\n{r}"))
                 .unwrap_or_default();
             let timeline_section = build_timeline_section();
+            // Per-cgroup telemetry is now built unconditionally per
+            // declared cgroup (collect_handles no longer gates it behind
+            // has_worker_checks), so an empty `cgroups` here means NO
+            // cgroup was declared (e.g. a host_only run), not "no worker
+            // check was configured" — suppress the section in that case.
             let stats_section = if !check_result.stats.cgroups.is_empty() {
                 let s = &check_result.stats;
                 let mut lines = vec![format!(

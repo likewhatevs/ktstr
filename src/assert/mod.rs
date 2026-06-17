@@ -3655,59 +3655,59 @@ impl AssertPlan {
         cpuset: Option<&BTreeSet<usize>>,
         numa_nodes: Option<&BTreeSet<usize>>,
     ) -> AssertResult {
+        // Per-cgroup TELEMETRY is built unconditionally — it is pure
+        // measurement and must not be gated behind whether any worker
+        // check is configured (see [`cgroup_stats`]). The opt-in checks
+        // below only append fail/inconclusive outcomes onto `r`.
+        let cg = cgroup_stats(reports);
         let mut r = AssertResult::pass();
+        r.stats = scenario_stats_for_cgroup(&cg);
+
+        // `not_starved`: default-threshold fairness (Starved / Unfair /
+        // Stuck) on top of the telemetry already built above.
         if self.not_starved {
-            let mut cgroup_result = assert_not_starved(reports);
-            // Apply custom spread threshold if set.
-            if let Some(spread_limit) = self.max_spread_pct {
-                // Re-check spread against custom threshold. The default
-                // assert_not_starved uses spread_threshold_pct(); clear
-                // those failures and re-evaluate.
-                // Strip the default-threshold Unfair Fail outcomes
-                // before re-evaluating against the caller's limit.
-                cgroup_result
-                    .outcomes
-                    .retain(|o| !matches!(o, Outcome::Fail(d) if d.kind == DetailKind::Unfair));
-                if let Some(cg) = cgroup_result.stats.cgroups.first()
-                    && cg.spread > spread_limit
-                    && cg.num_workers >= 2
-                {
-                    cgroup_result.record_fail(AssertDetail::new(
-                        DetailKind::Unfair,
+            record_default_fairness(&mut r, &cg, reports);
+        }
+        // Custom spread threshold — independent of `not_starved` (it gates
+        // on its own field). Strip any default-threshold Unfair outcome
+        // (present only when `not_starved` also ran) before re-evaluating
+        // against the caller's limit.
+        if let Some(spread_limit) = self.max_spread_pct {
+            r.outcomes
+                .retain(|o| !matches!(o, Outcome::Fail(d) if d.kind == DetailKind::Unfair));
+            // `num_workers >= 2` matches the pre-decouple custom-spread
+            // path. It is equivalent to the default path's
+            // `measurable >= 2` gate here: a non-zero `spread` requires at
+            // least two workers with measurable wall time (fewer collapses
+            // min==max -> spread==0), so the `spread > limit` guard already
+            // implies >= 2 measurable.
+            if cg.spread > spread_limit && cg.num_workers >= 2 {
+                r.record_fail(AssertDetail::new(
+                    DetailKind::Unfair,
+                    format!(
+                        "unfair cgroup: spread={:.0}% ({:.0}-{:.0}%) {} workers on {} cpus (threshold {:.0}%)",
+                        cg.spread, cg.min_off_cpu_pct, cg.max_off_cpu_pct,
+                        cg.num_workers, cg.num_cpus, spread_limit
+                    ),
+                ));
+            }
+        }
+        // Custom gap threshold — independent of `not_starved`. Strip any
+        // default-threshold Stuck outcome before re-evaluating.
+        if let Some(threshold) = self.max_gap_ms {
+            r.outcomes
+                .retain(|o| !matches!(o, Outcome::Fail(d) if d.kind == DetailKind::Stuck));
+            for w in reports {
+                if w.max_gap_ms > threshold {
+                    r.record_fail(AssertDetail::new(
+                        DetailKind::Stuck,
                         format!(
-                            "unfair cgroup: spread={:.0}% ({:.0}-{:.0}%) {} workers on {} cpus (threshold {:.0}%)",
-                            cg.spread, cg.min_off_cpu_pct, cg.max_off_cpu_pct,
-                            cg.num_workers, cg.num_cpus, spread_limit
+                            "tid {} stuck {}ms on cpu{} at +{}ms (threshold {}ms)",
+                            w.tid, w.max_gap_ms, w.max_gap_cpu, w.max_gap_at_ms, threshold,
                         ),
                     ));
                 }
-                // Else: no new Unfair failure; remaining Starved/Stuck
-                // Fail outcomes (if any) already encode the verdict
-                // via `outcomes`. No re-derive needed — outcomes are
-                // the single source of truth, so there is no `passed`
-                // flag to keep in sync with `details`.
             }
-            // Apply custom gap threshold if set.
-            if let Some(threshold) = self.max_gap_ms {
-                // Re-check gaps against custom threshold. Strip the
-                // default-threshold Stuck Fail outcomes before
-                // re-evaluating against the caller's limit.
-                cgroup_result
-                    .outcomes
-                    .retain(|o| !matches!(o, Outcome::Fail(d) if d.kind == DetailKind::Stuck));
-                for w in reports {
-                    if w.max_gap_ms > threshold {
-                        cgroup_result.record_fail(AssertDetail::new(
-                            DetailKind::Stuck,
-                            format!(
-                                "tid {} stuck {}ms on cpu{} at +{}ms (threshold {}ms)",
-                                w.tid, w.max_gap_ms, w.max_gap_cpu, w.max_gap_at_ms, threshold,
-                            ),
-                        ));
-                    }
-                }
-            }
-            r.merge(cgroup_result);
         }
         if self.isolation
             && let Some(cs) = cpuset
@@ -4007,6 +4007,11 @@ impl AssertPlan {
 
     fn max_gap_ms(mut self, ms: u64) -> Self {
         self.max_gap_ms = Some(ms);
+        self
+    }
+
+    fn max_spread_pct(mut self, pct: f64) -> Self {
+        self.max_spread_pct = Some(pct);
         self
     }
 }
@@ -4486,7 +4491,12 @@ impl Assert {
         self
     }
 
-    /// True when any worker-level check field is `Some`.
+    /// True when any worker-level check field is `Some`. A pure query on
+    /// the configured checks — it no longer gates per-cgroup telemetry
+    /// (telemetry is built unconditionally per handle in
+    /// [`crate::scenario`]'s collect path; worker-check assertions are the
+    /// only opt-in part). Retained as public API for callers composing an
+    /// `Assert` who need to know whether any worker check is set.
     pub const fn has_worker_checks(&self) -> bool {
         self.not_starved.is_some()
             || self.isolation.is_some()
@@ -4989,32 +4999,6 @@ pub fn assert_isolation(reports: &[WorkerReport], expected: &BTreeSet<usize>) ->
     r
 }
 
-/// Check one cgroup's workers. Returns per-cgroup stats.
-///
-/// ```
-/// # use ktstr::assert::assert_not_starved;
-/// # use ktstr::workload::WorkerReport;
-/// # let report = WorkerReport {
-/// #     tid: 1, cpus_used: [0].into_iter().collect(),
-/// #     work_units: 100, cpu_time_ns: 1_000_000, wall_time_ns: 5_000_000_000,
-/// #     off_cpu_ns: 500_000_000, migration_count: 0, migrations: vec![],
-/// #     max_gap_ms: 50, max_gap_cpu: 0, max_gap_at_ms: 1000,
-/// #     wake_latencies_ns: vec![], wake_sample_total: 0,
-/// #     iteration_costs_ns: vec![], iteration_cost_sample_total: 0,
-/// #     iterations: 0,
-/// #     schedstat_run_delay_ns: 0, schedstat_run_count: 0,
-/// #     schedstat_cpu_time_ns: 0,
-/// #     completed: true,
-/// #     numa_pages: std::collections::BTreeMap::new(),
-/// #     vmstat_numa_pages_migrated: 0,
-/// #     exit_info: None,
-/// #     is_messenger: false,
-/// #     ..Default::default()
-/// # };
-/// let r = assert_not_starved(&[report]);
-/// assert!(r.is_pass());
-/// assert_eq!(r.stats.total_workers, 1);
-/// ```
 /// Nearest-rank percentile of a sorted slice (`p` in `[0.0, 1.0]`).
 ///
 /// Returns the value at index `ceil(n * p) - 1`, clamped into
@@ -5051,29 +5035,25 @@ fn percentile(sorted: &[u64], p: f64) -> u64 {
     sorted[idx]
 }
 
-pub fn assert_not_starved(reports: &[WorkerReport]) -> AssertResult {
-    let mut r = AssertResult::pass();
-    if reports.is_empty() {
-        return r;
-    }
-
+/// Build per-cgroup telemetry (pure measurement, no assertions) from
+/// worker reports. This is the SINGLE telemetry builder on the assertion
+/// path: `AssertPlan::assert_cgroup` calls it unconditionally and
+/// [`assert_not_starved`] wraps it with the default fairness checks, so
+/// per-cgroup [`CgroupStats`] is never gated behind whether a worker-check
+/// assertion was configured. Empty `reports` yield a `num_workers == 0`
+/// `CgroupStats` (the reduces below collapse to 0.0/0), so a declared
+/// cgroup that collected no reports surfaces as a zero-worker entry rather
+/// than silently vanishing from [`ScenarioStats::cgroups`].
+pub fn cgroup_stats(reports: &[WorkerReport]) -> CgroupStats {
     let cpus: BTreeSet<usize> = reports
         .iter()
         .flat_map(|w| w.cpus_used.iter().copied())
         .collect();
-    let mut pcts: Vec<f64> = Vec::new();
-
-    for w in reports {
-        if w.work_units == 0 {
-            r.record_fail(AssertDetail::new(
-                DetailKind::Starved,
-                format!("tid {} starved (0 work units)", w.tid),
-            ));
-        }
-        if w.wall_time_ns > 0 {
-            pcts.push(w.off_cpu_ns as f64 / w.wall_time_ns as f64 * 100.0);
-        }
-    }
+    let pcts: Vec<f64> = reports
+        .iter()
+        .filter(|w| w.wall_time_ns > 0)
+        .map(|w| w.off_cpu_ns as f64 / w.wall_time_ns as f64 * 100.0)
+        .collect();
 
     let min = pcts.iter().cloned().reduce(f64::min).unwrap_or(0.0);
     let max = pcts.iter().cloned().reduce(f64::max).unwrap_or(0.0);
@@ -5144,7 +5124,7 @@ pub fn assert_not_starved(reports: &[WorkerReport]) -> AssertResult {
         0.0
     };
 
-    let cg = CgroupStats {
+    CgroupStats {
         num_workers: reports.len(),
         num_cpus: cpus.len(),
         avg_off_cpu_pct: avg,
@@ -5164,33 +5144,79 @@ pub fn assert_not_starved(reports: &[WorkerReport]) -> AssertResult {
         page_locality: 0.0,
         cross_node_migration_ratio: 0.0,
         ext_metrics: BTreeMap::new(),
-    };
+    }
+}
 
-    // Per-cgroup fairness: spread above threshold means unequal scheduling within a cgroup.
-    // Threshold is appended to the message so the detail carries the exact bound the
-    // observed spread crossed, matching the AssertPlan custom-spread path's format
-    // and giving the operator the gate value without re-grepping `show-thresholds`.
+/// Roll a single cgroup's [`CgroupStats`] up into a one-cgroup
+/// [`ScenarioStats`]. The `worst_*` fields carry this cgroup's values;
+/// [`AssertResult::merge`] folds them across cgroups (max for the
+/// higher-is-worse fields, lowest-non-zero for the 0.0-sentinel fields).
+/// `cgroups` carries exactly this one entry so merge appends one per
+/// handle without double-counting.
+fn scenario_stats_for_cgroup(cg: &CgroupStats) -> ScenarioStats {
+    ScenarioStats {
+        total_workers: cg.num_workers,
+        total_cpus: cg.num_cpus,
+        total_migrations: cg.total_migrations,
+        worst_spread: cg.spread,
+        worst_gap_ms: cg.max_gap_ms,
+        worst_gap_cpu: cg.max_gap_cpu,
+        worst_migration_ratio: cg.migration_ratio,
+        worst_p99_wake_latency_us: cg.p99_wake_latency_us,
+        worst_median_wake_latency_us: cg.median_wake_latency_us,
+        worst_wake_latency_cv: cg.wake_latency_cv,
+        total_iterations: cg.total_iterations,
+        worst_mean_run_delay_us: cg.mean_run_delay_us,
+        worst_run_delay_us: cg.worst_run_delay_us,
+        worst_page_locality: 0.0,
+        worst_cross_node_migration_ratio: 0.0,
+        worst_wake_latency_tail_ratio: cg.wake_latency_tail_ratio(),
+        // `iterations_per_worker()` returns the per-worker throughput for
+        // this cgroup. The merge fold treats 0.0 as the unreported
+        // sentinel — the accumulator pattern
+        // `AssertResult::pass().merge(real)` starts at 0.0 from `Default`,
+        // so any positive reading from a real measurement must override
+        // the sentinel rather than be masked by a plain min.
+        worst_iterations_per_worker: cg.iterations_per_worker(),
+        ext_metrics: cg.ext_metrics.clone(),
+        cgroups: vec![cg.clone()],
+        phases: Vec::new(),
+    }
+}
+
+/// Record the DEFAULT fairness outcomes (Starved / Unfair / Stuck) for one
+/// cgroup against the framework default thresholds
+/// ([`spread_threshold_pct`] / [`gap_threshold_ms`]). Telemetry is built
+/// separately by [`cgroup_stats`]; this only appends fail outcomes, so it
+/// is shared by [`assert_not_starved`] and the `not_starved` arm of
+/// [`AssertPlan::assert_cgroup`] without rebuilding stats.
+fn record_default_fairness(r: &mut AssertResult, cg: &CgroupStats, reports: &[WorkerReport]) {
+    for w in reports {
+        if w.work_units == 0 {
+            r.record_fail(AssertDetail::new(
+                DetailKind::Starved,
+                format!("tid {} starved (0 work units)", w.tid),
+            ));
+        }
+    }
+    // Off-cpu spread above the default threshold, gated on >=2 workers
+    // with measurable wall time (the historical `pcts.len() >= 2`).
+    let measurable = reports.iter().filter(|w| w.wall_time_ns > 0).count();
     let spread_limit = spread_threshold_pct();
-    if spread > spread_limit && pcts.len() >= 2 {
+    if cg.spread > spread_limit && measurable >= 2 {
         r.record_fail(AssertDetail::new(
             DetailKind::Unfair,
             format!(
                 "unfair cgroup: spread={:.0}% ({:.0}-{:.0}%) {} workers on {} cpus (threshold {:.0}%)",
-                spread,
-                min,
-                max,
-                reports.len(),
-                cpus.len(),
+                cg.spread,
+                cg.min_off_cpu_pct,
+                cg.max_off_cpu_pct,
+                cg.num_workers,
+                cg.num_cpus,
                 spread_limit,
             ),
         ));
     }
-
-    // Scheduling gap: >threshold = dispatch failure. The tid is included so an
-    // operator triaging a multi-worker cgroup can identify the affected worker
-    // without cross-referencing CPU placement; matches the `tid X starved` /
-    // `tid X ran on unexpected CPUs` shape used by the sibling diagnostics.
-    // Threshold is appended for parity with the AssertPlan custom-gap path.
     let gap_limit = gap_threshold_ms();
     for w in reports {
         if w.max_gap_ms > gap_limit {
@@ -5203,38 +5229,19 @@ pub fn assert_not_starved(reports: &[WorkerReport]) -> AssertResult {
             ));
         }
     }
+}
 
-    // Store this cgroup's stats - merge accumulates cgroups
-    r.stats = ScenarioStats {
-        total_workers: reports.len(),
-        total_cpus: cpus.len(),
-        total_migrations: reports.iter().map(|w| w.migration_count).sum(),
-        worst_spread: spread,
-        worst_gap_ms: gap_ms,
-        worst_gap_cpu: gap_cpu,
-        worst_migration_ratio: cg.migration_ratio,
-        worst_p99_wake_latency_us: cg.p99_wake_latency_us,
-        worst_median_wake_latency_us: cg.median_wake_latency_us,
-        worst_wake_latency_cv: cg.wake_latency_cv,
-        total_iterations: cg.total_iterations,
-        worst_mean_run_delay_us: cg.mean_run_delay_us,
-        worst_run_delay_us: cg.worst_run_delay_us,
-        worst_page_locality: 0.0,
-        worst_cross_node_migration_ratio: 0.0,
-        worst_wake_latency_tail_ratio: cg.wake_latency_tail_ratio(),
-        // `iterations_per_worker()` returns the per-worker
-        // throughput for this cgroup. The merge fold treats 0.0
-        // as the unreported sentinel — the accumulator pattern
-        // `AssertResult::pass().merge(real)` starts at 0.0 from
-        // `Default`, so any positive reading from a real
-        // measurement must override the sentinel rather than be
-        // masked by a plain min.
-        worst_iterations_per_worker: cg.iterations_per_worker(),
-        ext_metrics: cg.ext_metrics.clone(),
-        cgroups: vec![cg],
-        phases: Vec::new(),
-    };
-
+/// Default fairness check for one cgroup's worker reports: builds the
+/// per-cgroup telemetry ([`cgroup_stats`]) and records Starved / Unfair /
+/// Stuck against the framework default thresholds. Telemetry is ALWAYS
+/// populated — including a `num_workers == 0` entry for empty reports — so
+/// `r.stats.cgroups` is never empty for a declared cgroup, independent of
+/// whether any fail outcome fired.
+pub fn assert_not_starved(reports: &[WorkerReport]) -> AssertResult {
+    let cg = cgroup_stats(reports);
+    let mut r = AssertResult::pass();
+    record_default_fairness(&mut r, &cg, reports);
+    r.stats = scenario_stats_for_cgroup(&cg);
     r
 }
 

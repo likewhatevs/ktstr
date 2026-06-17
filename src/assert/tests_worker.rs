@@ -540,3 +540,32 @@ fn neg_plan_custom_gap_passes_below_threshold() {
         .any(|d| matches!(d.kind, DetailKind::Stuck));
     assert!(!has_stuck, "1000ms gap should pass 5000ms threshold");
 }
+
+#[test]
+fn not_starved_empty_reports_surface_zero_worker_cgroup() {
+    // no-silent-drop: a declared cgroup that collected zero reports
+    // must surface as a num_workers=0 telemetry entry, not vanish. Pre-fix
+    // assert_not_starved early-returned empty stats on reports.is_empty().
+    let r = assert_not_starved(&[]);
+    assert!(r.is_pass(), "no workers -> no fairness fail");
+    assert_eq!(
+        r.stats.cgroups.len(),
+        1,
+        "empty-reports cgroup must surface a zero-worker entry, not be dropped",
+    );
+    assert_eq!(r.stats.cgroups[0].num_workers, 0);
+    assert_eq!(r.stats.total_workers, 0);
+}
+
+#[test]
+fn not_starved_no_double_count() {
+    // assert_not_starved builds telemetry via the shared `cgroup_stats`
+    // builder exactly once — a regression re-introducing a second build
+    // site would yield two cgroup entries for one call.
+    let r = assert_not_starved(&[
+        rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 50),
+        rpt(2, 1000, 5e9 as u64, 6e8 as u64, &[1], 60),
+    ]);
+    assert_eq!(r.stats.cgroups.len(), 1, "exactly one cgroup entry per call");
+    assert_eq!(r.stats.total_workers, 2);
+}
