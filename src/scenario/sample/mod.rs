@@ -563,6 +563,56 @@ mod tests {
     }
 
     #[test]
+    fn bpf_member_names_union_not_blinded_by_placeholder_first_sample() {
+        // Sample 0 is a placeholder (no maps); sample 1 carries the bss
+        // struct. member_names must discover the struct's fields by unioning
+        // across samples, not return empty because sample 0 lacked the map
+        // (which would silently blind a blanket u64_fields/f64_fields
+        // projection).
+        let drained = vec![
+            (
+                "periodic_000".to_string(),
+                crate::monitor::dump::FailureDumpReport::default(),
+                None,
+                Some(100),
+            ),
+            ("periodic_001".to_string(), synthetic_report(10), None, Some(200)),
+        ];
+        let series = SampleSeries::from_drained(drained, None);
+        let names = series.bpf_map("scx_obj.bss").member_names();
+        assert!(
+            names.contains(&"nr_dispatched".to_string()),
+            "must discover nr_dispatched from sample 1 despite placeholder sample 0; got {names:?}",
+        );
+        assert!(
+            names.contains(&"stall".to_string()),
+            "must discover stall from sample 1; got {names:?}",
+        );
+    }
+
+    #[test]
+    fn stats_key_names_union_not_blinded_by_errored_first_sample() {
+        // Sample 0 has no stats (Err); sample 1 carries the scx_stats
+        // object. key_names must union across samples so the object's keys
+        // are discoverable, not empty because sample 0's stats was Err.
+        let drained = vec![
+            ("periodic_000".to_string(), synthetic_report(10), None, Some(100)),
+            (
+                "periodic_001".to_string(),
+                synthetic_report(20),
+                Some(synthetic_stats(60.0)),
+                Some(200),
+            ),
+        ];
+        let series = SampleSeries::from_drained(drained, None);
+        let names = series.stats_path("").key_names();
+        assert!(
+            names.contains(&"busy".to_string()),
+            "must discover the scx_stats keys from sample 1 despite sample 0 having no stats; got {names:?}",
+        );
+    }
+
+    #[test]
     fn periodic_only_filters_non_periodic_tags() {
         let drained = vec![
             (

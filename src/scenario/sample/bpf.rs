@@ -424,32 +424,43 @@ impl<'a> BpfMapProjector<'a> {
         })
     }
 
-    /// Discover the struct member names of the map's first
-    /// rendered value. Empty when the map is missing in sample 0
-    /// or its value is not a struct. Useful for tests that want
-    /// to enumerate every scalar field for a blanket assertion.
+    /// Discover the struct member names of the map's rendered value,
+    /// unioned across ALL samples (first-seen order, deduplicated).
+    /// Useful for tests that want to enumerate every scalar field for a
+    /// blanket assertion.
+    ///
+    /// Discovery spans every row rather than `rows.first()` alone: sample
+    /// 0 can be a placeholder (the map missing or not yet captured) while
+    /// later rows carry the struct, and reading only row 0 would silently
+    /// enumerate nothing — blinding a "assert over every scalar field"
+    /// projection. Empty ONLY when NO sample renders the map as a struct
+    /// (the field set is genuinely undiscoverable).
     pub fn member_names(&self) -> Vec<String> {
-        let row = match self.series.rows.first() {
-            Some(r) => r,
-            None => return Vec::new(),
-        };
-        let snap = Snapshot::new(&row.report);
-        let map = match snap.map(self.map_name) {
-            Ok(m) => m,
-            Err(_) => return Vec::new(),
-        };
-        let entry = map.at(self.entry_index);
-        // Walk the entry's value — SnapshotEntry doesn't expose
-        // its struct members directly, but the rendered_value()
-        // accessor on the field-with-empty-path does.
-        let field = entry.get("");
-        match field {
-            SnapshotField::Value(crate::monitor::btf_render::RenderedValue::Struct {
+        let mut names: Vec<String> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for row in &self.series.rows {
+            let snap = Snapshot::new(&row.report);
+            let map = match snap.map(self.map_name) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            let entry = map.at(self.entry_index);
+            // Walk the entry's value — SnapshotEntry doesn't expose its
+            // struct members directly, but the rendered_value() accessor
+            // on the field-with-empty-path does.
+            if let SnapshotField::Value(crate::monitor::btf_render::RenderedValue::Struct {
                 members,
                 ..
-            }) => members.iter().map(|m| m.name.clone()).collect(),
-            _ => Vec::new(),
+            }) = entry.get("")
+            {
+                for m in members {
+                    if seen.insert(m.name.clone()) {
+                        names.push(m.name.clone());
+                    }
+                }
+            }
         }
+        names
     }
 
     /// Project every struct member that resolves as `u64` for at

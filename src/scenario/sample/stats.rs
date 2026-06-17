@@ -187,32 +187,28 @@ impl<'a> StatsPathProjector<'a> {
         }
     }
 
-    /// Discover the JSON object keys of the resolved path at
-    /// sample 0. Empty when the path is missing or resolves to a
-    /// non-object; populated when the projection lands on a
-    /// `serde_json::Value::Object`.
+    /// Discover the JSON object keys of the resolved path, unioned across
+    /// ALL samples (sorted, deduplicated). Empty ONLY when no sample
+    /// resolves the path to an object.
+    ///
+    /// Discovery spans every row rather than sample 0 alone: a
+    /// scheduler-defined `scx_stats` object can be absent or `Err` in
+    /// sample 0 (the first capture often predates the scheduler's first
+    /// stats emit) while later samples carry it; reading only sample 0
+    /// would silently return no keys and blind a "assert over every
+    /// scx_stats counter" blanket projection.
     pub fn key_names(&self) -> Vec<String> {
-        let row = match self.series.rows.first() {
-            Some(r) => r,
-            None => return Vec::new(),
-        };
-        let stats = match row.stats.as_ref() {
-            Ok(s) => s,
-            Err(_) => return Vec::new(),
-        };
-        let resolved = stats_path(stats, &self.path);
-        let raw = match resolved.raw() {
-            Some(v) => v,
-            None => return Vec::new(),
-        };
-        match raw {
-            serde_json::Value::Object(map) => {
-                let mut names: Vec<String> = map.keys().cloned().collect();
-                names.sort();
-                names
+        let mut names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for row in &self.series.rows {
+            let Ok(stats) = row.stats.as_ref() else {
+                continue;
+            };
+            let resolved = stats_path(stats, &self.path);
+            if let Some(serde_json::Value::Object(map)) = resolved.raw() {
+                names.extend(map.keys().cloned());
             }
-            _ => Vec::new(),
         }
+        names.into_iter().collect()
     }
 
     /// Project every object key that resolves as `u64` for at
