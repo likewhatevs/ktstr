@@ -2240,17 +2240,13 @@ pub fn build_phase_buckets_with_stimulus(
         if prev.is_terminal {
             continue;
         }
-        let (Some(s), Some(e)) = (prev.total_iterations, curr.total_iterations) else {
+        // Shared formula with Timeline::build via StimulusEvent::rate_to
+        // (the sole iteration_rate site): None when the count did not
+        // advance, an event lacks total_iterations, or the window is
+        // zero-length.
+        let Some(rate) = prev.rate_to(curr) else {
             continue;
         };
-        if e <= s {
-            continue;
-        }
-        let duration_ms = curr.elapsed_ms.saturating_sub(prev.elapsed_ms);
-        if duration_ms == 0 {
-            continue;
-        }
-        let rate = (e - s) as f64 / (duration_ms as f64 / 1000.0);
         // Attribute the rate to the step PREV starts: the pair
         // (prev, curr) measures iterations accumulated from prev's
         // step-start to curr's — the throughput DURING prev's step.

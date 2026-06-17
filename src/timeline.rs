@@ -155,6 +155,32 @@ impl StimulusEvent {
             is_terminal: true,
         }
     }
+
+    /// Iterations-per-second from this event to `next`:
+    /// `(next.total_iterations - self.total_iterations)` over the
+    /// guest-clock elapsed-ms delta between them. Returns `None` when
+    /// either event lacks a `total_iterations` sample, the count did not
+    /// advance (`next <= self` — e.g. a step-local worker population
+    /// reset, or the first step's ~0 starting sample), or the window is
+    /// zero-length.
+    ///
+    /// This is the SINGLE iteration_rate formula shared by
+    /// [`crate::assert::build_phase_buckets_with_stimulus`] (per-step
+    /// windows attributed by `step_index`) and [`Timeline::build`]
+    /// (per-phase windows attributed by index) — the two callers pair
+    /// events differently but must compute the rate identically.
+    pub(crate) fn rate_to(&self, next: &StimulusEvent) -> Option<f64> {
+        let s = self.total_iterations?;
+        let e = next.total_iterations?;
+        if e <= s {
+            return None;
+        }
+        let duration_ms = next.elapsed_ms.saturating_sub(self.elapsed_ms);
+        if duration_ms == 0 {
+            return None;
+        }
+        Some((e - s) as f64 / (duration_ms as f64 / 1000.0))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -386,15 +412,12 @@ impl Timeline {
             } else {
                 terminal
             };
-            if let (Some(s), Some(next_ev)) = (this.total_iterations, next)
-                && let Some(e) = next_ev.total_iterations
-                && e > s
+            // Shared formula with build_phase_buckets_with_stimulus via
+            // StimulusEvent::rate_to (the sole iteration_rate site).
+            if let Some(next_ev) = next
+                && let Some(rate) = this.rate_to(next_ev)
             {
-                let duration_ms = next_ev.elapsed_ms.saturating_sub(this.elapsed_ms);
-                if duration_ms > 0 {
-                    phases[i].metrics.iteration_rate =
-                        Some((e - s) as f64 / (duration_ms as f64 / 1000.0));
-                }
+                phases[i].metrics.iteration_rate = Some(rate);
             }
         }
 
