@@ -317,6 +317,8 @@ fn sidecar_result_roundtrip() {
             schedstat_deltas: None,
             ..Default::default()
         }),
+        periodic_fired: 7,
+        periodic_target: 9,
         stimulus_events: vec![crate::timeline::StimulusEvent {
             elapsed_ms: 500,
             label: "StepStart[0]".to_string(),
@@ -364,6 +366,8 @@ fn sidecar_result_roundtrip() {
         inconclusive,
         stats,
         monitor,
+        periodic_fired: _,
+        periodic_target: _,
         stimulus_events,
         work_type,
         verifier_stats,
@@ -531,6 +535,8 @@ fn sidecar_result_roundtrip_all_fields_round_trip() {
             total_samples: 17,
             ..Default::default()
         }),
+        periodic_fired: 5,
+        periodic_target: 6,
         stimulus_events: vec![StimulusEvent {
             elapsed_ms: 123,
             label: "audit_event".to_string(),
