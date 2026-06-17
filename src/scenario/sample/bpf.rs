@@ -495,14 +495,17 @@ impl<'a> BpfMapProjector<'a> {
     // entry returns `PerCpuNotNarrowed`). Two ways in:
     //   - aggregate across CPUs: `field_cpu_sum_u64` etc., delegating
     //     to the [`SnapshotEntry`](crate::scenario::snapshot::SnapshotEntry)
-    //     `cpu_*` reductions — None slots (unmapped CPUs) are skipped;
-    //     the empty set yields `0` for sum and `Err(NoMatch)` for
-    //     max / min;
+    //     `cpu_*` reductions — None slots (unmapped / unreadable CPUs)
+    //     are skipped; the empty set (every slot None) yields
+    //     `Err(NoMatch)` for sum, max, and min alike, since a None slot
+    //     is unreadable rather than a real zero;
     //   - select one CPU: [`Self::cpu`] → [`BpfMapCpuProjector`].
     // -----------------------------------------------------------------
 
-    /// Sum a named per-CPU field across all CPUs as `u64`. Delegates
-    /// to [`SnapshotEntry::cpu_sum_u64`](crate::scenario::snapshot::SnapshotEntry::cpu_sum_u64).
+    /// Sum a named per-CPU field across all CPUs as `u64`.
+    /// `Err(NoMatch)` when every slot is `None` (unreadable, not a real
+    /// zero); a readable all-zero map sums to `Ok(0)`. Delegates to
+    /// [`SnapshotEntry::cpu_sum_u64`](crate::scenario::snapshot::SnapshotEntry::cpu_sum_u64).
     pub fn field_cpu_sum_u64(&self, field: &str) -> SeriesField<u64> {
         let map_name = self.map_name.to_string();
         let entry_index = self.entry_index;
@@ -518,7 +521,9 @@ impl<'a> BpfMapProjector<'a> {
 
     /// Sum a named per-CPU field across all CPUs as `i64`. The sum
     /// saturates at `i64::MIN` / `i64::MAX` (parity with the `u64`
-    /// variant's `saturating_add`). Delegates to
+    /// variant's `saturating_add`). `Err(NoMatch)` when every slot is
+    /// `None` (unreadable, not a real zero); a readable all-zero map
+    /// sums to `Ok(0)`. Delegates to
     /// [`SnapshotEntry::cpu_sum_i64`](crate::scenario::snapshot::SnapshotEntry::cpu_sum_i64).
     pub fn field_cpu_sum_i64(&self, field: &str) -> SeriesField<i64> {
         let map_name = self.map_name.to_string();
@@ -533,8 +538,10 @@ impl<'a> BpfMapProjector<'a> {
         })
     }
 
-    /// Sum a named per-CPU field across all CPUs as `f64`. Delegates
-    /// to [`SnapshotEntry::cpu_sum_f64`](crate::scenario::snapshot::SnapshotEntry::cpu_sum_f64).
+    /// Sum a named per-CPU field across all CPUs as `f64`.
+    /// `Err(NoMatch)` when every slot is `None` (unreadable, not a real
+    /// zero); a readable all-zero map sums to `Ok(0.0)`. Delegates to
+    /// [`SnapshotEntry::cpu_sum_f64`](crate::scenario::snapshot::SnapshotEntry::cpu_sum_f64).
     pub fn field_cpu_sum_f64(&self, field: &str) -> SeriesField<f64> {
         let map_name = self.map_name.to_string();
         let entry_index = self.entry_index;
@@ -1163,16 +1170,19 @@ mod tests {
         );
     }
 
-    /// All-None: `field_cpu_sum_u64` yields the empty-sum identity `0`
-    /// (the deliberate behavior; #18 tracks the pending no-data-error
-    /// decision), while `field_cpu_max_u64` errors (max of empty set
-    /// is undefined).
+    /// All-None: `field_cpu_sum_u64` AND `field_cpu_max_u64` both error.
+    /// A None slot is UNREADABLE (host-read failure), not a real zero,
+    /// so summing an all-None map to 0 would silently drop the missing
+    /// data — sum now matches max/min (Err) rather than an empty-sum
+    /// identity 0. A readable all-zero map still sums to Ok(0).
     #[test]
-    fn bpf_map_projector_field_cpu_all_none_sum_zero_max_errors() {
+    fn bpf_map_projector_field_cpu_all_none_sum_and_max_error() {
         let series = percpu_series(&[None, None, None]);
-        assert_eq!(
-            oks_u64(series.bpf_map("cpu_ctxs").at(0).field_cpu_sum_u64("dispatched")),
-            vec![0],
+        let sum = series.bpf_map("cpu_ctxs").at(0).field_cpu_sum_u64("dispatched");
+        assert!(
+            sum.values_iter().all(|r| r.is_err()),
+            "all-None sum must error (None is unreadable, not a real zero), \
+             not a silent Ok(0)",
         );
         let max = series.bpf_map("cpu_ctxs").at(0).field_cpu_max_u64("dispatched");
         assert!(

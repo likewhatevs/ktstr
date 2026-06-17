@@ -1168,7 +1168,7 @@ fn snapshot_entry_cpu_min_u64_returns_smallest_present() {
 /// return NoMatch — no slot contributes a value, so neither max
 /// nor min has a meaningful answer.
 #[test]
-fn snapshot_entry_cpu_max_min_no_slots_returns_no_match() {
+fn snapshot_entry_cpu_sum_max_min_no_slots_returns_no_match() {
     let entry_struct = FailureDumpPercpuEntry {
         key: 0,
         per_cpu: vec![None, None, None],
@@ -1181,10 +1181,23 @@ fn snapshot_entry_cpu_max_min_no_slots_returns_no_match() {
         }
         other => panic!("unexpected: {other:?}"),
     }
-    // cpu_sum_u64 returns 0 for all-None (sum identity); this
-    // pins the asymmetry between sum (always-defined) and
-    // max/min (require >= 1 slot).
-    assert_eq!(entry.cpu_sum_u64("").unwrap(), 0);
+    // cpu_sum_* ALSO errors on all-None: a None slot is UNREADABLE
+    // (host-read failure), not a real zero, so summing to 0 would
+    // silently drop the missing data — parity with max/min, NOT a
+    // sum-identity 0.
+    match entry.cpu_sum_u64("").expect_err("all-None sum must err") {
+        SnapshotError::NoMatch { op, len, .. } => {
+            assert_eq!(op, "cpu_sum_u64");
+            assert_eq!(len, 0);
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+    entry
+        .cpu_sum_i64("")
+        .expect_err("all-None i64 sum must err");
+    entry
+        .cpu_sum_f64("")
+        .expect_err("all-None f64 sum must err");
 }
 
 #[test]
