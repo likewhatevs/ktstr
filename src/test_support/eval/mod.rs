@@ -1803,6 +1803,32 @@ fn evaluate_vm_result(
             check_result.merge(AssertResult::fail(d));
         }
 
+        // Populate per-phase telemetry + cross-RUN ext_metrics on
+        // check_result BEFORE write_sidecar below: the sidecar is the
+        // durable telemetry every cross-run comparison reads, so it must
+        // carry stats.phases + stats.ext_metrics, not the empty defaults
+        // (previously these were filled AFTER write_sidecar, so the
+        // persisted sidecar dropped both). Phase buckets were built at
+        // evaluate_vm_result entry from result.periodic_series()
+        // (off-cadence on-demand / watchpoint captures excluded); reuse the
+        // pre-built vec + already-drained series rather than re-draining.
+        // The cross-RUN ext_metrics fill covers METRICS entries with a
+        // read_sample wire but no typed GauntletRow field
+        // (populate_run_ext_metrics) plus the phase-only metrics whose
+        // read_sample returns None — avg_imbalance_ratio, iteration_rate,
+        // system_time_ns / user_time_ns (populate_run_ext_metrics_from_phases).
+        // Without it those keys never reach the sidecar and
+        // `cargo ktstr stats compare` silently drops the rows.
+        check_result.stats.phases = std::mem::take(&mut early_phase_buckets);
+        crate::assert::populate_run_ext_metrics(
+            &early_periodic_series,
+            &mut check_result.stats.ext_metrics,
+        );
+        crate::assert::populate_run_ext_metrics_from_phases(
+            &check_result.stats.phases,
+            &mut check_result.stats.ext_metrics,
+        );
+
         // Write sidecar before checking pass/fail so both outcomes are captured.
         // A sidecar write failure is logged but not propagated: the test
         // verdict itself is still valid — only post-run stats tooling
@@ -2029,62 +2055,12 @@ fn evaluate_vm_result(
             }
         }
 
-        // Auto-populate per-phase metric buckets on the returned
-        // AssertResult. Drains the snapshot bridge for periodic
-        // captures + on-demand fixture-path captures, builds a
-        // SampleSeries, and folds it through
-        // `crate::assert::build_phase_buckets` so the test author
-        // sees `result.stats.phases` populated without needing to
-        // manually stitch the snapshot drain to the metric
-        // aggregator. Single-phase scenarios with no Steps still
-        // run (the bridge may have a periodic capture or two)
-        // but yield a phases vec containing only the BASELINE
-        // bucket; the renderer is sentinel-free so an empty
-        // metrics map paints as "no data" rather than masquerading
-        // as real zeros.
-        //
-        // The bridge drain backing `captures_series()` is the
-        // framework's contract drain; an integration test that
-        // bypasses evaluate_vm_result (e.g. tests/stats_bridge_e2e.rs)
-        // still owns its own direct `result.snapshot_bridge.drain*()`
-        // call path because those tests instrument the framework
-        // rather than depending on it.
-        // Phase buckets were built at evaluate_vm_result entry from
-        // `result.periodic_series()` (off-cadence on-demand / watchpoint
-        // captures excluded) so the unified PhaseBucket source feeds both
-        // the failure-message Timeline render (via
-        // Timeline::from_phase_buckets up top) and the stamped
-        // ScenarioStats.phases below. The cross-RUN ext_metrics fill
-        // below reuses the SAME periodic-only series so off-cadence
-        // outliers do not pollute the cross-RUN aggregates either. Reuse
-        // the pre-built vec + the already-drained series rather than
-        // re-draining.
-        check_result.stats.phases = std::mem::take(&mut early_phase_buckets);
-        let sample_series_for_phases = &early_periodic_series;
-        // Cross-RUN aggregate fill: for any METRICS entry with a
-        // read_sample wire but no typed GauntletRow field, compute
-        // the per-RUN aggregate from the same samples and write into
-        // stats.ext_metrics. Without this, MetricDef::read returns
-        // None on both sides at cargo ktstr stats compare time, the
-        // EPSILON guard drops the row, and the operator never sees
-        // the metric — a silent data drop. Skips keys already
-        // populated as typed fields or by other producers.
-        crate::assert::populate_run_ext_metrics(
-            sample_series_for_phases,
-            &mut check_result.stats.ext_metrics,
-        );
-        // Sibling fill from per-phase metrics — closes the gap for the
-        // phase-only metrics whose read_sample dispatches return None:
-        // avg_imbalance_ratio (MonitorSample-sourced), iteration_rate
-        // (stimulus-event-sourced), and system_time_ns / user_time_ns
-        // (per-thread-group CPU-time deltas). The SampleSeries path
-        // above misses them; without this call those keys never appear
-        // in ext_metrics and cargo ktstr stats compare silently drops
-        // them.
-        crate::assert::populate_run_ext_metrics_from_phases(
-            &check_result.stats.phases,
-            &mut check_result.stats.ext_metrics,
-        );
+        // (Per-phase telemetry + cross-RUN ext_metrics were populated on
+        // check_result above, BEFORE write_sidecar, so the persisted
+        // sidecar carries them — see the populate block at the sidecar
+        // write site. stats.phases feeds both the failure-message Timeline
+        // render and the test author's result.stats.phases; the sentinel-
+        // free renderer paints an empty metrics map as "no data".)
 
         return Ok(check_result);
     }
