@@ -248,7 +248,6 @@ pub(crate) fn make_vm_result(
         stderr: stderr.to_string(),
         monitor: None,
         guest_messages: None,
-        stimulus_events: Vec::new(),
         verifier_stats: Vec::new(),
         kvm_stats: None,
         crash_message: None,

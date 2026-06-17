@@ -1136,7 +1136,15 @@ fn run_ktstr_test_inner_impl(
     // pairs an LlmExtract `RawPayloadOutput` to its empty-metrics
     // companion by EQUAL `payload_index`, not by emission order —
     // see `host_side_llm_extract` for the pairing implementation.
-    let mut stimulus_events = Vec::new();
+    // Complete per-phase stimulus timeline (step-start frames + the
+    // scenario-end terminal boundary) via the single shared accessor —
+    // the SAME timeline a post_vm callback gets, so the production eval
+    // and any out-of-tree re-derivation can never disagree on the last
+    // step's iteration_rate boundary. The bulk loop below handles only
+    // the remaining message kinds (Profraw / WprofTrace / PayloadMetrics
+    // / RawPayloadOutput); Stimulus + ScenarioEnd are consumed by
+    // stimulus_timeline().
+    let stimulus_events = result.stimulus_timeline();
     let mut payload_metrics: Vec<crate::test_support::PayloadMetrics> = Vec::new();
     let mut raw_outputs: Vec<crate::test_support::RawPayloadOutput> = Vec::new();
     if let Some(ref bulk) = result.guest_messages {
@@ -1186,14 +1194,6 @@ fn run_ktstr_test_inner_impl(
                         }
                     }
                 }
-                Some(crate::vmm::wire::MsgType::Stimulus) => {
-                    if bulk_entry.crc_ok
-                        && let Some(ev) =
-                            crate::vmm::wire::StimulusEvent::from_payload(&bulk_entry.payload)
-                    {
-                        stimulus_events.push(crate::timeline::StimulusEvent::from_wire(&ev));
-                    }
-                }
                 Some(crate::vmm::wire::MsgType::PayloadMetrics) => {
                     if bulk_entry.crc_ok {
                         match postcard::from_bytes::<crate::test_support::PayloadMetrics>(
@@ -1218,21 +1218,24 @@ fn run_ktstr_test_inner_impl(
                         }
                     }
                 }
-                // The remaining verdict-bearing variants
-                // (TestResult, Exit, SchedExit, ScenarioStart,
-                // ScenarioEnd, Stdout, Stderr, SchedLog, Lifecycle,
-                // ExecExit, Dmesg, ProbeOutput, SnapshotReply,
-                // Crash) are consumed by other walkers further down
-                // the pipeline (parse_assert_result_from_drain,
+                // Stimulus + ScenarioEnd are consumed by
+                // `result.stimulus_timeline()` above (the per-phase
+                // timeline), so they are no-ops in this loop. The
+                // remaining verdict-bearing variants (TestResult, Exit,
+                // SchedExit, ScenarioStart, Stdout, Stderr, SchedLog,
+                // Lifecycle, ExecExit, Dmesg, ProbeOutput,
+                // SnapshotReply, Crash) are consumed by other walkers
+                // further down the pipeline (parse_assert_result_from_drain,
                 // bulk_exit lookup in collect_results, lifecycle
                 // classifier, sched_log concatenator, etc.). No
                 // per-entry side effect here.
                 Some(
-                    crate::vmm::wire::MsgType::TestResult
+                    crate::vmm::wire::MsgType::Stimulus
+                    | crate::vmm::wire::MsgType::ScenarioEnd
+                    | crate::vmm::wire::MsgType::TestResult
                     | crate::vmm::wire::MsgType::Exit
                     | crate::vmm::wire::MsgType::SchedExit
                     | crate::vmm::wire::MsgType::ScenarioStart
-                    | crate::vmm::wire::MsgType::ScenarioEnd
                     | crate::vmm::wire::MsgType::ScenarioPause
                     | crate::vmm::wire::MsgType::ScenarioResume
                     | crate::vmm::wire::MsgType::Stdout

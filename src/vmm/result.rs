@@ -101,9 +101,6 @@ pub struct VmResult {
     /// virtio-console port 1 during the run with the final port-1
     /// `port1_tx_buf` flush.
     pub guest_messages: Option<BulkDrainResult>,
-    /// Stimulus events extracted from guest TLV entries.
-    #[allow(dead_code)]
-    pub stimulus_events: Vec<wire::StimulusEvent>,
     /// BPF verifier stats collected from host-side memory reads.
     pub verifier_stats: Vec<monitor::bpf_prog::ProgVerifierStats>,
     /// KVM per-vCPU cumulative stats (requires Linux >= 5.14).
@@ -214,12 +211,11 @@ pub struct VmResult {
     /// assert!(c.reads_completed > 0);
     /// ```
     ///
-    /// `#[allow(dead_code)]` mirrors `stimulus_events` above: the
-    /// field is part of the public API surface and read by user
-    /// test code outside `lib.rs`, but the lib build doesn't see
-    /// any in-tree readers because no lib code path calls
-    /// `.virtio_blk_counters` on a `VmResult`. The in-tree readers
-    /// live in unit tests.
+    /// `#[allow(dead_code)]`: the field is part of the public API
+    /// surface and read by user test code outside `lib.rs`, but the
+    /// lib build doesn't see any in-tree readers because no lib code
+    /// path calls `.virtio_blk_counters` on a `VmResult`. The in-tree
+    /// readers live in unit tests.
     #[allow(dead_code)]
     pub virtio_blk_counters: Option<VirtioBlkCountersSnapshot>,
     /// Host-side virtio-net device counters, snapshotted after the
@@ -463,6 +459,58 @@ impl VmResult {
         .periodic_only()
     }
 
+    /// The complete per-phase stimulus timeline for `post_vm`
+    /// callbacks doing per-phase metric assertions: one
+    /// [`crate::timeline::StimulusEvent`] per guest `Stimulus` frame
+    /// (the step-start boundaries, via
+    /// [`crate::timeline::StimulusEvent::from_wire`]) PLUS the
+    /// synthesized terminal scenario-end boundary (from the
+    /// `ScenarioEnd` frame's final cumulative count, via
+    /// [`crate::timeline::StimulusEvent::terminal`]).
+    ///
+    /// Fold THIS through
+    /// [`crate::assert::build_phase_buckets_with_stimulus`] — it is the
+    /// SAME timeline the framework's own `evaluate_vm_result` builds,
+    /// so the LAST step gets an `iteration_rate` (the terminal supplies
+    /// its right boundary). A hand-rolled map over only the guest
+    /// `Stimulus` frames would omit the terminal and silently drop the
+    /// final step's rate.
+    ///
+    /// Non-destructive: reads the already-drained `guest_messages` TLV
+    /// log (unlike [`Self::periodic_series`], which drains the snapshot
+    /// bridge), so it may be called alongside the bridge drain. CRC-bad
+    /// / malformed frames are skipped.
+    pub fn stimulus_timeline(&self) -> Vec<crate::timeline::StimulusEvent> {
+        let mut out = Vec::new();
+        let Some(bulk) = &self.guest_messages else {
+            return out;
+        };
+        for entry in &bulk.entries {
+            if !entry.crc_ok {
+                continue;
+            }
+            match wire::MsgType::from_wire(entry.msg_type) {
+                Some(wire::MsgType::Stimulus) => {
+                    if let Some(ev) = wire::StimulusEvent::from_payload(&entry.payload) {
+                        out.push(crate::timeline::StimulusEvent::from_wire(&ev));
+                    }
+                }
+                Some(wire::MsgType::ScenarioEnd) => {
+                    if let Some((elapsed_ms, total_iterations)) =
+                        wire::parse_scenario_end(&entry.payload)
+                    {
+                        out.push(crate::timeline::StimulusEvent::terminal(
+                            elapsed_ms,
+                            total_iterations,
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
     /// Minimal "nothing happened" fixture for tests that exercise
     /// code consuming a [`VmResult`] without actually booting a VM
     /// (the sidecar-write tests in `src/test_support/sidecar.rs`
@@ -495,7 +543,6 @@ impl VmResult {
             stderr: String::new(),
             monitor: None,
             guest_messages: None,
-            stimulus_events: Vec::new(),
             verifier_stats: Vec::new(),
             kvm_stats: None,
             crash_message: None,
@@ -928,7 +975,7 @@ mod tests {
         assert_eq!(r.stderr, "boot log");
         assert!(r.monitor.is_none());
         assert!(r.guest_messages.is_none());
-        assert!(r.stimulus_events.is_empty());
+        assert!(r.stimulus_timeline().is_empty());
         assert_eq!(r.cleanup_duration, Some(Duration::from_millis(50)));
         assert!(r.virtio_blk_counters.is_none());
         // Second construction covers the opposite polarity of

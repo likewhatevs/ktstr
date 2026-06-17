@@ -495,8 +495,8 @@ pub(crate) mod taskstats;
 pub mod test_support;
 // `pub` (not `pub(crate)`): `assert::build_phase_buckets_with_stimulus`
 // takes `timeline::StimulusEvent` in its public signature, and result
-// analyzers (e2e tests folding `VmResult::stimulus_events` through that
-// fn) need to name the type and call `StimulusEvent::from_wire`.
+// analyzers (post_vm callbacks folding `VmResult::stimulus_timeline()`
+// through that fn) need to name the type.
 pub mod timeline;
 pub mod topology;
 

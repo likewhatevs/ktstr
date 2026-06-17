@@ -103,7 +103,9 @@ pub enum MsgType {
     Stimulus,
     /// Scenario start marker. Sets a fresh watchdog deadline.
     ScenarioStart,
-    /// Scenario end marker (payload: 8-byte LE u64 elapsed_ms).
+    /// Scenario end marker (payload: two 8-byte LE u64s — elapsed_ms
+    /// then the final cumulative `total_iterations`; see
+    /// [`SCENARIO_END_PAYLOAD_SIZE`] / [`parse_scenario_end`]).
     ScenarioEnd,
     /// Pause the watchdog clock. Wall time while paused doesn't
     /// count against the workload budget.
@@ -789,6 +791,31 @@ impl StimulusEvent {
     }
 }
 
+/// Size in bytes of the [`MsgType::ScenarioEnd`] payload: two
+/// little-endian `u64`s — scenario-relative elapsed milliseconds
+/// followed by the final cumulative worker iteration count.
+pub const SCENARIO_END_PAYLOAD_SIZE: usize = 16;
+
+/// Parse the [`MsgType::ScenarioEnd`] payload written by
+/// [`crate::vmm::guest_comms::send_scenario_end`]: `elapsed_ms`
+/// (LE `u64`, scenario-relative) followed by `total_iterations`
+/// (LE `u64`, the cumulative worker iteration count summed across
+/// every live handle at the LAST step's end). The iteration count is
+/// the right boundary the final step's `iteration_rate` delta needs —
+/// the host folds it into a synthetic terminal
+/// [`crate::timeline::StimulusEvent`] (see
+/// [`crate::timeline::StimulusEvent::terminal`]). Returns `None` for a
+/// short/torn payload so a CRC-bad or truncated frame is skipped
+/// rather than misread.
+pub fn parse_scenario_end(payload: &[u8]) -> Option<(u64, u64)> {
+    if payload.len() < SCENARIO_END_PAYLOAD_SIZE {
+        return None;
+    }
+    let elapsed_ms = u64::from_le_bytes(payload[0..8].try_into().ok()?);
+    let total_iterations = u64::from_le_bytes(payload[8..16].try_into().ok()?);
+    Some((elapsed_ms, total_iterations))
+}
+
 // ---------------------------------------------------------------------------
 // Snapshot request/reply TLV payloads
 // ---------------------------------------------------------------------------
@@ -1350,6 +1377,21 @@ pub const PORT2_NAME: &str = "ktstr-stats";
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `parse_scenario_end` round-trips the two LE u64s the guest
+    /// writes, and rejects a short/torn payload (returns None rather
+    /// than misreading) — the host folds the parsed iteration count
+    /// into the terminal StimulusEvent for the last step's rate.
+    #[test]
+    fn parse_scenario_end_round_trip_and_short_payload() {
+        let mut payload = [0u8; SCENARIO_END_PAYLOAD_SIZE];
+        payload[0..8].copy_from_slice(&12_345u64.to_le_bytes());
+        payload[8..16].copy_from_slice(&987_654u64.to_le_bytes());
+        assert_eq!(parse_scenario_end(&payload), Some((12_345, 987_654)));
+        // A short payload (e.g. only the elapsed field) is rejected.
+        assert_eq!(parse_scenario_end(&payload[..8]), None);
+        assert_eq!(parse_scenario_end(&[]), None);
+    }
 
     /// `ShmMessage` round-trips through bytes — guards against an
     /// accidental field reorder or a stray padding byte that would

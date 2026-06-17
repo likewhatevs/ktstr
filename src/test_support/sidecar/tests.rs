@@ -324,6 +324,7 @@ fn sidecar_result_roundtrip() {
             detail: Some("4 cpus".to_string()),
             total_iterations: None,
             step_index: None,
+            is_terminal: false,
         }],
         work_type: "SpinWait".to_string(),
         verifier_stats: vec![],
@@ -536,6 +537,7 @@ fn sidecar_result_roundtrip_all_fields_round_trip() {
             detail: None,
             total_iterations: None,
             step_index: None,
+            is_terminal: false,
         }],
         work_type: "AuditWork".to_string(),
         verifier_stats: vec![ProgVerifierStats {

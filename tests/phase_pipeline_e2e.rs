@@ -83,9 +83,9 @@
 use anyhow::Result;
 use ktstr::assert::AssertResult;
 use ktstr::ktstr_test;
-use ktstr::prelude::{SampleSeries, VmResult};
+use ktstr::prelude::{Backdrop, SampleSeries, VmResult};
 use ktstr::scenario::Ctx;
-use ktstr::scenario::ops::{CgroupDef, HoldSpec, Op, Step, execute_steps};
+use ktstr::scenario::ops::{CgroupDef, HoldSpec, Op, Step, execute_scenario, execute_steps};
 use ktstr::test_support::{Scheduler, SchedulerSpec};
 
 const KTSTR_SCHED: Scheduler =
@@ -129,11 +129,10 @@ fn assert_phase_pipeline(result: &VmResult) -> Result<()> {
     // produce 2× the sample_count.
     let drained_len = drained.len();
     let series = SampleSeries::from_drained_typed(drained, result.monitor.clone());
-    let stimulus: Vec<ktstr::timeline::StimulusEvent> = result
-        .stimulus_events
-        .iter()
-        .map(ktstr::timeline::StimulusEvent::from_wire)
-        .collect();
+    // The COMPLETE timeline (step frames + scenario-end terminal) via
+    // the shared accessor — folding only the raw wire Stimulus frames
+    // would omit the terminal and drop the last step's iteration_rate.
+    let stimulus = result.stimulus_timeline();
     let phases = ktstr::assert::build_phase_buckets_with_stimulus(&series, &stimulus);
 
     // A1 — at least one Step bucket present (step_index >= 1)
@@ -364,11 +363,10 @@ fn assert_phase_pipeline_three_step(result: &VmResult) -> Result<()> {
     let drained = result.snapshot_bridge.drain_ordered_with_stats();
     let drained_len = drained.len();
     let series = SampleSeries::from_drained_typed(drained, result.monitor.clone());
-    let stimulus: Vec<ktstr::timeline::StimulusEvent> = result
-        .stimulus_events
-        .iter()
-        .map(ktstr::timeline::StimulusEvent::from_wire)
-        .collect();
+    // The COMPLETE timeline (step frames + scenario-end terminal) via
+    // the shared accessor — folding only the raw wire Stimulus frames
+    // would omit the terminal and drop the last step's iteration_rate.
+    let stimulus = result.stimulus_timeline();
     let phases = ktstr::assert::build_phase_buckets_with_stimulus(&series, &stimulus);
 
     // The load-bearing invariant: exact count. BASELINE bucket
@@ -451,6 +449,95 @@ fn phase_pipeline_three_step_e2e(ctx: &Ctx) -> Result<AssertResult> {
     execute_steps(ctx, steps)
 }
 
+/// First-and-last-step iteration_rate end-to-end: a Backdrop-PERSISTENT workload (workers
+/// that survive across Steps — the documented pattern for cross-phase
+/// throughput; see [`ktstr::timeline::StimulusEvent::total_iterations`])
+/// must yield an `iteration_rate` for BOTH the FIRST Step (the
+/// 0-baseline first stimulus frame previously collapsed to `None`
+/// and dropped the rate) AND the LAST Step (previously no
+/// successor frame existed to diff against). Boots a real guest under
+/// scx-ktstr so the full path is exercised: per-step stimulus emission,
+/// the widened `ScenarioEnd` terminal frame (final cumulative count
+/// captured coincident with its elapsed), and host aggregation — not
+/// just the synthetic-fixture unit path that previously bypassed
+/// `from_wire`.
+fn assert_iteration_rate_first_and_last(result: &VmResult) -> Result<()> {
+    anyhow::ensure!(
+        result.periodic_fired >= 2,
+        "periodic_fired = {} of {} — need a capture in each Step window \
+         so both the first and last Step produce a bucket the rate can \
+         attach to",
+        result.periodic_fired,
+        result.periodic_target,
+    );
+    let drained = result.snapshot_bridge.drain_ordered_with_stats();
+    let series = SampleSeries::from_drained_typed(drained, result.monitor.clone());
+    // The COMPLETE timeline (step frames + scenario-end terminal) via
+    // the shared accessor — folding only the raw wire Stimulus frames
+    // would omit the terminal and drop the last step's iteration_rate.
+    let stimulus = result.stimulus_timeline();
+    let phases = ktstr::assert::build_phase_buckets_with_stimulus(&series, &stimulus);
+
+    // FIRST step = lowest step_index >= 1 (Step[0] under the 1-indexed
+    // encoding). Its rate is the (first_frame -> second_frame) delta —
+    // the zero-baseline case fixed.
+    let first = phases
+        .iter()
+        .filter(|p| p.step_index >= 1)
+        .min_by_key(|p| p.step_index)
+        .ok_or_else(|| anyhow::anyhow!("no Step bucket present in phases"))?;
+    anyhow::ensure!(
+        first.metrics.contains_key("iteration_rate"),
+        "first Step (step_index {}) has no iteration_rate — the \
+         0-baseline first frame was dropped. metric keys = {:?}",
+        first.step_index,
+        first.metrics.keys().collect::<Vec<_>>(),
+    );
+
+    // LAST step = highest step_index. Its rate comes from the terminal
+    // ScenarioEnd frame — the last-step terminal case fixed.
+    let last = phases
+        .iter()
+        .filter(|p| p.step_index >= 1)
+        .max_by_key(|p| p.step_index)
+        .expect("at least one Step bucket (checked above)");
+    anyhow::ensure!(
+        last.metrics.contains_key("iteration_rate"),
+        "last Step (step_index {}) has no iteration_rate — the \
+         scenario-end terminal frame did not supply its right boundary. \
+         metric keys = {:?}",
+        last.step_index,
+        last.metrics.keys().collect::<Vec<_>>(),
+    );
+    Ok(())
+}
+
+#[ktstr_test(
+    scheduler = KTSTR_SCHED,
+    llcs = 1,
+    cores = 2,
+    threads = 1,
+    duration_s = 10,
+    watchdog_timeout_s = 20,
+    num_snapshots = 6,
+    auto_repro = false,
+    post_vm = assert_iteration_rate_first_and_last,
+)]
+fn phase_pipeline_iteration_rate_backdrop_e2e(ctx: &Ctx) -> Result<AssertResult> {
+    // Persistent workload on the Backdrop so its iteration counter
+    // survives across BOTH Steps (cross-step throughput is defined for
+    // the persistent population; step-local workers would reset each
+    // step). Two bare hold Steps let the backdrop spin continuously
+    // across both phase windows so each step boundary's cumulative
+    // count strictly increases.
+    let backdrop = Backdrop::new().push_cgroup(CgroupDef::named("cg_bg").workers(2));
+    let steps = vec![
+        Step::new(vec![], HoldSpec::frac(0.5)),
+        Step::new(vec![], HoldSpec::frac(0.5)),
+    ];
+    execute_scenario(ctx, backdrop, steps)
+}
+
 /// Probabilistic per-step-cpuset e2e: when the per-Step cpuset differs
 /// meaningfully (Step 0 spreads across all CPUs, Step 1 collapses
 /// to one LLC), the per-step `max_dsq_depth` metric must differ.
@@ -473,11 +560,10 @@ fn phase_pipeline_three_step_e2e(ctx: &Ctx) -> Result<AssertResult> {
 fn assert_per_step_cpuset_changes_metrics(result: &VmResult) -> Result<()> {
     let drained = result.snapshot_bridge.drain_ordered_with_stats();
     let series = SampleSeries::from_drained_typed(drained, result.monitor.clone());
-    let stimulus: Vec<ktstr::timeline::StimulusEvent> = result
-        .stimulus_events
-        .iter()
-        .map(ktstr::timeline::StimulusEvent::from_wire)
-        .collect();
+    // The COMPLETE timeline (step frames + scenario-end terminal) via
+    // the shared accessor — folding only the raw wire Stimulus frames
+    // would omit the terminal and drop the last step's iteration_rate.
+    let stimulus = result.stimulus_timeline();
     let phases = ktstr::assert::build_phase_buckets_with_stimulus(&series, &stimulus);
 
     let step0 = phases.iter().find(|p| p.step_index == 1);

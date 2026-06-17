@@ -2166,16 +2166,30 @@ pub fn populate_run_ext_metrics(
 /// For each adjacent pair of stimulus events with
 /// `total_iterations: Some(_)`, the per-phase rate is
 /// `(later - earlier) / duration_s` where `duration_s` is the
-/// PhaseBucket window. Phases that don't overlap a stimulus pair
-/// keep their PhaseBucket.metrics map unchanged (no
-/// iteration_rate key). Per the unweighted-mean cross-RUN policy
+/// elapsed-ms delta BETWEEN THE TWO STIMULUS EVENTS (guest clock),
+/// not the PhaseBucket sample window. The rate is attributed to the
+/// step the EARLIER event starts (`prev.step_index`). Phases that
+/// don't overlap a stimulus pair keep their PhaseBucket.metrics map
+/// unchanged (no iteration_rate key).
+///
+/// SEMANTICS: `total_iterations` is the sum of the worker handles
+/// alive at each event (see
+/// [`crate::timeline::StimulusEvent::total_iterations`]). The
+/// cross-step delta therefore measures the throughput of the
+/// PERSISTENT (Backdrop) population — workers alive across both
+/// endpoints. Step-local workers replaced between steps are not
+/// measured cross-step; the trailing `is_terminal` event supplies the
+/// LAST step's right boundary (consumed only as the later member of a
+/// pair, never the earlier).
+///
+/// Per the unweighted-mean cross-RUN policy
 /// of `crate::stats::aggregate_samples` for `Gauge(Avg)` —
 /// iteration_rate is registered as `Gauge(Avg)` with
 /// `HigherBetter` polarity (more throughput is better) via the
 /// `iteration_rate` registry entry alongside the other Avg-kind
 /// metrics.
 ///
-/// Live caller: `evaluate_vm_result` at `src/test_support/eval.rs`
+/// Live caller: `evaluate_vm_result` at `src/test_support/eval/mod.rs`
 /// — has both the SampleSeries and the stimulus_events vec in scope.
 pub fn build_phase_buckets_with_stimulus(
     samples: &crate::scenario::sample::SampleSeries,
@@ -2229,6 +2243,16 @@ pub fn build_phase_buckets_with_stimulus(
     for w in sorted_events.windows(2) {
         let prev = w[0];
         let curr = w[1];
+        // The terminal scenario-end event is a right boundary only —
+        // never the EARLIER member of a pair (a step the rate is
+        // attributed to). It sorts last (max elapsed_ms) so it is
+        // naturally only ever `curr`, but guard explicitly so a future
+        // caller producing a non-last or duplicate terminal can't have
+        // it fall into the `None` step_index timestamp-window branch
+        // below and attach a bogus rate.
+        if prev.is_terminal {
+            continue;
+        }
         let (Some(s), Some(e)) = (prev.total_iterations, curr.total_iterations) else {
             continue;
         };

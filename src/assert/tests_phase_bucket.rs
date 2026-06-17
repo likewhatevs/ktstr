@@ -1103,6 +1103,7 @@ fn build_phase_buckets_with_stimulus_populates_iteration_rate() {
             detail: None,
             total_iterations: Some(0),
             step_index: None,
+            is_terminal: false,
         },
         StimulusEvent {
             elapsed_ms: 1100,
@@ -1111,6 +1112,7 @@ fn build_phase_buckets_with_stimulus_populates_iteration_rate() {
             detail: None,
             total_iterations: Some(1000),
             step_index: None,
+            is_terminal: false,
         },
         StimulusEvent {
             elapsed_ms: 2100,
@@ -1119,6 +1121,7 @@ fn build_phase_buckets_with_stimulus_populates_iteration_rate() {
             detail: None,
             total_iterations: Some(3000),
             step_index: None,
+            is_terminal: false,
         },
     ];
     let phases = crate::assert::build_phase_buckets_with_stimulus(&samples, &stimulus);
@@ -1175,6 +1178,7 @@ fn build_phase_buckets_with_stimulus_remaps_by_boundary_offset_over_stamped_step
         detail: None,
         total_iterations: None,
         step_index: Some(k),
+        is_terminal: false,
     };
     let stimulus = vec![stim(1000, 1), stim(2000, 2), stim(3000, 3)];
     let phases = crate::assert::build_phase_buckets_with_stimulus(&samples, &stimulus);
@@ -1223,6 +1227,7 @@ fn build_phase_buckets_with_stimulus_none_offset_falls_back_to_stamped_step() {
         detail: None,
         total_iterations: None,
         step_index: Some(5),
+        is_terminal: false,
     }];
     let phases = crate::assert::build_phase_buckets_with_stimulus(&samples, &stimulus);
     let idxs: Vec<u16> = phases.iter().map(|p| p.step_index).collect();
@@ -1272,6 +1277,7 @@ fn build_phase_buckets_with_stimulus_iteration_rate_attaches_by_step_not_interio
         detail: None,
         total_iterations: Some(iters),
         step_index: Some(k),
+        is_terminal: false,
     };
     let stimulus = vec![stim(1000, 1, 0), stim(2000, 2, 1000), stim(3000, 3, 3000)];
     let phases = crate::assert::build_phase_buckets_with_stimulus(&samples, &stimulus);
@@ -1303,6 +1309,167 @@ fn build_phase_buckets_with_stimulus_iteration_rate_attaches_by_step_not_interio
         Some(2000.0),
         "step 2 iteration_rate must attach by step_index; got {:?}",
         step2.metrics.get("iteration_rate"),
+    );
+}
+
+/// Issue #2: the LAST step has no successor step event, so its
+/// iteration_rate needs the terminal scenario-end boundary. The
+/// terminal supplies that boundary (last step's rate = delta to the
+/// terminal count) and must NOT seed a phantom bucket — the bucket set
+/// stays equal to the sample-derived phases.
+#[test]
+fn build_phase_buckets_with_stimulus_terminal_gives_last_step_rate_no_phantom_bucket() {
+    use crate::scenario::snapshot::{DrainedSnapshotEntry, MissingStatsReason};
+    use crate::timeline::StimulusEvent;
+    let mk = |tag: &str, offset_ms: u64| DrainedSnapshotEntry {
+        tag: tag.to_string(),
+        report: fixture_report(),
+        stats: Err(MissingStatsReason::NoSchedulerBinary),
+        elapsed_ms: Some(9_000),
+        boundary_offset_ms: Some(offset_ms),
+        step_index: Some(9),
+    };
+    // Two captures: step 1 interior, step 2 interior.
+    let drained = vec![mk("periodic_000", 1_500), mk("periodic_001", 2_500)];
+    let samples = SampleSeries::from_drained_typed(drained, None);
+    let stim = |elapsed_ms: u64, k: u16, iters: u64| StimulusEvent {
+        elapsed_ms,
+        label: format!("StepStart[{k}]"),
+        op_kind: None,
+        detail: None,
+        total_iterations: Some(iters),
+        step_index: Some(k),
+        is_terminal: false,
+    };
+    // Step starts at 1000/2000 (iters 0/1000); terminal at 3000 with
+    // final iters 3000 — the right boundary the LAST step (step 2)
+    // needs. The terminal carries step_index None + is_terminal so it
+    // seeds no bucket.
+    let stimulus = vec![
+        stim(1000, 1, 0),
+        stim(2000, 2, 1000),
+        StimulusEvent::terminal(3000, 3000),
+    ];
+    let phases = crate::assert::build_phase_buckets_with_stimulus(&samples, &stimulus);
+    let idxs: Vec<u16> = phases.iter().map(|p| p.step_index).collect();
+    assert_eq!(
+        idxs,
+        vec![1, 2],
+        "terminal must not add a phantom bucket; got {idxs:?}",
+    );
+    // Step 2 is the LAST step: its rate comes from the terminal,
+    // 1000 -> 3000 over 1s = 2000/s. Without the terminal it would be
+    // None (the bug this fixes).
+    let step2 = phases
+        .iter()
+        .find(|p| p.step_index == 2)
+        .expect("step 2 bucket present");
+    assert_eq!(
+        step2.metrics.get("iteration_rate").copied(),
+        Some(2000.0),
+        "last step's iteration_rate must come from the terminal boundary",
+    );
+}
+
+/// First-step zero-baseline rate, through the production aggregator + the FULL from_wire
+/// path (unit tests previously injected Some(0) directly, masking the
+/// wire 0->None collapse). The first step frame reads 0 cumulative
+/// iterations; after dropping the sentinel the first step's bucket gets
+/// a rate.
+#[test]
+fn build_phase_buckets_with_stimulus_first_step_zero_baseline_from_wire() {
+    use crate::scenario::snapshot::{DrainedSnapshotEntry, MissingStatsReason};
+    use crate::timeline::StimulusEvent;
+    let mk = |tag: &str, offset_ms: u64| DrainedSnapshotEntry {
+        tag: tag.to_string(),
+        report: fixture_report(),
+        stats: Err(MissingStatsReason::NoSchedulerBinary),
+        elapsed_ms: Some(9_000),
+        boundary_offset_ms: Some(offset_ms),
+        step_index: Some(9),
+    };
+    let drained = vec![mk("periodic_000", 1_500), mk("periodic_001", 2_500)];
+    let samples = SampleSeries::from_drained_typed(drained, None);
+    let wire = |elapsed_ms: u32, step_index: u16, iters: u64| crate::vmm::wire::StimulusEvent {
+        elapsed_ms,
+        step_index,
+        op_count: 0,
+        op_kinds: 0,
+        cgroup_count: 0,
+        worker_count: 1,
+        total_iterations: iters,
+    };
+    // First step frame reads 0 cumulative iters (workers just spawned).
+    let stimulus: Vec<StimulusEvent> = [wire(1000, 1, 0), wire(2000, 2, 2000)]
+        .iter()
+        .map(StimulusEvent::from_wire)
+        .collect();
+    let phases = crate::assert::build_phase_buckets_with_stimulus(&samples, &stimulus);
+    let step1 = phases
+        .iter()
+        .find(|p| p.step_index == 1)
+        .expect("step 1 bucket present");
+    assert_eq!(
+        step1.metrics.get("iteration_rate").copied(),
+        Some(2000.0),
+        "first step's iteration_rate must compute from the 0 baseline",
+    );
+}
+
+/// Loop-hold attribution: once the guest emits a start frame
+/// for a Loop step (the run_step Loop arm), a scenario ending on a Loop
+/// step must attribute the final window's throughput to the LOOP step,
+/// NOT graft it onto the prior step. This pins the host-side contract
+/// the guest fix relies on: with the loop step's own start frame
+/// present, (loop_start -> terminal) lands on the loop step's bucket and
+/// (prior_start -> loop_start) lands on the prior step's bucket.
+#[test]
+fn build_phase_buckets_with_stimulus_loop_step_rate_no_prior_graft() {
+    use crate::scenario::snapshot::{DrainedSnapshotEntry, MissingStatsReason};
+    use crate::timeline::StimulusEvent;
+    let mk = |tag: &str, offset_ms: u64| DrainedSnapshotEntry {
+        tag: tag.to_string(),
+        report: fixture_report(),
+        stats: Err(MissingStatsReason::NoSchedulerBinary),
+        elapsed_ms: Some(9_000),
+        boundary_offset_ms: Some(offset_ms),
+        step_index: Some(9),
+    };
+    // Prior step (step 1) interior + Loop step (step 2) interior.
+    let drained = vec![mk("periodic_000", 1_500), mk("periodic_001", 2_500)];
+    let samples = SampleSeries::from_drained_typed(drained, None);
+    let stim = |elapsed_ms: u64, k: u16, iters: u64| StimulusEvent {
+        elapsed_ms,
+        label: format!("StepStart[{k}]"),
+        op_kind: None,
+        detail: None,
+        total_iterations: Some(iters),
+        step_index: Some(k),
+        is_terminal: false,
+    };
+    // step1@1000 (iters 0), loop step2@2000 (iters 1000, its OWN start
+    // frame — the loop-hold attribution fix), terminal@3000 (iters 3000).
+    let stimulus = vec![
+        stim(1000, 1, 0),
+        stim(2000, 2, 1000),
+        StimulusEvent::terminal(3000, 3000),
+    ];
+    let phases = crate::assert::build_phase_buckets_with_stimulus(&samples, &stimulus);
+    let step1 = phases.iter().find(|p| p.step_index == 1).expect("step 1 bucket");
+    let loop_step = phases.iter().find(|p| p.step_index == 2).expect("loop step bucket");
+    // Prior step gets ONLY its own window (0 -> 1000 over 1s = 1000/s),
+    // NOT the loop window grafted on.
+    assert_eq!(
+        step1.metrics.get("iteration_rate").copied(),
+        Some(1000.0),
+        "prior step must not absorb the loop step's window",
+    );
+    // Loop step gets the (loop_start -> terminal) rate: 1000 -> 3000
+    // over 1s = 2000/s.
+    assert_eq!(
+        loop_step.metrics.get("iteration_rate").copied(),
+        Some(2000.0),
+        "loop step must get its own throughput from its start frame + terminal",
     );
 }
 

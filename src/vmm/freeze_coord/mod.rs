@@ -12198,23 +12198,23 @@ impl KtstrVm {
         // stream) with the post-exit `drain_bulk()`. Mid-flight
         // entries come first since they were drained during
         // execution.
-        let (guest_messages, stimulus_events) =
+        // The complete TLV log (mid-flight + post-exit). The per-phase
+        // stimulus timeline (step frames + scenario-end terminal) is
+        // derived on demand from these entries via
+        // `VmResult::stimulus_timeline()` — no separate pre-extracted
+        // stimulus vec is stored, so every consumer sees the same
+        // complete timeline (the previous wire-only field omitted the
+        // terminal and silently dropped the last step's iteration_rate
+        // for post_vm re-derivation).
+        let guest_messages =
             if !mid_flight_drain.entries.is_empty() || !bulk_drain.entries.is_empty() {
                 let mut all_entries = mid_flight_drain.entries;
                 all_entries.extend(bulk_drain.entries);
-                let events: Vec<wire::StimulusEvent> = all_entries
-                    .iter()
-                    .filter(|e| e.msg_type == wire::MSG_TYPE_STIMULUS && e.crc_ok)
-                    .filter_map(|e| wire::StimulusEvent::from_payload(&e.payload))
-                    .collect();
-                (
-                    Some(BulkDrainResult {
-                        entries: all_entries,
-                    }),
-                    events,
-                )
+                Some(BulkDrainResult {
+                    entries: all_entries,
+                })
             } else {
-                (None, Vec::new())
+                None
             };
 
         let com2_bytes = run.com2.lock().output();
@@ -12364,7 +12364,6 @@ impl KtstrVm {
             stderr: console_output,
             monitor: monitor_report,
             guest_messages,
-            stimulus_events,
             verifier_stats,
             kvm_stats: None,
             crash_message,

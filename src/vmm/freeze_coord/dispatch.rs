@@ -693,9 +693,10 @@ pub(super) fn dispatch_bulk_message(
                     .store(event.step_index, std::sync::atomic::Ordering::Release);
             }
             // Stimulus is verdict-bearing — bucket verbatim so the
-            // post-run drain at `freeze_coord/mod.rs:11130`
-            // recovers the full log for `VmResult::stimulus_events`
-            // population.
+            // post-run drain recovers the full TLV log into
+            // `VmResult::guest_messages`, from which
+            // `VmResult::stimulus_timeline()` derives the per-phase
+            // timeline (step frames + scenario-end terminal) on demand.
             Some(crate::vmm::wire::ShmEntry {
                 msg_type: msg.msg_type,
                 payload: msg.payload.to_vec(),
