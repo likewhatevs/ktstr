@@ -866,17 +866,43 @@ pub const KVM_INTERESTING_STATS: &[&str] = &[
 ];
 
 impl KvmStatsTotals {
-    /// Sum a stat across all vCPUs.
+    /// Sum a stat across all vCPUs. Returns 0 BOTH when no vCPU published
+    /// the stat and when every vCPU measured zero — use [`Self::try_sum`]
+    /// to distinguish "unpublished" from "measured zero".
     pub fn sum(&self, name: &str) -> u64 {
-        self.per_vcpu.iter().filter_map(|m| m.get(name)).sum()
+        self.try_sum(name).unwrap_or(0)
     }
 
-    /// Average a stat across all vCPUs (returns 0 if no vCPUs).
+    /// Average a stat across all vCPUs (returns 0 if no vCPUs). Same
+    /// absent-vs-zero ambiguity as [`Self::sum`]; see [`Self::try_avg`].
     pub fn avg(&self, name: &str) -> u64 {
-        if self.per_vcpu.is_empty() {
-            return 0;
+        self.try_avg(name).unwrap_or(0)
+    }
+
+    /// Sum a stat across all vCPUs, or `None` when NO per-vCPU map
+    /// published it. Distinguishes an unpublished stat (`None`) from a
+    /// genuinely-measured zero (`Some(0)`) — the plain [`Self::sum`]
+    /// collapses both to `0`, so a test reading a counter that the kernel
+    /// never emitted on this arch cannot tell it apart from a real zero.
+    pub fn try_sum(&self, name: &str) -> Option<u64> {
+        let mut acc: Option<u64> = None;
+        for m in &self.per_vcpu {
+            if let Some(&v) = m.get(name) {
+                acc = Some(acc.unwrap_or(0) + v);
+            }
         }
-        self.sum(name) / self.per_vcpu.len() as u64
+        acc
+    }
+
+    /// Average a stat across all vCPUs, or `None` when there are no vCPUs
+    /// or NO per-vCPU map published the stat. The absent-aware counterpart
+    /// of [`Self::avg`].
+    pub fn try_avg(&self, name: &str) -> Option<u64> {
+        let n = self.per_vcpu.len() as u64;
+        if n == 0 {
+            return None;
+        }
+        self.try_sum(name).map(|s| s / n)
     }
 }
 
@@ -1074,6 +1100,29 @@ pub(crate) struct VmRunState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kvm_stats_try_sum_distinguishes_absent_from_zero() {
+        let totals = KvmStatsTotals {
+            per_vcpu: vec![
+                [("exits".to_string(), 0u64)].into_iter().collect(),
+                [("exits".to_string(), 0u64)].into_iter().collect(),
+            ],
+        };
+        // "exits" is published as 0 on every vCPU -> a measured zero.
+        assert_eq!(totals.try_sum("exits"), Some(0));
+        assert_eq!(totals.try_avg("exits"), Some(0));
+        // "halt_exits" was never published -> absent, not zero.
+        assert_eq!(totals.try_sum("halt_exits"), None);
+        assert_eq!(totals.try_avg("halt_exits"), None);
+        // sum/avg keep the 0-coercing behavior for both cases.
+        assert_eq!(totals.sum("exits"), 0);
+        assert_eq!(totals.sum("halt_exits"), 0);
+        // No vCPUs at all -> try_avg None (no div-by-zero, no false 0).
+        let empty = KvmStatsTotals { per_vcpu: vec![] };
+        assert_eq!(empty.try_sum("exits"), None);
+        assert_eq!(empty.try_avg("exits"), None);
+    }
 
     #[test]
     fn vm_result_fields_carry_values() {
