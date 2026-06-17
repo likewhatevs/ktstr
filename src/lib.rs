@@ -867,7 +867,7 @@ pub mod prelude {
     pub use crate::monitor::scx_walker::{DsqState, RqScxState, ScxSchedState};
     pub use crate::monitor::task_enrichment::TaskEnrichment;
     pub use crate::scenario::sample::{
-        BpfMapProjector, Sample, SampleSeries, StatsPathProjector, StatsValue,
+        BpfMapCpuProjector, BpfMapProjector, Sample, SampleSeries, StatsPathProjector, StatsValue,
     };
     pub use crate::scenario::snapshot::{
         BridgeGuard, CaptureCallback, CgroupProcsSnapshot, JsonField, MAX_WATCH_SNAPSHOTS,

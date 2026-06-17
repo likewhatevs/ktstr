@@ -158,6 +158,49 @@ impl<'a> SnapshotEntry<'a> {
         best.ok_or_else(|| self.empty_aggregate_error("cpu_min_u64"))
     }
 
+    /// Sum the per-CPU values at `path` as `i64`. Returns `0` when
+    /// every slot is `None` (no slot contributed), matching
+    /// [`Self::cpu_sum_u64`]'s empty-sum identity. The sum saturates
+    /// at `i64::MIN` / `i64::MAX`. A slot whose rendered value cannot
+    /// decode to `i64` propagates an Err immediately and stops the
+    /// aggregation.
+    pub fn cpu_sum_i64(&self, path: &str) -> SnapshotResult<i64> {
+        let mut acc: i64 = 0;
+        self.try_for_each_cpu_value(path, |v| {
+            acc = acc.saturating_add(SnapshotField::Value(v).as_i64()?);
+            Ok(())
+        })?;
+        Ok(acc)
+    }
+
+    /// Maximum of per-CPU values at `path` as `i64`. Returns
+    /// `Err(NoMatch)` when every slot is `None` (no slot contributed).
+    /// A slot whose rendered value cannot decode to `i64` propagates
+    /// an Err immediately.
+    pub fn cpu_max_i64(&self, path: &str) -> SnapshotResult<i64> {
+        let mut best: Option<i64> = None;
+        self.try_for_each_cpu_value(path, |v| {
+            let n = SnapshotField::Value(v).as_i64()?;
+            best = Some(best.map_or(n, |b| b.max(n)));
+            Ok(())
+        })?;
+        best.ok_or_else(|| self.empty_aggregate_error("cpu_max_i64"))
+    }
+
+    /// Minimum of per-CPU values at `path` as `i64`. Returns
+    /// `Err(NoMatch)` when every slot is `None`. A slot whose
+    /// rendered value cannot decode to `i64` propagates an Err
+    /// immediately.
+    pub fn cpu_min_i64(&self, path: &str) -> SnapshotResult<i64> {
+        let mut best: Option<i64> = None;
+        self.try_for_each_cpu_value(path, |v| {
+            let n = SnapshotField::Value(v).as_i64()?;
+            best = Some(best.map_or(n, |b| b.min(n)));
+            Ok(())
+        })?;
+        best.ok_or_else(|| self.empty_aggregate_error("cpu_min_i64"))
+    }
+
     /// Sum the per-CPU values at `path` as `f64`. Returns `0.0`
     /// when every slot is `None`. A slot whose rendered value
     /// cannot decode to `f64` propagates an Err immediately. NaN

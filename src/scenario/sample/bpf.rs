@@ -487,6 +487,245 @@ impl<'a> BpfMapProjector<'a> {
             })
             .collect()
     }
+
+    // -----------------------------------------------------------------
+    // Per-CPU projection. A `BPF_MAP_TYPE_PERCPU_ARRAY` /
+    // `*_PERCPU_HASH` value has one slot per CPU; the scalar
+    // `field_*` helpers above can't read it (`.get()` on a per-CPU
+    // entry returns `PerCpuNotNarrowed`). Two ways in:
+    //   - aggregate across CPUs: `field_cpu_sum_u64` etc., delegating
+    //     to the [`SnapshotEntry`](crate::scenario::snapshot::SnapshotEntry)
+    //     `cpu_*` reductions — None slots (unmapped CPUs) are skipped;
+    //     the empty set yields `0` for sum and `Err(NoMatch)` for
+    //     max / min;
+    //   - select one CPU: [`Self::cpu`] → [`BpfMapCpuProjector`].
+    // -----------------------------------------------------------------
+
+    /// Sum a named per-CPU field across all CPUs as `u64`. Delegates
+    /// to [`SnapshotEntry::cpu_sum_u64`](crate::scenario::snapshot::SnapshotEntry::cpu_sum_u64).
+    pub fn field_cpu_sum_u64(&self, field: &str) -> SeriesField<u64> {
+        let map_name = self.map_name.to_string();
+        let entry_index = self.entry_index;
+        let field_owned = field.to_string();
+        self.series.bpf(field, move |snap| {
+            let entry = match snap.map(&map_name) {
+                Ok(m) => m.at(entry_index),
+                Err(e) => return Err(e),
+            };
+            entry.cpu_sum_u64(&field_owned)
+        })
+    }
+
+    /// Sum a named per-CPU field across all CPUs as `i64`. The sum
+    /// saturates at `i64::MIN` / `i64::MAX` (parity with the `u64`
+    /// variant's `saturating_add`). Delegates to
+    /// [`SnapshotEntry::cpu_sum_i64`](crate::scenario::snapshot::SnapshotEntry::cpu_sum_i64).
+    pub fn field_cpu_sum_i64(&self, field: &str) -> SeriesField<i64> {
+        let map_name = self.map_name.to_string();
+        let entry_index = self.entry_index;
+        let field_owned = field.to_string();
+        self.series.bpf(field, move |snap| {
+            let entry = match snap.map(&map_name) {
+                Ok(m) => m.at(entry_index),
+                Err(e) => return Err(e),
+            };
+            entry.cpu_sum_i64(&field_owned)
+        })
+    }
+
+    /// Sum a named per-CPU field across all CPUs as `f64`. Delegates
+    /// to [`SnapshotEntry::cpu_sum_f64`](crate::scenario::snapshot::SnapshotEntry::cpu_sum_f64).
+    pub fn field_cpu_sum_f64(&self, field: &str) -> SeriesField<f64> {
+        let map_name = self.map_name.to_string();
+        let entry_index = self.entry_index;
+        let field_owned = field.to_string();
+        self.series.bpf(field, move |snap| {
+            let entry = match snap.map(&map_name) {
+                Ok(m) => m.at(entry_index),
+                Err(e) => return Err(e),
+            };
+            entry.cpu_sum_f64(&field_owned)
+        })
+    }
+
+    /// Maximum of a named per-CPU field across all CPUs as `u64`.
+    /// `Err(NoMatch)` when no CPU slot contributed. Delegates to
+    /// [`SnapshotEntry::cpu_max_u64`](crate::scenario::snapshot::SnapshotEntry::cpu_max_u64).
+    pub fn field_cpu_max_u64(&self, field: &str) -> SeriesField<u64> {
+        let map_name = self.map_name.to_string();
+        let entry_index = self.entry_index;
+        let field_owned = field.to_string();
+        self.series.bpf(field, move |snap| {
+            let entry = match snap.map(&map_name) {
+                Ok(m) => m.at(entry_index),
+                Err(e) => return Err(e),
+            };
+            entry.cpu_max_u64(&field_owned)
+        })
+    }
+
+    /// Maximum of a named per-CPU field across all CPUs as `i64`.
+    /// `Err(NoMatch)` when no CPU slot contributed. Delegates to
+    /// [`SnapshotEntry::cpu_max_i64`](crate::scenario::snapshot::SnapshotEntry::cpu_max_i64).
+    pub fn field_cpu_max_i64(&self, field: &str) -> SeriesField<i64> {
+        let map_name = self.map_name.to_string();
+        let entry_index = self.entry_index;
+        let field_owned = field.to_string();
+        self.series.bpf(field, move |snap| {
+            let entry = match snap.map(&map_name) {
+                Ok(m) => m.at(entry_index),
+                Err(e) => return Err(e),
+            };
+            entry.cpu_max_i64(&field_owned)
+        })
+    }
+
+    /// Maximum of a named per-CPU field across all CPUs as `f64`.
+    /// `Err(NoMatch)` when no CPU slot contributed; an all-NaN run
+    /// yields `Ok(NaN)`. Delegates to
+    /// [`SnapshotEntry::cpu_max_f64`](crate::scenario::snapshot::SnapshotEntry::cpu_max_f64).
+    pub fn field_cpu_max_f64(&self, field: &str) -> SeriesField<f64> {
+        let map_name = self.map_name.to_string();
+        let entry_index = self.entry_index;
+        let field_owned = field.to_string();
+        self.series.bpf(field, move |snap| {
+            let entry = match snap.map(&map_name) {
+                Ok(m) => m.at(entry_index),
+                Err(e) => return Err(e),
+            };
+            entry.cpu_max_f64(&field_owned)
+        })
+    }
+
+    /// Minimum of a named per-CPU field across all CPUs as `u64`.
+    /// `Err(NoMatch)` when no CPU slot contributed. Delegates to
+    /// [`SnapshotEntry::cpu_min_u64`](crate::scenario::snapshot::SnapshotEntry::cpu_min_u64).
+    pub fn field_cpu_min_u64(&self, field: &str) -> SeriesField<u64> {
+        let map_name = self.map_name.to_string();
+        let entry_index = self.entry_index;
+        let field_owned = field.to_string();
+        self.series.bpf(field, move |snap| {
+            let entry = match snap.map(&map_name) {
+                Ok(m) => m.at(entry_index),
+                Err(e) => return Err(e),
+            };
+            entry.cpu_min_u64(&field_owned)
+        })
+    }
+
+    /// Minimum of a named per-CPU field across all CPUs as `i64`.
+    /// `Err(NoMatch)` when no CPU slot contributed. Delegates to
+    /// [`SnapshotEntry::cpu_min_i64`](crate::scenario::snapshot::SnapshotEntry::cpu_min_i64).
+    pub fn field_cpu_min_i64(&self, field: &str) -> SeriesField<i64> {
+        let map_name = self.map_name.to_string();
+        let entry_index = self.entry_index;
+        let field_owned = field.to_string();
+        self.series.bpf(field, move |snap| {
+            let entry = match snap.map(&map_name) {
+                Ok(m) => m.at(entry_index),
+                Err(e) => return Err(e),
+            };
+            entry.cpu_min_i64(&field_owned)
+        })
+    }
+
+    /// Minimum of a named per-CPU field across all CPUs as `f64`.
+    /// `Err(NoMatch)` when no CPU slot contributed; an all-NaN run
+    /// yields `Ok(NaN)`. Delegates to
+    /// [`SnapshotEntry::cpu_min_f64`](crate::scenario::snapshot::SnapshotEntry::cpu_min_f64).
+    pub fn field_cpu_min_f64(&self, field: &str) -> SeriesField<f64> {
+        let map_name = self.map_name.to_string();
+        let entry_index = self.entry_index;
+        let field_owned = field.to_string();
+        self.series.bpf(field, move |snap| {
+            let entry = match snap.map(&map_name) {
+                Ok(m) => m.at(entry_index),
+                Err(e) => return Err(e),
+            };
+            entry.cpu_min_f64(&field_owned)
+        })
+    }
+
+    /// Narrow to a single CPU's slot of a per-CPU map, returning a
+    /// [`BpfMapCpuProjector`] whose `field_*` read CPU `n` (vs the
+    /// cross-CPU [`Self::field_cpu_sum_u64`] reductions). Mirrors
+    /// [`Self::at`] as a builder step; making the per-CPU SELECT a
+    /// distinct handle means `.cpu(n).field_cpu_sum_*` cannot be
+    /// written (aggregate-vs-select can't be mixed up).
+    ///
+    /// On a non-per-CPU map (`.bss` / ARRAY / HASH) `.cpu(n)` is a
+    /// no-op — the underlying [`SnapshotMap::cpu`](crate::scenario::snapshot::SnapshotMap::cpu)
+    /// narrow is recorded but ignored, so the value reads the same as
+    /// without it (it neither errors nor filters).
+    pub fn cpu(self, n: usize) -> BpfMapCpuProjector<'a> {
+        BpfMapCpuProjector {
+            series: self.series,
+            map_name: self.map_name,
+            entry_index: self.entry_index,
+            cpu: n,
+        }
+    }
+}
+
+/// Single-CPU view of a per-CPU BPF map, returned by
+/// [`BpfMapProjector::cpu`]. Its `field_*` read the chosen CPU's slot
+/// of the map's per-CPU value — the per-CPU SELECT counterpart to the
+/// cross-CPU [`BpfMapProjector::field_cpu_sum_u64`] reductions.
+///
+/// On a non-per-CPU map the CPU narrow is a no-op (see
+/// [`BpfMapProjector::cpu`]), so `field_*` read the plain value.
+pub struct BpfMapCpuProjector<'a> {
+    series: &'a SampleSeries,
+    map_name: &'a str,
+    entry_index: usize,
+    cpu: usize,
+}
+
+impl<'a> BpfMapCpuProjector<'a> {
+    /// Project this CPU's slot of a named struct field as `u64`.
+    pub fn field_u64(&self, field: &str) -> SeriesField<u64> {
+        let map_name = self.map_name.to_string();
+        let entry_index = self.entry_index;
+        let cpu = self.cpu;
+        let field_owned = field.to_string();
+        self.series.bpf(field, move |snap| {
+            let entry = match snap.map(&map_name) {
+                Ok(m) => m.cpu(cpu).at(entry_index),
+                Err(e) => return Err(e),
+            };
+            entry.get(&field_owned).as_u64()
+        })
+    }
+
+    /// Project this CPU's slot of a named struct field as `i64`.
+    pub fn field_i64(&self, field: &str) -> SeriesField<i64> {
+        let map_name = self.map_name.to_string();
+        let entry_index = self.entry_index;
+        let cpu = self.cpu;
+        let field_owned = field.to_string();
+        self.series.bpf(field, move |snap| {
+            let entry = match snap.map(&map_name) {
+                Ok(m) => m.cpu(cpu).at(entry_index),
+                Err(e) => return Err(e),
+            };
+            entry.get(&field_owned).as_i64()
+        })
+    }
+
+    /// Project this CPU's slot of a named struct field as `f64`.
+    pub fn field_f64(&self, field: &str) -> SeriesField<f64> {
+        let map_name = self.map_name.to_string();
+        let entry_index = self.entry_index;
+        let cpu = self.cpu;
+        let field_owned = field.to_string();
+        self.series.bpf(field, move |snap| {
+            let entry = match snap.map(&map_name) {
+                Ok(m) => m.cpu(cpu).at(entry_index),
+                Err(e) => return Err(e),
+            };
+            entry.get(&field_owned).as_f64()
+        })
+    }
 }
 
 #[cfg(test)]
@@ -802,6 +1041,211 @@ mod tests {
             f64s.is_empty(),
             "empty series must yield empty f64_fields, got {} entries",
             f64s.len(),
+        );
+    }
+
+    // --- per-CPU projection ---
+
+    /// Build a one-sample series with a single PERCPU map `cpu_ctxs`
+    /// whose key 0 carries a per-CPU `cpu_ctx { dispatched: Uint }`
+    /// slot per entry — `None` models an unreadable / unmapped CPU
+    /// slot (the by-slot `None` the host renderer emits).
+    fn percpu_series(per_cpu: &[Option<u64>]) -> SampleSeries {
+        let slots: Vec<Option<RenderedValue>> = per_cpu
+            .iter()
+            .map(|v| {
+                v.map(|n| RenderedValue::Struct {
+                    type_name: Some("cpu_ctx".into()),
+                    members: vec![RenderedMember {
+                        name: "dispatched".into(),
+                        value: RenderedValue::Uint { bits: 64, value: n },
+                    }],
+                })
+            })
+            .collect();
+        let map = FailureDumpMap {
+            name: "cpu_ctxs".into(),
+            percpu_entries: vec![crate::monitor::dump::FailureDumpPercpuEntry {
+                key: 0,
+                per_cpu: slots,
+            }],
+            ..Default::default()
+        };
+        let report = FailureDumpReport {
+            schema: SCHEMA_SINGLE.to_string(),
+            maps: vec![map],
+            ..Default::default()
+        };
+        SampleSeries::from_drained(
+            vec![("periodic_000".to_string(), report, None, Some(100))],
+            None,
+        )
+    }
+
+    fn oks_u64(f: SeriesField<u64>) -> Vec<u64> {
+        f.values_iter().filter_map(|r| r.as_ref().ok().copied()).collect()
+    }
+    fn oks_i64(f: SeriesField<i64>) -> Vec<i64> {
+        f.values_iter().filter_map(|r| r.as_ref().ok().copied()).collect()
+    }
+    fn oks_f64(f: SeriesField<f64>) -> Vec<f64> {
+        f.values_iter().filter_map(|r| r.as_ref().ok().copied()).collect()
+    }
+
+    /// `field_cpu_sum_u64` sums the readable per-CPU slots and SKIPS
+    /// the `None` (unreadable) slot.
+    #[test]
+    fn bpf_map_projector_field_cpu_sum_u64_sums_present_skips_none() {
+        let series = percpu_series(&[Some(11), Some(22), None, Some(44)]);
+        assert_eq!(
+            oks_u64(series.bpf_map("cpu_ctxs").at(0).field_cpu_sum_u64("dispatched")),
+            vec![11 + 22 + 44],
+        );
+    }
+
+    /// `field_cpu_max_u64` / `field_cpu_min_u64` reduce across the
+    /// readable slots.
+    #[test]
+    fn bpf_map_projector_field_cpu_max_min_u64() {
+        let series = percpu_series(&[Some(11), Some(22), None, Some(44)]);
+        assert_eq!(
+            oks_u64(series.bpf_map("cpu_ctxs").at(0).field_cpu_max_u64("dispatched")),
+            vec![44],
+        );
+        assert_eq!(
+            oks_u64(series.bpf_map("cpu_ctxs").at(0).field_cpu_min_u64("dispatched")),
+            vec![11],
+        );
+    }
+
+    /// The NEW i64 reductions (`field_cpu_sum_i64` etc.) mirror the
+    /// u64 ones over the same readable slots.
+    #[test]
+    fn bpf_map_projector_field_cpu_i64_aggregates() {
+        let series = percpu_series(&[Some(11), Some(22), None, Some(44)]);
+        assert_eq!(
+            oks_i64(series.bpf_map("cpu_ctxs").at(0).field_cpu_sum_i64("dispatched")),
+            vec![77],
+        );
+        assert_eq!(
+            oks_i64(series.bpf_map("cpu_ctxs").at(0).field_cpu_max_i64("dispatched")),
+            vec![44],
+        );
+        assert_eq!(
+            oks_i64(series.bpf_map("cpu_ctxs").at(0).field_cpu_min_i64("dispatched")),
+            vec![11],
+        );
+    }
+
+    /// `field_cpu_sum_f64` reads the Uint slots as f64 and sums them.
+    #[test]
+    fn bpf_map_projector_field_cpu_sum_f64() {
+        let series = percpu_series(&[Some(10), None, Some(30)]);
+        assert_eq!(
+            oks_f64(series.bpf_map("cpu_ctxs").at(0).field_cpu_sum_f64("dispatched")),
+            vec![40.0],
+        );
+    }
+
+    /// `.cpu(n)` selects ONE CPU's slot; an unmapped (`None`) slot
+    /// surfaces as an error (distinct from the aggregate skip).
+    #[test]
+    fn bpf_map_projector_cpu_select_reads_one_cpu_and_errors_on_none() {
+        let series = percpu_series(&[Some(11), Some(22), None, Some(44)]);
+        assert_eq!(
+            oks_u64(series.bpf_map("cpu_ctxs").cpu(1).field_u64("dispatched")),
+            vec![22],
+        );
+        let none_slot = series.bpf_map("cpu_ctxs").cpu(2).field_u64("dispatched");
+        assert!(
+            none_slot.values_iter().all(|r| r.is_err()),
+            "an unmapped CPU slot must surface as an error on select, not a value",
+        );
+    }
+
+    /// All-None: `field_cpu_sum_u64` yields the empty-sum identity `0`
+    /// (the deliberate behavior; #18 tracks the pending no-data-error
+    /// decision), while `field_cpu_max_u64` errors (max of empty set
+    /// is undefined).
+    #[test]
+    fn bpf_map_projector_field_cpu_all_none_sum_zero_max_errors() {
+        let series = percpu_series(&[None, None, None]);
+        assert_eq!(
+            oks_u64(series.bpf_map("cpu_ctxs").at(0).field_cpu_sum_u64("dispatched")),
+            vec![0],
+        );
+        let max = series.bpf_map("cpu_ctxs").at(0).field_cpu_max_u64("dispatched");
+        assert!(
+            max.values_iter().all(|r| r.is_err()),
+            "all-None max must error (max of the empty set is undefined)",
+        );
+    }
+
+    /// A cross-CPU reduction on a NON-per-CPU map errors (the value is
+    /// not a per-CPU entry) rather than silently mis-reading it.
+    #[test]
+    fn bpf_map_projector_field_cpu_sum_on_non_percpu_errors() {
+        let series = SampleSeries::from_drained(
+            vec![("periodic_000".to_string(), synthetic_report(10), None, Some(100))],
+            None,
+        );
+        let f = series
+            .bpf_map("scx_obj.bss")
+            .at(0)
+            .field_cpu_sum_u64("nr_dispatched");
+        assert!(
+            f.values_iter().all(|r| r.is_err()),
+            "cpu_sum on a non-per-CPU map must error (TypeMismatch)",
+        );
+    }
+
+    /// A readable per-CPU slot whose value can't decode to the
+    /// requested scalar makes the aggregate ERR (not a silent skip /
+    /// partial sum) — only `None` (unreadable) slots are skipped. The
+    /// aggregator's `?` on `as_u64()` propagates the decode failure and
+    /// stops the walk, so a malformed slot can never be silently
+    /// dropped from the sum (the no-silent-drop contract).
+    #[test]
+    fn bpf_map_projector_field_cpu_sum_errors_on_non_numeric_slot() {
+        let bad = RenderedValue::Struct {
+            type_name: Some("cpu_ctx".into()),
+            members: vec![RenderedMember {
+                name: "dispatched".into(),
+                value: RenderedValue::Bytes { hex: "de ad".into() },
+            }],
+        };
+        let good = RenderedValue::Struct {
+            type_name: Some("cpu_ctx".into()),
+            members: vec![RenderedMember {
+                name: "dispatched".into(),
+                value: RenderedValue::Uint { bits: 64, value: 7 },
+            }],
+        };
+        let map = FailureDumpMap {
+            name: "cpu_ctxs".into(),
+            percpu_entries: vec![crate::monitor::dump::FailureDumpPercpuEntry {
+                key: 0,
+                per_cpu: vec![Some(bad), Some(good)],
+            }],
+            ..Default::default()
+        };
+        let report = FailureDumpReport {
+            schema: SCHEMA_SINGLE.to_string(),
+            maps: vec![map],
+            ..Default::default()
+        };
+        let series = SampleSeries::from_drained(
+            vec![("periodic_000".to_string(), report, None, Some(100))],
+            None,
+        );
+        let f = series
+            .bpf_map("cpu_ctxs")
+            .at(0)
+            .field_cpu_sum_u64("dispatched");
+        assert!(
+            f.values_iter().all(|r| r.is_err()),
+            "a non-numeric readable slot must make field_cpu_sum_u64 ERR \
+             (no silent skip / partial sum over the numeric slots)",
         );
     }
 

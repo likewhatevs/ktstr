@@ -250,6 +250,34 @@ struct {
 	__uint(max_entries, KTSTR_ARRAY_ENTRIES);
 } ktstr_array_fixture SEC(".maps");
 
+/* Per-CPU fixture for the per-CPU map-projection e2e
+ * (tests/percpu_projection_e2e.rs). One-key PERCPU_ARRAY; each CPU
+ * that dispatches stamps its OWN slot from ktstr_dispatch via
+ * bpf_map_lookup_elem (which returns the running CPU's per-CPU slot),
+ * so slot i carries KTSTR_PERCPU_MAGIC + i for every CPU that ran.
+ * CPUs that never dispatched keep the kernel zero-fill (read back as
+ * Some(0) on the host, NOT None — None is only an unreadable slot).
+ * Exists solely to give the host-side per-CPU snapshot projector
+ * (`BpfMapProjector::field_cpu_sum_u64` / `.cpu(n)`) real captured
+ * per-CPU data; nothing inside scx-ktstr reads it back. The value is a
+ * 16-byte struct so the host can project a named field. The map name
+ * is kept <= 15 chars so the kernel's BPF_OBJ_NAME_LEN truncation
+ * leaves it intact for the host's name-based `bpf_map(...)` lookup. */
+#define KTSTR_PERCPU_MAGIC 0x5A5A00000000ULL
+
+struct ktstr_percpu_value {
+	__u64 magic;
+	__u32 cpu_echo;
+	__u32 _pad;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__type(key, __u32);
+	__type(value, struct ktstr_percpu_value);
+	__uint(max_entries, 1);
+} ktstr_pcpu_fix SEC(".maps");
+
 /* Single sentinel key for `ktstr_cross_btf_map`. The fixture only
  * uses one entry — distinct keys would diverge the publish and
  * chase helpers' lookups, producing a useless empty entry. */
@@ -446,6 +474,22 @@ void BPF_STRUCT_OPS(ktstr_dispatch, s32 cpu, struct task_struct *prev)
 	}
 	scx_bpf_dsq_move_to_local(SHARED_DSQ, 0);
 	__sync_fetch_and_add(&nr_dispatched, 1);
+
+	/* Per-CPU fixture stamp — see `ktstr_pcpu_fix` decl.
+	 * `bpf_map_lookup_elem` on a PERCPU_ARRAY returns the RUNNING
+	 * CPU's own slot, so each dispatching CPU records
+	 * KTSTR_PERCPU_MAGIC + its id (and echoes the id). Lets the
+	 * per-CPU map-projection e2e read distinct per-CPU values back. */
+	{
+		__u32 pz = 0;
+		struct ktstr_percpu_value *pv =
+			bpf_map_lookup_elem(&ktstr_pcpu_fix, &pz);
+		if (pv) {
+			__u32 me = bpf_get_smp_processor_id();
+			pv->magic = KTSTR_PERCPU_MAGIC + me;
+			pv->cpu_echo = me;
+		}
+	}
 
 	/* Per-cgroup dispatch tally — see `ktstr_cgroup_dispatch_count`
 	 * decl for purpose. NULL lookup is the cold-key path; insert

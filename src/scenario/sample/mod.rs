@@ -53,7 +53,7 @@ mod host;
 mod monitor;
 mod stats;
 
-pub use bpf::BpfMapProjector;
+pub use bpf::{BpfMapCpuProjector, BpfMapProjector};
 pub use host::HostView;
 pub use monitor::{ERROR_CLASS_NAMES, MonitorView, ScxEventsView};
 pub use stats::{StatsPathProjector, StatsValue};
