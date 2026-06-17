@@ -1765,7 +1765,10 @@ fn merge_metric_values(
 ) -> f64 {
     use crate::stats::{GaugeAgg, MetricKind};
     match kind {
-        Some(MetricKind::Counter) => a + b,
+        // Counter (cumulative) and DeltaSum (sum of per-read deltas)
+        // both merge across AssertResults by summing the reduced values
+        // (commutative — see MetricKind::merge_kind).
+        Some(MetricKind::Counter) | Some(MetricKind::DeltaSum) => a + b,
         Some(MetricKind::Peak) | Some(MetricKind::Gauge(GaugeAgg::Max)) => a.max(b),
         Some(MetricKind::Gauge(GaugeAgg::Avg)) => {
             let total_count = a_count + b_count;

@@ -135,6 +135,20 @@ pub enum MetricKind {
     /// CLOCK_REALTIME-stamped capture timestamps). Aggregate by
     /// Last — averaging timestamps loses meaning.
     Timestamp,
+    /// PRE-DELTAED counter: each sample is already a delta-since-the-
+    /// previous-read, not a cumulative-since-boot total. Schedulers
+    /// that delta their scx_stats Metrics server-side per reader
+    /// request (e.g. scx_mitosis) produce this — one ktstr snapshot =
+    /// one reader request = one delta. The per-phase reduction is the
+    /// SUM of the in-phase deltas (NOT the `Counter` last-minus-first,
+    /// which would difference two deltas into nonsense); the flat-run
+    /// reduction is likewise the sum. Boundary: the first in-phase
+    /// delta straddles the phase boundary (it spans from the last
+    /// pre-phase read to the first in-phase read, so it includes a
+    /// little pre-phase activity); it is attributed to the phase its
+    /// read lands in — a slight left-edge over-attribution, the
+    /// deliberate semantic since a per-read delta cannot be split.
+    DeltaSum,
 }
 
 /// Sub-classification for [`MetricKind::Gauge`] picking the
@@ -212,6 +226,10 @@ impl MetricKind {
             MetricKind::Gauge(GaugeAgg::Max) => MergeKind::Commutative,
             MetricKind::Gauge(GaugeAgg::Last) => MergeKind::NonCommutative,
             MetricKind::Timestamp => MergeKind::NonCommutative,
+            // Per-phase reduction is a sum of in-phase deltas — an
+            // associative, commutative fold, so cross-AssertResult merge
+            // sums the two reduced values (same as Counter).
+            MetricKind::DeltaSum => MergeKind::Commutative,
         }
     }
 }
@@ -300,7 +318,12 @@ fn aggregate_finite(
         return None;
     }
     Some(match kind {
-        MetricKind::Counter => finite.iter().sum(),
+        // Counter (cumulative-since-boot, cross-RUN flat sum) and
+        // DeltaSum (each sample already a per-read delta) both reduce to
+        // a plain sum of the finite samples here; they differ only in
+        // the PER-PHASE path (Counter last-minus-first vs DeltaSum sum —
+        // see aggregate_samples_for_phase).
+        MetricKind::Counter | MetricKind::DeltaSum => finite.iter().sum(),
         MetricKind::Gauge(GaugeAgg::Avg) => {
             // Weighted mean: sum(v * w) / sum(w). Uniform-weight
             // callers (aggregate_samples) reduce to arithmetic
@@ -351,7 +374,10 @@ fn aggregate_finite(
 /// delta `175 - 100 = 75`) and route through
 /// [`phase_counter_delta`] instead. All other kinds use
 /// [`aggregate_samples`] verbatim, which is correct for them
-/// (Gauge avg/last/max, Peak max, Timestamp last).
+/// (Gauge avg/last/max, Peak max, Timestamp last, and DeltaSum — whose
+/// samples are ALREADY per-read deltas, so the per-phase reduction is
+/// the sum of the in-phase deltas, NOT a last-minus-first that would
+/// difference two deltas into nonsense).
 ///
 /// `samples` are the per-Sample readings of `metric` collected
 /// over one phase's window of
@@ -5616,6 +5642,30 @@ mod tests {
             Some(4.0),
             "Gauge(Avg) kind must reduce by arithmetic mean",
         );
+
+        let delta_sum = MetricDef {
+            name: "total_test_delta",
+            accessor: |_| None,
+            display_unit: "",
+            polarity: crate::test_support::Polarity::LowerBetter,
+            default_abs: 0.0,
+            default_rel: 0.0,
+            kind: MetricKind::DeltaSum,
+        };
+        // DeltaSum samples are ALREADY per-read deltas, so the per-phase
+        // reduction SUMS them — NOT a last-minus-first that would
+        // difference two deltas. [10, 20, 5] -> 35, not 5 - 10 (which a
+        // Counter would clamp to 0).
+        assert_eq!(
+            aggregate_samples_for_phase(&delta_sum, &[10.0, 20.0, 5.0]),
+            Some(35.0),
+            "DeltaSum kind must reduce by sum of per-read deltas",
+        );
+        assert_eq!(
+            aggregate_samples(&[10.0, 20.0, 5.0], MetricKind::DeltaSum),
+            Some(35.0),
+            "DeltaSum flat-run reduction is also a sum",
+        );
     }
 
     /// All-empty / all-NaN inputs to either entry point return
@@ -5664,13 +5714,15 @@ mod tests {
     #[test]
     fn every_metric_has_kind_consistent_with_naming() {
         for m in METRICS {
-            // Counter metrics must be named with `total_` / `_count` /
+            // Counter and DeltaSum metrics are both cumulative totals
+            // (Counter = since-boot, DeltaSum = sum of per-read deltas),
+            // so both must be named with `total_` / `_count` /
             // `total_iterations` / `stuck_count` per the established
             // convention.
-            if matches!(m.kind, MetricKind::Counter) {
+            if matches!(m.kind, MetricKind::Counter | MetricKind::DeltaSum) {
                 assert!(
                     m.name.starts_with("total_") || m.name.ends_with("_count"),
-                    "Counter-kind metric must follow total_*/*_count naming, got {:?}",
+                    "Counter/DeltaSum-kind metric must follow total_*/*_count naming, got {:?}",
                     m.name,
                 );
             }

@@ -174,6 +174,52 @@ impl<T> SeriesField<T> {
         out
     }
 
+    /// Per-phase SUM of the Ok-sample values — the per-phase total for a
+    /// metric whose samples are already per-read DELTAS, e.g. a
+    /// scheduler-defined scx_stats metric the scheduler deltas
+    /// server-side per reader request (one ktstr snapshot = one request
+    /// = one delta), read via `series.stats(name)`. Returns one entry
+    /// per phase with at least one finite Ok-sample; all-err / all-NaN
+    /// phases and `None`-phase (fixture / unstamped) samples are
+    /// excluded, matching [`Self::aggregate_by_phase`].
+    ///
+    /// This is the `crate::stats::MetricKind::DeltaSum` per-phase
+    /// reduction WITHOUT requiring a `crate::stats::MetricDef` — the
+    /// ergonomic accessor for the common case "I read a delta-reported
+    /// scx_stats metric; give me each phase's total." For a registered
+    /// metric, `aggregate_by_phase(&def)` with `def.kind == DeltaSum`
+    /// gives the identical result.
+    ///
+    /// Boundary: the first in-phase delta straddles the phase boundary
+    /// (it spans from the last pre-phase read to the first in-phase
+    /// read, so it carries a little pre-phase activity); it is
+    /// attributed to the phase its read lands in — a slight left-edge
+    /// over-attribution, the deliberate semantic since a per-read delta
+    /// cannot be split.
+    pub fn sum_by_phase(&self) -> std::collections::BTreeMap<crate::assert::Phase, f64>
+    where
+        T: Copy + Into<f64>,
+    {
+        let (by_phase, _none_bucket) = self.by_phase();
+        let mut out: std::collections::BTreeMap<crate::assert::Phase, f64> =
+            std::collections::BTreeMap::new();
+        for (phase, samples) in by_phase {
+            let values: Vec<f64> = samples
+                .iter()
+                .filter_map(|(_tag, _elapsed, value)| match value {
+                    Ok(v) => Some((*v).into()),
+                    Err(_) => None,
+                })
+                .collect();
+            if let Some(reduced) =
+                crate::stats::aggregate_samples(&values, crate::stats::MetricKind::DeltaSum)
+            {
+                out.insert(phase, reduced);
+            }
+        }
+        out
+    }
+
     /// Apply `f` once per phase, with the per-phase slice of
     /// [`SampleTriple<T>`]s. `None`-phase samples (fixture /
     /// unstamped) are skipped — callers wanting them call
@@ -2738,6 +2784,46 @@ mod tests {
             agg[&crate::assert::Phase::step(0)],
             75.0,
             "Counter routes through phase_counter_delta (last-first), not the flat-run sum aggregate_samples",
+        );
+    }
+
+    /// `sum_by_phase` totals per-read DELTAS per phase — the
+    /// delta-reported scx_stats reduction. Each sample is its own
+    /// window's count, so the per-phase total is their SUM, NOT a
+    /// Counter last-minus-first (which would difference two deltas).
+    #[test]
+    fn series_field_sum_by_phase_sums_per_read_deltas_per_phase() {
+        let f = SeriesField::<f64>::from_parts_with_phases(
+            "x",
+            vec![
+                "t0".into(),
+                "t1".into(),
+                "t2".into(),
+                "t3".into(),
+                "t4".into(),
+            ],
+            vec![100, 200, 300, 400, 500],
+            vec![Ok(10.0), Ok(20.0), Ok(5.0), Ok(100.0), Ok(50.0)],
+            vec![
+                Some(crate::assert::Phase::step(0)),
+                Some(crate::assert::Phase::step(0)),
+                Some(crate::assert::Phase::step(0)),
+                Some(crate::assert::Phase::step(1)),
+                Some(crate::assert::Phase::step(1)),
+            ],
+        );
+        let sums = f.sum_by_phase();
+        assert_eq!(sums.len(), 2, "two distinct phases");
+        assert_eq!(
+            sums[&crate::assert::Phase::step(0)],
+            35.0,
+            "Step[0] is the SUM of its per-read deltas (10+20+5=35), NOT a \
+             last-minus-first (5-10)",
+        );
+        assert_eq!(
+            sums[&crate::assert::Phase::step(1)],
+            150.0,
+            "Step[1] = 100 + 50",
         );
     }
 
