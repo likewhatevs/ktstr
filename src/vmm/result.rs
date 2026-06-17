@@ -603,16 +603,18 @@ impl VmResult {
     /// the framework's own `result.stats.phases` empty (the drain-once
     /// starvation [`Self::captures_series`] now prevents).
     ///
-    /// Folds [`Self::captures_series`] (the shared single drain)
-    /// through [`crate::assert::build_phase_buckets_with_stimulus`]
-    /// using [`Self::stimulus_timeline`] for the step windows. In
-    /// production the framework builds `stats.phases` from the same
+    /// Folds [`Self::periodic_series`] (the periodic-only projection of
+    /// the shared single drain — on-demand / watchpoint captures are
+    /// off-cadence outliers excluded from per-phase folds) through
+    /// [`crate::assert::build_phase_buckets_with_stimulus`] using
+    /// [`Self::stimulus_timeline`] for the step windows. In production
+    /// the framework builds `stats.phases` from the same periodic-only
     /// series and the same stimulus timeline, so this returns content
     /// identical to `result.stats.phases` (pinned by a
     /// `phase_buckets() == stats.phases` test).
     pub fn phase_buckets(&self) -> Vec<crate::assert::PhaseBucket> {
         crate::assert::build_phase_buckets_with_stimulus(
-            self.captures_series(),
+            &self.periodic_series(),
             &self.stimulus_timeline(),
         )
     }

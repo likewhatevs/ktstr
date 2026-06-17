@@ -1563,9 +1563,15 @@ fn evaluate_vm_result(
     // `result.phase_buckets()` uses — so `stats.phases` and
     // `result.phase_buckets()` carry identical content; pinned by
     // `phase_buckets_equals_stats_phases`).
-    let early_sample_series = result.captures_series();
+    //
+    // Bucket the PERIODIC-ONLY view: on-demand `Op::CaptureSnapshot` and
+    // watchpoint-fire captures are off-cadence outliers (see
+    // `SampleSeries::periodic_only`) that must not pollute the per-phase
+    // metric folds. `periodic_series()` reads the same memoized
+    // single-drain `captures_series()` cache, so this does not re-drain.
+    let early_periodic_series = result.periodic_series();
     let mut early_phase_buckets =
-        crate::assert::build_phase_buckets_with_stimulus(early_sample_series, stimulus_events);
+        crate::assert::build_phase_buckets_with_stimulus(&early_periodic_series, stimulus_events);
     // Build timeline from the pre-bucketed phases. When no
     // PhaseBuckets exist (scenario had no periodic captures,
     // e.g. single-phase tests) but monitor samples ARE present,
@@ -2034,13 +2040,17 @@ fn evaluate_vm_result(
         // call path because those tests instrument the framework
         // rather than depending on it.
         // Phase buckets were built at evaluate_vm_result entry from
-        // `result.captures_series()` so the unified PhaseBucket source
-        // feeds both the failure-message Timeline render (via
+        // `result.periodic_series()` (off-cadence on-demand / watchpoint
+        // captures excluded) so the unified PhaseBucket source feeds both
+        // the failure-message Timeline render (via
         // Timeline::from_phase_buckets up top) and the stamped
-        // ScenarioStats.phases below. Reuse the pre-built vec + the
-        // cached SampleSeries rather than re-draining.
+        // ScenarioStats.phases below. The cross-RUN ext_metrics fill
+        // below reuses the SAME periodic-only series so off-cadence
+        // outliers do not pollute the cross-RUN aggregates either. Reuse
+        // the pre-built vec + the already-drained series rather than
+        // re-draining.
         check_result.stats.phases = std::mem::take(&mut early_phase_buckets);
-        let sample_series_for_phases = early_sample_series;
+        let sample_series_for_phases = &early_periodic_series;
         // Cross-RUN aggregate fill: for any METRICS entry with a
         // read_sample wire but no typed GauntletRow field, compute
         // the per-RUN aggregate from the same samples and write into

@@ -619,6 +619,78 @@ fn build_phase_buckets_extracts_wired_metric_arms_end_to_end() {
     }
 }
 
+/// Off-cadence captures (on-demand `Op::CaptureSnapshot` / watchpoint
+/// fires, tagged non-`periodic_`) must NOT pollute per-phase metric
+/// folds — the production accessors (`VmResult::phase_buckets` /
+/// `evaluate_vm_result`) bucket `periodic_only()`. A full-series bucket
+/// folds the off-cadence outlier into the Peak; a periodic-only bucket
+/// excludes it.
+#[test]
+fn periodic_only_excludes_off_cadence_captures_from_phase_buckets() {
+    use crate::monitor::dump::{FailureDumpReport, SCHEMA_SINGLE};
+    use crate::monitor::scx_walker::DsqState;
+
+    fn entry(tag: &str, elapsed_ms: u64, dsq_depth: u32) -> DrainedSnapshotEntry {
+        DrainedSnapshotEntry {
+            tag: tag.to_string(),
+            report: FailureDumpReport {
+                schema: SCHEMA_SINGLE.to_string(),
+                dsq_states: vec![DsqState {
+                    id: 0,
+                    origin: "local cpu 0".to_string(),
+                    nr: dsq_depth,
+                    seq: 0,
+                    task_kvas: Vec::new(),
+                    truncated: false,
+                }],
+                ..Default::default()
+            },
+            stats: Err(MissingStatsReason::NoSchedulerBinary),
+            elapsed_ms: Some(elapsed_ms),
+            boundary_offset_ms: None,
+            step_index: Some(1),
+        }
+    }
+
+    // Step[0]: two periodic captures (dsq 5, 8) + one off-cadence
+    // on-demand capture with a wild dsq depth (1000). max_dsq_depth is a
+    // Peak (order-independent), so the outlier wins a full-series max.
+    let drained = vec![
+        entry("periodic_000", 100, 5),
+        entry("periodic_001", 200, 8),
+        entry("ondemand_000", 300, 1000),
+    ];
+    let series = SampleSeries::from_drained_typed(drained, None);
+
+    // Sanity: the full series folds the off-cadence outlier into the Peak.
+    let full = crate::assert::build_phase_buckets(&series);
+    assert_eq!(
+        full.iter()
+            .find(|p| p.step_index == 1)
+            .expect("Step[0]")
+            .metrics
+            .get("max_dsq_depth")
+            .copied(),
+        Some(1000.0),
+        "full series includes the off-cadence capture's dsq depth",
+    );
+
+    // Periodic-only (the production path) EXCLUDES the off-cadence
+    // capture: the Peak is the periodic max (8), not the 1000 outlier.
+    let periodic = crate::assert::build_phase_buckets(&series.clone().periodic_only());
+    assert_eq!(
+        periodic
+            .iter()
+            .find(|p| p.step_index == 1)
+            .expect("Step[0]")
+            .metrics
+            .get("max_dsq_depth")
+            .copied(),
+        Some(8.0),
+        "periodic_only excludes the off-cadence outlier: max is 8, NOT 1000",
+    );
+}
+
 /// `system_time_ns` / `user_time_ns` are injected per-phase as a
 /// per-thread-GROUP delta (each tgid's `thread_group_cputime` at first
 /// vs last appearance, summed), NOT a per-sample cross-task sum then a
