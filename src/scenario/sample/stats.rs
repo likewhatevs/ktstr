@@ -12,6 +12,30 @@
 //! Orthogonal to [`super::bpf`]: the stats axis sources its values
 //! from the userspace scheduler's `scx_stats` JSON; the BPF axis
 //! sources from kernel-side BPF state. Tests typically use both.
+//!
+//! ## Counter semantics are scheduler-defined (cumulative vs per-read delta)
+//!
+//! ktstr issues ONE fresh `scx_stats` request per periodic snapshot
+//! and stores the response verbatim — it never accumulates or diffs a
+//! field across snapshots. Whether a field is CUMULATIVE (monotonic
+//! since scheduler start) or a DELTA since the previous reader request
+//! is decided by the scheduler's stats implementation, not by ktstr.
+//! Some schedulers delta their metrics per reader request; because
+//! ktstr issues one request per snapshot, each sample of such a field
+//! is the change since the PREVIOUS snapshot, not a running total.
+//!
+//! This dictates the per-phase reduction. For a CUMULATIVE field the
+//! phase total is last − first
+//! ([`counter_delta_per_phase`](crate::assert::temporal::SeriesField::counter_delta_per_phase)).
+//! For a DELTA-per-request field that reduction is wrong — it diffs two
+//! deltas; the phase total is the SUM of the per-snapshot deltas in the
+//! phase. There is no built-in per-phase sum today, so group with
+//! [`by_stimulus_phase`](crate::scenario::sample::SampleSeries::by_stimulus_phase)
+//! and sum each phase's values by hand. Mind the boundary: a
+//! per-snapshot delta covers the interval since the previous snapshot,
+//! so the FIRST delta inside a phase spans the phase boundary and
+//! carries the tail of the prior phase. Know your scheduler's
+//! convention before choosing the reduction.
 
 use crate::assert::temporal::SeriesField;
 use crate::scenario::snapshot::{JsonField, SnapshotResult, stats_path};
