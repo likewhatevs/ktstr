@@ -3659,7 +3659,34 @@ impl AssertPlan {
         // measurement and must not be gated behind whether any worker
         // check is configured (see [`cgroup_stats`]). The opt-in checks
         // below only append fail/inconclusive outcomes onto `r`.
-        let cg = cgroup_stats(reports);
+        let mut cg = cgroup_stats(reports);
+        // NUMA page-locality telemetry: the expected-node set lives in
+        // `numa_nodes` (cgroup_stats has no NUMA context), so compute
+        // locality here whenever it is supplied — independent of whether
+        // the min_page_locality CHECK is set — and store it on the
+        // telemetry. The (locality, total, local) triple is reused by that
+        // check below so the value is computed once.
+        let page_locality = numa_nodes.map(|nodes| {
+            let mut total: u64 = 0;
+            let mut local: u64 = 0;
+            for w in reports {
+                for (&node, &count) in &w.numa_pages {
+                    total += count;
+                    if nodes.contains(&node) {
+                        local += count;
+                    }
+                }
+            }
+            let locality = if total > 0 {
+                local as f64 / total as f64
+            } else {
+                0.0
+            };
+            (locality, total, local)
+        });
+        if let Some((locality, _, _)) = page_locality {
+            cg.page_locality = locality;
+        }
         let mut r = AssertResult::pass();
         r.stats = scenario_stats_for_cgroup(&cg);
 
@@ -3760,45 +3787,25 @@ impl AssertPlan {
             }
         }
         if let Some(min_locality) = self.min_page_locality
-            && let Some(nodes) = numa_nodes
+            && let Some((locality, total, local)) = page_locality
         {
-            // Aggregate NUMA pages across the cgroup so the locality
-            // check evaluates the cgroup as a whole rather than
-            // skipping workers with empty numa_pages or summing
-            // misleading per-worker fractions. Skipping zero-page
-            // workers lets a cgroup with no NUMA signal silently
-            // pass `min_page_locality`.
-            let mut total: u64 = 0;
-            let mut local: u64 = 0;
-            for w in reports {
-                for (&node, &count) in &w.numa_pages {
-                    total += count;
-                    if nodes.contains(&node) {
-                        local += count;
-                    }
-                }
-            }
-            // POLICY-derived denominator: the page-locality gate is
-            // only reachable when the caller already supplied a
-            // `numa_nodes` set — i.e. the test set a NUMA policy
-            // (typically `MemPolicy::Bind`) declaring that the
-            // workload WILL allocate pages on the expected nodes.
-            // Zero observed pages is therefore a policy violation,
-            // not an instrumentation gap, and stays as Fail (via the
-            // `0.0` coercion that the threshold then fails) per the
-            // [`Outcome`] doc's INSTRUMENT-vs-POLICY carve-out. The
-            // Inconclusive primitive does NOT apply here — see the
-            // sibling `max_migration_ratio` / `max_slow_tier_ratio`
-            // / `assert_cross_node_migration` arms for the
-            // INSTRUMENT-derived counterparts.
-            let locality = if total > 0 {
-                local as f64 / total as f64
-            } else {
-                // Zero observed pages across the cgroup is treated
-                // as zero locality so the threshold surfaces a
-                // workload that produced no NUMA allocations.
-                0.0
-            };
+            // Reuse the page-locality telemetry computed in the head (the
+            // cgroup-wide local/total aggregate, evaluating the cgroup as a
+            // whole rather than skipping zero-page workers or summing
+            // misleading per-worker fractions).
+            //
+            // POLICY-derived denominator: this gate is only reachable when
+            // the caller supplied a `numa_nodes` set — i.e. the test set a
+            // NUMA policy (typically `MemPolicy::Bind`) declaring that the
+            // workload WILL allocate pages on the expected nodes. Zero
+            // observed pages is therefore a policy violation, not an
+            // instrumentation gap, and stays Fail (the `0.0` locality the
+            // head computed then fails the threshold) per the [`Outcome`]
+            // doc's INSTRUMENT-vs-POLICY carve-out. The Inconclusive
+            // primitive does NOT apply here — see the sibling
+            // `max_migration_ratio` / `max_slow_tier_ratio` /
+            // `assert_cross_node_migration` arms for the INSTRUMENT-derived
+            // counterparts.
             r.merge(assert_page_locality(
                 locality,
                 Some(min_locality),
@@ -5124,6 +5131,30 @@ pub fn cgroup_stats(reports: &[WorkerReport]) -> CgroupStats {
         0.0
     };
 
+    // Cross-node page-migration ratio: pages migrated cross-node over the
+    // cgroup's total allocated pages. `vmstat_numa_pages_migrated` is a
+    // system-wide delta each worker captured over its own loop; concurrent
+    // workers observe overlapping deltas, so take the MAX across the cgroup
+    // (summing would inflate by the worker count) over the cgroup-wide
+    // total of allocated pages. Pure measurement — populated whenever NUMA
+    // pages were seen, 0.0 otherwise. (The `max_cross_node_migration_ratio`
+    // CHECK in `AssertPlan::assert_cgroup` recomputes the same raw counts
+    // for its diagnostic; this is the always-on telemetry.)
+    let total_numa_pages: u64 = reports
+        .iter()
+        .map(|w| w.numa_pages.values().sum::<u64>())
+        .sum();
+    let migrated_pages: u64 = reports
+        .iter()
+        .map(|w| w.vmstat_numa_pages_migrated)
+        .max()
+        .unwrap_or(0);
+    let cross_node_ratio = if total_numa_pages > 0 {
+        migrated_pages as f64 / total_numa_pages as f64
+    } else {
+        0.0
+    };
+
     CgroupStats {
         num_workers: reports.len(),
         num_cpus: cpus.len(),
@@ -5141,8 +5172,12 @@ pub fn cgroup_stats(reports: &[WorkerReport]) -> CgroupStats {
         total_iterations: total_iters,
         mean_run_delay_us: mean_run_delay,
         worst_run_delay_us: worst_run_delay,
+        // page_locality requires the expected NUMA node set (the cpuset's
+        // nodes), which this reports-only builder does not have. It is
+        // populated by `AssertPlan::assert_cgroup` when `numa_nodes` is
+        // supplied; left 0.0 here (no NUMA context).
         page_locality: 0.0,
-        cross_node_migration_ratio: 0.0,
+        cross_node_migration_ratio: cross_node_ratio,
         ext_metrics: BTreeMap::new(),
     }
 }
@@ -5168,8 +5203,8 @@ fn scenario_stats_for_cgroup(cg: &CgroupStats) -> ScenarioStats {
         total_iterations: cg.total_iterations,
         worst_mean_run_delay_us: cg.mean_run_delay_us,
         worst_run_delay_us: cg.worst_run_delay_us,
-        worst_page_locality: 0.0,
-        worst_cross_node_migration_ratio: 0.0,
+        worst_page_locality: cg.page_locality,
+        worst_cross_node_migration_ratio: cg.cross_node_migration_ratio,
         worst_wake_latency_tail_ratio: cg.wake_latency_tail_ratio(),
         // `iterations_per_worker()` returns the per-worker throughput for
         // this cgroup. The merge fold treats 0.0 as the unreported
