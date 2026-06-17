@@ -1911,17 +1911,16 @@ fn build_phase_buckets_with_stimulus_step_local_wins_over_persistent_cross_step(
     );
 }
 
-/// A STALLED step (its own `StepStart[k] -> StepEnd[k]` delta is zero,
-/// the rate_to `e <= s` blind spot) must report NO iteration_rate — it
-/// must NOT leak the inter-step teardown-gap rate that the
-/// `StepEnd[k] -> StepStart[k+1]` pair would otherwise produce. StepEnd[k]
-/// carries step_index `k`, so without the `is_step_end` guard in the
-/// attribution loop that cross-step pair (prev = StepEnd[k], also
-/// step_index `k`) would `or_insert` a gap rate into the empty bucket `k`.
-/// This pins the guard: bucket `k` is sourced ONLY by its own
-/// StepStart -> StepEnd pair.
+/// A STALLED step (its own `StepStart[k] -> StepEnd[k]` delta is zero)
+/// must report its MEASURED-ZERO rate `Some(0.0)` — it must NOT leak the
+/// inter-step teardown-gap rate that the `StepEnd[k] -> StepStart[k+1]`
+/// pair would otherwise produce. StepEnd[k] carries step_index `k`, so
+/// without the `is_step_end` guard in the attribution loop that cross-step
+/// pair (prev = StepEnd[k], also step_index `k`) would `or_insert` a gap
+/// rate into bucket `k`. This pins the guard: bucket `k` is sourced ONLY
+/// by its own StepStart -> StepEnd pair (which here is a measured zero).
 #[test]
-fn build_phase_buckets_with_stimulus_stalled_step_does_not_leak_cross_step_gap_rate() {
+fn build_phase_buckets_with_stimulus_stalled_step_reports_measured_zero() {
     use crate::scenario::snapshot::{DrainedSnapshotEntry, MissingStatsReason};
     use crate::timeline::StimulusEvent;
     let mk = |tag: &str, offset_ms: u64| DrainedSnapshotEntry {
@@ -1955,11 +1954,11 @@ fn build_phase_buckets_with_stimulus_stalled_step_does_not_leak_cross_step_gap_r
         is_step_end: true,
     };
     // Step 1 STALLED: StepStart[1] == StepEnd[1] == 0, so its step-local
-    // pair is rate_to None and bucket 1 stays empty. A persistent
+    // pair is rate_to Some(0.0) — measured zero throughput. A persistent
     // population then advances 500 during the 100ms teardown gap, so the
     // cross-step StepEnd[1](0) -> StepStart[2](500) pair WOULD compute
-    // 500/0.1s = 5000/s — which must NOT land in bucket 1. Step 2 runs
-    // normally: 500 -> 1500 over 1s = 1000/s.
+    // 500/0.1s = 5000/s — which must NOT land in bucket 1 (it is
+    // guard-skipped). Step 2 runs normally: 500 -> 1500 over 1s = 1000/s.
     let stimulus = vec![
         start(1_000, 1, 0),
         end(2_000, 1, 0),
@@ -1978,9 +1977,10 @@ fn build_phase_buckets_with_stimulus_stalled_step_does_not_leak_cross_step_gap_r
         .expect("step 2 bucket present");
     assert_eq!(
         step1.metrics.get("iteration_rate").copied(),
-        None,
-        "a stalled step must report no rate, not the leaked 5000/s teardown \
-         gap rate from the StepEnd[1] -> StepStart[2] pair; got {:?}",
+        Some(0.0),
+        "a stalled step reports measured-zero throughput, not the leaked \
+         5000/s teardown gap rate from the StepEnd[1] -> StepStart[2] pair; \
+         got {:?}",
         step1.metrics.get("iteration_rate"),
     );
     assert_eq!(

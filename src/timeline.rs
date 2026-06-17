@@ -75,9 +75,10 @@ pub struct StimulusEvent {
     /// `iteration_rate` attribution loop in
     /// [`crate::assert::build_phase_buckets_with_stimulus`] skips any
     /// `is_step_end` `prev`, so a stalled step whose step-local delta is
-    /// zero (`StepEnd[k] == StepStart[k]`, the rate_to `e <= s` blind
-    /// spot) reports NO rate rather than leaking the inter-step gap rate
-    /// from the `StepEnd[k] -> StepStart[k+1]` pair. The monitor-only
+    /// zero (`StepEnd[k] == StepStart[k]`) reports its MEASURED-ZERO rate
+    /// `Some(0.0)` (see `Self::rate_to`) rather than leaking the
+    /// inter-step gap rate from the `StepEnd[k] -> StepStart[k+1]` pair.
+    /// The monitor-only
     /// [`Timeline::build`] fallback (no snapshot captures) computes the
     /// SAME step-local `StepStart[k] -> StepEnd[k]` rate — the StepEnd
     /// events reach it too (they are emitted independent of captures) — and
@@ -228,30 +229,24 @@ impl StimulusEvent {
 
     /// Iterations-per-second from this event to `next`:
     /// `(next.total_iterations - self.total_iterations)` over the
-    /// guest-clock elapsed-ms delta between them. Returns `None` when
-    /// either event lacks a `total_iterations` sample, the count did not
-    /// advance (`next <= self` — e.g. a step-local worker population
-    /// reset, or the first step's ~0 starting sample), or the window is
-    /// zero-length.
+    /// guest-clock elapsed-ms delta between them. Returns `None` ONLY when
+    /// the measurement is genuinely undefined: either event lacks a
+    /// `total_iterations` sample, the window is zero-length, or the count
+    /// went BACKWARD (`next < self` — a worker-population reset; the delta
+    /// is unmeasurable, not zero).
     ///
-    /// BLIND SPOT (deliberate): a step whose workers made EXACTLY zero
-    /// forward progress over a positive hold (`next == self`) also
-    /// returns `None`, not `Some(0.0)` — it is folded into the
-    /// non-advancing case because the `next < self` (counter-decrease /
-    /// population-reset) case it shares the `<=` guard with is genuinely
-    /// unmeasurable, and the pre-existing
-    /// `terminal_event_stalled_last_step_no_spurious_rate` test pins
-    /// "stalled != measured zero". Consequence: a step that collapsed to
-    /// literally zero throughput emits NO `iteration_rate` key and is
-    /// therefore invisible to the throughput-degradation detector
-    /// ([`Timeline::build`] / [`Timeline::from_phase_buckets`], which both
-    /// gate on `before.iteration_rate.is_some()` AND `before > 0.0`). A
-    /// near-zero (>= 1 iteration) collapse still
-    /// produces a positive rate and IS flagged. Distinguishing
-    /// measured-zero from not-measured for degradation detection requires
-    /// reworking BOTH this guard and the detector's `before > 0.0`
-    /// div-by-zero gate (a measurement-semantics change beyond the
-    /// step-local model); tracked as a follow-up.
+    /// MEASURED ZERO is distinct from not-measured: a step whose workers
+    /// made exactly zero forward progress over a positive hold
+    /// (`next == self`) returns `Some(0.0)`, not `None`. Zero throughput
+    /// is a real, measured value — the strongest degradation signal — so
+    /// it must surface, not vanish. With `Some(0.0)` a phase that
+    /// collapsed to zero IS visible to the throughput-degradation detector
+    /// ([`Timeline::build`] / [`Timeline::from_phase_buckets`]): when the
+    /// prior phase had a positive rate (`before > 0.0`), the relative
+    /// delta is `-1.0` and the drop is flagged. (A phase that was already
+    /// zero before is still not relatively comparable — the detector's
+    /// `before > 0.0` gate avoids a div-by-zero — but an *unchanged* zero
+    /// is not a degradation.)
     ///
     /// This is the SINGLE iteration_rate formula shared by
     /// [`crate::assert::build_phase_buckets_with_stimulus`] (per-step
@@ -261,7 +256,7 @@ impl StimulusEvent {
     pub(crate) fn rate_to(&self, next: &StimulusEvent) -> Option<f64> {
         let s = self.total_iterations?;
         let e = next.total_iterations?;
-        if e <= s {
+        if e < s {
             return None;
         }
         let duration_ms = next.elapsed_ms.saturating_sub(self.elapsed_ms);
@@ -2078,12 +2073,12 @@ mod tests {
     }
 
     #[test]
-    fn build_stalled_step_with_step_end_reports_none_not_cross_step() {
-        // Issue #14 (monitor-only path): a step that HAS a StepEnd but
-        // stalled (StepEnd[k] == StepStart[k], rate_to None) must report
-        // None — its StepEnd lookup hits, so the cross-step fallback must
-        // NOT run. Mirrors the snapshot path's
-        // build_phase_buckets_with_stimulus_stalled_step_does_not_leak_cross_step_gap_rate.
+    fn build_stalled_step_with_step_end_reports_measured_zero_not_cross_step() {
+        // Monitor-only path: a step that HAS a StepEnd but
+        // stalled (StepEnd[k] == StepStart[k]) reports its MEASURED-ZERO
+        // step-local rate (Some(0.0)) — its StepEnd lookup hits, so the
+        // cross-step fallback must NOT run. Mirrors the snapshot path's
+        // build_phase_buckets_with_stimulus_stalled_step_reports_measured_zero.
         // Step 0 stalls (0 -> 0); a persistent population reads 500 at
         // StepStart[1], so a cross-step StepStart[0] -> StepStart[1] leak
         // would be ~454/s. Step 1 advances 500 -> 5500 (5000/s).
@@ -2097,9 +2092,10 @@ mod tests {
             (1..30).map(|i| sample(i * 100, vec![(2, 1, i * 1000)])).collect();
         let t = Timeline::build(&events, &samples);
         assert_eq!(t.phases.len(), 2);
-        assert!(
-            t.phases[0].metrics.iteration_rate.is_none(),
-            "a stalled step with a StepEnd must report None, not the \
+        assert_eq!(
+            t.phases[0].metrics.iteration_rate,
+            Some(0.0),
+            "a stalled step reports measured-zero throughput, not the \
              cross-step StepStart[0] -> StepStart[1] persistent-leak rate",
         );
         assert!(
@@ -2128,11 +2124,13 @@ mod tests {
     }
 
     #[test]
-    fn terminal_event_stalled_last_step_no_spurious_rate() {
+    fn terminal_event_stalled_last_step_reports_measured_zero() {
         // Boundary case: the last step's counter did not advance
-        // (terminal count == last step-start count). e <= s, so no
-        // rate is manufactured — a stalled step is distinct from a
-        // measured zero throughput, and must not divide or panic.
+        // (terminal count == last step-start count): e == s. That is
+        // MEASURED ZERO throughput — a real value (the strongest
+        // degradation signal), not "unmeasured" — so rate_to returns
+        // Some(0.0), and the zero surfaces to the degradation detector.
+        // Only a counter DECREASE (e < s) is unmeasurable -> None.
         let mut events: Vec<StimulusEvent> = [wire_event(0, 1, 0), wire_event(2000, 2, 4000)]
             .iter()
             .map(StimulusEvent::from_wire)
@@ -2143,18 +2141,21 @@ mod tests {
             .collect();
         let t = Timeline::build(&events, &samples);
         assert_eq!(t.phases.len(), 2);
-        assert!(
-            t.phases[1].metrics.iteration_rate.is_none(),
-            "stalled last step (e <= s) must not manufacture a rate",
+        assert_eq!(
+            t.phases[1].metrics.iteration_rate,
+            Some(0.0),
+            "stalled last step (e == s) reports measured-zero, not None",
         );
     }
 
     #[test]
     fn iteration_rate_counter_decrease_yields_no_rate() {
         // A counter DECREASE between consecutive step frames (e.g. a
-        // step-local worker population reset) must NOT produce a
-        // negative or conflated rate — the e>s guard drops the pair.
-        // Pin it so a future change that loosens the guard fails here.
+        // step-local worker population reset) is unmeasurable and must NOT
+        // produce a negative or conflated rate — the `e < s` guard drops
+        // the pair, returning None (distinct from `e == s`, which is a
+        // measured-zero Some(0.0)). Pin it so a future change that loosens
+        // the guard to allow a negative delta fails here.
         let events: Vec<StimulusEvent> = [
             wire_event(0, 1, 0),
             wire_event(2000, 2, 5000),
@@ -2259,6 +2260,40 @@ mod tests {
         assert_eq!(phase.index, 1);
         assert_eq!(change.direction, ChangeDirection::Degraded);
         assert!(change.before > change.after);
+    }
+
+    #[test]
+    fn throughput_collapse_to_zero_is_flagged() {
+        // A phase that collapses to ZERO throughput (e == s, measured
+        // zero) must be flagged as a degradation — it is the strongest
+        // degradation signal. Previously the zero phase's rate_to returned
+        // None, so the detector's Some/Some gate dropped it and the worst
+        // degradation went silently unreported.
+        let events = vec![
+            stimulus_with_iters(0, "ScenarioStart", 0),
+            stimulus_with_iters(2000, "StepStart[0]", 10000), // phase 0: ~5000/s
+            stimulus_with_iters(4000, "StepStart[1]", 10000), // phase 1: 0/s (stalled)
+        ];
+        let samples: Vec<MonitorSample> = (5..45)
+            .map(|i| sample(i * 100, vec![(2, 1, i * 1000)]))
+            .collect();
+        let t = Timeline::build(&events, &samples);
+        assert_eq!(
+            t.phases[1].metrics.iteration_rate,
+            Some(0.0),
+            "the collapsed phase must report measured-zero throughput",
+        );
+        let degs: Vec<_> = t
+            .degradations()
+            .into_iter()
+            .filter(|(p, c)| p.index == 1 && c.metric == "throughput")
+            .collect();
+        assert!(
+            !degs.is_empty(),
+            "a collapse to zero throughput must be flagged as a degradation",
+        );
+        assert_eq!(degs[0].1.direction, ChangeDirection::Degraded);
+        assert_eq!(degs[0].1.after, 0.0);
     }
 
     #[test]
