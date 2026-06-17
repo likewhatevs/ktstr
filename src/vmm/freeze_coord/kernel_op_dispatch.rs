@@ -932,6 +932,7 @@ impl TaskValidationOffsets {
 fn find_task_by_pid(
     kernel: &GuestKernel,
     init_task_kva: u64,
+    kaslr_offset: u64,
     offs: &TaskValidationOffsets,
     target_pid: u32,
 ) -> Result<u64, String> {
@@ -945,15 +946,29 @@ fn find_task_by_pid(
 
     // init_task.tasks anchor lives in .data (init_task is a static
     // global at init/init_task.c:96), so text_kva_to_pa is the right
-    // translation. List nodes (task_struct) live in slab and use
-    // translate_any_kva.
-    let head_kva = init_task_kva.checked_add(tasks_off as u64).ok_or_else(|| {
+    // translation for the head.next READ. List nodes (task_struct) live
+    // in slab and use translate_any_kva.
+    let head_kva_link = init_task_kva.checked_add(tasks_off as u64).ok_or_else(|| {
         format!(
             "find_task_by_pid: head_kva overflow init_task={init_task_kva:#x} + \
              tasks_off={tasks_off}"
         )
     })?;
-    let head_pa = kernel.text_kva_to_pa(head_kva);
+    let head_pa = kernel.text_kva_to_pa(head_kva_link);
+    // The list's .next pointers (and signal->thread_head members) are
+    // RUNTIME addresses carrying the virtual KASLR slide, so the leader
+    // terminator and the init_task defense must compare against the
+    // RUNTIME head / init_task — slid_kernel_kva applies the high-half
+    // slide (identity when kaslr_offset == 0). text_kva_to_pa above keeps
+    // the link-time kva for the PA read (phys_base maps it correctly).
+    // Without the runtime head the canonical for_each_process ring (which
+    // closes through the runtime &init_task per
+    // include/linux/sched/signal.h) never closes under KASLR-on and the
+    // walk runs to the cap, returning "walker cap exceeded" instead of
+    // resolving the pid.
+    let head_kva = crate::monitor::symbols::slid_kernel_kva(head_kva_link, kaslr_offset);
+    let init_task_kva_runtime =
+        crate::monitor::symbols::slid_kernel_kva(init_task_kva, kaslr_offset);
 
     // list_head.next is the first u64 in the list_head struct.
     let mut node_kva = mem.read_u64(head_pa, 0);
@@ -971,6 +986,10 @@ fn find_task_by_pid(
     }
 
     let mut visited: u32 = 0;
+    // Address-cycle backstop: a corrupt leader ring that does not close
+    // through the runtime head is bounded to its unique-node set rather
+    // than running to the cap. Bounded by MAX_TASK_WALKER_NODES.
+    let mut seen_leaders: std::collections::HashSet<u64> = std::collections::HashSet::new();
 
     // Tier 1: walk leaders via init_task.tasks.
     while node_kva != head_kva {
@@ -979,6 +998,13 @@ fn find_task_by_pid(
                 "find_task_by_pid: walker cap {MAX_TASK_WALKER_NODES} exceeded \
                  scanning for pid={target_pid} (visited={visited}); list may be \
                  corrupted (cycle) or pid_max exceeded the cap"
+            ));
+        }
+        if !seen_leaders.insert(node_kva) {
+            return Err(format!(
+                "find_task_by_pid: leader ring revisited node {node_kva:#x} \
+                 without closing through head — corrupt init_task.tasks list; \
+                 cannot resolve pid={target_pid}"
             ));
         }
         visited += 1;
@@ -990,11 +1016,11 @@ fn find_task_by_pid(
         // leaked into the candidate set. for_each_process skips the
         // head by construction, but defensive reject catches future
         // kernel reshapes or corrupt-chain races.
-        if leader_kva == init_task_kva {
+        if leader_kva == init_task_kva_runtime {
             return Err(format!(
                 "find_task_by_pid: candidate task_kva={leader_kva:#x} equals \
-                 init_task_kva={init_task_kva:#x} (pid=0 swapper); init_task \
-                 is not a writable target"
+                 init_task (runtime {init_task_kva_runtime:#x}, pid=0 swapper); \
+                 init_task is not a writable target"
             ));
         }
 
@@ -1033,6 +1059,14 @@ fn find_task_by_pid(
                 walk.tcr_el1,
             ) {
                 let mut thread_node_kva = mem.read_u64(thread_head_pa, 0);
+                // Address-cycle backstop for this leader's thread ring. The
+                // thread_head is already a RUNTIME address (signal_kva is
+                // read from guest memory), so no slide applies here — only
+                // the HashSet. A corrupt thread ring breaks the inner loop
+                // (skip this leader's threads) rather than aborting the
+                // whole pid search — partial visibility over none.
+                let mut seen_threads: std::collections::HashSet<u64> =
+                    std::collections::HashSet::new();
                 while thread_node_kva != 0 && thread_node_kva != thread_head_kva {
                     if visited >= MAX_TASK_WALKER_NODES {
                         return Err(format!(
@@ -1040,6 +1074,9 @@ fn find_task_by_pid(
                              exceeded inside thread-group of leader_pid={leader_pid} \
                              scanning for pid={target_pid}"
                         ));
+                    }
+                    if !seen_threads.insert(thread_node_kva) {
+                        break;
                     }
                     visited += 1;
 
@@ -1396,7 +1433,7 @@ fn resolve_and_validate_task_field(
 
     let val_offs = TaskValidationOffsets::resolve_from_btf(btf)?;
 
-    let task_kva = find_task_by_pid(kernel, init_task_kva, &val_offs, pid)?;
+    let task_kva = find_task_by_pid(kernel, init_task_kva, kaslr_offset, &val_offs, pid)?;
     let walk = kernel.walk_context();
     let task_pa = translate_any_kva(
         kernel.mem(),
