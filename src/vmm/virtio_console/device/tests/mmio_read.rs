@@ -1,6 +1,5 @@
 use super::super::super::*;
 
-
 // ----------------------------------------------------------------
 // mmio_read non-4-byte and config_read out-of-range defenses.
 //

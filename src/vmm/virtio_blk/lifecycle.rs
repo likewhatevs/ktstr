@@ -6,7 +6,6 @@ use super::*;
 use std::sync::mpsc;
 use std::thread;
 
-
 /// Maximum number of retries [`signal_worker_stop`] performs when
 /// `EventFd::write` returns `WouldBlock` (EAGAIN). The eventfd
 /// counter saturates at `u64::MAX - 1`; reaching that value

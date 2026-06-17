@@ -1,6 +1,5 @@
 use super::*;
 
-
 #[test]
 fn leaf_80000008_amd_topology() {
     let kvm = match kvm_ioctls::Kvm::new() {
@@ -851,9 +850,7 @@ fn leaf0b_core_subleaf_emitted_both_vendors() {
         let core_sub = cpuid
             .iter()
             .find(|e| e.function == 0xb && e.index == 1)
-            .unwrap_or_else(|| {
-                panic!("{vendor}: 0xB Core subleaf (index 1) must be synthesized")
-            });
+            .unwrap_or_else(|| panic!("{vendor}: 0xB Core subleaf (index 1) must be synthesized"));
         assert_eq!(
             (core_sub.ecx >> 8) & 0xff,
             2,

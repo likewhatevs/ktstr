@@ -4,7 +4,6 @@
 //! `std` by fully-qualified path, so no glob from the parent module
 //! is needed.
 
-
 /// Async-signal-safe rendering of `value` as lowercase hex (no `0x`
 /// prefix, no leading-zero trim) into the tail of `buf`. Returns the
 /// byte slice covering the rendered digits.
@@ -54,7 +53,7 @@ fn write_all_asm(fd: libc::c_int, bytes: &[u8]) {
 
 /// Async-signal-safe handler for SIGSEGV / SIGBUS / SIGILL.
 ///
-/// The Rust panic hook installed in [`ktstr_guest_init`] does NOT
+/// The Rust panic hook installed in [`crate::vmm::rust_init::ktstr_guest_init`] does NOT
 /// fire for native CPU faults: the kernel raises these signals with
 /// `SIG_DFL` disposition, which calls `do_coredump` and terminates
 /// the process. Inside guest init that means PID 1 dies, the kernel
@@ -64,7 +63,7 @@ fn write_all_asm(fd: libc::c_int, bytes: &[u8]) {
 /// This handler closes the gap by emitting a `PANIC:`-prefixed line
 /// — matching the prefix `extract_panic_message` anchors on — that
 /// names the signal and the faulting address before driving
-/// [`force_reboot`]. The host crash-classification pipeline then
+/// [`crate::vmm::rust_init::force_reboot`]. The host crash-classification pipeline then
 /// surfaces native faults through the same code path as Rust panics.
 ///
 /// Constraints, all enforced inside the handler:

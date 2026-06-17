@@ -313,6 +313,6 @@ fn synth_host_topo(groups: &[(Vec<usize>, usize)]) -> HostTopology {
 // Test groups extracted from the original flat tests.rs; the helper fns
 // and RAII scaffolding structs above stay here so every group reaches
 // them as a child module via `use super::*`.
-mod pinning;
 mod locking;
+mod pinning;
 mod planning;

@@ -4,7 +4,6 @@
 //! parent module (`super`), reached via the glob below.
 use super::*;
 
-
 /// Mount essential filesystems.
 pub(crate) fn mount_filesystems() {
     let mounts: &[(&str, &str, &str, bool)] = &[

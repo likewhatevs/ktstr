@@ -1,7 +1,6 @@
 use super::super::super::*;
 use super::*;
 
-
 // ----------------------------------------------------------------
 // Chain-level MockSplitQueue tests for the port 1 TX path.
 //

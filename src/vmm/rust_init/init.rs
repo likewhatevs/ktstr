@@ -4,7 +4,6 @@
 //! parent module (`super`), reached via the glob below.
 use super::*;
 
-
 /// Full guest init lifecycle. Called from the ctor when PID 1 is
 /// detected. Mounts filesystems, then either runs the test lifecycle
 /// (scheduler + dispatch + reboot) or drops into an interactive

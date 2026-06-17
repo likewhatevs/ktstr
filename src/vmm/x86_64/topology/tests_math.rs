@@ -1,6 +1,5 @@
 use super::*;
 
-
 #[test]
 fn bits_needed_values() {
     assert_eq!(bits_needed(1), 0);

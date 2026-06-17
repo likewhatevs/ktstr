@@ -1,7 +1,6 @@
 use super::super::super::*;
 use super::*;
 
-
 #[test]
 fn magic_version_device_id() {
     let dev = VirtioConsole::new();

@@ -302,7 +302,9 @@ impl Backing for FaultBacking {
             // SAFETY: `partial` aliases the first caller iovec's base
             // with a SHORTER length (half < iov_len), so it stays within
             // the validated region; forwards the validity precondition.
-            return unsafe { Backing::pwritev(&self.inner, std::slice::from_ref(&partial), offset) };
+            return unsafe {
+                Backing::pwritev(&self.inner, std::slice::from_ref(&partial), offset)
+            };
         }
         // SAFETY: forwards the caller's validity precondition unchanged.
         unsafe { Backing::pwritev(&self.inner, iovs, offset) }
@@ -701,11 +703,7 @@ fn process_requests_read_chain_all_zero_len_segments_is_zero_byte_ok() {
         1,
         "a 0-byte read counts as one completed read",
     );
-    assert_eq!(
-        c.bytes_read.load(Ordering::Relaxed),
-        0,
-        "zero bytes read",
-    );
+    assert_eq!(c.bytes_read.load(Ordering::Relaxed), 0, "zero bytes read",);
     assert_eq!(
         c.io_errors.load(Ordering::Relaxed),
         0,

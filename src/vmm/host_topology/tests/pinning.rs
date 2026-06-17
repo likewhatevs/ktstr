@@ -2,7 +2,6 @@ use super::super::*;
 use super::*;
 use crate::vmm::topology::Topology;
 
-
 #[test]
 fn parse_cpu_list_range() {
     assert_eq!(parse_cpu_list_lenient("0-3"), vec![0, 1, 2, 3]);

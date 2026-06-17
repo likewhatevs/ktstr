@@ -4,7 +4,6 @@
 //! parent module (`super`), reached via the glob below.
 use super::*;
 
-
 /// Outcome of [`poll_startup`].
 #[derive(Debug)]
 pub(crate) enum StartupStatus {
@@ -323,7 +322,10 @@ fn drain_probe_pipeline(drain: Option<&ProbeDrain>) {
 /// window; on timeout the child is left for the VM reboot to reap —
 /// teardown must not block unboundedly on a wedged process (see
 /// [`SCHED_REAP_TIMEOUT`]).
-pub(crate) fn reap_child_bounded(child: &mut std::process::Child, timeout: std::time::Duration) -> bool {
+pub(crate) fn reap_child_bounded(
+    child: &mut std::process::Child,
+    timeout: std::time::Duration,
+) -> bool {
     // Fast path: already exited (e.g. a clean scheduler that took the
     // SIGKILL immediately).
     if let Ok(Some(_)) = child.try_wait() {

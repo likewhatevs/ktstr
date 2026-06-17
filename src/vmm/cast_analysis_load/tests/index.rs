@@ -4,7 +4,6 @@ use goblin::elf::header as h;
 use goblin::elf::section_header as sh;
 use goblin::elf::sym as syms;
 
-
 /// Multiple BTFs: the index records the first BTF seen for any
 /// duplicate name, so an entry's `(idx, type_id)` reflects the
 /// first-write-wins policy. The renderer only consults the
@@ -586,7 +585,10 @@ fn cached_cast_analysis_concurrent_callers_share_one_oncelock_init() {
 #[test]
 fn recover_alloc_size_adjacent_mov_returns_imm() {
     let text = vec![BpfInsn::new(MOV_R1_CODE, 1, 0, 0, 4096), call_insn()];
-    assert_eq!(super::super::recover_alloc_size_from_r1(&text, 1), Some(4096));
+    assert_eq!(
+        super::super::recover_alloc_size_from_r1(&text, 1),
+        Some(4096)
+    );
 }
 
 /// A BPF_CALL between the MOV and the target call clobbers r1-r5, so
@@ -660,7 +662,10 @@ fn recover_alloc_size_lookback_window_boundary() {
         text.push(mov_r2());
     }
     text.push(call_insn());
-    assert_eq!(super::super::recover_alloc_size_from_r1(&text, lb), Some(4096));
+    assert_eq!(
+        super::super::recover_alloc_size_from_r1(&text, lb),
+        Some(4096)
+    );
 
     // Out-of-window: one extra filler pushes the MOV to distance lb+1.
     let mut text = vec![BpfInsn::new(MOV_R1_CODE, 1, 0, 0, 4096)];
@@ -668,5 +673,8 @@ fn recover_alloc_size_lookback_window_boundary() {
         text.push(mov_r2());
     }
     text.push(call_insn());
-    assert_eq!(super::super::recover_alloc_size_from_r1(&text, lb + 1), None);
+    assert_eq!(
+        super::super::recover_alloc_size_from_r1(&text, lb + 1),
+        None
+    );
 }

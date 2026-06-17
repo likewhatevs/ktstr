@@ -1435,7 +1435,15 @@ fn tx_multi_desc_sum_over_cap_is_dropped() {
     // lands within the 1 MiB window (zero-filled). VRING_DESC_F_NEXT
     // = 1.
     let desc0_len = (VIRTIO_NET_HDR_LEN + 40_000) as u32;
-    write_desc(&mem, layout.tx_desc, 0, layout.tx_frame_buf, desc0_len, 1, 1);
+    write_desc(
+        &mem,
+        layout.tx_desc,
+        0,
+        layout.tx_frame_buf,
+        desc0_len,
+        1,
+        1,
+    );
     let desc1_addr = layout.tx_frame_buf + desc0_len as u64;
     write_desc(&mem, layout.tx_desc, 1, desc1_addr, 30_000, 0, 0);
     publish_avail(&mem, layout.tx_avail, 0, 0);

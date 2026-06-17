@@ -4,7 +4,6 @@
 //! parent module (`super`), reached via the glob below.
 use super::*;
 
-
 /// Print the topology line for the shell MOTD.
 ///
 /// Parses KTSTR_TOPO=N,L,C,T from /proc/cmdline (passed by the host).

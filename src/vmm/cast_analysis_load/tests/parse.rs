@@ -5,7 +5,6 @@ use goblin::elf::header as h;
 use goblin::elf::section_header as sh;
 use goblin::elf::sym as syms;
 
-
 // ----- Tests for cached_cast_analysis_for_scheduler error paths --
 
 /// 1. Path that does not exist on the filesystem: the

@@ -258,7 +258,10 @@ mod tests {
         // SAFETY: buf outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
         let head = (DEFAULT_PAGE_OFFSET + pa as u64) | 2;
-        assert_eq!(xa_load(&mem, DEFAULT_PAGE_OFFSET, head, 0, 8, 0), Some(leaf));
+        assert_eq!(
+            xa_load(&mem, DEFAULT_PAGE_OFFSET, head, 0, 8, 0),
+            Some(leaf)
+        );
     }
 
     #[test]
@@ -279,6 +282,9 @@ mod tests {
         // SAFETY: buf outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
         let head = (DEFAULT_PAGE_OFFSET + n1 as u64) | 2;
-        assert_eq!(xa_load(&mem, DEFAULT_PAGE_OFFSET, head, 5, 8, 0), Some(leaf));
+        assert_eq!(
+            xa_load(&mem, DEFAULT_PAGE_OFFSET, head, 5, 8, 0),
+            Some(leaf)
+        );
     }
 }

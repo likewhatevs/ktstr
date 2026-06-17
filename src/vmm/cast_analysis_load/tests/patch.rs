@@ -4,7 +4,6 @@ use goblin::elf::header as h;
 use goblin::elf::section_header as sh;
 use goblin::elf::sym as syms;
 
-
 /// Test 1 — happy path: kfunc call gets rewritten.
 #[test]
 fn patch_kfunc_calls_happy_path_rewrites_call_site() {

@@ -4,7 +4,6 @@
 //! parent module (`super`), reached via the glob below.
 use super::*;
 
-
 /// Reboot immediately. Used for fatal init errors and normal shutdown.
 pub(crate) fn force_reboot() -> ! {
     let _ = reboot(RebootMode::RB_AUTOBOOT);

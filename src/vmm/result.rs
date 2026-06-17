@@ -264,8 +264,8 @@ pub struct VmResult {
     ///     `rx_write_failed`) make `rx_packets` fall SHORT of
     ///     `tx_packets - drops`, while a `tx_add_used_failures` on a
     ///     chain whose RX already delivered makes `rx_packets` EXCEED
-    ///     it. Asymmetric counts surface queue-state breakage on
-    ///     either side.
+    ///       it. Asymmetric counts surface queue-state breakage on
+    ///       either side.
     ///   - `tx_dropped_no_rx_buffer` — successfully-captured TX
     ///     frames the device could not deliver because the RX queue
     ///     was empty (transient back-pressure event).

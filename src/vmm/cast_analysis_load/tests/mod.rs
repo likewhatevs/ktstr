@@ -1121,6 +1121,6 @@ fn call_insn() -> BpfInsn {
 // Test groups extracted from the original flat tests.rs; the shared
 // ELF/BTF fixture builders above stay here so every group reaches
 // them as a child module via `use super::*`.
+mod index;
 mod parse;
 mod patch;
-mod index;

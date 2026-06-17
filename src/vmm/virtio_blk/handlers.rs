@@ -285,7 +285,10 @@ impl VirtioBlk {
     /// Service `VIRTIO_BLK_T_FLUSH`. `fdatasync(2)` on the backing.
     /// Returns `(status_byte, used_len)`; caller writes the status
     /// byte and gates `add_used` on a successful status write.
-    pub(crate) fn handle_flush_impl(backing: &dyn Backing, counters: &VirtioBlkCounters) -> (u8, u32) {
+    pub(crate) fn handle_flush_impl(
+        backing: &dyn Backing,
+        counters: &VirtioBlkCounters,
+    ) -> (u8, u32) {
         let status = match backing.sync_data() {
             Ok(()) => {
                 counters.record_flush();
@@ -334,6 +337,7 @@ impl VirtioBlk {
     ///   - qemu: truncate instead of reject — write up to
     ///     `min(serial length, chain bytes, 20)` across the full
     ///     chain and return `S_OK`.
+    ///
     /// We reject (not truncate) and target the first descriptor
     /// because a chain that can't fit the 20-byte id in one
     /// descriptor signals a buggy guest; a truncated or garbled

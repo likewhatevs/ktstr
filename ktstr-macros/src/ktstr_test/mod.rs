@@ -1025,7 +1025,7 @@ pub(crate) fn validate_payload_workloads_dedup(
     Ok(())
 }
 
-/// Inner implementation of [`ktstr_test`] operating on `proc_macro2::TokenStream`
+/// Inner implementation of `ktstr_test` operating on `proc_macro2::TokenStream`
 /// so unit tests in this crate can synthesize input + assert output without
 /// the `proc_macro` runtime context (`proc_macro` types panic outside a
 /// procedural-macro invocation). The proc-macro entry above is a thin wrapper

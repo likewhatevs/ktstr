@@ -27,10 +27,8 @@ fn detect_guest_failure_surfaces_alloc_oom_panic_and_generic() {
         "echoes the line: {c:?}"
     );
     // Kernel panic on COM1 → panic cause.
-    let c = KtstrVm::detect_guest_failure(
-        "Kernel panic - not syncing: Attempted to kill init!\n",
-        "",
-    );
+    let c =
+        KtstrVm::detect_guest_failure("Kernel panic - not syncing: Attempted to kill init!\n", "");
     assert!(c.contains("Guest kernel panic"), "panic cause: {c:?}");
     // No marker → generic hint (preserves the original wording so the
     // error reads identically when the cause is unknown).

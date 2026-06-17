@@ -1140,7 +1140,6 @@ fn analyze_one_object_with_btf(obj_bytes: &[u8]) -> (CastMap, Option<Arc<Btf>>, 
     (result, Some(btf), alloc_sizes)
 }
 
-
 mod reloc;
 // Re-export the relocation/patch/parse layer so the staying loader code
 // calls these helpers by bare name and the test module reaches them via

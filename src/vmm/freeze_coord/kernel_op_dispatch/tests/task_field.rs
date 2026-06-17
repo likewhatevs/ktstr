@@ -49,8 +49,7 @@ const DEFAULT_START_TIME: u64 = 1_700_000_000_000;
 fn paint_valid_task(buf: &mut [u8], pa: usize, pid: u32) {
     const PAGE_OFFSET: u64 = 0xFFFF_8880_0000_0000;
     // pid (u32 LE)
-    buf[pa + synth_task::PID_OFF..pa + synth_task::PID_OFF + 4]
-        .copy_from_slice(&pid.to_le_bytes());
+    buf[pa + synth_task::PID_OFF..pa + synth_task::PID_OFF + 4].copy_from_slice(&pid.to_le_bytes());
     // start_time = arbitrary
     buf[pa + synth_task::START_TIME_OFF..pa + synth_task::START_TIME_OFF + 8]
         .copy_from_slice(&DEFAULT_START_TIME.to_le_bytes());
@@ -206,12 +205,11 @@ fn validate_task_rejects_start_time_above_window() {
 fn validate_task_rejects_task_dead() {
     let mut buf = vec![0u8; 4096];
     paint_valid_task(&mut buf, 0, 12345);
-    buf[synth_task::STATE_OFF..synth_task::STATE_OFF + 4]
-        .copy_from_slice(&0x80u32.to_le_bytes());
+    buf[synth_task::STATE_OFF..synth_task::STATE_OFF + 4].copy_from_slice(&0x80u32.to_le_bytes());
     let kernel = build_test_kernel(&mut buf, Default::default());
     let offs = synth_validation_offsets();
-    let err = validate(&kernel, 0, 12345, DEFAULT_START_TIME, &offs)
-        .expect_err("TASK_DEAD must reject");
+    let err =
+        validate(&kernel, 0, 12345, DEFAULT_START_TIME, &offs).expect_err("TASK_DEAD must reject");
     assert!(err.contains("TASK_DEAD"));
     assert!(err.contains("state=0x80"));
 }
@@ -225,8 +223,8 @@ fn validate_task_rejects_on_rq_queued() {
     buf[synth_task::ON_RQ_OFF..synth_task::ON_RQ_OFF + 4].copy_from_slice(&1u32.to_le_bytes());
     let kernel = build_test_kernel(&mut buf, Default::default());
     let offs = synth_validation_offsets();
-    let err = validate(&kernel, 0, 12345, DEFAULT_START_TIME, &offs)
-        .expect_err("on_rq=1 must reject");
+    let err =
+        validate(&kernel, 0, 12345, DEFAULT_START_TIME, &offs).expect_err("on_rq=1 must reject");
     assert!(err.contains("on_rq=1"));
     assert!(err.contains("rb-tree"));
     assert!(err.contains("WorkType::FutexPingPong"));
@@ -309,8 +307,7 @@ fn validate_task_layer_order_pid_before_start_time() {
     let kernel = build_test_kernel(&mut buf, Default::default());
     let offs = synth_validation_offsets();
     // Both mismatched — expect pid error.
-    let err =
-        validate(&kernel, 0, 12345, DEFAULT_START_TIME + 1, &offs).expect_err("must reject");
+    let err = validate(&kernel, 0, 12345, DEFAULT_START_TIME + 1, &offs).expect_err("must reject");
     assert!(err.contains("pid mismatch"), "L1 must fire first: {err}");
     assert!(!err.contains("start_time identity mismatch"));
 }
@@ -320,12 +317,10 @@ fn validate_task_layer_order_pid_before_start_time() {
 fn validate_task_layer_order_start_time_before_dead() {
     let mut buf = vec![0u8; 4096];
     paint_valid_task(&mut buf, 0, 12345);
-    buf[synth_task::STATE_OFF..synth_task::STATE_OFF + 4]
-        .copy_from_slice(&0x80u32.to_le_bytes());
+    buf[synth_task::STATE_OFF..synth_task::STATE_OFF + 4].copy_from_slice(&0x80u32.to_le_bytes());
     let kernel = build_test_kernel(&mut buf, Default::default());
     let offs = synth_validation_offsets();
-    let err =
-        validate(&kernel, 0, 12345, DEFAULT_START_TIME + 1, &offs).expect_err("must reject");
+    let err = validate(&kernel, 0, 12345, DEFAULT_START_TIME + 1, &offs).expect_err("must reject");
     assert!(
         err.contains("start_time identity mismatch"),
         "L2 must fire first: {err}"
@@ -361,8 +356,7 @@ fn oru32_sets_target_bits_preserves_others() {
     const INITIAL_FLAGS: u32 = 0xAAAA_AAAA;
     const OR_MASK: u32 = 0x0000_0001;
     let mut buf = vec![0u8; 4096];
-    buf[SYMBOL_PA as usize..SYMBOL_PA as usize + 4]
-        .copy_from_slice(&INITIAL_FLAGS.to_le_bytes());
+    buf[SYMBOL_PA as usize..SYMBOL_PA as usize + 4].copy_from_slice(&INITIAL_FLAGS.to_le_bytes());
     let mut symbols = std::collections::HashMap::new();
     symbols.insert("test_flags".to_string(), symbol_kva);
     let kernel = build_test_kernel(&mut buf, symbols);
@@ -409,8 +403,7 @@ fn oru32_idempotent_on_already_set_bit() {
     // already-set bit.
     const ALREADY_SET: u32 = 0x0000_0002;
     let mut buf = vec![0u8; 4096];
-    buf[SYMBOL_PA as usize..SYMBOL_PA as usize + 4]
-        .copy_from_slice(&INITIAL_FLAGS.to_le_bytes());
+    buf[SYMBOL_PA as usize..SYMBOL_PA as usize + 4].copy_from_slice(&INITIAL_FLAGS.to_le_bytes());
     let mut symbols = std::collections::HashMap::new();
     symbols.insert("test_flags".to_string(), symbol_kva);
     let kernel = build_test_kernel(&mut buf, symbols);

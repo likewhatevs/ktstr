@@ -4,7 +4,6 @@
 //! parent module (`super`), reached via the glob below.
 use super::*;
 
-
 /// Redirect stdout and stderr through bulk-port forwarder threads.
 ///
 /// Pre-bulk-port-migration: dup2'd `/dev/ttyS1` over fd 1 and fd 2 so

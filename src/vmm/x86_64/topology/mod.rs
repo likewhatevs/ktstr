@@ -547,6 +547,6 @@ pub fn generate_cpuid(
 }
 
 #[cfg(test)]
-mod tests_math;
-#[cfg(test)]
 mod tests_cpuid;
+#[cfg(test)]
+mod tests_math;

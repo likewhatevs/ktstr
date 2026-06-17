@@ -140,15 +140,13 @@ fn vcpu_reg_snapshot_serde_round_trip_tcr_el1() {
     );
 
     // Deserialize Some-flavour JSON back, assert value preserved.
-    let parsed_some: VcpuRegSnapshot =
-        serde_json::from_str(&json_some).expect("deserialize Some");
+    let parsed_some: VcpuRegSnapshot = serde_json::from_str(&json_some).expect("deserialize Some");
     assert_eq!(parsed_some.tcr_el1, Some(some_val));
 
     // Deserialize JSON without the key (None-flavour); the
     // serde(default) attribute must yield None rather than
     // failing because the field is absent.
-    let parsed_none: VcpuRegSnapshot =
-        serde_json::from_str(&json_none).expect("deserialize None");
+    let parsed_none: VcpuRegSnapshot = serde_json::from_str(&json_none).expect("deserialize None");
     assert!(
         parsed_none.tcr_el1.is_none(),
         "missing tcr_el1 must deserialize as None"

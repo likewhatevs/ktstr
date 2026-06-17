@@ -1,7 +1,6 @@
 use super::super::*;
 use super::*;
 
-
 /// `CpuCap::new(1)` succeeds — minimum legal cap.
 #[test]
 fn cpu_cap_new_accepts_one() {

@@ -70,7 +70,7 @@ impl VirtioConsole {
 
     /// Eventfd signaled when new TX data arrives on port 2 (scheduler
     /// stats relay). Used by
-    /// [`super::sched_stats::SchedStatsClient`] to wake on a
+    /// [`crate::vmm::sched_stats::SchedStatsClient`] to wake on a
     /// stats-response edge without seeing port-0 console / port-1
     /// bulk wakes.
     pub fn stats_tx_evt(&self) -> &EventFd {
@@ -279,7 +279,7 @@ impl VirtioConsole {
             // Wake the matching host poll thread. Ports 0 and 1 share
             // `tx_evt` (the freeze coordinator's TOKEN_TX handler
             // drains both); port 2 fires its own `stats_tx_evt` so
-            // [`super::sched_stats::SchedStatsClient`] wakes only on
+            // [`crate::vmm::sched_stats::SchedStatsClient`] wakes only on
             // a stats edge. A missed write means the host poll
             // absorbs the latency next cycle — not a correctness
             // failure. Silent swallow is intentional (in contrast to
@@ -552,7 +552,7 @@ impl VirtioConsole {
 
     /// Push host data into the guest's port-1 RX buffers. Used by the
     /// freeze coordinator's snapshot-request handler to deliver a
-    /// [`super::wire::SnapshotReplyPayload`] back to the in-guest
+    /// [`crate::vmm::wire::SnapshotReplyPayload`] back to the in-guest
     /// `request_snapshot` blocking reader. Bytes that cannot be
     /// delivered immediately (no chain available, port not opened
     /// yet, DRIVER_OK not set) accumulate in port 1's `pending_rx`
@@ -568,7 +568,7 @@ impl VirtioConsole {
     // ------------------------------------------------------------------
 
     /// Push host data into the guest's port-2 RX buffers. Used by the
-    /// host's [`super::sched_stats::SchedStatsClient`] to deliver
+    /// host's [`crate::vmm::sched_stats::SchedStatsClient`] to deliver
     /// scx_stats request bytes to the in-guest relay thread that
     /// forwards them to `/var/run/scx/root/stats`. Bytes that cannot
     /// be delivered immediately accumulate in port 2's `pending_rx`
@@ -582,7 +582,7 @@ impl VirtioConsole {
 
     /// Drop any host→guest port-2 request bytes that have not yet
     /// been consumed by the guest. Called by
-    /// [`super::sched_stats::SchedStatsClient::request_raw`] at the
+    /// [`crate::vmm::sched_stats::SchedStatsClient::request_raw`] at the
     /// start of every fresh request: a freeze rendezvous that
     /// landed mid-request can leave half a JSON request line in port
     /// 2's `pending_rx`. If the next request just pushed onto the

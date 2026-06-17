@@ -15,7 +15,6 @@ use super::worker::worker_thread_main;
 #[cfg(not(test))]
 use std::thread;
 
-
 // `DrainOutcome` and `drain_bracket_impl` live in `drain.rs`; reach them
 // via the `super::*;` glob (sourced from `mod.rs`'s
 // `pub(crate) use drain::*;`). Pulled out for module locality so the

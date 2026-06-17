@@ -1261,8 +1261,7 @@ fn hmat_sllbi_cxl_entries_differ() {
 
     // CXL target is the last region (node 2, memory-only).
     // Read first initiator's entries for DRAM target 0 and CXL target 2.
-    let dram_entry =
-        u16::from_le_bytes(hmat[matrix_offset..matrix_offset + 2].try_into().unwrap());
+    let dram_entry = u16::from_le_bytes(hmat[matrix_offset..matrix_offset + 2].try_into().unwrap());
     let cxl_entry = u16::from_le_bytes(
         hmat[matrix_offset + 2 * (nt - 1)..matrix_offset + 2 * nt]
             .try_into()

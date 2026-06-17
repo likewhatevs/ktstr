@@ -1,7 +1,6 @@
 use super::super::super::*;
 use super::*;
 
-
 // ----------------------------------------------------------------
 // Port 2 TX (PORT2_TXQ) chain-level tests.
 // ----------------------------------------------------------------
@@ -538,9 +537,9 @@ fn port1_tx_wakes_tx_evt_only_not_stats_tx_evt() {
     let tx_count = dev.tx_evt.read().expect("tx_evt was written by port-1 TX");
     assert!(tx_count > 0, "port 1 TX must wake tx_evt");
     match dev.stats_tx_evt.read() {
-        Ok(n) => panic!(
-            "stats_tx_evt must NOT have been written by port-1 TX, but read returned {n}"
-        ),
+        Ok(n) => {
+            panic!("stats_tx_evt must NOT have been written by port-1 TX, but read returned {n}")
+        }
         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
         Err(e) => panic!("unexpected stats_tx_evt read error: {e}"),
     }

@@ -4,7 +4,6 @@
 //! parent module (`super`), reached via the glob below.
 use super::*;
 
-
 /// Maximum scheduler-log chunk emitted in a single
 /// [`crate::vmm::guest_comms::send_sched_log`] frame. Sub-cap of
 /// [`crate::vmm::bulk::MAX_BULK_FRAME_PAYLOAD`] so a chunk fits

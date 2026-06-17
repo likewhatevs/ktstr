@@ -56,7 +56,6 @@ const TRACE_PIPE: &str = "/sys/kernel/tracing/trace_pipe";
 /// `sch->ops.name` is set.
 const SYSFS_SCHED_EXT_ROOT_OPS: &str = "/sys/kernel/sched_ext/root/ops";
 
-
 /// Side channel for the scheduler PID published by [`start_scheduler`]
 /// once `Command::spawn` returns. The guest test-dispatch path
 /// (e.g. [`crate::test_support`] consumers that need the scheduler's
@@ -121,25 +120,25 @@ const SCHED_KILL_GRACE: std::time::Duration = std::time::Duration::from_millis(3
 /// (`dump_sched_output`) over the fast bulk port.
 const SCX_DUMP_CAPTURE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-mod process;
 mod asmsig;
+mod dump;
 mod init;
 mod modes;
-mod topology;
 mod mounts;
-mod scheduler;
+mod process;
 mod relay;
-mod dump;
+mod scheduler;
+mod topology;
 
-pub(crate) use process::*;
 pub(crate) use asmsig::*;
+pub(crate) use dump::*;
 pub(crate) use init::*;
 pub(crate) use modes::*;
-pub(crate) use topology::*;
 pub(crate) use mounts::*;
-pub(crate) use scheduler::*;
+pub(crate) use process::*;
 pub(crate) use relay::*;
-pub(crate) use dump::*;
+pub(crate) use scheduler::*;
+pub(crate) use topology::*;
 
 #[cfg(test)]
 mod tests;

@@ -1,7 +1,6 @@
 use super::super::super::*;
 use super::*;
 
-
 /// Empty pending-rx → drain is a no-op. No queue access, no
 /// add_used, no signal_used. Pins the `if pending.is_empty()`
 /// fast-exit at the head of `drain_port1_pending_rx`.

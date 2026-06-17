@@ -253,8 +253,7 @@ fn send_sys_rdy_retry_exits_when_budget_exhausted() {
     // Use a path that won't exist on the host so the loop
     // takes the port_exists=false branch — no real device
     // interaction in unit tests.
-    let port_path =
-        std::path::Path::new("/tmp/ktstr-test-nonexistent-port-please-do-not-create");
+    let port_path = std::path::Path::new("/tmp/ktstr-test-nonexistent-port-please-do-not-create");
     let t0 = std::time::Instant::now();
     send_sys_rdy_with_retry(budget, 1, &addrs, port_path);
     let elapsed = t0.elapsed();
@@ -295,8 +294,7 @@ fn send_sys_rdy_retry_exits_when_budget_exhausted() {
 /// coupling test.
 #[test]
 fn send_sys_rdy_retry_respects_budget_across_sizes() {
-    let port_path =
-        std::path::Path::new("/tmp/ktstr-test-nonexistent-port-please-do-not-create");
+    let port_path = std::path::Path::new("/tmp/ktstr-test-nonexistent-port-please-do-not-create");
     let addrs = crate::vmm::wire::KernAddrs::new(0, 0, None);
     for &(budget_ms, vcpus) in &[(50u64, 1u32), (150, 2), (250, 8), (500, 32)] {
         let budget = std::time::Duration::from_millis(budget_ms);

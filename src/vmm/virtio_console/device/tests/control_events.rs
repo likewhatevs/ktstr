@@ -1,7 +1,6 @@
 use super::super::super::*;
 use super::*;
 
-
 // ----------------------------------------------------------------
 // Hostile-guest control message defenses (handle_control_event).
 //

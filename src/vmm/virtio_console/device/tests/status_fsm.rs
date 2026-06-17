@@ -1,7 +1,6 @@
 use super::super::super::*;
 use super::*;
 
-
 // ----------------------------------------------------------------
 // set_status monotone defense.
 //

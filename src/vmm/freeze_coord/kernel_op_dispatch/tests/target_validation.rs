@@ -91,9 +91,7 @@ fn validate_direct_target_accepts_in_range() {
     // Mid-range.
     assert!(validate_direct_target(page_offset + 0x1000, 8, page_offset, dram_size).is_ok());
     // Last U32 inside.
-    assert!(
-        validate_direct_target(page_offset + dram_size - 4, 4, page_offset, dram_size).is_ok()
-    );
+    assert!(validate_direct_target(page_offset + dram_size - 4, 4, page_offset, dram_size).is_ok());
 }
 
 /// validate_direct_target rejects a KVA below page_offset.

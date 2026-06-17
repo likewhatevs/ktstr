@@ -4,7 +4,6 @@
 //! `ensure_template`, `clone_to_per_test`, `lookup`, …) via `use super::*`.
 use super::*;
 
-
 /// Sweep stale staging debris out of the disk-template cache root.
 ///
 /// Three debris shapes accumulate when a template-build peer or a

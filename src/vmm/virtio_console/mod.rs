@@ -480,5 +480,4 @@ impl Default for VirtioConsole {
     }
 }
 
-
 mod device;

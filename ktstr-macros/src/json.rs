@@ -47,9 +47,7 @@ pub(crate) fn tokens_to_json(out: &mut String, tokens: proc_macro2::TokenStream)
                             out.push('0');
                         }
                     }
-                    syn::Lit::Bool(b) => {
-                        out.push_str(if b.value { "true" } else { "false" })
-                    }
+                    syn::Lit::Bool(b) => out.push_str(if b.value { "true" } else { "false" }),
                     // Byte strings, c-strings, byte/char literals, and
                     // verbatim tokens are not JSON values; emit verbatim
                     // so a malformed result surfaces at parse time as a

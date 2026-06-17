@@ -39,9 +39,9 @@ use virtio_queue::Error as VirtioQueueError;
 use virtio_queue::{QueueOwnedT, QueueT};
 
 use super::{
-    Backing, BlkQueue, BlkWorkerState, ChainDescriptor, NUM_QUEUES, REQ_QUEUE, VIRTIO_BLK_OUTHDR_SIZE,
-    VIRTIO_BLK_SECTOR_SIZE, VIRTIO_BLK_SEG_MAX, VIRTIO_BLK_SIZE_MAX, VirtioBlk, VirtioBlkOutHdr,
-    publish_completion,
+    Backing, BlkQueue, BlkWorkerState, ChainDescriptor, NUM_QUEUES, REQ_QUEUE,
+    VIRTIO_BLK_OUTHDR_SIZE, VIRTIO_BLK_SECTOR_SIZE, VIRTIO_BLK_SEG_MAX, VIRTIO_BLK_SIZE_MAX,
+    VirtioBlk, VirtioBlkOutHdr, publish_completion,
 };
 
 /// Outcome of a single `drain_bracket_impl` invocation.

@@ -1,7 +1,6 @@
 use super::super::*;
 use super::*;
 
-
 #[test]
 fn resource_lock_shared_acquires() {
     let _tempfile_keep_alive = tempfile::Builder::new()

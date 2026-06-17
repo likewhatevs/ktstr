@@ -110,6 +110,16 @@ pub(crate) fn format_monitor_section(
     format!("\n\n--- monitor ---\n{}", lines.join("\n"))
 }
 
+/// Number of monitor samples to skip at the start of evaluation.
+///
+/// During VM boot the kernel performs BPF verification, initramfs
+/// unpacking, and scheduler loading. These memory-intensive operations
+/// cause the scheduler tick to stall for hundreds of milliseconds.
+/// The stalls are real but transient — evaluating them produces false
+/// positives, especially in low-memory VMs.
+///
+/// 20 samples at ~100ms interval = ~2 seconds of warmup. This covers
+/// the boot settling period after the scheduler attaches.
 const MONITOR_WARMUP_SAMPLES: usize = 20;
 
 /// Skip boot-settle samples from a MonitorReport for threshold evaluation.

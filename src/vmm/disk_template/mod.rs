@@ -1540,7 +1540,6 @@ mod cleanup;
 #[allow(unused_imports)]
 pub use cleanup::{clean_all, clean_orphaned_tmp_dirs};
 
-
 /// Extract the last `n` lines of `text` for an error context.
 /// Used by [`build_template_via_vm`] to surface the trailing guest
 /// stderr — typically the `mkfs` failure message — without

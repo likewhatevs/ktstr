@@ -2247,17 +2247,6 @@ fn evaluate_vm_result(
     anyhow::bail!("{msg}")
 }
 
-/// Number of monitor samples to skip at the start of evaluation.
-///
-/// During VM boot the kernel performs BPF verification, initramfs
-/// unpacking, and scheduler loading. These memory-intensive operations
-/// cause the scheduler tick to stall for hundreds of milliseconds.
-/// The stalls are real but transient — evaluating them produces false
-/// positives, especially in low-memory VMs.
-///
-/// 20 samples at ~100ms interval = ~2 seconds of warmup. This covers
-/// the boot settling period after the scheduler attaches.
-
 #[cfg(test)]
 mod eval_tests;
 #[cfg(test)]

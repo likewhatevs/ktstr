@@ -28,8 +28,8 @@ use virtio_queue::{Error as VirtioQueueError, Queue, QueueOwnedT, QueueT};
 use vm_memory::{Address, ByteValued, Bytes, GuestAddress, GuestMemoryMmap};
 use vmm_sys_util::eventfd::EventFd;
 
-use crate::vmm::net_config::NetConfig;
 use super::counters::VirtioNetCounters;
+use crate::vmm::net_config::NetConfig;
 
 pub(crate) const MMIO_MAGIC: u32 = 0x7472_6976; // "virt" in LE
 pub(crate) const MMIO_VERSION: u32 = 2; // virtio 1.x MMIO
@@ -1046,7 +1046,10 @@ impl VirtioNet {
             let start = self.tx_frame_scratch.len();
             self.tx_frame_scratch.resize(start + desc_len, 0);
             if mem
-                .read_slice(&mut self.tx_frame_scratch[start..start + desc_len], desc_addr)
+                .read_slice(
+                    &mut self.tx_frame_scratch[start..start + desc_len],
+                    desc_addr,
+                )
                 .is_err()
             {
                 // Guest-memory read failed (unmapped GPA). Drop the

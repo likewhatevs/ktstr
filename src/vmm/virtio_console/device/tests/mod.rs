@@ -7,7 +7,6 @@ use virtio_queue::desc::{RawDescriptor, split::Descriptor as SplitDescriptor};
 use virtio_queue::mock::MockSplitQueue;
 use vm_memory::{Address, GuestAddress};
 
-
 fn read_reg(dev: &VirtioConsole, offset: u32) -> u32 {
     let mut buf = [0u8; 4];
     dev.mmio_read(offset as u64, &mut buf);
@@ -229,10 +228,10 @@ fn wire_port2_rxq_to_mock(dev: &mut VirtioConsole, mock: &MockSplitQueue<GuestMe
     wire_console_queue_to_mock(dev, mock, PORT2_RXQ as u32);
 }
 
-mod mmio_config;
-mod port_tx;
 mod control_events;
-mod status_fsm;
+mod mmio_config;
 mod mmio_read;
-mod rx_drain;
 mod port2;
+mod port_tx;
+mod rx_drain;
+mod status_fsm;

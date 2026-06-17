@@ -4,7 +4,6 @@
 //! parent module (`super`), reached via the glob below.
 use super::*;
 
-
 /// Path of the scheduler-stats Unix socket inside the guest. Owned
 /// by the running scx_* scheduler binary (created via
 /// `scx_utils::stats::ScxStatsServer`). Empty when no scheduler is
