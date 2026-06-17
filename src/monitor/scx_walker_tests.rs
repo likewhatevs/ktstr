@@ -563,7 +563,7 @@ fn walk_scx_tasks_global_zero_kva_returns_empty() {
         false,
     );
 
-    let kvas = walk_scx_tasks_global(&kernel, 0, 0x10, 0x60, 0x44);
+    let kvas = walk_scx_tasks_global(&kernel, 0, 0, 0x10, 0x60, 0x44);
     assert!(
         kvas.is_empty(),
         "scx_tasks_kva=0 must short-circuit before any read"
@@ -593,7 +593,7 @@ fn walk_scx_tasks_global_empty_list_returns_empty() {
         false,
     );
 
-    let kvas = walk_scx_tasks_global(&kernel, head_kva, 0x10, 0x60, 0x44);
+    let kvas = walk_scx_tasks_global(&kernel, head_kva, 0, 0x10, 0x60, 0x44);
     assert!(kvas.is_empty(), "empty global list must yield no tasks");
 }
 
@@ -652,6 +652,7 @@ fn walk_scx_tasks_global_two_tasks_round_trip() {
     let kvas = walk_scx_tasks_global(
         &kernel,
         head_kva,
+        0, // kaslr_offset (test KVAs are link-time == runtime)
         tasks_node_off_in_task,
         tasks_node_off_in_see,
         flags_off_in_see,
@@ -665,6 +666,162 @@ fn walk_scx_tasks_global_two_tasks_round_trip() {
     assert_eq!(
         kvas[1],
         t2_node_kva.wrapping_sub(tasks_node_off_in_task as u64)
+    );
+}
+
+/// HOSTILE-INPUT backstop: a genuinely corrupt / non-canonical ring whose
+/// final node.next points at an INTERIOR node instead of the head (a torn
+/// read, or guest memory corruption) must yield each unique task once via
+/// the HashSet address-cycle break, not repeat the ring to
+/// `MAX_NODES_PER_LIST`. (The in-VM ~57× cycle that surfaced this was NOT
+/// a corrupt list — the kernel ring is canonical; it was the link-time vs
+/// runtime KASLR-slide mismatch on the head, fixed separately and covered
+/// by `walk_scx_tasks_global_closes_through_slid_runtime_head`. This test
+/// exercises the HashSet as the remaining hostile-input safeguard.)
+#[test]
+fn walk_scx_tasks_global_corrupt_interior_ring_yields_unique_nodes_once() {
+    // t2.next = t1_node_kva (back to an interior node) so the ring never
+    // closes through head_kva — kaslr_offset = 0 so head is not the issue.
+    let head_kva = crate::monitor::symbols::START_KERNEL_MAP + 0x100;
+    let head_pa = 0x100usize;
+    let t1_node_kva: u64 = 0x800;
+    let t2_node_kva: u64 = 0x900;
+    let tasks_node_off_in_task: usize = 0x40;
+    let tasks_node_off_in_see: usize = 0x60;
+    let flags_off_in_see: usize = 0x44;
+
+    let mut buf = vec![0u8; 0x1000];
+    buf[head_pa..head_pa + 8].copy_from_slice(&t1_node_kva.to_le_bytes());
+    let t1_pa = t1_node_kva as usize;
+    let t2_pa = t2_node_kva as usize;
+    buf[t1_pa..t1_pa + 8].copy_from_slice(&t2_node_kva.to_le_bytes());
+    // Non-canonical: close the ring to t1 (interior), NOT head — a corrupt
+    // guest list the HashSet must bound (the kernel never produces this;
+    // list_add_tail always links the last node back to &scx_tasks).
+    buf[t2_pa..t2_pa + 8].copy_from_slice(&t1_node_kva.to_le_bytes());
+
+    let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
+    let kernel = crate::monitor::guest::GuestKernel::new_for_test(
+        std::sync::Arc::new(mem),
+        std::collections::HashMap::new(),
+        0,
+        0,
+        false,
+    );
+
+    let kvas = walk_scx_tasks_global(
+        &kernel,
+        head_kva,
+        0, // kaslr_offset (test KVAs are link-time == runtime)
+        tasks_node_off_in_task,
+        tasks_node_off_in_see,
+        flags_off_in_see,
+    );
+    assert_eq!(
+        kvas.len(),
+        2,
+        "cyclic list must yield each unique task once (cycle detection), \
+         not repeat to MAX_NODES_PER_LIST: got {}",
+        kvas.len(),
+    );
+    assert_eq!(
+        kvas[0],
+        t1_node_kva.wrapping_sub(tasks_node_off_in_task as u64)
+    );
+    assert_eq!(
+        kvas[1],
+        t2_node_kva.wrapping_sub(tasks_node_off_in_task as u64)
+    );
+}
+
+/// Under KASLR the list's runtime `.next` pointers carry the virtual
+/// slide, so the walk must slide the LINK-TIME head symbol before the
+/// terminator comparison. With the correct slide the canonical ring
+/// closes ON the runtime head and the head node is never processed.
+/// Regression for the real in-VM root cause (link-time head vs slid
+/// runtime `.next`, which cycled to the cap on every KASLR-on boot) AND
+/// the phantom head-node task it would otherwise emit: without the slide
+/// the terminator never matches, the loop runs on the runtime head node,
+/// and pushes a third (phantom) entry. The assertion `len() == 2`
+/// discriminates the fixed path (2 real tasks, closed on head) from the
+/// bug (3 entries incl the phantom).
+#[test]
+fn walk_scx_tasks_global_closes_through_slid_runtime_head() {
+    let slide: u64 = 0x2d60_0000; // realistic KASLR virtual slide
+    let head_kva = crate::monitor::symbols::START_KERNEL_MAP + 0x100; // link-time
+    let head_pa = 0x100usize;
+    let t1_node_kva: u64 = 0x800;
+    let t2_node_kva: u64 = 0x900;
+    let tasks_node_off_in_task: usize = 0x40;
+    let tasks_node_off_in_see: usize = 0x60;
+    let flags_off_in_see: usize = 0x44;
+
+    let mut buf = vec![0u8; 0x1000];
+    // head.next = t1; t1.next = t2; t2.next = RUNTIME head (link + slide),
+    // exactly how the kernel's list_add_tail closes the ring at runtime.
+    buf[head_pa..head_pa + 8].copy_from_slice(&t1_node_kva.to_le_bytes());
+    let t1_pa = t1_node_kva as usize;
+    let t2_pa = t2_node_kva as usize;
+    buf[t1_pa..t1_pa + 8].copy_from_slice(&t2_node_kva.to_le_bytes());
+    let runtime_head = head_kva + slide;
+    buf[t2_pa..t2_pa + 8].copy_from_slice(&runtime_head.to_le_bytes());
+
+    let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
+    let kernel = crate::monitor::guest::GuestKernel::new_for_test(
+        std::sync::Arc::new(mem),
+        std::collections::HashMap::new(),
+        0,
+        0,
+        false,
+    );
+
+    let kvas = walk_scx_tasks_global(
+        &kernel,
+        head_kva, // link-time head, as resolved from the ELF symbol
+        slide,    // kaslr_offset: the walk slides head before comparing
+        tasks_node_off_in_task,
+        tasks_node_off_in_see,
+        flags_off_in_see,
+    );
+    assert_eq!(
+        kvas.len(),
+        2,
+        "ring must close ON the slid runtime head with no phantom head-node \
+         task; got {kvas:?}",
+    );
+    assert_eq!(
+        kvas[0],
+        t1_node_kva.wrapping_sub(tasks_node_off_in_task as u64)
+    );
+    assert_eq!(
+        kvas[1],
+        t2_node_kva.wrapping_sub(tasks_node_off_in_task as u64)
+    );
+}
+
+/// `slid_kernel_kva` applies the virtual KASLR slide ONLY to high-half
+/// (kernel-image) symbols; low / zero-based per-CPU templates are
+/// returned unchanged, and a zero offset is the identity.
+#[test]
+fn slid_kernel_kva_slides_high_half_only() {
+    use crate::monitor::symbols::slid_kernel_kva;
+    let slide = 0x2d60_0000u64;
+    let high = crate::monitor::symbols::START_KERNEL_MAP + 0x1000; // >= 1<<48
+    assert_eq!(
+        slid_kernel_kva(high, slide),
+        high + slide,
+        "high-half symbol gets the slide",
+    );
+    let low = 0x4000u64; // zero-based template, < 1<<48
+    assert_eq!(
+        slid_kernel_kva(low, slide),
+        low,
+        "low / zero-based template must not be slid",
+    );
+    assert_eq!(
+        slid_kernel_kva(high, 0),
+        high,
+        "zero offset is the identity",
     );
 }
 
@@ -831,6 +988,7 @@ fn walk_scx_tasks_global_skips_cursor_entries() {
     let kvas = walk_scx_tasks_global(
         &kernel,
         head_kva,
+        0, // kaslr_offset (test KVAs are link-time == runtime)
         tasks_node_off_in_task,
         tasks_node_off_in_see,
         flags_off_in_see,

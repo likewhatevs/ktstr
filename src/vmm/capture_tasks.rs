@@ -203,6 +203,7 @@ pub(crate) fn build(
     let mut all_task_kvas: Vec<u64> = crate::monitor::scx_walker::walk_scx_tasks_global(
         kernel,
         scx_owned.scx_tasks_kva,
+        scx_owned.kaslr_offset,
         tasks_node_off_in_task,
         see_offs.tasks_node,
         see_offs.flags,
@@ -360,8 +361,19 @@ fn walk_runnable_list(
     }
 
     let mut visited: u32 = 0;
+    // Address-cycle backstop: a corrupt / non-canonical runnable_list ring
+    // (final .next at an interior node, or a torn read) bounds to its
+    // unique-node set rather than cycling to MAX_NODES_PER_LIST and burning
+    // a translate_any_kva page-table walk per phantom iteration on the
+    // freeze-coordinator thread. Mirrors walk_scx_tasks_global's contract;
+    // duplicate emission here is additionally collapsed by build()'s
+    // all_task_kvas_set, but the freeze-time burn is not — so stop early.
+    let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
     while node_kva != head_kva {
         if visited >= MAX_NODES_PER_LIST {
+            return task_kvas;
+        }
+        if !seen.insert(node_kva) {
             return task_kvas;
         }
         visited += 1;
@@ -564,20 +576,22 @@ mod tests {
         assert_eq!(kvas, vec![(n1 - off) as u64]);
     }
 
-    /// Cycle protection: a runnable_list whose chain length exceeds
-    /// [`MAX_NODES_PER_LIST`] returns truncated rather than looping
-    /// forever. We synthesize a 2-node cycle that does NOT close
-    /// back to head; the walker hits the cap and returns.
+    /// Cycle protection: a corrupt runnable_list whose chain forms an
+    /// interior cycle that never closes back to head is bounded by the
+    /// address-cycle HashSet to its UNIQUE-node set — it does not run to
+    /// [`MAX_NODES_PER_LIST`]. We synthesize a 2-node cycle (n1 <-> n2,
+    /// never reaching head); the walker visits n1 and n2 once each, then
+    /// breaks on revisiting n1.
     #[test]
-    fn walk_runnable_list_truncates_at_cap() {
+    fn walk_runnable_list_cyclic_ring_breaks_on_revisit() {
         let mut buf = vec![0u8; 0x1000];
         let head = 0x100usize;
         let n1 = 0x200usize;
         let n2 = 0x300usize;
 
         buf[head..head + 8].copy_from_slice(&(n1 as u64).to_le_bytes());
-        // n1.next = n2, n2.next = n1 — infinite loop never reaching
-        // head. The visited-cap kicks in.
+        // n1.next = n2, n2.next = n1 — interior cycle never reaching head.
+        // The HashSet breaks on the revisit of n1.
         buf[n1..n1 + 8].copy_from_slice(&(n2 as u64).to_le_bytes());
         buf[n2..n2 + 8].copy_from_slice(&(n1 as u64).to_le_bytes());
 
@@ -589,7 +603,13 @@ mod tests {
             head as u64,
             0,
         );
-        assert_eq!(kvas.len() as u32, MAX_NODES_PER_LIST);
+        // offset 0 -> container_of is identity; the two unique nodes only.
+        assert_eq!(
+            kvas,
+            vec![n1 as u64, n2 as u64],
+            "interior cycle must yield the unique-node set via the HashSet \
+             break, not run to MAX_NODES_PER_LIST",
+        );
     }
 
     /// Unmapped guest memory: when the in-list next pointer reads as
@@ -1054,6 +1074,7 @@ mod tests {
         let global = crate::monitor::scx_walker::walk_scx_tasks_global(
             &kernel,
             head_kva,
+            0, // kaslr_offset (test KVAs are link-time == runtime)
             tasks_node_off_in_task,
             tasks_node_off_in_see,
             flags_off_in_see,
@@ -1110,7 +1131,7 @@ mod tests {
 
         // Global walk on scx_tasks_kva=0 must return empty.
         let global =
-            crate::monitor::scx_walker::walk_scx_tasks_global(&kernel, 0, 0x40, 0x60, 0x44);
+            crate::monitor::scx_walker::walk_scx_tasks_global(&kernel, 0, 0, 0x40, 0x60, 0x44);
         assert!(
             global.is_empty(),
             "scx_tasks_kva=0 must NOT produce phantom entries"
@@ -1177,6 +1198,7 @@ mod tests {
         let global = crate::monitor::scx_walker::walk_scx_tasks_global(
             &kernel,
             head_kva,
+            0, // kaslr_offset (test KVAs are link-time == runtime)
             tasks_node_off_in_task,
             tasks_node_off_in_see,
             flags_off_in_see,
@@ -1240,6 +1262,7 @@ mod tests {
         let global = crate::monitor::scx_walker::walk_scx_tasks_global(
             &kernel,
             head_kva,
+            0, // kaslr_offset (test KVAs are link-time == runtime)
             tasks_node_off_in_task,
             tasks_node_off_in_see,
             flags_off_in_see,
@@ -1287,6 +1310,7 @@ mod tests {
         let global = crate::monitor::scx_walker::walk_scx_tasks_global(
             &kernel,
             global_head_kva,
+            0, // kaslr_offset
             0x40,
             0x60,
             0x44,

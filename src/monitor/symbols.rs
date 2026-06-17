@@ -888,49 +888,45 @@ pub(crate) fn read_per_cpu_offsets(
 ///   both sides of the subtraction in `__per_cpu_offset[cpu]`
 ///   and cancel.
 ///
-/// Combining the two cases: the host-side host-equivalent of
+/// Combining the two cases, the host-side equivalent of
 /// `per_cpu_ptr(&template, cpu)` is
-/// `template_kva + kaslr_offset_if_high_half + per_cpu_off`.
-/// This helper applies the slide ONLY when `template_kva` is in
-/// the kernel half (`template_kva >= 1 << 48` — any plausible
-/// kernel-half address satisfies this on every supported
-/// arch+paging combination: x86_64 4-level (>= 0xffff_8000_...),
-/// x86_64 5-level (>= 0xff00_0000_...), aarch64 VA_BITS=48
-/// (>= 0xffff_0000_...), and aarch64 VA_BITS=52 (>=
-/// 0xfff0_0000_...).  Zero-based per-CPU templates are link-time
-/// offsets below 4 GiB, so they fall well under 2^48 and the
-/// slide is suppressed; the stored `__per_cpu_offset[cpu]`
-/// already encodes the absolute runtime address in that case.
-/// Documented in `linux:include/linux/percpu-defs.h:237`
-/// (`per_cpu_ptr` macro) and the per-arch `setup_per_cpu_areas`
-/// for the delta.
-///
-/// Extracted into a single helper so the formula has one audit
-/// point.  Production callers route the `kaslr_offset` argument
-/// from the shared Arc snapshot; 0 is the KASLR-off /
-/// nokaslr-karg / not-yet-published fallback (the addition is a
-/// no-op slide and the formula collapses to
-/// `template_kva + per_cpu_off`).  Anyone adding a sixth per-CPU
-/// walker should call this helper rather than re-deriving the
-/// formula.
+/// `slid_kernel_kva(template_kva, kaslr_offset) + per_cpu_off`:
+/// [`slid_kernel_kva`] owns the high-half slide and its zero-based
+/// suppression (it is the single audit point for the `>= 1 << 48`
+/// threshold), and this helper adds the per-CPU offset on top.
+/// `per_cpu_ptr` macro: `linux:include/linux/percpu-defs.h:237`; the
+/// `__per_cpu_offset[cpu]` delta: the per-arch `setup_per_cpu_areas`.
+/// Production callers route `kaslr_offset` from the shared Arc (0 is the
+/// KASLR-off / nokaslr-karg / not-yet-published no-op slide). Anyone
+/// adding a sixth per-CPU walker should call this helper rather than
+/// re-deriving the formula.
 #[inline]
 pub(crate) fn per_cpu_kva(template_kva: u64, kaslr_offset: u64, per_cpu_off: u64) -> u64 {
-    // Apply the KASLR slide ONLY for high-half templates (v6.15+
-    // post-fix layout). Zero-based templates encode the absolute
-    // runtime address inside `per_cpu_off` already, so adding the
-    // slide would double-count and shift the result outside the
-    // mapped direct-map window. Threshold is arch-portable: any
-    // kernel-half KVA satisfies `>= 1 << 48` on every supported
-    // arch+paging combination (x86_64 4-level / 5-level, aarch64
-    // VA_BITS=48 / 52), and zero-based per-CPU symbol offsets sit
-    // well under 4 GiB so they always fall below.
+    slid_kernel_kva(template_kva, kaslr_offset).wrapping_add(per_cpu_off)
+}
+
+/// Slide a LINK-TIME kernel-image symbol KVA to its RUNTIME KVA by the
+/// virtual KASLR offset. The slide is applied ONLY for high-half
+/// addresses (`>= 1 << 48`): link-time per-CPU symbol offsets and other
+/// zero-based templates sit below 4 GiB and must not be slid (they encode
+/// their absolute runtime address elsewhere — see [`per_cpu_kva`]). The
+/// threshold is arch-portable: any kernel-half KVA satisfies `>= 1 << 48`
+/// on every supported arch+paging combination (x86_64 4-level/5-level,
+/// aarch64 VA_BITS=48/52). `kaslr_offset == 0` (KASLR-off / nokaslr-karg /
+/// not-yet-published) makes this an identity. This is the SINGLE audit
+/// point for the virtual-slide formula; every walker that compares a
+/// runtime guest pointer against a link-time symbol must route the symbol
+/// through here first (e.g. a list walk whose `.next` pointers are runtime
+/// addresses but whose head is a static link-time symbol).
+#[inline]
+pub(crate) fn slid_kernel_kva(link_kva: u64, kaslr_offset: u64) -> u64 {
     const HIGH_HALF_THRESHOLD: u64 = 1u64 << 48;
-    let slide = if template_kva >= HIGH_HALF_THRESHOLD {
+    let slide = if link_kva >= HIGH_HALF_THRESHOLD {
         kaslr_offset
     } else {
         0
     };
-    template_kva.wrapping_add(slide).wrapping_add(per_cpu_off)
+    link_kva.wrapping_add(slide)
 }
 
 /// Compute the physical address of each CPU's `struct rq`.
