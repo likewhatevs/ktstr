@@ -360,14 +360,13 @@ fn assert_phase_pipeline_three_step(result: &VmResult) -> Result<()> {
         result.periodic_target,
     );
 
-    let drained = result.snapshot_bridge.drain_ordered_with_stats();
-    let drained_len = drained.len();
-    let series = SampleSeries::from_drained_typed(drained, result.monitor.clone());
-    // The COMPLETE timeline (step frames + scenario-end terminal) via
-    // the shared accessor — folding only the raw wire Stimulus frames
-    // would omit the terminal and drop the last step's iteration_rate.
-    let stimulus = result.stimulus_timeline();
-    let phases = ktstr::assert::build_phase_buckets_with_stimulus(&series, &stimulus);
+    // The framework-canonical per-phase buckets via the phase-buckets accessor —
+    // one shared captures_series() drain, no manual bridge drain that
+    // would starve the framework's own stats.phases build.
+    let phases = result.phase_buckets();
+    // Full capture count for the sum invariant, read from the same
+    // cached drain phase_buckets() just populated.
+    let drained_len = result.captures_series().len();
 
     // The load-bearing invariant: exact count. BASELINE bucket
     // is only emitted when at least one sample lands in the
@@ -470,13 +469,14 @@ fn assert_iteration_rate_first_and_last(result: &VmResult) -> Result<()> {
         result.periodic_fired,
         result.periodic_target,
     );
-    let drained = result.snapshot_bridge.drain_ordered_with_stats();
-    let series = SampleSeries::from_drained_typed(drained, result.monitor.clone());
-    // The COMPLETE timeline (step frames + scenario-end terminal) via
-    // the shared accessor — folding only the raw wire Stimulus frames
-    // would omit the terminal and drop the last step's iteration_rate.
-    let stimulus = result.stimulus_timeline();
-    let phases = ktstr::assert::build_phase_buckets_with_stimulus(&series, &stimulus);
+    // The framework-canonical per-phase buckets via the phase-buckets accessor:
+    // one shared captures_series() drain folded through
+    // build_phase_buckets_with_stimulus over the COMPLETE timeline
+    // (step frames + scenario-end terminal). Identical to the manual
+    // drain+build oracle in `assert_phase_pipeline`, but it does NOT
+    // drain the bridge out from under the framework's own stats.phases
+    // build (the drain-once starvation fixed).
+    let phases = result.phase_buckets();
 
     // FIRST step = lowest step_index >= 1 (Step[0] under the 1-indexed
     // encoding). Its rate is the (first_frame -> second_frame) delta —
@@ -558,13 +558,14 @@ fn phase_pipeline_iteration_rate_backdrop_e2e(ctx: &Ctx) -> Result<AssertResult>
 /// that the two configurations produce DIFFERENT readings, not
 /// that they differ by a specific amount.
 fn assert_per_step_cpuset_changes_metrics(result: &VmResult) -> Result<()> {
-    let drained = result.snapshot_bridge.drain_ordered_with_stats();
-    let series = SampleSeries::from_drained_typed(drained, result.monitor.clone());
-    // The COMPLETE timeline (step frames + scenario-end terminal) via
-    // the shared accessor — folding only the raw wire Stimulus frames
-    // would omit the terminal and drop the last step's iteration_rate.
-    let stimulus = result.stimulus_timeline();
-    let phases = ktstr::assert::build_phase_buckets_with_stimulus(&series, &stimulus);
+    // The framework-canonical per-phase buckets via the phase-buckets accessor:
+    // one shared captures_series() drain folded through
+    // build_phase_buckets_with_stimulus over the COMPLETE timeline
+    // (step frames + scenario-end terminal). Identical to the manual
+    // drain+build oracle in `assert_phase_pipeline`, but it does NOT
+    // drain the bridge out from under the framework's own stats.phases
+    // build (the drain-once starvation fixed).
+    let phases = result.phase_buckets();
 
     let step0 = phases.iter().find(|p| p.step_index == 1);
     let step1 = phases.iter().find(|p| p.step_index == 2);
@@ -770,16 +771,23 @@ fn phase_pipeline_per_step_cpuset_differs(ctx: &Ctx) -> Result<AssertResult> {
 /// race window to sub-ms hit-swap→load latency on the coord
 /// thread, well under the wall-clock duration of a typical Step.
 fn assert_watch_snapshot_trip_phase_stamped(result: &VmResult) -> Result<()> {
-    let drained = result.snapshot_bridge.drain_ordered_with_stats();
-    let watch_caps: Vec<_> = drained.iter().filter(|e| e.tag == "jiffies_64").collect();
+    // Inspect the captures through the shared cache rather than a raw
+    // bridge drain, so this post_vm does not starve the framework's
+    // own stats.phases build. iter_samples() preserves each capture's
+    // tag + stamped step_index — all this watchpoint test needs.
+    let series = result.captures_series();
+    let watch_caps: Vec<_> = series
+        .iter_samples()
+        .filter(|s| s.tag == "jiffies_64")
+        .collect();
     anyhow::ensure!(
         !watch_caps.is_empty(),
         "watchpoint on 'jiffies_64' did not fire — `kernel/time/timekeeping.c` \
          writes jiffies_64 every tick so a fire within Step[0]'s window is \
          expected. Without a fire, the trip-stamping wire-up is uncovered. \
-         Drained {} entries; tags = {:?}",
-        drained.len(),
-        drained.iter().map(|e| e.tag.as_str()).collect::<Vec<_>>(),
+         Captured {} entries; tags = {:?}",
+        series.len(),
+        series.iter_samples().map(|s| s.tag).collect::<Vec<_>>(),
     );
     for cap in &watch_caps {
         anyhow::ensure!(

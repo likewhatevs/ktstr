@@ -153,7 +153,7 @@ pub struct Sample<'a> {
 /// captures) coexist in the drain output and are tolerated by the
 /// projection helpers — the typical pattern is to pre-filter to
 /// periodic tags via [`Self::periodic_only`] before asserting.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SampleSeries {
     rows: Vec<SampleRow>,
     /// Host-side monitor report for the VM run that produced this
@@ -171,7 +171,7 @@ pub struct SampleSeries {
 /// but carries the timestamp explicitly (defaulted to `0` when
 /// the bridge omitted it) so iteration does not have to handle
 /// the `Option<u64>` repeatedly.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct SampleRow {
     tag: String,
     report: FailureDumpReport,

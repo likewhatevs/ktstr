@@ -1551,17 +1551,21 @@ fn evaluate_vm_result(
     // Build phase buckets early so the failure-message timeline
     // renderer can drive from the unified PhaseBucket source
     // (Timeline::from_phase_buckets) rather than re-deriving phases
-    // from raw monitor samples (Timeline::build). The drain
-    // consumes the snapshot bridge; success-path consumers below
-    // read pre-built buckets + the cached SampleSeries instead of
-    // re-draining (the bridge is already empty after this point).
-    let drained_for_phases = result.snapshot_bridge.drain_ordered_with_stats();
-    let early_sample_series = crate::scenario::sample::SampleSeries::from_drained_typed(
-        drained_for_phases,
-        result.monitor.clone(),
-    );
+    // from raw monitor samples (Timeline::build). `captures_series()`
+    // performs the bridge's single destructive drain and memoizes it;
+    // a `post_vm` callback that already read the series via
+    // `result.phase_buckets()` / `result.periodic_series()` (post_vm
+    // runs BEFORE this) shares that same cached drain, so neither
+    // starves the other. Runs before any early return so `stats.phases`
+    // fills on the failure paths too. The buckets use this function's
+    // `stimulus_events` param (the production caller passes
+    // `result.stimulus_timeline()`, which is exactly what
+    // `result.phase_buckets()` uses — so `stats.phases` and
+    // `result.phase_buckets()` carry identical content; pinned by
+    // `phase_buckets_equals_stats_phases`).
+    let early_sample_series = result.captures_series();
     let mut early_phase_buckets =
-        crate::assert::build_phase_buckets_with_stimulus(&early_sample_series, stimulus_events);
+        crate::assert::build_phase_buckets_with_stimulus(early_sample_series, stimulus_events);
     // Build timeline from the pre-bucketed phases. When no
     // PhaseBuckets exist (scenario had no periodic captures,
     // e.g. single-phase tests) but monitor samples ARE present,
@@ -2021,22 +2025,20 @@ fn evaluate_vm_result(
         // metrics map paints as "no data" rather than masquerading
         // as real zeros.
         //
-        // The bridge drain here is the framework's contract drain;
-        // an integration test that bypasses evaluate_vm_result
-        // (e.g. tests/stats_bridge_e2e.rs) still owns its own
-        // direct `result.snapshot_bridge.drain*()` call path
-        // because those tests instrument the framework rather
-        // than depending on it. Within evaluate_vm_result the
-        // drain is the final consumer.
-        // Phase buckets were built at evaluate_vm_result entry
-        // (drain happened there) so the unified PhaseBucket source
+        // The bridge drain backing `captures_series()` is the
+        // framework's contract drain; an integration test that
+        // bypasses evaluate_vm_result (e.g. tests/stats_bridge_e2e.rs)
+        // still owns its own direct `result.snapshot_bridge.drain*()`
+        // call path because those tests instrument the framework
+        // rather than depending on it.
+        // Phase buckets were built at evaluate_vm_result entry from
+        // `result.captures_series()` so the unified PhaseBucket source
         // feeds both the failure-message Timeline render (via
         // Timeline::from_phase_buckets up top) and the stamped
-        // ScenarioStats.phases below. Reuse the pre-built vec +
-        // SampleSeries rather than re-draining (the bridge was
-        // already consumed).
+        // ScenarioStats.phases below. Reuse the pre-built vec + the
+        // cached SampleSeries rather than re-draining.
         check_result.stats.phases = std::mem::take(&mut early_phase_buckets);
-        let sample_series_for_phases = &early_sample_series;
+        let sample_series_for_phases = early_sample_series;
         // Cross-RUN aggregate fill: for any METRICS entry with a
         // read_sample wire but no typed GauntletRow field, compute
         // the per-RUN aggregate from the same samples and write into

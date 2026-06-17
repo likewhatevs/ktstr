@@ -12409,6 +12409,11 @@ impl KtstrVm {
             // Leaving it `None` here is correct; the eval-layer
             // stamping happens before any post_vm callback runs.
             entry_name: None,
+            // Empty cache: the single bridge drain is deferred to the
+            // first `captures_series()` call on the host (post_vm or
+            // evaluate_vm_result). See the `periodic_series_cache`
+            // field doc.
+            periodic_series_cache: std::sync::OnceLock::new(),
         })
     }
 
