@@ -99,8 +99,19 @@ use zerocopy::{FromBytes, IntoBytes};
 /// repurposed.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 pub enum MsgType {
-    /// Stimulus event from the guest step executor.
+    /// Stimulus event from the guest step executor — emitted at each
+    /// step's START (the StepStart frame).
     Stimulus,
+    /// Per-step END frame from the guest step executor, emitted at the
+    /// end of each step's hold while its workers are still alive.
+    /// Reuses the [`StimulusPayload`] body (same 24 bytes) carrying the
+    /// step's coincident end-of-hold (elapsed_ms, total_iterations) and
+    /// the SAME 1-indexed `step_index` as its StepStart. The host pairs
+    /// `StepStart[k]` -> `StepEnd[k]` for each step's OWN throughput
+    /// (step-local iteration_rate), which — unlike the cross-step
+    /// `StepStart[k]` -> `StepStart[k+1]` delta — does not read ~0 for
+    /// workers respawned per step.
+    StepEnd,
     /// Scenario start marker. Sets a fresh watchdog deadline.
     ScenarioStart,
     /// Scenario end marker (payload: two 8-byte LE u64s — elapsed_ms
@@ -221,6 +232,7 @@ impl MsgType {
     pub const fn wire_value(self) -> u32 {
         match self {
             MsgType::Stimulus => MSG_TYPE_STIMULUS,
+            MsgType::StepEnd => MSG_TYPE_STEP_END,
             MsgType::ScenarioStart => MSG_TYPE_SCENARIO_START,
             MsgType::ScenarioEnd => MSG_TYPE_SCENARIO_END,
             MsgType::ScenarioPause => MSG_TYPE_SCENARIO_PAUSE,
@@ -254,6 +266,7 @@ impl MsgType {
     pub const fn from_wire(value: u32) -> Option<Self> {
         match value {
             MSG_TYPE_STIMULUS => Some(MsgType::Stimulus),
+            MSG_TYPE_STEP_END => Some(MsgType::StepEnd),
             MSG_TYPE_SCENARIO_START => Some(MsgType::ScenarioStart),
             MSG_TYPE_SCENARIO_END => Some(MsgType::ScenarioEnd),
             MSG_TYPE_SCENARIO_PAUSE => Some(MsgType::ScenarioPause),
@@ -301,6 +314,11 @@ impl MsgType {
     ///     tag in the internal set keeps the dispatch and the
     ///     `collect_results` post-run drain in lockstep — both filter
     ///     the same way.
+    ///   - [`MsgType::KernelOpRequest`] — paired with its
+    ///     [`MsgType::KernelOpReply`] over port-1 RX (the cold-path
+    ///     kernel-op roundtrip); the request carries no test verdict.
+    ///   - [`MsgType::KernelOpReply`] — host→guest only on port-1 RX,
+    ///     same illegitimate-guest-TX reasoning as `SnapshotReply`.
     ///   - [`MsgType::SysRdy`] — its only semantic is the eventfd
     ///     promotion that releases the monitor's pre-sample
     ///     `epoll_wait`.
@@ -381,8 +399,12 @@ impl LifecyclePhase {
 // filter). [`MsgType::wire_value`] is the typed entry point; the
 // constants are the same values exposed for raw-byte comparisons.
 
-/// Stimulus event from the guest step executor.
+/// Stimulus event from the guest step executor (step START frame).
 pub const MSG_TYPE_STIMULUS: u32 = 0x5354_494D; // "STIM"
+
+/// Per-step END frame from the guest step executor (reuses the
+/// [`StimulusPayload`] body; see [`MsgType::StepEnd`]).
+pub const MSG_TYPE_STEP_END: u32 = 0x5354_454E; // "STEN"
 
 /// Scenario start marker.
 pub const MSG_TYPE_SCENARIO_START: u32 = 0x5343_5354; // "SCST"
@@ -774,9 +796,15 @@ pub struct StimulusEvent {
 }
 
 impl StimulusEvent {
-    /// Deserialize from raw payload bytes.
+    /// Deserialize from raw payload bytes. Requires EXACTLY a
+    /// [`StimulusPayload`]-sized (24-byte) buffer — a shorter buffer would
+    /// truncate and a longer one would carry trailing bytes the guest
+    /// never frames (`send_stimulus`/`send_step_end` always write exactly
+    /// 24 bytes), so both are rejected (matching [`KernAddrs::from_payload`]'s
+    /// exact-length gate). A torn or hostile oversized frame is dropped
+    /// rather than promoted by reading a 24-byte prefix.
     pub fn from_payload(data: &[u8]) -> Option<Self> {
-        if data.len() < std::mem::size_of::<StimulusPayload>() {
+        if data.len() != std::mem::size_of::<StimulusPayload>() {
             return None;
         }
         Some(StimulusEvent {
@@ -1424,8 +1452,11 @@ mod tests {
     fn msg_type_constants_are_unique() {
         let ids = [
             MSG_TYPE_STIMULUS,
+            MSG_TYPE_STEP_END,
             MSG_TYPE_SCENARIO_START,
             MSG_TYPE_SCENARIO_END,
+            MSG_TYPE_SCENARIO_PAUSE,
+            MSG_TYPE_SCENARIO_RESUME,
             MSG_TYPE_EXIT,
             MSG_TYPE_TEST_RESULT,
             MSG_TYPE_SCHED_EXIT,
@@ -1433,6 +1464,7 @@ mod tests {
             MSG_TYPE_PAYLOAD_METRICS,
             MSG_TYPE_RAW_PAYLOAD_OUTPUT,
             MSG_TYPE_PROFRAW,
+            MSG_TYPE_WPROF_TRACE,
             MSG_TYPE_SNAPSHOT_REQUEST,
             MSG_TYPE_SNAPSHOT_REPLY,
             MSG_TYPE_KERNEL_OP_REQUEST,
@@ -1493,8 +1525,11 @@ mod tests {
     fn msg_type_round_trips() {
         let all = [
             MsgType::Stimulus,
+            MsgType::StepEnd,
             MsgType::ScenarioStart,
             MsgType::ScenarioEnd,
+            MsgType::ScenarioPause,
+            MsgType::ScenarioResume,
             MsgType::Exit,
             MsgType::TestResult,
             MsgType::SchedExit,
@@ -1537,7 +1572,10 @@ mod tests {
     #[test]
     fn msg_type_wire_value_matches_constants() {
         assert_eq!(MsgType::Stimulus.wire_value(), MSG_TYPE_STIMULUS);
+        assert_eq!(MsgType::StepEnd.wire_value(), MSG_TYPE_STEP_END);
         assert_eq!(MsgType::ScenarioStart.wire_value(), MSG_TYPE_SCENARIO_START);
+        assert_eq!(MsgType::ScenarioPause.wire_value(), MSG_TYPE_SCENARIO_PAUSE);
+        assert_eq!(MsgType::ScenarioResume.wire_value(), MSG_TYPE_SCENARIO_RESUME);
         assert_eq!(MsgType::ScenarioEnd.wire_value(), MSG_TYPE_SCENARIO_END);
         assert_eq!(MsgType::Exit.wire_value(), MSG_TYPE_EXIT);
         assert_eq!(MsgType::TestResult.wire_value(), MSG_TYPE_TEST_RESULT);
@@ -1558,6 +1596,11 @@ mod tests {
             MSG_TYPE_SNAPSHOT_REQUEST
         );
         assert_eq!(MsgType::SnapshotReply.wire_value(), MSG_TYPE_SNAPSHOT_REPLY);
+        assert_eq!(
+            MsgType::KernelOpRequest.wire_value(),
+            MSG_TYPE_KERNEL_OP_REQUEST
+        );
+        assert_eq!(MsgType::KernelOpReply.wire_value(), MSG_TYPE_KERNEL_OP_REPLY);
         assert_eq!(MsgType::SysRdy.wire_value(), MSG_TYPE_SYS_RDY);
         assert_eq!(MsgType::Stdout.wire_value(), MSG_TYPE_STDOUT);
         assert_eq!(MsgType::Stderr.wire_value(), MSG_TYPE_STDERR);
@@ -1592,8 +1635,11 @@ mod tests {
         ];
         let verdict = [
             MsgType::Stimulus,
+            MsgType::StepEnd,
             MsgType::ScenarioStart,
             MsgType::ScenarioEnd,
+            MsgType::ScenarioPause,
+            MsgType::ScenarioResume,
             MsgType::Exit,
             MsgType::TestResult,
             MsgType::SchedExit,
@@ -1953,6 +1999,19 @@ mod tests {
         assert!(KernAddrs::from_payload(&[]).is_none());
         assert!(KernAddrs::from_payload(&[0u8; KernAddrs::WIRE_LEN - 1]).is_none());
         assert!(KernAddrs::from_payload(&[0u8; KernAddrs::WIRE_LEN + 1]).is_none());
+    }
+
+    #[test]
+    fn stimulus_from_payload_requires_exact_24_bytes() {
+        // Exact-length match (24 bytes): an undersized buffer would
+        // truncate and an oversized one carries bytes the guest never
+        // frames (send_stimulus/send_step_end write exactly 24), so a
+        // torn / hostile frame is dropped, not promoted by a prefix read.
+        let n = std::mem::size_of::<StimulusPayload>();
+        assert_eq!(n, 24);
+        assert!(StimulusEvent::from_payload(&[0u8; 23]).is_none());
+        assert!(StimulusEvent::from_payload(&[0u8; 25]).is_none());
+        assert!(StimulusEvent::from_payload(&[0u8; 24]).is_some());
     }
 
     #[test]

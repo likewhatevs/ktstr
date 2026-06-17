@@ -1557,6 +1557,22 @@ fn run_step<'a>(
             .flat_map(|(_, h)| h.snapshot_iterations())
             .sum();
         *final_total_iterations = Some((end_elapsed_ms, end_iterations));
+
+        // Emit a per-step StepEnd frame carrying this step's coincident
+        // end-of-hold (elapsed_ms, total_iterations) and the SAME
+        // 1-indexed step_index as its StepStart, so the host pairs
+        // StepStart[k] -> StepEnd[k] for step-LOCAL throughput: each
+        // step's OWN workers measured start-to-end, which —
+        // unlike the cross-step StepStart[k] -> StepStart[k+1] delta —
+        // does not read ~0 for workers respawned per step. build_stimulus
+        // supplies the op/cgroup/worker fields + the 1-indexed
+        // step_index; override its recomputed elapsed/iterations with the
+        // values captured above so the StepEnd pair stays coincident with
+        // `final_total_iterations` (no pause/teardown wall-time creep).
+        let mut step_end = build_stimulus(&scenario_start, step_idx, &step.ops, &scenario);
+        step_end.elapsed_ms = u32::try_from(end_elapsed_ms).unwrap_or(u32::MAX);
+        step_end.total_iterations = end_iterations;
+        guest_comms::send_step_end(zerocopy::IntoBytes::as_bytes(&step_end));
     }
 
     Ok(())

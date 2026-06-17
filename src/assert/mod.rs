@@ -2170,24 +2170,35 @@ pub fn populate_run_ext_metrics(
 /// throughput annotation without going through the legacy
 /// `crate::timeline::Timeline::build` path.
 ///
-/// For each adjacent pair of stimulus events with
+/// For each `StepStart[k]` -> `StepEnd[k]` pair with
 /// `total_iterations: Some(_)`, the per-phase rate is
 /// `(later - earlier) / duration_s` where `duration_s` is the
 /// elapsed-ms delta BETWEEN THE TWO STIMULUS EVENTS (guest clock),
 /// not the PhaseBucket sample window. The rate is attributed to the
-/// step the EARLIER event starts (`prev.step_index`). Phases that
-/// don't overlap a stimulus pair keep their PhaseBucket.metrics map
-/// unchanged (no iteration_rate key).
+/// step the EARLIER event starts (`prev.step_index`); the attribution
+/// loop skips any `is_step_end` (or `is_terminal`) `prev`, so only a
+/// StepStart is ever the earlier member. Phases that don't overlap a
+/// stimulus pair keep their PhaseBucket.metrics map unchanged (no
+/// iteration_rate key).
 ///
 /// SEMANTICS: `total_iterations` is the sum of the worker handles
 /// alive at each event (see
-/// [`crate::timeline::StimulusEvent::total_iterations`]). The
-/// cross-step delta therefore measures the throughput of the
-/// PERSISTENT (Backdrop) population — workers alive across both
-/// endpoints. Step-local workers replaced between steps are not
-/// measured cross-step; the trailing `is_terminal` event supplies the
-/// LAST step's right boundary (consumed only as the later member of a
-/// pair, never the earlier).
+/// [`crate::timeline::StimulusEvent::total_iterations`]). Each step's
+/// rate is its STEP-LOCAL `StepStart[k]` -> `StepEnd[k]` delta — the
+/// step's own workers measured over its own hold — so a bucket is
+/// sourced ONLY by its own pair (the `is_step_end` guard drops the
+/// inter-step `StepEnd[k]` -> `StepStart[k+1]` pair entirely). This
+/// measures BOTH fresh-per-step workers (which read ~0 at each
+/// StepStart, so the old cross-step delta produced no rate) and
+/// persistent (Backdrop) workers (excluding the inter-step teardown
+/// wall-time a cross-step window would span). On a clean run the
+/// `(StepEnd[N], terminal)` pair is guard-skipped and the trailing
+/// `is_terminal` event is not consumed; it supplies a step's right
+/// boundary ONLY for legacy/synthetic data carrying a `ScenarioEnd`
+/// frame but no `StepEnd` frames. A sched-died step has neither frame
+/// (its early return skips both emissions), so the dead step's
+/// `StepStart` is never a `prev` with a successor and it reports no
+/// rate.
 ///
 /// Per the unweighted-mean cross-RUN policy
 /// of `crate::stats::aggregate_samples` for `Gauge(Avg)` —
@@ -2233,14 +2244,25 @@ pub fn build_phase_buckets_with_stimulus(
     for w in sorted_events.windows(2) {
         let prev = w[0];
         let curr = w[1];
-        // The terminal scenario-end event is a right boundary only —
-        // never the EARLIER member of a pair (a step the rate is
-        // attributed to). It sorts last (max elapsed_ms) so it is
-        // naturally only ever `curr`, but guard explicitly so a future
-        // caller producing a non-last or duplicate terminal can't have
-        // it fall into the `None` step_index timestamp-window branch
-        // below and attach a bogus rate.
-        if prev.is_terminal {
+        // The terminal scenario-end event and per-step StepEnd events are
+        // right boundaries only — never the EARLIER member of a pair (the
+        // step a rate is attributed to). Both carry an end-of-hold count,
+        // not a step-start, so pairing them as `prev` would attribute the
+        // WRONG window to a bucket:
+        // - terminal sorts last so it is naturally only ever `curr`, but
+        //   guard explicitly so a future caller producing a non-last or
+        //   duplicate terminal can't fall into the `None` step_index
+        //   timestamp-window branch below and attach a bogus rate.
+        // - StepEnd[k] carries step_index k (same as StepStart[k]); if its
+        //   step's own StepStart[k] -> StepEnd[k] pair returned None (a
+        //   stalled step, e <= s — see StimulusEvent::rate_to), the bucket
+        //   k key is still empty, so without this guard the next pair
+        //   StepEnd[k] -> StepStart[k+1] would or_insert an inter-step
+        //   teardown-gap rate into bucket k, mislabeling gap throughput as
+        //   step k's. A stalled step must report no rate, not a leaked gap
+        //   rate. With the guard, bucket k is sourced ONLY by its
+        //   StepStart[k] -> StepEnd[k] pair.
+        if prev.is_terminal || prev.is_step_end {
             continue;
         }
         // Shared formula with Timeline::build via StimulusEvent::rate_to
@@ -2250,9 +2272,10 @@ pub fn build_phase_buckets_with_stimulus(
         let Some(rate) = prev.rate_to(curr) else {
             continue;
         };
-        // Attribute the rate to the step PREV starts: the pair
-        // (prev, curr) measures iterations accumulated from prev's
-        // step-start to curr's — the throughput DURING prev's step.
+        // Attribute the rate to the step PREV starts: the guards above
+        // leave `prev` as a StepStart (or a legacy/synthetic step event),
+        // so the pair (prev, curr) measures iterations accumulated from
+        // prev's step-start to curr's — the throughput DURING prev's step.
         // Match by prev.step_index, NOT a timestamp window: the bucket
         // windows here are workload-relative capture offsets (the step
         // INTERIOR, 10-90% of the workload per

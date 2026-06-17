@@ -394,6 +394,16 @@ pub fn send_stimulus(payload: &[u8]) {
     write_msg(MsgType::Stimulus.wire_value(), payload);
 }
 
+/// Send a per-step END frame from the guest step executor. Reuses the
+/// same byte-serialised [`crate::vmm::wire::StimulusPayload`] body as
+/// [`send_stimulus`] (24 bytes) but frames with [`MsgType::StepEnd`] so
+/// the host can pair `StepStart[k]` -> `StepEnd[k]` for step-local
+/// throughput. Emitted at each step's end-of-hold while its workers are
+/// still alive.
+pub fn send_step_end(payload: &[u8]) {
+    write_msg(MsgType::StepEnd.wire_value(), payload);
+}
+
 /// Send raw stdout/stderr from an LlmExtract payload. Payload:
 /// postcard-encoded [`crate::test_support::RawPayloadOutput`].
 ///

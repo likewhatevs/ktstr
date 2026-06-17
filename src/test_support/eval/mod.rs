@@ -1218,19 +1218,24 @@ fn run_ktstr_test_inner_impl(
                         }
                     }
                 }
-                // Stimulus + ScenarioEnd are consumed by
+                // Stimulus + StepEnd + ScenarioEnd are consumed by
                 // `result.stimulus_timeline()` above (the per-phase
-                // timeline), so they are no-ops in this loop. The
-                // remaining verdict-bearing variants (TestResult, Exit,
-                // SchedExit, ScenarioStart, Stdout, Stderr, SchedLog,
-                // Lifecycle, ExecExit, Dmesg, ProbeOutput,
+                // timeline: StepEnd is decoded via
+                // `StimulusEvent::from_step_end` alongside Stimulus's
+                // `from_wire` and ScenarioEnd's terminal), so they are
+                // no-ops in this loop. The remaining verdict-bearing
+                // variants in this arm (TestResult, Exit, SchedExit,
+                // ScenarioStart, ScenarioPause, ScenarioResume, Stdout,
+                // SchedLog, Lifecycle, ExecExit, Dmesg, ProbeOutput,
                 // SnapshotReply, Crash) are consumed by other walkers
                 // further down the pipeline (parse_assert_result_from_drain,
                 // bulk_exit lookup in collect_results, lifecycle
                 // classifier, sched_log concatenator, etc.). No
-                // per-entry side effect here.
+                // per-entry side effect here. (Stderr is NOT in this arm —
+                // it has its own arm below that streams to host stderr.)
                 Some(
                     crate::vmm::wire::MsgType::Stimulus
+                    | crate::vmm::wire::MsgType::StepEnd
                     | crate::vmm::wire::MsgType::ScenarioEnd
                     | crate::vmm::wire::MsgType::TestResult
                     | crate::vmm::wire::MsgType::Exit

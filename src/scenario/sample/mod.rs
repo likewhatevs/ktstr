@@ -437,11 +437,15 @@ impl SampleSeries {
         stimulus_events: &[crate::timeline::StimulusEvent],
     ) -> std::collections::BTreeMap<u16, Vec<Sample<'_>>> {
         // Step-start timeline in scenario-relative (guest monotonic) ms
-        // — the same frame as `boundary_offset_ms`. Only events with a
-        // step stamp anchor a step window; the terminal scenario-end
-        // event (step_index None) is excluded.
+        // — the same frame as `boundary_offset_ms`. Only step-START
+        // events anchor a step window: the terminal scenario-end event
+        // (step_index None) is excluded, and per-step StepEnd events
+        // (is_step_end, which carry their step's step_index) are excluded
+        // so a step's window is anchored by its start, not its
+        // end-of-hold marker.
         let mut step_starts: Vec<(u64, u16)> = stimulus_events
             .iter()
+            .filter(|e| !e.is_step_end)
             .filter_map(|e| e.step_index.map(|k| (e.elapsed_ms, k)))
             .collect();
         step_starts.sort_by_key(|(ms, _)| *ms);

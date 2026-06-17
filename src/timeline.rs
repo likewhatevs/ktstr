@@ -62,16 +62,28 @@ pub struct StimulusEvent {
     ///
     /// SEMANTICS: this is the sum of the iteration counters of the
     /// worker handles ALIVE at the event instant (step-local +
-    /// Backdrop). Step-local workers are torn down at each step
-    /// boundary and respawn fresh (~0), so the cross-step delta
-    /// `next.total_iterations - this.total_iterations` measures the
-    /// throughput of the PERSISTENT (Backdrop) population — the
-    /// population alive across both endpoints. To compare throughput
-    /// across scenario phases, put the workload on the Backdrop so it
-    /// persists; step-local workers replaced between steps are not
-    /// measured cross-step. (Per-step throughput of step-local workers
-    /// is a separate model — a follow-up; the scenario-end terminal
-    /// event does capture the last step's end-of-hold live sum.)
+    /// Backdrop). Each step emits BOTH a StepStart event (counter at the
+    /// step's start) and a StepEnd event ([`Self::is_step_end`], counter
+    /// at the step's end-of-hold), so the per-phase iteration_rate is the
+    /// STEP-LOCAL delta `StepEnd[k] - StepStart[k]` — each step's OWN
+    /// workers measured start-to-end. That works for workers respawned
+    /// per step (the cross-step `StepStart[k+1] - StepStart[k]` delta
+    /// reads fresh~0 - fresh~0 and is dropped) AND is more accurate for
+    /// persistent (Backdrop) workers (it excludes the inter-step
+    /// teardown/respawn wall-time the cross-step window spanned). Bucket
+    /// `k` is sourced ONLY by its `StepStart[k] -> StepEnd[k]` pair: the
+    /// `iteration_rate` attribution loop in
+    /// [`crate::assert::build_phase_buckets_with_stimulus`] skips any
+    /// `is_step_end` `prev`, so a stalled step whose step-local delta is
+    /// zero (`StepEnd[k] == StepStart[k]`, the rate_to `e <= s` blind
+    /// spot) reports NO rate rather than leaking the inter-step gap rate
+    /// from the `StepEnd[k] -> StepStart[k+1]` pair. The monitor-only
+    /// [`Timeline::build`] fallback (no snapshot captures) computes the
+    /// SAME step-local `StepStart[k] -> StepEnd[k]` rate — the StepEnd
+    /// events reach it too (they are emitted independent of captures) — and
+    /// falls back to cross-step (or the terminal for the last step) only
+    /// when a step has no StepEnd (sched-died / legacy data); StepEnd is
+    /// filtered only from that path's phase LAYOUT, not its rate.
     pub total_iterations: Option<u64>,
     /// 1-indexed scenario step this event belongs to (the same
     /// encoding the bridge stamps: `1..=N` for Step ordinals), or
@@ -84,14 +96,39 @@ pub struct StimulusEvent {
     pub step_index: Option<u16>,
     /// True only for the synthetic scenario-end boundary the eval
     /// walker appends from the `ScenarioEnd` wire frame's final
-    /// `total_iterations`. It exists purely as the right boundary the
-    /// LAST step's `iteration_rate` delta needs — the last real step
-    /// otherwise has no successor event to diff against. It is NOT a
-    /// step start: `step_index` is `None` so it seeds no
-    /// [`crate::assert::PhaseBucket`] (excluded from the step-start timeline), and
-    /// [`Timeline::build`] skips it when laying out phase boundaries so
-    /// it never renders a phantom trailing phase.
+    /// `total_iterations`. On a CLEAN run the last step emits its own
+    /// `StepEnd[N]`, which supplies that step's `iteration_rate` right
+    /// boundary in BOTH rate consumers — the snapshot path
+    /// ([`crate::assert::build_phase_buckets_with_stimulus`], the
+    /// `StepStart[N]` -> `StepEnd[N]` pair) and the monitor-only
+    /// [`Timeline::build`] fallback (which looks up each step's `StepEnd`
+    /// by `step_index`) — and the terminal is then NOT consumed for a
+    /// rate: the snapshot path's attribution loop skips the
+    /// `(StepEnd[N], terminal)` pair via its `is_step_end` guard (before
+    /// `rate_to` is reached), and `Timeline::build` reaches for the
+    /// terminal only when a step's `StepEnd` lookup misses. The terminal
+    /// is consumed as a step's rate boundary ONLY for legacy/synthetic
+    /// data that carries a `ScenarioEnd` frame but no `StepEnd` frames
+    /// (fresh guest output always pairs them). A sched-died step is NOT
+    /// such a case: its early return skips BOTH the `StepEnd` emission AND
+    /// `send_scenario_end`, so neither frame exists and the dead step
+    /// reports no rate via the no-successor path. It is NOT a step start:
+    /// `step_index` is `None` so it seeds no [`crate::assert::PhaseBucket`]
+    /// (excluded from the step-start timeline), and [`Timeline::build`]
+    /// skips it when laying out phase boundaries so it never renders a
+    /// phantom trailing phase.
     pub is_terminal: bool,
+    /// True for a per-step END event (decoded from a
+    /// `crate::vmm::wire::MsgType::StepEnd` frame via
+    /// [`Self::from_step_end`]). It carries the SAME 1-indexed
+    /// `step_index` as its StepStart and its step's end-of-hold
+    /// `total_iterations`, so [`crate::assert::build_phase_buckets_with_stimulus`]'s
+    /// elapsed-sorted `windows(2)` pairs `StepStart[k]` -> `StepEnd[k]`
+    /// first and `or_insert` keeps that step-local rate. NOT a step
+    /// start, so [`Timeline::build`] (the monitor-only fallback's
+    /// index-based cross-step pairing) filters it out of its step-start
+    /// list to avoid a phantom phase.
+    pub is_step_end: bool,
 }
 
 impl StimulusEvent {
@@ -130,20 +167,52 @@ impl StimulusEvent {
             total_iterations: Some(ev.total_iterations),
             step_index: Some(ev.step_index),
             is_terminal: false,
+            is_step_end: false,
+        }
+    }
+
+    /// Build a per-step END event from a `crate::vmm::wire::MsgType::StepEnd`
+    /// frame (reuses the `crate::vmm::wire::StimulusEvent` wire body).
+    /// Carries the SAME 1-indexed `step_index` as the step's StepStart
+    /// and the step's end-of-hold `total_iterations`, with `is_step_end`
+    /// set. Elapsed-sorted, a step's events order `StepStart[k]` (start) <
+    /// `StepEnd[k]` (end-of-hold) < `StepStart[k+1]`, so
+    /// [`crate::assert::build_phase_buckets_with_stimulus`]'s `windows(2)`
+    /// pairs `StepStart[k]` -> `StepEnd[k]` first and `or_insert` keeps that
+    /// step-local rate. `is_terminal` is false (it is a real per-step
+    /// boundary, not the scenario-end terminal).
+    pub fn from_step_end(ev: &crate::vmm::wire::StimulusEvent) -> Self {
+        Self {
+            elapsed_ms: ev.elapsed_ms as u64,
+            label: format!("StepEnd[{}]", ev.step_index.saturating_sub(1)),
+            op_kind: Some(format!("ops={}", ev.op_count)),
+            detail: Some(format!(
+                "{} cgroups, {} workers",
+                ev.cgroup_count, ev.worker_count,
+            )),
+            total_iterations: Some(ev.total_iterations),
+            step_index: Some(ev.step_index),
+            is_terminal: false,
+            is_step_end: true,
         }
     }
 
     /// Build the synthetic terminal boundary event from the
     /// `ScenarioEnd` wire frame's final cumulative `total_iterations`
     /// and scenario-relative `elapsed_ms`. Appended once, after every
-    /// per-step [`Self::from_wire`] event, so the LAST real step has a
-    /// successor to diff its `iteration_rate` against. `step_index` is
-    /// `None` (it is not a step start — it seeds no [`crate::assert::PhaseBucket`])
-    /// and `is_terminal` is set so [`Timeline::build`] treats it as a
-    /// right boundary only, never a phase. `elapsed_ms` is in the same
-    /// guest-monotonic frame as the step events (both come from
-    /// `scenario_start.elapsed()`), so the last-step duration is
-    /// well-formed.
+    /// per-step [`Self::from_wire`] event. On a clean run `StepEnd[N]`
+    /// supplies the last step's `iteration_rate` right boundary in both
+    /// rate consumers and the terminal is not consumed for a rate; it is
+    /// consumed as a step's boundary ONLY for legacy/synthetic data with a
+    /// `ScenarioEnd` frame but no `StepEnd` frames (a sched-died step has
+    /// neither, since the early return skips both emissions) — see the
+    /// [`Self::is_terminal`] field doc.
+    /// `step_index` is `None` (it is not a step start — it seeds no
+    /// [`crate::assert::PhaseBucket`]) and `is_terminal` is set so
+    /// [`Timeline::build`] treats it as a right boundary only, never a
+    /// phase. `elapsed_ms` is in the same guest-monotonic frame as the
+    /// step events (both come from `scenario_start.elapsed()`), so the
+    /// last-step duration is well-formed.
     pub fn terminal(elapsed_ms: u64, total_iterations: u64) -> Self {
         Self {
             elapsed_ms,
@@ -153,6 +222,7 @@ impl StimulusEvent {
             total_iterations: Some(total_iterations),
             step_index: None,
             is_terminal: true,
+            is_step_end: false,
         }
     }
 
@@ -163,6 +233,25 @@ impl StimulusEvent {
     /// advance (`next <= self` — e.g. a step-local worker population
     /// reset, or the first step's ~0 starting sample), or the window is
     /// zero-length.
+    ///
+    /// BLIND SPOT (deliberate): a step whose workers made EXACTLY zero
+    /// forward progress over a positive hold (`next == self`) also
+    /// returns `None`, not `Some(0.0)` — it is folded into the
+    /// non-advancing case because the `next < self` (counter-decrease /
+    /// population-reset) case it shares the `<=` guard with is genuinely
+    /// unmeasurable, and the pre-existing
+    /// `terminal_event_stalled_last_step_no_spurious_rate` test pins
+    /// "stalled != measured zero". Consequence: a step that collapsed to
+    /// literally zero throughput emits NO `iteration_rate` key and is
+    /// therefore invisible to the throughput-degradation detector
+    /// ([`Timeline::build`] / [`Timeline::from_phase_buckets`], which both
+    /// gate on `before.iteration_rate.is_some()` AND `before > 0.0`). A
+    /// near-zero (>= 1 iteration) collapse still
+    /// produces a positive rate and IS flagged. Distinguishing
+    /// measured-zero from not-measured for degradation detection requires
+    /// reworking BOTH this guard and the detector's `before > 0.0`
+    /// div-by-zero gate (a measurement-semantics change beyond the
+    /// step-local model); tracked as a follow-up.
     ///
     /// This is the SINGLE iteration_rate formula shared by
     /// [`crate::assert::build_phase_buckets_with_stimulus`] (per-step
@@ -352,7 +441,21 @@ impl Timeline {
         // of `events` and misalign the dense phase index against the
         // step events. `step_events` is the phase-bearing set.
         let terminal: Option<&StimulusEvent> = events.iter().find(|e| e.is_terminal);
-        let step_events: Vec<&StimulusEvent> = events.iter().filter(|e| !e.is_terminal).collect();
+        // StepStart events only — the PHASE-LAYOUT set. Per-step StepEnd
+        // events are excluded here because a StepEnd seeds no new phase
+        // (it is an end-of-hold marker, not a step boundary); including
+        // them would produce a phantom extra phase and misalign the dense
+        // phase index. StepEnd events are NOT discarded, though: the
+        // step-local iteration_rate loop below pairs each StepStart[k]
+        // with its own StepEnd[k] (looked up by step_index in the full
+        // `events` vec), matching build_phase_buckets_with_stimulus. The
+        // dense-index cross-step pairing is kept only as a fallback for
+        // steps that have no StepEnd (a sched-died step, or legacy data
+        // predating the StepEnd frame).
+        let step_events: Vec<&StimulusEvent> = events
+            .iter()
+            .filter(|e| !e.is_terminal && !e.is_step_end)
+            .collect();
 
         let mut boundaries: Vec<(u64, u64, Option<StimulusEvent>)> = Vec::new();
         for i in 0..step_events.len() {
@@ -395,23 +498,42 @@ impl Timeline {
             });
         }
 
-        // Per-phase iteration rate. Each step's rate uses ITS OWN
-        // window: from `step_events[i]` to the next step event, or to
-        // the terminal scenario-end event for the LAST step (issue #2).
-        // Duration is the guest-clock elapsed-ms delta between those two
-        // events — matching `build_phase_buckets_with_stimulus` and
-        // independent of the metric-sample window above (whose last
-        // phase reaches end-of-monitor-data). Measures the PERSISTENT
-        // (Backdrop) population's throughput (see
-        // `StimulusEvent::total_iterations`).
+        // Per-phase iteration rate, STEP-LOCAL: each step's rate is its
+        // own `StepStart[k] -> StepEnd[k]` delta — the step's OWN workers
+        // measured start-to-end-of-hold, matching the snapshot path
+        // (`build_phase_buckets_with_stimulus`). StepEnd events are
+        // present in `events` (emitted independent of snapshot captures)
+        // even on this monitor-only path, so the same step-local model
+        // applies; without it, workers respawned fresh each step read
+        // ~0 -> ~0 cross-step and every fresh-per-step phase but the last
+        // silently reported no throughput. A step with NO StepEnd falls
+        // back to the cross-step successor, or the terminal scenario-end
+        // event for the last step — but that fallback yields a rate only
+        // for legacy/synthetic data (a ScenarioEnd frame present without
+        // per-step StepEnd frames). A sched-died step has neither a
+        // StepEnd nor a terminal (the early return skips both emissions),
+        // so its lookup and fallback both miss and it correctly reports no
+        // rate. Duration is the guest-clock elapsed-ms delta between the
+        // paired events — independent of the metric-sample window above
+        // (whose last phase reaches end-of-monitor-data).
         #[allow(clippy::needless_range_loop)]
         for i in 0..phases.len() {
             let this = step_events[i];
-            let next: Option<&StimulusEvent> = if i + 1 < step_events.len() {
-                Some(step_events[i + 1])
-            } else {
-                terminal
-            };
+            // Step-local boundary: this step's own StepEnd (same
+            // step_index). Cross-step successor / terminal only when the
+            // step has no StepEnd.
+            let step_end: Option<&StimulusEvent> = this.step_index.and_then(|k| {
+                events
+                    .iter()
+                    .find(|e| e.is_step_end && e.step_index == Some(k))
+            });
+            let next: Option<&StimulusEvent> = step_end.or_else(|| {
+                if i + 1 < step_events.len() {
+                    Some(step_events[i + 1])
+                } else {
+                    terminal
+                }
+            });
             // Shared formula with build_phase_buckets_with_stimulus via
             // StimulusEvent::rate_to (the sole iteration_rate site).
             if let Some(next_ev) = next
@@ -667,8 +789,14 @@ impl Timeline {
         // step ops/detail to render and its elapsed_ms lands past
         // every bucket window, so it would never correlate — filtering
         // it keeps the correlation set to real step starts only.
-        let mut sorted_events: Vec<&StimulusEvent> =
-            stimulus_events.iter().filter(|e| !e.is_terminal).collect();
+        // Per-step StepEnd events are likewise excluded so each bucket's
+        // rendered op/detail label correlates to the step's defining
+        // StepStart, not its end-of-hold marker (the bucket's iteration_rate
+        // is already the step-local value computed upstream).
+        let mut sorted_events: Vec<&StimulusEvent> = stimulus_events
+            .iter()
+            .filter(|e| !e.is_terminal && !e.is_step_end)
+            .collect();
         sorted_events.sort_by_key(|e| e.elapsed_ms);
         let mut phases: Vec<Phase> = sorted
             .into_iter()
@@ -844,6 +972,7 @@ fn phase_from_bucket(
                 // ordinal to carry.
                 step_index: None,
                 is_terminal: false,
+                is_step_end: false,
             }),
         }
     };
@@ -1012,6 +1141,7 @@ mod tests {
             total_iterations: None,
             step_index: None,
             is_terminal: false,
+            is_step_end: false,
         }
     }
 
@@ -1141,6 +1271,7 @@ mod tests {
             total_iterations: None,
             step_index: None,
             is_terminal: false,
+            is_step_end: false,
         };
         let events = vec![stimulus(0, "ScenarioStart"), e];
         let samples: Vec<MonitorSample> = (5..25)
@@ -1754,6 +1885,7 @@ mod tests {
             total_iterations: Some(total_iterations),
             step_index: None,
             is_terminal: false,
+            is_step_end: false,
         }
     }
 
@@ -1820,6 +1952,24 @@ mod tests {
         assert_eq!(te.total_iterations, Some(0));
         assert_eq!(te.step_index, Some(1));
         assert!(!te.is_terminal);
+        assert!(!te.is_step_end, "a StepStart-derived event is not a StepEnd");
+    }
+
+    #[test]
+    fn from_step_end_carries_step_index_and_marks_step_end() {
+        // A StepEnd frame reuses the StimulusEvent wire body.
+        // from_step_end must carry the same 1-indexed step_index and the
+        // step's end-of-hold total_iterations, flag is_step_end, and leave
+        // is_terminal off (it is a real per-step boundary, not the
+        // scenario terminal).
+        let te = StimulusEvent::from_step_end(&wire_event(1_900, 1, 9_000));
+        assert_eq!(te.step_index, Some(1));
+        assert_eq!(te.total_iterations, Some(9_000));
+        assert!(te.is_step_end, "StepEnd-derived event must set is_step_end");
+        assert!(
+            !te.is_terminal,
+            "StepEnd is a per-step boundary, not the scenario terminal",
+        );
     }
 
     #[test]
@@ -1866,6 +2016,95 @@ mod tests {
         assert!(
             t.phases[1].metrics.iteration_rate.is_some(),
             "last step must get a rate from the terminal boundary",
+        );
+    }
+
+    #[test]
+    fn build_filters_step_end_events_no_phantom_phase() {
+        // A StepEnd must be filtered from the PHASE-LAYOUT set
+        // (it is an end-of-hold marker, not a step boundary) so it neither
+        // adds a phantom phase nor misaligns the dense phase index. Two
+        // StepStart events with an interleaved StepEnd still yield exactly
+        // two phases. (StepEnd is still consumed for the step-local RATE —
+        // see build_pairs_step_local_when_step_end_events_present.)
+        let events: Vec<StimulusEvent> = vec![
+            StimulusEvent::from_wire(&wire_event(0, 1, 0)),
+            StimulusEvent::from_step_end(&wire_event(1_900, 1, 9_000)),
+            StimulusEvent::from_wire(&wire_event(2_000, 2, 9_000)),
+        ];
+        let samples: Vec<MonitorSample> =
+            (5..35).map(|i| sample(i * 100, vec![(2, 1, i * 1000)])).collect();
+        let t = Timeline::build(&events, &samples);
+        assert_eq!(
+            t.phases.len(),
+            2,
+            "two StepStart events -> two phases; the interleaved StepEnd seeds none",
+        );
+    }
+
+    #[test]
+    fn build_pairs_step_local_when_step_end_events_present() {
+        // The monitor-only Timeline::build fallback must ALSO
+        // use step-local StepStart[k] -> StepEnd[k] pairing when StepEnd
+        // events are present (they are emitted independent of snapshot
+        // captures), NOT the cross-step StepStart[k] -> StepStart[k+1]
+        // pairing that reads 0 -> 0 for respawned-per-step workers. Two
+        // fresh-per-step steps (each StepStart reads ~0); without
+        // step-local pairing phase 0 would be None (0 -> 0 cross-step).
+        // With it, both phases get a positive rate.
+        let events: Vec<StimulusEvent> = vec![
+            StimulusEvent::from_wire(&wire_event(0, 1, 0)), // StepStart[0], iters 0
+            StimulusEvent::from_step_end(&wire_event(1_000, 1, 5_000)), // StepEnd[0], iters 5000
+            StimulusEvent::from_wire(&wire_event(1_100, 2, 0)), // StepStart[1] respawned, iters 0
+            StimulusEvent::from_step_end(&wire_event(2_100, 2, 3_000)), // StepEnd[1], iters 3000
+        ];
+        let samples: Vec<MonitorSample> =
+            (1..30).map(|i| sample(i * 100, vec![(2, 1, i * 1000)])).collect();
+        let t = Timeline::build(&events, &samples);
+        assert_eq!(
+            t.phases.len(),
+            2,
+            "two StepStart events -> two phases (each StepEnd seeds none)",
+        );
+        assert!(
+            t.phases[0].metrics.iteration_rate.is_some(),
+            "phase 0 must get a step-local rate from StepStart[0] -> StepEnd[0], \
+             not the cross-step 0 -> 0 None (the old cross-step fallback bug)",
+        );
+        assert!(
+            t.phases[1].metrics.iteration_rate.is_some(),
+            "phase 1 (respawned workers) must get its own step-local rate",
+        );
+    }
+
+    #[test]
+    fn build_stalled_step_with_step_end_reports_none_not_cross_step() {
+        // Issue #14 (monitor-only path): a step that HAS a StepEnd but
+        // stalled (StepEnd[k] == StepStart[k], rate_to None) must report
+        // None — its StepEnd lookup hits, so the cross-step fallback must
+        // NOT run. Mirrors the snapshot path's
+        // build_phase_buckets_with_stimulus_stalled_step_does_not_leak_cross_step_gap_rate.
+        // Step 0 stalls (0 -> 0); a persistent population reads 500 at
+        // StepStart[1], so a cross-step StepStart[0] -> StepStart[1] leak
+        // would be ~454/s. Step 1 advances 500 -> 5500 (5000/s).
+        let events: Vec<StimulusEvent> = vec![
+            StimulusEvent::from_wire(&wire_event(0, 1, 0)), // StepStart[0], iters 0
+            StimulusEvent::from_step_end(&wire_event(1_000, 1, 0)), // StepEnd[0], STALLED 0
+            StimulusEvent::from_wire(&wire_event(1_100, 2, 500)), // StepStart[1], persistent 500
+            StimulusEvent::from_step_end(&wire_event(2_100, 2, 5_500)), // StepEnd[1], iters 5500
+        ];
+        let samples: Vec<MonitorSample> =
+            (1..30).map(|i| sample(i * 100, vec![(2, 1, i * 1000)])).collect();
+        let t = Timeline::build(&events, &samples);
+        assert_eq!(t.phases.len(), 2);
+        assert!(
+            t.phases[0].metrics.iteration_rate.is_none(),
+            "a stalled step with a StepEnd must report None, not the \
+             cross-step StepStart[0] -> StepStart[1] persistent-leak rate",
+        );
+        assert!(
+            t.phases[1].metrics.iteration_rate.is_some(),
+            "step 1 still reports its own step-local rate",
         );
     }
 

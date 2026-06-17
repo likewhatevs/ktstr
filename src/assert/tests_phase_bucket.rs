@@ -1482,6 +1482,7 @@ fn build_phase_buckets_with_stimulus_populates_iteration_rate() {
             total_iterations: Some(0),
             step_index: None,
             is_terminal: false,
+            is_step_end: false,
         },
         StimulusEvent {
             elapsed_ms: 1100,
@@ -1491,6 +1492,7 @@ fn build_phase_buckets_with_stimulus_populates_iteration_rate() {
             total_iterations: Some(1000),
             step_index: None,
             is_terminal: false,
+            is_step_end: false,
         },
         StimulusEvent {
             elapsed_ms: 2100,
@@ -1500,6 +1502,7 @@ fn build_phase_buckets_with_stimulus_populates_iteration_rate() {
             total_iterations: Some(3000),
             step_index: None,
             is_terminal: false,
+            is_step_end: false,
         },
     ];
     let phases = crate::assert::build_phase_buckets_with_stimulus(&samples, &stimulus);
@@ -1557,6 +1560,7 @@ fn build_phase_buckets_with_stimulus_remaps_by_boundary_offset_over_stamped_step
         total_iterations: None,
         step_index: Some(k),
         is_terminal: false,
+        is_step_end: false,
     };
     let stimulus = vec![stim(1000, 1), stim(2000, 2), stim(3000, 3)];
     let phases = crate::assert::build_phase_buckets_with_stimulus(&samples, &stimulus);
@@ -1614,6 +1618,7 @@ fn by_stimulus_phase_separates_what_by_stamped_phase_collapses() {
         total_iterations: None,
         step_index: Some(k),
         is_terminal: false,
+        is_step_end: false,
     };
     let stimulus = vec![stim(1000, 1), stim(2000, 2), stim(3000, 3)];
 
@@ -1658,6 +1663,7 @@ fn build_phase_buckets_with_stimulus_none_offset_falls_back_to_stamped_step() {
         total_iterations: None,
         step_index: Some(5),
         is_terminal: false,
+        is_step_end: false,
     }];
     let phases = crate::assert::build_phase_buckets_with_stimulus(&samples, &stimulus);
     let idxs: Vec<u16> = phases.iter().map(|p| p.step_index).collect();
@@ -1708,6 +1714,7 @@ fn build_phase_buckets_with_stimulus_iteration_rate_attaches_by_step_not_interio
         total_iterations: Some(iters),
         step_index: Some(k),
         is_terminal: false,
+        is_step_end: false,
     };
     let stimulus = vec![stim(1000, 1, 0), stim(2000, 2, 1000), stim(3000, 3, 3000)];
     let phases = crate::assert::build_phase_buckets_with_stimulus(&samples, &stimulus);
@@ -1742,7 +1749,249 @@ fn build_phase_buckets_with_stimulus_iteration_rate_attaches_by_step_not_interio
     );
 }
 
-/// Issue #2: the LAST step has no successor step event, so its
+/// Each step's `iteration_rate` is the STEP-LOCAL
+/// `StepStart[k]` -> `StepEnd[k]` delta (its OWN workers, start-to-end of
+/// hold), NOT the cross-step `StepStart[k]` -> `StepStart[k+1]` delta.
+/// Workers respawned per step read ~0 at every StepStart, so the
+/// cross-step delta is `0 - 0` and yields no rate (the old cross-step bug:
+/// every fresh-per-step phase silently had no throughput). Pairing each
+/// step's own StepStart -> StepEnd recovers the real per-step rate. The
+/// elapsed-sorted `windows(2)` walk pairs `StepStart[k]` -> `StepEnd[k]`
+/// first (both carry step_index `k`); `or_insert` keeps that step-local
+/// rate, and the intervening `StepEnd[k]` -> `StepStart[k+1]` pair reads
+/// `0 <= end` so `rate_to` returns None and never overwrites.
+#[test]
+fn build_phase_buckets_with_stimulus_pairs_step_local_for_respawned_workers() {
+    use crate::scenario::snapshot::{DrainedSnapshotEntry, MissingStatsReason};
+    use crate::timeline::StimulusEvent;
+    let mk = |tag: &str, offset_ms: u64| DrainedSnapshotEntry {
+        tag: tag.to_string(),
+        report: fixture_report(),
+        stats: Err(MissingStatsReason::NoSchedulerBinary),
+        elapsed_ms: Some(9_000),
+        boundary_offset_ms: Some(offset_ms),
+        step_index: Some(9),
+    };
+    let drained = vec![
+        mk("periodic_000", 1_500), // step 1 interior (window [1000,2100))
+        mk("periodic_001", 2_500), // step 2 interior (window [2100,..))
+    ];
+    let samples = SampleSeries::from_drained_typed(drained, None);
+    let start = |elapsed_ms: u64, k: u16, iters: u64| StimulusEvent {
+        elapsed_ms,
+        label: format!("StepStart[{k}]"),
+        op_kind: None,
+        detail: None,
+        total_iterations: Some(iters),
+        step_index: Some(k),
+        is_terminal: false,
+        is_step_end: false,
+    };
+    let end = |elapsed_ms: u64, k: u16, iters: u64| StimulusEvent {
+        elapsed_ms,
+        label: format!("StepEnd[{k}]"),
+        op_kind: None,
+        detail: None,
+        total_iterations: Some(iters),
+        step_index: Some(k),
+        is_terminal: false,
+        is_step_end: true,
+    };
+    // Step 1: 0 -> 10000 over its 1s hold (10000/s). Step 2 workers are
+    // RESPAWNED, so StepStart[2] reads 0 again; step 2: 0 -> 5000 over 1s
+    // (5000/s). 1000ms windows keep the division exact (1.0s denominator).
+    let stimulus = vec![
+        start(1_000, 1, 0),
+        end(2_000, 1, 10_000),
+        start(2_100, 2, 0),
+        end(3_100, 2, 5_000),
+        StimulusEvent::terminal(3_200, 5_000),
+    ];
+    let phases = crate::assert::build_phase_buckets_with_stimulus(&samples, &stimulus);
+    let step1 = phases
+        .iter()
+        .find(|p| p.step_index == 1)
+        .expect("step 1 bucket present");
+    let step2 = phases
+        .iter()
+        .find(|p| p.step_index == 2)
+        .expect("step 2 bucket present");
+    assert_eq!(
+        step1.metrics.get("iteration_rate").copied(),
+        Some(10_000.0),
+        "step 1 must report its step-local StepStart->StepEnd rate, not the \
+         cross-step 0->0 delta (the old cross-step silent None); got {:?}",
+        step1.metrics.get("iteration_rate"),
+    );
+    assert_eq!(
+        step2.metrics.get("iteration_rate").copied(),
+        Some(5_000.0),
+        "step 2 (respawned workers) must report its step-local rate; got {:?}",
+        step2.metrics.get("iteration_rate"),
+    );
+}
+
+/// A PERSISTENT (Backdrop) population keeps iterating through
+/// the inter-step teardown, so `StepStart[k+1]` reads MORE than
+/// `StepEnd[k]` and the cross-step `StepEnd[k]` -> `StepStart[k+1]` pair
+/// WOULD yield a rate. But that pair has an `is_step_end` `prev`, so the
+/// attribution loop's guard skips it before `rate_to`/`or_insert` ever
+/// run — the cross-step rate is never even computed, and each step
+/// reports only its own step-local `StepStart[k]` -> `StepEnd[k]`
+/// throughput. (`or_insert` is a redundant secondary safety here, not
+/// the operative mechanism — the guard is.)
+#[test]
+fn build_phase_buckets_with_stimulus_step_local_wins_over_persistent_cross_step() {
+    use crate::scenario::snapshot::{DrainedSnapshotEntry, MissingStatsReason};
+    use crate::timeline::StimulusEvent;
+    let mk = |tag: &str, offset_ms: u64| DrainedSnapshotEntry {
+        tag: tag.to_string(),
+        report: fixture_report(),
+        stats: Err(MissingStatsReason::NoSchedulerBinary),
+        elapsed_ms: Some(9_000),
+        boundary_offset_ms: Some(offset_ms),
+        step_index: Some(9),
+    };
+    let drained = vec![mk("periodic_000", 1_500), mk("periodic_001", 2_500)];
+    let samples = SampleSeries::from_drained_typed(drained, None);
+    let start = |elapsed_ms: u64, k: u16, iters: u64| StimulusEvent {
+        elapsed_ms,
+        label: format!("StepStart[{k}]"),
+        op_kind: None,
+        detail: None,
+        total_iterations: Some(iters),
+        step_index: Some(k),
+        is_terminal: false,
+        is_step_end: false,
+    };
+    let end = |elapsed_ms: u64, k: u16, iters: u64| StimulusEvent {
+        elapsed_ms,
+        label: format!("StepEnd[{k}]"),
+        op_kind: None,
+        detail: None,
+        total_iterations: Some(iters),
+        step_index: Some(k),
+        is_terminal: false,
+        is_step_end: true,
+    };
+    // Step 1 local: 0 -> 10000 over 1s (10000/s). Persistent workers add
+    // 500 in the 100ms teardown gap, so StepStart[2] reads 10500 — the
+    // cross-step StepEnd[1] -> StepStart[2] pair would compute 500/0.1s =
+    // 5000/s, but its is_step_end prev is skipped by the guard so that
+    // rate is never computed for step 1.
+    // Step 2 local: 10500 -> 15500 over 1s (5000/s).
+    let stimulus = vec![
+        start(1_000, 1, 0),
+        end(2_000, 1, 10_000),
+        start(2_100, 2, 10_500),
+        end(3_100, 2, 15_500),
+        StimulusEvent::terminal(3_200, 15_500),
+    ];
+    let phases = crate::assert::build_phase_buckets_with_stimulus(&samples, &stimulus);
+    let step1 = phases
+        .iter()
+        .find(|p| p.step_index == 1)
+        .expect("step 1 bucket present");
+    let step2 = phases
+        .iter()
+        .find(|p| p.step_index == 2)
+        .expect("step 2 bucket present");
+    assert_eq!(
+        step1.metrics.get("iteration_rate").copied(),
+        Some(10_000.0),
+        "step-local rate must win over the 5000/s persistent cross-step \
+         delta (the is_step_end guard skips the cross-step pair); got {:?}",
+        step1.metrics.get("iteration_rate"),
+    );
+    assert_eq!(
+        step2.metrics.get("iteration_rate").copied(),
+        Some(5_000.0),
+        "step 2 must report its own start-to-end-of-hold rate; got {:?}",
+        step2.metrics.get("iteration_rate"),
+    );
+}
+
+/// A STALLED step (its own `StepStart[k] -> StepEnd[k]` delta is zero,
+/// the rate_to `e <= s` blind spot) must report NO iteration_rate — it
+/// must NOT leak the inter-step teardown-gap rate that the
+/// `StepEnd[k] -> StepStart[k+1]` pair would otherwise produce. StepEnd[k]
+/// carries step_index `k`, so without the `is_step_end` guard in the
+/// attribution loop that cross-step pair (prev = StepEnd[k], also
+/// step_index `k`) would `or_insert` a gap rate into the empty bucket `k`.
+/// This pins the guard: bucket `k` is sourced ONLY by its own
+/// StepStart -> StepEnd pair.
+#[test]
+fn build_phase_buckets_with_stimulus_stalled_step_does_not_leak_cross_step_gap_rate() {
+    use crate::scenario::snapshot::{DrainedSnapshotEntry, MissingStatsReason};
+    use crate::timeline::StimulusEvent;
+    let mk = |tag: &str, offset_ms: u64| DrainedSnapshotEntry {
+        tag: tag.to_string(),
+        report: fixture_report(),
+        stats: Err(MissingStatsReason::NoSchedulerBinary),
+        elapsed_ms: Some(9_000),
+        boundary_offset_ms: Some(offset_ms),
+        step_index: Some(9),
+    };
+    let drained = vec![mk("periodic_000", 1_500), mk("periodic_001", 2_500)];
+    let samples = SampleSeries::from_drained_typed(drained, None);
+    let start = |elapsed_ms: u64, k: u16, iters: u64| StimulusEvent {
+        elapsed_ms,
+        label: format!("StepStart[{k}]"),
+        op_kind: None,
+        detail: None,
+        total_iterations: Some(iters),
+        step_index: Some(k),
+        is_terminal: false,
+        is_step_end: false,
+    };
+    let end = |elapsed_ms: u64, k: u16, iters: u64| StimulusEvent {
+        elapsed_ms,
+        label: format!("StepEnd[{k}]"),
+        op_kind: None,
+        detail: None,
+        total_iterations: Some(iters),
+        step_index: Some(k),
+        is_terminal: false,
+        is_step_end: true,
+    };
+    // Step 1 STALLED: StepStart[1] == StepEnd[1] == 0, so its step-local
+    // pair is rate_to None and bucket 1 stays empty. A persistent
+    // population then advances 500 during the 100ms teardown gap, so the
+    // cross-step StepEnd[1](0) -> StepStart[2](500) pair WOULD compute
+    // 500/0.1s = 5000/s — which must NOT land in bucket 1. Step 2 runs
+    // normally: 500 -> 1500 over 1s = 1000/s.
+    let stimulus = vec![
+        start(1_000, 1, 0),
+        end(2_000, 1, 0),
+        start(2_100, 2, 500),
+        end(3_100, 2, 1_500),
+        StimulusEvent::terminal(3_200, 1_500),
+    ];
+    let phases = crate::assert::build_phase_buckets_with_stimulus(&samples, &stimulus);
+    let step1 = phases
+        .iter()
+        .find(|p| p.step_index == 1)
+        .expect("step 1 bucket present");
+    let step2 = phases
+        .iter()
+        .find(|p| p.step_index == 2)
+        .expect("step 2 bucket present");
+    assert_eq!(
+        step1.metrics.get("iteration_rate").copied(),
+        None,
+        "a stalled step must report no rate, not the leaked 5000/s teardown \
+         gap rate from the StepEnd[1] -> StepStart[2] pair; got {:?}",
+        step1.metrics.get("iteration_rate"),
+    );
+    assert_eq!(
+        step2.metrics.get("iteration_rate").copied(),
+        Some(1_000.0),
+        "step 2 still reports its own step-local rate; got {:?}",
+        step2.metrics.get("iteration_rate"),
+    );
+}
+
+/// The LAST step has no successor step event, so its
 /// iteration_rate needs the terminal scenario-end boundary. The
 /// terminal supplies that boundary (last step's rate = delta to the
 /// terminal count) and must NOT seed a phantom bucket — the bucket set
@@ -1770,6 +2019,7 @@ fn build_phase_buckets_with_stimulus_terminal_gives_last_step_rate_no_phantom_bu
         total_iterations: Some(iters),
         step_index: Some(k),
         is_terminal: false,
+        is_step_end: false,
     };
     // Step starts at 1000/2000 (iters 0/1000); terminal at 3000 with
     // final iters 3000 — the right boundary the LAST step (step 2)
@@ -1876,6 +2126,7 @@ fn build_phase_buckets_with_stimulus_loop_step_rate_no_prior_graft() {
         total_iterations: Some(iters),
         step_index: Some(k),
         is_terminal: false,
+        is_step_end: false,
     };
     // step1@1000 (iters 0), loop step2@2000 (iters 1000, its OWN start
     // frame — the loop-hold attribution fix), terminal@3000 (iters 3000).

@@ -573,6 +573,14 @@ impl VmResult {
                         out.push(crate::timeline::StimulusEvent::from_wire(&ev));
                     }
                 }
+                Some(wire::MsgType::StepEnd) => {
+                    // Per-step end-of-hold frame (reuses the StimulusPayload
+                    // body). Paired with its StepStart for step-local
+                    // iteration_rate in build_phase_buckets_with_stimulus.
+                    if let Some(ev) = wire::StimulusEvent::from_payload(&entry.payload) {
+                        out.push(crate::timeline::StimulusEvent::from_step_end(&ev));
+                    }
+                }
                 Some(wire::MsgType::ScenarioEnd) => {
                     if let Some((elapsed_ms, total_iterations)) =
                         wire::parse_scenario_end(&entry.payload)

@@ -325,6 +325,7 @@ fn sidecar_result_roundtrip() {
             total_iterations: None,
             step_index: None,
             is_terminal: false,
+            is_step_end: false,
         }],
         work_type: "SpinWait".to_string(),
         verifier_stats: vec![],
@@ -538,6 +539,7 @@ fn sidecar_result_roundtrip_all_fields_round_trip() {
             total_iterations: None,
             step_index: None,
             is_terminal: false,
+            is_step_end: false,
         }],
         work_type: "AuditWork".to_string(),
         verifier_stats: vec![ProgVerifierStats {
