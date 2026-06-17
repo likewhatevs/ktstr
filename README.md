@@ -36,7 +36,7 @@ automates this:
 
 - **Clean slate** -- each test boots its own kernel in a KVM VM. No
   shared state between tests.
-- **Topology as code** -- `topology(1, 2, 4, 2)` gives you 1 NUMA
+- **Topology as code** -- `topology = (1, 2, 4, 2)` gives you 1 NUMA
   node, 2 LLCs (last-level caches), 4 cores/LLC, 2 threads. x86_64
   and aarch64. The same
   test produces the same topology on any host.
@@ -69,7 +69,7 @@ Add ktstr as a dev-dependency:
 
 ```toml
 [dev-dependencies]
-ktstr = "0.12"
+ktstr = "0.15"
 ```
 
 The library is the test-author surface. The `anyhow::Result`
@@ -102,7 +102,7 @@ This installs:
 `cargo install --locked --bin cargo-ktstr ktstr@X.Y.Z`. ktstr is
 pre-1.0 — minor-version bumps may break the test-facing API, and
 patch bumps may break unstable internal surfaces (the CI matrix
-runs against the locked patch). Examples below assume 0.12; an
+runs against the locked patch). Examples below assume 0.15; an
 example from a different release may not compile against the crate
 this README documents.
 
@@ -419,8 +419,8 @@ cargo ktstr stats                                          # aggregate gauntlet 
 cargo ktstr stats compare --a-kernel 6.14 --b-kernel 6.15  # diff sidecar partitions across kernels
 cargo ktstr stats show-host --run <key>                    # print archived HostContext for a run
 cargo ktstr stats list-metrics                             # discover the metric vocabulary in archived sidecars
-cargo ktstr stats list-values <metric>                     # dump every recorded value for one metric
-cargo ktstr stats explain-sidecar <path>                   # print the per-file aggregation explanation for one sidecar
+cargo ktstr stats list-values                              # list distinct values per filterable dimension in the sidecar pool
+cargo ktstr stats explain-sidecar --run <key>              # explain per-field None causes across a run's sidecars
 cargo ktstr show-host                                      # print current host context
 cargo ktstr show-thresholds my_test                        # print resolved Assert thresholds for a test
 cargo ktstr export my_test                                 # write a self-contained .run for bare-metal repro

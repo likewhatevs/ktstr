@@ -4855,7 +4855,7 @@ impl WorkloadHandle {
         // the SAME crash/bypass window, so once one times out the rest get
         // the remaining (~0) budget and give up immediately rather than
         // summing to N×timeout. Mirrors the scheduler-side
-        // `reap_child_bounded` (rust_init.rs); on timeout the zombie is left
+        // `reap_child_bounded` (rust_init/scheduler.rs); on timeout the zombie is left
         // for VM reboot to reap (SIGKILL cannot make it exit faster — see
         // that fn's doc).
         const WORKER_REAP_TIMEOUT: Duration = Duration::from_secs(3);

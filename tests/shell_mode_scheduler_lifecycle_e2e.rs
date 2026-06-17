@@ -33,7 +33,7 @@
 //! ## Marker sink: `/proc/1/fd/1`
 //!
 //! Markers route through init's fd 1 (whichever char device
-//! `shell_console_device()` in `src/vmm/rust_init.rs` returns —
+//! `shell_console_device()` in `src/vmm/rust_init/modes.rs` returns —
 //! `/dev/hvc0` when virtio-console is available, else `/dev/ttyS1`).
 //! The `cargo-ktstr` subprocess captures that pipeline as
 //! `Output.stdout`.
@@ -65,7 +65,7 @@
 //!
 //! ## Marker shape
 //!
-//! `exec_shell_line` in `src/vmm/rust_init.rs` ONLY supports literal
+//! `exec_shell_line` in `src/vmm/rust_init/dump.rs` ONLY supports literal
 //! `echo VALUE > /path`. No subshell expansion, no append `>>`, no
 //! other commands. Markers are unique sentinels
 //! (`SHELL_LIFECYCLE_ENABLE_MARKER`, etc.) — the "missing initramfs
@@ -131,7 +131,7 @@ const SHELL_LIFECYCLE_FIXTURE_PARTIAL_FAIL: Scheduler =
         enable: &[
             // First line fails (parent dir doesn't exist); per
             // `exec_shell_script` partial-apply contract in
-            // `src/vmm/rust_init.rs`, fail_count increments but
+            // `src/vmm/rust_init/dump.rs`, fail_count increments but
             // the loop continues to the next line.
             "echo bogus > /this/path/does/not/exist",
             "echo SHELL_LIFECYCLE_ENABLE_MARKER > /proc/1/fd/1",
@@ -332,7 +332,7 @@ fn shell_mode_enable_side_effects_visible_to_payload() {
 }
 
 /// only-enable: descriptor sets enable cmds + EMPTY disable cmds.
-/// Per `exec_shell_script` in `src/vmm/rust_init.rs`, a missing
+/// Per `exec_shell_script` in `src/vmm/rust_init/dump.rs`, a missing
 /// /sched_disable file is a legitimate "no script" debug-skip;
 /// no error surfaces. Enable still fires normally. The
 /// disable-marker absence assertion catches a regression that
@@ -495,7 +495,7 @@ fn shell_mode_payload_zero_exit_propagates() {
 
 /// Partial-apply: enable cmd list has one line that fails (writes
 /// to a non-existent path) and one line that succeeds (writes the
-/// marker). Per `exec_shell_script` in `src/vmm/rust_init.rs`,
+/// marker). Per `exec_shell_script` in `src/vmm/rust_init/dump.rs`,
 /// per-line failures increment fail_count but the script continues
 /// to the next line. The marker MUST appear (proves the second
 /// line ran despite the first failing) AND the partial-apply

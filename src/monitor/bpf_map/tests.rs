@@ -24,6 +24,7 @@ fn value_ctx<'a>(mem: &'a GuestMem, cr3_pa: u64, l5: bool) -> AccessorCtx<'a> {
         tcr_el1: 0,
         start_kernel_map: START_KERNEL_MAP,
         phys_base: 0,
+        iter_max: MAP_WALK_ITER_MAX,
     }
 }
 
@@ -43,6 +44,7 @@ pub(super) fn lookup_ctx<'a>(
         tcr_el1: 0,
         start_kernel_map: START_KERNEL_MAP,
         phys_base: 0,
+        iter_max: MAP_WALK_ITER_MAX,
     }
 }
 
@@ -2492,6 +2494,67 @@ fn find_all_bpf_maps_returns_both_types() {
     assert!(hash_map.unwrap().value_kva.is_none());
     assert_eq!(array_map.unwrap().map_type, BPF_MAP_TYPE_ARRAY);
     assert!(array_map.unwrap().value_kva.is_some());
+}
+
+// Pins the two-method split on a concrete `GuestMemMapAccessor`:
+// the inherent `find_array_map` filters to `BPF_MAP_TYPE_ARRAY`
+// while the `BpfMapAccessor::find_map` trait method matches by
+// suffix regardless of type. Before the rename, both names were
+// `find_map`, inherent-over-trait resolution silently bound the
+// ARRAY-only inherent method on the concrete receiver, and a
+// caller intending the trait's suffix-only semantics for a
+// non-ARRAY map got `None` with no compiler signal. After the
+// rename the two are distinct symbols and this test asserts each
+// resolves to its own filter.
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn concrete_accessor_find_array_map_vs_trait_find_map_diverge_on_non_array() {
+    use crate::monitor::guest::GuestKernel;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    // Two ARRAY maps ("other.data", "mitosis.bss"); flip the first
+    // to HASH so it has no `value_kva` and is rejected by the
+    // ARRAY filter. Layout matches `find_all_bpf_maps_returns_both_types`.
+    let mut setup = setup_find_bpf_map_multi();
+    let map1_pa: u64 = 0x14000;
+    let map_type_off = setup.3.map_type;
+    let off = (map1_pa + map_type_off as u64) as usize;
+    setup.0[off..off + 4].copy_from_slice(&1u32.to_ne_bytes()); // BPF_MAP_TYPE_HASH
+
+    let (buf, cr3_pa, idr_kva, offsets) = setup;
+    let page_offset: u64 = 0xFFFF_8880_0000_0000;
+    // SAFETY: buf is a live local buffer whose backing storage
+    // outlives the GuestMem use.
+    let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
+    let kernel =
+        GuestKernel::new_for_test(Arc::new(mem), HashMap::new(), page_offset, cr3_pa, false);
+    let accessor = GuestMemMapAccessor::new_for_test(&kernel, &offsets, idr_kva);
+
+    // Inherent ARRAY-only method: HASH map with this suffix is
+    // filtered out.
+    assert!(
+        accessor.find_array_map("other.data").is_none(),
+        "find_array_map must skip the non-ARRAY (HASH) map"
+    );
+    // Trait suffix-only method (call through the trait explicitly):
+    // the same HASH map matches.
+    let via_trait = BpfMapAccessor::find_map(&accessor, "other.data");
+    let via_trait = via_trait.expect("trait find_map matches by suffix regardless of map_type");
+    assert_eq!(via_trait.name(), "other.data");
+    assert_eq!(via_trait.map_type, 1); // BPF_MAP_TYPE_HASH
+    assert!(via_trait.value_kva.is_none());
+
+    // Both agree on the genuine ARRAY map.
+    let arr = accessor
+        .find_array_map("mitosis.bss")
+        .expect("find_array_map matches the ARRAY map");
+    assert_eq!(arr.name(), "mitosis.bss");
+    assert_eq!(arr.map_type, BPF_MAP_TYPE_ARRAY);
+    assert!(arr.value_kva.is_some());
+    let arr_trait = BpfMapAccessor::find_map(&accessor, "mitosis.bss")
+        .expect("trait find_map matches ARRAY too");
+    assert_eq!(arr_trait.name(), "mitosis.bss");
 }
 
 #[test]

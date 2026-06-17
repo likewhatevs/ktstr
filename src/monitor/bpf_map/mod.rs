@@ -11,8 +11,11 @@
 //! - xa_node structs are SLAB-allocated (direct mapping): use `kva_to_pa`.
 //! - bpf_map/bpf_array may be kmalloc'd or vmalloc'd: use `translate_any_kva`.
 //! - .bss value region is vmalloc'd: use `translate_kva`.
-//! - Per-CPU values (`BPF_MAP_TYPE_PERCPU_ARRAY`) are in the direct mapping:
-//!   use `kva_to_pa` with `__per_cpu_offset[cpu]`.
+//! - Per-CPU values (`PERCPU_ARRAY` / `PERCPU_HASH`) live in dynamic
+//!   per-CPU memory — the embedded first chunk is in the direct
+//!   mapping, larger allocations are vmalloc'd. Add
+//!   `__per_cpu_offset[cpu]` to the `__percpu` base and read the value
+//!   page-by-page via `read_percpu_value_bytes` (`translate_any_kva`).
 
 use crate::sync::MutexExt;
 use anyhow::Context;
@@ -37,6 +40,25 @@ use local_storage::iter_local_storage_entries;
 /// [`BpfMapAccessor::iter_percpu_hash_map`] and the underlying walker
 /// helpers in [`htab`].
 pub(crate) type PerCpuHashEntries = Vec<(Vec<u8>, Vec<Option<Vec<u8>>>)>;
+
+/// Maximum chain-element visits per map walk — the production value of
+/// [`AccessorCtx::iter_max`]. A corrupted `next` pointer that forms a
+/// cycle is bounded here so a hash-bucket or local-storage walk can't
+/// spin the freeze hot path until the rendezvous timeout. Shared by
+/// the bucket walker `htab::walk_htab` and the local-storage walker
+/// `local_storage::iter_local_storage_entries`.
+pub(crate) const MAP_WALK_ITER_MAX: usize = 1_000_000;
+
+/// Maximum chain entries a walker materializes into its result `Vec`
+/// before the renderer's per-map `.take`. One-past
+/// (`out.len() > MAP_MATERIALIZE_MAX`) so the renderer's
+/// `len > MAX_HASH_ENTRIES` truncation check still fires on a truncated
+/// map. Without it the guest-memory walker materializes up to
+/// [`MAP_WALK_ITER_MAX`] entries (×num_cpus for per-CPU values) before
+/// the renderer truncates to 4096 — a freeze-hot-path memory spike.
+/// `dump::render_map::MAX_HASH_ENTRIES` aliases this so the render cap
+/// and the walker materialize cap are one value.
+pub(crate) const MAP_MATERIALIZE_MAX: usize = 4096;
 
 /// Bundle of borrow-held state every map-access routine threads
 /// through the page-table walk, bounds check, and byte read/write path.
@@ -70,6 +92,13 @@ pub(crate) struct AccessorCtx<'a> {
     /// text/data symbols correctly. See
     /// [`super::guest::GuestKernel::phys_base`].
     pub phys_base: u64,
+    /// Maximum chain-element visits per map walk (hash buckets,
+    /// local-storage chains). A corrupted `next` pointer that loops
+    /// back into a chain would otherwise spin the walker on the freeze
+    /// hot path; this bounds the walk. Production sets
+    /// [`MAP_WALK_ITER_MAX`]; tests override it with a small value to
+    /// exercise the cap cheaply.
+    pub iter_max: usize,
 }
 
 // Map type discriminants from `enum bpf_map_type` in
@@ -346,8 +375,8 @@ impl std::fmt::Display for BpfMapInfo {
 /// `struct bpf_map`. The struct itself is ~250 bytes on 6.16+
 /// kernels (verified against include/linux/bpf.h `struct bpf_map`),
 /// and every field [`find_all_bpf_maps`] touches falls within this
-/// span. The cap is a hostile-guest safety bound (`map_pa` could
-/// straddle end-of-DRAM) — `read_bytes` already truncates short, so
+/// span. The bound keeps the batched read to a fixed scratch size; if
+/// `map_pa` straddles end-of-DRAM `read_bytes` truncates short, so
 /// any field whose end exceeds the actual copy length falls through
 /// to the scalar read path via `MapMetadata::u32_at` / `u64_at`.
 const MAP_METADATA_SPAN: usize = 384;
@@ -577,7 +606,7 @@ pub(crate) fn find_all_bpf_maps(ctx: &AccessorCtx<'_>, map_idr_kva: u64) -> Vec<
 /// PERCPU_HASH, RINGBUF, ARENA, …) alongside the small set of ARRAY
 /// maps the failure-dump renderer reaches through, so the savings
 /// are proportional to the reject rate.
-// Production callers go through [`GuestMemMapAccessor::find_map`] /
+// Production callers go through [`GuestMemMapAccessor::find_array_map`] /
 // [`BpfMapAccessor::maps`]; this single-shot variant is preserved
 // for the `bpf_map::tests` suite that exercises the IDR walk
 // directly.
@@ -631,7 +660,7 @@ pub(crate) fn find_bpf_map(
         // [`find_bpf_map`] is reached only by direct callers (tests
         // today; future single-shot probes that don't want to pay the
         // [`find_all_bpf_maps`] IDR walk). The freeze hot path in
-        // production goes through [`GuestMemMapAccessor::find_map`] /
+        // production goes through [`GuestMemMapAccessor::find_array_map`] /
         // [`BpfMapAccessor::maps`], which build and consult the
         // per-accessor [`maps_cache`] populated by
         // [`find_all_bpf_maps`]; that path does the full bulk read
@@ -689,14 +718,17 @@ pub(crate) fn find_bpf_map(
     None
 }
 
-/// Hostile-guest cap on a single value-region read. Bounds the
-/// `vec![0u8; len]` allocation before it reaches the heap so a
-/// corrupted (uninitialized) `bpf_map.value_size` read can't
-/// induce a multi-gigabyte allocation on the freeze hot path.
-/// 16 MiB covers every realistic BPF map's per-entry size; a
-/// global-section ARRAY (`.bss` etc.) is the largest practical
-/// value at scheduler scale, and the kernel itself caps `value_size`
-/// well below this for ordinary map types.
+/// Robustness bound on a single value-region allocation. `value_size`
+/// is read live from kernel memory via page-table translation, so a
+/// torn read mid-update, a stale/wrong offset-table entry for the
+/// running kernel, or a corrupted-pointer chase could yield a garbage
+/// `value_size` — up to ~4 GiB, the u32 max. Capping before the
+/// `vec![0u8; len]` allocation keeps a mis-read from driving a
+/// multi-gigabyte allocation on the freeze hot path. 16 MiB covers
+/// every realistic scheduler-scale map (a global-section `.bss` ARRAY
+/// is the largest practical value, KiB–low-MiB); kernel-legal
+/// non-percpu ARRAYs can exceed it (up to INT_MAX), so the cap is a
+/// robustness heuristic, not a kernel limit.
 const MAX_VALUE_SIZE: usize = 16 * 1024 * 1024;
 
 /// BPF-map I/O wrapper around [`super::kva_io::chunked_kva_io`] that
@@ -803,9 +835,10 @@ pub(crate) fn read_bpf_map_value(
     if end > map_info.value_size as usize {
         return None;
     }
-    // Hostile-guest size cap before allocation: a corrupted
-    // `value_size` (or a caller passing a huge `len`) would
-    // otherwise allocate up to 4 GiB inside `vec![0u8; len]`.
+    // Live-read robustness cap before allocation (see MAX_VALUE_SIZE):
+    // a garbage `value_size` (torn / stale-offset read) or a caller
+    // passing a huge `len` would otherwise allocate up to 4 GiB inside
+    // `vec![0u8; len]`.
     if len > MAX_VALUE_SIZE {
         return None;
     }
@@ -847,8 +880,8 @@ pub(crate) fn read_bpf_map_array_value(
         return None;
     }
     let value_size = map_info.value_size as usize;
-    // Hostile-guest size cap before any allocation, matching
-    // `read_bpf_map_value`.
+    // Live-read robustness cap before any allocation, matching
+    // `read_bpf_map_value` (see MAX_VALUE_SIZE).
     if value_size > MAX_VALUE_SIZE {
         return None;
     }
@@ -866,17 +899,40 @@ pub(crate) fn read_bpf_map_array_value(
 }
 
 /// Page-walk `len` bytes from guest kernel-virtual address
-/// `target_kva` via [`chunked_kva_io`], returning the bytes or `None`
-/// if any page in the range is unmapped or the copy short-reads
-/// (end-of-DRAM).
+/// `target_kva` into a fresh buffer, resolving each 4 KiB page through
+/// `translate`. The translator abstracts WHICH KVA→PA strategy
+/// applies: [`read_kva_bytes`] passes the PTE-only `translate_kva`
+/// (vmalloc'd `.bss` value region); [`read_percpu_value_bytes`]
+/// passes `translate_any_kva` (direct-mapping-first, for per-CPU
+/// values that may live in either the direct mapping or vmalloc).
 ///
-/// Shared by [`read_bpf_map_value`] (byte-range reads bounded by one
-/// entry's `value_size`) and [`read_bpf_map_array_value`] (per-entry
-/// reads into a multi-entry ARRAY bounded by `max_entries * stride`).
-/// This helper performs NO semantic bounds check — callers MUST cap
-/// `len` against `MAX_VALUE_SIZE` and confirm `target_kva` lies in the
-/// map's value region before calling.
-fn read_kva_bytes(ctx: &AccessorCtx<'_>, target_kva: u64, len: usize) -> Option<Vec<u8>> {
+/// Walking page-by-page is mandatory, not an optimization. A
+/// vmalloc-backed range (a `.bss` map's value region, or a large
+/// dynamic per-CPU allocation) occupies physically discontiguous
+/// order-0 frames, so a value crossing a page boundary lives in
+/// non-adjacent guest physical memory. A single translate of the
+/// first page followed by one bulk read of `len` bytes would copy
+/// whatever frame happens to sit after the first page — garbage — for
+/// every byte past that boundary.
+///
+/// Returns `None` if any page is unmapped (`translate` returns
+/// `None`) or the copy short-reads (`read_bytes` returns fewer bytes
+/// than the chunk at end-of-DRAM); the buffer is adopted via
+/// `set_len` only once every byte is proven written. Performs NO
+/// semantic bounds check: `target_kva` must lie in the value region.
+/// Every value-region caller caps `len`/`value_size` against
+/// `MAX_VALUE_SIZE` before allocating — the `.bss`/ARRAY paths
+/// ([`read_bpf_map_value`], [`read_bpf_map_array_value`]) and the
+/// per-CPU paths ([`read_percpu_array_value`] and the PERCPU-HASH
+/// walker via `walk_htab`) alike — because `value_size` is read live
+/// from kernel memory and a mis-read could otherwise drive a huge
+/// allocation (per CPU, in the per-CPU case).
+fn read_kva_bytes_with<T: Fn(u64) -> Option<u64>>(
+    mem: &GuestMem,
+    translate: T,
+    target_kva: u64,
+    len: usize,
+) -> Option<Vec<u8>> {
     // `Vec::with_capacity` reserves backing storage without zeroing
     // — the zero-fill that `vec![0u8; len]` would have emitted is
     // wasted because every byte gets overwritten by the
@@ -890,7 +946,7 @@ fn read_kva_bytes(ctx: &AccessorCtx<'_>, target_kva: u64, len: usize) -> Option<
     // see "unreadable" rather than a partial buffer.
     let buf_ptr = buf.as_mut_ptr();
     let mut bytes_filled: usize = 0;
-    let ok = chunked_kva_io(ctx, target_kva, len, |pa, dst_off, chunk_len| {
+    let ok = super::kva_io::chunked_kva_io(translate, target_kva, len, |pa, dst_off, chunk_len| {
         // SAFETY: dst_off + chunk_len <= len <= buf.capacity(); the
         // slice borrows the heap-allocated Vec whose backing storage
         // is live for the duration of this call (the Vec is pinned in
@@ -902,11 +958,10 @@ fn read_kva_bytes(ctx: &AccessorCtx<'_>, target_kva: u64, len: usize) -> Option<
         let slice =
             unsafe { std::slice::from_raw_parts_mut(buf_ptr.add(dst_off as usize), chunk_len) };
         // GuestMem::read_bytes returns the count actually copied; the
-        // caller has bounds-checked the value region and translate_kva
-        // has confirmed the page is mapped, so a short read here means
-        // the page crosses end-of-DRAM, which the original byte loop
-        // would also have silently short-copied.
-        let n = ctx.mem.read_bytes(pa, slice);
+        // page was confirmed mapped by `translate`, so a short read
+        // here means the page crosses end-of-DRAM, which the original
+        // byte loop would also have silently short-copied.
+        let n = mem.read_bytes(pa, slice);
         // `saturating_add` so a pathological accumulation past
         // `usize::MAX` clamps and the `bytes_filled != len` check
         // below still surfaces the short read instead of wrapping
@@ -926,6 +981,62 @@ fn read_kva_bytes(ctx: &AccessorCtx<'_>, target_kva: u64, len: usize) -> Option<
     Some(buf)
 }
 
+/// Page-walk `len` bytes from a `.bss`/ARRAY value-region KVA via the
+/// PTE-only `translate_kva` (the value region is vmalloc'd, never in
+/// the direct mapping).
+///
+/// Shared by [`read_bpf_map_value`] (byte-range reads bounded by one
+/// entry's `value_size`) and [`read_bpf_map_array_value`] (per-entry
+/// reads into a multi-entry ARRAY bounded by `max_entries * stride`).
+/// Performs NO semantic bounds check — see [`read_kva_bytes_with`].
+fn read_kva_bytes(ctx: &AccessorCtx<'_>, target_kva: u64, len: usize) -> Option<Vec<u8>> {
+    read_kva_bytes_with(
+        ctx.mem,
+        |kva| {
+            ctx.mem
+                .translate_kva(ctx.cr3_pa.0, Kva(kva), ctx.l5, ctx.tcr_el1)
+        },
+        target_kva,
+        len,
+    )
+}
+
+/// Page-walk `len` bytes of one CPU's per-CPU value via
+/// `translate_any_kva` (direct-mapping-first, then a page-table walk
+/// for vmalloc'd per-CPU memory).
+///
+/// Per-CPU values come from the kernel's dynamic per-CPU allocator:
+/// the embedded first chunk lives in the direct mapping, while larger
+/// allocations are vmalloc-backed (`mm/percpu-vm.c` hands out order-0
+/// pages via `pcpu_get_vm_areas`, so the frames are physically
+/// discontiguous). Walking page-by-page — [`read_kva_bytes_with`]'s
+/// core behavior — is therefore required for any value that crosses a
+/// page boundary; a single translate + bulk read would copy garbage
+/// past the first page.
+///
+/// Returns `None` if any page is unmapped or the read short-reads at
+/// end-of-DRAM. The end-of-DRAM bound the single-read path checked
+/// explicitly (`cpu_pa + value_size <= mem.size()`) is subsumed:
+/// [`GuestMem::read_bytes`] returns 0 for a PA past `mem.size()`, so
+/// `bytes_filled != len` drops the slot to `None`.
+fn read_percpu_value_bytes(ctx: &AccessorCtx<'_>, target_kva: u64, len: usize) -> Option<Vec<u8>> {
+    read_kva_bytes_with(
+        ctx.mem,
+        |kva| {
+            translate_any_kva(
+                ctx.mem,
+                ctx.cr3_pa.0,
+                ctx.page_offset.0,
+                kva,
+                ctx.l5,
+                ctx.tcr_el1,
+            )
+        },
+        target_kva,
+        len,
+    )
+}
+
 /// Read a u32 from a BPF map's value region at `offset`.
 pub(crate) fn read_bpf_map_value_u32(
     ctx: &AccessorCtx<'_>,
@@ -941,12 +1052,12 @@ pub(crate) fn read_bpf_map_value_u32(
 /// `bpf_array.pptrs[key]` holds a `__percpu` pointer. Adding
 /// `__per_cpu_offset[cpu]` yields the per-CPU KVA, which may live
 /// either in the direct mapping (static percpu, kmalloc'd percpu)
-/// or in vmalloc'd memory (large dynamic per-CPU allocations).
-/// Address translation goes through [`translate_any_kva`], which
-/// tries direct mapping first and falls through to a page-table
-/// walk for vmalloc'd percpu — so a per-CPU value that misses the
-/// direct mapping no longer reads as `None` simply because the
-/// underlying allocation lives in vmalloc.
+/// or in vmalloc'd memory (large dynamic per-CPU allocations). The
+/// value is read via [`read_percpu_value_bytes`], which walks it
+/// page-by-page through [`translate_any_kva`] (direct-mapping-first,
+/// vmalloc fallback) so a value that misses the direct mapping — or
+/// that straddles physically discontiguous vmalloc frames — is read
+/// correctly rather than reading as `None` or copying garbage.
 ///
 /// Returns one entry per CPU, indexed by CPU number. `Some(bytes)`
 /// when the per-CPU PA falls within guest memory; `None` when it
@@ -988,6 +1099,17 @@ fn read_percpu_array_value(
     }
 
     let value_size = map.value_size as usize;
+    // Robustness cap mirroring read_bpf_map_value / read_bpf_map_array_value
+    // (and htab.rs's walk_htab): value_size is read live from kernel memory,
+    // so a torn read mid-update, a stale offset-table entry for the running
+    // kernel, or a corrupted-pointer chase could yield a garbage size — and
+    // here it would allocate value_size bytes PER CPU across the loop below.
+    // The kernel bounds PERCPU value_size well under 16 MiB (map create
+    // rejects round_up(value_size, 8) > PCPU_MIN_UNIT_SIZE), so this never
+    // rejects a legal map; it only fires on a mis-read.
+    if value_size > MAX_VALUE_SIZE {
+        return Vec::new();
+    }
     let mut result = Vec::with_capacity(per_cpu_offsets.len());
 
     for (cpu_index, &cpu_off) in per_cpu_offsets.iter().enumerate() {
@@ -1014,48 +1136,13 @@ fn read_percpu_array_value(
         // mapping (per-CPU __percpu allocations from the static
         // percpu region or kmalloc'd percpu blocks) or vmalloc'd
         // percpu memory (large dynamic per-CPU allocations served
-        // from pcpu_get_vm_areas). `translate_any_kva` tries direct
-        // mapping first and falls through to a page-table walk for
-        // vmalloc'd percpu, so it covers both.
-        match translate_any_kva(
-            ctx.mem,
-            ctx.cr3_pa.0,
-            ctx.page_offset.0,
-            cpu_kva,
-            ctx.l5,
-            ctx.tcr_el1,
-        ) {
-            Some(cpu_pa)
-                if cpu_pa
-                    .checked_add(value_size as u64)
-                    .is_some_and(|end| end <= ctx.mem.size()) =>
-            {
-                // `Vec::with_capacity` skips the zero-fill that
-                // `vec![0u8; value_size]` would emit; every byte is
-                // overwritten by `read_bytes` on the success path,
-                // and a short read drops the slot to `None` rather
-                // than handing a partial buffer to the renderer.
-                // Same with-capacity-then-set-len pattern used by
-                // [`htab::iter_htab_entries`] and
-                // [`local_storage::iter_local_storage_entries`].
-                let mut buf: Vec<u8> = Vec::with_capacity(value_size);
-                // SAFETY: capacity == value_size; we set_len only
-                // after `read_bytes` returns value_size, mirroring
-                // the htab walker's invariant.
-                let slice = unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr(), value_size) };
-                let n = ctx.mem.read_bytes(cpu_pa, slice);
-                if n == value_size {
-                    // SAFETY: read_bytes filled value_size bytes.
-                    unsafe {
-                        buf.set_len(value_size);
-                    }
-                    result.push(Some(buf));
-                } else {
-                    result.push(None);
-                }
-            }
-            _ => result.push(None),
-        }
+        // from pcpu_get_vm_areas). `read_percpu_value_bytes` walks the
+        // value page-by-page through `translate_any_kva` (direct
+        // mapping first, page-table walk for vmalloc'd percpu), so a
+        // value straddling physically discontiguous vmalloc frames is
+        // read correctly; it drops the slot to `None` on any unmapped
+        // page or end-of-DRAM short read.
+        result.push(read_percpu_value_bytes(ctx, cpu_kva, value_size));
     }
 
     result
@@ -1481,6 +1568,7 @@ impl<'a> GuestMemMapAccessor<'a> {
             tcr_el1: self.kernel.tcr_el1(),
             start_kernel_map: self.kernel.start_kernel_map(),
             phys_base: self.kernel.phys_base(),
+            iter_max: MAP_WALK_ITER_MAX,
         }
     }
 
@@ -1502,11 +1590,18 @@ impl<'a> GuestMemMapAccessor<'a> {
 
     /// Find the first BPF ARRAY map whose name ends with `name_suffix`.
     ///
-    /// Only returns `BPF_MAP_TYPE_ARRAY` maps. Use
+    /// Only returns `BPF_MAP_TYPE_ARRAY` maps — distinct from the
+    /// suffix-only [`BpfMapAccessor::find_map`] trait method. The
+    /// distinct name keeps inherent-over-trait method resolution
+    /// honest: a concrete-receiver caller that wants the ARRAY
+    /// filter (value-region read/write needs `value_kva`, which is
+    /// `Some` only for ARRAY maps) names it explicitly here, and the
+    /// compiler errors instead of silently shadowing the trait
+    /// method when the receiver type changes. Use
     /// [`BpfMapAccessor::maps`] to enumerate maps of all types.
     /// Goes through the per-accessor maps cache so repeat
-    /// `find_map` calls within one dump amortize the IDR walk.
-    pub fn find_map(&self, name_suffix: &str) -> Option<BpfMapInfo> {
+    /// `find_array_map` calls within one dump amortize the IDR walk.
+    pub fn find_array_map(&self, name_suffix: &str) -> Option<BpfMapInfo> {
         let mut guard = self.maps_cache.lock_unpoisoned();
         if guard.is_none() {
             *guard = Some(std::sync::Arc::new(find_all_bpf_maps(
@@ -1666,8 +1761,9 @@ impl BpfMapAccessor for GuestMemMapAccessor<'_> {
     /// `(owner_kva_le_bytes, value_bytes)` per entry — see
     /// [`iter_local_storage_entries`] for the kernel-side walk
     /// shape (`bpf_local_storage_map.buckets[i].list` — regular
-    /// hlist, NULL termination — followed by `container_of` math
-    /// from `map_node` back to the elem base).
+    /// hlist, NULL termination — with `map_node` at offset 0 of the
+    /// elem, so the node KVA is the elem base and no `container_of`
+    /// subtraction is needed).
     fn iter_task_storage(&self, map: &BpfMapInfo) -> Vec<(Vec<u8>, Vec<u8>)> {
         iter_local_storage_entries(&self.ctx(), map)
     }

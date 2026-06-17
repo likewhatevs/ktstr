@@ -2374,7 +2374,7 @@ fn decode_probe_counters_snapshot(
     // coordinator's lazy-discovery path uses (matched by suffix
     // to avoid colliding with a scheduler-under-test's own
     // `.bss`).
-    let bss_map = accessor.find_map("probe_bp.bss")?;
+    let bss_map = accessor.find_array_map("probe_bp.bss")?;
     if bss_map.btf_kva == 0 {
         // Probe not yet loaded — accessor enumerated a stub.
         return None;
@@ -2466,7 +2466,7 @@ fn decode_probe_sched_state_snapshot(
     // Locate the probe's `.bss` map. Same suffix the freeze
     // coordinator's lazy-discovery path uses (matched by suffix to
     // avoid colliding with a scheduler-under-test's own `.bss`).
-    let bss_map = accessor.find_map("probe_bp.bss")?;
+    let bss_map = accessor.find_array_map("probe_bp.bss")?;
     if bss_map.btf_kva == 0 {
         // Probe not yet loaded — accessor enumerated a stub. The
         // var offsets live in the program BTF the loader hasn't

@@ -712,8 +712,8 @@ pub enum Op {
     /// `kernel/sched/ext.c:7372-7381`), sends `SIGTERM` to the
     /// scheduler pid, waits up to `SCHED_LIFECYCLE_KILL_GRACE` (10s)
     /// for the kernel BPF state to reach `SCX_DISABLED`, then
-    /// clears the `SCHED_PID` atomic (defined at
-    /// `src/vmm/rust_init.rs:90`) so subsequent
+    /// clears the `SCHED_PID` atomic (defined in
+    /// `src/vmm/rust_init/mod.rs`) so subsequent
     /// `crate::vmm::rust_init::sched_pid()` reads return `None`.
     ///
     /// Bails when no scheduler is currently attached (SCHED_PID is

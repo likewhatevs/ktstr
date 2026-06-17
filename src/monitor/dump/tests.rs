@@ -2172,6 +2172,28 @@ fn pinned_error_local_storage_truncation() {
     );
 }
 
+/// `fd-array dump does not walk hash-shaped FD maps (...)` is set by
+/// the FD-array arm via [`super::render_map::fd_map_is_hash_shaped`]
+/// when the map is SOCKHASH / DEVMAP_HASH / HASH_OF_MAPS — those store
+/// slots in a hash table, not the `bpf_array.ptrs` flex array the
+/// walker reads. Pins the wire-stable diagnostic so a log scraper sees
+/// a stable shape; `render_map_hash_shaped_fd_map_sets_error` verifies
+/// the producer actually emits it.
+#[test]
+fn pinned_error_fd_array_hash_shaped() {
+    // Reproduce the production literal (same line continuation) so a
+    // rephrasing in dump/render_map.rs trips.
+    let rendered: String = "fd-array dump does not walk hash-shaped FD maps \
+         (SOCKHASH/DEVMAP_HASH/HASH_OF_MAPS); populated \
+         count is unavailable for these"
+        .into();
+    assert_eq!(
+        rendered,
+        "fd-array dump does not walk hash-shaped FD maps (SOCKHASH/DEVMAP_HASH/HASH_OF_MAPS); populated count is unavailable for these",
+        "fd-array hash-shaped error string drifted from pin",
+    );
+}
+
 // -- Per-node NUMA stats wire shape -------------------------------
 //
 // The live walker is a follow-up; this section pins the wire
@@ -5617,6 +5639,100 @@ fn render_fd_array_populated_indices() {
     );
 }
 
+/// `fd_map_is_hash_shaped` flags exactly the three hash-table-shaped
+/// FD-map types and nothing else.
+#[test]
+fn fd_map_is_hash_shaped_flags_only_hash_families() {
+    use super::super::bpf_map::{
+        BPF_MAP_TYPE_ARRAY_OF_MAPS, BPF_MAP_TYPE_DEVMAP, BPF_MAP_TYPE_DEVMAP_HASH,
+        BPF_MAP_TYPE_HASH_OF_MAPS, BPF_MAP_TYPE_PROG_ARRAY, BPF_MAP_TYPE_SOCKHASH,
+        BPF_MAP_TYPE_SOCKMAP,
+    };
+    use super::render_map::fd_map_is_hash_shaped;
+    assert!(fd_map_is_hash_shaped(BPF_MAP_TYPE_SOCKHASH));
+    assert!(fd_map_is_hash_shaped(BPF_MAP_TYPE_DEVMAP_HASH));
+    assert!(fd_map_is_hash_shaped(BPF_MAP_TYPE_HASH_OF_MAPS));
+    // Array-shaped FD families are not hash-shaped.
+    assert!(!fd_map_is_hash_shaped(BPF_MAP_TYPE_PROG_ARRAY));
+    assert!(!fd_map_is_hash_shaped(BPF_MAP_TYPE_SOCKMAP));
+    assert!(!fd_map_is_hash_shaped(BPF_MAP_TYPE_DEVMAP));
+    assert!(!fd_map_is_hash_shaped(BPF_MAP_TYPE_ARRAY_OF_MAPS));
+}
+
+/// `render_map` surfaces the unwalkable-gap `error` for a hash-shaped
+/// FD map (SOCKHASH) so an operator can tell "this dump path can't walk
+/// hash-shaped FD maps" apart from "genuinely empty array map" — both
+/// otherwise render `fd_array.populated == 0`. The direct-walker bail
+/// (`scanned == 0`) is covered by `render_fd_array_hash_shaped_returns_empty`.
+#[test]
+fn render_map_hash_shaped_fd_map_sets_error() {
+    let page_offset = crate::monitor::symbols::DEFAULT_PAGE_OFFSET;
+    let buf = vec![0u8; 0x4000];
+    // SAFETY: buf is a live local Vec<u8> outliving the GuestMem use.
+    let mem =
+        unsafe { super::super::reader::GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
+    let kernel = super::super::guest::GuestKernel::new_for_test(
+        std::sync::Arc::new(mem),
+        std::collections::HashMap::new(),
+        page_offset,
+        0,
+        false,
+    );
+    let kernel_ref = unsafe { &*(&kernel as *const _) };
+    let offsets = crate::monitor::btf_offsets::BpfMapOffsets::EMPTY;
+    let accessor =
+        super::super::bpf_map::GuestMemMapAccessor::new_for_test(kernel_ref, &offsets, 0);
+    let (name_bytes, name_len) = name_from_str("test_sockhash");
+    let info = super::super::bpf_map::BpfMapInfo {
+        map_pa: 0,
+        map_kva: pa_to_kva(0x1000, page_offset),
+        name_bytes,
+        name_len,
+        map_type: super::super::bpf_map::BPF_MAP_TYPE_SOCKHASH,
+        map_flags: 0,
+        key_size: 4,
+        value_size: 4,
+        // Large max_entries: a scanning walker would report on these;
+        // the bail must ignore the count entirely.
+        max_entries: 1024,
+        value_kva: None,
+        btf_kva: 0,
+        btf_value_type_id: 0,
+        btf_vmlinux_value_type_id: 0,
+        btf_key_type_id: 0,
+    };
+    let arena_page_index = super::render_map::ArenaPageIndex::new();
+    let sdt_alloc_metas: Vec<super::render_map::SdtAllocMeta> = Vec::new();
+    let ctx = super::render_map::RenderMapCtx {
+        accessor: &accessor,
+        btf: None,
+        num_cpus: 1,
+        arena_offsets: None,
+        shared_arena: None,
+        arena_page_index: &arena_page_index,
+        sdt_alloc_metas: &sdt_alloc_metas,
+        cast_map: None,
+        arena_slot_index: None,
+        cross_btf_fwd_index: None,
+        scx_static_index: None,
+        alloc_size_types: &[],
+        rendered_slot_addrs: None,
+    };
+    let rendered = super::render_map::render_map(&ctx, &info);
+    let err = rendered
+        .error
+        .expect("hash-shaped FD map must surface the unwalkable-gap error");
+    assert!(
+        err.contains("hash-shaped FD maps"),
+        "error must name the limitation; got: {err}",
+    );
+    let fd = rendered
+        .fd_array
+        .expect("fd_array slot is still populated (with scanned: 0)");
+    assert_eq!(fd.scanned, 0);
+    assert_eq!(fd.populated, 0);
+}
+
 /// HASH-shaped FD families (SOCKHASH / DEVMAP_HASH / HASH_OF_MAPS)
 /// short-circuit to populated=0/scanned=0/empty.
 #[test]
@@ -6002,6 +6118,537 @@ fn render_map_multi_entry_array_truncates_at_cap() {
     assert!(
         err.contains("; "),
         "joined-error format (truncation; unreadable count) drifted: {err}"
+    );
+}
+
+/// A PERCPU_ARRAY declaring more keys than `MAX_PERCPU_KEYS` renders
+/// only the first `MAX_PERCPU_KEYS` per-CPU entries and records the cap
+/// in `error`. The PERCPU_ARRAY arm's truncation is index-driven
+/// (`for key in 0..info.max_entries.min(MAX_PERCPU_KEYS)`), so it fires
+/// regardless of whether per-CPU bytes are readable. This synthetic
+/// guest has no `__per_cpu_offset` symbol, so every per-CPU value is
+/// empty (`resolve_per_cpu_offsets` returns None and `read_percpu_array`
+/// hands back an empty vec) — but a `FailureDumpPercpuEntry` slot is
+/// still pushed per key, so the cap clamp and error string are the
+/// behavior under test. Mirrors `render_map_multi_entry_array_truncates_at_cap`
+/// for the PERCPU_ARRAY arm; the format-string-only
+/// `pinned_error_percpu_array_truncation` stays as the cheap secondary
+/// guard.
+#[test]
+fn render_map_percpu_array_truncates_at_cap() {
+    let page_offset = crate::monitor::symbols::DEFAULT_PAGE_OFFSET;
+    let buf = vec![0u8; 0x4000];
+    // SAFETY: buf is a live local Vec<u8> outliving the GuestMem use.
+    let mem =
+        unsafe { super::super::reader::GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
+    // Empty symbol map → no `__per_cpu_offset`, so the per-CPU deref
+    // path yields empty values; the truncation flag is independent.
+    let kernel = super::super::guest::GuestKernel::new_for_test(
+        std::sync::Arc::new(mem),
+        std::collections::HashMap::new(),
+        page_offset,
+        0,
+        false,
+    );
+    let kernel_ref = unsafe { &*(&kernel as *const _) };
+    let offsets = crate::monitor::btf_offsets::BpfMapOffsets::EMPTY;
+    let accessor =
+        super::super::bpf_map::GuestMemMapAccessor::new_for_test(kernel_ref, &offsets, 0);
+    let (name_bytes, name_len) = name_from_str("test_percpu");
+    // Declare more keys than the cap so the render arm truncates.
+    let max_entries: u32 = MAX_PERCPU_KEYS + 71;
+    let info = super::super::bpf_map::BpfMapInfo {
+        map_pa: 0,
+        map_kva: pa_to_kva(0x1000, page_offset),
+        name_bytes,
+        name_len,
+        map_type: super::super::bpf_map::BPF_MAP_TYPE_PERCPU_ARRAY,
+        map_flags: 0,
+        key_size: 4,
+        value_size: 4,
+        max_entries,
+        value_kva: Some(pa_to_kva(0x2000, page_offset)),
+        btf_kva: 0,
+        btf_value_type_id: 0,
+        btf_vmlinux_value_type_id: 0,
+        btf_key_type_id: 0,
+    };
+    let arena_page_index = super::render_map::ArenaPageIndex::new();
+    let sdt_alloc_metas: Vec<super::render_map::SdtAllocMeta> = Vec::new();
+    let ctx = super::render_map::RenderMapCtx {
+        accessor: &accessor,
+        btf: None,
+        num_cpus: 1,
+        arena_offsets: None,
+        shared_arena: None,
+        arena_page_index: &arena_page_index,
+        sdt_alloc_metas: &sdt_alloc_metas,
+        cast_map: None,
+        arena_slot_index: None,
+        cross_btf_fwd_index: None,
+        scx_static_index: None,
+        alloc_size_types: &[],
+        rendered_slot_addrs: None,
+    };
+    let rendered = super::render_map::render_map(&ctx, &info);
+    assert_eq!(
+        rendered.percpu_entries.len(),
+        MAX_PERCPU_KEYS as usize,
+        "render must cap the PERCPU_ARRAY walk at MAX_PERCPU_KEYS"
+    );
+    // First/last walked keys are the kernel indices 0..MAX_PERCPU_KEYS.
+    assert_eq!(rendered.percpu_entries[0].key, 0);
+    assert_eq!(
+        rendered.percpu_entries[MAX_PERCPU_KEYS as usize - 1].key,
+        MAX_PERCPU_KEYS - 1
+    );
+    let err = rendered
+        .error
+        .expect("over-cap PERCPU_ARRAY must surface an error");
+    assert_eq!(
+        err,
+        format!("PERCPU_ARRAY truncated at {MAX_PERCPU_KEYS} keys (max_entries={max_entries})"),
+        "PERCPU_ARRAY truncation error must match the production format exactly; got: {err}"
+    );
+}
+
+/// A HASH map holding more than `MAX_HASH_ENTRIES` (4096) live elements
+/// renders only the first `MAX_HASH_ENTRIES` entries and records the cap
+/// in `error`. Unlike the index-driven ARRAY/PERCPU_ARRAY arms, the HASH
+/// arm's entry count comes from `iter_hash_map` walking real htab
+/// buckets (render_map.rs:1796-1831 `raw_entries.len() > MAX_HASH_ENTRIES`
+/// then `.take(MAX_HASH_ENTRIES)`), so this builds a 4097-element
+/// `hlist_nulls` chain in bucket 0 of a synthetic `bpf_htab` and runs the
+/// real walker. The synthetic htab offsets reuse the exact field values
+/// from the htab walker unit tests (bpf_map/tests/htab_tests.rs:9-19) —
+/// arbitrary but consistent with the walker's reads. The
+/// format-string-only `pinned_error_hash_map_truncation` stays as the
+/// cheap secondary guard.
+#[test]
+fn render_map_hash_truncates_at_cap() {
+    use crate::monitor::btf_offsets::HtabOffsets;
+    let page_offset = crate::monitor::symbols::DEFAULT_PAGE_OFFSET;
+    // Synthetic htab field offsets (mirror of htab_tests::test_htab_offsets).
+    let htab = HtabOffsets {
+        htab_buckets: 200,
+        htab_n_buckets: 208,
+        bucket_size: 16,
+        bucket_head: 0,
+        hlist_nulls_head_first: 0,
+        hlist_nulls_node_next: 0,
+        htab_elem_size_base: 32,
+    };
+    // One bucket; every elem chains into bucket 0.
+    let n_buckets: u32 = 1;
+    let key_size: u32 = 4;
+    let value_size: u32 = 4;
+    // Build 4097 elements so the walk exceeds MAX_HASH_ENTRIES by one.
+    let n_elems: usize = MAX_HASH_ENTRIES + 1;
+    let htab_pa: u64 = 0x0000;
+    let buckets_pa: u64 = 0x1000;
+    let elems_start: u64 = 0x2000;
+    let elem_stride: u64 = 64; // > htab_elem_size_base + key + value (32+8+4)
+    let buf_size = elems_start as usize + n_elems * elem_stride as usize + 0x1000;
+    let mut buf = vec![0u8; buf_size];
+    let write_u32 = |buf: &mut Vec<u8>, pa: u64, val: u32| {
+        let off = pa as usize;
+        buf[off..off + 4].copy_from_slice(&val.to_ne_bytes());
+    };
+    let write_u64 = |buf: &mut Vec<u8>, pa: u64, val: u64| {
+        let off = pa as usize;
+        buf[off..off + 8].copy_from_slice(&val.to_ne_bytes());
+    };
+    // bpf_htab: buckets pointer + n_buckets.
+    write_u64(
+        &mut buf,
+        htab_pa + htab.htab_buckets as u64,
+        pa_to_kva(buckets_pa, page_offset),
+    );
+    write_u32(&mut buf, htab_pa + htab.htab_n_buckets as u64, n_buckets);
+    // Bucket 0 head -> first elem KVA.
+    let first_elem_pa = elems_start;
+    write_u64(
+        &mut buf,
+        buckets_pa + htab.bucket_head as u64 + htab.hlist_nulls_head_first as u64,
+        pa_to_kva(first_elem_pa, page_offset),
+    );
+    // Chain every elem; last elem's next is the nulls end marker (odd).
+    for idx in 0..n_elems {
+        let elem_pa = elems_start + (idx as u64) * elem_stride;
+        let next = if idx + 1 < n_elems {
+            pa_to_kva(elems_start + ((idx + 1) as u64) * elem_stride, page_offset)
+        } else {
+            1u64 // hlist_nulls end marker (bit 0 set)
+        };
+        write_u64(&mut buf, elem_pa + htab.hlist_nulls_node_next as u64, next);
+        // Distinct key bytes per elem so torn/aliased reads would show.
+        write_u32(
+            &mut buf,
+            elem_pa + htab.htab_elem_size_base as u64,
+            idx as u32,
+        );
+        // Value at htab_elem_size_base + round_up(key_size, 8).
+        let val_off = elem_pa + htab.htab_elem_size_base as u64 + ((key_size as u64 + 7) & !7);
+        write_u32(&mut buf, val_off, (idx as u32).wrapping_mul(7));
+    }
+    // SAFETY: buf is a live local Vec<u8> outliving the GuestMem use.
+    let mem =
+        unsafe { super::super::reader::GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
+    // Direct-mapping translation (kva = pa + page_offset); cr3 = 0 is
+    // unused on the direct-map path the walker takes.
+    let kernel = super::super::guest::GuestKernel::new_for_test(
+        std::sync::Arc::new(mem),
+        std::collections::HashMap::new(),
+        page_offset,
+        0,
+        false,
+    );
+    let kernel_ref = unsafe { &*(&kernel as *const _) };
+    let mut offsets = crate::monitor::btf_offsets::BpfMapOffsets::EMPTY;
+    offsets.htab_offsets = Some(htab);
+    let accessor =
+        super::super::bpf_map::GuestMemMapAccessor::new_for_test(kernel_ref, &offsets, 0);
+    let (name_bytes, name_len) = name_from_str("test_hash");
+    let info = super::super::bpf_map::BpfMapInfo {
+        map_pa: 0,
+        map_kva: pa_to_kva(htab_pa, page_offset),
+        name_bytes,
+        name_len,
+        map_type: super::super::bpf_map::BPF_MAP_TYPE_HASH,
+        map_flags: 0,
+        key_size,
+        value_size,
+        max_entries: n_elems as u32,
+        value_kva: None,
+        btf_kva: 0,
+        btf_value_type_id: 0,
+        btf_vmlinux_value_type_id: 0,
+        btf_key_type_id: 0,
+    };
+    let arena_page_index = super::render_map::ArenaPageIndex::new();
+    let sdt_alloc_metas: Vec<super::render_map::SdtAllocMeta> = Vec::new();
+    let ctx = super::render_map::RenderMapCtx {
+        accessor: &accessor,
+        btf: None,
+        num_cpus: 1,
+        arena_offsets: None,
+        shared_arena: None,
+        arena_page_index: &arena_page_index,
+        sdt_alloc_metas: &sdt_alloc_metas,
+        cast_map: None,
+        arena_slot_index: None,
+        cross_btf_fwd_index: None,
+        scx_static_index: None,
+        alloc_size_types: &[],
+        rendered_slot_addrs: None,
+    };
+    let rendered = super::render_map::render_map(&ctx, &info);
+    assert_eq!(
+        rendered.entries.len(),
+        MAX_HASH_ENTRIES,
+        "render must clamp the HASH entry vec to MAX_HASH_ENTRIES"
+    );
+    let err = rendered
+        .error
+        .expect("over-cap HASH must surface a truncation error");
+    assert_eq!(
+        err,
+        format!("hash map truncated at {MAX_HASH_ENTRIES} entries"),
+        "HASH truncation error must match the production format exactly; got: {err}"
+    );
+}
+
+/// PERCPU_HASH render arm (render_map.rs:1839-1861) — the worst
+/// materialization case (per-CPU Vecs ×num_cpus). r23 bounds the walker
+/// at MAP_MATERIALIZE_MAX+1 (via the shared `walk_htab`) so render
+/// truncates to MAX_HASH_ENTRIES and reports it. Mirror of
+/// `render_map_hash_truncates_at_cap` with map_type PERCPU_HASH; a
+/// minimal `__per_cpu_offset` symbol (one zero offset) lets the
+/// accessor resolve per-CPU offsets so the walk runs. Each elem's value
+/// slot (the percpu pointer) is left 0, so the per-CPU deref
+/// short-circuits to an empty per_cpu — the entry COUNT and truncation
+/// (what r23 bounds) are independent of the per-CPU values, matching
+/// `render_map_percpu_array_truncates_at_cap`'s approach.
+#[test]
+fn render_map_percpu_hash_truncates_at_cap() {
+    use crate::monitor::btf_offsets::HtabOffsets;
+    let page_offset = crate::monitor::symbols::DEFAULT_PAGE_OFFSET;
+    let htab = HtabOffsets {
+        htab_buckets: 200,
+        htab_n_buckets: 208,
+        bucket_size: 16,
+        bucket_head: 0,
+        hlist_nulls_head_first: 0,
+        hlist_nulls_node_next: 0,
+        htab_elem_size_base: 32,
+    };
+    let n_buckets: u32 = 1;
+    let key_size: u32 = 4;
+    let value_size: u32 = 4;
+    let n_elems: usize = MAX_HASH_ENTRIES + 1;
+    let htab_pa: u64 = 0x0000;
+    let buckets_pa: u64 = 0x1000;
+    let elems_start: u64 = 0x2000;
+    let elem_stride: u64 = 64;
+    // `__per_cpu_offset[]` storage sits in the padding past the elems.
+    // `new_for_test` uses phys_base=0, so text_kva_to_pa(kva) = kva -
+    // START_KERNEL_MAP; place the symbol so it resolves to pco_pa.
+    let pco_pa: u64 = elems_start + n_elems as u64 * elem_stride + 0x100;
+    let buf_size = elems_start as usize + n_elems * elem_stride as usize + 0x1000;
+    let mut buf = vec![0u8; buf_size];
+    let write_u32 = |buf: &mut Vec<u8>, pa: u64, val: u32| {
+        let off = pa as usize;
+        buf[off..off + 4].copy_from_slice(&val.to_ne_bytes());
+    };
+    let write_u64 = |buf: &mut Vec<u8>, pa: u64, val: u64| {
+        let off = pa as usize;
+        buf[off..off + 8].copy_from_slice(&val.to_ne_bytes());
+    };
+    write_u64(
+        &mut buf,
+        htab_pa + htab.htab_buckets as u64,
+        pa_to_kva(buckets_pa, page_offset),
+    );
+    write_u32(&mut buf, htab_pa + htab.htab_n_buckets as u64, n_buckets);
+    let first_elem_pa = elems_start;
+    write_u64(
+        &mut buf,
+        buckets_pa + htab.bucket_head as u64 + htab.hlist_nulls_head_first as u64,
+        pa_to_kva(first_elem_pa, page_offset),
+    );
+    for idx in 0..n_elems {
+        let elem_pa = elems_start + (idx as u64) * elem_stride;
+        let next = if idx + 1 < n_elems {
+            pa_to_kva(elems_start + ((idx + 1) as u64) * elem_stride, page_offset)
+        } else {
+            1u64
+        };
+        write_u64(&mut buf, elem_pa + htab.hlist_nulls_node_next as u64, next);
+        write_u32(
+            &mut buf,
+            elem_pa + htab.htab_elem_size_base as u64,
+            idx as u32,
+        );
+        // Value slot (percpu pointer) left 0 → per-CPU deref short-circuits.
+    }
+    // SAFETY: buf is a live local Vec<u8> outliving the GuestMem use.
+    let mem =
+        unsafe { super::super::reader::GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
+    let mut symbols = std::collections::HashMap::new();
+    symbols.insert(
+        "__per_cpu_offset".to_string(),
+        crate::monitor::symbols::START_KERNEL_MAP + pco_pa,
+    );
+    let kernel = super::super::guest::GuestKernel::new_for_test(
+        std::sync::Arc::new(mem),
+        symbols,
+        page_offset,
+        0,
+        false,
+    );
+    let kernel_ref = unsafe { &*(&kernel as *const _) };
+    let mut offsets = crate::monitor::btf_offsets::BpfMapOffsets::EMPTY;
+    offsets.htab_offsets = Some(htab);
+    let accessor =
+        super::super::bpf_map::GuestMemMapAccessor::new_for_test(kernel_ref, &offsets, 0);
+    let (name_bytes, name_len) = name_from_str("test_percpu_hash");
+    let info = super::super::bpf_map::BpfMapInfo {
+        map_pa: 0,
+        map_kva: pa_to_kva(htab_pa, page_offset),
+        name_bytes,
+        name_len,
+        map_type: super::super::bpf_map::BPF_MAP_TYPE_PERCPU_HASH,
+        map_flags: 0,
+        key_size,
+        value_size,
+        max_entries: n_elems as u32,
+        value_kva: None,
+        btf_kva: 0,
+        btf_value_type_id: 0,
+        btf_vmlinux_value_type_id: 0,
+        btf_key_type_id: 0,
+    };
+    let arena_page_index = super::render_map::ArenaPageIndex::new();
+    let sdt_alloc_metas: Vec<super::render_map::SdtAllocMeta> = Vec::new();
+    let ctx = super::render_map::RenderMapCtx {
+        accessor: &accessor,
+        btf: None,
+        num_cpus: 1,
+        arena_offsets: None,
+        shared_arena: None,
+        arena_page_index: &arena_page_index,
+        sdt_alloc_metas: &sdt_alloc_metas,
+        cast_map: None,
+        arena_slot_index: None,
+        cross_btf_fwd_index: None,
+        scx_static_index: None,
+        alloc_size_types: &[],
+        rendered_slot_addrs: None,
+    };
+    let rendered = super::render_map::render_map(&ctx, &info);
+    assert_eq!(
+        rendered.percpu_hash_entries.len(),
+        MAX_HASH_ENTRIES,
+        "render must clamp the PERCPU_HASH entry vec to MAX_HASH_ENTRIES"
+    );
+    let err = rendered
+        .error
+        .expect("over-cap PERCPU_HASH must surface a truncation error");
+    assert_eq!(
+        err,
+        format!("percpu hash map truncated at {MAX_HASH_ENTRIES} entries"),
+        "PERCPU_HASH truncation error must match the production format exactly; got: {err}"
+    );
+}
+/// A TASK_STORAGE map holding more than `MAX_HASH_ENTRIES` (4096) selems
+/// renders only the first `MAX_HASH_ENTRIES` entries and records the cap
+/// in `error`. The local-storage arm shares the HASH cap policy
+/// (render_map.rs:2059-2132 `raw_entries.len() > MAX_HASH_ENTRIES` then
+/// `.take(MAX_HASH_ENTRIES)`), and the entry count comes from
+/// `iter_task_storage` walking a real `bpf_local_storage_map` hlist, so
+/// this chains 4097 `bpf_local_storage_elem`s in bucket 0 and runs the
+/// real walker. Synthetic offsets reuse the exact field values from the
+/// local-storage walker unit tests
+/// (bpf_map/tests/local_storage_tests.rs:22-40). The format-string-only
+/// `pinned_error_local_storage_truncation` stays as the cheap secondary
+/// guard.
+#[test]
+fn render_map_local_storage_truncates_at_cap() {
+    use crate::monitor::btf_offsets::TaskStorageOffsets;
+    let page_offset = crate::monitor::symbols::DEFAULT_PAGE_OFFSET;
+    // Synthetic local-storage offsets (mirror of
+    // local_storage_tests::test_task_storage_offsets). bucket_log = 0
+    // here, so n_buckets = 1 and all selems chain in bucket 0.
+    let ts = TaskStorageOffsets {
+        smap_buckets: 0,
+        smap_bucket_log: 8,
+        bucket_size: 16,
+        bucket_list: 0,
+        hlist_head_first: 0,
+        hlist_node_next: 0,
+        elem_local_storage: 16,
+        elem_sdata: 24,
+        sdata_data: 0,
+        ls_owner: 0,
+    };
+    let value_size: u32 = 4;
+    let n_elems: usize = MAX_HASH_ENTRIES + 1;
+    let smap_pa: u64 = 0x0000;
+    let buckets_pa: u64 = 0x1000;
+    let elems_start: u64 = 0x2000;
+    let elem_stride: u64 = 64; // > elem_sdata + sdata_data + value_size (24+0+4)
+    let ls_start: u64 = 0x40_0000;
+    let ls_stride: u64 = 64;
+    let buf_size = ls_start as usize + n_elems * ls_stride as usize + 0x1000;
+    let mut buf = vec![0u8; buf_size];
+    let write_u32 = |buf: &mut Vec<u8>, pa: u64, val: u32| {
+        let off = pa as usize;
+        buf[off..off + 4].copy_from_slice(&val.to_ne_bytes());
+    };
+    let write_u64 = |buf: &mut Vec<u8>, pa: u64, val: u64| {
+        let off = pa as usize;
+        buf[off..off + 8].copy_from_slice(&val.to_ne_bytes());
+    };
+    // smap: bucket_log = 0 (one bucket) and buckets pointer.
+    write_u32(&mut buf, smap_pa + ts.smap_bucket_log as u64, 0);
+    write_u64(
+        &mut buf,
+        smap_pa + ts.smap_buckets as u64,
+        pa_to_kva(buckets_pa, page_offset),
+    );
+    // Bucket 0 head -> first elem KVA.
+    write_u64(
+        &mut buf,
+        buckets_pa + ts.bucket_list as u64 + ts.hlist_head_first as u64,
+        pa_to_kva(elems_start, page_offset),
+    );
+    for idx in 0..n_elems {
+        let elem_pa = elems_start + (idx as u64) * elem_stride;
+        // Chain link at offset 0; NULL terminates the regular hlist.
+        let next = if idx + 1 < n_elems {
+            pa_to_kva(elems_start + ((idx + 1) as u64) * elem_stride, page_offset)
+        } else {
+            0u64 // regular hlist NULL termination (NOT hlist_nulls)
+        };
+        write_u64(&mut buf, elem_pa + ts.hlist_node_next as u64, next);
+        // Value bytes at elem + elem_sdata + sdata_data.
+        let value_off = elem_pa + ts.elem_sdata as u64 + ts.sdata_data as u64;
+        write_u32(&mut buf, value_off, idx as u32);
+        // bpf_local_storage container with a distinct owner KVA.
+        let ls_pa = ls_start + (idx as u64) * ls_stride;
+        write_u64(
+            &mut buf,
+            ls_pa + ts.ls_owner as u64,
+            0xFFFF_8000_0000_0000 + idx as u64,
+        );
+        write_u64(
+            &mut buf,
+            elem_pa + ts.elem_local_storage as u64,
+            pa_to_kva(ls_pa, page_offset),
+        );
+    }
+    // SAFETY: buf is a live local Vec<u8> outliving the GuestMem use.
+    let mem =
+        unsafe { super::super::reader::GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
+    let kernel = super::super::guest::GuestKernel::new_for_test(
+        std::sync::Arc::new(mem),
+        std::collections::HashMap::new(),
+        page_offset,
+        0,
+        false,
+    );
+    let kernel_ref = unsafe { &*(&kernel as *const _) };
+    let mut offsets = crate::monitor::btf_offsets::BpfMapOffsets::EMPTY;
+    offsets.task_storage_offsets = Some(ts);
+    let accessor =
+        super::super::bpf_map::GuestMemMapAccessor::new_for_test(kernel_ref, &offsets, 0);
+    let (name_bytes, name_len) = name_from_str("test_task_storage");
+    let info = super::super::bpf_map::BpfMapInfo {
+        map_pa: 0,
+        map_kva: pa_to_kva(smap_pa, page_offset),
+        name_bytes,
+        name_len,
+        map_type: super::super::bpf_map::BPF_MAP_TYPE_TASK_STORAGE,
+        map_flags: 0,
+        key_size: 0,
+        value_size,
+        max_entries: 0,
+        value_kva: None,
+        btf_kva: 0,
+        btf_value_type_id: 0,
+        btf_vmlinux_value_type_id: 0,
+        btf_key_type_id: 0,
+    };
+    let arena_page_index = super::render_map::ArenaPageIndex::new();
+    let sdt_alloc_metas: Vec<super::render_map::SdtAllocMeta> = Vec::new();
+    let ctx = super::render_map::RenderMapCtx {
+        accessor: &accessor,
+        btf: None,
+        num_cpus: 1,
+        arena_offsets: None,
+        shared_arena: None,
+        arena_page_index: &arena_page_index,
+        sdt_alloc_metas: &sdt_alloc_metas,
+        cast_map: None,
+        arena_slot_index: None,
+        cross_btf_fwd_index: None,
+        scx_static_index: None,
+        alloc_size_types: &[],
+        rendered_slot_addrs: None,
+    };
+    let rendered = super::render_map::render_map(&ctx, &info);
+    assert_eq!(
+        rendered.entries.len(),
+        MAX_HASH_ENTRIES,
+        "render must clamp the local_storage entry vec to MAX_HASH_ENTRIES"
+    );
+    let err = rendered
+        .error
+        .expect("over-cap local_storage must surface a truncation error");
+    assert_eq!(
+        err,
+        format!("local_storage map truncated at {MAX_HASH_ENTRIES} entries"),
+        "local_storage truncation error must match the production format exactly; got: {err}"
     );
 }
 

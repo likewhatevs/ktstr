@@ -54,7 +54,7 @@ jobs:
         with:
           tool: cargo-nextest
       - name: Install ktstr
-        run: cargo install --path . --locked
+        run: cargo install --path . --locked --features remote-cache
       - name: Cache kernel images
         uses: actions/cache@v5
         with:
@@ -84,7 +84,7 @@ strategy:
 steps:
   # ...
   - name: Install ktstr
-    run: cargo install --path . --locked
+    run: cargo install --path . --locked --features remote-cache
   - name: Build test kernel
     run: cargo ktstr kernel build ${{ matrix.kernel-version }}
   - run: cargo ktstr test --kernel ${{ matrix.kernel-version }} -- --profile ci --features integration
@@ -112,7 +112,11 @@ on `hashFiles('ktstr.kconfig')` so kconfig changes trigger a rebuild.
 
 Set `KTSTR_GHA_CACHE=1` to enable a remote cache layer that shares
 kernels across jobs and workflow runs. Remote failures are non-fatal;
-local cache is authoritative.
+local cache is authoritative. `KTSTR_GHA_CACHE=1` only takes effect
+when ktstr is installed with `--features remote-cache` (off by
+default); without that feature the remote layer is compiled out and
+the variable is a no-op — so the install steps above use
+`cargo install --path . --locked --features remote-cache`.
 
 ## Budget-based test selection
 
@@ -144,7 +148,7 @@ coverage:
       with:
         tool: cargo-llvm-cov,cargo-nextest
     - name: Install ktstr
-      run: cargo install --path . --locked
+      run: cargo install --path . --locked --features remote-cache
     - name: Cache kernel images
       uses: actions/cache@v5
       with:
@@ -172,7 +176,7 @@ Collect test statistics after the test run:
 ```
 
 `stats` reads sidecar JSON files from `target/ktstr/`
-and prints gauntlet analysis, BPF verifier stats, callback profiles,
+and prints gauntlet analysis, BPF verifier stats, callback profile,
 and KVM stats. The `if: !cancelled()` condition ensures stats are
 collected even on test failure. See
 [cargo-ktstr stats](running-tests/cargo-ktstr.md#stats) for
@@ -186,10 +190,12 @@ above and apply these differences:
 - Runner labels: `[ktstr-arm64]` (or your aarch64 self-hosted pool labels)
   (adjust to match your runner pool).
 - Cache key prefix: `arm64` instead of `x64`.
-- `sccache` must be installed on every runner the workflow targets
-  (x64 and arm64). The workflow's global `RUSTC_WRAPPER=sccache`
-  applies to every job; a runner without `sccache` on `$PATH`
-  fails the first cargo invocation.
+- If your workflow sets a global `RUSTC_WRAPPER=sccache` (as this
+  repo's own CI does), `sccache` must be on `$PATH` on every targeted
+  runner — x64 and arm64 alike — or the first cargo invocation fails.
+  This is not arm64-specific; the example workflows above set no
+  `RUSTC_WRAPPER`, so add one (and install `sccache`) only if you want
+  compile caching.
 
 ## Performance mode
 
@@ -220,7 +226,7 @@ The workspace ships a `ci` nextest profile in `.config/nextest.toml`.
 Compared to the default profile, it raises the slow-timeout
 period from 60s to 90s (`slow-timeout.period = "90s"`), raises
 the termination threshold from 2 to 3 cycles
-(`terminate-after = 3`), bumps `retries.count` from 5 to 30,
+(`terminate-after = 3`), bumps `retries.count` from 5 to 6,
 defers per-test output until the run completes
 (`failure-output = "final"`), and continues past failures
 (`fail-fast = false`). Use it with `--profile ci`.

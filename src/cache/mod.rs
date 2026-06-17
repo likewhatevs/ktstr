@@ -71,6 +71,10 @@ pub use crate::kernel_path::KernelId;
 pub(crate) use resolve::{
     path_inside_cache_root, resolve_cache_root_with_suffix, resolve_lock_dir,
 };
+// Durable-publish primitives shared by both cache layers
+// (cache_dir::CacheDir::store and vmm/disk_template::store_atomic) so
+// the two stay consistent — see fsync_staging_dir's contract.
+pub(crate) use housekeeping::{fsync_parent, fsync_staging_dir};
 // Re-exported for rustdoc cross-link resolution (cache/mod.rs:31's
 // `[`strip_vmlinux_debug`]` link). No `crate::cache::strip_vmlinux_debug`
 // code call sites today; intra-cache callers (cache_dir.rs, tests)

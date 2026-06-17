@@ -182,9 +182,10 @@ values.
 
 The top-level `CtprofSnapshot` also embeds a `HostContext`
 (the same structure `show-host` prints — kernel, CPU, memory,
-sched_\* tunables, cmdline). Older tools or synthetic fixtures
-that omit the context render `(host context unavailable)` rather
-than failing the compare.
+sched_\* tunables, cmdline) for round-trip/tooling use. The `compare`
+diff output does not render the embedded host context, so a snapshot
+that omits it is simply absent from the output rather than failing the
+compare.
 
 ### Cgroup namespace caveat
 
@@ -259,10 +260,10 @@ doesn't expose this" from "every tid raced exit" from
 | `cpu_delay_*` | `tsk->sched_info.{pcount,run_delay}` via `delayacct_add_tsk` (`kernel/delayacct.c`) | Time waiting on the runqueue. **RACY**: count + total are not updated atomically (lockless `sched_info` path); a concurrent reader may observe one ahead of the other. Captures the same wait-for-CPU bucket as schedstat `wait_*` via a different code path. |
 | `blkio_delay_*` | `delayacct_blkio_start` / `_end` (`kernel/delayacct.c`) | Synchronous block I/O wait. Updates serialize through `task->delays->lock` so count + total are atomic (unlike `cpu_*`). The canonical delay-accounting block-I/O reading; distinct from schedstat `iowait_sum`. |
 | `swapin_delay_*` | `delayacct_swapin_start` / `_end` (`include/linux/delayacct.h`) | Swap-in wait. **OVERLAPS** with `thrashing_*` — every thrashing event is also a swapin event from the syscall layer; do not sum the two. |
-| `freepages_delay_*` | `delayacct_freepages_start` / `_end` (`mm/page_alloc.c`) | Direct memory reclaim wait. |
-| `thrashing_delay_*` | `delayacct_thrashing_start` / `_end` (`mm/workingset.c`) | Thrashing wait. Refines swapin tracking — see `swapin_*`. |
-| `compact_delay_*` | `delayacct_compact_start` / `_end` (`mm/compaction.c`) | Memory-compaction wait. |
-| `wpcopy_delay_*` | `delayacct_wpcopy_start` / `_end` (`mm/memory.c`) | Write-protect-copy (CoW) fault wait. Introduced in taskstats v13. |
+| `freepages_delay_*` | `delayacct_freepages_start` / `_end` (called from `mm/vmscan.c`; impl in `kernel/delayacct.c`) | Direct memory reclaim wait. |
+| `thrashing_delay_*` | `delayacct_thrashing_start` / `_end` (called from `mm/filemap.c` and `mm/page_io.c`; impl in `kernel/delayacct.c`) | Thrashing wait. Refines swapin tracking — see `swapin_*`. |
+| `compact_delay_*` | `delayacct_compact_start` / `_end` (called from `mm/page_alloc.c`; impl in `kernel/delayacct.c`) | Memory-compaction wait. |
+| `wpcopy_delay_*` | `delayacct_wpcopy_start` / `_end` (called from `mm/memory.c` and `mm/hugetlb.c`; impl in `kernel/delayacct.c`) | Write-protect-copy (CoW) fault wait. Introduced in taskstats v13. |
 | `irq_delay_*` | `delayacct_irq` (`kernel/delayacct.c`) | IRQ-handler windows charged to the task by IRQ accounting. Introduced in taskstats v14. |
 
 Each category has four fields:
@@ -290,16 +291,25 @@ shared-mm semantics.
 ktstr ctprof compare before.ctprof.zst after.ctprof.zst
 ```
 
-`compare` joins the two snapshots on `pcomm` (process name) by
-default — see [Grouping](#grouping) for the other axes —
-and emits one row per `(group, metric)` pair. Groups present
+`compare` defaults to `--group-by all`, which runs all three
+pattern-aware axes (cgroup → pcomm → comm) and renders each as its own
+labeled `## Primary metrics` block — see [Grouping](#grouping) for the
+individual axes — and emits one row per `(group, metric)` pair within
+each block. Groups present
 on only one side surface as **unmatched** — a row is missing
 because the process did not exist, not because it did zero work.
 
 ### Grouping
 
-- `--group-by pcomm` (default) — aggregate every thread of the
-  same process together.
+- `--group-by all` (default for `compare`) — run all three
+  pattern-aware axes (`cgroup` → `pcomm` → `comm`), each rendered as
+  its own labeled `## Primary metrics` block, independently truncated
+  by `--limit`. Under `all`, cgroup-rename fudging also activates:
+  cgroup pairs with renamed-but-identical thread populations are joined
+  for diffing rather than surfacing as orphans (rendered with a
+  `[fudged: <leaf>]` marker and a `## Fudged cgroup matches` section).
+- `--group-by pcomm` (default for `show`) — aggregate every thread of
+  the same process together.
 - `--group-by cgroup` — aggregate by cgroup path. Useful for
   container-per-workload deployments where the process name is
   ambiguous across cgroups.
@@ -476,9 +486,6 @@ Heterogeneous groups render as `"N-M cpus (mixed)"`. Unlike the
 other rules, `Affinity` does not route through a
 `metric_types` trait — its reduction produces a structured
 summary, not a homogeneous newtype.
-
-[`metric_types`]: https://likewhatevs.github.io/ktstr/api/ktstr/metric_types/index.html
-[`PeakNs`]: https://likewhatevs.github.io/ktstr/api/ktstr/metric_types/struct.PeakNs.html
 
 ### Derived metrics
 

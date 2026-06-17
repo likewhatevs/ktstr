@@ -24,8 +24,8 @@ belong to a NUMA node. The render is `{numa}n{llcs}l{cores}c{threads}t`
 where `llcs` is the **total** count across the VM. So `2n4l4c2t`
 describes 2 NUMA nodes with a total of 4 LLCs (2 LLCs/node), 4
 cores per LLC, 2 threads per core = 2 × 4 × 2 = 16 vCPUs per node ×
-2 nodes = 64 vCPUs total. A smaller worked example: `1n2l4c2t` is
-1 × 2 × 4 × 2 = 16 vCPUs.
+2 nodes = 32 vCPUs total (4 LLCs × 4 cores × 2 threads = 32). A
+smaller worked example: `1n2l4c2t` is 1 × 2 × 4 × 2 = 16 vCPUs.
 
 Most tests use a single NUMA node (the default). NUMA matters when a
 scheduler makes placement decisions based on memory locality.
@@ -207,7 +207,7 @@ Two standalone functions parse CPU list strings:
 silently skips invalid entries.
 
 See also: [CgroupManager](../architecture/cgroup-manager.md) for
-`set_cpuset()` which consumes cpuset strings,
+`set_cpuset()` which writes a cgroup cpuset from a `BTreeSet<usize>`,
 [CgroupGroup](../architecture/cgroup-group.md) for RAII cgroup
 management, [WorkloadHandle](../architecture/workload-handle.md) for
 worker lifecycle, [Scenarios](scenarios.md) for how `CpusetSpec`

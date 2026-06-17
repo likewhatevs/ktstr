@@ -3,8 +3,8 @@
 `WorkType` controls what each worker process does during a scenario.
 
 The `WorkType` enum in `ktstr::workload` is the source of truth.
-The variants below are grouped by intent; each one-line summary is
-the leading sentence of the variant's rustdoc. Run `cargo doc --open`
+The variants below are grouped by intent; each one-line summary
+paraphrases the variant's rustdoc. Run `cargo doc --open`
 for full per-variant semantics, parameter ranges, and kernel-path
 citations — this page reproduces only the high-level shape.
 
@@ -14,7 +14,7 @@ pub enum WorkType {
     SpinWait,                            // Tight CPU spin loop (1024 iterations per cycle).
     YieldHeavy,                          // Repeated sched_yield with minimal CPU work.
     Mixed,                               // CPU spin burst followed by sched_yield.
-    AluHot { width: AluWidth },          // Dependent integer multiply chain at high IPC (>= 2.0); optional SIMD width.
+    AluHot { width: AluWidth },          // Independent multiply chains (four parallel streams) at high IPC (>= 2.0); optional SIMD width.
     SmtSiblingSpin,                      // Tight PAUSE-spin from a paired worker pinned to two SMT siblings.
     IpcVariance {                        // Alternating high-IPC (multiplies) / low-IPC (random cache touches) phases.
         hot_iters: u64,
@@ -81,6 +81,7 @@ pub enum WorkType {
     ForkExit,                                           // Rapid fork+_exit cycling; parent waitpid's then repeats.
     NiceSweep,                                          // Cycle nice level from -20 to 19 across iterations.
     AffinityChurn { spin_iters: u64 },                  // Rapid self-directed sched_setaffinity to random CPUs.
+    CrossAffinityChurn { spin_iters: u64 },             // Rapid cross-task (sibling) sched_setaffinity churn.
     PolicyChurn { spin_iters: u64 },                    // Cycle SCHED_OTHER -> BATCH -> IDLE (-> FIFO/RR if CAP_SYS_NICE).
     NumaMigrationChurn { period_ms: u64 },              // Rotate sched_setaffinity across NUMA nodes.
     CgroupChurn { groups: usize, cycle_ms: u64 },       // Cycle cgroup membership between sibling cgroups.
@@ -139,7 +140,7 @@ pub enum WorkType {
     // User-supplied
     Custom {                                            // User-supplied work function (name + fn pointer).
         name: String,
-        run: fn(&AtomicBool) -> WorkerReport,
+        run: CustomFn,                                  // newtype over fn(&WorkerCtx) -> WorkerReport
     },
 }
 ```
@@ -172,10 +173,11 @@ and parameter validation rules.
 (humantime-serialised in captured configs) — pass
 `Duration::from_millis(N)` or
 `Duration::from_micros(N)` from `std::time` rather than raw integers.
-`IpcVariance`, `ProducerConsumerImbalance`, `RtStarvation`,
-`PriorityInversion`, `EpollStorm`, `PreemptStorm`, and
-`ThunderingHerd` reject zero-valued counters at spawn time
-(`WorkTypeValidationError::*`).
+`IdleChurn` (burst/sleep durations) and `IpcVariance` (hot/cold/period
+iters) reject zero-valued parameters at spawn time
+(`WorkTypeValidationError::ZeroBurstDuration` / `ZeroSleepDuration` /
+`ZeroIpcVarianceParam`); `IpcVariance` also rejects at construction
+time via `WorkType::ipc_variance`.
 
 ## Choosing a work type
 
@@ -192,6 +194,7 @@ and parameter validation rules.
 | Task creation/destruction pressure | `ForkExit` |
 | Priority reweighting / nice dynamics | `NiceSweep` |
 | Rapid CPU migration / affinity churn | `AffinityChurn` |
+| Cross-task (sibling) affinity churn | `CrossAffinityChurn` |
 | Scheduling class transitions | `PolicyChurn` |
 | Page fault / TLB pressure | `PageFaultChurn` |
 | Lock contention / convoy effect | `MutexContention` |
@@ -270,7 +273,7 @@ working set (three square matrices of u64, O(n^3)). Requires
 
 **`Sequence`** -- compound work pattern: loop through phases in order,
 repeat. Each phase runs for its specified duration before the next
-starts. Phases are defined via the `Phase` enum:
+starts. Phases are defined via the `WorkPhase` enum:
 
 - `WorkPhase::Spin(Duration)` -- CPU spin for the given duration.
 - `WorkPhase::Sleep(Duration)` -- `thread::sleep` for the given duration.
@@ -309,6 +312,12 @@ from the effective cpuset, then `sched_yield`. Exercises
 `affine_move_task` and `migration_cpu_stop`. Records per-yield wake
 latency.
 
+**`CrossAffinityChurn`** -- like `AffinityChurn`, but each worker
+rewrites its cgroup-SIBLINGS' affinity (not its own) via
+`sched_setaffinity`, then `sched_yield`. Must run in a dedicated
+`CgroupDef` so it only churns its own group's workers; records
+per-yield wake latency.
+
 **`PolicyChurn`** -- cycles through scheduling policies each iteration.
 Each iteration: `spin_iters` spin burst, `sched_setscheduler` to the
 next policy in the sequence, then `sched_yield`. Cycles through
@@ -335,8 +344,10 @@ lock-holder preemption cascading stalls, and futex wait/wake
 contention paths. Requires `num_workers` divisible by `contenders`.
 
 **`Custom`** -- user-supplied work function. The `run` function pointer
-receives a reference to the stop flag (`&AtomicBool`, set by SIGUSR1)
-and returns a `WorkerReport` when the flag becomes `true`. The
+receives a `&WorkerCtx` (exposing the stop flag via `ctx.stop()` — a
+`&AtomicBool` set by SIGUSR1 in `CloneMode::Fork` — plus `ctx.cpus()`
+and `ctx.sibling_pids()`) and returns a `WorkerReport` when the stop
+flag becomes `true`. The
 framework handles fork, cgroup placement, affinity, scheduling policy,
 and signal setup; the user function owns the work loop and all
 `WorkerReport` field population. Framework telemetry (migration
@@ -358,15 +369,15 @@ worker must either detach it from the worker's pgid (call
 `setpgid(child_pid, 0)` after fork) or wait on it explicitly
 before returning the `WorkerReport`.
 
-Function pointers (`fn(&AtomicBool) -> WorkerReport`) are fork-safe
+Function pointers (`fn(&WorkerCtx) -> WorkerReport`) are fork-safe
 because they carry no captured state across the fork boundary. Closures
 are not supported. Cannot be constructed via `WorkType::from_name()`.
 
 ```rust,ignore
-use std::sync::atomic::{AtomicBool, Ordering};
-use ktstr::workload::{WorkType, WorkerReport};
+use std::sync::atomic::Ordering;
+use ktstr::workload::{WorkType, WorkerCtx, WorkerReport};
 
-fn my_workload(stop: &AtomicBool) -> WorkerReport {
+fn my_workload(ctx: &WorkerCtx) -> WorkerReport {
     // `tid` in `WorkerReport` is an `i32` (libc::pid_t). Using
     // `std::process::id() as i32` avoids a direct `libc` dependency in
     // the consumer crate; inside ktstr the two produce the same value
@@ -374,7 +385,7 @@ fn my_workload(stop: &AtomicBool) -> WorkerReport {
     let tid: i32 = std::process::id() as i32;
     let start = std::time::Instant::now();
     let mut work_units = 0u64;
-    while !stop.load(Ordering::Relaxed) {
+    while !ctx.stop().load(Ordering::Relaxed) {
         // ... custom work ...
         work_units += 1;
     }
@@ -452,14 +463,11 @@ is per-task, not per-tgid.
 
 `WorkType::from_name()` resolves each parameterised variant to a
 default instance via the constants in the `ktstr::workload::defaults`
-module (one `pub const` per variant — `BURSTY`, `PIPE_IO`,
-`FUTEX_PING_PONG`, `CACHE_PRESSURE`, `CACHE_YIELD`, `CACHE_PIPE`,
-`FUTEX_FAN_OUT`, `AFFINITY_CHURN`, `POLICY_CHURN`, `FAN_OUT_COMPUTE`,
-`PAGE_FAULT_CHURN`, `MUTEX_CONTENTION`, `THUNDERING_HERD`,
-`PRIORITY_INVERSION`, `PRODUCER_CONSUMER`, `RT_STARVATION`,
-`ASYMMETRIC_WAKER`, `WAKE_CHAIN`, `NUMA_WORKING_SET_SWEEP`,
-`CGROUP_CHURN`, `SIGNAL_STORM`, `PREEMPT_STORM`, `EPOLL_STORM`,
-`NUMA_MIGRATION_CHURN`, `IDLE_CHURN`, `ALU_HOT`, `IPC_VARIANCE`, …).
+module (one `pub const` per parameter, named `{VARIANT}_{FIELD}` —
+e.g. `BURSTY_BURST_DURATION` + `BURSTY_SLEEP_DURATION`,
+`CACHE_PRESSURE_SIZE_KIB` + `CACHE_PRESSURE_STRIDE`,
+`MUTEX_CONTENTION_CONTENDERS`, and the four `FAN_OUT_COMPUTE_*`
+knobs, …).
 A few representative defaults are shown below; see the
 `defaults` module rustdoc for the authoritative per-variant values.
 
@@ -472,6 +480,7 @@ A few representative defaults are shown below; see the
 - `FutexFanOut`: `fan_out=4`, `spin_iters=1024`
 - `FanOutCompute`: `fan_out=4`, `cache_footprint_kib=256`, `operations=5`, `sleep_usec=100`
 - `AffinityChurn`: `spin_iters=1024`
+- `CrossAffinityChurn`: `spin_iters=1024`
 - `PolicyChurn`: `spin_iters=1024`
 - `PageFaultChurn`: `region_kib=4096`, `touches_per_cycle=256`, `spin_iters=64`
 - `MutexContention`: `contenders=4`, `hold_iters=256`, `work_iters=1024`
@@ -559,14 +568,18 @@ validate at construction time.
 
 ## Overriding work types
 
-The work type override (configured via gauntlet or
-`Ctx.work_type_override`) replaces the default `SpinWait` work type
-for all scenarios that use it. Scenarios with non-`SpinWait` work types
-are not overridden.
+The work-type override (gauntlet `--ktstr-work-type=NAME`, exposed as
+`Ctx.work_type_override`) replaces a WorkSpec's work type only when
+that WorkSpec's owning `CgroupDef` is marked `swappable(true)`
+(default false), and only when the override's group size divides
+`num_workers`. Non-swappable WorkSpecs keep their declared work type
+regardless of what it is — there is no `SpinWait`-specific path.
 
 Overrides to grouped work types (`PipeIo`, `FutexPingPong`,
-`CachePipe`, `FutexFanOut`, `FanOutCompute`, `MutexContention`) are skipped
-when `num_workers` is not divisible by the work type's group size.
+`CachePipe`, `FutexFanOut`, `FanOutCompute`, `MutexContention`) are
+skipped when `num_workers` is not divisible by the work type's group
+size.
 
-Ops-based scenarios have a separate override mechanism via
-`CgroupDef.swappable`. See [Ops and Steps](ops.md#workspec-type-overrides-and-swappable).
+`swappable` is the single override mechanism for both `#[ktstr_test]`
+and ops-based scenarios. See
+[Ops and Steps](ops.md#workspec-type-overrides-and-swappable).

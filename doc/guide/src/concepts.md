@@ -28,7 +28,7 @@ Five supporting concepts complete the picture:
 - [TestTopology](concepts/topology.md) — CPU and LLC layout for
   cpuset partitioning.
 - [MemPolicy](concepts/mem-policy.md) — per-cgroup NUMA memory
-  policy (Bind / Preferred / Interleave / WeightedInterleave) for
+  policy (Bind, Interleave, WeightedInterleave, and more) for
   tests that exercise the memory policy subsystem.
 - [Performance Mode](concepts/performance-mode.md) — host-side
   isolation for noise-sensitive measurements.

@@ -138,8 +138,15 @@ the consecutive-timeout count, so a sustained host overload does
 not pile up dozens of placeholder samples.
 
 **Boundary deferral on missing prereqs.** Each periodic boundary
-also gates on `kern_virt_kaslr_published() && owned_accessor.is_some()`
-(the same prerequisites the cold-path ColdOp dispatch enforces).
+gates on three conditions:
+`kern_virt_kaslr_published() && owned_accessor.is_some() &&
+owned_prog_accessor.is_some()`. The `owned_prog_accessor` is an EXTRA
+prerequisite beyond the cold-path ColdOp dispatch (which gates only on
+kaslr-published + `owned_accessor`): the periodic dump's struct_ops
+walker needs the prog accessor to attribute the active scheduler
+across same-binary swaps, so a boundary firing before
+`owned_prog_accessor` adopts would emit a report with empty
+`active_map_kvas` and surface `NoActiveScheduler`.
 Under KASLR-on guests (the default) a boundary that would fire
 before the BSP MSR_LSTAR derive / guest-channel KERN_ADDRS publish
 lands is **deferred** to the next outer-loop iteration so the dump
@@ -191,7 +198,10 @@ fn my_test(ctx: &Ctx) -> Result<AssertResult> {
 `drain_ordered_with_stats` returns a `Vec<DrainedSnapshotEntry>` in
 the order `store()` saw inserts. Each entry exposes `tag` (`String`),
 `report` (`FailureDumpReport`), `stats` (`Result<serde_json::Value,
-MissingStatsReason>`), `elapsed_ms` (`Option<u64>`), and `step_index`
+MissingStatsReason>`), `elapsed_ms` (`Option<u64>`),
+`boundary_offset_ms` (`Option<u64>` — the workload-relative boundary
+offset, `None` for non-periodic / on-demand captures, used by the
+phase-bucket aggregator), and `step_index`
 (`Option<u16>` — the phase stamp, 0 = baseline, 1.. = step ordinal).
 Periodic boundaries land `periodic_000` first, `periodic_NNN` last.
 The FIFO eviction at `MAX_STORED_SNAPSHOTS` drops the oldest tags
@@ -240,8 +250,8 @@ wired (`scheduler_binary` is absent → `NoSchedulerBinary`), or the
 per-sample stats request failed (relay rejected, non-zero envelope
 errno, scheduler not yet listening). An `Err` slot surfaces through
 [`SampleSeries::stats`](temporal-assertions.md#projecting-from-scx_stats-json) as a
-`SnapshotError::MissingStats { tag }` per-sample error — distinct
-from in-JSON path misses so the assertion site can branch on the
+`SnapshotError::MissingStats { tag, reason }` per-sample error —
+distinct from in-JSON path misses so the assertion site can branch on the
 cause.
 
 A sample whose underlying `FailureDumpReport` is a placeholder

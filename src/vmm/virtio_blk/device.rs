@@ -11,17 +11,21 @@
 //! caveat — lives there.
 
 pub(crate) use std::fs::File;
-// `AsRawFd` is required by the vectored read/write helpers below
-// to extract the raw fd for `libc::preadv` / `libc::pwritev`. The
-// `worker.rs` consumer separately re-uses it (cfg(not(test)) only)
-// for `EventFd::write` accounting; we hoist it to unconditional
-// import so the vectored helpers compile in both `cfg(test)` and
-// production.
+// `AsRawFd` for the eventfd raw-fd plumbing (stop_fd / kick_fd
+// `as_raw_fd` in the worker-engine drop and respawn paths), which is
+// `cfg(not(test))` (the test build uses the inline engine and has no
+// worker fds). The backing's vectored IO no longer needs it — that
+// routes through the `Backing` trait's `preadv`/`pwritev` (the
+// impl-for-File holds the `as_raw_fd` call) rather than a raw fd at
+// the call site.
+#[cfg(not(test))]
 pub(crate) use std::os::unix::io::AsRawFd;
 pub(crate) use std::sync::Arc;
 pub(crate) use std::sync::OnceLock;
 pub(crate) use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::mpsc;
+// `std::thread` is used only by the `#[cfg(not(test))]` SpawnedEngine handle;
+// the worker spawn/join + mpsc moved with control.rs/lifecycle.rs.
+#[cfg(not(test))]
 use std::thread;
 pub(crate) use std::time::Duration;
 
@@ -71,6 +75,7 @@ pub(crate) use vm_memory::{ByteValued, Bytes, GuestAddress, GuestMemory, GuestMe
 // `VirtioBlkCounters` lives in `counters.rs`; reach it via `super::*`
 // (sourced from `mod.rs`'s `pub(crate) use counters::*;`).
 use super::VirtioBlkCounters;
+use super::{Backing, advance_iovecs};
 // `EpollEvent` / `EventSet` are re-exported because tests for the
 // always-compiled `worker_dispatch_event` helper construct EventSet
 // values directly via `super::*`, and the helper itself accepts an
@@ -152,6 +157,31 @@ pub(crate) const VIRTIO_BLK_SEG_MAX: u32 = 128;
 /// 512 KiB). Without `F_SIZE_MAX` the guest treats per-descriptor
 /// length as unbounded — host OOM hazard on a hostile guest.
 pub(crate) const VIRTIO_BLK_SIZE_MAX: u32 = 1 << 20;
+
+/// Linux's maximum iovec count (`UIO_MAXIOV`) for a single
+/// `preadv`/`pwritev`: passing `iovcnt > IOV_MAX` returns `EINVAL`.
+/// The vectored-IO paths build at most `SEG_MAX * 2 = 256` iovecs
+/// (see the SAFETY comments at the preadv/pwritev sites for the
+/// structural derivation), well under this cap; the `debug_assert`s
+/// there trip in test/debug builds if a future change ever breaks
+/// that bound.
+const IOV_MAX: usize = 1024;
+
+/// Cap on consecutive `EINTR` re-issues of a single blk vectored IO
+/// (`preadv`/`pwritev`) before giving up with `S_IOERR`. `EINTR` on a
+/// buffered regular-file path implies a PENDING FATAL signal (the
+/// wait is `TASK_KILLABLE`, so only `SIGKILL`/group-exit interrupts),
+/// which does NOT clear — an unbounded retry would spin until the task
+/// is reaped, delaying the freeze-rendezvous failure dump. 16 is
+/// generous for any (rare) catchable-signal case while bounding the
+/// fatal-signal spin to a handful of iterations.
+///
+/// Divergence (we get this right): firecracker / vm-memory's
+/// `retry_eintr!` loops on `EINTR` UNBOUNDED — on a pending fatal
+/// signal that is a latent spin. We bound it: a spinning IO thread
+/// delays the freeze-rendezvous dump (the project's vCPU-blocking
+/// budget).
+const MAX_EINTR_RETRIES: u32 = 16;
 
 /// Device serial number returned by `VIRTIO_BLK_T_GET_ID`. Per
 /// virtio-v1.2 §5.2.6.4 (and `virtio_blk.h` `VIRTIO_BLK_ID_BYTES`)
@@ -318,8 +348,6 @@ pub(crate) const S_OK: u32 = S_FEAT | VIRTIO_CONFIG_S_DRIVER_OK;
 // rather than scattered through the device + worker code. See
 // `throttle.rs` for the full type-level rationale.
 use super::throttle::*;
-#[cfg(not(test))]
-use super::worker::worker_thread_main;
 
 /// Publish a chain completion: write the status byte and, on
 /// success, mark the chain used. Returns `true` if the device
@@ -421,7 +449,7 @@ pub(crate) fn publish_completion<Q: QueueT>(
 pub(crate) struct BlkWorkerState {
     /// Backing file. The worker reads and writes sectors via
     /// `pread`/`pwrite` and never inspects the on-disk contents.
-    pub(crate) backing: File,
+    pub(crate) backing: Box<dyn Backing>,
     /// Token-bucket for ops/sec.
     pub(crate) ops_bucket: TokenBucket,
     /// Token-bucket for bytes/sec.
@@ -902,7 +930,11 @@ impl VirtioBlk {
         let counters = Arc::new(VirtioBlkCounters::default());
 
         let state = BlkWorkerState {
-            backing,
+            // Wrap the production `File` in the `Backing` seam (unsizing
+            // coercion `Box<File>` -> `Box<dyn Backing>`). Tests swap
+            // `state.backing` for a fault-injecting mock to exercise
+            // the write retry / IOERR paths a real File rarely hits.
+            backing: Box::new(backing),
             ops_bucket,
             bytes_bucket,
             all_descs_scratch: Vec::with_capacity(VIRTIO_BLK_SEG_MAX as usize + 2),
@@ -1232,14 +1264,12 @@ impl VirtioBlk {
     /// scratch→guest) into one syscall reading directly into guest
     /// memory.
     ///
-    /// Mirrors the cloud-hypervisor `block::Request::execute_async`
-    /// vectored read path
-    /// (cloud-hypervisor/block/src/lib.rs `iovecs.push(...)` then
-    /// `read_vectored`): one iovec per `VolatileSlice` produced by
-    /// `mem.get_slices(addr, len)`. `get_slices` handles fragmentation
-    /// when a descriptor's `[addr, addr+len)` range spans a guest
-    /// memory region boundary — each contiguous host range becomes
-    /// its own iovec entry.
+    /// Mirrors cloud-hypervisor's `block::Request::execute_async`
+    /// vectored read path: one iovec per `VolatileSlice` produced by
+    /// `mem.get_slices(addr, len)`, then a single vectored read.
+    /// `get_slices` handles fragmentation when a descriptor's
+    /// `[addr, addr+len)` range spans a guest memory region boundary —
+    /// each contiguous host range becomes its own iovec entry.
     ///
     /// `data_len` and `sector` are pre-validated by the caller
     /// (`drain_bracket_impl`): SIZE_MAX, SEG_MAX, sub-sector,
@@ -1276,7 +1306,7 @@ impl VirtioBlk {
     /// can hold a concurrent mutable borrow of the queues vec.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn handle_read_vectored_impl(
-        backing: &File,
+        backing: &dyn Backing,
         capacity_bytes: u64,
         counters: &VirtioBlkCounters,
         mem: &GuestMemoryMmap,
@@ -1364,6 +1394,18 @@ impl VirtioBlk {
             }
         }
 
+        // Tripwire for the structural iovec-count bound derived in the
+        // SAFETY comment below (SEG_MAX * 2 = 256 <= IOV_MAX). Debug-
+        // only (zero release cost); a future change that broke the
+        // bound trips the proptest fuzzers here instead of surfacing as
+        // a runtime `preadv` EINVAL.
+        debug_assert!(
+            iovecs.len() <= IOV_MAX,
+            "blk preadv iovcnt {} exceeds IOV_MAX {} — structural bound broke (see SAFETY comment)",
+            iovecs.len(),
+            IOV_MAX,
+        );
+
         // Empty iovec means data_len == 0 — every data descriptor in
         // the chain had len == 0. The upstream zero-data gate in
         // drain.rs gates on `data_segments.is_empty()`, NOT on
@@ -1382,44 +1424,90 @@ impl VirtioBlk {
             // a `VolatileSlice` produced by `mem.get_slices(...)`
             // and the corresponding `PtrGuardMut` is alive in
             // `_guards` for the duration of this call, keeping the
-            // backing pointer valid). `backing.as_raw_fd()` borrows
-            // the `File` which the caller (`drain_bracket_impl`)
-            // owns for the duration of the drain.
+            // backing pointer valid) — this upholds the
+            // `Backing::preadv` precondition that each `iov_base` is
+            // valid for `iov_len` bytes across the call. The backing
+            // (`&dyn Backing`) is borrowed from the `BlkWorkerState`
+            // the caller (`drain_bracket_impl`) owns for the drain.
             //
-            // `iovecs.len()` upper bound: `data_segments` has at
-            // most `VIRTIO_BLK_SEG_MAX` (128) entries (enforced
-            // upstream in drain.rs); `mem.get_slices(addr, len)`
-            // can return MULTIPLE slices per descriptor when its
-            // `[addr, addr+len)` range crosses one or more
-            // `GuestMemoryMmap` region boundaries. With multi-region
-            // guest memory each segment can fragment into K slices
-            // (K bounded by the number of regions the segment spans).
-            // The realistic worst case is well under `IOV_MAX = 1024`
-            // (Linux): a 1 MiB SIZE_MAX descriptor over typical
-            // GiB-scale regions produces 1 slice, and even a
-            // pathological boundary-straddle produces 2 — total
-            // bound `~SEG_MAX * regions_per_segment`, kept below
-            // 1024 by realistic region sizing.
+            // `iovecs.len()` is structurally bounded at <= 256 — a
+            // quarter of Linux's `IOV_MAX` (UIO_MAXIOV = 1024) — so
+            // `preadv` never sees `iovcnt > IOV_MAX`. Derived from
+            // three enforced/structural facts:
+            //   - at most `VIRTIO_BLK_SEG_MAX` (128) data segments:
+            //     drain.rs rejects `chain_len > SEG_MAX + 2` before
+            //     this loop runs;
+            //   - each segment is <= `VIRTIO_BLK_SIZE_MAX` (1 MiB):
+            //     drain.rs rejects `any(len > SIZE_MAX)` before this
+            //     loop runs;
+            //   - every `GuestMemoryMmap` region is >= 1 MiB and
+            //     MiB-granular: numa_mem allocates per-node memory in
+            //     whole MiB (a 0-MiB node is omitted) and the MMIO-gap
+            //     split is GiB-aligned, so even the split pieces are
+            //     MiB-granular (numa_mem.rs `push_node_regions`).
+            // `mem.get_slices(addr, len)` returns one slice per
+            // `GuestMemoryMmap` region the `[addr, addr+len)` range
+            // spans. A <= 1 MiB segment over >= 1 MiB regions crosses
+            // at most one region boundary -> at most 2 slices, so the
+            // total is at most `SEG_MAX * 2 = 256`. This is a
+            // STRUCTURAL invariant (the three facts above), NOT a
+            // code-enforced cap: if a future change lowers the minimum
+            // region size, raises SEG_MAX/SIZE_MAX, or makes
+            // `get_slices` fragment more finely (e.g. per-page),
+            // re-derive this bound or add an explicit
+            // `iovcnt <= IOV_MAX` chunking loop.
             // `base_offset` is a `u64` validated above to fit in
             // `[0, capacity_bytes]`; `capacity_bytes` is host-trusted
             // (constructed in `with_options`) so it cannot exceed
             // `i64::MAX` for any realistic disk size and fits in
             // `off_t` losslessly.
-            let r = unsafe {
-                libc::preadv(
-                    backing.as_raw_fd(),
-                    iovecs.as_ptr(),
-                    iovecs.len() as libc::c_int,
-                    base_offset as libc::off_t,
-                )
-            };
-            if r < 0 {
-                let e = std::io::Error::last_os_error();
-                tracing::warn!(sector, %e, "virtio-blk preadv error");
-                counters.record_io_error();
-                return (VIRTIO_BLK_S_IOERR as u8, 1);
+            // Retry ONLY a signal-interrupted read (`Err(Interrupted)`,
+            // 0 bytes transferred). A short POSITIVE return is EOF for a
+            // regular file (a thin/truncated backing shorter than the
+            // advertised capacity) — NOT a signal — so it exits the loop
+            // and the short-read pad below zero-fills the `[n..data_len)`
+            // tail. This is asymmetric to the write path: a read returns
+            // at EOF, whereas a write must retry a short-positive to
+            // completion. (read(2): a catchable-signal interrupt with 0
+            // bytes yields `-EINTR` (Err); a partial-then-signal yields
+            // the positive count, indistinguishable from EOF and treated
+            // as EOF — retrying an at-EOF read would spin.)
+            // Divergence: firecracker errors a short read
+            // (`read_exact_volatile` → UnexpectedEof → S_IOERR); we
+            // zero-pad it as EOF — the more lenient regular-file-EOF
+            // choice, matching qemu's short-read `iov_memset` pad.
+            let mut eintr_retries: u32 = 0;
+            loop {
+                // SAFETY: each iovec base points at live guest memory
+                // held by `_guards` for this call; `iovecs.len()` is
+                // structurally <= IOV_MAX (see the bound derivation
+                // above).
+                match unsafe { backing.preadv(&iovecs, base_offset) } {
+                    Ok(n) => break n as u64,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                        // EINTR here is a pending FATAL signal (the read
+                        // waits TASK_KILLABLE; a fatal signal does not
+                        // clear), so re-issue is bounded to avoid
+                        // spinning a dying IO thread — see
+                        // MAX_EINTR_RETRIES.
+                        eintr_retries += 1;
+                        if eintr_retries > MAX_EINTR_RETRIES {
+                            tracing::warn!(
+                                sector,
+                                "virtio-blk preadv: EINTR retry cap hit (pending fatal signal?); failing"
+                            );
+                            counters.record_io_error();
+                            return (VIRTIO_BLK_S_IOERR as u8, 1);
+                        }
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::warn!(sector, %e, "virtio-blk preadv error");
+                        counters.record_io_error();
+                        return (VIRTIO_BLK_S_IOERR as u8, 1);
+                    }
+                }
             }
-            r as u64
         };
 
         // Short-read pad: zero-fill the unfilled `[n..data_len)`
@@ -1508,14 +1596,19 @@ impl VirtioBlk {
     /// would have `pwritev` read from a buffer the spec marked
     /// device-only-writable from the driver's perspective).
     ///
-    /// Short-write handling: `pwritev` may return `n < data_len`,
-    /// e.g. on ENOSPC mid-write or a hostile-FS short-write
-    /// signal. Both partial-write (`n < data_len`) and outright
-    /// error (`r < 0`) collapse to S_IOERR + an `io_errors` bump,
-    /// matching the per-segment behavior in
-    /// `Self::handle_write_impl` (which rejects on the first
-    /// `Ok(n)` where `n < seg.len`). The host backing-file
-    /// distress signal is preserved.
+    /// Short-write handling: `pwritev` may return `0 < n < data_len`
+    /// (e.g. ENOSPC mid-write or a signal-interrupted partial). A
+    /// short POSITIVE write is recoverable forward progress, so the
+    /// loop advances the iovecs past `n` and re-issues the remainder
+    /// until the full `data_len` lands — matching the kernel's
+    /// `generic_perform_write` copy loop. Only `Ok(0)` (zero forward
+    /// progress) or a hard `Err` is a genuine failure → S_IOERR + an
+    /// `io_errors` bump; `Err(Interrupted)` is retried up to
+    /// `MAX_EINTR_RETRIES`. This DIVERGES from the cfg(test)
+    /// per-segment `Self::handle_write_impl`, which rejects on the
+    /// first short `Ok(n)` — the single-shot reject was a
+    /// guest-data-integrity bug (a completable write failed the
+    /// guest's bio).
     ///
     /// Counter taxonomy is preserved exactly:
     /// - `record_write(total_written)`: bytes accepted by the
@@ -1527,7 +1620,7 @@ impl VirtioBlk {
     /// [`Self::handle_read_vectored_impl`].
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn handle_write_vectored_impl(
-        backing: &File,
+        backing: &dyn Backing,
         capacity_bytes: u64,
         counters: &VirtioBlkCounters,
         mem: &GuestMemoryMmap,
@@ -1601,6 +1694,17 @@ impl VirtioBlk {
             }
         }
 
+        // Tripwire for the structural iovec-count bound (SEG_MAX * 2 =
+        // 256 <= IOV_MAX); see the pwritev SAFETY comment below.
+        // Debug-only; a future change that broke the bound trips the
+        // proptest fuzzers here instead of a runtime `pwritev` EINVAL.
+        debug_assert!(
+            iovecs.len() <= IOV_MAX,
+            "blk pwritev iovcnt {} exceeds IOV_MAX {} — structural bound broke (see SAFETY comment)",
+            iovecs.len(),
+            IOV_MAX,
+        );
+
         if iovecs.is_empty() {
             // data_len == 0 — every data descriptor in the chain had
             // len == 0. The upstream zero-data gate in drain.rs
@@ -1616,44 +1720,95 @@ impl VirtioBlk {
             return (VIRTIO_BLK_S_OK as u8, 1);
         }
 
-        // SAFETY: identical to the preadv site above. iovecs is
-        // built from live `PtrGuard`s held in `_guards`; the
-        // backing fd is valid for the call (caller owns the File).
-        // `iovecs.len()` upper bound: see the preadv SAFETY comment
-        // — `data_segments` has at most SEG_MAX (128) entries and
-        // `mem.get_slices` may fragment each across region
-        // boundaries, with the realistic worst case well under
-        // `IOV_MAX = 1024` for any sane GuestMemoryMmap region
-        // sizing.
-        let r = unsafe {
-            libc::pwritev(
-                backing.as_raw_fd(),
-                iovecs.as_ptr(),
-                iovecs.len() as libc::c_int,
-                base_offset as libc::off_t,
-            )
-        };
-        if r < 0 {
-            let e = std::io::Error::last_os_error();
-            tracing::warn!(sector, %e, "virtio-blk pwritev error");
-            counters.record_io_error();
-            return (VIRTIO_BLK_S_IOERR as u8, 1);
-        }
-        let total_written = r as u64;
-        if total_written != data_len {
-            // Partial write (`n < data_len`): same failure semantic
-            // as `handle_write_impl`'s per-segment short-write arm.
-            // The guest's request was not fulfilled in full and
-            // there is no retry path inside the device — surface
-            // S_IOERR and let the guest's blk-mq layer decide.
-            tracing::warn!(
-                sector,
-                total_written,
-                data_len,
-                "virtio-blk pwritev short write"
+        // Retry-to-completion. A SHORT positive write (`0 < n <
+        // remaining`) is recoverable forward progress — `pwritev` may
+        // transfer fewer bytes than requested on ENOSPC mid-write or a
+        // signal-interrupted partial — so advance the iovecs past `n`
+        // and re-issue the remainder until the full `data_len` lands.
+        // Only `Ok(0)` (zero forward progress, e.g. immediate ENOSPC)
+        // or a hard `Err` is a genuine failure → S_IOERR. The prior
+        // single-pwritev returned S_IOERR on ANY short write, failing
+        // the guest's bio for a write the device could have completed —
+        // a guest-data-integrity bug. Asymmetric to the read path
+        // (short positive read = EOF).
+        //
+        // Reference behavior (matches + intentional divergences):
+        //   - kernel `generic_perform_write` (mm/filemap.c): MATCH —
+        //     the page-copy loop advances the iter and re-copies until
+        //     the byte count drains; a short write is recoverable
+        //     progress returned as a positive partial.
+        //   - firecracker `write_all_volatile` (vm-memory): MATCH —
+        //     loops `offset(n)` past each short write until the buffer
+        //     is empty; `Ok(0)` → WriteZero.
+        //   - qemu file-posix: also retries to completion, but via a
+        //     DIFFERENT mechanism — it abandons the vectored syscall on
+        //     a short return and linearizes into a bounce buffer
+        //     (`handle_aiocb_rw_linear` loops; returns EINVAL if a
+        //     write is still short). We advance the iovecs and re-issue
+        //     `pwritev` directly — same goal, no bounce-buffer copy.
+        //   - cloud-hypervisor and libkrun: a silent-truncation bug we
+        //     do NOT mirror — both accept a short positive write as
+        //     success (cloud-hypervisor's block completion handler
+        //     treats any `result >= 0` as S_OK with the partial byte
+        //     count as `used.len`; libkrun's `consume` runs the write
+        //     callback once, no retry), truncating the guest's write.
+        let mut remaining: &mut [libc::iovec] = &mut iovecs;
+        let mut off = base_offset;
+        let mut total_written: u64 = 0;
+        let mut eintr_retries: u32 = 0;
+        loop {
+            // SAFETY: each iovec base points at live guest memory held
+            // by `_guards` for this call (`_guards` outlives the loop);
+            // `remaining.len()` only shrinks from the
+            // structurally-bounded initial `iovecs.len()` (<= IOV_MAX),
+            // so iovcnt stays in range.
+            let n = match unsafe { backing.pwritev(remaining, off) } {
+                Ok(0) => {
+                    tracing::warn!(
+                        sector,
+                        total_written,
+                        data_len,
+                        "virtio-blk pwritev made zero forward progress; failing"
+                    );
+                    counters.record_io_error();
+                    return (VIRTIO_BLK_S_IOERR as u8, 1);
+                }
+                Ok(n) => n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                    // EINTR here is a pending FATAL signal (the write
+                    // path returns -EINTR under fatal_signal_pending; a
+                    // fatal signal does not clear), so bound the
+                    // re-issue to avoid spinning a dying IO thread and
+                    // delaying the freeze dump — see MAX_EINTR_RETRIES.
+                    eintr_retries += 1;
+                    if eintr_retries > MAX_EINTR_RETRIES {
+                        tracing::warn!(
+                            sector,
+                            "virtio-blk pwritev: EINTR retry cap hit (pending fatal signal?); failing"
+                        );
+                        counters.record_io_error();
+                        return (VIRTIO_BLK_S_IOERR as u8, 1);
+                    }
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!(sector, %e, "virtio-blk pwritev error");
+                    counters.record_io_error();
+                    return (VIRTIO_BLK_S_IOERR as u8, 1);
+                }
+            };
+            total_written += n as u64;
+            off += n as u64;
+            if total_written == data_len {
+                break;
+            }
+            // total_written < data_len ⇒ n < the remaining iovec bytes,
+            // so `advance_iovecs` returns a non-empty slice.
+            remaining = advance_iovecs(remaining, n);
+            debug_assert!(
+                !remaining.is_empty(),
+                "virtio-blk pwritev: iovecs exhausted at {total_written} of {data_len} bytes"
             );
-            counters.record_io_error();
-            return (VIRTIO_BLK_S_IOERR as u8, 1);
         }
         counters.record_write(total_written);
         // used_len: 1 (status byte only — write data is not
@@ -1790,2038 +1945,5 @@ impl VirtioBlk {
             &self.interrupt_status,
             &self.device_status,
         );
-    }
-}
-
-// `DrainOutcome` and `drain_bracket_impl` live in `drain.rs`; reach them
-// via the `super::*;` glob (sourced from `mod.rs`'s
-// `pub(crate) use drain::*;`). Pulled out for module locality so the
-// chain-validation/throttle/handler-dispatch/completion-publish pipeline
-// sits in one file beside its tests.
-
-impl VirtioBlk {
-    // The four `handle_*_impl` per-request-type handlers (T_IN /
-    // T_OUT / T_FLUSH / T_GET_ID) and their `cfg(test)` `&self`
-    // wrappers live in `handlers.rs` as a separate `impl VirtioBlk`
-    // block. Pulled out for module locality so the per-request
-    // logic sits beside its tests; this impl block continues with
-    // the MMIO/FSM/lifecycle methods.
-
-    /// Handle MMIO read at `offset` within the device's MMIO region.
-    ///
-    /// Two address ranges:
-    /// - `offset >= 0x100`: device-specific config space, dispatched
-    ///   to `read_blk_config`.
-    /// - `offset < 0x100`: virtio-mmio common transport registers
-    ///   (magic/version/device-id, status, queue config, interrupt
-    ///   status). All transport registers are 4-byte u32; non-4-byte
-    ///   reads here are guest bugs.
-    ///
-    /// Non-4-byte fallback fills `data` with `0xff` rather than 0
-    /// because 0xff is far easier to spot in a guest crash dump or
-    /// hex view than a successful 0 — it surfaces "the device
-    /// declined to answer" instead of disguising it as a valid
-    /// zero-valued register read. Config space (`offset >= 0x100`)
-    /// uses 0-fill instead because virtio-v1.2 §4.2.2.2 specifies
-    /// reads past the populated config layout return zero.
-    pub fn mmio_read(&self, offset: u64, data: &mut [u8]) {
-        if offset >= 0x100 {
-            self.read_blk_config(offset - 0x100, data);
-            return;
-        }
-        if data.len() != 4 {
-            data.fill(0xff);
-            return;
-        }
-        let val: u32 = match offset as u32 {
-            VIRTIO_MMIO_MAGIC_VALUE => MMIO_MAGIC,
-            VIRTIO_MMIO_VERSION => MMIO_VERSION,
-            VIRTIO_MMIO_DEVICE_ID => VIRTIO_ID_BLOCK,
-            VIRTIO_MMIO_VENDOR_ID => VENDOR_ID,
-            VIRTIO_MMIO_DEVICE_FEATURES => {
-                let page = self.device_features_sel;
-                if page == 0 {
-                    self.device_features() as u32
-                } else if page == 1 {
-                    (self.device_features() >> 32) as u32
-                } else {
-                    0
-                }
-            }
-            VIRTIO_MMIO_QUEUE_NUM_MAX => self
-                .selected_queue()
-                .map(|i| self.worker.queues[i].max_size() as u32)
-                .unwrap_or(0),
-            VIRTIO_MMIO_QUEUE_READY => self
-                .selected_queue()
-                .map(|i| self.worker.queues[i].ready() as u32)
-                .unwrap_or(0),
-            VIRTIO_MMIO_INTERRUPT_STATUS => self.interrupt_status.load(Ordering::Acquire),
-            VIRTIO_MMIO_STATUS => self.device_status.load(Ordering::Acquire),
-            VIRTIO_MMIO_CONFIG_GENERATION => self.config_generation.load(Ordering::Acquire),
-            _ => 0,
-        };
-        data.copy_from_slice(&val.to_le_bytes());
-    }
-
-    /// Read from block config space. virtio-v1.2 §5.2.4 layout, mirrored
-    /// in [`VirtioBlkConfig`]:
-    ///   - 0x00..0x08: capacity (u64 LE, sectors) — always
-    ///   - 0x08..0x0C: size_max (u32 LE) — VIRTIO_BLK_F_SIZE_MAX
-    ///   - 0x0C..0x10: seg_max (u32 LE) — VIRTIO_BLK_F_SEG_MAX
-    ///   - 0x10..0x14: geometry (4 bytes) — VIRTIO_BLK_F_GEOMETRY (zero;
-    ///     feature bit not advertised)
-    ///   - 0x14..0x18: blk_size (u32 LE) — VIRTIO_BLK_F_BLK_SIZE
-    ///
-    /// Reads at offsets `>= VIRTIO_BLK_CONFIG_SIZE` return zero per
-    /// virtio-v1.2 §4.2.2.2 ("reads past the populated config layout
-    /// return zero") — guarded fields like topology / MQ / discard
-    /// have feature bits we don't advertise, so the kernel driver's
-    /// `virtio_cread_feature` skips them and never observes the
-    /// zero-bytes we serve.
-    pub(crate) fn read_blk_config(&self, offset: u64, data: &mut [u8]) {
-        let cfg = VirtioBlkConfig {
-            capacity: self.capacity_sectors,
-            size_max: VIRTIO_BLK_SIZE_MAX,
-            seg_max: VIRTIO_BLK_SEG_MAX,
-            geometry: VirtioBlkGeometry::default(),
-            blk_size: VIRTIO_BLK_SECTOR_SIZE,
-        };
-        // `as_slice()` returns the struct's wire-format byte
-        // representation directly — `repr(C, packed)` guarantees no
-        // padding and host-LE u32/u64 stores match the virtio LE wire
-        // format on the supported (x86_64, aarch64) hosts. See
-        // ByteValued impl SAFETY note above.
-        let cfg_bytes = cfg.as_slice();
-        let len = data.len();
-        let start = offset as usize;
-        if start >= cfg_bytes.len() {
-            data.fill(0);
-            return;
-        }
-        let end = (start + len).min(cfg_bytes.len());
-        let n = end - start;
-        data[..n].copy_from_slice(&cfg_bytes[start..end]);
-        data[n..].fill(0);
-    }
-
-    /// Handle MMIO write at `offset` within the device's MMIO region.
-    ///
-    /// Same two address ranges as [`Self::mmio_read`]:
-    /// - `offset >= 0x100`: device config space. Per virtio-v1.2
-    ///   §4.2.2 the device owns this region — it's read-only from
-    ///   the driver's perspective, populated by the device when
-    ///   the driver reads. Guest writes are silently dropped (no
-    ///   tracing::warn either; the kernel's virtio_mmio probe path
-    ///   has been seen to issue speculative config-space writes
-    ///   during feature negotiation, and warning on every one
-    ///   would flood the log without identifying any real bug).
-    /// - `offset < 0x100`: transport registers, dispatched per
-    ///   `match`. Non-4-byte writes are silently dropped — same
-    ///   "the spec mandates 4-byte access" reasoning as the read
-    ///   path; the device acts on a partial register write at its
-    ///   peril, so dropping is safer than wedging an MMIO FSM
-    ///   with half-applied state.
-    pub fn mmio_write(&mut self, offset: u64, data: &[u8]) {
-        if offset >= 0x100 {
-            // Config space writes are device-owned; drop silently.
-            return;
-        }
-        if data.len() != 4 {
-            return;
-        }
-        let val = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-        match offset as u32 {
-            VIRTIO_MMIO_DEVICE_FEATURES_SEL => self.device_features_sel = val,
-            VIRTIO_MMIO_DRIVER_FEATURES_SEL => self.driver_features_sel = val,
-            VIRTIO_MMIO_DRIVER_FEATURES => {
-                if !self.features_write_allowed() {
-                    return;
-                }
-                let page = self.driver_features_sel;
-                if page == 0 {
-                    self.driver_features =
-                        (self.driver_features & 0xFFFF_FFFF_0000_0000) | val as u64;
-                } else if page == 1 {
-                    self.driver_features =
-                        (self.driver_features & 0x0000_0000_FFFF_FFFF) | ((val as u64) << 32);
-                }
-            }
-            VIRTIO_MMIO_QUEUE_SEL => self.queue_select = val,
-            VIRTIO_MMIO_QUEUE_NUM if self.queue_config_allowed() => {
-                if let Some(i) = self.selected_queue() {
-                    self.worker.queues[i].set_size(val as u16);
-                }
-            }
-            VIRTIO_MMIO_QUEUE_READY if self.queue_config_allowed() => {
-                if let Some(i) = self.selected_queue() {
-                    self.worker.queues[i].set_ready(val == 1);
-                }
-            }
-            VIRTIO_MMIO_QUEUE_NOTIFY => {
-                let idx = val as usize;
-                if idx == REQ_QUEUE {
-                    self.process_requests();
-                }
-            }
-            VIRTIO_MMIO_INTERRUPT_ACK => {
-                // Clear bits the guest ACKed. AcqRel: the Acquire
-                // half pairs with the worker's Release fetch_or so
-                // we don't lose a bit racing with worker bit-set;
-                // the Release half publishes the cleared state.
-                self.interrupt_status.fetch_and(!val, Ordering::AcqRel);
-            }
-            VIRTIO_MMIO_STATUS => {
-                if val == 0 {
-                    self.reset();
-                } else {
-                    self.set_status(val);
-                }
-            }
-            // QUEUE_{DESC,AVAIL,USED}_{LOW,HIGH} write a 64-bit
-            // guest physical address as two 32-bit halves. Per
-            // virtio-v1.2 §4.2.2: writes are only valid while
-            // FEATURES_OK is set and DRIVER_OK is NOT — i.e. the
-            // window between feature negotiation and the driver
-            // signalling "I'm done configuring." Outside that
-            // window the write is silently dropped (the
-            // `queue_config_allowed` guard returns false). The
-            // virtio-queue crate accumulates the two halves
-            // internally; the guest typically writes LOW first
-            // then HIGH but the order is not load-bearing here.
-            VIRTIO_MMIO_QUEUE_DESC_LOW if self.queue_config_allowed() => {
-                if let Some(i) = self.selected_queue() {
-                    self.worker.queues[i].set_desc_table_address(Some(val), None);
-                }
-            }
-            VIRTIO_MMIO_QUEUE_DESC_HIGH if self.queue_config_allowed() => {
-                if let Some(i) = self.selected_queue() {
-                    self.worker.queues[i].set_desc_table_address(None, Some(val));
-                }
-            }
-            VIRTIO_MMIO_QUEUE_AVAIL_LOW if self.queue_config_allowed() => {
-                if let Some(i) = self.selected_queue() {
-                    self.worker.queues[i].set_avail_ring_address(Some(val), None);
-                }
-            }
-            VIRTIO_MMIO_QUEUE_AVAIL_HIGH if self.queue_config_allowed() => {
-                if let Some(i) = self.selected_queue() {
-                    self.worker.queues[i].set_avail_ring_address(None, Some(val));
-                }
-            }
-            VIRTIO_MMIO_QUEUE_USED_LOW if self.queue_config_allowed() => {
-                if let Some(i) = self.selected_queue() {
-                    self.worker.queues[i].set_used_ring_address(Some(val), None);
-                }
-            }
-            VIRTIO_MMIO_QUEUE_USED_HIGH if self.queue_config_allowed() => {
-                if let Some(i) = self.selected_queue() {
-                    self.worker.queues[i].set_used_ring_address(None, Some(val));
-                }
-            }
-            _ => {}
-        }
-    }
-
-    /// Validate and apply a status transition per virtio-v1.2 §3.1.1.
-    ///
-    /// FEATURES_OK additionally enforces two constraints:
-    ///
-    /// 1. VIRTIO_F_VERSION_1 must be in `driver_features`
-    ///    (virtio-v1.2 §6.1: "A driver MUST accept VIRTIO_F_VERSION_1").
-    ///    Modern devices require this bit; a driver that fails to ack
-    ///    it (legacy/transitional driver against this modern-only
-    ///    device) cannot operate.
-    /// 2. `driver_features` must be a SUBSET of `device_features()`
-    ///    (virtio-v1.2 §3.1.1 step 5: "the driver MUST NOT set any
-    ///    feature bit that the device did not offer"). A driver that
-    ///    acks an unadvertised bit has either misread the device
-    ///    feature page or is buggy/hostile; either way the device
-    ///    cannot honor the implied contract because none of the
-    ///    backend code paths for the unadvertised feature exist.
-    ///
-    /// The kernel's `virtio_features_ok` (drivers/virtio/virtio.c)
-    /// writes FEATURES_OK then re-reads STATUS to confirm the bit
-    /// stuck — rejecting here clears the path: the FSM leaves
-    /// FEATURES_OK unset, the kernel's read-back fails, and the
-    /// driver bind surfaces -ENODEV without descending into queue
-    /// config.
-    ///
-    /// Every rejection path emits a `tracing::warn!` with the
-    /// `device_status` / requested `val` / `new_bits` payload so an
-    /// operator debugging a failed-bind can see which step the FSM
-    /// rejected — clearing-bit attempts, ordering violations, multi-
-    /// bit transitions, and unknown bits all surface explicitly
-    /// rather than as a silent return.
-    ///
-    /// Idempotent re-writes (the requested `val` equals the
-    /// current `device_status`) are a NO-OP, not a rejection: the
-    /// monotone-bit gate accepts them (no bits cleared) and the
-    /// new_bits-zero short-circuit returns without logging.
-    /// Standard drivers go through `virtio_add_status`
-    /// (drivers/virtio/virtio.c:196-200), which writes
-    /// `STATUS = old | NEW_BIT`; `virtio_features_ok`
-    /// (drivers/virtio/virtio.c:230) re-reads via `get_status`
-    /// to confirm the bit stuck. Warning on idempotent re-writes
-    /// would pollute operator logs without surfacing real bugs.
-    pub(crate) fn set_status(&mut self, val: u32) {
-        // Snapshot the current FSM state. `set_status` runs on the
-        // vCPU thread that received the MMIO write; the FSM walk
-        // through ACK → DRIVER → FEATURES_OK → DRIVER_OK happens
-        // sequentially within and across calls on that thread. The
-        // production worker thread's only write site to
-        // device_status is the `fetch_or(NEEDS_RESET, SeqCst)` on
-        // the queue-poison path. Whether that write can race the
-        // vCPU's FSM-advance store depends on the worker's
-        // lifecycle:
-        //
-        // - **Pre-DRIVER_OK** (initial spawn deferred to the first
-        //   `STATUS = DRIVER_OK` per `consume_pending_respawn`):
-        //   no worker thread is alive yet, so no concurrent
-        //   `fetch_or` can land. Single-writer device_status.
-        // - **Between DRIVER_OK and reset**: the worker is alive
-        //   and may queue-poison at any point; a vCPU-side
-        //   set_status arriving in this window can race its
-        //   `fetch_or(NEEDS_RESET)`.
-        // - **Between reset and the next DRIVER_OK**: the worker
-        //   has been joined (`reset_engine_spawned` →
-        //   `stop_worker_and_reclaim_state`); single-writer.
-        //
-        // The middle bucket is the race that motivates the CAS
-        // below. A naive `store(val, Release)` after the snapshot
-        // would clobber a NEEDS_RESET bit the worker had just
-        // fetch_or'd in — silently lying to the guest by reporting
-        // a healthy FSM after the device had already declared
-        // itself broken. The CAS below is **load-bearing for race
-        // safety**, not defense-in-depth: the worker's
-        // `fetch_or(NEEDS_RESET, SeqCst)` can set bits between this
-        // load and the CAS attempt, and the CAS is the mechanism
-        // that detects the contention. Replacing the store with a
-        // compare_exchange against the snapshot detects the race:
-        // if the worker advanced device_status concurrently, the
-        // CAS fails and we re-snapshot + re-validate. Either the
-        // re-validated transition still passes (worker added bits
-        // we are about to set anyway — proceed) or it fails
-        // (worker added NEEDS_RESET, which is not a legal
-        // FSM-advance bit; the new snapshot rejects with the
-        // monotone-bit gate or the `valid` match). The Acquire
-        // load and the CAS's failure-side Acquire ordering
-        // synchronise-with the worker's SeqCst fetch_or at
-        // `drain_bracket_impl`'s queue-poison arm — Acquire
-        // observation pairs with the SeqCst write side because
-        // SeqCst is at least Release on the writer.
-        //
-        // Snapshot loaded outside the loop; on a CAS failure the
-        // `Err(observed)` branch updates `current_status` directly
-        // without re-issuing a `load` — saving one redundant
-        // atomic read per retry while preserving the same
-        // happens-before chain.
-        let mut current_status = self.device_status.load(Ordering::Acquire);
-        // CAS retry loop. Each iteration re-validates the proposed
-        // transition against the freshly-snapshotted `current_status`
-        // and attempts a `compare_exchange` to commit. On contention
-        // (the worker fetch_or'd NEEDS_RESET between snapshot and
-        // commit), the CAS returns `Err(observed)` and we restart
-        // the loop with the observed value as the new snapshot.
-        // Termination is bounded at AT MOST ONE worker-induced
-        // retry: by the worker invariant (see the worker's
-        // queue-poison fetch_or site), the worker may only
-        // fetch_or `VIRTIO_CONFIG_S_NEEDS_RESET` and the operation
-        // is idempotent after the first call. So the worker can
-        // transition `device_status` from one observable state
-        // (`current_status`) to one other state
-        // (`current_status | NEEDS_RESET`) and never to a third
-        // value while this set_status is running. After that
-        // single retry the snapshot is stable: either the second
-        // CAS succeeds, or the monotone-bit gate fires because
-        // the new snapshot has NEEDS_RESET and `val` does not
-        // include it.
-        //
-        // Defense-in-depth bounded-retry budget: the proof above
-        // says termination is bounded at one worker-induced retry,
-        // so any execution exceeding `MAX_CAS_RETRIES` (4) is
-        // either an invariant violation (worker fetch_or'ing
-        // something other than NEEDS_RESET, multi-writer
-        // device_status) or a hardware live-lock. Cap the loop
-        // and bail rather than spin the vCPU thread indefinitely
-        // — bailing is safe because the guest will simply retry
-        // the STATUS write and observe the worker-set NEEDS_RESET
-        // on the next attempt. The cap is large enough (4) that
-        // proof-respecting execution never reaches it.
-        const MAX_CAS_RETRIES: u32 = 4;
-        let mut cas_retries: u32 = 0;
-        loop {
-            if val & current_status != current_status {
-                // CORRECT behavior — do NOT "fix" this gate to admit
-                // the advance. After the worker's queue-poison path
-                // fetch_or'd `VIRTIO_CONFIG_S_NEEDS_RESET` into
-                // `current_status`, every subsequent guest STATUS
-                // write whose `val` does NOT include the NEEDS_RESET
-                // bit (drivers never set it — it is device-emitted
-                // per virtio-v1.2 §2.1.1 bit 0x40) trips this check
-                // and is rejected. That is the spec-mandated
-                // behaviour: the device is dead until a STATUS=0
-                // reset, and the kernel's `virtio_features_ok`-style
-                // post-write `get_status` re-read sees the FSM bit
-                // never stuck (because we rejected here) and
-                // surfaces -ENODEV to the bind path. A future
-                // refactor that loosens this gate to "allow the
-                // advance and clear NEEDS_RESET silently" would
-                // restore the silent-corruption hazard the CAS
-                // exists to prevent.
-                //
-                // Distinguish the two failure modes that both surface
-                // here as `val & current_status != current_status`:
-                //
-                // 1. NEEDS_RESET bit (0x40) is set in `current_status`
-                //    but not in `val`. This happens when the worker's
-                //    queue-poison path fetch_or'd NEEDS_RESET — either
-                //    before this set_status call or during a CAS
-                //    retry. The driver did NOT try to regress; the
-                //    device set NEEDS_RESET on its own. Cite the
-                //    queue-poison cause and the STATUS=0 recovery
-                //    path so an operator reading the log knows the
-                //    fix is a full reset, not a driver bug.
-                //
-                // 2. Otherwise: the driver attempted to clear a
-                //    previously-set bit (per virtio-v1.2 §3.1.1
-                //    status bits are monotone within a driver
-                //    session) — a regress that surfaces a buggy
-                //    driver clearing FEATURES_OK while keeping
-                //    ACKNOWLEDGE.
-                if current_status & VIRTIO_CONFIG_S_NEEDS_RESET != 0 {
-                    tracing::warn!(
-                        device_status = current_status,
-                        requested = val,
-                        "virtio-blk set_status rejected — device in \
-                         NEEDS_RESET state from prior queue poison; \
-                         guest must write STATUS=0 to reset before any \
-                         further FSM advance can succeed"
-                    );
-                } else {
-                    tracing::warn!(
-                        device_status = current_status,
-                        requested = val,
-                        "virtio-blk set_status rejected — attempted to clear \
-                         a previously-set status bit without a full reset \
-                         (virtio-v1.2 §3.1.1: status bits are monotone within \
-                         a driver session)"
-                    );
-                }
-                return;
-            }
-            let new_bits = val & !current_status;
-            // Idempotent re-write of the current device_status: the
-            // monotone-bit gate above passed (val is a superset) AND
-            // the requested value adds no new bits. This is a
-            // legitimate driver pattern — the kernel's
-            // `virtio_add_status` (drivers/virtio/virtio.c:196-200)
-            // writes `STATUS = old | NEW_BIT` and a subsequent
-            // `virtio_features_ok` (drivers/virtio/virtio.c:230)
-            // `get_status` read may race a duplicate set, plus an
-            // MMIO probe path may issue a duplicate STATUS write.
-            // Treat as a no-op rather than a rejection so the
-            // rejection-warn path stays a true signal.
-            if new_bits == 0 {
-                return;
-            }
-            // FAILED (virtio-v1.2 §2.1.1 bit 0x80) is the driver's
-            // "I give up" signal. The kernel's
-            // `virtio_add_status(dev, VIRTIO_CONFIG_S_FAILED)` is the
-            // exit path on probe failure
-            // (drivers/virtio/virtio.c:363, 570, 606, 643): it reads
-            // `get_status`, ORs in FAILED, and writes the result. So
-            // `val == current_status | FAILED` and `new_bits ==
-            // FAILED` regardless of which FSM rung the driver had
-            // reached. Accept and store without consulting the
-            // FSM-ladder match — FAILED can land at any state, and
-            // routing it through the ACK/DRIVER/FEATURES_OK/DRIVER_OK
-            // arms would reject the legitimate signal as an "illegal
-            // FSM transition" and silently drop the FAILED bit from
-            // device_status, leaving operators reading the failure
-            // dump unable to see the guest gave up. Reject only when
-            // FAILED appears alongside other unrecognised new bits —
-            // those are protocol violations unrelated to the
-            // legitimate FAILED signal and fall through to the
-            // FSM-ladder match below. Mirrors virtio_console.rs's
-            // FAILED early-accept pattern at the same location in its
-            // set_status.
-            if new_bits == VIRTIO_CONFIG_S_FAILED {
-                // CAS against the snapshot for the same race-safety
-                // reason as the valid-FSM-transition store below: the
-                // worker thread can fetch_or NEEDS_RESET between
-                // snapshot and store, and a naive `store(val,
-                // Release)` would clobber that bit. Acquire on
-                // failure synchronizes-with the worker's SeqCst
-                // fetch_or so the next iteration's monotone-bit gate
-                // (top of the loop) sees the worker's NEEDS_RESET. On
-                // CAS-failure retry the new snapshot has NEEDS_RESET
-                // but `val` does not (the kernel's `val` was computed
-                // from the pre-fetch_or get_status), so the
-                // monotone-bit gate fires and rejects — the device is
-                // already declaring itself broken via NEEDS_RESET, so
-                // dropping the FAILED bit on this path is acceptable;
-                // the guest must reset before any further FSM advance
-                // can succeed.
-                match self.device_status.compare_exchange(
-                    current_status,
-                    val,
-                    Ordering::Release,
-                    Ordering::Acquire,
-                ) {
-                    Ok(_) => {
-                        tracing::warn!(
-                            old = current_status,
-                            new = val,
-                            "virtio-blk set_status: guest set FAILED status \
-                             (virtio-v1.2 §2.1.1 bit 0x80 — driver gave up on \
-                             device probe). Stored without further FSM advance.",
-                        );
-                        return;
-                    }
-                    Err(observed) => {
-                        debug_assert_eq!(
-                            observed & !current_status & !VIRTIO_CONFIG_S_NEEDS_RESET,
-                            0,
-                            "device_status race: observed bits beyond NEEDS_RESET — \
-                             worker invariant violated (snapshot={current_status:#x}, \
-                             observed={observed:#x})",
-                        );
-                        cas_retries += 1;
-                        if cas_retries >= MAX_CAS_RETRIES {
-                            tracing::error!(
-                                device_status = observed,
-                                requested = val,
-                                retries = cas_retries,
-                                "virtio-blk set_status abandoned — \
-                                 CAS retry budget exhausted on FAILED \
-                                 store; either the worker invariant is \
-                                 violated or a hardware live-lock is \
-                                 starving the vCPU thread; bailing \
-                                 without advancing the FSM",
-                            );
-                            return;
-                        }
-                        current_status = observed;
-                        continue;
-                    }
-                }
-            }
-            let valid = match new_bits {
-                VIRTIO_CONFIG_S_ACKNOWLEDGE => current_status == 0,
-                VIRTIO_CONFIG_S_DRIVER => current_status == S_ACK,
-                VIRTIO_CONFIG_S_FEATURES_OK => {
-                    current_status == S_DRV
-                        && self.driver_features & (1u64 << VIRTIO_F_VERSION_1) != 0
-                        && self.driver_features & !self.device_features() == 0
-                }
-                VIRTIO_CONFIG_S_DRIVER_OK => current_status == S_FEAT,
-                _ => false,
-            };
-            if valid {
-                // compare_exchange against the snapshot. On success
-                // the store lands with Release ordering (mirroring
-                // the pre-CAS `store(val, Release)` semantics for
-                // any vCPU reader doing `load(Acquire)`). On failure
-                // the worker raced an additional bit (NEEDS_RESET on
-                // queue poison) and we restart the outer loop with
-                // the observed value. Acquire on the failure side
-                // synchronizes-with the worker's SeqCst fetch_or
-                // (which is at least Release on the writer side) so
-                // the next iteration's re-validation sees the
-                // worker's NEEDS_RESET bit.
-                match self.device_status.compare_exchange(
-                    current_status,
-                    val,
-                    Ordering::Release,
-                    Ordering::Acquire,
-                ) {
-                    Ok(_) => {}
-                    Err(observed) => {
-                        // Verify the worker invariant: the only bits
-                        // that can appear in `observed` beyond the
-                        // pre-CAS snapshot are NEEDS_RESET. Any other
-                        // newly-set bit means a writer beyond the
-                        // documented queue-poison fetch_or site
-                        // exists — a regression that must surface
-                        // loudly in debug builds before the CAS retry
-                        // proof's bounded-retry assumption is
-                        // silently violated.
-                        debug_assert_eq!(
-                            observed & !current_status & !VIRTIO_CONFIG_S_NEEDS_RESET,
-                            0,
-                            "device_status race: observed bits beyond NEEDS_RESET — \
-                             worker invariant violated (snapshot={current_status:#x}, \
-                             observed={observed:#x})",
-                        );
-                        cas_retries += 1;
-                        if cas_retries >= MAX_CAS_RETRIES {
-                            tracing::error!(
-                                device_status = observed,
-                                requested = val,
-                                retries = cas_retries,
-                                "virtio-blk set_status abandoned — \
-                                 CAS retry budget exhausted; either the \
-                                 worker invariant is violated or a \
-                                 hardware live-lock is starving the \
-                                 vCPU thread; bailing without \
-                                 advancing the FSM",
-                            );
-                            return;
-                        }
-                        current_status = observed;
-                        continue;
-                    }
-                }
-                // Once FEATURES_OK is committed, feature negotiation
-                // is closed (virtio-v1.2 §3.1.1) — the negotiated set
-                // lives in `driver_features` and the device may rely
-                // on it. If VIRTIO_RING_F_EVENT_IDX was negotiated,
-                // enable event-idx tracking on the request queue so
-                // `Queue::needs_notification` consults the guest's
-                // `used_event` threshold instead of always returning
-                // true. `QueueT::event_idx_enabled` is documented to
-                // return the correct value only after FEATURES_OK,
-                // so this is the earliest legal moment to flip it
-                // on.
-                if new_bits == VIRTIO_CONFIG_S_FEATURES_OK
-                    && self.driver_features & (1u64 << VIRTIO_RING_F_EVENT_IDX) != 0
-                {
-                    self.worker.queues[REQ_QUEUE].set_event_idx(true);
-                }
-                // DRIVER_OK transition: consume any deferred respawn
-                // state stashed by `reset_engine_spawned`. By the
-                // time the guest reaches DRIVER_OK it has walked ACK
-                // → DRIVER → FEATURES_OK, and the
-                // queue_config_allowed gate (S_FEAT && !DRIVER_OK)
-                // admitted any DESC/AVAIL/USED address writes plus
-                // QUEUE_NUM / QUEUE_READY between FEATURES_OK and
-                // now. The kernel virtio-mmio driver's `vm_setup_vq`
-                // (drivers/virtio/virtio_mmio.c:346-444) publishes
-                // the queue addresses and writes `QUEUE_READY=1` in
-                // that window before the DRIVER_OK MMIO write, so
-                // the worker spawned here will find a
-                // fully-configured queue on its first drain attempt.
-                // Production cfg only — the inline-engine test build
-                // has no respawn machinery. See the
-                // `SpawnedEngine::respawn_pending` doc for the full
-                // rationale and race-free invariant.
-                #[cfg(not(test))]
-                if new_bits == VIRTIO_CONFIG_S_DRIVER_OK {
-                    self.consume_pending_respawn();
-                }
-                return;
-            }
-            // Rejection paths. The FEATURES_OK case has the richest
-            // diagnostic because it's the only transition with
-            // sub-conditions beyond simple ordering (subset rule +
-            // VERSION_1 mandate); other rejections cite the FSM
-            // ordering violation directly.
-            if new_bits == VIRTIO_CONFIG_S_FEATURES_OK && current_status == S_DRV {
-                // FEATURES_OK with the right ordering but the driver
-                // failed the feature-set rules. Report VERSION_1
-                // missing first (most common failure mode for a
-                // legacy/transitional driver); fall through to the
-                // unadvertised-bit case if VERSION_1 is fine.
-                if self.driver_features & (1u64 << VIRTIO_F_VERSION_1) == 0 {
-                    tracing::warn!(
-                        driver_features = ?self.driver_features,
-                        "FEATURES_OK rejected — VIRTIO_F_VERSION_1 not negotiated; \
-                         legacy/transitional driver against modern-only device",
-                    );
-                } else {
-                    let unadvertised = self.driver_features & !self.device_features();
-                    if unadvertised != 0 {
-                        tracing::warn!(
-                            driver_features = ?self.driver_features,
-                            device_features = ?self.device_features(),
-                            unadvertised = ?unadvertised,
-                            "FEATURES_OK rejected — driver acked unadvertised \
-                             feature bits; subset rule (virtio-v1.2 §3.1.1) \
-                             violated",
-                        );
-                    }
-                }
-            } else if current_status & VIRTIO_CONFIG_S_NEEDS_RESET != 0 {
-                // NEEDS_RESET-specific diagnostic — defense in depth
-                // alongside the same gate at the monotone-bit branch
-                // above. The monotone-bit branch fires for the
-                // typical race (val omits NEEDS_RESET, current_status
-                // has it), but a future caller that constructed
-                // `val` to include NEEDS_RESET (e.g. an internal
-                // helper that shouldn't exist but might be added)
-                // would slip past the monotone-bit gate and reach
-                // this rejection arm. Cite the queue-poison cause
-                // here too so the diagnostic taxonomy stays
-                // consistent.
-                tracing::warn!(
-                    device_status = current_status,
-                    requested = val,
-                    new_bits = new_bits,
-                    "virtio-blk set_status rejected — device in \
-                     NEEDS_RESET state from prior queue poison; \
-                     guest must write STATUS=0 to reset before any \
-                     further FSM advance can succeed",
-                );
-            } else {
-                // Generic ordering or unknown-bit rejection: ACK
-                // without device_status==0, DRIVER without ACK,
-                // FEATURES_OK from the wrong predecessor, DRIVER_OK
-                // without FEATURES_OK, or any new_bits that aren't a
-                // single virtio-v1.2 status bit (multi-bit
-                // transitions, reserved bits set). Citing
-                // device_status + new_bits lets an operator identify
-                // the ordering violation without rederiving the FSM.
-                tracing::warn!(
-                    device_status = current_status,
-                    requested = val,
-                    new_bits = new_bits,
-                    "virtio-blk set_status rejected — illegal FSM transition \
-                     (virtio-v1.2 §3.1.1 ordering: ACK → DRIVER → FEATURES_OK \
-                     → DRIVER_OK, one bit at a time)",
-                );
-            }
-            return;
-        }
-    }
-
-    /// Reset the device to its initial state per virtio-v1.2 §2.1.
-    ///
-    /// Two race-free paths, gated by `cfg`:
-    ///
-    /// - **Production (`cfg(not(test))`):** the worker thread owns
-    ///   the `BlkWorkerState` and may be mid-drain when the vCPU
-    ///   MMIO write of `STATUS = 0` lands here. Issuing
-    ///   `q.reset()` while the worker holds the QueueSync mutex
-    ///   (during `pop_descriptor_chain` / `add_used`) would race —
-    ///   even worse, the worker may be in `pread`/`pwrite` against
-    ///   a soon-to-be-stale guest memory mapping or compute an
-    ///   `add_used` against the post-reset queue with cleared
-    ///   `next_avail`. We close that window by stopping the worker
-    ///   first, joining it (so no concurrent reader exists), then
-    ///   running `q.reset()` and re-spawning a fresh worker
-    ///   against the post-reset queue.
-    ///
-    ///   We converge with cloud-hypervisor's pattern of stopping
-    ///   the worker on reset and deferring the respawn to the
-    ///   guest's next `DRIVER_OK` transition. We still diverge
-    ///   from firecracker (whose virtio-block device does not
-    ///   implement reset at all — `Reset` returns `None` from the
-    ///   device shim and the transport marks the device FAILED).
-    ///   The reclaimed `BlkWorkerState` is parked in
-    ///   `SpawnedEngine::respawn_pending` until `set_status`
-    ///   observes the `STATUS = DRIVER_OK` MMIO write and calls
-    ///   `consume_pending_respawn`, which builds fresh kick/stop
-    ///   eventfds and a fresh worker thread against the
-    ///   re-bound queue. Between reset and DRIVER_OK no worker
-    ///   thread is alive, so kicks landing on the stale
-    ///   (now-detached) `kick_fd` accumulate harmlessly until the
-    ///   re-bind completes — the fresh worker will iter() over
-    ///   chains the guest enqueued, since chain state lives in
-    ///   guest memory, not the eventfd counter. Deferring saves
-    ///   a thread sitting in `epoll_wait` for the duration of the
-    ///   guest's rebind sequence (queue addresses zeroed,
-    ///   `QUEUE_READY` false) — a window driver implementations
-    ///   can stretch into milliseconds.
-    ///
-    /// - **Tests (`cfg(test)`):** Inline mode runs `drain_inline`
-    ///   synchronously on the caller thread, so by the time
-    ///   `reset()` is invoked there is no concurrent reader on
-    ///   `worker.queues[…]`. The test-mode reset
-    ///   (`reset_engine_inline`) resets the queue in place,
-    ///   rebuilds the throttle buckets from the captured
-    ///   `self.throttle` (so an adversarial test cannot drain the
-    ///   bucket and reset to bypass), and clears the scratch Vecs
-    ///   (capacity retained).
-    ///
-    /// # Counter persistence
-    ///
-    /// `VirtioBlkCounters` (`reads_completed`, `bytes_read`,
-    /// `throttled_count`, `io_errors`, etc.) persist across reset.
-    /// They are cumulative for the device's lifetime — a guest
-    /// re-bind preserves the counter Arc so an operator monitoring
-    /// failure-dump counters observes a monotonically
-    /// non-decreasing series spanning the device's full IO
-    /// history.
-    ///
-    /// # vCPU thread blocking
-    ///
-    /// The production path's `handle.join()` runs on the vCPU
-    /// thread that received the MMIO write. If the worker is
-    /// mid-`pread`/`pwrite` when STOP_TOKEN is signaled, the
-    /// syscall completes before the worker reaches the next
-    /// `epoll_wait` and observes the stop signal. The vCPU thread
-    /// blocks for the duration. This is bounded by the same
-    /// backing-speed assumption documented at the module level
-    /// (tmpfs / warm page cache). A `reset()` issued during a slow
-    /// IO can stretch beyond the freeze coordinator's rendezvous
-    /// timeout, so `reset()` caps the worker join at
-    /// [`RESET_JOIN_TIMEOUT`] (1 s) via [`join_worker_with_timeout`]
-    /// (see [`Self::stop_worker_and_reclaim_state`]); on timeout
-    /// the worker is leaked into the permanent-workerless state
-    /// rather than hanging the rendezvous indefinitely.
-    pub(crate) fn reset(&mut self) {
-        // Phase 1 — clear MMIO-side scalar device state. These
-        // fields live on `VirtioBlk` only (not shared with the
-        // worker thread), so they're safe to mutate before the
-        // queue stop+respawn. `interrupt_status` is intentionally
-        // NOT cleared here because the worker thread (production)
-        // may still race-fire `irq_evt.write(1)` and bit-set
-        // INT_VRING; we clear it only after the worker is joined.
-        // `device_status` is also deferred to Phase 3 for the same
-        // reason: the worker's queue-poison path can fetch_or
-        // NEEDS_RESET concurrently with this reset(), and clearing
-        // it before the worker is joined would let a phantom
-        // NEEDS_RESET bit re-set itself between Phase 1 and Phase 2.
-        // `mem_unset_warned` is deferred to Phase 3 for the same
-        // reason: the worker thread does
-        // `mem_unset_warned.swap(true, Relaxed)` (worker.rs:788)
-        // when it observes a missing GuestMemory, and clearing the
-        // latch in Phase 1 would let a worker swap-true between
-        // Phase 1 and Phase 2 — leaving the latch stuck `true` for
-        // the post-reset driver session and silencing the
-        // wiring-bug warning we explicitly want for the next
-        // bind.
-        self.queue_select = 0;
-        self.device_features_sel = 0;
-        self.driver_features_sel = 0;
-        self.driver_features = 0;
-        // Bump config_generation on every reset so a re-binding
-        // driver observes a different value and re-reads config
-        // space (per virtio-v1.2 §4.2.2.1: drivers MUST re-read
-        // on changed generation). For v0 the capacity is fixed
-        // for the device's lifetime — set once in `new()` and
-        // never mutated — so the bump is purely defense-in-depth:
-        // a future patch that resizes the disk between resets is
-        // the case it guards. wrapping_add is implicit in
-        // fetch_add's modular arithmetic.
-        //
-        // Release ordering: today the only writer is this
-        // (vCPU-thread `reset()`), and the only reader is the
-        // vCPU-thread `mmio_read(CONFIG_GENERATION)`, so
-        // single-threaded access makes Release semantically
-        // unnecessary. Release is defense-in-depth against future
-        // cross-thread config writers (e.g. a follow-up that
-        // resizes the disk from a worker thread or a host
-        // monitor); pairs with the Acquire load in `mmio_read`.
-        self.config_generation.fetch_add(1, Ordering::Release);
-
-        // Phase 2 — engine-specific quiesce and queue reset
-        // (production); respawn deferred to DRIVER_OK via
-        // `consume_pending_respawn`. The `cfg(test)` Inline path
-        // performs an in-place state reset on the caller thread.
-        // Both paths leave the engine in a state where no worker
-        // is currently mutating `interrupt_status` / `irq_evt`.
-        #[cfg(test)]
-        self.reset_engine_inline();
-        #[cfg(not(test))]
-        self.reset_engine_spawned();
-
-        // Phase 3 — quiesce the IRQ path. With the worker stopped
-        // (production) or never-active (test), no new
-        // `irq_evt.write(1)`, `interrupt_status` bit-set, or
-        // `device_status` fetch_or(NEEDS_RESET) can race us. Drain
-        // the eventfd's pending counter so a stale worker write
-        // (delivered between the last add_used and the stop signal)
-        // doesn't fire a phantom IRQ at the post-reset guest; zero
-        // `interrupt_status` so the guest's MMIO read of
-        // INTERRUPT_STATUS observes a clean slate; zero
-        // `device_status` so the guest re-reads STATUS=0 and walks
-        // the FSM from scratch (per virtio-v1.2 §3.1.1: a reset
-        // returns the device to its initial state including all FSM
-        // bits — the NEEDS_RESET bit set by the worker's
-        // queue-poison path is part of that state and clears here).
-        // Both stores are Release-ordered to pair with their
-        // respective `mmio_read` Acquire loads.
-        //
-        // Race window: a worker that completed `add_used` +
-        // `irq_evt.write(1)` after the vCPU latched STATUS=0 but
-        // before the stop signal landed would otherwise leave a
-        // pending eventfd counter; KVM's irqfd would deliver the
-        // GSI to the guest after reset, with the used ring now
-        // empty (post-`q.reset()`), causing the guest's
-        // `virtblk_done` to spin chasing a non-existent
-        // completion. Draining here closes that window. The
-        // device_status store deferral closes the parallel window
-        // for the queue-poison path: a worker that ran
-        // `fetch_or(NEEDS_RESET)` after Phase 1 but before being
-        // joined would otherwise leave the bit set after reset,
-        // and the guest's FSM walk from STATUS=0 → ACK → DRIVER →
-        // FEATURES_OK → DRIVER_OK would silently transition
-        // through a "device still says NEEDS_RESET" state visible
-        // through `mmio_read(STATUS)`.
-        let _ = self.irq_evt.read();
-        // Drain the pause eventfd counter so any `pause()` writes
-        // that landed during this reset cycle (e.g. a freeze
-        // coordinator that fired between `reset_engine_spawned`'s
-        // join and this Phase 3) do not carry a stale tick across
-        // the rebind. Without this drain, the next
-        // `worker_thread_main` (spawned at the next DRIVER_OK)
-        // would observe PAUSE_TOKEN on its first `epoll_wait`,
-        // park immediately, and starve the guest's first kicks
-        // until the coordinator's eventual `resume()`. The read
-        // is best-effort — a `WouldBlock` (counter already 0)
-        // is normal, any other error means the eventfd is
-        // already torn down which the next worker spawn will
-        // re-create.
-        let _ = self.pause_evt.read();
-        self.interrupt_status.store(0, Ordering::Release);
-        self.device_status.store(0, Ordering::Release);
-        // Re-arm the "queue notify before set_mem" warning so a
-        // post-reset wiring bug surfaces (virtio-v1.2 §3.1.1: a
-        // reset puts the device in a state where the driver must
-        // rebind and re-publish queue addresses; if a kick reaches
-        // us before the rebind completes, that's worth a fresh
-        // log line, not a quiet drop based on a latch from a
-        // previous lifetime). Deferred to Phase 3 so the worker
-        // (which is the only thread that swaps the latch to
-        // `true` at worker.rs:788) is joined first — clearing in
-        // Phase 1 would race a live worker swap-true and leave
-        // the latch stuck `true` for the next driver session,
-        // silencing the wiring-bug warning we explicitly want.
-        self.mem_unset_warned.store(false, Ordering::Relaxed);
-    }
-
-    /// Test-mode engine reset: queue mutation and bucket rebuild
-    /// happen on the caller thread (no worker exists). Scratches
-    /// keep their capacity.
-    #[cfg(test)]
-    pub(crate) fn reset_engine_inline(&mut self) {
-        for q in &mut self.worker.queues {
-            q.reset();
-        }
-        let WorkerEngine::Inline(engine) = &mut self.worker.engine;
-        let (ops_bucket, bytes_bucket) = buckets_from_throttle(self.throttle);
-        engine.state.ops_bucket = ops_bucket;
-        engine.state.bytes_bucket = bytes_bucket;
-        engine.state.all_descs_scratch.clear();
-        engine.state.io_buf_scratch.clear();
-        // Reset throttle-stall gauge state. q.reset() above
-        // cleared the queue cursor, so any chain that was
-        // rolled-back-pending is now lost from the device's
-        // perspective — the guest's re-bind will re-issue
-        // chains from a fresh avail.idx=0. The currently_stalled
-        // flag must clear and the gauge must decrement to match;
-        // otherwise the gauge leaks one increment per reset that
-        // happens during a stall window. The gauge is "currently
-        // pending throttle-stalled requests"; post-reset there
-        // are none until the guest re-issues IO.
-        if engine.state.currently_stalled {
-            engine.state.currently_stalled = false;
-            engine.state.counters.record_throttle_pending_dec();
-        }
-        // Clear hostile-guest poison: the guest issued a virtio
-        // reset, which is the only documented escape from the
-        // queue-poisoned state. The `invalid_avail_idx_count`
-        // counter is intentionally NOT cleared here — operators
-        // need cumulative-event visibility across resets to detect
-        // repeated hostile-guest behavior.
-        engine.state.queue_poisoned = false;
-    }
-
-    /// Production engine reset: stop the worker, join, q.reset(),
-    /// stash the reclaimed state in `respawn_pending` for
-    /// `set_status` to consume on the next DRIVER_OK transition.
-    /// The reclaimed state contributes its long-lived resources
-    /// (backing File, scratch capacities, capacity_bytes,
-    /// read_only, counters Arc) — only the throttle buckets are
-    /// rebuilt by `respawn_worker` once DRIVER_OK fires.
-    ///
-    /// Why defer the respawn: between `reset()` and DRIVER_OK
-    /// the guest is rebinding (queue addresses zeroed,
-    /// QUEUE_READY false). A worker spawned eagerly here would
-    /// sit in `epoll_wait` doing nothing for the duration of the
-    /// rebind. See the `SpawnedEngine::respawn_pending` doc for
-    /// the full rationale and race-free invariant.
-    #[cfg(not(test))]
-    pub(crate) fn reset_engine_spawned(&mut self) {
-        // Detect a back-to-back reset (the guest issued STATUS=0
-        // twice without an intervening DRIVER_OK). The first
-        // reset stashed state in respawn_pending and joined the
-        // worker; the second reset has no live worker to stop
-        // and must NOT overwrite the pending state (the second
-        // `stop_worker_and_reclaim_state` would return None and
-        // clobber the first reset's reclaimed state — the
-        // backing File and counter Arc would be lost). Skip the
-        // worker-quiesce step in that case; the queue reset
-        // below still runs because the guest expects a fresh
-        // queue cursor.
-        let already_pending = {
-            let WorkerEngine::Spawned(eng) = &self.worker.engine;
-            eng.respawn_pending.is_some()
-        };
-        if !already_pending {
-            // If a freeze coordinator paused the worker via
-            // `pause()` and a STATUS=0 reset arrives before
-            // `resume()`, the worker is parked in its
-            // `park_timeout(10ms)` Acquire-load loop and does NOT
-            // observe `stop_fd` — `epoll_wait` is unreachable from
-            // the park. Clear `paused` (Release) and unpark BEFORE
-            // writing `stop_fd` so the worker wakes within 10 ms
-            // (or immediately on the unpark hint), exits the park
-            // loop, returns to `epoll_wait`, and observes
-            // STOP_TOKEN. Without this, the
-            // `join_worker_with_timeout(RESET_JOIN_TIMEOUT, 1s)`
-            // would always fire the TimedOut diagnostic when reset
-            // races a paused worker. Cloud-hypervisor's epoll-helper
-            // teardown follows the same unpause-before-stop ordering
-            // (clear the paused flag and wake before signalling the
-            // kill eventfd) so a parked worker observes the kill on
-            // its first epoll-wake rather than after a 10 ms
-            // park-timeout tick.
-            self.resume();
-            let reclaimed = self.stop_worker_and_reclaim_state();
-            // Re-arm the construction-time "paused" sentinel so a
-            // freeze that fires between this stop and the next
-            // DRIVER_OK respawn passes the rendezvous vacuously
-            // (mirrors the `with_options` initialisation). Without
-            // this, the prior `resume()` left `paused=false`, and
-            // the rendezvous would block until the 30 s timeout
-            // waiting for a worker that does not yet exist — the
-            // freeze coordinator's failure-dump path would lose
-            // the dump for any STALL_DETECTED that lands in the
-            // rebind window.
-            self.paused.store(true, Ordering::Release);
-            // Stash the reclaimed state for the deferred respawn.
-            // `set_status` consumes it on the next valid DRIVER_OK
-            // transition. `None` (worker had panicked / timed out /
-            // helper failed) means no state to respawn from — the
-            // device is permanently workerless from this point. The
-            // diagnostic was already logged by
-            // `stop_worker_and_reclaim_state`; the WorkerEngine
-            // remains in `Spawned` form with `handle: None` and
-            // `respawn_pending: None`, so future kicks land on the
-            // stale `kick_fd` and accumulate harmlessly until the
-            // device is destroyed. Only constructing a fresh
-            // `VirtioBlk` recovers IO service.
-            let WorkerEngine::Spawned(eng) = &mut self.worker.engine;
-            eng.respawn_pending = reclaimed;
-        }
-        // q.reset() runs uncontested: the worker thread is joined
-        // (or was never alive in the back-to-back-reset case) and
-        // no new one has been spawned yet, so the QueueSync mutex
-        // has no other holder.
-        for q in &mut self.worker.queues {
-            q.reset();
-        }
-    }
-
-    /// Production: send STOP_TOKEN to the worker, join the
-    /// thread with a [`RESET_JOIN_TIMEOUT`] budget, return the
-    /// worker state. Returns `None` if the worker had already been
-    /// joined (Option already taken — a second `reset()` after a
-    /// torn-down engine, or a concurrent Drop racing the MMIO
-    /// writer; both are operator bugs but must not panic the vCPU
-    /// thread), if the worker panicked, OR if the join timed out
-    /// or the helper machinery itself failed.
-    ///
-    /// # vCPU thread protection
-    ///
-    /// The unbounded `handle.join()` this function previously used
-    /// would block the vCPU thread that received the `STATUS = 0`
-    /// MMIO write through any wedged backing-IO path the worker
-    /// hit (NFS stall, slow page cache, hung block device). The
-    /// freeze coordinator's SIGRTMIN-based rendezvous (30 s wall
-    /// budget at the coordinator level) targets that same vCPU
-    /// thread; an unbounded reset block would either time out the
-    /// rendezvous empty or arrive minutes late. Routing through
-    /// [`join_worker_with_timeout`] caps the vCPU's pre-rendezvous
-    /// overhead at [`RESET_JOIN_TIMEOUT`] (1 s) — the same
-    /// invariant `Drop` enforces via [`DROP_JOIN_TIMEOUT`].
-    ///
-    /// # Outcomes
-    ///
-    /// - [`JoinWithTimeoutOutcome::Joined`] → return `Some(state)`;
-    ///   reset proceeds to `q.reset()` + respawn.
-    /// - [`JoinWithTimeoutOutcome::Panicked`] → log structured
-    ///   error (matching Drop's diagnostic), return `None`. Device
-    ///   enters permanent-workerless state.
-    /// - [`JoinWithTimeoutOutcome::TimedOut`] → log structured
-    ///   warn (worker is wedged in a blocking syscall that does
-    ///   not check stop_fd), return `None`. Helper retains the
-    ///   `JoinHandle` and the underlying `BlkWorkerState`; the
-    ///   wedged worker keeps running until its blocking syscall
-    ///   returns. Device enters permanent-workerless state — the
-    ///   resource-retention trade documented at
-    ///   [`join_worker_with_timeout`] applies here too.
-    /// - [`JoinWithTimeoutOutcome::HelperSpawnFailed`] /
-    ///   [`JoinWithTimeoutOutcome::HelperDisconnected`] → log
-    ///   structured error, return `None`. Outer worker is
-    ///   detached.
-    ///
-    /// All four non-Joined outcomes funnel through the
-    /// "permanent device death" path documented at
-    /// [`VirtioBlk::reset_engine_spawned`] — `reclaimed = None`
-    /// skips the respawn and the device serves no further IO
-    /// until reconstruction.
-    #[cfg(not(test))]
-    pub(crate) fn stop_worker_and_reclaim_state(&mut self) -> Option<BlkWorkerState> {
-        let WorkerEngine::Spawned(eng) = &mut self.worker.engine;
-        // Capture device-identifier fields before the
-        // `eng.handle.take()` consumes the Option, so the
-        // diagnostic warns can name the wedged device without
-        // re-borrowing `self`.
-        let stop_fd = eng.stop_fd.as_raw_fd();
-        let capacity_sectors = self.capacity_sectors;
-        let instance_id = self.instance_id;
-        // Signal the worker to exit via the stop_fd helper, which
-        // retries on EAGAIN (eventfd counter saturation) up to
-        // STOP_FD_WRITE_MAX_RETRIES times before giving up. On
-        // exhaustion the worker may not observe the stop signal;
-        // the subsequent join's RESET_JOIN_TIMEOUT budget bounds
-        // the wait to 1 s and surfaces the stall through the
-        // TimedOut diagnostic below.
-        signal_worker_stop(&eng.stop_fd, stop_fd, instance_id, capacity_sectors);
-        // Re-borrow eng after the immutable reads above — needed
-        // because `take()` mutates the Option.
-        let WorkerEngine::Spawned(eng) = &mut self.worker.engine;
-        let handle = eng.handle.take()?;
-        match join_worker_with_timeout(handle, RESET_JOIN_TIMEOUT) {
-            JoinWithTimeoutOutcome::Joined(state) => Some(state),
-            JoinWithTimeoutOutcome::Panicked(payload) => {
-                tracing::error!(
-                    panic = panic_payload_str(&*payload),
-                    stop_fd,
-                    capacity_sectors,
-                    instance_id,
-                    "virtio-blk worker thread panicked during reset; \
-                     no state to reclaim — device will not service IO \
-                     until a fresh VirtioBlk is constructed"
-                );
-                None
-            }
-            JoinWithTimeoutOutcome::TimedOut => {
-                tracing::warn!(
-                    timeout_s = RESET_JOIN_TIMEOUT.as_secs_f32(),
-                    stop_fd,
-                    capacity_sectors,
-                    instance_id,
-                    "virtio-blk worker did not exit within \
-                     RESET_JOIN_TIMEOUT of stop_fd during reset; \
-                     leaking the worker thread to avoid blocking the \
-                     vCPU thread (which the freeze coordinator may \
-                     target with SIGRTMIN). Device enters the \
-                     permanent-workerless state — guests will hang \
-                     on every request until \
-                     kernel.hung_task_timeout_secs (default 120 s) \
-                     fires, and only constructing a fresh VirtioBlk \
-                     recovers IO service. \
-                     hint: identify the wedged device by stop_fd / \
-                     instance_id / capacity_sectors above. \
-                     hint: check `dmesg` for the backing fd's \
-                     storage path stalling on I/O, or kill -USR1 \
-                     the host process to dump worker thread \
-                     backtraces."
-                );
-                None
-            }
-            JoinWithTimeoutOutcome::HelperSpawnFailed => {
-                tracing::error!(
-                    stop_fd,
-                    capacity_sectors,
-                    instance_id,
-                    "virtio-blk reset helper thread spawn failed; \
-                     detaching worker without join — device enters \
-                     the permanent-workerless state"
-                );
-                None
-            }
-            JoinWithTimeoutOutcome::HelperDisconnected => {
-                tracing::error!(
-                    stop_fd,
-                    capacity_sectors,
-                    instance_id,
-                    "virtio-blk reset helper thread terminated \
-                     without forwarding the worker join result; \
-                     device enters the permanent-workerless state"
-                );
-                None
-            }
-        }
-    }
-
-    /// Drain any state stashed in `SpawnedEngine::respawn_pending`
-    /// by a prior `reset_engine_spawned` call and pass it to
-    /// `respawn_worker`. Called by `set_status` on the DRIVER_OK
-    /// transition — the only legal point at which the guest has
-    /// finished publishing fresh queue addresses and the worker
-    /// has real work to service.
-    ///
-    /// `respawn_pending` is `take()`-ed unconditionally even when
-    /// `respawn_worker` itself fails to construct fresh fds or
-    /// spawn the thread. This avoids leaving stale state holding
-    /// scratch buffers and the backing-file `File` handle alive
-    /// past the device's effective lifetime — the failure
-    /// diagnostics from `respawn_worker` already document the
-    /// permanent-workerless outcome. A second DRIVER_OK with no
-    /// pending state (e.g. the guest re-binds without an
-    /// intervening reset) is a no-op.
-    #[cfg(not(test))]
-    pub(crate) fn consume_pending_respawn(&mut self) {
-        let pending = {
-            let WorkerEngine::Spawned(eng) = &mut self.worker.engine;
-            eng.respawn_pending.take()
-        };
-        if let Some(state) = pending {
-            self.respawn_worker(state);
-        }
-    }
-
-    /// Production: build a fresh `SpawnedEngine` (new kick_fd,
-    /// stop_fd, worker thread) seeded with the reclaimed
-    /// `BlkWorkerState`, and replace `self.worker.engine`. The
-    /// throttle buckets in `state` are reconstructed from the
-    /// captured `self.throttle` so an adversarial guest cannot
-    /// drain the bucket and issue a reset to bypass the rate
-    /// limit (spec-compliant: virtio-v1.2 §2.1 requires reset to
-    /// return the device to its initial state, and bucket fill is
-    /// part of that state).
-    ///
-    /// Scratch buffers (`all_descs_scratch`, `io_buf_scratch`) are
-    /// `clear()`-ed (length zeroed, capacity retained) so the
-    /// next worker iteration starts with no stale entries but
-    /// without paying re-allocation cost on the first request.
-    ///
-    /// # Failure consequences
-    ///
-    /// On any resource-creation failure inside this function
-    /// (`EventFd::new`, `try_clone`, `thread::Builder::spawn`),
-    /// the engine is left holding the *old* `SpawnedEngine` whose
-    /// `handle` field is `None` (taken by
-    /// `stop_worker_and_reclaim_state` before this respawn).
-    /// Future kicks via `process_requests` write to the stale
-    /// `kick_fd` that no live worker is reading; the eventfd's
-    /// counter increments harmlessly, but no IO completes — the
-    /// guest will hang on every request until
-    /// `kernel.hung_task_timeout_secs` (default 120 s) fires or
-    /// the host destroys the device. The error is logged but not
-    /// propagated to the caller (`reset()` returns `()` and the
-    /// vCPU thread continues). This is permanent device death;
-    /// only constructing a fresh `VirtioBlk` recovers the disk.
-    #[cfg(not(test))]
-    pub(crate) fn respawn_worker(&mut self, mut state: BlkWorkerState) {
-        let (ops_bucket, bytes_bucket) = buckets_from_throttle(self.throttle);
-        state.ops_bucket = ops_bucket;
-        state.bytes_bucket = bytes_bucket;
-        state.all_descs_scratch.clear();
-        state.io_buf_scratch.clear();
-        // Reset throttle-stall gauge state. q.reset() (run by
-        // the caller before this) cleared the queue cursor, so
-        // any chain that was rolled-back-pending is now lost
-        // from the device's perspective — the guest's re-bind
-        // will re-issue chains from a fresh avail.idx=0. The
-        // currently_stalled flag must clear and the gauge must
-        // decrement to match; otherwise the gauge leaks one
-        // increment per reset-while-stalled scenario across the
-        // device's lifetime.
-        if state.currently_stalled {
-            state.currently_stalled = false;
-            state.counters.record_throttle_pending_dec();
-        }
-        // Clear hostile-guest poison: the guest issued a virtio
-        // reset, which is the only documented escape from the
-        // queue-poisoned state. `invalid_avail_idx_count` stays
-        // because it tracks cumulative events across the device's
-        // lifetime, not per-rebind state.
-        state.queue_poisoned = false;
-
-        // Build fresh kick/stop fds — the previous worker's
-        // counter values are stale (a kick that arrived during
-        // the old worker's drain may have been read but never
-        // serviced before the stop, and the stop counter is
-        // already incremented), and a hung vCPU mid-write to the
-        // old kick_fd has nothing to coalesce against. Fresh fds
-        // give a clean slate.
-        //
-        // The OLD worker's timerfd is owned by `worker_thread_main`'s
-        // stack frame and dropped on STOP_TOKEN exit; we do NOT
-        // need to migrate it. By the time this respawn runs:
-        //   * `q.reset()` (called by the parent `reset_engine_spawned`
-        //     just above this respawn) cleared the queue cursor —
-        //     any chain that was rolled back via `set_next_avail`
-        //     is gone from the device's perspective.
-        //   * `state.ops_bucket` and `state.bytes_bucket` are
-        //     rebuilt from `self.throttle` to full capacity, so
-        //     the new worker's first drain attempt will not stall
-        //     on a refill deficit (no timerfd needs to be armed
-        //     for a chain that never re-stalls).
-        //   * The guest must rebind (publish fresh queue addresses
-        //     and set `QUEUE_READY = 1`) before any kick can fire.
-        //     Until then `drain_bracket_impl` short-circuits on
-        //     the `queues[REQ_QUEUE].ready()` gate — no drain, no
-        //     stall, no need for a pending timerfd.
-        // The clean-state contract above means a new timerfd
-        // arms naturally on the first post-rebind stall, exactly
-        // when one is needed.
-        let kick_fd = match EventFd::new(libc::EFD_NONBLOCK) {
-            Ok(fd) => fd,
-            Err(e) => {
-                tracing::error!(
-                    %e,
-                    "virtio-blk reset: kick eventfd creation failed; \
-                     leaving device without a worker — IO will not \
-                     be serviced until reconstruction"
-                );
-                return;
-            }
-        };
-        let stop_fd = match EventFd::new(libc::EFD_NONBLOCK) {
-            Ok(fd) => fd,
-            Err(e) => {
-                tracing::error!(
-                    %e,
-                    "virtio-blk reset: stop eventfd creation failed; \
-                     leaving device without a worker — IO will not \
-                     be serviced until reconstruction"
-                );
-                return;
-            }
-        };
-        let worker_kick = match kick_fd.try_clone() {
-            Ok(fd) => fd,
-            Err(e) => {
-                tracing::error!(
-                    %e,
-                    "virtio-blk reset: kick eventfd clone failed; \
-                     leaving device without a worker"
-                );
-                return;
-            }
-        };
-        let worker_stop = match stop_fd.try_clone() {
-            Ok(fd) => fd,
-            Err(e) => {
-                tracing::error!(
-                    %e,
-                    "virtio-blk reset: stop eventfd clone failed; \
-                     leaving device without a worker"
-                );
-                return;
-            }
-        };
-        // Worker-side read clone of the host-owned `pause_evt`.
-        // `try_clone` is `dup(2)`: it produces a new file descriptor
-        // that points at the SAME underlying eventfd kernel object,
-        // so the counter and any pending POLLIN readiness are shared
-        // with `self.pause_evt`. The clone exists not to give the
-        // worker a private counter (it can't — the kernel object is
-        // shared) but because each fd can be registered in only one
-        // epoll set: the worker's epoll holds this fd, while the
-        // host side keeps `self.pause_evt` for `pause()` /
-        // `is_paused()`. Counter cleanliness across respawns is
-        // handled separately by `reset_engine_spawned`'s Phase 3
-        // `pause_evt.read()` drain (V3) — a stale `1` from a
-        // pre-stop write would otherwise carry across to the new
-        // worker and trigger an immediate spurious park.
-        let pause_fd = match self.pause_evt.try_clone() {
-            Ok(fd) => fd,
-            Err(e) => {
-                tracing::error!(
-                    %e,
-                    "virtio-blk reset: pause eventfd clone failed; \
-                     leaving device without a worker"
-                );
-                return;
-            }
-        };
-        // Clone the queue handles and Arcs the worker needs.
-        // QueueSync is internally an `Arc<Mutex<Queue>>` so the
-        // clone is cheap (refcount bump).
-        let worker_queues = [self.worker.queues[REQ_QUEUE].clone()];
-        let worker_mem = Arc::clone(&self.mem);
-        let worker_irq = Arc::clone(&self.irq_evt);
-        let worker_status = Arc::clone(&self.interrupt_status);
-        let worker_device_status = Arc::clone(&self.device_status);
-        let worker_warned = Arc::clone(&self.mem_unset_warned);
-        let worker_paused = Arc::clone(&self.paused);
-        let worker_parked_evt_slot = Arc::clone(&self.parked_evt);
-        // Snapshot the placement at spawn time. A subsequent
-        // `set_worker_placement` call only takes effect on the
-        // NEXT respawn; the running worker observes the placement
-        // captured here. This matches cloud-hypervisor's "topology
-        // applied at activate()" pattern.
-        let worker_placement = self.worker_placement.clone();
-
-        let handle = match thread::Builder::new()
-            .name("ktstr-vblk".to_string())
-            .spawn(move || {
-                worker_thread_main(
-                    state,
-                    worker_queues,
-                    worker_mem,
-                    worker_irq,
-                    worker_status,
-                    worker_device_status,
-                    worker_warned,
-                    worker_paused,
-                    worker_placement,
-                    worker_kick,
-                    worker_stop,
-                    pause_fd,
-                    worker_parked_evt_slot,
-                )
-            }) {
-            Ok(h) => h,
-            Err(e) => {
-                tracing::error!(
-                    %e,
-                    "virtio-blk reset: worker thread spawn failed; \
-                     leaving device without a worker"
-                );
-                return;
-            }
-        };
-        let WorkerEngine::Spawned(eng) = &mut self.worker.engine;
-        *eng = SpawnedEngine {
-            kick_fd,
-            stop_fd,
-            handle: Some(handle),
-            respawn_pending: None,
-        };
-    }
-
-    /// Signal the worker thread to park for a failure-dump
-    /// rendezvous. Writes 1 to `pause_evt`; the worker's
-    /// `epoll_wait` resumes on PAUSE_TOKEN, drains the eventfd
-    /// counter, stores `paused=true` (Release), and parks in a
-    /// 10 ms `park_timeout` loop until [`Self::resume`] clears
-    /// the flag.
-    ///
-    /// The freeze coordinator polls `paused.load(Acquire)` after
-    /// calling this to confirm the worker has reached the parked
-    /// state before reading guest memory. The Release/Acquire
-    /// pair provides the happens-before edge that makes the
-    /// host-side post-rendezvous reads observe every queue
-    /// mutation the worker performed pre-pause.
-    ///
-    /// Cfg-independent: `cfg(test)` builds use the inline engine,
-    /// so `pause()` writes to the host eventfd but no worker is
-    /// blocked on it; the test harness can inspect
-    /// `self.paused.load()` directly to verify the host-side
-    /// rendezvous machinery without a worker thread.
-    ///
-    /// On EAGAIN (counter saturation at u64::MAX-1) or EBADF
-    /// (closed fd during shutdown), we log via `tracing::warn!`
-    /// and return — the caller's downstream `paused.load(Acquire)`
-    /// poll either succeeds (a prior pause ack is still latched) or
-    /// times out at the 30s rendezvous deadline. Saturation is
-    /// implausible in practice (every `pause()` is paired with a
-    /// `resume()` that does NOT increment the counter; the worker's
-    /// drain reads it back to 0 each cycle).
-    pub fn pause(&self) {
-        // No-live-worker fast path. With the deferred-spawn lifecycle
-        // (initial worker created on the first DRIVER_OK), there is a
-        // window between `with_options` and the guest's bind where no
-        // thread is reading `pause_fd`. Writing the eventfd is still
-        // safe — counter just accumulates harmlessly, and `reset`'s
-        // Phase 3 drain (V3) clears it before the next worker spawns —
-        // but the counter would otherwise carry a stale tick across
-        // a respawn, and the rendezvous already passes vacuously
-        // because `paused` was initialised to `true` and is never
-        // cleared until the worker actually starts. Skip the write
-        // and log at `debug` level so a misuse (pause without a
-        // worker) is observable but not noisy.
-        #[cfg(not(test))]
-        {
-            let WorkerEngine::Spawned(eng) = &self.worker.engine;
-            if eng.handle.is_none() {
-                tracing::debug!(
-                    "virtio-blk pause() with no live worker; \
-                     `paused` is already `true` from construction \
-                     (or post-stop), rendezvous will pass vacuously"
-                );
-                return;
-            }
-        }
-        if let Err(e) = self.pause_evt.write(1) {
-            tracing::warn!(%e, "virtio-blk pause_evt.write failed");
-        }
-    }
-
-    /// Clear the worker's parked state. Stores `paused=false`
-    /// (Release); the worker's 10 ms `park_timeout` Acquire-load
-    /// observes the clear within 10 ms and resumes its
-    /// `epoll_wait` loop. The `unpark` call is a hint — the
-    /// `park_timeout` already wakes periodically so a missed
-    /// unpark is bounded at 10 ms latency, not unbounded.
-    ///
-    /// Cfg-independent for the same reason as [`Self::pause`].
-    /// Returns `true` if a worker thread is alive and was
-    /// unparked; `false` if the engine has no live worker (test
-    /// mode, post-stop, post-failed-respawn). Callers use the
-    /// return value to skip a `resume()` that has nothing to
-    /// resume.
-    pub fn resume(&self) -> bool {
-        // No-live-worker fast path. Mirrors `pause()`'s early-return:
-        // when the engine has no live thread (pre-DRIVER_OK, post-stop,
-        // post-failed-respawn), preserve the V1 sentinel by RE-ARMING
-        // `paused = true` instead of clearing it. Without this, a
-        // dual-snapshot freeze (early + late) that calls
-        // pause()/resume() across the rebind window would clear the
-        // sentinel on the first resume(), and the second freeze's
-        // is_paused() poll would observe `false` and time out at
-        // FREEZE_RENDEZVOUS_TIMEOUT waiting for a worker that does
-        // not exist. Re-arming preserves the vacuous-pass invariant
-        // across consecutive freezes.
-        #[cfg(not(test))]
-        {
-            let WorkerEngine::Spawned(eng) = &self.worker.engine;
-            if let Some(ref handle) = eng.handle {
-                self.paused.store(false, Ordering::Release);
-                handle.thread().unpark();
-                return true;
-            }
-            // No live worker — re-arm the sentinel.
-            self.paused.store(true, Ordering::Release);
-            false
-        }
-        #[cfg(test)]
-        {
-            // Inline engine: no worker thread to unpark; the
-            // store(Release) above is the entire resume side. A
-            // test harness driving pause/resume observes the
-            // updated `paused` flag directly.
-            self.paused.store(false, Ordering::Release);
-            false
-        }
-    }
-
-    /// Return `true` when the worker has acknowledged a prior
-    /// [`Self::pause`] call by parking. The freeze coordinator's
-    /// rendezvous loop uses this to wait for the worker's parked
-    /// state before reading guest memory. Acquire ordering pairs
-    /// with the worker's `paused.store(true, Release)` so the
-    /// host-side reads happen-after every queue mutation the
-    /// worker performed pre-pause.
-    ///
-    /// Cfg-independent for the same reason as [`Self::pause`].
-    // Production callers retired with the freeze-coordinator queue
-    // pause path; preserved for `tests_atomics` Acquire/Release pin.
-    #[allow(dead_code)]
-    pub fn is_paused(&self) -> bool {
-        self.paused.load(Ordering::Acquire)
-    }
-}
-
-/// Maximum number of retries [`signal_worker_stop`] performs when
-/// `EventFd::write` returns `WouldBlock` (EAGAIN). The eventfd
-/// counter saturates at `u64::MAX - 1`; reaching that value
-/// requires `~2^64` unbalanced writes, which the device never
-/// emits — each `reset()`/`Drop` writes the stop_fd exactly once
-/// per fresh fd allocation. The retry loop exists strictly as
-/// defense-in-depth against a future regression that re-uses a
-/// long-lived stop_fd (or any other path that could let the
-/// counter accumulate). 4 retries with `thread::yield_now`
-/// between each gives the worker thread (running on the same
-/// CPU under contention) a chance to drain the counter via its
-/// `epoll_wait → read` cycle.
-#[cfg(not(test))]
-const STOP_FD_WRITE_MAX_RETRIES: u32 = 4;
-
-/// Best-effort signal to the worker thread to exit by writing 1
-/// to its `stop_fd`. Retries up to [`STOP_FD_WRITE_MAX_RETRIES`]
-/// times on `WouldBlock` (EAGAIN — counter saturation),
-/// yielding the scheduler between attempts so a co-located
-/// worker can drain the eventfd counter. Logs the per-attempt
-/// failure so the operator can see the rare path even when the
-/// retry succeeds.
-///
-/// On exhaustion: log a structured warn and return — the caller
-/// (`Drop` / `stop_worker_and_reclaim_state`) proceeds to the
-/// join-with-timeout path. If the stop signal never reaches the
-/// worker the join will time out and the existing
-/// permanent-workerless diagnostic surfaces. The retry exists to
-/// surface the failure-path itself; it does NOT promise the
-/// worker will exit (only the join timeout does).
-///
-/// `device_id` is the per-device tracing tuple (stop_fd raw fd,
-/// instance_id, capacity_sectors) so a warn can correlate to
-/// the wedged device without the caller plumbing the same
-/// fields through. Free function (not method) so the borrow is
-/// limited to the EventFd reference; the caller still owns
-/// `&mut self.worker.engine`.
-#[cfg(not(test))]
-pub(crate) fn signal_worker_stop(
-    stop_fd: &EventFd,
-    raw_fd: std::os::unix::io::RawFd,
-    instance_id: u64,
-    capacity_sectors: u64,
-) {
-    for attempt in 0..STOP_FD_WRITE_MAX_RETRIES {
-        match stop_fd.write(1) {
-            Ok(()) => return,
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                tracing::warn!(
-                    attempt,
-                    stop_fd = raw_fd,
-                    instance_id,
-                    capacity_sectors,
-                    "virtio-blk stop_fd write returned WouldBlock; \
-                     eventfd counter likely saturated. Yielding and retrying"
-                );
-                std::thread::yield_now();
-            }
-            Err(e) => {
-                tracing::error!(
-                    attempt,
-                    stop_fd = raw_fd,
-                    instance_id,
-                    capacity_sectors,
-                    %e,
-                    "virtio-blk stop_fd write failed with non-EAGAIN error; \
-                     worker may not observe the stop signal — \
-                     downstream join will surface the timeout"
-                );
-                return;
-            }
-        }
-    }
-    tracing::error!(
-        max_retries = STOP_FD_WRITE_MAX_RETRIES,
-        stop_fd = raw_fd,
-        instance_id,
-        capacity_sectors,
-        "virtio-blk stop_fd write exhausted retries on WouldBlock; \
-         worker did not consume the eventfd counter in time — \
-         downstream join will surface the timeout and the device \
-         enters the permanent-workerless state"
-    );
-}
-
-/// Upper bound on how long [`VirtioBlk::drop`] will block while
-/// joining the worker thread.
-///
-/// 1 s is a deliberate trade between two failure modes. Below 1 s,
-/// the timeout would fire on healthy shutdowns under load — the
-/// worker may be mid-`pread`/`pwrite` when `stop_fd` is signalled,
-/// and a fast-but-not-instant drain (cold page cache, contended
-/// disk) can take tens to hundreds of milliseconds before the
-/// worker reaches the next `epoll_wait` and observes the stop. A
-/// budget shorter than typical drain latency would log false
-/// "wedged worker" warnings and detach threads that were about to
-/// exit. Above 1 s, the budget would risk vCPU thread starvation
-/// during freeze rendezvous: the freeze coordinator's SIGRTMIN
-/// rendezvous timeout is 30 s and the vCPU thread can be mid-`drop`
-/// at that moment, so any `Drop` blocking budget compounds with
-/// other pre-rendezvous overhead.
-///
-/// The 1 s value is large enough to absorb realistic drain
-/// latency on warm caches and small enough to keep the `Drop`
-/// completion well below the rendezvous threshold.
-pub(crate) const DROP_JOIN_TIMEOUT: Duration = Duration::from_secs(1);
-
-/// Upper bound on how long [`VirtioBlk::reset`] (production
-/// `WorkerEngine::Spawned` path) will block while joining the
-/// outgoing worker thread before declaring it wedged and entering
-/// the permanent-device-death state documented at
-/// [`VirtioBlk::reset_engine_spawned`].
-///
-/// The same budget as [`DROP_JOIN_TIMEOUT`] (1 s) and for the same
-/// reasons: a `reset()` runs on the vCPU thread that received the
-/// `STATUS = 0` MMIO write, and that vCPU thread can be the next
-/// SIGRTMIN target the freeze coordinator picks for a
-/// failure-dump rendezvous (30 s wall budget at the coordinator
-/// level — see `FREEZE_RENDEZVOUS_TIMEOUT` in
-/// `src/vmm/freeze_coord.rs`). An unbounded `handle.join()` here would
-/// block the vCPU through the worker's wedged `pread`/`pwrite`
-/// (NFS stall, slow page cache, hung block device) and the freeze
-/// would either time out empty or arrive minutes late. Capping at
-/// the same 1 s the Drop path uses keeps the "reset takes ≤ 1 s
-/// of vCPU time" invariant uniform — a guest issuing a re-bind
-/// burst (multiple resets in flight from a confused driver) does
-/// not compound the per-reset cap into a multi-second freeze
-/// blocker.
-///
-/// Below 1 s would fire false-positive timeouts on healthy resets
-/// where the worker is mid-sync on a contended disk; above 1 s
-/// would let a single hung worker pin the vCPU past the freeze
-/// coordinator's rendezvous tolerance.
-///
-/// On timeout the device enters the same permanent-workerless
-/// state described in [`VirtioBlk::respawn_worker`]'s "Failure
-/// consequences" section: future kicks land on a stale `kick_fd`
-/// and the guest hangs on every request until
-/// `kernel.hung_task_timeout_secs` (default 120 s) fires. Only
-/// constructing a fresh `VirtioBlk` recovers IO service. This is
-/// the explicit trade chosen over blocking a vCPU thread
-/// indefinitely — the same trade [`DROP_JOIN_TIMEOUT`] makes for
-/// the destructor path.
-///
-/// Visible to `cfg(test)` builds so the unit-test module can pin
-/// the constant's value via `reset_join_timeout_matches_drop_budget`
-/// without duplicating the literal. The production callsite in
-/// [`VirtioBlk::stop_worker_and_reclaim_state`] is itself
-/// `cfg(not(test))`, so the const stays unread in test builds —
-/// the test module references it explicitly.
-pub(crate) const RESET_JOIN_TIMEOUT: Duration = Duration::from_secs(1);
-
-/// Outcome of a bounded join attempt by [`join_worker_with_timeout`].
-///
-/// The variants distinguish observable shutdown states so callers
-/// can log appropriately and unit tests can assert which path the
-/// worker took. `Joined` carries the recovered `BlkWorkerState`;
-/// the other variants are valueless because the state is either
-/// lost (panic) or still owned by a detached helper / worker
-/// thread (timeout, helper failure).
-pub(crate) enum JoinWithTimeoutOutcome {
-    /// Worker exited normally and yielded its `BlkWorkerState`.
-    /// `dead_code` allow: the carried state is consumed only by
-    /// `stop_worker_and_reclaim_state` (cfg(not(test))). Under
-    /// `cargo check --tests` no reader exists, but
-    /// `join_worker_with_timeout` still constructs the variant
-    /// and the value matters for production reset.
-    #[allow(dead_code)]
-    Joined(BlkWorkerState),
-    /// Worker panicked. The variant carries the panic payload
-    /// returned by `JoinHandle::join` so the caller can render it
-    /// (commonly a `&'static str` or `String` from `panic!(…)`)
-    /// into a log message via `Debug` or by downcasting.
-    Panicked(Box<dyn std::any::Any + Send>),
-    /// Worker did not exit within `timeout`. The original
-    /// `JoinHandle` is held by the helper thread, which continues
-    /// running until the worker finally exits.
-    TimedOut,
-    /// `thread::Builder::spawn` for the helper thread failed
-    /// (typically `EAGAIN` from `RLIMIT_NPROC` or thread-count
-    /// exhaustion). The original handle was dropped — the worker
-    /// is detached.
-    HelperSpawnFailed,
-    /// Helper thread itself panicked before forwarding the join
-    /// result. Worker's outcome is unknown.
-    HelperDisconnected,
-}
-
-/// Best-effort conversion of a `JoinHandle::join` panic payload to
-/// a borrowed `&str`. Matches the two variants `panic!(…)` emits
-/// in safe code: `&'static str` for `panic!("literal")` and
-/// `String` for `panic!("{}", x)` / `panic!(format!(…))`. Other
-/// payload types fall through to the placeholder `<non-string panic>`.
-pub(crate) fn panic_payload_str(payload: &(dyn std::any::Any + Send)) -> &str {
-    if let Some(s) = payload.downcast_ref::<&'static str>() {
-        s
-    } else if let Some(s) = payload.downcast_ref::<String>() {
-        s.as_str()
-    } else {
-        "<non-string panic>"
-    }
-}
-
-/// Join `handle` with an upper bound on the calling thread's wait
-/// time.
-///
-/// Spawns a short-lived `ktstr-vblk-drop` helper thread that
-/// performs the blocking `JoinHandle::join` and forwards the
-/// result on an `mpsc::channel`. The calling thread waits via
-/// `recv_timeout`; on timeout the helper is left running with the
-/// handle and the calling thread returns. This bounds the
-/// worst-case duration even when the worker is wedged in a
-/// blocking syscall that does not check `stop_fd`
-/// (`pread`/`pwrite` on slow backing, hung NFS, etc.). The vCPU
-/// thread — which calls `VirtioBlk::drop` post-reset — therefore
-/// cannot miss a SIGRTMIN delivery during freeze rendezvous
-/// because the worker is hung.
-///
-/// # Outcomes
-///
-/// - [`JoinWithTimeoutOutcome::Joined`] — worker exited within
-///   `timeout`; state recovered.
-/// - [`JoinWithTimeoutOutcome::Panicked`] — worker exited within
-///   `timeout`, but with a panic; state lost. The `Box<dyn Any +
-///   Send>` payload returned by `JoinHandle::join` is propagated
-///   so the caller can render it via [`panic_payload_str`] or by
-///   downcasting to a concrete type.
-/// - [`JoinWithTimeoutOutcome::TimedOut`] — worker did not exit
-///   within `timeout`. Helper retains the `JoinHandle` and (through
-///   it) the worker's `BlkWorkerState` until the worker finally
-///   exits; if the worker never exits (perpetually-stuck IO), the
-///   state outlives the device.
-/// - [`JoinWithTimeoutOutcome::HelperSpawnFailed`] — the helper
-///   thread itself could not be created (`RLIMIT_NPROC`,
-///   thread-count exhaustion). Falling back to a direct
-///   `handle.join()` would re-introduce the unbounded block this
-///   function exists to prevent, so the handle is dropped and the
-///   worker is detached.
-/// - [`JoinWithTimeoutOutcome::HelperDisconnected`] — the helper
-///   thread panicked before forwarding the join result. Worker's
-///   outcome is unknown; the helper's `JoinHandle<()>` is dropped
-///   when this function returns, detaching it.
-///
-/// # Resource retention on timeout
-///
-/// `BlkWorkerState` owns a `File`, an `Arc<VirtioBlkCounters>`,
-/// two scratch `Vec`s, and two `TokenBucket`s. On timeout these
-/// are reclaimed only when the worker thread finally exits; if it
-/// does not, they outlive the device. This is the explicit trade
-/// chosen over blocking a vCPU thread indefinitely. (The worker
-/// also retains an `Arc<GuestMemoryMmap>` and the queue Arc clones
-/// it was spawned with; those are part of the worker thread's
-/// stack frame, not `BlkWorkerState`, but the same retention
-/// applies — they live until the worker exits.)
-pub(crate) fn join_worker_with_timeout(
-    handle: thread::JoinHandle<BlkWorkerState>,
-    timeout: Duration,
-) -> JoinWithTimeoutOutcome {
-    let (tx, rx) = mpsc::channel();
-    let spawn_result = thread::Builder::new()
-        .name("ktstr-vblk-drop".to_string())
-        .spawn(move || {
-            // Forward the join result. `send` failure means the
-            // calling thread already gave up on `recv_timeout`
-            // and dropped `rx`; the helper still owns the joined
-            // state until this closure returns.
-            let _ = tx.send(handle.join());
-        });
-    let _helper = match spawn_result {
-        Ok(h) => h,
-        Err(_) => return JoinWithTimeoutOutcome::HelperSpawnFailed,
-    };
-    match rx.recv_timeout(timeout) {
-        Ok(Ok(state)) => JoinWithTimeoutOutcome::Joined(state),
-        Ok(Err(payload)) => JoinWithTimeoutOutcome::Panicked(payload),
-        Err(mpsc::RecvTimeoutError::Timeout) => JoinWithTimeoutOutcome::TimedOut,
-        Err(mpsc::RecvTimeoutError::Disconnected) => JoinWithTimeoutOutcome::HelperDisconnected,
-    }
-}
-
-/// `Drop` matches on `WorkerEngine` rather than gating the entire
-/// impl on `cfg(not(test))`: the Inline branch is a no-op (the
-/// default Drop drops `BlkWorkerState` cleanly when the engine
-/// goes out of scope), the Spawned branch signals via `stop_fd`
-/// and joins the worker thread so its resources (state, queues,
-/// Arcs, eventfd clones) are reclaimed before `VirtioBlk` is
-/// fully torn down.
-///
-/// The unconditional impl removes a fragility: a cfg-gated Drop
-/// silently disappears in `cfg(test)`, so any pre-Drop side effect
-/// added later (e.g. `tracing::debug!` on shutdown) would be
-/// missing in tests. Pattern-matching the engine variant inside a
-/// single impl keeps the dispatch obvious and makes adding such
-/// side effects symmetric across cfgs. A regression that detached
-/// the worker thread without stopping it would leave a daemon
-/// thread holding the queue Arcs and the backing file open after
-/// the device is dropped — visible as "test process leaks fds and
-/// threads under stress."
-///
-/// # Bounded join
-///
-/// The Spawned arm quiesces the worker thread (production
-/// `WorkerEngine::Spawned` path) by writing the `stop_fd` and
-/// joining the thread with [`DROP_JOIN_TIMEOUT`] via
-/// [`join_worker_with_timeout`]. On timeout the helper thread
-/// retains the `JoinHandle` and the calling thread returns
-/// without blocking further. The match arms log per-outcome
-/// diagnostics — every error arm emits a structured `tracing`
-/// event so the operator can correlate a missing-VM teardown
-/// against the originating device. `JoinWithTimeoutOutcome::Joined`
-/// is silent (clean shutdown is not logged). See
-/// [`join_worker_with_timeout`] for full outcome semantics and
-/// resource-retention notes, and [`DROP_JOIN_TIMEOUT`] for why
-/// the budget is set where it is.
-///
-/// # Resource retention on `TimedOut`
-///
-/// When the worker join exceeds [`DROP_JOIN_TIMEOUT`] (the
-/// `JoinWithTimeoutOutcome::TimedOut` arm), the [`Drop`] returns
-/// without calling [`std::thread::JoinHandle::join`] — the
-/// helper thread is detached and the worker keeps running. Every
-/// `Arc` the worker holds remains live until the worker thread
-/// exits naturally (typically when its blocking syscall
-/// returns) and its captured state finally drops.
-///
-/// The retained Arcs are:
-/// - `Arc<OnceLock<GuestMemoryMmap>>` (the `mem` field;
-///   cloned into the worker thread frame). The guest memory
-///   mapping stays mapped on the host until the worker exits —
-///   the parent VM's teardown does NOT free guest memory at the
-///   `VirtioBlk::drop` site.
-/// - `Arc<EventFd>` (the IRQ eventfd, `irq_evt`). The eventfd's
-///   kernel object stays alive; the kvmfd irqfd binding the
-///   parent VM held does not unwind synchronously.
-/// - `Arc<AtomicU32>` (the `interrupt_status` register, used
-///   for the worker's release-store of `VIRTIO_MMIO_INT_VRING`).
-/// - `Arc<AtomicBool>` (the `mem_unset_warned` one-shot latch).
-/// - `Arc<VirtioBlkCounters>` (the per-device counter Arc the
-///   worker increments on each request).
-///
-/// Operationally: a wedged worker means the VM teardown returns
-/// to the caller (the calling thread is freed promptly, which is
-/// the [`DROP_JOIN_TIMEOUT`] mechanism's whole point — usually a
-/// vCPU thread that the freeze coordinator must not pin) but
-/// the per-device shared state stays mapped until the kernel
-/// eventually unblocks the worker. For long-lived host
-/// processes that build many VMs, this can accumulate retained
-/// memory; restart the host process to flush all leaked
-/// per-device state. Bug reports mentioning "host RSS keeps
-/// climbing across many ktstr test runs even though no VM is
-/// active" should investigate `tracing::warn!` lines from this
-/// arm to identify the wedged device(s).
-impl Drop for VirtioBlk {
-    fn drop(&mut self) {
-        // Snapshot the device-identifier fields BEFORE the
-        // match so the per-arm logs can correlate the device
-        // across multiple concurrent VirtioBlk drops without
-        // borrowing `self` after the `&mut self.worker.engine`
-        // mutable borrow lands. None of the three are stable
-        // across host restarts (`stop_fd` recycles, `instance_id`
-        // resets at process start) but together they uniquely
-        // identify the device within this process run.
-        // `instance_id` replaces an earlier `self as *const _`
-        // pointer field — the pointer leaked the host's ASLR
-        // layout into log output (environment leakage); the
-        // process-local counter has the same uniqueness shape
-        // without the leak.
-        //
-        // The cfg(test) Inline arm doesn't consume these
-        // snapshots; the `let _ = (capacity_sectors, instance_id);`
-        // reference inside that arm satisfies the
-        // `unused_variables` lint under cfg(test) where the
-        // Spawned arm is excluded. (`stop_fd` is read inside the
-        // cfg(not(test)) Spawned arm directly, so it doesn't
-        // need the same dead-code dance.)
-        let capacity_sectors = self.capacity_sectors;
-        let instance_id = self.instance_id;
-        match &mut self.worker.engine {
-            #[cfg(test)]
-            WorkerEngine::Inline(engine) => {
-                // Default-drop the inline state when this fn returns.
-                // Reference the snapshot vars to avoid `unused`
-                // lints in cfg(test).
-                let _ = (capacity_sectors, instance_id);
-                // Decrement the live "currently waiting for tokens"
-                // gauge if the device is being dropped while a
-                // chain is rollback-stalled. Symmetric with
-                // `reset_engine_inline`'s mid-stall path: the
-                // chain is gone from the device's perspective, so
-                // the gauge must match. Without this, an external
-                // observer that cloned the counters Arc before
-                // drop sees one stranded increment per
-                // drop-while-stalled. The shared gauge is
-                // saturating (see `record_throttle_pending_dec`),
-                // so this dec is safe even if a racing path
-                // already decremented.
-                if engine.state.currently_stalled {
-                    engine.state.currently_stalled = false;
-                    engine.state.counters.record_throttle_pending_dec();
-                }
-            }
-            #[cfg(not(test))]
-            WorkerEngine::Spawned(eng) => {
-                // The third device-identifier field (`stop_fd`
-                // raw fd) is only meaningful in the Spawned
-                // arm — Inline mode has no eventfd to name.
-                let stop_fd = eng.stop_fd.as_raw_fd();
-                // Unpause first so a parked worker observes the
-                // upcoming stop signal. Same rationale as
-                // `reset_engine_spawned`: a worker stuck in its
-                // `park_timeout(10ms)` Acquire-load loop is
-                // unreachable from `epoll_wait`, so STOP_TOKEN
-                // would block until the 10 ms tick + Acquire-load
-                // sees the cleared flag. Clearing here makes the
-                // worker exit the park within 10 ms (faster on
-                // the unpark hint) so the join timeout window
-                // (DROP_JOIN_TIMEOUT, 1 s) is not consumed by
-                // park latency alone.
-                self.paused.store(false, Ordering::Release);
-                if let Some(ref handle) = eng.handle {
-                    handle.thread().unpark();
-                }
-                // Signal the worker to exit via the stop_fd
-                // helper, which retries on EAGAIN (eventfd
-                // counter saturation) up to STOP_FD_WRITE_MAX_RETRIES
-                // times before giving up. On exhaustion the join
-                // below absorbs the failure via DROP_JOIN_TIMEOUT.
-                signal_worker_stop(&eng.stop_fd, stop_fd, instance_id, capacity_sectors);
-                if let Some(handle) = eng.handle.take() {
-                    match join_worker_with_timeout(handle, DROP_JOIN_TIMEOUT) {
-                        JoinWithTimeoutOutcome::Joined(state) => {
-                            // Clean shutdown. If the worker exited
-                            // while a chain was rollback-stalled
-                            // (worker observed STOP_TOKEN before
-                            // any post-stall successful drain
-                            // could clear the per-worker flag),
-                            // decrement the live "currently
-                            // waiting for tokens" gauge to match —
-                            // the chain is gone from the device's
-                            // perspective. Without this, every
-                            // drop-while-stalled pins one
-                            // increment on the shared counters
-                            // Arc for any external observer
-                            // (failure-dump renderer, host
-                            // monitor) that cloned the Arc
-                            // before drop. Symmetric with
-                            // `reset_engine_spawned`'s mid-stall
-                            // path. Saturating dec (see
-                            // `record_throttle_pending_dec`)
-                            // makes a redundant bump safe.
-                            if state.currently_stalled {
-                                state.counters.record_throttle_pending_dec();
-                            }
-                            // State drops at scope end.
-                        }
-                        JoinWithTimeoutOutcome::Panicked(payload) => {
-                            // Worker panicked — its `BlkWorkerState`
-                            // is lost (panic propagation drops
-                            // owned values without giving us
-                            // access). If a stall was in flight,
-                            // the gauge increment leaks for the
-                            // device's lifetime. The doc on
-                            // `VirtioBlkCounters::currently_throttled_gauge`
-                            // documents this acceptable leak —
-                            // operators must not depend on a
-                            // strictly zero-on-shutdown gauge.
-                            tracing::error!(
-                                panic = panic_payload_str(&*payload),
-                                stop_fd,
-                                capacity_sectors,
-                                instance_id,
-                                "virtio-blk worker thread panicked"
-                            );
-                        }
-                        JoinWithTimeoutOutcome::TimedOut => {
-                            tracing::warn!(
-                                timeout_s = DROP_JOIN_TIMEOUT.as_secs_f32(),
-                                stop_fd,
-                                capacity_sectors,
-                                instance_id,
-                                "virtio-blk worker did not exit within \
-                                 DROP_JOIN_TIMEOUT of stop_fd; leaking \
-                                 the worker thread to avoid blocking the \
-                                 calling thread (likely a vCPU). Worker \
-                                 is wedged in a blocking syscall that \
-                                 does not check stop_fd. \
-                                 hint: identify the wedged device by \
-                                 stop_fd / instance_id / capacity_sectors \
-                                 above; per-device GuestMemoryMmap and \
-                                 EventFd Arcs stay live until the worker \
-                                 unblocks (see Drop's resource-retention \
-                                 doc). hint: kill -USR1 the host process \
-                                 to dump worker thread backtraces, OR \
-                                 check `dmesg` for the backing fd's \
-                                 storage path stalling on I/O."
-                            );
-                        }
-                        JoinWithTimeoutOutcome::HelperSpawnFailed => {
-                            tracing::error!(
-                                stop_fd,
-                                capacity_sectors,
-                                instance_id,
-                                "virtio-blk drop helper thread spawn \
-                                 failed; detaching worker without join"
-                            );
-                        }
-                        JoinWithTimeoutOutcome::HelperDisconnected => {
-                            tracing::error!(
-                                stop_fd,
-                                capacity_sectors,
-                                instance_id,
-                                "virtio-blk drop helper thread \
-                                 terminated without forwarding the \
-                                 worker join result"
-                            );
-                        }
-                    }
-                }
-            }
-        }
     }
 }

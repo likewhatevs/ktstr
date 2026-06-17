@@ -234,6 +234,7 @@ fn current_stats(skel: &BpfSkel<'_>) -> KtstrStats {
             nr_enqueued: bss.nr_enqueued,
             nr_select_cpu: bss.nr_select_cpu,
             nr_yielded: bss.nr_yielded,
+            stats_magic: bss.stats_magic,
         })
         .unwrap_or_default()
 }

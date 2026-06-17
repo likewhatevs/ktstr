@@ -1037,3 +1037,62 @@ fn json_macro_const_context() {
     const CFG: &str = ktstr::json!({"hello": "world"});
     assert_eq!(CFG, r#"{"hello":"world"}"#);
 }
+
+#[test]
+fn json_macro_suffixed_int_canonicalized() {
+    // Rust type suffixes are invalid JSON; 1u32 must emit 1.
+    let s = ktstr::json!({"n": 1u32});
+    assert_eq!(s, r#"{"n":1}"#);
+    serde_json::from_str::<serde_json::Value>(s).expect("valid JSON");
+}
+
+#[test]
+fn json_macro_digit_separator_stripped() {
+    // Rust digit separators are invalid JSON; 1_000 must emit 1000.
+    let s = ktstr::json!({"n": 1_000});
+    assert_eq!(s, r#"{"n":1000}"#);
+    serde_json::from_str::<serde_json::Value>(s).expect("valid JSON");
+}
+
+#[test]
+fn json_macro_float_suffix_and_separator() {
+    let s = ktstr::json!({"f": 1_234.5f64});
+    assert_eq!(s, r#"{"f":1234.5}"#);
+    serde_json::from_str::<serde_json::Value>(s).expect("valid JSON");
+}
+
+#[test]
+fn json_macro_bare_trailing_dot_float() {
+    // `1.` is a valid Rust float literal but invalid JSON (RFC 8259
+    // requires a digit after the decimal point); it must normalize to
+    // 1.0, not pass through as `1.`.
+    let s = ktstr::json!({"f": 1.});
+    assert_eq!(s, r#"{"f":1.0}"#);
+    serde_json::from_str::<serde_json::Value>(s).expect("valid JSON");
+}
+
+#[test]
+fn json_macro_unicode_brace_escape_canonicalized() {
+    // Rust's `\u{41}` brace escape is invalid JSON; the unescaped value
+    // (A) is emitted as a plain character.
+    let s = ktstr::json!({"s": "\u{41}"});
+    assert_eq!(s, r#"{"s":"A"}"#);
+    serde_json::from_str::<serde_json::Value>(s).expect("valid JSON");
+}
+
+#[test]
+fn json_macro_raw_string_canonicalized() {
+    // Raw strings carry literal backslashes; they must be JSON-escaped.
+    let s = ktstr::json!({"r": r"a\b"});
+    assert_eq!(s, r#"{"r":"a\\b"}"#);
+    serde_json::from_str::<serde_json::Value>(s).expect("valid JSON");
+}
+
+#[test]
+fn json_macro_string_control_chars_escaped() {
+    // Embedded quote / newline / tab must be JSON-escaped, not emitted
+    // verbatim from the Rust source.
+    let s = ktstr::json!({"s": "a\"b\nc\td"});
+    assert_eq!(s, r#"{"s":"a\"b\nc\td"}"#);
+    serde_json::from_str::<serde_json::Value>(s).expect("valid JSON");
+}

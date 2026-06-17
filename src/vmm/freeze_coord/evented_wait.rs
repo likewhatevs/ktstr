@@ -8,7 +8,7 @@
 //! against the narrow cases where neither evented source fires
 //! (verified per-call-site rationale in each caller — see
 //! `poll_scx_attached` and `wait_for_scx_disabled` in
-//! `src/vmm/rust_init.rs` and `src/scenario/ops/mod.rs`).
+//! `src/vmm/rust_init/scheduler.rs` and `src/scenario/ops/mod.rs`).
 //!
 //! Built on `nix::sys::inotify` and `nix::poll` instead of raw
 //! `libc::inotify_*` / `libc::poll`, so callers contain zero

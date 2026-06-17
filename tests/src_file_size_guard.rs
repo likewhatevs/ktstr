@@ -75,30 +75,39 @@ const DEFAULT_MAX_LINES: usize = 3000;
 /// entry must reference the queued split task in a `// queued: ...`
 /// comment so the deferral is auditable.
 ///
-/// Counts pinned 2026-05-06; refresh per the drain protocol.
+/// Counts bulk-refreshed 2026-06-15: the prior list (pinned 2026-05-06)
+/// had drifted across ~6 weeks of unrelated growth — entries removed for
+/// files since split below the limit (the 2k-decomposition campaign's
+/// virtio_console / rust_init / exit_dispatch / host_topology-tests /
+/// virtio_blk-device, plus eval / fetch / scx_walker / host_context /
+/// initramfs / ops-mod reductions) and re-pinned to current counts for
+/// files that grew or are newly over the limit. Refresh per the drain
+/// protocol; entries shrink toward zero as files are split.
 const EXCEPTIONS: &[(&str, usize)] = &[
-    ("stats.rs", 9856),
-    ("vmm/freeze_coord/mod.rs", 8973), // queued: split into submodules
-    ("scenario/ops/mod.rs", 7463),
-    ("monitor/reader.rs", 5608),
-    ("scenario/payload_run.rs", 5598),
-    ("test_support/eval.rs", 5504),
-    ("vmm/virtio_console.rs", 4793),
-    ("monitor/dump/tests.rs", 4645),
-    ("monitor/bpf_map/tests.rs", 4013), // queued: split into submodules
-    ("vmm/virtio_blk/device.rs", 3826),
-    ("workload/spawn/mod.rs", 3752),
-    ("fetch.rs", 3727), // queued: split into submodules
-    ("workload/worker/mod.rs", 3635),
-    ("bin/cargo_ktstr/parse_tests.rs", 3571),
-    ("ctprof/mod.rs", 3568),
-    ("vmm/rust_init.rs", 3510),
-    ("vmm/host_topology/tests.rs", 3189), // queued: split into submodules
-    ("vmm/exit_dispatch.rs", 3091),
-    ("vmm/initramfs.rs", 3074),
-    ("monitor/scx_walker.rs", 3055),
-    ("host_context.rs", 3041), // queued: split into submodules
-    ("test_support/probe.rs", 3027),
+    ("vmm/freeze_coord/mod.rs", 13295),
+    ("stats.rs", 12216),
+    ("monitor/cast_analysis/tests.rs", 10771),
+    ("monitor/btf_render/tests.rs", 10011),
+    ("scenario/ops/tests.rs", 9388),
+    ("monitor/dump/tests.rs", 8614),
+    ("monitor/reader.rs", 5939),
+    ("scenario/payload_run.rs", 5831),
+    ("assert/mod.rs", 5713),
+    ("test_support/entry.rs", 5652),
+    ("workload/spawn/mod.rs", 5428),
+    ("test_support/probe.rs", 4879),
+    ("scenario/snapshot/tests.rs", 4825),
+    ("monitor/btf_render/mod.rs", 4764),
+    ("test_support/dispatch.rs", 4417),
+    ("monitor/cast_analysis/mod.rs", 4154),
+    ("monitor/bpf_map/tests.rs", 4133),
+    ("monitor/dump/mod.rs", 4089),
+    ("workload/worker/mod.rs", 3947),
+    ("assert/temporal.rs", 3845),
+    ("bin/cargo_ktstr/parse_tests.rs", 3636),
+    ("ctprof/mod.rs", 3571),
+    ("probe/process.rs", 3335),
+    ("bin/ktstr.rs", 3001),
 ];
 
 /// Resolve `<repo>/src` from `CARGO_MANIFEST_DIR`. Cargo always

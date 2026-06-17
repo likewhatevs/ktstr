@@ -61,6 +61,7 @@ blocking IO does not drown the scenario.
 Custom scenarios receive a `Ctx` reference:
 
 ```rust,ignore
+#[non_exhaustive]
 pub struct Ctx<'a> {
     pub cgroups: &'a dyn CgroupOps,
     pub topo: &'a TestTopology,
@@ -72,6 +73,7 @@ pub struct Ctx<'a> {
     pub assert: Assert,
     pub wait_for_map_write: bool,
     pub current_step: Arc<AtomicU16>,
+    pub entry_name: Option<&'static str>,
 }
 ```
 
@@ -96,8 +98,8 @@ generation, and inter-node distance queries. See
 **`sched_pid`** -- scheduler process ID (`Option<libc::pid_t>`) for
 liveness checks. `None` when the test runs without an scx scheduler
 (the EEVDF default path has no userspace scheduler binary). Unwrap
-or `is_some_and(...)` before passing to `process_alive` or
-`kill(Pid::from_raw(pid), None)`.
+or `is_some_and(...)` before passing to a liveness check such as
+`kill(Pid::from_raw(pid), None)` (nix).
 
 **`settle`** -- time to wait after cgroup creation for the scheduler
 to stabilize.

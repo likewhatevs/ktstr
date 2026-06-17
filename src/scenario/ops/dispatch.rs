@@ -1905,7 +1905,7 @@ pub(super) fn wait_for_worker_state_not_trying_or_bail(
             // `spawn_scheduler_for_op` via
             // `crate::vmm::rust_init::poll_scx_attached` polling
             // `/sys/kernel/sched_ext/root/ops` directly (see `try_spawn_scheduler`
-            // in src/vmm/rust_init.rs). Skip with a debug trace so the
+            // in src/vmm/rust_init/scheduler.rs). Skip with a debug trace so the
             // operator can see the intentional bypass.
             if crate::vmm::guest_comms::is_guest() {
                 tracing::debug!(

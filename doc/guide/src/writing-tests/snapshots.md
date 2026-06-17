@@ -78,11 +78,15 @@ for the scope of the scenario — a bare `let _ = bridge.set_thread_local()`
 drops the guard immediately and clears the bridge before any op runs.
 `must_use` will warn if the return value is discarded entirely.
 
-If no bridge is installed, `Op::capture_snapshot` is a no-op with a
-`tracing::warn!` and the scenario continues. If the capture callback
-returns `None` (capture pipeline unavailable), the bridge stays empty
-and the scenario continues. Existing scenarios that never declare
-snapshot ops keep working unchanged.
+If no bridge is installed, `Op::capture_snapshot` fails loudly (per
+the no-silent-drops policy): a guest run issues a host-coordinator
+snapshot request over the SHM/port-1 transport (bailing on a
+transport/host error), and a host-only / test-fixture context with no
+`SnapshotBridge` installed returns an error naming the missing bridge.
+Only a capture callback that returns `None` (capture pipeline
+unavailable) leaves the bridge empty and lets the scenario continue.
+Existing scenarios that never declare snapshot ops keep working
+unchanged.
 
 ## Reading the captured report
 
@@ -111,9 +115,11 @@ let nr_cpus = snap.var("nr_cpus_onln").as_u64()?;
 `Snapshot::var(name)` walks every `*.bss`, `*.data`, and `*.rodata`
 global-section map for a top-level member named `name` and returns
 the unique match as a [`SnapshotField`](#terminal-accessors).
-Multiple matches yield
+Multiple matches first trigger an automatic active-scheduler
+resolution; only when that cannot narrow to a single live scheduler
+copy does `var` yield
 `SnapshotError::AmbiguousVar { requested, found_in }` —
-disambiguate via `Snapshot::map(name)`. A miss yields
+disambiguate explicitly via `Snapshot::map(name)`. A miss yields
 `SnapshotError::VarNotFound { requested, available }` with the
 union of every section's top-level member names.
 
@@ -213,7 +219,7 @@ The dotted-path walker:
 
 Type mismatches surface as `SnapshotError::TypeMismatch { expected,
 actual, requested }` — for example, `as_str()` on a `Uint` reports
-`expected: "Enum"`, `actual: "Uint"`.
+`expected: "str (enum variant name)"`, `actual: "Uint"`.
 
 ### Cast-recovered pointers
 
@@ -376,10 +382,7 @@ fn snapshot_then_inspect(ctx: &Ctx) -> Result<AssertResult> {
 
     // Top-level scalar.
     if let Ok(nr_cpus) = snap.var("nr_cpus_onln").as_u64() {
-        result.details.push(AssertDetail::new(
-            DetailKind::Other,
-            format!("captured nr_cpus_onln = {nr_cpus}"),
-        ));
+        result.note(format!("captured nr_cpus_onln = {nr_cpus}"));
     }
 
     Ok(result)

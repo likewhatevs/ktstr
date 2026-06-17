@@ -77,8 +77,9 @@ for version selection and local source builds.
 
 `cargo ktstr test` resolves the kernel from `KTSTR_KERNEL`, the cache,
 or an explicit `--kernel <spec>` (a version like `6.14`, a cache key
-from `cargo ktstr kernel list`, or a path to a kernel source tree or
-prebuilt `bzImage`/`Image`). Step 3 populated the cache with the
+from `cargo ktstr kernel list`, or a path to a kernel source tree).
+`cargo ktstr test` does not accept a prebuilt `bzImage`/`Image` (only
+`cargo ktstr shell` does). Step 3 populated the cache with the
 declared kernels, so the bare form is sufficient when a single kernel
 is available:
 
@@ -154,7 +155,7 @@ one — silent regressions become visible).
 The test author defines a `BpfMapWrite` constant naming the
 scheduler-side `.bss` slot to write, then names it in the
 `bpf_map_write` macro attribute. The scheduler under test must
-expose the slot AND emit a deterministic `scx_bpf_error_str(...)`
+expose the slot AND emit a deterministic `scx_bpf_error(...)`
 when it sees the host-written value:
 
 ```rust,ignore
@@ -163,7 +164,7 @@ use ktstr::prelude::*;
 // User-defined trigger: ".bss" suffix matches the libbpf-named
 // .bss map; offset and value name the slot + payload the host
 // writes after the scheduler loads. The scheduler reads this slot
-// in its error path and calls scx_bpf_error_str(...).
+// in its error path and calls scx_bpf_error(...).
 static BPF_CRASH: BpfMapWrite = BpfMapWrite::new(".bss", 4, 1);
 
 #[ktstr_test(
@@ -179,7 +180,7 @@ fn crash_path_emits_expected_error(ctx: &Ctx) -> Result<AssertResult> {
 
 The host writes the trigger value into the scheduler's `.bss` slot
 after the scheduler loads. The scheduler-side error path reads the
-slot and calls `scx_bpf_error_str(...)` with a message containing
+slot and calls `scx_bpf_error(...)` with a message containing
 the documented substring (`"ktstr: host-triggered crash"` is the
 convention used by the scx-ktstr fixture). The substring contract
 is yours to define for your scheduler — the framework only enforces

@@ -562,7 +562,25 @@ where
             return self.verdict;
         }
         let ratio = later_f / earlier_f;
-        if ratio > ceiling {
+        if !ratio.is_finite() {
+            // A non-finite ratio: the `earlier_f == 0.0` guard above
+            // misses a NaN baseline (NaN != 0.0), and a NaN later_f
+            // or an inf-producing quotient also lands here. Raw
+            // `ratio > ceiling` is always false for NaN, so without
+            // this guard the phase pair would silently PASS. Treat a
+            // corrupt endpoint as a Fail, mirroring rate_within /
+            // ratio_within's non-finite handling (distinct from the
+            // zero-baseline Inconclusive above, which is "no signal").
+            push_detail(
+                self.verdict,
+                format!(
+                    "{label_prefix}ratio_across_phases({:?}→{:?}) = \
+                     {later_str}/{earlier_str} = {ratio} is non-finite \
+                     (corrupt endpoint) — cannot evaluate ceiling {ceiling:.4}",
+                    self.earlier, self.later,
+                ),
+            );
+        } else if ratio > ceiling {
             push_detail(
                 self.verdict,
                 format!(
@@ -1270,7 +1288,20 @@ impl SeriesField<f64> {
             }
             any_post_warmup = true;
             match slot {
-                Ok(v) => active.push((i, *v)),
+                // A non-finite value (NaN/inf) cannot be band-checked
+                // — `v < lo` is always false for NaN — and a single
+                // NaN poisons the mean (1320), making `lo`/`hi` NaN so
+                // EVERY sample slips past the band and the assertion
+                // silently PASSES. Treat a non-finite value as a gap,
+                // like a projection error: drop it from the band
+                // population (so it can neither poison the mean nor
+                // slip the band) and surface it in the skip Note.
+                Ok(v) if v.is_finite() => active.push((i, *v)),
+                Ok(v) => skipped.push(format!(
+                    "{tag}(+{elapsed_ms}ms): non-finite value {v}",
+                    tag = self.tags[i],
+                    elapsed_ms = self.elapsed_ms[i],
+                )),
                 // Per-sample projection errors are treated as
                 // gaps: a missing post-warmup sample cannot
                 // violate the steady-state band (we have no value
@@ -1600,7 +1631,26 @@ impl SeriesField<f64> {
                 continue;
             }
             let ratio = lhs / rhs;
-            if ratio < lo || ratio > hi {
+            // A NaN lhs/rhs (or finite endpoints whose quotient
+            // overflows to inf) yields a non-finite ratio; the
+            // `rhs == 0.0` guard above misses it (NaN != 0.0). Raw
+            // `<`/`>` against NaN is always false, so a non-finite
+            // ratio would silently slip past the band check and PASS.
+            // Surface it as a detail naming the pair, mirroring
+            // rate_within's non-finite-rate guard.
+            if !ratio.is_finite() {
+                push_detail(
+                    verdict,
+                    format!(
+                        "{label} (ratio_within {other_label} [{lo}, {hi}]): non-finite \
+                         ratio at sample {tag} (+{elapsed_ms}ms) — lhs={lhs} rhs={rhs}",
+                        label = self.label,
+                        other_label = other.label,
+                        tag = self.tags[i],
+                        elapsed_ms = self.elapsed_ms[i],
+                    ),
+                );
+            } else if ratio < lo || ratio > hi {
                 push_detail(
                     verdict,
                     format!(
@@ -2243,6 +2293,79 @@ mod tests {
             "expected gap note: {:?}",
             r.info_notes
         );
+    }
+
+    /// A non-finite (NaN) post-warmup sample must not poison the mean
+    /// into a silent PASS. With the NaN dropped from the band
+    /// population (and noted), the mean is computed over the finite
+    /// samples [10, 100] = 55, so both fall outside ±10% and the
+    /// verdict FAILS — whereas the pre-fix code let the NaN make the
+    /// mean NaN, the band NaN, and every band check vacuously pass.
+    #[test]
+    fn steady_within_nan_sample_does_not_silently_pass() {
+        let tags = vec![
+            "periodic_000".to_string(),
+            "periodic_001".to_string(),
+            "periodic_002".to_string(),
+        ];
+        let elapsed = vec![300u64, 400u64, 500u64];
+        let values: Vec<SnapshotResult<f64>> = vec![Ok(10.0f64), Ok(f64::NAN), Ok(100.0f64)];
+        let f = SeriesField::from_parts("util", tags, elapsed, values);
+        let mut v = Verdict::new();
+        f.steady_within(&mut v, 0, 0.10);
+        let r = v.into_result();
+        assert!(
+            !r.is_pass(),
+            "a NaN sample must not poison the band into a silent pass: {:?}",
+            r.outcomes
+        );
+        assert!(
+            r.info_notes
+                .iter()
+                .any(|n| n.message.contains("non-finite") && n.message.contains("periodic_001")),
+            "expected non-finite skip note naming the NaN sample: {:?}",
+            r.info_notes
+        );
+    }
+
+    /// A NaN lhs or rhs yields a non-finite ratio that the `rhs == 0`
+    /// guard misses (NaN != 0.0); it must flip the verdict (a detail),
+    /// not slip past the band check (NaN comparisons are always false)
+    /// into a silent pass.
+    #[test]
+    fn ratio_within_non_finite_ratio_does_not_silently_pass() {
+        let tags = vec!["periodic_000".to_string()];
+        let elapsed = vec![100u64];
+        // NaN numerator.
+        {
+            let lhs =
+                SeriesField::from_parts("lhs", tags.clone(), elapsed.clone(), vec![Ok(f64::NAN)]);
+            let rhs =
+                SeriesField::from_parts("rhs", tags.clone(), elapsed.clone(), vec![Ok(5.0f64)]);
+            let mut v = Verdict::new();
+            lhs.ratio_within(&mut v, &rhs, 0.0, 1.0);
+            let r = v.into_result();
+            assert!(
+                !r.is_pass(),
+                "NaN lhs must not silently pass: {:?}",
+                r.outcomes
+            );
+        }
+        // NaN denominator (passes the rhs==0 guard, since NaN != 0.0).
+        {
+            let lhs =
+                SeriesField::from_parts("lhs", tags.clone(), elapsed.clone(), vec![Ok(5.0f64)]);
+            let rhs =
+                SeriesField::from_parts("rhs", tags.clone(), elapsed.clone(), vec![Ok(f64::NAN)]);
+            let mut v = Verdict::new();
+            lhs.ratio_within(&mut v, &rhs, 0.0, 1.0);
+            let r = v.into_result();
+            assert!(
+                !r.is_pass(),
+                "NaN rhs must not silently pass: {:?}",
+                r.outcomes
+            );
+        }
     }
 
     /// converges_to with fewer than 3 successfully-projected
@@ -3132,6 +3255,45 @@ mod tests {
                 && n.message.contains("ceiling 0.8500")),
             "expected pass info note carrying ratio + ceiling, got {:?}",
             r.info_notes,
+        );
+    }
+
+    /// A non-finite phase value must not let `ratio_across_phases().at_most()`
+    /// silently pass: a NaN `later` makes later/earlier = NaN, the
+    /// `earlier == 0.0` guard misses it (NaN != 0.0), and raw
+    /// `ratio > ceiling` is false for NaN — so without the non-finite
+    /// guard the pair would PASS. Same class as the ratio_within /
+    /// steady_within NaN fixes.
+    #[test]
+    fn ratio_across_phases_non_finite_does_not_silently_pass() {
+        let f = SeriesField::<f64>::from_parts_with_phases(
+            "dispatches",
+            vec!["t0".into(), "t1".into()],
+            vec![100, 200],
+            vec![Ok(100.0f64), Ok(f64::NAN)],
+            vec![
+                Some(crate::assert::Phase::step(0)),
+                Some(crate::assert::Phase::step(1)),
+            ],
+        );
+        let mut v = Verdict::new();
+        f.ratio_across_phases(
+            &mut v,
+            crate::assert::Phase::step(0),
+            crate::assert::Phase::step(1),
+        )
+        .at_most(0.85);
+        let r = v.into_result();
+        assert!(
+            !r.is_pass(),
+            "a non-finite phase ratio must not silently pass: outcomes={:?}",
+            r.outcomes,
+        );
+        assert!(
+            r.failure_details()
+                .any(|d| d.message.contains("non-finite")),
+            "expected a non-finite failure detail: {:?}",
+            r.failure_details().collect::<Vec<_>>(),
         );
     }
 

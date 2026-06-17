@@ -241,6 +241,29 @@ impl KtstrKvm {
         use_hugepages: bool,
         performance_mode: bool,
     ) -> Result<Self> {
+        // Bound the vCPU count to MAX_VCPUS before touching any host
+        // resource. The GICv3 redistributor region grows from
+        // GIC_REDIST_BASE at GIC_REDIST_SIZE_PER_CPU per vCPU; the device
+        // MMIO window starts at GIC_REDIST_MAX_END (= SERIAL_MMIO_BASE),
+        // sized for exactly MAX_VCPUS redistributors. With more vCPUs the
+        // redistributor (KVM's online_vcpus * KVM_VGIC_V3_REDIST_SIZE and
+        // the FDT reg num_cpus * GIC_REDIST_SIZE_PER_CPU) overruns the
+        // device window. KVM's vgic_v3_check_base validates only
+        // redistributor-vs-distributor overlap, not redistributor-vs-
+        // userspace-device MMIO, so the in-kernel vGIC silently claims the
+        // device GPAs on the MMIO bus and shadows serial/virtio. Reject
+        // here so an over-large topology is a clear error, not a silent
+        // boot failure.
+        let total_cpus = topo.total_cpus();
+        anyhow::ensure!(
+            total_cpus <= MAX_VCPUS,
+            "topology has {} vCPUs, exceeding the maximum of {}; the GICv3 \
+             redistributor region would overrun the device MMIO window and \
+             shadow the serial/virtio devices",
+            total_cpus,
+            MAX_VCPUS,
+        );
+
         let kvm = Kvm::new().context("open /dev/kvm")?;
 
         let has_immediate_exit = kvm.check_extension(Cap::ImmediateExit);
@@ -694,6 +717,61 @@ mod tests {
             max_cpus >= MAX_VCPUS as u64,
             "device window must sit above MAX_VCPUS={} redistributors; fits only {max_cpus}",
             MAX_VCPUS
+        );
+    }
+
+    /// The device MMIO window must fit EXACTLY MAX_VCPUS redistributors and
+    /// no more: MAX_VCPUS redistributors end at or below SERIAL_MMIO_BASE,
+    /// but MAX_VCPUS + 1 would overrun it. Pins the upper bound the runtime
+    /// guard in `new_inner` enforces — a future change that widened the
+    /// device window or shrank the redistributor stride without updating
+    /// MAX_VCPUS is caught at compile time.
+    #[test]
+    fn gic_redist_window_holds_exactly_max_vcpus() {
+        // MAX_VCPUS redistributors fit (end <= device window).
+        const {
+            assert!(
+                GIC_REDIST_BASE + MAX_VCPUS as u64 * GIC_REDIST_SIZE_PER_CPU <= SERIAL_MMIO_BASE
+            )
+        };
+        // One more redistributor would overrun the device window.
+        const {
+            assert!(
+                GIC_REDIST_BASE + (MAX_VCPUS as u64 + 1) * GIC_REDIST_SIZE_PER_CPU
+                    > SERIAL_MMIO_BASE
+            )
+        };
+    }
+
+    /// A topology whose total vCPU count exceeds MAX_VCPUS must be rejected
+    /// with a clear error BEFORE any KVM resource is touched. The guard in
+    /// `new_inner` runs ahead of `Kvm::new()`, so the rejection is a pure
+    /// function of the topology and this test is host-independent (no
+    /// /dev/kvm). Without the guard, construction would create MAX_VCPUS + 1
+    /// vCPUs and a redistributor region overrunning the device MMIO window,
+    /// silently shadowing serial/virtio.
+    #[test]
+    fn over_max_vcpus_topology_is_rejected() {
+        // total_cpus = llcs * cores_per_llc * threads_per_core. Choose a
+        // product strictly greater than MAX_VCPUS (MAX_VCPUS + 1 LLCs).
+        let topo = Topology {
+            llcs: MAX_VCPUS + 1,
+            cores_per_llc: 1,
+            threads_per_core: 1,
+            numa_nodes: 1,
+            nodes: None,
+            distances: None,
+        };
+        assert_eq!(topo.total_cpus(), MAX_VCPUS + 1);
+        // `let Err` rather than `expect_err` (which needs the Ok type
+        // `KtstrKvm` to be `Debug`).
+        let Err(err) = KtstrKvm::new_deferred(topo, false, false) else {
+            panic!("topology over MAX_VCPUS must be rejected");
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(&(MAX_VCPUS + 1).to_string()) && msg.contains(&MAX_VCPUS.to_string()),
+            "error must name the actual count and MAX_VCPUS; got: {msg}"
         );
     }
 

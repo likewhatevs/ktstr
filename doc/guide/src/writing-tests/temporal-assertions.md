@@ -59,13 +59,20 @@ needs both views from the same series.
   the stats axis: `stats_live_u64(path)` / `_i64(path)` / `_f64(path)`.
 - `bpf_map(map_name)` / `stats_path(path)` — typed auto-projection
   helpers (see [Auto-projection](#auto-projection)).
-- Per-phase reducers: `counter_delta_per_phase()`, `last_per_phase()`,
-  `first_per_phase()`, `value_at_phase(phase)`, `by_phase()`, `phase(p)`.
-  Cross-phase: `ratio_across_phases(verdict, label, phase_a, phase_b)`
-  returns a `CrossPhaseRatio` with `at_most`/`at_least`/`between`
-  comparators. `PhaseMapExt` and `FracPair` (re-exported from
-  `crate::assert`) compose per-phase deltas into ratios for swap-A/B
-  patterns.
+- `by_phase()` — groups samples by phase, keyed by `u16` step_index
+  (`BTreeMap<u16, Vec<Sample>>`).
+
+The per-phase reducers (`counter_delta_per_phase`, `last_per_phase`,
+`first_per_phase`, `value_at_phase(phase)`, `phase(p)`) and
+`ratio_across_phases` are methods on a projected
+[`SeriesField`](#seriesfield), not on `SampleSeries` — project a field
+first, e.g. `series.bpf(...).value_at_phase(...)`.
+`SeriesField::ratio_across_phases(verdict, earlier, later)` returns a
+`CrossPhaseRatio` whose single `at_most(ceiling)` comparator pins
+`later / earlier` against a ceiling;
+`PhaseMapExt::ratio_across_phases(verdict, label, earlier, later)`
+(with `FracPair`, re-exported from `crate::assert`) does the same on a
+pre-reduced `BTreeMap<Phase, _>` for swap-A/B patterns.
 
 ## SeriesField
 
@@ -99,7 +106,7 @@ its `SnapshotResult<T>` return value lands directly in the field.
 
 The `SampleSeries::stats` closure receives each sample's
 `StatsValue<'_>` — a thin wrapper around the per-sample stats JSON
-exposing `path("…").as_u64()` / `as_f64()` etc.:
+exposing `get("…").as_u64()` / `as_f64()` etc.:
 
 ```rust,ignore
 let busy: SeriesField<f64> = series.stats(
@@ -110,7 +117,7 @@ let busy: SeriesField<f64> = series.stats(
 
 A sample whose stats slot is `None` (the stats request failed, the
 relay rejected, or the scheduler binary isn't wired) yields a
-`SnapshotError::MissingStats { tag }` slot — distinct from an
+`SnapshotError::MissingStats { tag, reason }` slot — distinct from an
 in-JSON path miss (`FieldNotFound` / `TypeMismatch`) so the
 assertion site can tell coverage gaps from data errors apart.
 
@@ -151,9 +158,8 @@ Every pattern takes `&mut Verdict` and returns the same `&mut
 Verdict` so chains of assertions stack onto one accumulator. Each
 PATTERN is a method on `SeriesField` (distinct from `each(...)`,
 which returns the per-sample comparator builder covered in its own
-section below). `nondecreasing` and `strictly_increasing` share the
-same section heading; the seven patterns are six sections plus the
-shared one.
+section below). The seven patterns occupy six sections, one of which
+(`nondecreasing` / `strictly_increasing`) is shared.
 
 ### `nondecreasing` / `strictly_increasing`
 
@@ -186,9 +192,11 @@ let ticks: SeriesField<f64> = series.bpf("ticks",
 ticks.rate_within(&mut v, 0.5, 2.0);
 ```
 
+A zero-time delta between adjacent samples records an inconclusive
+detail (zero denominator) naming the offending pair — the rate is
+neither pass nor fail.
+
 Failure modes:
-- A zero-time delta between adjacent samples records a structured
-  detail naming the offending pair.
 - A non-finite rate (NaN / Inf endpoints, or a finite difference
   that overflows f64) records a `non-finite rate` detail rather
   than silently slipping past the band check.
@@ -262,8 +270,8 @@ util.ratio_within(&mut v, &runtime, 0.4, 0.6);
 ```
 
 A length mismatch fires a single caller-error detail and aborts
-the comparison. A sample where `rhs == 0` records a "cannot
-compute ratio" detail naming the sample; out-of-band ratios
+the comparison. A sample where `rhs == 0` records an inconclusive
+detail (zero denominator) naming the sample; out-of-band ratios
 record a structured detail with the lhs/rhs values. Per-sample
 projection errors on either side are SKIPPED with a `Note`
 listing each gap and which side errored.
@@ -295,7 +303,7 @@ checks.
 
 Every temporal failure carries the field's `label`, the pattern
 name, and the offending sample's `tag` + `elapsed_ms`. A
-nondecreasing regression at sample `periodic_004` (+850 ms) reads:
+nondecreasing regression at sample `periodic_004` (+850ms) reads:
 
 ```text
 nr_dispatched (nondecreasing): regression at sample periodic_004 (+850ms): \

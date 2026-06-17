@@ -24,7 +24,7 @@
 //! [`assert_wprof_pb_landed`] callback rather than the
 //! guest test body. The body runs INSIDE the guest VM and
 //! cannot read the host sidecar directory (no virtio-fs mount
-//! for it per `src/vmm/rust_init.rs`'s mount table); the
+//! for it per `src/vmm/rust_init/mounts.rs`'s mount table); the
 //! `post_vm` callback runs HOST-side after `vm.run()` returns
 //! with `.wprof.pb` already on disk, so it CAN read and
 //! validate the file.

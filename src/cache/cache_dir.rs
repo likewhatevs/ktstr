@@ -56,8 +56,8 @@ use crate::sync::MutexExt;
 use anyhow::Context;
 
 use super::housekeeping::{
-    TmpDirGuard, atomic_swap_dirs, clean_orphaned_tmp_dirs, read_metadata, validate_cache_key,
-    validate_filename,
+    TmpDirGuard, atomic_swap_dirs, clean_orphaned_tmp_dirs, fsync_parent, fsync_staging_dir,
+    read_metadata, validate_cache_key, validate_filename,
 };
 #[cfg(test)]
 use super::metadata::KconfigStatus;
@@ -581,6 +581,25 @@ impl CacheDir {
         fs::write(tmp_dir.join("metadata.json"), meta_json)
             .map_err(|e| anyhow::anyhow!("write cache metadata: {e}"))?;
 
+        // Durability: fsync the staged files + tmp dir before the
+        // publish rename so a host crash is less likely to leave the
+        // cache pointing at a torn entry. Best-effort — lookup re-parses
+        // metadata.json on read (and checks the image file exists), so a
+        // torn metadata.json re-detects as a cache miss and rebuilds. A
+        // torn kernel image or vmlinux with intact metadata is not
+        // content-checked here; it surfaces at the consumer (kernel boot
+        // fails, or monitor/probe reads of vmlinux fail) — a loud
+        // failure, never silent corruption of a shipped artifact.
+        if let Err(e) = fsync_staging_dir(&tmp_dir) {
+            tracing::warn!(
+                cache_key = cache_key,
+                err = %e,
+                "fsync of staged cache entry before publish failed; \
+                 publishing without the durability barrier (validate-on-read \
+                 remains the correctness backstop)",
+            );
+        }
+
         match fs::rename(&tmp_dir, &final_dir) {
             Ok(()) => {}
             Err(e)
@@ -592,6 +611,17 @@ impl CacheDir {
             Err(e) => {
                 return Err(anyhow::anyhow!("atomic rename cache entry: {e}"));
             }
+        }
+
+        // Persist the publish rename itself: fsync the cache root so the
+        // new entry name survives a crash. Best-effort, same rationale.
+        if let Err(e) = fsync_parent(&final_dir) {
+            tracing::warn!(
+                cache_key = cache_key,
+                err = %e,
+                "fsync of cache root after publish failed; the rename may \
+                 not survive a crash (validate-on-read backstop)",
+            );
         }
 
         Ok(CacheEntry {

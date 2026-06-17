@@ -169,8 +169,8 @@ assert!(result.is_fail());
 // failure_details() yields a detail whose message carries:
 //   "Op::WatchSnapshot cap exceeded: scenario already registered 3
 //    watchpoints (3 user watchpoint slots occupied; slot 0 reserved for
-//    the error-class exit_kind trigger; drop a watch or use
-//    Op::CaptureSnapshot for a time-driven capture instead)"
+//    the error-class exit_kind trigger). Drop a watch or use
+//    Op::CaptureSnapshot for a time-driven capture instead."
 ```
 
 A failed register (cap exceeded, callback error, missing
@@ -227,7 +227,6 @@ typed terminal reads — is shared. See [Snapshots](snapshots.md) for
 the full surface.
 
 [`MAX_WATCH_SNAPSHOTS`]: #maximum-of-3-watches-per-scenario
-[`Op::WatchSnapshot`]: #symbol-resolution
 [`Snapshot`]: snapshots.md#reading-the-captured-report
 [`SnapshotBridge`]: snapshots.md#wiring-the-bridge
 [`WatchRegisterCallback`]: #failure-modes

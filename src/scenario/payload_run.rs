@@ -1991,14 +1991,14 @@ fn spawn_error_context(err: std::io::Error, binary: &str) -> anyhow::Error {
 /// it to `SIG_DFL` on construction, and restores the saved value on
 /// `Drop`. Required for [`spawn_and_wait`] and the background
 /// [`spawn_child`] path because the guest ktstr-init sets
-/// `SIGCHLD = SIG_IGN` at startup in `src/vmm/rust_init.rs`
+/// `SIGCHLD = SIG_IGN` at startup in `src/vmm/rust_init/init.rs`
 /// ("Ignore SIGCHLD so child processes don't become zombies").
 /// Under `SIG_IGN` the kernel auto-reaps children, so
 /// `waitpid(child_pid)` returns `ECHILD` and Rust std's
 /// `Command::spawn()` / `.output()` / `Child::wait()` internals
 /// panic with "wait() should either return Ok or panic".
 ///
-/// The shell-exec mode in `src/vmm/rust_init.rs` already documents
+/// The shell-exec mode in `src/vmm/rust_init/modes.rs` already documents
 /// this exact gotcha and uses the same save/set-`SIG_DFL` /
 /// restore-on-completion pattern. `PayloadRun::run` /
 /// `PayloadRun::spawn` are the second dispatch site that needs it.

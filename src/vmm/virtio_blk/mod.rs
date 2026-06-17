@@ -85,15 +85,16 @@
 //! # Backing-speed caveat
 //!
 //! Backend IO is synchronous within `drain_bracket_impl`:
-//! `handle_read_impl` / `handle_write_impl` call
-//! `FileExt::read_at` / `write_at` (`pread64` / `pwrite64`) and
-//! `handle_flush_impl` calls `File::sync_data` (`fdatasync`).
-//! There is no `io_uring` and no second-tier async queue — the
-//! worker serializes requests through the backing fd one at a
-//! time.
+//! `handle_read_vectored_impl` / `handle_write_vectored_impl` issue
+//! a single `preadv` / `pwritev` over the chain's data segments (a
+//! short positive write retries to completion; a short read is
+//! treated as EOF and the tail zero-padded) and `handle_flush_impl`
+//! calls `Backing::sync_data` (`fdatasync`). There is no `io_uring`
+//! and no second-tier async queue — the worker serializes requests
+//! through the backing one at a time.
 //!
 //! This is fine when the backing is **fast** — tmpfs (the
-//! `tempfile()` default) or warm page cache — where pread / pwrite
+//! `tempfile()` default) or warm page cache — where preadv / pwritev
 //! return in sub-microsecond time and fdatasync is a no-op
 //! (`noop_fsync`). With slow backing (cold page cache on spinning
 //! media, network-mounted file, fdatasync forcing real journal
@@ -197,6 +198,20 @@ mod handlers;
 // extends the type that lives in `device.rs`. `mod handlers;`
 // alone wires the file into the build.
 
+mod control;
+mod lifecycle;
+// `control.rs` adds an `impl VirtioBlk` block (MMIO/FSM dispatch +
+// reset/respawn/pause); `lifecycle.rs` holds the worker stop/join free
+// helpers (join_worker_with_timeout, the timeout consts,
+// JoinWithTimeoutOutcome, panic_payload_str) + `impl Drop for VirtioBlk`.
+// Both were split out of device.rs for the 2000-line ceiling. The impl
+// block needs no re-export; the `lifecycle` glob re-exports the join
+// helpers so the cfg(test) atomics/fsm test sub-files and `control`'s
+// reset/respawn reach them via `super::*` (the same way they reached the
+// helpers when they lived in device.rs behind `pub(crate) use device::*`).
+#[allow(unused_imports)]
+pub(crate) use lifecycle::*;
+
 mod drain;
 // `pub(crate) use drain::*;` exposes `DrainOutcome` and
 // `drain_bracket_impl` to `worker.rs` (which references both via
@@ -204,6 +219,14 @@ mod drain;
 // the test sub-files. The lib build references both via these
 // paths, so the glob is consumed without `#[allow(unused_imports)]`.
 pub(crate) use drain::*;
+
+mod backing;
+// `Backing` (the storage seam) + `advance_iovecs` (the write
+// retry-loop helper). device.rs holds a `Box<dyn Backing>` and the
+// vectored-IO handlers call the trait methods; the test sub-files
+// inject fault-injecting mock `Backing` impls. Referenced via
+// `super::Backing` / `super::advance_iovecs`.
+pub(crate) use backing::*;
 
 #[cfg(test)]
 mod testing;
@@ -215,7 +238,10 @@ mod tests_proptest;
 mod tests_atomics;
 
 #[cfg(test)]
-mod tests_drain;
+mod tests_drain_chain;
+
+#[cfg(test)]
+mod tests_drain_throttle;
 
 #[cfg(test)]
 mod tests_drain_validation;

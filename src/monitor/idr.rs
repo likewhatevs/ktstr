@@ -57,8 +57,9 @@ pub(crate) fn xa_load(
         return Some(0);
     }
 
-    // Check if xa_head is an internal node (bit 1 set) or a direct entry.
-    if xa_head & 2 == 0 {
+    // A non-node head (direct entry, value entry, or a reserved small
+    // internal marker) is a single-entry xarray — see xa_is_node.
+    if !xa_is_node(xa_head) {
         // Single-entry xarray: only index 0 is valid.
         return if index == 0 { Some(xa_head) } else { Some(0) };
     }
@@ -88,8 +89,9 @@ pub(crate) fn xa_load(
             return Some(0);
         }
 
-        if entry & 2 == 0 {
-            // Leaf entry.
+        if !xa_is_node(entry) {
+            // Terminal entry: a leaf pointer, a value entry, or a
+            // reserved small internal marker — not a node to descend.
             return Some(entry);
         }
 
@@ -100,6 +102,19 @@ pub(crate) fn xa_load(
         }
         shift -= 6; // XA_CHUNK_SHIFT
     }
+}
+
+/// Mirror of the kernel's `xa_is_node` (include/linux/xarray.h): an
+/// xarray slot is a node to descend into only when it is an internal
+/// entry (`entry & 3 == 2` — bit 1 set, bit 0 clear) AND its value
+/// exceeds 4096. The kernel reserves internal values 0..=4096 for
+/// sibling entries, the RETRY marker, and ZERO/reserved encodings, and
+/// `xas_load` descends `while (xa_is_node(entry))` (lib/xarray.c), so a
+/// small internal-looking marker — or a value entry (bit 0 set) — is
+/// terminal, not a node. Testing only `entry & 2` would mis-descend
+/// those into a bogus tiny node KVA.
+fn xa_is_node(entry: u64) -> bool {
+    entry & 3 == 2 && entry > 4096
 }
 
 /// Read the `shift` field from an xa_node (SLAB-allocated, direct mapping).
@@ -157,6 +172,119 @@ mod tests {
         assert_eq!(
             xa_node_shift(&mem, DEFAULT_PAGE_OFFSET, node_kva, 0x10),
             255
+        );
+    }
+
+    // -- xa_load classification (mirrors kernel xa_is_node) --
+
+    #[test]
+    fn xa_load_empty_head_returns_zero() {
+        let mut buf = [0u8; 0x100];
+        // SAFETY: buf outlives the GuestMem use.
+        let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
+        assert_eq!(xa_load(&mem, DEFAULT_PAGE_OFFSET, 0, 0, 8, 0), Some(0));
+    }
+
+    #[test]
+    fn xa_load_single_entry_direct_pointer() {
+        // An 8-byte-aligned head (bits 0-1 clear) is not a node: it's a
+        // single-entry xarray holding that pointer at index 0.
+        let mut buf = [0u8; 0x100];
+        // SAFETY: buf outlives the GuestMem use.
+        let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
+        let ptr = DEFAULT_PAGE_OFFSET + 0x40;
+        assert_eq!(xa_load(&mem, DEFAULT_PAGE_OFFSET, ptr, 0, 8, 0), Some(ptr));
+        assert_eq!(xa_load(&mem, DEFAULT_PAGE_OFFSET, ptr, 1, 8, 0), Some(0));
+    }
+
+    #[test]
+    fn xa_load_root_value_entry_is_single_entry() {
+        // A head with bit 1 set but value <= 4096 (7 = a value entry,
+        // bits 0+1 set) is NOT an xa_node (xa_is_node requires > 4096);
+        // it is a single-entry xarray. The prior `xa_head & 2` test
+        // would have mis-treated it as a node and descended.
+        let mut buf = [0u8; 0x100];
+        // SAFETY: buf outlives the GuestMem use.
+        let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
+        assert_eq!(xa_load(&mem, DEFAULT_PAGE_OFFSET, 7, 0, 8, 0), Some(7));
+        assert_eq!(xa_load(&mem, DEFAULT_PAGE_OFFSET, 7, 1, 8, 0), Some(0));
+    }
+
+    #[test]
+    fn xa_load_node_slot_value_entry_is_terminal() {
+        // A real node (kva | 2, > 4096) whose slot 0 holds a VALUE entry
+        // (7 = 0b111, bits 0+1 set, so `& 3 == 3`) must be returned
+        // terminal, NOT descended. xa_is_node(7) is false via the
+        // `& 3 == 2` clause — a value entry is not internal. The prior
+        // `entry & 2` test (bit 1 set) mis-descended into a bogus tiny
+        // node KVA (7 & !3 = 4).
+        let mut buf = [0u8; 0x200];
+        let pa = 0x100usize;
+        buf[pa] = 0; // shift = 0 (leaf level)
+        buf[pa + 8..pa + 16].copy_from_slice(&7u64.to_le_bytes()); // slot[0] = 7 (value entry)
+        // SAFETY: buf outlives the GuestMem use.
+        let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
+        let head = (DEFAULT_PAGE_OFFSET + pa as u64) | 2;
+        assert_eq!(xa_load(&mem, DEFAULT_PAGE_OFFSET, head, 0, 8, 0), Some(7));
+    }
+
+    #[test]
+    fn xa_load_node_slot_small_internal_marker_is_terminal() {
+        // The `> 4096` size clause: a slot holding a true internal marker
+        // (6 = 0b110, `& 3 == 2` — bit 1 set, bit 0 clear) but with value
+        // <= 4096 is a kernel-reserved entry (sibling / RETRY / ZERO), NOT
+        // a node. xa_is_node(6) is false via the `> 4096` clause, so it is
+        // returned terminal. The prior `entry & 2` test (6 & 2 = 2)
+        // mis-descended into node_kva = 6 & !3 = 4 (a bogus tiny KVA).
+        let mut buf = [0u8; 0x200];
+        let pa = 0x100usize;
+        buf[pa] = 0; // shift = 0 (leaf level)
+        buf[pa + 8..pa + 16].copy_from_slice(&6u64.to_le_bytes()); // slot[0] = 6 (internal marker, <= 4096)
+        // SAFETY: buf outlives the GuestMem use.
+        let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
+        let head = (DEFAULT_PAGE_OFFSET + pa as u64) | 2;
+        assert_eq!(xa_load(&mem, DEFAULT_PAGE_OFFSET, head, 0, 8, 0), Some(6));
+    }
+
+    #[test]
+    fn xa_load_node_slot_pointer_leaf_resolves() {
+        // A node whose slot holds an 8-byte-aligned pointer returns it
+        // as a leaf (real descent + leaf path stays correct).
+        let mut buf = [0u8; 0x200];
+        let pa = 0x100usize;
+        buf[pa] = 0; // shift = 0
+        let leaf = DEFAULT_PAGE_OFFSET + 0x40;
+        buf[pa + 8..pa + 16].copy_from_slice(&leaf.to_le_bytes());
+        // SAFETY: buf outlives the GuestMem use.
+        let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
+        let head = (DEFAULT_PAGE_OFFSET + pa as u64) | 2;
+        assert_eq!(
+            xa_load(&mem, DEFAULT_PAGE_OFFSET, head, 0, 8, 0),
+            Some(leaf)
+        );
+    }
+
+    #[test]
+    fn xa_load_multi_level_node_descends_to_leaf() {
+        // Two real nodes (both > 4096): index 5 walks node1.slot[0] (a
+        // node entry) then node2.slot[5] (the leaf). Confirms genuine
+        // internal entries still descend after the xa_is_node tightening.
+        let mut buf = [0u8; 0x400];
+        let n1 = 0x100usize;
+        let n2 = 0x200usize;
+        buf[n1] = 6; // node1 shift = 6 (xa_load decrements by 6 per level)
+        let node2_kva = DEFAULT_PAGE_OFFSET + n2 as u64;
+        // node1.slot[(5 >> 6) & 63 = 0] = node2 (internal node entry)
+        buf[n1 + 8..n1 + 16].copy_from_slice(&(node2_kva | 2).to_le_bytes());
+        // node2.slot[(5 >> 0) & 63 = 5] = leaf pointer
+        let leaf = DEFAULT_PAGE_OFFSET + 0x80;
+        buf[n2 + 8 + 5 * 8..n2 + 8 + 5 * 8 + 8].copy_from_slice(&leaf.to_le_bytes());
+        // SAFETY: buf outlives the GuestMem use.
+        let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
+        let head = (DEFAULT_PAGE_OFFSET + n1 as u64) | 2;
+        assert_eq!(
+            xa_load(&mem, DEFAULT_PAGE_OFFSET, head, 5, 8, 0),
+            Some(leaf)
         );
     }
 }

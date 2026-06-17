@@ -16,14 +16,6 @@
 //! gap from a stale blk-mq tag status (see the parent module's
 //! "Why" doc).
 
-use std::fs::File;
-// `FileExt` provides `read_at`/`write_at`, used only by the
-// `handle_read_impl` / `handle_write_impl` cfg(test) variants below;
-// `handle_flush_impl` uses `File::sync_data` from std and does not
-// need this trait in the lib build.
-#[cfg(test)]
-use std::os::unix::fs::FileExt;
-
 // `GuestAddress` is consumed only by the `cfg(test)` `&self` wrapper
 // signatures below; clippy --lib doesn't see those, so the import
 // looks unused without the `cfg(test)` gate.
@@ -33,7 +25,7 @@ use vm_memory::{Bytes, GuestMemoryMmap};
 
 use virtio_bindings::virtio_blk::{VIRTIO_BLK_ID_BYTES, VIRTIO_BLK_S_IOERR, VIRTIO_BLK_S_OK};
 
-use super::{ChainDescriptor, VIRTIO_BLK_SERIAL, VirtioBlk, VirtioBlkCounters};
+use super::{Backing, ChainDescriptor, VIRTIO_BLK_SERIAL, VirtioBlk, VirtioBlkCounters};
 // `VIRTIO_BLK_SECTOR_SIZE` is consumed only by the cfg(test)
 // `handle_read_impl` / `handle_write_impl` per-segment variants; the
 // production vectored handlers in `device.rs` use the constant
@@ -77,7 +69,7 @@ impl VirtioBlk {
     #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn handle_read_impl(
-        backing: &File,
+        backing: &dyn Backing,
         capacity_bytes: u64,
         counters: &VirtioBlkCounters,
         mem: &GuestMemoryMmap,
@@ -201,7 +193,7 @@ impl VirtioBlk {
     #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn handle_write_impl(
-        backing: &File,
+        backing: &dyn Backing,
         capacity_bytes: u64,
         counters: &VirtioBlkCounters,
         mem: &GuestMemoryMmap,
@@ -293,7 +285,10 @@ impl VirtioBlk {
     /// Service `VIRTIO_BLK_T_FLUSH`. `fdatasync(2)` on the backing.
     /// Returns `(status_byte, used_len)`; caller writes the status
     /// byte and gates `add_used` on a successful status write.
-    pub(crate) fn handle_flush_impl(backing: &File, counters: &VirtioBlkCounters) -> (u8, u32) {
+    pub(crate) fn handle_flush_impl(
+        backing: &dyn Backing,
+        counters: &VirtioBlkCounters,
+    ) -> (u8, u32) {
         let status = match backing.sync_data() {
             Ok(()) => {
                 counters.record_flush();
@@ -319,17 +314,35 @@ impl VirtioBlk {
     /// (drivers/block/virtio_blk.c) maps a single 20-byte buffer
     /// via `blk_rq_map_kern(req, id_str, VIRTIO_BLK_ID_BYTES,
     /// GFP_KERNEL)`, so a well-formed chain has exactly one data
-    /// descriptor of length >= 20. Multi-descriptor chains are
-    /// theoretically legal under the spec but never produced by
-    /// the kernel driver; we honor the kernel's contract by
-    /// writing into the first descriptor only — matching
-    /// firecracker's `process_get_device_id` and libkrun's
-    /// `worker.rs` arm. If the first data descriptor is shorter
-    /// than 20 bytes the request is rejected with `S_IOERR`
-    /// (firecracker, cloud-hypervisor, libkrun all reject;
-    /// QEMU truncates instead — we diverge intentionally because
-    /// a guest that hands us a too-small buffer is already buggy
-    /// and partial-data is a silent footgun).
+    /// descriptor of length >= 20. We honor that contract: write
+    /// into the first data descriptor only, and reject with
+    /// `S_IOERR` if that descriptor is shorter than 20 bytes.
+    ///
+    /// Multi-descriptor GET_ID chains are spec-legal but never
+    /// emitted by the kernel driver. On the realistic single-
+    /// descriptor shape every reference VMM agrees; on a multi-
+    /// descriptor chain they diverge (documented so ours is an
+    /// intentional choice, not an oversight):
+    ///   - firecracker: same as us — first data descriptor only,
+    ///     reject if that descriptor's len < 20 (the
+    ///     `RequestType::GetDeviceID` arm of its block request
+    ///     parse/execute; no spread across the chain).
+    ///   - cloud-hypervisor: per-descriptor — reject if ANY data
+    ///     descriptor is < 20, write the serial into EVERY writable
+    ///     data descriptor.
+    ///   - libkrun: full writable chain — reject on TOTAL writable
+    ///     bytes < 20 (so it accepts a fragmented chain, e.g. 10+10,
+    ///     that we reject) and write via `write_all` across the
+    ///     chain.
+    ///   - qemu: truncate instead of reject — write up to
+    ///     `min(serial length, chain bytes, 20)` across the full
+    ///     chain and return `S_OK`.
+    ///
+    /// We reject (not truncate) and target the first descriptor
+    /// because a chain that can't fit the 20-byte id in one
+    /// descriptor signals a buggy guest; a truncated or garbled
+    /// serial is a silent footgun (the guest's `serial_show` maps
+    /// `-EIO` to an empty string — the honest outcome).
     ///
     /// The data descriptor's direction has already been validated
     /// by the outer `direction_violation` gate in
@@ -369,11 +382,11 @@ impl VirtioBlk {
         if first.len < VIRTIO_BLK_ID_BYTES {
             // Buffer too small — kernel driver always passes
             // exactly VIRTIO_BLK_ID_BYTES (20). Reject rather than
-            // truncate: matches firecracker / cloud-hypervisor /
-            // libkrun. A truncated serial would surface as a
-            // garbled `/sys/block/<dev>/serial` value, which is
-            // worse than an explicit IOERR (the guest's
-            // `serial_show` maps -EIO to an empty string).
+            // truncate (qemu truncates; see the fn doc for the
+            // per-VMM reject-basis divergences). A truncated serial
+            // would surface as a garbled `/sys/block/<dev>/serial`
+            // value, which is worse than an explicit IOERR (the
+            // guest's `serial_show` maps -EIO to an empty string).
             counters.record_io_error();
             return (VIRTIO_BLK_S_IOERR as u8, 1);
         }
@@ -409,7 +422,7 @@ impl VirtioBlk {
         let mut scratch = Vec::new();
         let s = self.worker.state();
         let (status, used_len) = Self::handle_read_impl(
-            &s.backing,
+            &*s.backing,
             s.capacity_bytes,
             s.counters.as_ref(),
             mem,
@@ -435,7 +448,7 @@ impl VirtioBlk {
         let mut scratch = Vec::new();
         let s = self.worker.state();
         let (status, used_len) = Self::handle_write_impl(
-            &s.backing,
+            &*s.backing,
             s.capacity_bytes,
             s.counters.as_ref(),
             mem,
@@ -456,7 +469,7 @@ impl VirtioBlk {
         status_addr: GuestAddress,
     ) -> (u8, u32) {
         let s = self.worker.state();
-        let (status, used_len) = Self::handle_flush_impl(&s.backing, s.counters.as_ref());
+        let (status, used_len) = Self::handle_flush_impl(&*s.backing, s.counters.as_ref());
         mem.write_slice(&[status], status_addr)
             .expect("write status in test wrapper");
         (status, used_len)

@@ -43,11 +43,16 @@ on `CloneMode`:
 - **`CloneMode::Fork`** (default): forks N child processes; each child
   installs a SIGUSR1 handler, then blocks on a pipe waiting for the
   start signal.
-- **`CloneMode::Thread`**: spawns N threads inside the spawner; they
-  block on a sync channel until `start()` flips a shared flag.
-- **`pcomm` containers**: spawns ONE container process that hosts N
-  threads internally (used when a `WorkSpec::pcomm` is set; the
-  container is named accordingly).
+- **`CloneMode::Thread`**: spawns N threads inside the spawner; each
+  blocks in `recv()` on a zero-capacity sync-channel rendezvous until
+  `start()` sends on the channel.
+
+`pcomm` containers are NOT created by `spawn()` — it bails when a
+composed `WorkSpec::pcomm` is set, directing you to
+`WorkloadHandle::spawn_pcomm_cgroup` or the `CgroupDef::pcomm` /
+`apply_setup` path. Those paths spawn ONE container (thread-group
+leader) process hosting N worker threads internally so
+`task->group_leader->comm` matches the pcomm name.
 
 Workers do not begin their workload until `start()` is called.
 
@@ -71,8 +76,9 @@ contention families (`FutexPingPong`, `FutexFanOut`, `FanOutCompute`,
 processes. Used with `CgroupManager::move_task()` or `move_tasks()`
 to place workers in cgroups before starting them.
 
-**`start()`** -- signals all workers to begin their workload by writing
-to their start pipes. Idempotent: calling it twice has no effect.
+**`start()`** -- signals all workers to begin their workload (a
+start-pipe byte write for fork-mode children, a sync-channel send for
+thread-mode workers). Idempotent: calling it twice has no effect.
 Call this after moving workers into their target cgroups.
 
 **`set_affinity(idx, cpus) -> Result<()>`** -- sets CPU affinity for
@@ -103,8 +109,8 @@ Auto-starts workers if `start()` was not called. SIGKILL fires
 unconditionally after the read (or on deadline expiry without a
 report) to reap zombies. Consumes the handle. Each `WorkerReport`
 carries `work_units`, `tid`, optional `affinity_error`, and an
-optional `exit_info` discriminator (`Panicked` / `TimedOut` /
-`Killed` / `WaitFailed(errno)` / `Exited(code)`) — see
+optional `exit_info` discriminator (`Panicked` / `Signaled(sig)` /
+`TimedOut` / `WaitFailed(errno)` / `Exited(code)`) — see
 [`WorkerReport`](workers.md) for the full shape and the
 sentinel-vs-real-report distinction.
 

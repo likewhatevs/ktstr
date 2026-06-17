@@ -18,18 +18,14 @@ use super::{
     BPF_MAP_TYPE_PERCPU_HASH, BpfMapInfo,
 };
 
-/// Maximum number of entries to iterate when walking a hash map.
-/// Prevents unbounded iteration on corrupted or very large maps.
-pub(super) const HTAB_ITER_MAX: usize = 1_000_000;
-
 /// Maximum number of buckets walked per hash map.
 ///
 /// Production maps cap n_buckets at `roundup_pow_of_two(max_entries)`
 /// where `max_entries` is bounded by the kernel's BPF_MAP_CREATE
-/// validation. This 16-bit cap is a hostile-guest safety bound:
-/// a corrupted (uninitialized) u32 read of `bpf_htab.n_buckets`
-/// could yield up to `u32::MAX`, which would otherwise attempt to
-/// walk billions of buckets on the freeze hot path. Mirror of the
+/// validation. This 16-bit cap is a live-read robustness bound:
+/// `bpf_htab.n_buckets` is read live from kernel memory, so a torn or
+/// mis-offset read could yield up to `u32::MAX`, which would otherwise
+/// attempt to walk billions of buckets on the freeze hot path. Mirror of the
 /// matching `TASK_STORAGE_BUCKETS_MAX` cap in
 /// `bpf_map::local_storage`.
 pub(super) const HTAB_BUCKETS_MAX: u32 = 1 << 16;
@@ -191,46 +187,16 @@ pub(super) fn iter_percpu_htab_entries(
                     continue;
                 }
                 let cpu_kva = percpu_base.wrapping_add(cpu_off);
-                match translate_any_kva(
-                    ctx.mem,
-                    ctx.cr3_pa.0,
-                    ctx.page_offset.0,
-                    cpu_kva,
-                    ctx.l5,
-                    ctx.tcr_el1,
-                ) {
-                    // `checked_add` against a pathological cpu_pa
-                    // + value_size that would wrap u64 — without
-                    // the guard, a wrap would silently make
-                    // `<= mem.size()` true and the read_bytes call
-                    // would walk past end-of-DRAM.
-                    Some(cpu_pa)
-                        if cpu_pa
-                            .checked_add(value_size as u64)
-                            .is_some_and(|end| end <= ctx.mem.size()) =>
-                    {
-                        // Same with-capacity-then-set-len trick as
-                        // the key buffer; a short read leaves the
-                        // slot as `None` so the renderer never sees a
-                        // partially-zeroed value.
-                        let mut buf: Vec<u8> = Vec::with_capacity(value_size);
-                        // SAFETY: capacity == value_size; gated by
-                        // the read returning value_size.
-                        let slice =
-                            unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr(), value_size) };
-                        let n = ctx.mem.read_bytes(cpu_pa, slice);
-                        if n == value_size {
-                            // SAFETY: read_bytes filled value_size bytes.
-                            unsafe {
-                                buf.set_len(value_size);
-                            }
-                            per_cpu.push(Some(buf));
-                        } else {
-                            per_cpu.push(None);
-                        }
-                    }
-                    _ => per_cpu.push(None),
-                }
+                // A per-CPU value straddling physically discontiguous
+                // vmalloc frames must be read page-by-page; share the
+                // array map's reader, which translates each page via
+                // `translate_any_kva` (direct mapping first, page-table
+                // walk for vmalloc'd percpu) and drops the slot to
+                // `None` on any unmapped page or end-of-DRAM short
+                // read. The single-read path's explicit
+                // `cpu_pa + value_size <= mem.size()` bound is subsumed
+                // by the per-page translate + short-read detection.
+                per_cpu.push(super::read_percpu_value_bytes(ctx, cpu_kva, value_size));
             }
             Some((key_buf, per_cpu))
         },
@@ -241,7 +207,7 @@ pub(super) fn iter_percpu_htab_entries(
 /// `htab_elem`, collecting whatever the closure returns.
 ///
 /// Centralizes the bucket-array translation, hlist_nulls chain walk,
-/// and the [`HTAB_ITER_MAX`] cap so plain-HASH and PERCPU-HASH
+/// and the per-walk visit cap ([`super::AccessorCtx::iter_max`]) so plain-HASH and PERCPU-HASH
 /// variants share one traversal — the only difference between them
 /// is what the per-element extractor reads.
 fn walk_htab<T, F>(ctx: &AccessorCtx<'_>, map: &BpfMapInfo, mut extract: F) -> Vec<T>
@@ -309,7 +275,7 @@ where
                 break;
             }
             total_visited += 1;
-            if total_visited > HTAB_ITER_MAX {
+            if total_visited > ctx.iter_max {
                 return out;
             }
 
@@ -336,6 +302,13 @@ where
                 ctx.mem,
             ) {
                 out.push(item);
+            }
+            // Bound materialization at the renderer's cap, one-past so
+            // render's `len > MAX_HASH_ENTRIES` still flags truncation
+            // (see super::MAP_MATERIALIZE_MAX). Without this a large map
+            // materializes up to ctx.iter_max entries before the take.
+            if out.len() > super::MAP_MATERIALIZE_MAX {
+                return out;
             }
 
             node_ptr = ctx.mem.read_u64(elem_pa, htab.hlist_nulls_node_next);

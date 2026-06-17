@@ -13,12 +13,17 @@ budget falls mid-LLC). See
 the comparison against the other two tiers.
 
 Every no-perf-mode VM and kernel build runs through this pipeline
-— there is no "no cap" path. When `--cpu-cap` is absent, the
-planner applies a **30% default** of the calling process's
-sched_getaffinity cpuset (minimum 1 CPU). This keeps
-`sched_setaffinity` safe under cgroup-restricted CI runners (CI
-hosts, systemd slices, sudo-under-a-limited-cpuset) where the
-process cannot run on every online CPU even if sysfs lists them.
+— there is no "no cap" path. When `--cpu-cap` is absent, the default
+budget depends on the path. Kernel builds floor at a flat **30% of
+the allowed-CPU set** (minimum 1 CPU; `default_cpu_budget`).
+No-perf-mode VMs instead size to `max(30%, min(vcpus, allowed))`
+(`no_perf_cpu_budget`) so a wide VM's vCPU threads are not
+host-oversubscribed by a 30% mask. A per-test `cpu_budget` knob
+(`#[ktstr_test]`) overrides the auto-size, clamped to `[1, allowed]`;
+an explicit `--cpu-cap` / `KTSTR_CPU_CAP` still wins outright. The
+30% floor keeps `sched_setaffinity` safe under cgroup-restricted CI
+runners (CI hosts, systemd slices, sudo-under-a-limited-cpuset) where
+the process cannot run on every online CPU even if sysfs lists them.
 
 ## When to use it
 
@@ -94,11 +99,14 @@ diagnostic.
    contribution per LLC until the accumulated count meets
    `target_cpus`. Final acquire order is ascending LLC index for
    livelock safety.
-3. **ACQUIRE** — non-blocking `LOCK_SH` on every selected LLC. A
-   single `EWOULDBLOCK` drops every held fd and retries once
-   (one TOCTOU retry — the second DISCOVER's `/proc/locks` read
-   IS the backoff; more retries would amplify livelock risk
-   without adding coordination signal).
+3. **ACQUIRE** — non-blocking `LOCK_SH` on every selected LLC,
+   all-or-nothing. A single `EWOULDBLOCK` drops every held fd and the
+   DISCOVER → PLAN → ACQUIRE loop retries up to 3 times (4 total
+   attempts; `ACQUIRE_MAX_TOCTOU_RETRIES = 3`). Between attempts it
+   sleeps an ascending micro-budget — 10ms, 50ms, 200ms
+   (`TOCTOU_RETRY_DELAYS`) — so a racing peer has time to drop its fds
+   before the next `/proc/locks` snapshot. After the final attempt it
+   bails with a `ResourceContention` error naming the winning holders.
 
 ### Partial-take on the last LLC
 
@@ -244,7 +252,7 @@ Ceph MDS does not participate in `flock` serialization across
 nodes; AFS does not support `flock(2)` at all; FUSE flock
 semantics depend on whether the userspace server implements the
 op. `try_flock` statfs-checks every lockfile path at open time
-via `reject_remote_fs` in `src/flock.rs` — hitting any
+via `reject_remote_fs` in `src/flock/fs_filter.rs` — hitting any
 deny-listed filesystem produces an actionable runtime error
 naming the filesystem plus the remediation "Move the lockfile
 path to a local filesystem (tmpfs, ext4, xfs, btrfs, f2fs,

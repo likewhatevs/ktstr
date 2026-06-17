@@ -78,9 +78,12 @@ cargo ktstr test --kernel ../linux -- --run-ignored ignored-only \
 Topology format: `{numa_nodes}n{llcs}l{cores_per_llc}c{threads_per_core}t`
 (e.g. `1n2l4c2t` = 1 NUMA node, 2 LLCs, 4 cores per LLC, 2 threads
 per core = 16 CPUs). Presets are defined in `gauntlet_presets()`.
-Multi-NUMA presets are excluded by default
-(`max_numa_nodes: Some(1)` in `TopologyConstraints::DEFAULT`), so
-tests opt in to NUMA testing by raising `max_numa_nodes`.
+Multi-NUMA presets are excluded by default (`max_numa_nodes: Some(1)`
+in `TopologyConstraints::DEFAULT`), as are the scale-boundary
+single-node presets that exceed the default caps `max_llcs: Some(12)`
+/ `max_cpus: Some(192)` — `near-max-llc` and `max-cpu` (240/252 CPUs,
+15/14 LLCs) and their `-nosmt` variants. Tests opt into these presets
+by raising `max_numa_nodes`, `max_llcs`, or `max_cpus` respectively.
 
 > **aarch64:** ARM64 CPUs do not have SMT. Presets with
 > `threads_per_core > 1` are excluded on aarch64, leaving 14 presets

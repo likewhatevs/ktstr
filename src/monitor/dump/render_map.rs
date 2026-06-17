@@ -43,7 +43,7 @@ use super::super::bpf_map::{
     BPF_MAP_TYPE_REUSEPORT_SOCKARRAY, BPF_MAP_TYPE_RINGBUF, BPF_MAP_TYPE_SK_STORAGE,
     BPF_MAP_TYPE_SOCKHASH, BPF_MAP_TYPE_SOCKMAP, BPF_MAP_TYPE_STACK, BPF_MAP_TYPE_STACK_TRACE,
     BPF_MAP_TYPE_STRUCT_OPS, BPF_MAP_TYPE_TASK_STORAGE, BPF_MAP_TYPE_USER_RINGBUF,
-    BPF_MAP_TYPE_XSKMAP, BpfMapAccessor, BpfMapInfo, GuestMemMapAccessor,
+    BPF_MAP_TYPE_XSKMAP, BpfMapAccessor, BpfMapInfo, GuestMemMapAccessor, MAP_MATERIALIZE_MAX,
 };
 use super::super::btf_render::{
     ArenaResolveHit, CastHit, CrossBtfRef, FwdKind, MemReader, RenderedValue, render_value_with_mem,
@@ -72,9 +72,14 @@ pub(super) const MAX_PERCPU_KEYS: u32 = 256;
 /// HASH map with millions of live entries would OOM the host
 /// renderer if iterated unbounded, so the dump caps at 4096 and
 /// surfaces an `error` describing the truncation. The unrendered
-/// tail is silently dropped — recording it would itself require
-/// unbounded memory.
-pub(super) const MAX_HASH_ENTRIES: usize = 4096;
+/// tail is dropped (the truncation `error` reports it) — recording it
+/// would itself require unbounded memory.
+///
+/// Aliases [`MAP_MATERIALIZE_MAX`]: the bpf_map walkers stop
+/// materializing one past this value, so the render cap and the walker
+/// materialize cap are intentionally one const — a drift between them
+/// would silently lose the `len > MAX_HASH_ENTRIES` truncation signal.
+pub(super) const MAX_HASH_ENTRIES: usize = MAP_MATERIALIZE_MAX;
 
 /// Maximum entries the dump path will render from a multi-entry
 /// `BPF_MAP_TYPE_ARRAY` map.
@@ -705,7 +710,7 @@ struct AccessorMemReader<'a> {
     rendered_slot_addrs: Option<&'a std::collections::HashSet<u32>>,
     /// Unique alloc_sizes from all Arena CastHits in the CastMap.
     /// Fallback for deferred-resolve chases with alloc_size=None.
-    alloc_size_types: Vec<(u64, String)>,
+    alloc_size_types: &'a [(u64, String)],
     /// Kernel virtual address of the program BTF the current per-map
     /// renderer is using. Threaded into the
     /// [`MemReader::resolve_arena_type`] gate so the sdt_alloc
@@ -861,7 +866,7 @@ impl MemReader for AccessorMemReader<'_> {
         set.contains(&(addr as u32))
     }
     fn alloc_size_types(&self) -> &[(u64, String)] {
-        &self.alloc_size_types
+        self.alloc_size_types
     }
 }
 
@@ -1022,7 +1027,7 @@ impl<'a> GuestMemMapAccessor<'a> {
             cross_btf_fwd_index,
             scx_static_index,
             rendered_slot_addrs,
-            alloc_size_types: alloc_size_types.to_vec(),
+            alloc_size_types,
             requesting_btf_kva,
         }
     }
@@ -2182,6 +2187,14 @@ pub(super) fn render_map(ctx: &RenderMapCtx<'_>, info: &BpfMapInfo) -> FailureDu
         | BPF_MAP_TYPE_XSKMAP
         | BPF_MAP_TYPE_REUSEPORT_SOCKARRAY => {
             out.fd_array = Some(render_fd_array_slots(accessor, info));
+            if fd_map_is_hash_shaped(info.map_type) {
+                out.error = Some(
+                    "fd-array dump does not walk hash-shaped FD maps \
+                     (SOCKHASH/DEVMAP_HASH/HASH_OF_MAPS); populated \
+                     count is unavailable for these"
+                        .into(),
+                );
+            }
         }
         // Every other map type (transient containers,
         // sub-structures the dump path doesn't yet decode) maps to
@@ -2517,23 +2530,33 @@ pub(super) fn render_stack_traces(
 /// Walk an FD-array's `bpf_array.ptrs[]` flex array and report
 /// populated indices.
 ///
+/// True for FD-map types whose slots live in a hash table (SOCKHASH,
+/// DEVMAP_HASH, HASH_OF_MAPS) rather than the contiguous
+/// `bpf_array.ptrs` flex array. [`render_fd_array_slots`] cannot walk
+/// these; [`render_map`] surfaces the gap in `out.error`.
+pub(super) fn fd_map_is_hash_shaped(map_type: u32) -> bool {
+    matches!(
+        map_type,
+        BPF_MAP_TYPE_SOCKHASH | BPF_MAP_TYPE_DEVMAP_HASH | BPF_MAP_TYPE_HASH_OF_MAPS
+    )
+}
+
 /// FD-array families (PROG_ARRAY, PERF_EVENT_ARRAY, CGROUP_ARRAY,
-/// ARRAY_OF_MAPS, HASH_OF_MAPS, DEVMAP*, SOCKMAP*, CPUMAP, XSKMAP,
+/// ARRAY_OF_MAPS, DEVMAP, SOCKMAP, CPUMAP, XSKMAP,
 /// REUSEPORT_SOCKARRAY) all share the `bpf_array.ptrs` layout: each
 /// slot is `sizeof(void *)` (8 bytes on 64-bit). Non-zero = populated.
 /// The dump reports populated count + indices (truncated to
 /// [`MAX_FD_ARRAY_INDICES`]).
 ///
 /// HASH_OF_MAPS and SOCKHASH/DEVMAP_HASH are hash-shaped, not array-
-/// shaped — but the underlying slot storage uses the same `void *`
-/// pointer layout. The accurate walk for those is `iter_hash_map`
-/// followed by per-element fd resolution; today the dump path treats
-/// them like the array variants and walks `bpf_array.ptrs` which only
-/// works for the strictly-array families. The hash variants land here
-/// as a no-op (max_entries reads but slots empty); operators see
-/// `populated: 0` which truthfully reports "this dump path doesn't
-/// walk hash-shaped FD maps." The error string makes the limitation
-/// explicit.
+/// shaped: their slots do not live in the contiguous `bpf_array.ptrs`
+/// flex array this walker reads, so scanning it would report a false
+/// `populated: 0` indistinguishable from a genuinely empty array map.
+/// [`fd_map_is_hash_shaped`] detects them, the walker returns
+/// immediately with `scanned: 0`, and [`render_map`] sets `out.error`
+/// so operators see the dump path does not walk these. Accurate
+/// support would walk the hash table (`iter_hash_map`) and resolve
+/// each element's fd pointer.
 pub(super) fn render_fd_array_slots(
     accessor: &GuestMemMapAccessor<'_>,
     info: &BpfMapInfo,
@@ -2550,17 +2573,10 @@ pub(super) fn render_fd_array_slots(
     let mut indices: Vec<u32> = Vec::new();
 
     // For hash-shaped FD maps, bpf_array layout doesn't apply — the
-    // ptrs flex array isn't the right slot home. iter_hash_map is the
-    // accurate walker but doesn't currently surface the per-element
-    // fd pointer side. Treating these as "fd_array with populated=0"
-    // is misleading; bail without scanning so the consumer doesn't
-    // get a false negative. Distinct hash-shaped types: SOCKHASH,
-    // DEVMAP_HASH, HASH_OF_MAPS.
-    let hash_shaped = matches!(
-        info.map_type,
-        BPF_MAP_TYPE_SOCKHASH | BPF_MAP_TYPE_DEVMAP_HASH | BPF_MAP_TYPE_HASH_OF_MAPS
-    );
-    if hash_shaped {
+    // ptrs flex array isn't the right slot home. Bail without scanning
+    // (scanned: 0) rather than report a false populated: 0; render_map
+    // sets out.error so the gap is explicit. See fd_map_is_hash_shaped.
+    if fd_map_is_hash_shaped(info.map_type) {
         return FailureDumpFdArray {
             populated: 0,
             scanned: 0,

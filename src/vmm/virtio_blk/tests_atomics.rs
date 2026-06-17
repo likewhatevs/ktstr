@@ -21,7 +21,7 @@ use virtio_queue::mock::MockSplitQueue;
 /// the backing file an unsized tempfile.
 fn dummy_worker_state() -> BlkWorkerState {
     BlkWorkerState {
-        backing: tempfile().expect("create tempfile for dummy_worker_state"),
+        backing: Box::new(tempfile().expect("create tempfile for dummy_worker_state")),
         ops_bucket: TokenBucket::unlimited(),
         bytes_bucket: TokenBucket::unlimited(),
         all_descs_scratch: Vec::new(),

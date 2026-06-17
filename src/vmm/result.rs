@@ -110,7 +110,7 @@ pub struct VmResult {
     pub kvm_stats: Option<KvmStatsTotals>,
     /// Crash message extracted from COM2 output via
     /// `crate::test_support::extract_panic_message`. The guest
-    /// panic hook in `rust_init.rs` writes `PANIC: <info>\n<bt>\n`
+    /// panic hook in `rust_init/init.rs` writes `PANIC: <info>\n<bt>\n`
     /// to `/dev/ttyS1` synchronously inside `KVM_RUN`, so the host
     /// captures the full backtrace in `output` even when the guest
     /// is wedged. `None` when no `PANIC:`-prefixed line was seen.
@@ -235,26 +235,51 @@ pub struct VmResult {
     /// the final cumulative totals; no atomic load is needed on the
     /// consumer side.
     ///
-    /// The counter struct exposes eleven `AtomicU64` fields, each
-    /// bumped from `process_tx_loopback`:
+    /// The counter struct exposes thirteen `AtomicU64` fields, each
+    /// bumped across the TX-drain path rooted at `process_tx_loopback`
+    /// (several are bumped inside the `pop_and_capture_tx` /
+    /// `try_loopback_to_rx` helpers it calls):
     ///
-    ///   - `tx_packets` — count of TX chains the device accepted
-    ///     and marked used; advances per parsed chain regardless of
-    ///     downstream RX outcome.
+    ///   - `tx_packets` — count of TX chains whose L2 frame was
+    ///     captured (`frame_len = Some`) AND whose TX `add_used`
+    ///     succeeded. Over-size-dropped and malformed chains are still
+    ///     marked used (so the guest doesn't hang) but do NOT advance
+    ///     `tx_packets`; a chain whose `add_used` fails advances
+    ///     `tx_add_used_failures` instead. So `tx_packets` advances per
+    ///     successfully-captured-and-published chain, not per parsed
+    ///     chain.
     ///   - `tx_bytes` — bytes of L2 frame data captured from
     ///     successfully parsed TX chains (excludes the 12-byte
     ///     virtio header).
     ///   - `rx_packets` / `rx_bytes` — count + bytes of RX chains
-    ///     successfully written and marked used. In v0's pure-
-    ///     loopback mode the steady-state expectation is
-    ///     `rx_packets == tx_packets - tx_dropped_no_rx_buffer`;
-    ///     asymmetric counts surface RX-side breakage.
+    ///     successfully written and marked used. `rx_packets` and
+    ///     `tx_packets` gate INDEPENDENTLY per chain: `rx_packets`
+    ///     bumps when the loopback delivers — recorded BEFORE the TX
+    ///     `add_used` — while `tx_packets` bumps only when that later
+    ///     TX `add_used` succeeds. So the identity
+    ///     `rx_packets == tx_packets - tx_dropped_no_rx_buffer
+    ///     - tx_dropped_rx_poisoned` holds ONLY when both the RX-side
+    ///     failure counters AND `tx_add_used_failures` are zero:
+    ///     RX-side failures (`rx_add_used_failures`, `rx_chain_invalid`,
+    ///     `rx_write_failed`) make `rx_packets` fall SHORT of
+    ///     `tx_packets - drops`, while a `tx_add_used_failures` on a
+    ///     chain whose RX already delivered makes `rx_packets` EXCEED
+    ///       it. Asymmetric counts surface queue-state breakage on
+    ///       either side.
     ///   - `tx_dropped_no_rx_buffer` — successfully-captured TX
     ///     frames the device could not deliver because the RX queue
-    ///     was empty (back-pressure event).
+    ///     was empty (transient back-pressure event).
+    ///   - `tx_dropped_rx_poisoned` — successfully-captured TX frames
+    ///     dropped because the RX queue was poisoned by a prior guest
+    ///     avail-ring violation (wedged until a virtio reset), as
+    ///     opposed to the transient empty-queue back-pressure counted
+    ///     by `tx_dropped_no_rx_buffer`.
     ///   - `tx_chain_invalid` / `rx_chain_invalid` — chains rejected
     ///     for malformed shape (short header, wrong direction,
     ///     attacker-controlled descriptor address overflow).
+    ///   - `tx_oversize_dropped` — TX chains dropped (not truncated)
+    ///     because the captured post-header frame data exceeded the
+    ///     maximum L2 frame size the guest's `max_mtu` permits.
     ///   - `rx_write_failed` — RX chain whose shape was valid but
     ///     whose guest-memory `write_slice` (header or frame) hit
     ///     an unmapped GPA. Distinct from `rx_chain_invalid` so an

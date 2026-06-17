@@ -6,9 +6,12 @@
 > diffs** (kernel build, CPU model, sched_\* tunables, NUMA layout
 > between machines or over time), see
 > [Capture and Compare Host State](host-state.md). Both recipes
-> invoke `cargo ktstr stats compare`; this recipe drives it via two
-> branch worktrees, the host-state recipe drives it via two
-> `show-host` snapshots.
+> invoke `cargo ktstr stats compare`; this recipe drives it by
+> partitioning two branch worktrees' runs on the `commit` dimension,
+> and the host-state recipe drives it the same way, reading the
+> host-delta from each sidecar's archived `host` field (`show-host`
+> there is for live/archived host inspection, not for feeding
+> `stats compare`).
 
 Compare scheduler behavior between two branches by running the
 same `#[ktstr_test]` suite against each, then using
@@ -88,11 +91,11 @@ one directory (last-writer-wins via per-process pre-clear);
 mark one of them as `-dirty` (uncommitted change) or commit /
 amend between runs to land separate directories.
 
-Do **not** set `KTSTR_SIDECAR_DIR`: `cargo ktstr stats list`
-and `cargo ktstr stats compare` walk
-`{CARGO_TARGET_DIR or "target"}/ktstr/` by default and would
-not see runs written to a custom flat directory unless
-`--dir DIR` is passed.
+Do **not** set `KTSTR_SIDECAR_DIR`: `cargo ktstr stats compare`
+walks `{CARGO_TARGET_DIR or "target"}/ktstr/` by default and would
+not see runs written to a custom flat directory unless `--dir DIR`
+is passed; `cargo ktstr stats list` has no `--dir` flag and honors
+only `CARGO_TARGET_DIR`.
 
 ## Discover available dimension values
 

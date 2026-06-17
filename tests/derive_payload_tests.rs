@@ -83,6 +83,28 @@ fn derive_payload_full_grammar() {
     assert_eq!(FIO_FULL.metrics[3].unit, "");
 }
 
+/// `TargetValue` accepts negative and integer-valued targets. A
+/// negative literal parses as `Expr::Unary(Neg, Lit)` (never a bare
+/// `Lit`) and an integer is `Lit::Int`; both coerce to f64. Pins the
+/// derive fix — previously these were rejected with a misleading
+/// "must be a float literal" error.
+#[derive(ktstr::Payload)]
+#[payload(binary = "tgt", output = Json)]
+#[metric(name = "signed_delta", polarity = TargetValue(-1.5))]
+#[metric(name = "zero_target", polarity = TargetValue(0))]
+#[allow(dead_code)]
+struct TargetValuePayload;
+
+#[test]
+fn derive_payload_target_value_negative_and_integer() {
+    assert_eq!(TARGET_VALUE.metrics.len(), 2);
+    assert_eq!(
+        TARGET_VALUE.metrics[0].polarity,
+        Polarity::TargetValue(-1.5)
+    );
+    assert_eq!(TARGET_VALUE.metrics[1].polarity, Polarity::TargetValue(0.0));
+}
+
 /// `output = LlmExtract` (bare-ident shorthand) resolves to
 /// `LlmExtract(None)`.
 #[derive(ktstr::Payload)]
@@ -292,4 +314,30 @@ fn derive_payload_accepts_fully_qualified_check_path() {
         FULLY_QUALIFIED_CHECK.default_checks[1],
         MetricCheck::ExitCodeEq(0),
     ));
+}
+
+/// `#[include_files(...)]` registers the variadic string literals into
+/// the emitted const's `include_files` slice, in declaration order.
+/// Regression: the derive body parsed `include_files` but the
+/// attribute was not in the derive's `attributes(...)` list, so
+/// `#[include_files(...)]` on a `#[derive(Payload)]` struct failed to
+/// compile ("cannot find attribute include_files in this scope") —
+/// this test only compiles because the helper attribute is registered.
+#[derive(ktstr::Payload)]
+#[payload(binary = "bench_with_includes")]
+#[include_files("bench-helper", "config.json")]
+#[allow(dead_code)]
+struct BenchWithIncludesPayload;
+
+#[test]
+fn derive_payload_include_files_registered_in_order() {
+    // The derive auto-injects the `binary` spec as the first
+    // include_files entry (payload.rs `include_files.insert(0, binary)`),
+    // so `#[payload(binary = "X")]` packages X without a separate
+    // `#[include_files("X")]`. The user-declared helpers follow in
+    // source order.
+    assert_eq!(
+        BENCH_WITH_INCLUDES.include_files,
+        &["bench_with_includes", "bench-helper", "config.json"],
+    );
 }

@@ -66,8 +66,11 @@ dependencies — no manual `.so` lists or `LD_LIBRARY_PATH` hacks.
 `cargo ktstr export` packages a registered test as a self-extracting
 `.run` script that reproduces the scenario on bare metal without
 a VM. The runfile validates host topology and sched_ext support,
-then dispatches the test directly under whatever scheduler is
-already active. Config files declared via `Scheduler::config_file`
+checks that no other sched_ext scheduler is already attached (it
+errors out rather than displacing one), then launches the test's
+bundled scheduler (the binary frozen at registration) and runs the
+scenario under it; non-scheduler (EEVDF) tests run under the kernel
+default. Config files declared via `Scheduler::config_file`
 or `config_content` (paired with `config_file_def`) are packed into
 the archive and the scheduler launch line includes the matching
 `--config`/`{file}` arg, so a layered/lavd-class test reproduces
@@ -122,10 +125,10 @@ catalog aggregator.)
 - `CgroupDef` — declarative cgroup: name + cpuset + workload(s)
 - `Step` — sequence of ops followed by a hold period
 - `Op` — atomic operation (add/remove cgroup, set/swap/clear cpuset, spawn, stop, set affinity, move tasks)
-- `CpusetSpec` — topology-relative cpuset (LLC-aligned, disjoint, overlapping, range, exact)
+- `CpusetSpec` — topology-relative cpuset (LLC-aligned, NUMA-aligned, disjoint, overlapping, range, exact)
 - `HoldSpec` — hold duration (fractional, fixed, or looped)
 - `AffinityIntent` — per-worker affinity (inherit, random subset, LLC-aligned, SMT-sibling-pair, cross-cgroup, single CPU, exact)
-- `SchedPolicy` — Linux scheduling policy (Normal, Batch, Idle, FIFO, RoundRobin, Deadline)
+- `SchedPolicy` — Linux scheduling policy (Normal, Batch, Idle, Fifo, RoundRobin, Deadline)
 - `WorkSpec` — workload definition for a group of workers
 - `Backdrop` — long-lived cgroups, payloads, and ops that span the whole scenario; the framework applies them before any Step runs and tears them down after the last Step completes
 
@@ -177,14 +180,14 @@ readiness gates between host and guest.
 </details>
 
 <details>
-<summary><b>38 work types</b> — configurable workload profiles for different scheduling pressures</summary>
+<summary><b>39 work types</b> — configurable workload profiles for different scheduling pressures</summary>
 
 Workers are `fork()`ed processes placed in cgroups:
 
 - `SpinWait` — tight CPU spin loop
 - `YieldHeavy` — repeated sched_yield with minimal CPU work
 - `Mixed` — CPU spin burst followed by sched_yield
-- `AluHot` — dependent integer multiply chain at high IPC (≥ 2.0)
+- `AluHot` — independent integer multiply chains at high IPC (≥ 2.0)
 - `SmtSiblingSpin` — paired PAUSE-spin pinned across two SMT siblings
 - `IpcVariance` — alternating high-IPC (multiplies) / low-IPC (cache touches) phases
 - `IoSyncWrite` — 16 × 4 KB pwrites + fdatasync per iteration (O_SYNC)
@@ -202,6 +205,7 @@ Workers are `fork()`ed processes placed in cgroups:
 - `ForkExit` — rapid fork+_exit cycling
 - `NiceSweep` — cycle nice level from -20 to 19
 - `AffinityChurn` — rapid self-directed sched_setaffinity
+- `CrossAffinityChurn` — each worker rewrites its cgroup-siblings' affinity via sched_setaffinity (distinct from `AffinityChurn`, which churns the worker's own affinity)
 - `PolicyChurn` — cycle SCHED_OTHER → BATCH → IDLE (→ FIFO/RR with CAP_SYS_NICE)
 - `NumaMigrationChurn` — rotate sched_setaffinity across NUMA nodes
 - `CgroupChurn` — cycle cgroup membership between sibling cgroups
@@ -405,9 +409,9 @@ and [Performance Mode](concepts/performance-mode.md#tier-2-no-perf-mode-with-cpu
 </details>
 
 <details>
-<summary><b>Statistical regression detection</b> — Polars-powered analysis across combinatoric test matrices</summary>
+<summary><b>Statistical regression detection</b> — cross-run analysis across combinatoric test matrices</summary>
 
-[Polars](https://pola.rs)-powered aggregation computes scheduling
+Cross-run aggregation computes scheduling
 metrics across runs. Run-to-run compare with dual-gate
 significance thresholds (absolute and relative) catches regressions
 that single-run assertions miss.
@@ -417,8 +421,8 @@ that single-run assertions miss.
 - `worst_gap_ms` — longest scheduling gap
 - `total_migrations` / `worst_migration_ratio` — cross-CPU migration volume
 - `max_imbalance_ratio` — runqueue length imbalance
-- `p99_wake_latency_us` — tail wake-to-run latency
-- `mean_run_delay_us` — mean schedstat run delay
+- `worst_p99_wake_latency_us` — tail wake-to-run latency
+- `worst_mean_run_delay_us` — mean schedstat run delay
 - `total_iterations` — throughput
 
 </details>

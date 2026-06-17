@@ -299,12 +299,15 @@ const volatile int scattershot = 0;
 const volatile int slow = 0;
 
 /* When non-zero, ktstr_dispatch contains a #pragma unroll loop
- * followed by while(1). The compiler unrolls the loop into
- * sequential copies of the same instruction block. The trailing
- * while(1) forces verifier rejection so libbpf prints the full
- * trace to stderr. collapse_cycles() compresses the repetitive
- * unrolled output. const volatile (.rodata) so the verifier
- * prunes the path when verify_loop=0. */
+ * followed by a store through a null pointer. The compiler unrolls
+ * the loop into sequential copies of the same instruction block.
+ * The trailing null-pointer store is the invalid access that forces
+ * verifier rejection so libbpf prints the full trace to stderr
+ * (deliberately NOT a while(1): an infinite loop's verifier analysis
+ * could keep scx_ops_load from returning within the host's
+ * scheduler-attach poll). collapse_cycles() compresses the
+ * repetitive unrolled output. const volatile (.rodata) so the
+ * verifier prunes the path when verify_loop=0. */
 const volatile int verify_loop = 0;
 
 /* Runtime-mutable degrade flag. Set from userspace via .bss map write,
@@ -320,6 +323,15 @@ volatile int degrade_rt;
 u32 degrade_cnt;
 u32 slow_cnt;
 
+/* Stats-bridge fidelity sentinel. `ktstr_init` stamps `stats_magic`
+ * with this fixed value; the host stats-bridge e2e asserts the value
+ * it receives over the scx_stats relay is EXACTLY this. A `> 0` /
+ * non-zero check (as used for the dynamic counters below) would pass
+ * on any stray cardinal; an exact known value proves the bridge
+ * delivers the emitted bytes intact. The Rust side mirrors this
+ * constant in tests/stats_bridge_e2e.rs — they must stay in sync. */
+#define KTSTR_STATS_MAGIC 0x5354415473746174ULL /* "STATstat" */
+
 /* Cumulative counters surfaced via the scx_stats userspace protocol
  * (KtstrStats in scx-ktstr/src/stats.rs). Updated with
  * `__sync_fetch_and_add` because each ops callback runs concurrently
@@ -330,6 +342,11 @@ volatile u64 nr_dispatched;
 volatile u64 nr_enqueued;
 volatile u64 nr_select_cpu;
 volatile u64 nr_yielded;
+
+/* Written once by `ktstr_init` to KTSTR_STATS_MAGIC; never
+ * incremented. Exists solely so the host stats-bridge e2e can assert
+ * an exact, known value round-trips through the scx_stats relay. */
+volatile u64 stats_magic;
 
 
 s32 BPF_STRUCT_OPS(ktstr_select_cpu, struct task_struct *p,
@@ -449,6 +466,11 @@ void BPF_STRUCT_OPS(ktstr_dispatch, s32 cpu, struct task_struct *prev)
 s32 BPF_STRUCT_OPS_SLEEPABLE(ktstr_init)
 {
 	int ret;
+
+	/* Stamp the stats-bridge fidelity sentinel (see KTSTR_STATS_MAGIC).
+	 * Read back by userspace via bss_data.stats_magic in current_stats
+	 * (scx-ktstr/src/main.rs) and asserted exact by the host e2e. */
+	stats_magic = KTSTR_STATS_MAGIC;
 
 	ret = scx_bpf_create_dsq(SHARED_DSQ, -1);
 	if (ret)

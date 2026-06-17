@@ -2,8 +2,8 @@
 
 `cargo ktstr` is a cargo plugin for kernel build, cache, and test
 workflow. Subcommands in `--help` order: `test` (alias: `nextest`),
-`coverage`, `llvm-cov`, `stats`, `kernel`, `model`, `verifier`,
-`funify` (alias: `costume`), `completions`, `show-host`,
+`coverage`, `llvm-cov`, `stats`, `replay`, `kernel`, `model`,
+`verifier`, `funify` (alias: `costume`), `completions`, `show-host`,
 `show-thresholds`, `export`, `locks`, `shell`.
 
 ## test
@@ -212,8 +212,9 @@ distinct cache entry under the clean shape.
    can not land under a stale identity. Dirty / non-git trees
    skip the cache store unconditionally (no stable HEAD identity
    for the cache key) but still get `compile_commands.json`.
-6. **Test execution** — execs `cargo nextest run` once with
-   `KTSTR_KERNEL` set in the environment (single-kernel) or with
+6. **Test execution** — runs `cargo nextest run` once (spawned and
+   waited on via `Command::status()`, not exec) with `KTSTR_KERNEL`
+   set in the environment (single-kernel) or with
    both `KTSTR_KERNEL` and `KTSTR_KERNEL_LIST` (multi-kernel; the
    latter encodes the resolved kernel set as
    `label1=path1;label2=path2;…`). For clean Path-spec resolution
@@ -530,6 +531,8 @@ find the latest available tarball. Skips building when a cached entry already ex
 | `--force` | Rebuild even if a cached image exists. |
 | `--clean` | Run `make mrproper` before configuring. Only meaningful with `--source`. |
 | `--cpu-cap N` | Reserve exactly N host CPUs for the build (integer ≥ 1; must be ≤ the calling process's `sched_getaffinity` cpuset size). When absent, 30% of the allowed CPUs are reserved (minimum 1). The planner walks whole LLCs in consolidation- and NUMA-aware order, partial-taking the last LLC so `plan.cpus.len() == N` exactly. Under `--cpu-cap`, `make -jN` parallelism matches the reserved CPU count and the build runs inside a cgroup v2 sandbox that pins gcc/ld to the reserved CPUs + NUMA nodes. Mutually exclusive with `KTSTR_BYPASS_LLC_LOCKS=1`. Also settable via `KTSTR_CPU_CAP` env var (CLI flag wins when both are present). |
+| `--extra-kconfig PATH` | Additional kconfig fragment merged on top of the baked-in `ktstr.kconfig` (user values win on conflict). Lands in a distinct cache slot keyed by the extra fragment's hash, so it never collides with a baked-only build. |
+| `--skip-sha256` | Skip SHA-256 verification of a downloaded stable tarball (emits a bypass warning). No effect on `--source`/`--git` builds, which download no tarball. |
 
 ### kernel clean
 
@@ -1189,14 +1192,16 @@ The compare output renders per-phase tables in addition to the
 scalar findings table. The flags below tune that rendering. They
 are mutually exclusive with each other only where noted —
 `--no-phases` is the global suppress switch and conflicts with
-every other phase flag; the other four compose.
+every other phase flag, and `--steps-only` and `--phase` are also
+mutually exclusive; the remaining pairings among `--phases-only` /
+`--steps-only` / `--phase` / `--phase-threshold` compose.
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--no-phases` | off | Suppress the per-phase tables entirely; render only the scalar findings table. Mutually exclusive with every other `--phase…` flag below. |
 | `--phases-only` | off | Render ONLY the per-phase tables; suppress the scalar findings table and the scalar summary footer. The host-context delta still renders. Composes with `--steps-only`, `--phase`, `--phase-threshold`. |
-| `--steps-only` | off | Inside each per-phase table, suppress the BASELINE / CANDIDATE / DELTA / % numeric columns and render only the steps column for that phase. Useful for surveying which phases fired without numerical detail. Composes with `--phase` and `--phase-threshold`. |
-| `--phase N` (repeatable) | every phase | Render only the named phase indices. Repeatable. Indices match the `phase_index` recorded in sidecars. |
+| `--steps-only` | off | Within the per-phase tables, suppress the BASELINE bucket (`step_index` 0) and render only scenario Step buckets. Useful when the BASELINE settle window is dominated by scheduler startup transients. Mutually exclusive with `--phase`; composes with `--phases-only` and `--phase-threshold`. |
+| `--phase N` | every phase | Render only the named phase index (single value, not repeatable). `0` selects BASELINE; `1..=N` select scenario Step ordinals (matched against `step_index`). Mutually exclusive with `--steps-only`. |
 | `--phase-threshold PCT` | inherits `--threshold` | Per-phase significance threshold in percent. Lets per-phase tables use a different threshold from the scalar comparison (e.g. tighter scalar gate but a looser per-phase gate for noisy boundary effects). Inherits the scalar `--threshold` (or registry `default_rel`) when unset. |
 
 ### Prerequisites
@@ -1248,7 +1253,7 @@ side A and side B using the same `HostContext::diff` logic.
 Print the resolved assertion thresholds for the named test —
 the same merged `Assert` value `run_ktstr_test_inner` evaluates
 against worker reports, produced by the runtime merge chain
-`Assert::default_checks().merge(entry.scheduler.assert()).merge(&entry.assert)`.
+`Assert::default_checks().merge(&entry.scheduler.assert).merge(&entry.assert)`.
 Surfaces every threshold field (or `none` when inherited or
 unset) so an operator can see what the test will actually
 check against without reading source or guessing which layer

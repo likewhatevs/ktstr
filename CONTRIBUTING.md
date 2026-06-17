@@ -13,7 +13,7 @@ All dev and CI commands are defined in the `justfile` — run
 Pre-PR sanity check: run `just lint && just compile-fail && just
 link-check` locally before opening a PR. These mirror the `lint`,
 `compile-fail`, and `docs-link-check` GitHub Actions jobs that run
-on every push and pull-request; the heavier `test-x64`,
+on every pull-request (and on pushes to `main`); the heavier `test-x64`,
 `test-arm64`, `coverage-x64`, and `coverage-arm64` jobs run on
 self-hosted KVM runners and don't need to be run locally.
 `just compile-fail` shells `cargo nextest run`, so install
@@ -53,8 +53,8 @@ tests that also spawn cargo invocations (or otherwise mutate
 intermediate artifacts that let a fixture compile cleanly when it
 should fail. The test-group addresses that cross-test contention;
 within the driver, trybuild's fixture loop is already serial. CI
-runs `just compile-fail` as a dedicated job on every push and
-pull-request, so a new fixture is picked up automatically.
+runs `just compile-fail` as a dedicated job on every pull-request
+(and on pushes to `main`), so a new fixture is picked up automatically.
 
 When you change a diagnostic intentionally, regenerate every
 fixture's `.stderr` snapshot with:
@@ -72,12 +72,13 @@ message they will see, so it should read cleanly.
 
 ## Doc link validation
 
-`just link-check` runs `mdbook build doc/guide` and then `lychee
---offline doc/guide/book/html` to walk every rendered HTML file and
-verify each internal link + `#fragment` resolves. The `--offline`
-flag skips external HTTP fetches so the check is deterministic and
+`just link-check` runs `mdbook build doc/guide`, then `mdbook
+test doc/guide`, then `lychee --offline doc/guide/book/html` to
+walk every rendered HTML file and verify each internal link +
+`#fragment` resolves. The `--offline` flag skips external HTTP
+fetches so the check is deterministic and
 not subject to network flakes. CI runs the same recipe via the
-`docs-link-check` job on every push and pull-request.
+`docs-link-check` job on every pull-request (and on pushes to `main`).
 
 When lychee fails on a broken link, the report cites the path of
 the rendered HTML file (`doc/guide/book/html/<page>.html`). The
@@ -86,9 +87,10 @@ broken link target in the source markdown and either correct the
 link or rename the target heading. Run `just link-check` locally
 to verify before pushing.
 
-`mdbook-linkcheck2` (a preprocessor configured in
-`doc/guide/book.toml`) catches pre-render link errors at
-`mdbook build` time. `lychee` runs against the rendered HTML and
+`mdbook-linkcheck2` (an output backend configured in
+`doc/guide/book.toml` via `[output.linkcheck2]`) catches
+pre-render link errors at `mdbook build` time. `lychee` runs
+against the rendered HTML and
 catches the post-render class — typo'd `#fragment` refs against
 heading IDs that mdbook's slug-generation pipeline produces, slug
 collisions, and other anchors that the source-level check
@@ -108,8 +110,9 @@ profile — especially the monitor loop, KVM vCPU threads, and
 anything spawned from `WorkloadHandle`. Relying on
 `catch_unwind` as a soft failure boundary is a bug; introduce
 explicit `Result` plumbing instead. The only escape hatch is
-`panic_hook` (see `src/vmm/vcpu_panic.rs`), which runs
-synchronously on the panicking thread before `libc::abort` to
+the vCPU panic-hook shim (`install_once` in
+`src/vmm/vcpu_panic.rs`), which runs synchronously on the
+panicking thread before `libc::abort` to
 flip kill/exited signalling atomics; it does not recover, only
 classifies.
 

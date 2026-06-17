@@ -79,7 +79,7 @@ fn handle_write_persists_bytes_to_backing_file() {
     assert_eq!(used, 1);
     // Verify backing file at offset 512 now contains 0xCD.
     let mut readback = [0u8; 512];
-    f_for_verify.read_at(&mut readback, 512).unwrap();
+    FileExt::read_at(&f_for_verify, &mut readback, 512).unwrap();
     assert!(readback.iter().all(|&b| b == 0xCD));
 }
 

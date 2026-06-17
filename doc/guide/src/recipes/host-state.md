@@ -69,9 +69,13 @@ Prints a `key: value` report covering:
 - `kernel_name` / `kernel_release` / `arch` (from the `uname()`
   syscall).
 - `/proc/cmdline` verbatim.
-- `heap_state` — nested jemalloc allocator state when the binary
-  was built with the `jemalloc-probe` instrumentation; renders
-  `(unknown)` otherwise.
+- `heap_state` — nested jemalloc allocator state, populated whenever
+  jemalloc is installed as the process's `#[global_allocator]`. Every
+  `cli-bins` binary (`ktstr`, `cargo-ktstr`) installs
+  `tikv_jemallocator::Jemalloc`, so `cargo ktstr show-host` always
+  populates it. It collapses to `None` only for downstream library
+  consumers that link jemalloc but do not install it as the global
+  allocator (allocated and active bytes both zero).
 
 Absent fields render as `(unknown)` — an empty `sched_*` map
 renders as `(empty)` and a missing map renders as `(unknown)`.
@@ -126,7 +130,7 @@ five host-section shapes depending on what survived capture:
 host delta ('A' → 'B'):
   kernel_release: 6.14.2 → 6.15.0
   thp_enabled: always [madvise] never → always madvise [never]
-  sched_tunables.sched_migration_cost_ns: 500000 → 100000
+  sched_tunables.sched_rt_runtime_us: 950000 → 980000
 ```
 
 Fields that match in both runs are suppressed by design — this
@@ -169,26 +173,20 @@ the same key out of a sidecar via `jq '.host.<field>'`.
   you pin THP via `transparent_hugepage=` on the kernel cmdline.
   The bracketed selection inside the value is the active setting;
   compare the bracket position, not just the full string.
-- `sched_tunables.sched_migration_cost_ns` differs (look for it
-  inside the `sched_*` block printed by `show-host`) → fair
-  scheduler migrated the run onto different CPUs, which changes
-  the idle-steal pressure on `scx_*` schedulers that depend on
-  it. Other `sched_tunables.*` keys
-  (`sched_wakeup_granularity_ns`, `sched_min_granularity_ns`,
-  `sched_latency_ns`, `sched_rt_runtime_us`, etc.) have the same
-  shape — the full set is whatever `/proc/sys/kernel/sched_*`
-  lists at capture time. Note: the examples above are CFS-era
-  tunables; several of them (`sched_wakeup_granularity_ns`,
-  `sched_min_granularity_ns`, `sched_latency_ns`) were dropped
-  when CFS was replaced by EEVDF in Linux 6.6+, so a run on an
-  EEVDF kernel will simply not have those keys in the map —
-  their absence is a kernel-version fact, not a capture failure.
-  EEVDF's own latency-floor knob is exposed as
-  `sched_tunables.sched_base_slice_ns` on 6.6+ kernels (the
-  replacement for the dropped CFS latency / granularity triple);
-  check for its presence to confirm an EEVDF-era capture.
-  What you get in practice is whatever `/proc/sys/kernel/sched_*`
-  exposes on the running kernel.
+- A `sched_tunables.*` key differs → the kernel's scheduler tunables
+  changed between runs, which can shift the idle-steal pressure on
+  `scx_*` schedulers that depend on them. `sched_tunables` captures
+  only the surviving `/proc/sys/kernel/sched_*` sysctls (e.g.
+  `sched_rt_period_us`, `sched_rt_runtime_us`, `sched_rr_timeslice_ms`,
+  `sched_cfs_bandwidth_slice_us`, `sched_schedstats`,
+  `sched_util_clamp_*`) — the full set is whatever
+  `/proc/sys/kernel/sched_*` lists at capture time. Note: the
+  CFS/EEVDF granularity, latency, migration-cost, and base-slice knobs
+  (`min_granularity_ns`, `latency_ns`, `wakeup_granularity_ns`,
+  `migration_cost_ns`, `base_slice_ns`) live in debugfs
+  (`/sys/kernel/debug/sched/`), not `/proc/sys/kernel`, and were moved
+  there in Linux 5.13 (well before EEVDF) — `show-host` reads only
+  `/proc/sys/kernel`, so it never captures them on any kernel.
 - `kernel_cmdline` diverges → `isolcpus=` / `nohz_full=` /
   `mitigations=` / `transparent_hugepage=` / `numa_balancing=`
   are all boot-time and change the whole scheduling surface.

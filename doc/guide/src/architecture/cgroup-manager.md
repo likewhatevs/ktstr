@@ -8,6 +8,7 @@ use ktstr::prelude::*;
 
 pub struct CgroupManager {
     parent: PathBuf,
+    walk_root: PathBuf,
     outstanding_removes: AtomicUsize,
 }
 ```
@@ -24,6 +25,7 @@ exposes the count for diagnostics.
 
 ```rust,ignore
 use std::collections::BTreeSet;
+use ktstr::cgroup::Controller;
 
 let cgroups = CgroupManager::new("/sys/fs/cgroup/ktstr");
 let mut controllers = BTreeSet::new();
@@ -46,9 +48,24 @@ directory and returns without touching `subtree_control`. The
 deterministic `BTreeSet` iteration order keeps the rendered
 subtree_control write stable between runs.
 
+## Walk root
+
+`walk_root` defaults to `/sys/fs/cgroup` (Mode A, a root-owned tree).
+`with_walk_root(root)` retargets it for cgroup-v2 user delegation
+(systemd `Delegate=yes` / container `nsdelegate`, Mode B/C): it bounds
+both the `setup` `cgroup.subtree_control` ancestor walk and the drain
+destination to the delegated subtree, and the constructor validates
+that `parent` is at or below `walk_root` and rejects `..` components.
+
 ## Methods
 
 **`parent_path() -> &Path`** -- returns the parent cgroup directory path.
+
+**`walk_root() -> &Path`** -- returns the walk-root directory (default
+`/sys/fs/cgroup`; the delegation boundary when set via `with_walk_root`).
+
+**`with_walk_root(root) -> Result<Self>`** -- retargets the walk root for
+cgroup-v2 user delegation; validates the parent is at or below `root`.
 
 **`create_cgroup(name)`** -- creates a child cgroup directory.
 Idempotent: no error if the directory already exists. Supports nested
@@ -63,11 +80,12 @@ for the operator-facing diagnostic shape.
 
 **`remove_cgroup(name)`** -- auto-unfreezes any frozen tasks (a
 frozen task cannot be reparented), drains tasks from the child
-cgroup to the cgroup filesystem root, then waits for
+cgroup to the walk-root cgroup (default `/sys/fs/cgroup`; the
+delegated subtree root under cgroup-v2 delegation), then waits for
 `cgroup.events` to report `populated 0` via inotify (1s deadline)
 before removing the directory. No error if the cgroup does not
-exist. Returns `Err` once the outstanding-remove cap (10) is
-reached.
+exist. Returns `Err` once the outstanding-remove count exceeds the
+cap (10).
 
 **`set_cpuset(name, cpus)`** -- writes `cpuset.cpus` for a child cgroup.
 The `BTreeSet<usize>` is formatted as a compact range string via
@@ -91,7 +109,8 @@ load-bearing. Propagates EBUSY after retries exhausted.
 
 In addition to the public methods above, `CgroupManager` exposes a
 broader knob surface for each controller: `set_cpuset_mems` /
-`clear_cpuset_mems` (memory.mems analogue of set_cpuset), `set_cpu_max`
+`clear_cpuset_mems` (`cpuset.mems` — the NUMA-node analogue of
+set_cpuset), `set_cpu_max`
 / `set_cpu_weight` (cpu controller), `set_memory_max` / `set_memory_high`
 / `set_memory_low` / `set_memory_swap_max` (memory + memory.swap),
 `set_io_weight` (io controller), `set_freeze` (cgroup.freeze), and
@@ -103,8 +122,9 @@ names, leading slash, NUL bytes, `..`/`.` components, and
 leading-dot components at all entry points.
 
 **`drain_tasks(name)`** -- moves all tasks from a child cgroup to the
-cgroup filesystem root (`/sys/fs/cgroup`) by reading `cgroup.procs`
-and writing each PID to the root's `cgroup.procs`. Drains to root
+walk-root cgroup (default `/sys/fs/cgroup`; the delegated subtree root
+under cgroup-v2 delegation) by reading `cgroup.procs` and writing each
+PID to the walk-root's `cgroup.procs`. Drains to the walk root
 because the parent has `subtree_control` set and the kernel's
 no-internal-process constraint rejects writes to a cgroup with
 active controllers.

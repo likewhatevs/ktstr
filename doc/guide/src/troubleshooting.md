@@ -84,20 +84,25 @@ installed kernel) for a `vmlinux` file, falling back to
 ### busybox download failure
 
 ```text
-failed to obtain busybox source.
-  tarball (https://github.com/mirror/busybox/archive/refs/tags/1_36_1.tar.gz): download: ...
-  git clone (https://github.com/mirror/busybox.git): ...
-  Check network connectivity. First build requires internet access.
+failed to obtain busybox source after 4 attempts.
+  tarball (https://github.com/mirror/busybox/archive/refs/tags/1_36_1.tar.gz): ...
+  Remediation:
+    • Check network connectivity (the build script needs HTTPS access to github.com to fetch the upstream tarball).
+    • If behind a proxy, ensure HTTP_PROXY/HTTPS_PROXY environment variables are set.
+    • Or set KTSTR_BUSYBOX_TARBALL=<path> to point at a pre-fetched local copy.
+    • Or set KTSTR_SKIP_BUSYBOX_BUILD=1 to skip the busybox compile entirely (shell mode will be unavailable).
 ```
 
-build.rs downloads busybox source on first build (tarball first,
-git clone fallback). Subsequent builds use the cached binary in
-`$OUT_DIR`.
+build.rs downloads the busybox tarball on first build (4 attempts with
+backoff). Subsequent builds use the cached binary in `$OUT_DIR`.
 
 **Fixes:**
 
 - Verify network connectivity to github.com.
 - If behind a proxy, set `HTTP_PROXY` / `HTTPS_PROXY`.
+- Set `KTSTR_BUSYBOX_TARBALL=<path>` to point at a pre-fetched local copy.
+- Set `KTSTR_SKIP_BUSYBOX_BUILD=1` to skip the busybox compile entirely
+  (shell mode will be unavailable).
 - After a successful first build, no network access is needed
   unless `cargo clean` removes the cached binary.
 
@@ -145,7 +150,7 @@ KVM enabled and the user must have read+write access to `/dev/kvm`.
 ```text
 no kernel found — the test harness was likely invoked outside `cargo ktstr test` (which builds and injects a kernel automatically).
   hint: run `cargo ktstr test --kernel <path-or-version>` to drive this test, or set KTSTR_TEST_KERNEL=/path/to/{bzImage|Image} to point at a pre-built bootable image directly.
-  hint: set KTSTR_KERNEL to a kernel source directory, a version (e.g. `6.14.2`), or a cache key (see `cargo ktstr kernel list`), or run `cargo ktstr kernel build` to populate the cache
+  hint: set KTSTR_KERNEL to one of: exact version (`6.14`), inclusive range (`6.14..7.0` or `6.14..=7.0`), git source (`git+URL#REF`), absolute or `~`-prefixed path, or cache key. List cached keys with `cargo ktstr kernel list`; build new ones with `cargo ktstr kernel build`
 ```
 
 On aarch64 the first hint's image filename is `Image` instead of
@@ -249,7 +254,7 @@ complete failure output format and auto-repro walkthrough.
 ## send_sys_rdy timeout
 
 ```text
-WARN ktstr::vmm::rust_init: ktstr-init: send_sys_rdy failed within boot budget; see https://likewhatevs.github.io/ktstr/guide/troubleshooting.html#send_sys_rdy-timeout budget_ms=10000 vcpus=8 elapsed_ms=10142 port_exists=false kern_addrs_sent=false
+WARN ktstr::vmm::rust_init: ktstr-init: send_sys_rdy failed within boot budget; see https://likewhatevs.github.io/ktstr/guide/troubleshooting.html#send_sys_rdy-timeout budget_ms=11200 vcpus=8 elapsed_ms=11342 port_exists=false kern_addrs_sent=false
 ```
 
 The guest-side `ktstr-init` sends a `MSG_TYPE_SYS_RDY` TLV frame
@@ -295,19 +300,19 @@ output.
 
 ### Budget
 
-The budget scales with vCPU count between a 10 s floor and a 30 s
-cap — 150 ms per vCPU once `vcpus >= 67`, capped at 30 s once
-`vcpus >= 200`. Worked examples:
+The budget is a fixed 10 s base plus 150 ms per vCPU, capped at 30 s
+— `10000 + vcpus*150`, clamped to 30000. The 30 s cap is first hit at
+134 vCPUs. Worked examples:
 
 | vCPUs   | budget_ms |
 |---------|-----------|
-| 1       | 10000 (floor) |
-| 8       | 10000 (floor) |
-| 67      | 10050 |
-| 126     | 18900 |
-| 200+    | 30000 (cap) |
+| 1       | 10150 |
+| 8       | 11200 |
+| 67      | 20050 |
+| 126     | 28900 |
+| 134+    | 30000 (cap) |
 
-On lightly-loaded hosts the floor covers the boot path
+On lightly-loaded hosts the 10 s base covers the boot path
 comfortably.
 
 ### Fixes
@@ -830,9 +835,10 @@ linked llama.cpp version.
   sidecar; `fetch` re-downloads from the pinned URL and SHA-checks
   the result.
 - If `model status` reports `Mismatches`, the local file's hash
-  diverged from the pinned digest — `cargo ktstr model fetch` will
-  refuse to overwrite a corrupt cache and the explicit `clean` is
-  required first.
+  diverged from the pinned digest — re-run `cargo ktstr model fetch`,
+  which atomically re-downloads into a tempfile and renames it over
+  the corrupt cache entry (an explicit `clean` is only required under
+  `KTSTR_MODEL_OFFLINE`, which refuses the network re-fetch).
 - If you set `KTSTR_MODEL_OFFLINE=1`, unset it for the re-fetch.
   See [`cargo ktstr model`](running-tests/cargo-ktstr.md#model).
 

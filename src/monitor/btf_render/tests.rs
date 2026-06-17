@@ -1007,6 +1007,25 @@ fn try_render_cpumask_bits_single_word_high_bit() {
 }
 
 #[test]
+fn try_render_cpumask_bits_fully_online_above_128_cpus() {
+    // Four all-ones u64 words = CPUs 0-255 fully online. The old
+    // `word > 0xFFFF_FFFF && set_cpus.len() > 64` gate bailed at word 2,
+    // silently dropping CPUs 128-255; the all-ones-exempting gate (mirror
+    // of the kptr path) must render the full set.
+    let bytes = [0xFFu8; 32];
+    let v = try_render_cpumask_bits(&bytes, 256);
+    match v {
+        Some(RenderedValue::CpuList { cpus }) => {
+            assert_eq!(
+                cpus, "0-255",
+                "fully-online 256-CPU mask must render all CPUs, got {cpus}"
+            );
+        }
+        other => panic!("expected CpuList 0-255, got {other:?}"),
+    }
+}
+
+#[test]
 fn try_render_cpumask_bits_caps_at_nr_cpu_ids() {
     // 8 CPUs: bits 0..=7 are real, bits 8..=63 are slab padding
     // / freelist garbage. With max_cpus=8, only bits 0..=7
@@ -1106,6 +1125,37 @@ fn try_render_cpumask_bits_garbage_capped_at_max_cpus() {
             );
         }
         other => panic!("expected CpuList 0-3, got {other:?}"),
+    }
+}
+
+/// A multi-word inline cpumask whose trailing word carries the
+/// canonical kernel-pointer top byte (`0xff..`) but is NOT all-ones
+/// must trigger the per-word plausibility break (mod.rs:1592,
+/// `word != u64::MAX && word >> 56 == 0xff`) — that word is slab /
+/// pointer garbage, not online CPUs. word0 = 0b11 (cpus 0,1); word1 =
+/// 0xff00_0000_0000_0000 (top byte 0xff; bits 120-127 if trusted).
+/// max_cpus = 256 is well past word1, so the cap is NOT what stops the
+/// walk (that path is pinned by
+/// `try_render_cpumask_bits_garbage_capped_at_max_cpus`) — only the
+/// 0xff break can drop word1, so the result is "0-1", never
+/// "0-1,120-127". The all-ones EXEMPTION side (a fully-online >128-CPU
+/// host) is pinned by `try_render_cpumask_bits_fully_online_above_128_cpus`.
+#[test]
+fn try_render_cpumask_bits_kptr_pattern_word_breaks_walk() {
+    let mut bytes = [0u8; 16];
+    bytes[0..8].copy_from_slice(&0b11u64.to_le_bytes());
+    // Top byte 0xff, rest zero: a kernel-pointer-class word, distinct
+    // from all-ones (a legitimately fully-online 64-CPU chunk).
+    let w1: u64 = 0xff00_0000_0000_0000;
+    bytes[8..16].copy_from_slice(&w1.to_le_bytes());
+    let v = try_render_cpumask_bits(&bytes, 256);
+    match v {
+        Some(RenderedValue::CpuList { cpus }) => assert_eq!(
+            cpus, "0-1",
+            "0xff-top-byte word must break the walk; only cpus 0,1 from \
+             word0 may surface (the cap is well past word1), got: {cpus}",
+        ),
+        other => panic!("expected CpuList 0-1, got {other:?}"),
     }
 }
 
@@ -2641,13 +2691,23 @@ const CAST_BTF_KIND_TYPEDEF: u32 = 8;
 /// `BTF_KIND_CONST` per `btf-rs::obj::resolve` — kind 10 maps to
 /// `Type::Const`. Used by the modifier-chain integration test.
 const CAST_BTF_KIND_CONST: u32 = 10;
+/// `BTF_KIND_TYPE_TAG` per `btf-rs::obj::resolve` — kind 18 maps to
+/// `Type::TypeTag`. Models a `__kptr` tag wrapping a pointer, the
+/// realistic shape of a `struct bpf_cpumask __kptr *` member/global.
+const CAST_BTF_KIND_TYPE_TAG: u32 = 18;
+/// `BTF_KIND_ENUM` per `btf-rs` — kind 6 maps to `Type::Enum`. Used
+/// by the bitfield tests with a signed-enum base.
+const CAST_BTF_KIND_ENUM: u32 = 6;
+/// `BTF_KIND_ENUM64` per `btf-rs` — kind 19 maps to `Type::Enum64`.
+/// Used by the bitfield tests with a signed-enum64 base.
+const CAST_BTF_KIND_ENUM64: u32 = 19;
 
 /// Build a minimal BTF blob containing `types` (id=1..) and a
 /// string-section payload `strings` (must start with `\0`). The
 /// header layout matches `cast_analysis::tests::build_btf`:
-/// 24-byte header, type section, string section. Only the kinds
-/// the renderer's cast intercept exercises (Int, Struct) are
-/// supported here.
+/// 24-byte header, type section, string section. Supports the BTF
+/// kinds the renderer tests exercise: Int, Struct, BitfieldStruct,
+/// Enum, Enum64, Typedef, Const, TypeTag, Ptr, Fwd.
 fn cast_build_btf(types: &[CastSynType], strings: &[u8]) -> Vec<u8> {
     let mut type_section = Vec::new();
     for ty in types {
@@ -2704,6 +2764,16 @@ fn cast_build_btf(types: &[CastSynType], strings: &[u8]) -> Vec<u8> {
                 type_section.extend_from_slice(&info.to_le_bytes());
                 type_section.extend_from_slice(&type_id.to_le_bytes());
             }
+            CastSynType::TypeTag { name_off, type_id } => {
+                // BTF_KIND_TYPE_TAG wire layout: name_off (4) + info (4)
+                // + type (4, the tagged type id). Same shape as
+                // Typedef; the kind byte selects TypeTag. Models a
+                // `__kptr` tag wrapping a pointer.
+                type_section.extend_from_slice(&name_off.to_le_bytes());
+                let info = (CAST_BTF_KIND_TYPE_TAG << 24) & 0x1f00_0000;
+                type_section.extend_from_slice(&info.to_le_bytes());
+                type_section.extend_from_slice(&type_id.to_le_bytes());
+            }
             CastSynType::Ptr { type_id } => {
                 // BTF_KIND_PTR wire layout: name_off (4, always 0) +
                 // info (4) + size_type (4, the pointee type id). Ptr
@@ -2725,6 +2795,72 @@ fn cast_build_btf(types: &[CastSynType], strings: &[u8]) -> Vec<u8> {
                 let info = ((CAST_BTF_KIND_FWD << 24) & 0x1f00_0000) | kind_flag;
                 type_section.extend_from_slice(&info.to_le_bytes());
                 type_section.extend_from_slice(&0u32.to_le_bytes());
+            }
+            CastSynType::BitfieldStruct {
+                name_off,
+                size,
+                members,
+            } => {
+                // A BTF_KIND_STRUCT emitted with kind_flag == 1 (info
+                // bit 31): btf-rs then decodes each member offset word
+                // as bitfield_size<<24 | (bit_offset & 0xffffff) and
+                // Member::bitfield_size returns Some.
+                type_section.extend_from_slice(&name_off.to_le_bytes());
+                let vlen = members.len() as u32;
+                let info =
+                    ((CAST_BTF_KIND_STRUCT << 24) & 0x1f00_0000) | (vlen & 0xffff) | (1u32 << 31);
+                type_section.extend_from_slice(&info.to_le_bytes());
+                type_section.extend_from_slice(&size.to_le_bytes());
+                for m in members {
+                    type_section.extend_from_slice(&m.name_off.to_le_bytes());
+                    type_section.extend_from_slice(&m.type_id.to_le_bytes());
+                    let off_word = (m.bitfield_size << 24) | (m.bit_offset & 0x00ff_ffff);
+                    type_section.extend_from_slice(&off_word.to_le_bytes());
+                }
+            }
+            CastSynType::Enum {
+                name_off,
+                size,
+                signed,
+                members,
+            } => {
+                // BTF_KIND_ENUM: name_off + info + size_type, then vlen *
+                // btf_enum{ name_off(4), val(4) }. `signed` sets info
+                // bit 31, which btf-rs Enum::is_signed reads.
+                type_section.extend_from_slice(&name_off.to_le_bytes());
+                let vlen = members.len() as u32;
+                let kf = if *signed { 1u32 << 31 } else { 0 };
+                let info = ((CAST_BTF_KIND_ENUM << 24) & 0x1f00_0000) | (vlen & 0xffff) | kf;
+                type_section.extend_from_slice(&info.to_le_bytes());
+                type_section.extend_from_slice(&size.to_le_bytes());
+                for (m_name_off, val) in members {
+                    type_section.extend_from_slice(&m_name_off.to_le_bytes());
+                    type_section.extend_from_slice(&val.to_le_bytes());
+                }
+            }
+            CastSynType::Enum64 {
+                name_off,
+                size,
+                signed,
+                members,
+            } => {
+                // BTF_KIND_ENUM64: name_off + info + size_type, then
+                // vlen * btf_enum64{ name_off(4), val_lo32(4),
+                // val_hi32(4) }. `signed` sets info bit 31
+                // (Enum64::is_signed); val() reconstructs (hi<<32)|lo.
+                type_section.extend_from_slice(&name_off.to_le_bytes());
+                let vlen = members.len() as u32;
+                let kf = if *signed { 1u32 << 31 } else { 0 };
+                let info = ((CAST_BTF_KIND_ENUM64 << 24) & 0x1f00_0000) | (vlen & 0xffff) | kf;
+                type_section.extend_from_slice(&info.to_le_bytes());
+                type_section.extend_from_slice(&size.to_le_bytes());
+                for (m_name_off, val) in members {
+                    type_section.extend_from_slice(&m_name_off.to_le_bytes());
+                    let lo = (*val & 0xffff_ffff) as u32;
+                    let hi = (*val >> 32) as u32;
+                    type_section.extend_from_slice(&lo.to_le_bytes());
+                    type_section.extend_from_slice(&hi.to_le_bytes());
+                }
             }
         }
     }
@@ -2756,6 +2892,20 @@ struct CastSynMember {
     byte_offset: u32,
 }
 
+/// A bitfield member for [`CastSynType::BitfieldStruct`]. The parent
+/// struct is emitted with `kind_flag == 1`, so `btf-rs`
+/// `Member::bitfield_size` returns `Some(bitfield_size)` and
+/// `Member::bit_offset` returns `bit_offset` (the low 24 bits of the
+/// packed offset word). `bit_offset` is a RAW bit offset (not bytes);
+/// `bitfield_size` is the field width in bits.
+#[derive(Clone, Copy)]
+struct CastSynBitMember {
+    name_off: u32,
+    type_id: u32,
+    bit_offset: u32,
+    bitfield_size: u32,
+}
+
 enum CastSynType {
     /// `BTF_KIND_INT`. encoding=0 = plain unsigned (not signed,
     /// not char, not bool — the gate the cast intercept requires).
@@ -2784,6 +2934,10 @@ enum CastSynType {
     /// anonymous), but the field is still emitted for wire-format
     /// completeness.
     Const { type_id: u32 },
+    /// `BTF_KIND_TYPE_TAG` (kind=18). Named tag wrapping `type_id`.
+    /// Models `__kptr` on a pointer (`struct bpf_cpumask __kptr *`);
+    /// `peel_modifiers_with_id` peels it to reach the wrapped Ptr.
+    TypeTag { name_off: u32, type_id: u32 },
     /// `BTF_KIND_PTR` (kind=2). Anonymous pointer-to-`type_id`. Used
     /// to model a Type::Ptr field whose pointee is a forward-
     /// declared aggregate (the scenario the Fwd chase test exercises).
@@ -2796,6 +2950,449 @@ enum CastSynType {
     /// program only references it via pointer; the program's BTF
     /// then carries `Fwd` rather than the full `Struct`.
     Fwd { name_off: u32, is_union: bool },
+    /// A `BTF_KIND_STRUCT` emitted with `kind_flag == 1` so its members
+    /// are bitfields: `btf-rs` decodes each member offset word as
+    /// `bitfield_size << 24 | bit_offset` and `Member::bitfield_size`
+    /// returns `Some`. The plain [`Struct`](Self::Struct) variant keeps
+    /// `kind_flag == 0` (byte-aligned members); this variant isolates
+    /// the bitfield encoding so non-bitfield tests stay noise-free.
+    BitfieldStruct {
+        name_off: u32,
+        size: u32,
+        members: Vec<CastSynBitMember>,
+    },
+    /// `BTF_KIND_ENUM` (kind=6). 32-bit-valued enum. `signed` sets the
+    /// info-word `kind_flag` (bit 31), which `btf-rs` `Enum::is_signed`
+    /// reads. Each `(name_off, val)` is a `btf_enum` record.
+    Enum {
+        name_off: u32,
+        size: u32,
+        signed: bool,
+        members: Vec<(u32, u32)>,
+    },
+    /// `BTF_KIND_ENUM64` (kind=19). 64-bit-valued enum. `signed` sets
+    /// the info-word `kind_flag` (bit 31), read by `Enum64::is_signed`.
+    /// Each `(name_off, val)` is a `btf_enum64` record (val split into
+    /// lo/hi 32-bit halves on the wire).
+    Enum64 {
+        name_off: u32,
+        size: u32,
+        signed: bool,
+        members: Vec<(u32, u64)>,
+    },
+}
+
+// -- render_bitfield coverage --
+//
+// render_bitfield (mod.rs ~4490) decodes a struct bitfield member. It
+// is reached from render_member only when the owning struct has
+// kind_flag == 1 and the member width > 0, which the synthetic builder
+// expresses via CastSynType::BitfieldStruct + CastSynBitMember. The
+// width == 0 branch is unreachable through render_value (render_member
+// filters width == 0), so it is exercised by a direct render_bitfield
+// call.
+
+/// Pull the sole member's value out of a rendered single-member
+/// struct, transparently peeling the `Truncated` wrapper that
+/// `render_struct` adds when `bytes.len() < struct size`.
+fn sole_member_value(v: &RenderedValue) -> &RenderedValue {
+    match v {
+        RenderedValue::Struct { members, .. } => {
+            assert_eq!(members.len(), 1, "expected exactly one member");
+            &members[0].value
+        }
+        RenderedValue::Truncated { partial, .. } => sole_member_value(partial),
+        other => panic!("expected Struct/Truncated, got {other:?}"),
+    }
+}
+
+#[test]
+fn render_bitfield_unsigned_multibit_at_nonzero_offset_decodes_exact() {
+    // struct B { u64 f : 12; } with the field placed at bit offset 4.
+    // 8 bytes little-endian = 0x0000_0000_0000_ABC0 -> (val>>4)&0xFFF = 0xABC.
+    let mut strings: Vec<u8> = vec![0];
+    let push = |s: &mut Vec<u8>, name: &str| -> u32 {
+        let off = s.len() as u32;
+        s.extend_from_slice(name.as_bytes());
+        s.push(0);
+        off
+    };
+    let n_u64 = push(&mut strings, "u64");
+    let n_b = push(&mut strings, "B");
+    let n_f = push(&mut strings, "f");
+    let types = vec![
+        CastSynType::Int {
+            name_off: n_u64,
+            size: 8,
+            encoding: 0,
+            offset: 0,
+            bits: 64,
+        },
+        CastSynType::BitfieldStruct {
+            name_off: n_b,
+            size: 8,
+            members: vec![CastSynBitMember {
+                name_off: n_f,
+                type_id: 1,
+                bit_offset: 4,
+                bitfield_size: 12,
+            }],
+        },
+    ];
+    let blob = cast_build_btf(&types, &strings);
+    let btf = Btf::from_bytes(&blob).expect("synthetic BTF parses");
+    let bytes = 0xABC0u64.to_le_bytes();
+    let v = render_value(&btf, 2, &bytes);
+    assert_eq!(
+        sole_member_value(&v),
+        &RenderedValue::Uint {
+            bits: 12,
+            value: 0xABC,
+        }
+    );
+}
+
+#[test]
+fn render_bitfield_signed_int_base_decodes_negative() {
+    // struct B { int f : 4; } at bit offset 0; byte 0x0F -> raw 0xF ->
+    // sign_extend(0xF, 4) = -1.
+    let mut strings: Vec<u8> = vec![0];
+    let push = |s: &mut Vec<u8>, name: &str| -> u32 {
+        let off = s.len() as u32;
+        s.extend_from_slice(name.as_bytes());
+        s.push(0);
+        off
+    };
+    let n_int = push(&mut strings, "int");
+    let n_b = push(&mut strings, "B");
+    let n_f = push(&mut strings, "f");
+    let types = vec![
+        // encoding=1 sets BTF_INT_SIGNED.
+        CastSynType::Int {
+            name_off: n_int,
+            size: 4,
+            encoding: 1,
+            offset: 0,
+            bits: 32,
+        },
+        CastSynType::BitfieldStruct {
+            name_off: n_b,
+            size: 4,
+            members: vec![CastSynBitMember {
+                name_off: n_f,
+                type_id: 1,
+                bit_offset: 0,
+                bitfield_size: 4,
+            }],
+        },
+    ];
+    let blob = cast_build_btf(&types, &strings);
+    let btf = Btf::from_bytes(&blob).expect("synthetic BTF parses");
+    let v = render_value(&btf, 2, &[0x0F, 0x00, 0x00, 0x00]);
+    assert_eq!(
+        sole_member_value(&v),
+        &RenderedValue::Int { bits: 4, value: -1 }
+    );
+}
+
+#[test]
+fn render_bitfield_signed_enum_base_decodes_negative_int() {
+    // struct B { enum E f : 8; } where E is signed (a negative variant).
+    // render_bitfield routes signed enum bases through the Int arm, so
+    // the result is Int{-1}, NOT Enum.
+    let mut strings: Vec<u8> = vec![0];
+    let push = |s: &mut Vec<u8>, name: &str| -> u32 {
+        let off = s.len() as u32;
+        s.extend_from_slice(name.as_bytes());
+        s.push(0);
+        off
+    };
+    let n_e = push(&mut strings, "E");
+    let n_neg = push(&mut strings, "NEG");
+    let n_b = push(&mut strings, "B");
+    let n_f = push(&mut strings, "f");
+    let types = vec![
+        // id 1: signed enum E { NEG = -1 } size 4.
+        CastSynType::Enum {
+            name_off: n_e,
+            size: 4,
+            signed: true,
+            members: vec![(n_neg, 0xFFFF_FFFFu32)],
+        },
+        CastSynType::BitfieldStruct {
+            name_off: n_b,
+            size: 4,
+            members: vec![CastSynBitMember {
+                name_off: n_f,
+                type_id: 1,
+                bit_offset: 0,
+                bitfield_size: 8,
+            }],
+        },
+    ];
+    let blob = cast_build_btf(&types, &strings);
+    let btf = Btf::from_bytes(&blob).expect("synthetic BTF parses");
+    let v = render_value(&btf, 2, &[0xFF, 0x00, 0x00, 0x00]);
+    assert_eq!(
+        sole_member_value(&v),
+        &RenderedValue::Int { bits: 8, value: -1 }
+    );
+}
+
+#[test]
+fn render_sub_byte_signed_enum_resolves_negative_variant_name() {
+    // A 1-byte signed enum E { NEG = -1 } rendered directly. `raw` reads
+    // 1 byte (0xFF); the member's stored value is the full 0xFFFF_FFFF.
+    // Width-truncating the member value to the enum's byte width before
+    // compare resolves the variant name — without it the name was
+    // silently dropped (the value rendered correctly as -1, but the
+    // human-readable "NEG" was lost on sub-4-byte signed enums).
+    let mut strings: Vec<u8> = vec![0];
+    let push = |s: &mut Vec<u8>, name: &str| -> u32 {
+        let off = s.len() as u32;
+        s.extend_from_slice(name.as_bytes());
+        s.push(0);
+        off
+    };
+    let n_e = push(&mut strings, "E");
+    let n_neg = push(&mut strings, "NEG");
+    let types = vec![CastSynType::Enum {
+        name_off: n_e,
+        size: 1,
+        signed: true,
+        members: vec![(n_neg, 0xFFFF_FFFFu32)],
+    }];
+    let blob = cast_build_btf(&types, &strings);
+    let btf = Btf::from_bytes(&blob).expect("synthetic BTF parses");
+    let v = render_value(&btf, 1, &[0xFF]);
+    assert_eq!(v, enum_v(8, -1, Some("NEG"), true));
+}
+
+#[test]
+fn render_sub_byte_signed_enum64_resolves_negative_variant_name() {
+    // BTF_KIND_ENUM64 mirror of the Enum32 sub-byte case: a 4-byte
+    // signed enum64 E { NEG = -1 } whose member is stored as the full
+    // u64 (u64::MAX for -1). `raw` reads `needed`=4 bytes (0xFFFF_FFFF);
+    // the Enum64 width-mask (mod.rs val_mask, needed*8=32 < 64 →
+    // (1<<32)-1) truncates the member before compare so "NEG" resolves.
+    // Without the mask the member u64::MAX != raw 0xFFFF_FFFF and the
+    // variant name was silently dropped on sub-8-byte signed enum64s.
+    let mut strings: Vec<u8> = vec![0];
+    let push = |s: &mut Vec<u8>, name: &str| -> u32 {
+        let off = s.len() as u32;
+        s.extend_from_slice(name.as_bytes());
+        s.push(0);
+        off
+    };
+    let n_e = push(&mut strings, "E64");
+    let n_neg = push(&mut strings, "NEG");
+    let types = vec![CastSynType::Enum64 {
+        name_off: n_e,
+        size: 4,
+        signed: true,
+        members: vec![(n_neg, u64::MAX)],
+    }];
+    let blob = cast_build_btf(&types, &strings);
+    let btf = Btf::from_bytes(&blob).expect("synthetic BTF parses");
+    let v = render_value(&btf, 1, &[0xFF, 0xFF, 0xFF, 0xFF]);
+    assert_eq!(v, enum_v(32, -1, Some("NEG"), true));
+}
+
+#[test]
+fn render_full_width_signed_enum64_resolves_negative_variant_name() {
+    // size=8 enum64: `needed`=8 → needed*8 == 64 ≥ 64, so val_mask is
+    // u64::MAX — the branch that avoids `1u64 << 64` UB. member u64::MAX,
+    // raw 8×0xFF (u64::MAX) → value -1, (member & u64::MAX) == raw →
+    // "NEG" resolves. Pins the needed=8 boundary distinct from the
+    // sub-byte path; the only other size=8 enum64 test goes through the
+    // bitfield path and asserts the Int value, never the variant name.
+    let mut strings: Vec<u8> = vec![0];
+    let push = |s: &mut Vec<u8>, name: &str| -> u32 {
+        let off = s.len() as u32;
+        s.extend_from_slice(name.as_bytes());
+        s.push(0);
+        off
+    };
+    let n_e = push(&mut strings, "E64");
+    let n_neg = push(&mut strings, "NEG");
+    let types = vec![CastSynType::Enum64 {
+        name_off: n_e,
+        size: 8,
+        signed: true,
+        members: vec![(n_neg, u64::MAX)],
+    }];
+    let blob = cast_build_btf(&types, &strings);
+    let btf = Btf::from_bytes(&blob).expect("synthetic BTF parses");
+    let v = render_value(&btf, 1, &[0xFF; 8]);
+    assert_eq!(v, enum_v(64, -1, Some("NEG"), true));
+}
+
+#[test]
+fn render_bitfield_signed_enum64_base_decodes_negative_int() {
+    // Same as the Enum case but with a BTF_KIND_ENUM64 (kind 19) base.
+    let mut strings: Vec<u8> = vec![0];
+    let push = |s: &mut Vec<u8>, name: &str| -> u32 {
+        let off = s.len() as u32;
+        s.extend_from_slice(name.as_bytes());
+        s.push(0);
+        off
+    };
+    let n_e = push(&mut strings, "E64");
+    let n_neg = push(&mut strings, "NEG");
+    let n_b = push(&mut strings, "B");
+    let n_f = push(&mut strings, "f");
+    let types = vec![
+        CastSynType::Enum64 {
+            name_off: n_e,
+            size: 8,
+            signed: true,
+            members: vec![(n_neg, u64::MAX)],
+        },
+        CastSynType::BitfieldStruct {
+            name_off: n_b,
+            size: 8,
+            members: vec![CastSynBitMember {
+                name_off: n_f,
+                type_id: 1,
+                bit_offset: 0,
+                bitfield_size: 8,
+            }],
+        },
+    ];
+    let blob = cast_build_btf(&types, &strings);
+    let btf = Btf::from_bytes(&blob).expect("synthetic BTF parses");
+    let v = render_value(&btf, 2, &[0xFF, 0, 0, 0, 0, 0, 0, 0]);
+    assert_eq!(
+        sole_member_value(&v),
+        &RenderedValue::Int { bits: 8, value: -1 }
+    );
+}
+
+#[test]
+fn render_bitfield_width_over_64_is_unsupported() {
+    // width=65 reaches render_bitfield (render_member passes any width>0)
+    // and is rejected by the width>64 guard.
+    let mut strings: Vec<u8> = vec![0];
+    let push = |s: &mut Vec<u8>, name: &str| -> u32 {
+        let off = s.len() as u32;
+        s.extend_from_slice(name.as_bytes());
+        s.push(0);
+        off
+    };
+    let n_u64 = push(&mut strings, "u64");
+    let n_b = push(&mut strings, "B");
+    let n_f = push(&mut strings, "f");
+    let types = vec![
+        CastSynType::Int {
+            name_off: n_u64,
+            size: 8,
+            encoding: 0,
+            offset: 0,
+            bits: 64,
+        },
+        CastSynType::BitfieldStruct {
+            name_off: n_b,
+            size: 16,
+            members: vec![CastSynBitMember {
+                name_off: n_f,
+                type_id: 1,
+                bit_offset: 0,
+                bitfield_size: 65,
+            }],
+        },
+    ];
+    let blob = cast_build_btf(&types, &strings);
+    let btf = Btf::from_bytes(&blob).expect("synthetic BTF parses");
+    let v = render_value(&btf, 2, &[0u8; 16]);
+    match sole_member_value(&v) {
+        RenderedValue::Unsupported { reason } => {
+            assert!(
+                reason.contains("out of range"),
+                "unexpected reason: {reason}"
+            );
+        }
+        other => panic!("expected Unsupported, got {other:?}"),
+    }
+}
+
+#[test]
+fn render_bitfield_width_zero_is_unsupported_direct() {
+    // render_member filters width==0 before calling render_bitfield, so
+    // exercise render_bitfield's own width==0 rejection directly.
+    // render_bitfield is module-private; the tests submodule reaches it
+    // via super::. A 1-type BTF (just a u64) supplies member_type_id.
+    let mut strings: Vec<u8> = vec![0];
+    let push = |s: &mut Vec<u8>, name: &str| -> u32 {
+        let off = s.len() as u32;
+        s.extend_from_slice(name.as_bytes());
+        s.push(0);
+        off
+    };
+    let n_u64 = push(&mut strings, "u64");
+    let types = vec![CastSynType::Int {
+        name_off: n_u64,
+        size: 8,
+        encoding: 0,
+        offset: 0,
+        bits: 64,
+    }];
+    let blob = cast_build_btf(&types, &strings);
+    let btf = Btf::from_bytes(&blob).expect("synthetic BTF parses");
+    let v = super::render_bitfield(&btf, 1, &[0u8; 8], 0, 0);
+    match v {
+        RenderedValue::Unsupported { reason } => {
+            assert!(
+                reason.contains("out of range"),
+                "unexpected reason: {reason}"
+            );
+        }
+        other => panic!("expected Unsupported, got {other:?}"),
+    }
+}
+
+#[test]
+fn render_bitfield_straddling_end_of_bytes_is_truncated() {
+    // struct B { u64 f : 64; } size 8, but only 1 byte supplied. The
+    // member byte_off (0) is < bytes.len() (1) so render_struct does NOT
+    // skip it; render_bitfield needs 8 bytes -> Truncated.
+    let mut strings: Vec<u8> = vec![0];
+    let push = |s: &mut Vec<u8>, name: &str| -> u32 {
+        let off = s.len() as u32;
+        s.extend_from_slice(name.as_bytes());
+        s.push(0);
+        off
+    };
+    let n_u64 = push(&mut strings, "u64");
+    let n_b = push(&mut strings, "B");
+    let n_f = push(&mut strings, "f");
+    let types = vec![
+        CastSynType::Int {
+            name_off: n_u64,
+            size: 8,
+            encoding: 0,
+            offset: 0,
+            bits: 64,
+        },
+        CastSynType::BitfieldStruct {
+            name_off: n_b,
+            size: 8,
+            members: vec![CastSynBitMember {
+                name_off: n_f,
+                type_id: 1,
+                bit_offset: 0,
+                bitfield_size: 64,
+            }],
+        },
+    ];
+    let blob = cast_build_btf(&types, &strings);
+    let btf = Btf::from_bytes(&blob).expect("synthetic BTF parses");
+    let v = render_value(&btf, 2, &[0xAB]);
+    match sole_member_value(&v) {
+        RenderedValue::Truncated { needed, had, .. } => {
+            assert_eq!((*needed, *had), (8, 1));
+        }
+        other => panic!("expected Truncated, got {other:?}"),
+    }
 }
 
 /// Helper: build a string section + name offsets for the names
@@ -9041,4 +9638,374 @@ fn rendered_value_as_bool_array_via_truncated_peel() {
         partial: Box::new(arr),
     };
     assert_eq!(trunc.as_bool_array(), Some(vec![true, false]));
+}
+
+// ---- bpf_cpumask __kptr deref: positive-path render -------------
+//
+// The Type::Ptr arm chases a `struct bpf_cpumask`/`cpumask` kptr
+// member to a CpuList by reading the bitmap via MemReader::read_kva
+// (mod.rs:2309-2434). The existing tests only pin the no-op/skip
+// paths (try_render_cpumask_bits byte-decode, and
+// arena_chase_bridge_address_outside_window_is_no_op which asserts
+// deref.is_none()). These pin the SUCCESS path end-to-end: a
+// `cpumask` pointee + a mock read_kva returning a real bitmap must
+// render `Ptr{ value, deref: Some(CpuList{cpus}) }`.
+
+/// Build `outer { mask: *cpumask }` where `struct cpumask` has a u64
+/// `bits` member (size > 0 so the kptr branch's incomplete-type gate
+/// passes). `pointee_name` selects "cpumask" or "bpf_cpumask" — both
+/// must match the name predicate. Returns `(btf, outer_type_id)`.
+fn cpumask_kptr_outer_btf(pointee_name: &str) -> (Btf, u32) {
+    let mut strings: Vec<u8> = vec![0];
+    let mut push = |name: &str| -> u32 {
+        let off = strings.len() as u32;
+        strings.extend_from_slice(name.as_bytes());
+        strings.push(0);
+        off
+    };
+    let n_u64 = push("u64");
+    let n_pointee = push(pointee_name);
+    let n_bits = push("bits");
+    let n_outer = push("outer");
+    let n_mask = push("mask");
+    let types = vec![
+        // id 1: u64 (the cpumask's bits member element)
+        CastSynType::Int {
+            name_off: n_u64,
+            size: 8,
+            encoding: 0,
+            offset: 0,
+            bits: 64,
+        },
+        // id 2: struct cpumask { u64 bits; } — size 8 > 0
+        CastSynType::Struct {
+            name_off: n_pointee,
+            size: 8,
+            members: vec![CastSynMember {
+                name_off: n_bits,
+                type_id: 1,
+                byte_offset: 0,
+            }],
+        },
+        // id 3: *cpumask (the kptr)
+        CastSynType::Ptr { type_id: 2 },
+        // id 4: struct outer { *cpumask mask; }
+        CastSynType::Struct {
+            name_off: n_outer,
+            size: 8,
+            members: vec![CastSynMember {
+                name_off: n_mask,
+                type_id: 3,
+                byte_offset: 0,
+            }],
+        },
+    ];
+    let blob = cast_build_btf(&types, &strings);
+    let btf = Btf::from_bytes(&blob).expect("synthetic cpumask BTF parses");
+    (btf, 4)
+}
+
+/// A 1024-byte cpumask read (CPUMASK_READ_CAP) with the given low
+/// 64-bit word; the rest of the slab read is zero.
+fn cpumask_read_bytes(word0: u64) -> Vec<u8> {
+    let mut b = vec![0u8; 1024];
+    b[..8].copy_from_slice(&word0.to_le_bytes());
+    b
+}
+
+#[test]
+fn cpumask_kptr_member_chases_to_cpu_list() {
+    for name in ["cpumask", "bpf_cpumask"] {
+        let (btf, outer_id) = cpumask_kptr_outer_btf(name);
+        let val: u64 = 0xFFFF_8000_0010_0000; // kernel kptr VA the slot holds
+        let outer_bytes = val.to_le_bytes().to_vec();
+        // bits 0, 1, 3 set → "0-1,3" after range collapse.
+        let mut kva = std::collections::HashMap::new();
+        kva.insert(val, cpumask_read_bytes(0b0000_1011));
+        let reader = CastStubReader {
+            kva_bytes_at: kva,
+            ..Default::default()
+        };
+
+        let v = render_value_with_mem(&btf, outer_id, &outer_bytes, &reader);
+        let RenderedValue::Struct { ref members, .. } = v else {
+            panic!("expected Struct render for {name}, got {v:?}");
+        };
+        let RenderedValue::Ptr {
+            value,
+            ref deref,
+            ref deref_skipped_reason,
+            ref cast_annotation,
+            ..
+        } = members[0].value
+        else {
+            panic!(
+                "mask field must render as Ptr for {name}; got {:?}",
+                members[0].value
+            );
+        };
+        assert_eq!(value, val, "raw pointer retained alongside deref ({name})");
+        assert!(
+            deref_skipped_reason.is_none(),
+            "valid cpumask must not skip ({name}): {deref_skipped_reason:?}"
+        );
+        assert!(
+            cast_annotation.is_none(),
+            "kptr branch leaves cast_annotation None ({name})"
+        );
+        match deref.as_deref() {
+            Some(RenderedValue::CpuList { cpus }) => {
+                assert_eq!(cpus, "0-1,3", "decoded cpu set ({name})")
+            }
+            other => panic!("expected deref Some(CpuList) for {name}, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn cpumask_kptr_null_pointer_no_chase() {
+    let (btf, outer_id) = cpumask_kptr_outer_btf("bpf_cpumask");
+    let outer_bytes = 0u64.to_le_bytes().to_vec(); // NULL kptr
+    // read_kva should never be consulted; empty reader.
+    let reader = CastStubReader::default();
+    let v = render_value_with_mem(&btf, outer_id, &outer_bytes, &reader);
+    let RenderedValue::Struct { ref members, .. } = v else {
+        panic!("expected Struct, got {v:?}");
+    };
+    let RenderedValue::Ptr {
+        value,
+        ref deref,
+        ref deref_skipped_reason,
+        ..
+    } = members[0].value
+    else {
+        panic!("mask field must render as Ptr; got {:?}", members[0].value);
+    };
+    assert_eq!(value, 0);
+    assert!(deref.is_none(), "NULL kptr must not chase");
+    assert!(
+        deref_skipped_reason.is_none(),
+        "NULL kptr is a clean skip with no reason, got {deref_skipped_reason:?}"
+    );
+}
+
+#[test]
+fn cpumask_kptr_plausibility_gate_rejects_freed_slab_pattern() {
+    let (btf, outer_id) = cpumask_kptr_outer_btf("cpumask");
+    let val: u64 = 0xFFFF_8000_0010_0000;
+    let outer_bytes = val.to_le_bytes().to_vec();
+    // word0 top byte == 0xff: the freed-slab freelist-pointer pattern
+    // the plausibility gate (mod.rs:2372) rejects.
+    let mut kva = std::collections::HashMap::new();
+    kva.insert(val, cpumask_read_bytes(0xFF00_0000_0000_0000));
+    let reader = CastStubReader {
+        kva_bytes_at: kva,
+        ..Default::default()
+    };
+    let v = render_value_with_mem(&btf, outer_id, &outer_bytes, &reader);
+    let RenderedValue::Struct { ref members, .. } = v else {
+        panic!("expected Struct, got {v:?}");
+    };
+    let RenderedValue::Ptr {
+        ref deref,
+        ref deref_skipped_reason,
+        ..
+    } = members[0].value
+    else {
+        panic!("mask field must render as Ptr; got {:?}", members[0].value);
+    };
+    assert!(
+        deref.is_none(),
+        "freed-slab pattern must not decode to a CpuList"
+    );
+    assert!(
+        deref_skipped_reason
+            .as_deref()
+            .is_some_and(|r| r.contains("plausibility")),
+        "skip reason must cite the plausibility gate, got {deref_skipped_reason:?}"
+    );
+}
+
+// ---- llc_cpumask inline-bitmap render -------------------------------
+//
+// `struct llc_cpumask { unsigned long bits[NR]; }` (scx_mitosis) is an
+// inline NON-kptr bitmap. Its BTF name must be in render_struct's
+// embedded cpumask-detection list so the bytes render as a CpuList
+// rather than a raw u64 array. A synthetic BTF avoids a vmlinux
+// dependency (the name is scheduler-specific, absent from vmlinux).
+
+#[test]
+fn llc_cpumask_struct_renders_as_cpu_list() {
+    let mut strings: Vec<u8> = vec![0];
+    let mut push = |name: &str| -> u32 {
+        let off = strings.len() as u32;
+        strings.extend_from_slice(name.as_bytes());
+        strings.push(0);
+        off
+    };
+    let n_u64 = push("u64");
+    let n_llc = push("llc_cpumask");
+    let n_bits = push("bits");
+    // struct llc_cpumask { u64 bits; } — the renderer treats the whole
+    // struct's bytes as the bitmap, so a single-word stand-in exercises
+    // the name-detection arm (real scx_mitosis declares bits[128]).
+    let types = vec![
+        CastSynType::Int {
+            name_off: n_u64,
+            size: 8,
+            encoding: 0,
+            offset: 0,
+            bits: 64,
+        },
+        CastSynType::Struct {
+            name_off: n_llc,
+            size: 8,
+            members: vec![CastSynMember {
+                name_off: n_bits,
+                type_id: 1,
+                byte_offset: 0,
+            }],
+        },
+    ];
+    let blob = cast_build_btf(&types, &strings);
+    let btf = Btf::from_bytes(&blob).expect("synthetic llc_cpumask BTF parses");
+    // bits 0, 2, 5 set.
+    let bytes = 0b10_0101u64.to_le_bytes();
+    match render_value(&btf, 2, &bytes) {
+        RenderedValue::CpuList { cpus } => assert_eq!(cpus, "0,2,5"),
+        other => panic!("expected CpuList for llc_cpumask, got {other:?}"),
+    }
+}
+
+/// Plausibility gate must NOT reject a fully-online <=64-CPU mask: an
+/// all-ones first word (0xFFFF..FFFF) is a valid mask, not a freed-slab
+/// freelist pointer (a real next pointer carries address bits and is
+/// never all-ones / non-canonical). Regression for the gate
+/// false-positive — on the pre-fix top-byte-0xff check this read would
+/// skip with a "plausibility" reason instead of decoding cpus 0-63.
+#[test]
+fn cpumask_kptr_all_ones_word_decodes_not_rejected() {
+    let (btf, outer_id) = cpumask_kptr_outer_btf("bpf_cpumask");
+    let val: u64 = 0xFFFF_8000_0010_0000;
+    let outer_bytes = val.to_le_bytes().to_vec();
+    // word0 all ones (CPUs 0-63 online), higher words zero.
+    let mut kva = std::collections::HashMap::new();
+    kva.insert(val, cpumask_read_bytes(u64::MAX));
+    let reader = CastStubReader {
+        kva_bytes_at: kva,
+        ..Default::default()
+    };
+    let v = render_value_with_mem(&btf, outer_id, &outer_bytes, &reader);
+    let RenderedValue::Struct { ref members, .. } = v else {
+        panic!("expected Struct, got {v:?}");
+    };
+    let RenderedValue::Ptr {
+        ref deref,
+        ref deref_skipped_reason,
+        ..
+    } = members[0].value
+    else {
+        panic!("mask field must render as Ptr; got {:?}", members[0].value);
+    };
+    match deref.as_deref() {
+        Some(RenderedValue::CpuList { cpus }) => assert_eq!(cpus, "0-63"),
+        other => panic!(
+            "all-ones mask must decode to cpus 0-63, got {other:?} \
+             (skip reason {deref_skipped_reason:?})"
+        ),
+    }
+}
+
+/// Realistic kptr shape: `struct bpf_cpumask __kptr *` is a
+/// btf_type_tag("kptr") wrapping a Ptr, NOT a bare Ptr (which the
+/// other cpumask_kptr tests use). The render path must peel the
+/// TypeTag to reach the Ptr cpumask arm. This is the shape a datasec
+/// global like scx_mitosis's `all_cpumask` carries; render_datasec
+/// routes each variable through the same render_value_inner exercised
+/// here (after try_cast_intercept returns None for a non-u64 Ptr
+/// type), so this pins the datasec-kptr value-decode link.
+#[test]
+fn cpumask_kptr_through_kptr_typetag_chases_to_cpu_list() {
+    let mut strings: Vec<u8> = vec![0];
+    let mut push = |name: &str| -> u32 {
+        let off = strings.len() as u32;
+        strings.extend_from_slice(name.as_bytes());
+        strings.push(0);
+        off
+    };
+    let n_u64 = push("u64");
+    let n_cpumask = push("bpf_cpumask");
+    let n_bits = push("bits");
+    let n_kptr = push("kptr");
+    let n_outer = push("outer");
+    let n_mask = push("mask");
+    let types = vec![
+        // id 1: u64
+        CastSynType::Int {
+            name_off: n_u64,
+            size: 8,
+            encoding: 0,
+            offset: 0,
+            bits: 64,
+        },
+        // id 2: struct bpf_cpumask { u64 bits; }
+        CastSynType::Struct {
+            name_off: n_cpumask,
+            size: 8,
+            members: vec![CastSynMember {
+                name_off: n_bits,
+                type_id: 1,
+                byte_offset: 0,
+            }],
+        },
+        // id 3: *bpf_cpumask
+        CastSynType::Ptr { type_id: 2 },
+        // id 4: __kptr tag wrapping the pointer (the realistic shape)
+        CastSynType::TypeTag {
+            name_off: n_kptr,
+            type_id: 3,
+        },
+        // id 5: struct outer { bpf_cpumask __kptr *mask; }
+        CastSynType::Struct {
+            name_off: n_outer,
+            size: 8,
+            members: vec![CastSynMember {
+                name_off: n_mask,
+                type_id: 4,
+                byte_offset: 0,
+            }],
+        },
+    ];
+    let blob = cast_build_btf(&types, &strings);
+    let btf = Btf::from_bytes(&blob).expect("synthetic kptr-typetag BTF parses");
+    let val: u64 = 0xFFFF_8000_0010_0000;
+    let outer_bytes = val.to_le_bytes().to_vec();
+    let mut kva = std::collections::HashMap::new();
+    kva.insert(val, cpumask_read_bytes(0b0000_1011)); // bits 0,1,3
+    let reader = CastStubReader {
+        kva_bytes_at: kva,
+        ..Default::default()
+    };
+    let v = render_value_with_mem(&btf, 5, &outer_bytes, &reader);
+    let RenderedValue::Struct { ref members, .. } = v else {
+        panic!("expected Struct, got {v:?}");
+    };
+    let RenderedValue::Ptr {
+        ref deref,
+        ref deref_skipped_reason,
+        ..
+    } = members[0].value
+    else {
+        panic!(
+            "kptr-tagged mask field must render as Ptr; got {:?}",
+            members[0].value
+        );
+    };
+    match deref.as_deref() {
+        Some(RenderedValue::CpuList { cpus }) => assert_eq!(cpus, "0-1,3"),
+        other => panic!(
+            "kptr TypeTag must peel to the Ptr cpumask chase; got {other:?} \
+             (skip reason {deref_skipped_reason:?})"
+        ),
+    }
 }

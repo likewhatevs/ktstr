@@ -44,15 +44,20 @@ Neither threshold is set by default; enable via `Assert` setters or
 **Benchmarking** -- `assert_benchmarks()` checks per-wakeup latency
 and iteration throughput. Three thresholds:
 - `max_p99_wake_latency_ns`: p99 of all `wake_latencies_ns` samples
-  across workers in a cgroup. Populated only for work types that
-  record wake-to-run latency: `IoSyncWrite`, `IoRandRead`, `IoConvoy`,
-  `Bursty`, `PipeIo`,
-  `FutexPingPong`, `CacheYield`, `CachePipe`, `FutexFanOut`
-  (receivers), `Sequence` (Sleep / Yield / Io phases),
-  `ForkExit`, `NiceSweep`, `AffinityChurn`, `PolicyChurn`,
-  `FanOutCompute`, `MutexContention`. Pure-CPU work types
-  (`SpinWait`, `Mixed`, `CachePressure`, `PageFaultChurn`) do not
-  record samples.
+  across workers in a cgroup. Populated by work types that block or
+  yield and measure wake-to-run latency — most I/O, futex, pipe,
+  sleep, and yield-churn variants, including `IoSyncWrite`,
+  `IoRandRead`, `IoConvoy`, `Bursty`, `PipeIo`, `FutexPingPong`,
+  `CacheYield`, `CachePipe`, `FutexFanOut` (receivers), `Sequence`
+  (Sleep / Yield / Io phases), `ForkExit`, `NiceSweep`,
+  `AffinityChurn`, `CrossAffinityChurn`, `PolicyChurn`,
+  `FanOutCompute`, `MutexContention`, `ThunderingHerd`, `WakeChain`,
+  `AsymmetricWaker`, `PriorityInversion`, `ProducerConsumerImbalance`,
+  `NumaWorkingSetSweep`, `EpollStorm`, `IdleChurn`. Pure-CPU spin
+  variants (`SpinWait`, `Mixed`, `CachePressure`, `PageFaultChurn`,
+  `YieldHeavy`, `AluHot`, `SmtSiblingSpin`, `IpcVariance`, and the
+  like) record no wake-latency samples — the compute variants sample
+  iteration cost instead.
 - `max_wake_latency_cv`: coefficient of variation of wake latency
   samples. High CV means inconsistent scheduling latency.
 - `min_iteration_rate`: minimum outer-loop iterations per wall-clock
@@ -272,9 +277,10 @@ Each field is independent — `None` skips that check. The four fields:
 - `max_p99_wake_latency_ns` -- pooled p99 across every worker's
   `wake_latencies_ns`. Same semantics as `Assert::max_p99_wake_latency_ns`.
 - `max_iteration_cost_p99_ns` -- pooled p99 across every worker's
-  `iteration_costs_ns`. Only meaningful for compute work types
-  (`AluHot`, `SmtSiblingSpin`, `IpcVariance`); blocking variants
-  report empty reservoirs and the check is a no-op.
+  `iteration_costs_ns`. Meaningful for compute work types that sample
+  iteration cost — `AluHot`, `SmtSiblingSpin`, `IpcVariance`, and a
+  `Sequence` whose phases include `WorkPhase::AluHot`; purely blocking
+  variants report empty reservoirs and the check is a no-op.
 - `max_migrations` -- absolute sum of `migration_count` across
   workers. Distinct from `Assert::max_migration_ratio` (per-iteration
   rate); useful when the test pins a known workload size.
@@ -375,9 +381,10 @@ For scalar `ClaimBuilder<T>`:
 - `T: PartialEq + Display` → `eq`, `ne`
 - `T = f64` → `is_finite`, `near`
 
-For container claims (set / sequence), comparators bypass scalars and
-offer `empty` / `nonempty` / `contains` / `len_eq` / `len_at_most` /
-`len_at_least` / `subset_of` / `disjoint_from`.
+For container claims, comparators bypass scalars. Set claims offer
+`empty` / `nonempty` / `contains` / `len_eq` / `len_at_most` /
+`len_at_least` / `subset_of` / `disjoint_from`; sequence claims offer
+the same set minus `subset_of` / `disjoint_from`.
 
 ### Finishing the verdict
 
@@ -614,8 +621,9 @@ accumulate in a loop body.
   `is_inconclusive()` / `is_skip()` from this vec (no separate
   `passed: bool` / `skipped: bool` field exists).
 - `passes: Vec<PassDetail>` -- recorded pass details (capped at
-  `MAX_RECORDED_PASSES`). Surfaced via `failure_details()` when
-  composing diagnostic notes.
+  `MAX_RECORDED_PASSES`). Consumed by the auto-repro renderer (which
+  iterates both `outcomes` and `passes`) to surface passing context
+  alongside failing assertions.
 - `stats: ScenarioStats` -- aggregated worker telemetry across all
   cgroups (spread, gaps, migrations, wake latency, iterations).
 - `measurements: BTreeMap<String, NoteValue>` -- structured

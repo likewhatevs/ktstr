@@ -61,16 +61,20 @@ stripped. Version specs render as `kernel_<version>` — `6.16.1`
 becomes `kernel_6_16_1`. Path specs render as
 `kernel_path_<basename>_<hash6>` — `../linux` becomes
 `kernel_path_linux_<hash6>` (and `..._dirty` when the source tree
-is dirty). The 6-char content hash disambiguates two different
-source paths that share a basename.
+is dirty). The 6-char path hash (a CRC32 over the canonical path
+string) disambiguates two different source paths that share a
+basename.
 
 ## Run analysis
 
 Each test invocation writes a `*.ktstr.json` sidecar per variant
 into `{CARGO_TARGET_DIR or "target"}/ktstr/{kernel}-{project_commit}/`.
 `cargo ktstr stats list` enumerates runs; `cargo ktstr stats
-compare`, `list-values`, `list-metrics`, and `show-host` operate on
-those sidecars. See [Runs](running-tests/runs.md) for the directory
+compare`, `list-values`, and `show-host` operate on those sidecars.
+`list-metrics` is independent of the sidecar pool — it enumerates the
+static `ktstr::stats::METRICS` regression-metric registry (metric
+names, polarities, default abs/rel thresholds, units) and takes no
+run input. See [Runs](running-tests/runs.md) for the directory
 layout, last-writer-wins semantics, and the comparison workflow.
 
 ## Budget-based test selection
