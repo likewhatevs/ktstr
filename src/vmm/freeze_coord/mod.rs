@@ -2140,6 +2140,15 @@ impl KtstrVm {
                     /// resolve `scx_tasks` / `jiffies_64` /
                     /// `scx_watchdog_timestamp` correctly.
                     phys_base: u64,
+                    /// Runtime VIRTUAL KASLR slide — distinct from
+                    /// `phys_base`, the PHYSICAL slide. `scx_tasks` is a
+                    /// link-time symbol but the global list's `.next`
+                    /// pointers are runtime addresses, so the global
+                    /// walk's terminator must compare against the runtime
+                    /// head `slid_kernel_kva(scx_tasks_kva, kaslr_offset)`.
+                    /// Sourced from `coord_kaslr_offset()`; `0` when KASLR
+                    /// is off / not yet derived.
+                    kaslr_offset: u64,
                 }
                 // Lazy-construct BpfMapAccessorOwned. The constructor
                 // parses vmlinux ELF (goblin) and BTF (~MB-scale
@@ -4354,6 +4363,7 @@ impl KtstrVm {
                                 walk,
                                 start_kernel_map: kernel.start_kernel_map(),
                                 phys_base: kernel.phys_base(),
+                                kaslr_offset: coord_kaslr_offset(),
                             })
                         };
                         match try_resolve() {
@@ -8534,6 +8544,7 @@ impl KtstrVm {
                             ctx.watchdog_timestamp_pa,
                             ctx.start_kernel_map,
                             ctx.phys_base,
+                            ctx.kaslr_offset,
                         );
                         // Track scan trajectory for the diagnostic
                         // logged when err_triggered fires before the
@@ -8792,6 +8803,7 @@ impl KtstrVm {
                                     ctx.watchdog_timestamp_pa,
                                     ctx.start_kernel_map,
                                     ctx.phys_base,
+                                    ctx.kaslr_offset,
                                 );
                             if backstop_max_age >= half_threshold_jiffies {
                                 tracing::info!(
