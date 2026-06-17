@@ -2024,9 +2024,13 @@ impl ScenarioStats {
 /// `PhaseBucket.metrics` but never reach `ext_metrics` via the
 /// SampleSeries path (their `read_sample` returns `None`):
 /// `avg_imbalance_ratio` (sourced from MonitorSample windowing
-/// inside [`build_phase_buckets`]) and `iteration_rate` (sourced
-/// from stimulus event totals inside
-/// [`build_phase_buckets_with_stimulus`]).
+/// inside [`build_phase_buckets`]), `iteration_rate` (sourced from
+/// stimulus event totals inside [`build_phase_buckets_with_stimulus`]),
+/// and `system_time_ns` / `user_time_ns` (per-thread-group CPU-time
+/// deltas injected by `phase_group_cpu_delta` inside
+/// `buckets_from_grouped`). The fold is generic over every key
+/// present on any phase, so it carries any such phase-only metric; this
+/// list is the current set whose `read_sample` returns `None`.
 ///
 /// Per-phase reduction dispatch is described on [`PhaseBucket`];
 /// the cross-phase fold here uses `sample_count` as the weight so
@@ -2036,10 +2040,10 @@ impl ScenarioStats {
 /// overwritten — `read_sample` path values win when both produced
 /// an entry.
 ///
-/// Without this fill, `cargo ktstr stats compare` silently
-/// misses avg_imbalance_ratio + iteration_rate in flat-row
-/// output because `MetricDef::read` falls back to ext_metrics
-/// and finds nothing.
+/// Without this fill, `cargo ktstr stats compare` silently misses
+/// these phase-only metrics (avg_imbalance_ratio, iteration_rate,
+/// system_time_ns, user_time_ns) in flat-row output because
+/// `MetricDef::read` falls back to ext_metrics and finds nothing.
 pub fn populate_run_ext_metrics_from_phases(
     phases: &[PhaseBucket],
     target: &mut std::collections::BTreeMap<String, f64>,
@@ -2340,6 +2344,135 @@ pub fn build_phase_buckets(samples: &crate::scenario::sample::SampleSeries) -> V
     buckets_from_grouped(samples.by_stamped_phase(), monitor_samples, 0)
 }
 
+/// Per-phase CPU-time delta (ns) for one field family
+/// (`stime`/`signal_stime` or `utime`/`signal_utime`), folded host-side
+/// from the frozen `task_struct` enrichments captured at the phase's
+/// freeze boundaries. Backs the injected `system_time_ns` /
+/// `user_time_ns` per-phase metrics.
+///
+/// The unit is the THREAD GROUP, not the individual task: the kernel's
+/// `thread_group_cputime` is `signal_struct.{u,s}time` (the accumulator
+/// a dying thread's time is folded into at exit) plus the live threads'
+/// `task_struct.{u,s}time`. `signal_struct` is shared across a thread
+/// group, so its value is counted once per `tgid`; the live counters are
+/// summed across the group's threads. For each `tgid` the group total is
+/// taken at the FIRST and LAST sample in which the group had a READABLE
+/// total (ordered by capture time) and `last - first` is summed across
+/// groups.
+///
+/// Per-group first-seen/last-seen, NOT a per-sample cross-task SUM then a
+/// Counter `last - first`: the captured set changes between freezes
+/// (system tasks churn in and out). A task carrying a large cumulative
+/// counter that appears only in a LATER sample would dump its entire
+/// pre-phase history into a summed delta, inflating the phase value
+/// many-fold. Subtracting each group's OWN first-seen total cancels its
+/// pre-phase history, so a late-joining group contributes only what it
+/// accrued while observed — bounding the result by wall-clock × cores. A
+/// group's thread exiting mid-phase does not dip the total: its time
+/// moves from a `task_struct` counter into `signal_struct`, both of which
+/// the group total includes.
+///
+/// A `None` `signal_field` is a `signal_struct` translate miss, NOT a
+/// real zero (which reads `Some(0)`): such a sample is omitted for that
+/// group so every endpoint is a full live+signal total — mixing a
+/// live-only endpoint with a live+signal one would otherwise leak the
+/// cumulative accumulator as a phantom positive. A numeric `tgid` reused
+/// within the phase (process exit + PID realloc) can read lower at last
+/// than first; `saturating_sub` clamps that to 0 rather than wrapping.
+///
+/// Returns `None` when no group was observed with a readable total across
+/// at least two samples — no delta is measurable — keeping an absent
+/// per-phase bucket key distinct from a real `0` (a qualifying group
+/// whose counters did not advance yields `Some(0.0)`). Accumulates in
+/// `u128` to stay exact before the final `f64` (a phase can total many
+/// task-seconds of ns).
+fn phase_group_cpu_delta(
+    samples: &[crate::scenario::sample::Sample<'_>],
+    task_field: impl Fn(&crate::monitor::task_enrichment::TaskEnrichment) -> u64,
+    signal_field: impl Fn(&crate::monitor::task_enrichment::TaskEnrichment) -> Option<u64>,
+) -> Option<f64> {
+    // Per-tgid `thread_group_cputime` total at one sample: the shared
+    // signal_struct accumulator (once per group) plus the sum of the
+    // group's live threads' task_struct counter. A group is INCLUDED for
+    // a sample only when its signal accumulator was readable there (some
+    // thread of the tgid carried `Some`): a `None` is a signal_struct
+    // translate miss (see `task_enrichment.rs`), NOT a real zero — a real
+    // zero reads `Some(0)`. Omitting unreadable-signal groups keeps every
+    // endpoint a FULL group total (live + signal), so the first/last delta
+    // can never mix a live-only endpoint with a live+signal endpoint and
+    // leak the cumulative accumulator as a phantom positive.
+    let group_totals = |s: &crate::scenario::sample::Sample<'_>| {
+        let mut live: std::collections::HashMap<i32, u128> = std::collections::HashMap::new();
+        let mut signal: std::collections::HashMap<i32, Option<u128>> =
+            std::collections::HashMap::new();
+        for t in s.snapshot.task_enrichments() {
+            *live.entry(t.tgid).or_insert(0) += u128::from(task_field(t));
+            match signal_field(t) {
+                // Shared across the group — any readable thread fixes it.
+                Some(v) => {
+                    signal.insert(t.tgid, Some(u128::from(v)));
+                }
+                None => {
+                    signal.entry(t.tgid).or_insert(None);
+                }
+            }
+        }
+        live.into_iter()
+            .filter_map(|(tgid, l)| {
+                signal
+                    .get(&tgid)
+                    .copied()
+                    .flatten()
+                    .map(|sig| (tgid, l + sig))
+            })
+            .collect::<std::collections::HashMap<i32, u128>>()
+    };
+
+    // Order by capture time so first/last are the earliest/latest
+    // boundary — the grouped vec is not guaranteed sorted (the
+    // offset-remap in the stimulus path can reorder samples).
+    let mut ordered: Vec<&crate::scenario::sample::Sample<'_>> = samples.iter().collect();
+    ordered.sort_by_key(|s| s.boundary_offset_ms.unwrap_or(s.elapsed_ms));
+
+    // Per tgid: its full group total at the first and last sample in which
+    // it had a readable total, and how many such samples it had.
+    let mut first_seen: std::collections::HashMap<i32, u128> = std::collections::HashMap::new();
+    let mut last_seen: std::collections::HashMap<i32, u128> = std::collections::HashMap::new();
+    let mut readable_count: std::collections::HashMap<i32, u32> = std::collections::HashMap::new();
+    for s in ordered {
+        for (tgid, total) in group_totals(s) {
+            first_seen.entry(tgid).or_insert(total);
+            last_seen.insert(tgid, total);
+            *readable_count.entry(tgid).or_insert(0) += 1;
+        }
+    }
+
+    let mut sum: u128 = 0;
+    let mut measured = false;
+    for (tgid, last) in &last_seen {
+        // A delta needs the group observed with a readable total across
+        // TWO boundaries; one readable sample gives first == last and no
+        // measurable in-phase growth (and a tgid that appears in only one
+        // sample, or whose signal_struct never translated, never reaches
+        // 2). saturating_sub clamps a last < first read — a numeric tgid
+        // reused within the phase (process exit + PID realloc to a fresh
+        // group starting near zero) reads lower at last; clamp to 0 rather
+        // than wrap.
+        if readable_count.get(tgid).copied().unwrap_or(0) < 2 {
+            continue;
+        }
+        measured = true;
+        // first_seen always holds tgid (populated in the same pass).
+        let first = first_seen.get(tgid).copied().unwrap_or(*last);
+        sum += last.saturating_sub(first);
+    }
+    // None when no group was observed with a readable total across two
+    // samples — unmeasurable, so the bucket key stays ABSENT (distinct
+    // from a real 0: a qualifying group whose counters did not advance
+    // yields Some(0.0)).
+    measured.then_some(sum as f64)
+}
+
 /// Assemble [`PhaseBucket`]s from a pre-grouped phase map. Shared by
 /// [`build_phase_buckets`] (grouping by the bridge-stamped step_index)
 /// and [`build_phase_buckets_with_stimulus`] (grouping by the
@@ -2421,6 +2554,23 @@ fn buckets_from_grouped(
             {
                 metrics.insert(metric_def.name.to_string(), reduced);
             }
+        }
+        // Per-phase system / user CPU time (ns), injected post-hoc as a
+        // per-thread-GROUP delta over the phase's freeze samples (NOT a
+        // read_sample metric — a per-sample cross-task sum then a Counter
+        // delta inflates when the captured task set churns; see
+        // `phase_group_cpu_delta`). Observer-free: reads the frozen
+        // task_struct.{s,u}time + thread-group signal_struct accumulator
+        // already captured in each sample's enrichments.
+        if let Some(v) =
+            phase_group_cpu_delta(&samples_in_phase, |t| t.stime, |t| t.signal_stime)
+        {
+            metrics.entry("system_time_ns".to_string()).or_insert(v);
+        }
+        if let Some(v) =
+            phase_group_cpu_delta(&samples_in_phase, |t| t.utime, |t| t.signal_utime)
+        {
+            metrics.entry("user_time_ns".to_string()).or_insert(v);
         }
         // Per-phase MonitorSample windowing (wire-up for metrics
         // that need per-CPU full-class rq.nr_running). The monitor

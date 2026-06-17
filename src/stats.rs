@@ -527,6 +527,20 @@ impl MetricDef {
                 .event_counter_timeline()
                 .last()
                 .map(|e| e.dispatch_keep_last as f64),
+            // `system_time_ns` / `user_time_ns` are deliberately absent
+            // here: they are NOT read per-sample. A per-sample
+            // cross-thread SUM followed by a Counter `last - first`
+            // inflates whenever the captured task set changes between
+            // freezes — a task carrying a large cumulative counter that
+            // appears only in a LATER sample dumps its entire pre-phase
+            // history into the delta. They are injected post-hoc as a
+            // per-thread-GROUP delta (each tgid's first-seen-to-last-seen
+            // `thread_group_cputime`) by
+            // [`crate::assert::phase_group_cpu_delta`], which subtracts
+            // each group's own first-seen total and so bounds the result
+            // by wall-clock × cores. Still observer-free — that injector
+            // reads the same frozen `task_struct` enrichments.
+            //
             // Every other metric stays None. The 16 host-only
             // names (full list in the doc comment above) compute
             // cross-cgroup folds at `evaluate_vm_result` time and
@@ -828,6 +842,47 @@ pub static METRICS: &[MetricDef] = &[
         default_rel: 0.10,
         display_unit: "",
         accessor: |r| Some(r.total_iterations as f64),
+    },
+    MetricDef {
+        // Per-phase SYSTEM (in-kernel) CPU time in nanoseconds. Read
+        // host-side from frozen task_struct.stime + the thread-group
+        // signal_struct.stime accumulator (zero guest work). Injected
+        // post-hoc — NOT a read_sample metric — as a per-thread-GROUP
+        // delta over the phase: `crate::assert::phase_group_cpu_delta`
+        // sums each tgid's `thread_group_cputime` (signal + live-thread
+        // stime) at its first and last appearance among the phase's
+        // freeze samples and takes `last - first` = system CPU time the
+        // group spent during the phase. Gauge(Avg): the per-phase value
+        // is already a delta (one per phase; cross-RUN folds by mean,
+        // like iteration_rate). LowerBetter — the DSQ-spinlock
+        // regression surfaces as rising system time (CPUs spinning in
+        // the kernel). No typed GauntletRow field; the ext_metrics
+        // fallback carries it through cargo ktstr stats compare.
+        name: "system_time_ns",
+        polarity: crate::test_support::Polarity::LowerBetter,
+        kind: MetricKind::Gauge(GaugeAgg::Avg),
+        default_abs: 1_000_000.0,
+        default_rel: 0.30,
+        display_unit: "ns",
+        accessor: |_| None,
+    },
+    MetricDef {
+        // Per-phase USER-mode CPU time in nanoseconds. Same host-side /
+        // injected / Gauge(Avg) shape as `system_time_ns` (task_struct
+        // .utime + the thread-group signal_struct.utime accumulator,
+        // per-tgid delta via `crate::assert::phase_group_cpu_delta`).
+        // Pairs with it so a test can distinguish "system time rose,
+        // user work flat" (the lock-contention signature) from "both
+        // rose" (genuine extra work). LowerBetter — less CPU consumed
+        // for the same work is the efficiency win; utime already
+        // includes gtime so the two are never summed.
+        name: "user_time_ns",
+        polarity: crate::test_support::Polarity::LowerBetter,
+        kind: MetricKind::Gauge(GaugeAgg::Avg),
+        default_abs: 1_000_000.0,
+        default_rel: 0.30,
+        display_unit: "ns",
+        accessor: |_| None,
     },
     MetricDef {
         name: "worst_mean_run_delay_us",

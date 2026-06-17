@@ -2051,13 +2051,14 @@ fn evaluate_vm_result(
             sample_series_for_phases,
             &mut check_result.stats.ext_metrics,
         );
-        // Sibling fill from per-phase metrics — closes the gap
-        // for avg_imbalance_ratio (MonitorSample-sourced) and
-        // iteration_rate (stimulus-event-sourced). Their
-        // read_sample dispatches return None so the SampleSeries
-        // path above misses them; without this call, those keys
-        // never appear in ext_metrics and cargo ktstr stats
-        // compare silently drops them.
+        // Sibling fill from per-phase metrics — closes the gap for the
+        // phase-only metrics whose read_sample dispatches return None:
+        // avg_imbalance_ratio (MonitorSample-sourced), iteration_rate
+        // (stimulus-event-sourced), and system_time_ns / user_time_ns
+        // (per-thread-group CPU-time deltas). The SampleSeries path
+        // above misses them; without this call those keys never appear
+        // in ext_metrics and cargo ktstr stats compare silently drops
+        // them.
         crate::assert::populate_run_ext_metrics_from_phases(
             &check_result.stats.phases,
             &mut check_result.stats.ext_metrics,

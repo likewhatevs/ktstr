@@ -619,6 +619,312 @@ fn build_phase_buckets_extracts_wired_metric_arms_end_to_end() {
     }
 }
 
+/// `system_time_ns` / `user_time_ns` are injected per-phase as a
+/// per-thread-GROUP delta (each tgid's `thread_group_cputime` at first
+/// vs last appearance, summed), NOT a per-sample cross-task sum then a
+/// Counter delta. Pins three properties:
+///   * the delta is `last - first` of the live `task_struct` counter per
+///     tgid (3000 ns system, 7000 ns user for the persistent group);
+///   * a high-cumulative-counter task that appears in only ONE sample
+///     contributes 0 (it never reaches two readable boundaries) — a
+///     sum-then-delta would have inflated the phase by ~1e6 ns;
+///   * a phase with fewer than two readable samples for any group omits
+///     the key (absent != real 0).
+///
+/// signal_{u,s}time are `Some(0)` here, matching production: a readable
+/// signal_struct with no exited-thread time reads `Some(0)`, not `None`
+/// (`None` is reserved for a translate miss — see the dedicated test).
+#[test]
+fn build_phase_buckets_injects_per_group_cpu_time_delta() {
+    use crate::monitor::task_enrichment::TaskEnrichment;
+
+    fn task(tgid: i32, utime: u64, stime: u64) -> TaskEnrichment {
+        TaskEnrichment {
+            pid: tgid,
+            tgid,
+            utime,
+            stime,
+            signal_utime: Some(0),
+            signal_stime: Some(0),
+            ..Default::default()
+        }
+    }
+    fn entry(
+        tag: &str,
+        step_index: u16,
+        elapsed_ms: u64,
+        tasks: Vec<TaskEnrichment>,
+    ) -> DrainedSnapshotEntry {
+        DrainedSnapshotEntry {
+            tag: tag.to_string(),
+            report: FailureDumpReport {
+                schema: SCHEMA_SINGLE.to_string(),
+                task_enrichments: tasks,
+                ..Default::default()
+            },
+            stats: Err(MissingStatsReason::NoSchedulerBinary),
+            elapsed_ms: Some(elapsed_ms),
+            boundary_offset_ms: None,
+            step_index: Some(step_index),
+        }
+    }
+
+    let drained = vec![
+        // BASELINE: a single enriched sample -> no delta measurable.
+        entry("periodic_000", 0, 10, vec![task(100, 2000, 1000)]),
+        // Step[0]: two samples. tgid=100 persists (utime 2000->9000,
+        // stime 1000->4000). tgid=200 (huge cumulative history) appears
+        // ONLY in the later sample -> single-appearance -> contributes 0.
+        entry("periodic_001", 1, 100, vec![task(100, 2000, 1000)]),
+        entry(
+            "periodic_002",
+            1,
+            200,
+            vec![task(100, 9000, 4000), task(200, 2_000_000, 1_000_000)],
+        ),
+    ];
+    let samples = SampleSeries::from_drained_typed(drained, None);
+    let phases = crate::assert::build_phase_buckets(&samples);
+    assert_eq!(phases.len(), 2, "BASELINE + Step[0]");
+
+    let baseline = &phases[0];
+    assert_eq!(baseline.step_index, 0);
+    assert!(
+        !baseline.metrics.contains_key("system_time_ns")
+            && !baseline.metrics.contains_key("user_time_ns"),
+        "single enriched sample -> CPU-time key omitted (absent != real 0)",
+    );
+
+    let step0 = &phases[1];
+    assert_eq!(step0.step_index, 1);
+    assert_eq!(
+        step0.metrics.get("system_time_ns").copied(),
+        Some(3000.0),
+        "system delta = tgid100 (4000-1000) + tgid200 (single-appearance \
+         -> 0); NOT 1_003_000 (sum-then-delta inflation)",
+    );
+    assert_eq!(
+        step0.metrics.get("user_time_ns").copied(),
+        Some(7000.0),
+        "user delta = tgid100 (9000-2000); tgid200 single-appearance -> 0",
+    );
+}
+
+/// The per-phase CPU-time fold includes the thread-group
+/// `signal_struct` accumulator (a dying thread's time moves there at
+/// exit), counted once per tgid, so a mid-phase thread exit does not
+/// dip the group total below its live-thread-only sum.
+#[test]
+fn build_phase_buckets_cpu_time_includes_signal_accumulator() {
+    use crate::monitor::task_enrichment::TaskEnrichment;
+
+    fn entry(
+        tag: &str,
+        elapsed_ms: u64,
+        stime: u64,
+        signal_stime: Option<u64>,
+    ) -> DrainedSnapshotEntry {
+        DrainedSnapshotEntry {
+            tag: tag.to_string(),
+            report: FailureDumpReport {
+                schema: SCHEMA_SINGLE.to_string(),
+                task_enrichments: vec![TaskEnrichment {
+                    pid: 100,
+                    tgid: 100,
+                    stime,
+                    signal_stime,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            stats: Err(MissingStatsReason::NoSchedulerBinary),
+            elapsed_ms: Some(elapsed_ms),
+            boundary_offset_ms: None,
+            step_index: Some(1),
+        }
+    }
+
+    // tgid=100 group total = live stime + the shared signal accumulator.
+    // Sample A's signal is Some(0) (a genuine zero — no exited-thread time
+    // yet — NOT None, which would mean an unreadable signal_struct):
+    //   sample A: 1000 + 0    = 1000
+    //   sample B: 2000 + 3000 = 5000   (a thread exited; 3000 -> signal)
+    //   delta = 4000  (without the signal fold it would read 1000)
+    let drained = vec![
+        entry("periodic_000", 100, 1000, Some(0)),
+        entry("periodic_001", 200, 2000, Some(3000)),
+    ];
+    let samples = SampleSeries::from_drained_typed(drained, None);
+    let phases = crate::assert::build_phase_buckets(&samples);
+    let step0 = phases
+        .iter()
+        .find(|p| p.step_index == 1)
+        .expect("Step[0] bucket present");
+    assert_eq!(
+        step0.metrics.get("system_time_ns").copied(),
+        Some(4000.0),
+        "signal accumulator (3000) folds into the group total: \
+         (2000+3000) - (1000+0) = 4000",
+    );
+}
+
+/// A `None` signal_field is an unreadable signal_struct (translate miss),
+/// NOT a real zero. A group whose signal is None at one of its endpoints
+/// is EXCLUDED from the delta there (its full thread_group_cputime is
+/// unmeasurable) rather than counted live-only — otherwise a None-at-first
+/// / Some(large)-at-last pair would leak the cumulative accumulator as a
+/// phantom positive. Pins that the phantom does not leak.
+#[test]
+fn build_phase_buckets_cpu_time_excludes_group_with_unreadable_signal() {
+    use crate::monitor::task_enrichment::TaskEnrichment;
+
+    fn t(tgid: i32, stime: u64, signal_stime: Option<u64>) -> TaskEnrichment {
+        TaskEnrichment {
+            pid: tgid,
+            tgid,
+            stime,
+            signal_stime,
+            ..Default::default()
+        }
+    }
+    fn entry(tag: &str, elapsed_ms: u64, tasks: Vec<TaskEnrichment>) -> DrainedSnapshotEntry {
+        DrainedSnapshotEntry {
+            tag: tag.to_string(),
+            report: FailureDumpReport {
+                schema: SCHEMA_SINGLE.to_string(),
+                task_enrichments: tasks,
+                ..Default::default()
+            },
+            stats: Err(MissingStatsReason::NoSchedulerBinary),
+            elapsed_ms: Some(elapsed_ms),
+            boundary_offset_ms: None,
+            step_index: Some(1),
+        }
+    }
+
+    // tgid=100: signal UNREADABLE (None) at the first sample, Some(5e6) at
+    //   the last, live stime flat (1000) -> the None endpoint is omitted,
+    //   leaving one readable sample -> EXCLUDED (must not add 5e6).
+    // tgid=200: signal Some(0) both samples, stime 1000 -> 3000 -> 2000.
+    let drained = vec![
+        entry(
+            "periodic_000",
+            100,
+            vec![t(100, 1000, None), t(200, 1000, Some(0))],
+        ),
+        entry(
+            "periodic_001",
+            200,
+            vec![t(100, 1000, Some(5_000_000)), t(200, 3000, Some(0))],
+        ),
+    ];
+    let samples = SampleSeries::from_drained_typed(drained, None);
+    let phases = crate::assert::build_phase_buckets(&samples);
+    let step0 = phases
+        .iter()
+        .find(|p| p.step_index == 1)
+        .expect("Step[0] bucket present");
+    assert_eq!(
+        step0.metrics.get("system_time_ns").copied(),
+        Some(2000.0),
+        "only tgid200 (readable at both) contributes (3000-1000=2000); \
+         tgid100's unreadable-signal first endpoint excludes it — the 5e6 \
+         accumulator must NOT leak as a phantom positive",
+    );
+}
+
+/// A numeric tgid reused within the phase (process exit + PID realloc to a
+/// fresh group starting near zero) reads a LOWER thread_group_cputime at
+/// the last sample than the first; `saturating_sub` clamps the per-group
+/// delta to 0 rather than wrapping u128 to a phantom huge value. The group
+/// still qualifies (two readable samples), so the result is a real
+/// `Some(0.0)`, not absent.
+#[test]
+fn build_phase_buckets_cpu_time_clamps_counter_decrease() {
+    use crate::monitor::task_enrichment::TaskEnrichment;
+    fn entry(tag: &str, elapsed_ms: u64, stime: u64) -> DrainedSnapshotEntry {
+        DrainedSnapshotEntry {
+            tag: tag.to_string(),
+            report: FailureDumpReport {
+                schema: SCHEMA_SINGLE.to_string(),
+                task_enrichments: vec![TaskEnrichment {
+                    pid: 100,
+                    tgid: 100,
+                    stime,
+                    signal_stime: Some(0),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            stats: Err(MissingStatsReason::NoSchedulerBinary),
+            elapsed_ms: Some(elapsed_ms),
+            boundary_offset_ms: None,
+            step_index: Some(1),
+        }
+    }
+    // stime decreases 5000 -> 1000 across the phase (tgid reuse).
+    let drained = vec![
+        entry("periodic_000", 100, 5000),
+        entry("periodic_001", 200, 1000),
+    ];
+    let samples = SampleSeries::from_drained_typed(drained, None);
+    let phases = crate::assert::build_phase_buckets(&samples);
+    let step0 = phases
+        .iter()
+        .find(|p| p.step_index == 1)
+        .expect("Step[0] bucket present");
+    assert_eq!(
+        step0.metrics.get("system_time_ns").copied(),
+        Some(0.0),
+        "a last < first read clamps to 0 (qualifying group, counters did \
+         not advance) — a real Some(0.0), never a wrapped huge value",
+    );
+}
+
+/// Two readable samples whose tgid sets are DISJOINT (every group appears
+/// in exactly one sample) yield no group with two readable boundaries, so
+/// the key is ABSENT (unmeasurable) — distinct from a real `Some(0.0)`.
+#[test]
+fn build_phase_buckets_cpu_time_disjoint_groups_yield_absent_not_zero() {
+    use crate::monitor::task_enrichment::TaskEnrichment;
+    fn entry(tag: &str, elapsed_ms: u64, tgid: i32) -> DrainedSnapshotEntry {
+        DrainedSnapshotEntry {
+            tag: tag.to_string(),
+            report: FailureDumpReport {
+                schema: SCHEMA_SINGLE.to_string(),
+                task_enrichments: vec![TaskEnrichment {
+                    pid: tgid,
+                    tgid,
+                    stime: 1000,
+                    signal_stime: Some(0),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            stats: Err(MissingStatsReason::NoSchedulerBinary),
+            elapsed_ms: Some(elapsed_ms),
+            boundary_offset_ms: None,
+            step_index: Some(1),
+        }
+    }
+    // sample A: only tgid=100; sample B: only tgid=200 (disjoint sets).
+    let drained = vec![
+        entry("periodic_000", 100, 100),
+        entry("periodic_001", 200, 200),
+    ];
+    let samples = SampleSeries::from_drained_typed(drained, None);
+    let phases = crate::assert::build_phase_buckets(&samples);
+    let step0 = phases
+        .iter()
+        .find(|p| p.step_index == 1)
+        .expect("Step[0] bucket present");
+    assert!(
+        !step0.metrics.contains_key("system_time_ns"),
+        "disjoint groups -> no group spans two readable samples -> absent, \
+         not a sentinel Some(0.0)",
+    );
+}
+
 /// `ScenarioStats::phase` lookup against the phases built by
 /// `build_phase_buckets` returns the bucket whose step_index
 /// matches, not by vec position. Confirms the integration
