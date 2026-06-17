@@ -2199,29 +2199,12 @@ pub fn build_phase_buckets_with_stimulus(
         samples.monitor().map(|m| m.samples()).unwrap_or(&[]);
     // Re-group periodic captures by the guest step whose stimulus
     // window contains each capture's workload-relative boundary offset,
-    // NOT the step_index stamped at (deferred) fire time. Under the
-    // dump-prerequisite gate the periodic boundaries can all fire in a
-    // burst once the accessor adopts, so every capture stamps the same
-    // late CURRENT_STEP and the naive grouping collapses to one phase;
-    // the scheduled offset is the timing-independent truth. Captures
-    // with no offset (on-demand / fixture) keep their stamped
-    // step_index via the fallback. step_starts is the step-start
-    // timeline in scenario-relative (guest monotonic) ms — the same
-    // frame as boundary_offset_ms.
-    let mut step_starts: Vec<(u64, u16)> = stimulus_events
-        .iter()
-        .filter_map(|e| e.step_index.map(|k| (e.elapsed_ms, k)))
-        .collect();
-    step_starts.sort_by_key(|(ms, _)| *ms);
-    let mut by_phase: std::collections::BTreeMap<u16, Vec<crate::scenario::sample::Sample<'_>>> =
-        std::collections::BTreeMap::new();
-    for sample in samples.iter_samples() {
-        let key = match sample.boundary_offset_ms {
-            Some(offset) => remap_offset_to_step(offset, &step_starts),
-            None => sample.step_index.unwrap_or(0),
-        };
-        by_phase.entry(key).or_default().push(sample);
-    }
+    // NOT the step_index stamped at (deferred) fire time — see
+    // [`crate::scenario::sample::SampleSeries::by_stimulus_phase`] for
+    // why the scheduled offset is the timing-independent truth (it
+    // survives the deferred-fire burst that collapses the stamped
+    // step_index to one phase).
+    let by_phase = samples.by_stimulus_phase(stimulus_events);
     // Bucket windows are workload-relative (boundary-offset) here, so the
     // monitor samples (run-relative) are shifted by the stimulus/monitor
     // clock skew before windowing.
@@ -2307,8 +2290,8 @@ pub fn build_phase_buckets_with_stimulus(
 
 /// Build per-phase metric buckets from a sample series.
 ///
-/// Walks [`crate::scenario::sample::SampleSeries::by_phase`] to
-/// group every stamped sample under its bridge-stamped
+/// Walks [`crate::scenario::sample::SampleSeries::by_stamped_phase`]
+/// to group every stamped sample under its bridge-stamped
 /// `step_index` (NOT re-derived from elapsed-ms windows; the
 /// bridge stamp is authoritative because the capture path knows
 /// the phase it fired from while the time window cannot recover
@@ -2347,14 +2330,14 @@ pub fn build_phase_buckets(samples: &crate::scenario::sample::SampleSeries) -> V
         samples.monitor().map(|m| m.samples()).unwrap_or(&[]);
     // Group by the bridge-stamped step_index. Without a stimulus
     // timeline to remap against, the stamped index is the only phase
-    // signal available — see `build_phase_buckets_with_stimulus` for
-    // the offset-remap that corrects a deferred-fire burst (every
-    // capture stamping the same late CURRENT_STEP). The bucket window
-    // and the monitor folding share the run-relative frame here, so
-    // the clock offset is `0`; synthetic / legacy fixture samples carry
-    // `boundary_offset_ms = None` and the window falls back to
-    // `elapsed_ms`.
-    buckets_from_grouped(samples.by_phase(), monitor_samples, 0)
+    // signal available — see `build_phase_buckets_with_stimulus` (and
+    // `SampleSeries::by_stimulus_phase`) for the offset-remap that
+    // corrects a deferred-fire burst (every capture stamping the same
+    // late CURRENT_STEP). The bucket window and the monitor folding
+    // share the run-relative frame here, so the clock offset is `0`;
+    // synthetic / legacy fixture samples carry `boundary_offset_ms =
+    // None` and the window falls back to `elapsed_ms`.
+    buckets_from_grouped(samples.by_stamped_phase(), monitor_samples, 0)
 }
 
 /// Assemble [`PhaseBucket`]s from a pre-grouped phase map. Shared by
@@ -2500,28 +2483,6 @@ fn buckets_from_grouped(
     out
 }
 
-/// Map a capture's workload-relative boundary offset (ms since scenario
-/// start) to the guest step active at that instant: the `step_index` of
-/// the latest stimulus step-start at or before the offset, or `0`
-/// (BASELINE) when the offset precedes the first step-start.
-/// `step_starts` must be sorted ascending by elapsed_ms.
-///
-/// This is the timing-independent attribution at the heart of the
-/// deferred-fire fix: the scheduled boundary offset is computed from the
-/// boundary schedule (not the fire time), so it survives a burst of
-/// captures that all fire — and would all stamp the same late
-/// CURRENT_STEP — after the dump-prerequisite gate clears.
-fn remap_offset_to_step(offset_ms: u64, step_starts: &[(u64, u16)]) -> u16 {
-    let mut step = 0u16;
-    for (start_ms, k) in step_starts {
-        if *start_ms <= offset_ms {
-            step = *k;
-        } else {
-            break;
-        }
-    }
-    step
-}
 
 /// Clock skew (ms) between the host monitor's run-relative timeline and
 /// the guest's scenario-relative stimulus timeline, computed the same

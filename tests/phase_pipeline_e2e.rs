@@ -4,7 +4,7 @@
 //! `Arc<AtomicU16>` (published by the Step loop on every Step
 //! transition) through the host-side capture path (bridge stamps
 //! every periodic capture with the live step_index, sample
-//! conversion preserves it, `SampleSeries::by_phase` partitions
+//! conversion preserves it, `SampleSeries::by_stimulus_phase` partitions
 //! by it) into [`crate::assert::build_phase_buckets`] which folds
 //! per-phase samples into the rendered [`crate::assert::PhaseBucket`]
 //! vec the operator sees on `result.stats.phases`. The unit tests
@@ -23,7 +23,7 @@
 //! the integration sentinel that catches gaps BETWEEN those
 //! stages: a CURRENT_STEP atomic that's published but never read,
 //! a bridge that stamps every capture as `step_index = 0`
-//! regardless of guest state, a `SampleSeries::by_phase`
+//! regardless of guest state, a `SampleSeries::by_stimulus_phase`
 //! BTreeMap that silently drops samples whose step_index doesn't
 //! match the bridge's expected encoding. The unit tests pass
 //! because each stage is correct in isolation; the e2e test
@@ -125,7 +125,7 @@ fn assert_phase_pipeline(result: &VmResult) -> Result<()> {
     // double-equality form catches BOTH the silent-drop class
     // (sum < drained_len) AND the double-count class (sum >
     // drained_len) — `sum > 0` alone would let a regression
-    // that visits each sample twice through by_phase silently
+    // that visits each sample twice through by_stimulus_phase silently
     // produce 2× the sample_count.
     let drained_len = drained.len();
     let series = SampleSeries::from_drained_typed(drained, result.monitor.clone());
@@ -178,16 +178,16 @@ fn assert_phase_pipeline(result: &VmResult) -> Result<()> {
     // entry count. The double-equality form catches BOTH the
     // silent-drop class (sum < drained_len) AND the
     // double-count class (sum > drained_len). A bare sum > 0
-    // would let a by_phase regression that visits each sample
+    // would let a by_stimulus_phase regression that visits each sample
     // twice silently produce 2× the sample_count and still pass.
     let total_samples: usize = phases.iter().map(|p| p.sample_count).sum();
     anyhow::ensure!(
         total_samples == drained_len,
         "phases vec sum(sample_count) = {} but {} entries were \
          drained from the bridge. Mismatch: \
-         - sum < drained: SampleSeries::by_phase / aggregator \
+         - sum < drained: SampleSeries::by_stimulus_phase / aggregator \
            dropped samples (silent-data-loss class). \
-         - sum > drained: by_phase counted samples in multiple \
+         - sum > drained: by_stimulus_phase counted samples in multiple \
            buckets (double-count class). phases = {:?}",
         total_samples,
         drained_len,
@@ -348,7 +348,7 @@ fn phase_pipeline_no_periodic_samples_yields_empty_phases(ctx: &Ctx) -> Result<A
 /// within the 15 s duration + 6 captures fixture. All three
 /// Steps must produce at least one bucket; missing any bucket
 /// would indicate either a step_index advancement bug or a
-/// silent-drop in `by_phase`.
+/// silent-drop in `by_stimulus_phase`.
 fn assert_phase_pipeline_three_step(result: &VmResult) -> Result<()> {
     anyhow::ensure!(
         result.periodic_fired >= 3,
@@ -384,7 +384,7 @@ fn assert_phase_pipeline_three_step(result: &VmResult) -> Result<()> {
         "phases.len() = {} — expected 3 (Step[0..2] only) or 4 \
          (BASELINE + Step[0..2]). Any other count means the \
          step_index pipeline either lost a bucket (silent drop \
-         in by_phase) or double-counted a boundary. \
+         in by_stimulus_phase) or double-counted a boundary. \
          step_indices = {:?}",
         phases.len(),
         step_indices,
@@ -396,7 +396,7 @@ fn assert_phase_pipeline_three_step(result: &VmResult) -> Result<()> {
             step_indices.contains(&expected_step),
             "phases vec is missing step_index = {} (Step[{}]) — \
              step_indices = {:?}. The CURRENT_STEP atomic either \
-             skipped a value or the by_phase partition lost every \
+             skipped a value or the by_stimulus_phase partition lost every \
              sample for this Step.",
             expected_step,
             expected_step - 1,
@@ -404,12 +404,12 @@ fn assert_phase_pipeline_three_step(result: &VmResult) -> Result<()> {
         );
     }
     // Sum invariant (same as 2-Step variant) — catches silent
-    // drops + double-counts in the by_phase partition.
+    // drops + double-counts in the by_stimulus_phase partition.
     let total_samples: usize = phases.iter().map(|p| p.sample_count).sum();
     anyhow::ensure!(
         total_samples == drained_len,
         "phases vec sum(sample_count) = {} but {} entries drained \
-         (mismatch in by_phase). step_indices = {:?}",
+         (mismatch in by_stimulus_phase). step_indices = {:?}",
         total_samples,
         drained_len,
         step_indices,

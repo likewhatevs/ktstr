@@ -382,8 +382,8 @@ fn build_phase_buckets_three_phases_round_trip_with_correct_labels() {
     let phases = crate::assert::build_phase_buckets(&samples);
     assert_eq!(phases.len(), 3);
 
-    // Buckets returned in step_index order because SampleSeries::by_phase
-    // returns a BTreeMap keyed by step_index.
+    // Buckets returned in step_index order because
+    // SampleSeries::by_stamped_phase returns a BTreeMap keyed by step_index.
     assert_eq!(phases[0].step_index, 0);
     assert_eq!(phases[0].label, "BASELINE");
     assert_eq!(phases[0].sample_count, 2);
@@ -405,7 +405,7 @@ fn build_phase_buckets_three_phases_round_trip_with_correct_labels() {
 }
 
 /// Unstamped samples (DrainedSnapshotEntry.step_index = None)
-/// fall under key `0` per SampleSeries::by_phase's
+/// fall under key `0` per SampleSeries::by_stamped_phase's
 /// "no stamped index" fallback. The resulting bucket is
 /// labelled "BASELINE" because step_index = 0 is the BASELINE
 /// encoding regardless of whether the original stamp was Some(0)
@@ -1197,6 +1197,58 @@ fn build_phase_buckets_with_stimulus_remaps_by_boundary_offset_over_stamped_step
              step_index={} count={}",
             p.step_index, p.sample_count,
         );
+    }
+}
+
+/// The public SampleSeries grouping methods: by_stamped_phase
+/// COLLAPSES a deferred-fire burst (every capture stamped the same late
+/// step) into one phase, while by_stimulus_phase re-derives the correct
+/// per-phase grouping from each sample's timing-independent
+/// boundary_offset_ms. Pins both new public entry points and the
+/// difference that motivates by_stimulus_phase.
+#[test]
+fn by_stimulus_phase_separates_what_by_stamped_phase_collapses() {
+    use crate::scenario::sample::SampleSeries;
+    use crate::scenario::snapshot::{DrainedSnapshotEntry, MissingStatsReason};
+    use crate::timeline::StimulusEvent;
+    // All four captures stamp the SAME late step (the burst) but their
+    // SCHEDULED offsets fall in distinct step windows.
+    let mk = |tag: &str, offset_ms: u64| DrainedSnapshotEntry {
+        tag: tag.to_string(),
+        report: fixture_report(),
+        stats: Err(MissingStatsReason::NoSchedulerBinary),
+        elapsed_ms: Some(9_000),
+        boundary_offset_ms: Some(offset_ms),
+        step_index: Some(3),
+    };
+    let drained = vec![
+        mk("p0", 500),   // before step 1 start (1000) -> BASELINE (0)
+        mk("p1", 1_500), // step 1 window
+        mk("p2", 2_500), // step 2 window
+        mk("p3", 3_500), // step 3 window
+    ];
+    let samples = SampleSeries::from_drained_typed(drained, None);
+    let stim = |elapsed_ms: u64, k: u16| StimulusEvent {
+        elapsed_ms,
+        label: format!("StepStart[{k}]"),
+        op_kind: None,
+        detail: None,
+        total_iterations: None,
+        step_index: Some(k),
+        is_terminal: false,
+    };
+    let stimulus = vec![stim(1000, 1), stim(2000, 2), stim(3000, 3)];
+
+    // by_stamped_phase: all four collapse into the single stamped key 3.
+    let stamped = samples.by_stamped_phase();
+    assert_eq!(stamped.keys().copied().collect::<Vec<_>>(), vec![3]);
+    assert_eq!(stamped[&3].len(), 4, "stamped grouping collapses the burst");
+
+    // by_stimulus_phase: re-derived from boundary_offset -> 4 phases.
+    let by_stim = samples.by_stimulus_phase(&stimulus);
+    assert_eq!(by_stim.keys().copied().collect::<Vec<_>>(), vec![0, 1, 2, 3]);
+    for k in [0u16, 1, 2, 3] {
+        assert_eq!(by_stim[&k].len(), 1, "phase {k} should hold exactly one sample");
     }
 }
 

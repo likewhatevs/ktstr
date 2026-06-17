@@ -124,8 +124,9 @@ pub struct Sample<'a> {
     /// production captures via the periodic-fire path and the
     /// on-demand `Op::CaptureSnapshot` / `Op::WatchSnapshot` apply
     /// arms always carry `Some(idx)`. Read by
-    /// [`SampleSeries::by_phase`] to bucket samples per scenario
-    /// phase for the phase-aware aggregator.
+    /// [`SampleSeries::by_stamped_phase`] (and as the offset-less
+    /// fallback in [`SampleSeries::by_stimulus_phase`]) to bucket
+    /// samples per scenario phase for the phase-aware aggregator.
     pub step_index: Option<u16>,
     /// Workload-relative boundary offset (ms) this periodic capture
     /// was scheduled for (`boundary_ns - scenario_anchor_ns`), or
@@ -258,9 +259,9 @@ impl SampleSeries {
                 // Fixture/tuple path carries no scheduled boundary offset.
                 boundary_offset_ms: None,
                 // Unstamped fixture path: samples surface with
-                // `step_index = None` and fall under the by_phase
-                // fallback bucket. Production callers thread the
-                // bridge-stamped index via from_drained_typed.
+                // `step_index = None` and fall under the
+                // by_stamped_phase fallback bucket. Production callers
+                // thread the bridge-stamped index via from_drained_typed.
                 step_index: None,
             })
             .collect();
@@ -370,9 +371,9 @@ impl SampleSeries {
         })
     }
 
-    /// Group samples by their stamped scenario phase. The returned
-    /// map is keyed by `step_index` (1-indexed phase encoding —
-    /// `0` is BASELINE, `1..=N` align with scenario Step ordinals);
+    /// Group samples by the RAW bridge-stamped scenario phase. The
+    /// returned map is keyed by `step_index` (1-indexed phase encoding
+    /// — `0` is BASELINE, `1..=N` align with scenario Step ordinals);
     /// each entry is the ordered run of samples that fell in that
     /// phase, preserving the iteration order produced by
     /// [`Self::iter_samples`].
@@ -389,10 +390,18 @@ impl SampleSeries {
     /// perspective; production callers that need to distinguish
     /// can inspect `Sample::step_index` directly.
     ///
+    /// CAVEAT — prefer [`Self::by_stimulus_phase`] when a stimulus
+    /// timeline is available: the bridge stamp is the step active at
+    /// (deferred) FIRE time, so under the dump-prerequisite gate a
+    /// burst of captures can all stamp the same late `CURRENT_STEP`
+    /// and collapse every sample into one phase. `by_stimulus_phase`
+    /// re-derives the phase from each sample's timing-independent
+    /// `boundary_offset_ms`, which is immune to the burst.
+    ///
     /// The phase-aware aggregator consumes this map to compute
     /// per-phase metric reductions (Counter `last - first` delta,
     /// Gauge / Peak / Timestamp via `crate::stats::aggregate_samples`).
-    pub fn by_phase(&self) -> std::collections::BTreeMap<u16, Vec<Sample<'_>>> {
+    pub fn by_stamped_phase(&self) -> std::collections::BTreeMap<u16, Vec<Sample<'_>>> {
         let mut by_phase: std::collections::BTreeMap<u16, Vec<Sample<'_>>> =
             std::collections::BTreeMap::new();
         for sample in self.iter_samples() {
@@ -401,6 +410,75 @@ impl SampleSeries {
         }
         by_phase
     }
+
+    /// Group samples by the guest step whose stimulus window contains
+    /// each sample's workload-relative `boundary_offset_ms`, rather
+    /// than the raw bridge-stamped `step_index`
+    /// ([`Self::by_stamped_phase`]). The returned map uses the same
+    /// 1-indexed phase key (`0` = BASELINE, `1..=N` = Step ordinals)
+    /// and preserves [`Self::iter_samples`] order within each bucket.
+    ///
+    /// This is the correct grouping whenever a stimulus timeline is
+    /// available: `boundary_offset_ms` is derived from the scheduled
+    /// boundary, NOT the (deferred) fire time, so it survives the
+    /// dump-prerequisite-gate burst that makes every periodic capture
+    /// stamp the same late `CURRENT_STEP` (the `phases.len() == 1`
+    /// collapse `by_stamped_phase` is subject to). Samples with no
+    /// `boundary_offset_ms` (on-demand / fixture captures) fall back
+    /// to their stamped `step_index`.
+    ///
+    /// Unlike the folded scalar [`crate::assert::PhaseBucket`]s that
+    /// [`crate::assert::build_phase_buckets_with_stimulus`] returns,
+    /// this keeps the per-sample [`Sample`] views (full Snapshot / dsq
+    /// access) per phase. `build_phase_buckets_with_stimulus` itself
+    /// is built on this method.
+    pub fn by_stimulus_phase(
+        &self,
+        stimulus_events: &[crate::timeline::StimulusEvent],
+    ) -> std::collections::BTreeMap<u16, Vec<Sample<'_>>> {
+        // Step-start timeline in scenario-relative (guest monotonic) ms
+        // — the same frame as `boundary_offset_ms`. Only events with a
+        // step stamp anchor a step window; the terminal scenario-end
+        // event (step_index None) is excluded.
+        let mut step_starts: Vec<(u64, u16)> = stimulus_events
+            .iter()
+            .filter_map(|e| e.step_index.map(|k| (e.elapsed_ms, k)))
+            .collect();
+        step_starts.sort_by_key(|(ms, _)| *ms);
+        let mut by_phase: std::collections::BTreeMap<u16, Vec<Sample<'_>>> =
+            std::collections::BTreeMap::new();
+        for sample in self.iter_samples() {
+            let key = match sample.boundary_offset_ms {
+                Some(offset) => remap_offset_to_step(offset, &step_starts),
+                None => sample.step_index.unwrap_or(0),
+            };
+            by_phase.entry(key).or_default().push(sample);
+        }
+        by_phase
+    }
+}
+
+/// Map a capture's workload-relative boundary offset (ms since scenario
+/// start) to the guest step active at that instant: the `step_index` of
+/// the latest stimulus step-start at or before the offset, or `0`
+/// (BASELINE) when the offset precedes the first step-start.
+/// `step_starts` must be sorted ascending by elapsed_ms.
+///
+/// This is the timing-independent attribution at the heart of the
+/// deferred-fire fix: the scheduled boundary offset is computed from the
+/// boundary schedule (not the fire time), so it survives a burst of
+/// captures that all fire — and would all stamp the same late
+/// CURRENT_STEP — after the dump-prerequisite gate clears.
+fn remap_offset_to_step(offset_ms: u64, step_starts: &[(u64, u16)]) -> u16 {
+    let mut step = 0u16;
+    for (start_ms, k) in step_starts {
+        if *start_ms <= offset_ms {
+            step = *k;
+        } else {
+            break;
+        }
+    }
+    step
 }
 
 #[cfg(test)]

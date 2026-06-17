@@ -806,7 +806,21 @@ pub mod prelude {
         PASSES_TRUNCATION_SENTINEL_COMPARATOR, PASSES_TRUNCATION_SENTINEL_NAME, PassDetail,
         PhaseBucket, PhaseMapExt, ScenarioStats, SchedulerBaseline, SeqClaim, SeriesField,
         SetClaim, Verdict, assert_baseline, assert_scx_events_clean,
+        build_phase_buckets_with_stimulus,
     };
+    // Per-phase-metric building blocks for `post_vm` callbacks doing
+    // custom per-phase assertions: `StimulusEvent` is the timeline event
+    // type `build_phase_buckets_with_stimulus` consumes, and
+    // `VmResult::stimulus_timeline()` returns a `Vec<StimulusEvent>`
+    // (step frames + scenario-end terminal) ready to fold through it.
+    // The non-stimulus sibling `assert::build_phase_buckets` is
+    // INTENTIONALLY not preluded: it groups by the raw bridge-stamped
+    // step_index, which can collapse under a deferred-fire burst (see
+    // `SampleSeries::by_stamped_phase`); the stimulus-aware variant above
+    // is the collapse-immune common path, so the prelude surfaces only
+    // it. The plain variant remains reachable by full path for the rare
+    // no-stimulus-timeline case.
+    pub use crate::timeline::StimulusEvent;
     pub use crate::cgroup::CgroupManager;
     pub use crate::claim;
     pub use crate::declare_scheduler;
