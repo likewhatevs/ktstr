@@ -250,26 +250,27 @@ The bare `assert_cgroup` passes `None` for `numa_nodes`, which skips
 `page_locality` and `cross_node_migration` checks. Tests that drive
 NUMA assertions must use the `_with_numa` variant.
 
-## Preset baselines: `SchedulerBaseline`
+## Preset thresholds: `AbsoluteThresholds`
 
-`SchedulerBaseline` is a flat threshold preset designed for direct
-invocation in test bodies, distinct from the merge-tree threshold
-config carried by `Assert`. Use when a test wants a one-call
-multi-field check without engaging the `default_checks → scheduler →
-test` merge chain.
+`AbsoluteThresholds` is a flat absolute-threshold preset designed for
+direct invocation in test bodies, distinct from the merge-tree
+threshold config carried by `Assert`. (It is NOT an A/B comparison
+against a reference scheduler — every check is an absolute per-run
+bound.) Use when a test wants a one-call multi-field check without
+engaging the `default_checks → scheduler → test` merge chain.
 
 ```rust,ignore
-use ktstr::assert::{SchedulerBaseline, assert_baseline};
+use ktstr::assert::{AbsoluteThresholds, assert_thresholds};
 
 // Sane-default preset: p99 wake under 10ms, p99 iteration cost
 // under 1ms, total migrations under 1000, each worker >= 1 work unit.
-let r = assert_baseline(&reports, &SchedulerBaseline::strict());
+let r = assert_thresholds(&reports, &AbsoluteThresholds::strict());
 
 // Or build piecewise with explicit thresholds.
-let baseline = SchedulerBaseline::default()
+let thresholds = AbsoluteThresholds::default()
     .max_p99_wake_latency_ns(5_000_000)
     .min_work_units(100);
-let r = assert_baseline(&reports, &baseline);
+let r = assert_thresholds(&reports, &thresholds);
 ```
 
 Each field is independent — `None` skips that check. The four fields:
@@ -288,12 +289,12 @@ Each field is independent — `None` skips that check. The four fields:
   Distinct from `assert_not_starved`'s zero-floor — accepts a
   non-zero threshold so tests can reject "barely made progress" runs.
 
-`assert_baseline` returns a skip when `reports` is empty (a baseline
+`assert_thresholds` returns a skip when `reports` is empty (thresholds
 against zero samples would silently green-light a broken run that
 produced no signal).
 
 The preset composes with the merge-chain path: a test can run
-`assert_baseline` against a worker-report slice AND merge the
+`assert_thresholds` against a worker-report slice AND merge the
 `Assert`-derived result into the same accumulator via
 `AssertResult::merge`.
 
@@ -393,7 +394,7 @@ the same set minus `subset_of` / `disjoint_from`.
 `stats` / `measurements`. The terminal verdict is the fold of the
 `outcomes: Vec<Outcome>` slot per the four-state lattice (see the
 "Verdict outcomes" section below). Compose via `AssertResult::merge`
-to combine claim outcomes with `assert_cgroup` / `assert_baseline` /
+to combine claim outcomes with `assert_cgroup` / `assert_thresholds` /
 `assert_scx_events_clean` results in the same scenario.
 
 ## Verdict outcomes

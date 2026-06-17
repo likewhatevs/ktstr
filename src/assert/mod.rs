@@ -5421,32 +5421,32 @@ pub fn assert_scx_events_clean(events: &[(&str, i64)], max_count: Option<i64>) -
     r
 }
 
-/// Threshold-preset bundle for [`assert_baseline`]. Captures the
+/// Threshold-preset bundle for [`assert_thresholds`]. Captures the
 /// guarantees a scheduler-under-test should meet on a healthy run:
 /// wake latency stays within bound, per-iteration compute cost stays
 /// within bound, CPU migrations stay within bound, and every worker
 /// makes some forward progress.
 ///
 /// Each `Option` field is independent — `None` skips that check. A
-/// `SchedulerBaseline` with every field `None` is a no-op (the
+/// `AbsoluteThresholds` with every field `None` is a no-op (the
 /// returned [`AssertResult`] always passes), useful as a starting
 /// point for builder-style composition. Construct the all-`None`
-/// baseline via `SchedulerBaseline::default()` and chain the
-/// `max_*` / `min_*` setters (e.g. `SchedulerBaseline::default().max_migrations(5)`)
-/// or spread into a struct literal (`SchedulerBaseline { max_migrations: Some(5), ..Default::default() }`).
+/// thresholds via `AbsoluteThresholds::default()` and chain the
+/// `max_*` / `min_*` setters (e.g. `AbsoluteThresholds::default().max_migrations(5)`)
+/// or spread into a struct literal (`AbsoluteThresholds { max_migrations: Some(5), ..Default::default() }`).
 /// Use [`Self::strict`] for the "every check enabled with sane defaults" preset.
 ///
 /// Distinct from [`Assert`]: `Assert` is the merge-tree threshold
-/// config consumed by the worker-side `AssertPlan`; `SchedulerBaseline`
+/// config consumed by the worker-side `AssertPlan`; `AbsoluteThresholds`
 /// is a flat preset designed for direct invocation in test bodies
 /// where the test author wants a one-call multi-field check without
 /// engaging the merge chain. The two surfaces compose — a test can
-/// run `assert_baseline` against a worker-report slice AND merge the
+/// run `assert_thresholds` against a worker-report slice AND merge the
 /// `Assert`-derived result into the same accumulator via
 /// [`AssertResult::merge`].
-#[must_use = "SchedulerBaseline only takes effect when passed to assert_baseline"]
+#[must_use = "AbsoluteThresholds only takes effect when passed to assert_thresholds"]
 #[derive(Debug, Clone, Copy, Default)]
-pub struct SchedulerBaseline {
+pub struct AbsoluteThresholds {
     /// Maximum acceptable p99 wake latency (nanoseconds). Compared
     /// against the pooled p99 across every worker's
     /// [`WorkerReport::wake_latencies_ns`]. `None` skips the check.
@@ -5478,12 +5478,13 @@ pub struct SchedulerBaseline {
     pub min_work_units: Option<u64>,
 }
 
-impl SchedulerBaseline {
+impl AbsoluteThresholds {
     /// Sane-default preset: p99 wake latency under 10ms, p99
     /// iteration cost under 1ms, total migrations under 1000, every
     /// worker completes ≥1 work unit. The defaults are deliberately
-    /// loose — a baseline tight enough to catch egregious regressions
-    /// without flagging every routine scheduler perturbation. Tests
+    /// loose — a threshold set tight enough to catch egregious
+    /// regressions without flagging every routine scheduler
+    /// perturbation. Tests
     /// that need tighter bounds should set the fields explicitly via
     /// the bare-verb builder methods rather than tuning these constants.
     pub const fn strict() -> Self {
@@ -5520,13 +5521,13 @@ impl SchedulerBaseline {
     }
 }
 
-/// Run every check in `baseline` against `reports`, merging results
-/// into a single [`AssertResult`]. A `None` field on the baseline
+/// Run every check in `thresholds` against `reports`, merging results
+/// into a single [`AssertResult`]. A `None` field on the thresholds
 /// skips that check.
 ///
 /// An empty `reports` slice short-circuits to a skip (`"no worker
-/// reports to evaluate"`) regardless of baseline content — silently
-/// passing a baseline against zero samples would let thresholds look
+/// reports to evaluate"`) regardless of thresholds content — silently
+/// passing thresholds against zero samples would let them look
 /// "green" on a run that produced no measurement.
 ///
 /// Field-to-check mapping:
@@ -5545,7 +5546,7 @@ impl SchedulerBaseline {
 /// pooled `iteration_costs_ns` reservoir.
 ///
 /// ```
-/// # use ktstr::assert::{SchedulerBaseline, assert_baseline};
+/// # use ktstr::assert::{AbsoluteThresholds, assert_thresholds};
 /// # use ktstr::workload::WorkerReport;
 /// # let report = WorkerReport {
 /// #     tid: 1, cpus_used: [0].into_iter().collect(),
@@ -5568,17 +5569,17 @@ impl SchedulerBaseline {
 /// #     group_idx: 0,
 /// # };
 /// // Strict preset on a healthy run — passes.
-/// let r = assert_baseline(&[report], &SchedulerBaseline::strict());
+/// let r = assert_thresholds(&[report], &AbsoluteThresholds::strict());
 /// assert!(r.is_pass());
 /// ```
-pub fn assert_baseline(reports: &[WorkerReport], baseline: &SchedulerBaseline) -> AssertResult {
+pub fn assert_thresholds(reports: &[WorkerReport], thresholds: &AbsoluteThresholds) -> AssertResult {
     // Empty `reports` means nothing was measured. Returning a fresh
     // `pass()` here would silently green-light a broken run that
     // produced no signal; delegating to `assert_benchmarks` and
     // merging its skip would lose the skip flag (`AssertResult::merge`
     // ANDs `skipped`, so `pass.merge(skip) == passed-not-skipped`).
-    // Surface the skip directly so the operator sees the baseline
-    // wasn't actually exercised.
+    // Surface the skip directly so the operator sees the thresholds
+    // weren't actually exercised.
     if reports.is_empty() {
         return AssertResult::skip("no worker reports to evaluate");
     }
@@ -5588,11 +5589,11 @@ pub fn assert_baseline(reports: &[WorkerReport], baseline: &SchedulerBaseline) -
     // Wake-latency p99: reuse the existing `assert_benchmarks` path
     // so the percentile algorithm stays unified. With `reports`
     // non-empty here, `assert_benchmarks` cannot return a skip —
-    // the merge sees only pass/fail, preserving baseline semantics.
-    if baseline.max_p99_wake_latency_ns.is_some() {
+    // the merge sees only pass/fail, preserving thresholds semantics.
+    if thresholds.max_p99_wake_latency_ns.is_some() {
         r.merge(assert_benchmarks(
             reports,
-            baseline.max_p99_wake_latency_ns,
+            thresholds.max_p99_wake_latency_ns,
             None,
             None,
         ));
@@ -5602,7 +5603,7 @@ pub fn assert_baseline(reports: &[WorkerReport], baseline: &SchedulerBaseline) -
     // Skipped when no samples are present — compute work types that
     // populate `iteration_costs_ns` are sparse, so an empty pooled
     // set is the common case for blocking variants and not a failure.
-    if let Some(cost_limit) = baseline.max_iteration_cost_p99_ns {
+    if let Some(cost_limit) = thresholds.max_iteration_cost_p99_ns {
         let all_costs: Vec<u64> = reports
             .iter()
             .flat_map(|w| w.iteration_costs_ns.iter().copied())
@@ -5625,7 +5626,7 @@ pub fn assert_baseline(reports: &[WorkerReport], baseline: &SchedulerBaseline) -
 
     // Total migrations across all workers: absolute-count gate
     // (distinct from migration_ratio which is a per-iteration rate).
-    if let Some(max_mig) = baseline.max_migrations {
+    if let Some(max_mig) = thresholds.max_migrations {
         let total_mig: u64 = reports.iter().map(|w| w.migration_count).sum();
         if total_mig > max_mig {
             r.record_fail(AssertDetail::new(
@@ -5640,7 +5641,7 @@ pub fn assert_baseline(reports: &[WorkerReport], baseline: &SchedulerBaseline) -
 
     // Per-worker work_units floor: every worker must have completed
     // at least `min` work units. One starved worker fails the check.
-    if let Some(min_units) = baseline.min_work_units {
+    if let Some(min_units) = thresholds.min_work_units {
         for w in reports {
             if w.work_units < min_units {
                 r.record_fail(AssertDetail::new(

@@ -801,11 +801,11 @@ pub mod prelude {
     // scheduler-definition record test authors build via the
     // `declare_scheduler!` macro.
     pub use crate::assert::{
-        Assert, AssertDetail, AssertResult, COMPARATOR_VOCABULARY, ClaimBuilder, DetailKind,
-        EachClaim, FracPair, InfoNote, MAX_RECORDED_PASSES, NoteValue, Outcome, OutcomeRef,
-        PASSES_TRUNCATION_SENTINEL_COMPARATOR, PASSES_TRUNCATION_SENTINEL_NAME, PassDetail,
-        PhaseBucket, PhaseMapExt, ScenarioStats, SchedulerBaseline, SeqClaim, SeriesField,
-        SetClaim, Verdict, assert_baseline, assert_scx_events_clean,
+        AbsoluteThresholds, Assert, AssertDetail, AssertResult, COMPARATOR_VOCABULARY,
+        ClaimBuilder, DetailKind, EachClaim, FracPair, InfoNote, MAX_RECORDED_PASSES, NoteValue,
+        Outcome, OutcomeRef, PASSES_TRUNCATION_SENTINEL_COMPARATOR,
+        PASSES_TRUNCATION_SENTINEL_NAME, PassDetail, PhaseBucket, PhaseMapExt, ScenarioStats,
+        SeqClaim, SeriesField, SetClaim, Verdict, assert_scx_events_clean, assert_thresholds,
         build_phase_buckets_with_stimulus,
     };
     // Per-phase-metric building blocks for `post_vm` callbacks doing
