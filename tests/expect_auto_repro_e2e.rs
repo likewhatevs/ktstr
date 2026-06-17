@@ -11,12 +11,12 @@
 //! load-bearing sites:
 //!
 //! 1. `apply_expect_auto_repro_inversion` did NOT set
-//!    `VmResult.expect_auto_repro_satisfied = true` (eval.rs).
+//!    `VmResult.expect_auto_repro_satisfied = true` (eval/mod.rs).
 //!    Likely cause: artifact missing (auto-repro VM crashed),
 //!    artifact truncated (mid-write), or path-resolve bail
 //!    (entry_name=None on the VmResult).
 //! 2. The eval layer did NOT wrap the failure `Err` with the
-//!    `ExpectAutoReproSatisfied` marker (eval.rs:
+//!    `ExpectAutoReproSatisfied` marker (eval/mod.rs:
 //!    `run_ktstr_test_inner_impl`'s context-wrap after the helper).
 //! 3. The `result_to_exit_code` dispatch arm did NOT downcast the
 //!    marker correctly (dispatch.rs — note: `anyhow::Error::downcast_ref::<C>()`
@@ -58,7 +58,7 @@
 //! `[ktstr-arm64]`). ktstr supplies the guest kernel itself via
 //! its kernel-build cache. The dispatch + helper logic is also
 //! exercised
-//! at unit-test granularity in `src/test_support/eval.rs::tests`
+//! at unit-test granularity in `src/test_support/eval/eval_tests_reporting.rs`
 //! (apply_expect_auto_repro_inversion) and
 //! `src/test_support/dispatch.rs::tests` (verdict matrix); this
 //! e2e is the integration-layer pin that catches a regression at
@@ -125,7 +125,7 @@ fn pos_expect_auto_repro_satisfied_on_forced_fail(ctx: &Ctx) -> Result<AssertRes
              broke), \
              (b) `apply_expect_auto_repro_inversion` failed to set \
              `VmResult.expect_auto_repro_satisfied = true` despite \
-             a valid artifact (eval.rs gate regression), or \
+             a valid artifact (eval/mod.rs gate regression), or \
              (c) the `result_to_exit_code` dispatch arm did not \
              downcast the `ExpectAutoReproSatisfied` marker \
              (dispatch.rs — switched from `chain().any(c.is)` to \

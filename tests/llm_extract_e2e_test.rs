@@ -24,7 +24,7 @@
 //! guest-side `evaluate()` skips every model code path for
 //! `OutputFormat::LlmExtract` payloads, ships the raw
 //! stdout/stderr across the SHM ring, and the host's
-//! `eval.rs::host_side_llm_extract` runs `extract_via_llm`
+//! `crate::test_support::eval::host_side_llm_extract` runs `extract_via_llm`
 //! post-VM-exit. As a consequence, `ctx.payload(&SCHBENCH).run()`
 //! returns a `PayloadMetrics` with `metrics: vec![]` inside the
 //! guest test body — extraction is deferred. The body therefore
@@ -49,7 +49,7 @@
 //! benchmark, or schbench's non-negative microseconds vs a
 //! delta-emitting payload that legitimately reports negative deltas)
 //! and require a per-payload validation API that ktstr does not yet
-//! expose. See `eval.rs::validate_llm_extraction` for the host-side
+//! expose. See `crate::test_support::eval::validate_llm_extraction` for the host-side
 //! enforcement.
 //!
 //! **Stability disclaimer**: passing this test does NOT mean
@@ -93,7 +93,7 @@ use ktstr::scenario::Ctx;
 ///
 /// Test body shape: returns the `AssertResult` from
 /// `ctx.payload(&SCHBENCH).run()` directly. The metric-set sanity
-/// checks live host-side in `eval.rs::host_side_llm_extract` —
+/// checks live host-side in `crate::test_support::eval::host_side_llm_extract` —
 /// extraction is deferred until after VM exit because the model
 /// does not fit in guest RAM. See the module doc for the universal
 /// invariants the host applies.

@@ -457,7 +457,7 @@ pub enum Op {
     /// any hardware. Production in-VM scenarios run via the
     /// virtio-console port 1 `MSG_TYPE_SNAPSHOT_REQUEST` TLV frame
     /// and the host coordinator's `arm_user_watchpoint` path
-    /// (`src/vmm/freeze_coord.rs`); the thread-local bridge is
+    /// (`src/vmm/freeze_coord/mod.rs`); the thread-local bridge is
     /// never installed inside the guest.
     ///
     /// # Guard rails

@@ -469,8 +469,9 @@ impl Timeline {
     /// the header lines (`kernel:`, `topology:`, etc.) are omitted but
     /// the `--- timeline ---` prefix is preserved.
     // No parameterless format() sibling: output with default context
-    // is byte-identical, but the only non-test caller (eval.rs) always
-    // has real context, so format() would be dead code.
+    // is byte-identical, but the only non-test caller
+    // (crate::test_support::eval) always has real context, so format()
+    // would be dead code.
     pub fn format_with_context(&self, ctx: &TimelineContext) -> String {
         if self.phases.is_empty() {
             return String::new();

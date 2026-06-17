@@ -249,7 +249,7 @@ impl MetricKind {
 /// Timestamp without restating it. That fn is itself folded by
 /// [`crate::assert::build_phase_buckets`] whose live caller is
 /// the host-side `evaluate_vm_result` AssertResult-population
-/// site at `src/test_support/eval.rs`.
+/// site at `src/test_support/eval/mod.rs`.
 pub fn aggregate_samples(samples: &[f64], kind: MetricKind) -> Option<f64> {
     let finite: Vec<f64> = samples.iter().copied().filter(|x| x.is_finite()).collect();
     aggregate_finite(&finite, |_| 1, kind)
@@ -362,7 +362,7 @@ fn aggregate_finite(
 /// Live caller: [`crate::assert::build_phase_buckets`] folds
 /// per-phase sample slices through this entry point and the
 /// result lands on [`crate::assert::PhaseBucket::metrics`]; the
-/// host-side `evaluate_vm_result` at `src/test_support/eval.rs`
+/// host-side `evaluate_vm_result` at `src/test_support/eval/mod.rs`
 /// is the consumer that drives the call.
 pub fn aggregate_samples_for_phase(metric: &MetricDef, samples: &[f64]) -> Option<f64> {
     match metric.kind {
@@ -453,7 +453,7 @@ impl MetricDef {
     /// `read_sample` once per [`crate::stats::METRICS`] entry per
     /// sample to collect the per-sample readings the per-phase
     /// aggregator folds. The host-side `evaluate_vm_result` at
-    /// `src/test_support/eval.rs` drives the chain.
+    /// `src/test_support/eval/mod.rs` drives the chain.
     pub fn read_sample(&self, sample: &crate::scenario::sample::Sample<'_>) -> Option<f64> {
         // Per-metric dispatch by registry name. Only the metrics
         // whose value is genuinely a per-sample reading are wired;

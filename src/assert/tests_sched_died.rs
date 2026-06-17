@@ -5,7 +5,7 @@
 //! stderr can keep stable anchors, and the numeric formatting
 //! (step N of M, `{:.1}s`). The structural detection path —
 //! matching on `DetailKind::SchedulerDied` — is exercised in
-//! `eval.rs` tests directly; the message format is kept stable
+//! `crate::test_support::eval` tests directly; the message format is kept stable
 //! here purely as a human-readable contract.
 
 use super::*;

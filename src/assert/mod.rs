@@ -2316,7 +2316,7 @@ pub fn build_phase_buckets_with_stimulus(
 /// came back.
 ///
 /// Live production caller: `evaluate_vm_result` in
-/// `src/test_support/eval.rs` drains the snapshot bridge, builds
+/// `src/test_support/eval/mod.rs` drains the snapshot bridge, builds
 /// a `SampleSeries`, and routes it through this fn to populate
 /// `AssertResult.stats.phases`. Exposed `pub` (not `pub(crate)`)
 /// so out-of-tree consumers — payload authors writing custom

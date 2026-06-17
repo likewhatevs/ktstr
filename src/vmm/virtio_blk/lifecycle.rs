@@ -125,7 +125,7 @@ pub(crate) const DROP_JOIN_TIMEOUT: Duration = Duration::from_secs(1);
 /// SIGRTMIN target the freeze coordinator picks for a
 /// failure-dump rendezvous (30 s wall budget at the coordinator
 /// level — see `FREEZE_RENDEZVOUS_TIMEOUT` in
-/// `src/vmm/freeze_coord.rs`). An unbounded `handle.join()` here would
+/// `src/vmm/freeze_coord/mod.rs`). An unbounded `handle.join()` here would
 /// block the vCPU through the worker's wedged `pread`/`pwrite`
 /// (NFS stall, slow page cache, hung block device) and the freeze
 /// would either time out empty or arrive minutes late. Capping at

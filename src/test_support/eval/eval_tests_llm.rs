@@ -867,7 +867,7 @@ fn host_side_llm_extract_no_orphan_pm_when_all_pms_have_matching_raws() {
 ///    AND THEN ran extract_via_llm on empty stderr, doubling
 ///    the model-load attempt. The current contract:
 ///    `metrics.is_empty() && load_err.is_none() && !raw.stderr.is_empty()`
-///    in eval.rs:281 — empty stderr blocks the fallback.
+///    in `host_side_llm_extract` — empty stderr blocks the fallback.
 ///
 /// Holds [`lock_env`] across the env mutations and pairs an
 /// [`isolated_cache_dir`] with the offline-gate `EnvVarGuard`
@@ -995,7 +995,7 @@ fn host_side_llm_extract_under_offline_gate_surfaces_actionable_detail() {
 /// SKIPPED — the failure reason is identical across both calls
 /// and re-invoking inference would burn cycles to no purpose.
 /// Pins the `load_err.is_none()` clause in the fallback gate
-/// (eval.rs:281): `metrics.is_empty() && load_err.is_none() &&
+/// (`host_side_llm_extract`): `metrics.is_empty() && load_err.is_none() &&
 /// !raw.stderr.is_empty()`.
 ///
 /// Setup: empty stdout + non-empty stderr, under the offline

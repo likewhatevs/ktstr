@@ -48,7 +48,7 @@ pub fn is_topology_insufficient(e: &anyhow::Error) -> bool {
 ///
 /// Walks the FULL error chain via `e.chain().any(...)` so a
 /// `ResourceContention` wrapped in `.context(...)` (e.g. the
-/// `eval.rs` `"build ktstr_test VM"` and `"run ktstr_test VM"`
+/// `crate::test_support::eval` `"build ktstr_test VM"` and `"run ktstr_test VM"`
 /// wrappers) is still recognised — the macro's match arm depends on
 /// this.
 ///
@@ -995,7 +995,7 @@ pub const EXIT_INCONCLUSIVE: i32 = 2;
 /// `ResourceContention` detection walks the FULL error chain via
 /// [`is_resource_contention`] (chain-walk predicate) plus a
 /// matching `e.chain().find_map(...)` extraction for the reason
-/// string. The eval-side `eval.rs` `"build ktstr_test VM"` and
+/// string. The eval-side `crate::test_support::eval` `"build ktstr_test VM"` and
 /// `"run ktstr_test VM"` wrappers nest the contention error under
 /// `.context(...)`, so a top-level `downcast_ref` on the outer
 /// error misses the inner cause. Without the chain walk a wrapped
@@ -4112,7 +4112,7 @@ mod tests {
     // wrapped onto the failure Err by run_ktstr_test_inner_impl
     // when apply_expect_auto_repro_inversion signaled satisfaction.
     // The eval-side helper's gates are exercised separately at the
-    // eval.rs tests module; these pin the dispatch-arm match-order
+    // `crate::test_support::eval` tests module; these pin the dispatch-arm match-order
     // contract.
 
     /// Err with [`ExpectAutoReproSatisfied`] attached directly →
@@ -4202,7 +4202,7 @@ mod tests {
     // on whether the scx_bpf_error matcher mismatch marker is
     // attached. Until this batch, no test exercised the marker
     // detection path; the chain walk shape was untested at the
-    // dispatch layer and only protected by the eval.rs structural
+    // dispatch layer and only protected by the `crate::test_support::eval` structural
     // source-pin.
 
     /// `expect_err = true` + Err WITHOUT a matcher-mismatch marker

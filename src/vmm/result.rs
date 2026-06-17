@@ -396,7 +396,7 @@ pub struct VmResult {
     /// `#[ktstr_test(kaslr = false)]` or
     /// `Scheduler::kargs(&["nokaslr"])`, OR (b) the derivation
     /// chain (MSR_LSTAR readback in `vmm::x86_64::msr_kaslr` +
-    /// KERN_ADDRS `_text` path in `freeze_coord::dispatch.rs`) never
+    /// KERN_ADDRS `_text` path in `crate::vmm::freeze_coord::dispatch`) never
     /// published a non-zero value (early-boot crash, kallsyms masked
     /// by kptr_restrict, FRED-enabled kernel). E2E test consumers
     /// distinguish (a) from (b) by reading the test entry's `kaslr`
@@ -1013,7 +1013,7 @@ pub(crate) struct VmRunState {
     /// (a) KASLR was off (test ran with `#[ktstr_test(kaslr = false)]`
     /// or `Scheduler::kargs(&["nokaslr"])`), or (b) the derivation
     /// chain (MSR_LSTAR readback at `vmm::x86_64::msr_kaslr` +
-    /// KERN_ADDRS `_text` path at `freeze_coord::dispatch.rs`) never
+    /// KERN_ADDRS `_text` path at `crate::vmm::freeze_coord::dispatch`) never
     /// published a non-zero value (early-boot crash, kallsyms masked
     /// by kptr_restrict, FRED-enabled kernel). E2E test consumers
     /// distinguish (a) from (b) by asserting against the test entry's
@@ -1352,7 +1352,7 @@ mod tests {
         };
         let path = r.wprof_pb_path().expect("Some entry_name must Ok");
         // The path's file_name must exactly match `<entry_name>.wprof.pb`
-        // — the writer at eval.rs uses the same `format!("{}.wprof.pb",
+        // — the writer in `run_ktstr_test_inner_impl` uses the same `format!("{}.wprof.pb",
         // entry.name)` pattern. A divergence here would mean the
         // method derives a different path than the writer wrote to,
         // surfacing as ENOENT in the post_vm callback.

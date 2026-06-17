@@ -51,7 +51,7 @@ pub type CaptureCallback = Arc<dyn Fn(&str) -> Option<FailureDumpReport> + Send 
 /// `register_watch` is **not** installed; the in-guest
 /// `Op::WatchSnapshot` arm rings an SHM doorbell and the host's
 /// freeze coordinator runs `arm_user_watchpoint`
-/// (`src/vmm/freeze_coord.rs`), which resolves the symbol via a
+/// (`src/vmm/freeze_coord/mod.rs`), which resolves the symbol via a
 /// verbatim match against the vmlinux ELF symtab, allocates a
 /// free user watchpoint slot (3 user slots are available; slot 0
 /// is reserved for the existing `*scx_root->exit_kind` trigger),

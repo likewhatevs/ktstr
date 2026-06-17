@@ -362,7 +362,7 @@ fn bug_summary_line_immediately_follows_fingerprint_line_in_all_failure_messages
         assert_eq!(
             next.trim(),
             "bug_summary_line(),",
-            "failure-message format!() at eval.rs:{} passes `fingerprint_line,` \
+            "failure-message format!() at eval/mod.rs:{} passes `fingerprint_line,` \
                  but the next positional argument is `{}` (trimmed), not \
                  `bug_summary_line(),`. The BUG SUMMARY must render at the top \
                  of every failure message so it surfaces above the test-name / \
@@ -396,9 +396,9 @@ fn bug_summary_line_immediately_follows_fingerprint_line_in_all_failure_messages
         let stripped = strip_named_arg_prefix(trimmed);
         assert!(
             stripped.starts_with("\"{}{}"),
-            "failure-message format!() at eval.rs:{} passes `fingerprint_line,` \
+            "failure-message format!() at eval/mod.rs:{} passes `fingerprint_line,` \
                  then `bug_summary_line(),` as args 0+1, but the preceding format \
-                 string literal at eval.rs:{} (`{}`) does NOT start with `\"{{}}{{}}` \
+                 string literal at eval/mod.rs:{} (`{}`) does NOT start with `\"{{}}{{}}` \
                  (default positional indices for args 0+1 in order, optionally \
                  preceded by a single named-arg span like `{{post_vm_prefix}}`). \
                  A regression that reordered the format-string indices (e.g. \
@@ -413,8 +413,8 @@ fn bug_summary_line_immediately_follows_fingerprint_line_in_all_failure_messages
 }
 
 /// Pin the literal `BUG SUMMARY:` prefix in BOTH arms of the
-/// `bug_summary_line` closure (ANSI-colored at eval.rs:1912
-/// and plain at eval.rs:1914). CI log greps and downstream
+/// `bug_summary_line` closure (the `stderr_color()`-true ANSI-colored
+/// arm and the plain arm). CI log greps and downstream
 /// parsers key on the post-ANSI-strip byte sequence
 /// `BUG SUMMARY:`; a regression that renamed the prefix
 /// (e.g. `BPF ERROR:`, `BUG_SUMMARY:`, dropped the colon)
@@ -436,7 +436,7 @@ fn bug_summary_line_renders_bug_summary_prefix_in_both_arms() {
         .position(|l| l.contains("let bug_summary_line = || -> String {"))
         .expect(
             "bug_summary_line closure opener `let bug_summary_line = || -> String {` \
-                 must exist in eval.rs",
+                 must exist in eval/mod.rs",
         );
     let closer_idx = lines
         .iter()
@@ -455,7 +455,7 @@ fn bug_summary_line_renders_bug_summary_prefix_in_both_arms() {
         prefix_lines.len(),
         2,
         "expected the literal `BUG SUMMARY:` prefix to appear EXACTLY twice in \
-             the `bug_summary_line` closure body (eval.rs:{}-{}): once in the \
+             the `bug_summary_line` closure body (eval/mod.rs:{}-{}): once in the \
              ANSI-colored arm and once in the plain arm. Found {} occurrence(s) \
              at lines {:?}. A regression that renamed either arm's prefix (e.g. \
              `BPF ERROR:`, `BUG_SUMMARY:`, dropped the colon) would break the \
@@ -596,7 +596,8 @@ fn matcher_dispatch_and_mismatch_marker_wiring_pinned() {
         "`let matcher_configured =` assignment",
     );
     // 3-line window covers production's multi-line `X.is_some()
-    // || Y.is_some()` RHS at eval.rs:2020-2021.
+    // || Y.is_some()` RHS at the `let matcher_configured =` assignment
+    // in eval/mod.rs.
     let configured_window =
         lines[configured_site..=configured_site.saturating_add(2).min(scan_end - 1)].join("\n");
     assert!(

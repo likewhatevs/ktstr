@@ -1580,7 +1580,7 @@ mod tests {
     /// entry to the test) — the freeze coord's mid-run filter and
     /// `collect_results`'s post-run drain both key on this single
     /// classifier (search for `is_coordinator_internal` in
-    /// `freeze_coord.rs`).
+    /// `crate::vmm::freeze_coord`).
     #[test]
     fn is_coordinator_internal_matches_filter_set() {
         let internal = [

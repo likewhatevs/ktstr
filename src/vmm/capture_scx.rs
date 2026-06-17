@@ -230,7 +230,7 @@ mod tests {
     /// per-CPU rq KVA/PA pairs that match
     /// `runqueues_kva + per_cpu_offset[cpu]` and pass `scx_root_kva`
     /// through unchanged. Mirrors the runnable scanner's address
-    /// derivation in `freeze_coord.rs` so both code paths agree on
+    /// derivation in `crate::vmm::freeze_coord` so both code paths agree on
     /// the per-CPU rq base.
     #[test]
     fn compute_owned_happy_path() {

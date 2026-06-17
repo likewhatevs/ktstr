@@ -1197,7 +1197,8 @@ pub const KTSTR_VERIFIER_RAW_ENV: &str = "KTSTR_VERIFIER_RAW";
 /// Any non-empty value (`"1"`, `"yes"`, `"0"`, `"true"`) enables
 /// no-perf-mode. All readers (shell-mode VM builder in
 /// `lib.rs`, verifier dispatch in `verifier.rs`, dispatch
-/// gauntlet + eval entry in `test_support/{dispatch,eval}.rs`)
+/// gauntlet + eval entry in `test_support/dispatch.rs` and
+/// `test_support/eval/mod.rs`)
 /// route through the canonical helper so the empty-string
 /// contract holds uniformly.
 pub const KTSTR_NO_PERF_MODE_ENV: &str = "KTSTR_NO_PERF_MODE";
@@ -1362,8 +1363,8 @@ pub fn per_name_scheduler_env(name: &str) -> String {
 /// Name of the environment variable that overrides the kernel
 /// path the eval dispatch reads (orthogonal to
 /// [`KTSTR_KERNEL_ENV`] which the main entry points use). Read
-/// at `crate::test_support::eval::resolve_test_kernel` L3148-
-/// L3152: a set-but-empty `KTSTR_TEST_KERNEL=` surfaces a
+/// at `crate::test_support::eval::resolve_test_kernel`: a
+/// set-but-empty `KTSTR_TEST_KERNEL=` surfaces a
 /// `KTSTR_TEST_KERNEL not found:` hard error (typo-loud per
 /// reader comment); ONLY the unset / `Err(NotPresent)` case
 /// falls through to `crate::find_kernel()` (cache + sysroot
@@ -1441,7 +1442,7 @@ pub const KTSTR_WPROF_PATH_ENV: &str = "KTSTR_WPROF_PATH";
 /// CLI, monitor probes, and sidecar writers all point the operator
 /// at the same remediation. Referenced by the non-VM-boot skip
 /// paths in `cache.rs`, `probe/btf.rs`, `monitor/mod.rs`,
-/// `test_support/eval.rs`, and `test_support/mod.rs`.
+/// `test_support/eval/mod.rs`, and `test_support/mod.rs`.
 ///
 /// Format: caller prefixes the actionable first clause (e.g.
 /// "no vmlinux found") and appends this constant as the

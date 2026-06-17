@@ -1156,7 +1156,7 @@ impl PayloadMetrics {
 /// to stamp the host-extracted [`Metric`] set.
 ///
 /// Wire-only — never constructed in test bodies. Public-by-crate so
-/// `eval.rs` can decode and consume it.
+/// `crate::test_support::eval` can decode and consume it.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct WireMetricHint {
     /// Dotted-path metric name, mirrors [`MetricHint::name`].

@@ -630,7 +630,7 @@ fn parse_llm_response_valid_json_produces_metrics() {
 /// `parse_llm_response` is the seam where the host-side
 /// stdout-primary path's stream tag is stamped — `host_side_llm_extract`
 /// passes `MetricStream::Stdout` to `extract_via_llm` for the
-/// stdout call (eval.rs:265), and `extract_via_llm` forwards
+/// stdout call, and `extract_via_llm` forwards
 /// the same stream tag to `parse_llm_response` (model.rs:2329),
 /// which threads it into `walk_json_leaves`. A regression that
 /// hard-coded `Stdout` here regardless of input would slip
@@ -666,7 +666,7 @@ fn parse_llm_response_stream_tagging_stdout() {
 ///
 /// This is the unit-test counterpart to the host's stderr-fallback
 /// path: `host_side_llm_extract` passes `MetricStream::Stderr` to
-/// `extract_via_llm` for the stderr call (eval.rs:285), so a
+/// `extract_via_llm` for the stderr call, so a
 /// stderr-fallback metric set must be tagged Stderr. Without this
 /// pin, a regression that hard-coded `Stdout` in
 /// `walk_json_leaves` (or in `parse_llm_response`) would slip

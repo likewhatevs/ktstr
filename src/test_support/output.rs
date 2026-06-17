@@ -253,8 +253,9 @@ fn strip_ansi_csi(s: &str) -> String {
     // to twice per test failure via `extract_bug_summary` — once
     // on the dump arg (unconditionally), and again on the
     // sched_log arg if the dump anchor scan doesn't return. The
-    // eval.rs pre-compute was lifted into a closure that only
-    // fires on failure paths, so passing tests no longer hit
+    // `crate::test_support::eval` pre-compute was lifted into a
+    // closure that only fires on failure paths, so passing tests
+    // no longer hit
     // this; the fast path avoids unnecessary copy/strip work
     // when the corpus is plain text.
     if !s.contains('\x1b') {
@@ -365,21 +366,21 @@ pub(crate) fn extract_panic_message(output: &str) -> Option<&str> {
 // Init-stage classification labels
 // ---------------------------------------------------------------------------
 //
-// Returned by `classify_init_stage` and asserted by eval.rs tests via
-// substring match. Shared constants keep the production label and the
+// Returned by `classify_init_stage` and asserted by `crate::test_support::eval`
+// tests via substring match. Shared constants keep the production label and the
 // test pins from drifting silently.
 
 /// Stage label when no init sentinel appears in COM2 — indicates the
 /// guest kernel or initramfs never reached Rust init. Pinned by
 /// `classify_no_sentinels` (output.rs) and `eval_no_sentinels_shows_initramfs_failure`
-/// (eval.rs).
+/// (eval/eval_tests_eval.rs).
 pub(crate) const STAGE_INIT_NOT_STARTED: &str =
     "init script never started (kernel or mount failure)";
 
 /// Stage label when `KTSTR_INIT_STARTED` was written but the payload
 /// sentinel never appeared — cgroup or scheduler setup failed after
 /// filesystem mounts. Pinned by `classify_init_started_only` (output.rs)
-/// and `eval_init_started_but_no_payload` (eval.rs).
+/// and `eval_init_started_but_no_payload` (eval/eval_tests_eval.rs).
 pub(crate) const STAGE_INIT_STARTED_NO_PAYLOAD: &str =
     "init started but payload never ran (cgroup/scheduler setup failed)";
 
@@ -387,7 +388,7 @@ pub(crate) const STAGE_INIT_STARTED_NO_PAYLOAD: &str =
 /// AssertResult JSON followed — the test function entered and then
 /// crashed, hung, or produced no output. Pinned by
 /// `classify_payload_starting` / `classify_payload_starting_without_init`
-/// (output.rs) and `eval_payload_started_no_result` (eval.rs).
+/// (output.rs) and `eval_payload_started_no_result` (eval/eval_tests_eval.rs).
 pub(crate) const STAGE_PAYLOAD_STARTED_NO_RESULT: &str =
     "payload started but produced no test result";
 

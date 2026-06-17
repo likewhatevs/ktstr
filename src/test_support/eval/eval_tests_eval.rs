@@ -1243,7 +1243,9 @@ fn phase_buckets_equals_stats_phases_and_post_vm_read_does_not_starve() {
         "fixture with 3 captures must yield buckets"
     );
     // Framework builds stats.phases AFTER post_vm. Pass the SAME
-    // stimulus source the production caller passes (eval.rs:1147).
+    // stimulus source the production caller passes (the
+    // `stimulus_events = result.stimulus_timeline()` binding in
+    // `run_ktstr_test_inner_impl`).
     let stimulus = result.stimulus_timeline();
     let ar = evaluate_vm_result(
         &entry,

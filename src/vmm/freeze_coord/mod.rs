@@ -10179,7 +10179,7 @@ impl KtstrVm {
             // port-1 TLV bytes the guest wrote that the freeze
             // coordinator's tx_evt-driven mid-run drain did not
             // already consume; the merge into `guest_messages` keeps
-            // existing readers (eval.rs, sidecar) working without
+            // existing readers (crate::test_support::eval, sidecar) working without
             // any per-message-type code change.
             virtio_con,
             // Mid-run TLV entries the freeze coordinator already
