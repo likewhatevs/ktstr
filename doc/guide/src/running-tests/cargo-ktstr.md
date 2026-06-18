@@ -1218,6 +1218,74 @@ the default is `{CARGO_TARGET_DIR or "target"}/ktstr/{kernel}-{project_commit}/`
 where `{project_commit}` is the project HEAD short hex (with `-dirty`
 when the worktree differs).
 
+## perf-delta
+
+Compare `performance_mode` test metrics between HEAD and a baseline
+commit, exiting non-zero when a metric regresses past its threshold.
+The verdict reuses the same polarity-aware, abs+rel dual-gate engine as
+[`stats compare`](#stats) (`compare_partitions`): the baseline commit's
+sidecars are the A side, HEAD's are the B side, paired per scenario.
+The intended use is a CI perf-gate on a pull request — diff the branch
+against the point it diverged from `main` in one command. See the
+[A/B Compare Branches](../recipes/ab-compare.md) recipe for the manual
+`stats compare` equivalent.
+
+```sh
+cargo ktstr perf-delta --dual-run --kernel 6.14            # HEAD vs merge-base(HEAD, main)
+cargo ktstr perf-delta --dual-run --kernel 6.14 --base-ref release  # vs merge-base(HEAD, release)
+cargo ktstr perf-delta --base abc1234                      # vs an explicit commit, cached sidecars
+cargo ktstr perf-delta --dual-run --kernel 6.14 -E perf_throughput  # narrow within performance_mode
+cargo ktstr perf-delta --dual-run --kernel 6.14 --threshold 5       # 5% uniform regression gate
+```
+
+**Baseline resolution** (highest precedence first):
+
+1. `--base <commit>` — compare HEAD directly against this commit-ish,
+   no merge-base. The testability / cached-baseline override.
+2. `--base-ref <ref>` — compare against `merge-base(HEAD, <ref>)`.
+3. `$GITHUB_BASE_REF` (set only on `pull_request` events) — compare
+   against `merge-base(HEAD, origin/<ref>)`, the fetched
+   remote-tracking ref. An empty value is treated as unset.
+4. otherwise — `merge-base(HEAD, <--default-branch>)` (default `main`).
+
+The resolved baseline is shortened to the 7-hex form the sidecar
+`project_commit` records, so it lines up with pooled runs directly. The
+command bails if the baseline resolves to HEAD (nothing to compare).
+
+**Two source models for the baseline run's sidecars:**
+
+- **default (cached-baseline)** — compares sidecars ALREADY pooled
+  under the runs-root from a prior run or a downloaded CI artifact. The
+  caller supplies both runs; perf-delta only resolves the pair and
+  compares.
+- **`--dual-run`** — PRODUCES both runs first: it checks the baseline
+  commit out in a detached `git worktree` and runs its
+  `performance_mode` tests there (sidecars redirected into the main
+  pool), runs HEAD's in the working tree, then compares. Both ends run
+  `KTSTR_PERF_ONLY=1` so only `performance_mode` tests execute, narrowed
+  by `-E`. The worktree is removed on return. `gix` has no
+  worktree-creation API, so this shells `git worktree add/remove` —
+  `git` must be on `PATH`. A non-zero child test exit is logged but does
+  not abort; the sidecars that were written are still compared.
+
+If no `performance_mode` sidecars are produced at the baseline (none
+are defined yet, or `-E` matched none), the command prints a notice and
+exits `0` — an empty perf set is "nothing to compare", not a failure.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--dual-run` | off | Produce both runs via a baseline worktree before comparing (else compare already-pooled sidecars). |
+| `--kernel SPEC` | — | Kernel both runs boot. Required with `--dual-run`. Same `--kernel` form as `cargo ktstr test`. |
+| `--base COMMIT` | — | Explicit baseline commit-ish (skips merge-base). |
+| `--base-ref REF` | — | Ref to merge-base against. |
+| `--default-branch BRANCH` | `main` | Merge-base target when no `--base`/`--base-ref`/`$GITHUB_BASE_REF`. |
+| `-E, --filter EXPR` | all `performance_mode` | Nextest filter narrowing within the `performance_mode` set. |
+| `--threshold PCT` | registry defaults | Uniform relative regression gate (percent). Mutually exclusive with `--policy`. |
+| `--policy PATH` | registry defaults | Per-metric threshold JSON. Mutually exclusive with `--threshold`. Schema: see [`stats compare`](#stats). |
+| `--no-phases` / `--phases-only` / `--steps-only` / `--phase N` / `--phase-threshold PCT` | full per-phase render | Per-phase output projection (render-only; does not change the verdict). Same flags as `stats compare`. |
+
+Runnable as `just perf-delta <kernel> [base]`.
+
 ## show-host
 
 Print the **live** host context used by the sidecar collector:
