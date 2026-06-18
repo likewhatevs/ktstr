@@ -32,9 +32,13 @@ macro_rules! skip {
 }
 
 /// Evaluate a `Result`-returning builder (or any `anyhow::Result`
-/// expression) and either unwrap the value or skip gracefully on
-/// [`crate::vmm::host_topology::ResourceContention`]. Any other error
-/// panics with `{e:#}`.
+/// expression) and either unwrap the value or skip gracefully on a
+/// skip-class error: [`crate::vmm::host_topology::ResourceContention`]
+/// (transient slot/resource shortage) or
+/// [`crate::vmm::host_topology::TopologyInsufficient`] (host too small
+/// for the requested perf-mode topology). Both are matched chain-aware
+/// (`e.chain().any(...)`) so a `.context(...)`-wrapped instance still
+/// skips. Any other error panics with `{e:#}`.
 ///
 /// Replaces the recurring `match ... { Ok => v, Err(e) if
 /// ResourceContention => skip!(...), Err(e) => panic!(...) }`
@@ -54,10 +58,11 @@ macro_rules! skip_on_contention {
                 skip!("resource contention: {e:#}");
             }
             Err(e)
-                if {
-                    let msg = format!("{e:#}");
-                    msg.contains("need") && (msg.contains("LLC") || msg.contains("CPU"))
-                } =>
+                if e.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<$crate::vmm::host_topology::TopologyInsufficient>()
+                        .is_some()
+                }) =>
             {
                 skip!("host topology insufficient: {e:#}");
             }
@@ -124,7 +129,7 @@ macro_rules! assert_not_impl_default {
 
 #[cfg(test)]
 mod tests {
-    use crate::vmm::host_topology::ResourceContention;
+    use crate::vmm::host_topology::{ResourceContention, TopologyInsufficient};
 
     /// Regression for the error-chain fix: a ResourceContention wrapped
     /// in `.context(...)` must still be recognized by the macro and
@@ -189,6 +194,48 @@ mod tests {
     fn skip_on_contention_panics_on_non_contention_error() {
         fn skip_fn() {
             let err = anyhow::anyhow!("unrelated error");
+            let _: () = skip_on_contention!(Err::<(), _>(err));
+        }
+        skip_fn();
+    }
+
+    /// A [`TopologyInsufficient`] (host too small for the requested
+    /// perf-mode topology) routes to skip, including when wrapped in
+    /// `.context(...)`.
+    ///
+    /// `#[cfg(panic = "unwind")]`: same rationale as the
+    /// ResourceContention skip tests — `catch_unwind` is unusable
+    /// under `panic = "abort"`.
+    #[test]
+    #[cfg(panic = "unwind")]
+    fn skip_on_contention_skips_topology_insufficient() {
+        let result = std::panic::catch_unwind(|| {
+            fn skip_fn() {
+                let err: anyhow::Error = anyhow::Error::new(TopologyInsufficient {
+                    reason: "performance_mode: need 4 LLCs but host has 1 LLC groups".into(),
+                })
+                .context("build ktstr_test VM");
+                let _: () = skip_on_contention!(Err::<(), _>(err));
+                unreachable!("skip_on_contention! should have early-returned");
+            }
+            skip_fn();
+        });
+        assert!(
+            result.is_ok(),
+            "context-wrapped TopologyInsufficient must skip, not panic",
+        );
+    }
+
+    /// Anti-fragility: a plain error whose message HAPPENS to contain
+    /// "need" + "CPU" but carries no typed skip-class error must PANIC
+    /// (it is a real failure), not skip. The replaced string-match
+    /// (`"need"` + `"CPU"`/`"LLC"`) would have wrongly skipped this.
+    #[test]
+    #[should_panic(expected = "did not get the CPU")]
+    fn skip_on_contention_panics_on_unrelated_need_cpu_message() {
+        fn skip_fn() {
+            let err =
+                anyhow::anyhow!("scheduler regression: workload did not get the CPU time it needs");
             let _: () = skip_on_contention!(Err::<(), _>(err));
         }
         skip_fn();

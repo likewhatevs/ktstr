@@ -35,13 +35,25 @@ use super::{
     run_ktstr_test_inner, sidecar_dir, try_flush_profraw,
 };
 
-/// Check if an error is a host topology mismatch (e.g. test
-/// requests 2 LLCs but host has 1). String-match because the
-/// error is a plain `anyhow::Error`, not a typed error.
+/// Check if an error is a host topology mismatch (e.g. test requests
+/// 2 LLCs but host has 1, or more CPUs than the host carries).
+///
+/// Walks the FULL error chain via `e.chain().any(...)` so a
+/// [`TopologyInsufficient`] wrapped in `.context(...)` (the
+/// `crate::test_support::eval` `"build ktstr_test VM"` / `"run
+/// ktstr_test VM"` wrappers) is still recognised — mirrors
+/// [`is_resource_contention`]. Replaced a fragile message string-match
+/// (`"need"` + `"LLC"`/`"CPU"`) that would misclassify any unrelated
+/// error happening to contain those words as a topology skip.
+///
+/// [`TopologyInsufficient`]: crate::vmm::host_topology::TopologyInsufficient
 #[doc(hidden)]
 pub fn is_topology_insufficient(e: &anyhow::Error) -> bool {
-    let msg = format!("{e:#}");
-    msg.contains("need") && (msg.contains("LLC") || msg.contains("CPU"))
+    e.chain().any(|cause| {
+        cause
+            .downcast_ref::<crate::vmm::host_topology::TopologyInsufficient>()
+            .is_some()
+    })
 }
 
 /// Check if an `anyhow::Error` carries a [`ResourceContention`].
@@ -2673,6 +2685,59 @@ mod tests {
         // never reaching preset lookup or VM spawn.
         let exit = run_gauntlet_test("__not_a_test__/tiny-1llc");
         assert_eq!(exit, 1);
+    }
+
+    // ---------------------------------------------------------------
+    // is_topology_insufficient — typed-error classification
+    // ---------------------------------------------------------------
+
+    /// A [`TopologyInsufficient`] is recognised, including when wrapped
+    /// in `.context(...)` layers (the eval build/run wrappers) — the
+    /// predicate walks the full error chain.
+    #[test]
+    fn is_topology_insufficient_recognizes_typed_error_through_context() {
+        use crate::vmm::host_topology::TopologyInsufficient;
+        let direct: anyhow::Error = anyhow::Error::new(TopologyInsufficient {
+            reason: "performance_mode: need 4 CPUs but only 2 host CPUs available".into(),
+        });
+        assert!(is_topology_insufficient(&direct), "direct must match");
+        // Mirror the real production wrapping depth: acquire_slot_with_locks
+        // adds "performance_mode: topology mapping" (builder.rs), then the
+        // eval layer adds "build ktstr_test VM" / "run ktstr_test VM".
+        let wrapped = direct
+            .context("performance_mode: topology mapping")
+            .context("build ktstr_test VM")
+            .context("run ktstr_test VM");
+        assert!(
+            is_topology_insufficient(&wrapped),
+            "context-wrapped TopologyInsufficient must still match through \
+             the full production wrapper depth",
+        );
+    }
+
+    /// Anti-fragility: an unrelated error whose message HAPPENS to
+    /// contain "need" + "CPU" must NOT be classified as a topology
+    /// skip. The replaced string-match (`"need"` + `"CPU"`/`"LLC"`)
+    /// would have wrongly skipped a real failure here. A
+    /// [`ResourceContention`] (a distinct typed class) is likewise not
+    /// topology-insufficient.
+    #[test]
+    fn is_topology_insufficient_rejects_unrelated_and_other_typed_errors() {
+        let look_alike =
+            anyhow::anyhow!("scheduler regression: workload did not get the CPU time it needs");
+        assert!(
+            !is_topology_insufficient(&look_alike),
+            "a plain error mentioning need+CPU must NOT be a topology skip — \
+             that is the string-match fragility this typed predicate fixes",
+        );
+        let contention: anyhow::Error =
+            anyhow::Error::new(crate::vmm::host_topology::ResourceContention {
+                reason: "no 4 consecutive CPUs available".into(),
+            });
+        assert!(
+            !is_topology_insufficient(&contention),
+            "ResourceContention is a distinct class, not topology-insufficient",
+        );
     }
 
     #[test]

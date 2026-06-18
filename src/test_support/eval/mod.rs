@@ -153,11 +153,14 @@ pub(crate) const ERR_GUEST_CRASHED_PREFIX: &str = "guest crashed:";
 /// Public-crate entry point. Thin wrapper around
 /// [`run_ktstr_test_inner_impl`] that records a skip sidecar as a
 /// **defensive late catch-all** whenever the inner pipeline bails
-/// with a [`crate::vmm::host_topology::ResourceContention`].
+/// with a skip-class host-resource error —
+/// [`crate::vmm::host_topology::ResourceContention`] (transient slot
+/// shortage) or [`crate::vmm::host_topology::TopologyInsufficient`]
+/// (host too small for the requested perf-mode topology).
 ///
-/// No pre-build path constructs `ResourceContention` today. Every
-/// `ResourceContention` construction site in the crate
-/// (`vmm::host_topology` and `vmm::mod`) fires from inside
+/// No pre-build path constructs either error today. Every
+/// `ResourceContention` / `TopologyInsufficient` construction site in
+/// the crate (`vmm::host_topology` and `vmm::mod`) fires from inside
 /// `builder.build()` or `vm.run()` — both already record their
 /// own sidecar at the bail point via the per-site
 /// `record_skip_sidecar` calls in the match arms below. The
@@ -180,33 +183,32 @@ pub(crate) const ERR_GUEST_CRASHED_PREFIX: &str = "guest crashed:";
 /// strict sense: the wrapper's write overwrites the per-site
 /// write's `run_id` and timestamp with fresh values produced at
 /// wrapper-return time. Both recordings carry the same skip
-/// classification (the same `ResourceContention` reason flowing
-/// through the same `write_skip_sidecar`), so the final sidecar
-/// is correct for stats tooling — only the run_id / timestamp
-/// shift between the two writes, and downstream tooling keys on
-/// (test name, skip classification), not on those volatile
-/// fields.
+/// classification (the same skip-class reason flowing through the
+/// same `write_skip_sidecar`), so the final sidecar is correct for
+/// stats tooling — only the run_id / timestamp shift between the two
+/// writes, and downstream tooling keys on (test name, skip
+/// classification), not on those volatile fields.
 pub(crate) fn run_ktstr_test_inner(
     entry: &KtstrTestEntry,
     topo: Option<&TopoOverride>,
 ) -> Result<AssertResult> {
     let result = run_ktstr_test_inner_impl(entry, topo);
     if let Err(ref e) = result
-        && super::is_resource_contention(e)
+        && (super::is_resource_contention(e) || super::is_topology_insufficient(e))
     {
-        // Late catch-all for ResourceContention from any early-
-        // bail path before the existing per-site `record_skip_sidecar`
-        // calls in builder.build()/vm.run() arms below. Walks the
-        // FULL `anyhow::Error` chain via `is_resource_contention`
-        // (which uses `e.chain().any(...)`) so a contention wrapped
-        // in `.context(...)` (e.g. the `"build ktstr_test VM"` and
-        // `"run ktstr_test VM"` wrappers in `evaluate_vm_result`)
-        // is still recognised — without the chain walk, a wrapped
-        // contention would skip the catch-all and the run would
-        // not record a skip sidecar. Not strictly idempotent — a
-        // second write refreshes run_id and timestamp — but the
-        // skip classification round-trips identically, so stats
-        // tooling sees the same outcome.
+        // Late catch-all for a skip-class error (ResourceContention or
+        // TopologyInsufficient) from any early-bail path before the
+        // existing per-site `record_skip_sidecar` calls in
+        // builder.build()/vm.run() arms below. Both predicates walk the
+        // FULL `anyhow::Error` chain via `e.chain().any(...)` so an error
+        // wrapped in `.context(...)` (e.g. the `"build ktstr_test VM"` and
+        // `"run ktstr_test VM"` wrappers in `evaluate_vm_result`, and
+        // `"performance_mode: topology mapping"` from acquire_slot_with_locks)
+        // is still recognised — without the chain walk, a wrapped error
+        // would skip the catch-all and the run would not record a skip
+        // sidecar. Not strictly idempotent — a second write refreshes
+        // run_id and timestamp — but the skip classification round-trips
+        // identically, so stats tooling sees the same outcome.
         record_skip_sidecar(entry);
     }
     // `expect_auto_repro = true` inversion: when the primary VM
@@ -938,6 +940,8 @@ fn run_ktstr_test_inner_impl(
         Err(e) => {
             if e.downcast_ref::<crate::vmm::host_topology::ResourceContention>()
                 .is_some()
+                || e.downcast_ref::<crate::vmm::host_topology::TopologyInsufficient>()
+                    .is_some()
             {
                 record_skip_sidecar(entry);
             }
@@ -949,6 +953,8 @@ fn run_ktstr_test_inner_impl(
         Err(e) => {
             if e.downcast_ref::<crate::vmm::host_topology::ResourceContention>()
                 .is_some()
+                || e.downcast_ref::<crate::vmm::host_topology::TopologyInsufficient>()
+                    .is_some()
             {
                 record_skip_sidecar(entry);
             }

@@ -210,6 +210,11 @@ fn compute_pinning_error_too_many_vcpus() {
         msg.contains("4 vCPUs") && msg.contains("2 host CPUs"),
         "error should mention CPU counts: {msg}",
     );
+    assert!(
+        err.downcast_ref::<TopologyInsufficient>().is_some(),
+        "must be a typed TopologyInsufficient so the skip routing is \
+         not a fragile message string-match: {err:#}",
+    );
 }
 
 #[test]
@@ -224,6 +229,10 @@ fn compute_pinning_error_too_many_llcs() {
         msg.contains("2 LLCs") && msg.contains("1 LLC groups"),
         "error should mention LLC count mismatch: {msg}",
     );
+    assert!(
+        err.downcast_ref::<TopologyInsufficient>().is_some(),
+        "LLC-shortage must be a typed TopologyInsufficient: {err:#}",
+    );
 }
 
 #[test]
@@ -237,6 +246,10 @@ fn compute_pinning_error_llc_too_small() {
     assert!(
         msg.contains("LLC group 1") && msg.contains("1 available"),
         "error should identify the undersized LLC: {msg}",
+    );
+    assert!(
+        err.downcast_ref::<TopologyInsufficient>().is_some(),
+        "per-LLC shortage must be a typed TopologyInsufficient: {err:#}",
     );
 }
 

@@ -29,6 +29,32 @@ impl std::fmt::Display for ResourceContention {
 
 impl std::error::Error for ResourceContention {}
 
+/// The host cannot satisfy the requested `performance_mode` topology:
+/// it has fewer physical CPUs or LLC groups than the test's virtual
+/// topology needs. Distinct from [`ResourceContention`] (a transient
+/// slot/resource shortage a retry can resolve) — a too-small host is a
+/// permanent condition, so the operator must provision hardware or drop
+/// perf-mode rather than retry.
+///
+/// Downcast via `anyhow::Error::downcast_ref::<TopologyInsufficient>()`
+/// (chain-aware: the `#[ktstr_test]` dispatch and `skip_on_contention!`
+/// walk the full error chain so a `.context(...)`-wrapped instance is
+/// still recognised). This typed error replaced a fragile message
+/// string-match (`"need"` + `"LLC"`/`"CPU"`) that would misclassify any
+/// unrelated error happening to contain those words.
+#[derive(Debug)]
+pub struct TopologyInsufficient {
+    pub reason: String,
+}
+
+impl std::fmt::Display for TopologyInsufficient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.reason)
+    }
+}
+
+impl std::error::Error for TopologyInsufficient {}
+
 /// A physical LLC group on the host, identified by its cache ID.
 #[derive(Debug, Clone)]
 pub struct LlcGroup {
@@ -354,25 +380,29 @@ impl HostTopology {
         let total_vcpus = llcs * vcpus_per_llc;
         let total_needed = total_vcpus as usize + if reserve_service_cpu { 1 } else { 0 };
 
-        anyhow::ensure!(
-            total_needed <= self.total_cpus(),
-            "performance_mode: need {} CPUs ({} vCPUs + {} service) \
-             but only {} host CPUs available",
-            total_needed,
-            total_vcpus,
-            if reserve_service_cpu { 1 } else { 0 },
-            self.total_cpus(),
-        );
+        if total_needed > self.total_cpus() {
+            return Err(anyhow::Error::new(TopologyInsufficient {
+                reason: format!(
+                    "performance_mode: need {} CPUs ({} vCPUs + {} service) \
+                     but only {} host CPUs available",
+                    total_needed,
+                    total_vcpus,
+                    if reserve_service_cpu { 1 } else { 0 },
+                    self.total_cpus(),
+                ),
+            }));
+        }
 
         let num_llcs = self.llc_groups.len();
-        anyhow::ensure!(
-            llcs as usize <= num_llcs,
-            "performance_mode: need {} LLCs for {} virtual LLCs, \
-             but host has {} LLC groups",
-            llcs,
-            llcs,
-            num_llcs,
-        );
+        if llcs as usize > num_llcs {
+            return Err(anyhow::Error::new(TopologyInsufficient {
+                reason: format!(
+                    "performance_mode: need {} LLCs for {} virtual LLCs, \
+                     but host has {} LLC groups",
+                    llcs, llcs, num_llcs,
+                ),
+            }));
+        }
 
         // Build the virtual-to-host LLC index mapping. When numa_nodes > 1,
         // try to place each guest NUMA node's LLCs on host LLCs within
@@ -392,15 +422,18 @@ impl HostTopology {
                 .filter(|c| !used_cpus.contains(c))
                 .collect();
 
-            anyhow::ensure!(
-                available.len() >= vcpus_per_llc as usize,
-                "performance_mode: LLC group {} has {} available CPUs, \
-                 need {} for virtual LLC {}",
-                llc_idx,
-                available.len(),
-                vcpus_per_llc,
-                llc,
-            );
+            if available.len() < vcpus_per_llc as usize {
+                return Err(anyhow::Error::new(TopologyInsufficient {
+                    reason: format!(
+                        "performance_mode: LLC group {} has {} available CPUs, \
+                         need {} for virtual LLC {}",
+                        llc_idx,
+                        available.len(),
+                        vcpus_per_llc,
+                        llc,
+                    ),
+                }));
+            }
 
             for vcpu_in_llc in 0..vcpus_per_llc {
                 let vcpu_id = llc * vcpus_per_llc + vcpu_in_llc;
@@ -416,12 +449,21 @@ impl HostTopology {
                 .iter()
                 .copied()
                 .find(|c| !used_cpus.contains(c));
-            anyhow::ensure!(
-                cpu.is_some(),
-                "performance_mode: no free host CPU for service threads \
-                 after assigning {} vCPUs",
-                total_vcpus,
-            );
+            // Defensive: the total-CPU check above already folds the +1
+            // service CPU into `total_needed`, so a passing host always
+            // has at least one online CPU beyond the assigned vCPUs and
+            // this never fires today. Typed as TopologyInsufficient (not
+            // plain anyhow) so that if a future refactor of that check
+            // ever lets it through, it classifies as the same host-too-
+            // small skip as its three sibling shortfall checks.
+            if cpu.is_none() {
+                return Err(anyhow::Error::new(TopologyInsufficient {
+                    reason: format!(
+                        "performance_mode: no free host CPU for service threads \
+                         after assigning {total_vcpus} vCPUs"
+                    ),
+                }));
+            }
             cpu
         } else {
             None

@@ -545,6 +545,25 @@ pub(super) fn emit_entry_static(input: ItemFn, attrs: AttrValues) -> proc_macro2
             eprintln!("ktstr: SKIP: resource contention: {e:#}");
             return;
         }
+        Err(e) if ::ktstr::test_support::is_topology_insufficient(&e) => {
+            // The host is too small for the test's perf-mode topology
+            // (not enough CPUs / LLC groups). Like resource contention
+            // this is a host-infra condition, not a test outcome: emit
+            // the canonical SKIP banner and early-return so libtest sees
+            // pass. The skip sidecar is recorded by run_ktstr_test_inner.
+            // KTSTR_NO_SKIP_MODE promotes it to a hard failure so a
+            // CI run that demands execution surfaces the too-small host
+            // instead of silently passing.
+            if ::std::env::var_os("KTSTR_NO_SKIP_MODE").is_some() {
+                panic!(
+                    "ktstr: FAIL: host topology insufficient under --no-skip-mode: {e:#}. \
+                     Either provision a host with the required CPU / LLC count, or drop \
+                     --no-skip-mode / KTSTR_NO_SKIP_MODE to accept the skip."
+                );
+            }
+            eprintln!("ktstr: SKIP: host topology insufficient: {e:#}");
+            return;
+        }
     };
     let test_body = if expect_err {
         quote! {
