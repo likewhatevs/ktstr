@@ -168,6 +168,8 @@ fn main() {
             default_branch,
             kernel,
             dual_run,
+            threshold,
+            policy,
         } => {
             let args = perf_delta::PerfDeltaArgs {
                 base: base.as_deref(),
@@ -176,6 +178,8 @@ fn main() {
                 default_branch: &default_branch,
                 kernel: kernel.as_deref(),
                 dual_run,
+                threshold,
+                policy: policy.as_deref(),
             };
             match perf_delta::run(&args) {
                 Ok(0) => Ok(()),

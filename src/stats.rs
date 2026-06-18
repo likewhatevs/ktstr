@@ -4173,6 +4173,37 @@ impl ComparisonPolicy {
         Ok(())
     }
 
+    /// Resolve the mutually-exclusive `--threshold` / `--policy` CLI
+    /// pair into a policy: `--threshold N` is sugar for a uniform N%
+    /// default (validated for sign); `--policy PATH` loads a
+    /// per-metric JSON policy; neither falls through to the registry
+    /// defaults. Shared by every subcommand that accepts the pair
+    /// (`stats compare`, `perf-delta`) so the resolution rules — and
+    /// the "exactly one of the two" contract — live in one place.
+    ///
+    /// Both flags set is rejected with an error. At the CLI call
+    /// sites clap `conflicts_with` makes that unreachable, but this is
+    /// a library entry point and must not panic on its inputs; the
+    /// error is the defence-in-depth backstop.
+    pub fn from_cli_flags(
+        threshold: Option<f64>,
+        policy: Option<&std::path::Path>,
+    ) -> anyhow::Result<Self> {
+        match (threshold, policy) {
+            (Some(t), None) => {
+                let p = Self::uniform(t);
+                p.validate()?;
+                Ok(p)
+            }
+            (None, Some(path)) => Self::load_json(path),
+            (None, None) => Ok(Self::default()),
+            (Some(_), Some(_)) => anyhow::bail!(
+                "--threshold and --policy are mutually exclusive; use --policy \
+                 for per-metric overrides"
+            ),
+        }
+    }
+
     /// Resolve the relative threshold (as a fraction, e.g. `0.10`
     /// for 10%) for `metric_name` with `default_rel` as the
     /// registry-level fallback. Handles the percent→fraction
@@ -8323,6 +8354,45 @@ mod tests {
         let loaded = ComparisonPolicy::load_json(tmp.path()).expect("load per-metric-only policy");
         assert_eq!(loaded.default_percent, None);
         assert_eq!(loaded.per_metric_percent.get("worst_spread"), Some(&3.0),);
+    }
+
+    /// `from_cli_flags` resolves the `--threshold` / `--policy` pair
+    /// the shared way for `stats compare` and `perf-delta`:
+    /// threshold → uniform (validated), policy → load_json, neither →
+    /// registry defaults, both → error (the clap-`conflicts_with`
+    /// backstop). Pin every branch so a future edit can't silently
+    /// drop the sign check or the mutual-exclusion guard.
+    #[test]
+    fn comparison_policy_from_cli_flags_resolves_each_branch() {
+        // --threshold N → uniform default_percent = N.
+        let p = ComparisonPolicy::from_cli_flags(Some(15.0), None).expect("threshold resolves");
+        assert_eq!(p.default_percent, Some(15.0));
+        assert!(p.per_metric_percent.is_empty());
+
+        // A negative --threshold is rejected via validate().
+        assert!(
+            ComparisonPolicy::from_cli_flags(Some(-1.0), None).is_err(),
+            "negative --threshold must be rejected before the dual-gate math",
+        );
+
+        // --policy PATH → load_json.
+        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        std::fs::write(tmp.path(), r#"{"default_percent": 8.0}"#).expect("write policy");
+        let p =
+            ComparisonPolicy::from_cli_flags(None, Some(tmp.path())).expect("policy file resolves");
+        assert_eq!(p.default_percent, Some(8.0));
+
+        // Neither → registry defaults (no uniform override).
+        let p = ComparisonPolicy::from_cli_flags(None, None).expect("default resolves");
+        assert_eq!(p.default_percent, None);
+
+        // Both set → error: clap `conflicts_with` makes this
+        // unreachable at the CLI, but the library entry point must not
+        // silently prefer one over the other.
+        assert!(
+            ComparisonPolicy::from_cli_flags(Some(10.0), Some(tmp.path())).is_err(),
+            "--threshold + --policy together must error",
+        );
     }
 
     /// End-to-end pin: `compare_rows` with a per-metric policy

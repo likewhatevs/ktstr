@@ -110,6 +110,8 @@ fn parse_perf_delta_flags_and_defaults() {
         "--kernel",
         "6.14",
         "--dual-run",
+        "--threshold",
+        "12.5",
     ])
     .unwrap_or_else(|e| panic!("{e}"));
     match k.command {
@@ -120,6 +122,8 @@ fn parse_perf_delta_flags_and_defaults() {
             default_branch,
             kernel,
             dual_run,
+            threshold,
+            policy,
         } => {
             assert_eq!(base.as_deref(), Some("abc123"));
             assert_eq!(base_ref.as_deref(), Some("release"));
@@ -127,6 +131,8 @@ fn parse_perf_delta_flags_and_defaults() {
             assert_eq!(default_branch, "main", "default branch defaults to main");
             assert_eq!(kernel.as_deref(), Some("6.14"));
             assert!(dual_run, "--dual-run flag sets dual_run");
+            assert_eq!(threshold, Some(12.5));
+            assert!(policy.is_none());
         }
         _ => panic!("expected PerfDelta"),
     }
@@ -142,14 +148,25 @@ fn parse_perf_delta_flags_and_defaults() {
             default_branch,
             kernel,
             dual_run,
+            threshold,
+            policy,
         } => {
             assert!(base.is_none() && base_ref.is_none() && filter.is_none());
             assert_eq!(default_branch, "main");
             assert!(kernel.is_none());
             assert!(!dual_run, "--dual-run defaults off (cached-baseline path)");
+            assert!(threshold.is_none() && policy.is_none());
         }
         _ => panic!("expected PerfDelta"),
     }
+    // --threshold and --policy are mutually exclusive.
+    assert!(
+        Cargo::try_parse_from([
+            "cargo", "ktstr", "perf-delta", "--threshold", "10", "--policy", "/tmp/p.json",
+        ])
+        .is_err(),
+        "--threshold and --policy must conflict at parse time",
+    );
 }
 
 /// Build a `cargo ktstr <subcommand> -- <passthrough...>` invocation,

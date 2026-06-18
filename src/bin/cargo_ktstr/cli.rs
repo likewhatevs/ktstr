@@ -265,6 +265,18 @@ pub(crate) enum KtstrCommand {
         /// pooled from a prior run or a downloaded CI artifact.
         #[arg(long)]
         dual_run: bool,
+        /// Uniform relative significance threshold in percent (e.g. 10
+        /// for 10%), overriding every metric's registry default — the
+        /// knob a CI perf-gate tightens or loosens. Sugar for a
+        /// `--policy` with `{default_percent: N}`. Mutually exclusive
+        /// with `--policy`.
+        #[arg(long, conflicts_with = "policy")]
+        threshold: Option<f64>,
+        /// Path to a JSON `ComparisonPolicy` with per-metric
+        /// thresholds. Mutually exclusive with `--threshold`; see
+        /// `cargo ktstr stats compare --help` for the schema.
+        #[arg(long, conflicts_with = "threshold")]
+        policy: Option<std::path::PathBuf>,
     },
     /// Manage cached kernel images.
     Kernel {

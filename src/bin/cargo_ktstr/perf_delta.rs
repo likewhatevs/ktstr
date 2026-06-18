@@ -328,6 +328,12 @@ pub(crate) struct PerfDeltaArgs<'a> {
     /// worktree before comparing, instead of comparing sidecars already
     /// pooled from prior / downloaded runs.
     pub dual_run: bool,
+    /// `--threshold <PCT>` — uniform relative regression threshold
+    /// (percent). Mutually exclusive with `policy`.
+    pub threshold: Option<f64>,
+    /// `--policy <PATH>` — per-metric threshold JSON. Mutually
+    /// exclusive with `threshold`.
+    pub policy: Option<&'a std::path::Path>,
 }
 
 /// Resolve the `(baseline, HEAD)` commit pair and A/B-compare their
@@ -404,7 +410,11 @@ pub(crate) fn run(args: &PerfDeltaArgs<'_>) -> Result<i32> {
         ..Default::default()
     };
     let (filter_a, filter_b) = build.build();
-    let policy = cli::ComparisonPolicy::default();
+    // Resolve the regression sensitivity from --threshold / --policy
+    // via the shared resolver (same as `stats compare`); neither flag
+    // falls through to the registry per-metric defaults.
+    let policy = cli::ComparisonPolicy::from_cli_flags(args.threshold, args.policy)
+        .context("resolve --threshold / --policy")?;
     let phase_opts = cli::PhaseDisplayOptions {
         no_phases: false,
         phases_only: false,
