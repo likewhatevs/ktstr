@@ -19,6 +19,17 @@ same `#[ktstr_test]` suite against each, then using
 dual-gate (absolute and relative) significance and exit non-zero
 on any regression.
 
+> **Automated alternative**:
+> [`cargo ktstr perf-delta`](../running-tests/cargo-ktstr.md#perf-delta)
+> automates this entire flow for `performance_mode` tests — it
+> resolves the baseline as `merge-base(HEAD, <ref>)` (or a
+> `$GITHUB_BASE_REF` PR target), runs both commits (`--dual-run`
+> checks the baseline out in a `git worktree`), and drives the same
+> `stats compare` engine, exiting non-zero on a regression. Reach for
+> it as a CI perf-gate; use the manual steps below when you need
+> control over the worktrees, the test selection, or comparing
+> non-`performance_mode` runs.
+
 ## Setup worktrees
 
 The examples below use the `scx` scheduler crate under
