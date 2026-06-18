@@ -236,6 +236,25 @@ impl Drop for WorktreeGuard {
     }
 }
 
+/// Absolutize a relative kernel-source path against the MAIN tree so the
+/// baseline child resolves the SAME kernel HEAD does. The baseline child
+/// runs with its cwd in the worktree (a temp dir), where a relative
+/// `--kernel ../linux` would resolve against the worktree instead of the
+/// project root — pointing at the wrong (or a nonexistent) tree. A
+/// kernel VERSION (e.g. `6.14`), an already-absolute path, and a
+/// relative string that is not an existing path (a version, or a typo
+/// ktstr surfaces identically from either cwd) all pass through
+/// unchanged; only a relative path that EXISTS from the main tree is
+/// rewritten to its absolute form.
+fn resolve_kernel_for_children(repo_root: &Path, kernel: &str) -> String {
+    let p = Path::new(kernel);
+    if p.is_relative() && repo_root.join(p).exists() {
+        repo_root.join(p).to_string_lossy().into_owned()
+    } else {
+        kernel.to_string()
+    }
+}
+
 /// Produce BOTH commits' `performance_mode` sidecars so the compare has
 /// fresh data: check the baseline commit out in a detached git worktree
 /// and run its perf tests there (sidecars redirected into the main
@@ -259,6 +278,9 @@ fn dual_run(
     let runs_root_abs = repo_root.join(ktstr::test_support::runs_root());
     let leaf = baseline_sidecar_leaf(&runs_root_abs, baseline_short);
     let wt_dir = worktree_checkout_dir(&std::env::temp_dir(), baseline_short);
+    // Absolutize a relative kernel path so the baseline child (cwd =
+    // worktree) resolves the same tree HEAD does (cwd = main).
+    let kernel_arg = resolve_kernel_for_children(repo_root, kernel);
 
     // Create the detached baseline worktree.
     let add = Command::new("git")
@@ -282,7 +304,7 @@ fn dual_run(
     println!("perf-delta: running baseline {baseline_short} perf tests in worktree");
     let baseline_status = Command::new("cargo")
         .current_dir(&wt_dir)
-        .args(perf_test_argv(kernel, filter))
+        .args(perf_test_argv(&kernel_arg, filter))
         .envs(baseline_child_env(&leaf))
         .status()
         .with_context(|| format!("spawn baseline `cargo ktstr test` in {}", wt_dir.display()))?;
@@ -297,7 +319,7 @@ fn dual_run(
     println!("perf-delta: running HEAD perf tests in the working tree");
     let head_status = Command::new("cargo")
         .current_dir(repo_root)
-        .args(perf_test_argv(kernel, filter))
+        .args(perf_test_argv(&kernel_arg, filter))
         .env(ktstr::KTSTR_PERF_ONLY_ENV, "1")
         .status()
         .context("spawn HEAD `cargo ktstr test`")?;
@@ -585,6 +607,38 @@ mod tests {
                 "-E".to_string(),
                 "test(perf_smoke)".to_string(),
             ],
+        );
+    }
+
+    #[test]
+    fn resolve_kernel_absolutizes_relative_existing_path() {
+        // A relative kernel path that exists from the main tree must be
+        // absolutized so the worktree-cwd baseline child resolves the
+        // same tree (the bug: `../linux` resolved against the worktree).
+        let base = std::env::temp_dir().join(format!("ktstr-pd-kresolve-{}", std::process::id()));
+        std::fs::create_dir_all(base.join("linux")).expect("mk linux dir");
+        assert_eq!(
+            resolve_kernel_for_children(&base, "linux"),
+            base.join("linux").to_string_lossy(),
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn resolve_kernel_passes_version_and_absolute_and_missing_through() {
+        let repo = Path::new("/no/such/repo-xyz");
+        // A version (not an existing path) passes through verbatim.
+        assert_eq!(resolve_kernel_for_children(repo, "6.14"), "6.14");
+        // An already-absolute path passes through unchanged.
+        assert_eq!(
+            resolve_kernel_for_children(repo, "/abs/linux"),
+            "/abs/linux",
+        );
+        // A relative non-existent path passes through (version or typo —
+        // ktstr surfaces the same error from either cwd).
+        assert_eq!(
+            resolve_kernel_for_children(repo, "../nonexistent-xyz"),
+            "../nonexistent-xyz",
         );
     }
 }
