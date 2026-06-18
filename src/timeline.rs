@@ -1177,7 +1177,12 @@ mod tests {
         ];
         let t = Timeline::build(&events, &samples);
         assert_eq!(t.phases.len(), 1);
-        assert!(t.phases[0].metrics.sample_count > 0);
+        // Both samples — including the one AT last_monitor_ms (700) —
+        // must fall inside the single phase's [start, last_monitor_ms+1)
+        // window. A > 0 check passes even if the last-sample-inclusion
+        // off-by-one (end = last_monitor_ms+1) regressed to +0, dropping
+        // the 700 sample. Pin the exact count.
+        assert_eq!(t.phases[0].metrics.sample_count, 2);
     }
 
     #[test]
@@ -1188,8 +1193,19 @@ mod tests {
             .collect();
         let t = Timeline::build(&events, &samples);
         assert_eq!(t.phases.len(), 2);
-        assert!(t.phases[0].metrics.sample_count > 0);
-        assert!(t.phases[1].metrics.sample_count > 0);
+        // Pin WHERE the boundary fell, not just non-emptiness: 60 samples
+        // at i*100 (i in 5..65 → 500..6400); the >500 warmup drops the
+        // 500 sample (i=5), leaving 59. The StepStart[0]@3000 boundary
+        // (offset-adjusted) splits them 30/29. A > 0 check passes even if
+        // the offset/boundary math shifted the split point while leaving
+        // samples on both sides.
+        assert_eq!(t.phases[0].metrics.sample_count, 30);
+        assert_eq!(t.phases[1].metrics.sample_count, 29);
+        assert_eq!(
+            t.phases[0].metrics.sample_count + t.phases[1].metrics.sample_count,
+            59,
+            "59 = 60 samples minus the 500ms sample dropped by the >500 warmup",
+        );
     }
 
     #[test]
