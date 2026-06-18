@@ -567,12 +567,19 @@ fn cpu_lock_acquire_slides_past_held() {
 
 #[test]
 fn cpu_lock_acquire_no_windows_fit() {
-    // count > total_host_cpus: loop condition never satisfied,
-    // returns ResourceContention without touching any files.
+    // count > total_host_cpus: a permanent host-too-small shortfall,
+    // returned as TopologyInsufficient (not transient ResourceContention)
+    // before the loop touches any files. A retry can never satisfy it,
+    // so the operator banner must say "host topology insufficient".
     let err = acquire_cpu_locks(2, 0, None).unwrap_err();
     assert!(
-        err.downcast_ref::<ResourceContention>().is_some(),
-        "error should be ResourceContention: {err}",
+        err.downcast_ref::<TopologyInsufficient>().is_some(),
+        "count exceeding host CPUs must be TopologyInsufficient: {err}",
+    );
+    assert!(
+        err.downcast_ref::<ResourceContention>().is_none(),
+        "must NOT be ResourceContention — that implies a transient, \
+         retryable contention: {err}",
     );
 }
 

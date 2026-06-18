@@ -441,15 +441,15 @@ pub(crate) fn invoke_post_vm_callback(
 }
 
 /// Write a skip sidecar for `entry`, logging to stderr on failure
-/// without propagating the error. Used at six sites — the four in
-/// [`run_ktstr_test_inner`] (the wrapper's catch-all that fires
-/// for any pre-VM-build ResourceContention, the performance_mode
-/// gate, and the two `ResourceContention` arms at VM build + VM
-/// run) and the two in `super::dispatch` (performance_mode gates
-/// at the plain-run entry points) — all of which must record the
-/// skip for stats tooling but cannot meaningfully handle a
-/// sidecar-write failure beyond logging it. The skip itself is
-/// still valid; only post-run stats tooling loses visibility.
+/// without propagating the error. Called wherever a run is skipped
+/// before producing a real result: the skip-class catch-all and the
+/// VM build / VM run arms in [`run_ktstr_test_inner`] (each fires on a
+/// `ResourceContention` or `TopologyInsufficient`), and the
+/// performance-mode / coverage gates at the plain-run entry points in
+/// the crate `dispatch` module. All must record the skip for stats
+/// tooling but cannot meaningfully handle a sidecar-write failure
+/// beyond logging it — the skip itself is still valid; only post-run
+/// stats tooling loses visibility.
 pub(crate) fn record_skip_sidecar(entry: &KtstrTestEntry) {
     if let Err(e) = write_skip_sidecar(entry) {
         // Dual-emit at warn level: an unwritten skip sidecar costs

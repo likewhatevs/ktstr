@@ -353,8 +353,9 @@ pub struct KtstrVm {
     /// flag is needed at `run()` time so the lock-acquisition switch
     /// can distinguish "no-perf-mode bypass / degraded-sysfs" (no
     /// locks, no plans, no acquire) from the default-else path that
-    /// reserves a per-CPU window via `acquire_cpu_locks` whenever
-    /// neither `performance_mode` nor `no_perf_mode` is in effect.
+    /// takes an LLC `LOCK_SH` set via `compute_pinning` +
+    /// `acquire_resource_locks` (per LLC offset) whenever neither
+    /// `performance_mode` nor `no_perf_mode` is in effect.
     /// Persisted on KtstrVm so the deferred-lock contract in
     /// `KtstrVm::run` does not need to re-read the env every spawn.
     pub(crate) no_perf_mode: bool,
@@ -400,8 +401,9 @@ pub struct KtstrVm {
     pub(crate) no_perf_plan: Option<host_topology::LlcPlan>,
     /// Cached host topology snapshot read once at `build()` time
     /// from `/sys/devices/system/cpu`. `KtstrVm::run`'s default-else
-    /// branch threads this through `acquire_cpu_locks` to take a
-    /// fresh per-CPU window without re-reading sysfs. `None` only on
+    /// branch threads this through `compute_pinning` per LLC offset,
+    /// then takes `LOCK_SH` via `acquire_resource_locks`, without
+    /// re-reading sysfs. `None` only on
     /// the degraded-sysfs no-perf-mode branch, where no LLC
     /// reservation is possible to begin with — `KtstrVm::run`
     /// short-circuits to "no locks" in that case.
@@ -733,10 +735,13 @@ impl KtstrVm {
     ///   `acquire_resource_locks`. ResourceContention surfaces
     ///   verbatim so callers route it to the existing
     ///   `skip_on_contention!` path.
-    /// * default else: re-acquires the per-CPU window via
-    ///   `acquire_cpu_locks` with the cached `host_topo`. This is
-    ///   the path test fixtures take when neither `--perf-mode`
-    ///   nor `--no-perf-mode` is in effect.
+    /// * default else: walks LLC offsets, computing a
+    ///   `compute_pinning` candidate per offset and taking `LOCK_SH`
+    ///   via `acquire_resource_locks` until one succeeds (compatible
+    ///   with other non-perf `LOCK_SH` holders, blocked by perf-mode
+    ///   `LOCK_EX`); all offsets busy yields `ResourceContention`.
+    ///   This is the path test fixtures take when neither
+    ///   `--perf-mode` nor `--no-perf-mode` is in effect.
     fn acquire_run_locks(&self) -> Result<RunLocks> {
         if self.no_perf_mode {
             // Reuse the build-time plan's LLC selection rather than

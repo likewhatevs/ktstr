@@ -612,8 +612,9 @@ impl KtstrVmBuilder {
     /// KVM_CAP_HALT_POLL skipped (guest haltpoll cpuidle disables
     /// host halt polling via MSR_KVM_POLL_CONTROL). On aarch64, KVM
     /// exit suppression and CPUID hints are not available. Validated
-    /// at build time -- oversubscription returns `ResourceContention`,
-    /// insufficient hugepages is a warning.
+    /// at build time -- a host with too few CPUs / LLC groups for the
+    /// topology returns `TopologyInsufficient` (busy LLC slots return
+    /// `ResourceContention`); insufficient hugepages is a warning.
     #[allow(dead_code)]
     pub fn performance_mode(mut self, enabled: bool) -> Self {
         self.performance_mode = enabled;
@@ -839,9 +840,10 @@ impl KtstrVmBuilder {
     ///
     /// Returns `Err` for missing required inputs (kernel, init binary),
     /// invalid topology, or host resources insufficient to satisfy
-    /// `performance_mode` requirements (the last surfaces as
-    /// `ResourceContention`, which callers typically treat as a
-    /// skip rather than a failure).
+    /// `performance_mode` requirements (a too-small host surfaces as
+    /// `TopologyInsufficient`, busy LLC slots as `ResourceContention`;
+    /// both are skip-class, which callers typically treat as a skip
+    /// rather than a failure).
     pub fn build(mut self) -> Result<KtstrVm> {
         // Periodic capture's boundary computation requires
         // `workload_duration` to slice. Without it the
@@ -867,7 +869,8 @@ impl KtstrVmBuilder {
 
         // `host_topo` is cached on KtstrVm so `KtstrVm::run`'s
         // default-else branch (neither perf-mode nor no-perf-mode)
-        // can call `acquire_cpu_locks` without re-reading sysfs.
+        // can call `compute_pinning` per LLC offset and take `LOCK_SH`
+        // via `acquire_resource_locks` without re-reading sysfs.
         // The no-perf-mode and perf-mode branches reuse their
         // stored plans' `locked_llcs` / `llc_indices` directly
         // through `acquire_resource_locks` and do not need the
@@ -1204,9 +1207,12 @@ impl KtstrVmBuilder {
 
     /// Validate host resources for performance_mode and compute the
     /// pinning plan. Returns both the plan and the host topology (needed
-    /// for NUMA node discovery). Returns `ResourceContention` when the
-    /// host lacks CPUs or LLC slots. Warnings are printed for degraded
-    /// conditions (hugepages, host load).
+    /// for NUMA node discovery). Returns `TopologyInsufficient` when the
+    /// host has too few CPUs / LLC groups for the requested topology (a
+    /// permanent shortfall, here and in `compute_pinning`), or
+    /// `ResourceContention` when the host is big enough but LLC slots are
+    /// currently busy. Warnings are printed for degraded conditions
+    /// (hugepages, host load).
     fn validate_performance_mode(
         &mut self,
     ) -> Result<(host_topology::PinningPlan, host_topology::HostTopology)> {
@@ -1228,7 +1234,11 @@ impl KtstrVmBuilder {
             .sum();
         let total_reserved = reserved + 1; // +1 for service CPU
         if total_reserved > host_topo.total_cpus() {
-            return Err(anyhow::Error::new(host_topology::ResourceContention {
+            // The host has fewer CPUs than perf-mode must reserve: a
+            // permanent shortfall (provision a bigger host or drop perf
+            // mode), not transient slot contention — classify it as such
+            // so the operator banner says "host topology insufficient".
+            return Err(anyhow::Error::new(host_topology::TopologyInsufficient {
                 reason: format!(
                     "performance_mode: need {} CPUs ({} across {} LLCs + 1 service) \
                      but only {} host CPUs available\n  \

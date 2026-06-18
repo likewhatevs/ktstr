@@ -802,8 +802,10 @@ pub(crate) fn pid_window_offset(pid: u32, max_start: usize) -> usize {
 /// pid-derived offset, stepping by 1 if any CPU in the window is busy
 /// and wrapping around once the high end of the search range is
 /// exhausted so the lower windows (those below `start_offset`) are
-/// also probed before giving up. Returns the held fds on success, or
-/// `ResourceContention` when no window is available.
+/// also probed before giving up. Returns the held fds on success,
+/// `TopologyInsufficient` when the requested count exceeds the host CPU
+/// total (a permanent shortfall), or `ResourceContention` when the host
+/// is big enough but every window is currently busy (transient).
 ///
 /// When `host_topo` is provided, also acquires `LOCK_SH` on the LLC lock
 /// files containing the acquired CPUs. This prevents a perf VM from
@@ -835,7 +837,10 @@ pub fn acquire_cpu_locks(
     // entering the search loop so the modular arithmetic below has a
     // non-zero domain.
     if count > total_host_cpus {
-        return Err(anyhow::Error::new(ResourceContention {
+        // The host physically has fewer CPUs than the reservation needs:
+        // a permanent shortfall (provision a bigger host or drop perf
+        // mode), not transient slot contention a retry could clear.
+        return Err(anyhow::Error::new(TopologyInsufficient {
             reason: format!(
                 "no {count} consecutive CPUs available on a {total_host_cpus}-CPU host\n  \
                  hint: pass --no-perf-mode or set KTSTR_NO_PERF_MODE=1 to run without CPU reservation"
