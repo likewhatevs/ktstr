@@ -193,6 +193,24 @@ fn perf_test_argv(kernel: &str, filter: Option<&str>) -> Vec<String> {
     v
 }
 
+/// Count `*.ktstr.json` sidecars directly in `dir` (non-recursive). A
+/// missing or unreadable dir counts as `0`. The dual-run path uses this
+/// on the baseline leaf to detect "no `performance_mode` tests produced
+/// any sidecar" and exit cleanly, instead of running the compare into a
+/// confusing empty-pool bail.
+fn count_sidecars(dir: &Path) -> usize {
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| {
+            e.file_name()
+                .to_str()
+                .is_some_and(|n| n.ends_with(".ktstr.json"))
+        })
+        .count()
+}
+
 /// RAII cleanup for the baseline worktree: `git worktree remove
 /// --force` on drop so an early return, `?`, or panic in [`dual_run`]
 /// never leaks a checkout. Removal runs from the MAIN tree
@@ -359,6 +377,21 @@ pub(crate) fn run(args: &PerfDeltaArgs<'_>) -> Result<i32> {
             kernel,
             args.filter,
         )?;
+        // If the baseline run produced no sidecars, no `performance_mode`
+        // tests were selected (none are defined yet, or the `-E` filter
+        // matched none). There is nothing to compare — exit cleanly
+        // rather than letting the compare bail on an empty pool. HEAD
+        // runs the same selection, so a zero-baseline implies no delta
+        // is computable regardless of HEAD's output.
+        let leaf = baseline_sidecar_leaf(&cwd.join(ktstr::test_support::runs_root()), &baseline);
+        if count_sidecars(&leaf) == 0 {
+            println!(
+                "perf-delta: no performance_mode sidecars produced at baseline {baseline} \
+                 — nothing to compare (define #[ktstr_test(performance_mode)] tests, or widen \
+                 the -E filter, to enable the delta)"
+            );
+            return Ok(0);
+        }
     }
 
     // Reuse the stats-compare engine: partition the pooled sidecars by
@@ -496,6 +529,23 @@ mod tests {
                 "/tmp/wt".to_string(),
             ],
         );
+    }
+
+    #[test]
+    fn count_sidecars_counts_ktstr_json_and_zero_for_missing() {
+        let base = std::env::temp_dir().join(format!("ktstr-pd-count-{}", std::process::id()));
+        // A missing directory counts as zero (the no-tests-ran case).
+        assert_eq!(count_sidecars(&base.join("absent")), 0);
+        std::fs::create_dir_all(&base).expect("mk tempdir");
+        std::fs::write(base.join("a.ktstr.json"), "{}").expect("write a");
+        std::fs::write(base.join("b.ktstr.json"), "{}").expect("write b");
+        std::fs::write(base.join("notes.txt"), "x").expect("write txt");
+        assert_eq!(
+            count_sidecars(&base),
+            2,
+            "only *.ktstr.json sidecars count, not sibling files",
+        );
+        std::fs::remove_dir_all(&base).ok();
     }
 
     #[test]
