@@ -85,6 +85,39 @@ pub fn is_resource_contention(e: &anyhow::Error) -> bool {
     })
 }
 
+/// Check if an `anyhow::Error` carries a [`PerfModeUnavailable`].
+///
+/// Chain-aware (walks `e.chain()`), like [`is_topology_insufficient`].
+/// A `PerfModeUnavailable` is a HARD ERROR (the host cannot honor an
+/// explicitly-requested perf-mode guarantee), NOT a skip — so unlike the
+/// RC/TI predicates this does not gate a skip path; `result_to_exit_code`
+/// and the macro body route it to a FAIL banner + non-skip exit.
+///
+/// [`PerfModeUnavailable`]: crate::vmm::host_topology::PerfModeUnavailable
+#[doc(hidden)]
+pub fn is_perf_mode_unavailable(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| {
+        cause
+            .downcast_ref::<crate::vmm::host_topology::PerfModeUnavailable>()
+            .is_some()
+    })
+}
+
+/// Check if an `anyhow::Error` carries a [`CpuBudgetUnsatisfiable`].
+///
+/// Chain-aware. A `CpuBudgetUnsatisfiable` is a HARD ERROR (an explicit
+/// `--cpu-cap` / `cpu_budget` number the host cannot satisfy), NOT a skip.
+///
+/// [`CpuBudgetUnsatisfiable`]: crate::vmm::host_topology::CpuBudgetUnsatisfiable
+#[doc(hidden)]
+pub fn is_cpu_budget_unsatisfiable(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| {
+        cause
+            .downcast_ref::<crate::vmm::host_topology::CpuBudgetUnsatisfiable>()
+            .is_some()
+    })
+}
+
 /// Predicate: walks the [`anyhow::Error`] chain looking for a
 /// [`KernelUnavailable`] cause. Used by the `#[ktstr_test]`
 /// macro's wrapper to distinguish "harness not configured" (skip)
@@ -1090,6 +1123,39 @@ fn result_to_exit_code(
             }
         }
         Ok(_) => EXIT_PASS,
+        Err(e) if is_perf_mode_unavailable(&e) => {
+            // Hard FAIL, not a skip: a performance_mode test explicitly
+            // requested an isolation guarantee the host cannot honor. Not
+            // gated on KTSTR_NO_SKIP_MODE (already a failure). Placed above
+            // the RC/TI skip arms so it wins the match.
+            let reason = e
+                .chain()
+                .find_map(|c| {
+                    c.downcast_ref::<crate::vmm::host_topology::PerfModeUnavailable>()
+                        .map(|p| p.reason.clone())
+                })
+                .unwrap_or_else(|| "<unknown>".to_string());
+            eprintln!(
+                "ktstr: FAIL: performance mode unavailable: {reason}. \
+                 Provision a host with the required CPU / LLC count, narrow the \
+                 test topology, or drop --perf-mode."
+            );
+            EXIT_FAIL
+        }
+        Err(e) if is_cpu_budget_unsatisfiable(&e) => {
+            // Hard FAIL, not a skip: an explicit --cpu-cap / cpu_budget the
+            // host cannot satisfy (a user-typed number that does not exist
+            // here).
+            let reason = e
+                .chain()
+                .find_map(|c| {
+                    c.downcast_ref::<crate::vmm::host_topology::CpuBudgetUnsatisfiable>()
+                        .map(|b| b.reason.clone())
+                })
+                .unwrap_or_else(|| "<unknown>".to_string());
+            eprintln!("ktstr: FAIL: cpu budget unsatisfiable: {reason}");
+            EXIT_FAIL
+        }
         Err(e) if is_resource_contention(&e) => {
             let reason = e
                 .chain()
@@ -2705,14 +2771,16 @@ mod tests {
     fn is_topology_insufficient_recognizes_typed_error_through_context() {
         use crate::vmm::host_topology::TopologyInsufficient;
         let direct: anyhow::Error = anyhow::Error::new(TopologyInsufficient {
-            reason: "performance_mode: need 4 CPUs but only 2 host CPUs available".into(),
+            reason: "vCPU count 600 exceeds KVM_CAP_MAX_VCPUS 512; cannot boot a VM this wide"
+                .into(),
         });
         assert!(is_topology_insufficient(&direct), "direct must match");
-        // Mirror the real production wrapping depth: acquire_slot_with_locks
-        // adds "performance_mode: topology mapping" (builder.rs), then the
-        // eval layer adds "build ktstr_test VM" / "run ktstr_test VM".
+        // Mirror the real production wrapping: a kvm-cap TopologyInsufficient
+        // (the VM cannot boot) flows through the eval layer's
+        // "build ktstr_test VM" / "run ktstr_test VM" .context wrappers. (A
+        // perf-mode-too-small host is re-mapped to PerfModeUnavailable
+        // before any wrapper, so it never reaches this predicate.)
         let wrapped = direct
-            .context("performance_mode: topology mapping")
             .context("build ktstr_test VM")
             .context("run ktstr_test VM");
         assert!(
@@ -3942,6 +4010,43 @@ mod tests {
             ),
             0
         );
+    }
+
+    /// `PerfModeUnavailable` routes to EXIT_FAIL via result_to_exit_code
+    /// even under expect_err — a host-config failure is never "the
+    /// expected error appeared". Chain-aware (context-wrapped, mirroring
+    /// eval's "build ktstr_test VM" wrap). Pins the FAIL arm above the
+    /// expect_err / skip arms against a match-reorder regression.
+    #[test]
+    fn result_to_exit_code_perf_mode_unavailable_fails_even_under_expect_err() {
+        use anyhow::Context as _;
+        let mk = || -> Result<crate::assert::AssertResult> {
+            Err(anyhow::Error::new(
+                crate::vmm::host_topology::PerfModeUnavailable {
+                    reason: "host too small for perf topology".to_string(),
+                },
+            ))
+            .context("build ktstr_test VM")
+        };
+        assert_eq!(result_to_exit_code(mk(), false, false), EXIT_FAIL);
+        assert_eq!(result_to_exit_code(mk(), true, false), EXIT_FAIL);
+    }
+
+    /// `CpuBudgetUnsatisfiable` routes to EXIT_FAIL even under expect_err
+    /// (same arm-ordering invariant as the perf-mode case).
+    #[test]
+    fn result_to_exit_code_cpu_budget_unsatisfiable_fails_even_under_expect_err() {
+        use anyhow::Context as _;
+        let mk = || -> Result<crate::assert::AssertResult> {
+            Err(anyhow::Error::new(
+                crate::vmm::host_topology::CpuBudgetUnsatisfiable {
+                    reason: "--cpu-cap exceeds allowed CPUs".to_string(),
+                },
+            ))
+            .context("build ktstr_test VM")
+        };
+        assert_eq!(result_to_exit_code(mk(), false, false), EXIT_FAIL);
+        assert_eq!(result_to_exit_code(mk(), true, false), EXIT_FAIL);
     }
 
     /// `allow_inconclusive = true` routes a terminal Inconclusive

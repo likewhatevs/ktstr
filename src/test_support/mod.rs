@@ -116,8 +116,9 @@ pub use sidecar::{
 
 pub use dispatch::{
     DEFAULT_HOST_CGROUP_PARENT, EXIT_FAIL, EXIT_INCONCLUSIVE, EXIT_PASS, analyze_sidecars,
-    is_kernel_unavailable, is_resource_contention, is_topology_insufficient, ktstr_main,
-    ktstr_test_early_dispatch, resolve_host_cgroup_parent, run_ktstr_test, sanitize_kernel_label,
+    is_cpu_budget_unsatisfiable, is_kernel_unavailable, is_perf_mode_unavailable,
+    is_resource_contention, is_topology_insufficient, ktstr_main, ktstr_test_early_dispatch,
+    resolve_host_cgroup_parent, run_ktstr_test, sanitize_kernel_label,
 };
 pub use entry::{
     BinaryKindJson, BpfMapWrite, CgroupPath, KTSTR_SCHEDULERS, KTSTR_TESTS, KtstrTestEntry,

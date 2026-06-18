@@ -35,10 +35,13 @@ macro_rules! skip {
 /// expression) and either unwrap the value or skip gracefully on a
 /// skip-class error: [`crate::vmm::host_topology::ResourceContention`]
 /// (transient slot/resource shortage) or
-/// [`crate::vmm::host_topology::TopologyInsufficient`] (host too small
-/// for the requested perf-mode topology). Both are matched chain-aware
-/// (`e.chain().any(...)`) so a `.context(...)`-wrapped instance still
-/// skips. Any other error panics with `{e:#}`.
+/// [`crate::vmm::host_topology::TopologyInsufficient`] (the VM cannot boot
+/// at all on this host — the x86_64 kvm hardware caps). Both are matched
+/// chain-aware (`e.chain().any(...)`) so a `.context(...)`-wrapped instance
+/// still skips. Any other error panics with `{e:#}` — including the
+/// hard-error `PerfModeUnavailable` / `CpuBudgetUnsatisfiable` (an
+/// explicitly-requested perf guarantee or cpu budget the host cannot honor
+/// is a FAIL, not a skip).
 ///
 /// Replaces the recurring `match ... { Ok => v, Err(e) if
 /// ResourceContention => skip!(...), Err(e) => panic!(...) }`
@@ -199,8 +202,8 @@ mod tests {
         skip_fn();
     }
 
-    /// A [`TopologyInsufficient`] (host too small for the requested
-    /// perf-mode topology) routes to skip, including when wrapped in
+    /// A [`TopologyInsufficient`] (the VM cannot boot on this host — a kvm
+    /// hardware cap) routes to skip, including when wrapped in
     /// `.context(...)`.
     ///
     /// `#[cfg(panic = "unwind")]`: same rationale as the
@@ -212,7 +215,9 @@ mod tests {
         let result = std::panic::catch_unwind(|| {
             fn skip_fn() {
                 let err: anyhow::Error = anyhow::Error::new(TopologyInsufficient {
-                    reason: "performance_mode: need 4 LLCs but host has 1 LLC groups".into(),
+                    reason: "vCPU count 600 exceeds KVM_CAP_MAX_VCPUS 512; cannot boot a VM \
+                             this wide"
+                        .into(),
                 })
                 .context("build ktstr_test VM");
                 let _: () = skip_on_contention!(Err::<(), _>(err));

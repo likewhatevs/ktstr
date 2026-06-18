@@ -130,7 +130,9 @@ run at normal priority (results may be noisy).
 `validate_performance_mode()` runs during VM build and applies two
 levels of checks:
 
-**Errors (fatal):**
+**Errors (fatal) -- all surface as `PerfModeUnavailable` (a hard error,
+exit 1 / FAIL, NOT a skip: the explicitly requested isolation guarantee
+cannot be honored):**
 - Total vCPUs + 1 service CPU exceed available host CPUs.
 - Virtual LLCs exceed available LLC groups.
 - Pinning plan cannot be satisfied (an LLC group has fewer available
@@ -237,8 +239,11 @@ When `performance_mode` is enabled, the build step validates LLC
 exclusivity: each virtual LLC must reserve the entire physical
 LLC group it maps to. The validation sums the actual CPU count of
 each LLC group and checks the total (plus service CPU) fits within
-the host's online CPUs. If validation fails, the build returns an
-error (tests skip with `ResourceContention`).
+the host's online CPUs. If validation fails, the build returns the
+hard error `PerfModeUnavailable` (exit 1 / FAIL, NOT a skip): the
+explicitly requested perf-mode isolation guarantee cannot be honored
+on a too-small host. This is distinct from the transient all-slots-busy
+`ResourceContention` skip above.
 
 ## Three-way mode tier
 

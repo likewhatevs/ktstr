@@ -2731,7 +2731,8 @@ fn acquire_run_dir_flock_with_timeout(
 ///    - `performance_mode` gated off via `KTSTR_NO_PERF_MODE`
 ///      (see `run_ktstr_test_inner`),
 ///    - `ResourceContention` at `builder.build()` or `vm.run()`
-///      (topology-level unavailability — the VM never booted).
+///      (all-slots-busy / transient host-resource contention — the
+///      VM never booted).
 ///
 ///    These paths write a MINIMAL sidecar: empty VM telemetry,
 ///    `work_type = "skipped"`, and `payload` pinned to the entry's

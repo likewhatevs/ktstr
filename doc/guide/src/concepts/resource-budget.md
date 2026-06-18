@@ -58,7 +58,9 @@ is the three-tier precedence:
 
 `CpuCap::effective_count(allowed_cpus: usize) -> Result<usize>`
 clamps at acquire time, not construction time.
-`N > allowed_cpus` returns a `ResourceContention` error naming
+`N > allowed_cpus` returns a `CpuBudgetUnsatisfiable` hard error
+(exit 1 / FAIL -- an explicit cap the host cannot satisfy is a
+user-input error, not transient contention) naming
 both numbers — operators reading the error see immediately that
 the cap exceeds the process's `sched_getaffinity` cpuset, not the
 host's total online CPU count. Fixing the cap requires either

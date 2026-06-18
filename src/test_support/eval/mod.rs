@@ -156,7 +156,9 @@ pub(crate) const ERR_GUEST_CRASHED_PREFIX: &str = "guest crashed:";
 /// with a skip-class host-resource error —
 /// [`crate::vmm::host_topology::ResourceContention`] (transient slot
 /// shortage) or [`crate::vmm::host_topology::TopologyInsufficient`]
-/// (host too small for the requested perf-mode topology).
+/// (the VM cannot boot at all on this host -- the x86_64 kvm hardware
+/// caps; a perf-mode-too-small host is the hard-error `PerfModeUnavailable`
+/// instead, which this catch-all does NOT skip).
 ///
 /// No pre-build path constructs either error today. Every
 /// `ResourceContention` / `TopologyInsufficient` construction site in
@@ -202,9 +204,8 @@ pub(crate) fn run_ktstr_test_inner(
         // builder.build()/vm.run() arms below. Both predicates walk the
         // FULL `anyhow::Error` chain via `e.chain().any(...)` so an error
         // wrapped in `.context(...)` (e.g. the `"build ktstr_test VM"` and
-        // `"run ktstr_test VM"` wrappers in `evaluate_vm_result`, and
-        // `"performance_mode: topology mapping"` from acquire_slot_with_locks)
-        // is still recognised — without the chain walk, a wrapped error
+        // `"run ktstr_test VM"` wrappers in `evaluate_vm_result`) is still
+        // recognised — without the chain walk, a wrapped error
         // would skip the catch-all and the run would not record a skip
         // sidecar. Not strictly idempotent — a second write refreshes
         // run_id and timestamp — but the skip classification round-trips

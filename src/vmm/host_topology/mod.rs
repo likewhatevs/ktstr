@@ -29,16 +29,18 @@ impl std::fmt::Display for ResourceContention {
 
 impl std::error::Error for ResourceContention {}
 
-/// A permanent host-capability shortfall: the host cannot satisfy the
-/// requested topology, and no retry can change that. Two producer
-/// families: the `performance_mode` planner (the host has fewer physical
-/// CPUs or LLC groups than the test's virtual topology needs) and x86_64
-/// VM creation (guest RAM top above the host MAXPHYADDR, vCPU count above
-/// KVM_CAP_MAX_VCPUS, or max APIC id at/above KVM_CAP_MAX_VCPU_ID).
-/// Distinct from [`ResourceContention`] (a transient slot/resource
-/// shortage a retry can resolve) — a too-small host is permanent, so the
-/// operator must provision different hardware or narrow the topology
-/// rather than retry.
+/// The requested topology cannot be realized on this host, and no retry
+/// changes that. Surfaced as a SKIP by the x86_64 VM-creation caps (guest
+/// RAM top above the host MAXPHYADDR, vCPU count above KVM_CAP_MAX_VCPUS,
+/// or max APIC id at/above KVM_CAP_MAX_VCPU_ID): these fire for ANY VM of
+/// this shape, perf-mode or not, so the test cannot run here. Also
+/// returned by the `performance_mode` planner (`compute_pinning`) when the
+/// host has too few physical CPUs / LLC groups — but that perf-mode caller
+/// RE-MAPS it to [`PerfModeUnavailable`] (a hard error: the isolation
+/// guarantee was explicitly requested and cannot be honored). Distinct
+/// from [`ResourceContention`] (a transient slot/resource shortage a retry
+/// resolves → skip); a too-small host is permanent, so the operator must
+/// provision different hardware or narrow the topology rather than retry.
 ///
 /// Downcast via `anyhow::Error::downcast_ref::<TopologyInsufficient>()`
 /// (chain-aware: the `#[ktstr_test]` dispatch and `skip_on_contention!`
@@ -58,6 +60,54 @@ impl std::fmt::Display for TopologyInsufficient {
 }
 
 impl std::error::Error for TopologyInsufficient {}
+
+/// The host cannot honor the `performance_mode` guarantee (exclusive 1:1
+/// CPU pinning across the test's virtual LLC topology), and no retry
+/// changes that. A HARD ERROR — distinct from [`TopologyInsufficient`]
+/// (the VM cannot boot AT ALL on this host → skip) and
+/// [`ResourceContention`] (a transient slot/CPU shortage a retry resolves
+/// → skip). A `performance_mode` test EXPLICITLY requested the isolation
+/// guarantee, so skipping it (or silently running it unisolated) would
+/// hide that the measurement is invalid; the operator must provision a
+/// bigger host, narrow the topology, or drop `--perf-mode`.
+///
+/// Downcast via `anyhow::Error::downcast_ref::<PerfModeUnavailable>()`
+/// (chain-aware: the dispatch + macro predicates walk the full error
+/// chain, so a `.context(...)`-wrapped instance is still recognised).
+#[derive(Debug)]
+pub struct PerfModeUnavailable {
+    pub reason: String,
+}
+
+impl std::fmt::Display for PerfModeUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.reason)
+    }
+}
+
+impl std::error::Error for PerfModeUnavailable {}
+
+/// An explicit CPU budget (`--cpu-cap N` / per-test `cpu_budget = N`) the
+/// host cannot satisfy: N exceeds the CPUs this process is allowed on. A
+/// HARD ERROR, not a skip — the author typed a concrete number that does
+/// not exist on this host (a user-input error, distinct from a bare
+/// capability request). Contrast [`ResourceContention`] (a transient
+/// shortage of an otherwise-satisfiable budget → skip/retry).
+///
+/// Downcast via `anyhow::Error::downcast_ref::<CpuBudgetUnsatisfiable>()`
+/// (chain-aware).
+#[derive(Debug)]
+pub struct CpuBudgetUnsatisfiable {
+    pub reason: String,
+}
+
+impl std::fmt::Display for CpuBudgetUnsatisfiable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.reason)
+    }
+}
+
+impl std::error::Error for CpuBudgetUnsatisfiable {}
 
 /// A physical LLC group on the host, identified by its cache ID.
 #[derive(Debug, Clone)]
@@ -457,9 +507,13 @@ impl HostTopology {
             // service CPU into `total_needed`, so a passing host always
             // has at least one online CPU beyond the assigned vCPUs and
             // this never fires today. Typed as TopologyInsufficient (not
-            // plain anyhow) so that if a future refactor of that check
-            // ever lets it through, it classifies as the same host-too-
-            // small skip as its three sibling shortfall checks.
+            // plain anyhow) so that if a future refactor of that check ever
+            // lets it through, it is handled identically to its three
+            // sibling shortfall checks: the perf-mode caller
+            // (acquire_slot_with_locks) re-maps every compute_pinning
+            // TopologyInsufficient to PerfModeUnavailable (a hard FAIL), and
+            // the non-perf caller passes reserve_service_cpu=false so this
+            // site is unreachable there.
             if cpu.is_none() {
                 return Err(anyhow::Error::new(TopologyInsufficient {
                     reason: format!(
@@ -984,14 +1038,19 @@ impl CpuCap {
 
     /// Runtime-bounded cap: returns the inner count unless it exceeds
     /// `allowed_cpus` (the calling process's sched_getaffinity cpuset
-    /// count), in which case a `ResourceContention` error steers
-    /// the caller toward an actionable message. This check lives at
-    /// acquire time — not at construction — because the allowed set
-    /// is not known until `host_allowed_cpus` reads the syscall.
+    /// count), in which case a `CpuBudgetUnsatisfiable` hard error (an
+    /// explicit cap the host cannot satisfy is a FAIL, not a transient
+    /// skip) steers the caller toward an actionable message. This check
+    /// lives at acquire time — not at construction — because the allowed
+    /// set is not known until `host_allowed_cpus` reads the syscall.
     pub fn effective_count(&self, allowed_cpus: usize) -> Result<usize> {
         let n = self.n.get();
         if n > allowed_cpus {
-            return Err(anyhow::Error::new(ResourceContention {
+            // An explicit --cpu-cap the host cannot satisfy is a hard ERROR
+            // (the author typed a concrete number that does not exist here),
+            // not transient contention: CpuBudgetUnsatisfiable, not
+            // ResourceContention, so it fails rather than skips.
+            return Err(anyhow::Error::new(CpuBudgetUnsatisfiable {
                 reason: format!(
                     "--cpu-cap N = {n} exceeds the {allowed_cpus} CPUs this \
                      process is allowed on (from sched_getaffinity / \

@@ -62,10 +62,13 @@ pub(crate) enum KtstrCommand {
         /// Also settable via KTSTR_NO_PERF_MODE env var.
         #[arg(long)]
         no_perf_mode: bool,
-        /// Promote hardware-driven test skips to hard failures.
-        /// `ResourceContention` (no LLC slot / not enough CPUs / KVM
-        /// fd budget) and host-topology-insufficient skips become
-        /// exit 1 instead of silent passes. For CI environments
+        /// Promote hardware-driven test SKIPS to hard failures.
+        /// `ResourceContention` (no LLC slot currently free / KVM fd
+        /// budget exhausted -- transient) and `TopologyInsufficient`
+        /// (the VM can't boot on this host) skips become exit 1 instead
+        /// of silent passes. (Perf-mode and explicit cpu-budget hard
+        /// errors already fail and are NOT gated by this flag.) For CI
+        /// environments
         /// where the hardware IS expected to support every test —
         /// a skip means the CI config is wrong, not that the test
         /// is inapplicable. Exports `KTSTR_NO_SKIP_MODE=1`.

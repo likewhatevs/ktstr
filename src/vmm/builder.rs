@@ -613,8 +613,10 @@ impl KtstrVmBuilder {
     /// host halt polling via MSR_KVM_POLL_CONTROL). On aarch64, KVM
     /// exit suppression and CPUID hints are not available. Validated
     /// at build time -- a host with too few CPUs / LLC groups for the
-    /// topology returns `TopologyInsufficient` (busy LLC slots return
-    /// `ResourceContention`); insufficient hugepages is a warning.
+    /// requested perf topology returns `PerfModeUnavailable` (a hard
+    /// error, NOT a skip: the explicit isolation guarantee cannot be
+    /// honored); busy LLC slots return `ResourceContention` (skip-class,
+    /// transient); insufficient hugepages is a warning.
     #[allow(dead_code)]
     pub fn performance_mode(mut self, enabled: bool) -> Self {
         self.performance_mode = enabled;
@@ -841,9 +843,11 @@ impl KtstrVmBuilder {
     /// Returns `Err` for missing required inputs (kernel, init binary),
     /// invalid topology, or host resources insufficient to satisfy
     /// `performance_mode` requirements (a too-small host surfaces as
-    /// `TopologyInsufficient`, busy LLC slots as `ResourceContention`;
-    /// both are skip-class, which callers typically treat as a skip
-    /// rather than a failure).
+    /// `PerfModeUnavailable` — a hard error, NOT skip-class: the
+    /// explicitly-requested isolation guarantee cannot be honored; busy
+    /// LLC slots surface as `ResourceContention`, which IS skip-class). An
+    /// explicit over-budget `--cpu-cap` / `cpu_budget` surfaces as
+    /// `CpuBudgetUnsatisfiable` (also a hard error).
     pub fn build(mut self) -> Result<KtstrVm> {
         // Periodic capture's boundary computation requires
         // `workload_duration` to slice. Without it the
@@ -952,11 +956,31 @@ impl KtstrVmBuilder {
                         let allowed = host_topology::host_allowed_cpus().len();
                         let vcpus = self.topology.total_cpus() as usize;
                         // A per-test `cpu_budget` (#[ktstr_test]) overrides the
-                        // auto-size: clamp to [1, allowed] so a test can force
-                        // overcommit (budget < vcpus) without exceeding the host
-                        // allowance. Absent → size to the vCPU count.
+                        // auto-size: a budget > allowed is a CpuBudgetUnsatisfiable
+                        // hard error (see the match arm); ≤ allowed stands (floored
+                        // at 1) so a test can force overcommit (budget < vcpus).
+                        // Absent → size to the vCPU count.
                         let budget = match self.cpu_budget {
-                            Some(n) => (n as usize).clamp(1, allowed.max(1)),
+                            // An explicit per-test cpu_budget the host cannot
+                            // satisfy is a hard ERROR (the author set a concrete
+                            // number exceeding the allowed CPUs), symmetric with
+                            // --cpu-cap. At or below the allowance it stands
+                            // (floored at 1) so a test can force overcommit.
+                            Some(n) => {
+                                let n = n as usize;
+                                if n > allowed {
+                                    return Err(anyhow::Error::new(
+                                        host_topology::CpuBudgetUnsatisfiable {
+                                            reason: format!(
+                                                "cpu_budget = {n} exceeds the {allowed} CPUs \
+                                                 this process is allowed on; pick a budget \
+                                                 ≤ {allowed} or release the cpuset constraint"
+                                            ),
+                                        },
+                                    ));
+                                }
+                                n.max(1)
+                            }
                             None => host_topology::no_perf_cpu_budget(allowed, vcpus),
                         };
                         Some(host_topology::CpuCap::new(budget)?)
@@ -1207,11 +1231,13 @@ impl KtstrVmBuilder {
 
     /// Validate host resources for performance_mode and compute the
     /// pinning plan. Returns both the plan and the host topology (needed
-    /// for NUMA node discovery). Returns `TopologyInsufficient` when the
-    /// host has too few CPUs / LLC groups for the requested topology (a
-    /// permanent shortfall, here and in `compute_pinning`), or
-    /// `ResourceContention` when the host is big enough but LLC slots are
-    /// currently busy. Warnings are printed for degraded conditions
+    /// for NUMA node discovery). Returns `PerfModeUnavailable` when the
+    /// host has too few CPUs / LLC groups for the requested perf topology
+    /// (the explicit isolation guarantee cannot be honored — a hard error,
+    /// from the pre-check here and via the `compute_pinning` re-map in
+    /// `acquire_slot_with_locks`), or `ResourceContention` when the host is
+    /// big enough but all LLC slots are currently busy (transient →
+    /// skip/retry). Warnings are printed for degraded conditions
     /// (hugepages, host load).
     fn validate_performance_mode(
         &mut self,
@@ -1234,11 +1260,12 @@ impl KtstrVmBuilder {
             .sum();
         let total_reserved = reserved + 1; // +1 for service CPU
         if total_reserved > host_topo.total_cpus() {
-            // The host has fewer CPUs than perf-mode must reserve: a
-            // permanent shortfall (provision a bigger host or drop perf
-            // mode), not transient slot contention — classify it as such
-            // so the operator banner says "host topology insufficient".
-            return Err(anyhow::Error::new(host_topology::TopologyInsufficient {
+            // The host has fewer CPUs than perf-mode must reserve: the
+            // explicitly-requested isolation guarantee cannot be honored on
+            // this host. A hard ERROR (PerfModeUnavailable), not a skip —
+            // the operator must provision a bigger host, narrow the
+            // topology, or drop --perf-mode.
+            return Err(anyhow::Error::new(host_topology::PerfModeUnavailable {
                 reason: format!(
                     "performance_mode: need {} CPUs ({} across {} LLCs + 1 service) \
                      but only {} host CPUs available\n  \
@@ -1310,8 +1337,11 @@ fn build_per_node_map(
 
 /// Try each LLC slot, compute a pinning plan, and acquire resource
 /// locks (non-blocking). Single pass through all available slots.
-/// Returns `ResourceContention` when all slots are busy; callers
-/// rely on nextest retry backoff for contention resolution.
+/// Returns `PerfModeUnavailable` when `compute_pinning` reports the host is
+/// too small for the perf topology (the isolation guarantee cannot be
+/// honored — a hard error), or `ResourceContention` when the host fits but
+/// all slots are currently busy (transient; callers rely on nextest retry
+/// backoff for contention resolution).
 fn acquire_slot_with_locks(
     host_topo: &host_topology::HostTopology,
     topo: &topology::Topology,
@@ -1324,9 +1354,23 @@ fn acquire_slot_with_locks(
     for slot in 0..max_slots {
         let offset = slot * llcs_needed;
 
-        let candidate = host_topo
-            .compute_pinning(topo, true, offset)
-            .context("performance_mode: topology mapping")?;
+        let candidate = match host_topo.compute_pinning(topo, true, offset) {
+            Ok(c) => c,
+            // compute_pinning returns TopologyInsufficient when the host has
+            // too few CPUs/LLCs for the requested perf topology. For a
+            // perf-mode test that means the isolation guarantee cannot be
+            // honored here -> hard ERROR (PerfModeUnavailable), distinct from
+            // the transient all-slots-busy ResourceContention below.
+            Err(e)
+                if e.downcast_ref::<host_topology::TopologyInsufficient>()
+                    .is_some() =>
+            {
+                return Err(anyhow::Error::new(host_topology::PerfModeUnavailable {
+                    reason: format!("performance_mode: {e:#}"),
+                }));
+            }
+            Err(e) => return Err(e).context("performance_mode: topology mapping"),
+        };
 
         match host_topology::acquire_resource_locks(&candidate, &candidate.llc_indices, llc_mode)? {
             host_topology::LockOutcome::Acquired { locks, .. } => {

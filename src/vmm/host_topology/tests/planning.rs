@@ -28,8 +28,10 @@ fn cpu_cap_effective_count_fits() {
 }
 
 /// `effective_count` when cap exceeds the allowed-CPU count
-/// returns a `ResourceContention` error naming both numbers, so
-/// the operator can fix the flag without re-running `ktstr topo`.
+/// returns a `CpuBudgetUnsatisfiable` hard error naming both
+/// numbers. An explicit `--cpu-cap` the host cannot satisfy is a
+/// user-input error (FAIL so the operator fixes the flag), NOT
+/// transient contention (skip/retry).
 #[test]
 fn cpu_cap_effective_count_exceeds_host() {
     let cap = CpuCap::new(8).unwrap();
@@ -37,11 +39,11 @@ fn cpu_cap_effective_count_exceeds_host() {
     let msg = format!("{err:#}");
     assert!(msg.contains("8"), "msg must name requested cap: {msg}");
     assert!(msg.contains("4"), "msg must name allowed-CPU count: {msg}");
-    // Must downcast to ResourceContention for nextest-retry
-    // routing per the Tier-1/Tier-2 contract.
+    // Must downcast to CpuBudgetUnsatisfiable: a hard FAIL (the typed
+    // cap does not fit the host), NOT a ResourceContention skip/retry.
     assert!(
-        err.downcast_ref::<ResourceContention>().is_some(),
-        "must be a ResourceContention for retry routing: {msg}",
+        err.downcast_ref::<CpuBudgetUnsatisfiable>().is_some(),
+        "must be a CpuBudgetUnsatisfiable hard error: {msg}",
     );
 }
 
@@ -262,10 +264,12 @@ fn numa_nodes_sorted_by_distance_skips_empty_nodes() {
 
 /// `acquire_llc_plan` with `cpu_cap == Some(cap)` and
 /// `cap > allowed-CPU count` fails at `effective_count` with a
-/// `ResourceContention` — before any /tmp side-effects. Pins
-/// that over-cap fails cleanly without touching the lock pool.
-/// The test pins a 2-CPU allowed set and caps at 3 CPUs, the
-/// minimum pair that exercises the "N > allowed" branch.
+/// `CpuBudgetUnsatisfiable` hard error — before any /tmp
+/// side-effects. An explicit cap the host cannot satisfy is a
+/// user-input FAIL, not retry-routed contention. Pins that
+/// over-cap fails cleanly without touching the lock pool. The
+/// test pins a 2-CPU allowed set and caps at 3 CPUs, the minimum
+/// pair that exercises the "N > allowed" branch.
 #[test]
 fn acquire_llc_plan_rejects_cap_over_allowed_cpus() {
     let _allowed = AllowedCpusGuard::new(vec![0, 1]);
@@ -276,8 +280,8 @@ fn acquire_llc_plan_rejects_cap_over_allowed_cpus() {
     let err =
         acquire_llc_plan(&topo, &test_topo, Some(cap)).expect_err("cap > allowed_cpus must error");
     assert!(
-        err.downcast_ref::<ResourceContention>().is_some(),
-        "must be ResourceContention: {err:#}"
+        err.downcast_ref::<CpuBudgetUnsatisfiable>().is_some(),
+        "must be CpuBudgetUnsatisfiable: {err:#}"
     );
 }
 
@@ -654,8 +658,8 @@ fn cpu_cap_effective_count_on_zero_llc_host() {
     let cap = CpuCap::new(1).unwrap();
     let err = cap.effective_count(0).expect_err("1 > 0 must error");
     assert!(
-        err.downcast_ref::<ResourceContention>().is_some(),
-        "must be ResourceContention for retry routing",
+        err.downcast_ref::<CpuBudgetUnsatisfiable>().is_some(),
+        "must be CpuBudgetUnsatisfiable: an explicit cap > host is a hard error",
     );
 }
 
