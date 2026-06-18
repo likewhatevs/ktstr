@@ -3574,6 +3574,95 @@ fn uint_v(v: u64) -> RenderedValue {
     RenderedValue::Uint { bits: 64, value: v }
 }
 
+/// A map whose contents failed to render at capture: no `value`,
+/// no entries, `error` set — exactly the shape `render_map` emits
+/// when the guest-memory read of a map's value region fails.
+fn make_errored_map(name: &str, error: &str) -> FailureDumpMap {
+    FailureDumpMap {
+        name: name.to_string(),
+        map_kva: 0,
+        map_type: 2,
+        max_entries: 1,
+        value: None,
+        error: Some(error.to_string()),
+        ..FailureDumpMap::default()
+    }
+}
+
+/// A render-failed global-section map (`.bss` naming so `var`
+/// considers it) — a render failure surfaces as MapRenderIncomplete,
+/// not a false VarNotFound.
+#[test]
+fn snapshot_var_surfaces_render_failure_not_var_not_found() {
+    let report = make_report_with_maps(vec![make_errored_map(
+        "scx_test.bss",
+        "ARRAY value region unreadable",
+    )]);
+    let snap = Snapshot::new(&report);
+    match snap.var("counter") {
+        SnapshotField::Missing(SnapshotError::MapRenderIncomplete { map, error }) => {
+            assert_eq!(map, "scx_test.bss");
+            assert_eq!(error, "ARRAY value region unreadable");
+        }
+        other => panic!("expected MapRenderIncomplete, got {other:?}"),
+    }
+}
+
+/// A successfully-rendered global map with no errored sibling still
+/// reports VarNotFound for a genuinely-absent var — the render-failure
+/// path must not fire when the contents are present.
+#[test]
+fn snapshot_var_absent_in_rendered_map_is_var_not_found() {
+    let report = make_report_with_maps(vec![make_global_map(
+        "scx_test.bss",
+        vec![("counter", uint_v(7))],
+    )]);
+    let snap = Snapshot::new(&report);
+    match snap.var("missing") {
+        SnapshotField::Missing(SnapshotError::VarNotFound { requested, .. }) => {
+            assert_eq!(requested, "missing");
+        }
+        other => panic!("expected VarNotFound, got {other:?}"),
+    }
+}
+
+/// `at` on a render-failed map surfaces MapRenderIncomplete rather
+/// than IndexOutOfRange { len: 0 } — a capture gap is not an empty map.
+#[test]
+fn snapshot_at_on_render_failed_map_surfaces_render_failure() {
+    let report = make_report_with_maps(vec![make_errored_map("scx_test.bss", "boom")]);
+    let snap = Snapshot::new(&report);
+    let entry = snap.map("scx_test.bss").unwrap().at(0);
+    match entry {
+        SnapshotEntry::Missing(SnapshotError::MapRenderIncomplete { map, error }) => {
+            assert_eq!(map, "scx_test.bss");
+            assert_eq!(error, "boom");
+        }
+        other => panic!("expected MapRenderIncomplete, got {other:?}"),
+    }
+}
+
+/// `find` / `max_by` over a render-failed map surface
+/// MapRenderIncomplete rather than NoMatch { len: 0 }.
+#[test]
+fn snapshot_find_and_max_by_on_render_failed_map_surface_render_failure() {
+    let report = make_report_with_maps(vec![make_errored_map("scx_test.bss", "boom")]);
+    let snap = Snapshot::new(&report);
+    let m = snap.map("scx_test.bss").unwrap();
+    match m.find(|_| true) {
+        SnapshotEntry::Missing(SnapshotError::MapRenderIncomplete { error, .. }) => {
+            assert_eq!(error, "boom");
+        }
+        other => panic!("find: expected MapRenderIncomplete, got {other:?}"),
+    }
+    match m.max_by(|_| 0) {
+        SnapshotEntry::Missing(SnapshotError::MapRenderIncomplete { error, .. }) => {
+            assert_eq!(error, "boom");
+        }
+        other => panic!("max_by: expected MapRenderIncomplete, got {other:?}"),
+    }
+}
+
 #[test]
 fn snapshot_active_single_obj_returns_filtered_view() {
     let report = make_report_with_maps(vec![make_global_map(

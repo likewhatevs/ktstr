@@ -428,6 +428,21 @@ pub enum SnapshotError {
     /// Surfaces in temporal-assertion failure messages as
     /// `projection failed: <reason>`.
     ProjectionFailed { reason: String },
+    /// A captured map's contents could not be rendered at dump time:
+    /// `crate::monitor::dump::FailureDumpMap::error` is set and the
+    /// map carries no entries / value to walk. Surfaced by
+    /// [`super::Snapshot::var`] / [`super::SnapshotMap::at`] /
+    /// [`super::SnapshotMap::find`] / [`super::SnapshotMap::max_by`]
+    /// instead of [`Self::VarNotFound`] /
+    /// [`Self::IndexOutOfRange`] `{ len: 0 }` /
+    /// [`Self::NoMatch`] `{ len: 0 }` so a guest-memory render
+    /// failure is distinguishable from a genuinely-absent variable
+    /// or a legitimately-empty map. Without this distinction a map
+    /// whose contents failed to read reads identically to "the
+    /// symbol does not exist", masking the capture failure.
+    /// `map` names the owning map; `error` mirrors
+    /// `FailureDumpMap.error`.
+    MapRenderIncomplete { map: String, error: String },
 }
 
 impl std::fmt::Display for SnapshotError {
@@ -688,6 +703,12 @@ impl std::fmt::Display for SnapshotError {
             }
             SnapshotError::ProjectionFailed { reason } => {
                 write!(f, "projection failed: {reason}")
+            }
+            SnapshotError::MapRenderIncomplete { map, error } => {
+                write!(
+                    f,
+                    "map '{map}' contents unavailable (render failed at capture): {error}"
+                )
             }
         }
     }
