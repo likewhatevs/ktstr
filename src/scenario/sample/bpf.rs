@@ -162,7 +162,7 @@ impl SampleSeries {
         }
         let mut values: Vec<SnapshotResult<T>> = Vec::with_capacity(self.rows.len());
         let mut tags: Vec<String> = Vec::with_capacity(self.rows.len());
-        let mut elapsed: Vec<u64> = Vec::with_capacity(self.rows.len());
+        let mut elapsed: Vec<Option<u64>> = Vec::with_capacity(self.rows.len());
         let mut phases: Vec<Option<crate::assert::Phase>> = Vec::with_capacity(self.rows.len());
         let mut phase_kva_pin: std::collections::BTreeMap<crate::assert::Phase, Vec<u64>> =
             std::collections::BTreeMap::new();
@@ -231,7 +231,7 @@ impl SampleSeries {
                 (other, _) => values.push(other),
             }
         }
-        SeriesField::from_parts_with_phases(label, tags, elapsed, values, phases)
+        SeriesField::from_parts_with_phases_opt(label, tags, elapsed, values, phases)
     }
 
     /// Per-snapshot co-picked BPF projection of N counters from the
@@ -275,7 +275,7 @@ impl SampleSeries {
         let mut per_field: [Vec<crate::scenario::snapshot::SnapshotResult<u64>>; N] =
             std::array::from_fn(|_| Vec::with_capacity(self.rows.len()));
         let mut tags: Vec<String> = Vec::with_capacity(self.rows.len());
-        let mut elapsed: Vec<u64> = Vec::with_capacity(self.rows.len());
+        let mut elapsed: Vec<Option<u64>> = Vec::with_capacity(self.rows.len());
         let mut phases: Vec<Option<crate::assert::Phase>> = Vec::with_capacity(self.rows.len());
 
         for row in &self.rows {
@@ -319,7 +319,7 @@ impl SampleSeries {
         // value vector. Tags / elapsed / phases share the same
         // sample identity across fields — clone for each output.
         std::array::from_fn(|i| {
-            crate::assert::temporal::SeriesField::from_parts_with_phases(
+            crate::assert::temporal::SeriesField::from_parts_with_phases_opt(
                 names[i].to_string(),
                 tags.clone(),
                 elapsed.clone(),

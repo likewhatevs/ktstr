@@ -82,11 +82,18 @@ impl<'a> HostView<'a> {
     /// production walker (`collect_per_cpu_time`) enforces one
     /// entry per cpu per sample, but the lookup leaves the contract
     /// first-match for graceful degradation on a malformed report.
+    /// Samples whose `elapsed_ms` is `None` (the bridge recorded no
+    /// timestamp) are EXCLUDED: a timestamp-less sample has
+    /// no position on a time-ordered axis, and placing it at a
+    /// fabricated `0` would corrupt the ascending-by-time contract.
     pub fn per_cpu_time_timeline(&self, cpu: u32) -> Vec<(u64, &'a PerCpuTimeStats)> {
         let mut entries: Vec<(u64, &'a PerCpuTimeStats)> = Vec::new();
         for row in self.rows {
+            let Some(elapsed_ms) = row.elapsed_ms else {
+                continue;
+            };
             if let Some(stats) = row.report.per_cpu_time.iter().find(|c| c.cpu == cpu) {
-                entries.push((row.elapsed_ms, stats));
+                entries.push((elapsed_ms, stats));
             }
         }
         entries.sort_by_key(|(elapsed_ms, _)| *elapsed_ms);
@@ -230,6 +237,43 @@ mod tests {
             "cpu not captured in any sample MUST yield empty timeline (not default-zero)"
         );
         assert_eq!(host.cpus(), vec![0, 3]);
+    }
+
+    /// REGRESSION: a sample whose `elapsed_ms` is `None` (the
+    /// bridge recorded no timestamp) is DROPPED from the time-ordered
+    /// timeline — it has no position on a time axis and must not be
+    /// placed at a fabricated `0` (which would sort first and corrupt the
+    /// ascending contract).
+    #[test]
+    fn series_host_per_cpu_time_timeline_drops_none_elapsed() {
+        let mk = |user_ns: u64| FailureDumpReport {
+            per_cpu_time: vec![PerCpuTimeStats {
+                cpu: 0,
+                cpustat_user_ns: user_ns,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let series = SampleSeries::from_drained(
+            vec![
+                ("a".to_string(), mk(10), None, Some(100u64)),
+                // No recorded timestamp: must be dropped from the timeline.
+                ("b".to_string(), mk(20), None, None),
+                ("c".to_string(), mk(30), None, Some(300u64)),
+            ],
+            None,
+        );
+        let host = series.host().expect("non-empty series");
+        let t0 = host.per_cpu_time_timeline(0);
+        assert_eq!(
+            t0.len(),
+            2,
+            "the None-elapsed row must be dropped, not placed at a fabricated 0",
+        );
+        assert_eq!(t0[0].0, 100);
+        assert_eq!(t0[0].1.cpustat_user_ns, 10);
+        assert_eq!(t0[1].0, 300);
+        assert_eq!(t0[1].1.cpustat_user_ns, 30);
     }
 
     /// Multi-sample series with NON-monotonic elapsed_ms:
@@ -610,13 +654,13 @@ mod tests {
         let full: Vec<_> = field.iter_full().collect();
         assert_eq!(full.len(), 3);
         assert_eq!(full[0].0, "alpha");
-        assert_eq!(full[0].1, 100);
+        assert_eq!(full[0].1, Some(100));
         assert_eq!(*full[0].2.as_ref().unwrap(), 10);
         assert_eq!(full[1].0, "beta");
-        assert_eq!(full[1].1, 200);
+        assert_eq!(full[1].1, Some(200));
         assert_eq!(*full[1].2.as_ref().unwrap(), 20);
         assert_eq!(full[2].0, "gamma");
-        assert_eq!(full[2].1, 300);
+        assert_eq!(full[2].1, Some(300));
         assert_eq!(*full[2].2.as_ref().unwrap(), 30);
     }
 

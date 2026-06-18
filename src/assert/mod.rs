@@ -1609,14 +1609,17 @@ pub struct PhaseBucket {
     /// inspection of the formatted diagnostic and the structured
     /// sidecar yield the same phase identifiers.
     pub label: String,
-    /// Phase window start, milliseconds since `run_start`
-    /// (pause-adjusted to match [`crate::scenario::sample::Sample`]
-    /// elapsed timestamps).
+    /// Phase window start: the MINIMUM per-sample time anchor in the
+    /// phase — each sample's `boundary_offset_ms`, falling back to its
+    /// `elapsed_ms`. Samples with neither anchor (both `None` — a
+    /// not-measured timestamp) are excluded from the min.
     pub start_ms: u64,
-    /// Phase window end, milliseconds since `run_start`
-    /// (inclusive). Set to the last bucketed sample's `elapsed_ms`;
-    /// downstream renderers should not assume the value is closed
-    /// against a stimulus event.
+    /// Phase window end: the MAXIMUM per-sample time anchor in the
+    /// phase (the same `boundary_offset_ms`-or-`elapsed_ms` key as
+    /// `start_ms`). A phase whose every sample is unanchored yields the
+    /// inverted window `(start_ms = u64::MAX, end_ms = 0)`, which folds
+    /// no monitor samples. Downstream renderers should not assume the
+    /// value is closed against a stimulus event.
     pub end_ms: u64,
     /// Number of periodic samples bucketed into this phase. Zero
     /// when the phase fired no captures (e.g. BASELINE when the
@@ -2478,7 +2481,11 @@ fn phase_group_cpu_delta(
     // boundary — the grouped vec is not guaranteed sorted (the
     // offset-remap in the stimulus path can reorder samples).
     let mut ordered: Vec<&crate::scenario::sample::Sample<'_>> = samples.iter().collect();
-    ordered.sort_by_key(|s| s.boundary_offset_ms.unwrap_or(s.elapsed_ms));
+    // `elapsed_ms` is now Option: a sample with neither a
+    // boundary offset nor a measured elapsed has no time anchor — sort
+    // it LAST (u64::MAX), never first, so an untimestamped sample can't
+    // become the spurious earliest first_seen endpoint.
+    ordered.sort_by_key(|s| s.boundary_offset_ms.or(s.elapsed_ms).unwrap_or(u64::MAX));
 
     // Per tgid: its full group total at the first and last sample in which
     // it had a readable total, and how many such samples it had.
@@ -2565,17 +2572,23 @@ fn buckets_from_grouped(
         // / on-demand). min/max rather than first/last because the
         // offset-remap in the stimulus path can reorder samples
         // relative to drain order.
-        let win =
-            |s: &crate::scenario::sample::Sample<'_>| s.boundary_offset_ms.unwrap_or(s.elapsed_ms);
+        let win = |s: &crate::scenario::sample::Sample<'_>| s.boundary_offset_ms.or(s.elapsed_ms);
         let (start_ms, end_ms) = if samples_in_phase.is_empty() {
             (0, u64::MAX)
         } else {
             let mut lo = u64::MAX;
             let mut hi = 0u64;
             for s in &samples_in_phase {
-                let w = win(s);
-                lo = lo.min(w);
-                hi = hi.max(w);
+                // Skip a sample with no time anchor (no boundary offset
+                // AND no measured elapsed): coercing it to 0
+                // would pull start_ms to 0 and over-fold monitor samples.
+                // If EVERY sample in the phase is unanchored, lo/hi stay
+                // (u64::MAX, 0) — an inverted window that folds nothing,
+                // the correct "no placeable samples" outcome.
+                if let Some(w) = win(s) {
+                    lo = lo.min(w);
+                    hi = hi.max(w);
+                }
             }
             (lo, hi)
         };

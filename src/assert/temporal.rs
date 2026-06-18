@@ -47,7 +47,7 @@ use super::{AssertDetail, DetailKind, Outcome, Verdict};
 /// Per-sample triple `(tag, elapsed_ms, &value)` yielded by
 /// [`SeriesField::iter_full`] and stored in the per-phase buckets
 /// returned by [`SeriesField::by_phase`].
-pub type SampleTriple<'a, T> = (&'a str, u64, &'a SnapshotResult<T>);
+pub type SampleTriple<'a, T> = (&'a str, Option<u64>, &'a SnapshotResult<T>);
 
 /// Return shape of [`SeriesField::by_phase`]: a `BTreeMap` keyed by
 /// `Phase` carrying the samples whose source row had a stamped
@@ -58,12 +58,25 @@ pub type ByPhasePartition<'a, T> = (
     Vec<SampleTriple<'a, T>>,
 );
 
+/// Render the numeric part of an optional sample timestamp for the
+/// `(+{n}ms)` failure-/skip-message convention: `Some(ms)` -> `"123"`,
+/// `None` (the bridge recorded no timestamp for this sample) -> `"?"`,
+/// so a not-measured sample reads as `+?ms` — visibly distinct from a
+/// measured `+0ms`. Keeping it numeric lets the existing
+/// `"(+{elapsed_ms}ms)"` format strings stay unchanged.
+fn fmt_elapsed_num(elapsed_ms: Option<u64>) -> String {
+    match elapsed_ms {
+        Some(ms) => ms.to_string(),
+        None => "?".to_string(),
+    }
+}
+
 #[derive(Debug, Clone)]
 #[must_use = "SeriesField records nothing until a temporal pattern is invoked"]
 pub struct SeriesField<T> {
     label: String,
     tags: Vec<String>,
-    elapsed_ms: Vec<u64>,
+    elapsed_ms: Vec<Option<u64>>,
     values: Vec<SnapshotResult<T>>,
     /// Per-sample scenario phase, mirrored from the
     /// [`crate::scenario::sample::Sample::step_index`] each value
@@ -99,10 +112,40 @@ impl<T> SeriesField<T> {
     /// is intended for projection helpers in
     /// [`crate::scenario::sample`] that already know each sample's
     /// step_index from the drained bridge tuple.
+    /// 5-arg convenience taking MEASURED `Vec<u64>` timestamps; wraps
+    /// each in `Some` and delegates to [`Self::from_parts_with_phases_opt`].
+    /// Test fixtures (which always model measured samples) and any
+    /// all-measured caller use this. The production projection funnel
+    /// — which threads `Option<u64>` from the bridge so "not measured"
+    /// stays distinct from "measured 0" — calls
+    /// [`Self::from_parts_with_phases_opt`] directly.
     pub fn from_parts_with_phases(
         label: impl Into<String>,
         tags: Vec<String>,
         elapsed_ms: Vec<u64>,
+        values: Vec<SnapshotResult<T>>,
+        phases: Vec<Option<crate::assert::Phase>>,
+    ) -> Self {
+        Self::from_parts_with_phases_opt(
+            label,
+            tags,
+            elapsed_ms.into_iter().map(Some).collect(),
+            values,
+            phases,
+        )
+    }
+
+    /// None-aware constructor: `elapsed_ms[i] == None` means the bridge
+    /// recorded no timestamp for that sample (not measured), kept
+    /// distinct from a measured `Some(0)`. Temporal patterns that do
+    /// timestamp math ([`EachClaim`]-free `rate_within` dt,
+    /// `steady_within` warmup gate, `converges_to` deadline gate) SKIP
+    /// a `None`-anchored sample rather than fabricating a `0` (the
+    /// silent-wrong-answer this distinction prevents).
+    pub fn from_parts_with_phases_opt(
+        label: impl Into<String>,
+        tags: Vec<String>,
+        elapsed_ms: Vec<Option<u64>>,
         values: Vec<SnapshotResult<T>>,
         phases: Vec<Option<crate::assert::Phase>>,
     ) -> Self {
@@ -298,7 +341,7 @@ impl<T> SeriesField<T> {
     /// vectors are guaranteed equal-length to `values` by
     /// [`Self::from_parts`]'s `assert_eq!` checks (which run in
     /// both debug and release builds).
-    pub fn iter_full(&self) -> impl Iterator<Item = (&str, u64, &SnapshotResult<T>)> {
+    pub fn iter_full(&self) -> impl Iterator<Item = (&str, Option<u64>, &SnapshotResult<T>)> {
         self.tags
             .iter()
             .zip(self.elapsed_ms.iter())
@@ -862,7 +905,7 @@ where
                             "{label} (each.at_least {floor}): sample {tag} (+{elapsed_ms}ms): \
                              value {v}",
                             tag = self.field.tags[i],
-                            elapsed_ms = self.field.elapsed_ms[i],
+                            elapsed_ms = fmt_elapsed_num(self.field.elapsed_ms[i]),
                         ),
                     ),
                     None => push_detail(
@@ -871,7 +914,7 @@ where
                             "{label} (each.at_least {floor}): sample {tag} (+{elapsed_ms}ms): \
                              value {v} is incomparable (NaN)",
                             tag = self.field.tags[i],
-                            elapsed_ms = self.field.elapsed_ms[i],
+                            elapsed_ms = fmt_elapsed_num(self.field.elapsed_ms[i]),
                         ),
                     ),
                     Some(std::cmp::Ordering::Equal | std::cmp::Ordering::Greater) => {}
@@ -883,7 +926,7 @@ where
                             "{label} (each.at_least {floor}): sample {tag} (+{elapsed_ms}ms): \
                              projection error: {e}",
                             tag = self.field.tags[i],
-                            elapsed_ms = self.field.elapsed_ms[i],
+                            elapsed_ms = fmt_elapsed_num(self.field.elapsed_ms[i]),
                         ),
                     );
                 }
@@ -911,7 +954,7 @@ where
                             "{label} (each.at_most {ceiling}): sample {tag} (+{elapsed_ms}ms): \
                              value {v}",
                             tag = self.field.tags[i],
-                            elapsed_ms = self.field.elapsed_ms[i],
+                            elapsed_ms = fmt_elapsed_num(self.field.elapsed_ms[i]),
                         ),
                     ),
                     None => push_detail(
@@ -920,7 +963,7 @@ where
                             "{label} (each.at_most {ceiling}): sample {tag} (+{elapsed_ms}ms): \
                              value {v} is incomparable (NaN)",
                             tag = self.field.tags[i],
-                            elapsed_ms = self.field.elapsed_ms[i],
+                            elapsed_ms = fmt_elapsed_num(self.field.elapsed_ms[i]),
                         ),
                     ),
                     Some(std::cmp::Ordering::Equal | std::cmp::Ordering::Less) => {}
@@ -932,7 +975,7 @@ where
                             "{label} (each.at_most {ceiling}): sample {tag} (+{elapsed_ms}ms): \
                              projection error: {e}",
                             tag = self.field.tags[i],
-                            elapsed_ms = self.field.elapsed_ms[i],
+                            elapsed_ms = fmt_elapsed_num(self.field.elapsed_ms[i]),
                         ),
                     );
                 }
@@ -972,7 +1015,7 @@ where
                                 "{label} (each.between [{lo}, {hi}]): sample {tag} \
                                  (+{elapsed_ms}ms): value {v} is incomparable (NaN)",
                                 tag = self.field.tags[i],
-                                elapsed_ms = self.field.elapsed_ms[i],
+                                elapsed_ms = fmt_elapsed_num(self.field.elapsed_ms[i]),
                             ),
                         );
                     } else if matches!(lo_cmp, Some(std::cmp::Ordering::Less))
@@ -984,7 +1027,7 @@ where
                                 "{label} (each.between [{lo}, {hi}]): sample {tag} \
                                  (+{elapsed_ms}ms): value {v}",
                                 tag = self.field.tags[i],
-                                elapsed_ms = self.field.elapsed_ms[i],
+                                elapsed_ms = fmt_elapsed_num(self.field.elapsed_ms[i]),
                             ),
                         );
                     }
@@ -996,7 +1039,7 @@ where
                             "{label} (each.between [{lo}, {hi}]): sample {tag} \
                              (+{elapsed_ms}ms): projection error: {e}",
                             tag = self.field.tags[i],
-                            elapsed_ms = self.field.elapsed_ms[i],
+                            elapsed_ms = fmt_elapsed_num(self.field.elapsed_ms[i]),
                         ),
                     );
                 }
@@ -1088,7 +1131,7 @@ where
                     skipped.push(format!(
                         "{tag}(+{elapsed_ms}ms): {e}",
                         tag = self.tags[i],
-                        elapsed_ms = self.elapsed_ms[i],
+                        elapsed_ms = fmt_elapsed_num(self.elapsed_ms[i]),
                     ));
                     continue;
                 }
@@ -1113,9 +1156,9 @@ where
                          (+{prev_elapsed}ms)",
                         label = self.label,
                         tag = self.tags[i + 1],
-                        elapsed_ms = self.elapsed_ms[i + 1],
+                        elapsed_ms = fmt_elapsed_num(self.elapsed_ms[i + 1]),
                         prev_tag = self.tags[i],
-                        prev_elapsed = self.elapsed_ms[i],
+                        prev_elapsed = fmt_elapsed_num(self.elapsed_ms[i]),
                     ),
                 );
             }
@@ -1132,7 +1175,7 @@ where
             skipped.push(format!(
                 "{tag}(+{elapsed_ms}ms): {e}",
                 tag = self.tags[i],
-                elapsed_ms = self.elapsed_ms[i],
+                elapsed_ms = fmt_elapsed_num(self.elapsed_ms[i]),
             ));
         }
         if !skipped.is_empty() {
@@ -1204,21 +1247,38 @@ impl SeriesField<f64> {
                         endpoints.push(format!(
                             "{tag}(+{elapsed_ms}ms): {e}",
                             tag = self.tags[i],
-                            elapsed_ms = self.elapsed_ms[i],
+                            elapsed_ms = fmt_elapsed_num(self.elapsed_ms[i]),
                         ));
                     }
                     if let Err(e) = rhs_slot {
                         endpoints.push(format!(
                             "{tag}(+{elapsed_ms}ms): {e}",
                             tag = self.tags[i + 1],
-                            elapsed_ms = self.elapsed_ms[i + 1],
+                            elapsed_ms = fmt_elapsed_num(self.elapsed_ms[i + 1]),
                         ));
                     }
                     gaps.push(endpoints.join(" | "));
                     continue;
                 }
             };
-            let dt_ms = self.elapsed_ms[i + 1].saturating_sub(self.elapsed_ms[i]) as f64;
+            // A None elapsed endpoint = the bridge recorded no timestamp
+            // for that sample: the interval's duration is
+            // UNDEFINED, so the rate over it cannot be computed. Skip the
+            // pair (record it in `gaps`) rather than fabricating a dt from
+            // a `0` — this runs BEFORE the dt<=0 guard, which applies only
+            // once both endpoints are measured.
+            let (Some(prev_ms), Some(next_ms)) = (self.elapsed_ms[i], self.elapsed_ms[i + 1])
+            else {
+                gaps.push(format!(
+                    "{prev_tag}(+{prev_elapsed}ms)..{tag}(+{elapsed_ms}ms): elapsed not measured",
+                    prev_tag = self.tags[i],
+                    prev_elapsed = fmt_elapsed_num(self.elapsed_ms[i]),
+                    tag = self.tags[i + 1],
+                    elapsed_ms = fmt_elapsed_num(self.elapsed_ms[i + 1]),
+                ));
+                continue;
+            };
+            let dt_ms = next_ms.saturating_sub(prev_ms) as f64;
             if dt_ms <= 0.0 {
                 push_inconclusive(
                     verdict,
@@ -1228,9 +1288,9 @@ impl SeriesField<f64> {
                          INSTRUMENT-derived; rate is neither pass nor fail",
                         label = self.label,
                         prev_tag = self.tags[i],
-                        prev_elapsed = self.elapsed_ms[i],
+                        prev_elapsed = fmt_elapsed_num(self.elapsed_ms[i]),
                         tag = self.tags[i + 1],
-                        elapsed_ms = self.elapsed_ms[i + 1],
+                        elapsed_ms = fmt_elapsed_num(self.elapsed_ms[i + 1]),
                     ),
                 );
                 continue;
@@ -1255,9 +1315,9 @@ impl SeriesField<f64> {
                          or produced inf in the delta",
                         label = self.label,
                         prev_tag = self.tags[i],
-                        prev_elapsed = self.elapsed_ms[i],
+                        prev_elapsed = fmt_elapsed_num(self.elapsed_ms[i]),
                         tag = self.tags[i + 1],
-                        elapsed_ms = self.elapsed_ms[i + 1],
+                        elapsed_ms = fmt_elapsed_num(self.elapsed_ms[i + 1]),
                     ),
                 );
             } else if rate < lo || rate > hi {
@@ -1269,9 +1329,9 @@ impl SeriesField<f64> {
                          {tag} (+{elapsed_ms}ms, value {right})",
                         label = self.label,
                         prev_tag = self.tags[i],
-                        prev_elapsed = self.elapsed_ms[i],
+                        prev_elapsed = fmt_elapsed_num(self.elapsed_ms[i]),
                         tag = self.tags[i + 1],
-                        elapsed_ms = self.elapsed_ms[i + 1],
+                        elapsed_ms = fmt_elapsed_num(self.elapsed_ms[i + 1]),
                     ),
                 );
             }
@@ -1279,7 +1339,8 @@ impl SeriesField<f64> {
         if !gaps.is_empty() {
             verdict.note(format!(
                 "{label} (rate_within): {n} consecutive-pair gap(s) skipped \
-                 due to projection errors on at least one endpoint: {samples}",
+                 due to a projection error or an unmeasured elapsed timestamp \
+                 on at least one endpoint: {samples}",
                 label = self.label,
                 n = gaps.len(),
                 samples = gaps.join(", "),
@@ -1329,7 +1390,18 @@ impl SeriesField<f64> {
         // existed but all errored" (skip-Note already covers it).
         let mut any_post_warmup = false;
         for (i, slot) in self.values.iter().enumerate() {
-            if self.elapsed_ms[i] < warmup_ms {
+            // A None timestamp cannot be placed relative to
+            // the warmup window: skip with a Note rather than treating it
+            // as 0 (< warmup, silently dropped) or admitting an
+            // untimestamped value into the post-warmup band.
+            let Some(ms) = self.elapsed_ms[i] else {
+                skipped.push(format!(
+                    "{tag}(+?ms): elapsed not measured (cannot place vs warmup)",
+                    tag = self.tags[i],
+                ));
+                continue;
+            };
+            if ms < warmup_ms {
                 continue;
             }
             any_post_warmup = true;
@@ -1346,7 +1418,7 @@ impl SeriesField<f64> {
                 Ok(v) => skipped.push(format!(
                     "{tag}(+{elapsed_ms}ms): non-finite value {v}",
                     tag = self.tags[i],
-                    elapsed_ms = self.elapsed_ms[i],
+                    elapsed_ms = fmt_elapsed_num(self.elapsed_ms[i]),
                 )),
                 // Per-sample projection errors are treated as
                 // gaps: a missing post-warmup sample cannot
@@ -1363,14 +1435,14 @@ impl SeriesField<f64> {
                 Err(e) => skipped.push(format!(
                     "{tag}(+{elapsed_ms}ms): {e}",
                     tag = self.tags[i],
-                    elapsed_ms = self.elapsed_ms[i],
+                    elapsed_ms = fmt_elapsed_num(self.elapsed_ms[i]),
                 )),
             }
         }
         if !skipped.is_empty() {
             verdict.note(format!(
-                "{label} (steady_within): skipped {n} post-warmup sample(s) with \
-                 projection errors: {samples}",
+                "{label} (steady_within): skipped {n} sample(s) with a projection \
+                 error or an unmeasured elapsed timestamp: {samples}",
                 label = self.label,
                 n = skipped.len(),
                 samples = skipped.join(", "),
@@ -1411,7 +1483,7 @@ impl SeriesField<f64> {
                         label = self.label,
                         pct = tolerance * 100.0,
                         tag = self.tags[i],
-                        elapsed_ms = self.elapsed_ms[i],
+                        elapsed_ms = fmt_elapsed_num(self.elapsed_ms[i]),
                     ),
                 );
             }
@@ -1470,7 +1542,11 @@ impl SeriesField<f64> {
         let mut projected_count: usize = 0;
         let mut error_samples: Vec<String> = Vec::new();
         for (i, slot) in self.values.iter().enumerate() {
-            if self.elapsed_ms[i] > deadline_ms {
+            // A None timestamp cannot be placed before/after
+            // the deadline: skip it from the projected-sample count
+            // rather than counting it as 0 <= deadline, which would
+            // falsely admit an untimestamped sample into the window.
+            if self.elapsed_ms[i].is_none_or(|ms| ms > deadline_ms) {
                 continue;
             }
             match slot {
@@ -1478,7 +1554,7 @@ impl SeriesField<f64> {
                 Err(e) => error_samples.push(format!(
                     "{tag}(+{elapsed_ms}ms): {e}",
                     tag = self.tags[i],
-                    elapsed_ms = self.elapsed_ms[i],
+                    elapsed_ms = fmt_elapsed_num(self.elapsed_ms[i]),
                 )),
             }
         }
@@ -1509,7 +1585,11 @@ impl SeriesField<f64> {
         // consecutive counter mid-run.
         let mut interrupting_errors: Vec<String> = Vec::new();
         for (i, slot) in self.values.iter().enumerate() {
-            if self.elapsed_ms[i] > deadline_ms {
+            // A None timestamp cannot be placed before/after
+            // the deadline: treat it as out-of-window (skip / reset the
+            // witness run) rather than as 0 <= deadline, which would
+            // falsely admit an untimestamped sample into the window.
+            if self.elapsed_ms[i].is_none_or(|ms| ms > deadline_ms) {
                 consecutive = 0;
                 continue;
             }
@@ -1535,7 +1615,7 @@ impl SeriesField<f64> {
                         interrupting_errors.push(format!(
                             "{tag}(+{elapsed_ms}ms): {e}",
                             tag = self.tags[i],
-                            elapsed_ms = self.elapsed_ms[i],
+                            elapsed_ms = fmt_elapsed_num(self.elapsed_ms[i]),
                         ));
                     }
                     consecutive = 0;
@@ -1567,7 +1647,7 @@ impl SeriesField<f64> {
                     format!(
                         "{tag} (+{elapsed_ms}ms)",
                         tag = self.tags[i],
-                        elapsed_ms = self.elapsed_ms[i],
+                        elapsed_ms = fmt_elapsed_num(self.elapsed_ms[i]),
                     )
                 })
                 .unwrap_or_else(|| "<unreached>".to_string());
@@ -1649,14 +1729,14 @@ impl SeriesField<f64> {
                         endpoints.push(format!(
                             "lhs {tag}(+{elapsed_ms}ms): {e}",
                             tag = self.tags[i],
-                            elapsed_ms = self.elapsed_ms[i],
+                            elapsed_ms = fmt_elapsed_num(self.elapsed_ms[i]),
                         ));
                     }
                     if let Err(e) = rhs_slot {
                         endpoints.push(format!(
                             "rhs {tag}(+{elapsed_ms}ms): {e}",
                             tag = other.tags[i],
-                            elapsed_ms = other.elapsed_ms[i],
+                            elapsed_ms = fmt_elapsed_num(other.elapsed_ms[i]),
                         ));
                     }
                     gaps.push(endpoints.join(" | "));
@@ -1671,7 +1751,7 @@ impl SeriesField<f64> {
                          denominator is INSTRUMENT-derived; ratio is neither pass nor fail",
                         label = self.label,
                         tag = self.tags[i],
-                        elapsed_ms = self.elapsed_ms[i],
+                        elapsed_ms = fmt_elapsed_num(self.elapsed_ms[i]),
                     ),
                 );
                 continue;
@@ -1693,7 +1773,7 @@ impl SeriesField<f64> {
                         label = self.label,
                         other_label = other.label,
                         tag = self.tags[i],
-                        elapsed_ms = self.elapsed_ms[i],
+                        elapsed_ms = fmt_elapsed_num(self.elapsed_ms[i]),
                     ),
                 );
             } else if ratio < lo || ratio > hi {
@@ -1706,7 +1786,7 @@ impl SeriesField<f64> {
                         label = self.label,
                         other_label = other.label,
                         tag = self.tags[i],
-                        elapsed_ms = self.elapsed_ms[i],
+                        elapsed_ms = fmt_elapsed_num(self.elapsed_ms[i]),
                     ),
                 );
             }
@@ -1750,7 +1830,7 @@ impl SeriesField<bool> {
                                  value false",
                                 label = self.label,
                                 tag = self.tags[i],
-                                elapsed_ms = self.elapsed_ms[i],
+                                elapsed_ms = fmt_elapsed_num(self.elapsed_ms[i]),
                             ),
                         );
                     }
@@ -1763,7 +1843,7 @@ impl SeriesField<bool> {
                              projection error: {e}",
                             label = self.label,
                             tag = self.tags[i],
-                            elapsed_ms = self.elapsed_ms[i],
+                            elapsed_ms = fmt_elapsed_num(self.elapsed_ms[i]),
                         ),
                     );
                 }
@@ -2003,6 +2083,63 @@ mod tests {
         assert!(!v.is_pass());
     }
 
+    /// REGRESSION: steady_within SKIPS a sample whose elapsed
+    /// timestamp is None — it cannot be placed relative to warmup_ms, so
+    /// it must be Note-skipped, never treated as 0 (< warmup, silently
+    /// dropped) nor admitted into the steady-state band. The None sample
+    /// here carries a wild value that would blow the band if admitted.
+    #[test]
+    fn steady_within_skips_none_elapsed_with_note() {
+        let f: SeriesField<f64> = SeriesField::from_parts_with_phases_opt(
+            "util",
+            vec!["a".to_string(), "b".to_string(), "c".to_string()],
+            vec![Some(300), None, Some(400)],
+            vec![Ok(10.0), Ok(9999.0), Ok(10.0)],
+            vec![None; 3],
+        );
+        let mut v = Verdict::new();
+        f.steady_within(&mut v, 0, 0.05);
+        let r = v.into_result();
+        assert!(
+            r.is_pass(),
+            "None-elapsed sample must be skipped, not admitted into the band: {:?}",
+            r.outcomes,
+        );
+        assert!(
+            r.info_notes.iter().any(|n| n.message.contains("not measured")),
+            "the skipped None-elapsed sample must surface a Note: {:?}",
+            r.info_notes,
+        );
+    }
+
+    /// REGRESSION: converges_to treats a None-elapsed sample
+    /// as out-of-window — it RESETS the 3-consecutive witness run rather
+    /// than bridging it. Here a,b,d are all in-band (1.0) but the None at
+    /// index 2 breaks the run, so the longest streak is 2 → no witness →
+    /// fail. If None were coerced to 0 (in-window, in-band), c would
+    /// complete a 3-run and the assertion would falsely PASS.
+    #[test]
+    fn converges_to_none_elapsed_breaks_witness() {
+        let f: SeriesField<f64> = SeriesField::from_parts_with_phases_opt(
+            "load",
+            vec![
+                "a".to_string(),
+                "b".to_string(),
+                "c".to_string(),
+                "d".to_string(),
+            ],
+            vec![Some(100), Some(200), None, Some(300)],
+            vec![Ok(1.0), Ok(1.0), Ok(1.0), Ok(1.0)],
+            vec![None; 4],
+        );
+        let mut v = Verdict::new();
+        f.converges_to(&mut v, 1.0, 0.1, 1000);
+        assert!(
+            !v.is_pass(),
+            "a None-elapsed sample must break the witness run, not bridge it",
+        );
+    }
+
     #[test]
     fn always_true_passes_on_all_true() {
         let f = synthetic_field("alive", vec![(100, true), (200, true)]);
@@ -2120,7 +2257,7 @@ mod tests {
     fn iter_full_empty_yields_no_items() {
         let f: SeriesField<u64> =
             SeriesField::from_parts("empty", Vec::new(), Vec::new(), Vec::new());
-        let collected: Vec<(&str, u64, &SnapshotResult<u64>)> = f.iter_full().collect();
+        let collected: Vec<(&str, Option<u64>, &SnapshotResult<u64>)> = f.iter_full().collect();
         assert!(collected.is_empty());
         assert_eq!(f.iter_full().count(), 0);
     }
@@ -2148,16 +2285,16 @@ mod tests {
             Ok(42u64),
         ];
         let f = SeriesField::from_parts("counter", tags, elapsed, values);
-        let collected: Vec<(&str, u64, &SnapshotResult<u64>)> = f.iter_full().collect();
+        let collected: Vec<(&str, Option<u64>, &SnapshotResult<u64>)> = f.iter_full().collect();
         assert_eq!(collected.len(), 3);
         assert_eq!(collected[0].0, "periodic_000");
-        assert_eq!(collected[0].1, 100u64);
+        assert_eq!(collected[0].1, Some(100u64));
         assert_eq!(collected[0].2.as_ref().ok().copied(), Some(7u64));
         assert_eq!(collected[1].0, "periodic_001");
-        assert_eq!(collected[1].1, 200u64);
+        assert_eq!(collected[1].1, Some(200u64));
         assert!(collected[1].2.is_err());
         assert_eq!(collected[2].0, "periodic_002");
-        assert_eq!(collected[2].1, 300u64);
+        assert_eq!(collected[2].1, Some(300u64));
         assert_eq!(collected[2].2.as_ref().ok().copied(), Some(42u64));
     }
 
@@ -2274,6 +2411,38 @@ mod tests {
             r.info_notes.iter().any(|n| n.message.contains("gap")),
             "expected gap note: {:?}",
             r.info_notes
+        );
+    }
+
+    /// REGRESSION: rate_within SKIPS an interval whose
+    /// endpoint has no measured elapsed timestamp (`None`) — the dt is
+    /// undefined, so the rate cannot be computed and must be skipped
+    /// with a Note, NEVER fabricated from a `0`-coerced dt. The band
+    /// `[0, 0.001]` is chosen so the bug-shape (coerce `None`→`0`, giving
+    /// the b→c interval dt = 400 and rate (9-2)/400 = 0.0175) would
+    /// FAIL; the correct skip leaves no computable interval and passes.
+    #[test]
+    fn rate_within_skips_none_elapsed_endpoint() {
+        let tags = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        // Sample `b` carries no recorded timestamp.
+        let elapsed = vec![Some(100u64), None, Some(400u64)];
+        let values: Vec<SnapshotResult<f64>> = vec![Ok(1.0), Ok(2.0), Ok(9.0)];
+        let f =
+            SeriesField::from_parts_with_phases_opt("ticks", tags, elapsed, values, vec![None; 3]);
+        let mut v = Verdict::new();
+        f.rate_within(&mut v, 0.0, 0.001);
+        let r = v.into_result();
+        assert!(
+            r.is_pass(),
+            "None-endpoint intervals must be skipped, not coerced into a band failure: {:?}",
+            r.outcomes,
+        );
+        assert!(
+            r.info_notes
+                .iter()
+                .any(|n| n.message.contains("unmeasured elapsed")),
+            "the skipped None-endpoint interval(s) must surface a Note: {:?}",
+            r.info_notes,
         );
     }
 

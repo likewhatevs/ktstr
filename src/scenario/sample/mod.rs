@@ -86,10 +86,11 @@ pub struct Sample<'a> {
     /// so the value reflects when the running scheduler's
     /// stats were observed. BPF state is observed up to
     /// `FREEZE_RENDEZVOUS_TIMEOUT` later than this anchor.
-    /// `0` when the bridge could not record a timestamp
+    /// `None` when the bridge could not record a timestamp
     /// (legacy stores without elapsed metadata, or
-    /// non-periodic captures surfaced through the same drain).
-    pub elapsed_ms: u64,
+    /// non-periodic captures surfaced through the same drain) —
+    /// distinct from a measured `Some(0)`.
+    pub elapsed_ms: Option<u64>,
     /// Frozen BPF state captured at this boundary. The view is
     /// cheap to build — accessor methods walk the underlying
     /// [`FailureDumpReport`] in place.
@@ -168,15 +169,15 @@ pub struct SampleSeries {
 
 /// Owned tuple stored inside [`SampleSeries`]. Mirrors the shape of
 /// [`super::snapshot::SnapshotBridge::drain_ordered_with_stats`]
-/// but carries the timestamp explicitly (defaulted to `0` when
-/// the bridge omitted it) so iteration does not have to handle
-/// the `Option<u64>` repeatedly.
+/// but carries the timestamp as `Option<u64>` — `None` preserves the
+/// bridge's "no timestamp recorded" signal so a not-measured sample
+/// stays distinct from a measured `Some(0)`.
 #[derive(Debug, Clone)]
 struct SampleRow {
     tag: String,
     report: FailureDumpReport,
     stats: Result<serde_json::Value, crate::scenario::snapshot::MissingStatsReason>,
-    elapsed_ms: u64,
+    elapsed_ms: Option<u64>,
     /// Workload-relative boundary offset (ms) for periodic captures;
     /// `None` for non-periodic / on-demand. Mirrored from
     /// [`super::snapshot::DrainedSnapshotEntry::boundary_offset_ms`].
@@ -203,7 +204,7 @@ fn build_series_field<T>(
 ) -> SeriesField<T> {
     let mut values: Vec<SnapshotResult<T>> = Vec::with_capacity(rows.len());
     let mut tags: Vec<String> = Vec::with_capacity(rows.len());
-    let mut elapsed: Vec<u64> = Vec::with_capacity(rows.len());
+    let mut elapsed: Vec<Option<u64>> = Vec::with_capacity(rows.len());
     let mut phases: Vec<Option<crate::assert::Phase>> = Vec::with_capacity(rows.len());
     for row in rows {
         tags.push(row.tag.clone());
@@ -217,7 +218,7 @@ fn build_series_field<T>(
         phases.push(row.step_index.map(crate::assert::Phase::from));
         values.push(row_to_slot(row));
     }
-    SeriesField::from_parts_with_phases(label, tags, elapsed, values, phases)
+    SeriesField::from_parts_with_phases_opt(label, tags, elapsed, values, phases)
 }
 
 impl SampleSeries {
@@ -255,7 +256,7 @@ impl SampleSeries {
                 stats: stats.map(Ok).unwrap_or(Err(
                     crate::scenario::snapshot::MissingStatsReason::NoSchedulerBinary,
                 )),
-                elapsed_ms: elapsed_ms.unwrap_or(0),
+                elapsed_ms,
                 // Fixture/tuple path carries no scheduled boundary offset.
                 boundary_offset_ms: None,
                 // Unstamped fixture path: samples surface with
@@ -297,7 +298,7 @@ impl SampleSeries {
                     tag,
                     report,
                     stats,
-                    elapsed_ms: elapsed_ms.unwrap_or(0),
+                    elapsed_ms,
                     boundary_offset_ms,
                     step_index,
                 }

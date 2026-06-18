@@ -997,6 +997,102 @@ fn build_phase_buckets_cpu_time_disjoint_groups_yield_absent_not_zero() {
     );
 }
 
+/// An unanchored sample (no boundary offset AND no measured `elapsed_ms`)
+/// must sort LAST in the per-group CPU-time delta, never
+/// first: with the pre-Option behavior it coerced to `0` and became the
+/// spurious earliest `first_seen` endpoint, so a high cumulative counter
+/// in that sample masked real in-phase growth (last <= first ->
+/// saturating_sub -> 0). Pins that the unanchored sample sorts to MAX so
+/// `first_seen` comes from the earliest TIMED sample.
+#[test]
+fn build_phase_buckets_cpu_time_unanchored_sample_sorts_last_not_first() {
+    use crate::monitor::task_enrichment::TaskEnrichment;
+    fn task(stime: u64) -> TaskEnrichment {
+        TaskEnrichment {
+            pid: 100,
+            tgid: 100,
+            stime,
+            signal_stime: Some(0),
+            ..Default::default()
+        }
+    }
+    fn entry(tag: &str, elapsed_ms: Option<u64>, stime: u64) -> DrainedSnapshotEntry {
+        DrainedSnapshotEntry {
+            tag: tag.to_string(),
+            report: FailureDumpReport {
+                schema: SCHEMA_SINGLE.to_string(),
+                task_enrichments: vec![task(stime)],
+                ..Default::default()
+            },
+            stats: Err(MissingStatsReason::NoSchedulerBinary),
+            elapsed_ms,
+            boundary_offset_ms: None,
+            step_index: Some(1),
+        }
+    }
+    // tgid=100, signal Some(0) -> group total == live stime. Drain order
+    // leads with the UNANCHORED sample (elapsed None, stime 3000) to
+    // simulate an unsorted grouped vec; the timed samples grow 1000 ->
+    // 3000.
+    //   * fix (None -> u64::MAX): sort [A(100), B(200), X(None)] ->
+    //     first_seen = 1000 (A), last_seen = 3000 -> delta = 2000.
+    //   * bug (None -> 0): sort [X, A(100), B(200)] -> first_seen = 3000
+    //     (X), last_seen = 3000 -> saturating_sub -> 0 (real growth lost).
+    let drained = vec![
+        entry("on_demand_000", None, 3000),
+        entry("periodic_001", Some(100), 1000),
+        entry("periodic_002", Some(200), 3000),
+    ];
+    let samples = SampleSeries::from_drained_typed(drained, None);
+    let phases = crate::assert::build_phase_buckets(&samples);
+    let step0 = phases
+        .iter()
+        .find(|p| p.step_index == 1)
+        .expect("Step[0] bucket present");
+    assert_eq!(
+        step0.metrics.get("system_time_ns").copied(),
+        Some(2000.0),
+        "unanchored sample sorts LAST -> first_seen from the earliest \
+         timed sample (1000), delta = 2000; if it sorted first the delta \
+         would clamp to 0",
+    );
+}
+
+/// A phase whose every sample is unanchored (no boundary offset AND no
+/// measured `elapsed_ms`) yields the inverted window
+/// `(start_ms = u64::MAX, end_ms = 0)`: no sample contributes a time
+/// anchor, so `lo`/`hi` keep their identity seeds. The half-open window
+/// test then folds zero monitor samples — the correct "no placeable
+/// samples" outcome — rather than coercing the missing anchors to 0 and
+/// over-folding from the run start.
+#[test]
+fn build_phase_buckets_all_unanchored_phase_yields_inverted_window() {
+    fn unanchored(tag: &str) -> DrainedSnapshotEntry {
+        DrainedSnapshotEntry {
+            tag: tag.to_string(),
+            report: fixture_report(),
+            stats: Err(MissingStatsReason::NoSchedulerBinary),
+            elapsed_ms: None,
+            boundary_offset_ms: None,
+            step_index: Some(1),
+        }
+    }
+    let drained = vec![unanchored("on_demand_000"), unanchored("on_demand_001")];
+    let samples = SampleSeries::from_drained_typed(drained, None);
+    let phases = crate::assert::build_phase_buckets(&samples);
+    let step0 = phases
+        .iter()
+        .find(|p| p.step_index == 1)
+        .expect("phase bucket present even when every sample is unanchored");
+    assert_eq!(step0.sample_count, 2, "both unanchored samples counted");
+    assert_eq!(
+        (step0.start_ms, step0.end_ms),
+        (u64::MAX, 0),
+        "all-unanchored phase -> inverted window that folds nothing, \
+         not a (0, x) window anchored at the run start",
+    );
+}
+
 /// `ScenarioStats::phase` lookup against the phases built by
 /// `build_phase_buckets` returns the bucket whose step_index
 /// matches, not by vec position. Confirms the integration
