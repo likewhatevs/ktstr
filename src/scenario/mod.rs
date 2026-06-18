@@ -1435,15 +1435,35 @@ pub fn setup_cgroups<'a>(
 /// `ScenarioStats.cgroups` empty for tests that read the telemetry
 /// without configuring a check.)
 pub(crate) fn collect_handles<'a>(
-    handles: impl IntoIterator<Item = (WorkloadHandle, Option<&'a BTreeSet<usize>>)>,
+    handles: impl IntoIterator<Item = (String, WorkloadHandle, Option<&'a BTreeSet<usize>>)>,
     checks: &crate::assert::Assert,
     topo: Option<&crate::topology::TestTopology>,
 ) -> AssertResult {
     let mut r = AssertResult::pass();
-    for (h, cpuset) in handles {
+    for (name, h, cpuset) in handles {
         let reports = h.stop_and_collect();
         let numa_nodes = cpuset.and_then(|cs| topo.map(|t| t.numa_nodes_for_cpuset(cs)));
-        r.merge(checks.assert_cgroup_with_numa(&reports, cpuset, numa_nodes.as_ref()));
+        let mut one = checks.assert_cgroup_with_numa(&reports, cpuset, numa_nodes.as_ref());
+        // `assert_cgroup_with_numa` produces exactly one CgroupStats entry
+        // (scenario_stats_for_cgroup); no sub-check populates stats.cgroups,
+        // so last_mut() is that entry. Label it with the cgroup name here —
+        // the name is in scope only at the collection layer; cgroup_stats
+        // sees only the reports. merge() extends cgroups, so the label
+        // survives the roll-up and surfaces per-cgroup on a passing run.
+        // The debug_assert trips immediately (in any debug-build test path)
+        // if a future sub-assert ever adds a second cgroups entry, which
+        // would make last_mut() mislabel the wrong one.
+        debug_assert_eq!(
+            one.stats.cgroups.len(),
+            1,
+            "assert_cgroup_with_numa must yield exactly one cgroup entry for \
+             collect_handles to label correctly; got {}",
+            one.stats.cgroups.len(),
+        );
+        if let Some(cg) = one.stats.cgroups.last_mut() {
+            cg.cgroup_name = name;
+        }
+        r.merge(one);
     }
     r
 }
@@ -1453,7 +1473,11 @@ pub(crate) fn collect_handles<'a>(
 /// Uses `checks` for worker evaluation. Returns a merged
 /// [`AssertResult`] across all workers.
 pub fn collect_all(handles: Vec<WorkloadHandle>, checks: &crate::assert::Assert) -> AssertResult {
-    collect_handles(handles.into_iter().map(|h| (h, None)), checks, None)
+    collect_handles(
+        handles.into_iter().map(|h| (String::new(), h, None)),
+        checks,
+        None,
+    )
 }
 
 /// Default [`WorkloadConfig`] with `ctx.workers_per_cgroup` workers.

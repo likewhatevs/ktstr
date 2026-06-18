@@ -2011,9 +2011,10 @@ fn collect_step(
     };
     let handles = std::mem::take(&mut step_state.handles);
     let mut result = crate::scenario::collect_handles(
-        handles
-            .into_iter()
-            .map(|(name, h)| (h, step_state.cpusets.get(&name))),
+        handles.into_iter().map(|(name, h)| {
+            let cpuset = step_state.cpusets.get(&name);
+            (name, h, cpuset)
+        }),
         checks,
         Some(topo),
     );
@@ -2126,9 +2127,10 @@ fn collect_backdrop(
     drain_all_payload_handles(&mut backdrop_state.payload_handles);
     let handles = std::mem::take(&mut backdrop_state.handles);
     crate::scenario::collect_handles(
-        handles
-            .into_iter()
-            .map(|(name, h)| (h, backdrop_state.cpusets.get(&name))),
+        handles.into_iter().map(|(name, h)| {
+            let cpuset = backdrop_state.cpusets.get(&name);
+            (name, h, cpuset)
+        }),
         checks,
         Some(topo),
     )

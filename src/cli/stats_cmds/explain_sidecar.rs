@@ -478,6 +478,25 @@ fn render_explain_sidecar_text(
         } else {
             let _ = writeln!(out, "  cpu_budget: {} / {} vcpus", sc.cpu_budget, sc.vcpus);
         }
+        // Per-cgroup CPU placement — which host/guest CPUs each cgroup's
+        // workers actually ran on. Surfaced on EVERY run (the scheduler
+        // failure dump only fires on failure); reads the always-written
+        // ScenarioStats.cgroups. Cgroups with no recorded CPU (no worker
+        // reported one) are skipped.
+        for cg in sc.stats.cgroups.iter().filter(|c| !c.cpus_used.is_empty()) {
+            let label = if cg.cgroup_name.is_empty() {
+                "(unnamed)"
+            } else {
+                cg.cgroup_name.as_str()
+            };
+            let cpus = cg
+                .cpus_used
+                .iter()
+                .map(|c| c.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            let _ = writeln!(out, "  cgroup {label}: ran on cpus [{cpus}]");
+        }
         let projected = project_optional_fields(sc);
         let populated: Vec<&'static str> = projected
             .iter()
@@ -1178,6 +1197,45 @@ mod tests {
         assert!(
             malformed.contains("[malformed") && !malformed.contains("OVERCOMMIT"),
             "budget>0 with vcpus==0 must render the malformed note, not overcommit: {malformed}",
+        );
+    }
+
+    /// Per-cgroup CPU placement renders on the text path for any run.
+    /// A labeled cgroup with a non-empty cpus_used prints a
+    /// "cgroup <name>: ran on cpus [..]" line; a cgroup that recorded no
+    /// CPU (empty cpus_used) is skipped.
+    #[test]
+    fn explain_sidecar_text_renders_per_cgroup_cpus() {
+        let tmp = tempfile::tempdir().unwrap();
+        let run_dir = tmp.path().join("run-cgcpus");
+        std::fs::create_dir(&run_dir).unwrap();
+        let mut sc = crate::test_support::SidecarResult::test_fixture();
+        sc.stats.cgroups = vec![
+            crate::assert::CgroupStats {
+                cgroup_name: "cg_a".to_string(),
+                cpus_used: [0usize, 1].into_iter().collect(),
+                num_cpus: 2,
+                ..Default::default()
+            },
+            crate::assert::CgroupStats {
+                cgroup_name: "cg_idle".to_string(),
+                cpus_used: std::collections::BTreeSet::new(),
+                ..Default::default()
+            },
+        ];
+        std::fs::write(
+            run_dir.join("t-0000000000000000.ktstr.json"),
+            serde_json::to_string(&sc).unwrap(),
+        )
+        .unwrap();
+        let out = explain_sidecar("run-cgcpus", Some(tmp.path()), false).unwrap();
+        assert!(
+            out.contains("cgroup cg_a: ran on cpus [0,1]"),
+            "labeled cgroup must render its cpus_used: {out}",
+        );
+        assert!(
+            !out.contains("cg_idle"),
+            "a cgroup with empty cpus_used must be skipped: {out}",
         );
     }
 

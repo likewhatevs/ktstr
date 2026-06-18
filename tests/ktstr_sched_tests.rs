@@ -34,6 +34,74 @@ fn sched_cpuset_split(ctx: &Ctx) -> Result<AssertResult> {
     execute_steps(ctx, steps)
 }
 
+/// Per-cgroup CPU placement is captured and labeled on a PASSING
+/// run (not only the failure-path scheduler dump). Two cgroups on
+/// DISJOINT cpuset halves run a spin workload; the run passes, then the
+/// body asserts each cgroup's `CgroupStats` is labeled with its name and
+/// carries the (non-empty, disjoint) set of CPUs its workers actually
+/// ran on. Exercises the full chain unit tests cannot: real worker
+/// cpus_used -> cgroup_stats union -> collect_handles labeling ->
+/// result.stats.cgroups. A labeling or capture regression fails here
+/// even though the scheduler run itself passes.
+#[ktstr_test(scheduler = KTSTR_SCHED, llcs = 1, cores = 4, threads = 1, sustained_samples = 15, watchdog_timeout_s = 15, max_spread_pct = 80.0)]
+fn sched_cgroup_cpus_used_surfaced_on_pass(ctx: &Ctx) -> Result<AssertResult> {
+    let steps = vec![Step {
+        setup: vec![
+            CgroupDef::named("cg_0").cpuset(CpusetSpec::Disjoint { index: 0, of: 2 }),
+            CgroupDef::named("cg_1").cpuset(CpusetSpec::Disjoint { index: 1, of: 2 }),
+        ]
+        .into(),
+        ops: vec![],
+        hold: HoldSpec::FULL,
+    }];
+    let result = execute_steps(ctx, steps)?;
+    let cgroups = &result.stats.cgroups;
+    assert_eq!(
+        cgroups.len(),
+        2,
+        "two declared cgroups -> two labeled stats entries; got {cgroups:#?}",
+    );
+    let by_name: std::collections::BTreeMap<&str, &_> = cgroups
+        .iter()
+        .map(|c| (c.cgroup_name.as_str(), c))
+        .collect();
+    let cg0 = by_name
+        .get("cg_0")
+        .unwrap_or_else(|| panic!("cg_0 must be labeled; got {cgroups:#?}"));
+    let cg1 = by_name
+        .get("cg_1")
+        .unwrap_or_else(|| panic!("cg_1 must be labeled; got {cgroups:#?}"));
+    for cg in [cg0, cg1] {
+        // Non-empty presumes a real (non-sentinel) report: every worker
+        // records its starting CPU before the work loop, and a passing run
+        // collects only thawed workers, so no empty-cpus_used sentinel
+        // reaches the union. A future report-collection change that emitted
+        // a sentinel here would fail this assertion, naming the cause.
+        assert!(
+            !cg.cpus_used.is_empty(),
+            "cgroup {} must record the CPUs its workers ran on: {cg:#?}",
+            cg.cgroup_name,
+        );
+        assert_eq!(
+            cg.num_cpus,
+            cg.cpus_used.len(),
+            "num_cpus must equal cpus_used.len() for {}",
+            cg.cgroup_name,
+        );
+    }
+    // Disjoint cpusets are a hard kernel constraint, so the captured
+    // cpus_used sets must not overlap — proving cpus_used reflects the
+    // real per-cgroup confinement, not a shared/aggregate set.
+    assert!(
+        cg0.cpus_used.is_disjoint(&cg1.cpus_used),
+        "disjoint-cpuset cgroups must record disjoint cpus_used; \
+         cg_0={:?} cg_1={:?}",
+        cg0.cpus_used,
+        cg1.cpus_used,
+    );
+    Ok(result)
+}
+
 #[ktstr_test(scheduler = KTSTR_SCHED, llcs = 1, cores = 2, threads = 1, sustained_samples = 15, watchdog_timeout_s = 15)]
 fn sched_dynamic_add(ctx: &Ctx) -> Result<AssertResult> {
     let steps = vec![

@@ -1357,9 +1357,22 @@ pub struct AssertResult {
 /// [`AssertResult::merge`].
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize, crate::Claim)]
 pub struct CgroupStats {
+    /// Cgroup name (the workload-handle label this telemetry belongs to),
+    /// or empty for unlabeled call sites (`collect_all`, bare
+    /// `assert_cgroup`). Set post-hoc by `collect_handles` (in
+    /// `crate::scenario`) where the name is in scope; `cgroup_stats`
+    /// itself has only the reports and leaves it empty. Lets a PASSING-run
+    /// consumer say which cgroup's work landed on which CPUs.
+    pub cgroup_name: String,
     /// Number of workers in this cgroup.
     pub num_workers: usize,
-    /// Distinct CPUs used across all workers in this cgroup.
+    /// Distinct CPUs the workers in this cgroup actually ran on (union of
+    /// each [`crate::workload::WorkerReport::cpus_used`]). `num_cpus` is
+    /// its length, kept for the existing rollups; this set surfaces WHICH
+    /// CPUs (not just how many) on every run, pass or fail.
+    pub cpus_used: BTreeSet<usize>,
+    /// Distinct CPUs used across all workers in this cgroup
+    /// (`cpus_used.len()`).
     pub num_cpus: usize,
     /// Mean off-CPU percentage across workers (off_cpu_ns /
     /// wall_time_ns * 100). `None` when no worker reported a
@@ -5560,8 +5573,12 @@ pub fn cgroup_stats(reports: &[WorkerReport]) -> CgroupStats {
     };
 
     CgroupStats {
+        // Empty here; collect_handles labels the entry post-hoc (it has
+        // the cgroup name in scope, this reports-only builder does not).
+        cgroup_name: String::new(),
         num_workers: reports.len(),
         num_cpus: cpus.len(),
+        cpus_used: cpus,
         avg_off_cpu_pct: avg,
         min_off_cpu_pct: min,
         max_off_cpu_pct: max,

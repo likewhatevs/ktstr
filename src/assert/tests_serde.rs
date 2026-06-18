@@ -10,8 +10,10 @@ use super::*;
 fn scenario_stats_serde_roundtrip() {
     let s = ScenarioStats {
         cgroups: vec![CgroupStats {
+            cgroup_name: "cg_0".to_string(),
             num_workers: 4,
-            num_cpus: 2,
+            num_cpus: 3,
+            cpus_used: [0usize, 1, 2].into_iter().collect(),
             avg_off_cpu_pct: Some(50.0),
             min_off_cpu_pct: Some(40.0),
             max_off_cpu_pct: Some(60.0),
@@ -46,6 +48,16 @@ fn scenario_stats_serde_roundtrip() {
     assert_eq!(c.min_off_cpu_pct, Some(40.0));
     assert_eq!(c.max_off_cpu_pct, Some(60.0));
     assert_eq!(c.spread, Some(20.0));
+    // The new wire fields: non-empty so a BTreeSet ordering / String
+    // encode regression on cpus_used / cgroup_name surfaces here, not
+    // only via the render path.
+    assert_eq!(c.cgroup_name, "cg_0");
+    assert_eq!(
+        c.cpus_used,
+        [0usize, 1, 2]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<usize>>(),
+    );
 }
 
 #[test]
@@ -220,8 +232,10 @@ fn cgroup_stats_missing_required_field_rejected_by_deserialize() {
     // these are legitimately optional on the wire — not a softened
     // required scalar.
     const REQUIRED_FIELDS: &[&str] = &[
+        "cgroup_name",
         "num_workers",
         "num_cpus",
+        "cpus_used",
         "max_gap_ms",
         "max_gap_cpu",
         "total_migrations",
