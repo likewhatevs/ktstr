@@ -429,6 +429,51 @@ pub(super) fn is_arena_addr_in_snapshot(
     addr >= snap.user_vm_start && addr < end
 }
 
+/// Free helper backing [`AccessorMemReader::read_arena`]: read `len`
+/// bytes at arena user-address `addr` from the pre-pass snapshot,
+/// falling back to a live kernel-virtual read. Extracted (mirroring
+/// [`is_arena_addr_in_snapshot`]) so unit tests exercise the real
+/// page-index fast path, the cross-page `checked_add` / `> 4096` bound,
+/// the short-captured-page fall-through, and the `kern_vm_start`-anchor
+/// KVA composition without a full [`super::super::guest::GuestKernel`].
+/// `read_kva` performs the slow-path read; it is invoked only when the
+/// page was not captured (or was captured short) AND
+/// `kern_vm_start != 0`.
+pub(super) fn read_arena_in_snapshot(
+    snapshot: Option<&super::super::arena::ArenaSnapshot>,
+    arena_page_index: &ArenaPageIndex,
+    addr: u64,
+    len: usize,
+    read_kva: impl FnOnce(u64, usize) -> Option<Vec<u8>>,
+) -> Option<Vec<u8>> {
+    let snap = snapshot?;
+    let offset = (addr & 0xFFF) as usize;
+    // checked_add against a hostile addr+len near u64::MAX keeps the
+    // single-page bound from wrapping into a false-positive accept.
+    let end = offset.checked_add(len)?;
+    if end > 4096 {
+        return None;
+    }
+    let page_addr = addr & !0xFFF;
+    if let Some(&idx) = arena_page_index.get(&page_addr) {
+        let page = &snap.pages[idx];
+        if end <= page.bytes.len() {
+            return Some(page.bytes[offset..end].to_vec());
+        }
+        // Captured page is short (region/DRAM truncation at capture
+        // time): fall through to the live walker rather than returning
+        // a short slice.
+    }
+    // Slow path: snapshot didn't capture this page. `kern_vm_start == 0`
+    // means the pre-pass bailed before resolving the kernel-side anchor;
+    // without it there's no way to compose a KVA.
+    if snap.kern_vm_start == 0 {
+        return None;
+    }
+    let kva = snap.kern_vm_start.wrapping_add(addr & 0xFFFF_FFFF);
+    read_kva(kva, len)
+}
+
 /// Free helper: resolve a chased arena address to a payload BTF type
 /// id and `header_skip` byte count. Factored out of
 /// [`AccessorMemReader::resolve_arena_type`] so unit tests can call
@@ -751,50 +796,20 @@ impl MemReader for AccessorMemReader<'_> {
     }
 
     fn read_arena(&self, addr: u64, len: usize) -> Option<Vec<u8>> {
-        let snap = self.arena_snapshot?;
-        // Single-page bound: the caller (Ptr deref in btf_render)
-        // caps `len` at one page (4096) before calling us, but pin
-        // the invariant locally so an addr+len that crosses a page
-        // boundary always bails rather than reading mismatched
-        // contents from two distinct pages whose host PAs may be
-        // non-contiguous. checked_add against a hostile addr+len
-        // near u64::MAX keeps the bound from wrapping into a
-        // false-positive accept.
-        let offset = (addr & 0xFFF) as usize;
-        let end = offset.checked_add(len)?;
-        if end > 4096 {
-            return None;
-        }
-        let page_addr = addr & !0xFFF;
-        // Fast path: the requested page was captured in the
-        // pre-pass snapshot. Read straight from frozen bytes —
-        // no page-table walk on the hot path.
-        if let Some(&idx) = self.arena_page_index.get(&page_addr) {
-            let page = &snap.pages[idx];
-            if end <= page.bytes.len() {
-                return Some(page.bytes[offset..end].to_vec());
-            }
-            // Captured page is short (region/DRAM truncation at
-            // capture time): fall through to the live walker rather
-            // than returning a short slice.
-        }
-        // Slow path: snapshot didn't capture this page (sequential
-        // prefix capped at MAX_ARENA_PAGES; allocations beyond
-        // that fall outside the snapshot). Translate the user-side
-        // arena address to a kernel virtual address using the
-        // arena's `kern_vm_start` anchor — same formula
-        // [`super::super::arena::snapshot_arena`] uses to walk
-        // pages at capture time and
-        // [`chase_sdt_data_payload`] uses for sdt_data payload
-        // chase. `kern_vm_start == 0` means the pre-pass bailed
-        // before resolving the kernel-side anchor; without it
-        // there's no way to compose a KVA, so the chase silently
-        // returns None.
-        if snap.kern_vm_start == 0 {
-            return None;
-        }
-        let kva = snap.kern_vm_start.wrapping_add(addr & 0xFFFF_FFFF);
-        self.read_kva(kva, len)
+        // Body lives in the free helper so unit tests reach it without a
+        // full GuestKernel. The caller (Ptr deref in btf_render) caps
+        // `len` at one page before calling, but the helper pins the
+        // single-page bound locally. The slow-path closure walks the
+        // kernel page tables via `read_kva` using the arena's
+        // `kern_vm_start` anchor — the same formula
+        // [`super::super::arena::snapshot_arena`] uses at capture time.
+        read_arena_in_snapshot(
+            self.arena_snapshot,
+            self.arena_page_index,
+            addr,
+            len,
+            |kva, l| self.read_kva(kva, l),
+        )
     }
 
     fn nr_cpu_ids(&self) -> u32 {

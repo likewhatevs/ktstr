@@ -2838,22 +2838,17 @@ fn accessor_mem_reader_arena_addr_range_via_snapshot() {
 /// `read_arena` returns None when no snapshot is attached.
 #[test]
 fn accessor_mem_reader_read_arena_none_when_no_snapshot() {
-    struct StubReader<'a> {
-        arena_snapshot: Option<&'a super::super::arena::ArenaSnapshot>,
-    }
-    impl super::super::btf_render::MemReader for StubReader<'_> {
-        fn read_kva(&self, _: u64, _: usize) -> Option<Vec<u8>> {
-            None
-        }
-        fn read_arena(&self, _: u64, _: usize) -> Option<Vec<u8>> {
-            self.arena_snapshot?;
-            None
-        }
-    }
-    let r = StubReader {
-        arena_snapshot: None,
-    };
-    assert!(r.read_arena(0x1234, 8).is_none());
+    use super::render_map::read_arena_in_snapshot;
+    use std::collections::HashMap;
+    // Drive the REAL production helper (the body of
+    // AccessorMemReader::read_arena), not a divergent stub: no snapshot
+    // short-circuits at `?` before read_kva.
+    assert!(
+        read_arena_in_snapshot(None, &HashMap::new(), 0x1234, 8, |_, _| {
+            panic!("read_kva must not run when there is no snapshot")
+        })
+        .is_none()
+    );
 }
 
 /// `read_arena` page-aligns the address and returns the matching
@@ -2865,6 +2860,8 @@ fn accessor_mem_reader_read_arena_none_when_no_snapshot() {
 #[test]
 fn accessor_mem_reader_read_arena_page_hit() {
     use super::super::arena::{ArenaPage, ArenaSnapshot};
+    use super::render_map::read_arena_in_snapshot;
+    use std::collections::HashMap;
     let snap = ArenaSnapshot {
         pages: vec![ArenaPage {
             user_addr: 0x1000,
@@ -2872,47 +2869,50 @@ fn accessor_mem_reader_read_arena_page_hit() {
         }],
         ..ArenaSnapshot::default()
     };
+    // Production resolves the page via the arena_page_index HashMap fast
+    // path, not a linear scan — build the index the real reader uses.
+    let mut index: HashMap<u64, usize> = HashMap::new();
+    index.insert(0x1000, 0);
 
-    struct StubReader<'a> {
-        arena_snapshot: &'a ArenaSnapshot,
-    }
-    impl super::super::btf_render::MemReader for StubReader<'_> {
-        fn read_kva(&self, _: u64, _: usize) -> Option<Vec<u8>> {
-            None
-        }
-        fn read_arena(&self, addr: u64, len: usize) -> Option<Vec<u8>> {
-            let page_addr = addr & !0xFFF;
-            let offset = (addr & 0xFFF) as usize;
-            let page = self
-                .arena_snapshot
-                .pages
-                .iter()
-                .find(|p| p.user_addr == page_addr)?;
-            if offset + len > page.bytes.len() {
-                // Contract: full request cannot be satisfied → None.
-                return None;
-            }
-            Some(page.bytes[offset..offset + len].to_vec())
-        }
-    }
-    let r = StubReader {
-        arena_snapshot: &snap,
-    };
+    // Page base: bytes 0..8 of (0..=0xff cycled), via the index. read_kva
+    // must NOT run on the fast path.
+    assert_eq!(
+        read_arena_in_snapshot(Some(&snap), &index, 0x1000, 8, |_, _| panic!(
+            "fast path must not call read_kva"
+        ))
+        .unwrap(),
+        vec![0, 1, 2, 3, 4, 5, 6, 7],
+    );
+    // Offset 100: bytes 100..108.
+    let at100 = read_arena_in_snapshot(Some(&snap), &index, 0x1000 + 100, 8, |_, _| None)
+        .expect("offset hit");
+    assert_eq!(at100[0], 100);
 
-    // Read at page base: byte 0..8 of (0..=0xff cycled).
-    let bytes = r.read_arena(0x1000, 8).expect("page-aligned hit");
-    assert_eq!(bytes, vec![0, 1, 2, 3, 4, 5, 6, 7]);
-
-    // Read at offset 100: bytes 100..108.
-    let bytes = r.read_arena(0x1000 + 100, 8).expect("offset hit");
-    assert_eq!(bytes[0], 100);
-
-    // Read past page end: contract says None. The full request
-    // cannot be satisfied from one captured page, so the reader
-    // declines rather than handing back a short slice.
+    // Cross-page: offset 4090 + len 100 = 4190 > 4096 → None (production
+    // `> 4096` bound, not the stub's `> bytes.len()`).
     assert!(
-        r.read_arena(0x1000 + 4090, 100).is_none(),
-        "cross-page read must return None per MemReader::read_arena contract",
+        read_arena_in_snapshot(Some(&snap), &index, 0x1000 + 4090, 100, |_, _| None).is_none(),
+        "cross-page read must return None",
+    );
+    // Hostile overflow: checked_add must reject rather than wrap.
+    assert!(read_arena_in_snapshot(Some(&snap), &index, u64::MAX, 8, |_, _| None).is_none());
+
+    // Short captured page (bytes shorter than the requested end) with
+    // kern_vm_start == 0 falls through to the slow path and returns None
+    // — the old stub got this backwards (returned None early instead of
+    // falling through).
+    let short = ArenaSnapshot {
+        pages: vec![ArenaPage {
+            user_addr: 0x5000,
+            bytes: vec![0u8; 2048],
+        }],
+        ..ArenaSnapshot::default()
+    };
+    let mut short_index: HashMap<u64, usize> = HashMap::new();
+    short_index.insert(0x5000, 0);
+    assert!(
+        read_arena_in_snapshot(Some(&short), &short_index, 0x5000, 4096, |_, _| None).is_none(),
+        "short captured page must fall through, not return a short slice",
     );
 }
 
@@ -2920,42 +2920,44 @@ fn accessor_mem_reader_read_arena_page_hit() {
 /// captured pages (page miss).
 #[test]
 fn accessor_mem_reader_read_arena_page_miss_returns_none() {
-    use super::super::arena::{ArenaPage, ArenaSnapshot};
-    let snap = ArenaSnapshot {
-        pages: vec![ArenaPage {
-            user_addr: 0x1000,
-            bytes: vec![0u8; 4096],
-        }],
+    use super::super::arena::ArenaSnapshot;
+    use super::render_map::read_arena_in_snapshot;
+    use std::cell::Cell;
+    use std::collections::HashMap;
+
+    // Page miss + kern_vm_start == 0 → no anchor for the slow path → None
+    // (read_kva must not even run).
+    let no_anchor = ArenaSnapshot {
+        kern_vm_start: 0,
         ..ArenaSnapshot::default()
     };
+    assert!(
+        read_arena_in_snapshot(Some(&no_anchor), &HashMap::new(), 0x2000, 8, |_, _| panic!(
+            "zero kern_vm_start must short-circuit before read_kva"
+        ))
+        .is_none(),
+    );
 
-    struct StubReader<'a> {
-        arena_snapshot: &'a ArenaSnapshot,
-    }
-    impl super::super::btf_render::MemReader for StubReader<'_> {
-        fn read_kva(&self, _: u64, _: usize) -> Option<Vec<u8>> {
-            None
-        }
-        fn read_arena(&self, addr: u64, len: usize) -> Option<Vec<u8>> {
-            let page_addr = addr & !0xFFF;
-            let offset = (addr & 0xFFF) as usize;
-            let page = self
-                .arena_snapshot
-                .pages
-                .iter()
-                .find(|p| p.user_addr == page_addr)?;
-            if offset + len > page.bytes.len() {
-                // Contract: full request cannot be satisfied → None.
-                return None;
-            }
-            Some(page.bytes[offset..offset + len].to_vec())
-        }
-    }
-    let r = StubReader {
-        arena_snapshot: &snap,
+    // Page miss + non-zero kern_vm_start → compose
+    // kern_vm_start.wrapping_add(addr & 0xFFFF_FFFF) and route to read_kva
+    // with the same len. This is the only assertion that pins the
+    // 0xFFFF_FFFF mask + wrapping_add formula + len passthrough.
+    let anchor: u64 = 0xffff_8000_0000_0000;
+    let snap = ArenaSnapshot {
+        kern_vm_start: anchor,
+        ..ArenaSnapshot::default()
     };
-    // 0x2000 is NOT in the captured pages → None.
-    assert!(r.read_arena(0x2000, 8).is_none());
+    let addr: u64 = 0x1_2345_6010;
+    let seen: Cell<Option<(u64, usize)>> = Cell::new(None);
+    let got = read_arena_in_snapshot(Some(&snap), &HashMap::new(), addr, 8, |kva, l| {
+        seen.set(Some((kva, l)));
+        Some(vec![0xAB; l])
+    })
+    .expect("slow path returns the read_kva bytes");
+    assert_eq!(got, vec![0xAB; 8]);
+    let (kva, l) = seen.get().expect("read_kva must run on the slow path");
+    assert_eq!(l, 8);
+    assert_eq!(kva, anchor.wrapping_add(addr & 0xFFFF_FFFF));
 }
 
 /// MemReader default impls: any reader that doesn't override
