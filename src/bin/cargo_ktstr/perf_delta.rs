@@ -641,4 +641,67 @@ mod tests {
             "../nonexistent-xyz",
         );
     }
+
+    /// Exercise the gix-resolution path against a real throwaway repo:
+    /// `rev_parse_commit` for revspecs, `resolve_baseline` for BOTH the
+    /// explicit-commit and merge-base arms, and `short_hash`'s 7-hex
+    /// format. These are the load-bearing baseline-resolution functions
+    /// that the pure-helper unit tests can't reach (they need commits).
+    /// Shells `git` to build the fixture — the same `git` dependency
+    /// perf-delta's worktree path already requires.
+    #[test]
+    fn gix_resolution_against_a_temp_repo() {
+        use std::process::Command;
+        let dir = std::env::temp_dir().join(format!("ktstr-pd-gitfix-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mk tempdir");
+        let run = |args: &[&str]| {
+            let ok = Command::new("git")
+                .current_dir(&dir)
+                .args([
+                    "-c",
+                    "user.email=t@example.invalid",
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            assert!(ok, "git {args:?} failed");
+        };
+        run(&["init", "-q"]);
+        std::fs::write(dir.join("f"), "1").expect("write f");
+        run(&["add", "."]);
+        run(&["commit", "-q", "-m", "first"]);
+        std::fs::write(dir.join("f"), "2").expect("write f");
+        run(&["add", "."]);
+        run(&["commit", "-q", "-m", "second"]);
+
+        let repo = gix::discover(&dir).expect("discover temp repo");
+        let head = rev_parse_commit(&repo, "HEAD").expect("rev-parse HEAD");
+        let first = rev_parse_commit(&repo, "HEAD~1").expect("rev-parse HEAD~1");
+        assert_ne!(head, first, "HEAD and HEAD~1 are distinct commits");
+
+        // ExplicitCommit resolves the revspec verbatim (no merge-base).
+        assert_eq!(
+            resolve_baseline(&repo, &BaseSelection::ExplicitCommit("HEAD~1".to_string())).unwrap(),
+            first,
+        );
+        // MergeBaseWith(HEAD~1): HEAD~1 is HEAD's ancestor, so the
+        // merge-base of (HEAD, HEAD~1) is HEAD~1 itself.
+        assert_eq!(
+            resolve_baseline(&repo, &BaseSelection::MergeBaseWith("HEAD~1".to_string())).unwrap(),
+            first,
+            "merge-base(HEAD, HEAD~1) is HEAD~1",
+        );
+        // short_hash: 7 lowercase hex, no -dirty for a clean non-HEAD commit.
+        let sh = short_hash(&repo, first);
+        assert_eq!(sh.len(), 7, "short hash is 7 hex chars: {sh}");
+        assert!(sh.bytes().all(|b| b.is_ascii_hexdigit()), "hex only: {sh}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
