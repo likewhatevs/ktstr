@@ -1361,14 +1361,26 @@ pub struct CgroupStats {
     pub num_workers: usize,
     /// Distinct CPUs used across all workers in this cgroup.
     pub num_cpus: usize,
-    /// Mean off-CPU percentage across workers (off_cpu_ns / wall_time_ns * 100).
-    pub avg_off_cpu_pct: f64,
-    /// Minimum off-CPU percentage across workers.
-    pub min_off_cpu_pct: f64,
-    /// Maximum off-CPU percentage across workers.
-    pub max_off_cpu_pct: f64,
-    /// max_off_cpu_pct - min_off_cpu_pct. Measures scheduling fairness within the cgroup.
-    pub spread: f64,
+    /// Mean off-CPU percentage across workers (off_cpu_ns /
+    /// wall_time_ns * 100). `None` when no worker reported a
+    /// positive `wall_time_ns` (off-CPU% is undefined without wall
+    /// time) — distinct from `Some(0.0)`, a measured "never off
+    /// CPU". The `Option` keeps a not-measured cgroup from reading
+    /// as a perfectly-on-CPU one in the telemetry consumers
+    /// (`ScenarioStats.cgroups`).
+    pub avg_off_cpu_pct: Option<f64>,
+    /// Minimum off-CPU percentage across workers. `None` under the
+    /// same no-measurable-wall-time condition as `avg_off_cpu_pct`.
+    pub min_off_cpu_pct: Option<f64>,
+    /// Maximum off-CPU percentage across workers. `None` under the
+    /// same no-measurable-wall-time condition as `avg_off_cpu_pct`.
+    pub max_off_cpu_pct: Option<f64>,
+    /// `max_off_cpu_pct - min_off_cpu_pct`. Measures scheduling
+    /// fairness within the cgroup. `None` when off-CPU% was not
+    /// measured (no worker with positive wall time) — a not-measured
+    /// cgroup is inconclusive for fairness, NOT "spread 0 = perfectly
+    /// fair". `Some(0.0)` means a real measured zero spread.
+    pub spread: Option<f64>,
     /// Longest scheduling gap across all workers (ms).
     pub max_gap_ms: u64,
     /// CPU where the longest scheduling gap occurred.
@@ -3739,12 +3751,21 @@ impl AssertPlan {
             // least two workers with measurable wall time (fewer collapses
             // min==max -> spread==0), so the `spread > limit` guard already
             // implies >= 2 measurable.
-            if cg.spread > spread_limit && cg.num_workers >= 2 {
+            // `spread` is None when off-CPU% was not measured (no
+            // worker with positive wall time) — inconclusive, never
+            // flagged unfair. A measured `Some(spread)` over the
+            // limit on >= 2 workers is the real violation.
+            if let Some(spread) = cg.spread
+                && spread > spread_limit
+                && cg.num_workers >= 2
+            {
                 r.record_fail(AssertDetail::new(
                     DetailKind::Unfair,
                     format!(
                         "unfair cgroup: spread={:.0}% ({:.0}-{:.0}%) {} workers on {} cpus (threshold {:.0}%)",
-                        cg.spread, cg.min_off_cpu_pct, cg.max_off_cpu_pct,
+                        spread,
+                        cg.min_off_cpu_pct.unwrap_or(0.0),
+                        cg.max_off_cpu_pct.unwrap_or(0.0),
                         cg.num_workers, cg.num_cpus, spread_limit
                     ),
                 ));
@@ -5093,14 +5114,21 @@ pub fn cgroup_stats(reports: &[WorkerReport]) -> CgroupStats {
         .map(|w| w.off_cpu_ns as f64 / w.wall_time_ns as f64 * 100.0)
         .collect();
 
-    let min = pcts.iter().cloned().reduce(f64::min).unwrap_or(0.0);
-    let max = pcts.iter().cloned().reduce(f64::max).unwrap_or(0.0);
+    // None when no worker had measurable wall time (pcts empty):
+    // off-CPU% is undefined, and a not-measured cgroup must not read
+    // as a measured 0% / spread-0 (perfectly fair) one. Some(_)
+    // otherwise, including a real measured zero.
+    let min = pcts.iter().cloned().reduce(f64::min);
+    let max = pcts.iter().cloned().reduce(f64::max);
     let avg = if pcts.is_empty() {
-        0.0
+        None
     } else {
-        pcts.iter().sum::<f64>() / pcts.len() as f64
+        Some(pcts.iter().sum::<f64>() / pcts.len() as f64)
     };
-    let spread = max - min;
+    let spread = match (min, max) {
+        (Some(lo), Some(hi)) => Some(hi - lo),
+        _ => None,
+    };
 
     let worst_gap = reports.iter().max_by_key(|w| w.max_gap_ms);
     let (gap_ms, gap_cpu) = worst_gap
@@ -5224,7 +5252,11 @@ fn scenario_stats_for_cgroup(cg: &CgroupStats) -> ScenarioStats {
         total_workers: cg.num_workers,
         total_cpus: cg.num_cpus,
         total_migrations: cg.total_migrations,
-        worst_spread: cg.spread,
+        // worst_spread is higher-is-worse (merge takes max). A
+        // not-measured cgroup (`spread == None`) maps to 0.0 — the
+        // neutral element for max, and the gauntlet layer's
+        // documented no-data convention. A measured zero stays 0.0.
+        worst_spread: cg.spread.unwrap_or(0.0),
         worst_gap_ms: cg.max_gap_ms,
         worst_gap_cpu: cg.max_gap_cpu,
         worst_migration_ratio: cg.migration_ratio,
@@ -5268,16 +5300,21 @@ fn record_default_fairness(r: &mut AssertResult, cg: &CgroupStats, reports: &[Wo
     }
     // Off-cpu spread above the default threshold, gated on >=2 workers
     // with measurable wall time (the historical `pcts.len() >= 2`).
+    // `cg.spread` is None when off-CPU% was not measured — inconclusive,
+    // never flagged unfair.
     let measurable = reports.iter().filter(|w| w.wall_time_ns > 0).count();
     let spread_limit = spread_threshold_pct();
-    if cg.spread > spread_limit && measurable >= 2 {
+    if let Some(spread) = cg.spread
+        && spread > spread_limit
+        && measurable >= 2
+    {
         r.record_fail(AssertDetail::new(
             DetailKind::Unfair,
             format!(
                 "unfair cgroup: spread={:.0}% ({:.0}-{:.0}%) {} workers on {} cpus (threshold {:.0}%)",
-                cg.spread,
-                cg.min_off_cpu_pct,
-                cg.max_off_cpu_pct,
+                spread,
+                cg.min_off_cpu_pct.unwrap_or(0.0),
+                cg.max_off_cpu_pct.unwrap_or(0.0),
                 cg.num_workers,
                 cg.num_cpus,
                 spread_limit,

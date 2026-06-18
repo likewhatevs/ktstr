@@ -155,10 +155,10 @@ fn stats_accuracy() {
     let c = &r.stats.cgroups[0];
     assert_eq!(c.num_workers, 2);
     assert_eq!(c.num_cpus, 2);
-    assert!((c.min_off_cpu_pct - 20.0).abs() < 0.1);
-    assert!((c.max_off_cpu_pct - 30.0).abs() < 0.1);
-    assert!((c.spread - 10.0).abs() < 0.1);
-    assert!((c.avg_off_cpu_pct - 25.0).abs() < 0.1);
+    assert!((c.min_off_cpu_pct.unwrap() - 20.0).abs() < 0.1);
+    assert!((c.max_off_cpu_pct.unwrap() - 30.0).abs() < 0.1);
+    assert!((c.spread.unwrap() - 10.0).abs() < 0.1);
+    assert!((c.avg_off_cpu_pct.unwrap() - 25.0).abs() < 0.1);
 }
 
 #[test]
@@ -217,7 +217,9 @@ fn single_worker_spread_zero() {
     let r = assert_not_starved(&[rpt(1, 500, 5e9 as u64, 25e8 as u64, &[0, 1], 50)]);
     assert!(r.is_pass());
     let c = &r.stats.cgroups[0];
-    assert!((c.spread - 0.0).abs() < f64::EPSILON);
+    // Single worker with measurable wall time: a real measured zero
+    // spread (Some(0.0)), not None.
+    assert_eq!(c.spread, Some(0.0));
 }
 
 #[test]
@@ -231,6 +233,14 @@ fn zero_wall_time_nonzero_work() {
         "nonzero work with zero wall_time: {:?}",
         r.outcomes
     );
+    // No worker had measurable wall time, so off-CPU% is not defined.
+    // The fields must be None (not measured), NOT 0.0 — a not-measured
+    // cgroup must not read as a perfectly-on-CPU / perfectly-fair one.
+    let c = &r.stats.cgroups[0];
+    assert_eq!(c.avg_off_cpu_pct, None, "off-cpu% must be None, not 0.0");
+    assert_eq!(c.min_off_cpu_pct, None);
+    assert_eq!(c.max_off_cpu_pct, None);
+    assert_eq!(c.spread, None, "spread must be None (inconclusive), not 0.0");
 }
 
 #[test]
@@ -366,23 +376,14 @@ fn neg_unfairness_extreme_spread_detected() {
         "must include threshold bound: {detail}"
     );
     let c = &r.stats.cgroups[0];
-    assert!(
-        c.spread > 80.0,
-        "spread should be >80%, got {:.1}",
-        c.spread
-    );
+    let spread = c.spread.expect("measured workers => Some");
+    assert!(spread > 80.0, "spread should be >80%, got {spread:.1}");
     assert_eq!(c.num_workers, 2);
     assert_eq!(c.num_cpus, 2);
-    assert!(
-        c.min_off_cpu_pct < 10.0,
-        "min pct should be ~5%: {:.1}",
-        c.min_off_cpu_pct
-    );
-    assert!(
-        c.max_off_cpu_pct > 90.0,
-        "max pct should be ~95%: {:.1}",
-        c.max_off_cpu_pct
-    );
+    let min_pct = c.min_off_cpu_pct.expect("measured workers => Some");
+    assert!(min_pct < 10.0, "min pct should be ~5%: {min_pct:.1}");
+    let max_pct = c.max_off_cpu_pct.expect("measured workers => Some");
+    assert!(max_pct > 90.0, "max pct should be ~95%: {max_pct:.1}");
 }
 
 #[test]

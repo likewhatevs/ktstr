@@ -1900,11 +1900,14 @@ fn evaluate_vm_result(
                 )];
                 for (i, cg) in s.cgroups.iter().enumerate() {
                     lines.push(format!(
-                        "  cg{}: workers={} cpus={} spread={:.1}% gap={}ms migrations={} iter={}",
+                        "  cg{}: workers={} cpus={} spread={} gap={}ms migrations={} iter={}",
                         i,
                         cg.num_workers,
                         cg.num_cpus,
-                        cg.spread,
+                        // None = off-CPU% not measured (no worker with
+                        // wall time); show "n/a" rather than a fake 0%.
+                        cg.spread
+                            .map_or_else(|| "n/a".to_string(), |s| format!("{s:.1}%")),
                         cg.max_gap_ms,
                         cg.total_migrations,
                         cg.total_iterations,
