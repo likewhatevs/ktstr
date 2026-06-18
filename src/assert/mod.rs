@@ -1355,7 +1355,7 @@ pub struct AssertResult {
 /// [`ScenarioStats::worst_iterations_per_worker`] aggregate these
 /// methods over per-cgroup [`Self`] entries during
 /// [`AssertResult::merge`].
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, crate::Claim)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize, crate::Claim)]
 pub struct CgroupStats {
     /// Number of workers in this cgroup.
     pub num_workers: usize,
@@ -1813,7 +1813,7 @@ fn merge_metric_values(
 }
 
 /// Aggregated statistics across all cgroups in a scenario.
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, crate::Claim)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize, crate::Claim)]
 pub struct ScenarioStats {
     /// Per-cgroup stats, one entry per cgroup.
     pub cgroups: Vec<CgroupStats>,

@@ -31,10 +31,21 @@ fn scenario_stats_serde_roundtrip() {
     };
     let json = serde_json::to_string(&s).unwrap();
     let s2: ScenarioStats = serde_json::from_str(&json).unwrap();
-    assert_eq!(s.total_workers, s2.total_workers);
-    assert_eq!(s.worst_gap_ms, s2.worst_gap_ms);
-    assert_eq!(s.cgroups.len(), s2.cgroups.len());
-    assert_eq!(s.cgroups[0].num_workers, s2.cgroups[0].num_workers);
+    // Full-value roundtrip, not just a 4-field spot check: a serde
+    // regression (a rename typo, a precision-losing serializer, or an
+    // Option mis-encode turning Some(50.0) into None/0.0) must surface.
+    // The nested CgroupStats Option<f64> off-CPU% fields are the
+    // load-bearing case — they are legitimately optional on the wire,
+    // so a Some->None corruption deserializes cleanly and only an
+    // explicit value check catches it.
+    assert_eq!(s, s2, "ScenarioStats must roundtrip every field verbatim");
+    // Spot-pin the optional off-CPU% fields so a reader sees exactly
+    // what the equality guards.
+    let c = &s2.cgroups[0];
+    assert_eq!(c.avg_off_cpu_pct, Some(50.0));
+    assert_eq!(c.min_off_cpu_pct, Some(40.0));
+    assert_eq!(c.max_off_cpu_pct, Some(60.0));
+    assert_eq!(c.spread, Some(20.0));
 }
 
 #[test]
