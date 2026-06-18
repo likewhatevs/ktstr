@@ -526,6 +526,20 @@ impl Timeline {
             let metrics = compute_metrics(&phase_samples);
 
             phases.push(Phase {
+                // Enumerate position over the phase-bearing step_events,
+                // NOT the bucket step_index `phase_from_bucket` uses. This
+                // path's input is a monitor-only / legacy / test stream with
+                // no step_index-bearing Stimulus frames (the settle is
+                // step_events[0]; later events follow), so enumerate IS the
+                // step identity and `index == 0 => BASELINE` holds for this
+                // model. It diverges from the step_index model ONLY for a
+                // step_index-bearing stream with no leading settle (the
+                // production stimulus shape), which never reaches `build`:
+                // build is the monitor-only fallback, taken only when there
+                // are no PhaseBuckets, i.e. no StepStarts
+                // (build_phase_buckets_with_stimulus synthesizes a bucket
+                // per StepStart) — so a step_index-bearing production stream
+                // always takes from_phase_buckets, never this path.
                 index: idx,
                 start_ms: start,
                 end_ms: end,
@@ -876,8 +890,7 @@ impl Timeline {
         sorted_events.sort_by_key(|e| e.elapsed_ms);
         let mut phases: Vec<Phase> = sorted
             .into_iter()
-            .enumerate()
-            .map(|(idx, b)| phase_from_bucket(idx, b, &sorted_events))
+            .map(|b| phase_from_bucket(b, &sorted_events))
             .collect();
         // Boundary-change detection — same per-pair diffing logic
         // [`Self::build`] applies. Walks each adjacent (prev, curr)
@@ -976,18 +989,18 @@ impl Timeline {
 // ---------------------------------------------------------------------------
 
 /// Build a [`Phase`] from a [`crate::assert::PhaseBucket`]. The phase
-/// index is the bucket's ENUMERATE position in the step_index-sorted vec
-/// (the `idx` argument), NOT the bucket's `step_index` — a known render
-/// quirk: `format_phases` keys its BASELINE-vs-Step label on this index,
-/// so a run whose first bucket is a Step (no BASELINE bucket) mislabels
-/// it as BASELINE. The metric map is projected onto the named
-/// `PhaseMetrics` fields per the table
-/// in [`Timeline::from_phase_buckets`]. Phase 0 (BASELINE) emits
-/// `stimulus = None`; later phases synthesize a [`StimulusEvent`]
-/// whose label / op_kind come from the bucket label so the
-/// failure-message renderer prints a recognizable phase header.
+/// index is the bucket's `step_index` (BASELINE = 0, scenario Step k =
+/// k + 1), NOT the enumerate position in the vec — so `format_phases`
+/// keys its BASELINE-vs-Step label on the true phase identity, and a run
+/// whose first bucket is a Step (no BASELINE bucket, e.g. under
+/// `--cell-parent-cgroup` where BASELINE captured nothing) renders that
+/// Step correctly rather than mislabeling it as BASELINE. The metric map
+/// is projected onto the named `PhaseMetrics` fields per the table in
+/// [`Timeline::from_phase_buckets`]. BASELINE (`step_index` 0) emits
+/// `stimulus = None`; later phases synthesize a [`StimulusEvent`] whose
+/// label / op_kind come from the bucket label so the failure-message
+/// renderer prints a recognizable phase header.
 fn phase_from_bucket(
-    idx: usize,
     b: &crate::assert::PhaseBucket,
     sorted_events: &[&StimulusEvent],
 ) -> Phase {
@@ -1063,7 +1076,7 @@ fn phase_from_bucket(
         }
     };
     Phase {
-        index: idx,
+        index: b.step_index as usize,
         start_ms: b.start_ms,
         end_ms: b.end_ms,
         stimulus,
@@ -1361,9 +1374,10 @@ mod tests {
 
     /// A synthesized zero-capture step (sample_count==0) still renders its
     /// stimulus-derived throughput in the formatted timeline, not only
-    /// "[no samples]". Pins the #4 visibility fix in format_phases. The
-    /// BASELINE bucket holds enumerate index 0 (the settle render) so the
-    /// synthesized step lands at a Phase index that takes the metric path.
+    /// "[no samples]". Pins the synthesized-step visibility in format_phases. The
+    /// BASELINE bucket holds step_index 0 (its phase index, the settle
+    /// render) so the synthesized step lands at a Phase index that takes
+    /// the metric path.
     #[test]
     fn format_renders_synthesized_step_throughput() {
         let buckets = vec![
@@ -1435,6 +1449,94 @@ mod tests {
         assert!(
             formatted.contains("dsq: avg=5 max=7"),
             "synthesized bucket's folded dsq must render; got:\n{formatted}",
+        );
+    }
+
+    /// A from_phase_buckets render whose first bucket is a Step (no
+    /// BASELINE bucket — e.g. under --cell-parent-cgroup where BASELINE
+    /// captured nothing) must NOT mislabel that Step as "BASELINE".
+    /// phase.index is the bucket's step_index, so format_phases' index==0
+    /// BASELINE check fires only for a real BASELINE bucket.
+    #[test]
+    fn format_no_baseline_bucket_does_not_mislabel_first_step() {
+        let buckets = vec![
+            crate::assert::PhaseBucket {
+                step_index: 1, // scenario Step 0; NO BASELINE bucket present
+                label: "Step[0]".to_string(),
+                start_ms: 1000,
+                end_ms: 2000,
+                sample_count: 3,
+                metrics: std::collections::BTreeMap::from([(
+                    "avg_imbalance_ratio".to_string(),
+                    1.0,
+                )]),
+            },
+            crate::assert::PhaseBucket {
+                step_index: 2,
+                label: "Step[1]".to_string(),
+                start_ms: 2000,
+                end_ms: 3000,
+                sample_count: 3,
+                metrics: std::collections::BTreeMap::from([(
+                    "avg_imbalance_ratio".to_string(),
+                    1.0,
+                )]),
+            },
+        ];
+        let t = Timeline::from_phase_buckets(&buckets, &[], &TimelineContext::default());
+        let formatted = t.format_with_context(&TimelineContext::default());
+        assert!(
+            !formatted.contains("BASELINE"),
+            "no BASELINE bucket -> no BASELINE label; the first Step must not \
+             be mislabeled as BASELINE; got:\n{formatted}",
+        );
+        assert!(
+            formatted.contains("Phase 1"),
+            "the first Step renders as 'Phase 1' (its step_index), not \
+             'Phase 0'/BASELINE; got:\n{formatted}",
+        );
+    }
+
+    /// Sparse / non-contiguous step_index renders the TRUE step number:
+    /// BASELINE(0) + a Step at step_index 3 renders "Phase 3", not the
+    /// enumerate-position "Phase 1". Pins index == step_index for a
+    /// non-zero, non-contiguous label — the case that distinguishes
+    /// step_index from the old enumerate index (a revert to enumerate
+    /// would pass the contiguous tests but fail this one).
+    #[test]
+    fn format_sparse_step_index_renders_true_step_number() {
+        let buckets = vec![
+            crate::assert::PhaseBucket {
+                step_index: 0,
+                label: "BASELINE".to_string(),
+                start_ms: 0,
+                end_ms: 100,
+                sample_count: 2,
+                metrics: std::collections::BTreeMap::new(),
+            },
+            crate::assert::PhaseBucket {
+                step_index: 3, // sparse: Steps 0/1 absent, only step_index 3
+                label: "Step[2]".to_string(),
+                start_ms: 200,
+                end_ms: 300,
+                sample_count: 2,
+                metrics: std::collections::BTreeMap::from([(
+                    "avg_imbalance_ratio".to_string(),
+                    1.0,
+                )]),
+            },
+        ];
+        let t = Timeline::from_phase_buckets(&buckets, &[], &TimelineContext::default());
+        let formatted = t.format_with_context(&TimelineContext::default());
+        assert!(
+            formatted.contains("Phase 3"),
+            "a sparse Step at step_index 3 must render 'Phase 3' (its \
+             step_index), not the enumerate-position 'Phase 1'; got:\n{formatted}",
+        );
+        assert!(
+            !formatted.contains("Phase 1"),
+            "the enumerate-position 'Phase 1' must NOT appear for a \
+             step_index-3 bucket; got:\n{formatted}",
         );
     }
 
