@@ -651,7 +651,10 @@ mod tests_coercion {
             variant: Some("SCX_OPS_ENABLED".to_string()),
             is_signed: false,
         };
-        assert_eq!(SnapshotField::Value(&named).as_str().unwrap(), "SCX_OPS_ENABLED");
+        assert_eq!(
+            SnapshotField::Value(&named).as_str().unwrap(),
+            "SCX_OPS_ENABLED"
+        );
         let nameless = RenderedValue::Enum {
             bits: 32,
             value: 2,
@@ -681,7 +684,10 @@ mod tests_coercion {
             cast_annotation: None,
         };
         assert_eq!(
-            SnapshotField::Value(&through_ptr).get("stall").as_u64().unwrap(),
+            SnapshotField::Value(&through_ptr)
+                .get("stall")
+                .as_u64()
+                .unwrap(),
             1,
         );
         // Walking into a scalar surfaces NotAStruct.

@@ -1280,7 +1280,9 @@ impl<'a> SnapshotMap<'a> {
         }
         // An empty traversal over a map whose contents failed to
         // render is a capture gap, not "predicate never matched".
-        if len == 0 && let Some(err) = self.render_incomplete_err() {
+        if len == 0
+            && let Some(err) = self.render_incomplete_err()
+        {
             return SnapshotEntry::Missing(err);
         }
         SnapshotEntry::Missing(SnapshotError::NoMatch {

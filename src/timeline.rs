@@ -556,14 +556,16 @@ impl Timeline {
             let mut changes = Vec::new();
 
             if before.sample_count > 0 && after_metrics.sample_count > 0 {
-                if let (Some(bi), Some(ai)) =
-                    (before.avg_imbalance, after_metrics.avg_imbalance)
-                {
-                    changes.extend(detect_change(bi, ai, IMBALANCE_THRESHOLD, "imbalance", true));
+                if let (Some(bi), Some(ai)) = (before.avg_imbalance, after_metrics.avg_imbalance) {
+                    changes.extend(detect_change(
+                        bi,
+                        ai,
+                        IMBALANCE_THRESHOLD,
+                        "imbalance",
+                        true,
+                    ));
                 }
-                if let (Some(bd), Some(ad)) =
-                    (before.avg_dsq_depth, after_metrics.avg_dsq_depth)
-                {
+                if let (Some(bd), Some(ad)) = (before.avg_dsq_depth, after_metrics.avg_dsq_depth) {
                     changes.extend(detect_change(bd, ad, DSQ_THRESHOLD, "dsq_depth", true));
                 }
                 if let (Some(bf), Some(af)) = (before.fallback_rate, after_metrics.fallback_rate) {
@@ -826,7 +828,13 @@ impl Timeline {
             }
             let mut changes = Vec::new();
             if let (Some(bi), Some(ai)) = (before.avg_imbalance, after.avg_imbalance) {
-                changes.extend(detect_change(bi, ai, IMBALANCE_THRESHOLD, "imbalance", true));
+                changes.extend(detect_change(
+                    bi,
+                    ai,
+                    IMBALANCE_THRESHOLD,
+                    "imbalance",
+                    true,
+                ));
             }
             if let (Some(bd), Some(ad)) = (before.avg_dsq_depth, after.avg_dsq_depth) {
                 changes.extend(detect_change(bd, ad, DSQ_THRESHOLD, "dsq_depth", true));
@@ -1974,7 +1982,10 @@ mod tests {
         assert_eq!(te.total_iterations, Some(0));
         assert_eq!(te.step_index, Some(1));
         assert!(!te.is_terminal);
-        assert!(!te.is_step_end, "a StepStart-derived event is not a StepEnd");
+        assert!(
+            !te.is_step_end,
+            "a StepStart-derived event is not a StepEnd"
+        );
     }
 
     #[test]
@@ -2054,8 +2065,9 @@ mod tests {
             StimulusEvent::from_step_end(&wire_event(1_900, 1, 9_000)),
             StimulusEvent::from_wire(&wire_event(2_000, 2, 9_000)),
         ];
-        let samples: Vec<MonitorSample> =
-            (5..35).map(|i| sample(i * 100, vec![(2, 1, i * 1000)])).collect();
+        let samples: Vec<MonitorSample> = (5..35)
+            .map(|i| sample(i * 100, vec![(2, 1, i * 1000)]))
+            .collect();
         let t = Timeline::build(&events, &samples);
         assert_eq!(
             t.phases.len(),
@@ -2080,8 +2092,9 @@ mod tests {
             StimulusEvent::from_wire(&wire_event(1_100, 2, 0)), // StepStart[1] respawned, iters 0
             StimulusEvent::from_step_end(&wire_event(2_100, 2, 3_000)), // StepEnd[1], iters 3000
         ];
-        let samples: Vec<MonitorSample> =
-            (1..30).map(|i| sample(i * 100, vec![(2, 1, i * 1000)])).collect();
+        let samples: Vec<MonitorSample> = (1..30)
+            .map(|i| sample(i * 100, vec![(2, 1, i * 1000)]))
+            .collect();
         let t = Timeline::build(&events, &samples);
         assert_eq!(
             t.phases.len(),
@@ -2115,8 +2128,9 @@ mod tests {
             StimulusEvent::from_wire(&wire_event(1_100, 2, 500)), // StepStart[1], persistent 500
             StimulusEvent::from_step_end(&wire_event(2_100, 2, 5_500)), // StepEnd[1], iters 5500
         ];
-        let samples: Vec<MonitorSample> =
-            (1..30).map(|i| sample(i * 100, vec![(2, 1, i * 1000)])).collect();
+        let samples: Vec<MonitorSample> = (1..30)
+            .map(|i| sample(i * 100, vec![(2, 1, i * 1000)]))
+            .collect();
         let t = Timeline::build(&events, &samples);
         assert_eq!(t.phases.len(), 2);
         assert_eq!(
@@ -2136,14 +2150,20 @@ mod tests {
         // Boundary case: a one-step scenario (first == last). With the
         // 0 baseline and the terminal boundary        // the single step still gets a rate, and the terminal adds no
         // phase.
-        let mut events: Vec<StimulusEvent> =
-            [wire_event(0, 1, 0)].iter().map(StimulusEvent::from_wire).collect();
+        let mut events: Vec<StimulusEvent> = [wire_event(0, 1, 0)]
+            .iter()
+            .map(StimulusEvent::from_wire)
+            .collect();
         events.push(StimulusEvent::terminal(3000, 9000));
         let samples: Vec<MonitorSample> = (5..35)
             .map(|i| sample(i * 100, vec![(2, 1, i * 1000)]))
             .collect();
         let t = Timeline::build(&events, &samples);
-        assert_eq!(t.phases.len(), 1, "single step -> one phase; terminal adds none");
+        assert_eq!(
+            t.phases.len(),
+            1,
+            "single step -> one phase; terminal adds none"
+        );
         assert!(
             t.phases[0].metrics.iteration_rate.is_some(),
             "single step gets a rate (first == last)",
@@ -2240,7 +2260,11 @@ mod tests {
             .collect();
         let t = Timeline::build(&events, &samples);
         // Two step events -> two phases regardless of terminal position.
-        assert_eq!(t.phases.len(), 2, "terminal position must not change phase count");
+        assert_eq!(
+            t.phases.len(),
+            2,
+            "terminal position must not change phase count"
+        );
         // Phase 0 (step 1) still gets its correct rate (0 -> 4000 over
         // 2s = 2000/s): the misordered terminal did not misalign it.
         assert_eq!(

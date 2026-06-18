@@ -1159,8 +1159,10 @@ mod tests {
         for line in maps.lines() {
             let range = line.split_whitespace().next().unwrap_or("");
             if let Some((start, end)) = range.split_once('-')
-                && let (Ok(start), Ok(end)) =
-                    (usize::from_str_radix(start, 16), usize::from_str_radix(end, 16))
+                && let (Ok(start), Ok(end)) = (
+                    usize::from_str_radix(start, 16),
+                    usize::from_str_radix(end, 16),
+                )
             {
                 assert!(
                     !(start <= addr_val && addr_val < end),

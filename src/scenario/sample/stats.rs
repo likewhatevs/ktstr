@@ -485,12 +485,22 @@ mod tests {
         // misses (mirror of bpf.rs).
         let busy = fields.iter().find(|(n, _)| n == "busy").expect("busy kept");
         assert_eq!(
-            busy.1.values_iter().filter_map(|r| r.as_ref().ok().copied()).collect::<Vec<u64>>(),
+            busy.1
+                .values_iter()
+                .filter_map(|r| r.as_ref().ok().copied())
+                .collect::<Vec<u64>>(),
             vec![50u64, 60],
         );
-        let count = fields.iter().find(|(n, _)| n == "count").expect("count kept");
+        let count = fields
+            .iter()
+            .find(|(n, _)| n == "count")
+            .expect("count kept");
         assert_eq!(
-            count.1.values_iter().filter_map(|r| r.as_ref().ok().copied()).collect::<Vec<u64>>(),
+            count
+                .1
+                .values_iter()
+                .filter_map(|r| r.as_ref().ok().copied())
+                .collect::<Vec<u64>>(),
             vec![7u64, 9],
         );
     }

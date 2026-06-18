@@ -217,7 +217,10 @@ fn telemetry_populated_without_not_starved() {
     // inside `if self.not_starved`, so stats.cgroups came back [] despite
     // real reports.
     let plan = AssertPlan::new().max_gap_ms(1_000_000);
-    assert!(!plan.not_starved, "guard: not_starved must be off for this pin");
+    assert!(
+        !plan.not_starved,
+        "guard: not_starved must be off for this pin"
+    );
     let reports = [
         rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 50),
         rpt(2, 1000, 5e9 as u64, 6e8 as u64, &[1], 60),
@@ -262,7 +265,8 @@ fn max_spread_pct_fires_without_not_starved() {
     ];
     let r = plan.assert_cgroup(&reports, None, None);
     assert!(
-        r.failure_details().any(|d| matches!(d.kind, DetailKind::Unfair)),
+        r.failure_details()
+            .any(|d| matches!(d.kind, DetailKind::Unfair)),
         "spread 80% > 5% threshold must fire Unfair without not_starved; got {:?}",
         r.outcomes,
     );
@@ -276,7 +280,8 @@ fn max_gap_ms_fires_without_not_starved() {
     let reports = [rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 500)];
     let r = plan.assert_cgroup(&reports, None, None);
     assert!(
-        r.failure_details().any(|d| matches!(d.kind, DetailKind::Stuck)),
+        r.failure_details()
+            .any(|d| matches!(d.kind, DetailKind::Stuck)),
         "gap 500ms > 100ms threshold must fire Stuck without not_starved; got {:?}",
         r.outcomes,
     );
@@ -294,6 +299,10 @@ fn assert_cgroup_no_double_count_telemetry() {
         rpt(2, 1000, 5e9 as u64, 6e8 as u64, &[1], 60),
     ];
     let r = plan.assert_cgroup(&reports, None, None);
-    assert_eq!(r.stats.cgroups.len(), 1, "exactly one cgroup entry per call");
+    assert_eq!(
+        r.stats.cgroups.len(),
+        1,
+        "exactly one cgroup entry per call"
+    );
     assert_eq!(r.stats.total_workers, 2);
 }

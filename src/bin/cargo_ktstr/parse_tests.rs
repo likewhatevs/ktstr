@@ -182,7 +182,11 @@ fn parse_perf_delta_flags_and_defaults() {
             assert!(threshold.is_none() && policy.is_none());
             assert!(a_scheduler.is_none() && b_scheduler.is_none());
             assert!(
-                !no_phases && !phases_only && !steps_only && phase.is_none() && phase_threshold.is_none(),
+                !no_phases
+                    && !phases_only
+                    && !steps_only
+                    && phase.is_none()
+                    && phase_threshold.is_none(),
                 "phase flags default off (full per-phase render)",
             );
         }
@@ -192,7 +196,13 @@ fn parse_perf_delta_flags_and_defaults() {
     let Cargo {
         command: CargoSub::Ktstr(k),
     } = Cargo::try_parse_from([
-        "cargo", "ktstr", "perf-delta", "--a-scheduler", "scx_a", "--b-scheduler", "scx_b",
+        "cargo",
+        "ktstr",
+        "perf-delta",
+        "--a-scheduler",
+        "scx_a",
+        "--b-scheduler",
+        "scx_b",
     ])
     .unwrap_or_else(|e| panic!("{e}"));
     match k.command {
@@ -214,7 +224,13 @@ fn parse_perf_delta_flags_and_defaults() {
     // Config axis conflicts with the commit axis at parse time.
     assert!(
         Cargo::try_parse_from([
-            "cargo", "ktstr", "perf-delta", "--a-scheduler", "scx_a", "--b-scheduler", "scx_b",
+            "cargo",
+            "ktstr",
+            "perf-delta",
+            "--a-scheduler",
+            "scx_a",
+            "--b-scheduler",
+            "scx_b",
             "--dual-run",
         ])
         .is_err(),
@@ -223,21 +239,40 @@ fn parse_perf_delta_flags_and_defaults() {
     // --threshold and --policy are mutually exclusive.
     assert!(
         Cargo::try_parse_from([
-            "cargo", "ktstr", "perf-delta", "--threshold", "10", "--policy", "/tmp/p.json",
+            "cargo",
+            "ktstr",
+            "perf-delta",
+            "--threshold",
+            "10",
+            "--policy",
+            "/tmp/p.json",
         ])
         .is_err(),
         "--threshold and --policy must conflict at parse time",
     );
     // --no-phases conflicts with every other phase flag.
     assert!(
-        Cargo::try_parse_from(["cargo", "ktstr", "perf-delta", "--no-phases", "--phases-only"])
-            .is_err(),
+        Cargo::try_parse_from([
+            "cargo",
+            "ktstr",
+            "perf-delta",
+            "--no-phases",
+            "--phases-only"
+        ])
+        .is_err(),
         "--no-phases must conflict with --phases-only",
     );
     // --steps-only conflicts with the single --phase filter.
     assert!(
-        Cargo::try_parse_from(["cargo", "ktstr", "perf-delta", "--steps-only", "--phase", "1"])
-            .is_err(),
+        Cargo::try_parse_from([
+            "cargo",
+            "ktstr",
+            "perf-delta",
+            "--steps-only",
+            "--phase",
+            "1"
+        ])
+        .is_err(),
         "--steps-only must conflict with --phase",
     );
 }
@@ -560,7 +595,10 @@ fn parse_coverage_with_release_scheduler_flag() {
         release_scheduler,
         "`--release-scheduler` must set release_scheduler=true on coverage"
     );
-    assert!(!release, "`--release-scheduler` alone must NOT set --release");
+    assert!(
+        !release,
+        "`--release-scheduler` alone must NOT set --release"
+    );
 }
 
 /// Pin `trailing_var_arg` args forwarded verbatim after `--`.

@@ -2621,14 +2621,10 @@ fn buckets_from_grouped(
         // `phase_group_cpu_delta`). Observer-free: reads the frozen
         // task_struct.{s,u}time + thread-group signal_struct accumulator
         // already captured in each sample's enrichments.
-        if let Some(v) =
-            phase_group_cpu_delta(&samples_in_phase, |t| t.stime, |t| t.signal_stime)
-        {
+        if let Some(v) = phase_group_cpu_delta(&samples_in_phase, |t| t.stime, |t| t.signal_stime) {
             metrics.entry("system_time_ns".to_string()).or_insert(v);
         }
-        if let Some(v) =
-            phase_group_cpu_delta(&samples_in_phase, |t| t.utime, |t| t.signal_utime)
-        {
+        if let Some(v) = phase_group_cpu_delta(&samples_in_phase, |t| t.utime, |t| t.signal_utime) {
             metrics.entry("user_time_ns".to_string()).or_insert(v);
         }
         // Per-phase MonitorSample windowing (wire-up for metrics
@@ -2691,7 +2687,6 @@ fn buckets_from_grouped(
     }
     out
 }
-
 
 /// Clock skew (ms) between the host monitor's run-relative timeline and
 /// the guest's scenario-relative stimulus timeline, computed the same
@@ -5868,7 +5863,10 @@ impl AbsoluteThresholds {
 /// let r = assert_thresholds(&[report], &AbsoluteThresholds::strict());
 /// assert!(r.is_pass());
 /// ```
-pub fn assert_thresholds(reports: &[WorkerReport], thresholds: &AbsoluteThresholds) -> AssertResult {
+pub fn assert_thresholds(
+    reports: &[WorkerReport],
+    thresholds: &AbsoluteThresholds,
+) -> AssertResult {
     // Empty `reports` means nothing was measured. Returning a fresh
     // `pass()` here would silently green-light a broken run that
     // produced no signal; delegating to `assert_benchmarks` and

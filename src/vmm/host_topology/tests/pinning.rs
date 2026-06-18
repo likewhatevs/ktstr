@@ -618,7 +618,11 @@ fn numa_aware_llc_order_zero_numa_nodes_is_safe() {
     // Pin the fallback CONTENT, not just length: a len-only check passes
     // for [0,0] (two guest LLCs double-pinned to host LLC 0), a real
     // misconfiguration. Sequential fallback over 2 host LLCs is [0,1].
-    assert_eq!(order, vec![0, 1], "zero-numa fallback must map sequentially");
+    assert_eq!(
+        order,
+        vec![0, 1],
+        "zero-numa fallback must map sequentially"
+    );
 }
 
 #[test]
@@ -637,9 +641,17 @@ fn numa_aware_llc_order_fewer_llcs_than_nodes_falls_back() {
     // distinctness: [0,0] (len 2) would double-pin two guest LLCs to
     // host LLC 0 and never use LLC 1 — a real misconfiguration a
     // len-only check admits.
-    assert_eq!(order, vec![0, 1], "fewer-llcs fallback must map to distinct LLCs");
+    assert_eq!(
+        order,
+        vec![0, 1],
+        "fewer-llcs fallback must map to distinct LLCs"
+    );
     let unique: std::collections::HashSet<usize> = order.iter().copied().collect();
-    assert_eq!(unique.len(), order.len(), "no two guest LLCs may pin to the same host LLC");
+    assert_eq!(
+        unique.len(),
+        order.len(),
+        "no two guest LLCs may pin to the same host LLC"
+    );
 }
 
 #[test]

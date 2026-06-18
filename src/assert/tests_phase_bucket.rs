@@ -1725,9 +1725,16 @@ fn by_stimulus_phase_separates_what_by_stamped_phase_collapses() {
 
     // by_stimulus_phase: re-derived from boundary_offset -> 4 phases.
     let by_stim = samples.by_stimulus_phase(&stimulus);
-    assert_eq!(by_stim.keys().copied().collect::<Vec<_>>(), vec![0, 1, 2, 3]);
+    assert_eq!(
+        by_stim.keys().copied().collect::<Vec<_>>(),
+        vec![0, 1, 2, 3]
+    );
     for k in [0u16, 1, 2, 3] {
-        assert_eq!(by_stim[&k].len(), 1, "phase {k} should hold exactly one sample");
+        assert_eq!(
+            by_stim[&k].len(),
+            1,
+            "phase {k} should hold exactly one sample"
+        );
     }
 }
 
@@ -2232,8 +2239,14 @@ fn build_phase_buckets_with_stimulus_loop_step_rate_no_prior_graft() {
         StimulusEvent::terminal(3000, 3000),
     ];
     let phases = crate::assert::build_phase_buckets_with_stimulus(&samples, &stimulus);
-    let step1 = phases.iter().find(|p| p.step_index == 1).expect("step 1 bucket");
-    let loop_step = phases.iter().find(|p| p.step_index == 2).expect("loop step bucket");
+    let step1 = phases
+        .iter()
+        .find(|p| p.step_index == 1)
+        .expect("step 1 bucket");
+    let loop_step = phases
+        .iter()
+        .find(|p| p.step_index == 2)
+        .expect("loop step bucket");
     // Prior step gets ONLY its own window (0 -> 1000 over 1s = 1000/s),
     // NOT the loop window grafted on.
     assert_eq!(

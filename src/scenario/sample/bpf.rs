@@ -1101,13 +1101,19 @@ mod tests {
     }
 
     fn oks_u64(f: SeriesField<u64>) -> Vec<u64> {
-        f.values_iter().filter_map(|r| r.as_ref().ok().copied()).collect()
+        f.values_iter()
+            .filter_map(|r| r.as_ref().ok().copied())
+            .collect()
     }
     fn oks_i64(f: SeriesField<i64>) -> Vec<i64> {
-        f.values_iter().filter_map(|r| r.as_ref().ok().copied()).collect()
+        f.values_iter()
+            .filter_map(|r| r.as_ref().ok().copied())
+            .collect()
     }
     fn oks_f64(f: SeriesField<f64>) -> Vec<f64> {
-        f.values_iter().filter_map(|r| r.as_ref().ok().copied()).collect()
+        f.values_iter()
+            .filter_map(|r| r.as_ref().ok().copied())
+            .collect()
     }
 
     /// `field_cpu_sum_u64` sums the readable per-CPU slots and SKIPS
@@ -1116,7 +1122,12 @@ mod tests {
     fn bpf_map_projector_field_cpu_sum_u64_sums_present_skips_none() {
         let series = percpu_series(&[Some(11), Some(22), None, Some(44)]);
         assert_eq!(
-            oks_u64(series.bpf_map("cpu_ctxs").at(0).field_cpu_sum_u64("dispatched")),
+            oks_u64(
+                series
+                    .bpf_map("cpu_ctxs")
+                    .at(0)
+                    .field_cpu_sum_u64("dispatched")
+            ),
             vec![11 + 22 + 44],
         );
     }
@@ -1127,11 +1138,21 @@ mod tests {
     fn bpf_map_projector_field_cpu_max_min_u64() {
         let series = percpu_series(&[Some(11), Some(22), None, Some(44)]);
         assert_eq!(
-            oks_u64(series.bpf_map("cpu_ctxs").at(0).field_cpu_max_u64("dispatched")),
+            oks_u64(
+                series
+                    .bpf_map("cpu_ctxs")
+                    .at(0)
+                    .field_cpu_max_u64("dispatched")
+            ),
             vec![44],
         );
         assert_eq!(
-            oks_u64(series.bpf_map("cpu_ctxs").at(0).field_cpu_min_u64("dispatched")),
+            oks_u64(
+                series
+                    .bpf_map("cpu_ctxs")
+                    .at(0)
+                    .field_cpu_min_u64("dispatched")
+            ),
             vec![11],
         );
     }
@@ -1142,15 +1163,30 @@ mod tests {
     fn bpf_map_projector_field_cpu_i64_aggregates() {
         let series = percpu_series(&[Some(11), Some(22), None, Some(44)]);
         assert_eq!(
-            oks_i64(series.bpf_map("cpu_ctxs").at(0).field_cpu_sum_i64("dispatched")),
+            oks_i64(
+                series
+                    .bpf_map("cpu_ctxs")
+                    .at(0)
+                    .field_cpu_sum_i64("dispatched")
+            ),
             vec![77],
         );
         assert_eq!(
-            oks_i64(series.bpf_map("cpu_ctxs").at(0).field_cpu_max_i64("dispatched")),
+            oks_i64(
+                series
+                    .bpf_map("cpu_ctxs")
+                    .at(0)
+                    .field_cpu_max_i64("dispatched")
+            ),
             vec![44],
         );
         assert_eq!(
-            oks_i64(series.bpf_map("cpu_ctxs").at(0).field_cpu_min_i64("dispatched")),
+            oks_i64(
+                series
+                    .bpf_map("cpu_ctxs")
+                    .at(0)
+                    .field_cpu_min_i64("dispatched")
+            ),
             vec![11],
         );
     }
@@ -1160,7 +1196,12 @@ mod tests {
     fn bpf_map_projector_field_cpu_sum_f64() {
         let series = percpu_series(&[Some(10), None, Some(30)]);
         assert_eq!(
-            oks_f64(series.bpf_map("cpu_ctxs").at(0).field_cpu_sum_f64("dispatched")),
+            oks_f64(
+                series
+                    .bpf_map("cpu_ctxs")
+                    .at(0)
+                    .field_cpu_sum_f64("dispatched")
+            ),
             vec![40.0],
         );
     }
@@ -1189,13 +1230,19 @@ mod tests {
     #[test]
     fn bpf_map_projector_field_cpu_all_none_sum_and_max_error() {
         let series = percpu_series(&[None, None, None]);
-        let sum = series.bpf_map("cpu_ctxs").at(0).field_cpu_sum_u64("dispatched");
+        let sum = series
+            .bpf_map("cpu_ctxs")
+            .at(0)
+            .field_cpu_sum_u64("dispatched");
         assert!(
             sum.values_iter().all(|r| r.is_err()),
             "all-None sum must error (None is unreadable, not a real zero), \
              not a silent Ok(0)",
         );
-        let max = series.bpf_map("cpu_ctxs").at(0).field_cpu_max_u64("dispatched");
+        let max = series
+            .bpf_map("cpu_ctxs")
+            .at(0)
+            .field_cpu_max_u64("dispatched");
         assert!(
             max.values_iter().all(|r| r.is_err()),
             "all-None max must error (max of the empty set is undefined)",
@@ -1207,7 +1254,12 @@ mod tests {
     #[test]
     fn bpf_map_projector_field_cpu_sum_on_non_percpu_errors() {
         let series = SampleSeries::from_drained(
-            vec![("periodic_000".to_string(), synthetic_report(10), None, Some(100))],
+            vec![(
+                "periodic_000".to_string(),
+                synthetic_report(10),
+                None,
+                Some(100),
+            )],
             None,
         );
         let f = series
@@ -1232,7 +1284,9 @@ mod tests {
             type_name: Some("cpu_ctx".into()),
             members: vec![RenderedMember {
                 name: "dispatched".into(),
-                value: RenderedValue::Bytes { hex: "de ad".into() },
+                value: RenderedValue::Bytes {
+                    hex: "de ad".into(),
+                },
             }],
         };
         let good = RenderedValue::Struct {

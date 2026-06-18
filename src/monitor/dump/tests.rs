@@ -90,7 +90,10 @@ fn render_sparkline_i64_clamps_negatives() {
         chars[0], '▁',
         "clamped -5 must render the lowest glyph, not the highest (clamp dropped?)",
     );
-    assert_eq!(chars[3], '█', "the max value (10) must render the highest glyph");
+    assert_eq!(
+        chars[3], '█',
+        "the max value (10) must render the highest glyph"
+    );
 }
 
 /// Full SCX_EV_* counter timeline construction: build a

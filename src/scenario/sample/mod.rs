@@ -577,7 +577,12 @@ mod tests {
                 None,
                 Some(100),
             ),
-            ("periodic_001".to_string(), synthetic_report(10), None, Some(200)),
+            (
+                "periodic_001".to_string(),
+                synthetic_report(10),
+                None,
+                Some(200),
+            ),
         ];
         let series = SampleSeries::from_drained(drained, None);
         let names = series.bpf_map("scx_obj.bss").member_names();
@@ -597,7 +602,12 @@ mod tests {
         // object. key_names must union across samples so the object's keys
         // are discoverable, not empty because sample 0's stats was Err.
         let drained = vec![
-            ("periodic_000".to_string(), synthetic_report(10), None, Some(100)),
+            (
+                "periodic_000".to_string(),
+                synthetic_report(10),
+                None,
+                Some(100),
+            ),
             (
                 "periodic_001".to_string(),
                 synthetic_report(20),

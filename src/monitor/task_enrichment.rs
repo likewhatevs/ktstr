@@ -416,42 +416,42 @@ pub fn walk_task_enrichment(
                     // undercount per-phase CPU time.
                     let signal_utime_v = mem.read_u64(signal_pa, offsets.signal_struct_utime);
                     let signal_stime_v = mem.read_u64(signal_pa, offsets.signal_struct_stime);
-                // pids[PIDTYPE_PGID] / pids[PIDTYPE_SID] traversal.
-                // Each slot is `struct pid *` (8 bytes); the
-                // numbers[0].nr deref reads the canonical root-ns
-                // pid number.
-                let pgid_v = read_pid_nr_at_index(
-                    mem,
-                    walk,
-                    signal_pa,
-                    offsets.signal_struct_pids,
-                    pid_type::PGID,
-                    offsets.pid_numbers,
-                    offsets.upid_size,
-                    offsets.upid_nr,
-                );
-                let sid_v = read_pid_nr_at_index(
-                    mem,
-                    walk,
-                    signal_pa,
-                    offsets.signal_struct_pids,
-                    pid_type::SID,
-                    offsets.pid_numbers,
-                    offsets.upid_size,
-                    offsets.upid_nr,
-                );
-                (
-                    Some(nr_threads_v),
-                    Some(signal_nvcsw_v),
-                    Some(signal_nivcsw_v),
-                    Some(signal_utime_v),
-                    Some(signal_stime_v),
-                    pgid_v,
-                    sid_v,
-                )
+                    // pids[PIDTYPE_PGID] / pids[PIDTYPE_SID] traversal.
+                    // Each slot is `struct pid *` (8 bytes); the
+                    // numbers[0].nr deref reads the canonical root-ns
+                    // pid number.
+                    let pgid_v = read_pid_nr_at_index(
+                        mem,
+                        walk,
+                        signal_pa,
+                        offsets.signal_struct_pids,
+                        pid_type::PGID,
+                        offsets.pid_numbers,
+                        offsets.upid_size,
+                        offsets.upid_nr,
+                    );
+                    let sid_v = read_pid_nr_at_index(
+                        mem,
+                        walk,
+                        signal_pa,
+                        offsets.signal_struct_pids,
+                        pid_type::SID,
+                        offsets.pid_numbers,
+                        offsets.upid_size,
+                        offsets.upid_nr,
+                    );
+                    (
+                        Some(nr_threads_v),
+                        Some(signal_nvcsw_v),
+                        Some(signal_nivcsw_v),
+                        Some(signal_utime_v),
+                        Some(signal_stime_v),
+                        pgid_v,
+                        sid_v,
+                    )
+                }
             }
-        }
-    };
+        };
 
     // Lock-slowpath PC match, if a PC was supplied.
     let lock_slowpath_match = pc.and_then(|p| locks.match_pc(p)).map(str::to_string);

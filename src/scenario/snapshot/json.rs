@@ -467,7 +467,10 @@ mod tests_coercion {
         assert_eq!(json_to_u64(&json!(true)).unwrap(), 1);
         assert_eq!(json_to_u64(&json!(false)).unwrap(), 0);
         // scx_stats stringifies large counters to dodge 53-bit float collapse.
-        assert_eq!(json_to_u64(&json!("18446744073709551615")).unwrap(), u64::MAX);
+        assert_eq!(
+            json_to_u64(&json!("18446744073709551615")).unwrap(),
+            u64::MAX
+        );
     }
 
     #[test]
@@ -476,7 +479,9 @@ mod tests_coercion {
         assert_eq!(json_to_u64(&json!(5.0)).unwrap(), 5);
         // A fractional float is not an integer.
         match json_to_u64(&json!(2.5)) {
-            Err(SnapshotError::TypeMismatch { expected, actual, .. }) => {
+            Err(SnapshotError::TypeMismatch {
+                expected, actual, ..
+            }) => {
                 assert_eq!(expected, "integer");
                 assert_eq!(actual, "non-integer float");
             }
@@ -484,7 +489,9 @@ mod tests_coercion {
         }
         // A negative float cannot be a u64.
         match json_to_u64(&json!(-2.5)) {
-            Err(SnapshotError::TypeMismatch { expected, actual, .. }) => {
+            Err(SnapshotError::TypeMismatch {
+                expected, actual, ..
+            }) => {
                 assert_eq!(expected, "u64");
                 assert_eq!(actual, "Float(non-coercible)");
             }
@@ -507,7 +514,12 @@ mod tests_coercion {
             other => panic!("expected non-numeric-string TypeMismatch, got {other:?}"),
         }
         // null / array / object fall through to the describe_json_kind arm.
-        assert!(json_to_u64(&json!(null)).unwrap_err().to_string().contains("Null"));
+        assert!(
+            json_to_u64(&json!(null))
+                .unwrap_err()
+                .to_string()
+                .contains("Null")
+        );
         assert!(matches!(
             json_to_u64(&json!({"k": 1})),
             Err(SnapshotError::TypeMismatch { .. })
@@ -534,7 +546,9 @@ mod tests_coercion {
             other => panic!("expected over-i64::MAX TypeMismatch, got {other:?}"),
         }
         match json_to_i64(&json!(2.5)) {
-            Err(SnapshotError::TypeMismatch { expected, actual, .. }) => {
+            Err(SnapshotError::TypeMismatch {
+                expected, actual, ..
+            }) => {
                 assert_eq!(expected, "integer");
                 assert_eq!(actual, "non-integer float");
             }
@@ -629,9 +643,18 @@ mod tests_coercion {
         let v = json!({"x": 1});
         let missing = stats_path(&v, "absent");
         // Every typed terminal returns the SAME FieldNotFound, not a coercion error.
-        assert!(matches!(missing.as_u64(), Err(SnapshotError::FieldNotFound { .. })));
-        assert!(matches!(missing.as_i64(), Err(SnapshotError::FieldNotFound { .. })));
-        assert!(matches!(missing.as_f64(), Err(SnapshotError::FieldNotFound { .. })));
+        assert!(matches!(
+            missing.as_u64(),
+            Err(SnapshotError::FieldNotFound { .. })
+        ));
+        assert!(matches!(
+            missing.as_i64(),
+            Err(SnapshotError::FieldNotFound { .. })
+        ));
+        assert!(matches!(
+            missing.as_f64(),
+            Err(SnapshotError::FieldNotFound { .. })
+        ));
     }
 
     #[test]
@@ -671,8 +694,14 @@ mod tests_coercion {
             "f": [1.5, 2.0],
             "b": [true, false, true],
         });
-        assert_eq!(stats_path(&v, "u").as_u64_array().unwrap(), vec![1u64, 2, 3]);
-        assert_eq!(stats_path(&v, "i").as_i64_array().unwrap(), vec![-1i64, 0, 5]);
+        assert_eq!(
+            stats_path(&v, "u").as_u64_array().unwrap(),
+            vec![1u64, 2, 3]
+        );
+        assert_eq!(
+            stats_path(&v, "i").as_i64_array().unwrap(),
+            vec![-1i64, 0, 5]
+        );
         assert_eq!(stats_path(&v, "f").as_f64_array().unwrap(), vec![1.5, 2.0]);
         assert_eq!(
             stats_path(&v, "b").as_bool_array().unwrap(),
@@ -685,7 +714,9 @@ mod tests_coercion {
         // An element exceeding u32::MAX must error, not silently truncate.
         let v = json!({"c": [1, 4294967296u64]});
         match stats_path(&v, "c").as_u32_array() {
-            Err(SnapshotError::TypeMismatch { expected, actual, .. }) => {
+            Err(SnapshotError::TypeMismatch {
+                expected, actual, ..
+            }) => {
                 assert_eq!(expected, "u32");
                 assert_eq!(actual, "Uint(>u32::MAX)");
             }
@@ -698,7 +729,9 @@ mod tests_coercion {
         // The "expected" diagnostic names the element type in brackets.
         let v = json!({"scalar": 7});
         match stats_path(&v, "scalar").as_u64_array() {
-            Err(SnapshotError::TypeMismatch { expected, actual, .. }) => {
+            Err(SnapshotError::TypeMismatch {
+                expected, actual, ..
+            }) => {
                 assert_eq!(expected, "[u64]");
                 assert_eq!(actual, "Number");
             }

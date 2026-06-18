@@ -1575,7 +1575,10 @@ mod tests {
         assert_eq!(MsgType::StepEnd.wire_value(), MSG_TYPE_STEP_END);
         assert_eq!(MsgType::ScenarioStart.wire_value(), MSG_TYPE_SCENARIO_START);
         assert_eq!(MsgType::ScenarioPause.wire_value(), MSG_TYPE_SCENARIO_PAUSE);
-        assert_eq!(MsgType::ScenarioResume.wire_value(), MSG_TYPE_SCENARIO_RESUME);
+        assert_eq!(
+            MsgType::ScenarioResume.wire_value(),
+            MSG_TYPE_SCENARIO_RESUME
+        );
         assert_eq!(MsgType::ScenarioEnd.wire_value(), MSG_TYPE_SCENARIO_END);
         assert_eq!(MsgType::Exit.wire_value(), MSG_TYPE_EXIT);
         assert_eq!(MsgType::TestResult.wire_value(), MSG_TYPE_TEST_RESULT);
@@ -1600,7 +1603,10 @@ mod tests {
             MsgType::KernelOpRequest.wire_value(),
             MSG_TYPE_KERNEL_OP_REQUEST
         );
-        assert_eq!(MsgType::KernelOpReply.wire_value(), MSG_TYPE_KERNEL_OP_REPLY);
+        assert_eq!(
+            MsgType::KernelOpReply.wire_value(),
+            MSG_TYPE_KERNEL_OP_REPLY
+        );
         assert_eq!(MsgType::SysRdy.wire_value(), MSG_TYPE_SYS_RDY);
         assert_eq!(MsgType::Stdout.wire_value(), MSG_TYPE_STDOUT);
         assert_eq!(MsgType::Stderr.wire_value(), MSG_TYPE_STDERR);

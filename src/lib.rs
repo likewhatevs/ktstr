@@ -820,7 +820,6 @@ pub mod prelude {
     // is the collapse-immune common path, so the prelude surfaces only
     // it. The plain variant remains reachable by full path for the rare
     // no-stimulus-timeline case.
-    pub use crate::timeline::StimulusEvent;
     pub use crate::cgroup::CgroupManager;
     pub use crate::claim;
     pub use crate::declare_scheduler;
@@ -837,6 +836,7 @@ pub mod prelude {
     pub use crate::scenario::payload_run::{PayloadHandle, PayloadRun};
     pub use crate::scenario::scenarios;
     pub use crate::test_support::post_vm_skip;
+    pub use crate::timeline::StimulusEvent;
     // Snapshot accessor surface and the underlying report shapes
     // a test author needs to inspect the captured BTF-rendered
     // bytes. The renderer types come from monitor::btf_render and

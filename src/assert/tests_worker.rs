@@ -240,7 +240,10 @@ fn zero_wall_time_nonzero_work() {
     assert_eq!(c.avg_off_cpu_pct, None, "off-cpu% must be None, not 0.0");
     assert_eq!(c.min_off_cpu_pct, None);
     assert_eq!(c.max_off_cpu_pct, None);
-    assert_eq!(c.spread, None, "spread must be None (inconclusive), not 0.0");
+    assert_eq!(
+        c.spread, None,
+        "spread must be None (inconclusive), not 0.0"
+    );
 }
 
 #[test]
@@ -567,6 +570,10 @@ fn not_starved_no_double_count() {
         rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 50),
         rpt(2, 1000, 5e9 as u64, 6e8 as u64, &[1], 60),
     ]);
-    assert_eq!(r.stats.cgroups.len(), 1, "exactly one cgroup entry per call");
+    assert_eq!(
+        r.stats.cgroups.len(),
+        1,
+        "exactly one cgroup entry per call"
+    );
     assert_eq!(r.stats.total_workers, 2);
 }

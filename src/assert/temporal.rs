@@ -2106,7 +2106,9 @@ mod tests {
             r.outcomes,
         );
         assert!(
-            r.info_notes.iter().any(|n| n.message.contains("not measured")),
+            r.info_notes
+                .iter()
+                .any(|n| n.message.contains("not measured")),
             "the skipped None-elapsed sample must surface a Note: {:?}",
             r.info_notes,
         );

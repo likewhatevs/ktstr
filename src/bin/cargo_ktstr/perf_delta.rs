@@ -86,7 +86,10 @@ fn rev_parse_commit(repo: &gix::Repository, spec: &str) -> Result<gix::ObjectId>
 
 /// Resolve the baseline commit per the [`BaseSelection`]: an explicit
 /// `--base` commit verbatim, or `merge_base(HEAD, <ref>)`.
-pub(crate) fn resolve_baseline(repo: &gix::Repository, sel: &BaseSelection) -> Result<gix::ObjectId> {
+pub(crate) fn resolve_baseline(
+    repo: &gix::Repository,
+    sel: &BaseSelection,
+) -> Result<gix::ObjectId> {
     match sel {
         BaseSelection::ExplicitCommit(c) => rev_parse_commit(repo, c),
         BaseSelection::MergeBaseWith(r) => {
@@ -436,7 +439,10 @@ pub(crate) fn run(args: &PerfDeltaArgs<'_>) -> Result<i32> {
         config_axis_filters(args.a_scheduler, args.b_scheduler, has_commit_axis_flag)?
     {
         // SAFETY: config_axis_filters returns Some only when both are set.
-        let (a, b) = (args.a_scheduler.unwrap_or(""), args.b_scheduler.unwrap_or(""));
+        let (a, b) = (
+            args.a_scheduler.unwrap_or(""),
+            args.b_scheduler.unwrap_or(""),
+        );
         println!("perf-delta: scheduler {b} vs {a} (config axis, same commit)");
         println!(
             "  perf tests: {}",
@@ -457,7 +463,12 @@ pub(crate) fn run(args: &PerfDeltaArgs<'_>) -> Result<i32> {
     let cwd = std::env::current_dir().context("get cwd")?;
     let repo = gix::discover(&cwd).context("discover git repository")?;
     let env_base = std::env::var("GITHUB_BASE_REF").ok();
-    let sel = select_base(args.base, args.base_ref, env_base.as_deref(), args.default_branch);
+    let sel = select_base(
+        args.base,
+        args.base_ref,
+        env_base.as_deref(),
+        args.default_branch,
+    );
     let baseline_oid = resolve_baseline(&repo, &sel)?;
     let baseline = short_hash(&repo, baseline_oid);
     let head = short_hash(&repo, repo.head_id().context("resolve HEAD")?.detach());
@@ -581,7 +592,10 @@ mod tests {
     fn baseline_sidecar_leaf_is_distinct_subdir_of_runs_root() {
         let root = Path::new("/work/target/ktstr");
         let leaf = baseline_sidecar_leaf(root, "abc1234");
-        assert_eq!(leaf, Path::new("/work/target/ktstr/perf-delta-baseline-abc1234"));
+        assert_eq!(
+            leaf,
+            Path::new("/work/target/ktstr/perf-delta-baseline-abc1234")
+        );
         // A distinct baseline yields a distinct leaf (no collision); and
         // neither collides with HEAD's `{kernel}-{HEAD}` default leaf.
         assert_ne!(leaf, baseline_sidecar_leaf(root, "def5678"));

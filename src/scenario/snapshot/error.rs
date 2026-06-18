@@ -896,14 +896,27 @@ mod tests_api_gaps {
             MissingStatsReason::MutexPoisoned,
         ];
         for c in &cases {
-            assert!(!format!("{c}").is_empty(), "Display must be non-empty for {c:?}");
+            assert!(
+                !format!("{c}").is_empty(),
+                "Display must be non-empty for {c:?}"
+            );
         }
         assert!(
-            format!("{}", MissingStatsReason::RequestTooLarge { size: 10, max: 5 }).contains("10"),
+            format!(
+                "{}",
+                MissingStatsReason::RequestTooLarge { size: 10, max: 5 }
+            )
+            .contains("10"),
         );
         assert!(
-            format!("{}", MissingStatsReason::SchedulerError { errno: 13, args: json!({}) })
-                .contains("13"),
+            format!(
+                "{}",
+                MissingStatsReason::SchedulerError {
+                    errno: 13,
+                    args: json!({})
+                }
+            )
+            .contains("13"),
         );
     }
 }
