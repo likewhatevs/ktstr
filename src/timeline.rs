@@ -275,9 +275,20 @@ impl StimulusEvent {
 #[derive(Debug, Clone, Default)]
 pub struct PhaseMetrics {
     pub sample_count: usize,
-    pub avg_imbalance: f64,
-    pub max_imbalance: f64,
-    pub avg_dsq_depth: f64,
+    /// Mean CPU-imbalance ratio over the phase's valid samples. `None`
+    /// when the phase had no valid samples (monitor-only `Timeline::build`)
+    /// or its source bucket carried no `avg_imbalance_ratio` metric
+    /// (snapshot `from_phase_buckets`) — distinct from a real `Some(0.0)`
+    /// (perfectly balanced). The change detector compares it only when
+    /// both sides are `Some`, so an absent phase never reads as a false
+    /// zero-imbalance.
+    pub avg_imbalance: Option<f64>,
+    /// Peak CPU-imbalance ratio over the phase's valid samples. `None` on
+    /// the same no-data conditions as [`Self::avg_imbalance`].
+    pub max_imbalance: Option<f64>,
+    /// Mean local-DSQ depth over the phase's valid samples. `None` on the
+    /// same no-data conditions as [`Self::avg_imbalance`].
+    pub avg_dsq_depth: Option<f64>,
     pub max_dsq_depth: u32,
     pub stall_count: usize,
     /// select_cpu_fallback events per second. None when event counters unavailable.
@@ -545,20 +556,16 @@ impl Timeline {
             let mut changes = Vec::new();
 
             if before.sample_count > 0 && after_metrics.sample_count > 0 {
-                changes.extend(detect_change(
-                    before.avg_imbalance,
-                    after_metrics.avg_imbalance,
-                    IMBALANCE_THRESHOLD,
-                    "imbalance",
-                    true,
-                ));
-                changes.extend(detect_change(
-                    before.avg_dsq_depth,
-                    after_metrics.avg_dsq_depth,
-                    DSQ_THRESHOLD,
-                    "dsq_depth",
-                    true,
-                ));
+                if let (Some(bi), Some(ai)) =
+                    (before.avg_imbalance, after_metrics.avg_imbalance)
+                {
+                    changes.extend(detect_change(bi, ai, IMBALANCE_THRESHOLD, "imbalance", true));
+                }
+                if let (Some(bd), Some(ad)) =
+                    (before.avg_dsq_depth, after_metrics.avg_dsq_depth)
+                {
+                    changes.extend(detect_change(bd, ad, DSQ_THRESHOLD, "dsq_depth", true));
+                }
                 if let (Some(bf), Some(af)) = (before.fallback_rate, after_metrics.fallback_rate) {
                     changes.extend(detect_change(
                         bf,
@@ -688,8 +695,14 @@ impl Timeline {
             let m = &phase.metrics;
             if m.sample_count > 0 {
                 out.push_str(&format!(
-                    "  imbalance: avg={:.1} max={:.1} | dsq: avg={:.0} max={}",
-                    m.avg_imbalance, m.max_imbalance, m.avg_dsq_depth, m.max_dsq_depth,
+                    "  imbalance: avg={} max={} | dsq: avg={} max={}",
+                    m.avg_imbalance
+                        .map_or_else(|| "n/a".to_string(), |v| format!("{v:.1}")),
+                    m.max_imbalance
+                        .map_or_else(|| "n/a".to_string(), |v| format!("{v:.1}")),
+                    m.avg_dsq_depth
+                        .map_or_else(|| "n/a".to_string(), |v| format!("{v:.0}")),
+                    m.max_dsq_depth,
                 ));
                 if let Some(fb) = m.fallback_rate {
                     out.push_str(&format!(" | fallback: {:.0}/s", fb));
@@ -812,20 +825,12 @@ impl Timeline {
                 continue;
             }
             let mut changes = Vec::new();
-            changes.extend(detect_change(
-                before.avg_imbalance,
-                after.avg_imbalance,
-                IMBALANCE_THRESHOLD,
-                "imbalance",
-                true,
-            ));
-            changes.extend(detect_change(
-                before.avg_dsq_depth,
-                after.avg_dsq_depth,
-                DSQ_THRESHOLD,
-                "dsq_depth",
-                true,
-            ));
+            if let (Some(bi), Some(ai)) = (before.avg_imbalance, after.avg_imbalance) {
+                changes.extend(detect_change(bi, ai, IMBALANCE_THRESHOLD, "imbalance", true));
+            }
+            if let (Some(bd), Some(ad)) = (before.avg_dsq_depth, after.avg_dsq_depth) {
+                changes.extend(detect_change(bd, ad, DSQ_THRESHOLD, "dsq_depth", true));
+            }
             if let (Some(bf), Some(af)) = (before.fallback_rate, after.fallback_rate) {
                 changes.extend(detect_change(
                     bf,
@@ -916,9 +921,9 @@ fn phase_from_bucket(
     };
     let metrics = PhaseMetrics {
         sample_count: b.sample_count,
-        avg_imbalance: b.metrics.get("avg_imbalance_ratio").copied().unwrap_or(0.0),
-        max_imbalance: b.metrics.get("max_imbalance_ratio").copied().unwrap_or(0.0),
-        avg_dsq_depth: b.metrics.get("avg_dsq_depth").copied().unwrap_or(0.0),
+        avg_imbalance: b.metrics.get("avg_imbalance_ratio").copied(),
+        max_imbalance: b.metrics.get("max_imbalance_ratio").copied(),
+        avg_dsq_depth: b.metrics.get("avg_dsq_depth").copied(),
         max_dsq_depth: b
             .metrics
             .get("max_dsq_depth")
@@ -1082,12 +1087,15 @@ fn compute_metrics(samples: &[&MonitorSample]) -> PhaseMetrics {
         _ => (None, None),
     };
 
-    let n = valid.len() as f64;
+    let valid_count = valid.len();
+    let n = valid_count as f64;
+    // None when no valid samples — avoids a 0.0/0.0 NaN and keeps "no
+    // data" distinct from a real zero (the detector skips None sides).
     PhaseMetrics {
-        sample_count: valid.len(),
-        avg_imbalance: total_imbalance / n,
-        max_imbalance,
-        avg_dsq_depth: total_dsq / n,
+        sample_count: valid_count,
+        avg_imbalance: (valid_count > 0).then(|| total_imbalance / n),
+        max_imbalance: (valid_count > 0).then_some(max_imbalance),
+        avg_dsq_depth: (valid_count > 0).then(|| total_dsq / n),
         max_dsq_depth: max_dsq,
         stall_count,
         fallback_rate,
@@ -1252,7 +1260,10 @@ mod tests {
     fn compute_metrics_empty() {
         let m = compute_metrics(&[]);
         assert_eq!(m.sample_count, 0);
-        assert_eq!(m.avg_imbalance, 0.0);
+        // No samples -> no measurement, not a false 0.0 (the sentinel fix).
+        assert_eq!(m.avg_imbalance, None);
+        assert_eq!(m.max_imbalance, None);
+        assert_eq!(m.avg_dsq_depth, None);
         assert_eq!(m.max_dsq_depth, 0);
     }
 
@@ -1297,8 +1308,8 @@ mod tests {
         let refs: Vec<&MonitorSample> = vec![&s1, &s2];
         let m = compute_metrics(&refs);
         assert_eq!(m.sample_count, 2);
-        assert!((m.avg_imbalance - 2.5).abs() < 0.01); // (4+1)/2
-        assert!((m.max_imbalance - 4.0).abs() < 0.01);
+        assert!((m.avg_imbalance.unwrap() - 2.5).abs() < 0.01); // (4+1)/2
+        assert!((m.max_imbalance.unwrap() - 4.0).abs() < 0.01);
         assert_eq!(m.max_dsq_depth, 7);
     }
 
@@ -1685,8 +1696,8 @@ mod tests {
             "baseline must have samples"
         );
         assert!(
-            (t.phases[0].metrics.avg_imbalance - 1.0).abs() < 0.5,
-            "baseline imbalance should be ~1.0, got {:.1}",
+            (t.phases[0].metrics.avg_imbalance.unwrap() - 1.0).abs() < 0.5,
+            "baseline imbalance should be ~1.0, got {:?}",
             t.phases[0].metrics.avg_imbalance,
         );
 
@@ -2388,9 +2399,9 @@ mod tests {
         assert_eq!(t.phases[1].stimulus.as_ref().unwrap().label, "Step[0]");
         assert_eq!(t.phases[1].metrics.sample_count, 20);
         assert_eq!(t.phases[1].metrics.max_dsq_depth, 7);
-        assert!((t.phases[1].metrics.avg_dsq_depth - 2.5).abs() < f64::EPSILON);
-        assert!((t.phases[1].metrics.max_imbalance - 3.5).abs() < f64::EPSILON);
-        assert!((t.phases[1].metrics.avg_imbalance - 1.8).abs() < f64::EPSILON);
+        assert!((t.phases[1].metrics.avg_dsq_depth.unwrap() - 2.5).abs() < f64::EPSILON);
+        assert!((t.phases[1].metrics.max_imbalance.unwrap() - 3.5).abs() < f64::EPSILON);
+        assert!((t.phases[1].metrics.avg_imbalance.unwrap() - 1.8).abs() < f64::EPSILON);
         // fallback_rate = 200 / (5000 / 1000) = 40.0 events/s
         assert_eq!(t.phases[1].metrics.fallback_rate, Some(40.0));
         // keep_last_rate absent → None (no total_keep_last in metrics map)
@@ -2426,6 +2437,27 @@ mod tests {
         // so rate divisions stay None rather than producing
         // spurious infinities.
         assert_eq!(t.phases[0].metrics.fallback_rate, None);
+    }
+
+    #[test]
+    fn from_phase_buckets_absent_imbalance_metric_is_none_not_zero() {
+        // A bucket carrying no avg_imbalance_ratio / avg_dsq_depth
+        // metric must yield None (no data), NOT Some(0.0) — so the change
+        // detector skips it instead of comparing a false zero-imbalance.
+        use crate::assert::PhaseBucket;
+        use std::collections::BTreeMap;
+        let bucket = PhaseBucket {
+            step_index: 1,
+            label: "Step[0]".to_string(),
+            start_ms: 100,
+            end_ms: 600,
+            sample_count: 3,
+            metrics: BTreeMap::new(),
+        };
+        let t = Timeline::from_phase_buckets(&[bucket], &[], &TimelineContext::default());
+        assert_eq!(t.phases[0].metrics.avg_imbalance, None);
+        assert_eq!(t.phases[0].metrics.max_imbalance, None);
+        assert_eq!(t.phases[0].metrics.avg_dsq_depth, None);
     }
 
     #[test]
