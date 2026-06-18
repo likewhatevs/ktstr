@@ -1112,15 +1112,22 @@ fn result_to_exit_code(
             }
         }
         Err(e) if is_topology_insufficient(&e) => {
+            let reason = e
+                .chain()
+                .find_map(|c| {
+                    c.downcast_ref::<crate::vmm::host_topology::TopologyInsufficient>()
+                        .map(|ti| ti.reason.clone())
+                })
+                .unwrap_or_else(|| "<unknown>".to_string());
             if no_skip {
                 eprintln!(
-                    "ktstr: FAIL: host topology insufficient under --no-skip-mode: {e:#}. \
+                    "ktstr: FAIL: host topology insufficient under --no-skip-mode: {reason}. \
                      Either provision a host with the required CPU / LLC count, or drop \
                      --no-skip-mode / KTSTR_NO_SKIP_MODE to accept the skip."
                 );
                 EXIT_FAIL
             } else {
-                crate::report::test_skip(format_args!("host topology insufficient: {e:#}"));
+                crate::report::test_skip(format_args!("host topology insufficient: {reason}"));
                 EXIT_PASS
             }
         }
