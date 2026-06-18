@@ -5992,6 +5992,26 @@ mod tests {
         );
     }
 
+    /// Companion to the below-threshold case: a scenario whose mean is
+    /// far above overall_mean + 2*std MUST be flagged. The strictly-
+    /// greater test only proves the absence side (10.0 < 16.55); without
+    /// this, a never-flags or inverted (`<` instead of `>`) comparison
+    /// passes. 10 scenarios at spread 10 + 1 at 100: overall mean ~18,
+    /// std ~27, threshold ~72; the 100 scenario clears it decisively.
+    #[test]
+    fn find_outliers_flags_scenario_above_threshold() {
+        let mut rows: Vec<GauntletRow> = (0..10)
+            .map(|i| make_row(&format!("normal{i}"), "t", true, 10.0))
+            .collect();
+        rows.push(make_row("hot", "t", true, 100.0));
+        let outliers = find_outliers(&rows);
+        let spread: Vec<_> = outliers.iter().filter(|o| o.metric == "spread").collect();
+        assert!(
+            spread.iter().any(|o| o.scenario == "hot"),
+            "a scenario far above the 2-sigma threshold must be flagged as a spread outlier",
+        );
+    }
+
     /// find_outliers skips metrics with near-zero standard deviation.
     /// When std < f64::EPSILON, the metric has no measurable spread,
     /// so outlier detection would be noise. The function should skip it.

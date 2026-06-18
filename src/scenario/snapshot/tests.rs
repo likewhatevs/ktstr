@@ -3697,6 +3697,15 @@ fn snapshot_find_and_max_by_on_render_failed_map_surface_render_failure() {
     }
 }
 
+// Narrowing is NOT observable for the single-obj fast arm by
+// construction: with one obj there is nothing to narrow away. Adding a
+// second global-section obj does not strengthen THIS arm — two obj
+// prefixes route active() to the `(multiple, _)` arm (NoActiveScheduler
+// error) unless report.active_obj_name is set, which is the separate
+// WALKER path exercised by snapshot_active_multi_bss_same_name_with_-
+// walker_resolves. So this test correctly pins what the single-obj arm
+// can verify: active() SUCCEEDS (does not error) and resolves the obj's
+// var through the filtered view.
 #[test]
 fn snapshot_active_single_obj_returns_filtered_view() {
     let report = make_report_with_maps(vec![make_global_map(
