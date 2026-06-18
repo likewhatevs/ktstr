@@ -65,6 +65,7 @@ pub(crate) fn run_stats(command: &Option<StatsCommand>) -> Result<(), String> {
             project_commit,
             kernel_commit,
             run_source,
+            cpu_budget,
             scheduler,
             topology,
             work_type,
@@ -72,6 +73,7 @@ pub(crate) fn run_stats(command: &Option<StatsCommand>) -> Result<(), String> {
             a_project_commit,
             a_kernel_commit,
             a_run_source,
+            a_cpu_budget,
             a_scheduler,
             a_topology,
             a_work_type,
@@ -79,6 +81,7 @@ pub(crate) fn run_stats(command: &Option<StatsCommand>) -> Result<(), String> {
             b_project_commit,
             b_kernel_commit,
             b_run_source,
+            b_cpu_budget,
             b_scheduler,
             b_topology,
             b_work_type,
@@ -168,6 +171,7 @@ pub(crate) fn run_stats(command: &Option<StatsCommand>) -> Result<(), String> {
                 shared_project_commit: project_commit,
                 shared_kernel_commit: kernel_commit,
                 shared_run_source: run_source.clone(),
+                shared_cpu_budget: cpu_budget.clone(),
                 shared_scheduler: scheduler.clone(),
                 shared_topology: topology.clone(),
                 shared_work_type: work_type.clone(),
@@ -175,6 +179,7 @@ pub(crate) fn run_stats(command: &Option<StatsCommand>) -> Result<(), String> {
                 a_project_commit,
                 a_kernel_commit,
                 a_run_source: a_run_source.clone(),
+                a_cpu_budget: a_cpu_budget.clone(),
                 a_scheduler: a_scheduler.clone(),
                 a_topology: a_topology.clone(),
                 a_work_type: a_work_type.clone(),
@@ -182,6 +187,7 @@ pub(crate) fn run_stats(command: &Option<StatsCommand>) -> Result<(), String> {
                 b_project_commit,
                 b_kernel_commit,
                 b_run_source: b_run_source.clone(),
+                b_cpu_budget: b_cpu_budget.clone(),
                 b_scheduler: b_scheduler.clone(),
                 b_topology: b_topology.clone(),
                 b_work_type: b_work_type.clone(),
@@ -479,6 +485,7 @@ pub(crate) struct BuildCompareFilters {
     pub(crate) shared_project_commit: Vec<String>,
     pub(crate) shared_kernel_commit: Vec<String>,
     pub(crate) shared_run_source: Vec<String>,
+    pub(crate) shared_cpu_budget: Vec<String>,
     pub(crate) shared_scheduler: Vec<String>,
     pub(crate) shared_topology: Vec<String>,
     pub(crate) shared_work_type: Vec<String>,
@@ -486,6 +493,7 @@ pub(crate) struct BuildCompareFilters {
     pub(crate) a_project_commit: Vec<String>,
     pub(crate) a_kernel_commit: Vec<String>,
     pub(crate) a_run_source: Vec<String>,
+    pub(crate) a_cpu_budget: Vec<String>,
     pub(crate) a_scheduler: Vec<String>,
     pub(crate) a_topology: Vec<String>,
     pub(crate) a_work_type: Vec<String>,
@@ -493,6 +501,7 @@ pub(crate) struct BuildCompareFilters {
     pub(crate) b_project_commit: Vec<String>,
     pub(crate) b_kernel_commit: Vec<String>,
     pub(crate) b_run_source: Vec<String>,
+    pub(crate) b_cpu_budget: Vec<String>,
     pub(crate) b_scheduler: Vec<String>,
     pub(crate) b_topology: Vec<String>,
     pub(crate) b_work_type: Vec<String>,
@@ -520,6 +529,7 @@ impl BuildCompareFilters {
             project_commits: pick_vec(&self.a_project_commit, &self.shared_project_commit),
             kernel_commits: pick_vec(&self.a_kernel_commit, &self.shared_kernel_commit),
             run_sources: pick_vec(&self.a_run_source, &self.shared_run_source),
+            cpu_budgets: pick_vec(&self.a_cpu_budget, &self.shared_cpu_budget),
             schedulers: pick_vec(&self.a_scheduler, &self.shared_scheduler),
             topologies: pick_vec(&self.a_topology, &self.shared_topology),
             work_types: pick_vec(&self.a_work_type, &self.shared_work_type),
@@ -529,6 +539,7 @@ impl BuildCompareFilters {
             project_commits: pick_vec(&self.b_project_commit, &self.shared_project_commit),
             kernel_commits: pick_vec(&self.b_kernel_commit, &self.shared_kernel_commit),
             run_sources: pick_vec(&self.b_run_source, &self.shared_run_source),
+            cpu_budgets: pick_vec(&self.b_cpu_budget, &self.shared_cpu_budget),
             schedulers: pick_vec(&self.b_scheduler, &self.shared_scheduler),
             topologies: pick_vec(&self.b_topology, &self.shared_topology),
             work_types: pick_vec(&self.b_work_type, &self.shared_work_type),
@@ -614,6 +625,29 @@ mod tests {
             vec![ktstr::cli::Dimension::KernelCommit],
             "differing per-side kernel-commit must derive as a single \
              KernelCommit slicing dim",
+        );
+    }
+
+    /// Disjoint per-side `--a-cpu-budget` / `--b-cpu-budget` derive
+    /// CpuBudget as the slicing dim at the CLI/BuildCompareFilters
+    /// boundary — mirrors the kernel-commit / scheduler slicing tests so
+    /// every sliceable dim has CLI-level coverage of the wiring.
+    #[test]
+    fn build_compare_filters_disjoint_per_side_cpu_budget_slices() {
+        let b = BuildCompareFilters {
+            a_cpu_budget: vec!["4".to_string()],
+            b_cpu_budget: vec!["32".to_string()],
+            ..BuildCompareFilters::default()
+        };
+        let (fa, fb) = b.build();
+        assert_eq!(fa.cpu_budgets, vec!["4"]);
+        assert_eq!(fb.cpu_budgets, vec!["32"]);
+        let slicing = ktstr::cli::derive_slicing_dims(&fa, &fb);
+        assert_eq!(
+            slicing,
+            vec![ktstr::cli::Dimension::CpuBudget],
+            "differing per-side cpu-budget must derive as a single \
+             CpuBudget slicing dim",
         );
     }
 

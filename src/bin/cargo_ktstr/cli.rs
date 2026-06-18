@@ -740,9 +740,9 @@ pub(crate) enum StatsCommand {
     ///
     /// Walks every run directory under `runs_root()` (or `--dir`),
     /// pools the sidecars, and reports the set of distinct values
-    /// found across all seven filterable dimensions: `kernel`,
-    /// `commit`, `kernel_commit`, `source`, `scheduler`,
-    /// `topology`, and `work_type`. The JSON keys `commit` and `source` map to the
+    /// found across all eight filterable dimensions: `kernel`,
+    /// `commit`, `kernel_commit`, `source`, `cpu_budget`,
+    /// `scheduler`, `topology`, and `work_type`. The JSON keys `commit` and `source` map to the
     /// internal `SidecarResult::project_commit` /
     /// `SidecarResult::run_source` fields; the per-side filter
     /// flags spell `--project-commit` / `--run-source` on the
@@ -1138,6 +1138,16 @@ pub(crate) enum StatsCommand {
         /// tag.
         #[arg(long = "run-source", action = ArgAction::Append)]
         run_source: Vec<String>,
+        /// Filter to runs whose effective host-CPU budget (the count of
+        /// host CPUs the guest vCPU threads ran on) equals this value
+        /// (`--cpu-budget 32`, repeatable / OR-combined). cpu-budget is a
+        /// pairing dimension: even WITHOUT this flag, A/B comparison never
+        /// pairs rows of different budgets (a 4-CPU-budget run and a
+        /// 32-CPU-budget run measure different things). Use this flag to
+        /// SLICE by budget, or `--a-cpu-budget` / `--b-cpu-budget` to
+        /// contrast two budgets.
+        #[arg(long = "cpu-budget", action = ArgAction::Append)]
+        cpu_budget: Vec<String>,
         /// A-side overrides: replace the corresponding shared
         /// `--X` value for the A side only. See the per-side
         /// semantics on each `--X` flag's doc.
@@ -1157,6 +1167,8 @@ pub(crate) enum StatsCommand {
         a_kernel_commit: Vec<String>,
         #[arg(long = "a-run-source", action = ArgAction::Append)]
         a_run_source: Vec<String>,
+        #[arg(long = "a-cpu-budget", action = ArgAction::Append)]
+        a_cpu_budget: Vec<String>,
         #[arg(long = "a-scheduler", action = ArgAction::Append)]
         a_scheduler: Vec<String>,
         #[arg(long = "a-topology", action = ArgAction::Append)]
@@ -1183,6 +1195,8 @@ pub(crate) enum StatsCommand {
         b_kernel_commit: Vec<String>,
         #[arg(long = "b-run-source", action = ArgAction::Append)]
         b_run_source: Vec<String>,
+        #[arg(long = "b-cpu-budget", action = ArgAction::Append)]
+        b_cpu_budget: Vec<String>,
         #[arg(long = "b-scheduler", action = ArgAction::Append)]
         b_scheduler: Vec<String>,
         #[arg(long = "b-topology", action = ArgAction::Append)]

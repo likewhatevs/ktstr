@@ -400,8 +400,9 @@ impl KtstrVmBuilder {
     /// vCPU count; setting `budget` < vcpus forces CPU overcommit (used by
     /// `#[ktstr_test(cpu_budget = N)]` for contention tests). Only takes
     /// effect on the no-perf path; an explicit `--cpu-cap` / `KTSTR_CPU_CAP`
-    /// overrides it. A `budget` of 0 is floored to 1 here so this low-level
-    /// setter never produces a zero-CPU mask; the `#[ktstr_test]` macro and
+    /// overrides it. This setter stores `budget` verbatim; a value of 0 is
+    /// clamped to >= 1 only when `build()` resolves the no-perf CPU cap, so
+    /// no zero-CPU mask is ever produced. The `#[ktstr_test]` macro and
     /// `KtstrTestEntry::validate` reject 0 before it reaches this setter.
     pub fn cpu_budget(mut self, budget: u32) -> Self {
         self.cpu_budget = Some(budget);
@@ -946,10 +947,7 @@ impl KtstrVmBuilder {
                     Some(c) => Some(c),
                     None => {
                         let allowed = host_topology::host_allowed_cpus().len();
-                        let vcpus = (self.topology.llcs
-                            * self.topology.cores_per_llc
-                            * self.topology.threads_per_core)
-                            as usize;
+                        let vcpus = self.topology.total_cpus() as usize;
                         // A per-test `cpu_budget` (#[ktstr_test]) overrides the
                         // auto-size: clamp to [1, allowed] so a test can force
                         // overcommit (budget < vcpus) without exceeding the host
@@ -973,9 +971,7 @@ impl KtstrVmBuilder {
                 // too-small process cpuset is the silent case.
                 if let Some(cap) = effective_cap {
                     let allowed = host_topology::host_allowed_cpus().len();
-                    let vcpus = (self.topology.llcs
-                        * self.topology.cores_per_llc
-                        * self.topology.threads_per_core) as usize;
+                    let vcpus = self.topology.total_cpus() as usize;
                     let eff = cap.effective_count(allowed).unwrap_or(allowed);
                     let explicit = cpu_cap.is_some() || self.cpu_budget.is_some();
                     if let Some(msg) = host_topology::overcommit_warning(
@@ -984,7 +980,15 @@ impl KtstrVmBuilder {
                         explicit,
                         self.watchdog_timeout.map(|d| d.as_secs()),
                     ) {
-                        eprintln!("{msg}");
+                        // KTSTR_CARGO_TEST_MODE does not enforce the budget
+                        // (acquire_llc_plan masks to the full allowed cpuset
+                        // and ignores cpu_cap), so the would-be-overcommit
+                        // warning is misleading there — the stamped budget
+                        // shows no overcommit and the sidecar marker stays
+                        // silent. Suppress the build-time warning to match.
+                        if !crate::cargo_test_mode::cargo_test_mode_active() {
+                            eprintln!("{msg}");
+                        }
                     }
                 }
                 // Compute the plan and immediately drop the flocks:
@@ -1109,6 +1113,46 @@ impl KtstrVmBuilder {
             .map(|s| (s.name.clone(), s.sched_args.clone()))
             .collect();
 
+        // Stamp the run's guest vCPU count + the EFFECTIVE host-CPU budget
+        // for the sidecar (#5: budget Dimension + overcommit marker) — the
+        // number of distinct host CPUs the vCPU threads actually run on.
+        // no-perf reserves a CPU budget (the no_perf_plan's cpus) and masks
+        // every vCPU thread onto it (the overcommit-relevant path: budget
+        // may be < vcpus). Under KTSTR_CARGO_TEST_MODE the plan reserves
+        // nothing and its cpus == the full allowed cpuset (a no-op mask), so
+        // the stamp records the unrestricted set the vCPUs floated across —
+        // still the true CPU count the threads ran on.
+        // perf-mode AND the deferred default both acquire a 1:1 pinning plan
+        // at run time — perf-mode via `validate_performance_mode`, the
+        // default via `run()`'s LOCK_SH offset search — and hard-pin each
+        // vCPU thread to one distinct host CPU (`compute_pinning` emits
+        // exactly `vcpus` 1:1 assignments; `run()` aborts with
+        // ResourceContention if no plan can be acquired, so any sidecar
+        // written on these paths reflects a real 1:1 pin). Both cache the
+        // host topology, so `cached_host_topo.is_some()` is the predicate
+        // that 1:1 pinning will be applied — the effective budget is then
+        // the vCPU count. Only when no affinity is applied (no-perf bypass,
+        // sysfs unreadable, or the deferred default with no cached host
+        // topology) do the vCPU threads float across the process's full
+        // allowed cpuset. The earlier `no_perf_plan` arm wins first, so the
+        // `cached_host_topo` arm is only reached with no no-perf plan
+        // (perf-mode / deferred default), never the no-perf masked path.
+        let vcpus = t.total_cpus();
+        let effective_cpu_budget = if let Some(p) = no_perf_plan.as_ref() {
+            p.cpus.len() as u32
+        } else if cached_host_topo.is_some() {
+            vcpus
+        } else {
+            // No affinity applied (bypass / sysfs-unreadable): the threads
+            // float across the allowed cpuset. host_allowed_cpus() returns
+            // empty only when BOTH sched_getaffinity AND /proc/self/status
+            // fail (a host that can barely run); clamp to >= 1 so a genuinely
+            // booted run never stamps 0, which sidecar_to_row maps to None
+            // and explain renders as the "skip; VM not booted" sentinel —
+            // misclassifying a real run as a skip.
+            (host_topology::host_allowed_cpus().len() as u32).max(1)
+        };
+
         Ok(KtstrVm {
             kernel,
             init_binary: self.init_binary,
@@ -1118,6 +1162,8 @@ impl KtstrVmBuilder {
             run_args: self.run_args,
             sched_args: self.sched_args,
             topology: self.topology,
+            vcpus,
+            effective_cpu_budget,
             memory_mib: self.memory_mib,
             memory_min_mib: self.memory_min_mib,
             cmdline_extra: self.cmdline_extra,

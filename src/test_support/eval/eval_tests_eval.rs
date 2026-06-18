@@ -669,6 +669,8 @@ fn eval_monitor_fail_has_fingerprint() {
         crate::monitor::MonitorSummary::from_samples_with_threshold(&imbalance_samples, 0);
     let result = crate::vmm::VmResult {
         success: true,
+        vcpus: 1,
+        cpu_budget: 1,
         expect_auto_repro_satisfied: false,
         exit_code: 0,
         duration: std::time::Duration::from_secs(1),
@@ -1018,6 +1020,8 @@ fn eval_sched_exit_includes_monitor() {
     let entry = sched_entry("__eval_sched_exit_monitor__");
     let result = crate::vmm::VmResult {
         success: false,
+        vcpus: 1,
+        cpu_budget: 1,
         expect_auto_repro_satisfied: false,
         exit_code: 1,
         duration: std::time::Duration::from_secs(1),
@@ -1128,6 +1132,8 @@ fn eval_monitor_fail_includes_sched_log() {
         crate::monitor::MonitorSummary::from_samples_with_threshold(&imbalance_samples, 0);
     let result = crate::vmm::VmResult {
         success: true,
+        vcpus: 1,
+        cpu_budget: 1,
         expect_auto_repro_satisfied: false,
         exit_code: 0,
         duration: std::time::Duration::from_secs(1),
@@ -1324,7 +1330,11 @@ fn evaluate_synthesizes_phase_buckets_for_uncaptured_steps() {
         is_terminal: false,
         is_step_end: false,
     };
-    let stimulus = vec![start(1000, 1, 0), start(2000, 2, 1000), start(3000, 3, 2000)];
+    let stimulus = vec![
+        start(1000, 1, 0),
+        start(2000, 2, 1000),
+        start(3000, 3, 2000),
+    ];
     let ar = evaluate_vm_result(
         &entry,
         &result,

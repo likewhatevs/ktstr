@@ -337,6 +337,38 @@ fn merge_worst_iterations_per_worker_skips_no_data() {
 }
 
 #[test]
+fn merge_worst_iterations_per_cpu_sec_lowest_wins_none_aware() {
+    // worst_iterations_per_cpu_sec (overcommit-invariant efficiency)
+    // uses the same fold_lowest_some merge as worst_iterations_per_worker:
+    // the least-efficient cgroup wins (lowest Some), a measured Some(0.0)
+    // beats a healthy reading, and None (no defined rate) is skipped,
+    // never fabricated as zero.
+    fn with(v: Option<f64>) -> AssertResult {
+        AssertResult {
+            outcomes: vec![],
+            passes: vec![],
+            stats: ScenarioStats {
+                worst_iterations_per_cpu_sec: v,
+                ..ScenarioStats::default()
+            },
+            measurements: std::collections::BTreeMap::new(),
+            info_notes: vec![],
+        }
+    }
+    let mut acc = AssertResult::pass();
+    assert_eq!(acc.stats.worst_iterations_per_cpu_sec, None);
+    // None skipped; the real reading survives.
+    acc.merge(with(None));
+    acc.merge(with(Some(900.0)));
+    assert_eq!(acc.stats.worst_iterations_per_cpu_sec, Some(900.0));
+    // Lower efficiency wins; a measured zero is the worst and is not
+    // displaced by a later healthy reading.
+    acc.merge(with(Some(0.0)));
+    acc.merge(with(Some(1500.0)));
+    assert_eq!(acc.stats.worst_iterations_per_cpu_sec, Some(0.0));
+}
+
+#[test]
 fn merge_scenario_stats_worst_wins_and_iterations_sum() {
     // Aggregates-across-cgroups contract: every `worst_*` field on
     // ScenarioStats takes the larger value between the two cgroups,

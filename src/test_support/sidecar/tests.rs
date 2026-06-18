@@ -269,6 +269,8 @@ fn sidecar_result_roundtrip() {
         test_name: "my_test".to_string(),
         topology: "1n2l4c2t".to_string(),
         scheduler: "scx_mitosis".to_string(),
+        vcpus: 16,
+        cpu_budget: 4,
         scheduler_commit: Some("abc123".to_string()),
         project_commit: Some("def4567".to_string()),
         payload: None,
@@ -357,6 +359,8 @@ fn sidecar_result_roundtrip() {
         test_name,
         topology,
         scheduler,
+        vcpus,
+        cpu_budget,
         scheduler_commit,
         project_commit,
         payload,
@@ -387,6 +391,9 @@ fn sidecar_result_roundtrip() {
     assert_eq!(topology, "1n2l4c2t");
     assert_eq!(scheduler, "scx_mitosis");
     assert_eq!(work_type, "SpinWait");
+    // (vcpus, cpu_budget) round-trip — distinct values catch a field swap.
+    assert_eq!(vcpus, 16, "vcpus must round-trip the literal");
+    assert_eq!(cpu_budget, 4, "cpu_budget must round-trip the literal");
     // Nullable string metadata fields.
     assert_eq!(scheduler_commit.as_deref(), Some("abc123"));
     assert_eq!(project_commit.as_deref(), Some("def4567"));
@@ -505,6 +512,8 @@ fn sidecar_result_roundtrip_all_fields_round_trip() {
         test_name: "audit".to_string(),
         topology: "8n8l16c2t".to_string(),
         scheduler: "scx_audit".to_string(),
+        vcpus: 256,
+        cpu_budget: 95,
         scheduler_commit: Some("deadbeef1234567890abcdef".to_string()),
         project_commit: Some("cafebab-dirty".to_string()),
         payload: Some("audit_payload".to_string()),
@@ -741,6 +750,10 @@ fn sidecar_result_missing_required_field_rejected_by_deserialize() {
         "kargs",
         "timestamp",
         "run_id",
+        "periodic_fired",
+        "periodic_target",
+        "vcpus",
+        "cpu_budget",
     ];
 
     let fixture = SidecarResult::test_fixture();
@@ -771,6 +784,28 @@ fn sidecar_result_missing_required_field_rejected_by_deserialize() {
         assert!(
             msg.contains(field),
             "missing-field error for `{field}` must name the field; got: {msg}",
+        );
+    }
+
+    // Reverse completeness: a field is required-on-deserialize IFF it is
+    // listed above. serde defaults a missing `Option<T>` to None, so an
+    // Option field is removable (deserialize succeeds) while a non-Option
+    // field errors on removal. Iterating EVERY serialized key catches a
+    // NEW required field added to the struct but omitted from the list —
+    // the gap the forward loop alone cannot see.
+    for key in full.keys() {
+        let mut obj = full.clone();
+        obj.remove(key);
+        let removable =
+            serde_json::from_str::<SidecarResult>(&serde_json::Value::Object(obj).to_string())
+                .is_ok();
+        let listed = REQUIRED_NON_OPTION_FIELDS.contains(&key.as_str());
+        assert_eq!(
+            !removable, listed,
+            "field `{key}`: required-on-deserialize={} but listed-in-\
+             REQUIRED_NON_OPTION_FIELDS={} — the list has drifted from the \
+             struct's non-Option fields",
+            !removable, listed,
         );
     }
 }

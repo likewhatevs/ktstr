@@ -440,6 +440,44 @@ fn render_explain_sidecar_text(
             .and_then(|h| h.arch.as_deref())
             .unwrap_or("-");
         let _ = writeln!(out, "  arch: {arch}");
+        // vCPU count + effective host-CPU budget, with the overcommit
+        // marker: cpu_budget < vcpus means the host time-sliced the guest's
+        // vCPU threads, so wake-latency / off-CPU / run-delay timing metrics
+        // are host-contention-confounded. schedstat run_delay accumulates
+        // `rq_clock` deltas (kernel/sched/stats.h sched_info_arrive), and
+        // rq->clock tracks the guest TSC and is NEVER steal-adjusted — the
+        // steal subtraction hits only rq->clock_task (kernel/sched/core.c
+        // update_rq_clock_task) — so the off-host deschedule window INFLATES
+        // run_delay for guest tasks enqueued-and-waiting across it, just
+        // like wake-latency and off-CPU, not "freezes" it. Matches
+        // host_topology::overcommit_warning. The raw metrics are
+        // KEPT (never None'd); this annotates them. The branch order is
+        // skip -> malformed -> overcommit -> plain: cpu_budget == 0 renders
+        // skip irrespective of vcpus (the writer pairs 0/0), and vcpus == 0
+        // with a nonzero budget is a malformed on-disk sidecar the writer
+        // never emits.
+        if sc.cpu_budget == 0 {
+            let _ = writeln!(out, "  cpu_budget: - (skip; VM not booted)");
+        } else if sc.vcpus == 0 {
+            let _ = writeln!(
+                out,
+                "  cpu_budget: {} / 0 vcpus  [malformed: vcpus=0 with a nonzero \
+                 budget; the writer never emits this]",
+                sc.cpu_budget,
+            );
+        } else if sc.cpu_budget < sc.vcpus {
+            let _ = writeln!(
+                out,
+                "  cpu_budget: {} / {} vcpus  [OVERCOMMIT: host time-slices the \
+                 guest vCPUs -> wake-latency / off-CPU / run-delay timing metrics \
+                 are host-contention-confounded; compare the overcommit-invariant \
+                 worst_iterations_per_cpu_sec (stats compare --metric \
+                 worst_iterations_per_cpu_sec), not raw timing]",
+                sc.cpu_budget, sc.vcpus,
+            );
+        } else {
+            let _ = writeln!(out, "  cpu_budget: {} / {} vcpus", sc.cpu_budget, sc.vcpus);
+        }
         let projected = project_optional_fields(sc);
         let populated: Vec<&'static str> = projected
             .iter()
@@ -514,12 +552,22 @@ fn render_explain_sidecar_text(
 /// JSON schema version stamp emitted on
 /// [`ExplainOutput::_schema_version`]. Bumped on any incompatible
 /// shape change.
-const EXPLAIN_SIDECAR_SCHEMA_VERSION: &str = "1";
+// "2": added `overcommit_runs` (the count of pooled sidecars whose
+// host CPU budget was below their vCPU count, so their timing metrics
+// are host-contention-confounded — the JSON-path mirror of the text
+// per-sidecar OVERCOMMIT marker, for scripted consumers that gate on
+// data quality).
+const EXPLAIN_SIDECAR_SCHEMA_VERSION: &str = "2";
 
 #[derive(serde::Serialize)]
 struct ExplainOutput<'a> {
     _schema_version: &'a str,
     _walk: WalkStatsJson<'a>,
+    /// Count of pooled sidecars with `cpu_budget != 0 && cpu_budget <
+    /// vcpus` — host-overcommitted runs whose wake-latency / off-CPU /
+    /// run-delay timing metrics are host-contention-confounded. Skip
+    /// rows (`cpu_budget == 0`) never booted and are excluded.
+    overcommit_runs: usize,
     fields: std::collections::BTreeMap<&'a str, FieldDiagnostic<'a>>,
 }
 
@@ -599,6 +647,10 @@ fn render_explain_sidecar_json(
             error: &err.raw_error,
         })
         .collect();
+    let overcommit_runs = sidecars
+        .iter()
+        .filter(|sc| sc.cpu_budget != 0 && sc.cpu_budget < sc.vcpus)
+        .count();
     let output = ExplainOutput {
         _schema_version: EXPLAIN_SIDECAR_SCHEMA_VERSION,
         _walk: WalkStatsJson {
@@ -607,6 +659,7 @@ fn render_explain_sidecar_json(
             errors,
             io_errors,
         },
+        overcommit_runs,
         fields,
     };
     serde_json::to_string_pretty(&output).expect(
@@ -963,6 +1016,40 @@ mod tests {
         }
     }
 
+    /// JSON `overcommit_runs` counts only sidecars whose host CPU
+    /// budget was below their vCPU count; skip rows (budget 0) and
+    /// roomy/exact runs are excluded — the JSON-path mirror of the
+    /// text OVERCOMMIT marker.
+    #[test]
+    fn explain_sidecar_json_counts_overcommitted_runs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let run_dir = tmp.path().join("run-budget");
+        std::fs::create_dir(&run_dir).unwrap();
+        let mk = |name: &str, prefix: &str, budget: u32, vcpus: u32| {
+            let mut sc = crate::test_support::SidecarResult::test_fixture();
+            sc.test_name = name.to_string();
+            sc.cpu_budget = budget;
+            sc.vcpus = vcpus;
+            std::fs::write(
+                run_dir.join(format!("{prefix}-0000000000000000.ktstr.json")),
+                serde_json::to_string(&sc).unwrap(),
+            )
+            .unwrap();
+        };
+        mk("over", "a", 4, 16); // overcommit -> counted
+        mk("exact", "b", 16, 16); // boundary -> not counted
+        mk("roomy", "c", 32, 16); // roomy -> not counted
+        mk("skip", "d", 0, 0); // skip -> not counted
+        let out = explain_sidecar("run-budget", Some(tmp.path()), true).unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&out).expect("json output must round-trip parse");
+        assert_eq!(
+            parsed.get("overcommit_runs").and_then(|v| v.as_u64()),
+            Some(1),
+            "only the 4/16 run is overcommitted: {out}",
+        );
+    }
+
     /// Mixed populated/None: text output splits "populated optional
     /// fields (N)" from "none fields (M)" with the right counts.
     #[test]
@@ -1029,6 +1116,68 @@ mod tests {
         assert!(
             out.contains("arch: -"),
             "host-None sidecar must surface `arch: -`: {out}",
+        );
+    }
+
+    /// Per-sidecar text output: the cpu_budget line renders all four
+    /// branches — skip (budget 0), overcommit (budget < vcpus), normal
+    /// (budget >= vcpus), and the malformed budget>0/vcpus=0 case — and
+    /// the overcommit marker names run-delay as confounded (locks in
+    /// the kernel-grounded "run_delay is steal-inflated" semantics so a
+    /// regression that dropped it back to "only partial" is caught).
+    #[test]
+    fn explain_sidecar_text_renders_cpu_budget_marker_branches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let render = |name: &str, budget: u32, vcpus: u32| -> String {
+            let run_dir = tmp.path().join(name);
+            std::fs::create_dir(&run_dir).unwrap();
+            let mut sc = crate::test_support::SidecarResult::test_fixture();
+            sc.cpu_budget = budget;
+            sc.vcpus = vcpus;
+            std::fs::write(
+                run_dir.join("t-0000000000000000.ktstr.json"),
+                serde_json::to_string(&sc).unwrap(),
+            )
+            .unwrap();
+            explain_sidecar(name, Some(tmp.path()), false).unwrap()
+        };
+
+        let skip = render("run-skip", 0, 0);
+        assert!(
+            skip.contains("cpu_budget: - (skip; VM not booted)"),
+            "budget 0 must render the skip sentinel: {skip}",
+        );
+        assert!(
+            !skip.contains("OVERCOMMIT"),
+            "skip row must not be flagged overcommit: {skip}",
+        );
+
+        let over = render("run-over", 4, 16);
+        assert!(
+            over.contains("cpu_budget: 4 / 16 vcpus") && over.contains("[OVERCOMMIT"),
+            "budget < vcpus must render the raw values AND the OVERCOMMIT marker: {over}",
+        );
+        assert!(
+            over.contains("run-delay"),
+            "OVERCOMMIT marker must list run-delay as confounded (steal-inflated): {over}",
+        );
+
+        let exact = render("run-exact", 16, 16);
+        assert!(
+            exact.contains("cpu_budget: 16 / 16 vcpus") && !exact.contains("OVERCOMMIT"),
+            "budget == vcpus is the boundary: plain line, no marker: {exact}",
+        );
+
+        let roomy = render("run-roomy", 32, 16);
+        assert!(
+            roomy.contains("cpu_budget: 32 / 16 vcpus") && !roomy.contains("OVERCOMMIT"),
+            "budget > vcpus must render plain, no marker: {roomy}",
+        );
+
+        let malformed = render("run-malformed", 8, 0);
+        assert!(
+            malformed.contains("[malformed") && !malformed.contains("OVERCOMMIT"),
+            "budget>0 with vcpus==0 must render the malformed note, not overcommit: {malformed}",
         );
     }
 
@@ -1232,10 +1381,10 @@ mod tests {
         );
     }
 
-    /// Schema version stamp is "1".
+    /// Schema version stamp is "2".
     #[test]
-    fn explain_sidecar_schema_version_constant_is_one() {
-        assert_eq!(EXPLAIN_SIDECAR_SCHEMA_VERSION, "1");
+    fn explain_sidecar_schema_version_constant_is_two() {
+        assert_eq!(EXPLAIN_SIDECAR_SCHEMA_VERSION, "2");
     }
 
     /// JSON output stamps `_schema_version` at top level.

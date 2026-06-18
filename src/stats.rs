@@ -455,8 +455,8 @@ impl MetricDef {
     /// host-side from cross-CPU or cross-cgroup folds
     /// (`worst_spread`, `worst_gap_ms`, `worst_migration_ratio`,
     /// `max_imbalance_ratio`, all `worst_*_wake_latency_*`,
-    /// `worst_iterations_per_worker`, `worst_page_locality`,
-    /// `worst_cross_node_migration_ratio`,
+    /// `worst_iterations_per_worker`, `worst_iterations_per_cpu_sec`,
+    /// `worst_page_locality`, `worst_cross_node_migration_ratio`,
     /// `worst_mean_run_delay_us`, `worst_run_delay_us`,
     /// `worst_wake_latency_tail_ratio`) and have no single-sample
     /// reading.
@@ -634,13 +634,14 @@ impl MetricDef {
 /// | `worst_page_locality` | `page_locality` | `page_locality` |
 /// | `worst_cross_node_migration_ratio` | `cross_node_migration_ratio` | `cross_node_migration_ratio` |
 ///
-/// Eight of the remaining metrics in [`METRICS`] have matching
+/// Nine of the remaining metrics in [`METRICS`] have matching
 /// registry / field / DataFrame column names
 /// (`worst_p99_wake_latency_us`, `worst_median_wake_latency_us`,
 /// `worst_wake_latency_cv`, `total_iterations`,
 /// `worst_mean_run_delay_us`, `worst_run_delay_us`,
 /// `worst_wake_latency_tail_ratio`,
-/// `worst_iterations_per_worker`) and are not listed — no
+/// `worst_iterations_per_worker`,
+/// `worst_iterations_per_cpu_sec`) and are not listed — no
 /// translation to document.
 ///
 /// Quoting the matching list instead of a bare count avoids
@@ -998,6 +999,32 @@ pub static METRICS: &[MetricDef] = &[
         accessor: |r| Some(r.worst_iterations_per_worker),
     },
     MetricDef {
+        // Overcommit-INVARIANT per-cgroup efficiency (iterations per
+        // CPU-second). `HigherBetter`: a cgroup that lost efficiency
+        // regresses this downward. Unlike worst_iterations_per_worker
+        // (raw work, scales with the host-CPU budget), this is the metric
+        // to compare across `cpu_budget` settings — the overcommit marker
+        // and compare-path warning point operators here.
+        //
+        // `default_rel = 0.10` is the binding proportional gate (a 10%
+        // efficiency change is the regression signal), mirroring the
+        // per-worker sibling. `default_abs = 10.0` (iterations/CPU-second)
+        // is a near-zero noise floor: for any real busy workload the rate
+        // is orders of magnitude larger, so the floor only binds for a
+        // near-idle cgroup, where it stops a large rel% on a tiny rate
+        // from flagging jitter. Distinct from the per-worker metric's
+        // floor (which scales with worker count) — this is a per-second
+        // rate, so the floor is a flat anti-noise guard, not a per-worker
+        // derivation.
+        name: "worst_iterations_per_cpu_sec",
+        polarity: crate::test_support::Polarity::HigherBetter,
+        kind: MetricKind::Gauge(GaugeAgg::Last),
+        default_abs: 10.0,
+        default_rel: 0.10,
+        display_unit: "",
+        accessor: |r| Some(r.worst_iterations_per_cpu_sec),
+    },
+    MetricDef {
         name: "worst_page_locality",
         polarity: crate::test_support::Polarity::HigherBetter,
         kind: MetricKind::Gauge(GaugeAgg::Last),
@@ -1284,6 +1311,21 @@ pub struct GauntletRow {
     pub scenario: String,
     pub topology: String,
     pub work_type: String,
+    /// Effective host-CPU budget the run's vCPU threads ran on
+    /// (`SidecarResult::cpu_budget`); `None` for skip rows (budget 0).
+    /// Drives the [`Dimension::CpuBudget`] pairing so cross-budget runs
+    /// are never compared (confining 32 vCPUs to 4 host CPUs measures
+    /// something different), and (with [`vcpus`](Self::vcpus)) feeds the
+    /// compare-path overcommit warning in [`render_overcommit_warning`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_budget: Option<u32>,
+    /// Guest vCPU count (`SidecarResult::vcpus`); `None` for skip rows.
+    /// NOT a Dimension — it rides alongside [`cpu_budget`](Self::cpu_budget)
+    /// so [`render_overcommit_warning`] can flag a compared run whose host
+    /// time-sliced its vCPUs (`cpu_budget < vcpus`), whose guest-scheduler
+    /// timing metrics are then host-contention-confounded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vcpus: Option<u32>,
     /// Scheduler binary name carried from the source sidecar
     /// (`SidecarResult::scheduler`). Surfaced through the substring
     /// filter in [`compare_rows_by`] and the typed
@@ -1542,6 +1584,18 @@ pub struct GauntletRow {
     /// cgroup, direction determined by the metric's polarity" —
     /// is documented on [`METRICS`] and applies here.
     pub worst_iterations_per_worker: f64,
+    /// Worst-case per-cgroup CPU-time efficiency
+    /// ([`crate::assert::ScenarioStats::worst_iterations_per_cpu_sec`],
+    /// the lowest [`crate::assert::CgroupStats::iterations_per_cpu_sec`]
+    /// across the run's cgroups). Unlike
+    /// [`Self::worst_iterations_per_worker`] (raw work, which scales with
+    /// the host-CPU budget), this is OVERCOMMIT-INVARIANT — it is the
+    /// metric to compare across runs of different `cpu_budget` without the
+    /// host-contention confound the overcommit marker / compare-path
+    /// warning point at. `0.0` when no cgroup reported a defined rate
+    /// (collapsed from `None`, same as the sibling worst_* fields).
+    /// Surfaced in [`METRICS`] under `worst_iterations_per_cpu_sec`.
+    pub worst_iterations_per_cpu_sec: f64,
     // NUMA fields.
     /// Worst-case per-cgroup NUMA page-locality fraction (lowest
     /// non-zero). Surfaced in [`METRICS`] under registry name
@@ -1730,6 +1784,14 @@ pub struct RowFilter {
     /// [`crate::cache::KernelSource`] — those describe the kernel
     /// build's input, this describes the run-environment provenance.
     pub run_sources: Vec<String>,
+    /// Repeatable cpu-budget filter, OR-combined: a row matches iff its
+    /// `GauntletRow::cpu_budget` (the effective host-CPU budget, as a
+    /// decimal string) equals ANY entry. Empty vec disables the filter.
+    /// Rows with `cpu_budget == None` (skips) are dropped when this filter
+    /// is non-empty, mirroring `kernels` / `run_sources`. Backs the
+    /// [`Dimension::CpuBudget`] slice (`--cpu-budget` / `--a-cpu-budget` /
+    /// `--b-cpu-budget`).
+    pub cpu_budgets: Vec<String>,
     /// Repeatable scheduler-name filter, OR-combined: a row matches
     /// iff its `GauntletRow::scheduler` equals ANY entry. Empty vec
     /// disables the filter ("do not filter on scheduler"). Strict
@@ -1835,6 +1897,20 @@ impl RowFilter {
                 .run_sources
                 .iter()
                 .any(|want| row_run_source == Some(want.as_str()));
+            if !any {
+                return false;
+            }
+        }
+        if !self.cpu_budgets.is_empty() {
+            // OR-combined match against `GauntletRow::cpu_budget` rendered
+            // as a decimal string. A row with `cpu_budget == None` (skip)
+            // never matches a populated filter — same opt-in policy as
+            // `run_sources` / `kernels`.
+            let row_budget = row.cpu_budget.map(|n| n.to_string());
+            let any = self
+                .cpu_budgets
+                .iter()
+                .any(|want| row_budget.as_deref() == Some(want.as_str()));
             if !any {
                 return false;
             }
@@ -1957,16 +2033,17 @@ fn is_major_minor_prefix(s: &str) -> bool {
             .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
 }
 
-/// One of the seven dimensions that compose a `GauntletRow`'s
+/// One of the eight dimensions that compose a `GauntletRow`'s
 /// identity in the comparison pipeline: `kernel`, `scheduler`,
 /// `topology`, `work-type`, `project-commit`, `kernel-commit`,
-/// `run-source`. Each maps to the corresponding
+/// `run-source`, `cpu-budget`. Each maps to the corresponding
 /// `RowFilter` field and `GauntletRow` field; the dimension
 /// model lets `compare_partitions` derive its slicing dims and
 /// dynamic pairing key without hardcoding the dimension list at
 /// every call site. Variant names match the CLI flag suffix
 /// (e.g. `Dimension::ProjectCommit` ↔ `--project-commit`,
-/// `Dimension::RunSource` ↔ `--run-source`) so a reader can map
+/// `Dimension::RunSource` ↔ `--run-source`,
+/// `Dimension::CpuBudget` ↔ `--cpu-budget`) so a reader can map
 /// from operator surface to internal enum without a translation
 /// table.
 ///
@@ -1977,9 +2054,9 @@ fn is_major_minor_prefix(s: &str) -> bool {
 /// Iteration order via [`Dimension::ALL`] is deterministic and
 /// matches the order operators read in the CLI flags
 /// (`--kernel` / `--scheduler` / `--topology` / `--work-type` /
-/// `--project-commit` / `--kernel-commit` / `--run-source`), so
-/// generated labels and error messages list dims in a stable,
-/// predictable order.
+/// `--project-commit` / `--kernel-commit` / `--run-source` /
+/// `--cpu-budget`), so generated labels and error messages list
+/// dims in a stable, predictable order.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Dimension {
     Kernel,
@@ -1989,6 +2066,7 @@ pub enum Dimension {
     ProjectCommit,
     KernelCommit,
     RunSource,
+    CpuBudget,
 }
 
 impl Dimension {
@@ -2004,6 +2082,7 @@ impl Dimension {
         Dimension::ProjectCommit,
         Dimension::KernelCommit,
         Dimension::RunSource,
+        Dimension::CpuBudget,
     ];
 
     /// Compute pairing dims from a slicing-dim set: every
@@ -2034,6 +2113,7 @@ impl Dimension {
             Dimension::ProjectCommit => "project-commit",
             Dimension::KernelCommit => "kernel-commit",
             Dimension::RunSource => "run-source",
+            Dimension::CpuBudget => "cpu-budget",
         }
     }
 }
@@ -2060,7 +2140,7 @@ pub(crate) const LEGACY_PAIRING_DIMS: &[Dimension] = &[Dimension::Topology, Dime
 /// Comparison shape per dimension: every dim uses the same
 /// SORTED-DEDUPED `Vec<&str>` comparison — order and multiplicity
 /// don't matter (`--a-kernel 6.14 --a-kernel 6.15` and
-/// `--b-kernel 6.15 --b-kernel 6.14` are NOT a slice). All seven
+/// `--b-kernel 6.15 --b-kernel 6.14` are NOT a slice). All eight
 /// dimensions are repeatable Vec filters; the previously
 /// `Option<String>`-typed `scheduler` / `topology` / `work_type`
 /// dims were promoted to `Vec<String>` so the operator-visible
@@ -2091,6 +2171,9 @@ pub fn derive_slicing_dims(filter_a: &RowFilter, filter_b: &RowFilter) -> Vec<Di
             }
             Dimension::RunSource => {
                 sorted_dedup(&filter_a.run_sources) != sorted_dedup(&filter_b.run_sources)
+            }
+            Dimension::CpuBudget => {
+                sorted_dedup(&filter_a.cpu_budgets) != sorted_dedup(&filter_b.cpu_budgets)
             }
         };
         if differs {
@@ -2140,6 +2223,7 @@ pub(crate) fn render_side_label(
             Dimension::ProjectCommit => render_vec_dim(&filter.project_commits, bare_label),
             Dimension::KernelCommit => render_vec_dim(&filter.kernel_commits, bare_label),
             Dimension::RunSource => render_vec_dim(&filter.run_sources, bare_label),
+            Dimension::CpuBudget => render_vec_dim(&filter.cpu_budgets, bare_label),
         };
         parts.push(part);
     }
@@ -2210,6 +2294,11 @@ impl PairingKey {
                 Dimension::ProjectCommit => commit_pairing_key_part(&row.commit),
                 Dimension::KernelCommit => commit_pairing_key_part(&row.kernel_commit),
                 Dimension::RunSource => row.run_source.clone().unwrap_or_default(),
+                // Cross-budget rows never pair: a row's budget value
+                // becomes part of its pairing key (None -> empty, distinct
+                // from any real budget). A skip (None) only pairs with
+                // another skip.
+                Dimension::CpuBudget => row.cpu_budget.map(|n| n.to_string()).unwrap_or_default(),
             });
         }
         PairingKey(parts)
@@ -2517,6 +2606,7 @@ pub fn group_and_average_by(
         sum_mean_run_delay: f64,
         sum_tail_ratio: f64,
         sum_iters_per_worker: f64,
+        sum_iters_per_cpu_sec: f64,
         sum_page_locality: f64,
         sum_cross_node_mig: f64,
         // Per-row MAX-fold for Peak-kind fields. Per
@@ -2590,6 +2680,7 @@ pub fn group_and_average_by(
                 sum_mean_run_delay: 0.0,
                 sum_tail_ratio: 0.0,
                 sum_iters_per_worker: 0.0,
+                sum_iters_per_cpu_sec: 0.0,
                 sum_page_locality: 0.0,
                 sum_cross_node_mig: 0.0,
                 max_gap_ms: 0,
@@ -2657,6 +2748,7 @@ pub fn group_and_average_by(
         acc.sum_mean_run_delay += row.worst_mean_run_delay_us;
         acc.sum_tail_ratio += row.worst_wake_latency_tail_ratio;
         acc.sum_iters_per_worker += row.worst_iterations_per_worker;
+        acc.sum_iters_per_cpu_sec += row.worst_iterations_per_cpu_sec;
         acc.sum_page_locality += row.page_locality;
         acc.sum_cross_node_mig += row.cross_node_migration_ratio;
         // Peak-kind typed fields: cross-RUN aggregation surfaces
@@ -2736,6 +2828,23 @@ pub fn group_and_average_by(
             commit: project_commit_rendered,
             kernel_commit: kernel_commit_rendered,
             run_source: acc.first.run_source.clone(),
+            // First-seen budget metadata, like scheduler/kernel_version
+            // above. When CpuBudget is a PAIRING dim it is part of the
+            // group key, so every contributor shares one budget and the
+            // first row's value is the group's. When the operator slices
+            // on budget (e.g. an asymmetric `--a-cpu-budget`), CpuBudget
+            // is a SLICING dim and is dropped from the pairing key, so a
+            // group's contributors may carry heterogeneous budgets — the
+            // first-seen value is then representative metadata, not a join
+            // key, and `render_overcommit_warning` surfaces the cross-budget
+            // mix on the compared sides. vcpus is likewise first-seen
+            // metadata — and is NOT a Dimension, so a TOPOLOGY-sliced group
+            // (vcpus = topology.total_cpus()) can mix vcpus too. No
+            // post-aggregation consumer reads the aggregated vcpus (the
+            // overcommit checks run pre-aggregation on the raw rows), so the
+            // first-seen value is metadata only.
+            cpu_budget: acc.first.cpu_budget,
+            vcpus: acc.first.vcpus,
             // ALL must pass: any failed, inconclusive, or skipped
             // contributor flips the aggregate. A group with zero
             // passes_observed (every contributor failed, was
@@ -2780,6 +2889,7 @@ pub fn group_and_average_by(
             worst_mean_run_delay_us: acc.sum_mean_run_delay / denom,
             worst_wake_latency_tail_ratio: acc.sum_tail_ratio / denom,
             worst_iterations_per_worker: acc.sum_iters_per_worker / denom,
+            worst_iterations_per_cpu_sec: acc.sum_iters_per_cpu_sec / denom,
             page_locality: acc.sum_page_locality / denom,
             cross_node_migration_ratio: acc.sum_cross_node_mig / denom,
             ext_metrics: acc
@@ -2897,6 +3007,10 @@ pub fn sidecar_to_row(sc: &crate::test_support::SidecarResult) -> GauntletRow {
         commit: sc.project_commit.clone(),
         kernel_commit: sc.kernel_commit.clone(),
         run_source: sc.run_source.clone(),
+        // 0 = skip rows (never booted) -> None: skips carry no budget
+        // identity, so they don't pair into a "budget 0" bucket.
+        cpu_budget: (sc.cpu_budget != 0).then_some(sc.cpu_budget),
+        vcpus: (sc.vcpus != 0).then_some(sc.vcpus),
         passed: sc.is_pass(),
         skipped: sc.is_skip(),
         inconclusive: sc.is_inconclusive(),
@@ -2973,6 +3087,20 @@ pub fn sidecar_to_row(sc: &crate::test_support::SidecarResult) -> GauntletRow {
                     test = %sc.test_name,
                     field = "worst_iterations_per_worker",
                     "no cgroup reported a worker; substituting 0.0",
+                );
+                0.0
+            }
+        },
+        // Overcommit-invariant efficiency. `None` when no cgroup reported
+        // a defined rate (no workers or no on-CPU time captured); maps to
+        // 0.0 with a warn, same sentinel convention as the sibling above.
+        worst_iterations_per_cpu_sec: match sc.stats.worst_iterations_per_cpu_sec {
+            Some(v) => finite_or_zero("worst_iterations_per_cpu_sec", v),
+            None => {
+                tracing::warn!(
+                    test = %sc.test_name,
+                    field = "worst_iterations_per_cpu_sec",
+                    "no cgroup reported a defined per-cpu-sec rate; substituting 0.0",
                 );
                 0.0
             }
@@ -3581,18 +3709,24 @@ fn sorted_run_entries(root: &std::path::Path) -> std::io::Result<Vec<RunEntryRow
 /// Pool every sidecar under the runs root (or `dir` when set) and
 /// emit the distinct values present on each filterable dimension.
 ///
-/// Seven dimensions are reported: `kernel` (from
+/// Eight dimensions are reported: `kernel` (from
 /// `SidecarResult::kernel_version`), `scheduler`, `topology`,
 /// `work_type`, `commit` (from `SidecarResult::project_commit`),
-/// `kernel_commit` (from `SidecarResult::kernel_commit`), and
-/// `source` (from `SidecarResult::run_source`). The dimension
-/// catalogue here matches what `cargo ktstr stats compare`
-/// accepts as `--X` and `--a-X` / `--b-X` filter flags — the
-/// command exists so an operator can answer "what kernel versions
-/// are in the pool?" before crafting a compare invocation. The
-/// JSON keys `commit` and `source` are the wire contract; the
-/// corresponding per-side filter flags spell `--project-commit`
-/// and `--run-source`.
+/// `kernel_commit` (from `SidecarResult::kernel_commit`), `source`
+/// (from `SidecarResult::run_source`), and `cpu_budget` (from
+/// `SidecarResult::cpu_budget`). The dimension catalogue here matches
+/// what `cargo ktstr stats compare` accepts as `--X` and `--a-X` /
+/// `--b-X` filter flags — the command exists so an operator can answer
+/// "what kernel versions are in the pool?" before crafting a compare
+/// invocation. The JSON keys `commit` and `source` are the wire
+/// contract; the corresponding per-side filter flags spell
+/// `--project-commit` and `--run-source`.
+///
+/// `cpu_budget` is the sole NUMERIC dimension: its JSON value is an
+/// array of integers (every other dimension is a string array), and
+/// budget-0 skip rows (never-booted) are excluded — a non-empty pool
+/// of only skips renders the `(all runs skipped — no budget recorded)`
+/// sentinel rather than `null` / `unknown`.
 ///
 /// `kernel_version`, `project_commit`, `kernel_commit`, and
 /// `run_source` are `Option<String>` on the source sidecar;
@@ -3633,6 +3767,7 @@ pub fn list_values(json: bool, dir: Option<&std::path::Path>) -> anyhow::Result<
     let mut project_commits: BTreeSet<Option<String>> = BTreeSet::new();
     let mut kernel_commits: BTreeSet<Option<String>> = BTreeSet::new();
     let mut run_sources: BTreeSet<Option<String>> = BTreeSet::new();
+    let mut cpu_budgets: BTreeSet<u32> = BTreeSet::new();
     let mut schedulers: BTreeSet<String> = BTreeSet::new();
     let mut topologies: BTreeSet<String> = BTreeSet::new();
     let mut work_types: BTreeSet<String> = BTreeSet::new();
@@ -3642,6 +3777,10 @@ pub fn list_values(json: bool, dir: Option<&std::path::Path>) -> anyhow::Result<
         project_commits.insert(sc.project_commit.clone());
         kernel_commits.insert(sc.kernel_commit.clone());
         run_sources.insert(sc.run_source.clone());
+        // 0 = skip rows (never booted); exclude — they carry no budget.
+        if sc.cpu_budget != 0 {
+            cpu_budgets.insert(sc.cpu_budget);
+        }
         schedulers.insert(sc.scheduler.clone());
         topologies.insert(sc.topology.clone());
         work_types.insert(sc.work_type.clone());
@@ -3691,6 +3830,7 @@ pub fn list_values(json: bool, dir: Option<&std::path::Path>) -> anyhow::Result<
             "commit": project_commits_json,
             "kernel_commit": kernel_commits_json,
             "source": run_sources_json,
+            "cpu_budget": cpu_budgets.iter().collect::<Vec<_>>(),
             "scheduler": schedulers.iter().collect::<Vec<_>>(),
             "topology": topologies.iter().collect::<Vec<_>>(),
             "work_type": work_types.iter().collect::<Vec<_>>(),
@@ -3741,6 +3881,23 @@ pub fn list_values(json: bool, dir: Option<&std::path::Path>) -> anyhow::Result<
     render_opt_set(&mut out, "commit:", &project_commits);
     render_opt_set(&mut out, "kernel_commit:", &kernel_commits);
     render_opt_set(&mut out, "source:", &run_sources);
+    out.push_str("cpu_budget:\n");
+    if cpu_budgets.is_empty() {
+        // cpu_budgets excludes budget-0 skip rows, so an empty set on a
+        // NON-empty pool means every sidecar was a skip — distinguish
+        // that from a genuinely empty pool (the other dims always insert
+        // a value per sidecar, so they never hit this).
+        if pool.is_empty() {
+            out.push_str("  (no sidecars in pool)\n");
+        } else {
+            out.push_str("  (all runs skipped — no budget recorded)\n");
+        }
+    } else {
+        for b in &cpu_budgets {
+            out.push_str(&format!("  {b}\n"));
+        }
+    }
+    out.push('\n');
     render_str_set(&mut out, "scheduler:", &schedulers);
     render_str_set(&mut out, "topology:", &topologies);
     render_str_set(&mut out, "work_type:", &work_types);
@@ -4542,6 +4699,159 @@ fn warn_on_dirty_builds(rows_a: &[GauntletRow], rows_b: &[GauntletRow]) {
     }
 }
 
+/// Emit the CPU-budget hazard warning for a comparison, if any.
+/// Pure-render half is [`render_overcommit_warning`]; this only
+/// `eprint!`s it, mirroring [`warn_on_dirty_builds`].
+fn warn_on_overcommit(rows_a: &[GauntletRow], rows_b: &[GauntletRow], pairing_dims: &[Dimension]) {
+    if let Some(text) = render_overcommit_warning(rows_a, rows_b, pairing_dims) {
+        eprint!("{text}");
+    }
+}
+
+/// Build the CPU-budget hazard warning from the filtered compare
+/// sides, or `None` when neither hazard is present.
+///
+/// Two independent hazards, both read from [`GauntletRow::cpu_budget`]
+/// / [`GauntletRow::vcpus`] — the consumers that make those fields
+/// load-bearing on the compare path:
+///
+/// - OVERCOMMIT (`cpu_budget < vcpus`): the host time-sliced that
+///   run's vCPU threads, so its wake-latency / off-CPU / run-delay
+///   timing metrics are host-contention artifacts, not scheduler
+///   signal (see [`crate::vmm::host_topology::overcommit_warning`]).
+///   Always flagged when present on either side: comparing raw timing
+///   from an overcommitted run is the silent-wrong-answer the budget
+///   stamp exists to surface.
+/// - MIXED BUDGET: a single pairing group on a side holds more than
+///   one distinct non-skip budget. [`group_and_average_by`] folds rows
+///   that share a full [`PairingKey`], so this is exactly the set
+///   `--average` would average together across budgets. It only arises
+///   when [`Dimension::CpuBudget`] is NOT a pairing dim (the operator
+///   sliced on cpu-budget, dropping it from the key); when it IS a
+///   pairing dim, each budget keys its own group and is never folded.
+///   Detection is per pairing group, NOT side-wide: two rows of
+///   different scenarios (or any differing pairing dim) carry different
+///   keys and never average, so a side merely spanning budgets across
+///   distinct groups is not flagged.
+///
+/// Skip rows (budget 0 -> `None` in [`sidecar_to_row`]) carry no
+/// budget identity and are ignored by both checks. Split from
+/// emission so a unit test pins the text and the `None`-when-clean
+/// polarity without trapping stderr, mirroring [`render_dirty_warning`].
+fn render_overcommit_warning(
+    rows_a: &[GauntletRow],
+    rows_b: &[GauntletRow],
+    pairing_dims: &[Dimension],
+) -> Option<String> {
+    use std::collections::BTreeSet;
+    use std::fmt::Write;
+
+    // Side-wide: the distinct overcommitted (budget, vcpus) pairs.
+    let overcommitted = |rows: &[GauntletRow]| -> BTreeSet<(u32, u32)> {
+        let mut over = BTreeSet::new();
+        for r in rows {
+            if let (Some(b), Some(v)) = (r.cpu_budget, r.vcpus)
+                && b < v
+            {
+                over.insert((b, v));
+            }
+        }
+        over
+    };
+
+    // Per pairing group: the union of budgets across groups that hold
+    // >1 distinct budget — exactly the budgets `--average` folds into
+    // one mean. Empty when CpuBudget is a pairing dim (each budget keys
+    // its own group, so no group ever holds two).
+    let cpu_budget_is_pairing = pairing_dims.contains(&Dimension::CpuBudget);
+    let mixed_folded = |rows: &[GauntletRow]| -> BTreeSet<u32> {
+        let mut folded = BTreeSet::new();
+        if cpu_budget_is_pairing {
+            return folded;
+        }
+        let mut by_key: std::collections::HashMap<PairingKey, BTreeSet<u32>> =
+            std::collections::HashMap::new();
+        for r in rows {
+            if let Some(b) = r.cpu_budget {
+                by_key
+                    .entry(PairingKey::from_row(r, pairing_dims))
+                    .or_default()
+                    .insert(b);
+            }
+        }
+        for budgets in by_key.values() {
+            if budgets.len() > 1 {
+                folded.extend(budgets.iter().copied());
+            }
+        }
+        folded
+    };
+
+    let over_a = overcommitted(rows_a);
+    let over_b = overcommitted(rows_b);
+    let mixed_a = mixed_folded(rows_a);
+    let mixed_b = mixed_folded(rows_b);
+
+    if over_a.is_empty() && over_b.is_empty() && mixed_a.is_empty() && mixed_b.is_empty() {
+        return None;
+    }
+
+    let any_overcommit = !over_a.is_empty() || !over_b.is_empty();
+    let mut out = String::new();
+    if any_overcommit {
+        // Host time-slicing actually occurred -> raw timing is confounded.
+        let _ = writeln!(
+            out,
+            "ktstr: WARNING: CPU-budget hazard in this comparison — a run was \
+             host-overcommitted, so its guest-scheduler timing metrics \
+             (wake-latency / off-CPU / run-delay) are host-contention-confounded. \
+             Compare the overcommit-invariant worst_iterations_per_cpu_sec metric \
+             (`stats compare --metric worst_iterations_per_cpu_sec`) instead of raw \
+             timing."
+        );
+    } else {
+        // Mixed budgets with NO overcommit: no host contention, the hazard is
+        // collapsing two different measurement conditions into one number.
+        let _ = writeln!(
+            out,
+            "ktstr: WARNING: CPU-budget hazard in this comparison — runs of \
+             different CPU budgets share a pairing group, mixing two measurement \
+             conditions. Slice with --cpu-budget, or compare the budget-invariant \
+             worst_iterations_per_cpu_sec metric."
+        );
+    }
+    let mut emit_side = |label: &str, over: &BTreeSet<(u32, u32)>, mixed: &BTreeSet<u32>| {
+        if !over.is_empty() {
+            let list = over
+                .iter()
+                .map(|(b, v)| format!("{b}/{v}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let _ = writeln!(
+                out,
+                "  side {label}: host-overcommitted run(s) [budget/vcpus]: {list}"
+            );
+        }
+        if !mixed.is_empty() {
+            let list = mixed
+                .iter()
+                .map(|b| b.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let _ = writeln!(
+                out,
+                "  side {label}: CPU budgets [{list}] share a pairing group — \
+                 --average folds them into one mean (--no-average rejects them as \
+                 duplicate keys); slice with --cpu-budget so cross-budget runs are \
+                 not compared under one key"
+            );
+        }
+    };
+    emit_side("A", &over_a, &mixed_a);
+    emit_side("B", &over_b, &mixed_b);
+    Some(out)
+}
+
 /// Build the dirty-builds warning block from row data.
 ///
 /// Returns `None` when no row on either side carries a `-dirty`
@@ -4742,6 +5052,46 @@ fn zero_match_diagnostic(
         }
     }
 
+    // Unknown-cpu-budget hint. Mirrors the run_sources hint for the
+    // numeric budget dimension: fires when a `--cpu-budget` value is
+    // not among the budgets present in the pool (the budgets render
+    // canonically as decimal via `cpu_budget.to_string()`, so a
+    // non-canonical input like `032` lists as not-found against the
+    // canonical present set). Skip rows (`cpu_budget == None`) carry no
+    // budget and are excluded.
+    if !filter.cpu_budgets.is_empty() {
+        let pool_budgets: std::collections::BTreeSet<u32> =
+            rows.iter().filter_map(|r| r.cpu_budget).collect();
+        let present_strs: std::collections::BTreeSet<String> =
+            pool_budgets.iter().map(|b| b.to_string()).collect();
+        let unknowns: Vec<&str> = filter
+            .cpu_budgets
+            .iter()
+            .map(String::as_str)
+            .filter(|want| !present_strs.contains(*want))
+            .collect();
+        if !unknowns.is_empty() {
+            let unknown_list = unknowns
+                .iter()
+                .map(|s| format!("`{s}`"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let present_list = if pool_budgets.is_empty() {
+                "(none — every row is a skip with no recorded budget)".to_string()
+            } else {
+                pool_budgets
+                    .iter()
+                    .map(|b| format!("`{b}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            msg.push_str(&format!(
+                "\nhint: --cpu-budget {unknown_list} not found in pool; \
+                 distinct budgets present: {present_list}."
+            ));
+        }
+    }
+
     // list-values redirect: only fires when the operator narrowed
     // on a commit dimension. Generic case (no commit filter) keeps
     // the existing `stats list` redirect at the top of the message
@@ -4910,6 +5260,7 @@ pub fn compare_partitions(
     }
 
     warn_on_dirty_builds(&rows_a, &rows_b);
+    warn_on_overcommit(&rows_a, &rows_b, &pairing_dims);
 
     let pre_agg_a = rows_a.len();
     let pre_agg_b = rows_b.len();
@@ -6189,6 +6540,8 @@ mod tests {
             work_type: "SpinWait".into(),
             scheduler: String::new(),
             kernel_version: None,
+            cpu_budget: None,
+            vcpus: None,
             commit: None,
             kernel_commit: None,
             run_source: None,
@@ -6213,6 +6566,7 @@ mod tests {
             worst_run_delay_us: 0.0,
             worst_wake_latency_tail_ratio: 0.0,
             worst_iterations_per_worker: 0.0,
+            worst_iterations_per_cpu_sec: 0.0,
             page_locality: 0.0,
             cross_node_migration_ratio: 0.0,
             ext_metrics: BTreeMap::new(),
@@ -6404,6 +6758,40 @@ mod tests {
         assert_eq!(row.stuck_count, 1);
         assert_eq!(row.fallback_count, 7);
         assert_eq!(row.keep_last_count, 3);
+    }
+
+    /// `worst_iterations_per_cpu_sec` (the overcommit-invariant compare
+    /// metric the budget warning recommends) flows ScenarioStats ->
+    /// GauntletRow: Some maps through, None collapses to 0.0 like the
+    /// sibling worst_* fields, and the metric is in the METRICS registry
+    /// so `stats compare --metric worst_iterations_per_cpu_sec` resolves.
+    #[test]
+    fn sidecar_to_row_maps_worst_iterations_per_cpu_sec() {
+        use crate::test_support;
+        let some = test_support::SidecarResult {
+            stats: ScenarioStats {
+                worst_iterations_per_cpu_sec: Some(1234.5),
+                ..Default::default()
+            },
+            ..test_support::SidecarResult::test_fixture()
+        };
+        assert_eq!(sidecar_to_row(&some).worst_iterations_per_cpu_sec, 1234.5);
+
+        let none = test_support::SidecarResult {
+            stats: ScenarioStats {
+                worst_iterations_per_cpu_sec: None,
+                ..Default::default()
+            },
+            ..test_support::SidecarResult::test_fixture()
+        };
+        assert_eq!(sidecar_to_row(&none).worst_iterations_per_cpu_sec, 0.0);
+
+        assert!(
+            METRICS
+                .iter()
+                .any(|m| m.name == "worst_iterations_per_cpu_sec"),
+            "metric must be registered so `stats compare --metric` resolves it",
+        );
     }
 
     #[test]
@@ -7255,6 +7643,7 @@ mod tests {
             "commit:",
             "kernel_commit:",
             "source:",
+            "cpu_budget:",
             "scheduler:",
             "topology:",
             "work_type:",
@@ -7264,15 +7653,15 @@ mod tests {
                 "text output must include heading for {dim}: {out}",
             );
         }
-        // Each dim should report the empty-pool sentinel exactly seven
+        // Each dim should report the empty-pool sentinel exactly eight
         // times — one per dim — so a regression that dropped the
         // sentinel for one dim falls out as a count mismatch.
         let sentinel_count = out.matches("(no sidecars in pool)").count();
         assert_eq!(
-            sentinel_count, 7,
+            sentinel_count, 8,
             "empty pool must surface the no-sidecars sentinel under every \
-             one of the 7 dims (kernel/commit/kernel_commit/source/\
-             scheduler/topology/work_type); got {sentinel_count} \
+             one of the 8 dims (kernel/commit/kernel_commit/source/\
+             cpu_budget/scheduler/topology/work_type); got {sentinel_count} \
              occurrences in:\n{out}",
         );
     }
@@ -7290,6 +7679,7 @@ mod tests {
             "commit",
             "kernel_commit",
             "source",
+            "cpu_budget",
             "scheduler",
             "topology",
             "work_type",
@@ -7410,6 +7800,86 @@ mod tests {
             pos_eevdf < pos_rusty,
             "values within a dim must render sorted (BTreeSet iter order); \
              expected 'eevdf' before 'scx_rusty' in:\n{out}",
+        );
+    }
+
+    /// The populated `cpu_budget` dim renders distinct budgets once
+    /// each, sorted ascending, in both the text block and as a numeric
+    /// JSON array (every other dim is a string array; cpu_budget is the
+    /// sole numeric one). Skip rows (budget 0) are excluded.
+    #[test]
+    fn list_values_cpu_budget_renders_distinct_sorted() {
+        use crate::test_support::SidecarResult;
+
+        let alt = tempfile::TempDir::new().expect("tempdir");
+        let sidecars = vec![
+            SidecarResult {
+                test_name: "t_a".to_string(),
+                cpu_budget: 32,
+                vcpus: 32,
+                ..SidecarResult::test_fixture()
+            },
+            SidecarResult {
+                test_name: "t_b".to_string(),
+                cpu_budget: 4,
+                vcpus: 16,
+                ..SidecarResult::test_fixture()
+            },
+            // Duplicate budget 4 — the BTreeSet must dedupe.
+            SidecarResult {
+                test_name: "t_c".to_string(),
+                cpu_budget: 4,
+                vcpus: 16,
+                ..SidecarResult::test_fixture()
+            },
+            // Skip row (budget 0) — excluded from the budget set.
+            SidecarResult {
+                test_name: "t_d".to_string(),
+                cpu_budget: 0,
+                vcpus: 0,
+                ..SidecarResult::test_fixture()
+            },
+        ];
+        write_listvalues_fixture(alt.path(), &sidecars);
+
+        let text = list_values(false, Some(alt.path())).expect("text render must succeed");
+        // Distinct budgets appear once each. Scope the search to the
+        // cpu_budget block so digits in other values can't false-match:
+        // the block is the lines between "cpu_budget:\n" and the next
+        // blank line.
+        let block_start =
+            text.find("cpu_budget:\n").expect("cpu_budget heading") + "cpu_budget:\n".len();
+        let block = &text[block_start..];
+        let block_end = block.find("\n\n").map(|i| i + 1).unwrap_or(block.len());
+        let block = &block[..block_end];
+        assert_eq!(
+            block.matches("  4\n").count(),
+            1,
+            "budget 4 once: {block:?}"
+        );
+        assert_eq!(
+            block.matches("  32\n").count(),
+            1,
+            "budget 32 once: {block:?}"
+        );
+        let pos_4 = block.find("  4\n").expect("4 present");
+        let pos_32 = block.find("  32\n").expect("32 present");
+        assert!(pos_4 < pos_32, "budgets must sort ascending: {block:?}");
+
+        let json = list_values(true, Some(alt.path())).expect("json render must succeed");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("json must parse");
+        let arr = parsed
+            .get("cpu_budget")
+            .and_then(|v| v.as_array())
+            .expect("cpu_budget must be a JSON array");
+        let nums: Vec<u64> = arr
+            .iter()
+            .map(|v| v.as_u64().expect("numeric budget"))
+            .collect();
+        assert_eq!(
+            nums,
+            vec![4, 32],
+            "JSON cpu_budget must be a sorted numeric array"
         );
     }
 
@@ -8891,6 +9361,44 @@ mod tests {
         assert_eq!(back, row);
     }
 
+    /// Round-trip with populated `cpu_budget` / `vcpus`: the
+    /// `Option<u32>` + `skip_serializing_if` pair emits the numeric
+    /// keys and reads them back. Distinct from `SidecarResult`'s
+    /// always-emit u32 round-trip (tests.rs) — this pins the
+    /// GauntletRow Option serde contract, the compare-pipeline wire
+    /// shape where the skip_serializing_if subtlety lives.
+    #[test]
+    fn gauntlet_row_round_trip_populated_cpu_budget() {
+        let mut row = make_row("scn", "topo", true, 1.0);
+        row.cpu_budget = Some(4);
+        row.vcpus = Some(16);
+        let json = serde_json::to_string(&row).unwrap();
+        assert!(
+            json.contains("\"cpu_budget\":4") && json.contains("\"vcpus\":16"),
+            "populated budget/vcpus must emit numeric JSON keys: {json}"
+        );
+        let back: GauntletRow = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, row);
+        assert_eq!(back.cpu_budget, Some(4));
+        assert_eq!(back.vcpus, Some(16));
+    }
+
+    /// None `cpu_budget` / `vcpus` (skip rows) omit both keys via
+    /// `skip_serializing_if`; the reader defaults them back to None so
+    /// the round-trip closes without the keys present.
+    #[test]
+    fn gauntlet_row_none_cpu_budget_omits_keys() {
+        let row = make_row("scn", "topo", true, 1.0);
+        assert!(row.cpu_budget.is_none() && row.vcpus.is_none());
+        let json = serde_json::to_string(&row).unwrap();
+        assert!(
+            !json.contains("\"cpu_budget\"") && !json.contains("\"vcpus\""),
+            "None budget/vcpus must be omitted from JSON: {json}"
+        );
+        let back: GauntletRow = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, row);
+    }
+
     /// `compare_partitions` honours the `--dir` override —
     /// pool-collection walks the override path rather than the
     /// default [`crate::test_support::runs_root`]. Pool source-of-
@@ -9120,6 +9628,139 @@ mod tests {
         );
     }
 
+    // -- render_overcommit_warning --
+
+    fn budget_row(scenario: &str, budget: Option<u32>, vcpus: Option<u32>) -> GauntletRow {
+        let mut r = make_row(scenario, "topo", true, 1.0);
+        r.cpu_budget = budget;
+        r.vcpus = vcpus;
+        r
+    }
+
+    /// No hazard: every row's budget meets its vCPU count and no group
+    /// mixes budgets -> `None`, whether CpuBudget is pairing or sliced.
+    #[test]
+    fn render_overcommit_warning_none_when_clean() {
+        let pairing: &[Dimension] = &[Dimension::CpuBudget];
+        let sliced: &[Dimension] = &[];
+        let a = budget_row("a", Some(16), Some(16));
+        let b = budget_row("b", Some(32), Some(16)); // roomy, not overcommit
+        assert!(
+            super::render_overcommit_warning(
+                std::slice::from_ref(&a),
+                std::slice::from_ref(&b),
+                pairing,
+            )
+            .is_none()
+        );
+        assert!(super::render_overcommit_warning(&[a], &[b], sliced).is_none());
+    }
+
+    /// Skip rows (budget `None`) carry no budget identity and never
+    /// trip either check.
+    #[test]
+    fn render_overcommit_warning_ignores_skip_rows() {
+        let sliced: &[Dimension] = &[];
+        let a = budget_row("a", None, None);
+        let b = budget_row("b", None, None);
+        assert!(super::render_overcommit_warning(&[a], &[b], sliced).is_none());
+    }
+
+    /// An overcommitted run (budget < vcpus) is flagged on its side,
+    /// names the budget/vcpus pair, and the warning lists run-delay as
+    /// confounded (pins the kernel-grounded semantics). Fires
+    /// regardless of pairing.
+    #[test]
+    fn render_overcommit_warning_flags_overcommitted_side() {
+        let pairing: &[Dimension] = &[Dimension::CpuBudget];
+        let a = budget_row("a", Some(4), Some(16));
+        let b = budget_row("b", Some(16), Some(16));
+        let text = super::render_overcommit_warning(&[a], &[b], pairing)
+            .expect("an overcommitted A row must warn");
+        assert!(text.contains("side A"), "must name side A: {text}");
+        assert!(text.contains("4/16"), "must list budget/vcpus: {text}");
+        assert!(
+            text.contains("run-delay"),
+            "warning must list run-delay as confounded: {text}",
+        );
+        assert!(
+            !text.contains("side B"),
+            "the clean B side must not be flagged: {text}",
+        );
+    }
+
+    /// The mixed-budget warning fires per pairing GROUP, not side-wide:
+    /// only rows that share a full PairingKey are averaged together.
+    /// - CpuBudget pairing: budgets key separate groups -> no fold.
+    /// - sliced + same scenario: budgets fold into one mean -> warn.
+    /// - sliced + different scenarios: distinct keys, never folded -> no
+    ///   warning (the precision that distinguishes "side spans budgets"
+    ///   from "a group averages budgets").
+    #[test]
+    fn render_overcommit_warning_mixed_budget_per_group() {
+        let pairing: &[Dimension] = &[Dimension::CpuBudget];
+        // Realistic sliced pairing-dims: production passes
+        // Dimension::pairing_dims(&slicing) = ALL minus the sliced dim, so
+        // the per-group key includes scheduler/topology/work-type/commits/
+        // source — NOT just scenario. Use the real derivation so a
+        // from_row key-shape regression on the sliced path is caught.
+        let sliced = Dimension::pairing_dims(&[Dimension::CpuBudget]);
+        let a = budget_row("a", Some(16), Some(16));
+        let b1 = budget_row("b", Some(8), Some(16)); // overcommit + two budgets...
+        let b2 = budget_row("b", Some(16), Some(16)); // ...same scenario AND all other dims
+
+        // CpuBudget pairing: budgets key separate groups; the only
+        // hazard is the overcommitted 8/16 row, NOT a mixed-budget fold.
+        let paired = super::render_overcommit_warning(
+            std::slice::from_ref(&a),
+            &[b1.clone(), b2.clone()],
+            pairing,
+        )
+        .expect("overcommitted B row still warns");
+        assert!(
+            paired.contains("8/16") && !paired.contains("share a pairing group"),
+            "pairing dim: overcommit flagged, no mixed-fold warning: {paired}",
+        );
+
+        // Sliced + b1/b2 share EVERY pairing dim (scenario + scheduler +
+        // topology + ... all default-equal): one group, two budgets, so
+        // --average folds them -> mixed warning on side B.
+        let sliced_same = super::render_overcommit_warning(&[a], &[b1, b2], &sliced)
+            .expect("mixed budgets in one group on a sliced side must warn");
+        assert!(
+            sliced_same.contains("share a pairing group") && sliced_same.contains("side B"),
+            "sliced same-key: must warn B's budgets share a pairing group: {sliced_same}",
+        );
+
+        // Sliced but the two budgets differ on a NON-budget pairing dim
+        // (scheduler): distinct pairing keys -> never folded -> no
+        // warning, even though the side has two budgets and shares
+        // scenario. Proves the per-group key uses the FULL dim set, not
+        // just scenario (the degenerate &[] key would have missed this).
+        let mut s1 = budget_row("c", Some(16), Some(16));
+        s1.scheduler = "sched_a".to_string();
+        let mut s2 = budget_row("c", Some(32), Some(32));
+        s2.scheduler = "sched_b".to_string();
+        let clean_a = budget_row("d", Some(16), Some(16));
+        assert!(
+            super::render_overcommit_warning(&[s1, s2], std::slice::from_ref(&clean_a), &sliced)
+                .is_none(),
+            "two budgets differing on a non-budget pairing dim (scheduler) key \
+             separate groups -> no fold -> no warning",
+        );
+
+        // Sliced + different scenarios on ONE side: distinct pairing
+        // keys, never folded, neither overcommitted -> NO warning.
+        let xa = budget_row("x", Some(16), Some(16));
+        let ya = budget_row("y", Some(32), Some(32));
+        let clean_b = budget_row("z", Some(16), Some(16));
+        assert!(
+            super::render_overcommit_warning(&[xa, ya], std::slice::from_ref(&clean_b), &sliced)
+                .is_none(),
+            "one side spanning budgets across distinct scenarios -> no fold -> no warning",
+        );
+    }
+
     // -- RowFilter / apply_row_filters --
 
     /// Helper that builds a `GauntletRow` with controllable
@@ -9140,6 +9781,8 @@ mod tests {
             work_type: work_type.into(),
             scheduler: scheduler.into(),
             kernel_version: kernel_version.map(str::to_owned),
+            cpu_budget: None,
+            vcpus: None,
             commit: None,
             kernel_commit: None,
             run_source: None,
@@ -9164,6 +9807,7 @@ mod tests {
             worst_run_delay_us: 0.0,
             worst_wake_latency_tail_ratio: 0.0,
             worst_iterations_per_worker: 0.0,
+            worst_iterations_per_cpu_sec: 0.0,
             page_locality: 0.0,
             cross_node_migration_ratio: 0.0,
             ext_metrics: BTreeMap::new(),
@@ -9756,6 +10400,7 @@ mod tests {
         row.worst_run_delay_us = (gap_ms * 2) as f64;
         row.worst_wake_latency_tail_ratio = spread / 25.0;
         row.worst_iterations_per_worker = iters as f64 / 10.0;
+        row.worst_iterations_per_cpu_sec = iters as f64 / 5.0;
         row.page_locality = 1.0 - spread / 100.0;
         row.cross_node_migration_ratio = spread / 200.0;
     }
@@ -9833,6 +10478,9 @@ mod tests {
         // Gauge(Last) f64 mean for worst_p99_wake_latency_us:
         // (20 + 40 + 60)/3 = 40.
         assert_eq!(ar.row.worst_p99_wake_latency_us, 40.0);
+        // worst_iterations_per_cpu_sec cross-RUN arithmetic mean:
+        // iters/5 = 180/220/200; (180 + 220 + 200)/3 = 200.
+        assert_eq!(ar.row.worst_iterations_per_cpu_sec, 200.0);
     }
 
     /// `group_and_average_by` propagates `run_sample_count` to the
@@ -11250,7 +11898,7 @@ mod tests {
 
     // -- Dimension / derive_slicing_dims / pairing dims --
 
-    /// `Dimension::ALL` lists all seven dims in canonical order.
+    /// `Dimension::ALL` lists all eight dims in canonical order.
     /// Order matters for [`PairingKey::from_row`] and for header
     /// rendering — a regression that reordered the slice would
     /// silently shift every dynamic key, splitting previously-
@@ -11267,6 +11915,7 @@ mod tests {
                 Dimension::ProjectCommit,
                 Dimension::KernelCommit,
                 Dimension::RunSource,
+                Dimension::CpuBudget,
             ],
         );
     }
@@ -11286,6 +11935,7 @@ mod tests {
                 Dimension::WorkType,
                 Dimension::KernelCommit,
                 Dimension::RunSource,
+                Dimension::CpuBudget,
             ],
         );
         // Order of slicing input doesn't change the output —
@@ -11732,6 +12382,49 @@ mod tests {
         );
     }
 
+    /// `PairingKey::from_row` includes the row's cpu_budget when CpuBudget
+    /// is a pairing dim — so cross-budget rows NEVER pair — and excludes
+    /// it when CpuBudget is the slicing dim. This is the whole point of
+    /// #5: a 4-CPU-budget run and a 32-CPU-budget run measure different
+    /// things and must not be silently compared.
+    #[test]
+    fn pairing_key_from_row_includes_cpu_budget_when_pairing() {
+        let mut row_4 = make_filter_row("scn", "scx_a", "1n1l", "SpinWait", Some("6.14"));
+        row_4.cpu_budget = Some(4);
+        let mut row_32 = make_filter_row("scn", "scx_a", "1n1l", "SpinWait", Some("6.14"));
+        row_32.cpu_budget = Some(32);
+        let mut row_none = make_filter_row("scn", "scx_a", "1n1l", "SpinWait", Some("6.14"));
+        row_none.cpu_budget = None;
+
+        let pair_dims = &[Dimension::CpuBudget];
+        let key_4 = PairingKey::from_row(&row_4, pair_dims);
+        let key_32 = PairingKey::from_row(&row_32, pair_dims);
+        let key_none = PairingKey::from_row(&row_none, pair_dims);
+        assert_eq!(key_4.0, vec!["scn".to_string(), "4".to_string()]);
+        assert_eq!(key_32.0, vec!["scn".to_string(), "32".to_string()]);
+        assert_eq!(
+            key_none.0,
+            vec!["scn".to_string(), String::new()],
+            "None cpu_budget (a skip) collapses to an empty slot",
+        );
+        assert_ne!(
+            key_4, key_32,
+            "rows of different cpu_budget must NOT pair when CpuBudget pairs",
+        );
+        assert_ne!(
+            key_4, key_none,
+            "a budgeted row must not pair with a skip (None budget)",
+        );
+
+        // CpuBudget sliced → the dim is dropped → the two budgets pair.
+        let slice_dims = Dimension::pairing_dims(&[Dimension::CpuBudget]);
+        assert_eq!(
+            PairingKey::from_row(&row_4, &slice_dims),
+            PairingKey::from_row(&row_32, &slice_dims),
+            "rows differing only on the sliced dim (CpuBudget) must pair",
+        );
+    }
+
     /// Clean and dirty contributors at the same canonical hex
     /// must land in the same pairing bucket. Without the
     /// `-dirty` strip in `commit_pairing_key_part`, `abc1234`
@@ -12070,6 +12763,56 @@ mod tests {
         assert!(
             msg.contains("case-sensitive"),
             "must mention case sensitivity (`ci` ≠ `CI`); got:\n{msg}",
+        );
+    }
+
+    /// `zero_match_diagnostic` flags a `--cpu-budget` value not present
+    /// in the pool, naming the unknown value AND the distinct budgets
+    /// actually seen — the numeric mirror of the run_source hint. Skip
+    /// rows (`cpu_budget: None`) contribute no budget to the list.
+    #[test]
+    fn zero_match_diagnostic_unknown_cpu_budget_lists_present_values() {
+        let mut row4 = make_row("scn", "1n1l1c1t", true, 1.0);
+        row4.cpu_budget = Some(4);
+        let mut row32 = make_row("scn", "1n1l1c1t", true, 1.0);
+        row32.cpu_budget = Some(32);
+        let skip = make_row("scn", "1n1l1c1t", true, 1.0); // cpu_budget None
+        let rows = vec![row4, row32, skip];
+        let filter = RowFilter {
+            cpu_budgets: vec!["64".to_string()],
+            ..Default::default()
+        };
+
+        let msg = zero_match_diagnostic("A", &filter, &rows, rows.len());
+
+        assert!(
+            msg.contains("--cpu-budget `64` not found"),
+            "must name the unknown budget verbatim; got:\n{msg}",
+        );
+        assert!(
+            msg.contains("`4`") && msg.contains("`32`"),
+            "must list distinct budgets present in the pool; got:\n{msg}",
+        );
+    }
+
+    /// A `--cpu-budget` value that DOES match a row must NOT trigger
+    /// the unknown-budget hint (guards against the hint firing for
+    /// every populated `--cpu-budget` regardless of pool membership).
+    #[test]
+    fn zero_match_diagnostic_known_cpu_budget_does_not_fire_unknown_hint() {
+        let mut row = make_row("scn", "1n1l1c1t", true, 1.0);
+        row.cpu_budget = Some(4);
+        let rows = vec![row];
+        let filter = RowFilter {
+            cpu_budgets: vec!["4".to_string()],
+            ..Default::default()
+        };
+
+        let msg = zero_match_diagnostic("A", &filter, &rows, rows.len());
+
+        assert!(
+            !msg.contains("--cpu-budget `4` not found"),
+            "a present budget must not fire the unknown-budget hint; got:\n{msg}",
         );
     }
 

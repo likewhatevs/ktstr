@@ -2208,6 +2208,8 @@ mod tests {
             monitor: None,
             periodic_fired: 0,
             periodic_target: 0,
+            vcpus: 1,
+            cpu_budget: 1,
             stimulus_events: Vec::new(),
             work_type: "SpinWait".to_string(),
             verifier_stats: Vec::new(),

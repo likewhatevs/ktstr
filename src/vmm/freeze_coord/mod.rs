@@ -12378,6 +12378,8 @@ impl KtstrVm {
 
         Ok(VmResult {
             success: !timed_out && exit_code == 0,
+            vcpus: self.vcpus,
+            cpu_budget: self.effective_cpu_budget,
             // Default false at construction — set true (when applicable)
             // by the eval-layer inversion site that runs AFTER
             // evaluate_vm_result, preserving the original success +

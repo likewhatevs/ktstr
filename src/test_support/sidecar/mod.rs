@@ -233,6 +233,23 @@ pub struct SidecarResult {
     pub periodic_fired: u32,
     /// See [`Self::periodic_fired`].
     pub periodic_target: u32,
+    /// Guest vCPU count and the effective host-CPU budget the vCPU threads
+    /// ran on, carried verbatim from [`crate::prelude::VmResult`]. Drive
+    /// the `cpu-budget` comparison Dimension (cross-budget runs are not
+    /// paired — confining 32 vCPUs to 4 host CPUs measures something else)
+    /// and the overcommit marker: `cpu_budget < vcpus` means the host
+    /// time-sliced the guest's vCPUs, confounding the timing metrics
+    /// (wake-latency / off-CPU / run-delay — schedstat run_delay tracks
+    /// rq->clock, which follows the guest TSC and is not steal-adjusted,
+    /// so the off-host window inflates it for tasks waiting across it).
+    /// Hard-required `u32`
+    /// (old sidecars re-generate; sidecar data is disposable). EXCLUDED
+    /// from `sidecar_variant_hash`: a budget change is a different
+    /// measurement, separated downstream by the Dimension, not the
+    /// identity bucket.
+    pub vcpus: u32,
+    /// See [`Self::vcpus`].
+    pub cpu_budget: u32,
     /// Ordered stimulus events published by the guest step executor
     /// while the scenario ran.
     pub stimulus_events: Vec<StimulusEvent>,
@@ -540,6 +557,8 @@ impl SidecarResult {
             monitor: None,
             periodic_fired: 0,
             periodic_target: 0,
+            vcpus: 1,
+            cpu_budget: 1,
             stimulus_events: Vec::new(),
             work_type: "SpinWait".to_string(),
             verifier_stats: Vec::new(),
@@ -2006,8 +2025,9 @@ fn kernel_commit_for_sidecar() -> Option<String> {
 /// The hash is over test-identity fields (topology, scheduler,
 /// payload, work_type, sysctls, kargs) — NOT over
 /// [`crate::host_context::HostContext`], NOT over `scheduler_commit`, NOT over
-/// `project_commit`, NOT over `kernel_commit`, and NOT over
-/// `run_source`. The [`crate::host_context::HostContext`] exclusion is pinned by
+/// `project_commit`, NOT over `kernel_commit`, NOT over
+/// `run_source`, and NOT over `cpu_budget` / `vcpus`. The
+/// [`crate::host_context::HostContext`] exclusion is pinned by
 /// `sidecar_variant_hash_excludes_host_context`; the
 /// `scheduler_commit` exclusion by
 /// `sidecar_variant_hash_excludes_scheduler_commit`; the
@@ -2016,15 +2036,21 @@ fn kernel_commit_for_sidecar() -> Option<String> {
 /// `kernel_commit` exclusion by
 /// `sidecar_variant_hash_excludes_kernel_commit`; the
 /// `run_source` exclusion by
-/// `sidecar_variant_hash_excludes_run_source`. All five are
+/// `sidecar_variant_hash_excludes_run_source`; the
+/// `cpu_budget` / `vcpus` exclusion by
+/// `sidecar_variant_hash_excludes_cpu_budget`. All six are
 /// deliberate for the same cross-host grouping reason — a
 /// gauntlet rebuilt against a different userspace scheduler
 /// commit, a bumped ktstr checkout, a kernel source tree at a
-/// different HEAD, or a different CI runner / developer
-/// machine must still bucket with the same-named variant so
+/// different HEAD, a different CI runner / developer machine, or
+/// a run that confined its vCPUs to a different host-CPU budget
+/// must still bucket with the same-named variant so
 /// `compare_partitions` can diff two runs of the "same" test
-/// without the commit hash or run-source tag shattering them
-/// into one-row-per-commit islands. Callers that want to detect
+/// without the commit hash, run-source tag, or budget shattering
+/// them into one-row-per-commit islands. `cpu_budget` / `vcpus`
+/// are instead surfaced as the [`crate::stats::Dimension::CpuBudget`]
+/// pairing axis, which separates cross-budget runs at compare time
+/// rather than at the identity bucket. Callers that want to detect
 /// a commit drift or compare across run environments inspect
 /// [`SidecarResult::scheduler_commit`] /
 /// [`SidecarResult::project_commit`] /
@@ -2762,6 +2788,11 @@ pub(crate) fn write_skip_sidecar(entry: &KtstrTestEntry) -> anyhow::Result<()> {
         // A skip never ran the VM, so no periodic captures fired.
         periodic_fired: 0,
         periodic_target: 0,
+        // A skip never booted the VM, so it has no measured budget. 0/0
+        // maps to None on the GauntletRow's cpu_budget dim (skips carry no
+        // budget identity, like work_type="skipped").
+        vcpus: 0,
+        cpu_budget: 0,
         stimulus_events: Vec::new(),
         // Skip paths never ran a workload; work_type is "skipped"
         // so stats tooling that groups by work_type puts these in a
@@ -2831,6 +2862,8 @@ pub(crate) fn write_sidecar(
         monitor: vm_result.monitor.as_ref().map(|m| m.summary.clone()),
         periodic_fired: vm_result.periodic_fired,
         periodic_target: vm_result.periodic_target,
+        vcpus: vm_result.vcpus,
+        cpu_budget: vm_result.cpu_budget,
         stimulus_events: stimulus_events.to_vec(),
         work_type: work_type.to_string(),
         verifier_stats: vm_result.verifier_stats.clone(),

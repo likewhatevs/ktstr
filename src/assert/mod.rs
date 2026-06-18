@@ -1938,6 +1938,16 @@ pub struct ScenarioStats {
     /// `METRICS` registry; `stats compare` surfaces this axis
     /// in its comparison rows.
     pub worst_iterations_per_worker: Option<f64>,
+    /// Lowest [`CgroupStats::iterations_per_cpu_sec`] across the run's
+    /// cgroups — the worst per-cgroup CPU-time EFFICIENCY. Unlike
+    /// [`Self::worst_iterations_per_worker`] (raw work, which scales with
+    /// the host-CPU budget) this is OVERCOMMIT-INVARIANT: it is the
+    /// metric `stats compare` surfaces so two runs at different
+    /// `cpu_budget` settings can be compared without the host-contention
+    /// confound the overcommit marker warns about. `None` when no cgroup
+    /// reported a defined rate (no workers or no on-CPU time captured);
+    /// merged None-aware lowest-wins like `worst_iterations_per_worker`.
+    pub worst_iterations_per_cpu_sec: Option<f64>,
     /// Extensible metrics for the generic comparison pipeline.
     /// Populated from per-cgroup ext_metrics (worst value across cgroups).
     pub ext_metrics: BTreeMap<String, f64>,
@@ -2387,10 +2397,13 @@ pub fn build_phase_buckets_with_stimulus(
     // would be silently dropped. The synthesized bucket carries the
     // step's true stimulus window so `fold_monitor_into_bucket` still
     // recovers its monitor-derived imbalance; `sample_count == 0` marks
-    // it capture-free for downstream consumers (e.g.
-    // `Timeline::from_phase_buckets` skips zero-sample pairs in change
-    // detection). BASELINE (step 0) is synthesized only if a StepStart
-    // carries `step_index == 0` — it is not special-cased.
+    // it capture-free for downstream consumers. `Timeline::from_phase_buckets`
+    // COMPARES this bucket's stimulus-derived throughput across the gap
+    // (the iteration_rate is real, not a sampling artifact) but GATES the
+    // monitor-derived metrics (imbalance/dsq/fallback/keep_last) behind
+    // both sides having samples — see `detect_boundary_changes`. BASELINE
+    // (step 0) is synthesized only if a StepStart carries
+    // `step_index == 0` — it is not special-cased.
     let step_starts = crate::scenario::sample::step_starts_from_stimulus(stimulus_events);
     for &(start_ms, k) in &step_starts {
         if buckets.iter().any(|b| b.step_index == k) {
@@ -2984,15 +2997,16 @@ fn fold_monitor_into_bucket(
         // restart can reset the counter, producing a negative raw delta).
         // phase_from_bucket re-rates these over the bucket window, matching
         // the read_sample representation captured buckets carry.
-        let has_events = |s: &&crate::monitor::MonitorSample| {
-            s.cpus.iter().any(|c| c.event_counters.is_some())
-        };
+        let has_events =
+            |s: &&crate::monitor::MonitorSample| s.cpus.iter().any(|c| c.event_counters.is_some());
         let first_ev = phase_monitor_samples.iter().copied().find(has_events);
         let last_ev = phase_monitor_samples.iter().copied().rev().find(has_events);
         if let (Some(first), Some(last)) = (first_ev, last_ev) {
             let fb = crate::monitor::counter_delta(
                 last.sum_event_field(|e| e.select_cpu_fallback).unwrap_or(0),
-                first.sum_event_field(|e| e.select_cpu_fallback).unwrap_or(0),
+                first
+                    .sum_event_field(|e| e.select_cpu_fallback)
+                    .unwrap_or(0),
             );
             let kl = crate::monitor::counter_delta(
                 last.sum_event_field(|e| e.dispatch_keep_last).unwrap_or(0),
@@ -3585,6 +3599,13 @@ impl AssertResult {
         fold_lowest_some(
             &mut s.worst_iterations_per_worker,
             o.worst_iterations_per_worker,
+        );
+        // Overcommit-invariant per-cgroup efficiency is likewise
+        // lower-is-worse: the least-efficient cgroup wins the "worst"
+        // bucket. None-aware, same policy as worst_iterations_per_worker.
+        fold_lowest_some(
+            &mut s.worst_iterations_per_cpu_sec,
+            o.worst_iterations_per_cpu_sec,
         );
         // Coupled fields: `worst_gap_cpu` must come from the same
         // cgroup that posted the new worst `worst_gap_ms`.
@@ -5602,6 +5623,9 @@ fn scenario_stats_for_cgroup(cg: &CgroupStats) -> ScenarioStats {
         // carried through as `Option` rather than collapsed to a 0.0
         // sentinel.
         worst_iterations_per_worker: cg.iterations_per_worker(),
+        // Overcommit-invariant efficiency for this cgroup; None-aware
+        // lowest-wins merge folds the run's worst across cgroups.
+        worst_iterations_per_cpu_sec: cg.iterations_per_cpu_sec(),
         ext_metrics: cg.ext_metrics.clone(),
         cgroups: vec![cg.clone()],
         phases: Vec::new(),

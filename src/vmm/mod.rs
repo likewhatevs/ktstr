@@ -297,6 +297,20 @@ pub struct KtstrVm {
     /// independently of where the framework places the scheduler).
     pub(crate) scheduler_cgroup_parent: Option<String>,
     pub(crate) topology: Topology,
+    /// Guest vCPU count (topology llcs*cores*threads). Stamped onto the
+    /// sidecar so `cargo ktstr stats` can pair/compare runs by their
+    /// (vcpus, cpu_budget) and flag overcommit (cpu_budget < vcpus).
+    pub(crate) vcpus: u32,
+    /// Effective host-CPU budget the vCPU threads actually run on: the
+    /// reserved plan's CPU count under no-perf-mode; the guest vCPU count
+    /// under perf-mode (always) and under the deferred default WHEN host
+    /// sysfs topology is readable (both then hard-pin each vCPU thread
+    /// 1:1 to one host CPU). Falls back to the process's full allowed
+    /// cpuset when no affinity is applied: no-perf bypass, sysfs
+    /// unreadable, or the deferred default with no cached host topology.
+    /// Below `vcpus` means the host time-slices the guest's vCPUs
+    /// (overcommit), confounding the guest-scheduler timing metrics.
+    pub(crate) effective_cpu_budget: u32,
     /// Guest memory in MiB. `None` = deferred: computed from actual
     /// initramfs size after the initramfs build completes.
     pub(crate) memory_mib: Option<u32>,

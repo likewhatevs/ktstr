@@ -73,6 +73,14 @@ pub struct VmResult {
     /// Overall success flag: `true` when the test reported a pass AND
     /// the VM exited cleanly without crash, timeout, or watchdog.
     pub success: bool,
+    /// Guest vCPU count for this run (topology llcs*cores*threads),
+    /// carried from `KtstrVm` to the sidecar `(vcpus, cpu_budget)` stamp.
+    pub vcpus: u32,
+    /// Effective host-CPU budget the vCPU threads ran on (see
+    /// `KtstrVm::effective_cpu_budget`); stamped to the sidecar. Below
+    /// `vcpus` means host overcommit, which confounds the guest-scheduler
+    /// timing metrics.
+    pub cpu_budget: u32,
     /// True when the `#[ktstr_test(expect_auto_repro)]` attribute set
     /// `expect_auto_repro = true` on the entry AND the auto-repro
     /// path fired with a valid repro artifact during the run — the
@@ -759,6 +767,8 @@ impl VmResult {
     pub fn test_fixture() -> Self {
         Self {
             success: true,
+            vcpus: 1,
+            cpu_budget: 1,
             expect_auto_repro_satisfied: false,
             exit_code: 0,
             duration: Duration::from_secs(1),
