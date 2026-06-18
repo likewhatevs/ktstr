@@ -356,7 +356,7 @@ fn pid_window_offset_spreads_adjacent_pids() {
         );
     }
 
-    // Unique-offset count: SipHash13's avalanche makes
+    // Unique-offset count: AHasher's avalanche makes
     // adjacent pid landings independent of each other, so
     // 100 pids over 33 offsets should hit roughly all 33
     // offsets. Pin >= 25 to absorb the natural birthday-
@@ -369,7 +369,7 @@ fn pid_window_offset_spreads_adjacent_pids() {
     // modulo. The "adjacent-pid landings differ by 1"
     // assertion below catches that case: bare modulo gives
     // |offset[i+1] - offset[i]| == 1 always (the cyclic
-    // step), whereas SipHash13 produces a fully randomized
+    // step), whereas AHasher produces a fully randomized
     // step distribution.
     let unique: std::collections::HashSet<_> = offsets.iter().copied().collect();
     assert!(
@@ -383,14 +383,14 @@ fn pid_window_offset_spreads_adjacent_pids() {
     // bare modulo on consecutive pids gives consecutive
     // offsets (gap of exactly 1 modulo max_start). Count how
     // many adjacent pid pairs land at exactly +/-1 offset
-    // (handling the wrap at the boundary). For SipHash13,
+    // (handling the wrap at the boundary). For AHasher,
     // each adjacent pair has a 2/max_start ≈ 6% probability
     // of landing at +/-1 by chance, so over 99 pairs the
     // expected count is ~6 with stddev ~2.4. The bare
     // modulo baseline produces 99/99. Pin <= 30 (well above
     // the random-noise expected value, well below the bare-
     // modulo signature) so a regression that drops the
-    // SipHash mixer trips this without flaking on the
+    // AHasher mixer trips this without flaking on the
     // hashed distribution.
     let adjacent_step_count = offsets
         .windows(2)
@@ -403,7 +403,7 @@ fn pid_window_offset_spreads_adjacent_pids() {
         adjacent_step_count <= 30,
         "{adjacent_step_count} of {} adjacent pid pairs landed at +/-1 offset \
          (max_start={max_start}); the bare `pid % {max_start}` baseline produces \
-         99/99 such pairs. SipHash13 avalanche should give ~6. offsets: {offsets:?}",
+         99/99 such pairs. AHasher avalanche should give ~6. offsets: {offsets:?}",
         offsets.len() - 1,
     );
 
@@ -411,7 +411,7 @@ fn pid_window_offset_spreads_adjacent_pids() {
     // signal that distinguishes "diffused" (gap >> 1) from
     // "adjacent collapse" (gap == 1, the bare `pid % 33`
     // shape that this fix replaces). Compute mean absolute
-    // difference; SipHash13 avalanche should give average
+    // difference; AHasher avalanche should give average
     // gap near `max_start / 3` (uniform random walk on a
     // circular space of size N has expected step `N/3`).
     let gaps: Vec<usize> = offsets
@@ -426,7 +426,7 @@ fn pid_window_offset_spreads_adjacent_pids() {
     assert!(
         mean_gap > 5.0,
         "mean offset gap between adjacent pids = {mean_gap:.2}, expected > 5 \
-         (the bare `pid % {max_start}` baseline produces gap = 1; SipHash13 \
+         (the bare `pid % {max_start}` baseline produces gap = 1; AHasher \
          avalanche should produce >> 5). offsets: {offsets:?}",
     );
 }

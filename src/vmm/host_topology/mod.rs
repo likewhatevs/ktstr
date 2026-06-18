@@ -785,7 +785,8 @@ fn try_acquire_all(
 /// slot-rotation loop has a fair chance of finding a free slot
 /// without burning the entire lockfile pool.
 ///
-/// The hash key is `AHasher::default()` — a per-run random
+/// The hasher is `ahash::AHasher` keyed with fixed zero seeds
+/// (`RandomState::with_seeds(0, 0, 0, 0)`); a per-run random
 /// seed would defeat reproducibility for unit-test fixtures and
 /// for any future debug logging that wants to confirm "pid X
 /// picks offset Y for slot N".
