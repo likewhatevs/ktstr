@@ -2418,6 +2418,146 @@ mod tests {
         assert!(formatted.contains("Step[0]"));
     }
 
+    /// Boundary change-detection on the from_phase_buckets path — the
+    /// PRODUCTION success path (`evaluate_vm_result` prefers
+    /// from_phase_buckets over `build`). Two adjacent metric-bearing
+    /// buckets whose avg_imbalance / avg_dsq_depth cross the thresholds
+    /// in the worsening direction must record Degraded changes on the
+    /// ENTERED phase (phases[1]), and the BASELINE phase records none.
+    /// Without this, the 821-869 detection loop ships unverified (a
+    /// wrong threshold, inverted direction, wrong-phase recording, or
+    /// wrong metric field would all slip past the other
+    /// from_phase_buckets tests, which never trigger the loop).
+    #[test]
+    fn from_phase_buckets_detects_boundary_degradation() {
+        use crate::assert::PhaseBucket;
+        use std::collections::BTreeMap;
+        let mut base = BTreeMap::new();
+        base.insert("avg_imbalance_ratio".to_string(), 1.0);
+        base.insert("avg_dsq_depth".to_string(), 1.0);
+        let mut step = BTreeMap::new();
+        step.insert("avg_imbalance_ratio".to_string(), 2.0); // +1.0 > 0.5 threshold
+        step.insert("avg_dsq_depth".to_string(), 6.0); // +5.0 > 3.0 threshold
+        let buckets = vec![
+            PhaseBucket {
+                step_index: 0,
+                label: "BASELINE".to_string(),
+                start_ms: 0,
+                end_ms: 1000,
+                sample_count: 5,
+                metrics: base,
+            },
+            PhaseBucket {
+                step_index: 1,
+                label: "Step[0]".to_string(),
+                start_ms: 1000,
+                end_ms: 6000,
+                sample_count: 20,
+                metrics: step,
+            },
+        ];
+        let t = Timeline::from_phase_buckets(&buckets, &[], &TimelineContext::default());
+        // Change recorded on the ENTERED phase, never the prior one.
+        assert!(
+            t.phases[0].changes.is_empty(),
+            "BASELINE has no prior phase to diff; changes belong to the entered phase",
+        );
+        let changes = &t.phases[1].changes;
+        let imb = changes
+            .iter()
+            .find(|c| c.metric == "imbalance")
+            .expect("imbalance change must fire (1.0 -> 2.0 crosses 0.5)");
+        assert_eq!(imb.direction, ChangeDirection::Degraded);
+        assert!((imb.before - 1.0).abs() < f64::EPSILON);
+        assert!((imb.after - 2.0).abs() < f64::EPSILON);
+        let dsq = changes
+            .iter()
+            .find(|c| c.metric == "dsq_depth")
+            .expect("dsq_depth change must fire (1.0 -> 6.0 crosses 3.0)");
+        assert_eq!(dsq.direction, ChangeDirection::Degraded);
+        assert!((dsq.before - 1.0).abs() < f64::EPSILON);
+        assert!((dsq.after - 6.0).abs() < f64::EPSILON);
+    }
+
+    /// Sub-threshold deltas record NO change — guards a dropped/zeroed
+    /// threshold that would fabricate spurious boundary changes.
+    #[test]
+    fn from_phase_buckets_subthreshold_records_no_change() {
+        use crate::assert::PhaseBucket;
+        use std::collections::BTreeMap;
+        let mut base = BTreeMap::new();
+        base.insert("avg_imbalance_ratio".to_string(), 1.0);
+        base.insert("avg_dsq_depth".to_string(), 1.0);
+        let mut step = BTreeMap::new();
+        step.insert("avg_imbalance_ratio".to_string(), 1.2); // +0.2 < 0.5
+        step.insert("avg_dsq_depth".to_string(), 2.0); // +1.0 < 3.0
+        let buckets = vec![
+            PhaseBucket {
+                step_index: 0,
+                label: "BASELINE".to_string(),
+                start_ms: 0,
+                end_ms: 1000,
+                sample_count: 5,
+                metrics: base,
+            },
+            PhaseBucket {
+                step_index: 1,
+                label: "Step[0]".to_string(),
+                start_ms: 1000,
+                end_ms: 6000,
+                sample_count: 20,
+                metrics: step,
+            },
+        ];
+        let t = Timeline::from_phase_buckets(&buckets, &[], &TimelineContext::default());
+        assert!(
+            t.phases[1].changes.is_empty(),
+            "sub-threshold deltas must not record a boundary change",
+        );
+    }
+
+    /// Decreasing imbalance across the boundary records an IMPROVEMENT —
+    /// locks the higher_is_worse direction so an inverted flag cannot
+    /// report a regression as an improvement (or vice versa).
+    #[test]
+    fn from_phase_buckets_detects_boundary_improvement() {
+        use crate::assert::PhaseBucket;
+        use std::collections::BTreeMap;
+        let mut base = BTreeMap::new();
+        base.insert("avg_imbalance_ratio".to_string(), 2.0);
+        let mut step = BTreeMap::new();
+        step.insert("avg_imbalance_ratio".to_string(), 1.0); // -1.0, |delta|>0.5, after<before
+        let buckets = vec![
+            PhaseBucket {
+                step_index: 0,
+                label: "BASELINE".to_string(),
+                start_ms: 0,
+                end_ms: 1000,
+                sample_count: 5,
+                metrics: base,
+            },
+            PhaseBucket {
+                step_index: 1,
+                label: "Step[0]".to_string(),
+                start_ms: 1000,
+                end_ms: 6000,
+                sample_count: 20,
+                metrics: step,
+            },
+        ];
+        let t = Timeline::from_phase_buckets(&buckets, &[], &TimelineContext::default());
+        let imb = t.phases[1]
+            .changes
+            .iter()
+            .find(|c| c.metric == "imbalance")
+            .expect("imbalance change must fire (2.0 -> 1.0 crosses 0.5)");
+        assert_eq!(
+            imb.direction,
+            ChangeDirection::Improved,
+            "a decreasing imbalance is an improvement, not a degradation",
+        );
+    }
+
     #[test]
     fn from_phase_buckets_zero_duration_window_emits_no_rate() {
         use crate::assert::PhaseBucket;
