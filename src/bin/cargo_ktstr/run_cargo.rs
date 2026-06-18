@@ -324,7 +324,7 @@ fn run_cargo_sub(
     eprintln!("  {}", sidecar_dir.display());
     eprintln!("    *.failure-dump.json       — VM-state JSON when a test crashed or asserted");
     eprintln!("    *.repro.failure-dump.json — VM-state JSON from the auto-repro retry");
-    eprintln!("    *.sidecar.json            — per-scenario stats + scheduler metadata");
+    eprintln!("    *.ktstr.json              — per-scenario stats + scheduler metadata");
     eprintln!("    *.wprof.pb                — Perfetto trace from #[ktstr_test(wprof)] tests");
     eprintln!("    *.repro.wprof.pb          — Perfetto trace from the auto-repro retry");
     eprintln!(

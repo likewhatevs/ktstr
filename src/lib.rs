@@ -1301,7 +1301,7 @@ pub const KTSTR_NO_SKIP_MODE_ENV: &str = "KTSTR_NO_SKIP_MODE";
 pub const KTSTR_BUDGET_SECS_ENV: &str = "KTSTR_BUDGET_SECS";
 
 /// Name of the environment variable that overrides the sidecar
-/// output directory (the per-test `*.sidecar.json` write target).
+/// output directory (the per-test `*.ktstr.json` write target).
 /// Empty / unset falls back to the per-test
 /// `target/ktstr/<run-id>` location. Read at
 /// `crate::test_support::sidecar` +
