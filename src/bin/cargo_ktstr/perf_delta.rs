@@ -112,11 +112,18 @@ pub(crate) struct PerfDeltaArgs<'a> {
     pub default_branch: &'a str,
 }
 
-/// v0: resolve and report the `(baseline, HEAD)` commit pair the run
-/// would A/B-compare, plus the perf-test selector. Always returns 0.
-/// The dual-run (perf-mode tests at HEAD and at the baseline in a gix
-/// worktree) + the `compare_partitions` regression verdict are the
-/// follow-up increment — see task "mergebase perf-delta".
+/// Resolve the `(baseline, HEAD)` commit pair and A/B-compare their
+/// sidecars via the existing `compare_partitions` engine, returning its
+/// exit code (non-zero on a regression). The compare pairs per-scenario
+/// and applies each metric's polarity + abs/rel thresholds.
+///
+/// This increment compares sidecars ALREADY in the pool (the
+/// cached-baseline model: the baseline run's sidecars are present from a
+/// prior run / downloaded artifact). The dual-run that PRODUCES the
+/// baseline run in a gix worktree — and threads the `KTSTR_PERF_ONLY`
+/// selector + the `-E` filter so only perf-mode tests run at both
+/// commits — is the next increment; until it lands, the perf-test
+/// selector is reported but the caller supplies the runs.
 pub(crate) fn run(args: &PerfDeltaArgs<'_>) -> Result<i32> {
     let repo = gix::discover(std::env::current_dir().context("get cwd")?)
         .context("discover git repository")?;
@@ -124,22 +131,44 @@ pub(crate) fn run(args: &PerfDeltaArgs<'_>) -> Result<i32> {
     let sel = select_base(args.base, args.base_ref, env_base.as_deref(), args.default_branch);
     let baseline = short_hash(&repo, resolve_baseline(&repo, &sel)?);
     let head = short_hash(&repo, repo.head_id().context("resolve HEAD")?.detach());
+    if baseline == head {
+        anyhow::bail!(
+            "baseline ({baseline}) resolves to HEAD — nothing to compare; \
+             choose a different --base / --base-ref"
+        );
+    }
     println!("perf-delta: candidate HEAD {head} vs baseline {baseline}");
     match &sel {
         BaseSelection::ExplicitCommit(c) => println!("  baseline: explicit --base {c}"),
         BaseSelection::MergeBaseWith(r) => println!("  baseline: merge-base(HEAD, {r})"),
     }
     println!(
-        "  perf tests: {}",
+        "  perf tests: {} (selected via KTSTR_PERF_ONLY once the dual-run lands)",
         args.filter.unwrap_or("all performance_mode tests")
     );
-    eprintln!(
-        "perf-delta v0: resolved the A/B commit pair only; the dual-run \
-         (perf-mode tests at HEAD and at the baseline) + regression compare \
-         is the next increment"
-    );
-    Ok(0)
+
+    // Reuse the stats-compare engine: partition the pooled sidecars by
+    // project_commit (baseline = A, HEAD = B) and emit the polarity-aware
+    // regression verdict. The resolved short hashes match the sidecar
+    // project_commit format, so they line up with pool entries directly.
+    let build = crate::stats::BuildCompareFilters {
+        a_project_commit: vec![baseline],
+        b_project_commit: vec![head],
+        ..Default::default()
+    };
+    let (filter_a, filter_b) = build.build();
+    let policy = cli::ComparisonPolicy::default();
+    let phase_opts = cli::PhaseDisplayOptions {
+        no_phases: false,
+        phases_only: false,
+        steps_only: false,
+        phase: None,
+        phase_threshold: None,
+    };
+    cli::compare_partitions(&filter_a, &filter_b, None, &policy, None, false, &phase_opts)
 }
+
+use ktstr::cli;
 
 #[cfg(test)]
 mod tests {
