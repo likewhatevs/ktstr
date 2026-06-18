@@ -413,6 +413,103 @@ fn detect_change(
     })
 }
 
+/// Per-boundary change set between two adjacent phases, shared by both
+/// [`Timeline::build`] and [`Timeline::from_phase_buckets`].
+///
+/// Throughput (`iteration_rate`) is compared whenever BOTH phases carry
+/// a rate and the earlier one is positive — INCLUDING a synthesized
+/// zero-capture step, whose rate is stimulus-derived (total_iterations
+/// deltas) rather than sampled. Throughput is the one metric that
+/// survives a capture gap, so a throughput collapse entering or leaving
+/// a synthesized step must still be flagged; gating it on `sample_count`
+/// (as both call sites did before) silently dropped exactly the
+/// degradation this timeline exists to surface.
+///
+/// Asymmetry from the `bi > 0.0` div-by-zero guard: a COLLAPSE into a
+/// zero-rate (incl. a synthesized measured-zero) step is flagged
+/// (before > 0), but a RECOVERY out of one (before == 0 -> positive) is
+/// not — there is no relative baseline to divide by. This is a
+/// deliberate tradeoff, not an oversight: an unchanged zero is genuinely
+/// not a degradation, and the collapse direction (the one this task
+/// targets) is caught.
+///
+/// The monitor-derived metrics (imbalance, dsq depth, fallback rate,
+/// keep_last rate) ARE gated on both phases having real samples. The
+/// values themselves can be real even on a synthesized phase (monitor
+/// windows fold into the bucket), but they come from a DIFFERENT
+/// sampling basis (folded monitor window vs captured periodic samples)
+/// than a captured neighbor's, so cross-comparing them is
+/// apples-to-oranges — suppressed. Throughput is exempt because it is
+/// the same stimulus-derived quantity on both sides.
+fn detect_boundary_changes(before: &PhaseMetrics, after: &PhaseMetrics) -> Vec<PhaseChange> {
+    let mut changes = Vec::new();
+
+    // Monitor-derived metrics (absolute-unit gauges/rates with
+    // fixed-magnitude thresholds) — gated on both phases having real
+    // samples. Pushed FIRST to preserve the historical render order
+    // (these before throughput in a multi-change boundary; format_phases
+    // renders changes in vec order).
+    if before.sample_count > 0 && after.sample_count > 0 {
+        if let (Some(bi), Some(ai)) = (before.avg_imbalance, after.avg_imbalance) {
+            changes.extend(detect_change(
+                bi,
+                ai,
+                IMBALANCE_THRESHOLD,
+                "imbalance",
+                true,
+            ));
+        }
+        if let (Some(bd), Some(ad)) = (before.avg_dsq_depth, after.avg_dsq_depth) {
+            changes.extend(detect_change(bd, ad, DSQ_THRESHOLD, "dsq_depth", true));
+        }
+        if let (Some(bf), Some(af)) = (before.fallback_rate, after.fallback_rate) {
+            changes.extend(detect_change(
+                bf,
+                af,
+                FALLBACK_RATE_THRESHOLD,
+                "fallback",
+                true,
+            ));
+        }
+        if let (Some(bk), Some(ak)) = (before.keep_last_rate, after.keep_last_rate) {
+            changes.extend(detect_change(
+                bk,
+                ak,
+                KEEP_LAST_RATE_THRESHOLD,
+                "keep_last",
+                true,
+            ));
+        }
+    }
+
+    // Throughput is the SOLE rate-class field (counter-delta / elapsed), so
+    // it uses a RELATIVE threshold (rel = (ai-bi)/bi vs
+    // ITERATION_RATE_REL_THRESHOLD) and cannot route through detect_change's
+    // absolute-delta gate above — fixed-unit metrics get absolute
+    // thresholds, this gets a relative one (a semantic-class decision, not
+    // arbitrary). Strict `>`: an exactly-at-threshold relative change is not
+    // flagged. Pushed last so it renders after the monitor metrics.
+    if let (Some(bi), Some(ai)) = (before.iteration_rate, after.iteration_rate)
+        && bi > 0.0
+    {
+        let rel = (ai - bi) / bi;
+        if rel.abs() > ITERATION_RATE_REL_THRESHOLD {
+            changes.push(PhaseChange {
+                direction: if rel < 0.0 {
+                    ChangeDirection::Degraded
+                } else {
+                    ChangeDirection::Improved
+                },
+                metric: "throughput".to_string(),
+                before: bi,
+                after: ai,
+            });
+        }
+    }
+
+    changes
+}
+
 impl Timeline {
     /// Build a timeline from stimulus events and monitor samples.
     ///
@@ -594,63 +691,12 @@ impl Timeline {
             }
         }
 
-        // Detect changes at each phase boundary.
+        // Detect changes at each phase boundary. Throughput is compared
+        // even across synthesized zero-capture steps; monitor-derived
+        // metrics stay gated on both phases having real samples (see
+        // [`detect_boundary_changes`]).
         for i in 1..phases.len() {
-            let before = &phases[i - 1].metrics;
-            let after_metrics = &phases[i].metrics;
-            let mut changes = Vec::new();
-
-            if before.sample_count > 0 && after_metrics.sample_count > 0 {
-                if let (Some(bi), Some(ai)) = (before.avg_imbalance, after_metrics.avg_imbalance) {
-                    changes.extend(detect_change(
-                        bi,
-                        ai,
-                        IMBALANCE_THRESHOLD,
-                        "imbalance",
-                        true,
-                    ));
-                }
-                if let (Some(bd), Some(ad)) = (before.avg_dsq_depth, after_metrics.avg_dsq_depth) {
-                    changes.extend(detect_change(bd, ad, DSQ_THRESHOLD, "dsq_depth", true));
-                }
-                if let (Some(bf), Some(af)) = (before.fallback_rate, after_metrics.fallback_rate) {
-                    changes.extend(detect_change(
-                        bf,
-                        af,
-                        FALLBACK_RATE_THRESHOLD,
-                        "fallback",
-                        true,
-                    ));
-                }
-                if let (Some(bk), Some(ak)) = (before.keep_last_rate, after_metrics.keep_last_rate)
-                {
-                    changes.extend(detect_change(
-                        bk,
-                        ak,
-                        KEEP_LAST_RATE_THRESHOLD,
-                        "keep_last",
-                        true,
-                    ));
-                }
-                if let (Some(bi), Some(ai)) = (before.iteration_rate, after_metrics.iteration_rate)
-                    && bi > 0.0
-                {
-                    let rel_delta = (ai - bi) / bi;
-                    if rel_delta.abs() > ITERATION_RATE_REL_THRESHOLD {
-                        changes.push(PhaseChange {
-                            direction: if rel_delta < 0.0 {
-                                ChangeDirection::Degraded
-                            } else {
-                                ChangeDirection::Improved
-                            },
-                            metric: "throughput".to_string(),
-                            before: bi,
-                            after: ai,
-                        });
-                    }
-                }
-            }
-
+            let changes = detect_boundary_changes(&phases[i - 1].metrics, &phases[i].metrics);
             phases[i].changes = changes;
         }
 
@@ -892,75 +938,19 @@ impl Timeline {
             .into_iter()
             .map(|b| phase_from_bucket(b, &sorted_events))
             .collect();
-        // Boundary-change detection — same per-pair diffing logic
-        // [`Self::build`] applies. Walks each adjacent (prev, curr)
-        // pair and records significant deltas on the LATER phase's
-        // `changes` vec so the operator sees "what changed when
-        // entering this phase". Skips pairs where either side had
-        // no samples — those phases produce default-zero metrics
-        // and a diff would falsely paint every metric as changed.
-        // A SYNTHESIZED zero-capture bucket
-        // (build_phase_buckets_with_stimulus) also has sample_count 0, so
-        // it is excluded here even though it now carries real
-        // monitor-derived metrics + iteration_rate: the boundary-diff
-        // stays conservative (no phantom change from a partial-metric
-        // phase), and a captured neighbor flanking a synthesized step is
-        // not diffed against it. The synthesized step's metrics remain
-        // available via the structured API and the per-phase render.
+        // Boundary-change detection — shares [`detect_boundary_changes`]
+        // with [`Self::build`]. Walks each adjacent (prev, curr) pair and
+        // records significant deltas on the LATER phase's `changes` vec so
+        // the operator sees "what changed when entering this phase".
+        // Throughput is compared even when a side is a SYNTHESIZED
+        // zero-capture bucket (build_phase_buckets_with_stimulus): its
+        // `iteration_rate` is stimulus-derived and real, so a throughput
+        // collapse entering or leaving it must surface. The monitor-derived
+        // metrics (imbalance / dsq depth / fallback / keep_last) stay gated
+        // inside the helper on both phases having real samples, so a
+        // partial-metric phase never paints a phantom non-throughput change.
         for i in 1..phases.len() {
-            let before = phases[i - 1].metrics.clone();
-            let after = &phases[i].metrics;
-            if before.sample_count == 0 || after.sample_count == 0 {
-                continue;
-            }
-            let mut changes = Vec::new();
-            if let (Some(bi), Some(ai)) = (before.avg_imbalance, after.avg_imbalance) {
-                changes.extend(detect_change(
-                    bi,
-                    ai,
-                    IMBALANCE_THRESHOLD,
-                    "imbalance",
-                    true,
-                ));
-            }
-            if let (Some(bd), Some(ad)) = (before.avg_dsq_depth, after.avg_dsq_depth) {
-                changes.extend(detect_change(bd, ad, DSQ_THRESHOLD, "dsq_depth", true));
-            }
-            if let (Some(bf), Some(af)) = (before.fallback_rate, after.fallback_rate) {
-                changes.extend(detect_change(
-                    bf,
-                    af,
-                    FALLBACK_RATE_THRESHOLD,
-                    "fallback",
-                    true,
-                ));
-            }
-            if let (Some(bk), Some(ak)) = (before.keep_last_rate, after.keep_last_rate) {
-                changes.extend(detect_change(
-                    bk,
-                    ak,
-                    KEEP_LAST_RATE_THRESHOLD,
-                    "keep_last",
-                    true,
-                ));
-            }
-            if let (Some(bi), Some(ai)) = (before.iteration_rate, after.iteration_rate)
-                && bi > 0.0
-            {
-                let rel = (ai - bi) / bi;
-                if rel.abs() > ITERATION_RATE_REL_THRESHOLD {
-                    changes.push(PhaseChange {
-                        direction: if rel < 0.0 {
-                            ChangeDirection::Degraded
-                        } else {
-                            ChangeDirection::Improved
-                        },
-                        metric: "throughput".to_string(),
-                        before: bi,
-                        after: ai,
-                    });
-                }
-            }
+            let changes = detect_boundary_changes(&phases[i - 1].metrics, &phases[i].metrics);
             phases[i].changes = changes;
         }
         Self { phases }
@@ -1000,10 +990,7 @@ impl Timeline {
 /// `stimulus = None`; later phases synthesize a [`StimulusEvent`] whose
 /// label / op_kind come from the bucket label so the failure-message
 /// renderer prints a recognizable phase header.
-fn phase_from_bucket(
-    b: &crate::assert::PhaseBucket,
-    sorted_events: &[&StimulusEvent],
-) -> Phase {
+fn phase_from_bucket(b: &crate::assert::PhaseBucket, sorted_events: &[&StimulusEvent]) -> Phase {
     let duration_s = if b.end_ms > b.start_ms {
         (b.end_ms - b.start_ms) as f64 / 1000.0
     } else {
@@ -1395,10 +1382,7 @@ mod tests {
                 start_ms: 1000,
                 end_ms: 2000,
                 sample_count: 0, // synthesized zero-capture step
-                metrics: std::collections::BTreeMap::from([(
-                    "iteration_rate".to_string(),
-                    1500.0,
-                )]),
+                metrics: std::collections::BTreeMap::from([("iteration_rate".to_string(), 1500.0)]),
             },
         ];
         let t = Timeline::from_phase_buckets(&buckets, &[], &TimelineContext::default());
@@ -2187,6 +2171,136 @@ mod tests {
         assert!(detect_change(1.0, 1.5, 0.5, "imbalance", true).is_none());
     }
 
+    // -- detect_boundary_changes: throughput across synthesized steps --
+
+    /// Throughput is flagged across a SYNTHESIZED zero-capture phase
+    /// (sample_count 0) — its iteration_rate is stimulus-derived and
+    /// real — while monitor-derived metrics stay gated on samples, so
+    /// the synthesized side never paints a phantom imbalance change.
+    /// This is the collapse-suppression invariant: a throughput collapse entering or
+    /// leaving a capture-free step must not be silently dropped.
+    #[test]
+    fn detect_boundary_changes_flags_throughput_across_synthesized_phase() {
+        let before = PhaseMetrics {
+            sample_count: 30,
+            iteration_rate: Some(1000.0),
+            avg_imbalance: Some(1.0),
+            ..Default::default()
+        };
+        let after = PhaseMetrics {
+            sample_count: 0,             // synthesized zero-capture step
+            iteration_rate: Some(300.0), // 70% collapse
+            avg_imbalance: Some(99.0),   // partial/default — must be ignored
+            ..Default::default()
+        };
+        let changes = detect_boundary_changes(&before, &after);
+        let throughput: Vec<_> = changes
+            .iter()
+            .filter(|c| c.metric == "throughput")
+            .collect();
+        assert_eq!(
+            throughput.len(),
+            1,
+            "throughput collapse across a synthesized step must be flagged: {changes:?}",
+        );
+        assert_eq!(throughput[0].direction, ChangeDirection::Degraded);
+        assert!(
+            !changes.iter().any(|c| c.metric == "imbalance"),
+            "monitor metrics must stay gated when a side has 0 samples: {changes:?}",
+        );
+    }
+
+    /// The monitor-metric gate only suppresses a ZERO-sample side: when
+    /// both phases captured samples, monitor-derived changes still
+    /// surface. Guards the collapse suppression from over-suppressing the normal
+    /// captured-to-captured boundary.
+    #[test]
+    fn detect_boundary_changes_reports_monitor_metrics_when_both_sampled() {
+        let before = PhaseMetrics {
+            sample_count: 30,
+            iteration_rate: Some(1000.0),
+            avg_imbalance: Some(1.0),
+            ..Default::default()
+        };
+        let after = PhaseMetrics {
+            sample_count: 30,
+            iteration_rate: Some(1000.0), // unchanged throughput
+            avg_imbalance: Some(5.0),     // imbalance jump > IMBALANCE_THRESHOLD
+            ..Default::default()
+        };
+        let changes = detect_boundary_changes(&before, &after);
+        assert!(
+            changes.iter().any(|c| c.metric == "imbalance"),
+            "imbalance change must surface when both sides sampled: {changes:?}",
+        );
+        assert!(
+            !changes.iter().any(|c| c.metric == "throughput"),
+            "unchanged throughput must not be flagged: {changes:?}",
+        );
+    }
+
+    /// Throughput uses a STRICT relative threshold: a change of exactly
+    /// ITERATION_RATE_REL_THRESHOLD (30%) is NOT flagged. Pins the `>`
+    /// boundary so a future `>` -> `>=` flip is caught (the absolute
+    /// detect_change gate is a different code path, tested separately).
+    #[test]
+    fn detect_boundary_changes_throughput_exactly_at_threshold_not_flagged() {
+        let before = PhaseMetrics {
+            sample_count: 30,
+            iteration_rate: Some(1000.0),
+            ..Default::default()
+        };
+        let after = PhaseMetrics {
+            sample_count: 30,
+            iteration_rate: Some(700.0), // rel = -0.3 exactly
+            ..Default::default()
+        };
+        assert_eq!((700.0 - 1000.0) / 1000.0, -ITERATION_RATE_REL_THRESHOLD);
+        assert!(
+            !detect_boundary_changes(&before, &after)
+                .iter()
+                .any(|c| c.metric == "throughput"),
+            "an exactly-30% relative change must not flag (strict >)",
+        );
+    }
+
+    /// synthesized -> synthesized boundary (BOTH sides sample_count 0,
+    /// both carrying a real stimulus-derived rate): throughput is still
+    /// compared (the gate is symmetric and sample_count-independent for
+    /// throughput) and monitor metrics stay suppressed on both sides.
+    /// Pins the zero->zero cell of the transition matrix against a future
+    /// edit that re-couples throughput to a per-side sample_count check.
+    #[test]
+    fn detect_boundary_changes_synthesized_to_synthesized_flags_throughput() {
+        let before = PhaseMetrics {
+            sample_count: 0,
+            iteration_rate: Some(1000.0),
+            avg_imbalance: Some(1.0),
+            ..Default::default()
+        };
+        let after = PhaseMetrics {
+            sample_count: 0,
+            iteration_rate: Some(300.0), // 70% collapse
+            avg_imbalance: Some(99.0),   // wild — must stay gated
+            ..Default::default()
+        };
+        let changes = detect_boundary_changes(&before, &after);
+        let throughput: Vec<_> = changes
+            .iter()
+            .filter(|c| c.metric == "throughput")
+            .collect();
+        assert_eq!(
+            throughput.len(),
+            1,
+            "zero->zero throughput collapse must flag: {changes:?}"
+        );
+        assert_eq!(throughput[0].direction, ChangeDirection::Degraded);
+        assert!(
+            !changes.iter().any(|c| c.metric == "imbalance"),
+            "monitor metrics gated on both zero-sample sides: {changes:?}",
+        );
+    }
+
     // -- iteration_rate computation tests --
 
     fn stimulus_with_iters(elapsed_ms: u64, label: &str, total_iterations: u64) -> StimulusEvent {
@@ -2739,6 +2853,70 @@ mod tests {
         assert!(formatted.contains("--- timeline ---"));
         assert!(formatted.contains("BASELINE"));
         assert!(formatted.contains("Step[0]"));
+    }
+
+    /// Collapse-suppression production path: a throughput collapse INTO a synthesized
+    /// zero-capture step surfaces through from_phase_buckets (the path
+    /// `evaluate_vm_result` prefers), not only via the helper unit test.
+    /// BASELINE captures samples + an iteration_rate; Step[0] is
+    /// synthesized (sample_count 0) with a collapsed iteration_rate AND a
+    /// divergent imbalance that must stay gated. Re-adding the old
+    /// `if sample_count==0 { continue }` gate at this call site makes
+    /// phases[1].changes empty, so this test fails — it is the
+    /// regression pin for the removed gate. The producer half — that
+    /// build_phase_buckets_with_stimulus actually populates a synthesized
+    /// bucket's iteration_rate from stimulus deltas — is pinned by
+    /// assert::tests_phase_bucket::build_phase_buckets_with_stimulus_synthesizes_zero_capture_step_bucket;
+    /// together they pin the full producer->consumer chain.
+    #[test]
+    fn from_phase_buckets_flags_throughput_into_synthesized_step() {
+        use crate::assert::PhaseBucket;
+        use std::collections::BTreeMap;
+        let mut baseline_metrics = BTreeMap::new();
+        baseline_metrics.insert("iteration_rate".to_string(), 1000.0);
+        baseline_metrics.insert("avg_imbalance_ratio".to_string(), 1.0);
+        let mut step_metrics = BTreeMap::new();
+        step_metrics.insert("iteration_rate".to_string(), 300.0); // 70% collapse
+        step_metrics.insert("avg_imbalance_ratio".to_string(), 99.0); // must stay gated
+        let buckets = vec![
+            PhaseBucket {
+                step_index: 0,
+                label: "BASELINE".to_string(),
+                start_ms: 0,
+                end_ms: 1000,
+                sample_count: 5,
+                metrics: baseline_metrics,
+            },
+            PhaseBucket {
+                step_index: 1,
+                label: "Step[0]".to_string(),
+                start_ms: 1000,
+                end_ms: 6000,
+                sample_count: 0, // synthesized zero-capture step
+                metrics: step_metrics,
+            },
+        ];
+        let t = Timeline::from_phase_buckets(&buckets, &[], &TimelineContext::default());
+        assert_eq!(t.phases[1].metrics.sample_count, 0);
+        assert_eq!(t.phases[1].metrics.iteration_rate, Some(300.0));
+        let throughput: Vec<_> = t.phases[1]
+            .changes
+            .iter()
+            .filter(|c| c.metric == "throughput")
+            .collect();
+        assert_eq!(
+            throughput.len(),
+            1,
+            "throughput collapse into a synthesized step must surface via \
+             from_phase_buckets: {:?}",
+            t.phases[1].changes,
+        );
+        assert_eq!(throughput[0].direction, ChangeDirection::Degraded);
+        assert!(
+            !t.phases[1].changes.iter().any(|c| c.metric == "imbalance"),
+            "monitor metrics must stay gated for a zero-sample side: {:?}",
+            t.phases[1].changes,
+        );
     }
 
     /// Boundary change-detection on the from_phase_buckets path — the

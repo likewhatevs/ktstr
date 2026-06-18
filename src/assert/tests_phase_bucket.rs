@@ -1715,7 +1715,11 @@ fn build_phase_buckets_with_stimulus_synthesizes_zero_capture_step_bucket() {
         is_terminal: false,
         is_step_end: false,
     };
-    let stimulus = vec![start(1000, 1, 0), start(2000, 2, 1000), start(3000, 3, 2000)];
+    let stimulus = vec![
+        start(1000, 1, 0),
+        start(2000, 2, 1000),
+        start(3000, 3, 2000),
+    ];
     let phases = crate::assert::build_phase_buckets_with_stimulus(&samples, &stimulus);
 
     let step2 = phases
@@ -1894,14 +1898,17 @@ fn build_phase_buckets_with_stimulus_sched_died_last_step_yields_empty_present_b
     );
 }
 
-/// A synthesized (sample_count == 0) bucket between two captured phases
-/// must NOT produce a phantom boundary change in Timeline: the
-/// change-detection skips any pair touching a zero-sample bucket, so a
-/// synthesized bucket's wild/absent metrics never flag a spurious
-/// change on its neighbors.
+/// A synthesized (sample_count == 0) bucket between two captured phases:
+/// its STIMULUS-DERIVED throughput (iteration_rate) is a real measurement
+/// that survives the capture gap, so a collapse INTO it and a recovery
+/// OUT of it ARE flagged (the #12 fix). Its monitor-derived metrics
+/// (avg_imbalance) come from a different sampling basis on a zero-sample
+/// phase, so they stay SUPPRESSED — a wild synthesized imbalance never
+/// flags a phantom change while a real throughput change does. Pins the
+/// behavior the pre-#12 blanket sample_count gate got wrong.
 #[test]
-fn synthesized_zero_sample_bucket_produces_no_phantom_timeline_change() {
-    use crate::timeline::{Timeline, TimelineContext};
+fn synthesized_zero_sample_bucket_flags_throughput_not_phantom_monitor() {
+    use crate::timeline::{ChangeDirection, Timeline, TimelineContext};
     let captured = |k: u16, imbalance: f64, rate: f64| crate::assert::PhaseBucket {
         step_index: k,
         label: format!("Step[{}]", k.saturating_sub(1)),
@@ -1913,8 +1920,9 @@ fn synthesized_zero_sample_bucket_produces_no_phantom_timeline_change() {
             ("iteration_rate".to_string(), rate),
         ]),
     };
-    // step 1 + step 3 steady & captured; step 2 synthesized with WILD
-    // metrics but sample_count == 0.
+    // step 1 + step 3 steady & captured; step 2 synthesized with a WILD
+    // imbalance (monitor — must stay gated) AND a real collapsed
+    // stimulus-derived throughput (must flag).
     let buckets = vec![
         captured(1, 1.0, 1000.0),
         crate::assert::PhaseBucket {
@@ -1931,15 +1939,51 @@ fn synthesized_zero_sample_bucket_produces_no_phantom_timeline_change() {
         captured(3, 1.0, 1000.0),
     ];
     let timeline = Timeline::from_phase_buckets(&buckets, &[], &TimelineContext::default());
+    // No phase flags a monitor (imbalance) change — the wild synthesized
+    // imbalance is gated off on both boundaries it touches.
     assert!(
-        timeline.phases.iter().all(|p| p.changes.is_empty()),
-        "a zero-sample synthesized bucket must not flag a phantom change on \
-         its neighbors; got {:?}",
         timeline
             .phases
             .iter()
-            .map(|p| (p.index, p.changes.len()))
+            .all(|p| !p.changes.iter().any(|c| c.metric == "imbalance")),
+        "a zero-sample bucket's wild imbalance must not flag a phantom change; got {:?}",
+        timeline
+            .phases
+            .iter()
+            .map(|p| (p.index, p.changes.clone()))
             .collect::<Vec<_>>(),
+    );
+    // Phase index 1 = boundary INTO the synthesized step: throughput
+    // 1000 -> 10 is a real collapse, flagged Degraded. Pin the phase
+    // index so a reorder can't mis-target the boundary while finding a
+    // throughput change of the expected direction by coincidence.
+    let into_synth = &timeline.phases[1];
+    assert_eq!(
+        into_synth.index, 2,
+        "phases[1] is step_index 2 (the synthesized step)"
+    );
+    assert!(
+        into_synth
+            .changes
+            .iter()
+            .any(|c| c.metric == "throughput" && c.direction == ChangeDirection::Degraded),
+        "throughput collapse into the synthesized step must flag Degraded; got {:?}",
+        into_synth.changes,
+    );
+    // Phase index 2 = boundary OUT of the synthesized step: throughput
+    // 10 -> 1000 recovery flagged Improved (before == 10 > 0).
+    let out_of_synth = &timeline.phases[2];
+    assert_eq!(
+        out_of_synth.index, 3,
+        "phases[2] is step_index 3 (the captured step after)"
+    );
+    assert!(
+        out_of_synth
+            .changes
+            .iter()
+            .any(|c| c.metric == "throughput" && c.direction == ChangeDirection::Improved),
+        "throughput recovery out of the synthesized step must flag Improved; got {:?}",
+        out_of_synth.changes,
     );
 }
 
@@ -2092,8 +2136,7 @@ fn build_phase_buckets_with_stimulus_synthesized_bucket_folds_full_monitor_set()
         ..Default::default()
     };
     // No captures -> step 1 synthesizes; StepStart[2] bounds its window.
-    let samples =
-        SampleSeries::from_drained_typed(Vec::<DrainedSnapshotEntry>::new(), Some(mon));
+    let samples = SampleSeries::from_drained_typed(Vec::<DrainedSnapshotEntry>::new(), Some(mon));
     let start = |elapsed_ms: u64, k: u16| StimulusEvent {
         elapsed_ms,
         label: format!("StepStart[{k}]"),
@@ -2117,8 +2160,16 @@ fn build_phase_buckets_with_stimulus_synthesized_bucket_folds_full_monitor_set()
     assert_eq!(g("max_imbalance_ratio"), Some(2.0), "max imbalance");
     assert_eq!(g("avg_dsq_depth"), Some(2.0), "avg dsq depth");
     assert_eq!(g("max_dsq_depth"), Some(3.0), "max dsq depth");
-    assert_eq!(g("total_fallback"), Some(100.0), "fallback counter delta 110-10");
-    assert_eq!(g("total_keep_last"), Some(50.0), "keep_last counter delta 55-5");
+    assert_eq!(
+        g("total_fallback"),
+        Some(100.0),
+        "fallback counter delta 110-10"
+    );
+    assert_eq!(
+        g("total_keep_last"),
+        Some(50.0),
+        "keep_last counter delta 55-5"
+    );
     // avg_imbalance_ratio was folded pre-fix too; still present.
     assert_eq!(g("avg_imbalance_ratio"), Some(2.0), "avg imbalance");
 }
@@ -2140,8 +2191,7 @@ fn build_phase_buckets_with_stimulus_synthesized_inverted_window_folds_nothing()
         samples: vec![MonitorSample::new(1500, vec![cpu(6), cpu(2)])],
         ..Default::default()
     };
-    let samples =
-        SampleSeries::from_drained_typed(Vec::<DrainedSnapshotEntry>::new(), Some(mon));
+    let samples = SampleSeries::from_drained_typed(Vec::<DrainedSnapshotEntry>::new(), Some(mon));
     let ev = |elapsed_ms: u64, k: u16, is_step_end: bool| StimulusEvent {
         elapsed_ms,
         label: format!("Step{}[{k}]", if is_step_end { "End" } else { "Start" }),
@@ -2196,8 +2246,7 @@ fn build_phase_buckets_with_stimulus_synthesized_end_ms_clamps_to_terminal() {
         ],
         ..Default::default()
     };
-    let samples =
-        SampleSeries::from_drained_typed(Vec::<DrainedSnapshotEntry>::new(), Some(mon));
+    let samples = SampleSeries::from_drained_typed(Vec::<DrainedSnapshotEntry>::new(), Some(mon));
     let start = StimulusEvent {
         elapsed_ms: 1000,
         label: "StepStart[1]".to_string(),
@@ -2218,8 +2267,7 @@ fn build_phase_buckets_with_stimulus_synthesized_end_ms_clamps_to_terminal() {
         is_terminal: true,
         is_step_end: false,
     };
-    let phases =
-        crate::assert::build_phase_buckets_with_stimulus(&samples, &[start, terminal]);
+    let phases = crate::assert::build_phase_buckets_with_stimulus(&samples, &[start, terminal]);
     let step1 = phases
         .iter()
         .find(|p| p.step_index == 1)
@@ -2343,10 +2391,27 @@ fn build_phase_buckets_with_stimulus_none_offset_falls_back_to_stamped_step() {
     );
     // The captures stayed in buckets 1/2 (one each) — NOT collapsed into a
     // single step-5 bucket. Step 5 is the synthesized, capture-free one.
-    let count = |k: u16| phases.iter().find(|p| p.step_index == k).map(|p| p.sample_count);
-    assert_eq!(count(1), Some(1), "capture stamped 1 stays in its own bucket");
-    assert_eq!(count(2), Some(1), "capture stamped 2 stays in its own bucket");
-    assert_eq!(count(5), Some(0), "step 5 is the synthesized capture-free bucket");
+    let count = |k: u16| {
+        phases
+            .iter()
+            .find(|p| p.step_index == k)
+            .map(|p| p.sample_count)
+    };
+    assert_eq!(
+        count(1),
+        Some(1),
+        "capture stamped 1 stays in its own bucket"
+    );
+    assert_eq!(
+        count(2),
+        Some(1),
+        "capture stamped 2 stays in its own bucket"
+    );
+    assert_eq!(
+        count(5),
+        Some(0),
+        "step 5 is the synthesized capture-free bucket"
+    );
 }
 
 /// Iteration-rate attribution regression: in the production shape (periodic captures carry
