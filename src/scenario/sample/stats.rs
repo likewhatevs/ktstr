@@ -478,6 +478,21 @@ mod tests {
             !names.contains(&"name"),
             "String key must be excluded — every u64 projection errors: {names:?}",
         );
+        // Pin the projected VALUES, not just the kept names: the kept
+        // name is the bare key label, but the value resolves through
+        // join_paths(path, key) — a wrong-leaf or wrong-cast bug keeps
+        // the name while corrupting the value, which a name-only check
+        // misses (mirror of bpf.rs).
+        let busy = fields.iter().find(|(n, _)| n == "busy").expect("busy kept");
+        assert_eq!(
+            busy.1.values_iter().filter_map(|r| r.as_ref().ok().copied()).collect::<Vec<u64>>(),
+            vec![50u64, 60],
+        );
+        let count = fields.iter().find(|(n, _)| n == "count").expect("count kept");
+        assert_eq!(
+            count.1.values_iter().filter_map(|r| r.as_ref().ok().copied()).collect::<Vec<u64>>(),
+            vec![7u64, 9],
+        );
     }
 
     /// Mirror of the u64 test for `f64_fields`. `busy`, `count`,
@@ -519,6 +534,29 @@ mod tests {
             !names.contains(&"name"),
             "String key must be excluded — every f64 projection errors: {names:?}",
         );
+        // Pin the projected f64 VALUES. `count` (a second integer key)
+        // catches a wrong-leaf bug; `ratio` (the only non-integer
+        // fraction) catches a fraction-mangling bug — neither is value-
+        // checked elsewhere.
+        let getf = |n: &str| -> Vec<f64> {
+            fields
+                .iter()
+                .find(|(name, _)| name == n)
+                .unwrap_or_else(|| panic!("{n} kept"))
+                .1
+                .values_iter()
+                .filter_map(|r| r.as_ref().ok().copied())
+                .collect()
+        };
+        let approx = |got: Vec<f64>, want: &[f64]| {
+            assert_eq!(got.len(), want.len());
+            for (g, w) in got.iter().zip(want) {
+                assert!((g - w).abs() < f64::EPSILON, "got {got:?} want {want:?}");
+            }
+        };
+        approx(getf("busy"), &[50.0, 60.0]);
+        approx(getf("count"), &[7.0, 9.0]);
+        approx(getf("ratio"), &[0.5, 0.5]);
     }
 
     /// Empty series — no rows to discover JSON keys from, so
