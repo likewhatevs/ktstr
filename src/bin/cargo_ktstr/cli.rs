@@ -228,6 +228,32 @@ pub(crate) enum KtstrCommand {
         #[arg(long)]
         exec: bool,
     },
+    /// Resolve the baseline commit a perf run is compared against — the
+    /// branch merge-base, a PR target via `$GITHUB_BASE_REF`, or an
+    /// explicit `--base` override — and report the A/B commit pair the
+    /// regression compare pairs on. v0 reports the resolution; the
+    /// dual-run (perf-mode tests at HEAD and at the baseline) + the
+    /// `stats compare` regression verdict are a follow-up increment.
+    PerfDelta {
+        /// Override the baseline commit directly (skips merge-base). The
+        /// testability / cached-baseline knob: diff HEAD against any
+        /// chosen commit without a real branch divergence.
+        #[arg(long)]
+        base: Option<String>,
+        /// Override the ref to diverge from (merge-base against it).
+        /// Defaults to `$GITHUB_BASE_REF` (as `origin/<ref>`) on a PR,
+        /// else `--default-branch`.
+        #[arg(long)]
+        base_ref: Option<String>,
+        /// Nextest `-E` filter narrowing within the `performance_mode`
+        /// test set the run selects by default.
+        #[arg(long, short = 'E')]
+        filter: Option<String>,
+        /// Branch to merge-base against when neither `--base` /
+        /// `--base-ref` nor `$GITHUB_BASE_REF` is set.
+        #[arg(long, default_value = "main")]
+        default_branch: String,
+    },
     /// Manage cached kernel images.
     Kernel {
         #[command(subcommand)]

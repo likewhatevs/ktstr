@@ -92,6 +92,55 @@ fn parse_compare(extra: &[&str]) -> StatsCommand {
     sc
 }
 
+#[test]
+fn parse_perf_delta_flags_and_defaults() {
+    // Explicit flags round-trip (kebab-case subcommand `perf-delta`).
+    let Cargo {
+        command: CargoSub::Ktstr(k),
+    } = Cargo::try_parse_from([
+        "cargo",
+        "ktstr",
+        "perf-delta",
+        "--base",
+        "abc123",
+        "--base-ref",
+        "release",
+        "-E",
+        "perf::",
+    ])
+    .unwrap_or_else(|e| panic!("{e}"));
+    match k.command {
+        KtstrCommand::PerfDelta {
+            base,
+            base_ref,
+            filter,
+            default_branch,
+        } => {
+            assert_eq!(base.as_deref(), Some("abc123"));
+            assert_eq!(base_ref.as_deref(), Some("release"));
+            assert_eq!(filter.as_deref(), Some("perf::"));
+            assert_eq!(default_branch, "main", "default branch defaults to main");
+        }
+        _ => panic!("expected PerfDelta"),
+    }
+    // Bare invocation: overrides None, default branch = main.
+    let Cargo {
+        command: CargoSub::Ktstr(k),
+    } = Cargo::try_parse_from(["cargo", "ktstr", "perf-delta"]).unwrap_or_else(|e| panic!("{e}"));
+    match k.command {
+        KtstrCommand::PerfDelta {
+            base,
+            base_ref,
+            filter,
+            default_branch,
+        } => {
+            assert!(base.is_none() && base_ref.is_none() && filter.is_none());
+            assert_eq!(default_branch, "main");
+        }
+        _ => panic!("expected PerfDelta"),
+    }
+}
+
 /// Build a `cargo ktstr <subcommand> -- <passthrough...>` invocation,
 /// parse it, and assert that the trailing args round-trip verbatim
 /// into the variant's `args` Vec without spuriously populating any

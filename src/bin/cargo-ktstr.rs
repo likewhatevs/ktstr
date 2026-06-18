@@ -46,6 +46,8 @@ mod cli;
 mod kernel;
 #[path = "cargo_ktstr/misc/mod.rs"]
 mod misc;
+#[path = "cargo_ktstr/perf_delta.rs"]
+mod perf_delta;
 #[path = "cargo_ktstr/replay.rs"]
 mod replay;
 #[path = "cargo_ktstr/run_cargo.rs"]
@@ -154,6 +156,24 @@ fn main() {
         KtstrCommand::Stats { ref command } => stats::run_stats(command),
         KtstrCommand::Replay { dir, filter, exec } => {
             match replay::run_replay(dir.as_deref(), filter.as_deref(), exec) {
+                Ok(0) => Ok(()),
+                Ok(code) => std::process::exit(code),
+                Err(e) => Err(format!("{e:#}")),
+            }
+        }
+        KtstrCommand::PerfDelta {
+            base,
+            base_ref,
+            filter,
+            default_branch,
+        } => {
+            let args = perf_delta::PerfDeltaArgs {
+                base: base.as_deref(),
+                base_ref: base_ref.as_deref(),
+                filter: filter.as_deref(),
+                default_branch: &default_branch,
+            };
+            match perf_delta::run(&args) {
                 Ok(0) => Ok(()),
                 Ok(code) => std::process::exit(code),
                 Err(e) => Err(format!("{e:#}")),
