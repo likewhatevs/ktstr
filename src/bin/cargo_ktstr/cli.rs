@@ -277,6 +277,50 @@ pub(crate) enum KtstrCommand {
         /// `cargo ktstr stats compare --help` for the schema.
         #[arg(long, conflicts_with = "threshold")]
         policy: Option<std::path::PathBuf>,
+        /// Suppress the per-phase delta tables entirely. Mutually
+        /// exclusive with every other phase flag.
+        #[arg(
+            long = "no-phases",
+            help_heading = "Phase rendering",
+            conflicts_with_all = ["phases_only", "steps_only", "phase", "phase_threshold"],
+        )]
+        no_phases: bool,
+        /// Show ONLY the per-phase tables; suppress the scalar
+        /// findings table and footer. Composes with `--steps-only`,
+        /// `--phase`, and `--phase-threshold`.
+        #[arg(
+            long = "phases-only",
+            help_heading = "Phase rendering",
+            conflicts_with = "no_phases"
+        )]
+        phases_only: bool,
+        /// Within the per-phase tables, suppress the BASELINE bucket
+        /// (`step_index == 0`). Mutually exclusive with `--phase`.
+        #[arg(
+            long = "steps-only",
+            help_heading = "Phase rendering",
+            conflicts_with_all = ["no_phases", "phase"],
+        )]
+        steps_only: bool,
+        /// Show only the named per-phase index. `0` selects BASELINE;
+        /// `1..=N` select scenario Step ordinals. Mutually exclusive
+        /// with `--steps-only`.
+        #[arg(
+            long = "phase",
+            help_heading = "Phase rendering",
+            conflicts_with_all = ["no_phases", "steps_only"],
+        )]
+        phase: Option<u16>,
+        /// Per-row relative-delta gate for the per-phase tables:
+        /// suppress paired rows whose `|delta| / max(|a|, 1.0) < PCT /
+        /// 100.0`. Independent from `--threshold`. Mutually exclusive
+        /// with `--no-phases`.
+        #[arg(
+            long = "phase-threshold",
+            help_heading = "Phase rendering",
+            conflicts_with = "no_phases"
+        )]
+        phase_threshold: Option<f64>,
     },
     /// Manage cached kernel images.
     Kernel {

@@ -170,6 +170,11 @@ fn main() {
             dual_run,
             threshold,
             policy,
+            no_phases,
+            phases_only,
+            steps_only,
+            phase,
+            phase_threshold,
         } => {
             let args = perf_delta::PerfDeltaArgs {
                 base: base.as_deref(),
@@ -180,6 +185,13 @@ fn main() {
                 dual_run,
                 threshold,
                 policy: policy.as_deref(),
+                phase_display: ktstr::cli::PhaseDisplayOptions {
+                    no_phases,
+                    phases_only,
+                    steps_only,
+                    phase,
+                    phase_threshold,
+                },
             };
             match perf_delta::run(&args) {
                 Ok(0) => Ok(()),

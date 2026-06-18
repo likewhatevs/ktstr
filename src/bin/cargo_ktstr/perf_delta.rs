@@ -334,6 +334,11 @@ pub(crate) struct PerfDeltaArgs<'a> {
     /// `--policy <PATH>` — per-metric threshold JSON. Mutually
     /// exclusive with `threshold`.
     pub policy: Option<&'a std::path::Path>,
+    /// Per-phase render projection (`--no-phases` / `--phases-only` /
+    /// `--steps-only` / `--phase` / `--phase-threshold`), threaded to
+    /// the compare's `PhaseDisplayOptions`. Render-only — does not
+    /// change the regression verdict / exit code.
+    pub phase_display: cli::PhaseDisplayOptions,
 }
 
 /// Resolve the `(baseline, HEAD)` commit pair and A/B-compare their
@@ -415,14 +420,15 @@ pub(crate) fn run(args: &PerfDeltaArgs<'_>) -> Result<i32> {
     // falls through to the registry per-metric defaults.
     let policy = cli::ComparisonPolicy::from_cli_flags(args.threshold, args.policy)
         .context("resolve --threshold / --policy")?;
-    let phase_opts = cli::PhaseDisplayOptions {
-        no_phases: false,
-        phases_only: false,
-        steps_only: false,
-        phase: None,
-        phase_threshold: None,
-    };
-    cli::compare_partitions(&filter_a, &filter_b, None, &policy, None, false, &phase_opts)
+    cli::compare_partitions(
+        &filter_a,
+        &filter_b,
+        None,
+        &policy,
+        None,
+        false,
+        &args.phase_display,
+    )
 }
 
 use ktstr::cli;

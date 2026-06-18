@@ -112,6 +112,9 @@ fn parse_perf_delta_flags_and_defaults() {
         "--dual-run",
         "--threshold",
         "12.5",
+        "--phases-only",
+        "--phase-threshold",
+        "5",
     ])
     .unwrap_or_else(|e| panic!("{e}"));
     match k.command {
@@ -124,6 +127,11 @@ fn parse_perf_delta_flags_and_defaults() {
             dual_run,
             threshold,
             policy,
+            no_phases,
+            phases_only,
+            steps_only,
+            phase,
+            phase_threshold,
         } => {
             assert_eq!(base.as_deref(), Some("abc123"));
             assert_eq!(base_ref.as_deref(), Some("release"));
@@ -133,6 +141,9 @@ fn parse_perf_delta_flags_and_defaults() {
             assert!(dual_run, "--dual-run flag sets dual_run");
             assert_eq!(threshold, Some(12.5));
             assert!(policy.is_none());
+            assert!(phases_only, "--phases-only sets phases_only");
+            assert_eq!(phase_threshold, Some(5.0));
+            assert!(!no_phases && !steps_only && phase.is_none());
         }
         _ => panic!("expected PerfDelta"),
     }
@@ -150,12 +161,21 @@ fn parse_perf_delta_flags_and_defaults() {
             dual_run,
             threshold,
             policy,
+            no_phases,
+            phases_only,
+            steps_only,
+            phase,
+            phase_threshold,
         } => {
             assert!(base.is_none() && base_ref.is_none() && filter.is_none());
             assert_eq!(default_branch, "main");
             assert!(kernel.is_none());
             assert!(!dual_run, "--dual-run defaults off (cached-baseline path)");
             assert!(threshold.is_none() && policy.is_none());
+            assert!(
+                !no_phases && !phases_only && !steps_only && phase.is_none() && phase_threshold.is_none(),
+                "phase flags default off (full per-phase render)",
+            );
         }
         _ => panic!("expected PerfDelta"),
     }
@@ -166,6 +186,18 @@ fn parse_perf_delta_flags_and_defaults() {
         ])
         .is_err(),
         "--threshold and --policy must conflict at parse time",
+    );
+    // --no-phases conflicts with every other phase flag.
+    assert!(
+        Cargo::try_parse_from(["cargo", "ktstr", "perf-delta", "--no-phases", "--phases-only"])
+            .is_err(),
+        "--no-phases must conflict with --phases-only",
+    );
+    // --steps-only conflicts with the single --phase filter.
+    assert!(
+        Cargo::try_parse_from(["cargo", "ktstr", "perf-delta", "--steps-only", "--phase", "1"])
+            .is_err(),
+        "--steps-only must conflict with --phase",
     );
 }
 
