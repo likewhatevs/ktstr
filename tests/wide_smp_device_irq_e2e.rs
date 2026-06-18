@@ -111,12 +111,15 @@ fn drive_disk_io() -> Result<()> {
     no_perf_mode,
     duration_s = 4
 )]
-fn device_irq_delivers_to_apic_id_above_255(ctx: &Ctx) -> Result<AssertResult> {
-    let total = ctx.topo.total_cpus();
-    ensure!(
-        total > 254,
-        "need a >254-vCPU topology to reach APIC IDs above 255 (got {total})"
-    );
+fn device_irq_delivers_to_apic_id_above_255(_ctx: &Ctx) -> Result<AssertResult> {
+    // No vCPU-count gate: the sparse APIC-ID encoding mints IDs up to 433
+    // from this 252-vCPU topology (see the module doc), so the requirement
+    // is "an APIC ID > 255 exists", not "> 254 vCPUs". find_apic_above_255
+    // reads the guest's actual /proc/cpuinfo and errors if none reach 256 --
+    // the correct runtime gate. (A > 254-vCPU count is the right invariant
+    // for the dense sibling tests -- 16*16*1 = 256, max APIC ID 255 -- but
+    // wrong for this sparse topology: 14*9*2 = 252 < 254, so it failed every
+    // run that was not host-skipped.)
 
     // Pick a vCPU whose APIC ID exceeds 255 (the ext-dest threshold). cpu# !=
     // apic_id under the sparse encoding, so select by APIC ID.
