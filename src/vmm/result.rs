@@ -76,10 +76,13 @@ pub struct VmResult {
     /// Guest vCPU count for this run (topology llcs*cores*threads),
     /// carried from `KtstrVm` to the sidecar `(vcpus, cpu_budget)` stamp.
     pub vcpus: u32,
-    /// Effective host-CPU budget the vCPU threads ran on (see
-    /// `KtstrVm::effective_cpu_budget`); stamped to the sidecar. Below
-    /// `vcpus` means host overcommit, which confounds the guest-scheduler
-    /// timing metrics.
+    /// Effective host-CPU budget the vCPU threads ran on; stamped to the
+    /// sidecar. Normally `KtstrVm::effective_cpu_budget` (the build-time
+    /// plan's CPU count), but the default-overcommit path (host too small
+    /// for a 1:1 pin) overrides it in `run()` with the actual masked
+    /// host-CPU count, since the build-time value assumes 1:1 pinning.
+    /// Below `vcpus` means host overcommit, which confounds the
+    /// guest-scheduler timing metrics.
     pub cpu_budget: u32,
     /// True when the `#[ktstr_test(expect_auto_repro)]` attribute set
     /// `expect_auto_repro = true` on the entry AND the auto-repro

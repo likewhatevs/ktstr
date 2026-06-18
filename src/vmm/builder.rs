@@ -1149,21 +1149,25 @@ impl KtstrVmBuilder {
         // nothing and its cpus == the full allowed cpuset (a no-op mask), so
         // the stamp records the unrestricted set the vCPUs floated across —
         // still the true CPU count the threads ran on.
-        // perf-mode AND the deferred default both acquire a 1:1 pinning plan
-        // at run time — perf-mode via `validate_performance_mode`, the
-        // default via `run()`'s LOCK_SH offset search — and hard-pin each
+        // perf-mode AND the deferred default both attempt a 1:1 pinning
+        // plan at run time — perf-mode via `validate_performance_mode`, the
+        // default via `run()`'s LOCK_SH offset search — hard-pinning each
         // vCPU thread to one distinct host CPU (`compute_pinning` emits
-        // exactly `vcpus` 1:1 assignments; `run()` aborts with
-        // ResourceContention if no plan can be acquired, so any sidecar
-        // written on these paths reflects a real 1:1 pin). Both cache the
-        // host topology, so `cached_host_topo.is_some()` is the predicate
-        // that 1:1 pinning will be applied — the effective budget is then
-        // the vCPU count. Only when no affinity is applied (no-perf bypass,
-        // sysfs unreadable, or the deferred default with no cached host
-        // topology) do the vCPU threads float across the process's full
-        // allowed cpuset. The earlier `no_perf_plan` arm wins first, so the
-        // `cached_host_topo` arm is only reached with no no-perf plan
-        // (perf-mode / deferred default), never the no-perf masked path.
+        // exactly `vcpus` 1:1 assignments). Both cache the host topology, so
+        // `cached_host_topo.is_some()` predicts a 1:1 pin and the build-time
+        // budget is the vCPU count. Two run-time outcomes diverge from that
+        // estimate: perf-mode aborts with ResourceContention if its LOCK_EX
+        // is unavailable (no sidecar written), and the default path
+        // OVERCOMMITS when no offset can map the topology (host too small) —
+        // `run()` then overrides `VmResult.cpu_budget` with the actual
+        // masked host-CPU count (`RunLocks::default_cpu_mask` length), so a
+        // too-small host stamps the real overcommit, not this `vcpus`
+        // estimate. Only when no affinity is applied (no-perf bypass, sysfs
+        // unreadable, or the deferred default with no cached host topology)
+        // do the vCPU threads fall to the allowed-cpuset size below. The
+        // earlier `no_perf_plan` arm wins first, so the `cached_host_topo`
+        // arm is only reached with no no-perf plan (perf-mode / deferred
+        // default), never the no-perf masked path.
         let vcpus = t.total_cpus();
         let effective_cpu_budget = if let Some(p) = no_perf_plan.as_ref() {
             p.cpus.len() as u32
