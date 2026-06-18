@@ -1145,7 +1145,10 @@ pub(crate) enum StatsCommand {
         /// pairs rows of different budgets (a 4-CPU-budget run and a
         /// 32-CPU-budget run measure different things). Use this flag to
         /// SLICE by budget, or `--a-cpu-budget` / `--b-cpu-budget` to
-        /// contrast two budgets.
+        /// contrast two budgets. Matches by exact decimal string (the
+        /// canonical form `stats list-values` prints), like every other
+        /// typed dimension filter: a non-canonical value such as `032`
+        /// or ` 4` will not match `4`.
         #[arg(long = "cpu-budget", action = ArgAction::Append)]
         cpu_budget: Vec<String>,
         /// A-side overrides: replace the corresponding shared
