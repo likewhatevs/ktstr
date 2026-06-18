@@ -1619,6 +1619,14 @@ pub(super) fn map_type_name(map_type: u32) -> Option<&'static str> {
     })
 }
 
+/// Operator-facing error set into `FailureDumpMap.error` when a
+/// BPF_MAP_TYPE_ARENA map is captured but its BTF offsets did not
+/// resolve. A `const` (not an inline literal) so the byte-exact wire
+/// string is pinnable by a test without constructing a full render_map
+/// context.
+pub(super) const ARENA_OFFSETS_UNAVAILABLE_MSG: &str =
+    "arena BTF offsets unavailable (kernel lacks struct bpf_arena?)";
+
 pub(super) const MAP_TYPE_EXPLANATIONS: &[(u32, &str)] = &[
     (
         BPF_MAP_TYPE_CGROUP_STORAGE,
@@ -1959,9 +1967,7 @@ pub(super) fn render_map(ctx: &RenderMapCtx<'_>, info: &BpfMapInfo) -> FailureDu
                     out.arena = Some(snap);
                 }
                 None => {
-                    out.error = Some(
-                        "arena BTF offsets unavailable (kernel lacks struct bpf_arena?)".into(),
-                    );
+                    out.error = Some(ARENA_OFFSETS_UNAVAILABLE_MSG.into());
                 }
             }
         }

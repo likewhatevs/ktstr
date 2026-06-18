@@ -2183,11 +2183,13 @@ fn failure_dump_report_optional_fields_round_trip_when_omitted() {
 /// is None — surfacing that the kernel lacks struct bpf_arena.
 #[test]
 fn pinned_error_arena_btf_offsets_unavailable() {
-    // The producer has no format placeholders; reproduce the
-    // exact `.into()` literal so a rephrasing in dump/render_map.rs trips.
-    let rendered: String = "arena BTF offsets unavailable (kernel lacks struct bpf_arena?)".into();
+    // Assert against the PRODUCTION const the ARENA arm emits, not a
+    // literal-vs-itself: a reword of render_map.rs's
+    // ARENA_OFFSETS_UNAVAILABLE_MSG (which the None branch sets into
+    // out.error) now trips this test.
     assert_eq!(
-        rendered, "arena BTF offsets unavailable (kernel lacks struct bpf_arena?)",
+        super::render_map::ARENA_OFFSETS_UNAVAILABLE_MSG,
+        "arena BTF offsets unavailable (kernel lacks struct bpf_arena?)",
         "arena-unavailable error string drifted from pin",
     );
 }
