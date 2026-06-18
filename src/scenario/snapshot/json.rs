@@ -434,5 +434,284 @@ fn json_to_f64(v: &serde_json::Value) -> SnapshotResult<f64> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Dotted-path walker
+#[cfg(test)]
+mod tests_coercion {
+    //! Host-pure coverage for the JSON coercion helpers
+    //! ([`json_to_u64`] / [`json_to_i64`] / [`json_to_f64`] /
+    //! [`describe_json_kind`]) and the [`JsonField`] terminal
+    //! accessors. The dotted-path walk is exercised by the snapshot
+    //! integration tests; this module pins the per-branch coercion
+    //! rules that decide whether a stats read SUCCEEDS or surfaces a
+    //! typed [`SnapshotError`] — the silent-wrong-answer surface where
+    //! a swapped arm would coerce a value the device should reject.
+    use super::*;
+    use serde_json::json;
+
+    // ---- describe_json_kind: every Value discriminant ----
+
+    #[test]
+    fn describe_json_kind_names_each_value_shape() {
+        assert_eq!(describe_json_kind(&json!(null)), "Null");
+        assert_eq!(describe_json_kind(&json!(true)), "Bool");
+        assert_eq!(describe_json_kind(&json!(1)), "Number");
+        assert_eq!(describe_json_kind(&json!("s")), "String");
+        assert_eq!(describe_json_kind(&json!([])), "Array");
+        assert_eq!(describe_json_kind(&json!({})), "Object");
+    }
+
+    // ---- json_to_u64: each accepted/rejected branch ----
+
+    #[test]
+    fn json_to_u64_accepts_uint_bool_and_numeric_string() {
+        assert_eq!(json_to_u64(&json!(42u64)).unwrap(), 42);
+        assert_eq!(json_to_u64(&json!(true)).unwrap(), 1);
+        assert_eq!(json_to_u64(&json!(false)).unwrap(), 0);
+        // scx_stats stringifies large counters to dodge 53-bit float collapse.
+        assert_eq!(json_to_u64(&json!("18446744073709551615")).unwrap(), u64::MAX);
+    }
+
+    #[test]
+    fn json_to_u64_accepts_integral_float_rejects_fractional_and_negative() {
+        // A JSON float that happens to be integral coerces.
+        assert_eq!(json_to_u64(&json!(5.0)).unwrap(), 5);
+        // A fractional float is not an integer.
+        match json_to_u64(&json!(2.5)) {
+            Err(SnapshotError::TypeMismatch { expected, actual, .. }) => {
+                assert_eq!(expected, "integer");
+                assert_eq!(actual, "non-integer float");
+            }
+            other => panic!("expected non-integer-float TypeMismatch, got {other:?}"),
+        }
+        // A negative float cannot be a u64.
+        match json_to_u64(&json!(-2.5)) {
+            Err(SnapshotError::TypeMismatch { expected, actual, .. }) => {
+                assert_eq!(expected, "u64");
+                assert_eq!(actual, "Float(non-coercible)");
+            }
+            other => panic!("expected negative-float TypeMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn json_to_u64_rejects_negative_int_nonnumeric_string_and_other_shapes() {
+        match json_to_u64(&json!(-5)) {
+            Err(SnapshotError::TypeMismatch { actual, .. }) => {
+                assert_eq!(actual, "Int(negative)");
+            }
+            other => panic!("expected negative-int TypeMismatch, got {other:?}"),
+        }
+        match json_to_u64(&json!("abc")) {
+            Err(SnapshotError::TypeMismatch { actual, .. }) => {
+                assert_eq!(actual, "String(non-numeric)");
+            }
+            other => panic!("expected non-numeric-string TypeMismatch, got {other:?}"),
+        }
+        // null / array / object fall through to the describe_json_kind arm.
+        assert!(json_to_u64(&json!(null)).unwrap_err().to_string().contains("Null"));
+        assert!(matches!(
+            json_to_u64(&json!({"k": 1})),
+            Err(SnapshotError::TypeMismatch { .. })
+        ));
+    }
+
+    // ---- json_to_i64: signed-specific branches ----
+
+    #[test]
+    fn json_to_i64_accepts_signed_bool_string_and_integral_float() {
+        assert_eq!(json_to_i64(&json!(-7)).unwrap(), -7);
+        assert_eq!(json_to_i64(&json!(true)).unwrap(), 1);
+        assert_eq!(json_to_i64(&json!("-123")).unwrap(), -123);
+        assert_eq!(json_to_i64(&json!(9.0)).unwrap(), 9);
+    }
+
+    #[test]
+    fn json_to_i64_rejects_uint_over_i64_max_and_fractional_float() {
+        // u64::MAX is stored as a u64 Number; it overflows i64.
+        match json_to_i64(&json!(u64::MAX)) {
+            Err(SnapshotError::TypeMismatch { actual, .. }) => {
+                assert_eq!(actual, "Uint(>i64::MAX)");
+            }
+            other => panic!("expected over-i64::MAX TypeMismatch, got {other:?}"),
+        }
+        match json_to_i64(&json!(2.5)) {
+            Err(SnapshotError::TypeMismatch { expected, actual, .. }) => {
+                assert_eq!(expected, "integer");
+                assert_eq!(actual, "non-integer float");
+            }
+            other => panic!("expected fractional-float TypeMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn json_to_i64_rejects_nonnumeric_string_and_other_shapes() {
+        match json_to_i64(&json!("nope")) {
+            Err(SnapshotError::TypeMismatch { actual, .. }) => {
+                assert_eq!(actual, "String(non-numeric)");
+            }
+            other => panic!("expected non-numeric-string TypeMismatch, got {other:?}"),
+        }
+        assert!(matches!(
+            json_to_i64(&json!([1, 2])),
+            Err(SnapshotError::TypeMismatch { .. })
+        ));
+    }
+
+    // ---- json_to_f64 ----
+
+    #[test]
+    fn json_to_f64_accepts_number_and_numeric_string_rejects_others() {
+        assert_eq!(json_to_f64(&json!(1.5)).unwrap(), 1.5);
+        // An integer Number coerces to f64.
+        assert_eq!(json_to_f64(&json!(3)).unwrap(), 3.0);
+        assert_eq!(json_to_f64(&json!("2.25")).unwrap(), 2.25);
+        match json_to_f64(&json!("x")) {
+            Err(SnapshotError::TypeMismatch { actual, .. }) => {
+                assert_eq!(actual, "String(non-numeric)");
+            }
+            other => panic!("expected non-numeric-string TypeMismatch, got {other:?}"),
+        }
+        assert!(matches!(
+            json_to_f64(&json!(null)),
+            Err(SnapshotError::TypeMismatch { .. })
+        ));
+    }
+
+    // ---- JsonField terminal accessors + Missing propagation ----
+
+    #[test]
+    fn json_field_is_present_raw_and_error_reflect_variant() {
+        let v = json!({"a": 1});
+        let present = stats_path(&v, "a");
+        assert!(present.is_present());
+        assert!(present.raw().is_some());
+        assert!(present.error().is_none());
+
+        let missing = stats_path(&v, "nope");
+        assert!(!missing.is_present());
+        assert!(missing.raw().is_none());
+        assert!(missing.error().is_some());
+    }
+
+    #[test]
+    fn json_field_as_bool_accepts_bool_rejects_other_and_propagates_missing() {
+        let t = json!({"on": true});
+        assert!(stats_path(&t, "on").as_bool().unwrap());
+        // A stringified "1" is NOT a bool — honest typing.
+        let n = json!({"on": "1"});
+        assert!(matches!(
+            stats_path(&n, "on").as_bool(),
+            Err(SnapshotError::TypeMismatch { .. })
+        ));
+        // A missing path propagates the FieldNotFound, not a type error.
+        assert!(matches!(
+            stats_path(&n, "absent").as_bool(),
+            Err(SnapshotError::FieldNotFound { .. })
+        ));
+    }
+
+    #[test]
+    fn json_field_as_str_accepts_string_rejects_other_and_propagates_missing() {
+        let v = json!({"name": "batch"});
+        assert_eq!(stats_path(&v, "name").as_str().unwrap(), "batch");
+        let num = json!({"name": 7});
+        assert!(matches!(
+            stats_path(&num, "name").as_str(),
+            Err(SnapshotError::TypeMismatch { .. })
+        ));
+        assert!(matches!(
+            stats_path(&v, "absent").as_str(),
+            Err(SnapshotError::FieldNotFound { .. })
+        ));
+    }
+
+    #[test]
+    fn json_field_scalar_accessors_propagate_missing_error() {
+        let v = json!({"x": 1});
+        let missing = stats_path(&v, "absent");
+        // Every typed terminal returns the SAME FieldNotFound, not a coercion error.
+        assert!(matches!(missing.as_u64(), Err(SnapshotError::FieldNotFound { .. })));
+        assert!(matches!(missing.as_i64(), Err(SnapshotError::FieldNotFound { .. })));
+        assert!(matches!(missing.as_f64(), Err(SnapshotError::FieldNotFound { .. })));
+    }
+
+    #[test]
+    fn json_field_get_on_missing_stays_missing() {
+        let v = json!({"x": 1});
+        // Drilling into an already-failed lookup keeps the original error.
+        let chained = stats_path(&v, "absent").get("deeper");
+        assert!(matches!(
+            chained.error(),
+            Some(SnapshotError::FieldNotFound { .. })
+        ));
+    }
+
+    #[test]
+    fn json_field_iter_members_yields_elements_and_empty_for_nonarray() {
+        let arr = json!([10, 20, 30]);
+        let got: Vec<u64> = stats_path(&arr, "")
+            .iter_members()
+            .map(|el| el.as_u64().unwrap())
+            .collect();
+        assert_eq!(got, vec![10, 20, 30]);
+        // A non-array value yields nothing (the natural "no elements" shape).
+        let scalar = json!(5);
+        assert_eq!(stats_path(&scalar, "").iter_members().count(), 0);
+        // A missing field also yields nothing.
+        let obj = json!({"a": 1});
+        assert_eq!(stats_path(&obj, "absent").iter_members().count(), 0);
+    }
+
+    // ---- typed-array coercion: success, out-of-range, non-array, Missing ----
+
+    #[test]
+    fn json_field_typed_arrays_extract_each_element_type() {
+        let v = json!({
+            "u": [1, 2, 3],
+            "i": [-1, 0, 5],
+            "f": [1.5, 2.0],
+            "b": [true, false, true],
+        });
+        assert_eq!(stats_path(&v, "u").as_u64_array().unwrap(), vec![1u64, 2, 3]);
+        assert_eq!(stats_path(&v, "i").as_i64_array().unwrap(), vec![-1i64, 0, 5]);
+        assert_eq!(stats_path(&v, "f").as_f64_array().unwrap(), vec![1.5, 2.0]);
+        assert_eq!(
+            stats_path(&v, "b").as_bool_array().unwrap(),
+            vec![true, false, true]
+        );
+    }
+
+    #[test]
+    fn json_field_as_u32_array_rejects_out_of_range_element() {
+        // An element exceeding u32::MAX must error, not silently truncate.
+        let v = json!({"c": [1, 4294967296u64]});
+        match stats_path(&v, "c").as_u32_array() {
+            Err(SnapshotError::TypeMismatch { expected, actual, .. }) => {
+                assert_eq!(expected, "u32");
+                assert_eq!(actual, "Uint(>u32::MAX)");
+            }
+            other => panic!("expected u32 out-of-range TypeMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn json_field_typed_array_on_nonarray_value_errors_with_element_type() {
+        // The "expected" diagnostic names the element type in brackets.
+        let v = json!({"scalar": 7});
+        match stats_path(&v, "scalar").as_u64_array() {
+            Err(SnapshotError::TypeMismatch { expected, actual, .. }) => {
+                assert_eq!(expected, "[u64]");
+                assert_eq!(actual, "Number");
+            }
+            other => panic!("expected non-array TypeMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn json_field_typed_array_propagates_missing_error() {
+        let v = json!({"x": 1});
+        assert!(matches!(
+            stats_path(&v, "absent").as_u64_array(),
+            Err(SnapshotError::FieldNotFound { .. })
+        ));
+    }
+}

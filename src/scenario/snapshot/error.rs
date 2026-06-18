@@ -796,4 +796,114 @@ mod tests_api_gaps {
         seen.insert(a);
         assert!(seen.contains(&b));
     }
+
+    /// `From<&SchedStatsError>` must map EVERY scheduler-stats failure
+    /// to its corresponding MissingStatsReason. A swapped arm would
+    /// mislabel a stats failure (e.g. a size-cap breach reported as a
+    /// poisoned mutex), and the operator's diagnostic would point at the
+    /// wrong cause. Pin each variant's mapping.
+    #[test]
+    fn missing_stats_reason_from_sched_stats_error_maps_each_variant() {
+        use crate::vmm::sched_stats::SchedStatsError as S;
+        use serde_json::json;
+        assert_eq!(
+            MissingStatsReason::from(&S::Poisoned),
+            MissingStatsReason::MutexPoisoned,
+        );
+        assert_eq!(
+            MissingStatsReason::from(&S::DuringFreeze),
+            MissingStatsReason::DuringFreeze,
+        );
+        assert_eq!(
+            MissingStatsReason::from(&S::Cancelled),
+            MissingStatsReason::Cancelled,
+        );
+        assert_eq!(
+            MissingStatsReason::from(&S::RequestTooLarge { size: 10, max: 5 }),
+            MissingStatsReason::RequestTooLarge { size: 10, max: 5 },
+        );
+        assert_eq!(
+            MissingStatsReason::from(&S::ResponseTooLarge { size: 20, max: 8 }),
+            MissingStatsReason::ResponseTooLarge { size: 20, max: 8 },
+        );
+        assert_eq!(
+            MissingStatsReason::from(&S::NoScheduler {
+                reason: "no sock".into()
+            }),
+            MissingStatsReason::NoScheduler {
+                reason: "no sock".into()
+            },
+        );
+        assert_eq!(
+            MissingStatsReason::from(&S::SchedulerError {
+                errno: 13,
+                args: json!({"k": 1}),
+            }),
+            MissingStatsReason::SchedulerError {
+                errno: 13,
+                args: json!({"k": 1}),
+            },
+        );
+        assert_eq!(
+            MissingStatsReason::from(&S::MissingResp {
+                args: json!({"a": 2}),
+            }),
+            MissingStatsReason::MissingResp {
+                args: json!({"a": 2}),
+            },
+        );
+    }
+
+    /// `From<&anyhow::Error>` downcasts a typed SchedStatsError in the
+    /// chain to its mapped variant; a non-typed error falls back to
+    /// NoScheduler carrying the rendered display (so serde/IO errors
+    /// surfacing through the same Result still classify).
+    #[test]
+    fn missing_stats_reason_from_anyhow_downcasts_typed_else_no_scheduler() {
+        use crate::vmm::sched_stats::SchedStatsError as S;
+        let typed: anyhow::Error = anyhow::Error::new(S::DuringFreeze);
+        assert_eq!(
+            MissingStatsReason::from(&typed),
+            MissingStatsReason::DuringFreeze,
+            "a typed SchedStatsError in the anyhow chain must downcast",
+        );
+        let other = anyhow::anyhow!("plain io failure");
+        match MissingStatsReason::from(&other) {
+            MissingStatsReason::NoScheduler { reason } => {
+                assert!(reason.contains("plain io failure"));
+            }
+            x => panic!("expected NoScheduler fallback, got {x:?}"),
+        }
+    }
+
+    /// Every MissingStatsReason renders a non-empty operator message,
+    /// and the value-bearing variants surface their payload.
+    #[test]
+    fn missing_stats_reason_display_covers_each_variant() {
+        use serde_json::json;
+        let cases = [
+            MissingStatsReason::NoSchedulerBinary,
+            MissingStatsReason::NoScheduler { reason: "r".into() },
+            MissingStatsReason::DuringFreeze,
+            MissingStatsReason::Cancelled,
+            MissingStatsReason::SchedulerError {
+                errno: 1,
+                args: json!({}),
+            },
+            MissingStatsReason::MissingResp { args: json!({}) },
+            MissingStatsReason::RequestTooLarge { size: 1, max: 2 },
+            MissingStatsReason::ResponseTooLarge { size: 3, max: 4 },
+            MissingStatsReason::MutexPoisoned,
+        ];
+        for c in &cases {
+            assert!(!format!("{c}").is_empty(), "Display must be non-empty for {c:?}");
+        }
+        assert!(
+            format!("{}", MissingStatsReason::RequestTooLarge { size: 10, max: 5 }).contains("10"),
+        );
+        assert!(
+            format!("{}", MissingStatsReason::SchedulerError { errno: 13, args: json!({}) })
+                .contains("13"),
+        );
+    }
 }
