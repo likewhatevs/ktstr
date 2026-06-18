@@ -183,10 +183,13 @@ pub enum MetricKind {
     /// the three cross-RUN ext-metrics reducers (`populate_run_ext_metrics`,
     /// `populate_run_ext_metrics_from_phases`, and `group_and_average_by`).
     /// The cross-CGROUP `AssertResult::merge` ext-metrics fold uses
-    /// worst-case polarity (min/max) and is NOT a re-pool site; re-pooling
-    /// a Rate across cgroups (where a component may live in a typed
-    /// `GauntletRow` field rather than the ext-metrics map) is not yet
-    /// wired and is decided when a Rate is registered.
+    /// worst-case polarity (min/max) and is NOT a re-pool site. The first
+    /// registered Rate (`iteration_rate`) does not exercise it: it and its
+    /// components are host-injected by
+    /// `populate_run_ext_metrics_from_phases` AFTER the cross-cgroup
+    /// `merge`, so the fold never sees them. A cross-cgroup re-pool (lifting
+    /// the components into the merge, or injecting them before it) is the
+    /// deferred follow-up.
     ///
     /// Because a single sample slice cannot express the re-pool, a Rate is
     /// FORBIDDEN from the single-slice reducers ([`aggregate_finite`]
@@ -530,6 +533,14 @@ pub fn phase_counter_delta(samples: &[f64]) -> Option<f64> {
 /// A rate is skipped (its key left absent) when either component key is
 /// missing, the denominator is zero, or either component is non-finite —
 /// keeping an absent rate distinct from a real `0.0`.
+///
+/// INVARIANT: the producers must co-insert both components from the same
+/// observation (both-or-neither per map) — e.g.
+/// `build_phase_buckets_with_stimulus` inserts `total_phase_iterations` and
+/// `total_phase_duration_sec` together under one `rate_components` guard. A
+/// partial pair (numerator from one source, denominator from another) is
+/// never produced today but would derive a cross-paired rate; any second
+/// Rate must keep the co-insertion contract.
 pub(crate) fn derive_rate_metrics(metrics: &mut std::collections::BTreeMap<String, f64>) {
     derive_rate_metrics_from(
         metrics,
@@ -975,21 +986,26 @@ pub static METRICS: &[MetricDef] = &[
         accessor: |r| Some(r.worst_wake_latency_cv),
     },
     MetricDef {
-        // Per-phase worker iterations per second, derived from
-        // adjacent stimulus events' `total_iterations` deltas via
-        // build_phase_buckets_with_stimulus. Higher-is-better
-        // (more throughput); Gauge(Avg) kind because the per-phase
-        // value is already a rate (no further temporal reduction
-        // needed within a phase — one value per phase). The
+        // Per-phase worker iterations per second. MetricKind::Rate with
+        // Counter components total_phase_iterations / total_phase_duration_sec:
+        // build_phase_buckets_with_stimulus emits those two components (the
+        // iteration delta + the window seconds) from adjacent stimulus events'
+        // total_iterations / elapsed_ms deltas — NOT a ready ratio — and
+        // derive_rate_metrics re-derives iteration_rate = Σiterations /
+        // Σseconds, so it re-pools correctly across phases/runs rather than
+        // averaging per-phase ratios. Higher-is-better (more throughput). The
         // registry entry exists so MetricDef::read on a
-        // GauntletRow.ext_metrics fallback surfaces it through
-        // cargo ktstr stats compare like any other metric, and so
-        // Timeline::from_phase_buckets reads it by the canonical
-        // name from PhaseBucket.metrics. No typed GauntletRow
-        // field; accessor is the ext_metrics fallback.
+        // GauntletRow.ext_metrics fallback surfaces it through cargo ktstr
+        // stats compare like any other metric, and so
+        // Timeline::from_phase_buckets reads it by the canonical name from
+        // PhaseBucket.metrics. No typed GauntletRow field; accessor is the
+        // ext_metrics fallback.
         name: "iteration_rate",
         polarity: crate::test_support::Polarity::HigherBetter,
-        kind: MetricKind::Gauge(GaugeAgg::Avg),
+        kind: MetricKind::Rate {
+            numerator: "total_phase_iterations",
+            denominator: "total_phase_duration_sec",
+        },
         default_abs: 1.0,
         default_rel: 0.30,
         display_unit: "iter/s",
@@ -1005,6 +1021,36 @@ pub static METRICS: &[MetricDef] = &[
         accessor: |r| Some(r.total_iterations as f64),
     },
     MetricDef {
+        // Per-phase iteration delta — the NUMERATOR component of the
+        // `iteration_rate` Rate. ext_metrics-only (no GauntletRow field):
+        // inserted per phase as the last-minus-first delta of the cumulative
+        // iteration counter, alongside `total_phase_duration_sec`, so
+        // `derive_rate_metrics` yields `iteration_rate` = Σ(iter delta) /
+        // Σ(phase seconds). `total_` prefix satisfies the Counter naming gate.
+        name: "total_phase_iterations",
+        polarity: crate::test_support::Polarity::HigherBetter,
+        kind: MetricKind::Counter,
+        default_abs: 100.0,
+        default_rel: 0.10,
+        display_unit: "",
+        accessor: |_| None,
+    },
+    MetricDef {
+        // Per-phase WALL-clock duration in SECONDS — the DENOMINATOR
+        // component of the `iteration_rate` Rate. ext_metrics-only. The
+        // ms→s conversion is applied at the component-insertion site (NOT in
+        // `derive_rate_metrics`, which does a bare num/den with no scaling),
+        // so the stored value is already seconds and the derived rate is
+        // iterations/second. `total_` prefix satisfies the Counter naming gate.
+        name: "total_phase_duration_sec",
+        polarity: crate::test_support::Polarity::HigherBetter,
+        kind: MetricKind::Counter,
+        default_abs: 1.0,
+        default_rel: 0.30,
+        display_unit: "s",
+        accessor: |_| None,
+    },
+    MetricDef {
         // Per-phase SYSTEM (in-kernel) CPU time in nanoseconds. Read
         // host-side from frozen task_struct.stime + the thread-group
         // signal_struct.stime accumulator (zero guest work). Injected
@@ -1015,7 +1061,7 @@ pub static METRICS: &[MetricDef] = &[
         // freeze samples and takes `last - first` = system CPU time the
         // group spent during the phase. Gauge(Avg): the per-phase value
         // is already a delta (one per phase; cross-RUN folds by mean,
-        // like iteration_rate). LowerBetter — the DSQ-spinlock
+        // like user_time_ns). LowerBetter — the DSQ-spinlock
         // regression surfaces as rising system time (CPUs spinning in
         // the kernel). No typed GauntletRow field; the ext_metrics
         // fallback carries it through cargo ktstr stats compare.
@@ -6421,6 +6467,32 @@ mod tests {
                         m.name,
                     );
                 }
+            }
+
+            // REVERSE gate: a metric NAMED like a per-second rate MUST be a
+            // Rate, so a future per-second metric cannot silently ship as a
+            // Gauge that averages ready-made ratios (the (r₁+r₂)/2 bug). Scoped
+            // to per-SECOND tokens (`_rate` / `_per_sec` / `_per_cpu_sec`) — NOT
+            // bare `_per_` — so a count-denominator metric like
+            // `worst_iterations_per_worker` (intentionally a Gauge) is not
+            // falsely flagged. `worst_iterations_per_cpu_sec` is the documented
+            // exception: registered Gauge(Last) (temporal: last sample), its
+            // cross-cgroup worst is a min-SELECTION via fold_lowest_some on
+            // the typed ScenarioStats field (later surfaced as the GauntletRow
+            // field) — the per-cgroup starvation signal, NOT a Σnum/Σdenom
+            // re-pool — so it is correctly NOT a Rate and keeps its accurate
+            // `_per_cpu_sec` name.
+            let looks_like_rate = m.name.ends_with("_rate")
+                || m.name.contains("_per_sec")
+                || m.name.contains("_per_cpu_sec");
+            if looks_like_rate && m.name != "worst_iterations_per_cpu_sec" {
+                assert!(
+                    matches!(m.kind, MetricKind::Rate { .. }),
+                    "metric {:?} is named like a per-second rate but is not \
+                     MetricKind::Rate (register it as a Rate, or allowlist it \
+                     here if it is intentionally a non-re-pooled gauge)",
+                    m.name,
+                );
             }
         }
     }

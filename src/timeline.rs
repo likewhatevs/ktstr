@@ -106,7 +106,7 @@ pub struct StimulusEvent {
     /// by `step_index`) — and the terminal is then NOT consumed for a
     /// rate: the snapshot path's attribution loop skips the
     /// `(StepEnd[N], terminal)` pair via its `is_step_end` guard (before
-    /// `rate_to` is reached), and `Timeline::build` reaches for the
+    /// `rate_components` is reached), and `Timeline::build` reaches for the
     /// terminal only when a step's `StepEnd` lookup misses. The terminal
     /// is consumed as a step's rate boundary ONLY for legacy/synthetic
     /// data that carries a `ScenarioEnd` frame but no `StepEnd` frames
@@ -252,12 +252,30 @@ impl StimulusEvent {
     /// `before > 0.0` gate avoids a div-by-zero — but an *unchanged* zero
     /// is not a degradation.)
     ///
-    /// This is the SINGLE iteration_rate formula shared by
+    /// This is the SINGLE iteration-rate formula, shared via its
+    /// decomposition [`Self::rate_components`] by
     /// [`crate::assert::build_phase_buckets_with_stimulus`] (per-step
     /// windows attributed by `step_index`) and [`Timeline::build`]
     /// (per-phase windows attributed by index) — the two callers pair
-    /// events differently but must compute the rate identically.
+    /// events differently but must compute the rate identically. The
+    /// per-step metric producer inserts the `rate_components` pair (the
+    /// `iteration_rate` Rate's `total_phase_iterations` /
+    /// `total_phase_duration_sec` components); `rate_to` (the quotient) is
+    /// the display/comparison form used by `Timeline::build` and the
+    /// result-helper ratios.
     pub fn rate_to(&self, next: &StimulusEvent) -> Option<f64> {
+        self.rate_components(next).map(|(iters, secs)| iters / secs)
+    }
+
+    /// The `(iteration_delta, window_seconds)` components of [`Self::rate_to`]
+    /// — same `None` conditions (missing `total_iterations`, backward count,
+    /// or zero-length window). The per-phase metric pipeline inserts these as
+    /// the `total_phase_iterations` / `total_phase_duration_sec` Counter
+    /// components rather than the ready ratio, so the `iteration_rate` Rate
+    /// re-pools across phases/runs as `Σdelta / Σseconds`, not a mean of
+    /// per-phase ratios. The ms→s `/1000` lives HERE (the seconds component)
+    /// because `derive_rate_metrics` does a bare num/den with no scaling.
+    pub fn rate_components(&self, next: &StimulusEvent) -> Option<(f64, f64)> {
         let s = self.total_iterations?;
         let e = next.total_iterations?;
         if e < s {
@@ -267,7 +285,7 @@ impl StimulusEvent {
         if duration_ms == 0 {
             return None;
         }
-        Some((e - s) as f64 / (duration_ms as f64 / 1000.0))
+        Some(((e - s) as f64, duration_ms as f64 / 1000.0))
     }
 
     /// The scenario [`Phase`](crate::assert::Phase) this event belongs to,
@@ -682,8 +700,12 @@ impl Timeline {
                     terminal
                 }
             });
-            // Shared formula with build_phase_buckets_with_stimulus via
-            // StimulusEvent::rate_to (the sole iteration_rate site).
+            // Timeline::build's display fallback: compute this phase's rate
+            // directly via rate_to. The metric-pipeline producer
+            // build_phase_buckets_with_stimulus shares the same rate
+            // semantics via rate_components (it emits the two Counter
+            // components that derive_rate_metrics re-pools into
+            // iteration_rate); this display field reads the quotient.
             if let Some(next_ev) = next
                 && let Some(rate) = this.rate_to(next_ev)
             {
@@ -1022,9 +1044,11 @@ fn phase_from_bucket(b: &crate::assert::PhaseBucket, sorted_events: &[&StimulusE
             .unwrap_or(0),
         fallback_rate: rate("total_fallback"),
         keep_last_rate: rate("total_keep_last"),
-        // iteration_rate is already a rate per-phase, not a
-        // counter-over-window — read it verbatim from the
-        // bucket map; do NOT divide by duration.
+        // iteration_rate is a derived Rate: derive_rate_metrics already
+        // placed the Σiterations/Σseconds quotient into the bucket map, so
+        // read it verbatim — do NOT divide by duration (unlike
+        // fallback_rate / keep_last_rate above, which divide their Counter
+        // by the window).
         iteration_rate: b.metrics.get("iteration_rate").copied(),
     };
     let stimulus = if b.step_index == 0 {

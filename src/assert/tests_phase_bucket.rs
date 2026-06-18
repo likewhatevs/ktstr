@@ -2574,7 +2574,7 @@ fn build_phase_buckets_with_stimulus_pairs_step_local_for_respawned_workers() {
 /// the inter-step teardown, so `StepStart[k+1]` reads MORE than
 /// `StepEnd[k]` and the cross-step `StepEnd[k]` -> `StepStart[k+1]` pair
 /// WOULD yield a rate. But that pair has an `is_step_end` `prev`, so the
-/// attribution loop's guard skips it before `rate_to`/`or_insert` ever
+/// attribution loop's guard skips it before `rate_components`/`or_insert` ever
 /// run — the cross-step rate is never even computed, and each step
 /// reports only its own step-local `StepStart[k]` -> `StepEnd[k]`
 /// throughput. (`or_insert` is a redundant secondary safety here, not
@@ -2693,7 +2693,8 @@ fn build_phase_buckets_with_stimulus_stalled_step_reports_measured_zero() {
         is_step_end: true,
     };
     // Step 1 STALLED: StepStart[1] == StepEnd[1] == 0, so its step-local
-    // pair is rate_to Some(0.0) — measured zero throughput. A persistent
+    // pair is rate_components (0.0, secs), derived iteration_rate 0.0 —
+    // measured zero throughput. A persistent
     // population then advances 500 during the 100ms teardown gap, so the
     // cross-step StepEnd[1](0) -> StepStart[2](500) pair WOULD compute
     // 500/0.1s = 5000/s — which must NOT land in bucket 1 (it is
@@ -2727,6 +2728,67 @@ fn build_phase_buckets_with_stimulus_stalled_step_reports_measured_zero() {
         Some(1_000.0),
         "step 2 still reports its own step-local rate; got {:?}",
         step2.metrics.get("iteration_rate"),
+    );
+}
+
+/// Pins the ms→s unit conversion + end-to-end component emission for the
+/// iteration_rate Rate: a step over a 2000ms window with a 1000-iteration
+/// delta must emit total_phase_duration_sec == 2.0 (NOT 2000 — the /1000
+/// lives in the component because derive_rate_metrics does a bare num/den)
+/// and total_phase_iterations == 1000, so the re-derived iteration_rate is
+/// 1000 / 2.0 = 500/s. A regression leaving the denominator in ms would
+/// derive 1000/2000 = 0.5 and pass every type/naming gate silently.
+#[test]
+fn build_phase_buckets_with_stimulus_emits_rate_components_in_seconds() {
+    use crate::timeline::StimulusEvent;
+    // No capture samples for step 1 → the synthesized-bucket seam creates
+    // it and the attribution loop fills the components from the stimulus.
+    let samples = SampleSeries::from_drained_typed(vec![], None);
+    let stimulus = vec![
+        StimulusEvent {
+            elapsed_ms: 1_000,
+            label: "StepStart[1]".to_string(),
+            op_kind: None,
+            detail: None,
+            total_iterations: Some(0),
+            step_index: Some(1),
+            is_terminal: false,
+            is_step_end: false,
+        },
+        StimulusEvent {
+            elapsed_ms: 3_000, // 2000ms = 2.0s window
+            label: "StepEnd[1]".to_string(),
+            op_kind: None,
+            detail: None,
+            total_iterations: Some(1_000), // 1000-iteration delta
+            step_index: Some(1),
+            is_terminal: false,
+            is_step_end: true,
+        },
+        StimulusEvent::terminal(3_100, 1_000),
+    ];
+    let phases = crate::assert::build_phase_buckets_with_stimulus(&samples, &stimulus);
+    let step1 = phases
+        .iter()
+        .find(|p| p.step_index == 1)
+        .expect("step 1 bucket synthesized from stimulus");
+    assert_eq!(
+        step1.metrics.get("total_phase_duration_sec").copied(),
+        Some(2.0),
+        "duration component is SECONDS (2000ms / 1000), not ms; got {:?}",
+        step1.metrics.get("total_phase_duration_sec"),
+    );
+    assert_eq!(
+        step1.metrics.get("total_phase_iterations").copied(),
+        Some(1_000.0),
+        "iteration component is the 1000-iteration delta",
+    );
+    assert_eq!(
+        step1.metrics.get("iteration_rate").copied(),
+        Some(500.0),
+        "derived iteration_rate = 1000 iters / 2.0 s = 500/s (NOT 0.5 from a \
+         ms denominator); got {:?}",
+        step1.metrics.get("iteration_rate"),
     );
 }
 
@@ -2945,9 +3007,11 @@ fn populate_run_ext_metrics_populated_series_inserts_expected_keys() {
     );
 }
 
-/// populate_run_ext_metrics_from_phases populates per-phase
-/// metrics that have no read_sample dispatch (avg_imbalance_ratio,
-/// iteration_rate). Weighted-mean fold across phases.
+/// populate_run_ext_metrics_from_phases folds per-phase metrics that
+/// have no read_sample dispatch (e.g. avg_imbalance_ratio) by a
+/// Gauge(Avg) weighted mean across phases. (iteration_rate, also without
+/// read_sample dispatch, is a MetricKind::Rate — re-pooled from its
+/// summed components, not weighted-mean folded.)
 #[test]
 fn populate_run_ext_metrics_from_phases_folds_per_phase_keys() {
     use crate::assert::PhaseBucket;
@@ -2989,19 +3053,29 @@ fn populate_run_ext_metrics_from_phases_folds_per_phase_keys() {
 }
 
 /// A synthesized zero-capture phase (sample_count==0) still folds into
-/// the run aggregate at weight 1 via the .max(1) floor — its
-/// capture-independent iteration_rate is INCLUDED, not zero-weighted
-/// out. A regression dropping the floor (bare sample_count) would
-/// zero-weight the synthesized step and silently re-drop its rate from
-/// the sidecar aggregate: the run-level variant of the #4 bug.
+/// the run aggregate — its capture-independent iteration_rate is
+/// INCLUDED, not dropped. iteration_rate is now a MetricKind::Rate, so
+/// inclusion is via its Counter components (total_phase_iterations /
+/// total_phase_duration_sec) SUMMING across phases (weights ignored — see
+/// aggregate_finite) and the rate re-deriving as Σiters/Σseconds. A
+/// regression dropping the synthesized phase would silently re-drop its
+/// iterations from the sidecar aggregate: the run-level variant of the #4
+/// bug. Unequal phase durations make the re-pool (450) distinct from both
+/// a mean-of-ratios (500) and a dropped-synthesized result (400).
 #[test]
-fn populate_run_ext_metrics_includes_zero_capture_phase_at_weight_one() {
+fn populate_run_ext_metrics_repools_synthesized_zero_capture_phase() {
     use crate::assert::PhaseBucket;
     use std::collections::BTreeMap;
-    let mut cap = BTreeMap::new();
-    cap.insert("iteration_rate".to_string(), 1200.0);
-    let mut synth = BTreeMap::new();
-    synth.insert("iteration_rate".to_string(), 600.0);
+    // Captured phase: 1200 iters over 3s = 400/s.
+    let cap = BTreeMap::from([
+        ("total_phase_iterations".to_string(), 1200.0),
+        ("total_phase_duration_sec".to_string(), 3.0),
+    ]);
+    // Synthesized zero-capture phase: 600 iters over 1s = 600/s.
+    let synth = BTreeMap::from([
+        ("total_phase_iterations".to_string(), 600.0),
+        ("total_phase_duration_sec".to_string(), 1.0),
+    ]);
     let phases = vec![
         PhaseBucket {
             step_index: 1,
@@ -3022,15 +3096,23 @@ fn populate_run_ext_metrics_includes_zero_capture_phase_at_weight_one() {
     ];
     let mut target = BTreeMap::new();
     crate::assert::populate_run_ext_metrics_from_phases(&phases, &mut target);
-    // iteration_rate is Gauge(Avg); weighted mean with the zero-capture
-    // phase floored to weight 1: (1200*5 + 600*1) / (5+1) = 6600/6 = 1100.
+    // Re-pool: Σiters / Σseconds = (1200 + 600) / (3 + 1) = 1800/4 = 450/s.
+    // The synthesized phase's 600 iters are SUMMED in (Counters ignore the
+    // sample_count weight), so 450 — NOT 400 (synthesized dropped, 1200/3)
+    // and NOT 500 (mean of the two ready ratios 400 and 600).
     let r = target
         .get("iteration_rate")
         .copied()
-        .expect("synthesized zero-capture phase must still fold into the run aggregate");
+        .expect("synthesized zero-capture phase's components must re-pool into iteration_rate");
     assert!(
-        (r - 1100.0).abs() < f64::EPSILON,
-        "expected weight-5:1 mean 1100.0 (zero-capture phase counted at \
-         weight 1, NOT dropped), got {r}",
+        (r - 450.0).abs() < f64::EPSILON,
+        "expected re-pooled 450/s (synthesized 600 iters summed in), NOT \
+         400 (dropped) or 500 (mean of ratios); got {r}",
+    );
+    // The summed components survive for any further re-derivation.
+    assert_eq!(
+        target.get("total_phase_iterations").copied(),
+        Some(1800.0),
+        "components sum across phases (weights ignored for Counters)",
     );
 }

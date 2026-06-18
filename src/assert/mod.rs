@@ -1761,9 +1761,9 @@ impl PhaseBucket {
 ///   sides' per-phase means weighted by sample population, each weight
 ///   floored at 1. The `.max(1)` floor (mirroring
 ///   `populate_run_ext_metrics_from_phases`) keeps a synthesized
-///   zero-capture bucket's capture-independent value (e.g.
-///   `iteration_rate` from stimulus deltas) contributing one
-///   phase-observation of weight rather than being zero-weighted out of
+///   zero-capture bucket's capture-independent Gauge(Avg) value
+///   contributing one phase-observation of weight rather than being
+///   zero-weighted out of
 ///   the merge — the silent-drop the synthesize seam exists to prevent.
 ///   With both counts > 0 the floor is a no-op (the plain
 ///   sample-population weighting); both counts zero degenerates to
@@ -1869,19 +1869,20 @@ fn merge_metric_values(
         Some(MetricKind::Counter) | Some(MetricKind::DeltaSum) => a + b,
         Some(MetricKind::Peak) | Some(MetricKind::Gauge(GaugeAgg::Max)) => a.max(b),
         Some(MetricKind::Gauge(GaugeAgg::Avg)) => {
-            // Weight by sample_count, floored at 1: a synthesized
-            // zero-capture bucket (sample_count==0) carrying a
-            // capture-independent value (e.g. iteration_rate from
-            // stimulus StepStart/StepEnd deltas, recovered by
-            // build_phase_buckets_with_stimulus) must contribute one
-            // phase-observation of weight, not be zero-weighted out of
-            // the merge — that would silently drop the very rate the
-            // synthesize seam recovers. Mirrors the .max(1) floor in
+            // Weight by sample_count, floored at 1: a sample_count==0
+            // bucket carrying a capture-independent Gauge(Avg) value must
+            // contribute one phase-observation of weight, not be
+            // zero-weighted out of the merge. Mirrors the .max(1) floor in
             // populate_run_ext_metrics_from_phases. With both counts > 0
             // the floor is a no-op (the prior sample_count weighting);
             // with both 0 each still floors to weight 1, giving the
             // (a+b)/2 equal-weight mean (the aggregate_samples_weighted
             // zero-total-weight fallback is unreachable from here).
+            // (iteration_rate — the original synthesized zero-capture case —
+            // is now a MetricKind::Rate: merge_matched_phase_buckets skips it
+            // via the Rate `continue` in its key loop (above this fn) and
+            // re-pools it from its summed Counter components, so a Rate value
+            // never reaches this Gauge(Avg) fold.)
             let a_w = a_count.max(1) as f64;
             let b_w = b_count.max(1) as f64;
             (a * a_w + b * b_w) / (a_w + b_w)
@@ -2251,16 +2252,21 @@ pub fn populate_run_ext_metrics_from_phases(
         // Per-phase (value, sample_count) for the kind-aware fold.
         // A phase that doesn't carry the key contributes nothing.
         // Lock-step shape enforced by the (f64, usize) pair type.
-        // `sample_count.max(1)` is load-bearing: a synthesized
-        // zero-capture phase (the build_phase_buckets_with_stimulus
-        // seam) carries a real capture-independent value — iteration_rate
-        // from stimulus StepStart/StepEnd deltas — at sample_count==0.
-        // The floor gives it weight 1 (one phase observation) so its rate
-        // is INCLUDED in the run-level Gauge(Avg) mean rather than
-        // zero-weighted out; this is the run-aggregate completion of the
-        // per-step #4 fix. A regression dropping the floor (bare
-        // sample_count) would silently re-drop a zero-capture step's rate
-        // from the sidecar aggregate.
+        // `sample_count.max(1)` is load-bearing for Gauge(Avg) keys: a
+        // synthesized zero-capture phase (the
+        // build_phase_buckets_with_stimulus seam) carrying a
+        // capture-independent Gauge(Avg) value at sample_count==0 gets
+        // weight 1 (one phase observation) rather than being zero-weighted
+        // out of the run-level mean. The floor is a no-op for
+        // Counter/DeltaSum keys, which sum with weights ignored (see
+        // aggregate_finite): iteration_rate's components
+        // total_phase_iterations / total_phase_duration_sec are such
+        // Counters, so a synthesized step's iterations are INCLUDED in the
+        // re-pooled iteration_rate via the sum — the run-aggregate
+        // completion of the per-step #4 fix (iteration_rate itself is a
+        // Rate, skipped above and re-derived below). A regression dropping
+        // the floor would silently re-drop a zero-capture step's Gauge(Avg)
+        // value from the sidecar aggregate.
         let pairs: Vec<(f64, usize)> = phases
             .iter()
             .filter_map(|phase| {
@@ -2413,23 +2419,28 @@ pub fn populate_run_ext_metrics(
 /// `StepStart` is never a `prev` with a successor and it reports no
 /// rate.
 ///
-/// iteration_rate is registered as `Gauge(Avg)` with `HigherBetter`
-/// polarity (more throughput is better). Its per-run run-scalar fold
-/// (one run's per-phase values → that run's `ext_metrics`) runs through
-/// `populate_run_ext_metrics_from_phases`, which folds with
-/// `crate::stats::aggregate_samples_weighted` (a `sample_count`-WEIGHTED
-/// mean, each phase weight floored at 1 — NOT the unweighted
-/// `crate::stats::aggregate_samples`). The `.max(1)` floor keeps a
-/// synthesized zero-capture phase's stimulus-derived rate in the run
-/// scalar rather than zero-weighting it out. Across cgroups/assertions
-/// WITHIN a run, the `ext_metrics` fold in `AssertResult::merge` is a
-/// worst-case polarity (min/max) fold — correct for this `Gauge(Avg)`
-/// metric and the `worst_*` family, but NOT a re-pool. The genuine
-/// cross-sidecar-run rollup is `group_and_average_by`, which DOES re-pool
-/// a `MetricKind::Rate` via its `derive_rate_metrics` post-pass. Were
-/// `iteration_rate` migrated to Rate, the per-phase, ext-metrics-reducer,
-/// and cross-sidecar-run re-pool would already cover it; only the
-/// cross-cgroup `AssertResult::merge` axis would need separate wiring.
+/// iteration_rate is registered as `MetricKind::Rate` with the Counter
+/// components `total_phase_iterations` / `total_phase_duration_sec` and
+/// `HigherBetter` polarity (more throughput is better). The per-step
+/// producer below emits those two components (the iteration delta and the
+/// window seconds — the ms→s `/1000` applied at the component, since
+/// `derive_rate_metrics` does a bare num/den) rather than a ready ratio,
+/// and the `derive_rate_metrics` post-pass re-derives `iteration_rate` =
+/// Σiterations / Σseconds at every in-map aggregation level. Its per-run
+/// run-scalar fold (one run's per-phase values → that run's `ext_metrics`)
+/// runs through `populate_run_ext_metrics_from_phases`, which SUMS the
+/// Counter components across phases (a synthesized zero-capture phase's
+/// components are summed in, not zero-weighted out — the run-aggregate
+/// completion of the per-step #4 fix) and re-derives the rate. The
+/// cross-sidecar-run rollup `group_and_average_by` likewise re-pools via
+/// its `derive_rate_metrics` post-pass. The cross-cgroup axis is NOT yet
+/// re-pooled: `AssertResult::merge`'s `ext_metrics` fold is a worst-case
+/// polarity min/max fold (correct for the `worst_*` family), but in the
+/// current data flow iteration_rate and its two components are host-injected
+/// by `populate_run_ext_metrics_from_phases` (the eval layer) AFTER the
+/// cross-cgroup `merge`, so that fold never sees them. A cross-cgroup
+/// Σnum/Σdenom re-pool would require lifting the components into the merge
+/// (or injecting them before it) — the deferred follow-up.
 ///
 /// Live caller: `evaluate_vm_result` at `src/test_support/eval/mod.rs`
 /// — has both the SampleSeries and the stimulus_events vec in scope.
@@ -2578,21 +2589,27 @@ pub fn build_phase_buckets_with_stimulus(
         //   timestamp-window branch below and attach a bogus rate.
         // - StepEnd[k] carries step_index k (same as StepStart[k]); if its
         //   step's own StepStart[k] -> StepEnd[k] pair returned None (a
-        //   stalled step, e <= s — see StimulusEvent::rate_to), the bucket
-        //   k key is still empty, so without this guard the next pair
-        //   StepEnd[k] -> StepStart[k+1] would or_insert an inter-step
-        //   teardown-gap rate into bucket k, mislabeling gap throughput as
-        //   step k's. A stalled step must report no rate, not a leaked gap
-        //   rate. With the guard, bucket k is sourced ONLY by its
-        //   StepStart[k] -> StepEnd[k] pair.
+        //   BACKWARD count, e < s — a counter reset; a stalled step e == s
+        //   instead yields a measured-ZERO rate, see
+        //   StimulusEvent::rate_components), the bucket k key is still empty,
+        //   so without this guard the next pair StepEnd[k] -> StepStart[k+1]
+        //   would or_insert an inter-step teardown-gap rate into bucket k,
+        //   mislabeling gap throughput as step k's. The guard keeps bucket k
+        //   sourced ONLY by its own StepStart[k] -> StepEnd[k] pair (whether
+        //   a measured zero or a real rate), never a leaked gap rate.
         if prev.is_terminal || prev.is_step_end {
             continue;
         }
-        // Shared formula with Timeline::build via StimulusEvent::rate_to
-        // (the sole iteration_rate site): None when the count did not
-        // advance, an event lacks total_iterations, or the window is
-        // zero-length.
-        let Some(rate) = prev.rate_to(curr) else {
+        // Emit the iteration_rate Rate's two components (the per-step
+        // iteration delta + window seconds) rather than the ready ratio, so
+        // derive_rate_metrics re-pools Σiters/Σseconds at every aggregation
+        // level. rate_components is None only when the count went BACKWARD
+        // (e < s, a counter reset), an event lacks total_iterations, or the
+        // window is zero-length; a non-advancing count (e == s over a
+        // positive window) yields Some((0.0, secs)) — a measured zero, not
+        // None (the same shared formula Timeline::build's rate_to divides
+        // for display).
+        let Some((iters, secs)) = prev.rate_components(curr) else {
             continue;
         };
         // Attribute the rate to the step PREV starts: the guards above
@@ -2626,10 +2643,19 @@ pub fn build_phase_buckets_with_stimulus(
                 }
             };
             if in_bucket {
+                // Both components come from the SAME (prev, curr) pair and are
+                // inserted together; or_insert keeps the first pair that
+                // matched this bucket (mirrors the prior first-wins
+                // iteration_rate attribution). The derive_rate_metrics
+                // post-pass below produces iteration_rate from them.
                 bucket
                     .metrics
-                    .entry("iteration_rate".to_string())
-                    .or_insert(rate);
+                    .entry("total_phase_iterations".to_string())
+                    .or_insert(iters);
+                bucket
+                    .metrics
+                    .entry("total_phase_duration_sec".to_string())
+                    .or_insert(secs);
                 break;
             }
         }
