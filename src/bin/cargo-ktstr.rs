@@ -170,6 +170,8 @@ fn main() {
             dual_run,
             threshold,
             policy,
+            a_scheduler,
+            b_scheduler,
             no_phases,
             phases_only,
             steps_only,
@@ -185,6 +187,8 @@ fn main() {
                 dual_run,
                 threshold,
                 policy: policy.as_deref(),
+                a_scheduler: a_scheduler.as_deref(),
+                b_scheduler: b_scheduler.as_deref(),
                 phase_display: ktstr::cli::PhaseDisplayOptions {
                     no_phases,
                     phases_only,

@@ -1258,6 +1258,21 @@ The resolved baseline is shortened to the 7-hex form the sidecar
 `project_commit` records, so it lines up with pooled runs directly. The
 command bails if the baseline resolves to HEAD (nothing to compare).
 
+**Two comparison axes:**
+
+- **commit axis** (default) — HEAD vs a baseline commit, partitioned by
+  `project_commit` (baseline resolution above; source models below).
+- **config axis** (`--a-scheduler X --b-scheduler Y`) — two scheduler
+  configs at the SAME commit, partitioned by `scheduler`: the "is config
+  B not slower than A on this case" gate. It compares runs already
+  pooled from a `cargo ktstr test` that exercised both schedulers (the
+  test declares the scheduler enums), so it needs no worktree and
+  conflicts with the commit-axis flags (`--base` / `--base-ref` /
+  `--dual-run`). Both `--a-scheduler` and `--b-scheduler` are required
+  together.
+
+The baseline resolution and source models below are the **commit axis**.
+
 **Two source models for the baseline run's sidecars:**
 
 - **default (cached-baseline)** — compares sidecars ALREADY pooled
@@ -1288,6 +1303,7 @@ exits `0` — an empty perf set is "nothing to compare", not a failure.
 | `-E, --filter EXPR` | all `performance_mode` | Nextest filter narrowing within the `performance_mode` set. |
 | `--threshold PCT` | registry defaults | Uniform relative regression gate (percent). Mutually exclusive with `--policy`. |
 | `--policy PATH` | registry defaults | Per-metric threshold JSON. Mutually exclusive with `--threshold`. Schema: see [`stats compare`](#stats). |
+| `--a-scheduler X` / `--b-scheduler Y` | — | CONFIG axis: compare two scheduler configs at the same commit (partitioned by `scheduler`). Both required together; conflict with the commit-axis flags `--base`/`--base-ref`/`--dual-run`. |
 | `--no-phases` / `--phases-only` / `--steps-only` / `--phase N` / `--phase-threshold PCT` | full per-phase render | Per-phase output projection (render-only; does not change the verdict). Same flags as `stats compare`. |
 
 Runnable as `just perf-delta <kernel> [base]`.

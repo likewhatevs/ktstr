@@ -277,6 +277,17 @@ pub(crate) enum KtstrCommand {
         /// `cargo ktstr stats compare --help` for the schema.
         #[arg(long, conflicts_with = "threshold")]
         policy: Option<std::path::PathBuf>,
+        /// CONFIG axis: compare this scheduler config against
+        /// `--b-scheduler` at the SAME commit (partitioned by
+        /// `scheduler`), instead of the commit axis. Both flags are
+        /// required together. Compares runs already pooled from a
+        /// `cargo ktstr test` that exercised both schedulers, so it
+        /// conflicts with the commit-axis run-production flags.
+        #[arg(long, requires = "b_scheduler", conflicts_with_all = ["base", "base_ref", "dual_run"])]
+        a_scheduler: Option<String>,
+        /// CONFIG axis B side — see `--a-scheduler`.
+        #[arg(long, requires = "a_scheduler", conflicts_with_all = ["base", "base_ref", "dual_run"])]
+        b_scheduler: Option<String>,
         /// Suppress the per-phase delta tables entirely. Mutually
         /// exclusive with every other phase flag.
         #[arg(

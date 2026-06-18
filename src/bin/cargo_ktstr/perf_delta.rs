@@ -361,21 +361,99 @@ pub(crate) struct PerfDeltaArgs<'a> {
     /// the compare's `PhaseDisplayOptions`. Render-only — does not
     /// change the regression verdict / exit code.
     pub phase_display: cli::PhaseDisplayOptions,
+    /// `--a-scheduler <X>` — CONFIG axis A side. When set with
+    /// `b_scheduler`, perf-delta compares two scheduler configs at the
+    /// SAME commit (partitioned by `scheduler`) instead of the commit
+    /// axis. Both required together; conflict with `--base`/`--base-ref`/
+    /// `--dual-run`.
+    pub a_scheduler: Option<&'a str>,
+    /// `--b-scheduler <Y>` — CONFIG axis B side. See [`Self::a_scheduler`].
+    pub b_scheduler: Option<&'a str>,
 }
 
-/// Resolve the `(baseline, HEAD)` commit pair and A/B-compare their
-/// sidecars via the existing `compare_partitions` engine, returning its
-/// exit code (non-zero on a regression). The compare pairs per-scenario
-/// and applies each metric's polarity + abs/rel thresholds.
+/// Build the CONFIG-axis (scheduler A vs B at the SAME commit) compare
+/// filters, validating the pair. Returns `Ok(None)` when no config-axis
+/// flag is set — the caller falls through to the COMMIT axis. Pure (no
+/// gix / no I/O) so the axis-selection + validation is unit-testable.
 ///
-/// Two source models for the baseline run's sidecars:
-/// - default (cached-baseline): compares sidecars ALREADY pooled under
-///   the runs-root from a prior run or a downloaded CI artifact.
-/// - `--dual-run`: [`dual_run`] PRODUCES both commits' runs first —
-///   the baseline in a detached git worktree, HEAD in the working tree,
-///   both `performance_mode`-only (`KTSTR_PERF_ONLY`) and narrowed by
-///   the `-E` filter — then this compares the freshly pooled sidecars.
+/// The config axis does NOT produce runs: both scheduler configs are
+/// expected already pooled from a `cargo ktstr test` that exercised both
+/// (the test declares the scheduler enums), so it compares post-hoc —
+/// hence it conflicts with the commit-axis run-production flags
+/// (`--base` / `--base-ref` / `--dual-run`).
+fn config_axis_filters(
+    a_scheduler: Option<&str>,
+    b_scheduler: Option<&str>,
+    has_commit_axis_flag: bool,
+) -> Result<Option<crate::stats::BuildCompareFilters>> {
+    match (a_scheduler, b_scheduler) {
+        (None, None) => Ok(None),
+        (Some(a), Some(b)) => {
+            if has_commit_axis_flag {
+                anyhow::bail!(
+                    "--a-scheduler/--b-scheduler (config axis) conflicts with the commit axis \
+                     (--base / --base-ref / --dual-run) — pick one axis"
+                );
+            }
+            if a == b {
+                anyhow::bail!(
+                    "--a-scheduler and --b-scheduler are identical ({a}) — nothing to compare"
+                );
+            }
+            Ok(Some(crate::stats::BuildCompareFilters {
+                a_scheduler: vec![a.to_string()],
+                b_scheduler: vec![b.to_string()],
+                ..Default::default()
+            }))
+        }
+        _ => anyhow::bail!("the config axis needs BOTH --a-scheduler and --b-scheduler"),
+    }
+}
+
+/// A/B-compare two perf runs via the existing `compare_partitions`
+/// engine, returning its exit code (non-zero on a regression). The
+/// compare pairs per-scenario and applies each metric's polarity +
+/// abs/rel thresholds. Two axes:
+///
+/// - COMMIT axis (default): HEAD vs a baseline commit, partitioned by
+///   `project_commit`. Sidecars come either from the pool already
+///   (cached-baseline) or from `--dual-run`, which [`dual_run`] PRODUCES
+///   in a detached git worktree (baseline) + the working tree (HEAD),
+///   both `performance_mode`-only and `-E`-narrowed.
+/// - CONFIG axis (`--a-scheduler X --b-scheduler Y`): two scheduler
+///   configs at the SAME commit, partitioned by `scheduler`. Compares
+///   sidecars already pooled from a `cargo ktstr test` that exercised
+///   both — the "is config B not slower than A on this case" gate.
 pub(crate) fn run(args: &PerfDeltaArgs<'_>) -> Result<i32> {
+    // Regression sensitivity from --threshold / --policy via the shared
+    // resolver (same as `stats compare`); shared by both axes.
+    let policy = cli::ComparisonPolicy::from_cli_flags(args.threshold, args.policy)
+        .context("resolve --threshold / --policy")?;
+
+    // Config axis short-circuit: no gix / repo needed (same commit).
+    let has_commit_axis_flag = args.dual_run || args.base.is_some() || args.base_ref.is_some();
+    if let Some(build) =
+        config_axis_filters(args.a_scheduler, args.b_scheduler, has_commit_axis_flag)?
+    {
+        // SAFETY: config_axis_filters returns Some only when both are set.
+        let (a, b) = (args.a_scheduler.unwrap_or(""), args.b_scheduler.unwrap_or(""));
+        println!("perf-delta: scheduler {b} vs {a} (config axis, same commit)");
+        println!(
+            "  perf tests: {}",
+            args.filter.unwrap_or("all performance_mode tests")
+        );
+        let (filter_a, filter_b) = build.build();
+        return cli::compare_partitions(
+            &filter_a,
+            &filter_b,
+            None,
+            &policy,
+            None,
+            false,
+            &args.phase_display,
+        );
+    }
+
     let cwd = std::env::current_dir().context("get cwd")?;
     let repo = gix::discover(&cwd).context("discover git repository")?;
     let env_base = std::env::var("GITHUB_BASE_REF").ok();
@@ -437,11 +515,6 @@ pub(crate) fn run(args: &PerfDeltaArgs<'_>) -> Result<i32> {
         ..Default::default()
     };
     let (filter_a, filter_b) = build.build();
-    // Resolve the regression sensitivity from --threshold / --policy
-    // via the shared resolver (same as `stats compare`); neither flag
-    // falls through to the registry per-metric defaults.
-    let policy = cli::ComparisonPolicy::from_cli_flags(args.threshold, args.policy)
-        .context("resolve --threshold / --policy")?;
     cli::compare_partitions(
         &filter_a,
         &filter_b,
@@ -703,5 +776,49 @@ mod tests {
         assert!(sh.bytes().all(|b| b.is_ascii_hexdigit()), "hex only: {sh}");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- config axis (scheduler A vs B) selection + validation ----
+
+    #[test]
+    fn config_axis_none_falls_through_to_commit_axis() {
+        assert!(
+            config_axis_filters(None, None, false).unwrap().is_none(),
+            "no scheduler flags -> commit axis (None)",
+        );
+        // The commit-axis flag is irrelevant when no scheduler is set.
+        assert!(config_axis_filters(None, None, true).unwrap().is_none());
+    }
+
+    #[test]
+    fn config_axis_both_set_builds_scheduler_filters() {
+        let build = config_axis_filters(Some("scx_a"), Some("scx_b"), false)
+            .unwrap()
+            .expect("both set -> config axis");
+        assert_eq!(build.a_scheduler, vec!["scx_a".to_string()]);
+        assert_eq!(build.b_scheduler, vec!["scx_b".to_string()]);
+        // No commit-axis filter leaks in.
+        assert!(build.a_project_commit.is_empty() && build.b_project_commit.is_empty());
+        // The built RowFilters slice on scheduler, A vs B.
+        let (fa, fb) = build.build();
+        assert_eq!(fa.schedulers, vec!["scx_a".to_string()]);
+        assert_eq!(fb.schedulers, vec!["scx_b".to_string()]);
+    }
+
+    #[test]
+    fn config_axis_rejects_partial_conflict_and_identical() {
+        // Only one side set.
+        assert!(config_axis_filters(Some("scx_a"), None, false).is_err());
+        assert!(config_axis_filters(None, Some("scx_b"), false).is_err());
+        // Both set but a commit-axis flag also present.
+        assert!(
+            config_axis_filters(Some("scx_a"), Some("scx_b"), true).is_err(),
+            "config axis must conflict with the commit axis",
+        );
+        // Identical sides — nothing to compare.
+        assert!(
+            config_axis_filters(Some("scx_a"), Some("scx_a"), false).is_err(),
+            "identical schedulers have no contrast",
+        );
     }
 }

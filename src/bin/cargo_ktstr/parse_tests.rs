@@ -127,6 +127,8 @@ fn parse_perf_delta_flags_and_defaults() {
             dual_run,
             threshold,
             policy,
+            a_scheduler,
+            b_scheduler,
             no_phases,
             phases_only,
             steps_only,
@@ -141,6 +143,10 @@ fn parse_perf_delta_flags_and_defaults() {
             assert!(dual_run, "--dual-run flag sets dual_run");
             assert_eq!(threshold, Some(12.5));
             assert!(policy.is_none());
+            assert!(
+                a_scheduler.is_none() && b_scheduler.is_none(),
+                "commit-axis invocation sets no scheduler flags",
+            );
             assert!(phases_only, "--phases-only sets phases_only");
             assert_eq!(phase_threshold, Some(5.0));
             assert!(!no_phases && !steps_only && phase.is_none());
@@ -161,6 +167,8 @@ fn parse_perf_delta_flags_and_defaults() {
             dual_run,
             threshold,
             policy,
+            a_scheduler,
+            b_scheduler,
             no_phases,
             phases_only,
             steps_only,
@@ -172,6 +180,7 @@ fn parse_perf_delta_flags_and_defaults() {
             assert!(kernel.is_none());
             assert!(!dual_run, "--dual-run defaults off (cached-baseline path)");
             assert!(threshold.is_none() && policy.is_none());
+            assert!(a_scheduler.is_none() && b_scheduler.is_none());
             assert!(
                 !no_phases && !phases_only && !steps_only && phase.is_none() && phase_threshold.is_none(),
                 "phase flags default off (full per-phase render)",
@@ -179,6 +188,38 @@ fn parse_perf_delta_flags_and_defaults() {
         }
         _ => panic!("expected PerfDelta"),
     }
+    // Config axis: --a-scheduler/--b-scheduler round-trip.
+    let Cargo {
+        command: CargoSub::Ktstr(k),
+    } = Cargo::try_parse_from([
+        "cargo", "ktstr", "perf-delta", "--a-scheduler", "scx_a", "--b-scheduler", "scx_b",
+    ])
+    .unwrap_or_else(|e| panic!("{e}"));
+    match k.command {
+        KtstrCommand::PerfDelta {
+            a_scheduler,
+            b_scheduler,
+            ..
+        } => {
+            assert_eq!(a_scheduler.as_deref(), Some("scx_a"));
+            assert_eq!(b_scheduler.as_deref(), Some("scx_b"));
+        }
+        _ => panic!("expected PerfDelta"),
+    }
+    // --a-scheduler requires --b-scheduler (both-or-neither at parse time).
+    assert!(
+        Cargo::try_parse_from(["cargo", "ktstr", "perf-delta", "--a-scheduler", "scx_a"]).is_err(),
+        "--a-scheduler alone must fail (requires --b-scheduler)",
+    );
+    // Config axis conflicts with the commit axis at parse time.
+    assert!(
+        Cargo::try_parse_from([
+            "cargo", "ktstr", "perf-delta", "--a-scheduler", "scx_a", "--b-scheduler", "scx_b",
+            "--dual-run",
+        ])
+        .is_err(),
+        "config axis (--a-scheduler/--b-scheduler) must conflict with --dual-run",
+    );
     // --threshold and --policy are mutually exclusive.
     assert!(
         Cargo::try_parse_from([
