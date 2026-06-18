@@ -2956,10 +2956,27 @@ pub fn sidecar_to_row(sc: &crate::test_support::SidecarResult) -> GauntletRow {
             "worst_wake_latency_tail_ratio",
             sc.stats.worst_wake_latency_tail_ratio,
         ),
-        worst_iterations_per_worker: finite_or_zero(
-            "worst_iterations_per_worker",
-            sc.stats.worst_iterations_per_worker,
-        ),
+        // `worst_iterations_per_worker` is `Option` on ScenarioStats
+        // (None = no cgroup reported a worker; Some(0.0) = a cgroup
+        // ran zero iterations). The GauntletRow field uses this
+        // layer's documented 0.0-sentinel-with-warn convention (see
+        // the doc above): a measured Some(0.0) maps to 0.0 (real
+        // starvation, surfaced), and None warns and maps to 0.0 like
+        // any other no-data field at this ingress. The cross-cgroup
+        // None/Some(0.0) distinction is preserved upstream in
+        // AssertResult::merge; this boundary matches the gauntlet
+        // layer's uniform sentinel handling.
+        worst_iterations_per_worker: match sc.stats.worst_iterations_per_worker {
+            Some(v) => finite_or_zero("worst_iterations_per_worker", v),
+            None => {
+                tracing::warn!(
+                    test = %sc.test_name,
+                    field = "worst_iterations_per_worker",
+                    "no cgroup reported a worker; substituting 0.0",
+                );
+                0.0
+            }
+        },
         page_locality: finite_or_zero("page_locality", sc.stats.worst_page_locality),
         cross_node_migration_ratio: finite_or_zero(
             "cross_node_migration_ratio",
@@ -6628,7 +6645,7 @@ mod tests {
                 worst_mean_run_delay_us: non_finite,
                 worst_run_delay_us: non_finite,
                 worst_wake_latency_tail_ratio: non_finite,
-                worst_iterations_per_worker: non_finite,
+                worst_iterations_per_worker: Some(non_finite),
                 worst_page_locality: non_finite,
                 worst_cross_node_migration_ratio: non_finite,
                 ..Default::default()

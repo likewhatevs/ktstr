@@ -1431,10 +1431,18 @@ impl CgroupStats {
     }
 
     /// Throughput per parallel degree:
-    /// `total_iterations / num_workers`. Returns `0.0` when
-    /// `num_workers == 0` so the result never propagates
-    /// `NaN` / `Infinity`. Method-only access (no stored shadow) —
-    /// recomputed every call from the raw fields.
+    /// `total_iterations / num_workers`. `None` when
+    /// `num_workers == 0` (no worker reported, so per-worker
+    /// throughput is undefined — distinct from a measured zero);
+    /// `Some(0.0)` when workers ran but completed zero iterations
+    /// (a real throughput collapse). The `None` / `Some(0.0)` split
+    /// is load-bearing: the cross-cgroup roll-up in
+    /// [`AssertResult::merge`] must treat a measured zero as the
+    /// worst reading (it wins the "lowest" bucket) while skipping a
+    /// no-data cgroup — collapsing both to `0.0` would hide a
+    /// starved cgroup behind the no-data sentinel. Method-only
+    /// access (no stored shadow) — recomputed every call from the
+    /// raw fields.
     ///
     /// Only meaningful across runs of the SAME variant (equal
     /// scenario duration): cross-variant comparison is misleading
@@ -1443,11 +1451,11 @@ impl CgroupStats {
     /// the scheduler is identical. `stats compare`-style
     /// comparisons hold scenario, topology, and work_type constant
     /// before reading this method.
-    pub fn iterations_per_worker(&self) -> f64 {
+    pub fn iterations_per_worker(&self) -> Option<f64> {
         if self.num_workers > 0 {
-            self.total_iterations as f64 / self.num_workers as f64
+            Some(self.total_iterations as f64 / self.num_workers as f64)
         } else {
-            0.0
+            None
         }
     }
 }
@@ -1841,26 +1849,30 @@ pub struct ScenarioStats {
     /// `stats compare` surfaces this axis in its comparison rows.
     pub worst_wake_latency_tail_ratio: f64,
     /// Worst per-worker iteration count across cgroups (LOWEST
-    /// non-zero).
+    /// reading, measured-zero included).
     ///
     /// Per-cgroup [`CgroupStats::iterations_per_worker`] is a
     /// throughput metric; the worst-case (regression-detecting)
-    /// roll-up across cgroups is the lowest non-zero value — a
-    /// cgroup that fell behind surfaces as the lowest per-worker
-    /// throughput. The fold in [`AssertResult::merge`] uses
-    /// `fold_lowest_nonzero` rather than plain `min`: the
-    /// accumulator pattern `AssertResult::pass().merge(real)`
-    /// starts at 0.0 from `Default`, and a plain min would let
-    /// that sentinel destroy any positive reading folded in. 0.0
-    /// is treated as "not reported," matching the sentinel
-    /// convention shared with [`Self::worst_page_locality`].
+    /// roll-up across cgroups is the lowest reading — a cgroup that
+    /// fell behind surfaces as the lowest per-worker throughput.
+    /// `None` means no cgroup reported a worker (the `Default`
+    /// accumulator start, and the merge result when every folded
+    /// cgroup had `num_workers == 0`); `Some(0.0)` means a cgroup
+    /// ran with zero iterations — a real starvation that the merge
+    /// surfaces as the worst reading rather than discarding as a
+    /// sentinel. The fold in [`AssertResult::merge`] is None-aware:
+    /// it skips `None` contributors (no data) but lets a
+    /// `Some(0.0)` win the "lowest" bucket. This is why the field is
+    /// `Option<f64>` and not a `0.0`-sentinel `f64` — collapsing
+    /// no-data and measured-zero to the same value would hide a
+    /// starved cgroup.
     ///
     /// Only meaningful across runs of the SAME variant — see
     /// [`CgroupStats::iterations_per_worker`] for the cross-
     /// variant caveat. Routed through `GauntletRow` and the
     /// `METRICS` registry; `stats compare` surfaces this axis
     /// in its comparison rows.
-    pub worst_iterations_per_worker: f64,
+    pub worst_iterations_per_worker: Option<f64>,
     /// Extensible metrics for the generic comparison pipeline.
     /// Populated from per-cgroup ext_metrics (worst value across cgroups).
     pub ext_metrics: BTreeMap<String, f64>,
@@ -3181,6 +3193,25 @@ impl AssertResult {
             }
         }
 
+        /// None-aware lowest fold: `Some(x)` is a real measurement
+        /// (including `Some(0.0)` — a cgroup that ran zero
+        /// iterations, the worst possible throughput), `None` is "no
+        /// data" (cgroup had no workers) and contributes nothing.
+        /// `*self_field` becomes `other` when `other` is `Some` and
+        /// either `*self_field` is `None` (nothing folded yet) or
+        /// `other`'s value is strictly smaller. Unlike
+        /// `fold_lowest_nonzero`, a measured `0.0` is NOT treated as
+        /// a sentinel — it wins the "lowest" bucket so a starved
+        /// cgroup surfaces as the worst reading instead of being
+        /// discarded.
+        fn fold_lowest_some(self_field: &mut Option<f64>, other: Option<f64>) {
+            if let Some(o) = other
+                && self_field.is_none_or(|s| o < s)
+            {
+                *self_field = Some(o);
+            }
+        }
+
         self.outcomes.extend(other.outcomes);
         self.passes.extend(other.passes);
         self.info_notes.extend(other.info_notes);
@@ -3207,15 +3238,15 @@ impl AssertResult {
         s.worst_wake_latency_tail_ratio = s
             .worst_wake_latency_tail_ratio
             .max(o.worst_wake_latency_tail_ratio);
-        // Per-worker throughput is lower-is-worse: take the
-        // lowest non-zero reading across cgroups so a cgroup
-        // falling behind wins the "worst" bucket. 0.0 is the
-        // unreported sentinel — the accumulator pattern
-        // `AssertResult::pass().merge(real)` starts at 0.0 from
-        // `Default`, so a plain min would let that sentinel
-        // destroy real measurements. See `fold_lowest_nonzero`
-        // above for the policy.
-        fold_lowest_nonzero(
+        // Per-worker throughput is lower-is-worse: take the lowest
+        // reading across cgroups so a cgroup falling behind wins the
+        // "worst" bucket. None-aware (`fold_lowest_some`): a cgroup
+        // that ran zero iterations contributes `Some(0.0)` and wins
+        // the bucket (real starvation), while a cgroup with no
+        // workers contributes `None` and is skipped. The accumulator
+        // `AssertResult::pass().merge(real)` starts at `None` from
+        // `Default`. See `fold_lowest_some` above for the policy.
+        fold_lowest_some(
             &mut s.worst_iterations_per_worker,
             o.worst_iterations_per_worker,
         );
@@ -5206,12 +5237,13 @@ fn scenario_stats_for_cgroup(cg: &CgroupStats) -> ScenarioStats {
         worst_page_locality: cg.page_locality,
         worst_cross_node_migration_ratio: cg.cross_node_migration_ratio,
         worst_wake_latency_tail_ratio: cg.wake_latency_tail_ratio(),
-        // `iterations_per_worker()` returns the per-worker throughput for
-        // this cgroup. The merge fold treats 0.0 as the unreported
-        // sentinel — the accumulator pattern
-        // `AssertResult::pass().merge(real)` starts at 0.0 from `Default`,
-        // so any positive reading from a real measurement must override
-        // the sentinel rather than be masked by a plain min.
+        // `iterations_per_worker()` is `None` when this cgroup had no
+        // workers and `Some(v)` (including `Some(0.0)` for a ran-zero
+        // cgroup) otherwise. The None-aware merge fold
+        // (`fold_lowest_some`) lets a measured zero win the "worst"
+        // bucket while skipping no-data cgroups, so the distinction is
+        // carried through as `Option` rather than collapsed to a 0.0
+        // sentinel.
         worst_iterations_per_worker: cg.iterations_per_worker(),
         ext_metrics: cg.ext_metrics.clone(),
         cgroups: vec![cg.clone()],

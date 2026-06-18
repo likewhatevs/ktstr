@@ -207,8 +207,8 @@ fn derived_ratio_methods_compute_tail_and_throughput() {
     );
     assert_eq!(
         cg.iterations_per_worker(),
-        200.0,
-        "total_iterations / num_workers = 800 / 4; got {}",
+        Some(200.0),
+        "total_iterations / num_workers = 800 / 4; got {:?}",
         cg.iterations_per_worker(),
     );
 
@@ -236,14 +236,16 @@ fn derived_ratio_methods_compute_tail_and_throughput() {
     );
     assert_eq!(
         cg.iterations_per_worker(),
-        50.0,
+        Some(50.0),
         "cross-check: median-guard branch must not zero out the \
-         independent iterations_per_worker (100 / 2 = 50); got {}",
+         independent iterations_per_worker (100 / 2 = 50); got {:?}",
         cg.iterations_per_worker(),
     );
 
-    // Zero-divisor: num_workers == 0 → iterations_per_worker stays at 0.0.
-    // Cross-check: tail_ratio lands at its non-guard value.
+    // Zero-divisor: num_workers == 0 → iterations_per_worker is None
+    // (no per-worker throughput defined — distinct from a measured
+    // zero), never a NaN/Inf. Cross-check: tail_ratio lands at its
+    // non-guard value.
     let cg = CgroupStats {
         num_workers: 0,
         total_iterations: 100,
@@ -253,14 +255,9 @@ fn derived_ratio_methods_compute_tail_and_throughput() {
     };
     assert_eq!(
         cg.iterations_per_worker(),
-        0.0,
-        "divide-by-zero guard on num_workers must yield 0.0, \
-         not NaN; got {}",
-        cg.iterations_per_worker(),
-    );
-    assert!(
-        cg.iterations_per_worker().is_finite(),
-        "iterations_per_worker must be finite; got {}",
+        None,
+        "num_workers == 0 → None (no per-worker throughput), not a \
+         0.0 sentinel and never NaN; got {:?}",
         cg.iterations_per_worker(),
     );
     assert_eq!(
@@ -305,7 +302,7 @@ fn wire_format_omits_derived_ratio_keys() {
     // Cross-check: the methods still compute correctly even though
     // the values aren't stored.
     assert_eq!(cg.wake_latency_tail_ratio(), 5.0);
-    assert_eq!(cg.iterations_per_worker(), 500.0);
+    assert_eq!(cg.iterations_per_worker(), Some(500.0));
 }
 
 /// Computed accessor edge cases not covered by the main
@@ -449,7 +446,9 @@ fn computed_accessors_handle_nan_infinity_and_negative_median() {
         total_iterations: u64::MAX,
         ..CgroupStats::default()
     };
-    let got = cg.iterations_per_worker();
+    // num_workers > 0 → Some(value); the cast `as f64` loses
+    // precision but must stay finite and positive.
+    let got = cg.iterations_per_worker().expect("num_workers > 0 => Some");
     assert!(
         got.is_finite(),
         "[u64-max-iters] iterations_per_worker must stay finite \
