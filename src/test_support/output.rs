@@ -563,6 +563,7 @@ pub(crate) fn format_periodic_samples_section(result: &vmm::VmResult) -> String 
         return String::new();
     }
     let fired = result.periodic_fired;
+    let real = result.periodic_real;
     let target = result.periodic_target;
     let mut lines = vec![format!(
         "fired {fired}/{target} periodic snapshots ({pct:.0}% coverage)",
@@ -572,6 +573,18 @@ pub(crate) fn format_periodic_samples_section(result: &vmm::VmResult) -> String 
             100.0 * fired as f64 / target as f64
         }
     )];
+    // `periodic_fired` counts every attempted boundary, including
+    // rendezvous-timeout placeholders that carry no BPF state. When
+    // some fires were placeholder-only, "100% fired" overstates
+    // usable coverage — surface the real-capture floor so the
+    // operator does not read a degraded run as fully covered.
+    if real < fired {
+        lines.push(format!(
+            "{placeholders} were degraded placeholders \
+             (real BPF-state captures: {real}/{target})",
+            placeholders = fired.saturating_sub(real),
+        ));
+    }
     // Snapshot tags / elapsed timestamps live on the bridge until
     // the test author drains it; without draining (which would
     // consume the bridge) we can only report coverage. The full
@@ -1806,11 +1819,13 @@ ktstr-5678 [002] 0.500: sched_ext_dump: scheduler[2] unrelated event from cpu 2
         let mut result = crate::vmm::VmResult::test_fixture();
         result.periodic_target = 5;
         result.periodic_fired = 5;
+        result.periodic_real = 5;
         let s = format_periodic_samples_section(&result);
         assert!(s.contains("--- periodic samples ---"));
         assert!(s.contains("fired 5/5"));
         assert!(s.contains("100% coverage"));
         assert!(!s.contains("missing"));
+        assert!(!s.contains("placeholder"));
     }
 
     /// Periodic capture configured but partially covered: section
@@ -1820,10 +1835,37 @@ ktstr-5678 [002] 0.500: sched_ext_dump: scheduler[2] unrelated event from cpu 2
         let mut result = crate::vmm::VmResult::test_fixture();
         result.periodic_target = 5;
         result.periodic_fired = 2;
+        result.periodic_real = 2;
         let s = format_periodic_samples_section(&result);
         assert!(s.contains("--- periodic samples ---"));
         assert!(s.contains("fired 2/5"));
         assert!(s.contains("missing 3"));
+        assert!(!s.contains("placeholder"));
+    }
+
+    /// Every boundary fired but some landed only a degraded
+    /// placeholder: "100% fired" must not read as full coverage —
+    /// the section surfaces the real-capture floor so the operator
+    /// sees the placeholder gap.
+    #[test]
+    fn format_periodic_samples_section_distinguishes_placeholders() {
+        let mut result = crate::vmm::VmResult::test_fixture();
+        result.periodic_target = 5;
+        result.periodic_fired = 5;
+        result.periodic_real = 2;
+        let s = format_periodic_samples_section(&result);
+        assert!(s.contains("fired 5/5"));
+        // No coverage gap (every boundary fired) ...
+        assert!(!s.contains("missing"));
+        // ... but the placeholder fills are surfaced.
+        assert!(
+            s.contains("3 were degraded placeholders"),
+            "placeholder count must surface: {s}"
+        );
+        assert!(
+            s.contains("real BPF-state captures: 2/5"),
+            "real-capture floor must surface: {s}"
+        );
     }
 
     // ---- format_temporal_assertions_section ----

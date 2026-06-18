@@ -260,6 +260,7 @@ pub(crate) fn make_vm_result(
         },
         stats_client: None,
         periodic_fired: 0,
+        periodic_real: 0,
         periodic_target: 0,
         kern_kaslr_offset: 0,
         entry_name: None,

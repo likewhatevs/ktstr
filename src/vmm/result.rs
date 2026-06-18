@@ -382,6 +382,19 @@ pub struct VmResult {
     /// [`Self::periodic_target`] flag missing samples (early VM
     /// exit, kill-flag stop, abandoned-after-timeouts).
     pub periodic_fired: u32,
+    /// Periodic captures that landed REAL BPF state — the
+    /// placeholder-excluded subset of [`Self::periodic_fired`]
+    /// (`periodic_fired` counts rendezvous-timeout placeholders as
+    /// fired). Snapshotted from
+    /// [`crate::scenario::snapshot::SnapshotBridge::periodic_real_count`]
+    /// at result-collection time so it is stable regardless of any
+    /// later test-side drain of the bridge. `periodic_real <
+    /// periodic_fired` means the gap is placeholder-only fills (the
+    /// boundary fired but the dump was degraded); the failure-output
+    /// periodic-samples section surfaces this so a "100% fired" run
+    /// whose captures were all placeholders does not read as full
+    /// coverage.
+    pub periodic_real: u32,
     /// Configured `num_snapshots` count for the entry that drove
     /// this run (mirrors the `KtstrTestEntry::num_snapshots` field
     /// the entry was registered with). `0` when periodic capture
@@ -668,6 +681,7 @@ impl VmResult {
             snapshot_bridge: empty_snapshot_bridge_for_tests(),
             stats_client: None,
             periodic_fired: 0,
+            periodic_real: 0,
             periodic_target: 0,
             kern_kaslr_offset: 0,
             entry_name: None,
@@ -1155,6 +1169,7 @@ mod tests {
             timed_out: true,
             virtio_blk_counters: Some(VirtioBlkCountersSnapshot::default()),
             periodic_fired: 3,
+            periodic_real: 2,
             periodic_target: 7,
             ..VmResult::test_fixture()
         };

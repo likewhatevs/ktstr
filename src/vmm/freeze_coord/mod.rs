@@ -12366,6 +12366,16 @@ impl KtstrVm {
         // and the drainer thread exits.
         let stats_client = run.stats_client;
 
+        // Count periodic captures that landed REAL BPF state, before
+        // the bridge is moved into the result. `periodic_fired`
+        // counts every attempted boundary including rendezvous-timeout
+        // placeholders; `periodic_real` is the placeholder-excluded
+        // floor so the failure display can distinguish "fired but
+        // degraded" from genuine coverage. Computed here (run just
+        // ended, nothing drained yet) so it is independent of any
+        // later test-side drain that would empty the bridge.
+        let periodic_real = run.snapshot_bridge.periodic_real_count();
+
         Ok(VmResult {
             success: !timed_out && exit_code == 0,
             // Default false at construction — set true (when applicable)
@@ -12409,6 +12419,7 @@ impl KtstrVm {
             snapshot_bridge: run.snapshot_bridge,
             stats_client,
             periodic_fired: run.periodic_fired,
+            periodic_real,
             periodic_target: run.periodic_target,
             // Plumb the virt-KASLR snapshot from VmRunState
             // (populated at `VmRunState { kern_kaslr_offset: ... }`
