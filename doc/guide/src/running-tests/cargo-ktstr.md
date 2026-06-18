@@ -266,7 +266,7 @@ values. CI gates and dashboards triage runs by exit code:
 | Code | Verdict      | Meaning                                                                                                                                                |
 |------|--------------|--------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `0`  | Pass / Skip  | All assertions passed, or the test never ran (host topology insufficient, resource contention). Skip degenerates to Pass at the process boundary.      |
-| `1`  | Fail         | At least one assertion failed, OR `expect_err = true` and the test produced a Pass / Inconclusive (an `expect_err` test whose gate could not evaluate is unsatisfied just as it would be on a Pass). |
+| `1`  | Fail         | At least one assertion failed; OR a requested host guarantee is impossible — `performance_mode` on a host too small for the topology (`PerfModeUnavailable`), or an explicit per-test `cpu_budget` / `--cpu-cap` the host cannot satisfy (`CpuBudgetUnsatisfiable`) — both hard errors, NOT the skips in the `0` row; OR `expect_err = true` and the test produced a Pass / Inconclusive (an `expect_err` test whose gate could not evaluate is unsatisfied just as it would be on a Pass). |
 | `2`  | Inconclusive | A zero-denominator ratio gate could not evaluate — the workload produced no signal to ratio against, so neither pass nor fail is truthful.             |
 
 Exit code `2` is the silent-pass guard: a Pass at a `≤ threshold`

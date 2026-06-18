@@ -344,6 +344,69 @@ plan, so its per-CPU loop iterates zero times — its capped LLC
 `SH` is enforced via the cgroup cpuset, and the per-LLC flock is
 sufficient coordination.
 
+When the default path cannot place the topology 1:1 it does NOT skip.
+`acquire_run_locks` tracks whether any LLC offset produced a valid
+`compute_pinning` candidate, which splits the two ways the offset walk
+comes up empty:
+
+- **No candidate (topology cannot be placed)** — `compute_pinning`
+  fails for every offset: the host has either fewer online CPUs than
+  the guest needs, or enough CPUs but too few LLC groups (it rejects
+  `virtual_llcs > host_llc_groups` regardless of CPU count). Both gates
+  read the host's online topology. Rather than skipping, the run masks
+  every vCPU thread onto `host_allowed_cpus()` and overrides the sidecar
+  `cpu_budget` to that masked allowed-CPU count. Whether the overcommit
+  is surfaced turns on the ALLOWED cpuset, not the online count: when
+  `host_allowed_cpus()` is SMALLER than `vcpus` — genuine
+  oversubscription, including a process cpuset narrower than the guest
+  (a CI runner or systemd slice can be narrower than the online host) —
+  an overcommit warning is emitted, the stamped `cpu_budget` falls below
+  `vcpus`, and the A/B-compare overcommit marker fires, so the confound
+  is durable, not silent. When the allowed cpuset still covers at least
+  `vcpus` CPUs (the candidate failed only on LLC-group count), the vCPUs
+  mask onto the full allowed set with no oversubscription, so neither
+  the warning nor the marker fires. The no-cached-topology case (sysfs
+  unreadable at build time) takes the same masked fallback.
+- **A candidate exists but every offset is busy (transient)** — a 1:1
+  plan maps, but a peer holds the lock on every offset (a perf-mode
+  `LOCK_EX` on the LLC, or a non-perf peer on the per-CPU `LOCK_EX`
+  set). The run returns `ResourceContention` (exit 0, skip); nextest
+  retries after the holder releases. It does NOT overcommit, so a
+  default test never runs on the CPUs a concurrent perf-mode test
+  reserved.
+
+## Sizing the host for tight balance
+
+"Tight balance" is running a topology on a host with just enough CPUs
+— or several `performance_mode` tests concurrently, each needing its
+own LLC. The three tiers diverge when the host cannot fit the requested
+topology, so the mode choice determines whether a too-small host fails,
+skips, or runs degraded:
+
+| Tier | Host too small for the topology | Exit |
+|------|----------------------------------|------|
+| Tier 1 (`performance_mode`) | `PerfModeUnavailable` — the isolation guarantee cannot be honored | 1 / FAIL |
+| Tier 2 — explicit `--cpu-cap` / per-test `cpu_budget` exceeds the allowed cpuset | `CpuBudgetUnsatisfiable` — the requested cap is impossible | 1 / FAIL |
+| Tier 2 — default budget (no explicit cap) | sizes down to `max(30%, min(vcpus, allowed))` and runs | 0 |
+| Tier 3 (default) | masks onto the allowed CPUs; warns + marks the sidecar only when that set is smaller than `vcpus` | 0 |
+
+The asymmetry is deliberate: an EXPLICIT request — `performance_mode`,
+or a specific cpu-budget — for a guarantee the host cannot provide is a
+hard error, because silently downscaling it would ship a measurement
+that does not match what was asked for. The DEFAULT path instead makes
+the test run regardless, surfacing any oversubscription confound through
+the overcommit warning and the sidecar `cpu_budget` stamp rather than
+failing.
+
+To size a host so a `performance_mode` test passes (Tier 1), provide
+`(llcs * cores * threads) + 1` online CPUs and at least `llcs` LLC
+groups (see [Prerequisites](#prerequisites)). To run `K`
+`performance_mode` tests CONCURRENTLY without `ResourceContention`
+skips, the host needs `K * llcs` free LLC groups — each perf-mode test
+holds `LOCK_EX` on its LLCs for the run's duration (see
+[Nextest parallelism](#nextest-parallelism)); a host with fewer LLCs
+serializes the excess via the flock retry.
+
 ## Disabling performance mode
 
 `--no-perf-mode` (or `KTSTR_NO_PERF_MODE=1`) forces
