@@ -10009,3 +10009,68 @@ fn cpumask_kptr_through_kptr_typetag_chases_to_cpu_list() {
         ),
     }
 }
+
+/// `RenderedValue::as_bool` coerces a `Ptr` to a non-null test, in
+/// lockstep with `as_u64` (which treats a pointer as its numeric
+/// address). Before the `Ptr` arm landed, a pointer fell through to
+/// `None` here while the scalar `SnapshotField::as_bool` accepted it —
+/// so `field.as_bool()` and `field.as_bool_array()` (which routes each
+/// element through THIS method) disagreed on a pointer. Pin both the
+/// non-null and null cases.
+#[test]
+fn rendered_value_as_bool_coerces_ptr_as_non_null() {
+    let non_null = RenderedValue::Ptr {
+        value: 0xffff_8000_0000_0000,
+        deref: None,
+        deref_skipped_reason: None,
+        cast_annotation: None,
+    };
+    let null = RenderedValue::Ptr {
+        value: 0,
+        deref: None,
+        deref_skipped_reason: None,
+        cast_annotation: None,
+    };
+    assert_eq!(non_null.as_bool(), Some(true), "non-null pointer is true");
+    assert_eq!(null.as_bool(), Some(false), "null pointer is false");
+    // Agreement with as_u64: both surface the pointer's numeric value.
+    assert_eq!(non_null.as_u64(), Some(0xffff_8000_0000_0000));
+    assert_eq!(null.as_u64(), Some(0));
+}
+
+/// `as_bool_array` (which calls `as_bool` per element) must accept an
+/// array of pointers now that the per-element coercion has a `Ptr`
+/// arm — previously the first pointer element collapsed the whole
+/// array to `None`, the array-path half of the scalar-vs-array
+/// divergence.
+#[test]
+fn rendered_value_as_bool_array_accepts_pointer_elements() {
+    let arr = RenderedValue::Array {
+        len: 3,
+        elements: vec![
+            RenderedValue::Ptr {
+                value: 0x1000,
+                deref: None,
+                deref_skipped_reason: None,
+                cast_annotation: None,
+            },
+            RenderedValue::Ptr {
+                value: 0,
+                deref: None,
+                deref_skipped_reason: None,
+                cast_annotation: None,
+            },
+            RenderedValue::Ptr {
+                value: 0xdead_beef,
+                deref: None,
+                deref_skipped_reason: None,
+                cast_annotation: None,
+            },
+        ],
+    };
+    assert_eq!(
+        arr.as_bool_array(),
+        Some(vec![true, false, true]),
+        "an array of pointers coerces to a per-element non-null mask",
+    );
+}
