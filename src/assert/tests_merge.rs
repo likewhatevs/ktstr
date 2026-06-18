@@ -1105,3 +1105,46 @@ fn merge_kind_enum_exhaustively_covers_metric_kind_variants() {
         MergeKind::NonCommutative,
     );
 }
+
+/// merge_matched_phase_buckets must NOT zero-weight a synthesized
+/// (sample_count==0) bucket's capture-independent iteration_rate when
+/// merging it against a captured bucket at the same step_index. The
+/// Gauge(Avg) merge floors each side's weight at 1 (mirroring
+/// populate_run_ext_metrics_from_phases), so the synthesized rate
+/// contributes one phase-observation rather than collapsing to the
+/// captured side — guarding the no-silent-drops invariant for any future
+/// cross-result phase merge (e.g. the per-cgroup phase-bucket fold).
+#[test]
+fn merge_matched_phase_buckets_floors_zero_count_gauge_avg_weight() {
+    use std::collections::BTreeMap;
+    let synth = PhaseBucket {
+        step_index: 2,
+        label: "Step[1]".to_string(),
+        start_ms: 2000,
+        end_ms: 3000,
+        sample_count: 0, // synthesized zero-capture bucket
+        metrics: BTreeMap::from([("iteration_rate".to_string(), 600.0)]),
+    };
+    let captured = PhaseBucket {
+        step_index: 2,
+        label: "Step[1]".to_string(),
+        start_ms: 2000,
+        end_ms: 3000,
+        sample_count: 5,
+        metrics: BTreeMap::from([("iteration_rate".to_string(), 1200.0)]),
+    };
+    let merged = merge_matched_phase_buckets(synth, captured);
+    // Gauge(Avg) weighted mean, zero-count side floored to weight 1:
+    // (600*1 + 1200*5) / (1+5) = 6600/6 = 1100 — NOT 1200 (which a
+    // zero-weighted synthesized side would have collapsed to).
+    let r = merged
+        .metrics
+        .get("iteration_rate")
+        .copied()
+        .expect("merged bucket carries iteration_rate");
+    assert!(
+        (r - 1100.0).abs() < f64::EPSILON,
+        "synthesized rate must contribute at weight 1, not be zero-weighted \
+         to the captured 1200; got {r}",
+    );
+}

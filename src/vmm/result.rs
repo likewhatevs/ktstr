@@ -719,10 +719,15 @@ impl VmResult {
     /// metric across two phases (e.g. scheduler-vs-detached-EEVDF
     /// `system_time_ns`) without re-deriving the buckets — the
     /// general form of the scheduler-vs-EEVDF throughput compare.
-    /// `None` when `phase` produced no bucket (it fired no periodic
-    /// capture) or the bucket carries no reading for `metric` (every
-    /// sample's per-phase reading was absent — the sentinel-free
-    /// "no data" contract, distinct from a real `Some(0.0)`).
+    /// `None` when `phase` has no bucket — no capture landed in it AND no
+    /// stimulus `StepStart` synthesized one (e.g. `Phase::BASELINE` when
+    /// the settle window fired no captures, or a `phase` past the last
+    /// step) — or the bucket carries no reading for `metric` (every
+    /// sample's per-phase reading was absent — the sentinel-free "no data"
+    /// contract, distinct from a real `Some(0.0)`). A started-but-
+    /// uncaptured step (a `StepStart` with zero captures) DOES produce a
+    /// synthesized bucket, so `phase_metric` returns its stimulus-derived
+    /// `iteration_rate` rather than `None`.
     pub fn phase_metric(&self, phase: crate::assert::Phase, metric: &str) -> Option<f64> {
         self.phase_buckets()
             .into_iter()

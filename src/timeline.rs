@@ -232,8 +232,12 @@ impl StimulusEvent {
     /// guest-clock elapsed-ms delta between them. Returns `None` ONLY when
     /// the measurement is genuinely undefined: either event lacks a
     /// `total_iterations` sample, the window is zero-length, or the count
-    /// went BACKWARD (`next < self` — a worker-population reset; the delta
-    /// is unmeasurable, not zero).
+    /// went BACKWARD (`next < self` — a counter reset; the delta is
+    /// unmeasurable, not zero). The backward case is reachable only for the
+    /// guard-skipped cross-step pairing or legacy/synthetic data, NOT for
+    /// the live step-local `StepStart[k]` -> `StepEnd[k]` pair: teardown
+    /// runs after `StepEnd` is emitted, so the handle set is stable within
+    /// a step and the per-worker counters are monotone across the pair.
     ///
     /// MEASURED ZERO is distinct from not-measured: a step whose workers
     /// made exactly zero forward progress over a positive hold
@@ -422,21 +426,31 @@ impl Timeline {
     /// Build a Timeline from stimulus events + raw monitor
     /// samples via the per-window `compute_metrics` reduction.
     /// The production success path uses [`Self::from_phase_buckets`]
-    /// (which folds pre-bucketed PhaseBuckets) ; `build` is the
-    /// fallback evaluate_vm_result takes for monitor-only runs
-    /// (no snapshot bridge captures → PhaseBuckets vec is empty
-    /// but monitor samples exist) so the failure-message
-    /// timeline still renders. Both entry points produce the
-    /// same Timeline field shape; from_phase_buckets is
-    /// preferred when buckets are available because it avoids
-    /// the per-MonitorSample reduction.
+    /// (which folds pre-bucketed PhaseBuckets); `build` is the fallback
+    /// evaluate_vm_result takes only for a run with an EMPTY PhaseBuckets
+    /// vec but monitor samples present — i.e. no periodic captures AND no
+    /// stimulus Steps. A monitor-only run that DID run Steps now
+    /// synthesizes a capture-free bucket per StepStart (see
+    /// [`crate::assert::build_phase_buckets_with_stimulus`]), so its vec is
+    /// non-empty and it takes the from_phase_buckets path (whose
+    /// fold_monitor_into_bucket recovers the same monitor-derived metric
+    /// set this path computes). Both entry points produce the same
+    /// Timeline field shape; from_phase_buckets is preferred when buckets
+    /// are available because it avoids the per-MonitorSample reduction.
     pub fn build(stimulus_events: &[StimulusEvent], monitor_samples: &[MonitorSample]) -> Self {
         if stimulus_events.is_empty() || monitor_samples.is_empty() {
             return Self { phases: Vec::new() };
         }
 
         let mut events = stimulus_events.to_vec();
-        events.sort_by_key(|e| e.elapsed_ms);
+        // Total-order on an elapsed_ms tie: StepEnd before StepStart
+        // (`!is_step_end` is false=0 for StepEnd) so a zero-length
+        // inter-step gap at the guest's coarse-ms clock attributes the
+        // step-local StepStart[k]->StepEnd[k] rate to bucket k, never the
+        // cross-step StepStart[k]->StepStart[k+1] delta. Mirrors the same
+        // sort in build_phase_buckets_with_stimulus so the two rate
+        // consumers stay identical.
+        events.sort_by_key(|e| (e.elapsed_ms, !e.is_step_end));
 
         // Clock alignment: find the offset between guest stimulus time
         // and host monitor time. The first stimulus event (ScenarioStart)
@@ -712,7 +726,23 @@ impl Timeline {
             }
 
             let m = &phase.metrics;
-            if m.sample_count > 0 {
+            // Render the metric block whenever the phase carries
+            // monitor-derived metrics, not only when it captured periodic
+            // samples: a SYNTHESIZED zero-capture bucket
+            // (build_phase_buckets_with_stimulus) has sample_count 0 but
+            // fold_monitor_into_bucket fills its imbalance / dsq / fallback
+            // / stall from in-window monitor samples — render them for
+            // parity with the legacy Timeline::build path (which a
+            // zero-capture-with-monitor run took before the synthesize
+            // seam flipped it onto from_phase_buckets).
+            let has_monitor_metrics = m.avg_imbalance.is_some()
+                || m.max_imbalance.is_some()
+                || m.avg_dsq_depth.is_some()
+                || m.max_dsq_depth > 0
+                || m.fallback_rate.is_some()
+                || m.keep_last_rate.is_some()
+                || m.stall_count > 0;
+            if m.sample_count > 0 || has_monitor_metrics {
                 out.push_str(&format!(
                     "  imbalance: avg={} max={} | dsq: avg={} max={}",
                     m.avg_imbalance
@@ -730,12 +760,31 @@ impl Timeline {
                     out.push_str(&format!(" | keep_last: {:.0}/s", kl));
                 }
                 if let Some(ir) = m.iteration_rate {
-                    out.push_str(&format!(" | throughput: {:.0} iter/s", ir));
+                    // A synthesized (sample_count==0) step's rate is
+                    // stimulus-derived; label it consistently with the
+                    // no-monitor-metrics branch below.
+                    let suffix = if m.sample_count == 0 {
+                        " (stimulus-derived)"
+                    } else {
+                        ""
+                    };
+                    out.push_str(&format!(" | throughput: {ir:.0} iter/s{suffix}"));
                 }
                 out.push('\n');
                 if m.stall_count > 0 {
                     out.push_str(&format!("  stalls: {}\n", m.stall_count));
                 }
+            } else if let Some(ir) = m.iteration_rate {
+                // Synthesized zero-capture step (the
+                // build_phase_buckets_with_stimulus seam): no periodic
+                // captures landed, but the stimulus StepStart/StepEnd
+                // deltas still yield a throughput. Surface it so a short
+                // interior step's recovered rate is visible in the
+                // rendered timeline, not only via the structured
+                // phase_metric/step_metric API.
+                out.push_str(&format!(
+                    "  [no samples] | throughput: {ir:.0} iter/s (stimulus-derived)\n"
+                ));
             } else {
                 out.push_str("  [no samples]\n");
             }
@@ -837,6 +886,14 @@ impl Timeline {
         // entering this phase". Skips pairs where either side had
         // no samples — those phases produce default-zero metrics
         // and a diff would falsely paint every metric as changed.
+        // A SYNTHESIZED zero-capture bucket
+        // (build_phase_buckets_with_stimulus) also has sample_count 0, so
+        // it is excluded here even though it now carries real
+        // monitor-derived metrics + iteration_rate: the boundary-diff
+        // stays conservative (no phantom change from a partial-metric
+        // phase), and a captured neighbor flanking a synthesized step is
+        // not diffed against it. The synthesized step's metrics remain
+        // available via the structured API and the per-phase render.
         for i in 1..phases.len() {
             let before = phases[i - 1].metrics.clone();
             let after = &phases[i].metrics;
@@ -918,9 +975,13 @@ impl Timeline {
 // PhaseBucket → Phase conversion
 // ---------------------------------------------------------------------------
 
-/// Build a [`Phase`] from a [`crate::assert::PhaseBucket`]. The
-/// bucket's `step_index` becomes the phase index; the metric map
-/// is projected onto the named `PhaseMetrics` fields per the table
+/// Build a [`Phase`] from a [`crate::assert::PhaseBucket`]. The phase
+/// index is the bucket's ENUMERATE position in the step_index-sorted vec
+/// (the `idx` argument), NOT the bucket's `step_index` — a known render
+/// quirk: `format_phases` keys its BASELINE-vs-Step label on this index,
+/// so a run whose first bucket is a Step (no BASELINE bucket) mislabels
+/// it as BASELINE. The metric map is projected onto the named
+/// `PhaseMetrics` fields per the table
 /// in [`Timeline::from_phase_buckets`]. Phase 0 (BASELINE) emits
 /// `stimulus = None`; later phases synthesize a [`StimulusEvent`]
 /// whose label / op_kind come from the bucket label so the
@@ -1015,7 +1076,7 @@ fn phase_from_bucket(
 // Metric computation
 // ---------------------------------------------------------------------------
 
-fn compute_metrics(samples: &[&MonitorSample]) -> PhaseMetrics {
+pub(crate) fn compute_metrics(samples: &[&MonitorSample]) -> PhaseMetrics {
     if samples.is_empty() {
         return PhaseMetrics::default();
     }
@@ -1296,6 +1357,85 @@ mod tests {
         assert!(formatted.contains("BASELINE"));
         assert!(formatted.contains("Phase 1"));
         assert!(formatted.contains("imbalance"));
+    }
+
+    /// A synthesized zero-capture step (sample_count==0) still renders its
+    /// stimulus-derived throughput in the formatted timeline, not only
+    /// "[no samples]". Pins the #4 visibility fix in format_phases. The
+    /// BASELINE bucket holds enumerate index 0 (the settle render) so the
+    /// synthesized step lands at a Phase index that takes the metric path.
+    #[test]
+    fn format_renders_synthesized_step_throughput() {
+        let buckets = vec![
+            crate::assert::PhaseBucket {
+                step_index: 0,
+                label: "BASELINE".to_string(),
+                start_ms: 0,
+                end_ms: 1000,
+                sample_count: 2,
+                metrics: std::collections::BTreeMap::new(),
+            },
+            crate::assert::PhaseBucket {
+                step_index: 1,
+                label: "Step[0]".to_string(),
+                start_ms: 1000,
+                end_ms: 2000,
+                sample_count: 0, // synthesized zero-capture step
+                metrics: std::collections::BTreeMap::from([(
+                    "iteration_rate".to_string(),
+                    1500.0,
+                )]),
+            },
+        ];
+        let t = Timeline::from_phase_buckets(&buckets, &[], &TimelineContext::default());
+        let formatted = t.format_with_context(&TimelineContext::default());
+        assert!(
+            formatted.contains("throughput: 1500 iter/s (stimulus-derived)"),
+            "a synthesized step must render its stimulus-derived throughput, \
+             not only '[no samples]'; got:\n{formatted}",
+        );
+    }
+
+    /// A synthesized (sample_count==0) bucket carrying monitor-derived
+    /// metrics renders the imbalance/dsq block, not just "[no samples]" —
+    /// the render-layer half of the monitor-parity handling. format_phases
+    /// gates that block on `has_monitor_metrics`, not `sample_count > 0`.
+    #[test]
+    fn format_renders_synthesized_step_monitor_metrics() {
+        let buckets = vec![
+            crate::assert::PhaseBucket {
+                step_index: 0,
+                label: "BASELINE".to_string(),
+                start_ms: 0,
+                end_ms: 1000,
+                sample_count: 2,
+                metrics: std::collections::BTreeMap::new(),
+            },
+            crate::assert::PhaseBucket {
+                step_index: 1,
+                label: "Step[0]".to_string(),
+                start_ms: 1000,
+                end_ms: 2000,
+                sample_count: 0, // synthesized zero-capture step
+                metrics: std::collections::BTreeMap::from([
+                    ("avg_imbalance_ratio".to_string(), 2.0),
+                    ("max_imbalance_ratio".to_string(), 3.0),
+                    ("avg_dsq_depth".to_string(), 5.0),
+                    ("max_dsq_depth".to_string(), 7.0),
+                ]),
+            },
+        ];
+        let t = Timeline::from_phase_buckets(&buckets, &[], &TimelineContext::default());
+        let formatted = t.format_with_context(&TimelineContext::default());
+        assert!(
+            formatted.contains("imbalance: avg=2.0 max=3.0"),
+            "synthesized bucket's folded imbalance must render, not \
+             '[no samples]'; got:\n{formatted}",
+        );
+        assert!(
+            formatted.contains("dsq: avg=5 max=7"),
+            "synthesized bucket's folded dsq must render; got:\n{formatted}",
+        );
     }
 
     #[test]

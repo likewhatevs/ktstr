@@ -1654,8 +1654,12 @@ pub struct PhaseBucket {
     /// value is closed against a stimulus event.
     pub end_ms: u64,
     /// Number of periodic samples bucketed into this phase. Zero
-    /// when the phase fired no captures (e.g. BASELINE when the
-    /// settle window was shorter than the periodic interval).
+    /// when the phase fired no captures: BASELINE when the settle window
+    /// was shorter than the periodic interval, OR a synthesized
+    /// capture-free interior step (the
+    /// `build_phase_buckets_with_stimulus` seam — a `StepStart`-step
+    /// whose window held no periodic boundary still gets a bucket so its
+    /// capture-independent `iteration_rate` is not dropped).
     pub sample_count: usize,
     /// Per-metric phase-aggregated values. See the [`PhaseBucket`]
     /// struct doc for the registry key source and per-kind reduction
@@ -1739,12 +1743,18 @@ impl PhaseBucket {
 /// - `MetricKind::Peak` and `MetricKind::Gauge(GaugeAgg::Max)` →
 ///   `max(a, b)` (the worst-case "peak that fired" survives).
 /// - `MetricKind::Gauge(GaugeAgg::Avg)` → weighted mean
-///   `(a * a_count + b * b_count) / (a_count + b_count)` so the
-///   merged mean is the unbiased combination of both side's
-///   per-phase means weighted by sample population. Falls back to
-///   `(a + b) / 2.0` when both sample_counts are zero (the
-///   per-cgroup default-merge accumulator pattern can produce
-///   this transient before any real merge).
+///   `(a * a_w + b * b_w) / (a_w + b_w)` where `a_w = a_count.max(1)`
+///   and `b_w = b_count.max(1)` — the unbiased combination of both
+///   sides' per-phase means weighted by sample population, each weight
+///   floored at 1. The `.max(1)` floor (mirroring
+///   `populate_run_ext_metrics_from_phases`) keeps a synthesized
+///   zero-capture bucket's capture-independent value (e.g.
+///   `iteration_rate` from stimulus deltas) contributing one
+///   phase-observation of weight rather than being zero-weighted out of
+///   the merge — the silent-drop the synthesize seam exists to prevent.
+///   With both counts > 0 the floor is a no-op (the plain
+///   sample-population weighting); both counts zero degenerates to
+///   `(a + b) / 2.0`.
 /// - `MetricKind::Gauge(GaugeAgg::Last)` and `MetricKind::Timestamp`
 ///   → value from the bucket with the larger `end_ms`; ties keep
 ///   `a`'s value. Captures the "latest-sample-wins" semantic per
@@ -1826,14 +1836,22 @@ fn merge_metric_values(
         Some(MetricKind::Counter) | Some(MetricKind::DeltaSum) => a + b,
         Some(MetricKind::Peak) | Some(MetricKind::Gauge(GaugeAgg::Max)) => a.max(b),
         Some(MetricKind::Gauge(GaugeAgg::Avg)) => {
-            let total_count = a_count + b_count;
-            if total_count == 0 {
-                (a + b) / 2.0
-            } else {
-                let a_w = a_count as f64;
-                let b_w = b_count as f64;
-                (a * a_w + b * b_w) / (total_count as f64)
-            }
+            // Weight by sample_count, floored at 1: a synthesized
+            // zero-capture bucket (sample_count==0) carrying a
+            // capture-independent value (e.g. iteration_rate from
+            // stimulus StepStart/StepEnd deltas, recovered by
+            // build_phase_buckets_with_stimulus) must contribute one
+            // phase-observation of weight, not be zero-weighted out of
+            // the merge — that would silently drop the very rate the
+            // synthesize seam recovers. Mirrors the .max(1) floor in
+            // populate_run_ext_metrics_from_phases. With both counts > 0
+            // the floor is a no-op (the prior sample_count weighting);
+            // with both 0 each still floors to weight 1, giving the
+            // (a+b)/2 equal-weight mean (the aggregate_samples_weighted
+            // zero-total-weight fallback is unreachable from here).
+            let a_w = a_count.max(1) as f64;
+            let b_w = b_count.max(1) as f64;
+            (a * a_w + b * b_w) / (a_w + b_w)
         }
         Some(MetricKind::Gauge(GaugeAgg::Last)) | Some(MetricKind::Timestamp) => {
             if b_end_ms > a_end_ms { b } else { a }
@@ -2172,6 +2190,16 @@ pub fn populate_run_ext_metrics_from_phases(
         // Per-phase (value, sample_count) for the kind-aware fold.
         // A phase that doesn't carry the key contributes nothing.
         // Lock-step shape enforced by the (f64, usize) pair type.
+        // `sample_count.max(1)` is load-bearing: a synthesized
+        // zero-capture phase (the build_phase_buckets_with_stimulus
+        // seam) carries a real capture-independent value — iteration_rate
+        // from stimulus StepStart/StepEnd deltas — at sample_count==0.
+        // The floor gives it weight 1 (one phase observation) so its rate
+        // is INCLUDED in the run-level Gauge(Avg) mean rather than
+        // zero-weighted out; this is the run-aggregate completion of the
+        // per-step #4 fix. A regression dropping the floor (bare
+        // sample_count) would silently re-drop a zero-capture step's rate
+        // from the sidecar aggregate.
         let pairs: Vec<(f64, usize)> = phases
             .iter()
             .filter_map(|phase| {
@@ -2266,6 +2294,20 @@ pub fn populate_run_ext_metrics(
 /// windows are then workload-relative, the run-relative monitor samples
 /// are shifted by the stimulus/monitor clock skew before windowing.
 ///
+/// Additionally synthesizes a capture-free `PhaseBucket`
+/// (`sample_count == 0`) for any stimulus `StepStart`-step that
+/// captured no periodic samples — the uniform whole-workload boundary
+/// placement (`compute_periodic_boundaries_ns`) is step-agnostic, so a
+/// short interior step can land zero captures and otherwise leave no
+/// bucket, silently dropping its capture-independent `iteration_rate`.
+/// The synthesized bucket carries the step's full stimulus window so its
+/// `iteration_rate` (from `StepStart`/`StepEnd` deltas) and
+/// `avg_imbalance_ratio` (from in-window monitor samples) are still
+/// recovered. The returned vec therefore holds one bucket per
+/// (captured phase ∪ `StepStart`-step), sorted by `step_index` — NOT
+/// one-per-captured-phase, so `len()` is no longer "number of captured
+/// phases".
+///
 /// The `iteration_rate` enrichment lets
 /// `crate::timeline::Timeline::from_phase_buckets` render the per-phase
 /// throughput annotation without going through the legacy
@@ -2301,12 +2343,17 @@ pub fn populate_run_ext_metrics(
 /// `StepStart` is never a `prev` with a successor and it reports no
 /// rate.
 ///
-/// Per the unweighted-mean cross-RUN policy
-/// of `crate::stats::aggregate_samples` for `Gauge(Avg)` —
-/// iteration_rate is registered as `Gauge(Avg)` with
-/// `HigherBetter` polarity (more throughput is better) via the
-/// `iteration_rate` registry entry alongside the other Avg-kind
-/// metrics.
+/// iteration_rate is registered as `Gauge(Avg)` with `HigherBetter`
+/// polarity (more throughput is better). Its per-run run-scalar fold
+/// (one run's per-phase values → that run's `ext_metrics`) runs through
+/// `populate_run_ext_metrics_from_phases`, which folds with
+/// `crate::stats::aggregate_samples_weighted` (a `sample_count`-WEIGHTED
+/// mean, each phase weight floored at 1 — NOT the unweighted
+/// `crate::stats::aggregate_samples`). The `.max(1)` floor keeps a
+/// synthesized zero-capture phase's stimulus-derived rate in the run
+/// scalar rather than zero-weighting it out. The genuine cross-RUN
+/// rollup (across sidecar runs) is the `ext_metrics` fold in
+/// `AssertResult::merge`.
 ///
 /// Live caller: `evaluate_vm_result` at `src/test_support/eval/mod.rs`
 /// — has both the SampleSeries and the stimulus_events vec in scope.
@@ -2327,11 +2374,100 @@ pub fn build_phase_buckets_with_stimulus(
     // Bucket windows are workload-relative (boundary-offset) here, so the
     // monitor samples (run-relative) are shifted by the stimulus/monitor
     // clock skew before windowing.
-    let mut buckets = buckets_from_grouped(
-        by_phase,
-        monitor_samples,
-        monitor_clock_offset(stimulus_events, monitor_samples),
-    );
+    let monitor_to_window_offset_ms = monitor_clock_offset(stimulus_events, monitor_samples);
+    let mut buckets = buckets_from_grouped(by_phase, monitor_samples, monitor_to_window_offset_ms);
+    // Synthesize a PhaseBucket for any scenario step that has a stimulus
+    // StepStart but produced no capture bucket. Periodic boundaries are
+    // placed uniformly over the whole workload (step-agnostic — see
+    // `compute_periodic_boundaries_ns`), so a short interior step can
+    // capture zero samples and leave no bucket. The iteration_rate
+    // attribution loop below only mutates EXISTING buckets, so without
+    // this seam that step's capture-independent rate (derived purely from
+    // the StepStart/StepEnd total_iterations deltas, needing no capture)
+    // would be silently dropped. The synthesized bucket carries the
+    // step's true stimulus window so `fold_monitor_into_bucket` still
+    // recovers its monitor-derived imbalance; `sample_count == 0` marks
+    // it capture-free for downstream consumers (e.g.
+    // `Timeline::from_phase_buckets` skips zero-sample pairs in change
+    // detection). BASELINE (step 0) is synthesized only if a StepStart
+    // carries `step_index == 0` — it is not special-cased.
+    let step_starts = crate::scenario::sample::step_starts_from_stimulus(stimulus_events);
+    for &(start_ms, k) in &step_starts {
+        if buckets.iter().any(|b| b.step_index == k) {
+            continue;
+        }
+        // Right edge: the step's own StepEnd, CLAMPED to the next
+        // step-start so a non-monotonic (corrupt-wire) StepEnd[k] >=
+        // StepStart[k+1] can never extend this synthesized window past the
+        // next step's start (which would fold the same MonitorSample into
+        // two adjacent synthesized buckets). Falls back to the next
+        // step-start alone, else open-ended (the last step on data with no
+        // StepEnd — e.g. sched-died — which the rate loop leaves rateless).
+        // Earliest StepEnd elapsed for k (min, symmetric with start_ms's
+        // earliest step-start), so a duplicate/corrupt StepEnd later in the
+        // vec can't pick a wrong right edge.
+        let step_end = stimulus_events
+            .iter()
+            .filter(|e| e.is_step_end && e.step_index == Some(k))
+            .map(|e| e.elapsed_ms)
+            .min();
+        // `ms > start_ms` (strict): two DISTINCT step_index sharing the
+        // same elapsed is corrupt-wire only (build_stimulus emits StepStarts
+        // at distinct monotone guest-clock times), so the equal-elapsed
+        // window-overlap edge is out of scope — its worst case is a
+        // redundant double-fold of one monitor sample, never a drop or panic.
+        let next_start = step_starts
+            .iter()
+            .filter(|&&(ms, _)| ms > start_ms)
+            .map(|&(ms, _)| ms)
+            .min();
+        // Last-resort right edge for a last step with no StepEnd and no
+        // successor: the scenario-end terminal event, bounding the window
+        // at run-end instead of folding every trailing teardown monitor
+        // sample into the bucket. NOTE the production sched-died path emits
+        // NEITHER a StepEnd NOR a ScenarioEnd (its early return skips both),
+        // so it carries no terminal here and falls to u64::MAX — matching
+        // Timeline::build, which extends the last phase to end-of-monitor.
+        // This terminal clamp therefore only binds for legacy/synthetic
+        // data carrying a ScenarioEnd frame without StepEnd frames.
+        let terminal = stimulus_events
+            .iter()
+            .find(|e| e.is_terminal)
+            .map(|e| e.elapsed_ms);
+        let end_ms = match (step_end, next_start) {
+            (Some(se), Some(ns)) => se.min(ns),
+            (Some(se), None) => se,
+            (None, Some(ns)) => ns,
+            (None, None) => terminal.unwrap_or(u64::MAX),
+        };
+        // BASELINE (step 0) is synthesized only if a StepStart carries
+        // step_index == 0; build_stimulus 1-indexes scenario Steps (Step 0
+        // -> step_index 1), so it never emits step_index 0 and BASELINE is
+        // intentionally never synthesized (its pre-first-Step settle window
+        // carries no meaningful per-step rate). The branch is kept for the
+        // convention, not for a production path.
+        let label = if k == 0 {
+            "BASELINE".to_string()
+        } else {
+            format!("Step[{}]", k.saturating_sub(1))
+        };
+        let mut bucket = PhaseBucket {
+            step_index: k,
+            label,
+            start_ms,
+            end_ms,
+            sample_count: 0,
+            metrics: std::collections::BTreeMap::new(),
+        };
+        fold_monitor_into_bucket(&mut bucket, monitor_samples, monitor_to_window_offset_ms);
+        buckets.push(bucket);
+    }
+    // Keep buckets in step_index order: buckets_from_grouped emits them
+    // sorted (BTreeMap key order), but the synthesize loop appends out of
+    // order. Downstream lookups resolve by step_index, but a sorted vec
+    // matches the captured-bucket invariant and keeps rendered output
+    // stable.
+    buckets.sort_by_key(|b| b.step_index);
     // Per-phase iteration_rate from stimulus event total_iterations
     // deltas. Walk events pairwise; for each pair compute the
     // rate. Sort events by elapsed_ms first so an out-of-order
@@ -2341,7 +2477,14 @@ pub fn build_phase_buckets_with_stimulus(
     // inversion produces duration_ms == 0 → skipped, a silent
     // drop).
     let mut sorted_events: Vec<&crate::timeline::StimulusEvent> = stimulus_events.iter().collect();
-    sorted_events.sort_by_key(|e| e.elapsed_ms);
+    // Total-order on an elapsed_ms tie: StepEnd before StepStart
+    // (`!is_step_end` is false=0 for StepEnd) so a zero-length inter-step
+    // gap at the guest's coarse-ms clock attributes the step-local
+    // StepStart[k]->StepEnd[k] rate to bucket k, never the cross-step
+    // StepStart[k]->StepStart[k+1] delta (the is_step_end guard below only
+    // stops StepEnd from being `prev`; it does not order a StepEnd before
+    // the next StepStart on a tie). Mirrors Timeline::build's sort.
+    sorted_events.sort_by_key(|e| (e.elapsed_ms, !e.is_step_end));
     for w in sorted_events.windows(2) {
         let prev = w[0];
         let curr = w[1];
@@ -2701,65 +2844,164 @@ fn buckets_from_grouped(
         if let Some(v) = phase_group_cpu_delta(&samples_in_phase, |t| t.utime, |t| t.signal_utime) {
             metrics.entry("user_time_ns".to_string()).or_insert(v);
         }
-        // Per-phase MonitorSample windowing (wire-up for metrics
-        // that need per-CPU full-class rq.nr_running). The monitor
-        // sample's run-relative elapsed_ms is shifted into the
-        // bucket-window frame (subtract `monitor_to_window_offset_ms`)
-        // before the half-open `[start_ms, end_ms)` test so a
-        // MonitorSample whose timestamp equals the boundary lands in
-        // exactly one bucket (not both adjacent buckets — the
-        // closed-on-right form double-counted boundary samples).
-        // Single-sample phases (start_ms == end_ms) use explicit
-        // equality so the window is not empty.
-        //
-        // Filters via crate::monitor::sample_looks_valid before
-        // the per-sample reduction so an invalid sample (empty
-        // cpus → imbalance_ratio = 1.0 default per
-        // MonitorSample::imbalance_ratio) doesn't pull the mean
-        // toward "perfect balance" and mask a real regression —
-        // matches the legacy Timeline::build path's filter
-        // discipline.
-        let in_window = |monitor_ms: u64| -> bool {
-            let shifted = monitor_ms as i64 - monitor_to_window_offset_ms;
-            if shifted < 0 {
-                return false;
-            }
-            let m = shifted as u64;
-            if start_ms == end_ms {
-                m == start_ms
-            } else {
-                m >= start_ms && m < end_ms
-            }
-        };
-        let phase_monitor_samples: Vec<&crate::monitor::MonitorSample> = monitor_samples
-            .iter()
-            .filter(|s| in_window(s.elapsed_ms))
-            .filter(|s| crate::monitor::sample_looks_valid(s))
-            .collect();
-        if !phase_monitor_samples.is_empty() && !metrics.contains_key("avg_imbalance_ratio") {
-            // Mean of MonitorSample::imbalance_ratio() across the
-            // valid samples in the phase window. `imbalance_ratio`
-            // is max(nr_running) / max(1, min(nr_running)) per
-            // CPU — the full-class count (CFS + scx + rt + dl).
-            let sum: f64 = phase_monitor_samples
-                .iter()
-                .map(|s| s.imbalance_ratio())
-                .sum();
-            let avg = sum / phase_monitor_samples.len() as f64;
-            if avg.is_finite() {
-                metrics.insert("avg_imbalance_ratio".to_string(), avg);
-            }
-        }
-        out.push(PhaseBucket {
+        let mut bucket = PhaseBucket {
             step_index,
             label,
             start_ms,
             end_ms,
             sample_count,
             metrics,
-        });
+        };
+        // Per-phase MonitorSample windowing for monitor-derived metrics
+        // (avg_imbalance_ratio). Factored into `fold_monitor_into_bucket`
+        // so a synthesized zero-capture bucket (see
+        // `build_phase_buckets_with_stimulus`) recovers its in-window
+        // imbalance too — same formula and frame, but over the
+        // synthesized bucket's FULL stimulus window vs this captured
+        // bucket's narrower interior capture-offset span.
+        fold_monitor_into_bucket(&mut bucket, monitor_samples, monitor_to_window_offset_ms);
+        out.push(bucket);
     }
     out
+}
+
+/// Fold the per-CPU full-class imbalance from the monitor samples whose
+/// run-relative timestamp falls in `bucket`'s `[start_ms, end_ms)`
+/// window into `bucket.metrics["avg_imbalance_ratio"]`.
+///
+/// The monitor sample's run-relative `elapsed_ms` is shifted into the
+/// bucket-window frame (subtract `monitor_to_window_offset_ms`) before
+/// the half-open `[start_ms, end_ms)` test so a MonitorSample whose
+/// timestamp equals the boundary lands in exactly one bucket (not both
+/// adjacent buckets — the closed-on-right form double-counted boundary
+/// samples). Single-sample phases (`start_ms == end_ms`) use explicit
+/// equality so the window is not empty.
+///
+/// Filters via [`crate::monitor::sample_looks_valid`] (implausible-DSQ
+/// samples) before the fold; `compute_metrics` additionally drops
+/// empty-cpus samples (which would default `imbalance_ratio` to 1.0 and
+/// pull the mean toward "perfect balance", masking a real regression) —
+/// matching the legacy `Timeline::build` path's filter discipline.
+///
+/// Folds the FULL monitor-derived metric set the legacy `Timeline::build`
+/// reducer (`crate::timeline::compute_metrics`) produces —
+/// `avg_imbalance_ratio`, `max_imbalance_ratio`, `avg_dsq_depth`,
+/// `max_dsq_depth`, `stuck_count`, and the `total_fallback` /
+/// `total_keep_last` counter deltas — over the bucket's window. Only
+/// `avg_imbalance_ratio` is folded for EVERY bucket with in-window monitor
+/// samples (its accessor is `None`, so read_sample never sets it, and the
+/// pre-synthesize buckets_from_grouped block likewise folded only that
+/// key). The REST of the set is folded ONLY for a synthesized
+/// (`sample_count == 0`) bucket: a captured bucket sources dsq / stall /
+/// fallback from its read_sample captures and keeps its pre-synthesize
+/// behavior, while a synthesized bucket has no captures, so monitor is its
+/// only source — restoring the rendered timeline to PARITY with the old
+/// `Timeline::build` fallback (the path a zero-capture-with-monitor run
+/// took before the synthesize seam flipped it onto from_phase_buckets;
+/// `format_phases` renders these folded metrics for a `sample_count == 0`
+/// bucket via its `has_monitor_metrics` gate). Each key is `or_insert` so
+/// it never overwrites a value already present. Parity with
+/// `Timeline::build` is exact for the production case; for legacy
+/// ScenarioEnd-but-no-StepEnd data the synthesized last-step window clamps
+/// to the terminal rather than extending to end-of-monitor, and a
+/// synthesized bucket's dsq metrics come from the monitor
+/// `CpuSnapshot.local_dsq_depth` axis (vs a captured bucket's DSQ-walker
+/// axis) — same metric, different sampling axis.
+///
+/// `bucket`'s `[start_ms, end_ms)` IS the window basis and differs by
+/// bucket kind: a captured bucket's is the min/max of its samples'
+/// interior capture offsets; a synthesized bucket's is its full
+/// `[StepStart, StepEnd)` stimulus window. The monitor sample's
+/// run-relative `elapsed_ms` is shifted into that frame (subtract
+/// `monitor_to_window_offset_ms`) before the half-open test so a sample
+/// on the boundary lands in exactly one bucket. `compute_metrics` returns
+/// fallback / keep_last as RATES; this re-derives the bucket-native
+/// counter DELTAS (so `phase_from_bucket` re-rates them over the bucket
+/// window like the read_sample path) using the same `counter_delta` clamp.
+fn fold_monitor_into_bucket(
+    bucket: &mut PhaseBucket,
+    monitor_samples: &[crate::monitor::MonitorSample],
+    monitor_to_window_offset_ms: i64,
+) {
+    let start_ms = bucket.start_ms;
+    let end_ms = bucket.end_ms;
+    let in_window = |monitor_ms: u64| -> bool {
+        let shifted = monitor_ms as i64 - monitor_to_window_offset_ms;
+        if shifted < 0 {
+            return false;
+        }
+        let m = shifted as u64;
+        if start_ms == end_ms {
+            m == start_ms
+        } else {
+            m >= start_ms && m < end_ms
+        }
+    };
+    // Filter via sample_looks_valid (matches Timeline::build) so an invalid
+    // sample (empty cpus -> imbalance_ratio 1.0 default) doesn't pull the
+    // mean toward "perfect balance" and mask a real regression.
+    let phase_monitor_samples: Vec<&crate::monitor::MonitorSample> = monitor_samples
+        .iter()
+        .filter(|s| in_window(s.elapsed_ms))
+        .filter(|s| crate::monitor::sample_looks_valid(s))
+        .collect();
+    if phase_monitor_samples.is_empty() {
+        return;
+    }
+    let pm = crate::timeline::compute_metrics(&phase_monitor_samples);
+    // sample_count == 0 IFF the bucket is synthesized: buckets_from_grouped
+    // only emits >=1-sample buckets, the synthesize loop only emits 0-sample
+    // ones. A CAPTURED bucket folds ONLY avg_imbalance_ratio from monitor —
+    // its accessor is None so read_sample never provides it, and the
+    // pre-synthesize buckets_from_grouped block likewise folded only that
+    // one key. Restricting the rest of the monitor set to synthesized
+    // buckets preserves captured-bucket behavior; a synthesized bucket has
+    // no captures, so monitor is its only source and it takes the full set
+    // (Timeline::build render parity).
+    let synthesized = bucket.sample_count == 0;
+    let mut put = |key: &str, v: f64| {
+        if v.is_finite() {
+            bucket.metrics.entry(key.to_string()).or_insert(v);
+        }
+    };
+    if let Some(v) = pm.avg_imbalance {
+        put("avg_imbalance_ratio", v);
+    }
+    if synthesized {
+        if let Some(v) = pm.max_imbalance {
+            put("max_imbalance_ratio", v);
+        }
+        if let Some(v) = pm.avg_dsq_depth {
+            put("avg_dsq_depth", v);
+        }
+        put("max_dsq_depth", pm.max_dsq_depth as f64);
+        if pm.stall_count > 0 {
+            put("stuck_count", pm.stall_count as f64);
+        }
+        // Bucket-native counter totals for fallback / keep_last: the first
+        // and last in-window samples carrying event counters, clamped with
+        // the same counter_delta MonitorSummary uses (a mid-phase scheduler
+        // restart can reset the counter, producing a negative raw delta).
+        // phase_from_bucket re-rates these over the bucket window, matching
+        // the read_sample representation captured buckets carry.
+        let has_events = |s: &&crate::monitor::MonitorSample| {
+            s.cpus.iter().any(|c| c.event_counters.is_some())
+        };
+        let first_ev = phase_monitor_samples.iter().copied().find(has_events);
+        let last_ev = phase_monitor_samples.iter().copied().rev().find(has_events);
+        if let (Some(first), Some(last)) = (first_ev, last_ev) {
+            let fb = crate::monitor::counter_delta(
+                last.sum_event_field(|e| e.select_cpu_fallback).unwrap_or(0),
+                first.sum_event_field(|e| e.select_cpu_fallback).unwrap_or(0),
+            );
+            let kl = crate::monitor::counter_delta(
+                last.sum_event_field(|e| e.dispatch_keep_last).unwrap_or(0),
+                first.sum_event_field(|e| e.dispatch_keep_last).unwrap_or(0),
+            );
+            put("total_fallback", fb as f64);
+            put("total_keep_last", kl as f64);
+        }
+    }
 }
 
 /// Clock skew (ms) between the host monitor's run-relative timeline and

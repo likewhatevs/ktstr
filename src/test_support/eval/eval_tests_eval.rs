@@ -1275,6 +1275,84 @@ fn phase_buckets_equals_stats_phases_and_post_vm_read_does_not_starve() {
     );
 }
 
+/// #4 through the production eval path: with stimulus StepStarts
+/// spanning steps 1..3 but periodic captures landing only in step 1,
+/// evaluate_vm_result's stats.phases must contain a SYNTHESIZED bucket
+/// (sample_count==0) for the uncaptured steps carrying their
+/// stimulus-derived iteration_rate. This is the --cell-parent-cgroup
+/// short-interior-step scenario, pinned through
+/// evaluate_vm_result (not just build_phase_buckets_with_stimulus): the
+/// non-empty synthesized buckets also flip timeline selection onto the
+/// from_phase_buckets path.
+#[test]
+fn evaluate_synthesizes_phase_buckets_for_uncaptured_steps() {
+    use crate::timeline::StimulusEvent;
+    let pass_assert = build_assert_result(true, vec![]);
+    let entry = sched_entry("__eval_synthesize_uncaptured__");
+    let result = crate::vmm::VmResult {
+        success: true,
+        guest_messages: Some(crate::vmm::host_comms::BulkDrainResult {
+            entries: vec![crate::test_support::test_helpers::assert_result_tlv_entry(
+                &pass_assert,
+            )],
+        }),
+        periodic_fired: 1,
+        periodic_target: 1,
+        ..crate::vmm::VmResult::test_fixture()
+    };
+    // One capture stamped into step 1 (boundary_offset None -> stamped
+    // step_index fallback in by_stimulus_phase). Steps 2 and 3 capture
+    // nothing.
+    result.snapshot_bridge.store_with_stats_and_step(
+        "periodic_000",
+        crate::monitor::dump::FailureDumpReport::default(),
+        None,
+        Some(100),
+        None,
+        1,
+    );
+    // Hand-built stimulus (the evaluate_vm_result param): a StepStart per
+    // step with cumulative iterations. Steps 2/3 have starts but no
+    // captures, so build_phase_buckets_with_stimulus must synthesize them.
+    let start = |elapsed_ms: u64, k: u16, iters: u64| StimulusEvent {
+        elapsed_ms,
+        label: format!("StepStart[{k}]"),
+        op_kind: None,
+        detail: None,
+        total_iterations: Some(iters),
+        step_index: Some(k),
+        is_terminal: false,
+        is_step_end: false,
+    };
+    let stimulus = vec![start(1000, 1, 0), start(2000, 2, 1000), start(3000, 3, 2000)];
+    let ar = evaluate_vm_result(
+        &entry,
+        &result,
+        &crate::assert::Assert::NO_OVERRIDES,
+        &stimulus,
+        &[],
+        &[],
+        &EVAL_TOPO,
+        &no_repro,
+        None,
+    )
+    .expect("pass_assert on the success arm must return Ok");
+    // Step 2 captured nothing but must appear in stats.phases, synthesized.
+    let step2 = ar
+        .stats
+        .phases
+        .iter()
+        .find(|p| p.step_index == 2)
+        .expect("uncaptured step 2 must appear as a synthesized bucket in stats.phases");
+    assert_eq!(step2.sample_count, 0, "synthesized bucket is capture-free");
+    assert_eq!(
+        step2.metrics.get("iteration_rate").copied(),
+        Some(1000.0),
+        "synthesized step 2 carries its stimulus-derived rate \
+         (StepStart[2]=1000 -> StepStart[3]=2000 over 1s) through evaluate",
+    );
+}
+
 /// `acquire_test_kernel_lock_if_cached` returns `Some(guard)`
 /// when `kernel_path` is shaped like a real cache entry:
 /// `{cache_root}/{cache_key}/{image_name}`. Exercises the

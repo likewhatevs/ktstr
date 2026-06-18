@@ -1678,6 +1678,564 @@ fn build_phase_buckets_with_stimulus_remaps_by_boundary_offset_over_stamped_step
     }
 }
 
+/// #4 residual fix: a scenario step whose periodic-boundary window
+/// captured ZERO samples (the uniform whole-workload boundary placement
+/// skipped it) still gets a PhaseBucket carrying its capture-independent
+/// iteration_rate. Steps 1 and 3 capture; step 2 captures nothing. The
+/// stimulus carries a StepStart per step with total_iterations, so step
+/// 2's rate (StepStart[2]=1000 -> StepStart[3]=2000 over 1000 ms =
+/// 1000/s) is measurable from the timeline alone. Before the synthesize
+/// seam, step 2 produced no bucket and its rate was silently dropped.
+/// Also pins dedup: a captured step is never given a duplicate bucket.
+#[test]
+fn build_phase_buckets_with_stimulus_synthesizes_zero_capture_step_bucket() {
+    use crate::scenario::snapshot::{DrainedSnapshotEntry, MissingStatsReason};
+    use crate::timeline::StimulusEvent;
+    // Captures: one in step 1's window, one in step 3's window. NONE in
+    // step 2's window [2000, 3000).
+    let cap = |tag: &str, offset_ms: u64| DrainedSnapshotEntry {
+        tag: tag.to_string(),
+        report: fixture_report(),
+        stats: Err(MissingStatsReason::NoSchedulerBinary),
+        elapsed_ms: Some(9_000),
+        boundary_offset_ms: Some(offset_ms),
+        step_index: Some(1),
+    };
+    let drained = vec![cap("periodic_000", 1_500), cap("periodic_001", 3_500)];
+    let samples = SampleSeries::from_drained_typed(drained, None);
+    // StepStart[k] at k*1000 ms with cumulative iterations; the rate loop
+    // pairs consecutive starts (delta iters / delta s).
+    let start = |elapsed_ms: u64, k: u16, iters: u64| StimulusEvent {
+        elapsed_ms,
+        label: format!("StepStart[{k}]"),
+        op_kind: None,
+        detail: None,
+        total_iterations: Some(iters),
+        step_index: Some(k),
+        is_terminal: false,
+        is_step_end: false,
+    };
+    let stimulus = vec![start(1000, 1, 0), start(2000, 2, 1000), start(3000, 3, 2000)];
+    let phases = crate::assert::build_phase_buckets_with_stimulus(&samples, &stimulus);
+
+    let step2 = phases
+        .iter()
+        .find(|p| p.step_index == 2)
+        .expect("zero-capture step 2 must still produce a synthesized bucket");
+    assert_eq!(step2.sample_count, 0, "synthesized bucket is capture-free");
+    let rate = step2
+        .metrics
+        .get("iteration_rate")
+        .copied()
+        .expect("step 2's capture-independent iteration_rate must be recovered");
+    assert!(
+        (rate - 1000.0).abs() < f64::EPSILON,
+        "step 2 rate = (2000-1000) iters / 1000 ms = 1000/s, got {rate}",
+    );
+    // Dedup: each captured step keeps a single bucket (no duplicate
+    // synthesized bucket for steps 1 and 3) and the vec is step-sorted.
+    let idxs: Vec<u16> = phases.iter().map(|p| p.step_index).collect();
+    assert_eq!(
+        idxs,
+        vec![1, 2, 3],
+        "captured steps 1/3 keep their single bucket; step 2 synthesized; \
+         sorted by step_index; got {idxs:?}",
+    );
+}
+
+/// #4 fuller variant: a synthesized zero-capture step bucket also
+/// recovers its monitor-derived `avg_imbalance_ratio` from the
+/// MonitorSamples in its window — not just iteration_rate. The anchor
+/// monitor sample at the first stimulus elapsed pins
+/// `monitor_clock_offset` to 0 so the in-step-2 sample lands in [2000,
+/// 3000).
+#[test]
+fn build_phase_buckets_with_stimulus_synthesized_bucket_folds_monitor_imbalance() {
+    use crate::monitor::{CpuSnapshot, MonitorReport, MonitorSample};
+    use crate::scenario::snapshot::{DrainedSnapshotEntry, MissingStatsReason};
+    use crate::timeline::StimulusEvent;
+    let cpu = |nr: u32| CpuSnapshot {
+        nr_running: nr,
+        ..Default::default()
+    };
+    let mon = MonitorReport {
+        samples: vec![
+            // Anchor (>500 ms) at the first stimulus elapsed -> offset 0.
+            MonitorSample::new(1000, vec![cpu(2), cpu(2)]), // step 1, imbalance 1.0
+            MonitorSample::new(2500, vec![cpu(6), cpu(2)]), // step 2, imbalance 3.0
+        ],
+        ..Default::default()
+    };
+    // Captures in steps 1 and 3 only; step 2 captures nothing.
+    let cap = |tag: &str, offset_ms: u64| DrainedSnapshotEntry {
+        tag: tag.to_string(),
+        report: fixture_report(),
+        stats: Err(MissingStatsReason::NoSchedulerBinary),
+        elapsed_ms: Some(9_000),
+        boundary_offset_ms: Some(offset_ms),
+        step_index: Some(1),
+    };
+    let drained = vec![cap("periodic_000", 1_500), cap("periodic_001", 3_500)];
+    let samples = SampleSeries::from_drained_typed(drained, Some(mon));
+    let start = |elapsed_ms: u64, k: u16| StimulusEvent {
+        elapsed_ms,
+        label: format!("StepStart[{k}]"),
+        op_kind: None,
+        detail: None,
+        total_iterations: None,
+        step_index: Some(k),
+        is_terminal: false,
+        is_step_end: false,
+    };
+    let stimulus = vec![start(1000, 1), start(2000, 2), start(3000, 3)];
+    let phases = crate::assert::build_phase_buckets_with_stimulus(&samples, &stimulus);
+    let step2 = phases
+        .iter()
+        .find(|p| p.step_index == 2)
+        .expect("synthesized zero-capture step 2 bucket present");
+    assert_eq!(step2.sample_count, 0);
+    let avg = step2
+        .metrics
+        .get("avg_imbalance_ratio")
+        .copied()
+        .expect("synthesized bucket must recover avg_imbalance_ratio from monitor samples");
+    assert!(
+        (avg - 3.0).abs() < f64::EPSILON,
+        "step 2 in-window monitor imbalance = 6 / max(1, 2) = 3.0, got {avg}",
+    );
+    // The stimulus carried total_iterations: None, so no rate is fabricated.
+    assert!(
+        !step2.metrics.contains_key("iteration_rate"),
+        "None total_iterations must yield NO iteration_rate (no fabrication); got {:?}",
+        step2.metrics,
+    );
+}
+
+/// A single-step run with a capture in its window produces exactly one
+/// Step bucket and synthesizes nothing extra: the synthesize loop only
+/// fires for a step that has a StepStart but no bucket.
+#[test]
+fn build_phase_buckets_with_stimulus_single_captured_step_no_spurious_synthesis() {
+    use crate::scenario::snapshot::{DrainedSnapshotEntry, MissingStatsReason};
+    use crate::timeline::StimulusEvent;
+    let cap = DrainedSnapshotEntry {
+        tag: "periodic_000".to_string(),
+        report: fixture_report(),
+        stats: Err(MissingStatsReason::NoSchedulerBinary),
+        elapsed_ms: Some(9_000),
+        boundary_offset_ms: Some(1_500),
+        step_index: Some(1),
+    };
+    let samples = SampleSeries::from_drained_typed(vec![cap], None);
+    let stimulus = vec![StimulusEvent {
+        elapsed_ms: 1000,
+        label: "StepStart[1]".to_string(),
+        op_kind: None,
+        detail: None,
+        total_iterations: None,
+        step_index: Some(1),
+        is_terminal: false,
+        is_step_end: false,
+    }];
+    let phases = crate::assert::build_phase_buckets_with_stimulus(&samples, &stimulus);
+    let idxs: Vec<u16> = phases.iter().map(|p| p.step_index).collect();
+    assert_eq!(
+        idxs,
+        vec![1],
+        "exactly the one captured step; the synthesize loop adds no extras",
+    );
+    assert_eq!(phases[0].sample_count, 1);
+}
+
+/// A sched-died last step (a StepStart with no StepEnd, no successor
+/// start, and no captures) still produces a present-but-empty bucket:
+/// open-ended window (u64::MAX), sample_count 0, and NO iteration_rate
+/// (rate_to has no right boundary) — no panic, no phantom rate.
+#[test]
+fn build_phase_buckets_with_stimulus_sched_died_last_step_yields_empty_present_bucket() {
+    use crate::scenario::snapshot::{DrainedSnapshotEntry, MissingStatsReason};
+    use crate::timeline::StimulusEvent;
+    let cap = DrainedSnapshotEntry {
+        tag: "periodic_000".to_string(),
+        report: fixture_report(),
+        stats: Err(MissingStatsReason::NoSchedulerBinary),
+        elapsed_ms: Some(9_000),
+        boundary_offset_ms: Some(1_500),
+        step_index: Some(1),
+    };
+    let samples = SampleSeries::from_drained_typed(vec![cap], None);
+    let start = |elapsed_ms: u64, k: u16, iters: u64| StimulusEvent {
+        elapsed_ms,
+        label: format!("StepStart[{k}]"),
+        op_kind: None,
+        detail: None,
+        total_iterations: Some(iters),
+        step_index: Some(k),
+        is_terminal: false,
+        is_step_end: false,
+    };
+    // step 1 captured; step 2 started then died (no StepEnd, no successor).
+    let stimulus = vec![start(1000, 1, 0), start(2000, 2, 1000)];
+    let phases = crate::assert::build_phase_buckets_with_stimulus(&samples, &stimulus);
+    let step2 = phases
+        .iter()
+        .find(|p| p.step_index == 2)
+        .expect("sched-died last step still gets a present bucket");
+    assert_eq!(step2.sample_count, 0);
+    assert_eq!(
+        step2.end_ms,
+        u64::MAX,
+        "no StepEnd / successor start -> open-ended window",
+    );
+    assert!(
+        !step2.metrics.contains_key("iteration_rate"),
+        "no right boundary -> no rate (absent, not a phantom 0); got {:?}",
+        step2.metrics,
+    );
+}
+
+/// A synthesized (sample_count == 0) bucket between two captured phases
+/// must NOT produce a phantom boundary change in Timeline: the
+/// change-detection skips any pair touching a zero-sample bucket, so a
+/// synthesized bucket's wild/absent metrics never flag a spurious
+/// change on its neighbors.
+#[test]
+fn synthesized_zero_sample_bucket_produces_no_phantom_timeline_change() {
+    use crate::timeline::{Timeline, TimelineContext};
+    let captured = |k: u16, imbalance: f64, rate: f64| crate::assert::PhaseBucket {
+        step_index: k,
+        label: format!("Step[{}]", k.saturating_sub(1)),
+        start_ms: (k as u64) * 1000,
+        end_ms: (k as u64) * 1000 + 1000,
+        sample_count: 5,
+        metrics: std::collections::BTreeMap::from([
+            ("avg_imbalance_ratio".to_string(), imbalance),
+            ("iteration_rate".to_string(), rate),
+        ]),
+    };
+    // step 1 + step 3 steady & captured; step 2 synthesized with WILD
+    // metrics but sample_count == 0.
+    let buckets = vec![
+        captured(1, 1.0, 1000.0),
+        crate::assert::PhaseBucket {
+            step_index: 2,
+            label: "Step[1]".to_string(),
+            start_ms: 2000,
+            end_ms: 3000,
+            sample_count: 0,
+            metrics: std::collections::BTreeMap::from([
+                ("avg_imbalance_ratio".to_string(), 100.0),
+                ("iteration_rate".to_string(), 10.0),
+            ]),
+        },
+        captured(3, 1.0, 1000.0),
+    ];
+    let timeline = Timeline::from_phase_buckets(&buckets, &[], &TimelineContext::default());
+    assert!(
+        timeline.phases.iter().all(|p| p.changes.is_empty()),
+        "a zero-sample synthesized bucket must not flag a phantom change on \
+         its neighbors; got {:?}",
+        timeline
+            .phases
+            .iter()
+            .map(|p| (p.index, p.changes.len()))
+            .collect::<Vec<_>>(),
+    );
+}
+
+/// Event-sort tie-stability: when StepEnd[k] and StepStart[k+1] share
+/// the same elapsed_ms (a zero-length inter-step gap at the guest's
+/// coarse-ms clock), the rate attributed to step k must be the
+/// step-LOCAL StepStart[k]->StepEnd[k] delta, NOT the cross-step
+/// StepStart[k]->StepStart[k+1] delta. The total-ordered sort (StepEnd
+/// before StepStart on a tie) guarantees the step-local pairing.
+#[test]
+fn build_phase_buckets_with_stimulus_step_end_tie_attributes_step_local_rate() {
+    use crate::scenario::snapshot::{DrainedSnapshotEntry, MissingStatsReason};
+    use crate::timeline::StimulusEvent;
+    let cap = |tag: &str, offset_ms: u64| DrainedSnapshotEntry {
+        tag: tag.to_string(),
+        report: fixture_report(),
+        stats: Err(MissingStatsReason::NoSchedulerBinary),
+        elapsed_ms: Some(9_000),
+        boundary_offset_ms: Some(offset_ms),
+        step_index: Some(1),
+    };
+    let drained = vec![cap("periodic_000", 1_500), cap("periodic_001", 2_500)];
+    let samples = SampleSeries::from_drained_typed(drained, None);
+    // StepEnd[1] and StepStart[2] BOTH at elapsed 2000 (the tie). Step 1's
+    // local delta is 500 iters / 1s = 500/s; the cross-step
+    // StepStart[1]->StepStart[2] delta would be 9000 iters / 1s = 9000/s.
+    let ev = |elapsed_ms: u64, k: u16, iters: u64, is_step_end: bool| StimulusEvent {
+        elapsed_ms,
+        label: if is_step_end {
+            format!("StepEnd[{k}]")
+        } else {
+            format!("StepStart[{k}]")
+        },
+        op_kind: None,
+        detail: None,
+        total_iterations: Some(iters),
+        step_index: Some(k),
+        is_terminal: false,
+        is_step_end,
+    };
+    let stimulus = vec![
+        ev(1000, 1, 0, false),    // StepStart[1]
+        ev(2000, 1, 500, true),   // StepEnd[1]   (ties with StepStart[2])
+        ev(2000, 2, 9000, false), // StepStart[2] (ties with StepEnd[1])
+    ];
+    let phases = crate::assert::build_phase_buckets_with_stimulus(&samples, &stimulus);
+    let step1 = phases
+        .iter()
+        .find(|p| p.step_index == 1)
+        .expect("step 1 bucket present");
+    let rate = step1
+        .metrics
+        .get("iteration_rate")
+        .copied()
+        .expect("step 1 iteration_rate populated");
+    assert!(
+        (rate - 500.0).abs() < f64::EPSILON,
+        "step 1 must get its LOCAL StepStart[1]->StepEnd[1] rate (500/s), \
+         not the cross-step StepStart[1]->StepStart[2] delta (9000/s); got {rate}",
+    );
+}
+
+/// Hostile input: a synthesized bucket's end_ms clamps to the next
+/// step-start, so a non-monotonic (corrupt-wire) StepEnd[k] >=
+/// StepStart[k+1] cannot extend the synthesized window past the next
+/// step's start (which would over-fold monitor samples into two adjacent
+/// synthesized buckets).
+#[test]
+fn build_phase_buckets_with_stimulus_synthesized_end_ms_clamped_to_next_start() {
+    use crate::scenario::snapshot::DrainedSnapshotEntry;
+    use crate::timeline::StimulusEvent;
+    // No captures -> all steps synthesize.
+    let samples = SampleSeries::from_drained_typed(Vec::<DrainedSnapshotEntry>::new(), None);
+    let ev = |elapsed_ms: u64, k: u16, is_step_end: bool| StimulusEvent {
+        elapsed_ms,
+        label: format!("Step{}[{k}]", if is_step_end { "End" } else { "Start" }),
+        op_kind: None,
+        detail: None,
+        total_iterations: Some(0),
+        step_index: Some(k),
+        is_terminal: false,
+        is_step_end,
+    };
+    // StepEnd[1] at 5000 is CORRUPT — it lands AFTER StepStart[2] (2000).
+    let stimulus = vec![
+        ev(1000, 1, false), // StepStart[1]
+        ev(2000, 2, false), // StepStart[2]
+        ev(5000, 1, true),  // StepEnd[1] — non-monotonic
+    ];
+    let phases = crate::assert::build_phase_buckets_with_stimulus(&samples, &stimulus);
+    let step1 = phases
+        .iter()
+        .find(|p| p.step_index == 1)
+        .expect("synthesized step 1 bucket present");
+    assert_eq!(
+        step1.end_ms, 2000,
+        "synthesized step 1 end_ms must clamp to StepStart[2]=2000, NOT the \
+         corrupt StepEnd[1]=5000 that would overlap step 2; got {}",
+        step1.end_ms,
+    );
+}
+
+/// #4 regression fix: a synthesized zero-capture bucket folds the FULL
+/// monitor-derived metric set (not just avg_imbalance_ratio), restoring
+/// parity with the legacy Timeline::build fallback for a
+/// zero-capture-with-monitor run. Before the fix the synthesize path
+/// dropped max_imbalance / dsq / fallback / keep_last from the rendered
+/// timeline (the path-flip regression pass 3 caught).
+#[test]
+fn build_phase_buckets_with_stimulus_synthesized_bucket_folds_full_monitor_set() {
+    use crate::monitor::{CpuSnapshot, MonitorReport, MonitorSample, ScxEventCounters};
+    use crate::scenario::snapshot::DrainedSnapshotEntry;
+    use crate::timeline::StimulusEvent;
+    let cpu = |nr: u32, dsq: u32, rq: u64, ev: Option<ScxEventCounters>| CpuSnapshot {
+        nr_running: nr,
+        local_dsq_depth: dsq,
+        rq_clock: rq,
+        scx_nr_running: 0,
+        scx_flags: 0,
+        event_counters: ev,
+        schedstat: None,
+        vcpu_cpu_time_ns: None,
+        vcpu_perf: None,
+        sched_domains: None,
+    };
+    let evc = |fb: i64, kl: i64| {
+        Some(ScxEventCounters {
+            select_cpu_fallback: fb,
+            dispatch_keep_last: kl,
+            ..Default::default()
+        })
+    };
+    // Two in-window samples; anchor at the first stimulus elapsed (1000)
+    // pins monitor_clock_offset to 0. Per-CPU nr_running 4/2 -> imbalance
+    // 2.0; per-CPU dsq (3,1) -> avg 2.0, max 3; event counters
+    // 10->110 fallback (delta 100), 5->55 keep_last (delta 50).
+    let mon = MonitorReport {
+        samples: vec![
+            MonitorSample {
+                prog_stats: None,
+                elapsed_ms: 1000,
+                cpus: vec![cpu(4, 3, 100, evc(10, 5)), cpu(2, 1, 100, None)],
+            },
+            MonitorSample {
+                prog_stats: None,
+                elapsed_ms: 1500,
+                cpus: vec![cpu(4, 3, 100, evc(110, 55)), cpu(2, 1, 200, None)],
+            },
+        ],
+        ..Default::default()
+    };
+    // No captures -> step 1 synthesizes; StepStart[2] bounds its window.
+    let samples =
+        SampleSeries::from_drained_typed(Vec::<DrainedSnapshotEntry>::new(), Some(mon));
+    let start = |elapsed_ms: u64, k: u16| StimulusEvent {
+        elapsed_ms,
+        label: format!("StepStart[{k}]"),
+        op_kind: None,
+        detail: None,
+        total_iterations: None,
+        step_index: Some(k),
+        is_terminal: false,
+        is_step_end: false,
+    };
+    let stimulus = vec![start(1000, 1), start(2000, 2)];
+    let phases = crate::assert::build_phase_buckets_with_stimulus(&samples, &stimulus);
+    let step1 = phases
+        .iter()
+        .find(|p| p.step_index == 1)
+        .expect("synthesized step 1 bucket present");
+    assert_eq!(step1.sample_count, 0, "synthesized bucket is capture-free");
+    let g = |k: &str| step1.metrics.get(k).copied();
+    // The monitor-derived metrics the pre-fix synthesize path DROPPED,
+    // now restored to parity with Timeline::build's compute_metrics:
+    assert_eq!(g("max_imbalance_ratio"), Some(2.0), "max imbalance");
+    assert_eq!(g("avg_dsq_depth"), Some(2.0), "avg dsq depth");
+    assert_eq!(g("max_dsq_depth"), Some(3.0), "max dsq depth");
+    assert_eq!(g("total_fallback"), Some(100.0), "fallback counter delta 110-10");
+    assert_eq!(g("total_keep_last"), Some(50.0), "keep_last counter delta 55-5");
+    // avg_imbalance_ratio was folded pre-fix too; still present.
+    assert_eq!(g("avg_imbalance_ratio"), Some(2.0), "avg imbalance");
+}
+
+/// Hostile input: a corrupt StepEnd[k] BEFORE its StepStart[k] yields an
+/// inverted synthesized window (end_ms < start_ms). fold_monitor_into_bucket
+/// folds nothing (the half-open `m >= start_ms && m < end_ms` is vacuously
+/// false) and the bucket is present without panic — no over-fold, no crash.
+#[test]
+fn build_phase_buckets_with_stimulus_synthesized_inverted_window_folds_nothing() {
+    use crate::monitor::{CpuSnapshot, MonitorReport, MonitorSample};
+    use crate::scenario::snapshot::DrainedSnapshotEntry;
+    use crate::timeline::StimulusEvent;
+    let cpu = |nr: u32| CpuSnapshot {
+        nr_running: nr,
+        ..Default::default()
+    };
+    let mon = MonitorReport {
+        samples: vec![MonitorSample::new(1500, vec![cpu(6), cpu(2)])],
+        ..Default::default()
+    };
+    let samples =
+        SampleSeries::from_drained_typed(Vec::<DrainedSnapshotEntry>::new(), Some(mon));
+    let ev = |elapsed_ms: u64, k: u16, is_step_end: bool| StimulusEvent {
+        elapsed_ms,
+        label: format!("Step{}[{k}]", if is_step_end { "End" } else { "Start" }),
+        op_kind: None,
+        detail: None,
+        total_iterations: Some(0),
+        step_index: Some(k),
+        is_terminal: false,
+        is_step_end,
+    };
+    // StepEnd[1] at 1000 is BEFORE StepStart[1] at 2000 (corrupt wire).
+    let stimulus = vec![ev(2000, 1, false), ev(1000, 1, true)];
+    let phases = crate::assert::build_phase_buckets_with_stimulus(&samples, &stimulus);
+    let step1 = phases
+        .iter()
+        .find(|p| p.step_index == 1)
+        .expect("synthesized step 1 bucket present despite inverted window");
+    assert!(
+        step1.start_ms > step1.end_ms,
+        "window is inverted: start {} end {}",
+        step1.start_ms,
+        step1.end_ms,
+    );
+    assert!(
+        !step1.metrics.contains_key("avg_imbalance_ratio"),
+        "an inverted window folds no monitor samples; got {:?}",
+        step1.metrics,
+    );
+}
+
+/// Math-protocol boundary coverage for the synthesize end_ms terminal-clamp
+/// arm: a last step with no StepEnd and no successor but a ScenarioEnd
+/// terminal present clamps the window to the terminal (not u64::MAX), so a
+/// monitor sample AFTER the terminal is excluded from the fold (the
+/// pass-4 over-fold guard).
+#[test]
+fn build_phase_buckets_with_stimulus_synthesized_end_ms_clamps_to_terminal() {
+    use crate::monitor::{CpuSnapshot, MonitorReport, MonitorSample};
+    use crate::scenario::snapshot::DrainedSnapshotEntry;
+    use crate::timeline::StimulusEvent;
+    let cpu = |nr: u32| CpuSnapshot {
+        nr_running: nr,
+        ..Default::default()
+    };
+    // s1 @1000 (anchor -> monitor_clock_offset 0), imbalance 2/2 = 1.0,
+    // IN [1000, 3000). s2 @4000 (AFTER the terminal 3000), imbalance
+    // 10/2 = 5.0, must be EXCLUDED by the terminal clamp.
+    let mon = MonitorReport {
+        samples: vec![
+            MonitorSample::new(1000, vec![cpu(2), cpu(2)]),
+            MonitorSample::new(4000, vec![cpu(10), cpu(2)]),
+        ],
+        ..Default::default()
+    };
+    let samples =
+        SampleSeries::from_drained_typed(Vec::<DrainedSnapshotEntry>::new(), Some(mon));
+    let start = StimulusEvent {
+        elapsed_ms: 1000,
+        label: "StepStart[1]".to_string(),
+        op_kind: None,
+        detail: None,
+        total_iterations: None,
+        step_index: Some(1),
+        is_terminal: false,
+        is_step_end: false,
+    };
+    let terminal = StimulusEvent {
+        elapsed_ms: 3000,
+        label: "ScenarioEnd".to_string(),
+        op_kind: None,
+        detail: None,
+        total_iterations: None,
+        step_index: None,
+        is_terminal: true,
+        is_step_end: false,
+    };
+    let phases =
+        crate::assert::build_phase_buckets_with_stimulus(&samples, &[start, terminal]);
+    let step1 = phases
+        .iter()
+        .find(|p| p.step_index == 1)
+        .expect("synthesized step 1 bucket present");
+    assert_eq!(
+        step1.end_ms, 3000,
+        "end_ms clamps to the terminal (3000), not u64::MAX",
+    );
+    assert_eq!(
+        step1.metrics.get("avg_imbalance_ratio").copied(),
+        Some(1.0),
+        "only the in-window pre-terminal sample folds (imbalance 1.0); the \
+         post-terminal sample (5.0) is excluded — avg is 1.0, not 3.0",
+    );
+}
+
 /// The public SampleSeries grouping methods: by_stamped_phase
 /// COLLAPSES a deferred-fire burst (every capture stamped the same late
 /// step) into one phase, while by_stimulus_phase re-derives the correct
@@ -1738,10 +2296,15 @@ fn by_stimulus_phase_separates_what_by_stamped_phase_collapses() {
     }
 }
 
-/// Fallback: a capture with no `boundary_offset_ms` (on-demand /
-/// fixture) keeps its stamped step_index even when a stimulus timeline
-/// is present — the offset remap only overrides captures that carry a
-/// scheduled offset, so legacy / non-periodic entries are untouched.
+/// Fallback + synthesize interaction: a capture with no
+/// `boundary_offset_ms` (on-demand / fixture) keeps its stamped
+/// step_index even when a stimulus timeline is present — the offset
+/// remap only overrides captures that carry a scheduled offset, so
+/// legacy / non-periodic entries are untouched. The step-5 StepStart
+/// does NOT pull the None-offset captures to step 5 (they stay at their
+/// stamped 1 / 2); it does, per the #4 synthesize seam, produce its OWN
+/// capture-free step-5 bucket — a StepStart marks a step that ran, so
+/// every StepStart-step gets a bucket even with zero captures.
 #[test]
 fn build_phase_buckets_with_stimulus_none_offset_falls_back_to_stamped_step() {
     use crate::scenario::snapshot::{DrainedSnapshotEntry, MissingStatsReason};
@@ -1756,8 +2319,9 @@ fn build_phase_buckets_with_stimulus_none_offset_falls_back_to_stamped_step() {
     };
     let drained = vec![mk("periodic_000", 1), mk("periodic_001", 2)];
     let samples = SampleSeries::from_drained_typed(drained, None);
-    // A step-5 stimulus is present but must NOT pull the None-offset
-    // captures to step 5 — they keep their stamped 1 / 2.
+    // A step-5 stimulus is present: it must NOT pull the None-offset
+    // captures to step 5 (they keep their stamped 1 / 2), but it DOES
+    // synthesize its own capture-free step-5 bucket.
     let stimulus = vec![StimulusEvent {
         elapsed_ms: 0,
         label: "StepStart[5]".to_string(),
@@ -1772,10 +2336,17 @@ fn build_phase_buckets_with_stimulus_none_offset_falls_back_to_stamped_step() {
     let idxs: Vec<u16> = phases.iter().map(|p| p.step_index).collect();
     assert_eq!(
         idxs,
-        vec![1, 2],
-        "None-offset captures keep their stamped step_index (1, 2), not \
-         remapped to the step-5 stimulus; got {idxs:?}",
+        vec![1, 2, 5],
+        "None-offset captures keep their stamped step_index (1, 2), NOT \
+         remapped to the step-5 stimulus; step 5's StepStart synthesizes its \
+         own capture-free bucket; got {idxs:?}",
     );
+    // The captures stayed in buckets 1/2 (one each) — NOT collapsed into a
+    // single step-5 bucket. Step 5 is the synthesized, capture-free one.
+    let count = |k: u16| phases.iter().find(|p| p.step_index == k).map(|p| p.sample_count);
+    assert_eq!(count(1), Some(1), "capture stamped 1 stays in its own bucket");
+    assert_eq!(count(2), Some(1), "capture stamped 2 stays in its own bucket");
+    assert_eq!(count(5), Some(0), "step 5 is the synthesized capture-free bucket");
 }
 
 /// Iteration-rate attribution regression: in the production shape (periodic captures carry
@@ -2349,5 +2920,52 @@ fn populate_run_ext_metrics_from_phases_folds_per_phase_keys() {
     assert!(
         (avg - 3.5).abs() < f64::EPSILON,
         "expected weighted mean 3.5, got {avg}",
+    );
+}
+
+/// A synthesized zero-capture phase (sample_count==0) still folds into
+/// the run aggregate at weight 1 via the .max(1) floor — its
+/// capture-independent iteration_rate is INCLUDED, not zero-weighted
+/// out. A regression dropping the floor (bare sample_count) would
+/// zero-weight the synthesized step and silently re-drop its rate from
+/// the sidecar aggregate: the run-level variant of the #4 bug.
+#[test]
+fn populate_run_ext_metrics_includes_zero_capture_phase_at_weight_one() {
+    use crate::assert::PhaseBucket;
+    use std::collections::BTreeMap;
+    let mut cap = BTreeMap::new();
+    cap.insert("iteration_rate".to_string(), 1200.0);
+    let mut synth = BTreeMap::new();
+    synth.insert("iteration_rate".to_string(), 600.0);
+    let phases = vec![
+        PhaseBucket {
+            step_index: 1,
+            label: "Step[0]".to_string(),
+            start_ms: 0,
+            end_ms: 100,
+            sample_count: 5,
+            metrics: cap,
+        },
+        PhaseBucket {
+            step_index: 2,
+            label: "Step[1]".to_string(),
+            start_ms: 100,
+            end_ms: 200,
+            sample_count: 0, // synthesized zero-capture step
+            metrics: synth,
+        },
+    ];
+    let mut target = BTreeMap::new();
+    crate::assert::populate_run_ext_metrics_from_phases(&phases, &mut target);
+    // iteration_rate is Gauge(Avg); weighted mean with the zero-capture
+    // phase floored to weight 1: (1200*5 + 600*1) / (5+1) = 6600/6 = 1100.
+    let r = target
+        .get("iteration_rate")
+        .copied()
+        .expect("synthesized zero-capture phase must still fold into the run aggregate");
+    assert!(
+        (r - 1100.0).abs() < f64::EPSILON,
+        "expected weight-5:1 mean 1100.0 (zero-capture phase counted at \
+         weight 1, NOT dropped), got {r}",
     );
 }
