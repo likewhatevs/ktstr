@@ -705,6 +705,31 @@ impl VmResult {
         )
     }
 
+    /// One framework-computed per-phase metric for `phase` — the
+    /// metric-name analog of [`Self::step_throughput`] /
+    /// [`Self::throughput_ratio`], covering the per-phase metrics that
+    /// are NOT iteration throughput: per-phase CPU time
+    /// (`system_time_ns`, `user_time_ns`), latency
+    /// (`worst_run_delay_us`, `worst_mean_run_delay_us`), and
+    /// scheduling quality (`avg_imbalance_ratio`, `avg_dsq_depth`, ...).
+    /// `metric` is a `crate::stats::METRICS` registry name.
+    ///
+    /// Reads the SAME buckets [`Self::phase_buckets`] folds onto
+    /// `result.stats.phases`, so a `post_vm` callback can compare any
+    /// metric across two phases (e.g. scheduler-vs-detached-EEVDF
+    /// `system_time_ns`) without re-deriving the buckets — the
+    /// general form of the scheduler-vs-EEVDF throughput compare.
+    /// `None` when `phase` produced no bucket (it fired no periodic
+    /// capture) or the bucket carries no reading for `metric` (every
+    /// sample's per-phase reading was absent — the sentinel-free
+    /// "no data" contract, distinct from a real `Some(0.0)`).
+    pub fn phase_metric(&self, phase: crate::assert::Phase, metric: &str) -> Option<f64> {
+        self.phase_buckets()
+            .into_iter()
+            .find(|b| b.step_index == phase.as_u16())
+            .and_then(|b| b.get(metric))
+    }
+
     /// Minimal "nothing happened" fixture for tests that exercise
     /// code consuming a [`VmResult`] without actually booting a VM
     /// (the sidecar-write tests in `src/test_support/sidecar.rs`
@@ -1517,6 +1542,47 @@ mod tests {
             cloned, original,
             "a clone taken after cache population must carry the same \
              buckets (category-3 independent-once-populated semantics)"
+        );
+    }
+
+    /// `phase_metric` keys by `Phase` (1-indexed wire `step_index`) and
+    /// delegates to the matching bucket's `get()`: it returns each
+    /// present metric's value, `None` for an unknown metric on an
+    /// existing phase, and `None` for a phase with no bucket. (The
+    /// Some-value read itself is `PhaseBucket::get`, pinned by its own
+    /// tests; this pins the phase-keying and the None contract.)
+    #[test]
+    fn phase_metric_keys_by_phase_and_delegates_to_bucket_get() {
+        let r = vm_result_with_periodic_captures(2);
+        // The captures are stamped step_index=1 -> Phase::step(0).
+        let p0 = crate::assert::Phase::step(0);
+        let buckets = r.phase_buckets();
+        let step0 = buckets
+            .iter()
+            .find(|b| b.step_index == p0.as_u16())
+            .expect("a Step[0] bucket from the stamped captures (keys by step_index)");
+        // Some-path delegation: for every metric the matching bucket
+        // carries, phase_metric returns that exact value. The
+        // default-report fixture may fold no metrics, so this loop can be
+        // empty — the keying + None assertions below pin the rest.
+        for (name, val) in &step0.metrics {
+            assert_eq!(
+                r.phase_metric(p0, name),
+                Some(*val),
+                "phase_metric must return the matching bucket's value for present metric '{name}'",
+            );
+        }
+        // A name absent from the bucket -> None (the bucket is still found).
+        assert_eq!(
+            r.phase_metric(p0, "definitely_not_a_registry_metric"),
+            None,
+            "an unknown metric name yields None even when the phase has a bucket",
+        );
+        // A phase with no bucket -> None (not a panic, not a wrong bucket).
+        assert_eq!(
+            r.phase_metric(crate::assert::Phase::step(99), "iteration_rate"),
+            None,
+            "a phase with no bucket yields None",
         );
     }
 

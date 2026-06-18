@@ -44,6 +44,7 @@
   - [Diagnose a Slow Scheduler with ctprof](recipes/diagnose-slow-scheduler.md)
   - [Customize Checking](recipes/custom-checking.md)
   - [Benchmarking and Negative Tests](recipes/benchmarking-tests.md)
+  - [Compare a Scheduler vs EEVDF](recipes/scheduler-vs-eevdf.md)
 
 # Architecture
 

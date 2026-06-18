@@ -33,3 +33,5 @@ Standalone examples for common tasks. Each recipe is self-contained.
   thresholds, per-test overrides
 - [Benchmarking and negative tests](recipes/benchmarking-tests.md) --
   performance gates, intentional degradation, Assert checks
+- [Compare a scheduler vs EEVDF](recipes/scheduler-vs-eevdf.md) --
+  detach mid-run and compare per-phase throughput, latency, and CPU time
