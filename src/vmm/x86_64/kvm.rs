@@ -409,23 +409,33 @@ impl KtstrKvm {
             .get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
             .context("get_supported_cpuid")?;
 
-        // Reject (rather than silently truncate) a VM whose RAM relocates
-        // above the guest's addressable physical space. generate_cpuid leaves
-        // CPUID leaf 0x8000_0008 EAX = the host's MAXPHYADDR (it patches only
-        // ECX), so the guest's phys-addr width is the host's. If the relocated
-        // RAM top exceeds 1<<phys_bits, the guest kernel silently caps
-        // last_pfn at max_arch_pfn (e820__end_ram_pfn) and boots with less RAM
-        // than advertised — a silent data drop. Surface it as a
-        // host-capability skip, same class as the max_vcpus check below.
+        // Reject a VM whose RAM relocates above the guest's addressable
+        // physical space. generate_cpuid leaves CPUID leaf 0x8000_0008 EAX =
+        // the host's MAXPHYADDR (it patches only ECX), so the guest's
+        // phys-addr width is the host's. Bits above the guest MAXPHYADDR are
+        // architecturally reserved in guest PTEs (KVM sets reserved_gpa_bits
+        // = rsvd_bits(cpuid_maxphyaddr, 63)), so a PTE mapping a GPA above
+        // 1<<phys_bits faults on the MMU walk's reserved-bits check — RAM with
+        // a top above it is unreachable even though it is advertised. Reject
+        // pre-create: a permanent host-capability
+        // shortfall (the host MAXPHYADDR is fixed hardware), same skip class
+        // as the max_vcpus check below. (Distinct from the kernel's separate,
+        // wider e820 cap at max_arch_pfn = 1<<MAX_PHYSMEM_BITS (46/52), which
+        // does not key on the CPUID MAXPHYADDR.)
         //
-        // Reference note: qemu likewise rejects (its phys-bits-too-low
-        // hard-fail), never truncates. cloud-hypervisor instead caps the
-        // guest MAXPHYADDR at 46 and sizes the MMIO/device area from it (migration
-        // portability); ktstr has no migration, so it exposes the host's
-        // MAXPHYADDR and rejects. libkrun and firecracker also leave the
-        // host's MAXPHYADDR but lack this RAM bound, so the check is a
-        // correct superset. Bounds the RAM top only; widen to max(RAM, MMIO)
-        // top if a high MMIO window above RAM is ever added.
+        // Reference note (how other VMMs treat the host MAXPHYADDR): qemu
+        // hard-fails ("phys-bits too low") against a WIDER bound — phys_bits
+        // vs pc_max_used_gpa = max(RAM top, high-MMIO top). cloud-hypervisor
+        // caps the guest MAXPHYADDR at min(host, max_phys_bits) (default 46)
+        // and sizes the MMIO area from it, with no RAM-top rejection.
+        // firecracker and libkrun leave the host MAXPHYADDR with no
+        // 1<<phys_bits RAM bound. ktstr exposes
+        // the host MAXPHYADDR unmodified and rejects: a SUBSET of qemu's wider
+        // bound (equal today — ktstr's sole MMIO window is the sub-4G gap,
+        // below relocated RAM, so RAM top is the true max GPA) and a superset
+        // of the firecracker/libkrun no-bound case. Bounds the RAM top only;
+        // widen to max(RAM, MMIO) top if a high MMIO window above RAM is ever
+        // added.
         if let Some(layout) = &numa_layout {
             let phys_bits = base_cpuid
                 .as_slice()
@@ -435,12 +445,13 @@ impl KtstrKvm {
                 .unwrap_or(36);
             if let Some(top) = layout.ram_top_exceeds_phys_bits(phys_bits) {
                 return Err(anyhow::Error::new(
-                    crate::vmm::host_topology::ResourceContention {
+                    crate::vmm::host_topology::TopologyInsufficient {
                         reason: format!(
                             "guest RAM top {top:#x} exceeds the guest MAXPHYADDR \
                              (1<<{phys_bits}); this host's physical-address \
-                             width cannot back a VM this large without the guest \
-                             silently truncating RAM"
+                             width cannot back a VM this large — RAM above the \
+                             MAXPHYADDR is unreachable (a guest access faults on \
+                             the MMU reserved-bits check)"
                         ),
                     },
                 ));
@@ -462,7 +473,7 @@ impl KtstrKvm {
         let max_vcpus = kvm.get_max_vcpus();
         if total as usize > max_vcpus {
             return Err(anyhow::Error::new(
-                crate::vmm::host_topology::ResourceContention {
+                crate::vmm::host_topology::TopologyInsufficient {
                     reason: format!(
                         "topology requires {total} vCPUs but this host's \
                      KVM_CAP_MAX_VCPUS is {max_vcpus}; cannot run a VM this wide"
@@ -479,7 +490,7 @@ impl KtstrKvm {
         let max_vcpu_id = kvm.get_max_vcpu_id();
         if (max_apic_id as usize) >= max_vcpu_id {
             return Err(anyhow::Error::new(
-                crate::vmm::host_topology::ResourceContention {
+                crate::vmm::host_topology::TopologyInsufficient {
                     reason: format!(
                         "topology's max APIC ID {max_apic_id} (the KVM vcpu_id) is \
                          >= this host's KVM_CAP_MAX_VCPU_ID {max_vcpu_id}; cannot \

@@ -29,12 +29,16 @@ impl std::fmt::Display for ResourceContention {
 
 impl std::error::Error for ResourceContention {}
 
-/// The host cannot satisfy the requested `performance_mode` topology:
-/// it has fewer physical CPUs or LLC groups than the test's virtual
-/// topology needs. Distinct from [`ResourceContention`] (a transient
-/// slot/resource shortage a retry can resolve) — a too-small host is a
-/// permanent condition, so the operator must provision hardware or drop
-/// perf-mode rather than retry.
+/// A permanent host-capability shortfall: the host cannot satisfy the
+/// requested topology, and no retry can change that. Two producer
+/// families: the `performance_mode` planner (the host has fewer physical
+/// CPUs or LLC groups than the test's virtual topology needs) and x86_64
+/// VM creation (guest RAM top above the host MAXPHYADDR, vCPU count above
+/// KVM_CAP_MAX_VCPUS, or max APIC id at/above KVM_CAP_MAX_VCPU_ID).
+/// Distinct from [`ResourceContention`] (a transient slot/resource
+/// shortage a retry can resolve) — a too-small host is permanent, so the
+/// operator must provision different hardware or narrow the topology
+/// rather than retry.
 ///
 /// Downcast via `anyhow::Error::downcast_ref::<TopologyInsufficient>()`
 /// (chain-aware: the `#[ktstr_test]` dispatch and `skip_on_contention!`

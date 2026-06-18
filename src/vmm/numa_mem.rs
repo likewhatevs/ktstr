@@ -320,10 +320,14 @@ impl NumaMemoryLayout {
 
     /// If the relocated RAM top exceeds the guest's addressable physical
     /// space (`1 << phys_bits`), return that top GPA; otherwise `None`.
-    /// Without rejecting this, RAM above the guest MAXPHYADDR is SILENTLY
-    /// truncated by the guest kernel (e820__end_ram_pfn caps last_pfn at
-    /// max_arch_pfn), so the guest boots with less RAM than advertised.
-    /// `phys_bits >= 64` means no limit (the full u64 GPA space).
+    /// Bits above the guest MAXPHYADDR are architecturally reserved in guest
+    /// PTEs (KVM sets `reserved_gpa_bits = rsvd_bits(cpuid_maxphyaddr, 63)`),
+    /// so a PTE mapping a GPA above `1 << phys_bits` faults on the MMU walk's
+    /// reserved-bits check — RAM placed there is unreachable; rejecting it
+    /// keeps the guest from booting with RAM it cannot reach. (Distinct from
+    /// the kernel's separate, wider e820 cap at `max_arch_pfn =
+    /// 1 << MAX_PHYSMEM_BITS` (46/52), which does not key on the CPUID
+    /// MAXPHYADDR.) `phys_bits >= 64` means no limit (the full u64 GPA space).
     ///
     /// x86_64-only: `phys_bits` is the guest's CPUID 0x8000_0008
     /// MAXPHYADDR and the sole caller is `x86_64::kvm`. There is
@@ -1229,7 +1233,8 @@ mod tests {
     fn ram_top_exceeds_phys_bits_rejects_above_maxphyaddr() {
         // 8 GiB single node on x86 relocates above the 4 GiB MMIO gap -> top
         // GPA ~9 GiB. A 33-bit guest MAXPHYADDR (8 GiB) is exceeded -> must
-        // reject (else the guest silently truncates RAM); a 40-bit one
+        // reject (else the RAM above the MAXPHYADDR is unreachable — a guest
+        // access faults on the MMU reserved-bits check); a 40-bit one
         // (1 TiB) is not; >=64 means no limit.
         let topo = Topology {
             llcs: 1,
