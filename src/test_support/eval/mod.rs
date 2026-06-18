@@ -938,11 +938,11 @@ fn run_ktstr_test_inner_impl(
     let vm = match builder.build() {
         Ok(vm) => vm,
         Err(e) => {
-            if e.downcast_ref::<crate::vmm::host_topology::ResourceContention>()
-                .is_some()
-                || e.downcast_ref::<crate::vmm::host_topology::TopologyInsufficient>()
-                    .is_some()
-            {
+            // Chain-aware (the error can arrive .context()-wrapped, e.g.
+            // KtstrKvm::new's "create VM"): walk the chain so a wrapped
+            // skip-class error is still recorded here, matching the late
+            // catch-all in run_ktstr_test_inner.
+            if super::is_resource_contention(&e) || super::is_topology_insufficient(&e) {
                 record_skip_sidecar(entry);
             }
             return Err(e.context("build ktstr_test VM"));
@@ -951,11 +951,8 @@ fn run_ktstr_test_inner_impl(
     let mut result = match vm.run() {
         Ok(r) => r,
         Err(e) => {
-            if e.downcast_ref::<crate::vmm::host_topology::ResourceContention>()
-                .is_some()
-                || e.downcast_ref::<crate::vmm::host_topology::TopologyInsufficient>()
-                    .is_some()
-            {
+            // Chain-aware, as in the build arm above.
+            if super::is_resource_contention(&e) || super::is_topology_insufficient(&e) {
                 record_skip_sidecar(entry);
             }
             return Err(e.context("run ktstr_test VM"));
