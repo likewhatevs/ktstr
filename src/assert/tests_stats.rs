@@ -521,3 +521,43 @@ fn cgroup_balance_ratio_skips_no_worker_cells_and_surfaces_starvation() {
         "a zero-work with-worker cell must surface as inf, not None/NaN",
     );
 }
+
+/// `CgroupStats::iterations_per_cpu_sec` = iterations per CPU-second of
+/// on-CPU time (the overcommit-invariant rate). `None` when there is no
+/// worker or no captured on-CPU time (inconclusive, never `Inf`).
+#[test]
+fn iterations_per_cpu_sec_normalizes_by_on_cpu_time() {
+    // 120000 iterations over 12e9 ns = 12 CPU-seconds -> 10000 iters/CPU-s.
+    let cg = CgroupStats {
+        num_workers: 12,
+        total_iterations: 120_000,
+        total_cpu_time_ns: 12_000_000_000,
+        ..CgroupStats::default()
+    };
+    let r = cg
+        .iterations_per_cpu_sec()
+        .expect("workers + on-CPU time => Some");
+    assert!((r - 10_000.0).abs() < 1e-6, "got {r}");
+
+    // No worker -> None (undefined, not a measured zero).
+    let cg = CgroupStats {
+        num_workers: 0,
+        total_iterations: 0,
+        total_cpu_time_ns: 0,
+        ..CgroupStats::default()
+    };
+    assert_eq!(cg.iterations_per_cpu_sec(), None, "no workers => None");
+
+    // Workers ran but no on-CPU time captured -> None (inconclusive, not Inf).
+    let cg = CgroupStats {
+        num_workers: 12,
+        total_iterations: 120_000,
+        total_cpu_time_ns: 0,
+        ..CgroupStats::default()
+    };
+    assert_eq!(
+        cg.iterations_per_cpu_sec(),
+        None,
+        "zero on-CPU time => None, not Inf",
+    );
+}

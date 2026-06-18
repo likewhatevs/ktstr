@@ -1405,6 +1405,14 @@ pub struct CgroupStats {
     pub wake_latency_cv: f64,
     /// Sum of iteration counts across all workers.
     pub total_iterations: u64,
+    /// Sum of per-worker on-CPU time (nanoseconds), from each worker's
+    /// schedstat run time ([`crate::workload::WorkerReport::schedstat_cpu_time_ns`]
+    /// — the kernel `sched_info`/schedstat on-CPU accounting, which is the
+    /// summable per-thread proxy for the cgroup's `cpu.stat usage_usec`).
+    /// Denominator for [`Self::iterations_per_cpu_sec`], the
+    /// overcommit-invariant per-cell rate. `0` when no worker reported on-CPU
+    /// time (the accessor then returns `None`).
+    pub total_cpu_time_ns: u64,
     /// Mean schedstat run delay across workers (microseconds).
     pub mean_run_delay_us: f64,
     /// Worst schedstat run delay across workers (microseconds).
@@ -1469,6 +1477,30 @@ impl CgroupStats {
         } else {
             None
         }
+    }
+
+    /// Worker iterations per CPU-second of on-CPU time consumed by this
+    /// cgroup's workers — `total_iterations / (total_cpu_time_ns / 1e9)`.
+    ///
+    /// Unlike [`Self::iterations_per_worker`] (raw work, which scales with
+    /// the host-CPU budget delivered to the guest) and a wall-time rate
+    /// (which also drops under host oversubscription), this is
+    /// OVERCOMMIT-INVARIANT: under `cpu_budget < vcpus` a cell completes
+    /// proportionally fewer iterations AND consumes proportionally less
+    /// on-CPU time, so the ratio cancels the lost host-CPU-time factor. Use
+    /// it to compare per-cgroup throughput across `cpu_budget` settings.
+    ///
+    /// `None` when `num_workers == 0` (no worker — undefined, distinct from a
+    /// measured zero) or `total_cpu_time_ns == 0` (no on-CPU time captured;
+    /// returns inconclusive rather than `Inf`). For a pure busy-spin
+    /// workload this rate is ~constant by construction, so it measures
+    /// CPU-time EFFICIENCY; for the cross-cell ALLOCATION balance use
+    /// [`ScenarioStats::cgroup_balance_ratio`] over `iterations_per_worker`.
+    pub fn iterations_per_cpu_sec(&self) -> Option<f64> {
+        if self.num_workers == 0 || self.total_cpu_time_ns == 0 {
+            return None;
+        }
+        Some(self.total_iterations as f64 / (self.total_cpu_time_ns as f64 / 1e9))
     }
 }
 
@@ -5279,6 +5311,7 @@ pub fn cgroup_stats(reports: &[WorkerReport]) -> CgroupStats {
         median_wake_latency_us: median_us,
         wake_latency_cv: lat_cv,
         total_iterations: total_iters,
+        total_cpu_time_ns: reports.iter().map(|w| w.schedstat_cpu_time_ns).sum(),
         mean_run_delay_us: mean_run_delay,
         worst_run_delay_us: worst_run_delay,
         // page_locality requires the expected NUMA node set (the cpuset's

@@ -230,6 +230,7 @@ fn cgroup_stats_missing_required_field_rejected_by_deserialize() {
         "median_wake_latency_us",
         "wake_latency_cv",
         "total_iterations",
+        "total_cpu_time_ns",
         "mean_run_delay_us",
         "worst_run_delay_us",
         "page_locality",
