@@ -107,6 +107,9 @@ fn parse_perf_delta_flags_and_defaults() {
         "release",
         "-E",
         "perf::",
+        "--kernel",
+        "6.14",
+        "--dual-run",
     ])
     .unwrap_or_else(|e| panic!("{e}"));
     match k.command {
@@ -115,15 +118,19 @@ fn parse_perf_delta_flags_and_defaults() {
             base_ref,
             filter,
             default_branch,
+            kernel,
+            dual_run,
         } => {
             assert_eq!(base.as_deref(), Some("abc123"));
             assert_eq!(base_ref.as_deref(), Some("release"));
             assert_eq!(filter.as_deref(), Some("perf::"));
             assert_eq!(default_branch, "main", "default branch defaults to main");
+            assert_eq!(kernel.as_deref(), Some("6.14"));
+            assert!(dual_run, "--dual-run flag sets dual_run");
         }
         _ => panic!("expected PerfDelta"),
     }
-    // Bare invocation: overrides None, default branch = main.
+    // Bare invocation: overrides None, default branch = main, no dual-run.
     let Cargo {
         command: CargoSub::Ktstr(k),
     } = Cargo::try_parse_from(["cargo", "ktstr", "perf-delta"]).unwrap_or_else(|e| panic!("{e}"));
@@ -133,9 +140,13 @@ fn parse_perf_delta_flags_and_defaults() {
             base_ref,
             filter,
             default_branch,
+            kernel,
+            dual_run,
         } => {
             assert!(base.is_none() && base_ref.is_none() && filter.is_none());
             assert_eq!(default_branch, "main");
+            assert!(kernel.is_none());
+            assert!(!dual_run, "--dual-run defaults off (cached-baseline path)");
         }
         _ => panic!("expected PerfDelta"),
     }

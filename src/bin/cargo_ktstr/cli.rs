@@ -253,6 +253,18 @@ pub(crate) enum KtstrCommand {
         /// `--base-ref` nor `$GITHUB_BASE_REF` is set.
         #[arg(long, default_value = "main")]
         default_branch: String,
+        /// Kernel the baseline + HEAD `performance_mode` runs boot.
+        /// Required with `--dual-run`; same `--kernel <SPEC>` form as
+        /// `cargo ktstr test`. Unused on the cached-baseline path.
+        #[arg(long)]
+        kernel: Option<String>,
+        /// Produce both commits' runs before comparing: check the
+        /// baseline out in a detached git worktree and run its
+        /// `performance_mode` tests there, run HEAD's in the working
+        /// tree, then compare. Without it, compares sidecars already
+        /// pooled from a prior run or a downloaded CI artifact.
+        #[arg(long)]
+        dual_run: bool,
     },
     /// Manage cached kernel images.
     Kernel {

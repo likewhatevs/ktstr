@@ -166,12 +166,16 @@ fn main() {
             base_ref,
             filter,
             default_branch,
+            kernel,
+            dual_run,
         } => {
             let args = perf_delta::PerfDeltaArgs {
                 base: base.as_deref(),
                 base_ref: base_ref.as_deref(),
                 filter: filter.as_deref(),
                 default_branch: &default_branch,
+                kernel: kernel.as_deref(),
+                dual_run,
             };
             match perf_delta::run(&args) {
                 Ok(0) => Ok(()),
