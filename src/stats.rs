@@ -5839,8 +5839,11 @@ mod tests {
         let tiny = f64::MIN_POSITIVE / 2.0; // Subnormal
         let xs = [tiny, tiny * 2.0, tiny * 3.0];
         let m = mean(xs.iter().copied());
-        assert!(m.is_finite(), "mean of subnormals should be finite");
-        assert!(m > 0.0, "mean of positive subnormals should be positive");
+        // The sum is 6 subnormal ULPs and 6/3 = 2 ULPs exactly, so an
+        // exact equality is correct and catches wrong-divisor,
+        // partial-sum, and first-element bugs that a finite/positive
+        // check would admit (e.g. count-1 → 3*tiny, first sample → tiny).
+        assert_eq!(m, 2.0 * tiny, "subnormals must be summed/averaged exactly");
     }
 
     /// std_dev with exactly two values uses Bessel's correction (ddof=1).
@@ -10905,6 +10908,42 @@ mod tests {
             opts.passes_delta_threshold(&zero_a),
             "zero-a divisor floor (|a|.max(1.0)) must keep rel finite \
              (rel = |10|/max(0,1) = 10.0); 10.0 ≥ 0.5 → row passes"
+        );
+    }
+
+    /// Distinguishing pin for the `.max(1.0)` divisor floor: the
+    /// a=0/delta=10 case above passes both floored (10/1=10≥0.5) AND
+    /// unfloored (10/0=+inf≥0.5), so it does NOT guard the floor. The
+    /// floor actually protects a=0 AND delta=0 at --phase-threshold 0:
+    /// floored gives 0/1=0, and 0≥0 → the row renders (the documented
+    /// "PCT=0 shows every row" contract); unfloored gives 0/0=NaN, and
+    /// NaN≥0 is false → the row is silently dropped. Drop `.max(1.0)`
+    /// and this assertion flips to false.
+    #[test]
+    fn passes_delta_threshold_zero_a_zero_delta_at_pct_zero_renders() {
+        let opts = PhaseDisplayOptions {
+            phase_threshold: Some(0.0),
+            ..PhaseDisplayOptions::default()
+        };
+        let metric = METRICS
+            .iter()
+            .find(|m| m.name == "max_dsq_depth")
+            .expect("max_dsq_depth in METRICS");
+        let zero_a_zero_delta = PhaseDeltaRow {
+            pairing_key: PairingKey(vec!["t".into()]),
+            step_index: 0,
+            label: "BASELINE".into(),
+            metric,
+            a: 0.0,
+            b: 0.0,
+            delta: 0.0,
+            is_regression: false,
+        };
+        assert!(
+            opts.passes_delta_threshold(&zero_a_zero_delta),
+            "zero-a/zero-delta at --phase-threshold 0 must render: floored \
+             0/1=0, 0≥0 true. Dropping the .max(1.0) floor yields 0/0=NaN, \
+             NaN≥0 false, silently dropping the row",
         );
     }
 
