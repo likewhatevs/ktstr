@@ -106,7 +106,7 @@ test-group = "alu-vec512"
 threads-required = 1
 
 [[profile.ci.overrides]]
-filter = "test(acquire_llc_plan_) | test(resource_lock_exclusive_) | test(resource_lock_shared_) | test(resource_lock_contention_returns_unavailable) | test(resource_lock_all_or_nothing) | test(resource_lock_service_cpu_contention) | test(resource_lock_empty_llc_indices) | test(resource_lock_release_on_drop) | test(cpu_lock_window_) | test(cpu_lock_acquire_) | test(cpu_lock_llc_shared_protection) | test(cpu_lock_contention_slides_window) | test(cpu_lock_zero_count)"
+filter = "test(acquire_llc_plan_) | test(resource_lock_exclusive_) | test(resource_lock_shared_) | test(resource_lock_contention_returns_unavailable) | test(resource_lock_all_or_nothing) | test(resource_lock_service_cpu_contention) | test(resource_lock_empty_llc_indices) | test(resource_lock_release_on_drop)"
 test-group = "llc-lock"
 threads-required = 1
 
@@ -259,8 +259,9 @@ retries = 0
 max-threads = 1
 
 # Serialize shell_exec_* tests (CLI-spawned VMs) to avoid CPU-lock
-# contention with concurrent in-process VM tests — acquire_cpu_locks
-# fast-fails when peers hold all locks.
+# contention with concurrent in-process VM tests — the default
+# run-lock path (acquire_run_locks → acquire_resource_locks)
+# fast-fails when peers hold the per-CPU/LLC locks.
 [[profile.default.overrides]]
 filter = "test(shell_exec_)"
 test-group = "vm-cli"
@@ -316,7 +317,7 @@ threads-required = 1
 max-threads = 1
 
 [[profile.default.overrides]]
-filter = "test(acquire_llc_plan_) | test(resource_lock_exclusive_) | test(resource_lock_shared_) | test(resource_lock_contention_returns_unavailable) | test(resource_lock_all_or_nothing) | test(resource_lock_service_cpu_contention) | test(resource_lock_empty_llc_indices) | test(resource_lock_release_on_drop) | test(cpu_lock_window_) | test(cpu_lock_acquire_) | test(cpu_lock_llc_shared_protection) | test(cpu_lock_contention_slides_window) | test(cpu_lock_zero_count)"
+filter = "test(acquire_llc_plan_) | test(resource_lock_exclusive_) | test(resource_lock_shared_) | test(resource_lock_contention_returns_unavailable) | test(resource_lock_all_or_nothing) | test(resource_lock_service_cpu_contention) | test(resource_lock_empty_llc_indices) | test(resource_lock_release_on_drop)"
 test-group = "llc-lock"
 threads-required = 1
 

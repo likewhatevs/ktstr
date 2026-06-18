@@ -9,7 +9,7 @@ use crate::sync::MutexExt;
 // sockets top out around 1024 LLCs). Per-test offsets are
 // subdivided by 100:
 //   90000-90999: acquire_resource_locks / per-CPU path tests
-//   91000-91999: acquire_cpu_locks tests
+//   91000-91999: reserved (former per-CPU-window tests, removed)
 //   92000-92999: reserved
 //   93000-93999: acquire_llc_plan (none-cap, EX-peer, SH-peer)
 //                — each sub-test picks its own sub-range
@@ -129,18 +129,18 @@ impl Drop for CpuLockPrefixGuard {
     }
 }
 
-/// RAII bundle that installs BOTH [`LlcLockPrefixGuard`] AND
-/// [`CpuLockPrefixGuard`] in one call. Used by any test that hits
-/// both LLC and CPU lockfile families — `acquire_resource_locks`
-/// (LLC + per-CPU), `acquire_cpu_locks` (CPU + the LLC shared lock
-/// from `acquire_llc_shared_locks`), or any future helper that
-/// composes the two. Each test gets its own per-tempdir prefix for
-/// both lockfile families, so cross-run / cross-process
-/// collisions on `/tmp/ktstr-llc-*.lock` and `/tmp/ktstr-cpu-*.lock`
-/// cannot occur. When in doubt about which guard to pick, default
-/// to this bundle — over-provisioning a tempdir is cheap and is
-/// always safe; under-provisioning leaks production-path test
-/// collisions.
+/// RAII bundle that installs BOTH [`LlcLockPrefixGuard`]
+/// AND [`CpuLockPrefixGuard`] in one call. Used by any
+/// test that hits both LLC and CPU lockfile families —
+/// `acquire_resource_locks` (LLC + per-CPU), or any
+/// future helper that composes the two. Each test gets
+/// its own per-tempdir prefix for both lockfile families,
+/// so cross-run / cross-process collisions on
+/// `/tmp/ktstr-llc-*.lock` and `/tmp/ktstr-cpu-*.lock`
+/// cannot occur. When in doubt about which guard to pick,
+/// default to this bundle — over-provisioning a tempdir
+/// is cheap and is always safe; under-provisioning leaks
+/// production-path test collisions.
 struct LockPrefixesGuard {
     _cpu: CpuLockPrefixGuard,
     _llc: LlcLockPrefixGuard,

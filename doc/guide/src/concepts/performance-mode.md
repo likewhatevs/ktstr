@@ -307,25 +307,37 @@ branch never consults `CpuCap::resolve`.
 See [Resource Budget](resource-budget.md) for the `CpuCap`,
 `LlcPlan`, and `ktstr locks` surfaces in detail.
 
-### Tier 3: default (per-CPU window + LLC LOCK_SH)
+### Tier 3: default (LLC LOCK_SH + per-CPU LOCK_EX)
 
 Selected when neither `performance_mode=true` nor
 `--no-perf-mode`/`KTSTR_NO_PERF_MODE` is set — the default path
 for `#[ktstr_test]` entries that don't declare `performance_mode`
 (entry.rs `KtstrTestEntry::DEFAULT` sets `performance_mode:
-false`). `acquire_cpu_locks` (in `vmm/host_topology/mod.rs`) walks a
-contiguous CPU window, takes `LOCK_EX` on each window CPU's
-`/tmp/ktstr-cpu-{C}.lock`, then additionally takes `LOCK_SH` on
-the LLC lockfiles covering those CPUs so a perf-mode (tier 1)
-VM cannot grab `LOCK_EX` on an LLC that this path is using. No
-pinning, no isolation, no cgroup sandbox — the per-CPU reservation
-is purely for host-scheduling-noise avoidance between concurrent
-VMs.
+false`). `KtstrVm::acquire_run_locks` (its default-else arm, in
+`vmm/mod.rs`) picks a starting LLC slot via `pid_window_offset`,
+walks the LLC offsets computing a `compute_pinning` candidate per
+offset, and acquires that plan through `acquire_resource_locks` in
+`LlcLockMode::Shared` (`vmm/host_topology/mod.rs`): it takes
+`LOCK_SH` on the plan's LLC lockfiles (`/tmp/ktstr-llc-{N}.lock`),
+then `LOCK_EX` on each assigned host CPU's lockfile
+(`/tmp/ktstr-cpu-{C}.lock`) over the plan's vCPU→CPU assignments.
+(Tier 3 reserves no service CPU: its `compute_pinning` call passes
+`reserve_service_cpu=false`, so the plan's `service_cpu` is
+`None`.) The LLC `LOCK_SH` prevents a perf-mode (tier 1) VM from
+grabbing `LOCK_EX` on an LLC this path is using.
+No pinning, no isolation, no cgroup sandbox — the per-CPU
+reservation is purely for host-scheduling-noise avoidance between
+concurrent VMs.
 
 This is the ONLY tier that actually flocks per-CPU lockfiles.
-Tier 1 skips them (LLC EX already covers all CPUs in the group);
-tier 2 skips them (capped LLC SH is enforced via the cgroup
-cpuset and the flock is sufficient per-LLC coordination).
+`try_acquire_all` takes per-CPU `LOCK_EX` only when the LLC mode
+is non-exclusive AND the plan carries real vCPU→CPU assignments.
+Tier 1 skips them: its `Exclusive` LLC lock already covers every
+CPU in the group, so the per-CPU loop is bypassed. Tier 2 is
+`Shared` (non-exclusive) but passes an empty-`assignments` stub
+plan, so its per-CPU loop iterates zero times — its capped LLC
+`SH` is enforced via the cgroup cpuset, and the per-LLC flock is
+sufficient coordination.
 
 ## Disabling performance mode
 

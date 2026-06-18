@@ -768,8 +768,10 @@ fn try_acquire_all(
 }
 
 /// Diffuse a pid across `[0, max_start)` so adjacent pids do not
-/// land on adjacent offsets. Used by [`acquire_cpu_locks`] to
-/// pick a starting window.
+/// land on adjacent offsets. Used by the default-else run-lock path
+/// (`KtstrVm::acquire_run_locks`) to pick a starting LLC slot so two
+/// ktstr invocations launching simultaneously don't both probe slot 0
+/// first.
 ///
 /// Bare `pid % max_start` collapses adjacent pids onto adjacent
 /// offsets (Linux's pid allocator walks `pid_max` sequentially),
@@ -777,120 +779,25 @@ fn try_acquire_all(
 /// case: nextest forks N test processes back-to-back, every pid
 /// lands within a small contiguous range, every `pid % max_start`
 /// lands within an equally small contiguous slice of the offset
-/// space, and they all probe overlapping windows on the first
+/// space, and they all probe overlapping slots on the first
 /// pass. AHasher avalanche on the pid bytes diffuses adjacent
 /// pids across the whole `[0, max_start)` range, so the
-/// walk-around-once loop in [`acquire_cpu_locks`] has a fair
-/// chance of finding a free window without burning the entire
-/// lockfile pool.
+/// slot-rotation loop has a fair chance of finding a free slot
+/// without burning the entire lockfile pool.
 ///
 /// The hash key is `AHasher::default()` — a per-run random
 /// seed would defeat reproducibility for unit-test fixtures and
 /// for any future debug logging that wants to confirm "pid X
-/// picks offset Y for window N".
+/// picks offset Y for slot N".
 ///
 /// Caller invariant: `max_start >= 1`. Panics on `max_start == 0`
-/// (modulo-by-zero); callers must enforce this upstream — the
-/// `count > total_host_cpus` early-bail in [`acquire_cpu_locks`]
-/// is the production guarantee.
+/// (modulo-by-zero); callers must enforce this upstream (the
+/// run-lock path floors `max_slots` at 1).
 pub(crate) fn pid_window_offset(pid: u32, max_start: usize) -> usize {
     use std::hash::{BuildHasher, Hasher};
     let mut hasher = ahash::RandomState::with_seeds(0, 0, 0, 0).build_hasher();
     hasher.write(&pid.to_le_bytes());
     (hasher.finish() as usize) % max_start
-}
-
-/// Acquire exclusive CPU locks for a non-perf VM (non-blocking).
-///
-/// Tries to flock `count` consecutive CPU files starting from a
-/// pid-derived offset, stepping by 1 if any CPU in the window is busy
-/// and wrapping around once the high end of the search range is
-/// exhausted so the lower windows (those below `start_offset`) are
-/// also probed before giving up. Returns the held fds on success,
-/// `TopologyInsufficient` when the requested count exceeds the host CPU
-/// total (a permanent shortfall), or `ResourceContention` when the host
-/// is big enough but every window is currently busy (transient).
-///
-/// When `host_topo` is provided, also acquires `LOCK_SH` on the LLC lock
-/// files containing the acquired CPUs. This prevents a perf VM from
-/// grabbing exclusive LLC access while non-perf VMs hold CPUs in that LLC.
-///
-/// `total_host_cpus` bounds the search space. Single non-blocking pass;
-/// callers rely on nextest retry backoff for contention resolution.
-#[derive(Debug)]
-#[allow(dead_code)]
-pub struct CpuLockResult {
-    pub locks: Vec<std::os::fd::OwnedFd>,
-    pub cpus: Vec<usize>,
-}
-
-#[allow(dead_code)]
-pub fn acquire_cpu_locks(
-    count: usize,
-    total_host_cpus: usize,
-    host_topo: Option<&HostTopology>,
-) -> Result<CpuLockResult> {
-    if count == 0 {
-        return Ok(CpuLockResult {
-            locks: Vec::new(),
-            cpus: Vec::new(),
-        });
-    }
-
-    // No window can fit if the request exceeds the host. Bail before
-    // entering the search loop so the modular arithmetic below has a
-    // non-zero domain.
-    if count > total_host_cpus {
-        // The host physically has fewer CPUs than the reservation needs:
-        // a permanent shortfall (provision a bigger host or drop perf
-        // mode), not transient slot contention a retry could clear.
-        return Err(anyhow::Error::new(TopologyInsufficient {
-            reason: format!(
-                "no {count} consecutive CPUs available on a {total_host_cpus}-CPU host\n  \
-                 hint: pass --no-perf-mode or set KTSTR_NO_PERF_MODE=1 to run without CPU reservation"
-            ),
-        }));
-    }
-
-    // Spread peers across the lockfile pool: start at a pid-derived
-    // offset so two ktstr invocations launching simultaneously don't
-    // both probe CPU 0 first. `max_start` is the count of valid
-    // window-start positions in `[0, total_host_cpus - count]`
-    // (inclusive), giving `total_host_cpus - count + 1` candidates.
-    // The `count > total_host_cpus` early-bail above guarantees
-    // `max_start >= 1`, so the modulo never divides by zero.
-    let max_start = total_host_cpus - count + 1;
-    let start_offset = pid_window_offset(std::process::id(), max_start);
-    // Walk every candidate window exactly once, wrapping around so a
-    // peer holding the high end never starves the low end. Visit
-    // order is `start_offset, start_offset+1, ..., max_start-1,
-    // 0, 1, ..., start_offset-1`.
-    for step in 0..max_start {
-        let offset = (start_offset + step) % max_start;
-        match try_acquire_cpu_window(offset, count) {
-            Ok(mut locks) => {
-                let cpus: Vec<usize> = (offset..offset + count).collect();
-                if let Some(topo) = host_topo {
-                    match acquire_llc_shared_locks(topo, &cpus) {
-                        Ok(llc_locks) => locks.extend(llc_locks),
-                        Err(_) => {
-                            drop(locks);
-                            continue;
-                        }
-                    }
-                }
-                return Ok(CpuLockResult { locks, cpus });
-            }
-            Err(_) => continue,
-        }
-    }
-
-    Err(anyhow::Error::new(ResourceContention {
-        reason: format!(
-            "no {count} consecutive CPUs available\n  \
-             hint: pass --no-perf-mode or set KTSTR_NO_PERF_MODE=1 to run without CPU reservation"
-        ),
-    }))
 }
 
 // ===========================================================================
@@ -1834,51 +1741,6 @@ pub(crate) fn overcommit_warning(
         ));
     }
     Some(msg)
-}
-
-/// Acquire `LOCK_SH` on LLC lock files for the LLCs containing `cpus`.
-#[allow(dead_code)]
-fn acquire_llc_shared_locks(
-    topo: &HostTopology,
-    cpus: &[usize],
-) -> std::result::Result<Vec<std::os::fd::OwnedFd>, String> {
-    let mut llc_indices: Vec<usize> = Vec::new();
-    for &cpu in cpus {
-        for (idx, group) in topo.llc_groups.iter().enumerate() {
-            if group.cpus.contains(&cpu) && !llc_indices.contains(&idx) {
-                llc_indices.push(idx);
-            }
-        }
-    }
-    let mut locks = Vec::new();
-    for &llc_idx in &llc_indices {
-        let path = llc_lock_path(llc_idx);
-        match try_flock(&path, FlockMode::Shared) {
-            Ok(Some(fd)) => locks.push(fd),
-            Ok(None) => return Err(format!("LLC {llc_idx} exclusively held")),
-            Err(e) => return Err(format!("LLC {llc_idx}: {e}")),
-        }
-    }
-    Ok(locks)
-}
-
-/// Try to flock CPUs [offset..offset+count) exclusively.
-/// Returns all fds on success, or an error string on any busy CPU.
-#[allow(dead_code)]
-fn try_acquire_cpu_window(
-    offset: usize,
-    count: usize,
-) -> std::result::Result<Vec<std::os::fd::OwnedFd>, String> {
-    let mut locks = Vec::with_capacity(count);
-    for cpu in offset..offset + count {
-        let path = cpu_lock_path(cpu);
-        match try_flock(&path, FlockMode::Exclusive) {
-            Ok(Some(fd)) => locks.push(fd),
-            Ok(None) => return Err(format!("CPU {cpu} busy")),
-            Err(e) => return Err(format!("CPU {cpu}: {e}")),
-        }
-    }
-    Ok(locks)
 }
 
 /// Bind a memory region to specific NUMA nodes using `mbind(MPOL_BIND)`.
