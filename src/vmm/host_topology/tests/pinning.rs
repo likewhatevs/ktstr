@@ -615,11 +615,10 @@ fn numa_aware_llc_order_zero_numa_nodes_is_safe() {
     // Falls back to sequential mapping instead.
     let topo = synthetic_topo_numa(vec![(0, vec![0, 1]), (0, vec![2, 3])]);
     let order = topo.numa_aware_llc_order(0, 2, 0);
-    assert_eq!(
-        order.len(),
-        2,
-        "zero-numa fallback must still produce an order"
-    );
+    // Pin the fallback CONTENT, not just length: a len-only check passes
+    // for [0,0] (two guest LLCs double-pinned to host LLC 0), a real
+    // misconfiguration. Sequential fallback over 2 host LLCs is [0,1].
+    assert_eq!(order, vec![0, 1], "zero-numa fallback must map sequentially");
 }
 
 #[test]
@@ -634,11 +633,13 @@ fn numa_aware_llc_order_fewer_llcs_than_nodes_falls_back() {
         (1, vec![6, 7]),
     ]);
     let order = topo.numa_aware_llc_order(4, 2, 0);
-    assert_eq!(
-        order.len(),
-        2,
-        "fewer-llcs-than-nodes fallback must still produce 2 entries"
-    );
+    // Sequential fallback over 4 host LLCs is [0,1]. Pin content +
+    // distinctness: [0,0] (len 2) would double-pin two guest LLCs to
+    // host LLC 0 and never use LLC 1 — a real misconfiguration a
+    // len-only check admits.
+    assert_eq!(order, vec![0, 1], "fewer-llcs fallback must map to distinct LLCs");
+    let unique: std::collections::HashSet<usize> = order.iter().copied().collect();
+    assert_eq!(unique.len(), order.len(), "no two guest LLCs may pin to the same host LLC");
 }
 
 #[test]

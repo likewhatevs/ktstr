@@ -545,6 +545,21 @@ fn cpu_lock_acquire_slides_past_held() {
     };
     assert_eq!(result.locks.len(), 2);
     assert_eq!(result.cpus.len(), 2);
+    // The whole point: the acquired window slid PAST the held CPU 0. A
+    // len-only check passes even if production reported a window that
+    // still contained 0 (e.g. an off-by-one slide, or reporting the
+    // probe offset instead of the acquired offset). Pin exclusion +
+    // distinctness.
+    assert!(
+        !result.cpus.contains(&0),
+        "acquired window must exclude the held CPU 0, got {:?}",
+        result.cpus,
+    );
+    assert_ne!(
+        result.cpus[0], result.cpus[1],
+        "the two acquired CPUs must be distinct, got {:?}",
+        result.cpus,
+    );
 
     drop(result);
     drop(holder);
