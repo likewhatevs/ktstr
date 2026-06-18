@@ -79,10 +79,18 @@ fn render_sparkline_monotonic_scales_to_full_range() {
 #[test]
 fn render_sparkline_i64_clamps_negatives() {
     let s = render_sparkline_i64(&[-5, 0, 5, 10]);
-    // After clamp: [0, 0, 5, 10] → first two at lowest, last
-    // two scale up. Just pin length and bounds; exact glyphs
-    // depend on integer rounding.
-    assert_eq!(s.chars().count(), 4);
+    // After clamp: [0, 0, 5, 10] → -5 clamps to 0 (lowest glyph), 10
+    // is max (highest glyph). Pin the GLYPH CONTENT, not just length:
+    // dropping the `.max(0)` clamp renders `-5 as u64` = ~u64::MAX, so
+    // the first glyph becomes the highest block and 5/10 collapse to
+    // the lowest — still 4 chars, so a length-only check misses it.
+    let chars: Vec<char> = s.chars().collect();
+    assert_eq!(chars.len(), 4);
+    assert_eq!(
+        chars[0], '▁',
+        "clamped -5 must render the lowest glyph, not the highest (clamp dropped?)",
+    );
+    assert_eq!(chars[3], '█', "the max value (10) must render the highest glyph");
 }
 
 /// Full SCX_EV_* counter timeline construction: build a
@@ -2580,10 +2588,14 @@ fn pinned_error_struct_ops_region_unmapped() {
 
 #[test]
 fn pinned_error_cgroup_storage_deprecated() {
-    let rendered: String =
-        "deprecated cgroup-attached storage; use CGRP_STORAGE on newer kernels".into();
+    // Assert against the PRODUCTION table, not a literal-vs-itself: a
+    // reword of the render_map.rs entry must trip this.
+    let (_, msg) = MAP_TYPE_EXPLANATIONS
+        .iter()
+        .find(|(t, _)| *t == BPF_MAP_TYPE_CGROUP_STORAGE)
+        .expect("CGROUP_STORAGE entry present");
     assert_eq!(
-        rendered,
+        *msg,
         "deprecated cgroup-attached storage; use CGRP_STORAGE on newer kernels",
     );
 }
@@ -2592,16 +2604,25 @@ fn pinned_error_cgroup_storage_deprecated() {
 fn pinned_error_queue_stack_destructive() {
     let expected = "QUEUE/STACK are destructive (peek shows only the head; pop consumes); \
          no enumeration API";
-    let rendered: String = expected.into();
-    assert_eq!(rendered, expected);
+    // Both QUEUE and STACK map to this entry; assert the production
+    // table carries it byte-exact under both discriminants.
+    for ty in [BPF_MAP_TYPE_QUEUE, BPF_MAP_TYPE_STACK] {
+        let (_, msg) = MAP_TYPE_EXPLANATIONS
+            .iter()
+            .find(|(t, _)| *t == ty)
+            .expect("QUEUE/STACK entry present");
+        assert_eq!(*msg, expected);
+    }
 }
 
 #[test]
 fn pinned_error_bloom_filter() {
-    let rendered: String =
-        "BLOOM_FILTER is a probabilistic set; no key enumeration is possible".into();
+    let (_, msg) = MAP_TYPE_EXPLANATIONS
+        .iter()
+        .find(|(t, _)| *t == BPF_MAP_TYPE_BLOOM_FILTER)
+        .expect("BLOOM_FILTER entry present");
     assert_eq!(
-        rendered,
+        *msg,
         "BLOOM_FILTER is a probabilistic set; no key enumeration is possible",
     );
 }
@@ -2610,8 +2631,11 @@ fn pinned_error_bloom_filter() {
 fn pinned_error_lpm_trie() {
     let expected = "LPM_TRIE walker not implemented (keyed by prefixlen + data); \
          use bpf(2) BPF_MAP_GET_NEXT_KEY for live-host iteration";
-    let rendered: String = expected.into();
-    assert_eq!(rendered, expected);
+    let (_, msg) = MAP_TYPE_EXPLANATIONS
+        .iter()
+        .find(|(t, _)| *t == BPF_MAP_TYPE_LPM_TRIE)
+        .expect("LPM_TRIE entry present");
+    assert_eq!(*msg, expected);
 }
 
 #[test]
