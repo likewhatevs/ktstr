@@ -227,6 +227,25 @@ fn snapshot_var_walks_into_bss_struct() {
     assert!((snap.var("balance_factor").as_f64().unwrap() - 1.5).abs() < f64::EPSILON);
 }
 
+/// `SnapshotField::as_bool` returns `*value != 0`; the false side of
+/// that contract is otherwise unguarded. `stall = 1` above only catches
+/// an inverted `== 0` predicate, NOT an always-true bug (e.g. returning
+/// `Ok(true)` unconditionally), which would misreport a zero-valued flag
+/// — the worst false positive for a stall flag. Pin the zero → false
+/// case directly.
+#[test]
+fn snapshot_var_as_bool_false_for_zero_scalar() {
+    let report = make_report_with_maps(vec![make_global_map(
+        "scx_test.bss",
+        vec![("balanced", uint_v(0))],
+    )]);
+    let snap = Snapshot::new(&report);
+    assert!(
+        !snap.var("balanced").as_bool().unwrap(),
+        "a zero-valued scalar must read false, not be reported true",
+    );
+}
+
 #[test]
 fn snapshot_var_dotted_path_walks_nested_struct() {
     let r = synthetic_report();
@@ -1566,14 +1585,29 @@ fn snapshot_bridge_dispatch_kernel_op_invokes_callback_and_logs_reply() {
         .dispatch_kernel_op(&request)
         .expect("callback installed");
     assert!(reply.success);
+    assert!(reply.reason.is_empty());
     assert_eq!(reply.request_id, 99);
+    // Pin the read VALUE, not just the count: the whole point of
+    // dispatch_kernel_op is to return the host-read result verbatim, so
+    // a passthrough/clone bug that zeroed or variant-swapped the element
+    // (while keeping len==1) must fail.
     assert_eq!(reply.read_values.len(), 1);
+    assert_eq!(
+        reply.read_values[0],
+        crate::vmm::wire::KernelOpValue::U64(0xDEAD),
+    );
     assert_eq!(invocation_count.load(Ordering::Relaxed), 1);
-    // Drain log captures the (tag, reply) pair.
+    // Drain log captures the (tag, reply) pair — including the read
+    // values, which must equal the returned reply (the logged copy is
+    // load-bearing for failure dumps).
     let log = bridge.drain_kernel_ops();
     assert_eq!(log.len(), 1);
     assert_eq!(log[0].0, "rq_clock");
     assert_eq!(log[0].1.request_id, 99);
+    assert_eq!(
+        log[0].1.read_values,
+        vec![crate::vmm::wire::KernelOpValue::U64(0xDEAD)],
+    );
     // Second drain after the first returns empty — drain is
     // destructive.
     assert!(bridge.drain_kernel_ops().is_empty());
