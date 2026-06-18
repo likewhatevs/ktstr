@@ -961,6 +961,32 @@ impl KtstrVmBuilder {
                         Some(host_topology::CpuCap::new(budget)?)
                     }
                 };
+                // Oversubscription warning: when the resolved host-CPU
+                // budget is below the guest vCPU count the host time-slices
+                // the vCPU threads, confounding guest-scheduler measurement
+                // (see host_topology::overcommit_warning). Computed HERE —
+                // after effective_cap resolves — so the explicit
+                // --cpu-cap arm (which short-circuits the match above and
+                // never reaches the vcpus comparison) is covered too, not
+                // just the auto-size arm. `explicit` keys severity:
+                // cpu_budget / --cpu-cap is an opt-in; an auto-collapse to a
+                // too-small process cpuset is the silent case.
+                if let Some(cap) = effective_cap {
+                    let allowed = host_topology::host_allowed_cpus().len();
+                    let vcpus = (self.topology.llcs
+                        * self.topology.cores_per_llc
+                        * self.topology.threads_per_core) as usize;
+                    let eff = cap.effective_count(allowed).unwrap_or(allowed);
+                    let explicit = cpu_cap.is_some() || self.cpu_budget.is_some();
+                    if let Some(msg) = host_topology::overcommit_warning(
+                        eff,
+                        vcpus,
+                        explicit,
+                        self.watchdog_timeout.map(|d| d.as_secs()),
+                    ) {
+                        eprintln!("{msg}");
+                    }
+                }
                 // Compute the plan and immediately drop the flocks:
                 // we want the plan SHAPE on KtstrVm but not the
                 // RAII fds. `run()` re-takes fresh `LOCK_SH` on

@@ -1726,6 +1726,65 @@ fn should_warn_cross_node(mems: &std::collections::BTreeSet<usize>) -> bool {
     mems.len() > 1
 }
 
+/// Warning text when the effective host-CPU budget is below the guest's
+/// vCPU count, else `None`. Under `effective_host_cpus < vcpus` the host
+/// time-slices the vCPU threads, so absolute work scales ~`1/oversub` and
+/// guest-scheduler timing metrics (run_delay, off-CPU, wake latency, gaps)
+/// become host-contention artifacts — the silent-wrong-answer class the
+/// no-perf budget sizing guards against (see [`no_perf_cpu_budget`]).
+///
+/// `explicit` splits severity: a per-test `cpu_budget` / `--cpu-cap` below
+/// the vCPU count is a deliberate opt-in (the test asked to oversubscribe —
+/// an INFO note), whereas an auto-collapse (the calling process's cpuset is
+/// smaller than the vCPU count, so [`no_perf_cpu_budget`]'s
+/// `vcpus.min(allowed)` floored the budget to the allowed set) is the
+/// truly-silent case nothing opted into — a louder WARNING. `watchdog_secs`
+/// folds in the tight-watchdog false-eject caveat when small.
+///
+/// Pure (returns the text) so a test pins the message + the
+/// `None`-when-not-oversubscribed polarity without capturing stderr; the
+/// caller eprintln's it once at build time, mirroring
+/// [`warn_if_cross_node_spill`].
+pub(crate) fn overcommit_warning(
+    effective_host_cpus: usize,
+    vcpus: usize,
+    explicit: bool,
+    watchdog_secs: Option<u64>,
+) -> Option<String> {
+    if effective_host_cpus >= vcpus {
+        return None;
+    }
+    let oversub = vcpus as f64 / effective_host_cpus.max(1) as f64;
+    let mut msg = if explicit {
+        format!(
+            "ktstr: cpu_budget {effective_host_cpus} host CPUs < {vcpus} vCPUs \
+             ({oversub:.1}x oversubscription, opt-in): the host time-slices the \
+             vCPU threads, so absolute iterations scale ~1/{oversub:.0} and \
+             guest-scheduler timing metrics (run_delay, off-CPU, wake latency, \
+             gaps) are host-contention artifacts. Use iterations_per_cpu_sec \
+             for an overcommit-invariant per-cgroup rate."
+        )
+    } else {
+        format!(
+            "ktstr: WARNING: only {effective_host_cpus} host CPUs available for \
+             {vcpus} vCPUs ({oversub:.1}x oversubscription) — the process cpuset \
+             is smaller than the guest, so the auto-sized CPU budget collapsed \
+             to it. NOTHING opted into this. The host time-slices the vCPU \
+             threads, confounding guest-scheduler measurement (absolute work \
+             scales ~1/{oversub:.0}; timing metrics are host artifacts). Widen \
+             the process cpuset, or shrink the guest topology."
+        )
+    };
+    if watchdog_secs.is_some_and(|w| w <= 5) {
+        let w = watchdog_secs.unwrap();
+        msg.push_str(&format!(
+            " Also: watchdog_timeout_s={w} is tight under oversubscription — a \
+             host-descheduled vCPU can trip the scheduler watchdog (false stall)."
+        ));
+    }
+    Some(msg)
+}
+
 /// Acquire `LOCK_SH` on LLC lock files for the LLCs containing `cpus`.
 #[allow(dead_code)]
 fn acquire_llc_shared_locks(
