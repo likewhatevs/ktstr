@@ -2775,6 +2775,7 @@ fn snapshot_map_fd_array_threads_option() {
             indices: vec![0, 2, 4],
             truncated: false,
             indices_truncated: false,
+            unreadable: 0,
         }),
         None,
         None,
@@ -2813,6 +2814,7 @@ fn snapshot_map_stack_trace_threads_option() {
             n_buckets: 32,
             entries: Vec::new(),
             truncated: false,
+            buckets_unreadable: 0,
         }),
         None,
     );
@@ -2974,6 +2976,7 @@ fn snapshot_accessor_targets_round_trip_through_serde_json() {
                 n_buckets: 16,
                 entries: Vec::new(),
                 truncated: true,
+                buckets_unreadable: 0,
             }),
             fd_array: Some(FailureDumpFdArray {
                 populated: 2,
@@ -2981,6 +2984,7 @@ fn snapshot_accessor_targets_round_trip_through_serde_json() {
                 indices: vec![1, 3],
                 truncated: false,
                 indices_truncated: false,
+                unreadable: 0,
             }),
             error: Some("decode failed".to_string()),
         }],

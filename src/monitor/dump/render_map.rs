@@ -2404,6 +2404,7 @@ pub(super) fn render_stack_traces(
 
     let mut entries = Vec::new();
     let mut any_truncated = false;
+    let mut buckets_unreadable = 0u32;
 
     for bucket_id in 0..scan_buckets {
         // buckets[id] is a u64 pointer at smap_buckets + id*8.
@@ -2421,7 +2422,9 @@ pub(super) fn render_stack_traces(
         ) else {
             // Bucket array spans across pages on large maps; an
             // unmapped page in the array itself is exotic but
-            // possible. Skip rather than abort.
+            // possible. Skip rather than abort, but count it so the
+            // gap surfaces instead of reading as a smaller map.
+            buckets_unreadable += 1;
             continue;
         };
         let bucket_kva = mem.read_u64(slot_pa, 0);
@@ -2438,6 +2441,10 @@ pub(super) fn render_stack_traces(
             walk.l5,
             walk.tcr_el1,
         ) else {
+            // Non-null bucket pointer but its struct page is
+            // unmapped: the bucket exists yet its contents are
+            // unreadable. Count rather than silently drop.
+            buckets_unreadable += 1;
             continue;
         };
         let nr = mem.read_u32(bucket_pa, sm_offs.smb_nr);
@@ -2524,6 +2531,7 @@ pub(super) fn render_stack_traces(
         n_buckets,
         entries,
         truncated: any_truncated || n_buckets > MAX_STACK_TRACE_BUCKETS,
+        buckets_unreadable,
     })
 }
 
@@ -2583,9 +2591,11 @@ pub(super) fn render_fd_array_slots(
             indices: Vec::new(),
             truncated: false,
             indices_truncated: false,
+            unreadable: 0,
         };
     }
 
+    let mut unreadable: u32 = 0;
     for idx in 0..scan {
         let slot_kva = info
             .map_kva
@@ -2599,6 +2609,10 @@ pub(super) fn render_fd_array_slots(
             walk.l5,
             walk.tcr_el1,
         ) else {
+            // Unmapped slot page: cannot read this pointer. Count it
+            // rather than silently treating the slot as empty, so
+            // `populated` is a visible lower bound.
+            unreadable += 1;
             continue;
         };
         let ptr = mem.read_u64(slot_pa, 0);
@@ -2616,5 +2630,6 @@ pub(super) fn render_fd_array_slots(
         indices_truncated: indices.len() < populated as usize,
         indices,
         truncated,
+        unreadable,
     }
 }

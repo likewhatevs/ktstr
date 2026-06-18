@@ -203,6 +203,7 @@ fn report_serde_roundtrip() {
         scx_walker_unavailable: None,
         vcpu_perf_at_freeze: Vec::new(),
         dump_truncated_at_us: None,
+        maps_truncated: 0,
         probe_counters: None,
         scx_static_ranges: Default::default(),
         is_placeholder: false,
@@ -360,6 +361,7 @@ fn failure_dump_report_serialization_is_infallible_for_max_synthetic_input() {
         scx_walker_unavailable: Some(super::REASON_NO_SCX_WALKER.into()),
         vcpu_perf_at_freeze: vec![None, None, None],
         dump_truncated_at_us: Some(12_345),
+        maps_truncated: 0,
         probe_counters: Some(ProbeBssCounters::default()),
         scx_static_ranges: Default::default(),
         is_placeholder: false,
@@ -467,6 +469,7 @@ fn dual_failure_dump_report_serialization_is_infallible_for_max_synthetic_input(
             scx_walker_unavailable: Some(super::REASON_NO_SCX_WALKER.into()),
             vcpu_perf_at_freeze: vec![None, None],
             dump_truncated_at_us: Some(7_777),
+            maps_truncated: 0,
             probe_counters: Some(ProbeBssCounters::default()),
             scx_static_ranges: Default::default(),
             is_placeholder: false,
@@ -616,6 +619,41 @@ fn report_display_empty() {
 }
 
 #[test]
+fn report_display_truncation_only_does_not_say_empty_dump() {
+    // A dump that dropped maps to deadline truncation but has no
+    // other captured sections must surface the truncation footer
+    // rather than fall through to "(empty failure dump)" — otherwise
+    // a degraded dump reads as "nothing to show" instead of
+    // "everything was skipped".
+    let report = FailureDumpReport {
+        dump_truncated_at_us: Some(31_000),
+        maps_truncated: 4,
+        ..Default::default()
+    };
+    let out = format!("{report}");
+    assert_eq!(
+        out,
+        "dump truncated: deadline crossed at 31000us (4 map(s) skipped)"
+    );
+}
+
+#[test]
+fn report_display_appends_truncation_footer_after_sections() {
+    // When sections render AND truncation occurred, the footer is a
+    // separate trailing block.
+    let report = FailureDumpReport {
+        vcpu_regs: vec![None],
+        maps_truncated: 2,
+        ..Default::default()
+    };
+    let out = format!("{report}");
+    assert_eq!(
+        out,
+        "vcpu_regs:\n  vcpu 0: <unavailable>\n\ndump truncated: (2 map(s) skipped)"
+    );
+}
+
+#[test]
 fn report_display_one_map_with_value() {
     let report = FailureDumpReport {
         schema: SCHEMA_SINGLE.to_string(),
@@ -638,6 +676,7 @@ fn report_display_one_map_with_value() {
         scx_walker_unavailable: None,
         vcpu_perf_at_freeze: Vec::new(),
         dump_truncated_at_us: None,
+        maps_truncated: 0,
         probe_counters: None,
         scx_static_ranges: Default::default(),
         is_placeholder: false,
@@ -679,6 +718,7 @@ fn report_display_multiple_maps_separated() {
         scx_walker_unavailable: None,
         vcpu_perf_at_freeze: Vec::new(),
         dump_truncated_at_us: None,
+        maps_truncated: 0,
         probe_counters: None,
         scx_static_ranges: Default::default(),
         is_placeholder: false,
@@ -702,6 +742,52 @@ fn map_display_includes_error_marker() {
     assert!(
         out.contains("[error: ARRAY value region unreadable]"),
         "missing error marker: {out}"
+    );
+}
+
+#[test]
+fn map_display_stack_trace_surfaces_unreadable_buckets() {
+    let mut m = make_simple_map();
+    m.value = None;
+    m.stack_trace = Some(FailureDumpStackTrace {
+        n_buckets: 8,
+        entries: Vec::new(),
+        truncated: false,
+        buckets_unreadable: 3,
+    });
+    let out = format!("{m}");
+    assert!(
+        out.contains("0 of 8 buckets populated"),
+        "missing bucket summary: {out}"
+    );
+    assert!(
+        out.contains("(3 unreadable)"),
+        "unreadable-bucket count must surface so the gap reads as \
+         'unreadable' not 'fewer stacks': {out}"
+    );
+}
+
+#[test]
+fn map_display_fd_array_surfaces_unreadable_slots() {
+    let mut m = make_simple_map();
+    m.value = None;
+    m.fd_array = Some(FailureDumpFdArray {
+        populated: 1,
+        scanned: 6,
+        indices: vec![0],
+        truncated: false,
+        indices_truncated: false,
+        unreadable: 2,
+    });
+    let out = format!("{m}");
+    assert!(
+        out.contains("1 of 6 slots populated"),
+        "missing slot summary: {out}"
+    );
+    assert!(
+        out.contains("(2 unreadable)"),
+        "unreadable-slot count must surface so populated reads as a \
+         lower bound, not a confirmed total: {out}"
     );
 }
 
@@ -889,6 +975,7 @@ fn report_display_includes_vcpu_regs_section() {
         scx_walker_unavailable: None,
         vcpu_perf_at_freeze: Vec::new(),
         dump_truncated_at_us: None,
+        maps_truncated: 0,
         probe_counters: None,
         scx_static_ranges: Default::default(),
         is_placeholder: false,
@@ -935,6 +1022,7 @@ fn report_display_pairs_maps_and_vcpu_regs_with_blank_line() {
         scx_walker_unavailable: None,
         vcpu_perf_at_freeze: Vec::new(),
         dump_truncated_at_us: None,
+        maps_truncated: 0,
         probe_counters: None,
         scx_static_ranges: Default::default(),
         is_placeholder: false,
@@ -970,6 +1058,7 @@ fn report_display_empty_with_only_vcpu_regs_does_not_say_empty_dump() {
         scx_walker_unavailable: None,
         vcpu_perf_at_freeze: Vec::new(),
         dump_truncated_at_us: None,
+        maps_truncated: 0,
         probe_counters: None,
         scx_static_ranges: Default::default(),
         is_placeholder: false,
@@ -1020,6 +1109,7 @@ fn report_display_partial_with_populated_regs_and_empty_maps() {
         scx_walker_unavailable: None,
         vcpu_perf_at_freeze: Vec::new(),
         dump_truncated_at_us: None,
+        maps_truncated: 0,
         probe_counters: None,
         scx_static_ranges: Default::default(),
         is_placeholder: false,
@@ -1086,6 +1176,7 @@ fn dual_report_serde_roundtrip_with_early() {
         scx_walker_unavailable: None,
         vcpu_perf_at_freeze: Vec::new(),
         dump_truncated_at_us: None,
+        maps_truncated: 0,
         probe_counters: None,
         scx_static_ranges: Default::default(),
         is_placeholder: false,
@@ -1112,6 +1203,7 @@ fn dual_report_serde_roundtrip_with_early() {
         scx_walker_unavailable: None,
         vcpu_perf_at_freeze: Vec::new(),
         dump_truncated_at_us: None,
+        maps_truncated: 0,
         probe_counters: None,
         scx_static_ranges: Default::default(),
         is_placeholder: false,
@@ -1637,6 +1729,7 @@ fn prog_runtime_stats_serde_roundtrip_with_saturation() {
         scx_walker_unavailable: None,
         vcpu_perf_at_freeze: Vec::new(),
         dump_truncated_at_us: None,
+        maps_truncated: 0,
         probe_counters: None,
         scx_static_ranges: Default::default(),
         is_placeholder: false,
@@ -1711,6 +1804,7 @@ fn report_display_renders_prog_runtime_stats() {
         scx_walker_unavailable: None,
         vcpu_perf_at_freeze: Vec::new(),
         dump_truncated_at_us: None,
+        maps_truncated: 0,
         probe_counters: None,
         scx_static_ranges: Default::default(),
         is_placeholder: false,
@@ -1764,6 +1858,7 @@ fn report_display_only_prog_runtime_stats_does_not_say_empty_dump() {
         scx_walker_unavailable: None,
         vcpu_perf_at_freeze: Vec::new(),
         dump_truncated_at_us: None,
+        maps_truncated: 0,
         probe_counters: None,
         scx_static_ranges: Default::default(),
         is_placeholder: false,
@@ -4454,6 +4549,7 @@ fn failure_dump_stack_trace_empty_roundtrip() {
         n_buckets: 0,
         entries: Vec::new(),
         truncated: false,
+        buckets_unreadable: 0,
     };
     let json = serde_json::to_string(&original).expect("stack_trace serialize");
     // truncated=false should NOT appear in the wire format.
@@ -4461,11 +4557,17 @@ fn failure_dump_stack_trace_empty_roundtrip() {
         !json.contains("\"truncated\":true") && !json.contains("\"truncated\":false"),
         "skip_serializing_if must elide truncated when false; JSON: {json}",
     );
+    // buckets_unreadable=0 elides (is_zero_u32).
+    assert!(
+        !json.contains("buckets_unreadable"),
+        "buckets_unreadable=0 must be elided; JSON: {json}",
+    );
     let restored: FailureDumpStackTrace =
         serde_json::from_str(&json).expect("stack_trace deserialize");
     assert_eq!(restored.n_buckets, 0);
     assert!(restored.entries.is_empty());
     assert!(!restored.truncated);
+    assert_eq!(restored.buckets_unreadable, 0);
 }
 
 /// FailureDumpStackTrace populated entries with truncated=true
@@ -4493,11 +4595,16 @@ fn failure_dump_stack_trace_populated_roundtrip() {
             },
         ],
         truncated: true,
+        buckets_unreadable: 2,
     };
     let json = serde_json::to_string(&original).expect("stack_trace serialize");
     assert!(
         json.contains("\"truncated\":true"),
         "truncated=true must appear in JSON: {json}",
+    );
+    assert!(
+        json.contains("\"buckets_unreadable\":2"),
+        "non-zero buckets_unreadable must appear in JSON: {json}",
     );
     let restored: FailureDumpStackTrace =
         serde_json::from_str(&json).expect("stack_trace deserialize");
@@ -4510,6 +4617,7 @@ fn failure_dump_stack_trace_populated_roundtrip() {
     assert_eq!(restored.entries[0].data_hex, "00 10 20");
     assert_eq!(restored.entries[1].bucket_id, 2);
     assert!(restored.truncated);
+    assert_eq!(restored.buckets_unreadable, 2);
 }
 
 /// FailureDumpStackTraceEntry build-id mode: empty `pcs` is elided
@@ -4549,6 +4657,7 @@ fn failure_dump_fd_array_empty_roundtrip() {
         indices: Vec::new(),
         truncated: false,
         indices_truncated: false,
+        unreadable: 0,
     };
     let json = serde_json::to_string(&original).expect("fd_array serialize");
     assert!(
@@ -4559,11 +4668,16 @@ fn failure_dump_fd_array_empty_roundtrip() {
         !json.contains("\"indices_truncated\""),
         "indices_truncated=false must be elided; JSON: {json}",
     );
+    assert!(
+        !json.contains("unreadable"),
+        "unreadable=0 must be elided; JSON: {json}",
+    );
     let restored: FailureDumpFdArray = serde_json::from_str(&json).expect("fd_array deserialize");
     assert_eq!(restored.populated, 0);
     assert_eq!(restored.scanned, 0);
     assert!(restored.indices.is_empty());
     assert!(!restored.truncated);
+    assert_eq!(restored.unreadable, 0);
 }
 
 /// FailureDumpFdArray populated case: indices vector and
@@ -4579,11 +4693,16 @@ fn failure_dump_fd_array_populated_roundtrip() {
         indices: (0..1024).collect(), // capped at MAX_FD_ARRAY_INDICES
         truncated: true,
         indices_truncated: true, // 1500 > 1024
+        unreadable: 5,
     };
     let json = serde_json::to_string(&original).expect("fd_array serialize");
     assert!(
         json.contains("\"indices_truncated\":true"),
         "indices_truncated=true must be emitted; JSON: {json}",
+    );
+    assert!(
+        json.contains("\"unreadable\":5"),
+        "non-zero unreadable must be emitted; JSON: {json}",
     );
     let restored: FailureDumpFdArray = serde_json::from_str(&json).expect("fd_array deserialize");
     assert_eq!(restored.populated, 1500);
@@ -4596,6 +4715,7 @@ fn failure_dump_fd_array_populated_roundtrip() {
     );
     assert_eq!(restored.indices[1023], 1023);
     assert!(restored.truncated);
+    assert_eq!(restored.unreadable, 5);
 }
 
 /// Defaulted-from-empty deserialization: a stripped-down JSON

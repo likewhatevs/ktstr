@@ -368,6 +368,8 @@ impl std::fmt::Display for FailureDumpReport {
             && self.scx_sched_state.is_none()
             && self.scx_walker_unavailable.is_none()
             && self.vcpu_perf_at_freeze.is_empty()
+            && self.dump_truncated_at_us.is_none()
+            && self.maps_truncated == 0
         {
             return f.write_str("(empty failure dump)");
         }
@@ -566,9 +568,7 @@ impl std::fmt::Display for FailureDumpReport {
             if !first {
                 f.write_str("\n\n")?;
             }
-            // Trailing section; mirrors the event_counter_timeline
-            // pattern — `first` is no longer consulted after this
-            // block.
+            first = false;
             f.write_str("vcpu_perf_at_freeze:")?;
             for (i, slot) in self.vcpu_perf_at_freeze.iter().enumerate() {
                 f.write_str("\n  ")?;
@@ -586,6 +586,23 @@ impl std::fmt::Display for FailureDumpReport {
                     )?,
                     None => write!(f, "vcpu {i}: <unavailable>")?,
                 }
+            }
+        }
+        // Truncation footer: the per-map render loop bounds the freeze
+        // window by skipping work once the soft deadline is crossed.
+        // Surface both WHEN (`dump_truncated_at_us`) and HOW MANY maps
+        // (`maps_truncated`) were dropped so a degraded dump reads as
+        // "incomplete by truncation" rather than "this is everything".
+        if self.dump_truncated_at_us.is_some() || self.maps_truncated > 0 {
+            if !first {
+                f.write_str("\n\n")?;
+            }
+            f.write_str("dump truncated:")?;
+            if let Some(us) = self.dump_truncated_at_us {
+                write!(f, " deadline crossed at {us}us")?;
+            }
+            if self.maps_truncated > 0 {
+                write!(f, " ({} map(s) skipped)", self.maps_truncated)?;
             }
         }
         Ok(())
@@ -687,6 +704,9 @@ impl std::fmt::Display for FailureDumpMap {
             if st.truncated {
                 f.write_str(" (truncated)")?;
             }
+            if st.buckets_unreadable > 0 {
+                write!(f, " ({} unreadable)", st.buckets_unreadable)?;
+            }
             for entry in &st.entries {
                 if entry.pcs.is_empty() {
                     write!(f, "\n  bucket {}: nr={}", entry.bucket_id, entry.nr)?;
@@ -721,6 +741,9 @@ impl std::fmt::Display for FailureDumpMap {
             )?;
             if fda.truncated {
                 f.write_str(" (slots truncated)")?;
+            }
+            if fda.unreadable > 0 {
+                write!(f, " ({} unreadable)", fda.unreadable)?;
             }
             if !fda.indices.is_empty() {
                 // Same pattern as stack-trace: stream directly

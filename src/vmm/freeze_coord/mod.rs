@@ -6353,6 +6353,10 @@ impl KtstrVm {
                                         "dump prerequisites unavailable".to_string(),
                                     ),
                                     dump_truncated_at_us: None,
+                                    // Partial dump never enters the per-map
+                                    // render loop, so no map was dropped by
+                                    // deadline truncation.
+                                    maps_truncated: 0,
                                     probe_counters: None,
                                     scx_static_ranges: Default::default(),
                                     is_placeholder: false,
