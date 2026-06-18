@@ -610,6 +610,71 @@ impl VmResult {
         out
     }
 
+    /// Worker-iteration throughput (iterations/sec) for one scenario
+    /// [`Phase`](crate::assert::Phase), from the stimulus timeline's
+    /// `StepStart[k]` -> `StepEnd[k]` step-local window (the per-event rate
+    /// via [`crate::timeline::StimulusEvent::rate_to`]).
+    ///
+    /// `None` when the phase has no `StepStart` ([`crate::assert::Phase::BASELINE`], or a
+    /// step the run never reached), no right boundary (no `StepEnd`, no
+    /// later step, and no scenario-end terminal), or the rate is
+    /// unmeasurable (zero-length window / counter went backward). A step
+    /// whose workers made zero forward progress over a positive hold
+    /// returns `Some(0.0)` (measured zero), not `None`.
+    ///
+    /// Collapse-immune: the stimulus timeline carries per-step boundaries
+    /// independent of the periodic-capture pipeline, so this works even for
+    /// `--cell-parent-cgroup` schedulers where the capture-derived
+    /// [`PhaseBucket`](crate::assert::PhaseBucket) path can collapse.
+    pub fn step_throughput(&self, phase: crate::assert::Phase) -> Option<f64> {
+        Self::step_throughput_in(&self.stimulus_timeline(), phase)
+    }
+
+    /// Ratio `step_throughput(a) / step_throughput(b)` — e.g.
+    /// scheduler-vs-EEVDF throughput when phase `b` runs on the detached
+    /// kernel default ([`crate::scenario::ops::Op::detach_scheduler`]).
+    /// Walks the stimulus timeline once. `None` when either phase has no
+    /// measurable throughput; a `Some(0.0)` denominator yields `inf` so a
+    /// collapsed/stalled phase `b` surfaces rather than vanishing to `None`.
+    pub fn throughput_ratio(
+        &self,
+        a: crate::assert::Phase,
+        b: crate::assert::Phase,
+    ) -> Option<f64> {
+        let timeline = self.stimulus_timeline();
+        let ta = Self::step_throughput_in(&timeline, a)?;
+        let tb = Self::step_throughput_in(&timeline, b)?;
+        Some(ta / tb)
+    }
+
+    /// Shared core for [`Self::step_throughput`] / [`Self::throughput_ratio`]
+    /// over an already-built timeline: pair the phase's `StepStart` with its
+    /// own `StepEnd` (step-local), falling back to the next step's
+    /// `StepStart` then the scenario-end terminal for the last step on
+    /// legacy/sched-died data that lacks a `StepEnd`. Mirrors the boundary
+    /// selection in [`crate::timeline::Timeline::build`].
+    fn step_throughput_in(
+        timeline: &[crate::timeline::StimulusEvent],
+        phase: crate::assert::Phase,
+    ) -> Option<f64> {
+        let start = timeline
+            .iter()
+            .find(|e| !e.is_terminal && !e.is_step_end && e.phase() == Some(phase))?;
+        let end = timeline
+            .iter()
+            .find(|e| e.is_step_end && e.phase() == Some(phase))
+            .or_else(|| {
+                timeline
+                    .iter()
+                    .filter(|e| {
+                        !e.is_terminal && !e.is_step_end && e.phase().is_some_and(|p| p > phase)
+                    })
+                    .min_by_key(|e| e.elapsed_ms)
+            })
+            .or_else(|| timeline.iter().find(|e| e.is_terminal))?;
+        start.rate_to(end)
+    }
+
     /// The framework-computed per-phase metric buckets for this run —
     /// the SAME [`crate::assert::PhaseBucket`] vec the framework folds
     /// onto [`crate::assert::ScenarioStats::phases`] in
@@ -1114,6 +1179,62 @@ pub(crate) struct VmRunState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A StepStart/StepEnd/terminal `StimulusEvent` for the
+    /// `step_throughput_in` pairing tests.
+    fn ev(
+        elapsed_ms: u64,
+        step_index: Option<u16>,
+        iters: Option<u64>,
+        is_step_end: bool,
+        is_terminal: bool,
+    ) -> crate::timeline::StimulusEvent {
+        crate::timeline::StimulusEvent {
+            elapsed_ms,
+            label: String::new(),
+            op_kind: None,
+            detail: None,
+            total_iterations: iters,
+            step_index,
+            is_terminal,
+            is_step_end,
+        }
+    }
+
+    /// `step_throughput_in` pairs `StepStart[k]` -> `StepEnd[k]` of the SAME
+    /// `Phase` for the step-local rate; falls back to the next step then the
+    /// scenario-end terminal when a StepEnd is absent; a flat counter over a
+    /// positive window is measured-zero `Some(0.0)` (not `None`); BASELINE /
+    /// an absent step is `None`.
+    #[test]
+    fn step_throughput_in_pairs_step_local_and_handles_edges() {
+        use crate::assert::Phase;
+        let tl = vec![
+            ev(0, Some(1), Some(0), false, false),       // StepStart[0]
+            ev(1000, Some(1), Some(5000), true, false),  // StepEnd[0] -> 5000/s
+            ev(1100, Some(2), Some(5000), false, false), // StepStart[1]
+            ev(2100, Some(2), Some(5000), true, false),  // StepEnd[1] -> 0/s (flat)
+            ev(2200, Some(3), Some(5000), false, false), // StepStart[2] (no StepEnd)
+            crate::timeline::StimulusEvent::terminal(3200, 11000), // right boundary for step 2
+        ];
+        // Step 0: (5000-0)/1s = 5000/s.
+        assert_eq!(
+            VmResult::step_throughput_in(&tl, Phase::step(0)),
+            Some(5000.0)
+        );
+        // Step 1: counter flat over a positive window -> measured zero
+        // Some(0.0), NOT None.
+        assert_eq!(VmResult::step_throughput_in(&tl, Phase::step(1)), Some(0.0));
+        // Step 2: no StepEnd -> falls back to the terminal:
+        // (11000-5000)/1s = 6000/s.
+        assert_eq!(
+            VmResult::step_throughput_in(&tl, Phase::step(2)),
+            Some(6000.0)
+        );
+        // BASELINE and an absent step have no StepStart -> None.
+        assert_eq!(VmResult::step_throughput_in(&tl, Phase::BASELINE), None);
+        assert_eq!(VmResult::step_throughput_in(&tl, Phase::step(9)), None);
+    }
 
     #[test]
     fn kvm_stats_try_sum_distinguishes_absent_from_zero() {

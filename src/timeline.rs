@@ -253,7 +253,7 @@ impl StimulusEvent {
     /// windows attributed by `step_index`) and [`Timeline::build`]
     /// (per-phase windows attributed by index) — the two callers pair
     /// events differently but must compute the rate identically.
-    pub(crate) fn rate_to(&self, next: &StimulusEvent) -> Option<f64> {
+    pub fn rate_to(&self, next: &StimulusEvent) -> Option<f64> {
         let s = self.total_iterations?;
         let e = next.total_iterations?;
         if e < s {
@@ -264,6 +264,23 @@ impl StimulusEvent {
             return None;
         }
         Some((e - s) as f64 / (duration_ms as f64 / 1000.0))
+    }
+
+    /// The scenario [`Phase`](crate::assert::Phase) this event belongs to,
+    /// or `None` for the terminal scenario-end boundary (which seeds no
+    /// phase). Use THIS — not the raw [`Self::step_index`] field — to key
+    /// per-phase lookups. `step_index` carries the bridge 1-indexed wire
+    /// convention (`Step k` -> `Some(k + 1)`) while `label` renders the
+    /// 0-indexed `k`, so reading the field directly invites the 0-vs-1
+    /// off-by-one this method removes: it maps the wire value onto the same
+    /// [`Phase`](crate::assert::Phase) newtype the
+    /// [`ScenarioStats`](crate::assert::ScenarioStats) /
+    /// [`PhaseBucket`](crate::assert::PhaseBucket) accessors are keyed by
+    /// (`Phase::step(k)`). Step events carry `step_index >= 1`, so the
+    /// `saturating_sub(1)` is exact.
+    pub fn phase(&self) -> Option<crate::assert::Phase> {
+        self.step_index
+            .map(|si| crate::assert::Phase::step(si.saturating_sub(1)))
     }
 }
 
@@ -1120,6 +1137,30 @@ fn compute_metrics(samples: &[&MonitorSample]) -> PhaseMetrics {
 mod tests {
     use super::*;
     use crate::monitor::{CpuSnapshot, MonitorSample};
+
+    /// `StimulusEvent::phase()` maps the 1-indexed wire `step_index` onto the
+    /// canonical [`crate::assert::Phase`] (StepStart and StepEnd of step `k`
+    /// both -> `Phase::step(k)`); the scenario-end terminal seeds no phase.
+    #[test]
+    fn stimulus_event_phase_maps_wire_step_index_to_phase() {
+        use crate::assert::Phase;
+        // Wire step_index 1 (Step 0) -> Phase::step(0); 2 (Step 1) -> step(1).
+        assert_eq!(
+            StimulusEvent::from_wire(&wire_event(0, 1, 0)).phase(),
+            Some(Phase::step(0)),
+        );
+        assert_eq!(
+            StimulusEvent::from_wire(&wire_event(100, 2, 50)).phase(),
+            Some(Phase::step(1)),
+        );
+        // StepEnd carries the same step_index -> same Phase as its StepStart.
+        assert_eq!(
+            StimulusEvent::from_step_end(&wire_event(200, 2, 90)).phase(),
+            Some(Phase::step(1)),
+        );
+        // The terminal boundary is not a step -> no Phase.
+        assert_eq!(StimulusEvent::terminal(300, 100).phase(), None);
+    }
 
     fn sample(elapsed_ms: u64, cpus: Vec<(u32, u32, u64)>) -> MonitorSample {
         MonitorSample {

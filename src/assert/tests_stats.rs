@@ -459,3 +459,65 @@ fn computed_accessors_handle_nan_infinity_and_negative_median() {
         "[u64-max-iters] result must be positive; got {got}",
     );
 }
+
+/// `ScenarioStats::cgroup_balance_ratio` = max/min over per-cgroup
+/// `iterations_per_worker`, SKIPPING no-worker cells; `None` when fewer
+/// than two cells have workers; a with-worker cell that completed zero
+/// iterations drives the ratio to `inf` so starvation surfaces (never a
+/// hidden `None` or a `0/0` `NaN`).
+#[test]
+fn cgroup_balance_ratio_skips_no_worker_cells_and_surfaces_starvation() {
+    let cg = |workers: usize, iters: u64| CgroupStats {
+        num_workers: workers,
+        total_iterations: iters,
+        ..CgroupStats::default()
+    };
+
+    // Two with-worker cells: 120000/12 = 10000 and 90000/12 = 7500 -> 1.333x.
+    let s = ScenarioStats {
+        cgroups: vec![cg(12, 120_000), cg(12, 90_000)],
+        ..ScenarioStats::default()
+    };
+    let r = s
+        .cgroup_balance_ratio()
+        .expect("two with-worker cells => Some");
+    assert!((r - 10_000.0 / 7_500.0).abs() < 1e-9, "got {r}");
+
+    // A 0-worker cell is a config condition, SKIPPED — the ratio is still
+    // computed over the two with-worker cells, not voided.
+    let s = ScenarioStats {
+        cgroups: vec![cg(12, 120_000), cg(0, 0), cg(12, 90_000)],
+        ..ScenarioStats::default()
+    };
+    assert!(
+        (s.cgroup_balance_ratio().unwrap() - 10_000.0 / 7_500.0).abs() < 1e-9,
+        "a 0-worker cell must be skipped, not void the ratio",
+    );
+
+    // Fewer than two with-worker cells -> None (a ratio needs two).
+    let s = ScenarioStats {
+        cgroups: vec![cg(12, 120_000), cg(0, 0)],
+        ..ScenarioStats::default()
+    };
+    assert_eq!(
+        s.cgroup_balance_ratio(),
+        None,
+        "one with-worker cell => None"
+    );
+    assert_eq!(
+        ScenarioStats::default().cgroup_balance_ratio(),
+        None,
+        "no cells => None",
+    );
+
+    // A cell that ran workers but did zero work -> inf (starvation surfaces).
+    let s = ScenarioStats {
+        cgroups: vec![cg(12, 120_000), cg(12, 0)],
+        ..ScenarioStats::default()
+    };
+    assert_eq!(
+        s.cgroup_balance_ratio(),
+        Some(f64::INFINITY),
+        "a zero-work with-worker cell must surface as inf, not None/NaN",
+    );
+}

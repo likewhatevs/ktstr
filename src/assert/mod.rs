@@ -1986,6 +1986,48 @@ impl ScenarioStats {
         self.phase(step_index).and_then(|p| p.get(metric))
     }
 
+    /// Cross-cgroup balance: the ratio of the busiest cell's per-worker
+    /// throughput to the quietest's — `max / min` over each cgroup's
+    /// [`CgroupStats::iterations_per_worker`]. The bread-and-butter
+    /// scheduler-fairness assertion (every balance test hand-rolls this
+    /// `max/min` over `self.cgroups` today).
+    ///
+    /// No-worker cgroups (`iterations_per_worker() == None`) are SKIPPED: a
+    /// 0-worker cell is a config condition, not a balance signal. Returns
+    /// `None` when fewer than two cgroups have workers (a ratio needs two);
+    /// check the cgroup count separately if every declared cell must have
+    /// workers. A cell that ran workers but completed zero iterations
+    /// (measured `Some(0.0)`) drives the ratio to `f64::INFINITY` so
+    /// starvation SURFACES rather than vanishing — matching the
+    /// `None`-vs-`Some(0.0)` discipline of
+    /// [`CgroupStats::iterations_per_worker`]. For an explicit starvation
+    /// gate, check `min > 0` over the same cgroups separately.
+    ///
+    /// Whole-run aggregate: this reads `self.cgroups`, which sums over all
+    /// phases. For a single phase's balance in a multi-phase scenario, use
+    /// the per-`Phase` variant once per-phase per-cgroup stats land.
+    pub fn cgroup_balance_ratio(&self) -> Option<f64> {
+        let mut min = f64::INFINITY;
+        let mut max = 0.0_f64;
+        let mut n = 0usize;
+        for cg in &self.cgroups {
+            if let Some(rate) = cg.iterations_per_worker() {
+                min = min.min(rate);
+                max = max.max(rate);
+                n += 1;
+            }
+        }
+        if n < 2 {
+            return None;
+        }
+        if min == 0.0 {
+            // A with-worker cell did zero work: starvation. Surface it as an
+            // infinite ratio rather than a NaN (0/0) or a hidden None.
+            return Some(f64::INFINITY);
+        }
+        Some(max / min)
+    }
+
     /// Shortcut: look up a single metric value in a 0-indexed
     /// scenario Step. Sibling of [`Self::step`]. See [`Self::phase_metric`]
     /// for the None-cause taxonomy and
