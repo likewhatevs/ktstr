@@ -1136,6 +1136,15 @@ fn merge_kind_enum_exhaustively_covers_metric_kind_variants() {
         MetricKind::Timestamp.merge_kind(),
         MergeKind::NonCommutative,
     );
+    assert_eq!(MetricKind::DeltaSum.merge_kind(), MergeKind::Commutative);
+    assert_eq!(
+        MetricKind::Rate {
+            numerator: "n",
+            denominator: "d",
+        }
+        .merge_kind(),
+        MergeKind::Recompute,
+    );
 }
 
 /// merge_matched_phase_buckets must NOT zero-weight a synthesized

@@ -114,7 +114,14 @@ pub struct MetricDef {
 ///     the clock is now"). Diffing two captures gives elapsed
 ///     time, but a single window's reduction picks the latest
 ///     reading — averaging timestamps is meaningless.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+// Serialize only: MetricKind is serialized as part of MetricDef (which is
+// Serialize-only) but is never deserialized. A `Deserialize` derive here
+// would narrow to `Deserialize<'static>` because the Rate variant carries
+// `&'static str` fields (serde treats `&str` as borrowed), so it would not
+// satisfy `DeserializeOwned` and would break any future container that
+// deserializes an embedded MetricKind. Drop it rather than carry a fragile,
+// unused impl.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
 #[non_exhaustive]
 pub enum MetricKind {
     /// Monotonic counter (SCX_EV_* event counters,
@@ -149,6 +156,47 @@ pub enum MetricKind {
     /// read lands in — a slight left-edge over-attribution, the
     /// deliberate semantic since a per-read delta cannot be split.
     DeltaSum,
+    /// Derived ratio of two component metrics — a RATE that must be
+    /// recomputed from its components at every in-map aggregation level, never
+    /// averaged as a ready-made ratio. The variant carries the registry
+    /// names of its `numerator` and `denominator` component metrics, each
+    /// itself registered with its own kind (e.g. a `Counter` numerator).
+    ///
+    /// A Rate has NO samples of its own. Its value is DERIVED from the
+    /// already-reduced component values as `map[numerator] /
+    /// map[denominator]` by the [`derive_rate_metrics`] post-pass. An
+    /// aggregation level that pools the components FIRST (each by its own
+    /// kind — a `Counter` numerator sums, a `Gauge(Avg)` averages) and
+    /// then re-derives the rate RE-POOLS correctly: for the common
+    /// `Counter / Counter` case the result is `Σnumerator / Σdenominator`,
+    /// NOT a mean of two phases' ready-made ratios `(r₁ + r₂) / 2` (which
+    /// is WRONG whenever the phases carry different denominator weight,
+    /// e.g. iterations-per-cpu-second across phases of unequal CPU time).
+    /// The numerator and denominator must already be expressed in units
+    /// whose quotient is the intended rate unit (the component
+    /// registration owns the unit choice; this variant does not scale).
+    ///
+    /// `derive_rate_metrics` runs as a post-pass at the six aggregation
+    /// sites where the components co-locate in one map: the two per-phase
+    /// builds (`buckets_from_grouped`, `build_phase_buckets_with_stimulus`),
+    /// the cross-phase bucket merge (`merge_matched_phase_buckets`), and
+    /// the three cross-RUN ext-metrics reducers (`populate_run_ext_metrics`,
+    /// `populate_run_ext_metrics_from_phases`, and `group_and_average_by`).
+    /// The cross-CGROUP `AssertResult::merge` ext-metrics fold uses
+    /// worst-case polarity (min/max) and is NOT a re-pool site; re-pooling
+    /// a Rate across cgroups (where a component may live in a typed
+    /// `GauntletRow` field rather than the ext-metrics map) is not yet
+    /// wired and is decided when a Rate is registered.
+    ///
+    /// Because a single sample slice cannot express the re-pool, a Rate is
+    /// FORBIDDEN from the single-slice reducers ([`aggregate_finite`]
+    /// panics on it); the post-pass is its only producer.
+    Rate {
+        /// Registry name of the numerator component metric.
+        numerator: &'static str,
+        /// Registry name of the denominator component metric.
+        denominator: &'static str,
+    },
 }
 
 /// Sub-classification for [`MetricKind::Gauge`] picking the
@@ -207,6 +255,14 @@ pub enum MergeKind {
     /// Timestamp). The merge resolves to the value from whichever
     /// bucket has the later `end_ms`; ties keep `self`.
     NonCommutative,
+    /// The reduction is a DERIVED ratio (a [`MetricKind::Rate`]): it
+    /// cannot be folded from two already-divided values. The components
+    /// merge by their own kinds and the rate is re-derived as
+    /// `Σnumerator / Σdenominator` — see [`derive_rate_metrics`]. The
+    /// per-metric merge loop skips Rate keys entirely and the post-pass
+    /// re-derives them, so this variant is classification metadata: no
+    /// merge dispatches on it.
+    Recompute,
 }
 
 impl MetricKind {
@@ -230,6 +286,9 @@ impl MetricKind {
             // associative, commutative fold, so cross-AssertResult merge
             // sums the two reduced values (same as Counter).
             MetricKind::DeltaSum => MergeKind::Commutative,
+            // A Rate is re-derived from its pooled components, never
+            // folded from two ready-made ratios.
+            MetricKind::Rate { .. } => MergeKind::Recompute,
         }
     }
 }
@@ -361,6 +420,17 @@ fn aggregate_finite(
         MetricKind::Gauge(GaugeAgg::Max) | MetricKind::Peak => {
             finite.iter().copied().fold(f64::NEG_INFINITY, f64::max)
         }
+        // A Rate is derived from its components by `derive_rate_metrics`,
+        // never reduced from a single sample slice (one slice cannot
+        // express Σnum/Σdenom). EVERY aggregation path skips Rate before
+        // reaching the reducers: `aggregate_samples_for_phase` returns
+        // None, and the per-phase build, the cross-phase merge, and both
+        // cross-RUN reducers skip Rate keys then re-derive via
+        // `derive_rate_metrics`. So reaching here is a routing bug.
+        MetricKind::Rate { .. } => unreachable!(
+            "MetricKind::Rate must be derived via derive_rate_metrics, \
+             not reduced from a sample slice"
+        ),
     })
 }
 
@@ -393,6 +463,11 @@ fn aggregate_finite(
 pub fn aggregate_samples_for_phase(metric: &MetricDef, samples: &[f64]) -> Option<f64> {
     match metric.kind {
         MetricKind::Counter => phase_counter_delta(samples),
+        // A Rate has no samples of its own; its per-phase value is
+        // derived from the reduced numerator/denominator component
+        // buckets by `derive_rate_metrics` in the build post-pass. Return
+        // None so the build loop inserts no rate key here.
+        MetricKind::Rate { .. } => None,
         _ => aggregate_samples(samples, metric.kind),
     }
 }
@@ -430,6 +505,65 @@ pub fn phase_counter_delta(samples: &[f64]) -> Option<f64> {
                 Some(0.0)
             } else {
                 Some(delta)
+            }
+        }
+    }
+}
+
+/// Derive every registered [`MetricKind::Rate`] metric in `metrics`
+/// from its already-present numerator / denominator component values:
+/// `metrics[rate] = metrics[numerator] / metrics[denominator]`.
+///
+/// This is the SOLE producer of a Rate metric's value. It runs as a
+/// post-pass at six aggregation sites where the components co-locate in
+/// one map: the two per-phase builds, the cross-phase bucket merge, and
+/// the three cross-RUN ext-metrics reducers (`populate_run_ext_metrics`,
+/// `populate_run_ext_metrics_from_phases`, `group_and_average_by`). At
+/// each, the components are
+/// pooled FIRST by their own kinds (a `Counter` numerator summed), then
+/// the rate is re-derived — so for `Counter / Counter` the result is
+/// `Σnumerator / Σdenominator`, the correct re-pool rather than a mean of
+/// ready-made ratios. (The cross-CGROUP `AssertResult::merge` ext-metrics
+/// fold uses worst-case polarity and is NOT a derive site — see
+/// [`MetricKind::Rate`].)
+///
+/// A rate is skipped (its key left absent) when either component key is
+/// missing, the denominator is zero, or either component is non-finite —
+/// keeping an absent rate distinct from a real `0.0`.
+pub(crate) fn derive_rate_metrics(metrics: &mut std::collections::BTreeMap<String, f64>) {
+    derive_rate_metrics_from(
+        metrics,
+        METRICS.iter().filter_map(|m| match m.kind {
+            MetricKind::Rate {
+                numerator,
+                denominator,
+            } => Some((m.name, numerator, denominator)),
+            _ => None,
+        }),
+    );
+}
+
+/// Inner of [`derive_rate_metrics`] taking the rate specs explicitly as
+/// `(name, numerator, denominator)` so the derivation math is
+/// unit-testable without a registered Rate metric in [`METRICS`].
+fn derive_rate_metrics_from<'a>(
+    metrics: &mut std::collections::BTreeMap<String, f64>,
+    rates: impl Iterator<Item = (&'a str, &'a str, &'a str)>,
+) {
+    for (name, numerator, denominator) in rates {
+        let (Some(num), Some(den)) = (
+            metrics.get(numerator).copied(),
+            metrics.get(denominator).copied(),
+        ) else {
+            continue;
+        };
+        if num.is_finite() && den.is_finite() && den != 0.0 {
+            // Guard the QUOTIENT too: a finite num / finite tiny den can
+            // overflow to +/-inf. Insert only a finite rate so an absent
+            // rate stays distinct from a real value (no inf in the map).
+            let rate = num / den;
+            if rate.is_finite() {
+                metrics.insert(name.to_string(), rate);
             }
         }
     }
@@ -2819,6 +2953,38 @@ pub fn group_and_average_by(
             &acc.first_kernel_base,
             &acc.first.kernel_commit,
         );
+        // ext_metrics is built BEFORE the struct so Rate keys can be
+        // re-derived from the folded components as a post-pass. A Rate is
+        // derived, not folded: folding two ready-made per-phase ratios
+        // would lose the Σnum/Σdenom re-pool, and routing a Rate through
+        // aggregate_samples_weighted would hit the aggregate_finite Rate
+        // guard. Dispatch by registered MetricKind so Gauge(Avg) gets the
+        // weighted-mean fold (matches the per-phase merge contract);
+        // unregistered names (no metric_def) fall back to arithmetic mean,
+        // the legacy (sum, count) semantic. Skip a key whose reduction is
+        // None (every value NaN — defensive post sidecar_to_row sanitize).
+        let mut ext_metrics: std::collections::BTreeMap<String, f64> = acc
+            .ext_pairs
+            .into_iter()
+            .filter_map(|(k, pairs)| {
+                if let Some(def) = metric_def(&k) {
+                    if matches!(def.kind, MetricKind::Rate { .. }) {
+                        return None;
+                    }
+                    aggregate_samples_weighted(&pairs, def.kind).map(|v| (k, v))
+                } else {
+                    let n = pairs.len();
+                    if n == 0 {
+                        None
+                    } else {
+                        let sum: f64 = pairs.iter().map(|(v, _)| *v).sum();
+                        Some((k, sum / n as f64))
+                    }
+                }
+            })
+            .collect();
+        // Re-derive Rate metrics from the folded components (Σnum/Σdenom).
+        derive_rate_metrics(&mut ext_metrics);
         let aggregated = GauntletRow {
             scenario: acc.first.scenario.clone(),
             topology: acc.first.topology.clone(),
@@ -2892,31 +3058,7 @@ pub fn group_and_average_by(
             worst_iterations_per_cpu_sec: acc.sum_iters_per_cpu_sec / denom,
             page_locality: acc.sum_page_locality / denom,
             cross_node_migration_ratio: acc.sum_cross_node_mig / denom,
-            ext_metrics: acc
-                .ext_pairs
-                .into_iter()
-                .filter_map(|(k, pairs)| {
-                    // Dispatch by registered MetricKind so Gauge(Avg)
-                    // metrics get the weighted-mean fold (matches the
-                    // per-phase merge contract). Unregistered names
-                    // (no metric_def) fall back to arithmetic mean —
-                    // same legacy semantic the previous (sum, count)
-                    // path produced. Skip the key on `None` reduction
-                    // (every value was NaN — shouldn't happen post-
-                    // sidecar_to_row sanitization but defensive).
-                    if let Some(def) = metric_def(&k) {
-                        aggregate_samples_weighted(&pairs, def.kind).map(|v| (k, v))
-                    } else {
-                        let n = pairs.len();
-                        if n == 0 {
-                            None
-                        } else {
-                            let sum: f64 = pairs.iter().map(|(v, _)| *v).sum();
-                            Some((k, sum / n as f64))
-                        }
-                    }
-                })
-                .collect(),
+            ext_metrics,
             // Phase buckets do not aggregate cleanly across an
             // averaged group: two contributors might run different
             // scenarios with different phase counts, and per-phase
@@ -6067,6 +6209,116 @@ mod tests {
         );
     }
 
+    /// A [`MetricKind::Rate`] is derived as numerator/denominator at the
+    /// per-phase level and RE-POOLED (Σnum/Σdenom) across a merge — never
+    /// averaged as a ready-made ratio. Pins the core of the Rate kind.
+    #[test]
+    fn rate_derives_per_phase_and_repools_across_merge() {
+        use std::collections::BTreeMap;
+        // Per-phase: rate = num / denom.
+        let mut phase = BTreeMap::new();
+        phase.insert("iters".to_string(), 1000.0);
+        phase.insert("secs".to_string(), 4.0);
+        derive_rate_metrics_from(&mut phase, std::iter::once(("rate", "iters", "secs")));
+        assert_eq!(
+            phase.get("rate").copied(),
+            Some(250.0),
+            "per-phase rate = num/denom",
+        );
+
+        // Cross-phase merge re-pools: the components fold by their own
+        // kind (Counter -> sum) FIRST, then the rate is re-derived from
+        // the pooled components. Phase A = 1000 iters / 1 s = 1000/s;
+        // phase B = 10 iters / 9 s ≈ 1.11/s. The correct merged rate is
+        // (1000+10)/(1+9) = 101.0, NOT the mean of the two ratios
+        // (1000 + 1.11)/2 ≈ 500.6.
+        let mut merged = BTreeMap::new();
+        merged.insert("iters".to_string(), 1000.0 + 10.0); // Counter sum
+        merged.insert("secs".to_string(), 1.0 + 9.0); // Counter sum
+        derive_rate_metrics_from(&mut merged, std::iter::once(("rate", "iters", "secs")));
+        assert_eq!(
+            merged.get("rate").copied(),
+            Some(101.0),
+            "merged rate must re-pool Σnum/Σdenom",
+        );
+        let mean_of_ratios = (1000.0 + (10.0 / 9.0)) / 2.0;
+        assert!(
+            (merged.get("rate").copied().unwrap() - mean_of_ratios).abs() > 100.0,
+            "re-pool must differ from mean-of-ratios (got {:?}, mean-of-ratios {mean_of_ratios})",
+            merged.get("rate"),
+        );
+    }
+
+    /// `derive_rate_metrics` leaves the rate key ABSENT (distinct from a
+    /// real 0.0) when a component is missing, the denominator is zero, or
+    /// a component is non-finite.
+    #[test]
+    fn rate_absent_on_missing_component_zero_or_nonfinite() {
+        use std::collections::BTreeMap;
+        // Denominator missing.
+        let mut m = BTreeMap::new();
+        m.insert("iters".to_string(), 5.0);
+        derive_rate_metrics_from(&mut m, std::iter::once(("rate", "iters", "secs")));
+        assert!(!m.contains_key("rate"), "absent denom -> no rate key");
+
+        // Denominator zero (must NOT insert inf).
+        m.insert("secs".to_string(), 0.0);
+        derive_rate_metrics_from(&mut m, std::iter::once(("rate", "iters", "secs")));
+        assert!(!m.contains_key("rate"), "zero denom -> no rate key");
+
+        // Non-finite numerator.
+        let mut n = BTreeMap::new();
+        n.insert("iters".to_string(), f64::NAN);
+        n.insert("secs".to_string(), 2.0);
+        derive_rate_metrics_from(&mut n, std::iter::once(("rate", "iters", "secs")));
+        assert!(!n.contains_key("rate"), "NaN numerator -> no rate key");
+
+        // Finite inputs whose QUOTIENT overflows to inf: absent, not inf.
+        let mut o = BTreeMap::new();
+        o.insert("iters".to_string(), f64::MAX);
+        o.insert("secs".to_string(), f64::MIN_POSITIVE);
+        derive_rate_metrics_from(&mut o, std::iter::once(("rate", "iters", "secs")));
+        assert!(!o.contains_key("rate"), "inf quotient -> no rate key");
+    }
+
+    /// A Rate has no samples of its own, so the per-phase reducer returns
+    /// None (the build post-pass derives it from components instead).
+    #[test]
+    fn rate_kind_returns_none_from_per_phase_reducer() {
+        let rate = MetricDef {
+            name: "test_rate",
+            accessor: |_| None,
+            display_unit: "",
+            polarity: crate::test_support::Polarity::HigherBetter,
+            default_abs: 0.0,
+            default_rel: 0.0,
+            kind: MetricKind::Rate {
+                numerator: "n",
+                denominator: "d",
+            },
+        };
+        assert_eq!(
+            aggregate_samples_for_phase(&rate, &[1.0, 2.0, 3.0]),
+            None,
+            "Rate reduces to None per-phase; derive_rate_metrics owns it",
+        );
+    }
+
+    /// Routing a Rate through the single-slice reducer is a bug — it
+    /// cannot express Σnum/Σdenom — so `aggregate_finite` panics rather
+    /// than silently producing a meaningless one-slice value.
+    #[test]
+    #[should_panic(expected = "must be derived via derive_rate_metrics")]
+    fn rate_kind_panics_in_single_slice_reducer() {
+        let _ = aggregate_samples(
+            &[1.0, 2.0],
+            MetricKind::Rate {
+                numerator: "n",
+                denominator: "d",
+            },
+        );
+    }
+
     /// All-empty / all-NaN inputs to either entry point return
     /// `None`. The phase renderer treats absent values as "no
     /// finite samples for this metric in this phase" — distinct
@@ -6136,6 +6388,39 @@ mod tests {
                     "Peak-kind metric must use max_* naming OR be a documented worst-* peak, got {:?}",
                     m.name,
                 );
+            }
+            // Rate metrics are derived ratios; name them `*_rate` or
+            // `*_per_*` so the registry reads as a rate at a glance.
+            if let MetricKind::Rate {
+                numerator,
+                denominator,
+            } = m.kind
+            {
+                assert!(
+                    m.name.ends_with("_rate") || m.name.contains("_per_"),
+                    "Rate-kind metric must use *_rate or *_per_* naming, got {:?}",
+                    m.name,
+                );
+                // Components must be registered AND not themselves Rate:
+                // derive_rate_metrics is a pure function of non-derived
+                // components, which is what keeps the re-pool associative.
+                // A rate-of-a-rate would make the post-pass order-dependent
+                // on METRICS declaration order (the inner rate's key is
+                // skipped in the merge loop, so a stale value could be read).
+                for comp in [numerator, denominator] {
+                    let cd = metric_def(comp).unwrap_or_else(|| {
+                        panic!(
+                            "Rate metric {:?} component {comp:?} is not registered",
+                            m.name
+                        )
+                    });
+                    assert!(
+                        !matches!(cd.kind, MetricKind::Rate { .. }),
+                        "Rate metric {:?} component {comp:?} must not itself be Rate \
+                         (a rate-of-a-rate breaks the associative re-derive)",
+                        m.name,
+                    );
+                }
             }
         }
     }

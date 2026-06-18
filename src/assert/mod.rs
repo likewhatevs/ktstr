@@ -1772,6 +1772,12 @@ impl PhaseBucket {
 ///   → value from the bucket with the larger `end_ms`; ties keep
 ///   `a`'s value. Captures the "latest-sample-wins" semantic per
 ///   the [`crate::stats::MergeKind::NonCommutative`] contract.
+/// - `MetricKind::Rate { .. }` → SKIPPED in the per-key fold and
+///   re-derived from the pooled components by
+///   [`crate::stats::derive_rate_metrics`] as a post-pass, so the
+///   merged rate is `Σnumerator / Σdenominator` (each component
+///   folds by its own kind first) rather than a fold of two
+///   ready-made per-phase ratios.
 ///
 /// Unregistered metric names (not in `crate::stats::METRICS`)
 /// fall back to a commutative arithmetic mean
@@ -1793,6 +1799,15 @@ fn merge_matched_phase_buckets(a: PhaseBucket, b: PhaseBucket) -> PhaseBucket {
     let mut keys: std::collections::BTreeSet<&String> = a.metrics.keys().collect();
     keys.extend(b.metrics.keys());
     for key in keys {
+        // Rate metrics are DERIVED, not merged: skip here and re-derive
+        // from the merged components in the post-pass below. Folding two
+        // ready-made ratios would lose the Σnum/Σdenom re-pool.
+        if matches!(
+            crate::stats::metric_def(key).map(|m| m.kind),
+            Some(crate::stats::MetricKind::Rate { .. })
+        ) {
+            continue;
+        }
         let av = a.metrics.get(key).copied();
         let bv = b.metrics.get(key).copied();
         let merged = match (av, bv) {
@@ -1813,6 +1828,11 @@ fn merge_matched_phase_buckets(a: PhaseBucket, b: PhaseBucket) -> PhaseBucket {
         };
         metrics.insert(key.clone(), merged);
     }
+    // Re-derive Rate metrics from the now-pooled components: each
+    // component merged by its own kind above (a Counter numerator
+    // summed), so the rate becomes Σnumerator / Σdenominator — the
+    // correct re-pool, not a mean of the two phases' ready-made ratios.
+    crate::stats::derive_rate_metrics(&mut metrics);
     PhaseBucket {
         step_index: a.step_index,
         label: a.label,
@@ -1869,6 +1889,14 @@ fn merge_metric_values(
         Some(MetricKind::Gauge(GaugeAgg::Last)) | Some(MetricKind::Timestamp) => {
             if b_end_ms > a_end_ms { b } else { a }
         }
+        // Rate metrics are skipped in the merge loop and re-derived from
+        // their pooled components afterward (see
+        // `merge_matched_phase_buckets`), so a Rate value never reaches
+        // this per-value merge — folding two ready-made ratios would lose
+        // the Σnum/Σdenom re-pool.
+        Some(MetricKind::Rate { .. }) => unreachable!(
+            "Rate metrics are re-derived via derive_rate_metrics, not merged as values"
+        ),
         // Unregistered metric: commutative mean fallback. Sum
         // would over-count Gauge values; max would lose Counter
         // signal; "last" needs a tiebreak the caller can't
@@ -2193,9 +2221,11 @@ pub fn populate_run_ext_metrics_from_phases(
     phases: &[PhaseBucket],
     target: &mut std::collections::BTreeMap<String, f64>,
 ) {
-    if phases.is_empty() {
-        return;
-    }
+    // No early-return on empty `phases`: the derive_rate_metrics post-pass
+    // below must still run over whatever components populate_run_ext_metrics
+    // already inserted into `target` (the empty-phases case), so a run-level
+    // Rate is re-derived rather than silently dropped. The loops below are
+    // no-ops when `phases` is empty.
     // Collect every metric key that appears on any phase.
     let mut keys: std::collections::BTreeSet<&String> = std::collections::BTreeSet::new();
     for phase in phases {
@@ -2210,6 +2240,14 @@ pub fn populate_run_ext_metrics_from_phases(
         let Some(def) = crate::stats::metric_def(key) else {
             continue;
         };
+        // Rate metrics are DERIVED from their pooled components, not folded
+        // as values: skip here and re-derive after the loop so the run rate
+        // is Σnum/Σdenom over the folded components. Folding two ready-made
+        // per-phase ratios would lose the re-pool, and routing a Rate into
+        // aggregate_samples_weighted would hit the aggregate_finite guard.
+        if matches!(def.kind, crate::stats::MetricKind::Rate { .. }) {
+            continue;
+        }
         // Per-phase (value, sample_count) for the kind-aware fold.
         // A phase that doesn't carry the key contributes nothing.
         // Lock-step shape enforced by the (f64, usize) pair type.
@@ -2240,6 +2278,10 @@ pub fn populate_run_ext_metrics_from_phases(
             target.insert(key.clone(), reduced);
         }
     }
+    // Re-derive Rate metrics from the now-folded components so the run
+    // rate is Σnumerator / Σdenominator (the components folded by their
+    // own kinds above — a Counter numerator summed across phases).
+    crate::stats::derive_rate_metrics(target);
 }
 
 /// Populate cross-RUN aggregate entries for every registered
@@ -2300,6 +2342,11 @@ pub fn populate_run_ext_metrics(
             target.insert(metric_def.name.to_string(), reduced);
         }
     }
+    // Re-derive Rate metrics from the read_sample components just folded
+    // in. populate_run_ext_metrics is pub and called standalone (tests,
+    // and not only ahead of populate_run_ext_metrics_from_phases), so it
+    // derives its own rates to stay self-contained.
+    crate::stats::derive_rate_metrics(target);
 }
 
 /// Phase buckets attributed against the guest stimulus timeline, then
@@ -2374,9 +2421,15 @@ pub fn populate_run_ext_metrics(
 /// mean, each phase weight floored at 1 — NOT the unweighted
 /// `crate::stats::aggregate_samples`). The `.max(1)` floor keeps a
 /// synthesized zero-capture phase's stimulus-derived rate in the run
-/// scalar rather than zero-weighting it out. The genuine cross-RUN
-/// rollup (across sidecar runs) is the `ext_metrics` fold in
-/// `AssertResult::merge`.
+/// scalar rather than zero-weighting it out. Across cgroups/assertions
+/// WITHIN a run, the `ext_metrics` fold in `AssertResult::merge` is a
+/// worst-case polarity (min/max) fold — correct for this `Gauge(Avg)`
+/// metric and the `worst_*` family, but NOT a re-pool. The genuine
+/// cross-sidecar-run rollup is `group_and_average_by`, which DOES re-pool
+/// a `MetricKind::Rate` via its `derive_rate_metrics` post-pass. Were
+/// `iteration_rate` migrated to Rate, the per-phase, ext-metrics-reducer,
+/// and cross-sidecar-run re-pool would already cover it; only the
+/// cross-cgroup `AssertResult::merge` axis would need separate wiring.
 ///
 /// Live caller: `evaluate_vm_result` at `src/test_support/eval/mod.rs`
 /// — has both the SampleSeries and the stimulus_events vec in scope.
@@ -2580,6 +2633,13 @@ pub fn build_phase_buckets_with_stimulus(
                 break;
             }
         }
+    }
+    // Stimulus/monitor components are injected ABOVE, AFTER
+    // buckets_from_grouped's own derive_rate_metrics already ran; re-derive
+    // here so a Rate over a post-injected component is produced for these
+    // buckets too. Idempotent: re-deriving an unchanged map is a no-op.
+    for bucket in buckets.iter_mut() {
+        crate::stats::derive_rate_metrics(&mut bucket.metrics);
     }
     buckets
 }
@@ -2886,6 +2946,16 @@ fn buckets_from_grouped(
         // synthesized bucket's FULL stimulus window vs this captured
         // bucket's narrower interior capture-offset span.
         fold_monitor_into_bucket(&mut bucket, monitor_samples, monitor_to_window_offset_ms);
+        // Derive Rate metrics AFTER every component source is folded in:
+        // the METRICS reductions + system/user_time_ns above AND the
+        // monitor-injected components (e.g. avg_imbalance_ratio, whose ONLY
+        // source is fold_monitor_into_bucket). Deriving before the monitor
+        // fold would silently drop a Rate over a monitor-only component. A
+        // Rate has no samples of its own (see MetricKind::Rate); this is its
+        // per-phase producer. Inert until a Rate registers. The stimulus
+        // sibling build_phase_buckets_with_stimulus re-derives again after
+        // its own later injections (idempotent).
+        crate::stats::derive_rate_metrics(&mut bucket.metrics);
         out.push(bucket);
     }
     out
