@@ -1839,6 +1839,11 @@ ktstr-5678 [002] 0.500: sched_ext_dump: scheduler[2] unrelated event from cpu 2
         let s = format_periodic_samples_section(&result);
         assert!(s.contains("--- periodic samples ---"));
         assert!(s.contains("fired 2/5"));
+        // Pin the percentage too: it is computed independently of the
+        // fired/target and missing slots, so an inverted or mis-scaled
+        // formula (e.g. 250% for 2/5) is invisible to those asserts. The
+        // sibling full_coverage test's 100% holds even under inversion.
+        assert!(s.contains("40% coverage"), "2/5 must render 40%: {s}");
         assert!(s.contains("missing 3"));
         assert!(!s.contains("placeholder"));
     }
