@@ -1225,10 +1225,16 @@ commit, exiting non-zero when a metric regresses past its threshold.
 The verdict reuses the same polarity-aware, abs+rel dual-gate engine as
 [`stats compare`](#stats) (`compare_partitions`): the baseline commit's
 sidecars are the A side, HEAD's are the B side, paired per scenario.
-The intended use is a CI perf-gate on a pull request — diff the branch
-against the point it diverged from `main` in one command. See the
-[A/B Compare Branches](../recipes/ab-compare.md) recipe for the manual
-`stats compare` equivalent.
+It runs in any repo that consumes ktstr (it discovers the repo from the
+cwd). The primary use is a scheduler author asserting that a change does
+not regress a degenerate case: mark the degenerate-case scenarios
+`#[ktstr_test(performance_mode)]`, then `perf-delta` runs them at HEAD
+and at the baseline and fails if a metric got worse — so the commit
+that adds a fix-flag is gated against the commit before it. The
+baseline is the merge-base with `main` by default, or any `--base` /
+`--base-ref` commit. The same shape is a CI perf-gate on a pull
+request. See the [A/B Compare Branches](../recipes/ab-compare.md) recipe
+for the manual `stats compare` equivalent.
 
 ```sh
 cargo ktstr perf-delta --dual-run --kernel 6.14            # HEAD vs merge-base(HEAD, main)
