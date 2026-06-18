@@ -2574,6 +2574,58 @@ mod tests {
         );
     }
 
+    /// from_phase_buckets must CORRELATE a real stimulus event into the
+    /// phase header, carrying its op_kind + detail. Every other
+    /// from_phase_buckets test passes `&[]`, so only the synthetic
+    /// None-placeholder arm ran and the `Some(ev) => (*ev).clone()`
+    /// correlation arm (added to stop headers degrading to "Step[N]: ?")
+    /// was untested. A wrong interval bound or cloning the wrong event
+    /// would drop the operator-facing op/detail with no failure.
+    #[test]
+    fn from_phase_buckets_correlates_real_stimulus_op_and_detail() {
+        use crate::assert::PhaseBucket;
+        use std::collections::BTreeMap;
+        let event = StimulusEvent {
+            elapsed_ms: 1000,
+            label: "Step[0]".to_string(),
+            op_kind: Some("SetCpuset".to_string()),
+            detail: Some("4 cpus".to_string()),
+            total_iterations: None,
+            step_index: Some(1),
+            is_terminal: false,
+            is_step_end: false,
+        };
+        let buckets = vec![
+            PhaseBucket {
+                step_index: 0,
+                label: "BASELINE".to_string(),
+                start_ms: 0,
+                end_ms: 1000,
+                sample_count: 5,
+                metrics: BTreeMap::new(),
+            },
+            PhaseBucket {
+                step_index: 1,
+                label: "Step[0]".to_string(),
+                start_ms: 1000,
+                end_ms: 6000,
+                sample_count: 20,
+                metrics: BTreeMap::new(),
+            },
+        ];
+        let t = Timeline::from_phase_buckets(&buckets, &[event], &TimelineContext::default());
+        let stim = t.phases[1]
+            .stimulus
+            .as_ref()
+            .expect("Step[0] phase carries a stimulus");
+        assert_eq!(
+            stim.op_kind.as_deref(),
+            Some("SetCpuset"),
+            "the correlated event's op_kind must be carried, not the None placeholder",
+        );
+        assert_eq!(stim.detail.as_deref(), Some("4 cpus"));
+    }
+
     #[test]
     fn from_phase_buckets_zero_duration_window_emits_no_rate() {
         use crate::assert::PhaseBucket;

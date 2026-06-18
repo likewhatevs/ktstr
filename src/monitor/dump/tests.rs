@@ -2764,34 +2764,22 @@ fn accessor_mem_reader_no_snapshot_rejects_all_addrs() {
 #[test]
 fn accessor_mem_reader_zero_user_vm_start_rejects_all() {
     use super::super::arena::ArenaSnapshot;
-    let snap = ArenaSnapshot {
+    use super::render_map::is_arena_addr_in_snapshot;
+    // Drive the REAL production gate (is_arena_addr forwards to this), not
+    // a stub copy: a snapshot present but user_vm_start == 0 (the pre-pass
+    // bailed before reading the anchor) must reject EVERY address. This is
+    // the discriminating case for the `if snap.user_vm_start == 0 { return
+    // false }` guard — delete it and a zero-anchor snapshot would accept
+    // any addr < (1<<32). The 0xFFFF_FFFF case below would then wrongly
+    // pass.
+    let zero = ArenaSnapshot {
         user_vm_start: 0,
         ..ArenaSnapshot::default()
     };
-    struct StubReader<'a> {
-        arena_snapshot: Option<&'a ArenaSnapshot>,
-    }
-    impl super::super::btf_render::MemReader for StubReader<'_> {
-        fn read_kva(&self, _: u64, _: usize) -> Option<Vec<u8>> {
-            None
-        }
-        fn is_arena_addr(&self, addr: u64) -> bool {
-            let Some(snap) = self.arena_snapshot else {
-                return false;
-            };
-            if snap.user_vm_start == 0 {
-                return false;
-            }
-            addr >= snap.user_vm_start && addr < snap.user_vm_start.wrapping_add(1 << 32)
-        }
-    }
-    let r = StubReader {
-        arena_snapshot: Some(&snap),
-    };
-    // Even with a snapshot present, user_vm_start=0 means no
-    // arena base anchor → reject every address.
-    assert!(!r.is_arena_addr(0));
-    assert!(!r.is_arena_addr(0x100000));
+    assert!(!is_arena_addr_in_snapshot(Some(&zero), 0));
+    assert!(!is_arena_addr_in_snapshot(Some(&zero), 0x100000));
+    assert!(!is_arena_addr_in_snapshot(Some(&zero), 0xFFFF_FFFF));
+    assert!(!is_arena_addr_in_snapshot(None, 0x1000));
 }
 
 /// `is_arena_addr` enforces the `[user_vm_start, user_vm_start +
