@@ -481,7 +481,7 @@ fn emit_raw_payload_output(raw: &crate::test_support::RawPayloadOutput) {
 ///
 /// LLM extraction is HOST-ONLY: the model (~2.4 GiB) does not fit in
 /// the test VM's RAM budget and the cache lives on the host. The
-/// host's `eval.rs` post-VM-exit pipeline drains the SHM ring,
+/// host's `crate::test_support::eval` post-VM-exit pipeline drains the SHM ring,
 /// matches `payload_index` between the
 /// `MSG_TYPE_RAW_PAYLOAD_OUTPUT` and `MSG_TYPE_PAYLOAD_METRICS`
 /// messages emitted by this invocation, runs

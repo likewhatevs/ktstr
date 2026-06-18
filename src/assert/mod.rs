@@ -1355,20 +1355,32 @@ pub struct AssertResult {
 /// [`ScenarioStats::worst_iterations_per_worker`] aggregate these
 /// methods over per-cgroup [`Self`] entries during
 /// [`AssertResult::merge`].
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, crate::Claim)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize, crate::Claim)]
 pub struct CgroupStats {
     /// Number of workers in this cgroup.
     pub num_workers: usize,
     /// Distinct CPUs used across all workers in this cgroup.
     pub num_cpus: usize,
-    /// Mean off-CPU percentage across workers (off_cpu_ns / wall_time_ns * 100).
-    pub avg_off_cpu_pct: f64,
-    /// Minimum off-CPU percentage across workers.
-    pub min_off_cpu_pct: f64,
-    /// Maximum off-CPU percentage across workers.
-    pub max_off_cpu_pct: f64,
-    /// max_off_cpu_pct - min_off_cpu_pct. Measures scheduling fairness within the cgroup.
-    pub spread: f64,
+    /// Mean off-CPU percentage across workers (off_cpu_ns /
+    /// wall_time_ns * 100). `None` when no worker reported a
+    /// positive `wall_time_ns` (off-CPU% is undefined without wall
+    /// time) — distinct from `Some(0.0)`, a measured "never off
+    /// CPU". The `Option` keeps a not-measured cgroup from reading
+    /// as a perfectly-on-CPU one in the telemetry consumers
+    /// (`ScenarioStats.cgroups`).
+    pub avg_off_cpu_pct: Option<f64>,
+    /// Minimum off-CPU percentage across workers. `None` under the
+    /// same no-measurable-wall-time condition as `avg_off_cpu_pct`.
+    pub min_off_cpu_pct: Option<f64>,
+    /// Maximum off-CPU percentage across workers. `None` under the
+    /// same no-measurable-wall-time condition as `avg_off_cpu_pct`.
+    pub max_off_cpu_pct: Option<f64>,
+    /// `max_off_cpu_pct - min_off_cpu_pct`. Measures scheduling
+    /// fairness within the cgroup. `None` when off-CPU% was not
+    /// measured (no worker with positive wall time) — a not-measured
+    /// cgroup is inconclusive for fairness, NOT "spread 0 = perfectly
+    /// fair". `Some(0.0)` means a real measured zero spread.
+    pub spread: Option<f64>,
     /// Longest scheduling gap across all workers (ms).
     pub max_gap_ms: u64,
     /// CPU where the longest scheduling gap occurred.
@@ -1431,10 +1443,18 @@ impl CgroupStats {
     }
 
     /// Throughput per parallel degree:
-    /// `total_iterations / num_workers`. Returns `0.0` when
-    /// `num_workers == 0` so the result never propagates
-    /// `NaN` / `Infinity`. Method-only access (no stored shadow) —
-    /// recomputed every call from the raw fields.
+    /// `total_iterations / num_workers`. `None` when
+    /// `num_workers == 0` (no worker reported, so per-worker
+    /// throughput is undefined — distinct from a measured zero);
+    /// `Some(0.0)` when workers ran but completed zero iterations
+    /// (a real throughput collapse). The `None` / `Some(0.0)` split
+    /// is load-bearing: the cross-cgroup roll-up in
+    /// [`AssertResult::merge`] must treat a measured zero as the
+    /// worst reading (it wins the "lowest" bucket) while skipping a
+    /// no-data cgroup — collapsing both to `0.0` would hide a
+    /// starved cgroup behind the no-data sentinel. Method-only
+    /// access (no stored shadow) — recomputed every call from the
+    /// raw fields.
     ///
     /// Only meaningful across runs of the SAME variant (equal
     /// scenario duration): cross-variant comparison is misleading
@@ -1443,11 +1463,11 @@ impl CgroupStats {
     /// the scheduler is identical. `stats compare`-style
     /// comparisons hold scenario, topology, and work_type constant
     /// before reading this method.
-    pub fn iterations_per_worker(&self) -> f64 {
+    pub fn iterations_per_worker(&self) -> Option<f64> {
         if self.num_workers > 0 {
-            self.total_iterations as f64 / self.num_workers as f64
+            Some(self.total_iterations as f64 / self.num_workers as f64)
         } else {
-            0.0
+            None
         }
     }
 }
@@ -1589,14 +1609,17 @@ pub struct PhaseBucket {
     /// inspection of the formatted diagnostic and the structured
     /// sidecar yield the same phase identifiers.
     pub label: String,
-    /// Phase window start, milliseconds since `run_start`
-    /// (pause-adjusted to match [`crate::scenario::sample::Sample`]
-    /// elapsed timestamps).
+    /// Phase window start: the MINIMUM per-sample time anchor in the
+    /// phase — each sample's `boundary_offset_ms`, falling back to its
+    /// `elapsed_ms`. Samples with neither anchor (both `None` — a
+    /// not-measured timestamp) are excluded from the min.
     pub start_ms: u64,
-    /// Phase window end, milliseconds since `run_start`
-    /// (inclusive). Set to the last bucketed sample's `elapsed_ms`;
-    /// downstream renderers should not assume the value is closed
-    /// against a stimulus event.
+    /// Phase window end: the MAXIMUM per-sample time anchor in the
+    /// phase (the same `boundary_offset_ms`-or-`elapsed_ms` key as
+    /// `start_ms`). A phase whose every sample is unanchored yields the
+    /// inverted window `(start_ms = u64::MAX, end_ms = 0)`, which folds
+    /// no monitor samples. Downstream renderers should not assume the
+    /// value is closed against a stimulus event.
     pub end_ms: u64,
     /// Number of periodic samples bucketed into this phase. Zero
     /// when the phase fired no captures (e.g. BASELINE when the
@@ -1765,7 +1788,10 @@ fn merge_metric_values(
 ) -> f64 {
     use crate::stats::{GaugeAgg, MetricKind};
     match kind {
-        Some(MetricKind::Counter) => a + b,
+        // Counter (cumulative) and DeltaSum (sum of per-read deltas)
+        // both merge across AssertResults by summing the reduced values
+        // (commutative — see MetricKind::merge_kind).
+        Some(MetricKind::Counter) | Some(MetricKind::DeltaSum) => a + b,
         Some(MetricKind::Peak) | Some(MetricKind::Gauge(GaugeAgg::Max)) => a.max(b),
         Some(MetricKind::Gauge(GaugeAgg::Avg)) => {
             let total_count = a_count + b_count;
@@ -1790,7 +1816,7 @@ fn merge_metric_values(
 }
 
 /// Aggregated statistics across all cgroups in a scenario.
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, crate::Claim)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize, crate::Claim)]
 pub struct ScenarioStats {
     /// Per-cgroup stats, one entry per cgroup.
     pub cgroups: Vec<CgroupStats>,
@@ -1838,26 +1864,30 @@ pub struct ScenarioStats {
     /// `stats compare` surfaces this axis in its comparison rows.
     pub worst_wake_latency_tail_ratio: f64,
     /// Worst per-worker iteration count across cgroups (LOWEST
-    /// non-zero).
+    /// reading, measured-zero included).
     ///
     /// Per-cgroup [`CgroupStats::iterations_per_worker`] is a
     /// throughput metric; the worst-case (regression-detecting)
-    /// roll-up across cgroups is the lowest non-zero value — a
-    /// cgroup that fell behind surfaces as the lowest per-worker
-    /// throughput. The fold in [`AssertResult::merge`] uses
-    /// `fold_lowest_nonzero` rather than plain `min`: the
-    /// accumulator pattern `AssertResult::pass().merge(real)`
-    /// starts at 0.0 from `Default`, and a plain min would let
-    /// that sentinel destroy any positive reading folded in. 0.0
-    /// is treated as "not reported," matching the sentinel
-    /// convention shared with [`Self::worst_page_locality`].
+    /// roll-up across cgroups is the lowest reading — a cgroup that
+    /// fell behind surfaces as the lowest per-worker throughput.
+    /// `None` means no cgroup reported a worker (the `Default`
+    /// accumulator start, and the merge result when every folded
+    /// cgroup had `num_workers == 0`); `Some(0.0)` means a cgroup
+    /// ran with zero iterations — a real starvation that the merge
+    /// surfaces as the worst reading rather than discarding as a
+    /// sentinel. The fold in [`AssertResult::merge`] is None-aware:
+    /// it skips `None` contributors (no data) but lets a
+    /// `Some(0.0)` win the "lowest" bucket. This is why the field is
+    /// `Option<f64>` and not a `0.0`-sentinel `f64` — collapsing
+    /// no-data and measured-zero to the same value would hide a
+    /// starved cgroup.
     ///
     /// Only meaningful across runs of the SAME variant — see
     /// [`CgroupStats::iterations_per_worker`] for the cross-
     /// variant caveat. Routed through `GauntletRow` and the
     /// `METRICS` registry; `stats compare` surfaces this axis
     /// in its comparison rows.
-    pub worst_iterations_per_worker: f64,
+    pub worst_iterations_per_worker: Option<f64>,
     /// Extensible metrics for the generic comparison pipeline.
     /// Populated from per-cgroup ext_metrics (worst value across cgroups).
     pub ext_metrics: BTreeMap<String, f64>,
@@ -2024,9 +2054,13 @@ impl ScenarioStats {
 /// `PhaseBucket.metrics` but never reach `ext_metrics` via the
 /// SampleSeries path (their `read_sample` returns `None`):
 /// `avg_imbalance_ratio` (sourced from MonitorSample windowing
-/// inside [`build_phase_buckets`]) and `iteration_rate` (sourced
-/// from stimulus event totals inside
-/// [`build_phase_buckets_with_stimulus`]).
+/// inside [`build_phase_buckets`]), `iteration_rate` (sourced from
+/// stimulus event totals inside [`build_phase_buckets_with_stimulus`]),
+/// and `system_time_ns` / `user_time_ns` (per-thread-group CPU-time
+/// deltas injected by `phase_group_cpu_delta` inside
+/// `buckets_from_grouped`). The fold is generic over every key
+/// present on any phase, so it carries any such phase-only metric; this
+/// list is the current set whose `read_sample` returns `None`.
 ///
 /// Per-phase reduction dispatch is described on [`PhaseBucket`];
 /// the cross-phase fold here uses `sample_count` as the weight so
@@ -2036,10 +2070,10 @@ impl ScenarioStats {
 /// overwritten — `read_sample` path values win when both produced
 /// an entry.
 ///
-/// Without this fill, `cargo ktstr stats compare` silently
-/// misses avg_imbalance_ratio + iteration_rate in flat-row
-/// output because `MetricDef::read` falls back to ext_metrics
-/// and finds nothing.
+/// Without this fill, `cargo ktstr stats compare` silently misses
+/// these phase-only metrics (avg_imbalance_ratio, iteration_rate,
+/// system_time_ns, user_time_ns) in flat-row output because
+/// `MetricDef::read` falls back to ext_metrics and finds nothing.
 pub fn populate_run_ext_metrics_from_phases(
     phases: &[PhaseBucket],
     target: &mut std::collections::BTreeMap<String, f64>,
@@ -2163,19 +2197,44 @@ pub fn populate_run_ext_metrics(
 /// throughput annotation without going through the legacy
 /// `crate::timeline::Timeline::build` path.
 ///
-/// For each adjacent pair of stimulus events with
+/// For each `StepStart[k]` -> `StepEnd[k]` pair with
 /// `total_iterations: Some(_)`, the per-phase rate is
 /// `(later - earlier) / duration_s` where `duration_s` is the
-/// PhaseBucket window. Phases that don't overlap a stimulus pair
-/// keep their PhaseBucket.metrics map unchanged (no
-/// iteration_rate key). Per the unweighted-mean cross-RUN policy
+/// elapsed-ms delta BETWEEN THE TWO STIMULUS EVENTS (guest clock),
+/// not the PhaseBucket sample window. The rate is attributed to the
+/// step the EARLIER event starts (`prev.step_index`); the attribution
+/// loop skips any `is_step_end` (or `is_terminal`) `prev`, so only a
+/// StepStart is ever the earlier member. Phases that don't overlap a
+/// stimulus pair keep their PhaseBucket.metrics map unchanged (no
+/// iteration_rate key).
+///
+/// SEMANTICS: `total_iterations` is the sum of the worker handles
+/// alive at each event (see
+/// [`crate::timeline::StimulusEvent::total_iterations`]). Each step's
+/// rate is its STEP-LOCAL `StepStart[k]` -> `StepEnd[k]` delta — the
+/// step's own workers measured over its own hold — so a bucket is
+/// sourced ONLY by its own pair (the `is_step_end` guard drops the
+/// inter-step `StepEnd[k]` -> `StepStart[k+1]` pair entirely). This
+/// measures BOTH fresh-per-step workers (which read ~0 at each
+/// StepStart, so the old cross-step delta produced no rate) and
+/// persistent (Backdrop) workers (excluding the inter-step teardown
+/// wall-time a cross-step window would span). On a clean run the
+/// `(StepEnd[N], terminal)` pair is guard-skipped and the trailing
+/// `is_terminal` event is not consumed; it supplies a step's right
+/// boundary ONLY for legacy/synthetic data carrying a `ScenarioEnd`
+/// frame but no `StepEnd` frames. A sched-died step has neither frame
+/// (its early return skips both emissions), so the dead step's
+/// `StepStart` is never a `prev` with a successor and it reports no
+/// rate.
+///
+/// Per the unweighted-mean cross-RUN policy
 /// of `crate::stats::aggregate_samples` for `Gauge(Avg)` —
 /// iteration_rate is registered as `Gauge(Avg)` with
 /// `HigherBetter` polarity (more throughput is better) via the
 /// `iteration_rate` registry entry alongside the other Avg-kind
 /// metrics.
 ///
-/// Live caller: `evaluate_vm_result` at `src/test_support/eval.rs`
+/// Live caller: `evaluate_vm_result` at `src/test_support/eval/mod.rs`
 /// — has both the SampleSeries and the stimulus_events vec in scope.
 pub fn build_phase_buckets_with_stimulus(
     samples: &crate::scenario::sample::SampleSeries,
@@ -2185,29 +2244,12 @@ pub fn build_phase_buckets_with_stimulus(
         samples.monitor().map(|m| m.samples()).unwrap_or(&[]);
     // Re-group periodic captures by the guest step whose stimulus
     // window contains each capture's workload-relative boundary offset,
-    // NOT the step_index stamped at (deferred) fire time. Under the
-    // dump-prerequisite gate the periodic boundaries can all fire in a
-    // burst once the accessor adopts, so every capture stamps the same
-    // late CURRENT_STEP and the naive grouping collapses to one phase;
-    // the scheduled offset is the timing-independent truth. Captures
-    // with no offset (on-demand / fixture) keep their stamped
-    // step_index via the fallback. step_starts is the step-start
-    // timeline in scenario-relative (guest monotonic) ms — the same
-    // frame as boundary_offset_ms.
-    let mut step_starts: Vec<(u64, u16)> = stimulus_events
-        .iter()
-        .filter_map(|e| e.step_index.map(|k| (e.elapsed_ms, k)))
-        .collect();
-    step_starts.sort_by_key(|(ms, _)| *ms);
-    let mut by_phase: std::collections::BTreeMap<u16, Vec<crate::scenario::sample::Sample<'_>>> =
-        std::collections::BTreeMap::new();
-    for sample in samples.iter_samples() {
-        let key = match sample.boundary_offset_ms {
-            Some(offset) => remap_offset_to_step(offset, &step_starts),
-            None => sample.step_index.unwrap_or(0),
-        };
-        by_phase.entry(key).or_default().push(sample);
-    }
+    // NOT the step_index stamped at (deferred) fire time — see
+    // [`crate::scenario::sample::SampleSeries::by_stimulus_phase`] for
+    // why the scheduled offset is the timing-independent truth (it
+    // survives the deferred-fire burst that collapses the stamped
+    // step_index to one phase).
+    let by_phase = samples.by_stimulus_phase(stimulus_events);
     // Bucket windows are workload-relative (boundary-offset) here, so the
     // monitor samples (run-relative) are shifted by the stimulus/monitor
     // clock skew before windowing.
@@ -2229,20 +2271,38 @@ pub fn build_phase_buckets_with_stimulus(
     for w in sorted_events.windows(2) {
         let prev = w[0];
         let curr = w[1];
-        let (Some(s), Some(e)) = (prev.total_iterations, curr.total_iterations) else {
+        // The terminal scenario-end event and per-step StepEnd events are
+        // right boundaries only — never the EARLIER member of a pair (the
+        // step a rate is attributed to). Both carry an end-of-hold count,
+        // not a step-start, so pairing them as `prev` would attribute the
+        // WRONG window to a bucket:
+        // - terminal sorts last so it is naturally only ever `curr`, but
+        //   guard explicitly so a future caller producing a non-last or
+        //   duplicate terminal can't fall into the `None` step_index
+        //   timestamp-window branch below and attach a bogus rate.
+        // - StepEnd[k] carries step_index k (same as StepStart[k]); if its
+        //   step's own StepStart[k] -> StepEnd[k] pair returned None (a
+        //   stalled step, e <= s — see StimulusEvent::rate_to), the bucket
+        //   k key is still empty, so without this guard the next pair
+        //   StepEnd[k] -> StepStart[k+1] would or_insert an inter-step
+        //   teardown-gap rate into bucket k, mislabeling gap throughput as
+        //   step k's. A stalled step must report no rate, not a leaked gap
+        //   rate. With the guard, bucket k is sourced ONLY by its
+        //   StepStart[k] -> StepEnd[k] pair.
+        if prev.is_terminal || prev.is_step_end {
+            continue;
+        }
+        // Shared formula with Timeline::build via StimulusEvent::rate_to
+        // (the sole iteration_rate site): None when the count did not
+        // advance, an event lacks total_iterations, or the window is
+        // zero-length.
+        let Some(rate) = prev.rate_to(curr) else {
             continue;
         };
-        if e <= s {
-            continue;
-        }
-        let duration_ms = curr.elapsed_ms.saturating_sub(prev.elapsed_ms);
-        if duration_ms == 0 {
-            continue;
-        }
-        let rate = (e - s) as f64 / (duration_ms as f64 / 1000.0);
-        // Attribute the rate to the step PREV starts: the pair
-        // (prev, curr) measures iterations accumulated from prev's
-        // step-start to curr's — the throughput DURING prev's step.
+        // Attribute the rate to the step PREV starts: the guards above
+        // leave `prev` as a StepStart (or a legacy/synthetic step event),
+        // so the pair (prev, curr) measures iterations accumulated from
+        // prev's step-start to curr's — the throughput DURING prev's step.
         // Match by prev.step_index, NOT a timestamp window: the bucket
         // windows here are workload-relative capture offsets (the step
         // INTERIOR, 10-90% of the workload per
@@ -2283,8 +2343,8 @@ pub fn build_phase_buckets_with_stimulus(
 
 /// Build per-phase metric buckets from a sample series.
 ///
-/// Walks [`crate::scenario::sample::SampleSeries::by_phase`] to
-/// group every stamped sample under its bridge-stamped
+/// Walks [`crate::scenario::sample::SampleSeries::by_stamped_phase`]
+/// to group every stamped sample under its bridge-stamped
 /// `step_index` (NOT re-derived from elapsed-ms windows; the
 /// bridge stamp is authoritative because the capture path knows
 /// the phase it fired from while the time window cannot recover
@@ -2309,7 +2369,7 @@ pub fn build_phase_buckets_with_stimulus(
 /// came back.
 ///
 /// Live production caller: `evaluate_vm_result` in
-/// `src/test_support/eval.rs` drains the snapshot bridge, builds
+/// `src/test_support/eval/mod.rs` drains the snapshot bridge, builds
 /// a `SampleSeries`, and routes it through this fn to populate
 /// `AssertResult.stats.phases`. Exposed `pub` (not `pub(crate)`)
 /// so out-of-tree consumers — payload authors writing custom
@@ -2323,14 +2383,147 @@ pub fn build_phase_buckets(samples: &crate::scenario::sample::SampleSeries) -> V
         samples.monitor().map(|m| m.samples()).unwrap_or(&[]);
     // Group by the bridge-stamped step_index. Without a stimulus
     // timeline to remap against, the stamped index is the only phase
-    // signal available — see `build_phase_buckets_with_stimulus` for
-    // the offset-remap that corrects a deferred-fire burst (every
-    // capture stamping the same late CURRENT_STEP). The bucket window
-    // and the monitor folding share the run-relative frame here, so
-    // the clock offset is `0`; synthetic / legacy fixture samples carry
-    // `boundary_offset_ms = None` and the window falls back to
-    // `elapsed_ms`.
-    buckets_from_grouped(samples.by_phase(), monitor_samples, 0)
+    // signal available — see `build_phase_buckets_with_stimulus` (and
+    // `SampleSeries::by_stimulus_phase`) for the offset-remap that
+    // corrects a deferred-fire burst (every capture stamping the same
+    // late CURRENT_STEP). The bucket window and the monitor folding
+    // share the run-relative frame here, so the clock offset is `0`;
+    // synthetic / legacy fixture samples carry `boundary_offset_ms =
+    // None` and the window falls back to `elapsed_ms`.
+    buckets_from_grouped(samples.by_stamped_phase(), monitor_samples, 0)
+}
+
+/// Per-phase CPU-time delta (ns) for one field family
+/// (`stime`/`signal_stime` or `utime`/`signal_utime`), folded host-side
+/// from the frozen `task_struct` enrichments captured at the phase's
+/// freeze boundaries. Backs the injected `system_time_ns` /
+/// `user_time_ns` per-phase metrics.
+///
+/// The unit is the THREAD GROUP, not the individual task: the kernel's
+/// `thread_group_cputime` is `signal_struct.{u,s}time` (the accumulator
+/// a dying thread's time is folded into at exit) plus the live threads'
+/// `task_struct.{u,s}time`. `signal_struct` is shared across a thread
+/// group, so its value is counted once per `tgid`; the live counters are
+/// summed across the group's threads. For each `tgid` the group total is
+/// taken at the FIRST and LAST sample in which the group had a READABLE
+/// total (ordered by capture time) and `last - first` is summed across
+/// groups.
+///
+/// Per-group first-seen/last-seen, NOT a per-sample cross-task SUM then a
+/// Counter `last - first`: the captured set changes between freezes
+/// (system tasks churn in and out). A task carrying a large cumulative
+/// counter that appears only in a LATER sample would dump its entire
+/// pre-phase history into a summed delta, inflating the phase value
+/// many-fold. Subtracting each group's OWN first-seen total cancels its
+/// pre-phase history, so a late-joining group contributes only what it
+/// accrued while observed — bounding the result by wall-clock × cores. A
+/// group's thread exiting mid-phase does not dip the total: its time
+/// moves from a `task_struct` counter into `signal_struct`, both of which
+/// the group total includes.
+///
+/// A `None` `signal_field` is a `signal_struct` translate miss, NOT a
+/// real zero (which reads `Some(0)`): such a sample is omitted for that
+/// group so every endpoint is a full live+signal total — mixing a
+/// live-only endpoint with a live+signal one would otherwise leak the
+/// cumulative accumulator as a phantom positive. A numeric `tgid` reused
+/// within the phase (process exit + PID realloc) can read lower at last
+/// than first; `saturating_sub` clamps that to 0 rather than wrapping.
+///
+/// Returns `None` when no group was observed with a readable total across
+/// at least two samples — no delta is measurable — keeping an absent
+/// per-phase bucket key distinct from a real `0` (a qualifying group
+/// whose counters did not advance yields `Some(0.0)`). Accumulates in
+/// `u128` to stay exact before the final `f64` (a phase can total many
+/// task-seconds of ns).
+fn phase_group_cpu_delta(
+    samples: &[crate::scenario::sample::Sample<'_>],
+    task_field: impl Fn(&crate::monitor::task_enrichment::TaskEnrichment) -> u64,
+    signal_field: impl Fn(&crate::monitor::task_enrichment::TaskEnrichment) -> Option<u64>,
+) -> Option<f64> {
+    // Per-tgid `thread_group_cputime` total at one sample: the shared
+    // signal_struct accumulator (once per group) plus the sum of the
+    // group's live threads' task_struct counter. A group is INCLUDED for
+    // a sample only when its signal accumulator was readable there (some
+    // thread of the tgid carried `Some`): a `None` is a signal_struct
+    // translate miss (see `task_enrichment.rs`), NOT a real zero — a real
+    // zero reads `Some(0)`. Omitting unreadable-signal groups keeps every
+    // endpoint a FULL group total (live + signal), so the first/last delta
+    // can never mix a live-only endpoint with a live+signal endpoint and
+    // leak the cumulative accumulator as a phantom positive.
+    let group_totals = |s: &crate::scenario::sample::Sample<'_>| {
+        let mut live: std::collections::HashMap<i32, u128> = std::collections::HashMap::new();
+        let mut signal: std::collections::HashMap<i32, Option<u128>> =
+            std::collections::HashMap::new();
+        for t in s.snapshot.task_enrichments() {
+            *live.entry(t.tgid).or_insert(0) += u128::from(task_field(t));
+            match signal_field(t) {
+                // Shared across the group — any readable thread fixes it.
+                Some(v) => {
+                    signal.insert(t.tgid, Some(u128::from(v)));
+                }
+                None => {
+                    signal.entry(t.tgid).or_insert(None);
+                }
+            }
+        }
+        live.into_iter()
+            .filter_map(|(tgid, l)| {
+                signal
+                    .get(&tgid)
+                    .copied()
+                    .flatten()
+                    .map(|sig| (tgid, l + sig))
+            })
+            .collect::<std::collections::HashMap<i32, u128>>()
+    };
+
+    // Order by capture time so first/last are the earliest/latest
+    // boundary — the grouped vec is not guaranteed sorted (the
+    // offset-remap in the stimulus path can reorder samples).
+    let mut ordered: Vec<&crate::scenario::sample::Sample<'_>> = samples.iter().collect();
+    // `elapsed_ms` is now Option: a sample with neither a
+    // boundary offset nor a measured elapsed has no time anchor — sort
+    // it LAST (u64::MAX), never first, so an untimestamped sample can't
+    // become the spurious earliest first_seen endpoint.
+    ordered.sort_by_key(|s| s.boundary_offset_ms.or(s.elapsed_ms).unwrap_or(u64::MAX));
+
+    // Per tgid: its full group total at the first and last sample in which
+    // it had a readable total, and how many such samples it had.
+    let mut first_seen: std::collections::HashMap<i32, u128> = std::collections::HashMap::new();
+    let mut last_seen: std::collections::HashMap<i32, u128> = std::collections::HashMap::new();
+    let mut readable_count: std::collections::HashMap<i32, u32> = std::collections::HashMap::new();
+    for s in ordered {
+        for (tgid, total) in group_totals(s) {
+            first_seen.entry(tgid).or_insert(total);
+            last_seen.insert(tgid, total);
+            *readable_count.entry(tgid).or_insert(0) += 1;
+        }
+    }
+
+    let mut sum: u128 = 0;
+    let mut measured = false;
+    for (tgid, last) in &last_seen {
+        // A delta needs the group observed with a readable total across
+        // TWO boundaries; one readable sample gives first == last and no
+        // measurable in-phase growth (and a tgid that appears in only one
+        // sample, or whose signal_struct never translated, never reaches
+        // 2). saturating_sub clamps a last < first read — a numeric tgid
+        // reused within the phase (process exit + PID realloc to a fresh
+        // group starting near zero) reads lower at last; clamp to 0 rather
+        // than wrap.
+        if readable_count.get(tgid).copied().unwrap_or(0) < 2 {
+            continue;
+        }
+        measured = true;
+        // first_seen always holds tgid (populated in the same pass).
+        let first = first_seen.get(tgid).copied().unwrap_or(*last);
+        sum += last.saturating_sub(first);
+    }
+    // None when no group was observed with a readable total across two
+    // samples — unmeasurable, so the bucket key stays ABSENT (distinct
+    // from a real 0: a qualifying group whose counters did not advance
+    // yields Some(0.0)).
+    measured.then_some(sum as f64)
 }
 
 /// Assemble [`PhaseBucket`]s from a pre-grouped phase map. Shared by
@@ -2379,17 +2572,23 @@ fn buckets_from_grouped(
         // / on-demand). min/max rather than first/last because the
         // offset-remap in the stimulus path can reorder samples
         // relative to drain order.
-        let win =
-            |s: &crate::scenario::sample::Sample<'_>| s.boundary_offset_ms.unwrap_or(s.elapsed_ms);
+        let win = |s: &crate::scenario::sample::Sample<'_>| s.boundary_offset_ms.or(s.elapsed_ms);
         let (start_ms, end_ms) = if samples_in_phase.is_empty() {
             (0, u64::MAX)
         } else {
             let mut lo = u64::MAX;
             let mut hi = 0u64;
             for s in &samples_in_phase {
-                let w = win(s);
-                lo = lo.min(w);
-                hi = hi.max(w);
+                // Skip a sample with no time anchor (no boundary offset
+                // AND no measured elapsed): coercing it to 0
+                // would pull start_ms to 0 and over-fold monitor samples.
+                // If EVERY sample in the phase is unanchored, lo/hi stay
+                // (u64::MAX, 0) — an inverted window that folds nothing,
+                // the correct "no placeable samples" outcome.
+                if let Some(w) = win(s) {
+                    lo = lo.min(w);
+                    hi = hi.max(w);
+                }
             }
             (lo, hi)
         };
@@ -2414,6 +2613,19 @@ fn buckets_from_grouped(
             {
                 metrics.insert(metric_def.name.to_string(), reduced);
             }
+        }
+        // Per-phase system / user CPU time (ns), injected post-hoc as a
+        // per-thread-GROUP delta over the phase's freeze samples (NOT a
+        // read_sample metric — a per-sample cross-task sum then a Counter
+        // delta inflates when the captured task set churns; see
+        // `phase_group_cpu_delta`). Observer-free: reads the frozen
+        // task_struct.{s,u}time + thread-group signal_struct accumulator
+        // already captured in each sample's enrichments.
+        if let Some(v) = phase_group_cpu_delta(&samples_in_phase, |t| t.stime, |t| t.signal_stime) {
+            metrics.entry("system_time_ns".to_string()).or_insert(v);
+        }
+        if let Some(v) = phase_group_cpu_delta(&samples_in_phase, |t| t.utime, |t| t.signal_utime) {
+            metrics.entry("user_time_ns".to_string()).or_insert(v);
         }
         // Per-phase MonitorSample windowing (wire-up for metrics
         // that need per-CPU full-class rq.nr_running). The monitor
@@ -2474,29 +2686,6 @@ fn buckets_from_grouped(
         });
     }
     out
-}
-
-/// Map a capture's workload-relative boundary offset (ms since scenario
-/// start) to the guest step active at that instant: the `step_index` of
-/// the latest stimulus step-start at or before the offset, or `0`
-/// (BASELINE) when the offset precedes the first step-start.
-/// `step_starts` must be sorted ascending by elapsed_ms.
-///
-/// This is the timing-independent attribution at the heart of the
-/// deferred-fire fix: the scheduled boundary offset is computed from the
-/// boundary schedule (not the fire time), so it survives a burst of
-/// captures that all fire — and would all stamp the same late
-/// CURRENT_STEP — after the dump-prerequisite gate clears.
-fn remap_offset_to_step(offset_ms: u64, step_starts: &[(u64, u16)]) -> u16 {
-    let mut step = 0u16;
-    for (start_ms, k) in step_starts {
-        if *start_ms <= offset_ms {
-            step = *k;
-        } else {
-            break;
-        }
-    }
-    step
 }
 
 /// Clock skew (ms) between the host monitor's run-relative timeline and
@@ -3024,6 +3213,25 @@ impl AssertResult {
             }
         }
 
+        /// None-aware lowest fold: `Some(x)` is a real measurement
+        /// (including `Some(0.0)` — a cgroup that ran zero
+        /// iterations, the worst possible throughput), `None` is "no
+        /// data" (cgroup had no workers) and contributes nothing.
+        /// `*self_field` becomes `other` when `other` is `Some` and
+        /// either `*self_field` is `None` (nothing folded yet) or
+        /// `other`'s value is strictly smaller. Unlike
+        /// `fold_lowest_nonzero`, a measured `0.0` is NOT treated as
+        /// a sentinel — it wins the "lowest" bucket so a starved
+        /// cgroup surfaces as the worst reading instead of being
+        /// discarded.
+        fn fold_lowest_some(self_field: &mut Option<f64>, other: Option<f64>) {
+            if let Some(o) = other
+                && self_field.is_none_or(|s| o < s)
+            {
+                *self_field = Some(o);
+            }
+        }
+
         self.outcomes.extend(other.outcomes);
         self.passes.extend(other.passes);
         self.info_notes.extend(other.info_notes);
@@ -3050,15 +3258,15 @@ impl AssertResult {
         s.worst_wake_latency_tail_ratio = s
             .worst_wake_latency_tail_ratio
             .max(o.worst_wake_latency_tail_ratio);
-        // Per-worker throughput is lower-is-worse: take the
-        // lowest non-zero reading across cgroups so a cgroup
-        // falling behind wins the "worst" bucket. 0.0 is the
-        // unreported sentinel — the accumulator pattern
-        // `AssertResult::pass().merge(real)` starts at 0.0 from
-        // `Default`, so a plain min would let that sentinel
-        // destroy real measurements. See `fold_lowest_nonzero`
-        // above for the policy.
-        fold_lowest_nonzero(
+        // Per-worker throughput is lower-is-worse: take the lowest
+        // reading across cgroups so a cgroup falling behind wins the
+        // "worst" bucket. None-aware (`fold_lowest_some`): a cgroup
+        // that ran zero iterations contributes `Some(0.0)` and wins
+        // the bucket (real starvation), while a cgroup with no
+        // workers contributes `None` and is skipped. The accumulator
+        // `AssertResult::pass().merge(real)` starts at `None` from
+        // `Default`. See `fold_lowest_some` above for the policy.
+        fold_lowest_some(
             &mut s.worst_iterations_per_worker,
             o.worst_iterations_per_worker,
         );
@@ -3498,59 +3706,95 @@ impl AssertPlan {
         cpuset: Option<&BTreeSet<usize>>,
         numa_nodes: Option<&BTreeSet<usize>>,
     ) -> AssertResult {
-        let mut r = AssertResult::pass();
-        if self.not_starved {
-            let mut cgroup_result = assert_not_starved(reports);
-            // Apply custom spread threshold if set.
-            if let Some(spread_limit) = self.max_spread_pct {
-                // Re-check spread against custom threshold. The default
-                // assert_not_starved uses spread_threshold_pct(); clear
-                // those failures and re-evaluate.
-                // Strip the default-threshold Unfair Fail outcomes
-                // before re-evaluating against the caller's limit.
-                cgroup_result
-                    .outcomes
-                    .retain(|o| !matches!(o, Outcome::Fail(d) if d.kind == DetailKind::Unfair));
-                if let Some(cg) = cgroup_result.stats.cgroups.first()
-                    && cg.spread > spread_limit
-                    && cg.num_workers >= 2
-                {
-                    cgroup_result.record_fail(AssertDetail::new(
-                        DetailKind::Unfair,
-                        format!(
-                            "unfair cgroup: spread={:.0}% ({:.0}-{:.0}%) {} workers on {} cpus (threshold {:.0}%)",
-                            cg.spread, cg.min_off_cpu_pct, cg.max_off_cpu_pct,
-                            cg.num_workers, cg.num_cpus, spread_limit
-                        ),
-                    ));
-                }
-                // Else: no new Unfair failure; remaining Starved/Stuck
-                // Fail outcomes (if any) already encode the verdict
-                // via `outcomes`. No re-derive needed — outcomes are
-                // the single source of truth, so there is no `passed`
-                // flag to keep in sync with `details`.
-            }
-            // Apply custom gap threshold if set.
-            if let Some(threshold) = self.max_gap_ms {
-                // Re-check gaps against custom threshold. Strip the
-                // default-threshold Stuck Fail outcomes before
-                // re-evaluating against the caller's limit.
-                cgroup_result
-                    .outcomes
-                    .retain(|o| !matches!(o, Outcome::Fail(d) if d.kind == DetailKind::Stuck));
-                for w in reports {
-                    if w.max_gap_ms > threshold {
-                        cgroup_result.record_fail(AssertDetail::new(
-                            DetailKind::Stuck,
-                            format!(
-                                "tid {} stuck {}ms on cpu{} at +{}ms (threshold {}ms)",
-                                w.tid, w.max_gap_ms, w.max_gap_cpu, w.max_gap_at_ms, threshold,
-                            ),
-                        ));
+        // Per-cgroup TELEMETRY is built unconditionally — it is pure
+        // measurement and must not be gated behind whether any worker
+        // check is configured (see [`cgroup_stats`]). The opt-in checks
+        // below only append fail/inconclusive outcomes onto `r`.
+        let mut cg = cgroup_stats(reports);
+        // NUMA page-locality telemetry: the expected-node set lives in
+        // `numa_nodes` (cgroup_stats has no NUMA context), so compute
+        // locality here whenever it is supplied — independent of whether
+        // the min_page_locality CHECK is set — and store it on the
+        // telemetry. The (locality, total, local) triple is reused by that
+        // check below so the value is computed once.
+        let page_locality = numa_nodes.map(|nodes| {
+            let mut total: u64 = 0;
+            let mut local: u64 = 0;
+            for w in reports {
+                for (&node, &count) in &w.numa_pages {
+                    total += count;
+                    if nodes.contains(&node) {
+                        local += count;
                     }
                 }
             }
-            r.merge(cgroup_result);
+            let locality = if total > 0 {
+                local as f64 / total as f64
+            } else {
+                0.0
+            };
+            (locality, total, local)
+        });
+        if let Some((locality, _, _)) = page_locality {
+            cg.page_locality = locality;
+        }
+        let mut r = AssertResult::pass();
+        r.stats = scenario_stats_for_cgroup(&cg);
+
+        // `not_starved`: default-threshold fairness (Starved / Unfair /
+        // Stuck) on top of the telemetry already built above.
+        if self.not_starved {
+            record_default_fairness(&mut r, &cg, reports);
+        }
+        // Custom spread threshold — independent of `not_starved` (it gates
+        // on its own field). Strip any default-threshold Unfair outcome
+        // (present only when `not_starved` also ran) before re-evaluating
+        // against the caller's limit.
+        if let Some(spread_limit) = self.max_spread_pct {
+            r.outcomes
+                .retain(|o| !matches!(o, Outcome::Fail(d) if d.kind == DetailKind::Unfair));
+            // `num_workers >= 2` matches the pre-decouple custom-spread
+            // path. It is equivalent to the default path's
+            // `measurable >= 2` gate here: a non-zero `spread` requires at
+            // least two workers with measurable wall time (fewer collapses
+            // min==max -> spread==0), so the `spread > limit` guard already
+            // implies >= 2 measurable.
+            // `spread` is None when off-CPU% was not measured (no
+            // worker with positive wall time) — inconclusive, never
+            // flagged unfair. A measured `Some(spread)` over the
+            // limit on >= 2 workers is the real violation.
+            if let Some(spread) = cg.spread
+                && spread > spread_limit
+                && cg.num_workers >= 2
+            {
+                r.record_fail(AssertDetail::new(
+                    DetailKind::Unfair,
+                    format!(
+                        "unfair cgroup: spread={:.0}% ({:.0}-{:.0}%) {} workers on {} cpus (threshold {:.0}%)",
+                        spread,
+                        cg.min_off_cpu_pct.unwrap_or(0.0),
+                        cg.max_off_cpu_pct.unwrap_or(0.0),
+                        cg.num_workers, cg.num_cpus, spread_limit
+                    ),
+                ));
+            }
+        }
+        // Custom gap threshold — independent of `not_starved`. Strip any
+        // default-threshold Stuck outcome before re-evaluating.
+        if let Some(threshold) = self.max_gap_ms {
+            r.outcomes
+                .retain(|o| !matches!(o, Outcome::Fail(d) if d.kind == DetailKind::Stuck));
+            for w in reports {
+                if w.max_gap_ms > threshold {
+                    r.record_fail(AssertDetail::new(
+                        DetailKind::Stuck,
+                        format!(
+                            "tid {} stuck {}ms on cpu{} at +{}ms (threshold {}ms)",
+                            w.tid, w.max_gap_ms, w.max_gap_cpu, w.max_gap_at_ms, threshold,
+                        ),
+                    ));
+                }
+            }
         }
         if self.isolation
             && let Some(cs) = cpuset
@@ -3603,45 +3847,25 @@ impl AssertPlan {
             }
         }
         if let Some(min_locality) = self.min_page_locality
-            && let Some(nodes) = numa_nodes
+            && let Some((locality, total, local)) = page_locality
         {
-            // Aggregate NUMA pages across the cgroup so the locality
-            // check evaluates the cgroup as a whole rather than
-            // skipping workers with empty numa_pages or summing
-            // misleading per-worker fractions. Skipping zero-page
-            // workers lets a cgroup with no NUMA signal silently
-            // pass `min_page_locality`.
-            let mut total: u64 = 0;
-            let mut local: u64 = 0;
-            for w in reports {
-                for (&node, &count) in &w.numa_pages {
-                    total += count;
-                    if nodes.contains(&node) {
-                        local += count;
-                    }
-                }
-            }
-            // POLICY-derived denominator: the page-locality gate is
-            // only reachable when the caller already supplied a
-            // `numa_nodes` set — i.e. the test set a NUMA policy
-            // (typically `MemPolicy::Bind`) declaring that the
-            // workload WILL allocate pages on the expected nodes.
-            // Zero observed pages is therefore a policy violation,
-            // not an instrumentation gap, and stays as Fail (via the
-            // `0.0` coercion that the threshold then fails) per the
-            // [`Outcome`] doc's INSTRUMENT-vs-POLICY carve-out. The
-            // Inconclusive primitive does NOT apply here — see the
-            // sibling `max_migration_ratio` / `max_slow_tier_ratio`
-            // / `assert_cross_node_migration` arms for the
-            // INSTRUMENT-derived counterparts.
-            let locality = if total > 0 {
-                local as f64 / total as f64
-            } else {
-                // Zero observed pages across the cgroup is treated
-                // as zero locality so the threshold surfaces a
-                // workload that produced no NUMA allocations.
-                0.0
-            };
+            // Reuse the page-locality telemetry computed in the head (the
+            // cgroup-wide local/total aggregate, evaluating the cgroup as a
+            // whole rather than skipping zero-page workers or summing
+            // misleading per-worker fractions).
+            //
+            // POLICY-derived denominator: this gate is only reachable when
+            // the caller supplied a `numa_nodes` set — i.e. the test set a
+            // NUMA policy (typically `MemPolicy::Bind`) declaring that the
+            // workload WILL allocate pages on the expected nodes. Zero
+            // observed pages is therefore a policy violation, not an
+            // instrumentation gap, and stays Fail (the `0.0` locality the
+            // head computed then fails the threshold) per the [`Outcome`]
+            // doc's INSTRUMENT-vs-POLICY carve-out. The Inconclusive
+            // primitive does NOT apply here — see the sibling
+            // `max_migration_ratio` / `max_slow_tier_ratio` /
+            // `assert_cross_node_migration` arms for the INSTRUMENT-derived
+            // counterparts.
             r.merge(assert_page_locality(
                 locality,
                 Some(min_locality),
@@ -3850,6 +4074,11 @@ impl AssertPlan {
 
     fn max_gap_ms(mut self, ms: u64) -> Self {
         self.max_gap_ms = Some(ms);
+        self
+    }
+
+    fn max_spread_pct(mut self, pct: f64) -> Self {
+        self.max_spread_pct = Some(pct);
         self
     }
 }
@@ -4329,7 +4558,12 @@ impl Assert {
         self
     }
 
-    /// True when any worker-level check field is `Some`.
+    /// True when any worker-level check field is `Some`. A pure query on
+    /// the configured checks — it no longer gates per-cgroup telemetry
+    /// (telemetry is built unconditionally per handle in
+    /// [`crate::scenario`]'s collect path; worker-check assertions are the
+    /// only opt-in part). Retained as public API for callers composing an
+    /// `Assert` who need to know whether any worker check is set.
     pub const fn has_worker_checks(&self) -> bool {
         self.not_starved.is_some()
             || self.isolation.is_some()
@@ -4832,32 +5066,6 @@ pub fn assert_isolation(reports: &[WorkerReport], expected: &BTreeSet<usize>) ->
     r
 }
 
-/// Check one cgroup's workers. Returns per-cgroup stats.
-///
-/// ```
-/// # use ktstr::assert::assert_not_starved;
-/// # use ktstr::workload::WorkerReport;
-/// # let report = WorkerReport {
-/// #     tid: 1, cpus_used: [0].into_iter().collect(),
-/// #     work_units: 100, cpu_time_ns: 1_000_000, wall_time_ns: 5_000_000_000,
-/// #     off_cpu_ns: 500_000_000, migration_count: 0, migrations: vec![],
-/// #     max_gap_ms: 50, max_gap_cpu: 0, max_gap_at_ms: 1000,
-/// #     wake_latencies_ns: vec![], wake_sample_total: 0,
-/// #     iteration_costs_ns: vec![], iteration_cost_sample_total: 0,
-/// #     iterations: 0,
-/// #     schedstat_run_delay_ns: 0, schedstat_run_count: 0,
-/// #     schedstat_cpu_time_ns: 0,
-/// #     completed: true,
-/// #     numa_pages: std::collections::BTreeMap::new(),
-/// #     vmstat_numa_pages_migrated: 0,
-/// #     exit_info: None,
-/// #     is_messenger: false,
-/// #     ..Default::default()
-/// # };
-/// let r = assert_not_starved(&[report]);
-/// assert!(r.is_pass());
-/// assert_eq!(r.stats.total_workers, 1);
-/// ```
 /// Nearest-rank percentile of a sorted slice (`p` in `[0.0, 1.0]`).
 ///
 /// Returns the value at index `ceil(n * p) - 1`, clamped into
@@ -4894,38 +5102,41 @@ fn percentile(sorted: &[u64], p: f64) -> u64 {
     sorted[idx]
 }
 
-pub fn assert_not_starved(reports: &[WorkerReport]) -> AssertResult {
-    let mut r = AssertResult::pass();
-    if reports.is_empty() {
-        return r;
-    }
-
+/// Build per-cgroup telemetry (pure measurement, no assertions) from
+/// worker reports. This is the SINGLE telemetry builder on the assertion
+/// path: `AssertPlan::assert_cgroup` calls it unconditionally and
+/// [`assert_not_starved`] wraps it with the default fairness checks, so
+/// per-cgroup [`CgroupStats`] is never gated behind whether a worker-check
+/// assertion was configured. Empty `reports` yield a `num_workers == 0`
+/// `CgroupStats` (the reduces below collapse to 0.0/0), so a declared
+/// cgroup that collected no reports surfaces as a zero-worker entry rather
+/// than silently vanishing from [`ScenarioStats::cgroups`].
+pub fn cgroup_stats(reports: &[WorkerReport]) -> CgroupStats {
     let cpus: BTreeSet<usize> = reports
         .iter()
         .flat_map(|w| w.cpus_used.iter().copied())
         .collect();
-    let mut pcts: Vec<f64> = Vec::new();
+    let pcts: Vec<f64> = reports
+        .iter()
+        .filter(|w| w.wall_time_ns > 0)
+        .map(|w| w.off_cpu_ns as f64 / w.wall_time_ns as f64 * 100.0)
+        .collect();
 
-    for w in reports {
-        if w.work_units == 0 {
-            r.record_fail(AssertDetail::new(
-                DetailKind::Starved,
-                format!("tid {} starved (0 work units)", w.tid),
-            ));
-        }
-        if w.wall_time_ns > 0 {
-            pcts.push(w.off_cpu_ns as f64 / w.wall_time_ns as f64 * 100.0);
-        }
-    }
-
-    let min = pcts.iter().cloned().reduce(f64::min).unwrap_or(0.0);
-    let max = pcts.iter().cloned().reduce(f64::max).unwrap_or(0.0);
+    // None when no worker had measurable wall time (pcts empty):
+    // off-CPU% is undefined, and a not-measured cgroup must not read
+    // as a measured 0% / spread-0 (perfectly fair) one. Some(_)
+    // otherwise, including a real measured zero.
+    let min = pcts.iter().cloned().reduce(f64::min);
+    let max = pcts.iter().cloned().reduce(f64::max);
     let avg = if pcts.is_empty() {
-        0.0
+        None
     } else {
-        pcts.iter().sum::<f64>() / pcts.len() as f64
+        Some(pcts.iter().sum::<f64>() / pcts.len() as f64)
     };
-    let spread = max - min;
+    let spread = match (min, max) {
+        (Some(lo), Some(hi)) => Some(hi - lo),
+        _ => None,
+    };
 
     let worst_gap = reports.iter().max_by_key(|w| w.max_gap_ms);
     let (gap_ms, gap_cpu) = worst_gap
@@ -4987,7 +5198,31 @@ pub fn assert_not_starved(reports: &[WorkerReport]) -> AssertResult {
         0.0
     };
 
-    let cg = CgroupStats {
+    // Cross-node page-migration ratio: pages migrated cross-node over the
+    // cgroup's total allocated pages. `vmstat_numa_pages_migrated` is a
+    // system-wide delta each worker captured over its own loop; concurrent
+    // workers observe overlapping deltas, so take the MAX across the cgroup
+    // (summing would inflate by the worker count) over the cgroup-wide
+    // total of allocated pages. Pure measurement — populated whenever NUMA
+    // pages were seen, 0.0 otherwise. (The `max_cross_node_migration_ratio`
+    // CHECK in `AssertPlan::assert_cgroup` recomputes the same raw counts
+    // for its diagnostic; this is the always-on telemetry.)
+    let total_numa_pages: u64 = reports
+        .iter()
+        .map(|w| w.numa_pages.values().sum::<u64>())
+        .sum();
+    let migrated_pages: u64 = reports
+        .iter()
+        .map(|w| w.vmstat_numa_pages_migrated)
+        .max()
+        .unwrap_or(0);
+    let cross_node_ratio = if total_numa_pages > 0 {
+        migrated_pages as f64 / total_numa_pages as f64
+    } else {
+        0.0
+    };
+
+    CgroupStats {
         num_workers: reports.len(),
         num_cpus: cpus.len(),
         avg_off_cpu_pct: avg,
@@ -5004,36 +5239,96 @@ pub fn assert_not_starved(reports: &[WorkerReport]) -> AssertResult {
         total_iterations: total_iters,
         mean_run_delay_us: mean_run_delay,
         worst_run_delay_us: worst_run_delay,
+        // page_locality requires the expected NUMA node set (the cpuset's
+        // nodes), which this reports-only builder does not have. It is
+        // populated by `AssertPlan::assert_cgroup` when `numa_nodes` is
+        // supplied; left 0.0 here (no NUMA context).
         page_locality: 0.0,
-        cross_node_migration_ratio: 0.0,
+        cross_node_migration_ratio: cross_node_ratio,
         ext_metrics: BTreeMap::new(),
-    };
+    }
+}
 
-    // Per-cgroup fairness: spread above threshold means unequal scheduling within a cgroup.
-    // Threshold is appended to the message so the detail carries the exact bound the
-    // observed spread crossed, matching the AssertPlan custom-spread path's format
-    // and giving the operator the gate value without re-grepping `show-thresholds`.
+/// Roll a single cgroup's [`CgroupStats`] up into a one-cgroup
+/// [`ScenarioStats`]. The `worst_*` fields carry this cgroup's values;
+/// [`AssertResult::merge`] folds them across cgroups (max for the
+/// higher-is-worse fields, lowest-non-zero for the 0.0-sentinel fields).
+/// `cgroups` carries exactly this one entry so merge appends one per
+/// handle without double-counting.
+fn scenario_stats_for_cgroup(cg: &CgroupStats) -> ScenarioStats {
+    ScenarioStats {
+        total_workers: cg.num_workers,
+        total_cpus: cg.num_cpus,
+        total_migrations: cg.total_migrations,
+        // worst_spread is higher-is-worse (merge takes max). A
+        // not-measured cgroup (`spread == None`) maps to 0.0 — the
+        // neutral element for max, and the gauntlet layer's
+        // documented no-data convention. A measured zero stays 0.0.
+        worst_spread: cg.spread.unwrap_or(0.0),
+        worst_gap_ms: cg.max_gap_ms,
+        worst_gap_cpu: cg.max_gap_cpu,
+        worst_migration_ratio: cg.migration_ratio,
+        worst_p99_wake_latency_us: cg.p99_wake_latency_us,
+        worst_median_wake_latency_us: cg.median_wake_latency_us,
+        worst_wake_latency_cv: cg.wake_latency_cv,
+        total_iterations: cg.total_iterations,
+        worst_mean_run_delay_us: cg.mean_run_delay_us,
+        worst_run_delay_us: cg.worst_run_delay_us,
+        worst_page_locality: cg.page_locality,
+        worst_cross_node_migration_ratio: cg.cross_node_migration_ratio,
+        worst_wake_latency_tail_ratio: cg.wake_latency_tail_ratio(),
+        // `iterations_per_worker()` is `None` when this cgroup had no
+        // workers and `Some(v)` (including `Some(0.0)` for a ran-zero
+        // cgroup) otherwise. The None-aware merge fold
+        // (`fold_lowest_some`) lets a measured zero win the "worst"
+        // bucket while skipping no-data cgroups, so the distinction is
+        // carried through as `Option` rather than collapsed to a 0.0
+        // sentinel.
+        worst_iterations_per_worker: cg.iterations_per_worker(),
+        ext_metrics: cg.ext_metrics.clone(),
+        cgroups: vec![cg.clone()],
+        phases: Vec::new(),
+    }
+}
+
+/// Record the DEFAULT fairness outcomes (Starved / Unfair / Stuck) for one
+/// cgroup against the framework default thresholds
+/// ([`spread_threshold_pct`] / [`gap_threshold_ms`]). Telemetry is built
+/// separately by [`cgroup_stats`]; this only appends fail outcomes, so it
+/// is shared by [`assert_not_starved`] and the `not_starved` arm of
+/// [`AssertPlan::assert_cgroup`] without rebuilding stats.
+fn record_default_fairness(r: &mut AssertResult, cg: &CgroupStats, reports: &[WorkerReport]) {
+    for w in reports {
+        if w.work_units == 0 {
+            r.record_fail(AssertDetail::new(
+                DetailKind::Starved,
+                format!("tid {} starved (0 work units)", w.tid),
+            ));
+        }
+    }
+    // Off-cpu spread above the default threshold, gated on >=2 workers
+    // with measurable wall time (the historical `pcts.len() >= 2`).
+    // `cg.spread` is None when off-CPU% was not measured — inconclusive,
+    // never flagged unfair.
+    let measurable = reports.iter().filter(|w| w.wall_time_ns > 0).count();
     let spread_limit = spread_threshold_pct();
-    if spread > spread_limit && pcts.len() >= 2 {
+    if let Some(spread) = cg.spread
+        && spread > spread_limit
+        && measurable >= 2
+    {
         r.record_fail(AssertDetail::new(
             DetailKind::Unfair,
             format!(
                 "unfair cgroup: spread={:.0}% ({:.0}-{:.0}%) {} workers on {} cpus (threshold {:.0}%)",
                 spread,
-                min,
-                max,
-                reports.len(),
-                cpus.len(),
+                cg.min_off_cpu_pct.unwrap_or(0.0),
+                cg.max_off_cpu_pct.unwrap_or(0.0),
+                cg.num_workers,
+                cg.num_cpus,
                 spread_limit,
             ),
         ));
     }
-
-    // Scheduling gap: >threshold = dispatch failure. The tid is included so an
-    // operator triaging a multi-worker cgroup can identify the affected worker
-    // without cross-referencing CPU placement; matches the `tid X starved` /
-    // `tid X ran on unexpected CPUs` shape used by the sibling diagnostics.
-    // Threshold is appended for parity with the AssertPlan custom-gap path.
     let gap_limit = gap_threshold_ms();
     for w in reports {
         if w.max_gap_ms > gap_limit {
@@ -5046,38 +5341,19 @@ pub fn assert_not_starved(reports: &[WorkerReport]) -> AssertResult {
             ));
         }
     }
+}
 
-    // Store this cgroup's stats - merge accumulates cgroups
-    r.stats = ScenarioStats {
-        total_workers: reports.len(),
-        total_cpus: cpus.len(),
-        total_migrations: reports.iter().map(|w| w.migration_count).sum(),
-        worst_spread: spread,
-        worst_gap_ms: gap_ms,
-        worst_gap_cpu: gap_cpu,
-        worst_migration_ratio: cg.migration_ratio,
-        worst_p99_wake_latency_us: cg.p99_wake_latency_us,
-        worst_median_wake_latency_us: cg.median_wake_latency_us,
-        worst_wake_latency_cv: cg.wake_latency_cv,
-        total_iterations: cg.total_iterations,
-        worst_mean_run_delay_us: cg.mean_run_delay_us,
-        worst_run_delay_us: cg.worst_run_delay_us,
-        worst_page_locality: 0.0,
-        worst_cross_node_migration_ratio: 0.0,
-        worst_wake_latency_tail_ratio: cg.wake_latency_tail_ratio(),
-        // `iterations_per_worker()` returns the per-worker
-        // throughput for this cgroup. The merge fold treats 0.0
-        // as the unreported sentinel — the accumulator pattern
-        // `AssertResult::pass().merge(real)` starts at 0.0 from
-        // `Default`, so any positive reading from a real
-        // measurement must override the sentinel rather than be
-        // masked by a plain min.
-        worst_iterations_per_worker: cg.iterations_per_worker(),
-        ext_metrics: cg.ext_metrics.clone(),
-        cgroups: vec![cg],
-        phases: Vec::new(),
-    };
-
+/// Default fairness check for one cgroup's worker reports: builds the
+/// per-cgroup telemetry ([`cgroup_stats`]) and records Starved / Unfair /
+/// Stuck against the framework default thresholds. Telemetry is ALWAYS
+/// populated — including a `num_workers == 0` entry for empty reports — so
+/// `r.stats.cgroups` is never empty for a declared cgroup, independent of
+/// whether any fail outcome fired.
+pub fn assert_not_starved(reports: &[WorkerReport]) -> AssertResult {
+    let cg = cgroup_stats(reports);
+    let mut r = AssertResult::pass();
+    record_default_fairness(&mut r, &cg, reports);
+    r.stats = scenario_stats_for_cgroup(&cg);
     r
 }
 
@@ -5436,32 +5712,32 @@ pub fn assert_scx_events_clean(events: &[(&str, i64)], max_count: Option<i64>) -
     r
 }
 
-/// Threshold-preset bundle for [`assert_baseline`]. Captures the
+/// Threshold-preset bundle for [`assert_thresholds`]. Captures the
 /// guarantees a scheduler-under-test should meet on a healthy run:
 /// wake latency stays within bound, per-iteration compute cost stays
 /// within bound, CPU migrations stay within bound, and every worker
 /// makes some forward progress.
 ///
 /// Each `Option` field is independent — `None` skips that check. A
-/// `SchedulerBaseline` with every field `None` is a no-op (the
+/// `AbsoluteThresholds` with every field `None` is a no-op (the
 /// returned [`AssertResult`] always passes), useful as a starting
 /// point for builder-style composition. Construct the all-`None`
-/// baseline via `SchedulerBaseline::default()` and chain the
-/// `max_*` / `min_*` setters (e.g. `SchedulerBaseline::default().max_migrations(5)`)
-/// or spread into a struct literal (`SchedulerBaseline { max_migrations: Some(5), ..Default::default() }`).
+/// thresholds via `AbsoluteThresholds::default()` and chain the
+/// `max_*` / `min_*` setters (e.g. `AbsoluteThresholds::default().max_migrations(5)`)
+/// or spread into a struct literal (`AbsoluteThresholds { max_migrations: Some(5), ..Default::default() }`).
 /// Use [`Self::strict`] for the "every check enabled with sane defaults" preset.
 ///
 /// Distinct from [`Assert`]: `Assert` is the merge-tree threshold
-/// config consumed by the worker-side `AssertPlan`; `SchedulerBaseline`
+/// config consumed by the worker-side `AssertPlan`; `AbsoluteThresholds`
 /// is a flat preset designed for direct invocation in test bodies
 /// where the test author wants a one-call multi-field check without
 /// engaging the merge chain. The two surfaces compose — a test can
-/// run `assert_baseline` against a worker-report slice AND merge the
+/// run `assert_thresholds` against a worker-report slice AND merge the
 /// `Assert`-derived result into the same accumulator via
 /// [`AssertResult::merge`].
-#[must_use = "SchedulerBaseline only takes effect when passed to assert_baseline"]
+#[must_use = "AbsoluteThresholds only takes effect when passed to assert_thresholds"]
 #[derive(Debug, Clone, Copy, Default)]
-pub struct SchedulerBaseline {
+pub struct AbsoluteThresholds {
     /// Maximum acceptable p99 wake latency (nanoseconds). Compared
     /// against the pooled p99 across every worker's
     /// [`WorkerReport::wake_latencies_ns`]. `None` skips the check.
@@ -5493,12 +5769,13 @@ pub struct SchedulerBaseline {
     pub min_work_units: Option<u64>,
 }
 
-impl SchedulerBaseline {
+impl AbsoluteThresholds {
     /// Sane-default preset: p99 wake latency under 10ms, p99
     /// iteration cost under 1ms, total migrations under 1000, every
     /// worker completes ≥1 work unit. The defaults are deliberately
-    /// loose — a baseline tight enough to catch egregious regressions
-    /// without flagging every routine scheduler perturbation. Tests
+    /// loose — a threshold set tight enough to catch egregious
+    /// regressions without flagging every routine scheduler
+    /// perturbation. Tests
     /// that need tighter bounds should set the fields explicitly via
     /// the bare-verb builder methods rather than tuning these constants.
     pub const fn strict() -> Self {
@@ -5535,13 +5812,13 @@ impl SchedulerBaseline {
     }
 }
 
-/// Run every check in `baseline` against `reports`, merging results
-/// into a single [`AssertResult`]. A `None` field on the baseline
+/// Run every check in `thresholds` against `reports`, merging results
+/// into a single [`AssertResult`]. A `None` field on the thresholds
 /// skips that check.
 ///
 /// An empty `reports` slice short-circuits to a skip (`"no worker
-/// reports to evaluate"`) regardless of baseline content — silently
-/// passing a baseline against zero samples would let thresholds look
+/// reports to evaluate"`) regardless of thresholds content — silently
+/// passing thresholds against zero samples would let them look
 /// "green" on a run that produced no measurement.
 ///
 /// Field-to-check mapping:
@@ -5560,7 +5837,7 @@ impl SchedulerBaseline {
 /// pooled `iteration_costs_ns` reservoir.
 ///
 /// ```
-/// # use ktstr::assert::{SchedulerBaseline, assert_baseline};
+/// # use ktstr::assert::{AbsoluteThresholds, assert_thresholds};
 /// # use ktstr::workload::WorkerReport;
 /// # let report = WorkerReport {
 /// #     tid: 1, cpus_used: [0].into_iter().collect(),
@@ -5583,17 +5860,20 @@ impl SchedulerBaseline {
 /// #     group_idx: 0,
 /// # };
 /// // Strict preset on a healthy run — passes.
-/// let r = assert_baseline(&[report], &SchedulerBaseline::strict());
+/// let r = assert_thresholds(&[report], &AbsoluteThresholds::strict());
 /// assert!(r.is_pass());
 /// ```
-pub fn assert_baseline(reports: &[WorkerReport], baseline: &SchedulerBaseline) -> AssertResult {
+pub fn assert_thresholds(
+    reports: &[WorkerReport],
+    thresholds: &AbsoluteThresholds,
+) -> AssertResult {
     // Empty `reports` means nothing was measured. Returning a fresh
     // `pass()` here would silently green-light a broken run that
     // produced no signal; delegating to `assert_benchmarks` and
     // merging its skip would lose the skip flag (`AssertResult::merge`
     // ANDs `skipped`, so `pass.merge(skip) == passed-not-skipped`).
-    // Surface the skip directly so the operator sees the baseline
-    // wasn't actually exercised.
+    // Surface the skip directly so the operator sees the thresholds
+    // weren't actually exercised.
     if reports.is_empty() {
         return AssertResult::skip("no worker reports to evaluate");
     }
@@ -5603,11 +5883,11 @@ pub fn assert_baseline(reports: &[WorkerReport], baseline: &SchedulerBaseline) -
     // Wake-latency p99: reuse the existing `assert_benchmarks` path
     // so the percentile algorithm stays unified. With `reports`
     // non-empty here, `assert_benchmarks` cannot return a skip —
-    // the merge sees only pass/fail, preserving baseline semantics.
-    if baseline.max_p99_wake_latency_ns.is_some() {
+    // the merge sees only pass/fail, preserving thresholds semantics.
+    if thresholds.max_p99_wake_latency_ns.is_some() {
         r.merge(assert_benchmarks(
             reports,
-            baseline.max_p99_wake_latency_ns,
+            thresholds.max_p99_wake_latency_ns,
             None,
             None,
         ));
@@ -5617,7 +5897,7 @@ pub fn assert_baseline(reports: &[WorkerReport], baseline: &SchedulerBaseline) -
     // Skipped when no samples are present — compute work types that
     // populate `iteration_costs_ns` are sparse, so an empty pooled
     // set is the common case for blocking variants and not a failure.
-    if let Some(cost_limit) = baseline.max_iteration_cost_p99_ns {
+    if let Some(cost_limit) = thresholds.max_iteration_cost_p99_ns {
         let all_costs: Vec<u64> = reports
             .iter()
             .flat_map(|w| w.iteration_costs_ns.iter().copied())
@@ -5640,7 +5920,7 @@ pub fn assert_baseline(reports: &[WorkerReport], baseline: &SchedulerBaseline) -
 
     // Total migrations across all workers: absolute-count gate
     // (distinct from migration_ratio which is a per-iteration rate).
-    if let Some(max_mig) = baseline.max_migrations {
+    if let Some(max_mig) = thresholds.max_migrations {
         let total_mig: u64 = reports.iter().map(|w| w.migration_count).sum();
         if total_mig > max_mig {
             r.record_fail(AssertDetail::new(
@@ -5655,7 +5935,7 @@ pub fn assert_baseline(reports: &[WorkerReport], baseline: &SchedulerBaseline) -
 
     // Per-worker work_units floor: every worker must have completed
     // at least `min` work units. One starved worker fails the check.
-    if let Some(min_units) = baseline.min_work_units {
+    if let Some(min_units) = thresholds.min_work_units {
         for w in reports {
             if w.work_units < min_units {
                 r.record_fail(AssertDetail::new(

@@ -147,9 +147,7 @@ pub fn custom_cgroup_dsq_contention(ctx: &Ctx) -> Result<AssertResult> {
     let mut r = AssertResult::pass();
     {
         let reports = h_cgroup.stop_and_collect();
-        if ctx.assert.has_worker_checks() {
-            r.merge(ctx.assert.assert_cgroup(&reports, None));
-        }
+        r.merge(ctx.assert.assert_cgroup(&reports, None));
     }
     for h in pinned_handles {
         let reports = h.stop_and_collect();
@@ -166,9 +164,7 @@ pub fn custom_cgroup_dsq_contention(ctx: &Ctx) -> Result<AssertResult> {
                 ));
             }
         }
-        if ctx.assert.has_worker_checks() {
-            r.merge(ctx.assert.assert_cgroup(&reports, None));
-        }
+        r.merge(ctx.assert.assert_cgroup(&reports, None));
     }
     Ok(r)
 }
@@ -249,11 +245,7 @@ pub fn custom_cgroup_dynamic_workload_variety(ctx: &Ctx) -> Result<AssertResult>
     // that occurred during cg_3's duration/3 hold.
     let cg3_result: Option<AssertResult> = handles.pop().map(|h| {
         let reports = h.stop_and_collect();
-        if ctx.assert.has_worker_checks() {
-            ctx.assert.assert_cgroup_with_numa(&reports, None, None)
-        } else {
-            AssertResult::pass()
-        }
+        ctx.assert.assert_cgroup_with_numa(&reports, None, None)
     });
     // Best-effort early teardown: the CgroupGroup guard's Drop
     // skips missing cgroups, so a transient ENOENT (already
@@ -370,13 +362,8 @@ pub fn custom_cgroup_cpuset_cross_llc_race(ctx: &Ctx) -> Result<AssertResult> {
     }
 
     let mut r = AssertResult::pass();
-    if ctx.assert.has_worker_checks() {
-        r.merge(ctx.assert.assert_cgroup(&h0.stop_and_collect(), None));
-        r.merge(ctx.assert.assert_cgroup(&h1.stop_and_collect(), None));
-    } else {
-        let _ = h0.stop_and_collect();
-        let _ = h1.stop_and_collect();
-    }
+    r.merge(ctx.assert.assert_cgroup(&h0.stop_and_collect(), None));
+    r.merge(ctx.assert.assert_cgroup(&h1.stop_and_collect(), None));
     Ok(r)
 }
 

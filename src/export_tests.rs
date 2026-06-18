@@ -604,7 +604,7 @@ fn compute_config_export_additions_returns_empty_when_no_config() {
 
 /// `config_file_addition` mirrors the in-VM behavior at
 /// [`crate::test_support::runtime::config_file_parts`] +
-/// the surrounding push in `eval.rs`: a scheduler with
+/// the surrounding push in `crate::test_support::eval`: a scheduler with
 /// `config_file = Some(<host_path>)` causes a hardcoded
 /// `--config` arg to be emitted. The export-side path uses
 /// `"$DIR/include/<basename>"` so the .run extractor resolves
@@ -934,7 +934,8 @@ fn generate_preamble_prepends_config_addition_prefix() {
     );
 }
 
-/// Order parity with the in-VM path at eval.rs:1112-1125:
+/// Order parity with the in-VM path in
+/// `crate::test_support::eval::run_ktstr_test_inner_impl`:
 /// `--config <path>` (and any `config_file_def`-templated arg)
 /// is pushed FIRST, then `append_base_sched_args` (which
 /// includes `--cell-parent-cgroup` auto-inject) is appended
@@ -992,7 +993,7 @@ fn generate_preamble_emits_config_addition_before_base_sched_args() {
         .expect("preamble must contain --cell-parent-cgroup from the explicit sched_args entry");
     assert!(
         config_pos < cgroup_pos,
-        "argv ordering parity with eval.rs:1112-1125: `--config` must \
+        "argv ordering parity with run_ktstr_test_inner_impl: `--config` must \
              appear BEFORE `--cell-parent-cgroup`. \
              config_pos={config_pos}, cgroup_pos={cgroup_pos}, preamble:\n{preamble}"
     );
@@ -1003,7 +1004,8 @@ fn generate_preamble_emits_config_addition_before_base_sched_args() {
 /// with `scheduler.config_file_def`) are set. The two slots
 /// are orthogonal — a scheduler that declares both legitimately
 /// gets BOTH `--config` and the templated arg in its argv,
-/// matching the in-VM eval.rs behavior at L1112-1125 which
+/// matching the in-VM behavior in
+/// `crate::test_support::eval::run_ktstr_test_inner_impl` which
 /// pushes each slot independently. A regression that introduced
 /// a mutual-exclusion check (or coalesced the two slots) would
 /// silently drop one source.

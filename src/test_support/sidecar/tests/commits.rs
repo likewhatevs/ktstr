@@ -180,6 +180,8 @@ fn sidecar_payload_and_metrics_always_emit_when_empty() {
         inconclusive: _,
         stats: _,
         monitor,
+        periodic_fired: _,
+        periodic_target: _,
         stimulus_events,
         work_type: _,
         verifier_stats,

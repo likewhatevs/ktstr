@@ -227,6 +227,25 @@ fn snapshot_var_walks_into_bss_struct() {
     assert!((snap.var("balance_factor").as_f64().unwrap() - 1.5).abs() < f64::EPSILON);
 }
 
+/// `SnapshotField::as_bool` returns `*value != 0`; the false side of
+/// that contract is otherwise unguarded. `stall = 1` above only catches
+/// an inverted `== 0` predicate, NOT an always-true bug (e.g. returning
+/// `Ok(true)` unconditionally), which would misreport a zero-valued flag
+/// — the worst false positive for a stall flag. Pin the zero → false
+/// case directly.
+#[test]
+fn snapshot_var_as_bool_false_for_zero_scalar() {
+    let report = make_report_with_maps(vec![make_global_map(
+        "scx_test.bss",
+        vec![("balanced", uint_v(0))],
+    )]);
+    let snap = Snapshot::new(&report);
+    assert!(
+        !snap.var("balanced").as_bool().unwrap(),
+        "a zero-valued scalar must read false, not be reported true",
+    );
+}
+
 #[test]
 fn snapshot_var_dotted_path_walks_nested_struct() {
     let r = synthetic_report();
@@ -1168,7 +1187,7 @@ fn snapshot_entry_cpu_min_u64_returns_smallest_present() {
 /// return NoMatch — no slot contributes a value, so neither max
 /// nor min has a meaningful answer.
 #[test]
-fn snapshot_entry_cpu_max_min_no_slots_returns_no_match() {
+fn snapshot_entry_cpu_sum_max_min_no_slots_returns_no_match() {
     let entry_struct = FailureDumpPercpuEntry {
         key: 0,
         per_cpu: vec![None, None, None],
@@ -1181,10 +1200,23 @@ fn snapshot_entry_cpu_max_min_no_slots_returns_no_match() {
         }
         other => panic!("unexpected: {other:?}"),
     }
-    // cpu_sum_u64 returns 0 for all-None (sum identity); this
-    // pins the asymmetry between sum (always-defined) and
-    // max/min (require >= 1 slot).
-    assert_eq!(entry.cpu_sum_u64("").unwrap(), 0);
+    // cpu_sum_* ALSO errors on all-None: a None slot is UNREADABLE
+    // (host-read failure), not a real zero, so summing to 0 would
+    // silently drop the missing data — parity with max/min, NOT a
+    // sum-identity 0.
+    match entry.cpu_sum_u64("").expect_err("all-None sum must err") {
+        SnapshotError::NoMatch { op, len, .. } => {
+            assert_eq!(op, "cpu_sum_u64");
+            assert_eq!(len, 0);
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+    entry
+        .cpu_sum_i64("")
+        .expect_err("all-None i64 sum must err");
+    entry
+        .cpu_sum_f64("")
+        .expect_err("all-None f64 sum must err");
 }
 
 #[test]
@@ -1553,14 +1585,29 @@ fn snapshot_bridge_dispatch_kernel_op_invokes_callback_and_logs_reply() {
         .dispatch_kernel_op(&request)
         .expect("callback installed");
     assert!(reply.success);
+    assert!(reply.reason.is_empty());
     assert_eq!(reply.request_id, 99);
+    // Pin the read VALUE, not just the count: the whole point of
+    // dispatch_kernel_op is to return the host-read result verbatim, so
+    // a passthrough/clone bug that zeroed or variant-swapped the element
+    // (while keeping len==1) must fail.
     assert_eq!(reply.read_values.len(), 1);
+    assert_eq!(
+        reply.read_values[0],
+        crate::vmm::wire::KernelOpValue::U64(0xDEAD),
+    );
     assert_eq!(invocation_count.load(Ordering::Relaxed), 1);
-    // Drain log captures the (tag, reply) pair.
+    // Drain log captures the (tag, reply) pair — including the read
+    // values, which must equal the returned reply (the logged copy is
+    // load-bearing for failure dumps).
     let log = bridge.drain_kernel_ops();
     assert_eq!(log.len(), 1);
     assert_eq!(log[0].0, "rq_clock");
     assert_eq!(log[0].1.request_id, 99);
+    assert_eq!(
+        log[0].1.read_values,
+        vec![crate::vmm::wire::KernelOpValue::U64(0xDEAD)],
+    );
     // Second drain after the first returns empty — drain is
     // destructive.
     assert!(bridge.drain_kernel_ops().is_empty());
@@ -2762,6 +2809,7 @@ fn snapshot_map_fd_array_threads_option() {
             indices: vec![0, 2, 4],
             truncated: false,
             indices_truncated: false,
+            unreadable: 0,
         }),
         None,
         None,
@@ -2800,6 +2848,7 @@ fn snapshot_map_stack_trace_threads_option() {
             n_buckets: 32,
             entries: Vec::new(),
             truncated: false,
+            buckets_unreadable: 0,
         }),
         None,
     );
@@ -2961,6 +3010,7 @@ fn snapshot_accessor_targets_round_trip_through_serde_json() {
                 n_buckets: 16,
                 entries: Vec::new(),
                 truncated: true,
+                buckets_unreadable: 0,
             }),
             fd_array: Some(FailureDumpFdArray {
                 populated: 2,
@@ -2968,6 +3018,7 @@ fn snapshot_accessor_targets_round_trip_through_serde_json() {
                 indices: vec![1, 3],
                 truncated: false,
                 indices_truncated: false,
+                unreadable: 0,
             }),
             error: Some("decode failed".to_string()),
         }],
@@ -3557,6 +3608,104 @@ fn uint_v(v: u64) -> RenderedValue {
     RenderedValue::Uint { bits: 64, value: v }
 }
 
+/// A map whose contents failed to render at capture: no `value`,
+/// no entries, `error` set — exactly the shape `render_map` emits
+/// when the guest-memory read of a map's value region fails.
+fn make_errored_map(name: &str, error: &str) -> FailureDumpMap {
+    FailureDumpMap {
+        name: name.to_string(),
+        map_kva: 0,
+        map_type: 2,
+        max_entries: 1,
+        value: None,
+        error: Some(error.to_string()),
+        ..FailureDumpMap::default()
+    }
+}
+
+/// A render-failed global-section map (`.bss` naming so `var`
+/// considers it) — a render failure surfaces as MapRenderIncomplete,
+/// not a false VarNotFound.
+#[test]
+fn snapshot_var_surfaces_render_failure_not_var_not_found() {
+    let report = make_report_with_maps(vec![make_errored_map(
+        "scx_test.bss",
+        "ARRAY value region unreadable",
+    )]);
+    let snap = Snapshot::new(&report);
+    match snap.var("counter") {
+        SnapshotField::Missing(SnapshotError::MapRenderIncomplete { map, error }) => {
+            assert_eq!(map, "scx_test.bss");
+            assert_eq!(error, "ARRAY value region unreadable");
+        }
+        other => panic!("expected MapRenderIncomplete, got {other:?}"),
+    }
+}
+
+/// A successfully-rendered global map with no errored sibling still
+/// reports VarNotFound for a genuinely-absent var — the render-failure
+/// path must not fire when the contents are present.
+#[test]
+fn snapshot_var_absent_in_rendered_map_is_var_not_found() {
+    let report = make_report_with_maps(vec![make_global_map(
+        "scx_test.bss",
+        vec![("counter", uint_v(7))],
+    )]);
+    let snap = Snapshot::new(&report);
+    match snap.var("missing") {
+        SnapshotField::Missing(SnapshotError::VarNotFound { requested, .. }) => {
+            assert_eq!(requested, "missing");
+        }
+        other => panic!("expected VarNotFound, got {other:?}"),
+    }
+}
+
+/// `at` on a render-failed map surfaces MapRenderIncomplete rather
+/// than IndexOutOfRange { len: 0 } — a capture gap is not an empty map.
+#[test]
+fn snapshot_at_on_render_failed_map_surfaces_render_failure() {
+    let report = make_report_with_maps(vec![make_errored_map("scx_test.bss", "boom")]);
+    let snap = Snapshot::new(&report);
+    let entry = snap.map("scx_test.bss").unwrap().at(0);
+    match entry {
+        SnapshotEntry::Missing(SnapshotError::MapRenderIncomplete { map, error }) => {
+            assert_eq!(map, "scx_test.bss");
+            assert_eq!(error, "boom");
+        }
+        other => panic!("expected MapRenderIncomplete, got {other:?}"),
+    }
+}
+
+/// `find` / `max_by` over a render-failed map surface
+/// MapRenderIncomplete rather than NoMatch { len: 0 }.
+#[test]
+fn snapshot_find_and_max_by_on_render_failed_map_surface_render_failure() {
+    let report = make_report_with_maps(vec![make_errored_map("scx_test.bss", "boom")]);
+    let snap = Snapshot::new(&report);
+    let m = snap.map("scx_test.bss").unwrap();
+    match m.find(|_| true) {
+        SnapshotEntry::Missing(SnapshotError::MapRenderIncomplete { error, .. }) => {
+            assert_eq!(error, "boom");
+        }
+        other => panic!("find: expected MapRenderIncomplete, got {other:?}"),
+    }
+    match m.max_by(|_| 0) {
+        SnapshotEntry::Missing(SnapshotError::MapRenderIncomplete { error, .. }) => {
+            assert_eq!(error, "boom");
+        }
+        other => panic!("max_by: expected MapRenderIncomplete, got {other:?}"),
+    }
+}
+
+// Narrowing is NOT observable for the single-obj fast arm by
+// construction: with one obj there is nothing to narrow away. Adding a
+// second global-section obj does not strengthen THIS arm — two obj
+// prefixes route active() to the `(multiple, _)` arm (NoActiveScheduler
+// error) unless report.active_obj_name is set, which is the separate
+// WALKER path exercised by snapshot_active_multi_bss_same_name_with_-
+// walker_resolves. So this test correctly pins what the single-obj arm
+// can verify: active() SUCCEEDS (does not error) and resolves the obj's
+// var through the filtered view.
 #[test]
 fn snapshot_active_single_obj_returns_filtered_view() {
     let report = make_report_with_maps(vec![make_global_map(

@@ -79,7 +79,7 @@ pub fn assert_wprof_pb_shape(path: &Path) -> anyhow::Result<()> {
         format!(
             "wprof .pb missing at {}. Chain: #[ktstr_test(wprof)] → \
              KtstrTestEntry::wprof → primary VM builder.wprof(Some(config)) \
-             at src/test_support/eval.rs → KTSTR_WPROF_ARGS cmdline → \
+             at src/test_support/eval/mod.rs → KTSTR_WPROF_ARGS cmdline → \
              guest spawn_wprof_if_configured → send_wprof_trace → host \
              MsgType::WprofTrace arm → sidecar_dir.join(\"<name>.wprof.pb\")",
             path.display(),

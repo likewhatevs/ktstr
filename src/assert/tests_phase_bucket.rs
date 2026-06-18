@@ -382,8 +382,8 @@ fn build_phase_buckets_three_phases_round_trip_with_correct_labels() {
     let phases = crate::assert::build_phase_buckets(&samples);
     assert_eq!(phases.len(), 3);
 
-    // Buckets returned in step_index order because SampleSeries::by_phase
-    // returns a BTreeMap keyed by step_index.
+    // Buckets returned in step_index order because
+    // SampleSeries::by_stamped_phase returns a BTreeMap keyed by step_index.
     assert_eq!(phases[0].step_index, 0);
     assert_eq!(phases[0].label, "BASELINE");
     assert_eq!(phases[0].sample_count, 2);
@@ -405,7 +405,7 @@ fn build_phase_buckets_three_phases_round_trip_with_correct_labels() {
 }
 
 /// Unstamped samples (DrainedSnapshotEntry.step_index = None)
-/// fall under key `0` per SampleSeries::by_phase's
+/// fall under key `0` per SampleSeries::by_stamped_phase's
 /// "no stamped index" fallback. The resulting bucket is
 /// labelled "BASELINE" because step_index = 0 is the BASELINE
 /// encoding regardless of whether the original stamp was Some(0)
@@ -617,6 +617,480 @@ fn build_phase_buckets_extracts_wired_metric_arms_end_to_end() {
             "Step[0] must not carry host-only metric {host_only}"
         );
     }
+}
+
+/// Off-cadence captures (on-demand `Op::CaptureSnapshot` / watchpoint
+/// fires, tagged non-`periodic_`) must NOT pollute per-phase metric
+/// folds — the production accessors (`VmResult::phase_buckets` /
+/// `evaluate_vm_result`) bucket `periodic_only()`. A full-series bucket
+/// folds the off-cadence outlier into the Peak; a periodic-only bucket
+/// excludes it.
+#[test]
+fn periodic_only_excludes_off_cadence_captures_from_phase_buckets() {
+    use crate::monitor::dump::{FailureDumpReport, SCHEMA_SINGLE};
+    use crate::monitor::scx_walker::DsqState;
+
+    fn entry(tag: &str, elapsed_ms: u64, dsq_depth: u32) -> DrainedSnapshotEntry {
+        DrainedSnapshotEntry {
+            tag: tag.to_string(),
+            report: FailureDumpReport {
+                schema: SCHEMA_SINGLE.to_string(),
+                dsq_states: vec![DsqState {
+                    id: 0,
+                    origin: "local cpu 0".to_string(),
+                    nr: dsq_depth,
+                    seq: 0,
+                    task_kvas: Vec::new(),
+                    truncated: false,
+                }],
+                ..Default::default()
+            },
+            stats: Err(MissingStatsReason::NoSchedulerBinary),
+            elapsed_ms: Some(elapsed_ms),
+            boundary_offset_ms: None,
+            step_index: Some(1),
+        }
+    }
+
+    // Step[0]: two periodic captures (dsq 5, 8) + one off-cadence
+    // on-demand capture with a wild dsq depth (1000). max_dsq_depth is a
+    // Peak (order-independent), so the outlier wins a full-series max.
+    let drained = vec![
+        entry("periodic_000", 100, 5),
+        entry("periodic_001", 200, 8),
+        entry("ondemand_000", 300, 1000),
+    ];
+    let series = SampleSeries::from_drained_typed(drained, None);
+
+    // Sanity: the full series folds the off-cadence outlier into the Peak.
+    let full = crate::assert::build_phase_buckets(&series);
+    assert_eq!(
+        full.iter()
+            .find(|p| p.step_index == 1)
+            .expect("Step[0]")
+            .metrics
+            .get("max_dsq_depth")
+            .copied(),
+        Some(1000.0),
+        "full series includes the off-cadence capture's dsq depth",
+    );
+
+    // Periodic-only (the production path) EXCLUDES the off-cadence
+    // capture: the Peak is the periodic max (8), not the 1000 outlier.
+    let periodic = crate::assert::build_phase_buckets(&series.clone().periodic_only());
+    assert_eq!(
+        periodic
+            .iter()
+            .find(|p| p.step_index == 1)
+            .expect("Step[0]")
+            .metrics
+            .get("max_dsq_depth")
+            .copied(),
+        Some(8.0),
+        "periodic_only excludes the off-cadence outlier: max is 8, NOT 1000",
+    );
+}
+
+/// `system_time_ns` / `user_time_ns` are injected per-phase as a
+/// per-thread-GROUP delta (each tgid's `thread_group_cputime` at first
+/// vs last appearance, summed), NOT a per-sample cross-task sum then a
+/// Counter delta. Pins three properties:
+///   * the delta is `last - first` of the live `task_struct` counter per
+///     tgid (3000 ns system, 7000 ns user for the persistent group);
+///   * a high-cumulative-counter task that appears in only ONE sample
+///     contributes 0 (it never reaches two readable boundaries) — a
+///     sum-then-delta would have inflated the phase by ~1e6 ns;
+///   * a phase with fewer than two readable samples for any group omits
+///     the key (absent != real 0).
+///
+/// signal_{u,s}time are `Some(0)` here, matching production: a readable
+/// signal_struct with no exited-thread time reads `Some(0)`, not `None`
+/// (`None` is reserved for a translate miss — see the dedicated test).
+#[test]
+fn build_phase_buckets_injects_per_group_cpu_time_delta() {
+    use crate::monitor::task_enrichment::TaskEnrichment;
+
+    fn task(tgid: i32, utime: u64, stime: u64) -> TaskEnrichment {
+        TaskEnrichment {
+            pid: tgid,
+            tgid,
+            utime,
+            stime,
+            signal_utime: Some(0),
+            signal_stime: Some(0),
+            ..Default::default()
+        }
+    }
+    fn entry(
+        tag: &str,
+        step_index: u16,
+        elapsed_ms: u64,
+        tasks: Vec<TaskEnrichment>,
+    ) -> DrainedSnapshotEntry {
+        DrainedSnapshotEntry {
+            tag: tag.to_string(),
+            report: FailureDumpReport {
+                schema: SCHEMA_SINGLE.to_string(),
+                task_enrichments: tasks,
+                ..Default::default()
+            },
+            stats: Err(MissingStatsReason::NoSchedulerBinary),
+            elapsed_ms: Some(elapsed_ms),
+            boundary_offset_ms: None,
+            step_index: Some(step_index),
+        }
+    }
+
+    let drained = vec![
+        // BASELINE: a single enriched sample -> no delta measurable.
+        entry("periodic_000", 0, 10, vec![task(100, 2000, 1000)]),
+        // Step[0]: two samples. tgid=100 persists (utime 2000->9000,
+        // stime 1000->4000). tgid=200 (huge cumulative history) appears
+        // ONLY in the later sample -> single-appearance -> contributes 0.
+        entry("periodic_001", 1, 100, vec![task(100, 2000, 1000)]),
+        entry(
+            "periodic_002",
+            1,
+            200,
+            vec![task(100, 9000, 4000), task(200, 2_000_000, 1_000_000)],
+        ),
+    ];
+    let samples = SampleSeries::from_drained_typed(drained, None);
+    let phases = crate::assert::build_phase_buckets(&samples);
+    assert_eq!(phases.len(), 2, "BASELINE + Step[0]");
+
+    let baseline = &phases[0];
+    assert_eq!(baseline.step_index, 0);
+    assert!(
+        !baseline.metrics.contains_key("system_time_ns")
+            && !baseline.metrics.contains_key("user_time_ns"),
+        "single enriched sample -> CPU-time key omitted (absent != real 0)",
+    );
+
+    let step0 = &phases[1];
+    assert_eq!(step0.step_index, 1);
+    assert_eq!(
+        step0.metrics.get("system_time_ns").copied(),
+        Some(3000.0),
+        "system delta = tgid100 (4000-1000) + tgid200 (single-appearance \
+         -> 0); NOT 1_003_000 (sum-then-delta inflation)",
+    );
+    assert_eq!(
+        step0.metrics.get("user_time_ns").copied(),
+        Some(7000.0),
+        "user delta = tgid100 (9000-2000); tgid200 single-appearance -> 0",
+    );
+}
+
+/// The per-phase CPU-time fold includes the thread-group
+/// `signal_struct` accumulator (a dying thread's time moves there at
+/// exit), counted once per tgid, so a mid-phase thread exit does not
+/// dip the group total below its live-thread-only sum.
+#[test]
+fn build_phase_buckets_cpu_time_includes_signal_accumulator() {
+    use crate::monitor::task_enrichment::TaskEnrichment;
+
+    fn entry(
+        tag: &str,
+        elapsed_ms: u64,
+        stime: u64,
+        signal_stime: Option<u64>,
+    ) -> DrainedSnapshotEntry {
+        DrainedSnapshotEntry {
+            tag: tag.to_string(),
+            report: FailureDumpReport {
+                schema: SCHEMA_SINGLE.to_string(),
+                task_enrichments: vec![TaskEnrichment {
+                    pid: 100,
+                    tgid: 100,
+                    stime,
+                    signal_stime,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            stats: Err(MissingStatsReason::NoSchedulerBinary),
+            elapsed_ms: Some(elapsed_ms),
+            boundary_offset_ms: None,
+            step_index: Some(1),
+        }
+    }
+
+    // tgid=100 group total = live stime + the shared signal accumulator.
+    // Sample A's signal is Some(0) (a genuine zero — no exited-thread time
+    // yet — NOT None, which would mean an unreadable signal_struct):
+    //   sample A: 1000 + 0    = 1000
+    //   sample B: 2000 + 3000 = 5000   (a thread exited; 3000 -> signal)
+    //   delta = 4000  (without the signal fold it would read 1000)
+    let drained = vec![
+        entry("periodic_000", 100, 1000, Some(0)),
+        entry("periodic_001", 200, 2000, Some(3000)),
+    ];
+    let samples = SampleSeries::from_drained_typed(drained, None);
+    let phases = crate::assert::build_phase_buckets(&samples);
+    let step0 = phases
+        .iter()
+        .find(|p| p.step_index == 1)
+        .expect("Step[0] bucket present");
+    assert_eq!(
+        step0.metrics.get("system_time_ns").copied(),
+        Some(4000.0),
+        "signal accumulator (3000) folds into the group total: \
+         (2000+3000) - (1000+0) = 4000",
+    );
+}
+
+/// A `None` signal_field is an unreadable signal_struct (translate miss),
+/// NOT a real zero. A group whose signal is None at one of its endpoints
+/// is EXCLUDED from the delta there (its full thread_group_cputime is
+/// unmeasurable) rather than counted live-only — otherwise a None-at-first
+/// / Some(large)-at-last pair would leak the cumulative accumulator as a
+/// phantom positive. Pins that the phantom does not leak.
+#[test]
+fn build_phase_buckets_cpu_time_excludes_group_with_unreadable_signal() {
+    use crate::monitor::task_enrichment::TaskEnrichment;
+
+    fn t(tgid: i32, stime: u64, signal_stime: Option<u64>) -> TaskEnrichment {
+        TaskEnrichment {
+            pid: tgid,
+            tgid,
+            stime,
+            signal_stime,
+            ..Default::default()
+        }
+    }
+    fn entry(tag: &str, elapsed_ms: u64, tasks: Vec<TaskEnrichment>) -> DrainedSnapshotEntry {
+        DrainedSnapshotEntry {
+            tag: tag.to_string(),
+            report: FailureDumpReport {
+                schema: SCHEMA_SINGLE.to_string(),
+                task_enrichments: tasks,
+                ..Default::default()
+            },
+            stats: Err(MissingStatsReason::NoSchedulerBinary),
+            elapsed_ms: Some(elapsed_ms),
+            boundary_offset_ms: None,
+            step_index: Some(1),
+        }
+    }
+
+    // tgid=100: signal UNREADABLE (None) at the first sample, Some(5e6) at
+    //   the last, live stime flat (1000) -> the None endpoint is omitted,
+    //   leaving one readable sample -> EXCLUDED (must not add 5e6).
+    // tgid=200: signal Some(0) both samples, stime 1000 -> 3000 -> 2000.
+    let drained = vec![
+        entry(
+            "periodic_000",
+            100,
+            vec![t(100, 1000, None), t(200, 1000, Some(0))],
+        ),
+        entry(
+            "periodic_001",
+            200,
+            vec![t(100, 1000, Some(5_000_000)), t(200, 3000, Some(0))],
+        ),
+    ];
+    let samples = SampleSeries::from_drained_typed(drained, None);
+    let phases = crate::assert::build_phase_buckets(&samples);
+    let step0 = phases
+        .iter()
+        .find(|p| p.step_index == 1)
+        .expect("Step[0] bucket present");
+    assert_eq!(
+        step0.metrics.get("system_time_ns").copied(),
+        Some(2000.0),
+        "only tgid200 (readable at both) contributes (3000-1000=2000); \
+         tgid100's unreadable-signal first endpoint excludes it — the 5e6 \
+         accumulator must NOT leak as a phantom positive",
+    );
+}
+
+/// A numeric tgid reused within the phase (process exit + PID realloc to a
+/// fresh group starting near zero) reads a LOWER thread_group_cputime at
+/// the last sample than the first; `saturating_sub` clamps the per-group
+/// delta to 0 rather than wrapping u128 to a phantom huge value. The group
+/// still qualifies (two readable samples), so the result is a real
+/// `Some(0.0)`, not absent.
+#[test]
+fn build_phase_buckets_cpu_time_clamps_counter_decrease() {
+    use crate::monitor::task_enrichment::TaskEnrichment;
+    fn entry(tag: &str, elapsed_ms: u64, stime: u64) -> DrainedSnapshotEntry {
+        DrainedSnapshotEntry {
+            tag: tag.to_string(),
+            report: FailureDumpReport {
+                schema: SCHEMA_SINGLE.to_string(),
+                task_enrichments: vec![TaskEnrichment {
+                    pid: 100,
+                    tgid: 100,
+                    stime,
+                    signal_stime: Some(0),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            stats: Err(MissingStatsReason::NoSchedulerBinary),
+            elapsed_ms: Some(elapsed_ms),
+            boundary_offset_ms: None,
+            step_index: Some(1),
+        }
+    }
+    // stime decreases 5000 -> 1000 across the phase (tgid reuse).
+    let drained = vec![
+        entry("periodic_000", 100, 5000),
+        entry("periodic_001", 200, 1000),
+    ];
+    let samples = SampleSeries::from_drained_typed(drained, None);
+    let phases = crate::assert::build_phase_buckets(&samples);
+    let step0 = phases
+        .iter()
+        .find(|p| p.step_index == 1)
+        .expect("Step[0] bucket present");
+    assert_eq!(
+        step0.metrics.get("system_time_ns").copied(),
+        Some(0.0),
+        "a last < first read clamps to 0 (qualifying group, counters did \
+         not advance) — a real Some(0.0), never a wrapped huge value",
+    );
+}
+
+/// Two readable samples whose tgid sets are DISJOINT (every group appears
+/// in exactly one sample) yield no group with two readable boundaries, so
+/// the key is ABSENT (unmeasurable) — distinct from a real `Some(0.0)`.
+#[test]
+fn build_phase_buckets_cpu_time_disjoint_groups_yield_absent_not_zero() {
+    use crate::monitor::task_enrichment::TaskEnrichment;
+    fn entry(tag: &str, elapsed_ms: u64, tgid: i32) -> DrainedSnapshotEntry {
+        DrainedSnapshotEntry {
+            tag: tag.to_string(),
+            report: FailureDumpReport {
+                schema: SCHEMA_SINGLE.to_string(),
+                task_enrichments: vec![TaskEnrichment {
+                    pid: tgid,
+                    tgid,
+                    stime: 1000,
+                    signal_stime: Some(0),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            stats: Err(MissingStatsReason::NoSchedulerBinary),
+            elapsed_ms: Some(elapsed_ms),
+            boundary_offset_ms: None,
+            step_index: Some(1),
+        }
+    }
+    // sample A: only tgid=100; sample B: only tgid=200 (disjoint sets).
+    let drained = vec![
+        entry("periodic_000", 100, 100),
+        entry("periodic_001", 200, 200),
+    ];
+    let samples = SampleSeries::from_drained_typed(drained, None);
+    let phases = crate::assert::build_phase_buckets(&samples);
+    let step0 = phases
+        .iter()
+        .find(|p| p.step_index == 1)
+        .expect("Step[0] bucket present");
+    assert!(
+        !step0.metrics.contains_key("system_time_ns"),
+        "disjoint groups -> no group spans two readable samples -> absent, \
+         not a sentinel Some(0.0)",
+    );
+}
+
+/// An unanchored sample (no boundary offset AND no measured `elapsed_ms`)
+/// must sort LAST in the per-group CPU-time delta, never
+/// first: with the pre-Option behavior it coerced to `0` and became the
+/// spurious earliest `first_seen` endpoint, so a high cumulative counter
+/// in that sample masked real in-phase growth (last <= first ->
+/// saturating_sub -> 0). Pins that the unanchored sample sorts to MAX so
+/// `first_seen` comes from the earliest TIMED sample.
+#[test]
+fn build_phase_buckets_cpu_time_unanchored_sample_sorts_last_not_first() {
+    use crate::monitor::task_enrichment::TaskEnrichment;
+    fn task(stime: u64) -> TaskEnrichment {
+        TaskEnrichment {
+            pid: 100,
+            tgid: 100,
+            stime,
+            signal_stime: Some(0),
+            ..Default::default()
+        }
+    }
+    fn entry(tag: &str, elapsed_ms: Option<u64>, stime: u64) -> DrainedSnapshotEntry {
+        DrainedSnapshotEntry {
+            tag: tag.to_string(),
+            report: FailureDumpReport {
+                schema: SCHEMA_SINGLE.to_string(),
+                task_enrichments: vec![task(stime)],
+                ..Default::default()
+            },
+            stats: Err(MissingStatsReason::NoSchedulerBinary),
+            elapsed_ms,
+            boundary_offset_ms: None,
+            step_index: Some(1),
+        }
+    }
+    // tgid=100, signal Some(0) -> group total == live stime. Drain order
+    // leads with the UNANCHORED sample (elapsed None, stime 3000) to
+    // simulate an unsorted grouped vec; the timed samples grow 1000 ->
+    // 3000.
+    //   * fix (None -> u64::MAX): sort [A(100), B(200), X(None)] ->
+    //     first_seen = 1000 (A), last_seen = 3000 -> delta = 2000.
+    //   * bug (None -> 0): sort [X, A(100), B(200)] -> first_seen = 3000
+    //     (X), last_seen = 3000 -> saturating_sub -> 0 (real growth lost).
+    let drained = vec![
+        entry("on_demand_000", None, 3000),
+        entry("periodic_001", Some(100), 1000),
+        entry("periodic_002", Some(200), 3000),
+    ];
+    let samples = SampleSeries::from_drained_typed(drained, None);
+    let phases = crate::assert::build_phase_buckets(&samples);
+    let step0 = phases
+        .iter()
+        .find(|p| p.step_index == 1)
+        .expect("Step[0] bucket present");
+    assert_eq!(
+        step0.metrics.get("system_time_ns").copied(),
+        Some(2000.0),
+        "unanchored sample sorts LAST -> first_seen from the earliest \
+         timed sample (1000), delta = 2000; if it sorted first the delta \
+         would clamp to 0",
+    );
+}
+
+/// A phase whose every sample is unanchored (no boundary offset AND no
+/// measured `elapsed_ms`) yields the inverted window
+/// `(start_ms = u64::MAX, end_ms = 0)`: no sample contributes a time
+/// anchor, so `lo`/`hi` keep their identity seeds. The half-open window
+/// test then folds zero monitor samples — the correct "no placeable
+/// samples" outcome — rather than coercing the missing anchors to 0 and
+/// over-folding from the run start.
+#[test]
+fn build_phase_buckets_all_unanchored_phase_yields_inverted_window() {
+    fn unanchored(tag: &str) -> DrainedSnapshotEntry {
+        DrainedSnapshotEntry {
+            tag: tag.to_string(),
+            report: fixture_report(),
+            stats: Err(MissingStatsReason::NoSchedulerBinary),
+            elapsed_ms: None,
+            boundary_offset_ms: None,
+            step_index: Some(1),
+        }
+    }
+    let drained = vec![unanchored("on_demand_000"), unanchored("on_demand_001")];
+    let samples = SampleSeries::from_drained_typed(drained, None);
+    let phases = crate::assert::build_phase_buckets(&samples);
+    let step0 = phases
+        .iter()
+        .find(|p| p.step_index == 1)
+        .expect("phase bucket present even when every sample is unanchored");
+    assert_eq!(step0.sample_count, 2, "both unanchored samples counted");
+    assert_eq!(
+        (step0.start_ms, step0.end_ms),
+        (u64::MAX, 0),
+        "all-unanchored phase -> inverted window that folds nothing, \
+         not a (0, x) window anchored at the run start",
+    );
 }
 
 /// `ScenarioStats::phase` lookup against the phases built by
@@ -1103,6 +1577,8 @@ fn build_phase_buckets_with_stimulus_populates_iteration_rate() {
             detail: None,
             total_iterations: Some(0),
             step_index: None,
+            is_terminal: false,
+            is_step_end: false,
         },
         StimulusEvent {
             elapsed_ms: 1100,
@@ -1111,6 +1587,8 @@ fn build_phase_buckets_with_stimulus_populates_iteration_rate() {
             detail: None,
             total_iterations: Some(1000),
             step_index: None,
+            is_terminal: false,
+            is_step_end: false,
         },
         StimulusEvent {
             elapsed_ms: 2100,
@@ -1119,6 +1597,8 @@ fn build_phase_buckets_with_stimulus_populates_iteration_rate() {
             detail: None,
             total_iterations: Some(3000),
             step_index: None,
+            is_terminal: false,
+            is_step_end: false,
         },
     ];
     let phases = crate::assert::build_phase_buckets_with_stimulus(&samples, &stimulus);
@@ -1175,6 +1655,8 @@ fn build_phase_buckets_with_stimulus_remaps_by_boundary_offset_over_stamped_step
         detail: None,
         total_iterations: None,
         step_index: Some(k),
+        is_terminal: false,
+        is_step_end: false,
     };
     let stimulus = vec![stim(1000, 1), stim(2000, 2), stim(3000, 3)];
     let phases = crate::assert::build_phase_buckets_with_stimulus(&samples, &stimulus);
@@ -1192,6 +1674,66 @@ fn build_phase_buckets_with_stimulus_remaps_by_boundary_offset_over_stamped_step
             "each remapped bucket holds exactly its one scheduled capture; \
              step_index={} count={}",
             p.step_index, p.sample_count,
+        );
+    }
+}
+
+/// The public SampleSeries grouping methods: by_stamped_phase
+/// COLLAPSES a deferred-fire burst (every capture stamped the same late
+/// step) into one phase, while by_stimulus_phase re-derives the correct
+/// per-phase grouping from each sample's timing-independent
+/// boundary_offset_ms. Pins both new public entry points and the
+/// difference that motivates by_stimulus_phase.
+#[test]
+fn by_stimulus_phase_separates_what_by_stamped_phase_collapses() {
+    use crate::scenario::sample::SampleSeries;
+    use crate::scenario::snapshot::{DrainedSnapshotEntry, MissingStatsReason};
+    use crate::timeline::StimulusEvent;
+    // All four captures stamp the SAME late step (the burst) but their
+    // SCHEDULED offsets fall in distinct step windows.
+    let mk = |tag: &str, offset_ms: u64| DrainedSnapshotEntry {
+        tag: tag.to_string(),
+        report: fixture_report(),
+        stats: Err(MissingStatsReason::NoSchedulerBinary),
+        elapsed_ms: Some(9_000),
+        boundary_offset_ms: Some(offset_ms),
+        step_index: Some(3),
+    };
+    let drained = vec![
+        mk("p0", 500),   // before step 1 start (1000) -> BASELINE (0)
+        mk("p1", 1_500), // step 1 window
+        mk("p2", 2_500), // step 2 window
+        mk("p3", 3_500), // step 3 window
+    ];
+    let samples = SampleSeries::from_drained_typed(drained, None);
+    let stim = |elapsed_ms: u64, k: u16| StimulusEvent {
+        elapsed_ms,
+        label: format!("StepStart[{k}]"),
+        op_kind: None,
+        detail: None,
+        total_iterations: None,
+        step_index: Some(k),
+        is_terminal: false,
+        is_step_end: false,
+    };
+    let stimulus = vec![stim(1000, 1), stim(2000, 2), stim(3000, 3)];
+
+    // by_stamped_phase: all four collapse into the single stamped key 3.
+    let stamped = samples.by_stamped_phase();
+    assert_eq!(stamped.keys().copied().collect::<Vec<_>>(), vec![3]);
+    assert_eq!(stamped[&3].len(), 4, "stamped grouping collapses the burst");
+
+    // by_stimulus_phase: re-derived from boundary_offset -> 4 phases.
+    let by_stim = samples.by_stimulus_phase(&stimulus);
+    assert_eq!(
+        by_stim.keys().copied().collect::<Vec<_>>(),
+        vec![0, 1, 2, 3]
+    );
+    for k in [0u16, 1, 2, 3] {
+        assert_eq!(
+            by_stim[&k].len(),
+            1,
+            "phase {k} should hold exactly one sample"
         );
     }
 }
@@ -1223,6 +1765,8 @@ fn build_phase_buckets_with_stimulus_none_offset_falls_back_to_stamped_step() {
         detail: None,
         total_iterations: None,
         step_index: Some(5),
+        is_terminal: false,
+        is_step_end: false,
     }];
     let phases = crate::assert::build_phase_buckets_with_stimulus(&samples, &stimulus);
     let idxs: Vec<u16> = phases.iter().map(|p| p.step_index).collect();
@@ -1272,6 +1816,8 @@ fn build_phase_buckets_with_stimulus_iteration_rate_attaches_by_step_not_interio
         detail: None,
         total_iterations: Some(iters),
         step_index: Some(k),
+        is_terminal: false,
+        is_step_end: false,
     };
     let stimulus = vec![stim(1000, 1, 0), stim(2000, 2, 1000), stim(3000, 3, 3000)];
     let phases = crate::assert::build_phase_buckets_with_stimulus(&samples, &stimulus);
@@ -1303,6 +1849,417 @@ fn build_phase_buckets_with_stimulus_iteration_rate_attaches_by_step_not_interio
         Some(2000.0),
         "step 2 iteration_rate must attach by step_index; got {:?}",
         step2.metrics.get("iteration_rate"),
+    );
+}
+
+/// Each step's `iteration_rate` is the STEP-LOCAL
+/// `StepStart[k]` -> `StepEnd[k]` delta (its OWN workers, start-to-end of
+/// hold), NOT the cross-step `StepStart[k]` -> `StepStart[k+1]` delta.
+/// Workers respawned per step read ~0 at every StepStart, so the
+/// cross-step delta is `0 - 0` and yields no rate (the old cross-step bug:
+/// every fresh-per-step phase silently had no throughput). Pairing each
+/// step's own StepStart -> StepEnd recovers the real per-step rate. The
+/// elapsed-sorted `windows(2)` walk pairs `StepStart[k]` -> `StepEnd[k]`
+/// first (both carry step_index `k`); `or_insert` keeps that step-local
+/// rate, and the intervening `StepEnd[k]` -> `StepStart[k+1]` pair reads
+/// `0 <= end` so `rate_to` returns None and never overwrites.
+#[test]
+fn build_phase_buckets_with_stimulus_pairs_step_local_for_respawned_workers() {
+    use crate::scenario::snapshot::{DrainedSnapshotEntry, MissingStatsReason};
+    use crate::timeline::StimulusEvent;
+    let mk = |tag: &str, offset_ms: u64| DrainedSnapshotEntry {
+        tag: tag.to_string(),
+        report: fixture_report(),
+        stats: Err(MissingStatsReason::NoSchedulerBinary),
+        elapsed_ms: Some(9_000),
+        boundary_offset_ms: Some(offset_ms),
+        step_index: Some(9),
+    };
+    let drained = vec![
+        mk("periodic_000", 1_500), // step 1 interior (window [1000,2100))
+        mk("periodic_001", 2_500), // step 2 interior (window [2100,..))
+    ];
+    let samples = SampleSeries::from_drained_typed(drained, None);
+    let start = |elapsed_ms: u64, k: u16, iters: u64| StimulusEvent {
+        elapsed_ms,
+        label: format!("StepStart[{k}]"),
+        op_kind: None,
+        detail: None,
+        total_iterations: Some(iters),
+        step_index: Some(k),
+        is_terminal: false,
+        is_step_end: false,
+    };
+    let end = |elapsed_ms: u64, k: u16, iters: u64| StimulusEvent {
+        elapsed_ms,
+        label: format!("StepEnd[{k}]"),
+        op_kind: None,
+        detail: None,
+        total_iterations: Some(iters),
+        step_index: Some(k),
+        is_terminal: false,
+        is_step_end: true,
+    };
+    // Step 1: 0 -> 10000 over its 1s hold (10000/s). Step 2 workers are
+    // RESPAWNED, so StepStart[2] reads 0 again; step 2: 0 -> 5000 over 1s
+    // (5000/s). 1000ms windows keep the division exact (1.0s denominator).
+    let stimulus = vec![
+        start(1_000, 1, 0),
+        end(2_000, 1, 10_000),
+        start(2_100, 2, 0),
+        end(3_100, 2, 5_000),
+        StimulusEvent::terminal(3_200, 5_000),
+    ];
+    let phases = crate::assert::build_phase_buckets_with_stimulus(&samples, &stimulus);
+    let step1 = phases
+        .iter()
+        .find(|p| p.step_index == 1)
+        .expect("step 1 bucket present");
+    let step2 = phases
+        .iter()
+        .find(|p| p.step_index == 2)
+        .expect("step 2 bucket present");
+    assert_eq!(
+        step1.metrics.get("iteration_rate").copied(),
+        Some(10_000.0),
+        "step 1 must report its step-local StepStart->StepEnd rate, not the \
+         cross-step 0->0 delta (the old cross-step silent None); got {:?}",
+        step1.metrics.get("iteration_rate"),
+    );
+    assert_eq!(
+        step2.metrics.get("iteration_rate").copied(),
+        Some(5_000.0),
+        "step 2 (respawned workers) must report its step-local rate; got {:?}",
+        step2.metrics.get("iteration_rate"),
+    );
+}
+
+/// A PERSISTENT (Backdrop) population keeps iterating through
+/// the inter-step teardown, so `StepStart[k+1]` reads MORE than
+/// `StepEnd[k]` and the cross-step `StepEnd[k]` -> `StepStart[k+1]` pair
+/// WOULD yield a rate. But that pair has an `is_step_end` `prev`, so the
+/// attribution loop's guard skips it before `rate_to`/`or_insert` ever
+/// run — the cross-step rate is never even computed, and each step
+/// reports only its own step-local `StepStart[k]` -> `StepEnd[k]`
+/// throughput. (`or_insert` is a redundant secondary safety here, not
+/// the operative mechanism — the guard is.)
+#[test]
+fn build_phase_buckets_with_stimulus_step_local_wins_over_persistent_cross_step() {
+    use crate::scenario::snapshot::{DrainedSnapshotEntry, MissingStatsReason};
+    use crate::timeline::StimulusEvent;
+    let mk = |tag: &str, offset_ms: u64| DrainedSnapshotEntry {
+        tag: tag.to_string(),
+        report: fixture_report(),
+        stats: Err(MissingStatsReason::NoSchedulerBinary),
+        elapsed_ms: Some(9_000),
+        boundary_offset_ms: Some(offset_ms),
+        step_index: Some(9),
+    };
+    let drained = vec![mk("periodic_000", 1_500), mk("periodic_001", 2_500)];
+    let samples = SampleSeries::from_drained_typed(drained, None);
+    let start = |elapsed_ms: u64, k: u16, iters: u64| StimulusEvent {
+        elapsed_ms,
+        label: format!("StepStart[{k}]"),
+        op_kind: None,
+        detail: None,
+        total_iterations: Some(iters),
+        step_index: Some(k),
+        is_terminal: false,
+        is_step_end: false,
+    };
+    let end = |elapsed_ms: u64, k: u16, iters: u64| StimulusEvent {
+        elapsed_ms,
+        label: format!("StepEnd[{k}]"),
+        op_kind: None,
+        detail: None,
+        total_iterations: Some(iters),
+        step_index: Some(k),
+        is_terminal: false,
+        is_step_end: true,
+    };
+    // Step 1 local: 0 -> 10000 over 1s (10000/s). Persistent workers add
+    // 500 in the 100ms teardown gap, so StepStart[2] reads 10500 — the
+    // cross-step StepEnd[1] -> StepStart[2] pair would compute 500/0.1s =
+    // 5000/s, but its is_step_end prev is skipped by the guard so that
+    // rate is never computed for step 1.
+    // Step 2 local: 10500 -> 15500 over 1s (5000/s).
+    let stimulus = vec![
+        start(1_000, 1, 0),
+        end(2_000, 1, 10_000),
+        start(2_100, 2, 10_500),
+        end(3_100, 2, 15_500),
+        StimulusEvent::terminal(3_200, 15_500),
+    ];
+    let phases = crate::assert::build_phase_buckets_with_stimulus(&samples, &stimulus);
+    let step1 = phases
+        .iter()
+        .find(|p| p.step_index == 1)
+        .expect("step 1 bucket present");
+    let step2 = phases
+        .iter()
+        .find(|p| p.step_index == 2)
+        .expect("step 2 bucket present");
+    assert_eq!(
+        step1.metrics.get("iteration_rate").copied(),
+        Some(10_000.0),
+        "step-local rate must win over the 5000/s persistent cross-step \
+         delta (the is_step_end guard skips the cross-step pair); got {:?}",
+        step1.metrics.get("iteration_rate"),
+    );
+    assert_eq!(
+        step2.metrics.get("iteration_rate").copied(),
+        Some(5_000.0),
+        "step 2 must report its own start-to-end-of-hold rate; got {:?}",
+        step2.metrics.get("iteration_rate"),
+    );
+}
+
+/// A STALLED step (its own `StepStart[k] -> StepEnd[k]` delta is zero)
+/// must report its MEASURED-ZERO rate `Some(0.0)` — it must NOT leak the
+/// inter-step teardown-gap rate that the `StepEnd[k] -> StepStart[k+1]`
+/// pair would otherwise produce. StepEnd[k] carries step_index `k`, so
+/// without the `is_step_end` guard in the attribution loop that cross-step
+/// pair (prev = StepEnd[k], also step_index `k`) would `or_insert` a gap
+/// rate into bucket `k`. This pins the guard: bucket `k` is sourced ONLY
+/// by its own StepStart -> StepEnd pair (which here is a measured zero).
+#[test]
+fn build_phase_buckets_with_stimulus_stalled_step_reports_measured_zero() {
+    use crate::scenario::snapshot::{DrainedSnapshotEntry, MissingStatsReason};
+    use crate::timeline::StimulusEvent;
+    let mk = |tag: &str, offset_ms: u64| DrainedSnapshotEntry {
+        tag: tag.to_string(),
+        report: fixture_report(),
+        stats: Err(MissingStatsReason::NoSchedulerBinary),
+        elapsed_ms: Some(9_000),
+        boundary_offset_ms: Some(offset_ms),
+        step_index: Some(9),
+    };
+    let drained = vec![mk("periodic_000", 1_500), mk("periodic_001", 2_500)];
+    let samples = SampleSeries::from_drained_typed(drained, None);
+    let start = |elapsed_ms: u64, k: u16, iters: u64| StimulusEvent {
+        elapsed_ms,
+        label: format!("StepStart[{k}]"),
+        op_kind: None,
+        detail: None,
+        total_iterations: Some(iters),
+        step_index: Some(k),
+        is_terminal: false,
+        is_step_end: false,
+    };
+    let end = |elapsed_ms: u64, k: u16, iters: u64| StimulusEvent {
+        elapsed_ms,
+        label: format!("StepEnd[{k}]"),
+        op_kind: None,
+        detail: None,
+        total_iterations: Some(iters),
+        step_index: Some(k),
+        is_terminal: false,
+        is_step_end: true,
+    };
+    // Step 1 STALLED: StepStart[1] == StepEnd[1] == 0, so its step-local
+    // pair is rate_to Some(0.0) — measured zero throughput. A persistent
+    // population then advances 500 during the 100ms teardown gap, so the
+    // cross-step StepEnd[1](0) -> StepStart[2](500) pair WOULD compute
+    // 500/0.1s = 5000/s — which must NOT land in bucket 1 (it is
+    // guard-skipped). Step 2 runs normally: 500 -> 1500 over 1s = 1000/s.
+    let stimulus = vec![
+        start(1_000, 1, 0),
+        end(2_000, 1, 0),
+        start(2_100, 2, 500),
+        end(3_100, 2, 1_500),
+        StimulusEvent::terminal(3_200, 1_500),
+    ];
+    let phases = crate::assert::build_phase_buckets_with_stimulus(&samples, &stimulus);
+    let step1 = phases
+        .iter()
+        .find(|p| p.step_index == 1)
+        .expect("step 1 bucket present");
+    let step2 = phases
+        .iter()
+        .find(|p| p.step_index == 2)
+        .expect("step 2 bucket present");
+    assert_eq!(
+        step1.metrics.get("iteration_rate").copied(),
+        Some(0.0),
+        "a stalled step reports measured-zero throughput, not the leaked \
+         5000/s teardown gap rate from the StepEnd[1] -> StepStart[2] pair; \
+         got {:?}",
+        step1.metrics.get("iteration_rate"),
+    );
+    assert_eq!(
+        step2.metrics.get("iteration_rate").copied(),
+        Some(1_000.0),
+        "step 2 still reports its own step-local rate; got {:?}",
+        step2.metrics.get("iteration_rate"),
+    );
+}
+
+/// The LAST step has no successor step event, so its
+/// iteration_rate needs the terminal scenario-end boundary. The
+/// terminal supplies that boundary (last step's rate = delta to the
+/// terminal count) and must NOT seed a phantom bucket — the bucket set
+/// stays equal to the sample-derived phases.
+#[test]
+fn build_phase_buckets_with_stimulus_terminal_gives_last_step_rate_no_phantom_bucket() {
+    use crate::scenario::snapshot::{DrainedSnapshotEntry, MissingStatsReason};
+    use crate::timeline::StimulusEvent;
+    let mk = |tag: &str, offset_ms: u64| DrainedSnapshotEntry {
+        tag: tag.to_string(),
+        report: fixture_report(),
+        stats: Err(MissingStatsReason::NoSchedulerBinary),
+        elapsed_ms: Some(9_000),
+        boundary_offset_ms: Some(offset_ms),
+        step_index: Some(9),
+    };
+    // Two captures: step 1 interior, step 2 interior.
+    let drained = vec![mk("periodic_000", 1_500), mk("periodic_001", 2_500)];
+    let samples = SampleSeries::from_drained_typed(drained, None);
+    let stim = |elapsed_ms: u64, k: u16, iters: u64| StimulusEvent {
+        elapsed_ms,
+        label: format!("StepStart[{k}]"),
+        op_kind: None,
+        detail: None,
+        total_iterations: Some(iters),
+        step_index: Some(k),
+        is_terminal: false,
+        is_step_end: false,
+    };
+    // Step starts at 1000/2000 (iters 0/1000); terminal at 3000 with
+    // final iters 3000 — the right boundary the LAST step (step 2)
+    // needs. The terminal carries step_index None + is_terminal so it
+    // seeds no bucket.
+    let stimulus = vec![
+        stim(1000, 1, 0),
+        stim(2000, 2, 1000),
+        StimulusEvent::terminal(3000, 3000),
+    ];
+    let phases = crate::assert::build_phase_buckets_with_stimulus(&samples, &stimulus);
+    let idxs: Vec<u16> = phases.iter().map(|p| p.step_index).collect();
+    assert_eq!(
+        idxs,
+        vec![1, 2],
+        "terminal must not add a phantom bucket; got {idxs:?}",
+    );
+    // Step 2 is the LAST step: its rate comes from the terminal,
+    // 1000 -> 3000 over 1s = 2000/s. Without the terminal it would be
+    // None (the bug this fixes).
+    let step2 = phases
+        .iter()
+        .find(|p| p.step_index == 2)
+        .expect("step 2 bucket present");
+    assert_eq!(
+        step2.metrics.get("iteration_rate").copied(),
+        Some(2000.0),
+        "last step's iteration_rate must come from the terminal boundary",
+    );
+}
+
+/// First-step zero-baseline rate, through the production aggregator + the FULL from_wire
+/// path (unit tests previously injected Some(0) directly, masking the
+/// wire 0->None collapse). The first step frame reads 0 cumulative
+/// iterations; after dropping the sentinel the first step's bucket gets
+/// a rate.
+#[test]
+fn build_phase_buckets_with_stimulus_first_step_zero_baseline_from_wire() {
+    use crate::scenario::snapshot::{DrainedSnapshotEntry, MissingStatsReason};
+    use crate::timeline::StimulusEvent;
+    let mk = |tag: &str, offset_ms: u64| DrainedSnapshotEntry {
+        tag: tag.to_string(),
+        report: fixture_report(),
+        stats: Err(MissingStatsReason::NoSchedulerBinary),
+        elapsed_ms: Some(9_000),
+        boundary_offset_ms: Some(offset_ms),
+        step_index: Some(9),
+    };
+    let drained = vec![mk("periodic_000", 1_500), mk("periodic_001", 2_500)];
+    let samples = SampleSeries::from_drained_typed(drained, None);
+    let wire = |elapsed_ms: u32, step_index: u16, iters: u64| crate::vmm::wire::StimulusEvent {
+        elapsed_ms,
+        step_index,
+        op_count: 0,
+        op_kinds: 0,
+        cgroup_count: 0,
+        worker_count: 1,
+        total_iterations: iters,
+    };
+    // First step frame reads 0 cumulative iters (workers just spawned).
+    let stimulus: Vec<StimulusEvent> = [wire(1000, 1, 0), wire(2000, 2, 2000)]
+        .iter()
+        .map(StimulusEvent::from_wire)
+        .collect();
+    let phases = crate::assert::build_phase_buckets_with_stimulus(&samples, &stimulus);
+    let step1 = phases
+        .iter()
+        .find(|p| p.step_index == 1)
+        .expect("step 1 bucket present");
+    assert_eq!(
+        step1.metrics.get("iteration_rate").copied(),
+        Some(2000.0),
+        "first step's iteration_rate must compute from the 0 baseline",
+    );
+}
+
+/// Loop-hold attribution: once the guest emits a start frame
+/// for a Loop step (the run_step Loop arm), a scenario ending on a Loop
+/// step must attribute the final window's throughput to the LOOP step,
+/// NOT graft it onto the prior step. This pins the host-side contract
+/// the guest fix relies on: with the loop step's own start frame
+/// present, (loop_start -> terminal) lands on the loop step's bucket and
+/// (prior_start -> loop_start) lands on the prior step's bucket.
+#[test]
+fn build_phase_buckets_with_stimulus_loop_step_rate_no_prior_graft() {
+    use crate::scenario::snapshot::{DrainedSnapshotEntry, MissingStatsReason};
+    use crate::timeline::StimulusEvent;
+    let mk = |tag: &str, offset_ms: u64| DrainedSnapshotEntry {
+        tag: tag.to_string(),
+        report: fixture_report(),
+        stats: Err(MissingStatsReason::NoSchedulerBinary),
+        elapsed_ms: Some(9_000),
+        boundary_offset_ms: Some(offset_ms),
+        step_index: Some(9),
+    };
+    // Prior step (step 1) interior + Loop step (step 2) interior.
+    let drained = vec![mk("periodic_000", 1_500), mk("periodic_001", 2_500)];
+    let samples = SampleSeries::from_drained_typed(drained, None);
+    let stim = |elapsed_ms: u64, k: u16, iters: u64| StimulusEvent {
+        elapsed_ms,
+        label: format!("StepStart[{k}]"),
+        op_kind: None,
+        detail: None,
+        total_iterations: Some(iters),
+        step_index: Some(k),
+        is_terminal: false,
+        is_step_end: false,
+    };
+    // step1@1000 (iters 0), loop step2@2000 (iters 1000, its OWN start
+    // frame — the loop-hold attribution fix), terminal@3000 (iters 3000).
+    let stimulus = vec![
+        stim(1000, 1, 0),
+        stim(2000, 2, 1000),
+        StimulusEvent::terminal(3000, 3000),
+    ];
+    let phases = crate::assert::build_phase_buckets_with_stimulus(&samples, &stimulus);
+    let step1 = phases
+        .iter()
+        .find(|p| p.step_index == 1)
+        .expect("step 1 bucket");
+    let loop_step = phases
+        .iter()
+        .find(|p| p.step_index == 2)
+        .expect("loop step bucket");
+    // Prior step gets ONLY its own window (0 -> 1000 over 1s = 1000/s),
+    // NOT the loop window grafted on.
+    assert_eq!(
+        step1.metrics.get("iteration_rate").copied(),
+        Some(1000.0),
+        "prior step must not absorb the loop step's window",
+    );
+    // Loop step gets the (loop_start -> terminal) rate: 1000 -> 3000
+    // over 1s = 2000/s.
+    assert_eq!(
+        loop_step.metrics.get("iteration_rate").copied(),
+        Some(2000.0),
+        "loop step must get its own throughput from its start frame + terminal",
     );
 }
 

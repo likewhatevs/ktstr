@@ -182,7 +182,7 @@ fn merge_three_cgroups_worst_wins_and_iterations_sum() {
                 worst_migration_ratio: worst_mig,
                 worst_p99_wake_latency_us: worst_p99_us,
                 worst_page_locality: page_locality,
-                worst_iterations_per_worker: iters_per_worker,
+                worst_iterations_per_worker: Some(iters_per_worker),
                 cgroups: vec![cg],
                 ..ScenarioStats::default()
             },
@@ -219,15 +219,18 @@ fn merge_three_cgroups_worst_wins_and_iterations_sum() {
         "third cgroup's 70.0us p99 is worst",
     );
     // Lower-is-worse rollups across 3 cgroups (every value is
-    // strictly positive so the sentinel branch is never taken;
-    // both fields use `fold_lowest_nonzero`):
+    // strictly positive so the sentinel/None branches are never
+    // taken). `worst_page_locality` uses `fold_lowest_nonzero`;
+    // `worst_iterations_per_worker` uses the None-aware
+    // `fold_lowest_some`:
     assert_eq!(
         s.worst_page_locality, 0.5,
         "second cgroup's 0.5 is the lowest-non-zero — 0 sentinel never wins",
     );
     assert_eq!(
-        s.worst_iterations_per_worker, 150.0,
-        "second cgroup's 150 is the lowest-non-zero per-worker throughput",
+        s.worst_iterations_per_worker,
+        Some(150.0),
+        "second cgroup's 150 is the lowest per-worker throughput",
     );
     // total_iterations SUMS across cgroups, not maxes:
     assert_eq!(
@@ -235,6 +238,102 @@ fn merge_three_cgroups_worst_wins_and_iterations_sum() {
         100 + 200 + 400,
         "total_iterations must sum (not max) across all merged cgroups",
     );
+}
+
+#[test]
+fn iterations_per_worker_distinguishes_no_workers_from_ran_zero() {
+    // num_workers == 0: no per-worker throughput is defined → None.
+    let no_workers = CgroupStats {
+        num_workers: 0,
+        total_iterations: 0,
+        ..CgroupStats::default()
+    };
+    assert_eq!(no_workers.iterations_per_worker(), None);
+
+    // Workers ran but completed zero iterations → measured Some(0.0),
+    // NOT None: this is a real throughput collapse, not missing data.
+    let ran_zero = CgroupStats {
+        num_workers: 4,
+        total_iterations: 0,
+        ..CgroupStats::default()
+    };
+    assert_eq!(ran_zero.iterations_per_worker(), Some(0.0));
+
+    // Workers ran with iterations → the throughput value.
+    let ran = CgroupStats {
+        num_workers: 4,
+        total_iterations: 400,
+        ..CgroupStats::default()
+    };
+    assert_eq!(ran.iterations_per_worker(), Some(100.0));
+}
+
+#[test]
+fn merge_worst_iterations_per_worker_lets_measured_zero_win() {
+    // The regression this pins: a cgroup that ran zero iterations
+    // (Some(0.0)) is the worst possible per-worker throughput and MUST
+    // win the "lowest" bucket. The old `fold_lowest_nonzero` treated
+    // 0.0 as an unreported sentinel and discarded it, hiding the
+    // starved cgroup behind a healthier one's reading.
+    fn with_worst(v: Option<f64>) -> AssertResult {
+        AssertResult {
+            outcomes: vec![],
+            passes: vec![],
+            stats: ScenarioStats {
+                worst_iterations_per_worker: v,
+                ..ScenarioStats::default()
+            },
+            measurements: std::collections::BTreeMap::new(),
+            info_notes: vec![],
+        }
+    }
+
+    // Accumulator starts None (Default).
+    let mut acc = AssertResult::pass();
+    assert_eq!(acc.stats.worst_iterations_per_worker, None);
+
+    // Fold a healthy reading, then a measured zero: the zero wins.
+    acc.merge(with_worst(Some(100.0)));
+    acc.merge(with_worst(Some(0.0)));
+    assert_eq!(
+        acc.stats.worst_iterations_per_worker,
+        Some(0.0),
+        "a cgroup that ran zero iterations must win the worst bucket",
+    );
+
+    // A later healthy reading does not displace the worst zero.
+    acc.merge(with_worst(Some(250.0)));
+    assert_eq!(acc.stats.worst_iterations_per_worker, Some(0.0));
+}
+
+#[test]
+fn merge_worst_iterations_per_worker_skips_no_data() {
+    // None contributors (cgroups with no workers) are skipped, never
+    // treated as zero — they must not displace a real reading nor
+    // fabricate a Some(0.0).
+    fn with_worst(v: Option<f64>) -> AssertResult {
+        AssertResult {
+            outcomes: vec![],
+            passes: vec![],
+            stats: ScenarioStats {
+                worst_iterations_per_worker: v,
+                ..ScenarioStats::default()
+            },
+            measurements: std::collections::BTreeMap::new(),
+            info_notes: vec![],
+        }
+    }
+
+    // Only None folded in → stays None (no data, not a zero).
+    let mut acc = AssertResult::pass();
+    acc.merge(with_worst(None));
+    acc.merge(with_worst(None));
+    assert_eq!(acc.stats.worst_iterations_per_worker, None);
+
+    // None does not displace a real reading.
+    acc.merge(with_worst(Some(75.0)));
+    acc.merge(with_worst(None));
+    assert_eq!(acc.stats.worst_iterations_per_worker, Some(75.0));
 }
 
 #[test]
@@ -295,11 +394,11 @@ fn merge_scenario_stats_worst_wins_and_iterations_sum() {
 fn merge_derived_ratios_use_correct_polarities() {
     let mut a = AssertResult::pass();
     a.stats.worst_wake_latency_tail_ratio = 2.0;
-    a.stats.worst_iterations_per_worker = 500.0;
+    a.stats.worst_iterations_per_worker = Some(500.0);
 
     let mut b = AssertResult::pass();
     b.stats.worst_wake_latency_tail_ratio = 8.0;
-    b.stats.worst_iterations_per_worker = 100.0;
+    b.stats.worst_iterations_per_worker = Some(100.0);
 
     a.merge(b);
 
@@ -310,58 +409,62 @@ fn merge_derived_ratios_use_correct_polarities() {
         a.stats.worst_wake_latency_tail_ratio,
     );
     assert_eq!(
-        a.stats.worst_iterations_per_worker, 100.0,
-        "iterations_per_worker uses lowest-non-zero — 100.0 is \
-         worse than 500.0 (less throughput per worker); got {}",
+        a.stats.worst_iterations_per_worker,
+        Some(100.0),
+        "iterations_per_worker uses lowest — 100.0 is worse than \
+         500.0 (less throughput per worker); got {:?}",
         a.stats.worst_iterations_per_worker,
     );
 
-    // Sentinel-zero convention, direction 1: a 0.0 reading on
-    // `other` is the unreported sentinel and MUST NOT clobber
-    // self's positive measurement. `fold_lowest_nonzero` keeps
-    // self=300 when other=0.
+    // No-data convention, direction 1: a `None` reading on `other`
+    // (no cgroup reported a worker) MUST NOT clobber self's real
+    // measurement. `fold_lowest_some` skips None contributors.
     let mut c = AssertResult::pass();
-    c.stats.worst_iterations_per_worker = 300.0;
+    c.stats.worst_iterations_per_worker = Some(300.0);
     let mut empty = AssertResult::pass();
-    empty.stats.worst_iterations_per_worker = 0.0;
+    empty.stats.worst_iterations_per_worker = None;
     c.merge(empty);
     assert_eq!(
-        c.stats.worst_iterations_per_worker, 300.0,
-        "self=300 must be retained when other=0 (unreported \
-         sentinel) — a plain min would let the sentinel \
-         clobber the real reading; got {}",
+        c.stats.worst_iterations_per_worker,
+        Some(300.0),
+        "self=Some(300) must be retained when other=None (no data); \
+         got {:?}",
         c.stats.worst_iterations_per_worker,
     );
 
-    // Sentinel-zero convention, direction 2: the symmetric
-    // case where `self` starts at 0.0 (the accumulator-default
-    // sentinel from `AssertResult::pass()`) and `other`
-    // reports a positive reading. self must adopt other's
-    // measurement; this is the load-bearing case for
+    // No-data convention, direction 2: `self` starts at None (the
+    // accumulator default from `AssertResult::pass()`) and `other`
+    // reports a real reading. self must adopt other's measurement;
+    // this is the load-bearing case for
     // `AssertResult::pass().merge(real)`.
     let mut d = AssertResult::pass();
-    d.stats.worst_iterations_per_worker = 0.0;
+    assert_eq!(
+        d.stats.worst_iterations_per_worker, None,
+        "accumulator default must be None",
+    );
     let mut real = AssertResult::pass();
-    real.stats.worst_iterations_per_worker = 300.0;
+    real.stats.worst_iterations_per_worker = Some(300.0);
     d.merge(real);
     assert_eq!(
-        d.stats.worst_iterations_per_worker, 300.0,
-        "self=0 (accumulator sentinel) must adopt other=300 \
-         — the `AssertResult::pass().merge(real)` pattern \
-         depends on this; got {}",
+        d.stats.worst_iterations_per_worker,
+        Some(300.0),
+        "self=None (accumulator default) must adopt other=Some(300) \
+         — the `AssertResult::pass().merge(real)` pattern depends \
+         on this; got {:?}",
         d.stats.worst_iterations_per_worker,
     );
 
-    // Both-zero: no positive reading on either side, the
-    // sentinel-fold keeps the field at 0.0.
+    // Both-None: no data on either side stays None. A measured
+    // Some(0.0) winning the bucket is covered separately by
+    // `merge_worst_iterations_per_worker_lets_measured_zero_win`.
     let mut e = AssertResult::pass();
-    e.stats.worst_iterations_per_worker = 0.0;
+    e.stats.worst_iterations_per_worker = None;
     let mut f = AssertResult::pass();
-    f.stats.worst_iterations_per_worker = 0.0;
+    f.stats.worst_iterations_per_worker = None;
     e.merge(f);
     assert_eq!(
-        e.stats.worst_iterations_per_worker, 0.0,
-        "both-zero must stay zero; got {}",
+        e.stats.worst_iterations_per_worker, None,
+        "both-None must stay None; got {:?}",
         e.stats.worst_iterations_per_worker,
     );
 

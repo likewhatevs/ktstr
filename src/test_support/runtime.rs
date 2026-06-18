@@ -186,6 +186,29 @@ pub(crate) fn no_perf_mode_for_entry(entry: &KtstrTestEntry) -> bool {
     no_perf_mode_active() || entry.no_perf_mode
 }
 
+/// True when `KTSTR_PERF_ONLY` is set to a NON-EMPTY value.
+///
+/// Mirrors [`no_perf_mode_active`]'s empty-as-unset contract (see
+/// [`crate::KTSTR_PERF_ONLY_ENV`]): any non-empty value restricts the
+/// run to `performance_mode` tests, an empty value does not.
+/// Consulted at the dispatch named/gauntlet routes and the eval entry
+/// to skip non-perf entries before VM boot. Set by the mergebase
+/// perf-delta subcommand.
+pub(crate) fn perf_only_active() -> bool {
+    std::env::var(crate::KTSTR_PERF_ONLY_ENV)
+        .map(|v| !v.is_empty())
+        .unwrap_or(false)
+}
+
+/// Whether `perf_only_active()` requires SKIPPING this entry: perf-only
+/// mode is on and the entry is not a `performance_mode` test. A
+/// `performance_mode` entry is always kept (it is the selection
+/// target); every other entry is skipped so a perf-delta run measures
+/// only the perf-configured tests.
+pub(crate) fn perf_only_skips_entry(entry: &KtstrTestEntry) -> bool {
+    perf_only_active() && !entry.performance_mode
+}
+
 /// Derive initramfs archive path, host path, and guest path from a
 /// scheduler's `config_file`. Returns `None` when no config file is set.
 pub(crate) fn config_file_parts(entry: &KtstrTestEntry) -> Option<(String, PathBuf, String)> {
@@ -918,6 +941,70 @@ mod tests {
             "empty-string env must be treated as UNSET — a regression \
              here flips perf-mode for every consumer that routes \
              through no_perf_mode_active",
+        );
+    }
+
+    #[test]
+    fn perf_only_active_true_when_env_set_to_value() {
+        let _l = lock_env();
+        let _g = EnvVarGuard::set(crate::KTSTR_PERF_ONLY_ENV, "1");
+        assert!(perf_only_active());
+    }
+
+    #[test]
+    fn perf_only_active_false_when_env_unset() {
+        let _l = lock_env();
+        let _g = EnvVarGuard::remove(crate::KTSTR_PERF_ONLY_ENV);
+        assert!(!perf_only_active());
+    }
+
+    /// Empty-as-unset contract (mirrors `no_perf_mode_active`): a
+    /// `KTSTR_PERF_ONLY=` pass-through must NOT silently skip every
+    /// non-perf test.
+    #[test]
+    fn perf_only_active_false_when_env_set_to_empty_string() {
+        let _l = lock_env();
+        let _g = EnvVarGuard::set(crate::KTSTR_PERF_ONLY_ENV, "");
+        assert!(
+            !perf_only_active(),
+            "empty-string env must be treated as UNSET",
+        );
+    }
+
+    /// Selection logic: with perf-only active, a non-performance_mode
+    /// entry is skipped while a performance_mode entry is kept. When
+    /// perf-only is inactive, neither is skipped.
+    #[test]
+    fn perf_only_skips_entry_keeps_perf_skips_others() {
+        use super::super::entry::KtstrTestEntry;
+        let perf = KtstrTestEntry {
+            name: "perf",
+            performance_mode: true,
+            ..KtstrTestEntry::DEFAULT
+        };
+        let plain = KtstrTestEntry {
+            name: "plain",
+            performance_mode: false,
+            ..KtstrTestEntry::DEFAULT
+        };
+
+        let _l = lock_env();
+        {
+            let _g = EnvVarGuard::set(crate::KTSTR_PERF_ONLY_ENV, "1");
+            assert!(
+                !perf_only_skips_entry(&perf),
+                "a performance_mode test is the selection target, never skipped",
+            );
+            assert!(
+                perf_only_skips_entry(&plain),
+                "a non-performance_mode test must be skipped under perf-only",
+            );
+        }
+        let _g = EnvVarGuard::remove(crate::KTSTR_PERF_ONLY_ENV);
+        assert!(!perf_only_skips_entry(&perf));
+        assert!(
+            !perf_only_skips_entry(&plain),
+            "perf-only inactive => nothing is skipped on this axis",
         );
     }
 

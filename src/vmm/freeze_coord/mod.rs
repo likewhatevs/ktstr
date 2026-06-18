@@ -2140,6 +2140,15 @@ impl KtstrVm {
                     /// resolve `scx_tasks` / `jiffies_64` /
                     /// `scx_watchdog_timestamp` correctly.
                     phys_base: u64,
+                    /// Runtime VIRTUAL KASLR slide — distinct from
+                    /// `phys_base`, the PHYSICAL slide. `scx_tasks` is a
+                    /// link-time symbol but the global list's `.next`
+                    /// pointers are runtime addresses, so the global
+                    /// walk's terminator must compare against the runtime
+                    /// head `slid_kernel_kva(scx_tasks_kva, kaslr_offset)`.
+                    /// Sourced from `coord_kaslr_offset()`; `0` when KASLR
+                    /// is off / not yet derived.
+                    kaslr_offset: u64,
                 }
                 // Lazy-construct BpfMapAccessorOwned. The constructor
                 // parses vmlinux ELF (goblin) and BTF (~MB-scale
@@ -4354,6 +4363,7 @@ impl KtstrVm {
                                 walk,
                                 start_kernel_map: kernel.start_kernel_map(),
                                 phys_base: kernel.phys_base(),
+                                kaslr_offset: coord_kaslr_offset(),
                             })
                         };
                         match try_resolve() {
@@ -6343,6 +6353,10 @@ impl KtstrVm {
                                         "dump prerequisites unavailable".to_string(),
                                     ),
                                     dump_truncated_at_us: None,
+                                    // Partial dump never enters the per-map
+                                    // render loop, so no map was dropped by
+                                    // deadline truncation.
+                                    maps_truncated: 0,
                                     probe_counters: None,
                                     scx_static_ranges: Default::default(),
                                     is_placeholder: false,
@@ -8534,6 +8548,7 @@ impl KtstrVm {
                             ctx.watchdog_timestamp_pa,
                             ctx.start_kernel_map,
                             ctx.phys_base,
+                            ctx.kaslr_offset,
                         );
                         // Track scan trajectory for the diagnostic
                         // logged when err_triggered fires before the
@@ -8792,6 +8807,7 @@ impl KtstrVm {
                                     ctx.watchdog_timestamp_pa,
                                     ctx.start_kernel_map,
                                     ctx.phys_base,
+                                    ctx.kaslr_offset,
                                 );
                             if backstop_max_age >= half_threshold_jiffies {
                                 tracing::info!(
@@ -10179,7 +10195,7 @@ impl KtstrVm {
             // port-1 TLV bytes the guest wrote that the freeze
             // coordinator's tx_evt-driven mid-run drain did not
             // already consume; the merge into `guest_messages` keeps
-            // existing readers (eval.rs, sidecar) working without
+            // existing readers (crate::test_support::eval, sidecar) working without
             // any per-message-type code change.
             virtio_con,
             // Mid-run TLV entries the freeze coordinator already
@@ -12198,23 +12214,23 @@ impl KtstrVm {
         // stream) with the post-exit `drain_bulk()`. Mid-flight
         // entries come first since they were drained during
         // execution.
-        let (guest_messages, stimulus_events) =
+        // The complete TLV log (mid-flight + post-exit). The per-phase
+        // stimulus timeline (step frames + scenario-end terminal) is
+        // derived on demand from these entries via
+        // `VmResult::stimulus_timeline()` — no separate pre-extracted
+        // stimulus vec is stored, so every consumer sees the same
+        // complete timeline (the previous wire-only field omitted the
+        // terminal and silently dropped the last step's iteration_rate
+        // for post_vm re-derivation).
+        let guest_messages =
             if !mid_flight_drain.entries.is_empty() || !bulk_drain.entries.is_empty() {
                 let mut all_entries = mid_flight_drain.entries;
                 all_entries.extend(bulk_drain.entries);
-                let events: Vec<wire::StimulusEvent> = all_entries
-                    .iter()
-                    .filter(|e| e.msg_type == wire::MSG_TYPE_STIMULUS && e.crc_ok)
-                    .filter_map(|e| wire::StimulusEvent::from_payload(&e.payload))
-                    .collect();
-                (
-                    Some(BulkDrainResult {
-                        entries: all_entries,
-                    }),
-                    events,
-                )
+                Some(BulkDrainResult {
+                    entries: all_entries,
+                })
             } else {
-                (None, Vec::new())
+                None
             };
 
         let com2_bytes = run.com2.lock().output();
@@ -12350,6 +12366,16 @@ impl KtstrVm {
         // and the drainer thread exits.
         let stats_client = run.stats_client;
 
+        // Count periodic captures that landed REAL BPF state, before
+        // the bridge is moved into the result. `periodic_fired`
+        // counts every attempted boundary including rendezvous-timeout
+        // placeholders; `periodic_real` is the placeholder-excluded
+        // floor so the failure display can distinguish "fired but
+        // degraded" from genuine coverage. Computed here (run just
+        // ended, nothing drained yet) so it is independent of any
+        // later test-side drain that would empty the bridge.
+        let periodic_real = run.snapshot_bridge.periodic_real_count();
+
         Ok(VmResult {
             success: !timed_out && exit_code == 0,
             // Default false at construction — set true (when applicable)
@@ -12364,7 +12390,6 @@ impl KtstrVm {
             stderr: console_output,
             monitor: monitor_report,
             guest_messages,
-            stimulus_events,
             verifier_stats,
             kvm_stats: None,
             crash_message,
@@ -12394,6 +12419,7 @@ impl KtstrVm {
             snapshot_bridge: run.snapshot_bridge,
             stats_client,
             periodic_fired: run.periodic_fired,
+            periodic_real,
             periodic_target: run.periodic_target,
             // Plumb the virt-KASLR snapshot from VmRunState
             // (populated at `VmRunState { kern_kaslr_offset: ... }`
@@ -12410,6 +12436,11 @@ impl KtstrVm {
             // Leaving it `None` here is correct; the eval-layer
             // stamping happens before any post_vm callback runs.
             entry_name: None,
+            // Empty cache: the single bridge drain is deferred to the
+            // first `captures_series()` call on the host (post_vm or
+            // evaluate_vm_result). See the `periodic_series_cache`
+            // field doc.
+            periodic_series_cache: std::sync::OnceLock::new(),
         })
     }
 

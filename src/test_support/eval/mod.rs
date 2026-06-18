@@ -449,6 +449,13 @@ fn run_ktstr_test_inner_impl(
         record_skip_sidecar(entry);
         return Ok(AssertResult::skip(REASON));
     }
+    if super::runtime::perf_only_skips_entry(entry) {
+        const REASON: &str =
+            "KTSTR_PERF_ONLY is active and this test is not a performance_mode test";
+        crate::report::test_skip(format_args!("{}: {REASON}", entry.name));
+        record_skip_sidecar(entry);
+        return Ok(AssertResult::skip(REASON));
+    }
     ensure_kvm()?;
     let kernel = resolve_test_kernel()?;
     // Hold a reader flock on the cache entry (if the resolved
@@ -1136,7 +1143,15 @@ fn run_ktstr_test_inner_impl(
     // pairs an LlmExtract `RawPayloadOutput` to its empty-metrics
     // companion by EQUAL `payload_index`, not by emission order —
     // see `host_side_llm_extract` for the pairing implementation.
-    let mut stimulus_events = Vec::new();
+    // Complete per-phase stimulus timeline (step-start frames + the
+    // scenario-end terminal boundary) via the single shared accessor —
+    // the SAME timeline a post_vm callback gets, so the production eval
+    // and any out-of-tree re-derivation can never disagree on the last
+    // step's iteration_rate boundary. The bulk loop below handles only
+    // the remaining message kinds (Profraw / WprofTrace / PayloadMetrics
+    // / RawPayloadOutput); Stimulus + ScenarioEnd are consumed by
+    // stimulus_timeline().
+    let stimulus_events = result.stimulus_timeline();
     let mut payload_metrics: Vec<crate::test_support::PayloadMetrics> = Vec::new();
     let mut raw_outputs: Vec<crate::test_support::RawPayloadOutput> = Vec::new();
     if let Some(ref bulk) = result.guest_messages {
@@ -1186,14 +1201,6 @@ fn run_ktstr_test_inner_impl(
                         }
                     }
                 }
-                Some(crate::vmm::wire::MsgType::Stimulus) => {
-                    if bulk_entry.crc_ok
-                        && let Some(ev) =
-                            crate::vmm::wire::StimulusEvent::from_payload(&bulk_entry.payload)
-                    {
-                        stimulus_events.push(crate::timeline::StimulusEvent::from_wire(&ev));
-                    }
-                }
                 Some(crate::vmm::wire::MsgType::PayloadMetrics) => {
                     if bulk_entry.crc_ok {
                         match postcard::from_bytes::<crate::test_support::PayloadMetrics>(
@@ -1218,21 +1225,29 @@ fn run_ktstr_test_inner_impl(
                         }
                     }
                 }
-                // The remaining verdict-bearing variants
-                // (TestResult, Exit, SchedExit, ScenarioStart,
-                // ScenarioEnd, Stdout, Stderr, SchedLog, Lifecycle,
-                // ExecExit, Dmesg, ProbeOutput, SnapshotReply,
-                // Crash) are consumed by other walkers further down
-                // the pipeline (parse_assert_result_from_drain,
+                // Stimulus + StepEnd + ScenarioEnd are consumed by
+                // `result.stimulus_timeline()` above (the per-phase
+                // timeline: StepEnd is decoded via
+                // `StimulusEvent::from_step_end` alongside Stimulus's
+                // `from_wire` and ScenarioEnd's terminal), so they are
+                // no-ops in this loop. The remaining verdict-bearing
+                // variants in this arm (TestResult, Exit, SchedExit,
+                // ScenarioStart, ScenarioPause, ScenarioResume, Stdout,
+                // SchedLog, Lifecycle, ExecExit, Dmesg, ProbeOutput,
+                // SnapshotReply, Crash) are consumed by other walkers
+                // further down the pipeline (parse_assert_result_from_drain,
                 // bulk_exit lookup in collect_results, lifecycle
                 // classifier, sched_log concatenator, etc.). No
-                // per-entry side effect here.
+                // per-entry side effect here. (Stderr is NOT in this arm —
+                // it has its own arm below that streams to host stderr.)
                 Some(
-                    crate::vmm::wire::MsgType::TestResult
+                    crate::vmm::wire::MsgType::Stimulus
+                    | crate::vmm::wire::MsgType::StepEnd
+                    | crate::vmm::wire::MsgType::ScenarioEnd
+                    | crate::vmm::wire::MsgType::TestResult
                     | crate::vmm::wire::MsgType::Exit
                     | crate::vmm::wire::MsgType::SchedExit
                     | crate::vmm::wire::MsgType::ScenarioStart
-                    | crate::vmm::wire::MsgType::ScenarioEnd
                     | crate::vmm::wire::MsgType::ScenarioPause
                     | crate::vmm::wire::MsgType::ScenarioResume
                     | crate::vmm::wire::MsgType::Stdout
@@ -1548,17 +1563,27 @@ fn evaluate_vm_result(
     // Build phase buckets early so the failure-message timeline
     // renderer can drive from the unified PhaseBucket source
     // (Timeline::from_phase_buckets) rather than re-deriving phases
-    // from raw monitor samples (Timeline::build). The drain
-    // consumes the snapshot bridge; success-path consumers below
-    // read pre-built buckets + the cached SampleSeries instead of
-    // re-draining (the bridge is already empty after this point).
-    let drained_for_phases = result.snapshot_bridge.drain_ordered_with_stats();
-    let early_sample_series = crate::scenario::sample::SampleSeries::from_drained_typed(
-        drained_for_phases,
-        result.monitor.clone(),
-    );
+    // from raw monitor samples (Timeline::build). `captures_series()`
+    // performs the bridge's single destructive drain and memoizes it;
+    // a `post_vm` callback that already read the series via
+    // `result.phase_buckets()` / `result.periodic_series()` (post_vm
+    // runs BEFORE this) shares that same cached drain, so neither
+    // starves the other. Runs before any early return so `stats.phases`
+    // fills on the failure paths too. The buckets use this function's
+    // `stimulus_events` param (the production caller passes
+    // `result.stimulus_timeline()`, which is exactly what
+    // `result.phase_buckets()` uses — so `stats.phases` and
+    // `result.phase_buckets()` carry identical content; pinned by
+    // `phase_buckets_equals_stats_phases`).
+    //
+    // Bucket the PERIODIC-ONLY view: on-demand `Op::CaptureSnapshot` and
+    // watchpoint-fire captures are off-cadence outliers (see
+    // `SampleSeries::periodic_only`) that must not pollute the per-phase
+    // metric folds. `periodic_series()` reads the same memoized
+    // single-drain `captures_series()` cache, so this does not re-drain.
+    let early_periodic_series = result.periodic_series();
     let mut early_phase_buckets =
-        crate::assert::build_phase_buckets_with_stimulus(&early_sample_series, stimulus_events);
+        crate::assert::build_phase_buckets_with_stimulus(&early_periodic_series, stimulus_events);
     // Build timeline from the pre-bucketed phases. When no
     // PhaseBuckets exist (scenario had no periodic captures,
     // e.g. single-phase tests) but monitor samples ARE present,
@@ -1785,6 +1810,32 @@ fn evaluate_vm_result(
             check_result.merge(AssertResult::fail(d));
         }
 
+        // Populate per-phase telemetry + cross-RUN ext_metrics on
+        // check_result BEFORE write_sidecar below: the sidecar is the
+        // durable telemetry every cross-run comparison reads, so it must
+        // carry stats.phases + stats.ext_metrics, not the empty defaults
+        // (previously these were filled AFTER write_sidecar, so the
+        // persisted sidecar dropped both). Phase buckets were built at
+        // evaluate_vm_result entry from result.periodic_series()
+        // (off-cadence on-demand / watchpoint captures excluded); reuse the
+        // pre-built vec + already-drained series rather than re-draining.
+        // The cross-RUN ext_metrics fill covers METRICS entries with a
+        // read_sample wire but no typed GauntletRow field
+        // (populate_run_ext_metrics) plus the phase-only metrics whose
+        // read_sample returns None — avg_imbalance_ratio, iteration_rate,
+        // system_time_ns / user_time_ns (populate_run_ext_metrics_from_phases).
+        // Without it those keys never reach the sidecar and
+        // `cargo ktstr stats compare` silently drops the rows.
+        check_result.stats.phases = std::mem::take(&mut early_phase_buckets);
+        crate::assert::populate_run_ext_metrics(
+            &early_periodic_series,
+            &mut check_result.stats.ext_metrics,
+        );
+        crate::assert::populate_run_ext_metrics_from_phases(
+            &check_result.stats.phases,
+            &mut check_result.stats.ext_metrics,
+        );
+
         // Write sidecar before checking pass/fail so both outcomes are captured.
         // A sidecar write failure is logged but not propagated: the test
         // verdict itself is still valid — only post-run stats tooling
@@ -1839,6 +1890,11 @@ fn evaluate_vm_result(
                 .map(|r| format!("\n\n--- auto-repro ---\n{r}"))
                 .unwrap_or_default();
             let timeline_section = build_timeline_section();
+            // Per-cgroup telemetry is now built unconditionally per
+            // declared cgroup (collect_handles no longer gates it behind
+            // has_worker_checks), so an empty `cgroups` here means NO
+            // cgroup was declared (e.g. a host_only run), not "no worker
+            // check was configured" — suppress the section in that case.
             let stats_section = if !check_result.stats.cgroups.is_empty() {
                 let s = &check_result.stats;
                 let mut lines = vec![format!(
@@ -1851,11 +1907,14 @@ fn evaluate_vm_result(
                 )];
                 for (i, cg) in s.cgroups.iter().enumerate() {
                     lines.push(format!(
-                        "  cg{}: workers={} cpus={} spread={:.1}% gap={}ms migrations={} iter={}",
+                        "  cg{}: workers={} cpus={} spread={} gap={}ms migrations={} iter={}",
                         i,
                         cg.num_workers,
                         cg.num_cpus,
-                        cg.spread,
+                        // None = off-CPU% not measured (no worker with
+                        // wall time); show "n/a" rather than a fake 0%.
+                        cg.spread
+                            .map_or_else(|| "n/a".to_string(), |s| format!("{s:.1}%")),
                         cg.max_gap_ms,
                         cg.total_migrations,
                         cg.total_iterations,
@@ -1865,10 +1924,12 @@ fn evaluate_vm_result(
             } else {
                 String::new()
             };
-            // Structural filter for the console-dump gate: match on
-            // `DetailKind::SchedulerDied` only. Every scheduler-exit
-            // emit site in this crate tags its `AssertDetail` with
-            // that variant (see the ops.rs / scenario/mod.rs call
+            // Structural filter for the console-dump gate: match on the
+            // three scheduler-liveness `DetailKind` variants
+            // (`SchedulerCrashed` / `SchedulerExitedCleanly` /
+            // `SchedulerDiedUnknownReason`) below. Every scheduler-exit
+            // emit site in this crate tags its `AssertDetail` with one
+            // of those variants (see the ops.rs / scenario/mod.rs call
             // sites plus the `format_sched_died_*` helpers in
             // `assert.rs`), so filtering by kind is sufficient — the
             // prior `is_scheduler_death()` prefix-match fallback was
@@ -2004,59 +2065,12 @@ fn evaluate_vm_result(
             }
         }
 
-        // Auto-populate per-phase metric buckets on the returned
-        // AssertResult. Drains the snapshot bridge for periodic
-        // captures + on-demand fixture-path captures, builds a
-        // SampleSeries, and folds it through
-        // `crate::assert::build_phase_buckets` so the test author
-        // sees `result.stats.phases` populated without needing to
-        // manually stitch the snapshot drain to the metric
-        // aggregator. Single-phase scenarios with no Steps still
-        // run (the bridge may have a periodic capture or two)
-        // but yield a phases vec containing only the BASELINE
-        // bucket; the renderer is sentinel-free so an empty
-        // metrics map paints as "no data" rather than masquerading
-        // as real zeros.
-        //
-        // The bridge drain here is the framework's contract drain;
-        // an integration test that bypasses evaluate_vm_result
-        // (e.g. tests/stats_bridge_e2e.rs) still owns its own
-        // direct `result.snapshot_bridge.drain*()` call path
-        // because those tests instrument the framework rather
-        // than depending on it. Within evaluate_vm_result the
-        // drain is the final consumer.
-        // Phase buckets were built at evaluate_vm_result entry
-        // (drain happened there) so the unified PhaseBucket source
-        // feeds both the failure-message Timeline render (via
-        // Timeline::from_phase_buckets up top) and the stamped
-        // ScenarioStats.phases below. Reuse the pre-built vec +
-        // SampleSeries rather than re-draining (the bridge was
-        // already consumed).
-        check_result.stats.phases = std::mem::take(&mut early_phase_buckets);
-        let sample_series_for_phases = &early_sample_series;
-        // Cross-RUN aggregate fill: for any METRICS entry with a
-        // read_sample wire but no typed GauntletRow field, compute
-        // the per-RUN aggregate from the same samples and write into
-        // stats.ext_metrics. Without this, MetricDef::read returns
-        // None on both sides at cargo ktstr stats compare time, the
-        // EPSILON guard drops the row, and the operator never sees
-        // the metric — a silent data drop. Skips keys already
-        // populated as typed fields or by other producers.
-        crate::assert::populate_run_ext_metrics(
-            sample_series_for_phases,
-            &mut check_result.stats.ext_metrics,
-        );
-        // Sibling fill from per-phase metrics — closes the gap
-        // for avg_imbalance_ratio (MonitorSample-sourced) and
-        // iteration_rate (stimulus-event-sourced). Their
-        // read_sample dispatches return None so the SampleSeries
-        // path above misses them; without this call, those keys
-        // never appear in ext_metrics and cargo ktstr stats
-        // compare silently drops them.
-        crate::assert::populate_run_ext_metrics_from_phases(
-            &check_result.stats.phases,
-            &mut check_result.stats.ext_metrics,
-        );
+        // (Per-phase telemetry + cross-RUN ext_metrics were populated on
+        // check_result above, BEFORE write_sidecar, so the persisted
+        // sidecar carries them — see the populate block at the sidecar
+        // write site. stats.phases feeds both the failure-message Timeline
+        // render and the test author's result.stats.phases; the sentinel-
+        // free renderer paints an empty metrics map as "no data".)
 
         return Ok(check_result);
     }

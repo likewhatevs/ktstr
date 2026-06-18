@@ -140,6 +140,20 @@ fn assert_api_gap_helpers(result: &VmResult) -> Result<()> {
         );
     }
 
+    // gap 4: VmResult::phase_buckets() — the framework-canonical
+    // per-phase buckets — is reachable from post_vm and non-empty for
+    // a run with periodic captures. Reads the SAME cached drain
+    // `periodic_series()` populated above, so the two accessors compose
+    // without the drain-once starvation fixed (pre-cache, the
+    // earlier periodic_series() drain would have left this empty).
+    let phase_buckets = result.phase_buckets();
+    anyhow::ensure!(
+        !phase_buckets.is_empty(),
+        "VmResult::phase_buckets() returned empty despite periodic_fired \
+         = {periodic_fired}; the phase-buckets accessor must surface the framework's \
+         per-phase buckets to post_vm even after periodic_series() ran",
+    );
+
     Ok(())
 }
 

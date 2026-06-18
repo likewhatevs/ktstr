@@ -142,6 +142,21 @@ fn prebuilt_blob_bin_envs(
 /// that subcommand hands every argument to the user, so the profile
 /// is set via the user's trailing args (or not at all). `test` and
 /// `coverage` wire their `--release` flag through to this argument.
+/// The `KTSTR_SCHEDULER_PROFILE` value the scheduler-under-test build
+/// should use given the two CLI flags: `Some("release")` when EITHER
+/// `--release` (everything release) or `--release-scheduler` (only the
+/// scheduler) is set, else `None` (default dev profile). Pure so the
+/// flag->env coupling is unit-testable — `run_cargo_sub` itself execs
+/// cargo and can't be inspected directly.
+fn scheduler_profile_env(release: bool, release_scheduler: bool) -> Option<&'static str> {
+    (release || release_scheduler).then_some("release")
+}
+
+// Private internal dispatch helper with a cohesive run-config arg list
+// (sub-command identity + the four CLI flags + passthrough args);
+// bundling into a struct would not improve clarity for a fn called from
+// exactly the three sibling wrappers above.
+#[allow(clippy::too_many_arguments)]
 fn run_cargo_sub(
     sub_argv: &[&str],
     label: &str,
@@ -149,6 +164,7 @@ fn run_cargo_sub(
     no_perf_mode: bool,
     no_skip_mode: bool,
     release: bool,
+    release_scheduler: bool,
     args: Vec<String>,
 ) -> Result<(), String> {
     let mut cmd = Command::new("cargo");
@@ -169,6 +185,14 @@ fn run_cargo_sub(
     }
     if no_skip_mode {
         cmd.env(ktstr::KTSTR_NO_SKIP_MODE_ENV, "1");
+    }
+    // Build the scheduler-under-test release when either `--release`
+    // (everything release) or `--release-scheduler` (only the scheduler,
+    // harness stays dev) is set. The test binary's `build_and_find_binary`
+    // reads this and adds `--release` to its `cargo build -p <scheduler>`,
+    // decoupling the scheduler profile from the harness profile.
+    if let Some(profile) = scheduler_profile_env(release, release_scheduler) {
+        cmd.env(ktstr::KTSTR_SCHEDULER_PROFILE_ENV, profile);
     }
 
     // Hand the child build cargo-ktstr's embedded busybox / wprof so its
@@ -300,7 +324,7 @@ fn run_cargo_sub(
     eprintln!("  {}", sidecar_dir.display());
     eprintln!("    *.failure-dump.json       — VM-state JSON when a test crashed or asserted");
     eprintln!("    *.repro.failure-dump.json — VM-state JSON from the auto-repro retry");
-    eprintln!("    *.sidecar.json            — per-scenario stats + scheduler metadata");
+    eprintln!("    *.ktstr.json              — per-scenario stats + scheduler metadata");
     eprintln!("    *.wprof.pb                — Perfetto trace from #[ktstr_test(wprof)] tests");
     eprintln!("    *.repro.wprof.pb          — Perfetto trace from the auto-repro retry");
     eprintln!(
@@ -469,6 +493,7 @@ pub(crate) fn run_test(
     no_perf_mode: bool,
     no_skip_mode: bool,
     release: bool,
+    release_scheduler: bool,
     args: Vec<String>,
 ) -> Result<(), String> {
     ktstr::cli::check_kvm().map_err(|e| format!("{e:#}"))?;
@@ -480,6 +505,7 @@ pub(crate) fn run_test(
         no_perf_mode,
         no_skip_mode,
         release,
+        release_scheduler,
         args,
     )
 }
@@ -489,6 +515,7 @@ pub(crate) fn run_coverage(
     no_perf_mode: bool,
     no_skip_mode: bool,
     release: bool,
+    release_scheduler: bool,
     args: Vec<String>,
 ) -> Result<(), String> {
     ktstr::cli::check_kvm().map_err(|e| format!("{e:#}"))?;
@@ -500,6 +527,7 @@ pub(crate) fn run_coverage(
         no_perf_mode,
         no_skip_mode,
         release,
+        release_scheduler,
         args,
     )
 }
@@ -512,14 +540,15 @@ pub(crate) fn run_llvm_cov(
 ) -> Result<(), String> {
     // `llvm-cov` is raw passthrough — the user supplies every
     // argument after the subcommand name, including any profile
-    // selection. `release: false` here means "don't inject a profile
-    // ourselves"; the user decides.
+    // selection. `release: false` / `release_scheduler: false` here
+    // mean "don't inject a profile ourselves"; the user decides.
     run_cargo_sub(
         LLVM_COV_SUB_ARGV,
         "llvm-cov",
         kernel,
         no_perf_mode,
         no_skip_mode,
+        false,
         false,
         args,
     )
@@ -528,6 +557,19 @@ pub(crate) fn run_llvm_cov(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Truth table for the flag->scheduler-profile coupling:
+    /// EITHER --release (everything release) or --release-scheduler
+    /// (scheduler only) yields `Some("release")`; neither yields `None`
+    /// (dev). A regression narrowing the guard to drop the `release ||`
+    /// (so --release stops building the scheduler release) flips a cell.
+    #[test]
+    fn scheduler_profile_env_truth_table() {
+        assert_eq!(scheduler_profile_env(false, false), None);
+        assert_eq!(scheduler_profile_env(true, false), Some("release"));
+        assert_eq!(scheduler_profile_env(false, true), Some("release"));
+        assert_eq!(scheduler_profile_env(true, true), Some("release"));
+    }
 
     /// Byte-exact pin on the three `*_SUB_ARGV` constants that drive
     /// `run_test`, `run_coverage`, and `run_llvm_cov` into

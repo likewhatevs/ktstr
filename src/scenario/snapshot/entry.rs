@@ -111,23 +111,33 @@ impl<'a> SnapshotEntry<'a> {
     // aggregation; slots whose rendered value can't decode to the
     // requested scalar return `Err(TypeMismatch)` immediately.
     //
-    // `cpu_sum_*` returns `0` when no slot contributes (empty sum
-    // identity). `cpu_max_*` / `cpu_min_*` return `Err(NoMatch)`
-    // when no slot contributes (max / min of empty set has no
-    // meaningful answer).
+    // `cpu_sum_*`, `cpu_max_*`, and `cpu_min_*` all return
+    // `Err(NoMatch)` when no slot contributes (every slot `None`). A
+    // `None` slot is UNREADABLE (host-read failure), NOT a real zero,
+    // so an all-None sum of `0` would silently drop the missing data;
+    // a readable map whose slots are all `0` still sums to `Ok(0)`.
     // -----------------------------------------------------------------
 
-    /// Sum the per-CPU values at `path` as `u64`. Returns `0` when
-    /// every slot is `None` (no slot contributed). A slot whose
+    /// Sum the per-CPU values at `path` as `u64`. Returns
+    /// `Err(NoMatch)` when every slot is `None`: a `None` slot is
+    /// UNREADABLE (host-read failure), not a real zero, so an all-None
+    /// sum of `0` would silently drop the unreadable data. A readable
+    /// map whose slots are all `0` still sums to `Ok(0)`. A slot whose
     /// rendered value cannot decode to `u64` propagates an Err
     /// immediately and stops the aggregation.
     pub fn cpu_sum_u64(&self, path: &str) -> SnapshotResult<u64> {
         let mut acc: u64 = 0;
+        let mut contributed = false;
         self.try_for_each_cpu_value(path, |v| {
             acc = acc.saturating_add(SnapshotField::Value(v).as_u64()?);
+            contributed = true;
             Ok(())
         })?;
-        Ok(acc)
+        if contributed {
+            Ok(acc)
+        } else {
+            Err(self.empty_aggregate_error("cpu_sum_u64"))
+        }
     }
 
     /// Maximum of per-CPU values at `path` as `u64`. Returns
@@ -158,18 +168,77 @@ impl<'a> SnapshotEntry<'a> {
         best.ok_or_else(|| self.empty_aggregate_error("cpu_min_u64"))
     }
 
-    /// Sum the per-CPU values at `path` as `f64`. Returns `0.0`
-    /// when every slot is `None`. A slot whose rendered value
-    /// cannot decode to `f64` propagates an Err immediately. NaN
-    /// slot values propagate through `+=` per IEEE-754 — a single
-    /// NaN slot makes the result NaN.
-    pub fn cpu_sum_f64(&self, path: &str) -> SnapshotResult<f64> {
-        let mut acc: f64 = 0.0;
+    /// Sum the per-CPU values at `path` as `i64`. Returns
+    /// `Err(NoMatch)` when every slot is `None`, matching
+    /// [`Self::cpu_sum_u64`]: a `None` slot is UNREADABLE, not a real
+    /// zero, so an all-None sum of `0` would be a silent drop. A
+    /// readable all-zero map still sums to `Ok(0)`. The sum saturates
+    /// at `i64::MIN` / `i64::MAX`. A slot whose rendered value cannot
+    /// decode to `i64` propagates an Err immediately and stops the
+    /// aggregation.
+    pub fn cpu_sum_i64(&self, path: &str) -> SnapshotResult<i64> {
+        let mut acc: i64 = 0;
+        let mut contributed = false;
         self.try_for_each_cpu_value(path, |v| {
-            acc += SnapshotField::Value(v).as_f64()?;
+            acc = acc.saturating_add(SnapshotField::Value(v).as_i64()?);
+            contributed = true;
             Ok(())
         })?;
-        Ok(acc)
+        if contributed {
+            Ok(acc)
+        } else {
+            Err(self.empty_aggregate_error("cpu_sum_i64"))
+        }
+    }
+
+    /// Maximum of per-CPU values at `path` as `i64`. Returns
+    /// `Err(NoMatch)` when every slot is `None` (no slot contributed).
+    /// A slot whose rendered value cannot decode to `i64` propagates
+    /// an Err immediately.
+    pub fn cpu_max_i64(&self, path: &str) -> SnapshotResult<i64> {
+        let mut best: Option<i64> = None;
+        self.try_for_each_cpu_value(path, |v| {
+            let n = SnapshotField::Value(v).as_i64()?;
+            best = Some(best.map_or(n, |b| b.max(n)));
+            Ok(())
+        })?;
+        best.ok_or_else(|| self.empty_aggregate_error("cpu_max_i64"))
+    }
+
+    /// Minimum of per-CPU values at `path` as `i64`. Returns
+    /// `Err(NoMatch)` when every slot is `None`. A slot whose
+    /// rendered value cannot decode to `i64` propagates an Err
+    /// immediately.
+    pub fn cpu_min_i64(&self, path: &str) -> SnapshotResult<i64> {
+        let mut best: Option<i64> = None;
+        self.try_for_each_cpu_value(path, |v| {
+            let n = SnapshotField::Value(v).as_i64()?;
+            best = Some(best.map_or(n, |b| b.min(n)));
+            Ok(())
+        })?;
+        best.ok_or_else(|| self.empty_aggregate_error("cpu_min_i64"))
+    }
+
+    /// Sum the per-CPU values at `path` as `f64`. Returns
+    /// `Err(NoMatch)` when every slot is `None`: a `None` slot is
+    /// UNREADABLE, not a real zero, so an all-None sum of `0.0` would
+    /// be a silent drop. A readable all-zero map still sums to
+    /// `Ok(0.0)`. A slot whose rendered value cannot decode to `f64`
+    /// propagates an Err immediately. NaN slot values propagate through
+    /// `+=` per IEEE-754 — a single NaN slot makes the result NaN.
+    pub fn cpu_sum_f64(&self, path: &str) -> SnapshotResult<f64> {
+        let mut acc: f64 = 0.0;
+        let mut contributed = false;
+        self.try_for_each_cpu_value(path, |v| {
+            acc += SnapshotField::Value(v).as_f64()?;
+            contributed = true;
+            Ok(())
+        })?;
+        if contributed {
+            Ok(acc)
+        } else {
+            Err(self.empty_aggregate_error("cpu_sum_f64"))
+        }
     }
 
     /// Maximum of per-CPU values at `path` as `f64`. Returns

@@ -394,6 +394,16 @@ pub fn send_stimulus(payload: &[u8]) {
     write_msg(MsgType::Stimulus.wire_value(), payload);
 }
 
+/// Send a per-step END frame from the guest step executor. Reuses the
+/// same byte-serialised [`crate::vmm::wire::StimulusPayload`] body as
+/// [`send_stimulus`] (24 bytes) but frames with [`MsgType::StepEnd`] so
+/// the host can pair `StepStart[k]` -> `StepEnd[k]` for step-local
+/// throughput. Emitted at each step's end-of-hold while its workers are
+/// still alive.
+pub fn send_step_end(payload: &[u8]) {
+    write_msg(MsgType::StepEnd.wire_value(), payload);
+}
+
 /// Send raw stdout/stderr from an LlmExtract payload. Payload:
 /// postcard-encoded [`crate::test_support::RawPayloadOutput`].
 ///
@@ -455,10 +465,22 @@ pub fn send_scenario_start() {
     );
 }
 
-/// Send a scenario-end marker. Payload: 8-byte LE u64 elapsed
-/// milliseconds since scenario start.
-pub fn send_scenario_end(elapsed_ms: u64) {
-    write_msg(MsgType::ScenarioEnd.wire_value(), &elapsed_ms.to_le_bytes());
+/// Send a scenario-end marker. Payload: two LE u64s —
+/// `elapsed_ms` (since scenario start) followed by
+/// `total_iterations`, the final cumulative worker iteration count
+/// summed across every live handle at the LAST step's end. The host
+/// folds the iteration count into a synthetic terminal
+/// [`crate::timeline::StimulusEvent`] so the last step has a successor
+/// to diff its `iteration_rate` against — without it the final step's
+/// throughput is never computed (the per-phase rate is the delta
+/// between consecutive step events, and the last step has no following
+/// step event). Parsed host-side by
+/// [`crate::vmm::wire::parse_scenario_end`].
+pub fn send_scenario_end(elapsed_ms: u64, total_iterations: u64) {
+    let mut payload = [0u8; crate::vmm::wire::SCENARIO_END_PAYLOAD_SIZE];
+    payload[0..8].copy_from_slice(&elapsed_ms.to_le_bytes());
+    payload[8..16].copy_from_slice(&total_iterations.to_le_bytes());
+    write_msg(MsgType::ScenarioEnd.wire_value(), &payload);
 }
 
 pub fn send_scenario_pause() {
@@ -1400,8 +1422,8 @@ mod tests {
     #[test]
     fn send_scenario_end_from_host_context_is_noop() {
         let _g = IsGuestOverrideGuard::new(false);
-        send_scenario_end(0);
-        send_scenario_end(u64::MAX);
+        send_scenario_end(0, 0);
+        send_scenario_end(u64::MAX, u64::MAX);
     }
 
     /// `send_sys_rdy` from host context returns false (no-op +

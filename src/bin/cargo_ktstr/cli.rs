@@ -81,8 +81,23 @@ pub(crate) enum KtstrCommand {
         /// skipped because release sets `panic = "abort"` (see
         /// `Cargo.toml [profile.release]`). Tests gated on
         /// `#[cfg(debug_assertions)]` also skip.
+        ///
+        /// `--release` builds BOTH the harness/test binary AND the
+        /// scheduler-under-test release; use `--release-scheduler` to
+        /// build only the scheduler release while keeping the harness on
+        /// the dev profile.
         #[arg(long)]
         release: bool,
+        /// Build the scheduler-under-test (a `SchedulerSpec::Discover`
+        /// package) with the release profile while keeping the
+        /// harness/test binary on its current (dev) profile. Decouples
+        /// the scheduler's optimization from the harness's assertion
+        /// thresholds + `panic`/`catch_unwind` behavior — the right
+        /// setting for a perf test that wants an optimized scheduler but
+        /// normal harness behavior. Implied by `--release` (which builds
+        /// everything release); sets `KTSTR_SCHEDULER_PROFILE=release`.
+        #[arg(long)]
+        release_scheduler: bool,
         /// Arguments passed through to cargo nextest run.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
@@ -118,6 +133,12 @@ pub(crate) enum KtstrCommand {
         /// skipped because release sets `panic = "abort"`.
         #[arg(long)]
         release: bool,
+        /// Build the scheduler-under-test release while keeping the
+        /// harness on the dev profile (see `cargo ktstr test
+        /// --release-scheduler`). Implied by `--release`; sets
+        /// `KTSTR_SCHEDULER_PROFILE=release`.
+        #[arg(long)]
+        release_scheduler: bool,
         /// Arguments passed through to cargo llvm-cov nextest.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
@@ -206,6 +227,111 @@ pub(crate) enum KtstrCommand {
         /// before committing to the re-run.
         #[arg(long)]
         exec: bool,
+    },
+    /// Resolve the baseline commit a perf run is compared against — the
+    /// branch merge-base, a PR target via `$GITHUB_BASE_REF`, or an
+    /// explicit `--base` override — and report the A/B commit pair the
+    /// regression compare pairs on. v0 reports the resolution; the
+    /// dual-run (perf-mode tests at HEAD and at the baseline) + the
+    /// `stats compare` regression verdict are a follow-up increment.
+    PerfDelta {
+        /// Override the baseline commit directly (skips merge-base). The
+        /// testability / cached-baseline knob: diff HEAD against any
+        /// chosen commit without a real branch divergence.
+        #[arg(long)]
+        base: Option<String>,
+        /// Override the ref to diverge from (merge-base against it).
+        /// Defaults to `$GITHUB_BASE_REF` (as `origin/<ref>`) on a PR,
+        /// else `--default-branch`.
+        #[arg(long)]
+        base_ref: Option<String>,
+        /// Nextest `-E` filter narrowing within the `performance_mode`
+        /// test set the run selects by default.
+        #[arg(long, short = 'E')]
+        filter: Option<String>,
+        /// Branch to merge-base against when neither `--base` /
+        /// `--base-ref` nor `$GITHUB_BASE_REF` is set.
+        #[arg(long, default_value = "main")]
+        default_branch: String,
+        /// Kernel the baseline + HEAD `performance_mode` runs boot.
+        /// Required with `--dual-run`; same `--kernel <SPEC>` form as
+        /// `cargo ktstr test`. Unused on the cached-baseline path.
+        #[arg(long)]
+        kernel: Option<String>,
+        /// Produce both commits' runs before comparing: check the
+        /// baseline out in a detached git worktree and run its
+        /// `performance_mode` tests there, run HEAD's in the working
+        /// tree, then compare. Without it, compares sidecars already
+        /// pooled from a prior run or a downloaded CI artifact.
+        #[arg(long)]
+        dual_run: bool,
+        /// Uniform relative significance threshold in percent (e.g. 10
+        /// for 10%), overriding every metric's registry default — the
+        /// knob a CI perf-gate tightens or loosens. Sugar for a
+        /// `--policy` with `{default_percent: N}`. Mutually exclusive
+        /// with `--policy`.
+        #[arg(long, conflicts_with = "policy")]
+        threshold: Option<f64>,
+        /// Path to a JSON `ComparisonPolicy` with per-metric
+        /// thresholds. Mutually exclusive with `--threshold`; see
+        /// `cargo ktstr stats compare --help` for the schema.
+        #[arg(long, conflicts_with = "threshold")]
+        policy: Option<std::path::PathBuf>,
+        /// CONFIG axis: compare this scheduler config against
+        /// `--b-scheduler` at the SAME commit (partitioned by
+        /// `scheduler`), instead of the commit axis. Both flags are
+        /// required together. Compares runs already pooled from a
+        /// `cargo ktstr test` that exercised both schedulers, so it
+        /// conflicts with the commit-axis run-production flags.
+        #[arg(long, requires = "b_scheduler", conflicts_with_all = ["base", "base_ref", "dual_run"])]
+        a_scheduler: Option<String>,
+        /// CONFIG axis B side — see `--a-scheduler`.
+        #[arg(long, requires = "a_scheduler", conflicts_with_all = ["base", "base_ref", "dual_run"])]
+        b_scheduler: Option<String>,
+        /// Suppress the per-phase delta tables entirely. Mutually
+        /// exclusive with every other phase flag.
+        #[arg(
+            long = "no-phases",
+            help_heading = "Phase rendering",
+            conflicts_with_all = ["phases_only", "steps_only", "phase", "phase_threshold"],
+        )]
+        no_phases: bool,
+        /// Show ONLY the per-phase tables; suppress the scalar
+        /// findings table and footer. Composes with `--steps-only`,
+        /// `--phase`, and `--phase-threshold`.
+        #[arg(
+            long = "phases-only",
+            help_heading = "Phase rendering",
+            conflicts_with = "no_phases"
+        )]
+        phases_only: bool,
+        /// Within the per-phase tables, suppress the BASELINE bucket
+        /// (`step_index == 0`). Mutually exclusive with `--phase`.
+        #[arg(
+            long = "steps-only",
+            help_heading = "Phase rendering",
+            conflicts_with_all = ["no_phases", "phase"],
+        )]
+        steps_only: bool,
+        /// Show only the named per-phase index. `0` selects BASELINE;
+        /// `1..=N` select scenario Step ordinals. Mutually exclusive
+        /// with `--steps-only`.
+        #[arg(
+            long = "phase",
+            help_heading = "Phase rendering",
+            conflicts_with_all = ["no_phases", "steps_only"],
+        )]
+        phase: Option<u16>,
+        /// Per-row relative-delta gate for the per-phase tables:
+        /// suppress paired rows whose `|delta| / max(|a|, 1.0) < PCT /
+        /// 100.0`. Independent from `--threshold`. Mutually exclusive
+        /// with `--no-phases`.
+        #[arg(
+            long = "phase-threshold",
+            help_heading = "Phase rendering",
+            conflicts_with = "no_phases"
+        )]
+        phase_threshold: Option<f64>,
     },
     /// Manage cached kernel images.
     Kernel {

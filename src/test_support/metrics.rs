@@ -20,7 +20,7 @@
 //! metric set so the guest never loads the ~2.4 GiB local model into
 //! its constrained VM RAM. The captured raw stdout/stderr are shipped
 //! over the SHM ring as a `MSG_TYPE_RAW_PAYLOAD_OUTPUT` entry; the
-//! host's `eval.rs` post-VM-exit pipeline calls
+//! host's `crate::test_support::eval` post-VM-exit pipeline calls
 //! [`crate::test_support::model::extract_via_llm`] on the captured
 //! text and threads the resulting metrics back into the
 //! [`PayloadMetrics`](crate::test_support::PayloadMetrics) slot the
@@ -50,7 +50,7 @@ use crate::test_support::{Metric, MetricSource, MetricStream, OutputFormat, Pola
 /// host runs `extract_via_llm` post-VM-exit on the raw output that
 /// the guest shipped over the SHM ring. Callers that need
 /// LlmExtract metrics must consume the host-extracted result through
-/// the `eval.rs` pipeline. The `hint` carried on the
+/// the `crate::test_support::eval` pipeline. The `hint` carried on the
 /// `LlmExtract(Option<&'static str>)` payload is preserved on the
 /// raw-output SHM message for the host extractor to consume.
 ///

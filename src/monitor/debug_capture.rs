@@ -805,6 +805,10 @@ mod tests {
                 nivcsw: 0,
                 signal_nvcsw: None,
                 signal_nivcsw: None,
+                utime: 0,
+                stime: 0,
+                signal_utime: None,
+                signal_stime: None,
                 lock_slowpath_match: None,
             }
         }
@@ -888,6 +892,10 @@ mod tests {
                 nivcsw: 0,
                 signal_nvcsw: None,
                 signal_nivcsw: None,
+                utime: 0,
+                stime: 0,
+                signal_utime: None,
+                signal_stime: None,
                 lock_slowpath_match: None,
             }
         }

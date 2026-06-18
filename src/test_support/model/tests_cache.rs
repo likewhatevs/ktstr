@@ -10,7 +10,7 @@ fn resolve_cache_root_honors_ktstr_cache_dir() {
     // `std::env::set_var` is process-wide. `lock_env()`
     // serializes the save/mutate/restore window against every
     // other env-touching test in this crate so concurrent
-    // runners in sidecar.rs / eval.rs don't race on
+    // runners in sidecar.rs / crate::test_support::eval don't race on
     // KTSTR_CACHE_DIR. Poisoned-lock recovery is handled
     // inside `lock_env()` itself, so a panic inside the
     // critical section is safe to recover through.

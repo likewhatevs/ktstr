@@ -222,6 +222,17 @@ pub struct SidecarResult {
     /// on absence); reader-side, serde's native `Option<T>`
     /// deserialize tolerates absence — see the module-level doc.
     pub monitor: Option<MonitorSummary>,
+    /// Periodic-capture coverage for this run: how many periodic snapshot
+    /// boundaries actually fired (`periodic_fired`) out of the configured
+    /// `num_snapshots` target (`periodic_target`). Carried verbatim from
+    /// [`crate::prelude::VmResult`] so cross-run tooling can read the
+    /// coverage off the persisted sidecar (previously only the in-memory
+    /// result exposed it). `0`/`0` for runs with no periodic captures
+    /// configured. Hard-required `u32` fields — old sidecars predating
+    /// them re-generate on the next run (sidecar data is disposable).
+    pub periodic_fired: u32,
+    /// See [`Self::periodic_fired`].
+    pub periodic_target: u32,
     /// Ordered stimulus events published by the guest step executor
     /// while the scenario ran.
     pub stimulus_events: Vec<StimulusEvent>,
@@ -527,6 +538,8 @@ impl SidecarResult {
             inconclusive: false,
             stats: crate::assert::ScenarioStats::default(),
             monitor: None,
+            periodic_fired: 0,
+            periodic_target: 0,
             stimulus_events: Vec::new(),
             work_type: "SpinWait".to_string(),
             verifier_stats: Vec::new(),
@@ -2746,6 +2759,9 @@ pub(crate) fn write_skip_sidecar(entry: &KtstrTestEntry) -> anyhow::Result<()> {
         inconclusive: false,
         stats: Default::default(),
         monitor: None,
+        // A skip never ran the VM, so no periodic captures fired.
+        periodic_fired: 0,
+        periodic_target: 0,
         stimulus_events: Vec::new(),
         // Skip paths never ran a workload; work_type is "skipped"
         // so stats tooling that groups by work_type puts these in a
@@ -2813,6 +2829,8 @@ pub(crate) fn write_sidecar(
         inconclusive: check_result.is_inconclusive(),
         stats: check_result.stats.clone(),
         monitor: vm_result.monitor.as_ref().map(|m| m.summary.clone()),
+        periodic_fired: vm_result.periodic_fired,
+        periodic_target: vm_result.periodic_target,
         stimulus_events: stimulus_events.to_vec(),
         work_type: work_type.to_string(),
         verifier_stats: vm_result.verifier_stats.clone(),

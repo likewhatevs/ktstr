@@ -509,3 +509,255 @@ fn render_to_i64(v: &RenderedValue) -> SnapshotResult<i64> {
         }),
     }
 }
+
+#[cfg(test)]
+mod tests_coercion {
+    //! Host-pure coverage for the [`SnapshotField`] coercion paths
+    //! ([`render_to_u64`] / [`render_to_i64`], the inline `as_bool` /
+    //! `as_f64` / `as_str` matches, the dotted-path walk, and the
+    //! typed-array terminals). These decide whether a BTF-snapshot
+    //! read SUCCEEDS or surfaces a typed [`SnapshotError`]; a swapped
+    //! arm silently coerces a value the accessor should reject.
+    use super::*;
+
+    fn ptr(value: u64) -> RenderedValue {
+        RenderedValue::Ptr {
+            value,
+            deref: None,
+            deref_skipped_reason: None,
+            cast_annotation: None,
+        }
+    }
+
+    /// REGRESSION: the scalar `SnapshotField::as_bool` and the array
+    /// `as_bool_array` (which coerces each element via
+    /// `RenderedValue::as_bool`) must AGREE on a pointer. Before the
+    /// `Ptr` arm landed on `RenderedValue::as_bool`, the scalar
+    /// accepted a pointer (non-null test) while the array path errored
+    /// on the first pointer element — `field.as_bool()` succeeded and
+    /// `field.as_bool_array()` failed on the same shape.
+    #[test]
+    fn as_bool_scalar_and_array_agree_on_pointer() {
+        let non_null = ptr(0x1000);
+        let null = ptr(0);
+        // Scalar: pointer coerces as a non-null test.
+        assert!(SnapshotField::Value(&non_null).as_bool().unwrap());
+        assert!(!SnapshotField::Value(&null).as_bool().unwrap());
+        // Array: the same per-element coercion, no TypeMismatch.
+        let arr = RenderedValue::Array {
+            len: 2,
+            elements: vec![ptr(0x2000), ptr(0)],
+        };
+        assert_eq!(
+            SnapshotField::Value(&arr).as_bool_array().unwrap(),
+            vec![true, false],
+        );
+    }
+
+    /// `as_u64` accepts the pointer / char / bool scalar variants
+    /// (pointer as its numeric address, char as the raw byte, bool as
+    /// 0/1) — the wider integer-coercion set.
+    #[test]
+    fn as_u64_accepts_ptr_char_bool() {
+        assert_eq!(SnapshotField::Value(&ptr(0xdead)).as_u64().unwrap(), 0xdead);
+        let c = RenderedValue::Char { value: 65 };
+        assert_eq!(SnapshotField::Value(&c).as_u64().unwrap(), 65);
+        let b = RenderedValue::Bool { value: true };
+        assert_eq!(SnapshotField::Value(&b).as_u64().unwrap(), 1);
+    }
+
+    /// `render_to_u64`'s enum arm mirrors `RenderedValue::as_u64`:
+    /// an unsigned 64-bit enum at `u64::MAX` (stored as `i64 = -1`)
+    /// reinterprets the bit pattern, while a signed-negative enum is
+    /// rejected as out-of-range.
+    #[test]
+    fn as_u64_enum_signedness() {
+        let unsigned_max = RenderedValue::Enum {
+            bits: 64,
+            value: -1,
+            variant: None,
+            is_signed: false,
+        };
+        assert_eq!(
+            SnapshotField::Value(&unsigned_max).as_u64().unwrap(),
+            u64::MAX,
+        );
+        let signed_neg = RenderedValue::Enum {
+            bits: 32,
+            value: -5,
+            variant: None,
+            is_signed: true,
+        };
+        assert!(matches!(
+            SnapshotField::Value(&signed_neg).as_u64(),
+            Err(SnapshotError::TypeMismatch { .. })
+        ));
+    }
+
+    /// `as_u64` rejects a negative `Int`; `as_i64` rejects a `Uint`
+    /// above `i64::MAX` — the sign-loss boundaries.
+    #[test]
+    fn integer_sign_boundaries_error() {
+        let neg = RenderedValue::Int {
+            bits: 32,
+            value: -1,
+        };
+        assert!(matches!(
+            SnapshotField::Value(&neg).as_u64(),
+            Err(SnapshotError::TypeMismatch { .. })
+        ));
+        let big = RenderedValue::Uint {
+            bits: 64,
+            value: u64::MAX,
+        };
+        assert!(matches!(
+            SnapshotField::Value(&big).as_i64(),
+            Err(SnapshotError::TypeMismatch { .. })
+        ));
+    }
+
+    /// `as_f64` is narrower than `as_u64`: it accepts Float / Int /
+    /// Uint / Enum but rejects Char, Bool, and Ptr (a float of a
+    /// pointer or a char is not meaningful).
+    #[test]
+    fn as_f64_rejects_char_bool_ptr() {
+        let f = RenderedValue::Float {
+            bits: 64,
+            value: 1.5,
+        };
+        assert_eq!(SnapshotField::Value(&f).as_f64().unwrap(), 1.5);
+        for v in [
+            RenderedValue::Char { value: 1 },
+            RenderedValue::Bool { value: true },
+            ptr(0x10),
+        ] {
+            assert!(
+                matches!(
+                    SnapshotField::Value(&v).as_f64(),
+                    Err(SnapshotError::TypeMismatch { .. })
+                ),
+                "as_f64 must reject {v:?}",
+            );
+        }
+    }
+
+    /// `as_str` reads an enum's resolved variant name and rejects
+    /// non-enum / nameless-enum / percpu-key shapes.
+    #[test]
+    fn as_str_reads_enum_variant_else_errors() {
+        let named = RenderedValue::Enum {
+            bits: 32,
+            value: 2,
+            variant: Some("SCX_OPS_ENABLED".to_string()),
+            is_signed: false,
+        };
+        assert_eq!(
+            SnapshotField::Value(&named).as_str().unwrap(),
+            "SCX_OPS_ENABLED"
+        );
+        let nameless = RenderedValue::Enum {
+            bits: 32,
+            value: 2,
+            variant: None,
+            is_signed: false,
+        };
+        assert!(SnapshotField::Value(&nameless).as_str().is_err());
+        assert!(SnapshotField::PercpuKey { key: 3 }.as_str().is_err());
+    }
+
+    /// The dotted-path walk peels `Ptr{deref: Some}` to the pointed-at
+    /// struct, resolves a member, and surfaces structured errors for a
+    /// non-struct cursor and an empty path component.
+    #[test]
+    fn walk_dotted_path_peels_pointer_and_reports_errors() {
+        let inner = RenderedValue::Struct {
+            type_name: Some("scx_bss".to_string()),
+            members: vec![RenderedMember {
+                name: "stall".to_string(),
+                value: RenderedValue::Uint { bits: 8, value: 1 },
+            }],
+        };
+        let through_ptr = RenderedValue::Ptr {
+            value: 0xffff_0000,
+            deref: Some(Box::new(inner)),
+            deref_skipped_reason: None,
+            cast_annotation: None,
+        };
+        assert_eq!(
+            SnapshotField::Value(&through_ptr)
+                .get("stall")
+                .as_u64()
+                .unwrap(),
+            1,
+        );
+        // Walking into a scalar surfaces NotAStruct.
+        let scalar = RenderedValue::Uint { bits: 8, value: 5 };
+        assert!(matches!(
+            SnapshotField::Value(&scalar).get("x"),
+            SnapshotField::Missing(SnapshotError::NotAStruct { .. })
+        ));
+        // An empty component (`a..b`) surfaces EmptyPathComponent.
+        let s = RenderedValue::Struct {
+            type_name: None,
+            members: vec![RenderedMember {
+                name: "a".to_string(),
+                value: RenderedValue::Uint { bits: 8, value: 0 },
+            }],
+        };
+        assert!(matches!(
+            SnapshotField::Value(&s).get("a..b"),
+            SnapshotField::Missing(SnapshotError::EmptyPathComponent { .. })
+        ));
+    }
+
+    /// `get` on a percpu-key field surfaces a TypeMismatch naming the
+    /// percpu-key shape (no struct to walk into); `is_present`/`raw`/
+    /// `error` reflect each variant.
+    #[test]
+    fn percpu_key_navigation_and_view_helpers() {
+        let pk = SnapshotField::PercpuKey { key: 7 };
+        assert!(matches!(
+            pk.get("x"),
+            SnapshotField::Missing(SnapshotError::TypeMismatch { .. })
+        ));
+        assert!(pk.is_present());
+        assert!(pk.raw().is_none());
+        assert!(pk.error().is_none());
+        assert_eq!(pk.as_u64().unwrap(), 7);
+
+        let missing = SnapshotField::Missing(SnapshotError::EmptyPathComponent {
+            requested: "x".to_string(),
+        });
+        assert!(!missing.is_present());
+        assert!(missing.error().is_some());
+        assert!(matches!(
+            missing.as_u64(),
+            Err(SnapshotError::EmptyPathComponent { .. })
+        ));
+    }
+
+    /// `iter_members` peels `Truncated{partial: Array}` and yields the
+    /// preserved elements; a non-array (after peeling) yields nothing.
+    #[test]
+    fn iter_members_peels_truncated_array_else_empty() {
+        let truncated = RenderedValue::Truncated {
+            needed: 32,
+            had: 16,
+            partial: Box::new(RenderedValue::Array {
+                len: 4,
+                elements: vec![
+                    RenderedValue::Uint { bits: 8, value: 10 },
+                    RenderedValue::Uint { bits: 8, value: 20 },
+                ],
+            }),
+        };
+        let got: Vec<u64> = SnapshotField::Value(&truncated)
+            .iter_members()
+            .map(|el| el.as_u64().unwrap())
+            .collect();
+        assert_eq!(got, vec![10, 20]);
+        // A scalar yields no elements.
+        let scalar = RenderedValue::Uint { bits: 8, value: 1 };
+        assert_eq!(SnapshotField::Value(&scalar).iter_members().count(), 0);
+    }
+}

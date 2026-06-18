@@ -155,10 +155,10 @@ fn stats_accuracy() {
     let c = &r.stats.cgroups[0];
     assert_eq!(c.num_workers, 2);
     assert_eq!(c.num_cpus, 2);
-    assert!((c.min_off_cpu_pct - 20.0).abs() < 0.1);
-    assert!((c.max_off_cpu_pct - 30.0).abs() < 0.1);
-    assert!((c.spread - 10.0).abs() < 0.1);
-    assert!((c.avg_off_cpu_pct - 25.0).abs() < 0.1);
+    assert!((c.min_off_cpu_pct.unwrap() - 20.0).abs() < 0.1);
+    assert!((c.max_off_cpu_pct.unwrap() - 30.0).abs() < 0.1);
+    assert!((c.spread.unwrap() - 10.0).abs() < 0.1);
+    assert!((c.avg_off_cpu_pct.unwrap() - 25.0).abs() < 0.1);
 }
 
 #[test]
@@ -217,7 +217,9 @@ fn single_worker_spread_zero() {
     let r = assert_not_starved(&[rpt(1, 500, 5e9 as u64, 25e8 as u64, &[0, 1], 50)]);
     assert!(r.is_pass());
     let c = &r.stats.cgroups[0];
-    assert!((c.spread - 0.0).abs() < f64::EPSILON);
+    // Single worker with measurable wall time: a real measured zero
+    // spread (Some(0.0)), not None.
+    assert_eq!(c.spread, Some(0.0));
 }
 
 #[test]
@@ -230,6 +232,17 @@ fn zero_wall_time_nonzero_work() {
         r.is_pass(),
         "nonzero work with zero wall_time: {:?}",
         r.outcomes
+    );
+    // No worker had measurable wall time, so off-CPU% is not defined.
+    // The fields must be None (not measured), NOT 0.0 — a not-measured
+    // cgroup must not read as a perfectly-on-CPU / perfectly-fair one.
+    let c = &r.stats.cgroups[0];
+    assert_eq!(c.avg_off_cpu_pct, None, "off-cpu% must be None, not 0.0");
+    assert_eq!(c.min_off_cpu_pct, None);
+    assert_eq!(c.max_off_cpu_pct, None);
+    assert_eq!(
+        c.spread, None,
+        "spread must be None (inconclusive), not 0.0"
     );
 }
 
@@ -366,23 +379,14 @@ fn neg_unfairness_extreme_spread_detected() {
         "must include threshold bound: {detail}"
     );
     let c = &r.stats.cgroups[0];
-    assert!(
-        c.spread > 80.0,
-        "spread should be >80%, got {:.1}",
-        c.spread
-    );
+    let spread = c.spread.expect("measured workers => Some");
+    assert!(spread > 80.0, "spread should be >80%, got {spread:.1}");
     assert_eq!(c.num_workers, 2);
     assert_eq!(c.num_cpus, 2);
-    assert!(
-        c.min_off_cpu_pct < 10.0,
-        "min pct should be ~5%: {:.1}",
-        c.min_off_cpu_pct
-    );
-    assert!(
-        c.max_off_cpu_pct > 90.0,
-        "max pct should be ~95%: {:.1}",
-        c.max_off_cpu_pct
-    );
+    let min_pct = c.min_off_cpu_pct.expect("measured workers => Some");
+    assert!(min_pct < 10.0, "min pct should be ~5%: {min_pct:.1}");
+    let max_pct = c.max_off_cpu_pct.expect("measured workers => Some");
+    assert!(max_pct > 90.0, "max pct should be ~95%: {max_pct:.1}");
 }
 
 #[test]
@@ -539,4 +543,37 @@ fn neg_plan_custom_gap_passes_below_threshold() {
         .failure_details()
         .any(|d| matches!(d.kind, DetailKind::Stuck));
     assert!(!has_stuck, "1000ms gap should pass 5000ms threshold");
+}
+
+#[test]
+fn not_starved_empty_reports_surface_zero_worker_cgroup() {
+    // no-silent-drop: a declared cgroup that collected zero reports
+    // must surface as a num_workers=0 telemetry entry, not vanish. Pre-fix
+    // assert_not_starved early-returned empty stats on reports.is_empty().
+    let r = assert_not_starved(&[]);
+    assert!(r.is_pass(), "no workers -> no fairness fail");
+    assert_eq!(
+        r.stats.cgroups.len(),
+        1,
+        "empty-reports cgroup must surface a zero-worker entry, not be dropped",
+    );
+    assert_eq!(r.stats.cgroups[0].num_workers, 0);
+    assert_eq!(r.stats.total_workers, 0);
+}
+
+#[test]
+fn not_starved_no_double_count() {
+    // assert_not_starved builds telemetry via the shared `cgroup_stats`
+    // builder exactly once — a regression re-introducing a second build
+    // site would yield two cgroup entries for one call.
+    let r = assert_not_starved(&[
+        rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 50),
+        rpt(2, 1000, 5e9 as u64, 6e8 as u64, &[1], 60),
+    ]);
+    assert_eq!(
+        r.stats.cgroups.len(),
+        1,
+        "exactly one cgroup entry per call"
+    );
+    assert_eq!(r.stats.total_workers, 2);
 }

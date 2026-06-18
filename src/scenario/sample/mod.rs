@@ -53,7 +53,7 @@ mod host;
 mod monitor;
 mod stats;
 
-pub use bpf::BpfMapProjector;
+pub use bpf::{BpfMapCpuProjector, BpfMapProjector};
 pub use host::HostView;
 pub use monitor::{ERROR_CLASS_NAMES, MonitorView, ScxEventsView};
 pub use stats::{StatsPathProjector, StatsValue};
@@ -86,10 +86,11 @@ pub struct Sample<'a> {
     /// so the value reflects when the running scheduler's
     /// stats were observed. BPF state is observed up to
     /// `FREEZE_RENDEZVOUS_TIMEOUT` later than this anchor.
-    /// `0` when the bridge could not record a timestamp
+    /// `None` when the bridge could not record a timestamp
     /// (legacy stores without elapsed metadata, or
-    /// non-periodic captures surfaced through the same drain).
-    pub elapsed_ms: u64,
+    /// non-periodic captures surfaced through the same drain) —
+    /// distinct from a measured `Some(0)`.
+    pub elapsed_ms: Option<u64>,
     /// Frozen BPF state captured at this boundary. The view is
     /// cheap to build — accessor methods walk the underlying
     /// [`FailureDumpReport`] in place.
@@ -124,8 +125,9 @@ pub struct Sample<'a> {
     /// production captures via the periodic-fire path and the
     /// on-demand `Op::CaptureSnapshot` / `Op::WatchSnapshot` apply
     /// arms always carry `Some(idx)`. Read by
-    /// [`SampleSeries::by_phase`] to bucket samples per scenario
-    /// phase for the phase-aware aggregator.
+    /// [`SampleSeries::by_stamped_phase`] (and as the offset-less
+    /// fallback in [`SampleSeries::by_stimulus_phase`]) to bucket
+    /// samples per scenario phase for the phase-aware aggregator.
     pub step_index: Option<u16>,
     /// Workload-relative boundary offset (ms) this periodic capture
     /// was scheduled for (`boundary_ns - scenario_anchor_ns`), or
@@ -152,7 +154,7 @@ pub struct Sample<'a> {
 /// captures) coexist in the drain output and are tolerated by the
 /// projection helpers — the typical pattern is to pre-filter to
 /// periodic tags via [`Self::periodic_only`] before asserting.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SampleSeries {
     rows: Vec<SampleRow>,
     /// Host-side monitor report for the VM run that produced this
@@ -167,15 +169,15 @@ pub struct SampleSeries {
 
 /// Owned tuple stored inside [`SampleSeries`]. Mirrors the shape of
 /// [`super::snapshot::SnapshotBridge::drain_ordered_with_stats`]
-/// but carries the timestamp explicitly (defaulted to `0` when
-/// the bridge omitted it) so iteration does not have to handle
-/// the `Option<u64>` repeatedly.
-#[derive(Debug)]
+/// but carries the timestamp as `Option<u64>` — `None` preserves the
+/// bridge's "no timestamp recorded" signal so a not-measured sample
+/// stays distinct from a measured `Some(0)`.
+#[derive(Debug, Clone)]
 struct SampleRow {
     tag: String,
     report: FailureDumpReport,
     stats: Result<serde_json::Value, crate::scenario::snapshot::MissingStatsReason>,
-    elapsed_ms: u64,
+    elapsed_ms: Option<u64>,
     /// Workload-relative boundary offset (ms) for periodic captures;
     /// `None` for non-periodic / on-demand. Mirrored from
     /// [`super::snapshot::DrainedSnapshotEntry::boundary_offset_ms`].
@@ -202,7 +204,7 @@ fn build_series_field<T>(
 ) -> SeriesField<T> {
     let mut values: Vec<SnapshotResult<T>> = Vec::with_capacity(rows.len());
     let mut tags: Vec<String> = Vec::with_capacity(rows.len());
-    let mut elapsed: Vec<u64> = Vec::with_capacity(rows.len());
+    let mut elapsed: Vec<Option<u64>> = Vec::with_capacity(rows.len());
     let mut phases: Vec<Option<crate::assert::Phase>> = Vec::with_capacity(rows.len());
     for row in rows {
         tags.push(row.tag.clone());
@@ -216,7 +218,7 @@ fn build_series_field<T>(
         phases.push(row.step_index.map(crate::assert::Phase::from));
         values.push(row_to_slot(row));
     }
-    SeriesField::from_parts_with_phases(label, tags, elapsed, values, phases)
+    SeriesField::from_parts_with_phases_opt(label, tags, elapsed, values, phases)
 }
 
 impl SampleSeries {
@@ -254,13 +256,13 @@ impl SampleSeries {
                 stats: stats.map(Ok).unwrap_or(Err(
                     crate::scenario::snapshot::MissingStatsReason::NoSchedulerBinary,
                 )),
-                elapsed_ms: elapsed_ms.unwrap_or(0),
+                elapsed_ms,
                 // Fixture/tuple path carries no scheduled boundary offset.
                 boundary_offset_ms: None,
                 // Unstamped fixture path: samples surface with
-                // `step_index = None` and fall under the by_phase
-                // fallback bucket. Production callers thread the
-                // bridge-stamped index via from_drained_typed.
+                // `step_index = None` and fall under the
+                // by_stamped_phase fallback bucket. Production callers
+                // thread the bridge-stamped index via from_drained_typed.
                 step_index: None,
             })
             .collect();
@@ -296,7 +298,7 @@ impl SampleSeries {
                     tag,
                     report,
                     stats,
-                    elapsed_ms: elapsed_ms.unwrap_or(0),
+                    elapsed_ms,
                     boundary_offset_ms,
                     step_index,
                 }
@@ -370,9 +372,9 @@ impl SampleSeries {
         })
     }
 
-    /// Group samples by their stamped scenario phase. The returned
-    /// map is keyed by `step_index` (1-indexed phase encoding —
-    /// `0` is BASELINE, `1..=N` align with scenario Step ordinals);
+    /// Group samples by the RAW bridge-stamped scenario phase. The
+    /// returned map is keyed by `step_index` (1-indexed phase encoding
+    /// — `0` is BASELINE, `1..=N` align with scenario Step ordinals);
     /// each entry is the ordered run of samples that fell in that
     /// phase, preserving the iteration order produced by
     /// [`Self::iter_samples`].
@@ -389,10 +391,18 @@ impl SampleSeries {
     /// perspective; production callers that need to distinguish
     /// can inspect `Sample::step_index` directly.
     ///
+    /// CAVEAT — prefer [`Self::by_stimulus_phase`] when a stimulus
+    /// timeline is available: the bridge stamp is the step active at
+    /// (deferred) FIRE time, so under the dump-prerequisite gate a
+    /// burst of captures can all stamp the same late `CURRENT_STEP`
+    /// and collapse every sample into one phase. `by_stimulus_phase`
+    /// re-derives the phase from each sample's timing-independent
+    /// `boundary_offset_ms`, which is immune to the burst.
+    ///
     /// The phase-aware aggregator consumes this map to compute
     /// per-phase metric reductions (Counter `last - first` delta,
     /// Gauge / Peak / Timestamp via `crate::stats::aggregate_samples`).
-    pub fn by_phase(&self) -> std::collections::BTreeMap<u16, Vec<Sample<'_>>> {
+    pub fn by_stamped_phase(&self) -> std::collections::BTreeMap<u16, Vec<Sample<'_>>> {
         let mut by_phase: std::collections::BTreeMap<u16, Vec<Sample<'_>>> =
             std::collections::BTreeMap::new();
         for sample in self.iter_samples() {
@@ -401,6 +411,79 @@ impl SampleSeries {
         }
         by_phase
     }
+
+    /// Group samples by the guest step whose stimulus window contains
+    /// each sample's workload-relative `boundary_offset_ms`, rather
+    /// than the raw bridge-stamped `step_index`
+    /// ([`Self::by_stamped_phase`]). The returned map uses the same
+    /// 1-indexed phase key (`0` = BASELINE, `1..=N` = Step ordinals)
+    /// and preserves [`Self::iter_samples`] order within each bucket.
+    ///
+    /// This is the correct grouping whenever a stimulus timeline is
+    /// available: `boundary_offset_ms` is derived from the scheduled
+    /// boundary, NOT the (deferred) fire time, so it survives the
+    /// dump-prerequisite-gate burst that makes every periodic capture
+    /// stamp the same late `CURRENT_STEP` (the `phases.len() == 1`
+    /// collapse `by_stamped_phase` is subject to). Samples with no
+    /// `boundary_offset_ms` (on-demand / fixture captures) fall back
+    /// to their stamped `step_index`.
+    ///
+    /// Unlike the folded scalar [`crate::assert::PhaseBucket`]s that
+    /// [`crate::assert::build_phase_buckets_with_stimulus`] returns,
+    /// this keeps the per-sample [`Sample`] views (full Snapshot / dsq
+    /// access) per phase. `build_phase_buckets_with_stimulus` itself
+    /// is built on this method.
+    pub fn by_stimulus_phase(
+        &self,
+        stimulus_events: &[crate::timeline::StimulusEvent],
+    ) -> std::collections::BTreeMap<u16, Vec<Sample<'_>>> {
+        // Step-start timeline in scenario-relative (guest monotonic) ms
+        // — the same frame as `boundary_offset_ms`. Only step-START
+        // events anchor a step window: the terminal scenario-end event
+        // (step_index None) is excluded, and per-step StepEnd events
+        // (is_step_end, which carry their step's step_index) are excluded
+        // so a step's window is anchored by its start, not its
+        // end-of-hold marker.
+        let mut step_starts: Vec<(u64, u16)> = stimulus_events
+            .iter()
+            .filter(|e| !e.is_step_end)
+            .filter_map(|e| e.step_index.map(|k| (e.elapsed_ms, k)))
+            .collect();
+        step_starts.sort_by_key(|(ms, _)| *ms);
+        let mut by_phase: std::collections::BTreeMap<u16, Vec<Sample<'_>>> =
+            std::collections::BTreeMap::new();
+        for sample in self.iter_samples() {
+            let key = match sample.boundary_offset_ms {
+                Some(offset) => remap_offset_to_step(offset, &step_starts),
+                None => sample.step_index.unwrap_or(0),
+            };
+            by_phase.entry(key).or_default().push(sample);
+        }
+        by_phase
+    }
+}
+
+/// Map a capture's workload-relative boundary offset (ms since scenario
+/// start) to the guest step active at that instant: the `step_index` of
+/// the latest stimulus step-start at or before the offset, or `0`
+/// (BASELINE) when the offset precedes the first step-start.
+/// `step_starts` must be sorted ascending by elapsed_ms.
+///
+/// This is the timing-independent attribution at the heart of the
+/// deferred-fire fix: the scheduled boundary offset is computed from the
+/// boundary schedule (not the fire time), so it survives a burst of
+/// captures that all fire — and would all stamp the same late
+/// CURRENT_STEP — after the dump-prerequisite gate clears.
+fn remap_offset_to_step(offset_ms: u64, step_starts: &[(u64, u16)]) -> u16 {
+    let mut step = 0u16;
+    for (start_ms, k) in step_starts {
+        if *start_ms <= offset_ms {
+            step = *k;
+        } else {
+            break;
+        }
+    }
+    step
 }
 
 #[cfg(test)]
@@ -478,6 +561,66 @@ mod tests {
         assert_eq!(series.len(), 2);
         let tags: Vec<&str> = series.iter_samples().map(|s| s.tag).collect();
         assert_eq!(tags, vec!["periodic_000", "periodic_001"]);
+    }
+
+    #[test]
+    fn bpf_member_names_union_not_blinded_by_placeholder_first_sample() {
+        // Sample 0 is a placeholder (no maps); sample 1 carries the bss
+        // struct. member_names must discover the struct's fields by unioning
+        // across samples, not return empty because sample 0 lacked the map
+        // (which would silently blind a blanket u64_fields/f64_fields
+        // projection).
+        let drained = vec![
+            (
+                "periodic_000".to_string(),
+                crate::monitor::dump::FailureDumpReport::default(),
+                None,
+                Some(100),
+            ),
+            (
+                "periodic_001".to_string(),
+                synthetic_report(10),
+                None,
+                Some(200),
+            ),
+        ];
+        let series = SampleSeries::from_drained(drained, None);
+        let names = series.bpf_map("scx_obj.bss").member_names();
+        assert!(
+            names.contains(&"nr_dispatched".to_string()),
+            "must discover nr_dispatched from sample 1 despite placeholder sample 0; got {names:?}",
+        );
+        assert!(
+            names.contains(&"stall".to_string()),
+            "must discover stall from sample 1; got {names:?}",
+        );
+    }
+
+    #[test]
+    fn stats_key_names_union_not_blinded_by_errored_first_sample() {
+        // Sample 0 has no stats (Err); sample 1 carries the scx_stats
+        // object. key_names must union across samples so the object's keys
+        // are discoverable, not empty because sample 0's stats was Err.
+        let drained = vec![
+            (
+                "periodic_000".to_string(),
+                synthetic_report(10),
+                None,
+                Some(100),
+            ),
+            (
+                "periodic_001".to_string(),
+                synthetic_report(20),
+                Some(synthetic_stats(60.0)),
+                Some(200),
+            ),
+        ];
+        let series = SampleSeries::from_drained(drained, None);
+        let names = series.stats_path("").key_names();
+        assert!(
+            names.contains(&"busy".to_string()),
+            "must discover the scx_stats keys from sample 1 despite sample 0 having no stats; got {names:?}",
+        );
     }
 
     #[test]

@@ -4,7 +4,7 @@
 //! `Arc<AtomicU16>` (published by the Step loop on every Step
 //! transition) through the host-side capture path (bridge stamps
 //! every periodic capture with the live step_index, sample
-//! conversion preserves it, `SampleSeries::by_phase` partitions
+//! conversion preserves it, `SampleSeries::by_stimulus_phase` partitions
 //! by it) into [`crate::assert::build_phase_buckets`] which folds
 //! per-phase samples into the rendered [`crate::assert::PhaseBucket`]
 //! vec the operator sees on `result.stats.phases`. The unit tests
@@ -23,7 +23,7 @@
 //! the integration sentinel that catches gaps BETWEEN those
 //! stages: a CURRENT_STEP atomic that's published but never read,
 //! a bridge that stamps every capture as `step_index = 0`
-//! regardless of guest state, a `SampleSeries::by_phase`
+//! regardless of guest state, a `SampleSeries::by_stimulus_phase`
 //! BTreeMap that silently drops samples whose step_index doesn't
 //! match the bridge's expected encoding. The unit tests pass
 //! because each stage is correct in isolation; the e2e test
@@ -83,9 +83,9 @@
 use anyhow::Result;
 use ktstr::assert::AssertResult;
 use ktstr::ktstr_test;
-use ktstr::prelude::{SampleSeries, VmResult};
+use ktstr::prelude::{Backdrop, SampleSeries, VmResult};
 use ktstr::scenario::Ctx;
-use ktstr::scenario::ops::{CgroupDef, HoldSpec, Op, Step, execute_steps};
+use ktstr::scenario::ops::{CgroupDef, HoldSpec, Op, Step, execute_scenario, execute_steps};
 use ktstr::test_support::{Scheduler, SchedulerSpec};
 
 const KTSTR_SCHED: Scheduler =
@@ -125,15 +125,14 @@ fn assert_phase_pipeline(result: &VmResult) -> Result<()> {
     // double-equality form catches BOTH the silent-drop class
     // (sum < drained_len) AND the double-count class (sum >
     // drained_len) — `sum > 0` alone would let a regression
-    // that visits each sample twice through by_phase silently
+    // that visits each sample twice through by_stimulus_phase silently
     // produce 2× the sample_count.
     let drained_len = drained.len();
     let series = SampleSeries::from_drained_typed(drained, result.monitor.clone());
-    let stimulus: Vec<ktstr::timeline::StimulusEvent> = result
-        .stimulus_events
-        .iter()
-        .map(ktstr::timeline::StimulusEvent::from_wire)
-        .collect();
+    // The COMPLETE timeline (step frames + scenario-end terminal) via
+    // the shared accessor — folding only the raw wire Stimulus frames
+    // would omit the terminal and drop the last step's iteration_rate.
+    let stimulus = result.stimulus_timeline();
     let phases = ktstr::assert::build_phase_buckets_with_stimulus(&series, &stimulus);
 
     // A1 — at least one Step bucket present (step_index >= 1)
@@ -179,16 +178,16 @@ fn assert_phase_pipeline(result: &VmResult) -> Result<()> {
     // entry count. The double-equality form catches BOTH the
     // silent-drop class (sum < drained_len) AND the
     // double-count class (sum > drained_len). A bare sum > 0
-    // would let a by_phase regression that visits each sample
+    // would let a by_stimulus_phase regression that visits each sample
     // twice silently produce 2× the sample_count and still pass.
     let total_samples: usize = phases.iter().map(|p| p.sample_count).sum();
     anyhow::ensure!(
         total_samples == drained_len,
         "phases vec sum(sample_count) = {} but {} entries were \
          drained from the bridge. Mismatch: \
-         - sum < drained: SampleSeries::by_phase / aggregator \
+         - sum < drained: SampleSeries::by_stimulus_phase / aggregator \
            dropped samples (silent-data-loss class). \
-         - sum > drained: by_phase counted samples in multiple \
+         - sum > drained: by_stimulus_phase counted samples in multiple \
            buckets (double-count class). phases = {:?}",
         total_samples,
         drained_len,
@@ -349,7 +348,7 @@ fn phase_pipeline_no_periodic_samples_yields_empty_phases(ctx: &Ctx) -> Result<A
 /// within the 15 s duration + 6 captures fixture. All three
 /// Steps must produce at least one bucket; missing any bucket
 /// would indicate either a step_index advancement bug or a
-/// silent-drop in `by_phase`.
+/// silent-drop in `by_stimulus_phase`.
 fn assert_phase_pipeline_three_step(result: &VmResult) -> Result<()> {
     anyhow::ensure!(
         result.periodic_fired >= 3,
@@ -361,15 +360,13 @@ fn assert_phase_pipeline_three_step(result: &VmResult) -> Result<()> {
         result.periodic_target,
     );
 
-    let drained = result.snapshot_bridge.drain_ordered_with_stats();
-    let drained_len = drained.len();
-    let series = SampleSeries::from_drained_typed(drained, result.monitor.clone());
-    let stimulus: Vec<ktstr::timeline::StimulusEvent> = result
-        .stimulus_events
-        .iter()
-        .map(ktstr::timeline::StimulusEvent::from_wire)
-        .collect();
-    let phases = ktstr::assert::build_phase_buckets_with_stimulus(&series, &stimulus);
+    // The framework-canonical per-phase buckets via the phase-buckets accessor —
+    // one shared captures_series() drain, no manual bridge drain that
+    // would starve the framework's own stats.phases build.
+    let phases = result.phase_buckets();
+    // Full capture count for the sum invariant, read from the same
+    // cached drain phase_buckets() just populated.
+    let drained_len = result.captures_series().len();
 
     // The load-bearing invariant: exact count. BASELINE bucket
     // is only emitted when at least one sample lands in the
@@ -386,7 +383,7 @@ fn assert_phase_pipeline_three_step(result: &VmResult) -> Result<()> {
         "phases.len() = {} — expected 3 (Step[0..2] only) or 4 \
          (BASELINE + Step[0..2]). Any other count means the \
          step_index pipeline either lost a bucket (silent drop \
-         in by_phase) or double-counted a boundary. \
+         in by_stimulus_phase) or double-counted a boundary. \
          step_indices = {:?}",
         phases.len(),
         step_indices,
@@ -398,7 +395,7 @@ fn assert_phase_pipeline_three_step(result: &VmResult) -> Result<()> {
             step_indices.contains(&expected_step),
             "phases vec is missing step_index = {} (Step[{}]) — \
              step_indices = {:?}. The CURRENT_STEP atomic either \
-             skipped a value or the by_phase partition lost every \
+             skipped a value or the by_stimulus_phase partition lost every \
              sample for this Step.",
             expected_step,
             expected_step - 1,
@@ -406,12 +403,12 @@ fn assert_phase_pipeline_three_step(result: &VmResult) -> Result<()> {
         );
     }
     // Sum invariant (same as 2-Step variant) — catches silent
-    // drops + double-counts in the by_phase partition.
+    // drops + double-counts in the by_stimulus_phase partition.
     let total_samples: usize = phases.iter().map(|p| p.sample_count).sum();
     anyhow::ensure!(
         total_samples == drained_len,
         "phases vec sum(sample_count) = {} but {} entries drained \
-         (mismatch in by_phase). step_indices = {:?}",
+         (mismatch in by_stimulus_phase). step_indices = {:?}",
         total_samples,
         drained_len,
         step_indices,
@@ -451,6 +448,96 @@ fn phase_pipeline_three_step_e2e(ctx: &Ctx) -> Result<AssertResult> {
     execute_steps(ctx, steps)
 }
 
+/// First-and-last-step iteration_rate end-to-end: a Backdrop-PERSISTENT workload (workers
+/// that survive across Steps — the documented pattern for cross-phase
+/// throughput; see [`ktstr::timeline::StimulusEvent::total_iterations`])
+/// must yield an `iteration_rate` for BOTH the FIRST Step (the
+/// 0-baseline first stimulus frame previously collapsed to `None`
+/// and dropped the rate) AND the LAST Step (previously no
+/// successor frame existed to diff against). Boots a real guest under
+/// scx-ktstr so the full path is exercised: per-step stimulus emission,
+/// the widened `ScenarioEnd` terminal frame (final cumulative count
+/// captured coincident with its elapsed), and host aggregation — not
+/// just the synthetic-fixture unit path that previously bypassed
+/// `from_wire`.
+fn assert_iteration_rate_first_and_last(result: &VmResult) -> Result<()> {
+    anyhow::ensure!(
+        result.periodic_fired >= 2,
+        "periodic_fired = {} of {} — need a capture in each Step window \
+         so both the first and last Step produce a bucket the rate can \
+         attach to",
+        result.periodic_fired,
+        result.periodic_target,
+    );
+    // The framework-canonical per-phase buckets via the phase-buckets accessor:
+    // one shared captures_series() drain folded through
+    // build_phase_buckets_with_stimulus over the COMPLETE timeline
+    // (step frames + scenario-end terminal). Identical to the manual
+    // drain+build oracle in `assert_phase_pipeline`, but it does NOT
+    // drain the bridge out from under the framework's own stats.phases
+    // build (the drain-once starvation fixed).
+    let phases = result.phase_buckets();
+
+    // FIRST step = lowest step_index >= 1 (Step[0] under the 1-indexed
+    // encoding). Its rate is the (first_frame -> second_frame) delta —
+    // the zero-baseline case fixed.
+    let first = phases
+        .iter()
+        .filter(|p| p.step_index >= 1)
+        .min_by_key(|p| p.step_index)
+        .ok_or_else(|| anyhow::anyhow!("no Step bucket present in phases"))?;
+    anyhow::ensure!(
+        first.metrics.contains_key("iteration_rate"),
+        "first Step (step_index {}) has no iteration_rate — the \
+         0-baseline first frame was dropped. metric keys = {:?}",
+        first.step_index,
+        first.metrics.keys().collect::<Vec<_>>(),
+    );
+
+    // LAST step = highest step_index. Its rate comes from the terminal
+    // ScenarioEnd frame — the last-step terminal case fixed.
+    let last = phases
+        .iter()
+        .filter(|p| p.step_index >= 1)
+        .max_by_key(|p| p.step_index)
+        .expect("at least one Step bucket (checked above)");
+    anyhow::ensure!(
+        last.metrics.contains_key("iteration_rate"),
+        "last Step (step_index {}) has no iteration_rate — the \
+         scenario-end terminal frame did not supply its right boundary. \
+         metric keys = {:?}",
+        last.step_index,
+        last.metrics.keys().collect::<Vec<_>>(),
+    );
+    Ok(())
+}
+
+#[ktstr_test(
+    scheduler = KTSTR_SCHED,
+    llcs = 1,
+    cores = 2,
+    threads = 1,
+    duration_s = 10,
+    watchdog_timeout_s = 20,
+    num_snapshots = 6,
+    auto_repro = false,
+    post_vm = assert_iteration_rate_first_and_last,
+)]
+fn phase_pipeline_iteration_rate_backdrop_e2e(ctx: &Ctx) -> Result<AssertResult> {
+    // Persistent workload on the Backdrop so its iteration counter
+    // survives across BOTH Steps (cross-step throughput is defined for
+    // the persistent population; step-local workers would reset each
+    // step). Two bare hold Steps let the backdrop spin continuously
+    // across both phase windows so each step boundary's cumulative
+    // count strictly increases.
+    let backdrop = Backdrop::new().push_cgroup(CgroupDef::named("cg_bg").workers(2));
+    let steps = vec![
+        Step::new(vec![], HoldSpec::frac(0.5)),
+        Step::new(vec![], HoldSpec::frac(0.5)),
+    ];
+    execute_scenario(ctx, backdrop, steps)
+}
+
 /// Probabilistic per-step-cpuset e2e: when the per-Step cpuset differs
 /// meaningfully (Step 0 spreads across all CPUs, Step 1 collapses
 /// to one LLC), the per-step `max_dsq_depth` metric must differ.
@@ -471,14 +558,14 @@ fn phase_pipeline_three_step_e2e(ctx: &Ctx) -> Result<AssertResult> {
 /// that the two configurations produce DIFFERENT readings, not
 /// that they differ by a specific amount.
 fn assert_per_step_cpuset_changes_metrics(result: &VmResult) -> Result<()> {
-    let drained = result.snapshot_bridge.drain_ordered_with_stats();
-    let series = SampleSeries::from_drained_typed(drained, result.monitor.clone());
-    let stimulus: Vec<ktstr::timeline::StimulusEvent> = result
-        .stimulus_events
-        .iter()
-        .map(ktstr::timeline::StimulusEvent::from_wire)
-        .collect();
-    let phases = ktstr::assert::build_phase_buckets_with_stimulus(&series, &stimulus);
+    // The framework-canonical per-phase buckets via the phase-buckets accessor:
+    // one shared captures_series() drain folded through
+    // build_phase_buckets_with_stimulus over the COMPLETE timeline
+    // (step frames + scenario-end terminal). Identical to the manual
+    // drain+build oracle in `assert_phase_pipeline`, but it does NOT
+    // drain the bridge out from under the framework's own stats.phases
+    // build (the drain-once starvation fixed).
+    let phases = result.phase_buckets();
 
     let step0 = phases.iter().find(|p| p.step_index == 1);
     let step1 = phases.iter().find(|p| p.step_index == 2);
@@ -684,16 +771,23 @@ fn phase_pipeline_per_step_cpuset_differs(ctx: &Ctx) -> Result<AssertResult> {
 /// race window to sub-ms hit-swap→load latency on the coord
 /// thread, well under the wall-clock duration of a typical Step.
 fn assert_watch_snapshot_trip_phase_stamped(result: &VmResult) -> Result<()> {
-    let drained = result.snapshot_bridge.drain_ordered_with_stats();
-    let watch_caps: Vec<_> = drained.iter().filter(|e| e.tag == "jiffies_64").collect();
+    // Inspect the captures through the shared cache rather than a raw
+    // bridge drain, so this post_vm does not starve the framework's
+    // own stats.phases build. iter_samples() preserves each capture's
+    // tag + stamped step_index — all this watchpoint test needs.
+    let series = result.captures_series();
+    let watch_caps: Vec<_> = series
+        .iter_samples()
+        .filter(|s| s.tag == "jiffies_64")
+        .collect();
     anyhow::ensure!(
         !watch_caps.is_empty(),
         "watchpoint on 'jiffies_64' did not fire — `kernel/time/timekeeping.c` \
          writes jiffies_64 every tick so a fire within Step[0]'s window is \
          expected. Without a fire, the trip-stamping wire-up is uncovered. \
-         Drained {} entries; tags = {:?}",
-        drained.len(),
-        drained.iter().map(|e| e.tag.as_str()).collect::<Vec<_>>(),
+         Captured {} entries; tags = {:?}",
+        series.len(),
+        series.iter_samples().map(|s| s.tag).collect::<Vec<_>>(),
     );
     for cap in &watch_caps {
         anyhow::ensure!(

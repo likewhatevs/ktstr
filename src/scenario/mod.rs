@@ -1419,13 +1419,21 @@ pub fn setup_cgroups<'a>(
     Ok((handles, guard))
 }
 
-/// Stop workers, collect reports, and merge assertion results.
+/// Stop workers, collect reports, and merge per-cgroup telemetry +
+/// assertion results.
 ///
 /// Each item is a `(WorkloadHandle, Option<&BTreeSet<usize>>)` pair
 /// where the optional cpuset is passed through to
 /// [`Assert::assert_cgroup`](crate::assert::Assert::assert_cgroup)
-/// for isolation checks. When `checks` has no worker-level checks,
-/// workers are collected but no assertions run.
+/// for isolation checks. Per-cgroup telemetry ([`crate::assert::CgroupStats`])
+/// is produced for EVERY handle — one entry per declared cgroup,
+/// including a `num_workers == 0` entry for a handle that collected no
+/// reports — independent of whether any worker-level check is configured.
+/// Worker-check assertion outcomes are recorded only for the checks the
+/// caller set. (Telemetry was previously gated behind
+/// `checks.has_worker_checks()`, which silently left
+/// `ScenarioStats.cgroups` empty for tests that read the telemetry
+/// without configuring a check.)
 pub(crate) fn collect_handles<'a>(
     handles: impl IntoIterator<Item = (WorkloadHandle, Option<&'a BTreeSet<usize>>)>,
     checks: &crate::assert::Assert,
@@ -1434,10 +1442,8 @@ pub(crate) fn collect_handles<'a>(
     let mut r = AssertResult::pass();
     for (h, cpuset) in handles {
         let reports = h.stop_and_collect();
-        if checks.has_worker_checks() {
-            let numa_nodes = cpuset.and_then(|cs| topo.map(|t| t.numa_nodes_for_cpuset(cs)));
-            r.merge(checks.assert_cgroup_with_numa(&reports, cpuset, numa_nodes.as_ref()));
-        }
+        let numa_nodes = cpuset.and_then(|cs| topo.map(|t| t.numa_nodes_for_cpuset(cs)));
+        r.merge(checks.assert_cgroup_with_numa(&reports, cpuset, numa_nodes.as_ref()));
     }
     r
 }

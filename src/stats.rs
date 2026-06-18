@@ -135,6 +135,20 @@ pub enum MetricKind {
     /// CLOCK_REALTIME-stamped capture timestamps). Aggregate by
     /// Last — averaging timestamps loses meaning.
     Timestamp,
+    /// PRE-DELTAED counter: each sample is already a delta-since-the-
+    /// previous-read, not a cumulative-since-boot total. Schedulers
+    /// that delta their scx_stats Metrics server-side per reader
+    /// request (e.g. scx_mitosis) produce this — one ktstr snapshot =
+    /// one reader request = one delta. The per-phase reduction is the
+    /// SUM of the in-phase deltas (NOT the `Counter` last-minus-first,
+    /// which would difference two deltas into nonsense); the flat-run
+    /// reduction is likewise the sum. Boundary: the first in-phase
+    /// delta straddles the phase boundary (it spans from the last
+    /// pre-phase read to the first in-phase read, so it includes a
+    /// little pre-phase activity); it is attributed to the phase its
+    /// read lands in — a slight left-edge over-attribution, the
+    /// deliberate semantic since a per-read delta cannot be split.
+    DeltaSum,
 }
 
 /// Sub-classification for [`MetricKind::Gauge`] picking the
@@ -212,6 +226,10 @@ impl MetricKind {
             MetricKind::Gauge(GaugeAgg::Max) => MergeKind::Commutative,
             MetricKind::Gauge(GaugeAgg::Last) => MergeKind::NonCommutative,
             MetricKind::Timestamp => MergeKind::NonCommutative,
+            // Per-phase reduction is a sum of in-phase deltas — an
+            // associative, commutative fold, so cross-AssertResult merge
+            // sums the two reduced values (same as Counter).
+            MetricKind::DeltaSum => MergeKind::Commutative,
         }
     }
 }
@@ -249,7 +267,7 @@ impl MetricKind {
 /// Timestamp without restating it. That fn is itself folded by
 /// [`crate::assert::build_phase_buckets`] whose live caller is
 /// the host-side `evaluate_vm_result` AssertResult-population
-/// site at `src/test_support/eval.rs`.
+/// site at `src/test_support/eval/mod.rs`.
 pub fn aggregate_samples(samples: &[f64], kind: MetricKind) -> Option<f64> {
     let finite: Vec<f64> = samples.iter().copied().filter(|x| x.is_finite()).collect();
     aggregate_finite(&finite, |_| 1, kind)
@@ -300,7 +318,12 @@ fn aggregate_finite(
         return None;
     }
     Some(match kind {
-        MetricKind::Counter => finite.iter().sum(),
+        // Counter (cumulative-since-boot, cross-RUN flat sum) and
+        // DeltaSum (each sample already a per-read delta) both reduce to
+        // a plain sum of the finite samples here; they differ only in
+        // the PER-PHASE path (Counter last-minus-first vs DeltaSum sum —
+        // see aggregate_samples_for_phase).
+        MetricKind::Counter | MetricKind::DeltaSum => finite.iter().sum(),
         MetricKind::Gauge(GaugeAgg::Avg) => {
             // Weighted mean: sum(v * w) / sum(w). Uniform-weight
             // callers (aggregate_samples) reduce to arithmetic
@@ -351,7 +374,10 @@ fn aggregate_finite(
 /// delta `175 - 100 = 75`) and route through
 /// [`phase_counter_delta`] instead. All other kinds use
 /// [`aggregate_samples`] verbatim, which is correct for them
-/// (Gauge avg/last/max, Peak max, Timestamp last).
+/// (Gauge avg/last/max, Peak max, Timestamp last, and DeltaSum — whose
+/// samples are ALREADY per-read deltas, so the per-phase reduction is
+/// the sum of the in-phase deltas, NOT a last-minus-first that would
+/// difference two deltas into nonsense).
 ///
 /// `samples` are the per-Sample readings of `metric` collected
 /// over one phase's window of
@@ -362,7 +388,7 @@ fn aggregate_finite(
 /// Live caller: [`crate::assert::build_phase_buckets`] folds
 /// per-phase sample slices through this entry point and the
 /// result lands on [`crate::assert::PhaseBucket::metrics`]; the
-/// host-side `evaluate_vm_result` at `src/test_support/eval.rs`
+/// host-side `evaluate_vm_result` at `src/test_support/eval/mod.rs`
 /// is the consumer that drives the call.
 pub fn aggregate_samples_for_phase(metric: &MetricDef, samples: &[f64]) -> Option<f64> {
     match metric.kind {
@@ -453,7 +479,7 @@ impl MetricDef {
     /// `read_sample` once per [`crate::stats::METRICS`] entry per
     /// sample to collect the per-sample readings the per-phase
     /// aggregator folds. The host-side `evaluate_vm_result` at
-    /// `src/test_support/eval.rs` drives the chain.
+    /// `src/test_support/eval/mod.rs` drives the chain.
     pub fn read_sample(&self, sample: &crate::scenario::sample::Sample<'_>) -> Option<f64> {
         // Per-metric dispatch by registry name. Only the metrics
         // whose value is genuinely a per-sample reading are wired;
@@ -527,6 +553,20 @@ impl MetricDef {
                 .event_counter_timeline()
                 .last()
                 .map(|e| e.dispatch_keep_last as f64),
+            // `system_time_ns` / `user_time_ns` are deliberately absent
+            // here: they are NOT read per-sample. A per-sample
+            // cross-thread SUM followed by a Counter `last - first`
+            // inflates whenever the captured task set changes between
+            // freezes — a task carrying a large cumulative counter that
+            // appears only in a LATER sample dumps its entire pre-phase
+            // history into the delta. They are injected post-hoc as a
+            // per-thread-GROUP delta (each tgid's first-seen-to-last-seen
+            // `thread_group_cputime`) by
+            // [`crate::assert::phase_group_cpu_delta`], which subtracts
+            // each group's own first-seen total and so bounds the result
+            // by wall-clock × cores. Still observer-free — that injector
+            // reads the same frozen `task_struct` enrichments.
+            //
             // Every other metric stays None. The 16 host-only
             // names (full list in the doc comment above) compute
             // cross-cgroup folds at `evaluate_vm_result` time and
@@ -828,6 +868,47 @@ pub static METRICS: &[MetricDef] = &[
         default_rel: 0.10,
         display_unit: "",
         accessor: |r| Some(r.total_iterations as f64),
+    },
+    MetricDef {
+        // Per-phase SYSTEM (in-kernel) CPU time in nanoseconds. Read
+        // host-side from frozen task_struct.stime + the thread-group
+        // signal_struct.stime accumulator (zero guest work). Injected
+        // post-hoc — NOT a read_sample metric — as a per-thread-GROUP
+        // delta over the phase: `crate::assert::phase_group_cpu_delta`
+        // sums each tgid's `thread_group_cputime` (signal + live-thread
+        // stime) at its first and last appearance among the phase's
+        // freeze samples and takes `last - first` = system CPU time the
+        // group spent during the phase. Gauge(Avg): the per-phase value
+        // is already a delta (one per phase; cross-RUN folds by mean,
+        // like iteration_rate). LowerBetter — the DSQ-spinlock
+        // regression surfaces as rising system time (CPUs spinning in
+        // the kernel). No typed GauntletRow field; the ext_metrics
+        // fallback carries it through cargo ktstr stats compare.
+        name: "system_time_ns",
+        polarity: crate::test_support::Polarity::LowerBetter,
+        kind: MetricKind::Gauge(GaugeAgg::Avg),
+        default_abs: 1_000_000.0,
+        default_rel: 0.30,
+        display_unit: "ns",
+        accessor: |_| None,
+    },
+    MetricDef {
+        // Per-phase USER-mode CPU time in nanoseconds. Same host-side /
+        // injected / Gauge(Avg) shape as `system_time_ns` (task_struct
+        // .utime + the thread-group signal_struct.utime accumulator,
+        // per-tgid delta via `crate::assert::phase_group_cpu_delta`).
+        // Pairs with it so a test can distinguish "system time rose,
+        // user work flat" (the lock-contention signature) from "both
+        // rose" (genuine extra work). LowerBetter — less CPU consumed
+        // for the same work is the efficiency win; utime already
+        // includes gtime so the two are never summed.
+        name: "user_time_ns",
+        polarity: crate::test_support::Polarity::LowerBetter,
+        kind: MetricKind::Gauge(GaugeAgg::Avg),
+        default_abs: 1_000_000.0,
+        default_rel: 0.30,
+        display_unit: "ns",
+        accessor: |_| None,
     },
     MetricDef {
         name: "worst_mean_run_delay_us",
@@ -2875,10 +2956,27 @@ pub fn sidecar_to_row(sc: &crate::test_support::SidecarResult) -> GauntletRow {
             "worst_wake_latency_tail_ratio",
             sc.stats.worst_wake_latency_tail_ratio,
         ),
-        worst_iterations_per_worker: finite_or_zero(
-            "worst_iterations_per_worker",
-            sc.stats.worst_iterations_per_worker,
-        ),
+        // `worst_iterations_per_worker` is `Option` on ScenarioStats
+        // (None = no cgroup reported a worker; Some(0.0) = a cgroup
+        // ran zero iterations). The GauntletRow field uses this
+        // layer's documented 0.0-sentinel-with-warn convention (see
+        // the doc above): a measured Some(0.0) maps to 0.0 (real
+        // starvation, surfaced), and None warns and maps to 0.0 like
+        // any other no-data field at this ingress. The cross-cgroup
+        // None/Some(0.0) distinction is preserved upstream in
+        // AssertResult::merge; this boundary matches the gauntlet
+        // layer's uniform sentinel handling.
+        worst_iterations_per_worker: match sc.stats.worst_iterations_per_worker {
+            Some(v) => finite_or_zero("worst_iterations_per_worker", v),
+            None => {
+                tracing::warn!(
+                    test = %sc.test_name,
+                    field = "worst_iterations_per_worker",
+                    "no cgroup reported a worker; substituting 0.0",
+                );
+                0.0
+            }
+        },
         page_locality: finite_or_zero("page_locality", sc.stats.worst_page_locality),
         cross_node_migration_ratio: finite_or_zero(
             "cross_node_migration_ratio",
@@ -4073,6 +4171,37 @@ impl ComparisonPolicy {
             }
         }
         Ok(())
+    }
+
+    /// Resolve the mutually-exclusive `--threshold` / `--policy` CLI
+    /// pair into a policy: `--threshold N` is sugar for a uniform N%
+    /// default (validated for sign); `--policy PATH` loads a
+    /// per-metric JSON policy; neither falls through to the registry
+    /// defaults. Shared by every subcommand that accepts the pair
+    /// (`stats compare`, `perf-delta`) so the resolution rules — and
+    /// the "exactly one of the two" contract — live in one place.
+    ///
+    /// Both flags set is rejected with an error. At the CLI call
+    /// sites clap `conflicts_with` makes that unreachable, but this is
+    /// a library entry point and must not panic on its inputs; the
+    /// error is the defence-in-depth backstop.
+    pub fn from_cli_flags(
+        threshold: Option<f64>,
+        policy: Option<&std::path::Path>,
+    ) -> anyhow::Result<Self> {
+        match (threshold, policy) {
+            (Some(t), None) => {
+                let p = Self::uniform(t);
+                p.validate()?;
+                Ok(p)
+            }
+            (None, Some(path)) => Self::load_json(path),
+            (None, None) => Ok(Self::default()),
+            (Some(_), Some(_)) => anyhow::bail!(
+                "--threshold and --policy are mutually exclusive; use --policy \
+                 for per-metric overrides"
+            ),
+        }
     }
 
     /// Resolve the relative threshold (as a fraction, e.g. `0.10`
@@ -5561,6 +5690,30 @@ mod tests {
             Some(4.0),
             "Gauge(Avg) kind must reduce by arithmetic mean",
         );
+
+        let delta_sum = MetricDef {
+            name: "total_test_delta",
+            accessor: |_| None,
+            display_unit: "",
+            polarity: crate::test_support::Polarity::LowerBetter,
+            default_abs: 0.0,
+            default_rel: 0.0,
+            kind: MetricKind::DeltaSum,
+        };
+        // DeltaSum samples are ALREADY per-read deltas, so the per-phase
+        // reduction SUMS them — NOT a last-minus-first that would
+        // difference two deltas. [10, 20, 5] -> 35, not 5 - 10 (which a
+        // Counter would clamp to 0).
+        assert_eq!(
+            aggregate_samples_for_phase(&delta_sum, &[10.0, 20.0, 5.0]),
+            Some(35.0),
+            "DeltaSum kind must reduce by sum of per-read deltas",
+        );
+        assert_eq!(
+            aggregate_samples(&[10.0, 20.0, 5.0], MetricKind::DeltaSum),
+            Some(35.0),
+            "DeltaSum flat-run reduction is also a sum",
+        );
     }
 
     /// All-empty / all-NaN inputs to either entry point return
@@ -5609,13 +5762,15 @@ mod tests {
     #[test]
     fn every_metric_has_kind_consistent_with_naming() {
         for m in METRICS {
-            // Counter metrics must be named with `total_` / `_count` /
+            // Counter and DeltaSum metrics are both cumulative totals
+            // (Counter = since-boot, DeltaSum = sum of per-read deltas),
+            // so both must be named with `total_` / `_count` /
             // `total_iterations` / `stuck_count` per the established
             // convention.
-            if matches!(m.kind, MetricKind::Counter) {
+            if matches!(m.kind, MetricKind::Counter | MetricKind::DeltaSum) {
                 assert!(
                     m.name.starts_with("total_") || m.name.ends_with("_count"),
-                    "Counter-kind metric must follow total_*/*_count naming, got {:?}",
+                    "Counter/DeltaSum-kind metric must follow total_*/*_count naming, got {:?}",
                     m.name,
                 );
             }
@@ -5715,8 +5870,11 @@ mod tests {
         let tiny = f64::MIN_POSITIVE / 2.0; // Subnormal
         let xs = [tiny, tiny * 2.0, tiny * 3.0];
         let m = mean(xs.iter().copied());
-        assert!(m.is_finite(), "mean of subnormals should be finite");
-        assert!(m > 0.0, "mean of positive subnormals should be positive");
+        // The sum is 6 subnormal ULPs and 6/3 = 2 ULPs exactly, so an
+        // exact equality is correct and catches wrong-divisor,
+        // partial-sum, and first-element bugs that a finite/positive
+        // check would admit (e.g. count-1 → 3*tiny, first sample → tiny).
+        assert_eq!(m, 2.0 * tiny, "subnormals must be summed/averaged exactly");
     }
 
     /// std_dev with exactly two values uses Bessel's correction (ddof=1).
@@ -5862,6 +6020,26 @@ mod tests {
         assert!(
             spread_outliers.is_empty(),
             "no outlier when below threshold"
+        );
+    }
+
+    /// Companion to the below-threshold case: a scenario whose mean is
+    /// far above overall_mean + 2*std MUST be flagged. The strictly-
+    /// greater test only proves the absence side (10.0 < 16.55); without
+    /// this, a never-flags or inverted (`<` instead of `>`) comparison
+    /// passes. 10 scenarios at spread 10 + 1 at 100: overall mean ~18,
+    /// std ~27, threshold ~72; the 100 scenario clears it decisively.
+    #[test]
+    fn find_outliers_flags_scenario_above_threshold() {
+        let mut rows: Vec<GauntletRow> = (0..10)
+            .map(|i| make_row(&format!("normal{i}"), "t", true, 10.0))
+            .collect();
+        rows.push(make_row("hot", "t", true, 100.0));
+        let outliers = find_outliers(&rows);
+        let spread: Vec<_> = outliers.iter().filter(|o| o.metric == "spread").collect();
+        assert!(
+            spread.iter().any(|o| o.scenario == "hot"),
+            "a scenario far above the 2-sigma threshold must be flagged as a spread outlier",
         );
     }
 
@@ -6521,7 +6699,7 @@ mod tests {
                 worst_mean_run_delay_us: non_finite,
                 worst_run_delay_us: non_finite,
                 worst_wake_latency_tail_ratio: non_finite,
-                worst_iterations_per_worker: non_finite,
+                worst_iterations_per_worker: Some(non_finite),
                 worst_page_locality: non_finite,
                 worst_cross_node_migration_ratio: non_finite,
                 ..Default::default()
@@ -8176,6 +8354,45 @@ mod tests {
         let loaded = ComparisonPolicy::load_json(tmp.path()).expect("load per-metric-only policy");
         assert_eq!(loaded.default_percent, None);
         assert_eq!(loaded.per_metric_percent.get("worst_spread"), Some(&3.0),);
+    }
+
+    /// `from_cli_flags` resolves the `--threshold` / `--policy` pair
+    /// the shared way for `stats compare` and `perf-delta`:
+    /// threshold → uniform (validated), policy → load_json, neither →
+    /// registry defaults, both → error (the clap-`conflicts_with`
+    /// backstop). Pin every branch so a future edit can't silently
+    /// drop the sign check or the mutual-exclusion guard.
+    #[test]
+    fn comparison_policy_from_cli_flags_resolves_each_branch() {
+        // --threshold N → uniform default_percent = N.
+        let p = ComparisonPolicy::from_cli_flags(Some(15.0), None).expect("threshold resolves");
+        assert_eq!(p.default_percent, Some(15.0));
+        assert!(p.per_metric_percent.is_empty());
+
+        // A negative --threshold is rejected via validate().
+        assert!(
+            ComparisonPolicy::from_cli_flags(Some(-1.0), None).is_err(),
+            "negative --threshold must be rejected before the dual-gate math",
+        );
+
+        // --policy PATH → load_json.
+        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        std::fs::write(tmp.path(), r#"{"default_percent": 8.0}"#).expect("write policy");
+        let p =
+            ComparisonPolicy::from_cli_flags(None, Some(tmp.path())).expect("policy file resolves");
+        assert_eq!(p.default_percent, Some(8.0));
+
+        // Neither → registry defaults (no uniform override).
+        let p = ComparisonPolicy::from_cli_flags(None, None).expect("default resolves");
+        assert_eq!(p.default_percent, None);
+
+        // Both set → error: clap `conflicts_with` makes this
+        // unreachable at the CLI, but the library entry point must not
+        // silently prefer one over the other.
+        assert!(
+            ComparisonPolicy::from_cli_flags(Some(10.0), Some(tmp.path())).is_err(),
+            "--threshold + --policy together must error",
+        );
     }
 
     /// End-to-end pin: `compare_rows` with a per-metric policy
@@ -10781,6 +10998,42 @@ mod tests {
             opts.passes_delta_threshold(&zero_a),
             "zero-a divisor floor (|a|.max(1.0)) must keep rel finite \
              (rel = |10|/max(0,1) = 10.0); 10.0 ≥ 0.5 → row passes"
+        );
+    }
+
+    /// Distinguishing pin for the `.max(1.0)` divisor floor: the
+    /// a=0/delta=10 case above passes both floored (10/1=10≥0.5) AND
+    /// unfloored (10/0=+inf≥0.5), so it does NOT guard the floor. The
+    /// floor actually protects a=0 AND delta=0 at --phase-threshold 0:
+    /// floored gives 0/1=0, and 0≥0 → the row renders (the documented
+    /// "PCT=0 shows every row" contract); unfloored gives 0/0=NaN, and
+    /// NaN≥0 is false → the row is silently dropped. Drop `.max(1.0)`
+    /// and this assertion flips to false.
+    #[test]
+    fn passes_delta_threshold_zero_a_zero_delta_at_pct_zero_renders() {
+        let opts = PhaseDisplayOptions {
+            phase_threshold: Some(0.0),
+            ..PhaseDisplayOptions::default()
+        };
+        let metric = METRICS
+            .iter()
+            .find(|m| m.name == "max_dsq_depth")
+            .expect("max_dsq_depth in METRICS");
+        let zero_a_zero_delta = PhaseDeltaRow {
+            pairing_key: PairingKey(vec!["t".into()]),
+            step_index: 0,
+            label: "BASELINE".into(),
+            metric,
+            a: 0.0,
+            b: 0.0,
+            delta: 0.0,
+            is_regression: false,
+        };
+        assert!(
+            opts.passes_delta_threshold(&zero_a_zero_delta),
+            "zero-a/zero-delta at --phase-threshold 0 must render: floored \
+             0/1=0, 0≥0 true. Dropping the .max(1.0) floor yields 0/0=NaN, \
+             NaN≥0 false, silently dropping the row",
         );
     }
 

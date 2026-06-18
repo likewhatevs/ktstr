@@ -89,7 +89,7 @@ mod topo;
 pub type PostVmCallback = fn(&crate::vmm::VmResult) -> anyhow::Result<()>;
 
 // extract_probe_stack_arg and extract_work_type_arg are reached in
-// production via `super::args::` (probe.rs, eval.rs); the re-export here
+// production via `super::args::` (probe.rs, eval/mod.rs); the re-export here
 // preserves the flat-namespace invariant so `test_support::X` resolves
 // uniformly across all CLI arg extractors.
 #[cfg(feature = "export")]

@@ -1230,6 +1230,18 @@ pub struct FailureDumpReport {
     /// next iteration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dump_truncated_at_us: Option<u64>,
+    /// Count of scheduler-under-test maps the per-map render loop
+    /// skipped because the soft deadline had already been crossed
+    /// (`dump_truncated_at_us` records WHEN, this records HOW MANY).
+    /// `0` on a complete dump. A skipped map is absent from `maps`
+    /// entirely — without this count a consumer reading `maps`
+    /// cannot tell "the scheduler has N maps" from "the scheduler
+    /// has N+k maps but k were dropped by truncation", so a
+    /// degraded dump would silently under-report map state. Excludes
+    /// ktstr's own framework maps, which are filtered before the
+    /// deadline check and never counted here.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub maps_truncated: u32,
     /// Probe BPF program's per-CPU diagnostic counter snapshot
     /// (see `ProbeBssCounters`). Populated by the host-side
     /// reader in `decode_probe_counters_snapshot` which sums
@@ -1294,6 +1306,7 @@ impl Default for FailureDumpReport {
             scx_walker_unavailable: None,
             vcpu_perf_at_freeze: Vec::new(),
             dump_truncated_at_us: None,
+            maps_truncated: 0,
             probe_counters: None,
             is_placeholder: false,
             active_obj_name: None,
@@ -1604,6 +1617,10 @@ pub struct DualFailureDumpReport {
 }
 
 fn is_zero_u64(v: &u64) -> bool {
+    *v == 0
+}
+
+fn is_zero_u32(v: &u32) -> bool {
     *v == 0
 }
 
@@ -1923,6 +1940,16 @@ pub struct FailureDumpStackTrace {
     /// `MAX_STACK_TRACE_PCS` PCs.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub truncated: bool,
+    /// Count of buckets whose pointer slot or bucket struct could
+    /// not be translated to a guest physical address at capture
+    /// time (an unmapped page in the bucket array or a dangling
+    /// bucket KVA). These buckets are absent from `entries`
+    /// entirely. `0` when every non-null bucket was readable.
+    /// Without this count `entries.len()` undercounts the live
+    /// buckets and the gap reads as "fewer stacks present" rather
+    /// than "stacks present but unreadable".
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub buckets_unreadable: u32,
 }
 
 /// One populated stack trace from a STACK_TRACE map.
@@ -1971,6 +1998,13 @@ pub struct FailureDumpFdArray {
     /// `MAX_FD_ARRAY_INDICES` capped the index list.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub indices_truncated: bool,
+    /// Count of scanned slots whose KVA could not be translated to a
+    /// guest physical address (an unmapped page in the `ptrs` flex
+    /// array). These slots are neither confirmed empty nor counted
+    /// as `populated`, so `populated` is a lower bound when this is
+    /// non-zero. `0` when every scanned slot was readable.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub unreadable: u32,
 }
 
 /// One (key, value) pair from a hash map. Both sides are rendered via
@@ -2970,6 +3004,7 @@ pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
         scx_walker_unavailable,
         vcpu_perf_at_freeze,
         dump_truncated_at_us: None,
+        maps_truncated: 0,
         probe_counters,
         scx_static_ranges: Default::default(),
         is_placeholder: false,
@@ -3732,6 +3767,7 @@ pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
     );
 
     report.dump_truncated_at_us = truncated_at_us;
+    report.maps_truncated = maps_truncated as u32;
     report
 }
 

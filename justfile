@@ -124,6 +124,10 @@ sccache-stats:
 stats:
     cargo run --bin cargo-ktstr -- ktstr stats
 
+# Compare performance_mode metrics: HEAD vs a baseline commit (dual-run)
+perf-delta kernel base="":
+    cargo run --bin cargo-ktstr -- ktstr perf-delta --dual-run --kernel {{kernel}}{{ if base != "" { " --base " + base } else { "" } }}
+
 # Build and link-check the guide book
 docs:
     mdbook build doc/guide

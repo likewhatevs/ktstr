@@ -269,6 +269,30 @@ pub struct TaskEnrichment {
     /// `signal->nivcsw` (unsigned long). Mirror of `signal_nvcsw`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signal_nivcsw: Option<u64>,
+    /// `task_struct.utime` (u64, nanoseconds). This live thread's
+    /// cumulative user-mode CPU time, task-lifetime monotonic. The raw
+    /// kernel accumulator (NOT the cputime_adjust-scaled /proc value),
+    /// equal to taskstats `ac_utime` modulo ns→us truncation. Counter
+    /// semantics: per-phase user time = end-start delta of the
+    /// summed-across-tasks reading.
+    pub utime: u64,
+    /// `task_struct.stime` (u64, nanoseconds). This live thread's
+    /// cumulative system-mode (in-kernel) CPU time — the DSQ-spinlock
+    /// regression's direct symptom. Same raw-accumulator / Counter
+    /// semantics as [`Self::utime`].
+    pub stime: u64,
+    /// `signal->utime` (u64, ns). Thread-group accumulator of EXITED
+    /// threads' user-mode CPU time (`__exit_signal` folds a dying
+    /// thread's utime here). `None` on signal_struct translate failure.
+    /// Shared across a thread group, so a per-group sum must add it
+    /// exactly once; combined with the live-thread [`Self::utime`] sum
+    /// it keeps the per-phase total from dipping when a worker exits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal_utime: Option<u64>,
+    /// `signal->stime` (u64, ns). Exited threads' system-mode CPU time
+    /// accumulator. Mirror of [`Self::signal_utime`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal_stime: Option<u64>,
     /// Lock-slowpath pattern matched on a PC supplied by the caller
     /// (typically `VcpuRegSnapshot.instruction_pointer` for the task
     /// running on a vCPU at freeze time). One of
@@ -347,6 +371,12 @@ pub fn walk_task_enrichment(
     // Per-task context-switch counters.
     let nvcsw = mem.read_u64(task_pa, offsets.task_struct_nvcsw);
     let nivcsw = mem.read_u64(task_pa, offsets.task_struct_nivcsw);
+    // Per-task cumulative CPU time (nanoseconds), task-lifetime
+    // monotonic. Read raw from frozen guest memory — zero guest work
+    // (vs the taskstats genetlink query). utime already includes gtime
+    // (guest time is double-counted into utime); do not sum the two.
+    let utime = mem.read_u64(task_pa, offsets.task_struct_utime);
+    let stime = mem.read_u64(task_pa, offsets.task_struct_stime);
 
     // Pointer follows: group_leader, real_parent, signal.
     let group_leader_kva = mem.read_u64(task_pa, offsets.task_struct_group_leader);
@@ -363,56 +393,65 @@ pub fn walk_task_enrichment(
     );
 
     let signal_kva = mem.read_u64(task_pa, offsets.task_struct_signal);
-    let (nr_threads, signal_nvcsw, signal_nivcsw, pgid, sid) = if signal_kva == 0 {
-        (None, None, None, None, None)
-    } else {
-        match translate_any_kva(
-            mem,
-            walk.cr3_pa,
-            walk.page_offset,
-            signal_kva,
-            walk.l5,
-            walk.tcr_el1,
-        ) {
-            None => (None, None, None, None, None),
-            Some(signal_pa) => {
-                let nr_threads_v = mem.read_u32(signal_pa, offsets.signal_struct_nr_threads) as i32;
-                let signal_nvcsw_v = mem.read_u64(signal_pa, offsets.signal_struct_nvcsw);
-                let signal_nivcsw_v = mem.read_u64(signal_pa, offsets.signal_struct_nivcsw);
-                // pids[PIDTYPE_PGID] / pids[PIDTYPE_SID] traversal.
-                // Each slot is `struct pid *` (8 bytes); the
-                // numbers[0].nr deref reads the canonical root-ns
-                // pid number.
-                let pgid_v = read_pid_nr_at_index(
-                    mem,
-                    walk,
-                    signal_pa,
-                    offsets.signal_struct_pids,
-                    pid_type::PGID,
-                    offsets.pid_numbers,
-                    offsets.upid_size,
-                    offsets.upid_nr,
-                );
-                let sid_v = read_pid_nr_at_index(
-                    mem,
-                    walk,
-                    signal_pa,
-                    offsets.signal_struct_pids,
-                    pid_type::SID,
-                    offsets.pid_numbers,
-                    offsets.upid_size,
-                    offsets.upid_nr,
-                );
-                (
-                    Some(nr_threads_v),
-                    Some(signal_nvcsw_v),
-                    Some(signal_nivcsw_v),
-                    pgid_v,
-                    sid_v,
-                )
+    let (nr_threads, signal_nvcsw, signal_nivcsw, signal_utime, signal_stime, pgid, sid) =
+        if signal_kva == 0 {
+            (None, None, None, None, None, None, None)
+        } else {
+            match translate_any_kva(
+                mem,
+                walk.cr3_pa,
+                walk.page_offset,
+                signal_kva,
+                walk.l5,
+                walk.tcr_el1,
+            ) {
+                None => (None, None, None, None, None, None, None),
+                Some(signal_pa) => {
+                    let nr_threads_v =
+                        mem.read_u32(signal_pa, offsets.signal_struct_nr_threads) as i32;
+                    let signal_nvcsw_v = mem.read_u64(signal_pa, offsets.signal_struct_nvcsw);
+                    let signal_nivcsw_v = mem.read_u64(signal_pa, offsets.signal_struct_nivcsw);
+                    // Exited-thread CPU-time accumulators (ns): added to
+                    // the live-thread sum so a mid-phase exit does not
+                    // undercount per-phase CPU time.
+                    let signal_utime_v = mem.read_u64(signal_pa, offsets.signal_struct_utime);
+                    let signal_stime_v = mem.read_u64(signal_pa, offsets.signal_struct_stime);
+                    // pids[PIDTYPE_PGID] / pids[PIDTYPE_SID] traversal.
+                    // Each slot is `struct pid *` (8 bytes); the
+                    // numbers[0].nr deref reads the canonical root-ns
+                    // pid number.
+                    let pgid_v = read_pid_nr_at_index(
+                        mem,
+                        walk,
+                        signal_pa,
+                        offsets.signal_struct_pids,
+                        pid_type::PGID,
+                        offsets.pid_numbers,
+                        offsets.upid_size,
+                        offsets.upid_nr,
+                    );
+                    let sid_v = read_pid_nr_at_index(
+                        mem,
+                        walk,
+                        signal_pa,
+                        offsets.signal_struct_pids,
+                        pid_type::SID,
+                        offsets.pid_numbers,
+                        offsets.upid_size,
+                        offsets.upid_nr,
+                    );
+                    (
+                        Some(nr_threads_v),
+                        Some(signal_nvcsw_v),
+                        Some(signal_nivcsw_v),
+                        Some(signal_utime_v),
+                        Some(signal_stime_v),
+                        pgid_v,
+                        sid_v,
+                    )
+                }
             }
-        }
-    };
+        };
 
     // Lock-slowpath PC match, if a PC was supplied.
     let lock_slowpath_match = pc.and_then(|p| locks.match_pc(p)).map(str::to_string);
@@ -439,6 +478,10 @@ pub fn walk_task_enrichment(
         nivcsw,
         signal_nvcsw,
         signal_nivcsw,
+        utime,
+        stime,
+        signal_utime,
+        signal_stime,
         lock_slowpath_match,
     })
 }
@@ -631,6 +674,10 @@ mod tests {
             nivcsw: 0,
             signal_nvcsw: None,
             signal_nivcsw: None,
+            utime: 0,
+            stime: 0,
+            signal_utime: None,
+            signal_stime: None,
             lock_slowpath_match: None,
         };
         let json = serde_json::to_string(&e).unwrap();
@@ -641,12 +688,19 @@ mod tests {
         assert!(!json.contains("nr_threads"));
         assert!(!json.contains("core_cookie"));
         assert!(!json.contains("signal_nvcsw"));
+        // signal_utime/signal_stime skip on None (exited-thread
+        // accumulators absent when signal_struct didn't translate).
+        assert!(!json.contains("signal_utime"));
+        assert!(!json.contains("signal_stime"));
         assert!(!json.contains("lock_slowpath_match"));
         // Required fields must appear.
         assert!(json.contains("\"pid\":42"));
         assert!(json.contains("\"comm\":\"ktstr_worker\""));
         assert!(json.contains("\"weight\":100"));
         assert!(json.contains("\"sched_class\":\"fair\""));
+        // utime/stime are unconditional (always serialized, even 0).
+        assert!(json.contains("\"utime\":0"));
+        assert!(json.contains("\"stime\":0"));
     }
 
     #[test]
@@ -673,6 +727,10 @@ mod tests {
             nivcsw: 678,
             signal_nvcsw: Some(50_000),
             signal_nivcsw: Some(1_234),
+            utime: 99_000,
+            stime: 88_000,
+            signal_utime: Some(7_000),
+            signal_stime: Some(6_000),
             lock_slowpath_match: Some("queued_spin_lock_slowpath".to_string()),
         };
         let json = serde_json::to_string(&e).unwrap();
@@ -683,6 +741,10 @@ mod tests {
         assert_eq!(parsed.nr_threads, Some(8));
         assert_eq!(parsed.core_cookie, Some(0xc0c01e));
         assert!(parsed.pi_boosted_out_of_scx);
+        assert_eq!(parsed.utime, 99_000);
+        assert_eq!(parsed.stime, 88_000);
+        assert_eq!(parsed.signal_utime, Some(7_000));
+        assert_eq!(parsed.signal_stime, Some(6_000));
         assert_eq!(
             parsed.lock_slowpath_match.as_deref(),
             Some("queued_spin_lock_slowpath"),

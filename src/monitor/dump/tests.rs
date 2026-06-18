@@ -79,10 +79,21 @@ fn render_sparkline_monotonic_scales_to_full_range() {
 #[test]
 fn render_sparkline_i64_clamps_negatives() {
     let s = render_sparkline_i64(&[-5, 0, 5, 10]);
-    // After clamp: [0, 0, 5, 10] → first two at lowest, last
-    // two scale up. Just pin length and bounds; exact glyphs
-    // depend on integer rounding.
-    assert_eq!(s.chars().count(), 4);
+    // After clamp: [0, 0, 5, 10] → -5 clamps to 0 (lowest glyph), 10
+    // is max (highest glyph). Pin the GLYPH CONTENT, not just length:
+    // dropping the `.max(0)` clamp renders `-5 as u64` = ~u64::MAX, so
+    // the first glyph becomes the highest block and 5/10 collapse to
+    // the lowest — still 4 chars, so a length-only check misses it.
+    let chars: Vec<char> = s.chars().collect();
+    assert_eq!(chars.len(), 4);
+    assert_eq!(
+        chars[0], '▁',
+        "clamped -5 must render the lowest glyph, not the highest (clamp dropped?)",
+    );
+    assert_eq!(
+        chars[3], '█',
+        "the max value (10) must render the highest glyph"
+    );
 }
 
 /// Full SCX_EV_* counter timeline construction: build a
@@ -203,6 +214,7 @@ fn report_serde_roundtrip() {
         scx_walker_unavailable: None,
         vcpu_perf_at_freeze: Vec::new(),
         dump_truncated_at_us: None,
+        maps_truncated: 0,
         probe_counters: None,
         scx_static_ranges: Default::default(),
         is_placeholder: false,
@@ -360,6 +372,7 @@ fn failure_dump_report_serialization_is_infallible_for_max_synthetic_input() {
         scx_walker_unavailable: Some(super::REASON_NO_SCX_WALKER.into()),
         vcpu_perf_at_freeze: vec![None, None, None],
         dump_truncated_at_us: Some(12_345),
+        maps_truncated: 0,
         probe_counters: Some(ProbeBssCounters::default()),
         scx_static_ranges: Default::default(),
         is_placeholder: false,
@@ -467,6 +480,7 @@ fn dual_failure_dump_report_serialization_is_infallible_for_max_synthetic_input(
             scx_walker_unavailable: Some(super::REASON_NO_SCX_WALKER.into()),
             vcpu_perf_at_freeze: vec![None, None],
             dump_truncated_at_us: Some(7_777),
+            maps_truncated: 0,
             probe_counters: Some(ProbeBssCounters::default()),
             scx_static_ranges: Default::default(),
             is_placeholder: false,
@@ -616,6 +630,41 @@ fn report_display_empty() {
 }
 
 #[test]
+fn report_display_truncation_only_does_not_say_empty_dump() {
+    // A dump that dropped maps to deadline truncation but has no
+    // other captured sections must surface the truncation footer
+    // rather than fall through to "(empty failure dump)" — otherwise
+    // a degraded dump reads as "nothing to show" instead of
+    // "everything was skipped".
+    let report = FailureDumpReport {
+        dump_truncated_at_us: Some(31_000),
+        maps_truncated: 4,
+        ..Default::default()
+    };
+    let out = format!("{report}");
+    assert_eq!(
+        out,
+        "dump truncated: deadline crossed at 31000us (4 map(s) skipped)"
+    );
+}
+
+#[test]
+fn report_display_appends_truncation_footer_after_sections() {
+    // When sections render AND truncation occurred, the footer is a
+    // separate trailing block.
+    let report = FailureDumpReport {
+        vcpu_regs: vec![None],
+        maps_truncated: 2,
+        ..Default::default()
+    };
+    let out = format!("{report}");
+    assert_eq!(
+        out,
+        "vcpu_regs:\n  vcpu 0: <unavailable>\n\ndump truncated: (2 map(s) skipped)"
+    );
+}
+
+#[test]
 fn report_display_one_map_with_value() {
     let report = FailureDumpReport {
         schema: SCHEMA_SINGLE.to_string(),
@@ -638,6 +687,7 @@ fn report_display_one_map_with_value() {
         scx_walker_unavailable: None,
         vcpu_perf_at_freeze: Vec::new(),
         dump_truncated_at_us: None,
+        maps_truncated: 0,
         probe_counters: None,
         scx_static_ranges: Default::default(),
         is_placeholder: false,
@@ -679,6 +729,7 @@ fn report_display_multiple_maps_separated() {
         scx_walker_unavailable: None,
         vcpu_perf_at_freeze: Vec::new(),
         dump_truncated_at_us: None,
+        maps_truncated: 0,
         probe_counters: None,
         scx_static_ranges: Default::default(),
         is_placeholder: false,
@@ -702,6 +753,52 @@ fn map_display_includes_error_marker() {
     assert!(
         out.contains("[error: ARRAY value region unreadable]"),
         "missing error marker: {out}"
+    );
+}
+
+#[test]
+fn map_display_stack_trace_surfaces_unreadable_buckets() {
+    let mut m = make_simple_map();
+    m.value = None;
+    m.stack_trace = Some(FailureDumpStackTrace {
+        n_buckets: 8,
+        entries: Vec::new(),
+        truncated: false,
+        buckets_unreadable: 3,
+    });
+    let out = format!("{m}");
+    assert!(
+        out.contains("0 of 8 buckets populated"),
+        "missing bucket summary: {out}"
+    );
+    assert!(
+        out.contains("(3 unreadable)"),
+        "unreadable-bucket count must surface so the gap reads as \
+         'unreadable' not 'fewer stacks': {out}"
+    );
+}
+
+#[test]
+fn map_display_fd_array_surfaces_unreadable_slots() {
+    let mut m = make_simple_map();
+    m.value = None;
+    m.fd_array = Some(FailureDumpFdArray {
+        populated: 1,
+        scanned: 6,
+        indices: vec![0],
+        truncated: false,
+        indices_truncated: false,
+        unreadable: 2,
+    });
+    let out = format!("{m}");
+    assert!(
+        out.contains("1 of 6 slots populated"),
+        "missing slot summary: {out}"
+    );
+    assert!(
+        out.contains("(2 unreadable)"),
+        "unreadable-slot count must surface so populated reads as a \
+         lower bound, not a confirmed total: {out}"
     );
 }
 
@@ -889,6 +986,7 @@ fn report_display_includes_vcpu_regs_section() {
         scx_walker_unavailable: None,
         vcpu_perf_at_freeze: Vec::new(),
         dump_truncated_at_us: None,
+        maps_truncated: 0,
         probe_counters: None,
         scx_static_ranges: Default::default(),
         is_placeholder: false,
@@ -935,6 +1033,7 @@ fn report_display_pairs_maps_and_vcpu_regs_with_blank_line() {
         scx_walker_unavailable: None,
         vcpu_perf_at_freeze: Vec::new(),
         dump_truncated_at_us: None,
+        maps_truncated: 0,
         probe_counters: None,
         scx_static_ranges: Default::default(),
         is_placeholder: false,
@@ -970,6 +1069,7 @@ fn report_display_empty_with_only_vcpu_regs_does_not_say_empty_dump() {
         scx_walker_unavailable: None,
         vcpu_perf_at_freeze: Vec::new(),
         dump_truncated_at_us: None,
+        maps_truncated: 0,
         probe_counters: None,
         scx_static_ranges: Default::default(),
         is_placeholder: false,
@@ -1020,6 +1120,7 @@ fn report_display_partial_with_populated_regs_and_empty_maps() {
         scx_walker_unavailable: None,
         vcpu_perf_at_freeze: Vec::new(),
         dump_truncated_at_us: None,
+        maps_truncated: 0,
         probe_counters: None,
         scx_static_ranges: Default::default(),
         is_placeholder: false,
@@ -1086,6 +1187,7 @@ fn dual_report_serde_roundtrip_with_early() {
         scx_walker_unavailable: None,
         vcpu_perf_at_freeze: Vec::new(),
         dump_truncated_at_us: None,
+        maps_truncated: 0,
         probe_counters: None,
         scx_static_ranges: Default::default(),
         is_placeholder: false,
@@ -1112,6 +1214,7 @@ fn dual_report_serde_roundtrip_with_early() {
         scx_walker_unavailable: None,
         vcpu_perf_at_freeze: Vec::new(),
         dump_truncated_at_us: None,
+        maps_truncated: 0,
         probe_counters: None,
         scx_static_ranges: Default::default(),
         is_placeholder: false,
@@ -1637,6 +1740,7 @@ fn prog_runtime_stats_serde_roundtrip_with_saturation() {
         scx_walker_unavailable: None,
         vcpu_perf_at_freeze: Vec::new(),
         dump_truncated_at_us: None,
+        maps_truncated: 0,
         probe_counters: None,
         scx_static_ranges: Default::default(),
         is_placeholder: false,
@@ -1711,6 +1815,7 @@ fn report_display_renders_prog_runtime_stats() {
         scx_walker_unavailable: None,
         vcpu_perf_at_freeze: Vec::new(),
         dump_truncated_at_us: None,
+        maps_truncated: 0,
         probe_counters: None,
         scx_static_ranges: Default::default(),
         is_placeholder: false,
@@ -1764,6 +1869,7 @@ fn report_display_only_prog_runtime_stats_does_not_say_empty_dump() {
         scx_walker_unavailable: None,
         vcpu_perf_at_freeze: Vec::new(),
         dump_truncated_at_us: None,
+        maps_truncated: 0,
         probe_counters: None,
         scx_static_ranges: Default::default(),
         is_placeholder: false,
@@ -2080,11 +2186,13 @@ fn failure_dump_report_optional_fields_round_trip_when_omitted() {
 /// is None — surfacing that the kernel lacks struct bpf_arena.
 #[test]
 fn pinned_error_arena_btf_offsets_unavailable() {
-    // The producer has no format placeholders; reproduce the
-    // exact `.into()` literal so a rephrasing in dump/render_map.rs trips.
-    let rendered: String = "arena BTF offsets unavailable (kernel lacks struct bpf_arena?)".into();
+    // Assert against the PRODUCTION const the ARENA arm emits, not a
+    // literal-vs-itself: a reword of render_map.rs's
+    // ARENA_OFFSETS_UNAVAILABLE_MSG (which the None branch sets into
+    // out.error) now trips this test.
     assert_eq!(
-        rendered, "arena BTF offsets unavailable (kernel lacks struct bpf_arena?)",
+        super::render_map::ARENA_OFFSETS_UNAVAILABLE_MSG,
+        "arena BTF offsets unavailable (kernel lacks struct bpf_arena?)",
         "arena-unavailable error string drifted from pin",
     );
 }
@@ -2485,10 +2593,14 @@ fn pinned_error_struct_ops_region_unmapped() {
 
 #[test]
 fn pinned_error_cgroup_storage_deprecated() {
-    let rendered: String =
-        "deprecated cgroup-attached storage; use CGRP_STORAGE on newer kernels".into();
+    // Assert against the PRODUCTION table, not a literal-vs-itself: a
+    // reword of the render_map.rs entry must trip this.
+    let (_, msg) = MAP_TYPE_EXPLANATIONS
+        .iter()
+        .find(|(t, _)| *t == BPF_MAP_TYPE_CGROUP_STORAGE)
+        .expect("CGROUP_STORAGE entry present");
     assert_eq!(
-        rendered,
+        *msg,
         "deprecated cgroup-attached storage; use CGRP_STORAGE on newer kernels",
     );
 }
@@ -2497,16 +2609,25 @@ fn pinned_error_cgroup_storage_deprecated() {
 fn pinned_error_queue_stack_destructive() {
     let expected = "QUEUE/STACK are destructive (peek shows only the head; pop consumes); \
          no enumeration API";
-    let rendered: String = expected.into();
-    assert_eq!(rendered, expected);
+    // Both QUEUE and STACK map to this entry; assert the production
+    // table carries it byte-exact under both discriminants.
+    for ty in [BPF_MAP_TYPE_QUEUE, BPF_MAP_TYPE_STACK] {
+        let (_, msg) = MAP_TYPE_EXPLANATIONS
+            .iter()
+            .find(|(t, _)| *t == ty)
+            .expect("QUEUE/STACK entry present");
+        assert_eq!(*msg, expected);
+    }
 }
 
 #[test]
 fn pinned_error_bloom_filter() {
-    let rendered: String =
-        "BLOOM_FILTER is a probabilistic set; no key enumeration is possible".into();
+    let (_, msg) = MAP_TYPE_EXPLANATIONS
+        .iter()
+        .find(|(t, _)| *t == BPF_MAP_TYPE_BLOOM_FILTER)
+        .expect("BLOOM_FILTER entry present");
     assert_eq!(
-        rendered,
+        *msg,
         "BLOOM_FILTER is a probabilistic set; no key enumeration is possible",
     );
 }
@@ -2515,8 +2636,11 @@ fn pinned_error_bloom_filter() {
 fn pinned_error_lpm_trie() {
     let expected = "LPM_TRIE walker not implemented (keyed by prefixlen + data); \
          use bpf(2) BPF_MAP_GET_NEXT_KEY for live-host iteration";
-    let rendered: String = expected.into();
-    assert_eq!(rendered, expected);
+    let (_, msg) = MAP_TYPE_EXPLANATIONS
+        .iter()
+        .find(|(t, _)| *t == BPF_MAP_TYPE_LPM_TRIE)
+        .expect("LPM_TRIE entry present");
+    assert_eq!(*msg, expected);
 }
 
 #[test]
@@ -2645,34 +2769,22 @@ fn accessor_mem_reader_no_snapshot_rejects_all_addrs() {
 #[test]
 fn accessor_mem_reader_zero_user_vm_start_rejects_all() {
     use super::super::arena::ArenaSnapshot;
-    let snap = ArenaSnapshot {
+    use super::render_map::is_arena_addr_in_snapshot;
+    // Drive the REAL production gate (is_arena_addr forwards to this), not
+    // a stub copy: a snapshot present but user_vm_start == 0 (the pre-pass
+    // bailed before reading the anchor) must reject EVERY address. This is
+    // the discriminating case for the `if snap.user_vm_start == 0 { return
+    // false }` guard — delete it and a zero-anchor snapshot would accept
+    // any addr < (1<<32). The 0xFFFF_FFFF case below would then wrongly
+    // pass.
+    let zero = ArenaSnapshot {
         user_vm_start: 0,
         ..ArenaSnapshot::default()
     };
-    struct StubReader<'a> {
-        arena_snapshot: Option<&'a ArenaSnapshot>,
-    }
-    impl super::super::btf_render::MemReader for StubReader<'_> {
-        fn read_kva(&self, _: u64, _: usize) -> Option<Vec<u8>> {
-            None
-        }
-        fn is_arena_addr(&self, addr: u64) -> bool {
-            let Some(snap) = self.arena_snapshot else {
-                return false;
-            };
-            if snap.user_vm_start == 0 {
-                return false;
-            }
-            addr >= snap.user_vm_start && addr < snap.user_vm_start.wrapping_add(1 << 32)
-        }
-    }
-    let r = StubReader {
-        arena_snapshot: Some(&snap),
-    };
-    // Even with a snapshot present, user_vm_start=0 means no
-    // arena base anchor → reject every address.
-    assert!(!r.is_arena_addr(0));
-    assert!(!r.is_arena_addr(0x100000));
+    assert!(!is_arena_addr_in_snapshot(Some(&zero), 0));
+    assert!(!is_arena_addr_in_snapshot(Some(&zero), 0x100000));
+    assert!(!is_arena_addr_in_snapshot(Some(&zero), 0xFFFF_FFFF));
+    assert!(!is_arena_addr_in_snapshot(None, 0x1000));
 }
 
 /// `is_arena_addr` enforces the `[user_vm_start, user_vm_start +
@@ -2719,22 +2831,17 @@ fn accessor_mem_reader_arena_addr_range_via_snapshot() {
 /// `read_arena` returns None when no snapshot is attached.
 #[test]
 fn accessor_mem_reader_read_arena_none_when_no_snapshot() {
-    struct StubReader<'a> {
-        arena_snapshot: Option<&'a super::super::arena::ArenaSnapshot>,
-    }
-    impl super::super::btf_render::MemReader for StubReader<'_> {
-        fn read_kva(&self, _: u64, _: usize) -> Option<Vec<u8>> {
-            None
-        }
-        fn read_arena(&self, _: u64, _: usize) -> Option<Vec<u8>> {
-            self.arena_snapshot?;
-            None
-        }
-    }
-    let r = StubReader {
-        arena_snapshot: None,
-    };
-    assert!(r.read_arena(0x1234, 8).is_none());
+    use super::render_map::read_arena_in_snapshot;
+    use std::collections::HashMap;
+    // Drive the REAL production helper (the body of
+    // AccessorMemReader::read_arena), not a divergent stub: no snapshot
+    // short-circuits at `?` before read_kva.
+    assert!(
+        read_arena_in_snapshot(None, &HashMap::new(), 0x1234, 8, |_, _| {
+            panic!("read_kva must not run when there is no snapshot")
+        })
+        .is_none()
+    );
 }
 
 /// `read_arena` page-aligns the address and returns the matching
@@ -2746,6 +2853,8 @@ fn accessor_mem_reader_read_arena_none_when_no_snapshot() {
 #[test]
 fn accessor_mem_reader_read_arena_page_hit() {
     use super::super::arena::{ArenaPage, ArenaSnapshot};
+    use super::render_map::read_arena_in_snapshot;
+    use std::collections::HashMap;
     let snap = ArenaSnapshot {
         pages: vec![ArenaPage {
             user_addr: 0x1000,
@@ -2753,47 +2862,50 @@ fn accessor_mem_reader_read_arena_page_hit() {
         }],
         ..ArenaSnapshot::default()
     };
+    // Production resolves the page via the arena_page_index HashMap fast
+    // path, not a linear scan — build the index the real reader uses.
+    let mut index: HashMap<u64, usize> = HashMap::new();
+    index.insert(0x1000, 0);
 
-    struct StubReader<'a> {
-        arena_snapshot: &'a ArenaSnapshot,
-    }
-    impl super::super::btf_render::MemReader for StubReader<'_> {
-        fn read_kva(&self, _: u64, _: usize) -> Option<Vec<u8>> {
-            None
-        }
-        fn read_arena(&self, addr: u64, len: usize) -> Option<Vec<u8>> {
-            let page_addr = addr & !0xFFF;
-            let offset = (addr & 0xFFF) as usize;
-            let page = self
-                .arena_snapshot
-                .pages
-                .iter()
-                .find(|p| p.user_addr == page_addr)?;
-            if offset + len > page.bytes.len() {
-                // Contract: full request cannot be satisfied → None.
-                return None;
-            }
-            Some(page.bytes[offset..offset + len].to_vec())
-        }
-    }
-    let r = StubReader {
-        arena_snapshot: &snap,
-    };
+    // Page base: bytes 0..8 of (0..=0xff cycled), via the index. read_kva
+    // must NOT run on the fast path.
+    assert_eq!(
+        read_arena_in_snapshot(Some(&snap), &index, 0x1000, 8, |_, _| panic!(
+            "fast path must not call read_kva"
+        ))
+        .unwrap(),
+        vec![0, 1, 2, 3, 4, 5, 6, 7],
+    );
+    // Offset 100: bytes 100..108.
+    let at100 = read_arena_in_snapshot(Some(&snap), &index, 0x1000 + 100, 8, |_, _| None)
+        .expect("offset hit");
+    assert_eq!(at100[0], 100);
 
-    // Read at page base: byte 0..8 of (0..=0xff cycled).
-    let bytes = r.read_arena(0x1000, 8).expect("page-aligned hit");
-    assert_eq!(bytes, vec![0, 1, 2, 3, 4, 5, 6, 7]);
-
-    // Read at offset 100: bytes 100..108.
-    let bytes = r.read_arena(0x1000 + 100, 8).expect("offset hit");
-    assert_eq!(bytes[0], 100);
-
-    // Read past page end: contract says None. The full request
-    // cannot be satisfied from one captured page, so the reader
-    // declines rather than handing back a short slice.
+    // Cross-page: offset 4090 + len 100 = 4190 > 4096 → None (production
+    // `> 4096` bound, not the stub's `> bytes.len()`).
     assert!(
-        r.read_arena(0x1000 + 4090, 100).is_none(),
-        "cross-page read must return None per MemReader::read_arena contract",
+        read_arena_in_snapshot(Some(&snap), &index, 0x1000 + 4090, 100, |_, _| None).is_none(),
+        "cross-page read must return None",
+    );
+    // Hostile overflow: checked_add must reject rather than wrap.
+    assert!(read_arena_in_snapshot(Some(&snap), &index, u64::MAX, 8, |_, _| None).is_none());
+
+    // Short captured page (bytes shorter than the requested end) with
+    // kern_vm_start == 0 falls through to the slow path and returns None
+    // — the old stub got this backwards (returned None early instead of
+    // falling through).
+    let short = ArenaSnapshot {
+        pages: vec![ArenaPage {
+            user_addr: 0x5000,
+            bytes: vec![0u8; 2048],
+        }],
+        ..ArenaSnapshot::default()
+    };
+    let mut short_index: HashMap<u64, usize> = HashMap::new();
+    short_index.insert(0x5000, 0);
+    assert!(
+        read_arena_in_snapshot(Some(&short), &short_index, 0x5000, 4096, |_, _| None).is_none(),
+        "short captured page must fall through, not return a short slice",
     );
 }
 
@@ -2801,42 +2913,44 @@ fn accessor_mem_reader_read_arena_page_hit() {
 /// captured pages (page miss).
 #[test]
 fn accessor_mem_reader_read_arena_page_miss_returns_none() {
-    use super::super::arena::{ArenaPage, ArenaSnapshot};
-    let snap = ArenaSnapshot {
-        pages: vec![ArenaPage {
-            user_addr: 0x1000,
-            bytes: vec![0u8; 4096],
-        }],
+    use super::super::arena::ArenaSnapshot;
+    use super::render_map::read_arena_in_snapshot;
+    use std::cell::Cell;
+    use std::collections::HashMap;
+
+    // Page miss + kern_vm_start == 0 → no anchor for the slow path → None
+    // (read_kva must not even run).
+    let no_anchor = ArenaSnapshot {
+        kern_vm_start: 0,
         ..ArenaSnapshot::default()
     };
+    assert!(
+        read_arena_in_snapshot(Some(&no_anchor), &HashMap::new(), 0x2000, 8, |_, _| panic!(
+            "zero kern_vm_start must short-circuit before read_kva"
+        ))
+        .is_none(),
+    );
 
-    struct StubReader<'a> {
-        arena_snapshot: &'a ArenaSnapshot,
-    }
-    impl super::super::btf_render::MemReader for StubReader<'_> {
-        fn read_kva(&self, _: u64, _: usize) -> Option<Vec<u8>> {
-            None
-        }
-        fn read_arena(&self, addr: u64, len: usize) -> Option<Vec<u8>> {
-            let page_addr = addr & !0xFFF;
-            let offset = (addr & 0xFFF) as usize;
-            let page = self
-                .arena_snapshot
-                .pages
-                .iter()
-                .find(|p| p.user_addr == page_addr)?;
-            if offset + len > page.bytes.len() {
-                // Contract: full request cannot be satisfied → None.
-                return None;
-            }
-            Some(page.bytes[offset..offset + len].to_vec())
-        }
-    }
-    let r = StubReader {
-        arena_snapshot: &snap,
+    // Page miss + non-zero kern_vm_start → compose
+    // kern_vm_start.wrapping_add(addr & 0xFFFF_FFFF) and route to read_kva
+    // with the same len. This is the only assertion that pins the
+    // 0xFFFF_FFFF mask + wrapping_add formula + len passthrough.
+    let anchor: u64 = 0xffff_8000_0000_0000;
+    let snap = ArenaSnapshot {
+        kern_vm_start: anchor,
+        ..ArenaSnapshot::default()
     };
-    // 0x2000 is NOT in the captured pages → None.
-    assert!(r.read_arena(0x2000, 8).is_none());
+    let addr: u64 = 0x1_2345_6010;
+    let seen: Cell<Option<(u64, usize)>> = Cell::new(None);
+    let got = read_arena_in_snapshot(Some(&snap), &HashMap::new(), addr, 8, |kva, l| {
+        seen.set(Some((kva, l)));
+        Some(vec![0xAB; l])
+    })
+    .expect("slow path returns the read_kva bytes");
+    assert_eq!(got, vec![0xAB; 8]);
+    let (kva, l) = seen.get().expect("read_kva must run on the slow path");
+    assert_eq!(l, 8);
+    assert_eq!(kva, anchor.wrapping_add(addr & 0xFFFF_FFFF));
 }
 
 /// MemReader default impls: any reader that doesn't override
@@ -4454,6 +4568,7 @@ fn failure_dump_stack_trace_empty_roundtrip() {
         n_buckets: 0,
         entries: Vec::new(),
         truncated: false,
+        buckets_unreadable: 0,
     };
     let json = serde_json::to_string(&original).expect("stack_trace serialize");
     // truncated=false should NOT appear in the wire format.
@@ -4461,11 +4576,17 @@ fn failure_dump_stack_trace_empty_roundtrip() {
         !json.contains("\"truncated\":true") && !json.contains("\"truncated\":false"),
         "skip_serializing_if must elide truncated when false; JSON: {json}",
     );
+    // buckets_unreadable=0 elides (is_zero_u32).
+    assert!(
+        !json.contains("buckets_unreadable"),
+        "buckets_unreadable=0 must be elided; JSON: {json}",
+    );
     let restored: FailureDumpStackTrace =
         serde_json::from_str(&json).expect("stack_trace deserialize");
     assert_eq!(restored.n_buckets, 0);
     assert!(restored.entries.is_empty());
     assert!(!restored.truncated);
+    assert_eq!(restored.buckets_unreadable, 0);
 }
 
 /// FailureDumpStackTrace populated entries with truncated=true
@@ -4493,11 +4614,16 @@ fn failure_dump_stack_trace_populated_roundtrip() {
             },
         ],
         truncated: true,
+        buckets_unreadable: 2,
     };
     let json = serde_json::to_string(&original).expect("stack_trace serialize");
     assert!(
         json.contains("\"truncated\":true"),
         "truncated=true must appear in JSON: {json}",
+    );
+    assert!(
+        json.contains("\"buckets_unreadable\":2"),
+        "non-zero buckets_unreadable must appear in JSON: {json}",
     );
     let restored: FailureDumpStackTrace =
         serde_json::from_str(&json).expect("stack_trace deserialize");
@@ -4510,6 +4636,7 @@ fn failure_dump_stack_trace_populated_roundtrip() {
     assert_eq!(restored.entries[0].data_hex, "00 10 20");
     assert_eq!(restored.entries[1].bucket_id, 2);
     assert!(restored.truncated);
+    assert_eq!(restored.buckets_unreadable, 2);
 }
 
 /// FailureDumpStackTraceEntry build-id mode: empty `pcs` is elided
@@ -4549,6 +4676,7 @@ fn failure_dump_fd_array_empty_roundtrip() {
         indices: Vec::new(),
         truncated: false,
         indices_truncated: false,
+        unreadable: 0,
     };
     let json = serde_json::to_string(&original).expect("fd_array serialize");
     assert!(
@@ -4559,11 +4687,16 @@ fn failure_dump_fd_array_empty_roundtrip() {
         !json.contains("\"indices_truncated\""),
         "indices_truncated=false must be elided; JSON: {json}",
     );
+    assert!(
+        !json.contains("unreadable"),
+        "unreadable=0 must be elided; JSON: {json}",
+    );
     let restored: FailureDumpFdArray = serde_json::from_str(&json).expect("fd_array deserialize");
     assert_eq!(restored.populated, 0);
     assert_eq!(restored.scanned, 0);
     assert!(restored.indices.is_empty());
     assert!(!restored.truncated);
+    assert_eq!(restored.unreadable, 0);
 }
 
 /// FailureDumpFdArray populated case: indices vector and
@@ -4579,11 +4712,16 @@ fn failure_dump_fd_array_populated_roundtrip() {
         indices: (0..1024).collect(), // capped at MAX_FD_ARRAY_INDICES
         truncated: true,
         indices_truncated: true, // 1500 > 1024
+        unreadable: 5,
     };
     let json = serde_json::to_string(&original).expect("fd_array serialize");
     assert!(
         json.contains("\"indices_truncated\":true"),
         "indices_truncated=true must be emitted; JSON: {json}",
+    );
+    assert!(
+        json.contains("\"unreadable\":5"),
+        "non-zero unreadable must be emitted; JSON: {json}",
     );
     let restored: FailureDumpFdArray = serde_json::from_str(&json).expect("fd_array deserialize");
     assert_eq!(restored.populated, 1500);
@@ -4596,6 +4734,7 @@ fn failure_dump_fd_array_populated_roundtrip() {
     );
     assert_eq!(restored.indices[1023], 1023);
     assert!(restored.truncated);
+    assert_eq!(restored.unreadable, 5);
 }
 
 /// Defaulted-from-empty deserialization: a stripped-down JSON

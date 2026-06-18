@@ -40,9 +40,14 @@
 //!
 //! All walkers are best-effort: any address that fails to translate
 //! (slab page race, PA out of bounds) yields a partial result rather
-//! than aborting. Cycle protection is per-list (MAX_NODES_PER_LIST);
-//! the rhashtable walk caps total bucket-table chain length at
-//! MAX_RHT_NODES.
+//! than aborting. Cycle protection on every `list_head` walk is
+//! two-layer: a `HashSet` of visited node addresses breaks on the
+//! first revisited node (a corrupt / non-canonical ring), with
+//! `MAX_NODES_PER_LIST` as a hard count backstop; the rhashtable walk
+//! caps total bucket-table chain length at `MAX_RHT_NODES`. List heads
+//! that are static kernel symbols (`scx_tasks`) are slid by the runtime
+//! virtual KASLR offset before the terminator comparison, since the
+//! list's `.next` pointers are runtime addresses.
 //!
 //! # Lock-free reads
 //!
@@ -515,16 +520,25 @@ const SCX_TASK_CURSOR: u32 = 1 << 31;
 /// are not embedded in a `task_struct`); `flags_off_in_see` is the
 /// byte offset of `flags` within `sched_ext_entity`.
 ///
+/// `kaslr_offset` is the runtime virtual KASLR slide: `scx_tasks_kva`
+/// is the LINK-TIME symbol value, but the list's `.next` pointers are
+/// runtime addresses (link + slide), so the loop terminator compares
+/// against the RUNTIME head `slid_kernel_kva(scx_tasks_kva, kaslr_offset)`.
+/// Pass `0` when KASLR is off / not yet derived (identity slide).
+///
 /// Returns an empty vec when `scx_tasks_kva` is 0 (symbol absent —
 /// stripped vmlinux or kernel without sched_ext) or when the list
 /// head reads as empty (tasks_node points at itself).
 ///
-/// Bounded by `MAX_NODES_PER_LIST` to protect against a corrupt
-/// chain.
+/// Termination: the canonical circular list closes through the runtime
+/// head on the normal path. A `HashSet` of visited nodes is the
+/// hostile-guest backstop that bounds a corrupt / non-canonical ring to
+/// its unique-node set; `MAX_NODES_PER_LIST` is a further hard cap.
 #[allow(dead_code)]
 pub fn walk_scx_tasks_global(
     kernel: &GuestKernel,
     scx_tasks_kva: u64,
+    kaslr_offset: u64,
     tasks_node_off_in_task: usize,
     tasks_node_off_in_see: usize,
     flags_off_in_see: usize,
@@ -539,12 +553,23 @@ pub fn walk_scx_tasks_global(
     let mem = kernel.mem();
     let walk = kernel.walk_context();
 
-    // The LIST_HEAD lives in the kernel text/.data mapping; convert
-    // KVA → PA via the GuestKernel's runtime kernel image base. The
-    // first u64 at that PA is list_head.next (the LIST_HEAD struct's
-    // first field).
-    let head_kva = scx_tasks_kva;
+    // head_pa reads head.next via the LINK-TIME kva: text_kva_to_pa maps a
+    // link-time kernel-image kva to its PA (phys_base already accounts for
+    // the physical load address), so this correctly reads the LIST_HEAD's
+    // first field (list_head.next) regardless of KASLR.
     let head_pa = kernel.text_kva_to_pa(scx_tasks_kva);
+    // The terminator, however, must compare against the RUNTIME head: the
+    // .next pointers stored in the list are runtime kvas (link + virtual
+    // KASLR slide), filled by the kernel's list_add_tail(&p->scx.tasks_node,
+    // &scx_tasks). slid_kernel_kva applies the high-half slide (identity
+    // when kaslr_offset == 0). Comparing runtime .next against the link-time
+    // head would never match under KASLR-on (the default), so the canonical
+    // ring would never close and the walk would fall back to the seen-set /
+    // count backstop on every boot — and would process the runtime head
+    // node itself (reading garbage `flags` from .data before &scx_tasks and
+    // emitting a phantom task). With the runtime head the loop terminates ON
+    // the head and never processes it.
+    let head_kva = crate::monitor::symbols::slid_kernel_kva(scx_tasks_kva, kaslr_offset);
 
     let mut task_kvas: Vec<u64> = Vec::new();
     let mut node_kva = mem.read_u64(head_pa, 0);
@@ -559,8 +584,26 @@ pub fn walk_scx_tasks_global(
     }
 
     let mut visited: u32 = 0;
+    // Address-cycle backstop. The canonical list closes through the runtime
+    // head_kva (above) on the normal path. This HashSet bounds a genuinely
+    // corrupt / non-canonical ring — a torn read, or a final node.next that
+    // points at an interior node instead of the head — to its unique-node
+    // set rather than cycling to MAX_NODES_PER_LIST, the hostile-guest-safe
+    // list-walk contract. (Before the runtime-head fix this path fired on
+    // every KASLR-on boot, the symptom that surfaced the symbol bug.)
+    let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
     while node_kva != head_kva {
         if visited >= MAX_NODES_PER_LIST {
+            return task_kvas;
+        }
+        if !seen.insert(node_kva) {
+            tracing::debug!(
+                node_kva = format_args!("{:#x}", node_kva),
+                unique = seen.len(),
+                "walk_scx_tasks_global: revisited node — list does not close \
+                 through head_kva; stopping at the unique-node set rather than \
+                 cycling to MAX_NODES_PER_LIST",
+            );
             return task_kvas;
         }
         visited += 1;
@@ -1101,8 +1144,16 @@ fn walk_list_head_for_task_kvas(
     }
 
     let mut visited: u32 = 0;
+    // Address-cycle backstop (see module doc): a corrupt / non-canonical
+    // ring whose final .next points at an interior node instead of the
+    // head bounds to its unique-node set and flags the partial walk,
+    // rather than cycling to MAX_NODES_PER_LIST.
+    let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
     while node_kva != head_kva {
         if visited >= MAX_NODES_PER_LIST {
+            return (task_kvas, true);
+        }
+        if !seen.insert(node_kva) {
             return (task_kvas, true);
         }
         visited += 1;
@@ -1149,8 +1200,15 @@ fn walk_list_head_for_dsq_task_kvas(
     }
 
     let mut visited: u32 = 0;
+    // Address-cycle backstop (see module doc): a corrupt / non-canonical
+    // DSQ ring bounds to its unique-node set and flags the partial walk,
+    // rather than cycling to MAX_NODES_PER_LIST.
+    let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
     while node_kva != head_kva {
         if visited >= MAX_NODES_PER_LIST {
+            return (task_kvas, true);
+        }
+        if !seen.insert(node_kva) {
             return (task_kvas, true);
         }
         visited += 1;

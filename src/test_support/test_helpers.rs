@@ -248,7 +248,6 @@ pub(crate) fn make_vm_result(
         stderr: stderr.to_string(),
         monitor: None,
         guest_messages: None,
-        stimulus_events: Vec::new(),
         verifier_stats: Vec::new(),
         kvm_stats: None,
         crash_message: None,
@@ -261,9 +260,11 @@ pub(crate) fn make_vm_result(
         },
         stats_client: None,
         periodic_fired: 0,
+        periodic_real: 0,
         periodic_target: 0,
         kern_kaslr_offset: 0,
         entry_name: None,
+        periodic_series_cache: std::sync::OnceLock::new(),
     }
 }
 

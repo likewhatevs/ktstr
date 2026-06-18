@@ -670,13 +670,13 @@ pub(super) fn dispatch_bulk_message(
             // CRC-bad frames do NOT promote — a torn frame would
             // otherwise let a hostile guest forge a phase that
             // mislabels a periodic sample. The decoder also gates
-            // on the payload size match in
+            // on the exact 24-byte payload size in
             // [`crate::vmm::wire::StimulusEvent::from_payload`];
             // an oversized / undersized payload returns None and
             // the publish is skipped. The frame still buckets
-            // verbatim below so the post-run drain at
-            // `freeze_coord/mod.rs:11130` recovers the full
-            // stimulus log unchanged.
+            // verbatim below so the post-run drain in
+            // `collect_results` recovers the full stimulus log
+            // unchanged.
             //
             // Release pairs with the periodic-fire reader's
             // `Acquire` load on the same atomic so the published
@@ -693,9 +693,10 @@ pub(super) fn dispatch_bulk_message(
                     .store(event.step_index, std::sync::atomic::Ordering::Release);
             }
             // Stimulus is verdict-bearing — bucket verbatim so the
-            // post-run drain at `freeze_coord/mod.rs:11130`
-            // recovers the full log for `VmResult::stimulus_events`
-            // population.
+            // post-run drain recovers the full TLV log into
+            // `VmResult::guest_messages`, from which
+            // `VmResult::stimulus_timeline()` derives the per-phase
+            // timeline (step frames + scenario-end terminal) on demand.
             Some(crate::vmm::wire::ShmEntry {
                 msg_type: msg.msg_type,
                 payload: msg.payload.to_vec(),
@@ -704,7 +705,7 @@ pub(super) fn dispatch_bulk_message(
         }
         Some(other) if !other.is_coordinator_internal() => {
             // Every other typed verdict-bearing variant
-            // (ScenarioEnd, Exit, TestResult, Crash, PayloadMetrics,
+            // (StepEnd, Exit, TestResult, Crash, PayloadMetrics,
             // RawPayloadOutput, Profraw, Stdout, Stderr, SchedLog,
             // Lifecycle, ExecExit, Dmesg, ProbeOutput) accumulates
             // into the bucket verbatim. (ExecExit is listed for
@@ -712,9 +713,14 @@ pub(super) fn dispatch_bulk_message(
             // `cargo ktstr shell --exec` and consumed host-side by
             // `KtstrVm::run_interactive`, not the freeze coordinator;
             // the scheduler-test path never receives one, so it is
-            // never actually bucketed here.) Stimulus has its own typed
-            // arm above (decodes step_index into the host-side
-            // mirror, then buckets). SnapshotReply is host→guest
+            // never actually bucketed here.) Stimulus and ScenarioEnd
+            // have their own typed arms above (Stimulus decodes
+            // step_index into the host-side mirror, ScenarioEnd arms the
+            // watchdog, both then bucket). StepEnd has NO dedicated arm
+            // and buckets here: unlike Stimulus it publishes no new
+            // step_index for the host mirror — its step_index equals the
+            // StepStart frame that already set `current_step` for the
+            // step, so re-storing it would be a no-op. SnapshotReply is host→guest
             // only and is filtered out by the
             // `is_coordinator_internal` guard above; a guest TX
             // frame stamped with that tag falls through to the

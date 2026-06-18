@@ -756,3 +756,35 @@ fn plan_min_page_locality_aggregates_across_cgroup() {
         "cgroup-aggregate locality 0.5 < 0.8 must fail"
     );
 }
+
+#[test]
+fn cgroup_numa_telemetry_populates_without_a_check() {
+    // page_locality + cross_node_migration_ratio are pure measurement and
+    // must populate in stats.cgroups even when NO NUMA check is configured
+    // (pre-fix they were computed only inside the check arms and otherwise
+    // hardcoded 0.0, so a NUMA test reading the telemetry got nothing).
+    let mut w = rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 50);
+    w.numa_pages = [(0usize, 80u64), (1usize, 20u64)].into_iter().collect();
+    w.vmstat_numa_pages_migrated = 10;
+    let nodes: BTreeSet<usize> = [0].into_iter().collect();
+    // NO_OVERRIDES: no worker check at all -> telemetry-only path.
+    let r = Assert::NO_OVERRIDES.assert_cgroup_with_numa(&[w], None, Some(&nodes));
+    let cg = &r.stats.cgroups[0];
+    // locality = pages on node 0 (80) / total (100) = 0.8.
+    assert!(
+        (cg.page_locality - 0.8).abs() < 1e-9,
+        "page_locality must populate as telemetry; got {}",
+        cg.page_locality,
+    );
+    // cross_node = max migrated (10) / total pages (100) = 0.1.
+    assert!(
+        (cg.cross_node_migration_ratio - 0.1).abs() < 1e-9,
+        "cross_node_migration_ratio must populate; got {}",
+        cg.cross_node_migration_ratio,
+    );
+    assert_eq!(r.stats.worst_page_locality, cg.page_locality);
+    assert_eq!(
+        r.stats.worst_cross_node_migration_ratio,
+        cg.cross_node_migration_ratio,
+    );
+}

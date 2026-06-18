@@ -253,8 +253,9 @@ fn strip_ansi_csi(s: &str) -> String {
     // to twice per test failure via `extract_bug_summary` — once
     // on the dump arg (unconditionally), and again on the
     // sched_log arg if the dump anchor scan doesn't return. The
-    // eval.rs pre-compute was lifted into a closure that only
-    // fires on failure paths, so passing tests no longer hit
+    // `crate::test_support::eval` pre-compute was lifted into a
+    // closure that only fires on failure paths, so passing tests
+    // no longer hit
     // this; the fast path avoids unnecessary copy/strip work
     // when the corpus is plain text.
     if !s.contains('\x1b') {
@@ -365,21 +366,21 @@ pub(crate) fn extract_panic_message(output: &str) -> Option<&str> {
 // Init-stage classification labels
 // ---------------------------------------------------------------------------
 //
-// Returned by `classify_init_stage` and asserted by eval.rs tests via
-// substring match. Shared constants keep the production label and the
+// Returned by `classify_init_stage` and asserted by `crate::test_support::eval`
+// tests via substring match. Shared constants keep the production label and the
 // test pins from drifting silently.
 
 /// Stage label when no init sentinel appears in COM2 — indicates the
 /// guest kernel or initramfs never reached Rust init. Pinned by
 /// `classify_no_sentinels` (output.rs) and `eval_no_sentinels_shows_initramfs_failure`
-/// (eval.rs).
+/// (eval/eval_tests_eval.rs).
 pub(crate) const STAGE_INIT_NOT_STARTED: &str =
     "init script never started (kernel or mount failure)";
 
 /// Stage label when `KTSTR_INIT_STARTED` was written but the payload
 /// sentinel never appeared — cgroup or scheduler setup failed after
 /// filesystem mounts. Pinned by `classify_init_started_only` (output.rs)
-/// and `eval_init_started_but_no_payload` (eval.rs).
+/// and `eval_init_started_but_no_payload` (eval/eval_tests_eval.rs).
 pub(crate) const STAGE_INIT_STARTED_NO_PAYLOAD: &str =
     "init started but payload never ran (cgroup/scheduler setup failed)";
 
@@ -387,7 +388,7 @@ pub(crate) const STAGE_INIT_STARTED_NO_PAYLOAD: &str =
 /// AssertResult JSON followed — the test function entered and then
 /// crashed, hung, or produced no output. Pinned by
 /// `classify_payload_starting` / `classify_payload_starting_without_init`
-/// (output.rs) and `eval_payload_started_no_result` (eval.rs).
+/// (output.rs) and `eval_payload_started_no_result` (eval/eval_tests_eval.rs).
 pub(crate) const STAGE_PAYLOAD_STARTED_NO_RESULT: &str =
     "payload started but produced no test result";
 
@@ -562,6 +563,7 @@ pub(crate) fn format_periodic_samples_section(result: &vmm::VmResult) -> String 
         return String::new();
     }
     let fired = result.periodic_fired;
+    let real = result.periodic_real;
     let target = result.periodic_target;
     let mut lines = vec![format!(
         "fired {fired}/{target} periodic snapshots ({pct:.0}% coverage)",
@@ -571,6 +573,18 @@ pub(crate) fn format_periodic_samples_section(result: &vmm::VmResult) -> String 
             100.0 * fired as f64 / target as f64
         }
     )];
+    // `periodic_fired` counts every attempted boundary, including
+    // rendezvous-timeout placeholders that carry no BPF state. When
+    // some fires were placeholder-only, "100% fired" overstates
+    // usable coverage — surface the real-capture floor so the
+    // operator does not read a degraded run as fully covered.
+    if real < fired {
+        lines.push(format!(
+            "{placeholders} were degraded placeholders \
+             (real BPF-state captures: {real}/{target})",
+            placeholders = fired.saturating_sub(real),
+        ));
+    }
     // Snapshot tags / elapsed timestamps live on the bridge until
     // the test author drains it; without draining (which would
     // consume the bridge) we can only report coverage. The full
@@ -1805,11 +1819,13 @@ ktstr-5678 [002] 0.500: sched_ext_dump: scheduler[2] unrelated event from cpu 2
         let mut result = crate::vmm::VmResult::test_fixture();
         result.periodic_target = 5;
         result.periodic_fired = 5;
+        result.periodic_real = 5;
         let s = format_periodic_samples_section(&result);
         assert!(s.contains("--- periodic samples ---"));
         assert!(s.contains("fired 5/5"));
         assert!(s.contains("100% coverage"));
         assert!(!s.contains("missing"));
+        assert!(!s.contains("placeholder"));
     }
 
     /// Periodic capture configured but partially covered: section
@@ -1819,10 +1835,42 @@ ktstr-5678 [002] 0.500: sched_ext_dump: scheduler[2] unrelated event from cpu 2
         let mut result = crate::vmm::VmResult::test_fixture();
         result.periodic_target = 5;
         result.periodic_fired = 2;
+        result.periodic_real = 2;
         let s = format_periodic_samples_section(&result);
         assert!(s.contains("--- periodic samples ---"));
         assert!(s.contains("fired 2/5"));
+        // Pin the percentage too: it is computed independently of the
+        // fired/target and missing slots, so an inverted or mis-scaled
+        // formula (e.g. 250% for 2/5) is invisible to those asserts. The
+        // sibling full_coverage test's 100% holds even under inversion.
+        assert!(s.contains("40% coverage"), "2/5 must render 40%: {s}");
         assert!(s.contains("missing 3"));
+        assert!(!s.contains("placeholder"));
+    }
+
+    /// Every boundary fired but some landed only a degraded
+    /// placeholder: "100% fired" must not read as full coverage —
+    /// the section surfaces the real-capture floor so the operator
+    /// sees the placeholder gap.
+    #[test]
+    fn format_periodic_samples_section_distinguishes_placeholders() {
+        let mut result = crate::vmm::VmResult::test_fixture();
+        result.periodic_target = 5;
+        result.periodic_fired = 5;
+        result.periodic_real = 2;
+        let s = format_periodic_samples_section(&result);
+        assert!(s.contains("fired 5/5"));
+        // No coverage gap (every boundary fired) ...
+        assert!(!s.contains("missing"));
+        // ... but the placeholder fills are surfaced.
+        assert!(
+            s.contains("3 were degraded placeholders"),
+            "placeholder count must surface: {s}"
+        );
+        assert!(
+            s.contains("real BPF-state captures: 2/5"),
+            "real-capture floor must surface: {s}"
+        );
     }
 
     // ---- format_temporal_assertions_section ----

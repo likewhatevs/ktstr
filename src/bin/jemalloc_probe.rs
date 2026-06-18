@@ -2206,6 +2206,8 @@ mod tests {
             inconclusive: false,
             stats: ktstr::assert::ScenarioStats::default(),
             monitor: None,
+            periodic_fired: 0,
+            periodic_target: 0,
             stimulus_events: Vec::new(),
             work_type: "SpinWait".to_string(),
             verifier_stats: Vec::new(),

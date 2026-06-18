@@ -184,6 +184,7 @@ pub fn max_runnable_age(
     watchdog_timestamp_pa: Option<u64>,
     start_kernel_map: u64,
     phys_base: u64,
+    kaslr_offset: u64,
 ) -> u64 {
     let global = max_runnable_age_global(
         mem,
@@ -193,6 +194,7 @@ pub fn max_runnable_age(
         walk,
         start_kernel_map,
         phys_base,
+        kaslr_offset,
     );
     let mut per_rq_max: u64 = 0;
     for &rq_pa in rq_pas {
@@ -293,6 +295,7 @@ pub fn max_runnable_age(
 /// nothing for that task but does not abort the scan; a corrupted
 /// chain contributes whatever was scanned before the bail-out,
 /// capped at MAX_NODES visits.
+#[allow(clippy::too_many_arguments)]
 pub fn max_runnable_age_global(
     mem: &GuestMem,
     scx_tasks_kva: u64,
@@ -301,16 +304,22 @@ pub fn max_runnable_age_global(
     walk: WalkContext,
     start_kernel_map: u64,
     phys_base: u64,
+    kaslr_offset: u64,
 ) -> u64 {
     if scx_tasks_kva == 0 {
         return 0;
     }
-    // The LIST_HEAD lives in the kernel text/.data mapping; convert
-    // KVA → PA via text_kva_to_pa_with_base. The first u64 at that PA
-    // is list_head.next (the LIST_HEAD struct's first field).
-    let head_kva = scx_tasks_kva;
+    // head_pa reads head.next via the LINK-TIME kva: text_kva_to_pa_with_base
+    // maps a link-time kernel-image kva to its PA via phys_base, so the
+    // LIST_HEAD's first field (list_head.next) reads correctly under KASLR.
+    // The terminator below compares against the RUNTIME head, though: the
+    // list's .next pointers carry the virtual KASLR slide, so a link-time
+    // head would never close the canonical ring under KASLR-on (it would run
+    // to MAX_NODES and process the runtime head node itself). slid_kernel_kva
+    // applies the high-half slide (identity when kaslr_offset == 0).
     let head_pa =
         super::symbols::text_kva_to_pa_with_base(scx_tasks_kva, start_kernel_map, phys_base);
+    let head_kva = super::symbols::slid_kernel_kva(scx_tasks_kva, kaslr_offset);
 
     // Read head.next. struct list_head { next; prev; } — `next` at
     // offset 0. Empty list: head.next == &head, so the loop exits
@@ -332,12 +341,20 @@ pub fn max_runnable_age_global(
 
     let mut max_age: u64 = 0;
     let mut visited: u32 = 0;
+    // Address-cycle backstop: a corrupt / non-canonical ring that does not
+    // close through head_kva is bounded to its unique-node set instead of
+    // re-traversing to MAX_NODES, burning a translate_any_kva page-table
+    // walk per phantom iteration. Mirrors the scx_walker list walks.
+    let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
     while node_kva != head_kva {
         if visited >= MAX_NODES {
             // Cycle or runaway pointer — bail out with what we have.
             // tracing::warn would amplify a transient corruption into
             // log spam, so swallow silently. The freeze coord's normal
             // dump path still surfaces the underlying problem.
+            return max_age;
+        }
+        if !seen.insert(node_kva) {
             return max_age;
         }
         visited += 1;
@@ -543,8 +560,18 @@ pub fn max_runnable_age_per_rq(
 
     let mut max_age: u64 = 0;
     let mut visited: u32 = 0;
+    // Address-cycle backstop: a corrupt / torn per-rq runnable_list ring
+    // that does not close through head_kva is bounded to its unique-node
+    // set rather than re-traversing to MAX_NODES, burning two
+    // translate_any_kva page-table walks per phantom iteration on the
+    // freeze-coordinator thread (this walk runs once per CPU inside the
+    // freeze rendezvous). Mirrors the scx_walker list walks.
+    let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
     while node_kva != head_kva {
         if visited >= MAX_NODES {
+            return max_age;
+        }
+        if !seen.insert(node_kva) {
             return max_age;
         }
         visited += 1;
@@ -669,6 +696,7 @@ mod tests {
             WalkContext::default(),
             START_KERNEL_MAP,
             0,
+            0, // kaslr_offset (no virtual slide in tests)
         );
         assert_eq!(age, 0);
     }
@@ -701,6 +729,7 @@ mod tests {
             },
             START_KERNEL_MAP,
             0,
+            0, // kaslr_offset (no virtual slide in tests)
         );
         assert_eq!(age, 0, "empty list must return age 0");
     }
@@ -759,6 +788,7 @@ mod tests {
             },
             START_KERNEL_MAP,
             0,
+            0, // kaslr_offset (no virtual slide in tests)
         );
         assert_eq!(age, 50);
     }
@@ -806,6 +836,7 @@ mod tests {
             },
             START_KERNEL_MAP,
             0,
+            0, // kaslr_offset (no virtual slide in tests)
         );
         assert_eq!(age, 0, "future runnable_at must saturate to age 0");
     }
@@ -857,6 +888,7 @@ mod tests {
             },
             START_KERNEL_MAP,
             0,
+            0, // kaslr_offset (no virtual slide in tests)
         );
         assert_eq!(
             age, 0,
@@ -916,6 +948,7 @@ mod tests {
             },
             START_KERNEL_MAP,
             0,
+            0, // kaslr_offset (no virtual slide in tests)
         );
         assert_eq!(age, 70, "scan must take the max across the global list");
     }
@@ -986,6 +1019,7 @@ mod tests {
             },
             START_KERNEL_MAP,
             0,
+            0, // kaslr_offset (no virtual slide in tests)
         );
         assert_eq!(
             age, 30,
@@ -1036,6 +1070,7 @@ mod tests {
             },
             START_KERNEL_MAP,
             0,
+            0, // kaslr_offset (no virtual slide in tests)
         );
         // Walker visited the task at least once, so it captured age 5
         // before bailing out; the test confirms termination (no
@@ -1099,6 +1134,7 @@ mod tests {
             },
             START_KERNEL_MAP,
             0,
+            0, // kaslr_offset (no virtual slide in tests)
         );
         assert_eq!(
             age, 80,
@@ -1174,6 +1210,7 @@ mod tests {
             },
             START_KERNEL_MAP,
             0,
+            0, // kaslr_offset (no virtual slide in tests)
         );
         assert_eq!(
             age, 42,
@@ -1241,6 +1278,7 @@ mod tests {
             },
             START_KERNEL_MAP,
             0,
+            0, // kaslr_offset (no virtual slide in tests)
         );
         assert_eq!(
             age, 0,
@@ -1305,6 +1343,7 @@ mod tests {
             },
             START_KERNEL_MAP,
             0,
+            0, // kaslr_offset (no virtual slide in tests)
         );
         assert_eq!(
             age, 50,
@@ -1438,6 +1477,121 @@ mod tests {
         );
     }
 
+    /// Under KASLR the global list's runtime `.next` pointers carry the
+    /// virtual slide, so the walk compares the terminator against the
+    /// SLID head. A canonical ring closing through `head_kva + slide`
+    /// with `kaslr_offset = slide` terminates on the head and yields the
+    /// real age — a regression-lock that the global walk routes the head
+    /// through `slid_kernel_kva`. (The slide arithmetic itself is
+    /// discriminated by `scx_walker_tests::slid_kernel_kva_slides_high_half_only`;
+    /// the `kaslr_offset = 0` no-slide path is pinned by the other global
+    /// tests above.)
+    #[test]
+    fn global_walk_closes_through_slid_runtime_head() {
+        let task_scx = 0usize;
+        let tasks_node_off = 0usize;
+        let runnable_at_off = 16usize;
+        let flags_off = 8usize;
+        let page_offset = 0xffff_8880_0000_0000u64;
+        let slide = 0x2d60_0000u64;
+
+        let mut buf = vec![0u8; 4096];
+        let head_pa = 0u64;
+        let head_kva = START_KERNEL_MAP + head_pa; // link-time head symbol
+        let task_pa = 64u64;
+        let task_kva = page_offset.wrapping_add(task_pa);
+        let node_kva = task_kva + (task_scx + tasks_node_off) as u64;
+
+        // head.next = node; node.next = RUNTIME head (link + slide), as
+        // the kernel's list_add_tail closes the ring at runtime.
+        buf[0..8].copy_from_slice(&node_kva.to_le_bytes());
+        buf[64..72].copy_from_slice(&(head_kva + slide).to_le_bytes());
+        let jiffies = 1_000u64;
+        let runnable_at = jiffies - 50;
+        let ra_pa = task_pa as usize + task_scx + runnable_at_off;
+        buf[ra_pa..ra_pa + 8].copy_from_slice(&runnable_at.to_le_bytes());
+        let flags_pa = task_pa as usize + task_scx + flags_off;
+        buf[flags_pa..flags_pa + 4].copy_from_slice(&SCX_TASK_QUEUED.to_le_bytes());
+
+        // SAFETY: buf outlives mem.
+        let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
+        let offsets = test_offsets(task_scx, tasks_node_off, runnable_at_off, flags_off);
+        let age = max_runnable_age_global(
+            &mem,
+            head_kva, // link-time head (the ELF symbol value)
+            &offsets,
+            jiffies,
+            WalkContext {
+                page_offset,
+                ..Default::default()
+            },
+            START_KERNEL_MAP,
+            0,
+            slide, // kaslr_offset: walk slides head before the terminator
+        );
+        assert_eq!(
+            age, 50,
+            "canonical ring closing through the slid runtime head must \
+             terminate on the head and yield the real task age"
+        );
+    }
+
+    /// Per-rq walker: a corrupt runnable_list whose node cycles back on
+    /// itself (never reaching head) is bounded by the address-cycle
+    /// HashSet to its unique node and still returns that node's age — it
+    /// does not re-traverse to MAX_NODES.
+    #[test]
+    fn per_rq_cyclic_ring_terminates_with_correct_age() {
+        let task_scx = 0usize;
+        let runnable_node_off = 24usize;
+        let runnable_at_off = 16usize;
+        let flags_off = 8usize;
+        let rq_scx_off = 32usize;
+        let scx_rq_runnable_list_off = 8usize;
+        let page_offset = 0xffff_8880_0000_0000u64;
+
+        let mut buf = vec![0u8; 4096];
+        let rq_pa: u64 = 64;
+        let head_pa = rq_pa + (rq_scx_off + scx_rq_runnable_list_off) as u64;
+        let task_pa: u64 = 256;
+        let task_kva = page_offset + task_pa;
+        let node_kva = task_kva + (task_scx + runnable_node_off) as u64;
+
+        // head.next = node; node.next = node (self-cycle, never reaches
+        // head — the HashSet must break on the revisit).
+        buf[head_pa as usize..head_pa as usize + 8].copy_from_slice(&node_kva.to_le_bytes());
+        let node_pa = task_pa as usize + task_scx + runnable_node_off;
+        buf[node_pa..node_pa + 8].copy_from_slice(&node_kva.to_le_bytes());
+        let jiffies = 1_000u64;
+        let runnable_at = jiffies - 75;
+        let ra_pa = task_pa as usize + task_scx + runnable_at_off;
+        buf[ra_pa..ra_pa + 8].copy_from_slice(&runnable_at.to_le_bytes());
+
+        // SAFETY: buf outlives mem.
+        let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
+        let offsets = with_per_rq(
+            test_offsets(task_scx, 0, runnable_at_off, flags_off),
+            runnable_node_off,
+            rq_scx_off,
+            scx_rq_runnable_list_off,
+        );
+        let age = max_runnable_age_per_rq(
+            &mem,
+            rq_pa,
+            &offsets,
+            jiffies,
+            WalkContext {
+                page_offset,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            age, 75,
+            "self-cycling node is visited once (HashSet break) and its \
+             age returned; the walk does not re-traverse to MAX_NODES"
+        );
+    }
+
     /// Per-rq walker contributes age 0 when `rq_pa == 0` (the
     /// caller is signalling "no per-CPU rq PA available"). Without
     /// this guard the walker would dereference offset-from-zero
@@ -1558,6 +1712,7 @@ mod tests {
             None,
             START_KERNEL_MAP,
             0,
+            0, // kaslr_offset (no virtual slide in tests)
         );
         assert_eq!(
             age, 70,
@@ -1612,6 +1767,7 @@ mod tests {
             None,
             START_KERNEL_MAP,
             0,
+            0, // kaslr_offset (no virtual slide in tests)
         );
         assert_eq!(
             age, 42,
@@ -1663,6 +1819,7 @@ mod tests {
             Some(watchdog_pa),
             START_KERNEL_MAP,
             0,
+            0, // kaslr_offset (no virtual slide in tests)
         );
         assert_eq!(
             age, 800,
@@ -1707,6 +1864,7 @@ mod tests {
             Some(watchdog_pa),
             START_KERNEL_MAP,
             0,
+            0, // kaslr_offset (no virtual slide in tests)
         );
         assert_eq!(
             age, 0,
@@ -1758,6 +1916,7 @@ mod tests {
             Some(watchdog_pa),
             START_KERNEL_MAP,
             0,
+            0, // kaslr_offset (no virtual slide in tests)
         );
         assert_eq!(
             age, 0,
@@ -1805,6 +1964,7 @@ mod tests {
             Some(watchdog_pa),
             START_KERNEL_MAP,
             0,
+            0, // kaslr_offset (no virtual slide in tests)
         );
         assert_eq!(age, 0, "future watchdog_timestamp must saturate to age 0",);
     }

@@ -12,10 +12,10 @@ fn scenario_stats_serde_roundtrip() {
         cgroups: vec![CgroupStats {
             num_workers: 4,
             num_cpus: 2,
-            avg_off_cpu_pct: 50.0,
-            min_off_cpu_pct: 40.0,
-            max_off_cpu_pct: 60.0,
-            spread: 20.0,
+            avg_off_cpu_pct: Some(50.0),
+            min_off_cpu_pct: Some(40.0),
+            max_off_cpu_pct: Some(60.0),
+            spread: Some(20.0),
             max_gap_ms: 150,
             max_gap_cpu: 3,
             total_migrations: 10,
@@ -31,10 +31,21 @@ fn scenario_stats_serde_roundtrip() {
     };
     let json = serde_json::to_string(&s).unwrap();
     let s2: ScenarioStats = serde_json::from_str(&json).unwrap();
-    assert_eq!(s.total_workers, s2.total_workers);
-    assert_eq!(s.worst_gap_ms, s2.worst_gap_ms);
-    assert_eq!(s.cgroups.len(), s2.cgroups.len());
-    assert_eq!(s.cgroups[0].num_workers, s2.cgroups[0].num_workers);
+    // Full-value roundtrip, not just a 4-field spot check: a serde
+    // regression (a rename typo, a precision-losing serializer, or an
+    // Option mis-encode turning Some(50.0) into None/0.0) must surface.
+    // The nested CgroupStats Option<f64> off-CPU% fields are the
+    // load-bearing case — they are legitimately optional on the wire,
+    // so a Some->None corruption deserializes cleanly and only an
+    // explicit value check catches it.
+    assert_eq!(s, s2, "ScenarioStats must roundtrip every field verbatim");
+    // Spot-pin the optional off-CPU% fields so a reader sees exactly
+    // what the equality guards.
+    let c = &s2.cgroups[0];
+    assert_eq!(c.avg_off_cpu_pct, Some(50.0));
+    assert_eq!(c.min_off_cpu_pct, Some(40.0));
+    assert_eq!(c.max_off_cpu_pct, Some(60.0));
+    assert_eq!(c.spread, Some(20.0));
 }
 
 #[test]
@@ -201,13 +212,16 @@ fn assert_strict_type_rejection_names_offending_field() {
 /// `ScenarioStats` test.
 #[test]
 fn cgroup_stats_missing_required_field_rejected_by_deserialize() {
+    // The off-CPU% fields (avg / min / max_off_cpu_pct, spread) are
+    // intentionally OMITTED: they are `Option<f64>`, where `None`
+    // encodes "off-CPU% not measured" (no worker with positive wall
+    // time). serde maps a missing key on an `Option` field to `None`,
+    // which is the correct semantic here (absent == not reported), so
+    // these are legitimately optional on the wire — not a softened
+    // required scalar.
     const REQUIRED_FIELDS: &[&str] = &[
         "num_workers",
         "num_cpus",
-        "avg_off_cpu_pct",
-        "min_off_cpu_pct",
-        "max_off_cpu_pct",
-        "spread",
         "max_gap_ms",
         "max_gap_cpu",
         "total_migrations",
@@ -294,7 +308,10 @@ fn scenario_stats_missing_required_scalar_rejected_by_deserialize() {
         "worst_page_locality",
         "worst_cross_node_migration_ratio",
         "worst_wake_latency_tail_ratio",
-        "worst_iterations_per_worker",
+        // `worst_iterations_per_worker` is intentionally omitted: it is
+        // `Option<f64>` (None = no cgroup reported a worker), so a
+        // missing key correctly deserializes to None rather than being
+        // a softened required scalar.
         "ext_metrics",
     ];
 

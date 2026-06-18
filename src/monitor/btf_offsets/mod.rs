@@ -1645,6 +1645,12 @@ pub struct TaskStructEnrichmentOffsets {
     pub nvcsw: usize,
     /// Offset of `nivcsw` (unsigned long).
     pub nivcsw: usize,
+    /// Offset of `utime` (u64, nanoseconds). Cumulative user-mode CPU
+    /// time, task-lifetime monotonic. Unconditional field.
+    pub utime: usize,
+    /// Offset of `stime` (u64, nanoseconds). Cumulative system-mode
+    /// (in-kernel) CPU time, task-lifetime monotonic. Unconditional.
+    pub stime: usize,
 }
 
 impl TaskStructEnrichmentOffsets {
@@ -1664,6 +1670,8 @@ impl TaskStructEnrichmentOffsets {
             stack: member_byte_offset(btf, &task_struct, "stack")?,
             nvcsw: member_byte_offset(btf, &task_struct, "nvcsw")?,
             nivcsw: member_byte_offset(btf, &task_struct, "nivcsw")?,
+            utime: member_byte_offset(btf, &task_struct, "utime")?,
+            stime: member_byte_offset(btf, &task_struct, "stime")?,
         })
     }
 }
@@ -1928,6 +1936,15 @@ pub struct SignalStructOffsets {
     pub pids: usize,
     pub nvcsw: usize,
     pub nivcsw: usize,
+    /// Offset of `utime` (u64, nanoseconds). Thread-group accumulator
+    /// of EXITED threads' user-mode CPU time (`__exit_signal` folds a
+    /// dying thread's utime here). Live threads' utime is on their own
+    /// task_struct; the whole-group total is `signal.utime` + sum of
+    /// live `task_struct.utime`.
+    pub utime: usize,
+    /// Offset of `stime` (u64, nanoseconds). Thread-group accumulator
+    /// of EXITED threads' system-mode CPU time. Mirror of `utime`.
+    pub stime: usize,
 }
 
 impl SignalStructOffsets {
@@ -1938,6 +1955,8 @@ impl SignalStructOffsets {
             pids: member_byte_offset(btf, &signal, "pids")?,
             nvcsw: member_byte_offset(btf, &signal, "nvcsw")?,
             nivcsw: member_byte_offset(btf, &signal, "nivcsw")?,
+            utime: member_byte_offset(btf, &signal, "utime")?,
+            stime: member_byte_offset(btf, &signal, "stime")?,
         })
     }
 }
@@ -2192,6 +2211,15 @@ pub struct TaskEnrichmentOffsets {
     /// Offset of `nivcsw` (unsigned long). Involuntary context
     /// switches; mirror of `nvcsw`.
     pub signal_struct_nivcsw: usize,
+    /// Offset of `utime` (u64, ns) in `struct signal_struct`:
+    /// accumulator of EXITED threads' user-mode CPU time. Added to the
+    /// live-thread `task_struct_utime` sum so a mid-phase thread exit
+    /// does not undercount the per-phase delta.
+    pub signal_struct_utime: usize,
+    /// Offset of `stime` (u64, ns) in `struct signal_struct`: exited
+    /// threads' system-mode CPU time accumulator. Mirror of
+    /// `signal_struct_utime`.
+    pub signal_struct_stime: usize,
 
     // -- per-task voluntary/involuntary context-switch counters
     //    on task_struct itself (live thread count). The dump
@@ -2201,6 +2229,13 @@ pub struct TaskEnrichmentOffsets {
     pub task_struct_nvcsw: usize,
     /// Offset of `nivcsw` (unsigned long) within `struct task_struct`.
     pub task_struct_nivcsw: usize,
+    /// Offset of `utime` (u64, ns) within `struct task_struct`. Live
+    /// thread's cumulative user-mode CPU time; per-phase user time =
+    /// end-of-phase - start-of-phase delta of the summed reading.
+    pub task_struct_utime: usize,
+    /// Offset of `stime` (u64, ns) within `struct task_struct`. Live
+    /// thread's cumulative system-mode (in-kernel) CPU time.
+    pub task_struct_stime: usize,
 
     // -- struct pid fields --
     /// Offset of `numbers` (struct upid[]) flex array within
@@ -2271,8 +2306,12 @@ impl TaskEnrichmentOffsets {
             signal_struct_pids: signal.pids,
             signal_struct_nvcsw: signal.nvcsw,
             signal_struct_nivcsw: signal.nivcsw,
+            signal_struct_utime: signal.utime,
+            signal_struct_stime: signal.stime,
             task_struct_nvcsw: task_ext.nvcsw,
             task_struct_nivcsw: task_ext.nivcsw,
+            task_struct_utime: task_ext.utime,
+            task_struct_stime: task_ext.stime,
             pid_numbers: pid_offs.numbers,
             pid_size: pid_offs.size,
             upid_nr: upid.nr,

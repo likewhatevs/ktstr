@@ -330,6 +330,20 @@ impl<'a> Snapshot<'a> {
                 if let Some(err) = self.excluded_filter_err(name.to_string()) {
                     return SnapshotField::Missing(err);
                 }
+                // No global-section map yielded the var. If a
+                // global-section map's contents failed to render
+                // (value absent, `error` set), the search could not
+                // confirm the var's absence — that map might hold it.
+                // Surface the render failure rather than a false
+                // VarNotFound that reads as "the symbol doesn't exist".
+                if let Some(m) = self.maps_iter().find(|m| {
+                    is_global_section_map(&m.name) && m.value.is_none() && m.error.is_some()
+                }) {
+                    return SnapshotField::Missing(SnapshotError::MapRenderIncomplete {
+                        map: m.name.clone(),
+                        error: m.error.clone().unwrap_or_default(),
+                    });
+                }
                 let mut available: Vec<String> = Vec::new();
                 for m in self.maps_iter() {
                     if !is_global_section_map(&m.name) {
@@ -1150,6 +1164,22 @@ impl<'a> SnapshotMap<'a> {
         &self.map.name
     }
 
+    /// When this map's contents failed to render at capture time
+    /// (`FailureDumpMap::error` is set), produce the
+    /// [`SnapshotError::MapRenderIncomplete`] that callers should
+    /// surface in place of an "empty map" verdict. `None` when the
+    /// map rendered successfully — the absence is then genuine and
+    /// the caller's own "not found" / "out of range" error applies.
+    fn render_incomplete_err(&self) -> Option<SnapshotError> {
+        self.map
+            .error
+            .as_ref()
+            .map(|error| SnapshotError::MapRenderIncomplete {
+                map: self.map.name.clone(),
+                error: error.clone(),
+            })
+    }
+
     /// Underlying [`FailureDumpMap`].
     pub fn raw(&self) -> &'a FailureDumpMap {
         self.map
@@ -1248,6 +1278,13 @@ impl<'a> SnapshotMap<'a> {
             }
             len += 1;
         }
+        // An empty traversal over a map whose contents failed to
+        // render is a capture gap, not "predicate never matched".
+        if len == 0
+            && let Some(err) = self.render_incomplete_err()
+        {
+            return SnapshotEntry::Missing(err);
+        }
         SnapshotEntry::Missing(SnapshotError::NoMatch {
             map: self.map.name.clone(),
             op: "find".to_string(),
@@ -1276,12 +1313,20 @@ impl<'a> SnapshotMap<'a> {
         }
         match best {
             Some((_, e)) => e,
-            None => SnapshotEntry::Missing(SnapshotError::NoMatch {
-                map: self.map.name.clone(),
-                op: "max_by".to_string(),
-                len: 0,
-                available_keys: Vec::new(),
-            }),
+            None => {
+                // No entries to compare. A render failure (contents
+                // unreadable at capture) is distinct from an
+                // empty map; surface it so the gap is visible.
+                if let Some(err) = self.render_incomplete_err() {
+                    return SnapshotEntry::Missing(err);
+                }
+                SnapshotEntry::Missing(SnapshotError::NoMatch {
+                    map: self.map.name.clone(),
+                    op: "max_by".to_string(),
+                    len: 0,
+                    available_keys: Vec::new(),
+                })
+            }
         }
     }
 
@@ -1343,6 +1388,13 @@ impl<'a> SnapshotMap<'a> {
                 index: n,
                 len: 1,
             });
+        }
+        // Nothing to walk. Distinguish a render failure (contents
+        // could not be read at capture, `error` set) from a
+        // genuinely-empty map so the operator sees the capture gap
+        // rather than a misleading "index out of range, len 0".
+        if let Some(err) = self.render_incomplete_err() {
+            return Err(err);
         }
         Err(SnapshotError::IndexOutOfRange {
             map: self.map.name.clone(),

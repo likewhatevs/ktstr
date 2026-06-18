@@ -765,8 +765,9 @@ pub(crate) fn dispatch_watchpoint_hit(
 /// `kind_host_ptr` is guaranteed non-null when this helper runs.
 /// The freeze coordinator publishes the pair in `kind_host_ptr →
 /// request_kva` order with matching `Release` stores (see
-/// `freeze_coord.rs::run_coord_loop`, where the err_exit publish
-/// issues the `kind_host_ptr` store BEFORE the `request_kva`
+/// `freeze_coord/watchpoint.rs::republish_watchpoint_on_rebind`, where
+/// the err_exit publish issues the `kind_host_ptr` store BEFORE the
+/// `request_kva`
 /// store). [`super::vcpu::self_arm_watchpoint`] only programs the
 /// hardware watchpoint after observing a non-zero `request_kva`
 /// via an `Acquire` load — that load synchronises-with the
@@ -801,7 +802,9 @@ fn latch_slot0_with_gate(watchpoint: &WatchpointArm) {
             "latch_slot0_with_gate: kind_host_ptr null at fire time — \
              publication invariant broken (request_kva non-zero must \
              imply kind_host_ptr non-null per the Release-store \
-             ordering in freeze_coord.rs::run_coord_loop). Skipping \
+             ordering in \
+             freeze_coord/watchpoint.rs::republish_watchpoint_on_rebind). \
+             Skipping \
              slot-0 latch; the BPF .bss late-trigger fallback in the \
              freeze coordinator's poll loop remains active."
         );
@@ -1064,8 +1067,8 @@ pub(crate) fn vcpu_run_loop_unified(
 
 /// Drain pending PIO/MMIO state and park the vCPU until freeze
 /// clears. Called from the run loop when the freeze flag is observed,
-/// and from `mod.rs::run_bsp_loop` for the same purpose on the BSP
-/// thread.
+/// and from `super::freeze_coord::run_bsp_loop` for the same purpose
+/// on the BSP thread.
 ///
 /// The drain dance — `set_immediate_exit(1) → vcpu.run() →
 /// set_immediate_exit(0)` — is the Cloud Hypervisor pause/snapshot

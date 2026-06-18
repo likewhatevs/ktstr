@@ -369,8 +369,19 @@ impl RenderedValue {
     }
 
     /// Coerce a scalar variant to `bool`. Direct from `Bool`; from
-    /// `Uint`/`Int`/`Char`/`Enum` returns `Some(value != 0)`. `Float`
-    /// and aggregate variants return `None`.
+    /// `Uint`/`Int`/`Char`/`Enum`/`Ptr` returns `Some(value != 0)` —
+    /// a `Ptr` coerces as a non-null test, matching `as_u64`'s
+    /// treatment of a pointer as its numeric address. `Float` and
+    /// aggregate variants return `None`.
+    ///
+    /// The `Ptr` arm keeps this in lockstep with the scalar
+    /// `SnapshotField::as_bool` accessor (scenario/snapshot/field.rs),
+    /// which already coerces `Ptr` to a non-null bool. Without it the
+    /// array path (`as_bool_array` → this method per element) rejected
+    /// a pointer element that the scalar accessor accepted, so
+    /// `field.as_bool()` and `field.as_bool_array()` disagreed on a
+    /// pointer — the same scalar-vs-array divergence the `Enum`
+    /// signedness handling in `as_u64` was added to eliminate.
     pub fn as_bool(&self) -> Option<bool> {
         match self {
             RenderedValue::Bool { value } => Some(*value),
@@ -378,6 +389,7 @@ impl RenderedValue {
             RenderedValue::Int { value, .. } => Some(*value != 0),
             RenderedValue::Char { value } => Some(*value != 0),
             RenderedValue::Enum { value, .. } => Some(*value != 0),
+            RenderedValue::Ptr { value, .. } => Some(*value != 0),
             _ => None,
         }
     }

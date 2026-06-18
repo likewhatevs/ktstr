@@ -1117,7 +1117,7 @@ impl Scheduler {
     /// [`SchedulerSpec::has_active_scheduling`].
     ///
     /// Kept (unlike the trivial `name` / `binary` accessors that were
-    /// dropped) because the 11+ call sites in `eval.rs` / `probe.rs`
+    /// dropped) because the 11+ call sites in `crate::test_support::eval` / `probe.rs`
     /// would otherwise spell `entry.scheduler.binary.has_active_scheduling()`
     /// at every dispatch decision — the `.binary.` indirection
     /// repeats noise without adding meaning. The forwarder is one
@@ -1503,7 +1503,7 @@ pub struct KtstrTestEntry {
     ///   1. FRAMEWORK level: `post_vm` is skipped entirely when
     ///      the guest already reported a failed `AssertResult`
     ///      (see the `guest_already_failed` gate in
-    ///      `src/test_support/eval.rs::run_ktstr_test_inner_impl`'s
+    ///      `src/test_support/eval/mod.rs::run_ktstr_test_inner_impl`'s
     ///      post_vm dispatch site). `post_vm_unconditional`
     ///      bypasses that suppression and always runs.
     ///   2. CALLBACK level: the conventional `post_vm` callback
@@ -2920,7 +2920,7 @@ mod tests {
         assert!(d.payload.is_none());
         assert!(d.workloads.is_empty());
         // post_vm_unconditional defaults to None — the unconditional
-        // dispatch arm in eval.rs is a no-op for the default entry,
+        // dispatch arm in `run_post_vm_callbacks` is a no-op for the default entry,
         // matching the macro's omit-when-unset codegen.
         assert!(d.post_vm_unconditional.is_none());
     }

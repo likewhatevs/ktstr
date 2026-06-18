@@ -119,8 +119,9 @@ pub fn export_test(test_name: &str, output: Option<PathBuf>) -> Result<()> {
     // KernelBuiltin schedulers don't ship a userspace binary; they
     // activate via shell commands stored on the spec's `enable` /
     // `disable` slots. The framework runs those commands in the VM
-    // around the scheduler binary launch (eval.rs builds
-    // sched_enable_cmds / sched_disable_cmds on the VmBuilder). The
+    // around the scheduler binary launch (eval/mod.rs's
+    // run_ktstr_test_inner_impl builds sched_enable_cmds /
+    // sched_disable_cmds on the VmBuilder). The
     // preamble in v1 does not generate equivalent shell commands —
     // running the .run file on a host without applying those
     // settings would silently mis-launch the scheduler. Reject with
@@ -198,7 +199,7 @@ struct ConfigExportAddition {
     host_path: PathBuf,
     /// Shell-ready CLI argument string PREPENDED to the launched
     /// scheduler's argv at preamble-render time so the rendered
-    /// argv matches the in-VM eval.rs:1112-1125 ordering
+    /// argv matches the in-VM `run_ktstr_test_inner_impl` ordering
     /// (`--config FIRST, append_base_sched_args LAST`). Uses
     /// `"$DIR/include/<basename>"` (with the `$DIR` shell variable
     /// preserved for runtime expansion by the .run extractor) so
@@ -223,8 +224,9 @@ struct ConfigExportAddition {
 /// rejects an unpaired `config_content`, so the inline path emits
 /// at most one addition. The on-disk path is orthogonal and could
 /// in theory co-exist with the inline path — handled in lockstep
-/// with the in-VM eval.rs behavior so a single .run runs the
-/// scheduler with the same argv as a normal test invocation.
+/// with the in-VM `crate::test_support::eval` behavior so a single
+/// .run runs the scheduler with the same argv as a normal test
+/// invocation.
 fn compute_config_export_additions(entry: &KtstrTestEntry) -> Result<Vec<ConfigExportAddition>> {
     let mut out = Vec::new();
     if let Some(addition) = config_file_addition(entry)? {
@@ -240,7 +242,7 @@ fn compute_config_export_additions(entry: &KtstrTestEntry) -> Result<Vec<ConfigE
 /// into a [`ConfigExportAddition`]. Hardcoded `--config` arg
 /// matches the in-VM behavior at
 /// `crate::test_support::runtime::config_file_parts` and the
-/// surrounding push at `eval.rs`.
+/// surrounding push at `crate::test_support::eval`.
 fn config_file_addition(entry: &KtstrTestEntry) -> Result<Option<ConfigExportAddition>> {
     let Some(config_path) = entry.scheduler.config_file else {
         return Ok(None);
@@ -550,7 +552,7 @@ fn generate_preamble(
 
     // Compose scheduler args via the same host-side builder the
     // in-VM test path uses to assemble the scheduler argv
-    // (`append_base_sched_args`, invoked from both `eval.rs` and
+    // (`append_base_sched_args`, invoked from both `eval/mod.rs` and
     // `probe.rs`): cgroup-parent auto-inject from
     // `entry.scheduler.cgroup_parent`, then the scheduler def's own
     // `sched_args`, then per-test `extra_sched_args`. Reusing the
@@ -564,7 +566,7 @@ fn generate_preamble(
     // `config_content`) are handled via the `config_additions`
     // parameter: each addition contributes a shell-ready prefix
     // that lands BEFORE the joined base args. The ordering matches
-    // the in-VM path at `eval.rs:1112-1125` which pushes
+    // the in-VM path at `run_ktstr_test_inner_impl` which pushes
     // `--config <path>` (and any `config_file_def`-templated arg)
     // first and then appends `append_base_sched_args` last.
     // Keeping in-VM and export argv-order in lockstep means an

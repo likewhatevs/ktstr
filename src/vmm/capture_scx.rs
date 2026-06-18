@@ -55,6 +55,14 @@ pub(crate) struct ScxWalkerOwned {
     /// runnable_list drain that scheduler teardown triggers
     /// (`scx_bypass`, kernel/sched/ext.c:5304-5404).
     pub(crate) scx_tasks_kva: u64,
+    /// Runtime virtual KASLR slide. `scx_tasks_kva` is the LINK-TIME
+    /// symbol value; the global list's `.next` pointers are runtime
+    /// addresses (link + this slide), so the scx_tasks walk slides the
+    /// head before its terminator comparison
+    /// ([`crate::monitor::symbols::slid_kernel_kva`]). `0` when KASLR is
+    /// off / not yet derived. Same slide the per-CPU `rq_kvas` already
+    /// carry via [`crate::monitor::symbols::per_cpu_kva`].
+    pub(crate) kaslr_offset: u64,
 }
 
 /// Build the SCX walker owned-data set when the hard prerequisites
@@ -152,6 +160,7 @@ pub(crate) fn build(
                 rq_pas: Vec::new(),
                 scx_root_kva,
                 scx_tasks_kva,
+                kaslr_offset,
             });
         }
     };
@@ -218,6 +227,7 @@ fn compute_owned(
         rq_pas,
         scx_root_kva,
         scx_tasks_kva,
+        kaslr_offset,
     }
 }
 
@@ -230,7 +240,7 @@ mod tests {
     /// per-CPU rq KVA/PA pairs that match
     /// `runqueues_kva + per_cpu_offset[cpu]` and pass `scx_root_kva`
     /// through unchanged. Mirrors the runnable scanner's address
-    /// derivation in `freeze_coord.rs` so both code paths agree on
+    /// derivation in `crate::vmm::freeze_coord` so both code paths agree on
     /// the per-CPU rq base.
     #[test]
     fn compute_owned_happy_path() {
@@ -321,6 +331,7 @@ mod tests {
             rq_pas: Vec::new(),
             scx_root_kva,
             scx_tasks_kva,
+            kaslr_offset: 0,
         };
         assert!(owned.rq_kvas.is_empty());
         assert!(owned.rq_pas.is_empty());
@@ -345,6 +356,7 @@ mod tests {
             rq_pas: Vec::new(),
             scx_root_kva: 0,
             scx_tasks_kva,
+            kaslr_offset: 0,
         };
         // scx_tasks_kva remains addressable even though rq arrays
         // are empty — the global walk doesn't depend on per-CPU

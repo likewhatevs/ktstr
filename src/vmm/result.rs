@@ -51,6 +51,23 @@ use crate::monitor;
 ///    field's own doc for the precise drain / iteration contract.
 ///    If you need an independent snapshot view, drain into a local
 ///    `Vec` before cloning the `VmResult`.
+///
+/// 3. **The capture-series cache** (`periodic_series_cache`): a
+///    `OnceLock<SampleSeries>` that memoizes the one destructive drain
+///    of the category-2 `snapshot_bridge` (see
+///    [`Self::captures_series`]). Its clone behavior depends on whether
+///    it is populated at clone time:
+///    - **Populated** (any of [`Self::captures_series`] /
+///      [`Self::periodic_series`] / [`Self::phase_buckets`] was already
+///      called): the clone carries an INDEPENDENT copy of the cached
+///      series — category-1 semantics. Both clones return the same
+///      captures without touching the (now-drained) shared bridge.
+///    - **Empty**: the clone shares the category-2 bridge, so the
+///      FIRST `captures_series()` call on EITHER clone performs the
+///      single drain and the other clone — if it later drains the same
+///      shared bridge — sees nothing. To give each clone its own
+///      buckets, call [`Self::captures_series`] (or any accessor that
+///      routes through it) on the original BEFORE cloning.
 #[derive(Debug, Clone)]
 pub struct VmResult {
     /// Overall success flag: `true` when the test reported a pass AND
@@ -101,9 +118,6 @@ pub struct VmResult {
     /// virtio-console port 1 during the run with the final port-1
     /// `port1_tx_buf` flush.
     pub guest_messages: Option<BulkDrainResult>,
-    /// Stimulus events extracted from guest TLV entries.
-    #[allow(dead_code)]
-    pub stimulus_events: Vec<wire::StimulusEvent>,
     /// BPF verifier stats collected from host-side memory reads.
     pub verifier_stats: Vec<monitor::bpf_prog::ProgVerifierStats>,
     /// KVM per-vCPU cumulative stats (requires Linux >= 5.14).
@@ -214,12 +228,11 @@ pub struct VmResult {
     /// assert!(c.reads_completed > 0);
     /// ```
     ///
-    /// `#[allow(dead_code)]` mirrors `stimulus_events` above: the
-    /// field is part of the public API surface and read by user
-    /// test code outside `lib.rs`, but the lib build doesn't see
-    /// any in-tree readers because no lib code path calls
-    /// `.virtio_blk_counters` on a `VmResult`. The in-tree readers
-    /// live in unit tests.
+    /// `#[allow(dead_code)]`: the field is part of the public API
+    /// surface and read by user test code outside `lib.rs`, but the
+    /// lib build doesn't see any in-tree readers because no lib code
+    /// path calls `.virtio_blk_counters` on a `VmResult`. The in-tree
+    /// readers live in unit tests.
     #[allow(dead_code)]
     pub virtio_blk_counters: Option<VirtioBlkCountersSnapshot>,
     /// Host-side virtio-net device counters, snapshotted after the
@@ -327,22 +340,27 @@ pub struct VmResult {
     /// Always present after a successful `run_vm`; `None`-equivalent
     /// (empty) when the VM crashed before any snapshot fired.
     ///
-    /// **Drained by `evaluate_vm_result`**: the framework's
-    /// `crate::test_support::eval` path drains this bridge to
-    /// auto-populate [`crate::assert::ScenarioStats::phases`]
-    /// before returning the AssertResult. A `post_vm` callback or
-    /// any code path that runs THROUGH `evaluate_vm_result`
-    /// observes an empty bridge here — the periodic captures the
-    /// drain consumed are recovered as the per-phase
-    /// [`crate::assert::PhaseBucket`] entries on
-    /// `result.stats.phases`, which is the framework-curated
-    /// equivalent surface. Integration tests under `tests/` that
-    /// bypass `evaluate_vm_result` (e.g. `tests/stats_bridge_e2e.rs`,
-    /// `tests/temporal_assertions_e2e.rs`) see the bridge intact
-    /// because their entry path never reaches the auto-populate
-    /// site; those consumers continue to call
-    /// `result.snapshot_bridge.drain*()` directly without
-    /// observable contract change.
+    /// **Drained exactly once, via [`Self::captures_series`]**: the
+    /// bridge yields each capture once, so the host-side consumers
+    /// share a single drain. The first call to
+    /// [`Self::captures_series`] — whether from a `post_vm` callback
+    /// (which runs FIRST, via [`Self::periodic_series`] /
+    /// [`Self::phase_buckets`]) or from the framework's
+    /// `evaluate_vm_result` (which runs AFTER `post_vm` to build
+    /// [`crate::assert::ScenarioStats::phases`]) — drains this bridge
+    /// and memoizes the resulting
+    /// [`crate::scenario::sample::SampleSeries`] on the
+    /// `periodic_series_cache` field; every later call reads the
+    /// cache. That is why a per-phase `post_vm` and the framework's
+    /// `result.stats.phases` build no longer starve each other (a
+    /// `post_vm` that drained the bridge first used to leave
+    /// `stats.phases` empty). Integration tests under `tests/` that
+    /// bypass the series accessors and call
+    /// `result.snapshot_bridge.drain*()` directly (e.g.
+    /// `tests/stats_bridge_e2e.rs`, `tests/temporal_assertions_e2e.rs`)
+    /// are unaffected: the cache is only populated by
+    /// [`Self::captures_series`], which those tests never call, so the
+    /// raw destructive drain still returns the full capture set.
     pub snapshot_bridge: crate::scenario::snapshot::SnapshotBridge,
     /// Live scheduler-stats client. `Some(_)` when the run wired the
     /// virtio-console port-2 stats bridge (the in-tree path always
@@ -364,6 +382,19 @@ pub struct VmResult {
     /// [`Self::periodic_target`] flag missing samples (early VM
     /// exit, kill-flag stop, abandoned-after-timeouts).
     pub periodic_fired: u32,
+    /// Periodic captures that landed REAL BPF state — the
+    /// placeholder-excluded subset of [`Self::periodic_fired`]
+    /// (`periodic_fired` counts rendezvous-timeout placeholders as
+    /// fired). Snapshotted from
+    /// [`crate::scenario::snapshot::SnapshotBridge::periodic_real_count`]
+    /// at result-collection time so it is stable regardless of any
+    /// later test-side drain of the bridge. `periodic_real <
+    /// periodic_fired` means the gap is placeholder-only fills (the
+    /// boundary fired but the dump was degraded); the failure-output
+    /// periodic-samples section surfaces this so a "100% fired" run
+    /// whose captures were all placeholders does not read as full
+    /// coverage.
+    pub periodic_real: u32,
     /// Configured `num_snapshots` count for the entry that drove
     /// this run (mirrors the `KtstrTestEntry::num_snapshots` field
     /// the entry was registered with). `0` when periodic capture
@@ -378,7 +409,7 @@ pub struct VmResult {
     /// `#[ktstr_test(kaslr = false)]` or
     /// `Scheduler::kargs(&["nokaslr"])`, OR (b) the derivation
     /// chain (MSR_LSTAR readback in `vmm::x86_64::msr_kaslr` +
-    /// KERN_ADDRS `_text` path in `freeze_coord::dispatch.rs`) never
+    /// KERN_ADDRS `_text` path in `crate::vmm::freeze_coord::dispatch`) never
     /// published a non-zero value (early-boot crash, kallsyms masked
     /// by kptr_restrict, FRED-enabled kernel). E2E test consumers
     /// distinguish (a) from (b) by reading the test entry's `kaslr`
@@ -412,6 +443,33 @@ pub struct VmResult {
     /// hardcoded literal silently, where the method-form derives
     /// from this field automatically.
     pub entry_name: Option<&'static str>,
+    /// Memoized single drain of [`Self::snapshot_bridge`].
+    ///
+    /// The snapshot bridge yields each capture exactly once, but two
+    /// host-side consumers need the captures: a `post_vm` callback
+    /// (which runs first) and the framework's `evaluate_vm_result`
+    /// (which builds [`crate::assert::ScenarioStats::phases`]). Before
+    /// this cache existed, whichever drained first starved the other —
+    /// a per-phase `post_vm` calling [`Self::periodic_series`] left
+    /// `evaluate_vm_result` with an empty bridge, silently emptying
+    /// `result.stats.phases` and the failure-message timeline.
+    ///
+    /// [`Self::captures_series`] performs the one destructive bridge
+    /// drain on first call and stores the resulting full
+    /// [`crate::scenario::sample::SampleSeries`] here; every later call
+    /// — and [`Self::periodic_series`] / [`Self::phase_buckets`] /
+    /// `evaluate_vm_result` — reads the cached series instead of
+    /// re-draining. Lazily populated so a consumer that only touches
+    /// the raw bridge via `snapshot_bridge.drain*()` (e.g. integration
+    /// tests under `tests/`) is unaffected: the cache is never
+    /// initialised on that path.
+    ///
+    /// `pub(crate)` (not `pub`): in-crate constructors
+    /// (`freeze_coord::collect_results`, test fixtures) set it to an
+    /// empty `OnceLock`, but out-of-tree code cannot struct-literal a
+    /// `VmResult` — it flows from `run_vm` — so the cache stays an
+    /// implementation detail behind [`Self::captures_series`].
+    pub(crate) periodic_series_cache: std::sync::OnceLock<crate::scenario::sample::SampleSeries>,
 }
 
 impl VmResult {
@@ -435,32 +493,151 @@ impl VmResult {
         self.kern_kaslr_offset != 0
     }
 
-    /// One-line sugar for the recurring `post_vm`-callback boilerplate
-    /// `SampleSeries::from_drained_typed(self.snapshot_bridge.drain_ordered_with_stats(), self.monitor.clone()).periodic_only()`.
-    /// Equivalent in every observable way: same drain, same monitor
-    /// clone, same `periodic_only()` filter — exposed as a single
-    /// method so every benchmarking / per-phase / cross-phase test
-    /// expresses the projection in one statement instead of three.
+    /// The full capture series for this run — every snapshot the
+    /// freeze coordinator stored on [`Self::snapshot_bridge`]
+    /// (periodic boundaries AND on-demand `Op::CaptureSnapshot` /
+    /// watchpoint-fire captures), in the order the bridge surfaced.
     ///
-    /// The bridge drain is destructive (the snapshot bridge yields
-    /// each capture exactly once); calling this method twice on the
-    /// same [`VmResult`] leaves the second call with an empty series.
-    /// If a post_vm callback needs both the raw drain and a series
-    /// view, drain the bridge into a local Vec first and construct
-    /// the series via [`crate::scenario::sample::SampleSeries::from_drained_typed`].
+    /// Performs the bridge's single destructive drain on the first
+    /// call and memoizes the resulting
+    /// [`crate::scenario::sample::SampleSeries`] on the
+    /// `periodic_series_cache` field; every later call — and
+    /// [`Self::periodic_series`] / [`Self::phase_buckets`] and the
+    /// framework's `evaluate_vm_result` — returns the cached series
+    /// without re-draining. This is what lets a `post_vm` callback and
+    /// the framework's [`crate::assert::ScenarioStats::phases`] build
+    /// share one drain instead of starving each other (the bridge
+    /// yields each capture exactly once).
     ///
-    /// Takes `&self` rather than `&mut self` so it composes with the
+    /// Takes `&self`: the cache uses interior mutability
+    /// ([`std::sync::OnceLock`]) so this composes with the
     /// `#[ktstr_test(post_vm = ...)]` callback signature
-    /// (`fn(&VmResult) -> Result<()>`). The underlying bridge uses
-    /// interior mutability for its drain queue, so the destructive
-    /// semantics ride on the bridge's lock rather than Rust's
-    /// borrow-check exclusivity.
+    /// (`fn(&VmResult) -> Result<()>`).
+    ///
+    /// A consumer that calls `snapshot_bridge.drain*()` directly
+    /// (e.g. integration tests under `tests/`) bypasses this cache. If
+    /// such a raw drain runs BEFORE the first `captures_series()` call
+    /// the cache memoizes an empty series, so prefer this accessor over
+    /// a raw drain on any path that also reaches `evaluate_vm_result`.
+    pub fn captures_series(&self) -> &crate::scenario::sample::SampleSeries {
+        self.periodic_series_cache.get_or_init(|| {
+            crate::scenario::sample::SampleSeries::from_drained_typed(
+                self.snapshot_bridge.drain_ordered_with_stats(),
+                self.monitor.clone(),
+            )
+        })
+    }
+
+    /// The periodic-capture-only view of this run's series: the
+    /// `"periodic_"`-tagged subset of [`Self::captures_series`] — the
+    /// projection the temporal-assertion / per-phase patterns expect
+    /// (on-demand `Op::CaptureSnapshot` and watchpoint-fire captures
+    /// are filtered out as off-cadence outliers, see
+    /// [`crate::scenario::sample::SampleSeries::periodic_only`]).
+    ///
+    /// Reads the shared [`Self::captures_series`] cache (the single
+    /// bridge drain) and returns an owned, periodic-only clone.
+    /// Idempotent: calling it twice — or alongside
+    /// [`Self::phase_buckets`] / `evaluate_vm_result` — no longer
+    /// empties the bridge for the other consumers (the pre-cache
+    /// behavior, which silently starved whichever drained second).
+    ///
+    /// Takes `&self` so it composes with the
+    /// `#[ktstr_test(post_vm = ...)]` callback signature.
     pub fn periodic_series(&self) -> crate::scenario::sample::SampleSeries {
-        crate::scenario::sample::SampleSeries::from_drained_typed(
-            self.snapshot_bridge.drain_ordered_with_stats(),
-            self.monitor.clone(),
+        self.captures_series().clone().periodic_only()
+    }
+
+    /// The complete per-phase stimulus timeline for `post_vm`
+    /// callbacks doing per-phase metric assertions: one
+    /// [`crate::timeline::StimulusEvent`] per guest `Stimulus` frame
+    /// (the step-start boundaries, via
+    /// [`crate::timeline::StimulusEvent::from_wire`]) PLUS the
+    /// synthesized terminal scenario-end boundary (from the
+    /// `ScenarioEnd` frame's final cumulative count, via
+    /// [`crate::timeline::StimulusEvent::terminal`]).
+    ///
+    /// Fold THIS through
+    /// [`crate::assert::build_phase_buckets_with_stimulus`] — it is the
+    /// SAME timeline the framework's own `evaluate_vm_result` builds,
+    /// so the LAST step gets an `iteration_rate` (the terminal supplies
+    /// its right boundary). A hand-rolled map over only the guest
+    /// `Stimulus` frames would omit the terminal and silently drop the
+    /// final step's rate.
+    ///
+    /// Non-destructive: reads the already-drained `guest_messages` TLV
+    /// log (unlike the bridge-cache accessors [`Self::captures_series`]
+    /// / [`Self::periodic_series`] / [`Self::phase_buckets`], which
+    /// perform the single destructive snapshot-bridge drain), so it may
+    /// be called alongside the bridge drain. CRC-bad / malformed frames
+    /// are skipped.
+    pub fn stimulus_timeline(&self) -> Vec<crate::timeline::StimulusEvent> {
+        let mut out = Vec::new();
+        let Some(bulk) = &self.guest_messages else {
+            return out;
+        };
+        for entry in &bulk.entries {
+            if !entry.crc_ok {
+                continue;
+            }
+            match wire::MsgType::from_wire(entry.msg_type) {
+                Some(wire::MsgType::Stimulus) => {
+                    if let Some(ev) = wire::StimulusEvent::from_payload(&entry.payload) {
+                        out.push(crate::timeline::StimulusEvent::from_wire(&ev));
+                    }
+                }
+                Some(wire::MsgType::StepEnd) => {
+                    // Per-step end-of-hold frame (reuses the StimulusPayload
+                    // body). Paired with its StepStart for step-local
+                    // iteration_rate in build_phase_buckets_with_stimulus.
+                    if let Some(ev) = wire::StimulusEvent::from_payload(&entry.payload) {
+                        out.push(crate::timeline::StimulusEvent::from_step_end(&ev));
+                    }
+                }
+                Some(wire::MsgType::ScenarioEnd) => {
+                    if let Some((elapsed_ms, total_iterations)) =
+                        wire::parse_scenario_end(&entry.payload)
+                    {
+                        out.push(crate::timeline::StimulusEvent::terminal(
+                            elapsed_ms,
+                            total_iterations,
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// The framework-computed per-phase metric buckets for this run —
+    /// the SAME [`crate::assert::PhaseBucket`] vec the framework folds
+    /// onto [`crate::assert::ScenarioStats::phases`] in
+    /// `evaluate_vm_result`.
+    ///
+    /// This is the answer to "my `post_vm` callback wants the per-phase
+    /// metrics the framework already built." Before this accessor, a
+    /// `post_vm` had to re-derive them by hand —
+    /// `build_phase_buckets_with_stimulus(&result.periodic_series(),
+    /// &result.stimulus_timeline())` — which both duplicated the
+    /// framework's logic AND destructively drained the bridge, leaving
+    /// the framework's own `result.stats.phases` empty (the drain-once
+    /// starvation [`Self::captures_series`] now prevents).
+    ///
+    /// Folds [`Self::periodic_series`] (the periodic-only projection of
+    /// the shared single drain — on-demand / watchpoint captures are
+    /// off-cadence outliers excluded from per-phase folds) through
+    /// [`crate::assert::build_phase_buckets_with_stimulus`] using
+    /// [`Self::stimulus_timeline`] for the step windows. In production
+    /// the framework builds `stats.phases` from the same periodic-only
+    /// series and the same stimulus timeline, so this returns content
+    /// identical to `result.stats.phases` (pinned by a
+    /// `phase_buckets() == stats.phases` test).
+    pub fn phase_buckets(&self) -> Vec<crate::assert::PhaseBucket> {
+        crate::assert::build_phase_buckets_with_stimulus(
+            &self.periodic_series(),
+            &self.stimulus_timeline(),
         )
-        .periodic_only()
     }
 
     /// Minimal "nothing happened" fixture for tests that exercise
@@ -495,7 +672,6 @@ impl VmResult {
             stderr: String::new(),
             monitor: None,
             guest_messages: None,
-            stimulus_events: Vec::new(),
             verifier_stats: Vec::new(),
             kvm_stats: None,
             crash_message: None,
@@ -505,9 +681,11 @@ impl VmResult {
             snapshot_bridge: empty_snapshot_bridge_for_tests(),
             stats_client: None,
             periodic_fired: 0,
+            periodic_real: 0,
             periodic_target: 0,
             kern_kaslr_offset: 0,
             entry_name: None,
+            periodic_series_cache: std::sync::OnceLock::new(),
         }
     }
 
@@ -702,17 +880,43 @@ pub const KVM_INTERESTING_STATS: &[&str] = &[
 ];
 
 impl KvmStatsTotals {
-    /// Sum a stat across all vCPUs.
+    /// Sum a stat across all vCPUs. Returns 0 BOTH when no vCPU published
+    /// the stat and when every vCPU measured zero — use [`Self::try_sum`]
+    /// to distinguish "unpublished" from "measured zero".
     pub fn sum(&self, name: &str) -> u64 {
-        self.per_vcpu.iter().filter_map(|m| m.get(name)).sum()
+        self.try_sum(name).unwrap_or(0)
     }
 
-    /// Average a stat across all vCPUs (returns 0 if no vCPUs).
+    /// Average a stat across all vCPUs (returns 0 if no vCPUs). Same
+    /// absent-vs-zero ambiguity as [`Self::sum`]; see [`Self::try_avg`].
     pub fn avg(&self, name: &str) -> u64 {
-        if self.per_vcpu.is_empty() {
-            return 0;
+        self.try_avg(name).unwrap_or(0)
+    }
+
+    /// Sum a stat across all vCPUs, or `None` when NO per-vCPU map
+    /// published it. Distinguishes an unpublished stat (`None`) from a
+    /// genuinely-measured zero (`Some(0)`) — the plain [`Self::sum`]
+    /// collapses both to `0`, so a test reading a counter that the kernel
+    /// never emitted on this arch cannot tell it apart from a real zero.
+    pub fn try_sum(&self, name: &str) -> Option<u64> {
+        let mut acc: Option<u64> = None;
+        for m in &self.per_vcpu {
+            if let Some(&v) = m.get(name) {
+                acc = Some(acc.unwrap_or(0) + v);
+            }
         }
-        self.sum(name) / self.per_vcpu.len() as u64
+        acc
+    }
+
+    /// Average a stat across all vCPUs, or `None` when there are no vCPUs
+    /// or NO per-vCPU map published the stat. The absent-aware counterpart
+    /// of [`Self::avg`].
+    pub fn try_avg(&self, name: &str) -> Option<u64> {
+        let n = self.per_vcpu.len() as u64;
+        if n == 0 {
+            return None;
+        }
+        self.try_sum(name).map(|s| s / n)
     }
 }
 
@@ -859,7 +1063,7 @@ pub(crate) struct VmRunState {
     /// (a) KASLR was off (test ran with `#[ktstr_test(kaslr = false)]`
     /// or `Scheduler::kargs(&["nokaslr"])`), or (b) the derivation
     /// chain (MSR_LSTAR readback at `vmm::x86_64::msr_kaslr` +
-    /// KERN_ADDRS `_text` path at `freeze_coord::dispatch.rs`) never
+    /// KERN_ADDRS `_text` path at `crate::vmm::freeze_coord::dispatch`) never
     /// published a non-zero value (early-boot crash, kallsyms masked
     /// by kptr_restrict, FRED-enabled kernel). E2E test consumers
     /// distinguish (a) from (b) by asserting against the test entry's
@@ -912,6 +1116,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn kvm_stats_try_sum_distinguishes_absent_from_zero() {
+        let totals = KvmStatsTotals {
+            per_vcpu: vec![
+                [("exits".to_string(), 0u64)].into_iter().collect(),
+                [("exits".to_string(), 0u64)].into_iter().collect(),
+            ],
+        };
+        // "exits" is published as 0 on every vCPU -> a measured zero.
+        assert_eq!(totals.try_sum("exits"), Some(0));
+        assert_eq!(totals.try_avg("exits"), Some(0));
+        // "halt_exits" was never published -> absent, not zero.
+        assert_eq!(totals.try_sum("halt_exits"), None);
+        assert_eq!(totals.try_avg("halt_exits"), None);
+        // sum/avg keep the 0-coercing behavior for both cases.
+        assert_eq!(totals.sum("exits"), 0);
+        assert_eq!(totals.sum("halt_exits"), 0);
+        // No vCPUs at all -> try_avg None (no div-by-zero, no false 0).
+        let empty = KvmStatsTotals { per_vcpu: vec![] };
+        assert_eq!(empty.try_sum("exits"), None);
+        assert_eq!(empty.try_avg("exits"), None);
+    }
+
+    #[test]
     fn vm_result_fields_carry_values() {
         let r = VmResult {
             duration: Duration::from_secs(5),
@@ -928,7 +1155,7 @@ mod tests {
         assert_eq!(r.stderr, "boot log");
         assert!(r.monitor.is_none());
         assert!(r.guest_messages.is_none());
-        assert!(r.stimulus_events.is_empty());
+        assert!(r.stimulus_timeline().is_empty());
         assert_eq!(r.cleanup_duration, Some(Duration::from_millis(50)));
         assert!(r.virtio_blk_counters.is_none());
         // Second construction covers the opposite polarity of
@@ -942,6 +1169,7 @@ mod tests {
             timed_out: true,
             virtio_blk_counters: Some(VirtioBlkCountersSnapshot::default()),
             periodic_fired: 3,
+            periodic_real: 2,
             periodic_target: 7,
             ..VmResult::test_fixture()
         };
@@ -1067,6 +1295,110 @@ mod tests {
         assert_eq!(c.snapshot_bridge.len(), 1);
     }
 
+    /// Build a `VmResult` whose snapshot bridge holds `n` periodic
+    /// captures stamped into Step[0] (`step_index = 1`). No stimulus
+    /// frames are attached, so `stimulus_timeline()` is empty and the
+    /// bucketer falls back to each capture's stamped `step_index`.
+    fn vm_result_with_periodic_captures(n: usize) -> VmResult {
+        let r = VmResult {
+            periodic_fired: n as u32,
+            periodic_target: n as u32,
+            ..VmResult::test_fixture()
+        };
+        for i in 0..n {
+            r.snapshot_bridge.store_with_stats_and_step(
+                &format!("periodic_{i}"),
+                crate::monitor::dump::FailureDumpReport::default(),
+                None,
+                Some(i as u64 * 100),
+                None,
+                1,
+            );
+        }
+        r
+    }
+
+    /// Regression for the drain-once starvation bug: the snapshot
+    /// bridge is drained EXACTLY once and the resulting series is
+    /// shared, so a `post_vm`-style consumer reading the series does
+    /// not starve a later framework-style consumer. Before
+    /// [`VmResult::captures_series`], `periodic_series()` drained the
+    /// bridge directly and a second reader saw an empty bridge — the
+    /// silent-data-drop this task de-conflicts.
+    #[test]
+    fn captures_series_shared_across_consumers() {
+        let r = vm_result_with_periodic_captures(3);
+        // First consumer = post_vm style (drains the bridge into the cache).
+        let post_vm_series = r.periodic_series();
+        assert_eq!(
+            post_vm_series.len(),
+            3,
+            "post_vm consumer must see all captures"
+        );
+        // Second consumer = framework style (reads the cache, no re-drain).
+        let framework_series = r.captures_series();
+        assert_eq!(
+            framework_series.len(),
+            3,
+            "framework consumer must NOT see an empty bridge — the single \
+             cached drain is shared, not re-drained (pre-cache this was 0)"
+        );
+        // The raw bridge was consumed exactly once: a direct drain now
+        // yields nothing because captures_series() took ownership of the
+        // captures into the cache on first read.
+        assert_eq!(
+            r.snapshot_bridge.drain_ordered_with_stats().len(),
+            0,
+            "captures_series() performs the single destructive drain"
+        );
+    }
+
+    /// `phase_buckets()` folds the cached captures into per-phase
+    /// buckets without the caller draining the bridge — the
+    /// phase-buckets accessor. Idempotent: a second call returns the same vec from
+    /// the shared cache.
+    #[test]
+    fn phase_buckets_from_cached_captures() {
+        let r = vm_result_with_periodic_captures(2);
+        let buckets = r.phase_buckets();
+        assert!(
+            !buckets.is_empty(),
+            "phase_buckets must yield buckets from the cached captures"
+        );
+        assert!(
+            buckets.iter().any(|b| b.step_index >= 1),
+            "captures stamped step_index=1 must produce a Step bucket, got {:?}",
+            buckets.iter().map(|b| b.step_index).collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            r.phase_buckets(),
+            buckets,
+            "phase_buckets() must be idempotent (shared cache)"
+        );
+    }
+
+    /// Clone semantics, category 3 (the `periodic_series_cache` field):
+    /// a clone taken AFTER the cache is populated carries an
+    /// INDEPENDENT copy, so `phase_buckets()` on both the original and
+    /// the clone returns identical non-empty buckets without
+    /// re-touching the (already-drained) shared bridge. Pins the
+    /// documented safe path.
+    #[test]
+    fn vm_result_clone_after_cache_populated_carries_buckets() {
+        let r = vm_result_with_periodic_captures(2);
+        // Populate the cache BEFORE cloning (the documented safe path).
+        let original = r.phase_buckets();
+        assert!(!original.is_empty());
+        let c = r.clone();
+        let cloned = c.phase_buckets();
+        assert!(!cloned.is_empty());
+        assert_eq!(
+            cloned, original,
+            "a clone taken after cache population must carry the same \
+             buckets (category-3 independent-once-populated semantics)"
+        );
+    }
+
     #[cfg(feature = "wprof")]
     #[test]
     fn vm_result_wprof_pb_path_bails_when_entry_name_none() {
@@ -1094,7 +1426,7 @@ mod tests {
         };
         let path = r.wprof_pb_path().expect("Some entry_name must Ok");
         // The path's file_name must exactly match `<entry_name>.wprof.pb`
-        // — the writer at eval.rs uses the same `format!("{}.wprof.pb",
+        // — the writer in `run_ktstr_test_inner_impl` uses the same `format!("{}.wprof.pb",
         // entry.name)` pattern. A divergence here would mean the
         // method derives a different path than the writer wrote to,
         // surfacing as ENOENT in the post_vm callback.

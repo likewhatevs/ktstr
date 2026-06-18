@@ -174,9 +174,7 @@ pub fn custom_nested_cgroup_cpuset(ctx: &Ctx) -> Result<AssertResult> {
     thread::sleep(ctx.duration);
     let reports = h.stop_and_collect();
     let mut r = AssertResult::pass();
-    if ctx.assert.has_worker_checks() {
-        r.merge(ctx.assert.assert_cgroup(&reports, Some(&sub_set)));
-    }
+    r.merge(ctx.assert.assert_cgroup(&reports, Some(&sub_set)));
     Ok(r)
 }
 

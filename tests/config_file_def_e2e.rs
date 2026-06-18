@@ -110,7 +110,7 @@ fn config_file_def_e2e_pipeline(ctx: &Ctx) -> Result<AssertResult> {
                  inline content at the declared guest path. Likely \
                  break sites: `runtime::config_content_parts` (host \
                  temp file + arg template), the `include_files` \
-                 builder wire-up in `eval.rs`, or the initramfs cpio \
+                 builder wire-up in `eval/mod.rs`, or the initramfs cpio \
                  archive layout in `build_initramfs_base`."
             )));
         }

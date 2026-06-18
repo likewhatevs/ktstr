@@ -641,8 +641,8 @@ pub(crate) fn attempt_auto_repro(
     // Resolve staged schedulers for the auto-repro VM so any
     // scheduler-lifecycle ops in the replayed scenario can find
     // their staged binaries at the same /staging/schedulers/<name>/
-    // paths the primary VM used. See eval.rs for the resolve-loop
-    // rationale + KernelBuiltin/Eevdf skip semantics.
+    // paths the primary VM used. See crate::test_support::eval for the
+    // resolve-loop rationale + KernelBuiltin/Eevdf skip semantics.
     //
     // Resolution errors here log + skip rather than propagate: the
     // auto-repro function returns Option<String> (best-effort), so
@@ -838,7 +838,7 @@ pub(crate) fn attempt_auto_repro(
     // Write the auto-repro VM's sidecar artifacts (wprof Perfetto
     // trace + profraw coverage) BEFORE classify_repro_vm_status
     // consumes the drain for lifecycle signalling. Mirrors the
-    // primary VM's eval.rs per-frame dispatch but writes wprof under
+    // primary VM's crate::test_support::eval per-frame dispatch but writes wprof under
     // `${entry.name}.repro.wprof.pb` so primary + repro artifacts
     // coexist on disk (matches the `.repro.` infix every other
     // repro-VM sidecar already uses). Without this hop the

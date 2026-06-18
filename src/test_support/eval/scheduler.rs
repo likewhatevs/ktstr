@@ -277,7 +277,21 @@ pub fn resolve_scheduler(spec: &SchedulerSpec) -> Result<(Option<PathBuf>, Resol
             Ok((Some(path), ResolveSource::Path))
         }
         SchedulerSpec::Discover(name) => {
-            // 1. KTSTR_SCHEDULER env var
+            // 0. Per-name override KTSTR_SCHEDULER_BIN_<NAME>. Checked FIRST
+            // so a test declaring multiple distinct Discover schedulers
+            // can point each at its own binary; the global
+            // KTSTR_SCHEDULER below collapses them all to one path. A
+            // set-but-missing path falls through to the global + cascade
+            // (lenient, matching the global's own behavior).
+            if let Ok(p) = std::env::var(crate::per_name_scheduler_env(name)) {
+                let path = PathBuf::from(&p);
+                if path.exists() {
+                    return Ok((Some(path), ResolveSource::EnvVar));
+                }
+            }
+
+            // 1. KTSTR_SCHEDULER env var (global / coarse fallback —
+            // applies to every Discover scheduler regardless of name).
             if let Ok(p) = std::env::var(crate::KTSTR_SCHEDULER_ENV) {
                 let path = PathBuf::from(&p);
                 if path.exists() {
@@ -343,16 +357,20 @@ pub fn resolve_scheduler(spec: &SchedulerSpec) -> Result<(Option<PathBuf>, Resol
                 }
             }
 
-            // 3. target/debug/
-            let candidate = PathBuf::from("target/debug").join(name);
-            if candidate.exists() {
-                return Ok((Some(candidate), ResolveSource::TargetDebug));
-            }
-
-            // 4. target/release/
-            let candidate = PathBuf::from("target/release").join(name);
-            if candidate.exists() {
-                return Ok((Some(candidate), ResolveSource::TargetRelease));
+            // 3-4. target/{debug,release}/ pre-built fallbacks (reached
+            // only when the build-first step could not run). Probe the
+            // profile-matching dir FIRST: with
+            // KTSTR_SCHEDULER_PROFILE=release (set by --release /
+            // --release-scheduler) the release build is the intended
+            // one, so prefer target/release/ over a possibly-stale
+            // target/debug/ binary.
+            let prefer_release =
+                std::env::var(crate::KTSTR_SCHEDULER_PROFILE_ENV).as_deref() == Ok("release");
+            for (dir, source) in target_dir_probe_order(prefer_release) {
+                let candidate = PathBuf::from(dir).join(name);
+                if candidate.exists() {
+                    return Ok((Some(candidate), source));
+                }
             }
 
             // 5. Build the scheduler package on demand. Reached in
@@ -370,5 +388,26 @@ pub fn resolve_scheduler(spec: &SchedulerSpec) -> Result<(Option<PathBuf>, Resol
                  place it next to the test binary or in target/{{debug,release}}/"
             )
         }
+    }
+}
+
+/// Order to probe the pre-built `target/{debug,release}/` scheduler
+/// binaries in the `Discover` cascade fallback: the profile-matching
+/// directory first. With `prefer_release` (set when
+/// `KTSTR_SCHEDULER_PROFILE=release`) the release build is the intended
+/// one, so `target/release/` is probed before a possibly-stale
+/// opposite-profile `target/debug/` binary. Pure +
+/// `pub(crate)` so the reorder is unit-testable without staging a CWD.
+pub(crate) fn target_dir_probe_order(prefer_release: bool) -> [(&'static str, ResolveSource); 2] {
+    if prefer_release {
+        [
+            ("target/release", ResolveSource::TargetRelease),
+            ("target/debug", ResolveSource::TargetDebug),
+        ]
+    } else {
+        [
+            ("target/debug", ResolveSource::TargetDebug),
+            ("target/release", ResolveSource::TargetRelease),
+        ]
     }
 }

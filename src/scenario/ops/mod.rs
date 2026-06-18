@@ -791,6 +791,15 @@ fn run_scenario(
     let mut backdrop_state = BackdropState::empty(ctx);
     let mut result = AssertResult::pass();
 
+    // (scenario-relative elapsed_ms, cumulative worker iteration count)
+    // at the END of the most-recently completed step, captured
+    // coincidently inside `run_step` while that step's workers are still
+    // alive. Carries the LAST step's pair out of the loop so the
+    // `ScenarioEnd` frame can supply the final step's `iteration_rate`
+    // right boundary. `None` until the first step completes a
+    // hold cleanly.
+    let mut final_total_iterations: Option<(u64, u64)> = None;
+
     let scenario_start = std::time::Instant::now();
 
     // ScenarioStart marker. `is_guest` short-circuits in host
@@ -992,6 +1001,7 @@ fn run_scenario(
             scenario_start,
             effective_checks,
             &mut sched_died_during_hold,
+            &mut final_total_iterations,
         );
 
         // Scheduler died during this step's hold: the kernel has
@@ -1073,9 +1083,19 @@ fn run_scenario(
 
     // ScenarioEnd marker. Routes through `send_scenario_end`
     // (virtio-console port-1 with COM2 fallback for early-boot).
+    // Carries the last cleanly-completed step's COINCIDENT (elapsed_ms,
+    // iterations) pair so the host can give the last step an
+    // `iteration_rate` over a well-formed window. The elapsed
+    // is the end-of-hold timestamp captured WITH the count inside
+    // run_step — NOT recomputed here, which would include the
+    // pause+collect teardown wall-time and under-report the rate. When
+    // no step completed a hold (e.g. every step's scheduler died) the
+    // pair is `None`: fall back to (now, 0), which the host skips
+    // (0 baseline / e<=s).
     if guest_comms::is_guest() {
-        let elapsed = scenario_start.elapsed().as_millis() as u64;
-        crate::vmm::guest_comms::send_scenario_end(elapsed);
+        let (end_elapsed_ms, end_iterations) = final_total_iterations
+            .unwrap_or_else(|| (scenario_start.elapsed().as_millis() as u64, 0));
+        crate::vmm::guest_comms::send_scenario_end(end_elapsed_ms, end_iterations);
     }
 
     // Final liveness check. Live `crate::vmm::rust_init::sched_pid()`
@@ -1385,6 +1405,12 @@ fn run_step<'a>(
     scenario_start: std::time::Instant,
     _effective_checks: &crate::assert::Assert,
     sched_died_during_hold: &mut bool,
+    // Set to (scenario-relative elapsed_ms, cumulative worker iteration
+    // count) sampled coincidently at this step's clean completion
+    // Left unchanged on the sched-died early-return paths so
+    // a failed step does not overwrite a prior step's good value with a
+    // misleading post-death count.
+    final_total_iterations: &mut Option<(u64, u64)>,
 ) -> Result<()> {
     let mut scenario = ScenarioState::new(step_state, backdrop_state);
 
@@ -1411,6 +1437,21 @@ fn run_step<'a>(
             if !step.setup.is_empty() {
                 let defs = step.setup.resolve(ctx);
                 drain_on_err!(scenario, apply_setup(ctx, &mut scenario, &defs));
+            }
+            // Emit the Loop step's start stimulus frame + resume, like
+            // the non-Loop arm below. A Loop step is a phase like any
+            // other: without its own start frame the synthesized
+            // scenario-end terminal would pair against the
+            // PRIOR step's frame and misattribute the entire Loop
+            // window's throughput to the wrong step. The resume
+            // re-enables periodic captures for the loop body and matches
+            // the prior step's `run_steps` pause (same pause/resume
+            // pairing the non-Loop arm uses; the first-step unmatched
+            // resume is already the existing pattern).
+            if guest_comms::is_guest() {
+                let payload = build_stimulus(&scenario_start, step_idx, &step.ops, &scenario);
+                crate::vmm::guest_comms::send_stimulus(zerocopy::IntoBytes::as_bytes(&payload));
+                crate::vmm::guest_comms::send_scenario_resume();
             }
             // Loop mode: apply ops repeatedly at interval until
             // the remaining scenario time is exhausted, or the
@@ -1489,6 +1530,49 @@ fn run_step<'a>(
                 return Ok(());
             }
         }
+    }
+
+    // Capture the cumulative iteration count AND its scenario-relative
+    // timestamp at this step's end, AT THE SAME INSTANT, while the
+    // step's workers are still alive — `collect_step` tears them down
+    // right after `run_step` returns, so this is the last moment a
+    // step-inclusive sum is observable. `run_steps` forwards the LAST
+    // step's (elapsed_ms, iterations) pair in the widened `ScenarioEnd`
+    // frame so the final step's `iteration_rate` has a right boundary to
+    // diff against. The elapsed MUST be sampled HERE,
+    // coincident with the count: recomputing it at `ScenarioEnd` send
+    // time would measure past `send_scenario_pause` + the last step's
+    // `collect_step` teardown (100ms–seconds under contention),
+    // inflating the rate's denominator with wall-time during which no
+    // iterations accrued and systematically under-reporting the last
+    // step's throughput (a rate consumer treats counter/duration with
+    // coincident endpoints). Only reached on a clean hold (the
+    // sched-died early returns above skip it — a failed run needs no
+    // terminal rate); gated on `is_guest` so the host-side scenario walk
+    // doesn't sum a handle set that never ran a workload.
+    if guest_comms::is_guest() {
+        let end_elapsed_ms = scenario_start.elapsed().as_millis() as u64;
+        let end_iterations: u64 = scenario
+            .all_handles()
+            .flat_map(|(_, h)| h.snapshot_iterations())
+            .sum();
+        *final_total_iterations = Some((end_elapsed_ms, end_iterations));
+
+        // Emit a per-step StepEnd frame carrying this step's coincident
+        // end-of-hold (elapsed_ms, total_iterations) and the SAME
+        // 1-indexed step_index as its StepStart, so the host pairs
+        // StepStart[k] -> StepEnd[k] for step-LOCAL throughput: each
+        // step's OWN workers measured start-to-end, which —
+        // unlike the cross-step StepStart[k] -> StepStart[k+1] delta —
+        // does not read ~0 for workers respawned per step. build_stimulus
+        // supplies the op/cgroup/worker fields + the 1-indexed
+        // step_index; override its recomputed elapsed/iterations with the
+        // values captured above so the StepEnd pair stays coincident with
+        // `final_total_iterations` (no pause/teardown wall-time creep).
+        let mut step_end = build_stimulus(&scenario_start, step_idx, &step.ops, &scenario);
+        step_end.elapsed_ms = u32::try_from(end_elapsed_ms).unwrap_or(u32::MAX);
+        step_end.total_iterations = end_iterations;
+        guest_comms::send_step_end(zerocopy::IntoBytes::as_bytes(&step_end));
     }
 
     Ok(())

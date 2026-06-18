@@ -149,7 +149,7 @@ fn outcome_label(o: &JoinWithTimeoutOutcome) -> &'static str {
 /// shortens one but not the other surfaces here. The "must
 /// match" framing matters because the freeze coordinator's
 /// SIGRTMIN rendezvous (30 s wall budget at the coordinator
-/// level — see `FREEZE_RENDEZVOUS_TIMEOUT` in `src/vmm/freeze_coord.rs`)
+/// level — see `FREEZE_RENDEZVOUS_TIMEOUT` in `src/vmm/freeze_coord/mod.rs`)
 /// is sensitive to vCPU-thread blocking budgets; both
 /// `Drop` and `reset()` paths run on a vCPU thread, so
 /// asymmetric budgets would let one path miss the rendezvous

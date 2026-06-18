@@ -495,8 +495,8 @@ pub(crate) mod taskstats;
 pub mod test_support;
 // `pub` (not `pub(crate)`): `assert::build_phase_buckets_with_stimulus`
 // takes `timeline::StimulusEvent` in its public signature, and result
-// analyzers (e2e tests folding `VmResult::stimulus_events` through that
-// fn) need to name the type and call `StimulusEvent::from_wire`.
+// analyzers (post_vm callbacks folding `VmResult::stimulus_timeline()`
+// through that fn) need to name the type.
 pub mod timeline;
 pub mod topology;
 
@@ -801,12 +801,25 @@ pub mod prelude {
     // scheduler-definition record test authors build via the
     // `declare_scheduler!` macro.
     pub use crate::assert::{
-        Assert, AssertDetail, AssertResult, COMPARATOR_VOCABULARY, ClaimBuilder, DetailKind,
-        EachClaim, FracPair, InfoNote, MAX_RECORDED_PASSES, NoteValue, Outcome, OutcomeRef,
-        PASSES_TRUNCATION_SENTINEL_COMPARATOR, PASSES_TRUNCATION_SENTINEL_NAME, PassDetail,
-        PhaseBucket, PhaseMapExt, ScenarioStats, SchedulerBaseline, SeqClaim, SeriesField,
-        SetClaim, Verdict, assert_baseline, assert_scx_events_clean,
+        AbsoluteThresholds, Assert, AssertDetail, AssertResult, COMPARATOR_VOCABULARY,
+        ClaimBuilder, DetailKind, EachClaim, FracPair, InfoNote, MAX_RECORDED_PASSES, NoteValue,
+        Outcome, OutcomeRef, PASSES_TRUNCATION_SENTINEL_COMPARATOR,
+        PASSES_TRUNCATION_SENTINEL_NAME, PassDetail, PhaseBucket, PhaseMapExt, ScenarioStats,
+        SeqClaim, SeriesField, SetClaim, Verdict, assert_scx_events_clean, assert_thresholds,
+        build_phase_buckets_with_stimulus,
     };
+    // Per-phase-metric building blocks for `post_vm` callbacks doing
+    // custom per-phase assertions: `StimulusEvent` is the timeline event
+    // type `build_phase_buckets_with_stimulus` consumes, and
+    // `VmResult::stimulus_timeline()` returns a `Vec<StimulusEvent>`
+    // (step frames + scenario-end terminal) ready to fold through it.
+    // The non-stimulus sibling `assert::build_phase_buckets` is
+    // INTENTIONALLY not preluded: it groups by the raw bridge-stamped
+    // step_index, which can collapse under a deferred-fire burst (see
+    // `SampleSeries::by_stamped_phase`); the stimulus-aware variant above
+    // is the collapse-immune common path, so the prelude surfaces only
+    // it. The plain variant remains reachable by full path for the rare
+    // no-stimulus-timeline case.
     pub use crate::cgroup::CgroupManager;
     pub use crate::claim;
     pub use crate::declare_scheduler;
@@ -823,6 +836,7 @@ pub mod prelude {
     pub use crate::scenario::payload_run::{PayloadHandle, PayloadRun};
     pub use crate::scenario::scenarios;
     pub use crate::test_support::post_vm_skip;
+    pub use crate::timeline::StimulusEvent;
     // Snapshot accessor surface and the underlying report shapes
     // a test author needs to inspect the captured BTF-rendered
     // bytes. The renderer types come from monitor::btf_render and
@@ -853,7 +867,7 @@ pub mod prelude {
     pub use crate::monitor::scx_walker::{DsqState, RqScxState, ScxSchedState};
     pub use crate::monitor::task_enrichment::TaskEnrichment;
     pub use crate::scenario::sample::{
-        BpfMapProjector, Sample, SampleSeries, StatsPathProjector, StatsValue,
+        BpfMapCpuProjector, BpfMapProjector, Sample, SampleSeries, StatsPathProjector, StatsValue,
     };
     pub use crate::scenario::snapshot::{
         BridgeGuard, CaptureCallback, CgroupProcsSnapshot, JsonField, MAX_WATCH_SNAPSHOTS,
@@ -1183,10 +1197,30 @@ pub const KTSTR_VERIFIER_RAW_ENV: &str = "KTSTR_VERIFIER_RAW";
 /// Any non-empty value (`"1"`, `"yes"`, `"0"`, `"true"`) enables
 /// no-perf-mode. All readers (shell-mode VM builder in
 /// `lib.rs`, verifier dispatch in `verifier.rs`, dispatch
-/// gauntlet + eval entry in `test_support/{dispatch,eval}.rs`)
+/// gauntlet + eval entry in `test_support/dispatch.rs` and
+/// `test_support/eval/mod.rs`)
 /// route through the canonical helper so the empty-string
 /// contract holds uniformly.
 pub const KTSTR_NO_PERF_MODE_ENV: &str = "KTSTR_NO_PERF_MODE";
+
+/// Name of the environment variable that restricts a run to ONLY
+/// `performance_mode` tests: when set to a non-empty value, every
+/// test whose entry does not have `performance_mode` is skipped
+/// (skip sidecar recorded, libtest sees pass) before any VM boot.
+/// The mergebase perf-delta subcommand sets this so a regression run
+/// measures only the tests configured for clean performance numbers;
+/// an explicit nextest `-E` filter narrows further within the
+/// perf-mode set.
+///
+/// **Empty = unset** per the default contract, matching
+/// [`KTSTR_NO_PERF_MODE_ENV`]. The canonical reader
+/// `test_support::runtime::perf_only_active` (pub(crate)) uses
+/// `.map(|v| !v.is_empty()).unwrap_or(false)` so a stray
+/// `KTSTR_PERF_ONLY=` pass-through does not silently skip every
+/// non-perf test. Readers route through the helper (dispatch
+/// gauntlet + named routes in `test_support/dispatch.rs` and the
+/// eval entry in `test_support/eval/mod.rs`).
+pub const KTSTR_PERF_ONLY_ENV: &str = "KTSTR_PERF_ONLY";
 
 /// Name of the environment variable that enables the GitHub Actions
 /// remote-cache backend in [`crate::remote_cache`]. Read at cache-
@@ -1286,7 +1320,7 @@ pub const KTSTR_NO_SKIP_MODE_ENV: &str = "KTSTR_NO_SKIP_MODE";
 pub const KTSTR_BUDGET_SECS_ENV: &str = "KTSTR_BUDGET_SECS";
 
 /// Name of the environment variable that overrides the sidecar
-/// output directory (the per-test `*.sidecar.json` write target).
+/// output directory (the per-test `*.ktstr.json` write target).
 /// Empty / unset falls back to the per-test
 /// `target/ktstr/<run-id>` location. Read at
 /// `crate::test_support::sidecar` +
@@ -1295,15 +1329,61 @@ pub const KTSTR_SIDECAR_DIR_ENV: &str = "KTSTR_SIDECAR_DIR";
 
 /// Name of the environment variable that overrides the scheduler
 /// binary path test_support::eval uses for in-process scheduler
-/// dispatch. Empty / unset falls back to the workspace's built
-/// scx-ktstr binary. Read at `crate::test_support::eval`.
+/// dispatch. Read at `crate::test_support::eval`. This is the COARSE
+/// (global) override: it applies to EVERY `SchedulerSpec::Discover`
+/// scheduler regardless of name, so a test declaring multiple distinct
+/// schedulers can't point them at different binaries through it — use
+/// the per-name variant ([`per_name_scheduler_env`]) for that.
+///
+/// Resolution precedence: the per-name override is checked FIRST; this
+/// global var is the fallback when no per-name var is set; if neither
+/// resolves, the cascade falls through to the workspace build.
 pub const KTSTR_SCHEDULER_ENV: &str = "KTSTR_SCHEDULER";
+
+/// Per-scheduler-NAME override environment variable for a
+/// `SchedulerSpec::Discover(name)` scheduler:
+/// `KTSTR_SCHEDULER_BIN_<NAME>`, where `<NAME>` is the discover name
+/// uppercased with every non-alphanumeric character replaced by `_`
+/// (e.g. `scx_layered` -> `KTSTR_SCHEDULER_BIN_SCX_LAYERED`,
+/// `scx-ktstr` -> `KTSTR_SCHEDULER_BIN_SCX_KTSTR`).
+///
+/// The `BIN` infix keeps the per-name namespace disjoint from the
+/// `KTSTR_SCHEDULER_*` meta-variables ([`KTSTR_SCHEDULER_ENV`] = the
+/// global override, [`KTSTR_SCHEDULER_PROFILE_ENV`] = the build
+/// profile): without it a scheduler named `profile` would derive
+/// `KTSTR_SCHEDULER_PROFILE` and shadow the build-profile selector.
+/// `-` and `_` both map to `_` (env-var names can't contain `-`), so
+/// `scx-foo` and `scx_foo` derive the same var — not a practical
+/// ambiguity, as a scheduler is referred to by one canonical spelling
+/// per run.
+///
+/// Checked BEFORE the global [`KTSTR_SCHEDULER_ENV`] in the Discover
+/// resolution cascade, so a test that declares several distinct
+/// Discover schedulers (one `entry.scheduler` plus staged schedulers)
+/// can point each at its own pre-built binary. The global var remains
+/// the coarse fallback for the common single-scheduler case. A set
+/// per-name var whose path does not exist falls through to the global
+/// var and then the build cascade (lenient, matching the global var's
+/// own missing-path behavior).
+pub fn per_name_scheduler_env(name: &str) -> String {
+    let suffix: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    format!("KTSTR_SCHEDULER_BIN_{suffix}")
+}
 
 /// Name of the environment variable that overrides the kernel
 /// path the eval dispatch reads (orthogonal to
 /// [`KTSTR_KERNEL_ENV`] which the main entry points use). Read
-/// at `crate::test_support::eval::resolve_test_kernel` L3148-
-/// L3152: a set-but-empty `KTSTR_TEST_KERNEL=` surfaces a
+/// at `crate::test_support::eval::resolve_test_kernel`: a
+/// set-but-empty `KTSTR_TEST_KERNEL=` surfaces a
 /// `KTSTR_TEST_KERNEL not found:` hard error (typo-loud per
 /// reader comment); ONLY the unset / `Err(NotPresent)` case
 /// falls through to `crate::find_kernel()` (cache + sysroot
@@ -1381,7 +1461,7 @@ pub const KTSTR_WPROF_PATH_ENV: &str = "KTSTR_WPROF_PATH";
 /// CLI, monitor probes, and sidecar writers all point the operator
 /// at the same remediation. Referenced by the non-VM-boot skip
 /// paths in `cache.rs`, `probe/btf.rs`, `monitor/mod.rs`,
-/// `test_support/eval.rs`, and `test_support/mod.rs`.
+/// `test_support/eval/mod.rs`, and `test_support/mod.rs`.
 ///
 /// Format: caller prefixes the actionable first clause (e.g.
 /// "no vmlinux found") and appends this constant as the
@@ -1588,15 +1668,36 @@ pub fn find_kernel() -> anyhow::Result<Option<std::path::PathBuf>> {
     Ok(kernel_path::find_image(None, release_ref))
 }
 
+/// Name of the environment variable selecting the build profile for a
+/// `SchedulerSpec::Discover` scheduler built on demand by
+/// [`build_and_find_binary`]. `"release"` builds the scheduler-under-
+/// test with the release profile; any other value (or unset) uses the
+/// default dev profile. This DECOUPLES the scheduler-under-test's
+/// profile from the harness/test binary's compile profile:
+/// `cargo ktstr test --release-scheduler` sets this so the scheduler
+/// runs optimized while the harness keeps its dev-profile assertion
+/// thresholds and `catch_unwind` behavior; `--release` sets both.
+pub const KTSTR_SCHEDULER_PROFILE_ENV: &str = "KTSTR_SCHEDULER_PROFILE";
+
 /// Build a cargo binary package and return its output path.
 ///
 /// Runs from the ktstr crate's manifest directory (which is also the
 /// workspace root in this repo) so that workspace-level feature
 /// unification (e.g. vendored libbpf-sys) is always in effect,
 /// regardless of the calling process's working directory.
+///
+/// Honors [`KTSTR_SCHEDULER_PROFILE_ENV`]: when set to `"release"` the
+/// build adds `--release`, so the returned artifact path resolves under
+/// `target/release/` — letting the scheduler-under-test be built
+/// release-profile independently of how the calling test binary was
+/// compiled.
 pub fn build_and_find_binary(package: &str) -> anyhow::Result<std::path::PathBuf> {
+    let mut build_args: Vec<&str> = vec!["build", "-p", package, "--message-format=json"];
+    if std::env::var(KTSTR_SCHEDULER_PROFILE_ENV).as_deref() == Ok("release") {
+        build_args.push("--release");
+    }
     let output = std::process::Command::new("cargo")
-        .args(["build", "-p", package, "--message-format=json"])
+        .args(&build_args)
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())

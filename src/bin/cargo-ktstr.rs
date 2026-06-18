@@ -46,6 +46,8 @@ mod cli;
 mod kernel;
 #[path = "cargo_ktstr/misc/mod.rs"]
 mod misc;
+#[path = "cargo_ktstr/perf_delta.rs"]
+mod perf_delta;
 #[path = "cargo_ktstr/replay.rs"]
 mod replay;
 #[path = "cargo_ktstr/run_cargo.rs"]
@@ -120,15 +122,31 @@ fn main() {
             no_perf_mode,
             no_skip_mode,
             release,
+            release_scheduler,
             args,
-        } => run_cargo::run_test(kernel, no_perf_mode, no_skip_mode, release, args),
+        } => run_cargo::run_test(
+            kernel,
+            no_perf_mode,
+            no_skip_mode,
+            release,
+            release_scheduler,
+            args,
+        ),
         KtstrCommand::Coverage {
             kernel,
             no_perf_mode,
             no_skip_mode,
             release,
+            release_scheduler,
             args,
-        } => run_cargo::run_coverage(kernel, no_perf_mode, no_skip_mode, release, args),
+        } => run_cargo::run_coverage(
+            kernel,
+            no_perf_mode,
+            no_skip_mode,
+            release,
+            release_scheduler,
+            args,
+        ),
         KtstrCommand::LlvmCov {
             kernel,
             no_perf_mode,
@@ -138,6 +156,48 @@ fn main() {
         KtstrCommand::Stats { ref command } => stats::run_stats(command),
         KtstrCommand::Replay { dir, filter, exec } => {
             match replay::run_replay(dir.as_deref(), filter.as_deref(), exec) {
+                Ok(0) => Ok(()),
+                Ok(code) => std::process::exit(code),
+                Err(e) => Err(format!("{e:#}")),
+            }
+        }
+        KtstrCommand::PerfDelta {
+            base,
+            base_ref,
+            filter,
+            default_branch,
+            kernel,
+            dual_run,
+            threshold,
+            policy,
+            a_scheduler,
+            b_scheduler,
+            no_phases,
+            phases_only,
+            steps_only,
+            phase,
+            phase_threshold,
+        } => {
+            let args = perf_delta::PerfDeltaArgs {
+                base: base.as_deref(),
+                base_ref: base_ref.as_deref(),
+                filter: filter.as_deref(),
+                default_branch: &default_branch,
+                kernel: kernel.as_deref(),
+                dual_run,
+                threshold,
+                policy: policy.as_deref(),
+                a_scheduler: a_scheduler.as_deref(),
+                b_scheduler: b_scheduler.as_deref(),
+                phase_display: ktstr::cli::PhaseDisplayOptions {
+                    no_phases,
+                    phases_only,
+                    steps_only,
+                    phase,
+                    phase_threshold,
+                },
+            };
+            match perf_delta::run(&args) {
                 Ok(0) => Ok(()),
                 Ok(code) => std::process::exit(code),
                 Err(e) => Err(format!("{e:#}")),

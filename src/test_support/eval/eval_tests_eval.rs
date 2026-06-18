@@ -688,7 +688,6 @@ fn eval_monitor_fail_has_fingerprint() {
                 &pass_assert,
             )],
         }),
-        stimulus_events: Vec::new(),
         verifier_stats: Vec::new(),
         kvm_stats: None,
         crash_message: None,
@@ -701,9 +700,11 @@ fn eval_monitor_fail_has_fingerprint() {
         },
         stats_client: None,
         periodic_fired: 0,
+        periodic_real: 0,
         periodic_target: 0,
         kern_kaslr_offset: 0,
         entry_name: None,
+        periodic_series_cache: std::sync::OnceLock::new(),
     };
     let assertions = crate::assert::Assert::NO_OVERRIDES
         .max_imbalance_ratio(4.0)
@@ -1045,7 +1046,6 @@ fn eval_sched_exit_includes_monitor() {
                 &assert,
             )],
         }),
-        stimulus_events: Vec::new(),
         verifier_stats: Vec::new(),
         kvm_stats: None,
         crash_message: None,
@@ -1058,9 +1058,11 @@ fn eval_sched_exit_includes_monitor() {
         },
         stats_client: None,
         periodic_fired: 0,
+        periodic_real: 0,
         periodic_target: 0,
         kern_kaslr_offset: 0,
         entry_name: None,
+        periodic_series_cache: std::sync::OnceLock::new(),
     };
     let assertions = crate::assert::Assert::NO_OVERRIDES;
     let msg = format!(
@@ -1145,7 +1147,6 @@ fn eval_monitor_fail_includes_sched_log() {
                 &pass_assert,
             )],
         }),
-        stimulus_events: Vec::new(),
         verifier_stats: Vec::new(),
         kvm_stats: None,
         crash_message: None,
@@ -1158,9 +1159,11 @@ fn eval_monitor_fail_includes_sched_log() {
         },
         stats_client: None,
         periodic_fired: 0,
+        periodic_real: 0,
         periodic_target: 0,
         kern_kaslr_offset: 0,
         entry_name: None,
+        periodic_series_cache: std::sync::OnceLock::new(),
     };
     let assertions = crate::assert::Assert::NO_OVERRIDES
         .max_imbalance_ratio(4.0)
@@ -1186,6 +1189,90 @@ fn eval_monitor_fail_includes_sched_log() {
         "got: {msg}"
     );
     assert!(msg.contains("--- scheduler log ---"), "got: {msg}");
+}
+
+/// MANDATORY guard for the drain-once de-confliction:
+///
+/// 1. **No starvation.** A `post_vm`-style read of the series
+///    (`phase_buckets()`, which routes through `captures_series()`)
+///    runs BEFORE `evaluate_vm_result` — exactly the production
+///    ordering. The framework's later `stats.phases` build must still
+///    be non-empty: before the `captures_series()` cache, the post_vm
+///    read drained the bridge and `stats.phases` came up silently
+///    empty.
+/// 2. **Single source.** `stats.phases` and `VmResult::phase_buckets()`
+///    must carry IDENTICAL content. Both fold the same
+///    `captures_series()` cache through
+///    `build_phase_buckets_with_stimulus`; the only input that differs
+///    is the stimulus arg, and the production caller passes
+///    `result.stimulus_timeline()` — the same source `phase_buckets()`
+///    uses internally. This test pins that equality so a future drift
+///    of `evaluate`'s stimulus arg from `stimulus_timeline()` fails
+///    loudly.
+#[test]
+fn phase_buckets_equals_stats_phases_and_post_vm_read_does_not_starve() {
+    let pass_assert = build_assert_result(true, vec![]);
+    let entry = sched_entry("__eval_phase_buckets_eq__");
+    let result = crate::vmm::VmResult {
+        success: true,
+        guest_messages: Some(crate::vmm::host_comms::BulkDrainResult {
+            entries: vec![crate::test_support::test_helpers::assert_result_tlv_entry(
+                &pass_assert,
+            )],
+        }),
+        periodic_fired: 3,
+        periodic_target: 3,
+        ..crate::vmm::VmResult::test_fixture()
+    };
+    // Populate the snapshot bridge with periodic captures stamped into
+    // Step[0] (step_index = 1). No Stimulus frames are attached, so the
+    // bucketer falls back to each capture's stamped step_index on both
+    // the phase_buckets() and the evaluate path.
+    for i in 0..3 {
+        result.snapshot_bridge.store_with_stats_and_step(
+            &format!("periodic_{i}"),
+            crate::monitor::dump::FailureDumpReport::default(),
+            None,
+            Some(i as u64 * 100),
+            None,
+            1,
+        );
+    }
+    // post_vm runs BEFORE evaluate: read the series first (the
+    // pre-bug double-drain trigger).
+    let post_vm_buckets = result.phase_buckets();
+    assert!(
+        !post_vm_buckets.is_empty(),
+        "fixture with 3 captures must yield buckets"
+    );
+    // Framework builds stats.phases AFTER post_vm. Pass the SAME
+    // stimulus source the production caller passes (the
+    // `stimulus_events = result.stimulus_timeline()` binding in
+    // `run_ktstr_test_inner_impl`).
+    let stimulus = result.stimulus_timeline();
+    let ar = evaluate_vm_result(
+        &entry,
+        &result,
+        &crate::assert::Assert::NO_OVERRIDES,
+        &stimulus,
+        &[],
+        &[],
+        &EVAL_TOPO,
+        &no_repro,
+        None,
+    )
+    .expect("pass_assert on the success arm must return Ok");
+    assert!(
+        !ar.stats.phases.is_empty(),
+        "a post_vm series read must NOT starve stats.phases — the \
+         latent drain-once bug this task fixes",
+    );
+    assert_eq!(
+        ar.stats.phases, post_vm_buckets,
+        "stats.phases must equal VmResult::phase_buckets() (single \
+         source: shared captures_series() cache + same builder + \
+         stimulus_timeline)",
+    );
 }
 
 /// `acquire_test_kernel_lock_if_cached` returns `Some(guard)`

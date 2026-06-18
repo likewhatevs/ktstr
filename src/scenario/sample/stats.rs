@@ -12,6 +12,30 @@
 //! Orthogonal to [`super::bpf`]: the stats axis sources its values
 //! from the userspace scheduler's `scx_stats` JSON; the BPF axis
 //! sources from kernel-side BPF state. Tests typically use both.
+//!
+//! ## Counter semantics are scheduler-defined (cumulative vs per-read delta)
+//!
+//! ktstr issues ONE fresh `scx_stats` request per periodic snapshot
+//! and stores the response verbatim — it never accumulates or diffs a
+//! field across snapshots. Whether a field is CUMULATIVE (monotonic
+//! since scheduler start) or a DELTA since the previous reader request
+//! is decided by the scheduler's stats implementation, not by ktstr.
+//! Some schedulers delta their metrics per reader request; because
+//! ktstr issues one request per snapshot, each sample of such a field
+//! is the change since the PREVIOUS snapshot, not a running total.
+//!
+//! This dictates the per-phase reduction. For a CUMULATIVE field the
+//! phase total is last − first
+//! ([`counter_delta_per_phase`](crate::assert::temporal::SeriesField::counter_delta_per_phase)).
+//! For a DELTA-per-request field that reduction is wrong — it diffs two
+//! deltas; the phase total is the SUM of the per-snapshot deltas in the
+//! phase. There is no built-in per-phase sum today, so group with
+//! [`by_stimulus_phase`](crate::scenario::sample::SampleSeries::by_stimulus_phase)
+//! and sum each phase's values by hand. Mind the boundary: a
+//! per-snapshot delta covers the interval since the previous snapshot,
+//! so the FIRST delta inside a phase spans the phase boundary and
+//! carries the tail of the prior phase. Know your scheduler's
+//! convention before choosing the reduction.
 
 use crate::assert::temporal::SeriesField;
 use crate::scenario::snapshot::{JsonField, SnapshotResult, stats_path};
@@ -163,32 +187,28 @@ impl<'a> StatsPathProjector<'a> {
         }
     }
 
-    /// Discover the JSON object keys of the resolved path at
-    /// sample 0. Empty when the path is missing or resolves to a
-    /// non-object; populated when the projection lands on a
-    /// `serde_json::Value::Object`.
+    /// Discover the JSON object keys of the resolved path, unioned across
+    /// ALL samples (sorted, deduplicated). Empty ONLY when no sample
+    /// resolves the path to an object.
+    ///
+    /// Discovery spans every row rather than sample 0 alone: a
+    /// scheduler-defined `scx_stats` object can be absent or `Err` in
+    /// sample 0 (the first capture often predates the scheduler's first
+    /// stats emit) while later samples carry it; reading only sample 0
+    /// would silently return no keys and blind a "assert over every
+    /// scx_stats counter" blanket projection.
     pub fn key_names(&self) -> Vec<String> {
-        let row = match self.series.rows.first() {
-            Some(r) => r,
-            None => return Vec::new(),
-        };
-        let stats = match row.stats.as_ref() {
-            Ok(s) => s,
-            Err(_) => return Vec::new(),
-        };
-        let resolved = stats_path(stats, &self.path);
-        let raw = match resolved.raw() {
-            Some(v) => v,
-            None => return Vec::new(),
-        };
-        match raw {
-            serde_json::Value::Object(map) => {
-                let mut names: Vec<String> = map.keys().cloned().collect();
-                names.sort();
-                names
+        let mut names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for row in &self.series.rows {
+            let Ok(stats) = row.stats.as_ref() else {
+                continue;
+            };
+            let resolved = stats_path(stats, &self.path);
+            if let Some(serde_json::Value::Object(map)) = resolved.raw() {
+                names.extend(map.keys().cloned());
             }
-            _ => Vec::new(),
         }
+        names.into_iter().collect()
     }
 
     /// Project every object key that resolves as `u64` for at
@@ -458,6 +478,31 @@ mod tests {
             !names.contains(&"name"),
             "String key must be excluded — every u64 projection errors: {names:?}",
         );
+        // Pin the projected VALUES, not just the kept names: the kept
+        // name is the bare key label, but the value resolves through
+        // join_paths(path, key) — a wrong-leaf or wrong-cast bug keeps
+        // the name while corrupting the value, which a name-only check
+        // misses (mirror of bpf.rs).
+        let busy = fields.iter().find(|(n, _)| n == "busy").expect("busy kept");
+        assert_eq!(
+            busy.1
+                .values_iter()
+                .filter_map(|r| r.as_ref().ok().copied())
+                .collect::<Vec<u64>>(),
+            vec![50u64, 60],
+        );
+        let count = fields
+            .iter()
+            .find(|(n, _)| n == "count")
+            .expect("count kept");
+        assert_eq!(
+            count
+                .1
+                .values_iter()
+                .filter_map(|r| r.as_ref().ok().copied())
+                .collect::<Vec<u64>>(),
+            vec![7u64, 9],
+        );
     }
 
     /// Mirror of the u64 test for `f64_fields`. `busy`, `count`,
@@ -499,6 +544,29 @@ mod tests {
             !names.contains(&"name"),
             "String key must be excluded — every f64 projection errors: {names:?}",
         );
+        // Pin the projected f64 VALUES. `count` (a second integer key)
+        // catches a wrong-leaf bug; `ratio` (the only non-integer
+        // fraction) catches a fraction-mangling bug — neither is value-
+        // checked elsewhere.
+        let getf = |n: &str| -> Vec<f64> {
+            fields
+                .iter()
+                .find(|(name, _)| name == n)
+                .unwrap_or_else(|| panic!("{n} kept"))
+                .1
+                .values_iter()
+                .filter_map(|r| r.as_ref().ok().copied())
+                .collect()
+        };
+        let approx = |got: Vec<f64>, want: &[f64]| {
+            assert_eq!(got.len(), want.len());
+            for (g, w) in got.iter().zip(want) {
+                assert!((g - w).abs() < f64::EPSILON, "got {got:?} want {want:?}");
+            }
+        };
+        approx(getf("busy"), &[50.0, 60.0]);
+        approx(getf("count"), &[7.0, 9.0]);
+        approx(getf("ratio"), &[0.5, 0.5]);
     }
 
     /// Empty series — no rows to discover JSON keys from, so

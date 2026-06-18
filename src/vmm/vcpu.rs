@@ -853,7 +853,8 @@ impl WatchpointArm {
     ///     CAS true→true and skips the eventfd write. The
     ///     coordinator only resets `hit` on the slot-0
     ///     suppression / rendezvous-timeout path
-    ///     (`freeze_coord.rs::run_coord_loop`, the
+    ///     (`crate::vmm::freeze_coord::run_vm`'s coordinator
+    ///     loop, the
     ///     `None if watchpoint_only_trigger` arm — slot 0 alone
     ///     resets on suppression so the next genuine error-class
     ///     write retriggers; on a successful dump slot 0 stays

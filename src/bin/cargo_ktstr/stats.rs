@@ -89,36 +89,14 @@ pub(crate) fn run_stats(command: &Option<StatsCommand>) -> Result<(), String> {
             phase,
             phase_threshold,
         }) => {
-            // Resolve `--threshold N` / `--policy PATH` / neither
-            // into a single `ComparisonPolicy`. Clap's
-            // `conflicts_with` guarantees at most one of
-            // (threshold, policy) is set, so the three branches
-            // are exhaustive on user-visible input.
-            let resolved_policy = match (threshold, policy.as_ref()) {
-                (Some(t), None) => {
-                    let p = ktstr::cli::ComparisonPolicy::uniform(*t);
-                    // `uniform` is infallible, but the user-supplied
-                    // percent still needs a sign check. `validate`
-                    // rejects negatives before they reach
-                    // `compare_rows`' dual-gate math.
-                    p.validate().map_err(|e| format!("{e:#}"))?;
-                    p
-                }
-                (None, Some(path)) => {
-                    ktstr::cli::ComparisonPolicy::load_json(path).map_err(|e| format!("{e:#}"))?
-                }
-                (None, None) => ktstr::cli::ComparisonPolicy::default(),
-                (Some(_), Some(_)) => {
-                    // Defence-in-depth: clap's `conflicts_with` is
-                    // load-bearing here, but a regression that
-                    // dropped either attribute would silently pick
-                    // one path and ignore the other. Panic loudly.
-                    unreachable!(
-                        "clap `conflicts_with` on --threshold / --policy \
-                         must enforce mutual exclusion at parse time",
-                    );
-                }
-            };
+            // Resolve `--threshold N` / `--policy PATH` / neither into
+            // a single `ComparisonPolicy` via the shared resolver (also
+            // used by `perf-delta`). Clap's `conflicts_with` enforces
+            // mutual exclusion at parse time; the resolver's
+            // both-set-is-error branch is the unreachable backstop.
+            let resolved_policy =
+                ktstr::cli::ComparisonPolicy::from_cli_flags(*threshold, policy.as_deref())
+                    .map_err(|e| format!("{e:#}"))?;
             // Resolve git revspecs in `--project-commit` /
             // `--kernel-commit` flags (HEAD~1, tags, branch names,
             // `A..B` ranges) into 7-char short hashes BEFORE

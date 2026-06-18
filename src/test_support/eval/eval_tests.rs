@@ -600,6 +600,119 @@ fn resolve_scheduler_discover_via_env() {
     );
 }
 
+/// The per-name override `KTSTR_SCHEDULER_BIN_<NAME>` wins over the global
+/// `KTSTR_SCHEDULER` so a test declaring distinct Discover
+/// schedulers can point each at its own binary. Both vars point at
+/// existing-but-different paths; the per-name one must be the resolved
+/// result.
+#[test]
+fn resolve_scheduler_discover_per_name_env_wins_over_global() {
+    let _lock = lock_env();
+    let exe = crate::resolve_current_exe().unwrap();
+    // Global points at a different existing binary; per-name points at
+    // `exe`. The per-name override is checked first, so `exe` wins.
+    let global_dir = TempDir::new().expect("tempdir");
+    let global_bin = global_dir.path().join("global_sched");
+    std::fs::write(&global_bin, b"stub").expect("write global stub");
+    let _global = EnvVarGuard::set(crate::KTSTR_SCHEDULER_ENV, &global_bin);
+    let _per = EnvVarGuard::set(crate::per_name_scheduler_env("scx_demo"), &exe);
+    let (path, source) = resolve_scheduler(&SchedulerSpec::Discover("scx_demo")).unwrap();
+    assert_eq!(
+        path.unwrap(),
+        exe,
+        "per-name KTSTR_SCHEDULER_BIN_SCX_DEMO must win over the global KTSTR_SCHEDULER",
+    );
+    assert_eq!(source, ResolveSource::EnvVar);
+}
+
+/// A per-name override pointing at a NON-existent path falls through
+/// to the global var (the documented lenient behavior, matching the
+/// global var's own missing-path handling).
+#[test]
+fn resolve_scheduler_discover_per_name_missing_falls_back_to_global() {
+    let _lock = lock_env();
+    let exe = crate::resolve_current_exe().unwrap();
+    let _per = EnvVarGuard::set(
+        crate::per_name_scheduler_env("scx_demo"),
+        "/nonexistent/per_name_scheduler",
+    );
+    let _global = EnvVarGuard::set(crate::KTSTR_SCHEDULER_ENV, &exe);
+    let (path, source) = resolve_scheduler(&SchedulerSpec::Discover("scx_demo")).unwrap();
+    assert_eq!(
+        path.unwrap(),
+        exe,
+        "a set-but-missing per-name path must fall through to the global var",
+    );
+    assert_eq!(source, ResolveSource::EnvVar);
+}
+
+/// Two DISTINCT Discover names with two distinct per-name overrides
+/// resolve to two distinct binaries — the regression the per-name override fixes (the
+/// global var collapsed every Discover scheduler to one path).
+#[test]
+fn resolve_scheduler_discover_per_name_distinguishes_two_schedulers() {
+    let _lock = lock_env();
+    let _no_global = EnvVarGuard::remove(crate::KTSTR_SCHEDULER_ENV);
+    let dir = TempDir::new().expect("tempdir");
+    let bin_a = dir.path().join("sched_a");
+    let bin_b = dir.path().join("sched_b");
+    std::fs::write(&bin_a, b"a").expect("write a");
+    std::fs::write(&bin_b, b"b").expect("write b");
+    let _a = EnvVarGuard::set(crate::per_name_scheduler_env("scx_a"), &bin_a);
+    let _b = EnvVarGuard::set(crate::per_name_scheduler_env("scx_b"), &bin_b);
+    let (pa, _) = resolve_scheduler(&SchedulerSpec::Discover("scx_a")).unwrap();
+    let (pb, _) = resolve_scheduler(&SchedulerSpec::Discover("scx_b")).unwrap();
+    assert_eq!(pa.unwrap(), bin_a);
+    assert_eq!(pb.unwrap(), bin_b);
+}
+
+/// The per-name env var name derivation: `KTSTR_SCHEDULER_BIN_` +
+/// uppercase + non-alphanumeric to `_`.
+#[test]
+fn per_name_scheduler_env_derivation() {
+    assert_eq!(
+        crate::per_name_scheduler_env("scx_layered"),
+        "KTSTR_SCHEDULER_BIN_SCX_LAYERED",
+    );
+    assert_eq!(
+        crate::per_name_scheduler_env("scx-ktstr"),
+        "KTSTR_SCHEDULER_BIN_SCX_KTSTR",
+    );
+}
+
+/// The profile-aware target-dir probe order: with
+/// `prefer_release` the release dir is probed first (so a
+/// `--release-scheduler` run prefers `target/release/` over a stale
+/// `target/debug/` binary); otherwise debug-first (preserves the
+/// prior order). Pins the reorder branch without staging a CWD.
+#[test]
+fn target_dir_probe_order_prefers_profile_match() {
+    let rel = super::scheduler::target_dir_probe_order(true);
+    assert_eq!(rel[0], ("target/release", ResolveSource::TargetRelease));
+    assert_eq!(rel[1], ("target/debug", ResolveSource::TargetDebug));
+    let dbg = super::scheduler::target_dir_probe_order(false);
+    assert_eq!(dbg[0], ("target/debug", ResolveSource::TargetDebug));
+    assert_eq!(dbg[1], ("target/release", ResolveSource::TargetRelease));
+}
+
+/// The `BIN` infix keeps the per-name namespace disjoint from the
+/// `KTSTR_SCHEDULER_*` meta-variables: a scheduler named "profile" must NOT
+/// derive the build-profile selector `KTSTR_SCHEDULER_PROFILE`
+/// (namespace-collision guard).
+#[test]
+fn per_name_scheduler_env_does_not_collide_with_meta_vars() {
+    assert_ne!(
+        crate::per_name_scheduler_env("profile"),
+        crate::KTSTR_SCHEDULER_PROFILE_ENV,
+        "Discover(\"profile\") must not shadow KTSTR_SCHEDULER_PROFILE",
+    );
+    assert_ne!(
+        crate::per_name_scheduler_env("anything"),
+        crate::KTSTR_SCHEDULER_ENV,
+        "per-name vars must not collide with the global KTSTR_SCHEDULER",
+    );
+}
+
 /// `KTSTR_CARGO_TEST_MODE=1` enables the `$PATH` lookup branch of
 /// `Discover`. Stage a tempdir containing an executable with the
 /// requested name, point `PATH` at it, and verify the resolution

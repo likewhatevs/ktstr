@@ -57,7 +57,7 @@ pub const MAX_BULK_FRAME_PAYLOAD: u32 = 16 * 1024 * 1024;
 /// `payload` is read by external consumers via the public bulk API;
 /// internal lib code only inspects `msg_type` + `crc_ok` for the
 /// SCHED_EXIT promotion gate. `#[allow(dead_code)]` mirrors the
-/// pattern on `VmResult::stimulus_events` and `Snapshot` accessor
+/// pattern on `VmResult::virtio_blk_counters` and `Snapshot` accessor
 /// types — fields part of the public surface that the lib build
 /// does not internally read.
 ///

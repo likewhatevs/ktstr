@@ -280,10 +280,10 @@ fn sidecar_result_roundtrip() {
             cgroups: vec![CgroupStats {
                 num_workers: 4,
                 num_cpus: 2,
-                avg_off_cpu_pct: 50.0,
-                min_off_cpu_pct: 40.0,
-                max_off_cpu_pct: 60.0,
-                spread: 20.0,
+                avg_off_cpu_pct: Some(50.0),
+                min_off_cpu_pct: Some(40.0),
+                max_off_cpu_pct: Some(60.0),
+                spread: Some(20.0),
                 max_gap_ms: 100,
                 max_gap_cpu: 1,
                 total_migrations: 5,
@@ -317,6 +317,8 @@ fn sidecar_result_roundtrip() {
             schedstat_deltas: None,
             ..Default::default()
         }),
+        periodic_fired: 7,
+        periodic_target: 9,
         stimulus_events: vec![crate::timeline::StimulusEvent {
             elapsed_ms: 500,
             label: "StepStart[0]".to_string(),
@@ -324,6 +326,8 @@ fn sidecar_result_roundtrip() {
             detail: Some("4 cpus".to_string()),
             total_iterations: None,
             step_index: None,
+            is_terminal: false,
+            is_step_end: false,
         }],
         work_type: "SpinWait".to_string(),
         verifier_stats: vec![],
@@ -362,6 +366,8 @@ fn sidecar_result_roundtrip() {
         inconclusive,
         stats,
         monitor,
+        periodic_fired: _,
+        periodic_target: _,
         stimulus_events,
         work_type,
         verifier_stats,
@@ -529,6 +535,8 @@ fn sidecar_result_roundtrip_all_fields_round_trip() {
             total_samples: 17,
             ..Default::default()
         }),
+        periodic_fired: 5,
+        periodic_target: 6,
         stimulus_events: vec![StimulusEvent {
             elapsed_ms: 123,
             label: "audit_event".to_string(),
@@ -536,6 +544,8 @@ fn sidecar_result_roundtrip_all_fields_round_trip() {
             detail: None,
             total_iterations: None,
             step_index: None,
+            is_terminal: false,
+            is_step_end: false,
         }],
         work_type: "AuditWork".to_string(),
         verifier_stats: vec![ProgVerifierStats {

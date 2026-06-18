@@ -84,6 +84,7 @@ fn synthetic_report() -> FailureDumpReport {
         scx_walker_unavailable: None,
         vcpu_perf_at_freeze: Vec::new(),
         dump_truncated_at_us: None,
+        maps_truncated: 0,
         probe_counters: None,
         scx_static_ranges: Default::default(),
         is_placeholder: false,

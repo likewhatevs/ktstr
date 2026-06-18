@@ -20,7 +20,7 @@
 //!   advances on each freeze cycle.
 //!
 //! All four were previously defined inline at the top of
-//! `freeze_coord.rs` (or, for `FreezeState`, inside the run-loop
+//! `freeze_coord/mod.rs` (or, for `FreezeState`, inside the run-loop
 //! closure body); the public surface is unchanged.
 
 use std::time::Duration;

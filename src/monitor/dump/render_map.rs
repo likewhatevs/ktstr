@@ -429,6 +429,51 @@ pub(super) fn is_arena_addr_in_snapshot(
     addr >= snap.user_vm_start && addr < end
 }
 
+/// Free helper backing [`AccessorMemReader::read_arena`]: read `len`
+/// bytes at arena user-address `addr` from the pre-pass snapshot,
+/// falling back to a live kernel-virtual read. Extracted (mirroring
+/// [`is_arena_addr_in_snapshot`]) so unit tests exercise the real
+/// page-index fast path, the cross-page `checked_add` / `> 4096` bound,
+/// the short-captured-page fall-through, and the `kern_vm_start`-anchor
+/// KVA composition without a full [`super::super::guest::GuestKernel`].
+/// `read_kva` performs the slow-path read; it is invoked only when the
+/// page was not captured (or was captured short) AND
+/// `kern_vm_start != 0`.
+pub(super) fn read_arena_in_snapshot(
+    snapshot: Option<&super::super::arena::ArenaSnapshot>,
+    arena_page_index: &ArenaPageIndex,
+    addr: u64,
+    len: usize,
+    read_kva: impl FnOnce(u64, usize) -> Option<Vec<u8>>,
+) -> Option<Vec<u8>> {
+    let snap = snapshot?;
+    let offset = (addr & 0xFFF) as usize;
+    // checked_add against a hostile addr+len near u64::MAX keeps the
+    // single-page bound from wrapping into a false-positive accept.
+    let end = offset.checked_add(len)?;
+    if end > 4096 {
+        return None;
+    }
+    let page_addr = addr & !0xFFF;
+    if let Some(&idx) = arena_page_index.get(&page_addr) {
+        let page = &snap.pages[idx];
+        if end <= page.bytes.len() {
+            return Some(page.bytes[offset..end].to_vec());
+        }
+        // Captured page is short (region/DRAM truncation at capture
+        // time): fall through to the live walker rather than returning
+        // a short slice.
+    }
+    // Slow path: snapshot didn't capture this page. `kern_vm_start == 0`
+    // means the pre-pass bailed before resolving the kernel-side anchor;
+    // without it there's no way to compose a KVA.
+    if snap.kern_vm_start == 0 {
+        return None;
+    }
+    let kva = snap.kern_vm_start.wrapping_add(addr & 0xFFFF_FFFF);
+    read_kva(kva, len)
+}
+
 /// Free helper: resolve a chased arena address to a payload BTF type
 /// id and `header_skip` byte count. Factored out of
 /// [`AccessorMemReader::resolve_arena_type`] so unit tests can call
@@ -751,50 +796,20 @@ impl MemReader for AccessorMemReader<'_> {
     }
 
     fn read_arena(&self, addr: u64, len: usize) -> Option<Vec<u8>> {
-        let snap = self.arena_snapshot?;
-        // Single-page bound: the caller (Ptr deref in btf_render)
-        // caps `len` at one page (4096) before calling us, but pin
-        // the invariant locally so an addr+len that crosses a page
-        // boundary always bails rather than reading mismatched
-        // contents from two distinct pages whose host PAs may be
-        // non-contiguous. checked_add against a hostile addr+len
-        // near u64::MAX keeps the bound from wrapping into a
-        // false-positive accept.
-        let offset = (addr & 0xFFF) as usize;
-        let end = offset.checked_add(len)?;
-        if end > 4096 {
-            return None;
-        }
-        let page_addr = addr & !0xFFF;
-        // Fast path: the requested page was captured in the
-        // pre-pass snapshot. Read straight from frozen bytes —
-        // no page-table walk on the hot path.
-        if let Some(&idx) = self.arena_page_index.get(&page_addr) {
-            let page = &snap.pages[idx];
-            if end <= page.bytes.len() {
-                return Some(page.bytes[offset..end].to_vec());
-            }
-            // Captured page is short (region/DRAM truncation at
-            // capture time): fall through to the live walker rather
-            // than returning a short slice.
-        }
-        // Slow path: snapshot didn't capture this page (sequential
-        // prefix capped at MAX_ARENA_PAGES; allocations beyond
-        // that fall outside the snapshot). Translate the user-side
-        // arena address to a kernel virtual address using the
-        // arena's `kern_vm_start` anchor — same formula
-        // [`super::super::arena::snapshot_arena`] uses to walk
-        // pages at capture time and
-        // [`chase_sdt_data_payload`] uses for sdt_data payload
-        // chase. `kern_vm_start == 0` means the pre-pass bailed
-        // before resolving the kernel-side anchor; without it
-        // there's no way to compose a KVA, so the chase silently
-        // returns None.
-        if snap.kern_vm_start == 0 {
-            return None;
-        }
-        let kva = snap.kern_vm_start.wrapping_add(addr & 0xFFFF_FFFF);
-        self.read_kva(kva, len)
+        // Body lives in the free helper so unit tests reach it without a
+        // full GuestKernel. The caller (Ptr deref in btf_render) caps
+        // `len` at one page before calling, but the helper pins the
+        // single-page bound locally. The slow-path closure walks the
+        // kernel page tables via `read_kva` using the arena's
+        // `kern_vm_start` anchor — the same formula
+        // [`super::super::arena::snapshot_arena`] uses at capture time.
+        read_arena_in_snapshot(
+            self.arena_snapshot,
+            self.arena_page_index,
+            addr,
+            len,
+            |kva, l| self.read_kva(kva, l),
+        )
     }
 
     fn nr_cpu_ids(&self) -> u32 {
@@ -1604,6 +1619,14 @@ pub(super) fn map_type_name(map_type: u32) -> Option<&'static str> {
     })
 }
 
+/// Operator-facing error set into `FailureDumpMap.error` when a
+/// BPF_MAP_TYPE_ARENA map is captured but its BTF offsets did not
+/// resolve. A `const` (not an inline literal) so the byte-exact wire
+/// string is pinnable by a test without constructing a full render_map
+/// context.
+pub(super) const ARENA_OFFSETS_UNAVAILABLE_MSG: &str =
+    "arena BTF offsets unavailable (kernel lacks struct bpf_arena?)";
+
 pub(super) const MAP_TYPE_EXPLANATIONS: &[(u32, &str)] = &[
     (
         BPF_MAP_TYPE_CGROUP_STORAGE,
@@ -1944,9 +1967,7 @@ pub(super) fn render_map(ctx: &RenderMapCtx<'_>, info: &BpfMapInfo) -> FailureDu
                     out.arena = Some(snap);
                 }
                 None => {
-                    out.error = Some(
-                        "arena BTF offsets unavailable (kernel lacks struct bpf_arena?)".into(),
-                    );
+                    out.error = Some(ARENA_OFFSETS_UNAVAILABLE_MSG.into());
                 }
             }
         }
@@ -2404,6 +2425,7 @@ pub(super) fn render_stack_traces(
 
     let mut entries = Vec::new();
     let mut any_truncated = false;
+    let mut buckets_unreadable = 0u32;
 
     for bucket_id in 0..scan_buckets {
         // buckets[id] is a u64 pointer at smap_buckets + id*8.
@@ -2421,7 +2443,9 @@ pub(super) fn render_stack_traces(
         ) else {
             // Bucket array spans across pages on large maps; an
             // unmapped page in the array itself is exotic but
-            // possible. Skip rather than abort.
+            // possible. Skip rather than abort, but count it so the
+            // gap surfaces instead of reading as a smaller map.
+            buckets_unreadable += 1;
             continue;
         };
         let bucket_kva = mem.read_u64(slot_pa, 0);
@@ -2438,6 +2462,10 @@ pub(super) fn render_stack_traces(
             walk.l5,
             walk.tcr_el1,
         ) else {
+            // Non-null bucket pointer but its struct page is
+            // unmapped: the bucket exists yet its contents are
+            // unreadable. Count rather than silently drop.
+            buckets_unreadable += 1;
             continue;
         };
         let nr = mem.read_u32(bucket_pa, sm_offs.smb_nr);
@@ -2524,6 +2552,7 @@ pub(super) fn render_stack_traces(
         n_buckets,
         entries,
         truncated: any_truncated || n_buckets > MAX_STACK_TRACE_BUCKETS,
+        buckets_unreadable,
     })
 }
 
@@ -2583,9 +2612,11 @@ pub(super) fn render_fd_array_slots(
             indices: Vec::new(),
             truncated: false,
             indices_truncated: false,
+            unreadable: 0,
         };
     }
 
+    let mut unreadable: u32 = 0;
     for idx in 0..scan {
         let slot_kva = info
             .map_kva
@@ -2599,6 +2630,10 @@ pub(super) fn render_fd_array_slots(
             walk.l5,
             walk.tcr_el1,
         ) else {
+            // Unmapped slot page: cannot read this pointer. Count it
+            // rather than silently treating the slot as empty, so
+            // `populated` is a visible lower bound.
+            unreadable += 1;
             continue;
         };
         let ptr = mem.read_u64(slot_pa, 0);
@@ -2616,5 +2651,6 @@ pub(super) fn render_fd_array_slots(
         indices_truncated: indices.len() < populated as usize,
         indices,
         truncated,
+        unreadable,
     }
 }

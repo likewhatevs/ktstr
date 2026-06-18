@@ -1149,6 +1149,28 @@ mod tests {
         assert_eq!(size, 64 << 20);
         // Drop releases the VA reservation.
         drop(alloc);
+        // Prove the unmap actually fired: no /proc/self/maps entry may
+        // still cover the range. If impl Drop for ReservationGuard were
+        // deleted (a 64 MiB VA leak per VM) or munmap'd the wrong base/
+        // size, the PROT_NONE reservation would still appear here — the
+        // pre-drop assertions only read fields, never the unmap effect.
+        let addr_val = addr as usize;
+        let maps = std::fs::read_to_string("/proc/self/maps").unwrap();
+        for line in maps.lines() {
+            let range = line.split_whitespace().next().unwrap_or("");
+            if let Some((start, end)) = range.split_once('-')
+                && let (Ok(start), Ok(end)) = (
+                    usize::from_str_radix(start, 16),
+                    usize::from_str_radix(end, 16),
+                )
+            {
+                assert!(
+                    !(start <= addr_val && addr_val < end),
+                    "VA reservation at {addr_val:#x} still mapped after drop \
+                     (ReservationGuard unmap did not fire): {line}",
+                );
+            }
+        }
     }
 
     #[test]

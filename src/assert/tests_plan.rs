@@ -206,3 +206,103 @@ fn plan_starved_still_fails_with_custom_gap() {
             .any(|d| matches!(d.kind, DetailKind::Stuck))
     );
 }
+
+// -- per-cgroup telemetry decoupled from worker-check assertions --
+
+#[test]
+fn telemetry_populated_without_not_starved() {
+    // Per-cgroup telemetry is pure measurement and must populate even
+    // when `not_starved` is NOT set — here only a (huge, non-firing)
+    // max_gap_ms is configured. Pre-fix the CgroupStats build lived
+    // inside `if self.not_starved`, so stats.cgroups came back [] despite
+    // real reports.
+    let plan = AssertPlan::new().max_gap_ms(1_000_000);
+    assert!(
+        !plan.not_starved,
+        "guard: not_starved must be off for this pin"
+    );
+    let reports = [
+        rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 50),
+        rpt(2, 1000, 5e9 as u64, 6e8 as u64, &[1], 60),
+    ];
+    let r = plan.assert_cgroup(&reports, None, None);
+    assert_eq!(
+        r.stats.cgroups.len(),
+        1,
+        "telemetry must be built without a not_starved check; got {:?}",
+        r.stats.cgroups,
+    );
+    assert_eq!(r.stats.total_workers, 2);
+    assert_eq!(r.stats.cgroups[0].num_workers, 2);
+}
+
+#[test]
+fn empty_cgroup_surfaced_not_dropped() {
+    // A declared cgroup whose handle collected zero reports must surface
+    // as a num_workers=0 telemetry entry, not vanish. Pre-fix
+    // assert_not_starved early-returned empty stats on reports.is_empty().
+    let plan = AssertPlan::new().check_not_starved();
+    let r = plan.assert_cgroup(&[], None, None);
+    assert_eq!(
+        r.stats.cgroups.len(),
+        1,
+        "empty-reports cgroup must surface a zero-worker entry, not be dropped",
+    );
+    assert_eq!(r.stats.cgroups[0].num_workers, 0);
+    assert!(r.is_pass(), "no workers -> no fairness fail");
+}
+
+#[test]
+fn max_spread_pct_fires_without_not_starved() {
+    // A custom spread bound must be evaluated on its own field, not gated
+    // behind not_starved (pre-fix the re-check was nested inside
+    // `if self.not_starved`, so max_spread_pct alone was inert).
+    let plan = AssertPlan::new().max_spread_pct(5.0);
+    assert!(!plan.not_starved);
+    let reports = [
+        rpt(1, 1000, 1e9 as u64, 1e8 as u64, &[0], 50), // 10% off-cpu
+        rpt(2, 1000, 1e9 as u64, 9e8 as u64, &[1], 50), // 90% off-cpu -> spread 80%
+    ];
+    let r = plan.assert_cgroup(&reports, None, None);
+    assert!(
+        r.failure_details()
+            .any(|d| matches!(d.kind, DetailKind::Unfair)),
+        "spread 80% > 5% threshold must fire Unfair without not_starved; got {:?}",
+        r.outcomes,
+    );
+}
+
+#[test]
+fn max_gap_ms_fires_without_not_starved() {
+    // Same independence pin for the custom gap bound.
+    let plan = AssertPlan::new().max_gap_ms(100);
+    assert!(!plan.not_starved);
+    let reports = [rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 500)];
+    let r = plan.assert_cgroup(&reports, None, None);
+    assert!(
+        r.failure_details()
+            .any(|d| matches!(d.kind, DetailKind::Stuck)),
+        "gap 500ms > 100ms threshold must fire Stuck without not_starved; got {:?}",
+        r.outcomes,
+    );
+}
+
+#[test]
+fn assert_cgroup_no_double_count_telemetry() {
+    // Exactly one CgroupStats per assert_cgroup call, even with both
+    // not_starved and a custom spread bound active — guards against the
+    // telemetry being built twice once it no longer flows through a single
+    // assert_not_starved call.
+    let plan = AssertPlan::new().check_not_starved().max_spread_pct(50.0);
+    let reports = [
+        rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 50),
+        rpt(2, 1000, 5e9 as u64, 6e8 as u64, &[1], 60),
+    ];
+    let r = plan.assert_cgroup(&reports, None, None);
+    assert_eq!(
+        r.stats.cgroups.len(),
+        1,
+        "exactly one cgroup entry per call"
+    );
+    assert_eq!(r.stats.total_workers, 2);
+}
