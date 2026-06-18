@@ -101,6 +101,27 @@ pub struct CpuBudgetUnsatisfiable {
     pub reason: String,
 }
 
+impl CpuBudgetUnsatisfiable {
+    /// Construct the "explicit CPU budget exceeds the allowed cpuset"
+    /// hard error shared by the `--cpu-cap` (`CpuCap::effective_count`)
+    /// and per-test `cpu_budget` (`KtstrVmBuilder::build`) paths: both
+    /// share the same prefix, the `sched_getaffinity` framing, and the
+    /// "pick a smaller value or release the constraint" remediation.
+    /// `source` names the knob in the message (e.g. `"--cpu-cap N"`,
+    /// `"cpu_budget"`); `omit_hint` is the source-specific "or omit X to
+    /// use the default" tail.
+    pub(crate) fn exceeds_allowed(source: &str, n: usize, allowed: usize, omit_hint: &str) -> Self {
+        Self {
+            reason: format!(
+                "{source} = {n} exceeds the {allowed} CPUs this process is \
+                 allowed on (from sched_getaffinity / Cpus_allowed_list). \
+                 Pick a value ≤ {allowed}, release the cgroup/taskset \
+                 constraint restricting this process, or {omit_hint}."
+            ),
+        }
+    }
+}
+
 impl std::fmt::Display for CpuBudgetUnsatisfiable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.reason)
@@ -1050,16 +1071,12 @@ impl CpuCap {
             // (the author typed a concrete number that does not exist here),
             // not transient contention: CpuBudgetUnsatisfiable, not
             // ResourceContention, so it fails rather than skips.
-            return Err(anyhow::Error::new(CpuBudgetUnsatisfiable {
-                reason: format!(
-                    "--cpu-cap N = {n} exceeds the {allowed_cpus} CPUs this \
-                     process is allowed on (from sched_getaffinity / \
-                     Cpus_allowed_list). Pick a cap ≤ {allowed_cpus}, release \
-                     the cgroup/taskset constraint restricting this process, \
-                     or omit --cpu-cap to use the 30% default of the allowed \
-                     set."
-                ),
-            }));
+            return Err(anyhow::Error::new(CpuBudgetUnsatisfiable::exceeds_allowed(
+                "--cpu-cap N",
+                n,
+                allowed_cpus,
+                "omit --cpu-cap to use the 30% default of the allowed set",
+            )));
         }
         Ok(n)
     }

@@ -970,13 +970,12 @@ impl KtstrVmBuilder {
                                 let n = n as usize;
                                 if n > allowed {
                                     return Err(anyhow::Error::new(
-                                        host_topology::CpuBudgetUnsatisfiable {
-                                            reason: format!(
-                                                "cpu_budget = {n} exceeds the {allowed} CPUs \
-                                                 this process is allowed on; pick a budget \
-                                                 ≤ {allowed} or release the cpuset constraint"
-                                            ),
-                                        },
+                                        host_topology::CpuBudgetUnsatisfiable::exceeds_allowed(
+                                            "cpu_budget",
+                                            n,
+                                            allowed,
+                                            "omit cpu_budget to auto-size it",
+                                        ),
                                     ));
                                 }
                                 n.max(1)
