@@ -2135,6 +2135,16 @@ pub(crate) fn run_named_test(test_name: &str) -> i32 {
         return 0;
     }
 
+    if super::runtime::perf_only_skips_entry(entry) {
+        crate::report::test_skip(format_args!(
+            "{bare_name}: KTSTR_PERF_ONLY is active and this test is not a performance_mode test",
+        ));
+        // Skip sidecar so the perf-delta pool records the skip (excluded
+        // from the A/B compare) rather than a phantom missing result.
+        record_skip_sidecar(entry);
+        return 0;
+    }
+
     if !entry.bpf_map_write.is_empty()
         && let Ok(kernel) = resolve_test_kernel()
         && crate::vmm::find_vmlinux(&kernel).is_none()
@@ -2383,6 +2393,14 @@ pub(crate) fn run_gauntlet_test(rest: &str) -> i32 {
         crate::report::test_skip(format_args!(
             "{}: test requires performance_mode but --no-perf-mode or KTSTR_NO_PERF_MODE is active",
             test_name,
+        ));
+        record_skip_sidecar(entry);
+        return 0;
+    }
+
+    if super::runtime::perf_only_skips_entry(entry) {
+        crate::report::test_skip(format_args!(
+            "{test_name}: KTSTR_PERF_ONLY is active and this test is not a performance_mode test",
         ));
         record_skip_sidecar(entry);
         return 0;

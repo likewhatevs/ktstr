@@ -1203,6 +1203,25 @@ pub const KTSTR_VERIFIER_RAW_ENV: &str = "KTSTR_VERIFIER_RAW";
 /// contract holds uniformly.
 pub const KTSTR_NO_PERF_MODE_ENV: &str = "KTSTR_NO_PERF_MODE";
 
+/// Name of the environment variable that restricts a run to ONLY
+/// `performance_mode` tests: when set to a non-empty value, every
+/// test whose entry does not have `performance_mode` is skipped
+/// (skip sidecar recorded, libtest sees pass) before any VM boot.
+/// The mergebase perf-delta subcommand sets this so a regression run
+/// measures only the tests configured for clean performance numbers;
+/// an explicit nextest `-E` filter narrows further within the
+/// perf-mode set.
+///
+/// **Empty = unset** per the default contract, matching
+/// [`KTSTR_NO_PERF_MODE_ENV`]. The canonical reader
+/// `test_support::runtime::perf_only_active` (pub(crate)) uses
+/// `.map(|v| !v.is_empty()).unwrap_or(false)` so a stray
+/// `KTSTR_PERF_ONLY=` pass-through does not silently skip every
+/// non-perf test. Readers route through the helper (dispatch
+/// gauntlet + named routes in `test_support/dispatch.rs` and the
+/// eval entry in `test_support/eval/mod.rs`).
+pub const KTSTR_PERF_ONLY_ENV: &str = "KTSTR_PERF_ONLY";
+
 /// Name of the environment variable that enables the GitHub Actions
 /// remote-cache backend in [`crate::remote_cache`]. Read at cache-
 /// init time; value-typed — only the exact string `"1"` enables;

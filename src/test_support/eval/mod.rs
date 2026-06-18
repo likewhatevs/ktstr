@@ -449,6 +449,13 @@ fn run_ktstr_test_inner_impl(
         record_skip_sidecar(entry);
         return Ok(AssertResult::skip(REASON));
     }
+    if super::runtime::perf_only_skips_entry(entry) {
+        const REASON: &str =
+            "KTSTR_PERF_ONLY is active and this test is not a performance_mode test";
+        crate::report::test_skip(format_args!("{}: {REASON}", entry.name));
+        record_skip_sidecar(entry);
+        return Ok(AssertResult::skip(REASON));
+    }
     ensure_kvm()?;
     let kernel = resolve_test_kernel()?;
     // Hold a reader flock on the cache entry (if the resolved
