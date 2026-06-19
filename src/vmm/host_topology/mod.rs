@@ -1022,9 +1022,12 @@ impl CpuCap {
     }
 
     /// Three-tier resolution: explicit CLI flag wins over env var,
-    /// which wins over "not set". Returns `None` when neither is
-    /// present, meaning "use the 30% default of the allowed CPU set"
-    /// (see `default_cpu_budget`).
+    /// which wins over "not set". Returns `None` when neither is present,
+    /// meaning "use the caller's auto-sized default": the
+    /// kernel-build/planner path expands `None` to `default_cpu_budget`
+    /// (30% of the allowed set); the no-perf VM-builder path expands it to
+    /// `no_perf_cpu_budget` (max(30%, min(vcpus, allowed)), usually the
+    /// vCPU count).
     ///
     /// Env var is `KTSTR_CPU_CAP` (integer ≥ 1, CPU count). An empty
     /// or unset env var is treated as absent; a non-numeric value
@@ -1075,7 +1078,9 @@ impl CpuCap {
                 "--cpu-cap N",
                 n,
                 allowed_cpus,
-                "omit --cpu-cap to use the 30% default of the allowed set",
+                "omit --cpu-cap to use the auto-sized default (30% of the \
+                 allowed set for kernel builds; the vCPU count, floored at \
+                 30%, for VMs)",
             )));
         }
         Ok(n)
