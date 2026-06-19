@@ -254,6 +254,14 @@ impl KtstrKvm {
         // device GPAs on the MMIO bus and shadows serial/virtio. Reject
         // here so an over-large topology is a clear error, not a silent
         // boot failure.
+        //
+        // Deliberately asymmetric with x86_64. There the vCPU bound is the
+        // host-dependent KVM_CAP_MAX_VCPUS, so an over-cap topology is a
+        // skippable TopologyInsufficient (a host with a larger cap could run
+        // it). Here MAX_VCPUS is a VMM-layout constant — the statically sized
+        // GICv3 redistributor MMIO window, host-INDEPENDENT — so NO aarch64
+        // host can run a wider topology under this VMM. An over-bound topology
+        // is therefore a hard ERROR (a test misconfiguration), NOT a skip.
         let total_cpus = topo.total_cpus();
         anyhow::ensure!(
             total_cpus <= MAX_VCPUS,

@@ -467,9 +467,16 @@ impl KtstrKvm {
         // A topology wider than the host's KVM_CAP_MAX_VCPUS cannot run
         // here; surface it as a clean skip (a host-capability limit, same
         // SKIP class as overcommit) before the per-vCPU create loop, rather
-        // than a mid-loop create_vcpu errno. KVM_CAP_MAX_VCPUS is
-        // host-dependent (commonly 1024; CONFIG_KVM_MAX_NR_VCPUS,
-        // arch/x86/kvm/Kconfig).
+        // than a mid-loop create_vcpu errno. KVM_CAP_MAX_VCPUS returns the
+        // per-VM kvm->max_vcpus (arch/x86/kvm/x86.c), which defaults to
+        // KVM_MAX_VCPUS (= CONFIG_KVM_MAX_NR_VCPUS, commonly 1024) — a
+        // host-dependent value. Because the cap is host-dependent, an over-cap
+        // topology is a skippable TopologyInsufficient — a host with a larger
+        // cap could run it. This is the deliberate counterpart to aarch64,
+        // where the vCPU bound is a VMM-layout constant (the GICv3 redistributor
+        // window) that is host-independent (no host can run a wider topology
+        // under this VMM), so an over-bound topology there is a hard error, not
+        // a skip.
         let max_vcpus = kvm.get_max_vcpus();
         if total as usize > max_vcpus {
             return Err(anyhow::Error::new(
