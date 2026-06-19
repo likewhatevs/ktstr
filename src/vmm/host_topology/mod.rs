@@ -844,8 +844,8 @@ fn try_acquire_all(
 
 /// Diffuse a pid across `[0, max_start)` so adjacent pids do not
 /// land on adjacent offsets. Used by the default-else run-lock path
-/// (`KtstrVm::acquire_run_locks`) to pick a starting LLC slot so two
-/// ktstr invocations launching simultaneously don't both probe slot 0
+/// (`KtstrVm::acquire_default_run_locks`) to pick a starting LLC slot so
+/// two ktstr invocations launching simultaneously don't both probe slot 0
 /// first.
 ///
 /// Bare `pid % max_start` collapses adjacent pids onto adjacent

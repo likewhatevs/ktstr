@@ -14,6 +14,65 @@ fn routing_failure_summary_none_when_zero_else_counts() {
     );
 }
 
+/// build_overcommit_run_locks uses the resolved allowed cpuset as the default
+/// mask (no locks, no pinning plan). The mask is the run-time budget source:
+/// run() stamps result.cpu_budget = default_cpu_mask.len().max(1), so the
+/// sidecar reflects the overcommit mask, not the build-time vCPU count. vcpus
+/// equals the mask size here so the overcommit_warning side-channel (which fires
+/// only when the mask is narrower than vcpus) stays out of this mask-focused
+/// test.
+#[test]
+fn build_overcommit_run_locks_uses_allowed_as_mask() {
+    let rl = KtstrVm::build_overcommit_run_locks(vec![0, 1, 2, 3], 4, None);
+    assert_eq!(rl.default_cpu_mask, Some(vec![0, 1, 2, 3]));
+    assert!(rl.locks.is_empty());
+    assert!(rl.pinning_plan.is_none());
+}
+
+/// acquire_default_run_locks overcommits (default_cpu_mask = the allowed cpuset)
+/// when there is no cached host topology — nothing to plan a 1:1 pin against.
+#[test]
+fn acquire_default_run_locks_overcommits_with_no_host_topo() {
+    // Reset BEFORE the asserts so an assert-fail cannot leak the thread-local
+    // into a sibling; the call itself has no panic path. (host_topology's RAII
+    // AllowedCpusGuard is module-private; the override is thread-local +
+    // per-test isolated, so a leak could not cross tests regardless.)
+    host_topology::ALLOWED_CPUS_OVERRIDE.with(|p| *p.borrow_mut() = Some(vec![0, 1]));
+    let rl = KtstrVm::acquire_default_run_locks(None, &Topology::new(1, 1, 1, 1), None);
+    host_topology::ALLOWED_CPUS_OVERRIDE.with(|p| *p.borrow_mut() = None);
+    let rl = rl.expect("no-host overcommit is Ok, not an error");
+    assert_eq!(
+        rl.default_cpu_mask,
+        Some(vec![0, 1]),
+        "overcommit uses the allowed cpuset as the mask",
+    );
+    assert!(rl.pinning_plan.is_none());
+}
+
+/// acquire_default_run_locks overcommits when the host is too small for a 1:1
+/// pin (compute_pinning fails for every offset, produced_candidate stays false)
+/// — the make-it-work-overcommit-if-topologically-impossible host-gate policy.
+/// Host has 1 LLC; the topology requests 2, so no offset can map it.
+#[test]
+fn acquire_default_run_locks_overcommits_when_host_too_small() {
+    let host = host_topology::HostTopology::new_for_tests(&[(vec![0, 1], 0)]);
+    let topo = Topology::new(1, 2, 1, 1);
+    // Reset BEFORE the asserts so an assert-fail cannot leak the thread-local
+    // into a sibling; the call itself has no panic path. (host_topology's RAII
+    // AllowedCpusGuard is module-private; the override is thread-local +
+    // per-test isolated, so a leak could not cross tests regardless.)
+    host_topology::ALLOWED_CPUS_OVERRIDE.with(|p| *p.borrow_mut() = Some(vec![0, 1]));
+    let rl = KtstrVm::acquire_default_run_locks(Some(&host), &topo, None);
+    host_topology::ALLOWED_CPUS_OVERRIDE.with(|p| *p.borrow_mut() = None);
+    let rl = rl.expect("a too-small host overcommits, it does not error or skip");
+    assert_eq!(
+        rl.default_cpu_mask,
+        Some(vec![0, 1]),
+        "host too small for a 1:1 pin overcommits to the allowed cpuset",
+    );
+    assert!(rl.pinning_plan.is_none());
+}
+
 #[test]
 fn detect_guest_failure_surfaces_alloc_oom_panic_and_generic() {
     // Rust alloc-error on COM2 → actionable OOM cause, echoing the line.
