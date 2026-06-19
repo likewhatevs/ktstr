@@ -504,8 +504,9 @@ pub(super) fn emit_entry_static(input: ItemFn, attrs: AttrValues) -> proc_macro2
     // and the unconditional-Err arm. Two classes: SKIP bailouts
     // (harness-not-configured, resource-contention, topology-insufficient)
     // and hard-FAIL bailouts (perf-mode-unavailable, cpu-budget-
-    // unsatisfiable) that panic even in the expect_err body so a
-    // host-config failure is never swallowed as the expected failure.
+    // unsatisfiable, topology-unrepresentable) that panic even in the
+    // expect_err body so a host-config failure or test misconfiguration is
+    // never swallowed as the expected failure.
     // Factored into one TokenStream so a future change lands in one place
     // and both branches inherit it.
     let host_class_arms = quote! {
@@ -589,6 +590,14 @@ pub(super) fn emit_entry_static(input: ItemFn, attrs: AttrValues) -> proc_macro2
             // Hard FAIL: an explicit --cpu-cap / cpu_budget the host cannot
             // satisfy. Same shared-block / expect_err-precedence rationale.
             panic!("ktstr: FAIL: cpu budget unsatisfiable: {e:#}");
+        }
+        Err(e) if ::ktstr::test_support::is_topology_unrepresentable(&e) => {
+            // Hard FAIL: a topology no host can represent under this VMM's
+            // static device layout (the aarch64 over-MAX_VCPUS GICv3 case).
+            // Panics here in the shared block so it wins over the expect_err
+            // body's `Err(_) => {}` swallow — a test misconfiguration is
+            // never the expected logical failure.
+            panic!("ktstr: FAIL: topology unrepresentable: {e:#}");
         }
     };
     let test_body = if expect_err {

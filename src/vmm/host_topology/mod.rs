@@ -130,6 +130,53 @@ impl std::fmt::Display for CpuBudgetUnsatisfiable {
 
 impl std::error::Error for CpuBudgetUnsatisfiable {}
 
+/// The requested topology cannot be represented by this VMM's static
+/// device layout, and the limit is host-INDEPENDENT, so no retry and no
+/// different host changes that. Concretely: the aarch64 vCPU count
+/// exceeds `MAX_VCPUS` (the capacity of the statically sized GICv3
+/// redistributor MMIO window) — with more vCPUs the redistributor region
+/// overruns the device MMIO window and shadows serial/virtio.
+///
+/// A HARD ERROR — distinct from [`TopologyInsufficient`], its deliberate
+/// counterpart. `TopologyInsufficient` is host-DEPENDENT (the VM cannot
+/// boot on *this* host, but a bigger host could → skip);
+/// `TopologyUnrepresentable` is a fixed VMM-layout limit no aarch64 host
+/// can satisfy under this VMM, so it is a test misconfiguration — the
+/// author must narrow the topology, not provision different hardware.
+/// Routes to `EXIT_FAIL` via a DEDICATED hard-fail arm (the
+/// `is_topology_unrepresentable` predicate) in both `result_to_exit_code`
+/// and the `#[ktstr_test]` macro body, placed ABOVE the `expect_err`
+/// inversion and the skip arms — mirroring `PerfModeUnavailable` /
+/// `CpuBudgetUnsatisfiable`. That placement is what makes it fail even in
+/// an `expect_err` test (the generic `expect_err` arm would otherwise
+/// invert it to a pass) and keeps it out of the `skip_on_contention!` /
+/// `is_topology_insufficient` skip paths, so the misconfiguration can
+/// never masquerade as the expected failure or be turned into a skip.
+///
+/// Downcast via `anyhow::Error::downcast_ref::<TopologyUnrepresentable>()`
+/// (chain-aware: walks `e.chain()`, so a `.context(...)`-wrapped instance
+/// is still recognised) to identify it programmatically — e.g. tests
+/// asserting the over-`MAX_VCPUS` bail is this hard-fault and not a bare
+/// string-matched error.
+// Constructed only on aarch64 (the GICv3-layout over-MAX_VCPUS bail in
+// aarch64::kvm) and in cross-arch routing tests; a non-aarch64 lib-only
+// build sees no construction site. Keep the dead-code check live on
+// aarch64 (where the bail MUST construct it — a real regression if it
+// stops) and allow it only off-arch.
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+#[derive(Debug)]
+pub struct TopologyUnrepresentable {
+    pub reason: String,
+}
+
+impl std::fmt::Display for TopologyUnrepresentable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.reason)
+    }
+}
+
+impl std::error::Error for TopologyUnrepresentable {}
+
 /// A physical LLC group on the host, identified by its cache ID.
 #[derive(Debug, Clone)]
 pub struct LlcGroup {

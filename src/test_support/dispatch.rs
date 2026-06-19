@@ -118,6 +118,26 @@ pub fn is_cpu_budget_unsatisfiable(e: &anyhow::Error) -> bool {
     })
 }
 
+/// Check if an `anyhow::Error` carries a [`TopologyUnrepresentable`].
+///
+/// Chain-aware. A `TopologyUnrepresentable` is a HARD ERROR (a topology no
+/// host can represent under this VMM's static device layout — the aarch64
+/// over-`MAX_VCPUS` GICv3-redistributor case), NOT a skip. Routed to a
+/// dedicated FAIL arm placed ABOVE the `expect_err` inversion (and the
+/// RC/TI skip arms) so a too-wide aarch64 topology can neither masquerade
+/// as the expected failure nor be turned into a silent skip. Distinct from
+/// [`is_topology_insufficient`], which matches the host-DEPENDENT skip type.
+///
+/// [`TopologyUnrepresentable`]: crate::vmm::host_topology::TopologyUnrepresentable
+#[doc(hidden)]
+pub fn is_topology_unrepresentable(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| {
+        cause
+            .downcast_ref::<crate::vmm::host_topology::TopologyUnrepresentable>()
+            .is_some()
+    })
+}
+
 /// Predicate: walks the [`anyhow::Error`] chain looking for a
 /// [`KernelUnavailable`] cause. Used by the `#[ktstr_test]`
 /// macro's wrapper to distinguish "harness not configured" (skip)
@@ -1154,6 +1174,24 @@ fn result_to_exit_code(
                 })
                 .unwrap_or_else(|| "<unknown>".to_string());
             eprintln!("ktstr: FAIL: cpu budget unsatisfiable: {reason}");
+            EXIT_FAIL
+        }
+        Err(e) if is_topology_unrepresentable(&e) => {
+            // Hard FAIL, not a skip: a topology no host can represent under
+            // this VMM's static device layout (the aarch64 over-MAX_VCPUS
+            // GICv3-redistributor case) is a test misconfiguration. Placed
+            // above the expect_err inversion (and the RC/TI skip arms) so it
+            // cannot masquerade as the expected failure or be turned into a
+            // skip — the deliberate counterpart to the x86 over-cap
+            // TopologyInsufficient skip arm below.
+            let reason = e
+                .chain()
+                .find_map(|c| {
+                    c.downcast_ref::<crate::vmm::host_topology::TopologyUnrepresentable>()
+                        .map(|t| t.reason.clone())
+                })
+                .unwrap_or_else(|| "<unknown>".to_string());
+            eprintln!("ktstr: FAIL: topology unrepresentable: {reason}");
             EXIT_FAIL
         }
         Err(e) if is_resource_contention(&e) => {
@@ -2815,6 +2853,37 @@ mod tests {
         );
     }
 
+    /// `is_topology_unrepresentable` recognizes the typed hard-fault through
+    /// a `.context(...)` wrap (chain-aware, mirroring the eval VM-build
+    /// wrap) and rejects the sibling skip type — so its dedicated FAIL arm
+    /// fires for it and only it, and a `TopologyInsufficient` skip is never
+    /// promoted to the hard fault.
+    #[test]
+    fn is_topology_unrepresentable_is_chain_aware_and_distinct() {
+        let direct: anyhow::Error =
+            anyhow::Error::new(crate::vmm::host_topology::TopologyUnrepresentable {
+                reason: "topology has 513 vCPUs, exceeding the maximum of 512".into(),
+            });
+        assert!(is_topology_unrepresentable(&direct), "direct must match");
+        // `anyhow::Error::context` is the inherent method (no `Context`
+        // trait import needed — that trait is for Result/Option).
+        let wrapped = direct.context("build ktstr_test VM");
+        assert!(
+            is_topology_unrepresentable(&wrapped),
+            "context-wrapped must still match (chain-aware)",
+        );
+        // The host-dependent skip counterpart must NOT match — the two arms
+        // are disjoint (one fails, one skips).
+        let insufficient: anyhow::Error =
+            anyhow::Error::new(crate::vmm::host_topology::TopologyInsufficient {
+                reason: "host has too few CPUs".into(),
+            });
+        assert!(
+            !is_topology_unrepresentable(&insufficient),
+            "TopologyInsufficient (skip) is not TopologyUnrepresentable (fail)",
+        );
+    }
+
     #[test]
     fn run_gauntlet_test_rejects_unknown_preset() {
         // `__unit_test_dummy__` is registered in test_support::tests;
@@ -4047,6 +4116,46 @@ mod tests {
         };
         assert_eq!(result_to_exit_code(mk(), false, false), EXIT_FAIL);
         assert_eq!(result_to_exit_code(mk(), true, false), EXIT_FAIL);
+    }
+
+    /// `TopologyUnrepresentable` routes to EXIT_FAIL via its DEDICATED
+    /// hard-fail arm (above the `expect_err` inversion) even under
+    /// expect_err — a fixed VMM-layout limit no host can satisfy is a test
+    /// misconfiguration, never "the expected error appeared". Without that
+    /// arm the generic `expect_err` arm would invert it to EXIT_PASS.
+    /// Crucially it is NOT a skip type: `is_topology_insufficient` must
+    /// reject it (chain-aware, even context-wrapped) so a too-wide aarch64
+    /// topology hard-fails rather than silently skipping. This is the
+    /// deliberate counterpart to the x86 over-`KVM_CAP_MAX_VCPUS` bail,
+    /// which IS a `TopologyInsufficient` skip (host-dependent cap).
+    #[test]
+    fn result_to_exit_code_topology_unrepresentable_fails_and_is_not_a_skip() {
+        use anyhow::Context as _;
+        let mk = || -> Result<crate::assert::AssertResult> {
+            Err(anyhow::Error::new(
+                crate::vmm::host_topology::TopologyUnrepresentable {
+                    reason: "topology has 513 vCPUs, exceeding the maximum of 512".to_string(),
+                },
+            ))
+            .context("build ktstr_test VM")
+        };
+        assert_eq!(result_to_exit_code(mk(), false, false), EXIT_FAIL);
+        assert_eq!(result_to_exit_code(mk(), true, false), EXIT_FAIL);
+        // The dedicated is_topology_unrepresentable arm (above the skip
+        // arms) is what routes it to FAIL; this assertion separately pins
+        // type-distinctness — TopologyUnrepresentable is not a
+        // TopologyInsufficient skip — so a future skip-matcher change can't
+        // reclassify the type and silently turn the misconfiguration into a
+        // pass.
+        let wrapped: anyhow::Error =
+            anyhow::Error::new(crate::vmm::host_topology::TopologyUnrepresentable {
+                reason: "too wide".to_string(),
+            })
+            .context("build ktstr_test VM");
+        assert!(
+            !is_topology_insufficient(&wrapped),
+            "TopologyUnrepresentable is a hard fault, not a topology skip",
+        );
     }
 
     /// `allow_inconclusive = true` routes a terminal Inconclusive
