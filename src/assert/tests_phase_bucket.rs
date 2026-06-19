@@ -1467,6 +1467,168 @@ fn build_phase_buckets_avg_imbalance_excludes_out_of_window_monitor_samples() {
         (avg - 2.0).abs() < f64::EPSILON,
         "out-of-window sample must not contaminate in-window mean (got {avg})",
     );
+    // max_imbalance_ratio now folds on captured buckets too, so the
+    // elapsed=9999 outlier (imbalance 100/2 = 50) is out-of-window and must
+    // be excluded, so the per-phase Peak is the in-window max (all 2.0), NOT
+    // 50. Pins that the windowing gate applies to the newly-folded key.
+    let max_imb = step0
+        .metrics
+        .get("max_imbalance_ratio")
+        .copied()
+        .expect("max_imbalance_ratio populated on captured bucket");
+    assert!(
+        (max_imb - 2.0).abs() < f64::EPSILON,
+        "out-of-window outlier (50) must be excluded from max_imbalance_ratio (got {max_imb})",
+    );
+}
+
+/// A CAPTURED bucket (`sample_count > 0`) must carry
+/// `max_imbalance_ratio` (Peak) and `stuck_count` (Counter) folded from its
+/// in-window monitor samples. Neither has a `read_sample` dispatch arm (both
+/// fall to `_ => None`), so before the gate fix they surfaced ONLY on
+/// synthesized buckets and a captured (common-case) phase dropped them.
+/// max_imbalance = max sample ratio; stuck_count = consecutive
+/// frozen-`rq_clock` non-idle CPU stalls.
+#[test]
+fn build_phase_buckets_captured_bucket_carries_max_imbalance_and_stuck() {
+    use crate::monitor::{CpuSnapshot, MonitorReport, MonitorSample};
+    // cpu(nr, clk): nr_running + a frozen rq_clock so two consecutive
+    // samples sharing the SAME non-zero clock register a per-CPU stall.
+    let cpu = |nr: u32, clk: u64| CpuSnapshot {
+        nr_running: nr,
+        rq_clock: clk,
+        ..Default::default()
+    };
+    // s_60:  [nr=4, nr=2] -> imbalance 4 / max(1,2) = 2.0; rq_clock 1000
+    // s_120: [nr=6, nr=2] -> imbalance 6 / max(1,2) = 3.0; rq_clock 1000
+    //   frozen vs s_60 + both CPUs non-idle -> stall_count = 2.
+    let mon = MonitorReport {
+        samples: vec![
+            MonitorSample::new(60, vec![cpu(4, 1000), cpu(2, 1000)]),
+            MonitorSample::new(120, vec![cpu(6, 1000), cpu(2, 1000)]),
+        ],
+        ..Default::default()
+    };
+    // Two snapshot captures fence the Step[0] window at [50..250] and make
+    // the bucket CAPTURED (sample_count == 2), not synthesized.
+    let drained = vec![
+        fixture_entry("periodic_000", 1, 50),
+        fixture_entry("periodic_001", 1, 250),
+    ];
+    let samples = SampleSeries::from_drained_typed(drained, Some(mon));
+    let phases = crate::assert::build_phase_buckets(&samples);
+    assert_eq!(phases.len(), 1, "single phase");
+    let step0 = &phases[0];
+    assert!(
+        step0.sample_count > 0,
+        "bucket must be CAPTURED (not synthesized) for this test to mean anything",
+    );
+    let max_imb = step0
+        .metrics
+        .get("max_imbalance_ratio")
+        .copied()
+        .expect("captured bucket must now carry max_imbalance_ratio");
+    assert!(
+        (max_imb - 3.0).abs() < f64::EPSILON,
+        "max imbalance = max(2.0, 3.0) = 3.0, got {max_imb}",
+    );
+    let stuck = step0
+        .metrics
+        .get("stuck_count")
+        .copied()
+        .expect("captured bucket must now carry stuck_count");
+    assert!(
+        (stuck - 2.0).abs() < f64::EPSILON,
+        "two frozen-clock non-idle CPUs => stall_count 2, got {stuck}",
+    );
+}
+
+/// Boundary: `stuck_count` needs `windows(2)` of monitor samples, so
+/// a phase with a single in-window monitor sample has NO stall to report —
+/// `stuck_count` must be ABSENT (not present as 0), while `max_imbalance_ratio`
+/// (computed from the single sample) is still folded. Pins that the
+/// `if pm.stall_count > 0` gate leaves the key out rather than writing a
+/// misleading zero.
+#[test]
+fn build_phase_buckets_single_in_window_sample_has_no_stuck_count() {
+    use crate::monitor::{CpuSnapshot, MonitorReport, MonitorSample};
+    let cpu = |nr: u32, clk: u64| CpuSnapshot {
+        nr_running: nr,
+        rq_clock: clk,
+        ..Default::default()
+    };
+    // ONE in-window sample: imbalance 4/2 = 2.0; no second sample => no
+    // windows(2) => stall_count 0 => stuck_count not written.
+    let mon = MonitorReport {
+        samples: vec![MonitorSample::new(100, vec![cpu(4, 1000), cpu(2, 1000)])],
+        ..Default::default()
+    };
+    let drained = vec![
+        fixture_entry("periodic_000", 1, 50),
+        fixture_entry("periodic_001", 1, 250),
+    ];
+    let samples = SampleSeries::from_drained_typed(drained, Some(mon));
+    let phases = crate::assert::build_phase_buckets(&samples);
+    let step0 = &phases[0];
+    let max_imb = step0
+        .metrics
+        .get("max_imbalance_ratio")
+        .copied()
+        .expect("single in-window sample still yields max_imbalance_ratio");
+    assert!(
+        (max_imb - 2.0).abs() < f64::EPSILON,
+        "max imbalance = 2.0 from the single sample, got {max_imb}",
+    );
+    assert!(
+        !step0.metrics.contains_key("stuck_count"),
+        "no consecutive-sample stall => stuck_count must be ABSENT, not 0: {:?}",
+        step0.metrics.get("stuck_count"),
+    );
+}
+
+/// Boundary: stuck_count scopes to in-window samples. The in_window
+/// filter runs BEFORE compute_metrics' `windows(2)` stall detection, so a
+/// stall pair never forms across the phase edge — an out-of-window sample
+/// cannot pair with the last in-window sample. Two frozen-clock in-window
+/// samples plus one far-out sample must yield stuck_count = 2 (the single
+/// fully-in-window pair x 2 CPUs), NOT 4. Guards against a regression that
+/// windowed AFTER stall computation and mis-attributed a cross-phase stall.
+#[test]
+fn build_phase_buckets_stuck_count_excludes_cross_window_stall_pair() {
+    use crate::monitor::{CpuSnapshot, MonitorReport, MonitorSample};
+    let cpu = |nr: u32, clk: u64| CpuSnapshot {
+        nr_running: nr,
+        rq_clock: clk,
+        ..Default::default()
+    };
+    // s_100 + s_200 are in [50,250); their frozen rq_clock pairs them ->
+    // stall_count 2 (both CPUs). s_9999 is OUT of window; it is filtered
+    // before compute_metrics, so the (s_200, s_9999) pair never forms. If
+    // windowing ran AFTER stall detection, that pair would add 2 more.
+    let mon = MonitorReport {
+        samples: vec![
+            MonitorSample::new(100, vec![cpu(4, 1000), cpu(2, 1000)]),
+            MonitorSample::new(200, vec![cpu(6, 1000), cpu(2, 1000)]),
+            MonitorSample::new(9999, vec![cpu(8, 1000), cpu(2, 1000)]),
+        ],
+        ..Default::default()
+    };
+    let drained = vec![
+        fixture_entry("periodic_000", 1, 50),
+        fixture_entry("periodic_001", 1, 250),
+    ];
+    let samples = SampleSeries::from_drained_typed(drained, Some(mon));
+    let phases = crate::assert::build_phase_buckets(&samples);
+    let step0 = &phases[0];
+    let stuck = step0
+        .metrics
+        .get("stuck_count")
+        .copied()
+        .expect("in-window stall pair yields stuck_count");
+    assert!(
+        (stuck - 2.0).abs() < f64::EPSILON,
+        "only the fully-in-window pair counts => stuck_count 2 (not 4 with a cross-window pair), got {stuck}",
+    );
 }
 
 /// Tester B14 BLOCKING: avg_dsq_depth end-to-end pin through
@@ -3049,6 +3211,45 @@ fn populate_run_ext_metrics_from_phases_folds_per_phase_keys() {
     assert!(
         (avg - 3.5).abs() < f64::EPSILON,
         "expected weighted mean 3.5, got {avg}",
+    );
+}
+
+/// Run-level guard: populate_run_ext_metrics_from_phases must SKIP keys with
+/// a typed GauntletRow field (TYPED_FIELD_NAMES) so the phase fold never
+/// re-injects them into ext_metrics. The monitor fold writes max_imbalance_ratio +
+/// stuck_count onto CAPTURED buckets; both are typed-backed (their accessor
+/// wins on read), so writing them to ext would be unread bloat AND a cross-RUN
+/// drift trap (stuck_count: typed whole-run flag vs ext per-phase
+/// stall-count SUM). avg_imbalance_ratio (genuinely ext-only) must still fold.
+#[test]
+fn populate_run_ext_metrics_from_phases_skips_typed_backed_keys() {
+    use crate::assert::PhaseBucket;
+    use std::collections::BTreeMap;
+    let mut m = BTreeMap::new();
+    m.insert("avg_imbalance_ratio".to_string(), 2.0); // ext-only -> folded
+    m.insert("max_imbalance_ratio".to_string(), 3.0); // typed-backed -> skipped
+    m.insert("stuck_count".to_string(), 2.0); // typed-backed -> skipped
+    let phases = vec![PhaseBucket {
+        step_index: 1,
+        label: "Step[0]".to_string(),
+        start_ms: 0,
+        end_ms: 100,
+        sample_count: 5,
+        metrics: m,
+    }];
+    let mut target = BTreeMap::new();
+    crate::assert::populate_run_ext_metrics_from_phases(&phases, &mut target);
+    assert!(
+        target.contains_key("avg_imbalance_ratio"),
+        "avg_imbalance_ratio is ext-only and must be folded into ext_metrics",
+    );
+    assert!(
+        !target.contains_key("max_imbalance_ratio"),
+        "max_imbalance_ratio is typed-backed; must NOT leak into ext_metrics from the phase fold",
+    );
+    assert!(
+        !target.contains_key("stuck_count"),
+        "stuck_count is typed-backed; must NOT leak into ext_metrics (typed flag vs ext-sum drift)",
     );
 }
 

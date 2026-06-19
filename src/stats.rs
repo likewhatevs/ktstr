@@ -612,19 +612,23 @@ impl MetricDef {
     /// `worst_wake_latency_tail_ratio`) and have no single-sample
     /// reading.
     ///
-    /// Metrics that DO have a per-sample shape (`max_dsq_depth`
-    /// from `sample.snapshot`'s BPF .bss / per_cpu, `stuck_count`
-    /// from `sample.snapshot`'s stall counter, `total_fallback`
-    /// / `total_keep_last` / `total_migrations` /
-    /// `total_iterations` from `sample.stats`' scx_stats JSON
-    /// or `sample.snapshot`'s SCX events region) get their
-    /// dispatch arms added incrementally as the per-metric
-    /// adapters land. Until then this returns `None` for every
-    /// metric and [`crate::stats::aggregate_samples_for_phase`]
-    /// surfaces the all-None reduction as a `None` bucket entry
-    /// — distinct from `Some(0.0)` (a real zero), so the
-    /// bucket renderer can paint "no data" vs "real zero"
-    /// distinctly without losing information.
+    /// Wired per-sample arms (return `Some`): `max_dsq_depth` /
+    /// `avg_dsq_depth` from `sample.snapshot`'s DSQ-walker and
+    /// `total_fallback` / `total_keep_last` from its SCX events
+    /// region. Every other registered metric falls to `_ => None`
+    /// here, for one of three reasons: (1) it is a MONITOR-axis
+    /// signal with no guest-`Snapshot` shape (`stuck_count`,
+    /// `max_imbalance_ratio`, `avg_imbalance_ratio`) — folded
+    /// per-phase from `MonitorSample` windowing in
+    /// [`crate::assert::build_phase_buckets`], NOT from read_sample;
+    /// (2) it has no per-sample source yet (`total_migrations`,
+    /// `total_iterations` — per-task guest counters not captured per
+    /// tick); or (3) it is a run-level metric with no single-sample
+    /// reading (the `worst_*` family above).
+    /// [`crate::stats::aggregate_samples_for_phase`] surfaces an
+    /// all-None reduction as a `None` bucket entry — distinct from
+    /// `Some(0.0)` (a real zero) — so the bucket renderer can paint
+    /// "no data" vs "real zero" distinctly without losing information.
     ///
     /// Live caller: [`crate::assert::build_phase_buckets`] calls
     /// `read_sample` once per [`crate::stats::METRICS`] entry per

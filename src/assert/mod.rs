@@ -2194,6 +2194,30 @@ impl ScenarioStats {
     }
 }
 
+/// Registry metric names that already have a typed `GauntletRow` field — the
+/// typed accessor populates them at `sidecar_to_row` time and
+/// `MetricDef::read` prefers the accessor over `ext_metrics`, so writing the
+/// same key into `ext_metrics` would create unread sidecar bloat AND a
+/// cross-RUN aggregation-drift class (the typed-path reduction vs the
+/// ext-path kind-aware dispatch can produce different values for one metric —
+/// e.g. `stuck_count`'s typed whole-run flag vs an ext per-phase stall-count
+/// sum). Both run-level ext-metrics populators consult this — the SampleSeries
+/// path ([`populate_run_ext_metrics`]) and the phase-fold path
+/// ([`populate_run_ext_metrics_from_phases`]) — so only ext-metrics-only
+/// registry entries are written and a typed-backed metric's run-level value
+/// always comes from its accessor. `max_imbalance_ratio` is included because
+/// its accessor reads the typed `GauntletRow.imbalance_ratio` (whole-run
+/// MonitorSummary); its per-phase monitor fold feeds rendering only.
+const TYPED_FIELD_NAMES: &[&str] = &[
+    "max_dsq_depth",
+    "max_imbalance_ratio",
+    "total_fallback",
+    "total_keep_last",
+    "stuck_count",
+    "total_iterations",
+    "total_migrations",
+];
+
 /// Sibling of [`populate_run_ext_metrics`] that mines per-phase
 /// metrics back into the run-level `ext_metrics` map. Closes the
 /// gap for registered metrics whose values live in
@@ -2205,8 +2229,13 @@ impl ScenarioStats {
 /// and `system_time_ns` / `user_time_ns` (per-thread-group CPU-time
 /// deltas injected by `phase_group_cpu_delta` inside
 /// `buckets_from_grouped`). The fold is generic over every key
-/// present on any phase, so it carries any such phase-only metric; this
-/// list is the current set whose `read_sample` returns `None`.
+/// present on any phase, so it carries any such phase-only metric (the
+/// ext-metrics-only set whose `read_sample` returns `None`). Keys with a
+/// typed `GauntletRow` field (`TYPED_FIELD_NAMES`) are SKIPPED: their
+/// run-level value comes from the typed accessor (which wins on read), so
+/// re-injecting them here would double-source the run aggregate — the
+/// hazard the const's doc describes. Their per-phase `PhaseBucket` value
+/// still feeds per-phase rendering.
 ///
 /// Per-phase reduction dispatch is described on [`PhaseBucket`];
 /// the cross-phase fold here uses `sample_count` as the weight so
@@ -2249,6 +2278,19 @@ pub fn populate_run_ext_metrics_from_phases(
         // per-phase ratios would lose the re-pool, and routing a Rate into
         // aggregate_samples_weighted would hit the aggregate_finite guard.
         if matches!(def.kind, crate::stats::MetricKind::Rate { .. }) {
+            continue;
+        }
+        // Typed-backed keys (those in TYPED_FIELD_NAMES — a typed GauntletRow
+        // accessor that wins on read) must NOT be re-injected into ext_metrics
+        // from the phase fold: the ext copy would be unread bloat and, for a
+        // key whose typed and ext reductions differ (stuck_count: whole-run
+        // flag vs per-phase stall-count sum), a cross-RUN aggregation-drift
+        // trap. Their per-phase PhaseBucket value still feeds rendering; the
+        // run-level value stays the typed path. Mirrors the sibling
+        // populate_run_ext_metrics. (Without this, folding max_imbalance_ratio
+        // + stuck_count onto captured buckets would leak both into ext_metrics
+        // on the common path.)
+        if TYPED_FIELD_NAMES.contains(&key.as_str()) {
             continue;
         }
         // Per-phase (value, sample_count) for the kind-aware fold.
@@ -2382,22 +2424,9 @@ pub fn populate_run_ext_metrics(
     samples: &crate::scenario::sample::SampleSeries,
     target: &mut std::collections::BTreeMap<String, f64>,
 ) {
-    // Metrics that already have a typed GauntletRow field — the
-    // typed accessor populates them at sidecar_to_row time and
-    // MetricDef::read prefers the accessor over ext_metrics, so
-    // writing the same key into ext_metrics here would create
-    // unread sidecar bloat AND a cross-RUN aggregation drift
-    // class (typed-path arithmetic-mean vs ext-path kind-aware
-    // dispatch can produce different values for the same metric).
-    // Only ext-metrics-only registry entries get populated here.
-    const TYPED_FIELD_NAMES: &[&str] = &[
-        "max_dsq_depth",
-        "total_fallback",
-        "total_keep_last",
-        "stuck_count",
-        "total_iterations",
-        "total_migrations",
-    ];
+    // Typed-backed keys are skipped via the module-level TYPED_FIELD_NAMES
+    // (shared with populate_run_ext_metrics_from_phases) so only
+    // ext-metrics-only registry entries are populated here.
     for metric_def in crate::stats::METRICS {
         if target.contains_key(metric_def.name) {
             continue;
@@ -3079,13 +3108,24 @@ fn buckets_from_grouped(
 /// reducer (`crate::timeline::compute_metrics`) produces —
 /// `avg_imbalance_ratio`, `max_imbalance_ratio`, `avg_dsq_depth`,
 /// `max_dsq_depth`, `stuck_count`, and the `total_fallback` /
-/// `total_keep_last` counter deltas — over the bucket's window. Only
-/// `avg_imbalance_ratio` is folded for EVERY bucket with in-window monitor
-/// samples (its accessor is `None`, so read_sample never sets it, and the
-/// pre-synthesize buckets_from_grouped block likewise folded only that
-/// key). The REST of the set is folded ONLY for a synthesized
-/// (`sample_count == 0`) bucket: a captured bucket sources dsq / stall /
-/// fallback from its read_sample captures and keeps its pre-synthesize
+/// `total_keep_last` counter deltas — over the bucket's window.
+/// `avg_imbalance_ratio`, `max_imbalance_ratio`, and `stuck_count` are
+/// folded for EVERY bucket with in-window monitor samples: none of the three
+/// has a `read_sample` dispatch arm (`crate::stats` `read_sample` has arms
+/// only for the dsq / fallback keys; these three fall to `_ => None`), so the
+/// per-sample capture path never produces them and monitor is their only
+/// per-bucket source on captured AND synthesized buckets alike — a captured
+/// (common-case) phase must report its per-phase imbalance peak and stall
+/// count, not drop them. (`avg_imbalance_ratio` is genuinely ext-metrics-only;
+/// `max_imbalance_ratio` and `stuck_count` ALSO carry a typed `GauntletRow`
+/// accessor sourced from the whole-run MonitorSummary, so their per-phase
+/// fold here feeds per-phase RENDERING only — the run-level value stays the
+/// typed accessor, and both `populate_run_ext_metrics*` skip them via
+/// `TYPED_FIELD_NAMES` to avoid a double-source.) The dsq / fallback set
+/// (`avg_dsq_depth`,
+/// `max_dsq_depth`, `total_fallback`, `total_keep_last`) is folded ONLY for
+/// a synthesized (`sample_count == 0`) bucket: a captured bucket sources
+/// those from its read_sample captures and keeps its pre-synthesize
 /// behavior, while a synthesized bucket has no captures, so monitor is its
 /// only source — restoring the rendered timeline to PARITY with the old
 /// `Timeline::build` fallback (the path a zero-capture-with-monitor run
@@ -3143,12 +3183,12 @@ fn fold_monitor_into_bucket(
     let pm = crate::timeline::compute_metrics(&phase_monitor_samples);
     // sample_count == 0 IFF the bucket is synthesized: buckets_from_grouped
     // only emits >=1-sample buckets, the synthesize loop only emits 0-sample
-    // ones. A CAPTURED bucket folds ONLY avg_imbalance_ratio from monitor —
-    // its accessor is None so read_sample never provides it, and the
-    // pre-synthesize buckets_from_grouped block likewise folded only that
-    // one key. Restricting the rest of the monitor set to synthesized
-    // buckets preserves captured-bucket behavior; a synthesized bucket has
-    // no captures, so monitor is its only source and it takes the full set
+    // ones. A CAPTURED bucket folds the source-less monitor signals (avg/max
+    // imbalance + stuck_count — none have a read_sample arm) but NOT the
+    // dsq / fallback set, which it sources from its read_sample captures.
+    // Restricting only that dsq / fallback set to synthesized buckets
+    // preserves captured-bucket behavior; a synthesized bucket has no
+    // captures, so monitor is its only source and it takes the full set
     // (Timeline::build render parity).
     let synthesized = bucket.sample_count == 0;
     let mut put = |key: &str, v: f64| {
@@ -3159,17 +3199,31 @@ fn fold_monitor_into_bucket(
     if let Some(v) = pm.avg_imbalance {
         put("avg_imbalance_ratio", v);
     }
+    // max_imbalance_ratio (Peak) and stuck_count (Counter) have NO read_sample
+    // dispatch arm (both fall to `_ => None` in crate::stats read_sample), so
+    // the per-sample capture path never produces them and a CAPTURED bucket
+    // would otherwise never carry them — they would surface only on synthesized
+    // (zero-capture) buckets. Fold them for EVERY monitor-bearing bucket — like
+    // avg_imbalance_ratio above — so a captured (common-case) phase reports its
+    // per-phase imbalance peak and stall count instead of dropping them. (Both
+    // are monitor-axis signals: imbalance from full-class rq.nr_running, stalls
+    // from non-advancing rq.clock across consecutive samples — neither is in
+    // the guest Snapshot read_sample observes. Both ALSO carry a typed
+    // run-level GauntletRow accessor, so this per-phase fold feeds per-phase
+    // RENDERING only; TYPED_FIELD_NAMES keeps them out of the run-level
+    // ext_metrics so the typed accessor stays the single run-level source.)
+    // `or_insert` still guards against overwriting a value already present.
+    if let Some(v) = pm.max_imbalance {
+        put("max_imbalance_ratio", v);
+    }
+    if pm.stall_count > 0 {
+        put("stuck_count", pm.stall_count as f64);
+    }
     if synthesized {
-        if let Some(v) = pm.max_imbalance {
-            put("max_imbalance_ratio", v);
-        }
         if let Some(v) = pm.avg_dsq_depth {
             put("avg_dsq_depth", v);
         }
         put("max_dsq_depth", pm.max_dsq_depth as f64);
-        if pm.stall_count > 0 {
-            put("stuck_count", pm.stall_count as f64);
-        }
         // Bucket-native counter totals for fallback / keep_last: the first
         // and last in-window samples carrying event counters, clamped with
         // the same counter_delta MonitorSummary uses (a mid-phase scheduler
