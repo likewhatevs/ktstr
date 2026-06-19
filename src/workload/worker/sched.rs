@@ -25,7 +25,8 @@ use super::super::config::SchedPolicy;
 ///   leader stats), so reading it from a thread worker reports
 ///   the test runner's stats, not the worker's. The
 ///   `/proc/self/task/<tid>` path returns the per-task
-///   schedstat stored on `task->sched_info`. Available on Linux
+///   schedstat: field 1 = `task->se.sum_exec_runtime` (on-CPU ns),
+///   fields 2/3 = `task->sched_info.run_delay`/`pcount`. Available on Linux
 ///   2.6+; ktstr's 6.16 kernel floor guarantees it.
 ///
 /// Returns `None` when the file cannot be opened (kernel built

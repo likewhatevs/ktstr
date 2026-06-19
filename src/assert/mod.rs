@@ -1420,8 +1420,10 @@ pub struct CgroupStats {
     pub total_iterations: u64,
     /// Sum of per-worker on-CPU time (nanoseconds), from each worker's
     /// schedstat run time ([`crate::workload::WorkerReport::schedstat_cpu_time_ns`]
-    /// — the kernel `sched_info`/schedstat on-CPU accounting, which is the
-    /// summable per-thread proxy for the cgroup's `cpu.stat usage_usec`).
+    /// — `task->se.sum_exec_runtime`, the FIRST `/proc/<pid>/schedstat` field
+    /// (`sched_info` supplies only the run_delay/pcount fields 2/3, not the
+    /// on-CPU time), the summable per-thread proxy for the cgroup's
+    /// `cpu.stat usage_usec`).
     /// Denominator for [`Self::iterations_per_cpu_sec`], the
     /// overcommit-invariant per-cell rate. `0` when no worker reported on-CPU
     /// time (the accessor then returns `None`).
