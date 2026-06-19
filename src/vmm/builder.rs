@@ -950,41 +950,12 @@ impl KtstrVmBuilder {
                 // oversubscription). Computed here rather than folded into
                 // `cpu_cap` so the bypass-conflict check above still keys on
                 // the *explicit* cap only.
-                let effective_cap = match cpu_cap {
-                    Some(c) => Some(c),
-                    None => {
-                        let allowed = host_topology::host_allowed_cpus().len();
-                        let vcpus = self.topology.total_cpus() as usize;
-                        // A per-test `cpu_budget` (#[ktstr_test]) overrides the
-                        // auto-size: a budget > allowed is a CpuBudgetUnsatisfiable
-                        // hard error (see the match arm); ≤ allowed stands (floored
-                        // at 1) so a test can force overcommit (budget < vcpus).
-                        // Absent → size to the vCPU count.
-                        let budget = match self.cpu_budget {
-                            // An explicit per-test cpu_budget the host cannot
-                            // satisfy is a hard ERROR (the author set a concrete
-                            // number exceeding the allowed CPUs), symmetric with
-                            // --cpu-cap. At or below the allowance it stands
-                            // (floored at 1) so a test can force overcommit.
-                            Some(n) => {
-                                let n = n as usize;
-                                if n > allowed {
-                                    return Err(anyhow::Error::new(
-                                        host_topology::CpuBudgetUnsatisfiable::exceeds_allowed(
-                                            "cpu_budget",
-                                            n,
-                                            allowed,
-                                            "omit cpu_budget to auto-size it",
-                                        ),
-                                    ));
-                                }
-                                n.max(1)
-                            }
-                            None => host_topology::no_perf_cpu_budget(allowed, vcpus),
-                        };
-                        Some(host_topology::CpuCap::new(budget)?)
-                    }
-                };
+                let effective_cap = resolve_cpu_budget(
+                    cpu_cap,
+                    self.cpu_budget,
+                    host_topology::host_allowed_cpus().len(),
+                    self.topology.total_cpus() as usize,
+                )?;
                 // Oversubscription warning: when the resolved host-CPU
                 // budget is below the guest vCPU count the host time-slices
                 // the vCPU threads, confounding guest-scheduler measurement
@@ -1338,6 +1309,52 @@ fn build_per_node_map(
     map.into_iter().map(|s| s.into_iter().collect()).collect()
 }
 
+/// Resolve the effective per-VM CPU cap from an explicit cap, a per-test
+/// `cpu_budget`, and the host allowance.
+///
+/// - An explicit `--cpu-cap`/`KTSTR_CPU_CAP` (`cpu_cap = Some`) wins verbatim.
+/// - Otherwise a per-test `cpu_budget` (`#[ktstr_test]`) is honored: a budget
+///   exceeding `allowed` host CPUs is a [`host_topology::CpuBudgetUnsatisfiable`]
+///   hard error (the author named a concrete number the host cannot satisfy,
+///   symmetric with `--cpu-cap`); at or below the allowance it stands (floored
+///   at 1) so a test can force overcommit (`cpu_budget < vcpus`).
+/// - Absent both, the budget auto-sizes to the VM's vCPU count via
+///   [`host_topology::no_perf_cpu_budget`] so a wide VM's boot-time parallel AP
+///   bringup is not throttled by the 30% default mask.
+///
+/// Extracted from `build()` as a pure function so the budget-resolution policy
+/// is unit-testable without booting a VM.
+fn resolve_cpu_budget(
+    cpu_cap: Option<host_topology::CpuCap>,
+    per_test_budget: Option<u32>,
+    allowed: usize,
+    vcpus: usize,
+) -> Result<Option<host_topology::CpuCap>> {
+    match cpu_cap {
+        Some(c) => Ok(Some(c)),
+        None => {
+            let budget = match per_test_budget {
+                Some(n) => {
+                    let n = n as usize;
+                    if n > allowed {
+                        return Err(anyhow::Error::new(
+                            host_topology::CpuBudgetUnsatisfiable::exceeds_allowed(
+                                "cpu_budget",
+                                n,
+                                allowed,
+                                "omit cpu_budget to auto-size it",
+                            ),
+                        ));
+                    }
+                    n.max(1)
+                }
+                None => host_topology::no_perf_cpu_budget(allowed, vcpus),
+            };
+            Ok(Some(host_topology::CpuCap::new(budget)?))
+        }
+    }
+}
+
 /// Try each LLC slot, compute a pinning plan, and acquire resource
 /// locks (non-blocking). Single pass through all available slots.
 /// Returns `PerfModeUnavailable` when `compute_pinning` reports the host is
@@ -1406,6 +1423,82 @@ mod tests {
         let b = KtstrVmBuilder::default();
         assert_eq!(b.memory_mib, Some(256));
         assert_eq!(b.topology.total_cpus(), 1);
+    }
+
+    /// resolve_cpu_budget: an explicit cap wins verbatim and ignores the
+    /// per-test cpu_budget — even a per-test budget that would otherwise be a
+    /// hard error (999 > allowed 10) is bypassed by the explicit cap.
+    #[test]
+    fn resolve_cpu_budget_explicit_cap_wins() {
+        let cap = host_topology::CpuCap::new(5).unwrap();
+        let resolved = resolve_cpu_budget(Some(cap), Some(999), 10, 8)
+            .unwrap()
+            .expect("explicit cap resolves to Some");
+        assert_eq!(resolved.effective_count(10).unwrap(), 5);
+    }
+
+    /// resolve_cpu_budget: a per-test cpu_budget at or below the host allowance
+    /// stands (floored at 1) so a test can force overcommit (budget < vcpus).
+    #[test]
+    fn resolve_cpu_budget_per_test_budget_within_allowance_stands() {
+        let resolved = resolve_cpu_budget(None, Some(4), 10, 8)
+            .unwrap()
+            .expect("budget resolves to Some");
+        assert_eq!(resolved.effective_count(10).unwrap(), 4);
+    }
+
+    /// resolve_cpu_budget over-allowance gate: a per-test cpu_budget exceeding the host
+    /// allowance is a TYPED CpuBudgetUnsatisfiable hard error (symmetric with
+    /// --cpu-cap), not a silent clamp — the author named a concrete number the
+    /// host cannot satisfy.
+    #[test]
+    fn resolve_cpu_budget_per_test_budget_over_allowance_errors() {
+        let err = resolve_cpu_budget(None, Some(100), 10, 8)
+            .expect_err("budget 100 > allowed 10 must error");
+        assert!(
+            err.downcast_ref::<host_topology::CpuBudgetUnsatisfiable>()
+                .is_some(),
+            "must be a typed CpuBudgetUnsatisfiable, got: {err:#}",
+        );
+    }
+
+    /// resolve_cpu_budget auto-size default: absent both an explicit cap and a
+    /// per-test budget, the budget auto-sizes via no_perf_cpu_budget (so a wide
+    /// VM is not throttled by the 30% default mask). Pins the DELEGATION to
+    /// no_perf_cpu_budget, not a re-derived constant.
+    #[test]
+    fn resolve_cpu_budget_auto_sizes_to_no_perf_budget() {
+        let allowed = 100;
+        let vcpus = 50;
+        let resolved = resolve_cpu_budget(None, None, allowed, vcpus)
+            .unwrap()
+            .expect("auto-size resolves to Some");
+        assert_eq!(
+            resolved.effective_count(allowed).unwrap(),
+            host_topology::no_perf_cpu_budget(allowed, vcpus),
+            "absent-both must delegate to no_perf_cpu_budget",
+        );
+    }
+
+    /// acquire_slot_with_locks perf-mode re-map: when the host is too small
+    /// for the requested perf topology, compute_pinning's TopologyInsufficient
+    /// is re-mapped to a TYPED PerfModeUnavailable (a hard error — the isolation
+    /// guarantee cannot be honored on ANY slot of this host), NOT the transient
+    /// ResourceContention skip. Host = 1 LLC / 2 CPUs; request = 4 vCPUs. The
+    /// shortfall is detected by compute_pinning BEFORE any resource lock, so the
+    /// synthetic host needs no flock fixture.
+    #[test]
+    fn acquire_slot_with_locks_host_too_small_is_perf_mode_unavailable() {
+        let host = host_topology::HostTopology::new_for_tests(&[(vec![0, 1], 0)]);
+        let topo = topology::Topology::new(1, 1, 4, 1);
+        let err = acquire_slot_with_locks(&host, &topo)
+            .expect_err("4 vCPUs on a 2-CPU host cannot satisfy the perf topology");
+        assert!(
+            err.downcast_ref::<host_topology::PerfModeUnavailable>()
+                .is_some(),
+            "host-too-small must re-map TopologyInsufficient -> PerfModeUnavailable \
+             (hard error, not a skip-class ResourceContention): {err:#}",
+        );
     }
 
     /// Explicit `memory_mib(0)` must be rejected at build time rather
