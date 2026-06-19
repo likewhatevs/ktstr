@@ -1349,6 +1349,50 @@ pub fn metric_def(name: &str) -> Option<&'static MetricDef> {
     METRICS.iter().find(|m| m.name == name)
 }
 
+/// Rate-COMPONENT metric names suppressed from compare OUTPUT (scalar findings,
+/// per-phase deltas, and unpaired-phase rows). These are the internal
+/// numerator/denominator Counters of the derived rates — `iteration_rate`
+/// (`total_phase_iterations` / `total_phase_duration_sec`) and the pooled
+/// `iterations_per_cpu_sec` (`total_iterations_pooled` / `total_cpu_time_sec`) —
+/// and emitting them alongside their rate is redundant: three rows for one
+/// user-facing concept.
+///
+/// They are suppressed ONLY at the compare-render layer. They REMAIN in the
+/// persisted sidecar, in `GauntletRow::ext_metrics`, and in
+/// `PhaseBucket::metrics`, because the cross-RUN re-pool
+/// ([`group_and_average_by`]) re-derives the rates as `Σnum / Σdenom` from these
+/// components read out of the rows — stripping them from storage would break
+/// rate aggregation. The two user-facing rates and the typed `total_iterations`
+/// are NOT suppressed. (Their `default_abs`/`default_rel` thresholds are inert
+/// while suppressed — the compare significance gate never reads them — but the
+/// entries keep their registry slot: `name` is the re-pool component key and
+/// `kind` drives the fold dispatch.)
+const RENDER_SUPPRESSED_COMPONENTS: &[&str] = &[
+    "total_phase_iterations",
+    "total_phase_duration_sec",
+    "total_iterations_pooled",
+    "total_cpu_time_sec",
+];
+
+/// True when `name` is a Rate component suppressed from compare output (see
+/// [`RENDER_SUPPRESSED_COMPONENTS`]).
+fn is_render_suppressed_component(name: &str) -> bool {
+    RENDER_SUPPRESSED_COMPONENTS.contains(&name)
+}
+
+/// Clone a per-phase metrics map with the suppressed Rate components removed —
+/// used for the unpaired-phase compare rows so a side-only phase does not render
+/// the component plumbing (see [`RENDER_SUPPRESSED_COMPONENTS`]).
+fn metrics_without_suppressed(
+    metrics: &std::collections::BTreeMap<String, f64>,
+) -> std::collections::BTreeMap<String, f64> {
+    metrics
+        .iter()
+        .filter(|(k, _)| !is_render_suppressed_component(k.as_str()))
+        .map(|(k, v)| (k.clone(), *v))
+        .collect()
+}
+
 /// Infer the regression polarity (`higher_is_worse`) of a metric
 /// not present in [`METRICS`].
 ///
@@ -4754,6 +4798,11 @@ pub(crate) fn compare_rows_by(
         }
 
         for (i, m) in METRICS.iter().enumerate() {
+            // Rate components are internal plumbing — suppressed from compare
+            // output (they remain in storage for the cross-run re-pool).
+            if is_render_suppressed_component(m.name) {
+                continue;
+            }
             let val_a = m.read(row_a).unwrap_or(0.0);
             let val_b = m.read(row_b).unwrap_or(0.0);
             if val_a.abs() < f64::EPSILON && val_b.abs() < f64::EPSILON {
@@ -4848,6 +4897,12 @@ pub(crate) fn compare_rows_by(
                         // paired comparison; the filter is on the
                         // classification only.
                         for (metric_name, &val_a) in &pa.metrics {
+                            // Suppress Rate components from the per-phase view
+                            // too (they stay in PhaseBucket.metrics for the
+                            // re-pool; only the rendered delta is dropped).
+                            if is_render_suppressed_component(metric_name) {
+                                continue;
+                            }
                             let Some(&val_b) = pb.metrics.get(metric_name) else {
                                 continue;
                             };
@@ -4889,7 +4944,7 @@ pub(crate) fn compare_rows_by(
                             pairing_key: key_b.clone(),
                             step_index,
                             label: orphan.label.clone(),
-                            metrics: orphan.metrics.clone(),
+                            metrics: metrics_without_suppressed(&orphan.metrics),
                         });
                     }
                     (None, Some(orphan)) => {
@@ -4898,7 +4953,7 @@ pub(crate) fn compare_rows_by(
                             pairing_key: key_b.clone(),
                             step_index,
                             label: orphan.label.clone(),
-                            metrics: orphan.metrics.clone(),
+                            metrics: metrics_without_suppressed(&orphan.metrics),
                         });
                     }
                     (None, None) => {
@@ -5729,9 +5784,13 @@ pub fn compare_partitions(
                         // operator sees that the phase fired but
                         // produced no readable metric data on the
                         // single side it ran on, which is itself a
-                        // signal (capture path landed but
-                        // MetricDef::read_sample returned None for
-                        // every registered metric on these samples).
+                        // signal. Two paths reach here: (1) capture
+                        // landed but MetricDef::read_sample returned
+                        // None for every registered metric on these
+                        // samples; (2) the phase's only metrics were
+                        // suppressed Rate components, which
+                        // metrics_without_suppressed drops from the
+                        // unpaired row.
                         unpaired_table.add_row(vec![
                             Cell::new(u.side.as_str()),
                             Cell::new(test_label),
@@ -8594,6 +8653,42 @@ mod tests {
         for d in &res_imp.findings {
             assert!(!d.is_regression);
         }
+    }
+
+    /// Rate-COMPONENT metrics are suppressed from compare findings, but the
+    /// user-facing rate is not. `total_iterations_pooled` (a suppressed
+    /// component) differs 1000->2000 — past the default gate, normally a
+    /// finding — yet emits none; the pooled rate `iterations_per_cpu_sec`
+    /// differs 500->1000 and DOES emit. Pins the compare-emit suppression while
+    /// the components stay in `ext_metrics` for the cross-run re-pool.
+    #[test]
+    fn compare_rows_suppresses_rate_components_not_the_rate() {
+        let mut a = cmp_row("t", "tiny-1llc", true, 0.0, 1000);
+        a.ext_metrics
+            .insert("total_iterations_pooled".to_string(), 1000.0);
+        a.ext_metrics
+            .insert("iterations_per_cpu_sec".to_string(), 500.0);
+        let mut b = cmp_row("t", "tiny-1llc", true, 0.0, 1000);
+        b.ext_metrics
+            .insert("total_iterations_pooled".to_string(), 2000.0);
+        b.ext_metrics
+            .insert("iterations_per_cpu_sec".to_string(), 1000.0);
+        let res = compare_rows_by(
+            &[a],
+            &[b],
+            LEGACY_PAIRING_DIMS,
+            None,
+            &ComparisonPolicy::default(),
+        );
+        let names: Vec<&str> = res.findings.iter().map(|d| d.metric.name).collect();
+        assert!(
+            !names.contains(&"total_iterations_pooled"),
+            "the Rate component must be suppressed from compare findings; got {names:?}",
+        );
+        assert!(
+            names.contains(&"iterations_per_cpu_sec"),
+            "the user-facing pooled rate must still emit a finding; got {names:?}",
+        );
     }
 
     #[test]
@@ -11838,6 +11933,96 @@ mod tests {
             .expect("B-only orphan present");
         assert_eq!(b_orphan.step_index, 2);
         assert_eq!(b_orphan.label, "Step[1]");
+    }
+
+    /// The per-phase AND unpaired-phase compare surfaces suppress Rate
+    /// components too (not just the scalar findings pass). A and B share step 0
+    /// (matched); A has a step-1 phase B lacks (side=A orphan) and B has a
+    /// step-2 phase A lacks (side=B orphan) — covering BOTH orphan arms. Every
+    /// bucket carries `total_phase_iterations` (a suppressed component — the
+    /// real per-phase producer inserts it into every bucket) and
+    /// `max_dsq_depth` (not suppressed). The component must appear in NEITHER
+    /// the PhaseDeltaRows NOR either UnpairedPhaseRow.metrics, while
+    /// `max_dsq_depth` survives on all. `make_phase_bucket` builds
+    /// `PhaseBucket.metrics` directly — the exact map the per-phase pass reads.
+    #[test]
+    fn compare_rows_per_phase_and_unpaired_suppress_rate_components() {
+        let mut row_a = make_row("t", "tiny-1llc", true, 0.0);
+        let mut row_b = make_row("t", "tiny-1llc", true, 0.0);
+        row_a.phases = vec![
+            make_phase_bucket(
+                0,
+                "BASELINE",
+                &[("total_phase_iterations", 1000.0), ("max_dsq_depth", 5.0)],
+            ),
+            make_phase_bucket(
+                1,
+                "Step[0]",
+                &[("total_phase_iterations", 2000.0), ("max_dsq_depth", 8.0)],
+            ),
+        ];
+        // B lacks step 1 -> A's step-1 phase is an unpaired (side=A) row; B has a
+        // step-2 phase A lacks -> an unpaired (side=B) row. Covers BOTH orphan
+        // arms (the (Some,None) and (None,Some) metrics_without_suppressed calls).
+        row_b.phases = vec![
+            make_phase_bucket(
+                0,
+                "BASELINE",
+                &[("total_phase_iterations", 1500.0), ("max_dsq_depth", 6.0)],
+            ),
+            make_phase_bucket(
+                2,
+                "Step[1]",
+                &[("total_phase_iterations", 3000.0), ("max_dsq_depth", 9.0)],
+            ),
+        ];
+        let report = compare_rows_by(&[row_a], &[row_b], &[], None, &ComparisonPolicy::default());
+
+        // Matched step 0: component suppressed from phase_deltas; the
+        // non-suppressed metric still emits a delta (emitted regardless of gate).
+        let delta_names: Vec<&str> = report.phase_deltas.iter().map(|r| r.metric.name).collect();
+        assert!(
+            !delta_names.contains(&"total_phase_iterations"),
+            "Rate component must be suppressed from per-phase deltas; got {delta_names:?}",
+        );
+        assert!(
+            delta_names.contains(&"max_dsq_depth"),
+            "non-suppressed per-phase metric must still emit a delta; got {delta_names:?}",
+        );
+
+        // Unpaired step 1 (side A): component filtered from the orphan's metrics;
+        // the non-suppressed metric survives.
+        let orphan = report
+            .unpaired_phases
+            .iter()
+            .find(|r| r.step_index == 1)
+            .expect("A's step-1 phase emits an unpaired row");
+        assert!(
+            !orphan.metrics.contains_key("total_phase_iterations"),
+            "Rate component must be filtered from UnpairedPhaseRow.metrics; got {:?}",
+            orphan.metrics.keys().collect::<Vec<_>>(),
+        );
+        assert!(
+            orphan.metrics.contains_key("max_dsq_depth"),
+            "non-suppressed metric must survive in UnpairedPhaseRow.metrics",
+        );
+
+        // Unpaired step 2 (side B): the OTHER orphan arm also filters the
+        // component (the two arms are distinct call sites).
+        let orphan_b = report
+            .unpaired_phases
+            .iter()
+            .find(|r| r.step_index == 2)
+            .expect("B's step-2 phase emits an unpaired row");
+        assert!(
+            !orphan_b.metrics.contains_key("total_phase_iterations"),
+            "Rate component must be filtered from the side-B UnpairedPhaseRow.metrics too; got {:?}",
+            orphan_b.metrics.keys().collect::<Vec<_>>(),
+        );
+        assert!(
+            orphan_b.metrics.contains_key("max_dsq_depth"),
+            "non-suppressed metric must survive in the side-B UnpairedPhaseRow.metrics",
+        );
     }
 
     /// Empty `phases` on either side suppresses the entire
