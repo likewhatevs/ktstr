@@ -2290,6 +2290,72 @@ pub fn populate_run_ext_metrics_from_phases(
     crate::stats::derive_rate_metrics(target);
 }
 
+/// Inject the run-level POOLED `iterations_per_cpu_sec` Rate's two Counter
+/// components into `stats.ext_metrics`, summed across the cgroups that have
+/// measured on-CPU time — the cross-cgroup re-pool axis. Rather than routing
+/// the per-cgroup efficiency through `AssertResult::merge`'s worst-by-polarity
+/// `ext_metrics` fold (which picks the WORST cgroup's value, not Σ, and has
+/// no derive post-pass), this reads the already-merged `stats.cgroups` vec
+/// directly: `iterations_per_cpu_sec` = Σ`total_iterations` /
+/// Σ(`total_cpu_time_ns`/1e9) over cgroups with `total_cpu_time_ns > 0` — the
+/// per-cgroup [`CgroupStats::iterations_per_cpu_sec`] re-pooled, NOT a mean of
+/// per-cgroup ratios, NOT the worst single cgroup.
+///
+/// MUST run at the eval layer AFTER the cgroup-bearing merges (every merge that
+/// contributes a [`CgroupStats`], so `stats.cgroups` holds every per-cgroup
+/// entry) and BEFORE the sidecar write. The trailing monitor-verdict merge at
+/// the eval layer merges an `inconclusive()` carrying empty `stats` (no cgroups,
+/// no ext keys), so it is safe to run after this. If component injection ever
+/// moved BEFORE a cgroup-bearing merge, that worst-by-polarity fold would
+/// min/max these Counter keys into single-cgroup scalars, silently corrupting
+/// the pooled sum.
+///
+/// A cgroup with `total_cpu_time_ns == 0` (schedstat unavailable, or
+/// `num_workers == 0`) is EXCLUDED from BOTH sums — mirroring the per-cgroup
+/// [`CgroupStats::iterations_per_cpu_sec`] None-on-zero (`total_cpu_time_ns >
+/// 0` implies `num_workers > 0`, so the one predicate covers both). Crediting
+/// an unmeasured cgroup's iterations against the measured cgroups' CPU-seconds
+/// would overstate cohort efficiency — the silent-wrong-answer this gate
+/// prevents. Both components are inserted both-or-neither (the
+/// `derive_rate_metrics` co-location invariant), only when the summed MEASURED
+/// on-CPU time is > 0 (every cgroup unmeasured ⇒ no rate). The ns→s `/1e9` is
+/// applied ONCE here on the summed ns (not per-cgroup, to avoid repeated float
+/// rounding), since `derive_rate_metrics` is a bare num/den.
+/// `total_iterations_pooled` is a DISTINCT ext-only key, not the typed
+/// `total_iterations` (skipped from ext_metrics; it folds cross-RUN as a MEAN
+/// — a display average — while a Rate numerator must SUM-fold so Σnum/Σdenom
+/// re-pools, so one shared key cannot carry both folds). Because it sums only
+/// MEASURED cgroups, it is ≤ the merge-summed typed `total_iterations` (which
+/// includes any zero-cpu-time cgroups), and equals it unless an excluded
+/// zero-cpu-time cgroup carried iterations>0.
+pub fn populate_run_pooled_iterations_per_cpu_sec(stats: &mut ScenarioStats) {
+    // Exclude cgroups with no measured on-CPU time from BOTH sums (mirrors the
+    // per-cgroup None-on-zero): crediting an unmeasured cgroup's iterations
+    // against the measured cgroups' CPU-seconds would overstate efficiency.
+    let summed_ns: u64 = stats
+        .cgroups
+        .iter()
+        .filter(|c| c.total_cpu_time_ns > 0)
+        .map(|c| c.total_cpu_time_ns)
+        .sum();
+    if summed_ns == 0 {
+        return;
+    }
+    let summed_iters: u64 = stats
+        .cgroups
+        .iter()
+        .filter(|c| c.total_cpu_time_ns > 0)
+        .map(|c| c.total_iterations)
+        .sum();
+    stats
+        .ext_metrics
+        .insert("total_iterations_pooled".to_string(), summed_iters as f64);
+    stats
+        .ext_metrics
+        .insert("total_cpu_time_sec".to_string(), summed_ns as f64 / 1e9);
+    crate::stats::derive_rate_metrics(&mut stats.ext_metrics);
+}
+
 /// Populate cross-RUN aggregate entries for every registered
 /// `crate::stats::MetricDef` whose `read_sample` returns finite
 /// values across the entire sample series. Writes into
@@ -2433,14 +2499,16 @@ pub fn populate_run_ext_metrics(
 /// components are summed in, not zero-weighted out — the run-aggregate
 /// completion of the per-step #4 fix) and re-derives the rate. The
 /// cross-sidecar-run rollup `group_and_average_by` likewise re-pools via
-/// its `derive_rate_metrics` post-pass. The cross-cgroup axis is NOT yet
-/// re-pooled: `AssertResult::merge`'s `ext_metrics` fold is a worst-case
-/// polarity min/max fold (correct for the `worst_*` family), but in the
-/// current data flow iteration_rate and its two components are host-injected
-/// by `populate_run_ext_metrics_from_phases` (the eval layer) AFTER the
-/// cross-cgroup `merge`, so that fold never sees them. A cross-cgroup
-/// Σnum/Σdenom re-pool would require lifting the components into the merge
-/// (or injecting them before it) — the deferred follow-up.
+/// its `derive_rate_metrics` post-pass. `iteration_rate` has no cross-cgroup
+/// axis to re-pool: it is derived from run-level phase buckets and
+/// host-injected into the run `ext_metrics` by
+/// `populate_run_ext_metrics_from_phases` (the eval layer) AFTER the
+/// cross-cgroup `merge`, so `AssertResult::merge`'s worst-case polarity
+/// min/max `ext_metrics` fold (correct for the `worst_*` family) never sees
+/// its components. The rate whose components ARE per-cgroup is the separate
+/// pooled `iterations_per_cpu_sec`, re-pooled across a run's cgroups by
+/// `populate_run_pooled_iterations_per_cpu_sec` (reading `stats.cgroups`
+/// post-merge).
 ///
 /// Live caller: `evaluate_vm_result` at `src/test_support/eval/mod.rs`
 /// — has both the SampleSeries and the stimulus_events vec in scope.

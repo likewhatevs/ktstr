@@ -176,20 +176,23 @@ pub enum MetricKind {
     /// whose quotient is the intended rate unit (the component
     /// registration owns the unit choice; this variant does not scale).
     ///
-    /// `derive_rate_metrics` runs as a post-pass at the six aggregation
+    /// `derive_rate_metrics` runs as a post-pass at the seven aggregation
     /// sites where the components co-locate in one map: the two per-phase
     /// builds (`buckets_from_grouped`, `build_phase_buckets_with_stimulus`),
-    /// the cross-phase bucket merge (`merge_matched_phase_buckets`), and
-    /// the three cross-RUN ext-metrics reducers (`populate_run_ext_metrics`,
-    /// `populate_run_ext_metrics_from_phases`, and `group_and_average_by`).
-    /// The cross-CGROUP `AssertResult::merge` ext-metrics fold uses
-    /// worst-case polarity (min/max) and is NOT a re-pool site. The first
-    /// registered Rate (`iteration_rate`) does not exercise it: it and its
-    /// components are host-injected by
-    /// `populate_run_ext_metrics_from_phases` AFTER the cross-cgroup
-    /// `merge`, so the fold never sees them. A cross-cgroup re-pool (lifting
-    /// the components into the merge, or injecting them before it) is the
-    /// deferred follow-up.
+    /// the cross-phase bucket merge (`merge_matched_phase_buckets`), the
+    /// three cross-RUN ext-metrics reducers (`populate_run_ext_metrics`,
+    /// `populate_run_ext_metrics_from_phases`, and `group_and_average_by`),
+    /// and the cross-CGROUP pooled re-pool
+    /// (`crate::assert::populate_run_pooled_iterations_per_cpu_sec`).
+    /// The cross-CGROUP `AssertResult::merge` ext-metrics fold itself uses
+    /// worst-case polarity (min/max) and is NOT a re-pool site; the pooled
+    /// re-pool runs separately after it, at the eval layer, reading
+    /// `stats.cgroups` directly. `iteration_rate` does not exercise the merge
+    /// fold either: it and its components are host-injected by
+    /// `populate_run_ext_metrics_from_phases` AFTER the cross-cgroup `merge`,
+    /// so the fold never sees them. The pooled `iterations_per_cpu_sec` is the
+    /// rate whose components ARE per-cgroup, and
+    /// `populate_run_pooled_iterations_per_cpu_sec` re-pools it post-merge.
     ///
     /// Because a single sample slice cannot express the re-pool, a Rate is
     /// FORBIDDEN from the single-slice reducers ([`aggregate_finite`]
@@ -518,17 +521,20 @@ pub fn phase_counter_delta(samples: &[f64]) -> Option<f64> {
 /// `metrics[rate] = metrics[numerator] / metrics[denominator]`.
 ///
 /// This is the SOLE producer of a Rate metric's value. It runs as a
-/// post-pass at six aggregation sites where the components co-locate in
-/// one map: the two per-phase builds, the cross-phase bucket merge, and
-/// the three cross-RUN ext-metrics reducers (`populate_run_ext_metrics`,
-/// `populate_run_ext_metrics_from_phases`, `group_and_average_by`). At
-/// each, the components are
+/// post-pass at seven aggregation sites where the components co-locate in
+/// one map: the two per-phase builds, the cross-phase bucket merge, the
+/// three cross-RUN ext-metrics reducers (`populate_run_ext_metrics`,
+/// `populate_run_ext_metrics_from_phases`, `group_and_average_by`), and the
+/// cross-CGROUP pooled re-pool
+/// (`crate::assert::populate_run_pooled_iterations_per_cpu_sec`, run
+/// post-`merge` at the eval layer to re-pool `iterations_per_cpu_sec` across a
+/// run's cgroups). At each, the components are
 /// pooled FIRST by their own kinds (a `Counter` numerator summed), then
 /// the rate is re-derived — so for `Counter / Counter` the result is
 /// `Σnumerator / Σdenominator`, the correct re-pool rather than a mean of
 /// ready-made ratios. (The cross-CGROUP `AssertResult::merge` ext-metrics
-/// fold uses worst-case polarity and is NOT a derive site — see
-/// [`MetricKind::Rate`].)
+/// fold itself uses worst-case polarity and is NOT a derive site — the
+/// pooled re-pool above runs separately after it; see [`MetricKind::Rate`].)
 ///
 /// A rate is skipped (its key left absent) when either component key is
 /// missing, the denominator is zero, or either component is non-finite —
@@ -1051,6 +1057,78 @@ pub static METRICS: &[MetricDef] = &[
         accessor: |_| None,
     },
     MetricDef {
+        // Run-level POOLED CPU-seconds — the DENOMINATOR component of the
+        // pooled `iterations_per_cpu_sec` Rate. ext_metrics-only (accessor
+        // |_| None): populate_run_pooled_iterations_per_cpu_sec sums the
+        // MEASURED cgroups' CgroupStats.total_cpu_time_ns (total_cpu_time_ns >
+        // 0) and inserts the ns→s value (= Σns / 1e9) at the post-merge eval
+        // site. The measured-only filter leaves this denominator unchanged
+        // (excluded cgroups contribute 0 ns) — it matters for the numerator,
+        // whose excluded cgroups carry nonzero iterations. The /1e9 lives
+        // there (NOT in derive_rate_metrics, which does a bare num/den),
+        // applied ONCE on the summed ns. `total_` prefix satisfies the Counter
+        // gate.
+        name: "total_cpu_time_sec",
+        polarity: crate::test_support::Polarity::HigherBetter,
+        kind: MetricKind::Counter,
+        default_abs: 1.0,
+        default_rel: 0.30,
+        display_unit: "s",
+        accessor: |_| None,
+    },
+    MetricDef {
+        // Run-level POOLED iteration count — the NUMERATOR component of the
+        // pooled `iterations_per_cpu_sec` Rate, summed over cgroups with
+        // MEASURED cpu-time (total_cpu_time_ns > 0). ext_metrics-only,
+        // DISTINCT from the typed `total_iterations` Counter on purpose: the
+        // typed field is skipped from ext_metrics (TYPED_FIELD_NAMES) and folds
+        // cross-RUN as a MEAN (group_and_average_by's round_u64 divides the
+        // accumulated sum by the contributor count — a display average), while
+        // a Rate numerator must fold cross-RUN as a SUM (aggregate_finite
+        // Counter arm, no divide) so Σnum/Σdenom re-pools. One shared key
+        // cannot carry both folds, so the numerator gets its own ext key. It
+        // also sums only MEASURED cgroups, where the typed field's per-RUN
+        // cross-cgroup merge sums ALL cgroups — so it equals the merge-summed
+        // typed total_iterations unless an excluded (zero-cpu-time) cgroup
+        // carried iterations>0, in which case it is LESS.
+        // `total_` prefix satisfies the Counter naming gate.
+        name: "total_iterations_pooled",
+        polarity: crate::test_support::Polarity::HigherBetter,
+        kind: MetricKind::Counter,
+        default_abs: 100.0,
+        default_rel: 0.10,
+        display_unit: "",
+        accessor: |_| None,
+    },
+    MetricDef {
+        // Run-level cohort CPU-time EFFICIENCY pooled across cgroups (and
+        // re-pooled across runs): Σiterations / Σcpu-seconds. MetricKind::Rate
+        // over the two Counter components above; derive_rate_metrics re-derives
+        // it = Σtotal_iterations_pooled / Σtotal_cpu_time_sec at every level.
+        // Distinct from the per-cgroup `worst_iterations_per_cpu_sec` Gauge
+        // (the min-fold starvation selector): this is the POOLED cohort rate,
+        // overcommit-invariant. _per_cpu_sec name + Rate kind passes the
+        // reverse naming gate; ext_metrics-only (accessor |_| None).
+        //
+        // SAME physical quantity as worst_iterations_per_cpu_sec (iter/CPU-s
+        // efficiency), so it shares that sibling's compare thresholds:
+        // default_rel=0.10 (a 10% efficiency change is the regression signal)
+        // and default_abs=10.0 (near-zero anti-jitter floor — a real busy
+        // workload's rate is orders of magnitude larger). NOT the looser
+        // iteration_rate throughput gate (rel=0.30), which would silently
+        // swallow a 10-29% efficiency regression the per-cgroup row flags.
+        name: "iterations_per_cpu_sec",
+        polarity: crate::test_support::Polarity::HigherBetter,
+        kind: MetricKind::Rate {
+            numerator: "total_iterations_pooled",
+            denominator: "total_cpu_time_sec",
+        },
+        default_abs: 10.0,
+        default_rel: 0.10,
+        display_unit: "iter/cpu-s",
+        accessor: |_| None,
+    },
+    MetricDef {
         // Per-phase SYSTEM (in-kernel) CPU time in nanoseconds. Read
         // host-side from frozen task_struct.stime + the thread-group
         // signal_struct.stime accumulator (zero guest work). Injected
@@ -1201,7 +1279,9 @@ pub static METRICS: &[MetricDef] = &[
         kind: MetricKind::Gauge(GaugeAgg::Last),
         default_abs: 10.0,
         default_rel: 0.10,
-        display_unit: "",
+        // Same physical quantity as the pooled iterations_per_cpu_sec Rate;
+        // share its unit string rather than leaving this one under-specified.
+        display_unit: "iter/cpu-s",
         accessor: |r| Some(r.worst_iterations_per_cpu_sec),
     },
     MetricDef {
@@ -7848,6 +7928,36 @@ mod tests {
         assert_eq!(names.len(), len);
     }
 
+    /// Registry integrity: every `MetricKind::Rate`'s numerator and
+    /// denominator MUST name a registered `Counter` metric. `derive_rate_metrics`
+    /// silently skips a Rate whose component key is absent from the map
+    /// (`derive_rate_metrics_from` `continue`s on a missing key), so a typo'd
+    /// component name would never derive and never fail a value test — pin the
+    /// names at the registry level instead. Counter (not Gauge/Peak) because the
+    /// re-pool needs Σnum/Σdenom (sum-fold), which only the Counter kind gives.
+    #[test]
+    fn every_rate_metric_has_registered_counter_components() {
+        for m in METRICS.iter() {
+            let MetricKind::Rate {
+                numerator,
+                denominator,
+            } = m.kind
+            else {
+                continue;
+            };
+            for (role, comp) in [("numerator", numerator), ("denominator", denominator)] {
+                let def = metric_def(comp).unwrap_or_else(|| {
+                    panic!("Rate {} {role} {comp:?} is not a registered metric", m.name)
+                });
+                assert!(
+                    matches!(def.kind, MetricKind::Counter),
+                    "Rate {} {role} {comp:?} must be a Counter for the Σ-fold re-pool",
+                    m.name,
+                );
+            }
+        }
+    }
+
     // -- list_metrics tests --
 
     /// Text-mode [`list_metrics`] emits a table that names every
@@ -10887,6 +10997,122 @@ mod tests {
         assert!(
             (mean - 25.0).abs() < f64::EPSILON,
             "expected weighted mean 25.0, got {mean}",
+        );
+    }
+
+    /// Cross-RUN re-pool of the pooled `iterations_per_cpu_sec` Rate:
+    /// `group_and_average_by` SKIPS folding the Rate itself and re-derives it
+    /// from the folded Counter components (`total_iterations_pooled`,
+    /// `total_cpu_time_sec`). Registered Counters fold cross-RUN as a SUM
+    /// (`aggregate_finite` Counter arm = `finite.iter().sum()`, weight
+    /// ignored), so the components sum to Σnum / Σdenom = 1010 / 10.0 = 101.0 —
+    /// the true pooled rate, count-invariant, NOT the mean-of-per-run-ratios
+    /// (~500.6). The two components are co-inserted both-or-neither, so they
+    /// always share a contributor set; the SUM fold makes the rate identical
+    /// regardless of contributor count. The folded-COMPONENT assertions below
+    /// discriminate the SUM fold from a (wrong) hypothetical mean fold — the
+    /// rate value alone cannot, because Σ/Σ equals mean/mean when the
+    /// contributor count is equal (the N cancels); the component assertions
+    /// below discriminate. A stale per-run rate value is discarded by the
+    /// skip-then-derive path.
+    #[test]
+    fn group_and_average_repools_iterations_per_cpu_sec_from_components() {
+        let mut a = make_row("t", "tiny-1llc", true, 0.0);
+        a.ext_metrics
+            .insert("total_iterations_pooled".to_string(), 1000.0);
+        a.ext_metrics.insert("total_cpu_time_sec".to_string(), 1.0);
+        // A stale per-run rate must be DISCARDED (a Rate is derived, never
+        // folded from its own samples).
+        a.ext_metrics
+            .insert("iterations_per_cpu_sec".to_string(), 999.0);
+        let mut b = make_row("t", "tiny-1llc", true, 0.0);
+        b.ext_metrics
+            .insert("total_iterations_pooled".to_string(), 10.0);
+        b.ext_metrics.insert("total_cpu_time_sec".to_string(), 9.0);
+        b.ext_metrics
+            .insert("iterations_per_cpu_sec".to_string(), 999.0);
+        let out = group_and_average_by(&[a, b], LEGACY_PAIRING_DIMS);
+        assert_eq!(out.len(), 1);
+        // Components fold as SUM (1000+10, 1.0+9.0), NOT mean (505, 5.0) — this
+        // is what discriminates the fold mechanism the derived rate cannot.
+        assert_eq!(
+            out[0]
+                .row
+                .ext_metrics
+                .get("total_iterations_pooled")
+                .copied(),
+            Some(1010.0),
+            "numerator component folds cross-run as SUM (1010), not mean (505)",
+        );
+        assert_eq!(
+            out[0].row.ext_metrics.get("total_cpu_time_sec").copied(),
+            Some(10.0),
+            "denominator component folds cross-run as SUM (10.0), not mean (5.0)",
+        );
+        let rate = out[0]
+            .row
+            .ext_metrics
+            .get("iterations_per_cpu_sec")
+            .copied()
+            .expect("re-derived pooled rate present");
+        // Σnum / Σdenom = 1010 / 10.0 = 101.0.
+        assert!(
+            (rate - 101.0).abs() < 1e-9,
+            "cross-run pooled rate must re-derive to Σ/Σ = 101.0, not the \
+             mean-of-ratios (~500.6) or the stale 999.0; got {rate}",
+        );
+    }
+
+    /// Cross-RUN count-invariance vs a key-ABSENT run: two key-bearing passing
+    /// runs PLUS a third passing run with NO pooled component keys (all its
+    /// cgroups unmeasured, so populate_run_pooled_iterations_per_cpu_sec
+    /// inserted neither). The components SUM over the runs that carry them
+    /// (aggregate_finite Counter arm folds the present (value, weight) pairs),
+    /// so the key-absent run contributes NOTHING — the folded components and
+    /// the derived rate are identical to the two-run cohort. Asserting the
+    /// components (1010, 10.0 — NOT a mean-over-all-three 336.7, 3.33) guards
+    /// against a future regression that diluted the fold by treating a
+    /// key-absent run as a contributor (which a mean-over-all-runs fold would).
+    #[test]
+    fn group_and_average_pooled_rate_unaffected_by_key_absent_run() {
+        let mut a = make_row("t", "tiny-1llc", true, 0.0);
+        a.ext_metrics
+            .insert("total_iterations_pooled".to_string(), 1000.0);
+        a.ext_metrics.insert("total_cpu_time_sec".to_string(), 1.0);
+        let mut b = make_row("t", "tiny-1llc", true, 0.0);
+        b.ext_metrics
+            .insert("total_iterations_pooled".to_string(), 10.0);
+        b.ext_metrics.insert("total_cpu_time_sec".to_string(), 9.0);
+        // Third PASSING run with NO pooled component keys (all cgroups
+        // unmeasured — populate_run_pooled inserted neither key).
+        let c = make_row("t", "tiny-1llc", true, 0.0);
+        let out = group_and_average_by(&[a, b, c], LEGACY_PAIRING_DIMS);
+        assert_eq!(out.len(), 1);
+        // Components SUM over the two key-bearing runs only; the key-absent
+        // run contributes nothing — NOT diluted to (1010)/3 or (10.0)/3.
+        assert_eq!(
+            out[0]
+                .row
+                .ext_metrics
+                .get("total_iterations_pooled")
+                .copied(),
+            Some(1010.0),
+            "key-absent run must not dilute the summed numerator",
+        );
+        assert_eq!(
+            out[0].row.ext_metrics.get("total_cpu_time_sec").copied(),
+            Some(10.0),
+            "key-absent run must not dilute the summed denominator",
+        );
+        // Rate identical to the two-run cohort: Σ/Σ = 1010/10.0 = 101.0.
+        assert_eq!(
+            out[0]
+                .row
+                .ext_metrics
+                .get("iterations_per_cpu_sec")
+                .copied(),
+            Some(101.0),
+            "key-absent run must not change the pooled rate (count-invariant)",
         );
     }
 

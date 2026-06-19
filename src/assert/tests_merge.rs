@@ -368,6 +368,324 @@ fn merge_worst_iterations_per_cpu_sec_lowest_wins_none_aware() {
     assert_eq!(acc.stats.worst_iterations_per_cpu_sec, Some(0.0));
 }
 
+/// The POOLED `iterations_per_cpu_sec` Rate (the cross-cgroup re-pool) is
+/// Σiterations / Σcpu-seconds across cgroups — NOT a mean of per-cgroup
+/// ratios, NOT the worst single cgroup. Unequal per-cgroup cpu-time makes
+/// the three distinct: re-pool 101.0 vs mean-of-ratios ~500.6 vs worst ~1.11
+/// (the value the rejected merge-fold route would wrongly produce). The new
+/// pooled metric must NOT mutate the existing worst_iterations_per_cpu_sec
+/// (the min-fold starvation selector).
+#[test]
+fn populate_run_pooled_iterations_per_cpu_sec_repools_across_cgroups() {
+    // cg1: 1000 iters over 1.0 cpu-s -> 1000/cpu-s.
+    let cg1 = CgroupStats {
+        total_iterations: 1000,
+        total_cpu_time_ns: 1_000_000_000,
+        num_workers: 1,
+        ..CgroupStats::default()
+    };
+    // cg2: 10 iters over 9.0 cpu-s -> ~1.11/cpu-s.
+    let cg2 = CgroupStats {
+        total_iterations: 10,
+        total_cpu_time_ns: 9_000_000_000,
+        num_workers: 1,
+        ..CgroupStats::default()
+    };
+    let stats_for = |cg: &CgroupStats| ScenarioStats {
+        total_iterations: cg.total_iterations,
+        worst_iterations_per_cpu_sec: cg.iterations_per_cpu_sec(),
+        cgroups: vec![cg.clone()],
+        ..ScenarioStats::default()
+    };
+    let mk = |cg: &CgroupStats| AssertResult {
+        outcomes: vec![],
+        passes: vec![],
+        stats: stats_for(cg),
+        measurements: std::collections::BTreeMap::new(),
+        info_notes: vec![],
+    };
+    let mut acc = mk(&cg1);
+    acc.merge(mk(&cg2));
+    populate_run_pooled_iterations_per_cpu_sec(&mut acc.stats);
+
+    // Σiters / Σcpu-s = (1000 + 10) / ((1e9 + 9e9)/1e9) = 1010 / 10.0 = 101.0.
+    assert_eq!(
+        acc.stats.ext_metrics.get("iterations_per_cpu_sec").copied(),
+        Some(101.0),
+        "pooled rate must be Σiters/Σcpu-s = 101.0, NOT mean-of-ratios \
+         (~500.6) or the worst cgroup (~1.11); got {:?}",
+        acc.stats.ext_metrics.get("iterations_per_cpu_sec"),
+    );
+    // BOTH cgroups have measured cpu-time, so the ext-only pooled numerator
+    // equals the merge-summed typed total_iterations (both Σ over all
+    // cgroups). They diverge only when a zero-cpu-time cgroup is excluded from
+    // the pooled sum — see populate_run_pooled_..._excludes_zero_cpu_cgroup.
+    assert_eq!(acc.stats.total_iterations, 1010);
+    assert_eq!(
+        acc.stats
+            .ext_metrics
+            .get("total_iterations_pooled")
+            .copied(),
+        Some(acc.stats.total_iterations as f64),
+        "total_iterations_pooled must equal the merge-summed typed total_iterations \
+         when every cgroup is measured",
+    );
+    // The existing worst_iterations_per_cpu_sec (min-fold starvation
+    // selector) is UNCHANGED by the new pooled metric: the lower per-cgroup
+    // rate (cg2's 10/9) wins.
+    let worst = acc
+        .stats
+        .worst_iterations_per_cpu_sec
+        .expect("worst_iterations_per_cpu_sec present");
+    assert!(
+        (worst - 10.0 / 9.0).abs() < 1e-9,
+        "worst_iterations_per_cpu_sec stays the min-fold selector (~1.11), \
+         not mutated by the pooled metric; got {worst}",
+    );
+}
+
+/// Host-only / no-schedstat run: every cgroup reports zero on-CPU time, so
+/// the pooled rate is undefined. The helper inserts NEITHER component
+/// (both-or-neither) so no rate derives — matching
+/// `CgroupStats::iterations_per_cpu_sec`'s None-on-zero.
+#[test]
+fn populate_run_pooled_iterations_per_cpu_sec_absent_on_zero_cpu_time() {
+    let cg = CgroupStats {
+        total_iterations: 500,
+        total_cpu_time_ns: 0,
+        num_workers: 1,
+        ..CgroupStats::default()
+    };
+    let mut acc = AssertResult {
+        outcomes: vec![],
+        passes: vec![],
+        stats: ScenarioStats {
+            total_iterations: cg.total_iterations,
+            cgroups: vec![cg],
+            ..ScenarioStats::default()
+        },
+        measurements: std::collections::BTreeMap::new(),
+        info_notes: vec![],
+    };
+    populate_run_pooled_iterations_per_cpu_sec(&mut acc.stats);
+    assert!(
+        !acc.stats.ext_metrics.contains_key("iterations_per_cpu_sec"),
+        "no pooled rate when Σcpu-time is 0",
+    );
+    assert!(
+        !acc.stats.ext_metrics.contains_key("total_cpu_time_sec")
+            && !acc
+                .stats
+                .ext_metrics
+                .contains_key("total_iterations_pooled"),
+        "both-or-neither: neither component inserted when Σcpu-time is 0",
+    );
+}
+
+/// Mixed run: one cgroup has iterations but ZERO measured cpu-time (schedstat
+/// gap), the other has both. The zero-cpu cgroup is EXCLUDED from BOTH pooled
+/// sums (mirroring the per-cgroup None-on-zero) — its iterations are NOT
+/// credited against the measured cgroup's cpu-seconds, which would inflate the
+/// cohort efficiency. So the pooled rate is the measured cgroup's rate, and
+/// total_iterations_pooled (measured only) is strictly LESS than the
+/// merge-summed typed total_iterations (which includes both).
+#[test]
+fn populate_run_pooled_iterations_per_cpu_sec_excludes_zero_cpu_cgroup() {
+    // Unmeasured: 500 iters, 0 cpu-time (schedstat unavailable).
+    let unmeasured = CgroupStats {
+        total_iterations: 500,
+        total_cpu_time_ns: 0,
+        num_workers: 1,
+        ..CgroupStats::default()
+    };
+    // Measured: 1000 iters over 1.0 cpu-s -> 1000/cpu-s.
+    let measured = CgroupStats {
+        total_iterations: 1000,
+        total_cpu_time_ns: 1_000_000_000,
+        num_workers: 1,
+        ..CgroupStats::default()
+    };
+    let mk = |cg: &CgroupStats| AssertResult {
+        outcomes: vec![],
+        passes: vec![],
+        stats: ScenarioStats {
+            total_iterations: cg.total_iterations,
+            cgroups: vec![cg.clone()],
+            ..ScenarioStats::default()
+        },
+        measurements: std::collections::BTreeMap::new(),
+        info_notes: vec![],
+    };
+    let mut acc = mk(&unmeasured);
+    acc.merge(mk(&measured));
+    populate_run_pooled_iterations_per_cpu_sec(&mut acc.stats);
+
+    // Pooled rate excludes the zero-cpu cgroup: 1000 / 1.0 == 1000.0, NOT
+    // (500 + 1000) / 1.0 == 1500.0 (which would credit un-costed iters).
+    assert_eq!(
+        acc.stats.ext_metrics.get("iterations_per_cpu_sec").copied(),
+        Some(1000.0),
+        "zero-cpu cgroup's iters must NOT inflate the pooled rate; got {:?}",
+        acc.stats.ext_metrics.get("iterations_per_cpu_sec"),
+    );
+    // The pooled numerator counts only the measured cgroup (1000) and is
+    // strictly LESS than the merge-summed typed total_iterations (1500).
+    assert_eq!(
+        acc.stats
+            .ext_metrics
+            .get("total_iterations_pooled")
+            .copied(),
+        Some(1000.0),
+    );
+    assert_eq!(acc.stats.total_iterations, 1500);
+}
+
+/// Single measured cgroup: the pooled rate is exactly that cgroup's per-cgroup
+/// rate (degenerate Σ over one element).
+#[test]
+fn populate_run_pooled_iterations_per_cpu_sec_single_cgroup() {
+    let cg = CgroupStats {
+        total_iterations: 750,
+        total_cpu_time_ns: 3_000_000_000,
+        num_workers: 1,
+        ..CgroupStats::default()
+    };
+    let mut acc = AssertResult {
+        outcomes: vec![],
+        passes: vec![],
+        stats: ScenarioStats {
+            total_iterations: cg.total_iterations,
+            cgroups: vec![cg.clone()],
+            ..ScenarioStats::default()
+        },
+        measurements: std::collections::BTreeMap::new(),
+        info_notes: vec![],
+    };
+    populate_run_pooled_iterations_per_cpu_sec(&mut acc.stats);
+    // 750 / 3.0 == 250.0 == the per-cgroup rate.
+    assert_eq!(
+        acc.stats.ext_metrics.get("iterations_per_cpu_sec").copied(),
+        cg.iterations_per_cpu_sec(),
+    );
+    assert_eq!(
+        acc.stats.ext_metrics.get("iterations_per_cpu_sec").copied(),
+        Some(250.0),
+    );
+}
+
+/// Empty cgroups vec: nothing to pool, no keys inserted (both-or-neither).
+#[test]
+fn populate_run_pooled_iterations_per_cpu_sec_empty_cgroups() {
+    let mut stats = ScenarioStats::default();
+    populate_run_pooled_iterations_per_cpu_sec(&mut stats);
+    assert!(
+        stats.ext_metrics.is_empty(),
+        "no components inserted for an empty cgroups vec",
+    );
+}
+
+/// Costed-yet-idle cgroup INCLUDED in both sums (the symmetric counterpart of
+/// excludes_zero_cpu_cgroup): a cgroup with measured cpu-time but ZERO
+/// iterations (a stalled/spinning worker that burned CPU doing no work). The
+/// filter gates on total_cpu_time_ns > 0 (NOT on iterations), so this cgroup IS
+/// included — its CPU adds to the denominator and its 0 iters add nothing to
+/// the numerator, correctly diluting the cohort rate downward (burning CPU with
+/// no work IS less efficient).
+#[test]
+fn populate_run_pooled_iterations_per_cpu_sec_includes_costed_idle_cgroup() {
+    // Costed but idle: 0 iters over 2.0 cpu-s.
+    let idle = CgroupStats {
+        total_iterations: 0,
+        total_cpu_time_ns: 2_000_000_000,
+        num_workers: 1,
+        ..CgroupStats::default()
+    };
+    // Productive: 1000 iters over 1.0 cpu-s.
+    let busy = CgroupStats {
+        total_iterations: 1000,
+        total_cpu_time_ns: 1_000_000_000,
+        num_workers: 1,
+        ..CgroupStats::default()
+    };
+    let mk = |cg: &CgroupStats| AssertResult {
+        outcomes: vec![],
+        passes: vec![],
+        stats: ScenarioStats {
+            total_iterations: cg.total_iterations,
+            cgroups: vec![cg.clone()],
+            ..ScenarioStats::default()
+        },
+        measurements: std::collections::BTreeMap::new(),
+        info_notes: vec![],
+    };
+    let mut acc = mk(&idle);
+    acc.merge(mk(&busy));
+    populate_run_pooled_iterations_per_cpu_sec(&mut acc.stats);
+
+    // The idle cgroup's CPU MUST count: rate = 1000 / ((2e9+1e9)/1e9) = 1000/3.0
+    // == ~333.33, NOT 1000/1.0 == 1000 (which would ignore the wasted CPU).
+    let rate = acc
+        .stats
+        .ext_metrics
+        .get("iterations_per_cpu_sec")
+        .copied()
+        .expect("pooled rate present");
+    assert!(
+        (rate - 1000.0 / 3.0).abs() < 1e-9,
+        "costed-idle cgroup's CPU must dilute the rate to ~333.33, not 1000; got {rate}",
+    );
+    // Numerator = 0 + 1000; denominator counts the idle cgroup's 2.0s too.
+    assert_eq!(
+        acc.stats
+            .ext_metrics
+            .get("total_iterations_pooled")
+            .copied(),
+        Some(1000.0),
+    );
+    assert_eq!(
+        acc.stats.ext_metrics.get("total_cpu_time_sec").copied(),
+        Some(3.0),
+    );
+}
+
+/// Tiny-denominator finite-quotient guard: a cgroup with total_cpu_time_ns=1
+/// (total_cpu_time_sec = 1e-9) and a large iteration count yields a
+/// finite-but-enormous rate (~1e12). derive_rate_metrics_from's finite guard
+/// KEEPS it — an absent rate is reserved for a zero or non-finite denominator,
+/// not a tiny one — and the pooled wrapper feeds that same guard. (u64-summed
+/// ns cannot overflow within centuries, so no overflow case is reachable.)
+#[test]
+fn populate_run_pooled_iterations_per_cpu_sec_tiny_denominator_stays_finite() {
+    let cg = CgroupStats {
+        total_iterations: 1000,
+        total_cpu_time_ns: 1,
+        num_workers: 1,
+        ..CgroupStats::default()
+    };
+    let mut acc = AssertResult {
+        outcomes: vec![],
+        passes: vec![],
+        stats: ScenarioStats {
+            total_iterations: cg.total_iterations,
+            cgroups: vec![cg],
+            ..ScenarioStats::default()
+        },
+        measurements: std::collections::BTreeMap::new(),
+        info_notes: vec![],
+    };
+    populate_run_pooled_iterations_per_cpu_sec(&mut acc.stats);
+    let rate = acc
+        .stats
+        .ext_metrics
+        .get("iterations_per_cpu_sec")
+        .copied()
+        .expect("tiny-denom rate present (finite, not dropped)");
+    assert!(
+        rate.is_finite() && rate > 0.0,
+        "tiny-denom rate must be finite-but-enormous (~1e12), not inf/absent; got {rate}",
+    );
+}
+
 #[test]
 fn merge_scenario_stats_worst_wins_and_iterations_sum() {
     // Aggregates-across-cgroups contract: every `worst_*` field on

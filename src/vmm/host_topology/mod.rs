@@ -1801,7 +1801,7 @@ pub(crate) fn overcommit_warning(
              ({oversub:.1}x oversubscription, opt-in): the host time-slices the \
              vCPU threads, so absolute iterations scale ~1/{oversub:.0} and \
              guest-scheduler timing metrics (run_delay, off-CPU, wake latency, \
-             gaps) are host-contention artifacts. Use iterations_per_cpu_sec \
+             gaps) are host-contention artifacts. Use worst_iterations_per_cpu_sec \
              for an overcommit-invariant per-cgroup rate."
         )
     } else {

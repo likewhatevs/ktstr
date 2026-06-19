@@ -1839,6 +1839,15 @@ fn evaluate_vm_result(
             &check_result.stats.phases,
             &mut check_result.stats.ext_metrics,
         );
+        // Pooled cross-cgroup CPU-time efficiency (the cross-cgroup re-pool):
+        // sum total_iterations / total_cpu_time over the MEASURED merged
+        // cgroups (those with on-CPU time; mirrors the per-cgroup None-on-zero)
+        // and derive iterations_per_cpu_sec. MUST run here — AFTER the
+        // cgroup-bearing merges (check_result.stats.cgroups is complete) and
+        // BEFORE the sidecar write — so the worst-by-polarity merge fold never
+        // sees its components. The trailing monitor-verdict merge below is
+        // verdict-only (inconclusive with empty stats), so it is safe to follow.
+        crate::assert::populate_run_pooled_iterations_per_cpu_sec(&mut check_result.stats);
 
         // Write sidecar before checking pass/fail so both outcomes are captured.
         // A sidecar write failure is logged but not propagated: the test

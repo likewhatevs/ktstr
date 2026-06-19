@@ -538,6 +538,15 @@ fn sidecar_result_roundtrip_all_fields_round_trip() {
                 ..Default::default()
             }],
             total_workers: 3,
+            // ext_metrics carries the derived Rates + their Counter components
+            // (e.g. the pooled iterations_per_cpu_sec re-pool); it is the
+            // durable surface every cross-run compare reads, so it MUST survive
+            // sidecar serialize -> deserialize.
+            ext_metrics: std::collections::BTreeMap::from([
+                ("iterations_per_cpu_sec".to_string(), 101.0),
+                ("total_iterations_pooled".to_string(), 1010.0),
+                ("total_cpu_time_sec".to_string(), 10.0),
+            ]),
             ..Default::default()
         },
         monitor: Some(MonitorSummary {
@@ -620,6 +629,30 @@ fn sidecar_result_roundtrip_all_fields_round_trip() {
     assert_eq!(loaded.stats.total_workers, 3);
     assert_eq!(loaded.stats.cgroups.len(), 1);
     assert_eq!(loaded.stats.cgroups[0].num_workers, 3);
+    // ext_metrics (the pooled iterations_per_cpu_sec Rate + its Counter
+    // components) must round-trip — the sidecar is the durable surface every
+    // cross-run `stats compare` reads.
+    assert_eq!(
+        loaded
+            .stats
+            .ext_metrics
+            .get("iterations_per_cpu_sec")
+            .copied(),
+        Some(101.0),
+        "pooled rate must survive sidecar serialization",
+    );
+    assert_eq!(
+        loaded
+            .stats
+            .ext_metrics
+            .get("total_iterations_pooled")
+            .copied(),
+        Some(1010.0),
+    );
+    assert_eq!(
+        loaded.stats.ext_metrics.get("total_cpu_time_sec").copied(),
+        Some(10.0),
+    );
     let mon = loaded.monitor.expect("monitor round-trips");
     assert_eq!(mon.total_samples, 17);
     assert_eq!(loaded.stimulus_events.len(), 1);
