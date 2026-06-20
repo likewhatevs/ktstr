@@ -1350,14 +1350,14 @@ pub struct AssertResult {
 /// Pre-1.0 cleanup eliminated the prior stored-field shadow and
 /// `derive_ratios` stamper. Consumers always recompute on read,
 /// so a hand-constructed fixture or a deserialized sidecar from an
-/// older build cannot silently carry a stale ratio. The
-/// [`ScenarioStats::worst_wake_latency_tail_ratio`] roll-up aggregates
-/// [`Self::wake_latency_tail_ratio`] over per-cgroup [`Self`] entries during
-/// [`AssertResult::merge`]; the iterations efficiencies
-/// (`worst_iterations_per_worker` / `worst_iterations_per_cpu_sec`) are
-/// instead re-pooled lowest-wins from [`Self::iterations_per_worker`] /
-/// [`Self::iterations_per_cpu_sec`] post-merge by
-/// [`populate_run_distribution_metrics`].
+/// older build cannot silently carry a stale ratio. The run-level
+/// worst-cgroup tail ratio (`crate::stats::MetricKind::WakeLatencyTailRatio`,
+/// an `ext_metrics` entry) and the iterations efficiencies
+/// (`worst_iterations_per_worker` / `worst_iterations_per_cpu_sec`) are all
+/// re-pooled POST-merge by [`populate_run_distribution_metrics`] — the tail
+/// ratio as the max over [`Self::wake_latency_tail_ratio`] across per-cgroup
+/// [`Self`] entries, the efficiencies lowest-wins from
+/// [`Self::iterations_per_worker`] / [`Self::iterations_per_cpu_sec`].
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize, crate::Claim)]
 pub struct CgroupStats {
     /// Cgroup name (the workload-handle label this telemetry belongs to),
@@ -2353,8 +2353,9 @@ fn merge_metric_values(
         // would lose the re-pool.
         Some(MetricKind::Rate { .. })
         | Some(MetricKind::Distribution { .. })
-        | Some(MetricKind::WorstLowest { .. }) => unreachable!(
-            "derived metrics (Rate/Distribution/WorstLowest) are produced post-merge, not merged as values"
+        | Some(MetricKind::WorstLowest { .. })
+        | Some(MetricKind::WakeLatencyTailRatio) => unreachable!(
+            "derived metrics (Rate/Distribution/WorstLowest/WakeLatencyTailRatio) are produced post-merge, not merged as values"
         ),
         // Unregistered metric: commutative mean fallback. Sum
         // would over-count Gauge values; max would lose Counter
@@ -2392,17 +2393,12 @@ pub struct ScenarioStats {
     pub worst_page_locality: f64,
     /// Worst cross-node migration ratio across cgroups (highest).
     pub worst_cross_node_migration_ratio: f64,
-    /// Worst wake-latency tail amplification across cgroups
-    /// (highest). Higher is worse — it is the ratio of p99 to
-    /// median, so a cgroup with a severe long tail drives this up.
-    /// Zero when every cgroup has `median_wake_latency_us == 0.0`
-    /// (no samples). Pairs with
-    /// [`CgroupStats::wake_latency_tail_ratio`] — see that field
-    /// for the unit/semantics rationale.
-    ///
-    /// Routed through `GauntletRow` and the `METRICS` registry;
-    /// `stats compare` surfaces this axis in its comparison rows.
-    pub worst_wake_latency_tail_ratio: f64,
+    // worst_wake_latency_tail_ratio is NO LONGER a typed field: it is
+    // `crate::stats::MetricKind::WakeLatencyTailRatio`, re-selected into
+    // `ext_metrics` post-merge by `populate_run_distribution_metrics` (max
+    // over the per-cgroup `CgroupStats::wake_latency_tail_ratio` values,
+    // floor-gated below WAKE_LATENCY_TAIL_RATIO_MIN_ITERATIONS); `MetricDef::read`
+    // surfaces it via the ext fallback.
     /// Extensible metrics for the generic comparison pipeline.
     /// Populated from per-cgroup ext_metrics (worst value across cgroups).
     pub ext_metrics: BTreeMap<String, f64>,
@@ -2667,10 +2663,12 @@ impl ScenarioStats {
     ///   [`Self::worst_migration_ratio`], [`Self::worst_gap_ms`],
     ///   [`Self::total_migrations`], [`Self::total_iterations`],
     ///   [`Self::worst_page_locality`],
-    ///   [`Self::worst_cross_node_migration_ratio`],
-    ///   [`Self::worst_wake_latency_tail_ratio`]). They are
+    ///   [`Self::worst_cross_node_migration_ratio`]). They are
     ///   `0.0`-sentinel f64 (no not-measured state), so exposing them
     ///   here would split this method's sentinel-free contract.
+    ///   (`worst_wake_latency_tail_ratio` is NO LONGER in this group —
+    ///   it is now the `WakeLatencyTailRatio` ext key and IS resolved
+    ///   here via the ext lookup.)
     /// - the monitor-sourced run-level metrics (`max_imbalance_ratio`,
     ///   `max_dsq_depth`, `stuck_count`, `total_fallback`,
     ///   `total_keep_last`), which `ScenarioStats` does not hold
@@ -3009,6 +3007,7 @@ pub fn populate_run_distribution_metrics(stats: &mut ScenarioStats) {
                 m.kind,
                 crate::stats::MetricKind::Distribution { .. }
                     | crate::stats::MetricKind::WorstLowest { .. }
+                    | crate::stats::MetricKind::WakeLatencyTailRatio
             )
             .then_some((m.name, m.kind))
         }),
@@ -3017,6 +3016,7 @@ pub fn populate_run_distribution_metrics(stats: &mut ScenarioStats) {
         &run_delay_pool,
         &run_delay_carriers,
         &stats.cgroups,
+        stats.total_iterations,
     );
 }
 
@@ -3037,6 +3037,7 @@ fn populate_run_distribution_metrics_from<'a>(
     run_delay_pool: &[u64],
     run_delay_carriers: &std::collections::BTreeSet<&str>,
     cgroups: &[CgroupStats],
+    run_total_iterations: u64,
 ) {
     use crate::stats::{MetricKind, SampleSource, WorstLowestDenominator};
     for (name, kind) in metrics {
@@ -3056,17 +3057,22 @@ fn populate_run_distribution_metrics_from<'a>(
                 // degenerates to the max over every cgroup — the pre-Item-7
                 // cross-cgroup max.
                 //
-                // CONTRACT (differs from WorstLowest below, by design): a
-                // cohort with cgroups present but NO carrier samples whose
-                // per-cgroup reductions are all 0.0 (e.g. phases empty / no
-                // wake samples anywhere) folds to Some(0.0) — a measured zero,
-                // matching the deleted 0.0-sentinel typed field this replaced.
-                // WorstLowest yields ABSENCE (None) for its all-None cohort
-                // instead, because CgroupStats reductions are 0.0-sentinel f64
-                // (no not-measured state) whereas iterations_per_worker() /
-                // iterations_per_cpu_sec() return Option. So the absent-vs-0.0
-                // boundary is kind-specific: Distribution can emit Some(0.0)
-                // for a no-sample run, WorstLowest emits None.
+                // CONTRACT (differs from WorstLowest and WakeLatencyTailRatio
+                // below, by design): a cohort with cgroups present but NO carrier
+                // samples whose per-cgroup reductions are all 0.0 (e.g. phases
+                // empty / no wake samples anywhere) folds to Some(0.0) — a
+                // measured zero, matching the deleted 0.0-sentinel typed field
+                // this replaced. The absent-vs-0.0 boundary is NOT purely
+                // source-type-driven: WorstLowest yields ABSENCE (None) for its
+                // all-None cohort because iterations_per_worker() /
+                // iterations_per_cpu_sec() return Option; and WakeLatencyTailRatio
+                // ALSO yields None when no cgroup has a tail, even though
+                // wake_latency_tail_ratio() is a 0.0-sentinel f64 like the
+                // Distribution reductions here — because a 0.0 ratio means "no
+                // measurable tail" (median <= 0, i.e. NOT measured), not a
+                // measured-zero percentile. So: Distribution emits Some(0.0) for a
+                // no-sample run (a real measured zero of the percentile);
+                // WorstLowest and WakeLatencyTailRatio emit None (no measurement).
                 let mut v: Option<f64> = if pool.is_empty() {
                     None
                 } else {
@@ -3108,6 +3114,31 @@ fn populate_run_distribution_metrics_from<'a>(
                     }
                 }
                 worst
+            }
+            // Worst-cgroup wake-latency tail amplification: the MAX over each
+            // cgroup's own p99/median ratio (`CgroupStats::wake_latency_tail_ratio`).
+            // Emit NO key below the min-iterations noise floor (low-N ratios are
+            // single-outlier noise, not a distributional signal — gated HERE at
+            // the producer, NOT via a meaned-iteration accessor on the
+            // aggregated row), and none when no cgroup carried a measurable tail
+            // (every per-cgroup ratio 0.0, i.e. no median wake latency anywhere).
+            // Absence then stays distinct from a measured value and no
+            // sub-threshold run enters the cross-RUN mean. `wake_latency_tail_ratio`
+            // returns 0.0 for a cgroup with no wake samples (median <= 0), which
+            // a max-wins fold over the r > 0.0 reals correctly skips.
+            MetricKind::WakeLatencyTailRatio => {
+                if run_total_iterations < crate::stats::WAKE_LATENCY_TAIL_RATIO_MIN_ITERATIONS {
+                    None
+                } else {
+                    let mut worst: Option<f64> = None;
+                    for cg in cgroups {
+                        let r = cg.wake_latency_tail_ratio();
+                        if r > 0.0 {
+                            worst = Some(worst.map_or(r, |w| w.max(r)));
+                        }
+                    }
+                    worst
+                }
             }
             _ => None,
         };
@@ -4656,11 +4687,10 @@ impl AssertResult {
         s.worst_cross_node_migration_ratio = s
             .worst_cross_node_migration_ratio
             .max(o.worst_cross_node_migration_ratio);
-        // Tail ratio is higher-is-worse: max across cgroups surfaces
-        // the worst long-tail amplification.
-        s.worst_wake_latency_tail_ratio = s
-            .worst_wake_latency_tail_ratio
-            .max(o.worst_wake_latency_tail_ratio);
+        // worst_wake_latency_tail_ratio is no longer folded here: it is
+        // `MetricKind::WakeLatencyTailRatio`, re-selected post-merge by
+        // `populate_run_distribution_metrics` (the max over the merged
+        // `stats.cgroups` per-cgroup p99/median ratios, floor-gated).
         // worst_iterations_per_worker / worst_iterations_per_cpu_sec are no
         // longer folded here: they are `MetricKind::WorstLowest`, re-selected
         // post-merge by `populate_run_distribution_metrics` (the lowest-wins,
@@ -6838,12 +6868,13 @@ pub(crate) fn step_per_cgroup_bucket(
 /// [`ScenarioStats`]. The KEPT typed `worst_*` fields carry this cgroup's
 /// values and fold across cgroups in [`AssertResult::merge`]: max for the
 /// higher-is-worse fields (`worst_spread`, `worst_migration_ratio`,
-/// `worst_cross_node_migration_ratio`, `worst_wake_latency_tail_ratio`,
-/// and the coupled `worst_gap_ms` / `worst_gap_cpu`) and lowest-non-zero
-/// for `worst_page_locality`. The wake-latency / run-delay distributions
-/// and the iteration efficiencies are NOT carried here — they have no
-/// typed field and re-pool run-level POST-merge from
-/// `stats.phases[].per_cgroup` / `stats.cgroups` counters in
+/// `worst_cross_node_migration_ratio`, and the coupled `worst_gap_ms` /
+/// `worst_gap_cpu`) and lowest-non-zero for `worst_page_locality`. The
+/// wake-latency / run-delay distributions, the iteration efficiencies, and
+/// the wake-latency tail ratio are NOT carried here — they have no typed
+/// field and re-pool run-level POST-merge from `stats.phases[].per_cgroup`
+/// / `stats.cgroups` (the tail ratio is the max over the per-cgroup
+/// `CgroupStats::wake_latency_tail_ratio`) in
 /// [`populate_run_distribution_metrics`].
 /// `cgroups` carries exactly this one entry so merge appends one per
 /// handle without double-counting.
@@ -6863,7 +6894,6 @@ fn scenario_stats_for_cgroup(cg: &CgroupStats) -> ScenarioStats {
         total_iterations: cg.total_iterations,
         worst_page_locality: cg.page_locality,
         worst_cross_node_migration_ratio: cg.cross_node_migration_ratio,
-        worst_wake_latency_tail_ratio: cg.wake_latency_tail_ratio(),
         ext_metrics: cg.ext_metrics.clone(),
         cgroups: vec![cg.clone()],
         phases: Vec::new(),

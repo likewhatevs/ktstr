@@ -684,23 +684,21 @@ fn populate_run_pooled_iterations_per_cpu_sec_tiny_denominator_stays_finite() {
 fn merge_scenario_stats_worst_wins_and_iterations_sum() {
     // Aggregates-across-cgroups contract for the MERGE-FOLDED worst-wins
     // fields: each takes the larger value (higher-is-worse max) and
-    // `total_iterations` sums. The wake-latency / run-delay roll-ups are no
-    // longer merge-folded (they are `MetricKind::Distribution`, re-pooled
-    // post-merge — see the `repool_*` tests); this covers `worst_spread`,
-    // `worst_migration_ratio`, the kept `worst_wake_latency_tail_ratio`
-    // max-fold, and `worst_cross_node_migration_ratio`.
+    // `total_iterations` sums. The wake-latency / run-delay roll-ups and the
+    // wake-latency tail ratio are no longer merge-folded (they are derived
+    // `MetricKind`s re-pooled post-merge — see the `repool_*` tests); this
+    // covers `worst_spread`, `worst_migration_ratio`, and
+    // `worst_cross_node_migration_ratio`.
     let mut a = AssertResult::pass();
     a.stats.total_iterations = 100;
     a.stats.worst_spread = 5.0;
     a.stats.worst_migration_ratio = 0.1;
-    a.stats.worst_wake_latency_tail_ratio = 2.0;
     a.stats.worst_cross_node_migration_ratio = 0.05;
 
     let mut b = AssertResult::pass();
     b.stats.total_iterations = 400;
     b.stats.worst_spread = 15.0;
     b.stats.worst_migration_ratio = 0.4;
-    b.stats.worst_wake_latency_tail_ratio = 8.0;
     b.stats.worst_cross_node_migration_ratio = 0.25;
 
     a.merge(b);
@@ -708,42 +706,7 @@ fn merge_scenario_stats_worst_wins_and_iterations_sum() {
     assert_eq!(a.stats.total_iterations, 500);
     assert_eq!(a.stats.worst_spread, 15.0);
     assert_eq!(a.stats.worst_migration_ratio, 0.4);
-    assert_eq!(a.stats.worst_wake_latency_tail_ratio, 8.0);
     assert_eq!(a.stats.worst_cross_node_migration_ratio, 0.25);
-}
-
-/// `ScenarioStats::merge` rolls up `worst_wake_latency_tail_ratio`
-/// (higher-is-worse → max) across cgroups; both directions are pinned so a
-/// regression that silently flipped to `.min()` surfaces here. (The
-/// iteration-efficiency lowest-wins selection is now
-/// `MetricKind::WorstLowest`, re-pooled post-merge — covered by the
-/// `repool_worst_iterations_*` tests, not the merge fold.)
-#[test]
-fn merge_tail_ratio_uses_max_polarity() {
-    // Forward: self < other → adopt other's larger (worse) ratio.
-    let mut a = AssertResult::pass();
-    a.stats.worst_wake_latency_tail_ratio = 2.0;
-    let mut b = AssertResult::pass();
-    b.stats.worst_wake_latency_tail_ratio = 8.0;
-    a.merge(b);
-    assert_eq!(
-        a.stats.worst_wake_latency_tail_ratio, 8.0,
-        "tail ratio uses max — 8.0 is worse than 2.0 (more amplification); got {}",
-        a.stats.worst_wake_latency_tail_ratio,
-    );
-
-    // Reverse: self > other → retain self's larger worst. Pins the other
-    // branch of `.max()` so a flip to `.min()` cannot pass on forward alone.
-    let mut g = AssertResult::pass();
-    g.stats.worst_wake_latency_tail_ratio = 8.0;
-    let mut h = AssertResult::pass();
-    h.stats.worst_wake_latency_tail_ratio = 2.0;
-    g.merge(h);
-    assert_eq!(
-        g.stats.worst_wake_latency_tail_ratio, 8.0,
-        "tail_ratio uses max: self=8.0, other=2.0 → self retains 8.0; got {}",
-        g.stats.worst_wake_latency_tail_ratio,
-    );
 }
 
 #[test]
@@ -751,16 +714,15 @@ fn merge_scenario_stats_worst_wins_when_other_is_smaller() {
     // Symmetric case: when `other` reports smaller values, `self`
     // retains its larger worst. Covers the "self wins" branch of the
     // merge-folded scalar worst-comparisons: worst_spread,
-    // worst_migration_ratio, worst_wake_latency_tail_ratio,
-    // worst_cross_node_migration_ratio (all `.max()`) and the coupled
-    // worst_gap_ms/cpu guard. (Wake-latency / run-delay roll-ups moved to
-    // the post-merge re-pool — see the repool_* tests.)
+    // worst_migration_ratio, worst_cross_node_migration_ratio (all `.max()`)
+    // and the coupled worst_gap_ms/cpu guard. (Wake-latency / run-delay
+    // roll-ups and the wake-latency tail ratio moved to the post-merge
+    // re-pool — see the repool_* tests.)
     let mut a = AssertResult::pass();
     a.stats.worst_spread = 30.0;
     a.stats.worst_gap_ms = 500;
     a.stats.worst_gap_cpu = 7;
     a.stats.worst_migration_ratio = 0.9;
-    a.stats.worst_wake_latency_tail_ratio = 5.0;
     a.stats.worst_cross_node_migration_ratio = 0.35;
     a.stats.total_iterations = 500;
 
@@ -769,7 +731,6 @@ fn merge_scenario_stats_worst_wins_when_other_is_smaller() {
     b.stats.worst_gap_ms = 100;
     b.stats.worst_gap_cpu = 3;
     b.stats.worst_migration_ratio = 0.1;
-    b.stats.worst_wake_latency_tail_ratio = 1.5;
     b.stats.worst_cross_node_migration_ratio = 0.05;
     b.stats.total_iterations = 50;
 
@@ -781,7 +742,6 @@ fn merge_scenario_stats_worst_wins_when_other_is_smaller() {
     // index when `self` wins on `worst_gap_ms`.
     assert_eq!(a.stats.worst_gap_cpu, 7);
     assert_eq!(a.stats.worst_migration_ratio, 0.9);
-    assert_eq!(a.stats.worst_wake_latency_tail_ratio, 5.0);
     assert_eq!(a.stats.worst_cross_node_migration_ratio, 0.35);
     // Totals always sum, independent of worst-wins direction.
     assert_eq!(a.stats.total_iterations, 550);

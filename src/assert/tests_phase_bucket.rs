@@ -4317,6 +4317,7 @@ fn repool_distribution_empty_inserts_no_keys() {
         "worst_run_delay_us",
         "worst_iterations_per_worker",
         "worst_iterations_per_cpu_sec",
+        "worst_wake_latency_tail_ratio",
     ] {
         assert!(
             !stats.ext_metrics.contains_key(name),
@@ -4383,6 +4384,105 @@ fn repool_distribution_value_for_value_with_cgroup_stats() {
     assert!((ext("worst_wake_latency_cv") - cg.wake_latency_cv).abs() < 1e-9);
     assert!((ext("worst_mean_run_delay_us") - cg.mean_run_delay_us).abs() < 1e-9);
     assert!((ext("worst_run_delay_us") - cg.worst_run_delay_us).abs() < 1e-9);
+}
+
+/// `WakeLatencyTailRatio` producer contract: `populate_run_distribution_metrics`
+/// emits the `worst_wake_latency_tail_ratio` ext key as the MAX over the
+/// per-cgroup `CgroupStats::wake_latency_tail_ratio` values — but ONLY when the
+/// run cleared the `WAKE_LATENCY_TAIL_RATIO_MIN_ITERATIONS` floor AND at least
+/// one cgroup carried a measurable tail (median > 0). Below the floor, or with
+/// no measurable tail, the key is ABSENT (excluded from the cross-RUN mean,
+/// read as None by compare) — never a 0.0 sentinel. This is the floor gate the
+/// deleted typed-field accessor used to enforce, now moved to the producer.
+#[test]
+fn wake_latency_tail_ratio_producer_floor_gates_and_maxes() {
+    use crate::stats::WAKE_LATENCY_TAIL_RATIO_MIN_ITERATIONS as MIN;
+    let key = "worst_wake_latency_tail_ratio";
+    // Two cgroups with measurable tails: ratios 10.0 (20/2) and 4.0 (8/2).
+    let tail_cgroups = || {
+        vec![
+            CgroupStats {
+                cgroup_name: "a".to_string(),
+                p99_wake_latency_us: 20.0,
+                median_wake_latency_us: 2.0,
+                ..CgroupStats::default()
+            },
+            CgroupStats {
+                cgroup_name: "b".to_string(),
+                p99_wake_latency_us: 8.0,
+                median_wake_latency_us: 2.0,
+                ..CgroupStats::default()
+            },
+        ]
+    };
+
+    // Below the floor: no key, even though both cgroups carry a tail.
+    let mut below = repool_stats(vec![], tail_cgroups());
+    below.total_iterations = MIN - 1;
+    populate_run_distribution_metrics(&mut below);
+    assert_eq!(
+        below.ext_metrics.get(key).copied(),
+        None,
+        "sub-threshold run must emit no tail-ratio key (floor gate at the producer)",
+    );
+
+    // Above the floor: key present, the MAX over per-cgroup ratios (10.0 > 4.0).
+    let mut above = repool_stats(vec![], tail_cgroups());
+    above.total_iterations = MIN;
+    populate_run_distribution_metrics(&mut above);
+    assert_eq!(
+        above.ext_metrics.get(key).copied(),
+        Some(10.0),
+        "above-floor key must be the MAX over per-cgroup p99/median ratios",
+    );
+
+    // Above the floor but NO measurable tail (median 0 -> per-cgroup ratio 0.0):
+    // absent, not a 0.0 sentinel.
+    let mut no_tail = repool_stats(
+        vec![],
+        vec![CgroupStats {
+            cgroup_name: "a".to_string(),
+            p99_wake_latency_us: 0.0,
+            median_wake_latency_us: 0.0,
+            ..CgroupStats::default()
+        }],
+    );
+    no_tail.total_iterations = MIN;
+    populate_run_distribution_metrics(&mut no_tail);
+    assert_eq!(
+        no_tail.ext_metrics.get(key).copied(),
+        None,
+        "a run with no measurable tail (median 0) must emit no key, not Some(0.0)",
+    );
+
+    // Above the floor, MIXED: one cgroup with a tail (10/2 = 5.0), one with
+    // median 0 (ratio 0.0). The `r > 0.0` guard skips the zero so it is NOT
+    // folded into the max; the key is the surviving cgroup's tail, 5.0.
+    let mut mixed = repool_stats(
+        vec![],
+        vec![
+            CgroupStats {
+                cgroup_name: "a".to_string(),
+                p99_wake_latency_us: 10.0,
+                median_wake_latency_us: 2.0,
+                ..CgroupStats::default()
+            },
+            CgroupStats {
+                cgroup_name: "b".to_string(),
+                p99_wake_latency_us: 0.0,
+                median_wake_latency_us: 0.0,
+                ..CgroupStats::default()
+            },
+        ],
+    );
+    mixed.total_iterations = MIN;
+    populate_run_distribution_metrics(&mut mixed);
+    assert_eq!(
+        mixed.ext_metrics.get(key).copied(),
+        Some(5.0),
+        "a median-0 cgroup (ratio 0.0) is skipped by the r>0.0 guard; the key is \
+         the surviving cgroup's tail (10/2=5.0), not folded with the 0.0",
+    );
 }
 
 // -- Item 8: per-phase per-cgroup display-time reductions (PhaseCgroupStats) --
@@ -4603,6 +4703,7 @@ fn repool_distribution_cross_source_arm_debug_asserts_in_test_build() {
             cgroup_name: "a".to_string(),
             ..CgroupStats::default()
         }],
+        0,
     );
 }
 

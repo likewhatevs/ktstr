@@ -267,6 +267,34 @@ pub enum MetricKind {
         /// The per-cgroup denominator the iteration count is divided by.
         denominator: WorstLowestDenominator,
     },
+    /// Derived WORST-CGROUP wake-latency tail-amplification selector — the
+    /// highest per-cgroup `p99 / median` wake-latency ratio across the run.
+    /// Higher-is-worse (a stretched long tail), so "worst" is the MAX over
+    /// cgroups — the polarity-opposite of [`MetricKind::WorstLowest`]'s
+    /// lowest-wins. Re-selected post-merge by
+    /// `crate::assert::populate_run_distribution_metrics` from the
+    /// `stats.cgroups[]` entries via `CgroupStats::wake_latency_tail_ratio`
+    /// (deliberately NOT `pooled_p99 / pooled_median` of the cross-cgroup
+    /// union — that is the distinct `worst_p99_wake_latency_us` /
+    /// `worst_median_wake_latency_us` Distribution pair). Like Distribution /
+    /// WorstLowest it is [`MetricKind::is_derived`] (skipped at the within-run
+    /// reducers); the producer emits NO key when the run is below the
+    /// [`WAKE_LATENCY_TAIL_RATIO_MIN_ITERATIONS`] noise floor or no cgroup
+    /// carried a measurable tail (absence preserved as a missing ext entry,
+    /// never a `0.0` sentinel — the no-false-zero contract the deleted typed
+    /// field could not express).
+    ///
+    /// CROSS-RUN it folds, like every WorstLowest selector, by the UNWEIGHTED
+    /// exclude-missing MEAN through [`aggregate_finite`] (`sum / finite.len()`
+    /// over the runs that emitted the key) — the cohort's TYPICAL worst-cgroup
+    /// tail amplification, deliberately NOT a MAX: peak-of-peaks is reserved
+    /// for [`SampleReduction::Worst`] (a peak detector answering "did this ever
+    /// fire"), whereas this answers "what is this cohort's characteristic
+    /// worst-cgroup tail". A run below the floor never enters the mean, so no
+    /// sub-threshold run dilutes the cohort (the bug the ext relocation fixed:
+    /// the deleted typed cross-RUN fold summed every passing run's raw ratio
+    /// over `passes_observed`, folding noisy low-N runs in as real values).
+    WakeLatencyTailRatio,
 }
 
 /// Sub-classification for [`MetricKind::Gauge`] picking the
@@ -446,14 +474,22 @@ impl MetricKind {
             // Rate. See [`MetricKind::is_derived`].
             MetricKind::Distribution { .. } => MergeKind::Recompute,
             MetricKind::WorstLowest { .. } => MergeKind::Recompute,
+            // Worst-cgroup wake-latency tail ratio: derived post-merge by
+            // `populate_run_distribution_metrics` (max over the merged
+            // `stats.cgroups` per-cgroup ratios), so the per-phase merge loop
+            // skips and re-derives it — classification-only, like the other
+            // derived kinds.
+            MetricKind::WakeLatencyTailRatio => MergeKind::Recompute,
         }
     }
 
     /// Whether this kind is DERIVED post-merge from other data rather than
     /// reduced from its own per-phase sample slice: [`MetricKind::Rate`]
     /// (from numerator/denominator components), [`MetricKind::Distribution`]
-    /// (re-pooled from the per-cgroup raw sample sets), and
-    /// [`MetricKind::WorstLowest`] (lowest-wins over per-cgroup counters).
+    /// (re-pooled from the per-cgroup raw sample sets), [`MetricKind::WorstLowest`]
+    /// (lowest-wins over per-cgroup counters), and
+    /// [`MetricKind::WakeLatencyTailRatio`] (max over the per-cgroup p99/median
+    /// wake-latency ratios, floor-gated).
     ///
     /// Drives the WITHIN-RUN skip-sites that must not reduce a derived kind
     /// from a slice: [`aggregate_samples_for_phase`] returns None, and the
@@ -465,8 +501,8 @@ impl MetricKind {
     /// NOT a uniform cross-RUN skip: at the cross-RUN ext fold
     /// ([`group_and_average_by`]) ONLY [`MetricKind::Rate`] is skipped —
     /// its components survive cross-RUN so it re-derives there — while
-    /// Distribution / WorstLowest, whose components do NOT survive
-    /// cross-RUN, fall through to be plainly folded (MEAN, or MAX for
+    /// Distribution / WorstLowest / WakeLatencyTailRatio, whose components do
+    /// NOT survive cross-RUN, fall through to be plainly folded (MEAN, or MAX for
     /// [`SampleReduction::Worst`]) by [`aggregate_finite`]. So callers
     /// gate on `is_derived` for the within-run sites and on
     /// `matches!(.., Rate { .. })` for the cross-RUN ext fold.
@@ -476,6 +512,7 @@ impl MetricKind {
             MetricKind::Rate { .. }
                 | MetricKind::Distribution { .. }
                 | MetricKind::WorstLowest { .. }
+                | MetricKind::WakeLatencyTailRatio
         )
     }
 }
@@ -588,7 +625,7 @@ fn aggregate_finite(
         // fold is an UNWEIGHTED arithmetic mean — `sum / finite.len()`, i.e.
         // over the runs that EMITTED a finite value for the key. This matches
         // the unweighted-mean SHAPE of the surviving typed siblings
-        // (worst_wake_latency_tail_ratio, spread, migration_ratio), but its
+        // (spread, migration_ratio), but its
         // divisor is the present-finite-contributor count, NOT the typed path's
         // `sum / passes_observed`: a passing run that omitted the key (absent /
         // dropped-non-finite ext entry) is EXCLUDED from the mean rather than
@@ -621,9 +658,9 @@ fn aggregate_finite(
         // pooled CV — accepted here only because no combined set exists to
         // recompute over, and it reproduces the deleted typed path's shape
         // exactly. See [`MetricKind::Distribution`].
-        MetricKind::Distribution { .. } | MetricKind::WorstLowest { .. } => {
-            finite.iter().sum::<f64>() / (finite.len() as f64)
-        }
+        MetricKind::Distribution { .. }
+        | MetricKind::WorstLowest { .. }
+        | MetricKind::WakeLatencyTailRatio => finite.iter().sum::<f64>() / (finite.len() as f64),
         MetricKind::Gauge(GaugeAgg::Avg) => {
             // Weighted mean: sum(v * w) / sum(w). Uniform-weight
             // callers (aggregate_samples) reduce to arithmetic
@@ -1028,19 +1065,19 @@ impl MetricDef {
 /// | `worst_page_locality` | `page_locality` | `page_locality` |
 /// | `worst_cross_node_migration_ratio` | `cross_node_migration_ratio` | `cross_node_migration_ratio` |
 ///
-/// Two of the remaining metrics in [`METRICS`] have matching
+/// One of the remaining metrics in [`METRICS`] has matching
 /// registry / field / DataFrame column names backed by a typed
-/// `GauntletRow` field (`total_iterations`,
-/// `worst_wake_latency_tail_ratio`) and are not listed — no
+/// `GauntletRow` field (`total_iterations`) and is not listed — no
 /// translation to document.
 ///
-/// The seven wake-latency / run-delay / iteration-efficiency roll-ups
+/// The eight wake-latency / run-delay / iteration-efficiency roll-ups
 /// (`worst_p99_wake_latency_us`, `worst_median_wake_latency_us`,
 /// `worst_wake_latency_cv`, `worst_mean_run_delay_us`,
 /// `worst_run_delay_us`, `worst_iterations_per_worker`,
-/// `worst_iterations_per_cpu_sec`) are DERIVED kinds
-/// ([`MetricKind::Distribution`] / [`MetricKind::WorstLowest`]) with NO
-/// typed `GauntletRow` field: their accessors are `|_| None` and
+/// `worst_iterations_per_cpu_sec`, `worst_wake_latency_tail_ratio`) are
+/// DERIVED kinds ([`MetricKind::Distribution`] / [`MetricKind::WorstLowest`]
+/// / [`MetricKind::WakeLatencyTailRatio`]) with NO typed `GauntletRow`
+/// field: their accessors are `|_| None` and
 /// `crate::assert::populate_run_distribution_metrics` re-pools their value
 /// into `ext_metrics` post-merge, so [`MetricDef::read`] reads them through
 /// the ext fallback.
@@ -1499,42 +1536,52 @@ pub static METRICS: &[MetricDef] = &[
         // small deltas that percent-only gates would flag; `default_rel
         // = 0.25` matches the wake-latency metrics' percent gate.
         //
-        // BASIS: this stays a per-cgroup worst — the max over each
-        // cgroup's own p99/median ratio (`CgroupStats::wake_latency_tail_ratio`,
-        // a `Gauge(Last)` carried on the typed row). It is deliberately NOT
-        // `pooled_p99 / pooled_median` of the reclassified
-        // `worst_p99_wake_latency_us` / `worst_median_wake_latency_us`
-        // Distributions (those re-pool the cross-cgroup union), so the two
-        // do not satisfy `tail_ratio == pooled_p99/pooled_median`. Cross-RUN
-        // fold alignment of this metric with the exclude-missing Distribution
-        // semantic is tracked separately.
+        // BASIS: the per-cgroup worst — the MAX over each cgroup's own
+        // p99/median ratio (`CgroupStats::wake_latency_tail_ratio`), selected
+        // post-merge over `stats.cgroups`. Deliberately NOT
+        // `pooled_p99 / pooled_median` of the `worst_p99_wake_latency_us` /
+        // `worst_median_wake_latency_us` Distributions (those re-pool the
+        // cross-cgroup union), so the two do not satisfy
+        // `tail_ratio == pooled_p99/pooled_median`.
         //
-        // Samples-required noise gate: the accessor returns `None` when
-        // the run completed fewer than
-        // [`WAKE_LATENCY_TAIL_RATIO_MIN_ITERATIONS`] iterations; with
-        // few samples the p99 estimate is effectively the observed
-        // maximum and the tail ratio is dominated by a single
-        // outlier rather than a distributional signal. Routing
-        // through `None` lets `compare_rows` fall through to the
-        // `ext_metrics` lookup (which is also empty for a sub-
-        // threshold run), then to the `unwrap_or(0.0)` default, so
-        // both A- and B-side rows collapse to 0.0 and the subsequent
-        // `abs() < EPSILON` short-circuit silently skips the metric
-        // for that row. See [`WAKE_LATENCY_TAIL_RATIO_MIN_ITERATIONS`]
-        // for the threshold-value rationale.
+        // CROSS-RUN FOLD = unweighted exclude-missing MEAN (NOT MAX), by
+        // design. `MetricKind::WakeLatencyTailRatio` is a WITHIN-RUN
+        // worst-across-cgroups selector; cross-RUN `aggregate_finite`
+        // MEAN-folds the per-run worst values over ONLY the runs that cleared
+        // the floor (divisor = present-finite-contributor count), so a cohort
+        // of repeated runs reports its TYPICAL worst-cgroup tail amplification
+        // — the operator-facing cohort-comparison default shared with every
+        // WorstLowest selector. It deliberately does NOT fold by MAX: MAX
+        // (peak-of-peaks) is reserved for `SampleReduction::Worst`
+        // (worst_run_delay_us), a peak DETECTOR; this answers "what is this
+        // cohort's characteristic worst-cgroup tail". Aligning worst-across
+        // selectors to a cross-RUN extremum is a tracked product decision (see
+        // the EXTREMUM ASYMMETRY note in `aggregate_finite`), not this fix.
+        //
+        // Samples-required noise gate, enforced at the PRODUCER (not an
+        // accessor): `crate::assert::populate_run_distribution_metrics` emits
+        // NO ext key when the run completed fewer than
+        // [`WAKE_LATENCY_TAIL_RATIO_MIN_ITERATIONS`] iterations (with few
+        // samples the p99 estimate is effectively the observed maximum and the
+        // ratio is dominated by a single outlier, not a distributional signal),
+        // and none when no cgroup carried a measurable tail. An absent key is
+        // EXCLUDED from the cross-RUN mean (no sub-threshold run dilutes the
+        // cohort) and read as `None` by `compare_rows`, which `unwrap_or(0.0)`s
+        // both sides into the `abs() < EPSILON` skip. This REPLACES the deleted
+        // typed field's accessor gate, which (a) summed every passing run's raw
+        // ratio over `passes_observed` cross-RUN — folding noisy low-N runs in
+        // as real values — and (b) re-gated the AGGREGATED row against a MEANED
+        // iteration count. See [`WAKE_LATENCY_TAIL_RATIO_MIN_ITERATIONS`] for
+        // the threshold-value rationale.
+        //
+        // accessor |_| None: ext_metrics-sourced from the post-merge producer.
         name: "worst_wake_latency_tail_ratio",
         polarity: crate::test_support::Polarity::LowerBetter,
-        kind: MetricKind::Gauge(GaugeAgg::Last),
+        kind: MetricKind::WakeLatencyTailRatio,
         default_abs: 0.5,
         default_rel: 0.25,
         display_unit: "x",
-        accessor: |r| {
-            if r.total_iterations < WAKE_LATENCY_TAIL_RATIO_MIN_ITERATIONS {
-                None
-            } else {
-                Some(r.worst_wake_latency_tail_ratio)
-            }
-        },
+        accessor: |_| None,
     },
     MetricDef {
         // Per-worker iteration throughput, worst (lowest) cgroup.
@@ -1669,11 +1716,13 @@ pub static METRICS: &[MetricDef] = &[
 /// filter against the lowest-N degeneracy, not a guarantee that
 /// every cgroup in a passing row has a stable p99.
 ///
-/// The gate is applied in the metric's accessor closure in [`METRICS`]:
-/// a row with `total_iterations < WAKE_LATENCY_TAIL_RATIO_MIN_ITERATIONS`
-/// returns `None`, which `compare_rows` short-circuits to 0.0 against
-/// both A- and B-side rows, which then falls under the
-/// `abs() < EPSILON` "unchanged" guard and emits no finding.
+/// The gate is applied at the PRODUCER, not an accessor:
+/// `crate::assert::populate_run_distribution_metrics` emits no
+/// `worst_wake_latency_tail_ratio` ext key for a run with
+/// `total_iterations < WAKE_LATENCY_TAIL_RATIO_MIN_ITERATIONS`. The absent key
+/// is excluded from the cross-RUN mean and read as `None` by `compare_rows`,
+/// which `unwrap_or(0.0)`s both A- and B-side rows into the
+/// `abs() < EPSILON` "unchanged" guard, emitting no finding.
 pub const WAKE_LATENCY_TAIL_RATIO_MIN_ITERATIONS: u64 = 100;
 
 /// Look up a metric definition by name.
@@ -2183,14 +2232,12 @@ pub struct GauntletRow {
     // `crate::assert::populate_run_distribution_metrics`; `MetricDef::read`
     // surfaces them via the ext fallback (their accessors are `|_| None`).
     pub total_iterations: u64,
-    /// Worst-case ratio of p99 / median wake latency across cgroups.
-    /// Higher values indicate a stretched long tail. Registry name
-    /// matches the field name; see the triples table on [`METRICS`]
-    /// for the full registry / field / DataFrame-column mapping.
-    /// Noise-suppressed when the scenario produced fewer than
-    /// [`WAKE_LATENCY_TAIL_RATIO_MIN_ITERATIONS`] iterations — see
-    /// the constant's doc for the rationale.
-    pub worst_wake_latency_tail_ratio: f64,
+    // worst_wake_latency_tail_ratio is NO LONGER a typed field: it is
+    // `MetricKind::WakeLatencyTailRatio`, re-selected into `ext_metrics`
+    // post-merge by `crate::assert::populate_run_distribution_metrics` (max
+    // over the per-cgroup p99/median ratios, floor-gated below
+    // [`WAKE_LATENCY_TAIL_RATIO_MIN_ITERATIONS`]); `MetricDef::read` surfaces
+    // it via the ext fallback (accessor `|_| None`).
     // worst_iterations_per_worker / worst_iterations_per_cpu_sec are NO
     // LONGER typed fields: they are `MetricKind::WorstLowest`, re-selected
     // into `ext_metrics` post-merge by
@@ -3201,7 +3248,6 @@ pub fn group_and_average_by(
         sum_fallback_count: i64,
         sum_keep_last_count: i64,
         sum_total_iterations: u64,
-        sum_tail_ratio: f64,
         sum_page_locality: f64,
         sum_cross_node_mig: f64,
         // Per-row MAX-fold for Peak-kind fields. Per
@@ -3268,7 +3314,6 @@ pub fn group_and_average_by(
                 sum_fallback_count: 0,
                 sum_keep_last_count: 0,
                 sum_total_iterations: 0,
-                sum_tail_ratio: 0.0,
                 sum_page_locality: 0.0,
                 sum_cross_node_mig: 0.0,
                 max_gap_ms: 0,
@@ -3329,7 +3374,6 @@ pub fn group_and_average_by(
         acc.sum_total_iterations = acc
             .sum_total_iterations
             .saturating_add(row.total_iterations);
-        acc.sum_tail_ratio += row.worst_wake_latency_tail_ratio;
         acc.sum_page_locality += row.page_locality;
         acc.sum_cross_node_mig += row.cross_node_migration_ratio;
         // Peak-kind typed fields: cross-RUN aggregation surfaces
@@ -3499,7 +3543,6 @@ pub fn group_and_average_by(
             fallback_count: round_i64(acc.sum_fallback_count),
             keep_last_count: round_i64(acc.sum_keep_last_count),
             total_iterations: round_u64(acc.sum_total_iterations),
-            worst_wake_latency_tail_ratio: acc.sum_tail_ratio / denom,
             page_locality: acc.sum_page_locality / denom,
             cross_node_migration_ratio: acc.sum_cross_node_mig / denom,
             ext_metrics,
@@ -3637,10 +3680,6 @@ pub fn sidecar_to_row(sc: &crate::test_support::SidecarResult) -> GauntletRow {
             .map(|e| e.total_dispatch_keep_last)
             .unwrap_or(0),
         total_iterations: sc.stats.total_iterations,
-        worst_wake_latency_tail_ratio: finite_or_zero(
-            "worst_wake_latency_tail_ratio",
-            sc.stats.worst_wake_latency_tail_ratio,
-        ),
         page_locality: finite_or_zero("page_locality", sc.stats.worst_page_locality),
         cross_node_migration_ratio: finite_or_zero(
             "cross_node_migration_ratio",
@@ -7480,7 +7519,6 @@ mod tests {
             fallback_count: 0,
             keep_last_count: 0,
             total_iterations: 0,
-            worst_wake_latency_tail_ratio: 0.0,
             page_locality: 0.0,
             cross_node_migration_ratio: 0.0,
             ext_metrics: BTreeMap::new(),
@@ -7982,8 +8020,8 @@ mod tests {
     ///
     /// Covers the `finite_or_zero` call sites in `sidecar_to_row`: the
     /// remaining direct [`ScenarioStats`] f64 fields (worst_spread,
-    /// worst_migration_ratio, worst_wake_latency_tail_ratio,
-    /// worst_page_locality, worst_cross_node_migration_ratio) plus
+    /// worst_migration_ratio, worst_page_locality,
+    /// worst_cross_node_migration_ratio) plus
     /// `imbalance_ratio` from [`MonitorSummary`]. (The wake / run-delay
     /// roll-ups are now ext_metrics-sourced — non-finite ext entries are
     /// DROPPED, covered by `sidecar_to_row_drops_non_finite_ext_metrics`.) A
@@ -7997,7 +8035,6 @@ mod tests {
             stats: ScenarioStats {
                 worst_spread: non_finite,
                 worst_migration_ratio: non_finite,
-                worst_wake_latency_tail_ratio: non_finite,
                 worst_page_locality: non_finite,
                 worst_cross_node_migration_ratio: non_finite,
                 ..Default::default()
@@ -8013,10 +8050,6 @@ mod tests {
             ("spread", row.spread),
             ("migration_ratio", row.migration_ratio),
             ("imbalance_ratio", row.imbalance_ratio),
-            (
-                "worst_wake_latency_tail_ratio",
-                row.worst_wake_latency_tail_ratio,
-            ),
             ("page_locality", row.page_locality),
             ("cross_node_migration_ratio", row.cross_node_migration_ratio),
         ] {
@@ -8124,7 +8157,6 @@ mod tests {
                 // Every remaining direct f64 field non-finite.
                 worst_spread: f64::NAN,
                 worst_migration_ratio: f64::INFINITY,
-                worst_wake_latency_tail_ratio: f64::NEG_INFINITY,
                 worst_page_locality: f64::INFINITY,
                 worst_cross_node_migration_ratio: f64::NEG_INFINITY,
                 ext_metrics: ext.clone(),
@@ -9444,40 +9476,30 @@ mod tests {
         );
     }
 
-    /// `worst_wake_latency_tail_ratio` must be suppressed below the
-    /// [`WAKE_LATENCY_TAIL_RATIO_MIN_ITERATIONS`] sample floor. Low-N
-    /// runs produce p99/median ratios dominated by a single outlier;
-    /// the metric accessor must return `None` in that regime so
-    /// [`compare_rows_by`] short-circuits and emits no finding.
-    ///
-    /// Positive side: above the floor, the same delta that was
-    /// suppressed below must produce a finding. This proves the
-    /// None-vs-Some branching is the gate that's firing — not an
-    /// unrelated threshold somewhere else in the comparison math.
+    /// `worst_wake_latency_tail_ratio` is ext_metrics-sourced
+    /// (`MetricKind::WakeLatencyTailRatio`, accessor `|_| None`). The
+    /// min-iterations noise floor is enforced at the PRODUCER
+    /// (`populate_run_distribution_metrics` emits no key below the floor —
+    /// pinned by `wake_latency_tail_ratio_producer_floor_gates_and_maxes` in
+    /// the assert tests), so on the COMPARE side a sub-threshold (or no-tail)
+    /// run presents as an ABSENT ext key. This pins the compare-side
+    /// consequence: an absent key reads as `None` and emits no finding, while a
+    /// present key with a real delta surfaces as a regression. `MetricDef::read`
+    /// resolves the value purely from `ext_metrics` (the accessor is `|_| None`).
     #[test]
-    fn wake_latency_tail_ratio_is_suppressed_below_min_iteration_floor() {
-        use crate::stats::WAKE_LATENCY_TAIL_RATIO_MIN_ITERATIONS as MIN;
+    fn wake_latency_tail_ratio_compares_via_ext_metrics() {
         let metric = metric_def("worst_wake_latency_tail_ratio")
             .expect("worst_wake_latency_tail_ratio must be registered in METRICS");
+        let key = "worst_wake_latency_tail_ratio";
 
-        // Below the floor: accessor returns None. Both sides collapse
-        // to 0.0 via unwrap_or(0.0); the EPSILON-guard then classifies
-        // the delta as unchanged.
-        let mut low_a = make_row("tail_low", "tiny-1llc", true, 0.0);
-        let mut low_b = make_row("tail_low", "tiny-1llc", true, 0.0);
-        low_a.total_iterations = MIN - 1;
-        low_b.total_iterations = MIN - 1;
-        low_a.worst_wake_latency_tail_ratio = 2.0;
-        low_b.worst_wake_latency_tail_ratio = 20.0;
+        // Absent ext key (the producer's sub-threshold / no-tail output): both
+        // sides read None, both collapse to 0.0 via unwrap_or(0.0), and the
+        // EPSILON guard classifies the delta as unchanged.
+        let low_a = make_row("tail_low", "tiny-1llc", true, 0.0);
+        let low_b = make_row("tail_low", "tiny-1llc", true, 0.0);
         assert!(
             metric.read(&low_a).is_none(),
-            "below-floor A accessor must return None so the regression \
-             math cannot see a value",
-        );
-        assert!(
-            metric.read(&low_b).is_none(),
-            "below-floor B accessor must return None even when the \
-             raw field would have carried a suspicious value",
+            "absent ext key must read as None (accessor is |_| None, no ext entry)",
         );
         let below = compare_rows_by(
             std::slice::from_ref(&low_a),
@@ -9488,26 +9510,24 @@ mod tests {
         );
         assert_eq!(
             below.regressions, 0,
-            "below-floor comparison must not surface a regression — \
-             low-N ratios are noise, not signal",
+            "absent tail-ratio key (identical rows) must surface no regression",
         );
         assert!(
             below.findings.is_empty(),
-            "below-floor comparison must emit no findings",
+            "absent tail-ratio key (identical rows) must emit no findings",
         );
 
-        // At and above the floor: accessor returns Some and the same
-        // delta now produces a finding.
+        // Present ext key with a 10x delta (the only difference between two
+        // otherwise-identical rows): read() returns the ext value and the delta
+        // surfaces as a regression.
         let mut hi_a = make_row("tail_hi", "tiny-1llc", true, 0.0);
         let mut hi_b = make_row("tail_hi", "tiny-1llc", true, 0.0);
-        hi_a.total_iterations = MIN;
-        hi_b.total_iterations = MIN;
-        hi_a.worst_wake_latency_tail_ratio = 2.0;
-        hi_b.worst_wake_latency_tail_ratio = 20.0;
+        hi_a.ext_metrics.insert(key.to_string(), 2.0);
+        hi_b.ext_metrics.insert(key.to_string(), 20.0);
         assert_eq!(
             metric.read(&hi_a),
             Some(2.0),
-            "at-floor accessor must return Some",
+            "present ext key must read via the ext fallback",
         );
         let above = compare_rows_by(
             std::slice::from_ref(&hi_a),
@@ -9518,62 +9538,45 @@ mod tests {
         );
         assert_eq!(
             above.regressions, 1,
-            "at-floor comparison with a 10x tail blow-up must surface \
-             as a regression; threshold wiring has a gap otherwise",
+            "a present-key 10x tail blow-up must surface as a regression; \
+             threshold wiring has a gap otherwise",
         );
     }
 
-    /// Explicit None-branch pin on the compare_rows accessor contract.
+    /// Explicit None-branch pin on the `compare_rows` ext-fallback contract.
     ///
-    /// `compare_rows` calls `m.read(row)` for every metric and
-    /// falls through `unwrap_or(0.0)` to the EPSILON-guard when the
-    /// accessor returns `None`. The `wake_latency_tail_ratio_is_suppressed_below_*`
-    /// sibling exercises this path EMBEDDED in the full comparison
-    /// flow (via the tail-ratio accessor's iteration-count gate),
-    /// but does NOT directly prove that `compare_rows` handles a
-    /// None result; a regression that removed the `unwrap_or(0.0)`
-    /// and panicked on None would fail the sibling only through
-    /// the indirect "compare_rows panicked" route, which could be
-    /// mistaken for a test infrastructure problem.
+    /// `compare_rows` calls `m.read(row)` for every metric and falls through
+    /// `unwrap_or(0.0)` to the EPSILON-guard when the read is `None`. Since
+    /// `worst_wake_latency_tail_ratio` is now ext-sourced with a `|_| None`
+    /// accessor, an ABSENT ext key (the producer's sub-threshold output) is the
+    /// None condition. The sibling `wake_latency_tail_ratio_compares_via_ext_metrics`
+    /// exercises this embedded in the suppression semantic; this test pins the
+    /// raw mechanism — a regression that dropped `unwrap_or(0.0)` and panicked
+    /// on None, or that synthesized a value for an absent key, would fail here.
     ///
-    /// This test synthesizes the None condition explicitly — a
-    /// below-floor iterations count with distinctly-different
-    /// stored `worst_wake_latency_tail_ratio` values on each side
-    /// — and asserts the three observable consequences:
-    /// 1. `metric.read(&row)` returns `None` on both sides.
+    /// Asserts the three observable consequences:
+    /// 1. `metric.read(&row)` returns `None` on both sides (no ext key).
     /// 2. `compare_rows` does NOT panic.
-    /// 3. The resulting `CompareReport` classifies the pair as
-    ///    `unchanged` (EPSILON guard swallowed the 0.0/0.0 delta).
-    ///
-    /// A panic or a regression/improvement count > 0 here would
-    /// indicate the `unwrap_or(0.0)` in `compare_rows` has drifted.
+    /// 3. The resulting `CompareReport` classifies the pair as `unchanged`.
     #[test]
-    fn compare_rows_handles_none_from_accessor_as_zero() {
-        use crate::stats::WAKE_LATENCY_TAIL_RATIO_MIN_ITERATIONS as MIN;
+    fn compare_rows_handles_none_from_absent_ext_key_as_zero() {
         let metric = metric_def("worst_wake_latency_tail_ratio")
             .expect("tail ratio metric must be registered");
 
-        let mut row_a = make_row("none_branch", "tiny-1llc", true, 0.0);
-        let mut row_b = make_row("none_branch", "tiny-1llc", true, 0.0);
-        row_a.total_iterations = MIN - 1;
-        row_b.total_iterations = MIN - 1;
-        // Stored fields are distinctly non-zero so a regression that
-        // short-circuited the accessor (returned the stored value
-        // directly) would produce a 1000x delta that would fail
-        // both the "unchanged" classification AND the regression
-        // count assertion.
-        row_a.worst_wake_latency_tail_ratio = 1.0;
-        row_b.worst_wake_latency_tail_ratio = 1000.0;
+        // Neither row carries the tail-ratio ext key, so read() is None on both
+        // sides (accessor |_| None + absent ext entry). make_row no longer
+        // paints this key — the producer alone decides its presence.
+        let row_a = make_row("none_branch", "tiny-1llc", true, 0.0);
+        let row_b = make_row("none_branch", "tiny-1llc", true, 0.0);
 
         assert!(
             metric.read(&row_a).is_none(),
-            "accessor must return None for below-floor A input — \
-             otherwise this test is not actually exercising the \
-             None branch of compare_rows",
+            "absent ext key must read None on A — otherwise this test is not \
+             exercising the None branch of compare_rows",
         );
         assert!(
             metric.read(&row_b).is_none(),
-            "accessor must return None for below-floor B input",
+            "absent ext key must read None on B",
         );
 
         // The call must not panic (a regression that dropped the
@@ -10809,7 +10812,6 @@ mod tests {
             fallback_count: 0,
             keep_last_count: 0,
             total_iterations: 0,
-            worst_wake_latency_tail_ratio: 0.0,
             page_locality: 0.0,
             cross_node_migration_ratio: 0.0,
             ext_metrics: BTreeMap::new(),
@@ -11395,7 +11397,6 @@ mod tests {
         row.fallback_count = migrations as i64;
         row.keep_last_count = -(migrations as i64);
         row.total_iterations = iters;
-        row.worst_wake_latency_tail_ratio = spread / 25.0;
         row.page_locality = 1.0 - spread / 100.0;
         row.cross_node_migration_ratio = spread / 200.0;
         // The wake / run-delay / iteration-efficiency roll-ups are now
@@ -11578,6 +11579,37 @@ mod tests {
             Some(30.0),
             "unweighted mean over the 2 emitting runs (20+40)/2=30, NOT \
              (20+40+0)/3=20 a passes_observed divisor would give",
+        );
+    }
+
+    /// Same cross-RUN exclude-missing MEAN, pinned on the metric #11 relocated:
+    /// `worst_wake_latency_tail_ratio` (`MetricKind::WakeLatencyTailRatio`), whose
+    /// deleted typed fold was `sum / passes_observed` (folding sub-threshold runs
+    /// in as 0.0). Three passing runs, only TWO emit the key (2.0, 8.0) → aggregate
+    /// is their mean 5.0, NOT (2+8+0)/3 = 3.33 a passes_observed divisor gives. The
+    /// two emitters carry UNEQUAL `run_sample_count` (1000 vs 1) to prove the fold
+    /// is UNWEIGHTED — a sample-count-weighted mean would be (2*1000+8*1)/1001 ≈
+    /// 2.006, far from 5.0.
+    #[test]
+    fn group_and_average_tail_ratio_excludes_omitting_run_and_is_unweighted() {
+        let key = "worst_wake_latency_tail_ratio";
+        let mut a = make_row("t", "tiny-1llc", true, 0.0);
+        a.run_sample_count = 1000;
+        a.ext_metrics.insert(key.to_string(), 2.0);
+        let mut b = make_row("t", "tiny-1llc", true, 0.0);
+        b.run_sample_count = 1;
+        b.ext_metrics.insert(key.to_string(), 8.0);
+        // Third passing run omits the key entirely.
+        let c = make_row("t", "tiny-1llc", true, 0.0);
+        let out = group_and_average_by(&[a, b, c], LEGACY_PAIRING_DIMS);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].passes_observed, 3);
+        assert_eq!(
+            out[0].row.ext_metrics.get(key).copied(),
+            Some(5.0),
+            "unweighted mean over the 2 emitting runs (2+8)/2=5.0 — NOT \
+             (2+8+0)/3=3.33 (passes_observed divisor), and NOT a sample-count \
+             weighted mean (the 1000-vs-1 weights would pull it toward 2.0)",
         );
     }
 
