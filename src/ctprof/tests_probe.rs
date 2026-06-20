@@ -600,7 +600,7 @@ fn parse_summary_emits_kconfig_hint_when_dominant() {
     emit_parse_summary(&tally);
     assert!(logs_contain("(dominant: schedstat)"));
     assert!(logs_contain("hint:"));
-    assert!(logs_contain("CONFIG_SCHEDSTATS"));
+    assert!(logs_contain("CONFIG_SCHED_INFO"));
     assert!(logs_contain("CONFIG_TASK_IO_ACCOUNTING"));
 }
 

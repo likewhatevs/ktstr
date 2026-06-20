@@ -606,7 +606,7 @@ fn capture_with_corrupt_stat_file_zeroes_stat_fields_only() {
 }
 
 /// G4b — missing `schedstat` file (kernel without
-/// CONFIG_SCHEDSTATS) leaves run_time_ns / wait_time_ns /
+/// CONFIG_SCHED_INFO) leaves run_time_ns / wait_time_ns /
 /// timeslices at zero. The thread still lands because
 /// stat/comm are intact.
 #[test]

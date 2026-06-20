@@ -113,9 +113,10 @@
 //! failures dominate.
 //!
 //! Each internal procfs reader returns `Option` (graceful on
-//! missing/unreadable — a kernel without `CONFIG_SCHEDSTATS` or
-//! `CONFIG_SCHED_DEBUG` yields `None` from the affected reader
-//! without failing the rest of the thread). The assembled
+//! missing/unreadable — a kernel without `CONFIG_SCHED_INFO` (the
+//! `schedstat` file) or `CONFIG_TASK_IO_ACCOUNTING` (the `io` file)
+//! makes that file absent, so its reader yields `None` without
+//! failing the rest of the thread). The assembled
 //! [`ThreadState`] treats `None` as "absent at capture" via the
 //! field type — counters collapse to `0`, identity strings
 //! collapse to empty, affinity collapses to an empty vec. A
@@ -369,10 +370,10 @@ impl CtprofProbeSummary {
 /// though the per-field parsers fold every value to its absent-
 /// counter default. Read failures correspond to the kernel never
 /// having written the file (ENOENT / kernel without
-/// `CONFIG_SCHEDSTATS`), the file disappearing mid-capture (race),
+/// `CONFIG_SCHED_INFO`), the file disappearing mid-capture (race),
 /// or any other I/O-level error from the procfs reader. A snapshot
 /// with 1 K schedstat failures across 1 K tids implies a kernel
-/// build without `CONFIG_SCHEDSTATS`; 47 stat failures across 1 K
+/// build without `CONFIG_SCHED_INFO`; 47 stat failures across 1 K
 /// tids implies mid-capture races.
 ///
 /// One parse-level signal IS surfaced separately:
@@ -442,7 +443,7 @@ pub struct CtprofParseSummary {
     /// `true` when ≥ 50% of `read_failures` are concentrated in
     /// kernel-config-gated files (`"schedstat"`, `"io"`). These
     /// two files are absent on kernels built without
-    /// `CONFIG_SCHEDSTATS` / `CONFIG_TASK_IO_ACCOUNTING`
+    /// `CONFIG_SCHED_INFO` / `CONFIG_TASK_IO_ACCOUNTING`
     /// respectively, so a dominance signal here points the
     /// operator at a kernel build/config issue rather than a
     /// transient race or permission problem. `false` when
@@ -493,7 +494,7 @@ impl CtprofParseSummary {
     /// Operator-facing hint when kernel-config-gated file failures
     /// dominate the snapshot. Returns `Some(&'static str)` naming
     /// the two `CONFIG_*` knobs that gate the affected files
-    /// (`CONFIG_SCHEDSTATS` for `schedstat`, `CONFIG_TASK_IO_ACCOUNTING`
+    /// (`CONFIG_SCHED_INFO` for `schedstat`, `CONFIG_TASK_IO_ACCOUNTING`
     /// for `io`), or `None` when [`Self::kernel_config_dominant`]
     /// is `false`. Lets a downstream consumer surface a remediation
     /// pointer without parsing the log line or hand-rolling the
@@ -512,7 +513,7 @@ impl CtprofParseSummary {
 /// Names the two procfs files that disappear on kernels built
 /// without the corresponding `CONFIG_*` knobs.
 const PARSE_KCONFIG_HINT: &str = "hint: schedstat / io read failures dominate — \
-                                  kernel may be built without CONFIG_SCHEDSTATS \
+                                  kernel may be built without CONFIG_SCHED_INFO \
                                   and/or CONFIG_TASK_IO_ACCOUNTING";
 
 /// Absent-value sentinel for [`ThreadState::state`]. Used by both
@@ -767,7 +768,7 @@ pub struct ThreadState {
     #[serde(default = "default_state_char")]
     pub state: char,
 
-    // -- scheduling (cumulative + lifetime peaks; /proc/<tid>/sched, needs CONFIG_SCHED_DEBUG) --
+    // -- scheduling (cumulative + lifetime peaks; /proc/<tid>/sched schedstat fields, need CONFIG_SCHEDSTATS) --
     // -- (sched_ext gate: ext.enabled requires CONFIG_SCHED_CLASS_EXT) --
     /// `true` when the task is currently scheduled by sched_ext —
     /// `/proc/<tid>/sched` `ext.enabled` line. The kernel emits
@@ -2498,7 +2499,7 @@ impl ParseTally {
     }
 
     /// True when ≥ 50% of failures are in `schedstat` or `io` —
-    /// the two procfs files gated by `CONFIG_SCHEDSTATS` /
+    /// the two procfs files gated by `CONFIG_SCHED_INFO` /
     /// `CONFIG_TASK_IO_ACCOUNTING`. Mirrors
     /// [`ProbeSummary::ptrace_dominates`]'s shape: dominance gate
     /// at half-or-more, false when total is zero.

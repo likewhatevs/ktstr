@@ -530,9 +530,15 @@ pub(super) fn parse_schedstat(raw: &str) -> (Option<u64>, Option<u64>, Option<u6
 }
 
 /// Read `<proc_root>/<tgid>/task/<tid>/schedstat`. Three-tuple
-/// of `Option<u64>` — kernel without `CONFIG_SCHEDSTATS` yields
-/// all-`None`. Records a `"schedstat"` failure on read error
-/// when a tally is supplied.
+/// of `Option<u64>` — when `CONFIG_SCHED_INFO` is off the proc
+/// entry is absent (the registration is `#ifdef CONFIG_SCHED_INFO`
+/// in `fs/proc/base.c`), so the read fails with ENOENT and yields
+/// all-`None`; the kernel's "0 0 0" zero-fill branch is dead code
+/// for this file (it compiles only when `CONFIG_SCHED_INFO` is on).
+/// `CONFIG_SCHEDSTATS` selects `CONFIG_SCHED_INFO`, so a SCHEDSTATS
+/// kernel always has the file; SCHED_INFO is the minimal gate.
+/// Records a `"schedstat"` failure on read error when a tally is
+/// supplied.
 pub(super) fn read_schedstat_at_with_tally(
     proc_root: &Path,
     tgid: i32,
@@ -910,8 +916,11 @@ pub(super) fn parsed_ns_from_dotted(value: &str) -> Result<u64, ParseDottedNs> {
     }
 }
 
-/// Parse `/proc/<tgid>/task/<tid>/sched`. Requires
-/// `CONFIG_SCHED_DEBUG`. Format is many lines of `key : value`
+/// Parse `/proc/<tgid>/task/<tid>/sched`. The file is registered
+/// unconditionally (always present); the schedstat-prefixed fields
+/// this reads are emitted only under `CONFIG_SCHEDSTATS` (the
+/// kernel's `if (schedstat_enabled())` block) and are absent
+/// otherwise. Format is many lines of `key : value`
 /// where the key is dot-delimited (`se.statistics.nr_wakeups`);
 /// different kernel versions use `se.statistics.`, `stats.`,
 /// or bare names. The reader matches on the LAST dot-delimited
