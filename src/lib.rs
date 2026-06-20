@@ -114,8 +114,9 @@
 //!
 //! ```rust
 //! use ktstr::prelude::*;
-//! use ktstr::workload::WorkerReport;
-//! use std::collections::{BTreeMap, BTreeSet};
+//! // The typed `claim_<field>` accessors live on the `#[derive(Claim)]`-generated
+//! // extension trait, imported per stats type (not yet in the prelude):
+//! use ktstr::assert::CgroupStatsClaim;
 //!
 //! // A test author would obtain `cg` and `report` from `ctx`-driven
 //! // execution; the literal here just illustrates the assertion shape.

@@ -158,7 +158,7 @@ impl<'a> ScxEventsView<'a> {
     ///         .into_iter()
     ///         .filter(|(name, _)| ERROR_CLASS_NAMES.contains(name))
     ///         .collect();
-    ///     assert!(assert_scx_events_clean(&error_only, None).passed);
+    ///     assert!(assert_scx_events_clean(&error_only, None).is_pass());
     /// }
     /// # }
     /// ```

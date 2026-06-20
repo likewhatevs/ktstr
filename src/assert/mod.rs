@@ -7561,6 +7561,7 @@ impl AbsoluteThresholds {
 /// #     numa_pages: std::collections::BTreeMap::new(),
 /// #     vmstat_numa_pages_migrated: 0,
 /// #     exit_info: None,
+/// #     affinity_error: None,
 /// #     is_messenger: false,
 /// #     group_idx: 0,
 /// # };
