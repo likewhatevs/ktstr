@@ -350,11 +350,13 @@ enum TestResultWire {
 /// and a many-cgroup × many-step scenario accumulates non-merging carriers that
 /// can overrun the frame even with each carrier reservoir-capped. On overflow
 /// the three sample pools (wake_latencies_ns / run_delays_ns / off_cpu_pcts) are
-/// dropped — so the wake p99/median/CV, off-CPU% avg/min/max/spread, and
-/// mean/worst run-delay re-pools become not-measured — while the verdict,
-/// outcomes, and all scalar/counter telemetry are PRESERVED (never a PASS→FAIL
-/// flip). The truncated FAIL is reached only if the sample-free verdict ALONE
-/// overruns.
+/// dropped — so the wake p99/median/CV and mean/worst run-delay re-pools DEGRADE
+/// to the cross-cgroup max of the surviving per-cgroup `CgroupStats` reductions
+/// (a worst-cgroup proxy, via `populate_run_distribution_metrics`), not vanish;
+/// off-CPU% has no run-level re-pool consumer so only its per-phase render
+/// is lost. The verdict, outcomes, and all scalar/counter telemetry are
+/// PRESERVED (never a PASS→FAIL flip). The truncated FAIL is reached only if the
+/// sample-free verdict ALONE overruns.
 fn classify_test_result(result: &crate::assert::AssertResult, max: usize) -> Option<TestResultWire> {
     let bytes = postcard::to_stdvec(result).ok()?;
     if bytes.len() <= max {

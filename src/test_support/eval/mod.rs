@@ -1866,6 +1866,14 @@ fn evaluate_vm_result(
         // sees its components. The trailing monitor-verdict merge below is
         // verdict-only (inconclusive with empty stats), so it is safe to follow.
         crate::assert::populate_run_pooled_iterations_per_cpu_sec(&mut check_result.stats);
+        // Run-level distributional re-pool (Distribution + WorstLowest kinds):
+        // pool the per-cgroup raw sample sets in stats.phases across phases +
+        // cgroups and recompute the wake / run-delay distributions, and select
+        // the lowest-wins iteration efficiencies from stats.cgroups counters.
+        // MUST run here for the same reason as the pooled rate above — AFTER the
+        // per-cgroup carrier fold + cgroup merges, BEFORE the sidecar write — so
+        // these ext_metrics keys are the sole source for the |_| None accessors.
+        crate::assert::populate_run_distribution_metrics(&mut check_result.stats);
 
         // Write sidecar before checking pass/fail so both outcomes are captured.
         // A sidecar write failure is logged but not propagated: the test

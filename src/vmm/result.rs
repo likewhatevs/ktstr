@@ -727,10 +727,12 @@ impl VmResult {
     /// metric-name analog of [`Self::step_throughput`] /
     /// [`Self::throughput_ratio`], covering the per-phase metrics that
     /// are NOT iteration throughput: per-phase CPU time
-    /// (`system_time_ns`, `user_time_ns`), latency
-    /// (`worst_run_delay_us`, `worst_mean_run_delay_us`), and
-    /// scheduling quality (`avg_imbalance_ratio`, `avg_dsq_depth`, ...).
-    /// `metric` is a `crate::stats::METRICS` registry name.
+    /// (`system_time_ns`, `user_time_ns`) and scheduling quality
+    /// (`avg_imbalance_ratio`, `avg_dsq_depth`, ...). `metric` is a
+    /// `crate::stats::METRICS` registry name. (The wake-latency / run-delay
+    /// distributions are `MetricKind::Distribution`: they have no per-phase
+    /// `PhaseBucket::metrics` value — they re-pool run-level from the
+    /// per-cgroup carriers — so they are not readable here.)
     ///
     /// Reads the SAME buckets [`Self::phase_buckets`] folds onto
     /// `result.stats.phases`, so a `post_vm` callback can compare any

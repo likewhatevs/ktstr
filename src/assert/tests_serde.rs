@@ -314,19 +314,16 @@ fn scenario_stats_missing_required_scalar_rejected_by_deserialize() {
         "worst_gap_ms",
         "worst_gap_cpu",
         "worst_migration_ratio",
-        "worst_p99_wake_latency_us",
-        "worst_median_wake_latency_us",
-        "worst_wake_latency_cv",
         "total_iterations",
-        "worst_mean_run_delay_us",
-        "worst_run_delay_us",
         "worst_page_locality",
         "worst_cross_node_migration_ratio",
         "worst_wake_latency_tail_ratio",
-        // `worst_iterations_per_worker` is intentionally omitted: it is
-        // `Option<f64>` (None = no cgroup reported a worker), so a
-        // missing key correctly deserializes to None rather than being
-        // a softened required scalar.
+        // The wake / run-delay (worst_p99/median/cv, worst_mean_run_delay_us,
+        // worst_run_delay_us) and iteration-efficiency
+        // (worst_iterations_per_worker/_per_cpu_sec) roll-ups are intentionally
+        // omitted: they are no longer typed ScenarioStats fields — they are
+        // `MetricKind::Distribution` / `WorstLowest` metrics re-pooled into
+        // `ext_metrics` post-merge by `populate_run_distribution_metrics`.
         "ext_metrics",
     ];
 

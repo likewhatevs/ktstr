@@ -1350,11 +1350,14 @@ pub struct AssertResult {
 /// Pre-1.0 cleanup eliminated the prior stored-field shadow and
 /// `derive_ratios` stamper. Consumers always recompute on read,
 /// so a hand-constructed fixture or a deserialized sidecar from an
-/// older build cannot silently carry a stale ratio. The roll-up
-/// fields on [`ScenarioStats::worst_wake_latency_tail_ratio`] /
-/// [`ScenarioStats::worst_iterations_per_worker`] aggregate these
-/// methods over per-cgroup [`Self`] entries during
-/// [`AssertResult::merge`].
+/// older build cannot silently carry a stale ratio. The
+/// [`ScenarioStats::worst_wake_latency_tail_ratio`] roll-up aggregates
+/// [`Self::wake_latency_tail_ratio`] over per-cgroup [`Self`] entries during
+/// [`AssertResult::merge`]; the iterations efficiencies
+/// (`worst_iterations_per_worker` / `worst_iterations_per_cpu_sec`) are
+/// instead re-pooled lowest-wins from [`Self::iterations_per_worker`] /
+/// [`Self::iterations_per_cpu_sec`] post-merge by
+/// [`populate_run_distribution_metrics`].
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize, crate::Claim)]
 pub struct CgroupStats {
     /// Cgroup name (the workload-handle label this telemetry belongs to),
@@ -1512,15 +1515,26 @@ pub struct PhaseCgroupStats {
     /// un-reduced so mean / worst run-delay re-pool over the combined set; the
     /// re-pool converts ns → µs to match [`CgroupStats`]'s run-delay-µs fields.
     /// Stored as raw kernel ns (like `wake_latencies_ns`), not pre-converted,
-    /// per the raw-component thesis.
+    /// per the raw-component thesis. GRANULARITY: unlike `wake_latencies_ns`
+    /// (one per WAKEUP), each entry here is ONE per-worker value — the
+    /// worker's cumulative `sched_info.run_delay` delta over its execution
+    /// (`schedstat_run_delay_ns`, end−start). So the pool size is the worker
+    /// count, the mean is the average per-worker total queued-to-run delay, and
+    /// `worst_run_delay_us` selects the single worker with the largest total
+    /// queued-to-run delay (NOT the worst single dispatch).
     pub run_delays_ns: Vec<u64>,
-    /// Pooled per-worker off-CPU% samples for the phase, un-reduced so the MEAN
-    /// (`avg_off_cpu_pct`), the EXTREMES (min/max), and the SPREAD (max − min)
-    /// all re-pool over the combined set. An EMPTY vec is the not-measured
-    /// state (no worker with positive wall time), preserving the not-measured
-    /// vs measured-zero distinction [`CgroupStats`] keeps. Stored as raw
-    /// samples, not pre-reduced extremes, because the mean is unrecoverable
-    /// from min/max alone for >2 workers. Each sample is `off_cpu_ns /
+    /// Per-worker off-CPU% samples for the phase, un-reduced. Carried for the
+    /// per-phase per-cgroup off-CPU% RENDER (Item 8) — the avg / min / max /
+    /// spread of the combined set. NOT consumed by the Item 7 run-level
+    /// distributional re-pool: off-CPU% has no run-level Distribution metric
+    /// (off-CPU%/spread is intrinsically per-cgroup, so the run-level
+    /// `worst_spread` stays the cross-cgroup max of per-cgroup
+    /// [`CgroupStats::spread`] via the typed [`AssertResult::merge`] fold, not a
+    /// pooled distribution). An EMPTY vec is the not-measured state (no worker
+    /// with positive wall time), preserving the not-measured vs measured-zero
+    /// distinction [`CgroupStats`] keeps. Stored as raw samples, not pre-reduced
+    /// extremes, because the mean is unrecoverable from min/max alone for >2
+    /// workers. Each sample is `off_cpu_ns /
     /// wall_time_ns * 100`, where `off_cpu_ns = wall_time_ns - cpu_time_ns` and
     /// `cpu_time_ns` is the `CLOCK_THREAD_CPUTIME_ID` thread on-CPU time
     /// (workload/worker `off_cpu_ns` at report build). `total_cpu_time_ns` is a
@@ -1698,10 +1712,11 @@ impl CgroupStats {
     /// throughput is undefined — distinct from a measured zero);
     /// `Some(0.0)` when workers ran but completed zero iterations
     /// (a real throughput collapse). The `None` / `Some(0.0)` split
-    /// is load-bearing: the cross-cgroup roll-up in
-    /// [`AssertResult::merge`] must treat a measured zero as the
-    /// worst reading (it wins the "lowest" bucket) while skipping a
-    /// no-data cgroup — collapsing both to `0.0` would hide a
+    /// is load-bearing: the run-level worst-cgroup re-pool in
+    /// [`populate_run_distribution_metrics`] (the
+    /// `MetricKind::WorstLowest` arm) must treat a measured zero as
+    /// the worst reading (it wins the "lowest" bucket) while skipping
+    /// a no-data cgroup — collapsing both to `0.0` would hide a
     /// starved cgroup behind the no-data sentinel. Method-only
     /// access (no stored shadow) — recomputed every call from the
     /// raw fields.
@@ -2033,13 +2048,14 @@ fn merge_matched_phase_buckets(a: PhaseBucket, b: PhaseBucket) -> PhaseBucket {
     let mut keys: std::collections::BTreeSet<&String> = a.metrics.keys().collect();
     keys.extend(b.metrics.keys());
     for key in keys {
-        // Rate metrics are DERIVED, not merged: skip here and re-derive
-        // from the merged components in the post-pass below. Folding two
-        // ready-made ratios would lose the Σnum/Σdenom re-pool.
-        if matches!(
-            crate::stats::metric_def(key).map(|m| m.kind),
-            Some(crate::stats::MetricKind::Rate { .. })
-        ) {
+        // Derived metrics (Rate / Distribution / WorstLowest) are NOT merged
+        // here: a Rate re-derives from the merged components in the post-pass
+        // below, and Distribution / WorstLowest are re-pooled run-level by
+        // `populate_run_distribution_metrics` (they never appear in
+        // phase.metrics — `aggregate_samples_for_phase` returns None — so this
+        // skip is also a structural guard). Folding a ready-made derived value
+        // would lose the re-pool.
+        if crate::stats::metric_def(key).is_some_and(|m| m.kind.is_derived()) {
             continue;
         }
         let av = a.metrics.get(key).copied();
@@ -2231,13 +2247,16 @@ fn merge_metric_values(
         Some(MetricKind::Gauge(GaugeAgg::Last)) | Some(MetricKind::Timestamp) => {
             if b_end_ms > a_end_ms { b } else { a }
         }
-        // Rate metrics are skipped in the merge loop and re-derived from
-        // their pooled components afterward (see
-        // `merge_matched_phase_buckets`), so a Rate value never reaches
-        // this per-value merge — folding two ready-made ratios would lose
-        // the Σnum/Σdenom re-pool.
-        Some(MetricKind::Rate { .. }) => unreachable!(
-            "Rate metrics are re-derived via derive_rate_metrics, not merged as values"
+        // Derived kinds (Rate / Distribution / WorstLowest) are skipped in
+        // the merge loop (see `merge_matched_phase_buckets`'s `is_derived`
+        // continue) and produced post-merge (`derive_rate_metrics` /
+        // `populate_run_distribution_metrics`), so a derived value never
+        // reaches this per-value merge — folding a ready-made derived value
+        // would lose the re-pool.
+        Some(MetricKind::Rate { .. })
+        | Some(MetricKind::Distribution { .. })
+        | Some(MetricKind::WorstLowest { .. }) => unreachable!(
+            "derived metrics (Rate/Distribution/WorstLowest) are produced post-merge, not merged as values"
         ),
         // Unregistered metric: commutative mean fallback. Sum
         // would over-count Gauge values; max would lose Counter
@@ -2269,18 +2288,8 @@ pub struct ScenarioStats {
     pub worst_gap_cpu: usize,
     /// Worst migration ratio across any cgroup (highest).
     pub worst_migration_ratio: f64,
-    /// Worst p99 wake latency across all cgroups (highest, microseconds).
-    pub worst_p99_wake_latency_us: f64,
-    /// Worst median wake latency across all cgroups (highest, microseconds).
-    pub worst_median_wake_latency_us: f64,
-    /// Worst wake latency coefficient of variation across all cgroups (highest).
-    pub worst_wake_latency_cv: f64,
     /// Sum of iteration counts across all cgroups.
     pub total_iterations: u64,
-    /// Worst mean schedstat run delay across all cgroups (highest, microseconds).
-    pub worst_mean_run_delay_us: f64,
-    /// Worst schedstat run delay across all cgroups (highest, microseconds).
-    pub worst_run_delay_us: f64,
     /// Worst page locality fraction across cgroups (lowest non-zero).
     pub worst_page_locality: f64,
     /// Worst cross-node migration ratio across cgroups (highest).
@@ -2296,41 +2305,6 @@ pub struct ScenarioStats {
     /// Routed through `GauntletRow` and the `METRICS` registry;
     /// `stats compare` surfaces this axis in its comparison rows.
     pub worst_wake_latency_tail_ratio: f64,
-    /// Worst per-worker iteration count across cgroups (LOWEST
-    /// reading, measured-zero included).
-    ///
-    /// Per-cgroup [`CgroupStats::iterations_per_worker`] is a
-    /// throughput metric; the worst-case (regression-detecting)
-    /// roll-up across cgroups is the lowest reading — a cgroup that
-    /// fell behind surfaces as the lowest per-worker throughput.
-    /// `None` means no cgroup reported a worker (the `Default`
-    /// accumulator start, and the merge result when every folded
-    /// cgroup had `num_workers == 0`); `Some(0.0)` means a cgroup
-    /// ran with zero iterations — a real starvation that the merge
-    /// surfaces as the worst reading rather than discarding as a
-    /// sentinel. The fold in [`AssertResult::merge`] is None-aware:
-    /// it skips `None` contributors (no data) but lets a
-    /// `Some(0.0)` win the "lowest" bucket. This is why the field is
-    /// `Option<f64>` and not a `0.0`-sentinel `f64` — collapsing
-    /// no-data and measured-zero to the same value would hide a
-    /// starved cgroup.
-    ///
-    /// Only meaningful across runs of the SAME variant — see
-    /// [`CgroupStats::iterations_per_worker`] for the cross-
-    /// variant caveat. Routed through `GauntletRow` and the
-    /// `METRICS` registry; `stats compare` surfaces this axis
-    /// in its comparison rows.
-    pub worst_iterations_per_worker: Option<f64>,
-    /// Lowest [`CgroupStats::iterations_per_cpu_sec`] across the run's
-    /// cgroups — the worst per-cgroup CPU-time EFFICIENCY. Unlike
-    /// [`Self::worst_iterations_per_worker`] (raw work, which scales with
-    /// the host-CPU budget) this is OVERCOMMIT-INVARIANT: it is the
-    /// metric `stats compare` surfaces so two runs at different
-    /// `cpu_budget` settings can be compared without the host-contention
-    /// confound the overcommit marker warns about. `None` when no cgroup
-    /// reported a defined rate (no workers or no on-CPU time captured);
-    /// merged None-aware lowest-wins like `worst_iterations_per_worker`.
-    pub worst_iterations_per_cpu_sec: Option<f64>,
     /// Extensible metrics for the generic comparison pipeline.
     /// Populated from per-cgroup ext_metrics (worst value across cgroups).
     pub ext_metrics: BTreeMap<String, f64>,
@@ -2503,6 +2477,15 @@ impl ScenarioStats {
     ///     // ... compare per metric ...
     /// }
     /// ```
+    ///
+    /// Heads up: not every known name is phase-readable. The
+    /// `MetricKind::Distribution` / `MetricKind::WorstLowest` family
+    /// (`worst_*_wake_latency_*` / `worst_*_run_delay_*` /
+    /// `worst_iterations_per_*`) is RUN-LEVEL only — it never appears
+    /// in [`PhaseBucket::metrics`], so [`Self::phase_metric`] /
+    /// [`Self::step_metric`] return `None` for those names. Read them
+    /// via [`Self::run_metric`] instead. Iterating `known_metrics()`
+    /// through `step_metric` (as above) silently skips that family.
     pub fn known_metrics() -> impl Iterator<Item = &'static str> {
         crate::stats::METRICS.iter().map(|m| m.name)
     }
@@ -2530,6 +2513,80 @@ impl ScenarioStats {
     /// ```
     pub fn has_steps(&self) -> bool {
         self.phases.iter().any(|p| p.step_index >= 1)
+    }
+
+    /// Run-level value for a metric by registry name, for the
+    /// ext-sourced metric family that carries no typed
+    /// `ScenarioStats` field.
+    ///
+    /// Resolves [`Self::ext_metrics`] — the run-level map the
+    /// framework fills post-merge with every metric whose value has no
+    /// typed struct field: the pooled wake-latency / run-delay
+    /// distributions and worst-cgroup iteration efficiencies
+    /// (the `MetricKind::Distribution` / `MetricKind::WorstLowest`
+    /// registry kinds — `worst_p99_wake_latency_us`, `worst_run_delay_us`,
+    /// `worst_iterations_per_cpu_sec`, …), the derived rates
+    /// (`iteration_rate`, and the pooled `iterations_per_cpu_sec` —
+    /// distinct from the `worst_iterations_per_cpu_sec` selector above),
+    /// the per-thread-group `system_time_ns` / `user_time_ns`, and
+    /// `avg_imbalance_ratio` / `avg_dsq_depth`. This is the
+    /// run-level analogue of [`Self::phase_metric`] for that family:
+    /// code holding the run's [`AssertResult`] reads
+    /// `r.stats.run_metric("worst_run_delay_us")` instead of reaching
+    /// into the raw `ext_metrics` map by string key (`ScenarioStats` is
+    /// the [`AssertResult::stats`] field — the value a test body, or a
+    /// callback that builds an `AssertResult` via `collect_all` /
+    /// `execute_scenario`, holds). A `post_vm` callback instead receives
+    /// a `VmResult`, which has NO `stats` field and no run-level
+    /// Distribution surface — compare those cross-run via `cargo ktstr
+    /// stats compare`.
+    ///
+    /// The ext family is populated only by the `#[ktstr_test]` eval
+    /// flow's post-merge producer
+    /// ([`populate_run_distribution_metrics`]). An `AssertResult` built
+    /// by a DIRECT host assertion (`assert_not_starved` /
+    /// `AssertPlan::assert_cgroup`, which never run that producer)
+    /// carries the per-cgroup values on [`Self::cgroups`] but none of
+    /// these run-level roll-ups, so `run_metric` returns `None` for them
+    /// on that path — read the per-cgroup `CgroupStats` field directly
+    /// (e.g. `r.stats.cgroups[i].p99_wake_latency_us`) there.
+    ///
+    /// Sentinel-free, matching [`Self::phase_metric`]: `None` means
+    /// the metric is absent from this run (no contributing cgroup or
+    /// carrier, or a name not present in the map); `Some(0.0)` is a
+    /// real measured zero. Gate on [`Self::is_known_metric`] to tell a
+    /// typo from genuinely-absent data. (The map also carries any
+    /// user-defined extensible-metric keys, plus the framework-internal
+    /// Rate-component Counters — `total_phase_iterations` /
+    /// `total_phase_duration_sec` / `total_iterations_pooled` /
+    /// `total_cpu_time_sec`, the numerator/denominator plumbing behind
+    /// `iteration_rate` / `iterations_per_cpu_sec` — all of which resolve
+    /// here too; prefer the derived rate over its raw components.)
+    ///
+    /// NOT resolved here (these are not in `ext_metrics`):
+    /// - the typed cross-cgroup fields — read them via their named
+    ///   struct fields ([`Self::worst_spread`],
+    ///   [`Self::worst_migration_ratio`], [`Self::worst_gap_ms`],
+    ///   [`Self::total_migrations`], [`Self::total_iterations`],
+    ///   [`Self::worst_page_locality`],
+    ///   [`Self::worst_cross_node_migration_ratio`],
+    ///   [`Self::worst_wake_latency_tail_ratio`]). They are
+    ///   `0.0`-sentinel f64 (no not-measured state), so exposing them
+    ///   here would split this method's sentinel-free contract.
+    /// - the monitor-sourced run-level metrics (`max_imbalance_ratio`,
+    ///   `max_dsq_depth`, `stuck_count`, `total_fallback`,
+    ///   `total_keep_last`), which `ScenarioStats` does not hold
+    ///   run-level — read those per-phase via [`Self::phase_metric`] /
+    ///   [`Self::step_metric`].
+    ///
+    /// So this does NOT cover the full registry: iterating
+    /// [`Self::known_metrics`] through it yields `None` for those typed
+    /// and monitor names. There is no single run-level by-name accessor
+    /// over the whole registry (the typed fields live on `ScenarioStats`
+    /// directly, the monitor metrics only per-phase); this resolves the
+    /// ext-sourced family, the one with no typed field.
+    pub fn run_metric(&self, name: &str) -> Option<f64> {
+        self.ext_metrics.get(name).copied()
     }
 }
 
@@ -2611,12 +2668,15 @@ pub fn populate_run_ext_metrics_from_phases(
         let Some(def) = crate::stats::metric_def(key) else {
             continue;
         };
-        // Rate metrics are DERIVED from their pooled components, not folded
-        // as values: skip here and re-derive after the loop so the run rate
-        // is Σnum/Σdenom over the folded components. Folding two ready-made
-        // per-phase ratios would lose the re-pool, and routing a Rate into
-        // aggregate_samples_weighted would hit the aggregate_finite guard.
-        if matches!(def.kind, crate::stats::MetricKind::Rate { .. }) {
+        // Derived metrics (Rate / Distribution / WorstLowest) are produced
+        // from their pooled components, not folded as per-phase values: skip
+        // here. A Rate re-derives after the loop (Σnum/Σdenom over the folded
+        // components); Distribution / WorstLowest are re-pooled run-level by
+        // `populate_run_distribution_metrics` (and never appear in
+        // phase.metrics anyway). Folding a ready-made derived value would lose
+        // the re-pool, and routing one into aggregate_samples_weighted within
+        // a run is not its producer path.
+        if def.kind.is_derived() {
             continue;
         }
         // Typed-backed keys (those in TYPED_FIELD_NAMES — a typed GauntletRow
@@ -2737,6 +2797,322 @@ pub fn populate_run_pooled_iterations_per_cpu_sec(stats: &mut ScenarioStats) {
         .ext_metrics
         .insert("total_cpu_time_sec".to_string(), summed_ns as f64 / 1e9);
     crate::stats::derive_rate_metrics(&mut stats.ext_metrics);
+}
+
+/// Populate run-level DERIVED distributional metrics into
+/// `stats.ext_metrics`: every registered `MetricKind::Distribution`
+/// and `MetricKind::WorstLowest`. This is the SOLE
+/// within-run producer of those metrics' values — they carry no per-phase
+/// sample slice and no cross-cgroup merge fold, and their registry accessors
+/// are `|_| None`, so `MetricDef::read` reads the value
+/// written here from `ext_metrics`.
+///
+/// DISTRIBUTION (the 5 wake / run-delay aggregates): pools the RAW sample
+/// vectors held in `stats.phases[].per_cgroup` across EVERY phase and EVERY
+/// cgroup into one combined set, then recomputes the percentile / CV / mean
+/// / extreme over it — the statistic of the union, NOT a max or mean of
+/// per-cgroup reductions (the percentile of a union is not the max of
+/// per-source percentiles). The ns→µs scale is applied ONCE here (the
+/// carriers store raw ns, per [`PhaseCgroupStats::run_delays_ns`]).
+///
+/// CARRIER-LESS FOLD (backdrop coverage + graceful degradation): a cgroup
+/// whose raw samples are NOT in the pool — a backdrop (collected with no
+/// step_index, so no per-phase carrier; 6c/#36) or a cgroup whose carrier was
+/// stripped/empty (`strip_phase_cgroup_samples`) — is NOT dropped. Its
+/// surviving per-cgroup [`CgroupStats`] reduction folds worst-wins (max — every
+/// Distribution metric is `LowerBetter`, registry-gated) into the pooled value.
+/// The CgroupStats reductions are never stripped — `stats.cgroups[]` is the
+/// already-reduced `cgroup_stats(reports)` output, a SEPARATE reduction path
+/// from the per-phase carriers — so a carrier-less cgroup always has a source.
+/// When EVERY carrier is empty (a fully-stripped run) the pool is empty and the
+/// result degenerates to the max over every cgroup's reduction — the pre-Item-7
+/// cross-cgroup max. NOTE the value CLASS of a folded cgroup differs from a
+/// pooled one for the P99 / Median / Mean / CV reductions: a pooled cgroup
+/// contributes to the percentile of the union; a carrier-less cgroup
+/// contributes its per-cgroup reduction worst-wins (a worst-cgroup proxy, not
+/// pooled). For the `SampleReduction::Worst` reduction the two COINCIDE
+/// (max-of-union == max-of-per-cgroup-maxes), so the carrier-less fold is exact
+/// there, not a proxy. #36 will give backdrops a carrier so their samples join
+/// the pool.
+///
+/// WORSTLOWEST (the 2 iteration efficiencies): the lowest (worst) cgroup's
+/// efficiency, computed per-cgroup from the `stats.cgroups[]` COUNTERS via
+/// [`CgroupStats::iterations_per_worker`] / [`CgroupStats::iterations_per_cpu_sec`]
+/// and the None-aware lowest-wins fold (a measured `Some(0.0)` — starvation
+/// — wins; a no-data `None` is skipped; an all-`None` cohort writes no key,
+/// preserving absence as a missing ext entry rather than a `0.0`). The
+/// counters survive stripping, so WorstLowest needs no fallback branch.
+///
+/// Runs post-merge at the eval layer beside
+/// [`populate_run_pooled_iterations_per_cpu_sec`], AFTER the per-cgroup
+/// carriers are folded into `stats.phases` and BEFORE the sidecar write, so
+/// `stats.phases[].per_cgroup` is fully merged and `stats.cgroups` is the
+/// final per-cgroup roll-up.
+pub fn populate_run_distribution_metrics(stats: &mut ScenarioStats) {
+    // Pool the per-phase per-cgroup raw sample vectors across every phase and
+    // cgroup ONCE for the Distribution PRIMARY path, then sort so the
+    // percentile reductions can index directly. `wake_latencies_ns` is
+    // per-WAKEUP (reservoir-capped at MAX_WAKE_SAMPLES on the carrier because
+    // it can reach 100k); `run_delays_ns` is per-WORKER (one sample/worker, not
+    // capped), so the run-delay pool is total-workers × phases — genuinely
+    // small. The wake pool is NOT intrinsically small: it is the union of the
+    // per-carrier wake vectors, num_carriers × MAX_WAKE_SAMPLES worst case, so
+    // its size is bounded by the upstream 16 MiB bulk-frame cap on the arriving
+    // carriers (strip_phase_cgroup_samples is the overflow lever) rather than by
+    // being tiny — no OOM risk, no cap needed here. Both are transient: reduced
+    // to scalars here, never re-serialized.
+    let mut wake_pool: Vec<u64> = Vec::new();
+    let mut run_delay_pool: Vec<u64> = Vec::new();
+    // Names of cgroups that contributed NON-EMPTY samples to each pool. A
+    // cgroup absent here — a backdrop (carrier attachment is step-local only,
+    // collect_handles gates on a Some step_index; backdrops collect with None,
+    // 6c/#36) or a stripped/empty carrier — is NOT dropped from the run-level
+    // Distribution: the re-pool folds its surviving per-cgroup CgroupStats
+    // reduction worst-wins (see `populate_run_distribution_metrics_from`). #36
+    // will give backdrops a carrier so their raw samples join the pool.
+    //
+    // The fallback dedup keys on cgroup NAME (a `stats.cgroups` entry whose
+    // name is in `*_carriers` is pooled, not reduction-folded), which assumes
+    // carrier-bearing and carrier-less cgroup names are DISJOINT. That holds
+    // WITHIN one step's collect (cgroupfs path uniqueness — two live cgroups
+    // cannot share a name, mkdir would EEXIST — and a single collect_handles
+    // call attaches carriers to all its handles or none). It does NOT hold
+    // across STEPS: `AssertResult::merge` extends `stats.cgroups` per
+    // (handle, step), so a name that carried samples at step k recurs at step
+    // k+1, and the step-(k+1) entry is skipped by this dedup (its name is in
+    // `*_carriers`). That only OMITS a contribution, never vanishes the metric
+    // (the step-k pool still produces it). A skipped step-(k+1) entry whose
+    // carrier is merely EMPTY (collected no samples) is harmless: its per-cgroup
+    // reduction is the trivial zero a worst-wins f64::max ignores. The only
+    // LOSSY case is a step-(k+1) entry STRIPPED of live samples while step k
+    // survives, and that cannot arise today: `strip_phase_cgroup_samples` strips
+    // RUN-WIDE (every phase at once), so a run is never partially stripped per
+    // step. #36 (backdrops join the pool) dissolves the dedup entirely.
+    let mut wake_carriers: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    let mut run_delay_carriers: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    for phase in &stats.phases {
+        for (cgname, pcg) in &phase.per_cgroup {
+            if !pcg.wake_latencies_ns.is_empty() {
+                wake_pool.extend_from_slice(&pcg.wake_latencies_ns);
+                wake_carriers.insert(cgname.as_str());
+            }
+            if !pcg.run_delays_ns.is_empty() {
+                run_delay_pool.extend_from_slice(&pcg.run_delays_ns);
+                run_delay_carriers.insert(cgname.as_str());
+            }
+        }
+    }
+    wake_pool.sort_unstable();
+    run_delay_pool.sort_unstable();
+    populate_run_distribution_metrics_from(
+        &mut stats.ext_metrics,
+        crate::stats::METRICS.iter().filter_map(|m| {
+            matches!(
+                m.kind,
+                crate::stats::MetricKind::Distribution { .. }
+                    | crate::stats::MetricKind::WorstLowest { .. }
+            )
+            .then_some((m.name, m.kind))
+        }),
+        &wake_pool,
+        &wake_carriers,
+        &run_delay_pool,
+        &run_delay_carriers,
+        &stats.cgroups,
+    );
+}
+
+/// Inner of [`populate_run_distribution_metrics`] taking the metric specs
+/// `(name, kind)` and the pre-pooled+SORTED sample sets explicitly, so the
+/// re-pool math is unit-testable without registered metrics (the
+/// `derive_rate_metrics_from` precedent). `wake_pool` / `run_delay_pool` are
+/// the cross-phase+cross-cgroup raw-ns unions (ascending); `*_carriers` name
+/// the cgroups that contributed samples to each pool; `cgroups` supplies the
+/// WorstLowest counters and the per-cgroup reductions that carrier-less
+/// cgroups (backdrop / stripped) fold into the Distribution result.
+#[allow(clippy::too_many_arguments)]
+fn populate_run_distribution_metrics_from<'a>(
+    target: &mut std::collections::BTreeMap<String, f64>,
+    metrics: impl Iterator<Item = (&'a str, crate::stats::MetricKind)>,
+    wake_pool: &[u64],
+    wake_carriers: &std::collections::BTreeSet<&str>,
+    run_delay_pool: &[u64],
+    run_delay_carriers: &std::collections::BTreeSet<&str>,
+    cgroups: &[CgroupStats],
+) {
+    use crate::stats::{MetricKind, SampleSource, WorstLowestDenominator};
+    for (name, kind) in metrics {
+        let value: Option<f64> = match kind {
+            MetricKind::Distribution { source, reduction } => {
+                let (pool, carriers) = match source {
+                    SampleSource::WakeLatencyNs => (wake_pool, wake_carriers),
+                    SampleSource::RunDelayNs => (run_delay_pool, run_delay_carriers),
+                };
+                // Pool the carried samples (the thesis: percentile of the
+                // UNION), then fold worst-wins (max — Distribution is
+                // LowerBetter, registry-gated) the surviving per-cgroup
+                // reduction of every cgroup WITHOUT a carrier-with-samples for
+                // this source (a backdrop, or a stripped/empty carrier), so no
+                // cgroup is dropped from the run-level distribution. When EVERY
+                // carrier is empty (fully stripped) the pool is empty and this
+                // degenerates to the max over every cgroup — the pre-Item-7
+                // cross-cgroup max.
+                //
+                // CONTRACT (differs from WorstLowest below, by design): a
+                // cohort with cgroups present but NO carrier samples whose
+                // per-cgroup reductions are all 0.0 (e.g. phases empty / no
+                // wake samples anywhere) folds to Some(0.0) — a measured zero,
+                // matching the deleted 0.0-sentinel typed field this replaced.
+                // WorstLowest yields ABSENCE (None) for its all-None cohort
+                // instead, because CgroupStats reductions are 0.0-sentinel f64
+                // (no not-measured state) whereas iterations_per_worker() /
+                // iterations_per_cpu_sec() return Option. So the absent-vs-0.0
+                // boundary is kind-specific: Distribution can emit Some(0.0)
+                // for a no-sample run, WorstLowest emits None.
+                let mut v: Option<f64> = if pool.is_empty() {
+                    None
+                } else {
+                    Some(reduce_sorted_distribution(pool, reduction))
+                };
+                for cg in cgroups {
+                    if !carriers.contains(cg.cgroup_name.as_str()) {
+                        let r = distribution_cgroup_reduction(cg, source, reduction);
+                        v = Some(v.map_or(r, |acc| acc.max(r)));
+                    }
+                }
+                v
+            }
+            // numerator is always Iterations (the only variant); the
+            // denominator picks the per-cgroup efficiency method.
+            //
+            // In a MULTI-STEP scenario `AssertResult::merge` extends
+            // `stats.cgroups` per (handle, step), so the same cgroup name
+            // appears once per step; this selects the lowest single
+            // (handle, step) entry, NOT a per-name whole-run efficiency. That
+            // preserves the deleted `fold_lowest_some` granularity exactly and
+            // mirrors `populate_run_pooled_iterations_per_cpu_sec`, which sums
+            // over the same per-(handle, step) entries.
+            MetricKind::WorstLowest { denominator, .. } => {
+                let mut worst: Option<f64> = None;
+                for cg in cgroups {
+                    let per_cg = match denominator {
+                        WorstLowestDenominator::NumWorkers => cg.iterations_per_worker(),
+                        WorstLowestDenominator::CpuTimeNs => cg.iterations_per_cpu_sec(),
+                    };
+                    // Lowest-wins, None-aware (the semantic the deleted
+                    // `fold_lowest_some` carried in `AssertResult::merge`): a
+                    // measured `Some(0.0)` (starvation) wins the worst bucket;
+                    // a `None` is skipped.
+                    if let Some(v) = per_cg
+                        && worst.is_none_or(|w| v < w)
+                    {
+                        worst = Some(v);
+                    }
+                }
+                worst
+            }
+            _ => None,
+        };
+        // Insert only a real, FINITE value: an absent key (all-None
+        // WorstLowest cohort, or no cgroups at all) stays distinct from a
+        // measured 0.0, matching the None-vs-Some(0.0) contract the typed
+        // Option carried. The is_finite guard is a no-op for every
+        // registry-valid metric (reduce_sorted_distribution reduces non-empty
+        // pools with CV guarded to 0.0 on zero mean; WorstLowest reuses
+        // iterations_per_worker()/iterations_per_cpu_sec() which return None on
+        // a zero denominator), but it MATTERS for the registry-impossible
+        // cross-source arm of distribution_cgroup_reduction: that arm returns
+        // NaN, and when a Distribution has no pool (every carrier stripped) the
+        // carrier-less fold can carry that NaN to `v`. An inserted NaN would
+        // fail the ENTIRE serde_json sidecar write (serde_json rejects
+        // non-finite), losing ALL run telemetry — so the guard degrades a
+        // misauthored metric to ABSENCE here rather than risking that write
+        // failure downstream.
+        if let Some(v) = value.filter(|v| v.is_finite()) {
+            target.insert(name.to_string(), v);
+        }
+    }
+}
+
+/// Reduce a NON-EMPTY ascending-sorted raw-ns sample pool to one
+/// [`crate::stats::SampleReduction`] value, ns→µs once. Mirrors the
+/// per-cgroup reductions [`cgroup_stats`] computes (p99 / median via
+/// [`percentile`], CV with `n = pool.len()`, mean, max) so the run-level
+/// re-pool reproduces them over the COMBINED cross-cgroup set — to within
+/// FP tolerance for CV / mean, not bit-exactly: this sums over the
+/// ASCENDING-sorted pool while `cgroup_stats` sums over the unsorted
+/// arrival order, so the float results differ by ~1e-15 (the parity test
+/// `repool_distribution_value_for_value_with_cgroup_stats` uses a 1e-9
+/// bound). Same "distribution-equivalent, not byte-identical" framing as
+/// the `wake_latencies_ns` carrier doc.
+fn reduce_sorted_distribution(sorted: &[u64], reduction: crate::stats::SampleReduction) -> f64 {
+    use crate::stats::SampleReduction;
+    match reduction {
+        SampleReduction::P99 => percentile(sorted, 0.99) as f64 / 1000.0,
+        SampleReduction::Median => percentile(sorted, 0.5) as f64 / 1000.0,
+        SampleReduction::Cv => {
+            let n = sorted.len() as f64;
+            let mean_ns = sorted.iter().sum::<u64>() as f64 / n;
+            if mean_ns > 0.0 {
+                let variance =
+                    sorted.iter().map(|&v| (v as f64 - mean_ns).powi(2)).sum::<f64>() / n;
+                variance.sqrt() / mean_ns
+            } else {
+                0.0
+            }
+        }
+        // Divide ONCE on the summed/maxed ns (the carriers store raw ns):
+        // mean(ns)/1000 == mean(ns/1000) and max(ns)/1000 == max(ns/1000).
+        SampleReduction::Mean => sorted.iter().sum::<u64>() as f64 / sorted.len() as f64 / 1000.0,
+        // Sorted ascending, so the last element is the max.
+        SampleReduction::Worst => *sorted.last().expect("non-empty by caller") as f64 / 1000.0,
+    }
+}
+
+/// One cgroup's surviving [`CgroupStats`] reduction for a
+/// [`crate::stats::MetricKind::Distribution`] (source, reduction) pair — the
+/// value folded worst-wins into the run-level distribution for a cgroup whose
+/// raw samples are NOT in the pool (a backdrop, or a stripped/empty carrier).
+/// Worst-wins is `f64::max` (every Distribution metric is `LowerBetter`,
+/// enforced by `every_metric_has_kind_consistent_with_naming`).
+///
+/// Per-source match, EXHAUSTIVE over SampleReduction (no `_` catch-all,
+/// mirroring reduce_sorted_distribution) so a new SampleSource or
+/// SampleReduction variant fails the build until a reduction field is wired.
+/// The cross-source reductions (a wake source asking for a run-delay reduction,
+/// or vice versa) are registry-impossible (no CgroupStats field exists), so
+/// they debug_assert in tests and, in release, return `f64::NAN` rather than
+/// 0.0 — NaN is IGNORED by the caller's `f64::max` worst-wins fold, and if it
+/// still reaches `populate_run_distribution_metrics`'s insert (a pool-less
+/// Distribution whose every carrier-less cgroup hits this arm) the is_finite
+/// insert guard drops it to absence. Either way a registry-authoring mistake
+/// drops the bogus contribution instead of folding a 0.0 that a LowerBetter
+/// metric would read as "perfect".
+fn distribution_cgroup_reduction(
+    cg: &CgroupStats,
+    source: crate::stats::SampleSource,
+    reduction: crate::stats::SampleReduction,
+) -> f64 {
+    use crate::stats::{SampleReduction, SampleSource};
+    match source {
+        SampleSource::WakeLatencyNs => match reduction {
+            SampleReduction::P99 => cg.p99_wake_latency_us,
+            SampleReduction::Median => cg.median_wake_latency_us,
+            SampleReduction::Cv => cg.wake_latency_cv,
+            SampleReduction::Mean | SampleReduction::Worst => {
+                debug_assert!(false, "no CgroupStats wake reduction for {reduction:?}");
+                f64::NAN
+            }
+        },
+        SampleSource::RunDelayNs => match reduction {
+            SampleReduction::Mean => cg.mean_run_delay_us,
+            SampleReduction::Worst => cg.worst_run_delay_us,
+            SampleReduction::P99 | SampleReduction::Median | SampleReduction::Cv => {
+                debug_assert!(false, "no CgroupStats run-delay reduction for {reduction:?}");
+                f64::NAN
+            }
+        },
+    }
 }
 
 /// Populate cross-RUN aggregate entries for every registered
@@ -2873,9 +3249,8 @@ pub fn populate_run_ext_metrics(
 /// axis to re-pool: it is derived from run-level phase buckets and
 /// host-injected into the run `ext_metrics` by
 /// `populate_run_ext_metrics_from_phases` (the eval layer) AFTER the
-/// cross-cgroup `merge`, so `AssertResult::merge`'s worst-case polarity
-/// min/max `ext_metrics` fold (correct for the `worst_*` family) never sees
-/// its components. The rate whose components ARE per-cgroup is the separate
+/// cross-cgroup `merge`, so `AssertResult::merge`'s worst-case
+/// (min/max-by-polarity) `ext_metrics` fold never sees its components. The rate whose components ARE per-cgroup is the separate
 /// pooled `iterations_per_cpu_sec`, re-pooled across a run's cgroups by
 /// `populate_run_pooled_iterations_per_cpu_sec` (reading `stats.cgroups`
 /// post-merge).
@@ -3998,11 +4373,16 @@ impl AssertResult {
     /// (a PASS→FAIL flip + total telemetry loss), the sender drops only these
     /// best-effort sample pools — the verdict, outcomes, and every scalar/counter
     /// (including `wake_sample_total`, the NUMA counts, the coupled gap, and the
-    /// counter-derived metrics) survive. All THREE sample-backed distributional
-    /// re-pools lose their samples for that oversized run: wake p99 / median / CV
-    /// (from `wake_latencies_ns`), off-CPU% avg / min / max / spread (from
-    /// `off_cpu_pcts`), and mean / worst run-delay (from `run_delays_ns`) — each
-    /// collapses to not-measured.
+    /// counter-derived metrics) survive. The wake p99 / median / CV (from
+    /// `wake_latencies_ns`) and mean / worst run-delay (from `run_delays_ns`)
+    /// re-pools DEGRADE rather than vanish: with their carrier samples gone
+    /// every carrier is empty, so `populate_run_distribution_metrics` folds the
+    /// surviving per-cgroup [`CgroupStats`] reductions worst-wins (the pre-Item-7
+    /// cross-cgroup max — a worst-cgroup proxy, not the pooled distribution).
+    /// `off_cpu_pcts` has no run-level re-pool consumer (worst_spread / off-CPU%
+    /// come from the typed `CgroupStats` merge fold, not the carrier — off-CPU%
+    /// is intrinsically per-cgroup, out of the Item 7 re-pool), so dropping it
+    /// loses only the per-phase off-CPU% render (Item 8), not any run-level value.
     pub(crate) fn strip_phase_cgroup_samples(&mut self) -> usize {
         let mut dropped = 0usize;
         for bucket in &mut self.stats.phases {
@@ -4150,25 +4530,6 @@ impl AssertResult {
             }
         }
 
-        /// None-aware lowest fold: `Some(x)` is a real measurement
-        /// (including `Some(0.0)` — a cgroup that ran zero
-        /// iterations, the worst possible throughput), `None` is "no
-        /// data" (cgroup had no workers) and contributes nothing.
-        /// `*self_field` becomes `other` when `other` is `Some` and
-        /// either `*self_field` is `None` (nothing folded yet) or
-        /// `other`'s value is strictly smaller. Unlike
-        /// `fold_lowest_nonzero`, a measured `0.0` is NOT treated as
-        /// a sentinel — it wins the "lowest" bucket so a starved
-        /// cgroup surfaces as the worst reading instead of being
-        /// discarded.
-        fn fold_lowest_some(self_field: &mut Option<f64>, other: Option<f64>) {
-            if let Some(o) = other
-                && self_field.is_none_or(|s| o < s)
-            {
-                *self_field = Some(o);
-            }
-        }
-
         self.outcomes.extend(other.outcomes);
         self.passes.extend(other.passes);
         self.info_notes.extend(other.info_notes);
@@ -4180,13 +4541,11 @@ impl AssertResult {
         s.total_iterations += o.total_iterations;
         s.worst_spread = s.worst_spread.max(o.worst_spread);
         s.worst_migration_ratio = s.worst_migration_ratio.max(o.worst_migration_ratio);
-        s.worst_p99_wake_latency_us = s.worst_p99_wake_latency_us.max(o.worst_p99_wake_latency_us);
-        s.worst_median_wake_latency_us = s
-            .worst_median_wake_latency_us
-            .max(o.worst_median_wake_latency_us);
-        s.worst_wake_latency_cv = s.worst_wake_latency_cv.max(o.worst_wake_latency_cv);
-        s.worst_run_delay_us = s.worst_run_delay_us.max(o.worst_run_delay_us);
-        s.worst_mean_run_delay_us = s.worst_mean_run_delay_us.max(o.worst_mean_run_delay_us);
+        // worst_p99/median/cv wake-latency + mean/worst run-delay are no
+        // longer folded here: they are `MetricKind::Distribution`, re-pooled
+        // post-merge from the per-cgroup raw samples by
+        // `populate_run_distribution_metrics` (the pooled-distribution
+        // percentile, not a max of per-cgroup reductions).
         s.worst_cross_node_migration_ratio = s
             .worst_cross_node_migration_ratio
             .max(o.worst_cross_node_migration_ratio);
@@ -4195,25 +4554,11 @@ impl AssertResult {
         s.worst_wake_latency_tail_ratio = s
             .worst_wake_latency_tail_ratio
             .max(o.worst_wake_latency_tail_ratio);
-        // Per-worker throughput is lower-is-worse: take the lowest
-        // reading across cgroups so a cgroup falling behind wins the
-        // "worst" bucket. None-aware (`fold_lowest_some`): a cgroup
-        // that ran zero iterations contributes `Some(0.0)` and wins
-        // the bucket (real starvation), while a cgroup with no
-        // workers contributes `None` and is skipped. The accumulator
-        // `AssertResult::pass().merge(real)` starts at `None` from
-        // `Default`. See `fold_lowest_some` above for the policy.
-        fold_lowest_some(
-            &mut s.worst_iterations_per_worker,
-            o.worst_iterations_per_worker,
-        );
-        // Overcommit-invariant per-cgroup efficiency is likewise
-        // lower-is-worse: the least-efficient cgroup wins the "worst"
-        // bucket. None-aware, same policy as worst_iterations_per_worker.
-        fold_lowest_some(
-            &mut s.worst_iterations_per_cpu_sec,
-            o.worst_iterations_per_cpu_sec,
-        );
+        // worst_iterations_per_worker / worst_iterations_per_cpu_sec are no
+        // longer folded here: they are `MetricKind::WorstLowest`, re-selected
+        // post-merge by `populate_run_distribution_metrics` (the lowest-wins,
+        // None-aware min over the merged `stats.cgroups` counters — the same
+        // starvation semantic the deleted `fold_lowest_some` carried).
         // Coupled fields: `worst_gap_cpu` must come from the same
         // cgroup that posted the new worst `worst_gap_ms`.
         if o.worst_gap_ms > s.worst_gap_ms {
@@ -5132,9 +5477,9 @@ pub struct Assert {
     /// # Unit-name gotcha
     ///
     /// The threshold is `_ns`, but the paired reporting field on
-    /// [`CgroupStats::p99_wake_latency_us`] and the roll-up
-    /// [`ScenarioStats::worst_p99_wake_latency_us`] are
-    /// MICROSECONDS. The two surfaces are intentionally split:
+    /// [`CgroupStats::p99_wake_latency_us`] and the re-pooled run-level
+    /// `worst_p99_wake_latency_us` ext metric (a `MetricKind::Distribution`)
+    /// are MICROSECONDS. The two surfaces are intentionally split:
     ///   - the threshold uses NS for precision (typical scheduler
     ///     wake latencies are single-digit µs, so sub-µs resolution
     ///     matters for regression gates);
@@ -6383,9 +6728,16 @@ pub(crate) fn step_per_cgroup_bucket(
 }
 
 /// Roll a single cgroup's [`CgroupStats`] up into a one-cgroup
-/// [`ScenarioStats`]. The `worst_*` fields carry this cgroup's values;
-/// [`AssertResult::merge`] folds them across cgroups (max for the
-/// higher-is-worse fields, lowest-non-zero for the 0.0-sentinel fields).
+/// [`ScenarioStats`]. The KEPT typed `worst_*` fields carry this cgroup's
+/// values and fold across cgroups in [`AssertResult::merge`]: max for the
+/// higher-is-worse fields (`worst_spread`, `worst_migration_ratio`,
+/// `worst_cross_node_migration_ratio`, `worst_wake_latency_tail_ratio`,
+/// and the coupled `worst_gap_ms` / `worst_gap_cpu`) and lowest-non-zero
+/// for `worst_page_locality`. The wake-latency / run-delay distributions
+/// and the iteration efficiencies are NOT carried here — they have no
+/// typed field and re-pool run-level POST-merge from
+/// `stats.phases[].per_cgroup` / `stats.cgroups` counters in
+/// [`populate_run_distribution_metrics`].
 /// `cgroups` carries exactly this one entry so merge appends one per
 /// handle without double-counting.
 fn scenario_stats_for_cgroup(cg: &CgroupStats) -> ScenarioStats {
@@ -6401,26 +6753,10 @@ fn scenario_stats_for_cgroup(cg: &CgroupStats) -> ScenarioStats {
         worst_gap_ms: cg.max_gap_ms,
         worst_gap_cpu: cg.max_gap_cpu,
         worst_migration_ratio: cg.migration_ratio,
-        worst_p99_wake_latency_us: cg.p99_wake_latency_us,
-        worst_median_wake_latency_us: cg.median_wake_latency_us,
-        worst_wake_latency_cv: cg.wake_latency_cv,
         total_iterations: cg.total_iterations,
-        worst_mean_run_delay_us: cg.mean_run_delay_us,
-        worst_run_delay_us: cg.worst_run_delay_us,
         worst_page_locality: cg.page_locality,
         worst_cross_node_migration_ratio: cg.cross_node_migration_ratio,
         worst_wake_latency_tail_ratio: cg.wake_latency_tail_ratio(),
-        // `iterations_per_worker()` is `None` when this cgroup had no
-        // workers and `Some(v)` (including `Some(0.0)` for a ran-zero
-        // cgroup) otherwise. The None-aware merge fold
-        // (`fold_lowest_some`) lets a measured zero win the "worst"
-        // bucket while skipping no-data cgroups, so the distinction is
-        // carried through as `Option` rather than collapsed to a 0.0
-        // sentinel.
-        worst_iterations_per_worker: cg.iterations_per_worker(),
-        // Overcommit-invariant efficiency for this cgroup; None-aware
-        // lowest-wins merge folds the run's worst across cgroups.
-        worst_iterations_per_cpu_sec: cg.iterations_per_cpu_sec(),
         ext_metrics: cg.ext_metrics.clone(),
         cgroups: vec![cg.clone()],
         phases: Vec::new(),

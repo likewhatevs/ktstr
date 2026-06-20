@@ -203,6 +203,70 @@ pub enum MetricKind {
         /// Registry name of the denominator component metric.
         denominator: &'static str,
     },
+    /// Derived DISTRIBUTIONAL aggregate re-pooled from a raw per-cgroup
+    /// sample set, never folded from ready-made per-cgroup reductions. The
+    /// variant names the [`SampleSource`] (which
+    /// [`crate::assert::PhaseCgroupStats`] sample vector feeds it) and the
+    /// [`SampleReduction`] (which statistic to compute over the pooled set).
+    ///
+    /// Like [`MetricKind::Rate`], a Distribution has NO value of its own at
+    /// the WITHIN-RUN levels: its run-level value is DERIVED post-merge by
+    /// `crate::assert::populate_run_distribution_metrics`, which pools the
+    /// raw samples from `stats.phases[].per_cgroup` across every phase and
+    /// cgroup and recomputes the statistic over the COMBINED set — the
+    /// percentile / CV / mean / extreme of the pooled distribution, NOT a
+    /// max or mean of per-cgroup reductions (the percentile of a union is
+    /// not the max of per-source percentiles). It is therefore FORBIDDEN
+    /// from the per-phase single-slice reducers
+    /// ([`aggregate_samples_for_phase`] returns None via
+    /// [`MetricKind::is_derived`]); the post-pass is its only within-run
+    /// producer. When the size-limited bulk frame strips the sample pools
+    /// (`crate::assert::strip_phase_cgroup_samples`), the producer falls
+    /// back to a worst-wins fold over the surviving per-cgroup `CgroupStats`
+    /// reductions so the metric degrades rather than vanishing.
+    ///
+    /// CROSS-RUN it is a HYBRID, unlike Rate: a run's components (the raw
+    /// sample vectors) do not survive into the cross-RUN ext-metrics map
+    /// (phases are dropped at the cross-RUN fold), so there is no combined
+    /// sample SET to re-pool across runs. The cross-RUN value is instead a
+    /// plain fold of the per-run derived values — an UNWEIGHTED mean (over the
+    /// runs that emitted the key, `sum / finite.len()`) for the percentile /
+    /// CV / mean reductions and a MAX for [`SampleReduction::Worst`] (the
+    /// peak run-delay) — applied by [`aggregate_finite`] over the per-run ext
+    /// values. So `is_derived`
+    /// skips it at the within-run sites, but the cross-RUN ext fold does
+    /// NOT skip it (only Rate, whose components DO survive cross-RUN, is
+    /// skipped there).
+    Distribution {
+        /// Which raw sample vector on
+        /// [`crate::assert::PhaseCgroupStats`] feeds this aggregate.
+        source: SampleSource,
+        /// Which statistic to recompute over the pooled sample set.
+        reduction: SampleReduction,
+    },
+    /// Derived LOWEST-WINS per-cgroup efficiency selector — the worst
+    /// (lowest) cgroup's `numerator / denominator` rate across the run,
+    /// re-pooled from per-cgroup counters rather than folded from
+    /// ready-made rates. None-aware lowest-wins (the semantic the deleted
+    /// `fold_lowest_some` carried in [`crate::assert::AssertResult::merge`],
+    /// now in `crate::assert::populate_run_distribution_metrics`): a measured
+    /// `Some(0.0)` (a cgroup that ran zero iterations — real starvation)
+    /// wins the worst bucket, a not-measured `None` (no workers / no
+    /// on-CPU time) is skipped, and an all-`None` cohort produces no key
+    /// (absence preserved as a missing ext entry, never a `0.0`).
+    ///
+    /// Derived post-merge by
+    /// `crate::assert::populate_run_distribution_metrics` from the
+    /// `stats.cgroups[]` counters (which survive bulk-frame stripping, so
+    /// WorstLowest needs no degraded fallback). Like Distribution it is
+    /// `is_derived` (skipped at the within-run reducers) and CROSS-RUN it
+    /// MEAN-folds the per-run derived values through [`aggregate_finite`].
+    WorstLowest {
+        /// The per-cgroup iteration-count numerator.
+        numerator: WorstLowestNumerator,
+        /// The per-cgroup denominator the iteration count is divided by.
+        denominator: WorstLowestDenominator,
+    },
 }
 
 /// Sub-classification for [`MetricKind::Gauge`] picking the
@@ -223,6 +287,78 @@ pub enum GaugeAgg {
     /// detect a worst-case regression (e.g. queue-depth probe
     /// where any spike is the signal of interest).
     Max,
+}
+
+/// The raw per-cgroup sample vector on
+/// [`crate::assert::PhaseCgroupStats`] that a [`MetricKind::Distribution`]
+/// re-pools over. Each variant maps to exactly one un-reduced sample
+/// vector the per-phase per-cgroup carrier holds (stored RAW in
+/// nanoseconds; the [`SampleReduction`] applies the ns→µs scale once).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
+#[non_exhaustive]
+pub enum SampleSource {
+    /// Per-wakeup latency samples in ns
+    /// (`crate::assert::PhaseCgroupStats::wake_latencies_ns`). One sample per
+    /// observed wakeup (reservoir-capped per cgroup), so the pooled set is the
+    /// cross-cgroup union of those capped per-wakeup samples.
+    WakeLatencyNs,
+    /// Per-worker schedstat run-delay samples in ns
+    /// (`crate::assert::PhaseCgroupStats::run_delays_ns`). One sample per worker
+    /// — each is that worker's whole-run cumulative `sched_info.run_delay`
+    /// delta (last-minus-first), so the pool size is the worker count, NOT a
+    /// per-wakeup stream like `WakeLatencyNs`.
+    RunDelayNs,
+}
+
+/// The statistic a [`MetricKind::Distribution`] computes over its pooled
+/// [`SampleSource`] set. Each maps to the matching reduction
+/// `crate::assert::cgroup_stats` computes per cgroup, so the run-level
+/// re-pool reproduces that reduction over the COMBINED cross-cgroup set
+/// rather than folding ready-made per-cgroup reductions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
+#[non_exhaustive]
+pub enum SampleReduction {
+    /// 99th percentile (nearest-rank), ns→µs.
+    P99,
+    /// Median (50th percentile, nearest-rank), ns→µs.
+    Median,
+    /// Coefficient of variation (stddev / mean) over the pooled set,
+    /// `n = pool.len()`. Unitless.
+    Cv,
+    /// Arithmetic mean over the pooled set, ns→µs.
+    Mean,
+    /// Maximum (worst) sample over the pooled set, ns→µs. CROSS-RUN this is
+    /// the one reduction [`aggregate_finite`] folds by MAX (peak survives),
+    /// not MEAN — see [`MetricKind::Distribution`].
+    Worst,
+}
+
+/// The per-cgroup iteration-count numerator of a
+/// [`MetricKind::WorstLowest`] efficiency selector. Single variant today
+/// (`Iterations`); the slot mirrors [`MetricKind::Rate`]'s `numerator` and is
+/// `#[non_exhaustive]` so a future numerator (e.g. a work-unit count) can be
+/// added without a breaking change. The producer matches only on the
+/// `denominator`, treating the numerator as always-iterations for now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
+#[non_exhaustive]
+pub enum WorstLowestNumerator {
+    /// Per-cgroup total iteration count
+    /// (`crate::assert::CgroupStats::total_iterations`).
+    Iterations,
+}
+
+/// The per-cgroup denominator a [`MetricKind::WorstLowest`] iteration
+/// count is divided by to form the efficiency rate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
+#[non_exhaustive]
+pub enum WorstLowestDenominator {
+    /// Worker count (`crate::assert::CgroupStats::num_workers`) — yields
+    /// iterations-per-worker (raw throughput, scales with the CPU budget).
+    NumWorkers,
+    /// On-CPU nanoseconds (`crate::assert::CgroupStats::total_cpu_time_ns`),
+    /// converted ns→s ONCE on the summed counter — yields the
+    /// overcommit-invariant iterations-per-CPU-second efficiency.
+    CpuTimeNs,
 }
 
 /// How a per-phase metric reduction merges across two
@@ -261,12 +397,16 @@ pub enum MergeKind {
     /// Timestamp). The merge resolves to the value from whichever
     /// bucket has the later `end_ms`; ties keep `self`.
     NonCommutative,
-    /// The reduction is a DERIVED ratio (a [`MetricKind::Rate`]): it
-    /// cannot be folded from two already-divided values. The components
-    /// merge by their own kinds and the rate is re-derived as
-    /// `Σnumerator / Σdenominator` — see [`derive_rate_metrics`]. The
-    /// per-metric merge loop skips Rate keys entirely and the post-pass
-    /// re-derives them, so this variant is classification metadata: no
+    /// The value is DERIVED post-merge from pooled components, never folded
+    /// from two already-reduced values. Covers all three
+    /// [`MetricKind::is_derived`] kinds:
+    /// - [`MetricKind::Rate`]: re-derived as `Σnumerator / Σdenominator` from
+    ///   its component keys by [`derive_rate_metrics`];
+    /// - [`MetricKind::Distribution`] / [`MetricKind::WorstLowest`]: re-pooled
+    ///   from the raw per-cgroup samples / counters by
+    ///   `crate::assert::populate_run_distribution_metrics`.
+    /// The per-metric merge loop skips these derived keys entirely and the
+    /// post-pass produces them, so this variant is classification metadata: no
     /// merge dispatches on it.
     Recompute,
 }
@@ -295,7 +435,44 @@ impl MetricKind {
             // A Rate is re-derived from its pooled components, never
             // folded from two ready-made ratios.
             MetricKind::Rate { .. } => MergeKind::Recompute,
+            // Distribution and WorstLowest are derived post-merge by
+            // `populate_run_distribution_metrics` (re-pooled from the
+            // per-cgroup raw samples / counters), so the per-phase merge
+            // loop skips them and re-derives — classification-only, like
+            // Rate. See [`MetricKind::is_derived`].
+            MetricKind::Distribution { .. } => MergeKind::Recompute,
+            MetricKind::WorstLowest { .. } => MergeKind::Recompute,
         }
+    }
+
+    /// Whether this kind is DERIVED post-merge from other data rather than
+    /// reduced from its own per-phase sample slice: [`MetricKind::Rate`]
+    /// (from numerator/denominator components), [`MetricKind::Distribution`]
+    /// (re-pooled from the per-cgroup raw sample sets), and
+    /// [`MetricKind::WorstLowest`] (lowest-wins over per-cgroup counters).
+    ///
+    /// Drives the WITHIN-RUN skip-sites that must not reduce a derived kind
+    /// from a slice: [`aggregate_samples_for_phase`] returns None, and the
+    /// per-phase build, the cross-phase
+    /// `crate::assert::merge_matched_phase_buckets` key-loop, and
+    /// [`crate::assert::populate_run_ext_metrics_from_phases`] all skip the
+    /// key then re-derive.
+    ///
+    /// NOT a uniform cross-RUN skip: at the cross-RUN ext fold
+    /// ([`group_and_average_by`]) ONLY [`MetricKind::Rate`] is skipped —
+    /// its components survive cross-RUN so it re-derives there — while
+    /// Distribution / WorstLowest, whose components do NOT survive
+    /// cross-RUN, fall through to be plainly folded (MEAN, or MAX for
+    /// [`SampleReduction::Worst`]) by [`aggregate_finite`]. So callers
+    /// gate on `is_derived` for the within-run sites and on
+    /// `matches!(.., Rate { .. })` for the cross-RUN ext fold.
+    pub fn is_derived(self) -> bool {
+        matches!(
+            self,
+            MetricKind::Rate { .. }
+                | MetricKind::Distribution { .. }
+                | MetricKind::WorstLowest { .. }
+        )
     }
 }
 
@@ -389,6 +566,60 @@ fn aggregate_finite(
         // the PER-PHASE path (Counter last-minus-first vs DeltaSum sum —
         // see aggregate_samples_for_phase).
         MetricKind::Counter | MetricKind::DeltaSum => finite.iter().sum(),
+        // Distribution Worst (peak run-delay): the cross-RUN fold is MAX
+        // so the high-water peak survives, distinct from the MEAN-folded
+        // percentile / CV / mean reductions below. (WITHIN-RUN no
+        // Distribution/WorstLowest reaches here — `is_derived` skips them at
+        // the per-phase reducers; this arm only fires at the cross-RUN ext
+        // fold in `group_and_average_by`.) Matched before the general
+        // `Distribution { .. }` mean arm so Worst takes MAX, not MEAN.
+        MetricKind::Distribution {
+            reduction: SampleReduction::Worst,
+            ..
+        } => finite.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+        // Cross-RUN MEAN fold of the remaining Distribution reductions (p99 /
+        // median / CV / mean run-delay) and every WorstLowest selector: each
+        // per-run value is itself a within-run pooled reduction or a
+        // lowest-wins selector, NOT a monitor-sampled gauge, so the cross-RUN
+        // fold is an UNWEIGHTED arithmetic mean — `sum / finite.len()`, i.e.
+        // over the runs that EMITTED a finite value for the key. This matches
+        // the unweighted-mean SHAPE of the surviving typed siblings
+        // (worst_wake_latency_tail_ratio, spread, migration_ratio), but its
+        // divisor is the present-finite-contributor count, NOT the typed path's
+        // `sum / passes_observed`: a passing run that omitted the key (absent /
+        // dropped-non-finite ext entry) is EXCLUDED from the mean rather than
+        // folded in as 0.0 — the deliberate no-false-zero improvement the ext
+        // relocation buys (the old typed field defaulted a no-data run to 0.0).
+        // Weighting by `run_sample_count` (the MONITOR capture count) would
+        // weight by an unrelated population AND silently zero-weight a
+        // monitor-off run, so it is deliberately NOT used here. (WITHIN-RUN
+        // these never reach here — `is_derived` skips them at the per-phase
+        // reducers; this arm only fires at the cross-RUN ext fold in
+        // `group_and_average_by`.)
+        //
+        // EXTREMUM ASYMMETRY (on the record, ratified): every WorstLowest
+        // selector is a within-run lowest-wins ("worst cgroup") value yet folds
+        // cross-RUN by this MEAN, NOT by an extremum — UNLIKE worst_run_delay_us
+        // (SampleReduction::Worst), whose dedicated MAX arm above preserves the
+        // peak-of-peaks. Both reproduce the deleted typed cross-RUN folds
+        // exactly: run-delay is a peak detector (MAX), the iteration
+        // efficiencies are a starvation-floor cohort statistic (MEAN). Aligning
+        // WorstLowest to an extremum (a MIN arm gated on HigherBetter) would be
+        // a future product decision, tracked separately, not a Stage-1 fix.
+        //
+        // HYBRID caveat (sharpest for CV): a cross-RUN value here is a
+        // mean-of-per-run-reductions, NOT a reduction recomputed over the
+        // combined raw set — the raw samples do not survive cross-RUN (phases
+        // are dropped), so there is no union to re-pool. For p99 / median /
+        // mean run-delay this mean-of-summaries is a defensible cohort
+        // statistic; for worst_wake_latency_cv it is a mean-of-ratios (the
+        // fold-of-ready-made-ratios shape the Rate kind exists to avoid), not a
+        // pooled CV — accepted here only because no combined set exists to
+        // recompute over, and it reproduces the deleted typed path's shape
+        // exactly. See [`MetricKind::Distribution`].
+        MetricKind::Distribution { .. } | MetricKind::WorstLowest { .. } => {
+            finite.iter().sum::<f64>() / (finite.len() as f64)
+        }
         MetricKind::Gauge(GaugeAgg::Avg) => {
             // Weighted mean: sum(v * w) / sum(w). Uniform-weight
             // callers (aggregate_samples) reduce to arithmetic
@@ -469,11 +700,12 @@ fn aggregate_finite(
 pub fn aggregate_samples_for_phase(metric: &MetricDef, samples: &[f64]) -> Option<f64> {
     match metric.kind {
         MetricKind::Counter => phase_counter_delta(samples),
-        // A Rate has no samples of its own; its per-phase value is
-        // derived from the reduced numerator/denominator component
-        // buckets by `derive_rate_metrics` in the build post-pass. Return
-        // None so the build loop inserts no rate key here.
-        MetricKind::Rate { .. } => None,
+        // Derived kinds (Rate / Distribution / WorstLowest) have no samples
+        // of their own: their value is produced by a post-pass
+        // (`derive_rate_metrics` / `crate::assert::populate_run_distribution_metrics`)
+        // from pooled components, not reduced from a per-phase slice. Return
+        // None so the build loop inserts no key here.
+        k if k.is_derived() => None,
         _ => aggregate_samples(samples, metric.kind),
     }
 }
@@ -602,14 +834,15 @@ impl MetricDef {
     /// [`crate::assert::PhaseBucket`] value per metric.
     ///
     /// Returns `None` for metrics that cannot be derived from a
-    /// single-sample shape: most ktstr metrics are computed
-    /// host-side from cross-CPU or cross-cgroup folds
-    /// (`worst_spread`, `worst_gap_ms`, `worst_migration_ratio`,
-    /// `max_imbalance_ratio`, all `worst_*_wake_latency_*`,
-    /// `worst_iterations_per_worker`, `worst_iterations_per_cpu_sec`,
+    /// single-sample shape: most ktstr metrics are computed host-side
+    /// (cross-CPU / cross-cgroup folds, run-level distributional
+    /// re-pools, or monitor-axis windowing), not from one sample —
+    /// `worst_spread`, `worst_gap_ms`, `worst_migration_ratio`,
+    /// `max_imbalance_ratio`, the `worst_*_wake_latency_*` /
+    /// `worst_mean_run_delay_us` / `worst_run_delay_us` distributions,
+    /// `worst_iterations_per_worker` / `worst_iterations_per_cpu_sec`,
     /// `worst_page_locality`, `worst_cross_node_migration_ratio`,
-    /// `worst_mean_run_delay_us`, `worst_run_delay_us`,
-    /// `worst_wake_latency_tail_ratio`) and have no single-sample
+    /// `worst_wake_latency_tail_ratio` — and have no single-sample
     /// reading.
     ///
     /// Wired per-sample arms (return `Some`): `max_dsq_depth` /
@@ -639,10 +872,12 @@ impl MetricDef {
         // Per-metric dispatch by registry name. Only the metrics
         // whose value is genuinely a per-sample reading are wired;
         // the remaining 16 entries in the METRICS registry are
-        // cross-cgroup folds computed host-side at
-        // `evaluate_vm_result` time (worst-spread, worst-gap-ms,
-        // every `worst_*_wake_latency_*`, worst-iterations-per-
-        // worker, etc.) and have no single-sample equivalent —
+        // cross-cgroup folds or run-level distributional re-pools
+        // computed host-side at `evaluate_vm_result` time
+        // (worst-spread / worst-gap-ms fold; the
+        // `worst_*_wake_latency_*` distributions + worst-iterations-per-
+        // worker efficiencies re-pool) and have no single-sample
+        // equivalent —
         // they fall through to None below and the phase
         // aggregator paints them as absent bucket entries
         // (distinct from a real zero — sentinel-free contract).
@@ -789,15 +1024,36 @@ impl MetricDef {
 /// | `worst_page_locality` | `page_locality` | `page_locality` |
 /// | `worst_cross_node_migration_ratio` | `cross_node_migration_ratio` | `cross_node_migration_ratio` |
 ///
-/// Nine of the remaining metrics in [`METRICS`] have matching
-/// registry / field / DataFrame column names
-/// (`worst_p99_wake_latency_us`, `worst_median_wake_latency_us`,
-/// `worst_wake_latency_cv`, `total_iterations`,
-/// `worst_mean_run_delay_us`, `worst_run_delay_us`,
-/// `worst_wake_latency_tail_ratio`,
-/// `worst_iterations_per_worker`,
-/// `worst_iterations_per_cpu_sec`) and are not listed — no
+/// Two of the remaining metrics in [`METRICS`] have matching
+/// registry / field / DataFrame column names backed by a typed
+/// `GauntletRow` field (`total_iterations`,
+/// `worst_wake_latency_tail_ratio`) and are not listed — no
 /// translation to document.
+///
+/// The seven wake-latency / run-delay / iteration-efficiency roll-ups
+/// (`worst_p99_wake_latency_us`, `worst_median_wake_latency_us`,
+/// `worst_wake_latency_cv`, `worst_mean_run_delay_us`,
+/// `worst_run_delay_us`, `worst_iterations_per_worker`,
+/// `worst_iterations_per_cpu_sec`) are DERIVED kinds
+/// ([`MetricKind::Distribution`] / [`MetricKind::WorstLowest`]) with NO
+/// typed `GauntletRow` field: their accessors are `|_| None` and
+/// `crate::assert::populate_run_distribution_metrics` re-pools their value
+/// into `ext_metrics` post-merge, so [`MetricDef::read`] reads them through
+/// the ext fallback.
+///
+/// `worst_` naming convention: it is the codebase-wide prefix for a
+/// cross-cgroup roll-up, independent of polarity and of HOW the roll-up is
+/// formed. Polarity-directional selectors (`worst_spread` LowerBetter →
+/// max; `worst_page_locality` HigherBetter → lowest-non-zero) and
+/// [`MetricKind::WorstLowest`] (`worst_iterations_per_*`, None-aware
+/// lowest-wins) both surface the most problematic cgroup; whereas
+/// [`MetricKind::Distribution`] (`worst_p99_wake_latency_us` etc.) is the
+/// POOLED cross-cgroup distribution over the combined sample set, NOT a
+/// per-cgroup selection — here `worst_` is retained for sidecar /
+/// DataFrame / CI-gate name stability rather than literal accuracy. A
+/// `lowest_*` rename of the HigherBetter selectors was weighed and
+/// rejected as a high-churn rename across sidecars / DataFrames / CI gates
+/// for no readability gain.
 ///
 /// Quoting the matching list instead of a bare count avoids
 /// silent drift on rename: a metric whose registry / field /
@@ -969,31 +1225,53 @@ pub static METRICS: &[MetricDef] = &[
         accessor: |r| Some(r.keep_last_count as f64),
     },
     MetricDef {
+        // Wake-latency p99, re-pooled over the COMBINED wake-latency sample
+        // set across every cgroup (and phase), NOT a max of per-cgroup p99s.
+        // Distribution kind: derived post-merge by
+        // `crate::assert::populate_run_distribution_metrics`; accessor is
+        // |_| None so `MetricDef::read` takes the ext_metrics value the
+        // re-pool writes. (The `worst_` name is retained for sidecar /
+        // DataFrame / CI-gate stability — see the `worst_` naming
+        // convention on [`METRICS`].)
         name: "worst_p99_wake_latency_us",
         polarity: crate::test_support::Polarity::LowerBetter,
-        kind: MetricKind::Gauge(GaugeAgg::Last),
+        kind: MetricKind::Distribution {
+            source: SampleSource::WakeLatencyNs,
+            reduction: SampleReduction::P99,
+        },
         default_abs: 50.0,
         default_rel: 0.25,
         display_unit: "\u{00b5}s",
-        accessor: |r| Some(r.worst_p99_wake_latency_us),
+        accessor: |_| None,
     },
     MetricDef {
+        // Wake-latency median (50th pct), re-pooled over the combined wake
+        // set — see `worst_p99_wake_latency_us`.
         name: "worst_median_wake_latency_us",
         polarity: crate::test_support::Polarity::LowerBetter,
-        kind: MetricKind::Gauge(GaugeAgg::Last),
+        kind: MetricKind::Distribution {
+            source: SampleSource::WakeLatencyNs,
+            reduction: SampleReduction::Median,
+        },
         default_abs: 20.0,
         default_rel: 0.25,
         display_unit: "\u{00b5}s",
-        accessor: |r| Some(r.worst_median_wake_latency_us),
+        accessor: |_| None,
     },
     MetricDef {
+        // Wake-latency coefficient of variation (stddev/mean), re-pooled
+        // over the combined wake set (`n = pool.len()`) — see
+        // `worst_p99_wake_latency_us`.
         name: "worst_wake_latency_cv",
         polarity: crate::test_support::Polarity::LowerBetter,
-        kind: MetricKind::Gauge(GaugeAgg::Last),
+        kind: MetricKind::Distribution {
+            source: SampleSource::WakeLatencyNs,
+            reduction: SampleReduction::Cv,
+        },
         default_abs: 0.10,
         default_rel: 0.25,
         display_unit: "",
-        accessor: |r| Some(r.worst_wake_latency_cv),
+        accessor: |_| None,
     },
     MetricDef {
         // Per-phase worker iterations per second. MetricKind::Rate with
@@ -1109,9 +1387,9 @@ pub static METRICS: &[MetricDef] = &[
         // re-pooled across runs): Σiterations / Σcpu-seconds. MetricKind::Rate
         // over the two Counter components above; derive_rate_metrics re-derives
         // it = Σtotal_iterations_pooled / Σtotal_cpu_time_sec at every level.
-        // Distinct from the per-cgroup `worst_iterations_per_cpu_sec` Gauge
-        // (the min-fold starvation selector): this is the POOLED cohort rate,
-        // overcommit-invariant. _per_cpu_sec name + Rate kind passes the
+        // Distinct from the per-cgroup `worst_iterations_per_cpu_sec`
+        // WorstLowest metric (the lowest-wins min-fold starvation selector):
+        // this is the POOLED cohort rate, overcommit-invariant. _per_cpu_sec name + Rate kind passes the
         // reverse naming gate; ext_metrics-only (accessor |_| None).
         //
         // SAME physical quantity as worst_iterations_per_cpu_sec (iter/CPU-s
@@ -1174,22 +1452,39 @@ pub static METRICS: &[MetricDef] = &[
         accessor: |_| None,
     },
     MetricDef {
+        // Mean schedstat run-delay, re-pooled as the mean over the COMBINED
+        // run-delay sample set across every cgroup (and phase), RAW ns→µs
+        // once — see `worst_p99_wake_latency_us`. Each sample is one per-WORKER
+        // cumulative sched_info.run_delay total (NOT per-dispatch), so the pool
+        // size is the worker count — see
+        // [`crate::assert::PhaseCgroupStats::run_delays_ns`]. Distribution kind;
+        // accessor |_| None (ext_metrics-sourced from the re-pool).
         name: "worst_mean_run_delay_us",
         polarity: crate::test_support::Polarity::LowerBetter,
-        kind: MetricKind::Gauge(GaugeAgg::Last),
+        kind: MetricKind::Distribution {
+            source: SampleSource::RunDelayNs,
+            reduction: SampleReduction::Mean,
+        },
         default_abs: 50.0,
         default_rel: 0.25,
         display_unit: "\u{00b5}s",
-        accessor: |r| Some(r.worst_mean_run_delay_us),
+        accessor: |_| None,
     },
     MetricDef {
+        // Worst (max) schedstat run-delay over the combined run-delay sample
+        // set, RAW ns→µs once. Distribution kind with the Worst reduction:
+        // the one Distribution reduction whose cross-RUN fold is MAX (the
+        // peak survives), not MEAN — see [`crate::stats::SampleReduction::Worst`].
         name: "worst_run_delay_us",
         polarity: crate::test_support::Polarity::LowerBetter,
-        kind: MetricKind::Peak,
+        kind: MetricKind::Distribution {
+            source: SampleSource::RunDelayNs,
+            reduction: SampleReduction::Worst,
+        },
         default_abs: 100.0,
         default_rel: 0.50,
         display_unit: "\u{00b5}s",
-        accessor: |r| Some(r.worst_run_delay_us),
+        accessor: |_| None,
     },
     MetricDef {
         // Ratio of p99 / median wake latency, worst-case across
@@ -1199,6 +1494,16 @@ pub static METRICS: &[MetricDef] = &[
         // ordering). `default_abs = 0.5` guards against trivially
         // small deltas that percent-only gates would flag; `default_rel
         // = 0.25` matches the wake-latency metrics' percent gate.
+        //
+        // BASIS: this stays a per-cgroup worst — the max over each
+        // cgroup's own p99/median ratio (`CgroupStats::wake_latency_tail_ratio`,
+        // a `Gauge(Last)` carried on the typed row). It is deliberately NOT
+        // `pooled_p99 / pooled_median` of the reclassified
+        // `worst_p99_wake_latency_us` / `worst_median_wake_latency_us`
+        // Distributions (those re-pool the cross-cgroup union), so the two
+        // do not satisfy `tail_ratio == pooled_p99/pooled_median`. Cross-RUN
+        // fold alignment of this metric with the exclude-missing Distribution
+        // semantic is tracked separately.
         //
         // Samples-required noise gate: the accessor returns `None` when
         // the run completed fewer than
@@ -1252,13 +1557,23 @@ pub static METRICS: &[MetricDef] = &[
         // companion gate handles larger throughputs proportionally,
         // so the `abs=10` floor only binds in the small-count regime
         // where rel-only would let single-digit losses slip through.
+        //
+        // WorstLowest kind: the lowest (worst) cgroup's
+        // total_iterations / num_workers, re-pooled post-merge by
+        // `crate::assert::populate_run_distribution_metrics` from the
+        // per-cgroup counters via the None-aware lowest-wins fold (a
+        // measured Some(0.0) wins; a no-workers None is skipped). Accessor
+        // |_| None — ext_metrics-sourced; an all-None cohort writes no key.
         name: "worst_iterations_per_worker",
         polarity: crate::test_support::Polarity::HigherBetter,
-        kind: MetricKind::Gauge(GaugeAgg::Last),
+        kind: MetricKind::WorstLowest {
+            numerator: WorstLowestNumerator::Iterations,
+            denominator: WorstLowestDenominator::NumWorkers,
+        },
         default_abs: 10.0,
         default_rel: 0.10,
         display_unit: "",
-        accessor: |r| Some(r.worst_iterations_per_worker),
+        accessor: |_| None,
     },
     MetricDef {
         // Overcommit-INVARIANT per-cgroup efficiency (iterations per
@@ -1278,15 +1593,24 @@ pub static METRICS: &[MetricDef] = &[
         // floor (which scales with worker count) — this is a per-second
         // rate, so the floor is a flat anti-noise guard, not a per-worker
         // derivation.
+        //
+        // WorstLowest kind: the lowest (worst) cgroup's
+        // total_iterations / (total_cpu_time_ns / 1e9), re-pooled post-merge
+        // by `crate::assert::populate_run_distribution_metrics` (None when a
+        // cgroup has no workers or no on-CPU time; lowest measured wins).
+        // Accessor |_| None — ext_metrics-sourced.
         name: "worst_iterations_per_cpu_sec",
         polarity: crate::test_support::Polarity::HigherBetter,
-        kind: MetricKind::Gauge(GaugeAgg::Last),
+        kind: MetricKind::WorstLowest {
+            numerator: WorstLowestNumerator::Iterations,
+            denominator: WorstLowestDenominator::CpuTimeNs,
+        },
         default_abs: 10.0,
         default_rel: 0.10,
         // Same physical quantity as the pooled iterations_per_cpu_sec Rate;
         // share its unit string rather than leaving this one under-specified.
         display_unit: "iter/cpu-s",
-        accessor: |r| Some(r.worst_iterations_per_cpu_sec),
+        accessor: |_| None,
     },
     MetricDef {
         name: "worst_page_locality",
@@ -1849,13 +2173,12 @@ pub struct GauntletRow {
     /// see the triples table on [`METRICS`] for the registry / field /
     /// column rationale.
     pub keep_last_count: i64,
-    // Benchmarking fields.
-    pub worst_p99_wake_latency_us: f64,
-    pub worst_median_wake_latency_us: f64,
-    pub worst_wake_latency_cv: f64,
+    // Benchmarking fields. The wake-latency (p99 / median / CV) and
+    // run-delay (mean / worst) roll-ups are NO LONGER typed fields: they are
+    // `MetricKind::Distribution`, re-pooled into `ext_metrics` post-merge by
+    // `crate::assert::populate_run_distribution_metrics`; `MetricDef::read`
+    // surfaces them via the ext fallback (their accessors are `|_| None`).
     pub total_iterations: u64,
-    pub worst_mean_run_delay_us: f64,
-    pub worst_run_delay_us: f64,
     /// Worst-case ratio of p99 / median wake latency across cgroups.
     /// Higher values indicate a stretched long tail. Registry name
     /// matches the field name; see the triples table on [`METRICS`]
@@ -1864,46 +2187,12 @@ pub struct GauntletRow {
     /// [`WAKE_LATENCY_TAIL_RATIO_MIN_ITERATIONS`] iterations — see
     /// the constant's doc for the rationale.
     pub worst_wake_latency_tail_ratio: f64,
-    /// Worst-case per-worker iteration count across cgroups (LOWEST
-    /// across cgroups — lower is worse). Registry name matches the
-    /// field name; see the triples table on [`METRICS`] for the
-    /// field / registry / DataFrame-column mapping.
-    ///
-    /// # `worst_` vs `lowest_` naming evaluation
-    ///
-    /// A `lowest_iterations_per_worker` rename was considered — it
-    /// would describe the merge direction (min across cgroups) more
-    /// literally than `worst_`, which semantically maps "worst" to
-    /// different merge operations depending on polarity (max for
-    /// lower-better metrics, min for higher-better). Rejected
-    /// because `worst_` is the codebase-wide prefix for
-    /// cross-cgroup roll-ups regardless of polarity — see
-    /// `worst_page_locality` (`HigherBetter` → the merge takes the
-    /// LOWEST non-zero value) and `worst_spread` (`LowerBetter` →
-    /// the merge takes the HIGHEST). Breaking that convention for
-    /// one metric would require either (a) renaming every existing
-    /// `HigherBetter` worst_* metric to `lowest_*` for consistency,
-    /// or (b) accepting a mixed naming scheme where readers have to
-    /// cross-reference each metric's polarity to understand the
-    /// prefix. Option (a) is a high-churn rename across
-    /// sidecars / DataFrames / CI gates; option (b) degrades
-    /// readability. The current convention — `worst_` = "the
-    /// cross-cgroup roll-up that surfaces the most problematic
-    /// cgroup, direction determined by the metric's polarity" —
-    /// is documented on [`METRICS`] and applies here.
-    pub worst_iterations_per_worker: f64,
-    /// Worst-case per-cgroup CPU-time efficiency
-    /// ([`crate::assert::ScenarioStats::worst_iterations_per_cpu_sec`],
-    /// the lowest [`crate::assert::CgroupStats::iterations_per_cpu_sec`]
-    /// across the run's cgroups). Unlike
-    /// [`Self::worst_iterations_per_worker`] (raw work, which scales with
-    /// the host-CPU budget), this is OVERCOMMIT-INVARIANT — it is the
-    /// metric to compare across runs of different `cpu_budget` without the
-    /// host-contention confound the overcommit marker / compare-path
-    /// warning point at. `0.0` when no cgroup reported a defined rate
-    /// (collapsed from `None`, same as the sibling worst_* fields).
-    /// Surfaced in [`METRICS`] under `worst_iterations_per_cpu_sec`.
-    pub worst_iterations_per_cpu_sec: f64,
+    // worst_iterations_per_worker / worst_iterations_per_cpu_sec are NO
+    // LONGER typed fields: they are `MetricKind::WorstLowest`, re-selected
+    // into `ext_metrics` post-merge by
+    // `crate::assert::populate_run_distribution_metrics` (lowest-wins over
+    // the per-cgroup counters); `MetricDef::read` surfaces them via the ext
+    // fallback. The `worst_` naming convention is documented on [`METRICS`].
     // NUMA fields.
     /// Worst-case per-cgroup NUMA page-locality fraction (lowest
     /// non-zero). Surfaced in [`METRICS`] under registry name
@@ -2907,14 +3196,8 @@ pub fn group_and_average_by(
         sum_stuck_count: usize,
         sum_fallback_count: i64,
         sum_keep_last_count: i64,
-        sum_p99_wake: f64,
-        sum_median_wake: f64,
-        sum_wake_cv: f64,
         sum_total_iterations: u64,
-        sum_mean_run_delay: f64,
         sum_tail_ratio: f64,
-        sum_iters_per_worker: f64,
-        sum_iters_per_cpu_sec: f64,
         sum_page_locality: f64,
         sum_cross_node_mig: f64,
         // Per-row MAX-fold for Peak-kind fields. Per
@@ -2927,7 +3210,6 @@ pub fn group_and_average_by(
         max_gap_ms: u64,
         max_imbalance_ratio: f64,
         max_max_dsq_depth: u32,
-        max_run_delay_us: f64,
         // Per-ext-metric (value, weight) pairs, accumulated across
         // contributors. At emit time the kind-aware fold dispatches
         // each key through `aggregate_samples` with `Some(&weights)`
@@ -2981,20 +3263,13 @@ pub fn group_and_average_by(
                 sum_stuck_count: 0,
                 sum_fallback_count: 0,
                 sum_keep_last_count: 0,
-                sum_p99_wake: 0.0,
-                sum_median_wake: 0.0,
-                sum_wake_cv: 0.0,
                 sum_total_iterations: 0,
-                sum_mean_run_delay: 0.0,
                 sum_tail_ratio: 0.0,
-                sum_iters_per_worker: 0.0,
-                sum_iters_per_cpu_sec: 0.0,
                 sum_page_locality: 0.0,
                 sum_cross_node_mig: 0.0,
                 max_gap_ms: 0,
                 max_imbalance_ratio: 0.0,
                 max_max_dsq_depth: 0,
-                max_run_delay_us: 0.0,
                 ext_pairs: BTreeMap::new(),
                 sum_run_sample_count: 0,
             }
@@ -3047,16 +3322,10 @@ pub fn group_and_average_by(
         acc.sum_stuck_count = acc.sum_stuck_count.saturating_add(row.stuck_count);
         acc.sum_fallback_count = acc.sum_fallback_count.saturating_add(row.fallback_count);
         acc.sum_keep_last_count = acc.sum_keep_last_count.saturating_add(row.keep_last_count);
-        acc.sum_p99_wake += row.worst_p99_wake_latency_us;
-        acc.sum_median_wake += row.worst_median_wake_latency_us;
-        acc.sum_wake_cv += row.worst_wake_latency_cv;
         acc.sum_total_iterations = acc
             .sum_total_iterations
             .saturating_add(row.total_iterations);
-        acc.sum_mean_run_delay += row.worst_mean_run_delay_us;
         acc.sum_tail_ratio += row.worst_wake_latency_tail_ratio;
-        acc.sum_iters_per_worker += row.worst_iterations_per_worker;
-        acc.sum_iters_per_cpu_sec += row.worst_iterations_per_cpu_sec;
         acc.sum_page_locality += row.page_locality;
         acc.sum_cross_node_mig += row.cross_node_migration_ratio;
         // Peak-kind typed fields: cross-RUN aggregation surfaces
@@ -3068,9 +3337,6 @@ pub fn group_and_average_by(
             acc.max_imbalance_ratio = row.imbalance_ratio;
         }
         acc.max_max_dsq_depth = acc.max_max_dsq_depth.max(row.max_dsq_depth);
-        if row.worst_run_delay_us > acc.max_run_delay_us {
-            acc.max_run_delay_us = row.worst_run_delay_us;
-        }
         acc.sum_run_sample_count = acc
             .sum_run_sample_count
             .saturating_add(row.run_sample_count);
@@ -3128,15 +3394,22 @@ pub fn group_and_average_by(
             &acc.first.kernel_commit,
         );
         // ext_metrics is built BEFORE the struct so Rate keys can be
-        // re-derived from the folded components as a post-pass. A Rate is
-        // derived, not folded: folding two ready-made per-phase ratios
-        // would lose the Σnum/Σdenom re-pool, and routing a Rate through
-        // aggregate_samples_weighted would hit the aggregate_finite Rate
-        // guard. Dispatch by registered MetricKind so Gauge(Avg) gets the
-        // weighted-mean fold (matches the per-phase merge contract);
-        // unregistered names (no metric_def) fall back to arithmetic mean,
-        // the legacy (sum, count) semantic. Skip a key whose reduction is
-        // None (every value NaN — defensive post sidecar_to_row sanitize).
+        // re-derived from the folded components as a post-pass. ONLY Rate is
+        // skipped here: its components survive cross-RUN as their own ext keys
+        // so it re-derives Σnum/Σdenom (folding two ready-made ratios would
+        // lose the re-pool, and routing a Rate through
+        // aggregate_samples_weighted would hit the aggregate_finite guard).
+        // Distribution / WorstLowest are NOT skipped — their raw components do
+        // NOT survive cross-RUN (phases are dropped), so there is no pooled set
+        // to re-derive; they fall through to aggregate_samples_weighted and
+        // fold by kind (MEAN for the percentile / CV / mean reductions and
+        // every WorstLowest, MAX for SampleReduction::Worst — the
+        // aggregate_finite arms). Dispatch by registered MetricKind so
+        // Gauge(Avg) gets the weighted-mean fold (matches the per-phase merge
+        // contract); unregistered names (no metric_def) fall back to
+        // arithmetic mean, the legacy (sum, count) semantic. Skip a key whose
+        // reduction is None (every value NaN — defensive post sidecar_to_row
+        // sanitize).
         let mut ext_metrics: std::collections::BTreeMap<String, f64> = acc
             .ext_pairs
             .into_iter()
@@ -3216,20 +3489,13 @@ pub fn group_and_average_by(
             gap_ms: acc.max_gap_ms,
             imbalance_ratio: acc.max_imbalance_ratio,
             max_dsq_depth: acc.max_max_dsq_depth,
-            worst_run_delay_us: acc.max_run_delay_us,
             migrations: round_u64(acc.sum_migrations),
             migration_ratio: acc.sum_migration_ratio / denom,
             stuck_count: round_usize(acc.sum_stuck_count),
             fallback_count: round_i64(acc.sum_fallback_count),
             keep_last_count: round_i64(acc.sum_keep_last_count),
-            worst_p99_wake_latency_us: acc.sum_p99_wake / denom,
-            worst_median_wake_latency_us: acc.sum_median_wake / denom,
-            worst_wake_latency_cv: acc.sum_wake_cv / denom,
             total_iterations: round_u64(acc.sum_total_iterations),
-            worst_mean_run_delay_us: acc.sum_mean_run_delay / denom,
             worst_wake_latency_tail_ratio: acc.sum_tail_ratio / denom,
-            worst_iterations_per_worker: acc.sum_iters_per_worker / denom,
-            worst_iterations_per_cpu_sec: acc.sum_iters_per_cpu_sec / denom,
             page_locality: acc.sum_page_locality / denom,
             cross_node_migration_ratio: acc.sum_cross_node_mig / denom,
             ext_metrics,
@@ -3270,7 +3536,7 @@ pub fn group_and_average_by(
 ///
 /// The 0.0 substitution is indistinguishable from a legitimate 0.0
 /// measurement for metrics whose natural zero carries its own signal.
-/// Three fields are especially affected — note in-tree producers
+/// Two direct f64 fields are especially affected — note in-tree producers
 /// already guard the typical divide-by-zero path (`assert.rs` emits
 /// `0.0` for migration_ratio when `total_iters == 0` and `1.0` for
 /// page_locality when `total == 0`), so a NaN reaching this boundary
@@ -3288,10 +3554,12 @@ pub fn group_and_average_by(
 ///   "everything cross-node" where the truth is "no data". The
 ///   polarity is opposite to `migration_ratio`: the two failure
 ///   modes push the comparison in opposite directions.
-/// - `worst_wake_latency_cv`: lower-better. A real 0.0 means
-///   "wake-latency samples were perfectly uniform" (ideal jitter).
-///   A sanitized NaN collapses to the same value and reads as
-///   *falsely good* — same direction as `migration_ratio`.
+///
+/// The reclassified wake-latency / run-delay distributions (e.g.
+/// `worst_wake_latency_cv`) are NO LONGER direct f64 fields — they flow
+/// through `ext_metrics`, where a non-finite value is DROPPED (the entry is
+/// absent), NOT substituted with 0.0. That is the opposite, no-false-zero
+/// contract: an absent key reads as no-data, distinct from a measured 0.0.
 ///
 /// The accompanying `tracing::warn!` is the only signal that
 /// separates a sanitized NaN from a real 0.0; downstream aggregation
@@ -3364,63 +3632,11 @@ pub fn sidecar_to_row(sc: &crate::test_support::SidecarResult) -> GauntletRow {
             .and_then(|m| m.event_deltas.as_ref())
             .map(|e| e.total_dispatch_keep_last)
             .unwrap_or(0),
-        worst_p99_wake_latency_us: finite_or_zero(
-            "worst_p99_wake_latency_us",
-            sc.stats.worst_p99_wake_latency_us,
-        ),
-        worst_median_wake_latency_us: finite_or_zero(
-            "worst_median_wake_latency_us",
-            sc.stats.worst_median_wake_latency_us,
-        ),
-        worst_wake_latency_cv: finite_or_zero(
-            "worst_wake_latency_cv",
-            sc.stats.worst_wake_latency_cv,
-        ),
         total_iterations: sc.stats.total_iterations,
-        worst_mean_run_delay_us: finite_or_zero(
-            "worst_mean_run_delay_us",
-            sc.stats.worst_mean_run_delay_us,
-        ),
-        worst_run_delay_us: finite_or_zero("worst_run_delay_us", sc.stats.worst_run_delay_us),
         worst_wake_latency_tail_ratio: finite_or_zero(
             "worst_wake_latency_tail_ratio",
             sc.stats.worst_wake_latency_tail_ratio,
         ),
-        // `worst_iterations_per_worker` is `Option` on ScenarioStats
-        // (None = no cgroup reported a worker; Some(0.0) = a cgroup
-        // ran zero iterations). The GauntletRow field uses this
-        // layer's documented 0.0-sentinel-with-warn convention (see
-        // the doc above): a measured Some(0.0) maps to 0.0 (real
-        // starvation, surfaced), and None warns and maps to 0.0 like
-        // any other no-data field at this ingress. The cross-cgroup
-        // None/Some(0.0) distinction is preserved upstream in
-        // AssertResult::merge; this boundary matches the gauntlet
-        // layer's uniform sentinel handling.
-        worst_iterations_per_worker: match sc.stats.worst_iterations_per_worker {
-            Some(v) => finite_or_zero("worst_iterations_per_worker", v),
-            None => {
-                tracing::warn!(
-                    test = %sc.test_name,
-                    field = "worst_iterations_per_worker",
-                    "no cgroup reported a worker; substituting 0.0",
-                );
-                0.0
-            }
-        },
-        // Overcommit-invariant efficiency. `None` when no cgroup reported
-        // a defined rate (no workers or no on-CPU time captured); maps to
-        // 0.0 with a warn, same sentinel convention as the sibling above.
-        worst_iterations_per_cpu_sec: match sc.stats.worst_iterations_per_cpu_sec {
-            Some(v) => finite_or_zero("worst_iterations_per_cpu_sec", v),
-            None => {
-                tracing::warn!(
-                    test = %sc.test_name,
-                    field = "worst_iterations_per_cpu_sec",
-                    "no cgroup reported a defined per-cpu-sec rate; substituting 0.0",
-                );
-                0.0
-            }
-        },
         page_locality: finite_or_zero("page_locality", sc.stats.worst_page_locality),
         cross_node_migration_ratio: finite_or_zero(
             "cross_node_migration_ratio",
@@ -3495,10 +3711,49 @@ const OUTLIER_METRICS: &[(&str, MetricAccessor)] = &[
     ("stuck", |r| r.stuck_count as f64),
     ("fallback", |r| r.fallback_count as f64),
     ("keep_last", |r| r.keep_last_count as f64),
-    ("worst_p99_wake_latency_us", |r| r.worst_p99_wake_latency_us),
-    ("worst_wake_latency_cv", |r| r.worst_wake_latency_cv),
-    ("worst_mean_run_delay_us", |r| r.worst_mean_run_delay_us),
-    ("worst_run_delay_us", |r| r.worst_run_delay_us),
+    // Distribution-kind roll-ups are ext_metrics-sourced (no typed field):
+    // read them through the ext map, 0.0 when absent (the prior typed-field
+    // default), mirroring the deleted `worst_*` accessors. The 0.0-on-absent
+    // here is INTENTIONALLY distinct from the cross-RUN `group_and_average_by`
+    // fold (via `aggregate_finite`'s Distribution arm), which EXCLUDES an absent
+    // key from the mean (no-false-zero). The key is present whenever any cgroup
+    // or carrier contributed; the 0.0-on-absent path is still reachable for a
+    // telemetry-free pass (no phases AND no cgroups, e.g. host_only). A 0.0
+    // here not only escapes being flagged as its own scenario's outlier — it
+    // also ENTERS the cross-scenario overall_mean/overall_std baseline
+    // `find_outliers` builds over all is_pass() rows, so it can shift the
+    // 2-sigma threshold for the whole cohort. Both effects are benign ONLY
+    // because every OUTLIER_METRICS Distribution entry is LowerBetter (a 0.0
+    // reads as best, never the high tail outlier detection targets, and a
+    // telemetry-free row carries no measured signal to begin with) — a coupling
+    // the Distribution=>LowerBetter registry gate enforces. A HigherBetter ext
+    // metric added here would NOT be benign (a 0.0 would depress the baseline
+    // AND could itself read as a low outlier). So the two consumers diverge by
+    // design, not by accident.
+    ("worst_p99_wake_latency_us", |r| {
+        r.ext_metrics
+            .get("worst_p99_wake_latency_us")
+            .copied()
+            .unwrap_or(0.0)
+    }),
+    ("worst_wake_latency_cv", |r| {
+        r.ext_metrics
+            .get("worst_wake_latency_cv")
+            .copied()
+            .unwrap_or(0.0)
+    }),
+    ("worst_mean_run_delay_us", |r| {
+        r.ext_metrics
+            .get("worst_mean_run_delay_us")
+            .copied()
+            .unwrap_or(0.0)
+    }),
+    ("worst_run_delay_us", |r| {
+        r.ext_metrics
+            .get("worst_run_delay_us")
+            .copied()
+            .unwrap_or(0.0)
+    }),
 ];
 
 /// Arithmetic mean over the finite values produced by `iter`.
@@ -3592,8 +3847,13 @@ impl std::fmt::Display for Outlier {
 /// (`passed && !skipped && !inconclusive`, matching
 /// `GauntletRow::is_pass`) contribute to the per-scenario mean
 /// AND the overall mean/std baseline. Skipped / inconclusive /
-/// failed rows carry default-zero metric values (sidecar_to_row
-/// substitutes zero for non-finite + missing fields), and
+/// failed rows carry default-zero metric values (for typed fields
+/// `sidecar_to_row` substitutes zero for non-finite + missing
+/// fields; for the ext-sourced Distribution entries the
+/// `OUTLIER_METRICS` accessor's own `.unwrap_or(0.0)` supplies the
+/// zero, since `sidecar_to_row` copies only present finite ext keys
+/// and never zero-fills a missing one; see the block comment on
+/// those entries), and
 /// including them would silently depress every measured mean — a
 /// scenario with 1 real-pass run (value=100) and 9 inconclusive
 /// runs (value=0) would otherwise report a per-scenario mean of
@@ -6235,6 +6495,87 @@ mod tests {
         assert_eq!(r, Some(20.0));
     }
 
+    /// Cross-RUN reduction of the derived kinds — the ONLY path that reaches
+    /// aggregate_finite for Distribution/WorstLowest (WITHIN a run they are
+    /// `is_derived` and never reduced from a slice). Worst folds by MAX
+    /// (weight-independent); every other Distribution reduction and every
+    /// WorstLowest fold by UNWEIGHTED mean — proven with UNEQUAL weights
+    /// (5 vs 15) so a run_sample_count-weighted mean (which would give 25.0)
+    /// is distinguishable from the unweighted 20.0.
+    #[test]
+    fn aggregate_samples_weighted_distribution_worstlowest_arms() {
+        // Worst → MAX, weight-independent: max(10, 20) = 20.
+        assert_eq!(
+            aggregate_samples_weighted(
+                &[(10.0, 5), (20.0, 15)],
+                MetricKind::Distribution {
+                    source: SampleSource::RunDelayNs,
+                    reduction: SampleReduction::Worst,
+                },
+            ),
+            Some(20.0),
+        );
+        // Distribution (non-Worst) → UNWEIGHTED mean: (10 + 30)/2 = 20.0,
+        // NOT the run_sample_count-weighted (10*5 + 30*15)/20 = 25.0.
+        assert_eq!(
+            aggregate_samples_weighted(
+                &[(10.0, 5), (30.0, 15)],
+                MetricKind::Distribution {
+                    source: SampleSource::WakeLatencyNs,
+                    reduction: SampleReduction::P99,
+                },
+            ),
+            Some(20.0),
+        );
+        // WorstLowest → UNWEIGHTED mean: same (10 + 30)/2 = 20.0, not 25.0.
+        assert_eq!(
+            aggregate_samples_weighted(
+                &[(10.0, 5), (30.0, 15)],
+                MetricKind::WorstLowest {
+                    numerator: WorstLowestNumerator::Iterations,
+                    denominator: WorstLowestDenominator::CpuTimeNs,
+                },
+            ),
+            Some(20.0),
+        );
+    }
+
+    /// Cross-RUN weight-0 contributor contract: a monitor-off / no-periodic-
+    /// capture run (`run_sample_count == 0`) that DID emit a Distribution /
+    /// WorstLowest key is COUNTED in the unweighted mean, never zero-weighted
+    /// out. `aggregate_finite`'s Distribution/WorstLowest arm is
+    /// `sum / finite.len()` (it structurally ignores the weight closure — see
+    /// the monitor-off rationale at the arm: a weighted fold "would silently
+    /// zero-weight a monitor-off run"), so a `(value, 0)` pair that survives
+    /// the `is_finite` filter is included. Guards against a future weight-aware
+    /// refactor silently dropping a monitor-off run's distributional value.
+    #[test]
+    fn aggregate_samples_weighted_distribution_worstlowest_counts_zero_weight_contributor() {
+        // (10.0, 0) = a monitor-off run that emitted the key; (30.0, 15) a
+        // normal run. The weight-0 run IS counted: (10 + 30)/2 = 20.0 — a
+        // weight-aware fold that dropped the 0-weight run would give 30.0.
+        assert_eq!(
+            aggregate_samples_weighted(
+                &[(10.0, 0), (30.0, 15)],
+                MetricKind::Distribution {
+                    source: SampleSource::WakeLatencyNs,
+                    reduction: SampleReduction::P99,
+                },
+            ),
+            Some(20.0),
+        );
+        assert_eq!(
+            aggregate_samples_weighted(
+                &[(10.0, 0), (30.0, 15)],
+                MetricKind::WorstLowest {
+                    numerator: WorstLowestNumerator::Iterations,
+                    denominator: WorstLowestDenominator::CpuTimeNs,
+                },
+            ),
+            Some(20.0),
+        );
+    }
+
     /// `Gauge(Last)` and `Timestamp` ignore weights — last-finite
     /// is weight-independent.
     #[test]
@@ -6318,6 +6659,46 @@ mod tests {
     /// the invariant: a Counter-kind metric must NOT collapse
     /// to a sum across the phase window — that's the bug the
     /// per-phase aggregator was introduced to fix.
+    #[test]
+    fn aggregate_samples_for_phase_returns_none_for_derived_kinds() {
+        // Derived kinds (Rate / Distribution / WorstLowest) are `is_derived`,
+        // merge as Recompute, and have NO per-phase value: returning None keeps
+        // them off the single-slice reducers within a run (their value is
+        // produced post-merge by derive_rate_metrics /
+        // populate_run_distribution_metrics). Pins the within-run skip-routing.
+        let mk = |kind: MetricKind| MetricDef {
+            name: "x",
+            accessor: |_| None,
+            display_unit: "",
+            polarity: crate::test_support::Polarity::LowerBetter,
+            default_abs: 0.0,
+            default_rel: 0.0,
+            kind,
+        };
+        for kind in [
+            MetricKind::Rate {
+                numerator: "a",
+                denominator: "b",
+            },
+            MetricKind::Distribution {
+                source: SampleSource::WakeLatencyNs,
+                reduction: SampleReduction::P99,
+            },
+            MetricKind::WorstLowest {
+                numerator: WorstLowestNumerator::Iterations,
+                denominator: WorstLowestDenominator::NumWorkers,
+            },
+        ] {
+            assert!(kind.is_derived(), "{kind:?} must be is_derived");
+            assert_eq!(kind.merge_kind(), MergeKind::Recompute);
+            assert_eq!(
+                aggregate_samples_for_phase(&mk(kind), &[1.0, 2.0, 3.0]),
+                None,
+                "derived kind {kind:?} must have no per-phase reduction",
+            );
+        }
+    }
+
     #[test]
     fn aggregate_samples_for_phase_dispatches_on_kind() {
         let counter = MetricDef {
@@ -6566,16 +6947,52 @@ mod tests {
                     m.name,
                 );
             }
-            // Peak metrics must be named with `max_` or be one of
-            // the documented worst-case high-water entries
-            // (`worst_gap_ms`, `worst_run_delay_us`).
+            // Peak metrics must be named with `max_` or be the documented
+            // worst-case high-water entry `worst_gap_ms`. (worst_run_delay_us
+            // is now MetricKind::Distribution{RunDelayNs, Worst}, not Peak.)
             if matches!(m.kind, MetricKind::Peak) {
                 assert!(
-                    m.name.starts_with("max_")
-                        || m.name == "worst_gap_ms"
-                        || m.name == "worst_run_delay_us",
+                    m.name.starts_with("max_") || m.name == "worst_gap_ms",
                     "Peak-kind metric must use max_* naming OR be a documented worst-* peak, got {:?}",
                     m.name,
+                );
+            }
+            // Distribution metrics are re-pooled run-level by
+            // `populate_run_distribution_metrics`; for cgroups with no carried
+            // samples (backdrop / stripped) it folds the per-cgroup
+            // `distribution_cgroup_reduction` worst-wins via `f64::max` (in the
+            // `populate_run_distribution_metrics_from` loop), which is the
+            // correct worst-wins ONLY for LowerBetter metrics. Enforce that
+            // coupling so a future HigherBetter Distribution cannot silently
+            // invert the degraded-path regression signal (max would pick the
+            // BEST cgroup as the "worst"). A HigherBetter Distribution must
+            // first make that worst-wins fold polarity-aware.
+            if matches!(m.kind, MetricKind::Distribution { .. }) {
+                assert_eq!(
+                    m.polarity,
+                    crate::test_support::Polarity::LowerBetter,
+                    "Distribution-kind metric {:?} must be LowerBetter \
+                     (the carrier-less fold maxes); got {:?}",
+                    m.name,
+                    m.polarity,
+                );
+            }
+            // WorstLowest metrics are re-pooled by
+            // `populate_run_distribution_metrics`'s lowest-wins fold
+            // (`worst.is_none_or(|w| v < w)`), which treats the LOWEST per-cgroup
+            // value as the worst — correct ONLY for HigherBetter metrics.
+            // Enforce the mirror of the Distribution gate so a future
+            // LowerBetter WorstLowest cannot silently invert the regression
+            // signal (select the least-bad cgroup, mask the starved one); such a
+            // metric must first make the lowest-wins fold polarity-aware.
+            if matches!(m.kind, MetricKind::WorstLowest { .. }) {
+                assert_eq!(
+                    m.polarity,
+                    crate::test_support::Polarity::HigherBetter,
+                    "WorstLowest-kind metric {:?} must be HigherBetter \
+                     (the lowest-wins fold treats lowest as worst); got {:?}",
+                    m.name,
+                    m.polarity,
                 );
             }
             // Rate metrics are derived ratios; name them `*_rate` or
@@ -6617,14 +7034,14 @@ mod tests {
             // Gauge that averages ready-made ratios (the (r₁+r₂)/2 bug). Scoped
             // to per-SECOND tokens (`_rate` / `_per_sec` / `_per_cpu_sec`) — NOT
             // bare `_per_` — so a count-denominator metric like
-            // `worst_iterations_per_worker` (intentionally a Gauge) is not
-            // falsely flagged. `worst_iterations_per_cpu_sec` is the documented
-            // exception: registered Gauge(Last) (temporal: last sample), its
-            // cross-cgroup worst is a min-SELECTION via fold_lowest_some on
-            // the typed ScenarioStats field (later surfaced as the GauntletRow
-            // field) — the per-cgroup starvation signal, NOT a Σnum/Σdenom
-            // re-pool — so it is correctly NOT a Rate and keeps its accurate
-            // `_per_cpu_sec` name.
+            // `worst_iterations_per_worker` (a `WorstLowest` min-selection) is
+            // not falsely flagged. `worst_iterations_per_cpu_sec` is the
+            // documented exception: it is a `MetricKind::WorstLowest` (the
+            // lowest cgroup's iterations / CPU-second, the per-cgroup
+            // starvation signal selected lowest-wins), NOT a Σnum/Σdenom pooled
+            // rate — so it is correctly NOT a Rate and keeps its accurate
+            // `_per_cpu_sec` name. (The pooled cohort rate IS a Rate, under the
+            // distinct name `iterations_per_cpu_sec`.)
             let looks_like_rate = m.name.ends_with("_rate")
                 || m.name.contains("_per_sec")
                 || m.name.contains("_per_cpu_sec");
@@ -7058,15 +7475,8 @@ mod tests {
             stuck_count: 0,
             fallback_count: 0,
             keep_last_count: 0,
-            worst_p99_wake_latency_us: 0.0,
-            worst_median_wake_latency_us: 0.0,
-            worst_wake_latency_cv: 0.0,
             total_iterations: 0,
-            worst_mean_run_delay_us: 0.0,
-            worst_run_delay_us: 0.0,
             worst_wake_latency_tail_ratio: 0.0,
-            worst_iterations_per_worker: 0.0,
-            worst_iterations_per_cpu_sec: 0.0,
             page_locality: 0.0,
             cross_node_migration_ratio: 0.0,
             ext_metrics: BTreeMap::new(),
@@ -7262,36 +7672,34 @@ mod tests {
 
     /// `worst_iterations_per_cpu_sec` (the overcommit-invariant compare
     /// metric the budget warning recommends) flows ScenarioStats ->
-    /// GauntletRow: Some maps through, None collapses to 0.0 like the
-    /// sibling worst_* fields, and the metric is in the METRICS registry
-    /// so `stats compare --metric worst_iterations_per_cpu_sec` resolves.
+    /// worst_iterations_per_cpu_sec is now a `MetricKind::WorstLowest` ext
+    /// metric (re-pooled post-merge by populate_run_distribution_metrics).
+    /// sidecar_to_row carries it through the ext_metrics copy, and
+    /// MetricDef::read surfaces it via the `|_| None` accessor's ext fallback;
+    /// an absent key (no cgroup reported a defined rate) reads None, distinct
+    /// from a measured 0.0. The metric stays registered so
+    /// `stats compare --metric worst_iterations_per_cpu_sec` resolves.
     #[test]
-    fn sidecar_to_row_maps_worst_iterations_per_cpu_sec() {
+    fn sidecar_to_row_carries_worst_iterations_per_cpu_sec_via_ext() {
         use crate::test_support;
-        let some = test_support::SidecarResult {
-            stats: ScenarioStats {
-                worst_iterations_per_cpu_sec: Some(1234.5),
-                ..Default::default()
-            },
+        let mut stats = ScenarioStats::default();
+        stats
+            .ext_metrics
+            .insert("worst_iterations_per_cpu_sec".to_string(), 1234.5);
+        let present = test_support::SidecarResult {
+            stats,
             ..test_support::SidecarResult::test_fixture()
         };
-        assert_eq!(sidecar_to_row(&some).worst_iterations_per_cpu_sec, 1234.5);
+        let def = metric_def("worst_iterations_per_cpu_sec")
+            .expect("metric must be registered so `stats compare --metric` resolves it");
+        assert_eq!(def.read(&sidecar_to_row(&present)), Some(1234.5));
 
-        let none = test_support::SidecarResult {
-            stats: ScenarioStats {
-                worst_iterations_per_cpu_sec: None,
-                ..Default::default()
-            },
+        // Absent key (re-pool wrote nothing) → read None, NOT a measured 0.0.
+        let absent = test_support::SidecarResult {
+            stats: ScenarioStats::default(),
             ..test_support::SidecarResult::test_fixture()
         };
-        assert_eq!(sidecar_to_row(&none).worst_iterations_per_cpu_sec, 0.0);
-
-        assert!(
-            METRICS
-                .iter()
-                .any(|m| m.name == "worst_iterations_per_cpu_sec"),
-            "metric must be registered so `stats compare --metric` resolves it",
-        );
+        assert_eq!(def.read(&sidecar_to_row(&absent)), None);
     }
 
     #[test]
@@ -7568,11 +7976,15 @@ mod tests {
     /// `finite_or_zero` with `non_finite` planted in the source
     /// [`SidecarResult`], then assert each lands as 0.0 on the row.
     ///
-    /// Covers all twelve `finite_or_zero` call sites in `sidecar_to_row`:
-    /// eleven fields drawn from [`ScenarioStats`] plus `imbalance_ratio`
-    /// which is read from [`MonitorSummary`]. A missed call site would
-    /// leave one of the asserts comparing the non-finite input to 0.0
-    /// (NaN != 0.0, ±Infinity != 0.0) and fail the test.
+    /// Covers the `finite_or_zero` call sites in `sidecar_to_row`: the
+    /// remaining direct [`ScenarioStats`] f64 fields (worst_spread,
+    /// worst_migration_ratio, worst_wake_latency_tail_ratio,
+    /// worst_page_locality, worst_cross_node_migration_ratio) plus
+    /// `imbalance_ratio` from [`MonitorSummary`]. (The wake / run-delay
+    /// roll-ups are now ext_metrics-sourced — non-finite ext entries are
+    /// DROPPED, covered by `sidecar_to_row_drops_non_finite_ext_metrics`.) A
+    /// missed call site would leave one assert comparing the non-finite input
+    /// to 0.0 (NaN != 0.0, ±Infinity != 0.0) and fail the test.
     fn assert_all_direct_f64_fields_sanitized(non_finite: f64) {
         use crate::assert::ScenarioStats;
         use crate::monitor::MonitorSummary;
@@ -7581,13 +7993,7 @@ mod tests {
             stats: ScenarioStats {
                 worst_spread: non_finite,
                 worst_migration_ratio: non_finite,
-                worst_p99_wake_latency_us: non_finite,
-                worst_median_wake_latency_us: non_finite,
-                worst_wake_latency_cv: non_finite,
-                worst_mean_run_delay_us: non_finite,
-                worst_run_delay_us: non_finite,
                 worst_wake_latency_tail_ratio: non_finite,
-                worst_iterations_per_worker: Some(non_finite),
                 worst_page_locality: non_finite,
                 worst_cross_node_migration_ratio: non_finite,
                 ..Default::default()
@@ -7603,21 +8009,9 @@ mod tests {
             ("spread", row.spread),
             ("migration_ratio", row.migration_ratio),
             ("imbalance_ratio", row.imbalance_ratio),
-            ("worst_p99_wake_latency_us", row.worst_p99_wake_latency_us),
-            (
-                "worst_median_wake_latency_us",
-                row.worst_median_wake_latency_us,
-            ),
-            ("worst_wake_latency_cv", row.worst_wake_latency_cv),
-            ("worst_mean_run_delay_us", row.worst_mean_run_delay_us),
-            ("worst_run_delay_us", row.worst_run_delay_us),
             (
                 "worst_wake_latency_tail_ratio",
                 row.worst_wake_latency_tail_ratio,
-            ),
-            (
-                "worst_iterations_per_worker",
-                row.worst_iterations_per_worker,
             ),
             ("page_locality", row.page_locality),
             ("cross_node_migration_ratio", row.cross_node_migration_ratio),
@@ -7681,7 +8075,7 @@ mod tests {
             stats: ScenarioStats {
                 worst_spread: subnormal,
                 worst_page_locality: -subnormal,
-                worst_wake_latency_cv: subnormal,
+                worst_migration_ratio: subnormal,
                 ..Default::default()
             },
             ..test_support::SidecarResult::test_fixture()
@@ -7696,7 +8090,7 @@ mod tests {
             "negative subnormal must pass through finite_or_zero unchanged",
         );
         assert_eq!(
-            row.worst_wake_latency_cv, subnormal,
+            row.migration_ratio, subnormal,
             "subnormal on a second direct-f64 field must also pass through",
         );
         // Motivation check: subnormals serialize (unlike NaN / ±Inf,
@@ -7723,14 +8117,10 @@ mod tests {
         ext.insert("finite_negative".to_string(), -7.25);
         let sc = test_support::SidecarResult {
             stats: ScenarioStats {
-                // Every direct f64 field non-finite.
+                // Every remaining direct f64 field non-finite.
                 worst_spread: f64::NAN,
                 worst_migration_ratio: f64::INFINITY,
-                worst_p99_wake_latency_us: f64::NEG_INFINITY,
-                worst_median_wake_latency_us: f64::NAN,
-                worst_wake_latency_cv: f64::INFINITY,
-                worst_mean_run_delay_us: f64::NEG_INFINITY,
-                worst_run_delay_us: f64::NAN,
+                worst_wake_latency_tail_ratio: f64::NEG_INFINITY,
                 worst_page_locality: f64::INFINITY,
                 worst_cross_node_migration_ratio: f64::NEG_INFINITY,
                 ext_metrics: ext.clone(),
@@ -8113,6 +8503,45 @@ mod tests {
              fn-pointers are not serializable and the field carries \
              #[serde(skip)]: {out}",
         );
+    }
+
+    /// The Distribution/WorstLowest MetricKind serde shape is user-facing via
+    /// `cargo ktstr stats list-metrics --json` (list_metrics(true) serializes
+    /// the full MetricDef incl. `kind`). Pin the externally-tagged JSON variant
+    /// + helper-enum strings so a rename of MetricKind / SampleSource /
+    /// SampleReduction / WorstLowest* trips this test rather than silently
+    /// changing the CLI output. MetricKind is Serialize-only (output contract;
+    /// no deserialize symmetry to check).
+    #[test]
+    fn distribution_worstlowest_kind_json_shape_pinned() {
+        let dist = serde_json::to_string(&MetricKind::Distribution {
+            source: SampleSource::WakeLatencyNs,
+            reduction: SampleReduction::P99,
+        })
+        .expect("MetricKind serializes");
+        for tok in [
+            "\"Distribution\"",
+            "\"source\"",
+            "\"WakeLatencyNs\"",
+            "\"reduction\"",
+            "\"P99\"",
+        ] {
+            assert!(dist.contains(tok), "{tok} missing from {dist}");
+        }
+        let wl = serde_json::to_string(&MetricKind::WorstLowest {
+            numerator: WorstLowestNumerator::Iterations,
+            denominator: WorstLowestDenominator::CpuTimeNs,
+        })
+        .expect("MetricKind serializes");
+        for tok in [
+            "\"WorstLowest\"",
+            "\"numerator\"",
+            "\"Iterations\"",
+            "\"denominator\"",
+            "\"CpuTimeNs\"",
+        ] {
+            assert!(wl.contains(tok), "{tok} missing from {wl}");
+        }
     }
 
     /// Iteration order of [`list_metrics`] matches [`METRICS`]
@@ -8506,14 +8935,20 @@ mod tests {
         row.stuck_count = 3;
         row.fallback_count = 11;
         row.keep_last_count = 4;
-        row.worst_p99_wake_latency_us = 99.0;
-        row.worst_median_wake_latency_us = 50.0;
-        row.worst_wake_latency_cv = 0.5;
         row.total_iterations = 1000;
-        row.worst_mean_run_delay_us = 25.0;
-        row.worst_run_delay_us = 200.0;
         row.page_locality = 0.8;
         row.cross_node_migration_ratio = 0.1;
+        // Distribution roll-ups are ext_metrics-sourced now (accessor |_| None);
+        // read_metric resolves them via MetricDef::read's ext fallback.
+        for (name, v) in [
+            ("worst_p99_wake_latency_us", 99.0),
+            ("worst_median_wake_latency_us", 50.0),
+            ("worst_wake_latency_cv", 0.5),
+            ("worst_mean_run_delay_us", 25.0),
+            ("worst_run_delay_us", 200.0),
+        ] {
+            row.ext_metrics.insert(name.to_string(), v);
+        }
         assert_eq!(read_metric(&row, "worst_spread"), Some(42.0));
         assert_eq!(read_metric(&row, "worst_gap_ms"), Some(100.0));
         assert_eq!(read_metric(&row, "total_migrations"), Some(7.0));
@@ -9461,9 +9896,13 @@ mod tests {
         // trigger per-metric and default_percent branches in one
         // row pair.
         let mut row_a = cmp_row("t", "tiny-1llc", true, 100.0, 0);
-        row_a.worst_median_wake_latency_us = 100.0;
+        row_a
+            .ext_metrics
+            .insert("worst_median_wake_latency_us".to_string(), 100.0);
         let mut row_b = cmp_row("t", "tiny-1llc", true, 106.0, 0);
-        row_b.worst_median_wake_latency_us = 110.0;
+        row_b
+            .ext_metrics
+            .insert("worst_median_wake_latency_us".to_string(), 110.0);
 
         let mut policy = ComparisonPolicy::uniform(20.0);
         policy
@@ -10365,15 +10804,8 @@ mod tests {
             stuck_count: 0,
             fallback_count: 0,
             keep_last_count: 0,
-            worst_p99_wake_latency_us: 0.0,
-            worst_median_wake_latency_us: 0.0,
-            worst_wake_latency_cv: 0.0,
             total_iterations: 0,
-            worst_mean_run_delay_us: 0.0,
-            worst_run_delay_us: 0.0,
             worst_wake_latency_tail_ratio: 0.0,
-            worst_iterations_per_worker: 0.0,
-            worst_iterations_per_cpu_sec: 0.0,
             page_locality: 0.0,
             cross_node_migration_ratio: 0.0,
             ext_metrics: BTreeMap::new(),
@@ -10958,17 +11390,27 @@ mod tests {
         row.stuck_count = (migrations / 10) as usize;
         row.fallback_count = migrations as i64;
         row.keep_last_count = -(migrations as i64);
-        row.worst_p99_wake_latency_us = spread * 2.0;
-        row.worst_median_wake_latency_us = spread;
-        row.worst_wake_latency_cv = spread / 50.0;
         row.total_iterations = iters;
-        row.worst_mean_run_delay_us = gap_ms as f64;
-        row.worst_run_delay_us = (gap_ms * 2) as f64;
         row.worst_wake_latency_tail_ratio = spread / 25.0;
-        row.worst_iterations_per_worker = iters as f64 / 10.0;
-        row.worst_iterations_per_cpu_sec = iters as f64 / 5.0;
         row.page_locality = 1.0 - spread / 100.0;
         row.cross_node_migration_ratio = spread / 200.0;
+        // The wake / run-delay / iteration-efficiency roll-ups are now
+        // ext_metrics-sourced (Distribution / WorstLowest); paint them there so
+        // the cross-RUN ext fold (group_and_average_by → aggregate_finite)
+        // exercises them: the percentile / CV / mean reductions and the
+        // WorstLowest selectors MEAN-fold cross-RUN, worst_run_delay_us
+        // (Worst) MAX-folds.
+        for (name, v) in [
+            ("worst_p99_wake_latency_us", spread * 2.0),
+            ("worst_median_wake_latency_us", spread),
+            ("worst_wake_latency_cv", spread / 50.0),
+            ("worst_mean_run_delay_us", gap_ms as f64),
+            ("worst_run_delay_us", (gap_ms * 2) as f64),
+            ("worst_iterations_per_worker", iters as f64 / 10.0),
+            ("worst_iterations_per_cpu_sec", iters as f64 / 5.0),
+        ] {
+            row.ext_metrics.insert(name.to_string(), v);
+        }
     }
 
     /// Empty input produces zero aggregated rows. Pins the empty-
@@ -11003,7 +11445,12 @@ mod tests {
         assert_eq!(ar.row.total_iterations, 1000);
         assert_eq!(ar.row.fallback_count, 50);
         assert_eq!(ar.row.keep_last_count, -50);
-        assert_eq!(ar.row.worst_p99_wake_latency_us, 24.0);
+        // worst_p99_wake_latency_us is now ext_metrics-sourced (Distribution);
+        // single-pass pass-through carries it verbatim (spread*2 = 24.0).
+        assert_eq!(
+            ar.row.ext_metrics.get("worst_p99_wake_latency_us").copied(),
+            Some(24.0),
+        );
     }
 
     /// Three passing contributors with the same key are folded
@@ -11041,12 +11488,93 @@ mod tests {
         assert_eq!(ar.row.fallback_count, 60);
         // Counter i64 mean for keep_last_count: (-30 + -60 + -90)/3 = -60.
         assert_eq!(ar.row.keep_last_count, -60);
-        // Gauge(Last) f64 mean for worst_p99_wake_latency_us:
-        // (20 + 40 + 60)/3 = 40.
-        assert_eq!(ar.row.worst_p99_wake_latency_us, 40.0);
-        // worst_iterations_per_cpu_sec cross-RUN arithmetic mean:
-        // iters/5 = 180/220/200; (180 + 220 + 200)/3 = 200.
-        assert_eq!(ar.row.worst_iterations_per_cpu_sec, 200.0);
+        // Distribution worst_p99_wake_latency_us cross-RUN MEAN (unweighted)
+        // through the ext fold: spread*2 = 20/40/60; (20 + 40 + 60)/3 = 40.
+        assert_eq!(
+            ar.row.ext_metrics.get("worst_p99_wake_latency_us").copied(),
+            Some(40.0),
+        );
+        // WorstLowest worst_iterations_per_cpu_sec cross-RUN MEAN through the
+        // ext fold: iters/5 = 180/220/200; (180 + 220 + 200)/3 = 200.
+        assert_eq!(
+            ar.row
+                .ext_metrics
+                .get("worst_iterations_per_cpu_sec")
+                .copied(),
+            Some(200.0),
+        );
+        // worst_run_delay_us is the SOLE Worst Distribution: cross-RUN it
+        // folds by MAX (the peak survives), NOT mean — gap_ms*2 = 200/400/600
+        // → MAX 600 (a MEAN would give 400). Pins the Worst arm AND its
+        // ordering before the general Distribution MEAN arm in aggregate_finite.
+        assert_eq!(
+            ar.row.ext_metrics.get("worst_run_delay_us").copied(),
+            Some(600.0),
+        );
+        // The remaining Distribution + WorstLowest reductions cross-RUN MEAN
+        // (unweighted), locking the full MAX-vs-MEAN split: worst_median =
+        // spread 10/20/30 → 20; worst_mean_run_delay_us = gap_ms 100/200/300
+        // → 200; worst_iterations_per_worker = iters/10 90/110/100 → 100.
+        assert_eq!(
+            ar.row
+                .ext_metrics
+                .get("worst_median_wake_latency_us")
+                .copied(),
+            Some(20.0),
+        );
+        assert_eq!(
+            ar.row.ext_metrics.get("worst_mean_run_delay_us").copied(),
+            Some(200.0),
+        );
+        assert_eq!(
+            ar.row
+                .ext_metrics
+                .get("worst_iterations_per_worker")
+                .copied(),
+            Some(100.0),
+        );
+        // CV mean (spread/50 = 0.2/0.4/0.6 → 0.4) is float-approximate.
+        let cv = ar
+            .row
+            .ext_metrics
+            .get("worst_wake_latency_cv")
+            .copied()
+            .expect("worst_wake_latency_cv present");
+        assert!(
+            (cv - 0.4).abs() < 1e-9,
+            "worst_wake_latency_cv cross-RUN MEAN ~0.4, got {cv}",
+        );
+    }
+
+    /// The cross-RUN unweighted mean of a Distribution/WorstLowest metric
+    /// divides by the count of contributors that EMITTED the key
+    /// (`finite.len()`), NOT by `passes_observed`: a passing run that omits the
+    /// key is EXCLUDED from the mean, not folded in as 0.0. Three passing runs,
+    /// only TWO carry `worst_p99_wake_latency_us` (20, 40) → aggregate is their
+    /// mean 30.0, NOT the (20+40+0)/3 = 20.0 a passes_observed divisor gives.
+    #[test]
+    fn group_and_average_distribution_excludes_key_omitting_run_from_mean() {
+        let mut a = make_row("t", "tiny-1llc", true, 0.0);
+        a.ext_metrics
+            .insert("worst_p99_wake_latency_us".to_string(), 20.0);
+        let mut b = make_row("t", "tiny-1llc", true, 0.0);
+        b.ext_metrics
+            .insert("worst_p99_wake_latency_us".to_string(), 40.0);
+        // Third passing run omits the key entirely.
+        let c = make_row("t", "tiny-1llc", true, 0.0);
+        let out = group_and_average_by(&[a, b, c], LEGACY_PAIRING_DIMS);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].passes_observed, 3);
+        assert_eq!(
+            out[0]
+                .row
+                .ext_metrics
+                .get("worst_p99_wake_latency_us")
+                .copied(),
+            Some(30.0),
+            "unweighted mean over the 2 emitting runs (20+40)/2=30, NOT \
+             (20+40+0)/3=20 a passes_observed divisor would give",
+        );
     }
 
     /// `group_and_average_by` propagates `run_sample_count` to the

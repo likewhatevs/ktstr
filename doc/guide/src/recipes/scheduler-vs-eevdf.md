@@ -20,10 +20,12 @@ callback receives (the host-side hook that runs after the VM exits):
   periodic-capture pipeline, so throughput works even for
   `--cell-parent-cgroup` schedulers.
 - `VmResult::phase_metric(phase, name)` — any other per-phase metric by
-  its [registry](../concepts/checking.md) name: latency
-  (`worst_run_delay_us`, `worst_mean_run_delay_us`), CPU overhead
-  (`system_time_ns`, `user_time_ns`), and scheduling quality
-  (`avg_imbalance_ratio`, `avg_dsq_depth`). All flow through the one
+  its [registry](../concepts/checking.md) name: CPU overhead
+  (`system_time_ns`, `user_time_ns`) and scheduling quality
+  (`avg_imbalance_ratio`, `avg_dsq_depth`). (Wake-latency / run-delay
+  distributions are run-level — `MetricKind::Distribution`, pooled across
+  cgroups — compared via `cargo ktstr stats compare`, not per-phase.) All
+  flow through the one
   per-phase bucket pipeline, so a new metric becomes comparable here the
   moment it lands in that pipeline.
 
@@ -55,13 +57,17 @@ fn compare_vs_eevdf(result: &VmResult) -> Result<()> {
         "my_sched throughput is {throughput:.2}x EEVDF (below the 0.8x floor)"
     );
 
-    // Latency: any per-phase metric compares the same way via phase_metric.
-    // Skip the gate when a phase has no reading (None) rather than failing.
+    // Scheduling quality: any PER-PHASE metric compares the same way via
+    // phase_metric. Skip the gate when a phase has no reading (None) rather
+    // than failing. (Wake-latency and run-delay distributions are RUN-LEVEL —
+    // MetricKind::Distribution, pooled across cgroups — so they are NOT
+    // readable via phase_metric; compare those with `cargo ktstr stats
+    // compare` / the GauntletRow ext_metrics surface instead.)
     if let (Some(s), Some(e)) = (
-        result.phase_metric(sched, "worst_run_delay_us"),
-        result.phase_metric(eevdf, "worst_run_delay_us"),
+        result.phase_metric(sched, "avg_imbalance_ratio"),
+        result.phase_metric(eevdf, "avg_imbalance_ratio"),
     ) {
-        ensure!(s <= e * 1.5, "my_sched run-delay {s:.0}us is >1.5x EEVDF {e:.0}us");
+        ensure!(s <= e * 1.5, "my_sched imbalance {s:.2} is >1.5x EEVDF {e:.2}");
     }
 
     // CPU overhead: per-phase kernel (system) CPU time.
