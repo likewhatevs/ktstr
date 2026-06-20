@@ -467,7 +467,7 @@ fn resolve_family_id(socket: &Socket, name: &str) -> io::Result<u16> {
 ///
 /// Wire layout (host-endian, NLA-aligned to 4 bytes):
 ///
-/// ```no_rust
+/// ```text
 ///   nlmsghdr (16 bytes)
 ///   ├─ length: u32 (total message length including header)
 ///   ├─ message_type: u16 (= family_id)
