@@ -114,9 +114,6 @@
 //!
 //! ```rust
 //! use ktstr::prelude::*;
-//! // The typed `claim_<field>` accessors live on the `#[derive(Claim)]`-generated
-//! // extension trait, imported per stats type (not yet in the prelude):
-//! use ktstr::assert::CgroupStatsClaim;
 //!
 //! // A test author would obtain `cg` and `report` from `ctx`-driven
 //! // execution; the literal here just illustrates the assertion shape.
@@ -801,13 +798,19 @@ pub mod prelude {
     // `Scheduler` is the `test_support::Scheduler` struct — the
     // scheduler-definition record test authors build via the
     // `declare_scheduler!` macro.
+    // The `#[derive(Claim)]`-generated `<Type>Claim` extension traits carry the
+    // typed `claim_<field>(&mut verdict)` accessors. Every derive(Claim) stats
+    // type is preluded, so its Claim trait is preluded alongside it and
+    // `use ktstr::prelude::*` makes the accessors callable without a per-type
+    // trait import: the four assert-module traits below, plus `WorkerReportClaim`
+    // in the workload export block.
     pub use crate::assert::{
         AbsoluteThresholds, Assert, AssertDetail, AssertResult, COMPARATOR_VOCABULARY, CgroupStats,
-        ClaimBuilder, DetailKind, EachClaim, FracPair, InfoNote, MAX_RECORDED_PASSES, NoteValue,
-        Outcome, OutcomeRef, PASSES_TRUNCATION_SENTINEL_COMPARATOR,
-        PASSES_TRUNCATION_SENTINEL_NAME, PassDetail, PhaseBucket, PhaseCgroupStats, PhaseMapExt,
-        ScenarioStats,
-        SeqClaim, SeriesField, SetClaim, Verdict, assert_scx_events_clean, assert_thresholds,
+        CgroupStatsClaim, ClaimBuilder, DetailKind, EachClaim, FracPair, InfoNote,
+        MAX_RECORDED_PASSES, NoteValue, Outcome, OutcomeRef, PASSES_TRUNCATION_SENTINEL_COMPARATOR,
+        PASSES_TRUNCATION_SENTINEL_NAME, PassDetail, PhaseBucket, PhaseBucketClaim, PhaseCgroupStats,
+        PhaseCgroupStatsClaim, PhaseMapExt, ScenarioStats, ScenarioStatsClaim, SeqClaim,
+        SeriesField, SetClaim, Verdict, assert_scx_events_clean, assert_thresholds,
         build_phase_buckets_with_stimulus,
     };
     // Per-phase-metric building blocks for `post_vm` callbacks doing
@@ -930,7 +933,7 @@ pub mod prelude {
     pub use crate::workload::{
         AffinityIntent, AluWidth, CloneMode, CustomFn, MemPolicy, Migration, MpolFlags,
         ResolvedAffinity, SchedPolicy, WorkPhase, WorkSpec, WorkType, WorkTypeValidationError,
-        WorkerCtx, WorkerReport, WorkloadConfig, WorkloadHandle,
+        WorkerCtx, WorkerReport, WorkerReportClaim, WorkloadConfig, WorkloadHandle,
     };
     // Surface `Phase` from the assert module (the scenario-step
     // bucket) so test authors can write `Phase::step(0)` /
