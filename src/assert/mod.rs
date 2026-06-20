@@ -1602,7 +1602,7 @@ pub struct PhaseCgroupStats {
     pub max_gap_cpu: usize,
     /// True when this carrier's raw sample vectors (`wake_latencies_ns` /
     /// `run_delays_ns` / `off_cpu_pcts`) were dropped by
-    /// [`AssertResult::strip_phase_cgroup_samples`] to fit the size-limited guest
+    /// `AssertResult::strip_phase_cgroup_samples` to fit the size-limited guest
     /// bulk frame — distinct from a carrier that genuinely measured no samples.
     /// The reduced counters survive; only the per-phase distribution render
     /// (Item 8) loses its source, so the render shows "samples stripped" rather
