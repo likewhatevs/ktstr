@@ -1281,7 +1281,125 @@ fn phase_buckets_equals_stats_phases_and_post_vm_read_does_not_starve() {
     );
 }
 
-/// #4 through the production eval path: with stimulus StepStarts
+/// Eval REORDER wiring: on the GUEST-FAIL path the failure message's
+/// timeline is built from the POST-fold `check_result.stats.phases`
+/// (folded_timeline), so the per-cgroup sub-block AND orphan not-measured
+/// markers reach operator-facing output — not the pre-fold `early_timeline`
+/// (empty per_cgroup, orphans excluded). The timeline.rs unit tests prove
+/// from_phase_buckets renders these; the eval PASS-arm fold test proves the
+/// fold populates stats.phases.per_cgroup; this pins that the two are WIRED on
+/// the failure path. A revert of the call site to early_timeline would silently
+/// drop the per-cgroup detail + orphan markers from failures with the suite
+/// otherwise green.
+#[test]
+fn evaluate_failure_message_renders_per_cgroup_via_folded_timeline() {
+    use crate::timeline::StimulusEvent;
+    // A FAILING guest AssertResult -> evaluate_vm_result takes the failure arm
+    // (returns Err with the rendered message).
+    let mut guest_assert = build_assert_result(
+        false,
+        vec![crate::assert::AssertDetail::new(
+            crate::assert::DetailKind::Starved,
+            "deliberate failure for the render test".to_string(),
+        )],
+    );
+    let carrier = |step: u16, name: &str, off_cpu: f64, iters: u64| {
+        let mut pc = std::collections::BTreeMap::new();
+        pc.insert(
+            name.to_string(),
+            crate::assert::PhaseCgroupStats {
+                num_workers: 1,
+                off_cpu_pcts: vec![off_cpu],
+                total_iterations: iters,
+                ..Default::default()
+            },
+        );
+        crate::assert::PhaseBucket {
+            step_index: step,
+            label: format!("Step[{}]", step - 1),
+            start_ms: u64::MAX,
+            end_ms: 0,
+            sample_count: 0,
+            metrics: std::collections::BTreeMap::new(),
+            per_cgroup: pc,
+        }
+    };
+    // step 1 carrier MATCHES a real host bucket (per-cgroup sub-block renders on
+    // a measured phase); step 2 carrier has NO host bucket -> orphan arm
+    // (renders "window not measured").
+    guest_assert.stats.phases = vec![
+        carrier(1, "cgHog", 75.0, 900),
+        carrier(2, "cgOrphan", 10.0, 5),
+    ];
+    let entry = sched_entry("__eval_fail_render_per_cgroup__");
+    let result = crate::vmm::VmResult {
+        success: true,
+        guest_messages: Some(crate::vmm::host_comms::BulkDrainResult {
+            entries: vec![crate::test_support::test_helpers::assert_result_tlv_entry(
+                &guest_assert,
+            )],
+        }),
+        periodic_fired: 1,
+        periodic_target: 1,
+        ..crate::vmm::VmResult::test_fixture()
+    };
+    // Real host capture for step 1 ONLY -> step 1 folds via the matched arm;
+    // step 2 has no host bucket -> orphan arm (same setup the fold PASS-arm test
+    // uses for step 1).
+    result.snapshot_bridge.store_with_stats_and_step(
+        "periodic_000",
+        crate::monitor::dump::FailureDumpReport::default(),
+        None,
+        Some(1500),
+        None,
+        1,
+    );
+    let start = |elapsed_ms: u64, k: u16, iters: u64| StimulusEvent {
+        elapsed_ms,
+        label: format!("StepStart[{k}]"),
+        op_kind: None,
+        detail: None,
+        total_iterations: Some(iters),
+        step_index: Some(k),
+        is_terminal: false,
+        is_step_end: false,
+    };
+    // ONLY StepStart[1] — a StepStart[2] would make build_phase_buckets_with_stimulus
+    // SYNTHESIZE a host bucket at step 2, matching carrier2 (not the orphan arm).
+    // With no step-2 host bucket, carrier2 stays an orphan (the not-measured case).
+    let stimulus = vec![start(1000, 1, 0)];
+    let err = evaluate_vm_result(
+        &entry,
+        &result,
+        &crate::assert::Assert::NO_OVERRIDES,
+        &stimulus,
+        &[],
+        &[],
+        &EVAL_TOPO,
+        &no_repro,
+        None,
+    )
+    .unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("per-cgroup:"),
+        "failure message must carry the per-cgroup sub-block via folded_timeline; got:\n{msg}",
+    );
+    assert!(
+        msg.contains("cgHog: off-cpu avg=75.0%"),
+        "the matched-arm carrier's reduced line must render; got:\n{msg}",
+    );
+    assert!(
+        msg.contains("window not measured"),
+        "the orphan carrier must render its not-measured window; got:\n{msg}",
+    );
+    assert!(
+        msg.contains("cgOrphan:"),
+        "the orphan carrier's per-cgroup line must render; got:\n{msg}",
+    );
+}
+
+/// Through the production eval path: with stimulus StepStarts
 /// spanning steps 1..3 but periodic captures landing only in step 1,
 /// evaluate_vm_result's stats.phases must contain a SYNTHESIZED bucket
 /// (sample_count==0) for the uncaptured steps carrying their

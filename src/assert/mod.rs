@@ -1682,6 +1682,76 @@ impl PhaseCgroupStats {
             max_gap_cpu,
         }
     }
+
+    /// Off-CPU% reduction for the per-phase per-cgroup render (Item 8):
+    /// `(avg, min, max, spread)` over [`Self::off_cpu_pcts`], or `None` when
+    /// the vec is empty — the NOT-measured state (no worker had positive wall
+    /// time). Reduces the SAME per-worker pcts [`cgroup_stats`] reduces
+    /// (off_cpu_ns / wall_time_ns × 100), so for a phase spanning the whole run
+    /// it reproduces that whole-run reduction; `spread = max − min`.
+    /// `Some((0.0, ..))` is a MEASURED zero (distinct from the `None`
+    /// not-measured state), preserving the discipline the empty-vec contract on
+    /// `off_cpu_pcts` keeps. Display-only: never written back into a re-pool.
+    pub fn off_cpu_summary(&self) -> Option<(f64, f64, f64, f64)> {
+        let pcts = &self.off_cpu_pcts;
+        if pcts.is_empty() {
+            return None;
+        }
+        let min = pcts.iter().cloned().reduce(f64::min).expect("non-empty");
+        let max = pcts.iter().cloned().reduce(f64::max).expect("non-empty");
+        let avg = pcts.iter().sum::<f64>() / pcts.len() as f64;
+        Some((avg, min, max, max - min))
+    }
+
+    /// Wake-latency reduction for the per-phase render (Item 8):
+    /// `(p99_us, median_us)` over the pooled [`Self::wake_latencies_ns`], or
+    /// `None` when the pool is empty. Nearest-rank percentile via `percentile`
+    /// (ns→µs once), reproducing [`cgroup_stats`]'s p99/median value-for-value
+    /// for the ≤cap pool (and the Item 7 re-pool's `reduce_sorted_distribution`).
+    /// Above `MAX_WAKE_SAMPLES` the pool is a distribution-preserving reservoir
+    /// subsample (see [`Self::wake_latencies_ns`]), so p99/median is then
+    /// distribution-equivalent, NOT byte-identical, to the full-pool reduction —
+    /// the rendered tail stays accurate, only exact parity is size-bounded.
+    /// `None`-on-empty omits the wake segment from the render rather than
+    /// painting a misleading 0µs (the display analogue of `cgroup_stats`'s
+    /// 0.0-sentinel, which has no Option to carry not-measured).
+    pub fn wake_summary(&self) -> Option<(f64, f64)> {
+        if self.wake_latencies_ns.is_empty() {
+            return None;
+        }
+        let mut sorted = self.wake_latencies_ns.clone();
+        sorted.sort_unstable();
+        let p99 = percentile(&sorted, 0.99) as f64 / 1000.0;
+        let median = percentile(&sorted, 0.5) as f64 / 1000.0;
+        Some((p99, median))
+    }
+
+    /// Run-delay reduction for the per-phase render (Item 8):
+    /// `(mean_us, worst_us)` over the per-worker [`Self::run_delays_ns`] (raw
+    /// ns), or `None` when empty. Divides ns→µs ONCE on the summed / maxed ns.
+    /// `worst` reproduces [`cgroup_stats`]'s value-for-value (`max(ns)/1000 ==
+    /// max(ns/1000)`, division is monotone). `mean` reproduces it to f64 ULP,
+    /// not bit-exactly: this f64-sums then divides once (`Σns/n/1000`), while
+    /// `cgroup_stats` divides each worker's ns by 1000 first then sums
+    /// (`Σ(ns/1000)/n`) — the same value reassociated, differing only
+    /// sub-display-precision (a divergent-input parity test bounds it at 1e-9).
+    /// Each sample is
+    /// one worker's whole-phase cumulative `sched_info.run_delay` delta, so
+    /// `mean` is the average per-worker total queued-to-run delay and `worst`
+    /// the largest. `None`-on-empty omits the segment.
+    pub fn run_delay_summary(&self) -> Option<(f64, f64)> {
+        if self.run_delays_ns.is_empty() {
+            return None;
+        }
+        let n = self.run_delays_ns.len() as f64;
+        // Sum in f64, NOT u64-then-cast: matches cgroup_stats's f64 accumulation
+        // and cannot integer-overflow (an f64 sum saturates toward +inf; a u64
+        // sum would panic in debug / silently wrap in release on a pathological
+        // pool). Values are identical within the documented 1e-9 ULP bound.
+        let mean = self.run_delays_ns.iter().map(|&v| v as f64).sum::<f64>() / n / 1000.0;
+        let worst = *self.run_delays_ns.iter().max().expect("non-empty") as f64 / 1000.0;
+        Some((mean, worst))
+    }
 }
 
 impl CgroupStats {
@@ -1928,6 +1998,21 @@ pub struct PhaseBucket {
     /// name (see [`PhaseCgroupStats`]). Empty until a capture path populates
     /// it; the structural carrier for the per-phase per-cgroup distributional
     /// re-pool. Whole-run = aggregate of these per-phase per-cgroup components.
+    ///
+    /// An ORPHAN bucket — a guest carrier whose `step_index` has NO paired host
+    /// bucket (a dropped/absent StepStart frame, or a stimulus-less host/fixture
+    /// path; NOT merely a short step, since `build_phase_buckets_with_stimulus`
+    /// synthesizes a bucket for every StepStart so a captured-but-short step
+    /// takes the matched arm) — is carried by
+    /// `fold_guest_per_cgroup_into_host_buckets` with the shape
+    /// `(start_ms, end_ms) == (0, 0)` AND empty `metrics` AND non-empty
+    /// `per_cgroup` (it carries only these components). On every non-zero-duration
+    /// window that shape is the orphan arm's, so the timeline render keys on it
+    /// to surface "window not measured" rather than a misleading `0ms` (see
+    /// `crate::timeline::phase_from_bucket`): a captured bucket has metrics. A
+    /// zero-duration step at scenario start (`StepStart==StepEnd==0`) can also
+    /// produce it via the matched arm, but harmlessly — a zero-duration step has
+    /// no window, so "not measured" reads the same as "0ms".
     pub per_cgroup: std::collections::BTreeMap<String, PhaseCgroupStats>,
 }
 
@@ -2189,7 +2274,17 @@ pub(crate) fn fold_guest_per_cgroup_into_host_buckets(
                 // stimulus; build_phase_buckets synthesizes a bucket for every
                 // StepStart-step, so a captured-but-short step takes the matched
                 // arm above, not this one). Normalize the merge-neutral sentinel
-                // window to (0,0) so duration consumers don't underflow it.
+                // window to (0,0) so duration consumers don't underflow it. The
+                // resulting (0,0)-window + empty-metrics + non-empty-per_cgroup
+                // shape is the orphan signature the timeline render keys on to
+                // show "window not measured" instead of a misleading 0ms (the
+                // (0,0) is "no host window known", NOT a measured zero-duration
+                // step). On every non-zero-duration window the resulting shape is
+                // this arm's; a zero-duration step at scenario start
+                // (StepStart==StepEnd==0) can also produce it via the matched arm,
+                // but harmlessly (a zero-duration step has no window, so the render's
+                // "not measured" reads the same as "0ms") — see
+                // `crate::timeline::phase_from_bucket`.
                 let mut orphan = gb;
                 orphan.start_ms = 0;
                 orphan.end_ms = 0;

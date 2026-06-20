@@ -4385,6 +4385,130 @@ fn repool_distribution_value_for_value_with_cgroup_stats() {
     assert!((ext("worst_run_delay_us") - cg.worst_run_delay_us).abs() < 1e-9);
 }
 
+// -- Item 8: per-phase per-cgroup display-time reductions (PhaseCgroupStats) --
+
+/// `off_cpu_summary` boundary contract: `None` on empty (NOT measured), `Some`
+/// on data — INCLUDING a measured zero, distinct from the `None` state.
+/// avg/min/max/spread mirror cgroup_stats's off-CPU reduction (spread=max-min).
+#[test]
+fn phase_cgroup_off_cpu_summary_boundaries() {
+    assert_eq!(PhaseCgroupStats::default().off_cpu_summary(), None);
+    let one = PhaseCgroupStats {
+        off_cpu_pcts: vec![42.0],
+        ..Default::default()
+    };
+    assert_eq!(one.off_cpu_summary(), Some((42.0, 42.0, 42.0, 0.0)));
+    let zeros = PhaseCgroupStats {
+        off_cpu_pcts: vec![0.0, 0.0],
+        ..Default::default()
+    };
+    assert_eq!(
+        zeros.off_cpu_summary(),
+        Some((0.0, 0.0, 0.0, 0.0)),
+        "measured zeros are Some((0,..)), distinct from None (not-measured)",
+    );
+    let multi = PhaseCgroupStats {
+        off_cpu_pcts: vec![10.0, 20.0, 30.0],
+        ..Default::default()
+    };
+    assert_eq!(multi.off_cpu_summary(), Some((20.0, 10.0, 30.0, 20.0)));
+}
+
+/// `wake_summary` boundary: `None` on empty; single-sample p99 == median == the
+/// sole sample (µs); nearest-rank percentile, ns→µs once.
+#[test]
+fn phase_cgroup_wake_summary_boundaries() {
+    assert_eq!(PhaseCgroupStats::default().wake_summary(), None);
+    let one = PhaseCgroupStats {
+        wake_latencies_ns: vec![5000],
+        ..Default::default()
+    };
+    assert_eq!(one.wake_summary(), Some((5.0, 5.0)));
+    // 1000..10000ns: p99 nearest-rank idx ceil(10*0.99)-1=9 -> 10000ns=10µs;
+    // median idx ceil(10*0.5)-1=4 -> 5000ns=5µs.
+    let ten = PhaseCgroupStats {
+        wake_latencies_ns: (1..=10u64).map(|v| v * 1000).collect(),
+        ..Default::default()
+    };
+    assert_eq!(ten.wake_summary(), Some((10.0, 5.0)));
+}
+
+/// `run_delay_summary` boundary: `None` on empty; divides raw ns→µs ONCE
+/// (mean 200µs / worst 300µs over [100_000, 300_000] ns) — not double-divided
+/// (0.2) or un-divided (100_000).
+#[test]
+fn phase_cgroup_run_delay_summary_boundaries() {
+    assert_eq!(PhaseCgroupStats::default().run_delay_summary(), None);
+    let two = PhaseCgroupStats {
+        run_delays_ns: vec![100_000, 300_000],
+        ..Default::default()
+    };
+    assert_eq!(two.run_delay_summary(), Some((200.0, 300.0)));
+}
+
+/// Parity: a carrier built from the SAME reports cgroup_stats reduces yields
+/// off-cpu / wake / run-delay summaries equal value-for-value (≤cap) to
+/// cgroup_stats's fields — the per-phase render reproduces the whole-run
+/// reduction when the phase spans the whole run.
+#[test]
+fn phase_cgroup_summaries_match_cgroup_stats() {
+    let reports = vec![
+        WorkerReport {
+            wake_latencies_ns: vec![1000, 2000, 3000, 4000, 5000],
+            schedstat_run_delay_ns: 7000,
+            iterations: 100,
+            ..rpt(1, 1000, 10_000_000, 4_000_000, &[0], 0)
+        },
+        WorkerReport {
+            wake_latencies_ns: vec![6000, 7000, 8000, 9000, 10000],
+            schedstat_run_delay_ns: 3000,
+            iterations: 100,
+            ..rpt(2, 1000, 10_000_000, 1_000_000, &[1], 0)
+        },
+    ];
+    let cg = cgroup_stats(&reports);
+    let carrier = phase_cgroup_stats(&reports, None);
+    let (avg, min, max, spread) = carrier.off_cpu_summary().expect("off-cpu measured");
+    assert!((avg - cg.avg_off_cpu_pct.unwrap()).abs() < 1e-9);
+    assert!((min - cg.min_off_cpu_pct.unwrap()).abs() < 1e-9);
+    assert!((max - cg.max_off_cpu_pct.unwrap()).abs() < 1e-9);
+    assert!((spread - cg.spread.unwrap()).abs() < 1e-9);
+    let (p99, median) = carrier.wake_summary().expect("wake measured");
+    assert!((p99 - cg.p99_wake_latency_us).abs() < 1e-9);
+    assert!((median - cg.median_wake_latency_us).abs() < 1e-9);
+    let (mean, worst) = carrier.run_delay_summary().expect("run-delay measured");
+    assert!((mean - cg.mean_run_delay_us).abs() < 1e-9);
+    assert!((worst - cg.worst_run_delay_us).abs() < 1e-9);
+}
+
+/// run_delay_summary's mean is f64-ULP-equivalent (not bit-exact) to
+/// cgroup_stats — Σns/n/1000 vs Σ(ns/1000)/n reassociate differently. This
+/// pins the documented 1e-9 bound with a DIVERGENT input (the value-for-value
+/// parity test above uses run-delays that are bit-exact in BOTH reassociations,
+/// so its tolerance is dead): these three schedstat_run_delay_ns values make
+/// the two means differ at the float level (~1e-12), so the < 1e-9 assert is
+/// load-bearing — a reassociation/precision regression would exceed it.
+#[test]
+fn phase_cgroup_run_delay_mean_within_ulp_of_cgroup_stats() {
+    let reports: Vec<WorkerReport> = [8_865_093u64, 9_991_834, 9_627_760]
+        .iter()
+        .enumerate()
+        .map(|(i, &rd)| WorkerReport {
+            schedstat_run_delay_ns: rd,
+            ..rpt(i as i32 + 1, 1000, 1_000_000, 0, &[i], 0)
+        })
+        .collect();
+    let cg = cgroup_stats(&reports);
+    let carrier = phase_cgroup_stats(&reports, None);
+    let (mean, _worst) = carrier.run_delay_summary().expect("run-delay measured");
+    let delta = (mean - cg.mean_run_delay_us).abs();
+    assert!(delta < 1e-9, "mean within 1e-9 of cgroup_stats; delta={delta:e}");
+    assert!(
+        delta > 0.0,
+        "inputs must actually DIVERGE so the 1e-9 tolerance is load-bearing, not dead; delta={delta:e}",
+    );
+}
+
 /// Carrier-name dedup across STEPS: a cgroup NAME that carries samples in
 /// ANY phase is in `*_carriers`, so EVERY `stats.cgroups` entry with that
 /// name — including a separate (handle, step) entry merged in for a later

@@ -1529,6 +1529,20 @@ pub(crate) fn apply_expect_auto_repro_inversion(
     }
 }
 
+/// Format the failure-message timeline section for a given timeline (or none).
+/// Skips a phaseless timeline. Shared by every error branch so the section is
+/// rendered identically regardless of which timeline (the pre-fold monitor
+/// fallback, or the post-fold per-cgroup-bearing one) the branch holds.
+fn format_timeline_section(
+    timeline: Option<&crate::timeline::Timeline>,
+    ctx: &crate::timeline::TimelineContext,
+) -> String {
+    timeline
+        .filter(|t| !t.phases.is_empty())
+        .map(|t| format!("\n\n{}", t.format_with_context(ctx)))
+        .unwrap_or_default()
+}
+
 /// Evaluate a VM result and produce the appropriate error or Ok.
 ///
 /// This is the core result-evaluation logic, extracted from
@@ -1591,16 +1605,16 @@ fn evaluate_vm_result(
     let early_periodic_series = result.periodic_series();
     let mut early_phase_buckets =
         crate::assert::build_phase_buckets_with_stimulus(&early_periodic_series, stimulus_events);
-    // Build timeline from the pre-bucketed phases. When no
-    // PhaseBuckets exist (scenario had no periodic captures,
-    // e.g. single-phase tests) but monitor samples ARE present,
-    // fall back to the legacy Timeline::build path so the
-    // failure-message timeline still renders monitor-derived
-    // metrics. The fallback preserves operator-facing diagnostic
-    // continuity for monitor-only runs — the new from_phase_buckets
-    // path requires snapshot-bridge captures to materialise
-    // PhaseBuckets, which monitor-only runs don't produce.
-    let timeline = if !early_phase_buckets.is_empty() {
+    // PRE-FOLD timeline from the host phase buckets (per_cgroup empty by
+    // construction), used by the NO-guest-AssertResult error path (where no
+    // guest carriers exist to fold). When no PhaseBuckets exist (scenario had
+    // no periodic captures, e.g. single-phase tests) but monitor samples ARE
+    // present, fall back to the legacy Timeline::build path so the
+    // failure-message timeline still renders monitor-derived metrics. The
+    // guest-AssertResult path below REBUILDS the timeline from the POST-fold
+    // `check_result.stats.phases` so the per-cgroup sub-block + orphan
+    // not-measured markers render.
+    let early_timeline = if !early_phase_buckets.is_empty() {
         Some(crate::timeline::Timeline::from_phase_buckets(
             &early_phase_buckets,
             stimulus_events,
@@ -1699,15 +1713,10 @@ fn evaluate_vm_result(
     };
 
     // Section builders shared by every error branch in this function.
-    // Timeline skips phaseless runs; monitor only reports when an
-    // active scheduler exposes rq data (EEVDF reads would be junk).
-    let build_timeline_section = || -> String {
-        timeline
-            .as_ref()
-            .filter(|t| !t.phases.is_empty())
-            .map(|t| format!("\n\n{}", t.format_with_context(&tl_ctx)))
-            .unwrap_or_default()
-    };
+    // The timeline section is rendered via `format_timeline_section` per
+    // branch (the guest-AssertResult path passes the post-fold per-cgroup
+    // timeline; other paths pass `early_timeline`). Monitor only reports when
+    // an active scheduler exposes rq data (EEVDF reads would be junk).
     let build_monitor_section = || -> String {
         if entry.scheduler.has_active_scheduling()
             && let Some(ref monitor) = result.monitor
@@ -1875,6 +1884,21 @@ fn evaluate_vm_result(
         // these ext_metrics keys are the sole source for the |_| None accessors.
         crate::assert::populate_run_distribution_metrics(&mut check_result.stats);
 
+        // POST-fold timeline for this (guest-AssertResult) path: rebuild from
+        // the folded `check_result.stats.phases` so the per-cgroup sub-block
+        // and orphan not-measured markers render (Item 8). Falls back to
+        // `early_timeline` (the monitor-only / phaseless fallback) when no
+        // folded buckets exist. The folded vec includes the orphan (0,0)
+        // carriers the pre-fold `early_timeline` omitted — surfaced as
+        // "window not measured" by `phase_from_bucket`'s shape detection.
+        let folded_timeline = (!check_result.stats.phases.is_empty()).then(|| {
+            crate::timeline::Timeline::from_phase_buckets(
+                &check_result.stats.phases,
+                stimulus_events,
+                &crate::timeline::TimelineContext::default(),
+            )
+        });
+
         // Write sidecar before checking pass/fail so both outcomes are captured.
         // A sidecar write failure is logged but not propagated: the test
         // verdict itself is still valid — only post-run stats tooling
@@ -1928,7 +1952,10 @@ fn evaluate_vm_result(
             let repro_section = repro
                 .map(|r| format!("\n\n--- auto-repro ---\n{r}"))
                 .unwrap_or_default();
-            let timeline_section = build_timeline_section();
+            let timeline_section = format_timeline_section(
+                folded_timeline.as_ref().or(early_timeline.as_ref()),
+                &tl_ctx,
+            );
             // Per-cgroup telemetry is now built unconditionally per
             // declared cgroup (collect_handles no longer gates it behind
             // has_worker_checks), so an empty `cgroups` here means NO
@@ -2069,7 +2096,10 @@ fn evaluate_vm_result(
             let verdict = thresholds.evaluate(&eval_report);
             if verdict.is_fail() {
                 let details = verdict.details.join("\n  ");
-                let timeline_section = build_timeline_section();
+                let timeline_section = format_timeline_section(
+                    folded_timeline.as_ref().or(early_timeline.as_ref()),
+                    &tl_ctx,
+                );
                 let monitor_section = reporting::format_monitor_section(monitor, merged_assert);
                 let msg = format!(
                     "{}{}ktstr_test '{}'{} [topo={}] {ERR_MONITOR_FAILED_AFTER_SCENARIO}:\n  {}{}{}{}{}",
@@ -2105,15 +2135,16 @@ fn evaluate_vm_result(
         }
 
         // (Per-phase telemetry + cross-RUN ext_metrics were populated on
-        // check_result above, BEFORE write_sidecar, so the persisted
-        // sidecar carries them — see the populate block at the sidecar
-        // write site. The failure-message Timeline is built earlier from the
-        // host phase buckets (`early_phase_buckets`), BEFORE the 6b per_cgroup
-        // fold mutates `check_result.stats.phases`; the fold runs after Timeline
-        // construction so orphan (0,0)-window carriers cannot perturb it. The
-        // post-fold `stats.phases` is what the test author reads and what the
-        // sidecar persists; the sentinel-free renderer paints an empty metrics
-        // map as "no data".)
+        // check_result above, BEFORE write_sidecar, so the persisted sidecar
+        // carries them — see the populate block at the sidecar write site. The
+        // failure-message Timeline on THIS path is `folded_timeline`, built
+        // from the POST-fold `check_result.stats.phases` so the per-cgroup
+        // sub-block renders and orphan (0,0)-window carriers surface as "window
+        // not measured" (Item 8) rather than being omitted — the
+        // `early_timeline` built pre-fold is the fallback only for the
+        // no-guest-AssertResult path below. The post-fold `stats.phases` is what
+        // the test author reads and what the sidecar persists; the
+        // sentinel-free renderer paints an empty metrics map as "no data".)
 
         return Ok(check_result);
     }
@@ -2165,7 +2196,9 @@ fn evaluate_vm_result(
             String::new()
         };
 
-    let timeline_section = build_timeline_section();
+    // No-guest-AssertResult path: no guest carriers were folded, so the
+    // pre-fold early_timeline is authoritative (it has no per_cgroup either).
+    let timeline_section = format_timeline_section(early_timeline.as_ref(), &tl_ctx);
 
     // Build monitor section for error paths where neither the bulk
     // port nor COM2 had a parseable result.

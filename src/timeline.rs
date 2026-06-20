@@ -375,6 +375,22 @@ pub struct Phase {
     pub metrics: PhaseMetrics,
     /// Changes detected at this phase's stimulus boundary.
     pub changes: Vec<PhaseChange>,
+    /// Per-cgroup raw telemetry for this phase, keyed by cgroup name. Carried
+    /// from [`crate::assert::PhaseBucket::per_cgroup`] on the
+    /// [`Self`]-via-`from_phase_buckets` path; empty on the monitor-only
+    /// [`Timeline::build`] path (which has no carriers). Rendered as a
+    /// per-cgroup sub-block by display-time reduction
+    /// ([`crate::assert::PhaseCgroupStats::off_cpu_summary`] etc.); never a
+    /// change-detection input (those are [`PhaseMetrics`] scalars only).
+    pub per_cgroup: std::collections::BTreeMap<String, crate::assert::PhaseCgroupStats>,
+    /// True when `(start_ms, end_ms)` is the normalized `(0, 0)` of an ORPHAN
+    /// carrier (no measured host window) rather than a real window. Set in
+    /// `phase_from_bucket` by the orphan shape signature `(0,0)` + empty
+    /// `metrics` + non-empty `per_cgroup` (unique to
+    /// `crate::assert::fold_guest_per_cgroup_into_host_buckets`'s orphan arm).
+    /// The render shows "window not measured" instead of a misleading `0ms`.
+    /// Always `false` on the [`Timeline::build`] path.
+    pub not_measured_window: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -661,6 +677,9 @@ impl Timeline {
                 stimulus,
                 metrics,
                 changes: Vec::new(),
+                // Monitor-only path: no per-cgroup carriers, real window.
+                per_cgroup: std::collections::BTreeMap::new(),
+                not_measured_window: false,
             });
         }
 
@@ -780,12 +799,21 @@ impl Timeline {
     fn format_phases(&self, out: &mut String) {
         for phase in &self.phases {
             let duration_ms = phase.end_ms.saturating_sub(phase.start_ms);
+            // An orphan carrier carries a normalized (0,0) window that is NOT a
+            // measured zero-duration step; surface it as not-measured rather
+            // than a misleading 0ms (the None-vs-Some discipline the per-metric
+            // renders use, applied to the window).
+            let window = if phase.not_measured_window {
+                "window not measured".to_string()
+            } else {
+                format!("{duration_ms}ms")
+            };
 
             if phase.index == 0 {
                 // Phase 0 is the settle window before any stimulus.
                 out.push_str(&format!(
-                    "\nBASELINE (settle, {}ms, {} samples):\n",
-                    duration_ms, phase.metrics.sample_count,
+                    "\nBASELINE (settle, {}, {} samples):\n",
+                    window, phase.metrics.sample_count,
                 ));
             } else {
                 let label_start = phase
@@ -802,8 +830,8 @@ impl Timeline {
                     .unwrap_or_else(|| "?".to_string());
 
                 out.push_str(&format!(
-                    "\nPhase {}: {} ({}ms, {} samples):\n",
-                    phase.index, label_start, duration_ms, phase.metrics.sample_count,
+                    "\nPhase {}: {} ({}, {} samples):\n",
+                    phase.index, label_start, window, phase.metrics.sample_count,
                 ));
             }
 
@@ -870,6 +898,8 @@ impl Timeline {
             } else {
                 out.push_str("  [no samples]\n");
             }
+
+            format_phase_cgroups(out, &phase.per_cgroup);
 
             if let Some(ref stim) = phase.stimulus {
                 let detail = stim.detail.as_deref().unwrap_or("");
@@ -971,6 +1001,14 @@ impl Timeline {
         // metrics (imbalance / dsq depth / fallback / keep_last) stay gated
         // inside the helper on both phases having real samples, so a
         // partial-metric phase never paints a phantom non-throughput change.
+        // An orphan phase (a not-measured (0,0) window with all-None
+        // PhaseMetrics) sits between its neighbors here, so detect_boundary_changes
+        // compares each real neighbor against the orphan's None metrics — which
+        // the helper gates away (both sides must be Some) — rather than across
+        // the unmeasured window. INTENTIONAL: there is no data for the orphan's
+        // step, so flagging a phase-k-1 -> phase-k+1 change as if they were
+        // adjacent would assert a transition over an unmeasured interval. This is
+        // render-only (Phase.changes has no verdict/sidecar/A-B consumer).
         for i in 1..phases.len() {
             let changes = detect_boundary_changes(&phases[i - 1].metrics, &phases[i].metrics);
             phases[i].changes = changes;
@@ -1086,6 +1124,20 @@ fn phase_from_bucket(b: &crate::assert::PhaseBucket, sorted_events: &[&StimulusE
             }),
         }
     };
+    // Orphan signature: fold_guest_per_cgroup_into_host_buckets normalizes a
+    // guest carrier with no paired host bucket to a (0,0) window carrying ONLY
+    // per_cgroup (empty metrics). A captured bucket has metrics, so the
+    // (0,0)+empty-metrics+non-empty-per_cgroup shape is the orphan arm's on
+    // every NON-zero-duration window. The one other producer is a ZERO-duration
+    // step at scenario start (StepStart[k] == StepEnd[k] == 0 -> a synthesized
+    // host (0,0) window with empty metrics, since duration 0 yields no rate and
+    // no in-window monitor sample, then MATCHED with a same-step guest carrier),
+    // but that collision is HARMLESS: a zero-duration step has no window to
+    // measure, so "window not measured" reads the same as the "0ms" it would
+    // otherwise show. Display-only, with no verdict/sidecar consumer,
+    // so the marker needs no serialized PhaseBucket flag.
+    let not_measured_window =
+        b.start_ms == 0 && b.end_ms == 0 && b.metrics.is_empty() && !b.per_cgroup.is_empty();
     Phase {
         index: b.step_index as usize,
         start_ms: b.start_ms,
@@ -1093,6 +1145,65 @@ fn phase_from_bucket(b: &crate::assert::PhaseBucket, sorted_events: &[&StimulusE
         stimulus,
         metrics,
         changes: Vec::new(),
+        per_cgroup: b.per_cgroup.clone(),
+        not_measured_window,
+    }
+}
+
+/// Cap on per-cgroup lines rendered per phase, bounding the failure-message
+/// size for a many-cgroup scenario (the sched_log render caps similarly).
+/// Truncation is by BTreeMap NAME order (deterministic, no ranking math); a
+/// "+J more" note records the drop so the cap never reads as "all cgroups".
+const MAX_RENDERED_CGROUPS: usize = 16;
+
+/// Render the per-cgroup sub-block for one phase: one line per cgroup in
+/// BTreeMap (name) order, reduced at display time via the
+/// [`crate::assert::PhaseCgroupStats`] summaries. Empty `per_cgroup` (the
+/// monitor-only path, or a phase that carried no per-cgroup components)
+/// renders nothing. The None-vs-Some(0.0)
+/// discipline carries through: an absent off-CPU reduction renders `n/a` (NOT
+/// `0.0%`), and an empty wake / run-delay pool OMITS that segment rather than
+/// painting a misleading `0µs`.
+fn format_phase_cgroups(
+    out: &mut String,
+    per_cgroup: &std::collections::BTreeMap<String, crate::assert::PhaseCgroupStats>,
+) {
+    if per_cgroup.is_empty() {
+        return;
+    }
+    out.push_str("  per-cgroup:\n");
+    for (name, pcg) in per_cgroup.iter().take(MAX_RENDERED_CGROUPS) {
+        out.push_str(&format!("    {name}: "));
+        match pcg.off_cpu_summary() {
+            Some((avg, min, max, spread)) => out.push_str(&format!(
+                "off-cpu avg={avg:.1}% min={min:.1}% max={max:.1}% spread={spread:.1}%"
+            )),
+            None => out.push_str("off-cpu n/a"),
+        }
+        if let Some((p99, median)) = pcg.wake_summary() {
+            out.push_str(&format!(" | wake p99={p99:.0}\u{00b5}s median={median:.0}\u{00b5}s"));
+        }
+        if let Some((mean, worst)) = pcg.run_delay_summary() {
+            out.push_str(&format!(
+                " | run-delay mean={mean:.0}\u{00b5}s worst={worst:.0}\u{00b5}s"
+            ));
+        }
+        out.push_str(&format!(
+            " | iters={} migrations={}",
+            pcg.total_iterations, pcg.total_migrations
+        ));
+        // Gap is a Peak with no Option: 0 means "no notable gap", so omit it
+        // rather than print a noisy gap=0ms on every quiet cgroup.
+        if pcg.max_gap_ms > 0 {
+            out.push_str(&format!(" | gap={}ms@cpu{}", pcg.max_gap_ms, pcg.max_gap_cpu));
+        }
+        out.push('\n');
+    }
+    let total = per_cgroup.len();
+    if total > MAX_RENDERED_CGROUPS {
+        let dropped = total - MAX_RENDERED_CGROUPS;
+        let noun = if dropped == 1 { "cgroup" } else { "cgroups" };
+        out.push_str(&format!("    (+{dropped} more {noun})\n"));
     }
 }
 
@@ -1417,6 +1528,416 @@ mod tests {
             formatted.contains("throughput: 1500 iter/s (stimulus-derived)"),
             "a synthesized step must render its stimulus-derived throughput, \
              not only '[no samples]'; got:\n{formatted}",
+        );
+    }
+
+    // -- orphan not-measured marker + per-cgroup sub-block render --
+
+    /// An orphan bucket — the unique (0,0)-window + empty-metrics +
+    /// non-empty-per_cgroup shape from the fold's orphan arm — renders "window
+    /// not measured", NOT a misleading "0ms".
+    #[test]
+    fn format_renders_orphan_window_as_not_measured() {
+        let mut per_cgroup = std::collections::BTreeMap::new();
+        per_cgroup.insert(
+            "cg".to_string(),
+            crate::assert::PhaseCgroupStats {
+                off_cpu_pcts: vec![80.0],
+                total_iterations: 900_000,
+                ..Default::default()
+            },
+        );
+        let buckets = vec![crate::assert::PhaseBucket {
+            per_cgroup,
+            step_index: 1,
+            label: "Step[0]".to_string(),
+            start_ms: 0,
+            end_ms: 0,
+            sample_count: 0,
+            metrics: std::collections::BTreeMap::new(),
+        }];
+        let t = Timeline::from_phase_buckets(&buckets, &[], &TimelineContext::default());
+        let formatted = t.format_with_context(&TimelineContext::default());
+        assert!(
+            formatted.contains("window not measured"),
+            "orphan window must render not-measured; got:\n{formatted}",
+        );
+        assert!(
+            !formatted.contains("(0ms,"),
+            "orphan must NOT render as 0ms; got:\n{formatted}",
+        );
+        // The whole point of routing orphan carriers through the render (vs the
+        // pre-fold path that dropped them) is that their per-cgroup telemetry —
+        // an orphan's ONLY payload — SURFACES alongside the not-measured marker.
+        assert!(
+            formatted.contains("per-cgroup:"),
+            "orphan's per-cgroup sub-block must render; got:\n{formatted}",
+        );
+        assert!(
+            formatted.contains("cg: off-cpu avg=80.0%"),
+            "orphan carrier's off-cpu reduction must render; got:\n{formatted}",
+        );
+        assert!(
+            formatted.contains("iters=900000"),
+            "orphan carrier's counters must render; got:\n{formatted}",
+        );
+        // The cg carrier has off-cpu but NO wake/run-delay pools — pin the
+        // per-line omit when off-cpu is the sole reduction present (the most
+        // likely real orphan-carrier shape).
+        let cg_line = formatted
+            .lines()
+            .find(|l| l.contains("cg: off-cpu"))
+            .expect("cg line");
+        assert!(!cg_line.contains("wake p99="), "got:\n{formatted}");
+        assert!(!cg_line.contains("run-delay mean="), "got:\n{formatted}");
+    }
+
+    /// Orphan-adjacency suppression: an orphan phase (all-None
+    /// PhaseMetrics) BETWEEN two real phases makes detect_boundary_changes
+    /// compare each real neighbor against the orphan's gated-away None metrics,
+    /// NOT across the unmeasured window — so a step1->step3 throughput collapse
+    /// is NOT flagged on step3 (no data for the intervening orphan step).
+    /// INTENTIONAL + render-only; pins the documented from_phase_buckets behavior.
+    #[test]
+    fn format_orphan_phase_suppresses_cross_orphan_change_detection() {
+        let real = |step: u16, rate: f64| crate::assert::PhaseBucket {
+            per_cgroup: Default::default(),
+            step_index: step,
+            label: format!("Step[{}]", step - 1),
+            start_ms: step as u64 * 1000,
+            end_ms: step as u64 * 1000 + 500,
+            sample_count: 5,
+            metrics: std::collections::BTreeMap::from([("iteration_rate".to_string(), rate)]),
+        };
+        let mut orphan_pc = std::collections::BTreeMap::new();
+        orphan_pc.insert(
+            "cg".to_string(),
+            crate::assert::PhaseCgroupStats {
+                off_cpu_pcts: vec![50.0],
+                ..Default::default()
+            },
+        );
+        let orphan = crate::assert::PhaseBucket {
+            per_cgroup: orphan_pc,
+            step_index: 2,
+            label: "Step[1]".to_string(),
+            start_ms: 0,
+            end_ms: 0,
+            sample_count: 0,
+            metrics: std::collections::BTreeMap::new(),
+        };
+        // CONTROL: step1 (rate 10000) adjacent to step3 (rate 1000) — a 90%
+        // collapse (> the 30% rel threshold) IS flagged as a change on step3.
+        let ctrl = Timeline::from_phase_buckets(
+            &[real(1, 10000.0), real(3, 1000.0)],
+            &[],
+            &TimelineContext::default(),
+        );
+        let ctrl_step3 = ctrl.phases.iter().find(|p| p.index == 3).expect("step3");
+        assert!(
+            !ctrl_step3.changes.is_empty(),
+            "control: adjacent step1->step3 throughput collapse IS flagged; got: {:?}",
+            ctrl_step3.changes,
+        );
+        // With the orphan between, step3 is compared against the orphan's None
+        // metrics -> the change is suppressed (no data for the gap).
+        let t = Timeline::from_phase_buckets(
+            &[real(1, 10000.0), orphan, real(3, 1000.0)],
+            &[],
+            &TimelineContext::default(),
+        );
+        let step3 = t.phases.iter().find(|p| p.index == 3).expect("step3");
+        assert!(
+            step3.changes.is_empty(),
+            "orphan between suppresses the cross-orphan change; got: {:?}",
+            step3.changes,
+        );
+        assert!(
+            t.format_with_context(&TimelineContext::default())
+                .contains("window not measured"),
+            "the orphan still renders not-measured",
+        );
+    }
+
+    /// The orphan signature is GUARDED on empty metrics: a (0,0)-window bucket
+    /// that carries metrics is a captured bucket (or a measured zero-duration
+    /// step), NOT an orphan — it renders 0ms, never "window not measured".
+    #[test]
+    fn format_does_not_mark_not_measured_when_metrics_present() {
+        let mut per_cgroup = std::collections::BTreeMap::new();
+        per_cgroup.insert(
+            "cg".to_string(),
+            crate::assert::PhaseCgroupStats {
+                off_cpu_pcts: vec![50.0],
+                ..Default::default()
+            },
+        );
+        let buckets = vec![crate::assert::PhaseBucket {
+            per_cgroup,
+            step_index: 1,
+            label: "Step[0]".to_string(),
+            start_ms: 0,
+            end_ms: 0,
+            sample_count: 1,
+            metrics: std::collections::BTreeMap::from([("avg_imbalance_ratio".to_string(), 1.0)]),
+        }];
+        let t = Timeline::from_phase_buckets(&buckets, &[], &TimelineContext::default());
+        let formatted = t.format_with_context(&TimelineContext::default());
+        assert!(
+            !formatted.contains("window not measured"),
+            "a (0,0) window WITH metrics is captured, not an orphan; got:\n{formatted}",
+        );
+        assert!(
+            formatted.contains("(0ms,"),
+            "a measured zero-duration window renders 0ms; got:\n{formatted}",
+        );
+    }
+
+    /// The per-cgroup sub-block renders one line per cgroup (name order), with
+    /// the None-vs-Some discipline: a not-measured off-CPU reduction renders
+    /// `n/a` (not `0.0%`), and an empty wake/run-delay pool omits that segment.
+    #[test]
+    fn format_renders_per_cgroup_subblock_none_aware() {
+        let mut per_cgroup = std::collections::BTreeMap::new();
+        per_cgroup.insert(
+            "cg_a".to_string(),
+            crate::assert::PhaseCgroupStats {
+                off_cpu_pcts: vec![80.0, 84.0],
+                wake_latencies_ns: vec![100_000, 120_000],
+                run_delays_ns: vec![45_000],
+                total_iterations: 900_000,
+                total_migrations: 12,
+                max_gap_ms: 8,
+                max_gap_cpu: 3,
+                ..Default::default()
+            },
+        );
+        per_cgroup.insert(
+            "cg_b".to_string(),
+            crate::assert::PhaseCgroupStats {
+                off_cpu_pcts: vec![],
+                total_iterations: 80_000,
+                ..Default::default()
+            },
+        );
+        let buckets = vec![crate::assert::PhaseBucket {
+            per_cgroup,
+            step_index: 1,
+            label: "Step[0]".to_string(),
+            start_ms: 1000,
+            end_ms: 6000,
+            sample_count: 10,
+            metrics: std::collections::BTreeMap::from([("avg_imbalance_ratio".to_string(), 1.5)]),
+        }];
+        let t = Timeline::from_phase_buckets(&buckets, &[], &TimelineContext::default());
+        let formatted = t.format_with_context(&TimelineContext::default());
+        assert!(formatted.contains("per-cgroup:"), "sub-block header; got:\n{formatted}");
+        assert!(
+            formatted.contains("cg_a: off-cpu avg=82.0% min=80.0% max=84.0% spread=4.0%"),
+            "got:\n{formatted}",
+        );
+        assert!(formatted.contains("wake p99="), "wake segment present; got:\n{formatted}");
+        assert!(
+            formatted.contains("run-delay mean="),
+            "run-delay segment present; got:\n{formatted}",
+        );
+        assert!(
+            formatted.contains("iters=900000 migrations=12"),
+            "counters present; got:\n{formatted}",
+        );
+        assert!(
+            formatted.contains("cg_b: off-cpu n/a"),
+            "not-measured off-cpu is n/a, NOT 0.0%; got:\n{formatted}",
+        );
+        // cg_a has a coupled gap (8ms @ cpu 3) -> rendered with its cpu.
+        assert!(
+            formatted.contains("gap=8ms@cpu3"),
+            "coupled gap renders ms@cpu; got:\n{formatted}",
+        );
+        // cg_b has no wake/run-delay pools AND max_gap_ms==0 -> those segments
+        // omitted on its line (gap is omitted at 0, not printed as gap=0ms).
+        let cg_b_line = formatted
+            .lines()
+            .find(|l| l.contains("cg_b:"))
+            .expect("cg_b line");
+        assert!(!cg_b_line.contains("wake p99="), "got:\n{formatted}");
+        assert!(!cg_b_line.contains("gap="), "gap omitted at 0; got:\n{formatted}");
+        // BTreeMap name order: cg_a before cg_b.
+        assert!(
+            formatted.find("cg_a:").unwrap() < formatted.find("cg_b:").unwrap(),
+            "cgroups render in name order; got:\n{formatted}",
+        );
+    }
+
+    /// Measured-zero off-CPU renders `0.0%` (a real zero), distinct from the
+    /// `n/a` not-measured state — the kind-specific None-vs-Some(0.0) boundary.
+    #[test]
+    fn format_renders_measured_zero_off_cpu_as_zero_not_na() {
+        let mut per_cgroup = std::collections::BTreeMap::new();
+        per_cgroup.insert(
+            "cg".to_string(),
+            crate::assert::PhaseCgroupStats {
+                off_cpu_pcts: vec![0.0, 0.0],
+                ..Default::default()
+            },
+        );
+        let buckets = vec![crate::assert::PhaseBucket {
+            per_cgroup,
+            step_index: 1,
+            label: "Step[0]".to_string(),
+            start_ms: 1000,
+            end_ms: 2000,
+            sample_count: 1,
+            metrics: std::collections::BTreeMap::from([("avg_imbalance_ratio".to_string(), 1.0)]),
+        }];
+        let t = Timeline::from_phase_buckets(&buckets, &[], &TimelineContext::default());
+        let formatted = t.format_with_context(&TimelineContext::default());
+        assert!(
+            formatted.contains("off-cpu avg=0.0%"),
+            "measured zero off-cpu is 0.0%, not n/a; got:\n{formatted}",
+        );
+        assert!(!formatted.contains("off-cpu n/a"), "got:\n{formatted}");
+    }
+
+    /// Symmetric with the off-cpu measured-zero test for wake + run-delay: a
+    /// NON-empty pool of zeros is a measured zero (Some) and renders `0µs`, NOT
+    /// omitted (which only an EMPTY pool -> None does). Guards against a refactor
+    /// that special-cased a zero reduction to None (collapsing measured-zero
+    /// into not-measured), silently omitting a real zero-latency reading.
+    #[test]
+    fn format_renders_measured_zero_wake_and_run_delay_not_omitted() {
+        let mut per_cgroup = std::collections::BTreeMap::new();
+        per_cgroup.insert(
+            "cg".to_string(),
+            crate::assert::PhaseCgroupStats {
+                off_cpu_pcts: vec![5.0],
+                wake_latencies_ns: vec![0],
+                run_delays_ns: vec![0],
+                ..Default::default()
+            },
+        );
+        let buckets = vec![crate::assert::PhaseBucket {
+            per_cgroup,
+            step_index: 1,
+            label: "Step[0]".to_string(),
+            start_ms: 1000,
+            end_ms: 2000,
+            sample_count: 1,
+            metrics: std::collections::BTreeMap::from([("avg_imbalance_ratio".to_string(), 1.0)]),
+        }];
+        let t = Timeline::from_phase_buckets(&buckets, &[], &TimelineContext::default());
+        let formatted = t.format_with_context(&TimelineContext::default());
+        assert!(
+            formatted.contains("wake p99=0\u{00b5}s"),
+            "measured-zero wake renders 0µs, not omitted; got:\n{formatted}",
+        );
+        assert!(
+            formatted.contains("run-delay mean=0\u{00b5}s"),
+            "measured-zero run-delay renders 0µs, not omitted; got:\n{formatted}",
+        );
+    }
+
+    /// The per-cgroup sub-block caps at MAX_RENDERED_CGROUPS (16) by name
+    /// order, with a "+J more" note — bounding failure-message size.
+    #[test]
+    fn format_caps_per_cgroup_subblock() {
+        let mut per_cgroup = std::collections::BTreeMap::new();
+        for i in 0..20 {
+            per_cgroup.insert(
+                format!("cg{i:02}"),
+                crate::assert::PhaseCgroupStats {
+                    off_cpu_pcts: vec![10.0],
+                    ..Default::default()
+                },
+            );
+        }
+        let buckets = vec![crate::assert::PhaseBucket {
+            per_cgroup,
+            step_index: 1,
+            label: "Step[0]".to_string(),
+            start_ms: 1000,
+            end_ms: 2000,
+            sample_count: 1,
+            metrics: std::collections::BTreeMap::from([("avg_imbalance_ratio".to_string(), 1.0)]),
+        }];
+        let t = Timeline::from_phase_buckets(&buckets, &[], &TimelineContext::default());
+        let formatted = t.format_with_context(&TimelineContext::default());
+        assert!(
+            formatted.contains("(+4 more cgroups)"),
+            "20 cgroups capped at 16 -> +4 more; got:\n{formatted}",
+        );
+        assert!(formatted.contains("cg15:"), "first 16 rendered; got:\n{formatted}");
+        assert!(
+            !formatted.contains("cg16:"),
+            "cg16 is beyond the cap; got:\n{formatted}",
+        );
+    }
+
+    /// No per-cgroup sub-block when the phase carries no carriers (the
+    /// monitor-only path, or a phase with empty per_cgroup).
+    #[test]
+    fn format_omits_per_cgroup_subblock_when_empty() {
+        let buckets = vec![crate::assert::PhaseBucket {
+            per_cgroup: Default::default(),
+            step_index: 1,
+            label: "Step[0]".to_string(),
+            start_ms: 1000,
+            end_ms: 2000,
+            sample_count: 1,
+            metrics: std::collections::BTreeMap::from([("avg_imbalance_ratio".to_string(), 1.0)]),
+        }];
+        let t = Timeline::from_phase_buckets(&buckets, &[], &TimelineContext::default());
+        let formatted = t.format_with_context(&TimelineContext::default());
+        assert!(
+            !formatted.contains("per-cgroup:"),
+            "no sub-block when carriers absent; got:\n{formatted}",
+        );
+    }
+
+    /// Cap off-by-one boundary: EXACTLY 16 cgroups render all 16 with NO
+    /// "more cgroups" note (total > MAX is false); 17 render 16 + "(+1 more
+    /// cgroups)". Pins the `>` vs `>=` / `take(N)` edge against a silent drop
+    /// (one cgroup gone, no note) or a "(+0 more)" lie.
+    #[test]
+    fn format_per_cgroup_cap_boundary_16_and_17() {
+        let mk = |n: usize| {
+            let mut per_cgroup = std::collections::BTreeMap::new();
+            for i in 0..n {
+                per_cgroup.insert(
+                    format!("cg{i:02}"),
+                    crate::assert::PhaseCgroupStats {
+                        off_cpu_pcts: vec![10.0],
+                        ..Default::default()
+                    },
+                );
+            }
+            let buckets = vec![crate::assert::PhaseBucket {
+                per_cgroup,
+                step_index: 1,
+                label: "Step[0]".to_string(),
+                start_ms: 1000,
+                end_ms: 2000,
+                sample_count: 1,
+                metrics: std::collections::BTreeMap::from([(
+                    "avg_imbalance_ratio".to_string(),
+                    1.0,
+                )]),
+            }];
+            Timeline::from_phase_buckets(&buckets, &[], &TimelineContext::default())
+                .format_with_context(&TimelineContext::default())
+        };
+        let at16 = mk(16);
+        assert!(at16.contains("cg15:"), "16th cgroup renders; got:\n{at16}");
+        assert!(
+            !at16.contains("more cgroups"),
+            "exactly 16 has NO truncation note; got:\n{at16}",
+        );
+        let at17 = mk(17);
+        assert!(at17.contains("cg15:"), "got:\n{at17}");
+        assert!(!at17.contains("cg16:"), "17th is past the cap; got:\n{at17}");
+        assert!(
+            at17.contains("(+1 more cgroup)") && !at17.contains("(+1 more cgroups)"),
+            "17 cgroups -> exactly +1 more (singular 'cgroup'); got:\n{at17}",
         );
     }
 

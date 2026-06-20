@@ -139,7 +139,7 @@
 //! claim!(v, throughput).is_finite();                  // expression label
 //! claim!(v, cg.wake_latency_tail_ratio()).between(1.0, 5.0);
 //! let r = v.into_result();
-//! assert!(r.passed);
+//! assert!(r.is_pass());
 //! ```
 //!
 //! Every claim is labeled by `stringify!` on either a struct field name
@@ -801,10 +801,11 @@ pub mod prelude {
     // scheduler-definition record test authors build via the
     // `declare_scheduler!` macro.
     pub use crate::assert::{
-        AbsoluteThresholds, Assert, AssertDetail, AssertResult, COMPARATOR_VOCABULARY,
+        AbsoluteThresholds, Assert, AssertDetail, AssertResult, COMPARATOR_VOCABULARY, CgroupStats,
         ClaimBuilder, DetailKind, EachClaim, FracPair, InfoNote, MAX_RECORDED_PASSES, NoteValue,
         Outcome, OutcomeRef, PASSES_TRUNCATION_SENTINEL_COMPARATOR,
-        PASSES_TRUNCATION_SENTINEL_NAME, PassDetail, PhaseBucket, PhaseMapExt, ScenarioStats,
+        PASSES_TRUNCATION_SENTINEL_NAME, PassDetail, PhaseBucket, PhaseCgroupStats, PhaseMapExt,
+        ScenarioStats,
         SeqClaim, SeriesField, SetClaim, Verdict, assert_scx_events_clean, assert_thresholds,
         build_phase_buckets_with_stimulus,
     };
