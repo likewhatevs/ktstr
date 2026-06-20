@@ -19,6 +19,7 @@ fn phase_bucket_json_round_trips_all_fields() {
     metrics.insert("worst_spread".to_string(), 0.42);
     metrics.insert("dsq_depth_max".to_string(), 12.0);
     let bucket = PhaseBucket {
+        per_cgroup: Default::default(),
         step_index: 7,
         label: "Step[6]".to_string(),
         start_ms: 1500,
@@ -31,6 +32,56 @@ fn phase_bucket_json_round_trips_all_fields() {
     assert_eq!(back, bucket);
 }
 
+/// `PhaseBucket.per_cgroup` serde round-trip with a fully-populated
+/// [`PhaseCgroupStats`] (every field type: the sample Vecs, the cpus_used set,
+/// and the counters) pins the per-phase per-cgroup wire shape. Also asserts
+/// the default carrier is empty — the structural-carrier invariant before any
+/// capture path populates it.
+#[test]
+fn phase_bucket_per_cgroup_round_trips_and_defaults_empty() {
+    use super::PhaseCgroupStats;
+    use std::collections::BTreeSet;
+    assert!(
+        PhaseBucket::default().per_cgroup.is_empty(),
+        "the structural carrier defaults to an empty per_cgroup map",
+    );
+    let mut bucket = PhaseBucket {
+        per_cgroup: Default::default(),
+        step_index: 1,
+        label: "Step[0]".to_string(),
+        start_ms: 0,
+        end_ms: 1000,
+        sample_count: 3,
+        metrics: BTreeMap::new(),
+    };
+    bucket.per_cgroup.insert(
+        "cg_0".to_string(),
+        PhaseCgroupStats {
+            num_workers: 3,
+            cpus_used: BTreeSet::from([2, 5, 6]),
+            wake_latencies_ns: vec![10, 20, 30],
+            wake_sample_total: 3,
+            run_delays_ns: vec![1_500, 2_500],
+            off_cpu_pcts: vec![1.5, 11.0, 22.5],
+            total_migrations: 7,
+            total_iterations: 4200,
+            total_cpu_time_ns: 9_000_000,
+            numa_pages_local: 90,
+            numa_pages_total: 100,
+            cross_node_migrated: 4,
+            max_gap_ms: 13,
+            max_gap_cpu: 2,
+        },
+    );
+    let json = serde_json::to_string(&bucket).expect("serialize");
+    let back: PhaseBucket = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(back, bucket);
+    assert_eq!(back.per_cgroup["cg_0"].total_iterations, 4200);
+    assert_eq!(back.per_cgroup["cg_0"].wake_latencies_ns, vec![10, 20, 30]);
+    assert_eq!(back.per_cgroup["cg_0"].off_cpu_pcts, vec![1.5, 11.0, 22.5]);
+    assert_eq!(back.per_cgroup["cg_0"].cpus_used, BTreeSet::from([2, 5, 6]),);
+}
+
 /// Empty `metrics` BTreeMap serializes as a present-but-empty
 /// `"metrics": {}` field, not as absent. Pins the distinction
 /// between "phase had no samples for any metric" (empty map,
@@ -38,6 +89,7 @@ fn phase_bucket_json_round_trips_all_fields() {
 #[test]
 fn phase_bucket_empty_metrics_round_trips_as_empty_object() {
     let bucket = PhaseBucket {
+        per_cgroup: Default::default(),
         step_index: 0,
         label: "BASELINE".to_string(),
         start_ms: 0,
@@ -60,6 +112,7 @@ fn phase_bucket_empty_metrics_round_trips_as_empty_object() {
 #[test]
 fn phase_bucket_step_index_u16_max_round_trips() {
     let bucket = PhaseBucket {
+        per_cgroup: Default::default(),
         step_index: u16::MAX,
         label: "Step[65534]".to_string(),
         start_ms: 0,
@@ -80,6 +133,7 @@ fn phase_bucket_step_index_u16_max_round_trips() {
 #[test]
 fn phase_bucket_empty_label_round_trips_as_present_field() {
     let bucket = PhaseBucket {
+        per_cgroup: Default::default(),
         step_index: 0,
         label: String::new(),
         start_ms: 0,
@@ -107,6 +161,7 @@ fn phase_bucket_get_distinguishes_absent_from_zero() {
     let mut metrics = BTreeMap::new();
     metrics.insert("present".to_string(), 0.0);
     let bucket = PhaseBucket {
+        per_cgroup: Default::default(),
         step_index: 1,
         label: "Step[0]".to_string(),
         start_ms: 0,
@@ -143,6 +198,7 @@ fn scenario_stats_phase_lookup_by_step_index_not_position() {
     let stats = ScenarioStats {
         phases: vec![
             PhaseBucket {
+                per_cgroup: Default::default(),
                 step_index: 0,
                 label: "BASELINE".to_string(),
                 start_ms: 0,
@@ -151,6 +207,7 @@ fn scenario_stats_phase_lookup_by_step_index_not_position() {
                 metrics: metrics_baseline,
             },
             PhaseBucket {
+                per_cgroup: Default::default(),
                 step_index: 3,
                 label: "Step[2]".to_string(),
                 start_ms: 200,
@@ -178,6 +235,7 @@ fn scenario_stats_phase_metric_resolves_typed_lookup() {
     metrics.insert("dsq_depth_max".to_string(), 12.0);
     let stats = ScenarioStats {
         phases: vec![PhaseBucket {
+            per_cgroup: Default::default(),
             step_index: 1,
             label: "Step[0]".to_string(),
             start_ms: 100,
@@ -2072,6 +2130,7 @@ fn build_phase_buckets_with_stimulus_sched_died_last_step_yields_empty_present_b
 fn synthesized_zero_sample_bucket_flags_throughput_not_phantom_monitor() {
     use crate::timeline::{ChangeDirection, Timeline, TimelineContext};
     let captured = |k: u16, imbalance: f64, rate: f64| crate::assert::PhaseBucket {
+        per_cgroup: Default::default(),
         step_index: k,
         label: format!("Step[{}]", k.saturating_sub(1)),
         start_ms: (k as u64) * 1000,
@@ -2088,6 +2147,7 @@ fn synthesized_zero_sample_bucket_flags_throughput_not_phantom_monitor() {
     let buckets = vec![
         captured(1, 1.0, 1000.0),
         crate::assert::PhaseBucket {
+            per_cgroup: Default::default(),
             step_index: 2,
             label: "Step[1]".to_string(),
             start_ms: 2000,
@@ -3184,6 +3244,7 @@ fn populate_run_ext_metrics_from_phases_folds_per_phase_keys() {
     m1.insert("avg_imbalance_ratio".to_string(), 4.0);
     let phases = vec![
         PhaseBucket {
+            per_cgroup: Default::default(),
             step_index: 1,
             label: "Step[0]".to_string(),
             start_ms: 0,
@@ -3192,6 +3253,7 @@ fn populate_run_ext_metrics_from_phases_folds_per_phase_keys() {
             metrics: m0,
         },
         PhaseBucket {
+            per_cgroup: Default::default(),
             step_index: 2,
             label: "Step[1]".to_string(),
             start_ms: 100,
@@ -3230,6 +3292,7 @@ fn populate_run_ext_metrics_from_phases_skips_typed_backed_keys() {
     m.insert("max_imbalance_ratio".to_string(), 3.0); // typed-backed -> skipped
     m.insert("stuck_count".to_string(), 2.0); // typed-backed -> skipped
     let phases = vec![PhaseBucket {
+        per_cgroup: Default::default(),
         step_index: 1,
         label: "Step[0]".to_string(),
         start_ms: 0,
@@ -3279,6 +3342,7 @@ fn populate_run_ext_metrics_repools_synthesized_zero_capture_phase() {
     ]);
     let phases = vec![
         PhaseBucket {
+            per_cgroup: Default::default(),
             step_index: 1,
             label: "Step[0]".to_string(),
             start_ms: 0,
@@ -3287,6 +3351,7 @@ fn populate_run_ext_metrics_repools_synthesized_zero_capture_phase() {
             metrics: cap,
         },
         PhaseBucket {
+            per_cgroup: Default::default(),
             step_index: 2,
             label: "Step[1]".to_string(),
             start_ms: 100,

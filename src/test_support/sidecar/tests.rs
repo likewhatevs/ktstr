@@ -2742,6 +2742,7 @@ fn sidecar_round_trip_preserves_phases() {
     let stats = ScenarioStats {
         phases: vec![
             PhaseBucket {
+                per_cgroup: Default::default(),
                 step_index: 0,
                 label: "BASELINE".to_string(),
                 start_ms: 0,
@@ -2750,6 +2751,7 @@ fn sidecar_round_trip_preserves_phases() {
                 metrics: BTreeMap::new(),
             },
             PhaseBucket {
+                per_cgroup: Default::default(),
                 step_index: 1,
                 label: "Step[0]".to_string(),
                 start_ms: 500,
@@ -2758,6 +2760,7 @@ fn sidecar_round_trip_preserves_phases() {
                 metrics: s0_metrics.clone(),
             },
             PhaseBucket {
+                per_cgroup: Default::default(),
                 step_index: 2,
                 label: "Step[1]".to_string(),
                 start_ms: 5500,

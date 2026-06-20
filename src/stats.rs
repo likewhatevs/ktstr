@@ -11842,6 +11842,7 @@ mod tests {
     ) -> crate::assert::PhaseBucket {
         let metrics_map = metrics.iter().map(|(k, v)| (k.to_string(), *v)).collect();
         crate::assert::PhaseBucket {
+            per_cgroup: Default::default(),
             step_index,
             label: label.to_string(),
             start_ms: 0,

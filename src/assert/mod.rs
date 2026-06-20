@@ -1443,6 +1443,148 @@ pub struct CgroupStats {
     pub ext_metrics: BTreeMap<String, f64>,
 }
 
+/// Per-phase per-cgroup raw telemetry components — the per-phase analogue of
+/// [`CgroupStats`]. Holds RAW components (sample vectors + counters), NOT the
+/// reduced ratios/percentiles [`CgroupStats`] computes, so whole-run and
+/// cross-run aggregates RE-POOL from the components at every level (the
+/// per-phase telemetry thesis: an aggregate is recomputed over the pooled
+/// components, never averaged from ready-made per-phase reductions — a
+/// percentile or weighted ratio cannot be recovered from per-phase scalars).
+/// Covers every TYPED [`CgroupStats`] reduction: avg/min/max off-CPU% and
+/// spread from `off_cpu_pcts`; p99/median/CV wake latency from
+/// `wake_latencies_ns`; mean/worst run-delay from `run_delays_ns`;
+/// migration_ratio, iterations_per_cpu_sec, iterations_per_worker,
+/// page_locality, cross_node_migration_ratio from their counter components;
+/// the COUPLED worst gap (ms + the CPU that owned it) from `max_gap_ms` /
+/// `max_gap_cpu`; cpus_used / num_cpus from `cpus_used`. EXCLUDES
+/// [`CgroupStats::ext_metrics`] (the generic extensible map — a per-phase
+/// per-cgroup custom metric is a future extension, not part of the typed
+/// carrier). Lives in [`PhaseBucket::per_cgroup`], keyed by cgroup name. The
+/// structural carrier is empty until a capture path populates it per phase.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize, crate::Claim)]
+pub struct PhaseCgroupStats {
+    /// Worker count in this cgroup for the phase — denominator for the
+    /// re-pooled per-worker iteration rate (`iterations_per_worker`).
+    pub num_workers: usize,
+    /// Distinct CPUs the cgroup's workers ran on in the phase (union of each
+    /// worker's `cpus_used`). Re-pools [`CgroupStats::cpus_used`] / `num_cpus`
+    /// (= the set / its length) via a set UNION.
+    pub cpus_used: std::collections::BTreeSet<usize>,
+    /// Pooled per-wakeup latency samples (ns) across the cgroup's workers in
+    /// the phase, un-reduced so p99 / median / CV re-pool over the combined
+    /// set. Reservoir-clamped; `wake_sample_total` carries the true count.
+    pub wake_latencies_ns: Vec<u64>,
+    /// True wakeup count before reservoir clamping (`wake_latencies_ns` is
+    /// capped), so the re-pool can report the real population size.
+    pub wake_sample_total: u64,
+    /// Pooled per-worker schedstat run-delay samples (RAW ns) for the phase,
+    /// un-reduced so mean / worst run-delay re-pool over the combined set; the
+    /// re-pool converts ns → µs to match [`CgroupStats`]'s run-delay-µs fields.
+    /// Stored as raw kernel ns (like `wake_latencies_ns`), not pre-converted,
+    /// per the raw-component thesis.
+    pub run_delays_ns: Vec<u64>,
+    /// Pooled per-worker off-CPU% samples for the phase, un-reduced so the MEAN
+    /// (`avg_off_cpu_pct`), the EXTREMES (min/max), and the SPREAD (max − min)
+    /// all re-pool over the combined set. An EMPTY vec is the not-measured
+    /// state (no worker with positive wall time), preserving the not-measured
+    /// vs measured-zero distinction [`CgroupStats`] keeps. Stored as raw
+    /// samples, not pre-reduced extremes, because the mean is unrecoverable
+    /// from min/max alone for >2 workers.
+    pub off_cpu_pcts: Vec<f64>,
+    /// Sum of per-worker CPU-migration counts in the phase (Counter).
+    pub total_migrations: u64,
+    /// Sum of per-worker iteration counts in the phase (Counter).
+    pub total_iterations: u64,
+    /// Sum of per-worker on-CPU time (ns) in the phase — the
+    /// overcommit-invariant rate denominator (Counter).
+    pub total_cpu_time_ns: u64,
+    /// Pages on the expected NUMA node(s) — page-locality numerator. A genuine
+    /// per-thread numa_maps count (Counter, SUM across workers/sources).
+    pub numa_pages_local: u64,
+    /// Total allocated pages — the SHARED denominator for BOTH page_locality
+    /// (`numa_pages_local` / this) AND cross_node_migration_ratio
+    /// (`cross_node_migrated` / this). A genuine per-thread numa_maps count
+    /// (Counter, SUM); the kernel computes both ratios over the identical page
+    /// total, so one field serves both — a separate cross_node_total would
+    /// invite a silent desync.
+    pub numa_pages_total: u64,
+    /// Cross-node migrated pages — cross_node_migration_ratio numerator
+    /// (denominator is `numa_pages_total`). A SYSTEM-WIDE
+    /// `/proc/vmstat numa_pages_migrated` delta each worker observes
+    /// redundantly, so this is a PEAK (MAX across workers/sources), NOT a
+    /// Counter — summing would inflate it by the worker count (mirrors
+    /// [`CgroupStats`]'s deliberate max-fold of the same quantity).
+    pub cross_node_migrated: u64,
+    /// Longest scheduling gap (ms) across the cgroup's workers in the phase,
+    /// coupled with `max_gap_cpu`. A Peak folded as an ARGMAX of the (ms, cpu)
+    /// pair so the worst gap and its CPU survive together — mirrors
+    /// [`CgroupStats`]'s `max_gap_ms` / `max_gap_cpu` coupling (a bare
+    /// independent max would desync the gap from its CPU).
+    pub max_gap_ms: u64,
+    /// CPU that owned the worst scheduling gap — `max_gap_ms`'s argmax
+    /// companion. Folded together with `max_gap_ms`, never independently.
+    pub max_gap_cpu: usize,
+}
+
+impl PhaseCgroupStats {
+    /// Component-wise union of two per-phase per-cgroup data for the SAME
+    /// cgroup name (same `step_index`). Fold rule by component class:
+    /// - sample vectors (`wake_latencies_ns`, `run_delays_ns`, `off_cpu_pcts`)
+    ///   CONCAT, so the re-pool sees the combined set, never a mean of
+    ///   per-source reductions;
+    /// - the CPU set (`cpus_used`) UNIONs;
+    /// - genuine Counters (`wake_sample_total`, `total_migrations`,
+    ///   `total_iterations`, `total_cpu_time_ns`, `numa_pages_local`,
+    ///   `numa_pages_total`) SUM;
+    /// - Peaks take the MAX: `cross_node_migrated` (a system-wide vmstat delta
+    ///   observed redundantly per worker, so summing would inflate it) and
+    ///   `num_workers` (invariant for a given cgroup; max is the conservative
+    ///   count if two sources disagree);
+    /// - the COUPLED worst gap (`max_gap_ms`, `max_gap_cpu`) folds as an
+    ///   ARGMAX — the pair from whichever side has the larger ms (a's on tie)
+    ///   so the gap and its CPU stay bound together.
+    ///
+    /// The counter SUMs use plain `+`: debug builds panic on overflow rather
+    /// than wrapping. The realistic magnitudes (iteration / ns counts far
+    /// below `u64::MAX` even pooled across a long run) keep overflow
+    /// unreachable; a loud debug panic is preferred over a silently wrong
+    /// re-pool denominator.
+    fn merge(a: PhaseCgroupStats, b: PhaseCgroupStats) -> PhaseCgroupStats {
+        let mut wake_latencies_ns = a.wake_latencies_ns;
+        wake_latencies_ns.extend(b.wake_latencies_ns);
+        let mut run_delays_ns = a.run_delays_ns;
+        run_delays_ns.extend(b.run_delays_ns);
+        let mut off_cpu_pcts = a.off_cpu_pcts;
+        off_cpu_pcts.extend(b.off_cpu_pcts);
+        let mut cpus_used = a.cpus_used;
+        cpus_used.extend(b.cpus_used);
+        // Coupled worst-gap ARGMAX: take the (ms, cpu) pair together from the
+        // side with the larger gap (a's on tie) so the CPU stays bound to the
+        // gap it owned — a bare independent max would desync them.
+        let (max_gap_ms, max_gap_cpu) = if b.max_gap_ms > a.max_gap_ms {
+            (b.max_gap_ms, b.max_gap_cpu)
+        } else {
+            (a.max_gap_ms, a.max_gap_cpu)
+        };
+        PhaseCgroupStats {
+            num_workers: a.num_workers.max(b.num_workers),
+            cpus_used,
+            wake_latencies_ns,
+            wake_sample_total: a.wake_sample_total + b.wake_sample_total,
+            run_delays_ns,
+            off_cpu_pcts,
+            total_migrations: a.total_migrations + b.total_migrations,
+            total_iterations: a.total_iterations + b.total_iterations,
+            total_cpu_time_ns: a.total_cpu_time_ns + b.total_cpu_time_ns,
+            numa_pages_local: a.numa_pages_local + b.numa_pages_local,
+            numa_pages_total: a.numa_pages_total + b.numa_pages_total,
+            cross_node_migrated: a.cross_node_migrated.max(b.cross_node_migrated),
+            max_gap_ms,
+            max_gap_cpu,
+        }
+    }
+}
+
 impl CgroupStats {
     /// Wake-latency tail amplification:
     /// `p99_wake_latency_us / median_wake_latency_us`. Returns `0.0`
@@ -1682,6 +1824,11 @@ pub struct PhaseBucket {
     /// samples for that metric (sentinel-free: `None` from the
     /// reducer surfaces as "key absent" rather than "value 0.0").
     pub metrics: std::collections::BTreeMap<String, f64>,
+    /// Per-cgroup raw telemetry components for this phase, keyed by cgroup
+    /// name (see [`PhaseCgroupStats`]). Empty until a capture path populates
+    /// it; the structural carrier for the per-phase per-cgroup distributional
+    /// re-pool. Whole-run = aggregate of these per-phase per-cgroup components.
+    pub per_cgroup: std::collections::BTreeMap<String, PhaseCgroupStats>,
 }
 
 impl PhaseBucket {
@@ -1835,6 +1982,22 @@ fn merge_matched_phase_buckets(a: PhaseBucket, b: PhaseBucket) -> PhaseBucket {
     // summed), so the rate becomes Σnumerator / Σdenominator — the
     // correct re-pool, not a mean of the two phases' ready-made ratios.
     crate::stats::derive_rate_metrics(&mut metrics);
+    // Union per_cgroup by cgroup name: a cgroup present on both sides folds
+    // its raw components per PhaseCgroupStats::merge (concat samples, sum
+    // counters, combine extremes); a cgroup on only one side is carried
+    // verbatim. Empty ∪ empty = empty, so this is a no-op until a capture
+    // path populates per_cgroup (the structural-carrier invariant).
+    let mut per_cgroup = a.per_cgroup;
+    for (name, b_cg) in b.per_cgroup {
+        match per_cgroup.remove(&name) {
+            Some(a_cg) => {
+                per_cgroup.insert(name, PhaseCgroupStats::merge(a_cg, b_cg));
+            }
+            None => {
+                per_cgroup.insert(name, b_cg);
+            }
+        }
+    }
     PhaseBucket {
         step_index: a.step_index,
         label: a.label,
@@ -1842,6 +2005,7 @@ fn merge_matched_phase_buckets(a: PhaseBucket, b: PhaseBucket) -> PhaseBucket {
         end_ms: a.end_ms.max(b.end_ms),
         sample_count: a.sample_count + b.sample_count,
         metrics,
+        per_cgroup,
     }
 }
 
@@ -2647,6 +2811,7 @@ pub fn build_phase_buckets_with_stimulus(
             end_ms,
             sample_count: 0,
             metrics: std::collections::BTreeMap::new(),
+            per_cgroup: std::collections::BTreeMap::new(),
         };
         fold_monitor_into_bucket(&mut bucket, monitor_samples, monitor_to_window_offset_ms);
         buckets.push(bucket);
@@ -3062,6 +3227,7 @@ fn buckets_from_grouped(
             end_ms,
             sample_count,
             metrics,
+            per_cgroup: std::collections::BTreeMap::new(),
         };
         // Per-phase MonitorSample windowing for monitor-derived metrics
         // (avg_imbalance_ratio). Factored into `fold_monitor_into_bucket`

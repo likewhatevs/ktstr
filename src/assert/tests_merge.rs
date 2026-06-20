@@ -1198,6 +1198,7 @@ fn phase_bucket(
     metrics: &[(&str, f64)],
 ) -> PhaseBucket {
     PhaseBucket {
+        per_cgroup: Default::default(),
         step_index,
         label: label.to_string(),
         start_ms,
@@ -1262,6 +1263,139 @@ fn assert_result_merge_per_phase_peak_takes_max() {
     )];
     a.merge(b);
     assert_eq!(a.stats.phases[0].metrics["worst_gap_ms"], 12.0);
+}
+
+#[test]
+fn assert_result_merge_per_phase_per_cgroup_unions_and_folds() {
+    use crate::assert::PhaseCgroupStats;
+    use std::collections::BTreeSet;
+    // Two same-step buckets. cg_0 is shared — its RAW components FOLD by class:
+    // sample Vecs (latencies/run_delays/off_cpu_pcts) CONCAT, cpus_used UNIONs,
+    // genuine counters SUM, and the Peaks (cross_node_migrated [system-wide
+    // vmstat delta], gap, num_workers) take MAX. cg_x (shared) pins
+    // not-measured (empty off_cpu_pcts) UNION measured. cg_a/cg_b are one-sided
+    // and carried verbatim BY VALUE. Pins the per_cgroup union in
+    // merge_matched_phase_buckets.
+    let mut a = AssertResult::pass();
+    let mut a_bucket = phase_bucket(1, "Step[0]", 0, 100, 5, &[]);
+    a_bucket.per_cgroup.insert(
+        "cg_0".to_string(),
+        PhaseCgroupStats {
+            num_workers: 4,
+            cpus_used: BTreeSet::from([0, 1]),
+            wake_latencies_ns: vec![10, 20],
+            wake_sample_total: 2,
+            run_delays_ns: vec![1_000],
+            off_cpu_pcts: vec![5.0, 20.0],
+            total_migrations: 3,
+            total_iterations: 100,
+            total_cpu_time_ns: 1_000,
+            numa_pages_local: 90,
+            numa_pages_total: 100,
+            cross_node_migrated: 100,
+            max_gap_ms: 7,
+            max_gap_cpu: 3,
+        },
+    );
+    a_bucket.per_cgroup.insert(
+        "cg_x".to_string(),
+        PhaseCgroupStats {
+            off_cpu_pcts: vec![], // not measured on a's side
+            ..Default::default()
+        },
+    );
+    a_bucket.per_cgroup.insert(
+        "cg_a".to_string(),
+        PhaseCgroupStats {
+            num_workers: 1,
+            ..Default::default()
+        },
+    );
+    a.stats.phases = vec![a_bucket];
+
+    let mut b = AssertResult::pass();
+    let mut b_bucket = phase_bucket(1, "Step[0]", 0, 100, 5, &[]);
+    b_bucket.per_cgroup.insert(
+        "cg_0".to_string(),
+        PhaseCgroupStats {
+            num_workers: 4,
+            cpus_used: BTreeSet::from([1, 2]),
+            wake_latencies_ns: vec![30],
+            wake_sample_total: 1,
+            run_delays_ns: vec![2_000, 3_000],
+            off_cpu_pcts: vec![3.0, 15.0],
+            total_migrations: 2,
+            total_iterations: 50,
+            total_cpu_time_ns: 500,
+            numa_pages_local: 40,
+            numa_pages_total: 50,
+            cross_node_migrated: 50,
+            max_gap_ms: 9,
+            max_gap_cpu: 5,
+        },
+    );
+    b_bucket.per_cgroup.insert(
+        "cg_x".to_string(),
+        PhaseCgroupStats {
+            off_cpu_pcts: vec![7.0], // measured on b's side
+            ..Default::default()
+        },
+    );
+    b_bucket.per_cgroup.insert(
+        "cg_b".to_string(),
+        PhaseCgroupStats {
+            num_workers: 2,
+            ..Default::default()
+        },
+    );
+    b.stats.phases = vec![b_bucket];
+
+    a.merge(b);
+    let pc = &a.stats.phases[0].per_cgroup;
+    // One-sided cgroups carried verbatim BY VALUE (not just key presence).
+    assert_eq!(pc["cg_a"].num_workers, 1, "cg_a (a-only) carried by value");
+    assert_eq!(pc["cg_b"].num_workers, 2, "cg_b (b-only) carried by value");
+    // Shared cg_0 folded component-wise.
+    let cg0 = &pc["cg_0"];
+    assert_eq!(cg0.wake_latencies_ns, vec![10, 20, 30], "latencies concat");
+    assert_eq!(cg0.wake_sample_total, 3, "wake_sample_total sums");
+    assert_eq!(
+        cg0.run_delays_ns,
+        vec![1_000, 2_000, 3_000],
+        "run_delays concat (raw ns)"
+    );
+    assert_eq!(
+        cg0.off_cpu_pcts,
+        vec![5.0, 20.0, 3.0, 15.0],
+        "off_cpu_pcts concat (mean + spread re-pool from these raw samples)",
+    );
+    assert_eq!(cg0.cpus_used, BTreeSet::from([0, 1, 2]), "cpus_used union");
+    assert_eq!(cg0.total_migrations, 5, "migrations sum (3+2)");
+    assert_eq!(cg0.total_iterations, 150, "iterations sum (100+50)");
+    assert_eq!(cg0.total_cpu_time_ns, 1_500, "cpu time sum (1000+500)");
+    assert_eq!(cg0.numa_pages_local, 130, "numa_pages_local sum (90+40)");
+    assert_eq!(cg0.numa_pages_total, 150, "numa_pages_total sum (100+50)");
+    assert_eq!(
+        cg0.cross_node_migrated, 100,
+        "cross_node_migrated MAX(100,50)=100 NOT 150 — system-wide vmstat delta",
+    );
+    // Coupled worst gap folds as an ARGMAX: b has the larger gap (9 > 7) so
+    // BOTH ms and cpu come from b — never desynced into a's cpu.
+    assert_eq!(
+        cg0.max_gap_ms, 9,
+        "gap ms = argmax-by-ms(7@cpu3, 9@cpu5) = 9"
+    );
+    assert_eq!(
+        cg0.max_gap_cpu, 5,
+        "gap cpu coupled to the winning gap (b's 5, NOT a's 3)",
+    );
+    assert_eq!(cg0.num_workers, 4, "num_workers = max(4,4)");
+    // Not-measured (empty) UNION measured = measured (empty concat is a no-op).
+    assert_eq!(
+        pc["cg_x"].off_cpu_pcts,
+        vec![7.0],
+        "empty off_cpu_pcts (not measured) ∪ measured = measured",
+    );
 }
 
 #[test]
@@ -1479,6 +1613,7 @@ fn merge_kind_enum_exhaustively_covers_metric_kind_variants() {
 fn merge_matched_phase_buckets_repools_synthesized_zero_count() {
     use std::collections::BTreeMap;
     let synth = PhaseBucket {
+        per_cgroup: Default::default(),
         step_index: 2,
         label: "Step[1]".to_string(),
         start_ms: 2000,
@@ -1490,6 +1625,7 @@ fn merge_matched_phase_buckets_repools_synthesized_zero_count() {
         ]),
     };
     let captured = PhaseBucket {
+        per_cgroup: Default::default(),
         step_index: 2,
         label: "Step[1]".to_string(),
         start_ms: 2000,

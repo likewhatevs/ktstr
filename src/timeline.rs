@@ -1393,6 +1393,7 @@ mod tests {
     fn format_renders_synthesized_step_throughput() {
         let buckets = vec![
             crate::assert::PhaseBucket {
+                per_cgroup: Default::default(),
                 step_index: 0,
                 label: "BASELINE".to_string(),
                 start_ms: 0,
@@ -1401,6 +1402,7 @@ mod tests {
                 metrics: std::collections::BTreeMap::new(),
             },
             crate::assert::PhaseBucket {
+                per_cgroup: Default::default(),
                 step_index: 1,
                 label: "Step[0]".to_string(),
                 start_ms: 1000,
@@ -1426,6 +1428,7 @@ mod tests {
     fn format_renders_synthesized_step_monitor_metrics() {
         let buckets = vec![
             crate::assert::PhaseBucket {
+                per_cgroup: Default::default(),
                 step_index: 0,
                 label: "BASELINE".to_string(),
                 start_ms: 0,
@@ -1434,6 +1437,7 @@ mod tests {
                 metrics: std::collections::BTreeMap::new(),
             },
             crate::assert::PhaseBucket {
+                per_cgroup: Default::default(),
                 step_index: 1,
                 label: "Step[0]".to_string(),
                 start_ms: 1000,
@@ -1469,6 +1473,7 @@ mod tests {
     fn format_no_baseline_bucket_does_not_mislabel_first_step() {
         let buckets = vec![
             crate::assert::PhaseBucket {
+                per_cgroup: Default::default(),
                 step_index: 1, // scenario Step 0; NO BASELINE bucket present
                 label: "Step[0]".to_string(),
                 start_ms: 1000,
@@ -1480,6 +1485,7 @@ mod tests {
                 )]),
             },
             crate::assert::PhaseBucket {
+                per_cgroup: Default::default(),
                 step_index: 2,
                 label: "Step[1]".to_string(),
                 start_ms: 2000,
@@ -1515,6 +1521,7 @@ mod tests {
     fn format_sparse_step_index_renders_true_step_number() {
         let buckets = vec![
             crate::assert::PhaseBucket {
+                per_cgroup: Default::default(),
                 step_index: 0,
                 label: "BASELINE".to_string(),
                 start_ms: 0,
@@ -1523,6 +1530,7 @@ mod tests {
                 metrics: std::collections::BTreeMap::new(),
             },
             crate::assert::PhaseBucket {
+                per_cgroup: Default::default(),
                 step_index: 3, // sparse: Steps 0/1 absent, only step_index 3
                 label: "Step[2]".to_string(),
                 start_ms: 200,
@@ -2832,6 +2840,7 @@ mod tests {
         s0_metrics.insert("total_fallback".to_string(), 200.0);
         let buckets = vec![
             PhaseBucket {
+                per_cgroup: Default::default(),
                 step_index: 0,
                 label: "BASELINE".to_string(),
                 start_ms: 0,
@@ -2840,6 +2849,7 @@ mod tests {
                 metrics: BTreeMap::new(),
             },
             PhaseBucket {
+                per_cgroup: Default::default(),
                 step_index: 1,
                 label: "Step[0]".to_string(),
                 start_ms: 1000,
@@ -2904,6 +2914,7 @@ mod tests {
         step_metrics.insert("avg_imbalance_ratio".to_string(), 99.0); // must stay gated
         let buckets = vec![
             PhaseBucket {
+                per_cgroup: Default::default(),
                 step_index: 0,
                 label: "BASELINE".to_string(),
                 start_ms: 0,
@@ -2912,6 +2923,7 @@ mod tests {
                 metrics: baseline_metrics,
             },
             PhaseBucket {
+                per_cgroup: Default::default(),
                 step_index: 1,
                 label: "Step[0]".to_string(),
                 start_ms: 1000,
@@ -2965,6 +2977,7 @@ mod tests {
         step.insert("avg_dsq_depth".to_string(), 6.0); // +5.0 > 3.0 threshold
         let buckets = vec![
             PhaseBucket {
+                per_cgroup: Default::default(),
                 step_index: 0,
                 label: "BASELINE".to_string(),
                 start_ms: 0,
@@ -2973,6 +2986,7 @@ mod tests {
                 metrics: base,
             },
             PhaseBucket {
+                per_cgroup: Default::default(),
                 step_index: 1,
                 label: "Step[0]".to_string(),
                 start_ms: 1000,
@@ -3018,6 +3032,7 @@ mod tests {
         step.insert("avg_dsq_depth".to_string(), 2.0); // +1.0 < 3.0
         let buckets = vec![
             PhaseBucket {
+                per_cgroup: Default::default(),
                 step_index: 0,
                 label: "BASELINE".to_string(),
                 start_ms: 0,
@@ -3026,6 +3041,7 @@ mod tests {
                 metrics: base,
             },
             PhaseBucket {
+                per_cgroup: Default::default(),
                 step_index: 1,
                 label: "Step[0]".to_string(),
                 start_ms: 1000,
@@ -3054,6 +3070,7 @@ mod tests {
         step.insert("avg_imbalance_ratio".to_string(), 1.0); // -1.0, |delta|>0.5, after<before
         let buckets = vec![
             PhaseBucket {
+                per_cgroup: Default::default(),
                 step_index: 0,
                 label: "BASELINE".to_string(),
                 start_ms: 0,
@@ -3062,6 +3079,7 @@ mod tests {
                 metrics: base,
             },
             PhaseBucket {
+                per_cgroup: Default::default(),
                 step_index: 1,
                 label: "Step[0]".to_string(),
                 start_ms: 1000,
@@ -3106,6 +3124,7 @@ mod tests {
         };
         let buckets = vec![
             PhaseBucket {
+                per_cgroup: Default::default(),
                 step_index: 0,
                 label: "BASELINE".to_string(),
                 start_ms: 0,
@@ -3114,6 +3133,7 @@ mod tests {
                 metrics: BTreeMap::new(),
             },
             PhaseBucket {
+                per_cgroup: Default::default(),
                 step_index: 1,
                 label: "Step[0]".to_string(),
                 start_ms: 1000,
@@ -3142,6 +3162,7 @@ mod tests {
         let mut metrics = BTreeMap::new();
         metrics.insert("total_fallback".to_string(), 100.0);
         let bucket = PhaseBucket {
+            per_cgroup: Default::default(),
             step_index: 1,
             label: "Step[0]".to_string(),
             start_ms: 500,
@@ -3164,6 +3185,7 @@ mod tests {
         use crate::assert::PhaseBucket;
         use std::collections::BTreeMap;
         let bucket = PhaseBucket {
+            per_cgroup: Default::default(),
             step_index: 1,
             label: "Step[0]".to_string(),
             start_ms: 100,
@@ -3187,6 +3209,7 @@ mod tests {
         // how the caller arranged the input vec.
         let buckets = vec![
             PhaseBucket {
+                per_cgroup: Default::default(),
                 step_index: 2,
                 label: "Step[1]".to_string(),
                 start_ms: 2000,
@@ -3195,6 +3218,7 @@ mod tests {
                 metrics: BTreeMap::new(),
             },
             PhaseBucket {
+                per_cgroup: Default::default(),
                 step_index: 0,
                 label: "BASELINE".to_string(),
                 start_ms: 0,
@@ -3203,6 +3227,7 @@ mod tests {
                 metrics: BTreeMap::new(),
             },
             PhaseBucket {
+                per_cgroup: Default::default(),
                 step_index: 1,
                 label: "Step[0]".to_string(),
                 start_ms: 500,
