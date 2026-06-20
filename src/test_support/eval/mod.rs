@@ -1576,9 +1576,12 @@ fn evaluate_vm_result(
     // fills on the failure paths too. The buckets use this function's
     // `stimulus_events` param (the production caller passes
     // `result.stimulus_timeline()`, which is exactly what
-    // `result.phase_buckets()` uses — so `stats.phases` and
-    // `result.phase_buckets()` carry identical content; pinned by
-    // `phase_buckets_equals_stats_phases`).
+    // `result.phase_buckets()` uses). These host-rebuilt buckets equal
+    // `result.phase_buckets()` ONLY when there are no guest per_cgroup carriers
+    // — the no-carrier baseline pinned by `phase_buckets_equals_stats_phases`.
+    // With step-local cgroups, the per-phase fold below additionally merges the guest
+    // per_cgroup into `stats.phases` (and may append orphan buckets), so
+    // `stats.phases` is then a superset of `result.phase_buckets()`.
     //
     // Bucket the PERIODIC-ONLY view: on-demand `Op::CaptureSnapshot` and
     // watchpoint-fire captures are off-cadence outliers (see
@@ -1830,7 +1833,22 @@ fn evaluate_vm_result(
         // system_time_ns / user_time_ns (populate_run_ext_metrics_from_phases).
         // Without it those keys never reach the sidecar and
         // `cargo ktstr stats compare` silently drops the rows.
-        check_result.stats.phases = std::mem::take(&mut early_phase_buckets);
+        // 6b: fold the guest-collected per-phase per_cgroup carriers
+        // (parsed into check_result.stats.phases from the guest's
+        // AssertResult above) into the host-rebuilt buckets keyed by
+        // step_index, instead of clobbering them. The host buckets own the
+        // real window + metric folds (their per_cgroup is empty by
+        // construction); the guest carriers contribute only per_cgroup.
+        // Guest and host step_index are the identical 1-indexed value
+        // (step_idx + 1), so the pairing is exact. With no guest carriers
+        // (a run with no step-local cgroups) this returns the host buckets
+        // unchanged — the pre-6b behavior.
+        let host_phase_buckets = std::mem::take(&mut early_phase_buckets);
+        let guest_phase_buckets = std::mem::take(&mut check_result.stats.phases);
+        check_result.stats.phases = crate::assert::fold_guest_per_cgroup_into_host_buckets(
+            host_phase_buckets,
+            guest_phase_buckets,
+        );
         crate::assert::populate_run_ext_metrics(
             &early_periodic_series,
             &mut check_result.stats.ext_metrics,
@@ -2081,9 +2099,13 @@ fn evaluate_vm_result(
         // (Per-phase telemetry + cross-RUN ext_metrics were populated on
         // check_result above, BEFORE write_sidecar, so the persisted
         // sidecar carries them — see the populate block at the sidecar
-        // write site. stats.phases feeds both the failure-message Timeline
-        // render and the test author's result.stats.phases; the sentinel-
-        // free renderer paints an empty metrics map as "no data".)
+        // write site. The failure-message Timeline is built earlier from the
+        // host phase buckets (`early_phase_buckets`), BEFORE the 6b per_cgroup
+        // fold mutates `check_result.stats.phases`; the fold runs after Timeline
+        // construction so orphan (0,0)-window carriers cannot perturb it. The
+        // post-fold `stats.phases` is what the test author reads and what the
+        // sidecar persists; the sentinel-free renderer paints an empty metrics
+        // map as "no data".)
 
         return Ok(check_result);
     }

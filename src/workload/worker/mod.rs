@@ -33,7 +33,14 @@ use super::types::*;
 /// `doc/guide/src/architecture/workers.md`. Both pieces of text
 /// reference 100_000 — the pin trips when one drifts without the
 /// other.
-pub(super) const MAX_WAKE_SAMPLES: usize = 100_000;
+///
+/// `pub(crate)` so the per-phase per-cgroup carrier builder
+/// ([`crate::assert::phase_cgroup_stats`]) can re-cap the POOLED
+/// wake-latency samples at the same bound: the carrier concatenates
+/// every worker's already-capped vec, so the pool would otherwise grow
+/// to `workers × MAX_WAKE_SAMPLES` and overrun the bulk-port frame on a
+/// many-core host.
+pub(crate) const MAX_WAKE_SAMPLES: usize = 100_000;
 
 /// Wrap `FUTEX_WAKE` on `futex_ptr`, waking up to `n_waiters` tasks.
 /// Thin wrapper around `libc::syscall(SYS_futex, ...)` — callers of the
@@ -3887,7 +3894,7 @@ pub(super) fn pipe_exchange(
 /// `ipc_variance_rng`, `page_fault_rng_state`) so each thread / forked
 /// worker produces an independent stream. `cell.get() == 0` is the
 /// "uninitialised" sentinel because xorshift64 has 0 as a fixed point.
-pub(super) fn reservoir_push(buf: &mut Vec<u64>, count: &mut u64, sample: u64, cap: usize) {
+pub(crate) fn reservoir_push(buf: &mut Vec<u64>, count: &mut u64, sample: u64, cap: usize) {
     *count += 1;
     if buf.len() < cap {
         buf.push(sample);

@@ -1363,6 +1363,125 @@ fn evaluate_synthesizes_phase_buckets_for_uncaptured_steps() {
     );
 }
 
+/// End-to-end through the host eval path: a guest AssertResult
+/// carrying a per-phase per_cgroup carrier (step_index 1) survives the TLV
+/// serialize/parse roundtrip and is FOLDED into the host-rebuilt bucket of the
+/// same step_index — not clobbered. Asserts the host window/metrics survive
+/// (proving fold, not overwrite) AND the guest per_cgroup is carried through to
+/// check_result.stats.phases (the durable sidecar telemetry).
+#[test]
+fn evaluate_folds_guest_per_cgroup_into_host_phase_buckets() {
+    use crate::timeline::StimulusEvent;
+    let mut guest_assert = build_assert_result(true, vec![]);
+    let mut per_cgroup = std::collections::BTreeMap::new();
+    per_cgroup.insert(
+        "cgTest".to_string(),
+        crate::assert::PhaseCgroupStats {
+            num_workers: 2,
+            total_iterations: 99,
+            total_cpu_time_ns: 4242,
+            ..Default::default()
+        },
+    );
+    // The guest carrier: step_index 1, merge-neutral window, empty metrics,
+    // per_cgroup payload — exactly what step_per_cgroup_bucket emits in the guest.
+    guest_assert.stats.phases = vec![crate::assert::PhaseBucket {
+        step_index: 1,
+        label: "Step[0]".to_string(),
+        start_ms: u64::MAX,
+        end_ms: 0,
+        sample_count: 0,
+        metrics: std::collections::BTreeMap::new(),
+        per_cgroup,
+    }];
+    let entry = sched_entry("__eval_fold_per_cgroup__");
+    let result = crate::vmm::VmResult {
+        success: true,
+        guest_messages: Some(crate::vmm::host_comms::BulkDrainResult {
+            entries: vec![crate::test_support::test_helpers::assert_result_tlv_entry(
+                &guest_assert,
+            )],
+        }),
+        periodic_fired: 1,
+        periodic_target: 1,
+        ..crate::vmm::VmResult::test_fixture()
+    };
+    // One real host capture for step 1: elapsed_ms=1500, boundary_offset_ms=None,
+    // step_index=1. by_stimulus_phase keys it by the STAMPED step_index (1)
+    // (boundary_offset_ms is None, so there is no offset remap), and the bucket
+    // window comes from elapsed_ms — start_ms==end_ms==1500. So
+    // build_phase_buckets_with_stimulus produces a REAL host bucket at step_index
+    // 1 (sample_count 1, a non-sentinel window), which makes the fold take the
+    // MATCHED arm (host bucket + guest carrier at the same step_index merged via
+    // merge_matched_phase_buckets) — the path under test. Without a real host
+    // bucket at step_index 1 the guest carrier would be an ORPHAN whose
+    // assertions pass trivially.
+    result.snapshot_bridge.store_with_stats_and_step(
+        "periodic_000",
+        crate::monitor::dump::FailureDumpReport::default(),
+        None,
+        Some(1500),
+        None,
+        1,
+    );
+    // StepStart[1] -> StepStart[2] supplies step 1's iteration_rate (0 -> 1000
+    // iters over 1s), matched to the bucket by step_index; it does NOT set the
+    // bucket window (that comes from the capture's elapsed_ms above).
+    let start = |elapsed_ms: u64, k: u16, iters: u64| StimulusEvent {
+        elapsed_ms,
+        label: format!("StepStart[{k}]"),
+        op_kind: None,
+        detail: None,
+        total_iterations: Some(iters),
+        step_index: Some(k),
+        is_terminal: false,
+        is_step_end: false,
+    };
+    let stimulus = vec![start(1000, 1, 0), start(2000, 2, 1000)];
+    let ar = evaluate_vm_result(
+        &entry,
+        &result,
+        &crate::assert::Assert::NO_OVERRIDES,
+        &stimulus,
+        &[],
+        &[],
+        &EVAL_TOPO,
+        &no_repro,
+        None,
+    )
+    .expect("pass_assert on the success arm must return Ok");
+    let b = ar
+        .stats
+        .phases
+        .iter()
+        .find(|p| p.step_index == 1)
+        .expect("host bucket at step_index 1 must survive the fold");
+    // MATCHED arm, not orphan: the host bucket's capture (sample_count 1) and
+    // its window/metrics survived the merge with the guest carrier. An orphan
+    // (the bug this test guards against) would carry the guest carrier verbatim:
+    // sample_count 0, a normalized (0,0) window, and no metrics.
+    assert_eq!(b.sample_count, 1, "host capture merged — matched arm, not an orphan");
+    assert_ne!(
+        b.start_ms, u64::MAX,
+        "host window survived (min vs the carrier's MAX sentinel)",
+    );
+    assert_ne!(b.start_ms, 0, "real host window start, not the orphan's normalized 0");
+    assert!(
+        b.metrics.contains_key("iteration_rate"),
+        "host metric (iteration_rate) survived the matched merge — a clobber by \
+         the carrier's empty metrics would drop it",
+    );
+    // The guest per_cgroup folded into the matched host bucket through the TLV
+    // roundtrip + parse + fold.
+    let pc = b
+        .per_cgroup
+        .get("cgTest")
+        .expect("guest per_cgroup must fold into the host bucket, not be clobbered");
+    assert_eq!(pc.total_iterations, 99);
+    assert_eq!(pc.num_workers, 2);
+    assert_eq!(pc.total_cpu_time_ns, 4242);
+}
+
 /// `acquire_test_kernel_lock_if_cached` returns `Some(guard)`
 /// when `kernel_path` is shaped like a real cache entry:
 /// `{cache_root}/{cache_key}/{image_name}`. Exercises the

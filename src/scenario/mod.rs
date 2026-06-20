@@ -1438,9 +1438,13 @@ pub(crate) fn collect_handles<'a>(
     handles: impl IntoIterator<Item = (String, WorkloadHandle, Option<&'a BTreeSet<usize>>)>,
     checks: &crate::assert::Assert,
     topo: Option<&crate::topology::TestTopology>,
+    step_index: Option<u16>,
 ) -> AssertResult {
     let mut r = AssertResult::pass();
     for (name, h, cpuset) in handles {
+        // Bind the cgroup name before it is moved into cg.cgroup_name below,
+        // so the per-phase per_cgroup carrier can key on it.
+        let key = name.clone();
         let reports = h.stop_and_collect();
         let numa_nodes = cpuset.and_then(|cs| topo.map(|t| t.numa_nodes_for_cpuset(cs)));
         let mut one = checks.assert_cgroup_with_numa(&reports, cpuset, numa_nodes.as_ref());
@@ -1463,6 +1467,26 @@ pub(crate) fn collect_handles<'a>(
         if let Some(cg) = one.stats.cgroups.last_mut() {
             cg.cgroup_name = name;
         }
+        // For a step-local cgroup (step_index Some), attach the per-phase
+        // RAW per-cgroup components as a single-bucket phases entry keyed by the
+        // step's 1-indexed step_index. AssertResult::merge unions per_cgroup by
+        // name, so multiple cgroups in one step accumulate into the one bucket;
+        // the host eval fold then unions these into the host-rebuilt buckets.
+        // None (collect_all, backdrop, the non-step staging collect) attaches
+        // nothing.
+        if let Some(idx) = step_index {
+            one.stats.phases = vec![crate::assert::step_per_cgroup_bucket(
+                &key,
+                &reports,
+                numa_nodes.as_ref(),
+                idx,
+            )];
+        }
+        // Handle iteration order IS the per_cgroup fold order: AssertResult::merge
+        // folds same-name carriers (a multi-WorkSpec cgroup's per-handle carriers)
+        // in this order, and PhaseCgroupStats::merge's coupled-gap last-wins
+        // tie-break depends on it matching the order cgroup_stats pools the reports
+        // (also handle order) for gap-CPU parity. A reorder here would desync them.
         r.merge(one);
     }
     r
@@ -1476,6 +1500,8 @@ pub fn collect_all(handles: Vec<WorkloadHandle>, checks: &crate::assert::Assert)
     collect_handles(
         handles.into_iter().map(|h| (String::new(), h, None)),
         checks,
+        None,
+        // No step concept for the bare collect_all path -> no phase attribution.
         None,
     )
 }

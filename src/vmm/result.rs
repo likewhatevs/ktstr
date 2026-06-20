@@ -707,8 +707,15 @@ impl VmResult {
     /// [`Self::stimulus_timeline`] for the step windows. In production
     /// the framework builds `stats.phases` from the same periodic-only
     /// series and the same stimulus timeline, so this returns content
-    /// identical to `result.stats.phases` (pinned by a
-    /// `phase_buckets() == stats.phases` test).
+    /// identical to `result.stats.phases` — but ONLY when there are no
+    /// step-local-cgroup per_cgroup carriers (pinned by
+    /// `phase_buckets_equals_stats_phases_and_post_vm_read_does_not_starve`,
+    /// whose fixture has none). With step-local cgroups, `evaluate_vm_result`
+    /// folds the guest per_cgroup carriers into `stats.phases` (and may append
+    /// orphan buckets) via `fold_guest_per_cgroup_into_host_buckets`, so
+    /// `stats.phases` is then a SUPERSET — this accessor still returns the
+    /// host-rebuilt buckets with EMPTY per_cgroup and no orphans, i.e. it does
+    /// NOT expose per_cgroup.
     pub fn phase_buckets(&self) -> Vec<crate::assert::PhaseBucket> {
         crate::assert::build_phase_buckets_with_stimulus(
             &self.periodic_series(),

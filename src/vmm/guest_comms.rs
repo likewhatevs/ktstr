@@ -324,34 +324,99 @@ pub fn send_exit(code: i32) {
 /// `serde::Serialize` derives, so the only failure path is OOM
 /// during the `Vec<u8>` allocation, which the surrounding eprintln
 /// guards against silent loss.
-pub fn send_test_result(result: &crate::assert::AssertResult) {
-    match postcard::to_stdvec(result) {
-        Ok(bytes) => {
-            if bytes.len() > crate::vmm::bulk::MAX_BULK_FRAME_PAYLOAD as usize {
-                tracing::error!(
-                    size = bytes.len(),
-                    max = crate::vmm::bulk::MAX_BULK_FRAME_PAYLOAD,
-                    "AssertResult exceeds bulk port frame limit, sending truncated verdict"
-                );
-                let truncated =
-                    crate::assert::AssertResult::fail(crate::assert::AssertDetail::new(
-                        crate::assert::DetailKind::Other,
-                        format!(
-                            "AssertResult postcard size {} exceeded bulk port limit {}; \
-                             original details dropped",
-                            bytes.len(),
-                            crate::vmm::bulk::MAX_BULK_FRAME_PAYLOAD,
-                        ),
-                    ));
-                if let Ok(small) = postcard::to_stdvec(&truncated) {
-                    write_msg(MsgType::TestResult.wire_value(), &small);
-                }
-            } else {
-                write_msg(MsgType::TestResult.wire_value(), &bytes);
+/// What to emit for an `AssertResult` over a `max`-byte bulk frame — the pure
+/// graceful-degradation decision, factored out of [`send_test_result`] (which
+/// owns the `write_msg` side effect) so the size-class branch selection is
+/// unit-testable without a guest wire.
+#[derive(Debug)]
+enum TestResultWire {
+    /// The encoded result fits the frame as-is.
+    Raw(Vec<u8>),
+    /// Over-frame: `dropped` per_cgroup raw samples were dropped (the encoded
+    /// `bytes` already carry the info note); the sample-free encoding now fits.
+    Stripped { bytes: Vec<u8>, dropped: usize },
+    /// Even the sample-free verdict overruns the frame; emit a truncated FAIL.
+    /// `offending` is the size of the payload that actually overran — the
+    /// sample-free size when a strip happened, else the original (incl. the rare
+    /// re-serialize-error sub-case, which keeps the pre-strip size as best-effort).
+    Truncated { offending: usize },
+}
+
+/// Classify how to emit `result` over a `max`-byte bulk frame. Pure apart from
+/// `postcard` encoding; returns `None` only on a postcard encode error (the
+/// caller logs and drops).
+///
+/// This is the first path to put RAW per-cgroup sample vectors on the bulk port,
+/// and a many-cgroup × many-step scenario accumulates non-merging carriers that
+/// can overrun the frame even with each carrier reservoir-capped. On overflow
+/// the three sample pools (wake_latencies_ns / run_delays_ns / off_cpu_pcts) are
+/// dropped — so the wake p99/median/CV, off-CPU% avg/min/max/spread, and
+/// mean/worst run-delay re-pools become not-measured — while the verdict,
+/// outcomes, and all scalar/counter telemetry are PRESERVED (never a PASS→FAIL
+/// flip). The truncated FAIL is reached only if the sample-free verdict ALONE
+/// overruns.
+fn classify_test_result(result: &crate::assert::AssertResult, max: usize) -> Option<TestResultWire> {
+    let bytes = postcard::to_stdvec(result).ok()?;
+    if bytes.len() <= max {
+        return Some(TestResultWire::Raw(bytes));
+    }
+    let mut stripped = result.clone();
+    let dropped = stripped.strip_phase_cgroup_samples();
+    // Sample-free size once a strip happened — the payload that actually overruns
+    // on the Truncated path. On a re-serialize error (practically unreachable:
+    // stripping only shrinks) it stays None and the fallback reports the pre-strip
+    // size as best-effort.
+    let mut sample_free_size: Option<usize> = None;
+    if dropped > 0 {
+        stripped.note(format!(
+            "per_cgroup raw samples ({dropped}) dropped: AssertResult postcard size {} \
+             exceeded bulk port limit {max}; verdict and reduced telemetry preserved",
+            bytes.len(),
+        ));
+        if let Ok(small) = postcard::to_stdvec(&stripped) {
+            sample_free_size = Some(small.len());
+            if small.len() <= max {
+                return Some(TestResultWire::Stripped { bytes: small, dropped });
             }
         }
-        Err(e) => {
-            eprintln!("ktstr: postcard-encode AssertResult for bulk-port emit: {e}");
+    }
+    Some(TestResultWire::Truncated { offending: sample_free_size.unwrap_or(bytes.len()) })
+}
+
+pub fn send_test_result(result: &crate::assert::AssertResult) {
+    let max = crate::vmm::bulk::MAX_BULK_FRAME_PAYLOAD as usize;
+    match classify_test_result(result, max) {
+        Some(TestResultWire::Raw(bytes)) => {
+            write_msg(MsgType::TestResult.wire_value(), &bytes);
+        }
+        Some(TestResultWire::Stripped { bytes, dropped }) => {
+            tracing::warn!(
+                stripped = bytes.len(),
+                dropped_samples = dropped,
+                max,
+                "AssertResult exceeded bulk frame; dropped per_cgroup raw samples, verdict preserved"
+            );
+            write_msg(MsgType::TestResult.wire_value(), &bytes);
+        }
+        Some(TestResultWire::Truncated { offending }) => {
+            tracing::error!(
+                offending_size = offending,
+                max,
+                "AssertResult exceeds bulk port frame limit even after dropping samples, sending truncated verdict"
+            );
+            let truncated = crate::assert::AssertResult::fail(crate::assert::AssertDetail::new(
+                crate::assert::DetailKind::Other,
+                format!(
+                    "AssertResult postcard size {offending} exceeded bulk port limit {max}; \
+                     original details dropped",
+                ),
+            ));
+            if let Ok(small) = postcard::to_stdvec(&truncated) {
+                write_msg(MsgType::TestResult.wire_value(), &small);
+            }
+        }
+        None => {
+            eprintln!("ktstr: postcard-encode AssertResult for bulk-port emit failed");
         }
     }
 }
@@ -1687,5 +1752,80 @@ mod tests {
         }
         // Inner dropped — outer's value is restored.
         assert!(is_guest());
+    }
+
+    /// send_test_result's overflow branch selection (the AGGREGATE payload bound
+    /// across non-merging per-cgroup-per-step carriers). Drives the pure
+    /// classify_test_result at each size class and pins verdict integrity: a PASS
+    /// with only oversized samples is degraded (samples dropped, verdict kept),
+    /// NEVER flipped to a synthetic FAIL.
+    #[test]
+    fn classify_test_result_selects_branch_by_size() {
+        use crate::assert::{AssertResult, PhaseBucket, PhaseCgroupStats};
+        let mk = |n: u64| {
+            let mut pc = std::collections::BTreeMap::new();
+            pc.insert(
+                "cg".to_string(),
+                PhaseCgroupStats {
+                    wake_latencies_ns: (0..n).collect(),
+                    wake_sample_total: n,
+                    ..Default::default()
+                },
+            );
+            let mut r = AssertResult::pass();
+            r.stats.phases = vec![PhaseBucket {
+                step_index: 1,
+                label: "Step[0]".to_string(),
+                start_ms: 0,
+                end_ms: 1,
+                sample_count: 0,
+                metrics: std::collections::BTreeMap::new(),
+                per_cgroup: pc,
+            }];
+            r
+        };
+        let r = mk(1000);
+        let full = postcard::to_stdvec(&r).unwrap().len();
+
+        // (a) fits as-is -> Raw.
+        match classify_test_result(&r, full) {
+            Some(TestResultWire::Raw(b)) => assert_eq!(b.len(), full),
+            other => panic!("expected Raw, got {other:?}"),
+        }
+        // (b) sample_free <= max < full -> Stripped: verdict PRESERVED, samples gone.
+        match classify_test_result(&r, full - 1) {
+            Some(TestResultWire::Stripped { bytes, dropped }) => {
+                assert_eq!(dropped, 1000);
+                assert!(bytes.len() <= full - 1);
+                let decoded: AssertResult = postcard::from_bytes(&bytes).unwrap();
+                assert!(decoded.is_pass(), "verdict PRESERVED — no PASS->FAIL flip");
+                assert!(
+                    decoded.stats.phases[0].per_cgroup["cg"].wake_latencies_ns.is_empty(),
+                    "only the samples were dropped",
+                );
+            }
+            other => panic!("expected Stripped, got {other:?}"),
+        }
+        // (c) even the sample-free verdict overruns -> Truncated. The reported
+        // `offending` is the POST-strip (sample-free, incl. the dropped-samples
+        // info note) size, NOT the pre-strip original — so it is strictly less
+        // than `full`. (max=1 guarantees the stripped result still overruns.)
+        match classify_test_result(&r, 1) {
+            Some(TestResultWire::Truncated { offending }) => {
+                assert!(offending > 1, "offending overran max=1");
+                assert!(
+                    offending < full,
+                    "offending {offending} is the post-strip size, not the pre-strip original {full}",
+                );
+            }
+            other => panic!("expected Truncated, got {other:?}"),
+        }
+        // (d) no samples to drop + over max -> Truncated, offending == original size.
+        let ns = mk(0);
+        let ns_full = postcard::to_stdvec(&ns).unwrap().len();
+        match classify_test_result(&ns, ns_full - 1) {
+            Some(TestResultWire::Truncated { offending }) => assert_eq!(offending, ns_full),
+            other => panic!("expected Truncated, got {other:?}"),
+        }
     }
 }

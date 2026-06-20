@@ -903,8 +903,14 @@ fn run_scenario(
             // rather than disappearing into `StepState::drop`.
             let mut r =
                 collect_backdrop(&mut backdrop_state, effective_checks, ctx.topo, ctx.cgroups);
-            let staging_result =
-                collect_step(&mut step_staging, effective_checks, ctx.topo, ctx.cgroups);
+            let staging_result = collect_step(
+                &mut step_staging,
+                effective_checks,
+                ctx.topo,
+                ctx.cgroups,
+                // Defensive backdrop-staging collect: no step attribution.
+                None,
+            );
             r.merge(staging_result);
             r.merge(result);
             // step_staging's CgroupGroup RAII still drops here,
@@ -1021,7 +1027,16 @@ fn run_scenario(
             crate::vmm::guest_comms::send_scenario_pause();
         }
 
-        let step_result = collect_step(&mut step_state, effective_checks, ctx.topo, ctx.cgroups);
+        let step_result = collect_step(
+            &mut step_state,
+            effective_checks,
+            ctx.topo,
+            ctx.cgroups,
+            // The SAME 1-indexed value stamped onto this step's StepStart
+            // frames (build_stimulus), so the guest per_cgroup keys on the
+            // identical step_index the host rebuilds buckets under.
+            Some(phase_step_index),
+        );
         result.merge(step_result);
 
         // A step-level error is converted into a failure on the
@@ -1975,6 +1990,11 @@ fn collect_step(
     checks: &crate::assert::Assert,
     topo: &crate::topology::TestTopology,
     cgroups: &dyn crate::cgroup::CgroupOps,
+    // The 1-indexed phase step_index (BASELINE=0, Step k -> k+1) this
+    // teardown belongs to, threaded so collect_handles can attach the per-phase
+    // per_cgroup carrier. `None` for the defensive backdrop-staging collect,
+    // which has no step attribution.
+    step_index: Option<u16>,
 ) -> AssertResult {
     // Unfreeze every step-local cgroup before the graceful collect.
     // A frozen worker re-enters the freezer trap on the cooperative
@@ -2017,6 +2037,7 @@ fn collect_step(
         }),
         checks,
         Some(topo),
+        step_index,
     );
     for report in stall_reports {
         result.record_fail(crate::assert::AssertDetail::new(
@@ -2133,6 +2154,9 @@ fn collect_backdrop(
         }),
         checks,
         Some(topo),
+        // Backdrop spans all phases (6c, taskified #36); no single-step
+        // attribution at this collect.
+        None,
     )
 }
 

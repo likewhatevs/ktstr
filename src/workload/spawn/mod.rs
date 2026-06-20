@@ -427,9 +427,25 @@ pub struct WorkerReport {
     /// (`completed: false, iterations: 0` — the sentinel shape).
     pub completed: bool,
     /// Per-NUMA-node page counts from `/proc/self/numa_maps` after workload.
-    /// Keyed by node ID. Empty when numa_maps is unavailable.
+    /// Keyed by node ID. Empty when numa_maps is unavailable. numa_maps reports
+    /// the per-node RESIDENT pages of the calling task's mm. For
+    /// [`CloneMode::Fork`] workers (the scenario-engine default) each worker has
+    /// a disjoint mm, so SUMming across workers is the true cgroup page total;
+    /// for [`CloneMode::Thread`] siblings share one mm and each reports the SAME
+    /// residency, so a SUM counts shared pages once per thread. Consumers
+    /// (cgroup_stats / phase_cgroup_stats) SUM
+    /// this — correct for the Fork default; the Thread-mode caveat is inherited
+    /// identically by both reducers (no per-phase divergence).
     pub numa_pages: BTreeMap<usize, u64>,
-    /// Delta of `/proc/vmstat` `numa_pages_migrated` over the work loop.
+    /// Delta of `/proc/vmstat` `numa_pages_migrated` over the work loop. This is
+    /// the SYSTEM-WIDE vmstat `NUMA_PAGE_MIGRATE` vm_event (summed across all
+    /// CPUs), NOT the per-task `task_struct` field of the same name surfaced in
+    /// `/proc/PID/sched`. Because every worker reads the same system-wide
+    /// counter, consumers fold it as MAX across workers (a SUM would inflate it
+    /// by the worker count) — see `PhaseCgroupStats::cross_node_migrated`. The vm_event is bumped only by
+    /// NUMA balancing (the source of NUMA page migrations), so the delta is 0 on
+    /// kernels/configs without it (a measurement-availability caveat, not a wrong
+    /// value).
     pub vmstat_numa_pages_migrated: u64,
     /// Diagnostic attached only to sentinel reports — populated when
     /// `stop_and_collect` synthesized the entry because no (or

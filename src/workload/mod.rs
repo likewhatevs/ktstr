@@ -106,6 +106,13 @@ pub use config::*;
 // generated companion to `WorkerReport` (see the `crate::Claim`
 // derive on the `WorkerReport` struct).
 pub use spawn::{Migration, WorkerExitInfo, WorkerReport, WorkerReportClaim, WorkloadHandle};
+// Crate-internal re-export of the wake-latency reservoir cap + the
+// Algorithm-R push so the per-phase per-cgroup carrier builder
+// (`crate::assert::phase_cgroup_stats`) re-caps the POOLED samples at the
+// same bound the per-worker path uses (the carrier concatenates every
+// worker's vec, so the pool must be re-capped before it crosses the
+// size-limited guest bulk port). The `worker` module itself stays private.
+pub(crate) use worker::{MAX_WAKE_SAMPLES, reservoir_push};
 // `build_nodemask` is the low-level `set_mempolicy(2)` / `mbind(2)`
 // nodemask builder. It's deliberately NOT in the public surface —
 // test authors express NUMA placement through the [`MemPolicy`]

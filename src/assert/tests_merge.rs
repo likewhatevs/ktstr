@@ -1271,11 +1271,13 @@ fn assert_result_merge_per_phase_per_cgroup_unions_and_folds() {
     use std::collections::BTreeSet;
     // Two same-step buckets. cg_0 is shared — its RAW components FOLD by class:
     // sample Vecs (latencies/run_delays/off_cpu_pcts) CONCAT, cpus_used UNIONs,
-    // genuine counters SUM, and the Peaks (cross_node_migrated [system-wide
-    // vmstat delta], gap, num_workers) take MAX. cg_x (shared) pins
-    // not-measured (empty off_cpu_pcts) UNION measured. cg_a/cg_b are one-sided
-    // and carried verbatim BY VALUE. Pins the per_cgroup union in
-    // merge_matched_phase_buckets.
+    // genuine counters (num_workers, migrations, iterations, cpu time, numa
+    // pages, wake_sample_total) SUM — num_workers included, because two carriers
+    // for one cgroup name are per-handle subsets covering DISJOINT workers — and
+    // the one Peak cross_node_migrated [system-wide vmstat delta] takes MAX while
+    // the coupled gap takes ARGMAX. cg_x (shared) pins not-measured (empty
+    // off_cpu_pcts) UNION measured. cg_a/cg_b are one-sided and carried verbatim
+    // BY VALUE. Pins the per_cgroup union in merge_matched_phase_buckets.
     let mut a = AssertResult::pass();
     let mut a_bucket = phase_bucket(1, "Step[0]", 0, 100, 5, &[]);
     a_bucket.per_cgroup.insert(
@@ -1389,13 +1391,54 @@ fn assert_result_merge_per_phase_per_cgroup_unions_and_folds() {
         cg0.max_gap_cpu, 5,
         "gap cpu coupled to the winning gap (b's 5, NOT a's 3)",
     );
-    assert_eq!(cg0.num_workers, 4, "num_workers = max(4,4)");
+    assert_eq!(
+        cg0.num_workers, 8,
+        "num_workers SUMs (4+4) — a Counter over disjoint per-handle worker \
+         subsets, not a Peak",
+    );
     // Not-measured (empty) UNION measured = measured (empty concat is a no-op).
     assert_eq!(
         pc["cg_x"].off_cpu_pcts,
         vec![7.0],
         "empty off_cpu_pcts (not measured) ∪ measured = measured",
     );
+}
+
+/// Cross-STEP per_cgroup survival through `AssertResult::merge`: two DIFFERENT
+/// step_index carriers (step 1 cgA, step 2 cgB) BOTH reach the merged output via
+/// the unpaired-step-index arm. This is the cross-phase core invariant — each
+/// step's per_cgroup survives the guest-side merge, not just a single matched
+/// step. The per_cgroup union test above only exercises a SINGLE matched
+/// step_index; this pins the unpaired (different-step) path carries per_cgroup.
+#[test]
+fn assert_result_merge_keeps_per_cgroup_across_distinct_steps() {
+    use crate::assert::{PhaseBucket, PhaseCgroupStats};
+    let bucket = |idx: u16, name: &str, iters: u64| {
+        let mut pc = std::collections::BTreeMap::new();
+        pc.insert(
+            name.to_string(),
+            PhaseCgroupStats { total_iterations: iters, ..Default::default() },
+        );
+        PhaseBucket {
+            step_index: idx,
+            label: format!("Step[{}]", idx - 1),
+            start_ms: 0,
+            end_ms: 100,
+            sample_count: 0,
+            metrics: std::collections::BTreeMap::new(),
+            per_cgroup: pc,
+        }
+    };
+    let mut a = AssertResult::pass();
+    a.stats.phases = vec![bucket(1, "cgA", 11)];
+    let mut b = AssertResult::pass();
+    b.stats.phases = vec![bucket(2, "cgB", 22)];
+    a.merge(b);
+    assert_eq!(a.stats.phases.len(), 2, "both distinct-step buckets survive");
+    let s1 = a.stats.phases.iter().find(|p| p.step_index == 1).expect("step 1 survives");
+    let s2 = a.stats.phases.iter().find(|p| p.step_index == 2).expect("step 2 survives");
+    assert_eq!(s1.per_cgroup["cgA"].total_iterations, 11, "step 1 per_cgroup carried");
+    assert_eq!(s2.per_cgroup["cgB"].total_iterations, 22, "step 2 per_cgroup carried");
 }
 
 #[test]
