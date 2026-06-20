@@ -1589,6 +1589,16 @@ pub struct PhaseCgroupStats {
     /// CPU that owned the worst scheduling gap — `max_gap_ms`'s argmax
     /// companion. Folded together with `max_gap_ms`, never independently.
     pub max_gap_cpu: usize,
+    /// True when this carrier's raw sample vectors (`wake_latencies_ns` /
+    /// `run_delays_ns` / `off_cpu_pcts`) were dropped by
+    /// [`AssertResult::strip_phase_cgroup_samples`] to fit the size-limited guest
+    /// bulk frame — distinct from a carrier that genuinely measured no samples.
+    /// The reduced counters survive; only the per-phase distribution render
+    /// (Item 8) loses its source, so the render shows "samples stripped" rather
+    /// than the not-measured "n/a". Defaults to `false` (not stripped) and is set
+    /// only on a carrier that actually HAD samples to drop; ORs across `merge` so
+    /// a merged carrier is stripped if either input was.
+    pub stripped: bool,
 }
 
 impl PhaseCgroupStats {
@@ -1681,6 +1691,7 @@ impl PhaseCgroupStats {
             cross_node_migrated: a.cross_node_migrated.max(b.cross_node_migrated),
             max_gap_ms,
             max_gap_cpu,
+            stripped: a.stripped || b.stripped,
         }
     }
 
@@ -4619,11 +4630,21 @@ impl AssertResult {
         let mut dropped = 0usize;
         for bucket in &mut self.stats.phases {
             for pc in bucket.per_cgroup.values_mut() {
+                // Mark stripped only when this carrier ACTUALLY had samples to
+                // drop, so the render distinguishes "stripped for size" from a
+                // carrier that genuinely measured nothing (already-empty vecs
+                // stay not-stripped).
+                let had_samples = !pc.wake_latencies_ns.is_empty()
+                    || !pc.run_delays_ns.is_empty()
+                    || !pc.off_cpu_pcts.is_empty();
                 dropped +=
                     pc.wake_latencies_ns.len() + pc.run_delays_ns.len() + pc.off_cpu_pcts.len();
                 pc.wake_latencies_ns = Vec::new();
                 pc.run_delays_ns = Vec::new();
                 pc.off_cpu_pcts = Vec::new();
+                if had_samples {
+                    pc.stripped = true;
+                }
             }
         }
         dropped
@@ -6925,6 +6946,8 @@ pub(crate) fn phase_cgroup_stats(
         cross_node_migrated,
         max_gap_ms,
         max_gap_cpu,
+        // Fresh carrier built from worker reports — never stripped.
+        stripped: false,
     }
 }
 

@@ -1155,6 +1155,7 @@ fn assert_result_merge_per_phase_per_cgroup_unions_and_folds() {
             cross_node_migrated: 100,
             max_gap_ms: 7,
             max_gap_cpu: 3,
+            stripped: false,
         },
     );
     a_bucket.per_cgroup.insert(
@@ -1192,6 +1193,7 @@ fn assert_result_merge_per_phase_per_cgroup_unions_and_folds() {
             cross_node_migrated: 50,
             max_gap_ms: 9,
             max_gap_cpu: 5,
+            stripped: false,
         },
     );
     b_bucket.per_cgroup.insert(

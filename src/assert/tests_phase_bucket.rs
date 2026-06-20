@@ -71,6 +71,7 @@ fn phase_bucket_per_cgroup_round_trips_and_defaults_empty() {
             cross_node_migrated: 4,
             max_gap_ms: 13,
             max_gap_cpu: 2,
+            stripped: false,
         },
     );
     let json = serde_json::to_string(&bucket).expect("serialize");
@@ -4023,6 +4024,64 @@ fn strip_phase_cgroup_samples_drops_only_sample_vecs_preserving_verdict() {
     assert_eq!(cg.total_iterations, 42);
     assert_eq!((cg.max_gap_ms, cg.max_gap_cpu), (7, 2));
     assert!(r.is_pass(), "verdict preserved (no PASS->FAIL flip)");
+}
+
+/// `strip_phase_cgroup_samples` marks a carrier `stripped` ONLY when it actually
+/// dropped samples, so the render distinguishes a size-limit drop from a carrier
+/// that genuinely measured nothing — a carrier with no sample vectors stays
+/// not-stripped through a strip.
+#[test]
+fn strip_phase_cgroup_samples_marks_stripped_only_on_carriers_with_samples() {
+    let mut pc = BTreeMap::new();
+    pc.insert(
+        "has_samples".to_string(),
+        PhaseCgroupStats { wake_latencies_ns: vec![1, 2], total_iterations: 10, ..Default::default() },
+    );
+    pc.insert(
+        "empty".to_string(),
+        // No sample vectors — genuinely measured nothing.
+        PhaseCgroupStats { total_iterations: 5, ..Default::default() },
+    );
+    let mut r = crate::assert::AssertResult::pass();
+    r.stats.phases = vec![PhaseBucket {
+        step_index: 1,
+        label: "Step[0]".to_string(),
+        start_ms: 0,
+        end_ms: 100,
+        sample_count: 1,
+        metrics: BTreeMap::new(),
+        per_cgroup: pc,
+    }];
+    r.strip_phase_cgroup_samples();
+    assert!(
+        r.stats.phases[0].per_cgroup["has_samples"].stripped,
+        "a carrier that HAD samples is marked stripped after the drop",
+    );
+    assert!(
+        !r.stats.phases[0].per_cgroup["empty"].stripped,
+        "a carrier that measured nothing stays not-stripped (distinct from a size-limit drop)",
+    );
+}
+
+/// `PhaseCgroupStats::merge` ORs `stripped`: a merged carrier is stripped if
+/// EITHER input was, so the render flag survives folding a stripped carrier with
+/// a fresh one (in any order).
+#[test]
+fn phase_cgroup_stats_merge_ors_stripped() {
+    let stripped = PhaseCgroupStats { stripped: true, ..Default::default() };
+    let fresh = PhaseCgroupStats { stripped: false, ..Default::default() };
+    assert!(
+        PhaseCgroupStats::merge(stripped.clone(), fresh.clone()).stripped,
+        "stripped | fresh = stripped",
+    );
+    assert!(
+        PhaseCgroupStats::merge(fresh.clone(), stripped).stripped,
+        "fresh | stripped = stripped (order-independent)",
+    );
+    assert!(
+        !PhaseCgroupStats::merge(fresh.clone(), fresh).stripped,
+        "fresh | fresh = not stripped",
+    );
 }
 
 /// PhaseCgroupStats::merge breaks a max_gap_ms TIE toward `b` (last-wins),

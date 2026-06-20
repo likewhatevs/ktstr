@@ -1174,19 +1174,29 @@ fn format_phase_cgroups(
     out.push_str("  per-cgroup:\n");
     for (name, pcg) in per_cgroup.iter().take(MAX_RENDERED_CGROUPS) {
         out.push_str(&format!("    {name}: "));
-        match pcg.off_cpu_summary() {
-            Some((avg, min, max, spread)) => out.push_str(&format!(
-                "off-cpu avg={avg:.1}% min={min:.1}% max={max:.1}% spread={spread:.1}%"
-            )),
-            None => out.push_str("off-cpu n/a"),
-        }
-        if let Some((p99, median)) = pcg.wake_summary() {
-            out.push_str(&format!(" | wake p99={p99:.0}\u{00b5}s median={median:.0}\u{00b5}s"));
-        }
-        if let Some((mean, worst)) = pcg.run_delay_summary() {
-            out.push_str(&format!(
-                " | run-delay mean={mean:.0}\u{00b5}s worst={worst:.0}\u{00b5}s"
-            ));
+        // A stripped carrier had its raw sample vectors dropped to fit the bulk
+        // frame, so off-cpu / wake / run-delay summaries are all absent — but
+        // that is NOT "not measured". Surface the size-limit drop explicitly so
+        // the operator does not read it as a quiet cgroup.
+        if pcg.stripped {
+            out.push_str("samples stripped (size limit)");
+        } else {
+            match pcg.off_cpu_summary() {
+                Some((avg, min, max, spread)) => out.push_str(&format!(
+                    "off-cpu avg={avg:.1}% min={min:.1}% max={max:.1}% spread={spread:.1}%"
+                )),
+                None => out.push_str("off-cpu n/a"),
+            }
+            if let Some((p99, median)) = pcg.wake_summary() {
+                out.push_str(&format!(
+                    " | wake p99={p99:.0}\u{00b5}s median={median:.0}\u{00b5}s"
+                ));
+            }
+            if let Some((mean, worst)) = pcg.run_delay_summary() {
+                out.push_str(&format!(
+                    " | run-delay mean={mean:.0}\u{00b5}s worst={worst:.0}\u{00b5}s"
+                ));
+            }
         }
         out.push_str(&format!(
             " | iters={} migrations={}",
@@ -1766,6 +1776,56 @@ mod tests {
         assert!(
             formatted.find("cg_a:").unwrap() < formatted.find("cg_b:").unwrap(),
             "cgroups render in name order; got:\n{formatted}",
+        );
+    }
+
+    /// A stripped carrier (raw sample vectors dropped to fit the size-limited
+    /// bulk frame) renders "samples stripped (size limit)" — distinct from a
+    /// not-measured carrier's "off-cpu n/a" — so an operator does not read a
+    /// size-limit drop as a quiet cgroup. The surviving counters still render.
+    #[test]
+    fn format_renders_stripped_carrier_distinctly() {
+        let mut per_cgroup = std::collections::BTreeMap::new();
+        per_cgroup.insert(
+            "cg_stripped".to_string(),
+            crate::assert::PhaseCgroupStats {
+                stripped: true,
+                total_iterations: 500_000,
+                total_migrations: 9,
+                ..Default::default()
+            },
+        );
+        per_cgroup.insert(
+            "cg_quiet".to_string(),
+            // Genuinely measured nothing (NOT stripped).
+            crate::assert::PhaseCgroupStats { total_iterations: 1_000, ..Default::default() },
+        );
+        let buckets = vec![crate::assert::PhaseBucket {
+            per_cgroup,
+            step_index: 1,
+            label: "Step[0]".to_string(),
+            start_ms: 1000,
+            end_ms: 6000,
+            sample_count: 10,
+            metrics: std::collections::BTreeMap::from([("avg_imbalance_ratio".to_string(), 1.5)]),
+        }];
+        let t = Timeline::from_phase_buckets(&buckets, &[], &TimelineContext::default());
+        let formatted = t.format_with_context(&TimelineContext::default());
+        assert!(
+            formatted.contains("cg_stripped: samples stripped (size limit)"),
+            "stripped carrier shows the size-limit marker; got:\n{formatted}",
+        );
+        assert!(
+            formatted.contains("iters=500000 migrations=9"),
+            "stripped carrier still renders its surviving counters; got:\n{formatted}",
+        );
+        assert!(
+            formatted.contains("cg_quiet: off-cpu n/a"),
+            "a not-stripped, not-measured carrier stays n/a; got:\n{formatted}",
+        );
+        assert!(
+            !formatted.contains("cg_quiet: samples stripped"),
+            "a not-stripped carrier must NOT show the stripped marker; got:\n{formatted}",
         );
     }
 
