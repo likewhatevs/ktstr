@@ -100,6 +100,16 @@ compile-fail:
 test-macros:
     cargo nextest run -p ktstr-macros --features wprof --no-fail-fast
 
+# Run the crate's rustdoc doctests. cargo-ktstr's VM test runner and
+# cargo-nextest both SKIP `///` examples (`--doc` is not a nextest concept),
+# so a broken doc example would never execute in CI — it did, undetected,
+# until this gate was added. `cargo test --doc` is the only runner that
+# compiles and runs doc examples; it keeps the rustdoc examples in lockstep
+# with the live API. Default feature set (the pub-API examples); the
+# wprof/integration-gated paths have no doctests today.
+test-doc:
+    cargo test --doc
+
 # Verify ktstr stays out of a downstream consumer's release binary.
 # Thin wrapper over the `scripts::devdep-isolation` rust-script recipe
 # (see scripts.just): it builds the dev-dep fixture and asserts
