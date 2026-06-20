@@ -2269,22 +2269,25 @@ pub(crate) fn fold_guest_per_cgroup_into_host_buckets(
                 by_idx.insert(gb.step_index, merge_matched_phase_buckets(hb, gb));
             }
             None => {
-                // Orphan: a guest carrier whose step_index has no host bucket —
-                // defensive (the carrier's step has no StepStart frame in the host
-                // stimulus; build_phase_buckets synthesizes a bucket for every
-                // StepStart-step, so a captured-but-short step takes the matched
-                // arm above, not this one). Normalize the merge-neutral sentinel
-                // window to (0,0) so duration consumers don't underflow it. The
-                // resulting (0,0)-window + empty-metrics + non-empty-per_cgroup
-                // shape is the orphan signature the timeline render keys on to
-                // show "window not measured" instead of a misleading 0ms (the
-                // (0,0) is "no host window known", NOT a measured zero-duration
-                // step). On every non-zero-duration window the resulting shape is
-                // this arm's; a zero-duration step at scenario start
-                // (StepStart==StepEnd==0) can also produce it via the matched arm,
-                // but harmlessly (a zero-duration step has no window, so the render's
-                // "not measured" reads the same as "0ms") — see
-                // `crate::timeline::phase_from_bucket`.
+                // Orphan arm: a guest carrier whose step_index has no host bucket.
+                //
+                // Invariant: build_phase_buckets_with_stimulus synthesizes a host
+                // bucket for every StepStart-step, so a carrier whose step has a
+                // StepStart frame always takes the matched arm above. This arm is
+                // reached only by a carrier whose step has NO StepStart frame —
+                // defensive, not produced by normal capture.
+                //
+                // Normalize the merge-neutral sentinel window to (0,0) so duration
+                // consumers don't underflow it. The resulting (0,0)-window +
+                // empty-metrics + non-empty-per_cgroup shape is the orphan
+                // signature the timeline render keys on to show "window not
+                // measured" instead of a misleading 0ms — the (0,0) means "no host
+                // window known", NOT a measured zero-duration step.
+                //
+                // A zero-duration step at scenario start (StepStart==StepEnd==0)
+                // produces the same shape via the matched arm, but harmlessly: a
+                // zero-duration step has no window, so the render's "not measured"
+                // reads the same as "0ms". See `crate::timeline::phase_from_bucket`.
                 let mut orphan = gb;
                 orphan.start_ms = 0;
                 orphan.end_ms = 0;
