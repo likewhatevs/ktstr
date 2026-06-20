@@ -1301,7 +1301,10 @@ pub static METRICS: &[MetricDef] = &[
     },
     MetricDef {
         // Wake-latency coefficient of variation (stddev/mean), re-pooled
-        // over the combined wake set (`n = pool.len()`) — see
+        // over the combined wake set with a population-WEIGHTED variance and
+        // mean (denominator = Σ per-sample population weights, i.e. the
+        // reconstructed true wakeup population; == `pool.len()` only below the
+        // reservoir cap, where every weight is 1.0) — see
         // `worst_p99_wake_latency_us`.
         name: "worst_wake_latency_cv",
         polarity: crate::test_support::Polarity::LowerBetter,

@@ -1489,10 +1489,14 @@ pub struct PhaseCgroupStats {
     /// re-applied when same-name carriers merge so the carrier payload stays
     /// bounded on the size-limited guest bulk port — without it the pool would be
     /// `workers × MAX_WAKE_SAMPLES`); `wake_sample_total` carries the true
-    /// pre-cap population. The CV / stddev re-pool divides by
+    /// pre-cap population. The CARRIER-level reductions divide by
     /// `wake_latencies_ns.len()` (this capped pool size), NOT by
-    /// `wake_sample_total` — mirroring [`cgroup_stats`], which computes
-    /// `cv = stddev/mean` with `n = all_latencies.len()`.
+    /// `wake_sample_total`: [`Self::wake_summary`] takes p99 / median over `len`,
+    /// and [`cgroup_stats`] computes `cv = stddev/mean` with
+    /// `n = all_latencies.len()`. The RUN-level cross-phase re-pool
+    /// ([`populate_run_distribution_metrics`]) instead population-WEIGHTS (see
+    /// the PARITY CONTRACT below): its CV / mean divide by Σ per-sample weights
+    /// (the reconstructed true population), which equals `len` only below the cap.
     ///
     /// PARITY CONTRACT (the one component whose parity is size-dependent): for
     /// pools ≤ `MAX_WAKE_SAMPLES` the reservoir IS the full concatenation, so the
@@ -1507,10 +1511,17 @@ pub struct PhaseCgroupStats {
     /// a sub-display-precision artifact), and the carrier's >cap merge is WEIGHTED
     /// by `wake_sample_total` (`Self::weighted_merge_reservoirs`) so the subsample
     /// is an UNBIASED sample of the combined population — no smaller-population
-    /// skew. (That unbiasedness is the carrier MERGE layer only; the cross-PHASE
-    /// run-level pool in `populate_run_distribution_metrics` still concatenates
-    /// per-phase carriers length-weighted — a separate residual skew when one
-    /// cgroup exceeds the cap in multiple phases, not addressed here.)
+    /// skew. Both layers de-skew the cap: the carrier MERGE weights by
+    /// `wake_sample_total` (`Self::weighted_merge_reservoirs`), and the
+    /// cross-PHASE run-level pool in `populate_run_distribution_metrics` weights
+    /// each phase carrier's samples by `wake_sample_total / wake_latencies_ns.len()`
+    /// (so a phase that exceeded the cap contributes by true population, not
+    /// capped length) and reduces with the weighted percentile / moments — the
+    /// prior length-weighted concat is gone. Below the cap every weight is 1.0,
+    /// so the weighted P99 / median / mean / worst are BYTE-identical to the
+    /// unweighted concat; the weighted CV matches only within ~1e-9 (it sums in
+    /// f64 where the unweighted path sums the mean in u64 — a weighted variance
+    /// cannot keep the u64 sum).
     pub wake_latencies_ns: Vec<u64>,
     /// True wakeup count before reservoir clamping (`wake_latencies_ns` is
     /// capped), so the re-pool can report the real population size. An
@@ -3014,7 +3025,17 @@ pub fn populate_run_pooled_iterations_per_cpu_sec(stats: &mut ScenarioStats) {
 /// / extreme over it — the statistic of the union, NOT a max or mean of
 /// per-cgroup reductions (the percentile of a union is not the max of
 /// per-source percentiles). The ns→µs scale is applied ONCE here (the
-/// carriers store raw ns, per [`PhaseCgroupStats::run_delays_ns`]).
+/// carriers store raw ns, per [`PhaseCgroupStats::run_delays_ns`]). The wake
+/// pool is population-WEIGHTED: each phase carrier's samples carry weight
+/// `wake_sample_total / wake_latencies_ns.len()`, so a phase whose reservoir
+/// hit the cap contributes by true population, not capped length (the
+/// cross-PHASE de-skew) — reduced via the weighted percentile / moments.
+/// The run-delay pool is unweighted (per-worker, never reservoir-capped, so
+/// length IS population). Below the wake cap every weight is 1.0, so the
+/// weighted P99 / median / mean / worst are byte-identical to the unweighted
+/// concat; the weighted CV matches only within ~1e-9 (it sums the mean in f64
+/// where the unweighted path sums in u64 — a weighted variance cannot keep the
+/// u64 sum).
 ///
 /// CARRIER-LESS FOLD (backdrop coverage + graceful degradation): a cgroup
 /// whose raw samples are NOT in the pool — a backdrop (collected with no
@@ -3033,8 +3054,15 @@ pub fn populate_run_pooled_iterations_per_cpu_sec(stats: &mut ScenarioStats) {
 /// contributes its per-cgroup reduction worst-wins (a worst-cgroup proxy, not
 /// pooled). For the `SampleReduction::Worst` reduction the two COINCIDE
 /// (max-of-union == max-of-per-cgroup-maxes), so the carrier-less fold is exact
-/// there, not a proxy. #36 will give backdrops a carrier so their samples join
-/// the pool.
+/// there, not a proxy. A second asymmetry specific to CV (from the population
+/// weighting): the POOLED CV divides variance/mean by Σ per-sample weights (the
+/// reconstructed population), while a carrier-less cgroup's folded CV is
+/// [`cgroup_stats`]'s UNWEIGHTED CV (`n = all_latencies.len()`). The two
+/// coincide below the cap (all weights 1.0) and diverge above it; the mix is
+/// sound — a carrier-less cgroup has no per-phase weight data to
+/// population-weight (its carrier is absent by definition), and both feed the
+/// same LowerBetter worst-wins max. #36 will give backdrops a carrier so their
+/// samples join the pool.
 ///
 /// WORSTLOWEST (the 2 iteration efficiencies): the lowest (worst) cgroup's
 /// efficiency, computed per-cgroup from the `stats.cgroups[]` COUNTERS via
@@ -3062,7 +3090,12 @@ pub fn populate_run_distribution_metrics(stats: &mut ScenarioStats) {
     // carriers (strip_phase_cgroup_samples is the overflow lever) rather than by
     // being tiny — no OOM risk, no cap needed here. Both are transient: reduced
     // to scalars here, never re-serialized.
-    let mut wake_pool: Vec<u64> = Vec::new();
+    // Wake samples carry a per-sample population WEIGHT (`wake_sample_total /
+    // reservoir len`) so a >cap phase contributes in proportion to its true
+    // population, not its guest-capped length (the cross-PHASE de-skew). Run-delay
+    // samples are per-worker and never reservoir-capped (no `*_sample_total`), so
+    // their length IS their population — pooled unweighted.
+    let mut wake_pool: Vec<(u64, f64)> = Vec::new();
     let mut run_delay_pool: Vec<u64> = Vec::new();
     // Names of cgroups that contributed NON-EMPTY samples to each pool. A
     // cgroup absent here — a backdrop (carrier attachment is step-local only,
@@ -3094,7 +3127,31 @@ pub fn populate_run_distribution_metrics(stats: &mut ScenarioStats) {
     for phase in &stats.phases {
         for (cgname, pcg) in &phase.per_cgroup {
             if !pcg.wake_latencies_ns.is_empty() {
-                wake_pool.extend_from_slice(&pcg.wake_latencies_ns);
+                // Per-sample weight = true population / surviving reservoir size.
+                // A ≤cap carrier has len == wake_sample_total → weight 1.0, so the
+                // pool is value-for-value with the unweighted concat; a >cap
+                // carrier's capped samples each stand for `total/len > 1` true
+                // wakes, restoring the cross-phase population proportion.
+                //
+                // INVARIANT: `reservoir_push` bumps wake_sample_total on EVERY
+                // wakeup but pushes into the reservoir only up to MAX_WAKE_SAMPLES,
+                // and both the carrier merge and `phase_cgroup_stats` SUM the two,
+                // so wake_sample_total >= len always (== len below the cap). A
+                // carrier violating that — samples present but a zeroed/under-count
+                // total — would yield weight < 1 and silently UNDER-weight (at
+                // weight 0, DROP) its samples. Clamp the numerator to len so a
+                // malformed carrier degrades to unit weight (reservoir treated as
+                // its own population) instead of dropping data; debug_assert the
+                // invariant so a real counting bug surfaces in dev.
+                let len = pcg.wake_latencies_ns.len() as u64;
+                debug_assert!(
+                    pcg.wake_sample_total >= len,
+                    "wake_sample_total ({}) < reservoir len ({}): malformed carrier",
+                    pcg.wake_sample_total,
+                    len,
+                );
+                let w = pcg.wake_sample_total.max(len) as f64 / len as f64;
+                wake_pool.extend(pcg.wake_latencies_ns.iter().map(|&v| (v, w)));
                 wake_carriers.insert(cgname.as_str());
             }
             if !pcg.run_delays_ns.is_empty() {
@@ -3103,7 +3160,7 @@ pub fn populate_run_distribution_metrics(stats: &mut ScenarioStats) {
             }
         }
     }
-    wake_pool.sort_unstable();
+    wake_pool.sort_unstable_by_key(|&(v, _)| v);
     run_delay_pool.sort_unstable();
     populate_run_distribution_metrics_from(
         &mut stats.ext_metrics,
@@ -3137,7 +3194,7 @@ pub fn populate_run_distribution_metrics(stats: &mut ScenarioStats) {
 fn populate_run_distribution_metrics_from<'a>(
     target: &mut std::collections::BTreeMap<String, f64>,
     metrics: impl Iterator<Item = (&'a str, crate::stats::MetricKind)>,
-    wake_pool: &[u64],
+    wake_pool: &[(u64, f64)],
     wake_carriers: &std::collections::BTreeSet<&str>,
     run_delay_pool: &[u64],
     run_delay_carriers: &std::collections::BTreeSet<&str>,
@@ -3148,10 +3205,6 @@ fn populate_run_distribution_metrics_from<'a>(
     for (name, kind) in metrics {
         let value: Option<f64> = match kind {
             MetricKind::Distribution { source, reduction } => {
-                let (pool, carriers) = match source {
-                    SampleSource::WakeLatencyNs => (wake_pool, wake_carriers),
-                    SampleSource::RunDelayNs => (run_delay_pool, run_delay_carriers),
-                };
                 // Pool the carried samples (the thesis: percentile of the
                 // UNION), then fold worst-wins (max — Distribution is
                 // LowerBetter, registry-gated) the surviving per-cgroup
@@ -3161,6 +3214,14 @@ fn populate_run_distribution_metrics_from<'a>(
                 // carrier is empty (fully stripped) the pool is empty and this
                 // degenerates to the max over every cgroup — the pre-Item-7
                 // cross-cgroup max.
+                //
+                // Pool reduction is per-source: WakeLatencyNs is population-WEIGHTED
+                // (each phase's guest-capped samples carry weight
+                // wake_sample_total/len, so a >cap phase contributes by true
+                // population not capped length — the cross-PHASE de-skew, via
+                // reduce_weighted_sorted_distribution); RunDelayNs is unweighted
+                // (per-worker, never reservoir-capped, so length IS population, via
+                // reduce_sorted_distribution).
                 //
                 // CONTRACT (differs from WorstLowest and WakeLatencyTailRatio
                 // below, by design): a cohort with cgroups present but NO carrier
@@ -3178,11 +3239,19 @@ fn populate_run_distribution_metrics_from<'a>(
                 // measured-zero percentile. So: Distribution emits Some(0.0) for a
                 // no-sample run (a real measured zero of the percentile);
                 // WorstLowest and WakeLatencyTailRatio emit None (no measurement).
-                let mut v: Option<f64> = if pool.is_empty() {
-                    None
-                } else {
-                    Some(reduce_sorted_distribution(pool, reduction))
-                };
+                let (mut v, carriers): (Option<f64>, &std::collections::BTreeSet<&str>) =
+                    match source {
+                        SampleSource::WakeLatencyNs => (
+                            (!wake_pool.is_empty())
+                                .then(|| reduce_weighted_sorted_distribution(wake_pool, reduction)),
+                            wake_carriers,
+                        ),
+                        SampleSource::RunDelayNs => (
+                            (!run_delay_pool.is_empty())
+                                .then(|| reduce_sorted_distribution(run_delay_pool, reduction)),
+                            run_delay_carriers,
+                        ),
+                    };
                 for cg in cgroups {
                     if !carriers.contains(cg.cgroup_name.as_str()) {
                         let r = distribution_cgroup_reduction(cg, source, reduction);
@@ -3309,6 +3378,93 @@ fn reduce_sorted_distribution(sorted: &[u64], reduction: crate::stats::SampleRed
         }
         // Sorted ascending, so the last element is the max.
         SampleReduction::Worst => *sorted.last().expect("non-empty by caller") as f64 / 1000.0,
+    }
+}
+
+/// Weighted nearest-rank percentile over a value-sorted `(value, weight)` pool —
+/// the weighted sibling of [`percentile`]. Matches `percentile`'s convention
+/// (the value at 1-indexed rank `ceil(W * p)`, `W` = total weight, floored at
+/// rank 1) so with UNIT weights (every weight `1.0`) it returns byte-identically:
+/// cumulative weight after `k` elements is `k`, `ceil(W*p) == ceil(n*p)`, and the
+/// `.max(1.0)` floor mirrors `percentile`'s `saturating_sub(1)`, so the crossing
+/// element is `percentile`'s `sorted[ceil(n*p)-1]` for p>0 and `sorted[0]` at
+/// p=0. Used by the run-level wake re-pool to weight each phase's samples by
+/// true population.
+fn weighted_percentile(sorted: &[(u64, f64)], p: f64) -> u64 {
+    if sorted.is_empty() {
+        return 0;
+    }
+    debug_assert!(
+        sorted.windows(2).all(|w| w[0].0 <= w[1].0),
+        "weighted_percentile() requires value-sorted input",
+    );
+    let total: f64 = sorted.iter().map(|&(_, w)| w).sum();
+    // Nearest-rank target, floored at 1 so `p == 0.0` maps to the first element
+    // (mirrors percentile's saturating_sub(1) flooring rank 0 to index 0).
+    let target = (total * p).ceil().max(1.0);
+    let mut cum = 0.0;
+    for &(v, w) in sorted {
+        cum += w;
+        if cum >= target {
+            return v;
+        }
+    }
+    sorted.last().map(|&(v, _)| v).unwrap_or(0)
+}
+
+/// Weighted sibling of [`reduce_sorted_distribution`] for the wake-latency
+/// re-pool: each `(value, weight)` carries a per-sample weight of
+/// `wake_sample_total / reservoir_len`, so a >cap phase (reservoir-capped on the
+/// guest) contributes in proportion to its TRUE population, not its capped
+/// length — removing the cross-PHASE length-skew. With UNIT weights (every phase
+/// ≤cap, so `len == wake_sample_total`) it reduces byte-identically to
+/// [`reduce_sorted_distribution`] for P99 / Median / Mean / Worst; the Cv arm
+/// differs only by the f64-vs-u64 mean sum. For the small fixed pool the parity
+/// test uses, that gap is ~1e-15 (within its 1e-9 bound), but it grows ~n·ε with
+/// pool size — a cross-phase pool can reach millions of samples (~1e-9–1e-8 on a
+/// high-CV pool), so a LARGE-pool parity test must not assume a universal 1e-15.
+/// A weighted variance cannot keep the u64 sum.  Exhaustive over SampleReduction,
+/// mirroring [`reduce_sorted_distribution`], so a new variant fails the build.
+///
+/// The Cv / Mean `total_w <= 0.0` guards and [`weighted_percentile`]'s
+/// all-weight-zero fall-through are degenerate-input belts: the capture-path
+/// caller [`populate_run_distribution_metrics`] clamps every per-sample weight to
+/// >= 1.0, so `total_w >= len >= 1` there and those branches are unreachable on
+/// the production path.
+fn reduce_weighted_sorted_distribution(
+    sorted: &[(u64, f64)],
+    reduction: crate::stats::SampleReduction,
+) -> f64 {
+    use crate::stats::SampleReduction;
+    match reduction {
+        SampleReduction::P99 => weighted_percentile(sorted, 0.99) as f64 / 1000.0,
+        SampleReduction::Median => weighted_percentile(sorted, 0.5) as f64 / 1000.0,
+        SampleReduction::Cv => {
+            let total_w: f64 = sorted.iter().map(|&(_, w)| w).sum();
+            if total_w <= 0.0 {
+                return 0.0;
+            }
+            let mean_ns = sorted.iter().map(|&(v, w)| v as f64 * w).sum::<f64>() / total_w;
+            if mean_ns > 0.0 {
+                let variance = sorted
+                    .iter()
+                    .map(|&(v, w)| w * (v as f64 - mean_ns).powi(2))
+                    .sum::<f64>()
+                    / total_w;
+                variance.sqrt() / mean_ns
+            } else {
+                0.0
+            }
+        }
+        SampleReduction::Mean => {
+            let total_w: f64 = sorted.iter().map(|&(_, w)| w).sum();
+            if total_w <= 0.0 {
+                return 0.0;
+            }
+            sorted.iter().map(|&(v, w)| v as f64 * w).sum::<f64>() / total_w / 1000.0
+        }
+        // Max value present, weight-invariant — last element of the value-sorted pool.
+        SampleReduction::Worst => sorted.last().map(|&(v, _)| v).unwrap_or(0) as f64 / 1000.0,
     }
 }
 
