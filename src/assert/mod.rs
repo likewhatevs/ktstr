@@ -3158,7 +3158,16 @@ fn reduce_sorted_distribution(sorted: &[u64], reduction: crate::stats::SampleRed
         }
         // Divide ONCE on the summed/maxed ns (the carriers store raw ns):
         // mean(ns)/1000 == mean(ns/1000) and max(ns)/1000 == max(ns/1000).
-        SampleReduction::Mean => sorted.iter().sum::<u64>() as f64 / sorted.len() as f64 / 1000.0,
+        // Sum in f64 (not u64-then-cast) to match cgroup_stats's f64 run-delay
+        // accumulation and PhaseCgroupStats::run_delay_summary — overflow-safe
+        // (an f64 sum saturates toward +inf; a u64 sum would panic in debug /
+        // silently wrap in release on a pathological pool), value identical
+        // within the 1e-9 parity bound. (The Cv arm's mean_ns above keeps the u64 sum
+        // because cgroup_stats's CV also u64-sums all_latencies — matching it is
+        // exact-parity-preserving there.)
+        SampleReduction::Mean => {
+            sorted.iter().map(|&v| v as f64).sum::<f64>() / sorted.len() as f64 / 1000.0
+        }
         // Sorted ascending, so the last element is the max.
         SampleReduction::Worst => *sorted.last().expect("non-empty by caller") as f64 / 1000.0,
     }

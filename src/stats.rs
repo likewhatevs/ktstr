@@ -273,7 +273,11 @@ pub enum MetricKind {
 /// per-window reduction. Most ktstr gauges are Avg ("typical-load
 /// over the window"); Last fits "current state" snapshots like
 /// `comm` / `policy`; Max fits worst-instant queue-depth probes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+// Serialize-only, matching its container MetricKind (which is Serialize-only)
+// and the sibling MetricKind sub-enums (SampleSource / SampleReduction /
+// WorstLowestNumerator / WorstLowestDenominator). Nothing deserializes a
+// MetricKind / GaugeAgg, so the prior Deserialize derive was dead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
 #[non_exhaustive]
 pub enum GaugeAgg {
     /// Reduce by arithmetic mean. Default for `nr_running`-style
