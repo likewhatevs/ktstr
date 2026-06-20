@@ -3830,9 +3830,10 @@ fn phase_cgroup_stats_merge_caps_pooled_wake_latencies() {
         wake_sample_total: hi - lo,
         ..Default::default()
     };
-    // Two carriers each AT the cap (0..100k and 100k..200k, each ≤cap so neither
-    // is pre-subsampled) -> concat 200k = the TRUE 0..200_000 population (mean
-    // 99999.5) -> re-capped back to cap.
+    // Two carriers each AT the cap (0..100k and 100k..200k); their summed length
+    // 200k > cap, so this routes through the WEIGHTED merge with EQUAL populations
+    // (100k each) -> a ~50/50 with-replacement draw over the two ranges -> mean
+    // ≈ 99999.5, re-capped to cap.
     let merged = PhaseCgroupStats::merge(carrier(0, 100_000), carrier(100_000, 200_000));
     assert_eq!(
         merged.wake_latencies_ns.len(),
@@ -3845,9 +3846,10 @@ fn phase_cgroup_stats_merge_caps_pooled_wake_latencies() {
         "true pre-cap population SUMs across carriers",
     );
     // Distribution preservation: the merged reservoir's mean tracks the 0..200_000
-    // population mean (99999.5). (Both inputs were ≤cap so the concat is the true
-    // population; the reservoir-of-reservoirs bias only appears when EACH input is
-    // itself >cap with differing populations — see the merge bias note.)
+    // population mean (99999.5). Equal populations make the weighted merge an
+    // unbiased ~50/50 draw, so the mean lands at the midpoint (the
+    // population-weighting only diverges from 50/50 when the carriers' true
+    // populations differ — see weighted_merge_reservoirs and its tests).
     let mean = merged.wake_latencies_ns.iter().map(|&v| v as f64).sum::<f64>()
         / merged.wake_latencies_ns.len() as f64;
     assert!(
@@ -3857,6 +3859,124 @@ fn phase_cgroup_stats_merge_caps_pooled_wake_latencies() {
     // A merge whose concat is ≤ cap passes through unchanged (no re-sample).
     let small = PhaseCgroupStats::merge(carrier(0, 10), carrier(100, 120));
     assert_eq!(small.wake_latencies_ns.len(), 30, "≤cap concat not re-sampled");
+}
+
+/// The >cap merge weights by true POPULATION (`wake_sample_total`), not reservoir
+/// LENGTH. Two already-capped reservoirs of EQUAL length (cap each) but a 10:1
+/// population ratio (A: 1_000_000 wakes, B: 100_000) merge to a sample whose
+/// A-fraction tracks `w_a/(w_a+w_b) = 0.909` — NOT the 0.5 a length-weighted
+/// concat-and-re-cap (the deleted unweighted reservoir-of-reservoirs) gave. This
+/// is the smaller-population skew the weighted merge removes.
+#[test]
+fn weighted_merge_reservoirs_weights_by_population_not_length() {
+    use crate::workload::MAX_WAKE_SAMPLES as CAP;
+    // Disjoint value ranges so each merged element's source is identifiable.
+    let a: Vec<u64> = (0..CAP as u64).collect(); // range [0, CAP), pre-cap pop 1M
+    let b: Vec<u64> = (0..CAP as u64).map(|i| 10_000_000 + i).collect(); // [10M, …), pop 100k
+    let merged = PhaseCgroupStats::weighted_merge_reservoirs(&a, 1_000_000, &b, 100_000, CAP);
+    assert_eq!(merged.len(), CAP, "merged to exactly cap slots");
+    let from_a = merged.iter().filter(|&&v| v < 10_000_000).count() as f64 / CAP as f64;
+    assert!(
+        (from_a - 0.909).abs() < 0.03,
+        "merged A-fraction {from_a} tracks population ratio 1M/1.1M=0.909, NOT a \
+         length-weighted 0.5",
+    );
+}
+
+/// The weighted merge is DETERMINISTIC — a pure function of its inputs (seeded
+/// from populations + lengths, NOT gettid like reservoir_push). Two calls with
+/// identical inputs produce byte-identical output, so a merge run twice in one
+/// process is stable (the property `reservoir_push`'s thread-local stream lacks).
+#[test]
+fn weighted_merge_reservoirs_is_deterministic() {
+    use crate::workload::MAX_WAKE_SAMPLES as CAP;
+    let a: Vec<u64> = (0..CAP as u64).collect();
+    let b: Vec<u64> = (0..CAP as u64).map(|i| 10_000_000 + i).collect();
+    let m1 = PhaseCgroupStats::weighted_merge_reservoirs(&a, 700_000, &b, 300_000, CAP);
+    let m2 = PhaseCgroupStats::weighted_merge_reservoirs(&a, 700_000, &b, 300_000, CAP);
+    assert_eq!(m1, m2, "weighted merge is a pure function of its inputs");
+}
+
+/// Equal populations → ~50/50: the weighted merge degrades to the balanced split
+/// exactly when the weights are equal (which is when the old length-weighting was
+/// correct). Pins that the weighting does not skew the balanced case.
+#[test]
+fn weighted_merge_reservoirs_equal_population_is_symmetric() {
+    use crate::workload::MAX_WAKE_SAMPLES as CAP;
+    let a: Vec<u64> = (0..CAP as u64).collect();
+    let b: Vec<u64> = (0..CAP as u64).map(|i| 10_000_000 + i).collect();
+    let merged = PhaseCgroupStats::weighted_merge_reservoirs(&a, 500_000, &b, 500_000, CAP);
+    let from_a = merged.iter().filter(|&&v| v < 10_000_000).count() as f64 / CAP as f64;
+    assert!((from_a - 0.5).abs() < 0.03, "equal populations -> ~50/50, got {from_a}");
+}
+
+/// Strongly asymmetric weights (≈167:1) drive the merge almost entirely to the
+/// larger-population source — the merged A-fraction tracks `w_a/(w_a+w_b)`, not
+/// the inputs' equal lengths. The "mixed" case where one carrier's pre-cap
+/// population dwarfs the other's.
+#[test]
+fn weighted_merge_reservoirs_asymmetric_weights_favor_larger_population() {
+    use crate::workload::MAX_WAKE_SAMPLES as CAP;
+    let a: Vec<u64> = (0..CAP as u64).collect(); // tiny pre-cap population
+    let b: Vec<u64> = (0..CAP as u64).map(|i| 10_000_000 + i).collect(); // huge population
+    let merged = PhaseCgroupStats::weighted_merge_reservoirs(&a, 60_000, &b, 10_000_000, CAP);
+    let from_a = merged.iter().filter(|&&v| v < 10_000_000).count() as f64 / CAP as f64;
+    // w_a/(w_a+w_b) = 60_000 / 10_060_000 ≈ 0.006.
+    assert!(from_a < 0.02, "tiny-population A nearly excluded, got A-fraction {from_a}");
+}
+
+/// Integration through `PhaseCgroupStats::merge`: two >cap carriers (each at the
+/// per-carrier cap) with a 10:1 `wake_sample_total` ratio merge to a
+/// population-weighted sample, and `wake_sample_total` SUMs. Pins that merge
+/// routes >cap pools through the weighted merge, not the old length-weighted path.
+#[test]
+fn phase_cgroup_stats_merge_above_cap_is_population_weighted() {
+    use crate::workload::MAX_WAKE_SAMPLES as CAP;
+    let carrier = |base: u64, pop: u64| PhaseCgroupStats {
+        wake_latencies_ns: (0..CAP as u64).map(|i| base + i).collect(),
+        wake_sample_total: pop,
+        ..Default::default()
+    };
+    let merged = PhaseCgroupStats::merge(carrier(0, 1_000_000), carrier(10_000_000, 100_000));
+    assert_eq!(merged.wake_latencies_ns.len(), CAP, "re-capped to cap");
+    assert_eq!(merged.wake_sample_total, 1_100_000, "true populations SUM");
+    let from_a =
+        merged.wake_latencies_ns.iter().filter(|&&v| v < 10_000_000).count() as f64 / CAP as f64;
+    assert!(
+        (from_a - 0.909).abs() < 0.03,
+        "merge weights >cap pools by population (A-fraction {from_a} ~ 1M/1.1M), \
+         not 50/50 by length",
+    );
+}
+
+/// Sequential 3-way merge preserves the population proportions:
+/// `merge(merge(A,B),C)` yields A:B:C fractions tracking `w_x / (w_a+w_b+w_c)`.
+/// The first merge sets the combined carrier's `wake_sample_total = w_a+w_b`,
+/// which then weights against `w_c` in the second merge, so the recursive
+/// weighting telescopes to the true 3-way proportions (the case a cgroup with ≥3
+/// >cap WorkSpec handles in one step hits). Tolerance is widened slightly for the
+/// compounded resampling variance of two sequential draws; the length-weighted
+/// alternative (the deleted path) would give ~0.33 each — far outside it.
+#[test]
+fn weighted_merge_reservoirs_sequential_three_way_preserves_proportions() {
+    use crate::workload::MAX_WAKE_SAMPLES as CAP;
+    // Disjoint ranges per source; populations 600k : 300k : 100k -> 0.6 : 0.3 : 0.1.
+    let carrier = |base: u64, pop: u64| PhaseCgroupStats {
+        wake_latencies_ns: (0..CAP as u64).map(|i| base + i).collect(),
+        wake_sample_total: pop,
+        ..Default::default()
+    };
+    let ab = PhaseCgroupStats::merge(carrier(0, 600_000), carrier(10_000_000, 300_000));
+    let abc = PhaseCgroupStats::merge(ab, carrier(20_000_000, 100_000));
+    assert_eq!(abc.wake_latencies_ns.len(), CAP);
+    assert_eq!(abc.wake_sample_total, 1_000_000, "true populations SUM across all three");
+    let frac = |lo: u64, hi: u64| {
+        abc.wake_latencies_ns.iter().filter(|&&v| v >= lo && v < hi).count() as f64 / CAP as f64
+    };
+    let (a, b, c) = (frac(0, 10_000_000), frac(10_000_000, 20_000_000), frac(20_000_000, 30_000_000));
+    assert!((a - 0.6).abs() < 0.04, "A-fraction {a} ~ 600k/1M = 0.6 (not length-weighted 0.33)");
+    assert!((b - 0.3).abs() < 0.04, "B-fraction {b} ~ 300k/1M = 0.3");
+    assert!((c - 0.1).abs() < 0.04, "C-fraction {c} ~ 100k/1M = 0.1");
 }
 
 /// `AssertResult::strip_phase_cgroup_samples` — the graceful-degradation lever

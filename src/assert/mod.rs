@@ -1486,8 +1486,8 @@ pub struct PhaseCgroupStats {
     /// Pooled per-wakeup latency samples (ns) across the cgroup's workers in
     /// the phase, un-reduced so p99 / median / CV re-pool over the combined set.
     /// The POOL is reservoir-capped at `MAX_WAKE_SAMPLES` (the per-worker bound,
-    /// re-applied to the concatenation so the carrier payload stays bounded on
-    /// the size-limited guest bulk port — without it the pool would be
+    /// re-applied when same-name carriers merge so the carrier payload stays
+    /// bounded on the size-limited guest bulk port — without it the pool would be
     /// `workers × MAX_WAKE_SAMPLES`); `wake_sample_total` carries the true
     /// pre-cap population. The CV / stddev re-pool divides by
     /// `wake_latencies_ns.len()` (this capped pool size), NOT by
@@ -1501,8 +1501,16 @@ pub struct PhaseCgroupStats {
     /// SUBSAMPLE while [`cgroup_stats`] reduces over the full per-worker concat,
     /// so the re-pool is DISTRIBUTION-EQUIVALENT, not byte-identical (the bounded
     /// bulk-port frame forbids carrying the full pool; staged reservoirs cannot be
-    /// byte-identical to a single full-pool reduction). Item 7's re-pool may align
-    /// `cgroup_stats` onto the same capped pool if exact >cap parity is wanted.
+    /// byte-identical to a single full-pool reduction). This is BY DESIGN:
+    /// `cgroup_stats` stays the uncapped run-level authority (capping it to match
+    /// the carrier would discard most of a multi-worker cgroup's samples to chase
+    /// a sub-display-precision artifact), and the carrier's >cap merge is WEIGHTED
+    /// by `wake_sample_total` (`Self::weighted_merge_reservoirs`) so the subsample
+    /// is an UNBIASED sample of the combined population — no smaller-population
+    /// skew. (That unbiasedness is the carrier MERGE layer only; the cross-PHASE
+    /// run-level pool in `populate_run_distribution_metrics` still concatenates
+    /// per-phase carriers length-weighted — a separate residual skew when one
+    /// cgroup exceeds the cap in multiple phases, not addressed here.)
     pub wake_latencies_ns: Vec<u64>,
     /// True wakeup count before reservoir clamping (`wake_latencies_ns` is
     /// capped), so the re-pool can report the real population size. An
@@ -1610,42 +1618,35 @@ impl PhaseCgroupStats {
     /// unreachable; a loud debug panic is preferred over a silently wrong
     /// re-pool denominator.
     fn merge(a: PhaseCgroupStats, b: PhaseCgroupStats) -> PhaseCgroupStats {
-        let mut wake_latencies_ns = a.wake_latencies_ns;
-        wake_latencies_ns.extend(b.wake_latencies_ns);
-        // Re-cap the merged wake-latency concat at MAX_WAKE_SAMPLES, mirroring the
-        // per-handle builder. Same-name carriers (a multi-`WorkSpec` cgroup's
-        // per-handle carriers) merge ON THE GUEST before the AssertResult is
-        // serialized over the bulk port, so K carriers would otherwise concat to
-        // K × MAX_WAKE_SAMPLES and could overrun the 16 MiB frame — flipping a
-        // PASS to a truncated FAIL. Reservoir (not truncate) preserves the tail;
-        // `wake_sample_total` (SUMmed below) keeps the true population. A concat
-        // already ≤ MAX_WAKE_SAMPLES passes through unchanged, so value-for-value
-        // parity with cgroup_stats holds for small pools (only > cap pools become
-        // a reservoir subsample — see the `wake_latencies_ns` field doc).
+        // Merge the two capped wake-latency reservoirs. Same-name carriers (a
+        // multi-`WorkSpec` cgroup's per-handle carriers) merge ON THE GUEST before
+        // the AssertResult is serialized over the bulk port, so K carriers must
+        // not concat to K × MAX_WAKE_SAMPLES (it could overrun the 16 MiB frame,
+        // flipping a PASS to a truncated FAIL).
         //
-        // BIAS NOTE: when BOTH inputs already exceed MAX_WAKE_SAMPLES with
-        // DIFFERENT pre-cap populations, this is an UNWEIGHTED reservoir-of-
-        // reservoirs — it skews toward the smaller-population carrier (the
-        // `wake_sample_total` per-carrier weight is ignored here). This only
-        // bites a single step-local cgroup with ≥2 WorkSpec handles each emitting
-        // >100k wake samples in one step; the verdict and all counters are
-        // unaffected, only the >cap distributional p99/median/CV is approximate.
-        // A weighted reservoir merge (using wake_sample_total as the source
-        // weight) is an Item 7 re-pool consideration, alongside aligning
-        // cgroup_stats's own >cap pooling.
-        if wake_latencies_ns.len() > crate::workload::MAX_WAKE_SAMPLES {
-            let mut capped = Vec::new();
-            let mut pooled = 0u64;
-            for sample in wake_latencies_ns {
-                crate::workload::reservoir_push(
-                    &mut capped,
-                    &mut pooled,
-                    sample,
-                    crate::workload::MAX_WAKE_SAMPLES,
-                );
-            }
-            wake_latencies_ns = capped;
-        }
+        // ≤cap: the concatenation IS the true combined population, so it passes
+        // through unchanged — value-for-value parity with cgroup_stats for small
+        // pools (only >cap pools become a subsample; see the `wake_latencies_ns`
+        // field doc). >cap: a WEIGHTED reservoir merge weighted by each carrier's
+        // true pre-cap population (`wake_sample_total`), so the merged sample is an
+        // UNBIASED uniform sample of the combined population — NOT the
+        // smaller-population-skewed reservoir-of-reservoirs an unweighted
+        // concat-and-re-cap produced (which weighted by reservoir LENGTH ≈ 50/50,
+        // ignoring the true populations).
+        let cap = crate::workload::MAX_WAKE_SAMPLES;
+        let wake_latencies_ns = if a.wake_latencies_ns.len() + b.wake_latencies_ns.len() <= cap {
+            let mut v = a.wake_latencies_ns;
+            v.extend(b.wake_latencies_ns);
+            v
+        } else {
+            Self::weighted_merge_reservoirs(
+                &a.wake_latencies_ns,
+                a.wake_sample_total,
+                &b.wake_latencies_ns,
+                b.wake_sample_total,
+                cap,
+            )
+        };
         let mut run_delays_ns = a.run_delays_ns;
         run_delays_ns.extend(b.run_delays_ns);
         let mut off_cpu_pcts = a.off_cpu_pcts;
@@ -1681,6 +1682,99 @@ impl PhaseCgroupStats {
             max_gap_ms,
             max_gap_cpu,
         }
+    }
+
+    /// Merge two CAPPED uniform reservoirs into one of size ≤ `cap` that is a
+    /// uniform sample of the COMBINED population. `a` is a uniform reservoir of
+    /// `w_a` true samples, `b` of `w_b` (their `wake_sample_total` weights). Each
+    /// output slot is drawn from `a` with probability `w_a / (w_a + w_b)` and from
+    /// `b` otherwise; within a source the index is uniform. Composing the
+    /// source-level uniform reservoir with the within-source uniform draw makes
+    /// each output a uniform draw from the combined population, so the merged
+    /// A-fraction is the TRUE `w_a / (w_a + w_b)`. This removes the equal-slot
+    /// ("reservoir-of-reservoirs") skew an unweighted concat-and-re-cap imposes:
+    /// two already-capped inputs concat ≈ 50/50 by LENGTH regardless of their true
+    /// populations, over-counting the smaller-population carrier. Sampling WITH
+    /// replacement is the correct estimator once the inputs are capped (each
+    /// reservoir element stands for `w/len` population units; the pre-cap samples
+    /// are gone).
+    ///
+    /// DETERMINISTIC: the xorshift64 stream is seeded from the inputs (populations
+    /// + lengths) so the merge is a PURE function of its arguments — unlike
+    /// `crate::workload::reservoir_push`, whose stream is gettid-seeded
+    /// thread-local (a merge run twice would otherwise differ). The triple-shift
+    /// mirrors the codebase's inline xorshift64 (`reservoir_push` /
+    /// `io::xorshift64`).
+    ///
+    /// Assumes `w_a + w_b < 2^64` — a realistic wake population is far below it
+    /// (2^64 wakeups is physically unreachable), so the single-u64 `s % total`
+    /// draw spans `[0, total)`. Callers gate on `a.len() + b.len() > cap`, which
+    /// (each input ≤ cap) guarantees both sources non-empty; the per-slot guards
+    /// below stay safe for a degenerate hand-built input regardless.
+    fn weighted_merge_reservoirs(a: &[u64], w_a: u64, b: &[u64], w_b: u64, cap: usize) -> Vec<u64> {
+        if a.is_empty() && b.is_empty() {
+            return Vec::new();
+        }
+        // Weights are the true populations; fall back to reservoir lengths if a
+        // (hand-built) carrier reports zero population alongside non-empty samples,
+        // keeping the split well-defined instead of dividing by a zero total. The
+        // mixed case (one weight 0, the other > 0) is left as-is: a zero weight
+        // sends every draw to the other source, the only defensible split for a
+        // source claiming zero population. Production maintains wake_sample_total
+        // >= len (reservoir_push counts every push), so neither edge is reachable
+        // on the capture path.
+        let (wa, wb) = if w_a == 0 && w_b == 0 {
+            (a.len() as u128, b.len() as u128)
+        } else {
+            (w_a as u128, w_b as u128)
+        };
+        let total = wa + wb;
+        // Loud-panic on the documented `w_a + w_b < 2^64` assumption (a realistic
+        // wake population is far below it): if total exceeded u64::MAX the
+        // `s as u128 % total` draw — s spans [0, 2^64) — could not reach
+        // [2^64, total) and would silently bias the source split. Matches the merge
+        // SUM's debug-panic-on-overflow discipline (loud over silently wrong).
+        debug_assert!(
+            total <= u64::MAX as u128,
+            "weighted_merge_reservoirs: w_a + w_b overflows u64 ({total}); source draw would bias",
+        );
+        // Golden-ratio Weyl multiplier (the codebase's standard PRNG seed mixer);
+        // a non-zero, input-derived seed makes the merge deterministic. xorshift64
+        // has 0 as a fixed point, hence the fallback.
+        const GOLDEN: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut s = (w_a ^ w_b.rotate_left(32) ^ (a.len() as u64).rotate_left(16) ^ (b.len() as u64))
+            .wrapping_mul(GOLDEN);
+        if s == 0 {
+            s = GOLDEN;
+        }
+        let step = |x: u64| {
+            let mut v = x;
+            v ^= v << 13;
+            v ^= v >> 7;
+            v ^= v << 17;
+            v
+        };
+        let mut out = Vec::with_capacity(cap);
+        for _ in 0..cap {
+            s = step(s);
+            // Defensive empty-source guards: caller gates ensure both non-empty,
+            // but a stripped / zero-population fixture must never index an empty
+            // slice.
+            let from_a = if a.is_empty() {
+                false
+            } else if b.is_empty() {
+                true
+            } else {
+                (s as u128 % total) < wa
+            };
+            s = step(s);
+            if from_a {
+                out.push(a[(s % a.len() as u64) as usize]);
+            } else {
+                out.push(b[(s % b.len() as u64) as usize]);
+            }
+        }
+        out
     }
 
     /// Off-CPU% reduction for the per-phase per-cgroup render (Item 8):
@@ -6756,8 +6850,10 @@ pub(crate) fn phase_cgroup_stats(
     // VALUE-FOR-VALUE with cgroup_stats; above the cap it is a distribution-
     // preserving SUBSAMPLE (cgroup_stats keeps the full concat), so the re-pool is
     // distribution-equivalent, not byte-identical — see the wake_latencies_ns
-    // field doc for the full contract. PhaseCgroupStats::merge re-applies this
-    // same cap to the merged concat so same-name carriers stay bounded too.
+    // field doc for the full contract. PhaseCgroupStats::merge keeps same-name
+    // carriers bounded too: ≤cap it concatenates (value-for-value), >cap it uses a
+    // population-WEIGHTED reservoir merge (weighted_merge_reservoirs) so the merged
+    // subsample is unbiased rather than length-skewed toward the smaller carrier.
     let mut wake_latencies_ns: Vec<u64> = Vec::new();
     let mut pooled_wake_count: u64 = 0;
     for w in reports {
