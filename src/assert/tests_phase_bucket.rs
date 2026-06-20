@@ -4246,6 +4246,63 @@ fn fold_duplicate_guest_step_index_merges_sequentially() {
     assert_eq!((out[0].start_ms, out[0].end_ms), (0, 0), "orphan window normalized");
 }
 
+/// Defensive boundary: a guest carrier MUST carry the merge-neutral
+/// `(u64::MAX, 0)` sentinel window. The fold validates this BEFORE the
+/// matched/orphan dispatch, so BOTH arms are guarded — the matched arm relies on
+/// the window being merge-neutral (min/max no-ops against the host window) and
+/// the orphan arm normalizes it to (0,0). A carrier with a real window matching a
+/// host bucket would otherwise silently corrupt the merged window; the
+/// `debug_assert!` trips loudly in test builds instead. Host bucket present at the
+/// same step_index so the carrier WOULD take the (dangerous) matched arm — the
+/// assert fires first.
+#[test]
+#[should_panic(expected = "guest carrier must carry the merge-neutral")]
+fn fold_panics_on_non_sentinel_guest_window() {
+    let host = PhaseBucket {
+        step_index: 1,
+        label: "Step[0]".to_string(),
+        start_ms: 0,
+        end_ms: 100,
+        sample_count: 1,
+        metrics: BTreeMap::new(),
+        per_cgroup: BTreeMap::new(),
+    };
+    let mut g_pc = BTreeMap::new();
+    g_pc.insert("cg".to_string(), PhaseCgroupStats { total_iterations: 1, ..Default::default() });
+    // A guest carrier with a REAL window (not the (u64::MAX, 0) sentinel) — the
+    // step_per_cgroup_bucket invariant violated.
+    let bad = PhaseBucket {
+        step_index: 1,
+        label: "Step[0]".to_string(),
+        start_ms: 100,
+        end_ms: 200,
+        sample_count: 0,
+        metrics: BTreeMap::new(),
+        per_cgroup: g_pc,
+    };
+    let _ = fold_guest_per_cgroup_into_host_buckets(vec![host], vec![bad]);
+}
+
+/// Defensive boundary: host buckets MUST have unique step_index. The fold keys
+/// them into a `BTreeMap<u16, _>`, so a duplicate would silently MERGE one bucket
+/// into the other (a dropped phase, not a panic, in release); the
+/// `debug_assert_eq!` on the map size vs the input count trips loudly in test
+/// builds instead.
+#[test]
+#[should_panic(expected = "host buckets must have unique step_index")]
+fn fold_panics_on_duplicate_host_step_index() {
+    let dup = || PhaseBucket {
+        step_index: 1,
+        label: "Step[0]".to_string(),
+        start_ms: 0,
+        end_ms: 100,
+        sample_count: 1,
+        metrics: BTreeMap::new(),
+        per_cgroup: BTreeMap::new(),
+    };
+    let _ = fold_guest_per_cgroup_into_host_buckets(vec![dup(), dup()], vec![]);
+}
+
 // -- Item 7 run-level distributional re-pool (populate_run_distribution_metrics) --
 
 use super::{CgroupStats, populate_run_distribution_metrics, populate_run_distribution_metrics_from};
