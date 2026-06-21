@@ -289,7 +289,7 @@ enum CastSynType {
     /// it; the analyzer's [`super::super::bpf_map::resolve_to_struct_id`]
     /// peels through it too. Used by the modifier-chain integration
     /// test to verify both peel paths agree on the underlying
-    /// struct id the [`CastMap`] keys on.
+    /// struct id the [`crate::monitor::cast_analysis::CastMap`] keys on.
     Typedef { name_off: u32, type_id: u32 },
     /// `BTF_KIND_CONST` (kind=10). Anonymous wrapper around another
     /// type id. Same renderer / analyzer peel treatment as Typedef.

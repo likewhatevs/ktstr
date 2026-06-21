@@ -55,7 +55,7 @@ fn mem_reader_default_resolve_arena_type_is_none() {
 /// Custom [`MemReader`] override returns the configured
 /// [`ArenaResolveHit`] for known addresses and `None` for
 /// everything else. Mirrors the production
-/// [`super::super::dump::render_map::AccessorMemReader::resolve_arena_type`]
+/// [`crate::monitor::dump::render_map::AccessorMemReader::resolve_arena_type`]
 /// shape. Two distinct seeded entries cover the two production
 /// shapes — payload-start chase (`header_skip = 0`) and slot-start
 /// chase (`header_skip = header_size`).
@@ -136,11 +136,12 @@ fn mem_reader_resolve_arena_type_override_returns_configured_hit() {
 ///
 /// `CastStubReader::resolve_arena_type` (the test's MemReader) keys
 /// the bridge map on the FULL 64-bit address rather than the low 32
-/// bits — production [`AccessorMemReader::resolve_arena_type`] masks
-/// `addr & 0xFFFF_FFFF` and looks up in the per-pass index. Tests use
+/// bits — production
+/// [`crate::monitor::dump::render_map::AccessorMemReader::resolve_arena_type`]
+/// masks `addr & 0xFFFF_FFFF` and looks up in the per-pass index. Tests use
 /// full-address keys to avoid the masking concern in the test setup;
-/// the masking itself is exercised by
-/// [`super::super::dump::tests::accessor_mem_reader_resolve_arena_type_masks_low_32`].
+/// the masking itself is exercised by the production `resolve_arena_type`
+/// masking tests in `monitor/dump/tests.rs`.
 ///
 /// Returns `(blob, outer_id, fwd_id, task_ctx_id)`.
 fn bridge_btf_outer_fwd_taskctx() -> (Vec<u8>, u32, u32, u32) {

@@ -602,7 +602,7 @@ fn mov_k(dst: u8, imm: i32) -> BpfInsn {
 /// helper seed R1 that way, so R0 still ends up Unknown after the
 /// clobber as those tests assert. Tests that need a different
 /// helper id (e.g. to confirm the arm rejects non-allowlist ids)
-/// build the call instruction inline via [`helper_call`] instead.
+/// build the call instruction inline via `helper_call` instead.
 fn call() -> BpfInsn {
     mk_insn(BPF_CLASS_JMP | BPF_OP_CALL, 0, 0, 0, 1)
 }

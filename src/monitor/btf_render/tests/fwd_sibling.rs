@@ -920,7 +920,7 @@ fn cast_chase_kernel_page_edge_truncation() {
 /// byte != 0xff) and whose target peels + sizes correctly: the
 /// chase succeeds and the rendered struct's members are surfaced
 /// in the `deref` payload. Complement to
-/// [`cast_chase_kernel_plausibility_rejects_freed_slab`] — same
+/// `cast_chase_kernel_plausibility_rejects_freed_slab` — same
 /// path but the plausibility gate ALLOWS the read instead of
 /// rejecting it. Without this test, a regression that flipped the
 /// plausibility gate's polarity (`if first_qword >> 56 != 0xff`
