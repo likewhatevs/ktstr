@@ -458,7 +458,7 @@ pub fn send_test_result(result: &crate::assert::AssertResult) {
 /// failed, OR the call originated from host context (the
 /// [`write_msg`] -> [`assert_guest_context`] early-return). The
 /// fire-and-forget caller in
-/// [`crate::scenario::payload_run::emit_payload_metrics`] discards
+/// `crate::scenario::payload_run::emit_payload_metrics` discards
 /// the return at statement position; the boolean exists so the
 /// host-context no-op is observable to a test rather than swallowed.
 pub fn send_payload_metrics(metrics: &crate::test_support::PayloadMetrics) -> bool {
