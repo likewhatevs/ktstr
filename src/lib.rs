@@ -573,7 +573,7 @@ pub(crate) mod sync;
 #[cfg(any(feature = "export", feature = "remote-cache"))]
 pub(crate) mod tar_util;
 pub mod verifier;
-pub mod vm;
+pub mod gauntlet;
 pub(crate) mod vmm;
 pub mod worker_ready;
 

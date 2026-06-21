@@ -560,7 +560,7 @@ pub fn ktstr_test_early_dispatch() {
         // and is reachable ONLY under nextest. Every real ktstr
         // entry produces topology-preset variants under nextest
         // (`for_each_gauntlet_variant` iterates
-        // `crate::vm::gauntlet_presets()`). Without nextest those
+        // `crate::gauntlet::gauntlet_presets()`). Without nextest those
         // variants would silently not run — coverage loss with no
         // error. Emit a one-shot stderr `warning:` diagnostic (see
         // the `eprintln!` below) when the binary carries any real
@@ -1454,13 +1454,13 @@ fn list_tests(ignored_only: bool) {
 /// listers in `list_tests_*`.
 fn for_each_gauntlet_variant<F>(
     entry: &KtstrTestEntry,
-    presets: &[crate::vm::TopoPreset],
+    presets: &[crate::gauntlet::TopoPreset],
     host_cpus: u32,
     host_llcs: u32,
     host_max_cpus_per_llc: u32,
     mut visit: F,
 ) where
-    F: FnMut(&crate::vm::TopoPreset),
+    F: FnMut(&crate::gauntlet::TopoPreset),
 {
     let no_perf_mode = super::runtime::no_perf_mode_for_entry(entry);
     for preset in presets {
@@ -1506,7 +1506,7 @@ fn for_each_gauntlet_variant<F>(
 /// the listing matches what the dispatch path will actually run.
 fn list_tests_all(ignored_only: bool) {
     let cargo_test_mode = crate::cargo_test_mode::cargo_test_mode_active();
-    let presets = crate::vm::gauntlet_presets();
+    let presets = crate::gauntlet::gauntlet_presets();
     let has_vmlinux = resolve_test_kernel()
         .ok()
         .and_then(|k| crate::vmm::find_vmlinux(&k))
@@ -1727,7 +1727,7 @@ fn list_verifier_cells_all() {
     if kernel_list.is_empty() {
         return;
     }
-    let presets = crate::vm::gauntlet_presets();
+    let presets = crate::gauntlet::gauntlet_presets();
     let (host_cpus, host_llcs, host_max_cpus_per_llc) = super::host_capacity();
     let no_perf_mode = super::runtime::no_perf_mode_active();
 
@@ -1783,7 +1783,7 @@ fn list_verifier_cells_all() {
 
 /// Parse `verifier/<sched_name>/<kernel_label>/<preset_name>`, look
 /// up the declared scheduler in [`super::KTSTR_SCHEDULERS`] + the
-/// gauntlet preset in [`crate::vm::gauntlet_presets`] + the kernel
+/// gauntlet preset in [`crate::gauntlet::gauntlet_presets`] + the kernel
 /// in [`KTSTR_KERNEL_LIST_ENV`](crate::KTSTR_KERNEL_LIST_ENV),
 /// resolve the scheduler binary path per
 /// [`super::SchedulerSpec`], boot the verifier VM via
@@ -1849,7 +1849,7 @@ fn run_verifier_cell(full_name: &str) -> i32 {
         return 1;
     };
 
-    let preset_list = crate::vm::gauntlet_presets();
+    let preset_list = crate::gauntlet::gauntlet_presets();
     let Some(preset) = preset_list.iter().find(|p| p.name == preset_name) else {
         eprintln!("ktstr verifier: no gauntlet preset {preset_name:?} (cell {full_name:?})",);
         return 1;
@@ -1977,7 +1977,7 @@ fn list_tests_budget(ignored_only: bool, budget_secs: f64) {
     use crate::budget::{TestCandidate, estimate_duration, extract_features, select};
 
     let cargo_test_mode = crate::cargo_test_mode::cargo_test_mode_active();
-    let presets = crate::vm::gauntlet_presets();
+    let presets = crate::gauntlet::gauntlet_presets();
     let has_vmlinux = resolve_test_kernel()
         .ok()
         .and_then(|k| crate::vmm::find_vmlinux(&k))
@@ -2491,7 +2491,7 @@ pub(crate) fn run_gauntlet_test(rest: &str) -> i32 {
         return EXIT_PASS;
     }
 
-    let presets = crate::vm::gauntlet_presets();
+    let presets = crate::gauntlet::gauntlet_presets();
     let preset = match presets.iter().find(|p| p.name == preset_name) {
         Some(p) => p,
         None => {
@@ -3067,7 +3067,7 @@ mod tests {
         // `TopologyConstraints::accepts` and `visit` must never be
         // called. Any entry works since the constraint check runs
         // before the visit — use the test dummy.
-        let presets = crate::vm::gauntlet_presets();
+        let presets = crate::gauntlet::gauntlet_presets();
         // Precondition for the assertion below: if a future preset
         // with total_cpus <= 1 is added, this test must be updated to
         // account for it instead of silently under-asserting.
@@ -3111,7 +3111,7 @@ mod tests {
         //     passed),
         //   - a regression that skips accepted presets (e.g. an
         //     inverted condition) produces `count < expected`.
-        let presets = crate::vm::gauntlet_presets();
+        let presets = crate::gauntlet::gauntlet_presets();
         let entry = find_test("__unit_test_dummy__").unwrap();
         let expected: usize = presets
             .iter()
@@ -3144,7 +3144,7 @@ mod tests {
         // A regression that inverted the host-cap comparison (e.g.
         // `host_cpus < preset_cpus` → accept) would pass both
         // endpoint tests but fail here.
-        let presets = crate::vm::gauntlet_presets();
+        let presets = crate::gauntlet::gauntlet_presets();
         if presets.is_empty() {
             return;
         }
