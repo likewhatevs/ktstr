@@ -2,9 +2,9 @@
 
 `cargo ktstr` is a cargo plugin for kernel build, cache, and test
 workflow. Subcommands in `--help` order: `test` (alias: `nextest`),
-`coverage`, `llvm-cov`, `stats`, `replay`, `kernel`, `model`,
-`verifier`, `funify` (alias: `costume`), `completions`, `show-host`,
-`show-thresholds`, `export`, `locks`, `shell`.
+`coverage`, `llvm-cov`, `stats`, `replay`, `perf-delta`, `kernel`,
+`model`, `verifier`, `funify` (alias: `costume`), `completions`,
+`show-host`, `show-thresholds`, `export`, `locks`, `shell`.
 
 ## test
 
@@ -871,7 +871,7 @@ that dimension.
 | `--json` | off | Emit JSON instead of per-dimension text blocks. |
 | `--dir DIR` | `target/ktstr/` | Alternate run root. Same semantics as `compare --dir`. |
 
-### show-host
+### show-host (archived) {#stats-show-host}
 
 Print the archived `HostContext` for a specific run: CPU identity,
 memory/hugepage config, transparent-hugepage policy, NUMA node
@@ -1324,7 +1324,7 @@ exits `0` — an empty perf set is "nothing to compare", not a failure.
 
 Runnable as `just perf-delta <kernel> [base]`.
 
-## show-host
+## show-host (live) {#show-host-live}
 
 Print the **live** host context used by the sidecar collector:
 CPU identity, memory/hugepage config, transparent-hugepage
@@ -1343,7 +1343,7 @@ cargo ktstr show-host
 This is a **live** snapshot (reads `/proc`, `/sys`, and
 `uname()` at invocation time). For the **archived** host
 context captured at sidecar-write time for a past run, use
-[`cargo ktstr stats show-host --run RUN_ID`](#show-host)
+[`cargo ktstr stats show-host --run RUN_ID`](#stats-show-host)
 instead — same `HostContext::format_human` formatter so the
 two outputs are byte-for-byte comparable when the host is
 unchanged.

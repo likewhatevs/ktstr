@@ -44,7 +44,7 @@ interchangeable — pick the one whose target matches your question:
 
 The sections below cover the live `show-host`. For the archived
 variant's flag table see
-[`stats show-host`](../running-tests/cargo-ktstr.md#show-host).
+[`stats show-host`](../running-tests/cargo-ktstr.md#stats-show-host).
 
 ## Capture: `show-host`
 
@@ -82,19 +82,12 @@ renders as `(empty)` and a missing map renders as `(unknown)`.
 The distinction matters when you want to know whether a
 dimension was inspected but absent, vs failed to populate.
 
-Sidecars written before the `uname_sysname` / `uname_release` /
-`uname_machine` → `kernel_name` / `kernel_release` / `arch`
-rename render the renamed fields as `(unknown)` in `show-host`
-and in `stats compare`'s host-delta section, and re-running the
-test against the current binary regenerates the sidecar with
-the new field names populated. Mechanically: the old sidecar
-deserializes only because the rename was field-additive — the
-new fields are `Option<T>` and default to `None` when the
-old-name keys are absent. Cross-version-incompatible changes
-(field deletion, type change) would fail deserialization
-loudly. Per the pre-1.0 sidecar-disposable rule, re-run the
-test to regenerate the sidecar with the current schema rather
-than relying on the additive-rename path holding.
+Sidecars written before the older field names (`uname_sysname` /
+`uname_release` / `uname_machine`) were renamed to `kernel_name` /
+`kernel_release` / `arch` render those fields as `(unknown)` — in
+`show-host` and in `stats compare`'s host-delta section alike. Per
+the pre-1.0 sidecar-disposable rule, just re-run the test to
+regenerate the sidecar under the current schema.
 
 This output is human-oriented. For programmatic access, read
 the `host` field of any sidecar JSON (same schema, identical
@@ -221,8 +214,8 @@ the same key out of a sidecar via `jq '.host.<field>'`.
   memory-only nodes untouched.
 - CPU-level skew (`cpu_model` / `cpu_vendor`) → microarchitectural
   differences affect cache-sensitive benchmarks. Always inspect
-  alongside `cmdline` because a different CPU usually comes with
-  a different bootloader.
+  alongside `kernel_cmdline` because a different CPU usually comes
+  with a different bootloader.
 
 ## Seeing the raw sidecar field
 

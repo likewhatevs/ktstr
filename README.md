@@ -37,9 +37,8 @@ automates this:
 - **Clean slate** -- each test boots its own kernel in a KVM VM. No
   shared state between tests.
 - **Topology as code** -- `topology = (1, 2, 4, 2)` gives you 1 NUMA
-  node, 2 LLCs (last-level caches), 4 cores/LLC, 2 threads. x86_64
-  and aarch64. The same
-  test produces the same topology on any host.
+  node, 2 LLCs (last-level caches), 4 cores/LLC, 2 threads. The same
+  test produces the same topology on any x86_64 or aarch64 host.
 - **Declarative scenarios** -- tests declare cgroups, cpusets, and
   workloads as data (`CgroupDef`, `Step`, `Op`). The framework
   handles the rest.
@@ -69,7 +68,7 @@ Add ktstr as a dev-dependency:
 
 ```toml
 [dev-dependencies]
-ktstr = "0.15"
+ktstr = "0.16"
 ```
 
 The library is the test-author surface. The `anyhow::Result`
@@ -102,7 +101,7 @@ This installs:
 `cargo install --locked --bin cargo-ktstr ktstr@X.Y.Z`. ktstr is
 pre-1.0 — minor-version bumps may break the test-facing API, and
 patch bumps may break unstable internal surfaces (the CI matrix
-runs against the locked patch). Examples below assume 0.15; an
+runs against the locked patch). Examples below assume 0.16; an
 example from a different release may not compile against the crate
 this README documents.
 
@@ -378,7 +377,7 @@ zero iterations, zero pages, zero wake events) separately from
 `ktstr::prelude::{EXIT_PASS, EXIT_FAIL, EXIT_INCONCLUSIVE}`
 for tooling that drives the harness programmatically.
 
-See the [verdict outcomes guide](doc/guide/src/concepts/checking.md#verdict-outcomes)
+See the [verdict outcomes guide](https://likewhatevs.github.io/ktstr/guide/concepts/checking.html#verdict-outcomes)
 for the full four-state lattice (`Fail > Inconclusive > Pass > Skip`)
 and CI-gate patterns.
 
@@ -402,7 +401,7 @@ regardless of `allow_inconclusive`.
 cargo ktstr test                                           # build/resolve kernel + run tests
 cargo ktstr nextest                                        # visible alias for `test`
 cargo ktstr test --kernel ~/linux -- -E 'test(my_test)'    # local source tree + nextest filter
-cargo ktstr replay                                         # re-run only the tests that failed last session
+cargo ktstr replay                                         # print a nextest filter for last session's failures (add --exec to re-run)
 cargo ktstr coverage                                       # tests under cargo-llvm-cov nextest
 cargo ktstr llvm-cov report --lcov --output-path lcov.info # raw llvm-cov passthrough (report/clean/show-env)
 cargo ktstr kernel build 6.14.2                            # cache a specific version

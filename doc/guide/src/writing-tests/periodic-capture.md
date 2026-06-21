@@ -2,8 +2,10 @@
 
 `Op::capture_snapshot` is **on-demand** — the test author picks the moment of
 capture. **Periodic capture** is the cadenced complement: the freeze
-coordinator fires `freeze_and_dispatch(FreezeMode::Capture { gate_on_exit_kind: false })` at evenly-spaced points
-across the workload window without the scenario body asking. The
+coordinator runs the same capture pipeline as on-demand
+`Op::capture_snapshot` (freeze every vCPU, walk the BPF maps, store
+the report) at evenly-spaced points across the workload window
+without the scenario body asking. The
 result is a time-ordered series of `(report, stats, elapsed_ms)`
 samples that flows naturally into the
 [temporal-assertion](temporal-assertions.md) patterns.
@@ -70,8 +72,8 @@ periodic timeline before assertions.
 
 ## Capture cost
 
-Each periodic boundary fires the same `freeze_and_dispatch(FreezeMode::Capture { gate_on_exit_kind: false })`
-path that `Op::CaptureSnapshot` dispatches:
+Each periodic boundary runs the same capture pipeline that an
+on-demand `Op::capture_snapshot` dispatches:
 
 1. Every vCPU is parked under `FREEZE_RENDEZVOUS_TIMEOUT` (30 s
    hard ceiling).

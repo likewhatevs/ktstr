@@ -101,15 +101,20 @@ ktstr ctprof capture --output candidate.ctprof.zst
 ktstr ctprof compare baseline.ctprof.zst candidate.ctprof.zst
 ```
 
-**`capture`** walks `/proc` at capture time and writes every
-visible thread's metric values (cumulative counters from
-schedstat / sched / status CSW / page faults / I/O bytes /
-taskstats; lifetime peaks from schedstat `*_max` and
-`hiwater_*`; instantaneous gauges sampled at capture time
-including `nr_threads`, `fair_slice_ns`, `state`; categorical /
-ordinal scalars including `policy`, `nice`, `cpu_affinity`,
-identity strings) as zstd-compressed JSON (conventional
-extension `.ctprof.zst`). Cumulative counters and lifetime
+**`capture`** walks `/proc` at capture time and snapshots every
+visible thread's scheduling, memory, and I/O metrics as
+zstd-compressed JSON (conventional extension `.ctprof.zst`). The
+snapshot spans four metric kinds:
+
+- **cumulative counters** — from schedstat / sched / status CSW /
+  page faults / I/O bytes / taskstats.
+- **lifetime peaks** — schedstat `*_max` and `hiwater_*`.
+- **instantaneous gauges** sampled at capture time — `nr_threads`,
+  `fair_slice_ns`, `state`.
+- **categorical / ordinal scalars** — `policy`, `nice`,
+  `cpu_affinity`, identity strings.
+
+Cumulative counters and lifetime
 peaks are probe-timing-invariant — sampled twice, the value
 either monotonically increased or stayed at its high-water mark
 — so a diff between two snapshots measures exactly the
@@ -122,9 +127,9 @@ kernel tracing. The jemalloc-only memory fields
 (`allocated_bytes`/`deallocated_bytes`) are read by briefly
 `ptrace`-attaching each thread of jemalloc-linked processes
 (`PTRACE_SEIZE`), which needs root, `CAP_SYS_PTRACE`, or
-`kernel.yama.ptrace_scope=0`; targets not linked against jemalloc, or
-where the attach is denied, land those two fields at zero while the
-rest of the snapshot still populates.
+`kernel.yama.ptrace_scope=0`. For targets not linked against jemalloc,
+or when the ptrace attach is denied, those two fields are recorded as
+zero while the rest of the snapshot still populates.
 
 | Flag | Default | Description |
 |------|---------|-------------|

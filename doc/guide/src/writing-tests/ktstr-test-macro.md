@@ -111,7 +111,7 @@ handshake; tests are not expected to override either knob.
 |---|---|---|
 | `scheduler = CONST` | `&Scheduler::EEVDF` | Rust const path to a `&'static Scheduler`. The bare const emitted by `declare_scheduler!` (e.g. `MY_SCHED`) is the expected form. The default `Scheduler::EEVDF` runs tests under the kernel's default scheduler (EEVDF on Linux 6.6+) so tests without an explicit `scheduler =` run under the kernel default. |
 | `extra_sched_args = [...]` | `[]` | Extra CLI args for the scheduler, appended after `Scheduler::sched_args`. |
-| `watchdog_timeout_s` | 5 | scx watchdog override (seconds). Applied via `scx_sched.watchdog_timeout` on 7.1+ kernels (BTF-detected) and via the static `scx_watchdog_timeout` symbol on pre-7.1 kernels. When neither path is available the override silently no-ops. |
+| `watchdog_timeout_s` | 5 | scx watchdog override (seconds). Applied via `scx_sched.watchdog_timeout` on 7.1+ kernels (BTF-detected) and via the static `scx_watchdog_timeout` symbol on pre-7.1 kernels. When neither path is available the override logs a `tracing::warn!` and continues without overriding. |
 
 ### Payloads
 

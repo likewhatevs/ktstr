@@ -193,9 +193,10 @@ tree copied off a CI host). They do NOT consult
    cargo ktstr stats
    ```
 
-   Picks the newest subdirectory under `target/ktstr/` by mtime and
-   prints gauntlet analysis, BPF verifier stats, callback profile,
-   and KVM stats.
+   Honors `KTSTR_SIDECAR_DIR` when set (non-empty); otherwise picks
+   the newest subdirectory under `target/ktstr/` by mtime. Prints
+   gauntlet analysis, BPF verifier stats, callback profile, and KVM
+   stats.
 
 6. **Inspect the archived host context** for a specific run:
 

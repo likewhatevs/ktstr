@@ -28,14 +28,6 @@ any actual check — `Assert::default_checks()` is `Self::NO_OVERRIDES`
 per-test override, no assertions run. Per-test overrides on
 `#[ktstr_test]` merge LAST and win.
 
-For `post_vm` callbacks that synthesize their own `Assert` and
-need to surface the verdict back through the test result, use
-`v.into_anyhow_or_log()` on the resulting `Verdict` — it returns
-`Ok(())` on pass and `Err(_)` (with full failure-detail rendering)
-on fail, which is what a `post_vm` body wants. The older
-`AssertResult::into_anyhow_or_log` does the same for callers that
-already hold an `AssertResult` directly.
-
 ## Per-test overrides via #\[ktstr_test\]
 
 ```rust,ignore

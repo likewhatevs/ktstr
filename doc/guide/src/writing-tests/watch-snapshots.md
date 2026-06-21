@@ -49,14 +49,13 @@ automatic capture on write.
 ```rust,ignore
 use ktstr::prelude::*;
 
-let steps = vec![Step {
-    setup: vec![CgroupDef::named("workers").workers(2)].into(),
-    ops: vec![
-        Op::watch_snapshot("jiffies_64"),
-        Op::watch_snapshot("scx_watchdog_timestamp"),
-    ],
-    hold: HoldSpec::FULL,
-}];
+let steps = vec![
+    Step::with_defs(vec![CgroupDef::named("workers").workers(2)], HoldSpec::FULL)
+        .set_ops(vec![
+            Op::watch_snapshot("jiffies_64"),
+            Op::watch_snapshot("scx_watchdog_timestamp"),
+        ]),
+];
 execute_steps(ctx, steps)?;
 ```
 
@@ -151,19 +150,18 @@ error-class freeze trigger; the remaining three user watchpoint
 slots are available for on-demand watches.
 
 A 4th `Op::watch_snapshot` in the same scenario fails the step with
-"cap exceeded" when the cap is exceeded:
+a "cap exceeded" error:
 
 ```rust,ignore
-let steps = vec![Step {
-    setup: vec![CgroupDef::named("cg").workers(2)].into(),
-    ops: vec![
-        Op::watch_snapshot("kernel.a"),
-        Op::watch_snapshot("kernel.b"),
-        Op::watch_snapshot("kernel.c"),
-        Op::watch_snapshot("kernel.d"),  // <-- cap exceeded
-    ],
-    hold: HoldSpec::FULL,
-}];
+let steps = vec![
+    Step::with_defs(vec![CgroupDef::named("cg").workers(2)], HoldSpec::FULL)
+        .set_ops(vec![
+            Op::watch_snapshot("kernel.a"),
+            Op::watch_snapshot("kernel.b"),
+            Op::watch_snapshot("kernel.c"),
+            Op::watch_snapshot("kernel.d"),  // <-- cap exceeded
+        ]),
+];
 let result = execute_steps(ctx, steps)?;
 assert!(result.is_fail());
 // failure_details() yields a detail whose message carries:

@@ -18,7 +18,8 @@ KVM_HINTS_REALTIME CPUID, halt poll) are not available.
 
 Host-side `KVM_CAP_HALT_POLL` is explicitly skipped on x86_64 —
 the guest haltpoll cpuidle driver disables it via
-`MSR_KVM_POLL_CONTROL` (see below):
+`MSR_KVM_POLL_CONTROL` (see the "Skip host-side halt poll" item
+below).
 
 **vCPU pinning** -- each virtual LLC is mapped to a physical LLC
 group on the host. vCPU threads are pinned to cores within their

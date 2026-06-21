@@ -58,9 +58,14 @@ can share a NUMA node when `numa_nodes < llcs`; `llcs` must be an
 exact multiple of `numa_nodes` so LLCs partition evenly across nodes
 (the `declare_scheduler!` macro rejects violations at compile time
 and runtime callers inside ktstr hold the same invariant). CPUs
-numbered sequentially. Used as a fallback when sysfs is incomplete
-inside a guest VM. For the memory-aware variant, see
-`from_vm_topology_with_memory`.
+numbered sequentially. Populates LLCs, NUMA nodes, distances,
+per-node memory info, and memory-only node flags. Used as a fallback
+when sysfs is incomplete inside a guest VM.
+
+**`from_vm_topology_with_memory(topo, total_memory_mib) -> Self`** --
+same as `from_vm_topology` but accepts an optional total memory size
+for uniform topologies. When `Some`, divides memory evenly across
+nodes to populate `NodeMemInfo`; when `None`, memory info is omitted.
 
 **`synthetic(num_cpus, num_llcs) -> Self`** (`#[cfg(test)]`-gated; not
 callable from user code) -- creates a topology that distributes the
@@ -130,17 +135,6 @@ is the topology-level cpuset, not any cgroup's currently-effective
 cpuset; for cgroup-aware sizing use
 [`CgroupDef::workers_pct`](ops.md#builder-methods) which resolves
 against the cgroup's own cpuset at apply-setup time.
-
-## Construction from VM topology
-
-**`from_vm_topology(topo) -> Self`** -- build a `TestTopology` from a
-`Topology` (the VMM's topology spec). Populates LLCs, NUMA nodes,
-distances, per-node memory info, and memory-only node flags.
-
-**`from_vm_topology_with_memory(topo, total_memory_mib) -> Self`** --
-same as `from_vm_topology` but accepts an optional total memory size
-for uniform topologies. When `Some`, divides memory evenly across
-nodes to populate `NodeMemInfo`. When `None`, memory info is omitted.
 
 ## Cpuset generation
 

@@ -724,8 +724,10 @@ In `no_perf_mode`:
   CPUs >= total vCPUs".
 
 `no_perf_mode = true` is mutually exclusive with `performance_mode
-= true` (`KtstrTestEntry::validate` rejects the combination at
-runtime). Equivalent to setting `KTSTR_NO_PERF_MODE=1` per-test —
+= true` (rejected at compile time by the `#[ktstr_test]` proc macro;
+`KtstrTestEntry::validate` is a second-line runtime gate for
+programmatic-entry construction). Equivalent to setting
+`KTSTR_NO_PERF_MODE=1` per-test —
 either source forces the no-perf path. See
 [Performance Mode](concepts/performance-mode.md#tier-2-no-perf-mode-with-cpu-cap-reservation)
 for the full lifecycle.
