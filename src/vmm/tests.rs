@@ -358,13 +358,6 @@ fn kvm_has_immediate_exit_cap() {
 ///
 #[test]
 fn boot_kernel_with_monitor() {
-    // Skip-ordering: orchestration check fires BEFORE the
-    // coverage-instrumented check below. A non-orchestrated
-    // run can't have meaningful coverage-skip distinction
-    // (operator is skipping the test entirely via the wrong-
-    // runner gate), so surfacing the orchestration-skip first
-    // gives the more-actionable diagnostic. The 4 sibling
-    // vmm-boot tests mirror this ordering.
     if !crate::test_support::cargo_ktstr_orchestrated() {
         skip!(
             "test boots a real KVM VM and depends on cargo-ktstr's VM-test \
@@ -375,15 +368,6 @@ fn boot_kernel_with_monitor() {
              that masks the real cause (resource starvation, not a real bug). \
              Run via `cargo ktstr test --kernel ../linux` instead, which sets \
              KTSTR_ORCHESTRATED and constrains the per-VM resource budgets."
-        );
-    }
-    if crate::test_support::current_binary_is_coverage_instrumented() {
-        skip!(
-            "coverage-instrumented `current_exe` used as guest /init trips an \
-             AP-kill exit inside guest boot (failure shape: `kill set by AP` at \
-             ~3.6 s from VM start). Test exercises host-side monitor behaviour \
-             with no coverage-relevant code paths, so skip-under-coverage loses \
-             no real coverage; the real fix is a non-instrumented /init binary."
         );
     }
     let kernel = crate::test_support::require_kernel();
@@ -491,12 +475,6 @@ fn monitor_data_valid_latch_records_live_page_offset() {
     if !crate::test_support::cargo_ktstr_orchestrated() {
         skip!("{}", crate::test_support::SKIP_NOT_ORCHESTRATED_MSG);
     }
-    if crate::test_support::current_binary_is_coverage_instrumented() {
-        skip!(
-            "coverage-instrumented /init AP-kill — see boot_kernel_with_monitor \
-             for the shared rationale."
-        );
-    }
     let kernel = crate::test_support::require_kernel();
     let _vmlinux = crate::test_support::require_vmlinux(&kernel);
     let exe = crate::resolve_current_exe().unwrap();
@@ -589,12 +567,6 @@ fn monitor_data_valid_latch_records_live_page_offset() {
 fn sys_rdy_releases_monitor_before_5s_timeout() {
     if !crate::test_support::cargo_ktstr_orchestrated() {
         skip!("{}", crate::test_support::SKIP_NOT_ORCHESTRATED_MSG);
-    }
-    if crate::test_support::current_binary_is_coverage_instrumented() {
-        skip!(
-            "coverage-instrumented /init AP-kill — see boot_kernel_with_monitor \
-             for the shared rationale."
-        );
     }
     let kernel = crate::test_support::require_kernel();
     let _vmlinux = crate::test_support::require_vmlinux(&kernel);
@@ -750,12 +722,6 @@ fn monitor_exits_cleanly_when_guest_panics_before_sys_rdy() {
 fn first_sample_has_valid_rq_clock_thanks_to_sys_rdy() {
     if !crate::test_support::cargo_ktstr_orchestrated() {
         skip!("{}", crate::test_support::SKIP_NOT_ORCHESTRATED_MSG);
-    }
-    if crate::test_support::current_binary_is_coverage_instrumented() {
-        skip!(
-            "coverage-instrumented /init AP-kill — see boot_kernel_with_monitor \
-             for the shared rationale."
-        );
     }
     let kernel = crate::test_support::require_kernel();
     let _vmlinux = crate::test_support::require_vmlinux(&kernel);
@@ -999,12 +965,6 @@ fn watchdog_override_prevents_stall_exit() {
 fn sched_domain_data_populated() {
     if !crate::test_support::cargo_ktstr_orchestrated() {
         skip!("{}", crate::test_support::SKIP_NOT_ORCHESTRATED_MSG);
-    }
-    if crate::test_support::current_binary_is_coverage_instrumented() {
-        skip!(
-            "coverage-instrumented /init AP-kill — see boot_kernel_with_monitor \
-             for the shared rationale."
-        );
     }
     let kernel = crate::test_support::require_kernel();
     let vmlinux = crate::test_support::require_vmlinux(&kernel);

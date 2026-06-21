@@ -23,6 +23,31 @@ pub(crate) struct MemoryBudget {
     /// kernel (init sections and workspace are freed post-boot),
     /// absorbing percpu and misc boot allocations.
     pub kernel_init_size: u64,
+    /// `true` when the `/init` payload (the guest's PID 1) is built
+    /// with `-C instrument-coverage`. An instrumented `/init` holds
+    /// the LLVM profile-counter sections resident AND, at flush time,
+    /// `__llvm_profile_write_buffer` serializes them into a heap
+    /// buffer (`crate::test_support::try_flush_profraw`) — neither of
+    /// which a non-instrumented payload pays for. When set,
+    /// [`initramfs_min_memory_mib`] adds
+    /// `instrumented_reserve_bytes` to the workload term so the
+    /// instrumented `/init` does not OOM during boot.
+    pub init_coverage_instrumented: bool,
+    /// Extra resident bytes to reserve when
+    /// `init_coverage_instrumented` is set: the summed sizes of the
+    /// payload's `__llvm_prf_cnts` + `__llvm_prf_data` sections (the
+    /// live coverage-counter and profile-metadata arrays the
+    /// instrumented binary keeps resident). `0` when the payload is not
+    /// instrumented or the sections are absent.
+    ///
+    /// This is a STEADY-STATE floor, not the flush-time peak: at flush
+    /// `__llvm_profile_write_buffer` allocates a
+    /// `__llvm_profile_get_size_for_buffer()` heap buffer (cnts + data +
+    /// `__llvm_prf_names`) that briefly coexists with the resident
+    /// sections, so the true peak is ~2x(cnts+data)+names. `WORKLOAD_MIB`
+    /// slack absorbs the second copy at current binary sizes; a much
+    /// larger instrumented `/init` may want a peak-aware (2x) reserve.
+    pub instrumented_reserve_bytes: u64,
 }
 
 /// Read the kernel's declared memory footprint from the image file.
@@ -108,10 +133,13 @@ pub(crate) fn read_kernel_init_size(kernel_path: &Path) -> Result<u64> {
 ///   `free_initrd_mem()` after `unpack_to_rootfs` completes.
 ///
 /// - struct page array: `P / 64` bytes. Each 4KB page requires a
-///   `struct page` descriptor. On x86_64: base size = 56 bytes
-///   (flags:8 + 5-word union:40 + _mapcount:4 + _refcount:4), rounded
-///   to 64 by `CONFIG_HAVE_ALIGNED_STRUCT_PAGE` (16-byte alignment,
-///   `include/linux/mm_types.h`). Valid for x86_64 without `CONFIG_KMSAN`.
+///   `struct page` descriptor. Base size = 56 bytes (flags:8 + 5-word
+///   union:40 + _mapcount:4 + _refcount:4), reaching 64 either by
+///   `CONFIG_HAVE_ALIGNED_STRUCT_PAGE` 16-byte alignment padding
+///   (`CONFIG_MEMCG=n`) or by the extra `memcg_data:8` field
+///   (`CONFIG_MEMCG=y`) — same `/64` either way
+///   (`include/linux/mm_types.h`). `CONFIG_KMSAN` (off here) would add
+///   two pointers (→ 80 bytes); excluded.
 ///
 /// **tmpfs constraint** (the binding limit for initramfs extraction):
 ///
@@ -176,10 +204,28 @@ pub(crate) fn read_kernel_init_size(kernel_path: &Path) -> Result<u64> {
 ///
 /// Workload budget (MiB): scheduler execution, test scenarios, cgroup
 /// memory, BPF maps, and runtime allocations.
+///
+/// ## Coverage-instrumented `/init` reserve
+///
+/// A `-C instrument-coverage` `/init` payload (the
+/// [`MemoryBudget::init_coverage_instrumented`] flag) needs more than
+/// the base workload budget: it holds the LLVM profile-counter
+/// sections resident, and at flush time
+/// `__llvm_profile_write_buffer`
+/// (`crate::test_support::try_flush_profraw`) serializes them into a
+/// heap buffer whose size `__llvm_profile_get_size_for_buffer`
+/// reports. `WORKLOAD_MIB` is sized for a non-instrumented payload,
+/// so the instrumented case adds
+/// [`MemoryBudget::instrumented_reserve_bytes`] (the payload's
+/// `__llvm_prf_cnts` + `__llvm_prf_data` section sizes, MiB-ceil) to
+/// the workload term. Without it a ~600 MiB-stripped instrumented
+/// `/init` OOMs during boot (the empirically-confirmed
+/// `memory_deferred_min(4096)` workaround the reserve replaces with a
+/// right-sized figure derived from the actual section sizes).
 const WORKLOAD_MIB: u64 = 256;
 
 pub(crate) fn initramfs_min_memory_mib(budget: &MemoryBudget) -> u32 {
-    let ceil_mib = |bytes: u64| -> u64 { (bytes + (1 << 20) - 1) >> 20 };
+    let ceil_mib = |bytes: u64| -> u64 { bytes.saturating_add((1 << 20) - 1) >> 20 };
 
     let init_size_mib = ceil_mib(budget.kernel_init_size);
     let compressed_mib = ceil_mib(budget.compressed_initrd_bytes);
@@ -200,15 +246,41 @@ pub(crate) fn initramfs_min_memory_mib(budget: &MemoryBudget) -> u32 {
     //   (P - init_size - compressed - P/64) / 2 >= uncompressed
     //   P * 63/64 >= 2 * uncompressed + init_size + compressed
     //   P >= (2 * uncompressed + init_size + compressed) * 64/63
-    let uncompressed_scaled = uncompressed_mib * 2;
-    let content_mib = uncompressed_scaled + init_size_mib + compressed_mib;
+    let uncompressed_scaled = uncompressed_mib.saturating_mul(2);
+    let content_mib = uncompressed_scaled
+        .saturating_add(init_size_mib)
+        .saturating_add(compressed_mib);
 
     // struct page overhead: P/64 is part of reserved, creating a
     // circular dependency. Solve: P = content * 64/63.
-    let boot_mib = (content_mib * 64).div_ceil(63);
+    let boot_mib = content_mib.saturating_mul(64).div_ceil(63);
 
-    // total = computed boot requirement + workload budget.
-    (boot_mib + WORKLOAD_MIB) as u32
+    // Coverage-instrumented `/init` reserve: add the live profile
+    // sections (cnts + data) on top of the workload budget. Non-zero
+    // only when the payload is instrumented (see the const-level doc).
+    let coverage_reserve_mib = if budget.init_coverage_instrumented {
+        ceil_mib(budget.instrumented_reserve_bytes)
+    } else {
+        0
+    };
+
+    // total = computed boot requirement + workload budget + coverage
+    // reserve. All arithmetic above is saturating, so a pathological
+    // (hostile or buggy) input — a corrupt kernel Image `init_size`, a
+    // malformed `/init` ELF section size — saturates toward `u64::MAX`
+    // rather than wrapping to a too-small value; the `u32::try_from`
+    // below then fails LOUDLY (panic) instead of silently truncating
+    // the floor and OOMing the guest mid-boot.
+    let total_mib = boot_mib
+        .saturating_add(WORKLOAD_MIB)
+        .saturating_add(coverage_reserve_mib);
+    u32::try_from(total_mib).unwrap_or_else(|_| {
+        panic!(
+            "initramfs_min_memory_mib: computed floor {total_mib}MiB exceeds u32 \
+             (boot={boot_mib}MiB, workload={WORKLOAD_MIB}MiB, \
+             coverage_reserve={coverage_reserve_mib}MiB)"
+        )
+    })
 }
 
 #[cfg(test)]
@@ -233,6 +305,8 @@ mod tests {
             uncompressed_initramfs_bytes: 0,
             compressed_initrd_bytes: 0,
             kernel_init_size: 0,
+            init_coverage_instrumented: false,
+            instrumented_reserve_bytes: 0,
         };
         assert_eq!(initramfs_min_memory_mib(&budget), WORKLOAD_MIB as u32);
     }
@@ -253,6 +327,8 @@ mod tests {
             uncompressed_initramfs_bytes: 10 * (1 << 20),
             compressed_initrd_bytes: 2 * (1 << 20),
             kernel_init_size: 5 * (1 << 20),
+            init_coverage_instrumented: false,
+            instrumented_reserve_bytes: 0,
         };
         assert_eq!(initramfs_min_memory_mib(&budget), 284);
     }
@@ -272,6 +348,8 @@ mod tests {
             uncompressed_initramfs_bytes: 1,
             compressed_initrd_bytes: 0,
             kernel_init_size: 0,
+            init_coverage_instrumented: false,
+            instrumented_reserve_bytes: 0,
         };
         assert_eq!(initramfs_min_memory_mib(&budget), 259);
     }
@@ -291,8 +369,71 @@ mod tests {
             uncompressed_initramfs_bytes: 200 * (1 << 20),
             compressed_initrd_bytes: 50 * (1 << 20),
             kernel_init_size: 30 * (1 << 20),
+            init_coverage_instrumented: false,
+            instrumented_reserve_bytes: 0,
         };
         assert_eq!(initramfs_min_memory_mib(&budget), 744);
+    }
+
+    /// Coverage-instrumented shape: a GiB-scale instrumented `/init`
+    /// with a multi-hundred-MiB profile-counter reserve must produce a
+    /// floor well above the non-instrumented case AND above the
+    /// previously-used `memory_deferred_min(4096)` workaround.
+    ///
+    /// Inputs model a ~600 MiB-stripped instrumented `/init`:
+    ///   uncompressed=1200 MiB (binary + suffix), compressed=300 MiB,
+    ///   init_size=30 MiB, reserve=3500 MiB (cnts + data sections of a
+    ///   heavily-instrumented binary).
+    /// Trace:
+    ///   uncompressed_scaled = 1200 * 2 = 2400
+    ///   content_mib         = 2400 + 30 + 300 = 2730
+    ///   boot_mib            = ceil(2730*64/63) = ceil(2773.33) = 2774
+    ///   coverage_reserve    = 3500
+    ///   total              = 2774 + 256 + 3500 = 6530
+    ///
+    /// Two assertions pin the contract: (1) the instrumented floor is
+    /// strictly larger than the SAME budget with the flag off (the
+    /// reserve is actually added), and (2) the floor clears 4096 so an
+    /// instrumented `/init` of this shape boots without the manual
+    /// `memory_deferred_min(4096)` override.
+    #[test]
+    fn initramfs_min_memory_mib_instrumented_reserve_raises_floor() {
+        let base = MemoryBudget {
+            uncompressed_initramfs_bytes: 1200 * (1 << 20),
+            compressed_initrd_bytes: 300 * (1 << 20),
+            kernel_init_size: 30 * (1 << 20),
+            init_coverage_instrumented: false,
+            instrumented_reserve_bytes: 3500 * (1 << 20),
+        };
+        let instrumented = MemoryBudget {
+            init_coverage_instrumented: true,
+            ..base
+        };
+
+        let base_floor = initramfs_min_memory_mib(&base);
+        let instrumented_floor = initramfs_min_memory_mib(&instrumented);
+
+        // Flag off: reserve bytes are ignored entirely.
+        assert_eq!(
+            base_floor, 3030,
+            "non-instrumented floor must NOT include the reserve \
+             (2774 boot + 256 workload)"
+        );
+        // Flag on: reserve is added on top of the workload term.
+        assert_eq!(
+            instrumented_floor, 6530,
+            "instrumented floor = 2774 boot + 256 workload + 3500 reserve"
+        );
+        assert!(
+            instrumented_floor > base_floor,
+            "instrumented reserve must raise the floor ({instrumented_floor} \
+             vs {base_floor})"
+        );
+        assert!(
+            instrumented_floor > 4096,
+            "instrumented floor must clear the old memory_deferred_min(4096) \
+             workaround (got {instrumented_floor})"
+        );
     }
 
     /// `read_kernel_init_size` on x86_64 reads 4 little-endian bytes

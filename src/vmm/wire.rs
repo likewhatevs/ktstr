@@ -438,8 +438,8 @@ pub const MSG_TYPE_PAYLOAD_METRICS: u32 = 0x504d_4554; // "PMET"
 /// (payload: postcard-encoded `crate::test_support::RawPayloadOutput`).
 pub const MSG_TYPE_RAW_PAYLOAD_OUTPUT: u32 = 0x5241_574f; // "RAWO"
 
-/// Coverage profraw blob (payload: raw `.profraw` bytes from
-/// `__llvm_profile_get_data`).
+/// Coverage profraw blob (payload: raw `.profraw` bytes serialized by
+/// `__llvm_profile_write_buffer`).
 pub const MSG_TYPE_PROFRAW: u32 = 0x5052_4157; // "PRAW"
 
 /// wprof Perfetto-format trace blob (payload: raw `.pb` bytes

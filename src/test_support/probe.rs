@@ -443,23 +443,27 @@ fn extract_not_attached_reason(
 }
 
 /// Persist the auto-repro VM's bulk-drain sidecar artifacts to
-/// disk: wprof Perfetto trace + profraw coverage data. The wprof
-/// path uses the `.repro.wprof.pb` infix so it sits beside (not
-/// on top of) the primary VM's `.wprof.pb` from the same test —
-/// the `.repro.` infix matches the convention every other repro-VM
-/// sidecar in the crate already uses
-/// (`.repro.failure-dump.json`, `.repro.probe-payload.partial.json`).
-/// Profraw goes to the shared `llvm-cov-target` dir via
-/// [`crate::test_support::profraw::write_profraw`] whose filename
-/// (pid + counter) makes collision impossible.
+/// disk: the wprof Perfetto trace. The wprof path uses the
+/// `.repro.wprof.pb` infix so it sits beside (not on top of) the
+/// primary VM's `.wprof.pb` from the same test — the `.repro.`
+/// infix matches the convention every other repro-VM sidecar in
+/// the crate already uses (`.repro.failure-dump.json`,
+/// `.repro.probe-payload.partial.json`).
+///
+/// Coverage profraw from the auto-repro run is NOT extracted here:
+/// the repro VM runs via [`crate::vmm::KtstrVm::run`], which
+/// persists every `Profraw` frame centrally (see
+/// [`crate::test_support::persist_guest_profraw`]). Extracting it
+/// here too would write the same payload twice and make
+/// `llvm-profdata merge` double-count the counters.
 ///
 /// Mirrors the primary VM's per-frame dispatch in
 /// `crate::test_support::eval::run_ktstr_test_inner_impl`. Only
-/// the persistable-to-disk variants are replicated here — Stimulus,
-/// PayloadMetrics, and RawPayloadOutput frames from the auto-repro
-/// run are intentionally NOT extracted because they're a duplicate
-/// of the primary's and the verdict context only applies to the
-/// primary's drain.
+/// the persistable-to-disk variants unique to this path are
+/// replicated here — Stimulus, PayloadMetrics, and RawPayloadOutput
+/// frames from the auto-repro run are intentionally NOT extracted
+/// because they're a duplicate of the primary's and the verdict
+/// context only applies to the primary's drain.
 ///
 /// CRC failures gate the write per arm — a corrupted frame's
 /// payload is undecidable, so writing it would mask the corruption
@@ -486,36 +490,26 @@ fn write_auto_repro_sidecar_artifacts(
     };
     for bulk_entry in &drain.entries {
         let kind = crate::vmm::wire::MsgType::from_wire(bulk_entry.msg_type);
-        match kind {
-            Some(crate::vmm::wire::MsgType::Profraw) => {
-                if bulk_entry.crc_ok
-                    && !bulk_entry.payload.is_empty()
-                    && let Err(e) = crate::test_support::profraw::write_profraw(&bulk_entry.payload)
-                {
-                    eprintln!("ktstr_test: auto-repro: write guest profraw: {e}");
-                }
+        if let Some(crate::vmm::wire::MsgType::WprofTrace) = kind
+            && bulk_entry.crc_ok
+            && !bulk_entry.payload.is_empty()
+        {
+            let wprof_path = crate::test_support::sidecar::sidecar_dir()
+                .join(format!("{}.repro.wprof.pb", entry.name));
+            if let Err(e) = std::fs::create_dir_all(
+                wprof_path
+                    .parent()
+                    .expect("sidecar_dir join always has parent"),
+            ) {
+                eprintln!(
+                    "ktstr_test: auto-repro: create sidecar dir for wprof trace: {e}",
+                );
+            } else if let Err(e) = std::fs::write(&wprof_path, &bulk_entry.payload) {
+                eprintln!(
+                    "ktstr_test: auto-repro: write wprof trace to {}: {e}",
+                    wprof_path.display(),
+                );
             }
-            Some(crate::vmm::wire::MsgType::WprofTrace) => {
-                if bulk_entry.crc_ok && !bulk_entry.payload.is_empty() {
-                    let wprof_path = crate::test_support::sidecar::sidecar_dir()
-                        .join(format!("{}.repro.wprof.pb", entry.name));
-                    if let Err(e) = std::fs::create_dir_all(
-                        wprof_path
-                            .parent()
-                            .expect("sidecar_dir join always has parent"),
-                    ) {
-                        eprintln!(
-                            "ktstr_test: auto-repro: create sidecar dir for wprof trace: {e}",
-                        );
-                    } else if let Err(e) = std::fs::write(&wprof_path, &bulk_entry.payload) {
-                        eprintln!(
-                            "ktstr_test: auto-repro: write wprof trace to {}: {e}",
-                            wprof_path.display(),
-                        );
-                    }
-                }
-            }
-            _ => {}
         }
     }
 }

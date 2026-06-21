@@ -800,6 +800,78 @@ impl KtstrVm {
         Ok(total_compressed as u32)
     }
 
+    /// Probe the `/init` payload for LLVM coverage instrumentation and,
+    /// when instrumented, compute the extra resident memory the
+    /// instrumented runtime needs.
+    ///
+    /// Returns `(instrumented, reserve_bytes)`:
+    /// - `instrumented` is `true` when the payload's `.symtab` carries
+    ///   `__llvm_profile_write_buffer` / `__llvm_profile_get_size_for_buffer`
+    ///   (the same function-shaped symbols
+    ///   [`crate::test_support::try_flush_profraw`] resolves; chosen over
+    ///   the bare `__llvm_profile_runtime` marker because the marker can
+    ///   lose its `.symtab` size under `--gc-sections`). This probes the
+    ///   PAYLOAD bytes (`self.init_binary`), NOT the host process — the
+    ///   guest `/init` may be instrumented even when the host VMM binary
+    ///   is not (and vice versa), so
+    ///   `current_binary_is_coverage_instrumented` (which probes
+    ///   `/proc/self/exe`) is the wrong signal here.
+    /// - `reserve_bytes` is the summed `sh_size` of the payload's
+    ///   `__llvm_prf_cnts` + `__llvm_prf_data` sections — the live
+    ///   coverage-counter and profile-metadata arrays. This is the floor
+    ///   on the heap buffer `__llvm_profile_write_buffer` serializes into
+    ///   at flush time. `0` (and `instrumented = false`) on any failure
+    ///   path (no payload, unreadable file, ELF parse error, symbols
+    ///   absent) — the conservative outcome, leaving the budget at its
+    ///   non-instrumented size.
+    ///
+    /// Reads the payload via `memmap2::Mmap` (matching the
+    /// `try_flush_profraw` idiom) so a ~1 GiB coverage binary is not
+    /// copied into the heap just to read its section table.
+    fn init_payload_coverage_reserve(&self) -> (bool, u64) {
+        let Some(path) = self.init_binary.as_ref() else {
+            return (false, 0);
+        };
+        let Ok(file) = std::fs::File::open(path) else {
+            return (false, 0);
+        };
+        // SAFETY: `path` is the test-author-supplied `/init` payload;
+        // ktstr never writes to it during a VM build, satisfying
+        // memmap2's no-concurrent-modification invariant. The fd pins
+        // the inode for the mapping's lifetime.
+        let Ok(mmap) = (unsafe { memmap2::Mmap::map(&file) }) else {
+            return (false, 0);
+        };
+        let Ok(elf) = goblin::elf::Elf::parse(&mmap) else {
+            return (false, 0);
+        };
+
+        let vaddrs = crate::test_support::find_symbol_vaddrs(
+            &elf,
+            &[
+                "__llvm_profile_write_buffer",
+                "__llvm_profile_get_size_for_buffer",
+            ],
+        );
+        let instrumented = vaddrs.iter().any(|v| matches!(v, Some(va) if *va != 0));
+        if !instrumented {
+            return (false, 0);
+        }
+
+        // Sum the live profile sections' resident sizes. `sh_size` is
+        // the in-memory size (the counter/metadata arrays the runtime
+        // keeps resident and serializes at flush time).
+        let mut reserve_bytes: u64 = 0;
+        for sh in &elf.section_headers {
+            if let Some(name) = elf.shdr_strtab.get_at(sh.sh_name)
+                && (name == "__llvm_prf_cnts" || name == "__llvm_prf_data")
+            {
+                reserve_bytes = reserve_bytes.saturating_add(sh.sh_size);
+            }
+        }
+        (true, reserve_bytes)
+    }
+
     /// Join the initramfs thread and load the result into guest memory.
     /// Memory must already be allocated (non-deferred path). Validates
     /// that allocated memory is sufficient for the initramfs.
@@ -844,11 +916,15 @@ impl KtstrVm {
         let lz4_base = self.get_or_compress_base(base_bytes, &key)?;
         let lz4_suffix = initramfs::lz4_legacy_compress(&suffix);
         let compressed_size = lz4_base.len() + lz4_suffix.len();
-        let kernel_init_size = read_kernel_init_size(&self.kernel).unwrap_or(0) as u64;
+        let kernel_init_size = read_kernel_init_size(&self.kernel)?;
+        let (init_coverage_instrumented, instrumented_reserve_bytes) =
+            self.init_payload_coverage_reserve();
         let budget = MemoryBudget {
             uncompressed_initramfs_bytes: uncompressed_size as u64,
             compressed_initrd_bytes: compressed_size as u64,
             kernel_init_size,
+            init_coverage_instrumented,
+            instrumented_reserve_bytes,
         };
         let min_mib = initramfs_min_memory_mib(&budget);
         if memory_mib < min_mib {
@@ -916,17 +992,23 @@ impl KtstrVm {
 
         // Compute memory from actual sizes, honoring the
         // topology-requested minimum when non-zero.
-        let kernel_init_size = read_kernel_init_size(&self.kernel).unwrap_or(0) as u64;
+        let kernel_init_size = read_kernel_init_size(&self.kernel)?;
+        let (init_coverage_instrumented, instrumented_reserve_bytes) =
+            self.init_payload_coverage_reserve();
         let budget = MemoryBudget {
             uncompressed_initramfs_bytes: uncompressed_size as u64,
             compressed_initrd_bytes: compressed_size as u64,
             kernel_init_size,
+            init_coverage_instrumented,
+            instrumented_reserve_bytes,
         };
         let memory_mib = initramfs_min_memory_mib(&budget).max(self.memory_min_mib);
         tracing::debug!(
             uncompressed_mib = uncompressed_size >> 20,
             compressed_mib = compressed_size >> 20,
             init_size_mib = kernel_init_size >> 20,
+            coverage_instrumented = init_coverage_instrumented,
+            coverage_reserve_mib = instrumented_reserve_bytes >> 20,
             memory_min_mib = self.memory_min_mib,
             memory_mib,
             "deferred_memory_computed",
@@ -1494,11 +1576,15 @@ impl KtstrVm {
         // initramfs budget. Mirrors the x86_64 join_and_load_initramfs
         // contract: a builder with too-small memory_mib fails fast here
         // instead of OOMing during boot.
-        let kernel_init_size = read_kernel_init_size(&self.kernel).unwrap_or(0) as u64;
+        let kernel_init_size = read_kernel_init_size(&self.kernel)?;
+        let (init_coverage_instrumented, instrumented_reserve_bytes) =
+            self.init_payload_coverage_reserve();
         let budget = MemoryBudget {
             uncompressed_initramfs_bytes: uncompressed_size as u64,
             compressed_initrd_bytes: compressed_size as u64,
             kernel_init_size,
+            init_coverage_instrumented,
+            instrumented_reserve_bytes,
         };
         let min_mib = initramfs_min_memory_mib(&budget);
         if memory_mib < min_mib {
@@ -1564,17 +1650,23 @@ impl KtstrVm {
             "deferred_lz4_compress",
         );
 
-        let kernel_init_size = read_kernel_init_size(&self.kernel).unwrap_or(0) as u64;
+        let kernel_init_size = read_kernel_init_size(&self.kernel)?;
+        let (init_coverage_instrumented, instrumented_reserve_bytes) =
+            self.init_payload_coverage_reserve();
         let budget = MemoryBudget {
             uncompressed_initramfs_bytes: uncompressed_size as u64,
             compressed_initrd_bytes: compressed_size as u64,
             kernel_init_size,
+            init_coverage_instrumented,
+            instrumented_reserve_bytes,
         };
         let memory_mib = initramfs_min_memory_mib(&budget).max(self.memory_min_mib);
         tracing::debug!(
             uncompressed_mib = uncompressed_size >> 20,
             compressed_mib = compressed_size >> 20,
             init_size_mib = kernel_init_size >> 20,
+            coverage_instrumented = init_coverage_instrumented,
+            coverage_reserve_mib = instrumented_reserve_bytes >> 20,
             memory_min_mib = self.memory_min_mib,
             memory_mib,
             "deferred_memory_computed",

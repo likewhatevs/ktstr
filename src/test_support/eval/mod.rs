@@ -29,7 +29,6 @@ use super::output::{
     parse_assert_result_from_drain, sched_log_fingerprint,
 };
 use super::probe::attempt_auto_repro;
-use super::profraw::write_profraw;
 use super::sidecar::{write_sidecar, write_skip_sidecar};
 use super::topo::TopoOverride;
 use super::{KtstrTestEntry, SchedulerSpec, Topology};
@@ -1169,14 +1168,6 @@ fn run_ktstr_test_inner_impl(
         for bulk_entry in &bulk.entries {
             let kind = crate::vmm::wire::MsgType::from_wire(bulk_entry.msg_type);
             match kind {
-                Some(crate::vmm::wire::MsgType::Profraw) => {
-                    if bulk_entry.crc_ok
-                        && !bulk_entry.payload.is_empty()
-                        && let Err(e) = write_profraw(&bulk_entry.payload)
-                    {
-                        eprintln!("ktstr_test: write guest profraw: {e}");
-                    }
-                }
                 Some(crate::vmm::wire::MsgType::WprofTrace) => {
                     // wprof Perfetto trace captured during the
                     // guest's auto-repro window. Write next to the
@@ -1234,20 +1225,26 @@ fn run_ktstr_test_inner_impl(
                 // timeline: StepEnd is decoded via
                 // `StimulusEvent::from_step_end` alongside Stimulus's
                 // `from_wire` and ScenarioEnd's terminal), so they are
-                // no-ops in this loop. The remaining verdict-bearing
-                // variants in this arm (TestResult, Exit, SchedExit,
-                // ScenarioStart, ScenarioPause, ScenarioResume, Stdout,
-                // SchedLog, Lifecycle, ExecExit, Dmesg, ProbeOutput,
-                // SnapshotReply, Crash) are consumed by other walkers
-                // further down the pipeline (parse_assert_result_from_drain,
-                // bulk_exit lookup in collect_results, lifecycle
-                // classifier, sched_log concatenator, etc.). No
-                // per-entry side effect here. (Stderr is NOT in this arm —
-                // it has its own arm below that streams to host stderr.)
+                // no-ops in this loop. Profraw is persisted centrally
+                // in `crate::vmm::KtstrVm::run` (every run() caller
+                // funnels through there), so re-extracting it here would
+                // write the same payload twice and make
+                // `llvm-profdata merge` double-count the counters. The
+                // remaining verdict-bearing variants in this arm
+                // (TestResult, Exit, SchedExit, ScenarioStart,
+                // ScenarioPause, ScenarioResume, Stdout, SchedLog,
+                // Lifecycle, ExecExit, Dmesg, ProbeOutput, SnapshotReply,
+                // Crash) are consumed by other walkers further down the
+                // pipeline (parse_assert_result_from_drain, bulk_exit
+                // lookup in collect_results, lifecycle classifier,
+                // sched_log concatenator, etc.). No per-entry side effect
+                // here. (Stderr is NOT in this arm — it has its own arm
+                // below that streams to host stderr.)
                 Some(
                     crate::vmm::wire::MsgType::Stimulus
                     | crate::vmm::wire::MsgType::StepEnd
                     | crate::vmm::wire::MsgType::ScenarioEnd
+                    | crate::vmm::wire::MsgType::Profraw
                     | crate::vmm::wire::MsgType::TestResult
                     | crate::vmm::wire::MsgType::Exit
                     | crate::vmm::wire::MsgType::SchedExit

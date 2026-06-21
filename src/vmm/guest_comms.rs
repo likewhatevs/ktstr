@@ -472,9 +472,13 @@ pub fn send_payload_metrics(metrics: &crate::test_support::PayloadMetrics) -> bo
 }
 
 /// Send a coverage profraw blob to the host. Payload: raw `.profraw`
-/// bytes produced by `__llvm_profile_get_data`.
+/// bytes serialized by `__llvm_profile_write_buffer`.
 ///
-/// Frames with [`MsgType::Profraw`].
+/// Frames with [`MsgType::Profraw`]. Gated on `cfg(any(test, coverage))`
+/// because the only callers are the coverage-build guest flush
+/// (`try_flush_profraw`, `cfg(coverage)`) and its host-context
+/// suppression unit test (`cfg(test)`); a plain lib build has none.
+#[cfg(any(test, coverage))]
 pub fn send_profraw(buf: &[u8]) {
     write_msg(MsgType::Profraw.wire_value(), buf);
 }

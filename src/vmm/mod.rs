@@ -730,6 +730,18 @@ impl KtstrVm {
             result.kvm_stats = Some(ctx.read_stats());
         }
 
+        // Persist any coverage-profraw the guest /init flushed
+        // (`try_flush_profraw`) and the host bucketed into
+        // `guest_messages`. Every `KtstrVm::run` caller — the eval
+        // path, the auto-repro path, and direct callers — funnels
+        // through here, so this is the single profraw-persistence
+        // site: the eval/probe per-frame dispatch intentionally does
+        // NOT re-extract `Profraw` frames (a second write would make
+        // `llvm-profdata merge` double-count the counters).
+        if let Some(ref msgs) = result.guest_messages {
+            crate::test_support::persist_guest_profraw(msgs);
+        }
+
         Ok(result)
     }
 
