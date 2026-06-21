@@ -871,6 +871,13 @@ fn write_struct(
         .iter()
         .any(|m| m.name.is_empty() && matches!(m.value, RenderedValue::Struct { .. }))
     {
+        // Pool the NAMED siblings' scalar values BEFORE flatten
+        // consumes the anonymous overlays, so a union overlay that
+        // only re-views named fields is suppressed rather than
+        // flattened into duplicate sibling columns. (Building the pool
+        // after flatten — the previous order — left it unable to see
+        // the empty-name Structs at all, so the dedup never fired.)
+        let pool = build_sibling_scalar_pool(members);
         flat_members = Vec::with_capacity(members.len());
         for m in members {
             if m.name.is_empty()
@@ -878,6 +885,12 @@ fn write_struct(
                     members: ref inner, ..
                 } = m.value
             {
+                // Suppress an anonymous union overlay that merely
+                // duplicates named-sibling scalars; otherwise flatten
+                // its inner fields onto the parent.
+                if !pool.is_empty() && anon_duplicates_pool(&m.value, &pool) {
+                    continue;
+                }
                 flat_members.extend_from_slice(inner);
                 continue;
             }
@@ -886,13 +899,6 @@ fn write_struct(
         flat_members.as_slice()
     } else {
         members
-    };
-
-    let any_anon = members.iter().any(|m| m.name.is_empty());
-    let sibling_scalar_pool: Option<std::collections::HashSet<u64>> = if any_anon {
-        Some(build_sibling_scalar_pool(members))
-    } else {
-        None
     };
 
     // Single-pass filter + pre-render. `visible_rendered` carries
@@ -910,12 +916,6 @@ fn write_struct(
             continue;
         }
         if (m.name.contains("___fmt") || m.name.contains("____fmt")) && is_string_value(&m.value) {
-            continue;
-        }
-        if m.name.is_empty()
-            && let Some(pool) = sibling_scalar_pool.as_ref()
-            && anon_duplicates_pool(&m.value, pool)
-        {
             continue;
         }
         // Pre-render the value to a single-line string for flat
@@ -1344,6 +1344,12 @@ fn scalar_numeric_value(v: &RenderedValue) -> Option<u64> {
 fn build_sibling_scalar_pool(members: &[RenderedMember]) -> std::collections::HashSet<u64> {
     let mut sibling_values: std::collections::HashSet<u64> = std::collections::HashSet::new();
     for s in members {
+        // Pool only NAMED siblings: the anonymous overlays are the
+        // values being deduped against this pool, so including their
+        // own scalars would make the dedup self-referential.
+        if s.name.is_empty() {
+            continue;
+        }
         if let Some(n) = scalar_numeric_value(&s.value) {
             if n != 0 {
                 sibling_values.insert(n);
@@ -1367,6 +1373,14 @@ fn build_sibling_scalar_pool(members: &[RenderedMember]) -> std::collections::Ha
 /// already present in `pool`. Companion to
 /// [`build_sibling_scalar_pool`]: caller builds the pool once,
 /// queries it once per anonymous member.
+///
+/// Heuristic bound: the match is by scalar VALUE, not by field
+/// offset, so an overlay whose every non-zero leaf coincidentally
+/// equals an unrelated named sibling's value is also suppressed. The
+/// effect is display-only (a hidden render row — never a
+/// counter/verdict effect) and grows vanishingly unlikely as the leaf
+/// count rises; offset-aware dedup would be the precise fix but is
+/// unwarranted for a renderer.
 fn anon_duplicates_pool(anon: &RenderedValue, pool: &std::collections::HashSet<u64>) -> bool {
     let RenderedValue::Struct { members, .. } = anon else {
         return false;

@@ -10471,22 +10471,15 @@ fn anon_duplicates_pool_false_for_non_struct_or_empty_pool() {
 }
 
 #[test]
-fn write_struct_anonymous_overlay_is_flattened_not_deduped() {
-    // ACTUAL behavior pin. A named scalar `pid=42` plus an anonymous
-    // (empty-name) overlay Struct whose only leaf is also 42. The
-    // intended behavior (per the `anon_duplicates_pool` /
-    // `build_sibling_scalar_pool` doc) is to SUPPRESS the duplicate
-    // overlay so only `pid=42` shows. That suppression never runs:
-    // `write_struct`'s flatten pass (mod.rs:870-889) promotes the
-    // empty-name Struct's inner member to the parent BEFORE the
-    // dedup check at mod.rs:915-920 — and `anon_duplicates_pool`
-    // only returns true for a Struct value, which the flatten has
-    // already consumed. So the overlay's inner field surfaces as a
-    // sibling. This pins the dead-code reality: the
-    // `anon_duplicates_pool` suppression in `write_struct` is
-    // unreachable (its only true-returning input — a Struct value —
-    // is flattened away first), so duplicate overlays are NOT
-    // suppressed despite the helper's documented intent.
+fn write_struct_anonymous_overlay_duplicating_sibling_is_suppressed() {
+    // A named scalar `pid=42` plus an anonymous (empty-name) union
+    // overlay Struct whose only leaf is also 42. The overlay merely
+    // re-views the named field, so `write_struct` suppresses it (the
+    // documented `anon_duplicates_pool` / `build_sibling_scalar_pool`
+    // intent): the named-sibling pool is built BEFORE the flatten pass,
+    // so the empty-name Struct is recognized as a pure duplicate and
+    // dropped rather than flattened into a duplicate sibling column.
+    // Only `pid=42` shows.
     let v = RenderedValue::Struct {
         type_name: Some("scx_task".into()),
         members: vec![
@@ -10508,12 +10501,43 @@ fn write_struct_anonymous_overlay_is_flattened_not_deduped() {
     };
     let out = format!("{v}");
     assert!(out.contains("pid=42"), "named sibling visible: {out}");
-    // The overlay's inner field is flattened in (NOT suppressed).
     assert!(
-        out.contains("overlay_alias=42"),
-        "overlay flattened to a sibling (dedup never runs): {out}",
+        !out.contains("overlay_alias"),
+        "duplicate overlay suppressed, not flattened to a sibling: {out}",
     );
-    assert_eq!(out, "scx_task{pid=42, overlay_alias=42}", "exact flattened form");
+    assert_eq!(out, "scx_task{pid=42}", "exact suppressed form");
+}
+
+#[test]
+fn write_struct_anonymous_overlay_with_unique_field_is_flattened() {
+    // The companion to the suppression case: an anonymous overlay whose
+    // leaf does NOT duplicate any named sibling is flattened onto the
+    // parent (shown), not suppressed — the dedup drops only overlays
+    // that are pure re-views of named fields.
+    let v = RenderedValue::Struct {
+        type_name: Some("scx_task".into()),
+        members: vec![
+            RenderedMember {
+                name: "pid".into(),
+                value: uint(42),
+            },
+            RenderedMember {
+                name: String::new(), // anonymous union overlay
+                value: RenderedValue::Struct {
+                    type_name: None,
+                    members: vec![RenderedMember {
+                        name: "unique_field".into(),
+                        value: uint(99), // 99 not in the named-sibling pool {42}
+                    }],
+                },
+            },
+        ],
+    };
+    let out = format!("{v}");
+    assert_eq!(
+        out, "scx_task{pid=42, unique_field=99}",
+        "non-duplicate overlay flattened in",
+    );
 }
 
 // ---- write_struct multi-line column path -----------------------
