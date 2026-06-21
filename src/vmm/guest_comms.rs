@@ -1803,10 +1803,11 @@ mod tests {
             other => panic!("expected Raw, got {other:?}"),
         }
         // (b) sample_free <= max < full -> Stripped: verdict PRESERVED, samples gone.
-        match classify_test_result(&r, full - 1) {
+        let max = full - 1;
+        match classify_test_result(&r, max) {
             Some(TestResultWire::Stripped { bytes, dropped }) => {
                 assert_eq!(dropped, 1000);
-                assert!(bytes.len() <= full - 1);
+                assert!(bytes.len() <= max);
                 let decoded: AssertResult = postcard::from_bytes(&bytes).unwrap();
                 assert!(decoded.is_pass(), "verdict PRESERVED — no PASS->FAIL flip");
                 assert!(

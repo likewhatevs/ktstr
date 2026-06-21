@@ -426,6 +426,7 @@ pub enum MergeKind {
     /// - [`MetricKind::Distribution`] / [`MetricKind::WorstLowest`]: re-pooled
     ///   from the raw per-cgroup samples / counters by
     ///   `crate::assert::populate_run_distribution_metrics`.
+    ///
     /// The per-metric merge loop skips these derived keys entirely and the
     /// post-pass produces them, so this variant is classification metadata: no
     /// merge dispatches on it.

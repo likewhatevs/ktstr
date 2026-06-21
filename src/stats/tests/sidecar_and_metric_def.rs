@@ -889,7 +889,7 @@ fn list_metrics_json_omits_accessor_field() {
 /// The Distribution/WorstLowest MetricKind serde shape is user-facing via
 /// `cargo ktstr stats list-metrics --json` (list_metrics(true) serializes
 /// the full MetricDef incl. `kind`). Pin the externally-tagged JSON variant
-/// + helper-enum strings so a rename of MetricKind / SampleSource /
+/// and helper-enum strings so a rename of MetricKind / SampleSource /
 /// SampleReduction / WorstLowest* trips this test rather than silently
 /// changing the CLI output. MetricKind is Serialize-only (output contract;
 /// no deserialize symmetry to check).

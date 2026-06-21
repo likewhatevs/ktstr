@@ -522,8 +522,8 @@ impl PhaseCgroupStats {
     /// reservoir element stands for `w/len` population units; the pre-cap samples
     /// are gone).
     ///
-    /// DETERMINISTIC: the xorshift64 stream is seeded from the inputs (populations
-    /// + lengths) so the merge is a PURE function of its arguments — unlike
+    /// DETERMINISTIC: the xorshift64 stream is seeded from the inputs (populations +
+    /// lengths) so the merge is a PURE function of its arguments — unlike
     /// `crate::workload::reservoir_push`, whose stream is gettid-seeded
     /// thread-local (a merge run twice would otherwise differ). The triple-shift
     /// mirrors the codebase's inline xorshift64 (`reservoir_push` /

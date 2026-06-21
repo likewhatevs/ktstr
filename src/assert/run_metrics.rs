@@ -954,8 +954,8 @@ pub(crate) fn weighted_percentile(sorted: &[(u64, f64)], p: f64) -> u64 {
 /// The Cv / Mean `total_w <= 0.0` guards and [`weighted_percentile`]'s
 /// all-weight-zero fall-through are degenerate-input belts: the capture-path
 /// caller [`populate_run_distribution_metrics`] clamps every per-sample weight to
-/// >= 1.0, so `total_w >= len >= 1` there and those branches are unreachable on
-/// the production path.
+/// a floor of 1.0, so `total_w >= len >= 1` there and those branches are
+/// unreachable on the production path.
 pub(crate) fn reduce_weighted_sorted_distribution(
     sorted: &[(u64, f64)],
     reduction: crate::stats::SampleReduction,

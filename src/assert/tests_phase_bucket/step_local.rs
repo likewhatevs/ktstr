@@ -596,8 +596,8 @@ fn phase_cgroup_stats_merge_above_cap_is_population_weighted() {
 /// `merge(merge(A,B),C)` yields A:B:C fractions tracking `w_x / (w_a+w_b+w_c)`.
 /// The first merge sets the combined carrier's `wake_sample_total = w_a+w_b`,
 /// which then weights against `w_c` in the second merge, so the recursive
-/// weighting telescopes to the true 3-way proportions (the case a cgroup with ≥3
-/// >cap WorkSpec handles in one step hits). Tolerance is widened slightly for the
+/// weighting telescopes to the true 3-way proportions (the case a cgroup with ≥3 >cap
+/// WorkSpec handles in one step hits). Tolerance is widened slightly for the
 /// compounded resampling variance of two sequential draws; the length-weighted
 /// alternative (the deleted path) would give ~0.33 each — far outside it.
 #[test]
