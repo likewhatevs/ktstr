@@ -3,7 +3,7 @@
 //! Most tests use the declarative ops API from the [`ops`] submodule:
 //! - [`ops::CgroupDef`] -- declarative cgroup definition (name + cpuset + workload)
 //! - [`ops::Step`] -- a sequence of ops followed by a hold period
-//! - [`ops::Op`] -- atomic cgroup topology operation
+//! - [`ops::Op`] -- an atomic scenario operation (cgroup/worker topology, payload run/wait/kill, freeze, snapshot, kernel read/write, scheduler attach/detach/restart/replace, BPF map pin)
 //! - [`ops::CpusetSpec`] -- how to compute a cpuset from topology
 //! - [`ops::HoldSpec`] -- how long to hold after a step
 //! - [`backdrop::Backdrop`] -- persistent scenario state shared across every Step
@@ -481,8 +481,7 @@ impl std::fmt::Debug for Ctx<'_> {
 }
 
 impl Ctx<'_> {
-    /// Scheduler pid, filtered to the `> 0` range that
-    /// `process_alive` treats as signalable.
+    /// Read the live scheduler identity published by the
     ///
     /// `Ctx::sched_pid` documents `None` as the "no scheduler
     /// configured" state, and the liveness sites destructure with
@@ -546,6 +545,44 @@ impl Ctx<'_> {
         crate::vmm::rust_init::current_scheduler()
     }
 
+    /// Scheduler pid, filtered to the `> 0` range that
+    /// `process_alive` treats as signalable.
+    ///
+    /// `Ctx::sched_pid` documents `None` as the "no scheduler
+    /// configured" state, and the liveness sites destructure with
+    /// `if let Some(pid)`. Nothing in the builder, however, prevents
+    /// a caller from passing `Some(0)` or a negative pid — an easy
+    /// mistake for callers used to the workload module's internal
+    /// 0-sentinel pid slot (see the note on `sched_pid` above — the
+    /// sentinel lives on a module-private `AtomicI32` in
+    /// `src/workload.rs`, not on this `Option<pid_t>`). A bare
+    /// `Some(0)` would reach
+    /// `process_alive`, which returns `false` for any pid `<= 0`,
+    /// and the liveness sites would then bail with `scheduler died`
+    /// even though no scheduler was ever running — a false
+    /// positive that turns a misconfiguration into a misleading
+    /// scheduler-death diagnostic.
+    ///
+    /// Centralising the filter here means every liveness callsite
+    /// (`run_scenario` post-settle bail, workload-phase polling,
+    /// `setup_cgroups` post-settle bail) uses the same predicate:
+    /// only a positive pid is "configured". Callers must use this
+    /// accessor rather than destructuring `sched_pid` directly.
+    ///
+    /// A `Some(n)` where `n <= 0` is a caller bug — the builder
+    /// documents `None` as the unconfigured shape, and every
+    /// positive value flows through unchanged. When the accessor
+    /// squashes such a value to `None`, it emits a `tracing::warn!`
+    /// naming the offending pid so the misuse surfaces in
+    /// structured logs instead of manifesting downstream as a
+    /// silent "scheduler died" verdict or, worse, a `kill(0, …)`
+    /// reaching the caller's own process group. The warn is
+    /// bounded: there are exactly three callsites
+    /// (`run_scenario` post-settle bail, workload-phase polling,
+    /// `setup_cgroups` post-settle bail), so the volume is O(3)
+    /// per scenario run even for a sustained
+    /// misconfiguration — tight enough to leave in place without
+    /// a rate limiter.
     pub(crate) fn active_sched_pid(&self) -> Option<libc::pid_t> {
         match self.sched_pid {
             Some(p) if p > 0 => Some(p),

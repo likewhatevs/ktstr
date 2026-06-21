@@ -11,7 +11,9 @@
 //! runs scheduler test scenarios inside them, and evaluates results from the
 //! host via guest memory introspection. Each test creates cgroups, spawns
 //! worker processes, and checks that the scheduler handled the workload
-//! correctly. Also tests under the kernel's default EEVDF scheduler.
+//! correctly. The same scenarios also run under the kernel's default
+//! EEVDF scheduler, so a test can baseline sched_ext behavior against
+//! stock scheduling.
 //!
 //! # Quick start
 //!
@@ -157,7 +159,7 @@
 //!
 //! ```toml
 //! [dev-dependencies]
-//! ktstr = "0.10"
+//! ktstr = "0.16"
 //! ```
 //!
 //! Lean dev-dep (drops the host-tooling crates: tikv-jemallocator,
@@ -166,7 +168,7 @@
 //!
 //! ```toml
 //! [dev-dependencies]
-//! ktstr = { version = "0.10", default-features = false, features = ["llm"] }
+//! ktstr = { version = "0.16", default-features = false, features = ["llm"] }
 //! ```
 //!
 //! # Feature flags
@@ -182,7 +184,7 @@
 //!   the test binary. Drops `base64` from the manifest when off.
 //! - **`wprof`** — embed the wprof BPF tracer in shell-mode VMs.
 //!   First build clones `github.com/anakryiko/wprof` (requires git,
-//!   clang, elfutils-devel, zlib-devel).
+//!   make, gcc, clang, elfutils-devel, zlib-devel).
 //! - **`pretty-labels`** — grex-based regex synthesis for
 //!   `ctprof_compare` display labels. With the feature off,
 //!   labels fall back to the deterministic join key.
@@ -207,7 +209,7 @@
 //! - [`test_support`] -- `#[ktstr_test]` runtime and registration
 //! - [`topology`] -- CPU topology abstraction (LLCs, NUMA nodes)
 //! - [`verifier`] -- BPF verifier log parsing, cycle detection, and output formatting
-//! - [`worker_ready`] / [`worker_ready_wait`] -- pid-scoped marker file the alloc/test workers write before the parent samples them
+//! - [`worker_ready`] / [`worker_ready_wait`] -- pid-scoped ready-marker the alloc/test worker writes once it is work-ready, polled (`worker_ready_wait`) before the probe is launched against it
 //! - [`workload`] -- worker process types and telemetry collection
 //!
 //! ## ctprof subsystem
@@ -232,9 +234,12 @@
 //! Internal modules (not re-exported): `host_thread_probe` reads
 //! per-thread jemalloc TSD counters via ptrace, `monitor` reads
 //! live guest state, `probe` attaches BPF probes to traced
-//! functions, `vmm` owns the KVM VM lifecycle, and `timeline`
-//! correlates stimulus events with monitor samples for
-//! phase-aligned reporting.
+//! functions, and `vmm` owns the KVM VM lifecycle.
+//!
+//! [`timeline`] is a public module (its `StimulusEvent` appears in
+//! `assert::build_phase_buckets_with_stimulus`'s signature and is
+//! re-exported in the [`prelude`]); it correlates stimulus events
+//! with monitor samples for phase-aligned reporting.
 
 // `#[derive(Payload)]` expands into `::ktstr::test_support::...`
 // paths so downstream crates can use it without a `use` import.
@@ -1271,9 +1276,9 @@ pub const KTSTR_LOCK_DIR_ENV: &str = "KTSTR_LOCK_DIR";
 /// Name of the environment variable that triggers verbose logging
 /// in the VMM setup phase. Strict `v == "1"` semantics (only the
 /// literal `"1"` enables; unset / empty / any other value —
-/// including `"true"`, `"yes"`, `"0"` — is disabled). Read at
-/// `crate::vmm::setup` L1263-1266 (x86_64 cmdline) and
-/// L1680-1683 (aarch64 cmdline); both readers identical.
+/// including `"true"`, `"yes"`, `"0"` — is disabled). Read in
+/// `crate::vmm::setup` at the two cmdline-assembly sites (one per
+/// arch: x86_64 and aarch64); both readers identical.
 pub const KTSTR_VERBOSE_ENV: &str = "KTSTR_VERBOSE";
 
 /// Name of the environment variable that bypasses LLC resource
@@ -1412,9 +1417,9 @@ pub const KTSTR_GUEST_INIT_ENV: &str = "KTSTR_GUEST_INIT";
 
 /// Name of the environment variable that points at a probe binary
 /// for jemalloc-feature detection. Empty / unset leaves the probe
-/// binary unwired (the [`crate::test_support::runtime`] reader at
-/// L789-797 conditionally calls `.jemalloc_probe_binary()` only
-/// on set+non-empty — there is no `which`-based fallback). Tests
+/// binary unwired (the [`crate::test_support::runtime`]
+/// builder-wiring site calls `.jemalloc_probe_binary()` only on
+/// set+non-empty — there is no `which`-based fallback). Tests
 /// that need the probe set this var via `#[ctor]` before the
 /// harness runs (see `tests/jemalloc_probe_tests.rs`).
 pub const KTSTR_JEMALLOC_PROBE_BINARY_ENV: &str = "KTSTR_JEMALLOC_PROBE_BINARY";
@@ -1422,8 +1427,8 @@ pub const KTSTR_JEMALLOC_PROBE_BINARY_ENV: &str = "KTSTR_JEMALLOC_PROBE_BINARY";
 /// Name of the environment variable that points at a worker
 /// binary for jemalloc allocation-probe runs. Empty / unset
 /// leaves the worker binary unwired — same shape as
-/// [`KTSTR_JEMALLOC_PROBE_BINARY_ENV`]; reader at
-/// [`crate::test_support::runtime`] L799-806 conditionally calls
+/// [`KTSTR_JEMALLOC_PROBE_BINARY_ENV`]; the
+/// [`crate::test_support::runtime`] builder-wiring site calls
 /// `.jemalloc_alloc_worker_binary()` only on set+non-empty, no
 /// `which`-based fallback. Set alongside the probe via `#[ctor]`
 /// in `tests/jemalloc_probe_tests.rs`.

@@ -20,7 +20,7 @@
 //!
 //! # Module layout
 //!
-//! Implementation is split across 17 production submodules
+//! Implementation is split across 18 production submodules
 //! re-exported at `test_support::*` for a flat public API: `args`
 //! (CLI argument extraction), `dispatch` (ktstr / cargo-ktstr CLI
 //! entry points), `entry` (scheduler + test-entry types), `eval`
@@ -34,7 +34,9 @@
 //! eval and probe so they don't circularly depend on each other),
 //! `shell_descriptor` (wire-format struct shared between the test
 //! binary's `--ktstr-shell-test=<NAME>` producer and cargo-ktstr's
-//! shell-mode consumer), `sidecar` (per-run JSON records), `staged`
+//! shell-mode consumer), `wprof` (`#[cfg(feature = "wprof")]` —
+//! Perfetto-trace wire constants + `.wprof.pb` shape assertions),
+//! `sidecar` (per-run JSON records), `staged`
 //! (`pub(crate) mod` — staged-payload writer), `timefmt` (ISO-8601
 //! + run-id helpers), and `topo` (topology override parsing).
 //!

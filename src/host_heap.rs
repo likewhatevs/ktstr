@@ -22,9 +22,11 @@
 //!
 //! What differs is the *meaning* of the numbers:
 //!
-//! - When jemalloc IS `#[global_allocator]` (every binary in this
-//!   workspace — see `src/bin/*.rs`), every heap allocation flows
-//!   through jemalloc and `stats.allocated` / `stats.active` report
+//! - When jemalloc IS `#[global_allocator]` (every shipped binary in
+//!   this workspace, via the central `#[global_allocator]` in
+//!   `src/lib.rs` gated on the `cli-bins` feature), every heap
+//!   allocation flows through jemalloc and `stats.allocated` /
+//!   `stats.active` report
 //!   real application usage in the tens-to-hundreds of MiB range.
 //! - When jemalloc is linked but is NOT `#[global_allocator]`
 //!   (downstream consumers using ktstr as a library without opting
@@ -506,9 +508,10 @@ mod tests {
     /// allocated`, `resident >= active`, `mapped >= active` all
     /// hold trivially (`0 >= 0`, small >= 0, small >= 0). They do
     /// NOT validate jemalloc behavior — they are tautologies.
-    /// Real invariant coverage lives in each ktstr binary
-    /// (ktstr, cargo-ktstr, jemalloc-probe) whose `main.rs` installs
-    /// `tikv_jemallocator::Jemalloc` as `#[global_allocator]`; a
+    /// Real invariant coverage lives in each shipped ktstr binary
+    /// (ktstr, cargo-ktstr, ktstr-jemalloc-probe), which inherit
+    /// `tikv_jemallocator::Jemalloc` as the `#[global_allocator]`
+    /// from `src/lib.rs`; a
     /// live production run of any of those binaries exercises the
     /// non-trivial invariants. Documenting rather than
     /// feature-gating because a lib-crate integration test with its

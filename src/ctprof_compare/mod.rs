@@ -4,7 +4,8 @@
 //! Design summary: the per-thread profiler emits
 //! one snapshot per run. Comparison groups threads within each
 //! snapshot by a single axis (pcomm, cgroup, comm, or
-//! comm-exact — see [`GroupBy`]), aggregates every metric per
+//! comm-exact), or by all pattern-aware axes at once
+//! ([`GroupBy::All`]) — see [`GroupBy`]; aggregates every metric per
 //! the rule on its [`CtprofMetricDef`], then matches groups
 //! across the two snapshots and emits one row per
 //! `(group, metric)` pair. Groups present on only one side
@@ -14,9 +15,11 @@
 //!
 //! No judgment labels. The comparison prints raw numbers and
 //! percent delta; interpretation (regression vs improvement) is
-//! scheduler-specific and left to the user. This mirrors the
-//! no-label principle for the broader stats comparison pipeline
-//! (see the `stats.rs` module doc).
+//! scheduler-specific and left to the user. This deliberately
+//! diverges from the gauntlet stats comparison in `crate::stats`,
+//! which DOES classify each metric (`Finding::is_regression`,
+//! `CompareReport::{regressions, improvements, unchanged}`):
+//! ctprof_compare emits no verdict.
 
 mod pattern;
 pub use pattern::{pattern_display_label, pattern_key};

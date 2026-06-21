@@ -947,7 +947,7 @@ impl Timeline {
     /// Rate fields (`fallback_rate`, `keep_last_rate`) are computed
     /// by dividing the bucket's reduced counter delta by the
     /// bucket's window duration in seconds
-    /// (`end_ms - start_ms / 1000.0`). When the window has zero
+    /// (`(end_ms - start_ms) / 1000.0`). When the window has zero
     /// duration (degenerate bucket) the rate stays `None`.
     ///
     /// Every PhaseMetrics field has a PhaseBucket source — but
