@@ -334,7 +334,10 @@ fn scenario_stats_run_metric_resolves_ext_family_sentinel_free() {
         ..Default::default()
     };
     assert_eq!(stats.run_metric("worst_run_delay_us"), Some(48.0));
-    assert_eq!(stats.run_metric("worst_iterations_per_cpu_sec"), Some(12345.0));
+    assert_eq!(
+        stats.run_metric("worst_iterations_per_cpu_sec"),
+        Some(12345.0)
+    );
     // Sentinel-free: real measured zero is Some(0.0), distinct from absent.
     assert_eq!(stats.run_metric("worst_wake_latency_cv"), Some(0.0));
     assert_eq!(stats.run_metric("my_custom_metric"), Some(7.0));
@@ -3538,7 +3541,11 @@ fn phase_cgroup_stats_components_repool_to_cgroup_stats() {
     // Run delays stored RAW ns; the re-pool divides by 1000 ONCE to match
     // cgroup_stats's µs mean/worst (pre-dividing here would be a 1000x error).
     assert_eq!(pcs.run_delays_ns, vec![3000u64, 5000]);
-    let rd_us: Vec<f64> = pcs.run_delays_ns.iter().map(|&v| v as f64 / 1000.0).collect();
+    let rd_us: Vec<f64> = pcs
+        .run_delays_ns
+        .iter()
+        .map(|&v| v as f64 / 1000.0)
+        .collect();
     let mean_rd = rd_us.iter().sum::<f64>() / rd_us.len() as f64;
     let worst_rd = rd_us.iter().cloned().reduce(f64::max).unwrap();
     assert!((mean_rd - cg.mean_run_delay_us).abs() < 1e-9);
@@ -3583,7 +3590,10 @@ fn phase_cgroup_stats_components_repool_to_cgroup_stats() {
     );
 
     // Worst gap stays coupled to its CPU (argmax of the pair, not two maxes).
-    assert_eq!((pcs.max_gap_ms, pcs.max_gap_cpu), (cg.max_gap_ms, cg.max_gap_cpu));
+    assert_eq!(
+        (pcs.max_gap_ms, pcs.max_gap_cpu),
+        (cg.max_gap_ms, cg.max_gap_cpu)
+    );
     assert_eq!((pcs.max_gap_ms, pcs.max_gap_cpu), (60, 2));
 }
 
@@ -3620,7 +3630,11 @@ fn phase_cgroup_stats_off_cpu_pcts_measured_zero_is_present() {
         "measured zero is a PRESENT 0.0 sample, distinct from the empty not-measured vec",
     );
     let cg = cgroup_stats(&reports);
-    assert_eq!(cg.avg_off_cpu_pct, Some(0.0), "mirrors cgroup_stats Some(0.0), not None");
+    assert_eq!(
+        cg.avg_off_cpu_pct,
+        Some(0.0),
+        "mirrors cgroup_stats Some(0.0), not None"
+    );
 }
 
 /// Boundary (MIXED): a cgroup with SOME workers wall_time_ns==0 and others
@@ -3631,17 +3645,30 @@ fn phase_cgroup_stats_off_cpu_pcts_measured_zero_is_present() {
 #[test]
 fn phase_cgroup_stats_off_cpu_pcts_mixed_filters_zero_wall_workers() {
     let reports = vec![
-        rpt(1, 1000, 0, 0, &[0], 0),               // wall 0 -> excluded from off_cpu_pcts
+        rpt(1, 1000, 0, 0, &[0], 0), // wall 0 -> excluded from off_cpu_pcts
         rpt(2, 1000, 1_000_000, 200_000, &[1], 0), // wall>0 -> off-CPU% 20.0
     ];
     let pcs = phase_cgroup_stats(&reports, None);
-    assert_eq!(pcs.off_cpu_pcts, vec![20.0], "only the wall>0 worker contributes a sample");
-    assert_eq!(pcs.num_workers, 2, "the zero-wall worker still counts toward num_workers");
+    assert_eq!(
+        pcs.off_cpu_pcts,
+        vec![20.0],
+        "only the wall>0 worker contributes a sample"
+    );
+    assert_eq!(
+        pcs.num_workers, 2,
+        "the zero-wall worker still counts toward num_workers"
+    );
     // Re-pool matches cgroup_stats over the same mixed reports.
     let cg = cgroup_stats(&reports);
     let avg = pcs.off_cpu_pcts.iter().sum::<f64>() / pcs.off_cpu_pcts.len() as f64;
-    assert!((avg - cg.avg_off_cpu_pct.unwrap()).abs() < 1e-9, "avg re-pools to cgroup_stats");
-    assert!((20.0 - cg.max_off_cpu_pct.unwrap()).abs() < 1e-9, "max matches the lone sample");
+    assert!(
+        (avg - cg.avg_off_cpu_pct.unwrap()).abs() < 1e-9,
+        "avg re-pools to cgroup_stats"
+    );
+    assert!(
+        (20.0 - cg.max_off_cpu_pct.unwrap()).abs() < 1e-9,
+        "max matches the lone sample"
+    );
 }
 
 /// Boundary: without an expected-node set `numa_pages_local` is 0 (mirrors
@@ -3658,7 +3685,10 @@ fn phase_cgroup_stats_numa_local_zero_without_expected_nodes() {
         pcs.numa_pages_local, 0,
         "no node set -> 0 numerator (page_locality re-pools to 0.0)",
     );
-    assert_eq!(pcs.numa_pages_total, 140, "total still computed without node context");
+    assert_eq!(
+        pcs.numa_pages_total, 140,
+        "total still computed without node context"
+    );
 }
 
 /// Boundary: the partition counts ONLY pages on the expected nodes, exactly as
@@ -3689,8 +3719,14 @@ fn phase_cgroup_stats_numa_local_partitions_on_expected_nodes() {
 #[test]
 fn phase_cgroup_stats_cross_node_migrated_is_max_not_sum() {
     let reports = vec![
-        WorkerReport { vmstat_numa_pages_migrated: 30, ..rpt(1, 1, 1000, 0, &[0], 0) },
-        WorkerReport { vmstat_numa_pages_migrated: 20, ..rpt(2, 1, 1000, 0, &[1], 0) },
+        WorkerReport {
+            vmstat_numa_pages_migrated: 30,
+            ..rpt(1, 1, 1000, 0, &[0], 0)
+        },
+        WorkerReport {
+            vmstat_numa_pages_migrated: 20,
+            ..rpt(2, 1, 1000, 0, &[1], 0)
+        },
     ];
     let pcs = phase_cgroup_stats(&reports, None);
     assert_eq!(pcs.cross_node_migrated, 30, "MAX (30), not SUM (50)");
@@ -3701,9 +3737,21 @@ fn phase_cgroup_stats_cross_node_migrated_is_max_not_sum() {
 #[test]
 fn phase_cgroup_stats_gap_argmax_couples_ms_and_cpu() {
     let reports = vec![
-        WorkerReport { max_gap_ms: 40, max_gap_cpu: 7, ..rpt(1, 1, 1000, 0, &[0], 0) },
-        WorkerReport { max_gap_ms: 90, max_gap_cpu: 3, ..rpt(2, 1, 1000, 0, &[1], 0) },
-        WorkerReport { max_gap_ms: 10, max_gap_cpu: 5, ..rpt(3, 1, 1000, 0, &[2], 0) },
+        WorkerReport {
+            max_gap_ms: 40,
+            max_gap_cpu: 7,
+            ..rpt(1, 1, 1000, 0, &[0], 0)
+        },
+        WorkerReport {
+            max_gap_ms: 90,
+            max_gap_cpu: 3,
+            ..rpt(2, 1, 1000, 0, &[1], 0)
+        },
+        WorkerReport {
+            max_gap_ms: 10,
+            max_gap_cpu: 5,
+            ..rpt(3, 1, 1000, 0, &[2], 0)
+        },
     ];
     let pcs = phase_cgroup_stats(&reports, None);
     assert_eq!(
@@ -3724,17 +3772,26 @@ fn phase_cgroup_stats_gap_argmax_couples_ms_and_cpu() {
 fn phase_cgroup_stats_num_workers_sums_across_same_name_carriers() {
     // Two handles for one cgroup: 4 workers (100 iters each) + 2 (200 each).
     let reports1: Vec<WorkerReport> = (0..4)
-        .map(|i| WorkerReport { iterations: 100, ..rpt(i, 1, 1000, 0, &[i as usize], 0) })
+        .map(|i| WorkerReport {
+            iterations: 100,
+            ..rpt(i, 1, 1000, 0, &[i as usize], 0)
+        })
         .collect();
     let reports2: Vec<WorkerReport> = (4..6)
-        .map(|i| WorkerReport { iterations: 200, ..rpt(i, 1, 1000, 0, &[i as usize], 0) })
+        .map(|i| WorkerReport {
+            iterations: 200,
+            ..rpt(i, 1, 1000, 0, &[i as usize], 0)
+        })
         .collect();
     let pcs1 = phase_cgroup_stats(&reports1, None);
     let pcs2 = phase_cgroup_stats(&reports2, None);
     assert_eq!(pcs1.num_workers, 4);
     assert_eq!(pcs2.num_workers, 2);
     let merged = PhaseCgroupStats::merge(pcs1, pcs2);
-    assert_eq!(merged.num_workers, 6, "disjoint worker subsets SUM, not MAX(4,2)=4");
+    assert_eq!(
+        merged.num_workers, 6,
+        "disjoint worker subsets SUM, not MAX(4,2)=4"
+    );
     assert_eq!(merged.total_iterations, 4 * 100 + 2 * 200);
 
     // The merged components re-pool to the cgroup_stats reduction over the
@@ -3746,7 +3803,9 @@ fn phase_cgroup_stats_num_workers_sums_across_same_name_carriers() {
     assert_eq!(merged.num_workers, cg.num_workers);
     assert_eq!(merged.total_iterations, cg.total_iterations);
     let repooled = merged.total_iterations as f64 / merged.num_workers as f64;
-    let cg_ipw = cg.iterations_per_worker().expect("pooled cgroup has workers");
+    let cg_ipw = cg
+        .iterations_per_worker()
+        .expect("pooled cgroup has workers");
     assert!(
         (repooled - cg_ipw).abs() < 1e-9,
         "re-pooled iterations_per_worker {repooled} must match cgroup_stats {cg_ipw} \
@@ -3809,7 +3868,10 @@ fn phase_cgroup_stats_caps_pooled_wake_latencies() {
     // flake) to catch a constant/degenerate fill.
     let min = *pcs.wake_latencies_ns.iter().min().unwrap();
     let max = *pcs.wake_latencies_ns.iter().max().unwrap();
-    assert!(max < 120_000, "every sample drawn from the 0..120_000 population");
+    assert!(
+        max < 120_000,
+        "every sample drawn from the 0..120_000 population"
+    );
     assert!(
         max - min > 90_000,
         "reservoir spans the population (guaranteed range ≥ 99999), not a constant fill",
@@ -3851,7 +3913,11 @@ fn phase_cgroup_stats_merge_caps_pooled_wake_latencies() {
     // unbiased ~50/50 draw, so the mean lands at the midpoint (the
     // population-weighting only diverges from 50/50 when the carriers' true
     // populations differ — see weighted_merge_reservoirs and its tests).
-    let mean = merged.wake_latencies_ns.iter().map(|&v| v as f64).sum::<f64>()
+    let mean = merged
+        .wake_latencies_ns
+        .iter()
+        .map(|&v| v as f64)
+        .sum::<f64>()
         / merged.wake_latencies_ns.len() as f64;
     assert!(
         (mean - 99_999.5).abs() < 3000.0,
@@ -3859,7 +3925,11 @@ fn phase_cgroup_stats_merge_caps_pooled_wake_latencies() {
     );
     // A merge whose concat is ≤ cap passes through unchanged (no re-sample).
     let small = PhaseCgroupStats::merge(carrier(0, 10), carrier(100, 120));
-    assert_eq!(small.wake_latencies_ns.len(), 30, "≤cap concat not re-sampled");
+    assert_eq!(
+        small.wake_latencies_ns.len(),
+        30,
+        "≤cap concat not re-sampled"
+    );
 }
 
 /// The >cap merge weights by true POPULATION (`wake_sample_total`), not reservoir
@@ -3908,7 +3978,10 @@ fn weighted_merge_reservoirs_equal_population_is_symmetric() {
     let b: Vec<u64> = (0..CAP as u64).map(|i| 10_000_000 + i).collect();
     let merged = PhaseCgroupStats::weighted_merge_reservoirs(&a, 500_000, &b, 500_000, CAP);
     let from_a = merged.iter().filter(|&&v| v < 10_000_000).count() as f64 / CAP as f64;
-    assert!((from_a - 0.5).abs() < 0.03, "equal populations -> ~50/50, got {from_a}");
+    assert!(
+        (from_a - 0.5).abs() < 0.03,
+        "equal populations -> ~50/50, got {from_a}"
+    );
 }
 
 /// Strongly asymmetric weights (≈167:1) drive the merge almost entirely to the
@@ -3923,7 +3996,10 @@ fn weighted_merge_reservoirs_asymmetric_weights_favor_larger_population() {
     let merged = PhaseCgroupStats::weighted_merge_reservoirs(&a, 60_000, &b, 10_000_000, CAP);
     let from_a = merged.iter().filter(|&&v| v < 10_000_000).count() as f64 / CAP as f64;
     // w_a/(w_a+w_b) = 60_000 / 10_060_000 ≈ 0.006.
-    assert!(from_a < 0.02, "tiny-population A nearly excluded, got A-fraction {from_a}");
+    assert!(
+        from_a < 0.02,
+        "tiny-population A nearly excluded, got A-fraction {from_a}"
+    );
 }
 
 /// Integration through `PhaseCgroupStats::merge`: two >cap carriers (each at the
@@ -3941,8 +4017,12 @@ fn phase_cgroup_stats_merge_above_cap_is_population_weighted() {
     let merged = PhaseCgroupStats::merge(carrier(0, 1_000_000), carrier(10_000_000, 100_000));
     assert_eq!(merged.wake_latencies_ns.len(), CAP, "re-capped to cap");
     assert_eq!(merged.wake_sample_total, 1_100_000, "true populations SUM");
-    let from_a =
-        merged.wake_latencies_ns.iter().filter(|&&v| v < 10_000_000).count() as f64 / CAP as f64;
+    let from_a = merged
+        .wake_latencies_ns
+        .iter()
+        .filter(|&&v| v < 10_000_000)
+        .count() as f64
+        / CAP as f64;
     assert!(
         (from_a - 0.909).abs() < 0.03,
         "merge weights >cap pools by population (A-fraction {from_a} ~ 1M/1.1M), \
@@ -3970,12 +4050,26 @@ fn weighted_merge_reservoirs_sequential_three_way_preserves_proportions() {
     let ab = PhaseCgroupStats::merge(carrier(0, 600_000), carrier(10_000_000, 300_000));
     let abc = PhaseCgroupStats::merge(ab, carrier(20_000_000, 100_000));
     assert_eq!(abc.wake_latencies_ns.len(), CAP);
-    assert_eq!(abc.wake_sample_total, 1_000_000, "true populations SUM across all three");
+    assert_eq!(
+        abc.wake_sample_total, 1_000_000,
+        "true populations SUM across all three"
+    );
     let frac = |lo: u64, hi: u64| {
-        abc.wake_latencies_ns.iter().filter(|&&v| v >= lo && v < hi).count() as f64 / CAP as f64
+        abc.wake_latencies_ns
+            .iter()
+            .filter(|&&v| v >= lo && v < hi)
+            .count() as f64
+            / CAP as f64
     };
-    let (a, b, c) = (frac(0, 10_000_000), frac(10_000_000, 20_000_000), frac(20_000_000, 30_000_000));
-    assert!((a - 0.6).abs() < 0.04, "A-fraction {a} ~ 600k/1M = 0.6 (not length-weighted 0.33)");
+    let (a, b, c) = (
+        frac(0, 10_000_000),
+        frac(10_000_000, 20_000_000),
+        frac(20_000_000, 30_000_000),
+    );
+    assert!(
+        (a - 0.6).abs() < 0.04,
+        "A-fraction {a} ~ 600k/1M = 0.6 (not length-weighted 0.33)"
+    );
     assert!((b - 0.3).abs() < 0.04, "B-fraction {b} ~ 300k/1M = 0.3");
     assert!((c - 0.1).abs() < 0.04, "C-fraction {c} ~ 100k/1M = 0.1");
 }
@@ -4013,7 +4107,11 @@ fn strip_phase_cgroup_samples_drops_only_sample_vecs_preserving_verdict() {
         per_cgroup: pc,
     }];
     let dropped = r.strip_phase_cgroup_samples();
-    assert_eq!(dropped, 3 + 2 + 1, "wake(3) + run(2) + off(1) samples dropped");
+    assert_eq!(
+        dropped,
+        3 + 2 + 1,
+        "wake(3) + run(2) + off(1) samples dropped"
+    );
     let cg = &r.stats.phases[0].per_cgroup["cg"];
     assert!(cg.wake_latencies_ns.is_empty(), "wake samples dropped");
     assert!(cg.run_delays_ns.is_empty(), "run-delay samples dropped");
@@ -4035,12 +4133,19 @@ fn strip_phase_cgroup_samples_marks_stripped_only_on_carriers_with_samples() {
     let mut pc = BTreeMap::new();
     pc.insert(
         "has_samples".to_string(),
-        PhaseCgroupStats { wake_latencies_ns: vec![1, 2], total_iterations: 10, ..Default::default() },
+        PhaseCgroupStats {
+            wake_latencies_ns: vec![1, 2],
+            total_iterations: 10,
+            ..Default::default()
+        },
     );
     pc.insert(
         "empty".to_string(),
         // No sample vectors — genuinely measured nothing.
-        PhaseCgroupStats { total_iterations: 5, ..Default::default() },
+        PhaseCgroupStats {
+            total_iterations: 5,
+            ..Default::default()
+        },
     );
     let mut r = crate::assert::AssertResult::pass();
     r.stats.phases = vec![PhaseBucket {
@@ -4068,8 +4173,14 @@ fn strip_phase_cgroup_samples_marks_stripped_only_on_carriers_with_samples() {
 /// a fresh one (in any order).
 #[test]
 fn phase_cgroup_stats_merge_ors_stripped() {
-    let stripped = PhaseCgroupStats { stripped: true, ..Default::default() };
-    let fresh = PhaseCgroupStats { stripped: false, ..Default::default() };
+    let stripped = PhaseCgroupStats {
+        stripped: true,
+        ..Default::default()
+    };
+    let fresh = PhaseCgroupStats {
+        stripped: false,
+        ..Default::default()
+    };
     assert!(
         PhaseCgroupStats::merge(stripped.clone(), fresh.clone()).stripped,
         "stripped | fresh = stripped",
@@ -4090,8 +4201,16 @@ fn phase_cgroup_stats_merge_ors_stripped() {
 /// cross-carrier merge consistent with a single cgroup_stats over pooled reports.
 #[test]
 fn phase_cgroup_stats_merge_gap_tie_breaks_to_b() {
-    let a = PhaseCgroupStats { max_gap_ms: 5, max_gap_cpu: 3, ..Default::default() };
-    let b = PhaseCgroupStats { max_gap_ms: 5, max_gap_cpu: 7, ..Default::default() };
+    let a = PhaseCgroupStats {
+        max_gap_ms: 5,
+        max_gap_cpu: 3,
+        ..Default::default()
+    };
+    let b = PhaseCgroupStats {
+        max_gap_ms: 5,
+        max_gap_cpu: 7,
+        ..Default::default()
+    };
     let merged = PhaseCgroupStats::merge(a, b);
     assert_eq!(
         (merged.max_gap_ms, merged.max_gap_cpu),
@@ -4106,8 +4225,16 @@ fn phase_cgroup_stats_merge_gap_tie_breaks_to_b() {
 /// coupled to the pooled-report order (a reordered fold would desync the CPU).
 #[test]
 fn phase_cgroup_stats_merge_gap_tie_matches_pooled_cgroup_stats() {
-    let r1 = vec![WorkerReport { max_gap_ms: 8, max_gap_cpu: 1, ..rpt(1, 1, 1000, 0, &[1], 0) }];
-    let r2 = vec![WorkerReport { max_gap_ms: 8, max_gap_cpu: 9, ..rpt(2, 1, 1000, 0, &[9], 0) }];
+    let r1 = vec![WorkerReport {
+        max_gap_ms: 8,
+        max_gap_cpu: 1,
+        ..rpt(1, 1, 1000, 0, &[1], 0)
+    }];
+    let r2 = vec![WorkerReport {
+        max_gap_ms: 8,
+        max_gap_cpu: 9,
+        ..rpt(2, 1, 1000, 0, &[9], 0)
+    }];
     let merged =
         PhaseCgroupStats::merge(phase_cgroup_stats(&r1, None), phase_cgroup_stats(&r2, None));
     // cgroup_stats over the concatenation (r1 ++ r2, fold order): max_by_key
@@ -4136,9 +4263,19 @@ fn step_per_cgroup_bucket_keys_by_name_with_sentinel_window() {
     let nodes: BTreeSet<usize> = [0].into_iter().collect();
     let b = step_per_cgroup_bucket("cg_step", &reports, Some(&nodes), 3);
     assert_eq!(b.step_index, 3);
-    assert_eq!(b.label, "Step[2]", "Phase Display: 1-indexed step_index 3 -> Step[2]");
-    assert_eq!(b.start_ms, u64::MAX, "merge-neutral: min() against host start is a no-op");
-    assert_eq!(b.end_ms, 0, "merge-neutral: max() against host end is a no-op");
+    assert_eq!(
+        b.label, "Step[2]",
+        "Phase Display: 1-indexed step_index 3 -> Step[2]"
+    );
+    assert_eq!(
+        b.start_ms,
+        u64::MAX,
+        "merge-neutral: min() against host start is a no-op"
+    );
+    assert_eq!(
+        b.end_ms, 0,
+        "merge-neutral: max() against host end is a no-op"
+    );
     assert_eq!(b.sample_count, 0);
     assert!(b.metrics.is_empty(), "carrier contributes only per_cgroup");
     assert_eq!(b.per_cgroup.len(), 1);
@@ -4154,7 +4291,10 @@ fn step_per_cgroup_bucket_baseline_label() {
     let b = step_per_cgroup_bucket("cg", &[], None, 0);
     assert_eq!(b.label, "BASELINE");
     assert_eq!(b.step_index, 0);
-    assert_eq!(b.per_cgroup["cg"].num_workers, 0, "empty reports -> zero-component carrier");
+    assert_eq!(
+        b.per_cgroup["cg"].num_workers, 0,
+        "empty reports -> zero-component carrier"
+    );
 }
 
 /// The fold unions a guest carrier's per_cgroup into the host bucket of the
@@ -4182,7 +4322,13 @@ fn fold_unions_guest_per_cgroup_into_matching_host_bucket() {
         per_cgroup: BTreeMap::new(),
     };
     let mut g_pc = BTreeMap::new();
-    g_pc.insert("cgA".to_string(), PhaseCgroupStats { total_iterations: 42, ..Default::default() });
+    g_pc.insert(
+        "cgA".to_string(),
+        PhaseCgroupStats {
+            total_iterations: 42,
+            ..Default::default()
+        },
+    );
     let guest = PhaseBucket {
         step_index: 1,
         label: "Step[0]".to_string(),
@@ -4195,7 +4341,10 @@ fn fold_unions_guest_per_cgroup_into_matching_host_bucket() {
     let out = fold_guest_per_cgroup_into_host_buckets(vec![host], vec![guest]);
     assert_eq!(out.len(), 1);
     assert_eq!(out[0].step_index, 1);
-    assert_eq!(out[0].start_ms, 100, "host window start preserved (min vs MAX)");
+    assert_eq!(
+        out[0].start_ms, 100,
+        "host window start preserved (min vs MAX)"
+    );
     assert_eq!(out[0].end_ms, 200, "host window end preserved (max vs 0)");
     assert_eq!(out[0].sample_count, 3, "host sample_count preserved (+0)");
     assert_eq!(
@@ -4208,7 +4357,10 @@ fn fold_unions_guest_per_cgroup_into_matching_host_bucket() {
         Some(50.0),
         "host Rate re-derived from its carried components (1000/20), not dropped",
     );
-    assert_eq!(out[0].per_cgroup["cgA"].total_iterations, 42, "guest per_cgroup unioned in");
+    assert_eq!(
+        out[0].per_cgroup["cgA"].total_iterations, 42,
+        "guest per_cgroup unioned in"
+    );
 }
 
 /// Negative direction of the Rate-survival contract: a host bucket carrying a
@@ -4236,7 +4388,13 @@ fn fold_drops_host_rate_lacking_its_components() {
         per_cgroup: BTreeMap::new(),
     };
     let mut g_pc = BTreeMap::new();
-    g_pc.insert("cg".to_string(), PhaseCgroupStats { total_iterations: 1, ..Default::default() });
+    g_pc.insert(
+        "cg".to_string(),
+        PhaseCgroupStats {
+            total_iterations: 1,
+            ..Default::default()
+        },
+    );
     let guest = PhaseBucket {
         step_index: 1,
         label: "Step[0]".to_string(),
@@ -4277,7 +4435,13 @@ fn fold_carries_orphan_guest_step_index_with_normalized_window() {
         per_cgroup: BTreeMap::new(),
     };
     let mut g_pc = BTreeMap::new();
-    g_pc.insert("cgB".to_string(), PhaseCgroupStats { total_migrations: 7, ..Default::default() });
+    g_pc.insert(
+        "cgB".to_string(),
+        PhaseCgroupStats {
+            total_migrations: 7,
+            ..Default::default()
+        },
+    );
     let guest = PhaseBucket {
         step_index: 5,
         label: "Step[4]".to_string(),
@@ -4292,10 +4456,16 @@ fn fold_carries_orphan_guest_step_index_with_normalized_window() {
     assert_eq!(out[0].step_index, 1, "sorted by step_index");
     assert_eq!(out[1].step_index, 5);
     let orphan = &out[1];
-    assert_eq!(orphan.start_ms, 0, "orphan window normalized (no underflow)");
+    assert_eq!(
+        orphan.start_ms, 0,
+        "orphan window normalized (no underflow)"
+    );
     assert_eq!(orphan.end_ms, 0, "orphan window normalized");
     assert_eq!(orphan.label, "Step[4]", "orphan carrier label preserved");
-    assert_eq!(orphan.per_cgroup["cgB"].total_migrations, 7, "orphan per_cgroup not dropped");
+    assert_eq!(
+        orphan.per_cgroup["cgB"].total_migrations, 7,
+        "orphan per_cgroup not dropped"
+    );
 
     // Saturation boundary: a >65k-step scenario collapses step_index to u16::MAX
     // (the step loop + build_stimulus both saturate). An orphan there is carried
@@ -4304,7 +4474,10 @@ fn fold_carries_orphan_guest_step_index_with_normalized_window() {
     let mut sat_pc = BTreeMap::new();
     sat_pc.insert(
         "cgSat".to_string(),
-        PhaseCgroupStats { total_iterations: 3, ..Default::default() },
+        PhaseCgroupStats {
+            total_iterations: 3,
+            ..Default::default()
+        },
     );
     let sat_guest = PhaseBucket {
         step_index: u16::MAX,
@@ -4363,8 +4536,20 @@ fn fold_empty_guest_passes_host_through_unchanged() {
 #[test]
 fn fold_multiple_cgroups_in_one_step_all_carried() {
     let mut g_pc = BTreeMap::new();
-    g_pc.insert("cgX".to_string(), PhaseCgroupStats { total_iterations: 10, ..Default::default() });
-    g_pc.insert("cgY".to_string(), PhaseCgroupStats { total_iterations: 20, ..Default::default() });
+    g_pc.insert(
+        "cgX".to_string(),
+        PhaseCgroupStats {
+            total_iterations: 10,
+            ..Default::default()
+        },
+    );
+    g_pc.insert(
+        "cgY".to_string(),
+        PhaseCgroupStats {
+            total_iterations: 20,
+            ..Default::default()
+        },
+    );
     let guest = PhaseBucket {
         step_index: 2,
         label: "Step[1]".to_string(),
@@ -4399,7 +4584,10 @@ fn fold_duplicate_guest_step_index_merges_sequentially() {
         let mut pc = BTreeMap::new();
         pc.insert(
             "cgZ".to_string(),
-            PhaseCgroupStats { total_iterations: iters, ..Default::default() },
+            PhaseCgroupStats {
+                total_iterations: iters,
+                ..Default::default()
+            },
         );
         PhaseBucket {
             step_index: 3,
@@ -4414,15 +4602,18 @@ fn fold_duplicate_guest_step_index_merges_sequentially() {
     let out = fold_guest_per_cgroup_into_host_buckets(vec![], vec![make(5), make(8)]);
     assert_eq!(out.len(), 1);
     assert_eq!(
-        out[0].per_cgroup["cgZ"].total_iterations,
-        13,
+        out[0].per_cgroup["cgZ"].total_iterations, 13,
         "5 + 8 summed (Counter): neither carrier dropped or double-counted",
     );
     // The orphan window stays normalized (0,0) through the re-merge: the first
     // carrier hits the orphan arm and is normalized to (0,0) BEFORE the second
     // carrier merges via min(0, MAX)=0 / max(0, 0)=0 — so the MAX sentinel never
     // reaches a duration consumer.
-    assert_eq!((out[0].start_ms, out[0].end_ms), (0, 0), "orphan window normalized");
+    assert_eq!(
+        (out[0].start_ms, out[0].end_ms),
+        (0, 0),
+        "orphan window normalized"
+    );
 }
 
 /// Defensive boundary: a guest carrier MUST carry the merge-neutral
@@ -4447,7 +4638,13 @@ fn fold_panics_on_non_sentinel_guest_window() {
         per_cgroup: BTreeMap::new(),
     };
     let mut g_pc = BTreeMap::new();
-    g_pc.insert("cg".to_string(), PhaseCgroupStats { total_iterations: 1, ..Default::default() });
+    g_pc.insert(
+        "cg".to_string(),
+        PhaseCgroupStats {
+            total_iterations: 1,
+            ..Default::default()
+        },
+    );
     // A guest carrier with a REAL window (not the (u64::MAX, 0) sentinel) — the
     // step_per_cgroup_bucket invariant violated.
     let bad = PhaseBucket {
@@ -4847,7 +5044,10 @@ fn phase_cgroup_run_delay_mean_within_ulp_of_cgroup_stats() {
     let carrier = phase_cgroup_stats(&reports, None);
     let (mean, _worst) = carrier.run_delay_summary().expect("run-delay measured");
     let delta = (mean - cg.mean_run_delay_us).abs();
-    assert!(delta < 1e-9, "mean within 1e-9 of cgroup_stats; delta={delta:e}");
+    assert!(
+        delta < 1e-9,
+        "mean within 1e-9 of cgroup_stats; delta={delta:e}"
+    );
     assert!(
         delta > 0.0,
         "inputs must actually DIVERGE so the 1e-9 tolerance is load-bearing, not dead; delta={delta:e}",
@@ -5011,7 +5211,8 @@ fn repool_distribution_name_in_carriers_skips_cgroup_even_with_empty_sibling_pha
         step_index: 2,
         ..PhaseBucket::default()
     };
-    b1.per_cgroup.insert("a".to_string(), PhaseCgroupStats::default());
+    b1.per_cgroup
+        .insert("a".to_string(), PhaseCgroupStats::default());
     // A stats.cgroups "a" entry with a bogus high p99 that must NOT leak in
     // ("a" is in wake_carriers via phase[0], so this entry is skipped).
     let cgroups = vec![CgroupStats {
@@ -5057,10 +5258,7 @@ fn repool_distribution_falls_back_to_cgroup_reductions_when_stripped() {
     // Phase carrier with EMPTY sample vecs (the stripped state). Named "a"
     // but empty, so "a" is NOT in *_carriers — both cgroups fall to the
     // carrier-less fallback fold regardless of name.
-    let mut stats = repool_stats(
-        vec![("a", PhaseCgroupStats::default())],
-        vec![cg0, cg1],
-    );
+    let mut stats = repool_stats(vec![("a", PhaseCgroupStats::default())], vec![cg0, cg1]);
     populate_run_distribution_metrics(&mut stats);
     assert_eq!(
         stats.ext_metrics.get("worst_p99_wake_latency_us").copied(),
@@ -5217,7 +5415,11 @@ fn repool_distribution_folds_carrierless_backdrop_not_dropped() {
     );
     // The carrier-bearing cgroup "a" is POOLED (its samples), NOT reduction-
     // folded: its bogus typed p99=9999 must not appear.
-    assert_ne!(p99, Some(9999.0), "carrier-bearing cgroup must be pooled, not reduction-folded");
+    assert_ne!(
+        p99,
+        Some(9999.0),
+        "carrier-bearing cgroup must be pooled, not reduction-folded"
+    );
 }
 
 /// Per-SOURCE carrier independence: the run-delay carrier set is consulted
@@ -5383,7 +5585,10 @@ fn repool_wake_weights_phases_by_true_population_not_reservoir_length() {
     };
     populate_run_distribution_metrics(&mut stats);
 
-    let median = stats.ext_metrics.get("worst_median_wake_latency_us").copied();
+    let median = stats
+        .ext_metrics
+        .get("worst_median_wake_latency_us")
+        .copied();
     assert_eq!(
         median,
         Some(100.0),
@@ -5437,7 +5642,10 @@ fn repool_wake_under_cap_is_byte_identical_to_unweighted_union() {
         "≤cap (unit-weight) p99 must equal the unweighted union percentile",
     );
     assert_eq!(
-        stats.ext_metrics.get("worst_median_wake_latency_us").copied(),
+        stats
+            .ext_metrics
+            .get("worst_median_wake_latency_us")
+            .copied(),
         Some(percentile(&union, 0.5) as f64 / 1000.0),
         "≤cap (unit-weight) median must equal the unweighted union percentile",
     );
@@ -5480,7 +5688,11 @@ fn repool_wake_cv_is_population_weighted_at_over_cap() {
     };
     populate_run_distribution_metrics(&mut stats);
 
-    let cv = stats.ext_metrics.get("worst_wake_latency_cv").copied().unwrap();
+    let cv = stats
+        .ext_metrics
+        .get("worst_wake_latency_cv")
+        .copied()
+        .unwrap();
     assert!(
         (cv - 0.346_410_161_513_775_46).abs() < 1e-9,
         "population-weighted CV = √75e6/25000 = 0.346410, got {cv}",
@@ -5532,8 +5744,15 @@ fn repool_wake_merge_and_pool_layers_compose() {
         ..PhaseCgroupStats::default()
     };
     let phase1 = PhaseCgroupStats::merge(sub(), sub());
-    assert_eq!(phase1.wake_latencies_ns.len(), CAP, "merge re-caps to MAX_WAKE_SAMPLES");
-    assert_eq!(phase1.wake_sample_total, 120_000, "merge SUMs true population");
+    assert_eq!(
+        phase1.wake_latencies_ns.len(),
+        CAP,
+        "merge re-caps to MAX_WAKE_SAMPLES"
+    );
+    assert_eq!(
+        phase1.wake_sample_total, 120_000,
+        "merge SUMs true population"
+    );
 
     let mut b0 = PhaseBucket {
         step_index: 0,
@@ -5551,7 +5770,10 @@ fn repool_wake_merge_and_pool_layers_compose() {
     };
     populate_run_distribution_metrics(&mut stats);
 
-    let median = stats.ext_metrics.get("worst_median_wake_latency_us").copied();
+    let median = stats
+        .ext_metrics
+        .get("worst_median_wake_latency_us")
+        .copied();
     assert_eq!(
         median,
         Some(30.0),

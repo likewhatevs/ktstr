@@ -357,7 +357,10 @@ enum TestResultWire {
 /// is lost. The verdict, outcomes, and all scalar/counter telemetry are
 /// PRESERVED (never a PASS→FAIL flip). The truncated FAIL is reached only if the
 /// sample-free verdict ALONE overruns.
-fn classify_test_result(result: &crate::assert::AssertResult, max: usize) -> Option<TestResultWire> {
+fn classify_test_result(
+    result: &crate::assert::AssertResult,
+    max: usize,
+) -> Option<TestResultWire> {
     let bytes = postcard::to_stdvec(result).ok()?;
     if bytes.len() <= max {
         return Some(TestResultWire::Raw(bytes));
@@ -378,11 +381,16 @@ fn classify_test_result(result: &crate::assert::AssertResult, max: usize) -> Opt
         if let Ok(small) = postcard::to_stdvec(&stripped) {
             sample_free_size = Some(small.len());
             if small.len() <= max {
-                return Some(TestResultWire::Stripped { bytes: small, dropped });
+                return Some(TestResultWire::Stripped {
+                    bytes: small,
+                    dropped,
+                });
             }
         }
     }
-    Some(TestResultWire::Truncated { offending: sample_free_size.unwrap_or(bytes.len()) })
+    Some(TestResultWire::Truncated {
+        offending: sample_free_size.unwrap_or(bytes.len()),
+    })
 }
 
 pub fn send_test_result(result: &crate::assert::AssertResult) {
@@ -1802,7 +1810,9 @@ mod tests {
                 let decoded: AssertResult = postcard::from_bytes(&bytes).unwrap();
                 assert!(decoded.is_pass(), "verdict PRESERVED — no PASS->FAIL flip");
                 assert!(
-                    decoded.stats.phases[0].per_cgroup["cg"].wake_latencies_ns.is_empty(),
+                    decoded.stats.phases[0].per_cgroup["cg"]
+                        .wake_latencies_ns
+                        .is_empty(),
                     "only the samples were dropped",
                 );
             }

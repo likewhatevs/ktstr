@@ -1277,7 +1277,10 @@ fn assert_result_merge_keeps_per_cgroup_across_distinct_steps() {
         let mut pc = std::collections::BTreeMap::new();
         pc.insert(
             name.to_string(),
-            PhaseCgroupStats { total_iterations: iters, ..Default::default() },
+            PhaseCgroupStats {
+                total_iterations: iters,
+                ..Default::default()
+            },
         );
         PhaseBucket {
             step_index: idx,
@@ -1294,11 +1297,31 @@ fn assert_result_merge_keeps_per_cgroup_across_distinct_steps() {
     let mut b = AssertResult::pass();
     b.stats.phases = vec![bucket(2, "cgB", 22)];
     a.merge(b);
-    assert_eq!(a.stats.phases.len(), 2, "both distinct-step buckets survive");
-    let s1 = a.stats.phases.iter().find(|p| p.step_index == 1).expect("step 1 survives");
-    let s2 = a.stats.phases.iter().find(|p| p.step_index == 2).expect("step 2 survives");
-    assert_eq!(s1.per_cgroup["cgA"].total_iterations, 11, "step 1 per_cgroup carried");
-    assert_eq!(s2.per_cgroup["cgB"].total_iterations, 22, "step 2 per_cgroup carried");
+    assert_eq!(
+        a.stats.phases.len(),
+        2,
+        "both distinct-step buckets survive"
+    );
+    let s1 = a
+        .stats
+        .phases
+        .iter()
+        .find(|p| p.step_index == 1)
+        .expect("step 1 survives");
+    let s2 = a
+        .stats
+        .phases
+        .iter()
+        .find(|p| p.step_index == 2)
+        .expect("step 2 survives");
+    assert_eq!(
+        s1.per_cgroup["cgA"].total_iterations, 11,
+        "step 1 per_cgroup carried"
+    );
+    assert_eq!(
+        s2.per_cgroup["cgB"].total_iterations, 22,
+        "step 2 per_cgroup carried"
+    );
 }
 
 #[test]

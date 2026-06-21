@@ -1578,12 +1578,19 @@ fn evaluate_folds_guest_per_cgroup_into_host_phase_buckets() {
     // its window/metrics survived the merge with the guest carrier. An orphan
     // (the bug this test guards against) would carry the guest carrier verbatim:
     // sample_count 0, a normalized (0,0) window, and no metrics.
-    assert_eq!(b.sample_count, 1, "host capture merged — matched arm, not an orphan");
+    assert_eq!(
+        b.sample_count, 1,
+        "host capture merged — matched arm, not an orphan"
+    );
     assert_ne!(
-        b.start_ms, u64::MAX,
+        b.start_ms,
+        u64::MAX,
         "host window survived (min vs the carrier's MAX sentinel)",
     );
-    assert_ne!(b.start_ms, 0, "real host window start, not the orphan's normalized 0");
+    assert_ne!(
+        b.start_ms, 0,
+        "real host window start, not the orphan's normalized 0"
+    );
     assert!(
         b.metrics.contains_key("iteration_rate"),
         "host metric (iteration_rate) survived the matched merge — a clobber by \

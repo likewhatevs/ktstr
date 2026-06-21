@@ -1764,8 +1764,9 @@ impl PhaseCgroupStats {
         // a non-zero, input-derived seed makes the merge deterministic. xorshift64
         // has 0 as a fixed point, hence the fallback.
         const GOLDEN: u64 = 0x9E37_79B9_7F4A_7C15;
-        let mut s = (w_a ^ w_b.rotate_left(32) ^ (a.len() as u64).rotate_left(16) ^ (b.len() as u64))
-            .wrapping_mul(GOLDEN);
+        let mut s =
+            (w_a ^ w_b.rotate_left(32) ^ (a.len() as u64).rotate_left(16) ^ (b.len() as u64))
+                .wrapping_mul(GOLDEN);
         if s == 0 {
             s = GOLDEN;
         }
@@ -2350,7 +2351,8 @@ pub(crate) fn fold_guest_per_cgroup_into_host_buckets(
     // fold same-step_index duplicates via merge rather than a last-wins collect so
     // a future producer that violated the invariant DEGRADES to a merge, never a
     // silent release-mode drop. The debug_assert still trips loudly in test/debug.
-    let mut by_idx: std::collections::BTreeMap<u16, PhaseBucket> = std::collections::BTreeMap::new();
+    let mut by_idx: std::collections::BTreeMap<u16, PhaseBucket> =
+        std::collections::BTreeMap::new();
     for b in host_buckets {
         match by_idx.remove(&b.step_index) {
             Some(existing) => {
@@ -3123,7 +3125,8 @@ pub fn populate_run_distribution_metrics(stats: &mut ScenarioStats) {
     // RUN-WIDE (every phase at once), so a run is never partially stripped per
     // step. #36 (backdrops join the pool) dissolves the dedup entirely.
     let mut wake_carriers: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
-    let mut run_delay_carriers: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    let mut run_delay_carriers: std::collections::BTreeSet<&str> =
+        std::collections::BTreeSet::new();
     for phase in &stats.phases {
         for (cgname, pcg) in &phase.per_cgroup {
             if !pcg.wake_latencies_ns.is_empty() {
@@ -3357,8 +3360,11 @@ fn reduce_sorted_distribution(sorted: &[u64], reduction: crate::stats::SampleRed
             let n = sorted.len() as f64;
             let mean_ns = sorted.iter().sum::<u64>() as f64 / n;
             if mean_ns > 0.0 {
-                let variance =
-                    sorted.iter().map(|&v| (v as f64 - mean_ns).powi(2)).sum::<f64>() / n;
+                let variance = sorted
+                    .iter()
+                    .map(|&v| (v as f64 - mean_ns).powi(2))
+                    .sum::<f64>()
+                    / n;
                 variance.sqrt() / mean_ns
             } else {
                 0.0
@@ -3507,7 +3513,10 @@ fn distribution_cgroup_reduction(
             SampleReduction::Mean => cg.mean_run_delay_us,
             SampleReduction::Worst => cg.worst_run_delay_us,
             SampleReduction::P99 | SampleReduction::Median | SampleReduction::Cv => {
-                debug_assert!(false, "no CgroupStats run-delay reduction for {reduction:?}");
+                debug_assert!(
+                    false,
+                    "no CgroupStats run-delay reduction for {reduction:?}"
+                );
                 f64::NAN
             }
         },
@@ -7127,7 +7136,10 @@ pub(crate) fn step_per_cgroup_bucket(
     step_index: u16,
 ) -> PhaseBucket {
     let mut per_cgroup = std::collections::BTreeMap::new();
-    per_cgroup.insert(name.to_string(), phase_cgroup_stats(reports, expected_nodes));
+    per_cgroup.insert(
+        name.to_string(),
+        phase_cgroup_stats(reports, expected_nodes),
+    );
     PhaseBucket {
         step_index,
         label: Phase::from(step_index).to_string(),

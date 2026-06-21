@@ -808,9 +808,9 @@ pub mod prelude {
         AbsoluteThresholds, Assert, AssertDetail, AssertResult, COMPARATOR_VOCABULARY, CgroupStats,
         CgroupStatsClaim, ClaimBuilder, DetailKind, EachClaim, FracPair, InfoNote,
         MAX_RECORDED_PASSES, NoteValue, Outcome, OutcomeRef, PASSES_TRUNCATION_SENTINEL_COMPARATOR,
-        PASSES_TRUNCATION_SENTINEL_NAME, PassDetail, PhaseBucket, PhaseBucketClaim, PhaseCgroupStats,
-        PhaseCgroupStatsClaim, PhaseMapExt, ScenarioStats, ScenarioStatsClaim, SeqClaim,
-        SeriesField, SetClaim, Verdict, assert_scx_events_clean, assert_thresholds,
+        PASSES_TRUNCATION_SENTINEL_NAME, PassDetail, PhaseBucket, PhaseBucketClaim,
+        PhaseCgroupStats, PhaseCgroupStatsClaim, PhaseMapExt, ScenarioStats, ScenarioStatsClaim,
+        SeqClaim, SeriesField, SetClaim, Verdict, assert_scx_events_clean, assert_thresholds,
         build_phase_buckets_with_stimulus,
     };
     // Per-phase-metric building blocks for `post_vm` callbacks doing

@@ -1205,7 +1205,10 @@ fn format_phase_cgroups(
         // Gap is a Peak with no Option: 0 means "no notable gap", so omit it
         // rather than print a noisy gap=0ms on every quiet cgroup.
         if pcg.max_gap_ms > 0 {
-            out.push_str(&format!(" | gap={}ms@cpu{}", pcg.max_gap_ms, pcg.max_gap_cpu));
+            out.push_str(&format!(
+                " | gap={}ms@cpu{}",
+                pcg.max_gap_ms, pcg.max_gap_cpu
+            ));
         }
         out.push('\n');
     }
@@ -1741,12 +1744,18 @@ mod tests {
         }];
         let t = Timeline::from_phase_buckets(&buckets, &[], &TimelineContext::default());
         let formatted = t.format_with_context(&TimelineContext::default());
-        assert!(formatted.contains("per-cgroup:"), "sub-block header; got:\n{formatted}");
+        assert!(
+            formatted.contains("per-cgroup:"),
+            "sub-block header; got:\n{formatted}"
+        );
         assert!(
             formatted.contains("cg_a: off-cpu avg=82.0% min=80.0% max=84.0% spread=4.0%"),
             "got:\n{formatted}",
         );
-        assert!(formatted.contains("wake p99="), "wake segment present; got:\n{formatted}");
+        assert!(
+            formatted.contains("wake p99="),
+            "wake segment present; got:\n{formatted}"
+        );
         assert!(
             formatted.contains("run-delay mean="),
             "run-delay segment present; got:\n{formatted}",
@@ -1771,7 +1780,10 @@ mod tests {
             .find(|l| l.contains("cg_b:"))
             .expect("cg_b line");
         assert!(!cg_b_line.contains("wake p99="), "got:\n{formatted}");
-        assert!(!cg_b_line.contains("gap="), "gap omitted at 0; got:\n{formatted}");
+        assert!(
+            !cg_b_line.contains("gap="),
+            "gap omitted at 0; got:\n{formatted}"
+        );
         // BTreeMap name order: cg_a before cg_b.
         assert!(
             formatted.find("cg_a:").unwrap() < formatted.find("cg_b:").unwrap(),
@@ -1798,7 +1810,10 @@ mod tests {
         per_cgroup.insert(
             "cg_quiet".to_string(),
             // Genuinely measured nothing (NOT stripped).
-            crate::assert::PhaseCgroupStats { total_iterations: 1_000, ..Default::default() },
+            crate::assert::PhaseCgroupStats {
+                total_iterations: 1_000,
+                ..Default::default()
+            },
         );
         let buckets = vec![crate::assert::PhaseBucket {
             per_cgroup,
@@ -1926,7 +1941,10 @@ mod tests {
             formatted.contains("(+4 more cgroups)"),
             "20 cgroups capped at 16 -> +4 more; got:\n{formatted}",
         );
-        assert!(formatted.contains("cg15:"), "first 16 rendered; got:\n{formatted}");
+        assert!(
+            formatted.contains("cg15:"),
+            "first 16 rendered; got:\n{formatted}"
+        );
         assert!(
             !formatted.contains("cg16:"),
             "cg16 is beyond the cap; got:\n{formatted}",
@@ -1994,7 +2012,10 @@ mod tests {
         );
         let at17 = mk(17);
         assert!(at17.contains("cg15:"), "got:\n{at17}");
-        assert!(!at17.contains("cg16:"), "17th is past the cap; got:\n{at17}");
+        assert!(
+            !at17.contains("cg16:"),
+            "17th is past the cap; got:\n{at17}"
+        );
         assert!(
             at17.contains("(+1 more cgroup)") && !at17.contains("(+1 more cgroups)"),
             "17 cgroups -> exactly +1 more (singular 'cgroup'); got:\n{at17}",
