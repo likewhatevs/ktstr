@@ -116,7 +116,6 @@ const DEFAULT_FN_MAX_LINES: usize = 200;
 /// share one deferred task — the mega-function decomposition campaign);
 /// the guard's panic template emits it on every suggested entry.
 const EXCEPTIONS: &[(&str, &str, usize)] = &[
-    ("assert/mod.rs", "AssertPlan::assert_cgroup", 218), // queued: decompose
     ("bin/cargo_ktstr/kernel/mod.rs", "resolve_kernel_set", 210), // queued: decompose
     ("bin/cargo_ktstr/stats.rs", "run_stats", 226),      // queued: decompose
     ("bin/jemalloc_alloc_worker.rs", "main", 206),       // queued: decompose
@@ -198,9 +197,6 @@ const EXCEPTIONS: &[(&str, &str, usize)] = &[
         "<SnapshotError as std :: fmt :: Display>::fmt",
         260,
     ), // queued: decompose
-    ("stats.rs", "compare_partitions", 413),             // queued: decompose
-    ("stats.rs", "compare_rows_by", 253),                // queued: decompose
-    ("stats.rs", "group_and_average_by", 381),           // queued: decompose
     (
         "taskstats.rs",
         "parse_taskstats_payload_version_boundary_truncation",
