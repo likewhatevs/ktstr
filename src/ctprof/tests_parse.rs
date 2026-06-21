@@ -168,7 +168,7 @@ fn parse_status_absent_state_line_yields_none() {
 }
 
 /// PSI parser pins the kernel emission format
-/// `kernel/sched/psi.c:1284`. Two-line shape (some + full)
+/// `psi_show()` (`kernel/sched/psi.c`). Two-line shape (some + full)
 /// is the cpu/memory/io case; cpu's avg/total decomposition
 /// hits both halves so a one-side regression surfaces here.
 #[test]
@@ -188,7 +188,7 @@ fn parse_psi_extracts_some_and_full_halves() {
 }
 
 /// IRQ pressure is full-only per
-/// `kernel/sched/psi.c:1268` (`only_full = res == PSI_IRQ`),
+/// `psi_show()` (`kernel/sched/psi.c`) (`only_full = res == PSI_IRQ`),
 /// so the some-half stays at the absent-line default of zero.
 #[test]
 fn parse_psi_irq_full_only_leaves_some_at_zero() {
@@ -254,7 +254,7 @@ fn parse_psi_unknown_keys_ignored() {
 
 /// `parse_centi_percent` pads/truncates the fractional part
 /// to exactly 2 digits before combining. The kernel always
-/// emits `%02lu` per `kernel/sched/psi.c:1284`, but a robust
+/// emits `%02lu` per `psi_show()` (`kernel/sched/psi.c`), but a robust
 /// parser must not silently rescale `"1.5"` (one digit) as
 /// `1*100+5 = 105` (1.05%) — that would corrupt the value.
 /// Mirrors `parsed_ns_from_dotted`'s zero-pad-to-six rule.
@@ -276,7 +276,7 @@ fn parse_centi_percent_zero_pads_short_fraction() {
     );
     // Empty fraction (trailing dot) → 0.
     assert_eq!(parse_centi_percent("3."), 300);
-    // EWMA-rounding ceiling per loadavg.h:35.
+    // EWMA-rounding ceiling per calc_load() (include/linux/sched/loadavg.h).
     assert_eq!(parse_centi_percent("100.99"), 10099);
 }
 

@@ -397,7 +397,7 @@ fn psi_half_avg300_percent_uses_avg300_field() {
 /// All three percent methods round-trip the kernel-emission
 /// shape `LOAD_INT.LOAD_FRAC` losslessly. The kernel writes
 /// each average as a 2-decimal-digit percentage at
-/// `kernel/sched/psi.c:1284`; the centi-percent storage at
+/// `psi_show()` (`kernel/sched/psi.c`); the centi-percent storage at
 /// the [`PsiHalf`] field captures both digits as a single
 /// integer (`int * 100 + frac`). Pin that the percent method
 /// reproduces both digits with float precision.

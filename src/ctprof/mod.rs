@@ -846,7 +846,7 @@ pub struct ThreadState {
     /// increment this counter.
     pub nr_wakeups_affine_attempts: crate::metric_types::MonotonicCount,
     /// Total cross-CPU migrations of the task. Incremented
-    /// unconditionally at `kernel/sched/core.c` (`p->se.nr_migrations++`)
+    /// unconditionally in `kernel/sched/core.c` (`p->se.nr_migrations++`)
     /// — no schedstat macro, no class gating. Always populated
     /// regardless of `CONFIG_SCHEDSTATS` or scheduling class.
     /// `MonotonicCount`.
@@ -1090,9 +1090,9 @@ pub struct ThreadState {
     /// uses for ordering, while `nice` is the
     /// userspace-presentable [-20, 19] preference.
     /// `/proc/<tid>/stat` field 18, emitted via
-    /// `seq_put_decimal_ll(m, " ", task_prio(task))` at
-    /// `fs/proc/array.c:602`. Range per `task_prio()` at
-    /// `kernel/sched/syscalls.c:170`:
+    /// `seq_put_decimal_ll(m, " ", priority)` (the local `priority`
+    /// = `task_prio(task)`) in `do_task_stat()` (`fs/proc/array.c`).
+    /// Range per `task_prio()` (`kernel/sched/syscalls.c`):
     /// CFS / SCHED_OTHER tasks see `[0..39]` (nice [-20..19]
     /// translated by `task_prio()` returning
     /// `p->prio - MAX_RT_PRIO`); SCHED_FIFO / SCHED_RR tasks
@@ -1105,7 +1105,7 @@ pub struct ThreadState {
     pub priority: crate::metric_types::OrdinalI32,
     /// Real-time scheduler priority. `/proc/<tid>/stat` field
     /// 40, emitted via `seq_put_decimal_ull(m, " ", task->rt_priority)`
-    /// at `fs/proc/array.c:637`. Non-zero only when the task
+    /// in `do_task_stat()` (`fs/proc/array.c`). Non-zero only when the task
     /// runs SCHED_FIFO or SCHED_RR; CFS / SCHED_OTHER tasks
     /// land at zero. Useful as a post-hoc filter to identify
     /// real-time threads in a snapshot. Wrapped in
@@ -1121,17 +1121,15 @@ pub struct ThreadState {
     /// Cumulative time this task forced its SMT sibling idle for
     /// core-scheduling, in nanoseconds. `/proc/<tid>/sched`
     /// `core_forceidle_sum`, dotted ms.ns format via
-    /// `PN_SCHEDSTAT` (`kernel/sched/debug.c:1335`).
+    /// `PN_SCHEDSTAT` in `proc_sched_show_task()` (`kernel/sched/debug.c`).
     /// Reconstructed to full ns via the same
     /// `parsed_ns_from_dotted` helper as `wait_sum` /
     /// `block_sum`.
     ///
-    /// Increment occurs in `__account_forceidle_time()` at
-    /// `kernel/sched/cputime.c:244` (function defined at
-    /// `cputime.c:242`), called from
-    /// `__sched_core_account_forceidle()` in
-    /// `kernel/sched/core_sched.c:287` (function defined at
-    /// `core_sched.c:242`). The increment body is a plain
+    /// Increment occurs in `__account_forceidle_time()`
+    /// (`kernel/sched/cputime.c`), called from
+    /// `__sched_core_account_forceidle()`
+    /// (`kernel/sched/core_sched.c`). The increment body is a plain
     /// `__schedstat_add(p->stats.core_forceidle_sum, delta)` —
     /// it is CLASS-AGNOSTIC. The caller iterates
     /// `for_each_cpu(i, smt_mask)` and picks
@@ -1150,27 +1148,27 @@ pub struct ThreadState {
     ///   `kernel/sched/cputime.c` and
     ///   `kernel/sched/core_sched.c`).
     /// - **Build:** `CONFIG_SCHEDSTATS` (the caller's own
-    ///   `#ifdef CONFIG_SCHEDSTATS` at `core_sched.c:239`).
+    ///   `#ifdef CONFIG_SCHEDSTATS` in `__sched_core_account_forceidle()`).
     /// - **Runtime, scheduler-class entry:**
     ///   `sched_core_enabled(rq)` is the FIRST gate — checked
-    ///   at `pick_next_task()` entry at `kernel/sched/core.c:6014`
+    ///   at `pick_next_task()` entry (`kernel/sched/core.c`)
     ///   with an early `__pick_next_task()` return when false.
     ///   No core-wide selection runs without this.
     /// - **Runtime, transient counter:**
     ///   `rq->core->core_forceidle_count > 0` is a SEPARATE
     ///   subsequent gate — `pick_next_task()` only invokes
     ///   `sched_core_account_forceidle(rq)` when this counter is
-    ///   non-zero (`kernel/sched/core.c:6059`); the
+    ///   non-zero (`kernel/sched/core.c`); the
     ///   `WARN_ON_ONCE(!rq->core->core_forceidle_count)` inside
-    ///   `__sched_core_account_forceidle()` at
-    ///   `kernel/sched/core_sched.c:252` reasserts the same
-    ///   precondition. The early-return at `core_sched.c:254`
+    ///   `__sched_core_account_forceidle()`
+    ///   (`kernel/sched/core_sched.c`) reasserts the same
+    ///   precondition. The early-return in the same function
     ///   on `core_forceidle_start == 0` is then a third
     ///   transient guard against accounting before
     ///   forceidle has begun.
     /// - **Runtime, occupancy:** non-zero
-    ///   `core_forceidle_occupation` (the `WARN_ON_ONCE` at
-    ///   `core_sched.c:263`).
+    ///   `core_forceidle_occupation` (the `WARN_ON_ONCE` in
+    ///   `__sched_core_account_forceidle()`).
     ///
     /// Kernels that fail any build gate, or rqs that fail any
     /// runtime gate, see this counter at zero for every task.
@@ -1188,11 +1186,12 @@ pub struct ThreadState {
     /// guarantee about which class actually populated the value.
     ///
     /// `/proc/<tid>/sched` `se.slice`, plain integer via
-    /// `P(se.slice)` at `kernel/sched/debug.c:1364`, gated by
-    /// `fair_policy(p->policy)` at `kernel/sched/debug.c:1363`.
-    /// `fair_policy()` is defined at `kernel/sched/sched.h:203`
-    /// as `normal_policy(policy) || policy == SCHED_BATCH`, and
-    /// `normal_policy()` at `sched.h:194` returns true for
+    /// `P(se.slice)` in `proc_sched_show_task()`
+    /// (`kernel/sched/debug.c`), gated by `fair_policy(p->policy)`
+    /// in the same function. `fair_policy()` is defined in
+    /// `kernel/sched/sched.h` as
+    /// `normal_policy(policy) || policy == SCHED_BATCH`, and
+    /// `normal_policy()` (`sched.h`) returns true for
     /// SCHED_NORMAL AND, when `CONFIG_SCHED_CLASS_EXT` is
     /// built, for SCHED_EXT. So the line IS emitted for
     /// SCHED_EXT tasks on a sched_ext-enabled kernel — but the
@@ -1225,7 +1224,7 @@ pub struct ThreadState {
     /// name mirrors the kernel struct member to avoid collision
     /// with [`CtprofSnapshot::threads`] (the snapshot's own
     /// `Vec<ThreadState>`). `/proc/<pid>/status` `Threads:` line
-    /// emitted at `fs/proc/array.c:290` via
+    /// emitted in `task_sig()` (`fs/proc/array.c`) via
     /// `seq_put_decimal_ull(m, "Threads:\t", num_threads)`.
     /// Identical for every thread of the same tgid.
     ///
@@ -1251,11 +1250,11 @@ pub struct ThreadState {
     /// Per-process memory breakdown from
     /// `/proc/<tid>/smaps_rollup`, parsed as a key-value map
     /// with values in kilobytes (the kernel's native unit on
-    /// this file — `__show_smap()` at `fs/proc/task_mmu.c:1330-1368`
+    /// this file — `__show_smap()` (`fs/proc/task_mmu.c`)
     /// emits every line as `Name: NN kB`).
     ///
     /// Stored as a [`BTreeMap`] for forward-compat with the
-    /// open key set: rollup mode (gated at task_mmu.c:1336)
+    /// open key set: rollup mode (gated in `__show_smap()`)
     /// emits 22 keys on a recent kernel — Rss, Pss, Pss_Dirty,
     /// Pss_Anon, Pss_File, Pss_Shmem, Shared_Clean,
     /// Shared_Dirty, Private_Clean, Private_Dirty, Referenced,
@@ -1317,13 +1316,13 @@ pub struct ThreadState {
     /// inode invalidation). `/proc/<tid>/io` 7th line, gated by
     /// `CONFIG_TASK_IO_ACCOUNTING`.
     ///
-    /// `include/linux/task_io_accounting_ops.h:39-42`
+    /// `include/linux/task_io_accounting_ops.h`
     /// (`task_io_account_cancelled_write`) increments
     /// `current->ioac.cancelled_write_bytes` — i.e. the value
     /// records on the task that triggers the deaccount
     /// (the truncating / unmapping task), NOT the original
     /// writer. Sole call site is `folio_account_cleaned`
-    /// (`mm/page-writeback.c:2628`), invoked when a dirty folio
+    /// (`mm/page-writeback.c`), invoked when a dirty folio
     /// is reclaimed without going through writeback.
     ///
     /// Operationally this is a "negative write" signal — bytes
@@ -1516,9 +1515,9 @@ pub struct ThreadState {
     /// `smaps_rollup_kib["Rss"]` which is the CURRENT RSS —
     /// this field is the lifetime peak.
     ///
-    /// **Kernel threads read zero**: `xacct_add_tsk` at
-    /// `kernel/tsacct.c:99` calls `mm = get_task_mm(p)` and the
-    /// hiwater assignments at lines 100-104 are guarded by
+    /// **Kernel threads read zero**: `xacct_add_tsk`
+    /// (`kernel/tsacct.c`) calls `mm = get_task_mm(p)` and the
+    /// hiwater assignments are guarded by
     /// `if (mm)`. Kernel threads (`PF_KTHREAD`, `tsk->mm == NULL`)
     /// skip the assignment entirely, so the field stays at the
     /// kernel-side zero default.
@@ -1761,8 +1760,8 @@ pub struct CgroupStats {
     /// Pressure Stall Information for this cgroup, per resource.
     /// Populated from `<cgroup>/cpu.pressure`,
     /// `<cgroup>/memory.pressure`, `<cgroup>/io.pressure`, and
-    /// `<cgroup>/irq.pressure` (cgroup v2 files declared at
-    /// `kernel/cgroup/cgroup.c:5453-5482`). Defaults to all-zero
+    /// `<cgroup>/irq.pressure` (cgroup v2 files declared in
+    /// `cgroup_psi_files[]` (`kernel/cgroup/cgroup.c`)). Defaults to all-zero
     /// when the kernel has CONFIG_PSI off, when PSI is disabled
     /// at runtime via the `psi=0` boot param, or when individual
     /// resource files are absent (older kernels missing
@@ -1879,22 +1878,22 @@ pub struct CgroupPidsStats {
 /// One Pressure Stall Information half-line: either the `some`
 /// or `full` row for one resource. Mirrors the kernel emission
 /// format `%s avg10=%lu.%02lu avg60=%lu.%02lu avg300=%lu.%02lu total=%llu`
-/// at `kernel/sched/psi.c:1284`.
+/// in `psi_show()` (`kernel/sched/psi.c`).
 ///
 /// `avg10/60/300` are stored as **centi-percent** (lossless
 /// fixed-point) — the kernel writes `LOAD_INT(avg).LOAD_FRAC(avg)`
-/// as a 2-decimal-digit percentage at psi.c:1284. The integer
+/// as a 2-decimal-digit percentage in `psi_show()`. The integer
 /// expansion is `int * 100 + frac`, giving a numerical range of
 /// `0..=10099`. The upper bound is `100.99` (not `100.00`)
-/// because the kernel's EWMA helper at
-/// `include/linux/sched/loadavg.h:35` rounds via `newload +=
+/// because the kernel's EWMA helper `calc_load()`
+/// (`include/linux/sched/loadavg.h`) rounds via `newload +=
 /// FIXED_1 - 1` before the final `>> FSHIFT`, so a fully-loaded
 /// group can land just over `100.0` for one sample. This avoids
 /// serde JSON float-roundtrip drift that would manifest as
 /// spurious non-zero deltas in compare output.
 ///
 /// `total_usec` is microseconds (kernel
-/// `div_u64(total_ns, NSEC_PER_USEC)` at psi.c:1281). Same unit
+/// `div_u64(total_ns, NSEC_PER_USEC)` in `psi_show()`). Same unit
 /// as [`CgroupCpuStats::usage_usec`], so the existing
 /// auto_scale "µs" ladder applies.
 ///
@@ -1902,13 +1901,13 @@ pub struct CgroupPidsStats {
 /// resource. "full" semantics: every runnable task is stalled.
 /// At the SYSTEM level (`/proc/pressure/cpu`), `cpu.full` is
 /// always zero by kernel design — the explicit gate
-/// `if (!(group == &psi_system && res == PSI_CPU && full))` at
-/// `kernel/sched/psi.c:1276-1277` skips the avg/total
-/// computation, but the `seq_printf` at psi.c:1284 still emits
+/// `if (!(group == &psi_system && res == PSI_CPU && full))` in
+/// `psi_show()` (`kernel/sched/psi.c`) skips the avg/total
+/// computation, but the `seq_printf` in `psi_show()` still emits
 /// the structurally-present line. Per-cgroup `cpu.full` (under
 /// `<cgroup>/cpu.pressure`) IS meaningful and computed
 /// normally. `irq` is full-only (kernel `only_full = res == PSI_IRQ`
-/// at psi.c:1268), so [`PsiResource::some`] for irq always reads
+/// in `psi_show()`), so [`PsiResource::some`] for irq always reads
 /// zero.
 #[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
@@ -1967,11 +1966,11 @@ pub struct Psi {
     pub memory: PsiResource,
     pub io: PsiResource,
     /// IRQ pressure. Only the `full` half is populated by the
-    /// kernel (psi.c:1268 sets `only_full = res == PSI_IRQ`);
+    /// kernel (`psi_show()` sets `only_full = res == PSI_IRQ`);
     /// `irq.some` is structurally present but always zero.
     /// Requires both `CONFIG_IRQ_TIME_ACCOUNTING` at build AND
     /// `irqtime_enabled()` at runtime (`/proc/pressure/irq` returns
-    /// `-EOPNOTSUPP` per `kernel/sched/psi.c:1255` otherwise);
+    /// `-EOPNOTSUPP` per `psi_show()` (`kernel/sched/psi.c`) otherwise);
     /// runtime irqtime is gated by the `tsc=...` boot param /
     /// `irqtime_enabled` static branch — when off, the file open
     /// fails and the parser leaves this resource at the default
@@ -1981,8 +1980,8 @@ pub struct Psi {
 
 /// Global sched_ext sysfs state, captured from
 /// `/sys/kernel/sched_ext/`. The kernel registers exactly five
-/// global attributes via `scx_global_attrs[]` at
-/// `kernel/sched/ext.c:4715-4722`; this struct mirrors them
+/// global attributes via `scx_global_attrs[]`
+/// (`kernel/sched/ext.c`); this struct mirrors them
 /// 1-to-1.
 ///
 /// Per-scheduler attrs (`/sys/kernel/sched_ext/root/...`) are
@@ -1995,10 +1994,10 @@ pub struct Psi {
 pub struct SchedExtSysfs {
     /// `state` — sched_ext class enable state. One of
     /// `enabling`, `enabled`, `disabling`, `disabled` per
-    /// `scx_enable_state_str[]` at
-    /// `kernel/sched/ext_internal.h:1229-1234`. Emitted by
-    /// `scx_attr_state_show()` at
-    /// `kernel/sched/ext.c:4680-4684`. Defaults to empty string
+    /// `scx_enable_state_str[]`
+    /// (`kernel/sched/ext_internal.h`). Emitted by
+    /// `scx_attr_state_show()`
+    /// (`kernel/sched/ext.c`). Defaults to empty string
     /// when the file is unreadable; `disabled` when no scx
     /// scheduler is currently loaded. The "is sched_ext active
     /// during this capture?" answer.
@@ -2008,24 +2007,24 @@ pub struct SchedExtSysfs {
     /// whether ALL scheduling classes have been switched to
     /// scx (vs. only those tasks the BPF scheduler claims via
     /// the per-task selection path). Emitted by
-    /// `scx_attr_switch_all_show()` at
-    /// `kernel/sched/ext.c:4687-4691` via
+    /// `scx_attr_switch_all_show()`
+    /// (`kernel/sched/ext.c`) via
     /// `READ_ONCE(scx_switching_all)`.
     pub switch_all: u64,
 
     /// `nr_rejected` — count of tasks rejected from
     /// SCHED_EXT during init when `ops.init_task()` set
-    /// `p->disallow`. Increment at
-    /// `kernel/sched/ext.c:3531-3542`: when a task entering
+    /// `p->disallow`. Increment in `__scx_init_task()`
+    /// (`kernel/sched/ext.c`): when a task entering
     /// SCHED_EXT has its policy reverted to SCHED_NORMAL
     /// because the BPF scheduler asked the kernel to disallow
     /// it, `atomic_long_inc(&scx_nr_rejected)` fires.
     /// `atomic_long_read(&scx_nr_rejected)` is emitted by
-    /// `scx_attr_nr_rejected_show()` at
-    /// `kernel/sched/ext.c:4694-4698`.
+    /// `scx_attr_nr_rejected_show()`
+    /// (`kernel/sched/ext.c`).
     ///
-    /// Resets to 0 on every scheduler load: `scx_enable()` at
-    /// `kernel/sched/ext.c:6646` does
+    /// Resets to 0 on every scheduler load: `scx_root_enable_workfn()`
+    /// (`kernel/sched/ext.c`) does
     /// `atomic_long_set(&scx_nr_rejected, 0)` before bringing
     /// the new scheduler online. To detect a reload-driven
     /// reset rather than a genuine cumulative drop, pair the
@@ -2043,16 +2042,16 @@ pub struct SchedExtSysfs {
     /// `hotplug_seq` — per-CPU-hotplug-event sequence counter.
     /// Atomic long incremented every time the kernel observes a
     /// hotplug transition. Emitted by
-    /// `scx_attr_hotplug_seq_show()` at
-    /// `kernel/sched/ext.c:4701-4705`. Comparing two snapshots:
+    /// `scx_attr_hotplug_seq_show()`
+    /// (`kernel/sched/ext.c`). Comparing two snapshots:
     /// any delta indicates that a CPU online/offline event
     /// happened during the interval, which can confound
     /// per-CPU statistics.
     pub hotplug_seq: u64,
 
     /// `enable_seq` — per-scheduler-load sequence counter.
-    /// Atomic long incremented at
-    /// `kernel/sched/ext.c:6822` (`atomic_long_inc(&scx_enable_seq)`)
+    /// Atomic long incremented in `scx_root_enable_workfn()`
+    /// (`kernel/sched/ext.c`, `atomic_long_inc(&scx_enable_seq)`)
     /// each time a scx scheduler is enabled. Comparing two
     /// snapshots: any delta indicates a scheduler reload
     /// happened during the interval — counter resets on the
