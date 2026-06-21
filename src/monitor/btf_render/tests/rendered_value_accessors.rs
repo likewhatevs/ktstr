@@ -6,20 +6,6 @@ use super::*;
 // via .raw() and by the failure-dump renderer pipelines.
 // ---------------------------------------------------------------------------
 
-fn struct_with(members: Vec<(&str, RenderedValue)>) -> RenderedValue {
-    RenderedValue::Struct {
-        type_name: None,
-        members: members
-            .into_iter()
-            .map(|(n, v)| RenderedMember {
-                name: n.to_string(),
-                value: v,
-            })
-            .collect(),
-    }
-}
-
-
 #[test]
 fn rendered_value_member_walks_struct() {
     let v = struct_with(vec![("foo", uint(7)), ("bar", uint(11))]);
@@ -372,4 +358,3 @@ fn rendered_value_as_bool_array_via_truncated_peel() {
     };
     assert_eq!(trunc.as_bool_array(), Some(vec![true, false]));
 }
-

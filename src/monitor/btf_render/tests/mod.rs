@@ -30,7 +30,6 @@ fn enum_v(bits: u32, value: i64, variant: Option<&str>, is_signed: bool) -> Rend
     }
 }
 
-
 // ----- Shared cast-test fixtures (hoisted from cast_intercept) -----
 
 const CAST_BTF_MAGIC: u16 = 0xEB9F;
@@ -355,7 +354,6 @@ enum CastSynType {
 // filters width == 0), so it is exercised by a direct render_bitfield
 // call.
 
-
 /// Helper: build a string section + name offsets for the names
 /// used across cast tests. Returns `(strings, n_int_name, n_t,
 /// n_q, n_f, n_x)` where `n_*` are the byte offsets of each name
@@ -544,23 +542,50 @@ impl MemReader for CastStubReader {
     }
 }
 
-
 // ----- Shared RenderedValue constructor -----
 
 fn uint(value: u64) -> RenderedValue {
     RenderedValue::Uint { bits: 64, value }
 }
 
-mod display_basics;
-mod datasec_cpumask;
-mod predicates;
-mod templates_arrays_cycles;
+fn struct_with(members: Vec<(&str, RenderedValue)>) -> RenderedValue {
+    RenderedValue::Struct {
+        type_name: None,
+        members: members
+            .into_iter()
+            .map(|(n, v)| RenderedMember {
+                name: n.to_string(),
+                value: v,
+            })
+            .collect(),
+    }
+}
+
+/// Pull the sole member's value out of a rendered single-member
+/// struct, transparently peeling the `Truncated` wrapper that
+/// `render_struct` adds when `bytes.len() < struct size`.
+fn sole_member_value(v: &RenderedValue) -> &RenderedValue {
+    match v {
+        RenderedValue::Struct { members, .. } => {
+            assert_eq!(members.len(), 1, "expected exactly one member");
+            &members[0].value
+        }
+        RenderedValue::Truncated { partial, .. } => sole_member_value(partial),
+        other => panic!("expected Struct/Truncated, got {other:?}"),
+    }
+}
+
 mod cast_intercept;
-mod cast_pipeline;
 mod cast_kernel_arm;
-mod fwd_sibling;
+mod cast_pipeline;
 mod chase_edge_cases;
-mod sdt_bridge;
-mod rendered_value_accessors;
 mod cpumask_render;
+mod datasec_cpumask;
+mod display_basics;
+mod fwd_sibling;
+mod predicates;
+mod render_value_coverage;
+mod rendered_value_accessors;
+mod sdt_bridge;
+mod templates_arrays_cycles;
 mod typed_arrays_dedup;

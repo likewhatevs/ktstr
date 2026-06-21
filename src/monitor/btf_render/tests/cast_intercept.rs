@@ -26,20 +26,6 @@ use super::*;
 // keeps these tests independent of vmlinux availability and pins
 // the exact intercept gate without any real kernel BTF noise.
 
-/// Pull the sole member's value out of a rendered single-member
-/// struct, transparently peeling the `Truncated` wrapper that
-/// `render_struct` adds when `bytes.len() < struct size`.
-fn sole_member_value(v: &RenderedValue) -> &RenderedValue {
-    match v {
-        RenderedValue::Struct { members, .. } => {
-            assert_eq!(members.len(), 1, "expected exactly one member");
-            &members[0].value
-        }
-        RenderedValue::Truncated { partial, .. } => sole_member_value(partial),
-        other => panic!("expected Struct/Truncated, got {other:?}"),
-    }
-}
-
 #[test]
 fn render_bitfield_unsigned_multibit_at_nonzero_offset_decodes_exact() {
     // struct B { u64 f : 12; } with the field placed at bit offset 4.
@@ -429,7 +415,6 @@ fn render_bitfield_straddling_end_of_bytes_is_truncated() {
     }
 }
 
-
 /// Build a BTF blob where T's intercepted member is u32 (size=4)
 /// instead of u64. Used to verify the intercept's size==8 gate
 /// rejects sub-u64 fields. id=1: u32 (size=4,bits=32),
@@ -493,7 +478,6 @@ fn cast_btf_t_with_u32() -> (Vec<u8>, u32, u32) {
     ];
     (cast_build_btf(&types, &strings), 3, 4)
 }
-
 
 /// Arena cast hit on a u64 member: render_cast_pointer chases
 /// the value through `read_arena` and surfaces a Ptr whose
@@ -1001,4 +985,3 @@ fn cast_intercept_kernel_hint_arena_value_dispatches_to_arena_reader() {
          got {cast_annotation:?}",
     );
 }
-
