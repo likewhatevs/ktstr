@@ -717,36 +717,42 @@ fn worker_report_debug_shows_field_values() {
 
 #[test]
 fn worker_report_off_cpu_ns_calculation() {
-    // off_cpu_ns = wall_time_ns - cpu_time_ns
-    let r = WorkerReport {
-        tid: 1,
-        work_units: 100,
-        cpu_time_ns: 3_000_000_000,
-        wall_time_ns: 5_000_000_000,
-        off_cpu_ns: 2_000_000_000,
-        migration_count: 0,
-        cpus_used: [0].into_iter().collect(),
-        migrations: vec![],
-        max_gap_ms: 0,
-        max_gap_cpu: 0,
-        max_gap_at_ms: 0,
-        wake_latencies_ns: vec![],
-        wake_sample_total: 0,
-        iteration_costs_ns: vec![],
-        iteration_cost_sample_total: 0,
-        iterations: 0,
-        schedstat_run_delay_ns: 0,
-        schedstat_run_count: 0,
-        schedstat_cpu_time_ns: 0,
-        completed: true,
-        numa_pages: BTreeMap::new(),
-        vmstat_numa_pages_migrated: 0,
-        exit_info: None,
-        is_messenger: false,
-        group_idx: 0,
-        affinity_error: None,
-    };
-    assert_eq!(r.off_cpu_ns, r.wall_time_ns - r.cpu_time_ns);
+    // Drive the production derivation `derive_off_cpu_ns`
+    // (worker/mod.rs) — the same function `worker_main` uses to
+    // populate `WorkerReport::off_cpu_ns`. The prior version of this
+    // test hand-built a WorkerReport literal and asserted three
+    // self-chosen constants were arithmetically consistent, touching
+    // no production code.
+    //
+    // Normal case: off_cpu = wall - cpu.
+    assert_eq!(
+        derive_off_cpu_ns(5_000_000_000, 3_000_000_000),
+        2_000_000_000,
+        "off_cpu_ns must be wall_time_ns - cpu_time_ns",
+    );
+    // Zero off-CPU: a worker pinned on-CPU for its whole life.
+    assert_eq!(
+        derive_off_cpu_ns(4_000_000_000, 4_000_000_000),
+        0,
+        "wall == cpu must yield zero off-CPU time",
+    );
+    // Saturating boundary: cpu_time_ns slightly exceeds wall_time_ns
+    // (the two clocks — CLOCK_THREAD_CPUTIME_ID vs the monotonic
+    // start.elapsed() — can skew). The derivation must clamp to 0,
+    // NOT wrap to a near-u64::MAX phantom off-CPU figure. A
+    // regression that swapped the saturating subtraction for a plain
+    // `wall - cpu` would panic (overflow) in debug and wrap in
+    // release — this case catches both.
+    assert_eq!(
+        derive_off_cpu_ns(3_000_000_000, 3_000_000_001),
+        0,
+        "cpu > wall (clock skew) must saturate to 0, not wrap",
+    );
+    assert_eq!(
+        derive_off_cpu_ns(0, u64::MAX),
+        0,
+        "extreme cpu > wall must saturate to 0",
+    );
 }
 #[test]
 fn migration_serde_multiple() {

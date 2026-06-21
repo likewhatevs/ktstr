@@ -231,6 +231,37 @@ pub(crate) fn cache_root() -> Result<PathBuf> {
     crate::cache::resolve_cache_root_with_suffix(CACHE_SUFFIX)
 }
 
+/// Walk `dir`'s path tree upward and return the first ancestor (or
+/// `dir` itself) that exists on disk, so its filesystem can be
+/// `statfs`-probed. The cache root is created lazily and `statfs` on
+/// a not-yet-created path returns `ENOENT`, so [`Path::exists`] is
+/// the loop's termination gate; `Path::exists` follows symlinks, so a
+/// dangling symlink probes as missing and the walk ascends to the
+/// symlink's container rather than the (nonexistent) target's parent.
+///
+/// Returns the resolved ancestor on success, or an error when no
+/// component of `dir` exists (the path has no existing ancestor at
+/// all — only possible for a relative path with no current-directory
+/// anchor). Split out of [`verify_cache_dir_supports_reflink`] so the
+/// walk-up itself is unit-testable: a test can assert the resolved
+/// ancestor equals the existing prefix it expects, rather than only
+/// observing that the outer verify did not panic.
+fn resolve_existing_ancestor(dir: &Path) -> Result<PathBuf> {
+    let mut probe: PathBuf = dir.to_path_buf();
+    loop {
+        if probe.exists() {
+            return Ok(probe);
+        }
+        match probe.parent() {
+            Some(p) => probe = p.to_path_buf(),
+            None => bail!(
+                "no existing ancestor of {dir:?} found while probing \
+                 cache filesystem; cannot verify FICLONE support",
+            ),
+        }
+    }
+}
+
 /// Verify that `dir` lives on a filesystem that supports `FICLONE`.
 ///
 /// Returns `Ok(())` for btrfs and xfs. Other filesystems (tmpfs,
@@ -266,19 +297,7 @@ pub(crate) fn cache_root() -> Result<PathBuf> {
 /// missing target is a configuration error, not a filesystem-type
 /// question.
 pub(crate) fn verify_cache_dir_supports_reflink(dir: &Path) -> Result<()> {
-    let mut probe: PathBuf = dir.to_path_buf();
-    loop {
-        if probe.exists() {
-            break;
-        }
-        match probe.parent() {
-            Some(p) => probe = p.to_path_buf(),
-            None => bail!(
-                "no existing ancestor of {dir:?} found while probing \
-                 cache filesystem; cannot verify FICLONE support",
-            ),
-        }
-    }
+    let probe = resolve_existing_ancestor(dir)?;
     let buf = statfs_path(&probe).with_context(|| {
         format!(
             "cannot verify FICLONE support for cache directory {dir:?} \

@@ -2975,38 +2975,24 @@ fn mem_reader_default_impls_skip_arena() {
 // `AccessorMemReader::cast_lookup` (render_map.rs) consults its
 // `cast_map` field: `Some(map)` returns
 // `map.get(&(parent_type_id, member_byte_offset)).copied()`,
-// `None` returns `None`. The struct itself is private to
-// render_map.rs, so these tests use a stand-in `StubReader` that
-// mirrors the production method body verbatim — same convention
-// as the surrounding AccessorMemReader-shape tests
-// (`accessor_mem_reader_no_snapshot_rejects_all_addrs` and the
-// rest in this section).
+// `None` returns `None`. `AccessorMemReader` itself is private to
+// render_map.rs, but the body lives in the free helper
+// `cast_lookup_in_map` (the same extraction convention as
+// `is_arena_addr_in_snapshot` / `read_arena_in_snapshot` /
+// `resolve_arena_type_in_index`). The production `cast_lookup`
+// forwards to it, so the tests below call the helper directly and
+// therefore exercise the real lookup body — not a re-declared copy.
 
-/// `cast_lookup` with a populated [`CastMap`] returns the matching
-/// [`CastHit`] when the `(parent_type_id, member_byte_offset)` key
-/// is present, and `None` when it is not. Mirrors the production
-/// `AccessorMemReader::cast_lookup` body line-for-line so a
-/// regression in either trips this test.
+/// `cast_lookup_in_map` (the body of `AccessorMemReader::cast_lookup`)
+/// with a populated [`CastMap`] returns the matching [`CastHit`] when
+/// the `(parent_type_id, member_byte_offset)` key is present, and
+/// `None` when it is not. Drives the production helper directly so a
+/// regression in the key tuple order or the present-key semantics
+/// trips this test.
 #[test]
 fn accessor_mem_reader_cast_lookup_with_populated_map() {
-    use super::super::btf_render::CastHit;
-    use super::super::cast_analysis::{AddrSpace, CastMap};
-
-    // Production cast_lookup body (render_map.rs):
-    //   let map = self.cast_map?;
-    //   map.get(&(parent_type_id, member_byte_offset)).copied()
-    struct StubReader<'a> {
-        cast_map: Option<&'a CastMap>,
-    }
-    impl super::super::btf_render::MemReader for StubReader<'_> {
-        fn read_kva(&self, _: u64, _: usize) -> Option<Vec<u8>> {
-            None
-        }
-        fn cast_lookup(&self, parent_type_id: u32, member_byte_offset: u32) -> Option<CastHit> {
-            let map = self.cast_map?;
-            map.get(&(parent_type_id, member_byte_offset)).copied()
-        }
-    }
+    use super::super::cast_analysis::{AddrSpace, CastHit, CastMap};
+    use super::render_map::cast_lookup_in_map;
 
     // Build a CastMap with two entries: one Arena, one Kernel.
     // Parent ids and member offsets are arbitrary u32s — the
@@ -3030,13 +3016,8 @@ fn accessor_mem_reader_cast_lookup_with_populated_map() {
         },
     );
 
-    let r = StubReader {
-        cast_map: Some(&map),
-    };
-
     // Hit on (42, 8): returns the Arena CastHit.
-    let hit_arena = r
-        .cast_lookup(42, 8)
+    let hit_arena = cast_lookup_in_map(Some(&map), 42, 8)
         .expect("populated map must return CastHit for present key");
     assert_eq!(
         hit_arena.target_type_id, 99,
@@ -3048,8 +3029,7 @@ fn accessor_mem_reader_cast_lookup_with_populated_map() {
     );
 
     // Hit on (42, 16): returns the Kernel CastHit.
-    let hit_kernel = r
-        .cast_lookup(42, 16)
+    let hit_kernel = cast_lookup_in_map(Some(&map), 42, 16)
         .expect("populated map must return CastHit for present key");
     assert_eq!(hit_kernel.target_type_id, 100);
     assert!(
@@ -3059,49 +3039,39 @@ fn accessor_mem_reader_cast_lookup_with_populated_map() {
 
     // Miss on a non-present key: returns None.
     assert!(
-        r.cast_lookup(42, 24).is_none(),
+        cast_lookup_in_map(Some(&map), 42, 24).is_none(),
         "key not in map must produce None (no fallback to nearby offsets)",
     );
+    // The key tuple is `(parent_type_id, member_byte_offset)` in
+    // THAT order: swapping a present (parent, offset) pair (42, 8)
+    // to (8, 42) must miss, pinning that the helper keys on the
+    // tuple in the documented order rather than either projection.
     assert!(
-        r.cast_lookup(99, 8).is_none(),
+        cast_lookup_in_map(Some(&map), 8, 42).is_none(),
+        "swapped (offset, parent) key must miss — tuple order is (parent, offset)",
+    );
+    assert!(
+        cast_lookup_in_map(Some(&map), 99, 8).is_none(),
         "different parent_type_id must produce None even with same offset",
     );
 }
 
-/// `cast_lookup` with `cast_map = None` returns `None` for every
-/// query. The `?` operator on the Option short-circuits before the
-/// BTreeMap lookup. Production code path: when the dump pass runs
+/// `cast_lookup_in_map` with `cast_map = None` returns `None` for
+/// every query. The `?` operator on the Option short-circuits before
+/// the BTreeMap lookup. Production code path: when the dump pass runs
 /// without a cast analysis (no scheduler binary supplied), every
 /// `u64` field renders as a plain counter — no typed-pointer
-/// promotion fires.
+/// promotion fires. Drives the production helper directly so the
+/// None-short-circuit guards production, not a copy.
 #[test]
 fn accessor_mem_reader_cast_lookup_with_none_map() {
-    use super::super::cast_analysis::CastMap;
+    use super::render_map::cast_lookup_in_map;
 
-    struct StubReader<'a> {
-        cast_map: Option<&'a CastMap>,
-    }
-    impl super::super::btf_render::MemReader for StubReader<'_> {
-        fn read_kva(&self, _: u64, _: usize) -> Option<Vec<u8>> {
-            None
-        }
-        fn cast_lookup(
-            &self,
-            parent_type_id: u32,
-            member_byte_offset: u32,
-        ) -> Option<super::super::btf_render::CastHit> {
-            let map = self.cast_map?;
-            map.get(&(parent_type_id, member_byte_offset)).copied()
-        }
-    }
-
-    let r = StubReader { cast_map: None };
-
-    // Every query returns None — the `?` on `self.cast_map` fires
+    // Every query returns None — the `?` on the None map fires
     // before any map lookup happens.
-    assert!(r.cast_lookup(0, 0).is_none());
-    assert!(r.cast_lookup(42, 8).is_none());
-    assert!(r.cast_lookup(u32::MAX, u32::MAX).is_none());
+    assert!(cast_lookup_in_map(None, 0, 0).is_none());
+    assert!(cast_lookup_in_map(None, 42, 8).is_none());
+    assert!(cast_lookup_in_map(None, u32::MAX, u32::MAX).is_none());
 }
 
 // -- AccessorMemReader resolve_arena_type -------------------------

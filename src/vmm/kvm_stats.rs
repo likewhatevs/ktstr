@@ -260,18 +260,43 @@ mod tests {
 
     #[test]
     fn stats_fd_returns_some_on_modern_kernel() {
+        // KVM_GET_STATS_FD is generic-uapi
+        // (KVM_CAP_BINARY_STATS_FD in
+        // kvm_vm_ioctl_check_extension_generic), present on every
+        // KVM since Linux 5.17. A host that can create a VM
+        // (KtstrKvm::new succeeds below) is such a kernel, so the
+        // ioctl on the VM fd MUST yield a stats fd — not the
+        // vacuous "if Some" the previous version allowed.
         let vm = KtstrKvm::new(test_topo(1), 64, false).unwrap();
-        if let Some(fd) = get_stats_fd(&*vm.vm_fd) {
-            assert!(fd.as_raw_fd() >= 0);
-        }
+        let fd = get_stats_fd(&*vm.vm_fd).expect("KVM_GET_STATS_FD on VM fd must return Some");
+        // The fd must be usable, not merely a valid number: the
+        // initial read returns the self-describing header+desc
+        // blob and parse_meta yields a non-empty descriptor list.
+        let buf = read_initial(fd.as_raw_fd()).expect("initial read of VM stats fd");
+        let meta = parse_meta_from_buf(&buf).expect("parse VM stats metadata");
+        assert!(
+            !meta.descs.is_empty(),
+            "VM stats fd must publish at least one descriptor",
+        );
     }
 
     #[test]
     fn vcpu_stats_fd_returns_some() {
+        // Same generic-uapi guarantee as the VM-level test:
+        // KVM_GET_STATS_FD on a vCPU fd MUST return Some on any
+        // KVM that could create the vCPU. Exercise the fd through
+        // parse and assert the per-vCPU "exits" stat is present so
+        // the test proves usable stats, not just a non-negative
+        // fd id.
         let vm = KtstrKvm::new(test_topo(1), 64, false).unwrap();
-        if let Some(fd) = get_stats_fd(&vm.vcpus[0]) {
-            assert!(fd.as_raw_fd() >= 0);
-        }
+        let fd =
+            get_stats_fd(&vm.vcpus[0]).expect("KVM_GET_STATS_FD on vCPU fd must return Some");
+        let buf = read_initial(fd.as_raw_fd()).expect("initial read of vCPU stats fd");
+        let meta = parse_meta_from_buf(&buf).expect("parse vCPU stats metadata");
+        assert!(
+            meta.descs.iter().any(|d| d.name == "exits"),
+            "vCPU stats descriptors must include the 'exits' counter",
+        );
     }
 
     #[test]

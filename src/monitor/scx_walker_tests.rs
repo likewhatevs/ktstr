@@ -5,6 +5,17 @@
 
 use super::*;
 
+/// `SCX_EXIT_ERROR_BPF` from `enum scx_exit_kind`
+/// (`kernel/sched/ext_internal.h`): a runtime error triggered through
+/// `scx_bpf_error()`. The kernel bases the error band at
+/// `SCX_EXIT_ERROR = 1024`, so `SCX_EXIT_ERROR_BPF` is the next
+/// member, `1025` (`SCX_EXIT_ERROR_STALL` is `1026`). Defined once
+/// here as the single source of truth for the `exit_kind` fixtures so
+/// the value and name cannot drift apart across the roundtrip and
+/// healthy-exit tests; `1027` (the prior inline literal) is not a
+/// member of the enum at all.
+const SCX_EXIT_ERROR_BPF: u32 = 1025;
+
 /// Pin RqScxState wire shape — every optional field skips
 /// on None, required fields land directly. Same coverage style
 /// as task_enrichment::tests::task_enrichment_serde_skip_none_fields.
@@ -160,8 +171,8 @@ fn scx_sched_state_serde_roundtrip() {
     let s = ScxSchedState {
         aborting: true,
         bypass_depth: 2,
-        // SCX_EXIT_ERROR_BPF per include/linux/sched/ext.h
-        exit_kind: 1027,
+        // SCX_EXIT_ERROR_BPF (1025) per kernel/sched/ext_internal.h.
+        exit_kind: SCX_EXIT_ERROR_BPF,
         ..Default::default()
     };
     let json = serde_json::to_string(&s).unwrap();
@@ -174,7 +185,7 @@ fn scx_sched_state_serde_roundtrip() {
     let mut v = Verdict::new();
     crate::claim!(v, parsed_aborting).eq(true);
     crate::claim!(v, parsed_bypass_depth).eq(2i32);
-    crate::claim!(v, parsed_exit_kind).eq(1027u32);
+    crate::claim!(v, parsed_exit_kind).eq(SCX_EXIT_ERROR_BPF);
     let r = v.into_result();
     assert!(
         r.is_pass(),
@@ -532,14 +543,17 @@ fn scx_sched_state_healthy_exit_kind_claim() {
     let aborted = ScxSchedState {
         aborting: true,
         bypass_depth: 4,
-        // SCX_EXIT_ERROR_BPF (1027) per include/linux/sched/ext.h.
-        exit_kind: 1027,
+        // SCX_EXIT_ERROR_BPF (1025) per kernel/sched/ext_internal.h.
+        exit_kind: SCX_EXIT_ERROR_BPF,
         ..Default::default()
     };
     let mut v = Verdict::new();
     crate::claim!(v, aborted.exit_kind).eq(0u32);
     let r = v.into_result();
-    assert!(!r.is_pass(), "exit_kind=1027 must fail eq(0)");
+    assert!(
+        !r.is_pass(),
+        "exit_kind=SCX_EXIT_ERROR_BPF ({SCX_EXIT_ERROR_BPF}) must fail eq(0)"
+    );
 }
 
 /// `walk_scx_tasks_global` returns an empty vec when the

@@ -1049,22 +1049,38 @@ mod tests {
 
     #[test]
     fn select_budget_constraint() {
-        // Budget only fits one test. Both have 4 features at 15s each.
-        // Equal ratio -> lexicographic tiebreak picks "t1".
+        // Both candidates carry 4 features at 15s each → IDENTICAL
+        // marginal-coverage-per-second ratios (4/15), but DISJOINT
+        // feature bits so each adds genuine marginal coverage. Budget
+        // is 20s: only one 15s test fits. The greedy's first pick is
+        // therefore decided purely by the lexicographic
+        // `c.name < best_name` tiebreak ("t1" < "t2" → index 0); the
+        // second test would add new coverage but its 15s cost exceeds
+        // the remaining 5s budget, so the budget constraint — not a
+        // zero-marginal skip — drops it. This exercises BOTH the
+        // tiebreak (first pick) and a binding budget (second drop),
+        // distinct from `select_prefers_coverage_per_second` (unequal
+        // ratios) and `select_tie_broken_by_name` (no budget cap).
         let candidates = vec![
             TestCandidate {
                 name: "t1".into(),
-                features: 0b1111,
+                features: 0b0000_1111,
                 estimated_secs: 15.0,
             },
             TestCandidate {
                 name: "t2".into(),
-                features: 0b110000,
+                features: 0b1111_0000,
                 estimated_secs: 15.0,
             },
         ];
         let sel = select(&candidates, 20.0);
-        assert_eq!(sel, vec![0]);
+        assert_eq!(
+            sel,
+            vec![0],
+            "equal ratios + 20s budget that fits only one 15s test \
+             must pick \"t1\" (lexicographic tiebreak) and drop \"t2\" \
+             (binding budget, not zero marginal)",
+        );
     }
 
     #[test]

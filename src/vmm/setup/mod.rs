@@ -744,7 +744,7 @@ impl KtstrVm {
         // Try COW overlay: mmap compressed base from SHM fd directly
         // into guest memory, sharing physical pages across VMs.
         let t0 = Instant::now();
-        let cow_guard = self.try_cow_overlay(&vm.guest_mem, key, lz4_base.len(), load_addr);
+        let cow_guard = Self::try_cow_overlay(&vm.guest_mem, key, lz4_base.len(), load_addr);
         // IMPORTANT: stash the guard on the VM IMMEDIATELY — before
         // any fallible operation below. If a `?` unwinds this function
         // with a locally-held guard still on the stack, the guard
@@ -968,8 +968,14 @@ impl KtstrVm {
     /// (typically the VM lifetime). Validates the segment starts with
     /// LZ4 legacy magic to reject stale data from a previous
     /// compression format.
+    ///
+    /// Associated function (no `&self`): the COW path is a pure
+    /// transform of `(guest_mem, key, expected_len, load_addr)` —
+    /// it reads the SHM segment keyed by `key.0` and maps it into
+    /// `guest_mem`, touching no VM instance state. Keeping it
+    /// `self`-free lets the unit test drive the real overlay logic
+    /// without constructing a full `KtstrVm`.
     fn try_cow_overlay(
-        &self,
         guest_mem: &GuestMemoryMmap,
         key: &BaseKey,
         expected_len: usize,

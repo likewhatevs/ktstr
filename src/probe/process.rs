@@ -876,6 +876,21 @@ fn set_rodata_slot(
     }
 }
 
+/// Causal-task filter for the trigger event's `task_ptr` (sourced
+/// from `args[0]`).
+///
+/// The BPF `ktstr_trigger_tp` handler sets `args[0]` to
+/// `bpf_get_current_task()` only for `SCX_EXIT_ERROR_BPF` (where
+/// `current` IS the causal task); for `SCX_EXIT_ERROR` (kworker /
+/// sysrq context) it emits `args[0] == 0`. A zero `task_ptr` means
+/// "no causal task" and must suppress probe stitching, so this
+/// returns `None` for 0 and `Some(p)` otherwise. `run_probe_skeleton`
+/// calls this on the last trigger event; the `args0_*` tests pin both
+/// sides of the contract against this exact predicate.
+fn causal_tptr(task_ptr: u64) -> Option<u64> {
+    Some(task_ptr).filter(|&p| p != 0)
+}
+
 /// Run the BPF probe skeleton for auto-repro.
 ///
 /// Operates in two modes depending on `phase_b_rx`:
@@ -2104,7 +2119,7 @@ pub fn run_probe_skeleton(
             // output is suppressed.
             let (target_tptr, trigger_kstack) = {
                 let guard = events.lock().unwrap();
-                let tptr = guard.last().map(|e| e.task_ptr).filter(|&p| p != 0);
+                let tptr = guard.last().and_then(|e| causal_tptr(e.task_ptr));
                 let kstack = guard.last().map(|e| e.kstack.clone()).unwrap_or_default();
                 (tptr, kstack)
             };
@@ -3099,24 +3114,22 @@ mod tests {
     fn args0_zero_filtered_for_scx_exit_error() {
         // SCX_EXIT_ERROR (1024) fires from non-causal contexts
         // (kworker, sysrq) — the BPF side emits args[0] = 0,
-        // so task_ptr is 0. The `target_tptr` filter in
-        // `run_probe_skeleton` must drop this via
-        // `Option::filter(|&p| p != 0)`. Verifying with the
-        // exact same expression form so a future swap to
-        // `>= 1` (intent-equivalent but unrelated to the spec)
-        // would still pass — tightening to `== 0` would catch
-        // a sentinel-value swap.
+        // so task_ptr is 0. The production `causal_tptr` filter
+        // that `run_probe_skeleton` applies to the trigger
+        // event's task_ptr must drop this (return None). Driving
+        // the real `causal_tptr` (not a re-implemented copy)
+        // means a regression that loosens the predicate (e.g.
+        // `p >= 1`, or removing the guard entirely) surfaces here.
         let event = make_trigger_event(0, SCX_EXIT_ERROR);
         assert_eq!(
             event.task_ptr, 0,
             "SCX_EXIT_ERROR must propagate args[0]=0 into task_ptr"
         );
-        let tptr_after_filter: Option<u64> = Some(event.task_ptr).filter(|&p| p != 0);
-        assert!(
-            tptr_after_filter.is_none(),
-            "task_ptr=0 must be filtered out by .filter(|&p| p != 0); \
-             got Some({:?})",
-            tptr_after_filter
+        assert_eq!(
+            super::causal_tptr(event.task_ptr),
+            None,
+            "task_ptr=0 must be filtered out by the production \
+             causal_tptr (no causal task → no stitch)"
         );
         assert_eq!(
             event.args[1], SCX_EXIT_ERROR,
@@ -3130,19 +3143,20 @@ mod tests {
         // the running task's context — the BPF side emits
         // args[0] = bpf_get_current_task() (a non-zero
         // task_struct pointer), so task_ptr is non-zero. The
-        // host-side filter must retain this event so stitching
-        // can proceed.
+        // production `causal_tptr` filter must retain this event
+        // (return Some) so stitching can proceed. Asserting
+        // against the real `causal_tptr` ties the test to the
+        // code path `run_probe_skeleton` actually runs.
         const FAKE_TASK_PTR: u64 = 0xffff_8881_1234_5678; // plausible kernel VA
         let event = make_trigger_event(FAKE_TASK_PTR, SCX_EXIT_ERROR_BPF);
         assert_eq!(
             event.task_ptr, FAKE_TASK_PTR,
             "SCX_EXIT_ERROR_BPF must propagate args[0]=task_ptr into task_ptr"
         );
-        let tptr_after_filter: Option<u64> = Some(event.task_ptr).filter(|&p| p != 0);
         assert_eq!(
-            tptr_after_filter,
+            super::causal_tptr(event.task_ptr),
             Some(FAKE_TASK_PTR),
-            "non-zero task_ptr must survive .filter(|&p| p != 0)"
+            "non-zero task_ptr must survive the production causal_tptr"
         );
         assert_eq!(
             event.args[1], SCX_EXIT_ERROR_BPF,

@@ -434,18 +434,34 @@ fn build_template_via_vm_rejects_raw_filesystem() {
 
 #[test]
 fn verify_cache_dir_walks_up_to_existing_ancestor() {
-    // A non-existent cache root must still produce a usable
-    // statfs result by walking up. Anchor the missing path under
-    // a per-test tempdir so parallel runs do not collide on a
-    // shared system path; the tempdir itself exists and walking
-    // up from `<tempdir>/nonexistent/sub/dir` reaches it on the
-    // first ancestor probe.
+    // A non-existent cache root must still resolve a usable statfs
+    // target by walking up to its nearest existing ancestor. Anchor
+    // the missing path under a per-test tempdir so parallel runs do
+    // not collide on a shared system path. Only `<tempdir>` itself
+    // exists; `<tempdir>/nonexistent`, `.../sub`, and `.../dir` do
+    // not, so the walk-up MUST land on `<tempdir>` exactly.
     let tmp = tempfile::tempdir().expect("create tempdir");
     let nonexistent = tmp.path().join("nonexistent/sub/dir");
-    // The result depends on the tempdir's filesystem; this test
-    // only pins that the helper does not panic and either
-    // returns Ok (btrfs/xfs tempdir) or a fs-magic-named error
-    // (anything else).
+
+    // POSITIVE contract: the walk-up reached the existing ancestor
+    // (the tempdir), not the missing leaf and not a higher ancestor.
+    // This is the "walked up to an existing ancestor" behaviour the
+    // test name promises — without this assertion a regression that
+    // returned `dir` unchanged (skipping the walk) or over-ascended
+    // to `/` would pass on a green outer verify.
+    let resolved = resolve_existing_ancestor(&nonexistent)
+        .expect("an existing ancestor (the tempdir) must be found");
+    assert_eq!(
+        resolved,
+        tmp.path(),
+        "walk-up must stop at the nearest existing ancestor (the \
+         tempdir), got {resolved:?}",
+    );
+
+    // And the full verify drives that same resolved ancestor into
+    // statfs: it either returns Ok (tempdir on btrfs/xfs) or a
+    // fs-magic-named error (any other filesystem). Either outcome is
+    // valid; the load-bearing assertion is the walk-up above.
     match verify_cache_dir_supports_reflink(&nonexistent) {
         Ok(()) => { /* tempdir lives on btrfs/xfs */ }
         Err(e) => {

@@ -1251,15 +1251,88 @@ fn set_mem_twice_keeps_first_instance() {
     );
 }
 
+/// A [`Backing`] whose `sync_data` always fails, for exercising
+/// `handle_flush_impl`'s Err arm. read/write/vectored ops are
+/// unreachable in the flush path so they panic if ever called.
+struct FlushFailBacking;
+
+impl Backing for FlushFailBacking {
+    fn read_at(&self, _buf: &mut [u8], _offset: u64) -> std::io::Result<usize> {
+        unreachable!("FlushFailBacking only exercises sync_data");
+    }
+    fn write_at(&self, _buf: &[u8], _offset: u64) -> std::io::Result<usize> {
+        unreachable!("FlushFailBacking only exercises sync_data");
+    }
+    fn sync_data(&self) -> std::io::Result<()> {
+        Err(std::io::Error::from_raw_os_error(libc::EIO))
+    }
+    unsafe fn preadv(&self, _iovs: &[libc::iovec], _offset: u64) -> std::io::Result<usize> {
+        unreachable!("FlushFailBacking only exercises sync_data");
+    }
+    unsafe fn pwritev(&self, _iovs: &[libc::iovec], _offset: u64) -> std::io::Result<usize> {
+        unreachable!("FlushFailBacking only exercises sync_data");
+    }
+}
+
+/// `handle_flush_impl` is the production flush handler
+/// (handlers.rs): it maps `Backing::sync_data` to a
+/// `(status_byte, used_len)` tuple and records the matching
+/// counter. Drive it directly through the `Backing` seam — the
+/// prior version of this test called std's `File::sync_data` and
+/// asserted nothing about the device handler.
+///
+/// Ok arm: a writable tempfile's `sync_data` succeeds →
+/// `(VIRTIO_BLK_S_OK, 1)` and `flushes_completed` += 1, `io_errors`
+/// unchanged.
 #[test]
-fn handle_flush_no_mem_no_panic() {
-    // Flush calls fdatasync on the backing file. Ensure it
-    // succeeds on a fresh tempfile (which is always
-    // fdatasync-able on Linux).
+fn handle_flush_impl_ok_maps_to_s_ok_and_records_flush() {
     let mut f = tempfile().unwrap();
     f.write_all(&[0u8; 1024]).unwrap();
-    // Direct call bypassing MMIO — sync_data must succeed.
-    f.sync_data().expect("tempfile sync_data must succeed");
+    let counters = VirtioBlkCounters::default();
+    let (status, used_len) = VirtioBlk::handle_flush_impl(&f, &counters);
+    assert_eq!(
+        status, VIRTIO_BLK_S_OK as u8,
+        "successful fdatasync must map to S_OK",
+    );
+    assert_eq!(used_len, 1, "flush publishes only the 1-byte status");
+    assert_eq!(
+        counters.flushes_completed.load(Ordering::Relaxed),
+        1,
+        "Ok arm must increment flushes_completed",
+    );
+    assert_eq!(
+        counters.io_errors.load(Ordering::Relaxed),
+        0,
+        "Ok arm must not touch io_errors",
+    );
+}
+
+/// Err arm of `handle_flush_impl`: a backing whose `sync_data`
+/// returns `Err` must map to `(VIRTIO_BLK_S_IOERR, 1)` and bump
+/// `io_errors`, leaving `flushes_completed` at 0. A regression
+/// that swallowed the error and reported S_OK (or that bumped the
+/// wrong counter) would silently tell the guest its flush
+/// succeeded when the backing rejected it — a data-integrity
+/// hazard for btrfs tree-consistency ordering.
+#[test]
+fn handle_flush_impl_err_maps_to_s_ioerr_and_records_io_error() {
+    let counters = VirtioBlkCounters::default();
+    let (status, used_len) = VirtioBlk::handle_flush_impl(&FlushFailBacking, &counters);
+    assert_eq!(
+        status, VIRTIO_BLK_S_IOERR as u8,
+        "failed fdatasync must map to S_IOERR",
+    );
+    assert_eq!(used_len, 1, "flush publishes only the 1-byte status");
+    assert_eq!(
+        counters.io_errors.load(Ordering::Relaxed),
+        1,
+        "Err arm must increment io_errors",
+    );
+    assert_eq!(
+        counters.flushes_completed.load(Ordering::Relaxed),
+        0,
+        "Err arm must NOT increment flushes_completed",
+    );
 }
 
 #[test]

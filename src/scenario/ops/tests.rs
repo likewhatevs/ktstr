@@ -1657,19 +1657,35 @@ fn cpusetspec_disjoint_two_partitions() {
 
 #[test]
 fn cpusetspec_disjoint_remainder_to_last() {
-    // 7 usable CPUs / 3 partitions = chunk=2, so partition 0=[0,1], 1=[2,3], 2=[4,5,6].
-    // Last partition gets the remainder.
+    // 8 CPUs, last reserved → 7 usable [0..6]. 7/3 = chunk 2, so
+    // partition 0=[0,1], 1=[2,3], and the last partition (index 2)
+    // gets `usable[start..usable.len()]` = [4,5,6] — chunk PLUS the
+    // remainder CPU (6). Pin the exact set: a regression in the
+    // last-partition branch that computed `end = (index+1)*chunk = 6`
+    // instead of `usable.len() = 7` would drop CPU 6, yielding [4,5]
+    // (len 2). An inequality `len >= chunk` would still accept that
+    // bug; the exact-set assertion catches it.
     let (cg, topo) = make_ctx(1, 8, 1);
     let ctx = ctx_from(&cg, &topo);
-    let usable_len = ctx.topo.usable_cpus().len();
+    let usable = ctx.topo.usable_cpus();
+    assert_eq!(
+        usable,
+        [0, 1, 2, 3, 4, 5, 6],
+        "fixture assumption: 8 CPUs minus 1 reserved = 7 usable [0..6]"
+    );
     let c = CpusetSpec::Disjoint { index: 2, of: 3 }.resolve(&ctx);
-    let chunk = usable_len / 3;
-    // Last partition should be >= chunk size (gets remainder).
+    let expected: BTreeSet<usize> = [4, 5, 6].into_iter().collect();
+    assert_eq!(
+        c, expected,
+        "last partition must absorb the remainder CPU (the tail of \
+         usable), got {c:?}"
+    );
+    // Explicitly pin that the tail usable CPU is in the last partition
+    // — the property the remainder-to-last contract guarantees.
     assert!(
-        c.len() >= chunk,
-        "last partition {}: expected >= {}",
-        c.len(),
-        chunk
+        c.contains(usable.last().unwrap()),
+        "last partition must include the final usable CPU {}",
+        usable.last().unwrap()
     );
 }
 
@@ -2397,28 +2413,95 @@ fn execute_steps_with_bails_on_invalid_hold_before_ops() {
     let _ = std::fs::remove_dir_all(&parent);
 }
 
-/// The SetAffinity dispatcher's `ResolvedAffinity::Random` arm is
-/// guarded by `!from.is_empty() && *count > 0` (see the
-/// `ResolvedAffinity::Random` arm with that same guard in
-/// `apply_ops`). This test mirrors that classification to lock
-/// the contract in place: future refactors that drop either
-/// side of the AND must update this test alongside the dispatch.
-/// The live dispatcher path is partially covered by the
-/// `apply_setup_*` tests via `MockCgroupOps`, but the SetAffinity
-/// arm specifically still requires a running workload handle to
-/// exercise end-to-end and is therefore only covered by its
-/// classification guard here.
+/// The SetAffinity dispatcher resolves its intent via the real
+/// `crate::scenario::resolve_affinity_for_cgroup` (see
+/// `Op::SetAffinity` in dispatch.rs) and the resulting
+/// `ResolvedAffinity::Random` is consumed by the spawn-pipeline
+/// guard `crate::workload::resolve_affinity`. Both production
+/// functions reject the no-op conditions the test name names —
+/// empty pool and `count == 0` — because an empty
+/// `sched_setaffinity` mask is rejected by the kernel with EINVAL
+/// (no-silent-drops invariant). This drives BOTH real guards
+/// rather than a re-declared copy of the `!from.is_empty() &&
+/// count > 0` classification, so flipping `||` to `&&`, dropping a
+/// side of the condition, or removing the bail in either
+/// production function fails this test.
 #[test]
 fn set_affinity_random_no_op_conditions() {
-    fn should_apply(from: &BTreeSet<usize>, count: usize) -> bool {
-        !from.is_empty() && count > 0
-    }
+    use crate::workload::ResolvedAffinity;
+
+    let (cg, topo) = make_ctx(1, 8, 1);
+    let ctx = ctx_from(&cg, &topo);
     let pool: BTreeSet<usize> = [0, 1, 2].into_iter().collect();
-    let empty: BTreeSet<usize> = BTreeSet::new();
-    assert!(should_apply(&pool, 2));
-    assert!(!should_apply(&pool, 0), "count=0 → no-op");
-    assert!(!should_apply(&empty, 1), "empty pool → no-op");
-    assert!(!should_apply(&empty, 0), "both zero → no-op");
+
+    // -- Upstream resolver (the function dispatch.rs calls at
+    // Op::SetAffinity) --
+
+    // Valid pool + count>0 resolves to Random with the pool intact.
+    let resolved = crate::scenario::resolve_affinity_for_cgroup(
+        &AffinityIntent::random_subset(pool.iter().copied(), 2),
+        None,
+        ctx.topo,
+    )
+    .expect("non-empty pool + count>0 must resolve");
+    match &resolved {
+        ResolvedAffinity::Random { from, count } => {
+            assert_eq!(*from, pool, "resolved pool must equal the intent pool");
+            assert_eq!(*count, 2, "resolved count must equal the intent count");
+        }
+        other => panic!("expected ResolvedAffinity::Random, got {other:?}"),
+    }
+
+    // count == 0 bails before any allocation.
+    let err = crate::scenario::resolve_affinity_for_cgroup(
+        &AffinityIntent::random_subset(pool.iter().copied(), 0),
+        None,
+        ctx.topo,
+    )
+    .expect_err("count=0 must bail (no-op condition)");
+    assert!(
+        format!("{err:#}").contains("count=0"),
+        "count=0 diagnostic expected, got: {err:#}"
+    );
+
+    // Empty pool with count>0 bails (no CPU to sample).
+    let err = crate::scenario::resolve_affinity_for_cgroup(
+        &AffinityIntent::random_subset(std::iter::empty::<usize>(), 1),
+        None,
+        ctx.topo,
+    )
+    .expect_err("empty pool must bail (no-op condition)");
+    assert!(
+        format!("{err:#}").contains("empty `from` pool"),
+        "empty-pool diagnostic expected, got: {err:#}"
+    );
+
+    // -- Downstream consumer guard (the spawn pipeline's
+    // ResolvedAffinity::Random consumer) — drives the SAME no-op
+    // classification that dispatch.rs's per-worker Random arm
+    // unreachable!()s on if it is ever reached. --
+
+    // Valid Random samples exactly `count` CPUs, all from the pool.
+    let sampled = crate::workload::resolve_affinity(&ResolvedAffinity::random([0, 1, 2], 2))
+        .expect("valid Random must resolve")
+        .expect("Random yields a concrete CPU set");
+    assert_eq!(sampled.len(), 2, "must sample exactly count CPUs");
+    assert!(
+        sampled.is_subset(&pool),
+        "sampled CPUs {sampled:?} must come from the pool {pool:?}"
+    );
+
+    // count == 0 bails.
+    assert!(
+        crate::workload::resolve_affinity(&ResolvedAffinity::random([0, 1, 2], 0)).is_err(),
+        "count=0 Random must bail in the consumer guard"
+    );
+    // Empty pool with count>0 bails.
+    assert!(
+        crate::workload::resolve_affinity(&ResolvedAffinity::random(std::iter::empty::<usize>(), 1))
+            .is_err(),
+        "empty-pool Random must bail in the consumer guard"
+    );
 }
 
 #[test]

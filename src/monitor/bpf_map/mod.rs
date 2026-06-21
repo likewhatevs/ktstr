@@ -1929,6 +1929,24 @@ impl GuestMemMapAccessorOwned {
         &self.kernel
     }
 
+    /// Build an owned accessor around a test-constructed
+    /// [`GuestKernel`] without parsing a vmlinux. The map offsets are
+    /// [`BpfMapOffsets::EMPTY`] and `map_idr_kva` is `0`, so this is
+    /// only usable by callers that touch the `GuestKernel`
+    /// (`page_offset`, symbol lookup, raw reads) and never walk the
+    /// map IDR — e.g. [`crate::vmm::capture_scx::build`], which reads
+    /// only `guest_kernel().page_offset()`. Production must use
+    /// [`Self::new`] / [`Self::from_elf`].
+    #[cfg(test)]
+    pub(crate) fn new_for_test(kernel: super::guest::GuestKernel) -> Self {
+        Self {
+            kernel,
+            map_idr_kva: 0,
+            offsets: BpfMapOffsets::EMPTY,
+            per_cpu_offsets_cache: PerCpuOffsetsCache::new(),
+        }
+    }
+
     // Map operations live on [`GuestMemMapAccessor`]. Borrow via
     // [`as_accessor`] to call them: `owned.as_accessor().find_map(...)`.
     // The wrapper type exists only to own the `GuestKernel` and

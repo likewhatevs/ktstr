@@ -2395,40 +2395,45 @@ fn addr_space_cast_ambiguous_shape_emits_deferred_resolve() {
     );
 }
 
-/// `BPF_ADDR_SPACE_CAST` kernel -> arena (`imm == 0x10000`) drops
-/// the destination register state. Per kernel `verifier.c
-/// check_alu_op` the result is a 32-bit arena address, not a
-/// kernel pointer the analyzer can track. A subsequent LDX
-/// through the cast result must NOT record any access pattern,
-/// so no entry appears in the output map. Production line
-/// (`set_reg(dst, Unknown)` under the kernel->arena branch)
-/// touches ONLY dst — src must retain its prior `LoadedU64Field`
-/// state, otherwise an unrelated deref through src would also
-/// stop recording, masking real cast evidence.
+/// `BPF_ADDR_SPACE_CAST` kernel -> arena (`imm == 0x10000`) on a
+/// `LoadedU64Field` source PROPAGATES the source's `RegState` into
+/// the destination register (and tags `arena_confirmed` for the
+/// source slot). Production (cast_analysis/mod.rs, the `imm == 1
+/// << 16` arm) does `self.regs[dst] = self.regs[src]` for a
+/// `LoadedU64Field` source — it does NOT drop dst to Unknown. A
+/// subsequent deref through the cast RESULT register therefore
+/// records the same chase finding the source slot would, which is
+/// the analyzer's may-analysis behavior for cross-subprog arena
+/// pointer detection (see sibling
+/// `addr_space_cast_kernel_arena_preserves_pointer_source` for the
+/// `Pointer{T}` source case).
+///
+/// Note: this propagation intentionally over-tracks relative to the
+/// kernel verifier, which `mark_reg_unknown`s the cast_user
+/// (`imm == 1U << 16`) destination with no type
+/// (kernel/bpf/verifier.c::check_alu_op). The analyzer keeps the
+/// typed state so a later deref through the cast result still
+/// attributes to the source struct field.
 #[test]
-fn addr_space_cast_kernel_to_arena_drops_dst() {
+fn addr_space_cast_kernel_to_arena_propagates_loaded_field() {
     let (blob, t_id, q_id) = btf_with_source_and_target(8, 0);
     let btf = Btf::from_bytes(&blob).unwrap();
     // r3 = *(u64 *)(r1 + 8)            ; r3 = LoadedU64Field{T, 8}
-    // r4 = (cast as(0) -> as(1)) r3    ; r4 = Unknown specifically
-    // r5 = *(u64 *)(r4 + 0)            ; r4 Unknown -> no record
-    // r6 = *(u64 *)(r3 + 0)            ; r3 retained -> records
-    // The trailing deref through r3 distinguishes
-    // "dst Unknown, src preserved" (correct) from "both
-    // clobbered" (regression where the cast spilled into src).
+    // r4 = (cast as(0) -> as(1)) r3    ; arena_confirmed += (T, 8),
+    //                                    r4 = LoadedU64Field{T, 8}
+    //                                    (propagated from r3)
+    // r5 = *(u64 *)(r4 + 0)            ; deref through the cast
+    //                                    RESULT -> records (T,8)->Q
+    // The deref is through r4 ALONE (no redundant r3 deref), so the
+    // recorded finding can ONLY come from r4 retaining the
+    // propagated LoadedU64Field state. If production had dropped r4
+    // to Unknown, the deref would attribute to no source and the
+    // map would be empty.
     let cast = mk_insn(BPF_CLASS_ALU64 | BPF_OP_MOV | BPF_SRC_X, 4, 3, 1, 0x10000);
-    // arena-evidence mitigation: include an arena→kernel cast on r3 to
-    // populate `arena_confirmed` for `(T, 8)`. Without it,
-    // shape inference alone would not emit the finding. The
-    // cast targets a fresh register so r3 retains its
-    // `LoadedU64Field` state for the trailing deref.
-    let arena_confirm = addr_space_cast(7, 3, 1);
     let insns = vec![
         ldx(BPF_SIZE_DW, 3, 1, 8),
-        arena_confirm,
         cast,
         ldx(BPF_SIZE_DW, 5, 4, 0),
-        ldx(BPF_SIZE_DW, 6, 3, 0),
         exit(),
     ];
     let map = analyze_casts(
@@ -2442,14 +2447,14 @@ fn addr_space_cast_kernel_to_arena_drops_dst() {
         &[],
         &[],
     );
-    // The deref through r3 unique-resolves to Q (the only
-    // BTF struct with a u64 at offset 0). If r3 had been
-    // clobbered, the access pattern would never have been
-    // recorded and the map would be empty.
+    // The deref through the propagated r4 unique-resolves to Q (the
+    // only BTF struct with a u64 at offset 0). The cast itself
+    // populated arena_confirmed for (T, 8), so shape inference
+    // emits the (T, 8) -> (Q, Arena) finding.
     assert_eq!(
         map.len(),
         1,
-        "exactly one cast (via preserved r3) expected: {map:?}"
+        "exactly one finding (via the propagated cast result r4) expected: {map:?}"
     );
     assert_eq!(
         map.get(&(t_id, 8)),
@@ -2458,14 +2463,8 @@ fn addr_space_cast_kernel_to_arena_drops_dst() {
             target_type_id: q_id,
             addr_space: AddrSpace::Arena,
         }),
-        "cast preserves src LoadedU64Field; dst-only invalidation: {map:?}"
-    );
-    // Verify the dst-derived deref produced no entry under
-    // any other (source, offset) key — only the (T, 8) ->
-    // (Q, Arena) finding from r3 is allowed.
-    assert!(
-        !map.keys().any(|k| *k != (t_id, 8)),
-        "no record may originate from r4 (cast-clobbered dst): {map:?}"
+        "kernel->arena cast propagates src LoadedU64Field into dst, so the \
+         deref through the cast result records (T, 8) -> (Q, Arena): {map:?}"
     );
 }
 
@@ -5958,19 +5957,19 @@ fn addr_space_cast_arena_imm1_on_pointer_propagates() {
 }
 
 /// `BPF_ADDR_SPACE_CAST` kernel -> arena (`imm == 0x10000`) on a
-/// `Pointer{T}` source drops the destination to Unknown, even
-/// though the source carries a typed kernel pointer. Production
-/// routes any imm other than `1` (including `0x10000`) through
-/// the else branch, which clears dst regardless of source state.
-/// A subsequent kptr STX through the destination must NOT record.
+/// `Pointer{T}` source PROPAGATES the typed kernel pointer into the
+/// destination register. Production (cast_analysis/mod.rs, the
+/// `imm == 1 << 16` arm) does `self.regs[dst] = self.regs[src]` when
+/// the source is a `Pointer{..}` (or `ArenaU64FromAlloc`) — it does
+/// NOT clear dst. A subsequent kptr STX through the cast result
+/// therefore records the finding.
 ///
-/// Sibling test `addr_space_cast_kernel_to_arena_drops_dst`
-/// covers the `LoadedU64Field` source case; this test verifies
-/// that `Pointer{T}` survives `addr_space_cast(imm=0x10000)` so
-/// subsequent field loads through the cast destination produce
-/// `LoadedU64Field` entries (needed for cross-subprog arena
-/// pointer detection where a callee casts a forwarded Pointer
-/// parameter).
+/// Sibling test `addr_space_cast_kernel_to_arena_propagates_loaded_field`
+/// covers the `LoadedU64Field` source case; this test verifies that
+/// `Pointer{T}` survives `addr_space_cast(imm=0x10000)` so subsequent
+/// field loads through the cast destination produce `LoadedU64Field`
+/// entries (needed for cross-subprog arena pointer detection where a
+/// callee casts a forwarded Pointer parameter).
 #[test]
 fn addr_space_cast_kernel_arena_preserves_pointer_source() {
     let slot_off: u32 = 16;

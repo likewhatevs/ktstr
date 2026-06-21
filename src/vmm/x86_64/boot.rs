@@ -766,16 +766,36 @@ mod tests {
 
     #[test]
     fn setup_msrs_with_extra_append() {
+        use crate::vmm::x86_64::msr_io::read_one_msr_required;
         use crate::vmm::x86_64::test_helpers::single_vcpu_kvm;
         let vm = single_vcpu_kvm();
-        // Append a new MSR (IA32_EFER = 0xC0000080)
+        // IA32_EFER (0xC000_0080) is NOT in default_msr_entries, so this
+        // exercises the append (new-index) branch. KVM resets EFER to 0
+        // (arch/x86/kvm/x86.c kvm_vcpu_reset: set_efer(vcpu, 0)), so a
+        // non-zero sentinel distinguishes "appended + written" from
+        // "silently dropped" (which would leave EFER at the reset 0).
+        const IA32_EFER: u32 = 0xC000_0080;
+        // EFER.SCE (bit 0) is the sentinel. A host-initiated KVM_SET_MSRS
+        // accepts it unconditionally: set_efer's __kvm_valid_efer /
+        // LME-paging checks are gated on !host_initiated, and SCE is not
+        // in efer_reserved_bits (~(EFER_SCE|EFER_LME|EFER_LMA)).
+        const EFER_SCE: u64 = 0x1;
         let extra = [kvm_bindings::kvm_msr_entry {
-            index: 0xC000_0080,
-            data: 0,
+            index: IA32_EFER,
+            data: EFER_SCE,
             ..Default::default()
         }];
-        // Should succeed without error — the extra MSR is appended
         setup_msrs(&vm.vcpus[0], Some(&extra)).unwrap();
+        // Read the appended MSR back: a value of EFER_SCE proves the
+        // new-index entry reached set_msrs and was written. If the append
+        // logic dropped the entry, EFER would still read its reset 0.
+        let data = read_one_msr_required(&vm.vcpus[0], IA32_EFER, "post-append");
+        assert_eq!(
+            data & EFER_SCE,
+            EFER_SCE,
+            "appended IA32_EFER entry must be written (EFER.SCE set); \
+             got {data:#x} — a 0 means the extra entry was dropped",
+        );
     }
 
     #[test]
@@ -1027,17 +1047,44 @@ mod tests {
 
     #[test]
     fn e820_at_mmio_boundary() {
-        // Memory exactly at MMIO gap start (3 GB) — should produce 2 entries
-        let mem = test_mem(3072); // 3 GB
-        let params = write_boot_params(&mem, "console=ttyS0", 3072, None, None, None);
-        assert!(params.is_ok());
+        // usable_size EXACTLY at MMIO gap start (3 GiB == MMIO_GAP_START)
+        // takes the `usable_size <= MMIO_GAP_START` branch: a single high
+        // RAM region [HIMEM_START, 3 GiB), no above-gap relocation. Pin
+        // the boundary outcome (2 entries, no above-gap split) — the
+        // distinct guard vs e820_exact_3gb_two_entries (which only checks
+        // the count). An off-by-one to `<` would split here and produce 3.
+        assert_eq!(3072u64 << 20, MMIO_GAP_START, "test premise: 3 GiB == gap start");
+        let mem = test_mem(3072); // 3 GiB
+        write_boot_params(&mem, "console=ttyS0", 3072, None, None, None).unwrap();
+        use linux_loader::loader::bootparam::boot_params;
+        let params: boot_params = mem.read_obj(GuestAddress(BOOT_PARAMS_ADDR)).unwrap();
+        let entries = { params.e820_entries };
+        assert_eq!(entries, 2, "3 GiB at gap start: low + single high, no split");
+        // The single high entry spans [HIMEM_START, 3 GiB) and there is
+        // NO relocated above-gap entry.
+        let addr1 = { params.e820_table[1].addr };
+        let size1 = { params.e820_table[1].size };
+        assert_eq!(addr1, HIMEM_START);
+        assert_eq!(size1, MMIO_GAP_START - HIMEM_START);
     }
 
     #[test]
     fn e820_above_mmio_gap() {
-        // Memory above MMIO gap (5 GB) — should produce 3 entries
-        let mem = test_mem(5120); // 5 GB
-        let params = write_boot_params(&mem, "console=ttyS0", 5120, None, None, None);
-        assert!(params.is_ok());
+        // Memory above the MMIO gap (5 GiB) takes the relocate branch:
+        // low + below-gap + above-gap == 3 entries, with the above-gap
+        // entry relocated to begin at MMIO_GAP_END. Pin the count AND the
+        // relocated base so a regression that drops the above-gap entry
+        // (count → 2) or relocates to the wrong base is caught.
+        let mem = test_mem(5120); // 5 GiB
+        write_boot_params(&mem, "console=ttyS0", 5120, None, None, None).unwrap();
+        use linux_loader::loader::bootparam::boot_params;
+        let params: boot_params = mem.read_obj(GuestAddress(BOOT_PARAMS_ADDR)).unwrap();
+        let entries = { params.e820_entries };
+        assert_eq!(entries, 3, "5 GiB: low + below-gap + above-gap");
+        let above_addr = { params.e820_table[2].addr };
+        assert_eq!(
+            above_addr, MMIO_GAP_END,
+            "above-gap RAM must be relocated to begin at MMIO_GAP_END",
+        );
     }
 }

@@ -429,6 +429,26 @@ pub(super) fn is_arena_addr_in_snapshot(
     addr >= snap.user_vm_start && addr < end
 }
 
+/// Free helper backing [`AccessorMemReader::cast_lookup`]: look up
+/// the [`CastHit`] for `(parent_type_id, member_byte_offset)` in the
+/// optional [`CastMap`]. `None` map (no cast analysis supplied — the
+/// dump pass ran without a scheduler binary) short-circuits before
+/// any map access; a present map returns the keyed entry by value
+/// ([`CastHit`] is `Copy`), or `None` when the exact key is absent
+/// (no fallback to nearby offsets). Extracted (mirroring
+/// [`is_arena_addr_in_snapshot`] / [`read_arena_in_snapshot`] /
+/// [`resolve_arena_type_in_index`]) so unit tests exercise the real
+/// short-circuit + keyed-lookup path without constructing the
+/// private [`AccessorMemReader`].
+pub(super) fn cast_lookup_in_map(
+    cast_map: Option<&CastMap>,
+    parent_type_id: u32,
+    member_byte_offset: u32,
+) -> Option<CastHit> {
+    let map = cast_map?;
+    map.get(&(parent_type_id, member_byte_offset)).copied()
+}
+
 /// Free helper backing [`AccessorMemReader::read_arena`]: read `len`
 /// bytes at arena user-address `addr` from the pre-pass snapshot,
 /// falling back to a live kernel-virtual read. Extracted (mirroring
@@ -824,8 +844,11 @@ impl MemReader for AccessorMemReader<'_> {
         // `bpf_map::resolve_to_struct_id`), matching the form
         // [`super::super::btf_render::render_struct`] threads down
         // as `parent_type_id` after [`super::super::btf_render::peel_modifiers_with_id`].
-        let map = self.cast_map?;
-        map.get(&(parent_type_id, member_byte_offset)).copied()
+        //
+        // Body lives in the free helper so unit tests reach the
+        // None-short-circuit and keyed-lookup path without the
+        // private [`AccessorMemReader`]. See [`cast_lookup_in_map`].
+        cast_lookup_in_map(self.cast_map, parent_type_id, member_byte_offset)
     }
     fn resolve_arena_type(&self, addr: u64) -> Option<ArenaResolveHit> {
         // Forwarder to the free helper so unit tests can exercise

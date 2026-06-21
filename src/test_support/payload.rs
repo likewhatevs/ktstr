@@ -1341,11 +1341,36 @@ mod tests {
     }
 
     #[test]
-    fn output_format_variants() {
-        let _: OutputFormat = OutputFormat::ExitCode;
-        let _: OutputFormat = OutputFormat::Json;
-        let _: OutputFormat = OutputFormat::LlmExtract(None);
-        let _: OutputFormat = OutputFormat::LlmExtract(Some("focus on iops"));
+    fn output_format_llm_extract_hint_round_trips() {
+        // The `LlmExtract` payload variant carries an optional focus
+        // hint that the host appends to the extraction prompt
+        // (`compose_prompt`). Pin that the hint is preserved through
+        // construction and pattern-matching — a regression that dropped
+        // or swapped the inner `Option<&str>` would silently send the
+        // model the wrong (or no) focus directive.
+        assert!(
+            matches!(
+                OutputFormat::LlmExtract(Some("focus on iops")),
+                OutputFormat::LlmExtract(Some(h)) if h == "focus on iops",
+            ),
+            "Some(hint) must carry the exact hint string",
+        );
+        assert!(
+            matches!(
+                OutputFormat::LlmExtract(None),
+                OutputFormat::LlmExtract(None),
+            ),
+            "None hint must match the no-hint arm",
+        );
+        // A Some-hint must NOT match the None arm (the discriminant on
+        // the inner Option is load-bearing for the prompt path).
+        assert!(
+            !matches!(
+                OutputFormat::LlmExtract(Some("x")),
+                OutputFormat::LlmExtract(None),
+            ),
+            "Some(hint) must not match the None arm",
+        );
     }
 
     #[test]
@@ -1681,9 +1706,21 @@ mod tests {
 
     #[test]
     fn output_format_derive_debug_clone_copy() {
+        // Debug must name the variant (mirrors
+        // `payload_kind_debug_renders_variant_and_identity`).
+        let s = format!("{:?}", OutputFormat::Json);
+        assert!(s.contains("Json"), "Debug must name the variant: {s}");
+
+        // Copy semantics observably: after `let b = a;` the original
+        // `a` is still usable (a move would make this fail to compile),
+        // and both render identically.
         let a = OutputFormat::Json;
-        let b = a; // Copy
-        let _ = format!("{a:?} {b:?}"); // Debug
+        let b = a; // Copy, not move.
+        assert_eq!(
+            format!("{a:?}"),
+            format!("{b:?}"),
+            "copied value must Debug-render identically to the original",
+        );
     }
 
     #[test]

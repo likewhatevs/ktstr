@@ -628,7 +628,7 @@ impl<R: Read> Read for DownloadStream<R> {
 /// chunk; the watchdog provides the tighter 60s no-progress bound.
 const DOWNLOAD_REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// Total request timeout for [`fetch_stable_sha256sums`]: bounds
+/// Total request timeout for [`fetch_sha256sums_from_url`]: bounds
 /// the wall-clock window for the single small-body GET that
 /// retrieves the cleartext-signed checksum manifest. The body is
 /// the `sha256sums.asc` cleartext block — typically a few KiB of
@@ -646,19 +646,33 @@ const DOWNLOAD_REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(300);
 /// than a wedged build.
 const SHA256SUMS_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Fetch the cleartext SHA-256 manifest published alongside stable
-/// kernel tarballs at
+/// Construct the cdn.kernel.org `sha256sums.asc` URL for a stable
+/// major series:
 /// `https://cdn.kernel.org/pub/linux/kernel/v{major}.x/sha256sums.asc`.
+/// Single source of truth for the manifest URL shape, used by
+/// [`resolve_expected_sha256`] (production) and shared with the
+/// URL-injection test seam so the two never drift.
+fn sha256sums_url(major: u32) -> String {
+    format!("https://cdn.kernel.org/pub/linux/kernel/v{major}.x/sha256sums.asc")
+}
+
+/// GET the cleartext SHA-256 manifest at `url` and return its body.
 ///
 /// Returns the file body as a `String` on success. Any error
 /// (transport failure, non-2xx status, non-UTF-8 body) is
 /// propagated; the caller treats failure as "no expected hash
 /// available" and downgrades verification to a warning.
-fn fetch_stable_sha256sums(client: &Client, major: u32) -> Result<String> {
-    let url = format!("https://cdn.kernel.org/pub/linux/kernel/v{major}.x/sha256sums.asc");
+///
+/// Takes the full `url` rather than a `major` so the GET-and-status
+/// mechanics are reachable with an injected URL (a localhost mock)
+/// without a real cdn.kernel.org round-trip — mirrors the
+/// [`fetch_releases`] / [`cached_releases_with_url`] seam. Production
+/// reaches this only via [`resolve_expected_sha256_from_url`], whose
+/// URL is pinned by [`sha256sums_url`].
+fn fetch_sha256sums_from_url(client: &Client, url: &str) -> Result<String> {
     tracing::info!(%url, "fetching kernel tarball sha256sums (requires network)");
     let response = client
-        .get(&url)
+        .get(url)
         .timeout(SHA256SUMS_REQUEST_TIMEOUT)
         .send()
         .with_context(|| format!("fetch {url}"))?;
@@ -765,6 +779,22 @@ fn resolve_expected_sha256(
     tarball_name: &str,
     skip_sha256: bool,
 ) -> Option<String> {
+    resolve_expected_sha256_from_url(client, &sha256sums_url(major), tarball_name, skip_sha256)
+}
+
+/// URL-injectable core of [`resolve_expected_sha256`]: the skip-gate,
+/// fetch-then-parse, and per-cause warn-and-downgrade logic, against
+/// an arbitrary `sha256sums_url`. Production reaches this only via
+/// [`resolve_expected_sha256`], which pins the URL to
+/// [`sha256sums_url`]; the seam exists so the no-skip arm's
+/// fetch-and-parse path is testable against a localhost mock without a
+/// real cdn.kernel.org round-trip — mirrors [`cached_releases_with_url`].
+fn resolve_expected_sha256_from_url(
+    client: &Client,
+    sha256sums_url: &str,
+    tarball_name: &str,
+    skip_sha256: bool,
+) -> Option<String> {
     if skip_sha256 {
         tracing::warn!(
             tarball = %tarball_name,
@@ -781,7 +811,7 @@ fn resolve_expected_sha256(
     // download still proceeds. The warning surfaces the cause so an
     // operator triaging "kernel build went weird" can spot that
     // verification was skipped.
-    match fetch_stable_sha256sums(client, major) {
+    match fetch_sha256sums_from_url(client, sha256sums_url) {
         Ok(manifest) => match parse_sha256_for_file(&manifest, tarball_name) {
             Some(hex) => Some(hex),
             None => {

@@ -470,51 +470,15 @@ fn try_cow_overlay_rejects_cross_region_span() {
     );
 }
 
-#[test]
-fn try_cow_overlay_preserves_adjacent_region_bytes() {
-    // Proves the invariant at the application layer: with the
-    // bounds check in place, we never invoke mmap(MAP_FIXED),
-    // which means bytes outside the validated range stay
-    // untouched. We simulate "before" bytes in region B, run the
-    // same bounds check try_cow_overlay uses, observe that it
-    // rejects the request, and check region B's bytes survive.
-    use vm_memory::{Bytes, GuestAddress, GuestMemory};
-    let region_a_size: usize = 64 * 1024;
-    let region_b_size: usize = 64 * 1024;
-    let region_a_start: u64 = 0;
-    let region_b_start: u64 = 1 << 20;
-    let mem = vm_memory::GuestMemoryMmap::<()>::from_ranges(&[
-        (GuestAddress(region_a_start), region_a_size),
-        (GuestAddress(region_b_start), region_b_size),
-    ])
-    .unwrap();
-
-    // Seed region B with a detectable marker.
-    let marker: Vec<u8> = (0..region_b_size).map(|i| (i & 0xff) as u8).collect();
-    mem.write_slice(&marker, GuestAddress(region_b_start))
-        .unwrap();
-
-    // Compute an oversized COW request: starts in region A, len
-    // spans the whole guest range up to the end of region B.
-    let overrun_load_addr = region_a_start;
-    let overrun_len = (region_b_start + region_b_size as u64) as usize;
-
-    // This is the same check try_cow_overlay uses; on failure it
-    // returns early and never invokes cow_overlay. We assert the
-    // rejection and the preservation of region B's contents.
-    assert!(
-        mem.get_slice(GuestAddress(overrun_load_addr), overrun_len)
-            .is_err(),
-        "oversized overlay must be rejected before MAP_FIXED"
-    );
-    let mut readback = vec![0u8; region_b_size];
-    mem.read_slice(&mut readback, GuestAddress(region_b_start))
-        .unwrap();
-    assert_eq!(
-        readback, marker,
-        "region B must be untouched when bounds check rejects cow_overlay"
-    );
-}
+// NOTE: the former `try_cow_overlay_preserves_adjacent_region_bytes`
+// test lived here but never invoked the production `try_cow_overlay`
+// (it re-implemented the bounds check inline and asserted that NOT
+// writing leaves memory unchanged — a tautology). It is replaced by
+// `try_cow_overlay_maps_segment_and_preserves_adjacent_region` and
+// `try_cow_overlay_rejects_oversized_request_and_preserves_region`
+// in `src/vmm/setup/tests.rs`, which drive the real function against
+// a live LZ4 SHM segment. The `try_cow_overlay_rejects_cross_region_span`
+// test below remains as the vm_memory `get_slice` dependency-contract pin.
 
 #[test]
 fn load_initramfs_parts_sequential() {
@@ -1139,10 +1103,20 @@ fn include_files_preserves_mode() {
         ),
     )
     .unwrap();
-    let s = String::from_utf8_lossy(&base);
-    assert!(
-        s.contains("include-files/run.sh"),
-        "include path should appear in cpio"
+    // build_initramfs_base captures the host file's real mode
+    // (meta.permissions().mode()) and writes the include entry with it,
+    // so the cpio entry's mode must be exactly the 0o100755 we chmod'd —
+    // a regression forcing every include to 0o644 (or dropping the
+    // executable bit) would change this value. The name-presence is
+    // covered by include_files_adds_directory_entries.
+    let entries = cpio_entries(&base);
+    let entry = entries
+        .iter()
+        .find(|(name, ..)| name == "include-files/run.sh")
+        .expect("include-files/run.sh entry missing");
+    assert_eq!(
+        entry.2, 0o100755,
+        "include file mode must be preserved (S_IFREG | 0o755)",
     );
 }
 

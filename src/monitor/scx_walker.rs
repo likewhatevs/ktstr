@@ -206,8 +206,9 @@ pub struct ScxSchedState {
     pub bypass_depth: i32,
     /// `scx_sched.exit_kind` — the SCX_EXIT_* enum value latched
     /// at `scx_error()` time. 0 means no exit yet; non-zero values
-    /// match `enum scx_exit_kind` in
-    /// `include/linux/sched/ext.h`.
+    /// match `enum scx_exit_kind` in `kernel/sched/ext_internal.h`
+    /// (e.g. `SCX_EXIT_ERROR = 1024`, `SCX_EXIT_ERROR_BPF = 1025`,
+    /// `SCX_EXIT_ERROR_STALL = 1026`).
     pub exit_kind: u32,
     /// `scx_sched.watchdog_timeout` (jiffies) at the snapshot
     /// instant. `None` when the field was not captured — either

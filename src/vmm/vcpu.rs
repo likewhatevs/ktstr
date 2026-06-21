@@ -1460,25 +1460,85 @@ mod tests {
         assert!(sig <= libc::SIGRTMAX(), "signal should be <= SIGRTMAX");
     }
 
+    /// [`VcpuThread::wait_for_exit`] must block on its `exit_evt`
+    /// epoll until the AP signals exit, then return promptly. Drives
+    /// the real wait path (epoll + 10ms-kick timerfd + `exited`
+    /// Acquire load) end-to-end: the AP thread sleeps briefly, then
+    /// performs the production exit handshake (`exited.store(true)`
+    /// THEN `exit_evt.write(1)` — the same order the AP loop and the
+    /// panic hook use) and the parent's `wait_for_exit` must observe
+    /// the eventfd wake and return well under its timeout.
     #[test]
-    fn vcpu_exit_flag_transitions() {
-        // AtomicBool used as vcpu exit flag must transition false->true
-        // and the store must be visible to a subsequent load.
+    fn vcpu_wait_for_exit_returns_on_exit_signal() {
+        use std::sync::Barrier;
+        // SIGRTMIN handler so the periodic re-kick `pthread_kill`
+        // inside wait_for_exit does not terminate the test process.
+        register_vcpu_signal_handler();
+        let topo = Topology {
+            llcs: 1,
+            cores_per_llc: 1,
+            threads_per_core: 1,
+            numa_nodes: 1,
+            nodes: None,
+            distances: None,
+        };
+        let mut vm = kvm::KtstrKvm::new(topo, 64, false).unwrap();
+        let probe_vcpu = vm.vcpus.remove(0);
+
         let exited = Arc::new(AtomicBool::new(false));
+        let exit_evt = Arc::new(EventFd::new(EFD_NONBLOCK).unwrap());
+        let alive = Arc::new(AtomicBool::new(true));
+
+        // The AP thread waits for a go signal, sleeps a beat so the
+        // parent is already blocked in epoll_wait, then signals exit
+        // in the production order before handing back its VcpuFd.
+        let go = Arc::new(Barrier::new(2));
+        let go_ap = go.clone();
+        let exited_ap = Arc::clone(&exited);
+        let exit_evt_ap = Arc::clone(&exit_evt);
+        let handle = std::thread::Builder::new()
+            .name("wait-for-exit-stub".into())
+            .spawn(move || {
+                go_ap.wait();
+                std::thread::sleep(Duration::from_millis(20));
+                // Production exit handshake: flip the flag, then bump
+                // the eventfd so the epoll wake and the Acquire load
+                // both observe the exit.
+                exited_ap.store(true, Ordering::Release);
+                exit_evt_ap.write(1).unwrap();
+                probe_vcpu
+            })
+            .unwrap();
+
+        let vt = VcpuThread {
+            handle,
+            exited,
+            immediate_exit: None,
+            exit_evt,
+            alive,
+        };
+
+        // Before the AP signals, wait_for_exit must NOT short-circuit:
+        // the `exited` flag is still false, so the fast-path return at
+        // the top of wait_for_exit does not fire and the call would
+        // block. Release the AP and time the real wait.
+        assert!(!vt.exited.load(Ordering::Acquire), "pre-signal: not exited");
+        go.wait();
+        let start = Instant::now();
+        // Generous ceiling vs the ~20ms AP delay; a regression that
+        // failed to wake on exit_evt would burn the full timeout.
+        vt.wait_for_exit(Duration::from_secs(5));
+        let waited = start.elapsed();
         assert!(
-            !exited.load(Ordering::Acquire),
-            "initial state must be false"
+            vt.exited.load(Ordering::Acquire),
+            "wait_for_exit must only return once exited is observed true",
         );
-        // Simulate vcpu exit: another thread sets the flag.
-        let exited_clone = Arc::clone(&exited);
-        let handle = std::thread::spawn(move || {
-            exited_clone.store(true, Ordering::Release);
-        });
-        handle.join().unwrap();
         assert!(
-            exited.load(Ordering::Acquire),
-            "flag must be true after cross-thread store"
+            waited < Duration::from_secs(2),
+            "wait_for_exit must wake on exit_evt promptly, not burn the \
+             timeout: waited {waited:?}",
         );
+        let _ = vt.handle.join();
     }
 
     /// Pin the millisecond-precision Duration→jiffies conversion.

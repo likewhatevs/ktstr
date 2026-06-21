@@ -1919,36 +1919,103 @@ fn resolve_expected_sha256_skip_returns_none_without_network() {
     );
 }
 
-/// Mirror of the bypass test against the no-skip arg path with
-/// a tarball name the parser will not match (we substitute the
-/// network call by going through a localhost mock would require
-/// rerouting; instead this test relies on the production
-/// fetch_stable_sha256sums hitting kernel.org over reqwest with
-/// a 5-second timeout — too slow for a unit test). The bypass
-/// branch itself is the security-sensitive surface; the
-/// network-dependent fallback paths are covered by the
-/// `parse_sha256_for_file_*` family above (manifest parsing) and
-/// `fetch_releases_*` family (fetch error handling). Pinning
-/// the no-skip arg path's "does not panic on a malformed
-/// version" property is the most we can do without a network
-/// mock.
+/// Create a mockito server with a canned `sha256sums.asc`
+/// response. Returns (server, url, mock). The server owns the
+/// port — no port collisions under parallel nextest. Mirrors
+/// [`mock_releases`] for the checksum-manifest endpoint.
+fn mock_sha256sums(status: usize, body: &str) -> (mockito::ServerGuard, String, mockito::Mock) {
+    let mut server = mockito::Server::new();
+    let mock = server
+        .mock("GET", "/sha256sums.asc")
+        .with_status(status)
+        .with_body(body)
+        .create();
+    let url = format!("{}/sha256sums.asc", server.url());
+    (server, url, mock)
+}
+
+/// `resolve_expected_sha256` with `skip_sha256 = false` drives
+/// the real fetch-then-parse path: it GETs the manifest, parses
+/// the entry for `tarball_name`, and returns `Some(lowercase_hex)`
+/// when present. Routed through the URL-injection seam
+/// [`super::resolve_expected_sha256_from_url`] (mirroring
+/// [`cached_releases_with_url`]) so the no-skip arm hits a
+/// localhost [`mockito`] server instead of cdn.kernel.org — no
+/// real network, deterministic value pinned. The prior version of
+/// this test discarded the result with `let _` and only proved
+/// "did not panic" against a 1ms-timeout network call.
 #[test]
-fn resolve_expected_sha256_no_skip_does_not_panic_on_invalid_major() {
-    // Calls into fetch_stable_sha256sums which constructs a URL
-    // and issues a GET; the network attempt may succeed against
-    // kernel.org or fail with timeout. Either way the function
-    // must return `Option<String>` without panicking. This is a
-    // smoke test only; the full network-dependent fallback path
-    // is exercised end-to-end by the integration tests in
-    // tests/extra_kconfig_e2e.rs.
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_millis(1))
-        .connect_timeout(std::time::Duration::from_millis(1))
-        .build()
-        .expect("build test client with tight timeouts");
-    // major=999 is a kernel.org URL that returns 404; the
-    // function must surface this as None+warning, not panic.
-    let _ = super::resolve_expected_sha256(&client, 999, "linux-999.0.0.tar.xz", false);
+fn resolve_expected_sha256_no_skip_returns_digest_when_entry_present() {
+    let manifest = "\
+-----BEGIN PGP SIGNED MESSAGE-----
+Hash: SHA256
+
+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  linux-6.14.1.tar.xz
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  linux-6.14.2.tar.xz
+-----BEGIN PGP SIGNATURE-----
+... signature payload ...
+-----END PGP SIGNATURE-----
+";
+    let (_server, url, _mock) = mock_sha256sums(200, manifest);
+    let client = test_client();
+    let got =
+        super::resolve_expected_sha256_from_url(&client, &url, "linux-6.14.2.tar.xz", false);
+    assert_eq!(
+        got.as_deref(),
+        Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+        "no-skip path must fetch the manifest, parse the matching \
+             entry, and return its lowercase digest; got {got:?}",
+    );
+}
+
+/// `resolve_expected_sha256` (no-skip) downgrades to `None` when
+/// the manifest is fetched but carries no entry for the requested
+/// tarball — the warn-and-continue fallback that keeps a build
+/// progressing through schema drift / a rotated entry. Drives the
+/// real fetch-then-parse path against a localhost mock so the
+/// `Ok(manifest) => None` arm of the production match is exercised
+/// (not just `parse_sha256_for_file` in isolation).
+#[test]
+fn resolve_expected_sha256_no_skip_returns_none_when_entry_absent() {
+    let manifest = "\
+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  linux-6.14.1.tar.xz
+";
+    let (_server, url, _mock) = mock_sha256sums(200, manifest);
+    let client = test_client();
+    let got = super::resolve_expected_sha256_from_url(
+        &client,
+        &url,
+        "linux-9.99.99.tar.xz",
+        false,
+    );
+    assert!(
+        got.is_none(),
+        "no-skip path must return None when the fetched manifest \
+             has no entry for the tarball (warn-and-continue); got {got:?}",
+    );
+}
+
+/// `resolve_expected_sha256` (no-skip) downgrades to `None` when
+/// the manifest fetch itself fails (HTTP 404). Drives the
+/// `Err(err) => None` arm of the production match through the
+/// URL-injection seam against a localhost mock returning 404 —
+/// the fetch-failure fallback that lets a transient CDN outage
+/// proceed without verification rather than wedging the build.
+#[test]
+fn resolve_expected_sha256_no_skip_returns_none_on_fetch_error() {
+    let (_server, url, _mock) = mock_sha256sums(404, "Not Found");
+    let client = test_client();
+    let got = super::resolve_expected_sha256_from_url(
+        &client,
+        &url,
+        "linux-999.0.0.tar.xz",
+        false,
+    );
+    assert!(
+        got.is_none(),
+        "no-skip path must return None when the manifest fetch \
+             fails (HTTP 404 warn-and-continue); got {got:?}",
+    );
 }
 
 // -- verify_sha256 --

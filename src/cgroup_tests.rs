@@ -1305,25 +1305,54 @@ fn remove_cgroup_auto_unfreezes_before_drain() {
     );
 }
 
-/// `remove_cgroup` swallows ENOENT on the unfreeze write so a
-/// cgroup without `cgroup.freeze` (legacy kernel without
-/// CONFIG_CGROUP_FREEZE) still drains cleanly. The drain reaches
-/// `cgroup.procs` instead of returning early because of the
-/// missing freeze file.
+/// `remove_cgroup` gates the pre-drain unfreeze on `cgroup.freeze`
+/// existence (legacy kernel without CONFIG_CGROUP_FREEZE has no such
+/// file). When the file is absent, the unfreeze branch must NOT
+/// early-return or error — the drain must still run and migrate the
+/// cgroup's pids to `{walk_root}/cgroup.procs`.
+///
+/// Observable proof: seed `cg_x/cgroup.procs` with a fake pid, point
+/// `walk_root` at the tempdir so the drain destination is writable,
+/// and assert the pid landed at `{walk_root}/cgroup.procs` after the
+/// call. A regression where the missing freeze file produced a hard
+/// error (or an early return) before the drain would leave the
+/// destination empty and fail this assertion — which a "does not
+/// panic" check could never catch, because `remove_cgroup` returns
+/// `Result` (the rmdir at the end always fails on the leftover
+/// regular files, so the result is `Err` regardless of whether the
+/// drain ran).
 #[test]
 fn remove_cgroup_tolerates_missing_freeze_file() {
-    // Helper pre-creates cgroup.procs (drain_tasks needs it).
-    // Deliberately omit cgroup.freeze.
-    let (_tempdir_keep_alive, _inner, cg) = make_test_cgroup_with_procs("nofrz");
-    // The rmdir at the end fails on tmpfs (cgroup.procs left
-    // over) — we only care that no error propagates from the
-    // pre-drain unfreeze branch. The test would catch a
-    // regression where the missing freeze file produces a hard
-    // error before the drain runs.
+    let _tempdir_keep_alive = make_inline_tempdir("nofrz");
+    let dir = _tempdir_keep_alive.path();
+    let inner = dir.join("cg_x");
+    fs::create_dir_all(&inner).unwrap();
+    // Source cgroup.procs holds one fake pid; the drain reads this.
+    // Deliberately omit cgroup.freeze so the unfreeze branch is
+    // gated off.
+    fs::write(inner.join("cgroup.procs"), "4242\n").unwrap();
+    // Destination cgroup.procs (the writable walk root) starts
+    // empty; drain_tasks migrates the source pid here.
+    fs::write(dir.join("cgroup.procs"), "").unwrap();
+    // Point walk_root at the tempdir so the drain destination is
+    // observable (the default `/sys/fs/cgroup` is not writable in
+    // tests). parent == walk_root == dir, which satisfies the
+    // prefix invariant.
+    let cg = CgroupManager::new(dir.to_str().unwrap())
+        .with_walk_root(dir)
+        .unwrap();
+
+    // rmdir at the end fails on the leftover regular files; we
+    // ignore the result and assert on the drain side effect.
     let _ = cg.remove_cgroup("cg_x");
-    // No assertion on the freeze file — it never existed. The
-    // test passes when the call body runs to completion without
-    // panicking on the tolerated ENOENT branch.
+
+    // The fake pid landed at the walk root — proving the missing
+    // freeze file did NOT short-circuit the drain.
+    assert_eq!(
+        fs::read_to_string(dir.join("cgroup.procs")).unwrap().trim(),
+        "4242",
+        "drain must reach {{walk_root}}/cgroup.procs even when cgroup.freeze is absent",
+    );
 }
 
 /// `cleanup_recursive` writes `0` to `cgroup.freeze` before

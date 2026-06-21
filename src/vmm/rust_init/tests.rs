@@ -13,16 +13,39 @@ fn mkdir_p_creates_nested() {
     assert!(nested.exists());
 }
 
-/// Uses raw `std::env::temp_dir()` (not `tempfile::TempDir`)
-/// because the test's premise is "mkdir_p is a no-op when the
-/// dir already exists" — pointing at an existing dir is the
-/// whole point. `tempfile::TempDir` would also work, but raw
-/// `temp_dir()` is closer to the production input: `mkdir_p`
-/// is called against arbitrary already-existing system paths.
+/// `mkdir_p` against an already-existing directory must leave
+/// it present (the existing-dir branch is a no-op, NOT a
+/// remove-and-recreate). Uses a fresh `tempfile::TempDir` so the
+/// directory's identity is observable: capture the dir's inode
+/// before the no-op call and assert it is byte-identical after,
+/// proving `mkdir_p` did not unlink+recreate (which would mint a
+/// new inode) — a stronger guard than mere `is_dir()`, which a
+/// remove-and-recreate would still satisfy.
 #[test]
 fn mkdir_p_existing_is_noop() {
-    let tmp = std::env::temp_dir();
-    mkdir_p(tmp.to_str().unwrap());
+    use std::os::unix::fs::MetadataExt;
+    // Create the directory first so the second call hits the
+    // existing-dir (recursive-create-is-idempotent) branch.
+    let tempdir = tempfile::Builder::new()
+        .prefix("ktstr-rust-init-test-mkdir-noop-")
+        .tempdir()
+        .unwrap();
+    let path = tempdir.path();
+    assert!(path.is_dir(), "tempdir setup must create the directory");
+    let ino_before = fs::metadata(path).unwrap().ino();
+
+    // The no-op call: the directory already exists.
+    mkdir_p(path.to_str().unwrap());
+
+    // Postcondition: still a directory, and the SAME directory
+    // (same inode) — not unlinked and recreated.
+    assert!(path.is_dir(), "mkdir_p on an existing dir must leave it present");
+    let ino_after = fs::metadata(path).unwrap().ino();
+    assert_eq!(
+        ino_before, ino_after,
+        "mkdir_p on an existing dir must be a true no-op \
+         (inode {ino_before} != {ino_after} means it removed+recreated)",
+    );
 }
 
 #[test]
@@ -54,6 +77,7 @@ fn exec_shell_line_unsupported_input_returns_err() {
 /// roll-up, so an operator scanning init-log for the
 /// sched_enable result couldn't easily count failures.
 #[test]
+#[tracing_test::traced_test]
 fn exec_shell_script_counts_per_line_failures() {
     // Build a script with one valid echo + one unsupported
     // command. The valid line writes a sentinel value to a
@@ -76,15 +100,56 @@ fn exec_shell_script_counts_per_line_failures() {
     exec_shell_script(script.path().to_str().unwrap());
     let payload = fs::read_to_string(payload_path).unwrap();
     assert_eq!(payload, "7\n", "valid line must still apply");
+
+    // The headline behavior is the roll-up summary: a single
+    // error-level emit reporting the failure count. Pin both the
+    // message body and the structured count fields so a
+    // regression that drops the summary, miscounts, or downgrades
+    // the level trips here (the side-effect assert above alone
+    // would still pass under any of those regressions).
+    assert!(
+        logs_contain("1 line(s) failed, 1 line(s) ok"),
+        "partial-apply summary must report the per-line counts in its message",
+    );
+    assert!(
+        logs_contain("fail_count=1"),
+        "summary must carry the structured fail_count field",
+    );
+    assert!(
+        logs_contain("ok_count=1"),
+        "summary must carry the structured ok_count field",
+    );
 }
 
 /// File-not-found returns silently (legitimate "no script"
 /// case for the optional sched_enable/sched_disable hooks).
 /// Pins the debug-level skip so a future refactor that flipped
-/// the missing-file path to error-level would surface here.
+/// the missing-file path to error-level — or to a partial-apply
+/// summary — would surface here. `traced_test` installs a
+/// capturing subscriber with a `<crate>=trace` filter, so the
+/// DEBUG skip line is captured and observable.
 #[test]
+#[tracing_test::traced_test]
 fn exec_shell_script_missing_file_returns_silently() {
     exec_shell_script("/tmp/ktstr-tax-nonexistent-script-path");
+    // The NotFound arm must log the skip at DEBUG and return —
+    // observe the concrete no-op: the debug skip line is present.
+    assert!(
+        logs_contain("no script (skipping)"),
+        "missing-file must take the DEBUG skip branch",
+    );
+    // ...and must NOT escalate to the error arm ("read failed"),
+    // nor emit a partial-apply summary ("line(s) failed"): a
+    // regression flipping NotFound to error-level or running the
+    // line loop on absent content would trip one of these.
+    assert!(
+        !logs_contain("read failed"),
+        "missing-file must NOT hit the error-level read-failed arm",
+    );
+    assert!(
+        !logs_contain("line(s) failed"),
+        "missing-file must NOT emit a partial-apply failure summary",
+    );
 }
 
 #[test]

@@ -727,13 +727,6 @@ fn assert_max_spread_pct() {
     assert_eq!(v.max_spread_pct, Some(25.0));
 }
 
-#[test]
-fn gap_threshold_debug_vs_release() {
-    let t = gap_threshold_ms();
-    // In test builds (debug_assertions=true), threshold is 3000.
-    assert!(t >= 2000, "threshold should be at least 2000ms: {t}");
-}
-
 // -- Assert::has_worker_checks --
 
 #[test]

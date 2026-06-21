@@ -147,6 +147,18 @@ pub(crate) const BULK_PORT_DEV: &str = "/dev/vport0p1";
 static BULK_PORT_FD: std::sync::OnceLock<std::sync::Mutex<Option<std::fs::File>>> =
     std::sync::OnceLock::new();
 
+/// Test-only counter of [`write_to_bulk_port`] entries. Incremented
+/// on the FIRST line of `write_to_bulk_port`, which the `is_guest()`
+/// gate in [`write_msg`] reaches only inside a guest context. A
+/// host-context sender call short-circuits in `write_msg` and never
+/// touches this counter — so a test that snapshots the count, calls a
+/// void-returning sender from host context, and re-reads the count
+/// can assert the write was SUPPRESSED (count unchanged), not merely
+/// that the call did not panic.
+#[cfg(test)]
+pub(crate) static BULK_PORT_WRITE_ATTEMPTS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// Try to open [`BULK_PORT_DEV`] for writing. Returns None when the
 /// device is not yet present — the kernel virtio_console driver
 /// creates it via `device_create` inside `add_port`
@@ -215,6 +227,12 @@ fn write_msg(msg_type: u32, payload: &[u8]) -> bool {
 /// partial frames in the byte stream, so any per-iovec virtqueue
 /// submissions reassemble correctly.
 fn write_to_bulk_port(msg_type: u32, payload: &[u8]) -> bool {
+    // Test-only: record that the guest-only write path was entered.
+    // Reached only after `write_msg`'s `is_guest()` gate passes, so a
+    // host-context sender call never bumps this. See
+    // [`BULK_PORT_WRITE_ATTEMPTS`].
+    #[cfg(test)]
+    BULK_PORT_WRITE_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let slot = BULK_PORT_FD.get_or_init(|| std::sync::Mutex::new(None));
     let mut guard = slot.lock_unpoisoned();
     if guard.is_none() {
@@ -434,14 +452,21 @@ pub fn send_test_result(result: &crate::assert::AssertResult) {
 /// Send per-payload-invocation metrics to the host. Payload:
 /// postcard-encoded [`crate::test_support::PayloadMetrics`].
 ///
-/// Frames with [`MsgType::PayloadMetrics`].
-pub fn send_payload_metrics(metrics: &crate::test_support::PayloadMetrics) {
+/// Frames with [`MsgType::PayloadMetrics`]. Returns `true` when the
+/// frame was fully written, `false` when the bulk port was not open
+/// (handshake in flight), the write failed, the postcard encode
+/// failed, OR the call originated from host context (the
+/// [`write_msg`] -> [`assert_guest_context`] early-return). The
+/// fire-and-forget caller in
+/// [`crate::scenario::payload_run::emit_payload_metrics`] discards
+/// the return at statement position; the boolean exists so the
+/// host-context no-op is observable to a test rather than swallowed.
+pub fn send_payload_metrics(metrics: &crate::test_support::PayloadMetrics) -> bool {
     match postcard::to_stdvec(metrics) {
-        Ok(bytes) => {
-            write_msg(MsgType::PayloadMetrics.wire_value(), &bytes);
-        }
+        Ok(bytes) => write_msg(MsgType::PayloadMetrics.wire_value(), &bytes),
         Err(e) => {
             eprintln!("ktstr: postcard-encode PayloadMetrics for bulk-port emit: {e}");
+            false
         }
     }
 }
@@ -1414,7 +1439,18 @@ mod tests {
     //! which gates on `is_guest()`. The host-context check
     //! rejects every call from these tests — verifying that gate
     //! holds is the safest unit-test scope: it confirms the wrappers
-    //! do not accidentally write to a host process's memory.
+    //! do not write to the host's bulk-port path.
+    //!
+    //! The void-returning senders give the caller no return value to
+    //! inspect, so "did not write" is observed via
+    //! [`BULK_PORT_WRITE_ATTEMPTS`]: [`assert_no_bulk_write`] snapshots
+    //! the global write-path entry counter, runs the sender, and
+    //! asserts the counter did not advance — the concrete no-op
+    //! observation (suppression), not merely "did not panic". The
+    //! `is_guest()` override is thread-local, so the host-context gate
+    //! these tests exercise cannot be perturbed by parallel tests;
+    //! and no test calls a sender in guest context, so the global
+    //! counter is never advanced concurrently with these snapshots.
     //!
     //! End-to-end transport (guest → bulk port → host drain → TLV
     //! parse) is exercised by the integration test suite under
@@ -1422,22 +1458,44 @@ mod tests {
 
     use super::*;
 
-    /// `send_exit` from host context must be a no-op (no panic).
+    /// Run `f` (a host-context sender call) and assert it did NOT
+    /// enter `write_to_bulk_port` — i.e. the `is_guest()` gate in
+    /// `write_msg` suppressed the write. Snapshots
+    /// [`BULK_PORT_WRITE_ATTEMPTS`] before and after; a host-context
+    /// sender must leave it unchanged.
+    fn assert_no_bulk_write(label: &str, f: impl FnOnce()) {
+        use std::sync::atomic::Ordering;
+        let before = BULK_PORT_WRITE_ATTEMPTS.load(Ordering::SeqCst);
+        f();
+        let after = BULK_PORT_WRITE_ATTEMPTS.load(Ordering::SeqCst);
+        assert_eq!(
+            after, before,
+            "{label}: host-context call must NOT reach write_to_bulk_port; \
+             the is_guest() gate failed to suppress the write \
+             (before={before}, after={after})",
+        );
+    }
+
+    /// `send_exit` from host context must suppress the bulk-port write.
     #[test]
     fn send_exit_from_host_context_is_noop() {
         let _g = IsGuestOverrideGuard::new(false);
-        send_exit(0);
-        send_exit(-1);
+        assert_no_bulk_write("send_exit(0)", || send_exit(0));
+        assert_no_bulk_write("send_exit(-1)", || send_exit(-1));
     }
 
-    /// `send_test_result` from host context is a no-op.
+    /// `send_test_result` from host context suppresses the write.
     #[test]
     fn send_test_result_from_host_context_is_noop() {
         let _g = IsGuestOverrideGuard::new(false);
-        send_test_result(&crate::assert::AssertResult::pass());
+        assert_no_bulk_write("send_test_result", || {
+            send_test_result(&crate::assert::AssertResult::pass())
+        });
     }
 
-    /// `send_payload_metrics` from host context is a no-op.
+    /// `send_payload_metrics` from host context is a no-op and
+    /// reports it by returning `false` (the `assert_guest_context`
+    /// early-return inside `write_msg`), mirroring `send_sys_rdy`.
     #[test]
     fn send_payload_metrics_from_host_context_is_noop() {
         let _g = IsGuestOverrideGuard::new(false);
@@ -1446,24 +1504,27 @@ mod tests {
             metrics: vec![],
             exit_code: 0,
         };
-        send_payload_metrics(&pm);
+        assert!(
+            !send_payload_metrics(&pm),
+            "host-context send must return false (no frame written)"
+        );
     }
 
-    /// `send_profraw` from host context is a no-op.
+    /// `send_profraw` from host context suppresses the write.
     #[test]
     fn send_profraw_from_host_context_is_noop() {
         let _g = IsGuestOverrideGuard::new(false);
-        send_profraw(b"\x01\x02\x03");
+        assert_no_bulk_write("send_profraw", || send_profraw(b"\x01\x02\x03"));
     }
 
-    /// `send_stimulus` from host context is a no-op.
+    /// `send_stimulus` from host context suppresses the write.
     #[test]
     fn send_stimulus_from_host_context_is_noop() {
         let _g = IsGuestOverrideGuard::new(false);
-        send_stimulus(&[0u8; 24]);
+        assert_no_bulk_write("send_stimulus", || send_stimulus(&[0u8; 24]));
     }
 
-    /// `send_raw_payload_output` from host context is a no-op.
+    /// `send_raw_payload_output` from host context suppresses the write.
     #[test]
     fn send_raw_payload_output_from_host_context_is_noop() {
         let _g = IsGuestOverrideGuard::new(false);
@@ -1475,30 +1536,36 @@ mod tests {
             metric_hints: vec![],
             metric_bounds: None,
         };
-        send_raw_payload_output(&raw);
+        assert_no_bulk_write("send_raw_payload_output", || send_raw_payload_output(&raw));
     }
 
-    /// `send_sched_exit` from host context is a no-op.
+    /// `send_sched_exit` from host context suppresses the write.
     #[test]
     fn send_sched_exit_from_host_context_is_noop() {
         let _g = IsGuestOverrideGuard::new(false);
-        send_sched_exit(0);
-        send_sched_exit(-1);
+        assert_no_bulk_write("send_sched_exit(0)", || send_sched_exit(0));
+        assert_no_bulk_write("send_sched_exit(-1)", || send_sched_exit(-1));
     }
 
-    /// `send_scenario_start` from host context is a no-op.
+    /// `send_scenario_start` from host context suppresses the write.
+    /// `send_scenario_start` retries the write up to 5 times on a
+    /// not-yet-open port; the host-context gate must short-circuit
+    /// EVERY attempt, so the write-path counter stays put despite the
+    /// retry loop.
     #[test]
     fn send_scenario_start_from_host_context_is_noop() {
         let _g = IsGuestOverrideGuard::new(false);
-        send_scenario_start();
+        assert_no_bulk_write("send_scenario_start", send_scenario_start);
     }
 
-    /// `send_scenario_end` from host context is a no-op.
+    /// `send_scenario_end` from host context suppresses the write.
     #[test]
     fn send_scenario_end_from_host_context_is_noop() {
         let _g = IsGuestOverrideGuard::new(false);
-        send_scenario_end(0, 0);
-        send_scenario_end(u64::MAX, u64::MAX);
+        assert_no_bulk_write("send_scenario_end(0,0)", || send_scenario_end(0, 0));
+        assert_no_bulk_write("send_scenario_end(MAX,MAX)", || {
+            send_scenario_end(u64::MAX, u64::MAX)
+        });
     }
 
     /// `send_sys_rdy` from host context returns false (no-op +
@@ -1528,44 +1595,56 @@ mod tests {
         assert!(!send_stderr_chunk(b"oops"));
     }
 
-    /// `send_sched_log` from host context is a no-op.
+    /// `send_sched_log` from host context suppresses the write.
     #[test]
     fn send_sched_log_from_host_context_is_noop() {
         let _g = IsGuestOverrideGuard::new(false);
-        send_sched_log(b"---SCHED_OUTPUT_START---\n");
+        assert_no_bulk_write("send_sched_log", || {
+            send_sched_log(b"---SCHED_OUTPUT_START---\n")
+        });
     }
 
-    /// `send_lifecycle` from host context is a no-op for every
-    /// phase, including the reason-bearing variant.
+    /// `send_lifecycle` from host context suppresses the write for
+    /// every phase, including the reason-bearing variant.
     #[test]
     fn send_lifecycle_from_host_context_is_noop() {
         let _g = IsGuestOverrideGuard::new(false);
-        send_lifecycle(LifecyclePhase::InitStarted, "");
-        send_lifecycle(LifecyclePhase::PayloadStarting, "");
-        send_lifecycle(LifecyclePhase::SchedulerDied, "");
-        send_lifecycle(LifecyclePhase::SchedulerNotAttached, "verifier rejected");
+        assert_no_bulk_write("send_lifecycle(InitStarted)", || {
+            send_lifecycle(LifecyclePhase::InitStarted, "")
+        });
+        assert_no_bulk_write("send_lifecycle(PayloadStarting)", || {
+            send_lifecycle(LifecyclePhase::PayloadStarting, "")
+        });
+        assert_no_bulk_write("send_lifecycle(SchedulerDied)", || {
+            send_lifecycle(LifecyclePhase::SchedulerDied, "")
+        });
+        assert_no_bulk_write("send_lifecycle(SchedulerNotAttached)", || {
+            send_lifecycle(LifecyclePhase::SchedulerNotAttached, "verifier rejected")
+        });
     }
 
-    /// `send_exec_exit` from host context is a no-op.
+    /// `send_exec_exit` from host context suppresses the write.
     #[test]
     fn send_exec_exit_from_host_context_is_noop() {
         let _g = IsGuestOverrideGuard::new(false);
-        send_exec_exit(0);
-        send_exec_exit(-1);
+        assert_no_bulk_write("send_exec_exit(0)", || send_exec_exit(0));
+        assert_no_bulk_write("send_exec_exit(-1)", || send_exec_exit(-1));
     }
 
-    /// `send_dmesg` from host context is a no-op.
+    /// `send_dmesg` from host context suppresses the write.
     #[test]
     fn send_dmesg_from_host_context_is_noop() {
         let _g = IsGuestOverrideGuard::new(false);
-        send_dmesg(b"[    0.000000] Linux version 6.16.0\n");
+        assert_no_bulk_write("send_dmesg", || {
+            send_dmesg(b"[    0.000000] Linux version 6.16.0\n")
+        });
     }
 
-    /// `send_probe_output` from host context is a no-op.
+    /// `send_probe_output` from host context suppresses the write.
     #[test]
     fn send_probe_output_from_host_context_is_noop() {
         let _g = IsGuestOverrideGuard::new(false);
-        send_probe_output(b"{}\n");
+        assert_no_bulk_write("send_probe_output", || send_probe_output(b"{}\n"));
     }
 
     /// `request_snapshot` from host context returns `TransportError`.

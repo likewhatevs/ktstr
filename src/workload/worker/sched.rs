@@ -85,12 +85,28 @@ pub(super) fn parse_schedstat_line(data: &str) -> Option<(u64, u64, u64)> {
 /// `CONFIG_SCHEDSTATS`.
 pub(super) fn warn_schedstat_unavailable_once() {
     static WARNED: std::sync::Once = std::sync::Once::new();
-    WARNED.call_once(|| {
+    if claim_warn_slot(&WARNED) {
         eprintln!(
             "workload: /proc/self/schedstat unavailable (CONFIG_SCHEDSTATS off?); \
              schedstat_* fields in WorkerReport will be zero"
         );
-    });
+    }
+}
+
+/// Claim the one-shot warning slot guarded by `once`. Returns `true`
+/// exactly once across the lifetime of a given `Once` (the first
+/// call), `false` on every subsequent call. This is the testable
+/// core of the "warn at most once" gate: the caller emits its
+/// warning only when this returns `true`, so a regression that
+/// dropped the gate (warning on every call) would make this return
+/// `true` repeatedly and trip the unit test. Backed by
+/// [`std::sync::Once::call_once`] so the first-call determination is
+/// race-free across the worker threads that share a process-wide
+/// `Once`.
+pub(super) fn claim_warn_slot(once: &std::sync::Once) -> bool {
+    let mut first = false;
+    once.call_once(|| first = true);
+    first
 }
 
 /// Aggregate per-node page counts from `/proc/self/numa_maps`.

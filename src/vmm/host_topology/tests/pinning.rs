@@ -72,15 +72,39 @@ fn hugepages_needed_values() {
 }
 
 #[test]
-fn hugepages_free_runs() {
-    // `hugepages_free` returns 0 (not Err / not panic) when
-    // `/sys/kernel/mm/hugepages/hugepages-2048kB/free_hugepages`
-    // is absent, so this smoke test is safe to run on any host
-    // regardless of hugetlbfs configuration. Only the 2 MiB
-    // pool is consulted (matches the exact path the
-    // implementation opens); other hugepage sizes are not
-    // read here.
-    let _ = hugepages_free();
+fn hugepages_free_parses_count_and_falls_back_to_zero() {
+    // Drive the path-parameterized core `hugepages_free_from` against
+    // fixture files so the parse and the documented 0-fallback are
+    // pinned independent of the host's hugetlbfs configuration. The
+    // public `hugepages_free()` is this function applied to the fixed
+    // 2 MiB-pool sysfs path.
+    let tmp_dir = tempfile::TempDir::new().unwrap();
+
+    // Happy parse: a trimmed integer count round-trips exactly.
+    let present = tmp_dir.path().join("free_hugepages");
+    std::fs::write(&present, "7\n").unwrap();
+    assert_eq!(
+        hugepages_free_from(&present),
+        7,
+        "trimmed count must parse to its u64 value",
+    );
+
+    // Documented 0-fallback: an absent file yields 0, never Err/panic.
+    let missing = tmp_dir.path().join("nonexistent_free_hugepages");
+    assert_eq!(
+        hugepages_free_from(&missing),
+        0,
+        "absent sysfs file must fall back to 0",
+    );
+
+    // Non-numeric contents also fall back to 0 (parse failure path).
+    let garbage = tmp_dir.path().join("garbage_free_hugepages");
+    std::fs::write(&garbage, "not-a-number\n").unwrap();
+    assert_eq!(
+        hugepages_free_from(&garbage),
+        0,
+        "unparseable contents must fall back to 0",
+    );
 }
 
 #[test]
@@ -487,19 +511,32 @@ fn max_cores_per_llc_uniform() {
 }
 
 #[test]
-fn mbind_to_nodes_empty_is_noop() {
-    // Empty `nodes` slice short-circuits before the `mbind(2)`
-    // syscall, so neither a null pointer nor a non-zero size
-    // reaches the kernel. Guards against a regression where a
-    // caller passing `&[]` would either fault on the null ptr
-    // or silently mbind the "all nodes" default set.
-    // SAFETY: both calls hit the `nodes.is_empty()` short-circuit
-    // before `addr` is dereferenced, so the null pointer is never
-    // passed to the syscall.
-    unsafe {
-        mbind_to_nodes(std::ptr::null_mut(), 0, &[]);
-        mbind_to_nodes(std::ptr::null_mut(), 4096, &[]);
-    }
+fn mbind_to_nodes_short_circuits_on_empty_nodes_or_zero_len() {
+    // `mbind_to_nodes` short-circuits before the `mbind(2)` syscall
+    // (and before dereferencing `addr`) exactly when
+    // `mbind_should_skip` returns true: an empty node set or a
+    // zero-length region. Assert the pure predicate directly — the
+    // through-`mbind_to_nodes` path swallows syscall errors, so a
+    // not-crashing call would pass regardless of whether the guard
+    // was present, defeating the test's purpose.
+    //
+    // Skip cases (no policy target / no bytes to bind):
+    assert!(mbind_should_skip(0, &[]), "empty nodes + zero len skips");
+    assert!(
+        mbind_should_skip(4096, &[]),
+        "empty nodes skips regardless of len",
+    );
+    assert!(
+        mbind_should_skip(0, &[0, 1]),
+        "zero len skips regardless of nodes",
+    );
+
+    // Do-work case: a non-empty node set with a non-zero region must
+    // NOT skip — this is the branch that reaches the syscall.
+    assert!(
+        !mbind_should_skip(4096, &[0, 1]),
+        "non-empty nodes + non-zero len must reach the mbind syscall",
+    );
 }
 
 #[test]

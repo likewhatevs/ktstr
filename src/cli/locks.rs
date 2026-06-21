@@ -831,25 +831,25 @@ mod tests {
     // SIGINT handler — `--watch` loop kill flag
     // ---------------------------------------------------------------
 
-    /// `LOCKS_WATCH_KILL` starts at `false` so the watch loop
-    /// runs at least one iteration before the first SIGINT could
-    /// fire. The flag stays at `false` until the SIGINT handler
-    /// flips it. Pins the initial state of the global atomic.
+    /// `LOCKS_WATCH_KILL` must read `false` in the cleared state so
+    /// the `--watch` redraw loop runs at least one iteration before
+    /// a SIGINT can fire. A sibling test (`*_flips_kill_flag`) may
+    /// have left the flag set; reset it first so the assertion pins
+    /// the cleared-state contract the loop's `if KILL { break }`
+    /// gate (see [`list_locks`]) depends on, not whatever a prior
+    /// test happened to leave behind.
     #[test]
     fn locks_watch_kill_default_state_is_false() {
-        // The atomic might have been flipped by a sibling test
-        // that exercised the SIGINT handler — the test only pins
-        // the initial-state contract via direct read after the
-        // expected initialization order. To avoid coupling to
-        // sibling-test ordering, snapshot the value once and
-        // assert structural shape (Bool atomic, SeqCst ordering).
-        let _ = LOCKS_WATCH_KILL.load(std::sync::atomic::Ordering::SeqCst);
-        // Type / API assertion: the symbol exists at the expected
-        // path with a SeqCst load. Reading an atomic bool with
-        // SeqCst is the API contract the watch loop depends on; a
-        // future regression that switched the type to Relaxed or
-        // moved the symbol would break the watch loop's exit
-        // semantics.
+        use std::sync::atomic::Ordering::SeqCst;
+        // Clear, then assert the cleared state reads false. Without
+        // the reset this would be coupled to sibling-test ordering;
+        // with it the test concretely pins "cleared ⇒ loop runs".
+        LOCKS_WATCH_KILL.store(false, SeqCst);
+        assert!(
+            !LOCKS_WATCH_KILL.load(SeqCst),
+            "cleared LOCKS_WATCH_KILL must read false so the watch \
+             loop runs at least one iteration before SIGINT",
+        );
     }
 
     /// Calling the SIGINT handler with a synthetic signal flips

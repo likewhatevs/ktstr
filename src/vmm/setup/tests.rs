@@ -396,3 +396,133 @@ fn assemble_extras_and_key_threads_staged_into_basekey_in_both_modes() {
          BaseKey constructor",
     );
 }
+
+/// Drive the REAL `try_cow_overlay` against a live LZ4 SHM segment and a
+/// two-region `GuestMemoryMmap`. The overlay must succeed (return
+/// `Some`), map the SHM bytes into region A, and leave the adjacent
+/// marker region B byte-for-byte untouched. Exercises the full prod
+/// path — `shm_open_lz4`, the LZ4-magic pread validation, the rounded-
+/// length bounds check, and the `MAP_FIXED` overlay via `cow_overlay` —
+/// not a re-implementation of the bounds check.
+#[test]
+fn try_cow_overlay_maps_segment_and_preserves_adjacent_region() {
+    use vm_memory::{Bytes, GuestAddress};
+
+    let page = host_page_size() as usize;
+    // Region A holds the overlay target; region B holds a marker that
+    // must survive. Each is several host pages so the rounded-up overlay
+    // length fits comfortably inside region A.
+    let region_a_size = page * 4;
+    let region_b_size = page * 4;
+    let region_a_start: u64 = 0;
+    let region_b_start: u64 = (region_a_size as u64) + (1 << 20); // 1 MiB gap
+    let mem = GuestMemoryMmap::<()>::from_ranges(&[
+        (GuestAddress(region_a_start), region_a_size),
+        (GuestAddress(region_b_start), region_b_size),
+    ])
+    .unwrap();
+
+    // Plant a detectable marker across the whole of region B.
+    let marker: Vec<u8> = (0..region_b_size).map(|i| (i & 0xff) as u8).collect();
+    mem.write_slice(&marker, GuestAddress(region_b_start))
+        .unwrap();
+
+    // Store a real LZ4-magic SHM segment (one host page of content) and
+    // key the overlay off its content hash. Use a hash unlikely to
+    // collide with any concurrent test's segment.
+    let hash = 0xC0FF_EE00_DEAD_F00Du64;
+    let _ = rustix::shm::unlink(initramfs::shm_lz4_segment_name(hash).as_str());
+    let mut segment = initramfs::LZ4_LEGACY_MAGIC.to_vec();
+    segment.extend((segment.len()..page).map(|i| (i & 0xff) as u8));
+    assert_eq!(segment.len(), page, "segment sized to one host page");
+    initramfs::shm_store_lz4(hash, &segment).unwrap();
+
+    let key = BaseKey(hash);
+    let guard = KtstrVm::try_cow_overlay(&mem, &key, segment.len(), region_a_start);
+    assert!(
+        guard.is_some(),
+        "overlay of a valid, in-bounds, page-aligned segment must succeed",
+    );
+
+    // Region A now reflects the SHM segment content (MAP_PRIVATE reads
+    // see the backing bytes until first write).
+    let mut a_readback = vec![0u8; segment.len()];
+    mem.read_slice(&mut a_readback, GuestAddress(region_a_start))
+        .unwrap();
+    assert_eq!(
+        a_readback, segment,
+        "region A must reflect the COW-mapped segment bytes",
+    );
+
+    // Region B is byte-for-byte untouched — the overlay never reached it.
+    let mut b_readback = vec![0u8; region_b_size];
+    mem.read_slice(&mut b_readback, GuestAddress(region_b_start))
+        .unwrap();
+    assert_eq!(
+        b_readback, marker,
+        "adjacent region B must be untouched by the overlay",
+    );
+
+    // Drop the guard (releases LOCK_SH + closes fd) BEFORE the guest
+    // memory unmaps the MAP_FIXED region, matching the prod drop order.
+    drop(guard);
+    drop(mem);
+    let _ = rustix::shm::unlink(initramfs::shm_lz4_segment_name(hash).as_str());
+}
+
+/// Drive the REAL `try_cow_overlay` with a request whose rounded length
+/// overruns region A into the inter-region gap. The prod bounds check
+/// (`get_slice` on the rounded length) must reject it: `try_cow_overlay`
+/// returns `None`, never invokes `MAP_FIXED`, and the adjacent marker
+/// region survives. Unlike the dependency-contract pin in
+/// `initramfs_tests.rs` (which calls `get_slice` directly), this routes
+/// through the production function, so dropping the guard or bounds-
+/// checking `len` instead of `rounded_len` would fail here.
+#[test]
+fn try_cow_overlay_rejects_oversized_request_and_preserves_region() {
+    use vm_memory::{Bytes, GuestAddress};
+
+    let page = host_page_size() as usize;
+    let region_a_size = page * 2;
+    let region_b_size = page * 2;
+    let region_a_start: u64 = 0;
+    let region_b_start: u64 = (region_a_size as u64) + (1 << 20); // 1 MiB gap
+    let mem = GuestMemoryMmap::<()>::from_ranges(&[
+        (GuestAddress(region_a_start), region_a_size),
+        (GuestAddress(region_b_start), region_b_size),
+    ])
+    .unwrap();
+
+    let marker: Vec<u8> = (0..region_b_size).map(|i| (i & 0xff) as u8).collect();
+    mem.write_slice(&marker, GuestAddress(region_b_start))
+        .unwrap();
+
+    // Segment one host page LARGER than region A: the rounded overlay
+    // length cannot fit, so the bounds check must reject it.
+    let hash = 0xBADC_0DE0_0BAD_F00Du64;
+    let _ = rustix::shm::unlink(initramfs::shm_lz4_segment_name(hash).as_str());
+    let oversized_len = region_a_size + page;
+    let mut segment = initramfs::LZ4_LEGACY_MAGIC.to_vec();
+    segment.extend((segment.len()..oversized_len).map(|i| (i & 0xff) as u8));
+    assert_eq!(segment.len(), oversized_len);
+    initramfs::shm_store_lz4(hash, &segment).unwrap();
+
+    let key = BaseKey(hash);
+    let guard = KtstrVm::try_cow_overlay(&mem, &key, segment.len(), region_a_start);
+    assert!(
+        guard.is_none(),
+        "an overlay whose rounded length overruns region A must be rejected",
+    );
+
+    // Region B is untouched: MAP_FIXED was never invoked.
+    let mut b_readback = vec![0u8; region_b_size];
+    mem.read_slice(&mut b_readback, GuestAddress(region_b_start))
+        .unwrap();
+    assert_eq!(
+        b_readback, marker,
+        "region B must survive a rejected overlay",
+    );
+
+    drop(mem);
+    let _ = rustix::shm::unlink(initramfs::shm_lz4_segment_name(hash).as_str());
+}

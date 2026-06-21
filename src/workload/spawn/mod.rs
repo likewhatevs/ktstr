@@ -115,12 +115,50 @@ pub(super) const FUTEX_WAIT_TIMEOUT: libc::timespec = libc::timespec {
 /// downstream assertions.
 pub(super) const FAN_OUT_POST_WAKE_SPIN_ITERS: u64 = 256;
 
+/// Outcome of [`apply_mempolicy_with_flags`].
+///
+/// Makes each branch of the apply path observable to tests and any
+/// future caller that wants to react to the result (the production
+/// worker-setup caller in `worker::worker_main` discards it — applying
+/// the policy is best-effort there, matching the `setpriority` /
+/// `set_sched_policy` soft-fail idiom). The variants partition the
+/// function's exits exactly:
+///
+/// - [`SkippedDefault`](MempolicyOutcome::SkippedDefault): `policy ==
+///   MemPolicy::Default` — no syscall (inherit the parent's policy).
+/// - [`SkippedEmpty`](MempolicyOutcome::SkippedEmpty): a
+///   node-set-bearing variant (`Bind` / `Interleave` /
+///   `PreferredMany` / `WeightedInterleave`) carried an empty set — no
+///   `set_mempolicy(2)` is issued. Issuing one with an empty mask
+///   would be a different (and wrong) request to the kernel, so the
+///   skip is the contract, not merely "did not crash".
+/// - [`Applied`](MempolicyOutcome::Applied): `set_mempolicy(2)`
+///   returned 0.
+/// - [`Failed`](MempolicyOutcome::Failed): `set_mempolicy(2)` returned
+///   non-zero; the errno is logged to stderr and carried here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum MempolicyOutcome {
+    /// `MemPolicy::Default` — no syscall.
+    SkippedDefault,
+    /// A node-set variant with an empty set — no syscall.
+    SkippedEmpty,
+    /// `set_mempolicy(2)` succeeded.
+    Applied,
+    /// `set_mempolicy(2)` failed; carries the errno.
+    Failed(i32),
+}
+
 /// Call `set_mempolicy(2)` for the current process with mode flags.
 ///
-/// No-op for `MemPolicy::Default`. Logs a warning on syscall failure.
-pub(super) fn apply_mempolicy_with_flags(policy: &MemPolicy, flags: MpolFlags) {
+/// No-op for `MemPolicy::Default` (returns
+/// [`MempolicyOutcome::SkippedDefault`]) and for a node-set variant
+/// with an empty set (returns [`MempolicyOutcome::SkippedEmpty`]).
+/// Logs a warning on syscall failure and returns
+/// [`MempolicyOutcome::Failed`]; returns [`MempolicyOutcome::Applied`]
+/// on success.
+pub(super) fn apply_mempolicy_with_flags(policy: &MemPolicy, flags: MpolFlags) -> MempolicyOutcome {
     let (mode, node_set): (i32, BTreeSet<usize>) = match policy {
-        MemPolicy::Default => return,
+        MemPolicy::Default => return MempolicyOutcome::SkippedDefault,
         MemPolicy::Bind(nodes) => (libc::MPOL_BIND, nodes.clone()),
         MemPolicy::Preferred(node) => (libc::MPOL_PREFERRED, [*node].into_iter().collect()),
         MemPolicy::Interleave(nodes) => (libc::MPOL_INTERLEAVE, nodes.clone()),
@@ -136,17 +174,16 @@ pub(super) fn apply_mempolicy_with_flags(policy: &MemPolicy, flags: MpolFlags) {
                 )
             };
             if rc != 0 {
-                eprintln!(
-                    "ktstr: set_mempolicy(MPOL_LOCAL) failed: {}",
-                    std::io::Error::last_os_error(),
-                );
+                let err = std::io::Error::last_os_error();
+                eprintln!("ktstr: set_mempolicy(MPOL_LOCAL) failed: {err}");
+                return MempolicyOutcome::Failed(err.raw_os_error().unwrap_or(0));
             }
-            return;
+            return MempolicyOutcome::Applied;
         }
     };
     if node_set.is_empty() {
         eprintln!("ktstr: set_mempolicy: empty node set, skipping");
-        return;
+        return MempolicyOutcome::SkippedEmpty;
     }
     let (mask, maxnode) = build_nodemask(&node_set);
     let effective_mode = mode | flags.bits() as i32;
@@ -159,13 +196,11 @@ pub(super) fn apply_mempolicy_with_flags(policy: &MemPolicy, flags: MpolFlags) {
         )
     };
     if rc != 0 {
-        eprintln!(
-            "ktstr: set_mempolicy(mode={}, nodes={:?}) failed: {}",
-            mode,
-            node_set,
-            std::io::Error::last_os_error(),
-        );
+        let err = std::io::Error::last_os_error();
+        eprintln!("ktstr: set_mempolicy(mode={mode}, nodes={node_set:?}) failed: {err}");
+        return MempolicyOutcome::Failed(err.raw_os_error().unwrap_or(0));
     }
+    MempolicyOutcome::Applied
 }
 
 /// Terminate the calling forked-child worker with success status (code 0).

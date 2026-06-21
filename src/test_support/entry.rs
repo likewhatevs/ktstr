@@ -4060,8 +4060,14 @@ mod tests {
             .sysctls(TEST_SYSCTLS)
             .kargs(&["nosmt"]);
         assert_eq!(s.name, "test_sched");
+        // Assert the routed content, not just the length: a setter that
+        // stored a different non-empty slice (or swapped sysctls<->kargs)
+        // would pass length-only checks but fail these.
         assert_eq!(s.sysctls.len(), 1);
+        assert_eq!(s.sysctls[0].key(), "kernel.sched_cfs_bandwidth_slice_us");
+        assert_eq!(s.sysctls[0].value(), "1000");
         assert_eq!(s.kargs.len(), 1);
+        assert_eq!(s.kargs[0], "nosmt");
     }
 
     #[test]

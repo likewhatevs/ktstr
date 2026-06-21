@@ -461,8 +461,16 @@ fn evaluate(
 /// emit step rather than reaching across modules. Backpressure is
 /// handled inside `write_msg`: a busy port-1 virtqueue blocks the
 /// writer until the host's `add_used` rate catches up.
-fn emit_payload_metrics(pm: &PayloadMetrics) {
-    crate::vmm::guest_comms::send_payload_metrics(pm);
+///
+/// Forwards the underlying `send_payload_metrics` boolean: `true`
+/// when the frame was written, `false` when the bulk port was not
+/// open, the write failed, or the call ran in host context (the
+/// `assert_guest_context` early-return). The two emit call sites in
+/// `evaluate`/`evaluate_llm_extract_deferred` discard it at
+/// statement position; the boolean exists so the host-context no-op
+/// is observable to a test.
+fn emit_payload_metrics(pm: &PayloadMetrics) -> bool {
+    crate::vmm::guest_comms::send_payload_metrics(pm)
 }
 
 /// Emit a `RawPayloadOutput` on the guest-to-host bulk data
@@ -2996,22 +3004,51 @@ mod tests {
         );
     }
 
-    /// `stderr_tail` is valid UTF-8 regardless of where the
-    /// multi-byte character falls. Property-style sanity check
-    /// constructing every single-byte offset within a surrounding
-    /// multi-byte character and verifying `str::from_utf8` round-trips.
+    /// For every `max_bytes` offset across a string with an interior
+    /// multi-byte char, `stderr_tail`'s output is a faithful suffix of
+    /// the input — not just valid UTF-8 (which `String` guarantees for
+    /// free). The body after any leading `...` marker must be a suffix
+    /// of `s`, and the truncation must never lengthen the content.
+    /// Pins the slice CONTENT across every byte offset, catching a
+    /// snap-direction or off-by-one regression that the prior
+    /// discard-the-result loop could not see.
     #[test]
-    fn stderr_tail_output_is_always_valid_utf8() {
+    fn stderr_tail_output_is_suffix_of_input_at_every_offset() {
         // Chinese "好" = 3 bytes (E5 A5 BD); pin it mid-string.
         let s = "xxxxxxxxxx好yyyyyyyyyy"; // 10 + 3 + 10 = 23 bytes
         for max in 1..=s.len() {
-            // `stderr_tail` returns a `String`, which Rust guarantees
-            // is valid UTF-8 by construction. Calling it across every
-            // byte offset proves the helper never panics on
-            // multi-byte codepoint boundaries — the failure mode
-            // that motivated this test is a panic from slicing at
-            // mid-codepoint, not a corrupt string.
-            let _ = stderr_tail(s, max);
+            let tail = stderr_tail(s, max);
+            if s.len() <= max {
+                // No truncation: returns the input verbatim, no marker.
+                assert_eq!(tail, s, "max={max}: short input must round-trip");
+                assert!(!tail.starts_with("..."), "max={max}: no marker when untruncated");
+            } else {
+                // Truncated: leading "..." marker, then a suffix of s.
+                let body = tail
+                    .strip_prefix("...")
+                    .unwrap_or_else(|| panic!("max={max}: truncated output must carry the marker, got {tail:?}"));
+                assert!(
+                    s.ends_with(body),
+                    "max={max}: body {body:?} must be a suffix of the input {s:?}",
+                );
+                // Snap-forward only ever drops bytes from the front, so
+                // the retained suffix is at most `max` bytes and never
+                // longer than the input.
+                assert!(
+                    body.len() <= max,
+                    "max={max}: retained suffix {} bytes exceeds the {max}-byte budget",
+                    body.len(),
+                );
+                // The boundary snap must keep the suffix a valid char
+                // boundary of s (no mid-codepoint split) — equivalent
+                // to: stripping `body` off the end of s leaves a valid
+                // str whose remainder + body reconstructs s exactly.
+                let head_len = s.len() - body.len();
+                assert!(
+                    s.is_char_boundary(head_len),
+                    "max={max}: suffix start {head_len} must be a char boundary of {s:?}",
+                );
+            }
         }
     }
 
@@ -4241,14 +4278,24 @@ mod tests {
         assert_eq!(ms[1].unit, "ns");
     }
 
+    /// In host (test) context the bulk port is not open and
+    /// `is_guest()` is false, so the emit must NOT write — it returns
+    /// `false` via the `write_msg` -> `assert_guest_context`
+    /// early-return. Asserting the `false` return pins the
+    /// observable no-op (no frame written) rather than merely that
+    /// the call did not panic.
     #[test]
-    fn emit_payload_metrics_no_panic_without_shm() {
+    fn emit_payload_metrics_returns_false_in_host_context() {
         let pm = PayloadMetrics {
             payload_index: 0,
             metrics: Vec::new(),
             exit_code: 0,
         };
-        emit_payload_metrics(&pm);
+        assert!(
+            !emit_payload_metrics(&pm),
+            "host-context emit must report no write (false) — the \
+             bulk port is closed and assert_guest_context bails"
+        );
     }
 
     // -- PayloadHandle double-consume returns Err, not panic --

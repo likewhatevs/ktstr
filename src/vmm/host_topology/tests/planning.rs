@@ -611,13 +611,22 @@ fn should_warn_cross_node_polarity() {
     );
 }
 
-/// `warn_if_cross_node_spill` end-to-end pin: a multi-node plan
-/// produces the formatted warning (non-empty side effect
-/// observable via the pure predicate). A single-node plan is
-/// a no-op (predicate returns false → eprintln! is skipped).
-/// Pins the coupling between the predicate and the side-
-/// effecting wrapper so a refactor that dropped the predicate
-/// call (e.g. inlined an incorrect comparison) would fail.
+/// `warn_if_cross_node_spill` is a thin `eprintln!` wrapper over
+/// [`cross_node_spill_warning`], which holds the gate-and-format
+/// logic and returns the EXACT bytes the wrapper emits (sans
+/// newline). Asserting on that `Option<String>` pins both halves of
+/// the contract that the wrapper alone can only smoke-test:
+///   - multi-node plan → `Some(message)` whose body contains the
+///     `format_llc_list` rendering (`0 (node 0)`, `1 (node 1)`) and
+///     the NUMA node count, so a refactor that dropped the
+///     `format_llc_list` call, miscounted `mems.len()`, or inverted
+///     the gate would change the returned string and fail here;
+///   - single-node plan → `None`, so a refactor that flipped the
+///     predicate to fire on single-node plans surfaces as an
+///     unexpected `Some`.
+/// `warn_if_cross_node_spill` itself is still invoked to prove it
+/// stays a pure no-op on the single-node path (it must not panic and
+/// has no other observable side effect when the warning is `None`).
 #[test]
 fn warn_if_cross_node_spill_predicate_gates_stderr() {
     let topo = synth_host_topo(&[(vec![0], 0), (vec![1], 1)]);
@@ -628,11 +637,28 @@ fn warn_if_cross_node_spill_predicate_gates_stderr() {
         snapshot: Vec::new(),
         locks: Vec::new(),
     };
-    assert!(should_warn_cross_node(&multi_plan.mems));
-    // Call the wrapper — it produces stderr output but we rely
-    // on the predicate gate above to verify the "will fire" half.
-    // Directly capturing stderr in-process is fragile across
-    // test runners; the predicate test pins the decision.
+    let msg = cross_node_spill_warning(&multi_plan, &topo)
+        .expect("multi-node plan must produce a warning");
+    // The message must equal exactly what the wrapper eprintln!s and
+    // must thread the rendered LLC list + the node count through.
+    let expected = format!(
+        "ktstr: reserving LLCs {list} across {n} NUMA nodes \
+         (preferred single-node contiguous unavailable). Build \
+         will run; memory-access latency may be higher.",
+        list = format_llc_list(&multi_plan.locked_llcs, &topo),
+        n = multi_plan.mems.len(),
+    );
+    assert_eq!(msg, expected, "warning body must match the wrapper's emit");
+    assert!(
+        msg.contains("0 (node 0)") && msg.contains("1 (node 1)"),
+        "warning must carry the format_llc_list NUMA annotations: {msg}",
+    );
+    assert!(
+        msg.contains("across 2 NUMA nodes"),
+        "warning must name the spanned node count: {msg}",
+    );
+    // The wrapper threads the same Some through to eprintln! — invoke
+    // it to confirm the Some path does not panic.
     warn_if_cross_node_spill(&multi_plan, &topo);
 
     let single_plan = LlcPlan {
@@ -642,8 +668,11 @@ fn warn_if_cross_node_spill_predicate_gates_stderr() {
         snapshot: Vec::new(),
         locks: Vec::new(),
     };
-    assert!(!should_warn_cross_node(&single_plan.mems));
-    // No-op call — predicate returns false, eprintln! is skipped.
+    assert!(
+        cross_node_spill_warning(&single_plan, &topo).is_none(),
+        "single-node plan must suppress the warning (None), not emit",
+    );
+    // Wrapper must be a pure no-op on the None path.
     warn_if_cross_node_spill(&single_plan, &topo);
 }
 

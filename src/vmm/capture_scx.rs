@@ -234,7 +234,78 @@ fn compute_owned(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::monitor::guest::GuestKernel;
+    use crate::monitor::reader::GuestMem;
     use crate::monitor::symbols::DEFAULT_PAGE_OFFSET;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    /// All sub-groups `None`. `build`'s degraded path only needs
+    /// `offsets` to be `Some(&_)` (it binds `let _offs = offsets?`)
+    /// — the sub-group contents are never read on the
+    /// `per_cpu_offsets == None` arm, so an all-`None` value drives
+    /// the early-return without resolving real BTF.
+    fn empty_scx_walker_offsets() -> ScxWalkerOffsets {
+        ScxWalkerOffsets {
+            rq: None,
+            scx_rq: None,
+            task: None,
+            see: None,
+            dsq_lnode: None,
+            dsq: None,
+            sched: None,
+            sched_pnode: None,
+            sched_pcpu: None,
+            rht: None,
+        }
+    }
+
+    /// `KernelSymbols` with `scx_root` / `scx_tasks` set to the given
+    /// values and every other field absent. `build` reads only
+    /// `scx_root` and `scx_tasks` from the symbol set (plus
+    /// `runqueues` on the non-degraded path), so this is sufficient
+    /// to drive the degraded `build()` path.
+    fn symbols_with_scx(scx_root: Option<u64>, scx_tasks: Option<u64>) -> KernelSymbols {
+        KernelSymbols {
+            runqueues: 0,
+            per_cpu_offset: 0,
+            page_offset_base_kva: None,
+            phys_base_kva: None,
+            scx_root,
+            scx_tasks,
+            init_top_pgt: None,
+            pgtable_l5_enabled: None,
+            prog_idr: None,
+            scx_watchdog_timeout: None,
+            scx_watchdog_timestamp: None,
+            scx_watchdog_interval: None,
+            jiffies_64: None,
+            kernel_cpustat: None,
+            kstat: None,
+            tick_cpu_sched: None,
+            node_data: None,
+            entry_syscall_64_kva: None,
+            kernel_text_kva: None,
+        }
+    }
+
+    /// Build an owned accessor whose `GuestKernel` reports the
+    /// default test `PAGE_OFFSET`. `build` reads only
+    /// `guest_kernel().page_offset()` from the accessor (and never
+    /// on the degraded arm), so an empty synthetic memory + symbol
+    /// set suffices.
+    fn test_accessor() -> GuestMemMapAccessorOwned {
+        // SAFETY: `Box::leak` gives a `'static` backing buffer, so the
+        // pointer GuestMem holds stays valid for the returned
+        // accessor's whole lifetime. The degraded `build()` arm never
+        // dereferences guest memory through this accessor (it reads
+        // only the stored `page_offset`), so the bytes are never read.
+        let buf = Box::leak(Box::new([0u8; 64]));
+        let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
+        let kernel =
+            GuestKernel::new_for_test(Arc::new(mem), HashMap::new(), DEFAULT_PAGE_OFFSET, 0, false);
+        GuestMemMapAccessorOwned::new_for_test(kernel)
+    }
 
     /// Happy path: every prereq resolves. The pure builder produces
     /// per-CPU rq KVA/PA pairs that match
@@ -313,59 +384,83 @@ mod tests {
     }
 
     /// Degraded build (per_cpu_offsets absent, secondary CPUs still
-    /// booting): the captured `ScxWalkerOwned` must have empty rq
-    /// arrays but populated symbol KVAs. This is the shape the
-    /// build() degraded path returns when per_cpu_offsets is None
-    /// — the global-task walk and *scx_root sched-state read still
-    /// surface signal even when per-CPU addressing isn't ready.
-    /// Validates the structural contract: the downstream
-    /// scx_walker functions iterate over `rq_kvas`/`rq_pas`
-    /// (yielding nothing when empty) but consume `scx_tasks_kva`
-    /// and `scx_root_kva` independently.
+    /// booting): drives the real [`build`] with `per_cpu_offsets ==
+    /// None` and asserts it returns `Some` with empty rq arrays but
+    /// the passed-through `scx_root_kva` / `scx_tasks_kva`. This is
+    /// the early-return arm in `build()` (the `per_cpu_offsets`
+    /// match's `None` branch) — without driving `build` directly a
+    /// struct literal would only re-assert its own initializers. The
+    /// global-task walk and *scx_root sched-state read still surface
+    /// signal even when per-CPU addressing isn't ready; the
+    /// downstream scx_walker functions iterate over
+    /// `rq_kvas`/`rq_pas` (yielding nothing when empty) but consume
+    /// `scx_tasks_kva` and `scx_root_kva` independently.
     #[test]
     fn degraded_build_shape_empty_rq_with_symbol_kvas() {
         let scx_root_kva = 0xffff_ffff_8230_0000;
         let scx_tasks_kva = 0xffff_ffff_8240_0000;
-        let owned = ScxWalkerOwned {
-            rq_kvas: Vec::new(),
-            rq_pas: Vec::new(),
-            scx_root_kva,
-            scx_tasks_kva,
-            kaslr_offset: 0,
-        };
+        let accessor = test_accessor();
+        let offsets = empty_scx_walker_offsets();
+        let symbols = symbols_with_scx(Some(scx_root_kva), Some(scx_tasks_kva));
+
+        // per_cpu_offsets = None drives the degraded early-return.
+        let owned = build(&accessor, Some(&offsets), Some(&symbols), None, 0)
+            .expect("offsets + symbols present → degraded build returns Some");
+
+        // The early-return arm sets empty rq arrays but passes the
+        // symbol KVAs through.
         assert!(owned.rq_kvas.is_empty());
         assert!(owned.rq_pas.is_empty());
         assert_eq!(owned.scx_root_kva, scx_root_kva);
         assert_eq!(owned.scx_tasks_kva, scx_tasks_kva);
-        // Iteration over empty rq arrays yields no entries — the
-        // rq->scx and per-CPU local DSQ passes both no-op cleanly.
-        let zipped: Vec<_> = owned.rq_kvas.iter().zip(owned.rq_pas.iter()).collect();
-        assert!(zipped.is_empty());
+        assert_eq!(owned.kaslr_offset, 0);
     }
 
-    /// Degraded build coexists with the global-task walk: even with
-    /// empty rq arrays, a populated `scx_tasks_kva` is the input the
-    /// `walk_scx_tasks_global` walker uses. Pinning the field
-    /// independence at the struct-shape level so a future refactor
-    /// that ties `scx_tasks_kva` to `rq_kvas` length surfaces here.
+    /// `build`'s hard prereqs: `offsets` and `symbols` each gate the
+    /// capture. With `per_cpu_offsets == None` but a hard prereq
+    /// absent, `build` returns `None` (the `?` short-circuits) rather
+    /// than a degraded `Some`. Pins that the degraded arm is reached
+    /// ONLY after both hard prereqs resolve.
+    #[test]
+    fn build_returns_none_when_hard_prereq_absent() {
+        let accessor = test_accessor();
+        let offsets = empty_scx_walker_offsets();
+        let symbols = symbols_with_scx(Some(0xffff_ffff_8230_0000), Some(0xffff_ffff_8240_0000));
+
+        // offsets absent → None even though symbols + the degraded
+        // per_cpu_offsets path would otherwise apply.
+        assert!(build(&accessor, None, Some(&symbols), None, 0).is_none());
+        // symbols absent → None.
+        assert!(build(&accessor, Some(&offsets), None, None, 0).is_none());
+    }
+
+    /// Degraded build with a kernel that has `scx_tasks` but no
+    /// `scx_root` (no sched_ext-root symbol). Drives the real
+    /// [`build`] degraded path and asserts the absent `scx_root`
+    /// defaults to `0` while `scx_tasks_kva` passes through —
+    /// `scx_tasks_kva` is independent of both `scx_root` and the
+    /// (empty) rq arrays, so the global `walk_scx_tasks_global`
+    /// still has its anchor. A refactor that tied `scx_tasks_kva`
+    /// to `rq_kvas` length or to `scx_root` presence would surface
+    /// here as a zeroed / dropped `scx_tasks_kva`.
     #[test]
     fn degraded_build_scx_tasks_kva_independent_of_rq_arrays() {
         let scx_tasks_kva = 0xffff_ffff_82e5_e840;
-        let owned = ScxWalkerOwned {
-            rq_kvas: Vec::new(),
-            rq_pas: Vec::new(),
-            scx_root_kva: 0,
-            scx_tasks_kva,
-            kaslr_offset: 0,
-        };
-        // scx_tasks_kva remains addressable even though rq arrays
-        // are empty — the global walk doesn't depend on per-CPU
-        // addressing.
+        let accessor = test_accessor();
+        let offsets = empty_scx_walker_offsets();
+        // scx_root absent, scx_tasks present.
+        let symbols = symbols_with_scx(None, Some(scx_tasks_kva));
+
+        let owned = build(&accessor, Some(&offsets), Some(&symbols), None, 0)
+            .expect("offsets + symbols present → degraded build returns Some");
+
+        assert!(owned.rq_kvas.is_empty());
+        assert!(owned.rq_pas.is_empty());
+        // scx_tasks_kva survives even though rq arrays are empty and
+        // scx_root is absent.
         assert_eq!(owned.scx_tasks_kva, scx_tasks_kva);
-        // scx_root_kva == 0 here demonstrates the second
-        // independent-degradation axis: a kernel without sched_ext
-        // (no scx_root symbol) plus per_cpu_offsets unavailable
-        // still produces a valid owned struct.
+        // Absent scx_root symbol defaults to 0 (build()'s
+        // `unwrap_or(0)`), the second independent-degradation axis.
         assert_eq!(owned.scx_root_kva, 0);
     }
 

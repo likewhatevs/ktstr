@@ -855,13 +855,40 @@ fn parse_schedstat_line_non_u64_token_returns_none() {
     assert!(parse_schedstat_line("99999999999999999999 2 3").is_none());
 }
 #[test]
+fn claim_warn_slot_grants_first_call_only() {
+    // The once-only warning contract lives in `claim_warn_slot`:
+    // the warning helper emits its eprintln only when this returns
+    // `true`, and it must return `true` exactly once per `Once`.
+    // Drive it against a fresh `Once` so the assertion is
+    // independent of any process-global state that peer tests may
+    // have already tripped — direct stderr-emission capture is not
+    // possible because `#[test]` threads share fd 2. A regression
+    // that dropped the gate (emitting on every call) would make
+    // this return `true` repeatedly and fail the false-on-repeat
+    // assertions below.
+    let once = std::sync::Once::new();
+    assert!(
+        claim_warn_slot(&once),
+        "first call on a fresh Once must claim the slot (return true)",
+    );
+    for i in 0..10 {
+        assert!(
+            !claim_warn_slot(&once),
+            "call {i} after the first must NOT re-claim the slot \
+                 (the at-most-once emission contract)",
+        );
+    }
+}
+
+#[test]
 fn warn_schedstat_unavailable_once_does_not_panic_on_repeat() {
-    // `std::sync::Once::call_once` guarantees at most one
-    // eprintln regardless of how many times the gate fires.
-    // Smoke-check that repeated calls don't panic — direct
-    // stderr-emission assertions require a process-global
-    // capture gate (`#[test]` threads share fd 2), which is
-    // out of scope for this unit test.
+    // The process-wide warning helper must tolerate the 2N calls a
+    // full worker fan-out makes (each worker calls read_schedstat
+    // twice). The once-only emission itself is pinned by
+    // `claim_warn_slot_grants_first_call_only`; here we only
+    // confirm the public wrapper is panic-free across repeats
+    // (stderr-capture is unavailable since `#[test]` threads share
+    // fd 2).
     for _ in 0..10 {
         warn_schedstat_unavailable_once();
     }

@@ -438,16 +438,41 @@ impl BpfSyscallAccessor {
     /// Look up the pinned fd for a map identified by its
     /// `BpfMapInfo`. Returns `None` when no pinned map matches.
     ///
-    /// Match key: `name` field. Map ids would be more precise but
-    /// they're not part of `BpfMapInfo` today (a known follow-up if
-    /// the live-host backend grows other consumers); within a single
-    /// scheduler instance, names are unique and stable for the
-    /// duration of the run.
+    /// Match key: `name` field (via [`info_name_matches`]). Map ids
+    /// would be more precise but they're not part of `BpfMapInfo`
+    /// today (a known follow-up if the live-host backend grows other
+    /// consumers); within a single scheduler instance, names are
+    /// unique and stable for the duration of the run.
     fn pinned_for(&self, target: &BpfMapInfo) -> Option<&PinnedMap> {
         self.maps
             .iter()
-            .find(|p| p.info.name_bytes_active() == target.name_bytes_active())
+            .find(|p| info_name_matches(&p.info, target))
     }
+}
+
+/// Match key for [`BpfSyscallAccessor::pinned_for`] and the
+/// construction-time predicate filter: two `BpfMapInfo`s identify the
+/// same map iff their active name bytes
+/// ([`BpfMapInfo::name_bytes_active`]) are byte-equal. Extracted as a
+/// free fn so the keep/discard semantics are exercisable over a
+/// hand-built `&[BpfMapInfo]` fixture without the live-kernel walk.
+fn info_name_matches(a: &BpfMapInfo, b: &BpfMapInfo) -> bool {
+    a.name_bytes_active() == b.name_bytes_active()
+}
+
+/// Pure mirror of the construction-time keep/discard step in
+/// [`BpfSyscallAccessor::from_running_kernel_filtered`]: returns the
+/// subset of `infos` for which `predicate` returns `true`, preserving
+/// order. The production constructor applies the same
+/// `if !predicate(&info) { continue; }` gate inline against each map
+/// freshly fetched from the kernel; this fn lets a test pin the
+/// filter's keep/discard contract over a deterministic fixture.
+#[cfg(test)]
+fn select_keeping<'a, F>(infos: &'a [BpfMapInfo], mut predicate: F) -> Vec<&'a BpfMapInfo>
+where
+    F: FnMut(&BpfMapInfo) -> bool,
+{
+    infos.iter().filter(|info| predicate(info)).collect()
 }
 
 /// Fetch `bpf_map_info` for an open map fd via
@@ -1139,22 +1164,71 @@ mod tests {
         }
     }
 
-    /// Sized return for an empty enumeration is an empty vec, not
-    /// an error. Construction must succeed even on systems with no
-    /// BPF maps (rare but possible — minimal containers, fresh
-    /// boots before any BPF program loads).
+    /// Build a `BpfMapInfo` whose only populated field is the active
+    /// name — the key both the construction-time predicate filter
+    /// and `pinned_for` match on.
+    fn info_named(name: &str) -> BpfMapInfo {
+        let bytes = name.as_bytes();
+        assert!(bytes.len() <= BPF_OBJ_NAME_LEN, "test name too long");
+        let mut name_bytes = [0u8; BPF_OBJ_NAME_LEN];
+        name_bytes[..bytes.len()].copy_from_slice(bytes);
+        BpfMapInfo {
+            name_bytes,
+            name_len: bytes.len() as u8,
+            ..Default::default()
+        }
+    }
+
+    /// The construction-time keep/discard filter
+    /// ([`select_keeping`], the pure mirror of
+    /// `from_running_kernel_filtered`'s inline predicate gate) keeps
+    /// exactly the maps the predicate accepts: a predicate matching
+    /// no names yields the empty set; a name-suffix predicate yields
+    /// exactly the matching subset, in order.
     #[test]
     fn predicate_filters_pinned_set() {
-        // We can't actually invoke the kernel from this test
-        // without root + a running scheduler, but we can verify
-        // that the predicate signature compiles and the explicit
-        // type annotation matches the trait shape callers will
-        // use.
-        fn _check_predicate_shape() {
-            let _ =
-                BpfSyscallAccessor::from_running_kernel_filtered(|_info: &BpfMapInfo| -> bool {
-                    false
-                });
-        }
+        let infos = vec![
+            info_named("scx_central"),
+            info_named("central_dsq"),
+            info_named("cilium_lb"),
+            info_named("central_data"),
+        ];
+
+        // Match-nothing predicate ⇒ empty kept set.
+        let none = select_keeping(&infos, |_| false);
+        assert!(none.is_empty(), "false predicate must discard every map");
+
+        // Match-everything predicate ⇒ full set, order preserved.
+        let all = select_keeping(&infos, |_| true);
+        assert_eq!(all.len(), 4, "true predicate must keep every map");
+        assert_eq!(all[0].name(), "scx_central");
+        assert_eq!(all[3].name(), "central_data");
+
+        // Name-suffix predicate ⇒ exactly the "central"-bearing subset.
+        let kept = select_keeping(&infos, |i| i.name().contains("central"));
+        let kept_names: Vec<String> = kept.iter().map(|i| i.name().to_string()).collect();
+        assert_eq!(
+            kept_names,
+            vec!["scx_central", "central_dsq", "central_data"],
+            "suffix predicate must keep exactly the matching subset, in order",
+        );
+
+        // The same name-match key drives pinned_for: a target sharing
+        // active name bytes matches; a differing name does not.
+        assert!(
+            info_name_matches(&info_named("central_dsq"), &info_named("central_dsq")),
+            "identical active name bytes must match",
+        );
+        assert!(
+            !info_name_matches(&info_named("central_dsq"), &info_named("central_data")),
+            "differing active name bytes must NOT match",
+        );
+        // name_len bounds the compared region: a longer NUL-padded
+        // buffer with a shorter name_len compares only the active
+        // prefix, so "scx" (len 3) does not match "scx_central".
+        assert!(
+            !info_name_matches(&info_named("scx"), &info_named("scx_central")),
+            "name_len must bound the match to the active prefix",
+        );
     }
 }

@@ -111,6 +111,20 @@ unsafe fn futex_wait(futex_ptr: *mut u32, expected: u32, ts: &libc::timespec) {
 mod io;
 use io::*;
 
+/// Derive a worker's off-CPU time from its wall-clock and CPU-time
+/// totals: `off_cpu_ns = wall_time_ns - cpu_time_ns`, saturating at
+/// 0. Saturating (not wrapping) because `cpu_time_ns` and
+/// `wall_time_ns` come from two independent clocks
+/// (`CLOCK_THREAD_CPUTIME_ID` vs the monotonic `start.elapsed()`),
+/// so a momentary skew where the charged CPU time slightly exceeds
+/// the measured wall time must clamp to 0 rather than wrap to a
+/// near-`u64::MAX` phantom off-CPU figure. Single source of truth
+/// for the `WorkerReport::off_cpu_ns` field so the report builder
+/// and its tests agree on the derivation.
+pub(super) fn derive_off_cpu_ns(wall_time_ns: u64, cpu_time_ns: u64) -> u64 {
+    wall_time_ns.saturating_sub(cpu_time_ns)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn worker_main(
     affinity: Option<BTreeSet<usize>>,
@@ -3344,7 +3358,7 @@ pub(super) fn worker_main(
         work_units,
         cpu_time_ns,
         wall_time_ns,
-        off_cpu_ns: wall_time_ns.saturating_sub(cpu_time_ns),
+        off_cpu_ns: derive_off_cpu_ns(wall_time_ns, cpu_time_ns),
         migration_count,
         cpus_used,
         migrations,

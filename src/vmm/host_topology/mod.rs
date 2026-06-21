@@ -1784,18 +1784,34 @@ pub fn format_llc_list(locked: &[usize], topo: &HostTopology) -> String {
 /// Placement: called by `kernel_build_pipeline` and friends right
 /// after [`acquire_llc_plan`] returns, before the sandbox mount.
 /// Extracting this into a helper rather than inlining at the call
-/// site lets tests capture stderr and assert the format without
-/// poking into the orchestrator internals.
+/// site lets the message body be unit-tested via
+/// [`cross_node_spill_warning`] without capturing stderr.
 pub fn warn_if_cross_node_spill(plan: &LlcPlan, topo: &HostTopology) {
-    if should_warn_cross_node(&plan.mems) {
-        eprintln!(
-            "ktstr: reserving LLCs {list} across {n} NUMA nodes \
-             (preferred single-node contiguous unavailable). Build \
-             will run; memory-access latency may be higher.",
-            list = format_llc_list(&plan.locked_llcs, topo),
-            n = plan.mems.len(),
-        );
+    if let Some(msg) = cross_node_spill_warning(plan, topo) {
+        eprintln!("{msg}");
     }
+}
+
+/// Build the cross-node spill warning string for `plan`, or `None`
+/// when the plan fits within a single NUMA node (the suppression
+/// case). [`warn_if_cross_node_spill`] is a thin wrapper that
+/// `eprintln!`s the `Some` value; this function holds the actual
+/// gate-and-format logic so a test can pin both halves — the
+/// predicate gate AND the rendered message — without a stderr
+/// capture seam. The returned string is exactly the bytes
+/// `warn_if_cross_node_spill` would emit (sans the trailing newline
+/// that `eprintln!` appends).
+fn cross_node_spill_warning(plan: &LlcPlan, topo: &HostTopology) -> Option<String> {
+    if !should_warn_cross_node(&plan.mems) {
+        return None;
+    }
+    Some(format!(
+        "ktstr: reserving LLCs {list} across {n} NUMA nodes \
+         (preferred single-node contiguous unavailable). Build \
+         will run; memory-access latency may be higher.",
+        list = format_llc_list(&plan.locked_llcs, topo),
+        n = plan.mems.len(),
+    ))
 }
 
 /// Pure predicate backing [`warn_if_cross_node_spill`]. Returns
@@ -1872,6 +1888,17 @@ pub(crate) fn overcommit_warning(
     Some(msg)
 }
 
+/// Whether [`mbind_to_nodes`] must short-circuit before touching `addr`
+/// or invoking the `mbind(2)` syscall. Returns `true` when there is no
+/// work to do — an empty node set (no policy target) or a zero-length
+/// region. This is the exact guard [`mbind_to_nodes`] consults; it is a
+/// pure predicate so the short-circuit decision can be asserted directly
+/// instead of inferred from a not-crashing call (whose pass condition the
+/// syscall's own error-swallowing would satisfy regardless of the guard).
+fn mbind_should_skip(len: usize, nodes: &[usize]) -> bool {
+    nodes.is_empty() || len == 0
+}
+
 /// Bind a memory region to specific NUMA nodes using `mbind(MPOL_BIND)`.
 /// `nodes` is the set of NUMA node IDs. Logs a warning on error
 /// (single-node systems, missing capabilities).
@@ -1889,7 +1916,7 @@ pub(crate) fn overcommit_warning(
 /// without dereferencing `addr`, so a null or dangling pointer is
 /// permitted in those cases.
 pub unsafe fn mbind_to_nodes(addr: *mut u8, len: usize, nodes: &[usize]) {
-    if nodes.is_empty() || len == 0 {
+    if mbind_should_skip(len, nodes) {
         return;
     }
     let node_set: std::collections::BTreeSet<usize> = nodes.iter().copied().collect();
@@ -1925,7 +1952,19 @@ use crate::topology::parse_cpu_list_lenient;
 
 /// Number of free 2MB hugepages on the host.
 pub fn hugepages_free() -> u64 {
-    std::fs::read_to_string("/sys/kernel/mm/hugepages/hugepages-2048kB/free_hugepages")
+    hugepages_free_from(std::path::Path::new(
+        "/sys/kernel/mm/hugepages/hugepages-2048kB/free_hugepages",
+    ))
+}
+
+/// Path-parameterized core of [`hugepages_free`]. Reads the
+/// `free_hugepages` sysfs file at `path`, parses the trimmed count, and
+/// returns 0 when the file is absent, unreadable, or contains a value
+/// that does not parse as a `u64`. Exposes a path seam so the parse and
+/// the documented 0-fallback can be tested against fixture files without
+/// depending on the host's hugetlbfs configuration.
+fn hugepages_free_from(path: &std::path::Path) -> u64 {
+    std::fs::read_to_string(path)
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok())
         .unwrap_or(0)
