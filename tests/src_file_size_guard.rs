@@ -85,7 +85,6 @@ const DEFAULT_MAX_LINES: usize = 3000;
 /// protocol; entries shrink toward zero as files are split.
 const EXCEPTIONS: &[(&str, usize)] = &[
     ("vmm/freeze_coord/mod.rs", 13295),
-    ("monitor/cast_analysis/tests.rs", 10771),
     ("monitor/btf_render/tests.rs", 10011),
     ("scenario/ops/tests.rs", 9388),
     ("monitor/dump/tests.rs", 8614),

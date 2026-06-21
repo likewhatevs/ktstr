@@ -170,9 +170,9 @@ const EXCEPTIONS: &[(&str, &str, usize)] = &[
     ), // queued: decompose
     ("monitor/cast_analysis/mod.rs", "Analyzer < 'a >::run", 226), // queued: decompose
     ("monitor/cast_analysis/mod.rs", "Analyzer < 'a >::step", 391), // queued: decompose
-    ("monitor/cast_analysis/tests.rs", "build_btf", 223), // queued: decompose
+    ("monitor/cast_analysis/tests/mod.rs", "build_btf", 223), // queued: decompose
     (
-        "monitor/cast_analysis/tests.rs",
+        "monitor/cast_analysis/tests/helper_map_crossfn.rs",
         "helper_map_update_then_lookup_propagates_arena_through_map_value",
         220,
     ), // queued: decompose
