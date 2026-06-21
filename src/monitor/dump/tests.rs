@@ -8751,3 +8751,399 @@ fn failure_dump_map_zero_kva_is_no_identity_sentinel_not_real_capture() {
         "absent-in-JSON deserializes back to 0 (the sentinel)"
     );
 }
+
+// ---- try_write_entry_table + FailureDumpPercpuEntry Display ------
+//
+// Targets the table-layout decision in `try_write_entry_table` (via
+// the `FailureDumpMap` Display path) and the four-way branch in
+// `FailureDumpPercpuEntry::Display` (simple list, >64-CPU dedup-skip,
+// template/varying, and contiguous-range grouping). Every fixture is
+// a synthesized `RenderedValue` tree — no VM boot — and every
+// assertion pins the exact rendered substring the branch produces.
+
+/// Construct a `FailureDumpMap` carrying `entries` as its only
+/// populated content. All non-entry collections are empty so the
+/// rendered output is exactly the `map ...` header line followed by
+/// whatever `try_write_entry_table` (or the per-entry fallback)
+/// emits — no array / percpu / arena / ringbuf trailers to confuse
+/// substring assertions.
+fn map_with_entries(name: &str, entries: Vec<FailureDumpEntry>) -> FailureDumpMap {
+    FailureDumpMap {
+        name: name.into(),
+        map_kva: 0,
+        map_type: BPF_MAP_TYPE_HASH,
+        value_size: 8,
+        max_entries: 64,
+        value: None,
+        entries,
+        array_entries: Vec::new(),
+        percpu_entries: Vec::new(),
+        percpu_hash_entries: Vec::new(),
+        arena: None,
+        ringbuf: None,
+        stack_trace: None,
+        fd_array: None,
+        error: None,
+    }
+}
+
+/// `make_small_struct`-shaped entry: both sides are same-shape
+/// inline-scalar structs with no payload, so a batch of these is the
+/// homogeneous-table-eligible case.
+fn table_entry(
+    key_ty: &str,
+    key_fields: &[(&str, u64)],
+    val_ty: &str,
+    val_fields: &[(&str, u64)],
+) -> FailureDumpEntry {
+    FailureDumpEntry {
+        key: Some(make_small_struct(key_ty, key_fields)),
+        key_hex: "00".into(),
+        value: Some(make_small_struct(val_ty, val_fields)),
+        value_hex: "00".into(),
+        payload: None,
+    }
+}
+
+#[test]
+fn try_write_entry_table_homogeneous_exact_layout() {
+    // Two homogeneous entries with single-column key + value structs
+    // exercise the full width-measurement + right-alignment path.
+    // The body following the `map ...` header is, byte-for-byte:
+    //   "\n  id |  n"   (header: key name width 2, value name width 2)
+    //   "\n   1 |  5"   (row 0, both cells right-aligned to width 2)
+    //   "\n  10 | 50"   (row 1)
+    // Column width 2 comes from: key header "id"=2 vs cells "1"/"10";
+    // value header "n"=1 vs cells "5"/"50"=2 ⇒ max 2 each.
+    let m = map_with_entries(
+        "kc-table",
+        vec![
+            table_entry("kc", &[("id", 1)], "vc", &[("n", 5)]),
+            table_entry("kc", &[("id", 10)], "vc", &[("n", 50)]),
+        ],
+    );
+    let out = format!("{m}");
+    let body = out
+        .strip_prefix("map kc-table (type=hash, value_size=8, max_entries=64)")
+        .expect("map header prefix must match exactly");
+    assert_eq!(
+        body, "\n  id |  n\n   1 |  5\n  10 | 50",
+        "table body must be the exact right-aligned grid: {out:?}",
+    );
+    // The per-entry block form must NOT appear — the table replaced it.
+    assert!(
+        !out.contains("entry: key="),
+        "homogeneous batch must render as a table, not per-entry: {out}",
+    );
+}
+
+#[test]
+fn try_write_entry_table_two_entries_meets_minimum() {
+    // TABLE_MIN_ENTRIES is 2: a 2-entry homogeneous batch qualifies
+    // (boundary). One fewer (covered by the existing single-entry
+    // test) would not. This pins the lower boundary as table-eligible.
+    let m = map_with_entries(
+        "two",
+        vec![
+            table_entry("k", &[("a", 1)], "v", &[("b", 2)]),
+            table_entry("k", &[("a", 3)], "v", &[("b", 4)]),
+        ],
+    );
+    let out = format!("{m}");
+    assert!(out.contains(" | "), "2 entries must form a table: {out}");
+    assert!(
+        !out.contains("entry: key="),
+        "2-entry table must not fall back to per-entry: {out}",
+    );
+}
+
+#[test]
+fn try_write_entry_table_rejects_payload_present() {
+    // A single payload-bearing entry disqualifies the whole batch —
+    // the typed payload renders in a `.data` block the table can't
+    // carry, so every entry falls back to per-entry block form and
+    // the surviving payload still surfaces via `.data`.
+    let mut e0 = table_entry("k", &[("a", 1)], "v", &[("b", 2)]);
+    e0.payload = Some(RenderedValue::Uint {
+        bits: 64,
+        value: 0xDEAD,
+    });
+    let m = map_with_entries(
+        "with-payload",
+        vec![e0, table_entry("k", &[("a", 3)], "v", &[("b", 4)])],
+    );
+    let out = format!("{m}");
+    assert!(
+        !out.contains(" | "),
+        "payload-bearing batch must NOT render as a table: {out}",
+    );
+    assert!(
+        out.contains("entry: key="),
+        "payload-bearing batch must use per-entry form: {out}",
+    );
+    assert!(
+        out.contains("\n  .data "),
+        "the payload must still surface via .data: {out}",
+    );
+    assert!(
+        out.contains("57005"), // 0xDEAD in decimal
+        "the payload value must render: {out}",
+    );
+}
+
+#[test]
+fn try_write_entry_table_rejects_heterogeneous_value_type() {
+    // Same key type across both entries but DIFFERENT value type
+    // names ⇒ not homogeneous ⇒ no table. (The existing
+    // heterogeneous test varies the key type; this pins the value
+    // side of the type_name agreement check.)
+    let m = map_with_entries(
+        "het-val",
+        vec![
+            table_entry("k", &[("a", 1)], "v1", &[("b", 2)]),
+            table_entry("k", &[("a", 3)], "v2", &[("b", 4)]),
+        ],
+    );
+    let out = format!("{m}");
+    assert!(
+        !out.contains(" | "),
+        "differing value type_name must reject the table: {out}",
+    );
+    assert!(
+        out.contains("entry: key="),
+        "heterogeneous value type must use per-entry form: {out}",
+    );
+}
+
+/// Per-CPU struct slot with the given inline-scalar fields, for
+/// `FailureDumpPercpuEntry` Display tests.
+fn percpu_struct(ty: &str, fields: &[(&str, u64)]) -> Option<RenderedValue> {
+    Some(make_small_struct(ty, fields))
+}
+
+#[test]
+fn percpu_entry_display_template_varying_branch() {
+    // 3 CPUs, each a UNIQUE struct (so every group has exactly one
+    // CPU and groups.len()==3) where only `count` varies and
+    // `weight` is identical (1024). This drives the template branch:
+    // common fields rendered once, varying field as a per-CPU table.
+    let entry = FailureDumpPercpuEntry {
+        key: 0,
+        per_cpu: vec![
+            percpu_struct("ctx", &[("weight", 1024), ("count", 10)]),
+            percpu_struct("ctx", &[("weight", 1024), ("count", 20)]),
+            percpu_struct("ctx", &[("weight", 1024), ("count", 30)]),
+        ],
+    };
+    let out = format!("{entry}");
+    assert!(
+        out.contains("key 0: struct ctx (3 CPUs)"),
+        "header must name the struct + CPU count: {out}",
+    );
+    // Common (non-varying, non-zero) field shown once under `common:`.
+    assert!(
+        out.contains("\n  common:"),
+        "common section header missing: {out}",
+    );
+    assert!(
+        out.contains("\n    weight: 1024"),
+        "identical field rendered once in common: {out}",
+    );
+    // `weight` must appear EXACTLY once — proving it was hoisted to
+    // common and NOT repeated per CPU (the whole point of the branch).
+    assert_eq!(
+        out.matches("weight").count(),
+        1,
+        "identical field must not repeat per CPU: {out}",
+    );
+    // Varying field rendered as a per-CPU table with one column.
+    assert!(
+        out.contains("\n  per-cpu:"),
+        "per-cpu table header missing: {out}",
+    );
+    assert!(
+        out.contains("\n    cpu | count"),
+        "per-cpu table column header missing: {out}",
+    );
+    assert!(out.contains("| 10"), "cpu 0 varying value: {out}");
+    assert!(out.contains("| 20"), "cpu 1 varying value: {out}");
+    assert!(out.contains("| 30"), "cpu 2 varying value: {out}");
+    // The fallback per-group `cpus ...:` lines must NOT appear — the
+    // template branch returns before the fallback loop.
+    assert!(
+        !out.contains("cpu 0:"),
+        "template branch must not emit per-group rows: {out}",
+    );
+}
+
+#[test]
+fn percpu_entry_display_template_zero_common_field_suppressed() {
+    // A common field that is zero is suppressed from `common:` (the
+    // `is_zero` skip), while the non-zero common field survives and
+    // the varying field still tables. Pins the zero-suppression that
+    // sits inside the template branch.
+    let entry = FailureDumpPercpuEntry {
+        key: 7,
+        per_cpu: vec![
+            percpu_struct("s", &[("live", 5), ("dead", 0), ("v", 1)]),
+            percpu_struct("s", &[("live", 5), ("dead", 0), ("v", 2)]),
+            percpu_struct("s", &[("live", 5), ("dead", 0), ("v", 3)]),
+        ],
+    };
+    let out = format!("{entry}");
+    assert!(
+        out.contains("\n    live: 5"),
+        "non-zero common field must render: {out}",
+    );
+    assert!(
+        !out.contains("dead"),
+        "zero common field must be suppressed silently: {out}",
+    );
+    assert!(
+        out.contains("\n    cpu | v"),
+        "varying field tables under per-cpu: {out}",
+    );
+}
+
+#[test]
+fn percpu_entry_display_contiguous_range_grouping() {
+    // 4 CPUs in 2 groups (cpus 0,1 share one struct; cpus 2,3 share
+    // another). groups.len()==2 < 3 so the template branch is skipped
+    // and the fallback runs. Each >1-CPU contiguous group collapses
+    // to `cpus FIRST-LAST`. The contiguity test is the `windows(2)`
+    // adjacent-difference check.
+    let a = percpu_struct("g", &[("v", 100)]);
+    let b = percpu_struct("g", &[("v", 200)]);
+    let entry = FailureDumpPercpuEntry {
+        key: 1,
+        per_cpu: vec![a.clone(), a, b.clone(), b],
+    };
+    let out = format!("{entry}");
+    assert!(
+        out.contains("key 1: struct g (4 CPUs)"),
+        "header must name struct + CPU count: {out}",
+    );
+    assert!(
+        out.contains("\n  cpus 0-1: "),
+        "contiguous low group must render as a range: {out}",
+    );
+    assert!(
+        out.contains("\n  cpus 2-3: "),
+        "contiguous high group must render as a range: {out}",
+    );
+    // Range form, not the debug-list `cpus [0, 1]` form.
+    assert!(
+        !out.contains("cpus ["),
+        "contiguous CPUs must use the range form, not the list form: {out}",
+    );
+}
+
+#[test]
+fn percpu_entry_display_noncontiguous_group_uses_list_form() {
+    // A group whose CPUs are NOT adjacent (0 and 2, with CPU 1
+    // holding a different value) must fall through the contiguity
+    // check to the debug-list `cpus {:?}` form. Pins the
+    // `windows(2)` branch's false arm against the contiguous case
+    // above. 3 distinct-content CPUs would trip the template branch,
+    // so we use 4 CPUs forming 2 groups, one of which is split.
+    let a = percpu_struct("g", &[("v", 7)]);
+    let b = percpu_struct("g", &[("v", 9)]);
+    let entry = FailureDumpPercpuEntry {
+        key: 2,
+        // groups: v=7 → cpus [0, 2]; v=9 → cpus [1, 3].
+        per_cpu: vec![a.clone(), b.clone(), a, b],
+    };
+    let out = format!("{entry}");
+    assert!(
+        out.contains("cpus [0, 2]"),
+        "non-contiguous group must use the debug-list form: {out}",
+    );
+    assert!(
+        !out.contains("cpus 0-2"),
+        "non-contiguous group must NOT use the range form: {out}",
+    );
+}
+
+#[test]
+fn percpu_entry_display_over_64_cpus_skips_dedup() {
+    // 65 CPUs (> PERCPU_DEDUP_CPU_LIMIT = 64) bypasses the O(n²)
+    // dedup pass and emits one `cpu N:` row per CPU even though every
+    // value is identical (which below the threshold would collapse to
+    // a single `all CPUs:` group). Pins the scale-guard branch.
+    let v = percpu_struct("c", &[("x", 1)]);
+    let entry = FailureDumpPercpuEntry {
+        key: 3,
+        per_cpu: (0..65).map(|_| v.clone()).collect(),
+    };
+    let out = format!("{entry}");
+    assert!(
+        out.contains("key 3: struct c (65 CPUs)"),
+        "header must report 65 CPUs: {out}",
+    );
+    // One row per CPU — first, a middle, and last all present.
+    assert!(out.contains("\n  cpu 0: "), "cpu 0 row missing: {out}");
+    assert!(out.contains("\n  cpu 64: "), "cpu 64 row missing: {out}");
+    // Exactly 65 `cpu N: ` rows (each on its own `\n  cpu ` line).
+    assert_eq!(
+        out.matches("\n  cpu ").count(),
+        65,
+        "every CPU must get its own row above the dedup threshold: {out}",
+    );
+    // The dedup grouping (`all CPUs:`) and the template form must NOT
+    // appear — both are skipped above the threshold.
+    assert!(
+        !out.contains("all CPUs"),
+        "above-threshold render must not dedup into an all-CPUs group: {out}",
+    );
+    assert!(
+        !out.contains("common:"),
+        "above-threshold render must not use the template form: {out}",
+    );
+}
+
+#[test]
+fn percpu_entry_display_all_identical_collapses_to_all_cpus() {
+    // Below the threshold, all-identical struct slots collapse to a
+    // single `all CPUs:` group (the `cpus.len() == n_cpus` arm of the
+    // fallback). Contrast with the >64 test above, where the same
+    // all-identical input is forced to one row per CPU. 4 CPUs keeps
+    // groups.len()==1, so neither template (>=3 groups) nor range
+    // grouping applies.
+    let v = percpu_struct("c", &[("x", 42)]);
+    let entry = FailureDumpPercpuEntry {
+        key: 4,
+        per_cpu: vec![v.clone(), v.clone(), v.clone(), v],
+    };
+    let out = format!("{entry}");
+    assert!(
+        out.contains("key 4: struct c (4 CPUs)"),
+        "header must report 4 CPUs: {out}",
+    );
+    assert!(
+        out.contains("\n  all CPUs: "),
+        "all-identical slots collapse to a single all-CPUs group: {out}",
+    );
+    assert!(
+        !out.contains("\n  cpu 0:"),
+        "the collapsed form must not emit per-CPU rows: {out}",
+    );
+}
+
+#[test]
+fn percpu_entry_display_fallback_marks_unmapped_cpus() {
+    // A mix of mapped structs (2 groups, so template skipped) plus an
+    // unmapped CPU: the fallback emits each group then a trailing
+    // `cpus [..]: <unmapped>` line listing the None slots. Pins the
+    // unmapped-tail rendering in the fallback path.
+    let a = percpu_struct("g", &[("v", 1)]);
+    let b = percpu_struct("g", &[("v", 2)]);
+    let entry = FailureDumpPercpuEntry {
+        key: 5,
+        per_cpu: vec![a, b, None],
+    };
+    let out = format!("{entry}");
+    assert!(
+        out.contains("\n  cpus [2]: <unmapped>"),
+        "unmapped CPU must be listed in the fallback tail: {out}",
+    );
+}

@@ -2045,3 +2045,299 @@ proptest::proptest! {
         assert_eq!(major_version(&v).unwrap(), major);
     }
 }
+
+// -- version_tuple --
+
+/// Three-segment versions parse all three numeric components.
+#[test]
+fn version_tuple_three_part_parses_all_components() {
+    assert_eq!(version_tuple("6.14.2"), Some((6, 14, 2)));
+    assert_eq!(version_tuple("5.4.0"), Some((5, 4, 0)));
+    assert_eq!(version_tuple("6.12.81"), Some((6, 12, 81)));
+}
+
+/// Two-segment versions default the patch component to 0 — this is
+/// what lets a major.minor prefix compare against full patch
+/// versions in `latest_in_series` / `fetch_version_for_prefix`.
+#[test]
+fn version_tuple_two_part_defaults_patch_to_zero() {
+    assert_eq!(version_tuple("6.14"), Some((6, 14, 0)));
+    assert_eq!(version_tuple("7.0"), Some((7, 0, 0)));
+}
+
+/// A bare single segment (no dot) is unparseable — `parts.len()` is
+/// 1, which falls into the `_ => None` arm. Mirrors `patch_level`'s
+/// single-part rejection.
+#[test]
+fn version_tuple_single_segment_is_none() {
+    assert_eq!(version_tuple("6"), None);
+    assert_eq!(version_tuple(""), None);
+}
+
+/// Four-or-more segments are rejected outright — the match only has
+/// arms for 2 and 3 parts, everything else hits `_ => None`.
+#[test]
+fn version_tuple_four_part_is_none() {
+    assert_eq!(version_tuple("6.1.2.3"), None);
+    assert_eq!(version_tuple("1.2.3.4.5"), None);
+}
+
+/// A correctly-shaped version string whose components are not
+/// numeric yields `None`: the per-segment `parse().ok()?` short-
+/// circuits. RC tags split on `.` into 2 parts whose second
+/// segment (`"15-rc3"`) is non-numeric, so they are not version
+/// tuples — the resolution pipeline handles RC tags on a separate
+/// path.
+#[test]
+fn version_tuple_non_numeric_segments_are_none() {
+    // "6.15-rc3" -> ["6", "15-rc3"]: 2 parts, minor parse fails.
+    assert_eq!(version_tuple("6.15-rc3"), None);
+    // 3 parts, patch non-numeric.
+    assert_eq!(version_tuple("6.14.x"), None);
+    // 3 parts, minor non-numeric.
+    assert_eq!(version_tuple("6.x.2"), None);
+    // 2 parts, major non-numeric.
+    assert_eq!(version_tuple("v6.14"), None);
+    // u32 overflow on a segment: 2^32 = 4294967296 does not fit
+    // in u32, so `parse::<u32>()` errors and the tuple is None.
+    assert_eq!(version_tuple("6.4294967296"), None);
+}
+
+/// The returned tuples order the way callers depend on: tuple
+/// comparison is lexicographic over (major, minor, patch), so
+/// `latest_in_series` / `fetch_version_for_prefix` pick the highest
+/// version by comparing these tuples directly. Pin the ordering on
+/// each component so a regression that reordered the tuple fields
+/// would surface here.
+#[test]
+fn version_tuple_orders_lexicographically_by_component() {
+    let v = |s: &str| version_tuple(s).expect("parseable");
+    // Patch dominates within the same major.minor.
+    assert!(v("6.14.2") > v("6.14.1"));
+    // Minor dominates patch across minor bumps.
+    assert!(v("6.15.0") > v("6.14.99"));
+    // Major dominates everything.
+    assert!(v("7.0.0") > v("6.99.99"));
+    // The 2-part patch-zero default sorts below any nonzero patch
+    // in the same series — "6.14" (== 6.14.0) < "6.14.1".
+    assert!(v("6.14") < v("6.14.1"));
+    // Equal strings produce equal tuples.
+    assert_eq!(v("6.14.2"), v("6.14.2"));
+}
+
+// -- is_skippable_release_moniker --
+
+/// `linux-next` is the single moniker the resolution pipeline
+/// skips — its date-suffixed version strings do not fit the
+/// major.minor.patch model. Exact-match only: anything else
+/// (including substrings and case variants) is NOT skipped.
+#[test]
+fn is_skippable_release_moniker_matrix() {
+    // The one skippable moniker.
+    assert!(is_skippable_release_moniker("linux-next"));
+
+    // Every resolvable moniker must NOT be skipped — these are the
+    // ones `fetch_latest_stable_version` / `fetch_version_for_prefix`
+    // actually iterate over.
+    for keep in ["stable", "longterm", "mainline", "eol"] {
+        assert!(
+            !is_skippable_release_moniker(keep),
+            "{keep:?} is a resolvable moniker and must NOT be skipped",
+        );
+    }
+
+    // Exact-match contract: substrings and decorated variants are
+    // NOT skipped. A `contains`-style implementation would wrongly
+    // skip these.
+    for keep in [
+        "linux-next-20260420",
+        "linux-nextfoo",
+        "next",
+        "linux",
+        "",
+    ] {
+        assert!(
+            !is_skippable_release_moniker(keep),
+            "{keep:?} is not exactly \"linux-next\" and must NOT be skipped",
+        );
+    }
+
+    // Case-sensitive: the comparison is byte-exact `==`.
+    assert!(
+        !is_skippable_release_moniker("Linux-Next"),
+        "moniker match is case-sensitive",
+    );
+    assert!(!is_skippable_release_moniker("LINUX-NEXT"));
+}
+
+// -- reject_html_response --
+
+/// Fetch `path` from a mockito server configured with `status`,
+/// optional `content_type` header, and `body`, returning the live
+/// `reqwest::blocking::Response`. The `ServerGuard` is returned so
+/// the caller keeps the server alive for the response's lifetime.
+fn fetch_mock_response(
+    status: usize,
+    content_type: Option<&str>,
+    body: &str,
+) -> (mockito::ServerGuard, reqwest::blocking::Response) {
+    let mut server = mockito::Server::new();
+    let mut m = server.mock("GET", "/file").with_status(status);
+    if let Some(ct) = content_type {
+        m = m.with_header("content-type", ct);
+    }
+    let _mock = m.with_body(body).create();
+    let url = format!("{}/file", server.url());
+    let response = test_client()
+        .get(&url)
+        .send()
+        .expect("mock fetch must succeed");
+    (server, response)
+}
+
+/// A `text/html` Content-Type surfaces as `Err` — a CDN error page
+/// returned with a 200 status and `text/html` must be rejected
+/// before extraction so the xz/gzip decoder never chews on HTML.
+/// The diagnostic must name both the HTML cause and the URL.
+#[test]
+fn reject_html_response_rejects_text_html() {
+    let url = "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.14.2.tar.xz";
+    let (_server, response) =
+        fetch_mock_response(200, Some("text/html"), "<html><body>404</body></html>");
+    let err = reject_html_response(&response, url).expect_err("text/html must surface as Err");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("server returned HTML instead of tarball"),
+        "diagnostic must name the HTML cause: {msg}",
+    );
+    assert!(msg.contains(url), "diagnostic must name the URL: {msg}");
+}
+
+/// A `text/html; charset=utf-8` Content-Type is also rejected — the
+/// check is a substring match (`contains("text/html")`), so the
+/// parameterized form must still trip it.
+#[test]
+fn reject_html_response_rejects_text_html_with_charset() {
+    let url = "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.14.2.tar.xz";
+    let (_server, response) =
+        fetch_mock_response(200, Some("text/html; charset=utf-8"), "<html></html>");
+    let err = reject_html_response(&response, url)
+        .expect_err("text/html with charset param must surface as Err");
+    assert!(
+        format!("{err:#}").contains("server returned HTML instead of tarball"),
+        "charset-parameterized text/html must still be rejected",
+    );
+}
+
+/// A binary Content-Type (the real-tarball case) passes — the
+/// substring `text/html` is absent so the guard returns `Ok(())`
+/// and the download proceeds to extraction.
+#[test]
+fn reject_html_response_accepts_octet_stream() {
+    let url = "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.14.2.tar.xz";
+    let (_server, response) =
+        fetch_mock_response(200, Some("application/octet-stream"), "\x00\x01\x02");
+    reject_html_response(&response, url)
+        .expect("binary content-type must be accepted, not rejected as HTML");
+}
+
+/// A response with NO Content-Type header passes — the
+/// `if let Some(ct) = ...headers().get(CONTENT_TYPE)` guard short-
+/// circuits to `Ok(())`. A bare-bodied CDN response without the
+/// header must not be misclassified as HTML.
+#[test]
+fn reject_html_response_accepts_missing_content_type() {
+    let url = "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.14.2.tar.xz";
+    let (_server, response) = fetch_mock_response(200, None, "\x00\x01\x02");
+    // Precondition: the mock served no content-type header so the
+    // `Some(ct)` arm of the guard is genuinely skipped (rather than
+    // a header present that merely lacks "text/html").
+    assert!(
+        response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .is_none(),
+        "test precondition: mock must serve no content-type header",
+    );
+    reject_html_response(&response, url)
+        .expect("absent content-type must be accepted, not rejected as HTML");
+}
+
+// -- print_download_size --
+
+/// With a Content-Length header, `print_download_size` emits the
+/// MiB-annotated form `"{label}: downloading {url} ({mib:.1} MiB)"`.
+/// A body of exactly 1.5 MiB makes the rendered size deterministic
+/// ("1.5 MiB"), pinning both the formula (bytes / 1024^2) and the
+/// `{:.1}` precision. Capture goes through the crate-shared
+/// stderr-capture helper.
+#[test]
+fn print_download_size_with_content_length_renders_mib() {
+    let url = "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.14.2.tar.xz";
+    // Exactly 1.5 MiB: 1.5 * 1024 * 1024 = 1572864 bytes ->
+    // 1572864 / (1024*1024) = 1.5 -> formats to "1.5".
+    let body = vec![b'x'; 1_572_864];
+    let body_str = String::from_utf8(body).expect("ascii body is valid utf-8");
+    let (_server, response) = fetch_mock_response(200, Some("application/octet-stream"), &body_str);
+    // Precondition: reqwest must report the body length so the
+    // `Some(len)` branch is actually taken.
+    assert_eq!(
+        response.content_length(),
+        Some(1_572_864),
+        "test precondition: mock body must surface as a 1.5 MiB content length",
+    );
+
+    let (_, bytes) = crate::test_support::test_helpers::capture_stderr(|| {
+        print_download_size(&response, url, "ktstr");
+    });
+    let captured = String::from_utf8(bytes).expect("captured stderr must be utf-8");
+    assert_eq!(
+        captured,
+        format!("ktstr: downloading {url} (1.5 MiB)\n"),
+        "Content-Length present must render the MiB-annotated form \
+         with the cli_label prefix and 1-decimal size",
+    );
+}
+
+/// Without a Content-Length header (chunked transfer), the function
+/// falls to the un-annotated form `"{label}: downloading {url}"` —
+/// no size, no "MiB". A chunked mock body makes reqwest report
+/// `content_length() == None`, exercising the `else` arm. Also pins
+/// that `cli_label` threads through verbatim ("cargo ktstr").
+#[test]
+fn print_download_size_without_content_length_omits_mib() {
+    let url = "https://git.kernel.org/torvalds/t/linux-6.15-rc3.tar.gz";
+    let mut server = mockito::Server::new();
+    // Chunked body -> no Content-Length header on the response.
+    let _mock = server
+        .mock("GET", "/file")
+        .with_status(200)
+        .with_chunked_body(|w| w.write_all(b"streamed body bytes"))
+        .create();
+    let mock_url = format!("{}/file", server.url());
+    let response = test_client()
+        .get(&mock_url)
+        .send()
+        .expect("chunked mock fetch must succeed");
+    // Precondition: a chunked response carries no Content-Length,
+    // so `content_length()` is None and the `else` branch runs.
+    assert!(
+        response.content_length().is_none(),
+        "test precondition: chunked body must surface as None content length",
+    );
+
+    let (_, bytes) = crate::test_support::test_helpers::capture_stderr(|| {
+        print_download_size(&response, url, "cargo ktstr");
+    });
+    let captured = String::from_utf8(bytes).expect("captured stderr must be utf-8");
+    assert_eq!(
+        captured,
+        format!("cargo ktstr: downloading {url}\n"),
+        "absent Content-Length must render the un-annotated form \
+         (no size, no MiB) with the cli_label prefix",
+    );
+    assert!(
+        !captured.contains("MiB"),
+        "no-Content-Length form must NOT mention MiB: {captured:?}",
+    );
+}

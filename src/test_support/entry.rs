@@ -5649,4 +5649,373 @@ mod tests {
             "with_expect_auto_repro(false) must flip the field back to false"
         );
     }
-}
+
+    // -- with_disk / without_disk builder methods --
+    //
+    // The field-via-struct-literal path is covered by the
+    // validate_* host_only/disk tests above; these pin the
+    // chainable setter/clearer pair (the documented programmatic
+    // construction path) so a missing-setter or
+    // sets-the-wrong-field regression surfaces. DiskConfig does not
+    // derive PartialEq, so the round-trip is asserted on the
+    // distinguishing `capacity_mib` field rather than whole-struct
+    // equality.
+
+    #[test]
+    fn with_disk_sets_some_and_carries_config() {
+        // Distinguishing capacity (512 != DEFAULT 256) proves the
+        // setter stores the SUPPLIED config, not a fresh default.
+        let cfg = crate::vmm::disk_config::DiskConfig::DEFAULT.capacity_mib(512);
+        let entry = KtstrTestEntry::DEFAULT.with_name("disk_setter").with_disk(cfg);
+        let got = entry.disk.expect("with_disk must populate Some");
+        assert_eq!(
+            got.capacity_mib, 512,
+            "with_disk must carry the supplied DiskConfig's capacity_mib"
+        );
+        // DEFAULT starts with no disk — the setter is what changed it.
+        assert!(
+            KtstrTestEntry::DEFAULT.disk.is_none(),
+            "DEFAULT must boot without a disk; with_disk is the only mutator here"
+        );
+    }
+
+    #[test]
+    fn without_disk_clears_to_none() {
+        let cfg = crate::vmm::disk_config::DiskConfig::DEFAULT.capacity_mib(512);
+        let entry = KtstrTestEntry::DEFAULT
+            .with_name("disk_clear")
+            .with_disk(cfg)
+            .without_disk();
+        assert!(
+            entry.disk.is_none(),
+            "without_disk must return the disk field to None"
+        );
+    }
+
+    // -- with_network / without_network builder methods --
+
+    #[test]
+    fn with_network_sets_some_and_carries_config() {
+        // Distinguishing MAC (!= DEFAULT 02:00:00:00:00:01) proves
+        // the setter stores the SUPPLIED config.
+        const MAC: [u8; 6] = [0x52, 0x54, 0x00, 0xab, 0xcd, 0xef];
+        let cfg = crate::vmm::net_config::NetConfig::DEFAULT.mac(MAC);
+        let entry = KtstrTestEntry::DEFAULT
+            .with_name("net_setter")
+            .with_network(cfg);
+        let got = entry.network.expect("with_network must populate Some");
+        assert_eq!(
+            got.mac, MAC,
+            "with_network must carry the supplied NetConfig's MAC"
+        );
+        assert!(
+            KtstrTestEntry::DEFAULT.network.is_none(),
+            "DEFAULT must boot without a NIC; with_network is the only mutator here"
+        );
+    }
+
+    #[test]
+    fn without_network_clears_to_none() {
+        let cfg = crate::vmm::net_config::NetConfig::DEFAULT;
+        let entry = KtstrTestEntry::DEFAULT
+            .with_name("net_clear")
+            .with_network(cfg)
+            .without_network();
+        assert!(
+            entry.network.is_none(),
+            "without_network must return the network field to None"
+        );
+    }
+
+    /// `without_disk` does not touch `network` and vice versa — the
+    /// two clearers are independent. Pins against a copy-paste
+    /// regression where one clearer nulls the wrong field.
+    #[test]
+    fn disk_and_network_clearers_are_independent() {
+        // DiskConfig is Clone (not Copy), so build a fresh one per
+        // entry; NetConfig is Copy and can be reused.
+        let net = crate::vmm::net_config::NetConfig::DEFAULT.mac([0x52, 0x54, 0, 0, 0, 9]);
+        // Clear disk only: network must survive.
+        let e1 = KtstrTestEntry::DEFAULT
+            .with_name("indep_disk")
+            .with_disk(crate::vmm::disk_config::DiskConfig::DEFAULT.capacity_mib(512))
+            .with_network(net)
+            .without_disk();
+        assert!(e1.disk.is_none(), "without_disk must clear disk");
+        assert!(
+            e1.network.is_some(),
+            "without_disk must NOT clear network"
+        );
+        // Clear network only: disk must survive.
+        let e2 = KtstrTestEntry::DEFAULT
+            .with_name("indep_net")
+            .with_disk(crate::vmm::disk_config::DiskConfig::DEFAULT.capacity_mib(512))
+            .with_network(net)
+            .without_network();
+        assert!(
+            e2.network.is_none(),
+            "without_network must clear network"
+        );
+        assert!(e2.disk.is_some(), "without_network must NOT clear disk");
+    }
+
+    // -- with_num_snapshots builder method --
+
+    /// `with_num_snapshots` stores the exact supplied count and a
+    /// second call overrides it (the field is a plain `u32`, not an
+    /// accumulator). DEFAULT is `0` (periodic disabled), so the
+    /// setter is the only mutator.
+    #[test]
+    fn with_num_snapshots_sets_and_overrides_exact_count() {
+        assert_eq!(
+            KtstrTestEntry::DEFAULT.num_snapshots, 0,
+            "DEFAULT disables periodic capture (num_snapshots == 0)"
+        );
+        let entry = KtstrTestEntry::DEFAULT.with_name("snap").with_num_snapshots(4);
+        assert_eq!(
+            entry.num_snapshots, 4,
+            "with_num_snapshots must store the exact supplied count"
+        );
+        // A second call overrides rather than accumulating.
+        let entry = entry.with_num_snapshots(0);
+        assert_eq!(
+            entry.num_snapshots, 0,
+            "with_num_snapshots must OVERRIDE, not add to, the prior count"
+        );
+    }
+
+    // -- with_post_vm_unconditional / without_post_vm_unconditional --
+
+    fn unconditional_cb_ok(_r: &crate::vmm::VmResult) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn conditional_cb_ok(_r: &crate::vmm::VmResult) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    #[test]
+    fn with_post_vm_unconditional_sets_field() {
+        assert!(
+            KtstrTestEntry::DEFAULT.post_vm_unconditional.is_none(),
+            "DEFAULT must leave post_vm_unconditional unset"
+        );
+        let entry = KtstrTestEntry::DEFAULT
+            .with_name("uncond")
+            .with_post_vm_unconditional(unconditional_cb_ok);
+        let cb = entry
+            .post_vm_unconditional
+            .expect("with_post_vm_unconditional must populate Some");
+        // Pointer identity proves the setter stored the SUPPLIED fn
+        // pointer, not some sentinel.
+        assert!(
+            std::ptr::fn_addr_eq(
+                cb,
+                unconditional_cb_ok as crate::test_support::PostVmCallback
+            ),
+            "with_post_vm_unconditional must carry the supplied callback fn pointer"
+        );
+    }
+
+    #[test]
+    fn without_post_vm_unconditional_clears_to_none() {
+        let entry = KtstrTestEntry::DEFAULT
+            .with_name("uncond_clear")
+            .with_post_vm_unconditional(unconditional_cb_ok)
+            .without_post_vm_unconditional();
+        assert!(
+            entry.post_vm_unconditional.is_none(),
+            "without_post_vm_unconditional must return the field to None"
+        );
+    }
+
+    /// `without_post_vm_unconditional` must NOT disturb the
+    /// conditional `post_vm` slot — the two callback slots are
+    /// independent (a guest-success entry runs both; only
+    /// `post_vm` is gated on guest-fail). Pins the docstring claim
+    /// on `without_post_vm_unconditional` ("Does not affect the
+    /// conditional with_post_vm callback if one is set").
+    #[test]
+    fn without_post_vm_unconditional_leaves_conditional_post_vm_intact() {
+        let entry = KtstrTestEntry::DEFAULT
+            .with_name("both_then_clear_uncond")
+            .with_post_vm(conditional_cb_ok)
+            .with_post_vm_unconditional(unconditional_cb_ok)
+            .without_post_vm_unconditional();
+        assert!(
+            entry.post_vm_unconditional.is_none(),
+            "without_post_vm_unconditional must clear its own slot"
+        );
+        let cond = entry
+            .post_vm
+            .expect("conditional post_vm must survive the unconditional clear");
+        assert!(
+            std::ptr::fn_addr_eq(cond, conditional_cb_ok as crate::test_support::PostVmCallback),
+            "the surviving post_vm must still be the conditional callback"
+        );
+    }
+
+    /// Both callback slots can be set on the same entry and carry
+    /// DISTINCT fn pointers — pins the field doc on
+    /// `post_vm_unconditional` ("Both post_vm and
+    /// post_vm_unconditional may be set on the same entry").
+    #[test]
+    fn post_vm_and_unconditional_slots_are_separate() {
+        let entry = KtstrTestEntry::DEFAULT
+            .with_name("both_slots")
+            .with_post_vm(conditional_cb_ok)
+            .with_post_vm_unconditional(unconditional_cb_ok);
+        let cond = entry.post_vm.expect("post_vm set");
+        let uncond = entry
+            .post_vm_unconditional
+            .expect("post_vm_unconditional set");
+        assert!(
+            std::ptr::fn_addr_eq(cond, conditional_cb_ok as crate::test_support::PostVmCallback),
+            "post_vm slot must hold the conditional callback"
+        );
+        assert!(
+            std::ptr::fn_addr_eq(
+                uncond,
+                unconditional_cb_ok as crate::test_support::PostVmCallback
+            ),
+            "post_vm_unconditional slot must hold the unconditional callback"
+        );
+        assert!(
+            !std::ptr::fn_addr_eq(cond, uncond),
+            "the two slots must hold DISTINCT fn pointers, not alias each other"
+        );
+    }
+
+    // -- SchedulerJson::from_scheduler --
+    //
+    // `from_scheduler` projects a `&Scheduler` into the JSON wire
+    // shape the `--ktstr-list-schedulers` ctor emits. The binary_kind
+    // tag is the load-bearing projection — the verifier dispatch
+    // `match`es on it without re-parsing the string.
+
+    /// Each `SchedulerSpec` variant maps to the corresponding
+    /// `BinaryKindJson` tag, carrying the binary string for
+    /// Discover/Path and erasing it (no BPF to verify) for
+    /// Eevdf/KernelBuiltin. Table-driven over all four variants so a
+    /// future variant addition that forgets a `from_scheduler` arm
+    /// fails here.
+    #[test]
+    fn from_scheduler_projects_binary_kind_for_every_spec() {
+        // Discover → Discover(name)
+        let s = Scheduler::named("disc").binary(SchedulerSpec::Discover("scx_rusty"));
+        assert_eq!(
+            SchedulerJson::from_scheduler(&s).binary_kind,
+            BinaryKindJson::Discover("scx_rusty".to_string()),
+        );
+        // Path → Path(p)
+        let s = Scheduler::named("pth").binary(SchedulerSpec::Path("/usr/bin/scx_x"));
+        assert_eq!(
+            SchedulerJson::from_scheduler(&s).binary_kind,
+            BinaryKindJson::Path("/usr/bin/scx_x".to_string()),
+        );
+        // Eevdf → Eevdf (unit, string erased)
+        let s = Scheduler::named("ee").binary(SchedulerSpec::Eevdf);
+        assert_eq!(
+            SchedulerJson::from_scheduler(&s).binary_kind,
+            BinaryKindJson::Eevdf,
+        );
+        // KernelBuiltin → KernelBuiltin (unit; enable/disable commands erased)
+        let s = Scheduler::named("kb").binary(SchedulerSpec::KernelBuiltin {
+            enable: &["echo on"],
+            disable: &["echo off"],
+        });
+        assert_eq!(
+            SchedulerJson::from_scheduler(&s).binary_kind,
+            BinaryKindJson::KernelBuiltin,
+        );
+    }
+
+    /// `from_scheduler` copies `name`, the four topology dimensions,
+    /// `sched_args`, `kernels`, and every constraint field into the
+    /// wire shape. `EEVDF` defaults the topology to
+    /// 1 numa × 1 llc × 2 cores × 1 thread (see `Scheduler::EEVDF`),
+    /// and the constraints to `TopologyConstraints::DEFAULT`. Pins
+    /// every projected field so a mis-mapped dimension (e.g. swapping
+    /// llcs and cores) surfaces.
+    #[test]
+    fn from_scheduler_copies_name_topology_args_kernels_constraints() {
+        let json = SchedulerJson::from_scheduler(&Scheduler::EEVDF);
+        assert_eq!(json.name, "eevdf");
+        // EEVDF topology baseline.
+        assert_eq!(json.topology.num_numa_nodes, 1);
+        assert_eq!(json.topology.num_llcs, 1);
+        assert_eq!(json.topology.cores_per_llc, 2);
+        assert_eq!(json.topology.threads_per_core, 1);
+        // EEVDF carries no sched_args, no kernel filter.
+        assert!(json.sched_args.is_empty());
+        assert!(json.kernels.is_empty());
+        // Constraints mirror TopologyConstraints::DEFAULT.
+        assert_eq!(json.constraints.min_numa_nodes, 1);
+        assert_eq!(json.constraints.max_numa_nodes, Some(1));
+        assert_eq!(json.constraints.min_llcs, 1);
+        assert_eq!(json.constraints.max_llcs, Some(12));
+        assert!(!json.constraints.requires_smt);
+        assert_eq!(json.constraints.min_cpus, 1);
+        assert_eq!(json.constraints.max_cpus, Some(192));
+    }
+
+    /// Non-default fields round-trip through the projection: a
+    /// scheduler with an overridden topology, explicit `sched_args`,
+    /// `kernels`, and tightened `constraints` projects each verbatim.
+    /// `Scheduler::topology(numa, llcs, cores, threads)` maps the
+    /// argument order to the `Topology` fields, so this also pins
+    /// that the projection reads `num_numa_nodes()`/`num_llcs()`
+    /// (not the raw struct fields in a swapped order).
+    #[test]
+    fn from_scheduler_projects_overridden_fields_verbatim() {
+        static ARGS: &[&str] = &["--slice-us", "20000"];
+        static KERNELS: &[&str] = &["6.14", "6.15..6.16"];
+        let s = Scheduler::named("custom")
+            .binary_discover("scx_custom")
+            // 2 numa × 4 llcs × 8 cores × 2 threads
+            .topology(2, 4, 8, 2)
+            .sched_args(ARGS)
+            .kernels(KERNELS)
+            .constraints(
+                TopologyConstraints::DEFAULT
+                    .with_min_numa_nodes(2)
+                    .with_max_numa_nodes(4)
+                    .with_requires_smt(true),
+            );
+        let json = SchedulerJson::from_scheduler(&s);
+        assert_eq!(json.name, "custom");
+        assert_eq!(json.binary_kind, BinaryKindJson::Discover("scx_custom".to_string()));
+        assert_eq!(json.topology.num_numa_nodes, 2);
+        assert_eq!(json.topology.num_llcs, 4);
+        assert_eq!(json.topology.cores_per_llc, 8);
+        assert_eq!(json.topology.threads_per_core, 2);
+        assert_eq!(json.sched_args, vec!["--slice-us", "20000"]);
+        assert_eq!(json.kernels, vec!["6.14", "6.15..6.16"]);
+        assert_eq!(json.constraints.min_numa_nodes, 2);
+        assert_eq!(json.constraints.max_numa_nodes, Some(4));
+        assert!(json.constraints.requires_smt);
+    }
+
+    /// The projected `SchedulerJson` survives a serde JSON
+    /// round-trip with field-for-field equality — the wire shape the
+    /// `--ktstr-list-schedulers` ctor serializes is the exact shape a
+    /// consumer deserializes. Exercises the `#[serde(tag = "kind",
+    /// content = "value")]` adjacent tagging on `BinaryKindJson`
+    /// (Discover serializes as `{"kind":"discover","value":"..."}`).
+    #[test]
+    fn from_scheduler_json_roundtrips_through_serde() {
+        let s = Scheduler::named("rt")
+            .binary_discover("scx_rt")
+            .topology(1, 2, 4, 2)
+            .sched_args(&["--x"])
+            .kernels(&["6.14"]);
+        let json = SchedulerJson::from_scheduler(&s);
+        let text = serde_json::to_string(&json).expect("serialize SchedulerJson");
+        // The adjacent-tagged binary_kind must surface its tag/value.
+        assert!(
+            text.contains("\"kind\":\"discover\"") && text.contains("\"value\":\"scx_rt\""),
+            "Discover must serialize as kind/value adjacent tag, got: {text}"
+        );
+        let back: SchedulerJson =
+            serde_json::from_str(&text).expect("deserialize SchedulerJson");
+        assert_eq!(back, json, "SchedulerJson must round-trip through serde unchanged");
+    }}
