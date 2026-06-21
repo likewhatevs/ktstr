@@ -539,7 +539,7 @@ mod tests {
     /// fields present the comm field is the third token verbatim.
     #[test]
     fn build_primary_hier_splits_three_field_group_key() {
-        let rows = vec![mk_row("/svc\x00alpha\x00alpha-w", "alpha-w", 10.0)];
+        let rows = [mk_row("/svc\x00alpha\x00alpha-w", "alpha-w", 10.0)];
         let hier = build_primary_hier(rows.iter(), |r: &DiffRow| r.group_key.as_str());
         assert_eq!(hier.len(), 1);
         assert_eq!(hier[0].cgroup, "/svc");
@@ -554,7 +554,7 @@ mod tests {
     /// triple-segmented.
     #[test]
     fn build_primary_hier_comm_defaults_to_pcomm_when_two_fields() {
-        let rows = vec![mk_row("/svc\x00beta", "beta", 10.0)];
+        let rows = [mk_row("/svc\x00beta", "beta", 10.0)];
         let hier = build_primary_hier(rows.iter(), |r: &DiffRow| r.group_key.as_str());
         assert_eq!(hier[0].cgroup, "/svc");
         assert_eq!(hier[0].pcomm, "beta");
@@ -569,7 +569,7 @@ mod tests {
     /// `unwrap_or("")` / `unwrap_or(pcomm)` fallbacks.
     #[test]
     fn build_primary_hier_empty_key_yields_empty_fields() {
-        let rows = vec![mk_row("", "", 10.0)];
+        let rows = [mk_row("", "", 10.0)];
         let hier = build_primary_hier(rows.iter(), |r: &DiffRow| r.group_key.as_str());
         assert_eq!(hier[0].cgroup, "");
         assert_eq!(hier[0].pcomm, "");
@@ -585,7 +585,7 @@ mod tests {
     /// inside `/cg-b` the `p2` leaf (holding index 0) precedes `p1`.
     #[test]
     fn build_primary_hier_floats_top_mover_cgroup_and_leaf_first() {
-        let rows = vec![
+        let rows = [
             // index 0: top mover — lives in /cg-b under pcomm p2.
             mk_row("/cg-b\x00p2\x00p2-w", "p2-w", 999.0),
             // index 1: /cg-a under p1.
@@ -773,9 +773,10 @@ mod tests {
     /// `run_time_ns` sort metric so the section renderers have a
     /// real registry-backed sort name to print in the header.
     fn diff_with(rows: Vec<DiffRow>) -> CtprofDiff {
-        let mut diff = CtprofDiff::default();
-        diff.rows = rows;
-        diff
+        CtprofDiff {
+            rows,
+            ..Default::default()
+        }
     }
 
     /// `write_primary_section` under `GroupBy::All` emits the
@@ -835,8 +836,10 @@ mod tests {
         );
         let diff = diff_with(vec![fudged, normal]);
         let cols = full_columns();
-        let mut display = DisplayOptions::default();
-        display.section_line_limit = 1;
+        let display = DisplayOptions {
+            section_line_limit: 1,
+            ..Default::default()
+        };
         let mut out = String::new();
         write_primary_section(&mut out, &diff, GroupBy::All, "comm", &cols, &display, &[]).unwrap();
         assert!(
@@ -863,8 +866,10 @@ mod tests {
     fn write_primary_section_suppressed_when_neither_section_enabled() {
         let diff = diff_with(vec![mk_row("/svc\x00p\x00p-w", "p-w", 10.0)]);
         let cols = full_columns();
-        let mut display = DisplayOptions::default();
-        display.sections = vec![super::super::super::columns::Section::Derived];
+        let display = DisplayOptions {
+            sections: vec![super::super::super::columns::Section::Derived],
+            ..Default::default()
+        };
         let mut out = String::new();
         write_primary_section(&mut out, &diff, GroupBy::All, "comm", &cols, &display, &[]).unwrap();
         assert!(
@@ -882,8 +887,10 @@ mod tests {
     fn write_primary_section_taskstats_only_keeps_table_drops_primary_rows() {
         let diff = diff_with(vec![mk_row("alpha\x00alpha\x00alpha-w", "alpha-w", 10.0)]);
         let cols = full_columns();
-        let mut display = DisplayOptions::default();
-        display.sections = vec![super::super::super::columns::Section::TaskstatsDelay];
+        let display = DisplayOptions {
+            sections: vec![super::super::super::columns::Section::TaskstatsDelay],
+            ..Default::default()
+        };
         let mut out = String::new();
         // Flat-table branch (Pcomm) is simplest for the row-filter
         // assertion; the outer gate is shared with All/Cgroup.

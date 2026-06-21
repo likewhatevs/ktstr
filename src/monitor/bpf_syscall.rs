@@ -468,7 +468,7 @@ fn info_name_matches(a: &BpfMapInfo, b: &BpfMapInfo) -> bool {
 /// freshly fetched from the kernel; this fn lets a test pin the
 /// filter's keep/discard contract over a deterministic fixture.
 #[cfg(test)]
-fn select_keeping<'a, F>(infos: &'a [BpfMapInfo], mut predicate: F) -> Vec<&'a BpfMapInfo>
+fn select_keeping<F>(infos: &[BpfMapInfo], mut predicate: F) -> Vec<&BpfMapInfo>
 where
     F: FnMut(&BpfMapInfo) -> bool,
 {

@@ -624,6 +624,7 @@ fn should_warn_cross_node_polarity() {
 ///   - single-node plan → `None`, so a refactor that flipped the
 ///     predicate to fire on single-node plans surfaces as an
 ///     unexpected `Some`.
+///
 /// `warn_if_cross_node_spill` itself is still invoked to prove it
 /// stays a pure no-op on the single-node path (it must not panic and
 /// has no other observable side effect when the warning is `None`).
