@@ -92,6 +92,15 @@ fn capture_with_synthetic_tree_assembles_thread_state() {
     assert_eq!(t.comm, "worker-thread");
     assert_eq!(t.cgroup, "/ktstr.slice/worker0");
 
+    assert_synthetic_thread_state(t);
+}
+
+/// Asserts every non-identity field of the synthetic-tree
+/// `ThreadState` carries its planted value. Extracted verbatim
+/// from `capture_with_synthetic_tree_assembles_thread_state` so
+/// the capture+identity checks and the per-field assertions live
+/// in separate functions; called by that test on `&snap.threads[0]`.
+fn assert_synthetic_thread_state(t: &ThreadState) {
     use crate::metric_types::{
         Bytes, CategoricalString, ClockTicks, CpuSet, MonotonicCount, MonotonicNs, OrdinalI32,
         PeakNs,

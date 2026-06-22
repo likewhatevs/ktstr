@@ -123,11 +123,6 @@ const EXCEPTIONS: &[(&str, &str, usize)] = &[
     ), // queued: decompose
     ("cli/kernel_build/build.rs", "kernel_build_pipeline", 492),  // queued: decompose
     ("ctprof/mod.rs", "capture_with", 473),                       // queued: decompose
-    (
-        "ctprof/tests_capture.rs",
-        "capture_with_synthetic_tree_assembles_thread_state",
-        202,
-    ), // queued: decompose
     ("ctprof_compare/report/smaps.rs", "write_smaps_section", 212), // queued: decompose
     ("ctprof_compare/runner.rs", "write_metric_list", 212),       // queued: decompose
     ("export.rs", "generate_preamble", 416),                      // queued: decompose
