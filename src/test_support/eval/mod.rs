@@ -2407,9 +2407,8 @@ fn evaluate_vm_result(
     // like sched_log / sched_ext dump / monitor). Without this hint
     // the test author had to scroll past ~200 lines of trace_pipe
     // dump output to find the line that explains why the scheduler
-    // exited; see KTSTR_API_ISSUES_FROM_SCX_MITOSIS.md B4 for the
-    // motivating user report. Extraction is suppressed when there
-    // is nothing actionable to surface so passing tests stay quiet.
+    // exited. Extraction is suppressed when there is nothing
+    // actionable to surface so passing tests stay quiet.
     //
     // Gated behind a closure: every failure return path below renders
     // exactly one failure message and calls the closure exactly once,
