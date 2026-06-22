@@ -1378,25 +1378,66 @@ fn build_template_via_vm(
     let staging_path = staging_image_path(cache_root, cache_key, std::process::id());
     create_and_size_staging_image(&staging_path, capacity_bytes)?;
 
-    // Build the template VM. The `template_staging_image` setter
-    // makes init_virtio_blk open `staging_path` directly, bypassing
-    // BOTH the Raw tempfile and the Btrfs ensure_template branches —
-    // this is what breaks the recursion that would otherwise occur
-    // (a Btrfs disk inside a build-time VM would re-call
-    // ensure_template on the same key while we already hold the
-    // per-key flock above).
-    //
-    // The mkfs binary rides through `include_files` packed at
-    // `bin/<name>` so the guest's KTSTR_MODE=disk_template
-    // dispatch can spawn `/bin/<name>` against `/dev/vda`. The
-    // disk attached here uses Filesystem::Raw — the guest sees an
-    // unformatted device exactly as expected for the staging
-    // image (the whole point of this VM is to format it).
+    // Build the template VM. `build_template_vm` uses
+    // `template_staging_image` (rather than a normal Btrfs disk) to
+    // break the recursion that would otherwise occur: a Btrfs disk
+    // inside a build-time VM would re-call ensure_template on the same
+    // key whose flock the calling ensure_template already holds.
     //
     // `mkfs_name` came from the same [`locate_host_mkfs`] tuple
     // that produced the canonicalized binary path above; the
-    // host-PATH lookup name and the in-archive path are guaranteed
-    // to stay in lockstep without a parallel match arm to drift.
+    // host-PATH lookup name and the in-archive path stay in
+    // lockstep without a parallel match arm to drift.
+    let vm = build_template_vm(fs, capacity_bytes, kernel, &staging_path, mkfs, mkfs_name)?;
+    let result = vm.run().with_context(|| {
+        format!("run template-build VM for {fs:?} capacity_bytes={capacity_bytes}")
+    });
+    let result = match result {
+        Ok(r) => r,
+        Err(e) => {
+            // Best-effort cleanup of the staging image. The
+            // template-build error itself is the dominant signal
+            // and any remove_file error here is a tertiary
+            // problem the caller cannot meaningfully act on.
+            let _ = std::fs::remove_file(&staging_path);
+            return Err(e);
+        }
+    };
+    if result.timed_out || result.exit_code != 0 || !result.success {
+        let _ = std::fs::remove_file(&staging_path);
+        bail!(
+            "template-build VM did not complete cleanly \
+             (timed_out={}, exit_code={}, success={}). \
+             Tail of guest output: {}",
+            result.timed_out,
+            result.exit_code,
+            result.success,
+            tail_lines(&result.output, 20),
+        );
+    }
+    verify_template_superblock(fs, &staging_path, &result)?;
+    Ok(staging_path)
+}
+
+/// Construct and boot the template-build VM that formats the staging
+/// image, returning the booted [`crate::vmm::KtstrVm`] ready to run.
+///
+/// The disk attaches `staging_path` directly via
+/// `template_staging_image`, which makes `init_virtio_blk` open it as
+/// `Filesystem::Raw` (an unformatted device for the guest to format)
+/// and bypasses the per-test and `ensure_template` branches. The host
+/// `mkfs` binary rides through `include_files` packed at `bin/<name>`.
+/// On a `.build()` failure (host-resource errors after the staging
+/// image is already on disk) the staging file is unlinked best-effort
+/// before propagating, mirroring the later `.run()` cleanup.
+fn build_template_vm(
+    fs: Filesystem,
+    capacity_bytes: u64,
+    kernel: PathBuf,
+    staging_path: &Path,
+    mkfs: PathBuf,
+    mkfs_name: &'static str,
+) -> Result<crate::vmm::KtstrVm> {
     let mkfs_archive_path = format!("bin/{mkfs_name}");
     // `capacity_mib` is u32; an `as u32` cast on `capacity_bytes /
     // (1024 * 1024)` would silently truncate any input above 4 TiB
@@ -1466,7 +1507,7 @@ fn build_template_via_vm(
         .timeout(std::time::Duration::from_secs(120))
         .cmdline("KTSTR_MODE=disk_template")
         .disk(disk)
-        .template_staging_image(staging_path.clone())
+        .template_staging_image(staging_path.to_path_buf())
         .include_files(vec![(mkfs_archive_path, mkfs)])
         .busybox(Some(busybox_bytes))
         .build();
@@ -1479,49 +1520,35 @@ fn build_template_via_vm(
     let vm = match build_result {
         Ok(vm) => vm,
         Err(e) => {
-            let _ = std::fs::remove_file(&staging_path);
+            let _ = std::fs::remove_file(staging_path);
             return Err(e).with_context(|| {
                 format!("build template-VM for {fs:?} capacity_bytes={capacity_bytes}")
             });
         }
     };
-    let result = vm.run().with_context(|| {
-        format!("run template-build VM for {fs:?} capacity_bytes={capacity_bytes}")
-    });
-    let result = match result {
-        Ok(r) => r,
-        Err(e) => {
-            // Best-effort cleanup of the staging image. The
-            // template-build error itself is the dominant signal
-            // and any remove_file error here is a tertiary
-            // problem the caller cannot meaningfully act on.
-            let _ = std::fs::remove_file(&staging_path);
-            return Err(e);
-        }
-    };
-    if result.timed_out || result.exit_code != 0 || !result.success {
-        let _ = std::fs::remove_file(&staging_path);
-        bail!(
-            "template-build VM did not complete cleanly \
-             (timed_out={}, exit_code={}, success={}). \
-             Tail of guest output: {}",
-            result.timed_out,
-            result.exit_code,
-            result.success,
-            tail_lines(&result.output, 20),
-        );
-    }
-    // Publish gate: a clean VM exit does NOT prove the in-guest mkfs
-    // wrote a valid superblock — a silent mkfs failure, or a build path
-    // that never reached mkfs, leaves the staging image unformatted.
-    // Caching an unformatted image strands every future per-test clone
-    // with a -EINVAL mount (the guest kernel's superblock validator
-    // rejects the missing magic). Validate the on-disk magic before the
-    // staging image can be published so a bad build never reaches the
-    // cache — and never re-publishes the stale-empty-template failure
-    // mode that motivated this gate.
+    Ok(vm)
+}
+
+/// Validate the freshly-built staging image carries the expected
+/// on-disk superblock magic before it can be published to the cache.
+///
+/// A clean VM exit does NOT prove the in-guest mkfs wrote a valid
+/// superblock — a silent mkfs failure, or a build path that never
+/// reached mkfs, leaves the staging image unformatted. Caching an
+/// unformatted image strands every future per-test clone with a
+/// `-EINVAL` mount (the guest kernel's superblock validator rejects
+/// the missing magic). Both the read-error and magic-mismatch arms
+/// unlink the staging image best-effort before propagating, so a
+/// bad build never reaches the cache and a retry finds a clean cache
+/// root. Filesystem variants whose `superblock_magic()` returns
+/// `None` skip the check (no magic to validate).
+fn verify_template_superblock(
+    fs: Filesystem,
+    staging_path: &Path,
+    result: &crate::vmm::VmResult,
+) -> Result<()> {
     if let Some((offset, magic)) = fs.superblock_magic() {
-        let found = match read_superblock_magic(&staging_path, offset) {
+        let found = match read_superblock_magic(staging_path, offset) {
             Ok(found) => found,
             Err(e) => {
                 // A read error here (e.g. a short staging image from a
@@ -1530,14 +1557,14 @@ fn build_template_via_vm(
                 // cache miss, but Layer B must propagate the unusual
                 // case — so remove the staging image before propagating
                 // so a retry finds a clean cache root.
-                let _ = std::fs::remove_file(&staging_path);
+                let _ = std::fs::remove_file(staging_path);
                 return Err(e).with_context(|| {
                     format!("read superblock magic from freshly-built template {staging_path:?}")
                 });
             }
         };
         if found != magic {
-            let _ = std::fs::remove_file(&staging_path);
+            let _ = std::fs::remove_file(staging_path);
             bail!(
                 "template-build VM exited cleanly but the staging image at \
                  {staging_path:?} lacks the {} superblock magic at offset {offset:#x} \
@@ -1549,7 +1576,7 @@ fn build_template_via_vm(
             );
         }
     }
-    Ok(staging_path)
+    Ok(())
 }
 
 mod cleanup;
