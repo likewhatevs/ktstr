@@ -1488,249 +1488,243 @@ mod tests {
         // DelayStats field reads the planted u64 value (Some(v))
         // or zero (None), depending on whether the source offset
         // falls inside the truncated buffer.
-        struct Boundary {
-            size: usize,
-            label: &'static str,
-        }
+        assert_truncation_boundary(56, "v1 partial (mid-cpu/blkio/swapin block)");
+        assert_truncation_boundary(312, "pre-v8 (no freepages)");
+        assert_truncation_boundary(
+            360,
+            "v11 partial (compact_count without compact_delay_total)",
+        );
+        assert_truncation_boundary(408, "pre-v13 (no wpcopy_delay_total)");
+        assert_truncation_boundary(424, "pre-v14 (no irq_delay_total)");
+        assert_truncation_boundary(432, "pre-v15/v16 (no delay_max / delay_min block)");
+    }
 
-        for b in [
-            Boundary {
-                size: 56,
-                label: "v1 partial (mid-cpu/blkio/swapin block)",
-            },
-            Boundary {
-                size: 312,
-                label: "pre-v8 (no freepages)",
-            },
-            Boundary {
-                size: 360,
-                label: "v11 partial (compact_count without compact_delay_total)",
-            },
-            Boundary {
-                size: 408,
-                label: "pre-v13 (no wpcopy_delay_total)",
-            },
-            Boundary {
-                size: 424,
-                label: "pre-v14 (no irq_delay_total)",
-            },
-            Boundary {
-                size: 432,
-                label: "pre-v15/v16 (no delay_max / delay_min block)",
-            },
-        ] {
-            // Populate every aligned u64 slot inside the buffer with
-            // a unique non-zero marker so we can detect (a) reads
-            // succeed where they should, and (b) reads past the
-            // boundary collapse to zero rather than leaking adjacent
-            // memory or wrapping into a different field.
-            let mut buf = vec![0u8; b.size];
-            // Plant marker = (offset / 8) * 1000 + 1. Non-zero so it
-            // distinguishes from the absent-field default; offset-
-            // derived so a regression that shuffled fields would
-            // surface as a wrong-marker read.
-            for off in (16..b.size).step_by(8) {
-                if off + 8 <= b.size {
-                    let marker = (off as u64 / 8) * 1000 + 1;
-                    buf[off..off + 8].copy_from_slice(&marker.to_ne_bytes());
-                }
+    /// Build a `size`-byte taskstats payload with every aligned u64
+    /// slot planted with an offset-derived marker, parse it, and
+    /// assert every `DelayStats` field reads the marker (or zero past
+    /// the boundary). `label` names the version boundary for failure
+    /// messages. Called once per boundary by
+    /// [`parse_taskstats_payload_version_boundary_truncation`].
+    fn assert_truncation_boundary(size: usize, label: &str) {
+        // Populate every aligned u64 slot inside the buffer with
+        // a unique non-zero marker so we can detect (a) reads
+        // succeed where they should, and (b) reads past the
+        // boundary collapse to zero rather than leaking adjacent
+        // memory or wrapping into a different field.
+        let mut buf = vec![0u8; size];
+        // Plant marker = (offset / 8) * 1000 + 1. Non-zero so it
+        // distinguishes from the absent-field default; offset-
+        // derived so a regression that shuffled fields would
+        // surface as a wrong-marker read.
+        for off in (16..size).step_by(8) {
+            if off + 8 <= size {
+                let marker = (off as u64 / 8) * 1000 + 1;
+                buf[off..off + 8].copy_from_slice(&marker.to_ne_bytes());
             }
-
-            let stats = parse_taskstats_payload(&buf)
-                .unwrap_or_else(|e| panic!("{}: parse failed: {e}", b.label));
-
-            // Helper: marker for offset `off` if the slot fits inside
-            // the buffer, zero otherwise. Mirrors the parse_taskstats_payload
-            // r64 helper's out-of-range branch.
-            let m = |off: usize| -> u64 {
-                if off + 8 <= b.size {
-                    (off as u64 / 8) * 1000 + 1
-                } else {
-                    0
-                }
-            };
-
-            // Walk every offset the parser reads, assert the
-            // returned field equals the marker (or zero past the
-            // boundary). Hiwater fields go through saturating_mul(1024)
-            // so check those separately.
-            assert_eq!(stats.cpu_count, m(16), "{}: cpu_count", b.label);
-            assert_eq!(
-                stats.cpu_delay_total_ns,
-                m(24),
-                "{}: cpu_delay_total_ns",
-                b.label
-            );
-            assert_eq!(stats.blkio_count, m(32), "{}: blkio_count", b.label);
-            assert_eq!(
-                stats.blkio_delay_total_ns,
-                m(40),
-                "{}: blkio_delay_total_ns",
-                b.label
-            );
-            assert_eq!(stats.swapin_count, m(48), "{}: swapin_count", b.label);
-            assert_eq!(
-                stats.swapin_delay_total_ns,
-                m(56),
-                "{}: swapin_delay_total_ns",
-                b.label
-            );
-            assert_eq!(
-                stats.freepages_count,
-                m(312),
-                "{}: freepages_count",
-                b.label
-            );
-            assert_eq!(
-                stats.freepages_delay_total_ns,
-                m(320),
-                "{}: freepages_delay_total_ns",
-                b.label
-            );
-            assert_eq!(
-                stats.thrashing_count,
-                m(328),
-                "{}: thrashing_count",
-                b.label
-            );
-            assert_eq!(
-                stats.thrashing_delay_total_ns,
-                m(336),
-                "{}: thrashing_delay_total_ns",
-                b.label
-            );
-            assert_eq!(stats.compact_count, m(352), "{}: compact_count", b.label);
-            assert_eq!(
-                stats.compact_delay_total_ns,
-                m(360),
-                "{}: compact_delay_total_ns",
-                b.label
-            );
-            assert_eq!(stats.wpcopy_count, m(400), "{}: wpcopy_count", b.label);
-            assert_eq!(
-                stats.wpcopy_delay_total_ns,
-                m(408),
-                "{}: wpcopy_delay_total_ns",
-                b.label
-            );
-            assert_eq!(stats.irq_count, m(416), "{}: irq_count", b.label);
-            assert_eq!(
-                stats.irq_delay_total_ns,
-                m(424),
-                "{}: irq_delay_total_ns",
-                b.label
-            );
-            assert_eq!(
-                stats.cpu_delay_max_ns,
-                m(432),
-                "{}: cpu_delay_max_ns",
-                b.label
-            );
-            assert_eq!(
-                stats.cpu_delay_min_ns,
-                m(440),
-                "{}: cpu_delay_min_ns",
-                b.label
-            );
-            assert_eq!(
-                stats.blkio_delay_max_ns,
-                m(448),
-                "{}: blkio_delay_max_ns",
-                b.label
-            );
-            assert_eq!(
-                stats.blkio_delay_min_ns,
-                m(456),
-                "{}: blkio_delay_min_ns",
-                b.label
-            );
-            assert_eq!(
-                stats.swapin_delay_max_ns,
-                m(464),
-                "{}: swapin_delay_max_ns",
-                b.label
-            );
-            assert_eq!(
-                stats.swapin_delay_min_ns,
-                m(472),
-                "{}: swapin_delay_min_ns",
-                b.label
-            );
-            assert_eq!(
-                stats.freepages_delay_max_ns,
-                m(480),
-                "{}: freepages_delay_max_ns",
-                b.label
-            );
-            assert_eq!(
-                stats.freepages_delay_min_ns,
-                m(488),
-                "{}: freepages_delay_min_ns",
-                b.label
-            );
-            assert_eq!(
-                stats.thrashing_delay_max_ns,
-                m(496),
-                "{}: thrashing_delay_max_ns",
-                b.label
-            );
-            assert_eq!(
-                stats.thrashing_delay_min_ns,
-                m(504),
-                "{}: thrashing_delay_min_ns",
-                b.label
-            );
-            assert_eq!(
-                stats.compact_delay_max_ns,
-                m(512),
-                "{}: compact_delay_max_ns",
-                b.label
-            );
-            assert_eq!(
-                stats.compact_delay_min_ns,
-                m(520),
-                "{}: compact_delay_min_ns",
-                b.label
-            );
-            assert_eq!(
-                stats.wpcopy_delay_max_ns,
-                m(528),
-                "{}: wpcopy_delay_max_ns",
-                b.label
-            );
-            assert_eq!(
-                stats.wpcopy_delay_min_ns,
-                m(536),
-                "{}: wpcopy_delay_min_ns",
-                b.label
-            );
-            assert_eq!(
-                stats.irq_delay_max_ns,
-                m(544),
-                "{}: irq_delay_max_ns",
-                b.label
-            );
-            assert_eq!(
-                stats.irq_delay_min_ns,
-                m(552),
-                "{}: irq_delay_min_ns",
-                b.label
-            );
-            // Hiwater multiplies by 1024 — m(off) * 1024 (still 0
-            // when out of range since saturating_mul preserves 0).
-            assert_eq!(
-                stats.hiwater_rss_bytes,
-                m(200).saturating_mul(1024),
-                "{}: hiwater_rss_bytes",
-                b.label
-            );
-            assert_eq!(
-                stats.hiwater_vm_bytes,
-                m(208).saturating_mul(1024),
-                "{}: hiwater_vm_bytes",
-                b.label
-            );
         }
+
+        let stats = parse_taskstats_payload(&buf)
+            .unwrap_or_else(|e| panic!("{}: parse failed: {e}", label));
+
+        assert_truncation_fields(&stats, size, label);
+    }
+
+    /// Assert every `DelayStats` field parsed from a `size`-byte
+    /// truncated payload equals its offset-derived marker (or zero
+    /// past the boundary). Split from [`assert_truncation_boundary`]
+    /// so neither function exceeds the source-function size guard.
+    fn assert_truncation_fields(stats: &DelayStats, size: usize, label: &str) {
+        // Helper: marker for offset `off` if the slot fits inside
+        // the buffer, zero otherwise. Mirrors the parse_taskstats_payload
+        // r64 helper's out-of-range branch.
+        let m = |off: usize| -> u64 {
+            if off + 8 <= size {
+                (off as u64 / 8) * 1000 + 1
+            } else {
+                0
+            }
+        };
+
+        // Walk every offset the parser reads, assert the
+        // returned field equals the marker (or zero past the
+        // boundary). Hiwater fields go through saturating_mul(1024)
+        // so check those separately.
+        assert_eq!(stats.cpu_count, m(16), "{}: cpu_count", label);
+        assert_eq!(
+            stats.cpu_delay_total_ns,
+            m(24),
+            "{}: cpu_delay_total_ns",
+            label
+        );
+        assert_eq!(stats.blkio_count, m(32), "{}: blkio_count", label);
+        assert_eq!(
+            stats.blkio_delay_total_ns,
+            m(40),
+            "{}: blkio_delay_total_ns",
+            label
+        );
+        assert_eq!(stats.swapin_count, m(48), "{}: swapin_count", label);
+        assert_eq!(
+            stats.swapin_delay_total_ns,
+            m(56),
+            "{}: swapin_delay_total_ns",
+            label
+        );
+        assert_eq!(
+            stats.freepages_count,
+            m(312),
+            "{}: freepages_count",
+            label
+        );
+        assert_eq!(
+            stats.freepages_delay_total_ns,
+            m(320),
+            "{}: freepages_delay_total_ns",
+            label
+        );
+        assert_eq!(
+            stats.thrashing_count,
+            m(328),
+            "{}: thrashing_count",
+            label
+        );
+        assert_eq!(
+            stats.thrashing_delay_total_ns,
+            m(336),
+            "{}: thrashing_delay_total_ns",
+            label
+        );
+        assert_eq!(stats.compact_count, m(352), "{}: compact_count", label);
+        assert_eq!(
+            stats.compact_delay_total_ns,
+            m(360),
+            "{}: compact_delay_total_ns",
+            label
+        );
+        assert_eq!(stats.wpcopy_count, m(400), "{}: wpcopy_count", label);
+        assert_eq!(
+            stats.wpcopy_delay_total_ns,
+            m(408),
+            "{}: wpcopy_delay_total_ns",
+            label
+        );
+        assert_eq!(stats.irq_count, m(416), "{}: irq_count", label);
+        assert_eq!(
+            stats.irq_delay_total_ns,
+            m(424),
+            "{}: irq_delay_total_ns",
+            label
+        );
+        assert_eq!(
+            stats.cpu_delay_max_ns,
+            m(432),
+            "{}: cpu_delay_max_ns",
+            label
+        );
+        assert_eq!(
+            stats.cpu_delay_min_ns,
+            m(440),
+            "{}: cpu_delay_min_ns",
+            label
+        );
+        assert_eq!(
+            stats.blkio_delay_max_ns,
+            m(448),
+            "{}: blkio_delay_max_ns",
+            label
+        );
+        assert_eq!(
+            stats.blkio_delay_min_ns,
+            m(456),
+            "{}: blkio_delay_min_ns",
+            label
+        );
+        assert_eq!(
+            stats.swapin_delay_max_ns,
+            m(464),
+            "{}: swapin_delay_max_ns",
+            label
+        );
+        assert_eq!(
+            stats.swapin_delay_min_ns,
+            m(472),
+            "{}: swapin_delay_min_ns",
+            label
+        );
+        assert_eq!(
+            stats.freepages_delay_max_ns,
+            m(480),
+            "{}: freepages_delay_max_ns",
+            label
+        );
+        assert_eq!(
+            stats.freepages_delay_min_ns,
+            m(488),
+            "{}: freepages_delay_min_ns",
+            label
+        );
+        assert_eq!(
+            stats.thrashing_delay_max_ns,
+            m(496),
+            "{}: thrashing_delay_max_ns",
+            label
+        );
+        assert_eq!(
+            stats.thrashing_delay_min_ns,
+            m(504),
+            "{}: thrashing_delay_min_ns",
+            label
+        );
+        assert_eq!(
+            stats.compact_delay_max_ns,
+            m(512),
+            "{}: compact_delay_max_ns",
+            label
+        );
+        assert_eq!(
+            stats.compact_delay_min_ns,
+            m(520),
+            "{}: compact_delay_min_ns",
+            label
+        );
+        assert_eq!(
+            stats.wpcopy_delay_max_ns,
+            m(528),
+            "{}: wpcopy_delay_max_ns",
+            label
+        );
+        assert_eq!(
+            stats.wpcopy_delay_min_ns,
+            m(536),
+            "{}: wpcopy_delay_min_ns",
+            label
+        );
+        assert_eq!(
+            stats.irq_delay_max_ns,
+            m(544),
+            "{}: irq_delay_max_ns",
+            label
+        );
+        assert_eq!(
+            stats.irq_delay_min_ns,
+            m(552),
+            "{}: irq_delay_min_ns",
+            label
+        );
+        // Hiwater multiplies by 1024 — m(off) * 1024 (still 0
+        // when out of range since saturating_mul preserves 0).
+        assert_eq!(
+            stats.hiwater_rss_bytes,
+            m(200).saturating_mul(1024),
+            "{}: hiwater_rss_bytes",
+            label
+        );
+        assert_eq!(
+            stats.hiwater_vm_bytes,
+            m(208).saturating_mul(1024),
+            "{}: hiwater_vm_bytes",
+            label
+        );
     }
 
     /// `TaskstatsSummary::record_result` bumps `ok_count` on a

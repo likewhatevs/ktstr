@@ -180,11 +180,6 @@ const EXCEPTIONS: &[(&str, &str, usize)] = &[
         "<SnapshotError as std :: fmt :: Display>::fmt",
         266,
     ), // queued: decompose
-    (
-        "taskstats.rs",
-        "parse_taskstats_payload_version_boundary_truncation",
-        249,
-    ), // queued: decompose
     ("test_support/entry.rs", "KtstrTestEntry::validate", 338),   // queued: decompose
     ("test_support/eval/mod.rs", "evaluate_vm_result", 765),      // queued: decompose
     (
