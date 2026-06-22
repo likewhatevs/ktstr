@@ -342,6 +342,152 @@ impl std::fmt::Display for DegradedFailureDumpReport {
     }
 }
 
+impl FailureDumpReport {
+    /// Renders the scx walker section: per-CPU rq->scx / DSQ / scx_sched
+    /// counts, then the walker-unavailable reason when the walk failed.
+    fn fmt_scx_walker(
+        &self,
+        f: &mut std::fmt::Formatter<'_>,
+        first: &mut bool,
+    ) -> std::fmt::Result {
+        if !self.rq_scx_states.is_empty()
+            || !self.dsq_states.is_empty()
+            || self.scx_sched_state.is_some()
+        {
+            if !*first {
+                f.write_str("\n\n")?;
+            }
+            *first = false;
+            // scx walker section: counts of each sub-walk's output.
+            // JSON carries the full per-CPU rq->scx state, per-DSQ
+            // task lists, and scx_sched scalars; the Display surface
+            // tells the operator what the walker reached.
+            write!(
+                f,
+                "scx_walker: rq_scx={} dsq={} sched={}",
+                self.rq_scx_states.len(),
+                self.dsq_states.len(),
+                if self.scx_sched_state.is_some() {
+                    "captured"
+                } else {
+                    "absent"
+                },
+            )?;
+        }
+        if let Some(reason) = &self.scx_walker_unavailable {
+            if !*first {
+                f.write_str("\n\n")?;
+            }
+            *first = false;
+            write!(f, "scx_walker: <unavailable: {reason}>")?;
+        }
+        Ok(())
+    }
+
+    /// Renders the event-counter timeline: sample-count header plus a
+    /// per-counter sparkline row for each non-zero SCX_EV_* counter.
+    fn fmt_event_counter_timeline(
+        &self,
+        f: &mut std::fmt::Formatter<'_>,
+        first: &mut bool,
+    ) -> std::fmt::Result {
+        if !self.event_counter_timeline.is_empty() {
+            if !*first {
+                f.write_str("\n\n")?;
+            }
+            *first = false;
+            // Clear `first` like the sibling sections so a dump whose
+            // only populated sections are this one and
+            // vcpu_perf_at_freeze still renders the blank-line
+            // separator between them. The per-counter sparkline rows
+            // below append their own `\n`-prefixed lines.
+            write!(
+                f,
+                "event_counter_timeline: {} samples ({}–{}ms)",
+                self.event_counter_timeline.len(),
+                self.event_counter_timeline
+                    .first()
+                    .map(|s| s.elapsed_ms)
+                    .unwrap_or(0),
+                self.event_counter_timeline
+                    .last()
+                    .map(|s| s.elapsed_ms)
+                    .unwrap_or(0),
+            )?;
+            // Per-counter sparkline. Each row is one of the 13
+            // SCX_EV_* counters across all samples in the
+            // timeline. Skips counters that stayed at zero across
+            // every sample to keep the rendering compact (a
+            // counter at zero everywhere has no signal worth
+            // surfacing in the human-readable view).
+            type EventCounterExtract = (&'static str, fn(&EventCounterSample) -> i64);
+            let extract: [EventCounterExtract; 13] = [
+                ("select_cpu_fallback", |s| s.select_cpu_fallback),
+                ("dispatch_local_dsq_offline", |s| {
+                    s.dispatch_local_dsq_offline
+                }),
+                ("dispatch_keep_last", |s| s.dispatch_keep_last),
+                ("enq_skip_exiting", |s| s.enq_skip_exiting),
+                ("enq_skip_migration_disabled", |s| {
+                    s.enq_skip_migration_disabled
+                }),
+                ("reenq_immed", |s| s.reenq_immed),
+                ("reenq_local_repeat", |s| s.reenq_local_repeat),
+                ("refill_slice_dfl", |s| s.refill_slice_dfl),
+                ("bypass_duration", |s| s.bypass_duration),
+                ("bypass_dispatch", |s| s.bypass_dispatch),
+                ("bypass_activate", |s| s.bypass_activate),
+                ("insert_not_owned", |s| s.insert_not_owned),
+                ("sub_bypass_dispatch", |s| s.sub_bypass_dispatch),
+            ];
+            for (name, ext) in extract {
+                let series: Vec<i64> = self.event_counter_timeline.iter().map(ext).collect();
+                if series.iter().all(|&v| v == 0) {
+                    continue;
+                }
+                let line = render_sparkline_i64(&series);
+                let last = series.last().copied().unwrap_or(0);
+                write!(f, "\n  {name:>30}  {line}  (last={last})")?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Renders the per-vCPU performance-counter snapshot captured at
+    /// freeze: cycles / instructions / IPC / cache + branch misses.
+    fn fmt_vcpu_perf_at_freeze(
+        &self,
+        f: &mut std::fmt::Formatter<'_>,
+        first: &mut bool,
+    ) -> std::fmt::Result {
+        if !self.vcpu_perf_at_freeze.is_empty() {
+            if !*first {
+                f.write_str("\n\n")?;
+            }
+            *first = false;
+            f.write_str("vcpu_perf_at_freeze:")?;
+            for (i, slot) in self.vcpu_perf_at_freeze.iter().enumerate() {
+                f.write_str("\n  ")?;
+                match slot {
+                    Some(s) => write!(
+                        f,
+                        "vcpu {i}: cycles={} insns={} ipc={:.3} cache_misses={} branch_misses={} (en/ru={}/{} ns)",
+                        s.cycles,
+                        s.instructions,
+                        s.ipc(),
+                        s.cache_misses,
+                        s.branch_misses,
+                        s.time_enabled_ns,
+                        s.time_running_ns,
+                    )?,
+                    None => write!(f, "vcpu {i}: <unavailable>")?,
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 impl std::fmt::Display for FailureDumpReport {
     /// Human-readable rendering of every map plus per-vCPU register
     /// snapshots, per-program runtime stats, per-CPU CPU-time /
@@ -476,118 +622,9 @@ impl std::fmt::Display for FailureDumpReport {
             first = false;
             write!(f, "task_enrichments: <unavailable: {reason}>")?;
         }
-        if !self.rq_scx_states.is_empty()
-            || !self.dsq_states.is_empty()
-            || self.scx_sched_state.is_some()
-        {
-            if !first {
-                f.write_str("\n\n")?;
-            }
-            first = false;
-            // scx walker section: counts of each sub-walk's output.
-            // JSON carries the full per-CPU rq->scx state, per-DSQ
-            // task lists, and scx_sched scalars; the Display surface
-            // tells the operator what the walker reached.
-            write!(
-                f,
-                "scx_walker: rq_scx={} dsq={} sched={}",
-                self.rq_scx_states.len(),
-                self.dsq_states.len(),
-                if self.scx_sched_state.is_some() {
-                    "captured"
-                } else {
-                    "absent"
-                },
-            )?;
-        }
-        if let Some(reason) = &self.scx_walker_unavailable {
-            if !first {
-                f.write_str("\n\n")?;
-            }
-            first = false;
-            write!(f, "scx_walker: <unavailable: {reason}>")?;
-        }
-        if !self.event_counter_timeline.is_empty() {
-            if !first {
-                f.write_str("\n\n")?;
-            }
-            // Trailing section before vcpu_perf_at_freeze; mirrors
-            // the vcpu_perf_at_freeze pattern below — `first` is no
-            // longer consulted after this block (the per-counter
-            // sparkline rows do their own `\n` writes).
-            write!(
-                f,
-                "event_counter_timeline: {} samples ({}–{}ms)",
-                self.event_counter_timeline.len(),
-                self.event_counter_timeline
-                    .first()
-                    .map(|s| s.elapsed_ms)
-                    .unwrap_or(0),
-                self.event_counter_timeline
-                    .last()
-                    .map(|s| s.elapsed_ms)
-                    .unwrap_or(0),
-            )?;
-            // Per-counter sparkline. Each row is one of the 13
-            // SCX_EV_* counters across all samples in the
-            // timeline. Skips counters that stayed at zero across
-            // every sample to keep the rendering compact (a
-            // counter at zero everywhere has no signal worth
-            // surfacing in the human-readable view).
-            type EventCounterExtract = (&'static str, fn(&EventCounterSample) -> i64);
-            let extract: [EventCounterExtract; 13] = [
-                ("select_cpu_fallback", |s| s.select_cpu_fallback),
-                ("dispatch_local_dsq_offline", |s| {
-                    s.dispatch_local_dsq_offline
-                }),
-                ("dispatch_keep_last", |s| s.dispatch_keep_last),
-                ("enq_skip_exiting", |s| s.enq_skip_exiting),
-                ("enq_skip_migration_disabled", |s| {
-                    s.enq_skip_migration_disabled
-                }),
-                ("reenq_immed", |s| s.reenq_immed),
-                ("reenq_local_repeat", |s| s.reenq_local_repeat),
-                ("refill_slice_dfl", |s| s.refill_slice_dfl),
-                ("bypass_duration", |s| s.bypass_duration),
-                ("bypass_dispatch", |s| s.bypass_dispatch),
-                ("bypass_activate", |s| s.bypass_activate),
-                ("insert_not_owned", |s| s.insert_not_owned),
-                ("sub_bypass_dispatch", |s| s.sub_bypass_dispatch),
-            ];
-            for (name, ext) in extract {
-                let series: Vec<i64> = self.event_counter_timeline.iter().map(ext).collect();
-                if series.iter().all(|&v| v == 0) {
-                    continue;
-                }
-                let line = render_sparkline_i64(&series);
-                let last = series.last().copied().unwrap_or(0);
-                write!(f, "\n  {name:>30}  {line}  (last={last})")?;
-            }
-        }
-        if !self.vcpu_perf_at_freeze.is_empty() {
-            if !first {
-                f.write_str("\n\n")?;
-            }
-            first = false;
-            f.write_str("vcpu_perf_at_freeze:")?;
-            for (i, slot) in self.vcpu_perf_at_freeze.iter().enumerate() {
-                f.write_str("\n  ")?;
-                match slot {
-                    Some(s) => write!(
-                        f,
-                        "vcpu {i}: cycles={} insns={} ipc={:.3} cache_misses={} branch_misses={} (en/ru={}/{} ns)",
-                        s.cycles,
-                        s.instructions,
-                        s.ipc(),
-                        s.cache_misses,
-                        s.branch_misses,
-                        s.time_enabled_ns,
-                        s.time_running_ns,
-                    )?,
-                    None => write!(f, "vcpu {i}: <unavailable>")?,
-                }
-            }
-        }
+        self.fmt_scx_walker(f, &mut first)?;
+        self.fmt_event_counter_timeline(f, &mut first)?;
+        self.fmt_vcpu_perf_at_freeze(f, &mut first)?;
         // Truncation footer: the per-map render loop bounds the freeze
         // window by skipping work once the soft deadline is crossed.
         // Surface both WHEN (`dump_truncated_at_us`) and HOW MANY maps
@@ -1037,5 +1074,39 @@ impl std::fmt::Display for FailureDumpPercpuHashEntry {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression: when the event-counter timeline and
+    /// vcpu_perf_at_freeze are the only populated sections, the
+    /// timeline block must clear `first` so the blank-line separator
+    /// still renders between the two. The timeline block previously
+    /// left `first` set, which merged the two sections in this dump
+    /// shape (every earlier section empty, so `first` was still true
+    /// entering the timeline).
+    #[test]
+    fn report_display_event_counter_timeline_separated_from_vcpu_perf() {
+        let report = FailureDumpReport {
+            event_counter_timeline: vec![EventCounterSample {
+                elapsed_ms: 1,
+                select_cpu_fallback: 5,
+                ..Default::default()
+            }],
+            vcpu_perf_at_freeze: vec![None],
+            ..Default::default()
+        };
+        let out = format!("{report}");
+        assert!(
+            out.starts_with("event_counter_timeline: 1 samples (1–1ms)"),
+            "timeline header missing: {out}"
+        );
+        assert!(
+            out.contains("\n\nvcpu_perf_at_freeze:\n  vcpu 0: <unavailable>"),
+            "missing blank-line separator before vcpu_perf section: {out}"
+        );
     }
 }

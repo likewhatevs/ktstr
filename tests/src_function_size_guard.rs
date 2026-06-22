@@ -153,11 +153,6 @@ const EXCEPTIONS: &[(&str, &str, usize)] = &[
         "helper_map_update_then_lookup_propagates_arena_through_map_value",
         220,
     ), // queued: decompose
-    (
-        "monitor/dump/display.rs",
-        "<FailureDumpReport as std :: fmt :: Display>::fmt",
-        257,
-    ), // queued: decompose
     ("monitor/dump/mod.rs", "dump_state", 1166),                  // queued: decompose
     ("monitor/dump/render_map.rs", "render_map", 583),            // queued: decompose
     ("monitor/reader.rs", "monitor_loop", 808),                   // queued: decompose
