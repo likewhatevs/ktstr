@@ -285,13 +285,7 @@ fn alu64_add_x_destroys_typed_pointer() {
     let btf = Btf::from_bytes(&blob).unwrap();
     // ALU64 ADD X: code = BPF_CLASS_ALU64 | BPF_ADD | BPF_SRC_X.
     // BPF_ADD = 0x00, so code = 0x07 | 0x00 | 0x08 = 0x0f.
-    let add_x = mk_insn(
-        BPF_CLASS_ALU64 | BPF_OP_ADD | BPF_SRC_X,
-        1,
-        3,
-        0,
-        0,
-    );
+    let add_x = mk_insn(BPF_CLASS_ALU64 | BPF_OP_ADD | BPF_SRC_X, 1, 3, 0, 0);
     // r1 starts Pointer{T}. ADD r1, r3 -> r1 Unknown.
     // STX *(r6+slot_off) = r1 -> no record.
     let insns = vec![add_x, stx(BPF_SIZE_DW, 6, 1, slot_off as i16), exit()];

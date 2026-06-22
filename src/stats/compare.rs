@@ -588,7 +588,14 @@ pub(crate) fn compare_rows_by(
             continue;
         }
 
-        push_scalar_findings(&mut report, row_a, row_b, &key_b, &rel_thresholds, &suppressed);
+        push_scalar_findings(
+            &mut report,
+            row_a,
+            row_b,
+            &key_b,
+            &rel_thresholds,
+            &suppressed,
+        );
         push_phase_deltas(&mut report, row_a, row_b, &key_b, policy);
     }
 
@@ -1586,9 +1593,7 @@ pub fn compare_partitions(
 fn print_scalar_findings_table(report: &CompareReport, label_a: &str, label_b: &str) {
     use comfy_table::{Cell, Color};
     let mut table = crate::cli::new_table();
-    table.set_header(vec![
-        "TEST", "METRIC", label_a, label_b, "DELTA", "VERDICT",
-    ]);
+    table.set_header(vec!["TEST", "METRIC", label_a, label_b, "DELTA", "VERDICT"]);
     for f in &report.findings {
         let (verdict_text, verdict_color) = if f.is_regression {
             ("REGRESSION", Color::Red)

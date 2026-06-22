@@ -476,8 +476,8 @@ fn emit_matched_rows(diff: &mut CtprofDiff, ctx: &CompareCtx) {
         // runs grex over the result; every other grouping just
         // echoes the join key. Computed once per matched group,
         // reused across every metric row built off it.
-        let pattern_axis_active = matches!(ctx.group_by, GroupBy::Comm | GroupBy::Pcomm)
-            && !ctx.opts.no_thread_normalize;
+        let pattern_axis_active =
+            matches!(ctx.group_by, GroupBy::Comm | GroupBy::Pcomm) && !ctx.opts.no_thread_normalize;
         let display_key = if pattern_axis_active {
             let mut union: Vec<String> = group_a.members.clone();
             union.extend(group_b.members.iter().cloned());
@@ -568,10 +568,7 @@ type FudgeMatch = (
 /// type sets (reused downstream for the residual report). Excludes
 /// any prefix that already has a key matched on both sides
 /// (`matched_prefixes`).
-fn fudge_match_prefixes(
-    diff: &CtprofDiff,
-    ctx: &CompareCtx,
-) -> FudgeMatch {
+fn fudge_match_prefixes(diff: &CtprofDiff, ctx: &CompareCtx) -> FudgeMatch {
     // Collect thread types per CGROUP PREFIX (not per compound key).
     let mut cg_types_a: BTreeMap<String, TypeSet> = BTreeMap::new();
     let mut cg_types_b: BTreeMap<String, TypeSet> = BTreeMap::new();
@@ -965,7 +962,10 @@ fn fill_uptime_pct(diff: &mut CtprofDiff, ctx: &CompareCtx, fudged_key_pairs: &[
     let mut group_lifetime: BTreeMap<String, u64> = BTreeMap::new();
     for (key, group_b) in ctx.groups_b {
         if ctx.groups_a.contains_key(key) {
-            group_lifetime.insert(key.clone(), ctx.now_b.saturating_sub(group_b.avg_start_ticks));
+            group_lifetime.insert(
+                key.clone(),
+                ctx.now_b.saturating_sub(group_b.avg_start_ticks),
+            );
         }
     }
     let mut fudge_lt_sum: BTreeMap<String, (u64, u64)> = BTreeMap::new();
@@ -1169,7 +1169,11 @@ fn remap_fudged_smaps(diff: &mut CtprofDiff, fudged_key_pairs: &[(String, String
 /// flat otherwise), the fudged-smaps re-key
 /// ([`remap_fudged_smaps`]), and the global sched_ext sysfs
 /// snapshot.
-fn attach_enrichment(diff: &mut CtprofDiff, ctx: &CompareCtx, fudged_key_pairs: &[(String, String)]) {
+fn attach_enrichment(
+    diff: &mut CtprofDiff,
+    ctx: &CompareCtx,
+    fudged_key_pairs: &[(String, String)],
+) {
     if ctx.group_by == GroupBy::Cgroup {
         diff.cgroup_stats_a =
             flatten_cgroup_stats(&ctx.baseline.cgroup_stats, ctx.flatten, ctx.cgroup_key_map);

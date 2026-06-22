@@ -2775,8 +2775,7 @@ mod tests {
         let pid = self_pid();
         // SAFETY: `gettid(2)` takes no arguments; always safe.
         let main_tid = unsafe { libc::syscall(libc::SYS_gettid) } as i32;
-        let st = read_thread_start_time(pid, main_tid)
-            .expect("self starttime must be readable");
+        let st = read_thread_start_time(pid, main_tid).expect("self starttime must be readable");
         assert!(
             st > 0,
             "starttime jiffies since boot must be nonzero for a running thread; got {st}",

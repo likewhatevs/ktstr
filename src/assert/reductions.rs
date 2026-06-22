@@ -485,7 +485,10 @@ pub(crate) fn expand_backdrop_phase_buckets(
         .into_iter()
         .map(|(epoch, slices)| {
             let mut per_cgroup = std::collections::BTreeMap::new();
-            per_cgroup.insert(name.to_string(), pool_phase_slice_stats(&slices, expected_nodes));
+            per_cgroup.insert(
+                name.to_string(),
+                pool_phase_slice_stats(&slices, expected_nodes),
+            );
             // Lossless: a real epoch == u32::from(phase_step_index: u16),
             // and 0 / u32::MAX are filtered above.
             let step_index = epoch as u16;

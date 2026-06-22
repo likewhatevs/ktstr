@@ -1966,11 +1966,7 @@ fn register_parent_dirs_walks_all_ancestors() {
     register_parent_dirs(&mut dirs, "a/b/c/f");
     assert_eq!(
         dirs,
-        BTreeSet::from([
-            "a".to_string(),
-            "a/b".to_string(),
-            "a/b/c".to_string(),
-        ]),
+        BTreeSet::from(["a".to_string(), "a/b".to_string(), "a/b/c".to_string(),]),
         "every intermediate dir registered, the file itself excluded",
     );
 

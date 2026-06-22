@@ -1257,9 +1257,10 @@ fn member_offset_rejects_negative_sdata_and_expr_forms() {
     // path distinct from negative Sdata (the name's `_and_expr_forms`
     // half); a future special-case returning Ok for an expr form would
     // regress here but not via the Sdata path alone.
-    let expr = member_offset::<R>(Some(gimli::AttributeValue::Block(
-        gimli::EndianSlice::new(&[0x91, 0x00], gimli::LittleEndian),
-    )));
+    let expr = member_offset::<R>(Some(gimli::AttributeValue::Block(gimli::EndianSlice::new(
+        &[0x91, 0x00],
+        gimli::LittleEndian,
+    ))));
     assert!(
         expr.is_err(),
         "DWARF expression (Block) form must be rejected, got: {expr:?}",

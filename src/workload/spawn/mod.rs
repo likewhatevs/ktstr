@@ -1375,7 +1375,10 @@ impl Drop for SpawnGuard {
         }
         if !self.phase_epoch.is_null() && self.phase_epoch_bytes > 0 {
             unsafe {
-                libc::munmap(self.phase_epoch as *mut libc::c_void, self.phase_epoch_bytes);
+                libc::munmap(
+                    self.phase_epoch as *mut libc::c_void,
+                    self.phase_epoch_bytes,
+                );
             }
         }
     }
@@ -5638,7 +5641,10 @@ impl Drop for WorkloadHandle {
         }
         if !self.phase_epoch.is_null() && self.phase_epoch_bytes > 0 {
             unsafe {
-                libc::munmap(self.phase_epoch as *mut libc::c_void, self.phase_epoch_bytes);
+                libc::munmap(
+                    self.phase_epoch as *mut libc::c_void,
+                    self.phase_epoch_bytes,
+                );
             }
         }
     }

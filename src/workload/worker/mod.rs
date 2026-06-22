@@ -3279,8 +3279,8 @@ pub(super) fn worker_main(
         // into the adjacent slice. The 1024 checkpoint still drives the
         // gap/migration/cpus_used gauges; firing the block on a transition
         // adds one more (more-accurate) gap/migration sample at the boundary.
-        let epoch_changed = !phase_epoch.is_null()
-            && unsafe { &*phase_epoch }.load(Ordering::Relaxed) != cur_epoch;
+        let epoch_changed =
+            !phase_epoch.is_null() && unsafe { &*phase_epoch }.load(Ordering::Relaxed) != cur_epoch;
 
         if work_units.is_multiple_of(1024) || epoch_changed {
             let now = *now_for_gate.get_or_insert_with(Instant::now);

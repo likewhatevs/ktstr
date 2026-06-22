@@ -5108,8 +5108,7 @@ mod blueprint_coverage_tests {
         // miss returns the unresolved skip BEFORE any arena read, and
         // alloc_size_types() is empty (trait default) so the cross-BTF
         // fallback loop never runs.
-        let arena_bytes: std::collections::HashMap<u64, Vec<u8>> =
-            std::collections::HashMap::new();
+        let arena_bytes: std::collections::HashMap<u64, Vec<u8>> = std::collections::HashMap::new();
         let mut cast_map = CastMap::new();
         cast_map.insert(
             (outer_id, 0),

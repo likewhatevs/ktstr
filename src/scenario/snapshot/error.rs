@@ -601,7 +601,9 @@ impl std::fmt::Display for SnapshotError {
                 active_obj,
                 excluded_maps,
                 whitelist_kvas,
-            } => fmt_active_filter_excluded(f, requested, active_obj, excluded_maps, whitelist_kvas),
+            } => {
+                fmt_active_filter_excluded(f, requested, active_obj, excluded_maps, whitelist_kvas)
+            }
             SnapshotError::WalkerDriftedWithinPhase {
                 phase,
                 pinned_kvas,

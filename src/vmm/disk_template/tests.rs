@@ -1353,8 +1353,8 @@ fn clone_to_per_test_rejects_existing_dest() {
     let dest = tmp.path().join("per-test.img");
     std::fs::write(&dest, b"LEFTOVER_DEBRIS").unwrap();
 
-    let err = clone_to_per_test(&src, &dest)
-        .expect_err("create_new must reject a pre-existing dest");
+    let err =
+        clone_to_per_test(&src, &dest).expect_err("create_new must reject a pre-existing dest");
     let msg = err.to_string();
     assert!(
         msg.contains("dest path") && msg.contains("FICLONE"),
@@ -1379,8 +1379,7 @@ fn clone_to_per_test_missing_source_bails_without_creating_dest() {
     let missing_src = tmp.path().join("does-not-exist.img");
     let dest = tmp.path().join("per-test.img");
 
-    let err = clone_to_per_test(&missing_src, &dest)
-        .expect_err("missing source must bail");
+    let err = clone_to_per_test(&missing_src, &dest).expect_err("missing source must bail");
     let msg = err.to_string();
     assert!(
         msg.contains("open template source"),

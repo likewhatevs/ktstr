@@ -83,7 +83,10 @@ fn compare_rows_subinteger_stuck_count_difference_is_unchanged() {
     assert!(
         res.findings.iter().all(|f| f.metric.name != "stuck_count"),
         "stuck_count must not be a finding for a sub-abs delta; got {:?}",
-        res.findings.iter().map(|f| f.metric.name).collect::<Vec<_>>(),
+        res.findings
+            .iter()
+            .map(|f| f.metric.name)
+            .collect::<Vec<_>>(),
     );
 }
 
@@ -1823,9 +1826,8 @@ fn render_overcommit_warning_mixed_no_overcommit_uses_else_banner() {
     let b1 = budget_row("m", Some(16), Some(16));
     let b2 = budget_row("m", Some(32), Some(32));
     let clean = budget_row("n", Some(16), Some(16));
-    let text =
-        super::render_overcommit_warning(&[b1, b2], std::slice::from_ref(&clean), &sliced)
-            .expect("two non-overcommit budgets folding into one group must warn");
+    let text = super::render_overcommit_warning(&[b1, b2], std::slice::from_ref(&clean), &sliced)
+        .expect("two non-overcommit budgets folding into one group must warn");
     assert!(
         text.contains("mixing two measurement conditions"),
         "no-overcommit mixed-budget case must use the else-branch banner, \

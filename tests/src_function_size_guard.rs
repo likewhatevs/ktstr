@@ -116,12 +116,12 @@ const DEFAULT_FN_MAX_LINES: usize = 200;
 /// share one deferred task — the mega-function decomposition campaign);
 /// the guard's panic template emits it on every suggested entry.
 const EXCEPTIONS: &[(&str, &str, usize)] = &[
-    ("ctprof/mod.rs", "capture_with", 473),                       // queued: decompose
-    ("monitor/btf_render/mod.rs", "chase_arena_pointer", 367),    // queued: decompose
-    ("monitor/btf_render/mod.rs", "render_cast_pointer", 206),    // queued: decompose
-    ("monitor/btf_render/mod.rs", "render_value_inner", 461),     // queued: decompose
-    ("monitor/btf_render/mod.rs", "write_rendered_value", 348),   // queued: decompose
-    ("monitor/btf_render/mod.rs", "write_struct", 276),           // queued: decompose
+    ("ctprof/mod.rs", "capture_with", 473), // queued: decompose
+    ("monitor/btf_render/mod.rs", "chase_arena_pointer", 367), // queued: decompose
+    ("monitor/btf_render/mod.rs", "render_cast_pointer", 206), // queued: decompose
+    ("monitor/btf_render/mod.rs", "render_value_inner", 461), // queued: decompose
+    ("monitor/btf_render/mod.rs", "write_rendered_value", 348), // queued: decompose
+    ("monitor/btf_render/mod.rs", "write_struct", 276), // queued: decompose
     (
         "monitor/cast_analysis/mod.rs",
         "Analyzer < 'a >::finalize",
@@ -139,17 +139,17 @@ const EXCEPTIONS: &[(&str, &str, usize)] = &[
     ), // queued: decompose
     ("monitor/cast_analysis/mod.rs", "Analyzer < 'a >::run", 226), // queued: decompose
     ("monitor/cast_analysis/mod.rs", "Analyzer < 'a >::step", 391), // queued: decompose
-    ("monitor/cast_analysis/tests/mod.rs", "build_btf", 223),     // queued: decompose
+    ("monitor/cast_analysis/tests/mod.rs", "build_btf", 223), // queued: decompose
     (
         "monitor/cast_analysis/tests/helper_map_crossfn.rs",
         "helper_map_update_then_lookup_propagates_arena_through_map_value",
         220,
     ), // queued: decompose
-    ("monitor/dump/mod.rs", "dump_state", 1166),                  // queued: decompose
-    ("monitor/dump/render_map.rs", "render_map", 583),            // queued: decompose
-    ("monitor/reader.rs", "monitor_loop", 808),                   // queued: decompose
-    ("probe/process.rs", "attach_phase_b_fentry", 494),           // queued: decompose
-    ("probe/process.rs", "run_probe_skeleton", 1295),             // queued: decompose
+    ("monitor/dump/mod.rs", "dump_state", 1166), // queued: decompose
+    ("monitor/dump/render_map.rs", "render_map", 583), // queued: decompose
+    ("monitor/reader.rs", "monitor_loop", 808), // queued: decompose
+    ("probe/process.rs", "attach_phase_b_fentry", 494), // queued: decompose
+    ("probe/process.rs", "run_probe_skeleton", 1295), // queued: decompose
     (
         "test_support/eval/mod.rs",
         "run_ktstr_test_inner_impl",
@@ -162,27 +162,27 @@ const EXCEPTIONS: &[(&str, &str, usize)] = &[
     ), // queued: decompose
     ("vmm/freeze_coord/dispatch.rs", "dispatch_bulk_message", 534), // queued: decompose
     ("vmm/freeze_coord/mod.rs", "KtstrVm::collect_results", 474), // queued: decompose
-    ("vmm/freeze_coord/mod.rs", "KtstrVm::run_bsp_loop", 328),    // queued: decompose
-    ("vmm/freeze_coord/mod.rs", "KtstrVm::run_vm", 9326),         // queued: decompose
+    ("vmm/freeze_coord/mod.rs", "KtstrVm::run_bsp_loop", 328), // queued: decompose
+    ("vmm/freeze_coord/mod.rs", "KtstrVm::run_vm", 9326), // queued: decompose
     (
         "vmm/freeze_coord/mod.rs",
         "KtstrVm::start_bpf_map_write",
         202,
     ), // queued: decompose
-    ("vmm/freeze_coord/mod.rs", "KtstrVm::start_monitor", 796),   // queued: decompose
+    ("vmm/freeze_coord/mod.rs", "KtstrVm::start_monitor", 796), // queued: decompose
     ("vmm/freeze_coord/snapshot.rs", "arm_user_watchpoint", 237), // queued: decompose
-    ("vmm/mod.rs", "KtstrVm::run_interactive", 813),              // queued: decompose
-    ("vmm/rust_init/dump.rs", "start_sched_exit_monitor", 222),   // queued: decompose
-    ("vmm/rust_init/init.rs", "ktstr_guest_init", 765),           // queued: decompose
-    ("vmm/virtio_blk/control.rs", "VirtioBlk::set_status", 420),  // queued: decompose
+    ("vmm/mod.rs", "KtstrVm::run_interactive", 813), // queued: decompose
+    ("vmm/rust_init/dump.rs", "start_sched_exit_monitor", 222), // queued: decompose
+    ("vmm/rust_init/init.rs", "ktstr_guest_init", 765), // queued: decompose
+    ("vmm/virtio_blk/control.rs", "VirtioBlk::set_status", 420), // queued: decompose
     (
         "vmm/virtio_blk/device.rs",
         "VirtioBlk::handle_read_vectored_impl",
         262,
     ), // queued: decompose
-    ("vmm/virtio_blk/drain.rs", "drain_bracket_impl", 1197),      // queued: decompose
-    ("vmm/virtio_blk/worker.rs", "worker_thread_main", 515),      // queued: decompose
-    ("workload/spawn/mod.rs", "WorkloadHandle::spawn", 232),      // queued: decompose
+    ("vmm/virtio_blk/drain.rs", "drain_bracket_impl", 1197), // queued: decompose
+    ("vmm/virtio_blk/worker.rs", "worker_thread_main", 515), // queued: decompose
+    ("workload/spawn/mod.rs", "WorkloadHandle::spawn", 232), // queued: decompose
     ("workload/spawn/mod.rs", "WorkloadHandle::spawn_group", 959), // queued: decompose
     (
         "workload/spawn/mod.rs",
@@ -194,10 +194,10 @@ const EXCEPTIONS: &[(&str, &str, usize)] = &[
         "WorkloadHandle::stop_and_collect",
         539,
     ), // queued: decompose
-    ("workload/spawn/mod.rs", "spawn_pcomm_container", 781),      // queued: decompose
-    ("workload/worker/mod.rs", "worker_main", 3275),              // queued: decompose
-    // Added for post-fmt + recent-work growth; path order is cosmetic
-    // (the guard collects EXCEPTIONS into a BTreeMap). queued: decompose.
+    ("workload/spawn/mod.rs", "spawn_pcomm_container", 781), // queued: decompose
+    ("workload/worker/mod.rs", "worker_main", 3275), // queued: decompose
+                                            // Added for post-fmt + recent-work growth; path order is cosmetic
+                                            // (the guard collects EXCEPTIONS into a BTreeMap). queued: decompose.
 ];
 
 fn src_root() -> PathBuf {

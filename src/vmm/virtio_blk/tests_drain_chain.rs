@@ -1126,12 +1126,14 @@ impl Backing for RecordingBacking {
         Backing::sync_data(&self.inner)
     }
     unsafe fn preadv(&self, iovs: &[libc::iovec], offset: u64) -> std::io::Result<usize> {
-        self.max_read_iovcnt.fetch_max(iovs.len(), Ordering::Relaxed);
+        self.max_read_iovcnt
+            .fetch_max(iovs.len(), Ordering::Relaxed);
         // SAFETY: forwards the caller's iovec-validity precondition unchanged.
         unsafe { Backing::preadv(&self.inner, iovs, offset) }
     }
     unsafe fn pwritev(&self, iovs: &[libc::iovec], offset: u64) -> std::io::Result<usize> {
-        self.max_write_iovcnt.fetch_max(iovs.len(), Ordering::Relaxed);
+        self.max_write_iovcnt
+            .fetch_max(iovs.len(), Ordering::Relaxed);
         // SAFETY: forwards the caller's iovec-validity precondition unchanged.
         unsafe { Backing::pwritev(&self.inner, iovs, offset) }
     }

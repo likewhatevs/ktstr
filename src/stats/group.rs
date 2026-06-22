@@ -821,9 +821,7 @@ impl<'a> Accumulator<'a> {
 /// reduction is None (every value NaN — defensive post sidecar_to_row
 /// sanitize). Rate metrics are then re-derived from the folded
 /// components (Σnum/Σdenom) as a post-pass.
-fn fold_ext_metrics(
-    ext_pairs: BTreeMap<String, Vec<(f64, usize)>>,
-) -> BTreeMap<String, f64> {
+fn fold_ext_metrics(ext_pairs: BTreeMap<String, Vec<(f64, usize)>>) -> BTreeMap<String, f64> {
     let mut ext_metrics: std::collections::BTreeMap<String, f64> = ext_pairs
         .into_iter()
         .filter_map(|(k, pairs)| {

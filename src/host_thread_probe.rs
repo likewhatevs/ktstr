@@ -1636,18 +1636,17 @@ fn try_resolve_dwp_offsets(
     pid: i32,
 ) -> Option<CounterOffsets> {
     for dwp_path in dwp_candidates {
-        let dwp_mmap = match std::fs::File::open(dwp_path)
-            .and_then(|f| unsafe { memmap2::Mmap::map(&f) })
-        {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::debug!(
-                    pid, ?dwp_path, err = %e,
-                    "ctprof probe: DWP not readable",
-                );
-                continue;
-            }
-        };
+        let dwp_mmap =
+            match std::fs::File::open(dwp_path).and_then(|f| unsafe { memmap2::Mmap::map(&f) }) {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::debug!(
+                        pid, ?dwp_path, err = %e,
+                        "ctprof probe: DWP not readable",
+                    );
+                    continue;
+                }
+            };
         tracing::debug!(
             pid,
             ?dwp_path,
@@ -1695,8 +1694,8 @@ fn try_resolve_debuginfo_offsets(
     pid: i32,
 ) -> Option<CounterOffsets> {
     for candidate in debuginfo_candidates {
-        let dbg_mmap = std::fs::File::open(candidate)
-            .and_then(|f| unsafe { memmap2::Mmap::map(&f) });
+        let dbg_mmap =
+            std::fs::File::open(candidate).and_then(|f| unsafe { memmap2::Mmap::map(&f) });
         if let Ok(ref dbg_data) = dbg_mmap {
             tracing::debug!(
                 pid,

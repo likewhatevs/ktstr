@@ -275,8 +275,7 @@ fn run_stats_compare(args: CompareArgs<'_>) -> Result<(), String> {
         });
     let project_commit =
         resolve_commit_specs(project_repo.as_ref(), project_commit, "project-commit");
-    let kernel_commit =
-        resolve_commit_specs(kernel_repo.as_ref(), kernel_commit, "kernel-commit");
+    let kernel_commit = resolve_commit_specs(kernel_repo.as_ref(), kernel_commit, "kernel-commit");
     let a_project_commit =
         resolve_commit_specs(project_repo.as_ref(), a_project_commit, "a-project-commit");
     let a_kernel_commit =

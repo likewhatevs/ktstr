@@ -1598,16 +1598,9 @@ fn precompute_early_series(
             &crate::timeline::TimelineContext::default(),
         ))
     } else {
-        result
-            .monitor
-            .as_ref()
-            .map(|m| {
-                crate::timeline::Timeline::build(
-                    stimulus_events,
-                    &m.samples,
-                    m.preemption_threshold_ns,
-                )
-            })
+        result.monitor.as_ref().map(|m| {
+            crate::timeline::Timeline::build(stimulus_events, &m.samples, m.preemption_threshold_ns)
+        })
     };
     (early_periodic_series, early_phase_buckets, early_timeline)
 }
@@ -1623,7 +1616,13 @@ fn precompute_failure_sections(
     result: &vmm::VmResult,
     sched_log_input: &str,
     topo: &Topology,
-) -> (String, String, String, String, crate::timeline::TimelineContext) {
+) -> (
+    String,
+    String,
+    String,
+    String,
+    crate::timeline::TimelineContext,
+) {
     let sched_label = reporting::scheduler_label(&entry.scheduler.binary);
     let raw_dump = extract_sched_ext_dump(&result.stderr).unwrap_or_default();
     let dump_section = if raw_dump.is_empty() {
@@ -1647,7 +1646,13 @@ fn precompute_failure_sections(
         scenario: Some(entry.name.to_string()),
         duration_s: Some(result.duration.as_secs_f64()),
     };
-    (sched_label, raw_dump, dump_section, fingerprint_line, tl_ctx)
+    (
+        sched_label,
+        raw_dump,
+        dump_section,
+        fingerprint_line,
+        tl_ctx,
+    )
 }
 
 /// Fold the verdict inputs (host-extract failures, the `post_vm` callback's
@@ -1912,10 +1917,7 @@ fn render_failure_verdict_message(
     let repro_section = repro
         .map(|r| format!("\n\n--- auto-repro ---\n{r}"))
         .unwrap_or_default();
-    let timeline_section = format_timeline_section(
-        folded_timeline.or(early_timeline),
-        tl_ctx,
-    );
+    let timeline_section = format_timeline_section(folded_timeline.or(early_timeline), tl_ctx);
     // Per-cgroup telemetry is now built unconditionally per
     // declared cgroup (collect_handles no longer gates it behind
     // has_worker_checks), so an empty `cgroups` here means NO
@@ -1925,11 +1927,7 @@ fn render_failure_verdict_message(
         let s = &check_result.stats;
         let mut lines = vec![format!(
             "\n\n--- stats ---\n{} workers, {} cpus, {} migrations, worst_spread={:.1}%, worst_gap={}ms",
-            s.total_workers,
-            s.total_cpus,
-            s.total_migrations,
-            s.worst_spread,
-            s.worst_gap_ms,
+            s.total_workers, s.total_cpus, s.total_migrations, s.worst_spread, s.worst_gap_ms,
         )];
         for (i, cg) in s.cgroups.iter().enumerate() {
             lines.push(format!(
@@ -1982,8 +1980,7 @@ fn render_failure_verdict_message(
     // fired/target ratio; suppressed when the entry did
     // not request periodic capture so non-periodic tests
     // produce uncluttered failure output.
-    let periodic_section =
-        crate::test_support::output::format_periodic_samples_section(result);
+    let periodic_section = crate::test_support::output::format_periodic_samples_section(result);
     // Temporal-assertion summary: aggregates every
     // [`DetailKind::Temporal`] detail into a single block
     // so a test author chasing a violated periodic-sample
@@ -2292,10 +2289,8 @@ fn eval_monitor_thresholds(
         let verdict = thresholds.evaluate(&eval_report);
         if verdict.is_fail() {
             let details = verdict.details.join("\n  ");
-            let timeline_section = format_timeline_section(
-                folded_timeline.or(early_timeline),
-                tl_ctx,
-            );
+            let timeline_section =
+                format_timeline_section(folded_timeline.or(early_timeline), tl_ctx);
             let monitor_section = reporting::format_monitor_section(monitor, merged_assert);
             let msg = format!(
                 "{}{}ktstr_test '{}'{} [topo={}] {ERR_MONITOR_FAILED_AFTER_SCENARIO}:\n  {}{}{}{}{}",

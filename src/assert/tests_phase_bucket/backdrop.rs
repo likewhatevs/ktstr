@@ -72,7 +72,11 @@ fn phase_slice_off_cpu_pcts_empty_when_wall_zero() {
     };
     // wall_ns == 0 => the worker never ran this phase => not measured =>
     // EMPTY (distinct from a measured zero).
-    assert!(phase_slice_to_cgroup_stats(&s, None).off_cpu_pcts.is_empty());
+    assert!(
+        phase_slice_to_cgroup_stats(&s, None)
+            .off_cpu_pcts
+            .is_empty()
+    );
 }
 
 #[test]
@@ -83,7 +87,10 @@ fn phase_slice_off_cpu_pcts_measured_zero_present() {
         ..slice(1)
     };
     // wall measured, off_cpu 0 => a measured zero, NOT empty.
-    assert_eq!(phase_slice_to_cgroup_stats(&s, None).off_cpu_pcts, vec![0.0]);
+    assert_eq!(
+        phase_slice_to_cgroup_stats(&s, None).off_cpu_pcts,
+        vec![0.0]
+    );
 }
 
 #[test]
@@ -199,7 +206,10 @@ fn pool_phase_slice_stats_empty_is_zero_worker() {
 fn pool_single_slice_equals_mapper() {
     let s = slice(1);
     // A one-element pool is value-identical to the mapper output.
-    assert_eq!(pool_phase_slice_stats(&[&s], None), phase_slice_to_cgroup_stats(&s, None));
+    assert_eq!(
+        pool_phase_slice_stats(&[&s], None),
+        phase_slice_to_cgroup_stats(&s, None)
+    );
 }
 
 // -- expand_backdrop_phase_buckets (grouping + per-epoch pooling) --
@@ -207,11 +217,14 @@ fn pool_single_slice_equals_mapper() {
 #[test]
 fn expand_groups_by_epoch_skipping_sentinels() {
     let reports = vec![report_with_slices(vec![
-        slice(0),                                    // BASELINE -> skipped
-        slice(1),                                    // epoch 1, worker 1
-        PhaseSlice { iterations: 999, ..slice(1) },  // epoch 1, worker 2
-        slice(2),                                    // epoch 2
-        slice(u32::MAX),                             // inter-step gap -> skipped
+        slice(0), // BASELINE -> skipped
+        slice(1), // epoch 1, worker 1
+        PhaseSlice {
+            iterations: 999,
+            ..slice(1)
+        }, // epoch 1, worker 2
+        slice(2), // epoch 2
+        slice(u32::MAX), // inter-step gap -> skipped
     ])];
     let buckets = expand_backdrop_phase_buckets("cg_bg", &reports, None);
     // Only the two real epochs survive, in ascending order.
@@ -219,8 +232,14 @@ fn expand_groups_by_epoch_skipping_sentinels() {
     assert_eq!(idxs, vec![1, 2]);
     // label via Phase::Display; window is the merge-neutral sentinel;
     // metrics empty; sample_count 0 (per_cgroup is the only payload).
-    assert_eq!(buckets[0].label, crate::assert::Phase::from(1u16).to_string());
-    assert_eq!(buckets[1].label, crate::assert::Phase::from(2u16).to_string());
+    assert_eq!(
+        buckets[0].label,
+        crate::assert::Phase::from(1u16).to_string()
+    );
+    assert_eq!(
+        buckets[1].label,
+        crate::assert::Phase::from(2u16).to_string()
+    );
     assert_eq!((buckets[0].start_ms, buckets[0].end_ms), (u64::MAX, 0));
     assert_eq!(buckets[0].sample_count, 0);
     assert!(buckets[0].metrics.is_empty());

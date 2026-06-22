@@ -558,9 +558,13 @@ pub fn kernel_build_pipeline(
         });
     }
 
-    if let Some(skip_result) =
-        post_build_dirty_skip(acquired, source_dir, is_local_source, &image_path, cli_label)
-    {
+    if let Some(skip_result) = post_build_dirty_skip(
+        acquired,
+        source_dir,
+        is_local_source,
+        &image_path,
+        cli_label,
+    ) {
         return Ok(skip_result);
     }
 
@@ -2221,8 +2225,15 @@ mod tests {
         let zh = config_hash_for(source_dir)
             .expect("probe read")
             .expect("present .config must hash");
-        assert_eq!(zh.len(), 8, "config_hash must always be 8 hex chars ({{:08x}}): {zh}");
-        assert!(zh.starts_with('0'), "leading-zero CRC32 must keep its zero pad: {zh}");
+        assert_eq!(
+            zh.len(),
+            8,
+            "config_hash must always be 8 hex chars ({{:08x}}): {zh}"
+        );
+        assert!(
+            zh.starts_with('0'),
+            "leading-zero CRC32 must keep its zero pad: {zh}"
+        );
         assert!(
             zh.bytes().all(|b| b.is_ascii_hexdigit()),
             "config_hash must be lowercase hex: {zh}",
@@ -2337,13 +2348,13 @@ mod tests {
         run_git(&canonical, &["commit", "-q", "-m", "initial"]);
 
         // Acquire-time identity (frozen at build start in `local_source`).
-        let acquire = crate::fetch::inspect_local_source_state(&canonical)
-            .expect("acquire-time probe");
+        let acquire =
+            crate::fetch::inspect_local_source_state(&canonical).expect("acquire-time probe");
         let acquired_hash = acquire.short_hash.clone();
 
         // Clean post-build: same hash, clean worktree → store proceeds.
-        let post_clean = crate::fetch::inspect_local_source_state(&canonical)
-            .expect("post-build clean probe");
+        let post_clean =
+            crate::fetch::inspect_local_source_state(&canonical).expect("post-build clean probe");
         let (skip_clean, hash_changed_clean) =
             post_build_cache_store_skip(&post_clean, acquired_hash.as_deref());
         assert!(

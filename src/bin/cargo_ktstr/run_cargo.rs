@@ -787,8 +787,15 @@ mod tests {
         let argv: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
         assert_eq!(
             argv,
-            ["nextest", "run", "--cargo-profile", "release", "-E", "test(foo)"]
-                .map(std::ffi::OsStr::new),
+            [
+                "nextest",
+                "run",
+                "--cargo-profile",
+                "release",
+                "-E",
+                "test(foo)"
+            ]
+            .map(std::ffi::OsStr::new),
         );
     }
 

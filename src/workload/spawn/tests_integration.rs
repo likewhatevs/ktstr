@@ -265,7 +265,10 @@ fn backdrop_worker_phase_slices_partition_and_fold() {
             real.contains(&1) && real.contains(&2),
             "worker {} did not emit both real phase epochs; saw {:?}",
             r.tid,
-            r.phase_slices.iter().map(|s| s.phase_epoch).collect::<Vec<_>>(),
+            r.phase_slices
+                .iter()
+                .map(|s| s.phase_epoch)
+                .collect::<Vec<_>>(),
         );
         // Each real-phase slice measured a positive window, and off_cpu never
         // exceeds wall (the saturating off_cpu invariant, on live data).
@@ -274,7 +277,12 @@ fn backdrop_worker_phase_slices_partition_and_fold() {
             .iter()
             .filter(|s| s.phase_epoch == 1 || s.phase_epoch == 2)
         {
-            assert!(s.wall_ns > 0, "worker {} epoch {} zero wall", r.tid, s.phase_epoch);
+            assert!(
+                s.wall_ns > 0,
+                "worker {} epoch {} zero wall",
+                r.tid,
+                s.phase_epoch
+            );
             assert!(
                 s.off_cpu_ns <= s.wall_ns,
                 "worker {} epoch {}: off_cpu {} > wall {}",
@@ -295,7 +303,11 @@ fn backdrop_worker_phase_slices_partition_and_fold() {
     assert_eq!(steps, [1u16, 2].into_iter().collect::<BTreeSet<u16>>());
     for b in &buckets {
         let cg = b.per_cgroup.get("cg_bg").expect("cg_bg carrier present");
-        assert_eq!(cg.num_workers, 2, "step {} pools both workers", b.step_index);
+        assert_eq!(
+            cg.num_workers, 2,
+            "step {} pools both workers",
+            b.step_index
+        );
         assert!(
             cg.total_iterations > 0,
             "step {} backdrop carrier has zero iterations",

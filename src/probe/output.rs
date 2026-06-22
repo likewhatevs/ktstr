@@ -1310,8 +1310,12 @@ mod tests {
         // same arithmetic as format_field_line's Some(diff) arm.
         let fw = 8usize;
         let col = 3usize;
-        let field_line = format!("      {field:<fw$}  {entry:<col$}  →  {exit}\n",
-            field = "vtime", entry = "100", exit = "200");
+        let field_line = format!(
+            "      {field:<fw$}  {entry:<col$}  →  {exit}\n",
+            field = "vtime",
+            entry = "100",
+            exit = "200"
+        );
         let expected = format!("    task_struct *p\n{field_line}");
         assert!(
             out.contains(&expected),
@@ -1340,7 +1344,11 @@ mod tests {
 
         // fw = "weight".len().max(8) = 8; no arrow (equal exit).
         let fw = 8usize;
-        let field_line = format!("      {field:<fw$}  {entry}\n", field = "weight", entry = "100");
+        let field_line = format!(
+            "      {field:<fw$}  {entry}\n",
+            field = "weight",
+            entry = "100"
+        );
         let expected = format!("    task_struct *p\n{field_line}");
         assert!(
             out.contains(&expected),
@@ -1445,11 +1453,7 @@ mod tests {
                 // auto_fields with type_name=None → "void" fallback.
                 BtfParam {
                     name: "v".to_string(),
-                    auto_fields: vec![(
-                        "z".to_string(),
-                        "->z".to_string(),
-                        RenderHint::Signed,
-                    )],
+                    auto_fields: vec![("z".to_string(), "->z".to_string(), RenderHint::Signed)],
                     ..Default::default()
                 },
                 // Scalar (!is_ptr, no struct, no auto_fields) → val.<name> = Hex.
@@ -1516,7 +1520,11 @@ mod tests {
         // i=2: label "rq (ptr)" (a non-empty ptype gets the "(ptype)"
         //      suffix); value via the "ptr" arm → "ptr:3456".
         let fw = 8usize;
-        let line0 = format!("      {l:<fw$}  {d}\n", l = "prev (task_struct *)", d = "ptr:dead");
+        let line0 = format!(
+            "      {l:<fw$}  {d}\n",
+            l = "prev (task_struct *)",
+            d = "ptr:dead"
+        );
         let line1 = format!("      {l:<fw$}  {d}\n", l = "cpu", d = "3");
         let line2 = format!("      {l:<fw$}  {d}\n", l = "rq (ptr)", d = "ptr:3456");
         let block = format!("{line0}{line1}{line2}");

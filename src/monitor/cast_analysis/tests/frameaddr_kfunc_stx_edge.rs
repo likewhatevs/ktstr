@@ -142,7 +142,13 @@ fn map_update_with_r3_add_k(spill_off: i16, add_k_imm: i32) -> (Vec<BpfInsn>, Ve
     // r3 += add_k_imm (ALU64 | ADD | K). src field unused; imm
     // carries the constant. This is the FrameAddr ADD-K arm.
     let r3_add_k = mk_insn(BPF_CLASS_ALU64 | BPF_OP_ADD, 3, 0, 0, add_k_imm);
-    let call_update = mk_insn(BPF_CLASS_JMP | BPF_OP_CALL, 0, 0, 0, BPF_FUNC_MAP_UPDATE_ELEM);
+    let call_update = mk_insn(
+        BPF_CLASS_JMP | BPF_OP_CALL,
+        0,
+        0,
+        0,
+        BPF_FUNC_MAP_UPDATE_ELEM,
+    );
     let insns = vec![
         pseudo_call,
         stx_spill,

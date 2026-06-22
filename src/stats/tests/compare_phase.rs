@@ -935,7 +935,13 @@ fn compare_partitions_renders_phase_and_summary_blocks_via_pool() {
         // paired on both sides: 10 -> 30 scalar + BASELINE phase
         // regression; B's extra Step[0] -> unpaired (side B) phase.
         ("paired_scn", "scx_alpha", true, 10.0, baseline(10.0)),
-        ("paired_scn", "scx_beta", true, 30.0, baseline_plus_step(30.0)),
+        (
+            "paired_scn",
+            "scx_beta",
+            true,
+            30.0,
+            baseline_plus_step(30.0),
+        ),
         // present on both sides but B failed -> excluded_pairs.
         ("excl_scn", "scx_alpha", true, 10.0, baseline(10.0)),
         ("excl_scn", "scx_beta", false, 30.0, baseline(30.0)),

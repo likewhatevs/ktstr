@@ -1644,7 +1644,10 @@ mod tests {
         let mut fx = single_prog_fixture(0x4000, BPF_PROG_TYPE_STRUCT_OPS, &offsets);
         fx.write_name(FIX_AUX_PA + offsets.aux_name as u64, b"two_cpu");
         // prog_stats per-CPU base = stats_pa0's KVA. cpu_off shifts it.
-        fx.write_u64(FIX_PROG_PA + offsets.prog_stats as u64, fx.pa_to_kva(stats_pa0));
+        fx.write_u64(
+            FIX_PROG_PA + offsets.prog_stats as u64,
+            fx.pa_to_kva(stats_pa0),
+        );
 
         // Distinct small counters per block.
         let cnt0: u64 = 10;
@@ -1691,7 +1694,10 @@ mod tests {
         let stats_pa: u64 = 0x3000;
         let mut fx = single_prog_fixture(0x4000, BPF_PROG_TYPE_STRUCT_OPS, &offsets);
         fx.write_name(FIX_AUX_PA + offsets.aux_name as u64, b"bss_tail");
-        fx.write_u64(FIX_PROG_PA + offsets.prog_stats as u64, fx.pa_to_kva(stats_pa));
+        fx.write_u64(
+            FIX_PROG_PA + offsets.prog_stats as u64,
+            fx.pa_to_kva(stats_pa),
+        );
 
         let cnt0: u64 = 42;
         let nsecs0: u64 = 4200;
@@ -1862,7 +1868,10 @@ mod tests {
             FIX_AUX_PA + prog_offsets.aux_used_maps as u64,
             fx.pa_to_kva(FIX_USED_MAPS_PA),
         );
-        fx.write_u32(FIX_AUX_PA + prog_offsets.aux_used_map_cnt as u64, CORRUPT_CNT);
+        fx.write_u32(
+            FIX_AUX_PA + prog_offsets.aux_used_map_cnt as u64,
+            CORRUPT_CNT,
+        );
         fx.write_u64(FIX_USED_MAPS_PA, map0_kva);
         fx.write_u64(FIX_USED_MAPS_PA + 8, map1_kva);
         // Entries 2..70: arbitrary non-zero KVAs (never translated —

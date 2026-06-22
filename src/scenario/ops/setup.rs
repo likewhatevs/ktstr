@@ -426,13 +426,7 @@ fn resolve_def_works(
     let cgroup_cpuset: Option<BTreeSet<usize>> = state.lookup_cpuset(&def.name).cloned();
     if let Some(ref resolved) = cgroup_cpuset {
         for work in &effective_works {
-            validate_mempolicy_cpuset(
-                &work.mem_policy,
-                work.mpol_flags,
-                resolved,
-                ctx,
-                &def.name,
-            )?;
+            validate_mempolicy_cpuset(&work.mem_policy, work.mpol_flags, resolved, ctx, &def.name)?;
         }
     }
     // Per-WorkSpec pcomm dispatch. A WorkSpec with `pcomm =
@@ -477,11 +471,8 @@ fn resolve_def_works(
             def.swappable,
             n,
         );
-        let affinity = crate::scenario::intent_for_spawn(
-            &work.affinity,
-            cgroup_cpuset.as_ref(),
-            ctx.topo,
-        )?;
+        let affinity =
+            crate::scenario::intent_for_spawn(&work.affinity, cgroup_cpuset.as_ref(), ctx.topo)?;
         resolved_works.push(crate::workload::WorkSpec {
             work_type: effective_work_type,
             sched_policy: work.sched_policy,
@@ -692,11 +683,7 @@ fn spawn_def_workers(
 /// when `def.payload` is `None`. Rejects a duplicate payload already
 /// live in the same cgroup; on success pushes a [`PayloadEntry`]
 /// onto `state`'s target payload-handle vec.
-fn spawn_def_payload(
-    ctx: &Ctx,
-    state: &mut ScenarioState<'_, '_>,
-    def: &CgroupDef,
-) -> Result<()> {
+fn spawn_def_payload(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, def: &CgroupDef) -> Result<()> {
     // After synthetic workers are in place, spawn the optional
     // userspace payload inside the same cgroup. The payload runs
     // concurrently with the WorkSpec groups; its metrics are recorded
@@ -710,8 +697,7 @@ fn spawn_def_payload(
         // collide on teardown (one handle masks the other in
         // the sidecar). Reject upfront with the same error
         // shape as the Op::RunPayload path.
-        if let Some(existing) =
-            state.find_live_payload_with_cgroup(payload.name, def.name.as_ref())
+        if let Some(existing) = state.find_live_payload_with_cgroup(payload.name, def.name.as_ref())
         {
             anyhow::bail!(
                 "CgroupDef::workload: payload '{}' already running in cgroup '{}' (spawned by {}) — \

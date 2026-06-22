@@ -165,8 +165,7 @@ fn run_gauntlet_test_rejects_unknown_test_name() {
 fn is_topology_insufficient_recognizes_typed_error_through_context() {
     use crate::vmm::host_topology::TopologyInsufficient;
     let direct: anyhow::Error = anyhow::Error::new(TopologyInsufficient {
-        reason: "vCPU count 600 exceeds KVM_CAP_MAX_VCPUS 512; cannot boot a VM this wide"
-            .into(),
+        reason: "vCPU count 600 exceeds KVM_CAP_MAX_VCPUS 512; cannot boot a VM this wide".into(),
     });
     assert!(is_topology_insufficient(&direct), "direct must match");
     // Mirror the real production wrapping: a kvm-cap TopologyInsufficient
@@ -801,8 +800,7 @@ fn format_unknown_kernel_label_error_empty_present_renders_empty_brackets() {
     // (string equality drifted) but the present slice the caller
     // assembles is empty — still surfaces the bracket pair so the
     // diagnostic format is uniform with the non-empty case.
-    let s =
-        format_unknown_kernel_label_error("verifier/foo/kernel_x/tiny", "kernel_x", "foo", &[]);
+    let s = format_unknown_kernel_label_error("verifier/foo/kernel_x/tiny", "kernel_x", "foo", &[]);
     assert!(
         s.contains("Present labels: []"),
         "missing empty brackets: {s}"
@@ -1382,10 +1380,8 @@ fn result_to_exit_code_inconclusive_maps_to_distinct_code() {
     );
     // Inconclusive → 2 — distinct from Pass and Fail when
     // allow_inconclusive is unset.
-    let inc = AssertResult::inconclusive(AssertDetail::new(
-        DetailKind::Benchmark,
-        "zero-denominator",
-    ));
+    let inc =
+        AssertResult::inconclusive(AssertDetail::new(DetailKind::Benchmark, "zero-denominator"));
     assert_eq!(result_to_exit_code(Ok(inc), false, false), 2);
     // expect_err + Pass → 1 (the test was supposed to fail).
     assert_eq!(
@@ -1740,8 +1736,8 @@ fn resolve_host_cgroup_parent_env_invalid_bails() {
     let _env_lock = lock_env();
     {
         let _g = EnvVarGuard::set(crate::KTSTR_HOST_CGROUP_PARENT_ENV, "/tmp/foo");
-        let err = resolve_host_cgroup_parent()
-            .expect_err("override outside /sys/fs/cgroup must bail");
+        let err =
+            resolve_host_cgroup_parent().expect_err("override outside /sys/fs/cgroup must bail");
         let msg = format!("{err:#}");
         assert!(
             msg.contains("/sys/fs/cgroup") && msg.contains(DEFAULT_HOST_CGROUP_PARENT),
@@ -2456,8 +2452,7 @@ fn list_tests_budget_non_numeric_warns_and_lists_all() {
 
     // Nest stdout-capture inside stderr-capture so both the warning
     // (stderr) and the fallthrough listing (stdout) are observed.
-    let ((_, stdout), stderr) =
-        capture_stderr(|| capture_stdout(|| list_tests(false)));
+    let ((_, stdout), stderr) = capture_stderr(|| capture_stdout(|| list_tests(false)));
     let stderr = String::from_utf8(stderr).expect("stderr is utf-8");
     let stdout = String::from_utf8(stdout).expect("stdout is utf-8");
     assert!(
@@ -2475,7 +2470,9 @@ fn list_tests_budget_non_numeric_warns_and_lists_all() {
     );
     // Fell through to list_tests_all: at least one base `ktstr/` line.
     assert!(
-        stdout.lines().any(|l| l.starts_with("ktstr/") && l.ends_with(": test")),
+        stdout
+            .lines()
+            .any(|l| l.starts_with("ktstr/") && l.ends_with(": test")),
         "fallthrough must list base ktstr/ test names; got:\n{stdout}",
     );
 }
@@ -2493,8 +2490,7 @@ fn list_tests_budget_non_positive_warns_and_lists_all() {
     let _kernel_list = EnvVarGuard::remove(crate::KTSTR_KERNEL_LIST_ENV);
     let _cargo = EnvVarGuard::remove(crate::KTSTR_CARGO_TEST_MODE_ENV);
 
-    let ((_, stdout), stderr) =
-        capture_stderr(|| capture_stdout(|| list_tests(false)));
+    let ((_, stdout), stderr) = capture_stderr(|| capture_stdout(|| list_tests(false)));
     let stderr = String::from_utf8(stderr).expect("stderr is utf-8");
     let stdout = String::from_utf8(stdout).expect("stdout is utf-8");
     assert!(
@@ -2506,7 +2502,9 @@ fn list_tests_budget_non_positive_warns_and_lists_all() {
         "non-positive budget must NOT route through list_tests_budget; got: {stderr}",
     );
     assert!(
-        stdout.lines().any(|l| l.starts_with("ktstr/") && l.ends_with(": test")),
+        stdout
+            .lines()
+            .any(|l| l.starts_with("ktstr/") && l.ends_with(": test")),
         "fallthrough must list base ktstr/ test names; got:\n{stdout}",
     );
 }
@@ -2526,8 +2524,7 @@ fn list_tests_budget_valid_routes_to_budget_lister() {
     let _kernel_list = EnvVarGuard::remove(crate::KTSTR_KERNEL_LIST_ENV);
     let _cargo = EnvVarGuard::remove(crate::KTSTR_CARGO_TEST_MODE_ENV);
 
-    let ((_, _stdout), stderr) =
-        capture_stderr(|| capture_stdout(|| list_tests(false)));
+    let ((_, _stdout), stderr) = capture_stderr(|| capture_stdout(|| list_tests(false)));
     let stderr = String::from_utf8(stderr).expect("stderr is utf-8");
     assert!(
         stderr.contains("ktstr budget:"),
@@ -2616,8 +2613,7 @@ fn run_verifier_cell_unknown_scheduler_exits_one() {
     assert_eq!(code, 1, "unknown scheduler cell must exit 1");
     let stderr = String::from_utf8(captured).expect("stderr is utf-8");
     assert!(
-        stderr.contains("no declared scheduler")
-            && stderr.contains("__no_such_sched__"),
+        stderr.contains("no declared scheduler") && stderr.contains("__no_such_sched__"),
         "exit 1 must come from the scheduler-not-found branch naming the \
          missing scheduler; got: {stderr}",
     );
@@ -2710,9 +2706,8 @@ fn run_gauntlet_test_perf_mode_entry_derives_topo_then_skips() {
     // `gauntlet::gauntlet_presets()`) — a
     // real preset so the preset-lookup guard passes and topo
     // derivation runs.
-    let (code, captured) = capture_stderr(|| {
-        run_gauntlet_test(&format!("{PERF_MODE_SKIP_NAME}/tiny-1llc"))
-    });
+    let (code, captured) =
+        capture_stderr(|| run_gauntlet_test(&format!("{PERF_MODE_SKIP_NAME}/tiny-1llc")));
     assert_eq!(
         code, 0,
         "perf_mode gauntlet variant under --no-perf-mode must skip → exit 0 \

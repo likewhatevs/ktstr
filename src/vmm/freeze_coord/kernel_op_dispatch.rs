@@ -1042,7 +1042,13 @@ fn find_task_by_pid(
 
         // Tier 2: walk this leader's threads via signal->thread_head.
         if let Some(found) = find_pid_in_thread_group(
-            kernel, leader_pa, leader_kva, leader_pid, offs, target_pid, &mut visited,
+            kernel,
+            leader_pa,
+            leader_kva,
+            leader_pid,
+            offs,
+            target_pid,
+            &mut visited,
         )? {
             return Ok(found);
         }
@@ -1118,8 +1124,7 @@ fn find_pid_in_thread_group(
             // the HashSet. A corrupt thread ring breaks the inner loop
             // (skip this leader's threads) rather than aborting the
             // whole pid search — partial visibility over none.
-            let mut seen_threads: std::collections::HashSet<u64> =
-                std::collections::HashSet::new();
+            let mut seen_threads: std::collections::HashSet<u64> = std::collections::HashSet::new();
             while thread_node_kva != 0 && thread_node_kva != thread_head_kva {
                 if *visited >= MAX_TASK_WALKER_NODES {
                     return Err(format!(

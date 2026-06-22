@@ -997,7 +997,12 @@ mod tests {
         let mut buf = vec![0u8; 0x2000];
         plant_happy_task(&mut buf);
         let offsets = fixture_offsets();
-        put_u64(&mut buf, TASK_ADDR, offsets.task_struct_sched_class, sched_class_kva);
+        put_u64(
+            &mut buf,
+            TASK_ADDR,
+            offsets.task_struct_sched_class,
+            sched_class_kva,
+        );
         let kernel = build_kernel(&mut buf);
         let classes = SchedClassRegistry {
             fair: Some(FAIR_CLASS_KVA),
@@ -1267,7 +1272,12 @@ mod tests {
         // the replacement char rather than panicking.
         let mut buf_l = vec![0u8; 0x2000];
         plant_happy_task(&mut buf_l);
-        put_comm(&mut buf_l, TASK_ADDR, offsets.task_struct_comm, &[0xFF, 0x00]);
+        put_comm(
+            &mut buf_l,
+            TASK_ADDR,
+            offsets.task_struct_comm,
+            &[0xFF, 0x00],
+        );
         let kernel_l = build_kernel(&mut buf_l);
         let el = walk_task_enrichment(
             &kernel_l,

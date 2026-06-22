@@ -1529,8 +1529,11 @@ pub(crate) fn collect_handles<'a>(
                 // host's fold_guest_per_cgroup_into_host_buckets then
                 // unions these into the host-rebuilt buckets (matched
                 // epochs) or surfaces them as orphan not-measured windows.
-                one.stats.phases =
-                    crate::assert::expand_backdrop_phase_buckets(&key, &reports, numa_nodes.as_ref());
+                one.stats.phases = crate::assert::expand_backdrop_phase_buckets(
+                    &key,
+                    &reports,
+                    numa_nodes.as_ref(),
+                );
             }
         }
         // Handle iteration order IS the per_cgroup fold order: AssertResult::merge

@@ -4255,8 +4255,10 @@ fn snapshot_var_autofallback_to_active_resolves_ambiguity() {
 /// Ok arm is reached only here.
 #[test]
 fn snapshot_active_walker_obj_name_single_copy_empty_whitelist_resolves() {
-    let mut report =
-        make_report_with_maps(vec![make_global_map("bpf_bpf.bss", vec![("counter", uint_v(55))])]);
+    let mut report = make_report_with_maps(vec![make_global_map(
+        "bpf_bpf.bss",
+        vec![("counter", uint_v(55))],
+    )]);
     report.active_obj_name = Some("bpf_bpf".to_string());
     // active_map_kvas left empty (make_report_with_maps default).
     let snap = Snapshot::new(&report);
@@ -4281,8 +4283,14 @@ fn snapshot_map_count_reflects_active_filter_vs_unfiltered() {
     ]);
     report.active_obj_name = Some("alpha".to_string());
     let snap = Snapshot::new(&report);
-    assert_eq!(snap.map_count(), 3, "unfiltered view counts every captured map");
-    let active = snap.active().expect("active_obj_name names a captured prefix");
+    assert_eq!(
+        snap.map_count(),
+        3,
+        "unfiltered view counts every captured map"
+    );
+    let active = snap
+        .active()
+        .expect("active_obj_name names a captured prefix");
     assert_eq!(
         active.map_count(),
         2,

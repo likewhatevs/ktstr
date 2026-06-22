@@ -301,7 +301,10 @@ fn parse_kernel_version(release: &str) -> Option<(u16, u16, u16)> {
     // Minor may carry a trailing `-rcN` only when there is no PATCH
     // component (e.g. `6.18-rc1`); strip any non-digit suffix.
     let minor_raw = parts.next()?;
-    let minor_digits: String = minor_raw.chars().take_while(|c| c.is_ascii_digit()).collect();
+    let minor_digits: String = minor_raw
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
     if minor_digits.is_empty() {
         return None;
     }
@@ -310,7 +313,11 @@ fn parse_kernel_version(release: &str) -> Option<(u16, u16, u16)> {
     // `0-rc7-g...`). Absent, empty, or non-numeric => 0.
     let patch: u16 = parts
         .next()
-        .map(|p| p.chars().take_while(|c| c.is_ascii_digit()).collect::<String>())
+        .map(|p| {
+            p.chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect::<String>()
+        })
         .and_then(|d| d.parse().ok())
         .unwrap_or(0);
     Some((major, minor, patch))
@@ -342,7 +349,9 @@ fn parse_kernel_version(release: &str) -> Option<(u16, u16, u16)> {
 /// host-authored cache infrastructure, not guest input, so trusting its
 /// version for the fraction decision is consistent with the threat model
 /// (the guest never writes it).
-pub(crate) fn read_kernel_version_from_metadata_sidecar(kernel_path: &Path) -> Option<(u16, u16, u16)> {
+pub(crate) fn read_kernel_version_from_metadata_sidecar(
+    kernel_path: &Path,
+) -> Option<(u16, u16, u16)> {
     #[derive(serde::Deserialize)]
     struct VersionProbe {
         version: Option<String>,
@@ -507,9 +516,7 @@ pub(crate) fn initramfs_min_memory_mib(budget: &MemoryBudget) -> u32 {
     // uncompressed by 10/9. div_ceil never rounds DOWN (rounding down
     // would under-size RAM and risk a mid-boot tmpfs overrun).
     let (frac_num, frac_den) = budget.tmpfs_fraction.ratio();
-    let uncompressed_scaled = uncompressed_mib
-        .saturating_mul(frac_den)
-        .div_ceil(frac_num);
+    let uncompressed_scaled = uncompressed_mib.saturating_mul(frac_den).div_ceil(frac_num);
     let content_mib = uncompressed_scaled
         .saturating_add(init_size_mib)
         .saturating_add(compressed_mib);
@@ -754,7 +761,10 @@ mod tests {
     #[test]
     fn parse_kernel_version_shapes() {
         assert_eq!(parse_kernel_version("6.18.0-rc1"), Some((6, 18, 0)));
-        assert_eq!(parse_kernel_version("7.1.0-rc7-gc80ba8d32ec3"), Some((7, 1, 0)));
+        assert_eq!(
+            parse_kernel_version("7.1.0-rc7-gc80ba8d32ec3"),
+            Some((7, 1, 0))
+        );
         assert_eq!(parse_kernel_version("6.12.54"), Some((6, 12, 54)));
         assert_eq!(parse_kernel_version("6.6.113"), Some((6, 6, 113)));
         // Minor-only rc tag: no patch component => patch 0.

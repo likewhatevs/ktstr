@@ -2173,13 +2173,12 @@ mod bpf_btf_tests {
         let n_enqueue = push_str(&mut strings, "enqueue");
 
         // 12-byte `btf_type` header: name_off, info, size_type.
-        let push_hdr =
-            |sec: &mut Vec<u8>, name_off: u32, kind: u32, vlen: u32, size_type: u32| {
-                sec.extend_from_slice(&name_off.to_le_bytes());
-                let info = ((kind << 24) & 0x1f00_0000) | (vlen & 0xffff);
-                sec.extend_from_slice(&info.to_le_bytes());
-                sec.extend_from_slice(&size_type.to_le_bytes());
-            };
+        let push_hdr = |sec: &mut Vec<u8>, name_off: u32, kind: u32, vlen: u32, size_type: u32| {
+            sec.extend_from_slice(&name_off.to_le_bytes());
+            let info = ((kind << 24) & 0x1f00_0000) | (vlen & 0xffff);
+            sec.extend_from_slice(&info.to_le_bytes());
+            sec.extend_from_slice(&size_type.to_le_bytes());
+        };
 
         let mut sec: Vec<u8> = Vec::new();
         // id=1: int (12-byte hdr + 4-byte int data; encoding 0, bits 32).

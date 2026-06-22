@@ -491,7 +491,13 @@ fn assert_discriminant(op: Op, want: u32, name: &str) {
 #[test]
 fn op_discriminant_cgroup_ops() {
     assert_discriminant(Op::AddCgroup { name: "a".into() }, 0, "AddCgroup");
-    assert_discriminant(Op::AddCgroupDef { def: CgroupDef::named("a") }, 1, "AddCgroupDef");
+    assert_discriminant(
+        Op::AddCgroupDef {
+            def: CgroupDef::named("a"),
+        },
+        1,
+        "AddCgroupDef",
+    );
     assert_discriminant(Op::RemoveCgroup { cgroup: "a".into() }, 2, "RemoveCgroup");
     assert_discriminant(
         Op::SetCpuset {
@@ -517,7 +523,11 @@ fn op_discriminant_cgroup_ops() {
 /// full pin rationale.
 #[test]
 fn op_discriminant_workload_ops() {
-    assert_discriminant(Op::spawn(SpawnPlacement::cgroup("a"), WorkSpec::default()), 6, "Spawn");
+    assert_discriminant(
+        Op::spawn(SpawnPlacement::cgroup("a"), WorkSpec::default()),
+        6,
+        "Spawn",
+    );
     assert_discriminant(Op::StopCgroup { cgroup: "a".into() }, 7, "StopCgroup");
     assert_discriminant(
         Op::SetAffinity {
@@ -588,9 +598,25 @@ fn op_discriminant_payload_ops() {
 #[test]
 fn op_discriminant_freeze_snapshot_kernel_ops() {
     assert_discriminant(Op::FreezeCgroup { cgroup: "a".into() }, 13, "FreezeCgroup");
-    assert_discriminant(Op::UnfreezeCgroup { cgroup: "a".into() }, 14, "UnfreezeCgroup");
-    assert_discriminant(Op::CaptureSnapshot { name: "snap".into() }, 15, "Snapshot");
-    assert_discriminant(Op::WatchSnapshot { symbol: "kernel.x".into() }, 16, "WatchSnapshot");
+    assert_discriminant(
+        Op::UnfreezeCgroup { cgroup: "a".into() },
+        14,
+        "UnfreezeCgroup",
+    );
+    assert_discriminant(
+        Op::CaptureSnapshot {
+            name: "snap".into(),
+        },
+        15,
+        "Snapshot",
+    );
+    assert_discriminant(
+        Op::WatchSnapshot {
+            symbol: "kernel.x".into(),
+        },
+        16,
+        "WatchSnapshot",
+    );
     assert_discriminant(
         Op::WriteKernelHot {
             writes: vec![(KernelTarget::symbol("x"), KernelValue::u64(0))],
@@ -647,7 +673,13 @@ fn op_discriminant_scheduler_ops() {
         24,
         "ReplaceScheduler",
     );
-    assert_discriminant(Op::PinBpfMap { name: "scx_test.bss".into() }, 25, "PinBpfMap");
+    assert_discriminant(
+        Op::PinBpfMap {
+            name: "scx_test.bss".into(),
+        },
+        25,
+        "PinBpfMap",
+    );
     assert_discriminant(
         Op::CaptureCgroupProcs {
             tag: "snap".into(),

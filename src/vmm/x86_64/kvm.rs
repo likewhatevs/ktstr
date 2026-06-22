@@ -322,10 +322,7 @@ impl KtstrKvm {
 
     /// Set up the IRQ chip: split (LAPIC-only + x2APIC API + userspace
     /// IOAPIC) when `split_irqchip`, else full in-kernel PIC/IOAPIC/LAPIC + PIT.
-    fn setup_irqchip(
-        vm_fd: &VmFd,
-        split_irqchip: bool,
-    ) -> Result<Option<Arc<PiMutex<Ioapic>>>> {
+    fn setup_irqchip(vm_fd: &VmFd, split_irqchip: bool) -> Result<Option<Arc<PiMutex<Ioapic>>>> {
         if split_irqchip {
             // Split IRQ chip: only LAPIC is emulated in kernel.
             // PIC and IOAPIC are not created — userspace handles them.

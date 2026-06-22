@@ -1570,24 +1570,14 @@ mod tests {
             "{}: swapin_delay_total_ns",
             label
         );
-        assert_eq!(
-            stats.freepages_count,
-            m(312),
-            "{}: freepages_count",
-            label
-        );
+        assert_eq!(stats.freepages_count, m(312), "{}: freepages_count", label);
         assert_eq!(
             stats.freepages_delay_total_ns,
             m(320),
             "{}: freepages_delay_total_ns",
             label
         );
-        assert_eq!(
-            stats.thrashing_count,
-            m(328),
-            "{}: thrashing_count",
-            label
-        );
+        assert_eq!(stats.thrashing_count, m(328), "{}: thrashing_count", label);
         assert_eq!(
             stats.thrashing_delay_total_ns,
             m(336),

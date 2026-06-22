@@ -87,10 +87,8 @@ fn exit_code_for_result_pass_inconc_fail_skip_lattice() {
     // Pass → 0
     assert_eq!(exit_code_for_result(&AssertResult::pass()), 0);
     // Inconclusive → 2
-    let inc = AssertResult::inconclusive(AssertDetail::new(
-        DetailKind::Benchmark,
-        "zero-denominator",
-    ));
+    let inc =
+        AssertResult::inconclusive(AssertDetail::new(DetailKind::Benchmark, "zero-denominator"));
     assert_eq!(exit_code_for_result(&inc), 2);
     // Fail → 1
     let fail = AssertResult::fail(AssertDetail::new(DetailKind::Other, "real failure"));
@@ -1208,8 +1206,7 @@ fn render_failure_dump_file_single_schema() {
     let tmp = tempfile::NamedTempFile::new().expect("tempfile");
     std::fs::write(tmp.path(), json).expect("write tempfile");
 
-    let rendered =
-        render_failure_dump_file(tmp.path()).expect("single-schema must render Some");
+    let rendered = render_failure_dump_file(tmp.path()).expect("single-schema must render Some");
     assert!(
         rendered.starts_with("--- repro VM failure dump ---"),
         "header missing: {rendered}"
@@ -2242,9 +2239,7 @@ fn primary_reached_workload_distinguishes_payload_starting_from_scheduler_not_at
 /// Build a minimal `VmResult` whose `guest_messages` is `Some(...)`
 /// with the supplied entries. All other fields take fixture
 /// defaults via [`crate::vmm::result::VmResult::test_fixture`].
-fn vm_result_with_drain(
-    entries: Vec<crate::vmm::wire::ShmEntry>,
-) -> crate::vmm::result::VmResult {
+fn vm_result_with_drain(entries: Vec<crate::vmm::wire::ShmEntry>) -> crate::vmm::result::VmResult {
     crate::vmm::result::VmResult {
         guest_messages: Some(crate::vmm::host_comms::BulkDrainResult { entries }),
         ..crate::vmm::result::VmResult::test_fixture()
@@ -2275,8 +2270,7 @@ fn write_auto_repro_sidecar_artifacts_writes_wprof_pb() {
         crate::KTSTR_SIDECAR_DIR_ENV,
         tmp.path(),
     );
-    let entry =
-        crate::test_support::test_helpers::eevdf_entry("write_auto_repro_wprof_fixture");
+    let entry = crate::test_support::test_helpers::eevdf_entry("write_auto_repro_wprof_fixture");
     let payload = b"\x0a\x02hi";
     let result = vm_result_with_drain(vec![wprof_frame(payload, true)]);
     write_auto_repro_sidecar_artifacts(&entry, &result);
@@ -2302,8 +2296,7 @@ fn write_auto_repro_sidecar_artifacts_skips_crc_bad_wprof() {
         crate::KTSTR_SIDECAR_DIR_ENV,
         tmp.path(),
     );
-    let entry =
-        crate::test_support::test_helpers::eevdf_entry("write_auto_repro_crc_bad_fixture");
+    let entry = crate::test_support::test_helpers::eevdf_entry("write_auto_repro_crc_bad_fixture");
     let result = vm_result_with_drain(vec![wprof_frame(b"garbage", false)]);
     write_auto_repro_sidecar_artifacts(&entry, &result);
     let pb = tmp
@@ -2522,9 +2515,8 @@ fn emit_probe_payload_empty_events_round_trips_diagnostics_only() {
     // Default diagnostics make format_probe_diagnostics emit a
     // non-empty pipeline string, so extract_probe_output returns
     // Some(out) even though events is empty (NOT None).
-    let formatted = extract_probe_output(&output, None, None).expect(
-        "empty-events payload with default diagnostics must render the pipeline header",
-    );
+    let formatted = extract_probe_output(&output, None, None)
+        .expect("empty-events payload with default diagnostics must render the pipeline header");
     assert!(
         formatted.contains("--- probe pipeline ---"),
         "diagnostics header missing (format_probe_diagnostics's `--- probe pipeline ---` push): {formatted}",

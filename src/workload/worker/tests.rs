@@ -1439,11 +1439,20 @@ fn build_phase_slice_missing_schedstat_is_zero() {
         )
     };
     let only_start = mk(Some((10, 20, 30)), None);
-    assert_eq!((only_start.run_delay_ns, only_start.schedstat_cpu_time_ns), (0, 0));
+    assert_eq!(
+        (only_start.run_delay_ns, only_start.schedstat_cpu_time_ns),
+        (0, 0)
+    );
     let only_end = mk(None, Some((10, 20, 30)));
-    assert_eq!((only_end.run_delay_ns, only_end.schedstat_cpu_time_ns), (0, 0));
+    assert_eq!(
+        (only_end.run_delay_ns, only_end.schedstat_cpu_time_ns),
+        (0, 0)
+    );
     let neither = mk(None, None);
-    assert_eq!((neither.run_delay_ns, neither.schedstat_cpu_time_ns), (0, 0));
+    assert_eq!(
+        (neither.run_delay_ns, neither.schedstat_cpu_time_ns),
+        (0, 0)
+    );
 }
 
 /// Every counter delta saturates when end < start (a counter read across a

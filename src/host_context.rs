@@ -746,7 +746,11 @@ impl HostContext {
             b_kernel_cmdline.as_ref(),
         );
         diff_cpufreq_governor(&mut out, a_cpufreq_governor, b_cpufreq_governor);
-        diff_sched_tunables(&mut out, a_sched_tunables.as_ref(), b_sched_tunables.as_ref());
+        diff_sched_tunables(
+            &mut out,
+            a_sched_tunables.as_ref(),
+            b_sched_tunables.as_ref(),
+        );
         diff_heap_state(&mut out, a_heap_state.as_ref(), b_heap_state.as_ref());
         out
     }

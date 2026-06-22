@@ -245,8 +245,7 @@ fn resolve_arena_type_in_index_cross_btf_gate() {
 
     // Mismatch: slot's BTF kva 0xAAAA != requesting 0xBBBB.
     assert!(
-        resolve_arena_type_in_index(Some(&snap), Some(&index), 0x10_0000_1000, 0xBBBB)
-            .is_none(),
+        resolve_arena_type_in_index(Some(&snap), Some(&index), 0x10_0000_1000, 0xBBBB).is_none(),
         "cross-BTF mismatch must suppress the hit",
     );
     // Zero requesting kva with non-zero slot kva: conservative
@@ -583,9 +582,8 @@ fn chase_sdt_data_payload_renders_payload_struct() {
         seen_kva: Cell::new(None),
     };
 
-    let rendered =
-        chase_sdt_data_payload(Some(&btf), Some(0), Some(&meta), &value_bytes, &reader)
-            .expect("payload must render with all prereqs satisfied");
+    let rendered = chase_sdt_data_payload(Some(&btf), Some(0), Some(&meta), &value_bytes, &reader)
+        .expect("payload must render with all prereqs satisfied");
     match rendered {
         RenderedValue::Struct { members, .. } => {
             let first = members.first().expect("payload struct has one member");

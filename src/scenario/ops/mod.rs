@@ -1103,9 +1103,13 @@ fn run_scenario(
 
     wait_for_host_map_write(ctx);
 
-    if let Some(r) =
-        run_backdrop_setup(ctx, &backdrop, &mut backdrop_state, effective_checks, &result)?
-    {
+    if let Some(r) = run_backdrop_setup(
+        ctx,
+        &backdrop,
+        &mut backdrop_state,
+        effective_checks,
+        &result,
+    )? {
         return Ok(r);
     }
 

@@ -1737,8 +1737,8 @@ mod tests {
             SandboxDegraded::RootCgroupRefused,
         ] {
             let want = format!("--cpu-cap: {kind}.");
-            let err = BuildSandbox::degraded_or_err(kind.clone(), true)
-                .expect_err("hard error required");
+            let err =
+                BuildSandbox::degraded_or_err(kind.clone(), true).expect_err("hard error required");
             let msg = format!("{err:#}");
             assert!(
                 msg.contains(&want),
@@ -1767,8 +1767,8 @@ mod tests {
             SandboxDegraded::PermissionDenied,
             SandboxDegraded::RootCgroupRefused,
         ] {
-            let s = BuildSandbox::degraded_or_err(kind.clone(), false)
-                .expect("soft path must be Ok");
+            let s =
+                BuildSandbox::degraded_or_err(kind.clone(), false).expect("soft path must be Ok");
             // No PartialEq on SandboxDegraded — pick the expected
             // nested Degraded pattern per kind, then matches! it.
             let preserved = match kind {
@@ -1783,10 +1783,9 @@ mod tests {
                     s,
                     BuildSandbox::Degraded(SandboxDegraded::SubtreeControlRefused)
                 ),
-                SandboxDegraded::PermissionDenied => matches!(
-                    s,
-                    BuildSandbox::Degraded(SandboxDegraded::PermissionDenied)
-                ),
+                SandboxDegraded::PermissionDenied => {
+                    matches!(s, BuildSandbox::Degraded(SandboxDegraded::PermissionDenied))
+                }
                 SandboxDegraded::RootCgroupRefused => matches!(
                     s,
                     BuildSandbox::Degraded(SandboxDegraded::RootCgroupRefused)
@@ -1819,7 +1818,11 @@ mod tests {
             .tempdir()
             .unwrap();
         let dir = tmp.path();
-        std::fs::write(dir.join("cgroup.controllers"), "cpuset cpu io memory pids\n").unwrap();
+        std::fs::write(
+            dir.join("cgroup.controllers"),
+            "cpuset cpu io memory pids\n",
+        )
+        .unwrap();
         // First token.
         assert!(
             parent_controllers_include(dir, "cpuset"),
@@ -1976,7 +1979,9 @@ mod tests {
             .prefix("ktstr-sandbox-remove-orphan-")
             .tempdir()
             .unwrap();
-        let orphan = parent.path().join(format!("ktstr-build-1700000000000-{pid}"));
+        let orphan = parent
+            .path()
+            .join(format!("ktstr-build-1700000000000-{pid}"));
         std::fs::create_dir(&orphan).unwrap();
 
         // Shift the orphan's mtime 48h into the past so the

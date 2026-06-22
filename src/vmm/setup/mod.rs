@@ -20,7 +20,7 @@ use super::KtstrVm;
 use super::initramfs_cache::{BaseKey, BaseRef, get_or_build_base, get_or_compress_base_shm};
 use super::memory_budget::{
     MemoryBudget, TmpfsFraction, initramfs_min_memory_mib, read_kernel_init_size,
-    read_kernel_version_from_metadata_sidecar, read_kernel_version,
+    read_kernel_version, read_kernel_version_from_metadata_sidecar,
 };
 use super::pi_mutex::PiMutex;
 use super::{disk_config, disk_template, host_topology, initramfs, virtio_blk, virtio_net};
