@@ -750,4 +750,592 @@ mod tests {
             Some("queued_spin_lock_slowpath"),
         );
     }
+
+    // -- walk_task_enrichment memory-walk coverage --
+    //
+    // All fixtures use page_offset = 0 so a planted KVA equals its
+    // DRAM offset (kva_to_pa is `kva.wrapping_sub(0)`), and
+    // translate_any_kva returns the KVA directly when it is
+    // `< mem.size()`. cr3_pa = 0 / l5 = false means an out-of-bounds
+    // KVA falls through to the page-table walk, which fails with a
+    // zero root => None. OOB scalar reads return 0 (GuestMem's
+    // read_scalar), so every buffer is sized past the highest
+    // touched offset.
+
+    /// Synthetic struct layout shared by the walk fixtures. Offsets
+    /// are chosen so no two read ranges overlap. `scx` base is 0x30
+    /// and `see_weight` is 0x04 within it, so the weight read lands
+    /// at task+0x34.
+    fn fixture_offsets() -> TaskEnrichmentOffsets {
+        TaskEnrichmentOffsets {
+            // task_struct fields
+            task_struct_pid: 0x00,
+            task_struct_tgid: 0x04,
+            task_struct_prio: 0x08,
+            task_struct_static_prio: 0x0c,
+            task_struct_normal_prio: 0x10,
+            task_struct_rt_priority: 0x14,
+            task_struct_comm: 0x18,
+            task_struct_sched_class: 0x28,
+            task_struct_scx: 0x30,
+            task_struct_core_cookie: Some(0x38),
+            task_struct_nvcsw: 0x40,
+            task_struct_nivcsw: 0x48,
+            task_struct_utime: 0x50,
+            task_struct_stime: 0x58,
+            task_struct_group_leader: 0x60,
+            task_struct_real_parent: 0x68,
+            task_struct_signal: 0x70,
+            task_struct_stack: 0x78,
+            // sched_ext_entity field (relative to scx base)
+            see_weight: 0x04,
+            // signal_struct fields
+            signal_struct_nr_threads: 0x00,
+            signal_struct_nvcsw: 0x08,
+            signal_struct_nivcsw: 0x10,
+            signal_struct_utime: 0x18,
+            signal_struct_stime: 0x20,
+            signal_struct_pids: 0x30,
+            // struct pid / struct upid fields
+            pid_numbers: 0x00,
+            pid_size: 0x00,
+            upid_nr: 0x00,
+            upid_size: 16,
+        }
+    }
+
+    // In-buffer addresses (== KVA == PA under page_offset = 0).
+    const TASK_ADDR: u64 = 0x100;
+    const SIGNAL_ADDR: u64 = 0x400;
+    const PGID_PID_ADDR: u64 = 0x600;
+    const SID_PID_ADDR: u64 = 0x680;
+    const PARENT_TASK_ADDR: u64 = 0x800;
+    // sched_class comparison sentinels. Never dereferenced — only
+    // compared against the SchedClassRegistry slots.
+    const EXT_CLASS_KVA: u64 = 0x9000;
+    const FAIR_CLASS_KVA: u64 = 0x9100;
+
+    fn put_u32(buf: &mut [u8], at: u64, off: usize, val: u32) {
+        let a = at as usize + off;
+        buf[a..a + 4].copy_from_slice(&val.to_le_bytes());
+    }
+
+    fn put_u64(buf: &mut [u8], at: u64, off: usize, val: u64) {
+        let a = at as usize + off;
+        buf[a..a + 8].copy_from_slice(&val.to_le_bytes());
+    }
+
+    fn put_comm(buf: &mut [u8], at: u64, off: usize, bytes: &[u8]) {
+        let a = at as usize + off;
+        buf[a..a + bytes.len()].copy_from_slice(bytes);
+    }
+
+    /// Plant a complete, well-formed task_struct + signal_struct +
+    /// PGID/SID struct pids into `buf` using [`fixture_offsets`].
+    /// sched_class is planted as [`EXT_CLASS_KVA`]. The caller may
+    /// then mutate individual fields before walking to exercise a
+    /// specific branch.
+    fn plant_happy_task(buf: &mut [u8]) {
+        let o = fixture_offsets();
+        // Identity.
+        put_u32(buf, TASK_ADDR, o.task_struct_pid, 4321);
+        put_u32(buf, TASK_ADDR, o.task_struct_tgid, 4300);
+        put_comm(buf, TASK_ADDR, o.task_struct_comm, b"worker\0");
+        // Scheduling scalars.
+        put_u32(buf, TASK_ADDR, o.task_struct_prio, 100);
+        put_u32(buf, TASK_ADDR, o.task_struct_static_prio, 120);
+        put_u32(buf, TASK_ADDR, o.task_struct_normal_prio, 100);
+        put_u32(buf, TASK_ADDR, o.task_struct_rt_priority, 50);
+        put_u64(buf, TASK_ADDR, o.task_struct_sched_class, EXT_CLASS_KVA);
+        // weight at scx + see_weight.
+        put_u32(buf, TASK_ADDR, o.task_struct_scx + o.see_weight, 200);
+        // core_cookie.
+        put_u64(buf, TASK_ADDR, o.task_struct_core_cookie.unwrap(), 0xABCD);
+        // Per-task context-switch + cputime counters.
+        put_u64(buf, TASK_ADDR, o.task_struct_nvcsw, 11);
+        put_u64(buf, TASK_ADDR, o.task_struct_nivcsw, 22);
+        put_u64(buf, TASK_ADDR, o.task_struct_utime, 999_000);
+        put_u64(buf, TASK_ADDR, o.task_struct_stime, 888_000);
+        // Pointer fields: parent + group_leader point at the mini
+        // task; signal points at the signal_struct.
+        put_u64(buf, TASK_ADDR, o.task_struct_group_leader, PARENT_TASK_ADDR);
+        put_u64(buf, TASK_ADDR, o.task_struct_real_parent, PARENT_TASK_ADDR);
+        put_u64(buf, TASK_ADDR, o.task_struct_signal, SIGNAL_ADDR);
+
+        // Mini parent/group-leader task: only pid + comm are read by
+        // follow_task_for_pid (group_leader) and
+        // follow_task_for_pid_and_comm (real_parent), both at the
+        // task_struct pid/comm offsets.
+        put_u32(buf, PARENT_TASK_ADDR, o.task_struct_pid, 1);
+        put_comm(buf, PARENT_TASK_ADDR, o.task_struct_comm, b"init\0");
+
+        // signal_struct.
+        put_u32(buf, SIGNAL_ADDR, o.signal_struct_nr_threads, 8);
+        put_u64(buf, SIGNAL_ADDR, o.signal_struct_nvcsw, 70_000);
+        put_u64(buf, SIGNAL_ADDR, o.signal_struct_nivcsw, 3);
+        put_u64(buf, SIGNAL_ADDR, o.signal_struct_utime, 7_000);
+        put_u64(buf, SIGNAL_ADDR, o.signal_struct_stime, 6_000);
+        // pids[PGID] / pids[SID] slots -> struct pid KVAs.
+        put_u64(
+            buf,
+            SIGNAL_ADDR,
+            o.signal_struct_pids + pid_type::PGID * 8,
+            PGID_PID_ADDR,
+        );
+        put_u64(
+            buf,
+            SIGNAL_ADDR,
+            o.signal_struct_pids + pid_type::SID * 8,
+            SID_PID_ADDR,
+        );
+        // struct pid numbers[0].nr for PGID (4300) and SID (1).
+        put_u32(buf, PGID_PID_ADDR, o.pid_numbers + o.upid_nr, 4300);
+        put_u32(buf, SID_PID_ADDR, o.pid_numbers + o.upid_nr, 1);
+    }
+
+    /// Build a direct-mapped test kernel over `buf` (page_offset = 0,
+    /// cr3_pa = 0, l5 = false). `buf` must outlive the returned
+    /// kernel — the GuestMem holds a raw pointer into it.
+    fn build_kernel(buf: &mut [u8]) -> GuestKernel {
+        // SAFETY: `buf` is a live caller-owned slice that outlives the
+        // GuestKernel (and thus the GuestMem) in every test below.
+        let mem =
+            unsafe { crate::monitor::reader::GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
+        GuestKernel::new_for_test(
+            std::sync::Arc::new(mem),
+            std::collections::HashMap::new(),
+            0,
+            0,
+            false,
+        )
+    }
+
+    fn ext_registry() -> SchedClassRegistry {
+        SchedClassRegistry {
+            fair: Some(FAIR_CLASS_KVA),
+            ext: Some(EXT_CLASS_KVA),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn walk_task_enrichment_root_translate_fail_returns_none() {
+        // task_kva == mem.size() => direct_pa == size (NOT < size) so
+        // translate_any_kva skips the direct map, then the cr3_pa = 0
+        // page-table walk fails => the whole fn returns None.
+        let mut buf = vec![0u8; 0x2000];
+        let kernel = build_kernel(&mut buf);
+        let offsets = fixture_offsets();
+        let oob_task_kva = kernel.mem().size(); // == 0x2000
+        let result = walk_task_enrichment(
+            &kernel,
+            oob_task_kva,
+            &offsets,
+            &ext_registry(),
+            &LockSlowpathRegistry::default(),
+            false,
+            None,
+        );
+        assert!(
+            result.is_none(),
+            "unreadable task_struct must abort the whole enrichment"
+        );
+    }
+
+    #[test]
+    fn walk_task_enrichment_full_happy_path_exact_fields() {
+        let mut buf = vec![0u8; 0x2000];
+        plant_happy_task(&mut buf);
+        let kernel = build_kernel(&mut buf);
+        let offsets = fixture_offsets();
+        let e = walk_task_enrichment(
+            &kernel,
+            TASK_ADDR,
+            &offsets,
+            &ext_registry(),
+            &LockSlowpathRegistry::default(),
+            false,
+            None,
+        )
+        .expect("task built");
+
+        assert_eq!(e.pid, 4321);
+        assert_eq!(e.tgid, 4300);
+        assert_eq!(e.comm, "worker");
+        assert_eq!(e.prio, 100);
+        assert_eq!(e.static_prio, 120);
+        assert_eq!(e.normal_prio, 100);
+        assert_eq!(e.rt_priority, 50);
+        assert_eq!(e.sched_class.as_deref(), Some("ext"));
+        assert_eq!(e.weight, 200);
+        assert_eq!(e.core_cookie, Some(0xABCD));
+        assert_eq!(e.nvcsw, 11);
+        assert_eq!(e.nivcsw, 22);
+        assert_eq!(e.utime, 999_000);
+        assert_eq!(e.stime, 888_000);
+        assert_eq!(e.nr_threads, Some(8));
+        assert_eq!(e.signal_nvcsw, Some(70_000));
+        assert_eq!(e.signal_nivcsw, Some(3));
+        assert_eq!(e.signal_utime, Some(7_000));
+        assert_eq!(e.signal_stime, Some(6_000));
+        assert_eq!(e.pgid, Some(4300));
+        assert_eq!(e.sid, Some(1));
+        assert_eq!(e.group_leader_pid, Some(1));
+        assert_eq!(e.real_parent_pid, Some(1));
+        assert_eq!(e.real_parent_comm.as_deref(), Some("init"));
+        // pi_boosted_out_of_scx is false because is_runnable_in_scx
+        // is false on this call.
+        assert!(!e.pi_boosted_out_of_scx);
+        // pc = None => no lock-slowpath match attempted.
+        assert_eq!(e.lock_slowpath_match, None);
+    }
+
+    /// Helper for the pi_boosted truth table: plant a task whose
+    /// sched_class is `sched_class_kva`, build a registry with the
+    /// given `ext` slot, and return the resulting flag.
+    fn pi_boosted(sched_class_kva: u64, ext: Option<u64>, is_runnable_in_scx: bool) -> bool {
+        let mut buf = vec![0u8; 0x2000];
+        plant_happy_task(&mut buf);
+        let offsets = fixture_offsets();
+        put_u64(&mut buf, TASK_ADDR, offsets.task_struct_sched_class, sched_class_kva);
+        let kernel = build_kernel(&mut buf);
+        let classes = SchedClassRegistry {
+            fair: Some(FAIR_CLASS_KVA),
+            ext,
+            ..Default::default()
+        };
+        walk_task_enrichment(
+            &kernel,
+            TASK_ADDR,
+            &offsets,
+            &classes,
+            &LockSlowpathRegistry::default(),
+            is_runnable_in_scx,
+            None,
+        )
+        .expect("task built")
+        .pi_boosted_out_of_scx
+    }
+
+    #[test]
+    fn walk_task_enrichment_pi_boosted_out_of_scx_truth_table() {
+        // runnable + sched_class == ext => not boosted out.
+        assert!(!pi_boosted(EXT_CLASS_KVA, Some(EXT_CLASS_KVA), true));
+        // runnable + sched_class != ext + ext.is_some() => boosted out.
+        assert!(pi_boosted(FAIR_CLASS_KVA, Some(EXT_CLASS_KVA), true));
+        // runnable + ext == None => short-circuits on is_some() => false.
+        assert!(!pi_boosted(FAIR_CLASS_KVA, None, true));
+        // not runnable + sched_class != ext => false (gated on runnable).
+        assert!(!pi_boosted(FAIR_CLASS_KVA, Some(EXT_CLASS_KVA), false));
+    }
+
+    #[test]
+    fn walk_task_enrichment_core_cookie_absent_offset_yields_none() {
+        // Even though a non-zero u64 sits at the would-be core_cookie
+        // offset, task_struct_core_cookie = None skips the read.
+        let mut buf = vec![0u8; 0x2000];
+        plant_happy_task(&mut buf);
+        let kernel = build_kernel(&mut buf);
+        let mut offsets = fixture_offsets();
+        offsets.task_struct_core_cookie = None;
+        let e = walk_task_enrichment(
+            &kernel,
+            TASK_ADDR,
+            &offsets,
+            &ext_registry(),
+            &LockSlowpathRegistry::default(),
+            false,
+            None,
+        )
+        .expect("task built");
+        assert_eq!(e.core_cookie, None);
+    }
+
+    #[test]
+    fn walk_task_enrichment_signal_null_pointer_all_signal_fields_none() {
+        // signal_kva == 0 short-circuits before translate; the whole
+        // signal-derived septuple is None.
+        let mut buf = vec![0u8; 0x2000];
+        plant_happy_task(&mut buf);
+        let offsets = fixture_offsets();
+        put_u64(&mut buf, TASK_ADDR, offsets.task_struct_signal, 0);
+        let kernel = build_kernel(&mut buf);
+        let e = walk_task_enrichment(
+            &kernel,
+            TASK_ADDR,
+            &offsets,
+            &ext_registry(),
+            &LockSlowpathRegistry::default(),
+            false,
+            None,
+        )
+        .expect("task built");
+        assert_eq!(e.nr_threads, None);
+        assert_eq!(e.signal_nvcsw, None);
+        assert_eq!(e.signal_nivcsw, None);
+        assert_eq!(e.signal_utime, None);
+        assert_eq!(e.signal_stime, None);
+        assert_eq!(e.pgid, None);
+        assert_eq!(e.sid, None);
+        // The rest of the task still populated.
+        assert_eq!(e.pid, 4321);
+    }
+
+    #[test]
+    fn walk_task_enrichment_signal_translate_fail_all_signal_fields_none() {
+        // signal_kva != 0 but out of bounds => translate_any_kva None
+        // (distinct path from the signal_kva == 0 short-circuit).
+        let mut buf = vec![0u8; 0x2000];
+        plant_happy_task(&mut buf);
+        let offsets = fixture_offsets();
+        // 0xF000_0000 is far above mem.size() (0x2000); cr3_pa = 0 walk fails.
+        put_u64(&mut buf, TASK_ADDR, offsets.task_struct_signal, 0xF000_0000);
+        let kernel = build_kernel(&mut buf);
+        let e = walk_task_enrichment(
+            &kernel,
+            TASK_ADDR,
+            &offsets,
+            &ext_registry(),
+            &LockSlowpathRegistry::default(),
+            false,
+            None,
+        )
+        .expect("task built");
+        assert_eq!(
+            (
+                e.nr_threads,
+                e.signal_nvcsw,
+                e.signal_nivcsw,
+                e.signal_utime,
+                e.signal_stime,
+                e.pgid,
+                e.sid
+            ),
+            (None, None, None, None, None, None, None)
+        );
+        assert_eq!(e.tgid, 4300);
+    }
+
+    #[test]
+    fn read_pid_nr_at_index_null_slot_returns_none_via_pgid() {
+        // PGID slot zeroed => pgid None (the common non-leader case);
+        // SID slot populated => sid Some. Pins the pids_off + idx*8
+        // index math discriminating PGID (idx 2) from SID (idx 3).
+        let mut buf = vec![0u8; 0x2000];
+        plant_happy_task(&mut buf);
+        let offsets = fixture_offsets();
+        put_u64(
+            &mut buf,
+            SIGNAL_ADDR,
+            offsets.signal_struct_pids + pid_type::PGID * 8,
+            0,
+        );
+        let kernel = build_kernel(&mut buf);
+        let e = walk_task_enrichment(
+            &kernel,
+            TASK_ADDR,
+            &offsets,
+            &ext_registry(),
+            &LockSlowpathRegistry::default(),
+            false,
+            None,
+        )
+        .expect("task built");
+        assert_eq!(e.pgid, None);
+        assert_eq!(e.sid, Some(1));
+    }
+
+    #[test]
+    fn follow_task_for_pid_and_comm_null_and_translate_fail() {
+        let offsets = fixture_offsets();
+
+        // Sub-case A: both pointer fields NULL (init_task case).
+        let mut buf_a = vec![0u8; 0x2000];
+        plant_happy_task(&mut buf_a);
+        put_u64(&mut buf_a, TASK_ADDR, offsets.task_struct_group_leader, 0);
+        put_u64(&mut buf_a, TASK_ADDR, offsets.task_struct_real_parent, 0);
+        let kernel_a = build_kernel(&mut buf_a);
+        let ea = walk_task_enrichment(
+            &kernel_a,
+            TASK_ADDR,
+            &offsets,
+            &ext_registry(),
+            &LockSlowpathRegistry::default(),
+            false,
+            None,
+        )
+        .expect("task built");
+        assert_eq!(ea.group_leader_pid, None);
+        assert_eq!(ea.real_parent_pid, None);
+        assert_eq!(ea.real_parent_comm, None);
+
+        // Sub-case B: non-null but out-of-bounds => translate fail.
+        let mut buf_b = vec![0u8; 0x2000];
+        plant_happy_task(&mut buf_b);
+        put_u64(
+            &mut buf_b,
+            TASK_ADDR,
+            offsets.task_struct_group_leader,
+            0xF000_0000,
+        );
+        put_u64(
+            &mut buf_b,
+            TASK_ADDR,
+            offsets.task_struct_real_parent,
+            0xF000_0000,
+        );
+        let kernel_b = build_kernel(&mut buf_b);
+        let eb = walk_task_enrichment(
+            &kernel_b,
+            TASK_ADDR,
+            &offsets,
+            &ext_registry(),
+            &LockSlowpathRegistry::default(),
+            false,
+            None,
+        )
+        .expect("task built");
+        assert_eq!(eb.group_leader_pid, None);
+        assert_eq!(eb.real_parent_pid, None);
+        assert_eq!(eb.real_parent_comm, None);
+
+        // Sub-case C: valid parent (positive control) — the
+        // happy-path layout already points both at the mini task.
+        let mut buf_c = vec![0u8; 0x2000];
+        plant_happy_task(&mut buf_c);
+        let kernel_c = build_kernel(&mut buf_c);
+        let ec = walk_task_enrichment(
+            &kernel_c,
+            TASK_ADDR,
+            &offsets,
+            &ext_registry(),
+            &LockSlowpathRegistry::default(),
+            false,
+            None,
+        )
+        .expect("task built");
+        assert_eq!(ec.group_leader_pid, Some(1));
+        assert_eq!(ec.real_parent_pid, Some(1));
+        assert_eq!(ec.real_parent_comm.as_deref(), Some("init"));
+    }
+
+    #[test]
+    fn read_comm_no_nul_reads_full_16_bytes_and_nul_truncates() {
+        let offsets = fixture_offsets();
+
+        // Nul-terminated: truncates at the nul.
+        let mut buf_t = vec![0u8; 0x2000];
+        plant_happy_task(&mut buf_t);
+        put_comm(&mut buf_t, TASK_ADDR, offsets.task_struct_comm, b"short\0");
+        let kernel_t = build_kernel(&mut buf_t);
+        let et = walk_task_enrichment(
+            &kernel_t,
+            TASK_ADDR,
+            &offsets,
+            &ext_registry(),
+            &LockSlowpathRegistry::default(),
+            false,
+            None,
+        )
+        .expect("task built");
+        assert_eq!(et.comm, "short");
+
+        // No nul within the 16-byte window: reads the full 16 bytes.
+        let mut buf_n = vec![0u8; 0x2000];
+        plant_happy_task(&mut buf_n);
+        put_comm(
+            &mut buf_n,
+            TASK_ADDR,
+            offsets.task_struct_comm,
+            b"sixteencharcomm!",
+        );
+        let kernel_n = build_kernel(&mut buf_n);
+        let en = walk_task_enrichment(
+            &kernel_n,
+            TASK_ADDR,
+            &offsets,
+            &ext_registry(),
+            &LockSlowpathRegistry::default(),
+            false,
+            None,
+        )
+        .expect("task built");
+        assert_eq!(en.comm, "sixteencharcomm!");
+        assert_eq!(en.comm.len(), 16);
+
+        // Invalid UTF-8 before the nul: from_utf8_lossy substitutes
+        // the replacement char rather than panicking.
+        let mut buf_l = vec![0u8; 0x2000];
+        plant_happy_task(&mut buf_l);
+        put_comm(&mut buf_l, TASK_ADDR, offsets.task_struct_comm, &[0xFF, 0x00]);
+        let kernel_l = build_kernel(&mut buf_l);
+        let el = walk_task_enrichment(
+            &kernel_l,
+            TASK_ADDR,
+            &offsets,
+            &ext_registry(),
+            &LockSlowpathRegistry::default(),
+            false,
+            None,
+        )
+        .expect("task built");
+        assert_eq!(el.comm, "\u{FFFD}");
+    }
+
+    #[test]
+    fn lock_slowpath_match_pc_supplied_sets_field_and_nonmatch_clears() {
+        let offsets = fixture_offsets();
+        let locks = LockSlowpathRegistry {
+            queued_spin_lock_slowpath: Some(0x5_0000),
+            ..Default::default()
+        };
+
+        // Matching PC inside the qsl window => field set.
+        let mut buf_m = vec![0u8; 0x2000];
+        plant_happy_task(&mut buf_m);
+        let kernel_m = build_kernel(&mut buf_m);
+        let em = walk_task_enrichment(
+            &kernel_m,
+            TASK_ADDR,
+            &offsets,
+            &ext_registry(),
+            &locks,
+            false,
+            Some(0x5_0010),
+        )
+        .expect("task built");
+        assert_eq!(
+            em.lock_slowpath_match.as_deref(),
+            Some("queued_spin_lock_slowpath")
+        );
+
+        // Non-matching PC => field stays None.
+        let mut buf_x = vec![0u8; 0x2000];
+        plant_happy_task(&mut buf_x);
+        let kernel_x = build_kernel(&mut buf_x);
+        let ex = walk_task_enrichment(
+            &kernel_x,
+            TASK_ADDR,
+            &offsets,
+            &ext_registry(),
+            &locks,
+            false,
+            Some(0x9_9999),
+        )
+        .expect("task built");
+        assert_eq!(ex.lock_slowpath_match, None);
+    }
+
+    #[test]
+    fn lock_slowpath_match_pc_window_overflow_returns_none() {
+        // A symbol KVA near u64::MAX whose `s + 4096` window wraps
+        // must not falsely match a PC that would be inside the
+        // non-wrapping window. checked_add returning None => no match.
+        let r = LockSlowpathRegistry {
+            queued_spin_lock_slowpath: Some(u64::MAX - 100),
+            ..Default::default()
+        };
+        assert_eq!(r.match_pc(u64::MAX - 50), None);
+        assert_eq!(r.match_pc(u64::MAX), None);
+    }
 }

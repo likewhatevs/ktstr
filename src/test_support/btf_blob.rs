@@ -47,6 +47,11 @@ const CAST_BTF_KIND_ENUM: u32 = 6;
 /// `BTF_KIND_ENUM64` per `btf-rs` — kind 19 maps to `Type::Enum64`.
 /// Used by the bitfield tests with a signed-enum64 base.
 const CAST_BTF_KIND_ENUM64: u32 = 19;
+/// `BTF_KIND_FLOAT` per `btf-rs::cbtf` — kind 16 maps to
+/// `Type::Float`. Used by the float-decode tests so the renderer's
+/// `render_float` byte-decode arms run against a real BTF float
+/// instead of a hand-constructed `RenderedValue::Float`.
+const CAST_BTF_KIND_FLOAT: u32 = 16;
 
 /// Build a minimal BTF blob containing `types` (id=1..) and a
 /// string-section payload `strings` (must start with `\0`). The
@@ -208,6 +213,19 @@ pub(crate) fn cast_build_btf(types: &[CastSynType], strings: &[u8]) -> Vec<u8> {
                     type_section.extend_from_slice(&hi.to_le_bytes());
                 }
             }
+            CastSynType::Float { name_off, size } => {
+                // BTF_KIND_FLOAT wire layout: name_off (4) + info (4)
+                // + size_type (4, the byte width). Per `cbtf`, kind 16
+                // has `has_size()` true so `btf_type::size()` returns
+                // `size_type`, which `btf_rs::Float::size()` surfaces;
+                // vlen is 0 (no trailing records). The renderer's
+                // `render_float` reads this size to pick the f32 / f64
+                // decode arm.
+                type_section.extend_from_slice(&name_off.to_le_bytes());
+                let info = (CAST_BTF_KIND_FLOAT << 24) & 0x1f00_0000;
+                type_section.extend_from_slice(&info.to_le_bytes());
+                type_section.extend_from_slice(&size.to_le_bytes());
+            }
         }
     }
 
@@ -329,4 +347,11 @@ pub(crate) enum CastSynType {
         signed: bool,
         members: Vec<(u32, u64)>,
     },
+    /// `BTF_KIND_FLOAT` (kind=16). IEEE-754 float of `size` bytes
+    /// (`btf_rs::Float::size`). The renderer's `render_float` decodes
+    /// 4-byte slices as `f32` and 8-byte slices as `f64`; any other
+    /// declared `size` routes to the `Unsupported` arm. Used by the
+    /// float-decode tests so the byte-decode path runs through a real
+    /// BTF float rather than a hand-built `RenderedValue::Float`.
+    Float { name_off: u32, size: u32 },
 }

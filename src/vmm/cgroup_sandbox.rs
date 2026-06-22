@@ -595,8 +595,30 @@ pub(crate) fn is_root_cgroup(parent_rel: &str) -> bool {
 /// verbatim — leading slash preserved, suitable for callers that
 /// `trim_start_matches('/').join()` against `/sys/fs/cgroup` to
 /// form the absolute parent cgroup path.
+///
+/// The `/proc/self/cgroup` read is the only side effect; parsing is
+/// delegated to [`parse_self_cgroup_line`] so the line-selection +
+/// strip + trim logic is unit-testable without a fixed-path read.
 fn read_self_cgroup_path() -> Result<String> {
     let text = std::fs::read_to_string("/proc/self/cgroup").context("read /proc/self/cgroup")?;
+    parse_self_cgroup_line(&text)
+}
+
+/// Parse `/proc/self/cgroup` contents and return the cgroup v2
+/// relative path.
+///
+/// cgroup v2 line format is `0::/path`. Hybrid cgroup v1+v2 hosts
+/// also emit v1 controller-specific lines that start with a
+/// non-zero hierarchy id (e.g. `3:cpuset:/legacy`); those are
+/// skipped, and only the `0::` entry is returned. The matched
+/// path's leading slash is preserved while trailing whitespace
+/// (the line's `\n`) is trimmed. Bails when no `0::` entry exists.
+///
+/// Extracted from [`read_self_cgroup_path`] (which hardcodes the
+/// `/proc/self/cgroup` path and is therefore not host-isolable) so
+/// the parse logic is unit-testable on string input — mirroring the
+/// [`is_root_cgroup`] extraction.
+pub(crate) fn parse_self_cgroup_line(text: &str) -> Result<String> {
     for line in text.lines() {
         // cgroup v2 line format: `0::/path`. Hybrid cgroup v1+v2
         // may also list `0::/path`; ignore v1 controller-specific
@@ -1629,6 +1651,231 @@ mod tests {
         assert!(
             !calls.iter().any(|c| c.starts_with("remove_cgroup")),
             "remove_cgroup must NOT fire on success: {calls:?}",
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // degraded_or_err — hard-error remediation + soft round-trip
+    // ---------------------------------------------------------------
+
+    /// `degraded_or_err(kind, true)` builds the full `--cpu-cap`
+    /// hard-error: the interpolated `{kind}` Display verbatim AND all
+    /// four numbered remediation steps. The try_create-driven test
+    /// (`build_sandbox_try_create_hard_error_converts_degrade`)
+    /// short-circuits to `Ok(Active)` on any functional cgroup v2
+    /// host, leaving this arm host-dependent; calling the private fn
+    /// directly forces it deterministically with no filesystem.
+    ///
+    /// Pins the `{kind}` interpolation across all five variants so a
+    /// future Display refactor that desynchronized the message body
+    /// from the variant text would be caught.
+    #[test]
+    fn degraded_or_err_hard_error_renders_full_remediation() {
+        let e = BuildSandbox::degraded_or_err(SandboxDegraded::NoCpusetController, true)
+            .expect_err("hard_error_on_degrade=true must return Err");
+        let m = format!("{e:#}");
+        // {kind} Display interpolated verbatim after "--cpu-cap: ".
+        assert!(
+            m.contains("--cpu-cap: parent cgroup does not expose cpuset controller."),
+            "kind Display must interpolate verbatim: {m}",
+        );
+        // Remediation step 1: systemd transient scope.
+        assert!(
+            m.contains("systemd-run --user --scope"),
+            "step 1 (systemd-run) must be present: {m}",
+        );
+        // Remediation step 2: sudo -E preserving env.
+        assert!(
+            m.contains("sudo -E cargo ktstr kernel build"),
+            "step 2 (sudo -E) must be present: {m}",
+        );
+        // Remediation step 3: cpuset delegation needs CAP_SYS_ADMIN.
+        assert!(
+            m.contains("requires CAP_SYS_ADMIN"),
+            "step 3 (CAP_SYS_ADMIN) must be present: {m}",
+        );
+        // Remediation step 4: drop --cpu-cap, fall back to LLC flock.
+        assert!(
+            m.contains("falls back to LLC flock"),
+            "step 4 (LLC flock fallback) must be present: {m}",
+        );
+
+        // Every variant's Display must interpolate verbatim into the
+        // message — pins the {kind} substitution per variant.
+        for kind in [
+            SandboxDegraded::NoCgroupV2,
+            SandboxDegraded::NoCpusetController,
+            SandboxDegraded::SubtreeControlRefused,
+            SandboxDegraded::PermissionDenied,
+            SandboxDegraded::RootCgroupRefused,
+        ] {
+            let want = format!("--cpu-cap: {kind}.");
+            let err = BuildSandbox::degraded_or_err(kind.clone(), true)
+                .expect_err("hard error required");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains(&want),
+                "kind {kind:?} Display must interpolate verbatim: {msg}",
+            );
+        }
+    }
+
+    /// `degraded_or_err(kind, false)` returns
+    /// `Ok(BuildSandbox::Degraded(kind))` with the exact kind passed
+    /// in — the soft path that a cap-unset caller takes. No existing
+    /// test calls the fn directly to confirm the kind round-trips
+    /// (try_create-driven tests only assert non-empty Display and the
+    /// host may take Active). `SandboxDegraded` derives Debug+Clone
+    /// but not PartialEq, so the assertion uses `matches!` on the
+    /// nested pattern rather than `assert_eq!`.
+    #[test]
+    fn degraded_or_err_soft_returns_degraded_preserving_kind() {
+        let s = BuildSandbox::degraded_or_err(SandboxDegraded::SubtreeControlRefused, false)
+            .expect("soft path must be Ok");
+        assert!(
+            matches!(
+                s,
+                BuildSandbox::Degraded(SandboxDegraded::SubtreeControlRefused)
+            ),
+            "soft path must preserve the exact kind in Degraded",
+        );
+        assert!(!s.is_active(), "Degraded must report !is_active()");
+        // s is Degraded — Drop is a no-op per the Drop impl's early
+        // return on the non-Active arm.
+    }
+
+    // ---------------------------------------------------------------
+    // parent_controllers_include — readable-file token-match branches
+    // ---------------------------------------------------------------
+
+    /// `parent_controllers_include` returns `true` for a controller
+    /// token present anywhere in a readable `cgroup.controllers`
+    /// file. Covers the `Ok(contents)` + `.any(==)` TRUE branch
+    /// (`parent_controllers_include_missing_file` only covers the
+    /// `Err(_) => false` arm). Asserts a mid-list and an end-of-list
+    /// token both match.
+    #[test]
+    fn parent_controllers_include_present_returns_true() {
+        let tmp = tempfile::Builder::new()
+            .prefix("ktstr-controllers-present-")
+            .tempdir()
+            .unwrap();
+        let dir = tmp.path();
+        std::fs::write(dir.join("cgroup.controllers"), "cpuset cpu io memory pids\n").unwrap();
+        // First token.
+        assert!(
+            parent_controllers_include(dir, "cpuset"),
+            "cpuset (first token) must match",
+        );
+        // Last token.
+        assert!(
+            parent_controllers_include(dir, "pids"),
+            "pids (last token) must match",
+        );
+        // Middle token.
+        assert!(
+            parent_controllers_include(dir, "io"),
+            "io (middle token) must match",
+        );
+    }
+
+    /// `parent_controllers_include` returns `false` when the file is
+    /// readable but the requested controller is absent — distinct
+    /// from the `Err(_)` missing-file branch. Also pins that the
+    /// match is token-exact (`==`), not `contains()`: a file listing
+    /// `cpu` must NOT satisfy a request for `cpuset` despite the
+    /// substring collision.
+    #[test]
+    fn parent_controllers_include_present_but_absent_returns_false() {
+        let tmp = tempfile::Builder::new()
+            .prefix("ktstr-controllers-absent-")
+            .tempdir()
+            .unwrap();
+        let dir = tmp.path();
+        std::fs::write(dir.join("cgroup.controllers"), "cpu io memory\n").unwrap();
+        assert!(
+            !parent_controllers_include(dir, "cpuset"),
+            "cpuset absent despite the cpu prefix-collision token must be false",
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // read_cpuset_effective — present-file parse + empty-vs-absent
+    // ---------------------------------------------------------------
+
+    /// `read_cpuset_effective` parses a readable `.effective` file
+    /// into a `BTreeSet<usize>`: covers the `Some(...)` success path
+    /// (`read_cpuset_effective_missing_file_returns_none` covers only
+    /// the `None` read-error branch). Pins the
+    /// `parse_cpu_list_lenient` wiring — trailing-newline trim plus
+    /// range-expansion (`0-2` → `{0,1,2}`) into the set.
+    #[test]
+    fn read_cpuset_effective_parses_present_file() {
+        let tmp = tempfile::Builder::new()
+            .prefix("ktstr-effective-parse-")
+            .tempdir()
+            .unwrap();
+        let path = tmp.path().join("cpuset.cpus.effective");
+        std::fs::write(&path, "0-2,4\n").unwrap();
+        assert_eq!(
+            read_cpuset_effective(&path),
+            Some(BTreeSet::from([0usize, 1, 2, 4])),
+            "range 0-2 expands and 4 appends into the set after trim",
+        );
+    }
+
+    /// `read_cpuset_effective` on an existing-but-empty file yields
+    /// `Some(empty BTreeSet)`, NOT `None`. This pins the load-bearing
+    /// absent-vs-empty distinction: in `try_create`,
+    /// `cpuset_sets_equal(requested, empty)` would be `false` and
+    /// drive the degrade warn, whereas `None` means "cannot verify"
+    /// and is silently tolerated. The two must not collapse.
+    #[test]
+    fn read_cpuset_effective_empty_file_is_empty_set_not_none() {
+        let tmp = tempfile::Builder::new()
+            .prefix("ktstr-effective-empty-")
+            .tempdir()
+            .unwrap();
+        let path = tmp.path().join("cpuset.cpus.effective");
+        // Whitespace-only content: read_to_string is Ok, the trim +
+        // parse yields an empty list → Some(empty set).
+        std::fs::write(&path, "\n").unwrap();
+        assert_eq!(
+            read_cpuset_effective(&path),
+            Some(BTreeSet::new()),
+            "existing-but-empty file is Some(empty), explicitly NOT None",
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // parse_self_cgroup_line — pure parse seam
+    // ---------------------------------------------------------------
+
+    /// `parse_self_cgroup_line` strips the `0::` prefix and trims the
+    /// trailing newline, skips v1 controller-specific lines to select
+    /// the v2 entry, and errors when no `0::` entry exists. The
+    /// host-reading `read_self_cgroup_returns_path` only asserts
+    /// `starts_with('/')`; the multi-line skip, the trim, and the
+    /// no-v2-entry error are pinned here on pure string input.
+    #[test]
+    fn parse_self_cgroup_line_strips_prefix_and_selects_v2() {
+        // Single v2 line: prefix stripped, trailing newline trimmed.
+        assert_eq!(
+            parse_self_cgroup_line("0::/user.slice/x.scope\n").unwrap(),
+            "/user.slice/x.scope",
+            "0:: prefix stripped and trailing newline trimmed",
+        );
+        // Hybrid: a v1 controller line precedes the 0:: line; the
+        // v2 line is selected.
+        assert_eq!(
+            parse_self_cgroup_line("3:cpuset:/legacy\n0::/good\n").unwrap(),
+            "/good",
+            "v1 lines skipped, 0:: line selected",
+        );
+        // No 0:: entry: bail.
+        assert!(
+            parse_self_cgroup_line("3:cpuset:/legacy\n").is_err(),
+            "hybrid input with no 0:: entry must error",
         );
     }
 }

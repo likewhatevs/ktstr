@@ -1681,3 +1681,556 @@ fn classify_vmlinux_member(btf: &btf_rs::Btf, member_tid: u32) -> Option<MemberC
 #[cfg(test)]
 #[path = "btf_tests.rs"]
 mod tests;
+
+// ===================================================================
+// BPF-program-BTF side: synthetic libbpf-rs BTF parser tests.
+//
+// The sibling `tests` module (btf_tests.rs) covers the `btf_rs`
+// (vmlinux) classifiers via `btf_rs::Btf::from_bytes`. This module
+// covers the `libbpf_rs::btf` (BPF program BTF) classifiers
+// ([`classify_bpf_member`], [`discover_bpf_struct_fields`],
+// [`resolve_bpf_member_offset`], [`resolve_bpf_member_size`],
+// [`resolve_ops_callback_proto`]) against hand-built raw-BTF blobs
+// loaded through `libbpf_rs::btf::Btf::from_path`.
+//
+// libbpf's `btf__parse` (the `from_path` backend) runs
+// `btf_sanity_check`, which validates string offsets and referenced
+// type ids but tolerates the minimal blobs built here. The shared
+// `crate::test_support::btf_blob::cast_build_btf` builder emits the
+// same 24-byte-header raw-BTF wire format libbpf parses; it lacks a
+// FuncProto kind, so the ops-callback test builds that one blob with
+// a local raw encoder mirroring the same header layout.
+//
+// No kernel, no loaded BPF program, no VM — fully host-runnable.
+// `parse_bpf_btf_functions`, `resolve_bpf_field_specs`,
+// `resolve_bpf_prog_full_name`, `resolve_bpf_source_locs`, and
+// `discover_bpf_symbols` are NOT covered here: each calls
+// `Btf::from_vmlinux`/`from_prog_id` or raw `bpf_obj_get_info_by_fd`
+// against a live kernel / loaded program, with no synthetic-blob seam.
+// ===================================================================
+#[cfg(test)]
+mod bpf_btf_tests {
+    use super::*;
+    use crate::test_support::btf_blob::{CastSynMember, CastSynType, cast_build_btf};
+    use libbpf_rs::btf::Btf;
+    use libbpf_rs::btf::TypeId;
+    use libbpf_rs::btf::types::{FuncProto, Struct};
+
+    /// Append a NUL-terminated `name` to a BTF string section and
+    /// return its byte offset. Mirrors the `push_str` helper the
+    /// `kernel_op_dispatch` BTF-gated suite uses.
+    fn push_str(strings: &mut Vec<u8>, name: &str) -> u32 {
+        let off = strings.len() as u32;
+        strings.extend_from_slice(name.as_bytes());
+        strings.push(0);
+        off
+    }
+
+    /// Write a raw-BTF `blob` to a fresh temp file and load it through
+    /// libbpf's `btf__parse` (the `Btf::from_path` backend). The
+    /// returned `Btf<'static>` does not borrow the file, so the
+    /// `NamedTempFile` may drop immediately after the parse.
+    fn load_btf(blob: &[u8]) -> Btf<'static> {
+        use std::io::Write as _;
+        let mut f = tempfile::NamedTempFile::new().expect("temp file");
+        f.write_all(blob).expect("write blob");
+        f.flush().expect("flush");
+        Btf::from_path(f.path()).expect("synthetic BPF BTF must parse via libbpf btf__parse")
+    }
+
+    /// A plain-unsigned int BTF type. `encoding == 0` → the libbpf
+    /// `IntEncoding::None` arm; `bits == size * 8` so
+    /// `resolve_bpf_member_size` reads `bits / 8 == size`.
+    fn int_ty(name_off: u32, size: u32, encoding: u32) -> CastSynType {
+        CastSynType::Int {
+            name_off,
+            size,
+            encoding,
+            offset: 0,
+            bits: size * 8,
+        }
+    }
+
+    /// `cast_build_btf` member at a byte-aligned offset.
+    fn member(name_off: u32, type_id: u32, byte_offset: u32) -> CastSynMember {
+        CastSynMember {
+            name_off,
+            type_id,
+            byte_offset,
+        }
+    }
+
+    // ---- classify_bpf_member: Int encodings ----
+
+    /// `classify_bpf_member` Int arm maps each libbpf `IntEncoding` to
+    /// the documented `RenderHint`: Bool→Bool, Signed→Signed,
+    /// unsigned(None)→Hex. The `btf_rs` sibling
+    /// (`classify_vmlinux_member_variants`) is covered; this is the
+    /// only host coverage for the libbpf Int classifier.
+    ///
+    /// libbpf decodes the encoding nibble as `0b1`→Signed, `0b100`→Bool
+    /// (`IntEncoding::try_from`, registry libbpf-rs btf/types.rs:388),
+    /// so the int-data word's encoding field is 1 (signed) / 4 (bool) /
+    /// 0 (none) — matching `cast_build_btf`'s `encoding << 24`.
+    #[test]
+    fn classify_bpf_member_int_encodings() {
+        let mut strings: Vec<u8> = vec![0];
+        let n_bool = push_str(&mut strings, "boolt");
+        let n_signed = push_str(&mut strings, "signedt");
+        let n_unsigned = push_str(&mut strings, "unsignedt");
+        // encoding 4 = libbpf Bool; 1 = Signed; 0 = None (hex).
+        let types = vec![
+            int_ty(n_bool, 1, 4),     // id=1 bool
+            int_ty(n_signed, 4, 1),   // id=2 signed
+            int_ty(n_unsigned, 8, 0), // id=3 unsigned
+        ];
+        let blob = cast_build_btf(&types, &strings);
+        let btf = load_btf(&blob);
+
+        let t_bool = btf
+            .type_by_id::<libbpf_rs::btf::BtfType<'_>>(TypeId::from(1))
+            .expect("bool int");
+        let t_signed = btf
+            .type_by_id::<libbpf_rs::btf::BtfType<'_>>(TypeId::from(2))
+            .expect("signed int");
+        let t_unsigned = btf
+            .type_by_id::<libbpf_rs::btf::BtfType<'_>>(TypeId::from(3))
+            .expect("unsigned int");
+
+        assert!(matches!(
+            classify_bpf_member(t_bool),
+            Some(MemberClass::Int(RenderHint::Bool))
+        ));
+        assert!(matches!(
+            classify_bpf_member(t_signed),
+            Some(MemberClass::Int(RenderHint::Signed))
+        ));
+        assert!(matches!(
+            classify_bpf_member(t_unsigned),
+            Some(MemberClass::Int(RenderHint::Hex))
+        ));
+
+        // The full emitted tuple for a Bool int named "ok" pins the
+        // emit_member_field contract end-to-end.
+        let mut fields = Vec::new();
+        emit_member_field(
+            &mut fields,
+            "ok",
+            classify_bpf_member(t_bool).expect("bool classifies"),
+        );
+        assert_eq!(
+            fields,
+            vec![("ok".to_string(), "->ok".to_string(), RenderHint::Bool)]
+        );
+    }
+
+    // ---- classify_bpf_member: Enum / Enum64 / Ptr / catch-all ----
+
+    /// Enum and Enum64 → `MemberClass::Enum`; a `cpumask`-pointed Ptr
+    /// → `CpumaskPtr`; a `bpf_cpumask`-pointed Ptr → `BpfCpumaskPtr`
+    /// (the ONLY path that produces `BpfCpumaskPtr` — the vmlinux
+    /// sibling never emits it); a non-cpumask Ptr and a bare Struct
+    /// → `None`.
+    #[test]
+    fn classify_bpf_member_enum_enum64_and_ptr_kinds() {
+        let mut strings: Vec<u8> = vec![0];
+        let n_e = push_str(&mut strings, "color");
+        let n_e64 = push_str(&mut strings, "bigcolor");
+        let n_cpumask = push_str(&mut strings, "cpumask");
+        let n_bpf_cpumask = push_str(&mut strings, "bpf_cpumask");
+        let n_widget = push_str(&mut strings, "widget");
+        let n_u64 = push_str(&mut strings, "u64");
+        let n_bits = push_str(&mut strings, "bits");
+
+        // ids: 1 enum, 2 enum64, 3 u64, 4 struct cpumask, 5 ptr->cpumask,
+        // 6 struct bpf_cpumask, 7 ptr->bpf_cpumask, 8 struct widget,
+        // 9 ptr->widget.
+        let types = vec![
+            CastSynType::Enum {
+                name_off: n_e,
+                size: 4,
+                signed: false,
+                members: vec![],
+            }, // id=1
+            CastSynType::Enum64 {
+                name_off: n_e64,
+                size: 8,
+                signed: false,
+                members: vec![],
+            }, // id=2
+            int_ty(n_u64, 8, 0), // id=3
+            CastSynType::Struct {
+                name_off: n_cpumask,
+                size: 8,
+                members: vec![member(n_bits, 3, 0)],
+            }, // id=4
+            CastSynType::Ptr { type_id: 4 }, // id=5
+            CastSynType::Struct {
+                name_off: n_bpf_cpumask,
+                size: 8,
+                members: vec![member(n_bits, 3, 0)],
+            }, // id=6
+            CastSynType::Ptr { type_id: 6 }, // id=7
+            CastSynType::Struct {
+                name_off: n_widget,
+                size: 8,
+                members: vec![member(n_bits, 3, 0)],
+            }, // id=8
+            CastSynType::Ptr { type_id: 8 }, // id=9
+        ];
+        let blob = cast_build_btf(&types, &strings);
+        let btf = load_btf(&blob);
+
+        let by_id = |id: u32| {
+            btf.type_by_id::<libbpf_rs::btf::BtfType<'_>>(TypeId::from(id))
+                .expect("type id present")
+        };
+
+        assert!(matches!(
+            classify_bpf_member(by_id(1)),
+            Some(MemberClass::Enum)
+        ));
+        assert!(matches!(
+            classify_bpf_member(by_id(2)),
+            Some(MemberClass::Enum)
+        ));
+        assert!(matches!(
+            classify_bpf_member(by_id(5)),
+            Some(MemberClass::CpumaskPtr)
+        ));
+        assert!(matches!(
+            classify_bpf_member(by_id(7)),
+            Some(MemberClass::BpfCpumaskPtr)
+        ));
+        // Pointer to a non-cpumask struct → None (skipped).
+        assert!(classify_bpf_member(by_id(9)).is_none());
+        // A bare struct (not int/enum/ptr) → None (catch-all arm).
+        assert!(classify_bpf_member(by_id(4)).is_none());
+    }
+
+    // ---- discover_bpf_struct_fields ----
+
+    /// `discover_bpf_struct_fields` emits the exact access-pattern Vec
+    /// for a struct of mixed members, byte-for-byte the libbpf-side
+    /// sibling of `discover_vmlinux_struct_fields_emits_expected_access`.
+    /// The `bm`/BpfCpumaskPtr entry pins the BPF-only access string
+    /// `->bm->cpumask.bits[0]` (unreachable on the vmlinux side).
+    /// Anonymous and unclassified (non-cpumask pointer) members are
+    /// dropped.
+    #[test]
+    fn discover_bpf_struct_fields_emits_expected_access() {
+        let mut strings: Vec<u8> = vec![0];
+        let n_u64 = push_str(&mut strings, "u64");
+        let n_e = push_str(&mut strings, "ek");
+        let n_cpumask = push_str(&mut strings, "cpumask");
+        let n_bpf_cpumask = push_str(&mut strings, "bpf_cpumask");
+        let n_widget = push_str(&mut strings, "widget");
+        let n_bits = push_str(&mut strings, "bits");
+        let n_foo = push_str(&mut strings, "foo");
+        let n_sc = push_str(&mut strings, "sc");
+        let n_ok = push_str(&mut strings, "ok");
+        let n_em = push_str(&mut strings, "e");
+        let n_cm = push_str(&mut strings, "cm");
+        let n_bm = push_str(&mut strings, "bm");
+        let n_other = push_str(&mut strings, "other");
+
+        // Leaf / pointee types.
+        let types = vec![
+            int_ty(n_u64, 8, 0), // id=1 unsigned (hex)
+            int_ty(0, 4, 1),     // id=2 signed (anonymous int type ok)
+            int_ty(0, 1, 4),     // id=3 bool
+            CastSynType::Enum {
+                name_off: n_e,
+                size: 4,
+                signed: false,
+                members: vec![],
+            }, // id=4 enum
+            CastSynType::Struct {
+                name_off: n_cpumask,
+                size: 8,
+                members: vec![member(n_bits, 1, 0)],
+            }, // id=5 cpumask
+            CastSynType::Ptr { type_id: 5 }, // id=6 cpumask*
+            CastSynType::Struct {
+                name_off: n_bpf_cpumask,
+                size: 8,
+                members: vec![member(n_bits, 1, 0)],
+            }, // id=7 bpf_cpumask
+            CastSynType::Ptr { type_id: 7 }, // id=8 bpf_cpumask*
+            CastSynType::Struct {
+                name_off: n_widget,
+                size: 8,
+                members: vec![member(n_bits, 1, 0)],
+            }, // id=9 widget
+            CastSynType::Ptr { type_id: 9 }, // id=10 widget*
+            // id=11 foo: signed sc, bool ok, enum e, cpumask* cm,
+            // bpf_cpumask* bm, widget* (non-cpumask, dropped),
+            // anonymous member (dropped).
+            CastSynType::Struct {
+                name_off: n_foo,
+                size: 48,
+                members: vec![
+                    member(n_sc, 2, 0),
+                    member(n_ok, 3, 8),
+                    member(n_em, 4, 16),
+                    member(n_cm, 6, 24),
+                    member(n_bm, 8, 32),
+                    member(n_other, 10, 40),
+                    member(0, 1, 44), // anonymous → skipped
+                ],
+            }, // id=11
+            CastSynType::Ptr { type_id: 11 }, // id=12 foo*
+        ];
+        let blob = cast_build_btf(&types, &strings);
+        let btf = load_btf(&blob);
+
+        let expected = vec![
+            ("sc".to_string(), "->sc".to_string(), RenderHint::Signed),
+            ("ok".to_string(), "->ok".to_string(), RenderHint::Bool),
+            ("e".to_string(), "->e".to_string(), RenderHint::Hex),
+            (
+                "cm".to_string(),
+                "->cm->bits[0]".to_string(),
+                RenderHint::Hex,
+            ),
+            (
+                "bm".to_string(),
+                "->bm->cpumask.bits[0]".to_string(),
+                RenderHint::Hex,
+            ),
+            // `other` (non-cpumask ptr) and the anonymous member are
+            // both absent.
+        ];
+
+        // Direct struct id.
+        let fields = discover_bpf_struct_fields(&btf, TypeId::from(11));
+        assert_eq!(fields, expected);
+
+        // Ptr-to-foo id exercises the Ptr-peel branch and yields the
+        // same Vec.
+        let via_ptr = discover_bpf_struct_fields(&btf, TypeId::from(12));
+        assert_eq!(via_ptr, expected);
+    }
+
+    // ---- resolve_bpf_member_offset ----
+
+    /// `resolve_bpf_member_offset`: a byte-aligned `Normal` member
+    /// returns `Some(byte_offset)`; a bitfield at a non-byte-aligned
+    /// bit offset returns `None`; an unknown member returns `None`.
+    #[test]
+    fn resolve_bpf_member_offset_normal_and_bitfield_reject() {
+        // (a) Byte-aligned normal members.
+        let mut strings: Vec<u8> = vec![0];
+        let n_u64 = push_str(&mut strings, "u64");
+        let n_s = push_str(&mut strings, "s");
+        let n_cpu = push_str(&mut strings, "cpu");
+        let n_second = push_str(&mut strings, "second");
+        let normal = vec![
+            int_ty(n_u64, 8, 0), // id=1
+            CastSynType::Struct {
+                name_off: n_s,
+                size: 16,
+                members: vec![member(n_cpu, 1, 0), member(n_second, 1, 8)],
+            }, // id=2
+        ];
+        let normal_blob = cast_build_btf(&normal, &strings);
+        let btf = load_btf(&normal_blob);
+        let composite: Struct<'_> = btf.type_by_name("s").expect("struct s");
+        assert_eq!(resolve_bpf_member_offset(&composite, "cpu"), Some(0));
+        assert_eq!(resolve_bpf_member_offset(&composite, "second"), Some(8));
+        assert_eq!(resolve_bpf_member_offset(&composite, "nonexistent"), None);
+
+        // (b) Bitfield member at bit offset 4 (size 1) — kind_flag set,
+        // so libbpf decodes MemberAttr::BitField { offset: 4 }; 4 % 8
+        // != 0 triggers the bitfield reject.
+        let mut bstrings: Vec<u8> = vec![0];
+        let bn_u32 = push_str(&mut bstrings, "u32");
+        let bn_bf = push_str(&mut bstrings, "bf");
+        let bn_flag = push_str(&mut bstrings, "flag");
+        let bf_types = vec![
+            int_ty(bn_u32, 4, 0), // id=1
+            CastSynType::BitfieldStruct {
+                name_off: bn_bf,
+                size: 8,
+                members: vec![crate::test_support::btf_blob::CastSynBitMember {
+                    name_off: bn_flag,
+                    type_id: 1,
+                    bit_offset: 4,
+                    bitfield_size: 1,
+                }],
+            }, // id=2
+        ];
+        let bf_blob = cast_build_btf(&bf_types, &bstrings);
+        let bf_btf = load_btf(&bf_blob);
+        let bf: Struct<'_> = bf_btf.type_by_name("bf").expect("struct bf");
+        assert_eq!(
+            resolve_bpf_member_offset(&bf, "flag"),
+            None,
+            "non-byte-aligned bitfield member must be rejected"
+        );
+    }
+
+    // ---- resolve_bpf_member_size ----
+
+    /// `resolve_bpf_member_size` per kind: Int → bits/8; Enum →
+    /// hardcoded 4 (even when the declared enum size is 8 — the
+    /// divergence from a declared-size read); Enum64 → 8; Ptr → 8;
+    /// any other kind (embedded struct) → 8 default; missing → None.
+    #[test]
+    fn resolve_bpf_member_size_per_kind() {
+        let mut strings: Vec<u8> = vec![0];
+        let n_u32 = push_str(&mut strings, "u32t");
+        let n_u64 = push_str(&mut strings, "u64t");
+        let n_e = push_str(&mut strings, "ek");
+        let n_inner = push_str(&mut strings, "inner");
+        let n_x = push_str(&mut strings, "x");
+        let n_s = push_str(&mut strings, "s");
+        let n_u32m = push_str(&mut strings, "u32m");
+        let n_u64m = push_str(&mut strings, "u64m");
+        let n_em = push_str(&mut strings, "e");
+        let n_e64m = push_str(&mut strings, "e64");
+        let n_ptrm = push_str(&mut strings, "p");
+        let n_structm = push_str(&mut strings, "embed");
+        let n_e64 = push_str(&mut strings, "be");
+
+        let types = vec![
+            int_ty(n_u32, 4, 0), // id=1 u32
+            int_ty(n_u64, 8, 0), // id=2 u64
+            CastSynType::Enum {
+                name_off: n_e,
+                size: 8, // declared size 8 — must NOT be reflected (hardcoded 4).
+                signed: false,
+                members: vec![],
+            }, // id=3 enum
+            CastSynType::Enum64 {
+                name_off: n_e64,
+                size: 8,
+                signed: false,
+                members: vec![],
+            }, // id=4 enum64
+            CastSynType::Ptr { type_id: 2 }, // id=5 u64*
+            CastSynType::Struct {
+                name_off: n_inner,
+                size: 4,
+                members: vec![member(n_x, 1, 0)],
+            }, // id=6 embedded struct
+            // id=7 s with one member of each kind.
+            CastSynType::Struct {
+                name_off: n_s,
+                size: 64,
+                members: vec![
+                    member(n_u32m, 1, 0),
+                    member(n_u64m, 2, 8),
+                    member(n_em, 3, 16),
+                    member(n_e64m, 4, 24),
+                    member(n_ptrm, 5, 32),
+                    member(n_structm, 6, 40),
+                ],
+            }, // id=7
+        ];
+        let blob = cast_build_btf(&types, &strings);
+        let btf = load_btf(&blob);
+        let s: Struct<'_> = btf.type_by_name("s").expect("struct s");
+
+        assert_eq!(resolve_bpf_member_size(&btf, &s, "u32m"), Some(4));
+        assert_eq!(resolve_bpf_member_size(&btf, &s, "u64m"), Some(8));
+        // Enum is hardcoded to 4 regardless of the declared size_type (8).
+        assert_eq!(resolve_bpf_member_size(&btf, &s, "e"), Some(4));
+        assert_eq!(resolve_bpf_member_size(&btf, &s, "e64"), Some(8));
+        assert_eq!(resolve_bpf_member_size(&btf, &s, "p"), Some(8));
+        // Embedded struct member → default arm (8).
+        assert_eq!(resolve_bpf_member_size(&btf, &s, "embed"), Some(8));
+        // Missing member name → None fall-through.
+        assert_eq!(resolve_bpf_member_size(&btf, &s, "nope"), None);
+    }
+
+    // ---- resolve_ops_callback_proto ----
+
+    /// Build a raw-BTF blob containing one Int, a 2-param FuncProto, a
+    /// Ptr to it, and a `sched_ext_ops` struct with an `enqueue`
+    /// member typed as that function pointer. `cast_build_btf` has no
+    /// FuncProto kind, so this is hand-encoded with the same 24-byte
+    /// header layout. `with_ops` controls whether the `sched_ext_ops`
+    /// struct is emitted.
+    fn build_ops_btf(with_ops: bool) -> Vec<u8> {
+        const KIND_INT: u32 = 1;
+        const KIND_PTR: u32 = 2;
+        const KIND_STRUCT: u32 = 4;
+        const KIND_FUNC_PROTO: u32 = 13;
+
+        let mut strings: Vec<u8> = vec![0];
+        let n_int = push_str(&mut strings, "int");
+        let n_a = push_str(&mut strings, "a");
+        let n_b = push_str(&mut strings, "b");
+        let n_ops = push_str(&mut strings, "sched_ext_ops");
+        let n_enqueue = push_str(&mut strings, "enqueue");
+
+        // 12-byte `btf_type` header: name_off, info, size_type.
+        let push_hdr =
+            |sec: &mut Vec<u8>, name_off: u32, kind: u32, vlen: u32, size_type: u32| {
+                sec.extend_from_slice(&name_off.to_le_bytes());
+                let info = ((kind << 24) & 0x1f00_0000) | (vlen & 0xffff);
+                sec.extend_from_slice(&info.to_le_bytes());
+                sec.extend_from_slice(&size_type.to_le_bytes());
+            };
+
+        let mut sec: Vec<u8> = Vec::new();
+        // id=1: int (12-byte hdr + 4-byte int data; encoding 0, bits 32).
+        push_hdr(&mut sec, n_int, KIND_INT, 0, 4);
+        sec.extend_from_slice(&32u32.to_le_bytes());
+        // id=2: FuncProto, ret=int(1), 2 params (a:int, b:int).
+        push_hdr(&mut sec, 0, KIND_FUNC_PROTO, 2, 1);
+        sec.extend_from_slice(&n_a.to_le_bytes());
+        sec.extend_from_slice(&1u32.to_le_bytes());
+        sec.extend_from_slice(&n_b.to_le_bytes());
+        sec.extend_from_slice(&1u32.to_le_bytes());
+        // id=3: Ptr -> FuncProto(2).
+        push_hdr(&mut sec, 0, KIND_PTR, 0, 2);
+        if with_ops {
+            // id=4: struct sched_ext_ops { enqueue @0 : Ptr(3) }.
+            push_hdr(&mut sec, n_ops, KIND_STRUCT, 1, 8);
+            sec.extend_from_slice(&n_enqueue.to_le_bytes());
+            sec.extend_from_slice(&3u32.to_le_bytes()); // member type = Ptr(3)
+            sec.extend_from_slice(&0u32.to_le_bytes()); // member offset (bits) = 0
+        }
+
+        let type_len = sec.len() as u32;
+        let str_len = strings.len() as u32;
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&0xEB9F_u16.to_le_bytes()); // magic
+        blob.push(1); // version
+        blob.push(0); // flags
+        blob.extend_from_slice(&24u32.to_le_bytes()); // hdr_len
+        blob.extend_from_slice(&0u32.to_le_bytes()); // type_off
+        blob.extend_from_slice(&type_len.to_le_bytes()); // type_len
+        blob.extend_from_slice(&type_len.to_le_bytes()); // str_off
+        blob.extend_from_slice(&str_len.to_le_bytes()); // str_len
+        blob.extend_from_slice(&sec);
+        blob.extend_from_slice(&strings);
+        blob
+    }
+
+    /// `resolve_ops_callback_proto`: a func name whose suffix matches a
+    /// `sched_ext_ops` member resolves through the member's Ptr to the
+    /// FuncProto (param count pinned); a non-matching func name and a
+    /// BTF lacking `sched_ext_ops` both return `None`.
+    #[test]
+    fn resolve_ops_callback_proto_suffix_match_and_ptr_chase() {
+        let btf = load_btf(&build_ops_btf(true));
+        let proto: FuncProto<'_> =
+            resolve_ops_callback_proto(&btf, "ktstr_enqueue").expect("enqueue resolves");
+        assert_eq!(
+            proto.iter().count(),
+            2,
+            "the enqueue FuncProto has exactly 2 params"
+        );
+
+        // func_name matching no ops member → None.
+        assert!(resolve_ops_callback_proto(&btf, "ktstr_no_such_op").is_none());
+
+        // BTF without a sched_ext_ops struct → type_by_name None early
+        // return.
+        let btf_no_ops = load_btf(&build_ops_btf(false));
+        assert!(resolve_ops_callback_proto(&btf_no_ops, "ktstr_enqueue").is_none());
+    }
+}

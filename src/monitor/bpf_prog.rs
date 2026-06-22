@@ -1377,4 +1377,517 @@ mod tests {
              inner string matched a different format arm:\n{outer}",
         );
     }
+
+    // -- prog_idr chain fixtures: synthetic guest memory that drives
+    //    the full for_each_struct_ops_prog walk on the host with no
+    //    VM and no live kernel. The layout mirrors the existing
+    //    `walk_struct_ops_runtime_stats_bulk_chain_at_page_offset`
+    //    helper above (idr@0x0, prog@0x1000, aux@0x2000) and reuses
+    //    `synthetic_prog_offsets()`. PAs are offset by `page_offset`
+    //    to form direct-map KVAs that `translate_any_kva` resolves
+    //    via `kva_to_pa` (the direct-map fast path), and the
+    //    `prog_idr_kva` sits in kernel-text range translated via
+    //    `text_kva_to_pa_with_base`.
+
+    /// x86_64 PAGE_OFFSET baseline (4-level paging, non-KASLR) used
+    /// by the host-only chain fixtures below. The exact value only
+    /// has to keep `page_offset + pa` outside `[0, buf.len())` so the
+    /// formed KVAs are unambiguously in the direct-map range and
+    /// translate back to `pa` via `kva_to_pa`.
+    const FIXTURE_PAGE_OFFSET: u64 = 0xFFFF_8880_0000_0000;
+
+    /// Mutable byte buffer wrapped as guest DRAM for the prog_idr
+    /// chain fixtures. Owns the backing `Vec` so the unsafe
+    /// [`GuestMem::new`] pointer stays valid for the fixture's life.
+    struct ProgChainFixture {
+        buf: Vec<u8>,
+        page_offset: u64,
+    }
+
+    impl ProgChainFixture {
+        fn new(size: usize) -> Self {
+            Self {
+                buf: vec![0u8; size],
+                page_offset: FIXTURE_PAGE_OFFSET,
+            }
+        }
+
+        /// Direct-map KVA for a DRAM offset.
+        fn pa_to_kva(&self, pa: u64) -> u64 {
+            self.page_offset.wrapping_add(pa)
+        }
+
+        fn write_u64(&mut self, pa: u64, val: u64) {
+            let off = pa as usize;
+            self.buf[off..off + 8].copy_from_slice(&val.to_ne_bytes());
+        }
+
+        fn write_u32(&mut self, pa: u64, val: u32) {
+            let off = pa as usize;
+            self.buf[off..off + 4].copy_from_slice(&val.to_ne_bytes());
+        }
+
+        /// Write a NUL-terminated (within `BPF_OBJ_NAME_LEN`) name
+        /// blob at `pa`. Panics if the name needs a terminator but
+        /// fills the whole field — every fixture name here is short.
+        fn write_name(&mut self, pa: u64, name: &[u8]) {
+            assert!(
+                name.len() < BPF_OBJ_NAME_LEN,
+                "fixture name must leave room for the NUL terminator",
+            );
+            let off = pa as usize;
+            self.buf[off..off + name.len()].copy_from_slice(name);
+        }
+
+        fn mem(&self) -> GuestMem {
+            // SAFETY: `self.buf` is a live Vec<u8> owned by the
+            // fixture; it outlives every GuestMem read in the test
+            // because the fixture is dropped after the assertions.
+            unsafe { GuestMem::new(self.buf.as_ptr() as *mut u8, self.buf.len() as u64) }
+        }
+
+        fn walk(&self) -> WalkContext {
+            WalkContext {
+                cr3_pa: 0,
+                page_offset: self.page_offset,
+                l5: false,
+                tcr_el1: 0,
+            }
+        }
+    }
+
+    /// PA constants shared by the chain fixtures.
+    const FIX_IDR_PA: u64 = 0x0000;
+    const FIX_PROG_PA: u64 = 0x1000;
+    const FIX_AUX_PA: u64 = 0x2000;
+
+    /// Build a fixture whose prog_idr holds a single STRUCT_OPS prog
+    /// (single-entry xarray: `xa_head` IS the prog KVA, `idr_next=1`).
+    /// `prog_type` lets a caller override the type to exercise the
+    /// non-struct_ops skip arm. The prog's `aux` pointer is wired but
+    /// the aux body (name, verified_insns, used_maps, stats) is left
+    /// for the caller to populate. Returns the fixture; the
+    /// `prog_idr_kva` for the walk is `FIX_IDR_PA + START_KERNEL_MAP`.
+    fn single_prog_fixture(
+        size: usize,
+        prog_type: u32,
+        offsets: &BpfProgOffsets,
+    ) -> ProgChainFixture {
+        let mut fx = ProgChainFixture::new(size);
+        let prog_kva = fx.pa_to_kva(FIX_PROG_PA);
+        // Single-entry xarray leaf marker: prog_kva must have bits
+        // 0-1 clear so `xa_is_node` treats it as a direct entry.
+        assert_eq!(prog_kva & 3, 0, "prog_kva must be a leaf entry");
+
+        // IDR: xa_head = prog_kva, idr_next = 1.
+        fx.write_u64(FIX_IDR_PA + offsets.idr_xa_head as u64, prog_kva);
+        fx.write_u32(FIX_IDR_PA + offsets.idr_next as u64, 1);
+
+        // bpf_prog: type + aux pointer.
+        fx.write_u32(FIX_PROG_PA + offsets.prog_type as u64, prog_type);
+        fx.write_u64(
+            FIX_PROG_PA + offsets.prog_aux as u64,
+            fx.pa_to_kva(FIX_AUX_PA),
+        );
+        fx
+    }
+
+    // ---- find_struct_ops_progs ----
+
+    /// Happy path: a single STRUCT_OPS prog whose aux carries a name
+    /// and verified_insns count surfaces with both fields read from
+    /// the synthetic offsets. Covers the `find_struct_ops_progs`
+    /// payload closure (aux_verified_insns read + aux_name NUL-scan +
+    /// String build) and the `for_each_struct_ops_prog` happy path.
+    #[test]
+    fn find_struct_ops_progs_single_prog_reads_name_and_verified_insns() {
+        let offsets = synthetic_prog_offsets();
+        let mut fx = single_prog_fixture(0x3000, BPF_PROG_TYPE_STRUCT_OPS, &offsets);
+        fx.write_u32(FIX_AUX_PA + offsets.aux_verified_insns as u64, 12_345);
+        fx.write_name(FIX_AUX_PA + offsets.aux_name as u64, b"dispatch");
+
+        let progs = find_struct_ops_progs(
+            &fx.mem(),
+            fx.walk(),
+            FIX_IDR_PA + START_KERNEL_MAP,
+            &offsets,
+            START_KERNEL_MAP,
+            0,
+        );
+        assert_eq!(progs.len(), 1);
+        assert_eq!(progs[0].name, "dispatch");
+        assert_eq!(progs[0].verified_insns, 12_345u32);
+    }
+
+    /// The `prog_type != BPF_PROG_TYPE_STRUCT_OPS { continue }` filter
+    /// at `for_each_struct_ops_prog` line ~94: a prog whose type is
+    /// not 27 (here KPROBE=2) is skipped before its aux is read, so
+    /// the result is empty.
+    #[test]
+    fn find_struct_ops_progs_skips_non_struct_ops_type() {
+        const BPF_PROG_TYPE_KPROBE: u32 = 2;
+        let offsets = synthetic_prog_offsets();
+        // Populate the aux body too, to prove the skip happens at the
+        // type filter and not because aux was unreadable.
+        let mut fx = single_prog_fixture(0x3000, BPF_PROG_TYPE_KPROBE, &offsets);
+        fx.write_u32(FIX_AUX_PA + offsets.aux_verified_insns as u64, 999);
+        fx.write_name(FIX_AUX_PA + offsets.aux_name as u64, b"kprobe_prog");
+
+        let progs = find_struct_ops_progs(
+            &fx.mem(),
+            fx.walk(),
+            FIX_IDR_PA + START_KERNEL_MAP,
+            &offsets,
+            START_KERNEL_MAP,
+            0,
+        );
+        assert_eq!(progs.len(), 0);
+        assert!(progs.is_empty());
+    }
+
+    /// An all-zero IDR (xa_head left unwritten) yields an empty result:
+    /// `for_each_struct_ops_prog` short-circuits on `xa_head == 0` before
+    /// the id loop, but even without that guard an empty xarray surfaces
+    /// no progs — so this pins the empty-IDR→empty outcome, not the
+    /// short-circuit in isolation. Reached via `find_struct_ops_progs`.
+    #[test]
+    fn for_each_struct_ops_prog_empty_xa_head_returns_empty() {
+        let offsets = synthetic_prog_offsets();
+        // Default-zero buffer: do NOT write xa_head. idr_next is
+        // irrelevant because the xa_head guard fires first.
+        let fx = ProgChainFixture::new(0x3000);
+
+        let progs = find_struct_ops_progs(
+            &fx.mem(),
+            fx.walk(),
+            FIX_IDR_PA + START_KERNEL_MAP,
+            &offsets,
+            START_KERNEL_MAP,
+            0,
+        );
+        assert_eq!(progs.len(), 0);
+        assert!(progs.is_empty());
+    }
+
+    /// A corrupt `idr_next` of `u32::MAX` still returns the correct
+    /// result — the one real prog at id 0 — and terminates, because the
+    /// `.min(65536)` clamp on `idr_next` in `for_each_struct_ops_prog`
+    /// bounds the loop. The single-entry xarray returns the prog for id 0
+    /// and `Some(0)` for every id > 0 (see `idr::xa_load`). This pins the
+    /// RESULT under a corrupt count; a clamp regression would surface as
+    /// a slow run rather than a failed assertion (pinning the exact 65536
+    /// boundary would need a multi-level xarray with an entry past the
+    /// cap — out of scope here).
+    #[test]
+    fn for_each_struct_ops_prog_caps_idr_next_at_65536() {
+        let offsets = synthetic_prog_offsets();
+        let mut fx = single_prog_fixture(0x3000, BPF_PROG_TYPE_STRUCT_OPS, &offsets);
+        // Overwrite idr_next with u32::MAX. Without the .min(65536)
+        // clamp this loop would attempt ~4 billion iterations.
+        fx.write_u32(FIX_IDR_PA + offsets.idr_next as u64, u32::MAX);
+        fx.write_u32(FIX_AUX_PA + offsets.aux_verified_insns as u64, 7);
+        fx.write_name(FIX_AUX_PA + offsets.aux_name as u64, b"capped");
+
+        let progs = find_struct_ops_progs(
+            &fx.mem(),
+            fx.walk(),
+            FIX_IDR_PA + START_KERNEL_MAP,
+            &offsets,
+            START_KERNEL_MAP,
+            0,
+        );
+        assert_eq!(progs.len(), 1);
+        assert_eq!(progs[0].name, "capped");
+        assert_eq!(progs[0].verified_insns, 7u32);
+    }
+
+    // ---- walk_struct_ops_runtime_stats ----
+
+    /// The `if stats_percpu_kva == 0 { return None }` skip at
+    /// `walk_struct_ops_runtime_stats` line ~533: a prog whose
+    /// `prog_stats` per-CPU base is NULL is dropped from the result
+    /// (closure returns None -> not pushed). prog_stats is left
+    /// unwritten (zero) on the single STRUCT_OPS prog.
+    #[test]
+    fn walk_runtime_stats_skips_prog_with_null_stats_pointer() {
+        let offsets = synthetic_prog_offsets();
+        let mut fx = single_prog_fixture(0x3000, BPF_PROG_TYPE_STRUCT_OPS, &offsets);
+        fx.write_name(FIX_AUX_PA + offsets.aux_name as u64, b"no_stats");
+        // Deliberately leave prog_stats == 0 (do not write it).
+
+        let per_cpu_offsets = vec![0u64];
+        let stats = walk_struct_ops_runtime_stats(
+            &fx.mem(),
+            fx.walk(),
+            FIX_IDR_PA + START_KERNEL_MAP,
+            &offsets,
+            &per_cpu_offsets,
+            START_KERNEL_MAP,
+            0,
+        );
+        assert_eq!(stats.len(), 0);
+        assert!(stats.is_empty());
+    }
+
+    /// Multi-CPU accumulation: with two distinct, non-zero per-CPU
+    /// offsets the walker translates both per-CPU `bpf_prog_stats`
+    /// blocks and `saturating_add`s `cnt`/`nsecs`/`misses` across
+    /// them. Covers the per-CPU sum loop at
+    /// `walk_struct_ops_runtime_stats` lines ~544-623 for >1 CPU.
+    #[test]
+    fn walk_runtime_stats_sums_across_two_cpus() {
+        let offsets = synthetic_prog_offsets();
+        // Buffer must hold both stats blocks. stats0 @0x3000,
+        // stats1 @0x3800 — both within a 0x4000 buffer.
+        let stats_pa0: u64 = 0x3000;
+        let stats_pa1: u64 = 0x3800;
+        let mut fx = single_prog_fixture(0x4000, BPF_PROG_TYPE_STRUCT_OPS, &offsets);
+        fx.write_name(FIX_AUX_PA + offsets.aux_name as u64, b"two_cpu");
+        // prog_stats per-CPU base = stats_pa0's KVA. cpu_off shifts it.
+        fx.write_u64(FIX_PROG_PA + offsets.prog_stats as u64, fx.pa_to_kva(stats_pa0));
+
+        // Distinct small counters per block.
+        let cnt0: u64 = 10;
+        let nsecs0: u64 = 100;
+        let misses0: u64 = 1;
+        let cnt1: u64 = 7;
+        let nsecs1: u64 = 70;
+        let misses1: u64 = 3;
+        fx.write_u64(stats_pa0 + offsets.stats_cnt as u64, cnt0);
+        fx.write_u64(stats_pa0 + offsets.stats_nsecs as u64, nsecs0);
+        fx.write_u64(stats_pa0 + offsets.stats_misses as u64, misses0);
+        fx.write_u64(stats_pa1 + offsets.stats_cnt as u64, cnt1);
+        fx.write_u64(stats_pa1 + offsets.stats_nsecs as u64, nsecs1);
+        fx.write_u64(stats_pa1 + offsets.stats_misses as u64, misses1);
+
+        // cpu0: cpu_off=0 reads stats_pa0 (BSP). cpu1: cpu_off=delta
+        // reads stats_pa0+delta = stats_pa1.
+        let per_cpu_offsets = vec![0u64, stats_pa1 - stats_pa0];
+        let stats = walk_struct_ops_runtime_stats(
+            &fx.mem(),
+            fx.walk(),
+            FIX_IDR_PA + START_KERNEL_MAP,
+            &offsets,
+            &per_cpu_offsets,
+            START_KERNEL_MAP,
+            0,
+        );
+        assert_eq!(stats.len(), 1);
+        assert_eq!(stats[0].cnt, cnt0 + cnt1);
+        assert_eq!(stats[0].nsecs, nsecs0 + nsecs1);
+        assert_eq!(stats[0].misses, misses0 + misses1);
+    }
+
+    /// The `if cpu_off == 0 && cpu_index > 0 { continue }` BSS-zero-
+    /// tail guard at `walk_struct_ops_runtime_stats` lines ~556-558:
+    /// a trailing `__per_cpu_offset[]=0` slot (cpu_index > 0) must be
+    /// skipped so CPU 0's stats are NOT double-counted. With
+    /// `per_cpu_offsets = [0, 0]` the summed fields equal the single
+    /// block's values, not twice them — a regression that dropped the
+    /// `cpu_index > 0` guard would double them.
+    #[test]
+    fn walk_runtime_stats_skips_zero_offset_tail_cpu() {
+        let offsets = synthetic_prog_offsets();
+        let stats_pa: u64 = 0x3000;
+        let mut fx = single_prog_fixture(0x4000, BPF_PROG_TYPE_STRUCT_OPS, &offsets);
+        fx.write_name(FIX_AUX_PA + offsets.aux_name as u64, b"bss_tail");
+        fx.write_u64(FIX_PROG_PA + offsets.prog_stats as u64, fx.pa_to_kva(stats_pa));
+
+        let cnt0: u64 = 42;
+        let nsecs0: u64 = 4200;
+        let misses0: u64 = 5;
+        fx.write_u64(stats_pa + offsets.stats_cnt as u64, cnt0);
+        fx.write_u64(stats_pa + offsets.stats_nsecs as u64, nsecs0);
+        fx.write_u64(stats_pa + offsets.stats_misses as u64, misses0);
+
+        // Two slots: cpu0 (cpu_off=0, BSP, allowed) reads stats_pa;
+        // cpu1 (cpu_off=0, cpu_index=1) is skipped by the guard.
+        let per_cpu_offsets = vec![0u64, 0u64];
+        let stats = walk_struct_ops_runtime_stats(
+            &fx.mem(),
+            fx.walk(),
+            FIX_IDR_PA + START_KERNEL_MAP,
+            &offsets,
+            &per_cpu_offsets,
+            START_KERNEL_MAP,
+            0,
+        );
+        assert_eq!(stats.len(), 1);
+        assert_eq!(stats[0].cnt, cnt0);
+        assert_eq!(stats[0].nsecs, nsecs0);
+        assert_eq!(stats[0].misses, misses0);
+    }
+
+    // ---- find_active_struct_ops_obj_no_target ----
+
+    /// PA constants for the active-obj fixture's used_maps array and
+    /// map structs.
+    const FIX_USED_MAPS_PA: u64 = 0x3000;
+    const FIX_MAP0_PA: u64 = 0x4000;
+    const FIX_MAP1_PA: u64 = 0x5000;
+
+    /// Happy path: a STRUCT_OPS prog whose aux->used_maps holds two
+    /// map pointers — a struct_ops map (no global-section suffix) and
+    /// a `<obj>.bss` global-section map — resolves to the obj prefix
+    /// and the full used_map_kvas snapshot. Covers
+    /// `find_active_struct_ops_obj_no_target`: used_maps!=0,
+    /// used_map_cnt!=0, the entries snapshot loop, the per-map name
+    /// read + `extract_global_section_obj_prefix` match.
+    #[test]
+    fn find_active_struct_ops_obj_returns_obj_prefix_from_bss_map() {
+        let prog_offsets = synthetic_prog_offsets();
+        let map_offsets = BpfMapOffsets {
+            map_name: 0,
+            ..BpfMapOffsets::EMPTY
+        };
+        let mut fx = single_prog_fixture(0x6000, BPF_PROG_TYPE_STRUCT_OPS, &prog_offsets);
+
+        // aux->used_maps = used_maps array KVA, used_map_cnt = 2.
+        let map0_kva = fx.pa_to_kva(FIX_MAP0_PA);
+        let map1_kva = fx.pa_to_kva(FIX_MAP1_PA);
+        fx.write_u64(
+            FIX_AUX_PA + prog_offsets.aux_used_maps as u64,
+            fx.pa_to_kva(FIX_USED_MAPS_PA),
+        );
+        fx.write_u32(FIX_AUX_PA + prog_offsets.aux_used_map_cnt as u64, 2);
+        fx.write_u64(FIX_USED_MAPS_PA, map0_kva);
+        fx.write_u64(FIX_USED_MAPS_PA + 8, map1_kva);
+
+        // map0: struct_ops map name (no suffix -> no match).
+        fx.write_name(FIX_MAP0_PA + map_offsets.map_name as u64, b"scx_ktstr_ops");
+        // map1: global-section .bss map (matches -> obj "scx_ktstr").
+        fx.write_name(FIX_MAP1_PA + map_offsets.map_name as u64, b"scx_ktstr.bss");
+
+        let result = find_active_struct_ops_obj_no_target(
+            &fx.mem(),
+            fx.walk(),
+            FIX_IDR_PA + START_KERNEL_MAP,
+            &prog_offsets,
+            &map_offsets,
+            START_KERNEL_MAP,
+            0,
+        );
+        let m = result.unwrap();
+        assert_eq!(m.obj_name, "scx_ktstr");
+        assert_eq!(m.used_map_kvas, vec![map0_kva, map1_kva]);
+    }
+
+    /// The closure-returns-None path: every map in the snapshot is
+    /// scanned but none matches a global-section suffix, so the
+    /// closure returns None and `.into_iter().next()` yields None.
+    /// Distinct from the null-used_maps and zero-cnt early skips.
+    #[test]
+    fn find_active_struct_ops_obj_none_when_no_global_section_map() {
+        let prog_offsets = synthetic_prog_offsets();
+        let map_offsets = BpfMapOffsets {
+            map_name: 0,
+            ..BpfMapOffsets::EMPTY
+        };
+        let mut fx = single_prog_fixture(0x6000, BPF_PROG_TYPE_STRUCT_OPS, &prog_offsets);
+
+        fx.write_u64(
+            FIX_AUX_PA + prog_offsets.aux_used_maps as u64,
+            fx.pa_to_kva(FIX_USED_MAPS_PA),
+        );
+        fx.write_u32(FIX_AUX_PA + prog_offsets.aux_used_map_cnt as u64, 2);
+        fx.write_u64(FIX_USED_MAPS_PA, fx.pa_to_kva(FIX_MAP0_PA));
+        fx.write_u64(FIX_USED_MAPS_PA + 8, fx.pa_to_kva(FIX_MAP1_PA));
+
+        // Both maps lack any .bss/.data/.rodata suffix.
+        fx.write_name(FIX_MAP0_PA + map_offsets.map_name as u64, b"scx_ktstr_ops");
+        fx.write_name(FIX_MAP1_PA + map_offsets.map_name as u64, b"bpf_runq");
+
+        let result = find_active_struct_ops_obj_no_target(
+            &fx.mem(),
+            fx.walk(),
+            FIX_IDR_PA + START_KERNEL_MAP,
+            &prog_offsets,
+            &map_offsets,
+            START_KERNEL_MAP,
+            0,
+        );
+        assert!(result.is_none());
+    }
+
+    /// A STRUCT_OPS prog whose aux->used_maps pointer is NULL yields no
+    /// active obj: `find_active_struct_ops_obj` returns None on the
+    /// `used_maps_kva == 0` skip. The all-zero fixture also has
+    /// used_map_cnt == 0 (whose guard would likewise return None), so
+    /// this pins the NULL-used_maps→None outcome, not that one guard in
+    /// isolation. used_maps is left unwritten (zero).
+    #[test]
+    fn find_active_struct_ops_obj_none_when_used_maps_null() {
+        let prog_offsets = synthetic_prog_offsets();
+        let map_offsets = BpfMapOffsets {
+            map_name: 0,
+            ..BpfMapOffsets::EMPTY
+        };
+        // aux->used_maps left 0; used_map_cnt irrelevant.
+        let fx = single_prog_fixture(0x6000, BPF_PROG_TYPE_STRUCT_OPS, &prog_offsets);
+
+        let result = find_active_struct_ops_obj_no_target(
+            &fx.mem(),
+            fx.walk(),
+            FIX_IDR_PA + START_KERNEL_MAP,
+            &prog_offsets,
+            &map_offsets,
+            START_KERNEL_MAP,
+            0,
+        );
+        assert!(result.is_none());
+    }
+
+    /// The `.min(MAX_USED_MAPS)` clamp on used_map_cnt: a corrupt
+    /// used_map_cnt of 70 (> MAX_USED_MAPS=64) must bound the snapshot
+    /// loop to exactly 64 reads. Entry index 1 is a global-section
+    /// .bss map so the prefix still resolves, but the captured
+    /// used_map_kvas vector is capped at 64. The entries beyond index
+    /// 1 are never translated (the match returns at index 1), so only
+    /// maps 0 and 1 need a real backing struct; the rest are non-zero
+    /// KVAs that only enter the snapshot.
+    #[test]
+    fn find_active_struct_ops_obj_caps_used_map_cnt_at_max_used_maps() {
+        let prog_offsets = synthetic_prog_offsets();
+        let map_offsets = BpfMapOffsets {
+            map_name: 0,
+            ..BpfMapOffsets::EMPTY
+        };
+        let mut fx = single_prog_fixture(0x6000, BPF_PROG_TYPE_STRUCT_OPS, &prog_offsets);
+
+        // used_maps array of 70 non-zero entries (> MAX_USED_MAPS).
+        const CORRUPT_CNT: u32 = 70;
+        let map0_kva = fx.pa_to_kva(FIX_MAP0_PA);
+        let map1_kva = fx.pa_to_kva(FIX_MAP1_PA);
+        fx.write_u64(
+            FIX_AUX_PA + prog_offsets.aux_used_maps as u64,
+            fx.pa_to_kva(FIX_USED_MAPS_PA),
+        );
+        fx.write_u32(FIX_AUX_PA + prog_offsets.aux_used_map_cnt as u64, CORRUPT_CNT);
+        fx.write_u64(FIX_USED_MAPS_PA, map0_kva);
+        fx.write_u64(FIX_USED_MAPS_PA + 8, map1_kva);
+        // Entries 2..70: arbitrary non-zero KVAs (never translated —
+        // the match returns at index 1). They only populate the
+        // snapshot, so the clamp is what bounds the loop.
+        for i in 2..CORRUPT_CNT as u64 {
+            fx.write_u64(FIX_USED_MAPS_PA + i * 8, 0xDEAD_0000 + i);
+        }
+
+        // map0: struct_ops name (no match). map1: .bss (match).
+        fx.write_name(FIX_MAP0_PA + map_offsets.map_name as u64, b"scx_ktstr_ops");
+        fx.write_name(FIX_MAP1_PA + map_offsets.map_name as u64, b"scx_ktstr.bss");
+
+        let result = find_active_struct_ops_obj_no_target(
+            &fx.mem(),
+            fx.walk(),
+            FIX_IDR_PA + START_KERNEL_MAP,
+            &prog_offsets,
+            &map_offsets,
+            START_KERNEL_MAP,
+            0,
+        );
+        let m = result.unwrap();
+        assert_eq!(m.obj_name, "scx_ktstr");
+        assert!(m.used_map_kvas.len() <= MAX_USED_MAPS as usize);
+        assert_eq!(m.used_map_kvas.len(), 64);
+    }
 }

@@ -9117,3 +9117,192 @@ fn percpu_entry_display_fallback_marks_unmapped_cpus() {
         "unmapped CPU must be listed in the fallback tail: {out}",
     );
 }
+
+// -- count_global_sections_for_prefix ------------------------------
+//
+// The classifier is only exercised transitively through
+// `identify_active_obj_from_struct_ops` today; the per-section count
+// math and the STRUCT_OPS-skip arm are never asserted in isolation.
+
+/// Direct count: full-name equality classifies each section, the
+/// STRUCT_OPS map is skipped, and a `<prefix>.bss.shared` map is NOT
+/// counted as a `.bss` (the comparison is `n == "<prefix>.bss"`, not
+/// a prefix match). A `sched.bss` STRUCT_OPS map must NOT inflate the
+/// `.bss` total — only the ARRAY `sched.bss` counts.
+#[test]
+fn count_global_sections_for_prefix_skips_struct_ops_and_uses_full_name_equality() {
+    let maps = vec![
+        synthetic_global_section_map(0xa000, "sched.bss"),
+        synthetic_global_section_map(0xb000, "sched.data"),
+        synthetic_global_section_map(0xc000, "sched.bss.shared"),
+        synthetic_struct_ops_map(0xd000, "sched.bss", 0xe000),
+    ];
+    // (bss, data, rodata): one real `.bss` (struct_ops `sched.bss`
+    // excluded; `sched.bss.shared` is not `sched.bss`), one `.data`,
+    // zero `.rodata`.
+    assert_eq!(
+        super::count_global_sections_for_prefix(&maps, "sched"),
+        (1usize, 1usize, 0usize),
+    );
+}
+
+// -- is_scx_allocator_type / is_scx_static_type --------------------
+//
+// Both name-match helpers are only reached inside dump_state's
+// sdt_alloc / scx_static pre-passes, which need a live guest
+// snapshot. The name-match-vs-wrong-name-vs-non-struct decisions are
+// otherwise unpinned; a copy-paste literal regression would ship
+// undetected. `build_btf_with_named_struct` emits a 2-type blob:
+// id 1 = BTF_KIND_INT u64, id 2 = the named BTF_KIND_STRUCT.
+
+/// Struct-name match arm returns true only for `scx_allocator`; a
+/// wrong-name struct is rejected, and passing the INT type id (1)
+/// drives the `_ => return false` non-struct arm.
+#[test]
+fn is_scx_allocator_type_matches_named_struct_and_rejects_wrong_name_and_non_struct() {
+    let (blob_ok, struct_id) = build_btf_with_named_struct("scx_allocator");
+    let btf_ok = btf_rs::Btf::from_bytes(&blob_ok).expect("synthetic BTF parses");
+    assert!(super::is_scx_allocator_type(&btf_ok, struct_id));
+
+    let (blob_bad, other_id) = build_btf_with_named_struct("scx_other");
+    let btf_bad = btf_rs::Btf::from_bytes(&blob_bad).expect("synthetic BTF parses");
+    assert!(!super::is_scx_allocator_type(&btf_bad, other_id));
+
+    // Type id 1 is the BTF_KIND_INT u64 → non-struct `_` arm → false.
+    assert!(!super::is_scx_allocator_type(&btf_ok, 1));
+}
+
+/// Mirror of [`is_scx_allocator_type`] but matching `scx_static`.
+/// The cross-name negative (a `scx_allocator` struct must be false)
+/// guards against a copy-paste bug where `is_scx_static_type`
+/// compares against the wrong literal.
+#[test]
+fn is_scx_static_type_matches_named_struct_and_rejects_others() {
+    let (blob, struct_id) = build_btf_with_named_struct("scx_static");
+    let btf = btf_rs::Btf::from_bytes(&blob).expect("synthetic BTF parses");
+    assert!(super::is_scx_static_type(&btf, struct_id));
+
+    // INT type id 1 → non-struct `_` arm → false.
+    assert!(!super::is_scx_static_type(&btf, 1));
+
+    // Wrong-name struct (`scx_allocator`) must be rejected — pins the
+    // literal so a copy-paste of the allocator helper is caught.
+    let (b2, id2) = build_btf_with_named_struct("scx_allocator");
+    let btf2 = btf_rs::Btf::from_bytes(&b2).expect("synthetic BTF parses");
+    assert!(!super::is_scx_static_type(&btf2, id2));
+}
+
+// -- iter_bss_vars_with_type ---------------------------------------
+//
+// Both paths are uncovered: the Datasec→Var walk that yields
+// (name, offset, type_id) tuples, and the early-return-empty path
+// when `resolve_types_by_name` finds no matching section. Loads the
+// real probe BTF produced by build.rs at OUT_DIR/probe.o — the same
+// host-side fixture pattern as
+// `btf_render/tests/datasec_cpumask.rs::load_probe_btf_and_bss_id`.
+// The `.bss` var names (ktstr_err_exit_detected, ktstr_pcpu_counters)
+// are pinned as `.bss` members by that sibling test, so they are a
+// stable ground-truth set.
+
+/// The Datasec walk enumerates every `.bss` variable name; an
+/// unknown section name returns an empty Vec (the early-return path).
+#[test]
+fn iter_bss_vars_with_type_enumerates_probe_bss_vars() {
+    let probe = std::path::PathBuf::from(env!("OUT_DIR")).join("probe.o");
+    let btf = crate::monitor::btf_offsets::load_btf_from_path(&probe).unwrap_or_else(|e| {
+        panic!(
+            "load_btf_from_path({}) failed: {e}. build.rs always \
+             produces probe.o; a missing or unparseable artifact \
+             means the build pipeline is broken.",
+            probe.display()
+        )
+    });
+    let vars = super::iter_bss_vars_with_type(&btf, ".bss");
+    let names: std::collections::HashSet<&str> = vars.iter().map(|(n, _, _)| n.as_str()).collect();
+    assert!(
+        names.contains("ktstr_err_exit_detected") && names.contains("ktstr_pcpu_counters"),
+        "Datasec walk must enumerate the probe `.bss` vars. Found: {names:?}",
+    );
+    // Unknown section name → resolve_types_by_name finds nothing →
+    // empty iterator path.
+    assert!(super::iter_bss_vars_with_type(&btf, ".no_such_section").is_empty());
+}
+
+// -- EventCounterSample::from_monitor_sample (overflow clamp) -------
+//
+// The existing `event_counter_sample_sums_across_cpus` test only
+// sums small values, so the documented `saturating_add pins the sum
+// at i64::MAX rather than wrapping/panicking` contract is never
+// triggered. Two CPUs whose per-CPU s64 counter is near i64::MAX
+// would overflow plain `+`.
+
+/// Two CPUs each carrying `select_cpu_fallback = i64::MAX`: the sum
+/// clamps at i64::MAX (saturating_add) rather than wrapping to a
+/// negative or panicking. Plain `+` would overflow.
+#[test]
+fn event_counter_sample_saturates_at_i64_max_across_cpus() {
+    use super::super::{CpuSnapshot, MonitorSample, ScxEventCounters};
+    let big = ScxEventCounters {
+        select_cpu_fallback: i64::MAX,
+        ..Default::default()
+    };
+    let sample = MonitorSample {
+        elapsed_ms: 7,
+        cpus: vec![
+            CpuSnapshot {
+                event_counters: Some(big.clone()),
+                ..Default::default()
+            },
+            CpuSnapshot {
+                event_counters: Some(big),
+                ..Default::default()
+            },
+        ],
+        prog_stats: None,
+    };
+    let folded = EventCounterSample::from_monitor_sample(&sample)
+        .expect("at least one CPU has event_counters");
+    // Clamped, not wrapped to a negative.
+    assert_eq!(folded.select_cpu_fallback, i64::MAX);
+    assert_eq!(folded.elapsed_ms, 7);
+}
+
+// -- FailureDumpReport::placeholder --------------------------------
+//
+// The constructor is uncovered (0 refs to `.placeholder`). Its
+// contract — same reason cloned into all five `*_unavailable`
+// fields, `is_placeholder = true`, schema stays SCHEMA_SINGLE via
+// `..Self::default()`, every data vec empty — is unverified. A field
+// dropped from the fan-out would make a degraded capture
+// indistinguishable from a real empty dump.
+
+/// Placeholder fans the reason into all five `*_unavailable` fields,
+/// flips `is_placeholder`, keeps `schema == SCHEMA_SINGLE`, and
+/// leaves the data vecs empty.
+#[test]
+fn placeholder_report_sets_all_unavailable_reasons_and_flag() {
+    let r = FailureDumpReport::placeholder("rendezvous timed out");
+    assert_eq!(r.schema, SCHEMA_SINGLE);
+    assert!(r.is_placeholder);
+    assert_eq!(
+        r.prog_runtime_stats_unavailable.as_deref(),
+        Some("rendezvous timed out")
+    );
+    assert_eq!(
+        r.per_node_numa_unavailable.as_deref(),
+        Some("rendezvous timed out")
+    );
+    assert_eq!(
+        r.task_enrichments_unavailable.as_deref(),
+        Some("rendezvous timed out")
+    );
+    assert_eq!(
+        r.scx_walker_unavailable.as_deref(),
+        Some("rendezvous timed out")
+    );
+    assert_eq!(
+        r.sdt_alloc_unavailable.as_deref(),
+        Some("rendezvous timed out")
+    );
+    assert!(r.maps.is_empty() && r.prog_runtime_stats.is_empty());
+}

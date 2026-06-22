@@ -2998,4 +2998,549 @@ mod tests {
              bash@{bash_pos} zulu@{zulu_pos}\nafter:\n{after}",
         );
     }
+
+    /// Build the canonical single-cgroup fixture: one thread
+    /// pinned to `/app` so `build_groups` produces a `Cgroup`
+    /// bucket and `write_show`'s cgroup-stats sub-tables render.
+    /// Mirrors the per-field-assignment pattern the existing
+    /// cgroup test uses (the `ktstr` binary is a separate
+    /// translation unit from `ctprof`, so the `#[non_exhaustive]`
+    /// markers on `CtprofSnapshot` / `ThreadState` / `CgroupStats`
+    /// block struct-literal construction here). The caller mutates
+    /// the returned `CgroupStats` and inserts it under `/app`.
+    fn cgroup_fixture() -> (ktstr::ctprof::CtprofSnapshot, ktstr::ctprof::CgroupStats) {
+        let mut snap = ktstr::ctprof::CtprofSnapshot::default();
+        let mut t = ktstr::ctprof::ThreadState::default();
+        t.pcomm = "worker".to_string();
+        t.comm = "w".to_string();
+        t.cgroup = "/app".to_string();
+        snap.threads.push(t);
+        (snap, ktstr::ctprof::CgroupStats::default())
+    }
+
+    /// `write_show` under `GroupBy::Cgroup` emits the
+    /// `## Cgroup limits / knobs` sub-table when at least one
+    /// bucketed cgroup exposes a cpu.max / weight / memory.max /
+    /// pids value. Pins the `stats.values().any(...)` section gate
+    /// (line 1178) and each cell's formatter routing:
+    /// `format_cpu_max` for the cpu.max pair, `format_scaled_u64`
+    /// for the unitless weight / pids.current, `format_optional_limit`
+    /// for memory.max (`Some` → scaled) and for memory.high /
+    /// pids.max (`None` → the `max` token). The existing
+    /// cgroup-stats test sets only cpu.usage / memory.current, so
+    /// this whole block is otherwise dead in tests.
+    #[test]
+    fn write_show_emits_cgroup_limits_table_with_scaled_knobs() {
+        let (mut snap, mut cgs) = cgroup_fixture();
+        // cpu.max quota=50_000µs period=100_000µs →
+        // format_cpu_max → "50.000ms/100.000ms".
+        cgs.cpu.max_quota_us = Some(50_000);
+        cgs.cpu.max_period_us = 100_000;
+        // cpu.weight=200 → format_scaled_u64(200, Unitless),
+        // below the 1e3 ladder step → bare "200".
+        cgs.cpu.weight = Some(200);
+        // memory.max=2 GiB → format_optional_limit(Some, Bytes)
+        // → "2.000GiB". memory.high=None → "max".
+        cgs.memory.max = Some(2 * 1024 * 1024 * 1024);
+        // memory.current must be set so the CgroupStats sub-table
+        // gate (non-empty cgroup_stats) is satisfied; the limits
+        // gate is independent but the fixture stays realistic.
+        cgs.memory.current = 1;
+        // pids.current=7 → format_scaled_u64(7, Unitless) → "7".
+        // pids.max=None → format_optional_limit(None, Unitless)
+        // → "max".
+        cgs.pids.current = Some(7);
+        snap.cgroup_stats.insert("/app".to_string(), cgs);
+
+        let mut out = String::new();
+        write_show(
+            &mut out,
+            &snap,
+            ctprof_compare::GroupBy::Cgroup,
+            &[],
+            false,
+            false,
+            &[],
+            &[],
+            &[],
+            &[],
+            false,
+        )
+        .expect("write_show into String must not fail");
+
+        assert!(
+            out.contains("## Cgroup limits / knobs"),
+            "limits section must render when a cgroup exposes a knob:\n{out}",
+        );
+        assert!(
+            out.contains("50.000ms/100.000ms"),
+            "cpu.max 50_000µs/100_000µs must render via format_cpu_max \
+             as '50.000ms/100.000ms':\n{out}",
+        );
+        assert!(
+            out.contains(" 200 "),
+            "cpu.weight 200 must render via format_scaled_u64(Unitless) \
+             as the bare integer 200:\n{out}",
+        );
+        assert!(
+            out.contains("2.000GiB"),
+            "memory.max 2 GiB must render via format_optional_limit(Bytes) \
+             as '2.000GiB':\n{out}",
+        );
+        assert!(
+            out.contains(" 7 "),
+            "pids.current 7 must render via format_scaled_u64(Unitless) \
+             as the bare integer 7:\n{out}",
+        );
+        // memory.high=None and pids.max=None both render the `max`
+        // token (format_optional_limit's None arm). The column
+        // headers (`cpu.max`, `memory.max`, `pids.max`) carry
+        // `max` as a substring of a dotted token, so assert the
+        // space-padded standalone cell `" max "` to prove the
+        // None→`max` rendering rather than matching a header.
+        assert!(
+            out.contains(" max "),
+            "memory.high=None / pids.max=None must render the standalone \
+             `max` cell via format_optional_limit's None arm:\n{out}",
+        );
+    }
+
+    /// `write_show` under `GroupBy::Cgroup` emits the
+    /// `## memory.stat` long-table and suppresses zero-valued
+    /// rows. Pins the section gate (line 1269,
+    /// `any(|v| *v != 0)`) and the per-row
+    /// `if *stat_value == 0 { continue; }` skip (line 1280): a
+    /// non-zero `anon` key renders one row (`format_scaled_u64`
+    /// steps `4096` up to `4.096K`), while a zero `file` key is
+    /// suppressed entirely.
+    #[test]
+    fn write_show_emits_memory_stat_table_suppressing_zero_rows() {
+        let (mut snap, mut cgs) = cgroup_fixture();
+        cgs.memory.stat.insert("anon".to_string(), 4096);
+        cgs.memory.stat.insert("file".to_string(), 0);
+        snap.cgroup_stats.insert("/app".to_string(), cgs);
+
+        let mut out = String::new();
+        write_show(
+            &mut out,
+            &snap,
+            ctprof_compare::GroupBy::Cgroup,
+            &[],
+            false,
+            false,
+            &[],
+            &[],
+            &[],
+            &[],
+            false,
+        )
+        .expect("write_show into String must not fail");
+
+        assert!(
+            out.contains("## memory.stat"),
+            "memory.stat section must render when any key is non-zero:\n{out}",
+        );
+        assert!(
+            out.contains("anon"),
+            "non-zero `anon` key must render a row:\n{out}",
+        );
+        assert!(
+            out.contains("4.096K"),
+            "anon=4096 must render via format_scaled_u64(Unitless) \
+             stepping up to '4.096K':\n{out}",
+        );
+        assert!(
+            !out.contains("file"),
+            "zero-valued `file` key must be suppressed by the line-1280 \
+             continue:\n{out}",
+        );
+    }
+
+    /// `write_show` under `GroupBy::Cgroup` emits the
+    /// `## memory.events` long-table and suppresses zero-count
+    /// events. Pins the section gate (line 1300) and the per-row
+    /// `if *event_value == 0 { continue; }` skip (line 1311): a
+    /// non-zero `oom_kill` event renders one row (`3` below the
+    /// 1e3 ladder step → bare integer), while a zero `low` event
+    /// is suppressed.
+    #[test]
+    fn write_show_emits_memory_events_table_suppressing_zero_rows() {
+        let (mut snap, mut cgs) = cgroup_fixture();
+        cgs.memory.events.insert("oom_kill".to_string(), 3);
+        cgs.memory.events.insert("low".to_string(), 0);
+        snap.cgroup_stats.insert("/app".to_string(), cgs);
+
+        let mut out = String::new();
+        write_show(
+            &mut out,
+            &snap,
+            ctprof_compare::GroupBy::Cgroup,
+            &[],
+            false,
+            false,
+            &[],
+            &[],
+            &[],
+            &[],
+            false,
+        )
+        .expect("write_show into String must not fail");
+
+        assert!(
+            out.contains("## memory.events"),
+            "memory.events section must render when any event is non-zero:\n{out}",
+        );
+        assert!(
+            out.contains("oom_kill"),
+            "non-zero `oom_kill` event must render a row:\n{out}",
+        );
+        assert!(
+            out.contains(" 3 "),
+            "oom_kill=3 must render via format_scaled_u64(Unitless) \
+             as the bare integer 3:\n{out}",
+        );
+        assert!(
+            !out.contains("low"),
+            "zero-count `low` event must be suppressed by the line-1311 \
+             continue:\n{out}",
+        );
+    }
+
+    /// `write_show` under `GroupBy::Cgroup` emits per-cgroup
+    /// `## Pressure / <resource>` sub-tables and skips resources
+    /// with no data. Pins the section gate (line 1340), the
+    /// per-resource `if !any_data { continue; }` skip (line 1346),
+    /// and the `some`/`full` row rendering via `format_psi_avg`
+    /// (centi-percent → `N.NN%`) + `format_scaled_u64(Us)`. Only
+    /// `cpu.some` is populated, so the `cpu` sub-table renders
+    /// while `memory` / `io` (all-zero) are skipped.
+    #[test]
+    fn write_show_emits_per_cgroup_pressure_tables_skipping_zero_resources() {
+        let (mut snap, mut cgs) = cgroup_fixture();
+        // cpu.some.avg10=1859 centi-percent → format_psi_avg →
+        // "18.59%". cpu.some.total_usec=1_500_000 →
+        // format_scaled_u64(Us) → "1.500s".
+        cgs.psi.cpu.some.avg10 = 1859;
+        cgs.psi.cpu.some.total_usec = 1_500_000;
+        snap.cgroup_stats.insert("/app".to_string(), cgs);
+
+        let mut out = String::new();
+        write_show(
+            &mut out,
+            &snap,
+            ctprof_compare::GroupBy::Cgroup,
+            &[],
+            false,
+            false,
+            &[],
+            &[],
+            &[],
+            &[],
+            false,
+        )
+        .expect("write_show into String must not fail");
+
+        assert!(
+            out.contains("## Pressure / cpu"),
+            "cpu pressure sub-table must render when cpu PSI has data:\n{out}",
+        );
+        assert!(
+            out.contains("18.59%"),
+            "cpu.some.avg10=1859 must render via format_psi_avg as '18.59%':\n{out}",
+        );
+        assert!(
+            out.contains("1.500s"),
+            "cpu.some.total_usec=1_500_000 must render via \
+             format_scaled_u64(Us) as '1.500s':\n{out}",
+        );
+        assert!(
+            out.contains("some"),
+            "the `some` PSI row must render:\n{out}",
+        );
+        assert!(
+            out.contains("full"),
+            "the `full` PSI row must render:\n{out}",
+        );
+        assert!(
+            !out.contains("## Pressure / memory"),
+            "all-zero memory PSI must be skipped by the line-1346 \
+             any_data continue:\n{out}",
+        );
+        assert!(
+            !out.contains("## Pressure / io"),
+            "all-zero io PSI must be skipped by the line-1346 \
+             any_data continue:\n{out}",
+        );
+    }
+
+    /// `write_show` emits host-level `## Host pressure / <resource>`
+    /// sub-tables (group-by-independent) and skips resources with
+    /// no data. Pins the section gate (line 1388,
+    /// `host_psi_has_data`), the per-resource
+    /// `if !psi_resource_has_data(&r) { continue; }` skip
+    /// (line 1393), and the `some`/`full` row render. Only
+    /// `memory.full` is populated, so the `memory` sub-table
+    /// renders while `cpu` (all-zero) is skipped. The host PSI
+    /// header is `row | avg10 | avg60 | avg300 | total` with no
+    /// `cgroup` column — assert the cgroup token is absent from
+    /// the host-pressure region.
+    #[test]
+    fn write_show_emits_host_pressure_tables_skipping_zero_resources() {
+        let mut snap = ktstr::ctprof::CtprofSnapshot::default();
+        // A thread keeps the primary table populated, but the host
+        // PSI block is independent of grouping.
+        let mut t = ktstr::ctprof::ThreadState::default();
+        t.pcomm = "worker".to_string();
+        t.comm = "w".to_string();
+        snap.threads.push(t);
+        // memory.full.avg60=500 centi-percent → format_psi_avg →
+        // "5.00%". memory.full.total_usec=2_000_000 →
+        // format_scaled_u64(Us) → "2.000s".
+        snap.psi.memory.full.avg60 = 500;
+        snap.psi.memory.full.total_usec = 2_000_000;
+
+        let mut out = String::new();
+        write_show(
+            &mut out,
+            &snap,
+            ctprof_compare::GroupBy::Pcomm,
+            &[],
+            false,
+            false,
+            &[],
+            &[],
+            &[],
+            &[],
+            false,
+        )
+        .expect("write_show into String must not fail");
+
+        let host_at = out
+            .find("## Host pressure / memory")
+            .expect("host memory pressure sub-table must render");
+        assert!(
+            out.contains("5.00%"),
+            "memory.full.avg60=500 must render via format_psi_avg as '5.00%':\n{out}",
+        );
+        assert!(
+            out.contains("2.000s"),
+            "memory.full.total_usec=2_000_000 must render via \
+             format_scaled_u64(Us) as '2.000s':\n{out}",
+        );
+        assert!(
+            !out.contains("## Host pressure / cpu"),
+            "all-zero host cpu PSI must be skipped by the line-1393 \
+             psi_resource_has_data continue:\n{out}",
+        );
+        // The host-pressure header omits the `cgroup` column the
+        // per-cgroup PSI tables carry. Slice from the host-pressure
+        // index so a `cgroup` token elsewhere in the output (the
+        // primary table never carries one under Pcomm, but be
+        // precise) cannot mask a regression that re-added the
+        // column to the host header.
+        let host_region = &out[host_at..];
+        assert!(
+            !host_region.contains("cgroup"),
+            "host pressure header is `row | avg10 | avg60 | avg300 | total` \
+             with no cgroup column:\n{host_region}",
+        );
+    }
+
+    /// `write_show` emits the `## sched_ext` table when the
+    /// snapshot carries `sched_ext = Some(..)`. Pins the section
+    /// gate (line 1513), the non-empty-state branch of the
+    /// `state_cell` ternary (line 1524 — `state="enabled"` renders
+    /// verbatim, NOT the `-` sentinel), and the five counter rows
+    /// rendered via `format_scaled_u64(Unitless)`
+    /// (`enable_seq=1234` steps up to `1.234K`; `switch_all=1`
+    /// stays the bare integer). `snap.sched_ext` defaults to
+    /// `None`, so this block is otherwise dead in tests. The
+    /// counter-cell assertions are sliced from the `## sched_ext`
+    /// index so the single-digit cells (`switch_all=1`) can't
+    /// match the primary table's threads count.
+    #[test]
+    fn write_show_emits_sched_ext_table_with_state_and_scaled_counters() {
+        let mut snap = ktstr::ctprof::CtprofSnapshot::default();
+        let mut t = ktstr::ctprof::ThreadState::default();
+        t.pcomm = "worker".to_string();
+        t.comm = "w".to_string();
+        snap.threads.push(t);
+        // `SchedExtSysfs` is `#[non_exhaustive]` in the lib — build
+        // via Default + per-field assignment.
+        let mut scx = ktstr::ctprof::SchedExtSysfs::default();
+        scx.state = "enabled".to_string();
+        scx.switch_all = 1;
+        scx.nr_rejected = 2;
+        scx.hotplug_seq = 3;
+        scx.enable_seq = 1234;
+        snap.sched_ext = Some(scx);
+
+        let mut out = String::new();
+        write_show(
+            &mut out,
+            &snap,
+            ctprof_compare::GroupBy::Pcomm,
+            &[],
+            false,
+            false,
+            &[],
+            &[],
+            &[],
+            &[],
+            false,
+        )
+        .expect("write_show into String must not fail");
+
+        let scx_at = out
+            .find("## sched_ext")
+            .expect("sched_ext section must render when snap.sched_ext is Some");
+        let scx_region = &out[scx_at..];
+        assert!(
+            scx_region.contains("state"),
+            "sched_ext table must carry the `state` attr row:\n{scx_region}",
+        );
+        assert!(
+            scx_region.contains("enabled"),
+            "non-empty state must render verbatim ('enabled'), NOT the `-` \
+             sentinel:\n{scx_region}",
+        );
+        assert!(
+            scx_region.contains("switch_all"),
+            "sched_ext table must carry the `switch_all` row:\n{scx_region}",
+        );
+        assert!(
+            scx_region.contains("nr_rejected"),
+            "sched_ext table must carry the `nr_rejected` row:\n{scx_region}",
+        );
+        assert!(
+            scx_region.contains("1.234K"),
+            "enable_seq=1234 must render via format_scaled_u64(Unitless) \
+             stepping up to '1.234K':\n{scx_region}",
+        );
+        assert!(
+            scx_region.contains(" 1 "),
+            "switch_all=1 must render via format_scaled_u64(Unitless) \
+             as the bare integer 1:\n{scx_region}",
+        );
+    }
+
+    /// `write_show` with a non-empty `sections` whitelist
+    /// restricts output to the named sections. Pins the
+    /// restrict-to-named-entries branch of
+    /// `DisplayOptions::is_section_enabled`: `--sections derived`
+    /// suppresses the `## Primary metrics` outer gate (line 972 —
+    /// neither Primary nor TaskstatsDelay enabled) while still
+    /// emitting `## Derived metrics`; the converse
+    /// `--sections primary` does the inverse. Every existing
+    /// write_show test passes `&[]` (empty = all-on), so this
+    /// branch is otherwise uncovered. The fixture mirrors
+    /// `write_show_emits_derived_section` so `avg_slice_ns`
+    /// resolves to a real derived row.
+    #[test]
+    fn write_show_sections_filter_suppresses_unnamed_sections() {
+        let mut snap = ktstr::ctprof::CtprofSnapshot::default();
+        let mut t = ktstr::ctprof::ThreadState::default();
+        t.pcomm = "worker".to_string();
+        t.comm = "w".to_string();
+        t.run_time_ns = MonotonicNs(4_000);
+        t.timeslices = MonotonicCount(8);
+        snap.threads.push(t);
+
+        // `--sections derived`: Primary outer gate is false
+        // (neither Primary nor TaskstatsDelay enabled), Derived
+        // gate is true.
+        let mut derived_only = String::new();
+        write_show(
+            &mut derived_only,
+            &snap,
+            ctprof_compare::GroupBy::Pcomm,
+            &[],
+            false,
+            false,
+            &[],
+            &[],
+            &[ctprof_compare::Section::Derived],
+            &[],
+            false,
+        )
+        .expect("write_show into String must not fail");
+        assert!(
+            !derived_only.contains("## Primary metrics"),
+            "`--sections derived` must suppress the Primary section:\n{derived_only}",
+        );
+        assert!(
+            derived_only.contains("## Derived metrics"),
+            "`--sections derived` must still emit the Derived section:\n{derived_only}",
+        );
+
+        // Converse: `--sections primary` emits Primary, suppresses
+        // Derived.
+        let mut primary_only = String::new();
+        write_show(
+            &mut primary_only,
+            &snap,
+            ctprof_compare::GroupBy::Pcomm,
+            &[],
+            false,
+            false,
+            &[],
+            &[],
+            &[ctprof_compare::Section::Primary],
+            &[],
+            false,
+        )
+        .expect("write_show into String must not fail");
+        assert!(
+            primary_only.contains("## Primary metrics"),
+            "`--sections primary` must emit the Primary section:\n{primary_only}",
+        );
+        assert!(
+            !primary_only.contains("## Derived metrics"),
+            "`--sections primary` must suppress the Derived section:\n{primary_only}",
+        );
+    }
+
+    /// `run_show` parses `--sort-by` BEFORE loading the snapshot
+    /// (lines 769-797): an invalid spec must surface its parse
+    /// error even when the snapshot path does not exist, proving
+    /// the parse precedes the load. Pins the fail-fast ordering
+    /// contract — the flattened error chain carries the
+    /// `parse --sort-by` context label (line 770) and NOT the
+    /// `load snapshot` label (line 797). No existing test drives
+    /// `run_show`; the parse guards are otherwise uncovered.
+    #[test]
+    fn run_show_fails_fast_on_invalid_sort_by_before_snapshot_load() {
+        let args = CtprofShowArgs {
+            snapshot: std::path::PathBuf::from("/nonexistent/snap.ctprof.zst"),
+            group_by: ShowGroupBy::Pcomm,
+            cgroup_flatten: vec![],
+            no_thread_normalize: false,
+            no_cg_normalize: false,
+            // Invalid direction `bogusdir` makes parse_sort_by bail
+            // before the snapshot is touched.
+            sort_by: "not_a_metric:bogusdir".to_string(),
+            columns: String::new(),
+            sections: String::new(),
+            metrics: String::new(),
+            wrap: false,
+            limit: 0,
+        };
+        let err = run_show(&args).expect_err(
+            "an invalid --sort-by spec must fail before the absent snapshot \
+             is loaded",
+        );
+        // `{:#}` flattens the anyhow context chain so the
+        // context-label substrings are reachable.
+        let flat = format!("{err:#}");
+        assert!(
+            flat.contains("parse --sort-by"),
+            "error must come from the sort-by parser (the `parse --sort-by` \
+             with_context label), got: {flat}",
+        );
+        assert!(
+            !flat.contains("load snapshot"),
+            "the snapshot load must not run — its `load snapshot` context \
+             label must be absent, proving the parse fails first, got: {flat}",
+        );
+    }
 }

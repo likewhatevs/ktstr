@@ -2391,3 +2391,142 @@ fn print_download_size_without_content_length_omits_mib() {
         "no-Content-Length form must NOT mention MiB: {captured:?}",
     );
 }
+
+// -- sha256sums_url --
+
+/// `sha256sums_url` builds the cdn.kernel.org manifest URL for a
+/// stable major series: `.../v{major}.x/sha256sums.asc`. It is the
+/// single source of truth for the URL shape `resolve_expected_sha256`
+/// passes to `resolve_expected_sha256_from_url`; every checksum test
+/// injects its own mock URL via the `_from_url` seam, so the real
+/// builder has no other coverage. A silent drift (wrong dir segment,
+/// missing `/v`, wrong `.asc` name) would 404 every production
+/// checksum fetch and downgrade verification to a warning with no
+/// test catching it. Pin the full string for two distinct majors so
+/// the `{major}` interpolation is exercised, not just the literal
+/// scaffold.
+#[test]
+fn sha256sums_url_builds_cdn_manifest_url() {
+    assert_eq!(
+        super::sha256sums_url(6),
+        "https://cdn.kernel.org/pub/linux/kernel/v6.x/sha256sums.asc",
+        "major 6 must map to the v6.x manifest URL",
+    );
+    assert_eq!(
+        super::sha256sums_url(5),
+        "https://cdn.kernel.org/pub/linux/kernel/v5.x/sha256sums.asc",
+        "the {{major}} segment must interpolate (v5.x), not be a fixed literal",
+    );
+}
+
+// -- canonical_path_hash --
+
+/// `canonical_path_hash` returns the full 8-char (32-bit) lowercase-hex
+/// IEEE-CRC32 of the path's encoded bytes. Only indirectly exercised by
+/// `compose_local_cache_key_unknown_uses_path_hash_only`, which asserts
+/// the SHAPE (8 hex chars) but NOT the VALUE — a regression that
+/// truncated to 24 bits, swapped to a non-deterministic hasher, or
+/// changed the width would pass that shape check yet corrupt the
+/// cross-run cache-key stability and per-source-tree flock-name
+/// disambiguation the doc promises. Pin the exact CRC32 for two ASCII
+/// paths (ASCII so `as_encoded_bytes` equals the str bytes on every
+/// platform), plus an inequality arm mirroring the per-path-salt
+/// distinctness invariant.
+#[test]
+fn canonical_path_hash_is_full_crc32_lowercase_hex() {
+    // CRC32 (IEEE polynomial, identical to crc32fast::hash) over the
+    // ASCII bytes of each path, lowercase 8-char hex.
+    let h_anywhere = super::canonical_path_hash(std::path::Path::new("/anywhere"));
+    let h_some_path = super::canonical_path_hash(std::path::Path::new("/some/path"));
+    assert_eq!(
+        h_anywhere, "8b09f613",
+        "CRC32 of b\"/anywhere\" must be the full 8-char lowercase hex",
+    );
+    assert_eq!(
+        h_some_path, "46e02226",
+        "CRC32 of b\"/some/path\" must be the full 8-char lowercase hex",
+    );
+    // Leading-zero CRC32 (< 0x10000000): pins the {:08x} zero-PADDING —
+    // a `{:x}` regression would drop the leading 0 (7 chars, not 8).
+    assert_eq!(
+        super::canonical_path_hash(std::path::Path::new("/p50")),
+        "090cfa3e",
+        "a leading-zero CRC32 must render 8 chars (zero-padded), not 7",
+    );
+    // Distinctness: two different paths must produce different salts —
+    // without per-path distinctness, two dirty/non-git trees would
+    // collapse to the same local-unknown cache slot and flock name.
+    assert_ne!(
+        h_anywhere, h_some_path,
+        "distinct paths must produce distinct path-hash salts",
+    );
+}
+
+// -- config_hash_for_key --
+
+/// `config_hash_for_key` returns `None` when no `<dir>/.config` exists.
+/// This `None` is load-bearing: `compose_local_cache_key` collapses to
+/// the cfg-less legacy key shape on `None`, so a fresh checkout's first
+/// build (no `.config` yet) shares a cache slot with a later lookup. A
+/// regression that returned `Some(crc of empty)` instead of `None`
+/// would split that slot and silently miss the cache. Fixture is a
+/// fresh empty TempDir with no `.config`; the fn only reads
+/// `<dir>/.config` (no gix, no network, no ancestor-git walk).
+#[test]
+fn config_hash_for_key_returns_none_when_no_dotconfig() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    assert_eq!(
+        super::config_hash_for_key(tmp.path()),
+        None,
+        "absent .config must return None so the cache key collapses to \
+             the legacy cfg-less shape",
+    );
+}
+
+/// `config_hash_for_key` returns `Some(crc32_of_config_bytes)` (8-char
+/// lowercase hex) over the raw `.config` file contents when the file is
+/// present. Pins the doc's contract that the cache key folds in the
+/// PRE-BUILD `.config` so two builds of the same HEAD with different
+/// `.config` files do not collide — and that the encoding is the
+/// 8-char CRC32 of the raw file bytes (not a sha, not a path-derived
+/// value). The distinctness arm proves a different `.config` body
+/// yields a different `Some(_)`, which is the whole point of folding
+/// the config into the key.
+#[test]
+fn config_hash_for_key_returns_crc32_of_config_bytes() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    std::fs::write(tmp.path().join(".config"), b"CONFIG_FOO=y\n").unwrap();
+    // CRC32 (IEEE polynomial, crc32fast::hash) of b"CONFIG_FOO=y\n".
+    assert_eq!(
+        super::config_hash_for_key(tmp.path()).as_deref(),
+        Some("2ce4027e"),
+        "present .config must hash to the 8-char lowercase CRC32 of its \
+             raw bytes",
+    );
+
+    // Leading-zero CRC32 (< 0x10000000): pins the {:08x} zero-PADDING —
+    // a `{:x}` regression would drop the leading 0 (7 chars, not 8).
+    let tmp_lz = tempfile::TempDir::new().unwrap();
+    std::fs::write(tmp_lz.path().join(".config"), b"CONFIG_Z2=y\n").unwrap();
+    assert_eq!(
+        super::config_hash_for_key(tmp_lz.path()).as_deref(),
+        Some("04df91e9"),
+        "a leading-zero CRC32 must render 8 chars (zero-padded), not 7",
+    );
+
+    // Distinctness: a second tree with different .config bytes must
+    // produce a different hash — without this the per-config cache-key
+    // discrimination the doc promises would not hold.
+    let tmp2 = tempfile::TempDir::new().unwrap();
+    std::fs::write(tmp2.path().join(".config"), b"CONFIG_BAR=m\n").unwrap();
+    assert_eq!(
+        super::config_hash_for_key(tmp2.path()).as_deref(),
+        Some("8498a61e"),
+        "a different .config body must hash to a different CRC32",
+    );
+    assert_ne!(
+        super::config_hash_for_key(tmp.path()),
+        super::config_hash_for_key(tmp2.path()),
+        "distinct .config bodies must produce distinct cache-key hashes",
+    );
+}

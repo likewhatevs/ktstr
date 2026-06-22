@@ -1273,4 +1273,296 @@ mod tests {
             resolve_addrs_from_elf(std::path::Path::new("/nonexistent/vmlinux"), &func_names);
         assert!(result.is_empty());
     }
+
+    // -- entry→exit diff rendering (exit_fields) --
+
+    /// A field whose exit value differs from entry renders the
+    /// `entry → exit` diff line. Pins the `Some(ev) if ev != entry_val`
+    /// arm of `format_field_line` plus the `arrow_col` computation; no
+    /// existing test populates `exit_fields`, so this arm and the arrow
+    /// column were previously dead. `vtime` decodes passthrough, so
+    /// 100/200 are stable. Host-only, no VM.
+    #[test]
+    fn format_probe_events_entry_exit_diff_arrow() {
+        use crate::probe::process::ProbeEvent;
+
+        let events = vec![ProbeEvent {
+            func_idx: 0,
+            fields: vec![("p:task_struct.vtime".to_string(), 100)],
+            exit_fields: vec![("p:task_struct.vtime".to_string(), 200)],
+            ..Default::default()
+        }];
+        let func_names = vec![(0u32, "do_probe".to_string())];
+        let out = format_probe_events(&events, &func_names, None, None);
+
+        // max_field_w = "vtime".len().max(8) = 8; arrow_col = "100".len() = 3.
+        // col = arrow_col.max(entry.len()) = 3. Build the block with the
+        // same arithmetic as format_field_line's Some(diff) arm.
+        let fw = 8usize;
+        let col = 3usize;
+        let field_line = format!("      {field:<fw$}  {entry:<col$}  →  {exit}\n",
+            field = "vtime", entry = "100", exit = "200");
+        let expected = format!("    task_struct *p\n{field_line}");
+        assert!(
+            out.contains(&expected),
+            "expected entry→exit diff block:\n{expected}\ngot:\n{out}",
+        );
+        assert!(out.contains('→'), "diff arm must render an arrow: {out}");
+    }
+
+    /// An exit value equal to the entry value falls to the no-arrow
+    /// `_ =>` arm even though `exit_fields` is non-empty. Distinct from
+    /// the None-exit path the other tests cover: it pins that an
+    /// unchanged field is NOT rendered with `→`. `weight` decodes
+    /// passthrough. Host-only.
+    #[test]
+    fn format_probe_events_exit_equal_no_arrow() {
+        use crate::probe::process::ProbeEvent;
+
+        let events = vec![ProbeEvent {
+            func_idx: 0,
+            fields: vec![("p:task_struct.weight".to_string(), 100)],
+            exit_fields: vec![("p:task_struct.weight".to_string(), 100)],
+            ..Default::default()
+        }];
+        let func_names = vec![(0u32, "do_probe".to_string())];
+        let out = format_probe_events(&events, &func_names, None, None);
+
+        // fw = "weight".len().max(8) = 8; no arrow (equal exit).
+        let fw = 8usize;
+        let field_line = format!("      {field:<fw$}  {entry}\n", field = "weight", entry = "100");
+        let expected = format!("    task_struct *p\n{field_line}");
+        assert!(
+            out.contains(&expected),
+            "expected no-arrow block:\n{expected}\ngot:\n{out}",
+        );
+        assert!(
+            !out.contains('→'),
+            "equal exit must not render an arrow: {out}",
+        );
+    }
+
+    // -- build_param_names --
+
+    /// Covers the four type_label arms (struct pointer, typed pointer,
+    /// untyped ptr, scalar) and the variadic .take(6)/pad-to-6 loop.
+    /// Pure host call — BtfFunc/BtfParam are struct literals, no BTF
+    /// parse, no VM.
+    #[test]
+    fn build_param_names_struct_ptr_and_scalar_and_variadic_pad() {
+        use crate::probe::btf::{BtfFunc, BtfParam};
+
+        let f = BtfFunc {
+            name: "f".to_string(),
+            params: vec![
+                BtfParam {
+                    name: "p".to_string(),
+                    struct_name: Some("task_struct".to_string()),
+                    ..Default::default()
+                },
+                BtfParam {
+                    name: "c".to_string(),
+                    ..Default::default()
+                },
+                BtfParam {
+                    name: "q".to_string(),
+                    is_ptr: true,
+                    ..Default::default()
+                },
+                BtfParam {
+                    name: "t".to_string(),
+                    type_name: Some("myt".to_string()),
+                    ..Default::default()
+                },
+            ],
+            is_variadic: false,
+        };
+        let v = BtfFunc {
+            name: "v".to_string(),
+            params: vec![BtfParam {
+                name: "a".to_string(),
+                ..Default::default()
+            }],
+            is_variadic: true,
+        };
+
+        let map = build_param_names(&[f, v]);
+        assert_eq!(
+            map["f"],
+            vec![
+                ("p".to_string(), "task_struct *".to_string()),
+                ("c".to_string(), String::new()),
+                ("q".to_string(), "ptr".to_string()),
+                ("t".to_string(), "myt *".to_string()),
+            ],
+        );
+        // Variadic padded to 6 with arg{i} entries.
+        assert_eq!(map["v"].len(), 6);
+        assert_eq!(map["v"][0], ("a".to_string(), String::new()));
+        assert_eq!(map["v"][5], ("arg5".to_string(), String::new()));
+    }
+
+    // -- build_render_hints --
+
+    /// Covers the three insert arms: known struct in STRUCT_FIELDS
+    /// (every field → Hex), non-empty auto_fields (each field → its own
+    /// hint, with the type_name → "void" fallback), and scalar !is_ptr
+    /// (→ Hex under the `val.` key). Host-only struct literals.
+    #[test]
+    fn build_render_hints_known_struct_autofields_and_scalar() {
+        use crate::probe::btf::{BtfFunc, BtfParam, RenderHint};
+
+        let f = BtfFunc {
+            name: "f".to_string(),
+            params: vec![
+                // Known struct → STRUCT_FIELDS loop, every field = Hex.
+                BtfParam {
+                    name: "p".to_string(),
+                    struct_name: Some("task_struct".to_string()),
+                    ..Default::default()
+                },
+                // auto_fields with a named type → carries the field's hint.
+                BtfParam {
+                    name: "x".to_string(),
+                    type_name: Some("myt".to_string()),
+                    auto_fields: vec![(
+                        "count".to_string(),
+                        "->count".to_string(),
+                        RenderHint::Decimal,
+                    )],
+                    ..Default::default()
+                },
+                // auto_fields with type_name=None → "void" fallback.
+                BtfParam {
+                    name: "v".to_string(),
+                    auto_fields: vec![(
+                        "z".to_string(),
+                        "->z".to_string(),
+                        RenderHint::Signed,
+                    )],
+                    ..Default::default()
+                },
+                // Scalar (!is_ptr, no struct, no auto_fields) → val.<name> = Hex.
+                BtfParam {
+                    name: "n".to_string(),
+                    ..Default::default()
+                },
+            ],
+            is_variadic: false,
+        };
+
+        let hints = build_render_hints(&[f]);
+        // Known-struct entry: task_struct.pid is in STRUCT_FIELDS → Hex.
+        assert_eq!(hints["p:task_struct.pid"], RenderHint::Hex);
+        // auto_fields carry their own hint under {pname}:{tname}.{fname}.
+        assert_eq!(hints["x:myt.count"], RenderHint::Decimal);
+        // type_name=None falls back to "void".
+        assert_eq!(hints["v:void.z"], RenderHint::Signed);
+        // Scalar param gets a val.<name> = Hex entry.
+        assert_eq!(hints["n:val.n"], RenderHint::Hex);
+    }
+
+    // -- empty-fields branch with BTF param names --
+
+    /// The no-fields branch with a non-empty param_names map. Covers the
+    /// typed-label `{pname} ({ptype})`, the task_struct arm
+    /// (`ptr:{val&0xffff:04x}`), the `ptype == "ptr"` → format_raw_arg
+    /// arm, the scalar decode_named_value arm, and arg_cap derived from
+    /// the param count. Host-only — loc resolution misses the synthetic
+    /// func name and falls back to empty.
+    #[test]
+    fn format_probe_events_param_names_task_ptr_and_typed_label() {
+        use crate::probe::process::ProbeEvent;
+
+        let events = vec![ProbeEvent {
+            func_idx: 0,
+            args: [0xDEAD, 3, 0xffff_8881_0012_3456, 0, 0, 0],
+            fields: vec![], // forces the empty-fields branch
+            ..Default::default()
+        }];
+        let func_names = vec![(0u32, "do_probe".to_string())];
+        let mut param_names = std::collections::HashMap::new();
+        param_names.insert(
+            "do_probe".to_string(),
+            vec![
+                ("prev".to_string(), "task_struct *".to_string()),
+                ("cpu".to_string(), String::new()),
+                ("rq".to_string(), "ptr".to_string()),
+            ],
+        );
+        let out = format_probe_events_with_bpf_locs(
+            &events,
+            &func_names,
+            None,
+            &std::collections::HashMap::new(),
+            None,
+            &param_names,
+            &std::collections::HashMap::new(),
+        );
+
+        // fw = max_field_w = 8 (no fields → unwrap_or(8).max(8)).
+        // i=0: task_struct arm → "ptr:dead" (0xDEAD & 0xffff = 0xdead).
+        // i=1: scalar "cpu" → decode_named_value("","cpu","3") = "3".
+        // i=2: label "rq (ptr)" (a non-empty ptype gets the "(ptype)"
+        //      suffix); value via the "ptr" arm → "ptr:3456".
+        let fw = 8usize;
+        let line0 = format!("      {l:<fw$}  {d}\n", l = "prev (task_struct *)", d = "ptr:dead");
+        let line1 = format!("      {l:<fw$}  {d}\n", l = "cpu", d = "3");
+        let line2 = format!("      {l:<fw$}  {d}\n", l = "rq (ptr)", d = "ptr:3456");
+        let block = format!("{line0}{line1}{line2}");
+        assert!(
+            out.contains(&block),
+            "expected param-name block:\n{block}\ngot:\n{out}",
+        );
+    }
+
+    // -- format_cpumask_display partial-word masking --
+
+    /// A non-multiple-of-64 nr_cpus exercises the `valid_bits < 64`
+    /// partial-word mask (line 59): garbage high bits beyond CPU 9 are
+    /// stripped from the displayed hex word. Existing cpumask tests use
+    /// Some(64)/Some(128) where in-range words have valid_bits >= 64, so
+    /// only the unmasked line ran. Host-only direct call.
+    #[test]
+    fn format_cpumask_display_partial_word_masking() {
+        // word 0 = all bits set, nr_cpus = 10 → valid_bits = 10 →
+        // masked word = (1<<10)-1 = 0x3ff; merged decode = "0-9".
+        assert_eq!(
+            format_cpumask_display(&[u64::MAX, 0, 0, 0], Some(10)),
+            "0x3ff(0-9)",
+        );
+    }
+
+    // -- multi-field group header --
+
+    /// A group with >1 field emits a standalone `{label}` header then
+    /// indents each field. Pins exact ordering, indentation, and column
+    /// width for two distinct fields under one struct-pointer label.
+    /// pid/weight decode passthrough; no exit_fields (no arrows).
+    /// Host-only.
+    #[test]
+    fn format_probe_events_multi_field_group_header() {
+        use crate::probe::process::ProbeEvent;
+
+        let events = vec![ProbeEvent {
+            func_idx: 0,
+            fields: vec![
+                ("p:task_struct.pid".to_string(), 42),
+                ("p:task_struct.weight".to_string(), 100),
+            ],
+            ..Default::default()
+        }];
+        let func_names = vec![(0u32, "do_probe".to_string())];
+        let out = format_probe_events(&events, &func_names, None, None);
+
+        // fw = "weight".len().max(8) = 8 (longest field name is "weight").
+        let fw = 8usize;
+        let pid_line = format!("      {f:<fw$}  {v}\n", f = "pid", v = "42");
+        let weight_line = format!("      {f:<fw$}  {v}\n", f = "weight", v = "100");
+        let block = format!("    task_struct *p\n{pid_line}{weight_line}");
+        assert!(
+            out.contains(&block),
+            "expected multi-field group block:\n{block}\ngot:\n{out}",
+        );
+    }
 }

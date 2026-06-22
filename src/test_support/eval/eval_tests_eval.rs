@@ -2578,3 +2578,260 @@ fn eval_sched_log_truncates_over_200_lines() {
         "an early log line must be truncated out of the kept tail, got: {msg}",
     );
 }
+
+// -- guest-fail block bug_summary_line() closure Some-arm (mod.rs:1691-1702, 2048) --
+
+/// On the guest-AssertResult-fail path the `bug_summary_line()` closure
+/// (mod.rs:1691-1702) extracts a `scx_bpf_error`-class line from the
+/// scheduler-log corpus and prepends a `BUG SUMMARY: <text>\n` line to
+/// the rendered failure message (concatenated at mod.rs:2048, ahead of
+/// the `ktstr_test` header). `extract_bug_summary` falls through its
+/// dump scan to the sched-log loop (output.rs:171-179), returning the
+/// trimmed `scx_bpf_error: cell config invalid` line. Pins the Some-arm
+/// rendering through `evaluate_vm_result`: every existing eval failure
+/// fixture either has no `scx_bpf_error` substring (so the closure
+/// returns `None`) or exercises `write_placeholder` rather than this
+/// eval closure.
+///
+/// `stderr_color()` is `false` under the captured-stderr test harness
+/// (cli/util.rs:13-17 reads `is_terminal()`, cached), so the plain
+/// `BUG SUMMARY: ` form renders — the combined substring asserted below
+/// exists only in that plain form, not the `\x1b`-wrapped one. The
+/// `output` carries the line bracketed by `SCHED_OUTPUT_START` /
+/// `SCHED_OUTPUT_END`; `guest_messages` holds only the TEST_RESULT TLV,
+/// so `concat_sched_log_chunks` is empty and `sched_log_input` falls
+/// back to `output` (mod.rs:1641-1646), the corpus the closure scans.
+#[test]
+fn eval_failure_renders_bug_summary_line_via_closure() {
+    let _lock = lock_env();
+    let assert = build_assert_result(false, vec![AssertDetail::new(DetailKind::Stuck, "stuck")]);
+    let output =
+        format!("{SCHED_OUTPUT_START}\nscx_bpf_error: cell config invalid\n{SCHED_OUTPUT_END}",);
+    let entry = sched_entry("__eval_bug_summary_closure__");
+    let result = make_vm_result_with_assert(&output, "", 0, false, &assert);
+    let assertions = crate::assert::Assert::NO_OVERRIDES;
+    let err = evaluate_vm_result(
+        &entry,
+        &result,
+        &assertions,
+        &[],
+        &[],
+        &[],
+        &EVAL_TOPO,
+        &no_repro,
+        None,
+    )
+    .unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("BUG SUMMARY: scx_bpf_error: cell config invalid"),
+        "the closure's Some-arm must render the plain `BUG SUMMARY: <text>` line, got: {msg}",
+    );
+    let summary_pos = msg.find("BUG SUMMARY:").unwrap();
+    let name_pos = msg.find("ktstr_test").unwrap();
+    assert!(
+        summary_pos < name_pos,
+        "the BUG SUMMARY line must precede the ktstr_test header, got: {msg}",
+    );
+}
+
+// -- guest-fail block periodic-samples section wiring (mod.rs:2022-2023, 2057) --
+
+/// On the guest-fail path the periodic-samples section
+/// (`format_periodic_samples_section(result)`, mod.rs:2022-2023)
+/// renders into the failure message (mod.rs:2057) when
+/// `result.periodic_target > 0`. Every existing fail-arm eval fixture
+/// leaves `periodic_target == 0`, so the section returns `""` and never
+/// appears in an asserted failure message; the non-zero-target
+/// render-into-message wiring is otherwise untested. `make_vm_result_*`
+/// helpers can't set the periodic fields, so the `VmResult` is built via
+/// the `test_fixture()` struct-update idiom with the fields overridden.
+/// Exact strings per `format_periodic_samples_section`
+/// (output.rs:561-601): with `fired=2 real=2 target=4` the degraded-
+/// placeholder line is skipped (`real < fired` false) and the
+/// missing-samples line renders (`fired < target` true).
+#[test]
+fn eval_failure_renders_periodic_samples_section() {
+    let assert = build_assert_result(false, vec![AssertDetail::new(DetailKind::Stuck, "stuck")]);
+    let entry = eevdf_entry("__eval_periodic_section__");
+    let result = crate::vmm::VmResult {
+        guest_messages: Some(crate::vmm::host_comms::BulkDrainResult {
+            entries: vec![crate::test_support::test_helpers::assert_result_tlv_entry(
+                &assert,
+            )],
+        }),
+        periodic_fired: 2,
+        periodic_real: 2,
+        periodic_target: 4,
+        ..crate::vmm::VmResult::test_fixture()
+    };
+    let assertions = crate::assert::Assert::NO_OVERRIDES;
+    let err = evaluate_vm_result(
+        &entry,
+        &result,
+        &assertions,
+        &[],
+        &[],
+        &[],
+        &EVAL_TOPO,
+        &no_repro,
+        None,
+    )
+    .unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("--- periodic samples ---"),
+        "periodic_target>0 must render the periodic section into the failure message, got: {msg}",
+    );
+    assert!(
+        msg.contains("fired 2/4 periodic snapshots (50% coverage)"),
+        "the fired/target coverage line must render exactly, got: {msg}",
+    );
+    assert!(
+        msg.contains("missing 2 sample(s)"),
+        "the missing-samples line must render (fired < target), got: {msg}",
+    );
+}
+
+// -- guest-fail block temporal-assertions section wiring (mod.rs:2030-2031, 2058) --
+
+/// On the guest-fail path the temporal-assertions section
+/// (`format_temporal_assertions_section(&check_result)`,
+/// mod.rs:2030-2031) renders into the failure message (mod.rs:2058)
+/// when `check_result` carries a `DetailKind::Temporal` detail.
+/// `format_temporal_assertions_section` is unit-tested directly in
+/// output.rs, but no eval test feeds a Temporal-tagged detail through
+/// `evaluate_vm_result`, so the boundary wiring — that a post-TLV-
+/// roundtrip Temporal detail reaches the section — is otherwise
+/// unverified. The Temporal detail survives the postcard TLV roundtrip
+/// (`DetailKind` is a plain serde enum). Exact header per
+/// output.rs:632-637.
+#[test]
+fn eval_failure_renders_temporal_assertions_section() {
+    let assert = build_assert_result(
+        false,
+        vec![AssertDetail::new(
+            DetailKind::Temporal,
+            "sample tag p3 violated rate_within",
+        )],
+    );
+    let entry = eevdf_entry("__eval_temporal_section__");
+    let result = make_vm_result_with_assert("", "", 0, false, &assert);
+    let assertions = crate::assert::Assert::NO_OVERRIDES;
+    let err = evaluate_vm_result(
+        &entry,
+        &result,
+        &assertions,
+        &[],
+        &[],
+        &[],
+        &EVAL_TOPO,
+        &no_repro,
+        None,
+    )
+    .unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("--- temporal assertions ---"),
+        "a Temporal detail must render the temporal section into the failure message, got: {msg}",
+    );
+    assert!(
+        msg.contains("1 temporal assertion entry(ies):"),
+        "the temporal section header must render the entry count exactly, got: {msg}",
+    );
+    assert!(
+        msg.contains("sample tag p3 violated rate_within"),
+        "the Temporal detail message must render (survives the TLV roundtrip), got: {msg}",
+    );
+}
+
+// -- no-result console-suppression else arm (mod.rs:2188-2194) --
+
+/// The no-parseable-result `console_section` ternary's
+/// `else { String::new() }` arm (mod.rs:2192-2194) is reached only when
+/// `has_sched_output == true` AND `!verbose()` AND
+/// `!entry.scheduler.has_active_scheduling()`. Every existing EEVDF
+/// no-result fixture lacks `SCHED_OUTPUT_START`, so `has_sched_output`
+/// is false and the diagnostics section always renders; the suppression
+/// branch is otherwise unexercised. EEVDF (`has_active_scheduling()
+/// == false`) plus `SCHED_OUTPUT_START` in `output` (sets
+/// `has_sched_output`, mod.rs:2185-2187) plus `verbose()` false drives
+/// the else arm, so no `--- diagnostics ---` appears. `verbose()` reads
+/// `RUST_BACKTRACE` (runtime.rs:123-127), removed here under
+/// `lock_env()`. The reason stays `ERR_NO_TEST_FUNCTION_OUTPUT` (EEVDF,
+/// no crash/panic, mod.rs:2316-2317).
+#[test]
+fn eval_noresult_eevdf_with_sched_output_suppresses_console_section() {
+    let _lock = lock_env();
+    let _bt = EnvVarGuard::remove("RUST_BACKTRACE");
+    let entry = eevdf_entry("__eval_console_suppress__");
+    let output = format!("{SCHED_OUTPUT_START}\nnoise\n{SCHED_OUTPUT_END}",);
+    let result = make_vm_result(&output, "Kernel panic", 1, false);
+    let assertions = crate::assert::Assert::NO_OVERRIDES;
+    let err = evaluate_vm_result(
+        &entry,
+        &result,
+        &assertions,
+        &[],
+        &[],
+        &[],
+        &EVAL_TOPO,
+        &no_repro,
+        None,
+    )
+    .unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        !msg.contains("--- diagnostics ---"),
+        "EEVDF + SCHED_OUTPUT present + non-verbose must suppress the diagnostics section, got: {msg}",
+    );
+    assert!(
+        msg.contains(ERR_NO_TEST_FUNCTION_OUTPUT),
+        "the EEVDF no-result reason must still render, got: {msg}",
+    );
+}
+
+// -- guest-fail block build_monitor_section() empty else arm (mod.rs:1717-1725) --
+
+/// `build_monitor_section()`'s `String::new()` else arm
+/// (mod.rs:1722-1724): `entry.scheduler.has_active_scheduling()` is true
+/// (sched_entry) but `result.monitor` is `None`, so the `&& let
+/// Some(ref monitor)` bind (mod.rs:1718-1719) fails and the closure
+/// returns empty — no `--- monitor ---` section despite an active
+/// scheduler. `eval_sched_exit_includes_monitor` covers the
+/// monitor=Some arm; the `eval_eevdf_*` fixtures take the
+/// `has_active_scheduling()==false` short-circuit. `make_vm_result*`
+/// sets `monitor: None`, so the guest-fail block's
+/// `build_monitor_section()` call (mod.rs:2016) takes the empty else and
+/// the rendered failure message carries no monitor section.
+#[test]
+fn eval_sched_fail_with_no_monitor_omits_monitor_section() {
+    let assert = build_assert_result(
+        false,
+        vec![AssertDetail::new(DetailKind::Stuck, "worker 0 stuck")],
+    );
+    let entry = sched_entry("__eval_no_monitor_section__");
+    let result = make_vm_result_with_assert("", "", 0, false, &assert);
+    let assertions = crate::assert::Assert::NO_OVERRIDES;
+    let err = evaluate_vm_result(
+        &entry,
+        &result,
+        &assertions,
+        &[],
+        &[],
+        &[],
+        &EVAL_TOPO,
+        &no_repro,
+        None,
+    )
+    .unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        !msg.contains("--- monitor ---"),
+        "active scheduler with monitor=None must omit the monitor section, got: {msg}",
+    );
+    assert!(
+        msg.contains("worker 0 stuck"),
+        "the failure detail must still render (the guest-fail path ran), got: {msg}",
+    );
+}

@@ -90,7 +90,7 @@ const DEFAULT_MAX_LINES: usize = 3000;
 const EXCEPTIONS: &[(&str, usize)] = &[
     ("vmm/freeze_coord/mod.rs", 13531),
     ("scenario/ops/tests.rs", 9474),
-    ("monitor/dump/tests.rs", 9119),
+    ("monitor/dump/tests.rs", 9308),
     ("test_support/entry.rs", 6038),
     ("monitor/reader.rs", 5939),
     ("scenario/payload_run.rs", 5881),
@@ -100,7 +100,7 @@ const EXCEPTIONS: &[(&str, usize)] = &[
     // queued: split the inline #[cfg(test)] mod into test_support/dispatch/tests.rs.
     ("test_support/dispatch.rs", 4996),
     ("scenario/snapshot/tests.rs", 4974),
-    ("monitor/btf_render/mod.rs", 4790),
+    ("monitor/btf_render/mod.rs", 5508),
     ("monitor/bpf_map/tests.rs", 4169),
     ("monitor/cast_analysis/mod.rs", 4154),
     ("monitor/dump/mod.rs", 4125),
@@ -114,7 +114,7 @@ const EXCEPTIONS: &[(&str, usize)] = &[
     ("ctprof/mod.rs", 3571),
     // queued: split the inline #[cfg(test)] mod into probe/process/tests.rs.
     ("probe/process.rs", 3518),
-    ("bin/ktstr.rs", 3001),
+    ("bin/ktstr.rs", 3546),
 ];
 
 /// Resolve `<repo>/src` from `CARGO_MANIFEST_DIR`. Cargo always
