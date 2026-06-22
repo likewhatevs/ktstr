@@ -1148,6 +1148,7 @@ impl AbsoluteThresholds {
 /// #     affinity_error: None,
 /// #     is_messenger: false,
 /// #     group_idx: 0,
+/// #     phase_slices: vec![],
 /// # };
 /// // Strict preset on a healthy run — passes.
 /// let r = assert_thresholds(&[report], &AbsoluteThresholds::strict());
