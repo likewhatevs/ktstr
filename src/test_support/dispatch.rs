@@ -1016,249 +1016,274 @@ fn result_to_exit_code(
 ) -> i32 {
     let no_skip = std::env::var_os(crate::KTSTR_NO_SKIP_MODE_ENV).is_some();
     match result {
-        // A Skip degenerates to EXIT_PASS regardless of expect_err — the
-        // test never evaluated, so there is no guest failure to "expect"
-        // (the `Fail > Inconclusive > Pass > Skip` projection; mirrors the
-        // ResourceContention Err arm below, but on the Ok side). Without
-        // this arm a post_vm_skip under expect_err falls into the
-        // `Ok(r) if expect_err` arm and surfaces as "expected error but
-        // test passed" (EXIT_FAIL) — a load-starvation placeholder-dump
-        // skip becomes a flaky failure. End-to-end chain: a post_vm
-        // callback returns Err(post_vm_skip(..)) → the eval gate detects
-        // the HostSkipRequest marker, reports via report::test_skip, and
-        // returns Ok(AssertResult::skip) → this arm maps it to EXIT_PASS.
-        // is_skip() is true only when `outcomes` is non-empty and every
-        // outcome is Outcome::Skip (assert/mod.rs); the empty-outcomes
-        // Pass identity has is_skip()==false and falls through to the
-        // `Ok(_) => EXIT_PASS` arm.
-        Ok(r) if r.is_skip() => EXIT_PASS,
-        Ok(r) if expect_err => {
-            // expect_err inverts on Pass and on Inconclusive: both
-            // are "not a failure" in the operator's mental model,
-            // and an expect_err scenario that produces an
-            // Inconclusive verdict (denominator zero) failed to
-            // produce the expected failure just like a Pass would.
-            // Surface the inconclusive as exit code 2 to preserve
-            // the distinct verdict, but treat it as expect_err
-            // satisfaction failure (exit 1) — the test author
-            // wanted a Fail, not "the gate could not run".
-            //
-            // `allow_inconclusive` does NOT relax the expect_err
-            // contract: expect_err demands a real Fail, and an
-            // Inconclusive verdict does not satisfy that
-            // regardless of how the test author scopes
-            // Inconclusive elsewhere. The dominant gate wins;
-            // `allow_inconclusive` only relaxes the
-            // EXIT_INCONCLUSIVE projection on the no-expect_err
-            // path below.
-            if r.is_inconclusive() {
-                eprintln!(
-                    "expected error but test produced an Inconclusive verdict — \
-                     zero-denominator gate could not evaluate; expect_err is \
-                     unsatisfied"
-                );
-                EXIT_FAIL
-            } else {
-                eprintln!("expected error but test passed");
-                EXIT_FAIL
-            }
-        }
-        Ok(r) if r.is_inconclusive() => {
-            // `allow_inconclusive` opt-in: a test author may have
-            // declared `#[ktstr_test(allow_inconclusive)]` to
-            // signal "this test's Inconclusive arm is acceptable —
-            // don't fail the CI gate." Route to EXIT_PASS in that
-            // case (Inconclusive is still recorded in the sidecar
-            // for stats tooling and the operator-facing failure
-            // dump still renders the diagnostic). When the flag
-            // is unset (the default) the verdict surfaces as
-            // EXIT_INCONCLUSIVE so the operator triages it.
-            if allow_inconclusive {
-                eprintln!(
-                    "test produced an Inconclusive verdict but \
-                     `allow_inconclusive` is set — routing to EXIT_PASS \
-                     for CI gate, sidecar still records Inconclusive"
-                );
-                EXIT_PASS
-            } else {
-                EXIT_INCONCLUSIVE
-            }
-        }
-        Ok(_) => EXIT_PASS,
-        Err(e) if is_perf_mode_unavailable(&e) => {
-            // Hard FAIL, not a skip: a performance_mode test explicitly
-            // requested an isolation guarantee the host cannot honor. Not
-            // gated on KTSTR_NO_SKIP_MODE (already a failure). Placed above
-            // the RC/TI skip arms so it wins the match.
-            let reason = e
-                .chain()
-                .find_map(|c| {
-                    c.downcast_ref::<crate::vmm::host_topology::PerfModeUnavailable>()
-                        .map(|p| p.reason.clone())
-                })
-                .unwrap_or_else(|| "<unknown>".to_string());
+        Ok(r) => ok_to_exit_code(r, expect_err, allow_inconclusive),
+        Err(e) => err_to_exit_code(e, expect_err, no_skip),
+    }
+}
+
+/// Map an `Ok(AssertResult)` verdict to an exit code.
+///
+/// The sequential guards preserve the original `match` arm precedence
+/// (first matching guard wins): `is_skip()` → `expect_err` →
+/// `is_inconclusive()` → the trailing `EXIT_PASS` (the former
+/// `Ok(_) => EXIT_PASS` arm). Reordering these would change which
+/// verdict fires for a result matching more than one guard.
+fn ok_to_exit_code(r: AssertResult, expect_err: bool, allow_inconclusive: bool) -> i32 {
+    // A Skip degenerates to EXIT_PASS regardless of expect_err — the
+    // test never evaluated, so there is no guest failure to "expect"
+    // (the `Fail > Inconclusive > Pass > Skip` projection; mirrors the
+    // ResourceContention Err branch in `err_to_exit_code`, but on the
+    // Ok side). Without this guard a post_vm_skip under expect_err
+    // falls into the `expect_err` guard below and surfaces as "expected
+    // error but test passed" (EXIT_FAIL) — a load-starvation
+    // placeholder-dump skip becomes a flaky failure. End-to-end chain:
+    // a post_vm callback returns Err(post_vm_skip(..)) → the eval gate
+    // detects the HostSkipRequest marker, reports via report::test_skip,
+    // and returns Ok(AssertResult::skip) → this guard maps it to
+    // EXIT_PASS. is_skip() is true only when `outcomes` is non-empty and
+    // every outcome is Outcome::Skip (assert/mod.rs); the empty-outcomes
+    // Pass identity has is_skip()==false and falls through to the
+    // trailing `EXIT_PASS`.
+    if r.is_skip() {
+        return EXIT_PASS;
+    }
+    if expect_err {
+        // expect_err inverts on Pass and on Inconclusive: both
+        // are "not a failure" in the operator's mental model,
+        // and an expect_err scenario that produces an
+        // Inconclusive verdict (denominator zero) failed to
+        // produce the expected failure just like a Pass would.
+        // Surface the inconclusive as exit code 2 to preserve
+        // the distinct verdict, but treat it as expect_err
+        // satisfaction failure (exit 1) — the test author
+        // wanted a Fail, not "the gate could not run".
+        //
+        // `allow_inconclusive` does NOT relax the expect_err
+        // contract: expect_err demands a real Fail, and an
+        // Inconclusive verdict does not satisfy that
+        // regardless of how the test author scopes
+        // Inconclusive elsewhere. The dominant gate wins;
+        // `allow_inconclusive` only relaxes the
+        // EXIT_INCONCLUSIVE projection on the no-expect_err
+        // path below.
+        if r.is_inconclusive() {
             eprintln!(
-                "ktstr: FAIL: performance mode unavailable: {reason}. \
-                 Provision a host with the required CPU / LLC count, narrow the \
-                 test topology, or drop --perf-mode."
+                "expected error but test produced an Inconclusive verdict — \
+                 zero-denominator gate could not evaluate; expect_err is \
+                 unsatisfied"
             );
-            EXIT_FAIL
-        }
-        Err(e) if is_cpu_budget_unsatisfiable(&e) => {
-            // Hard FAIL, not a skip: an explicit --cpu-cap / cpu_budget the
-            // host cannot satisfy (a user-typed number that does not exist
-            // here).
-            let reason = e
-                .chain()
-                .find_map(|c| {
-                    c.downcast_ref::<crate::vmm::host_topology::CpuBudgetUnsatisfiable>()
-                        .map(|b| b.reason.clone())
-                })
-                .unwrap_or_else(|| "<unknown>".to_string());
-            eprintln!("ktstr: FAIL: cpu budget unsatisfiable: {reason}");
-            EXIT_FAIL
-        }
-        Err(e) if is_topology_unrepresentable(&e) => {
-            // Hard FAIL, not a skip: a topology no host can represent under
-            // this VMM's static device layout (the aarch64 over-MAX_VCPUS
-            // GICv3-redistributor case) is a test misconfiguration. Placed
-            // above the expect_err inversion (and the RC/TI skip arms) so it
-            // cannot masquerade as the expected failure or be turned into a
-            // skip — the deliberate counterpart to the x86 over-cap
-            // TopologyInsufficient skip arm below.
-            let reason = e
-                .chain()
-                .find_map(|c| {
-                    c.downcast_ref::<crate::vmm::host_topology::TopologyUnrepresentable>()
-                        .map(|t| t.reason.clone())
-                })
-                .unwrap_or_else(|| "<unknown>".to_string());
-            eprintln!("ktstr: FAIL: topology unrepresentable: {reason}");
-            EXIT_FAIL
-        }
-        Err(e) if is_resource_contention(&e) => {
-            let reason = e
-                .chain()
-                .find_map(|c| {
-                    c.downcast_ref::<crate::vmm::host_topology::ResourceContention>()
-                        .map(|rc| rc.reason.clone())
-                })
-                .unwrap_or_else(|| "<unknown>".to_string());
-            if no_skip {
-                eprintln!(
-                    "ktstr: FAIL: resource contention under --no-skip-mode: {reason}. \
-                     Either provision hardware that satisfies the test's topology \
-                     requirement, or drop --no-skip-mode / KTSTR_NO_SKIP_MODE to \
-                     accept the skip."
-                );
-                EXIT_FAIL
-            } else {
-                crate::report::test_skip(format_args!("resource contention: {reason}"));
-                EXIT_PASS
-            }
-        }
-        Err(e) if is_topology_insufficient(&e) => {
-            let reason = e
-                .chain()
-                .find_map(|c| {
-                    c.downcast_ref::<crate::vmm::host_topology::TopologyInsufficient>()
-                        .map(|ti| ti.reason.clone())
-                })
-                .unwrap_or_else(|| "<unknown>".to_string());
-            if no_skip {
-                eprintln!(
-                    "ktstr: FAIL: host topology insufficient under --no-skip-mode: {reason}. \
-                     Either provision a host with the required CPU / LLC count, or drop \
-                     --no-skip-mode / KTSTR_NO_SKIP_MODE to accept the skip."
-                );
-                EXIT_FAIL
-            } else {
-                crate::report::test_skip(format_args!("host topology insufficient: {reason}"));
-                EXIT_PASS
-            }
-        }
-        Err(e)
-            if e.downcast_ref::<crate::test_support::eval::PostVmAssertionFailure>()
-                .is_some() =>
-        {
-            // A host-side post_vm / post_vm_unconditional callback
-            // failed. This is a real regression that must surface
-            // regardless of expect_err / expect_auto_repro inversion —
-            // those invert a GUEST-side expected failure, but a
-            // HOST-side check is always honored. Positioned AFTER the
-            // resource-contention / topology skip arms (a skip means
-            // the test never ran, so there was no host-side state to
-            // assert) but BEFORE the ExpectAutoReproSatisfied and
-            // expect_err inversion arms so the host-side regression
-            // wins. `downcast_ref` walks the anyhow context+source
-            // chain (the marker rides as `.context(...)` from
-            // run_ktstr_test_inner_impl); a raw `chain().any(is::<C>())`
-            // would miss it (anyhow boxes context as ContextError<C,E>).
-            eprintln!("{e:#}");
-            EXIT_FAIL
-        }
-        Err(e)
-            if e.downcast_ref::<crate::test_support::eval::ExpectAutoReproSatisfied>()
-                .is_some() =>
-        {
-            // `expect_auto_repro = true` was satisfied: the primary
-            // VM produced a Fail AND the auto-repro VM landed a
-            // shape-valid `.repro.wprof.pb`. The eval layer attached
-            // the marker as `anyhow::Context`. `downcast_ref` walks
-            // the anyhow context+source chain (per anyhow's
-            // documentation: "For errors with context, this method
-            // returns true if E matches the type of the context C or
-            // the type of the error on which the context has been
-            // attached"). A `chain().any(|c| c.is::<E>())` walk on
-            // the raw `&dyn StdError` chain would MISS the marker
-            // because anyhow boxes context as `ContextError<C, E>`
-            // whose underlying `is::<C>()` check returns false. The
-            // diagnostic is printed so the operator sees both the
-            // original failure trail and the inversion notice — the
-            // verdict flips to PASS without erasing the failure
-            // detail. Positioned AFTER the ResourceContention /
-            // TopologyInsufficient arms so a skip-class outcome still
-            // wins over inversion (a skip is a skip regardless of the
-            // satisfaction signal). The macro-parse cross-attribute
-            // check rejects `expect_auto_repro` combined with
-            // `expect_err`, so the two inversion paths are mutually
-            // exclusive at the entry layer.
-            eprintln!("{e:#}");
-            EXIT_PASS
-        }
-        Err(e) if expect_err => {
-            // expect_err inverts a failure into a pass — UNLESS the
-            // failure carries the
-            // [`crate::test_support::eval::ScxBpfErrorMatcherMismatch`]
-            // marker, which signals that the reproducer's scx_bpf_error
-            // matcher rejected this particular failure. A matcher-
-            // mismatch failure must surface even when expect_err = true:
-            // the user authored the matcher to pin THIS specific bug,
-            // and a different bug firing is itself a regression.
-            //
-            // `downcast_ref` walks the anyhow context+source chain
-            // (anyhow's documented "For errors with context, this
-            // method returns true if E matches the type of the context
-            // C or the type of the error on which the context has been
-            // attached" semantics). A `chain().any(|c| c.is::<E>())`
-            // walk on the raw `&dyn StdError` chain would MISS the
-            // marker because anyhow boxes context as
-            // `ContextError<C, E>` whose underlying `is::<C>()` check
-            // returns false.
-            if e.downcast_ref::<crate::test_support::eval::ScxBpfErrorMatcherMismatch>()
-                .is_some()
-            {
-                eprintln!("{e:#}");
-                EXIT_FAIL
-            } else {
-                EXIT_PASS
-            }
-        }
-        Err(e) => {
-            eprintln!("{e:#}");
-            EXIT_FAIL
+            return EXIT_FAIL;
+        } else {
+            eprintln!("expected error but test passed");
+            return EXIT_FAIL;
         }
     }
+    if r.is_inconclusive() {
+        // `allow_inconclusive` opt-in: a test author may have
+        // declared `#[ktstr_test(allow_inconclusive)]` to
+        // signal "this test's Inconclusive arm is acceptable —
+        // don't fail the CI gate." Route to EXIT_PASS in that
+        // case (Inconclusive is still recorded in the sidecar
+        // for stats tooling and the operator-facing failure
+        // dump still renders the diagnostic). When the flag
+        // is unset (the default) the verdict surfaces as
+        // EXIT_INCONCLUSIVE so the operator triages it.
+        if allow_inconclusive {
+            eprintln!(
+                "test produced an Inconclusive verdict but \
+                 `allow_inconclusive` is set — routing to EXIT_PASS \
+                 for CI gate, sidecar still records Inconclusive"
+            );
+            return EXIT_PASS;
+        } else {
+            return EXIT_INCONCLUSIVE;
+        }
+    }
+    EXIT_PASS
+}
+
+/// Map an `Err(anyhow::Error)` outcome to an exit code.
+///
+/// The sequential guards preserve the original `match` arm precedence
+/// (first matching guard wins): the hard-FAIL classifiers
+/// (`is_perf_mode_unavailable` → `is_cpu_budget_unsatisfiable` →
+/// `is_topology_unrepresentable`), then the skip-or-fail contention
+/// classifiers (`is_resource_contention` → `is_topology_insufficient`),
+/// then the marker-typed guards (`PostVmAssertionFailure` →
+/// `ExpectAutoReproSatisfied`), then the `expect_err` inversion, then
+/// the catch-all (the former `Err(e) => …` arm) operating on the
+/// now-owned `e`. Reordering these would change which guard fires for an
+/// error matching more than one guard.
+fn err_to_exit_code(e: anyhow::Error, expect_err: bool, no_skip: bool) -> i32 {
+    if is_perf_mode_unavailable(&e) {
+        // Hard FAIL, not a skip: a performance_mode test explicitly
+        // requested an isolation guarantee the host cannot honor. Not
+        // gated on KTSTR_NO_SKIP_MODE (already a failure). Placed above
+        // the RC/TI skip guards so it returns first.
+        let reason = e
+            .chain()
+            .find_map(|c| {
+                c.downcast_ref::<crate::vmm::host_topology::PerfModeUnavailable>()
+                    .map(|p| p.reason.clone())
+            })
+            .unwrap_or_else(|| "<unknown>".to_string());
+        eprintln!(
+            "ktstr: FAIL: performance mode unavailable: {reason}. \
+             Provision a host with the required CPU / LLC count, narrow the \
+             test topology, or drop --perf-mode."
+        );
+        return EXIT_FAIL;
+    }
+    if is_cpu_budget_unsatisfiable(&e) {
+        // Hard FAIL, not a skip: an explicit --cpu-cap / cpu_budget the
+        // host cannot satisfy (a user-typed number that does not exist
+        // here).
+        let reason = e
+            .chain()
+            .find_map(|c| {
+                c.downcast_ref::<crate::vmm::host_topology::CpuBudgetUnsatisfiable>()
+                    .map(|b| b.reason.clone())
+            })
+            .unwrap_or_else(|| "<unknown>".to_string());
+        eprintln!("ktstr: FAIL: cpu budget unsatisfiable: {reason}");
+        return EXIT_FAIL;
+    }
+    if is_topology_unrepresentable(&e) {
+        // Hard FAIL, not a skip: a topology no host can represent under
+        // this VMM's static device layout (the aarch64 over-MAX_VCPUS
+        // GICv3-redistributor case) is a test misconfiguration. Placed
+        // above the expect_err inversion (and the RC/TI skip guards) so it
+        // cannot masquerade as the expected failure or be turned into a
+        // skip — the deliberate counterpart to the x86 over-cap
+        // TopologyInsufficient skip guard below.
+        let reason = e
+            .chain()
+            .find_map(|c| {
+                c.downcast_ref::<crate::vmm::host_topology::TopologyUnrepresentable>()
+                    .map(|t| t.reason.clone())
+            })
+            .unwrap_or_else(|| "<unknown>".to_string());
+        eprintln!("ktstr: FAIL: topology unrepresentable: {reason}");
+        return EXIT_FAIL;
+    }
+    if is_resource_contention(&e) {
+        let reason = e
+            .chain()
+            .find_map(|c| {
+                c.downcast_ref::<crate::vmm::host_topology::ResourceContention>()
+                    .map(|rc| rc.reason.clone())
+            })
+            .unwrap_or_else(|| "<unknown>".to_string());
+        if no_skip {
+            eprintln!(
+                "ktstr: FAIL: resource contention under --no-skip-mode: {reason}. \
+                 Either provision hardware that satisfies the test's topology \
+                 requirement, or drop --no-skip-mode / KTSTR_NO_SKIP_MODE to \
+                 accept the skip."
+            );
+            return EXIT_FAIL;
+        } else {
+            crate::report::test_skip(format_args!("resource contention: {reason}"));
+            return EXIT_PASS;
+        }
+    }
+    if is_topology_insufficient(&e) {
+        let reason = e
+            .chain()
+            .find_map(|c| {
+                c.downcast_ref::<crate::vmm::host_topology::TopologyInsufficient>()
+                    .map(|ti| ti.reason.clone())
+            })
+            .unwrap_or_else(|| "<unknown>".to_string());
+        if no_skip {
+            eprintln!(
+                "ktstr: FAIL: host topology insufficient under --no-skip-mode: {reason}. \
+                 Either provision a host with the required CPU / LLC count, or drop \
+                 --no-skip-mode / KTSTR_NO_SKIP_MODE to accept the skip."
+            );
+            return EXIT_FAIL;
+        } else {
+            crate::report::test_skip(format_args!("host topology insufficient: {reason}"));
+            return EXIT_PASS;
+        }
+    }
+    if e.downcast_ref::<crate::test_support::eval::PostVmAssertionFailure>()
+        .is_some()
+    {
+        // A host-side post_vm / post_vm_unconditional callback
+        // failed. This is a real regression that must surface
+        // regardless of expect_err / expect_auto_repro inversion —
+        // those invert a GUEST-side expected failure, but a
+        // HOST-side check is always honored. Positioned AFTER the
+        // resource-contention / topology skip guards (a skip means
+        // the test never ran, so there was no host-side state to
+        // assert) but BEFORE the ExpectAutoReproSatisfied and
+        // expect_err inversion guards so the host-side regression
+        // wins. `downcast_ref` walks the anyhow context+source
+        // chain (the marker rides as `.context(...)` from
+        // run_ktstr_test_inner_impl); a raw `chain().any(is::<C>())`
+        // would miss it (anyhow boxes context as ContextError<C,E>).
+        eprintln!("{e:#}");
+        return EXIT_FAIL;
+    }
+    if e.downcast_ref::<crate::test_support::eval::ExpectAutoReproSatisfied>()
+        .is_some()
+    {
+        // `expect_auto_repro = true` was satisfied: the primary
+        // VM produced a Fail AND the auto-repro VM landed a
+        // shape-valid `.repro.wprof.pb`. The eval layer attached
+        // the marker as `anyhow::Context`. `downcast_ref` walks
+        // the anyhow context+source chain (per anyhow's
+        // documentation: "For errors with context, this method
+        // returns true if E matches the type of the context C or
+        // the type of the error on which the context has been
+        // attached"). A `chain().any(|c| c.is::<E>())` walk on
+        // the raw `&dyn StdError` chain would MISS the marker
+        // because anyhow boxes context as `ContextError<C, E>`
+        // whose underlying `is::<C>()` check returns false. The
+        // diagnostic is printed so the operator sees both the
+        // original failure trail and the inversion notice — the
+        // verdict flips to PASS without erasing the failure
+        // detail. Positioned AFTER the ResourceContention /
+        // TopologyInsufficient guards so a skip-class outcome still
+        // wins over inversion (a skip is a skip regardless of the
+        // satisfaction signal). The macro-parse cross-attribute
+        // check rejects `expect_auto_repro` combined with
+        // `expect_err`, so the two inversion paths are mutually
+        // exclusive at the entry layer.
+        eprintln!("{e:#}");
+        return EXIT_PASS;
+    }
+    if expect_err {
+        // expect_err inverts a failure into a pass — UNLESS the
+        // failure carries the
+        // [`crate::test_support::eval::ScxBpfErrorMatcherMismatch`]
+        // marker, which signals that the reproducer's scx_bpf_error
+        // matcher rejected this particular failure. A matcher-
+        // mismatch failure must surface even when expect_err = true:
+        // the user authored the matcher to pin THIS specific bug,
+        // and a different bug firing is itself a regression.
+        //
+        // `downcast_ref` walks the anyhow context+source chain
+        // (anyhow's documented "For errors with context, this
+        // method returns true if E matches the type of the context
+        // C or the type of the error on which the context has been
+        // attached" semantics). A `chain().any(|c| c.is::<E>())`
+        // walk on the raw `&dyn StdError` chain would MISS the
+        // marker because anyhow boxes context as
+        // `ContextError<C, E>` whose underlying `is::<C>()` check
+        // returns false.
+        if e.downcast_ref::<crate::test_support::eval::ScxBpfErrorMatcherMismatch>()
+            .is_some()
+        {
+            eprintln!("{e:#}");
+            return EXIT_FAIL;
+        } else {
+            return EXIT_PASS;
+        }
+    }
+    eprintln!("{e:#}");
+    EXIT_FAIL
 }
 
 /// Whether a base test entry is "ignored" (skipped by default).
