@@ -331,17 +331,36 @@ fn bug_summary_line_immediately_follows_fingerprint_line_in_all_failure_messages
     // eval_tests.rs, so the scanned mod.rs holds no test literals
     // to double-count.
     let scan_end = lines.len();
-    // Find every line that is exactly `fingerprint_line,`
-    // (trimmed). The 4 failure-message format!() sites all
-    // pass `fingerprint_line` then `bug_summary_line()` on the
-    // next non-empty line. The single binding site
-    // (`let fingerprint_line = ...`) does not trim to
-    // `fingerprint_line,`, so it's excluded naturally.
+    // Find every failure-message `format!()` site that passes
+    // `fingerprint_line,` as a positional argument: a line trimming to
+    // exactly `fingerprint_line,` whose immediately-preceding non-empty
+    // source line is a format-string literal (trims to a leading `"`).
+    // The 4 real sites (assert-fail, monitor-fail, timeout, no-result)
+    // each pass `fingerprint_line` then `bug_summary_line()` on the next
+    // non-empty line. The preceding-literal gate excludes occurrences
+    // that also trim to `fingerprint_line,` but are NOT format
+    // positionals — notably the tuple-return field of
+    // `precompute_failure_sections` (`(.., dump_section, fingerprint_line,
+    // tl_ctx)`), whose preceding line is another tuple element, not a
+    // `"..."` literal. The `let fingerprint_line = ...` binding does not
+    // trim to `fingerprint_line,` and is excluded regardless. The gate
+    // does not weaken the guard: a newly-added failure-message format!()
+    // still has its format-string literal as the preceding line, so it is
+    // still counted and checked.
     let fingerprint_arg_lines: Vec<usize> = lines
         .iter()
         .enumerate()
         .take(scan_end)
-        .filter_map(|(i, l)| (l.trim() == "fingerprint_line,").then_some(i))
+        .filter_map(|(i, l)| {
+            if l.trim() != "fingerprint_line," {
+                return None;
+            }
+            let preceded_by_fmt_string = (0..i)
+                .rev()
+                .find(|&k| !lines[k].trim().is_empty())
+                .is_some_and(|k| lines[k].trim().starts_with('"'));
+            preceded_by_fmt_string.then_some(i)
+        })
         .collect();
     let display_lines: Vec<usize> = fingerprint_arg_lines.iter().map(|i| i + 1).collect();
     assert_eq!(
