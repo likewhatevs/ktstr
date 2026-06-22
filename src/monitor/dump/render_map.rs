@@ -2702,22 +2702,60 @@ mod render_map_unit_tests {
 
     // ---- pure helpers --------------------------------------------
 
-    /// `map_type_name` maps each known discriminant to its lowercase
-    /// short name and returns `None` for an unknown discriminant.
-    /// Exact-string assertions pin the table against a typo or a
-    /// dropped arm.
+    /// `map_type_name` maps every known discriminant to its lowercase
+    /// short name and returns `None` for an unknown discriminant. The
+    /// table below independently mirrors all 34 arms of the production
+    /// match, so a renamed arm (the string changes) or a dropped arm
+    /// (it now falls to `None`) fails this test. These names feed the
+    /// operator-facing failure-dump header, where a silent regression
+    /// in any single arm would mislabel a captured map.
     #[test]
     fn map_type_name_known_and_unknown() {
-        assert_eq!(map_type_name(BPF_MAP_TYPE_HASH), Some("hash"));
-        assert_eq!(map_type_name(BPF_MAP_TYPE_ARRAY), Some("array"));
-        assert_eq!(map_type_name(BPF_MAP_TYPE_RINGBUF), Some("ringbuf"));
-        assert_eq!(map_type_name(BPF_MAP_TYPE_ARENA), Some("arena"));
-        assert_eq!(map_type_name(BPF_MAP_TYPE_STRUCT_OPS), Some("struct_ops"));
-        assert_eq!(
-            map_type_name(BPF_MAP_TYPE_TASK_STORAGE),
-            Some("task_storage")
-        );
-        assert_eq!(map_type_name(BPF_MAP_TYPE_STACK_TRACE), Some("stack_trace"));
+        // (discriminant, expected lowercase short name) for every arm.
+        let table: &[(u32, &str)] = &[
+            (BPF_MAP_TYPE_HASH, "hash"),
+            (BPF_MAP_TYPE_ARRAY, "array"),
+            (BPF_MAP_TYPE_PROG_ARRAY, "prog_array"),
+            (BPF_MAP_TYPE_PERF_EVENT_ARRAY, "perf_event_array"),
+            (BPF_MAP_TYPE_PERCPU_HASH, "percpu_hash"),
+            (BPF_MAP_TYPE_PERCPU_ARRAY, "percpu_array"),
+            (BPF_MAP_TYPE_STACK_TRACE, "stack_trace"),
+            (BPF_MAP_TYPE_CGROUP_ARRAY, "cgroup_array"),
+            (BPF_MAP_TYPE_LRU_HASH, "lru_hash"),
+            (BPF_MAP_TYPE_LRU_PERCPU_HASH, "lru_percpu_hash"),
+            (BPF_MAP_TYPE_LPM_TRIE, "lpm_trie"),
+            (BPF_MAP_TYPE_ARRAY_OF_MAPS, "array_of_maps"),
+            (BPF_MAP_TYPE_HASH_OF_MAPS, "hash_of_maps"),
+            (BPF_MAP_TYPE_DEVMAP, "devmap"),
+            (BPF_MAP_TYPE_SOCKMAP, "sockmap"),
+            (BPF_MAP_TYPE_CPUMAP, "cpumap"),
+            (BPF_MAP_TYPE_XSKMAP, "xskmap"),
+            (BPF_MAP_TYPE_SOCKHASH, "sockhash"),
+            (BPF_MAP_TYPE_CGROUP_STORAGE, "cgroup_storage"),
+            (BPF_MAP_TYPE_REUSEPORT_SOCKARRAY, "reuseport_sockarray"),
+            (BPF_MAP_TYPE_PERCPU_CGROUP_STORAGE, "percpu_cgroup_storage"),
+            (BPF_MAP_TYPE_QUEUE, "queue"),
+            (BPF_MAP_TYPE_STACK, "stack"),
+            (BPF_MAP_TYPE_SK_STORAGE, "sk_storage"),
+            (BPF_MAP_TYPE_DEVMAP_HASH, "devmap_hash"),
+            (BPF_MAP_TYPE_STRUCT_OPS, "struct_ops"),
+            (BPF_MAP_TYPE_RINGBUF, "ringbuf"),
+            (BPF_MAP_TYPE_INODE_STORAGE, "inode_storage"),
+            (BPF_MAP_TYPE_TASK_STORAGE, "task_storage"),
+            (BPF_MAP_TYPE_BLOOM_FILTER, "bloom_filter"),
+            (BPF_MAP_TYPE_USER_RINGBUF, "user_ringbuf"),
+            (BPF_MAP_TYPE_CGRP_STORAGE, "cgrp_storage"),
+            (BPF_MAP_TYPE_ARENA, "arena"),
+            (BPF_MAP_TYPE_INSN_ARRAY, "insn_array"),
+        ];
+        assert_eq!(table.len(), 34, "table must mirror all 34 known arms");
+        for &(disc, name) in table {
+            assert_eq!(
+                map_type_name(disc),
+                Some(name),
+                "map_type_name({disc}) must be Some({name:?})",
+            );
+        }
         // Unknown discriminant well past every uapi value.
         assert_eq!(map_type_name(0xDEAD_BEEF), None);
     }

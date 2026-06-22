@@ -2900,6 +2900,14 @@ mod tests {
 
     #[test]
     fn detect_str_param_btf_string_ptr() {
+        // param[1] carries is_string_ptr (the BTF signal) but a name
+        // ("p1") matching NO name heuristic; param[2] is a non-BTF ptr
+        // whose name ("msg") DOES match the heuristic. The BTF loop runs
+        // first and returns index 1; were the BTF is_string_ptr loop
+        // deleted, the name fallback would instead return index 2. So
+        // asserting == 1 pins BOTH the BTF branch and its precedence
+        // over the name heuristic (a "fmt"-named string ptr could not —
+        // "fmt" is itself a name-heuristic literal, masking the branch).
         let func = BtfFunc {
             name: "test".into(),
             params: vec![
@@ -2910,10 +2918,16 @@ mod tests {
                     ..Default::default()
                 },
                 super::super::btf::BtfParam {
-                    name: "fmt".into(),
+                    name: "p1".into(),
                     struct_name: None,
                     is_ptr: true,
                     is_string_ptr: true,
+                    ..Default::default()
+                },
+                super::super::btf::BtfParam {
+                    name: "msg".into(),
+                    struct_name: None,
+                    is_ptr: true,
                     ..Default::default()
                 },
             ],

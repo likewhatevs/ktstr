@@ -2646,31 +2646,78 @@ mod tests {
     #[test]
     fn run_named_test_gauntlet_prefix_routes_to_run_gauntlet_test() {
         // Gauntlet names require two slash-separated parts after the
-        // prefix (`{name}/{preset}`); a single-segment name is
-        // rejected by `run_gauntlet_test`, proving the prefix routed
-        // there and not into the base-test path (which would print
-        // `unknown test: gauntlet/...` instead of the gauntlet-
-        // specific error and still return 1 but via a different
-        // branch).
-        let exit = run_named_test("gauntlet/__unit_test_dummy__");
+        // prefix (`{name}/{preset}`); a single-segment name is rejected
+        // by `run_gauntlet_test` with "invalid gauntlet test name: ...".
+        // The base-test path would instead print "unknown test: ..." —
+        // both return exit 1, so capturing stderr is what proves the
+        // `gauntlet/` prefix routed to `run_gauntlet_test` rather than
+        // falling through to `find_test`.
+        use crate::test_support::test_helpers::{EnvVarGuard, capture_stderr, lock_env};
+        // run_named_test reads KTSTR_KERNEL_LIST lock-free; hold the env
+        // lock and clear the list so a concurrent multi-kernel setter
+        // can't make strip_kernel_suffix reject the name (exit 1 via the
+        // wrong branch). Mirrors run_named_test_perf_mode_test_skips_*.
+        let _env_lock = lock_env();
+        let _kernel_list = EnvVarGuard::remove(crate::KTSTR_KERNEL_LIST_ENV);
+
+        let (exit, captured) =
+            capture_stderr(|| run_named_test("gauntlet/__unit_test_dummy__"));
         assert_eq!(exit, 1, "malformed gauntlet names must exit 1");
+        let stderr = String::from_utf8(captured).expect("stderr is utf-8");
+        assert!(
+            stderr.contains("invalid gauntlet test name: gauntlet/__unit_test_dummy__"),
+            "the gauntlet/ prefix must route to run_gauntlet_test (its \
+             format error), not the base-path 'unknown test'; got: {stderr}",
+        );
+        assert!(
+            !stderr.contains("unknown test:"),
+            "must NOT fall through to the base-test 'unknown test' path; \
+             got: {stderr}",
+        );
     }
 
     #[test]
     fn run_named_test_bare_unknown_exits_nonzero() {
-        // `run_named_test` strips `ktstr/` when present; a bare
-        // unknown name falls through to `find_test` which returns
-        // None, producing exit code 1.
-        let exit = run_named_test("__definitely_not_a_real_test__");
+        // `run_named_test` strips `ktstr/` when present; a bare unknown
+        // name falls through to `find_test` which returns None,
+        // producing exit code 1. Hold the env lock and clear
+        // KTSTR_KERNEL_LIST so a concurrent multi-kernel setter can't
+        // make strip_kernel_suffix reject the name first (also exit 1,
+        // but via the wrong branch); capture stderr to prove the
+        // find_test-None path is what produced the exit.
+        use crate::test_support::test_helpers::{EnvVarGuard, capture_stderr, lock_env};
+        let _env_lock = lock_env();
+        let _kernel_list = EnvVarGuard::remove(crate::KTSTR_KERNEL_LIST_ENV);
+        let (exit, captured) =
+            capture_stderr(|| run_named_test("__definitely_not_a_real_test__"));
         assert_eq!(exit, 1);
+        let stderr = String::from_utf8(captured).expect("stderr is utf-8");
+        assert!(
+            stderr.contains("unknown test:")
+                && stderr.contains("__definitely_not_a_real_test__"),
+            "exit 1 must come from the find_test None path; got: {stderr}",
+        );
     }
 
     #[test]
     fn run_named_test_ktstr_prefix_unknown_exits_nonzero() {
         // `ktstr/` prefix is stripped; the bare name (also unknown)
-        // returns 1 via the find_test None path.
-        let exit = run_named_test("ktstr/__definitely_not_a_real_test__");
+        // returns 1 via the find_test None path. Same env isolation and
+        // stderr check as the bare-name case so the asserted branch is
+        // provably the cause.
+        use crate::test_support::test_helpers::{EnvVarGuard, capture_stderr, lock_env};
+        let _env_lock = lock_env();
+        let _kernel_list = EnvVarGuard::remove(crate::KTSTR_KERNEL_LIST_ENV);
+        let (exit, captured) =
+            capture_stderr(|| run_named_test("ktstr/__definitely_not_a_real_test__"));
         assert_eq!(exit, 1);
+        let stderr = String::from_utf8(captured).expect("stderr is utf-8");
+        assert!(
+            stderr.contains("unknown test:")
+                && stderr.contains("__definitely_not_a_real_test__"),
+            "exit 1 must come from the find_test None path (after ktstr/ \
+             strip); got: {stderr}",
+        );
     }
 
     #[test]

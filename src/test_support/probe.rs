@@ -4929,9 +4929,10 @@ mod tests {
 
     /// `finalize_probe_after_unwind` is a no-op when no `DeferredProbe`
     /// was stashed: the `let Some(deferred) = take_deferred_probe()
-    /// else { return; }` early-return at probe.rs:2415-2417 leaves the
-    /// global `DEFERRED_PROBE_COLLECT` static untouched and never
-    /// reaches `wait_for_sched_disabled` / `collect_and_print_probe_data`.
+    /// else { return; }` early-return in `finalize_probe_after_unwind`
+    /// leaves the global `DEFERRED_PROBE_COLLECT` static untouched and
+    /// never reaches `wait_for_sched_disabled` /
+    /// `collect_and_print_probe_data`.
     /// Drain to a known-empty precondition, call the finaliser, then
     /// assert the static is still empty — the no-op path must NOT stash
     /// anything and must NOT panic.
@@ -4948,33 +4949,33 @@ mod tests {
         assert!(
             take_deferred_probe().is_none(),
             "no-op path must leave DEFERRED_PROBE_COLLECT empty \
-             (early-return at probe.rs:2415-2417)",
+             (the early-return in finalize_probe_after_unwind)",
         );
     }
 
     // -- collect_and_print_probe_data (handle:None path) --
 
     /// `collect_and_print_probe_data` returns at the `let Some(ph) =
-    /// handle else { return; }` early-return (probe.rs:2505-2507) when
-    /// `handle` is `None`, BEFORE the `stop.store(true, Release)` at
-    /// probe.rs:2509. Asserting the stop flag stays `false` (not merely
-    /// "no panic") distinguishes the early-return from the join path,
-    /// which would have set it to `true`.
+    /// handle else { return; }` early-return when `handle` is `None`,
+    /// BEFORE the `stop.store(true, Release)`. Asserting the stop flag
+    /// stays `false` (not merely "no panic") distinguishes the
+    /// early-return from the join path, which would have set it to
+    /// `true`.
     #[test]
     fn collect_and_print_probe_data_none_handle_leaves_stop_false() {
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         collect_and_print_probe_data(stop.clone(), None);
         assert!(
             !stop.load(std::sync::atomic::Ordering::Acquire),
-            "None-handle path must early-return before stop.store \
-             (probe.rs:2505-2509), leaving stop == false",
+            "None-handle path must early-return before stop.store, \
+             leaving stop == false",
         );
     }
 
     // -- publish_result_and_collect (host arm / stash arm) --
 
     /// Host arm: with `is_guest()` forced `false`, `publish_result_and_collect`
-    /// takes the else branch at probe.rs:2493
+    /// takes the else branch
     /// (`collect_and_print_probe_data(stop, None)`), which early-returns
     /// on the `None` handle before `stop.store`. `try_flush_profraw`
     /// (host no-op: the `cfg(coverage)` body early-returns when
@@ -4996,12 +4997,12 @@ mod tests {
     }
 
     /// Stash arm: with `is_guest()` forced `true`, `publish_result_and_collect`
-    /// takes the `stash_deferred_probe(stop, handle)` branch at
-    /// probe.rs:2491 — which stores `Some(DeferredProbe)` into the
-    /// global static even with `handle = None` (stash_deferred_probe at
-    /// probe.rs:2337-2343 always wraps in `Some`). After the call,
-    /// `take_deferred_probe()` must return `Some` (proves L2491
-    /// executed); then drain it so a subsequent deferred-probe test
+    /// takes the `stash_deferred_probe(stop, handle)` branch — which
+    /// stores `Some(DeferredProbe)` into the global static even with
+    /// `handle = None` (`stash_deferred_probe` always wraps in `Some`).
+    /// After the call, `take_deferred_probe()` must return `Some`
+    /// (proves the stash branch executed); then drain it so a subsequent
+    /// deferred-probe test
     /// starts clean. `IsGuestOverrideGuard` is thread-local
     /// (guest_comms.rs), but the global static needs the shared
     /// `DEFERRED_PROBE_TEST_LOCK`.
@@ -5016,8 +5017,8 @@ mod tests {
         let stashed = take_deferred_probe();
         assert!(
             stashed.is_some(),
-            "guest arm must stash a DeferredProbe via stash_deferred_probe \
-             (probe.rs:2491); take_deferred_probe must return Some",
+            "guest arm must stash a DeferredProbe via stash_deferred_probe; \
+             take_deferred_probe must return Some",
         );
         assert!(
             stashed.expect("stash present").handle.is_none(),
