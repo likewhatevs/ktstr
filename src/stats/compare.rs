@@ -588,171 +588,8 @@ pub(crate) fn compare_rows_by(
             continue;
         }
 
-        for (i, m) in METRICS.iter().enumerate() {
-            // Rate components are internal plumbing — suppressed from compare
-            // output (they remain in storage for the cross-run re-pool).
-            if suppressed[i] {
-                continue;
-            }
-            let val_a = m.read(row_a).unwrap_or(0.0);
-            let val_b = m.read(row_b).unwrap_or(0.0);
-            if val_a.abs() < f64::EPSILON && val_b.abs() < f64::EPSILON {
-                continue;
-            }
-
-            let rel_thresh = rel_thresholds[i];
-
-            let delta = val_b - val_a;
-            let rel_delta = if val_a.abs() > f64::EPSILON {
-                (delta / val_a).abs()
-            } else {
-                0.0
-            };
-
-            if delta.abs() < m.default_abs || rel_delta < rel_thresh {
-                report.unchanged += 1;
-                continue;
-            }
-
-            let is_regression = if m.higher_is_worse() {
-                delta > 0.0
-            } else {
-                delta < 0.0
-            };
-            if is_regression {
-                report.regressions += 1;
-            } else {
-                report.improvements += 1;
-            }
-            report.findings.push(Finding {
-                pairing_key: key_b.clone(),
-                scenario: row_b.scenario.clone(),
-                topology: row_b.topology.clone(),
-                work_type: row_b.work_type.clone(),
-                metric: m,
-                val_a,
-                val_b,
-                delta,
-                is_regression,
-            });
-        }
-
-        // Per-phase delta pass — runs on every paired row pair
-        // alongside the scalar findings above. Walks the union of
-        // step_index keys from `row_a.phases` and `row_b.phases`
-        // and emits one [`PhaseDeltaRow`] per matched
-        // (step_index, metric_name) pair where both sides carry
-        // a value, or one [`UnpairedPhaseRow`] per side-only
-        // step_index. Rows whose `phases` slice is empty on
-        // either side contribute nothing here — single-phase
-        // scenarios skip the per-phase view entirely without
-        // emitting orphan UnpairedPhaseRows (an empty A-side
-        // against a populated B-side would otherwise flood the
-        // unpaired section for every B phase). The early-skip
-        // matches the "Empty when scenario produced no periodic
-        // captures" semantic on `ScenarioStats.phases`.
-        if !row_a.phases.is_empty() && !row_b.phases.is_empty() {
-            let a_by_step: std::collections::BTreeMap<u16, &crate::assert::PhaseBucket> =
-                row_a.phases.iter().map(|p| (p.step_index, p)).collect();
-            let b_by_step: std::collections::BTreeMap<u16, &crate::assert::PhaseBucket> =
-                row_b.phases.iter().map(|p| (p.step_index, p)).collect();
-            let union: std::collections::BTreeSet<u16> =
-                a_by_step.keys().chain(b_by_step.keys()).copied().collect();
-            for step_index in union {
-                match (a_by_step.get(&step_index), b_by_step.get(&step_index)) {
-                    (Some(pa), Some(pb)) => {
-                        // Matched phase on both sides — emit a
-                        // PhaseDeltaRow per metric_name present on
-                        // BOTH sides. A name on only one side
-                        // surfaces as an absent entry via the
-                        // sentinel-free `PhaseBucket::get` contract;
-                        // the renderer does not invent a synthetic
-                        // delta for it.
-                        //
-                        // `is_regression` honors the same dual-gate
-                        // the scalar pass applies inside its
-                        // per-metric loop (search for `default_abs <`
-                        // in `compare_rows_by` above): a row whose
-                        // `|delta| < default_abs` OR whose
-                        // `rel_delta < policy.rel_threshold` is
-                        // classified `is_regression = false` even
-                        // when the direction matches `polarity`.
-                        // This mirrors the scalar `unchanged`
-                        // semantic so a sub-threshold per-phase
-                        // delta (e.g. `+0.1 ms` on a 10-ms-default
-                        // gate) does not produce a false-positive
-                        // REGRESSION verdict in the rendered table.
-                        // The row is still emitted into
-                        // `phase_deltas` so programmatic consumers
-                        // of `CompareReport.phase_deltas` see every
-                        // paired comparison; the filter is on the
-                        // classification only.
-                        for (metric_name, &val_a) in &pa.metrics {
-                            // Suppress Rate components from the per-phase view
-                            // too (they stay in PhaseBucket.metrics for the
-                            // re-pool; only the rendered delta is dropped).
-                            if is_render_suppressed_component(metric_name) {
-                                continue;
-                            }
-                            let Some(&val_b) = pb.metrics.get(metric_name) else {
-                                continue;
-                            };
-                            let Some(metric_def) = metric_def(metric_name) else {
-                                continue;
-                            };
-                            let delta = val_b - val_a;
-                            let rel_thresh =
-                                policy.rel_threshold(metric_def.name, metric_def.default_rel);
-                            let rel_delta = if val_a.abs() > f64::EPSILON {
-                                (delta / val_a).abs()
-                            } else {
-                                0.0
-                            };
-                            let below_dual_gate =
-                                delta.abs() < metric_def.default_abs || rel_delta < rel_thresh;
-                            let is_regression = if below_dual_gate {
-                                false
-                            } else if metric_def.higher_is_worse() {
-                                delta > 0.0
-                            } else {
-                                delta < 0.0
-                            };
-                            report.phase_deltas.push(PhaseDeltaRow {
-                                pairing_key: key_b.clone(),
-                                step_index,
-                                label: pa.label.clone(),
-                                metric: metric_def,
-                                a: val_a,
-                                b: val_b,
-                                delta,
-                                is_regression,
-                            });
-                        }
-                    }
-                    (Some(orphan), None) => {
-                        report.unpaired_phases.push(UnpairedPhaseRow {
-                            side: ComparePartition::A,
-                            pairing_key: key_b.clone(),
-                            step_index,
-                            label: orphan.label.clone(),
-                            metrics: metrics_without_suppressed(&orphan.metrics),
-                        });
-                    }
-                    (None, Some(orphan)) => {
-                        report.unpaired_phases.push(UnpairedPhaseRow {
-                            side: ComparePartition::B,
-                            pairing_key: key_b.clone(),
-                            step_index,
-                            label: orphan.label.clone(),
-                            metrics: metrics_without_suppressed(&orphan.metrics),
-                        });
-                    }
-                    (None, None) => {
-                        unreachable!("step_index taken from union of a_by_step / b_by_step keys")
-                    }
-                }
-            }
-        }
+        push_scalar_findings(&mut report, row_a, row_b, &key_b, &rel_thresholds, &suppressed);
+        push_phase_deltas(&mut report, row_a, row_b, &key_b, policy);
     }
 
     // Second pass: A-side rows whose key has no match on the B side.
@@ -785,6 +622,197 @@ pub(crate) fn compare_rows_by(
     }
 
     report
+}
+
+/// Append the scalar per-metric findings for one matched `(row_a,
+/// row_b)` pair to `report`. Indexed by the `METRICS` enumerate
+/// position: `rel_thresholds[i]` is the hoisted relative threshold
+/// and `suppressed[i]` the hoisted render-suppression flag for the
+/// i-th metric (both built once by [`compare_rows_by`] over the same
+/// `METRICS` order). Bumps `report.unchanged` for sub-dual-gate
+/// deltas and `report.regressions` / `report.improvements` per
+/// metric polarity for the rest, pushing a [`Finding`] for each
+/// significant delta.
+fn push_scalar_findings(
+    report: &mut CompareReport,
+    row_a: &GauntletRow,
+    row_b: &GauntletRow,
+    key_b: &PairingKey,
+    rel_thresholds: &[f64],
+    suppressed: &[bool],
+) {
+    for (i, m) in METRICS.iter().enumerate() {
+        // Rate components are internal plumbing — suppressed from compare
+        // output (they remain in storage for the cross-run re-pool).
+        if suppressed[i] {
+            continue;
+        }
+        let val_a = m.read(row_a).unwrap_or(0.0);
+        let val_b = m.read(row_b).unwrap_or(0.0);
+        if val_a.abs() < f64::EPSILON && val_b.abs() < f64::EPSILON {
+            continue;
+        }
+
+        let rel_thresh = rel_thresholds[i];
+
+        let delta = val_b - val_a;
+        let rel_delta = if val_a.abs() > f64::EPSILON {
+            (delta / val_a).abs()
+        } else {
+            0.0
+        };
+
+        if delta.abs() < m.default_abs || rel_delta < rel_thresh {
+            report.unchanged += 1;
+            continue;
+        }
+
+        let is_regression = if m.higher_is_worse() {
+            delta > 0.0
+        } else {
+            delta < 0.0
+        };
+        if is_regression {
+            report.regressions += 1;
+        } else {
+            report.improvements += 1;
+        }
+        report.findings.push(Finding {
+            pairing_key: key_b.clone(),
+            scenario: row_b.scenario.clone(),
+            topology: row_b.topology.clone(),
+            work_type: row_b.work_type.clone(),
+            metric: m,
+            val_a,
+            val_b,
+            delta,
+            is_regression,
+        });
+    }
+}
+
+/// Append the per-phase delta rows for one matched `(row_a, row_b)`
+/// pair to `report`. Runs on every paired row pair alongside the
+/// scalar findings (see [`push_scalar_findings`]). Walks the union of
+/// step_index keys from `row_a.phases` and `row_b.phases` and emits
+/// one [`PhaseDeltaRow`] per matched (step_index, metric_name) pair
+/// where both sides carry a value, or one [`UnpairedPhaseRow`] per
+/// side-only step_index. Rows whose `phases` slice is empty on
+/// either side contribute nothing here — single-phase scenarios skip
+/// the per-phase view entirely without emitting orphan
+/// UnpairedPhaseRows (an empty A-side against a populated B-side
+/// would otherwise flood the unpaired section for every B phase). The
+/// early-skip matches the "Empty when scenario produced no periodic
+/// captures" semantic on `ScenarioStats.phases`.
+fn push_phase_deltas(
+    report: &mut CompareReport,
+    row_a: &GauntletRow,
+    row_b: &GauntletRow,
+    key_b: &PairingKey,
+    policy: &ComparisonPolicy,
+) {
+    if !row_a.phases.is_empty() && !row_b.phases.is_empty() {
+        let a_by_step: std::collections::BTreeMap<u16, &crate::assert::PhaseBucket> =
+            row_a.phases.iter().map(|p| (p.step_index, p)).collect();
+        let b_by_step: std::collections::BTreeMap<u16, &crate::assert::PhaseBucket> =
+            row_b.phases.iter().map(|p| (p.step_index, p)).collect();
+        let union: std::collections::BTreeSet<u16> =
+            a_by_step.keys().chain(b_by_step.keys()).copied().collect();
+        for step_index in union {
+            match (a_by_step.get(&step_index), b_by_step.get(&step_index)) {
+                (Some(pa), Some(pb)) => {
+                    // Matched phase on both sides — emit a
+                    // PhaseDeltaRow per metric_name present on
+                    // BOTH sides. A name on only one side
+                    // surfaces as an absent entry via the
+                    // sentinel-free `PhaseBucket::get` contract;
+                    // the renderer does not invent a synthetic
+                    // delta for it.
+                    //
+                    // `is_regression` honors the same dual-gate
+                    // the scalar pass applies inside its
+                    // per-metric loop (search for `default_abs <`
+                    // in `compare_rows_by` above): a row whose
+                    // `|delta| < default_abs` OR whose
+                    // `rel_delta < policy.rel_threshold` is
+                    // classified `is_regression = false` even
+                    // when the direction matches `polarity`.
+                    // This mirrors the scalar `unchanged`
+                    // semantic so a sub-threshold per-phase
+                    // delta (e.g. `+0.1 ms` on a 10-ms-default
+                    // gate) does not produce a false-positive
+                    // REGRESSION verdict in the rendered table.
+                    // The row is still emitted into
+                    // `phase_deltas` so programmatic consumers
+                    // of `CompareReport.phase_deltas` see every
+                    // paired comparison; the filter is on the
+                    // classification only.
+                    for (metric_name, &val_a) in &pa.metrics {
+                        // Suppress Rate components from the per-phase view
+                        // too (they stay in PhaseBucket.metrics for the
+                        // re-pool; only the rendered delta is dropped).
+                        if is_render_suppressed_component(metric_name) {
+                            continue;
+                        }
+                        let Some(&val_b) = pb.metrics.get(metric_name) else {
+                            continue;
+                        };
+                        let Some(metric_def) = metric_def(metric_name) else {
+                            continue;
+                        };
+                        let delta = val_b - val_a;
+                        let rel_thresh =
+                            policy.rel_threshold(metric_def.name, metric_def.default_rel);
+                        let rel_delta = if val_a.abs() > f64::EPSILON {
+                            (delta / val_a).abs()
+                        } else {
+                            0.0
+                        };
+                        let below_dual_gate =
+                            delta.abs() < metric_def.default_abs || rel_delta < rel_thresh;
+                        let is_regression = if below_dual_gate {
+                            false
+                        } else if metric_def.higher_is_worse() {
+                            delta > 0.0
+                        } else {
+                            delta < 0.0
+                        };
+                        report.phase_deltas.push(PhaseDeltaRow {
+                            pairing_key: key_b.clone(),
+                            step_index,
+                            label: pa.label.clone(),
+                            metric: metric_def,
+                            a: val_a,
+                            b: val_b,
+                            delta,
+                            is_regression,
+                        });
+                    }
+                }
+                (Some(orphan), None) => {
+                    report.unpaired_phases.push(UnpairedPhaseRow {
+                        side: ComparePartition::A,
+                        pairing_key: key_b.clone(),
+                        step_index,
+                        label: orphan.label.clone(),
+                        metrics: metrics_without_suppressed(&orphan.metrics),
+                    });
+                }
+                (None, Some(orphan)) => {
+                    report.unpaired_phases.push(UnpairedPhaseRow {
+                        side: ComparePartition::B,
+                        pairing_key: key_b.clone(),
+                        step_index,
+                        label: orphan.label.clone(),
+                        metrics: metrics_without_suppressed(&orphan.metrics),
+                    });
+                }
+                (None, None) => {
+                    unreachable!("step_index taken from union of a_by_step / b_by_step keys")
+                }
+            }
+        }
+    }
 }
 
 /// Emit a stderr warning naming any `-dirty` commit values present

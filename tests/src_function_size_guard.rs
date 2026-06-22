@@ -298,7 +298,6 @@ const EXCEPTIONS: &[(&str, &str, usize)] = &[
     ), // queued: decompose
     ("assert/plan.rs", "AssertPlan::assert_cgroup", 234), // queued: decompose
     ("bin/cargo-ktstr.rs", "main", 239),                  // queued: decompose
-    ("stats/compare.rs", "compare_rows_by", 271),         // queued: decompose
     ("test_support/dispatch.rs", "result_to_exit_code", 247), // queued: decompose
     (
         "vmm/freeze_coord/kernel_op_dispatch.rs",
