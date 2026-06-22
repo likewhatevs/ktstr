@@ -65,6 +65,19 @@ zstd = { version = "0.13", features = ["zstdmt"] }
 lz4_flex = { version = "0.13", features = ["frame"] }
 flate2 = "1"
 glob = "0.3"
+# Stack-resident iovec/guard scratch for the virtio-blk vectored
+# read/write handlers (src/vmm/virtio_blk/device.rs): inline capacity
+# MAX_BLK_IOVECS (SEG_MAX*2 = 256) covers the proven worst case so a
+# legitimate-guest request builds its iovec chain with zero heap
+# allocation. Already pulled in transitively (vm-memory / gix /
+# tracing-subscriber and others), so promoting it to a direct dep adds
+# no new crate to the build. cloud-hypervisor uses the same
+# SmallVec<[libc::iovec; N]> pattern in its block device.
+# `const_generics` makes SmallVec<[T; N]> compile for any N (blanket
+# Array impl); without it only smallvec's hand-listed array sizes work,
+# so a future SEG_MAX whose *2 lands on a non-blessed size would fail
+# to compile with an opaque "Array not implemented" error.
+smallvec = { version = "1", features = ["const_generics"] }
 # `proc_macro` default feature kept on: tests/private_module_paths.rs
 # pins the `::ktstr::__private::ctor::ctor(...)` re-export so the
 # proc-macro form stays compilable for downstream consumers.

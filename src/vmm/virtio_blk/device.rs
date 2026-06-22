@@ -29,6 +29,7 @@ pub(crate) use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::thread;
 pub(crate) use std::time::Duration;
 
+use smallvec::SmallVec;
 pub(crate) use virtio_bindings::virtio_blk::{
     VIRTIO_BLK_F_BLK_SIZE, VIRTIO_BLK_F_FLUSH, VIRTIO_BLK_F_RO, VIRTIO_BLK_F_SEG_MAX,
     VIRTIO_BLK_F_SIZE_MAX, VIRTIO_BLK_ID_BYTES, VIRTIO_BLK_S_IOERR, VIRTIO_BLK_S_OK,
@@ -166,6 +167,17 @@ pub(crate) const VIRTIO_BLK_SIZE_MAX: u32 = 1 << 20;
 /// there trip in test/debug builds if a future change ever breaks
 /// that bound.
 const IOV_MAX: usize = 1024;
+
+/// Inline iovec capacity for the vectored read/write handlers'
+/// stack-resident `SmallVec`s. Sized to the structural worst case
+/// proven in the preadv/pwritev SAFETY comments: at most
+/// `VIRTIO_BLK_SEG_MAX` (128) data segments, each over MiB-granular
+/// guest-memory regions, so a segment crosses at most one region
+/// boundary -> at most 2 iovecs/segment -> `SEG_MAX * 2 = 256` total.
+/// A legitimate-guest request therefore builds its whole iovec chain
+/// inline with ZERO heap allocation, and stays <= `IOV_MAX` so
+/// preadv/pwritev never see `iovcnt > IOV_MAX`.
+pub(crate) const MAX_BLK_IOVECS: usize = VIRTIO_BLK_SEG_MAX as usize * 2;
 
 /// Cap on consecutive `EINTR` re-issues of a single blk vectored IO
 /// (`preadv`/`pwritev`) before giving up with `S_IOERR`. `EINTR` on a
@@ -1342,21 +1354,28 @@ impl VirtioBlk {
         // the raw pointer. Either way, holding the guards across
         // the syscall guarantees the `iov_base` pointers stay valid.
         //
-        // Local Vec rather than a reusable scratch on `BlkWorkerState`:
-        // `libc::iovec` contains a raw pointer, which is `!Send`, so
-        // storing a `Vec<libc::iovec>` on `BlkWorkerState` would make
-        // the whole struct `!Send` and break the `JoinHandle<…>`
-        // payload. The initial capacity is a `VIRTIO_BLK_SEG_MAX + 2`
-        // hint (one entry per data segment plus header+status); the
-        // Vec grows via reallocation if multi-region descriptors
-        // fragment into more iovec entries. The per-call allocation
-        // is amortized against the single `preadv` syscall it
-        // replaces — a quantum of overhead vastly smaller than the
-        // N kernel-mode syscall transitions the legacy per-segment
-        // path performed.
-        let mut iovecs: Vec<libc::iovec> = Vec::with_capacity(VIRTIO_BLK_SEG_MAX as usize + 2);
-        let mut _guards: Vec<vm_memory::volatile_memory::PtrGuardMut> =
-            Vec::with_capacity(VIRTIO_BLK_SEG_MAX as usize + 2);
+        // Stack-resident `SmallVec` (inline capacity `MAX_BLK_IOVECS`)
+        // rather than a heap `Vec` or a reusable scratch on
+        // `BlkWorkerState`. The inline capacity is the proven
+        // structural worst case (`SEG_MAX * 2`, derived in the SAFETY
+        // comment below), so a legitimate-guest request builds its
+        // whole iovec chain with ZERO heap allocation — no per-request
+        // malloc/free, no realloc on multi-region fragmentation. A
+        // reusable `BlkWorkerState` field is avoided: `libc::iovec`
+        // holds a raw pointer (`!Send`), so a field-resident scratch
+        // would make `BlkWorkerState` `!Send` and break moving it into
+        // the spawned blk worker thread (the worker closure captures
+        // the state and must be `Send`); a stack-local `SmallVec`
+        // sidesteps that (it is never stored) while still eliding the
+        // allocation. (cloud-hypervisor uses the same
+        // `SmallVec<[libc::iovec; N]>`. firecracker instead keeps a
+        // persistent per-queue iovec buffer as a field and makes it
+        // `Send` with an explicit `unsafe impl Send` (iovec.rs); ktstr
+        // avoids that unsafe impl — the inline `SmallVec` gives the same
+        // zero-alloc on the legitimate path without it.)
+        let mut iovecs: SmallVec<[libc::iovec; MAX_BLK_IOVECS]> = SmallVec::new();
+        let mut _guards: SmallVec<[vm_memory::volatile_memory::PtrGuardMut; MAX_BLK_IOVECS]> =
+            SmallVec::new();
         for seg in data_segments {
             if !seg.is_write_only {
                 // Spec violation — a T_IN request's data SGs must
@@ -1419,7 +1438,7 @@ impl VirtioBlk {
         let bytes_from_backing: u64 = if iovecs.is_empty() {
             0
         } else {
-            // SAFETY: `iovecs` is a non-empty Vec of `libc::iovec`
+            // SAFETY: `iovecs` is a non-empty `SmallVec` of `libc::iovec`
             // entries built from valid host pointers (each came from
             // a `VolatileSlice` produced by `mem.get_slices(...)`
             // and the corresponding `PtrGuardMut` is alive in
@@ -1651,9 +1670,9 @@ impl VirtioBlk {
         // hold `PtrGuard`s rather than `PtrGuardMut`s — no dirty
         // tracking is needed because we are not modifying guest
         // memory here.
-        let mut iovecs: Vec<libc::iovec> = Vec::with_capacity(VIRTIO_BLK_SEG_MAX as usize + 2);
-        let mut _guards: Vec<vm_memory::volatile_memory::PtrGuard> =
-            Vec::with_capacity(VIRTIO_BLK_SEG_MAX as usize + 2);
+        let mut iovecs: SmallVec<[libc::iovec; MAX_BLK_IOVECS]> = SmallVec::new();
+        let mut _guards: SmallVec<[vm_memory::volatile_memory::PtrGuard; MAX_BLK_IOVECS]> =
+            SmallVec::new();
         for seg in data_segments {
             if seg.is_write_only {
                 // Spec violation — a T_OUT request's data SGs must
