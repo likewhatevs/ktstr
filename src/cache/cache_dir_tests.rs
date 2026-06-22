@@ -1918,6 +1918,18 @@ fn store_in_lock_recheck_mixed_content_peers_publish_one_per_group() {
     }
     let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
 
+    assert_peer_results_group_coherent(&results, &group_a_inputs, &group_b_inputs);
+    observe_recheck_collapse(&results);
+    assert_final_on_disk_entry(&cache, &group_a_inputs, &group_b_inputs);
+}
+
+/// Asserts every peer return is content-valid and group-coherent
+/// (hash↔label, hash↔built_at cross-group separation).
+fn assert_peer_results_group_coherent(
+    results: &[(&'static str, Option<String>, String)],
+    group_a_inputs: &std::collections::BTreeSet<String>,
+    group_b_inputs: &std::collections::BTreeSet<String>,
+) {
     // Every peer's returned entry must carry one of the two
     // valid content states — never a torn third state, never
     // None. The exact set of returned config_hash values
@@ -1925,7 +1937,7 @@ fn store_in_lock_recheck_mixed_content_peers_publish_one_per_group() {
     // finished entirely before the other started, two states
     // otherwise) but every observed value MUST belong to
     // {Some("hash-a"), Some("hash-b")}.
-    for (label, observed_hash, observed_built_at) in &results {
+    for (label, observed_hash, observed_built_at) in results {
         let observed_hash_str = observed_hash.as_deref();
         assert!(
             matches!(observed_hash_str, Some("hash-a") | Some("hash-b")),
@@ -1998,7 +2010,11 @@ fn store_in_lock_recheck_mixed_content_peers_publish_one_per_group() {
             _ => unreachable!(),
         }
     }
+}
 
+/// Soft (non-asserting) observation of within-group recheck collapse.
+fn observe_recheck_collapse(results: &[(&'static str, Option<String>, String)]) {
+    use std::collections::BTreeSet;
     // Soft observation: at least one group SHOULD show
     // recheck collapse (multiple peers sharing the same
     // built_at). Logged not asserted — under adversarial
@@ -2038,7 +2054,14 @@ fn store_in_lock_recheck_mixed_content_peers_publish_one_per_group() {
             group_b_size,
         );
     }
+}
 
+/// Asserts the final on-disk entry is content-valid and group-coherent.
+fn assert_final_on_disk_entry(
+    cache: &CacheDir,
+    group_a_inputs: &std::collections::BTreeSet<String>,
+    group_b_inputs: &std::collections::BTreeSet<String>,
+) {
     // The final on-disk entry must match exactly one of the two
     // valid states (whichever cross-group writer won the last
     // publish). A torn or absent on-disk state means the

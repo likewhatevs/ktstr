@@ -116,11 +116,6 @@ const DEFAULT_FN_MAX_LINES: usize = 200;
 /// share one deferred task — the mega-function decomposition campaign);
 /// the guard's panic template emits it on every suggested entry.
 const EXCEPTIONS: &[(&str, &str, usize)] = &[
-    (
-        "cache/cache_dir_tests.rs",
-        "store_in_lock_recheck_mixed_content_peers_publish_one_per_group",
-        215,
-    ), // queued: decompose
     ("cli/kernel_build/build.rs", "kernel_build_pipeline", 492),  // queued: decompose
     ("ctprof/mod.rs", "capture_with", 473),                       // queued: decompose
     ("export.rs", "generate_preamble", 416),                      // queued: decompose
