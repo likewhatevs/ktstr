@@ -753,3 +753,30 @@ fn base_guest_cmdline_splices_arch_tail_and_pins_common_flags() {
         "cmdline must end with the KTSTR_GUEST=1 trailer; got {s:?}",
     );
 }
+
+#[test]
+fn numa_balancing_token_uses_kernel_accepted_spellings() {
+    use crate::vmm::topology::{NumaNode, Topology};
+    // Uniform topology has no memory-only nodes -> disable. The token
+    // MUST be the kernel-accepted "disable" string: setup_numabalancing
+    // (mm/mempolicy.c) strcmp-rejects everything but "enable"/"disable",
+    // so the old "numa_balancing=0" was silently ignored, leaving NUMA
+    // balancing at its CONFIG default instead of off.
+    let uniform = Topology::new(1, 1, 2, 1);
+    assert!(!uniform.has_memory_only_nodes());
+    assert_eq!(
+        numa_balancing_cmdline_token(&uniform),
+        " numa_balancing=disable",
+        "disable token must be the kernel-accepted 'disable' string, not '0'",
+    );
+    // Memory-only (CXL) topology -> enable (migrate pages toward
+    // CPU-bearing nodes).
+    static NODES: [NumaNode; 3] = [
+        NumaNode::new(2, 512),
+        NumaNode::new(2, 512),
+        NumaNode::new(0, 1024),
+    ];
+    let cxl = Topology::with_nodes(4, 1, &NODES);
+    assert!(cxl.has_memory_only_nodes());
+    assert_eq!(numa_balancing_cmdline_token(&cxl), " numa_balancing=enable");
+}

@@ -198,6 +198,26 @@ fn base_guest_cmdline(arch_extra: &str) -> String {
     )
 }
 
+/// NUMA-balancing cmdline token. The kernel handler
+/// `setup_numabalancing` (mm/mempolicy.c) accepts ONLY the strings
+/// "enable" / "disable" via `strcmp`; any other value (e.g. "0")
+/// leaves the parse result 0, logs `pr_warn("Unable to parse
+/// numa_balancing=")`, and is IGNORED — so the kernel keeps its
+/// compiled CONFIG_NUMA_BALANCING_DEFAULT_ENABLED state instead of
+/// being turned off. Memory-only (CXL) topologies want balancing ON to
+/// migrate pages toward CPU-bearing nodes; the uniform/default case
+/// wants it OFF to keep scheduler measurements free of migration
+/// noise. Extracted (like `base_guest_cmdline`) so the x86_64
+/// (`build_guest_cmdline`) and aarch64 (`finish_aarch64_setup`) sites
+/// share one definition and a host unit test can pin both branches.
+fn numa_balancing_cmdline_token(topology: &crate::vmm::topology::Topology) -> &'static str {
+    if topology.has_memory_only_nodes() {
+        " numa_balancing=enable"
+    } else {
+        " numa_balancing=disable"
+    }
+}
+
 /// Pure helper: assemble the `extras` slice and the [`BaseKey`] from
 /// the resolved scheduler/probe/worker/staged-binary paths. Extracted
 /// out of [`KtstrVm::spawn_initramfs_resolve`] so the staged-extras
@@ -1425,11 +1445,7 @@ impl KtstrVm {
                 kvm::VIRTIO_NET_IRQ,
             ));
         }
-        if self.topology.has_memory_only_nodes() {
-            cmdline.push_str(" numa_balancing=enable");
-        } else {
-            cmdline.push_str(" numa_balancing=0");
-        }
+        cmdline.push_str(numa_balancing_cmdline_token(&self.topology));
         #[cfg(feature = "wprof")]
         if let Some(wprof) = self.wprof.as_ref() {
             cmdline.push_str(" KTSTR_WPROF_ARGS=");
@@ -1754,11 +1770,7 @@ impl KtstrVm {
             let disk = &self.disks[0];
             cmdline.push_str(&disk_auto_mount_cmdline_tokens(disk));
         }
-        if self.topology.has_memory_only_nodes() {
-            cmdline.push_str(" numa_balancing=enable");
-        } else {
-            cmdline.push_str(" numa_balancing=0");
-        }
+        cmdline.push_str(numa_balancing_cmdline_token(&self.topology));
         #[cfg(feature = "wprof")]
         if let Some(wprof) = self.wprof.as_ref() {
             cmdline.push_str(" KTSTR_WPROF_ARGS=");
