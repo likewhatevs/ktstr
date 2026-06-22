@@ -880,6 +880,28 @@ impl VirtioNet {
     /// "no chain available" and lets every subsequent kick re-trip
     /// the same error. Mirror of the virtio-blk drain pattern.
     fn pop_and_capture_tx(&mut self, mem: &GuestMemoryMmap) -> TxPopOutcome {
+        // Two phases: pop one TX chain (entry poison-gate +
+        // iter()-pull), then walk its descriptors skipping the
+        // 12-byte header and capturing the frame bytes into
+        // `tx_frame_scratch`. Split out so each phase stays under the
+        // function-size guard; the per-phase bodies are unchanged.
+        let (chain, head) = match self.pop_tx_chain(mem) {
+            Ok(v) => v,
+            Err(outcome) => return outcome,
+        };
+        self.capture_tx_frame(chain, head, mem)
+    }
+
+    /// Pop one chain off the TX queue.
+    ///
+    /// Applies the per-queue poison entry gate (TX side) and pulls a
+    /// single chain via the two-step `iter()`-then-drop pattern. On
+    /// success returns the chain and its head index; every early exit
+    /// becomes `Err(TxPopOutcome::X)` for the caller to return verbatim.
+    fn pop_tx_chain<'a>(
+        &mut self,
+        mem: &'a GuestMemoryMmap,
+    ) -> Result<(DescriptorChain<&'a GuestMemoryMmap>, u16), TxPopOutcome> {
         // Per-queue poison gate. If the TX queue's flag is already
         // set, return Empty so the drain loop breaks naturally —
         // no iter() call (avoids re-tripping the same error and
@@ -890,7 +912,7 @@ impl VirtioNet {
         // false→true crossing, not on every kick. Re-kicks are
         // benign no-ops.
         if self.queue_poisoned[TXQ] {
-            return TxPopOutcome::Empty;
+            return Err(TxPopOutcome::Empty);
         }
         // Step 1: pull one chain out of the queue. The chain holds
         // its own `mem.clone()` (queue.rs:761-766) so it does NOT
@@ -933,11 +955,11 @@ impl VirtioNet {
                 Err(e) => IterStep::Poisoned(e),
             }
         };
-        let (chain, head) = match step {
-            IterStep::Empty => return TxPopOutcome::Empty,
+        match step {
+            IterStep::Empty => Err(TxPopOutcome::Empty),
             IterStep::Chain(c) => {
                 let h = c.head_index();
-                (c, h)
+                Ok((c, h))
             }
             IterStep::Poisoned(err) => {
                 // Hostile- or buggy-guest poison — first time. The
@@ -962,10 +984,26 @@ impl VirtioNet {
                      guest reset (any structural queue error is \
                      non-recoverable; cloud-hypervisor convergence)"
                 );
-                return TxPopOutcome::JustPoisoned;
+                Err(TxPopOutcome::JustPoisoned)
             }
-        };
+        }
+    }
 
+    /// Walk the popped TX `chain`, skipping the 12-byte virtio header
+    /// and capturing the post-header frame bytes into
+    /// `self.tx_frame_scratch`, then classify the outcome.
+    ///
+    /// Returns `Chain(TxChainOutcome { frame_len: None })` when the
+    /// chain is malformed or over-size — the caller must still
+    /// `add_used` the head so the guest doesn't hang. Returns
+    /// `Chain(TxChainOutcome { frame_len: Some(n) })` on success;
+    /// `self.tx_frame_scratch[..n]` holds the captured bytes.
+    fn capture_tx_frame(
+        &mut self,
+        chain: DescriptorChain<&GuestMemoryMmap>,
+        head: u16,
+        mem: &GuestMemoryMmap,
+    ) -> TxPopOutcome {
         // Reset scratch; capacity stays. `clear` is O(1) — it just
         // zeroes the len.
         self.tx_frame_scratch.clear();
