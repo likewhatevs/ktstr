@@ -512,6 +512,180 @@ fn write_auto_repro_sidecar_artifacts(
     }
 }
 
+/// Build and configure the auto-repro VM builder: resolve staged
+/// schedulers, construct the base builder, point the failure-dump sink
+/// at the `.repro` sibling path, enable the dual-snapshot freeze
+/// coordinator, attach wprof (when requested), wire KernelBuiltin
+/// enable/disable commands and monitor thresholds, and union the
+/// include files / scheduler args. Returns the configured builder plus
+/// the `.repro.failure-dump.json` path (needed to render the
+/// failure-dump tail later), or `None` if wprof attach fails.
+fn build_repro_vm_builder(
+    entry: &KtstrTestEntry,
+    kernel: &Path,
+    scheduler: Option<&Path>,
+    ktstr_bin: &Path,
+    topo: Option<&TopoOverride>,
+    guest_args: &[String],
+) -> Option<(crate::vmm::KtstrVmBuilder, std::path::PathBuf)> {
+    let cmdline_extra = super::runtime::build_cmdline_extra(entry);
+
+    let (vm_topology, memory_mib) = super::runtime::resolve_vm_topology(entry, topo);
+
+    let no_perf_mode = super::runtime::no_perf_mode_for_entry(entry);
+    // Resolve staged schedulers for the auto-repro VM so any
+    // scheduler-lifecycle ops in the replayed scenario can find
+    // their staged binaries at the same /staging/schedulers/<name>/
+    // paths the primary VM used. See crate::test_support::eval for the
+    // resolve-loop rationale + KernelBuiltin/Eevdf skip semantics.
+    //
+    // Resolution errors here log + skip rather than propagate: the
+    // auto-repro function returns Option<String> (best-effort), so
+    // a staging-resolve failure for one staged scheduler should not
+    // tear down the whole auto-repro path. The operator still gets
+    // the warn in tracing; the primary VM's failure already landed
+    // its own dump.
+    let mut resolved_staged: Vec<(String, std::path::PathBuf, Vec<String>)> = Vec::new();
+    for staged in entry.staged_schedulers {
+        match super::eval::resolve_scheduler(&staged.binary) {
+            Ok((Some(host_path), _src)) => {
+                resolved_staged.push((
+                    staged.name.to_string(),
+                    host_path,
+                    staged.sched_args.iter().map(|s| s.to_string()).collect(),
+                ));
+            }
+            Ok((None, _)) => {} // KernelBuiltin / Eevdf — no binary
+            Err(e) => {
+                tracing::warn!(
+                    staged_name = %staged.name,
+                    error = %e,
+                    "auto-repro: failed to resolve staged scheduler binary; skipping (Op::AttachScheduler / Op::ReplaceScheduler against this staged entry will fail at dispatch time in the repro VM)"
+                );
+            }
+        }
+    }
+    let mut builder = super::runtime::build_vm_builder_base(
+        entry,
+        kernel,
+        ktstr_bin,
+        scheduler,
+        &resolved_staged,
+        vm_topology,
+        memory_mib,
+        &cmdline_extra,
+        guest_args,
+        no_perf_mode,
+    );
+
+    // Set the auto-repro failure-dump sink to a `.repro` sibling
+    // of the primary's `{name}.failure-dump.json` so the auto-repro
+    // VM's dump (if it fires again) lands alongside, not on top of,
+    // the just-failed primary's dump. Both files survive in the
+    // sidecar dir for primary-vs-repro comparison. The setter is
+    // pure (no FS side effects); the repro path's stale-file
+    // pre-clear happened earlier at `test_support::eval`'s
+    // primary dispatch (which clears BOTH the primary AND the
+    // repro path before the primary VM boots). This setter call
+    // is therefore the only `failure_dump_path` invocation on the
+    // auto-repro path: `build_vm_builder_base` deliberately does
+    // not attach a path, so the primary dump is never touched
+    // during auto-repro.
+    let repro_dump_path =
+        super::sidecar::sidecar_dir().join(format!("{}.repro.failure-dump.json", entry.name));
+    builder = builder.failure_dump_path(&repro_dump_path);
+
+    // Repro VM gets the dual-snapshot freeze coordinator. The
+    // primary VM keeps the single-snapshot path (the primary's
+    // failure-dump.json schema is `FailureDumpReport`, not
+    // wrapped); flipping this on the repro builder is what tells
+    // the freeze coord to run the per-CPU `runnable_at` scanner
+    // and emit a `DualFailureDumpReport` at the repro path. The
+    // gate is a builder field rather than a path-string match so
+    // a future caller invoking the repro logic with a different
+    // `.failure_dump_path()` keeps working without surprise.
+    builder = builder
+        .dual_snapshot(true)
+        .performance_mode(entry.performance_mode);
+
+    #[cfg(feature = "wprof")]
+    {
+        builder = match crate::test_support::runtime::attach_wprof_if_requested(
+            builder,
+            entry,
+            "auto-repro",
+        ) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("ktstr_test: {e:#}");
+                return None;
+            }
+        };
+    }
+
+    if let crate::test_support::entry::SchedulerSpec::KernelBuiltin { enable, disable } =
+        &entry.scheduler.binary
+    {
+        builder = builder.sched_enable_cmds(enable);
+        builder = builder.sched_disable_cmds(disable);
+    }
+
+    let merged_assert = crate::assert::Assert::default_checks()
+        .merge(&entry.scheduler.assert)
+        .merge(&entry.assert);
+    if entry.scheduler.has_bpf_scheduler() {
+        builder = builder.monitor_thresholds(merged_assert.monitor_thresholds());
+    }
+
+    {
+        let mut args: Vec<String> = Vec::new();
+
+        let declarative_specs: Vec<std::path::PathBuf> = entry
+            .all_include_files()
+            .into_iter()
+            .map(std::path::PathBuf::from)
+            .collect();
+        let mut resolved_includes: Vec<(String, std::path::PathBuf, &'static str)> =
+            if declarative_specs.is_empty() {
+                Vec::new()
+            } else {
+                match crate::cli::resolve_include_files(&declarative_specs) {
+                    Ok(v) => v.into_iter().map(|(a, h)| (a, h, "declarative")).collect(),
+                    Err(e) => {
+                        eprintln!("ktstr_test: auto-repro: include_files resolve: {e:#}");
+                        Vec::new()
+                    }
+                }
+            };
+        if let Some((archive_path, host_path, guest_path)) = config_file_parts(entry) {
+            resolved_includes.push((archive_path, host_path, "scheduler config_file"));
+            args.push("--config".to_string());
+            args.push(guest_path);
+        }
+        if let Some((archive_path, host_path, _guest_path, cfg_args)) = config_content_parts(entry)
+        {
+            resolved_includes.push((archive_path, host_path, "inline config_content"));
+            args.extend(cfg_args);
+        }
+        match super::eval::dedupe_include_files(&resolved_includes) {
+            Ok(unioned) if !unioned.is_empty() => {
+                builder = builder.include_files(unioned);
+            }
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("ktstr_test: auto-repro: include_files dedupe: {e:#}");
+            }
+        }
+
+        super::runtime::append_base_sched_args(entry, &mut args);
+        if !args.is_empty() {
+            builder = builder.sched_args(&args);
+        }
+    }
+
+    Some((builder, repro_dump_path))
+}
+
 /// Attempt auto-repro: extract stack functions from COM2 scheduler output
 /// or COM1 kernel console (fallback), boot a second VM with BPF probes
 /// attached, and return formatted probe data. When no stack functions are
@@ -625,160 +799,8 @@ pub(crate) fn attempt_auto_repro(
         eprintln!("ktstr_test: auto-repro: stall exit — skipping probe attachment");
     }
 
-    let cmdline_extra = super::runtime::build_cmdline_extra(entry);
-
-    let (vm_topology, memory_mib) = super::runtime::resolve_vm_topology(entry, topo);
-
-    let no_perf_mode = super::runtime::no_perf_mode_for_entry(entry);
-    // Resolve staged schedulers for the auto-repro VM so any
-    // scheduler-lifecycle ops in the replayed scenario can find
-    // their staged binaries at the same /staging/schedulers/<name>/
-    // paths the primary VM used. See crate::test_support::eval for the
-    // resolve-loop rationale + KernelBuiltin/Eevdf skip semantics.
-    //
-    // Resolution errors here log + skip rather than propagate: the
-    // auto-repro function returns Option<String> (best-effort), so
-    // a staging-resolve failure for one staged scheduler should not
-    // tear down the whole auto-repro path. The operator still gets
-    // the warn in tracing; the primary VM's failure already landed
-    // its own dump.
-    let mut resolved_staged: Vec<(String, std::path::PathBuf, Vec<String>)> = Vec::new();
-    for staged in entry.staged_schedulers {
-        match super::eval::resolve_scheduler(&staged.binary) {
-            Ok((Some(host_path), _src)) => {
-                resolved_staged.push((
-                    staged.name.to_string(),
-                    host_path,
-                    staged.sched_args.iter().map(|s| s.to_string()).collect(),
-                ));
-            }
-            Ok((None, _)) => {} // KernelBuiltin / Eevdf — no binary
-            Err(e) => {
-                tracing::warn!(
-                    staged_name = %staged.name,
-                    error = %e,
-                    "auto-repro: failed to resolve staged scheduler binary; skipping (Op::AttachScheduler / Op::ReplaceScheduler against this staged entry will fail at dispatch time in the repro VM)"
-                );
-            }
-        }
-    }
-    let mut builder = super::runtime::build_vm_builder_base(
-        entry,
-        kernel,
-        ktstr_bin,
-        scheduler,
-        &resolved_staged,
-        vm_topology,
-        memory_mib,
-        &cmdline_extra,
-        &guest_args,
-        no_perf_mode,
-    );
-
-    // Set the auto-repro failure-dump sink to a `.repro` sibling
-    // of the primary's `{name}.failure-dump.json` so the auto-repro
-    // VM's dump (if it fires again) lands alongside, not on top of,
-    // the just-failed primary's dump. Both files survive in the
-    // sidecar dir for primary-vs-repro comparison. The setter is
-    // pure (no FS side effects); the repro path's stale-file
-    // pre-clear happened earlier at `test_support::eval`'s
-    // primary dispatch (which clears BOTH the primary AND the
-    // repro path before the primary VM boots). This setter call
-    // is therefore the only `failure_dump_path` invocation on the
-    // auto-repro path: `build_vm_builder_base` deliberately does
-    // not attach a path, so the primary dump is never touched
-    // during auto-repro.
-    let repro_dump_path =
-        super::sidecar::sidecar_dir().join(format!("{}.repro.failure-dump.json", entry.name));
-    builder = builder.failure_dump_path(&repro_dump_path);
-
-    // Repro VM gets the dual-snapshot freeze coordinator. The
-    // primary VM keeps the single-snapshot path (the primary's
-    // failure-dump.json schema is `FailureDumpReport`, not
-    // wrapped); flipping this on the repro builder is what tells
-    // the freeze coord to run the per-CPU `runnable_at` scanner
-    // and emit a `DualFailureDumpReport` at the repro path. The
-    // gate is a builder field rather than a path-string match so
-    // a future caller invoking the repro logic with a different
-    // `.failure_dump_path()` keeps working without surprise.
-    builder = builder
-        .dual_snapshot(true)
-        .performance_mode(entry.performance_mode);
-
-    #[cfg(feature = "wprof")]
-    {
-        builder = match crate::test_support::runtime::attach_wprof_if_requested(
-            builder,
-            entry,
-            "auto-repro",
-        ) {
-            Ok(b) => b,
-            Err(e) => {
-                eprintln!("ktstr_test: {e:#}");
-                return None;
-            }
-        };
-    }
-
-    if let crate::test_support::entry::SchedulerSpec::KernelBuiltin { enable, disable } =
-        &entry.scheduler.binary
-    {
-        builder = builder.sched_enable_cmds(enable);
-        builder = builder.sched_disable_cmds(disable);
-    }
-
-    let merged_assert = crate::assert::Assert::default_checks()
-        .merge(&entry.scheduler.assert)
-        .merge(&entry.assert);
-    if entry.scheduler.has_bpf_scheduler() {
-        builder = builder.monitor_thresholds(merged_assert.monitor_thresholds());
-    }
-
-    {
-        let mut args: Vec<String> = Vec::new();
-
-        let declarative_specs: Vec<std::path::PathBuf> = entry
-            .all_include_files()
-            .into_iter()
-            .map(std::path::PathBuf::from)
-            .collect();
-        let mut resolved_includes: Vec<(String, std::path::PathBuf, &'static str)> =
-            if declarative_specs.is_empty() {
-                Vec::new()
-            } else {
-                match crate::cli::resolve_include_files(&declarative_specs) {
-                    Ok(v) => v.into_iter().map(|(a, h)| (a, h, "declarative")).collect(),
-                    Err(e) => {
-                        eprintln!("ktstr_test: auto-repro: include_files resolve: {e:#}");
-                        Vec::new()
-                    }
-                }
-            };
-        if let Some((archive_path, host_path, guest_path)) = config_file_parts(entry) {
-            resolved_includes.push((archive_path, host_path, "scheduler config_file"));
-            args.push("--config".to_string());
-            args.push(guest_path);
-        }
-        if let Some((archive_path, host_path, _guest_path, cfg_args)) = config_content_parts(entry)
-        {
-            resolved_includes.push((archive_path, host_path, "inline config_content"));
-            args.extend(cfg_args);
-        }
-        match super::eval::dedupe_include_files(&resolved_includes) {
-            Ok(unioned) if !unioned.is_empty() => {
-                builder = builder.include_files(unioned);
-            }
-            Ok(_) => {}
-            Err(e) => {
-                eprintln!("ktstr_test: auto-repro: include_files dedupe: {e:#}");
-            }
-        }
-
-        super::runtime::append_base_sched_args(entry, &mut args);
-        if !args.is_empty() {
-            builder = builder.sched_args(&args);
-        }
-    }
+    let (builder, repro_dump_path) =
+        build_repro_vm_builder(entry, kernel, scheduler, ktstr_bin, topo, &guest_args)?;
 
     // VM build phase: KVM create, vCPU pinning, virtio device setup,
     // freeze-coord arming, ELF/BTF parses for monitor accessors. Any
@@ -827,6 +849,32 @@ pub(crate) fn attempt_auto_repro(
     );
     drop(vm);
 
+    format_repro_output(
+        entry,
+        &repro_result,
+        is_stall,
+        kernel,
+        primary_reached_workload,
+        auto_repro_start,
+        &repro_dump_path,
+    )
+}
+
+/// Render the auto-repro VM's output: write its sidecar artifacts,
+/// extract + format the probe section (or the crash-reproduction
+/// verdict when probe data is absent), and append the diagnostic tails
+/// (scheduler log, sched_ext dump, failure-dump JSON, dmesg). Returns
+/// `None` when neither probe data nor any tail is available.
+#[allow(clippy::too_many_arguments)]
+fn format_repro_output(
+    entry: &KtstrTestEntry,
+    repro_result: &crate::vmm::result::VmResult,
+    is_stall: bool,
+    kernel: &Path,
+    primary_reached_workload: bool,
+    auto_repro_start: Instant,
+    repro_dump_path: &Path,
+) -> Option<String> {
     // Write the auto-repro VM's sidecar artifacts (wprof Perfetto
     // trace + profraw coverage) BEFORE classify_repro_vm_status
     // consumes the drain for lifecycle signalling. Mirrors the
@@ -838,7 +886,7 @@ pub(crate) fn attempt_auto_repro(
     // host already paid the capture cost in the guest, throwing the
     // data away would mask exactly the bug the auto-repro VM was
     // booted to reproduce.
-    write_auto_repro_sidecar_artifacts(entry, &repro_result);
+    write_auto_repro_sidecar_artifacts(entry, repro_result);
 
     // Forward guest stderr (COM1) and COM2 probe lines when verbose.
     if verbose() {
@@ -924,7 +972,7 @@ pub(crate) fn attempt_auto_repro(
     // early/late jiffies metadata in the same tail block as the
     // sched_ext_dump and dmesg — no need to chase the separate
     // `.repro.failure-dump.json` sibling for the at-a-glance view.
-    let failure_dump_tail = render_failure_dump_file(&repro_dump_path);
+    let failure_dump_tail = render_failure_dump_file(repro_dump_path);
 
     let tails: Vec<String> = [sched_log_tail, dump_tail, failure_dump_tail, dmesg_tail]
         .into_iter()

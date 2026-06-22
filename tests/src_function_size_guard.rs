@@ -155,7 +155,6 @@ const EXCEPTIONS: &[(&str, &str, usize)] = &[
         "run_ktstr_test_inner_impl",
         1097,
     ), // queued: decompose
-    ("test_support/probe.rs", "attempt_auto_repro", 450),         // queued: decompose
     (
         "vmm/cast_analysis_load/mod.rs",
         "analyze_one_object_with_btf",
