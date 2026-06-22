@@ -1229,60 +1229,59 @@ pub(crate) fn zero_match_diagnostic(
     msg
 }
 
-/// Compare two filter-defined partitions of the sidecar pool and
-/// report regressions across slicing dimensions.
+/// Resolved inputs for the `stats compare --runs` render phase.
 ///
-/// `filter_a` and `filter_b` are the per-side row filters that
-/// define the A/B contrast. The dimensions on which the two
-/// filters DIFFER are the SLICING dimensions; the dimensions on
-/// which they AGREE (or on which both are unconstrained) are the
-/// PAIRING dimensions. Two rows pair across the A/B sides iff
-/// their dynamic [`PairingKey`] (scenario plus every pairing-dim
-/// value) is equal — so the comparison naturally ignores
-/// differences on the slicing axes (those ARE the contrast) and
-/// joins on everything else.
-///
-/// `dir` overrides the default `runs_root()` for pool collection.
-/// Pass `Some(path)` to compare archived sidecar trees copied off
-/// a CI host; pass `None` to walk `target/ktstr/` (or
-/// `CARGO_TARGET_DIR/ktstr/`).
-///
-/// Validation:
-/// - Empty slicing-dim set (every dimension is identical between
-///   A and B): bail with "specify at least one --a-X / --b-X to
-///   define what to compare". This includes the no-flags-at-all
-///   case (both filters are the empty default).
-/// - Identical effective filters with at least one slicing dim is
-///   a contradiction caught by clap-level construction; the
-///   downstream check is "every value in filter_a appears in
-///   filter_b on the same dim and vice versa." We catch that as
-///   "A and B select identical rows" — symmetric to the empty
-///   case.
-/// - More than one slicing dimension prints a warning to stderr
-///   ("warning: slicing on N dimensions; results compress
-///   multiple axes into a single A/B contrast") but does NOT
-///   bail — multi-dim slicing is a deliberate feature for
-///   comparing e.g. (kernel A + scheduler A) against (kernel B +
-///   scheduler B).
-///
-/// `no_average = false` (the default) groups every matching
-/// sidecar within each side by pairing key and averages the
-/// metrics across the group. `no_average = true` keeps each
-/// sidecar row distinct; if multiple rows on one side share the
-/// same pairing key the function bails with an actionable
-/// "duplicate pairing keys" error rather than picking one
-/// arbitrarily.
-///
-/// Returns 0 on no regressions, 1 if regressions detected.
-pub fn compare_partitions(
+/// Produced by [`prepare_partitioned_comparison`] — the validation,
+/// pooling, partitioning, and averaging steps of [`compare_partitions`]
+/// extracted into an owned bundle so the render half reads from one
+/// destructure rather than a long flat prelude. Every field carries
+/// the exact value the prior in-function prelude bound; the render
+/// half computes labels and headers from these, then runs the four
+/// print helpers.
+struct PartitionedComparison {
+    /// Dimensions on which `filter_a` differs from `filter_b` — the
+    /// A/B contrast axes. Guaranteed non-empty (the empty case bails).
+    slicing_dims: Vec<Dimension>,
+    /// Dimensions NOT in `slicing_dims`, in canonical
+    /// [`Dimension::ALL`] order — the join axes for pairing.
+    pairing_dims: Vec<Dimension>,
+    /// Every sidecar under the runs root (or `--dir` override).
+    /// Guaranteed non-empty (the empty pool bails).
+    pool: Vec<crate::test_support::SidecarResult>,
+    /// `pool` converted to rows, same length and iteration order.
+    rows: Vec<GauntletRow>,
+    /// A-side rows fed to [`compare_rows_by`]: averaged mean rows
+    /// when `no_average` is false, the raw filtered rows otherwise.
+    rows_a_for_compare: Vec<GauntletRow>,
+    /// B-side counterpart of `rows_a_for_compare`.
+    rows_b_for_compare: Vec<GauntletRow>,
+    /// A-side averaged groups when `no_average` is false; `None`
+    /// under `--no-average`. Drives the per-group pass-count block.
+    avg_a: Option<Vec<AveragedGroup>>,
+    /// B-side counterpart of `avg_a`.
+    avg_b: Option<Vec<AveragedGroup>>,
+    /// Post-typed-filter A-side contributor row count (pre-aggregation)
+    /// — the "averaged across N runs" header numerator.
+    pre_agg_a: usize,
+    /// B-side counterpart of `pre_agg_a`.
+    pre_agg_b: usize,
+}
+
+/// Validate, pool, partition, and average the inputs for
+/// [`compare_partitions`]. Returns the owned [`PartitionedComparison`]
+/// bundle the render half destructures, or bails with the same
+/// diagnostics in the same order as the original in-function prelude:
+/// identical-rows gate, empty-pool gate, then the two zero-match
+/// gates, then (under `--no-average`) the duplicate-pairing-key
+/// gates. The multi-dim slicing warning and the dirty-build /
+/// overcommit warnings are emitted here so they precede the render
+/// half's header lines, preserving output order.
+fn prepare_partitioned_comparison(
     filter_a: &RowFilter,
     filter_b: &RowFilter,
-    filter: Option<&str>,
-    policy: &ComparisonPolicy,
     dir: Option<&std::path::Path>,
     no_average: bool,
-    phase_opts: &PhaseDisplayOptions,
-) -> anyhow::Result<i32> {
+) -> anyhow::Result<PartitionedComparison> {
     // Validation gate 1: there must be at least one dimension
     // on which filter_a differs from filter_b — otherwise the
     // operator hasn't expressed a contrast and the function has
@@ -1402,10 +1401,92 @@ pub fn compare_partitions(
         (rows_a, rows_b, None, None)
     };
 
+    Ok(PartitionedComparison {
+        slicing_dims,
+        pairing_dims,
+        pool,
+        rows,
+        rows_a_for_compare,
+        rows_b_for_compare,
+        avg_a,
+        avg_b,
+        pre_agg_a,
+        pre_agg_b,
+    })
+}
+
+/// Compare two filter-defined partitions of the sidecar pool and
+/// report regressions across slicing dimensions.
+///
+/// `filter_a` and `filter_b` are the per-side row filters that
+/// define the A/B contrast. The dimensions on which the two
+/// filters DIFFER are the SLICING dimensions; the dimensions on
+/// which they AGREE (or on which both are unconstrained) are the
+/// PAIRING dimensions. Two rows pair across the A/B sides iff
+/// their dynamic [`PairingKey`] (scenario plus every pairing-dim
+/// value) is equal — so the comparison naturally ignores
+/// differences on the slicing axes (those ARE the contrast) and
+/// joins on everything else.
+///
+/// `dir` overrides the default `runs_root()` for pool collection.
+/// Pass `Some(path)` to compare archived sidecar trees copied off
+/// a CI host; pass `None` to walk `target/ktstr/` (or
+/// `CARGO_TARGET_DIR/ktstr/`).
+///
+/// Validation:
+/// - Empty slicing-dim set (every dimension is identical between
+///   A and B): bail with "specify at least one --a-X / --b-X to
+///   define what to compare". This includes the no-flags-at-all
+///   case (both filters are the empty default).
+/// - Identical effective filters with at least one slicing dim is
+///   a contradiction caught by clap-level construction; the
+///   downstream check is "every value in filter_a appears in
+///   filter_b on the same dim and vice versa." We catch that as
+///   "A and B select identical rows" — symmetric to the empty
+///   case.
+/// - More than one slicing dimension prints a warning to stderr
+///   ("warning: slicing on N dimensions; results compress
+///   multiple axes into a single A/B contrast") but does NOT
+///   bail — multi-dim slicing is a deliberate feature for
+///   comparing e.g. (kernel A + scheduler A) against (kernel B +
+///   scheduler B).
+///
+/// `no_average = false` (the default) groups every matching
+/// sidecar within each side by pairing key and averages the
+/// metrics across the group. `no_average = true` keeps each
+/// sidecar row distinct; if multiple rows on one side share the
+/// same pairing key the function bails with an actionable
+/// "duplicate pairing keys" error rather than picking one
+/// arbitrarily.
+///
+/// Returns 0 on no regressions, 1 if regressions detected.
+pub fn compare_partitions(
+    filter_a: &RowFilter,
+    filter_b: &RowFilter,
+    filter: Option<&str>,
+    policy: &ComparisonPolicy,
+    dir: Option<&std::path::Path>,
+    no_average: bool,
+    phase_opts: &PhaseDisplayOptions,
+) -> anyhow::Result<i32> {
+    let prepared = prepare_partitioned_comparison(filter_a, filter_b, dir, no_average)?;
+    let PartitionedComparison {
+        slicing_dims,
+        pairing_dims,
+        pool,
+        rows,
+        rows_a_for_compare,
+        rows_b_for_compare,
+        avg_a,
+        avg_b,
+        pre_agg_a,
+        pre_agg_b,
+    } = &prepared;
+
     let report = compare_rows_by(
-        &rows_a_for_compare,
-        &rows_b_for_compare,
-        &pairing_dims,
+        rows_a_for_compare,
+        rows_b_for_compare,
+        pairing_dims,
         filter,
         policy,
     );
@@ -1414,8 +1495,8 @@ pub fn compare_partitions(
     // Single slicing dim: e.g. "6.14.2" / "6.15.0". Multi: e.g.
     // "6.14.2:scx_rusty" / "6.15.0:scx_alpha". >3 values per dim:
     // collapse to "A"/"B" to keep column headers readable.
-    let label_a = render_side_label(filter_a, &slicing_dims, "A");
-    let label_b = render_side_label(filter_b, &slicing_dims, "B");
+    let label_a = render_side_label(filter_a, slicing_dims, "A");
+    let label_b = render_side_label(filter_b, slicing_dims, "B");
 
     // Header lines: name the slicing and pairing axes so the
     // operator can confirm the comparison shape at a glance.
@@ -1431,64 +1512,102 @@ pub fn compare_partitions(
     if !no_average {
         println!(
             "{}",
-            format_average_header(pre_agg_a, pre_agg_b, &label_a, &label_b)
+            format_average_header(*pre_agg_a, *pre_agg_b, &label_a, &label_b)
         );
     }
 
-    use comfy_table::{Cell, Color};
     // Scalar findings table — suppressed when the operator
     // passed `--phases-only` (they want the per-phase block
     // only). The scalar pre-aggregation already ran; this just
     // hides its render.
     if !phase_opts.phases_only {
-        let mut table = crate::cli::new_table();
-        table.set_header(vec![
-            "TEST", "METRIC", &label_a, &label_b, "DELTA", "VERDICT",
-        ]);
-        for f in &report.findings {
-            let (verdict_text, verdict_color) = if f.is_regression {
-                ("REGRESSION", Color::Red)
-            } else {
-                ("improvement", Color::Green)
-            };
-            // PairingKey's first slot is scenario; subsequent slots
-            // are the pairing-dim values in canonical order. Joining
-            // with `/` produces a label whose shape mirrors the
-            // pairing-dim count — so a comparison that pairs on
-            // (topology, work_type) renders a `scenario/topology/work_type`
-            // label, while a comparison that slices on most dims
-            // renders a shorter identifier. The operator can always
-            // cross-reference the "pairing on:" header line above to
-            // see what each segment means.
-            let label = f.pairing_key.0.join("/");
-            table.add_row(vec![
-                Cell::new(label),
-                Cell::new(f.metric.name),
-                Cell::new(format!("{:.2}", f.val_a)),
-                Cell::new(format!("{:.2}", f.val_b)),
-                Cell::new(format!("{:+.2}{}", f.delta, f.metric.display_unit)),
-                Cell::new(verdict_text).fg(verdict_color),
-            ]);
-        }
-        println!("{table}");
+        print_scalar_findings_table(&report, &label_a, &label_b);
     }
 
-    // Per-phase delta render. Activated when the parallel pass
-    // populated either phase_deltas or unpaired_phases for the
-    // current row-pair set AND `--no-phases` was not passed.
-    // Single-phase scenarios (no periodic captures) leave both
-    // vecs empty and the phase block is suppressed entirely.
-    //
-    // CLI filters compose by AND on independent axes:
-    // - `--phase <N>` keeps only the named step_index
-    // - `--steps-only` suppresses BASELINE (step_index == 0)
-    // - `--phase-threshold <PCT>` filters paired rows whose
-    //   `|delta| / max(|a|, 1.0)` is below `PCT / 100.0`
-    //
-    // Filtering is render-time projection — the underlying
-    // CompareReport.phase_deltas / unpaired_phases vecs hold
-    // the unfiltered data so programmatic consumers see every
-    // paired row regardless of CLI flags.
+    print_phase_block(&report, phase_opts, &label_a, &label_b);
+
+    // Scalar summary block — regressions / improvements /
+    // unchanged + skipped-failed + per-group pass counts +
+    // new_in_b / removed_from_a. All four lines describe the
+    // scalar findings table; suppress them under `--phases-only`
+    // so the operator's "phase-block only" projection stays
+    // pure (the phase block has its own footer hint above).
+    if !phase_opts.phases_only {
+        print_summary_block(&report, avg_a, avg_b, &label_a, &label_b);
+    }
+
+    // Host-context delta. Same first-Some(host) baseline
+    // `compare_partitions` uses — picking representative hosts
+    // off the partitioned sidecars rather than the full pool so
+    // the delta reflects what actually fed the comparison.
+    print_host_context_delta(pool, rows, filter_a, filter_b, &label_a, &label_b);
+
+    Ok(if report.regressions > 0 { 1 } else { 0 })
+}
+
+/// Render the scalar findings table for `stats compare --runs`.
+///
+/// Extracted from [`compare_partitions`] verbatim; the
+/// `--phases-only` gate stays at the call site so this prints
+/// unconditionally when invoked.
+fn print_scalar_findings_table(report: &CompareReport, label_a: &str, label_b: &str) {
+    use comfy_table::{Cell, Color};
+    let mut table = crate::cli::new_table();
+    table.set_header(vec![
+        "TEST", "METRIC", label_a, label_b, "DELTA", "VERDICT",
+    ]);
+    for f in &report.findings {
+        let (verdict_text, verdict_color) = if f.is_regression {
+            ("REGRESSION", Color::Red)
+        } else {
+            ("improvement", Color::Green)
+        };
+        // PairingKey's first slot is scenario; subsequent slots
+        // are the pairing-dim values in canonical order. Joining
+        // with `/` produces a label whose shape mirrors the
+        // pairing-dim count — so a comparison that pairs on
+        // (topology, work_type) renders a `scenario/topology/work_type`
+        // label, while a comparison that slices on most dims
+        // renders a shorter identifier. The operator can always
+        // cross-reference the "pairing on:" header line above to
+        // see what each segment means.
+        let label = f.pairing_key.0.join("/");
+        table.add_row(vec![
+            Cell::new(label),
+            Cell::new(f.metric.name),
+            Cell::new(format!("{:.2}", f.val_a)),
+            Cell::new(format!("{:.2}", f.val_b)),
+            Cell::new(format!("{:+.2}{}", f.delta, f.metric.display_unit)),
+            Cell::new(verdict_text).fg(verdict_color),
+        ]);
+    }
+    println!("{table}");
+}
+
+/// Render the per-phase delta block for `stats compare --runs`.
+/// Activated when the parallel pass
+/// populated either phase_deltas or unpaired_phases for the
+/// current row-pair set AND `--no-phases` was not passed.
+/// Single-phase scenarios (no periodic captures) leave both
+/// vecs empty and the phase block is suppressed entirely.
+///
+/// CLI filters compose by AND on independent axes:
+/// - `--phase <N>` keeps only the named step_index
+/// - `--steps-only` suppresses BASELINE (step_index == 0)
+/// - `--phase-threshold <PCT>` filters paired rows whose
+///   `|delta| / max(|a|, 1.0)` is below `PCT / 100.0`
+///
+/// Filtering is render-time projection — the underlying
+/// CompareReport.phase_deltas / unpaired_phases vecs hold
+/// the unfiltered data so programmatic consumers see every
+/// paired row regardless of CLI flags.
+fn print_phase_block(
+    report: &CompareReport,
+    phase_opts: &PhaseDisplayOptions,
+    label_a: &str,
+    label_b: &str,
+) {
+    use comfy_table::{Cell, Color};
     let render_phase_block = !phase_opts.no_phases
         && (!report.phase_deltas.is_empty() || !report.unpaired_phases.is_empty());
     if render_phase_block {
@@ -1514,7 +1633,7 @@ pub fn compare_partitions(
             if !filtered_deltas.is_empty() {
                 let mut phase_table = crate::cli::new_table();
                 phase_table.set_header(vec![
-                    "PHASE", "TEST", "METRIC", &label_a, &label_b, "DELTA", "VERDICT",
+                    "PHASE", "TEST", "METRIC", label_a, label_b, "DELTA", "VERDICT",
                 ]);
                 // Sort by step_index ascending, then pairing key,
                 // then metric name. step_index-first ordering matches
@@ -1632,51 +1751,66 @@ pub fn compare_partitions(
             }
         }
     }
+}
 
-    // Scalar summary block — regressions / improvements /
-    // unchanged + skipped-failed + per-group pass counts +
-    // new_in_b / removed_from_a. All four lines describe the
-    // scalar findings table; suppress them under `--phases-only`
-    // so the operator's "phase-block only" projection stays
-    // pure (the phase block has its own footer hint above).
-    if !phase_opts.phases_only {
-        println!();
+/// Render the scalar summary block for `stats compare --runs` —
+/// regressions / improvements / unchanged + skipped-failed +
+/// per-group pass counts + new_in_b / removed_from_a. All lines
+/// describe the scalar findings table; the `--phases-only` gate
+/// stays at the call site so this prints unconditionally when
+/// invoked.
+fn print_summary_block(
+    report: &CompareReport,
+    avg_a: &Option<Vec<AveragedGroup>>,
+    avg_b: &Option<Vec<AveragedGroup>>,
+    label_a: &str,
+    label_b: &str,
+) {
+    println!();
+    println!(
+        "summary: {} regressions, {} improvements, {} unchanged",
+        report.regressions, report.improvements, report.unchanged,
+    );
+    if report.excluded_pairs > 0 {
         println!(
-            "summary: {} regressions, {} improvements, {} unchanged",
-            report.regressions, report.improvements, report.unchanged,
+            "  {} pairing-key row pair(s) excluded from regression math because one \
+             or both sides did not pass (failed, inconclusive, or skipped)",
+            report.excluded_pairs,
         );
-        if report.excluded_pairs > 0 {
-            println!(
-                "  {} pairing-key row pair(s) excluded from regression math because one \
-                 or both sides did not pass (failed, inconclusive, or skipped)",
-                report.excluded_pairs,
-            );
-        }
-        if let (Some(avg_a), Some(avg_b)) = (&avg_a, &avg_b) {
-            let block = format_per_group_pass_counts(avg_a, avg_b, &label_a, &label_b);
-            if !block.is_empty() {
-                print!("{block}");
-            }
-        }
-        if report.new_in_b > 0 {
-            println!(
-                "  {} row(s) new in '{}' (no matching key in '{}')",
-                report.new_in_b, label_b, label_a,
-            );
-        }
-        if report.removed_from_a > 0 {
-            println!(
-                "  {} row(s) removed from '{}' (no matching key in '{}')",
-                report.removed_from_a, label_a, label_b,
-            );
+    }
+    if let (Some(avg_a), Some(avg_b)) = (avg_a, avg_b) {
+        let block = format_per_group_pass_counts(avg_a, avg_b, label_a, label_b);
+        if !block.is_empty() {
+            print!("{block}");
         }
     }
+    if report.new_in_b > 0 {
+        println!(
+            "  {} row(s) new in '{}' (no matching key in '{}')",
+            report.new_in_b, label_b, label_a,
+        );
+    }
+    if report.removed_from_a > 0 {
+        println!(
+            "  {} row(s) removed from '{}' (no matching key in '{}')",
+            report.removed_from_a, label_a, label_b,
+        );
+    }
+}
 
-    // Host-context delta. Same first-Some(host) baseline
-    // `compare_partitions` uses — picking representative hosts
-    // off the partitioned sidecars rather than the full pool so
-    // the delta reflects what actually fed the comparison.
-    //
+/// Print the host-context delta for `stats compare --runs`. Same
+/// first-Some(host) baseline `compare_partitions` uses — picking
+/// representative hosts off the partitioned sidecars rather than
+/// the full pool so the delta reflects what actually fed the
+/// comparison.
+fn print_host_context_delta(
+    pool: &[crate::test_support::SidecarResult],
+    rows: &[GauntletRow],
+    filter_a: &RowFilter,
+    filter_b: &RowFilter,
+    label_a: &str,
+    label_b: &str,
+) {
     // Zip the pool with the pre-computed `rows` (built once above
     // via `pool.iter().map(sidecar_to_row).collect()`) so the
     // per-side filter reuses the existing row instead of calling
@@ -1696,9 +1830,7 @@ pub fn compare_partitions(
         .collect();
     let host_a = sidecars_a.iter().find_map(|s| s.host.as_ref());
     let host_b = sidecars_b.iter().find_map(|s| s.host.as_ref());
-    print!("{}", format_host_delta(host_a, host_b, &label_a, &label_b));
-
-    Ok(if report.regressions > 0 { 1 } else { 0 })
+    print!("{}", format_host_delta(host_a, host_b, label_a, label_b));
 }
 
 /// Bail when `rows` contains two or more entries with the same
