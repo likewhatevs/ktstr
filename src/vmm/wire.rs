@@ -1062,8 +1062,8 @@ pub enum KernelOpTarget {
     /// the PID for an unrelated task.
     ///
     /// `field` is a dot-separated nested-member path. **SCX-only**:
-    /// the dispatcher's class/policy gates accept ONLY
-    /// `ext_sched_class` / `SCHED_EXT`. Recommended fields:
+    /// the dispatcher's class gate accepts ONLY tasks whose
+    /// `sched_class` is `ext_sched_class`. Recommended fields:
     /// - `"scx.dsq_vtime"` — SCX DSQ priority-queue ordering key;
     ///   preserved across dequeue/enqueue cycles
     ///   (`kernel/sched/ext.c`).
@@ -1077,10 +1077,14 @@ pub enum KernelOpTarget {
     /// sleeping tasks (which is our validation gate). TaskField
     /// rejects non-SCX tasks before reaching this field anyway.
     ///
-    /// Eight-layer task validation before any write/read lands:
+    /// Seven-layer task validation before any write/read lands:
     /// 1. `task->pid == requested_pid` (anti-mismatch),
-    /// 2. `task->start_time == expected_start_time_ns` (anti-PID-reuse
-    ///    identity),
+    /// 2. `task->start_time` within
+    ///    `[expected_start_time_ns, expected_start_time_ns + 10ms)`
+    ///    (anti-PID-reuse identity; the 10ms window absorbs the
+    ///    `/proc/<pid>/stat` CLK_TCK quantization since the kernel's
+    ///    `start_time` carries sub-tick ns precision while the
+    ///    caller's value is rounded down to a tick boundary),
     /// 3. `task->__state & TASK_DEAD == 0` (lifetime),
     /// 4. `task->on_rq == 0` (rb-tree / DSQ ordering safety per
     ///    `task_on_rq_queued` at `kernel/sched/sched.h:2399`),
@@ -1088,13 +1092,16 @@ pub enum KernelOpTarget {
     ///    list-empty (SCX maintains `runnable_node` linkage
     ///    independent of dsq pointer per
     ///    `include/linux/sched/ext.h:227`),
-    /// 6. `task->sched_class == &ext_sched_class` (SCX-only),
-    /// 7. `task->policy & ~SCHED_RESET_ON_FORK == SCHED_EXT (= 7)`
-    ///    per `include/uapi/linux/sched.h:121` (belt-and-suspenders
-    ///    for L6),
-    /// 8. `task->start_boottime != 0` (anti-slab-recycle: a
+    /// 6. `task->sched_class == &ext_sched_class` (the canonical
+    ///    SCX-managed gate),
+    /// 7. `task->start_boottime != 0` (anti-slab-recycle: a
     ///    freshly-zeroed slab page reads zero; live tasks have this
     ///    set to non-zero `ktime_get_boottime_ns()` at fork).
+    ///
+    /// (A former `task->policy == SCHED_EXT` gate was removed: SCX
+    /// claims fair-policy tasks via `sched_class` without changing
+    /// `task->policy`, so a policy check would wrongly reject
+    /// SCX-managed tasks that forked under `SCHED_NORMAL`.)
     TaskField {
         /// Guest-side PID of the target task. Both leaders and
         /// non-leader threads are addressable via the dispatcher's
