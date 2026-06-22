@@ -607,15 +607,41 @@ fn matcher_dispatch_and_mismatch_marker_wiring_pinned() {
              `.is_some()` checks, not a hardcoded literal; assignment window:\n\
              {configured_window}",
     );
-    let mismatch_site = assert_unique(
-        &find_sites("let matcher_mismatch ="),
-        "`let matcher_mismatch =` assignment",
+    // matcher_mismatch is COMPUTED once in `evaluate_verdict_folds`
+    // (deriving from matcher_details.is_empty()) and BOUND once in the
+    // driver from that helper's return value — two `let matcher_mismatch
+    // =` sites after the verdict-fold extraction. Pin both shapes so a
+    // hardcoded-literal regression at EITHER the computation or the
+    // driver binding is caught.
+    let mismatch_sites = find_sites("let matcher_mismatch =");
+    assert_eq!(
+        mismatch_sites.len(),
+        2,
+        "expected 2 `let matcher_mismatch =` sites (the \
+             evaluate_verdict_folds computation + the driver binding of \
+             its return); found {} at lines {:?}",
+        mismatch_sites.len(),
+        mismatch_sites.iter().map(|i| i + 1).collect::<Vec<_>>(),
     );
-    let mismatch_line = lines[mismatch_site];
-    assert!(
-        mismatch_line.contains("matcher_details.is_empty()"),
-        "matcher_mismatch must derive from `matcher_details.is_empty()`, \
-             not a hardcoded literal; assignment line: {mismatch_line}",
+    let mismatch_computation: Vec<usize> = mismatch_sites
+        .iter()
+        .copied()
+        .filter(|&i| lines[i].contains("matcher_details.is_empty()"))
+        .collect();
+    assert_unique(
+        &mismatch_computation,
+        "`let matcher_mismatch = ...matcher_details.is_empty()` computation \
+             (must derive from the matcher fields, not a hardcoded literal)",
+    );
+    let mismatch_binding: Vec<usize> = mismatch_sites
+        .iter()
+        .copied()
+        .filter(|&i| lines[i].contains("evaluate_verdict_folds("))
+        .collect();
+    assert_unique(
+        &mismatch_binding,
+        "`let matcher_mismatch = evaluate_verdict_folds(...)` driver binding \
+             (must bind the helper's return, not a hardcoded literal)",
     );
 }
 
