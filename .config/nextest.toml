@@ -154,6 +154,38 @@ filter = "test(vmm::sched_stats::)"
 slow-timeout = { period = "180s", terminate-after = 1 }
 retries = 3
 
+# Wide-SMP boot tests: every ~256-vCPU topology (16-LLC × 16-core, or
+# 14×9×2) overcommits its vCPU threads onto the host cpuset (~1.3x on a
+# 192-CPU runner). The boot wall-clock grows with the overcommit ratio,
+# so `vm_timeout_from_entry` scales the boot headroom by that ratio
+# (clamped at 6x), giving each VM a per-VM framework watchdog of up to
+# ~470s at the near-6x auto-skip boundary (base max(watchdog_timeout_s,
+# duration, 1) + vm_boot_headroom(256)=58.4s × 6). The binding case is
+# pos_expect_auto_repro_satisfied_wide_smp: it boots TWO 256-vCPU VMs
+# sequentially (primary + auto-repro), each with its OWN ~470s watchdog,
+# so a healthy two-VM run on a small runner just above the skip boundary
+# can reach ~940s. slow-timeout 960s/terminate-after 1 covers that two-VM
+# worst running case so the per-VM framework watchdog fires FIRST (a
+# clean failure dump) rather than nextest blunt-killing a still-booting
+# second VM; single-VM wide tests fail at their ≤470s watchdog long
+# before 960s, so the larger budget is harmless for them, and on a
+# 192-CPU runner (~1.3x) every test finishes in a few hundred seconds,
+# far under 960s. The `wide-smp` test-group (max-threads = 1) serializes
+# these heavy boots so they never oversubscribe EACH OTHER — two 256-vCPU
+# VMs on one host is 2.6x aggregate before any other test, the
+# concurrent-boot cascade that put 100+ VM tests into SLOW at one
+# instant. The filter is test()-scoped for snapshot_real_capture_e2e /
+# expect_auto_repro_e2e so only their wide-SMP tests join the group;
+# their lighter siblings keep normal budgets. retries = 2 absorbs
+# residual host-load jitter; the per-VM watchdog bounds each attempt, so
+# this is not a retry storm.
+[[profile.ci.overrides]]
+filter = "binary(wide_smp_boot_e2e) | binary(wide_smp_device_irq_e2e) | binary(wide_smp_net_irq_e2e) | test(multi_llc_guest_presents_fat_l3_wide_smp) | test(snapshot_real_capture_wide_smp) | test(pos_expect_auto_repro_satisfied_wide_smp)"
+slow-timeout = { period = "960s", terminate-after = 1 }
+test-group = "wide-smp"
+threads-required = 1
+retries = 2
+
 [profile.quick]
 # Usage: cargo nextest run --profile quick
 slow-timeout = { period = "10s", terminate-after = 2 }
@@ -254,6 +286,20 @@ filter = "test(model_loaded_)"
 slow-timeout = { period = "600s", terminate-after = 2 }
 retries = 0
 
+# Wide-SMP boot tests: mirror of the profile.ci override (nextest does
+# not inherit overrides across profiles). 960s/terminate-after 1 covers
+# the two-VM auto-repro test's worst running case so the per-VM framework
+# watchdog (vm_timeout_from_entry, oversub-scaled boot headroom) fires
+# before nextest's kill even under a local dev box's higher overcommit
+# ratio; the wide-smp test-group serializes the heavy 256-vCPU boots.
+# See the profile.ci copy for the full rationale.
+[[profile.default.overrides]]
+filter = "binary(wide_smp_boot_e2e) | binary(wide_smp_device_irq_e2e) | binary(wide_smp_net_irq_e2e) | test(multi_llc_guest_presents_fat_l3_wide_smp) | test(snapshot_real_capture_wide_smp) | test(pos_expect_auto_repro_satisfied_wide_smp)"
+slow-timeout = { period = "960s", terminate-after = 1 }
+test-group = "wide-smp"
+threads-required = 1
+retries = 2
+
 # ── vm-cli ───────────────────────────────────────────────────────────
 [test-groups.vm-cli]
 max-threads = 1
@@ -341,6 +387,18 @@ max-threads = 1
 filter = "binary(compile_fail) & test(=compile_fail)"
 test-group = "compile-fail"
 threads-required = 1
+
+# ── wide-smp ─────────────────────────────────────────────────────────
+# Serialize the 256-vCPU wide-SMP boot tests. Each overcommits its vCPU
+# threads onto the host cpuset; running two concurrently doubles the
+# oversubscription and starves both boots (the observed cascade where
+# 100+ VM tests entered SLOW at one instant). max-threads = 1 walks them
+# one at a time so each boot gets the full host, while still overlapping
+# the lighter (non-wide) VM tests. The companion slow-timeout overrides
+# (profile.ci + profile.default) keep the framework boot watchdog firing
+# before nextest's kill.
+[test-groups.wide-smp]
+max-threads = 1
 
 # Quick profile: short-circuit long-running tests.
 [[profile.quick.overrides]]

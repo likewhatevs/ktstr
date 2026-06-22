@@ -372,6 +372,30 @@ fn write_placeholder_failure_dump_if_missing(path: &std::path::Path, result: &vm
     }
 }
 
+/// Pre-boot overcommit auto-skip, extracted from
+/// [`run_ktstr_test_inner_impl`] so the predicate-to-skip WIRING is
+/// unit-testable without booting a VM (the sibling `performance_mode` /
+/// `perf_only` skips are env-driven; this one is topology-driven). When
+/// the host cannot run the entry's topology without racing the
+/// oversub-scaled boot watchdog
+/// ([`super::runtime::overcommit_skip_reason`]), emits the operator SKIP
+/// banner, records the skip sidecar, and returns the skip
+/// [`AssertResult`]; otherwise returns `None` to proceed to boot. Only
+/// the AUTO-collapse case skips — an explicit `cpu_budget` (a deliberate
+/// oversubscription opt-in) and the CI ~1.3x case both return `None` and
+/// RUN, so wide-SMP boot is validated there rather than silently
+/// skipped.
+fn overcommit_skip(entry: &KtstrTestEntry, host_cpus: &[usize]) -> Option<AssertResult> {
+    let reason = super::runtime::overcommit_skip_reason(
+        entry.topology.total_cpus(),
+        host_cpus.len(),
+        entry.cpu_budget,
+    )?;
+    crate::report::test_skip(format_args!("{}: {reason}", entry.name));
+    record_skip_sidecar(entry);
+    Some(AssertResult::skip(reason))
+}
+
 fn run_ktstr_test_inner_impl(
     entry: &KtstrTestEntry,
     topo: Option<&TopoOverride>,
@@ -457,6 +481,15 @@ fn run_ktstr_test_inner_impl(
         crate::report::test_skip(format_args!("{}: {REASON}", entry.name));
         record_skip_sidecar(entry);
         return Ok(AssertResult::skip(REASON));
+    }
+    // Auto-skip a default/no-perf overcommit so severe the guest boot
+    // would race even the oversub-scaled host watchdog — the "overcommit
+    // OR auto-skip, never hard-fail" contract. See `overcommit_skip` for
+    // the full rationale; it skips ONLY the auto-collapse case past
+    // `OVERCOMMIT_SKIP_RATIO`, so an explicit `cpu_budget` and the CI
+    // ~1.3x case both RUN and are validated here, never masked.
+    if let Some(skip) = overcommit_skip(entry, &host_cpus) {
+        return Ok(skip);
     }
     ensure_kvm()?;
     let kernel = resolve_test_kernel()?;
@@ -2167,16 +2200,19 @@ fn render_no_result_message(
             "\n\n--- watchdog ---\n\
              elapsed={:?} (VM run wall-clock)\n\
              vm_timeout={:?} (host watchdog deadline = max(watchdog_timeout, \
-             duration, 1s) + vCPU-scaled vm_boot_headroom [+ 30s cold-BTF \
-             budget for bpf_map_write tests])\n\
+             duration, 1s) + overcommit-scaled vCPU vm_boot_headroom [+ 30s \
+             cold-BTF budget for bpf_map_write tests])\n\
              watchdog_timeout={:?} (scx_sched.watchdog_timeout override)\n\
              duration={:?} (workload duration)\n\
              hint: if the test body needs more wall time, increase \
              duration (the `duration` field on `KtstrTestEntry` / \
              `#[ktstr_test(duration_ms = ...)]`); the VM timeout adds \
-             vCPU-scaled boot headroom on top of max(watchdog_timeout, \
-             duration, 1s), so raising duration also extends the host \
-             watchdog deadline",
+             vCPU-scaled boot headroom — itself multiplied by the host \
+             overcommit ratio (vCPUs / allowed host CPUs, clamped) so an \
+             oversubscribed boot gets proportionally longer — on top of \
+             max(watchdog_timeout, duration, 1s). Raising duration extends \
+             the deadline; widening the process cpuset shrinks the \
+             overcommit multiplier",
             result.duration, vm_timeout, entry.watchdog_timeout, entry.duration,
         );
         let timeout_reason = {

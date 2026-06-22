@@ -805,3 +805,65 @@ fn scheduler_label_path() {
         " [sched=/usr/bin/sched]"
     );
 }
+
+// -- overcommit_skip wiring tests --
+//
+// Pin the auto-skip WIRING extracted from run_ktstr_test_inner_impl: a
+// severe auto-collapse must yield a SKIP AssertResult (never a
+// hard-fail), while the CI ~1.3x ratio and an explicit cpu_budget must
+// RUN (None) so wide-SMP boot is validated on a typical runner rather
+// than silently skipped. The pure predicate
+// runtime::overcommit_skip_reason is unit-tested separately in
+// runtime.rs; these pin that Some(reason) -> Ok(AssertResult::skip) and
+// None -> proceed-to-boot at the eval call site.
+
+fn wide_smp_topology() -> crate::vmm::topology::Topology {
+    // 16 LLCs × 16 cores × 1 thread = 256 vCPUs (the wide-SMP class).
+    crate::vmm::topology::Topology {
+        llcs: 16,
+        cores_per_llc: 16,
+        threads_per_core: 1,
+        numa_nodes: 1,
+        nodes: None,
+        distances: None,
+    }
+}
+
+#[test]
+fn overcommit_skip_returns_skip_for_severe_auto_collapse() {
+    let mut entry = eevdf_entry("overcommit_skip_severe");
+    entry.topology = wide_smp_topology();
+    entry.cpu_budget = None;
+    // 256 vCPUs auto-collapse onto 8 host CPUs = 32x ≥ 6x → SKIP, not a
+    // hard-fail.
+    let skip = super::overcommit_skip(&entry, &[0, 1, 2, 3, 4, 5, 6, 7])
+        .expect("32x auto-collapse must auto-skip");
+    assert!(skip.is_skip(), "severe overcommit must yield a SKIP result");
+}
+
+#[test]
+fn overcommit_skip_runs_at_ci_wide_smp_ratio() {
+    let mut entry = eevdf_entry("overcommit_skip_ci");
+    entry.topology = wide_smp_topology();
+    entry.cpu_budget = None;
+    // 256 vCPUs on a 192-CPU CI runner = 1.33x < 6x → RUN (None), so
+    // wide-SMP boot is validated on CI, never masked.
+    let host: Vec<usize> = (0..192).collect();
+    assert!(
+        super::overcommit_skip(&entry, &host).is_none(),
+        "wide-SMP boot must RUN at the CI ~1.3x ratio",
+    );
+}
+
+#[test]
+fn overcommit_skip_never_skips_explicit_budget() {
+    let mut entry = eevdf_entry("overcommit_skip_explicit");
+    entry.topology = wide_smp_topology();
+    entry.cpu_budget = Some(4); // deliberate oversubscription opt-in
+    // Even 256 vCPUs on 8 host CPUs: an explicit cpu_budget is a
+    // contention-testing opt-in and must never auto-skip.
+    assert!(
+        super::overcommit_skip(&entry, &[0, 1, 2, 3, 4, 5, 6, 7]).is_none(),
+        "explicit cpu_budget must never auto-skip",
+    );
+}
