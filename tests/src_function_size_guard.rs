@@ -123,8 +123,6 @@ const EXCEPTIONS: &[(&str, &str, usize)] = &[
     ), // queued: decompose
     ("cli/kernel_build/build.rs", "kernel_build_pipeline", 492),  // queued: decompose
     ("ctprof/mod.rs", "capture_with", 473),                       // queued: decompose
-    ("ctprof_compare/report/smaps.rs", "write_smaps_section", 212), // queued: decompose
-    ("ctprof_compare/runner.rs", "write_metric_list", 212),       // queued: decompose
     ("export.rs", "generate_preamble", 416),                      // queued: decompose
     ("host_thread_probe.rs", "find_jemalloc_via_maps_at", 240),   // queued: decompose
     ("monitor/btf_render/mod.rs", "chase_arena_pointer", 367),    // queued: decompose

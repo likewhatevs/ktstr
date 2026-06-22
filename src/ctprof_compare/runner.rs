@@ -480,6 +480,16 @@ pub fn run_compare(args: &CtprofCompareArgs) -> anyhow::Result<i32> {
 /// into a `String` buffer; the public [`run_metric_list`] entry
 /// point is the print wrapper.
 pub fn write_metric_list<W: fmt::Write>(w: &mut W) -> fmt::Result {
+    write_tag_legend(w)?;
+    write_sections_table(w)?;
+    write_metrics_table(w)?;
+    write_derived_metrics_table(w)?;
+    Ok(())
+}
+
+/// Emit the `## Tag legend` section (sched_class / config_gates /
+/// `status:` `[dead]`) and its trailing blank-line separator.
+fn write_tag_legend<W: fmt::Write>(w: &mut W) -> fmt::Result {
     writeln!(w, "## Tag legend")?;
     writeln!(w)?;
     writeln!(w, "sched_class:")?;
@@ -584,7 +594,12 @@ pub fn write_metric_list<W: fmt::Write>(w: &mut W) -> fmt::Result {
     )?;
     writeln!(w, "                exposure surface.")?;
     writeln!(w)?;
+    Ok(())
+}
 
+/// Emit the `## Sections` vocabulary table and its trailing
+/// blank-line separator.
+fn write_sections_table<W: fmt::Write>(w: &mut W) -> fmt::Result {
     // Sections vocabulary table — discovery companion to the
     // `--sections` CLI flag. Lists every Section variant in
     // rendering order with its CLI name and a short description
@@ -652,7 +667,12 @@ pub fn write_metric_list<W: fmt::Write>(w: &mut W) -> fmt::Result {
     }
     writeln!(w, "{sections_table}")?;
     writeln!(w)?;
+    Ok(())
+}
 
+/// Emit the `## Metrics` registry table and its trailing
+/// blank-line separator.
+fn write_metrics_table<W: fmt::Write>(w: &mut W) -> fmt::Result {
     writeln!(w, "## Metrics")?;
     writeln!(w)?;
     let mut table = crate::cli::new_table();
@@ -667,6 +687,11 @@ pub fn write_metric_list<W: fmt::Write>(w: &mut W) -> fmt::Result {
     }
     writeln!(w, "{table}")?;
     writeln!(w)?;
+    Ok(())
+}
+
+/// Emit the `## Derived metrics` table.
+fn write_derived_metrics_table<W: fmt::Write>(w: &mut W) -> fmt::Result {
     writeln!(w, "## Derived metrics")?;
     writeln!(w)?;
     let mut dt = crate::cli::new_table();
