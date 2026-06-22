@@ -169,7 +169,6 @@ const EXCEPTIONS: &[(&str, &str, usize)] = &[
     ("probe/process.rs", "run_probe_skeleton", 1295),             // queued: decompose
     ("scenario/ops/dispatch.rs", "apply_ops", 1122),              // queued: decompose
     ("scenario/ops/mod.rs", "run_scenario", 414),                 // queued: decompose
-    ("scenario/ops/tests.rs", "op_discriminant_values", 210),     // queued: decompose
     (
         "scenario/snapshot/error.rs",
         "<SnapshotError as std :: fmt :: Display>::fmt",

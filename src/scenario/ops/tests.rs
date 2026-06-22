@@ -461,21 +461,87 @@ fn op_discriminant_unique() {
     }
 }
 
+/// Pin one Op variant's discriminant to `want`. `#[track_caller]`
+/// reports a mismatch at the call site (the specific variant), and
+/// `name` labels the variant in the panic message — so a
+/// multi-variant failure is operator-readable from the cargo-test
+/// output without a source cross-reference.
+#[track_caller]
+fn assert_discriminant(op: Op, want: u32, name: &str) {
+    assert_eq!(op.discriminant(), want, "{name}");
+}
+
 /// Pins every Op variant's exact discriminant value against the
 /// canonical `OpKind::bit_index` match in types.rs. A renumbering
 /// or reordering surfaces here naming the specific variant that
-/// moved — complementing `op_kind_bit_indices_are_unique_and_contiguous`
+/// moved (via [`assert_discriminant`]'s `name` label) —
+/// complementing `op_kind_bit_indices_are_unique_and_contiguous`
 /// (whose contiguity arm surfaces gaps as sorted indices only,
 /// not the offending variant; its uniqueness arm DOES name
 /// variants via the `{:?}` of `(OpKind, bit_index)` pairs) and
 /// `op_discriminant_unique` (which proves no collisions via the
-/// `BTreeSet::insert` "duplicate discriminant" panic). The
-/// variant-name label on each `assert_eq!` 3rd arg makes a
-/// multi-variant failure operator-readable: the cargo-test output
-/// names each variant whose discriminant drifted, no
-/// source-cross-reference needed.
+/// `BTreeSet::insert` "duplicate discriminant" panic).
+///
+/// The pin is split into theme-grouped sub-tests
+/// (`op_discriminant_cgroup_ops`, `op_discriminant_workload_ops`,
+/// `op_discriminant_payload_ops`,
+/// `op_discriminant_freeze_snapshot_kernel_ops`,
+/// `op_discriminant_scheduler_ops`); their union covers every Op
+/// variant (discriminants 0..=26) exactly once, in source order.
 #[test]
-fn op_discriminant_values() {
+fn op_discriminant_cgroup_ops() {
+    assert_discriminant(Op::AddCgroup { name: "a".into() }, 0, "AddCgroup");
+    assert_discriminant(Op::AddCgroupDef { def: CgroupDef::named("a") }, 1, "AddCgroupDef");
+    assert_discriminant(Op::RemoveCgroup { cgroup: "a".into() }, 2, "RemoveCgroup");
+    assert_discriminant(
+        Op::SetCpuset {
+            cgroup: "a".into(),
+            cpus: CpusetSpec::Llc(0),
+        },
+        3,
+        "SetCpuset",
+    );
+    assert_discriminant(Op::ClearCpuset { cgroup: "a".into() }, 4, "ClearCpuset");
+    assert_discriminant(
+        Op::SwapCpusets {
+            a: "a".into(),
+            b: "b".into(),
+        },
+        5,
+        "SwapCpusets",
+    );
+}
+
+/// Discriminant pin for the workload/placement Op variants
+/// (discriminants 6..=9). See [`op_discriminant_cgroup_ops`] for the
+/// full pin rationale.
+#[test]
+fn op_discriminant_workload_ops() {
+    assert_discriminant(Op::spawn(SpawnPlacement::cgroup("a"), WorkSpec::default()), 6, "Spawn");
+    assert_discriminant(Op::StopCgroup { cgroup: "a".into() }, 7, "StopCgroup");
+    assert_discriminant(
+        Op::SetAffinity {
+            cgroup: "a".into(),
+            affinity: AffinityIntent::Inherit,
+        },
+        8,
+        "SetAffinity",
+    );
+    assert_discriminant(
+        Op::MoveAllTasks {
+            from: "a".into(),
+            to: "b".into(),
+        },
+        9,
+        "MoveAllTasks",
+    );
+}
+
+/// Discriminant pin for the payload Op variants (discriminants
+/// 10..=12). See [`op_discriminant_cgroup_ops`] for the full pin
+/// rationale.
+#[test]
+fn op_discriminant_payload_ops() {
     use crate::test_support::{OutputFormat, Payload, PayloadKind};
     static TRUE_BIN: Payload = Payload {
         name: "true_bin",
@@ -489,198 +555,104 @@ fn op_discriminant_values() {
         known_flags: None,
         metric_bounds: None,
     };
-    assert_eq!(
-        Op::AddCgroup { name: "a".into() }.discriminant(),
-        0,
-        "AddCgroup",
-    );
-    assert_eq!(
-        Op::AddCgroupDef {
-            def: CgroupDef::named("a")
-        }
-        .discriminant(),
-        1,
-        "AddCgroupDef",
-    );
-    assert_eq!(
-        Op::RemoveCgroup { cgroup: "a".into() }.discriminant(),
-        2,
-        "RemoveCgroup",
-    );
-    assert_eq!(
-        Op::SetCpuset {
-            cgroup: "a".into(),
-            cpus: CpusetSpec::Llc(0),
-        }
-        .discriminant(),
-        3,
-        "SetCpuset",
-    );
-    assert_eq!(
-        Op::ClearCpuset { cgroup: "a".into() }.discriminant(),
-        4,
-        "ClearCpuset",
-    );
-    assert_eq!(
-        Op::SwapCpusets {
-            a: "a".into(),
-            b: "b".into(),
-        }
-        .discriminant(),
-        5,
-        "SwapCpusets",
-    );
-    assert_eq!(
-        Op::spawn(SpawnPlacement::cgroup("a"), WorkSpec::default()).discriminant(),
-        6,
-        "Spawn",
-    );
-    assert_eq!(
-        Op::StopCgroup { cgroup: "a".into() }.discriminant(),
-        7,
-        "StopCgroup",
-    );
-    assert_eq!(
-        Op::SetAffinity {
-            cgroup: "a".into(),
-            affinity: AffinityIntent::Inherit,
-        }
-        .discriminant(),
-        8,
-        "SetAffinity",
-    );
-    assert_eq!(
-        Op::MoveAllTasks {
-            from: "a".into(),
-            to: "b".into()
-        }
-        .discriminant(),
-        9,
-        "MoveAllTasks",
-    );
-    assert_eq!(
+    assert_discriminant(
         Op::RunPayload {
             payload: &TRUE_BIN,
             args: vec![],
             cgroup: None,
-        }
-        .discriminant(),
+        },
         10,
         "RunPayload",
     );
-    assert_eq!(
+    assert_discriminant(
         Op::WaitPayload {
             name: "p".into(),
             cgroup: None,
-        }
-        .discriminant(),
+        },
         11,
         "WaitPayload",
     );
-    assert_eq!(
+    assert_discriminant(
         Op::KillPayload {
             name: "p".into(),
             cgroup: None,
-        }
-        .discriminant(),
+        },
         12,
         "KillPayload",
     );
-    assert_eq!(
-        Op::FreezeCgroup { cgroup: "a".into() }.discriminant(),
-        13,
-        "FreezeCgroup",
-    );
-    assert_eq!(
-        Op::UnfreezeCgroup { cgroup: "a".into() }.discriminant(),
-        14,
-        "UnfreezeCgroup",
-    );
-    assert_eq!(
-        Op::CaptureSnapshot {
-            name: "snap".into()
-        }
-        .discriminant(),
-        15,
-        "Snapshot",
-    );
-    assert_eq!(
-        Op::WatchSnapshot {
-            symbol: "kernel.x".into()
-        }
-        .discriminant(),
-        16,
-        "WatchSnapshot",
-    );
-    assert_eq!(
+}
+
+/// Discriminant pin for the freeze, snapshot, and kernel-I/O Op
+/// variants (discriminants 13..=20). See [`op_discriminant_cgroup_ops`]
+/// for the full pin rationale.
+#[test]
+fn op_discriminant_freeze_snapshot_kernel_ops() {
+    assert_discriminant(Op::FreezeCgroup { cgroup: "a".into() }, 13, "FreezeCgroup");
+    assert_discriminant(Op::UnfreezeCgroup { cgroup: "a".into() }, 14, "UnfreezeCgroup");
+    assert_discriminant(Op::CaptureSnapshot { name: "snap".into() }, 15, "Snapshot");
+    assert_discriminant(Op::WatchSnapshot { symbol: "kernel.x".into() }, 16, "WatchSnapshot");
+    assert_discriminant(
         Op::WriteKernelHot {
-            writes: vec![(KernelTarget::symbol("x"), KernelValue::u64(0))]
-        }
-        .discriminant(),
+            writes: vec![(KernelTarget::symbol("x"), KernelValue::u64(0))],
+        },
         17,
         "WriteKernelHot",
     );
-    assert_eq!(
+    assert_discriminant(
         Op::WriteKernelCold {
-            writes: vec![(KernelTarget::symbol("x"), KernelValue::u64(0))]
-        }
-        .discriminant(),
+            writes: vec![(KernelTarget::symbol("x"), KernelValue::u64(0))],
+        },
         18,
         "WriteKernelCold",
     );
-    assert_eq!(
+    assert_discriminant(
         Op::ReadKernelHot {
             tag: "t".into(),
             target: KernelTarget::symbol("x"),
             width: KernelValueWidth::u64(),
-        }
-        .discriminant(),
+        },
         19,
         "ReadKernelHot",
     );
-    assert_eq!(
+    assert_discriminant(
         Op::ReadKernelCold {
             tag: "t".into(),
             target: KernelTarget::symbol("x"),
             width: KernelValueWidth::u64(),
-        }
-        .discriminant(),
+        },
         20,
         "ReadKernelCold",
     );
+}
+
+/// Discriminant pin for the scheduler-control Op variants plus
+/// `PinBpfMap`/`CaptureCgroupProcs` (discriminants 21..=26). See
+/// [`op_discriminant_cgroup_ops`] for the full pin rationale.
+#[test]
+fn op_discriminant_scheduler_ops() {
     static SCHED_FIXTURE: crate::test_support::Scheduler = crate::test_support::Scheduler::EEVDF;
-    assert_eq!(
+    assert_discriminant(
         Op::AttachScheduler {
             scheduler: &SCHED_FIXTURE,
-        }
-        .discriminant(),
+        },
         21,
         "AttachScheduler",
     );
-    assert_eq!(Op::DetachScheduler.discriminant(), 22, "DetachScheduler",);
-    assert_eq!(Op::RestartScheduler.discriminant(), 23, "RestartScheduler",);
-    assert_eq!(
+    assert_discriminant(Op::DetachScheduler, 22, "DetachScheduler");
+    assert_discriminant(Op::RestartScheduler, 23, "RestartScheduler");
+    assert_discriminant(
         Op::ReplaceScheduler {
             scheduler: &SCHED_FIXTURE,
-        }
-        .discriminant(),
+        },
         24,
         "ReplaceScheduler",
     );
-    assert_eq!(
-        Op::PinBpfMap {
-            name: "scx_test.bss".into(),
-        }
-        .discriminant(),
-        25,
-        "PinBpfMap",
-    );
-    assert_eq!(
+    assert_discriminant(Op::PinBpfMap { name: "scx_test.bss".into() }, 25, "PinBpfMap");
+    assert_discriminant(
         Op::CaptureCgroupProcs {
             tag: "snap".into(),
             cgroup: "a".into(),
-        }
-        .discriminant(),
+        },
         26,
         "CaptureCgroupProcs",
     );
