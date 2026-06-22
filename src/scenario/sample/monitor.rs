@@ -34,7 +34,7 @@ pub struct MonitorView<'a> {
 
 impl<'a> MonitorView<'a> {
     /// Aggregate summary statistics: imbalance ratio, nr_running
-    /// averages, local DSQ depth, stuck-CPU detection, and
+    /// averages, local DSQ depth, stuck-CPU count, and
     /// optional schedstat / prog-stats deltas. See
     /// `MonitorSummary` for the full field set.
     pub fn summary(&self) -> &'a MonitorSummary {
@@ -81,6 +81,16 @@ impl<'a> MonitorView<'a> {
     /// per-tick observations across the whole window.
     pub fn samples(&self) -> &'a [crate::monitor::MonitorSample] {
         &self.report.samples
+    }
+
+    /// vCPU-preemption exemption window (ns) for stall detection,
+    /// derived from the guest kernel's `CONFIG_HZ` at run time. `0`
+    /// means "derive from a default" — callers folding per-phase
+    /// stall counts pass it through to
+    /// `crate::timeline::compute_metrics` so the per-phase predicate
+    /// matches the run-level `MonitorSummary::stuck_count` one.
+    pub fn preemption_threshold_ns(&self) -> u64 {
+        self.report.preemption_threshold_ns
     }
 }
 

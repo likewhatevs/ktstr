@@ -323,11 +323,17 @@ impl ScenarioStats {
 /// Registry metric names that already have a typed `GauntletRow` field — the
 /// typed accessor populates them at `sidecar_to_row` time and
 /// `MetricDef::read` prefers the accessor over `ext_metrics`, so writing the
-/// same key into `ext_metrics` would create unread sidecar bloat AND a
-/// cross-RUN aggregation-drift class (the typed-path reduction vs the
-/// ext-path kind-aware dispatch can produce different values for one metric —
-/// e.g. `stuck_count`'s typed whole-run flag vs an ext per-phase stall-count
-/// sum). Both run-level ext-metrics populators consult this — the SampleSeries
+/// same key into `ext_metrics` would create unread sidecar bloat AND
+/// double-source the run-level value. For `stuck_count` the typed whole-run
+/// count (`MonitorSummary::stuck_count`, windowed over the full sample
+/// stream) is authoritative; the per-phase fold sum shares the
+/// `is_cpu_stuck` predicate but is a lower-or-equal (`<=`),
+/// partition-dependent quantity (it drops cross-boundary + out-of-phase
+/// windows, so it falls strictly below once any of those is stuck), so
+/// injecting the ext copy would shadow the authoritative typed value with
+/// a redundant — and, once a dropped window is stuck, divergent —
+/// number. Both run-level ext-metrics populators consult this — the
+/// SampleSeries
 /// path ([`populate_run_ext_metrics`]) and the phase-fold path
 /// ([`populate_run_ext_metrics_from_phases`]) — so only ext-metrics-only
 /// registry entries are written and a typed-backed metric's run-level value
@@ -411,14 +417,17 @@ pub fn populate_run_ext_metrics_from_phases(
         }
         // Typed-backed keys (those in TYPED_FIELD_NAMES — a typed GauntletRow
         // accessor that wins on read) must NOT be re-injected into ext_metrics
-        // from the phase fold: the ext copy would be unread bloat and, for a
-        // key whose typed and ext reductions differ (stuck_count: whole-run
-        // flag vs per-phase stall-count sum), a cross-RUN aggregation-drift
-        // trap. Their per-phase PhaseBucket value still feeds rendering; the
-        // run-level value stays the typed path. Mirrors the sibling
-        // populate_run_ext_metrics. (Without this, folding max_imbalance_ratio
-        // + stuck_count onto captured buckets would leak both into ext_metrics
-        // on the common path.)
+        // from the phase fold: the ext copy would be unread bloat and, for
+        // stuck_count (whose per-phase fold sum is `<=` the typed whole-run
+        // count, strictly below once a cross-boundary/out-of-phase window is
+        // stuck — they share the is_cpu_stuck predicate but the run-level
+        // count windows the full stream), a redundant-or-divergent value,
+        // not a guaranteed duplicate. Their per-phase
+        // PhaseBucket value still feeds rendering; the run-level value stays
+        // the typed path. Mirrors the sibling populate_run_ext_metrics.
+        // (Without this, folding max_imbalance_ratio + stuck_count onto
+        // captured buckets would leak both into ext_metrics on the common
+        // path.)
         if TYPED_FIELD_NAMES.contains(&key.as_str()) {
             continue;
         }

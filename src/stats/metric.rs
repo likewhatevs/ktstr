@@ -1224,6 +1224,9 @@ pub static METRICS: &[MetricDef] = &[
         name: "stuck_count",
         polarity: crate::test_support::Polarity::LowerBetter,
         kind: MetricKind::Counter,
+        // abs=1.0 (vs 5.0 for the event counters below): one additional
+        // scheduler stall is high-signal, so a delta of a single whole
+        // stall — gated by the 0.50 rel threshold — is worth flagging.
         default_abs: 1.0,
         default_rel: 0.50,
         display_unit: "",

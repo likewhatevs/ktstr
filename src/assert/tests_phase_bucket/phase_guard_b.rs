@@ -884,9 +884,12 @@ fn populate_run_ext_metrics_from_phases_folds_per_phase_keys() {
 /// a typed GauntletRow field (TYPED_FIELD_NAMES) so the phase fold never
 /// re-injects them into ext_metrics. The monitor fold writes max_imbalance_ratio +
 /// stuck_count onto CAPTURED buckets; both are typed-backed (their accessor
-/// wins on read), so writing them to ext would be unread bloat AND a cross-RUN
-/// drift trap (stuck_count: typed whole-run flag vs ext per-phase
-/// stall-count SUM). avg_imbalance_ratio (genuinely ext-only) must still fold.
+/// wins on read), so writing them to ext would be unread bloat AND, for
+/// stuck_count, a redundant-or-divergent value: the ext per-phase fold sum
+/// is `<=` the typed whole-run count (equal when no dropped window is stuck;
+/// strictly below otherwise — they share the is_cpu_stuck predicate but the
+/// run-level count windows the full sample stream). avg_imbalance_ratio
+/// (genuinely ext-only) must still fold.
 #[test]
 fn populate_run_ext_metrics_from_phases_skips_typed_backed_keys() {
     use crate::assert::PhaseBucket;
@@ -916,7 +919,7 @@ fn populate_run_ext_metrics_from_phases_skips_typed_backed_keys() {
     );
     assert!(
         !target.contains_key("stuck_count"),
-        "stuck_count is typed-backed; must NOT leak into ext_metrics (typed flag vs ext-sum drift)",
+        "stuck_count is typed-backed; must NOT leak into ext_metrics (the ext per-phase fold sum is <= the typed whole-run count, never a guaranteed duplicate)",
     );
 }
 

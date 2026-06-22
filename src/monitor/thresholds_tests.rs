@@ -260,7 +260,7 @@ fn thresholds_dsq_depth_below_sustained_passes() {
 }
 
 #[test]
-fn thresholds_stuck_detected_fails() {
+fn thresholds_stuck_fails() {
     // Stuck checks use the sustained_samples window. With sustained_samples=1,
     // a single stuck pair triggers failure. `enforce: true` opts out of
     // the report-only default so the violation flips `passed` to false.

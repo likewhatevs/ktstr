@@ -1034,7 +1034,7 @@ fn eval_sched_exit_includes_monitor() {
                 total_samples: 5,
                 max_imbalance_ratio: 3.0,
                 max_local_dsq_depth: 2,
-                stuck_detected: false,
+                stuck_count: 0,
                 event_deltas: None,
                 schedstat_deltas: None,
                 prog_stats_deltas: None,

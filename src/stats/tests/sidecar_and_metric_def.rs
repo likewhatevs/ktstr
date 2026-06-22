@@ -25,7 +25,7 @@ fn sidecar_to_row_basic() {
             total_samples: 10,
             max_imbalance_ratio: 2.5,
             max_local_dsq_depth: 4,
-            stuck_detected: true,
+            stuck_count: 1,
             event_deltas: Some(monitor::ScxEventDeltas {
                 total_fallback: 7,
                 fallback_rate: 0.5,
@@ -346,7 +346,7 @@ fn sidecar_to_row_no_stall() {
             total_samples: 5,
             max_imbalance_ratio: 1.0,
             max_local_dsq_depth: 0,
-            stuck_detected: false,
+            stuck_count: 0,
             event_deltas: None,
             schedstat_deltas: None,
             ..Default::default()

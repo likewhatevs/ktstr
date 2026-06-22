@@ -981,11 +981,7 @@ pub fn sidecar_to_row(sc: &crate::test_support::SidecarResult) -> GauntletRow {
             .as_ref()
             .map(|m| m.max_local_dsq_depth)
             .unwrap_or(0),
-        stuck_count: if sc.monitor.as_ref().is_some_and(|m| m.stuck_detected) {
-            1
-        } else {
-            0
-        },
+        stuck_count: sc.monitor.as_ref().map(|m| m.stuck_count).unwrap_or(0),
         fallback_count: sc
             .monitor
             .as_ref()

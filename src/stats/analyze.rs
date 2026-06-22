@@ -310,6 +310,10 @@ pub(crate) fn format_dimension_summary(rows: &[GauntletRow], group_col: &str) ->
         avg_gap_ms: f64,
         avg_imbalance: f64,
         avg_dsq_depth: f64,
+        /// Sum of per-run `stuck_count` across the group — total stall
+        /// observations, NOT the number of runs that stalled. Now that
+        /// `stuck_count` is a true per-run count, a single run can
+        /// contribute more than 1.
         total_stuck: f64,
         avg_fallback: f64,
     }

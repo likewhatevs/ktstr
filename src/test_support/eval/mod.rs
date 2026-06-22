@@ -1621,7 +1621,13 @@ fn evaluate_vm_result(
         result
             .monitor
             .as_ref()
-            .map(|m| crate::timeline::Timeline::build(stimulus_events, &m.samples))
+            .map(|m| {
+                crate::timeline::Timeline::build(
+                    stimulus_events,
+                    &m.samples,
+                    m.preemption_threshold_ns,
+                )
+            })
     };
 
     let sched_label = reporting::scheduler_label(&entry.scheduler.binary);

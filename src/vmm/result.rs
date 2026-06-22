@@ -1392,7 +1392,7 @@ mod tests {
             total_samples: 5,
             max_imbalance_ratio: 3.5,
             max_local_dsq_depth: 10,
-            stuck_detected: true,
+            stuck_count: 1,
             event_deltas: None,
             schedstat_deltas: None,
             ..Default::default()
@@ -1415,7 +1415,7 @@ mod tests {
         assert_eq!(mon.summary.total_samples, 5);
         assert!((mon.summary.max_imbalance_ratio - 3.5).abs() < f64::EPSILON);
         assert_eq!(mon.summary.max_local_dsq_depth, 10);
-        assert!(mon.summary.stuck_detected);
+        assert!(mon.summary.stuck_count > 0);
         assert!(r.timed_out);
         assert_eq!(r.exit_code, 1);
         assert_eq!(r.stderr, "kernel panic");

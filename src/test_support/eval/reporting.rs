@@ -30,7 +30,7 @@ pub(crate) fn format_monitor_section(
     let mut lines = vec![
         format!(
             "samples={} max_imbalance={:.2} max_dsq_depth={} stuck={}",
-            s.total_samples, s.max_imbalance_ratio, s.max_local_dsq_depth, s.stuck_detected,
+            s.total_samples, s.max_imbalance_ratio, s.max_local_dsq_depth, s.stuck_count,
         ),
         format!(
             "avg: imbalance={:.2} nr_running/cpu={:.1} dsq/cpu={:.1}",

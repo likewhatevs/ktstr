@@ -96,6 +96,15 @@ pub fn build_phase_buckets_with_stimulus(
 ) -> Vec<PhaseBucket> {
     let monitor_samples: &[crate::monitor::MonitorSample] =
         samples.monitor().map(|m| m.samples()).unwrap_or(&[]);
+    // vCPU-preemption exemption window for the per-phase stall predicate,
+    // threaded into fold_monitor_into_bucket -> compute_metrics so the
+    // per-phase stuck_count uses the SAME predicate as the run-level
+    // MonitorSummary::stuck_count. 0 (no monitor) derives from CONFIG_HZ
+    // inside compute_metrics, matching from_samples_with_threshold.
+    let preemption_threshold_ns: u64 = samples
+        .monitor()
+        .map(|m| m.preemption_threshold_ns())
+        .unwrap_or(0);
     // Re-group periodic captures by the guest step whose stimulus
     // window contains each capture's workload-relative boundary offset,
     // NOT the step_index stamped at (deferred) fire time — see
@@ -108,7 +117,12 @@ pub fn build_phase_buckets_with_stimulus(
     // monitor samples (run-relative) are shifted by the stimulus/monitor
     // clock skew before windowing.
     let monitor_to_window_offset_ms = monitor_clock_offset(stimulus_events, monitor_samples);
-    let mut buckets = buckets_from_grouped(by_phase, monitor_samples, monitor_to_window_offset_ms);
+    let mut buckets = buckets_from_grouped(
+        by_phase,
+        monitor_samples,
+        monitor_to_window_offset_ms,
+        preemption_threshold_ns,
+    );
     // Synthesize a PhaseBucket for any scenario step that has a stimulus
     // StepStart but produced no capture bucket. Periodic boundaries are
     // placed uniformly over the whole workload (step-agnostic — see
@@ -196,7 +210,12 @@ pub fn build_phase_buckets_with_stimulus(
             metrics: std::collections::BTreeMap::new(),
             per_cgroup: std::collections::BTreeMap::new(),
         };
-        fold_monitor_into_bucket(&mut bucket, monitor_samples, monitor_to_window_offset_ms);
+        fold_monitor_into_bucket(
+            &mut bucket,
+            monitor_samples,
+            monitor_to_window_offset_ms,
+            preemption_threshold_ns,
+        );
         buckets.push(bucket);
     }
     // Keep buckets in step_index order: buckets_from_grouped emits them
@@ -357,6 +376,13 @@ pub fn build_phase_buckets(samples: &crate::scenario::sample::SampleSeries) -> V
     // was attached, e.g. host-only fixture tests).
     let monitor_samples: &[crate::monitor::MonitorSample] =
         samples.monitor().map(|m| m.samples()).unwrap_or(&[]);
+    // vCPU-preemption exemption window for the per-phase stall predicate
+    // (see build_phase_buckets_with_stimulus). 0 (no monitor) derives from
+    // CONFIG_HZ inside compute_metrics.
+    let preemption_threshold_ns: u64 = samples
+        .monitor()
+        .map(|m| m.preemption_threshold_ns())
+        .unwrap_or(0);
     // Group by the bridge-stamped step_index. Without a stimulus
     // timeline to remap against, the stamped index is the only phase
     // signal available — see `build_phase_buckets_with_stimulus` (and
@@ -366,7 +392,12 @@ pub fn build_phase_buckets(samples: &crate::scenario::sample::SampleSeries) -> V
     // share the run-relative frame here, so the clock offset is `0`;
     // synthetic / legacy fixture samples carry `boundary_offset_ms =
     // None` and the window falls back to `elapsed_ms`.
-    buckets_from_grouped(samples.by_stamped_phase(), monitor_samples, 0)
+    buckets_from_grouped(
+        samples.by_stamped_phase(),
+        monitor_samples,
+        0,
+        preemption_threshold_ns,
+    )
 }
 
 /// Per-phase CPU-time delta (ns) for one field family
@@ -520,10 +551,15 @@ fn phase_group_cpu_delta(
 /// `avg_imbalance_ratio` that need per-CPU full-class `rq.nr_running`,
 /// which the bridge-captured Snapshot does not expose (Snapshot carries
 /// scx_rq.nr_running only).
+///
+/// `preemption_threshold_ns` is forwarded to `fold_monitor_into_bucket`
+/// (and thence `compute_metrics`) for the per-phase stall predicate; see
+/// `fold_monitor_into_bucket`.
 fn buckets_from_grouped(
     by_phase: std::collections::BTreeMap<u16, Vec<crate::scenario::sample::Sample<'_>>>,
     monitor_samples: &[crate::monitor::MonitorSample],
     monitor_to_window_offset_ms: i64,
+    preemption_threshold_ns: u64,
 ) -> Vec<PhaseBucket> {
     let mut out: Vec<PhaseBucket> = Vec::with_capacity(by_phase.len());
     for (step_index, samples_in_phase) in by_phase {
@@ -619,7 +655,12 @@ fn buckets_from_grouped(
         // imbalance too — same formula and frame, but over the
         // synthesized bucket's FULL stimulus window vs this captured
         // bucket's narrower interior capture-offset span.
-        fold_monitor_into_bucket(&mut bucket, monitor_samples, monitor_to_window_offset_ms);
+        fold_monitor_into_bucket(
+            &mut bucket,
+            monitor_samples,
+            monitor_to_window_offset_ms,
+            preemption_threshold_ns,
+        );
         // Derive Rate metrics AFTER every component source is folded in:
         // the METRICS reductions + system/user_time_ns above AND the
         // monitor-injected components (e.g. avg_imbalance_ratio, whose ONLY
@@ -703,6 +744,7 @@ fn fold_monitor_into_bucket(
     bucket: &mut PhaseBucket,
     monitor_samples: &[crate::monitor::MonitorSample],
     monitor_to_window_offset_ms: i64,
+    preemption_threshold_ns: u64,
 ) {
     let start_ms = bucket.start_ms;
     let end_ms = bucket.end_ms;
@@ -729,7 +771,7 @@ fn fold_monitor_into_bucket(
     if phase_monitor_samples.is_empty() {
         return;
     }
-    let pm = crate::timeline::compute_metrics(&phase_monitor_samples);
+    let pm = crate::timeline::compute_metrics(&phase_monitor_samples, preemption_threshold_ns);
     // sample_count == 0 IFF the bucket is synthesized: buckets_from_grouped
     // only emits >=1-sample buckets, the synthesize loop only emits 0-sample
     // ones. A CAPTURED bucket folds the source-less monitor signals (avg/max

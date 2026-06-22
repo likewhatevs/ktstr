@@ -13,7 +13,7 @@ fn empty_samples_default_summary() {
     assert_eq!(summary.total_samples, 0);
     assert_eq!(summary.max_imbalance_ratio, 0.0);
     assert_eq!(summary.max_local_dsq_depth, 0);
-    assert!(!summary.stuck_detected);
+    assert_eq!(summary.stuck_count, 0);
     assert_eq!(summary.avg_imbalance_ratio, 0.0);
     assert_eq!(summary.avg_nr_running, 0.0);
     assert_eq!(summary.avg_local_dsq_depth, 0.0);
@@ -43,7 +43,7 @@ fn single_sample_imbalanced_cpus() {
     assert_eq!(summary.total_samples, 1);
     assert!((summary.max_imbalance_ratio - 4.0).abs() < f64::EPSILON);
     assert_eq!(summary.max_local_dsq_depth, 3);
-    assert!(!summary.stuck_detected);
+    assert_eq!(summary.stuck_count, 0);
     // avg fields: single sample with cpus [nr_running=1, nr_running=4]
     assert!((summary.avg_imbalance_ratio - 4.0).abs() < f64::EPSILON);
     assert!((summary.avg_nr_running - 2.5).abs() < f64::EPSILON);
@@ -51,7 +51,7 @@ fn single_sample_imbalanced_cpus() {
 }
 
 #[test]
-fn stuck_detected_when_clock_stuck() {
+fn stuck_count_when_clock_stuck() {
     let s1 = MonitorSample {
         prog_stats: None,
         elapsed_ms: 100,
@@ -85,7 +85,7 @@ fn stuck_detected_when_clock_stuck() {
         ],
     };
     let summary = MonitorSummary::from_samples(&[s1, s2]);
-    assert!(summary.stuck_detected);
+    assert_eq!(summary.stuck_count, 1);
 }
 
 #[test]
@@ -108,7 +108,7 @@ fn balanced_cpus_ratio_one() {
     };
     let summary = MonitorSummary::from_samples(&[sample]);
     assert!((summary.max_imbalance_ratio - 1.0).abs() < f64::EPSILON);
-    assert!(!summary.stuck_detected);
+    assert_eq!(summary.stuck_count, 0);
     assert!((summary.avg_imbalance_ratio - 1.0).abs() < f64::EPSILON);
     assert!((summary.avg_nr_running - 3.0).abs() < f64::EPSILON);
     assert!((summary.avg_local_dsq_depth - 0.0).abs() < f64::EPSILON);
@@ -131,7 +131,7 @@ fn single_cpu_no_division_by_zero() {
     // Single CPU: min == max, ratio = 1.0
     assert!((summary.max_imbalance_ratio - 1.0).abs() < f64::EPSILON);
     assert_eq!(summary.max_local_dsq_depth, 2);
-    assert!(!summary.stuck_detected);
+    assert_eq!(summary.stuck_count, 0);
 }
 
 #[test]
@@ -148,7 +148,7 @@ fn all_zero_snapshots() {
     assert!((summary.max_imbalance_ratio - 1.0).abs() < f64::EPSILON);
     assert_eq!(summary.max_local_dsq_depth, 0);
     // rq_clock=0 is excluded from stall detection
-    assert!(!summary.stuck_detected);
+    assert_eq!(summary.stuck_count, 0);
     // avg: valid sample with 2 all-zero CPUs
     assert_eq!(summary.avg_imbalance_ratio, 0.0);
     assert_eq!(summary.avg_nr_running, 0.0);
@@ -272,7 +272,7 @@ fn advancing_clocks_no_stuck() {
         ],
     };
     let summary = MonitorSummary::from_samples(&[s1, s2, s3]);
-    assert!(!summary.stuck_detected);
+    assert_eq!(summary.stuck_count, 0);
     assert_eq!(summary.total_samples, 3);
 }
 
@@ -318,7 +318,7 @@ fn different_length_cpu_vecs() {
         ],
     };
     let summary = MonitorSummary::from_samples(&[s1, s2]);
-    assert!(!summary.stuck_detected);
+    assert_eq!(summary.stuck_count, 0);
     assert_eq!(summary.total_samples, 2);
     // max_local_dsq_depth comes from all CPUs in all samples.
     assert_eq!(summary.max_local_dsq_depth, 0);
@@ -392,9 +392,9 @@ fn from_samples_fields_sane_values() {
         "must stay below the plausibility ceiling that gates validity",
     );
 
-    // stuck_detected: rq_clock advances each sample, so no stuck.
-    assert!(
-        !summary.stuck_detected,
+    // stuck_count: rq_clock advances each sample, so no stuck.
+    assert_eq!(
+        summary.stuck_count, 0,
         "no stuck expected with advancing rq_clock"
     );
 
@@ -464,7 +464,7 @@ fn from_samples_empty_all_defaults() {
     assert_eq!(summary.total_samples, 0);
     assert_eq!(summary.max_imbalance_ratio, 0.0);
     assert_eq!(summary.max_local_dsq_depth, 0);
-    assert!(!summary.stuck_detected);
+    assert_eq!(summary.stuck_count, 0);
     assert_eq!(summary.avg_imbalance_ratio, 0.0);
     assert_eq!(summary.avg_nr_running, 0.0);
     assert_eq!(summary.avg_local_dsq_depth, 0.0);

@@ -304,7 +304,7 @@ fn sidecar_result_roundtrip() {
             total_samples: 10,
             max_imbalance_ratio: 1.5,
             max_local_dsq_depth: 3,
-            stuck_detected: false,
+            stuck_count: 0,
             event_deltas: Some(crate::monitor::ScxEventDeltas {
                 total_fallback: 7,
                 fallback_rate: 0.5,
@@ -439,7 +439,7 @@ fn sidecar_result_roundtrip() {
     assert_eq!(mon.total_samples, 10);
     assert_eq!(mon.max_imbalance_ratio, 1.5);
     assert_eq!(mon.max_local_dsq_depth, 3);
-    assert!(!mon.stuck_detected);
+    assert_eq!(mon.stuck_count, 0);
     let deltas = mon.event_deltas.unwrap();
     assert_eq!(deltas.total_fallback, 7);
     assert_eq!(deltas.total_dispatch_keep_last, 3);

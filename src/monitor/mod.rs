@@ -708,9 +708,17 @@ pub struct MonitorSummary {
     pub max_imbalance_ratio: f64,
     /// Peak local DSQ depth across all CPUs and samples.
     pub max_local_dsq_depth: u32,
-    /// Whether any CPU's `rq_clock` failed to advance between consecutive
-    /// samples. Idle CPUs (`nr_running == 0` in both samples) are exempt.
-    pub stuck_detected: bool,
+    /// Count of (CPU, consecutive-sample-pair) observations where the
+    /// CPU's `rq_clock` failed to advance. Idle CPUs (`nr_running == 0`
+    /// in both samples) and host-preempted vCPUs are exempt (see
+    /// `reader::is_cpu_stuck`). This is the run-level analog of the
+    /// per-phase `PhaseMetrics::stall_count`: both apply the SAME
+    /// per-(CPU, window) `is_cpu_stuck` predicate, but this counts over
+    /// the full sample stream while the per-phase path windows within
+    /// each phase, so run-level `>=` the sum of per-phase counts (it
+    /// additionally counts cross-phase-boundary window pairs and
+    /// out-of-phase samples — boot-settle warmup, inter-step gaps).
+    pub stuck_count: usize,
     /// Average imbalance ratio across valid samples.
     pub avg_imbalance_ratio: f64,
     /// Average nr_running per CPU across valid samples.
@@ -873,8 +881,13 @@ impl MonitorSummary {
             0.0
         };
 
-        // Stuck detection: any CPU whose rq_clock did not advance between
-        // consecutive samples. Skip invalid samples.
+        // Stuck count: number of (CPU, consecutive-sample-pair)
+        // observations whose rq_clock did not advance. Skip invalid samples.
+        // Counts EVERY hit across all CPUs and all window pairs (no early
+        // break). Windowed over the full sample stream, so this is `>=` the
+        // sum of per-phase `PhaseMetrics::stall_count` (both route through
+        // `is_cpu_stuck`; the per-phase path windows within each phase and
+        // drops cross-boundary pairs + out-of-phase samples).
         // Exempt idle CPUs: nr_running==0 in both samples means the tick
         // is stopped (NOHZ) and rq_clock legitimately does not advance.
         // Exempt preempted vCPUs: vcpu_cpu_time_ns didn't advance enough
@@ -884,7 +897,7 @@ impl MonitorSummary {
         } else {
             vcpu_preemption_threshold_ns(None)
         };
-        let mut stuck_detected = false;
+        let mut stuck_count: usize = 0;
         let valid_samples: Vec<&MonitorSample> = samples
             .iter()
             .filter(|s| !s.cpus.is_empty() && sample_looks_valid(s))
@@ -895,12 +908,8 @@ impl MonitorSummary {
             let cpu_count = prev.cpus.len().min(curr.cpus.len());
             for cpu in 0..cpu_count {
                 if reader::is_cpu_stuck(&prev.cpus[cpu], &curr.cpus[cpu], threshold) {
-                    stuck_detected = true;
-                    break;
+                    stuck_count += 1;
                 }
-            }
-            if stuck_detected {
-                break;
             }
         }
 
@@ -912,7 +921,7 @@ impl MonitorSummary {
             total_samples: samples.len(),
             max_imbalance_ratio,
             max_local_dsq_depth,
-            stuck_detected,
+            stuck_count,
             avg_imbalance_ratio,
             avg_nr_running,
             avg_local_dsq_depth,

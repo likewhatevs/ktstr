@@ -568,7 +568,17 @@ impl Timeline {
     /// set this path computes). Both entry points produce the same
     /// Timeline field shape; from_phase_buckets is preferred when buckets
     /// are available because it avoids the per-MonitorSample reduction.
-    pub fn build(stimulus_events: &[StimulusEvent], monitor_samples: &[MonitorSample]) -> Self {
+    ///
+    /// `preemption_threshold_ns` threads the vCPU-preemption exemption
+    /// window into the per-phase stall predicate (see `compute_metrics`);
+    /// the production caller passes the run's
+    /// `MonitorReport::preemption_threshold_ns`. `0` derives it from the
+    /// guest kernel `CONFIG_HZ`.
+    pub fn build(
+        stimulus_events: &[StimulusEvent],
+        monitor_samples: &[MonitorSample],
+        preemption_threshold_ns: u64,
+    ) -> Self {
         if stimulus_events.is_empty() || monitor_samples.is_empty() {
             return Self { phases: Vec::new() };
         }
@@ -654,7 +664,7 @@ impl Timeline {
                 .filter(|s| s.elapsed_ms >= start && s.elapsed_ms < end && sample_looks_valid(s))
                 .collect();
 
-            let metrics = compute_metrics(&phase_samples);
+            let metrics = compute_metrics(&phase_samples, preemption_threshold_ns);
 
             phases.push(Phase {
                 // Enumerate position over the phase-bearing step_events,
@@ -1224,7 +1234,23 @@ fn format_phase_cgroups(
 // Metric computation
 // ---------------------------------------------------------------------------
 
-pub(crate) fn compute_metrics(samples: &[&MonitorSample]) -> PhaseMetrics {
+/// Reduce a phase's monitor samples to [`PhaseMetrics`].
+///
+/// `preemption_threshold_ns` is the vCPU-preemption exemption window for
+/// stall detection: a non-advancing `rq_clock` on a CPU whose
+/// `vcpu_cpu_time_ns` advanced by less than this is a host-preemption
+/// artifact, not a scheduler stall, and is exempt. Pass `0` to derive it
+/// from the guest kernel's `CONFIG_HZ` via
+/// `crate::monitor::vcpu_preemption_threshold_ns` — the same resolution
+/// [`MonitorSummary::from_samples_with_threshold`](crate::monitor::MonitorSummary::from_samples_with_threshold)
+/// applies, so the per-phase `stall_count` applies the SAME per-(CPU,
+/// window) `is_cpu_stuck` predicate as the run-level
+/// `MonitorSummary::stuck_count` (run-level `>=` Σ per-phase: it also
+/// windows across phase boundaries).
+pub(crate) fn compute_metrics(
+    samples: &[&MonitorSample],
+    preemption_threshold_ns: u64,
+) -> PhaseMetrics {
     if samples.is_empty() {
         return PhaseMetrics::default();
     }
@@ -1270,16 +1296,23 @@ pub(crate) fn compute_metrics(samples: &[&MonitorSample]) -> PhaseMetrics {
     }
 
     // Stall detection between consecutive valid samples in this phase.
+    // Route through `is_cpu_stuck` (the shared predicate the run-level
+    // `MonitorSummary` path also uses) so the per-phase stall count and the
+    // run-level stuck count apply the identical NOHZ-idle and
+    // vCPU-preemption exemptions — the per-phase count uses the SAME
+    // predicate as the run-level one (run-level `>=` Σ per-phase: it also
+    // counts the boundary-straddling window pair and out-of-phase samples).
+    let threshold = if preemption_threshold_ns > 0 {
+        preemption_threshold_ns
+    } else {
+        crate::monitor::vcpu_preemption_threshold_ns(None)
+    };
     for w in valid.windows(2) {
         let prev = w[0];
         let curr = w[1];
         let cpu_count = prev.cpus.len().min(curr.cpus.len());
         for cpu in 0..cpu_count {
-            let idle = curr.cpus[cpu].nr_running == 0 && prev.cpus[cpu].nr_running == 0;
-            if curr.cpus[cpu].rq_clock != 0
-                && curr.cpus[cpu].rq_clock == prev.cpus[cpu].rq_clock
-                && !idle
-            {
+            if crate::monitor::reader::is_cpu_stuck(&prev.cpus[cpu], &curr.cpus[cpu], threshold) {
                 stall_count += 1;
             }
         }
@@ -1408,21 +1441,21 @@ mod tests {
 
     #[test]
     fn empty_inputs_empty_timeline() {
-        let t = Timeline::build(&[], &[]);
+        let t = Timeline::build(&[], &[], 0);
         assert!(t.phases.is_empty());
     }
 
     #[test]
     fn no_stimulus_empty_timeline() {
         let samples = vec![sample(1000, vec![(2, 1, 100)])];
-        let t = Timeline::build(&[], &samples);
+        let t = Timeline::build(&[], &samples, 0);
         assert!(t.phases.is_empty());
     }
 
     #[test]
     fn no_monitor_empty_timeline() {
         let events = vec![stimulus(0, "ScenarioStart")];
-        let t = Timeline::build(&events, &[]);
+        let t = Timeline::build(&events, &[], 0);
         assert!(t.phases.is_empty());
     }
 
@@ -1433,7 +1466,7 @@ mod tests {
             sample(600, vec![(2, 1, 100), (2, 1, 200)]),
             sample(700, vec![(2, 1, 300), (2, 1, 400)]),
         ];
-        let t = Timeline::build(&events, &samples);
+        let t = Timeline::build(&events, &samples, 0);
         assert_eq!(t.phases.len(), 1);
         // Both samples — including the one AT last_monitor_ms (700) —
         // must fall inside the single phase's [start, last_monitor_ms+1)
@@ -1449,7 +1482,7 @@ mod tests {
         let samples: Vec<MonitorSample> = (5..65)
             .map(|i| sample(i * 100, vec![(2, 1, i * 1000), (2, 1, i * 1000 + 100)]))
             .collect();
-        let t = Timeline::build(&events, &samples);
+        let t = Timeline::build(&events, &samples, 0);
         assert_eq!(t.phases.len(), 2);
         // Pin WHERE the boundary fell, not just non-emptiness: 60 samples
         // at i*100 (i in 5..65 → 500..6400); the >500 warmup drops the
@@ -1484,7 +1517,7 @@ mod tests {
                 vec![(2, 1, i * 1000), (2, 1, i * 1000 + 100)],
             ));
         }
-        let t = Timeline::build(&events, &samples);
+        let t = Timeline::build(&events, &samples, 0);
         let improvements: Vec<_> = t
             .phases
             .iter()
@@ -1500,7 +1533,7 @@ mod tests {
         let samples: Vec<MonitorSample> = (5..25)
             .map(|i| sample(i * 100, vec![(2, 1, i * 1000), (2, 1, i * 1000 + 100)]))
             .collect();
-        let t = Timeline::build(&events, &samples);
+        let t = Timeline::build(&events, &samples, 0);
         let formatted = t.format_with_context(&TimelineContext::default());
         assert!(formatted.contains("BASELINE"));
         assert!(formatted.contains("Phase 1"));
@@ -2164,7 +2197,7 @@ mod tests {
         let samples: Vec<MonitorSample> = (5..35)
             .map(|i| sample(i * 100, vec![(2, 1, i * 1000), (2, 1, i * 1000 + 100)]))
             .collect();
-        let t = Timeline::build(&events, &samples);
+        let t = Timeline::build(&events, &samples, 0);
         assert_eq!(t.phases.len(), 2);
         // First phase should be from ScenarioStart (earliest).
         assert!(t.phases[0].stimulus.is_none());
@@ -2177,13 +2210,56 @@ mod tests {
             sample(600, vec![(1, 0, 5000), (1, 0, 6000)]),
             sample(700, vec![(1, 0, 5000), (1, 0, 7000)]), // cpu0 stalled
         ];
-        let t = Timeline::build(&events, &samples);
+        let t = Timeline::build(&events, &samples, 0);
         assert_eq!(t.phases[0].metrics.stall_count, 1);
     }
 
     #[test]
+    fn compute_metrics_stall_count_accumulates_across_windows() {
+        // cpu0 frozen across TWO consecutive windows -> stall_count == 2.
+        // Pins that the per-phase path counts every stuck (CPU, window),
+        // mirroring the run-level accumulation (both breaks removed).
+        let s1 = sample(100, vec![(1, 0, 5000), (1, 0, 6000)]);
+        let s2 = sample(200, vec![(1, 0, 5000), (1, 0, 6100)]);
+        let s3 = sample(300, vec![(1, 0, 5000), (1, 0, 6200)]);
+        let refs: Vec<&MonitorSample> = vec![&s1, &s2, &s3];
+        let m = compute_metrics(&refs, 0);
+        assert_eq!(m.stall_count, 2);
+    }
+
+    #[test]
+    fn run_level_stuck_count_ge_sum_of_per_phase() {
+        // Same is_cpu_stuck predicate, different windowing domains: the
+        // run-level path windows(2) over the FULL stream and counts the
+        // pair straddling a phase split; partitioning the stream into
+        // per-phase subsets drops that boundary pair. So run-level >= Σ
+        // per-phase (strict here) — pins the documented inequality.
+        let s1 = sample(100, vec![(1, 0, 5000), (1, 0, 6000)]);
+        let s2 = sample(200, vec![(1, 0, 5000), (1, 0, 6100)]);
+        let s3 = sample(300, vec![(1, 0, 5000), (1, 0, 6200)]);
+        let samples = vec![s1, s2, s3];
+        // Run-level: windows(2) over all 3 -> cpu0 frozen in both windows.
+        let run_level = crate::monitor::MonitorSummary::from_samples(&samples).stuck_count;
+        assert_eq!(run_level, 2);
+        // Partition after s2 (phase A = [s1,s2], phase B = [s3]): the
+        // (s2,s3) boundary pair is in neither phase's windows(2).
+        let phase_a: Vec<&MonitorSample> = vec![&samples[0], &samples[1]];
+        let phase_b: Vec<&MonitorSample> = vec![&samples[2]];
+        let sum_per_phase =
+            compute_metrics(&phase_a, 0).stall_count + compute_metrics(&phase_b, 0).stall_count;
+        assert_eq!(
+            sum_per_phase, 1,
+            "the (s2,s3) boundary pair is in neither phase"
+        );
+        assert!(
+            run_level > sum_per_phase,
+            "run-level counts the boundary-straddling pair the per-phase partition drops"
+        );
+    }
+
+    #[test]
     fn compute_metrics_empty() {
-        let m = compute_metrics(&[]);
+        let m = compute_metrics(&[], 0);
         assert_eq!(m.sample_count, 0);
         // No samples -> no measurement, not a false 0.0 (the sentinel fix).
         assert_eq!(m.avg_imbalance, None);
@@ -2208,7 +2284,7 @@ mod tests {
         let samples: Vec<MonitorSample> = (5..25)
             .map(|i| sample(i * 100, vec![(2, 1, i * 1000), (2, 1, i * 1000 + 100)]))
             .collect();
-        let t = Timeline::build(&events, &samples);
+        let t = Timeline::build(&events, &samples, 0);
         let formatted = t.format_with_context(&TimelineContext::default());
         assert!(formatted.contains("SetCpuset"));
         assert!(formatted.contains("4 cpus"));
@@ -2222,7 +2298,7 @@ mod tests {
         let samples: Vec<MonitorSample> = (5..55)
             .map(|i| sample(i * 100, vec![(2, 1, i * 1000)]))
             .collect();
-        let t = Timeline::build(&events, &samples);
+        let t = Timeline::build(&events, &samples, 0);
         assert_eq!(t.phases.len(), 10);
     }
 
@@ -2231,7 +2307,7 @@ mod tests {
         let s1 = sample(600, vec![(1, 3, 100), (4, 5, 200)]); // ratio=4, avg_dsq=4
         let s2 = sample(700, vec![(2, 1, 300), (2, 7, 400)]); // ratio=1, avg_dsq=4
         let refs: Vec<&MonitorSample> = vec![&s1, &s2];
-        let m = compute_metrics(&refs);
+        let m = compute_metrics(&refs, 0);
         assert_eq!(m.sample_count, 2);
         assert!((m.avg_imbalance.unwrap() - 2.5).abs() < 0.01); // (4+1)/2
         assert!((m.max_imbalance.unwrap() - 4.0).abs() < 0.01);
@@ -2293,7 +2369,7 @@ mod tests {
             }],
         };
         let refs: Vec<&MonitorSample> = vec![&s1, &s2];
-        let m = compute_metrics(&refs);
+        let m = compute_metrics(&refs, 0);
         // fallback delta: 110 - 10 = 100 over 1.0s = 100.0/s
         assert!((m.fallback_rate.unwrap() - 100.0).abs() < 0.01);
         // keep_last delta: 55 - 5 = 50 over 1.0s = 50.0/s
@@ -2305,7 +2381,7 @@ mod tests {
         let s1 = sample(600, vec![(2, 1, 100)]);
         let s2 = sample(700, vec![(2, 1, 200)]);
         let refs: Vec<&MonitorSample> = vec![&s1, &s2];
-        let m = compute_metrics(&refs);
+        let m = compute_metrics(&refs, 0);
         assert!(m.fallback_rate.is_none());
         assert!(m.keep_last_rate.is_none());
     }
@@ -2360,7 +2436,7 @@ mod tests {
             }],
         };
         let refs: Vec<&MonitorSample> = vec![&s1, &s2];
-        let m = compute_metrics(&refs);
+        let m = compute_metrics(&refs, 0);
         let fb = m.fallback_rate.expect("reset still produces Some rate");
         let kl = m.keep_last_rate.expect("reset still produces Some rate");
         assert!(
@@ -2382,7 +2458,7 @@ mod tests {
             sample(600, vec![(1, 0, 5000), (1, 0, 6000)]),
             sample(700, vec![(1, 0, 5000), (1, 0, 7000)]), // cpu0 stalled
         ];
-        let t = Timeline::build(&events, &samples);
+        let t = Timeline::build(&events, &samples, 0);
         let formatted = t.format_with_context(&TimelineContext::default());
         assert!(formatted.contains("stalls: 1"));
     }
@@ -2402,7 +2478,7 @@ mod tests {
         let samples: Vec<MonitorSample> = (5..15)
             .map(|i| sample(i * 100, vec![(2, 1, i * 1000)]))
             .collect();
-        let t = Timeline::build(&events, &samples);
+        let t = Timeline::build(&events, &samples, 0);
         let formatted = t.format_with_context(&TimelineContext::default());
         // The last phase (50000+offset to end) should have no samples.
         assert!(formatted.contains("[no samples]"));
@@ -2464,7 +2540,7 @@ mod tests {
                 }],
             });
         }
-        let t = Timeline::build(&events, &samples);
+        let t = Timeline::build(&events, &samples, 0);
         let degs: Vec<_> = t
             .degradations()
             .into_iter()
@@ -2482,7 +2558,7 @@ mod tests {
             sample(600, vec![(2, 1, 100), (2, 1, 200)]),
             sample(700, vec![(2, 1, 300), (2, 1, 400)]),
         ];
-        let t = Timeline::build(&events, &samples);
+        let t = Timeline::build(&events, &samples, 0);
         let ctx = TimelineContext {
             kernel: Some("6.14.0-rc3+".to_string()),
             topology: Some("2n4l4c2t (16 cpus)".to_string()),
@@ -2504,7 +2580,7 @@ mod tests {
     fn format_with_context_partial_fields() {
         let events = vec![stimulus(0, "ScenarioStart")];
         let samples = vec![sample(600, vec![(2, 1, 100)])];
-        let t = Timeline::build(&events, &samples);
+        let t = Timeline::build(&events, &samples, 0);
         let ctx = TimelineContext {
             kernel: None,
             topology: Some("1n1l1c1t (1 cpus)".to_string()),
@@ -2534,7 +2610,7 @@ mod tests {
     fn format_with_context_empty_context() {
         let events = vec![stimulus(0, "ScenarioStart")];
         let samples = vec![sample(600, vec![(2, 1, 100)])];
-        let t = Timeline::build(&events, &samples);
+        let t = Timeline::build(&events, &samples, 0);
         let ctx = TimelineContext::default();
         let formatted = t.format_with_context(&ctx);
         // Should have the timeline header and phases but no context line.
@@ -2567,7 +2643,7 @@ mod tests {
             // Valid sample.
             sample(700, vec![(2, 3, 2000)]),
         ];
-        let t = Timeline::build(&events, &samples);
+        let t = Timeline::build(&events, &samples, 0);
         assert_eq!(t.phases.len(), 1);
         // Only the valid sample should be counted.
         assert_eq!(t.phases[0].metrics.sample_count, 1);
@@ -2587,7 +2663,7 @@ mod tests {
                 ..Default::default()
             }],
         }];
-        let t = Timeline::build(&events, &samples);
+        let t = Timeline::build(&events, &samples, 0);
         assert_eq!(t.phases[0].metrics.sample_count, 0);
     }
 
@@ -2611,7 +2687,7 @@ mod tests {
                 vec![(1, 1, i * 1000), (10, 1, i * 1000 + 100)],
             ));
         }
-        let t = Timeline::build(&events, &samples);
+        let t = Timeline::build(&events, &samples, 0);
         assert_eq!(t.phases.len(), 2, "must have 2 phases");
         assert!(!t.degradations().is_empty());
 
@@ -2697,7 +2773,7 @@ mod tests {
                 vec![(2, 20, i * 1000), (2, 20, i * 1000 + 100)],
             ));
         }
-        let t = Timeline::build(&events, &samples);
+        let t = Timeline::build(&events, &samples, 0);
         assert!(
             !t.degradations().is_empty(),
             "DSQ depth jump must be detected"
@@ -2747,7 +2823,7 @@ mod tests {
                 vec![(2, 1, i * 1000), (2, 1, i * 1000 + 100)],
             ));
         }
-        let t = Timeline::build(&events, &samples);
+        let t = Timeline::build(&events, &samples, 0);
         assert_eq!(t.phases.len(), 2, "must have 2 phases");
         assert!(t.phases[0].metrics.sample_count > 0);
         assert!(t.phases[1].metrics.sample_count > 0);
@@ -2961,7 +3037,7 @@ mod tests {
         let samples: Vec<MonitorSample> = (5..35)
             .map(|i| sample(i * 100, vec![(2, 1, i * 1000), (2, 1, i * 1000 + 100)]))
             .collect();
-        let t = Timeline::build(&events, &samples);
+        let t = Timeline::build(&events, &samples, 0);
         assert_eq!(t.phases.len(), 2);
         let rate = t.phases[0].metrics.iteration_rate;
         assert!(rate.is_some(), "phase 0 should have iteration_rate");
@@ -2978,7 +3054,7 @@ mod tests {
         let samples: Vec<MonitorSample> = (5..35)
             .map(|i| sample(i * 100, vec![(2, 1, i * 1000), (2, 1, i * 1000 + 100)]))
             .collect();
-        let t = Timeline::build(&events, &samples);
+        let t = Timeline::build(&events, &samples, 0);
         assert!(t.phases[0].metrics.iteration_rate.is_none());
         assert!(t.phases[1].metrics.iteration_rate.is_none());
     }
@@ -3050,7 +3126,7 @@ mod tests {
         let samples: Vec<MonitorSample> = (5..35)
             .map(|i| sample(i * 100, vec![(2, 1, i * 1000), (2, 1, i * 1000 + 100)]))
             .collect();
-        let t = Timeline::build(&events, &samples);
+        let t = Timeline::build(&events, &samples, 0);
         assert!(
             t.phases[0].metrics.iteration_rate.is_some(),
             "first phase must get a rate from the 0 baseline",
@@ -3071,7 +3147,7 @@ mod tests {
         let samples: Vec<MonitorSample> = (5..45)
             .map(|i| sample(i * 100, vec![(2, 1, i * 1000)]))
             .collect();
-        let t = Timeline::build(&events, &samples);
+        let t = Timeline::build(&events, &samples, 0);
         assert_eq!(
             t.phases.len(),
             2,
@@ -3099,7 +3175,7 @@ mod tests {
         let samples: Vec<MonitorSample> = (5..35)
             .map(|i| sample(i * 100, vec![(2, 1, i * 1000)]))
             .collect();
-        let t = Timeline::build(&events, &samples);
+        let t = Timeline::build(&events, &samples, 0);
         assert_eq!(
             t.phases.len(),
             2,
@@ -3126,7 +3202,7 @@ mod tests {
         let samples: Vec<MonitorSample> = (1..30)
             .map(|i| sample(i * 100, vec![(2, 1, i * 1000)]))
             .collect();
-        let t = Timeline::build(&events, &samples);
+        let t = Timeline::build(&events, &samples, 0);
         assert_eq!(
             t.phases.len(),
             2,
@@ -3162,7 +3238,7 @@ mod tests {
         let samples: Vec<MonitorSample> = (1..30)
             .map(|i| sample(i * 100, vec![(2, 1, i * 1000)]))
             .collect();
-        let t = Timeline::build(&events, &samples);
+        let t = Timeline::build(&events, &samples, 0);
         assert_eq!(t.phases.len(), 2);
         assert_eq!(
             t.phases[0].metrics.iteration_rate,
@@ -3189,7 +3265,7 @@ mod tests {
         let samples: Vec<MonitorSample> = (5..35)
             .map(|i| sample(i * 100, vec![(2, 1, i * 1000)]))
             .collect();
-        let t = Timeline::build(&events, &samples);
+        let t = Timeline::build(&events, &samples, 0);
         assert_eq!(
             t.phases.len(),
             1,
@@ -3217,7 +3293,7 @@ mod tests {
         let samples: Vec<MonitorSample> = (5..45)
             .map(|i| sample(i * 100, vec![(2, 1, i * 1000)]))
             .collect();
-        let t = Timeline::build(&events, &samples);
+        let t = Timeline::build(&events, &samples, 0);
         assert_eq!(t.phases.len(), 2);
         assert_eq!(
             t.phases[1].metrics.iteration_rate,
@@ -3245,7 +3321,7 @@ mod tests {
         let samples: Vec<MonitorSample> = (5..35)
             .map(|i| sample(i * 100, vec![(2, 1, i * 1000)]))
             .collect();
-        let t = Timeline::build(&events, &samples);
+        let t = Timeline::build(&events, &samples, 0);
         // phase 1 is step 2 (frame iters 5000 -> next 1000): decrease.
         assert!(
             t.phases[1].metrics.iteration_rate.is_none(),
@@ -3265,7 +3341,7 @@ mod tests {
         let samples: Vec<MonitorSample> = (5..35)
             .map(|i| sample(i * 100, vec![(2, 1, i * 1000)]))
             .collect();
-        let t = Timeline::build(&events, &samples);
+        let t = Timeline::build(&events, &samples, 0);
         assert!(
             t.phases[0].metrics.iteration_rate.is_none(),
             "zero-duration pair must not divide; rate stays None",
@@ -3289,7 +3365,7 @@ mod tests {
         let samples: Vec<MonitorSample> = (5..45)
             .map(|i| sample(i * 100, vec![(2, 1, i * 1000)]))
             .collect();
-        let t = Timeline::build(&events, &samples);
+        let t = Timeline::build(&events, &samples, 0);
         // Two step events -> two phases regardless of terminal position.
         assert_eq!(
             t.phases.len(),
@@ -3318,7 +3394,7 @@ mod tests {
         let samples: Vec<MonitorSample> = (5..45)
             .map(|i| sample(i * 100, vec![(2, 1, i * 1000), (2, 1, i * 1000 + 100)]))
             .collect();
-        let t = Timeline::build(&events, &samples);
+        let t = Timeline::build(&events, &samples, 0);
         assert_eq!(t.phases.len(), 3);
         // Phase 0 should have high iteration_rate.
         assert!(t.phases[0].metrics.iteration_rate.is_some());
@@ -3359,7 +3435,7 @@ mod tests {
         let samples: Vec<MonitorSample> = (5..45)
             .map(|i| sample(i * 100, vec![(2, 1, i * 1000)]))
             .collect();
-        let t = Timeline::build(&events, &samples);
+        let t = Timeline::build(&events, &samples, 0);
         assert_eq!(
             t.phases[1].metrics.iteration_rate,
             Some(0.0),
@@ -3391,7 +3467,7 @@ mod tests {
         let samples: Vec<MonitorSample> = (5..45)
             .map(|i| sample(i * 100, vec![(2, 1, i * 1000), (2, 1, i * 1000 + 100)]))
             .collect();
-        let t = Timeline::build(&events, &samples);
+        let t = Timeline::build(&events, &samples, 0);
         let improvements: Vec<_> = t
             .phases
             .iter()
@@ -3417,7 +3493,7 @@ mod tests {
         let samples: Vec<MonitorSample> = (5..45)
             .map(|i| sample(i * 100, vec![(2, 1, i * 1000), (2, 1, i * 1000 + 100)]))
             .collect();
-        let t = Timeline::build(&events, &samples);
+        let t = Timeline::build(&events, &samples, 0);
         let throughput_changes: Vec<_> = t
             .phases
             .iter()
@@ -3854,7 +3930,7 @@ mod tests {
         let samples: Vec<MonitorSample> = (5..25)
             .map(|i| sample(i * 100, vec![(2, 1, i * 1000), (2, 1, i * 1000 + 100)]))
             .collect();
-        let t = Timeline::build(&events, &samples);
+        let t = Timeline::build(&events, &samples, 0);
         let formatted = t.format_with_context(&TimelineContext::default());
         assert!(
             formatted.contains("throughput:"),
