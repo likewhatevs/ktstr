@@ -154,16 +154,17 @@ pub(crate) const ERR_GUEST_CRASHED_PREFIX: &str = "guest crashed:";
 /// **defensive late catch-all** whenever the inner pipeline bails
 /// with a skip-class host-resource error —
 /// [`crate::vmm::host_topology::ResourceContention`] (transient slot
-/// shortage) or [`crate::vmm::host_topology::TopologyInsufficient`]
+/// shortage), [`crate::vmm::host_topology::TopologyInsufficient`]
 /// (the VM cannot boot at all on this host -- the x86_64 kvm hardware
-/// caps; a perf-mode-too-small host is the hard-error `PerfModeUnavailable`
-/// instead, which this catch-all does NOT skip).
+/// caps), or [`crate::vmm::host_topology::PerfModeUnavailable`] (a
+/// perf-mode-too-small host — also skip-class, recorded here too).
 ///
-/// No pre-build path constructs either error today. Every
-/// `ResourceContention` / `TopologyInsufficient` construction site in
-/// the crate (`vmm::host_topology` and `vmm::mod`) fires from inside
-/// `builder.build()` or `vm.run()` — both already record their
-/// own sidecar at the bail point via the per-site
+/// No pre-build path constructs any of these errors today. Every
+/// `ResourceContention` / `TopologyInsufficient` / `PerfModeUnavailable`
+/// construction site in the crate (`vmm::host_topology`, `vmm::mod`, and
+/// the `validate_performance_mode` / `acquire_slot_with_locks` pre-checks in
+/// `vmm::builder`) fires from inside `builder.build()` or `vm.run()` — all
+/// already record their own sidecar at the bail point via the per-site
 /// `record_skip_sidecar` calls in the match arms below. The
 /// pre-build helpers (`ensure_kvm`, `resolve_test_kernel`,
 /// `acquire_test_kernel_lock_if_cached`, `resolve_scheduler`)
@@ -195,13 +196,16 @@ pub(crate) fn run_ktstr_test_inner(
 ) -> Result<AssertResult> {
     let result = run_ktstr_test_inner_impl(entry, topo);
     if let Err(ref e) = result
-        && (super::is_resource_contention(e) || super::is_topology_insufficient(e))
+        && (super::is_resource_contention(e)
+            || super::is_topology_insufficient(e)
+            || super::is_perf_mode_unavailable(e))
     {
-        // Late catch-all for a skip-class error (ResourceContention or
-        // TopologyInsufficient) from any early-bail path before the
+        // Late catch-all for a skip-class error (ResourceContention,
+        // TopologyInsufficient, or PerfModeUnavailable) from any early-bail
+        // path before the
         // existing per-site `record_skip_sidecar` calls in
-        // builder.build()/vm.run() arms below. Both predicates walk the
-        // FULL `anyhow::Error` chain via `e.chain().any(...)` so an error
+        // builder.build()/vm.run() arms below. All three predicates walk
+        // the FULL `anyhow::Error` chain via `e.chain().any(...)` so an error
         // wrapped in `.context(...)` (e.g. the `"build ktstr_test VM"` and
         // `"run ktstr_test VM"` wrappers in `evaluate_vm_result`) is still
         // recognised — without the chain walk, a wrapped error
@@ -975,7 +979,10 @@ fn run_ktstr_test_inner_impl(
             // KtstrKvm::new's "create VM"): walk the chain so a wrapped
             // skip-class error is still recorded here, matching the late
             // catch-all in run_ktstr_test_inner.
-            if super::is_resource_contention(&e) || super::is_topology_insufficient(&e) {
+            if super::is_resource_contention(&e)
+                || super::is_topology_insufficient(&e)
+                || super::is_perf_mode_unavailable(&e)
+            {
                 record_skip_sidecar(entry);
             }
             return Err(e.context("build ktstr_test VM"));
@@ -985,7 +992,10 @@ fn run_ktstr_test_inner_impl(
         Ok(r) => r,
         Err(e) => {
             // Chain-aware, as in the build arm above.
-            if super::is_resource_contention(&e) || super::is_topology_insufficient(&e) {
+            if super::is_resource_contention(&e)
+                || super::is_topology_insufficient(&e)
+                || super::is_perf_mode_unavailable(&e)
+            {
                 record_skip_sidecar(entry);
             }
             return Err(e.context("run ktstr_test VM"));

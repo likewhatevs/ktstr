@@ -131,9 +131,13 @@ run at normal priority (results may be noisy).
 `validate_performance_mode()` runs during VM build and applies two
 levels of checks:
 
-**Errors (fatal) -- all surface as `PerfModeUnavailable` (a hard error,
-exit 1 / FAIL, NOT a skip: the explicitly requested isolation guarantee
-cannot be honored):**
+**Host-insufficiency -- all surface as `PerfModeUnavailable`, a permanent
+host-insufficiency that skips by default (exit 0 / SKIP, with a visible
+banner and a recorded skip sidecar) and is promoted to a hard FAIL
+(exit 1) only under `KTSTR_NO_SKIP_MODE`, mirroring `ResourceContention` /
+`TopologyInsufficient`. The VM never runs unisolated (the build errors
+before boot), so the explicitly requested isolation guarantee is never
+silently violated:**
 - Total vCPUs + 1 service CPU exceed available host CPUs.
 - Virtual LLCs exceed available LLC groups.
 - Pinning plan cannot be satisfied (an LLC group has fewer available
@@ -240,11 +244,13 @@ When `performance_mode` is enabled, the build step validates LLC
 exclusivity: each virtual LLC must reserve the entire physical
 LLC group it maps to. The validation sums the actual CPU count of
 each LLC group and checks the total (plus service CPU) fits within
-the host's online CPUs. If validation fails, the build returns the
-hard error `PerfModeUnavailable` (exit 1 / FAIL, NOT a skip): the
-explicitly requested perf-mode isolation guarantee cannot be honored
-on a too-small host. This is distinct from the transient all-slots-busy
-`ResourceContention` skip above.
+the host's online CPUs. If validation fails, the build returns
+`PerfModeUnavailable`, a permanent host-insufficiency: it skips by
+default (exit 0 / SKIP) and is promoted to a hard FAIL only under
+`KTSTR_NO_SKIP_MODE`. A too-small host can never honor the perf-mode
+isolation guarantee, so this is a permanent skip — distinct from the
+transient all-slots-busy `ResourceContention` skip above, which a retry
+can resolve.
 
 ## Three-way mode tier
 
@@ -386,18 +392,22 @@ skips, or runs degraded:
 
 | Tier | Host too small for the topology | Exit |
 |------|----------------------------------|------|
-| Tier 1 (`performance_mode`) | `PerfModeUnavailable` — the isolation guarantee cannot be honored | 1 / FAIL |
+| Tier 1 (`performance_mode`) | `PerfModeUnavailable` — the isolation guarantee cannot be honored | 0 / SKIP (1 / FAIL under `KTSTR_NO_SKIP_MODE`) |
 | Tier 2 — explicit `--cpu-cap` / per-test `cpu_budget` exceeds the allowed cpuset | `CpuBudgetUnsatisfiable` — the requested cap is impossible | 1 / FAIL |
 | Tier 2 — default budget (no explicit cap) | sizes down to `max(30%, min(vcpus, allowed))` and runs | 0 |
 | Tier 3 (default) | masks onto the allowed CPUs; warns + marks the sidecar only when that set is smaller than `vcpus` | 0 |
 
-The asymmetry is deliberate: an EXPLICIT request — `performance_mode`,
-or a specific cpu-budget — for a guarantee the host cannot provide is a
-hard error, because silently downscaling it would ship a measurement
-that does not match what was asked for. The DEFAULT path instead makes
-the test run regardless, surfacing any oversubscription confound through
-the overcommit warning and the sidecar `cpu_budget` stamp rather than
-failing.
+The asymmetry is deliberate: an EXPLICIT request for a guarantee the host
+cannot provide must never silently downscale into a measurement that does
+not match what was asked for. A too-small `performance_mode` host honors
+that by SKIPPING — the VM never runs unisolated, so no wrong measurement
+ships; `KTSTR_NO_SKIP_MODE` turns the skip into a hard FAIL for runs that
+demand perf-mode execution. An explicit `--cpu-cap` / `cpu_budget` the host
+cannot satisfy stays a hard error (`CpuBudgetUnsatisfiable`): a user-typed
+number that does not exist on this host is a misconfiguration, not a
+host-capability gap. The DEFAULT path instead makes the test run
+regardless, surfacing any oversubscription confound through the overcommit
+warning and the sidecar `cpu_budget` stamp rather than failing.
 
 To size a host so a `performance_mode` test passes (Tier 1), provide
 `(llcs * cores * threads) + 1` online CPUs and at least `llcs` LLC

@@ -36,8 +36,8 @@ impl std::error::Error for ResourceContention {}
 /// this shape, perf-mode or not, so the test cannot run here. Also
 /// returned by the `performance_mode` planner (`compute_pinning`) when the
 /// host has too few physical CPUs / LLC groups — but that perf-mode caller
-/// RE-MAPS it to [`PerfModeUnavailable`] (a hard error: the isolation
-/// guarantee was explicitly requested and cannot be honored). Distinct
+/// RE-MAPS it to [`PerfModeUnavailable`] (a host-insufficiency: skip by
+/// default, fail under `KTSTR_NO_SKIP_MODE`). Distinct
 /// from [`ResourceContention`] (a transient slot/resource shortage a retry
 /// resolves → skip); a too-small host is permanent, so the operator must
 /// provision different hardware or narrow the topology rather than retry.
@@ -61,15 +61,17 @@ impl std::fmt::Display for TopologyInsufficient {
 
 impl std::error::Error for TopologyInsufficient {}
 
-/// The host cannot honor the `performance_mode` guarantee (exclusive 1:1
-/// CPU pinning across the test's virtual LLC topology), and no retry
-/// changes that. A HARD ERROR — distinct from [`TopologyInsufficient`]
-/// (the VM cannot boot AT ALL on this host → skip) and
-/// [`ResourceContention`] (a transient slot/CPU shortage a retry resolves
-/// → skip). A `performance_mode` test EXPLICITLY requested the isolation
-/// guarantee, so skipping it (or silently running it unisolated) would
-/// hide that the measurement is invalid; the operator must provision a
-/// bigger host, narrow the topology, or drop `--perf-mode`.
+/// The host cannot honor the `performance_mode` guarantee (an exclusive
+/// host LLC for the test's virtual LLC topology + a service CPU), and no
+/// retry changes that — a permanent host-insufficiency (e.g. a single-LLC
+/// host whose LLC spans every CPU, so LLC + 1 service never fits). Treated
+/// like [`TopologyInsufficient`] / [`ResourceContention`]: a SKIP by
+/// default (the VM never runs unisolated — it errors at build, so a
+/// visible skip informs the operator without reddening CI on a host that
+/// can never satisfy perf-mode), promoted to a hard FAIL under
+/// `KTSTR_NO_SKIP_MODE` for runs that demand perf-mode execution. The
+/// remedy is unchanged: provision a host with a spare LLC/CPU, narrow the
+/// topology, or drop `--perf-mode`.
 ///
 /// Downcast via `anyhow::Error::downcast_ref::<PerfModeUnavailable>()`
 /// (chain-aware: the dispatch + macro predicates walk the full error
@@ -146,8 +148,8 @@ impl std::error::Error for CpuBudgetUnsatisfiable {}
 /// Routes to `EXIT_FAIL` via a DEDICATED hard-fail arm (the
 /// `is_topology_unrepresentable` predicate) in both `result_to_exit_code`
 /// and the `#[ktstr_test]` macro body, placed ABOVE the `expect_err`
-/// inversion and the skip arms — mirroring `PerfModeUnavailable` /
-/// `CpuBudgetUnsatisfiable`. That placement is what makes it fail even in
+/// inversion and the skip arms — mirroring `CpuBudgetUnsatisfiable` (the
+/// other dedicated hard-fail). That placement is what makes it fail even in
 /// an `expect_err` test (the generic `expect_err` arm would otherwise
 /// invert it to a pass) and keeps it out of the `skip_on_contention!` /
 /// `is_topology_insufficient` skip paths, so the misconfiguration can
@@ -579,7 +581,8 @@ impl HostTopology {
             // lets it through, it is handled identically to its three
             // sibling shortfall checks: the perf-mode caller
             // (acquire_slot_with_locks) re-maps every compute_pinning
-            // TopologyInsufficient to PerfModeUnavailable (a hard FAIL), and
+            // TopologyInsufficient to PerfModeUnavailable (a host-insufficiency
+            // skip, fail under KTSTR_NO_SKIP_MODE), and
             // the non-perf caller passes reserve_service_cpu=false so this
             // site is unreachable there.
             if cpu.is_none() {

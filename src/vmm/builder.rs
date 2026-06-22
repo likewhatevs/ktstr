@@ -622,10 +622,11 @@ impl KtstrVmBuilder {
     /// host halt polling via MSR_KVM_POLL_CONTROL). On aarch64, KVM
     /// exit suppression and CPUID hints are not available. Validated
     /// at build time -- a host with too few CPUs / LLC groups for the
-    /// requested perf topology returns `PerfModeUnavailable` (a hard
-    /// error, NOT a skip: the explicit isolation guarantee cannot be
-    /// honored); busy LLC slots return `ResourceContention` (skip-class,
-    /// transient); insufficient hugepages is a warning.
+    /// requested perf topology returns `PerfModeUnavailable` (a
+    /// host-insufficiency: a visible skip by default, promoted to a hard
+    /// fail under `KTSTR_NO_SKIP_MODE`); busy LLC slots return
+    /// `ResourceContention` (skip-class, transient); insufficient
+    /// hugepages is a warning.
     #[allow(dead_code)]
     pub fn performance_mode(mut self, enabled: bool) -> Self {
         self.performance_mode = enabled;
@@ -852,11 +853,11 @@ impl KtstrVmBuilder {
     /// Returns `Err` for missing required inputs (kernel, init binary),
     /// invalid topology, or host resources insufficient to satisfy
     /// `performance_mode` requirements (a too-small host surfaces as
-    /// `PerfModeUnavailable` — a hard error, NOT skip-class: the
-    /// explicitly-requested isolation guarantee cannot be honored; busy
-    /// LLC slots surface as `ResourceContention`, which IS skip-class). An
-    /// explicit over-budget `--cpu-cap` / `cpu_budget` surfaces as
-    /// `CpuBudgetUnsatisfiable` (also a hard error).
+    /// `PerfModeUnavailable` — a host-insufficiency: skip-class by default,
+    /// promoted to a hard fail under `KTSTR_NO_SKIP_MODE`; busy LLC slots
+    /// surface as `ResourceContention`, also skip-class). An explicit
+    /// over-budget `--cpu-cap` / `cpu_budget` surfaces as
+    /// `CpuBudgetUnsatisfiable` (a hard error).
     pub fn build(mut self) -> Result<KtstrVm> {
         // Periodic capture's boundary computation requires
         // `workload_duration` to slice. Without it the
@@ -1200,9 +1201,11 @@ impl KtstrVmBuilder {
     /// pinning plan. Returns both the plan and the host topology (needed
     /// for NUMA node discovery). Returns `PerfModeUnavailable` when the
     /// host has too few CPUs / LLC groups for the requested perf topology
-    /// (the explicit isolation guarantee cannot be honored — a hard error,
-    /// from the pre-check here and via the `compute_pinning` re-map in
-    /// `acquire_slot_with_locks`), or `ResourceContention` when the host is
+    /// (the explicit isolation guarantee cannot be honored — a permanent
+    /// host-insufficiency the dispatch/macro treat as a SKIP by default,
+    /// promoted to a hard FAIL under `KTSTR_NO_SKIP_MODE`; from the pre-check
+    /// here and via the `compute_pinning` re-map in `acquire_slot_with_locks`),
+    /// or `ResourceContention` when the host is
     /// big enough but all LLC slots are currently busy (transient →
     /// skip/retry). Warnings are printed for degraded conditions
     /// (hugepages, host load).
@@ -1229,9 +1232,10 @@ impl KtstrVmBuilder {
         if total_reserved > host_topo.total_cpus() {
             // The host has fewer CPUs than perf-mode must reserve: the
             // explicitly-requested isolation guarantee cannot be honored on
-            // this host. A hard ERROR (PerfModeUnavailable), not a skip —
-            // the operator must provision a bigger host, narrow the
-            // topology, or drop --perf-mode.
+            // this host. PerfModeUnavailable — a host-insufficiency the
+            // dispatch/macro treat as a SKIP by default (FAIL under
+            // KTSTR_NO_SKIP_MODE); the operator provisions a bigger host,
+            // narrows the topology, or drops --perf-mode.
             return Err(anyhow::Error::new(host_topology::PerfModeUnavailable {
                 reason: format!(
                     "performance_mode: need {} CPUs ({} across {} LLCs + 1 service) \
@@ -1401,9 +1405,10 @@ fn resolve_cpu_budget(
 /// locks (non-blocking). Single pass through all available slots.
 /// Returns `PerfModeUnavailable` when `compute_pinning` reports the host is
 /// too small for the perf topology (the isolation guarantee cannot be
-/// honored — a hard error), or `ResourceContention` when the host fits but
-/// all slots are currently busy (transient; callers rely on nextest retry
-/// backoff for contention resolution).
+/// honored — a permanent host-insufficiency: a SKIP by default, a hard FAIL
+/// under `KTSTR_NO_SKIP_MODE`), or `ResourceContention` when the host fits
+/// but all slots are currently busy (transient; callers rely on nextest
+/// retry backoff for contention resolution).
 fn acquire_slot_with_locks(
     host_topo: &host_topology::HostTopology,
     topo: &topology::Topology,
@@ -1421,8 +1426,10 @@ fn acquire_slot_with_locks(
             // compute_pinning returns TopologyInsufficient when the host has
             // too few CPUs/LLCs for the requested perf topology. For a
             // perf-mode test that means the isolation guarantee cannot be
-            // honored here -> hard ERROR (PerfModeUnavailable), distinct from
-            // the transient all-slots-busy ResourceContention below.
+            // honored here -> PerfModeUnavailable, a host-insufficiency the
+            // dispatch/macro SKIP by default (FAIL under KTSTR_NO_SKIP_MODE);
+            // distinct from the transient all-slots-busy ResourceContention
+            // below.
             Err(e)
                 if e.downcast_ref::<host_topology::TopologyInsufficient>()
                     .is_some() =>
@@ -1524,11 +1531,12 @@ mod tests {
 
     /// acquire_slot_with_locks perf-mode re-map: when the host is too small
     /// for the requested perf topology, compute_pinning's TopologyInsufficient
-    /// is re-mapped to a TYPED PerfModeUnavailable (a hard error — the isolation
-    /// guarantee cannot be honored on ANY slot of this host), NOT the transient
-    /// ResourceContention skip. Host = 1 LLC / 2 CPUs; request = 4 vCPUs. The
-    /// shortfall is detected by compute_pinning BEFORE any resource lock, so the
-    /// synthetic host needs no flock fixture.
+    /// is re-mapped to a TYPED PerfModeUnavailable (a permanent
+    /// host-insufficiency — the isolation guarantee cannot be honored on ANY
+    /// slot of this host), distinct from the transient ResourceContention.
+    /// Host = 1 LLC / 2 CPUs; request = 4 vCPUs. The shortfall is detected by
+    /// compute_pinning BEFORE any resource lock, so the synthetic host needs
+    /// no flock fixture.
     #[test]
     fn acquire_slot_with_locks_host_too_small_is_perf_mode_unavailable() {
         let host = host_topology::HostTopology::new_for_tests(&[(vec![0, 1], 0)]);
@@ -1539,7 +1547,7 @@ mod tests {
             err.downcast_ref::<host_topology::PerfModeUnavailable>()
                 .is_some(),
             "host-too-small must re-map TopologyInsufficient -> PerfModeUnavailable \
-             (hard error, not a skip-class ResourceContention): {err:#}",
+             (a host-insufficiency, distinct from the transient ResourceContention): {err:#}",
         );
     }
 

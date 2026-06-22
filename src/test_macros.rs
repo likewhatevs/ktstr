@@ -34,14 +34,16 @@ macro_rules! skip {
 /// Evaluate a `Result`-returning builder (or any `anyhow::Result`
 /// expression) and either unwrap the value or skip gracefully on a
 /// skip-class error: [`crate::vmm::host_topology::ResourceContention`]
-/// (transient slot/resource shortage) or
+/// (transient slot/resource shortage),
 /// [`crate::vmm::host_topology::TopologyInsufficient`] (the VM cannot boot
-/// at all on this host — the x86_64 kvm hardware caps). Both are matched
-/// chain-aware (`e.chain().any(...)`) so a `.context(...)`-wrapped instance
-/// still skips. Any other error panics with `{e:#}` — including the
-/// hard-error `PerfModeUnavailable` / `CpuBudgetUnsatisfiable` (an
-/// explicitly-requested perf guarantee or cpu budget the host cannot honor
-/// is a FAIL, not a skip).
+/// at all on this host — the x86_64 kvm hardware caps), or
+/// [`crate::vmm::host_topology::PerfModeUnavailable`] (the host
+/// fundamentally cannot honor perf-mode — too few CPUs for an exclusive
+/// LLC + a service CPU). All are matched chain-aware
+/// (`e.chain().any(...)`) so a `.context(...)`-wrapped instance still
+/// skips. Any other error panics with `{e:#}` — including the hard-error
+/// `CpuBudgetUnsatisfiable` (an explicitly-typed cpu budget the host
+/// cannot satisfy is a FAIL, not a skip).
 ///
 /// Replaces the recurring `match ... { Ok => v, Err(e) if
 /// ResourceContention => skip!(...), Err(e) => panic!(...) }`
@@ -68,6 +70,15 @@ macro_rules! skip_on_contention {
                 }) =>
             {
                 skip!("host topology insufficient: {e:#}");
+            }
+            Err(e)
+                if e.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<$crate::vmm::host_topology::PerfModeUnavailable>()
+                        .is_some()
+                }) =>
+            {
+                skip!("performance mode unavailable: {e:#}");
             }
             Err(e) => panic!("{e:#}"),
         }
@@ -132,7 +143,9 @@ macro_rules! assert_not_impl_default {
 
 #[cfg(test)]
 mod tests {
-    use crate::vmm::host_topology::{ResourceContention, TopologyInsufficient};
+    use crate::vmm::host_topology::{
+        PerfModeUnavailable, ResourceContention, TopologyInsufficient,
+    };
 
     /// Regression for the error-chain fix: a ResourceContention wrapped
     /// in `.context(...)` must still be recognized by the macro and
@@ -228,6 +241,36 @@ mod tests {
         assert!(
             result.is_ok(),
             "context-wrapped TopologyInsufficient must skip, not panic",
+        );
+    }
+
+    /// A [`PerfModeUnavailable`] (the host fundamentally cannot honor
+    /// perf-mode — too few CPUs for an exclusive LLC + a service CPU)
+    /// routes to skip, including when wrapped in `.context(...)`. Pins the
+    /// `skip_on_contention!` perf-mode arm above its `Err(e) => panic!`
+    /// catch-all: a future reorder that drops it below the catch-all would
+    /// compile but panic real perf-incapable hosts.
+    ///
+    /// `#[cfg(panic = "unwind")]`: same rationale as the
+    /// ResourceContention / TopologyInsufficient skip tests —
+    /// `catch_unwind` is unusable under `panic = "abort"`.
+    #[test]
+    #[cfg(panic = "unwind")]
+    fn skip_on_contention_skips_perf_mode_unavailable() {
+        let result = std::panic::catch_unwind(|| {
+            fn skip_fn() {
+                let err: anyhow::Error = anyhow::Error::new(PerfModeUnavailable {
+                    reason: "host too small for perf topology".into(),
+                })
+                .context("build ktstr_test VM");
+                let _: () = skip_on_contention!(Err::<(), _>(err));
+                unreachable!("skip_on_contention! should have early-returned");
+            }
+            skip_fn();
+        });
+        assert!(
+            result.is_ok(),
+            "context-wrapped PerfModeUnavailable must skip, not panic",
         );
     }
 

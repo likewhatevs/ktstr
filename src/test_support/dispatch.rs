@@ -88,10 +88,12 @@ pub fn is_resource_contention(e: &anyhow::Error) -> bool {
 /// Check if an `anyhow::Error` carries a [`PerfModeUnavailable`].
 ///
 /// Chain-aware (walks `e.chain()`), like [`is_topology_insufficient`].
-/// A `PerfModeUnavailable` is a HARD ERROR (the host cannot honor an
-/// explicitly-requested perf-mode guarantee), NOT a skip — so unlike the
-/// RC/TI predicates this does not gate a skip path; `result_to_exit_code`
-/// and the macro body route it to a FAIL banner + non-skip exit.
+/// A `PerfModeUnavailable` is a HOST-INSUFFICIENCY skip, like RC/TI: the
+/// host fundamentally cannot honor an explicitly-requested perf-mode
+/// guarantee (too few CPUs for an exclusive host LLC + a service CPU).
+/// The VM is never run unisolated (it errors at build), so
+/// `result_to_exit_code` and the macro body route it to a VISIBLE skip
+/// by default, promoted to a FAIL banner under `KTSTR_NO_SKIP_MODE`.
 ///
 /// [`PerfModeUnavailable`]: crate::vmm::host_topology::PerfModeUnavailable
 #[doc(hidden)]
@@ -1105,21 +1107,28 @@ fn ok_to_exit_code(r: AssertResult, expect_err: bool, allow_inconclusive: bool) 
 /// Map an `Err(anyhow::Error)` outcome to an exit code.
 ///
 /// The sequential guards preserve the original `match` arm precedence
-/// (first matching guard wins): the hard-FAIL classifiers
-/// (`is_perf_mode_unavailable` → `is_cpu_budget_unsatisfiable` →
-/// `is_topology_unrepresentable`), then the skip-or-fail contention
-/// classifiers (`is_resource_contention` → `is_topology_insufficient`),
-/// then the marker-typed guards (`PostVmAssertionFailure` →
+/// (first matching guard wins): `is_perf_mode_unavailable` (a
+/// host-insufficiency skip-or-fail, checked first), then the hard-FAIL
+/// classifiers (`is_cpu_budget_unsatisfiable` →
+/// `is_topology_unrepresentable`), then the other skip-or-fail
+/// host-insufficiency classifiers (`is_resource_contention` →
+/// `is_topology_insufficient`), then the marker-typed guards
+/// (`PostVmAssertionFailure` →
 /// `ExpectAutoReproSatisfied`), then the `expect_err` inversion, then
 /// the catch-all (the former `Err(e) => …` arm) operating on the
 /// now-owned `e`. Reordering these would change which guard fires for an
 /// error matching more than one guard.
 fn err_to_exit_code(e: anyhow::Error, expect_err: bool, no_skip: bool) -> i32 {
     if is_perf_mode_unavailable(&e) {
-        // Hard FAIL, not a skip: a performance_mode test explicitly
-        // requested an isolation guarantee the host cannot honor. Not
-        // gated on KTSTR_NO_SKIP_MODE (already a failure). Placed above
-        // the RC/TI skip guards so it returns first.
+        // Host-insufficiency SKIP, like resource contention / topology
+        // insufficient (below): the host fundamentally cannot honor the
+        // performance_mode isolation guarantee — too few CPUs for an
+        // exclusive host LLC + a service CPU (e.g. a single-LLC host
+        // where the LLC spans every CPU, so LLC+1 never fits). The VM is
+        // never run unisolated (it errors at build), so a VISIBLE skip
+        // keeps the operator informed without reddening CI on a host
+        // that can never satisfy perf-mode. KTSTR_NO_SKIP_MODE promotes
+        // it to a hard FAIL for runs that demand perf-mode execution.
         let reason = e
             .chain()
             .find_map(|c| {
@@ -1127,12 +1136,17 @@ fn err_to_exit_code(e: anyhow::Error, expect_err: bool, no_skip: bool) -> i32 {
                     .map(|p| p.reason.clone())
             })
             .unwrap_or_else(|| "<unknown>".to_string());
-        eprintln!(
-            "ktstr: FAIL: performance mode unavailable: {reason}. \
-             Provision a host with the required CPU / LLC count, narrow the \
-             test topology, or drop --perf-mode."
-        );
-        return EXIT_FAIL;
+        if no_skip {
+            eprintln!(
+                "ktstr: FAIL: performance mode unavailable under --no-skip-mode: {reason}. \
+                 Provision a host with the required CPU / LLC count, narrow the \
+                 test topology, or drop --perf-mode / --no-skip-mode."
+            );
+            return EXIT_FAIL;
+        } else {
+            crate::report::test_skip(format_args!("performance mode unavailable: {reason}"));
+            return EXIT_PASS;
+        }
     }
     if is_cpu_budget_unsatisfiable(&e) {
         // Hard FAIL, not a skip: an explicit --cpu-cap / cpu_budget the

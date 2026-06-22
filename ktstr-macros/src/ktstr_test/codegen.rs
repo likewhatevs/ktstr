@@ -502,11 +502,13 @@ pub(super) fn emit_entry_static(input: ItemFn, attrs: AttrValues) -> proc_macro2
     // Both expect_err and expect_ok test bodies share the same
     // host-classification arms — they only differ on the success arm
     // and the unconditional-Err arm. Two classes: SKIP bailouts
-    // (harness-not-configured, resource-contention, topology-insufficient)
-    // and hard-FAIL bailouts (perf-mode-unavailable, cpu-budget-
-    // unsatisfiable, topology-unrepresentable) that panic even in the
-    // expect_err body so a host-config failure or test misconfiguration is
-    // never swallowed as the expected failure.
+    // (harness-not-configured always skips; resource-contention,
+    // topology-insufficient, and perf-mode-unavailable skip but promote to
+    // a hard fail under KTSTR_NO_SKIP_MODE — all host-insufficiency
+    // conditions the test cannot run under) and hard-FAIL bailouts
+    // (cpu-budget-unsatisfiable, topology-unrepresentable) that panic even
+    // in the expect_err body so a test misconfiguration is never swallowed
+    // as the expected failure.
     // Factored into one TokenStream so a future change lands in one place
     // and both branches inherit it.
     let host_class_arms = quote! {
@@ -555,7 +557,7 @@ pub(super) fn emit_entry_static(input: ItemFn, attrs: AttrValues) -> proc_macro2
             // KVM_CAP_MAX_VCPU_ID, or guest RAM-top above MAXPHYADDR); fires
             // for ANY VM of this shape, perf-mode or not. (A perf-mode host
             // that can boot but cannot honor the isolation guarantee is
-            // PerfModeUnavailable -- the hard-FAIL arm below.) Like resource
+            // PerfModeUnavailable -- the skip arm below.) Like resource
             // contention this is a host-infra condition, not a test outcome:
             // emit the canonical SKIP banner and early-return so libtest
             // sees pass. The skip sidecar is recorded by
@@ -573,18 +575,27 @@ pub(super) fn emit_entry_static(input: ItemFn, attrs: AttrValues) -> proc_macro2
             return;
         }
         Err(e) if ::ktstr::test_support::is_perf_mode_unavailable(&e) => {
-            // Hard FAIL, NOT a skip: a performance_mode test explicitly
-            // requested an isolation guarantee the host cannot honor. It
-            // panics here in the SHARED block so it wins over the expect_err
-            // body's `Err(_) => {}` swallow — a host-config failure is not
-            // the test's expected logical failure (mirrors
-            // PostVmAssertionFailure precedence). Not gated on
-            // KTSTR_NO_SKIP_MODE: already a failure.
-            panic!(
-                "ktstr: FAIL: performance mode unavailable: {e:#}. \
-                 Provision a host with the required CPU / LLC count, narrow \
-                 the test topology, or drop --perf-mode."
-            );
+            // Host-insufficiency SKIP, like resource contention / topology
+            // insufficient above: the host fundamentally cannot honor the
+            // performance_mode isolation guarantee (too few CPUs for an
+            // exclusive host LLC + a service CPU, e.g. a single-LLC host
+            // whose LLC spans every CPU). The VM never runs unisolated (it
+            // errors at build), so emit a VISIBLE skip rather than a hard
+            // fail — keeping CI green on a host that can never satisfy
+            // perf-mode. KTSTR_NO_SKIP_MODE promotes it to a hard failure
+            // for runs that demand perf-mode execution. This arm precedes
+            // the expect_err body's `Err(_) => {}` swallow, so an
+            // expect_err test on a perf-incapable host skips rather than
+            // counting the host-config error as its expected failure.
+            if ::std::env::var_os("KTSTR_NO_SKIP_MODE").is_some() {
+                panic!(
+                    "ktstr: FAIL: performance mode unavailable under --no-skip-mode: {e:#}. \
+                     Provision a host with the required CPU / LLC count, narrow \
+                     the test topology, or drop --perf-mode / --no-skip-mode."
+                );
+            }
+            eprintln!("ktstr: SKIP: performance mode unavailable: {e:#}");
+            return;
         }
         Err(e) if ::ktstr::test_support::is_cpu_budget_unsatisfiable(&e) => {
             // Hard FAIL: an explicit --cpu-cap / cpu_budget the host cannot

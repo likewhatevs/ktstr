@@ -1167,6 +1167,17 @@ fn builder_performance_mode_valid_succeeds() {
         {
             skip!("resource contention: {e}");
         }
+        Err(e)
+            if e.downcast_ref::<host_topology::PerfModeUnavailable>()
+                .is_some() =>
+        {
+            // The host fundamentally cannot honor perf-mode (too few CPUs
+            // for an exclusive LLC + a service CPU — e.g. a single-LLC
+            // host whose LLC spans every CPU). Skip rather than panic: the
+            // "valid perf-mode topology builds" invariant cannot be
+            // exercised on a host that cannot do perf-mode at all.
+            skip!("performance mode unavailable: {e}");
+        }
         Err(e) => panic!("valid topology with performance_mode should build: {e:#}",),
     }
 }

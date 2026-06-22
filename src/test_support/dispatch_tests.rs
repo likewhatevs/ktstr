@@ -1433,15 +1433,36 @@ fn result_to_exit_code_skip_maps_to_pass_even_under_expect_err() {
     );
 }
 
-/// `PerfModeUnavailable` routes to EXIT_FAIL via result_to_exit_code
-/// even under expect_err — a host-config failure is never "the
-/// expected error appeared". Chain-aware (context-wrapped, mirroring
-/// eval's "build ktstr_test VM" wrap). Pins the FAIL arm above the
-/// expect_err / skip arms against a match-reorder regression.
+/// `PerfModeUnavailable` (direct and `.context`-wrapped) is a
+/// host-insufficiency: it SKIPS (EXIT_PASS) when KTSTR_NO_SKIP_MODE is
+/// unset — including under expect_err=true, because the skip arm precedes
+/// the expect_err arm. Mirror of the ResourceContention / TopologyInsufficient
+/// skip tests; pins the first `err_to_exit_code` skip arm
+/// (`is_perf_mode_unavailable`). The no-skip-mode promotion to EXIT_FAIL is
+/// pinned by `result_to_exit_code_skip_class_fails_under_no_skip_mode`. NOTE:
+/// the 3rd `result_to_exit_code` arg is `allow_inconclusive`, NOT no_skip —
+/// no_skip is read from KTSTR_NO_SKIP_MODE_ENV inside the fn.
 #[test]
-fn result_to_exit_code_perf_mode_unavailable_fails_even_under_expect_err() {
+fn result_to_exit_code_perf_mode_unavailable_skips_when_not_no_skip() {
+    use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
     use anyhow::Context as _;
-    let mk = || -> Result<crate::assert::AssertResult> {
+    let _env_lock = lock_env();
+    let _no_skip = EnvVarGuard::remove(crate::KTSTR_NO_SKIP_MODE_ENV);
+
+    let direct = || -> Result<crate::assert::AssertResult> {
+        Err(anyhow::Error::new(
+            crate::vmm::host_topology::PerfModeUnavailable {
+                reason: "host too small for perf topology".to_string(),
+            },
+        ))
+    };
+    assert_eq!(result_to_exit_code(direct(), false, false), EXIT_PASS);
+    // Skip arm precedes the expect_err arm: still EXIT_PASS.
+    assert_eq!(result_to_exit_code(direct(), true, false), EXIT_PASS);
+
+    // Context-wrapped (production shape) still recognised via the chain
+    // walk → EXIT_PASS.
+    let wrapped = || -> Result<crate::assert::AssertResult> {
         Err(anyhow::Error::new(
             crate::vmm::host_topology::PerfModeUnavailable {
                 reason: "host too small for perf topology".to_string(),
@@ -1449,8 +1470,7 @@ fn result_to_exit_code_perf_mode_unavailable_fails_even_under_expect_err() {
         ))
         .context("build ktstr_test VM")
     };
-    assert_eq!(result_to_exit_code(mk(), false, false), EXIT_FAIL);
-    assert_eq!(result_to_exit_code(mk(), true, false), EXIT_FAIL);
+    assert_eq!(result_to_exit_code(wrapped(), false, false), EXIT_PASS);
 }
 
 /// `CpuBudgetUnsatisfiable` routes to EXIT_FAIL even under expect_err
@@ -2101,12 +2121,13 @@ fn result_to_exit_code_topology_insufficient_skips_when_not_no_skip() {
     assert_eq!(result_to_exit_code(wrapped(), false, false), EXIT_PASS);
 }
 
-/// Under KTSTR_NO_SKIP_MODE, both skip-class errors hard-FAIL
+/// Under KTSTR_NO_SKIP_MODE, all three skip-class errors hard-FAIL
 /// (EXIT_FAIL) instead of skipping, and the stderr banner names
 /// the contention/insufficiency reason. Pins the no_skip branches
 /// (the `if no_skip { ... EXIT_FAIL }` arms inside
-/// `result_to_exit_code`'s `is_resource_contention` and
-/// `is_topology_insufficient` Err arms) and the reason extraction.
+/// `result_to_exit_code`'s `is_perf_mode_unavailable`,
+/// `is_resource_contention`, and `is_topology_insufficient` Err arms)
+/// and the reason extraction.
 #[test]
 fn result_to_exit_code_skip_class_fails_under_no_skip_mode() {
     use crate::test_support::test_helpers::{EnvVarGuard, capture_stderr, lock_env};
@@ -2143,6 +2164,22 @@ fn result_to_exit_code_skip_class_fails_under_no_skip_mode() {
         stderr.contains("host topology insufficient under --no-skip-mode")
             && stderr.contains("host has too few CPUs"),
         "no-skip TI banner must name the cause + reason; got: {stderr}",
+    );
+
+    let perf = || -> Result<crate::assert::AssertResult> {
+        Err(anyhow::Error::new(
+            crate::vmm::host_topology::PerfModeUnavailable {
+                reason: "host too small for perf topology".into(),
+            },
+        ))
+    };
+    let (code, captured) = capture_stderr(|| result_to_exit_code(perf(), false, false));
+    assert_eq!(code, EXIT_FAIL);
+    let stderr = String::from_utf8(captured).expect("stderr is utf-8");
+    assert!(
+        stderr.contains("performance mode unavailable under --no-skip-mode")
+            && stderr.contains("host too small for perf topology"),
+        "no-skip perf-mode banner must name the cause + reason; got: {stderr}",
     );
 }
 
