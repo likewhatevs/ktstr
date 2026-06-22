@@ -191,11 +191,6 @@ const EXCEPTIONS: &[(&str, &str, usize)] = &[
     ("vmm/freeze_coord/snapshot.rs", "arm_user_watchpoint", 237), // queued: decompose
     ("vmm/initramfs.rs", "build_initramfs_base", 277),            // queued: decompose
     ("vmm/mod.rs", "KtstrVm::run_interactive", 813),              // queued: decompose
-    (
-        "vmm/numa_mem.rs",
-        "NumaMemoryLayout::allocate_and_register",
-        215,
-    ), // queued: decompose
     ("vmm/rust_init/dump.rs", "start_sched_exit_monitor", 222),   // queued: decompose
     ("vmm/rust_init/init.rs", "ktstr_guest_init", 765),           // queued: decompose
     ("vmm/rust_init/relay.rs", "run_relay_session", 209),         // queued: decompose

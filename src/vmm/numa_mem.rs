@@ -471,6 +471,43 @@ impl NumaMemoryLayout {
         // using hugepages (no-op for base pages: va_align == 1).
         let base = round_up(reservation as usize) as *mut libc::c_void;
 
+        // Per-node MAP_FIXED into the reservation + KVM slot registration.
+        // `guard` is held here across the call, so the reservation backing
+        // every sub-mapping outlives the loop; it is moved into the
+        // returned `AllocatedMemory` on success.
+        let guest_regions = self.map_and_register_regions(vm_fd, base, &va_spans, use_hugepages)?;
+
+        // Step 6: Build multi-region GuestMemoryMmap.
+        let guest_mem = GuestMemoryMmap::from_regions(guest_regions)
+            .context("create multi-region GuestMemoryMmap")?;
+
+        Ok(AllocatedMemory {
+            guest_mem,
+            reservation: guard,
+        })
+    }
+
+    /// MAP_FIXED each node into the VA reservation at `base` and register
+    /// its KVM memory slot, returning the per-node `GuestRegionMmap`s.
+    ///
+    /// `base` must point into a PROT_NONE reservation (owned by the
+    /// caller's `ReservationGuard`) that stays mapped for the whole call
+    /// and is at least `sum(va_spans) + (va_align - 1)` bytes; `va_spans`
+    /// is per-node host-VA span (hugepage-rounded when `use_hugepages`)
+    /// and must have one entry per `self.regions` entry in order.
+    ///
+    /// SAFETY: each `libc::mmap(MAP_FIXED)` writes within the caller's
+    /// reservation (packed offsets sum to <= the reservation size); the
+    /// resulting pointers are passed to `MmapRegion::build_raw` (owned=
+    /// false, so Drop is a no-op) and to KVM, all within the reservation's
+    /// lifetime guaranteed by the caller holding the guard across the call.
+    fn map_and_register_regions(
+        &self,
+        vm_fd: &kvm_ioctls::VmFd,
+        base: *mut libc::c_void,
+        va_spans: &[usize],
+        use_hugepages: bool,
+    ) -> Result<Vec<GuestRegionMmap>> {
         let mut guest_regions: Vec<GuestRegionMmap> = Vec::with_capacity(self.regions.len());
 
         // Host VA is PACKED (gap-free): the reservation is sum-of-sizes,
@@ -582,14 +619,7 @@ impl NumaMemoryLayout {
             }
         }
 
-        // Step 6: Build multi-region GuestMemoryMmap.
-        let guest_mem = GuestMemoryMmap::from_regions(guest_regions)
-            .context("create multi-region GuestMemoryMmap")?;
-
-        Ok(AllocatedMemory {
-            guest_mem,
-            reservation: guard,
-        })
+        Ok(guest_regions)
     }
 
     /// Bind each node's region to the corresponding host NUMA node(s),
