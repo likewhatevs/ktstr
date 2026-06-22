@@ -117,7 +117,6 @@ const DEFAULT_FN_MAX_LINES: usize = 200;
 /// the guard's panic template emits it on every suggested entry.
 const EXCEPTIONS: &[(&str, &str, usize)] = &[
     ("ctprof/mod.rs", "capture_with", 473),                       // queued: decompose
-    ("host_thread_probe.rs", "find_jemalloc_via_maps_at", 240),   // queued: decompose
     ("monitor/btf_render/mod.rs", "chase_arena_pointer", 367),    // queued: decompose
     ("monitor/btf_render/mod.rs", "render_cast_pointer", 206),    // queued: decompose
     ("monitor/btf_render/mod.rs", "render_value_inner", 461),     // queued: decompose

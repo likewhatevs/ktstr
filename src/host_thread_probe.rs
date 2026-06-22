@@ -1503,56 +1503,13 @@ fn find_jemalloc_via_maps_at(
                     ns_root.join(format!("{}.debuginfo", exe_rel.display())),
                     ns_root.join(format!("{}.debug", exe_rel.display())),
                 ];
-                for dwp_path in &dwp_candidates {
-                    let dwp_mmap = match std::fs::File::open(dwp_path)
-                        .and_then(|f| unsafe { memmap2::Mmap::map(&f) })
-                    {
-                        Ok(m) => m,
-                        Err(e) => {
-                            tracing::debug!(
-                                pid, ?dwp_path, err = %e,
-                                "ctprof probe: DWP not readable",
-                            );
-                            continue;
-                        }
-                    };
-                    tracing::debug!(
-                        pid,
-                        ?dwp_path,
-                        bytes = dwp_mmap.len(),
-                        "ctprof probe: trying DWP (mmap)",
-                    );
-                    // Try main binary as parent first.
-                    if let Ok(offsets) = resolve_field_offsets_from_dwp(data, &dwp_mmap, dwp_path) {
-                        return Ok((symbol, offsets));
-                    }
-                    // Try debuginfo files as parent (skeleton
-                    // units live here when the main binary is
-                    // fully stripped).
-                    for dbg_parent_path in &debuginfo_parent_candidates {
-                        let dbg_parent = match std::fs::File::open(dbg_parent_path)
-                            .and_then(|f| unsafe { memmap2::Mmap::map(&f) })
-                        {
-                            Ok(m) => m,
-                            Err(_) => continue,
-                        };
-                        tracing::debug!(
-                            pid,
-                            ?dbg_parent_path,
-                            bytes = dbg_parent.len(),
-                            "ctprof probe: trying DWP with debuginfo parent",
-                        );
-                        if let Ok(offsets) =
-                            resolve_field_offsets_from_dwp(&dbg_parent, &dwp_mmap, dwp_path)
-                        {
-                            return Ok((symbol, offsets));
-                        }
-                    }
-                    tracing::debug!(
-                        pid,
-                        ?dwp_path,
-                        "ctprof probe: DWP found but no parent had skeleton units",
-                    );
+                if let Some(offsets) = try_resolve_dwp_offsets(
+                    data,
+                    &dwp_candidates,
+                    &debuginfo_parent_candidates,
+                    pid,
+                ) {
+                    return Ok((symbol, offsets));
                 }
 
                 // 3. External debuginfo (.debuginfo, .debug, debuglink, build-id).
@@ -1575,20 +1532,8 @@ fn find_jemalloc_via_maps_at(
                     }
                     c
                 };
-                for candidate in &debuginfo_candidates {
-                    let dbg_mmap = std::fs::File::open(candidate)
-                        .and_then(|f| unsafe { memmap2::Mmap::map(&f) });
-                    if let Ok(ref dbg_data) = dbg_mmap {
-                        tracing::debug!(
-                            pid,
-                            ?candidate,
-                            bytes = dbg_data.len(),
-                            "ctprof probe: trying debuginfo (mmap)",
-                        );
-                        if let Ok(r) = resolve_field_offsets_from_bytes(dbg_data, candidate) {
-                            return Ok((symbol, r));
-                        }
-                    }
+                if let Some(r) = try_resolve_debuginfo_offsets(&debuginfo_candidates, pid) {
+                    return Ok((symbol, r));
                 }
 
                 // 4. Inline DWARF slow walk (last resort, bounded).
@@ -1677,6 +1622,94 @@ fn find_jemalloc_via_maps_at(
         maps_path.display(),
         context,
     )))
+}
+
+/// Walk the DWP (split-DWARF) candidates for the TSD field offsets.
+/// For each `.dwp`, try the main binary as the skeleton-unit parent
+/// first, then each external-debuginfo parent (skeleton units live
+/// there when the main binary is fully stripped). Returns the first
+/// resolved offsets, or `None` if no `.dwp` yields the field offsets.
+fn try_resolve_dwp_offsets(
+    data: &[u8],
+    dwp_candidates: &[PathBuf],
+    debuginfo_parent_candidates: &[PathBuf],
+    pid: i32,
+) -> Option<CounterOffsets> {
+    for dwp_path in dwp_candidates {
+        let dwp_mmap = match std::fs::File::open(dwp_path)
+            .and_then(|f| unsafe { memmap2::Mmap::map(&f) })
+        {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::debug!(
+                    pid, ?dwp_path, err = %e,
+                    "ctprof probe: DWP not readable",
+                );
+                continue;
+            }
+        };
+        tracing::debug!(
+            pid,
+            ?dwp_path,
+            bytes = dwp_mmap.len(),
+            "ctprof probe: trying DWP (mmap)",
+        );
+        // Try main binary as parent first.
+        if let Ok(offsets) = resolve_field_offsets_from_dwp(data, &dwp_mmap, dwp_path) {
+            return Some(offsets);
+        }
+        // Try debuginfo files as parent (skeleton
+        // units live here when the main binary is
+        // fully stripped).
+        for dbg_parent_path in debuginfo_parent_candidates {
+            let dbg_parent = match std::fs::File::open(dbg_parent_path)
+                .and_then(|f| unsafe { memmap2::Mmap::map(&f) })
+            {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            tracing::debug!(
+                pid,
+                ?dbg_parent_path,
+                bytes = dbg_parent.len(),
+                "ctprof probe: trying DWP with debuginfo parent",
+            );
+            if let Ok(offsets) = resolve_field_offsets_from_dwp(&dbg_parent, &dwp_mmap, dwp_path) {
+                return Some(offsets);
+            }
+        }
+        tracing::debug!(
+            pid,
+            ?dwp_path,
+            "ctprof probe: DWP found but no parent had skeleton units",
+        );
+    }
+    None
+}
+
+/// Walk the external-debuginfo candidates (`.debuginfo`, `.debug`,
+/// debuglink, build-id resolved) for the TSD field offsets, returning
+/// the first that resolves or `None`.
+fn try_resolve_debuginfo_offsets(
+    debuginfo_candidates: &[PathBuf],
+    pid: i32,
+) -> Option<CounterOffsets> {
+    for candidate in debuginfo_candidates {
+        let dbg_mmap = std::fs::File::open(candidate)
+            .and_then(|f| unsafe { memmap2::Mmap::map(&f) });
+        if let Ok(ref dbg_data) = dbg_mmap {
+            tracing::debug!(
+                pid,
+                ?candidate,
+                bytes = dbg_data.len(),
+                "ctprof probe: trying debuginfo (mmap)",
+            );
+            if let Ok(r) = resolve_field_offsets_from_bytes(dbg_data, candidate) {
+                return Some(r);
+            }
+        }
+    }
+    None
 }
 
 /// Extract the on-disk ELF path from a `/proc/<pid>/maps` line, or
