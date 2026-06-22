@@ -538,45 +538,7 @@ impl std::fmt::Display for SnapshotError {
                 op,
                 len,
                 available_keys,
-            } => {
-                if *len == 0 {
-                    write!(f, "map '{map}': {op} matched no entries (map is empty)")
-                } else if available_keys.is_empty() {
-                    write!(
-                        f,
-                        "map '{map}': {op} matched none of {len} entries (sample keys unavailable)"
-                    )
-                } else {
-                    write!(
-                        f,
-                        "map '{map}': {op} matched none of {len} entries (first {sampled}: {available_keys:?})",
-                        sampled = available_keys.len(),
-                    )?;
-                    // The `hex:` prefix is only ever produced by
-                    // `render_entry_key`'s fallback path when the
-                    // entry's `key` field was `None` at capture time.
-                    // Typed `RenderedValue::Display` does not emit
-                    // this prefix for any scalar variant; `Struct`
-                    // emits `TypeName{...}` inline or `TypeName:`
-                    // breadcrumb, where a `hex:` collision would
-                    // require a BTF struct literally named `hex` —
-                    // no real kernel scheduler does that. The hint
-                    // therefore fires only when BTF was uniformly
-                    // absent for this map's key type at capture time,
-                    // and names the kernel-side fix so the operator
-                    // does not have to reverse-engineer the `hex:`
-                    // discriminator.
-                    if available_keys.iter().all(|k| k.starts_with(HEX_KEY_PREFIX)) {
-                        write!(
-                            f,
-                            " (BTF missing at capture — keys shown as hex bytes; \
-                             rebuild guest kernel with CONFIG_DEBUG_INFO_BTF=y for \
-                             typed keys)"
-                        )?;
-                    }
-                    Ok(())
-                }
-            }
+            } => fmt_no_match(f, map, op, *len, available_keys),
             SnapshotError::EmptyPathComponent { requested } => {
                 write!(
                     f,
@@ -639,68 +601,13 @@ impl std::fmt::Display for SnapshotError {
                 active_obj,
                 excluded_maps,
                 whitelist_kvas,
-            } => {
-                let excluded_rendered = excluded_maps
-                    .iter()
-                    .map(|m| format!("{}@{:#x}", m.name, m.map_kva))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let some_zero = excluded_maps.iter().any(|m| m.map_kva == 0);
-                let some_alias = excluded_maps
-                    .iter()
-                    .any(|m| m.map_kva != 0 && !whitelist_kvas.contains(&m.map_kva));
-                let cause = match (some_zero, some_alias) {
-                    (false, true) => {
-                        "this snapshot pre-dates your most recent \
-                         Op::ReplaceScheduler / Op::AttachScheduler — \
-                         wait for the next periodic boundary (or re-run \
-                         the test) so the walker re-publishes the live \
-                         scheduler's KVAs"
-                    }
-                    (true, false) => {
-                        "the captured maps have no recorded KVAs — \
-                         the snapshot pre-dates the walker plumbing, \
-                         or the capture path failed to record per-map KVAs"
-                    }
-                    (true, true) => {
-                        "some captured maps lack KVAs and some disagree \
-                         with the walker's whitelist — both \
-                         pre-walker-capture state and a post-swap window \
-                         can produce this; re-run the test to regenerate \
-                         the snapshot"
-                    }
-                    (false, false) => "captured KVAs were neither absent nor in disagreement",
-                };
-                write!(
-                    f,
-                    "snapshot lookup '{requested}' returned no hits under the \
-                     active filter (obj='{active_obj}'): the walker's KVA \
-                     whitelist {whitelist_kvas:#x?} excluded {n} captured map(s) \
-                     sharing the obj prefix: {excluded_rendered} — {cause}. \
-                     Reach for Snapshot::vars('{requested}') to enumerate every \
-                     copy across all obj prefixes, or Snapshot::map(\"<name>\") \
-                     to address one of the excluded maps directly.",
-                    n = excluded_maps.len(),
-                )
-            }
+            } => fmt_active_filter_excluded(f, requested, active_obj, excluded_maps, whitelist_kvas),
             SnapshotError::WalkerDriftedWithinPhase {
                 phase,
                 pinned_kvas,
                 sample_kvas,
                 requested,
-            } => {
-                write!(
-                    f,
-                    "walker drift within {phase:?}: lookup '{requested}' resolved against \
-                     KVA set {sample_kvas:#x?}, but an earlier same-phase snapshot pinned \
-                     {pinned_kvas:#x?}. The walker re-published mid-phase (typical cause: \
-                     a post-Op::ReplaceScheduler swap window). The drifted sample is \
-                     surfaced as Err so per-phase reducers (counter_delta_per_phase, \
-                     ratio_across_phases) see monotonic Ok-sequences from one walker \
-                     decision; address by stepping the phase past the swap settle window \
-                     or by reading via the explicit picker form."
-                )
-            }
+            } => fmt_walker_drift(f, phase, pinned_kvas, sample_kvas, requested),
             SnapshotError::ProjectionFailed { reason } => {
                 write!(f, "projection failed: {reason}")
             }
@@ -712,6 +619,132 @@ impl std::fmt::Display for SnapshotError {
             }
         }
     }
+}
+
+/// Render the `NoMatch` arm: an empty-map message, a no-sample-keys
+/// message, or the matched-none message plus the BTF-missing hint when
+/// every sample key fell back to the hex-bytes form.
+fn fmt_no_match(
+    f: &mut std::fmt::Formatter<'_>,
+    map: &str,
+    op: &str,
+    len: usize,
+    available_keys: &[String],
+) -> std::fmt::Result {
+    if len == 0 {
+        write!(f, "map '{map}': {op} matched no entries (map is empty)")
+    } else if available_keys.is_empty() {
+        write!(
+            f,
+            "map '{map}': {op} matched none of {len} entries (sample keys unavailable)"
+        )
+    } else {
+        write!(
+            f,
+            "map '{map}': {op} matched none of {len} entries (first {sampled}: {available_keys:?})",
+            sampled = available_keys.len(),
+        )?;
+        // The `hex:` prefix is only ever produced by
+        // `render_entry_key`'s fallback path when the
+        // entry's `key` field was `None` at capture time.
+        // Typed `RenderedValue::Display` does not emit
+        // this prefix for any scalar variant; `Struct`
+        // emits `TypeName{...}` inline or `TypeName:`
+        // breadcrumb, where a `hex:` collision would
+        // require a BTF struct literally named `hex` —
+        // no real kernel scheduler does that. The hint
+        // therefore fires only when BTF was uniformly
+        // absent for this map's key type at capture time,
+        // and names the kernel-side fix so the operator
+        // does not have to reverse-engineer the `hex:`
+        // discriminator.
+        if available_keys.iter().all(|k| k.starts_with(HEX_KEY_PREFIX)) {
+            write!(
+                f,
+                " (BTF missing at capture — keys shown as hex bytes; \
+                 rebuild guest kernel with CONFIG_DEBUG_INFO_BTF=y for \
+                 typed keys)"
+            )?;
+        }
+        Ok(())
+    }
+}
+
+/// Render the `ActiveFilterExcludedMaps` arm: classify why the walker's
+/// KVA whitelist excluded the captured maps sharing the requested obj
+/// prefix, and name the explicit-picker escape hatches.
+fn fmt_active_filter_excluded(
+    f: &mut std::fmt::Formatter<'_>,
+    requested: &str,
+    active_obj: &str,
+    excluded_maps: &[ExcludedMap],
+    whitelist_kvas: &[u64],
+) -> std::fmt::Result {
+    let excluded_rendered = excluded_maps
+        .iter()
+        .map(|m| format!("{}@{:#x}", m.name, m.map_kva))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let some_zero = excluded_maps.iter().any(|m| m.map_kva == 0);
+    let some_alias = excluded_maps
+        .iter()
+        .any(|m| m.map_kva != 0 && !whitelist_kvas.contains(&m.map_kva));
+    let cause = match (some_zero, some_alias) {
+        (false, true) => {
+            "this snapshot pre-dates your most recent \
+             Op::ReplaceScheduler / Op::AttachScheduler — \
+             wait for the next periodic boundary (or re-run \
+             the test) so the walker re-publishes the live \
+             scheduler's KVAs"
+        }
+        (true, false) => {
+            "the captured maps have no recorded KVAs — \
+             the snapshot pre-dates the walker plumbing, \
+             or the capture path failed to record per-map KVAs"
+        }
+        (true, true) => {
+            "some captured maps lack KVAs and some disagree \
+             with the walker's whitelist — both \
+             pre-walker-capture state and a post-swap window \
+             can produce this; re-run the test to regenerate \
+             the snapshot"
+        }
+        (false, false) => "captured KVAs were neither absent nor in disagreement",
+    };
+    write!(
+        f,
+        "snapshot lookup '{requested}' returned no hits under the \
+         active filter (obj='{active_obj}'): the walker's KVA \
+         whitelist {whitelist_kvas:#x?} excluded {n} captured map(s) \
+         sharing the obj prefix: {excluded_rendered} — {cause}. \
+         Reach for Snapshot::vars('{requested}') to enumerate every \
+         copy across all obj prefixes, or Snapshot::map(\"<name>\") \
+         to address one of the excluded maps directly.",
+        n = excluded_maps.len(),
+    )
+}
+
+/// Render the `WalkerDriftedWithinPhase` arm: the walker re-published
+/// its KVA set mid-phase, so the drifted sample is surfaced as Err to
+/// keep per-phase reducers on a single walker decision.
+fn fmt_walker_drift(
+    f: &mut std::fmt::Formatter<'_>,
+    phase: &crate::assert::Phase,
+    pinned_kvas: &[u64],
+    sample_kvas: &[u64],
+    requested: &str,
+) -> std::fmt::Result {
+    write!(
+        f,
+        "walker drift within {phase:?}: lookup '{requested}' resolved against \
+         KVA set {sample_kvas:#x?}, but an earlier same-phase snapshot pinned \
+         {pinned_kvas:#x?}. The walker re-published mid-phase (typical cause: \
+         a post-Op::ReplaceScheduler swap window). The drifted sample is \
+         surfaced as Err so per-phase reducers (counter_delta_per_phase, \
+         ratio_across_phases) see monotonic Ok-sequences from one walker \
+         decision; address by stepping the phase past the swap settle window \
+         or by reading via the explicit picker form."
+    )
 }
 
 impl std::error::Error for SnapshotError {}

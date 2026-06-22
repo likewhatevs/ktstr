@@ -167,11 +167,6 @@ const EXCEPTIONS: &[(&str, &str, usize)] = &[
     ("probe/process.rs", "run_probe_skeleton", 1295),             // queued: decompose
     ("scenario/ops/dispatch.rs", "apply_ops", 1122),              // queued: decompose
     ("scenario/ops/mod.rs", "run_scenario", 414),                 // queued: decompose
-    (
-        "scenario/snapshot/error.rs",
-        "<SnapshotError as std :: fmt :: Display>::fmt",
-        266,
-    ), // queued: decompose
     ("test_support/entry.rs", "KtstrTestEntry::validate", 338),   // queued: decompose
     ("test_support/eval/mod.rs", "evaluate_vm_result", 765),      // queued: decompose
     (
