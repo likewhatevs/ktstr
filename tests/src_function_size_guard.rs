@@ -159,16 +159,6 @@ const EXCEPTIONS: &[(&str, &str, usize)] = &[
     ), // queued: decompose
     ("test_support/probe.rs", "attempt_auto_repro", 450),         // queued: decompose
     (
-        "test_support/probe.rs",
-        "maybe_dispatch_vm_test_with_args",
-        215,
-    ), // queued: decompose
-    (
-        "test_support/probe.rs",
-        "maybe_dispatch_vm_test_with_phase_a",
-        247,
-    ), // queued: decompose
-    (
         "vmm/cast_analysis_load/mod.rs",
         "analyze_one_object_with_btf",
         217,

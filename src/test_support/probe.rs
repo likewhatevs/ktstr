@@ -1593,134 +1593,9 @@ pub(crate) fn maybe_dispatch_vm_test_with_args(args: &[String]) -> Option<i32> {
     // Set up BPF probes if --ktstr-probe-stack was provided.
     let pipeline = ProbePipeline::new();
     let probe_stop = pipeline.stop.clone();
-    let probe_handle: Option<ProbeHandle> = probe_stack.as_ref().and_then(|stack_input| {
-        use crate::probe::stack::load_probe_stack;
-
-        eprintln!("ktstr_test: probe: loading probe stack from --ktstr-probe-stack");
-        let mut pipe_diag = PipelineDiagnostics::default();
-        let raw_functions = load_probe_stack(stack_input);
-        pipe_diag.stack_extracted = raw_functions.len() as u32;
-        let pre_filter: Vec<String> = raw_functions.iter().map(|f| f.raw_name.clone()).collect();
-        let mut functions = crate::probe::stack::filter_traceable(raw_functions);
-        // Record which functions were dropped by filter_traceable.
-        for name in &pre_filter {
-            if !functions.iter().any(|f| f.raw_name == *name) {
-                pipe_diag.filter_dropped.push(name.clone());
-            }
-        }
-        // Discover BPF scheduler functions from the running scheduler.
-        // Stack-extracted BPF names have stale prog IDs from the first VM;
-        // discover_bpf_symbols finds the current scheduler's programs.
-        let stack_display_names: Vec<&str> = functions
-            .iter()
-            .filter(|f| f.is_bpf)
-            .map(|f| f.display_name.as_str())
-            .collect();
-        let bpf_syms = crate::probe::btf::discover_bpf_symbols(&stack_display_names);
-        pipe_diag.bpf_discovered = bpf_syms.len() as u32;
-        if !bpf_syms.is_empty() {
-            eprintln!(
-                "ktstr_test: probe: {} BPF symbols discovered",
-                bpf_syms.len()
-            );
-            functions.extend(bpf_syms);
-        }
-        // Expand BPF functions to kernel-side callers for bridge kprobes,
-        // keeping BPF functions for fentry attachment.
-        let functions = crate::probe::stack::expand_bpf_to_kernel_callers(functions);
-        pipe_diag.total_after_expand = functions.len() as u32;
-        if functions.is_empty() {
-            eprintln!("ktstr_test: no traceable functions from --ktstr-probe-stack");
-            return None;
-        }
-
-        eprintln!(
-            "ktstr_test: probe: {} functions loaded, spawning probe thread",
-            functions.len()
-        );
-
-        // Resolve BTF signatures for kernel functions so probe output
-        // gets decoded field names instead of raw register values.
-        let kernel_names: Vec<&str> = functions
-            .iter()
-            .filter(|f| !f.is_bpf)
-            .map(|f| f.raw_name.as_str())
-            .collect();
-        let mut btf_funcs = crate::probe::btf::parse_btf_functions(&kernel_names, None);
-        // Parse BPF function signatures from BPF program BTF.
-        let bpf_btf_args: Vec<(&str, u32)> = functions
-            .iter()
-            .filter(|f| f.is_bpf)
-            .filter_map(|f| Some((f.display_name.as_str(), f.bpf_prog_id?)))
-            .collect();
-        if !bpf_btf_args.is_empty() {
-            btf_funcs.extend(crate::probe::btf::parse_bpf_btf_functions(&bpf_btf_args));
-        }
-
-        // Build func_names from the filtered list so indices match
-        // the func_idx values assigned by run_probe_skeleton.
-        let func_names: Vec<(u32, String)> = functions
-            .iter()
-            .enumerate()
-            .map(|(i, f)| (i as u32, f.display_name.clone()))
-            .collect();
-
-        // Pre-open BPF program FDs while the scheduler is alive.
-        // Holding these FDs keeps programs alive via kernel refcounting
-        // even after the scheduler crashes.
-        let bpf_fds = crate::probe::process::open_bpf_prog_fds(&functions);
-        let pnames = crate::probe::output::build_param_names(&btf_funcs);
-        let rhints = crate::probe::output::build_render_hints(&btf_funcs);
-        let pnames_thread = pnames.clone();
-        let rhints_thread = rhints.clone();
-        let thread_pipeline = pipeline.clone();
-        let funcs = functions.clone();
-        let fn_names = func_names.clone();
-        let pd = pipe_diag.clone();
-        let handle = std::thread::spawn(move || {
-            use crate::probe::process::run_probe_skeleton;
-            let (events, diag, accumulated_fn_names) = run_probe_skeleton(
-                &funcs,
-                &btf_funcs,
-                &thread_pipeline.stop,
-                &bpf_fds,
-                &thread_pipeline.probes_ready,
-                None,
-            );
-            let emit_fn_names = if accumulated_fn_names.is_empty() {
-                &fn_names
-            } else {
-                &accumulated_fn_names
-            };
-            // Serialize probe output after the trigger fires or stop
-            // is signaled. Runs before the thread returns so output
-            // reaches COM2 even if the main thread is blocked.
-            emit_probe_payload(
-                events.as_deref().unwrap_or(&[]),
-                emit_fn_names,
-                &pd,
-                &diag,
-                &pnames_thread,
-                &rhints_thread,
-            );
-            thread_pipeline.output_done.set();
-            (events, diag, accumulated_fn_names)
-        });
-
-        // Wait for probes to attach before starting the test function.
-        // Without this, the test may crash the scheduler before probes
-        // are active, resulting in 0 captured events.
-        pipeline.probes_ready.wait();
-
-        Some(ProbeHandle {
-            thread: handle,
-            func_names,
-            pipeline_diag: pipe_diag,
-            output_done: pipeline.output_done.clone(),
-            param_names: pnames,
-            render_hints: rhints,
-        })
-    });
+    let probe_handle: Option<ProbeHandle> = probe_stack
+        .as_ref()
+        .and_then(|stack_input| setup_probe_handle(stack_input, &pipeline));
 
     let (topo, cgroups, sched_pid, merged_assert) = build_dispatch_ctx_parts(entry, args);
     let ctx = crate::scenario::Ctx::builder(&cgroups, &topo)
@@ -1756,6 +1631,141 @@ pub(crate) fn maybe_dispatch_vm_test_with_args(args: &[String]) -> Option<i32> {
     let exit_code = exit_code_for_result(&result);
     publish_result_and_collect(&result, probe_stop, probe_handle);
     Some(exit_code)
+}
+
+/// Build the probe thread + handle for `--ktstr-probe-stack`: load the
+/// stack, filter to traceable functions, discover the running
+/// scheduler's BPF programs, resolve kernel + BPF BTF signatures,
+/// pre-open BPF program FDs, spawn the probe-skeleton thread, and wait
+/// for probes to attach before returning the handle. Returns `None`
+/// when the stack yields no traceable functions.
+fn setup_probe_handle(stack_input: &str, pipeline: &ProbePipeline) -> Option<ProbeHandle> {
+    use crate::probe::stack::load_probe_stack;
+
+    eprintln!("ktstr_test: probe: loading probe stack from --ktstr-probe-stack");
+    let mut pipe_diag = PipelineDiagnostics::default();
+    let raw_functions = load_probe_stack(stack_input);
+    pipe_diag.stack_extracted = raw_functions.len() as u32;
+    let pre_filter: Vec<String> = raw_functions.iter().map(|f| f.raw_name.clone()).collect();
+    let mut functions = crate::probe::stack::filter_traceable(raw_functions);
+    // Record which functions were dropped by filter_traceable.
+    for name in &pre_filter {
+        if !functions.iter().any(|f| f.raw_name == *name) {
+            pipe_diag.filter_dropped.push(name.clone());
+        }
+    }
+    // Discover BPF scheduler functions from the running scheduler.
+    // Stack-extracted BPF names have stale prog IDs from the first VM;
+    // discover_bpf_symbols finds the current scheduler's programs.
+    let stack_display_names: Vec<&str> = functions
+        .iter()
+        .filter(|f| f.is_bpf)
+        .map(|f| f.display_name.as_str())
+        .collect();
+    let bpf_syms = crate::probe::btf::discover_bpf_symbols(&stack_display_names);
+    pipe_diag.bpf_discovered = bpf_syms.len() as u32;
+    if !bpf_syms.is_empty() {
+        eprintln!(
+            "ktstr_test: probe: {} BPF symbols discovered",
+            bpf_syms.len()
+        );
+        functions.extend(bpf_syms);
+    }
+    // Expand BPF functions to kernel-side callers for bridge kprobes,
+    // keeping BPF functions for fentry attachment.
+    let functions = crate::probe::stack::expand_bpf_to_kernel_callers(functions);
+    pipe_diag.total_after_expand = functions.len() as u32;
+    if functions.is_empty() {
+        eprintln!("ktstr_test: no traceable functions from --ktstr-probe-stack");
+        return None;
+    }
+
+    eprintln!(
+        "ktstr_test: probe: {} functions loaded, spawning probe thread",
+        functions.len()
+    );
+
+    // Resolve BTF signatures for kernel functions so probe output
+    // gets decoded field names instead of raw register values.
+    let kernel_names: Vec<&str> = functions
+        .iter()
+        .filter(|f| !f.is_bpf)
+        .map(|f| f.raw_name.as_str())
+        .collect();
+    let mut btf_funcs = crate::probe::btf::parse_btf_functions(&kernel_names, None);
+    // Parse BPF function signatures from BPF program BTF.
+    let bpf_btf_args: Vec<(&str, u32)> = functions
+        .iter()
+        .filter(|f| f.is_bpf)
+        .filter_map(|f| Some((f.display_name.as_str(), f.bpf_prog_id?)))
+        .collect();
+    if !bpf_btf_args.is_empty() {
+        btf_funcs.extend(crate::probe::btf::parse_bpf_btf_functions(&bpf_btf_args));
+    }
+
+    // Build func_names from the filtered list so indices match
+    // the func_idx values assigned by run_probe_skeleton.
+    let func_names: Vec<(u32, String)> = functions
+        .iter()
+        .enumerate()
+        .map(|(i, f)| (i as u32, f.display_name.clone()))
+        .collect();
+
+    // Pre-open BPF program FDs while the scheduler is alive.
+    // Holding these FDs keeps programs alive via kernel refcounting
+    // even after the scheduler crashes.
+    let bpf_fds = crate::probe::process::open_bpf_prog_fds(&functions);
+    let pnames = crate::probe::output::build_param_names(&btf_funcs);
+    let rhints = crate::probe::output::build_render_hints(&btf_funcs);
+    let pnames_thread = pnames.clone();
+    let rhints_thread = rhints.clone();
+    let thread_pipeline = pipeline.clone();
+    let funcs = functions.clone();
+    let fn_names = func_names.clone();
+    let pd = pipe_diag.clone();
+    let handle = std::thread::spawn(move || {
+        use crate::probe::process::run_probe_skeleton;
+        let (events, diag, accumulated_fn_names) = run_probe_skeleton(
+            &funcs,
+            &btf_funcs,
+            &thread_pipeline.stop,
+            &bpf_fds,
+            &thread_pipeline.probes_ready,
+            None,
+        );
+        let emit_fn_names = if accumulated_fn_names.is_empty() {
+            &fn_names
+        } else {
+            &accumulated_fn_names
+        };
+        // Serialize probe output after the trigger fires or stop
+        // is signaled. Runs before the thread returns so output
+        // reaches COM2 even if the main thread is blocked.
+        emit_probe_payload(
+            events.as_deref().unwrap_or(&[]),
+            emit_fn_names,
+            &pd,
+            &diag,
+            &pnames_thread,
+            &rhints_thread,
+        );
+        thread_pipeline.output_done.set();
+        (events, diag, accumulated_fn_names)
+    });
+
+    // Wait for probes to attach before starting the test function.
+    // Without this, the test may crash the scheduler before probes
+    // are active, resulting in 0 captured events.
+    pipeline.probes_ready.wait();
+
+    Some(ProbeHandle {
+        thread: handle,
+        func_names,
+        pipeline_diag: pipe_diag,
+        output_done: pipeline.output_done.clone(),
+        param_names: pnames,
+        render_hints: rhints,
+    })
 }
 
 /// Result returned by the probe thread: collected events, skeleton
@@ -1971,7 +1981,6 @@ pub(crate) fn maybe_dispatch_vm_test_with_phase_a(
     pa: ProbePhaseAState,
 ) -> Option<i32> {
     use crate::probe::btf::discover_bpf_symbols;
-    use crate::probe::stack::expand_bpf_to_kernel_callers;
 
     // Env propagation cannot happen here: `pa` holds a live probe
     // thread spawned by `start_probe_phase_a`, so mutating
@@ -2086,80 +2095,12 @@ pub(crate) fn maybe_dispatch_vm_test_with_phase_a(
         bpf_syms.len()
     );
 
-    if !bpf_syms.is_empty() {
-        // Expand BPF to kernel callers. Both BPF callbacks (for fentry)
-        // and kernel callers (for additional kprobes) are included in
-        // Phase B input.
-        let phase_b_functions = expand_bpf_to_kernel_callers(bpf_syms);
-        // Roll the post-expansion total into Phase A's diag. The
-        // `after_expand` counter is the host-side render's sense of
-        // "total probe targets the pipeline planned"; Phase A only
-        // contributed kernel functions (already in
-        // `pa_pipe_diag.total_after_expand`), so add Phase B's
-        // contribution here. Without this, the
-        // `after_expand: N total probe targets` line undercounts by
-        // every Phase B function attached.
-        pa_pipe_diag.total_after_expand = pa_pipe_diag
-            .total_after_expand
-            .saturating_add(phase_b_functions.len() as u32);
-
-        // Open BPF program FDs while the scheduler is alive.
-        let bpf_fds = crate::probe::process::open_bpf_prog_fds(&phase_b_functions);
-
-        // Parse BPF function signatures from BPF program BTF.
-        let bpf_btf_args: Vec<(&str, u32)> = phase_b_functions
-            .iter()
-            .filter(|f| f.is_bpf)
-            .filter_map(|f| Some((f.display_name.as_str(), f.bpf_prog_id?)))
-            .collect();
-        let mut phase_b_btf = if !bpf_btf_args.is_empty() {
-            crate::probe::btf::parse_bpf_btf_functions(&bpf_btf_args)
-        } else {
-            Vec::new()
-        };
-        // Parse BTF for kernel callers added by expand_bpf_to_kernel_callers.
-        let kernel_caller_names: Vec<&str> = phase_b_functions
-            .iter()
-            .filter(|f| !f.is_bpf)
-            .map(|f| f.raw_name.as_str())
-            .collect();
-        if !kernel_caller_names.is_empty() {
-            phase_b_btf.extend(crate::probe::btf::parse_btf_functions(
-                &kernel_caller_names,
-                None,
-            ));
-        }
-
-        let phase_b_done = std::sync::Arc::new(crate::sync::Latch::new());
-        let phase_b_done_clone = phase_b_done.clone();
-
-        let n_phase_b_functions = phase_b_functions.len();
-        let phase_b_input = crate::probe::process::PhaseBInput {
-            functions: phase_b_functions,
-            bpf_prog_fds: bpf_fds,
-            btf_funcs: phase_b_btf,
-            done: phase_b_done_clone,
-            func_idx_offset: pa_kernel_func_count,
-        };
-
-        let attach_start = Instant::now();
-        if let Err(e) = pa_phase_b_tx.send(phase_b_input) {
-            eprintln!("ktstr_test: probe phase_b: failed to send: {e}");
-        } else {
-            // Wait for Phase B attachment to complete.
-            phase_b_done.wait();
-            tracing::info!(
-                elapsed_ms = attach_start.elapsed().as_millis() as u64,
-                phase_b_functions = n_phase_b_functions,
-                "auto_repro: phase_b_attach",
-            );
-            eprintln!("ktstr_test: probe phase_b: BPF fentry attached");
-        }
-    } else {
-        eprintln!("ktstr_test: probe phase_b: no BPF symbols, skipping fentry");
-        // Drop the sender so the probe thread's try_recv sees Disconnected.
-        drop(pa_phase_b_tx);
-    }
+    run_phase_b_attach(
+        bpf_syms,
+        pa_phase_b_tx,
+        pa_kernel_func_count,
+        &mut pa_pipe_diag,
+    );
 
     let (topo, cgroups, sched_pid, merged_assert) = build_dispatch_ctx_parts(entry, args);
     // Settle is `Duration::ZERO` to match the single-phase
@@ -2210,6 +2151,97 @@ pub(crate) fn maybe_dispatch_vm_test_with_phase_a(
     let exit_code = exit_code_for_result(&result);
     publish_result_and_collect(&result, stop, Some(handle));
     Some(exit_code)
+}
+
+/// Phase B of the auto-repro probe pipeline: given the BPF symbols
+/// discovered from the running scheduler, expand them to kernel-side
+/// callers, open the BPF program FDs, parse Phase B BTF, and hand the
+/// attach request to the probe thread, waiting for attachment to
+/// complete. With no BPF symbols, drops `phase_b_tx` so the probe
+/// thread's `try_recv` sees `Disconnected`. Rolls the post-expansion
+/// target count into `pipe_diag.total_after_expand`.
+fn run_phase_b_attach(
+    bpf_syms: Vec<crate::probe::stack::StackFunction>,
+    phase_b_tx: std::sync::mpsc::Sender<crate::probe::process::PhaseBInput>,
+    kernel_func_count: u32,
+    pipe_diag: &mut PipelineDiagnostics,
+) {
+    use crate::probe::stack::expand_bpf_to_kernel_callers;
+
+    if !bpf_syms.is_empty() {
+        // Expand BPF to kernel callers. Both BPF callbacks (for fentry)
+        // and kernel callers (for additional kprobes) are included in
+        // Phase B input.
+        let phase_b_functions = expand_bpf_to_kernel_callers(bpf_syms);
+        // Roll the post-expansion total into Phase A's diag. The
+        // `after_expand` counter is the host-side render's sense of
+        // "total probe targets the pipeline planned"; Phase A only
+        // contributed kernel functions (already in
+        // `pipe_diag.total_after_expand`), so add Phase B's
+        // contribution here. Without this, the
+        // `after_expand: N total probe targets` line undercounts by
+        // every Phase B function attached.
+        pipe_diag.total_after_expand = pipe_diag
+            .total_after_expand
+            .saturating_add(phase_b_functions.len() as u32);
+
+        // Open BPF program FDs while the scheduler is alive.
+        let bpf_fds = crate::probe::process::open_bpf_prog_fds(&phase_b_functions);
+
+        // Parse BPF function signatures from BPF program BTF.
+        let bpf_btf_args: Vec<(&str, u32)> = phase_b_functions
+            .iter()
+            .filter(|f| f.is_bpf)
+            .filter_map(|f| Some((f.display_name.as_str(), f.bpf_prog_id?)))
+            .collect();
+        let mut phase_b_btf = if !bpf_btf_args.is_empty() {
+            crate::probe::btf::parse_bpf_btf_functions(&bpf_btf_args)
+        } else {
+            Vec::new()
+        };
+        // Parse BTF for kernel callers added by expand_bpf_to_kernel_callers.
+        let kernel_caller_names: Vec<&str> = phase_b_functions
+            .iter()
+            .filter(|f| !f.is_bpf)
+            .map(|f| f.raw_name.as_str())
+            .collect();
+        if !kernel_caller_names.is_empty() {
+            phase_b_btf.extend(crate::probe::btf::parse_btf_functions(
+                &kernel_caller_names,
+                None,
+            ));
+        }
+
+        let phase_b_done = std::sync::Arc::new(crate::sync::Latch::new());
+        let phase_b_done_clone = phase_b_done.clone();
+
+        let n_phase_b_functions = phase_b_functions.len();
+        let phase_b_input = crate::probe::process::PhaseBInput {
+            functions: phase_b_functions,
+            bpf_prog_fds: bpf_fds,
+            btf_funcs: phase_b_btf,
+            done: phase_b_done_clone,
+            func_idx_offset: kernel_func_count,
+        };
+
+        let attach_start = Instant::now();
+        if let Err(e) = phase_b_tx.send(phase_b_input) {
+            eprintln!("ktstr_test: probe phase_b: failed to send: {e}");
+        } else {
+            // Wait for Phase B attachment to complete.
+            phase_b_done.wait();
+            tracing::info!(
+                elapsed_ms = attach_start.elapsed().as_millis() as u64,
+                phase_b_functions = n_phase_b_functions,
+                "auto_repro: phase_b_attach",
+            );
+            eprintln!("ktstr_test: probe phase_b: BPF fentry attached");
+        }
+    } else {
+        eprintln!("ktstr_test: probe phase_b: no BPF symbols, skipping fentry");
+        // Drop the sender so the probe thread's try_recv sees Disconnected.
+        drop(phase_b_tx);
+    }
 }
 
 /// Serialized probe data sent from guest to host via COM2.
