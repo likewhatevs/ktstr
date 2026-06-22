@@ -53,6 +53,7 @@ use anyhow::Result;
 mod args;
 mod dispatch;
 mod entry;
+mod entry_validate;
 mod eval;
 mod metrics;
 #[cfg(feature = "llm")]
