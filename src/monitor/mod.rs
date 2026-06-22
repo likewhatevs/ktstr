@@ -460,17 +460,11 @@ impl MonitorSample {
 
     /// Compute the imbalance ratio for this sample: max(nr_running) / max(1, min(nr_running)).
     /// Returns 1.0 for empty samples, 0.0 when all CPUs have nr_running=0.
+    /// Delegates to [`imbalance_ratio_of`] so the monitor loop's reactive
+    /// dump-trigger check can compute the identical ratio from a borrowed
+    /// `&[CpuSnapshot]` without cloning into a throwaway `MonitorSample`.
     pub fn imbalance_ratio(&self) -> f64 {
-        if self.cpus.is_empty() {
-            return 1.0;
-        }
-        let mut min_nr = u32::MAX;
-        let mut max_nr = 0u32;
-        for cpu in &self.cpus {
-            min_nr = min_nr.min(cpu.nr_running);
-            max_nr = max_nr.max(cpu.nr_running);
-        }
-        max_nr as f64 / min_nr.max(1) as f64
+        imbalance_ratio_of(&self.cpus)
     }
 
     /// Sum a field from event counters across all CPUs.
@@ -486,6 +480,27 @@ impl MonitorSample {
         }
         any.then_some(total)
     }
+}
+
+/// `max(nr_running) / max(1, min(nr_running))` over a slice of per-CPU
+/// snapshots — 1.0 for an empty slice, 0.0 when every CPU is idle
+/// (`max_nr == 0`). Extracted from [`MonitorSample::imbalance_ratio`]
+/// so the monitor loop's reactive dump-trigger check shares the EXACT
+/// computation the post-hoc verdict uses (any drift would let the
+/// reactive SysRq-D trigger fire on conditions the verdict rejects)
+/// while reading a borrowed `&[CpuSnapshot]` directly — no clone into
+/// a throwaway `MonitorSample`.
+pub(crate) fn imbalance_ratio_of(cpus: &[CpuSnapshot]) -> f64 {
+    if cpus.is_empty() {
+        return 1.0;
+    }
+    let mut min_nr = u32::MAX;
+    let mut max_nr = 0u32;
+    for cpu in cpus {
+        min_nr = min_nr.min(cpu.nr_running);
+        max_nr = max_nr.max(cpu.nr_running);
+    }
+    max_nr as f64 / min_nr.max(1) as f64
 }
 
 /// Per-CPU state read from guest VM memory.

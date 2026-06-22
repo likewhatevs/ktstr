@@ -2731,14 +2731,11 @@ pub(crate) fn monitor_loop(
             let t = &trigger.thresholds;
             let sample_idx = samples.len();
 
-            // Imbalance check — use the shared sample method so the
-            // min_nr.max(1)/max_nr calculation matches post-hoc.
-            let tmp_sample = MonitorSample {
-                elapsed_ms: 0,
-                cpus: cpus.clone(),
-                prog_stats: None,
-            };
-            let ratio = tmp_sample.imbalance_ratio();
+            // Imbalance check — share the exact min_nr.max(1)/max_nr
+            // computation with the post-hoc verdict via the extracted
+            // `imbalance_ratio_of`, reading `cpus` by reference so no
+            // throwaway `MonitorSample` is cloned per sample.
+            let ratio = super::imbalance_ratio_of(&cpus);
             imbalance_tracker.record(ratio > t.max_imbalance_ratio, ratio, sample_idx);
 
             // DSQ depth check.
