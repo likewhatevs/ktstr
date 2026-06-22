@@ -214,11 +214,6 @@ const EXCEPTIONS: &[(&str, &str, usize)] = &[
     ("workload/worker/mod.rs", "worker_main", 3275),              // queued: decompose
     // Added for post-fmt + recent-work growth; path order is cosmetic
     // (the guard collects EXCEPTIONS into a BTreeMap). queued: decompose.
-    (
-        "vmm/freeze_coord/kernel_op_dispatch.rs",
-        "find_task_by_pid",
-        221,
-    ), // queued: decompose
 ];
 
 fn src_root() -> PathBuf {

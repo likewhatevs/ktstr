@@ -940,9 +940,6 @@ fn find_task_by_pid(
     let walk = kernel.walk_context();
     let pid_off = offs.pid;
     let tasks_off = offs.tasks;
-    let signal_off = offs.signal;
-    let signal_thread_head_off = offs.signal_thread_head;
-    let thread_node_off = offs.thread_node;
 
     // init_task.tasks anchor lives in .data (init_task is a static
     // global at init/init_task.c:96), so text_kva_to_pa is the right
@@ -1044,99 +1041,10 @@ fn find_task_by_pid(
         }
 
         // Tier 2: walk this leader's threads via signal->thread_head.
-        // The signal pointer is at `signal_off` within task_struct;
-        // dereference to get signal_struct KVA; thread_head list_head
-        // is at `signal_thread_head_off` within signal_struct.
-        let signal_kva = mem.read_u64(leader_pa, signal_off);
-        if signal_kva != 0 {
-            let thread_head_kva = signal_kva.wrapping_add(signal_thread_head_off as u64);
-            if let Some(thread_head_pa) = translate_any_kva(
-                mem,
-                walk.cr3_pa,
-                walk.page_offset,
-                thread_head_kva,
-                walk.l5,
-                walk.tcr_el1,
-            ) {
-                let mut thread_node_kva = mem.read_u64(thread_head_pa, 0);
-                // Address-cycle backstop for this leader's thread ring. The
-                // thread_head is already a RUNTIME address (signal_kva is
-                // read from guest memory), so no slide applies here — only
-                // the HashSet. A corrupt thread ring breaks the inner loop
-                // (skip this leader's threads) rather than aborting the
-                // whole pid search — partial visibility over none.
-                let mut seen_threads: std::collections::HashSet<u64> =
-                    std::collections::HashSet::new();
-                while thread_node_kva != 0 && thread_node_kva != thread_head_kva {
-                    if visited >= MAX_TASK_WALKER_NODES {
-                        return Err(format!(
-                            "find_task_by_pid: walker cap {MAX_TASK_WALKER_NODES} \
-                             exceeded inside thread-group of leader_pid={leader_pid} \
-                             scanning for pid={target_pid}"
-                        ));
-                    }
-                    if !seen_threads.insert(thread_node_kva) {
-                        break;
-                    }
-                    visited += 1;
-
-                    let thread_kva = thread_node_kva.wrapping_sub(thread_node_off as u64);
-
-                    // The leader's thread_node is also on this list
-                    // — skip it (already checked as leader above).
-                    if thread_kva != leader_kva {
-                        let Some(thread_pa) = translate_any_kva(
-                            mem,
-                            walk.cr3_pa,
-                            walk.page_offset,
-                            thread_kva,
-                            walk.l5,
-                            walk.tcr_el1,
-                        ) else {
-                            // Skip this thread on translate failure
-                            // rather than aborting the whole walk —
-                            // partial visibility is better than none.
-                            // Advance via the node, not the task.
-                            let Some(thread_node_pa) = translate_any_kva(
-                                mem,
-                                walk.cr3_pa,
-                                walk.page_offset,
-                                thread_node_kva,
-                                walk.l5,
-                                walk.tcr_el1,
-                            ) else {
-                                break; // can't advance — break inner loop
-                            };
-                            thread_node_kva = mem.read_u64(thread_node_pa, 0);
-                            continue;
-                        };
-
-                        let thread_pid = mem.read_u32(thread_pa, pid_off);
-                        if thread_pid == target_pid {
-                            return Ok(thread_kva);
-                        }
-                    }
-
-                    // Advance to next thread via thread_node.next.
-                    let next_kva = mem.read_u64(
-                        thread_pa_or_node(
-                            mem,
-                            walk.cr3_pa,
-                            walk.page_offset,
-                            walk.l5,
-                            walk.tcr_el1,
-                            thread_kva,
-                            thread_node_kva,
-                            thread_node_off,
-                        ),
-                        0,
-                    );
-                    if next_kva == 0 {
-                        break; // chain broken — break inner loop
-                    }
-                    thread_node_kva = next_kva;
-                }
-            }
+        if let Some(found) = find_pid_in_thread_group(
+            kernel, leader_pa, leader_kva, leader_pid, offs, target_pid, &mut visited,
+        )? {
+            return Ok(found);
         }
 
         // Advance to next leader via this leader's tasks.next.
@@ -1155,6 +1063,136 @@ fn find_task_by_pid(
          or any leader's signal->thread_head (visited={visited} entries across \
          leaders + threads)"
     ))
+}
+
+/// Tier-2 of [`find_task_by_pid`]: walk one leader's thread group via
+/// `signal->thread_head` and return the `task_kva` of the thread whose
+/// `pid` matches `target_pid`. The signal pointer is at `offs.signal`
+/// within task_struct; dereference to get signal_struct KVA; the
+/// `thread_head` list_head is at `offs.signal_thread_head` within
+/// signal_struct; per-thread linkage is `offs.thread_node`.
+///
+/// `visited` is the shared walker budget threaded from the Tier-1
+/// leader loop and incremented per thread node, so the
+/// [`MAX_TASK_WALKER_NODES`] cap bounds BOTH walks combined.
+///
+/// Returns `Ok(Some(thread_kva))` on a pid match, `Err(reason)` when
+/// the walker cap is exceeded, and `Ok(None)` when the leader has no
+/// signal, the thread_head is unmapped, or the thread ring completes /
+/// breaks without a match (caller advances to the next leader).
+fn find_pid_in_thread_group(
+    kernel: &GuestKernel,
+    leader_pa: u64,
+    leader_kva: u64,
+    leader_pid: u32,
+    offs: &TaskValidationOffsets,
+    target_pid: u32,
+    visited: &mut u32,
+) -> Result<Option<u64>, String> {
+    let mem = kernel.mem();
+    let walk = kernel.walk_context();
+    let pid_off = offs.pid;
+    let signal_off = offs.signal;
+    let signal_thread_head_off = offs.signal_thread_head;
+    let thread_node_off = offs.thread_node;
+
+    // Tier 2: walk this leader's threads via signal->thread_head.
+    // The signal pointer is at `signal_off` within task_struct;
+    // dereference to get signal_struct KVA; thread_head list_head
+    // is at `signal_thread_head_off` within signal_struct.
+    let signal_kva = mem.read_u64(leader_pa, signal_off);
+    if signal_kva != 0 {
+        let thread_head_kva = signal_kva.wrapping_add(signal_thread_head_off as u64);
+        if let Some(thread_head_pa) = translate_any_kva(
+            mem,
+            walk.cr3_pa,
+            walk.page_offset,
+            thread_head_kva,
+            walk.l5,
+            walk.tcr_el1,
+        ) {
+            let mut thread_node_kva = mem.read_u64(thread_head_pa, 0);
+            // Address-cycle backstop for this leader's thread ring. The
+            // thread_head is already a RUNTIME address (signal_kva is
+            // read from guest memory), so no slide applies here — only
+            // the HashSet. A corrupt thread ring breaks the inner loop
+            // (skip this leader's threads) rather than aborting the
+            // whole pid search — partial visibility over none.
+            let mut seen_threads: std::collections::HashSet<u64> =
+                std::collections::HashSet::new();
+            while thread_node_kva != 0 && thread_node_kva != thread_head_kva {
+                if *visited >= MAX_TASK_WALKER_NODES {
+                    return Err(format!(
+                        "find_task_by_pid: walker cap {MAX_TASK_WALKER_NODES} \
+                         exceeded inside thread-group of leader_pid={leader_pid} \
+                         scanning for pid={target_pid}"
+                    ));
+                }
+                if !seen_threads.insert(thread_node_kva) {
+                    break;
+                }
+                *visited += 1;
+
+                let thread_kva = thread_node_kva.wrapping_sub(thread_node_off as u64);
+
+                // The leader's thread_node is also on this list
+                // — skip it (already checked as leader above).
+                if thread_kva != leader_kva {
+                    let Some(thread_pa) = translate_any_kva(
+                        mem,
+                        walk.cr3_pa,
+                        walk.page_offset,
+                        thread_kva,
+                        walk.l5,
+                        walk.tcr_el1,
+                    ) else {
+                        // Skip this thread on translate failure
+                        // rather than aborting the whole walk —
+                        // partial visibility is better than none.
+                        // Advance via the node, not the task.
+                        let Some(thread_node_pa) = translate_any_kva(
+                            mem,
+                            walk.cr3_pa,
+                            walk.page_offset,
+                            thread_node_kva,
+                            walk.l5,
+                            walk.tcr_el1,
+                        ) else {
+                            break; // can't advance — break inner loop
+                        };
+                        thread_node_kva = mem.read_u64(thread_node_pa, 0);
+                        continue;
+                    };
+
+                    let thread_pid = mem.read_u32(thread_pa, pid_off);
+                    if thread_pid == target_pid {
+                        return Ok(Some(thread_kva));
+                    }
+                }
+
+                // Advance to next thread via thread_node.next.
+                let next_kva = mem.read_u64(
+                    thread_pa_or_node(
+                        mem,
+                        walk.cr3_pa,
+                        walk.page_offset,
+                        walk.l5,
+                        walk.tcr_el1,
+                        thread_kva,
+                        thread_node_kva,
+                        thread_node_off,
+                    ),
+                    0,
+                );
+                if next_kva == 0 {
+                    break; // chain broken — break inner loop
+                }
+                thread_node_kva = next_kva;
+            }
+        }
+    }
+
+    Ok(None)
 }
 
 /// Resolve the PA holding a thread_node's .next pointer. Used by the
