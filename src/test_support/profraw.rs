@@ -462,15 +462,16 @@ fn redirect_default_profraw_path() {
     // actually has a decision to make. cargo-ktstr-wrapped runs and
     // cargo-llvm-cov runs both pre-set `LLVM_PROFILE_FILE`, so
     // `existing.is_some()` short-circuits before
-    // `is_coverage_instrumented_binary` mmaps `/proc/self/exe` and
-    // walks the symtab. pid=1 (in-VM init) similarly avoids the
+    // `current_binary_is_coverage_instrumented` mmaps `/proc/self/exe`
+    // and walks the symtab (first call only; memoised). pid=1 (in-VM
+    // init) similarly avoids the
     // probe — the SHM-ring flush owns guest-side coverage.
     let pid = unsafe { libc::getpid() };
     let existing = std::env::var_os("LLVM_PROFILE_FILE");
     if pid == 1 || existing.is_some() {
         return;
     }
-    let instrumented = is_coverage_instrumented_binary();
+    let instrumented = current_binary_is_coverage_instrumented();
     if let Some(pattern) = redirect_pattern_for(pid, existing, instrumented, target_dir) {
         // SAFETY: this ctor runs from `.init_array.0`, before any
         // user thread has spawned. The env block is single-writer,

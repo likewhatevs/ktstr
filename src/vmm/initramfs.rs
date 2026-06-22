@@ -620,8 +620,10 @@ fn write_symlink_entry(archive: &mut Vec<u8>, name: &str, target: &str) -> Resul
 }
 
 /// Section names removed during debug stripping. These contain debug
-/// info, compiler metadata, and profiling data that inflate the binary
-/// but are not needed inside the VM.
+/// info and compiler metadata (`.comment`) that inflate the binary but
+/// are not needed inside the VM. Coverage profiling sections
+/// (`__llvm_prf_*`) are deliberately absent from this list — guest
+/// coverage capture needs them resident.
 const DEBUG_SECTIONS: &[&[u8]] = &[
     b".debug_info",
     b".debug_abbrev",

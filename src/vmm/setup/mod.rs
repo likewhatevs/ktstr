@@ -182,8 +182,11 @@ fn base_guest_cmdline(arch_extra: &str) -> String {
     // __vm_enough_memory rejects a single mapping larger than free RAM,
     // so on a deferred-sized guest the /init aborts with "memory
     // allocation of N bytes failed" before the workload runs. ALWAYS mode
-    // admits the mapping; the small resident set stays within guest RAM
-    // so no OOM-kill follows. (arm64's arch_mm_preinit auto-enables
+    // admits the mapping; the resident set then stays within guest RAM
+    // so no OOM-kill follows (a coverage-instrumented /init's larger
+    // resident set — the live __llvm_prf_cnts + __llvm_prf_data
+    // sections — is covered by the memory_budget coverage reserve).
+    // (arm64's arch_mm_preinit auto-enables
     // ALWAYS only for PAGE_SIZE>=16K with <=128 physpages.)
     format!(
         "console=ttyS0 nomodules mitigations=off random.trust_cpu=on \
