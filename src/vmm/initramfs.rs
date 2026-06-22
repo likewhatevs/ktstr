@@ -756,6 +756,75 @@ pub fn build_initramfs_base(
     include_files: &[(&str, &Path)],
     busybox_bytes: Option<&[u8]>,
 ) -> Result<Vec<u8>> {
+    let validated_includes = validate_include_files(include_files)?;
+
+    let mut archive = Vec::new();
+
+    // Collect directory entries needed for shared libraries and includes.
+    let mut dirs = BTreeSet::new();
+
+    // `count` mirrors the moved `all_binaries.len()`: 1 (payload) + extras +
+    // include_files that are ELF (the set resolve_all_shared_libs walks).
+    let _s_resolve = tracing::debug_span!(
+        "resolve_all_libs",
+        count = 1 + extra_binaries.len() + include_files.iter().filter(|(_, p)| is_elf(p)).count()
+    )
+    .entered();
+    let shared_libs = resolve_all_shared_libs(payload, extra_binaries, include_files, &mut dirs)?;
+
+    // Busybox goes under bin/. wprof, when set, rides
+    // include_files (which registers its own parent dirs).
+    if busybox_bytes.is_some() {
+        dirs.insert("bin".to_string());
+    }
+    // Include files need their parent directories in the cpio archive.
+    // The component walk produces all ancestors (e.g. "include-files/sub/f"
+    // yields "include-files" and "include-files/sub").
+    for (archive_path, _, _) in &validated_includes {
+        register_parent_dirs(&mut dirs, archive_path);
+    }
+    // Extras with a path component (e.g. "bin/ktstr-jemalloc-probe")
+    // need their parent directory registered too, otherwise the
+    // kernel's cpio extractor sees the file before the directory
+    // entry exists and silently drops it. The `("scheduler",
+    // path)` case writes to archive root and has no parent to
+    // register, so `register_parent_dirs` no-ops on it.
+    for (name, _) in extra_binaries {
+        register_parent_dirs(&mut dirs, name);
+    }
+
+    drop(_s_resolve);
+
+    tracing::debug!(
+        shared_libs_count = shared_libs.len(),
+        dirs_count = dirs.len(),
+        dirs = ?dirs,
+        shared_libs_guests = ?shared_libs.iter().map(|(g, _)| g.as_str()).collect::<Vec<_>>(),
+        "pre-write archive contents"
+    );
+
+    write_archive_entries(
+        &mut archive,
+        &dirs,
+        busybox_bytes,
+        extra_binaries,
+        &validated_includes,
+        &shared_libs,
+    )?;
+
+    Ok(archive)
+}
+
+/// Validate `include_files` entries and capture each file's mode.
+///
+/// Rejects archive paths with `..` components or the `.ktstr_` sentinel
+/// prefix, stats each host path (following symlinks), and rejects
+/// non-regular files. The returned `(archive_path, host_path, mode)`
+/// triples reuse the stat result so the write loop avoids a second
+/// stat syscall per file.
+fn validate_include_files<'a>(
+    include_files: &'a [(&'a str, &'a Path)],
+) -> Result<Vec<(&'a str, &'a Path, u32)>> {
     // Validate include_files and collect metadata (reused in the write
     // loop to avoid a second stat syscall per file).
     let mut validated_includes: Vec<(&str, &Path, u32)> = Vec::with_capacity(include_files.len());
@@ -797,12 +866,25 @@ pub fn build_initramfs_base(
         }
         validated_includes.push((archive_path, host_path, meta.permissions().mode()));
     }
+    Ok(validated_includes)
+}
 
-    let mut archive = Vec::new();
-
-    // Collect directory entries needed for shared libraries and includes.
-    let mut dirs = BTreeSet::new();
-
+/// Resolve the shared-library closure for the init payload, extra
+/// binaries, and ELF include files.
+///
+/// Walks each binary's `DT_NEEDED` chain plus its `PT_INTERP` (and the
+/// interpreter's own deps for non-standard linkers), registering every
+/// resolved guest path's parent directories into `dirs`. Returns the
+/// sorted, deduplicated `(guest_path, host_path)` pairs. The
+/// `resolve_all_libs` span (and its dir-registration phase) is held
+/// entered by the caller; the per-binary `resolve_shared_libs` span is
+/// created here.
+fn resolve_all_shared_libs(
+    payload: &Path,
+    extra_binaries: &[(&str, &Path)],
+    include_files: &[(&str, &Path)],
+    dirs: &mut BTreeSet<String>,
+) -> Result<Vec<(String, PathBuf)>> {
     // Resolve shared library dependencies for init binary and extras.
     let mut shared_libs: Vec<(String, PathBuf)> = Vec::new();
     let mut all_binaries: Vec<&Path> = std::iter::once(payload)
@@ -818,7 +900,6 @@ pub fn build_initramfs_base(
         }
     }
 
-    let _s_resolve = tracing::debug_span!("resolve_all_libs", count = all_binaries.len()).entered();
     for path in &all_binaries {
         let _s_one =
             tracing::debug_span!("resolve_shared_libs", binary = %path.display()).entered();
@@ -863,7 +944,7 @@ pub fn build_initramfs_base(
                     .strip_prefix('/')
                     .unwrap_or(&canon_str)
                     .to_string();
-                register_parent_dirs(&mut dirs, &guest);
+                register_parent_dirs(dirs, &guest);
                 tracing::debug!(
                     canonical_guest = %guest,
                     canonical_host = %canonical.display(),
@@ -879,7 +960,7 @@ pub fn build_initramfs_base(
                         canonical_guest = %guest,
                         "packing interpreter original (non-canonical) path"
                     );
-                    register_parent_dirs(&mut dirs, &orig_guest);
+                    register_parent_dirs(dirs, &orig_guest);
                     shared_libs.push((orig_guest, canonical));
                 } else {
                     tracing::debug!("interpreter original path matches canonical, no alias needed");
@@ -895,7 +976,7 @@ pub fn build_initramfs_base(
                 // invalidates the base.
                 if let Ok(interp_result) = resolve_interpreter_deps(interp) {
                     for (g, h) in interp_result.found {
-                        register_parent_dirs(&mut dirs, &g);
+                        register_parent_dirs(dirs, &g);
                         shared_libs.push((g, h));
                     }
                 }
@@ -903,7 +984,7 @@ pub fn build_initramfs_base(
         }
 
         for (guest_path, host_path) in result.found {
-            register_parent_dirs(&mut dirs, &guest_path);
+            register_parent_dirs(dirs, &guest_path);
             shared_libs.push((guest_path, host_path));
         }
     }
@@ -916,42 +997,29 @@ pub fn build_initramfs_base(
         removed = pre_dedup_count - shared_libs.len(),
         "shared_libs dedup"
     );
+    Ok(shared_libs)
+}
 
-    // Busybox goes under bin/. wprof, when set, rides
-    // include_files (which registers its own parent dirs).
-    if busybox_bytes.is_some() {
-        dirs.insert("bin".to_string());
-    }
-    // Include files need their parent directories in the cpio archive.
-    // The component walk produces all ancestors (e.g. "include-files/sub/f"
-    // yields "include-files" and "include-files/sub").
-    for (archive_path, _, _) in &validated_includes {
-        register_parent_dirs(&mut dirs, archive_path);
-    }
-    // Extras with a path component (e.g. "bin/ktstr-jemalloc-probe")
-    // need their parent directory registered too, otherwise the
-    // kernel's cpio extractor sees the file before the directory
-    // entry exists and silently drops it. The `("scheduler",
-    // path)` case writes to archive root and has no parent to
-    // register, so `register_parent_dirs` no-ops on it.
-    for (name, _) in extra_binaries {
-        register_parent_dirs(&mut dirs, name);
-    }
-
-    drop(_s_resolve);
-
-    tracing::debug!(
-        shared_libs_count = shared_libs.len(),
-        dirs_count = dirs.len(),
-        dirs = ?dirs,
-        shared_libs_guests = ?shared_libs.iter().map(|(g, _)| g.as_str()).collect::<Vec<_>>(),
-        "pre-write archive contents"
-    );
-
+/// Write all cpio entries for the base archive in extractor-safe order:
+/// directories first, then busybox, extra binaries (stripped), include
+/// files (verbatim), and shared libraries.
+///
+/// Shared libraries are deduplicated by canonical host path: the first
+/// guest path for a host file is written as a regular file, later guest
+/// paths mapping to the same file become cpio symlinks. The
+/// `write_cpio` span brackets these writes.
+fn write_archive_entries(
+    archive: &mut Vec<u8>,
+    dirs: &BTreeSet<String>,
+    busybox_bytes: Option<&[u8]>,
+    extra_binaries: &[(&str, &Path)],
+    validated_includes: &[(&str, &Path, u32)],
+    shared_libs: &[(String, PathBuf)],
+) -> Result<()> {
     let _s_write = tracing::debug_span!("write_cpio").entered();
     // Directory entries
-    for dir in &dirs {
-        write_entry(&mut archive, dir, &[], 0o40755)?;
+    for dir in dirs {
+        write_entry(archive, dir, &[], 0o40755)?;
     }
 
     // Shell mode: embed busybox bytes provided by the caller. The
@@ -959,20 +1027,20 @@ pub fn build_initramfs_base(
     // `KTSTR_BUSYBOX_PATH` env var that cargo-ktstr sets at startup
     // (see [`crate::vmm::blobs::load_busybox_bytes`]).
     if let Some(busybox_bytes) = busybox_bytes {
-        write_entry(&mut archive, "bin/busybox", busybox_bytes, 0o100755)?;
+        write_entry(archive, "bin/busybox", busybox_bytes, 0o100755)?;
     }
 
     // Extra binaries (stripped to reduce initramfs size)
     for (name, path) in extra_binaries {
         let data = strip_debug(path)
             .with_context(|| format!("strip/read extra binary '{}': {}", name, path.display()))?;
-        write_entry(&mut archive, name, &data, 0o100755)?;
+        write_entry(archive, name, &data, 0o100755)?;
     }
 
     // Include files: copied verbatim, preserving original content and
     // debug symbols. No strip_debug — included files are user-provided
     // and may be non-ELF.
-    for (archive_path, host_path, mode) in &validated_includes {
+    for (archive_path, host_path, mode) in validated_includes {
         let data = std::fs::read(host_path).with_context(|| {
             format!(
                 "read include file '{}': {}",
@@ -980,7 +1048,7 @@ pub fn build_initramfs_base(
                 host_path.display()
             )
         })?;
-        write_entry(&mut archive, archive_path, &data, *mode)?;
+        write_entry(archive, archive_path, &data, *mode)?;
     }
 
     // Shared libraries — write each canonical host file once as a regular
@@ -990,17 +1058,17 @@ pub fn build_initramfs_base(
     {
         // canonical host path -> first guest_path written for this file
         let mut written_files: HashMap<PathBuf, String> = HashMap::new();
-        for (guest_path, host_path) in &shared_libs {
+        for (guest_path, host_path) in shared_libs {
             let canonical = std::fs::canonicalize(host_path).unwrap_or_else(|_| host_path.clone());
             if let Some(first_guest) = written_files.get(&canonical) {
                 // Already written — emit a symlink to the first guest path.
                 let target = format!("/{first_guest}");
-                write_symlink_entry(&mut archive, guest_path, &target)?;
+                write_symlink_entry(archive, guest_path, &target)?;
             } else {
                 let data = std::fs::read(host_path).with_context(|| {
                     format!("read shared lib '{}': {}", guest_path, host_path.display())
                 })?;
-                write_entry(&mut archive, guest_path, &data, 0o100755)?;
+                write_entry(archive, guest_path, &data, 0o100755)?;
                 written_files.insert(canonical, guest_path.clone());
             }
         }
@@ -1008,7 +1076,7 @@ pub fn build_initramfs_base(
 
     drop(_s_write);
 
-    Ok(archive)
+    Ok(())
 }
 
 /// Per-invocation inputs that turn a cached base archive into a
