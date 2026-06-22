@@ -278,17 +278,10 @@ fn metric_tags_renders_non_ext_class() {
     assert_eq!(metric_tags(m), "[non-ext] [SCHEDSTATS]",);
 }
 
-/// Exhaustive tag pin: every metric in CTPROF_METRICS
-/// gets its (sched_class, config_gates, is_dead) triple
-/// asserted against the locked matrix. Set-equality on the
-/// keys: every registry name must appear in the matrix
-/// table, and vice versa. Drift on either side fails the
-/// test before reaching the rendered output.
-#[test]
-fn registry_tag_matrix_is_pinned() {
-    // Locked matrix: (name → (sched_class, config_gates, is_dead)).
-    // Order matches CTPROF_METRICS for ease of audit.
-    let matrix: &[(&str, Option<&str>, &[&str], bool)] = &[
+/// Locked tag matrix: (name → (sched_class, config_gates, is_dead)).
+/// Order matches CTPROF_METRICS for ease of audit. Driven by
+/// [`registry_tag_matrix_is_pinned`].
+const LOCKED_TAG_MATRIX: &[(&str, Option<&str>, &[&str], bool)] = &[
         // structural: group population count
         ("thread_count", None, &[], false),
         // identity / structural
@@ -610,12 +603,21 @@ fn registry_tag_matrix_is_pinned() {
             &["CONFIG_TASKSTATS", "CONFIG_TASK_XACCT"],
             false,
         ),
-    ];
+];
+
+/// Exhaustive tag pin: every metric in CTPROF_METRICS
+/// gets its (sched_class, config_gates, is_dead) triple
+/// asserted against the locked matrix. Set-equality on the
+/// keys: every registry name must appear in the matrix
+/// table, and vice versa. Drift on either side fails the
+/// test before reaching the rendered output.
+#[test]
+fn registry_tag_matrix_is_pinned() {
     // Set-equality: registry keys vs matrix keys.
     let registry_names: std::collections::BTreeSet<&str> =
         CTPROF_METRICS.iter().map(|m| m.name).collect();
     let matrix_names: std::collections::BTreeSet<&str> =
-        matrix.iter().map(|(n, _, _, _)| *n).collect();
+        LOCKED_TAG_MATRIX.iter().map(|(n, _, _, _)| *n).collect();
     assert_eq!(
         registry_names, matrix_names,
         "registry vs matrix key mismatch — every metric must be \
@@ -623,7 +625,7 @@ fn registry_tag_matrix_is_pinned() {
          metrics that aren't registered",
     );
     // Per-entry pin: each tuple matches the registry exactly.
-    for (name, expected_class, expected_gates, expected_dead) in matrix {
+    for (name, expected_class, expected_gates, expected_dead) in LOCKED_TAG_MATRIX {
         let m = lookup_metric(name);
         assert_eq!(m.sched_class, *expected_class, "{name}: sched_class drift",);
         assert_eq!(
