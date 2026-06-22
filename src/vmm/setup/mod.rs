@@ -18,7 +18,10 @@ use vm_memory::{Bytes, GuestAddress, GuestMemory, GuestMemoryMmap};
 
 use super::KtstrVm;
 use super::initramfs_cache::{BaseKey, BaseRef, get_or_build_base, get_or_compress_base_shm};
-use super::memory_budget::{MemoryBudget, initramfs_min_memory_mib, read_kernel_init_size};
+use super::memory_budget::{
+    MemoryBudget, TmpfsFraction, initramfs_min_memory_mib, read_kernel_init_size,
+    read_kernel_version_major_minor,
+};
 use super::pi_mutex::PiMutex;
 use super::{disk_config, disk_template, host_topology, initramfs, virtio_blk, virtio_net};
 
@@ -823,6 +826,22 @@ impl KtstrVm {
         Ok(total_compressed as u32)
     }
 
+    /// Select the guest rootfs tmpfs fraction for the budget formula by
+    /// reading the kernel image's version and gating on mainline 6.18 or
+    /// newer (the floor that honors `initramfs_options=size=90%`).
+    ///
+    /// Mirrors [`Self::init_payload_coverage_reserve`]: a `&self`
+    /// accessor that derives a conservatively-defaulting value threaded
+    /// into [`MemoryBudget`] at every budget call site.
+    /// [`read_kernel_version_major_minor`] returns `None` on aarch64 (no
+    /// image version string) and on any x86_64 parse failure, so
+    /// [`TmpfsFraction::for_kernel_version`] yields the safe
+    /// [`TmpfsFraction::Half`] for every uncertain case — 90% is taken
+    /// only for a confirmed-honoring kernel.
+    fn tmpfs_fraction(&self) -> TmpfsFraction {
+        TmpfsFraction::for_kernel_version(read_kernel_version_major_minor(&self.kernel))
+    }
+
     /// Probe the `/init` payload for LLVM coverage instrumentation and,
     /// when instrumented, compute the extra resident memory the
     /// instrumented runtime needs.
@@ -950,6 +969,7 @@ impl KtstrVm {
             kernel_init_size,
             init_coverage_instrumented,
             instrumented_reserve_bytes,
+            tmpfs_fraction: self.tmpfs_fraction(),
         };
         let min_mib = initramfs_min_memory_mib(&budget);
         if memory_mib < min_mib {
@@ -1026,6 +1046,7 @@ impl KtstrVm {
             kernel_init_size,
             init_coverage_instrumented,
             instrumented_reserve_bytes,
+            tmpfs_fraction: self.tmpfs_fraction(),
         };
         let memory_mib = initramfs_min_memory_mib(&budget).max(self.memory_min_mib);
         tracing::debug!(
@@ -1613,6 +1634,7 @@ impl KtstrVm {
             kernel_init_size,
             init_coverage_instrumented,
             instrumented_reserve_bytes,
+            tmpfs_fraction: self.tmpfs_fraction(),
         };
         let min_mib = initramfs_min_memory_mib(&budget);
         if memory_mib < min_mib {
@@ -1687,6 +1709,7 @@ impl KtstrVm {
             kernel_init_size,
             init_coverage_instrumented,
             instrumented_reserve_bytes,
+            tmpfs_fraction: self.tmpfs_fraction(),
         };
         let memory_mib = initramfs_min_memory_mib(&budget).max(self.memory_min_mib);
         tracing::debug!(

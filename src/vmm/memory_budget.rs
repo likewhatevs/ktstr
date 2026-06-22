@@ -8,6 +8,73 @@
 use anyhow::{Context, Result};
 use std::path::Path;
 
+/// The fraction of `totalram_pages` the guest rootfs tmpfs is sized for
+/// during initramfs extraction.
+///
+/// `shmem_default_max_blocks` (`mm/shmem.c`) returns `totalram_pages() /
+/// 2`, so the rootfs tmpfs admits at most 50% of RAM by default. The
+/// `initramfs_options=size=90%` cmdline token (emitted unconditionally
+/// when `init_binary.is_some()`) raises that to 90% — but ONLY on
+/// kernels carrying mainline commit 278033a225e1 ("fs: Add
+/// 'initramfs_options'"), first tagged v6.18-rc1. On older kernels the
+/// token is silently ignored and the tmpfs stays at the 50% default.
+///
+/// The asymmetry is one-directional: sizing RAM for 50% when the kernel
+/// honors 90% wastes a little RAM (the tmpfs is bigger than we sized
+/// for — safe); sizing RAM for 90% when the kernel only gives 50% means
+/// extraction overruns the tmpfs and the guest panics. So [`Self::Half`]
+/// is the conservative default for ANY uncertainty, and
+/// [`Self::NinetyPercent`] is selected only when the kernel is
+/// POSITIVELY known to honor the token (mainline version >= 6.18).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TmpfsFraction {
+    /// 50% of `totalram_pages` — the `shmem_default_max_blocks` default
+    /// and the universally-safe floor.
+    Half,
+    /// 90% of `totalram_pages` — the ceiling `initramfs_options=size=90%`
+    /// raises the tmpfs to on honoring kernels (mainline 6.18 or newer).
+    /// Reclaims RAM proportional to the uncompressed payload — roughly a
+    /// third of the boot budget at the instrumented-payload shape (the
+    /// `ninety_percent_fraction_sizes_less_ram_than_half` test measures
+    /// the 3030 -> 1947 MiB drop).
+    NinetyPercent,
+}
+
+impl TmpfsFraction {
+    /// Numerator/denominator of the fraction, as a fixed-point pair the
+    /// budget formula multiplies through with integer saturating
+    /// arithmetic (no floats — the floor must round the same on every
+    /// host). `Half` -> 1/2, `NinetyPercent` -> 9/10.
+    fn ratio(self) -> (u64, u64) {
+        match self {
+            TmpfsFraction::Half => (1, 2),
+            TmpfsFraction::NinetyPercent => (9, 10),
+        }
+    }
+
+    /// Select the tmpfs fraction for a guest kernel whose mainline
+    /// `(major, minor)` version is `version`.
+    ///
+    /// [`Self::NinetyPercent`] iff the kernel is positively known to
+    /// honor `initramfs_options=size=90%` — mainline commit
+    /// 278033a225e1, first tagged v6.18-rc1, so `(major, minor) >= (6,
+    /// 18)`. `None` (version undeterminable — aarch64 `Image` carries no
+    /// version string, or the bzImage field is absent/unparsable) or any
+    /// version below 6.18 yields the conservative [`Self::Half`].
+    ///
+    /// Only mainline >= 6.18 is encoded; the per-stable-series backport
+    /// matrix (v5.10.246 / v6.6.113 / v6.12.54 / v6.17.4 etc.) is NOT —
+    /// recognizing those requires a per-series floor table verifiable
+    /// only against the stable trees (a follow-up), so those backported
+    /// kernels fall to the safe 50% (no reclaim, no panic).
+    pub(crate) fn for_kernel_version(version: Option<(u16, u16)>) -> Self {
+        match version {
+            Some((major, minor)) if (major, minor) >= (6, 18) => TmpfsFraction::NinetyPercent,
+            _ => TmpfsFraction::Half,
+        }
+    }
+}
+
 /// Parameters for computing minimum guest memory.
 pub(crate) struct MemoryBudget {
     /// Uncompressed initramfs size (base + suffix cpio) in bytes.
@@ -48,6 +115,11 @@ pub(crate) struct MemoryBudget {
     /// slack absorbs the second copy at current binary sizes; a much
     /// larger instrumented `/init` may want a peak-aware (2x) reserve.
     pub instrumented_reserve_bytes: u64,
+    /// Fraction of `totalram_pages` the guest rootfs tmpfs is sized for
+    /// during initramfs extraction; see [`TmpfsFraction`]. A larger
+    /// fraction sizes LESS total RAM for the same payload. Selected via
+    /// [`TmpfsFraction::for_kernel_version`].
+    pub tmpfs_fraction: TmpfsFraction,
 }
 
 /// Read the kernel's declared memory footprint from the image file.
@@ -103,6 +175,100 @@ pub(crate) fn read_kernel_init_size(kernel_path: &Path) -> Result<u64> {
     }
 }
 
+/// Read the guest kernel's mainline `(major, minor)` version from the
+/// kernel image, for the `initramfs_options=size=90%` honoring gate (see
+/// [`TmpfsFraction::for_kernel_version`]).
+///
+/// x86_64 bzImage: the setup_header `kernel_version` field (a `u16` at
+/// file offset 0x20E) is "a pointer to a NUL-terminated version string,
+/// less 0x200" (`Documentation/arch/x86/boot.rst`). When nonzero, the
+/// string lives at file offset `0x200 + value` and begins with
+/// `UTS_RELEASE` (`arch/x86/boot/version.c`), i.e.
+/// `MAJOR.MINOR.PATCH[-extra]` (e.g. `6.18.0-rc1`). This parses the
+/// leading `MAJOR.MINOR`.
+///
+/// aarch64 Image: the arm64 image header carries no version string —
+/// returns `None`, so aarch64 always falls to the safe 50% fraction
+/// (richer aarch64 reclaim is a follow-up).
+///
+/// Returns `None` (-> conservative 50% sizing) on ANY uncertainty:
+/// unreadable image, `kernel_version` field zero (pre-2.00 protocol or
+/// stripped), the string offset out of range, non-UTF-8, or a malformed
+/// leading `MAJOR.MINOR`. NEVER errors — a missing version is a normal,
+/// safe outcome, not a boot-blocking failure.
+pub(crate) fn read_kernel_version_major_minor(kernel_path: &Path) -> Option<(u16, u16)> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut f = std::fs::File::open(kernel_path).ok()?;
+        // Validate this is a real bzImage before trusting the version
+        // field: the setup_header "HdrS" magic is a 4-byte field at file
+        // offset 0x202 (boot protocol >= 2.00; the same check
+        // `linux_loader::BzImage::load` makes). Without it, a
+        // non-bzImage / pre-2.00 / corrupt image's arbitrary bytes at
+        // 0x20E could parse as a honoring version and select the 90%
+        // tmpfs fraction on a kernel that only gives 50% — the forbidden
+        // panic direction. On any mismatch, return None (=> the safe
+        // Half), matching the hostile-input doctrine: 90% is taken only
+        // for a positively-confirmed bzImage.
+        f.seek(SeekFrom::Start(0x202)).ok()?;
+        let mut magic = [0u8; 4];
+        f.read_exact(&mut magic).ok()?;
+        if &magic != b"HdrS" {
+            return None;
+        }
+        // setup_header `kernel_version` is a u16 at file offset 0x20E.
+        f.seek(SeekFrom::Start(0x20E)).ok()?;
+        let mut vbuf = [0u8; 2];
+        f.read_exact(&mut vbuf).ok()?;
+        let ver_ptr = u16::from_le_bytes(vbuf);
+        // Zero => no version string (boot protocol < 2.00, or absent).
+        if ver_ptr == 0 {
+            return None;
+        }
+        // String is at file offset 0x200 + ver_ptr, NUL-terminated. Read
+        // a bounded 256-byte window so a corrupt pointer can't drive an
+        // unbounded read.
+        f.seek(SeekFrom::Start(0x200u64 + ver_ptr as u64)).ok()?;
+        let mut window = [0u8; 256];
+        let n = f.read(&mut window).ok()?;
+        let bytes = &window[..n];
+        // The string is `RELEASE (compile-by@host) ...`; a NUL or space
+        // bounds the RELEASE token.
+        let end = bytes
+            .iter()
+            .position(|&b| b == 0 || b == b' ')
+            .unwrap_or(bytes.len());
+        let release = std::str::from_utf8(&bytes[..end]).ok()?;
+        parse_major_minor(release)
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // arm64 Image header carries no version string.
+        let _ = kernel_path;
+        None
+    }
+}
+
+/// Parse the leading `MAJOR.MINOR` from a kernel release string such as
+/// `6.18.0-rc1` or `7.1.0-rc7-gc80ba8d32ec3`. Returns `None` if either
+/// of the first two dot-separated components is absent or non-numeric.
+/// Free fn so the host unit tests pin the parse against real
+/// release-string shapes without constructing a bzImage.
+fn parse_major_minor(release: &str) -> Option<(u16, u16)> {
+    let mut parts = release.split('.');
+    let major: u16 = parts.next()?.parse().ok()?;
+    // Minor may carry a trailing `-rcN` only when there is no PATCH
+    // component (e.g. `6.18-rc1`); strip any non-digit suffix.
+    let minor_raw = parts.next()?;
+    let minor_digits: String = minor_raw.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if minor_digits.is_empty() {
+        return None;
+    }
+    let minor: u16 = minor_digits.parse().ok()?;
+    Some((major, minor))
+}
+
 /// Minimum guest memory (in MiB) needed to boot, extract the initramfs,
 /// and run the test workload.
 ///
@@ -153,29 +319,33 @@ pub(crate) fn read_kernel_init_size(kernel_path: &Path) -> Result<u64> {
 /// `totalram_pages() / 2` (`mm/shmem.c:146`).
 ///
 /// `initramfs_options=size=90%` on the cmdline is consumed by
-/// `init_mount_tree()` (`fs/namespace.c`) when mounting the rootfs
-/// tmpfs — but only on kernels that have commit 1c543509044d
-/// ("fs: Add 'initramfs_options' to set initramfs mount options"),
-/// which landed in v5.4.301 / v5.10.246 / v6.6.113 / v6.12.54 /
-/// v6.17.4. Stable series 6.13.x, 6.14.x, 6.15.x, 6.16.x never
-/// got the backport — on those kernels the parameter is silently
-/// ignored ("Unknown kernel command line parameters …, will be
-/// passed to user space") and the tmpfs uses its 50% default.
-/// Initramfs unpacking then fails with `write error` partway
-/// through if the uncompressed payload exceeds 50% of totalram,
-/// leaving `/init` packed but its dynamic-linker dep missing →
-/// `Failed to execute /init (error -2)` → kernel panic.
+/// `init_mount_tree()` (`fs/namespace.c`, via `initramfs_options_setup`)
+/// when mounting the rootfs tmpfs — but only on kernels with mainline
+/// commit 278033a225e1 ("fs: Add 'initramfs_options' to set initramfs
+/// mount options"), first tagged v6.18-rc1. On kernels older than 6.18
+/// the parameter is silently ignored ("Unknown kernel command line
+/// parameters …, will be passed to user space") and the tmpfs uses its
+/// 50% default. (The commit was later backported to several stable
+/// series — v5.10.246, v6.6.113, v6.12.54, v6.17.4, etc. — but ktstr
+/// gates the 90% bump on mainline >= 6.18 ONLY; see
+/// `TmpfsFraction::for_kernel_version`.) Initramfs unpacking then fails
+/// with `write error` partway through if the uncompressed payload
+/// exceeds the live tmpfs limit, leaving `/init` packed but its
+/// dynamic-linker dep missing → `Failed to execute /init (error -2)`
+/// → kernel panic.
 ///
-/// To work on every kernel ktstr supports, the formula below
-/// targets the 50% default rather than the 90% bump. Modern
-/// kernels that honor the hint still get the headroom (90% > 50%
-/// means the tmpfs is bigger than we sized for); older kernels
-/// pass too. The cost is ~40% more VM memory per shell-mode VM
-/// vs the 90% formula — measurable but worth the cross-kernel
-/// portability.
+/// The formula below sizes for `budget.tmpfs_fraction`: 90% only when
+/// the guest kernel is positively known to honor the hint (mainline
+/// 6.18 or newer, via `TmpfsFraction::for_kernel_version`), else the 50%
+/// default. Sizing for 50% on a kernel that honors 90% is safe — the
+/// tmpfs is bigger than we sized for; sizing for 90% on a kernel that
+/// only gives 50% panics the guest mid-extraction, so the 90% path is
+/// taken ONLY on a confirmed-honoring version (every uncertainty —
+/// unknown version, aarch64, < 6.18 — falls to the safe 50%).
 ///
-/// Note: `rootflags=size=90%` would set `root_mount_data`
-/// (`init/do_mounts.c:109`), consumed only by `do_mount_root()` via
+/// Note: `rootflags=size=90%` would set `root_mount_data` (assigned by
+/// `root_data_setup` via `__setup("rootflags=", ...)` in
+/// `init/do_mounts.c`), consumed only by `do_mount_root()` via
 /// `prepare_namespace()`. With `rdinit=`, `kernel_init_freeable`
 /// (`init/main.c`) skips `prepare_namespace()` when `init_eaccess`
 /// succeeds, so `rootflags=` is never applied to the rootfs.
@@ -231,22 +401,27 @@ pub(crate) fn initramfs_min_memory_mib(budget: &MemoryBudget) -> u32 {
     let compressed_mib = ceil_mib(budget.compressed_initrd_bytes);
     let uncompressed_mib = ceil_mib(budget.uncompressed_initramfs_bytes);
 
-    // Boot requirement: the rootfs tmpfs default block limit is 50%
-    // of totalram_pages. `initramfs_options=size=90%` on the cmdline
-    // raises it to 90% on kernels that have the commit (see fn-level
-    // doc) — but 6.13.x / 6.14.x / 6.15.x / 6.16.x silently ignore
-    // the option, so we size for the universal 50% floor.
+    // Boot requirement: the rootfs tmpfs block limit is a fraction F of
+    // totalram_pages. F = 50% (`shmem_default_max_blocks`) on every
+    // kernel that does not positively honor `initramfs_options=size=90%`;
+    // F = 90% only on mainline >= 6.18 (see `TmpfsFraction` /
+    // `TmpfsFraction::for_kernel_version`). A larger F sizes LESS RAM.
     //
-    // Constraint: totalram_pages / 2 >= uncompressed_pages.
+    // Constraint (F = frac_num/frac_den): F * totalram_pages >= uncompressed_pages.
     // totalram_pages = (P - reserved) / PAGE_SIZE.
-    // reserved = init_size + compressed + struct_page(P).
-    // struct_page(P) = P/64.
+    // reserved = init_size + compressed + struct_page(P) = init_size + compressed + P/64.
     //
     // Solving:
-    //   (P - init_size - compressed - P/64) / 2 >= uncompressed
-    //   P * 63/64 >= 2 * uncompressed + init_size + compressed
-    //   P >= (2 * uncompressed + init_size + compressed) * 64/63
-    let uncompressed_scaled = uncompressed_mib.saturating_mul(2);
+    //   (frac_num/frac_den) * (P - init_size - compressed - P/64) >= uncompressed
+    //   P * 63/64 >= (frac_den/frac_num) * uncompressed + init_size + compressed
+    //   P >= ((frac_den/frac_num)*uncompressed + init_size + compressed) * 64/63
+    // At F=1/2 this is the prior `2 * uncompressed`; at F=9/10 it scales
+    // uncompressed by 10/9. div_ceil never rounds DOWN (rounding down
+    // would under-size RAM and risk a mid-boot tmpfs overrun).
+    let (frac_num, frac_den) = budget.tmpfs_fraction.ratio();
+    let uncompressed_scaled = uncompressed_mib
+        .saturating_mul(frac_den)
+        .div_ceil(frac_num);
     let content_mib = uncompressed_scaled
         .saturating_add(init_size_mib)
         .saturating_add(compressed_mib);
@@ -307,6 +482,7 @@ mod tests {
             kernel_init_size: 0,
             init_coverage_instrumented: false,
             instrumented_reserve_bytes: 0,
+            tmpfs_fraction: TmpfsFraction::Half,
         };
         assert_eq!(initramfs_min_memory_mib(&budget), WORKLOAD_MIB as u32);
     }
@@ -329,6 +505,7 @@ mod tests {
             kernel_init_size: 5 * (1 << 20),
             init_coverage_instrumented: false,
             instrumented_reserve_bytes: 0,
+            tmpfs_fraction: TmpfsFraction::Half,
         };
         assert_eq!(initramfs_min_memory_mib(&budget), 284);
     }
@@ -350,6 +527,7 @@ mod tests {
             kernel_init_size: 0,
             init_coverage_instrumented: false,
             instrumented_reserve_bytes: 0,
+            tmpfs_fraction: TmpfsFraction::Half,
         };
         assert_eq!(initramfs_min_memory_mib(&budget), 259);
     }
@@ -371,6 +549,7 @@ mod tests {
             kernel_init_size: 30 * (1 << 20),
             init_coverage_instrumented: false,
             instrumented_reserve_bytes: 0,
+            tmpfs_fraction: TmpfsFraction::Half,
         };
         assert_eq!(initramfs_min_memory_mib(&budget), 744);
     }
@@ -404,6 +583,7 @@ mod tests {
             kernel_init_size: 30 * (1 << 20),
             init_coverage_instrumented: false,
             instrumented_reserve_bytes: 3500 * (1 << 20),
+            tmpfs_fraction: TmpfsFraction::Half,
         };
         let instrumented = MemoryBudget {
             init_coverage_instrumented: true,
@@ -434,6 +614,83 @@ mod tests {
             "instrumented floor must clear the old memory_deferred_min(4096) \
              workaround (got {instrumented_floor})"
         );
+    }
+
+    /// `TmpfsFraction::for_kernel_version` gates the 90% bump on mainline
+    /// 6.18 or newer (commit 278033a225e1, first tagged v6.18-rc1). Every
+    /// uncertain or older case falls to the safe 50%.
+    #[test]
+    fn tmpfs_fraction_gates_on_6_18() {
+        assert_eq!(
+            TmpfsFraction::for_kernel_version(Some((6, 18))),
+            TmpfsFraction::NinetyPercent
+        );
+        assert_eq!(
+            TmpfsFraction::for_kernel_version(Some((6, 19))),
+            TmpfsFraction::NinetyPercent
+        );
+        assert_eq!(
+            TmpfsFraction::for_kernel_version(Some((7, 0))),
+            TmpfsFraction::NinetyPercent
+        );
+        assert_eq!(
+            TmpfsFraction::for_kernel_version(Some((6, 17))),
+            TmpfsFraction::Half
+        );
+        assert_eq!(
+            TmpfsFraction::for_kernel_version(Some((6, 12))),
+            TmpfsFraction::Half
+        );
+        assert_eq!(
+            TmpfsFraction::for_kernel_version(Some((5, 10))),
+            TmpfsFraction::Half
+        );
+        assert_eq!(TmpfsFraction::for_kernel_version(None), TmpfsFraction::Half);
+    }
+
+    /// `parse_major_minor` extracts the leading MAJOR.MINOR from real
+    /// kernel release-string shapes; malformed inputs yield `None`.
+    #[test]
+    fn parse_major_minor_shapes() {
+        assert_eq!(parse_major_minor("6.18.0-rc1"), Some((6, 18)));
+        assert_eq!(parse_major_minor("7.1.0-rc7-gc80ba8d32ec3"), Some((7, 1)));
+        assert_eq!(parse_major_minor("6.12.54"), Some((6, 12)));
+        assert_eq!(parse_major_minor("6.18-rc1"), Some((6, 18)));
+        assert_eq!(parse_major_minor(""), None);
+        assert_eq!(parse_major_minor("garbage"), None);
+        assert_eq!(parse_major_minor("6"), None);
+        assert_eq!(parse_major_minor("6."), None);
+        assert_eq!(parse_major_minor("x.18"), None);
+    }
+
+    /// At the SAME payload, the 90% fraction sizes strictly LESS total
+    /// RAM than the 50% fraction — the entire point of the reclaim. A
+    /// change inverting the constraint (sizing MORE RAM for 90%) would
+    /// silently lose the reclaim AND risk under-sizing.
+    #[test]
+    fn ninety_percent_fraction_sizes_less_ram_than_half() {
+        let make = |frac: TmpfsFraction| MemoryBudget {
+            uncompressed_initramfs_bytes: 1200 * (1 << 20),
+            compressed_initrd_bytes: 300 * (1 << 20),
+            kernel_init_size: 30 * (1 << 20),
+            init_coverage_instrumented: false,
+            instrumented_reserve_bytes: 0,
+            tmpfs_fraction: frac,
+        };
+        let half = initramfs_min_memory_mib(&make(TmpfsFraction::Half));
+        let ninety = initramfs_min_memory_mib(&make(TmpfsFraction::NinetyPercent));
+        assert!(
+            ninety < half,
+            "90% tmpfs fraction must size less RAM than 50% \
+             (ninety={ninety}MiB, half={half}MiB)"
+        );
+        // half: uncompressed_scaled = 1200*2 = 2400; content = 2730;
+        //   boot = ceil(2730*64/63) = 2774; total = 2774 + 256 = 3030.
+        assert_eq!(half, 3030, "50% floor: 2774 boot + 256 workload");
+        // ninety: uncompressed_scaled = ceil(1200*10/9) = 1334;
+        //   content = 1664; boot = ceil(1664*64/63) = 1691;
+        //   total = 1691 + 256 = 1947.
+        assert_eq!(ninety, 1947, "90% floor: 1691 boot + 256 workload");
     }
 
     /// `read_kernel_init_size` on x86_64 reads 4 little-endian bytes
@@ -532,5 +789,57 @@ mod tests {
 
         let result = read_kernel_init_size(f.path());
         assert!(result.is_err(), "truncated file must fail; got: {result:?}",);
+    }
+
+    /// `read_kernel_version_major_minor` on x86_64 walks the bzImage
+    /// setup_header: the "HdrS" magic at 0x202, the kernel_version u16
+    /// at 0x20E, and the version string at 0x200 + ptr. Pins the
+    /// offset-chase AND the HdrS-magic gate (a non-bzImage returns None
+    /// — the safe-50% direction, the panic-direction guard).
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn read_kernel_version_x86_64_offset_chase_and_magic_gate() {
+        use std::io::{Seek, SeekFrom, Write};
+
+        let ver_ptr: u16 = 0x0100; // string at file offset 0x200 + 0x100 = 0x300
+        let string_off = 0x200u64 + ver_ptr as u64;
+
+        let write_image = |magic: &[u8; 4]| {
+            let mut f = tempfile::NamedTempFile::new().expect("tempfile");
+            // Pad past the version-string region.
+            f.write_all(&vec![0u8; (string_off as usize) + 64])
+                .expect("pad");
+            // setup_header "HdrS" magic at 0x202.
+            f.seek(SeekFrom::Start(0x202)).expect("seek magic");
+            f.write_all(magic).expect("write magic");
+            // kernel_version pointer at 0x20E.
+            f.seek(SeekFrom::Start(0x20E)).expect("seek ver_ptr");
+            f.write_all(&ver_ptr.to_le_bytes()).expect("write ver_ptr");
+            // Version string at 0x200 + ptr: "RELEASE (builder@host)" + NUL,
+            // as the kernel writes it (a space bounds the RELEASE token).
+            f.seek(SeekFrom::Start(string_off)).expect("seek string");
+            f.write_all(b"6.18.0-rc1 (builder@host)\0")
+                .expect("write string");
+            f.flush().expect("flush");
+            f
+        };
+
+        // Valid bzImage: HdrS magic present -> the version-chase parses 6.18.
+        let good = write_image(b"HdrS");
+        assert_eq!(
+            read_kernel_version_major_minor(good.path()),
+            Some((6, 18)),
+            "valid bzImage offset-chase must parse 6.18",
+        );
+
+        // Wrong HdrS magic (not a bzImage / corrupt) -> None, even though
+        // the 0x20E/0x300 bytes would parse as 6.18. The panic-direction
+        // guard: an unvalidated image must NOT select the 90% fraction.
+        let bad = write_image(b"XXXX");
+        assert_eq!(
+            read_kernel_version_major_minor(bad.path()),
+            None,
+            "wrong HdrS magic must return None (the safe-50% direction)",
+        );
     }
 }
