@@ -117,7 +117,6 @@ const DEFAULT_FN_MAX_LINES: usize = 200;
 /// the guard's panic template emits it on every suggested entry.
 const EXCEPTIONS: &[(&str, &str, usize)] = &[
     ("bin/cargo_ktstr/kernel/mod.rs", "resolve_kernel_set", 210), // queued: decompose
-    ("bin/cargo_ktstr/stats.rs", "run_stats", 226),               // queued: decompose
     ("bin/jemalloc_alloc_worker.rs", "main", 206),                // queued: decompose
     (
         "cache/cache_dir_tests.rs",
