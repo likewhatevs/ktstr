@@ -1974,6 +1974,7 @@ mod tests {
         );
     }
 
+    mod btf_gated;
     mod dispatch_arms;
     mod task_field;
 }

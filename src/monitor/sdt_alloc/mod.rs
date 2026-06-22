@@ -500,7 +500,7 @@ mod tests {
     // The tests below build minimal synthetic BTF blobs (mirroring
     // the per-test-module pattern in
     // `cast_analysis::tests::build_btf` and
-    // `btf_render::tests::cast_build_btf` — pared down here to only
+    // `test_support::btf_blob::cast_build_btf` — pared down here to only
     // the kinds `from_btf` consults: BTF_KIND_INT, BTF_KIND_STRUCT,
     // BTF_KIND_FWD) and parse them via `Btf::from_bytes`. Synthetic
     // BTF makes the four error paths reachable deterministically

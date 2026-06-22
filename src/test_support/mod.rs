@@ -74,6 +74,8 @@ pub use wprof::{PERFETTO_TRACE_PACKETS_TAG, WPROF_PB_MIN_BYTES, assert_wprof_pb_
 mod sidecar;
 pub(crate) mod staged;
 #[cfg(test)]
+pub(crate) mod btf_blob;
+#[cfg(test)]
 pub(crate) mod test_helpers;
 mod timefmt;
 mod topo;
