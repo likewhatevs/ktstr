@@ -1582,8 +1582,9 @@ fn psi_resources() -> [PsiAccessor; 4] {
 }
 
 /// Render a centi-percent PSI average as `N.NN%`. The kernel
-/// emits `LOAD_INT.LOAD_FRAC` at `kernel/sched/psi.c:1284` with
-/// 2-decimal-digit precision — preserve that on display.
+/// emits `LOAD_INT.LOAD_FRAC` from the `psi_show` seq_printf in
+/// `kernel/sched/psi.c` with 2-decimal-digit precision — preserve
+/// that on display.
 fn format_psi_avg(centi_percent: u16) -> String {
     let int = centi_percent / 100;
     let frac = centi_percent % 100;
@@ -1629,8 +1630,8 @@ mod psi_show_tests {
         assert_eq!(format_psi_avg(50), "0.50%");
         assert_eq!(format_psi_avg(1859), "18.59%");
         assert_eq!(format_psi_avg(10000), "100.00%");
-        // Kernel EWMA rounding ceiling per
-        // include/linux/sched/loadavg.h:35; render the boundary
+        // Kernel EWMA rounding ceiling from `calc_load` in
+        // include/linux/sched/loadavg.h; render the boundary
         // verbatim rather than clamping.
         assert_eq!(format_psi_avg(10099), "100.99%");
     }
@@ -3022,7 +3023,7 @@ mod tests {
     /// `## Cgroup limits / knobs` sub-table when at least one
     /// bucketed cgroup exposes a cpu.max / weight / memory.max /
     /// pids value. Pins the `stats.values().any(...)` section gate
-    /// (line 1178) and each cell's formatter routing:
+    /// and each cell's formatter routing:
     /// `format_cpu_max` for the cpu.max pair, `format_scaled_u64`
     /// for the unitless weight / pids.current, `format_optional_limit`
     /// for memory.max (`Some` → scaled) and for memory.high /
@@ -3107,9 +3108,9 @@ mod tests {
 
     /// `write_show` under `GroupBy::Cgroup` emits the
     /// `## memory.stat` long-table and suppresses zero-valued
-    /// rows. Pins the section gate (line 1269,
-    /// `any(|v| *v != 0)`) and the per-row
-    /// `if *stat_value == 0 { continue; }` skip (line 1280): a
+    /// rows. Pins the section gate
+    /// (`any(|v| *v != 0)`) and the per-row
+    /// `if *stat_value == 0 { continue; }` skip: a
     /// non-zero `anon` key renders one row (`format_scaled_u64`
     /// steps `4096` up to `4.096K`), while a zero `file` key is
     /// suppressed entirely.
@@ -3151,15 +3152,15 @@ mod tests {
         );
         assert!(
             !out.contains("file"),
-            "zero-valued `file` key must be suppressed by the line-1280 \
+            "zero-valued `file` key must be suppressed by the if *stat_value == 0 \
              continue:\n{out}",
         );
     }
 
     /// `write_show` under `GroupBy::Cgroup` emits the
     /// `## memory.events` long-table and suppresses zero-count
-    /// events. Pins the section gate (line 1300) and the per-row
-    /// `if *event_value == 0 { continue; }` skip (line 1311): a
+    /// events. Pins the section gate and the per-row
+    /// `if *event_value == 0 { continue; }` skip: a
     /// non-zero `oom_kill` event renders one row (`3` below the
     /// 1e3 ladder step → bare integer), while a zero `low` event
     /// is suppressed.
@@ -3201,15 +3202,15 @@ mod tests {
         );
         assert!(
             !out.contains("low"),
-            "zero-count `low` event must be suppressed by the line-1311 \
+            "zero-count `low` event must be suppressed by the if *event_value == 0 \
              continue:\n{out}",
         );
     }
 
     /// `write_show` under `GroupBy::Cgroup` emits per-cgroup
     /// `## Pressure / <resource>` sub-tables and skips resources
-    /// with no data. Pins the section gate (line 1340), the
-    /// per-resource `if !any_data { continue; }` skip (line 1346),
+    /// with no data. Pins the section gate, the
+    /// per-resource `if !any_data { continue; }` skip,
     /// and the `some`/`full` row rendering via `format_psi_avg`
     /// (centi-percent → `N.NN%`) + `format_scaled_u64(Us)`. Only
     /// `cpu.some` is populated, so the `cpu` sub-table renders
@@ -3263,22 +3264,22 @@ mod tests {
         );
         assert!(
             !out.contains("## Pressure / memory"),
-            "all-zero memory PSI must be skipped by the line-1346 \
-             any_data continue:\n{out}",
+            "all-zero memory PSI must be skipped by the if !any_data \
+             continue:\n{out}",
         );
         assert!(
             !out.contains("## Pressure / io"),
-            "all-zero io PSI must be skipped by the line-1346 \
-             any_data continue:\n{out}",
+            "all-zero io PSI must be skipped by the if !any_data \
+             continue:\n{out}",
         );
     }
 
     /// `write_show` emits host-level `## Host pressure / <resource>`
     /// sub-tables (group-by-independent) and skips resources with
-    /// no data. Pins the section gate (line 1388,
-    /// `host_psi_has_data`), the per-resource
-    /// `if !psi_resource_has_data(&r) { continue; }` skip
-    /// (line 1393), and the `some`/`full` row render. Only
+    /// no data. Pins the section gate
+    /// (`host_psi_has_data`), the per-resource
+    /// `if !psi_resource_has_data(&r) { continue; }` skip,
+    /// and the `some`/`full` row render. Only
     /// `memory.full` is populated, so the `memory` sub-table
     /// renders while `cpu` (all-zero) is skipped. The host PSI
     /// header is `row | avg10 | avg60 | avg300 | total` with no
@@ -3329,7 +3330,7 @@ mod tests {
         );
         assert!(
             !out.contains("## Host pressure / cpu"),
-            "all-zero host cpu PSI must be skipped by the line-1393 \
+            "all-zero host cpu PSI must be skipped by the \
              psi_resource_has_data continue:\n{out}",
         );
         // The host-pressure header omits the `cgroup` column the
@@ -3348,8 +3349,8 @@ mod tests {
 
     /// `write_show` emits the `## sched_ext` table when the
     /// snapshot carries `sched_ext = Some(..)`. Pins the section
-    /// gate (line 1513), the non-empty-state branch of the
-    /// `state_cell` ternary (line 1524 — `state="enabled"` renders
+    /// gate, the non-empty-state branch of the
+    /// `state_cell` ternary (`state="enabled"` renders
     /// verbatim, NOT the `-` sentinel), and the five counter rows
     /// rendered via `format_scaled_u64(Unitless)`
     /// (`enable_seq=1234` steps up to `1.234K`; `switch_all=1`
@@ -3428,8 +3429,8 @@ mod tests {
     /// restricts output to the named sections. Pins the
     /// restrict-to-named-entries branch of
     /// `DisplayOptions::is_section_enabled`: `--sections derived`
-    /// suppresses the `## Primary metrics` outer gate (line 972 —
-    /// neither Primary nor TaskstatsDelay enabled) while still
+    /// suppresses the `## Primary metrics` outer gate (neither
+    /// Primary nor TaskstatsDelay enabled) while still
     /// emitting `## Derived metrics`; the converse
     /// `--sections primary` does the inverse. Every existing
     /// write_show test passes `&[]` (empty = all-on), so this
@@ -3500,13 +3501,13 @@ mod tests {
         );
     }
 
-    /// `run_show` parses `--sort-by` BEFORE loading the snapshot
-    /// (lines 769-797): an invalid spec must surface its parse
+    /// `run_show` parses `--sort-by` BEFORE loading the snapshot:
+    /// an invalid spec must surface its parse
     /// error even when the snapshot path does not exist, proving
     /// the parse precedes the load. Pins the fail-fast ordering
     /// contract — the flattened error chain carries the
-    /// `parse --sort-by` context label (line 770) and NOT the
-    /// `load snapshot` label (line 797). No existing test drives
+    /// `parse --sort-by` context label and NOT the
+    /// `load snapshot` label. No existing test drives
     /// `run_show`; the parse guards are otherwise uncovered.
     #[test]
     fn run_show_fails_fast_on_invalid_sort_by_before_snapshot_load() {

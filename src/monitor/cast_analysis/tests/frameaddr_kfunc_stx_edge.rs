@@ -141,7 +141,7 @@ fn map_update_with_r3_add_k(spill_off: i16, add_k_imm: i32) -> (Vec<BpfInsn>, Ve
     let mov_r3 = mov_x(3, 10);
     // r3 += add_k_imm (ALU64 | ADD | K). src field unused; imm
     // carries the constant. This is the FrameAddr ADD-K arm.
-    let r3_add_k = mk_insn(BPF_CLASS_ALU64 | (bs::BPF_ADD as u8), 3, 0, 0, add_k_imm);
+    let r3_add_k = mk_insn(BPF_CLASS_ALU64 | BPF_OP_ADD, 3, 0, 0, add_k_imm);
     let call_update = mk_insn(BPF_CLASS_JMP | BPF_OP_CALL, 0, 0, 0, BPF_FUNC_MAP_UPDATE_ELEM);
     let insns = vec![
         pseudo_call,
@@ -270,7 +270,7 @@ fn step_alu64_add_k_on_non_frameaddr_drops_dst() {
     let btf = Btf::from_bytes(&blob).unwrap();
     // ALU64 | ADD | K r2, imm=8 — r2 is LoadedU64Field (not
     // FrameAddr), so the dst is dropped to Unknown.
-    let add_k = mk_insn(BPF_CLASS_ALU64 | (bs::BPF_ADD as u8), 2, 0, 0, 8);
+    let add_k = mk_insn(BPF_CLASS_ALU64 | BPF_OP_ADD, 2, 0, 0, 8);
     let insns = vec![
         ldx(BPF_SIZE_DW, 2, 1, 8),
         addr_space_cast(2, 2, 1),

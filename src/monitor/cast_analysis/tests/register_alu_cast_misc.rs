@@ -286,7 +286,7 @@ fn alu64_add_x_destroys_typed_pointer() {
     // ALU64 ADD X: code = BPF_CLASS_ALU64 | BPF_ADD | BPF_SRC_X.
     // BPF_ADD = 0x00, so code = 0x07 | 0x00 | 0x08 = 0x0f.
     let add_x = mk_insn(
-        BPF_CLASS_ALU64 | (bs::BPF_ADD as u8) | BPF_SRC_X,
+        BPF_CLASS_ALU64 | BPF_OP_ADD | BPF_SRC_X,
         1,
         3,
         0,
@@ -408,7 +408,7 @@ fn alu64_add_k_destroys_typed_pointer() {
     let btf = Btf::from_bytes(&blob).unwrap();
     // ALU64 ADD K: BPF_SRC_K is 0, so source field is unused.
     // imm carries the constant.
-    let add_k = mk_insn(BPF_CLASS_ALU64 | (bs::BPF_ADD as u8), 1, 0, 0, 8);
+    let add_k = mk_insn(BPF_CLASS_ALU64 | BPF_OP_ADD, 1, 0, 0, 8);
     let insns = vec![add_k, stx(BPF_SIZE_DW, 6, 1, slot_off as i16), exit()];
     let map = analyze_casts(
         &insns,

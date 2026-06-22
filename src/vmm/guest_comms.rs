@@ -826,7 +826,6 @@ pub fn send_stderr_chunk(buf: &[u8]) -> bool {
 ///
 /// Required: caller chunks at sub-cap boundaries; same constraint
 /// as [`send_stdout_chunk`].
-#[allow(dead_code)]
 pub fn send_sched_log(buf: &[u8]) {
     write_msg(MsgType::SchedLog.wire_value(), buf);
 }
@@ -869,7 +868,6 @@ pub fn send_exec_exit(code: i32) {
 /// Frames with [`MsgType::Dmesg`]. Sent on the
 /// initramfs-extraction failure path so the host sees the kernel
 /// OOM messages without scraping COM2.
-#[allow(dead_code)]
 pub fn send_dmesg(buf: &[u8]) {
     write_msg(MsgType::Dmesg.wire_value(), buf);
 }

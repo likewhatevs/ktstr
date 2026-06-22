@@ -1398,9 +1398,9 @@ fn helper_map_update_then_lookup_propagates_arena_through_map_value() {
     // R2 += -24 (ALU64 ADD K). Encoded as
     // `BPF_CLASS_ALU64 | BPF_ADD | BPF_SRC_K` per linux uapi
     // `bpf.h`; src field is unused, imm carries the constant.
-    let r2_minus_24 = mk_insn(BPF_CLASS_ALU64 | (bs::BPF_ADD as u8), 2, 0, 0, -24);
+    let r2_minus_24 = mk_insn(BPF_CLASS_ALU64 | BPF_OP_ADD, 2, 0, 0, -24);
     let mov_r3_from_r10 = mov_x(3, 10);
-    let r3_minus_24 = mk_insn(BPF_CLASS_ALU64 | (bs::BPF_ADD as u8), 3, 0, 0, -24);
+    let r3_minus_24 = mk_insn(BPF_CLASS_ALU64 | BPF_OP_ADD, 3, 0, 0, -24);
     // BPF_FUNC_map_update_elem == 2 per linux uapi `bpf.h`
     // (`FN(map_update_elem, 2, ...)`). The analyzer does not yet
     // export a BPF_FUNC_MAP_UPDATE_ELEM constant — that addition

@@ -95,7 +95,7 @@ const EXCEPTIONS: &[(&str, usize)] = &[
     ("monitor/reader.rs", 5946),
     ("scenario/payload_run.rs", 5881),
     ("workload/spawn/mod.rs", 5483),
-    ("scenario/snapshot/tests.rs", 5070),
+    ("scenario/snapshot/tests.rs", 5073),
     ("monitor/btf_render/mod.rs", 5508),
     ("monitor/bpf_map/tests.rs", 4169),
     ("monitor/cast_analysis/mod.rs", 4154),
@@ -106,7 +106,7 @@ const EXCEPTIONS: &[(&str, usize)] = &[
     // queued: decompose timeline.rs into submodules.
     ("timeline.rs", 3941),
     ("ctprof/mod.rs", 3571),
-    ("bin/ktstr.rs", 3546),
+    ("bin/ktstr.rs", 3547),
 ];
 
 /// Resolve `<repo>/src` from `CARGO_MANIFEST_DIR`. Cargo always

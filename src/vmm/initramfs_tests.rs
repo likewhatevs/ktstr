@@ -2028,12 +2028,15 @@ fn parse_ld_so_cache_parses_valid_entries_and_skips_oob_and_nonabsolute() {
     std::fs::write(&lib2_path, b"\x7fELF-stub2").unwrap();
     let lib2_abs = lib2_path.to_str().unwrap();
 
-    // 3 entries:
+    // 4 entries:
     //   A: soname "libfoo.so" -> lib_abs   (existing file, accepted)
     //   B: soname "libfoo.so" -> lib2_abs  (also existing → or_insert
     //                                        keeps A, not is_file filter)
     //   C: soname "liboob.so", val_off == data.len()  (OOB continue)
-    let nlibs: usize = 3;
+    //   D: soname "librel.so" -> "relative/libbar.so" (no leading
+    //                            slash → rejected by the starts_with('/')
+    //                            gate in parse_ld_so_cache before is_file)
+    let nlibs: usize = 4;
     let header_end = LD_CACHE_HEADER_SIZE + nlibs * LD_CACHE_ENTRY_SIZE;
 
     // Lay out the string table after the entry array; record absolute
@@ -2050,6 +2053,10 @@ fn parse_ld_so_cache_parses_valid_entries_and_skips_oob_and_nonabsolute() {
     let b_key = push_str("libfoo.so", &mut strtab);
     let b_val = push_str(lib2_abs, &mut strtab);
     let c_key = push_str("liboob.so", &mut strtab);
+    let d_key = push_str("librel.so", &mut strtab);
+    // Non-absolute value: no leading slash → the starts_with('/') gate
+    // rejects it before is_file is ever called.
+    let d_val = push_str("relative/libbar.so", &mut strtab);
 
     let mut data = Vec::new();
     // Header: magic[20] + nlibs[4] + len_strings[4] + flags[4] + unused[16].
@@ -2073,6 +2080,7 @@ fn parse_ld_so_cache_parses_valid_entries_and_skips_oob_and_nonabsolute() {
     push_entry(b_key, b_val, &mut data);
     // C's val_off points exactly at data.len() → OOB `continue`.
     push_entry(c_key, total_len as u32, &mut data);
+    push_entry(d_key, d_val, &mut data);
     assert_eq!(data.len(), header_end);
     data.extend_from_slice(&strtab);
     assert_eq!(data.len(), total_len);
@@ -2091,6 +2099,12 @@ fn parse_ld_so_cache_parses_valid_entries_and_skips_oob_and_nonabsolute() {
     assert!(
         !map.contains_key("liboob.so"),
         "out-of-bounds val_off entry must be skipped, not panic",
+    );
+    // D's value lacks a leading slash → rejected by the
+    // starts_with('/') gate in parse_ld_so_cache before is_file.
+    assert!(
+        !map.contains_key("librel.so"),
+        "non-absolute path must be rejected by the starts_with('/') gate",
     );
 }
 

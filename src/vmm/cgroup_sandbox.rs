@@ -1725,23 +1725,54 @@ mod tests {
     /// in — the soft path that a cap-unset caller takes. No existing
     /// test calls the fn directly to confirm the kind round-trips
     /// (try_create-driven tests only assert non-empty Display and the
-    /// host may take Active). `SandboxDegraded` derives Debug+Clone
-    /// but not PartialEq, so the assertion uses `matches!` on the
-    /// nested pattern rather than `assert_eq!`.
+    /// host may take Active). Pins the kind round-trip across all 5
+    /// `SandboxDegraded` variants, mirroring the hard-error sibling
+    /// `degraded_or_err_hard_error_renders_full_remediation`.
+    /// `SandboxDegraded` derives Debug+Clone but not PartialEq, so the
+    /// assertion uses a per-kind nested `matches!` pattern rather than
+    /// `assert_eq!`.
     #[test]
     fn degraded_or_err_soft_returns_degraded_preserving_kind() {
-        let s = BuildSandbox::degraded_or_err(SandboxDegraded::SubtreeControlRefused, false)
-            .expect("soft path must be Ok");
-        assert!(
-            matches!(
-                s,
-                BuildSandbox::Degraded(SandboxDegraded::SubtreeControlRefused)
-            ),
-            "soft path must preserve the exact kind in Degraded",
-        );
-        assert!(!s.is_active(), "Degraded must report !is_active()");
-        // s is Degraded — Drop is a no-op per the Drop impl's early
-        // return on the non-Active arm.
+        for kind in [
+            SandboxDegraded::NoCgroupV2,
+            SandboxDegraded::NoCpusetController,
+            SandboxDegraded::SubtreeControlRefused,
+            SandboxDegraded::PermissionDenied,
+            SandboxDegraded::RootCgroupRefused,
+        ] {
+            let s = BuildSandbox::degraded_or_err(kind.clone(), false)
+                .expect("soft path must be Ok");
+            // No PartialEq on SandboxDegraded — pick the expected
+            // nested Degraded pattern per kind, then matches! it.
+            let preserved = match kind {
+                SandboxDegraded::NoCgroupV2 => {
+                    matches!(s, BuildSandbox::Degraded(SandboxDegraded::NoCgroupV2))
+                }
+                SandboxDegraded::NoCpusetController => matches!(
+                    s,
+                    BuildSandbox::Degraded(SandboxDegraded::NoCpusetController)
+                ),
+                SandboxDegraded::SubtreeControlRefused => matches!(
+                    s,
+                    BuildSandbox::Degraded(SandboxDegraded::SubtreeControlRefused)
+                ),
+                SandboxDegraded::PermissionDenied => matches!(
+                    s,
+                    BuildSandbox::Degraded(SandboxDegraded::PermissionDenied)
+                ),
+                SandboxDegraded::RootCgroupRefused => matches!(
+                    s,
+                    BuildSandbox::Degraded(SandboxDegraded::RootCgroupRefused)
+                ),
+            };
+            assert!(
+                preserved,
+                "soft path must preserve the exact kind in Degraded",
+            );
+            assert!(!s.is_active(), "Degraded must report !is_active()");
+            // s is Degraded — Drop is a no-op per the Drop impl's early
+            // return on the non-Active arm.
+        }
     }
 
     // ---------------------------------------------------------------
