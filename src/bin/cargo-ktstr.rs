@@ -110,13 +110,38 @@ fn main() {
         command: CargoSub::Ktstr(ktstr),
     } = Cargo::parse();
 
-    // Match-arm order mirrors the `KtstrCommand` enum declaration in
-    // `cli.rs`. Keeping the two orderings in lockstep lets a reviewer
-    // eyeball "every variant is dispatched" in one linear scan instead
-    // of cross-referencing two different orders; a future variant
-    // addition then lands in the matching enum position and here
-    // without requiring the reader to rebuild the mapping.
-    let result = match ktstr.command {
+    let result = dispatch_command(ktstr.command);
+
+    if let Err(e) = result {
+        eprintln!("error: {e:#}");
+        std::process::exit(1);
+    }
+}
+
+/// Fan out a parsed [`KtstrCommand`] to its subcommand handler.
+///
+/// Split into [`dispatch_run_command`] (test/coverage/llvm-cov/stats/
+/// replay/perf-delta) and [`dispatch_admin_command`] (kernel/model/
+/// verifier/funify/completions/host/thresholds/export/locks/shell)
+/// purely to keep each function under the source-function size guard;
+/// the run-group helper matches its variants and forwards every other
+/// variant to the admin-group helper, so the two together cover the
+/// enum exhaustively with the same arm bodies main used to inline.
+fn dispatch_command(command: KtstrCommand) -> Result<(), String> {
+    dispatch_run_command(command)
+}
+
+/// Dispatch the run-producing subcommands; forward the rest to
+/// [`dispatch_admin_command`].
+///
+/// Match-arm order mirrors the `KtstrCommand` enum declaration in
+/// `cli.rs`. Keeping the two orderings in lockstep lets a reviewer
+/// eyeball "every variant is dispatched" in one linear scan instead
+/// of cross-referencing two different orders; a future variant
+/// addition then lands in the matching enum position and here
+/// without requiring the reader to rebuild the mapping.
+fn dispatch_run_command(command: KtstrCommand) -> Result<(), String> {
+    match command {
         KtstrCommand::Test {
             kernel,
             no_perf_mode,
@@ -203,6 +228,30 @@ fn main() {
                 Err(e) => Err(format!("{e:#}")),
             }
         }
+        // Forward the admin/introspection group verbatim. Listing the
+        // variants explicitly (rather than a `_` wildcard) keeps the
+        // match exhaustive over the full enum: a future `KtstrCommand`
+        // variant fails to compile here until it is routed, preserving
+        // the single-match compile-time exhaustiveness guarantee.
+        cmd @ (KtstrCommand::Kernel { .. }
+        | KtstrCommand::Verifier { .. }
+        | KtstrCommand::Funify { .. }
+        | KtstrCommand::Completions { .. }
+        | KtstrCommand::ShowHost
+        | KtstrCommand::ShowThresholds { .. }
+        | KtstrCommand::Export { .. }
+        | KtstrCommand::Locks { .. }
+        | KtstrCommand::Shell { .. }) => dispatch_admin_command(cmd),
+        #[cfg(feature = "llm")]
+        cmd @ KtstrCommand::Model { .. } => dispatch_admin_command(cmd),
+    }
+}
+
+/// Dispatch the cache/admin/introspection subcommands. Reached only
+/// for the variants [`dispatch_run_command`] forwards; its match
+/// covers exactly the remaining `KtstrCommand` variants in enum order.
+fn dispatch_admin_command(command: KtstrCommand) -> Result<(), String> {
+    match command {
         KtstrCommand::Kernel { command } => match command {
             KernelCommand::List { json, range } => match range {
                 Some(r) => {
@@ -306,10 +355,17 @@ fn main() {
             Ok(opt) => std::process::exit(opt.unwrap_or(0)),
             Err(e) => Err(e),
         },
-    };
-
-    if let Err(e) = result {
-        eprintln!("error: {e:#}");
-        std::process::exit(1);
+        // Reached only for variants `dispatch_run_command` handles;
+        // it forwards everything else here, so those variants never
+        // arrive. The arm exists to satisfy exhaustiveness without
+        // restating the run-group patterns.
+        KtstrCommand::Test { .. }
+        | KtstrCommand::Coverage { .. }
+        | KtstrCommand::LlvmCov { .. }
+        | KtstrCommand::Stats { .. }
+        | KtstrCommand::Replay { .. }
+        | KtstrCommand::PerfDelta { .. } => unreachable!(
+            "run-group variants are handled by dispatch_run_command and never forwarded here"
+        ),
     }
 }
