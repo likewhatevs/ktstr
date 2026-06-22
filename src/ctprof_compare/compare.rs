@@ -393,12 +393,7 @@ fn build_compare_groups(
     candidate: &CtprofSnapshot,
     opts: &CompareOptions,
     flatten: &[glob::Pattern],
-) -> (
-    GroupBy,
-    Option<BTreeMap<String, String>>,
-    BTreeMap<String, ThreadGroup>,
-    BTreeMap<String, ThreadGroup>,
-) {
+) -> CompareGroups {
     let group_by = opts.group_by.0;
     // For `GroupBy::Comm` and `GroupBy::Pcomm`, the frequency gate
     // that promotes a pattern_key from per-thread literal to a
@@ -547,6 +542,25 @@ fn cg_prefix(key: &str) -> &str {
 /// matches cgroups by Jaccard similarity over these sets.
 type TypeSet = std::collections::BTreeSet<(String, String)>;
 
+/// Grouping outcome from [`build_compare_groups`]: the resolved
+/// `GroupBy`, an optional cgroup-fudge map, and the per-side thread
+/// groups (baseline, candidate).
+type CompareGroups = (
+    GroupBy,
+    Option<BTreeMap<String, String>>,
+    BTreeMap<String, ThreadGroup>,
+    BTreeMap<String, ThreadGroup>,
+);
+
+/// Fudge-match outcome from [`fudge_match_prefixes`]: the matched
+/// `(baseline_cg, candidate_cg)` prefix pairs plus the per-prefix
+/// thread-type sets for each side (baseline, candidate).
+type FudgeMatch = (
+    Vec<(String, String)>,
+    BTreeMap<String, TypeSet>,
+    BTreeMap<String, TypeSet>,
+);
+
 /// Match baseline-only cgroup prefixes to candidate-only cgroup
 /// prefixes by Jaccard similarity (≥ 0.90, overlap ≥ 10) over
 /// their `(pcomm, comm)` thread-type sets, and return both the
@@ -557,11 +571,7 @@ type TypeSet = std::collections::BTreeSet<(String, String)>;
 fn fudge_match_prefixes(
     diff: &CtprofDiff,
     ctx: &CompareCtx,
-) -> (
-    Vec<(String, String)>,
-    BTreeMap<String, TypeSet>,
-    BTreeMap<String, TypeSet>,
-) {
+) -> FudgeMatch {
     // Collect thread types per CGROUP PREFIX (not per compound key).
     let mut cg_types_a: BTreeMap<String, TypeSet> = BTreeMap::new();
     let mut cg_types_b: BTreeMap<String, TypeSet> = BTreeMap::new();

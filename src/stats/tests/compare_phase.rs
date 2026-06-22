@@ -931,7 +931,7 @@ fn compare_partitions_renders_phase_and_summary_blocks_via_pool() {
     // asymmetry (covers the unpaired-phase render path).
     let baseline = |s: f64| vec![(0u16, "BASELINE", s)];
     let baseline_plus_step = |s: f64| vec![(0u16, "BASELINE", s), (1u16, "Step[0]", s)];
-    let sidecars: [(&str, &str, bool, f64, Vec<(u16, &str, f64)>); 6] = [
+    let sidecars = [
         // paired on both sides: 10 -> 30 scalar + BASELINE phase
         // regression; B's extra Step[0] -> unpaired (side B) phase.
         ("paired_scn", "scx_alpha", true, 10.0, baseline(10.0)),

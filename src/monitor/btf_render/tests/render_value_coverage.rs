@@ -569,7 +569,7 @@ fn render_char_int_renders_as_char_variant() {
     }];
     let blob = cast_build_btf(&types, &strings);
     let btf = Btf::from_bytes(&blob).expect("synthetic BTF parses");
-    let v = render_value(&btf, 1, &[b'Q']);
+    let v = render_value(&btf, 1, b"Q");
     assert_eq!(v, RenderedValue::Char { value: b'Q' });
 }
 

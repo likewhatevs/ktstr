@@ -2555,10 +2555,10 @@ fn eval_host_extract_failures_fold_into_guest_pass() {
 /// The body is 250 DISTINCT `frame_<i>+0x10` lines so `collapse_cycles`
 /// finds no repeating cycle (each line is unique -> no anchor repeats
 /// >= 3 times) and leaves all 250 intact; `is_verifier` is false (the
-/// lines contain neither "processed" nor "insns"). With exactly 250
-/// post-collapse lines the skip count is `250 - 200 = 50`, the last
-/// line (`frame_249+0x10`) survives in the kept tail, and an early line
-/// (`frame_0+0x10`) is truncated.
+/// > lines contain neither "processed" nor "insns"). With exactly 250
+/// > post-collapse lines the skip count is `250 - 200 = 50`, the last
+/// > line (`frame_249+0x10`) survives in the kept tail, and an early line
+/// > (`frame_0+0x10`) is truncated.
 #[test]
 fn eval_sched_log_truncates_over_200_lines() {
     let body = (0..250)

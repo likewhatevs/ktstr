@@ -559,7 +559,7 @@ impl BtfBuilder {
         let mut sec = Vec::new();
         // id 1: u32.
         Self::push_hdr(&mut sec, 0, K_INT, 0, 4);
-        sec.extend_from_slice(&((0u32 << 24) | 32u32).to_le_bytes()); // bits=32
+        sec.extend_from_slice(&32u32.to_le_bytes()); // bits=32
         // id 2: struct { member @ bit_off }.
         Self::push_hdr(&mut sec, struct_name_off, K_STRUCT, 1, 8);
         sec.extend_from_slice(&member_name_off.to_le_bytes());

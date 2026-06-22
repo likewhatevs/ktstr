@@ -2628,8 +2628,8 @@ fn run_verifier_cell_unknown_scheduler_exits_one() {
 /// anything). Pins the scheduler-lookup invariant the exit-1 branch
 /// depends on: a name absent from `KTSTR_SCHEDULERS` does not resolve, so
 /// the `find(|s| s.name == sched_name)` returns `None` and the cell exits
-/// 1. The lib test binary declares zero schedulers, so any name is
-/// absent; the gated test exercises the surrounding `run_verifier_cell`
+/// with code 1. The lib test binary declares zero schedulers, so any
+/// name is absent; the gated test exercises the surrounding `run_verifier_cell`
 /// exit path when KVM is present. This runs everywhere, so the
 /// precondition is verified even where the gated test cannot.
 #[test]
