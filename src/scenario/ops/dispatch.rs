@@ -25,12 +25,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use anyhow::{Context, Result};
 
 use crate::scenario::Ctx;
-use crate::workload::{ResolvedAffinity, WorkloadConfig, WorkloadHandle};
+use crate::workload::{AffinityIntent, ResolvedAffinity, WorkSpec, WorkloadConfig, WorkloadHandle};
 
 use super::setup::{append_placement_log, apply_setup};
 use super::{
-    KernelTarget, KernelValue, Op, PayloadEntry, PayloadSource, ScenarioState, SpawnPlacement,
-    validate_known_flags, validate_mempolicy_cpuset,
+    CgroupDef, CpusetSpec, KernelTarget, KernelValue, KernelValueWidth, Op, PayloadEntry,
+    PayloadSource, ScenarioState, SpawnPlacement, validate_known_flags, validate_mempolicy_cpuset,
 };
 
 /// Latched once `Op::CaptureSnapshot` / `Op::WatchSnapshot` observes a
@@ -87,26 +87,71 @@ pub(super) fn apply_ops(
     let merged = merge_adjacent_cold_writes(ops);
     for op in &merged {
         match op {
-            Op::AddCgroup { name } => {
-                // Mirror the collision check in `apply_setup`
-                // (`CgroupDef`) so the same name declared via `Op`
-                // is rejected the same way. Without this, an
-                // `Op::AddCgroup` could silently shadow a
-                // Backdrop-owned or step-local `CgroupDef`-created
-                // cgroup and the two writers could clobber each
-                // other's cpuset / subtree_control state.
-                if state.cgroup_name_is_tracked(name) {
-                    anyhow::bail!(
-                        "Op::AddCgroup '{}' collides with a cgroup already \
-                         tracked (by a prior Backdrop or step-local CgroupDef) — \
-                         declare it in exactly one place; use a fresh name for \
-                         the step-local cgroup",
-                        name,
-                    );
-                }
-                state.target_cgroups().add_cgroup_no_cpuset(name)?;
-            }
-            Op::AddCgroupDef { def } => {
+            Op::AddCgroup { name } => apply_add_cgroup(state, name)?,
+            Op::AddCgroupDef { def } => apply_add_cgroup_def(ctx, state, def)?,
+            Op::RemoveCgroup { cgroup } => apply_remove_cgroup(ctx, state, cgroup)?,
+            Op::SetCpuset { cgroup, cpus } => apply_set_cpuset(ctx, state, cgroup, cpus)?,
+            Op::ClearCpuset { cgroup } => apply_clear_cpuset(ctx, state, cgroup)?,
+            Op::SwapCpusets { a, b } => apply_swap_cpusets(ctx, state, a, b)?,
+            Op::Spawn { placement, work } => apply_spawn(ctx, state, placement, work)?,
+            Op::StopCgroup { cgroup } => apply_stop_cgroup(state, cgroup)?,
+            Op::SetAffinity { cgroup, affinity } => apply_set_affinity(ctx, state, cgroup, affinity)?,
+            Op::MoveAllTasks { from, to } => apply_move_all_tasks(ctx, state, from, to)?,
+            Op::RunPayload {
+                payload,
+                args,
+                cgroup,
+            } => apply_run_payload(ctx, state, payload, args, cgroup)?,
+            Op::WaitPayload { name, cgroup } => apply_wait_payload(state, name, cgroup)?,
+            Op::KillPayload { name, cgroup } => apply_kill_payload(state, name, cgroup)?,
+            Op::FreezeCgroup { cgroup } => apply_freeze_cgroup(ctx, cgroup)?,
+            Op::UnfreezeCgroup { cgroup } => apply_unfreeze_cgroup(ctx, cgroup)?,
+            Op::CaptureSnapshot { name } => apply_capture_snapshot(ctx, in_loop, name)?,
+            Op::WatchSnapshot { symbol } => apply_watch_snapshot(symbol)?,
+            Op::WriteKernelHot { writes } => apply_write_kernel_hot(writes)?,
+            Op::WriteKernelCold { writes } => apply_write_kernel_cold(writes)?,
+            Op::ReadKernelHot { tag, target, width } => apply_read_kernel_hot(tag, target, width)?,
+            Op::ReadKernelCold { tag, target, width } => apply_read_kernel_cold(tag, target, width)?,
+            Op::AttachScheduler { scheduler } => apply_attach_scheduler(scheduler)?,
+            Op::DetachScheduler => apply_detach_scheduler()?,
+            Op::RestartScheduler => apply_restart_scheduler()?,
+            Op::ReplaceScheduler { scheduler } => apply_replace_scheduler(scheduler)?,
+            Op::PinBpfMap { name } => apply_pin_bpf_map(state, name)?,
+            Op::CaptureCgroupProcs { tag, cgroup } => apply_capture_cgroup_procs(ctx, tag, cgroup)?,
+        }
+    }
+    Ok(())
+}
+
+/// `Op::AddCgroup` body: declare an empty step/backdrop cgroup.
+fn apply_add_cgroup(state: &mut ScenarioState<'_, '_>, name: &str) -> Result<()> {
+    // Mirror the collision check in `apply_setup`
+    // (`CgroupDef`) so the same name declared via `Op`
+    // is rejected the same way. Without this, an
+    // `Op::AddCgroup` could silently shadow a
+    // Backdrop-owned or step-local `CgroupDef`-created
+    // cgroup and the two writers could clobber each
+    // other's cpuset / subtree_control state.
+    if state.cgroup_name_is_tracked(name) {
+        anyhow::bail!(
+            "Op::AddCgroup '{}' collides with a cgroup already \
+             tracked (by a prior Backdrop or step-local CgroupDef) — \
+             declare it in exactly one place; use a fresh name for \
+             the step-local cgroup",
+            name,
+        );
+    }
+    state.target_cgroups().add_cgroup_no_cpuset(name)?;
+    Ok(())
+}
+
+/// `Op::AddCgroupDef` body: materialize a full `CgroupDef` mid-step.
+fn apply_add_cgroup_def(
+    ctx: &Ctx,
+    state: &mut ScenarioState<'_, '_>,
+    def: &CgroupDef,
+) -> Result<()> {
+    {
                 // Delegate to `apply_setup` so cpuset, cpu / memory /
                 // io / pids knobs, and worker spawning all run
                 // through the same code path that a Step's
@@ -121,8 +166,21 @@ pub(super) fn apply_ops(
                 // from Step::with_defs is the timing (apply-ops vs
                 // setup).
                 apply_setup(ctx, state, std::slice::from_ref(def))?;
-            }
-            Op::RemoveCgroup { cgroup } => {
+    }
+    Ok(())
+}
+
+/// `Op::RemoveCgroup` body: stop workers then rmdir the cgroup.
+// ptr_arg allow: private single-call helper; the `&Cow` param keeps this a
+// byte-faithful extraction of the Op match-arm binding (the dispatcher is the
+// only caller and already holds a `&Cow`).
+#[allow(clippy::ptr_arg)]
+fn apply_remove_cgroup(
+    ctx: &Ctx,
+    state: &mut ScenarioState<'_, '_>,
+    cgroup: &std::borrow::Cow<'static, str>,
+) -> Result<()> {
+    {
                 // Stop workers + payload binaries in this cgroup
                 // before the cgroupfs removal. A live process in the
                 // cgroup makes `rmdir` fail with EBUSY; kill the
@@ -221,8 +279,18 @@ pub(super) fn apply_ops(
                         "Op::RemoveCgroup: remove_cgroup returned non-ENOENT error",
                     );
                 }
-            }
-            Op::SetCpuset { cgroup, cpus } => {
+    }
+    Ok(())
+}
+
+/// `Op::SetCpuset` body: resolve+apply a cpuset to a live cgroup.
+fn apply_set_cpuset(
+    ctx: &Ctx,
+    state: &mut ScenarioState<'_, '_>,
+    cgroup: &str,
+    cpus: &CpusetSpec,
+) -> Result<()> {
+    {
                 if let Err(reason) = cpus.validate(ctx) {
                     anyhow::bail!(
                         "cgroup '{}': CpusetSpec validation failed: {}",
@@ -264,12 +332,27 @@ pub(super) fn apply_ops(
                 }
                 ctx.cgroups.set_cpuset(cgroup, &resolved)?;
                 state.record_cpuset(cgroup, resolved);
-            }
-            Op::ClearCpuset { cgroup } => {
+    }
+    Ok(())
+}
+
+/// `Op::ClearCpuset` body: release a cgroup's cpuset restriction.
+fn apply_clear_cpuset(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, cgroup: &str) -> Result<()> {
+    {
                 ctx.cgroups.clear_cpuset(cgroup)?;
                 state.forget_cpuset(cgroup);
-            }
-            Op::SwapCpusets { a, b } => {
+    }
+    Ok(())
+}
+
+/// `Op::SwapCpusets` body: read both cgroups' cpusets and exchange them.
+fn apply_swap_cpusets(
+    ctx: &Ctx,
+    state: &mut ScenarioState<'_, '_>,
+    a: &str,
+    b: &str,
+) -> Result<()> {
+    {
                 // Read current cpusets from the cgroup filesystem, swap them.
                 let cpus_a = read_cpuset(ctx, a);
                 let cpus_b = read_cpuset(ctx, b);
@@ -281,8 +364,18 @@ pub(super) fn apply_ops(
                     ctx.cgroups.set_cpuset(a, &cb)?;
                     state.record_cpuset(a, cb);
                 }
-            }
-            Op::Spawn { placement, work } => match placement {
+    }
+    Ok(())
+}
+
+/// `Op::Spawn` body: spawn workers per the `placement`.
+fn apply_spawn(
+    ctx: &Ctx,
+    state: &mut ScenarioState<'_, '_>,
+    placement: &SpawnPlacement,
+    work: &WorkSpec,
+) -> Result<()> {
+    match placement {
                 SpawnPlacement::RunnerCgroup => {
                     if let Err(reason) = work.mem_policy.validate() {
                         anyhow::bail!("Op::Spawn(RunnerCgroup): {}", reason);
@@ -408,12 +501,31 @@ pub(super) fn apply_ops(
                     h.start();
                     state.target_handles().push((cgroup.to_string(), h));
                 }
-            },
-            Op::StopCgroup { cgroup } => {
+    }
+    Ok(())
+}
+
+/// `Op::StopCgroup` body: stop a cgroup's workers/payloads, keep the dir.
+fn apply_stop_cgroup(state: &mut ScenarioState<'_, '_>, cgroup: &str) -> Result<()> {
+    {
                 state.drain_payloads_for_cgroup(cgroup);
                 state.drop_handles_for_cgroup(cgroup);
-            }
-            Op::SetAffinity { cgroup, affinity } => {
+    }
+    Ok(())
+}
+
+/// `Op::SetAffinity` body: re-pin a cgroup's worker affinity.
+// ptr_arg allow: private single-call helper; the `&Cow` param keeps this a
+// byte-faithful extraction of the Op match-arm binding (the dispatcher is the
+// only caller and already holds a `&Cow`).
+#[allow(clippy::ptr_arg)]
+fn apply_set_affinity(
+    ctx: &Ctx,
+    state: &mut ScenarioState<'_, '_>,
+    cgroup: &std::borrow::Cow<'static, str>,
+    affinity: &AffinityIntent,
+) -> Result<()> {
+    {
                 let cgroup_cpuset: Option<BTreeSet<usize>> = state.lookup_cpuset(cgroup).cloned();
                 let resolved = crate::scenario::resolve_affinity_for_cgroup(
                     affinity,
@@ -525,8 +637,22 @@ pub(super) fn apply_ops(
                         }
                     }
                 }
-            }
-            Op::MoveAllTasks { from, to } => {
+    }
+    Ok(())
+}
+
+/// `Op::MoveAllTasks` body: migrate every worker between two cgroups.
+// ptr_arg allow: private single-call helper; the `&Cow` params keep this a
+// byte-faithful extraction of the Op match-arm bindings (the dispatcher is the
+// only caller and already holds `&Cow`s).
+#[allow(clippy::ptr_arg)]
+fn apply_move_all_tasks(
+    ctx: &Ctx,
+    state: &mut ScenarioState<'_, '_>,
+    from: &std::borrow::Cow<'static, str>,
+    to: &std::borrow::Cow<'static, str>,
+) -> Result<()> {
+    {
                 // Self-move is a silent no-op: cgroup.procs writes are
                 // idempotent on same-cgroup targets and rename_handles
                 // collapses to identity when from == to. The op
@@ -681,12 +807,19 @@ pub(super) fn apply_ops(
                 // Only run after every kernel write succeeded —
                 // partial failure leaves `state` un-renamed.
                 state.rename_handles(from, to);
-            }
-            Op::RunPayload {
-                payload,
-                args,
-                cgroup,
-            } => {
+    }
+    Ok(())
+}
+
+/// `Op::RunPayload` body: spawn and track a userspace payload binary.
+fn apply_run_payload(
+    ctx: &Ctx,
+    state: &mut ScenarioState<'_, '_>,
+    payload: &'static crate::test_support::Payload,
+    args: &[String],
+    cgroup: &Option<std::borrow::Cow<'static, str>>,
+) -> Result<()> {
+    {
                 if payload.is_scheduler() {
                     anyhow::bail!(
                         "Op::RunPayload called with scheduler-kind Payload ('{}'); \
@@ -742,8 +875,17 @@ pub(super) fn apply_ops(
                     source: PayloadSource::OpRunPayload,
                     handle,
                 });
-            }
-            Op::WaitPayload { name, cgroup } => {
+    }
+    Ok(())
+}
+
+/// `Op::WaitPayload` body: block on a payload's natural exit.
+fn apply_wait_payload(
+    state: &mut ScenarioState<'_, '_>,
+    name: &str,
+    cgroup: &Option<std::borrow::Cow<'static, str>>,
+) -> Result<()> {
+    {
                 let entry = take_payload_for_op(
                     state,
                     "Op::WaitPayload",
@@ -760,8 +902,17 @@ pub(super) fn apply_ops(
                     .handle
                     .wait()
                     .with_context(|| format!("Op::WaitPayload: wait payload '{name}'"))?;
-            }
-            Op::KillPayload { name, cgroup } => {
+    }
+    Ok(())
+}
+
+/// `Op::KillPayload` body: SIGKILL and reap a tracked payload.
+fn apply_kill_payload(
+    state: &mut ScenarioState<'_, '_>,
+    name: &str,
+    cgroup: &Option<std::borrow::Cow<'static, str>>,
+) -> Result<()> {
+    {
                 let entry = take_payload_for_op(
                     state,
                     "Op::KillPayload",
@@ -774,18 +925,33 @@ pub(super) fn apply_ops(
                     .handle
                     .kill()
                     .with_context(|| format!("Op::KillPayload: kill payload '{name}'"))?;
-            }
-            Op::FreezeCgroup { cgroup } => {
+    }
+    Ok(())
+}
+
+/// `Op::FreezeCgroup` body: write `cgroup.freeze` = 1.
+fn apply_freeze_cgroup(ctx: &Ctx, cgroup: &str) -> Result<()> {
+    {
                 ctx.cgroups
                     .set_freeze(cgroup, true)
                     .with_context(|| format!("Op::FreezeCgroup: cgroup '{cgroup}'"))?;
-            }
-            Op::UnfreezeCgroup { cgroup } => {
+    }
+    Ok(())
+}
+
+/// `Op::UnfreezeCgroup` body: write `cgroup.freeze` = 0.
+fn apply_unfreeze_cgroup(ctx: &Ctx, cgroup: &str) -> Result<()> {
+    {
                 ctx.cgroups
                     .set_freeze(cgroup, false)
                     .with_context(|| format!("Op::UnfreezeCgroup: cgroup '{cgroup}'"))?;
-            }
-            Op::CaptureSnapshot { name } => {
+    }
+    Ok(())
+}
+
+/// `Op::CaptureSnapshot` body: drive a host-side diagnostic snapshot.
+fn apply_capture_snapshot(ctx: &Ctx, in_loop: bool, name: &str) -> Result<()> {
+    {
                 // Reject CaptureSnapshot inside any HoldSpec::Loop
                 // step. Each capture forces a freeze
                 // rendezvous; inside a Loop generating a high-rate
@@ -903,8 +1069,13 @@ pub(super) fn apply_ops(
                         );
                     }
                 }
-            }
-            Op::WatchSnapshot { symbol } => {
+    }
+    Ok(())
+}
+
+/// `Op::WatchSnapshot` body: arm a hardware-watchpoint snapshot on a symbol.
+fn apply_watch_snapshot(symbol: &str) -> Result<()> {
+    {
                 // Two execution contexts mirroring `Op::CaptureSnapshot`:
                 //   1. Test fixture: thread-local SnapshotBridge
                 //      drives the register callback directly.
@@ -1006,8 +1177,13 @@ pub(super) fn apply_ops(
                         }
                     }
                 }
-            }
-            Op::WriteKernelHot { writes } => {
+    }
+    Ok(())
+}
+
+/// `Op::WriteKernelHot` body: live-vCPU batched kernel write.
+fn apply_write_kernel_hot(writes: &[(KernelTarget, KernelValue)]) -> Result<()> {
+    {
                 let payload = build_kernel_op_request(
                     crate::vmm::wire::KernelOpMode::Hot,
                     crate::vmm::wire::KernelOpDirection::Write,
@@ -1015,8 +1191,13 @@ pub(super) fn apply_ops(
                     write_entries_from_writes(writes),
                 );
                 dispatch_kernel_op_request("Op::WriteKernelHot", payload)?;
-            }
-            Op::WriteKernelCold { writes } => {
+    }
+    Ok(())
+}
+
+/// `Op::WriteKernelCold` body: freeze-rendezvous batched kernel write.
+fn apply_write_kernel_cold(writes: &[(KernelTarget, KernelValue)]) -> Result<()> {
+    {
                 let payload = build_kernel_op_request(
                     crate::vmm::wire::KernelOpMode::Cold,
                     crate::vmm::wire::KernelOpDirection::Write,
@@ -1024,8 +1205,17 @@ pub(super) fn apply_ops(
                     write_entries_from_writes(writes),
                 );
                 dispatch_kernel_op_request("Op::WriteKernelCold", payload)?;
-            }
-            Op::ReadKernelHot { tag, target, width } => {
+    }
+    Ok(())
+}
+
+/// `Op::ReadKernelHot` body: live-vCPU kernel read into the bridge log.
+fn apply_read_kernel_hot(
+    tag: &str,
+    target: &KernelTarget,
+    width: &KernelValueWidth,
+) -> Result<()> {
+    {
                 let payload = build_kernel_op_request(
                     crate::vmm::wire::KernelOpMode::Hot,
                     crate::vmm::wire::KernelOpDirection::Read,
@@ -1036,8 +1226,17 @@ pub(super) fn apply_ops(
                     }],
                 );
                 dispatch_kernel_op_request("Op::ReadKernelHot", payload)?;
-            }
-            Op::ReadKernelCold { tag, target, width } => {
+    }
+    Ok(())
+}
+
+/// `Op::ReadKernelCold` body: freeze-rendezvous kernel read into the bridge log.
+fn apply_read_kernel_cold(
+    tag: &str,
+    target: &KernelTarget,
+    width: &KernelValueWidth,
+) -> Result<()> {
+    {
                 let payload = build_kernel_op_request(
                     crate::vmm::wire::KernelOpMode::Cold,
                     crate::vmm::wire::KernelOpDirection::Read,
@@ -1048,32 +1247,48 @@ pub(super) fn apply_ops(
                     }],
                 );
                 dispatch_kernel_op_request("Op::ReadKernelCold", payload)?;
-            }
-            // Scheduler-lifecycle Op dispatch. apply_ops runs
-            // guest-side (the test scenario executes inside the VM
-            // as part of the guest binary), so each arm calls into
-            // the `vmm::rust_init` spawn/kill primitives directly —
-            // no host-to-guest wire format is needed. The Op variant
-            // payload carries the target `&'static Scheduler`; the
-            // composer derives staging archive paths via the
-            // `test_support::staged` helpers so the spawn path
-            // matches the cpio entries packed by the initramfs
-            // composer.
-            //
-            // SCHED_PID is the single source of truth for "which
-            // scheduler is currently running". Each arm reads it
-            // (Detach/Replace/Restart) or writes it (Attach via the
-            // spawn helper's internal store) to keep the existing
-            // monitor / sched-stats / probe consumers consistent.
-            Op::AttachScheduler { scheduler } => {
+    }
+    Ok(())
+}
+
+/// `Op::AttachScheduler` body.
+///
+/// Scheduler-lifecycle Op dispatch. apply_ops runs
+/// guest-side (the test scenario executes inside the VM
+/// as part of the guest binary), so each arm calls into
+/// the `vmm::rust_init` spawn/kill primitives directly —
+/// no host-to-guest wire format is needed. The Op variant
+/// payload carries the target `&'static Scheduler`; the
+/// composer derives staging archive paths via the
+/// `test_support::staged` helpers so the spawn path
+/// matches the cpio entries packed by the initramfs
+/// composer.
+///
+/// SCHED_PID is the single source of truth for "which
+/// scheduler is currently running". Each arm reads it
+/// (Detach/Replace/Restart) or writes it (Attach via the
+/// spawn helper's internal store) to keep the existing
+/// monitor / sched-stats / probe consumers consistent.
+fn apply_attach_scheduler(scheduler: &'static crate::test_support::Scheduler) -> Result<()> {
+    {
                 dispatch_attach_scheduler(scheduler)?;
                 crate::vmm::rust_init::set_current_scheduler(Some(&scheduler.binary));
-            }
-            Op::DetachScheduler => {
+    }
+    Ok(())
+}
+
+/// `Op::DetachScheduler` body: kill the current scheduler, clear SCHED_PID.
+fn apply_detach_scheduler() -> Result<()> {
+    {
                 dispatch_detach_scheduler()?;
                 crate::vmm::rust_init::set_current_scheduler(None);
-            }
-            Op::RestartScheduler => {
+    }
+    Ok(())
+}
+
+/// `Op::RestartScheduler` body: kill the current scheduler, respawn boot.
+fn apply_restart_scheduler() -> Result<()> {
+    {
                 dispatch_restart_scheduler()?;
                 // RestartScheduler re-spawns the BOOT scheduler;
                 // CURRENT_SCHEDULER stays as the prior identity
@@ -1087,12 +1302,29 @@ pub(super) fn apply_ops(
                 // explicitly; for v0 the slot keeps its last value
                 // and consumers reading the post-Op state see the
                 // same identity they would have seen pre-Op.
-            }
-            Op::ReplaceScheduler { scheduler } => {
+    }
+    Ok(())
+}
+
+/// `Op::ReplaceScheduler` body: atomically swap to a staged scheduler.
+fn apply_replace_scheduler(scheduler: &'static crate::test_support::Scheduler) -> Result<()> {
+    {
                 dispatch_replace_scheduler(scheduler)?;
                 crate::vmm::rust_init::set_current_scheduler(Some(&scheduler.binary));
-            }
-            Op::PinBpfMap { name } => {
+    }
+    Ok(())
+}
+
+/// `Op::PinBpfMap` body: hold a named BPF map fd for the scenario lifetime.
+// ptr_arg allow: private single-call helper; the `&Cow` param keeps this a
+// byte-faithful extraction of the Op match-arm binding (the dispatcher is the
+// only caller and already holds a `&Cow`).
+#[allow(clippy::ptr_arg)]
+fn apply_pin_bpf_map(
+    state: &mut ScenarioState<'_, '_>,
+    name: &std::borrow::Cow<'static, str>,
+) -> Result<()> {
+    {
                 // Idempotent — pinning the same name twice no-ops.
                 // The first pin's OwnedFd already holds one extra
                 // refcount via `__bpf_map_inc_not_zero`
@@ -1129,8 +1361,13 @@ pub(super) fn apply_ops(
                         })?;
                     slot.insert(fd);
                 }
-            }
-            Op::CaptureCgroupProcs { tag, cgroup } => {
+    }
+    Ok(())
+}
+
+/// `Op::CaptureCgroupProcs` body: record a cgroup's `cgroup.procs` to the bridge.
+fn apply_capture_cgroup_procs(ctx: &Ctx, tag: &str, cgroup: &str) -> Result<()> {
+    {
                 if tag.is_empty() {
                     anyhow::bail!(
                         "Op::CaptureCgroupProcs: tag is empty; the tag is the \
@@ -1185,8 +1422,6 @@ pub(super) fn apply_ops(
                     pid_count,
                     "Op::CaptureCgroupProcs: captured cgroup.procs snapshot"
                 );
-            }
-        }
     }
     Ok(())
 }
