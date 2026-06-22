@@ -481,14 +481,6 @@ pub(crate) struct BlkWorkerState {
     /// once `status_addr` has been validated — no second Vec, no
     /// copy.
     pub(crate) all_descs_scratch: Vec<ChainDescriptor>,
-    /// Reusable per-segment IO buffer. Sized by `resize(len, 0)`
-    /// per segment in the read/write handlers. Allocated once and
-    /// reused across all segments of all requests; the underlying
-    /// `Vec`'s capacity grows monotonically up to
-    /// `VIRTIO_BLK_SIZE_MAX` (the per-descriptor cap we advertise),
-    /// at which point all subsequent IO is amortized to zero
-    /// allocation.
-    pub(crate) io_buf_scratch: Vec<u8>,
     /// Capacity in bytes. Computed once at construction
     /// (`capacity_sectors * VIRTIO_BLK_SECTOR_SIZE`) and threaded
     /// into handlers so the multiply isn't repeated per request and
@@ -950,7 +942,6 @@ impl VirtioBlk {
             ops_bucket,
             bytes_bucket,
             all_descs_scratch: Vec::with_capacity(VIRTIO_BLK_SEG_MAX as usize + 2),
-            io_buf_scratch: Vec::new(),
             capacity_bytes,
             read_only,
             counters: Arc::clone(&counters),

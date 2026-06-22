@@ -25,7 +25,6 @@ fn dummy_worker_state() -> BlkWorkerState {
         ops_bucket: TokenBucket::unlimited(),
         bytes_bucket: TokenBucket::unlimited(),
         all_descs_scratch: Vec::new(),
-        io_buf_scratch: Vec::new(),
         capacity_bytes: 0,
         read_only: false,
         counters: Arc::new(VirtioBlkCounters::default()),
