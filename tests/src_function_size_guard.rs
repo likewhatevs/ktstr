@@ -118,7 +118,6 @@ const DEFAULT_FN_MAX_LINES: usize = 200;
 const EXCEPTIONS: &[(&str, &str, usize)] = &[
     ("cli/kernel_build/build.rs", "kernel_build_pipeline", 492),  // queued: decompose
     ("ctprof/mod.rs", "capture_with", 473),                       // queued: decompose
-    ("export.rs", "generate_preamble", 416),                      // queued: decompose
     ("host_thread_probe.rs", "find_jemalloc_via_maps_at", 240),   // queued: decompose
     ("monitor/btf_render/mod.rs", "chase_arena_pointer", 367),    // queued: decompose
     ("monitor/btf_render/mod.rs", "render_cast_pointer", 206),    // queued: decompose
