@@ -1,5 +1,4 @@
 use super::*;
-use crate::sync::MutexExt;
 
 // ─── SYNTHETIC-TOPOLOGY OFFSET CONVENTION ────────────────────
 //
@@ -222,16 +221,16 @@ fn expect_unavailable(outcome: LockOutcome, ctx: Option<&str>) -> String {
 /// Serialize KTSTR_CPU_CAP env-var mutation across test threads.
 /// std::env::set_var is process-wide (unsafe in edition 2024);
 /// parallel tests would race if each mutated the same variable
-/// without coordination. Every env-touching test below takes
-/// this mutex for the duration of the test body.
+/// without coordination. Delegates to the ONE crate-wide env mutex
+/// ([`crate::test_support::test_helpers::lock_env`]) so KTSTR_CPU_CAP
+/// mutation here serializes against EVERY env-touching test in the
+/// lib-test binary — including the builder tests that read it via
+/// CpuCap::resolve and the KTSTR_BYPASS_LLC_LOCKS tests. A
+/// module-local mutex left those cross-module process-wide env reads
+/// racing.
 fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-    use std::sync::{Mutex, OnceLock};
-    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    // `lock().unwrap()` would panic on poison from an earlier
-    // panicking test, cascading failures. Recover by taking the
-    // inner guard — the test that panicked already failed; the
-    // current test's env cleanup still runs.
-    ENV_LOCK.get_or_init(|| Mutex::new(())).lock_unpoisoned()
+    // lock_env() already recovers from poison.
+    crate::test_support::test_helpers::lock_env()
 }
 
 /// RAII guard for scoped `std::env::set_var` mutation inside a

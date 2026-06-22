@@ -2022,6 +2022,14 @@ mod tests {
     /// Proves the `kernel()` setter is wired through the helper.
     #[test]
     fn build_vm_builder_base_propagates_kernel_path() {
+        // build()'s no-perf path reads KTSTR_BYPASS_LLC_LOCKS + KTSTR_CPU_CAP
+        // before the validation checks. Under the shared env lock, pin
+        // bypass=1 + cpu_cap unset so build() short-circuits the slot/LLC
+        // acquire path (no acquire_llc_plan contention; cpu_cap=None avoids
+        // the bypass+cpu_cap bail), leaving the asserted error the only outcome.
+        let _l = lock_env();
+        let _g = EnvVarGuard::set(crate::KTSTR_BYPASS_LLC_LOCKS_ENV, "1");
+        let _c = EnvVarGuard::remove(crate::KTSTR_CPU_CAP_ENV);
         let entry = KtstrTestEntry {
             name: "vmb_kernel_path",
             ..KtstrTestEntry::DEFAULT
@@ -2063,6 +2071,12 @@ mod tests {
     /// as a validation error. Proves `topology()` is wired through.
     #[test]
     fn build_vm_builder_base_propagates_topology_validation() {
+        // See build_vm_builder_base_propagates_kernel_path: pin bypass=1 +
+        // cpu_cap unset under the shared env lock so build() short-circuits
+        // the no-perf slot/LLC path and the asserted error is deterministic.
+        let _l = lock_env();
+        let _g = EnvVarGuard::set(crate::KTSTR_BYPASS_LLC_LOCKS_ENV, "1");
+        let _c = EnvVarGuard::remove(crate::KTSTR_CPU_CAP_ENV);
         let entry = KtstrTestEntry {
             name: "vmb_topology",
             ..KtstrTestEntry::DEFAULT
@@ -2105,6 +2119,12 @@ mod tests {
     /// error when the path is missing.
     #[test]
     fn build_vm_builder_base_propagates_scheduler_binary() {
+        // See build_vm_builder_base_propagates_kernel_path: pin bypass=1 +
+        // cpu_cap unset under the shared env lock so build() short-circuits
+        // the no-perf slot/LLC path and the asserted error is deterministic.
+        let _l = lock_env();
+        let _g = EnvVarGuard::set(crate::KTSTR_BYPASS_LLC_LOCKS_ENV, "1");
+        let _c = EnvVarGuard::remove(crate::KTSTR_CPU_CAP_ENV);
         let entry = KtstrTestEntry {
             name: "vmb_scheduler",
             ..KtstrTestEntry::DEFAULT

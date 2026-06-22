@@ -886,7 +886,6 @@ pub fn kernel_build_pipeline(
 mod tests {
     use super::super::super::kernel_cmd::KernelCommand;
     use super::*;
-    use crate::sync::MutexExt;
 
     /// Returns `false` when `git` is not on `PATH`. Tests that drive
     /// a real git repo in a tempdir call this first and `return` early
@@ -1518,13 +1517,14 @@ mod tests {
     // sandbox → make_jobs flow without needing a real kernel source.
     // ---------------------------------------------------------------
 
-    /// Serialize `KTSTR_BYPASS_LLC_LOCKS` env-var mutation across
-    /// test threads. Two parallel tests can't both mutate the same
-    /// process-wide env var without coordinating.
+    /// Serialize `KTSTR_BYPASS_LLC_LOCKS` env-var mutation across test
+    /// threads. Delegates to the ONE crate-wide env mutex so it
+    /// serializes against EVERY env-touching test (process-wide
+    /// `std::env`), including the builder tests that read
+    /// `KTSTR_BYPASS_LLC_LOCKS` — a module-local mutex left them racing.
+    /// `lock_env()` recovers from poison.
     fn bypass_env_lock() -> std::sync::MutexGuard<'static, ()> {
-        use std::sync::{Mutex, OnceLock};
-        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        ENV_LOCK.get_or_init(|| Mutex::new(())).lock_unpoisoned()
+        crate::test_support::test_helpers::lock_env()
     }
 
     /// RAII guard for scoped `KTSTR_BYPASS_LLC_LOCKS` mutation.

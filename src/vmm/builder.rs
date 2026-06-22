@@ -1506,6 +1506,15 @@ mod tests {
     /// builder default (None→256) passes.
     #[test]
     fn builder_rejects_explicit_zero_memory() {
+        // build()'s no-perf path reads KTSTR_BYPASS_LLC_LOCKS + KTSTR_CPU_CAP
+        // before the memory_mib guard. Under the shared env lock, pin
+        // bypass=1 + cpu_cap unset so build() short-circuits the slot/LLC
+        // acquire path (no acquire_llc_plan contention; cpu_cap=None avoids
+        // the bypass+cpu_cap bail), leaving the memory_mib(0) rejection.
+        use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
+        let _l = lock_env();
+        let _g = EnvVarGuard::set(crate::KTSTR_BYPASS_LLC_LOCKS_ENV, "1");
+        let _c = EnvVarGuard::remove(crate::KTSTR_CPU_CAP_ENV);
         // Point at a real file so the kernel-existence check
         // (which runs before the memory_mib guard) does not short-
         // circuit. /bin/true exists on every host the tests care
