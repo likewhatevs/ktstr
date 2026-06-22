@@ -918,8 +918,8 @@ pub(crate) fn dirty_cache_skip_hint(is_git: bool) -> &'static str {
 /// concurrent commit), because the acquire-time cache key no longer
 /// identifies the built input. Returns `(skip, hash_changed)` so the
 /// caller both decides and reports `hash_changed` in the skip message.
-/// `acquired_local_git_hash` is the acquire-time hash from
-/// [`crate::cache::KernelMetadata::as_local_git_hash`]. Pulled out of
+/// `acquired_local_git_hash` is the acquire-time hash from the kernel
+/// source's `as_local_git_hash`. Pulled out of
 /// [`kernel_build_pipeline`] for unit-testability.
 pub(crate) fn post_build_cache_store_skip(
     post: &crate::fetch::LocalSourceState,
