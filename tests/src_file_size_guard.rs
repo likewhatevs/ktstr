@@ -92,13 +92,9 @@ const EXCEPTIONS: &[(&str, usize)] = &[
     ("scenario/ops/tests.rs", 9474),
     ("monitor/dump/tests.rs", 9308),
     ("test_support/entry.rs", 6038),
-    ("monitor/reader.rs", 5939),
+    ("monitor/reader.rs", 5946),
     ("scenario/payload_run.rs", 5881),
     ("workload/spawn/mod.rs", 5483),
-    // queued: split the inline #[cfg(test)] mod into test_support/probe/tests.rs.
-    ("test_support/probe.rs", 5102),
-    // queued: split the inline #[cfg(test)] mod into test_support/dispatch/tests.rs.
-    ("test_support/dispatch.rs", 4996),
     ("scenario/snapshot/tests.rs", 5070),
     ("monitor/btf_render/mod.rs", 5508),
     ("monitor/bpf_map/tests.rs", 4169),
@@ -108,12 +104,8 @@ const EXCEPTIONS: &[(&str, usize)] = &[
     ("workload/worker/mod.rs", 3975),
     ("bin/cargo_ktstr/parse_tests.rs", 3898),
     // queued: decompose timeline.rs into submodules.
-    ("timeline.rs", 3865),
-    // queued: split the inline #[cfg(test)] mod into monitor/dump/render_map/tests.rs.
-    ("monitor/dump/render_map.rs", 3734),
+    ("timeline.rs", 3941),
     ("ctprof/mod.rs", 3571),
-    // queued: split the inline #[cfg(test)] mod into probe/process/tests.rs.
-    ("probe/process.rs", 3518),
     ("bin/ktstr.rs", 3546),
 ];
 

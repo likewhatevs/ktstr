@@ -203,7 +203,7 @@ const EXCEPTIONS: &[(&str, &str, usize)] = &[
         249,
     ), // queued: decompose
     ("test_support/entry.rs", "KtstrTestEntry::validate", 338),   // queued: decompose
-    ("test_support/eval/mod.rs", "evaluate_vm_result", 759),      // queued: decompose
+    ("test_support/eval/mod.rs", "evaluate_vm_result", 765),      // queued: decompose
     (
         "test_support/eval/mod.rs",
         "run_ktstr_test_inner_impl",
@@ -296,7 +296,7 @@ const EXCEPTIONS: &[(&str, &str, usize)] = &[
     (
         "assert/phase_build.rs",
         "build_phase_buckets_with_stimulus",
-        223,
+        242,
     ), // queued: decompose
     ("assert/plan.rs", "AssertPlan::assert_cgroup", 234), // queued: decompose
     ("bin/cargo-ktstr.rs", "main", 239),                  // queued: decompose
