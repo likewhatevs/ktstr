@@ -324,6 +324,36 @@ fn eval_check_result_passed_returns_ok() {
 }
 
 #[test]
+fn eval_check_result_skip_returns_ok() {
+    // Regression: an in-VM scenario skip (AssertResult::skip — e.g. the
+    // booted topology is below the scenario's CPU/LLC floor) must
+    // project to Ok so the exit-code path maps it to EXIT_PASS, NOT be
+    // rendered through the failure path as a test failure. Before the
+    // is_skip guard in evaluate_vm_result a skip-only result fell into
+    // `!is_pass()` (a skip is not is_pass) and returned Err (exit FAIL).
+    let assert = crate::assert::AssertResult::skip("topology below scenario floor");
+    let entry = eevdf_entry("__eval_skip__");
+    let result = make_vm_result_with_assert("", "", 0, false, &assert);
+    let assertions = crate::assert::Assert::NO_OVERRIDES;
+    let check_result = evaluate_vm_result(
+        &entry,
+        &result,
+        &assertions,
+        &[],
+        &[],
+        &[],
+        &EVAL_TOPO,
+        &no_repro,
+        None,
+    )
+    .expect("in-VM skip-only AssertResult must return Ok (EXIT_PASS), not render as a failure");
+    assert!(
+        check_result.is_skip(),
+        "the returned AssertResult must remain skip-only, not be flipped",
+    );
+}
+
+#[test]
 fn eval_check_result_failed_includes_details() {
     let assert = build_assert_result(
         false,

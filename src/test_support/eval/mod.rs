@@ -1992,9 +1992,12 @@ fn render_failure_verdict_message(
     // claim failures.
     let temporal_section =
         crate::test_support::output::format_temporal_assertions_section(check_result);
-    // Skip-only results take an early exit through
-    // `record_skip_sidecar` upstream, so this block only
-    // sees Fail or Inconclusive. Render the lattice verdict
+    // Skip-only results take an early exit before this render
+    // path: the `check_result.is_skip()` guard in
+    // evaluate_vm_result returns Ok for an in-VM scenario skip,
+    // and host-side skips route through `record_skip_sidecar`
+    // upstream — so this block only sees Fail or Inconclusive.
+    // Render the lattice verdict
     // accurately — "failed" for a hard Fail, "inconclusive"
     // for a zero-denominator Inconclusive — so a CI human
     // reading the dump can triage without inferring from
@@ -2480,6 +2483,19 @@ fn evaluate_vm_result(
             payload_metrics,
         ) {
             eprintln!("ktstr_test: {e:#}");
+        }
+
+        // An in-VM scenario skip (AssertResult::skip — e.g. the booted
+        // topology is below the scenario's CPU/LLC floor) is a
+        // legitimate skip, NOT a failure. Project it to Ok here so the
+        // exit-code path maps it to EXIT_PASS (matching host-side skips
+        // routed through record_skip_sidecar) rather than falling into
+        // the `!is_pass()` failure-render path below (a skip-only result
+        // is not is_pass), which would mis-report a skip as a test
+        // failure. The sidecar was already written above, so the skip
+        // is recorded.
+        if check_result.is_skip() {
+            return Ok(check_result);
         }
 
         if !check_result.is_pass() {
