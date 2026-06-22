@@ -288,11 +288,6 @@ const EXCEPTIONS: &[(&str, &str, usize)] = &[
     ("workload/worker/mod.rs", "worker_main", 3275),              // queued: decompose
     // Added for post-fmt + recent-work growth; path order is cosmetic
     // (the guard collects EXCEPTIONS into a BTreeMap). queued: decompose.
-    (
-        "assert/phase_build.rs",
-        "build_phase_buckets_with_stimulus",
-        242,
-    ), // queued: decompose
     ("bin/cargo-ktstr.rs", "main", 239), // queued: decompose
     (
         "vmm/freeze_coord/kernel_op_dispatch.rs",

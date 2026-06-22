@@ -123,26 +123,52 @@ pub fn build_phase_buckets_with_stimulus(
         monitor_to_window_offset_ms,
         preemption_threshold_ns,
     );
-    // Synthesize a PhaseBucket for any scenario step that has a stimulus
-    // StepStart but produced no capture bucket. Periodic boundaries are
-    // placed uniformly over the whole workload (step-agnostic — see
-    // `compute_periodic_boundaries_ns`), so a short interior step can
-    // capture zero samples and leave no bucket. The iteration_rate
-    // attribution loop below only mutates EXISTING buckets, so without
-    // this seam that step's capture-independent rate (derived purely from
-    // the StepStart/StepEnd total_iterations deltas, needing no capture)
-    // would be silently dropped. The synthesized bucket carries the
-    // step's true stimulus window so `fold_monitor_into_bucket` still
-    // recovers its monitor-derived imbalance; `sample_count == 0` marks
-    // it capture-free for downstream consumers. `Timeline::from_phase_buckets`
-    // COMPARES this bucket's stimulus-derived throughput across the gap
-    // (the iteration_rate is real, not a sampling artifact) but GATES the
-    // monitor-derived metrics (imbalance/dsq/fallback/keep_last) behind
-    // both sides having samples — see `detect_boundary_changes`. BASELINE
-    // (step 0) is synthesized only if a StepStart carries
-    // `step_index == 0` — it is not special-cased.
     let step_starts = crate::scenario::sample::step_starts_from_stimulus(stimulus_events);
-    for &(start_ms, k) in &step_starts {
+    synthesize_missing_step_buckets(
+        &mut buckets,
+        &step_starts,
+        stimulus_events,
+        monitor_samples,
+        monitor_to_window_offset_ms,
+        preemption_threshold_ns,
+    );
+    // Keep buckets in step_index order: buckets_from_grouped emits them
+    // sorted (BTreeMap key order), but the synthesize loop appends out of
+    // order. Downstream lookups resolve by step_index, but a sorted vec
+    // matches the captured-bucket invariant and keeps rendered output
+    // stable.
+    buckets.sort_by_key(|b| b.step_index);
+    fill_phase_iteration_rates(&mut buckets, stimulus_events);
+    buckets
+}
+
+/// Synthesize a `PhaseBucket` for any scenario step that has a stimulus
+/// StepStart but produced no capture bucket. Periodic boundaries are
+/// placed uniformly over the whole workload (step-agnostic — see
+/// `compute_periodic_boundaries_ns`), so a short interior step can
+/// capture zero samples and leave no bucket. The iteration_rate
+/// attribution in [`fill_phase_iteration_rates`] only mutates EXISTING
+/// buckets, so without this seam that step's capture-independent rate
+/// (derived purely from the StepStart/StepEnd total_iterations deltas,
+/// needing no capture) would be silently dropped. The synthesized bucket
+/// carries the step's true stimulus window so `fold_monitor_into_bucket`
+/// still recovers its monitor-derived imbalance; `sample_count == 0` marks
+/// it capture-free for downstream consumers. `Timeline::from_phase_buckets`
+/// COMPARES this bucket's stimulus-derived throughput across the gap
+/// (the iteration_rate is real, not a sampling artifact) but GATES the
+/// monitor-derived metrics (imbalance/dsq/fallback/keep_last) behind
+/// both sides having samples — see `detect_boundary_changes`. BASELINE
+/// (step 0) is synthesized only if a StepStart carries
+/// `step_index == 0` — it is not special-cased.
+fn synthesize_missing_step_buckets(
+    buckets: &mut Vec<PhaseBucket>,
+    step_starts: &[(u64, u16)],
+    stimulus_events: &[crate::timeline::StimulusEvent],
+    monitor_samples: &[crate::monitor::MonitorSample],
+    monitor_to_window_offset_ms: i64,
+    preemption_threshold_ns: u64,
+) {
+    for &(start_ms, k) in step_starts {
         if buckets.iter().any(|b| b.step_index == k) {
             continue;
         }
@@ -218,20 +244,22 @@ pub fn build_phase_buckets_with_stimulus(
         );
         buckets.push(bucket);
     }
-    // Keep buckets in step_index order: buckets_from_grouped emits them
-    // sorted (BTreeMap key order), but the synthesize loop appends out of
-    // order. Downstream lookups resolve by step_index, but a sorted vec
-    // matches the captured-bucket invariant and keeps rendered output
-    // stable.
-    buckets.sort_by_key(|b| b.step_index);
-    // Per-phase iteration_rate from stimulus event total_iterations
-    // deltas. Walk events pairwise; for each pair compute the
-    // rate. Sort events by elapsed_ms first so an out-of-order
-    // arrival from the bulk-port drain doesn't silently lose the
-    // delta to saturating_sub (the legacy Timeline::build path at
-    // src/timeline.rs sorts the same way; without the sort, an
-    // inversion produces duration_ms == 0 → skipped, a silent
-    // drop).
+}
+
+/// Fill each phase bucket's `iteration_rate` Rate components from the
+/// stimulus event `total_iterations` deltas. Walk events pairwise; for
+/// each pair compute the rate. Sort events by elapsed_ms first so an
+/// out-of-order arrival from the bulk-port drain doesn't silently lose the
+/// delta to saturating_sub (the legacy Timeline::build path at
+/// src/timeline.rs sorts the same way; without the sort, an inversion
+/// produces duration_ms == 0 → skipped, a silent drop).
+///
+/// Must run AFTER the synthesize seam and the step_index sort so it sees
+/// the full, ordered bucket set exactly as the returned vec will hold it.
+fn fill_phase_iteration_rates(
+    buckets: &mut [PhaseBucket],
+    stimulus_events: &[crate::timeline::StimulusEvent],
+) {
     let mut sorted_events: Vec<&crate::timeline::StimulusEvent> = stimulus_events.iter().collect();
     // Total-order on an elapsed_ms tie: StepEnd before StepStart
     // (`!is_step_end` is false=0 for StepEnd) so a zero-length inter-step
@@ -333,7 +361,6 @@ pub fn build_phase_buckets_with_stimulus(
     for bucket in buckets.iter_mut() {
         crate::stats::derive_rate_metrics(&mut bucket.metrics);
     }
-    buckets
 }
 
 /// Build per-phase metric buckets from a sample series.
