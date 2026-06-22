@@ -32,3 +32,22 @@ fn spawn_futex_ping_pong_produces_work() {
         );
     }
 }
+#[test]
+fn spawn_signal_storm_produces_work() {
+    let reports = spawn_and_collect_after(
+        WorkType::SignalStorm {
+            signals_per_iter: 8,
+            work_iters: 128,
+        },
+        2,
+        500,
+    );
+    assert_eq!(reports.len(), 2);
+    for r in &reports {
+        assert!(
+            r.work_units > 0,
+            "SignalStorm worker {} did no work — hit the futex==None break (worker/mod.rs:2660) or never reached spin_burst",
+            r.tid
+        );
+    }
+}

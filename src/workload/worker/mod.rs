@@ -2612,8 +2612,15 @@ pub(super) fn worker_main(
                 signals_per_iter,
                 work_iters,
             } => {
-                // Paired SIGUSR1 storm. Each worker installs a
-                // no-op SIGUSR1 handler once and exchanges its tid
+                // Paired SIGUSR2 storm. Uses SIGUSR2 (not SIGUSR1)
+                // because SIGUSR1 is the framework's Fork-mode stop
+                // channel (sigusr1_handler flips STOP); a no-op SIGUSR1
+                // handler installed here would clobber the stop handler
+                // and leave the worker un-stoppable — it would loop
+                // until the killpg/SIGKILL escalation, never returning
+                // to write its report (work_units would collect as 0).
+                // Each worker installs a no-op SIGUSR2 handler once and
+                // exchanges its tid
                 // with the partner via the per-pair futex shared
                 // region (slot 0 = worker 0's tid, slot 1 = worker
                 // 1's tid). Once both slots are populated, each
@@ -2652,7 +2659,7 @@ pub(super) fn worker_main(
                     sa.sa_flags = libc::SA_RESTART;
                     unsafe {
                         libc::sigemptyset(&mut sa.sa_mask);
-                        libc::sigaction(libc::SIGUSR1, &sa, std::ptr::null_mut());
+                        libc::sigaction(libc::SIGUSR2, &sa, std::ptr::null_mut());
                     }
                 });
                 let (futex_ptr, pos) = match futex {
@@ -2691,7 +2698,7 @@ pub(super) fn worker_main(
                         // Works across Fork, Thread, and Pcomm
                         // modes (see arm doc above).
                         let rc =
-                            unsafe { libc::syscall(libc::SYS_tkill, partner_tid, libc::SIGUSR1) };
+                            unsafe { libc::syscall(libc::SYS_tkill, partner_tid, libc::SIGUSR2) };
                         if rc == -1 {
                             let errno = std::io::Error::last_os_error().raw_os_error();
                             if !tkill_warned {

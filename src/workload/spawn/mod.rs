@@ -1062,6 +1062,10 @@ pub(super) fn futex_region_size_for(work_type: &WorkType) -> usize {
             let q = std::cmp::min(*queue_depth_target as usize, usize::MAX / 8 - 4);
             32 + q * 8
         }
+        // SignalStorm exchanges two u32 tid slots through the region
+        // (worker 0's tid @ offset 0, worker 1's @ offset 4), so it
+        // needs 8 bytes, not the default single u32.
+        WorkType::SignalStorm { .. } => 2 * std::mem::size_of::<u32>(),
         _ => std::mem::size_of::<u32>(),
     }
 }
