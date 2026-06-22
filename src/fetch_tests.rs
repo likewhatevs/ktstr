@@ -1243,12 +1243,18 @@ fn fetch_releases_against_localhost_mock_returns_parsed() {
 
 fn test_client() -> reqwest::blocking::Client {
     reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        // Bypass any ambient HTTP(S)_PROXY. Every caller hits a localhost
-        // mockito server (or makes no request), so on a CI runner with a
-        // proxy set, reqwest would otherwise route the 127.0.0.1 request
-        // through the proxy and time out. Production fetch keeps the proxy
-        // for real kernel.org downloads; only this test client opts out.
+        // Generous timeout. These tests drive a localhost mockito server
+        // whose background runtime is CPU-starved on a saturated CI runner
+        // (nextest runs many test processes in parallel, several VM-booting),
+        // so the original 5s fired before the mock could respond — a
+        // deterministic TimedOut across every retry. 60s sits under the
+        // nextest CI slow-timeout (90s) and lets the slow-under-load mock
+        // complete; locally the response is instant, so passing tests are
+        // unaffected.
+        .timeout(std::time::Duration::from_secs(60))
+        // Also bypass any ambient proxy so a proxied runner never routes the
+        // 127.0.0.1 mock request elsewhere (defensive). Production fetch keeps
+        // the proxy for real downloads.
         .no_proxy()
         .build()
         .expect("build test client")
