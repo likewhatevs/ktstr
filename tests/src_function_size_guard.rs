@@ -189,7 +189,6 @@ const EXCEPTIONS: &[(&str, &str, usize)] = &[
     ("vmm/mod.rs", "KtstrVm::run_interactive", 813),              // queued: decompose
     ("vmm/rust_init/dump.rs", "start_sched_exit_monitor", 222),   // queued: decompose
     ("vmm/rust_init/init.rs", "ktstr_guest_init", 765),           // queued: decompose
-    ("vmm/rust_init/relay.rs", "run_relay_session", 209),         // queued: decompose
     ("vmm/virtio_blk/control.rs", "VirtioBlk::set_status", 420),  // queued: decompose
     (
         "vmm/virtio_blk/device.rs",

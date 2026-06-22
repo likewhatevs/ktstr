@@ -532,6 +532,101 @@ fn drain_port_emit_errors(port: &mut std::fs::File) {
     }
 }
 
+/// Write the inline no-scheduler error envelope to the port,
+/// drain-and-error any already-queued host requests, and return
+/// [`RelaySessionExit::Other`]. Shared by every
+/// [`run_relay_session`] arm that abandons the socket
+/// (unhealthy-on-entry, socket write failure, socket EOF, socket
+/// read error, POLLHUP/POLLERR) so each writes the same envelope
+/// and runs the same drain before the outer loop re-arms inotify.
+/// The `write_all` result is discarded because the session is
+/// exiting regardless — a failed envelope write only means the
+/// host's pending request_raw waits for the next session instead
+/// of seeing NoScheduler now.
+fn emit_relay_errors_and_exit(port: &mut std::fs::File) -> RelaySessionExit {
+    let _ = port.write_all(SCHED_STATS_RELAY_NO_SCHEDULER_REPLY);
+    drain_port_emit_errors(port);
+    RelaySessionExit::Other
+}
+
+/// Outcome of one [`poll_relay_fds`] call. `Ready` carries the
+/// per-fd readiness snapshot the relay session acts on; `Retry`
+/// signals an EINTR-interrupted poll the caller re-issues by
+/// continuing its loop; `Exit` carries the [`RelaySessionExit`] a
+/// poll error terminates the session with.
+enum PollOutcome {
+    /// Poll returned and the revents were snapshotted. Mirrors the
+    /// four readiness flags the original inline poll block produced.
+    Ready {
+        port_ready: bool,
+        socket_in: bool,
+        socket_hup_seen: bool,
+        stop_ready: bool,
+    },
+    /// `poll` was interrupted by `EINTR`; the caller re-polls by
+    /// continuing its loop.
+    Retry,
+    /// `poll` failed with a non-EINTR error; the session exits with
+    /// the carried [`RelaySessionExit`].
+    Exit(RelaySessionExit),
+}
+
+/// Poll the relay session's three fds (port, scheduler socket,
+/// stop eventfd) for POLLIN and snapshot the revents. The `fds`
+/// array — and the immutable borrows on `port`, `socket`, and
+/// `stop_evt` it holds — live only for this call, so the borrows
+/// end when it returns and the caller can read/write `port` and
+/// `socket` freely. Returns [`PollOutcome::Retry`] on `EINTR`,
+/// [`PollOutcome::Exit`] on any other poll error, and
+/// [`PollOutcome::Ready`] with the four readiness flags otherwise.
+fn poll_relay_fds(
+    port: &std::fs::File,
+    socket: &std::os::unix::net::UnixStream,
+    stop_evt: &Arc<vmm_sys_util::eventfd::EventFd>,
+) -> PollOutcome {
+    let port_fd = port.as_fd();
+    let socket_fd = socket.as_fd();
+    // SAFETY: `stop_evt` is held by the surrounding `Arc`,
+    // so the raw fd is valid for the whole inner scope.
+    let stop_evt_fd = unsafe { std::os::unix::io::BorrowedFd::borrow_raw(stop_evt.as_raw_fd()) };
+    let mut fds = [
+        PollFd::new(port_fd, PollFlags::POLLIN),
+        PollFd::new(socket_fd, PollFlags::POLLIN),
+        PollFd::new(stop_evt_fd, PollFlags::POLLIN),
+    ];
+    match poll(&mut fds, PollTimeout::NONE) {
+        Ok(_) => {}
+        Err(nix::errno::Errno::EINTR) => return PollOutcome::Retry,
+        Err(e) => {
+            tracing::warn!(error = %e, "stats relay: poll failed; exiting session");
+            return PollOutcome::Exit(RelaySessionExit::Other);
+        }
+    }
+    // Snapshot the revents and drop the borrows.
+    let port_rev = fds[0].revents();
+    let socket_rev = fds[1].revents();
+    let stop_rev = fds[2].revents();
+    let port_ready = port_rev.is_some_and(|r| r.contains(PollFlags::POLLIN));
+    let socket_in = socket_rev.is_some_and(|r| r.contains(PollFlags::POLLIN));
+    // B6: any POLLHUP or POLLERR on the socket — with or
+    // without POLLIN — is a permanent transition to
+    // unhealthy. POLLHUP+POLLIN means buffered data is
+    // still drainable; the same-iteration drain of the
+    // socket POLLIN happens below after `socket_healthy`
+    // is flipped, because reading from a HUP'd socket with
+    // buffered data is well-defined — only WRITES need the
+    // gate.
+    let socket_hup_seen = socket_rev
+        .is_some_and(|r| r.contains(PollFlags::POLLHUP) || r.contains(PollFlags::POLLERR));
+    let stop_ready = stop_rev.is_some_and(|r| r.contains(PollFlags::POLLIN));
+    PollOutcome::Ready {
+        port_ready,
+        socket_in,
+        socket_hup_seen,
+        stop_ready,
+    }
+}
+
 /// Run a single port-↔-socket relay session. Returns
 /// [`RelaySessionExit::PortEof`] when `port.read` returned Ok(0)
 /// (the outer loop counts these toward the busy-loop budget — see
@@ -556,9 +651,7 @@ fn run_relay_session(
     stop: &Arc<AtomicBool>,
     stop_evt: &Arc<vmm_sys_util::eventfd::EventFd>,
 ) -> RelaySessionExit {
-    use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
     use std::io::ErrorKind;
-    use std::os::unix::io::AsFd;
 
     let mut buf = vec![0u8; RELAY_BUFFER_BYTES];
     // B6: track socket health across poll iterations. Set false the
@@ -576,49 +669,21 @@ fn run_relay_session(
     while !stop.load(Ordering::Acquire) {
         // Wait for one of: host pushed bytes (port readable),
         // scheduler emitted bytes (socket readable), or shutdown
-        // (stop_evt readable). Wrap the poll call in an inner
-        // scope so the `fds` array (and the immutable borrows on
-        // port + socket it holds) drops before we try to read or
-        // write either of them.
-        let (port_ready, socket_in, socket_hup_seen, stop_ready) = {
-            let port_fd = port.as_fd();
-            let socket_fd = socket.as_fd();
-            // SAFETY: `stop_evt` is held by the surrounding `Arc`,
-            // so the raw fd is valid for the whole inner scope.
-            let stop_evt_fd =
-                unsafe { std::os::unix::io::BorrowedFd::borrow_raw(stop_evt.as_raw_fd()) };
-            let mut fds = [
-                PollFd::new(port_fd, PollFlags::POLLIN),
-                PollFd::new(socket_fd, PollFlags::POLLIN),
-                PollFd::new(stop_evt_fd, PollFlags::POLLIN),
-            ];
-            match poll(&mut fds, PollTimeout::NONE) {
-                Ok(_) => {}
-                Err(nix::errno::Errno::EINTR) => continue,
-                Err(e) => {
-                    tracing::warn!(error = %e, "stats relay: poll failed; exiting session");
-                    return RelaySessionExit::Other;
-                }
-            }
-            // Snapshot the revents and drop the borrows.
-            let port_rev = fds[0].revents();
-            let socket_rev = fds[1].revents();
-            let stop_rev = fds[2].revents();
-            let port_ready = port_rev.is_some_and(|r| r.contains(PollFlags::POLLIN));
-            let socket_in = socket_rev.is_some_and(|r| r.contains(PollFlags::POLLIN));
-            // B6: any POLLHUP or POLLERR on the socket — with or
-            // without POLLIN — is a permanent transition to
-            // unhealthy. POLLHUP+POLLIN means buffered data is
-            // still drainable; the same-iteration drain of the
-            // socket POLLIN happens below after `socket_healthy`
-            // is flipped, because reading from a HUP'd socket with
-            // buffered data is well-defined — only WRITES need the
-            // gate.
-            let socket_hup_seen = socket_rev
-                .is_some_and(|r| r.contains(PollFlags::POLLHUP) || r.contains(PollFlags::POLLERR));
-            let stop_ready = stop_rev.is_some_and(|r| r.contains(PollFlags::POLLIN));
-            (port_ready, socket_in, socket_hup_seen, stop_ready)
-        };
+        // (stop_evt readable). `poll_relay_fds` performs the poll
+        // and snapshots the revents in an inner scope so the
+        // immutable borrows on port + socket end before we read or
+        // write either of them here.
+        let (port_ready, socket_in, socket_hup_seen, stop_ready) =
+            match poll_relay_fds(port, &socket, stop_evt) {
+                PollOutcome::Ready {
+                    port_ready,
+                    socket_in,
+                    socket_hup_seen,
+                    stop_ready,
+                } => (port_ready, socket_in, socket_hup_seen, stop_ready),
+                PollOutcome::Retry => continue,
+                PollOutcome::Exit(e) => return e,
+            };
 
         // Flip `socket_healthy` to false IMMEDIATELY when
         // POLLHUP/POLLERR is observed in the current iteration —
@@ -678,9 +743,7 @@ fn run_relay_session(
                     "stats relay: port→socket forward skipped (socket already \
                      unhealthy); emitting error envelopes and reconnecting"
                 );
-                let _ = port.write_all(SCHED_STATS_RELAY_NO_SCHEDULER_REPLY);
-                drain_port_emit_errors(port);
-                return RelaySessionExit::Other;
+                return emit_relay_errors_and_exit(port);
             }
             if let Err(e) = socket.write_all(&buf[..n]) {
                 tracing::debug!(
@@ -698,9 +761,7 @@ fn run_relay_session(
                 // No need to mutate `socket_healthy` here — every
                 // arm that reaches a write-failure path returns
                 // immediately and the local goes out of scope.
-                let _ = port.write_all(SCHED_STATS_RELAY_NO_SCHEDULER_REPLY);
-                drain_port_emit_errors(port);
-                return RelaySessionExit::Other;
+                return emit_relay_errors_and_exit(port);
             }
         }
 
@@ -718,9 +779,7 @@ fn run_relay_session(
                     tracing::debug!(
                         "stats relay: socket EOF; emitting error envelopes and reconnecting"
                     );
-                    let _ = port.write_all(SCHED_STATS_RELAY_NO_SCHEDULER_REPLY);
-                    drain_port_emit_errors(port);
-                    return RelaySessionExit::Other;
+                    return emit_relay_errors_and_exit(port);
                 }
                 Ok(m) => m,
                 Err(e) if e.kind() == ErrorKind::Interrupted => continue,
@@ -729,9 +788,7 @@ fn run_relay_session(
                         error = %e,
                         "stats relay: socket read error; emitting error envelopes and reconnecting"
                     );
-                    let _ = port.write_all(SCHED_STATS_RELAY_NO_SCHEDULER_REPLY);
-                    drain_port_emit_errors(port);
-                    return RelaySessionExit::Other;
+                    return emit_relay_errors_and_exit(port);
                 }
             };
             if let Err(e) = port.write_all(&buf[..m]) {
@@ -755,9 +812,7 @@ fn run_relay_session(
                 drained_in = socket_in,
                 "stats relay: socket POLLHUP/POLLERR; reconnecting after draining"
             );
-            let _ = port.write_all(SCHED_STATS_RELAY_NO_SCHEDULER_REPLY);
-            drain_port_emit_errors(port);
-            return RelaySessionExit::Other;
+            return emit_relay_errors_and_exit(port);
         }
     }
     // Reached only when the outer `stop` flag is observed at the
