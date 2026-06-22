@@ -499,119 +499,55 @@ pub(super) fn emit_entry_static(input: ItemFn, attrs: AttrValues) -> proc_macro2
         };
     };
 
-    // Both expect_err and expect_ok test bodies share the same
-    // host-classification arms — they only differ on the success arm
-    // and the unconditional-Err arm. Two classes: SKIP bailouts
-    // (harness-not-configured always skips; resource-contention,
-    // topology-insufficient, and perf-mode-unavailable skip but promote to
-    // a hard fail under KTSTR_NO_SKIP_MODE — all host-insufficiency
-    // conditions the test cannot run under) and hard-FAIL bailouts
-    // (cpu-budget-unsatisfiable, topology-unrepresentable) that panic even
-    // in the expect_err body so a test misconfiguration is never swallowed
-    // as the expected failure.
-    // Factored into one TokenStream so a future change lands in one place
-    // and both branches inherit it.
-    let host_class_arms = quote! {
-        Err(e) if ::ktstr::test_support::is_kernel_unavailable(&e) => {
-            // Harness not configured (no kernel resolved): the
-            // binary was likely invoked outside `cargo ktstr test`,
-            // which builds and injects a kernel automatically.
-            // Skip cleanly so a developer running `cargo nextest
-            // run` directly sees a SKIP banner rather than a
-            // confusing "no kernel found" panic. Applies in both
-            // the expect_err and expect_ok directions — an
-            // expect_err test that never ran is also a non-failure.
-            eprintln!("ktstr: SKIP: harness not configured: {e:#}");
-            return;
-        }
-        Err(e) if ::ktstr::test_support::is_resource_contention(&e) => {
-            // Resource contention is host-infra, not a test
-            // outcome: emit the canonical SKIP banner and early-
-            // return so libtest sees pass. The skip sidecar is
-            // recorded inside `run_ktstr_test_inner` at every
-            // contention site, so stats tooling still sees the
-            // skip without a panic-driven retry. For expect_err
-            // tests this also prevents host contention from
-            // masquerading as the expected failure (a false-
-            // positive pass for the wrong reason).
-            //
-            // KTSTR_NO_SKIP_MODE inverts the policy: CI runs that
-            // demand every test execute against the available
-            // hardware promote contention to a hard failure so a
-            // misconfigured host surfaces instead of silently
-            // passing.
-            if ::std::env::var_os("KTSTR_NO_SKIP_MODE").is_some() {
-                panic!(
-                    "ktstr: FAIL: resource contention under --no-skip-mode: {e:#}. \
-                     Either provision hardware that satisfies the test's topology \
-                     requirement, or drop --no-skip-mode / KTSTR_NO_SKIP_MODE to \
-                     accept the skip."
-                );
+    // Host-error handling shared by the expect_err and expect_ok test
+    // bodies. One macro-only arm precedes the shared classifier:
+    // KernelUnavailable (the harness has no kernel — the binary was run
+    // outside `cargo ktstr test`, which injects one). It stays macro-only:
+    // err_to_exit_code has no KernelUnavailable arm (a KernelUnavailable
+    // reaching the dispatch path falls through to the catch-all EXIT_FAIL
+    // there), so handling it only here is behavior-preserving (see
+    // test_support::host_class). The remaining FIVE host-insufficiency
+    // types route through `test_support::classify_host_error` — the single
+    // source of truth for the guard order + per-class skip/fail policy,
+    // shared with `err_to_exit_code` so the two sites cannot drift.
+    // `classify_host_error` returns a verdict; the libtest control flow
+    // (eprintln + return for a skip, panic for a fail) lives HERE, in the
+    // generated test fn body, so a fail panics in the test frame. The
+    // bare `reason` gets its `ktstr: SKIP:` / `ktstr: FAIL:` prefix at the
+    // emit site, matching the dispatch channels. The trailing
+    // NotHostClass behavior differs per direction (expect_err swallows a
+    // non-host failure; expect_ok panics with it), so it is interpolated.
+    let host_arms = |not_host_class: proc_macro2::TokenStream| {
+        quote! {
+            Err(e) if ::ktstr::test_support::is_kernel_unavailable(&e) => {
+                // Harness not configured: skip cleanly so a developer
+                // running the binary directly sees a SKIP banner rather
+                // than a confusing "no kernel found" panic. Non-failure
+                // in both the expect_err and expect_ok directions.
+                eprintln!("ktstr: SKIP: harness not configured: {e:#}");
+                return;
             }
-            eprintln!("ktstr: SKIP: resource contention: {e:#}");
-            return;
-        }
-        Err(e) if ::ktstr::test_support::is_topology_insufficient(&e) => {
-            // The VM cannot boot at all on this host -- an x86_64 kvm
-            // hardware cap (vCPUs > KVM_CAP_MAX_VCPUS, APIC id >=
-            // KVM_CAP_MAX_VCPU_ID, or guest RAM-top above MAXPHYADDR); fires
-            // for ANY VM of this shape, perf-mode or not. (A perf-mode host
-            // that can boot but cannot honor the isolation guarantee is
-            // PerfModeUnavailable -- the skip arm below.) Like resource
-            // contention this is a host-infra condition, not a test outcome:
-            // emit the canonical SKIP banner and early-return so libtest
-            // sees pass. The skip sidecar is recorded by
-            // run_ktstr_test_inner. KTSTR_NO_SKIP_MODE promotes it to a hard
-            // failure so a CI run that demands execution surfaces the
-            // unbootable host instead of silently passing.
-            if ::std::env::var_os("KTSTR_NO_SKIP_MODE").is_some() {
-                panic!(
-                    "ktstr: FAIL: host topology insufficient under --no-skip-mode: {e:#}. \
-                     Either provision a host with the required CPU / LLC count, or drop \
-                     --no-skip-mode / KTSTR_NO_SKIP_MODE to accept the skip."
-                );
-            }
-            eprintln!("ktstr: SKIP: host topology insufficient: {e:#}");
-            return;
-        }
-        Err(e) if ::ktstr::test_support::is_perf_mode_unavailable(&e) => {
-            // Host-insufficiency SKIP, like resource contention / topology
-            // insufficient above: the host fundamentally cannot honor the
-            // performance_mode isolation guarantee (too few CPUs for an
-            // exclusive host LLC + a service CPU, e.g. a single-LLC host
-            // whose LLC spans every CPU). The VM never runs unisolated (it
-            // errors at build), so emit a VISIBLE skip rather than a hard
-            // fail — keeping CI green on a host that can never satisfy
-            // perf-mode. KTSTR_NO_SKIP_MODE promotes it to a hard failure
-            // for runs that demand perf-mode execution. This arm precedes
-            // the expect_err body's `Err(_) => {}` swallow, so an
-            // expect_err test on a perf-incapable host skips rather than
-            // counting the host-config error as its expected failure.
-            if ::std::env::var_os("KTSTR_NO_SKIP_MODE").is_some() {
-                panic!(
-                    "ktstr: FAIL: performance mode unavailable under --no-skip-mode: {e:#}. \
-                     Provision a host with the required CPU / LLC count, narrow \
-                     the test topology, or drop --perf-mode / --no-skip-mode."
-                );
-            }
-            eprintln!("ktstr: SKIP: performance mode unavailable: {e:#}");
-            return;
-        }
-        Err(e) if ::ktstr::test_support::is_cpu_budget_unsatisfiable(&e) => {
-            // Hard FAIL: an explicit --cpu-cap / cpu_budget the host cannot
-            // satisfy. Same shared-block / expect_err-precedence rationale.
-            panic!("ktstr: FAIL: cpu budget unsatisfiable: {e:#}");
-        }
-        Err(e) if ::ktstr::test_support::is_topology_unrepresentable(&e) => {
-            // Hard FAIL: a topology no host can represent under this VMM's
-            // static device layout (the aarch64 over-MAX_VCPUS GICv3 case).
-            // Panics here in the shared block so it wins over the expect_err
-            // body's `Err(_) => {}` swallow — a test misconfiguration is
-            // never the expected logical failure.
-            panic!("ktstr: FAIL: topology unrepresentable: {e:#}");
+            Err(e) => match ::ktstr::test_support::classify_host_error(
+                &e,
+                ::std::env::var_os("KTSTR_NO_SKIP_MODE").is_some(),
+            ) {
+                ::ktstr::test_support::HostClass::Skip { reason } => {
+                    eprintln!("ktstr: SKIP: {reason}");
+                    return;
+                }
+                ::ktstr::test_support::HostClass::Fail { reason } => {
+                    panic!("ktstr: FAIL: {reason}");
+                }
+                ::ktstr::test_support::HostClass::NotHostClass => #not_host_class,
+            },
         }
     };
     let test_body = if expect_err {
+        // NotHostClass under expect_err: a non-host failure IS the
+        // expected failure, so swallow it. The host-class arms above win
+        // over this swallow (a host-insufficiency skip/fail is never the
+        // test's expected logical failure).
+        let host_arms = host_arms(quote! { {} });
         quote! {
             match ::ktstr::test_support::run_ktstr_test(&#entry_name) {
                 // A skip returns Ok(AssertResult::skip), NOT an Err —
@@ -626,16 +562,17 @@ pub(super) fn emit_entry_static(input: ItemFn, attrs: AttrValues) -> proc_macro2
                 // sidecar are already emitted inside run_ktstr_test_inner.
                 Ok(r) if r.is_skip() => {}
                 Ok(_) => panic!("expected test to fail but it passed"),
-                #host_class_arms
-                Err(_) => {}
+                #host_arms
             }
         }
     } else {
+        // NotHostClass under expect_ok: a non-host failure is a real
+        // test failure — panic with the full error chain.
+        let host_arms = host_arms(quote! { panic!("{e:#}") });
         quote! {
             match ::ktstr::test_support::run_ktstr_test(&#entry_name) {
                 Ok(_) => {}
-                #host_class_arms
-                Err(e) => panic!("{e:#}"),
+                #host_arms
             }
         }
     };

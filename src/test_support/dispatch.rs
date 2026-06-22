@@ -28,11 +28,11 @@ use crate::assert::AssertResult;
 #[cfg(feature = "export")]
 use super::extract_export_output_arg;
 use super::{
-    KTSTR_TESTS, KtstrTestEntry, TopoOverride, collect_sidecars, extract_export_test_arg,
-    extract_shell_test_arg, extract_test_fn_arg, extract_topo_arg, find_test,
-    format_callback_profile, format_kvm_stats, format_verifier_stats, maybe_dispatch_vm_test,
-    parse_topo_string, propagate_rust_env_from_cmdline, record_skip_sidecar, resolve_test_kernel,
-    run_ktstr_test_inner, sidecar_dir, try_flush_profraw,
+    HostClass, KTSTR_TESTS, KtstrTestEntry, TopoOverride, classify_host_error, collect_sidecars,
+    extract_export_test_arg, extract_shell_test_arg, extract_test_fn_arg, extract_topo_arg,
+    find_test, format_callback_profile, format_kvm_stats, format_verifier_stats,
+    maybe_dispatch_vm_test, parse_topo_string, propagate_rust_env_from_cmdline,
+    record_skip_sidecar, resolve_test_kernel, run_ktstr_test_inner, sidecar_dir, try_flush_profraw,
 };
 
 /// Check if an error is a host topology mismatch (e.g. test requests
@@ -124,11 +124,13 @@ pub fn is_cpu_budget_unsatisfiable(e: &anyhow::Error) -> bool {
 ///
 /// Chain-aware. A `TopologyUnrepresentable` is a HARD ERROR (a topology no
 /// host can represent under this VMM's static device layout — the aarch64
-/// over-`MAX_VCPUS` GICv3-redistributor case), NOT a skip. Routed to a
-/// dedicated FAIL arm placed ABOVE the `expect_err` inversion (and the
-/// RC/TI skip arms) so a too-wide aarch64 topology can neither masquerade
-/// as the expected failure nor be turned into a silent skip. Distinct from
-/// [`is_topology_insufficient`], which matches the host-DEPENDENT skip type.
+/// over-`MAX_VCPUS` GICv3-redistributor case), NOT a skip.
+/// `classify_host_error` classifies it as `HostClass::Fail`, checked above
+/// the RC/TI skip types and handled above the `expect_err` inversion in
+/// both `err_to_exit_code` and the macro body, so a too-wide aarch64
+/// topology can neither masquerade as the expected failure nor be turned
+/// into a silent skip. Distinct from [`is_topology_insufficient`], which
+/// matches the host-DEPENDENT skip type.
 ///
 /// [`TopologyUnrepresentable`]: crate::vmm::host_topology::TopologyUnrepresentable
 #[doc(hidden)]
@@ -1107,119 +1109,40 @@ fn ok_to_exit_code(r: AssertResult, expect_err: bool, allow_inconclusive: bool) 
 /// Map an `Err(anyhow::Error)` outcome to an exit code.
 ///
 /// The sequential guards preserve the original `match` arm precedence
-/// (first matching guard wins): `is_perf_mode_unavailable` (a
-/// host-insufficiency skip-or-fail, checked first), then the hard-FAIL
-/// classifiers (`is_cpu_budget_unsatisfiable` →
-/// `is_topology_unrepresentable`), then the other skip-or-fail
-/// host-insufficiency classifiers (`is_resource_contention` →
-/// `is_topology_insufficient`), then the marker-typed guards
-/// (`PostVmAssertionFailure` →
+/// (first matching guard wins): the host-insufficiency classification
+/// ([`classify_host_error`], covering perf-mode → cpu-budget →
+/// topology-unrepresentable → resource-contention → topology-insufficient,
+/// shared with the `#[ktstr_test]` macro body) runs FIRST, then the
+/// marker-typed guards (`PostVmAssertionFailure` →
 /// `ExpectAutoReproSatisfied`), then the `expect_err` inversion, then
 /// the catch-all (the former `Err(e) => …` arm) operating on the
 /// now-owned `e`. Reordering these would change which guard fires for an
-/// error matching more than one guard.
+/// error matching more than one guard. The host-insufficiency guard
+/// order + per-class skip/fail policy live in `classify_host_error`, not
+/// here, so this site and the macro cannot drift apart.
 fn err_to_exit_code(e: anyhow::Error, expect_err: bool, no_skip: bool) -> i32 {
-    if is_perf_mode_unavailable(&e) {
-        // Host-insufficiency SKIP, like resource contention / topology
-        // insufficient (below): the host fundamentally cannot honor the
-        // performance_mode isolation guarantee — too few CPUs for an
-        // exclusive host LLC + a service CPU (e.g. a single-LLC host
-        // where the LLC spans every CPU, so LLC+1 never fits). The VM is
-        // never run unisolated (it errors at build), so a VISIBLE skip
-        // keeps the operator informed without reddening CI on a host
-        // that can never satisfy perf-mode. KTSTR_NO_SKIP_MODE promotes
-        // it to a hard FAIL for runs that demand perf-mode execution.
-        let reason = e
-            .chain()
-            .find_map(|c| {
-                c.downcast_ref::<crate::vmm::host_topology::PerfModeUnavailable>()
-                    .map(|p| p.reason.clone())
-            })
-            .unwrap_or_else(|| "<unknown>".to_string());
-        if no_skip {
-            eprintln!(
-                "ktstr: FAIL: performance mode unavailable under --no-skip-mode: {reason}. \
-                 Provision a host with the required CPU / LLC count, narrow the \
-                 test topology, or drop --perf-mode / --no-skip-mode."
-            );
-            return EXIT_FAIL;
-        } else {
-            crate::report::test_skip(format_args!("performance mode unavailable: {reason}"));
+    // Host-insufficiency classification (perf-mode, cpu-budget,
+    // topology-unrepresentable, resource-contention, topology-insufficient)
+    // is shared with the `#[ktstr_test]` macro body via
+    // `classify_host_error` — the single source of truth for the guard
+    // ORDER and the per-class skip/fail policy. This site renders the
+    // verdict as an exit code; the macro renders the same `HostClass` as
+    // libtest control flow. The bare `reason` carries no prefix: the skip
+    // channel (`report::test_skip`) prepends `ktstr: SKIP:`, the fail
+    // channel prepends `ktstr: FAIL:`. Placed first so a host-insufficiency
+    // returns before the marker / expect_err / catch-all arms below — a
+    // skip is a skip and an unconditional hard fail is a hard fail
+    // regardless of `expect_err`.
+    match classify_host_error(&e, no_skip) {
+        HostClass::Skip { reason } => {
+            crate::report::test_skip(format_args!("{reason}"));
             return EXIT_PASS;
         }
-    }
-    if is_cpu_budget_unsatisfiable(&e) {
-        // Hard FAIL, not a skip: an explicit --cpu-cap / cpu_budget the
-        // host cannot satisfy (a user-typed number that does not exist
-        // here).
-        let reason = e
-            .chain()
-            .find_map(|c| {
-                c.downcast_ref::<crate::vmm::host_topology::CpuBudgetUnsatisfiable>()
-                    .map(|b| b.reason.clone())
-            })
-            .unwrap_or_else(|| "<unknown>".to_string());
-        eprintln!("ktstr: FAIL: cpu budget unsatisfiable: {reason}");
-        return EXIT_FAIL;
-    }
-    if is_topology_unrepresentable(&e) {
-        // Hard FAIL, not a skip: a topology no host can represent under
-        // this VMM's static device layout (the aarch64 over-MAX_VCPUS
-        // GICv3-redistributor case) is a test misconfiguration. Placed
-        // above the expect_err inversion (and the RC/TI skip guards) so it
-        // cannot masquerade as the expected failure or be turned into a
-        // skip — the deliberate counterpart to the x86 over-cap
-        // TopologyInsufficient skip guard below.
-        let reason = e
-            .chain()
-            .find_map(|c| {
-                c.downcast_ref::<crate::vmm::host_topology::TopologyUnrepresentable>()
-                    .map(|t| t.reason.clone())
-            })
-            .unwrap_or_else(|| "<unknown>".to_string());
-        eprintln!("ktstr: FAIL: topology unrepresentable: {reason}");
-        return EXIT_FAIL;
-    }
-    if is_resource_contention(&e) {
-        let reason = e
-            .chain()
-            .find_map(|c| {
-                c.downcast_ref::<crate::vmm::host_topology::ResourceContention>()
-                    .map(|rc| rc.reason.clone())
-            })
-            .unwrap_or_else(|| "<unknown>".to_string());
-        if no_skip {
-            eprintln!(
-                "ktstr: FAIL: resource contention under --no-skip-mode: {reason}. \
-                 Either provision hardware that satisfies the test's topology \
-                 requirement, or drop --no-skip-mode / KTSTR_NO_SKIP_MODE to \
-                 accept the skip."
-            );
+        HostClass::Fail { reason } => {
+            eprintln!("ktstr: FAIL: {reason}");
             return EXIT_FAIL;
-        } else {
-            crate::report::test_skip(format_args!("resource contention: {reason}"));
-            return EXIT_PASS;
         }
-    }
-    if is_topology_insufficient(&e) {
-        let reason = e
-            .chain()
-            .find_map(|c| {
-                c.downcast_ref::<crate::vmm::host_topology::TopologyInsufficient>()
-                    .map(|ti| ti.reason.clone())
-            })
-            .unwrap_or_else(|| "<unknown>".to_string());
-        if no_skip {
-            eprintln!(
-                "ktstr: FAIL: host topology insufficient under --no-skip-mode: {reason}. \
-                 Either provision a host with the required CPU / LLC count, or drop \
-                 --no-skip-mode / KTSTR_NO_SKIP_MODE to accept the skip."
-            );
-            return EXIT_FAIL;
-        } else {
-            crate::report::test_skip(format_args!("host topology insufficient: {reason}"));
-            return EXIT_PASS;
-        }
+        HostClass::NotHostClass => {}
     }
     if e.downcast_ref::<crate::test_support::eval::PostVmAssertionFailure>()
         .is_some()

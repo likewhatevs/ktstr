@@ -210,9 +210,9 @@ fn is_topology_insufficient_rejects_unrelated_and_other_typed_errors() {
 
 /// `is_topology_unrepresentable` recognizes the typed hard-fault through
 /// a `.context(...)` wrap (chain-aware, mirroring the eval VM-build
-/// wrap) and rejects the sibling skip type — so its dedicated FAIL arm
-/// fires for it and only it, and a `TopologyInsufficient` skip is never
-/// promoted to the hard fault.
+/// wrap) and rejects the sibling skip type — so `classify_host_error`
+/// classifies it as `HostClass::Fail` for it and only it, and a
+/// `TopologyInsufficient` skip is never promoted to the hard fault.
 #[test]
 fn is_topology_unrepresentable_is_chain_aware_and_distinct() {
     let direct: anyhow::Error =
@@ -227,8 +227,8 @@ fn is_topology_unrepresentable_is_chain_aware_and_distinct() {
         is_topology_unrepresentable(&wrapped),
         "context-wrapped must still match (chain-aware)",
     );
-    // The host-dependent skip counterpart must NOT match — the two arms
-    // are disjoint (one fails, one skips).
+    // The host-dependent skip counterpart must NOT match — the two
+    // classify_host_error classifications are disjoint (one Fail, one Skip).
     let insufficient: anyhow::Error =
         anyhow::Error::new(crate::vmm::host_topology::TopologyInsufficient {
             reason: "host has too few CPUs".into(),
@@ -1437,8 +1437,9 @@ fn result_to_exit_code_skip_maps_to_pass_even_under_expect_err() {
 /// host-insufficiency: it SKIPS (EXIT_PASS) when KTSTR_NO_SKIP_MODE is
 /// unset — including under expect_err=true, because the skip arm precedes
 /// the expect_err arm. Mirror of the ResourceContention / TopologyInsufficient
-/// skip tests; pins the first `err_to_exit_code` skip arm
-/// (`is_perf_mode_unavailable`). The no-skip-mode promotion to EXIT_FAIL is
+/// skip tests; pins the perf-mode skip routing through the shared
+/// `classify_host_error` (`HostClass::Skip`), surfaced via
+/// `result_to_exit_code` → `err_to_exit_code`. The no-skip-mode promotion to EXIT_FAIL is
 /// pinned by `result_to_exit_code_skip_class_fails_under_no_skip_mode`. NOTE:
 /// the 3rd `result_to_exit_code` arg is `allow_inconclusive`, NOT no_skip —
 /// no_skip is read from KTSTR_NO_SKIP_MODE_ENV inside the fn.
@@ -2034,10 +2035,9 @@ fn result_to_exit_code_post_vm_marker_wins_over_expect_auto_repro() {
 // -- result_to_exit_code: ResourceContention + TopologyInsufficient
 // skip/no-skip arms --
 //
-// Both typed errors route through the skip arms (the
-// `Err(e) if is_resource_contention(&e)` and
-// `Err(e) if is_topology_insufficient(&e)` arms of
-// `result_to_exit_code`):
+// Both typed errors route through the shared `classify_host_error`
+// (the `HostClass::Skip` / `Fail` mapping), surfaced via
+// `result_to_exit_code` → `err_to_exit_code`:
 // with KTSTR_NO_SKIP_MODE unset they map to EXIT_PASS (the test
 // never ran — `crate::report::test_skip` is a bare eprintln!, no VM
 // needed); with KTSTR_NO_SKIP_MODE set they hard-FAIL (EXIT_FAIL).
@@ -2090,8 +2090,8 @@ fn result_to_exit_code_resource_contention_skips_when_not_no_skip() {
 /// `TopologyInsufficient` (direct and `.context`-wrapped) routes to
 /// EXIT_PASS when KTSTR_NO_SKIP_MODE is unset — including under
 /// expect_err=true. Mirror of the ResourceContention skip test;
-/// pins the second skip arm (`result_to_exit_code`'s
-/// `Err(e) if is_topology_insufficient(&e)` arm).
+/// pins the topology-insufficient skip via the shared `classify_host_error`
+/// (`HostClass::Skip`), surfaced through `result_to_exit_code`.
 #[test]
 fn result_to_exit_code_topology_insufficient_skips_when_not_no_skip() {
     use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
@@ -2124,10 +2124,10 @@ fn result_to_exit_code_topology_insufficient_skips_when_not_no_skip() {
 /// Under KTSTR_NO_SKIP_MODE, all three skip-class errors hard-FAIL
 /// (EXIT_FAIL) instead of skipping, and the stderr banner names
 /// the contention/insufficiency reason. Pins the no_skip branches
-/// (the `if no_skip { ... EXIT_FAIL }` arms inside
-/// `result_to_exit_code`'s `is_perf_mode_unavailable`,
-/// `is_resource_contention`, and `is_topology_insufficient` Err arms)
-/// and the reason extraction.
+/// (the `no_skip` → `HostClass::Fail` arms in the shared
+/// `classify_host_error` for perf-mode, resource-contention, and
+/// topology-insufficient, surfaced via `result_to_exit_code`) and the
+/// reason extraction.
 #[test]
 fn result_to_exit_code_skip_class_fails_under_no_skip_mode() {
     use crate::test_support::test_helpers::{EnvVarGuard, capture_stderr, lock_env};

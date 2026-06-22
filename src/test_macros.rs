@@ -375,18 +375,27 @@ mod tests {
     }
 
     /// Pin the contract that the `#[ktstr_test]` macro's generated
-    /// body relies on: when `run_ktstr_test` returns
-    /// `Err(ResourceContention)` (possibly wrapped in
-    /// `.context(...)`), the macro must NOT panic — it must emit
-    /// the canonical `ktstr: SKIP: resource contention: ...`
-    /// banner and return. The macro lives in `ktstr-macros` and
-    /// expands to a literal `match` block that depends on
-    /// [`crate::test_support::is_resource_contention`] walking the
-    /// full error chain plus an `eprintln! + return` arm. We can't
-    /// invoke the proc-macro from a unit test, but we CAN simulate
-    /// its expansion shape and assert the same observable
-    /// behaviour: the banner is emitted, the post-arm sentinel
-    /// never executes, and the generated function never panics.
+    /// expect_ok body relies on: when `run_ktstr_test` returns
+    /// `Err(ResourceContention)` (possibly wrapped in `.context(...)`),
+    /// the macro must NOT panic — it must emit the canonical
+    /// `ktstr: SKIP: resource contention: ...` banner and return. The
+    /// macro lives in `ktstr-macros` and expands to a `match` whose
+    /// catch-all `Err(e)` arm routes through the REAL
+    /// [`crate::test_support::classify_host_error`] (the shared
+    /// single-source-of-truth classifier, also used by
+    /// `err_to_exit_code`) and maps a [`HostClass::Skip`] to
+    /// `eprintln! + return`. We can't invoke the proc-macro from a unit
+    /// test, but we CAN exercise the real classifier + the same
+    /// control-flow shape and assert the observable behaviour: the
+    /// canonical banner is emitted (the extracted reason, NOT the noisy
+    /// `.context(...)` chain), the post-arm sentinel never executes, and
+    /// the function never panics.
+    ///
+    /// `no_skip` is passed `false` directly (rather than read from the
+    /// env) so the test deterministically exercises the skip-default
+    /// path regardless of ambient `KTSTR_NO_SKIP_MODE` — the env read is
+    /// the macro's concern, not the classifier's (its env-independence is
+    /// the whole testability win).
     ///
     /// `#[cfg(panic = "unwind")]`: same rationale as the sibling
     /// `skip_on_contention_walks_context_chain` test —
@@ -395,17 +404,18 @@ mod tests {
     #[cfg(panic = "unwind")]
     fn ktstr_test_macro_body_skips_on_resource_contention() {
         use crate::test_support::test_helpers::capture_stderr;
+        use crate::test_support::{HostClass, classify_host_error};
         use crate::vmm::host_topology::ResourceContention;
         use std::sync::atomic::{AtomicBool, Ordering};
 
         let reached_tail = AtomicBool::new(false);
         let result = std::panic::catch_unwind(|| {
             let (_, bytes) = capture_stderr(|| {
-                // Simulates the body that
+                // Simulates the catch-all `Err(e)` arm of the body that
                 // `ktstr-macros::ktstr_test` expands into for a
-                // non-`expect_err` test. The contention arm must
-                // emit the SKIP banner and return; the trailing
-                // store must not execute.
+                // non-`expect_err` test: classify via the real shared fn,
+                // map Skip -> SKIP banner + return. The trailing store
+                // must not execute.
                 #[allow(unused_variables, unreachable_code)]
                 fn helper(reached: &AtomicBool) {
                     let result: Result<(), anyhow::Error> =
@@ -415,28 +425,24 @@ mod tests {
                         .context("build ktstr_test VM"));
                     match result {
                         Ok(_) => {}
-                        Err(e) if crate::test_support::is_resource_contention(&e) => {
-                            eprintln!("ktstr: SKIP: resource contention: {e:#}");
-                            return;
-                        }
-                        Err(e) => panic!("{e:#}"),
+                        Err(e) => match classify_host_error(&e, false) {
+                            HostClass::Skip { reason } => {
+                                eprintln!("ktstr: SKIP: {reason}");
+                                return;
+                            }
+                            HostClass::Fail { reason } => panic!("ktstr: FAIL: {reason}"),
+                            HostClass::NotHostClass => panic!("{e:#}"),
+                        },
                     }
                     reached.store(true, Ordering::SeqCst);
                 }
                 helper(&reached_tail);
             });
             let text = std::str::from_utf8(&bytes).expect("stderr is UTF-8");
-            assert!(
-                text.starts_with("ktstr: SKIP: resource contention: "),
-                "expected SKIP banner, got: {text:?}"
-            );
-            assert!(
-                text.contains("build ktstr_test VM"),
-                "banner must include the wrapping context layer; got: {text:?}"
-            );
-            assert!(
-                text.contains("all 3 LLC slots busy"),
-                "banner must include the inner ResourceContention reason; got: {text:?}"
+            assert_eq!(
+                text, "ktstr: SKIP: resource contention: all 3 LLC slots busy\n",
+                "expected the canonical SKIP banner with the extracted reason \
+                 (no .context(...) chain noise); got: {text:?}",
             );
         });
         assert!(

@@ -55,6 +55,7 @@ mod dispatch;
 mod entry;
 mod entry_validate;
 mod eval;
+mod host_class;
 mod metrics;
 #[cfg(feature = "llm")]
 mod model;
@@ -133,6 +134,7 @@ pub use entry::{
 };
 pub use eval::{KernelUnavailable, ResolveSource, resolve_scheduler, resolve_test_kernel};
 pub(crate) use eval::{record_skip_sidecar, run_ktstr_test_inner};
+pub use host_class::{HostClass, classify_host_error};
 pub use metrics::{
     MAX_WALK_DEPTH, WALK_TRUNCATION_SENTINEL_NAME, extract_metrics, is_truncation_sentinel_name,
     walk_json_leaves,
