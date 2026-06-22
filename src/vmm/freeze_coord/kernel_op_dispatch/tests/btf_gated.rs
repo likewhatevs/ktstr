@@ -95,8 +95,7 @@ fn percpu_symbols_and_paint(
     per_cpu_off: u64,
 ) -> std::collections::HashMap<String, u64> {
     let arr_slot_pa = ARR_PA + (cpu as u64) * 8;
-    buf[arr_slot_pa as usize..arr_slot_pa as usize + 8]
-        .copy_from_slice(&per_cpu_off.to_le_bytes());
+    buf[arr_slot_pa as usize..arr_slot_pa as usize + 8].copy_from_slice(&per_cpu_off.to_le_bytes());
     let mut m = std::collections::HashMap::new();
     m.insert("runqueues".to_string(), PAGE_OFFSET + BASE_PA);
     m.insert(
@@ -117,7 +116,10 @@ fn resolve_per_cpu_field_pa_happy_path_returns_base_pa() {
     let kernel = build_test_kernel(&mut buf, symbols);
     let pa = resolve_per_cpu_field_pa(&kernel, Some(&btf), 0, "runqueues", "nr_running", 0)
         .expect("per-cpu field PA must resolve");
-    assert_eq!(pa as u64, BASE_PA, "nr_running@0x0 + per_cpu_off=0 → BASE_PA");
+    assert_eq!(
+        pa as u64, BASE_PA,
+        "nr_running@0x0 + per_cpu_off=0 → BASE_PA"
+    );
 }
 
 /// Non-zero per-cpu offset shifts the resolved PA by exactly that
@@ -473,10 +475,7 @@ fn task_struct_btf() -> Vec<u8> {
         CastSynType::Struct {
             name_off: n_sched_ext_entity,
             size: 0x10,
-            members: vec![
-                member(n_dsq, 1, 0x0),
-                member(n_runnable_node, 1, 0x8),
-            ],
+            members: vec![member(n_dsq, 1, 0x0), member(n_runnable_node, 1, 0x8)],
         },
         // id=3: task_struct. scalar members → id=1; scx → id=2 so
         // nested descent reaches sched_ext_entity. Offsets are the
@@ -551,15 +550,13 @@ fn resolve_and_validate_task_field_happy_path_returns_task_pa() {
     let mut buf = vec![0u8; 0x4000];
     let symbols = paint_task_field_fixture(&mut buf);
     let kernel = build_test_kernel(&mut buf, symbols);
-    let (task_pa, _struct_t) = resolve_and_validate_task_field(
-        &kernel,
-        Some(&btf),
-        0,
-        TF_PID,
-        DEFAULT_START_TIME,
-    )
-    .expect("task field must resolve + validate");
-    assert_eq!(task_pa, TF_LEADER_PA, "must return the leader's direct-map PA");
+    let (task_pa, _struct_t) =
+        resolve_and_validate_task_field(&kernel, Some(&btf), 0, TF_PID, DEFAULT_START_TIME)
+            .expect("task field must resolve + validate");
+    assert_eq!(
+        task_pa, TF_LEADER_PA,
+        "must return the leader's direct-map PA"
+    );
 }
 
 /// End-to-end TaskField write through the production dispatcher: the
@@ -742,14 +739,8 @@ fn resolve_and_validate_task_field_btf_none_rejects() {
     let mut buf = vec![0u8; 0x4000];
     let symbols = paint_task_field_fixture(&mut buf);
     let kernel = build_test_kernel(&mut buf, symbols);
-    let err = resolve_and_validate_task_field(
-        &kernel,
-        None,
-        0,
-        TF_PID,
-        DEFAULT_START_TIME,
-    )
-    .expect_err("btf=None must reject");
+    let err = resolve_and_validate_task_field(&kernel, None, 0, TF_PID, DEFAULT_START_TIME)
+        .expect_err("btf=None must reject");
     assert!(err.contains("BTF not loaded"), "{err}");
 }
 
@@ -763,14 +754,8 @@ fn resolve_and_validate_task_field_no_init_task_rejects() {
     let mut symbols = paint_task_field_fixture(&mut buf);
     symbols.remove("init_task");
     let kernel = build_test_kernel(&mut buf, symbols);
-    let err = resolve_and_validate_task_field(
-        &kernel,
-        Some(&btf),
-        0,
-        TF_PID,
-        DEFAULT_START_TIME,
-    )
-    .expect_err("absent init_task must reject");
+    let err = resolve_and_validate_task_field(&kernel, Some(&btf), 0, TF_PID, DEFAULT_START_TIME)
+        .expect_err("absent init_task must reject");
     assert!(err.contains("init_task symbol absent"), "{err}");
 }
 
@@ -784,18 +769,9 @@ fn resolve_and_validate_task_field_no_ext_sched_class_rejects() {
     let mut symbols = paint_task_field_fixture(&mut buf);
     symbols.remove("ext_sched_class");
     let kernel = build_test_kernel(&mut buf, symbols);
-    let err = resolve_and_validate_task_field(
-        &kernel,
-        Some(&btf),
-        0,
-        TF_PID,
-        DEFAULT_START_TIME,
-    )
-    .expect_err("absent ext_sched_class must reject");
-    assert!(
-        err.contains("without CONFIG_SCHED_CLASS_EXT"),
-        "{err}"
-    );
+    let err = resolve_and_validate_task_field(&kernel, Some(&btf), 0, TF_PID, DEFAULT_START_TIME)
+        .expect_err("absent ext_sched_class must reject");
+    assert!(err.contains("without CONFIG_SCHED_CLASS_EXT"), "{err}");
 }
 
 /// task_struct absent from BTF → TaskValidationOffsets::resolve_from_btf
@@ -809,13 +785,7 @@ fn resolve_and_validate_task_field_task_struct_btf_miss_rejects() {
     let mut buf = vec![0u8; 0x4000];
     let symbols = paint_task_field_fixture(&mut buf);
     let kernel = build_test_kernel(&mut buf, symbols);
-    let err = resolve_and_validate_task_field(
-        &kernel,
-        Some(&btf),
-        0,
-        TF_PID,
-        DEFAULT_START_TIME,
-    )
-    .expect_err("absent task_struct BTF must reject");
+    let err = resolve_and_validate_task_field(&kernel, Some(&btf), 0, TF_PID, DEFAULT_START_TIME)
+        .expect_err("absent task_struct BTF must reject");
     assert!(err.contains("'struct task_struct' lookup"), "{err}");
 }

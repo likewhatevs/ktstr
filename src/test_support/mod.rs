@@ -71,10 +71,10 @@ pub use shell_descriptor::{SchedulerKind, ShellTestDescriptor};
 pub mod wprof;
 #[cfg(feature = "wprof")]
 pub use wprof::{PERFETTO_TRACE_PACKETS_TAG, WPROF_PB_MIN_BYTES, assert_wprof_pb_shape};
-mod sidecar;
-pub(crate) mod staged;
 #[cfg(test)]
 pub(crate) mod btf_blob;
+mod sidecar;
+pub(crate) mod staged;
 #[cfg(test)]
 pub(crate) mod test_helpers;
 mod timefmt;

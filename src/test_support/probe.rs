@@ -5086,8 +5086,9 @@ mod tests {
         // Default diagnostics make format_probe_diagnostics emit a
         // non-empty pipeline string, so extract_probe_output returns
         // Some(out) even though events is empty (NOT None).
-        let formatted = extract_probe_output(&output, None, None)
-            .expect("empty-events payload with default diagnostics must render the pipeline header");
+        let formatted = extract_probe_output(&output, None, None).expect(
+            "empty-events payload with default diagnostics must render the pipeline header",
+        );
         assert!(
             formatted.contains("--- probe pipeline ---"),
             "diagnostics header missing (format_probe_diagnostics at probe.rs:1278): {formatted}",

@@ -3419,7 +3419,11 @@ mod tests {
             ..Default::default()
         };
         let keys = build_field_keys(&func);
-        assert_eq!(keys.len(), 16, "cap truncates at 16, not the naive 12+12=24");
+        assert_eq!(
+            keys.len(),
+            16,
+            "cap truncates at 16, not the naive 12+12=24"
+        );
         assert_eq!(
             keys.iter().filter(|(k, _)| k.starts_with("p2:")).count(),
             4,
@@ -3470,10 +3474,22 @@ mod tests {
         assert_eq!(r.ktstr_fentry_func_idx_1, 0, "slot>3 must not touch idx_1");
         assert_eq!(r.ktstr_fentry_func_idx_2, 0, "slot>3 must not touch idx_2");
         assert_eq!(r.ktstr_fentry_func_idx_3, 0, "slot>3 must not touch idx_3");
-        assert_eq!(r.ktstr_fentry_is_kernel_0, 0, "slot>3 must not touch is_kernel_0");
-        assert_eq!(r.ktstr_fentry_is_kernel_1, 0, "slot>3 must not touch is_kernel_1");
-        assert_eq!(r.ktstr_fentry_is_kernel_2, 0, "slot>3 must not touch is_kernel_2");
-        assert_eq!(r.ktstr_fentry_is_kernel_3, 0, "slot>3 must not touch is_kernel_3");
+        assert_eq!(
+            r.ktstr_fentry_is_kernel_0, 0,
+            "slot>3 must not touch is_kernel_0"
+        );
+        assert_eq!(
+            r.ktstr_fentry_is_kernel_1, 0,
+            "slot>3 must not touch is_kernel_1"
+        );
+        assert_eq!(
+            r.ktstr_fentry_is_kernel_2, 0,
+            "slot>3 must not touch is_kernel_2"
+        );
+        assert_eq!(
+            r.ktstr_fentry_is_kernel_3, 0,
+            "slot>3 must not touch is_kernel_3"
+        );
     }
 
     #[test]
@@ -3484,8 +3500,14 @@ mod tests {
         // (the `as u8` cast), not a generic nonzero.
         let mut r: crate::bpf_skel::fentry::types::rodata = unsafe { std::mem::zeroed() };
         set_rodata_slot(&mut r, 2, 0xABCD, true);
-        assert_eq!(r.ktstr_fentry_func_idx_2, 0xABCD, "slot 2 idx must be written");
-        assert_eq!(r.ktstr_fentry_is_kernel_2, 1u8, "is_kernel=true encodes as 1u8");
+        assert_eq!(
+            r.ktstr_fentry_func_idx_2, 0xABCD,
+            "slot 2 idx must be written"
+        );
+        assert_eq!(
+            r.ktstr_fentry_is_kernel_2, 1u8,
+            "is_kernel=true encodes as 1u8"
+        );
         assert_eq!(r.ktstr_fentry_func_idx_0, 0, "slot 0 untouched");
         assert_eq!(r.ktstr_fentry_func_idx_1, 0, "slot 1 untouched");
         assert_eq!(r.ktstr_fentry_func_idx_3, 0, "slot 3 untouched");

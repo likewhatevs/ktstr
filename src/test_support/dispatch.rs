@@ -2660,8 +2660,7 @@ mod tests {
         let _env_lock = lock_env();
         let _kernel_list = EnvVarGuard::remove(crate::KTSTR_KERNEL_LIST_ENV);
 
-        let (exit, captured) =
-            capture_stderr(|| run_named_test("gauntlet/__unit_test_dummy__"));
+        let (exit, captured) = capture_stderr(|| run_named_test("gauntlet/__unit_test_dummy__"));
         assert_eq!(exit, 1, "malformed gauntlet names must exit 1");
         let stderr = String::from_utf8(captured).expect("stderr is utf-8");
         assert!(
@@ -2688,13 +2687,11 @@ mod tests {
         use crate::test_support::test_helpers::{EnvVarGuard, capture_stderr, lock_env};
         let _env_lock = lock_env();
         let _kernel_list = EnvVarGuard::remove(crate::KTSTR_KERNEL_LIST_ENV);
-        let (exit, captured) =
-            capture_stderr(|| run_named_test("__definitely_not_a_real_test__"));
+        let (exit, captured) = capture_stderr(|| run_named_test("__definitely_not_a_real_test__"));
         assert_eq!(exit, 1);
         let stderr = String::from_utf8(captured).expect("stderr is utf-8");
         assert!(
-            stderr.contains("unknown test:")
-                && stderr.contains("__definitely_not_a_real_test__"),
+            stderr.contains("unknown test:") && stderr.contains("__definitely_not_a_real_test__"),
             "exit 1 must come from the find_test None path; got: {stderr}",
         );
     }
@@ -2713,8 +2710,7 @@ mod tests {
         assert_eq!(exit, 1);
         let stderr = String::from_utf8(captured).expect("stderr is utf-8");
         assert!(
-            stderr.contains("unknown test:")
-                && stderr.contains("__definitely_not_a_real_test__"),
+            stderr.contains("unknown test:") && stderr.contains("__definitely_not_a_real_test__"),
             "exit 1 must come from the find_test None path (after ktstr/ \
              strip); got: {stderr}",
         );
@@ -4891,8 +4887,7 @@ mod tests {
         let err = run_ktstr_test(&invalid).expect_err("validate must reject cpu_budget=Some(0)");
         let rendered = format!("{err:#}");
         assert!(
-            rendered.contains("cpu_budget=Some(0)")
-                && rendered.contains("zero host-CPU"),
+            rendered.contains("cpu_budget=Some(0)") && rendered.contains("zero host-CPU"),
             "bail must be the cpu_budget-zero validate message (proving the failure \
              came from entry.validate()? before any VM work); got: {rendered}",
         );
@@ -4959,7 +4954,10 @@ mod tests {
 
         let (code, captured) =
             capture_stderr(|| run_named_test(&format!("ktstr/{PERF_MODE_SKIP_NAME}")));
-        assert_eq!(code, 0, "perf_mode test under --no-perf-mode must skip → exit 0");
+        assert_eq!(
+            code, 0,
+            "perf_mode test under --no-perf-mode must skip → exit 0"
+        );
         let stderr = String::from_utf8(captured).expect("stderr is utf-8");
         assert!(
             stderr.contains("requires performance_mode but --no-perf-mode"),
@@ -4985,7 +4983,10 @@ mod tests {
 
         let (code, captured) =
             capture_stderr(|| run_named_test(&format!("ktstr/{PERF_ONLY_SKIP_NAME}")));
-        assert_eq!(code, 0, "non-perf test under KTSTR_PERF_ONLY must skip → exit 0");
+        assert_eq!(
+            code, 0,
+            "non-perf test under KTSTR_PERF_ONLY must skip → exit 0"
+        );
         let stderr = String::from_utf8(captured).expect("stderr is utf-8");
         assert!(
             stderr.contains("KTSTR_PERF_ONLY is active"),

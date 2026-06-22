@@ -2084,7 +2084,10 @@ fn eval_failure_renders_stats_section_with_spread_na() {
     )
     .unwrap_err();
     let msg = format!("{err}");
-    assert!(msg.contains("--- stats ---"), "stats section must render, got: {msg}");
+    assert!(
+        msg.contains("--- stats ---"),
+        "stats section must render, got: {msg}"
+    );
     assert!(
         msg.contains("6 workers, 4 cpus, 11 migrations, worst_spread=12.5%, worst_gap=33ms"),
         "the run-level header must render the scalars exactly, got: {msg}",
@@ -2328,10 +2331,9 @@ fn eval_monitor_inconclusive_folds_into_verdict() {
 #[test]
 fn eval_inconclusive_verdict_word_in_header() {
     let mut assert = build_assert_result(true, vec![]);
-    assert.merge(crate::assert::AssertResult::inconclusive(AssertDetail::new(
-        DetailKind::Other,
-        "zero-denominator metric",
-    )));
+    assert.merge(crate::assert::AssertResult::inconclusive(
+        AssertDetail::new(DetailKind::Other, "zero-denominator metric"),
+    ));
     let entry = eevdf_entry("__eval_inconclusive_word__");
     let result = make_vm_result_with_assert("", "", 0, false, &assert);
     let assertions = crate::assert::Assert::NO_OVERRIDES;
@@ -2499,7 +2501,10 @@ fn eval_host_extract_failures_fold_into_guest_pass() {
     let entry = eevdf_entry("__eval_host_extract_fold__");
     let result = make_vm_result_with_assert("", "", 0, false, &assert);
     let assertions = crate::assert::Assert::NO_OVERRIDES;
-    let host_fails = vec![AssertDetail::new(DetailKind::Other, "llm model unavailable")];
+    let host_fails = vec![AssertDetail::new(
+        DetailKind::Other,
+        "llm model unavailable",
+    )];
     let err = evaluate_vm_result(
         &entry,
         &result,

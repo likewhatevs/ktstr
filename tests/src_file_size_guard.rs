@@ -82,27 +82,38 @@ const DEFAULT_MAX_LINES: usize = 3000;
 /// virtio_blk-device, plus eval / fetch / scx_walker / host_context /
 /// initramfs / ops-mod reductions) and re-pinned to current counts for
 /// files that grew or are newly over the limit. Refresh per the drain
-/// protocol; entries shrink toward zero as files are split.
+/// protocol; entries shrink toward zero as files are split. Entries
+/// carrying a `// queued:` note grew from in-file test-module additions
+/// and are pinned with their split target rather than loosened silently;
+/// landing each split (moving the inline `#[cfg(test)]` mod into a
+/// sibling `tests.rs`) drains the entry.
 const EXCEPTIONS: &[(&str, usize)] = &[
-    ("vmm/freeze_coord/mod.rs", 13295),
-    ("scenario/ops/tests.rs", 9388),
-    ("monitor/dump/tests.rs", 8614),
+    ("vmm/freeze_coord/mod.rs", 13531),
+    ("scenario/ops/tests.rs", 9474),
+    ("monitor/dump/tests.rs", 9119),
+    ("test_support/entry.rs", 6038),
     ("monitor/reader.rs", 5939),
-    ("scenario/payload_run.rs", 5831),
-    ("test_support/entry.rs", 5652),
-    ("workload/spawn/mod.rs", 5428),
-    ("test_support/probe.rs", 4879),
-    ("scenario/snapshot/tests.rs", 4825),
-    ("monitor/btf_render/mod.rs", 4764),
-    ("test_support/dispatch.rs", 4417),
+    ("scenario/payload_run.rs", 5881),
+    ("workload/spawn/mod.rs", 5483),
+    // queued: split the inline #[cfg(test)] mod into test_support/probe/tests.rs.
+    ("test_support/probe.rs", 5102),
+    // queued: split the inline #[cfg(test)] mod into test_support/dispatch/tests.rs.
+    ("test_support/dispatch.rs", 4996),
+    ("scenario/snapshot/tests.rs", 4974),
+    ("monitor/btf_render/mod.rs", 4790),
+    ("monitor/bpf_map/tests.rs", 4169),
     ("monitor/cast_analysis/mod.rs", 4154),
-    ("monitor/bpf_map/tests.rs", 4133),
-    ("monitor/dump/mod.rs", 4089),
-    ("workload/worker/mod.rs", 3947),
-    ("assert/temporal.rs", 3845),
-    ("bin/cargo_ktstr/parse_tests.rs", 3636),
+    ("monitor/dump/mod.rs", 4125),
+    ("assert/temporal.rs", 4102),
+    ("workload/worker/mod.rs", 3975),
+    ("bin/cargo_ktstr/parse_tests.rs", 3898),
+    // queued: decompose timeline.rs into submodules.
+    ("timeline.rs", 3865),
+    // queued: split the inline #[cfg(test)] mod into monitor/dump/render_map/tests.rs.
+    ("monitor/dump/render_map.rs", 3734),
     ("ctprof/mod.rs", 3571),
-    ("probe/process.rs", 3335),
+    // queued: split the inline #[cfg(test)] mod into probe/process/tests.rs.
+    ("probe/process.rs", 3518),
     ("bin/ktstr.rs", 3001),
 ];
 

@@ -116,11 +116,7 @@ fn worktype_fork_gauntlet_covers_all_arms(_ctx: &Ctx) -> Result<AssertResult> {
     };
 
     run_arm("SpinWait", cfg(WorkType::SpinWait, 2), &mut result);
-    run_arm(
-        "YieldHeavy",
-        cfg(WorkType::YieldHeavy, 2),
-        &mut result,
-    );
+    run_arm("YieldHeavy", cfg(WorkType::YieldHeavy, 2), &mut result);
     run_arm("Mixed", cfg(WorkType::Mixed, 2), &mut result);
     run_arm(
         "Bursty",
@@ -133,16 +129,8 @@ fn worktype_fork_gauntlet_covers_all_arms(_ctx: &Ctx) -> Result<AssertResult> {
         ),
         &mut result,
     );
-    run_arm(
-        "IoSyncWrite",
-        cfg(WorkType::IoSyncWrite, 2),
-        &mut result,
-    );
-    run_arm(
-        "IoRandRead",
-        cfg(WorkType::IoRandRead, 2),
-        &mut result,
-    );
+    run_arm("IoSyncWrite", cfg(WorkType::IoSyncWrite, 2), &mut result);
+    run_arm("IoRandRead", cfg(WorkType::IoRandRead, 2), &mut result);
     run_arm("IoConvoy", cfg(WorkType::IoConvoy, 2), &mut result);
     run_arm(
         "PipeIo",

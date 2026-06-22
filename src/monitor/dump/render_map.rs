@@ -3193,8 +3193,7 @@ mod render_map_unit_tests {
         // id 4: Struct value_t — kind_flag=1 marks bitfield members,
         // so each member's bit_offset encodes (size<<24)|offset.
         types.extend_from_slice(&n_value.to_le_bytes());
-        let struct_info =
-            ((BTF_KIND_STRUCT << 24) & 0x1f00_0000) | (1u32 << 31) | 2u32; // kind_flag=1, vlen=2
+        let struct_info = ((BTF_KIND_STRUCT << 24) & 0x1f00_0000) | (1u32 << 31) | 2u32; // kind_flag=1, vlen=2
         types.extend_from_slice(&struct_info.to_le_bytes());
         types.extend_from_slice(&24u32.to_le_bytes()); // size
         // member 0: bf — bitfield size 3, bit offset 3 (non-multiple
@@ -3408,11 +3407,7 @@ mod render_map_unit_tests {
         // bucket struct: nr at bucket+0, data[] at bucket+16.
         w32(&mut buf, bucket_pa, nr);
         for j in 0..nr as u64 {
-            w64(
-                &mut buf,
-                bucket_pa + 16 + j * 8,
-                0xFFFF_FFFF_8000_0000 + j,
-            );
+            w64(&mut buf, bucket_pa + 16 + j * 8, 0xFFFF_FFFF_8000_0000 + j);
         }
         let offsets = stackmap_offsets();
         let info = map_info("test_stack", BPF_MAP_TYPE_STACK_TRACE, pa_to_kva(map_pa), 1);
@@ -3671,14 +3666,13 @@ mod render_map_unit_tests {
         // Ringbuf offsets: rbm_rb @ 0; mask @ 0, consumer @ 64,
         // producer @ 128, pending @ 192 (matches dump::tests).
         let mut offsets = super::super::super::btf_offsets::BpfMapOffsets::EMPTY;
-        offsets.ringbuf_offsets =
-            Some(super::super::super::btf_offsets::BpfRingbufOffsets {
-                rbm_rb: 0,
-                rb_mask: 0,
-                rb_consumer_pos: 64,
-                rb_producer_pos: 128,
-                rb_pending_pos: 192,
-            });
+        offsets.ringbuf_offsets = Some(super::super::super::btf_offsets::BpfRingbufOffsets {
+            rbm_rb: 0,
+            rb_mask: 0,
+            rb_consumer_pos: 64,
+            rb_producer_pos: 128,
+            rb_pending_pos: 192,
+        });
         // map.rb pointer → rb KVA.
         w64(&mut buf, map_pa, pa_to_kva(rb_pa));
         // mask = 0xFFF (capacity 4096); consumer 100, producer 200,
@@ -3723,7 +3717,10 @@ mod render_map_unit_tests {
             let c = ctx(a, None, &page_index, &metas);
             render_map(&c, &info)
         });
-        assert!(out.error.is_none(), "empty stack-trace render must not error");
+        assert!(
+            out.error.is_none(),
+            "empty stack-trace render must not error"
+        );
         let st = out
             .stack_trace
             .expect("STACK_TRACE Ok arm must set out.stack_trace");
