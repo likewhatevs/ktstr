@@ -58,8 +58,7 @@ impl TmpfsFraction {
     /// [`Self::NinetyPercent`] iff the kernel is positively known to
     /// honor `initramfs_options=size=90%` — mainline commit
     /// 278033a225e1, first tagged v6.18-rc1, so `(major, minor) >= (6,
-    /// 18)`. `None` (version undeterminable — aarch64 `Image` carries no
-    /// version string, or the bzImage field is absent/unparsable) or any
+    /// 18)`. `None` (the caller could not establish a version) or any
     /// version below 6.18 yields the conservative [`Self::Half`].
     ///
     /// Only mainline >= 6.18 is encoded; the per-stable-series backport
@@ -188,8 +187,10 @@ pub(crate) fn read_kernel_init_size(kernel_path: &Path) -> Result<u64> {
 /// leading `MAJOR.MINOR`.
 ///
 /// aarch64 Image: the arm64 image header carries no version string —
-/// returns `None`, so aarch64 always falls to the safe 50% fraction
-/// (richer aarch64 reclaim is a follow-up).
+/// returns `None` here. The caller `tmpfs_fraction` falls back to the
+/// cache `metadata.json` sidecar
+/// (`read_kernel_version_from_metadata_sidecar`) to recover the aarch64
+/// version, so aarch64 is not unconditionally sized at 50%.
 ///
 /// Returns `None` (-> conservative 50% sizing) on ANY uncertainty:
 /// unreadable image, `kernel_version` field zero (pre-2.00 protocol or
@@ -244,7 +245,9 @@ pub(crate) fn read_kernel_version_major_minor(kernel_path: &Path) -> Option<(u16
     }
     #[cfg(target_arch = "aarch64")]
     {
-        // arm64 Image header carries no version string.
+        // arm64 Image header carries no version string; the cache
+        // metadata.json sidecar is the aarch64 version source (see
+        // read_kernel_version_from_metadata_sidecar).
         let _ = kernel_path;
         None
     }
@@ -267,6 +270,39 @@ fn parse_major_minor(release: &str) -> Option<(u16, u16)> {
     }
     let minor: u16 = minor_digits.parse().ok()?;
     Some((major, minor))
+}
+
+/// Recover the guest kernel `(major, minor)` version from the cache
+/// `metadata.json` sidecar next to the boot image.
+///
+/// The aarch64 `Image` carries no embedded version string (so
+/// [`read_kernel_version_major_minor`] returns `None` there), but a
+/// cached kernel records its version in `metadata.json` alongside the
+/// image: `crate::cache::CacheDir` stores the boot image at
+/// `<entry>/<image_name>` and its metadata at `<entry>/metadata.json`,
+/// so the sidecar is the image's sibling. This recovers the 90% reclaim
+/// for cache-resident aarch64 kernels (whose version originates from the
+/// kernel.org tarball acquisition).
+///
+/// Returns `None` — falling to the safe [`TmpfsFraction::Half`] — for
+/// every case the version can't be positively established: a non-cache
+/// image path (raw `--kernel`, no sibling sidecar), a local-source build
+/// (`version` absent/`null`), an unreadable or malformed `metadata.json`,
+/// or an unparsable version string. Only `version` is read (a minimal
+/// probe struct ignores the rest of the schema), keeping this decoupled
+/// from `crate::cache::KernelMetadata`'s other fields. The sidecar is
+/// host-authored cache infrastructure, not guest input, so trusting its
+/// version for the fraction decision is consistent with the threat model
+/// (the guest never writes it).
+pub(crate) fn read_kernel_version_from_metadata_sidecar(kernel_path: &Path) -> Option<(u16, u16)> {
+    #[derive(serde::Deserialize)]
+    struct VersionProbe {
+        version: Option<String>,
+    }
+    let sidecar = kernel_path.parent()?.join("metadata.json");
+    let json = std::fs::read_to_string(sidecar).ok()?;
+    let probe: VersionProbe = serde_json::from_str(&json).ok()?;
+    parse_major_minor(&probe.version?)
 }
 
 /// Minimum guest memory (in MiB) needed to boot, extract the initramfs,
@@ -341,7 +377,8 @@ fn parse_major_minor(release: &str) -> Option<(u16, u16)> {
 /// tmpfs is bigger than we sized for; sizing for 90% on a kernel that
 /// only gives 50% panics the guest mid-extraction, so the 90% path is
 /// taken ONLY on a confirmed-honoring version (every uncertainty —
-/// unknown version, aarch64, < 6.18 — falls to the safe 50%).
+/// unknown version, an image lacking both an embedded version and a
+/// honoring sidecar, or below 6.18 — falls to the safe 50%).
 ///
 /// Note: `rootflags=size=90%` would set `root_mount_data` (assigned by
 /// `root_data_setup` via `__setup("rootflags=", ...)` in
@@ -840,6 +877,74 @@ mod tests {
             read_kernel_version_major_minor(bad.path()),
             None,
             "wrong HdrS magic must return None (the safe-50% direction)",
+        );
+    }
+
+    /// `read_kernel_version_from_metadata_sidecar` reads `version` from a
+    /// `metadata.json` sibling of the image path and parses its
+    /// MAJOR.MINOR — the aarch64 reclaim source. Pins: a 6.18 version
+    /// parses (and unrelated schema keys are ignored); an absent `version`
+    /// key, an explicit `null`, an unparsable string, malformed JSON, and
+    /// a missing sidecar all return None — the safe-50% direction.
+    #[test]
+    fn read_kernel_version_from_metadata_sidecar_parses_and_guards() {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        // The reader only needs the image path's parent; the image file
+        // itself is never read, so it need not exist.
+        let image = dir.path().join("Image");
+        let sidecar = dir.path().join("metadata.json");
+        let write_sidecar = |json: &str| {
+            let mut f = std::fs::File::create(&sidecar).expect("create sidecar");
+            f.write_all(json.as_bytes()).expect("write sidecar");
+            f.flush().expect("flush");
+        };
+
+        // Honoring version present, with an unrelated key -> parses 6.18
+        // (extra schema fields ignored by the minimal probe).
+        write_sidecar(r#"{"version":"6.18.2","arch":"aarch64"}"#);
+        assert_eq!(
+            read_kernel_version_from_metadata_sidecar(&image),
+            Some((6, 18)),
+            "sidecar version must parse to (6, 18)",
+        );
+
+        // version key absent -> None (local-source build records no version).
+        write_sidecar(r#"{"arch":"aarch64"}"#);
+        assert_eq!(
+            read_kernel_version_from_metadata_sidecar(&image),
+            None,
+            "absent version key must return None",
+        );
+
+        // Explicit null version -> None.
+        write_sidecar(r#"{"version":null}"#);
+        assert_eq!(read_kernel_version_from_metadata_sidecar(&image), None);
+
+        // Unparsable version string -> None.
+        write_sidecar(r#"{"version":"not-a-version"}"#);
+        assert_eq!(read_kernel_version_from_metadata_sidecar(&image), None);
+
+        // Malformed JSON -> None.
+        write_sidecar("{not json");
+        assert_eq!(read_kernel_version_from_metadata_sidecar(&image), None);
+
+        // No sidecar at all (raw --kernel path) -> None.
+        std::fs::remove_file(&sidecar).expect("remove sidecar");
+        assert_eq!(
+            read_kernel_version_from_metadata_sidecar(&image),
+            None,
+            "missing sidecar must return None (raw --kernel path)",
+        );
+
+        // A path with no parent (root "/") exercises the
+        // `kernel_path.parent()?` guard: it early-returns None before any
+        // file read, deterministically (no cwd dependency).
+        assert_eq!(
+            read_kernel_version_from_metadata_sidecar(std::path::Path::new("/")),
+            None,
+            "root path (no parent) must return None",
         );
     }
 }
