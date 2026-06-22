@@ -603,6 +603,17 @@ pub(super) fn emit_entry_static(input: ItemFn, attrs: AttrValues) -> proc_macro2
     let test_body = if expect_err {
         quote! {
             match ::ktstr::test_support::run_ktstr_test(&#entry_name) {
+                // A skip returns Ok(AssertResult::skip), NOT an Err —
+                // e.g. the overcommit auto-skip, performance_mode /
+                // perf_only skips, or an in-VM scenario topology-floor
+                // skip (all via test_support::eval). A skipped run did
+                // not actually execute, so it is a non-failure in BOTH
+                // directions: an expect_err test that never ran did not
+                // "pass". Route is_skip first (mirroring ok_to_exit_code's
+                // is_skip -> EXIT_PASS precedence) so the skip is not
+                // mistaken for the expected failure. The SKIP banner +
+                // sidecar are already emitted inside run_ktstr_test_inner.
+                Ok(r) if r.is_skip() => {}
                 Ok(_) => panic!("expected test to fail but it passed"),
                 #host_class_arms
                 Err(_) => {}
