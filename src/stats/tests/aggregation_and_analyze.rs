@@ -1081,7 +1081,7 @@ fn format_dimension_summary_computed_values() {
     r1.gap_ms = 200;
     r1.imbalance_ratio = 2.5; // > 1.0, should show imbal=2.5
     r1.max_dsq_depth = 8; // > 0, should show dsq=8
-    r1.stuck_count = 2; // > 0, should show stuck=2
+    r1.stuck_count = 2.0; // > 0, should show stuck=2
     r1.fallback_count = 15; // > 0, should show fallback=15
     let r2 = make_row("fast", "tiny-1llc", true, 4.0);
     let rows = vec![r1, r2];

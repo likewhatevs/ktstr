@@ -469,9 +469,15 @@ fn render_mixed_dirty(
 ///   aggregate's `passed = false` routes the pair to
 ///   [`compare_rows_by`]' `excluded_pairs` gate.
 /// - `u64` / `i64` fields take the rounded mean
-///   (`(sum / count).round() as u64`). The 0.5-unit rounding error
-///   is well below every integer metric's `default_abs` gate (the
-///   smallest is `stuck_count = 1.0`).
+///   (`(sum / count).round() as u64`). The up-to-0.5-unit rounding
+///   error is well below each such field's `default_abs` gate (the
+///   smallest is `total_fallback` / `total_keep_last` at 5.0).
+/// - `stuck_count` is the exception: it is `f64` and carries the
+///   EXACT mean (`sum / count`, no rounding). Its `default_abs` is
+///   1.0 — tight enough that a rounded mean's up-to-1.0 per-A/B-pair
+///   error would fabricate single-stall regressions from sub-integer
+///   differences (an A-side mean of 1.4 vs a B-side 1.6 rounds to
+///   1 vs 2, a spurious delta of 1).
 /// - `ext_metrics` keys are unioned across passing contributors;
 ///   each key's mean is computed only across contributors that
 ///   carried it. A key present in some passing rows and absent
@@ -563,7 +569,7 @@ pub fn group_and_average_by(
         sum_spread: f64,
         sum_migrations: u64,
         sum_migration_ratio: f64,
-        sum_stuck_count: usize,
+        sum_stuck_count: f64,
         sum_fallback_count: i64,
         sum_keep_last_count: i64,
         sum_total_iterations: u64,
@@ -629,7 +635,7 @@ pub fn group_and_average_by(
                 sum_spread: 0.0,
                 sum_migrations: 0,
                 sum_migration_ratio: 0.0,
-                sum_stuck_count: 0,
+                sum_stuck_count: 0.0,
                 sum_fallback_count: 0,
                 sum_keep_last_count: 0,
                 sum_total_iterations: 0,
@@ -687,7 +693,7 @@ pub fn group_and_average_by(
         acc.sum_spread += row.spread;
         acc.sum_migrations = acc.sum_migrations.saturating_add(row.migrations);
         acc.sum_migration_ratio += row.migration_ratio;
-        acc.sum_stuck_count = acc.sum_stuck_count.saturating_add(row.stuck_count);
+        acc.sum_stuck_count += row.stuck_count;
         acc.sum_fallback_count = acc.sum_fallback_count.saturating_add(row.fallback_count);
         acc.sum_keep_last_count = acc.sum_keep_last_count.saturating_add(row.keep_last_count);
         acc.sum_total_iterations = acc
@@ -731,7 +737,6 @@ pub fn group_and_average_by(
         // and don't need a rounding helper.
         let round_u64 = |sum: u64| -> u64 { (sum as f64 / denom).round() as u64 };
         let round_i64 = |sum: i64| -> i64 { (sum as f64 / denom).round() as i64 };
-        let round_usize = |sum: usize| -> usize { (sum as f64 / denom).round() as usize };
 
         // Mixed-dirty markers. When the cohort contains both a
         // clean-form and dirty-form contributor for the same hex
@@ -858,7 +863,7 @@ pub fn group_and_average_by(
             max_dsq_depth: acc.max_max_dsq_depth,
             migrations: round_u64(acc.sum_migrations),
             migration_ratio: acc.sum_migration_ratio / denom,
-            stuck_count: round_usize(acc.sum_stuck_count),
+            stuck_count: acc.sum_stuck_count / denom,
             fallback_count: round_i64(acc.sum_fallback_count),
             keep_last_count: round_i64(acc.sum_keep_last_count),
             total_iterations: round_u64(acc.sum_total_iterations),
@@ -981,7 +986,7 @@ pub fn sidecar_to_row(sc: &crate::test_support::SidecarResult) -> GauntletRow {
             .as_ref()
             .map(|m| m.max_local_dsq_depth)
             .unwrap_or(0),
-        stuck_count: sc.monitor.as_ref().map(|m| m.stuck_count).unwrap_or(0),
+        stuck_count: sc.monitor.as_ref().map(|m| m.stuck_count).unwrap_or(0) as f64,
         fallback_count: sc
             .monitor
             .as_ref()

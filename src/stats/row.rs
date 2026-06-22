@@ -257,7 +257,16 @@ pub struct GauntletRow {
     /// names match (`stuck_count`) but the DataFrame column is
     /// `stuck`; see the triples table on [`METRICS`] for the
     /// column-level rename rationale.
-    pub stuck_count: usize,
+    ///
+    /// `f64`, not an integer: a per-run row carries an exact integer
+    /// count, but the cross-run average fold (`super::group`'s
+    /// `group_and_average_by`) stores the fractional mean here so the
+    /// A/B comparison reads the true delta. Rounding the mean to an
+    /// integer would let the up-to-1.0 rounding error defeat the
+    /// `stuck_count` metric's `default_abs` of 1.0 and fabricate
+    /// single-stall regressions from sub-integer differences (e.g. an
+    /// A-side mean of 1.4 vs a B-side mean of 1.6 rounds to 1 vs 2).
+    pub stuck_count: f64,
     /// Fallback-dispatch count across the run. Carried as-is from
     /// `MonitorSummary::event_deltas.total_fallback` — an integer
     /// event count, NOT a rate. Surfaced in [`METRICS`] under

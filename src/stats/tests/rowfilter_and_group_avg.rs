@@ -576,7 +576,7 @@ fn paint_metrics(row: &mut GauntletRow, spread: f64, gap_ms: u64, migrations: u6
     row.migration_ratio = spread / 100.0;
     row.imbalance_ratio = spread / 10.0;
     row.max_dsq_depth = (gap_ms / 10) as u32;
-    row.stuck_count = (migrations / 10) as usize;
+    row.stuck_count = (migrations / 10) as f64;
     row.fallback_count = migrations as i64;
     row.keep_last_count = -(migrations as i64);
     row.total_iterations = iters;
@@ -638,6 +638,32 @@ fn group_and_average_single_pass_passes_through_metrics() {
     assert_eq!(
         ar.row.ext_metrics.get("worst_p99_wake_latency_us").copied(),
         Some(24.0),
+    );
+}
+
+/// `stuck_count` folds as an EXACT `f64` mean — no rounding.
+/// Three passing contributors with stuck_count 1, 1, 2 average to
+/// 4/3 = 1.333..., NOT a rounded 1. Pins the fix for the rounding
+/// bug: rounding the cross-run mean to an integer let the
+/// up-to-1.0 per-A/B-pair error defeat stuck_count's
+/// `default_abs` of 1.0 and fabricate single-stall regressions
+/// from sub-integer differences. Every other typed integer field
+/// rounds (abs >= 5.0 absorbs the error); stuck_count alone is f64.
+#[test]
+fn group_and_average_stuck_count_is_exact_fractional_mean() {
+    let mut a = make_row("t", "tiny-1llc", true, 0.0);
+    a.stuck_count = 1.0;
+    let mut b = make_row("t", "tiny-1llc", true, 0.0);
+    b.stuck_count = 1.0;
+    let mut c = make_row("t", "tiny-1llc", true, 0.0);
+    c.stuck_count = 2.0;
+    let out = group_and_average_by(&[a, b, c], LEGACY_PAIRING_DIMS);
+    assert_eq!(out.len(), 1, "same-key contributors fold to one aggregate");
+    let got = out[0].row.stuck_count;
+    assert!(
+        (got - 4.0 / 3.0).abs() < 1e-9,
+        "stuck_count must fold to the EXACT fractional mean 1.333..., \
+         not a rounded integer; got {got}",
     );
 }
 

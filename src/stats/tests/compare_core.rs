@@ -55,6 +55,68 @@ fn compare_rows_dual_gate_both_must_trigger() {
     assert_eq!(res2.unchanged, 1);
 }
 
+/// compare must NOT flag a sub-integer `stuck_count` difference as a
+/// regression. A-side cross-run mean 1.4 vs B-side 1.6 (true delta
+/// 0.2, well under `default_abs` = 1.0) classifies UNCHANGED. Before
+/// the f64 fix the fold rounded these means to 1 vs 2 (delta 1),
+/// which cleared BOTH the abs (1.0, since 1.0 is not < 1.0) and rel
+/// (100% >= 50%) gates and fabricated a regression from noise. The
+/// f64 `stuck_count` carries the exact mean so compare reads 0.2.
+#[test]
+fn compare_rows_subinteger_stuck_count_difference_is_unchanged() {
+    let mut a = make_row("test_a", "tiny-1llc", true, 10.0);
+    a.stuck_count = 1.4;
+    let mut b = make_row("test_a", "tiny-1llc", true, 10.0);
+    b.stuck_count = 1.6;
+    let res = compare_rows_by(
+        &[a],
+        &[b],
+        LEGACY_PAIRING_DIMS,
+        None,
+        &ComparisonPolicy::default(),
+    );
+    assert_eq!(
+        res.regressions, 0,
+        "a 0.2 sub-integer stuck_count delta must NOT be a regression",
+    );
+    assert_eq!(res.improvements, 0);
+    assert!(
+        res.findings.iter().all(|f| f.metric.name != "stuck_count"),
+        "stuck_count must not be a finding for a sub-abs delta; got {:?}",
+        res.findings.iter().map(|f| f.metric.name).collect::<Vec<_>>(),
+    );
+}
+
+/// Contrast: a genuine whole-stall `stuck_count` regression IS still
+/// flagged. A-side mean 1.0 vs B-side 2.5 (delta 1.5 >= abs 1.0, rel
+/// 150% >= 50%) is a regression — the f64 fix preserves the
+/// deliberate single-whole-stall sensitivity (`default_abs` = 1.0),
+/// it only stops fabricating regressions from sub-integer noise.
+#[test]
+fn compare_rows_genuine_stuck_count_regression_is_flagged() {
+    let mut a = make_row("test_a", "tiny-1llc", true, 10.0);
+    a.stuck_count = 1.0;
+    let mut b = make_row("test_a", "tiny-1llc", true, 10.0);
+    b.stuck_count = 2.5;
+    let res = compare_rows_by(
+        &[a],
+        &[b],
+        LEGACY_PAIRING_DIMS,
+        None,
+        &ComparisonPolicy::default(),
+    );
+    assert_eq!(
+        res.regressions, 1,
+        "a 1.5 stuck_count delta clears both gates and must be a regression",
+    );
+    assert!(
+        res.findings
+            .iter()
+            .any(|f| f.metric.name == "stuck_count" && f.is_regression),
+        "stuck_count must be the flagged regression",
+    );
+}
+
 #[test]
 fn compare_rows_synthetic_regression_and_improvement() {
     // spread 10 -> 30: abs delta 20.0 >= 5.0, rel 2.0 >= 0.10 →

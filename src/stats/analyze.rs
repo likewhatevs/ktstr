@@ -22,7 +22,7 @@ const OUTLIER_METRICS: &[(&str, MetricAccessor)] = &[
     ("migration_ratio", |r| r.migration_ratio),
     ("imbalance", |r| r.imbalance_ratio),
     ("dsq_depth", |r| r.max_dsq_depth as f64),
-    ("stuck", |r| r.stuck_count as f64),
+    ("stuck", |r| r.stuck_count),
     ("fallback", |r| r.fallback_count as f64),
     ("keep_last", |r| r.keep_last_count as f64),
     // Distribution-kind roll-ups are ext_metrics-sourced (no typed field):
@@ -332,7 +332,7 @@ pub(crate) fn format_dimension_summary(rows: &[GauntletRow], group_col: &str) ->
             avg_dsq_depth: mean(group_rows.iter().map(|r| r.max_dsq_depth as f64)),
             total_stuck: group_rows
                 .iter()
-                .map(|r| r.stuck_count as f64)
+                .map(|r| r.stuck_count)
                 .filter(|x| x.is_finite())
                 .sum(),
             avg_fallback: mean(group_rows.iter().map(|r| r.fallback_count as f64)),

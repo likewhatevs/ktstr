@@ -1230,7 +1230,7 @@ pub static METRICS: &[MetricDef] = &[
         default_abs: 1.0,
         default_rel: 0.50,
         display_unit: "",
-        accessor: |r| Some(r.stuck_count as f64),
+        accessor: |r| Some(r.stuck_count),
     },
     MetricDef {
         name: "total_fallback",

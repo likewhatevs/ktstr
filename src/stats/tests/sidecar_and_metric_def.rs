@@ -52,7 +52,7 @@ fn sidecar_to_row_basic() {
     assert_eq!(row.migrations, 12);
     assert_eq!(row.imbalance_ratio, 2.5);
     assert_eq!(row.max_dsq_depth, 4);
-    assert_eq!(row.stuck_count, 1);
+    assert_eq!(row.stuck_count, 1.0);
     assert_eq!(row.fallback_count, 7);
     assert_eq!(row.keep_last_count, 3);
 }
@@ -103,7 +103,7 @@ fn sidecar_to_row_no_monitor() {
     assert!(row.is_fail());
     assert_eq!(row.imbalance_ratio, 0.0);
     assert_eq!(row.max_dsq_depth, 0);
-    assert_eq!(row.stuck_count, 0);
+    assert_eq!(row.stuck_count, 0.0);
     assert_eq!(row.fallback_count, 0);
     assert_eq!(row.keep_last_count, 0);
 }
@@ -354,7 +354,7 @@ fn sidecar_to_row_no_stall() {
         ..test_support::SidecarResult::test_fixture()
     };
     let row = sidecar_to_row(&sc);
-    assert_eq!(row.stuck_count, 0);
+    assert_eq!(row.stuck_count, 0.0);
     assert_eq!(row.fallback_count, 0);
     assert_eq!(row.keep_last_count, 0);
 }
@@ -1313,7 +1313,7 @@ fn metric_def_read_named_fields() {
     row.migration_ratio = 0.3;
     row.imbalance_ratio = 2.0;
     row.max_dsq_depth = 5;
-    row.stuck_count = 3;
+    row.stuck_count = 3.0;
     row.fallback_count = 11;
     row.keep_last_count = 4;
     row.total_iterations = 1000;
