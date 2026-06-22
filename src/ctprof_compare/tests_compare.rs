@@ -1116,3 +1116,128 @@ fn fudge_n_to_one_merge_unions_mode_tallies() {
         other => panic!("expected Mode for policy; got {other:?}"),
     }
 }
+
+/// Cross-phase seam: `apply_cgroup_fudge` → `fill_uptime_pct`. The
+/// `(bkey, ckey)` pairs the fudge phase returns are the only
+/// data thread between fudge and the uptime pass; a wiring slip
+/// (wrong vector passed, dropped arg) leaves the fudged baseline
+/// group out of `group_lifetime`, so its rows' `uptime_pct` stays
+/// `None`. This pins that the fudged baseline group's uptime% is
+/// computed from the CANDIDATE-side lifetime (`now_b - candidate
+/// avg_start_ticks`), not the baseline.
+///
+/// Layout (all clock-tick values chosen to be exact in f64):
+/// - matched `/anchor`: candidate start 0 → lifetime `now_b` (the
+///   longest-lived group → the uptime% denominator).
+/// - matched `/clock`: candidate start 1024 → sets `now_b = 1024`
+///   (the max candidate start tick), its own lifetime 0.
+/// - fudged `/cg-alpha` (baseline) ↔ `/cg-beta` (candidate):
+///   candidate start 512 → lifetime `1024 - 512 = 512` → uptime%
+///   `512 / 1024 * 100 = 50.0`.
+#[test]
+fn fudge_uptime_pct_seam_reflects_candidate_lifetime() {
+    let mut anchor_a = make_thread("anchorp", "anchorc");
+    anchor_a.cgroup = "/anchor".into();
+    let mut anchor_b = make_thread("anchorp", "anchorc");
+    anchor_b.cgroup = "/anchor".into();
+    anchor_b.start_time_clock_ticks = 0;
+
+    let mut clock_a = make_thread("clockp", "clockc");
+    clock_a.cgroup = "/clock".into();
+    let mut clock_b = make_thread("clockp", "clockc");
+    clock_b.cgroup = "/clock".into();
+    clock_b.start_time_clock_ticks = 1024;
+
+    let mut threads_a = vec![anchor_a, clock_a];
+    threads_a.extend(fudge_threads_with("/cg-alpha", 10, |_| {}));
+    let mut threads_b = vec![anchor_b, clock_b];
+    threads_b.extend(fudge_threads_with("/cg-beta", 10, |t| {
+        t.start_time_clock_ticks = 512;
+    }));
+
+    let diff = fudge_compare(&snap_with(threads_a), &snap_with(threads_b));
+    assert_eq!(
+        diff.fudged_pairs.len(),
+        1,
+        "/cg-alpha must fudge /cg-beta (Jaccard 1.0, 10 types each)",
+    );
+
+    let fudged_row = diff
+        .rows
+        .iter()
+        .find(|r| r.group_key.starts_with("/cg-alpha\x00"))
+        .expect("a fudged /cg-alpha row must be emitted");
+    let uptime = fudged_row
+        .uptime_pct
+        .expect("fudged baseline uptime% must be filled via the fudge→uptime seam");
+    assert!(
+        (uptime - 50.0).abs() < f64::EPSILON,
+        "fudged baseline uptime% must reflect candidate lifetime \
+         (1024-512)/1024 = 50.0; got {uptime}",
+    );
+}
+
+/// Cross-phase seam: `apply_cgroup_fudge` → `remap_fudged_smaps`
+/// (via `attach_enrichment`). The same `(bkey, ckey)` vector is
+/// also the only input that tells the smaps re-key which candidate
+/// cgroup belongs to which baseline root. A broken seam leaves the
+/// candidate smaps under the candidate_root (`/cg-beta`) instead of
+/// re-keying to the baseline_root (`/cg-alpha`). This pins that the
+/// candidate-side `smaps_rollup_b` is re-keyed from `/cg-beta\x00*`
+/// to `/cg-alpha\x00*` once the pair fudges, carrying the values.
+#[test]
+fn fudge_smaps_rekey_seam_maps_candidate_to_baseline_root() {
+    // Baseline /cg-alpha carries no smaps; each candidate /cg-beta
+    // thread carries an Rss rollup under a distinct literal pcomm.
+    // Under GroupBy::All the hierarchical smaps collector keys by
+    // (cgroup, pcomm) for every thread with a non-empty rollup (no
+    // leader/tid==tgid gate), so the 10 distinct pcomms yield 10
+    // entries `/cg-beta\x00<pcomm>`.
+    const RSS_KIB: u64 = 4096;
+    let threads_a = fudge_threads_with("/cg-alpha", 10, |_| {});
+    let threads_b = fudge_threads_with("/cg-beta", 10, |t| {
+        t.smaps_rollup_kib.insert("Rss".into(), RSS_KIB);
+    });
+
+    let diff = fudge_compare(&snap_with(threads_a), &snap_with(threads_b));
+    assert_eq!(
+        diff.fudged_pairs.len(),
+        1,
+        "/cg-alpha must fudge /cg-beta (Jaccard 1.0, 10 types each)",
+    );
+
+    let candidate_root_keys: Vec<&String> = diff
+        .smaps_rollup_b
+        .keys()
+        .filter(|k| k.starts_with("/cg-beta\x00"))
+        .collect();
+    assert!(
+        candidate_root_keys.is_empty(),
+        "candidate_root smaps keys must be re-keyed away after fudge; \
+         leftover = {candidate_root_keys:?}",
+    );
+    let baseline_root_keys: Vec<&String> = diff
+        .smaps_rollup_b
+        .keys()
+        .filter(|k| k.starts_with("/cg-alpha\x00"))
+        .collect();
+    assert_eq!(
+        baseline_root_keys.len(),
+        10,
+        "all 10 candidate smaps entries must re-key under the baseline_root; \
+         got {baseline_root_keys:?}",
+    );
+    // Values survive the re-key: smaps_rollup_bytes converts kB→bytes
+    // (×1024), so the total Rss across the re-keyed entries is
+    // 10 × 4096 × 1024.
+    let total_rss: u64 = diff
+        .smaps_rollup_b
+        .values()
+        .filter_map(|m| m.get("Rss"))
+        .sum();
+    assert_eq!(
+        total_rss,
+        10 * RSS_KIB * 1024,
+        "re-keyed smaps must preserve every candidate Rss value",
+    );
+}

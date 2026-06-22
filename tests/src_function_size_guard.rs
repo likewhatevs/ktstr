@@ -131,7 +131,6 @@ const EXCEPTIONS: &[(&str, &str, usize)] = &[
         "capture_with_synthetic_tree_assembles_thread_state",
         202,
     ), // queued: decompose
-    ("ctprof_compare/compare.rs", "compare", 710),                // queued: decompose
     ("ctprof_compare/report/smaps.rs", "write_smaps_section", 212), // queued: decompose
     ("ctprof_compare/runner.rs", "write_metric_list", 212),       // queued: decompose
     (

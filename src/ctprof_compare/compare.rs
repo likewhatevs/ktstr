@@ -354,13 +354,51 @@ pub(super) fn emit_fudged_rows(
     }
 }
 
-/// Compare two snapshots and produce a [`CtprofDiff`].
-pub fn compare(
+/// Read-only context threaded through the phase helpers of
+/// [`compare`]. Holds borrows of the snapshot pair, the resolved
+/// options, and the per-side thread groups so each phase signature
+/// stays short. Built once by [`compare`] after
+/// [`build_compare_groups`] returns the owned groups (kept as
+/// orchestrator locals so the borrows in this struct stay valid).
+struct CompareCtx<'a> {
+    baseline: &'a CtprofSnapshot,
+    candidate: &'a CtprofSnapshot,
+    opts: &'a CompareOptions,
+    /// Resolved grouping axis (`opts.group_by.0`), cached so the
+    /// phases don't re-unwrap the default wrapper.
+    group_by: GroupBy,
+    /// Compiled `cgroup_flatten` glob patterns.
+    flatten: &'a [glob::Pattern],
+    /// Auto-normalize cgroup-key map, present only under
+    /// `GroupBy::Cgroup | GroupBy::All` with `no_cg_normalize`
+    /// unset.
+    cgroup_key_map: Option<&'a BTreeMap<String, String>>,
+    groups_a: &'a BTreeMap<String, ThreadGroup>,
+    groups_b: &'a BTreeMap<String, ThreadGroup>,
+    /// Per-snapshot "now" for lifetime calc: newest candidate
+    /// thread's `start_time_clock_ticks`.
+    now_b: u64,
+}
+
+/// Build both sides' thread groups plus the auto-normalize cgroup
+/// key map. Resolves the grouping axis, seeds the per-thread
+/// frequency-count gate (only under `GroupBy::Comm | GroupBy::Pcomm`
+/// with normalization on), and runs [`build_groups`] for each side.
+/// Returns `(group_by, cgroup_key_map, groups_a, groups_b)` by
+/// value so [`compare`] can keep them as locals and borrow them
+/// into [`CompareCtx`]. `flatten` is computed by the caller and
+/// passed in so the patterns outlive the returned groups.
+fn build_compare_groups(
     baseline: &CtprofSnapshot,
     candidate: &CtprofSnapshot,
     opts: &CompareOptions,
-) -> CtprofDiff {
-    let flatten = compile_flatten_patterns(&opts.cgroup_flatten);
+    flatten: &[glob::Pattern],
+) -> (
+    GroupBy,
+    Option<BTreeMap<String, String>>,
+    BTreeMap<String, ThreadGroup>,
+    BTreeMap<String, ThreadGroup>,
+) {
     let group_by = opts.group_by.0;
     // For `GroupBy::Comm` and `GroupBy::Pcomm`, the frequency gate
     // that promotes a pattern_key from per-thread literal to a
@@ -403,14 +441,14 @@ pub fn compare(
     };
     let cgroup_key_map: Option<BTreeMap<String, String>> =
         if matches!(group_by, GroupBy::Cgroup | GroupBy::All) && !opts.no_cg_normalize {
-            Some(build_cgroup_key_map(baseline, candidate, &flatten))
+            Some(build_cgroup_key_map(baseline, candidate, flatten))
         } else {
             None
         };
     let groups_a = build_groups(
         baseline,
         group_by,
-        &flatten,
+        flatten,
         pattern_counts.as_ref(),
         cgroup_key_map.as_ref(),
         opts.no_thread_normalize,
@@ -418,25 +456,23 @@ pub fn compare(
     let groups_b = build_groups(
         candidate,
         group_by,
-        &flatten,
+        flatten,
         pattern_counts.as_ref(),
         cgroup_key_map.as_ref(),
         opts.no_thread_normalize,
     );
+    (group_by, cgroup_key_map, groups_a, groups_b)
+}
 
-    let mut diff = CtprofDiff::default();
-
-    // Compute per-snapshot "now" for lifetime calculation:
-    // newest thread's start_time approximates capture time in ticks.
-    let now_b = candidate
-        .threads
-        .iter()
-        .map(|t| t.start_time_clock_ticks)
-        .max()
-        .unwrap_or(0);
-
-    for (key, group_a) in &groups_a {
-        let Some(group_b) = groups_b.get(key) else {
+/// Emit one [`DiffRow`] per `(matched group, metric)` plus one
+/// [`DerivedRow`] per derivation, and populate
+/// [`CtprofDiff::only_baseline`] / [`CtprofDiff::only_candidate`]
+/// with the keys present on exactly one side. Display labels for
+/// pattern-aware groupings union both sides' members and run grex;
+/// every other grouping echoes the join key.
+fn emit_matched_rows(diff: &mut CtprofDiff, ctx: &CompareCtx) {
+    for (key, group_a) in ctx.groups_a {
+        let Some(group_b) = ctx.groups_b.get(key) else {
             diff.only_baseline.push(key.clone());
             continue;
         };
@@ -445,8 +481,8 @@ pub fn compare(
         // runs grex over the result; every other grouping just
         // echoes the join key. Computed once per matched group,
         // reused across every metric row built off it.
-        let pattern_axis_active =
-            matches!(group_by, GroupBy::Comm | GroupBy::Pcomm) && !opts.no_thread_normalize;
+        let pattern_axis_active = matches!(ctx.group_by, GroupBy::Comm | GroupBy::Pcomm)
+            && !ctx.opts.no_thread_normalize;
         let display_key = if pattern_axis_active {
             let mut union: Vec<String> = group_a.members.clone();
             union.extend(group_b.members.iter().cloned());
@@ -493,374 +529,466 @@ pub fn compare(
             ));
         }
     }
-    for key in groups_b.keys() {
-        if !groups_a.contains_key(key) {
+    for key in ctx.groups_b.keys() {
+        if !ctx.groups_a.contains_key(key) {
             diff.only_candidate.push(key.clone());
         }
     }
-    // Content-based cgroup fudging: match one-sided groups by
-    // thread population overlap when cgroup paths differ but
-    // the workload is the same (e.g. service re-deployed to a
-    // new cgroup path between snapshots).
-    let mut fudged_key_pairs: Vec<(String, String)> = Vec::new();
-    if group_by == GroupBy::All && !diff.only_baseline.is_empty() && !diff.only_candidate.is_empty()
-    {
-        // Extract cgroup prefix from compound keys.
-        fn cg_prefix(key: &str) -> &str {
-            key.split_once('\x00').map_or(key, |(cg, _)| cg)
+}
+
+/// Extract the cgroup prefix (the `cg` portion) from a compound
+/// `cg\x00pcomm\x00comm` group key. Used throughout the fudge
+/// phase to group one-sided keys by their owning cgroup.
+fn cg_prefix(key: &str) -> &str {
+    key.split_once('\x00').map_or(key, |(cg, _)| cg)
+}
+
+/// `(pcomm, comm)` thread-type set for one cgroup prefix. Fudge
+/// matches cgroups by Jaccard similarity over these sets.
+type TypeSet = std::collections::BTreeSet<(String, String)>;
+
+/// Match baseline-only cgroup prefixes to candidate-only cgroup
+/// prefixes by Jaccard similarity (≥ 0.90, overlap ≥ 10) over
+/// their `(pcomm, comm)` thread-type sets, and return both the
+/// matched `(baseline_cg, candidate_cg)` pairs and the per-prefix
+/// type sets (reused downstream for the residual report). Excludes
+/// any prefix that already has a key matched on both sides
+/// (`matched_prefixes`).
+fn fudge_match_prefixes(
+    diff: &CtprofDiff,
+    ctx: &CompareCtx,
+) -> (
+    Vec<(String, String)>,
+    BTreeMap<String, TypeSet>,
+    BTreeMap<String, TypeSet>,
+) {
+    // Collect thread types per CGROUP PREFIX (not per compound key).
+    let mut cg_types_a: BTreeMap<String, TypeSet> = BTreeMap::new();
+    let mut cg_types_b: BTreeMap<String, TypeSet> = BTreeMap::new();
+
+    // Collect cgroup prefixes that appear in BOTH groups (already matched).
+    // These must be excluded from fudging.
+    let matched_prefixes: std::collections::BTreeSet<String> = ctx
+        .groups_a
+        .keys()
+        .filter(|k| ctx.groups_b.contains_key(*k))
+        .map(|k| cg_prefix(k).to_string())
+        .collect();
+
+    // Collect unique cgroup prefixes from one-sided keys,
+    // skipping any prefix that already has matched keys.
+    let mut cg_prefixes_a: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut cg_prefixes_b: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for key in &diff.only_baseline {
+        let pfx = cg_prefix(key).to_string();
+        if !matched_prefixes.contains(&pfx) {
+            cg_prefixes_a.insert(pfx);
         }
-
-        // Collect thread types per CGROUP PREFIX (not per compound key).
-        type TypeSet = std::collections::BTreeSet<(String, String)>;
-        let mut cg_types_a: BTreeMap<String, TypeSet> = BTreeMap::new();
-        let mut cg_types_b: BTreeMap<String, TypeSet> = BTreeMap::new();
-
-        // Collect cgroup prefixes that appear in BOTH groups (already matched).
-        // These must be excluded from fudging.
-        let matched_prefixes: std::collections::BTreeSet<String> = groups_a
-            .keys()
-            .filter(|k| groups_b.contains_key(*k))
-            .map(|k| cg_prefix(k).to_string())
-            .collect();
-
-        // Collect unique cgroup prefixes from one-sided keys,
-        // skipping any prefix that already has matched keys.
-        let mut cg_prefixes_a: std::collections::BTreeSet<String> =
-            std::collections::BTreeSet::new();
-        let mut cg_prefixes_b: std::collections::BTreeSet<String> =
-            std::collections::BTreeSet::new();
-        for key in &diff.only_baseline {
-            let pfx = cg_prefix(key).to_string();
-            if !matched_prefixes.contains(&pfx) {
-                cg_prefixes_a.insert(pfx);
-            }
+    }
+    for key in &diff.only_candidate {
+        let pfx = cg_prefix(key).to_string();
+        if !matched_prefixes.contains(&pfx) {
+            cg_prefixes_b.insert(pfx);
         }
-        for key in &diff.only_candidate {
-            let pfx = cg_prefix(key).to_string();
-            if !matched_prefixes.contains(&pfx) {
-                cg_prefixes_b.insert(pfx);
-            }
-        }
+    }
 
-        // Populate thread types per cgroup prefix from snapshots.
-        for t in &baseline.threads {
-            let cg = flatten_cgroup_path(&t.cgroup, &flatten);
-            let cg_key = match cgroup_key_map.as_ref().and_then(|m| m.get(&cg)) {
-                Some(k) => k.clone(),
-                None => cg,
-            };
-            if cg_prefixes_a.contains(&cg_key) {
-                cg_types_a
-                    .entry(cg_key)
-                    .or_default()
-                    .insert((pattern_key(&t.pcomm), pattern_key(&t.comm)));
-            }
+    // Populate thread types per cgroup prefix from snapshots.
+    for t in &ctx.baseline.threads {
+        let cg = flatten_cgroup_path(&t.cgroup, ctx.flatten);
+        let cg_key = match ctx.cgroup_key_map.and_then(|m| m.get(&cg)) {
+            Some(k) => k.clone(),
+            None => cg,
+        };
+        if cg_prefixes_a.contains(&cg_key) {
+            cg_types_a
+                .entry(cg_key)
+                .or_default()
+                .insert((pattern_key(&t.pcomm), pattern_key(&t.comm)));
         }
-        for t in &candidate.threads {
-            let cg = flatten_cgroup_path(&t.cgroup, &flatten);
-            let cg_key = match cgroup_key_map.as_ref().and_then(|m| m.get(&cg)) {
-                Some(k) => k.clone(),
-                None => cg,
-            };
-            if cg_prefixes_b.contains(&cg_key) {
-                cg_types_b
-                    .entry(cg_key)
-                    .or_default()
-                    .insert((pattern_key(&t.pcomm), pattern_key(&t.comm)));
-            }
+    }
+    for t in &ctx.candidate.threads {
+        let cg = flatten_cgroup_path(&t.cgroup, ctx.flatten);
+        let cg_key = match ctx.cgroup_key_map.and_then(|m| m.get(&cg)) {
+            Some(k) => k.clone(),
+            None => cg,
+        };
+        if cg_prefixes_b.contains(&cg_key) {
+            cg_types_b
+                .entry(cg_key)
+                .or_default()
+                .insert((pattern_key(&t.pcomm), pattern_key(&t.comm)));
         }
+    }
 
-        // Match cgroup prefixes by Jaccard similarity. Each
-        // candidate finds its best baseline match independently —
-        // multiple candidates can match the same baseline (N
-        // vs 1 baseline).
-        let mut fudged_cg: Vec<(String, String)> = Vec::new(); // (baseline_cg, candidate_cg)
+    // Match cgroup prefixes by Jaccard similarity. Each
+    // candidate finds its best baseline match independently —
+    // multiple candidates can match the same baseline (N
+    // vs 1 baseline).
+    let mut fudged_cg: Vec<(String, String)> = Vec::new(); // (baseline_cg, candidate_cg)
 
-        for ccg in &cg_prefixes_b {
-            let Some(set_b) = cg_types_b.get(ccg) else {
+    for ccg in &cg_prefixes_b {
+        let Some(set_b) = cg_types_b.get(ccg) else {
+            continue;
+        };
+        if set_b.len() < 10 {
+            continue;
+        }
+        let mut best: Option<(&str, f64, usize)> = None;
+        for bcg in &cg_prefixes_a {
+            let Some(set_a) = cg_types_a.get(bcg) else {
                 continue;
             };
-            if set_b.len() < 10 {
+            let intersection = set_a.intersection(set_b).count();
+            if intersection < 10 {
                 continue;
             }
-            let mut best: Option<(&str, f64, usize)> = None;
-            for bcg in &cg_prefixes_a {
-                let Some(set_a) = cg_types_a.get(bcg) else {
-                    continue;
-                };
-                let intersection = set_a.intersection(set_b).count();
-                if intersection < 10 {
-                    continue;
-                }
-                let union = set_a.union(set_b).count();
-                let jaccard = intersection as f64 / union as f64;
-                if jaccard >= 0.90 && best.is_none_or(|(_, bj, _)| jaccard > bj) {
-                    best = Some((bcg.as_str(), jaccard, intersection));
-                }
-            }
-            if let Some((bcg, _jaccard, _overlap)) = best {
-                fudged_cg.push((bcg.to_string(), ccg.clone()));
+            let union = set_a.union(set_b).count();
+            let jaccard = intersection as f64 / union as f64;
+            if jaccard >= 0.90 && best.is_none_or(|(_, bj, _)| jaccard > bj) {
+                best = Some((bcg.as_str(), jaccard, intersection));
             }
         }
-
-        // For each fudged cgroup pair, remap ALL compound keys sharing
-        // that prefix. Match baseline keys to candidate keys by their
-        // pcomm\x00comm suffix.
-        let mut remove_baseline: std::collections::BTreeSet<String> =
-            std::collections::BTreeSet::new();
-        let mut remove_candidate: std::collections::BTreeSet<String> =
-            std::collections::BTreeSet::new();
-
-        // Collect all (baseline_key, candidate_key) pairs across
-        // all fudge pairs. Multiple candidate keys can map to the
-        // same baseline key (N:1).
-        let mut fudge_matches: BTreeMap<String, Vec<String>> = BTreeMap::new(); // bkey → [ckeys]
-        for (bcg, ccg) in &fudged_cg {
-            let b_keys: Vec<&String> = diff
-                .only_baseline
-                .iter()
-                .filter(|k| cg_prefix(k) == bcg.as_str())
-                .collect();
-            let c_keys: Vec<&String> = diff
-                .only_candidate
-                .iter()
-                .filter(|k| cg_prefix(k) == ccg.as_str())
-                .collect();
-            let c_suffix_map: BTreeMap<&str, &String> = c_keys
-                .iter()
-                .map(|k| {
-                    let suffix = k.split_once('\x00').map_or("", |(_, s)| s);
-                    (suffix, *k)
-                })
-                .collect();
-            for bkey in &b_keys {
-                let b_suffix = bkey.split_once('\x00').map_or("", |(_, s)| s);
-                if let Some(ckey) = c_suffix_map.get(b_suffix) {
-                    remove_baseline.insert((*bkey).clone());
-                    remove_candidate.insert((*ckey).clone());
-                    fudged_key_pairs.push(((*bkey).clone(), (*ckey).clone()));
-                    fudge_matches
-                        .entry((*bkey).clone())
-                        .or_default()
-                        .push((*ckey).clone());
-                }
-            }
+        if let Some((bcg, _jaccard, _overlap)) = best {
+            fudged_cg.push((bcg.to_string(), ccg.clone()));
         }
-        // Emit one row per baseline key with candidate values
-        // aggregated across all N matched candidate groups.
-        emit_fudged_rows(&mut diff, &fudge_matches, &groups_a, &groups_b);
+    }
 
-        // Cascade: for each fudged cgroup pair, compute cascade
-        // roots by stripping the longest common suffix (by /
-        // segments) from the pair. Use those shorter roots for
-        // starts_with matching, not the full fudged paths.
-        let mut cascade_counts: BTreeMap<String, usize> = BTreeMap::new();
-        let mut cascade_roots: BTreeMap<(String, String), (String, String)> = BTreeMap::new();
-        let mut cascade_matches: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        for (bcg, ccg) in &fudged_cg {
-            let b_segs: Vec<&str> = bcg.split('/').collect();
-            let c_segs: Vec<&str> = ccg.split('/').collect();
-            let common_suffix_len = b_segs
-                .iter()
-                .rev()
-                .zip(c_segs.iter().rev())
-                .take_while(|(a, b)| a == b)
-                .count();
-            let b_root: String = b_segs[..b_segs.len().saturating_sub(common_suffix_len)].join("/");
-            let c_root: String = c_segs[..c_segs.len().saturating_sub(common_suffix_len)].join("/");
-            let b_root = if b_root.is_empty() {
-                bcg.clone()
-            } else {
-                b_root
-            };
-            let c_root = if c_root.is_empty() {
-                ccg.clone()
-            } else {
-                c_root
-            };
+    (fudged_cg, cg_types_a, cg_types_b)
+}
 
-            cascade_roots.insert((bcg.clone(), ccg.clone()), (b_root.clone(), c_root.clone()));
+/// Tracks which one-sided keys have been consumed by fudging (so
+/// the cascade pass and the post-fudge `retain` drop them) and
+/// the per-baseline cascade root + child count for the report.
+#[derive(Default)]
+struct FudgeRemap {
+    remove_baseline: std::collections::BTreeSet<String>,
+    remove_candidate: std::collections::BTreeSet<String>,
+    cascade_counts: BTreeMap<String, usize>,
+    cascade_roots: BTreeMap<(String, String), (String, String)>,
+}
 
-            // Boundary-checked prefix match: accept either an
-            // exact root match (tail.is_empty()) or a child path
-            // (tail starts with '/'). Bare `starts_with` would
-            // false-match siblings — `/svc-extra` would slip
-            // through `b_root=/svc`. The non-matching keys would
-            // ultimately fail downstream lookup (c_by_suffix
-            // applies the same boundary filter), but skipping them
-            // here keeps the cascade scan consistent with the
-            // remap rule and avoids needless work.
-            let is_root_or_child = |cg: &str, root: &str| {
-                let Some(tail) = cg.strip_prefix(root) else {
-                    return false;
-                };
-                tail.is_empty() || tail.starts_with('/')
-            };
-            let remaining_b: Vec<String> = diff
-                .only_baseline
-                .iter()
-                .filter(|k| {
-                    !remove_baseline.contains(*k) && is_root_or_child(cg_prefix(k), b_root.as_str())
-                })
-                .cloned()
-                .collect();
-            let remaining_c: Vec<String> = diff
-                .only_candidate
-                .iter()
-                .filter(|k| {
-                    !remove_candidate.contains(*k)
-                        && is_root_or_child(cg_prefix(k), c_root.as_str())
-                })
-                .cloned()
-                .collect();
-            // Filter_map (not map) so boundary-rejected entries
-            // drop instead of all colliding at the empty-string
-            // key in the BTreeMap. Combined with the upstream
-            // is_root_or_child filter on remaining_c, every entry
-            // here should already qualify; this stays defensive
-            // against future filter regressions.
-            let c_by_suffix: BTreeMap<String, &String> = remaining_c
-                .iter()
-                .filter_map(|k| {
-                    let child_cg = cg_prefix(k);
-                    let tail = &child_cg[c_root.len()..];
-                    if !tail.is_empty() && !tail.starts_with('/') {
-                        return None;
-                    }
-                    let rewritten = format!("{b_root}{tail}");
-                    let suffix = k.split_once('\x00').map_or("", |(_, s)| s);
-                    Some((format!("{rewritten}\x00{suffix}"), k))
-                })
-                .collect();
-            for bkey in &remaining_b {
-                if let Some(ckey) = c_by_suffix.get(bkey) {
-                    remove_baseline.insert(bkey.clone());
-                    remove_candidate.insert((*ckey).clone());
-                    fudged_key_pairs.push((bkey.clone(), (*ckey).clone()));
-                    *cascade_counts.entry(bcg.clone()).or_insert(0) += 1;
-                    cascade_matches
-                        .entry(bkey.clone())
-                        .or_default()
-                        .push((*ckey).clone());
-                }
-            }
-        }
+/// Apply the direct (suffix-exact) remap and then the cascade
+/// remap for every fudged cgroup pair, emitting aggregated rows
+/// for both. Records consumed keys + cascade metadata in
+/// [`FudgeRemap`] and appends every joined `(bkey, ckey)` to
+/// `fudged_key_pairs`. Mirrors the two `emit_fudged_rows` calls of
+/// the original block: first the direct suffix matches, then the
+/// cascaded children.
+fn fudge_cascade(
+    diff: &mut CtprofDiff,
+    ctx: &CompareCtx,
+    fudged_cg: &[(String, String)],
+    fudged_key_pairs: &mut Vec<(String, String)>,
+) -> FudgeRemap {
+    // For each fudged cgroup pair, remap ALL compound keys sharing
+    // that prefix. Match baseline keys to candidate keys by their
+    // pcomm\x00comm suffix.
+    let mut remap = FudgeRemap::default();
 
-        // Emit aggregated rows for cascaded children (same N:1 merge).
-        emit_fudged_rows(&mut diff, &cascade_matches, &groups_a, &groups_b);
-
-        diff.only_baseline.retain(|k| !remove_baseline.contains(k));
-        diff.only_candidate
-            .retain(|k| !remove_candidate.contains(k));
-
-        // Store fudge report per cgroup pair.
-        //
-        // Residual deduplication for N:1: when one bcg is matched
-        // against multiple ccgs, the per-pair baseline_residual =
-        // (set_a - set_b_for_this_pair) over-reports thread types
-        // that are missing from EVERY ccg — they appear N times,
-        // once per pair. Same for candidate_residual when one ccg
-        // is matched against multiple bcgs (M:1 in the other
-        // direction). Compute residuals against the UNION of all
-        // counterpart sets so a missing-on-every-side type
-        // surfaces exactly once across the bcg's pairs.
-        let mut union_b_for_bcg: BTreeMap<String, TypeSet> = BTreeMap::new();
-        let mut union_a_for_ccg: BTreeMap<String, TypeSet> = BTreeMap::new();
-        for (bcg, ccg) in &fudged_cg {
-            if let Some(sb) = cg_types_b.get(ccg) {
-                union_b_for_bcg
-                    .entry(bcg.clone())
-                    .or_default()
-                    .extend(sb.iter().cloned());
-            }
-            if let Some(sa) = cg_types_a.get(bcg) {
-                union_a_for_ccg
-                    .entry(ccg.clone())
-                    .or_default()
-                    .extend(sa.iter().cloned());
-            }
-        }
-        diff.fudged_pairs = fudged_cg
+    // Collect all (baseline_key, candidate_key) pairs across
+    // all fudge pairs. Multiple candidate keys can map to the
+    // same baseline key (N:1).
+    let mut fudge_matches: BTreeMap<String, Vec<String>> = BTreeMap::new(); // bkey → [ckeys]
+    for (bcg, ccg) in fudged_cg {
+        let b_keys: Vec<&String> = diff
+            .only_baseline
             .iter()
-            .map(|(bcg, ccg)| {
-                let set_a = cg_types_a.get(bcg).cloned().unwrap_or_default();
-                let set_b = cg_types_b.get(ccg).cloned().unwrap_or_default();
-                // Residuals against the per-bcg / per-ccg unions
-                // so a thread type missing from every counterpart
-                // candidate appears exactly once.
-                let union_b = union_b_for_bcg.get(bcg).cloned().unwrap_or_default();
-                let union_a = union_a_for_ccg.get(ccg).cloned().unwrap_or_default();
-                let residual_a: Vec<String> = set_a
-                    .difference(&union_b)
-                    .map(|(p, c)| format!("{p}:{c}"))
-                    .collect();
-                let residual_b: Vec<String> = set_b
-                    .difference(&union_a)
-                    .map(|(p, c)| format!("{p}:{c}"))
-                    .collect();
-                let intersection = set_a.intersection(&set_b).count();
-                let union = set_a.union(&set_b).count();
-                FudgedPair {
-                    baseline_cgroup: bcg.clone(),
-                    candidate_cgroup: ccg.clone(),
-                    overlap: intersection,
-                    jaccard: if union > 0 {
-                        intersection as f64 / union as f64
-                    } else {
-                        0.0
-                    },
-                    baseline_residual: residual_a,
-                    candidate_residual: residual_b,
-                    cascaded_children: cascade_counts.get(bcg).copied().unwrap_or(0),
-                    baseline_root: cascade_roots
-                        .get(&(bcg.clone(), ccg.clone()))
-                        .map(|(b, _)| b.clone())
-                        .unwrap_or_else(|| bcg.clone()),
-                    candidate_root: cascade_roots
-                        .get(&(bcg.clone(), ccg.clone()))
-                        .map(|(_, c)| c.clone())
-                        .unwrap_or_else(|| ccg.clone()),
-                }
+            .filter(|k| cg_prefix(k) == bcg.as_str())
+            .collect();
+        let c_keys: Vec<&String> = diff
+            .only_candidate
+            .iter()
+            .filter(|k| cg_prefix(k) == ccg.as_str())
+            .collect();
+        let c_suffix_map: BTreeMap<&str, &String> = c_keys
+            .iter()
+            .map(|k| {
+                let suffix = k.split_once('\x00').map_or("", |(_, s)| s);
+                (suffix, *k)
             })
             .collect();
+        for bkey in &b_keys {
+            let b_suffix = bkey.split_once('\x00').map_or("", |(_, s)| s);
+            if let Some(ckey) = c_suffix_map.get(b_suffix) {
+                remap.remove_baseline.insert((*bkey).clone());
+                remap.remove_candidate.insert((*ckey).clone());
+                fudged_key_pairs.push(((*bkey).clone(), (*ckey).clone()));
+                fudge_matches
+                    .entry((*bkey).clone())
+                    .or_default()
+                    .push((*ckey).clone());
+            }
+        }
+    }
+    // Emit one row per baseline key with candidate values
+    // aggregated across all N matched candidate groups.
+    emit_fudged_rows(diff, &fudge_matches, ctx.groups_a, ctx.groups_b);
+
+    // Cascade: for each fudged cgroup pair, compute cascade
+    // roots by stripping the longest common suffix (by /
+    // segments) from the pair. Use those shorter roots for
+    // starts_with matching, not the full fudged paths.
+    let mut cascade_matches: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (bcg, ccg) in fudged_cg {
+        let b_segs: Vec<&str> = bcg.split('/').collect();
+        let c_segs: Vec<&str> = ccg.split('/').collect();
+        let common_suffix_len = b_segs
+            .iter()
+            .rev()
+            .zip(c_segs.iter().rev())
+            .take_while(|(a, b)| a == b)
+            .count();
+        let b_root: String = b_segs[..b_segs.len().saturating_sub(common_suffix_len)].join("/");
+        let c_root: String = c_segs[..c_segs.len().saturating_sub(common_suffix_len)].join("/");
+        let b_root = if b_root.is_empty() {
+            bcg.clone()
+        } else {
+            b_root
+        };
+        let c_root = if c_root.is_empty() {
+            ccg.clone()
+        } else {
+            c_root
+        };
+
+        remap
+            .cascade_roots
+            .insert((bcg.clone(), ccg.clone()), (b_root.clone(), c_root.clone()));
+
+        // Boundary-checked prefix match: accept either an
+        // exact root match (tail.is_empty()) or a child path
+        // (tail starts with '/'). Bare `starts_with` would
+        // false-match siblings — `/svc-extra` would slip
+        // through `b_root=/svc`. The non-matching keys would
+        // ultimately fail downstream lookup (c_by_suffix
+        // applies the same boundary filter), but skipping them
+        // here keeps the cascade scan consistent with the
+        // remap rule and avoids needless work.
+        let is_root_or_child = |cg: &str, root: &str| {
+            let Some(tail) = cg.strip_prefix(root) else {
+                return false;
+            };
+            tail.is_empty() || tail.starts_with('/')
+        };
+        let remaining_b: Vec<String> = diff
+            .only_baseline
+            .iter()
+            .filter(|k| {
+                !remap.remove_baseline.contains(*k)
+                    && is_root_or_child(cg_prefix(k), b_root.as_str())
+            })
+            .cloned()
+            .collect();
+        let remaining_c: Vec<String> = diff
+            .only_candidate
+            .iter()
+            .filter(|k| {
+                !remap.remove_candidate.contains(*k)
+                    && is_root_or_child(cg_prefix(k), c_root.as_str())
+            })
+            .cloned()
+            .collect();
+        // Filter_map (not map) so boundary-rejected entries
+        // drop instead of all colliding at the empty-string
+        // key in the BTreeMap. Combined with the upstream
+        // is_root_or_child filter on remaining_c, every entry
+        // here should already qualify; this stays defensive
+        // against future filter regressions.
+        let c_by_suffix: BTreeMap<String, &String> = remaining_c
+            .iter()
+            .filter_map(|k| {
+                let child_cg = cg_prefix(k);
+                let tail = &child_cg[c_root.len()..];
+                if !tail.is_empty() && !tail.starts_with('/') {
+                    return None;
+                }
+                let rewritten = format!("{b_root}{tail}");
+                let suffix = k.split_once('\x00').map_or("", |(_, s)| s);
+                Some((format!("{rewritten}\x00{suffix}"), k))
+            })
+            .collect();
+        for bkey in &remaining_b {
+            if let Some(ckey) = c_by_suffix.get(bkey) {
+                remap.remove_baseline.insert(bkey.clone());
+                remap.remove_candidate.insert((*ckey).clone());
+                fudged_key_pairs.push((bkey.clone(), (*ckey).clone()));
+                *remap.cascade_counts.entry(bcg.clone()).or_insert(0) += 1;
+                cascade_matches
+                    .entry(bkey.clone())
+                    .or_default()
+                    .push((*ckey).clone());
+            }
+        }
     }
 
-    diff.only_baseline.sort();
-    diff.only_candidate.sort();
+    // Emit aggregated rows for cascaded children (same N:1 merge).
+    emit_fudged_rows(diff, &cascade_matches, ctx.groups_a, ctx.groups_b);
 
-    // Second pass: fill in uptime_pct. Compute each group's
-    // average thread lifetime (candidate side), then express as
-    // % of the longest-lived group.
+    remap
+}
+
+/// Build the [`FudgedPair`] report vector for every matched cgroup
+/// pair: overlap / Jaccard over the two thread-type sets, residuals
+/// computed against the per-bcg / per-ccg UNION of counterpart sets
+/// (so a type missing from every counterpart surfaces once), and
+/// the cascade child count + roots from [`FudgeRemap`].
+fn build_fudged_pairs(
+    fudged_cg: &[(String, String)],
+    cg_types_a: &BTreeMap<String, TypeSet>,
+    cg_types_b: &BTreeMap<String, TypeSet>,
+    remap: &FudgeRemap,
+) -> Vec<FudgedPair> {
+    // Store fudge report per cgroup pair.
+    //
+    // Residual deduplication for N:1: when one bcg is matched
+    // against multiple ccgs, the per-pair baseline_residual =
+    // (set_a - set_b_for_this_pair) over-reports thread types
+    // that are missing from EVERY ccg — they appear N times,
+    // once per pair. Same for candidate_residual when one ccg
+    // is matched against multiple bcgs (M:1 in the other
+    // direction). Compute residuals against the UNION of all
+    // counterpart sets so a missing-on-every-side type
+    // surfaces exactly once across the bcg's pairs.
+    let mut union_b_for_bcg: BTreeMap<String, TypeSet> = BTreeMap::new();
+    let mut union_a_for_ccg: BTreeMap<String, TypeSet> = BTreeMap::new();
+    for (bcg, ccg) in fudged_cg {
+        if let Some(sb) = cg_types_b.get(ccg) {
+            union_b_for_bcg
+                .entry(bcg.clone())
+                .or_default()
+                .extend(sb.iter().cloned());
+        }
+        if let Some(sa) = cg_types_a.get(bcg) {
+            union_a_for_ccg
+                .entry(ccg.clone())
+                .or_default()
+                .extend(sa.iter().cloned());
+        }
+    }
+    fudged_cg
+        .iter()
+        .map(|(bcg, ccg)| {
+            let set_a = cg_types_a.get(bcg).cloned().unwrap_or_default();
+            let set_b = cg_types_b.get(ccg).cloned().unwrap_or_default();
+            // Residuals against the per-bcg / per-ccg unions
+            // so a thread type missing from every counterpart
+            // candidate appears exactly once.
+            let union_b = union_b_for_bcg.get(bcg).cloned().unwrap_or_default();
+            let union_a = union_a_for_ccg.get(ccg).cloned().unwrap_or_default();
+            let residual_a: Vec<String> = set_a
+                .difference(&union_b)
+                .map(|(p, c)| format!("{p}:{c}"))
+                .collect();
+            let residual_b: Vec<String> = set_b
+                .difference(&union_a)
+                .map(|(p, c)| format!("{p}:{c}"))
+                .collect();
+            let intersection = set_a.intersection(&set_b).count();
+            let union = set_a.union(&set_b).count();
+            FudgedPair {
+                baseline_cgroup: bcg.clone(),
+                candidate_cgroup: ccg.clone(),
+                overlap: intersection,
+                jaccard: if union > 0 {
+                    intersection as f64 / union as f64
+                } else {
+                    0.0
+                },
+                baseline_residual: residual_a,
+                candidate_residual: residual_b,
+                cascaded_children: remap.cascade_counts.get(bcg).copied().unwrap_or(0),
+                baseline_root: remap
+                    .cascade_roots
+                    .get(&(bcg.clone(), ccg.clone()))
+                    .map(|(b, _)| b.clone())
+                    .unwrap_or_else(|| bcg.clone()),
+                candidate_root: remap
+                    .cascade_roots
+                    .get(&(bcg.clone(), ccg.clone()))
+                    .map(|(_, c)| c.clone())
+                    .unwrap_or_else(|| ccg.clone()),
+            }
+        })
+        .collect()
+}
+
+/// Content-based cgroup fudging: join one-sided groups whose
+/// thread populations overlap (cgroup path changed but workload is
+/// the same). Runs only under `GroupBy::All` with both unmatched
+/// lists non-empty; otherwise returns an empty `fudged_key_pairs`
+/// and leaves `diff` untouched. On the active path it emits the
+/// merged rows (direct + cascade), prunes the joined keys from
+/// `only_baseline` / `only_candidate`, populates
+/// [`CtprofDiff::fudged_pairs`], and returns the `(bkey, ckey)`
+/// pairs consumed downstream by [`fill_uptime_pct`] and
+/// [`attach_enrichment`].
+fn apply_cgroup_fudge(diff: &mut CtprofDiff, ctx: &CompareCtx) -> Vec<(String, String)> {
+    let mut fudged_key_pairs: Vec<(String, String)> = Vec::new();
+    if ctx.group_by != GroupBy::All
+        || diff.only_baseline.is_empty()
+        || diff.only_candidate.is_empty()
     {
-        let mut group_lifetime: BTreeMap<String, u64> = BTreeMap::new();
-        for (key, group_b) in &groups_b {
-            if groups_a.contains_key(key) {
-                group_lifetime.insert(key.clone(), now_b.saturating_sub(group_b.avg_start_ticks));
-            }
-        }
-        let mut fudge_lt_sum: BTreeMap<String, (u64, u64)> = BTreeMap::new();
-        for (bkey, ckey) in &fudged_key_pairs {
-            if let Some(gb) = groups_b.get(ckey) {
-                let lt = now_b.saturating_sub(gb.avg_start_ticks);
-                let entry = fudge_lt_sum.entry(bkey.clone()).or_insert((0, 0));
-                entry.0 += lt;
-                entry.1 += 1;
-            }
-        }
-        for (bkey, (sum, count)) in &fudge_lt_sum {
-            if *count > 0 {
-                group_lifetime.insert(bkey.clone(), sum / count);
-            }
-        }
-        let max_lifetime = group_lifetime.values().copied().max().unwrap_or(1).max(1);
-        for row in &mut diff.rows {
-            if let Some(&lt) = group_lifetime.get(&row.group_key) {
-                row.uptime_pct = Some(lt as f64 / max_lifetime as f64 * 100.0);
-            }
-        }
+        return fudged_key_pairs;
     }
 
-    if opts.sort_by.is_empty() {
+    let (fudged_cg, cg_types_a, cg_types_b) = fudge_match_prefixes(diff, ctx);
+
+    let remap = fudge_cascade(diff, ctx, &fudged_cg, &mut fudged_key_pairs);
+
+    diff.only_baseline
+        .retain(|k| !remap.remove_baseline.contains(k));
+    diff.only_candidate
+        .retain(|k| !remap.remove_candidate.contains(k));
+
+    diff.fudged_pairs = build_fudged_pairs(&fudged_cg, &cg_types_a, &cg_types_b, &remap);
+
+    fudged_key_pairs
+}
+
+/// Second pass: fill [`DiffRow::uptime_pct`]. Computes each
+/// matched group's average candidate-side thread lifetime
+/// (`now_b - avg_start_ticks`), folds the fudged pairs' candidate
+/// lifetimes into their baseline key (averaged across the N
+/// matched candidates), then expresses each as a percentage of the
+/// longest-lived group.
+fn fill_uptime_pct(diff: &mut CtprofDiff, ctx: &CompareCtx, fudged_key_pairs: &[(String, String)]) {
+    let mut group_lifetime: BTreeMap<String, u64> = BTreeMap::new();
+    for (key, group_b) in ctx.groups_b {
+        if ctx.groups_a.contains_key(key) {
+            group_lifetime.insert(key.clone(), ctx.now_b.saturating_sub(group_b.avg_start_ticks));
+        }
+    }
+    let mut fudge_lt_sum: BTreeMap<String, (u64, u64)> = BTreeMap::new();
+    for (bkey, ckey) in fudged_key_pairs {
+        if let Some(gb) = ctx.groups_b.get(ckey) {
+            let lt = ctx.now_b.saturating_sub(gb.avg_start_ticks);
+            let entry = fudge_lt_sum.entry(bkey.clone()).or_insert((0, 0));
+            entry.0 += lt;
+            entry.1 += 1;
+        }
+    }
+    for (bkey, (sum, count)) in &fudge_lt_sum {
+        if *count > 0 {
+            group_lifetime.insert(bkey.clone(), sum / count);
+        }
+    }
+    let max_lifetime = group_lifetime.values().copied().max().unwrap_or(1).max(1);
+    for row in &mut diff.rows {
+        if let Some(&lt) = group_lifetime.get(&row.group_key) {
+            row.uptime_pct = Some(lt as f64 / max_lifetime as f64 * 100.0);
+        }
+    }
+}
+
+/// Order the diff + derived rows. With an empty `sort_by`, applies
+/// the default `|delta_pct|`-descending sort (ties broken by
+/// ascending group_key) to both row vecs. With a non-empty
+/// `sort_by`, routes through [`sort_diff_rows_by_keys`] for the
+/// multi-key rank, then fills [`DiffRow::sort_by_cell`] /
+/// `sort_by_delta` (mirrored onto the derived rows) from the
+/// primary sort metric's per-group cell.
+fn sort_diff(diff: &mut CtprofDiff, sort_by: &[SortKey]) {
+    if sort_by.is_empty() {
         // Default: stable-sort by descending |delta_pct|, ties
         // broken by ascending group_key + registry order of
         // metric. Apply the same shape to derived_rows so the
@@ -883,11 +1011,11 @@ pub fn compare(
     } else {
         // Multi-key sort: rank groups by tuple of named-metric
         // deltas, sort rows by (group_rank, metric_registry_idx).
-        sort_diff_rows_by_keys(&mut diff.rows, &mut diff.derived_rows, &opts.sort_by);
+        sort_diff_rows_by_keys(&mut diff.rows, &mut diff.derived_rows, sort_by);
 
         // Fill sort_by_cell: for each group, find the sort metric's
         // row and format its baseline→candidate (delta%).
-        let sort_metric = opts.sort_by.first().map(|sk| sk.metric);
+        let sort_metric = sort_by.first().map(|sk| sk.metric);
         diff.sort_metric_name = sort_metric;
         if let Some(metric_name) = sort_metric {
             let mut group_cells: BTreeMap<String, (String, Option<f64>)> = BTreeMap::new();
@@ -925,147 +1053,205 @@ pub fn compare(
             }
         }
     }
+}
 
-    if group_by == GroupBy::Cgroup {
-        diff.cgroup_stats_a =
-            flatten_cgroup_stats(&baseline.cgroup_stats, &flatten, cgroup_key_map.as_ref());
-        diff.cgroup_stats_b =
-            flatten_cgroup_stats(&candidate.cgroup_stats, &flatten, cgroup_key_map.as_ref());
-    }
-
-    diff.host_psi_a = baseline.psi;
-    diff.host_psi_b = candidate.psi;
-
-    if group_by == GroupBy::All {
-        diff.smaps_rollup_a = collect_smaps_rollup_hierarchical(
-            baseline,
-            opts.no_thread_normalize,
-            &flatten,
-            cgroup_key_map.as_ref(),
-        );
-        diff.smaps_rollup_b = collect_smaps_rollup_hierarchical(
-            candidate,
-            opts.no_thread_normalize,
-            &flatten,
-            cgroup_key_map.as_ref(),
-        );
-    } else {
-        diff.smaps_rollup_a = collect_smaps_rollup(baseline, opts.no_thread_normalize);
-        diff.smaps_rollup_b = collect_smaps_rollup(candidate, opts.no_thread_normalize);
-    }
-
-    // Remap fudged smaps keys so baseline and candidate join.
-    // Fudge pairs a baseline cgroup with a candidate cgroup (see
-    // FudgedPair), but smaps keys are cg\x00pcomm — different cg
-    // means no join. Re-key candidate smaps data under the pair's
-    // baseline_root so the renderer joins them.
-    //
-    // For each fudge pair, scan candidate-side smaps keys under
-    // the pair's candidate_root, strip that root to get a relative
-    // child path, then re-key under the SAME pair's baseline_root.
-    // Per-pair scoping prevents data from one pair landing under
-    // another pair's baseline_root (multiple unrelated fudge pairs
-    // each contribute their own baseline_root → candidate_root
-    // mapping; a global accumulator would collapse them).
-    // Sum values when multiple candidates map to the same baseline
-    // key (N containers under one pair → total candidate footprint).
-    //
-    // Sort by descending candidate_root.len() so the most-specific
-    // root processes first. With nested roots like `/svc` and
-    // `/svc/sub`, an unsorted scan would let the shorter `/svc`
-    // root claim every key starting with `/svc/sub` first,
-    // stealing the more-specific pair's data. Longest-first
-    // ensures `/svc/sub` removes its keys before `/svc` scans.
-    {
-        // Build a set of candidate cgroup paths that were
-        // actually fudge-matched (extracted from the candidate
-        // half of fudged_key_pairs). The smaps remap MUST
-        // restrict to these paths — without the gate, any smaps
-        // key that happens to share a prefix with a fudge pair's
-        // candidate_root is remapped, even if its compound-key
-        // counterpart was never fudge-matched. Sub-cgroups under
-        // a cascade root that didn't actually match would have
-        // their smaps data silently re-keyed under the baseline_root.
-        let fudged_cg_set: std::collections::BTreeSet<&str> = fudged_key_pairs
-            .iter()
-            .map(|(_, ckey)| ckey.split_once('\x00').map_or(ckey.as_str(), |(cg, _)| cg))
+/// Re-key candidate-side smaps data so fudged pairs join the
+/// baseline side. Fudge pairs a baseline cgroup with a candidate
+/// cgroup, but smaps keys are `cg\x00pcomm` — different cg means no
+/// join. For each fudge pair (processed most-specific-root-first),
+/// scan candidate smaps keys under the pair's `candidate_root`,
+/// strip that root to a relative child path, then re-key under the
+/// SAME pair's `baseline_root`. Restricts to candidate cgroups that
+/// were actually fudge-matched (`fudged_key_pairs`) and sums values
+/// when multiple candidates map to one baseline key.
+fn remap_fudged_smaps(diff: &mut CtprofDiff, fudged_key_pairs: &[(String, String)]) {
+    // Build a set of candidate cgroup paths that were
+    // actually fudge-matched (extracted from the candidate
+    // half of fudged_key_pairs). The smaps remap MUST
+    // restrict to these paths — without the gate, any smaps
+    // key that happens to share a prefix with a fudge pair's
+    // candidate_root is remapped, even if its compound-key
+    // counterpart was never fudge-matched. Sub-cgroups under
+    // a cascade root that didn't actually match would have
+    // their smaps data silently re-keyed under the baseline_root.
+    let fudged_cg_set: std::collections::BTreeSet<&str> = fudged_key_pairs
+        .iter()
+        .map(|(_, ckey)| ckey.split_once('\x00').map_or(ckey.as_str(), |(cg, _)| cg))
+        .collect();
+    let mut sorted_pairs: Vec<&FudgedPair> = diff.fudged_pairs.iter().collect();
+    sorted_pairs.sort_by(|a, b| b.candidate_root.len().cmp(&a.candidate_root.len()));
+    for fp in sorted_pairs {
+        let br = &fp.baseline_root;
+        let cr = &fp.candidate_root;
+        let cr_slash = format!("{cr}/");
+        let cr_nul = format!("{cr}\x00");
+        // (relative_child_path + \x00 + pcomm) → summed values,
+        // SCOPED to this fudge pair so pairs with different
+        // baseline_roots don't share a remap accumulator.
+        let mut summed_by_rel: BTreeMap<String, BTreeMap<String, u64>> = BTreeMap::new();
+        // Fudge runs only under GroupBy::All, which routes
+        // through `collect_smaps_rollup_hierarchical` and
+        // produces keys shaped `cgroup\x00pcomm` for every
+        // entry (see [`collect_smaps_rollup_inner`] under
+        // `compound_cgroup=true`). A bare-cgroup key
+        // (no `\x00`) cannot appear here, so the in-root
+        // filter only needs to consider the `/`-bounded
+        // (cr_slash) and `\x00`-bounded (cr_nul) prefixes.
+        let keys: Vec<String> = diff
+            .smaps_rollup_b
+            .keys()
+            .filter(|k| {
+                let in_root = k.starts_with(&cr_slash) || k.starts_with(&cr_nul);
+                if !in_root {
+                    return false;
+                }
+                // Gate on actual fudge match: the smaps key's
+                // cg_path must appear in the fudged_cg_set.
+                let cg_path = k.split_once('\x00').map_or(k.as_str(), |(cg, _)| cg);
+                fudged_cg_set.contains(cg_path)
+            })
+            .cloned()
             .collect();
-        let mut sorted_pairs: Vec<&FudgedPair> = diff.fudged_pairs.iter().collect();
-        sorted_pairs.sort_by(|a, b| b.candidate_root.len().cmp(&a.candidate_root.len()));
-        for fp in sorted_pairs {
-            let br = &fp.baseline_root;
-            let cr = &fp.candidate_root;
-            let cr_slash = format!("{cr}/");
-            let cr_nul = format!("{cr}\x00");
-            // (relative_child_path + \x00 + pcomm) → summed values,
-            // SCOPED to this fudge pair so pairs with different
-            // baseline_roots don't share a remap accumulator.
-            let mut summed_by_rel: BTreeMap<String, BTreeMap<String, u64>> = BTreeMap::new();
-            // Fudge runs only under GroupBy::All, which routes
-            // through `collect_smaps_rollup_hierarchical` and
-            // produces keys shaped `cgroup\x00pcomm` for every
-            // entry (see [`collect_smaps_rollup_inner`] under
-            // `compound_cgroup=true`). A bare-cgroup key
-            // (no `\x00`) cannot appear here, so the in-root
-            // filter only needs to consider the `/`-bounded
-            // (cr_slash) and `\x00`-bounded (cr_nul) prefixes.
-            let keys: Vec<String> = diff
-                .smaps_rollup_b
-                .keys()
-                .filter(|k| {
-                    let in_root = k.starts_with(&cr_slash) || k.starts_with(&cr_nul);
-                    if !in_root {
-                        return false;
-                    }
-                    // Gate on actual fudge match: the smaps key's
-                    // cg_path must appear in the fudged_cg_set.
-                    let cg_path = k.split_once('\x00').map_or(k.as_str(), |(cg, _)| cg);
-                    fudged_cg_set.contains(cg_path)
-                })
-                .cloned()
-                .collect();
-            for k in keys {
-                if let Some(val) = diff.smaps_rollup_b.remove(&k) {
-                    // Split smaps key: cg_path \x00 pcomm. The
-                    // unwrap_or fallback would only fire on a
-                    // key with no `\x00`, which cannot reach
-                    // here (see filter above) — kept defensive.
-                    let (cg_path, pcomm) = k.split_once('\x00').unwrap_or((&k, ""));
-                    // Strip candidate root to get relative child path.
-                    // `cg_path == cr.as_str()` covers the exact-root
-                    // hit (e.g. `/svc-a\x00pcomm` against root
-                    // `/svc-a`); the strip_prefix branch covers
-                    // child paths.
-                    let child = if cg_path == cr.as_str() {
-                        ""
-                    } else if let Some(rest) = cg_path.strip_prefix(&cr_slash) {
-                        rest
-                    } else {
-                        continue;
-                    };
-                    let rel_key = format!("{child}\x00{pcomm}");
-                    let entry = summed_by_rel.entry(rel_key).or_default();
-                    for (field, v) in &val {
-                        let slot = entry.entry(field.clone()).or_insert(0);
-                        *slot = slot.saturating_add(*v);
-                    }
+        for k in keys {
+            if let Some(val) = diff.smaps_rollup_b.remove(&k) {
+                // Split smaps key: cg_path \x00 pcomm. The
+                // unwrap_or fallback would only fire on a
+                // key with no `\x00`, which cannot reach
+                // here (see filter above) — kept defensive.
+                let (cg_path, pcomm) = k.split_once('\x00').unwrap_or((&k, ""));
+                // Strip candidate root to get relative child path.
+                // `cg_path == cr.as_str()` covers the exact-root
+                // hit (e.g. `/svc-a\x00pcomm` against root
+                // `/svc-a`); the strip_prefix branch covers
+                // child paths.
+                let child = if cg_path == cr.as_str() {
+                    ""
+                } else if let Some(rest) = cg_path.strip_prefix(&cr_slash) {
+                    rest
+                } else {
+                    continue;
+                };
+                let rel_key = format!("{child}\x00{pcomm}");
+                let entry = summed_by_rel.entry(rel_key).or_default();
+                for (field, v) in &val {
+                    let slot = entry.entry(field.clone()).or_insert(0);
+                    *slot = slot.saturating_add(*v);
                 }
             }
-            // Rebuild this pair's baseline-side keys and insert
-            // summed data under THIS pair's baseline_root.
-            for (rel_key, summed) in summed_by_rel {
-                let (child, pcomm) = rel_key.split_once('\x00').unwrap_or((&rel_key, ""));
-                let base_key = if child.is_empty() {
-                    format!("{br}\x00{pcomm}")
-                } else {
-                    format!("{br}/{child}\x00{pcomm}")
-                };
-                diff.smaps_rollup_b.insert(base_key, summed);
-            }
+        }
+        // Rebuild this pair's baseline-side keys and insert
+        // summed data under THIS pair's baseline_root.
+        for (rel_key, summed) in summed_by_rel {
+            let (child, pcomm) = rel_key.split_once('\x00').unwrap_or((&rel_key, ""));
+            let base_key = if child.is_empty() {
+                format!("{br}\x00{pcomm}")
+            } else {
+                format!("{br}/{child}\x00{pcomm}")
+            };
+            diff.smaps_rollup_b.insert(base_key, summed);
         }
     }
-    diff.sched_ext_a = baseline.sched_ext.clone();
-    diff.sched_ext_b = candidate.sched_ext.clone();
+}
+
+/// Attach the non-row enrichment data to `diff`: per-cgroup stats
+/// (only under `GroupBy::Cgroup`), host PSI snapshots,
+/// per-process smaps rollups (hierarchical under `GroupBy::All`,
+/// flat otherwise), the fudged-smaps re-key
+/// ([`remap_fudged_smaps`]), and the global sched_ext sysfs
+/// snapshot.
+fn attach_enrichment(diff: &mut CtprofDiff, ctx: &CompareCtx, fudged_key_pairs: &[(String, String)]) {
+    if ctx.group_by == GroupBy::Cgroup {
+        diff.cgroup_stats_a =
+            flatten_cgroup_stats(&ctx.baseline.cgroup_stats, ctx.flatten, ctx.cgroup_key_map);
+        diff.cgroup_stats_b =
+            flatten_cgroup_stats(&ctx.candidate.cgroup_stats, ctx.flatten, ctx.cgroup_key_map);
+    }
+
+    diff.host_psi_a = ctx.baseline.psi;
+    diff.host_psi_b = ctx.candidate.psi;
+
+    if ctx.group_by == GroupBy::All {
+        diff.smaps_rollup_a = collect_smaps_rollup_hierarchical(
+            ctx.baseline,
+            ctx.opts.no_thread_normalize,
+            ctx.flatten,
+            ctx.cgroup_key_map,
+        );
+        diff.smaps_rollup_b = collect_smaps_rollup_hierarchical(
+            ctx.candidate,
+            ctx.opts.no_thread_normalize,
+            ctx.flatten,
+            ctx.cgroup_key_map,
+        );
+    } else {
+        diff.smaps_rollup_a = collect_smaps_rollup(ctx.baseline, ctx.opts.no_thread_normalize);
+        diff.smaps_rollup_b = collect_smaps_rollup(ctx.candidate, ctx.opts.no_thread_normalize);
+    }
+
+    remap_fudged_smaps(diff, fudged_key_pairs);
+
+    diff.sched_ext_a = ctx.baseline.sched_ext.clone();
+    diff.sched_ext_b = ctx.candidate.sched_ext.clone();
+}
+
+/// Compare two snapshots and produce a [`CtprofDiff`]. Sequences
+/// the comparison phases in data-flow order: build the per-side
+/// thread groups, emit matched + one-sided rows, fudge one-sided
+/// cgroups together (producing the `fudged_key_pairs` consumed by
+/// the uptime and enrichment phases), sort the one-sided lists,
+/// fill uptime%, order the rows, and attach enrichment. The
+/// fudged-pair `(bkey, ckey)` threading is the only cross-phase
+/// data dependency: built by [`apply_cgroup_fudge`], read by
+/// [`fill_uptime_pct`] and [`attach_enrichment`].
+pub fn compare(
+    baseline: &CtprofSnapshot,
+    candidate: &CtprofSnapshot,
+    opts: &CompareOptions,
+) -> CtprofDiff {
+    let flatten = compile_flatten_patterns(&opts.cgroup_flatten);
+    let (group_by, cgroup_key_map, groups_a, groups_b) =
+        build_compare_groups(baseline, candidate, opts, &flatten);
+
+    // Compute per-snapshot "now" for lifetime calculation:
+    // newest thread's start_time approximates capture time in ticks.
+    let now_b = candidate
+        .threads
+        .iter()
+        .map(|t| t.start_time_clock_ticks)
+        .max()
+        .unwrap_or(0);
+
+    let ctx = CompareCtx {
+        baseline,
+        candidate,
+        opts,
+        group_by,
+        flatten: &flatten,
+        cgroup_key_map: cgroup_key_map.as_ref(),
+        groups_a: &groups_a,
+        groups_b: &groups_b,
+        now_b,
+    };
+
+    let mut diff = CtprofDiff::default();
+
+    emit_matched_rows(&mut diff, &ctx);
+
+    // Content-based cgroup fudging: match one-sided groups by
+    // thread population overlap when cgroup paths differ but
+    // the workload is the same (e.g. service re-deployed to a
+    // new cgroup path between snapshots). The returned pairs are
+    // read by the uptime and enrichment phases below.
+    let fudged_key_pairs = apply_cgroup_fudge(&mut diff, &ctx);
+
+    diff.only_baseline.sort();
+    diff.only_candidate.sort();
+
+    fill_uptime_pct(&mut diff, &ctx, &fudged_key_pairs);
+
+    sort_diff(&mut diff, &opts.sort_by);
+
+    attach_enrichment(&mut diff, &ctx, &fudged_key_pairs);
 
     diff
 }
