@@ -1063,10 +1063,25 @@ impl AssertPlan {
         let mut r = AssertResult::pass();
         r.stats = scenario_stats_for_cgroup(&cg);
 
+        // Opt-in CHECKS in fixed order — each only appends fail /
+        // inconclusive outcomes onto `r`; the order they run is the order
+        // outcomes land in `r.outcomes`, which is verdict-significant.
+        self.eval_fairness(&mut r, &cg, reports);
+        self.eval_isolation(&mut r, reports, cpuset);
+        self.eval_throughput_latency(&mut r, reports);
+        self.eval_migration_locality(&mut r, reports, page_locality);
+        self.eval_numa_migration_slow_tier(&mut r, reports, numa_nodes);
+        r
+    }
+
+    /// Fairness CHECKS (Starved / Unfair / Stuck), in order: the
+    /// default-threshold `not_starved` arm, then the custom
+    /// `max_spread_pct` and `max_gap_ms` arms. Each appends onto `r`.
+    fn eval_fairness(&self, r: &mut AssertResult, cg: &CgroupStats, reports: &[WorkerReport]) {
         // `not_starved`: default-threshold fairness (Starved / Unfair /
         // Stuck) on top of the telemetry already built above.
         if self.not_starved {
-            record_default_fairness(&mut r, &cg, reports);
+            record_default_fairness(r, cg, reports);
         }
         // Custom spread threshold — independent of `not_starved` (it gates
         // on its own field). Strip any default-threshold Unfair outcome
@@ -1118,11 +1133,29 @@ impl AssertPlan {
                 }
             }
         }
+    }
+
+    /// Isolation CHECK: run [`assert_isolation`] only when the
+    /// `isolation` flag is set and a `cpuset` constraint is supplied.
+    fn eval_isolation(
+        &self,
+        r: &mut AssertResult,
+        reports: &[WorkerReport],
+        cpuset: Option<&BTreeSet<usize>>,
+    ) {
         if self.isolation
             && let Some(cs) = cpuset
         {
             r.merge(assert_isolation(reports, cs));
         }
+    }
+
+    /// Throughput-parity and wake-latency / iteration-rate CHECKS, in
+    /// order: [`assert_throughput_parity`] (gated on
+    /// `max_throughput_cv` / `min_work_rate`) then [`assert_benchmarks`]
+    /// (gated on `max_p99_wake_latency_ns` / `max_wake_latency_cv` /
+    /// `min_iteration_rate`).
+    fn eval_throughput_latency(&self, r: &mut AssertResult, reports: &[WorkerReport]) {
         if self.max_throughput_cv.is_some() || self.min_work_rate.is_some() {
             r.merge(assert_throughput_parity(
                 reports,
@@ -1141,6 +1174,17 @@ impl AssertPlan {
                 self.min_iteration_rate,
             ));
         }
+    }
+
+    /// Migration-ratio then page-locality CHECKS, in order. The
+    /// locality arm reuses the `page_locality` triple computed once in
+    /// the telemetry head so the value is not recomputed.
+    fn eval_migration_locality(
+        &self,
+        r: &mut AssertResult,
+        reports: &[WorkerReport],
+        page_locality: Option<(f64, u64, u64)>,
+    ) {
         if let Some(max_ratio) = self.max_migration_ratio {
             let total_mig: u64 = reports.iter().map(|w| w.migration_count).sum();
             let total_iters: u64 = reports.iter().map(|w| w.iterations).sum();
@@ -1195,6 +1239,18 @@ impl AssertPlan {
                 local,
             ));
         }
+    }
+
+    /// Cross-node migration then slow-tier CHECKS, in order. Both are
+    /// NUMA-derived: the cross-node arm gates on
+    /// `max_cross_node_migration_ratio`; the slow-tier arm gates on
+    /// `max_slow_tier_ratio` and a present `numa_nodes` set.
+    fn eval_numa_migration_slow_tier(
+        &self,
+        r: &mut AssertResult,
+        reports: &[WorkerReport],
+        numa_nodes: Option<&BTreeSet<usize>>,
+    ) {
         if let Some(max_ratio) = self.max_cross_node_migration_ratio {
             // `vmstat_numa_pages_migrated` is the delta of the
             // system-wide `/proc/vmstat numa_pages_migrated` counter
@@ -1259,7 +1315,6 @@ impl AssertPlan {
                 ));
             }
         }
-        r
     }
 }
 

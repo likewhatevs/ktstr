@@ -295,8 +295,7 @@ const EXCEPTIONS: &[(&str, &str, usize)] = &[
         "build_phase_buckets_with_stimulus",
         242,
     ), // queued: decompose
-    ("assert/plan.rs", "AssertPlan::assert_cgroup", 234), // queued: decompose
-    ("bin/cargo-ktstr.rs", "main", 239),                  // queued: decompose
+    ("bin/cargo-ktstr.rs", "main", 239), // queued: decompose
     (
         "vmm/freeze_coord/kernel_op_dispatch.rs",
         "find_task_by_pid",
