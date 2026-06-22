@@ -1392,3 +1392,33 @@ fn clone_to_per_test_missing_source_bails_without_creating_dest() {
         "a missing-source bail must not create the dest file",
     );
 }
+
+#[test]
+fn build_template_via_vm_overflow_does_not_stage_image() {
+    // A capacity whose MiB value exceeds u32::MAX must be rejected
+    // BEFORE any staging image is created, so an oversized capacity
+    // never leaks an orphan staging file into the cache root. The
+    // overflow check now runs as the first statement of
+    // build_template_via_vm (ahead of create_and_size_staging_image),
+    // so this pins validation-before-consumption: a retry never trips
+    // on a leaked staging file.
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let _guard =
+        crate::test_support::test_helpers::EnvVarGuard::set(crate::KTSTR_CACHE_DIR_ENV, tmp.path());
+    let cache_key = "btrfs-overflow";
+    // (u32::MAX + 1) MiB expressed in bytes — the MiB value overflows u32.
+    let capacity_bytes = ((u32::MAX as u64) + 1) * 1024 * 1024;
+    let err = build_template_via_vm(Filesystem::Btrfs, capacity_bytes, tmp.path(), cache_key)
+        .expect_err("oversized capacity must be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("capacity_mib overflow"),
+        "error must name the overflow: {msg}",
+    );
+    // No staging image must exist at the deterministic staging path.
+    let staging = staging_image_path(tmp.path(), cache_key, std::process::id());
+    assert!(
+        !staging.exists(),
+        "oversized capacity must not stage (and then leak) an image: {staging:?}",
+    );
+}

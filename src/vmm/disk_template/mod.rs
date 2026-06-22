@@ -1319,6 +1319,23 @@ fn build_template_via_vm(
     cache_root: &Path,
     cache_key: &str,
 ) -> Result<PathBuf> {
+    // Validate the u32 `capacity_mib` BEFORE staging any file (or even
+    // resolving mkfs/kernel): the overflow is a pure function of
+    // `capacity_bytes` and needs no on-disk resource, so an oversized
+    // capacity must reject without ever creating — and then leaking —
+    // a staging image. `capacity_mib` is u32; an `as u32` cast would
+    // silently truncate above u32::MAX MiB, so `try_from` surfaces the
+    // overflow as an actionable error. Threaded into `build_template_vm`
+    // so the disk config is built from the already-validated value.
+    let capacity_mib = u32::try_from(capacity_bytes / (1024 * 1024)).with_context(|| {
+        format!(
+            "capacity_mib overflow: capacity_bytes={capacity_bytes} \
+             yields {} MiB which exceeds u32::MAX. DiskConfig::capacity_mib \
+             is u32; use a smaller capacity.",
+            capacity_bytes / (1024 * 1024),
+        )
+    })?;
+
     // Resolve the mkfs binary for `fs` via the typed accessor so
     // the exhaustive match forces a future `Filesystem` variant to
     // declare its formatter at compile time. `locate_host_mkfs`
@@ -1388,7 +1405,15 @@ fn build_template_via_vm(
     // that produced the canonicalized binary path above; the
     // host-PATH lookup name and the in-archive path stay in
     // lockstep without a parallel match arm to drift.
-    let vm = build_template_vm(fs, capacity_bytes, kernel, &staging_path, mkfs, mkfs_name)?;
+    let vm = build_template_vm(
+        fs,
+        capacity_bytes,
+        capacity_mib,
+        kernel,
+        &staging_path,
+        mkfs,
+        mkfs_name,
+    )?;
     let result = vm.run().with_context(|| {
         format!("run template-build VM for {fs:?} capacity_bytes={capacity_bytes}")
     });
@@ -1433,26 +1458,16 @@ fn build_template_via_vm(
 fn build_template_vm(
     fs: Filesystem,
     capacity_bytes: u64,
+    capacity_mib: u32,
     kernel: PathBuf,
     staging_path: &Path,
     mkfs: PathBuf,
     mkfs_name: &'static str,
 ) -> Result<crate::vmm::KtstrVm> {
     let mkfs_archive_path = format!("bin/{mkfs_name}");
-    // `capacity_mib` is u32; an `as u32` cast on `capacity_bytes /
-    // (1024 * 1024)` would silently truncate any input above 4 TiB
-    // (u32::MAX MiB). `try_from` surfaces the overflow as an
-    // actionable error naming the offending value, so a caller
-    // that passes an oversized capacity learns about it explicitly
-    // rather than seeing a corrupted disk size in the guest.
-    let capacity_mib = u32::try_from(capacity_bytes / (1024 * 1024)).with_context(|| {
-        format!(
-            "capacity_mib overflow: capacity_bytes={capacity_bytes} \
-             yields {} MiB which exceeds u32::MAX. DiskConfig::capacity_mib \
-             is u32; use a smaller capacity.",
-            capacity_bytes / (1024 * 1024),
-        )
-    })?;
+    // `capacity_mib` is validated in `build_template_via_vm` before any
+    // staging image is created (see the overflow check there); it is
+    // passed in already-bounded to u32.
     let disk = crate::vmm::disk_config::DiskConfig::default()
         .capacity_mib(capacity_mib)
         .filesystem(Filesystem::Raw);
