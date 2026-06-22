@@ -815,7 +815,7 @@ impl std::fmt::Debug for SchedStatsClient {
 }
 
 /// RAII guard: clear `request_in_flight` on drop. Prevents a
-/// stuck-true flag if `request_raw_with_timeout` returns early via
+/// stuck-true flag if `request_raw` returns early via
 /// `?` from any of the lock / mutex calls.
 struct InFlightGuard<'a> {
     flag: &'a Arc<AtomicBool>,
