@@ -116,7 +116,6 @@ const DEFAULT_FN_MAX_LINES: usize = 200;
 /// share one deferred task — the mega-function decomposition campaign);
 /// the guard's panic template emits it on every suggested entry.
 const EXCEPTIONS: &[(&str, &str, usize)] = &[
-    ("bin/jemalloc_alloc_worker.rs", "main", 206),                // queued: decompose
     (
         "cache/cache_dir_tests.rs",
         "store_in_lock_recheck_mixed_content_peers_publish_one_per_group",
