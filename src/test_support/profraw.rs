@@ -53,10 +53,13 @@
 //!   - `LLVM_PROFILE_FILE` is already set (operator override or
 //!     wrapper injection takes precedence — same `existing_env.is_some()`
 //!     short-circuit `cargo-ktstr.rs::profraw_inject_for` applies).
-//!   - The target binary is NOT coverage-instrumented. Detection is
-//!     a symtab probe for `__llvm_profile_runtime` — the same
-//!     compiler-rt symbol [`try_flush_profraw`] resolves for the
-//!     guest-side flush. Non-instrumented binaries that link the
+//!   - The target binary is NOT coverage-instrumented. Detection is a
+//!     symtab probe for the `__llvm_profile_write_buffer` /
+//!     `__llvm_profile_get_size_for_buffer` function symbols (the bare
+//!     `__llvm_profile_runtime` marker can lose its `.symtab` size under
+//!     `--gc-sections`; see `is_coverage_instrumented_binary`); the
+//!     guest-side flush [`try_flush_profraw`] calls those same compiler-rt
+//!     entry points directly. Non-instrumented binaries that link the
 //!     ktstr lib (e.g. `cargo-ktstr` itself in a non-coverage build)
 //!     must NOT set the env, otherwise the env propagates to spawned
 //!     child test binaries, which then short-circuit their own
@@ -143,6 +146,12 @@ pub(crate) fn try_flush_profraw() {
 
         let needed = unsafe { __llvm_profile_get_size_for_buffer() } as usize;
         if needed == 0 {
+            // Reliable Dmesg frame (NOT eprintln — the Phase-2 stdio->bulk
+            // redirect is lossy near reboot) so a zero-coverage run is never
+            // silent (frames sent, no profraw, no error).
+            vmm::guest_comms::send_dmesg(
+                b"ktstr coverage: __llvm_profile_get_size_for_buffer returned 0; no guest profile to flush\n",
+            );
             return;
         }
 
@@ -151,6 +160,9 @@ pub(crate) fn try_flush_profraw() {
         if unsafe { __llvm_profile_write_buffer(buf.as_mut_ptr().cast::<std::os::raw::c_char>()) }
             != 0
         {
+            vmm::guest_comms::send_dmesg(
+                b"ktstr coverage: __llvm_profile_write_buffer failed; guest coverage lost for this run\n",
+            );
             return;
         }
 
