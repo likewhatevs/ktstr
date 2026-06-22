@@ -24,7 +24,7 @@ use virtio_bindings::virtio_mmio::{
     VIRTIO_MMIO_QUEUE_USED_LOW, VIRTIO_MMIO_STATUS, VIRTIO_MMIO_VENDOR_ID, VIRTIO_MMIO_VERSION,
 };
 use virtio_bindings::virtio_net::VIRTIO_NET_F_MAC;
-use virtio_queue::{Error as VirtioQueueError, Queue, QueueOwnedT, QueueT};
+use virtio_queue::{DescriptorChain, Error as VirtioQueueError, Queue, QueueOwnedT, QueueT};
 use vm_memory::{Address, ByteValued, Bytes, GuestAddress, GuestMemoryMmap};
 use vmm_sys_util::eventfd::EventFd;
 
@@ -1130,6 +1130,31 @@ impl VirtioNet {
     /// Returns one of [`LoopbackOutcome`]'s variants — see the
     /// enum doc for the per-variant routing rules.
     fn try_loopback_to_rx(&mut self, mem: &GuestMemoryMmap, frame_len: usize) -> LoopbackOutcome {
+        // Three phases: pop one RX chain (entry poison-gate +
+        // iter()-pull), walk its descriptors writing the header +
+        // frame bytes, then finalize (counter routing, header
+        // rollback on failure, add_used). Split out so each phase
+        // stays under the function-size guard; the per-phase bodies
+        // are unchanged.
+        let (chain, head) = match self.pop_rx_chain(mem) {
+            Ok(v) => v,
+            Err(outcome) => return outcome,
+        };
+        let walk = self.write_rx_chain(chain, mem, frame_len);
+        self.finalize_rx(walk, head, mem, frame_len)
+    }
+
+    /// Pop one chain off the RX queue.
+    ///
+    /// Applies the per-queue poison entry gate (RX side) and pulls a
+    /// single chain via the same two-step `iter()`-then-drop pattern
+    /// as `pop_and_capture_tx`. On success returns the chain and its
+    /// head index; every early exit becomes `Err(LoopbackOutcome::X)`
+    /// for the caller to return verbatim.
+    fn pop_rx_chain<'a>(
+        &mut self,
+        mem: &'a GuestMemoryMmap,
+    ) -> Result<(DescriptorChain<&'a GuestMemoryMmap>, u16), LoopbackOutcome> {
         // Per-queue poison gate (RX side). If the RX queue's flag
         // is already set, return `RxAlreadyPoisoned` without
         // touching the queue — no iter(), no add_used, no counter
@@ -1138,7 +1163,7 @@ impl VirtioNet {
         // drain — the caller still does TX add_used in this
         // iteration even when RX is poisoned.
         if self.queue_poisoned[RXQ] {
-            return LoopbackOutcome::RxAlreadyPoisoned;
+            return Err(LoopbackOutcome::RxAlreadyPoisoned);
         }
         // Pull one chain out of the RX queue. Same two-step
         // iter()-then-drop pattern as `pop_and_capture_tx`. Any
@@ -1155,7 +1180,7 @@ impl VirtioNet {
                 // Driver hasn't published RX buffers yet (init not
                 // complete). Drop the frame; future TX after RX is
                 // set up will succeed.
-                return LoopbackOutcome::NoRxBuffer;
+                return Err(LoopbackOutcome::NoRxBuffer);
             }
             match q.iter(mem) {
                 Ok(mut iter) => match iter.next() {
@@ -1165,11 +1190,11 @@ impl VirtioNet {
                 Err(e) => IterStep::Poisoned(e),
             }
         };
-        let (chain, head) = match step {
-            IterStep::NoBuffer => return LoopbackOutcome::NoRxBuffer,
+        match step {
+            IterStep::NoBuffer => Err(LoopbackOutcome::NoRxBuffer),
             IterStep::Chain(c) => {
                 let h = c.head_index();
-                (c, h)
+                Ok((c, h))
             }
             IterStep::Poisoned(err) => {
                 // Hostile- or buggy-guest poison on the RX queue —
@@ -1188,10 +1213,24 @@ impl VirtioNet {
                      guest reset (any structural queue error is \
                      non-recoverable; cloud-hypervisor convergence)"
                 );
-                return LoopbackOutcome::JustRxPoisoned;
+                Err(LoopbackOutcome::JustRxPoisoned)
             }
-        };
+        }
+    }
 
+    /// Walk the popped RX `chain`, writing the 12-byte virtio header
+    /// followed by `self.tx_frame_scratch[..frame_len]` into the
+    /// device-writable descriptors. Returns an [`RxWriteResult`]
+    /// carrying the bytes written, the unwritten header remainder,
+    /// the recorded header-write slots (for rollback), and the
+    /// failure classification (`None` on success). Does not touch
+    /// counters or the used ring — that is [`Self::finalize_rx`]'s job.
+    fn write_rx_chain(
+        &self,
+        chain: DescriptorChain<&GuestMemoryMmap>,
+        mem: &GuestMemoryMmap,
+        frame_len: usize,
+    ) -> RxWriteResult {
         // Walk RX descriptors. Must be device-writable. Place the
         // 12-byte zero header first, then the captured frame bytes.
         // We do not split the header across descriptors — every
@@ -1222,21 +1261,6 @@ impl VirtioNet {
         let mut hdr_write_slots: [(GuestAddress, usize); VIRTIO_NET_HDR_LEN] =
             [(GuestAddress(0), 0); VIRTIO_NET_HDR_LEN];
         let mut hdr_write_count: usize = 0;
-        // `InvalidReason` distinguishes chain-shape rejection
-        // (read-only descriptor, address overflow on the
-        // descriptor's GPA) from guest-memory `write_slice` failure
-        // (chain shape was fine but a descriptor's GPA is
-        // unmapped). The two failure modes route to distinct
-        // counters (`rx_chain_invalid` vs `rx_write_failed`) so
-        // operators reading the failure dump can separate "guest
-        // violated the RX descriptor-direction rule" from "guest
-        // posted a buffer at an unmapped GPA". `None` = walk
-        // succeeded; the post-loop branch consults this and bumps
-        // exactly one counter (or none, on success).
-        enum InvalidReason {
-            Shape,
-            WriteFailed,
-        }
         let mut chain_invalid: Option<InvalidReason> = None;
 
         for desc in chain {
@@ -1345,7 +1369,29 @@ impl VirtioNet {
             }
         }
 
-        if let Some(reason) = chain_invalid {
+        RxWriteResult {
+            bytes_written,
+            hdr_remaining,
+            frame_pos,
+            chain_invalid,
+            hdr_write_slots,
+            hdr_write_count,
+        }
+    }
+
+    /// Finalize the RX delivery for chain `head` given the
+    /// descriptor-`walk` output: route the failure counters and roll
+    /// back the placed header bytes on a malformed/unmapped chain,
+    /// emit the too-small-buffer truncation warning, and call
+    /// `add_used`. Returns the [`LoopbackOutcome`] for the caller.
+    fn finalize_rx(
+        &mut self,
+        walk: RxWriteResult,
+        head: u16,
+        mem: &GuestMemoryMmap,
+        frame_len: usize,
+    ) -> LoopbackOutcome {
+        if let Some(reason) = walk.chain_invalid {
             // Malformed RX chain: the frame is dropped, the chain
             // is marked used with `len=0` so the guest can recycle
             // its descriptor (without `add_used` the kernel's
@@ -1392,7 +1438,7 @@ impl VirtioNet {
             // form of `Shape` enters with `hdr_write_count == 0`,
             // in which case the loop is a no-op.
             const ZEROS: [u8; VIRTIO_NET_HDR_LEN] = [0u8; VIRTIO_NET_HDR_LEN];
-            for &(addr, len) in &hdr_write_slots[..hdr_write_count] {
+            for &(addr, len) in &walk.hdr_write_slots[..walk.hdr_write_count] {
                 let _ = mem.write_slice(&ZEROS[..len], addr);
             }
             // If `add_used` itself fails after a chain-direction
@@ -1434,7 +1480,7 @@ impl VirtioNet {
             return LoopbackOutcome::RxChainInvalid { add_used_ok };
         }
 
-        if frame_pos < frame_len || hdr_remaining != 0 {
+        if walk.frame_pos < frame_len || walk.hdr_remaining != 0 {
             // RX descriptor chain was too small to hold the full
             // header + frame. virtio-v1.2 §5.1.6.4: the driver
             // SHOULD always provide an RX buffer of at least
@@ -1449,8 +1495,8 @@ impl VirtioNet {
             // do not pop a second RX chain for the spillover.
             tracing::debug!(
                 frame_len,
-                bytes_written,
-                hdr_remaining,
+                bytes_written = walk.bytes_written,
+                hdr_remaining = walk.hdr_remaining,
                 "virtio-net RX buffer too small for full frame; truncating"
             );
         }
@@ -1463,8 +1509,8 @@ impl VirtioNet {
         // partial, in which case the L2 byte count is zero.
         // `saturating_sub` covers both cases without an explicit
         // branch.
-        let hdr_taken = (VIRTIO_NET_HDR_LEN - hdr_remaining) as u32;
-        let l2_bytes = bytes_written.saturating_sub(hdr_taken) as u64;
+        let hdr_taken = (VIRTIO_NET_HDR_LEN - walk.hdr_remaining) as u32;
+        let l2_bytes = walk.bytes_written.saturating_sub(hdr_taken) as u64;
 
         // The guest cannot recover from an `add_used` failure
         // without a virtio reset. Bump `rx_add_used_failures`
@@ -1488,7 +1534,7 @@ impl VirtioNet {
         // NEEDS_RESET. Poison is reserved for `iter()` errors
         // (cloud-hypervisor convergence: structural avail.idx
         // violations only).
-        match self.queues[RXQ].add_used(mem, head, bytes_written) {
+        match self.queues[RXQ].add_used(mem, head, walk.bytes_written) {
             Ok(()) => LoopbackOutcome::Delivered {
                 l2_bytes_written: l2_bytes,
             },
@@ -1505,6 +1551,49 @@ impl VirtioNet {
             }
         }
     }
+}
+
+/// Classification of why an RX descriptor walk failed, recorded by
+/// `write_rx_chain` and consumed by `finalize_rx`.
+///
+/// Distinguishes chain-shape rejection (read-only descriptor,
+/// address overflow on the descriptor's GPA) from guest-memory
+/// `write_slice` failure (chain shape was fine but a descriptor's
+/// GPA is unmapped). The two failure modes route to distinct
+/// counters (`rx_chain_invalid` vs `rx_write_failed`) so operators
+/// reading the failure dump can separate "guest violated the RX
+/// descriptor-direction rule" from "guest posted a buffer at an
+/// unmapped GPA". `None` in [`RxWriteResult::chain_invalid`] means
+/// the walk succeeded; `finalize_rx` consults this and bumps exactly
+/// one counter (or none, on success).
+enum InvalidReason {
+    Shape,
+    WriteFailed,
+}
+
+/// Output of the RX descriptor walk (`write_rx_chain`), consumed by
+/// `finalize_rx`.
+///
+/// Carries exactly the state the finalize phase reads:
+///   - `bytes_written`: header + frame bytes successfully placed,
+///     the value `add_used` records on the success path.
+///   - `hdr_remaining`: unwritten header bytes (0 once the full
+///     12-byte header landed); a non-zero value means the chain
+///     truncated mid-header.
+///   - `frame_pos`: frame bytes consumed from `tx_frame_scratch`;
+///     `frame_pos < frame_len` flags a too-small RX buffer.
+///   - `chain_invalid`: `Some(reason)` when the walk hit a
+///     malformed/unmapped descriptor, `None` on success.
+///   - `hdr_write_slots` / `hdr_write_count`: the `(GPA, len)`
+///     locations the header bytes landed at, rolled back to zero on
+///     failure before `add_used(head, 0)`.
+struct RxWriteResult {
+    bytes_written: u32,
+    hdr_remaining: usize,
+    frame_pos: usize,
+    chain_invalid: Option<InvalidReason>,
+    hdr_write_slots: [(GuestAddress, usize); VIRTIO_NET_HDR_LEN],
+    hdr_write_count: usize,
 }
 
 /// Outcome classification for `try_loopback_to_rx`. Each variant

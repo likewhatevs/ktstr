@@ -208,11 +208,6 @@ const EXCEPTIONS: &[(&str, &str, usize)] = &[
         "VirtioNet::process_tx_loopback",
         291,
     ), // queued: decompose
-    (
-        "vmm/virtio_net/device.rs",
-        "VirtioNet::try_loopback_to_rx",
-        376,
-    ), // queued: decompose
     ("workload/spawn/mod.rs", "WorkloadHandle::spawn", 232),      // queued: decompose
     ("workload/spawn/mod.rs", "WorkloadHandle::spawn_group", 959), // queued: decompose
     (
