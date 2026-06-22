@@ -144,7 +144,6 @@ const EXCEPTIONS: &[(&str, &str, usize)] = &[
         348,
     ), // queued: decompose
     ("export.rs", "generate_preamble", 416),                      // queued: decompose
-    ("host_context.rs", "HostContext::diff", 226),                // queued: decompose
     ("host_thread_probe.rs", "find_jemalloc_via_maps_at", 240),   // queued: decompose
     ("monitor/btf_render/mod.rs", "chase_arena_pointer", 367),    // queued: decompose
     ("monitor/btf_render/mod.rs", "render_cast_pointer", 206),    // queued: decompose

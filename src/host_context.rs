@@ -269,6 +269,150 @@ pub fn parse_bracketed_active_policy(s: &str) -> Option<&str> {
     Some(&rest[..close])
 }
 
+fn fmt_opt<T: std::fmt::Display>(v: Option<&T>) -> String {
+    match v {
+        Some(v) => v.to_string(),
+        None => "(unknown)".to_string(),
+    }
+}
+
+fn diff_row<T: std::fmt::Display + PartialEq>(
+    out: &mut String,
+    key: &str,
+    a: Option<&T>,
+    b: Option<&T>,
+) {
+    use std::fmt::Write;
+    if a == b {
+        return;
+    }
+    let _ = writeln!(out, "  {key}: {} → {}", fmt_opt(a), fmt_opt(b));
+}
+
+fn summarize_tunables(m: Option<&BTreeMap<String, String>>) -> String {
+    match m {
+        None => "(unknown)".to_string(),
+        Some(map) if map.is_empty() => "(empty)".to_string(),
+        Some(map) if map.len() == 1 => "(1 entry)".to_string(),
+        Some(map) => format!("({} entries)", map.len()),
+    }
+}
+
+/// Append the per-CPU `cpufreq_governor` section of a
+/// [`HostContext::diff`]. Iterates the union of CPU ids from both
+/// maps in `BTreeSet` (ascending CPU id) order and emits one
+/// `cpufreq_governor.cpuN: before → after` line per CPU whose
+/// governor differs; a CPU present on only one side renders
+/// `(absent)` on the other.
+fn diff_cpufreq_governor(
+    out: &mut String,
+    a_cpufreq_governor: &BTreeMap<usize, String>,
+    b_cpufreq_governor: &BTreeMap<usize, String>,
+) {
+    use std::fmt::Write;
+    let mut cpus: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+    cpus.extend(a_cpufreq_governor.keys().copied());
+    cpus.extend(b_cpufreq_governor.keys().copied());
+    for cpu in cpus {
+        let av = a_cpufreq_governor.get(&cpu);
+        let bv = b_cpufreq_governor.get(&cpu);
+        if av != bv {
+            let _ = writeln!(
+                out,
+                "  cpufreq_governor.cpu{cpu}: {} → {}",
+                av.map(String::as_str).unwrap_or("(absent)"),
+                bv.map(String::as_str).unwrap_or("(absent)"),
+            );
+        }
+    }
+}
+
+/// Append the `sched_tunables` section of a [`HostContext::diff`].
+/// When both sides carry a map, emits one `sched_tunables.KEY:
+/// before → after` line per differing key in `BTreeSet`
+/// (ascending key) order, rendering `(absent)` for a key present on
+/// only one side. When the maps' `Option` presence or cardinality
+/// differs but a per-key diff is not applicable (one side `None`),
+/// emits a single summarized `sched_tunables: before → after` line
+/// via [`summarize_tunables`].
+fn diff_sched_tunables(
+    out: &mut String,
+    a_sched_tunables: Option<&BTreeMap<String, String>>,
+    b_sched_tunables: Option<&BTreeMap<String, String>>,
+) {
+    use std::fmt::Write;
+    match (a_sched_tunables, b_sched_tunables) {
+        (Some(am), Some(bm)) => {
+            let mut keys: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+            keys.extend(am.keys().map(String::as_str));
+            keys.extend(bm.keys().map(String::as_str));
+            for k in keys {
+                let av = am.get(k);
+                let bv = bm.get(k);
+                if av != bv {
+                    let _ = writeln!(
+                        out,
+                        "  sched_tunables.{k}: {} → {}",
+                        av.map(String::as_str).unwrap_or("(absent)"),
+                        bv.map(String::as_str).unwrap_or("(absent)"),
+                    );
+                }
+            }
+        }
+        (am, bm) if am != bm => {
+            let _ = writeln!(
+                out,
+                "  sched_tunables: {} → {}",
+                summarize_tunables(am),
+                summarize_tunables(bm),
+            );
+        }
+        _ => {}
+    }
+}
+
+/// Append the `heap_state` section of a [`HostContext::diff`]. When
+/// both sides carry a [`HostHeapState`](crate::host_heap::HostHeapState),
+/// delegates to its own `diff` and, if non-empty, emits a
+/// `heap_state:` header followed by the nested diff indented two
+/// extra spaces. When only one side is present, emits a single
+/// `heap_state: (present) → (unknown)` (or reverse) line.
+fn diff_heap_state(
+    out: &mut String,
+    a_heap_state: Option<&crate::host_heap::HostHeapState>,
+    b_heap_state: Option<&crate::host_heap::HostHeapState>,
+) {
+    use std::fmt::Write;
+    match (a_heap_state, b_heap_state) {
+        (Some(ah), Some(bh)) => {
+            let inner = ah.diff(bh);
+            if !inner.is_empty() {
+                out.push_str("  heap_state:\n");
+                for line in inner.lines() {
+                    let _ = writeln!(out, "    {line}");
+                }
+            }
+        }
+        (a, b) if a != b => {
+            let _ = writeln!(
+                out,
+                "  heap_state: {} → {}",
+                if a.is_some() {
+                    "(present)"
+                } else {
+                    "(unknown)"
+                },
+                if b.is_some() {
+                    "(present)"
+                } else {
+                    "(unknown)"
+                },
+            );
+        }
+        _ => {}
+    }
+}
+
 impl HostContext {
     /// Populated [`HostContext`] for unit tests. Every field carries
     /// a reasonable non-trivial value so call sites only spell out
@@ -478,8 +622,6 @@ impl HostContext {
     /// empty map or `(N entries)` for a populated one so the
     /// cardinality of the new data is visible at a glance.
     pub fn diff(&self, other: &HostContext) -> String {
-        use std::collections::BTreeMap;
-        use std::fmt::Write;
         // Symmetric destructuring bind of both sides: forces every
         // field to appear by name here, same reason as
         // `format_human` — a new HostContext field must be
@@ -523,184 +665,89 @@ impl HostContext {
             kernel_cmdline: b_kernel_cmdline,
             heap_state: b_heap_state,
         } = other;
-        fn fmt_opt<T: std::fmt::Display>(v: Option<&T>) -> String {
-            match v {
-                Some(v) => v.to_string(),
-                None => "(unknown)".to_string(),
-            }
-        }
-        fn row<T: std::fmt::Display + PartialEq>(
-            out: &mut String,
-            key: &str,
-            a: Option<&T>,
-            b: Option<&T>,
-        ) {
-            if a == b {
-                return;
-            }
-            let _ = writeln!(out, "  {key}: {} → {}", fmt_opt(a), fmt_opt(b));
-        }
-        fn summarize_tunables(m: Option<&BTreeMap<String, String>>) -> String {
-            match m {
-                None => "(unknown)".to_string(),
-                Some(map) if map.is_empty() => "(empty)".to_string(),
-                Some(map) if map.len() == 1 => "(1 entry)".to_string(),
-                Some(map) => format!("({} entries)", map.len()),
-            }
-        }
         let mut out = String::new();
-        row(
+        diff_row(
             &mut out,
             "kernel_name",
             a_kernel_name.as_ref(),
             b_kernel_name.as_ref(),
         );
-        row(
+        diff_row(
             &mut out,
             "kernel_release",
             a_kernel_release.as_ref(),
             b_kernel_release.as_ref(),
         );
-        row(&mut out, "arch", a_arch.as_ref(), b_arch.as_ref());
-        row(
+        diff_row(&mut out, "arch", a_arch.as_ref(), b_arch.as_ref());
+        diff_row(
             &mut out,
             "cpu_model",
             a_cpu_model.as_ref(),
             b_cpu_model.as_ref(),
         );
-        row(
+        diff_row(
             &mut out,
             "cpu_vendor",
             a_cpu_vendor.as_ref(),
             b_cpu_vendor.as_ref(),
         );
-        row(
+        diff_row(
             &mut out,
             "total_memory_kib",
             a_total_memory_kib.as_ref(),
             b_total_memory_kib.as_ref(),
         );
-        row(
+        diff_row(
             &mut out,
             "hugepages_total",
             a_hugepages_total.as_ref(),
             b_hugepages_total.as_ref(),
         );
-        row(
+        diff_row(
             &mut out,
             "hugepages_free",
             a_hugepages_free.as_ref(),
             b_hugepages_free.as_ref(),
         );
-        row(
+        diff_row(
             &mut out,
             "hugepages_size_kib",
             a_hugepages_size_kib.as_ref(),
             b_hugepages_size_kib.as_ref(),
         );
-        row(
+        diff_row(
             &mut out,
             "online_cpus",
             a_online_cpus.as_ref(),
             b_online_cpus.as_ref(),
         );
-        row(
+        diff_row(
             &mut out,
             "numa_nodes",
             a_numa_nodes.as_ref(),
             b_numa_nodes.as_ref(),
         );
-        row(
+        diff_row(
             &mut out,
             "thp_enabled",
             a_thp_enabled.as_ref(),
             b_thp_enabled.as_ref(),
         );
-        row(
+        diff_row(
             &mut out,
             "thp_defrag",
             a_thp_defrag.as_ref(),
             b_thp_defrag.as_ref(),
         );
-        row(
+        diff_row(
             &mut out,
             "kernel_cmdline",
             a_kernel_cmdline.as_ref(),
             b_kernel_cmdline.as_ref(),
         );
-        {
-            let mut cpus: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
-            cpus.extend(a_cpufreq_governor.keys().copied());
-            cpus.extend(b_cpufreq_governor.keys().copied());
-            for cpu in cpus {
-                let av = a_cpufreq_governor.get(&cpu);
-                let bv = b_cpufreq_governor.get(&cpu);
-                if av != bv {
-                    let _ = writeln!(
-                        &mut out,
-                        "  cpufreq_governor.cpu{cpu}: {} → {}",
-                        av.map(String::as_str).unwrap_or("(absent)"),
-                        bv.map(String::as_str).unwrap_or("(absent)"),
-                    );
-                }
-            }
-        }
-        match (a_sched_tunables.as_ref(), b_sched_tunables.as_ref()) {
-            (Some(am), Some(bm)) => {
-                let mut keys: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
-                keys.extend(am.keys().map(String::as_str));
-                keys.extend(bm.keys().map(String::as_str));
-                for k in keys {
-                    let av = am.get(k);
-                    let bv = bm.get(k);
-                    if av != bv {
-                        let _ = writeln!(
-                            &mut out,
-                            "  sched_tunables.{k}: {} → {}",
-                            av.map(String::as_str).unwrap_or("(absent)"),
-                            bv.map(String::as_str).unwrap_or("(absent)"),
-                        );
-                    }
-                }
-            }
-            (am, bm) if am != bm => {
-                let _ = writeln!(
-                    &mut out,
-                    "  sched_tunables: {} → {}",
-                    summarize_tunables(am),
-                    summarize_tunables(bm),
-                );
-            }
-            _ => {}
-        }
-        match (a_heap_state.as_ref(), b_heap_state.as_ref()) {
-            (Some(ah), Some(bh)) => {
-                let inner = ah.diff(bh);
-                if !inner.is_empty() {
-                    out.push_str("  heap_state:\n");
-                    for line in inner.lines() {
-                        let _ = writeln!(&mut out, "    {line}");
-                    }
-                }
-            }
-            (a, b) if a != b => {
-                let _ = writeln!(
-                    &mut out,
-                    "  heap_state: {} → {}",
-                    if a.is_some() {
-                        "(present)"
-                    } else {
-                        "(unknown)"
-                    },
-                    if b.is_some() {
-                        "(present)"
-                    } else {
-                        "(unknown)"
-                    },
-                );
-            }
-            _ => {}
-        }
+        diff_cpufreq_governor(&mut out, a_cpufreq_governor, b_cpufreq_governor);
+        diff_sched_tunables(&mut out, a_sched_tunables.as_ref(), b_sched_tunables.as_ref());
+        diff_heap_state(&mut out, a_heap_state.as_ref(), b_heap_state.as_ref());
         out
     }
 }
