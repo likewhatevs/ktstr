@@ -267,6 +267,15 @@ impl Default for KtstrVmBuilder {
     }
 }
 
+/// Run-time CPU/memory placement plans resolved by
+/// [`KtstrVmBuilder::resolve_run_plans`].
+struct RunPlans {
+    pinning_plan: Option<host_topology::PinningPlan>,
+    mbind_node_map: Vec<Vec<usize>>,
+    no_perf_plan: Option<host_topology::LlcPlan>,
+    host_topo: Option<host_topology::HostTopology>,
+}
+
 impl KtstrVmBuilder {
     /// Path to the guest kernel: either a source directory (the VMM
     /// extracts `arch/*/boot/{bzImage,Image}`) or a prebuilt image.
@@ -871,6 +880,145 @@ impl KtstrVmBuilder {
             self.performance_mode = false;
         }
 
+        let RunPlans {
+            pinning_plan,
+            mbind_node_map,
+            no_perf_plan,
+            host_topo: cached_host_topo,
+        } = self.resolve_run_plans(no_perf_mode)?;
+
+        let kernel = self.kernel.context("kernel path required")?;
+        anyhow::ensure!(kernel.exists(), "kernel not found: {}", kernel.display());
+        let t = &self.topology;
+        anyhow::ensure!(t.llcs > 0, "llcs must be > 0");
+        anyhow::ensure!(t.cores_per_llc > 0, "cores_per_llc must be > 0");
+        anyhow::ensure!(t.threads_per_core > 0, "threads_per_core must be > 0");
+        anyhow::ensure!(t.numa_nodes > 0, "numa_nodes must be > 0");
+        // `memory_mib == Some(0)` would forward a literal `-m 0` to the
+        // VMM backend (KVM rejects it at ioctl time with an opaque
+        // error). Catch it here with a clear message so the caller
+        // learns they set 0 explicitly rather than seeing a generic
+        // kvm failure later. `None` falls back to the default (256 MiB).
+        if matches!(self.memory_mib, Some(0)) {
+            anyhow::bail!(
+                "memory_mib must be > 0 (a VM with zero memory cannot boot); \
+                 omit `.memory_mib(...)` to use the builder default"
+            );
+        }
+        if let Some(ref bin) = self.init_binary
+            && !bin.starts_with("/proc/")
+        {
+            anyhow::ensure!(bin.exists(), "init binary not found: {}", bin.display());
+        }
+        if let Some(ref bin) = self.scheduler_binary {
+            anyhow::ensure!(
+                bin.exists(),
+                "scheduler binary not found: {}",
+                bin.display()
+            );
+        }
+
+        // Build a lazy on-demand BPF cast-analysis handle for the
+        // scheduler binary. NO file I/O and NO analyzer work runs
+        // here — the handle just captures the scheduler binary
+        // path and a `OnceLock` slot. The actual analyzer (file
+        // read + raw ELF parse + BTF parse + register-state walk
+        // over BPF instructions; no libbpf, no kernel interaction,
+        // no CAP_BPF) defers until the failure-dump path first
+        // calls
+        // [`super::cast_analysis_load::LazyCastMap::get_full`]
+        // (production accessor — `.get()` is `#[allow(dead_code)]`
+        // and used only by the lazy-handle unit tests).
+        // Schedulers whose tests pass never trigger analyzer
+        // work — the dominant case for nextest's process-per-test
+        // execution model where steady-state tests boot a VM,
+        // run, and exit without ever touching the dump path.
+        //
+        // When `.get_full()` does fire, it consults the process-
+        // wide content-hash cache via
+        // [`super::cast_analysis_load::cached_cast_analysis_for_scheduler`].
+        // Within a single process (auto-repro after a primary
+        // failure, future in-process multi-test drivers), two VMs
+        // resolving to the same scheduler binary content share
+        // one analyzer run.
+        let cast_map = std::sync::Arc::new(super::cast_analysis_load::LazyCastMap::new(
+            self.scheduler_binary.clone(),
+        ));
+
+        // Pre-materialize the (name, args) tuple view so the VM's
+        // `suffix_params()` helper can borrow it without leaking
+        // `StagedScheduler` into the `pub SuffixParams` field
+        // signature. Cheap clone (name is short, args are small);
+        // the duplication is the price for keeping the public
+        // initramfs-suffix surface free of crate-private types.
+        let staged_sched_args_packed: Vec<(String, Vec<String>)> = self
+            .staged_schedulers
+            .iter()
+            .map(|s| (s.name.clone(), s.sched_args.clone()))
+            .collect();
+
+        let vcpus = t.total_cpus();
+        let effective_cpu_budget =
+            resolve_effective_cpu_budget(&no_perf_plan, cached_host_topo.is_some(), vcpus);
+
+        Ok(KtstrVm {
+            kernel,
+            init_binary: self.init_binary,
+            scheduler_binary: self.scheduler_binary,
+            staged_schedulers: self.staged_schedulers,
+            staged_sched_args_packed,
+            run_args: self.run_args,
+            sched_args: self.sched_args,
+            topology: self.topology,
+            vcpus,
+            effective_cpu_budget,
+            memory_mib: self.memory_mib,
+            memory_min_mib: self.memory_min_mib,
+            cmdline_extra: self.cmdline_extra,
+            timeout: self.timeout,
+            monitor_thresholds: self.monitor_thresholds,
+            watchdog_timeout: self.watchdog_timeout,
+            rendezvous_timeout: self.rendezvous_timeout,
+            bpf_map_writes: self.bpf_map_writes,
+            performance_mode: self.performance_mode,
+            no_perf_mode,
+            pinning_plan,
+            mbind_node_map,
+            no_perf_plan,
+            host_topo: cached_host_topo,
+            sched_enable_cmds: self.sched_enable_cmds,
+            sched_disable_cmds: self.sched_disable_cmds,
+            include_files: self.include_files,
+            disks: self.disks,
+            network: self.network,
+            busybox_bytes: self.busybox_bytes,
+            #[cfg(feature = "wprof")]
+            wprof: self.wprof,
+            dmesg: self.dmesg,
+            exec_cmd: self.exec_cmd,
+            exec_timeout: self.exec_timeout,
+            jemalloc_probe_binary: self.jemalloc_probe_binary,
+            jemalloc_alloc_worker_binary: self.jemalloc_alloc_worker_binary,
+            failure_dump_path: self.failure_dump_path,
+            dual_snapshot: self.dual_snapshot,
+            template_staging_image: self.template_staging_image,
+            workload_duration: self.workload_duration,
+            num_snapshots: self.num_snapshots,
+            workload_root_cgroup: self.workload_root_cgroup,
+            scheduler_cgroup_parent: self.scheduler_cgroup_parent,
+            cast_map,
+        })
+    }
+
+    /// Resolve the run-time CPU/memory placement plans: the no-perf
+    /// CPU-budget LLC reservation, the perf-mode pinning plan + NUMA
+    /// mbind map, or the deferred-default (neither) path, and cache the
+    /// host topology for [`KtstrVm::run`]'s deferred-lock branch. Returns
+    /// the three plan slots plus the cached topology bundled in
+    /// [`RunPlans`]. `no_perf_mode` selects the first arm; otherwise
+    /// `self.performance_mode` selects the perf-mode arm, else the
+    /// deferred default.
+    fn resolve_run_plans(&mut self, no_perf_mode: bool) -> Result<RunPlans> {
         // `host_topo` is cached on KtstrVm so `KtstrVm::run`'s
         // default-else branch (neither perf-mode nor no-perf-mode)
         // can call `compute_pinning` per LLC offset and take `LOCK_SH`
@@ -1040,166 +1188,11 @@ impl KtstrVmBuilder {
             (None, Vec::new(), None)
         };
 
-        let kernel = self.kernel.context("kernel path required")?;
-        anyhow::ensure!(kernel.exists(), "kernel not found: {}", kernel.display());
-        let t = &self.topology;
-        anyhow::ensure!(t.llcs > 0, "llcs must be > 0");
-        anyhow::ensure!(t.cores_per_llc > 0, "cores_per_llc must be > 0");
-        anyhow::ensure!(t.threads_per_core > 0, "threads_per_core must be > 0");
-        anyhow::ensure!(t.numa_nodes > 0, "numa_nodes must be > 0");
-        // `memory_mib == Some(0)` would forward a literal `-m 0` to the
-        // VMM backend (KVM rejects it at ioctl time with an opaque
-        // error). Catch it here with a clear message so the caller
-        // learns they set 0 explicitly rather than seeing a generic
-        // kvm failure later. `None` falls back to the default (256 MiB).
-        if matches!(self.memory_mib, Some(0)) {
-            anyhow::bail!(
-                "memory_mib must be > 0 (a VM with zero memory cannot boot); \
-                 omit `.memory_mib(...)` to use the builder default"
-            );
-        }
-        if let Some(ref bin) = self.init_binary
-            && !bin.starts_with("/proc/")
-        {
-            anyhow::ensure!(bin.exists(), "init binary not found: {}", bin.display());
-        }
-        if let Some(ref bin) = self.scheduler_binary {
-            anyhow::ensure!(
-                bin.exists(),
-                "scheduler binary not found: {}",
-                bin.display()
-            );
-        }
-
-        // Build a lazy on-demand BPF cast-analysis handle for the
-        // scheduler binary. NO file I/O and NO analyzer work runs
-        // here — the handle just captures the scheduler binary
-        // path and a `OnceLock` slot. The actual analyzer (file
-        // read + raw ELF parse + BTF parse + register-state walk
-        // over BPF instructions; no libbpf, no kernel interaction,
-        // no CAP_BPF) defers until the failure-dump path first
-        // calls
-        // [`super::cast_analysis_load::LazyCastMap::get_full`]
-        // (production accessor — `.get()` is `#[allow(dead_code)]`
-        // and used only by the lazy-handle unit tests).
-        // Schedulers whose tests pass never trigger analyzer
-        // work — the dominant case for nextest's process-per-test
-        // execution model where steady-state tests boot a VM,
-        // run, and exit without ever touching the dump path.
-        //
-        // When `.get_full()` does fire, it consults the process-
-        // wide content-hash cache via
-        // [`super::cast_analysis_load::cached_cast_analysis_for_scheduler`].
-        // Within a single process (auto-repro after a primary
-        // failure, future in-process multi-test drivers), two VMs
-        // resolving to the same scheduler binary content share
-        // one analyzer run.
-        let cast_map = std::sync::Arc::new(super::cast_analysis_load::LazyCastMap::new(
-            self.scheduler_binary.clone(),
-        ));
-
-        // Pre-materialize the (name, args) tuple view so the VM's
-        // `suffix_params()` helper can borrow it without leaking
-        // `StagedScheduler` into the `pub SuffixParams` field
-        // signature. Cheap clone (name is short, args are small);
-        // the duplication is the price for keeping the public
-        // initramfs-suffix surface free of crate-private types.
-        let staged_sched_args_packed: Vec<(String, Vec<String>)> = self
-            .staged_schedulers
-            .iter()
-            .map(|s| (s.name.clone(), s.sched_args.clone()))
-            .collect();
-
-        // Stamp the run's guest vCPU count + the EFFECTIVE host-CPU budget
-        // for the sidecar (#5: budget Dimension + overcommit marker) — the
-        // number of distinct host CPUs the vCPU threads actually run on.
-        // no-perf reserves a CPU budget (the no_perf_plan's cpus) and masks
-        // every vCPU thread onto it (the overcommit-relevant path: budget
-        // may be < vcpus). Under KTSTR_CARGO_TEST_MODE the plan reserves
-        // nothing and its cpus == the full allowed cpuset (a no-op mask), so
-        // the stamp records the unrestricted set the vCPUs floated across —
-        // still the true CPU count the threads ran on.
-        // perf-mode AND the deferred default both attempt a 1:1 pinning
-        // plan at run time — perf-mode via `validate_performance_mode`, the
-        // default via `run()`'s LOCK_SH offset search — hard-pinning each
-        // vCPU thread to one distinct host CPU (`compute_pinning` emits
-        // exactly `vcpus` 1:1 assignments). Both cache the host topology, so
-        // `cached_host_topo.is_some()` predicts a 1:1 pin and the build-time
-        // budget is the vCPU count. Two run-time outcomes diverge from that
-        // estimate: perf-mode aborts with ResourceContention if its LOCK_EX
-        // is unavailable (no sidecar written), and the default path
-        // OVERCOMMITS when no offset can map the topology (host too small) —
-        // `run()` then overrides `VmResult.cpu_budget` with the actual
-        // masked host-CPU count (`RunLocks::default_cpu_mask` length), so a
-        // too-small host stamps the real overcommit, not this `vcpus`
-        // estimate. Only when no affinity is applied (no-perf bypass, sysfs
-        // unreadable, or the deferred default with no cached host topology)
-        // do the vCPU threads fall to the allowed-cpuset size below. The
-        // earlier `no_perf_plan` arm wins first, so the `cached_host_topo`
-        // arm is only reached with no no-perf plan (perf-mode / deferred
-        // default), never the no-perf masked path.
-        let vcpus = t.total_cpus();
-        let effective_cpu_budget = if let Some(p) = no_perf_plan.as_ref() {
-            p.cpus.len() as u32
-        } else if cached_host_topo.is_some() {
-            vcpus
-        } else {
-            // No affinity applied (bypass / sysfs-unreadable): the threads
-            // float across the allowed cpuset. host_allowed_cpus() returns
-            // empty only when BOTH sched_getaffinity AND /proc/self/status
-            // fail (a host that can barely run); clamp to >= 1 so a genuinely
-            // booted run never stamps 0, which sidecar_to_row maps to None
-            // and explain renders as the "skip; VM not booted" sentinel —
-            // misclassifying a real run as a skip.
-            (host_topology::host_allowed_cpus().len() as u32).max(1)
-        };
-
-        Ok(KtstrVm {
-            kernel,
-            init_binary: self.init_binary,
-            scheduler_binary: self.scheduler_binary,
-            staged_schedulers: self.staged_schedulers,
-            staged_sched_args_packed,
-            run_args: self.run_args,
-            sched_args: self.sched_args,
-            topology: self.topology,
-            vcpus,
-            effective_cpu_budget,
-            memory_mib: self.memory_mib,
-            memory_min_mib: self.memory_min_mib,
-            cmdline_extra: self.cmdline_extra,
-            timeout: self.timeout,
-            monitor_thresholds: self.monitor_thresholds,
-            watchdog_timeout: self.watchdog_timeout,
-            rendezvous_timeout: self.rendezvous_timeout,
-            bpf_map_writes: self.bpf_map_writes,
-            performance_mode: self.performance_mode,
-            no_perf_mode,
+        Ok(RunPlans {
             pinning_plan,
             mbind_node_map,
             no_perf_plan,
             host_topo: cached_host_topo,
-            sched_enable_cmds: self.sched_enable_cmds,
-            sched_disable_cmds: self.sched_disable_cmds,
-            include_files: self.include_files,
-            disks: self.disks,
-            network: self.network,
-            busybox_bytes: self.busybox_bytes,
-            #[cfg(feature = "wprof")]
-            wprof: self.wprof,
-            dmesg: self.dmesg,
-            exec_cmd: self.exec_cmd,
-            exec_timeout: self.exec_timeout,
-            jemalloc_probe_binary: self.jemalloc_probe_binary,
-            jemalloc_alloc_worker_binary: self.jemalloc_alloc_worker_binary,
-            failure_dump_path: self.failure_dump_path,
-            dual_snapshot: self.dual_snapshot,
-            template_staging_image: self.template_staging_image,
-            workload_duration: self.workload_duration,
-            num_snapshots: self.num_snapshots,
-            workload_root_cgroup: self.workload_root_cgroup,
-            scheduler_cgroup_parent: self.scheduler_cgroup_parent,
-            cast_map,
         })
     }
 
@@ -1307,6 +1300,55 @@ fn build_per_node_map(
         }
     }
     map.into_iter().map(|s| s.into_iter().collect()).collect()
+}
+
+// Stamp the run's guest vCPU count + the EFFECTIVE host-CPU budget
+// for the sidecar (budget Dimension + overcommit marker) — the
+// number of distinct host CPUs the vCPU threads actually run on.
+// no-perf reserves a CPU budget (the no_perf_plan's cpus) and masks
+// every vCPU thread onto it (the overcommit-relevant path: budget
+// may be < vcpus). Under KTSTR_CARGO_TEST_MODE the plan reserves
+// nothing and its cpus == the full allowed cpuset (a no-op mask), so
+// the stamp records the unrestricted set the vCPUs floated across —
+// still the true CPU count the threads ran on.
+// perf-mode AND the deferred default both attempt a 1:1 pinning
+// plan at run time — perf-mode via `validate_performance_mode`, the
+// default via `run()`'s LOCK_SH offset search — hard-pinning each
+// vCPU thread to one distinct host CPU (`compute_pinning` emits
+// exactly `vcpus` 1:1 assignments). Both cache the host topology, so
+// `cached_host_topo.is_some()` predicts a 1:1 pin and the build-time
+// budget is the vCPU count. Two run-time outcomes diverge from that
+// estimate: perf-mode aborts with ResourceContention if its LOCK_EX
+// is unavailable (no sidecar written), and the default path
+// OVERCOMMITS when no offset can map the topology (host too small) —
+// `run()` then overrides `VmResult.cpu_budget` with the actual
+// masked host-CPU count (`RunLocks::default_cpu_mask` length), so a
+// too-small host stamps the real overcommit, not this `vcpus`
+// estimate. Only when no affinity is applied (no-perf bypass, sysfs
+// unreadable, or the deferred default with no cached host topology)
+// do the vCPU threads fall to the allowed-cpuset size below. The
+// earlier `no_perf_plan` arm wins first, so the `cached_host_topo`
+// arm is only reached with no no-perf plan (perf-mode / deferred
+// default), never the no-perf masked path.
+fn resolve_effective_cpu_budget(
+    no_perf_plan: &Option<host_topology::LlcPlan>,
+    has_cached_host_topo: bool,
+    vcpus: u32,
+) -> u32 {
+    if let Some(p) = no_perf_plan {
+        p.cpus.len() as u32
+    } else if has_cached_host_topo {
+        vcpus
+    } else {
+        // No affinity applied (bypass / sysfs-unreadable): the threads
+        // float across the allowed cpuset. host_allowed_cpus() returns
+        // empty only when BOTH sched_getaffinity AND /proc/self/status
+        // fail (a host that can barely run); clamp to >= 1 so a genuinely
+        // booted run never stamps 0, which sidecar_to_row maps to None
+        // and explain renders as the "skip; VM not booted" sentinel —
+        // misclassifying a real run as a skip.
+        (host_topology::host_allowed_cpus().len() as u32).max(1)
+    }
 }
 
 /// Resolve the effective per-VM CPU cap from an explicit cap, a per-test
