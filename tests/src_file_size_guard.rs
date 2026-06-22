@@ -106,7 +106,6 @@ const EXCEPTIONS: &[(&str, usize)] = &[
     // queued: decompose timeline.rs into submodules.
     ("timeline.rs", 3941),
     ("ctprof/mod.rs", 3571),
-    ("bin/ktstr.rs", 3670),
 ];
 
 /// Resolve `<repo>/src` from `CARGO_MANIFEST_DIR`. Cargo always
