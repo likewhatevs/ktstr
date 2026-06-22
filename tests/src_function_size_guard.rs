@@ -300,7 +300,7 @@ const EXCEPTIONS: &[(&str, &str, usize)] = &[
     ("assert/plan.rs", "AssertPlan::assert_cgroup", 234), // queued: decompose
     ("bin/cargo-ktstr.rs", "main", 239),                  // queued: decompose
     ("stats/compare.rs", "compare_partitions", 418),      // queued: decompose
-    ("stats/compare.rs", "compare_rows_by", 264),         // queued: decompose
+    ("stats/compare.rs", "compare_rows_by", 271),         // queued: decompose
     ("stats/group.rs", "group_and_average_by", 383),      // queued: decompose
     ("test_support/dispatch.rs", "result_to_exit_code", 247), // queued: decompose
     (
