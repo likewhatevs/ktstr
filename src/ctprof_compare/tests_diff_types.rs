@@ -47,12 +47,98 @@ fn single_thread_group_yields_one_row_per_metric() {
     assert_eq!(solo_rows.len(), CTPROF_METRICS.len());
 }
 
-/// Reference test data: 14 multi-member buckets and 13
-/// singletons covering every classifier rule. Every input
-/// thread name produces the exact expected normalized form;
-/// every bucket has the exact expected member count.
+/// Reference test data: every input thread name produces the
+/// exact expected normalized form via `pattern_key`. Covers
+/// every classifier rule across the 14 multi-member bucket
+/// patterns and the 13 singletons. The bucket member-count
+/// half of the spec lives in
+/// [`spec_thread_grouping_bucket_membership`].
 #[test]
-fn spec_thread_grouping_verbatim() {
+fn spec_thread_grouping_pattern_keys() {
+    // Per-input expected pattern_key.
+    let expected_keys: &[(&str, &str)] = &[
+        ("whirly-gig-0", "whirly-gig-{N}"),
+        ("whirly-gig-1", "whirly-gig-{N}"),
+        ("whirly-gig-2", "whirly-gig-{N}"),
+        ("whirly-gig-15", "whirly-gig-{N}"),
+        ("plonk_zap_0", "plonk_zap_{N}"),
+        ("plonk_zap_1", "plonk_zap_{N}"),
+        ("plonk_zap_7", "plonk_zap_{N}"),
+        ("ksoftirqd/0", "ksoftirqd/{N}"),
+        ("ksoftirqd/1", "ksoftirqd/{N}"),
+        ("ksoftirqd/2", "ksoftirqd/{N}"),
+        ("ksoftirqd/99", "ksoftirqd/{N}"),
+        ("kworker/0:0", "kworker/{N}:{N}"),
+        ("kworker/0:1", "kworker/{N}:{N}"),
+        ("kworker/1:0", "kworker/{N}:{N}"),
+        ("kworker/3:2", "kworker/{N}:{N}"),
+        ("kworker/0:0-wq_reclaim", "kworker/{N}:{N}-wq_reclaim"),
+        ("kworker/1:0-wq_reclaim", "kworker/{N}:{N}-wq_reclaim"),
+        ("kworker/47:2-wq_reclaim", "kworker/{N}:{N}-wq_reclaim"),
+        ("kworker/u8:3", "kworker/u{N}:{N}"),
+        ("kworker/u8:7", "kworker/u{N}:{N}"),
+        ("kworker/u16:0", "kworker/u{N}:{N}"),
+        ("kworker/0:1H-wq_prio", "kworker/{N}:{N}H-wq_prio"),
+        ("kworker/1:0H-wq_prio", "kworker/{N}:{N}H-wq_prio"),
+        ("kworker/2:1H-wq_prio", "kworker/{N}:{N}H-wq_prio"),
+        ("FooBar0", "FooBar{N}"),
+        ("FooBar1", "FooBar{N}"),
+        ("FooBar2", "FooBar{N}"),
+        ("FooBar175", "FooBar{N}"),
+        ("BazQux0", "BazQux{N}"),
+        ("BazQux1", "BazQux{N}"),
+        ("BazQux42", "BazQux{N}"),
+        ("wonk0", "wonk{N}"),
+        ("wonk1", "wonk{N}"),
+        ("wonk9", "wonk{N}"),
+        ("Grommet.Z0", "Grommet.Z{N}"),
+        ("Grommet.Z1", "Grommet.Z{N}"),
+        ("Grommet.Z999", "Grommet.Z{N}"),
+        ("fizz-buzz-wham0", "fizz-buzz-wham{N}"),
+        ("fizz-buzz-wham1", "fizz-buzz-wham{N}"),
+        ("fizz-buzz-wham7", "fizz-buzz-wham{N}"),
+        (
+            "rcu_exp_par_gp_kthread_worker/0",
+            "rcu_exp_par_gp_kthread_worker/{N}",
+        ),
+        (
+            "rcu_exp_par_gp_kthread_worker/1",
+            "rcu_exp_par_gp_kthread_worker/{N}",
+        ),
+        ("migration/0", "migration/{N}"),
+        ("migration/1", "migration/{N}"),
+        // Singletons (skeleton form per algorithm).
+        ("bloop-tangler", "bloop-tangler"),
+        ("narf-bonker", "narf-bonker"),
+        ("spork-wrangler", "spork-wrangler"),
+        ("hamster", "hamster"),
+        ("zilch", "zilch"),
+        ("gadget-v2", "gadget-v{N}"),
+        ("thingo-r2", "thingo-r{N}"),
+        ("cpu0", "cpu{N}"),
+        ("blip0", "blip{N}"),
+        ("snorf0", "snorf{N}"),
+        ("ptp0", "ptp{N}"),
+        ("BPF_CUBIC", "BPF_CUBIC"),
+        ("AUTO_FLOWLABEL", "AUTO_FLOWLABEL"),
+    ];
+
+    for (input, expected) in expected_keys {
+        assert_eq!(
+            pattern_key(input),
+            *expected,
+            "pattern_key({input:?}) skeleton mismatch",
+        );
+    }
+}
+
+/// Reference test data: 14 multi-member buckets and 13
+/// singletons covering every classifier rule. Every bucket has
+/// the exact expected member count; singletons revert to their
+/// literal input. The per-input `pattern_key` skeleton half of
+/// the spec lives in [`spec_thread_grouping_pattern_keys`].
+#[test]
+fn spec_thread_grouping_bucket_membership() {
     let inputs: &[&str] = &[
         // Bucket 1: whirly-gig-{N} (4 members)
         "whirly-gig-0",
@@ -129,82 +215,6 @@ fn spec_thread_grouping_verbatim() {
         "BPF_CUBIC",
         "AUTO_FLOWLABEL",
     ];
-
-    // Per-input expected pattern_key.
-    let expected_keys: &[(&str, &str)] = &[
-        ("whirly-gig-0", "whirly-gig-{N}"),
-        ("whirly-gig-1", "whirly-gig-{N}"),
-        ("whirly-gig-2", "whirly-gig-{N}"),
-        ("whirly-gig-15", "whirly-gig-{N}"),
-        ("plonk_zap_0", "plonk_zap_{N}"),
-        ("plonk_zap_1", "plonk_zap_{N}"),
-        ("plonk_zap_7", "plonk_zap_{N}"),
-        ("ksoftirqd/0", "ksoftirqd/{N}"),
-        ("ksoftirqd/1", "ksoftirqd/{N}"),
-        ("ksoftirqd/2", "ksoftirqd/{N}"),
-        ("ksoftirqd/99", "ksoftirqd/{N}"),
-        ("kworker/0:0", "kworker/{N}:{N}"),
-        ("kworker/0:1", "kworker/{N}:{N}"),
-        ("kworker/1:0", "kworker/{N}:{N}"),
-        ("kworker/3:2", "kworker/{N}:{N}"),
-        ("kworker/0:0-wq_reclaim", "kworker/{N}:{N}-wq_reclaim"),
-        ("kworker/1:0-wq_reclaim", "kworker/{N}:{N}-wq_reclaim"),
-        ("kworker/47:2-wq_reclaim", "kworker/{N}:{N}-wq_reclaim"),
-        ("kworker/u8:3", "kworker/u{N}:{N}"),
-        ("kworker/u8:7", "kworker/u{N}:{N}"),
-        ("kworker/u16:0", "kworker/u{N}:{N}"),
-        ("kworker/0:1H-wq_prio", "kworker/{N}:{N}H-wq_prio"),
-        ("kworker/1:0H-wq_prio", "kworker/{N}:{N}H-wq_prio"),
-        ("kworker/2:1H-wq_prio", "kworker/{N}:{N}H-wq_prio"),
-        ("FooBar0", "FooBar{N}"),
-        ("FooBar1", "FooBar{N}"),
-        ("FooBar2", "FooBar{N}"),
-        ("FooBar175", "FooBar{N}"),
-        ("BazQux0", "BazQux{N}"),
-        ("BazQux1", "BazQux{N}"),
-        ("BazQux42", "BazQux{N}"),
-        ("wonk0", "wonk{N}"),
-        ("wonk1", "wonk{N}"),
-        ("wonk9", "wonk{N}"),
-        ("Grommet.Z0", "Grommet.Z{N}"),
-        ("Grommet.Z1", "Grommet.Z{N}"),
-        ("Grommet.Z999", "Grommet.Z{N}"),
-        ("fizz-buzz-wham0", "fizz-buzz-wham{N}"),
-        ("fizz-buzz-wham1", "fizz-buzz-wham{N}"),
-        ("fizz-buzz-wham7", "fizz-buzz-wham{N}"),
-        (
-            "rcu_exp_par_gp_kthread_worker/0",
-            "rcu_exp_par_gp_kthread_worker/{N}",
-        ),
-        (
-            "rcu_exp_par_gp_kthread_worker/1",
-            "rcu_exp_par_gp_kthread_worker/{N}",
-        ),
-        ("migration/0", "migration/{N}"),
-        ("migration/1", "migration/{N}"),
-        // Singletons (skeleton form per algorithm).
-        ("bloop-tangler", "bloop-tangler"),
-        ("narf-bonker", "narf-bonker"),
-        ("spork-wrangler", "spork-wrangler"),
-        ("hamster", "hamster"),
-        ("zilch", "zilch"),
-        ("gadget-v2", "gadget-v{N}"),
-        ("thingo-r2", "thingo-r{N}"),
-        ("cpu0", "cpu{N}"),
-        ("blip0", "blip{N}"),
-        ("snorf0", "snorf{N}"),
-        ("ptp0", "ptp{N}"),
-        ("BPF_CUBIC", "BPF_CUBIC"),
-        ("AUTO_FLOWLABEL", "AUTO_FLOWLABEL"),
-    ];
-
-    for (input, expected) in expected_keys {
-        assert_eq!(
-            pattern_key(input),
-            *expected,
-            "pattern_key({input:?}) skeleton mismatch",
-        );
-    }
 
     // Build groups via `build_groups` and assert bucket
     // membership counts. Singletons revert to the literal
