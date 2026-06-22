@@ -1568,7 +1568,12 @@ pub fn compare_partitions(
     // `compare_partitions` uses — picking representative hosts
     // off the partitioned sidecars rather than the full pool so
     // the delta reflects what actually fed the comparison.
-    print_host_context_delta(pool, rows, filter_a, filter_b, &label_a, &label_b);
+    // Suppressed under `--phases-only`, which renders ONLY the
+    // per-phase block (see `PhaseDisplayOptions::phases_only`),
+    // matching the scalar table and summary gates above.
+    if !phase_opts.phases_only {
+        print_host_context_delta(pool, rows, filter_a, filter_b, &label_a, &label_b);
+    }
 
     Ok(if report.regressions > 0 { 1 } else { 0 })
 }

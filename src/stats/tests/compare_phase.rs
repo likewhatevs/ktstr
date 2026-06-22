@@ -1006,8 +1006,9 @@ fn compare_partitions_renders_phase_and_summary_blocks_via_pool() {
          regression still drives exit 1",
     );
 
-    // --phases-only suppresses the scalar table and summary block but
-    // still returns the scalar regression count as the exit code.
+    // --phases-only suppresses the scalar table, summary block, and
+    // host-context delta but still returns the scalar regression
+    // count as the exit code.
     let opts_phases_only = PhaseDisplayOptions {
         phases_only: true,
         ..PhaseDisplayOptions::default()
