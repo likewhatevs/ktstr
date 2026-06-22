@@ -20,7 +20,7 @@ use super::KtstrVm;
 use super::initramfs_cache::{BaseKey, BaseRef, get_or_build_base, get_or_compress_base_shm};
 use super::memory_budget::{
     MemoryBudget, TmpfsFraction, initramfs_min_memory_mib, read_kernel_init_size,
-    read_kernel_version_from_metadata_sidecar, read_kernel_version_major_minor,
+    read_kernel_version_from_metadata_sidecar, read_kernel_version,
 };
 use super::pi_mutex::PiMutex;
 use super::{disk_config, disk_template, host_topology, initramfs, virtio_blk, virtio_net};
@@ -827,14 +827,15 @@ impl KtstrVm {
     }
 
     /// Select the guest rootfs tmpfs fraction for the budget formula by
-    /// reading the kernel's version and gating on mainline 6.18 or newer
-    /// (the floor that honors `initramfs_options=size=90%`).
+    /// reading the kernel's version and gating on the honoring versions
+    /// (mainline 6.18+ or a stable series at/above its backport floor)
+    /// via [`TmpfsFraction::for_kernel_version`].
     ///
     /// Mirrors [`Self::init_payload_coverage_reserve`]: a `&self` accessor
     /// that derives a conservatively-defaulting value threaded into
     /// [`MemoryBudget`] at every budget call site. The version is read
     /// from the image's own setup_header where it is embedded
-    /// ([`read_kernel_version_major_minor`], the x86_64 bzImage), falling
+    /// ([`read_kernel_version`], the x86_64 bzImage), falling
     /// back to the cache `metadata.json` sidecar
     /// ([`read_kernel_version_from_metadata_sidecar`]) for images without
     /// an embedded version — notably the aarch64 `Image`. Both sources
@@ -843,7 +844,7 @@ impl KtstrVm {
     /// [`TmpfsFraction::Half`] unless the kernel is positively confirmed
     /// to honor the token — 90% is never taken on a guess.
     fn tmpfs_fraction(&self) -> TmpfsFraction {
-        let version = read_kernel_version_major_minor(&self.kernel)
+        let version = read_kernel_version(&self.kernel)
             .or_else(|| read_kernel_version_from_metadata_sidecar(&self.kernel));
         TmpfsFraction::for_kernel_version(version)
     }

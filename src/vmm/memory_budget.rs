@@ -14,10 +14,12 @@ use std::path::Path;
 /// `shmem_default_max_blocks` (`mm/shmem.c`) returns `totalram_pages() /
 /// 2`, so the rootfs tmpfs admits at most 50% of RAM by default. The
 /// `initramfs_options=size=90%` cmdline token (emitted unconditionally
-/// when `init_binary.is_some()`) raises that to 90% — but ONLY on
+/// when `init_binary.is_some()`) raises that to 90% — but only on
 /// kernels carrying mainline commit 278033a225e1 ("fs: Add
-/// 'initramfs_options'"), first tagged v6.18-rc1. On older kernels the
-/// token is silently ignored and the tmpfs stays at the 50% default.
+/// 'initramfs_options'"), first tagged v6.18-rc1 and backported to the
+/// stable series (see [`Self::for_kernel_version`] for the per-series
+/// floors). On kernels without it the token is silently ignored and the
+/// tmpfs stays at the 50% default.
 ///
 /// The asymmetry is one-directional: sizing RAM for 50% when the kernel
 /// honors 90% wastes a little RAM (the tmpfs is bigger than we sized
@@ -25,14 +27,17 @@ use std::path::Path;
 /// extraction overruns the tmpfs and the guest panics. So [`Self::Half`]
 /// is the conservative default for ANY uncertainty, and
 /// [`Self::NinetyPercent`] is selected only when the kernel is
-/// POSITIVELY known to honor the token (mainline version >= 6.18).
+/// POSITIVELY known to honor the token (mainline >= 6.18, or a stable
+/// series at or above its backport floor — see
+/// [`Self::for_kernel_version`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TmpfsFraction {
     /// 50% of `totalram_pages` — the `shmem_default_max_blocks` default
     /// and the universally-safe floor.
     Half,
     /// 90% of `totalram_pages` — the ceiling `initramfs_options=size=90%`
-    /// raises the tmpfs to on honoring kernels (mainline 6.18 or newer).
+    /// raises the tmpfs to, on honoring kernels (mainline 6.18+ or a
+    /// backported stable series — see [`Self::for_kernel_version`]).
     /// Reclaims RAM proportional to the uncompressed payload — roughly a
     /// third of the boot budget at the instrumented-payload shape (the
     /// `ninety_percent_fraction_sizes_less_ram_than_half` test measures
@@ -52,24 +57,52 @@ impl TmpfsFraction {
         }
     }
 
-    /// Select the tmpfs fraction for a guest kernel whose mainline
-    /// `(major, minor)` version is `version`.
+    /// Select the tmpfs fraction for a guest kernel whose
+    /// `(major, minor, patch)` version is `version`.
     ///
     /// [`Self::NinetyPercent`] iff the kernel is positively known to
-    /// honor `initramfs_options=size=90%` — mainline commit
-    /// 278033a225e1, first tagged v6.18-rc1, so `(major, minor) >= (6,
-    /// 18)`. `None` (the caller could not establish a version) or any
-    /// version below 6.18 yields the conservative [`Self::Half`].
+    /// honor `initramfs_options=size=90%` (upstream commit 278033a225e1):
+    /// mainline `(major, minor) >= (6, 18)` (first tagged v6.18-rc1,
+    /// regardless of patch), or a stable series at or above the patch
+    /// level where the backport first shipped.
     ///
-    /// Only mainline >= 6.18 is encoded; the per-stable-series backport
-    /// matrix (v5.10.246 / v6.6.113 / v6.12.54 / v6.17.4 etc.) is NOT —
-    /// recognizing those requires a per-series floor table verifiable
-    /// only against the stable trees (a follow-up), so those backported
-    /// kernels fall to the safe 50% (no reclaim, no panic).
-    pub(crate) fn for_kernel_version(version: Option<(u16, u16)>) -> Self {
-        match version {
-            Some((major, minor)) if (major, minor) >= (6, 18) => TmpfsFraction::NinetyPercent,
-            _ => TmpfsFraction::Half,
+    /// The per-series backport floors, verified via `git tag --contains`
+    /// of each series' backport commit against the linux-stable trees,
+    /// are 5.4.301, 5.10.246, 5.15.195, 6.1.157, 6.6.113, 6.12.54, and
+    /// 6.17.4.
+    ///
+    /// `None` (no version established), a series absent from the table
+    /// (EOL / no backport, e.g. 6.7-6.11 or 6.13-6.16 — 6.12 IS in the
+    /// table), or a version below its series floor yields the
+    /// conservative [`Self::Half`]. The table is a
+    /// verified snapshot: a series that gains a backport later still
+    /// falls to `Half` until added here — safe (no reclaim), never a
+    /// panic.
+    pub(crate) fn for_kernel_version(version: Option<(u16, u16, u16)>) -> Self {
+        let Some((major, minor, patch)) = version else {
+            return TmpfsFraction::Half;
+        };
+        // Mainline 6.18+ honors the token regardless of patch level.
+        if (major, minor) >= (6, 18) {
+            return TmpfsFraction::NinetyPercent;
+        }
+        // Per-stable-series patch floor where the initramfs_options
+        // backport first shipped. A series not listed (EOL / no
+        // backport) falls through to the safe Half.
+        let floor = match (major, minor) {
+            (5, 4) => 301,
+            (5, 10) => 246,
+            (5, 15) => 195,
+            (6, 1) => 157,
+            (6, 6) => 113,
+            (6, 12) => 54,
+            (6, 17) => 4,
+            _ => return TmpfsFraction::Half,
+        };
+        if patch >= floor {
+            TmpfsFraction::NinetyPercent
+        } else {
+            TmpfsFraction::Half
         }
     }
 }
@@ -174,7 +207,7 @@ pub(crate) fn read_kernel_init_size(kernel_path: &Path) -> Result<u64> {
     }
 }
 
-/// Read the guest kernel's mainline `(major, minor)` version from the
+/// Read the guest kernel's `(major, minor, patch)` version from the
 /// kernel image, for the `initramfs_options=size=90%` honoring gate (see
 /// [`TmpfsFraction::for_kernel_version`]).
 ///
@@ -184,7 +217,7 @@ pub(crate) fn read_kernel_init_size(kernel_path: &Path) -> Result<u64> {
 /// string lives at file offset `0x200 + value` and begins with
 /// `UTS_RELEASE` (`arch/x86/boot/version.c`), i.e.
 /// `MAJOR.MINOR.PATCH[-extra]` (e.g. `6.18.0-rc1`). This parses the
-/// leading `MAJOR.MINOR`.
+/// leading `MAJOR.MINOR.PATCH`.
 ///
 /// aarch64 Image: the arm64 image header carries no version string —
 /// returns `None` here. The caller `tmpfs_fraction` falls back to the
@@ -197,7 +230,7 @@ pub(crate) fn read_kernel_init_size(kernel_path: &Path) -> Result<u64> {
 /// stripped), the string offset out of range, non-UTF-8, or a malformed
 /// leading `MAJOR.MINOR`. NEVER errors — a missing version is a normal,
 /// safe outcome, not a boot-blocking failure.
-pub(crate) fn read_kernel_version_major_minor(kernel_path: &Path) -> Option<(u16, u16)> {
+pub(crate) fn read_kernel_version(kernel_path: &Path) -> Option<(u16, u16, u16)> {
     #[cfg(target_arch = "x86_64")]
     {
         use std::io::{Read, Seek, SeekFrom};
@@ -241,7 +274,7 @@ pub(crate) fn read_kernel_version_major_minor(kernel_path: &Path) -> Option<(u16
             .position(|&b| b == 0 || b == b' ')
             .unwrap_or(bytes.len());
         let release = std::str::from_utf8(&bytes[..end]).ok()?;
-        parse_major_minor(release)
+        parse_kernel_version(release)
     }
     #[cfg(target_arch = "aarch64")]
     {
@@ -253,12 +286,16 @@ pub(crate) fn read_kernel_version_major_minor(kernel_path: &Path) -> Option<(u16
     }
 }
 
-/// Parse the leading `MAJOR.MINOR` from a kernel release string such as
-/// `6.18.0-rc1` or `7.1.0-rc7-gc80ba8d32ec3`. Returns `None` if either
-/// of the first two dot-separated components is absent or non-numeric.
-/// Free fn so the host unit tests pin the parse against real
-/// release-string shapes without constructing a bzImage.
-fn parse_major_minor(release: &str) -> Option<(u16, u16)> {
+/// Parse the leading `MAJOR.MINOR.PATCH` from a kernel release string
+/// such as `6.6.113`, `6.18.0-rc1`, or `7.1.0-rc7-gc80ba8d32ec3`.
+/// Returns `None` if either of the first two dot-separated components is
+/// absent or non-numeric. The patch component is optional — mainline rc
+/// tags (`6.18-rc1`) carry none, and mainline >= 6.18 honors regardless
+/// of patch; an absent or non-numeric patch is reported as `0` (only the
+/// stable-backport floors consult patch, and every stable release is
+/// `MAJOR.MINOR.PATCH`). Free fn so the host unit tests pin the parse
+/// against real release-string shapes without constructing a bzImage.
+fn parse_kernel_version(release: &str) -> Option<(u16, u16, u16)> {
     let mut parts = release.split('.');
     let major: u16 = parts.next()?.parse().ok()?;
     // Minor may carry a trailing `-rcN` only when there is no PATCH
@@ -269,14 +306,21 @@ fn parse_major_minor(release: &str) -> Option<(u16, u16)> {
         return None;
     }
     let minor: u16 = minor_digits.parse().ok()?;
-    Some((major, minor))
+    // Patch is optional; strip any trailing non-digit suffix (e.g.
+    // `0-rc7-g...`). Absent, empty, or non-numeric => 0.
+    let patch: u16 = parts
+        .next()
+        .map(|p| p.chars().take_while(|c| c.is_ascii_digit()).collect::<String>())
+        .and_then(|d| d.parse().ok())
+        .unwrap_or(0);
+    Some((major, minor, patch))
 }
 
-/// Recover the guest kernel `(major, minor)` version from the cache
-/// `metadata.json` sidecar next to the boot image.
+/// Recover the guest kernel `(major, minor, patch)` version from the
+/// cache `metadata.json` sidecar next to the boot image.
 ///
 /// The aarch64 `Image` carries no embedded version string (so
-/// [`read_kernel_version_major_minor`] returns `None` there), but a
+/// [`read_kernel_version`] returns `None` there), but a
 /// cached kernel records its version in `metadata.json` alongside the
 /// image: `crate::cache::CacheDir` stores the boot image at
 /// `<entry>/<image_name>` and its metadata at `<entry>/metadata.json`,
@@ -294,7 +338,7 @@ fn parse_major_minor(release: &str) -> Option<(u16, u16)> {
 /// host-authored cache infrastructure, not guest input, so trusting its
 /// version for the fraction decision is consistent with the threat model
 /// (the guest never writes it).
-pub(crate) fn read_kernel_version_from_metadata_sidecar(kernel_path: &Path) -> Option<(u16, u16)> {
+pub(crate) fn read_kernel_version_from_metadata_sidecar(kernel_path: &Path) -> Option<(u16, u16, u16)> {
     #[derive(serde::Deserialize)]
     struct VersionProbe {
         version: Option<String>,
@@ -302,7 +346,7 @@ pub(crate) fn read_kernel_version_from_metadata_sidecar(kernel_path: &Path) -> O
     let sidecar = kernel_path.parent()?.join("metadata.json");
     let json = std::fs::read_to_string(sidecar).ok()?;
     let probe: VersionProbe = serde_json::from_str(&json).ok()?;
-    parse_major_minor(&probe.version?)
+    parse_kernel_version(&probe.version?)
 }
 
 /// Minimum guest memory (in MiB) needed to boot, extract the initramfs,
@@ -356,15 +400,15 @@ pub(crate) fn read_kernel_version_from_metadata_sidecar(kernel_path: &Path) -> O
 ///
 /// `initramfs_options=size=90%` on the cmdline is consumed by
 /// `init_mount_tree()` (`fs/namespace.c`, via `initramfs_options_setup`)
-/// when mounting the rootfs tmpfs — but only on kernels with mainline
+/// when mounting the rootfs tmpfs — but only on kernels carrying mainline
 /// commit 278033a225e1 ("fs: Add 'initramfs_options' to set initramfs
-/// mount options"), first tagged v6.18-rc1. On kernels older than 6.18
-/// the parameter is silently ignored ("Unknown kernel command line
+/// mount options"), first tagged v6.18-rc1. On kernels without it the
+/// parameter is silently ignored ("Unknown kernel command line
 /// parameters …, will be passed to user space") and the tmpfs uses its
-/// 50% default. (The commit was later backported to several stable
-/// series — v5.10.246, v6.6.113, v6.12.54, v6.17.4, etc. — but ktstr
-/// gates the 90% bump on mainline >= 6.18 ONLY; see
-/// `TmpfsFraction::for_kernel_version`.) Initramfs unpacking then fails
+/// 50% default. (The commit was also backported to the stable series —
+/// v5.4.301, v5.10.246, v5.15.195, v6.1.157, v6.6.113, v6.12.54, v6.17.4
+/// — which ktstr recognizes via `TmpfsFraction::for_kernel_version`.)
+/// Initramfs unpacking then fails
 /// with `write error` partway through if the uncompressed payload
 /// exceeds the live tmpfs limit, leaving `/init` packed but its
 /// dynamic-linker dep missing → `Failed to execute /init (error -2)`
@@ -372,13 +416,15 @@ pub(crate) fn read_kernel_version_from_metadata_sidecar(kernel_path: &Path) -> O
 ///
 /// The formula below sizes for `budget.tmpfs_fraction`: 90% only when
 /// the guest kernel is positively known to honor the hint (mainline
-/// 6.18 or newer, via `TmpfsFraction::for_kernel_version`), else the 50%
-/// default. Sizing for 50% on a kernel that honors 90% is safe — the
-/// tmpfs is bigger than we sized for; sizing for 90% on a kernel that
-/// only gives 50% panics the guest mid-extraction, so the 90% path is
-/// taken ONLY on a confirmed-honoring version (every uncertainty —
-/// unknown version, an image lacking both an embedded version and a
-/// honoring sidecar, or below 6.18 — falls to the safe 50%).
+/// 6.18+ or a stable series at or above its backport floor, via
+/// `TmpfsFraction::for_kernel_version`), else the 50% default. Sizing
+/// for 50% on a kernel that honors 90% is safe — the tmpfs is bigger
+/// than we sized for; sizing for 90% on a kernel that only gives 50%
+/// panics the guest mid-extraction, so the 90% path is taken ONLY on a
+/// confirmed-honoring version (every uncertainty — unknown version, an
+/// image lacking both an embedded version and a honoring sidecar, a
+/// series absent from the table, or below its series floor — falls to
+/// the safe 50%).
 ///
 /// Note: `rootflags=size=90%` would set `root_mount_data` (assigned by
 /// `root_data_setup` via `__setup("rootflags=", ...)` in
@@ -441,7 +487,8 @@ pub(crate) fn initramfs_min_memory_mib(budget: &MemoryBudget) -> u32 {
     // Boot requirement: the rootfs tmpfs block limit is a fraction F of
     // totalram_pages. F = 50% (`shmem_default_max_blocks`) on every
     // kernel that does not positively honor `initramfs_options=size=90%`;
-    // F = 90% only on mainline >= 6.18 (see `TmpfsFraction` /
+    // F = 90% only on a positively-honoring kernel (mainline 6.18+ or a
+    // stable series at/above its backport floor; see `TmpfsFraction` /
     // `TmpfsFraction::for_kernel_version`). A larger F sizes LESS RAM.
     //
     // Constraint (F = frac_num/frac_den): F * totalram_pages >= uncompressed_pages.
@@ -653,51 +700,68 @@ mod tests {
         );
     }
 
-    /// `TmpfsFraction::for_kernel_version` gates the 90% bump on mainline
-    /// 6.18 or newer (commit 278033a225e1, first tagged v6.18-rc1). Every
-    /// uncertain or older case falls to the safe 50%.
+    /// `TmpfsFraction::for_kernel_version` gates the 90% bump on a
+    /// positively-honoring kernel: mainline 6.18+ (regardless of patch)
+    /// OR a stable series at/above its verified backport floor. Every
+    /// uncertain, absent-series, or below-floor case falls to the safe
+    /// 50%.
     #[test]
-    fn tmpfs_fraction_gates_on_6_18() {
-        assert_eq!(
-            TmpfsFraction::for_kernel_version(Some((6, 18))),
-            TmpfsFraction::NinetyPercent
-        );
-        assert_eq!(
-            TmpfsFraction::for_kernel_version(Some((6, 19))),
-            TmpfsFraction::NinetyPercent
-        );
-        assert_eq!(
-            TmpfsFraction::for_kernel_version(Some((7, 0))),
-            TmpfsFraction::NinetyPercent
-        );
-        assert_eq!(
-            TmpfsFraction::for_kernel_version(Some((6, 17))),
-            TmpfsFraction::Half
-        );
-        assert_eq!(
-            TmpfsFraction::for_kernel_version(Some((6, 12))),
-            TmpfsFraction::Half
-        );
-        assert_eq!(
-            TmpfsFraction::for_kernel_version(Some((5, 10))),
-            TmpfsFraction::Half
-        );
-        assert_eq!(TmpfsFraction::for_kernel_version(None), TmpfsFraction::Half);
+    fn tmpfs_fraction_gates_on_honoring_versions() {
+        use TmpfsFraction::{Half, NinetyPercent};
+        let frac = TmpfsFraction::for_kernel_version;
+
+        // Mainline 6.18+ honors regardless of patch.
+        assert_eq!(frac(Some((6, 18, 0))), NinetyPercent);
+        assert_eq!(frac(Some((6, 19, 0))), NinetyPercent);
+        assert_eq!(frac(Some((7, 0, 5))), NinetyPercent);
+        // Mainline below 6.18 in a series with no backport at all (6.16 is
+        // absent from the floor table) -> Half. (6.17 below-floor is
+        // covered in the per-series block below.)
+        assert_eq!(frac(Some((6, 16, 0))), Half);
+
+        // Stable-backport series: AT the floor -> NinetyPercent; one
+        // BELOW the floor -> Half. Floors verified via git tag --contains.
+        assert_eq!(frac(Some((6, 17, 4))), NinetyPercent);
+        assert_eq!(frac(Some((6, 17, 3))), Half);
+        assert_eq!(frac(Some((6, 12, 54))), NinetyPercent);
+        assert_eq!(frac(Some((6, 12, 53))), Half);
+        assert_eq!(frac(Some((6, 6, 113))), NinetyPercent);
+        assert_eq!(frac(Some((6, 6, 112))), Half);
+        assert_eq!(frac(Some((6, 1, 157))), NinetyPercent);
+        assert_eq!(frac(Some((6, 1, 156))), Half);
+        assert_eq!(frac(Some((5, 15, 195))), NinetyPercent);
+        assert_eq!(frac(Some((5, 15, 194))), Half);
+        assert_eq!(frac(Some((5, 10, 246))), NinetyPercent);
+        assert_eq!(frac(Some((5, 10, 245))), Half);
+        assert_eq!(frac(Some((5, 4, 301))), NinetyPercent);
+        assert_eq!(frac(Some((5, 4, 300))), Half);
+
+        // A series absent from the table (EOL / no backport) -> Half,
+        // even at a high patch level.
+        assert_eq!(frac(Some((6, 9, 999))), Half);
+        assert_eq!(frac(Some((6, 13, 999))), Half);
+        // No version established -> Half.
+        assert_eq!(frac(None), Half);
     }
 
-    /// `parse_major_minor` extracts the leading MAJOR.MINOR from real
-    /// kernel release-string shapes; malformed inputs yield `None`.
+    /// `parse_kernel_version` extracts the leading MAJOR.MINOR.PATCH from
+    /// real kernel release-string shapes; the patch is optional (absent
+    /// or rc-only => 0); a malformed major/minor yields `None`.
     #[test]
-    fn parse_major_minor_shapes() {
-        assert_eq!(parse_major_minor("6.18.0-rc1"), Some((6, 18)));
-        assert_eq!(parse_major_minor("7.1.0-rc7-gc80ba8d32ec3"), Some((7, 1)));
-        assert_eq!(parse_major_minor("6.12.54"), Some((6, 12)));
-        assert_eq!(parse_major_minor("6.18-rc1"), Some((6, 18)));
-        assert_eq!(parse_major_minor(""), None);
-        assert_eq!(parse_major_minor("garbage"), None);
-        assert_eq!(parse_major_minor("6"), None);
-        assert_eq!(parse_major_minor("6."), None);
-        assert_eq!(parse_major_minor("x.18"), None);
+    fn parse_kernel_version_shapes() {
+        assert_eq!(parse_kernel_version("6.18.0-rc1"), Some((6, 18, 0)));
+        assert_eq!(parse_kernel_version("7.1.0-rc7-gc80ba8d32ec3"), Some((7, 1, 0)));
+        assert_eq!(parse_kernel_version("6.12.54"), Some((6, 12, 54)));
+        assert_eq!(parse_kernel_version("6.6.113"), Some((6, 6, 113)));
+        // Minor-only rc tag: no patch component => patch 0.
+        assert_eq!(parse_kernel_version("6.18-rc1"), Some((6, 18, 0)));
+        // Non-numeric patch => 0 (major.minor still parse).
+        assert_eq!(parse_kernel_version("6.6.x"), Some((6, 6, 0)));
+        assert_eq!(parse_kernel_version(""), None);
+        assert_eq!(parse_kernel_version("garbage"), None);
+        assert_eq!(parse_kernel_version("6"), None);
+        assert_eq!(parse_kernel_version("6."), None);
+        assert_eq!(parse_kernel_version("x.18"), None);
     }
 
     /// At the SAME payload, the 90% fraction sizes strictly LESS total
@@ -828,7 +892,7 @@ mod tests {
         assert!(result.is_err(), "truncated file must fail; got: {result:?}",);
     }
 
-    /// `read_kernel_version_major_minor` on x86_64 walks the bzImage
+    /// `read_kernel_version` on x86_64 walks the bzImage
     /// setup_header: the "HdrS" magic at 0x202, the kernel_version u16
     /// at 0x20E, and the version string at 0x200 + ptr. Pins the
     /// offset-chase AND the HdrS-magic gate (a non-bzImage returns None
@@ -861,12 +925,13 @@ mod tests {
             f
         };
 
-        // Valid bzImage: HdrS magic present -> the version-chase parses 6.18.
+        // Valid bzImage: HdrS magic present -> the version-chase parses
+        // (6, 18, 0) from the "6.18.0-rc1" release string.
         let good = write_image(b"HdrS");
         assert_eq!(
-            read_kernel_version_major_minor(good.path()),
-            Some((6, 18)),
-            "valid bzImage offset-chase must parse 6.18",
+            read_kernel_version(good.path()),
+            Some((6, 18, 0)),
+            "valid bzImage offset-chase must parse (6, 18, 0)",
         );
 
         // Wrong HdrS magic (not a bzImage / corrupt) -> None, even though
@@ -874,7 +939,7 @@ mod tests {
         // guard: an unvalidated image must NOT select the 90% fraction.
         let bad = write_image(b"XXXX");
         assert_eq!(
-            read_kernel_version_major_minor(bad.path()),
+            read_kernel_version(bad.path()),
             None,
             "wrong HdrS magic must return None (the safe-50% direction)",
         );
@@ -882,10 +947,11 @@ mod tests {
 
     /// `read_kernel_version_from_metadata_sidecar` reads `version` from a
     /// `metadata.json` sibling of the image path and parses its
-    /// MAJOR.MINOR — the aarch64 reclaim source. Pins: a 6.18 version
-    /// parses (and unrelated schema keys are ignored); an absent `version`
-    /// key, an explicit `null`, an unparsable string, malformed JSON, and
-    /// a missing sidecar all return None — the safe-50% direction.
+    /// MAJOR.MINOR.PATCH — the aarch64 reclaim source. Pins: a 6.18.2
+    /// version parses (and unrelated schema keys are ignored); an absent
+    /// `version` key, an explicit `null`, an unparsable string, malformed
+    /// JSON, and a missing sidecar all return None — the safe-50%
+    /// direction.
     #[test]
     fn read_kernel_version_from_metadata_sidecar_parses_and_guards() {
         use std::io::Write;
@@ -901,13 +967,13 @@ mod tests {
             f.flush().expect("flush");
         };
 
-        // Honoring version present, with an unrelated key -> parses 6.18
-        // (extra schema fields ignored by the minimal probe).
+        // Honoring version present, with an unrelated key -> parses
+        // (6, 18, 2) (extra schema fields ignored by the minimal probe).
         write_sidecar(r#"{"version":"6.18.2","arch":"aarch64"}"#);
         assert_eq!(
             read_kernel_version_from_metadata_sidecar(&image),
-            Some((6, 18)),
-            "sidecar version must parse to (6, 18)",
+            Some((6, 18, 2)),
+            "sidecar version must parse to (6, 18, 2)",
         );
 
         // version key absent -> None (local-source build records no version).
