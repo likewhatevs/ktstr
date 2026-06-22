@@ -481,81 +481,7 @@ pub fn kernel_build_pipeline(
     // pre-acquire `cache_lookup` in `resolve_kernel_dir_to_entry`
     // catches the warm-cache case (no lock taken at all); this check
     // catches the cold-then-warmed-during-wait case.
-    //
-    // Mid-wait edit guard: the operator may edit a tracked file in
-    // the source tree DURING our EX wait (long peer build = long
-    // window). `acquired.is_dirty` snapshots clean-at-acquire; a fresh
-    // probe via `inspect_local_source_state` catches edits that landed
-    // during the wait. If dirty/hash-changed, the operator's intent
-    // is "build what's on disk" — skip the cache re-check and fall
-    // through to the build branch, where the post-build dirty re-check
-    // at the cache-store site will recognise the mutation and skip
-    // caching. Probe errors are warnings (not fatal) — same Err
-    // disposition as the post-build re-check.
-    // PreAcquireDirty distinguishes "operator started with a dirty
-    // tree" (the wait wasn't the cause) from "operator dirtied the
-    // tree during the wait" (DirtyEdit). The split keeps the enum
-    // variants honest about cause-attribution per the
-    // [`MidWaitState::diagnostic`] dispatch below.
-    //
-    // TOCTOU acceptance: the source tree can mutate between this
-    // probe and the `cache_lookup` call below — a microsecond window
-    // (typically) where an operator edit, background autoformatter
-    // write, `git commit`, or IDE pre-commit hook would slip through
-    // both this guard AND the post-build dirty re-check at the
-    // cache-store site (the cache-hit return below short-circuits
-    // before `make`, so the post-build re-check never runs for the
-    // racing-into-hit path). Publication-side staleness is gated by
-    // the separate post-build dirty re-check at the cache-store
-    // site; this paragraph is about the consumer-side stale-serving
-    // window only. The cache slot is keyed on `acquired.cache_key`
-    // (frozen at acquire time inside `local_source`), so the served
-    // artifact's identity is the acquire-time HEAD — a mid-window
-    // mutation produces a cache hit that serves a slightly-stale
-    // source state without destroying the operator's later state.
-    // Bounded race; the operator's next invocation re-acquires and
-    // observes the new state.
-    //
-    // "Next invocation correct" is NOT a remediation for: single-shot
-    // CI pipelines without retry, `git bisect run` invocations (each
-    // commit is independent), or pipelined CI flows where one job
-    // builds the kernel and a downstream job consumes the cached
-    // image without re-probing the source tree. Operators in those
-    // workflows should treat cache hits as acquire-time-correct, not
-    // invocation-time correct. Holding an EX flock across [probe,
-    // cache_lookup] or re-probing after the lookup were considered
-    // and rejected as adding common-path latency for a microsecond-
-    // wide window.
-    let mid_wait_state = if is_local_source && !acquired.is_dirty {
-        match crate::fetch::inspect_local_source_state(source_dir) {
-            Ok(post) => {
-                let hash_changed = post.short_hash
-                    != acquired
-                        .kernel_source
-                        .as_local_git_hash()
-                        .map(str::to_string);
-                if post.is_dirty {
-                    MidWaitState::DirtyEdit
-                } else if hash_changed {
-                    MidWaitState::HashAdvanced
-                } else {
-                    MidWaitState::Clean
-                }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    cli_label = cli_label,
-                    err = %format!("{e:#}"),
-                    "mid-wait dirty re-check failed; proceeding to build",
-                );
-                MidWaitState::ProbeFailed
-            }
-        }
-    } else if acquired.is_dirty {
-        MidWaitState::PreAcquireDirty
-    } else {
-        MidWaitState::Clean
-    };
+    let mid_wait_state = compute_mid_wait_state(acquired, source_dir, is_local_source, cli_label);
     let mid_wait_clean = mid_wait_state == MidWaitState::Clean;
 
     if let Some(body) = mid_wait_state.diagnostic() {
@@ -587,23 +513,181 @@ pub fn kernel_build_pipeline(
         }
     }
 
-    // Build the merged fragment ONCE so the configure call observes
-    // the byte layout `{EMBEDDED_KCONFIG}\n{extra}` (with a `\n`
-    // interleave) defined in [`crate::merge_kconfig_fragments`]. The
-    // helper returns a `Cow<'_, str>` so the no-extras path borrows
-    // `EMBEDDED_KCONFIG` without allocating; only the user-fragment
-    // case heaps the merged string. Unit tests pin the exact
-    // ordering kbuild's last-wins rule operates on.
+    reconfigure_and_build(source_dir, extra_kconfig, cli_label, make_jobs)?;
+
+    // Validate critical config options were not silently disabled.
+    // When `--extra-kconfig` is set, attach an actionable hint
+    // pointing at the user fragment as a likely cause. The most
+    // plausible failure mode is a user override that disables a
+    // baked-in invariant (e.g. a fragment containing
+    // `# CONFIG_BPF is not set` defeats the BPF dep chain), so
+    // name `--extra-kconfig` in the wrap context.
+    validate_kernel_config(source_dir).with_context(|| {
+        if extra_kconfig.is_some() {
+            "post-build kernel config validation failed; check that your \
+             --extra-kconfig fragment does not disable a CONFIG_X required by \
+             ktstr (e.g. CONFIG_BPF, CONFIG_DEBUG_INFO_BTF, CONFIG_FTRACE, \
+             CONFIG_SCHED_CLASS_EXT)"
+                .to_string()
+        } else {
+            "post-build kernel config validation failed".to_string()
+        }
+    })?;
+
+    if !acquired.is_temp {
+        generate_compile_commands(source_dir)?;
+    }
+
+    let (image_path, vmlinux_opt) = find_built_image(source_dir, cli_label)?;
+    let vmlinux_ref = vmlinux_opt.as_deref();
+
+    // Cache (skip for dirty local trees).
+    if acquired.is_dirty {
+        eprintln!("{cli_label}: kernel built at {}", image_path.display());
+        // Branch the hint wording: commit/stash is only an actionable
+        // remediation for an actual git repo. A non-git source tree
+        // is force-marked dirty (see `acquire_local_source` in
+        // `fetch.rs`) because dirty detection is impossible, and
+        // telling the operator to "commit or stash" leads nowhere.
+        let hint = dirty_cache_skip_hint(acquired.is_git);
+        eprintln!("{cli_label}: {hint}");
+        return Ok(KernelBuildResult {
+            entry: None,
+            image_path,
+            post_build_is_dirty: true,
+        });
+    }
+
+    if let Some(skip_result) =
+        post_build_dirty_skip(acquired, source_dir, is_local_source, &image_path, cli_label)
+    {
+        return Ok(skip_result);
+    }
+
+    build_metadata_and_store(
+        acquired,
+        cache,
+        cli_label,
+        is_local_source,
+        arch,
+        image_name,
+        extra_kconfig,
+        source_dir,
+        image_path,
+        vmlinux_ref,
+    )
+}
+
+/// Classify the source tree at the post-acquire re-probe site.
+///
+/// Mid-wait edit guard: the operator may edit a tracked file in
+/// the source tree DURING our EX wait (long peer build = long
+/// window). `acquired.is_dirty` snapshots clean-at-acquire; a fresh
+/// probe via `inspect_local_source_state` catches edits that landed
+/// during the wait. If dirty/hash-changed, the operator's intent
+/// is "build what's on disk" — skip the cache re-check and fall
+/// through to the build branch, where the post-build dirty re-check
+/// at the cache-store site will recognise the mutation and skip
+/// caching. Probe errors are warnings (not fatal) — same Err
+/// disposition as the post-build re-check.
+/// PreAcquireDirty distinguishes "operator started with a dirty
+/// tree" (the wait wasn't the cause) from "operator dirtied the
+/// tree during the wait" (DirtyEdit). The split keeps the enum
+/// variants honest about cause-attribution per the
+/// [`MidWaitState::diagnostic`] dispatch in [`kernel_build_pipeline`].
+///
+/// TOCTOU acceptance: the source tree can mutate between this
+/// probe and the `cache_lookup` call in the caller — a microsecond
+/// window (typically) where an operator edit, background
+/// autoformatter write, `git commit`, or IDE pre-commit hook would
+/// slip through both this guard AND the post-build dirty re-check at
+/// the cache-store site (the cache-hit return in the caller
+/// short-circuits before `make`, so the post-build re-check never
+/// runs for the racing-into-hit path). Publication-side staleness is
+/// gated by the separate post-build dirty re-check at the cache-store
+/// site; this paragraph is about the consumer-side stale-serving
+/// window only. The cache slot is keyed on `acquired.cache_key`
+/// (frozen at acquire time inside `local_source`), so the served
+/// artifact's identity is the acquire-time HEAD — a mid-window
+/// mutation produces a cache hit that serves a slightly-stale
+/// source state without destroying the operator's later state.
+/// Bounded race; the operator's next invocation re-acquires and
+/// observes the new state.
+///
+/// "Next invocation correct" is NOT a remediation for: single-shot
+/// CI pipelines without retry, `git bisect run` invocations (each
+/// commit is independent), or pipelined CI flows where one job
+/// builds the kernel and a downstream job consumes the cached
+/// image without re-probing the source tree. Operators in those
+/// workflows should treat cache hits as acquire-time-correct, not
+/// invocation-time correct. Holding an EX flock across [probe,
+/// cache_lookup] or re-probing after the lookup were considered
+/// and rejected as adding common-path latency for a microsecond-
+/// wide window.
+fn compute_mid_wait_state(
+    acquired: &crate::fetch::AcquiredSource,
+    source_dir: &Path,
+    is_local_source: bool,
+    cli_label: &str,
+) -> MidWaitState {
+    if is_local_source && !acquired.is_dirty {
+        match crate::fetch::inspect_local_source_state(source_dir) {
+            Ok(post) => {
+                let hash_changed = post.short_hash
+                    != acquired
+                        .kernel_source
+                        .as_local_git_hash()
+                        .map(str::to_string);
+                if post.is_dirty {
+                    MidWaitState::DirtyEdit
+                } else if hash_changed {
+                    MidWaitState::HashAdvanced
+                } else {
+                    MidWaitState::Clean
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    cli_label = cli_label,
+                    err = %format!("{e:#}"),
+                    "mid-wait dirty re-check failed; proceeding to build",
+                );
+                MidWaitState::ProbeFailed
+            }
+        }
+    } else if acquired.is_dirty {
+        MidWaitState::PreAcquireDirty
+    } else {
+        MidWaitState::Clean
+    }
+}
+
+/// Merge the kconfig fragments, reconfigure when stale, then build.
+///
+/// Builds the merged fragment ONCE so the configure call observes
+/// the byte layout `{EMBEDDED_KCONFIG}\n{extra}` (with a `\n`
+/// interleave) defined in [`crate::merge_kconfig_fragments`]. The
+/// helper returns a `Cow<'_, str>` so the no-extras path borrows
+/// `EMBEDDED_KCONFIG` without allocating; only the user-fragment
+/// case heaps the merged string. Unit tests pin the exact
+/// ordering kbuild's last-wins rule operates on.
+///
+/// Reconfigures when any merged-fragment line is missing from the
+/// current `.config`. The prior `has_sched_ext` probe was a proxy for
+/// "configured" — but a stale `.config` from an earlier build can carry
+/// sched_ext while MISSING a changed baked-in value (e.g. an edited
+/// CONFIG_NR_CPUS in ktstr.kconfig) or every user `--extra-kconfig` line,
+/// silently ignoring the edit. `all_fragment_lines_present` checks the
+/// actual merged fragment (exact-line) instead, so an edited baked-in
+/// symbol or a user extra both trigger the merged configure.
+fn reconfigure_and_build(
+    source_dir: &Path,
+    extra_kconfig: Option<&str>,
+    cli_label: &str,
+    make_jobs: Option<usize>,
+) -> Result<()> {
     let merged_fragment = crate::merge_kconfig_fragments(EMBEDDED_KCONFIG, extra_kconfig);
 
-    // Reconfigure when any merged-fragment line is missing from the current
-    // `.config`. The prior `has_sched_ext` probe was a proxy for
-    // "configured" — but a stale `.config` from an earlier build can carry
-    // sched_ext while MISSING a changed baked-in value (e.g. an edited
-    // CONFIG_NR_CPUS in ktstr.kconfig) or every user `--extra-kconfig` line,
-    // silently ignoring the edit. `all_fragment_lines_present` checks the
-    // actual merged fragment (exact-line) instead, so an edited baked-in
-    // symbol or a user extra both trigger the merged configure.
     // Surface a `tracing::warn!` for each user fragment line that
     // overrides a baked-in symbol from `EMBEDDED_KCONFIG`. The build
     // proceeds with the user value winning (last-wins is the design
@@ -657,106 +741,89 @@ pub fn kernel_build_pipeline(
     Spinner::with_progress("Building kernel...", "Kernel built", |sp| {
         make_kernel_with_output(source_dir, Some(sp), make_jobs)
     })?;
+    Ok(())
+}
 
-    // Validate critical config options were not silently disabled.
-    // When `--extra-kconfig` is set, attach an actionable hint
-    // pointing at the user fragment as a likely cause. The most
-    // plausible failure mode is a user override that disables a
-    // baked-in invariant (e.g. a fragment containing
-    // `# CONFIG_BPF is not set` defeats the BPF dep chain), so
-    // name `--extra-kconfig` in the wrap context.
-    validate_kernel_config(source_dir).with_context(|| {
-        if extra_kconfig.is_some() {
-            "post-build kernel config validation failed; check that your \
-             --extra-kconfig fragment does not disable a CONFIG_X required by \
-             ktstr (e.g. CONFIG_BPF, CONFIG_DEBUG_INFO_BTF, CONFIG_FTRACE, \
-             CONFIG_SCHED_CLASS_EXT)"
-                .to_string()
-        } else {
-            "post-build kernel config validation failed".to_string()
-        }
-    })?;
+/// Generate `compile_commands.json` for local trees (LSP support).
+///
+/// The args MUST match `make_kernel_with_output`'s
+/// (`-jN`, `KCFLAGS=-Wno-error`) — otherwise make's "command line
+/// flag changed" detection invalidates the build's object cache
+/// and recompiles every translation unit single-threaded under
+/// the compile_commands.json rule.  Build the same `-jN +
+/// KCFLAGS=-Wno-error` prefix via `build_make_args`, then append
+/// the target.
+fn generate_compile_commands(source_dir: &Path) -> Result<()> {
+    let nproc = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let mut cc_args = build_make_args(nproc);
+    cc_args.push("compile_commands.json".into());
+    let cc_arg_refs: Vec<&str> = cc_args.iter().map(|s| s.as_str()).collect();
+    Spinner::with_progress(
+        "Generating compile_commands.json...",
+        "compile_commands.json generated",
+        |sp| run_make_with_output(source_dir, &cc_arg_refs, Some(sp)),
+    )?;
+    Ok(())
+}
 
-    // Generate compile_commands.json for local trees (LSP support).
-    // The args MUST match `make_kernel_with_output`'s
-    // (`-jN`, `KCFLAGS=-Wno-error`) — otherwise make's "command line
-    // flag changed" detection invalidates the build's object cache
-    // and recompiles every translation unit single-threaded under
-    // the compile_commands.json rule.  Build the same `-jN +
-    // KCFLAGS=-Wno-error` prefix via `build_make_args`, then append
-    // the target.
-    if !acquired.is_temp {
-        let nproc = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1);
-        let mut cc_args = build_make_args(nproc);
-        cc_args.push("compile_commands.json".into());
-        let cc_arg_refs: Vec<&str> = cc_args.iter().map(|s| s.as_str()).collect();
-        Spinner::with_progress(
-            "Generating compile_commands.json...",
-            "compile_commands.json generated",
-            |sp| run_make_with_output(source_dir, &cc_arg_refs, Some(sp)),
-        )?;
-    }
-
-    // Find the built kernel image and vmlinux.
+/// Find the built kernel image and vmlinux. Returns `(image_path,
+/// vmlinux)` where `vmlinux` is `Some` only when `<source_dir>/vmlinux`
+/// exists; emits the operator-facing caching/missing diagnostic.
+fn find_built_image(
+    source_dir: &Path,
+    cli_label: &str,
+) -> Result<(std::path::PathBuf, Option<std::path::PathBuf>)> {
     let image_path = crate::kernel_path::find_image_in_dir(source_dir)
         .ok_or_else(|| anyhow::anyhow!("no kernel image found in {}", source_dir.display()))?;
     let vmlinux_path = source_dir.join("vmlinux");
-    let vmlinux_ref = if vmlinux_path.exists() {
+    let vmlinux_opt = if vmlinux_path.exists() {
         let orig_mib = std::fs::metadata(&vmlinux_path)
             .map(|m| m.len() as f64 / (1024.0 * 1024.0))
             .unwrap_or(0.0);
         eprintln!("{cli_label}: caching vmlinux ({orig_mib:.0} MiB, will be stripped)");
-        Some(vmlinux_path.as_path())
+        Some(vmlinux_path)
     } else {
         eprintln!("{cli_label}: warning: vmlinux not found, BTF will not be cached");
         None
     };
+    Ok((image_path, vmlinux_opt))
+}
 
-    // Cache (skip for dirty local trees).
-    if acquired.is_dirty {
-        eprintln!("{cli_label}: kernel built at {}", image_path.display());
-        // Branch the hint wording: commit/stash is only an actionable
-        // remediation for an actual git repo. A non-git source tree
-        // is force-marked dirty (see `acquire_local_source` in
-        // `fetch.rs`) because dirty detection is impossible, and
-        // telling the operator to "commit or stash" leads nowhere.
-        let hint = dirty_cache_skip_hint(acquired.is_git);
-        eprintln!("{cli_label}: {hint}");
-        return Ok(KernelBuildResult {
-            entry: None,
-            image_path,
-            post_build_is_dirty: true,
-        });
-    }
-
-    // Post-build dirty re-check. `local_source` captures
-    // `is_dirty` ONCE at acquire time. The operator may then edit a
-    // tracked file (`.config` mutation, source patch) DURING the
-    // build window. The acquire-time `is_dirty=false` would say
-    // "safe to cache" but the on-disk content actually built
-    // differs from the HEAD commit recorded in the cache key —
-    // a future cache hit on that key would serve a build that no
-    // longer matches its identity. Re-running the same gix probes
-    // catches the race. On any change (dirty flip OR HEAD-hash
-    // shift from a concurrent commit), skip the cache store and
-    // emit a one-liner explaining why the cache slot was passed
-    // over.
-    //
-    // Errors from the re-check are surfaced as a warning rather
-    // than a hard fail — the build itself succeeded; refusing to
-    // store on a re-check probe failure would penalize an
-    // otherwise-clean run for a transient gix glitch. The cache
-    // store proceeds with the original key, on the same
-    // pessimistic basis as a tree the re-check could not classify.
+/// Post-build dirty re-check. Returns `Some(result)` when the cache
+/// store must be skipped because the source tree changed during the
+/// build; `None` (proceed to store) otherwise.
+///
+/// `local_source` captures `is_dirty` ONCE at acquire time. The
+/// operator may then edit a tracked file (`.config` mutation, source
+/// patch) DURING the build window. The acquire-time `is_dirty=false`
+/// would say "safe to cache" but the on-disk content actually built
+/// differs from the HEAD commit recorded in the cache key — a future
+/// cache hit on that key would serve a build that no longer matches
+/// its identity. Re-running the same gix probes catches the race. On
+/// any change (dirty flip OR HEAD-hash shift from a concurrent
+/// commit), skip the cache store and emit a one-liner explaining why
+/// the cache slot was passed over.
+///
+/// Errors from the re-check are surfaced as a warning rather than a
+/// hard fail — the build itself succeeded; refusing to store on a
+/// re-check probe failure would penalize an otherwise-clean run for a
+/// transient gix glitch. The cache store proceeds with the original
+/// key, on the same pessimistic basis as a tree the re-check could not
+/// classify.
+fn post_build_dirty_skip(
+    acquired: &crate::fetch::AcquiredSource,
+    source_dir: &Path,
+    is_local_source: bool,
+    image_path: &Path,
+    cli_label: &str,
+) -> Option<KernelBuildResult> {
     if is_local_source {
         match crate::fetch::inspect_local_source_state(source_dir) {
             Ok(post) => {
-                let (skip, hash_changed) = post_build_cache_store_skip(
-                    &post,
-                    acquired.kernel_source.as_local_git_hash(),
-                );
+                let (skip, hash_changed) =
+                    post_build_cache_store_skip(&post, acquired.kernel_source.as_local_git_hash());
                 if skip {
                     eprintln!(
                         "{cli_label}: source tree changed during build \
@@ -766,9 +833,9 @@ pub fn kernel_build_pipeline(
                          the working tree settles to populate the cache.",
                         acquired.is_dirty, post.is_dirty,
                     );
-                    return Ok(KernelBuildResult {
+                    return Some(KernelBuildResult {
                         entry: None,
-                        image_path,
+                        image_path: image_path.to_path_buf(),
                         // Mid-build mutation flips the run's
                         // reproducibility — the cache key recorded at
                         // acquire time no longer identifies the actual
@@ -788,7 +855,31 @@ pub fn kernel_build_pipeline(
             }
         }
     }
+    None
+}
 
+/// Build the kernel metadata + artifact set, store to cache, and
+/// return the clean (non-dirty) [`KernelBuildResult`].
+///
+/// `too_many_arguments` allow: the cache-store tail threads the
+/// acquire-time inputs (`acquired`, `arch`, `image_name`,
+/// `extra_kconfig`, `is_local_source`) plus the build outputs
+/// (`source_dir`, `image_path`, `vmlinux_ref`) the metadata records;
+/// bundling them into a struct would add indirection without
+/// changing the data flow.
+#[allow(clippy::too_many_arguments)]
+fn build_metadata_and_store(
+    acquired: &crate::fetch::AcquiredSource,
+    cache: &crate::cache::CacheDir,
+    cli_label: &str,
+    is_local_source: bool,
+    arch: &str,
+    image_name: &str,
+    extra_kconfig: Option<&str>,
+    source_dir: &Path,
+    image_path: std::path::PathBuf,
+    vmlinux_ref: Option<&Path>,
+) -> Result<KernelBuildResult> {
     let config_hash = config_hash_for(source_dir)?;
 
     // Two-segment metadata: the bare baked-in hash stays in
