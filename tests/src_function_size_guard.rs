@@ -218,7 +218,6 @@ const EXCEPTIONS: &[(&str, &str, usize)] = &[
         "maybe_dispatch_vm_test_with_phase_a",
         247,
     ), // queued: decompose
-    ("topology.rs", "TestTopology::from_system", 228),            // queued: decompose
     ("vmm/builder.rs", "KtstrVmBuilder::build", 354),             // queued: decompose
     (
         "vmm/cast_analysis_load/mod.rs",
