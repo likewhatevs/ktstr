@@ -446,7 +446,7 @@ fn resolve_one_with_progress(
 ) -> Result<(String, PathBuf), String> {
     let result = resolve_one(id);
     if let Ok((label, _)) = &result {
-        tracing::debug!("cargo ktstr: resolved kernel {label:?}");
+        eprintln!("cargo ktstr: resolved kernel {label:?}");
     }
     result
 }
