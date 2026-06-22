@@ -726,14 +726,10 @@ fn required_controllers(
     set
 }
 
-/// Internal driver: runs Backdrop setup, the Step loop with
-/// per-Step teardown, and final Backdrop teardown.
-fn run_scenario(
-    ctx: &Ctx,
-    backdrop: backdrop::Backdrop,
-    steps: Vec<Step>,
-    checks: Option<&crate::assert::Assert>,
-) -> Result<AssertResult> {
+/// Validate every step hold spec and reject scheduler-kind Backdrop
+/// payloads up front so failures surface at the declaration, before
+/// any runtime state is created.
+fn validate_scenario_inputs(backdrop: &backdrop::Backdrop, steps: &[Step]) -> Result<()> {
     // Validate every step's hold spec up front so a typo doesn't
     // reach `Duration::from_secs_f64(NaN)` / `thread::sleep(ZERO)` /
     // a no-yield Loop busy-wait after ops have already been applied.
@@ -776,6 +772,302 @@ fn run_scenario(
             );
         }
     }
+    Ok(())
+}
+
+/// Guest-side gate that blocks until the host's queued BPF map writes
+/// land, so the workload phase observes fresh map values.
+fn wait_for_host_map_write(ctx: &Ctx) {
+    // When a host-side BPF map write is configured the test framework
+    // sets `wait_for_map_write=true`; in that case block until the
+    // guest's `hvc0_poll_loop` observes
+    // [`crate::vmm::virtio_console::SIGNAL_BPF_WRITE_DONE`] (pushed by
+    // the host's `bpf-map-write` thread after every queued
+    // `bpf_map_write` lands) and fires the `bpf_map_write_done` latch.
+    // Without this gate the workload phase races against the host's
+    // map writes and may observe a stale BPF map value.
+    //
+    // Guest-only path. On the host (unit tests) the latch is never
+    // armed, so we skip the wait entirely. The 60 s timeout matches
+    // the bpf-map-write thread's combined phase 1 + phase 2 budget
+    // (30 s accessor init + 30 s map discovery in
+    // `freeze_coord::start_bpf_map_write`); a real timeout means the
+    // host failed to resolve a map. The scenario continues anyway
+    // (rather than `bail!`) because the legacy rendezvous also let
+    // the guest proceed under its own timeout, and a bail here would
+    // mask the underlying host-side resolution failure with a
+    // test-side `Err`.
+    if ctx.wait_for_map_write && guest_comms::is_guest() {
+        let latch = crate::vmm::rust_init::bpf_map_write_done_latch();
+        if !latch.wait_timeout(Duration::from_secs(60)) {
+            tracing::warn!(
+                "wait_for_map_write timed out after 60s — host bpf-map-write \
+                 thread may have failed to resolve a queued map; proceeding \
+                 with the workload regardless"
+            );
+        }
+    }
+}
+
+/// Run persistent Backdrop setup. `Ok(None)` on success; `Ok(Some(r))`
+/// carries the failure AssertResult when setup errors so the caller
+/// returns it directly.
+fn run_backdrop_setup<'a>(
+    ctx: &'a Ctx,
+    backdrop: &backdrop::Backdrop,
+    backdrop_state: &mut BackdropState<'a>,
+    effective_checks: &crate::assert::Assert,
+    result: &AssertResult,
+) -> Result<Option<AssertResult>> {
+    // --- Backdrop setup (persistent) ---
+    // Run before the first Step. Cgroups + payloads declared on
+    // `backdrop` land in `backdrop_state` so they survive every
+    // Step's teardown. On error, drain Backdrop payload handles
+    // (metric emission) and propagate.
+    if backdrop.is_empty() {
+        return Ok(None);
+    }
+    let mut step_staging = StepState::empty(ctx);
+    let mut scratch = ScenarioState::new(&mut step_staging, backdrop_state);
+    let setup_res = scratch.with_target_backdrop(|s| {
+        // Order: cgroups → ops → payloads. CgroupDefs go first so
+        // a later `Op::add_cgroup` / `Op::run_payload_in_cgroup`
+        // can target cgroups that `apply_setup` just created.
+        // Payloads spawn last so `run_payload` resolving a cgroup
+        // placement lands inside a cgroup that either apply pass
+        // already built.
+        if !backdrop.cgroups.is_empty() {
+            apply_setup(ctx, s, &backdrop.cgroups)?;
+        }
+        // Raw ops: typically `Op::AddCgroup` for empty move-target
+        // cgroups (can't be expressed via CgroupDef because
+        // apply_setup forces a worker spawn), or placement-aware
+        // `Op::RunPayload` targeting a just-created backdrop
+        // cgroup.
+        if !backdrop.ops.is_empty() {
+            apply_ops(ctx, s, &backdrop.ops, false)?;
+        }
+        // Shorthand payloads: one Op::RunPayload per entry,
+        // inherited cgroup placement.
+        if !backdrop.payloads.is_empty() {
+            let ops: Vec<Op> = backdrop
+                .payloads
+                .iter()
+                .map(|p| Op::run_payload(p, Vec::<String>::new()))
+                .collect();
+            apply_ops(ctx, s, &ops, false)?;
+        }
+        Ok::<(), anyhow::Error>(())
+    });
+    if let Err(err) = setup_res {
+        // Scheduler crashed during backdrop setup (e.g. a worker
+        // tripped the BPF error before the first Step): SIGKILL the
+        // spawned workers up front so the collect reaps below aren't
+        // scheduling-gated behind fallback workers (see
+        // `sigkill_handles`). Gated on `scx_down` (crash-only) so a
+        // non-crash setup error keeps the graceful collect path.
+        if sched_crashed_unexpectedly() {
+            sigkill_handles(&backdrop_state.handles);
+            sigkill_handles(&step_staging.handles);
+        }
+        // Collect any workers that DID spawn before the failure
+        // so their stats reach the final result instead of being
+        // discarded by `WorkloadHandle::drop` (which SIGKILLs
+        // without gathering scheduler-side data). `collect_*`
+        // drain `payload_handles` internally, so the backdrop-
+        // and step-side payloads still get `.kill()` (SHM metric
+        // emission) on the error path.
+        //
+        // `with_target_backdrop` routes every target writer to
+        // the backdrop slot, so `step_staging` normally holds
+        // nothing — but collect defensively so a partial-failure
+        // path that leaks a non-backdrop write surfaces here
+        // rather than disappearing into `StepState::drop`.
+        let mut r = collect_backdrop(backdrop_state, effective_checks, ctx.topo, ctx.cgroups);
+        let staging_result = collect_step(
+            &mut step_staging,
+            effective_checks,
+            ctx.topo,
+            ctx.cgroups,
+            // Defensive backdrop-staging collect: no step attribution.
+            None,
+        );
+        r.merge(staging_result);
+        r.merge(result.clone());
+        // step_staging's CgroupGroup RAII still drops here,
+        // removing any cgroups the failed Backdrop setup routed
+        // into step-local state.
+        r.record_fail(crate::assert::AssertDetail::new(
+            crate::assert::DetailKind::Other,
+            format!("Backdrop setup failed: {err:#}"),
+        ));
+        return Ok(Some(r));
+    }
+    // `step_staging` should not have accumulated anything
+    // because `with_target_backdrop` routed every target writer
+    // to the backdrop side. Collect any stray handles defensively
+    // before dropping so a future refactor that leaks a non-
+    // backdrop write here surfaces as a missed teardown rather
+    // than silently discarded state.
+    drain_all_payload_handles(&mut step_staging.payload_handles);
+    Ok(None)
+}
+
+/// 1-indexed phase number for scenario Step `step_idx` (BASELINE=0,
+/// Step k -> k+1), saturating at `u16::MAX` past the encoding range.
+fn phase_step_index(step_idx: usize) -> u16 {
+    u16::try_from(step_idx)
+        .ok()
+        .and_then(|i| i.checked_add(1))
+        .unwrap_or(u16::MAX)
+}
+
+/// Build the inter-step scheduler-death failure result: collect
+/// backdrop workers, merge the accumulated result, record the
+/// `format_sched_died_after_step` detail.
+fn build_sched_died_after_step(
+    backdrop_state: &mut BackdropState<'_>,
+    result: AssertResult,
+    ctx: &Ctx,
+    effective_checks: &crate::assert::Assert,
+    step_idx: usize,
+    steps_len: usize,
+    scenario_start: std::time::Instant,
+) -> AssertResult {
+    // Collect backdrop-owned workload handles into the
+    // result before reporting the crash so whatever the
+    // persistent workers produced is still assertable.
+    let mut r = collect_backdrop(backdrop_state, effective_checks, ctx.topo, ctx.cgroups);
+    r.merge(result);
+    r.record_fail(crate::assert::AssertDetail::new(
+        sched_died_detail_kind(),
+        crate::assert::format_sched_died_after_step(
+            step_idx,
+            steps_len,
+            scenario_start.elapsed().as_secs_f64(),
+        ),
+    ));
+    r
+}
+
+/// Build the step-error failure result: collect backdrop workers,
+/// merge the accumulated result, record the `step N failed` detail.
+fn build_step_failed(
+    backdrop_state: &mut BackdropState<'_>,
+    result: AssertResult,
+    ctx: &Ctx,
+    effective_checks: &crate::assert::Assert,
+    step_idx: usize,
+    err: &anyhow::Error,
+) -> AssertResult {
+    // Collect Backdrop-owned workload handles into a fresh
+    // result first, then merge the accumulated step result
+    // on top. `collect_backdrop` drains
+    // `backdrop_state.payload_handles` internally, so the
+    // backdrop-side payloads still get `.kill()` (metric
+    // emission) on the error path. Ordering mirrors the
+    // scheduler-crash path above so detail order is
+    // consistent across both Ok(failed) returns.
+    let mut r = collect_backdrop(backdrop_state, effective_checks, ctx.topo, ctx.cgroups);
+    r.merge(result);
+    r.record_fail(crate::assert::AssertDetail::new(
+        crate::assert::DetailKind::Other,
+        format!("step {step_idx} failed: {err:#}"),
+    ));
+    r
+}
+
+/// Build the sched-died-during-hold failure result: collect backdrop
+/// workers, merge the accumulated result, record the
+/// `format_sched_died_during_workload` detail.
+fn build_sched_died_during_hold(
+    backdrop_state: &mut BackdropState<'_>,
+    result: AssertResult,
+    ctx: &Ctx,
+    effective_checks: &crate::assert::Assert,
+    scenario_start: std::time::Instant,
+) -> AssertResult {
+    let mut r = collect_backdrop(backdrop_state, effective_checks, ctx.topo, ctx.cgroups);
+    r.merge(result);
+    r.record_fail(crate::assert::AssertDetail::new(
+        sched_died_detail_kind(),
+        crate::assert::format_sched_died_during_workload(scenario_start.elapsed().as_secs_f64()),
+    ));
+    r
+}
+
+/// Emit the ScenarioEnd marker, run the final liveness check, tear the
+/// Backdrop down, and fold in a sched-died detail when the scheduler
+/// died after the last hold.
+fn finish_scenario(
+    ctx: &Ctx,
+    backdrop_state: &mut BackdropState<'_>,
+    effective_checks: &crate::assert::Assert,
+    scenario_start: std::time::Instant,
+    steps_len: usize,
+    final_total_iterations: Option<(u64, u64)>,
+    mut result: AssertResult,
+) -> AssertResult {
+    // ScenarioEnd marker. Routes through `send_scenario_end`
+    // (virtio-console port-1 with COM2 fallback for early-boot).
+    // Carries the last cleanly-completed step's COINCIDENT (elapsed_ms,
+    // iterations) pair so the host can give the last step an
+    // `iteration_rate` over a well-formed window. The elapsed
+    // is the end-of-hold timestamp captured WITH the count inside
+    // run_step — NOT recomputed here, which would include the
+    // pause+collect teardown wall-time and under-report the rate. When
+    // no step completed a hold (e.g. every step's scheduler died) the
+    // pair is `None`: fall back to (now, 0), which the host skips
+    // (0 baseline / e<=s).
+    if guest_comms::is_guest() {
+        let (end_elapsed_ms, end_iterations) = final_total_iterations
+            .unwrap_or_else(|| (scenario_start.elapsed().as_millis() as u64, 0));
+        crate::vmm::guest_comms::send_scenario_end(end_elapsed_ms, end_iterations);
+    }
+
+    // Final liveness check. Live `crate::vmm::rust_init::sched_pid()`
+    // read instead of `ctx.sched_pid` snapshot so a mid-scenario
+    // Op::ReplaceScheduler swap reflects the new pid here too.
+    // sched_pid() == None ⇒ no scheduler configured (kernel-default
+    // path) OR Op::DetachScheduler cleared it; no liveness to
+    // report on either case.
+    let sched_dead = crate::vmm::rust_init::sched_pid()
+        .is_some_and(|pid| !process_alive(pid) || dispatch::scx_down());
+
+    // Scheduler died after the last hold: SIGKILL the backdrop
+    // workers up front so the teardown reap below isn't
+    // scheduling-gated behind still-spinning workers that fell back
+    // to the builtin scheduler (see `sigkill_handles`).
+    if sched_dead {
+        sigkill_handles(&backdrop_state.handles);
+    }
+
+    // --- Backdrop teardown ---
+    let backdrop_result = collect_backdrop(backdrop_state, effective_checks, ctx.topo, ctx.cgroups);
+    result.merge(backdrop_result);
+
+    if sched_dead {
+        result.record_fail(crate::assert::AssertDetail::new(
+            sched_died_detail_kind(),
+            crate::assert::format_sched_died_after_all_steps(
+                steps_len,
+                scenario_start.elapsed().as_secs_f64(),
+            ),
+        ));
+    }
+
+    result
+}
+
+/// Internal driver: runs Backdrop setup, the Step loop with
+/// per-Step teardown, and final Backdrop teardown.
+fn run_scenario(
+    ctx: &Ctx,
+    backdrop: backdrop::Backdrop,
+    steps: Vec<Step>,
+    checks: Option<&crate::assert::Assert>,
+) -> Result<AssertResult> {
+    validate_scenario_inputs(&backdrop, &steps)?;
     let effective_checks = checks.unwrap_or(&ctx.assert);
 
     // Enable the controllers this scenario actually needs in
@@ -809,126 +1101,12 @@ fn run_scenario(
         crate::vmm::guest_comms::send_scenario_start();
     }
 
-    // When a host-side BPF map write is configured the test framework
-    // sets `wait_for_map_write=true`; in that case block until the
-    // guest's `hvc0_poll_loop` observes
-    // [`crate::vmm::virtio_console::SIGNAL_BPF_WRITE_DONE`] (pushed by
-    // the host's `bpf-map-write` thread after every queued
-    // `bpf_map_write` lands) and fires the `bpf_map_write_done` latch.
-    // Without this gate the workload phase races against the host's
-    // map writes and may observe a stale BPF map value.
-    //
-    // Guest-only path. On the host (unit tests) the latch is never
-    // armed, so we skip the wait entirely. The 60 s timeout matches
-    // the bpf-map-write thread's combined phase 1 + phase 2 budget
-    // (30 s accessor init + 30 s map discovery in
-    // `freeze_coord::start_bpf_map_write`); a real timeout means the
-    // host failed to resolve a map. The scenario continues anyway
-    // (rather than `bail!`) because the legacy rendezvous also let
-    // the guest proceed under its own timeout, and a bail here would
-    // mask the underlying host-side resolution failure with a
-    // test-side `Err`.
-    if ctx.wait_for_map_write && guest_comms::is_guest() {
-        let latch = crate::vmm::rust_init::bpf_map_write_done_latch();
-        if !latch.wait_timeout(Duration::from_secs(60)) {
-            tracing::warn!(
-                "wait_for_map_write timed out after 60s — host bpf-map-write \
-                 thread may have failed to resolve a queued map; proceeding \
-                 with the workload regardless"
-            );
-        }
-    }
+    wait_for_host_map_write(ctx);
 
-    // --- Backdrop setup (persistent) ---
-    // Run before the first Step. Cgroups + payloads declared on
-    // `backdrop` land in `backdrop_state` so they survive every
-    // Step's teardown. On error, drain Backdrop payload handles
-    // (metric emission) and propagate.
-    if !backdrop.is_empty() {
-        let mut step_staging = StepState::empty(ctx);
-        let mut scratch = ScenarioState::new(&mut step_staging, &mut backdrop_state);
-        let setup_res = scratch.with_target_backdrop(|s| {
-            // Order: cgroups → ops → payloads. CgroupDefs go first so
-            // a later `Op::add_cgroup` / `Op::run_payload_in_cgroup`
-            // can target cgroups that `apply_setup` just created.
-            // Payloads spawn last so `run_payload` resolving a cgroup
-            // placement lands inside a cgroup that either apply pass
-            // already built.
-            if !backdrop.cgroups.is_empty() {
-                apply_setup(ctx, s, &backdrop.cgroups)?;
-            }
-            // Raw ops: typically `Op::AddCgroup` for empty move-target
-            // cgroups (can't be expressed via CgroupDef because
-            // apply_setup forces a worker spawn), or placement-aware
-            // `Op::RunPayload` targeting a just-created backdrop
-            // cgroup.
-            if !backdrop.ops.is_empty() {
-                apply_ops(ctx, s, &backdrop.ops, false)?;
-            }
-            // Shorthand payloads: one Op::RunPayload per entry,
-            // inherited cgroup placement.
-            if !backdrop.payloads.is_empty() {
-                let ops: Vec<Op> = backdrop
-                    .payloads
-                    .iter()
-                    .map(|p| Op::run_payload(p, Vec::<String>::new()))
-                    .collect();
-                apply_ops(ctx, s, &ops, false)?;
-            }
-            Ok::<(), anyhow::Error>(())
-        });
-        if let Err(err) = setup_res {
-            // Scheduler crashed during backdrop setup (e.g. a worker
-            // tripped the BPF error before the first Step): SIGKILL the
-            // spawned workers up front so the collect reaps below aren't
-            // scheduling-gated behind fallback workers (see
-            // `sigkill_handles`). Gated on `scx_down` (crash-only) so a
-            // non-crash setup error keeps the graceful collect path.
-            if sched_crashed_unexpectedly() {
-                sigkill_handles(&backdrop_state.handles);
-                sigkill_handles(&step_staging.handles);
-            }
-            // Collect any workers that DID spawn before the failure
-            // so their stats reach the final result instead of being
-            // discarded by `WorkloadHandle::drop` (which SIGKILLs
-            // without gathering scheduler-side data). `collect_*`
-            // drain `payload_handles` internally, so the backdrop-
-            // and step-side payloads still get `.kill()` (SHM metric
-            // emission) on the error path.
-            //
-            // `with_target_backdrop` routes every target writer to
-            // the backdrop slot, so `step_staging` normally holds
-            // nothing — but collect defensively so a partial-failure
-            // path that leaks a non-backdrop write surfaces here
-            // rather than disappearing into `StepState::drop`.
-            let mut r =
-                collect_backdrop(&mut backdrop_state, effective_checks, ctx.topo, ctx.cgroups);
-            let staging_result = collect_step(
-                &mut step_staging,
-                effective_checks,
-                ctx.topo,
-                ctx.cgroups,
-                // Defensive backdrop-staging collect: no step attribution.
-                None,
-            );
-            r.merge(staging_result);
-            r.merge(result);
-            // step_staging's CgroupGroup RAII still drops here,
-            // removing any cgroups the failed Backdrop setup routed
-            // into step-local state.
-            r.record_fail(crate::assert::AssertDetail::new(
-                crate::assert::DetailKind::Other,
-                format!("Backdrop setup failed: {err:#}"),
-            ));
-            return Ok(r);
-        }
-        // `step_staging` should not have accumulated anything
-        // because `with_target_backdrop` routed every target writer
-        // to the backdrop side. Collect any stray handles defensively
-        // before dropping so a future refactor that leaks a non-
-        // backdrop write here surfaces as a missed teardown rather
-        // than silently discarded state.
-        drain_all_payload_handles(&mut step_staging.payload_handles);
+    if let Some(r) =
+        run_backdrop_setup(ctx, &backdrop, &mut backdrop_state, effective_checks, &result)?
+    {
+        return Ok(r);
     }
 
     // --- Step loop with per-Step teardown ---
@@ -953,21 +1131,15 @@ fn run_scenario(
             // collect reap below isn't scheduling-gated behind
             // still-spinning workers (see `sigkill_handles`).
             sigkill_handles(&backdrop_state.handles);
-            // Collect backdrop-owned workload handles into the
-            // result before reporting the crash so whatever the
-            // persistent workers produced is still assertable.
-            let mut r =
-                collect_backdrop(&mut backdrop_state, effective_checks, ctx.topo, ctx.cgroups);
-            r.merge(result);
-            r.record_fail(crate::assert::AssertDetail::new(
-                sched_died_detail_kind(),
-                crate::assert::format_sched_died_after_step(
-                    step_idx,
-                    steps.len(),
-                    scenario_start.elapsed().as_secs_f64(),
-                ),
+            return Ok(build_sched_died_after_step(
+                &mut backdrop_state,
+                result,
+                ctx,
+                effective_checks,
+                step_idx,
+                steps.len(),
+                scenario_start,
             ));
-            return Ok(r);
         }
 
         let mut step_state = StepState::empty(ctx);
@@ -982,10 +1154,7 @@ fn run_scenario(
         // `Acquire` load so a sample stamped with this value
         // happens-after any state the Step has set up before
         // calling run_step.
-        let phase_step_index = u16::try_from(step_idx)
-            .ok()
-            .and_then(|i| i.checked_add(1))
-            .unwrap_or(u16::MAX);
+        let phase_step_index = phase_step_index(step_idx);
         ctx.current_step
             .store(phase_step_index, std::sync::atomic::Ordering::Release);
         // Install the assert-side phase guard for the scenario
@@ -1056,22 +1225,14 @@ fn run_scenario(
             if sched_crashed_unexpectedly() {
                 sigkill_handles(&backdrop_state.handles);
             }
-            // Collect Backdrop-owned workload handles into a fresh
-            // result first, then merge the accumulated step result
-            // on top. `collect_backdrop` drains
-            // `backdrop_state.payload_handles` internally, so the
-            // backdrop-side payloads still get `.kill()` (metric
-            // emission) on the error path. Ordering mirrors the
-            // scheduler-crash path above so detail order is
-            // consistent across both Ok(failed) returns.
-            let mut r =
-                collect_backdrop(&mut backdrop_state, effective_checks, ctx.topo, ctx.cgroups);
-            r.merge(result);
-            r.record_fail(crate::assert::AssertDetail::new(
-                crate::assert::DetailKind::Other,
-                format!("step {step_idx} failed: {err:#}"),
+            return Ok(build_step_failed(
+                &mut backdrop_state,
+                result,
+                ctx,
+                effective_checks,
+                step_idx,
+                &err,
             ));
-            return Ok(r);
         }
 
         // Scheduler exited during the step's hold-period sleep —
@@ -1083,69 +1244,25 @@ fn run_scenario(
         // time. Same Backdrop-then-step merge order as the
         // inter-step path above so detail ordering stays consistent.
         if sched_died_during_hold {
-            let mut r =
-                collect_backdrop(&mut backdrop_state, effective_checks, ctx.topo, ctx.cgroups);
-            r.merge(result);
-            r.record_fail(crate::assert::AssertDetail::new(
-                sched_died_detail_kind(),
-                crate::assert::format_sched_died_during_workload(
-                    scenario_start.elapsed().as_secs_f64(),
-                ),
+            return Ok(build_sched_died_during_hold(
+                &mut backdrop_state,
+                result,
+                ctx,
+                effective_checks,
+                scenario_start,
             ));
-            return Ok(r);
         }
     }
 
-    // ScenarioEnd marker. Routes through `send_scenario_end`
-    // (virtio-console port-1 with COM2 fallback for early-boot).
-    // Carries the last cleanly-completed step's COINCIDENT (elapsed_ms,
-    // iterations) pair so the host can give the last step an
-    // `iteration_rate` over a well-formed window. The elapsed
-    // is the end-of-hold timestamp captured WITH the count inside
-    // run_step — NOT recomputed here, which would include the
-    // pause+collect teardown wall-time and under-report the rate. When
-    // no step completed a hold (e.g. every step's scheduler died) the
-    // pair is `None`: fall back to (now, 0), which the host skips
-    // (0 baseline / e<=s).
-    if guest_comms::is_guest() {
-        let (end_elapsed_ms, end_iterations) = final_total_iterations
-            .unwrap_or_else(|| (scenario_start.elapsed().as_millis() as u64, 0));
-        crate::vmm::guest_comms::send_scenario_end(end_elapsed_ms, end_iterations);
-    }
-
-    // Final liveness check. Live `crate::vmm::rust_init::sched_pid()`
-    // read instead of `ctx.sched_pid` snapshot so a mid-scenario
-    // Op::ReplaceScheduler swap reflects the new pid here too.
-    // sched_pid() == None ⇒ no scheduler configured (kernel-default
-    // path) OR Op::DetachScheduler cleared it; no liveness to
-    // report on either case.
-    let sched_dead = crate::vmm::rust_init::sched_pid()
-        .is_some_and(|pid| !process_alive(pid) || dispatch::scx_down());
-
-    // Scheduler died after the last hold: SIGKILL the backdrop
-    // workers up front so the teardown reap below isn't
-    // scheduling-gated behind still-spinning workers that fell back
-    // to the builtin scheduler (see `sigkill_handles`).
-    if sched_dead {
-        sigkill_handles(&backdrop_state.handles);
-    }
-
-    // --- Backdrop teardown ---
-    let backdrop_result =
-        collect_backdrop(&mut backdrop_state, effective_checks, ctx.topo, ctx.cgroups);
-    result.merge(backdrop_result);
-
-    if sched_dead {
-        result.record_fail(crate::assert::AssertDetail::new(
-            sched_died_detail_kind(),
-            crate::assert::format_sched_died_after_all_steps(
-                steps.len(),
-                scenario_start.elapsed().as_secs_f64(),
-            ),
-        ));
-    }
-
-    Ok(result)
+    Ok(finish_scenario(
+        ctx,
+        &mut backdrop_state,
+        effective_checks,
+        scenario_start,
+        steps.len(),
+        final_total_iterations,
+        result,
+    ))
 }
 
 /// Sleep up to `dur`, returning early if `sched_pid` exits.

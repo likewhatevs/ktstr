@@ -153,7 +153,6 @@ const EXCEPTIONS: &[(&str, &str, usize)] = &[
     ("probe/output.rs", "format_probe_events_inner", 330),        // queued: decompose
     ("probe/process.rs", "attach_phase_b_fentry", 494),           // queued: decompose
     ("probe/process.rs", "run_probe_skeleton", 1295),             // queued: decompose
-    ("scenario/ops/mod.rs", "run_scenario", 414),                 // queued: decompose
     ("test_support/entry.rs", "KtstrTestEntry::validate", 338),   // queued: decompose
     ("test_support/eval/mod.rs", "evaluate_vm_result", 765),      // queued: decompose
     (
