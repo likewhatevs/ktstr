@@ -198,11 +198,6 @@ const EXCEPTIONS: &[(&str, &str, usize)] = &[
     ), // queued: decompose
     ("vmm/virtio_blk/drain.rs", "drain_bracket_impl", 1197),      // queued: decompose
     ("vmm/virtio_blk/worker.rs", "worker_thread_main", 515),      // queued: decompose
-    (
-        "vmm/virtio_net/device.rs",
-        "VirtioNet::process_tx_loopback",
-        291,
-    ), // queued: decompose
     ("workload/spawn/mod.rs", "WorkloadHandle::spawn", 232),      // queued: decompose
     ("workload/spawn/mod.rs", "WorkloadHandle::spawn_group", 959), // queued: decompose
     (

@@ -667,141 +667,19 @@ impl VirtioNet {
                 // count we use for rx_bytes (truncation vs full),
                 // and the TX add_used at the end of this iteration
                 // determines whether tx_packets bumps at all.
-                match self.try_loopback_to_rx(mem, len) {
-                    LoopbackOutcome::Delivered { l2_bytes_written } => {
-                        // RX add_used Ok, used-ring advanced.
-                        // `l2_bytes_written` reflects actual bytes
-                        // the guest can read past the virtio
-                        // header — on a too-small RX buffer this
-                        // is < the source `len`, so rx_bytes never
-                        // overstates delivery.
-                        self.counters.record_rx_delivered(l2_bytes_written);
-                        had_used_ring_publish = true;
-                    }
-                    LoopbackOutcome::DeliveredButAddUsedFailed => {
-                        // Header + frame DID land in the descriptor
-                        // but the trailing `add_used` failed.
-                        // `rx_add_used_failures` was bumped inside
-                        // `try_loopback_to_rx`. Do NOT bump
-                        // rx_packets (guest never observes the
-                        // publish) and do NOT mark the used-ring as
-                        // advanced (it didn't). Do NOT poison the
-                        // queue — add_used failure is a transient
-                        // used-ring GPA mapping issue, not a
-                        // structural avail.idx violation. Continue
-                        // the drain; TX `add_used` below still
-                        // completes for this chain.
-                    }
-                    LoopbackOutcome::RxAlreadyPoisoned => {
-                        // Already-poisoned RX queue (re-kick after
-                        // a prior poison, OR a prior iteration of
-                        // this drain already triggered the
-                        // false→true transition for RX). Drop the
-                        // captured frame and record the drop. Do NOT
-                        // re-bump `invalid_avail_idx_count` (the
-                        // poison event was already counted on its
-                        // false→true transition) and do NOT re-fire
-                        // the signal. TX add_used below still runs,
-                        // so `tx_packets` still bumps for this chain.
-                        self.counters.record_tx_dropped_rx_poisoned();
-                    }
-                    LoopbackOutcome::JustRxPoisoned => {
-                        // RX-side `iter()` first-time error.
-                        // `try_loopback_to_rx` performed the
-                        // false→true RX poison transition, bumped
-                        // `invalid_avail_idx_count`, and set
-                        // `queue_poisoned[RXQ] = true`. The
-                        // TX-captured frame is dropped (nothing to
-                        // deliver into) — record the drop. TX
-                        // add_used below still runs so the in-flight
-                        // TX request doesn't hang (and `tx_packets`
-                        // still bumps). RX poison signal is fired
-                        // post-loop after the used-ring kick.
-                        self.counters.record_tx_dropped_rx_poisoned();
-                        rx_just_poisoned = true;
-                    }
-                    LoopbackOutcome::NoRxBuffer => {
-                        // No chain popped — the RX queue was empty
-                        // or not ready. The TX-captured frame is
-                        // dropped on the floor.
-                        self.counters.record_tx_dropped_no_rx_buffer();
-                    }
-                    LoopbackOutcome::RxChainInvalid { add_used_ok } => {
-                        // Chain rejected during the descriptor walk.
-                        // Exactly one of `rx_chain_invalid`
-                        // (chain-shape: read-only descriptor or
-                        // address overflow on the descriptor's GPA)
-                        // or `rx_write_failed` (chain shape OK but
-                        // a guest-memory `write_slice` hit an
-                        // unmapped GPA mid-walk) was bumped inside
-                        // `try_loopback_to_rx`; the two are
-                        // mutually exclusive per chain. Whether the
-                        // used-ring advanced depends on whether the
-                        // recycle-add_used succeeded; if it did,
-                        // the guest's NAPI must wake to see the
-                        // empty completion (otherwise the buffer
-                        // sits unrecycled until a virtio reset).
-                        // Recycle-add_used failure is NOT a poison
-                        // event — that's a transient used-ring GPA
-                        // issue, not a structural avail.idx
-                        // violation. `rx_add_used_failures` was
-                        // bumped inside the helper for visibility.
-                        if add_used_ok {
-                            had_used_ring_publish = true;
-                        }
-                    }
-                }
+                let outcome = self.try_loopback_to_rx(mem, len);
+                self.handle_rx_loopback_outcome(
+                    outcome,
+                    &mut had_used_ring_publish,
+                    &mut rx_just_poisoned,
+                );
             }
             // else: chain was malformed and tx_chain_invalid was
             // already bumped inside `pop_and_capture_tx`. Neither
             // `tx_packets` nor `rx_packets` advances on this path.
             // Still mark used so the guest doesn't hang.
 
-            // Mark the TX chain used. TX descriptors are
-            // device-readable, so used_len is 0 — the device wrote
-            // nothing back to guest memory on the TX side, and
-            // virtio-v1.2 §2.7.8.2 counts only device-WRITABLE bytes in
-            // used.len. (Reference divergence: cloud-hypervisor passes
-            // the bytes written to its tap as the TX used.len — a
-            // bytes-read value the spec does not sanction; the guest's
-            // virtnet driver ignores TX used.len so both work in
-            // practice, but 0 is the spec-correct value for a wholly
-            // device-readable chain.) tx_packets is bumped ONLY on TX
-            // add_used success — calling `record_tx_completed` before
-            // this point would let the counter lie if the publish fails
-            // (the guest never sees the completion). Failed TX add_used
-            // bumps `tx_add_used_failures` instead, keeping the
-            // per-event counter taxonomy 1:1 with observable events.
-            let q = &mut self.queues[TXQ];
-            match q.add_used(mem, head, 0) {
-                Ok(()) => {
-                    if let Some(len) = frame_len {
-                        self.counters.record_tx_completed(len as u64);
-                    }
-                    had_used_ring_publish = true;
-                }
-                Err(e) => {
-                    // Bump tx_add_used_failures for operator
-                    // visibility. Do NOT poison the queue: this is
-                    // a transient used-ring GPA mapping problem,
-                    // not a structural avail.idx violation. The
-                    // next QUEUE_NOTIFY may succeed if the guest
-                    // re-binds. Same rationale as the RX-side
-                    // add_used handling in `try_loopback_to_rx` —
-                    // poison is reserved for `iter()` errors
-                    // (cloud-hypervisor convergence). virtio-blk
-                    // follows the same rule: add_used failures
-                    // bump io_errors but never set NEEDS_RESET.
-                    self.counters.record_tx_add_used_failure();
-                    tracing::warn!(
-                        head,
-                        %e,
-                        "virtio-net TX add_used failed (used-ring address \
-                         likely unmapped); bumped tx_add_used_failures, \
-                         will NOT bump tx_packets"
-                    );
-                }
-            }
+            self.tx_add_used(mem, head, frame_len, &mut had_used_ring_publish);
 
             // Partial-RX-poison handling: if the RX-side `iter()`
             // just transitioned false→true this iteration (set by
@@ -849,6 +727,168 @@ impl VirtioNet {
         }
         if tx_just_poisoned || rx_just_poisoned {
             self.signal_queue_poisoned();
+        }
+    }
+
+    /// Apply the per-chain effects of one `try_loopback_to_rx`
+    /// outcome: bumps the matching RX counter and, when the RX
+    /// used-ring advanced, sets `had_used_ring_publish`. When the
+    /// RX queue's `iter()` just transitioned false→true this drain,
+    /// sets `rx_just_poisoned` so the driver loop breaks and the
+    /// post-loop signal fires. Performs no queue I/O of its own —
+    /// `try_loopback_to_rx` already did the descriptor walk and
+    /// add_used; this is the counter/flag bookkeeping for its
+    /// result. No break/continue/return: every arm only records a
+    /// counter and/or sets a flag, so the loop control flow stays
+    /// in `process_tx_loopback`.
+    fn handle_rx_loopback_outcome(
+        &mut self,
+        outcome: LoopbackOutcome,
+        had_used_ring_publish: &mut bool,
+        rx_just_poisoned: &mut bool,
+    ) {
+        match outcome {
+            LoopbackOutcome::Delivered { l2_bytes_written } => {
+                // RX add_used Ok, used-ring advanced.
+                // `l2_bytes_written` reflects actual bytes
+                // the guest can read past the virtio
+                // header — on a too-small RX buffer this
+                // is < the source `len`, so rx_bytes never
+                // overstates delivery.
+                self.counters.record_rx_delivered(l2_bytes_written);
+                *had_used_ring_publish = true;
+            }
+            LoopbackOutcome::DeliveredButAddUsedFailed => {
+                // Header + frame DID land in the descriptor
+                // but the trailing `add_used` failed.
+                // `rx_add_used_failures` was bumped inside
+                // `try_loopback_to_rx`. Do NOT bump
+                // rx_packets (guest never observes the
+                // publish) and do NOT mark the used-ring as
+                // advanced (it didn't). Do NOT poison the
+                // queue — add_used failure is a transient
+                // used-ring GPA mapping issue, not a
+                // structural avail.idx violation. Continue
+                // the drain; TX `add_used` below still
+                // completes for this chain.
+            }
+            LoopbackOutcome::RxAlreadyPoisoned => {
+                // Already-poisoned RX queue (re-kick after
+                // a prior poison, OR a prior iteration of
+                // this drain already triggered the
+                // false→true transition for RX). Drop the
+                // captured frame and record the drop. Do NOT
+                // re-bump `invalid_avail_idx_count` (the
+                // poison event was already counted on its
+                // false→true transition) and do NOT re-fire
+                // the signal. TX add_used below still runs,
+                // so `tx_packets` still bumps for this chain.
+                self.counters.record_tx_dropped_rx_poisoned();
+            }
+            LoopbackOutcome::JustRxPoisoned => {
+                // RX-side `iter()` first-time error.
+                // `try_loopback_to_rx` performed the
+                // false→true RX poison transition, bumped
+                // `invalid_avail_idx_count`, and set
+                // `queue_poisoned[RXQ] = true`. The
+                // TX-captured frame is dropped (nothing to
+                // deliver into) — record the drop. TX
+                // add_used below still runs so the in-flight
+                // TX request doesn't hang (and `tx_packets`
+                // still bumps). RX poison signal is fired
+                // post-loop after the used-ring kick.
+                self.counters.record_tx_dropped_rx_poisoned();
+                *rx_just_poisoned = true;
+            }
+            LoopbackOutcome::NoRxBuffer => {
+                // No chain popped — the RX queue was empty
+                // or not ready. The TX-captured frame is
+                // dropped on the floor.
+                self.counters.record_tx_dropped_no_rx_buffer();
+            }
+            LoopbackOutcome::RxChainInvalid { add_used_ok } => {
+                // Chain rejected during the descriptor walk.
+                // Exactly one of `rx_chain_invalid`
+                // (chain-shape: read-only descriptor or
+                // address overflow on the descriptor's GPA)
+                // or `rx_write_failed` (chain shape OK but
+                // a guest-memory `write_slice` hit an
+                // unmapped GPA mid-walk) was bumped inside
+                // `try_loopback_to_rx`; the two are
+                // mutually exclusive per chain. Whether the
+                // used-ring advanced depends on whether the
+                // recycle-add_used succeeded; if it did,
+                // the guest's NAPI must wake to see the
+                // empty completion (otherwise the buffer
+                // sits unrecycled until a virtio reset).
+                // Recycle-add_used failure is NOT a poison
+                // event — that's a transient used-ring GPA
+                // issue, not a structural avail.idx
+                // violation. `rx_add_used_failures` was
+                // bumped inside the helper for visibility.
+                if add_used_ok {
+                    *had_used_ring_publish = true;
+                }
+            }
+        }
+    }
+
+    /// Mark one drained TX chain used and, on success, set
+    /// `had_used_ring_publish` plus record the completion. Closes
+    /// the per-iteration TX half after the RX delivery: TX
+    /// descriptors are device-readable so used_len is 0, and
+    /// tx_packets bumps only when the publish succeeds.
+    fn tx_add_used(
+        &mut self,
+        mem: &GuestMemoryMmap,
+        head: u16,
+        frame_len: Option<usize>,
+        had_used_ring_publish: &mut bool,
+    ) {
+        // Mark the TX chain used. TX descriptors are
+        // device-readable, so used_len is 0 — the device wrote
+        // nothing back to guest memory on the TX side, and
+        // virtio-v1.2 §2.7.8.2 counts only device-WRITABLE bytes in
+        // used.len. (Reference divergence: cloud-hypervisor passes
+        // the bytes written to its tap as the TX used.len — a
+        // bytes-read value the spec does not sanction; the guest's
+        // virtnet driver ignores TX used.len so both work in
+        // practice, but 0 is the spec-correct value for a wholly
+        // device-readable chain.) tx_packets is bumped ONLY on TX
+        // add_used success — calling `record_tx_completed` before
+        // this point would let the counter lie if the publish fails
+        // (the guest never sees the completion). Failed TX add_used
+        // bumps `tx_add_used_failures` instead, keeping the
+        // per-event counter taxonomy 1:1 with observable events.
+        let q = &mut self.queues[TXQ];
+        match q.add_used(mem, head, 0) {
+            Ok(()) => {
+                if let Some(len) = frame_len {
+                    self.counters.record_tx_completed(len as u64);
+                }
+                *had_used_ring_publish = true;
+            }
+            Err(e) => {
+                // Bump tx_add_used_failures for operator
+                // visibility. Do NOT poison the queue: this is
+                // a transient used-ring GPA mapping problem,
+                // not a structural avail.idx violation. The
+                // next QUEUE_NOTIFY may succeed if the guest
+                // re-binds. Same rationale as the RX-side
+                // add_used handling in `try_loopback_to_rx` —
+                // poison is reserved for `iter()` errors
+                // (cloud-hypervisor convergence). virtio-blk
+                // follows the same rule: add_used failures
+                // bump io_errors but never set NEEDS_RESET.
+                self.counters.record_tx_add_used_failure();
+                tracing::warn!(
+                    head,
+                    %e,
+                    "virtio-net TX add_used failed (used-ring address \
+                     likely unmapped); bumped tx_add_used_failures, \
+                     will NOT bump tx_packets"
+                );
+            }
         }
     }
 
