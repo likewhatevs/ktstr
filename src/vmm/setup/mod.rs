@@ -1259,6 +1259,40 @@ impl KtstrVm {
         // Resolve effective memory_mib for boot params / ACPI / SHM.
         let memory_mib = self.effective_memory_mib(&vm.guest_mem);
 
+        let cmdline = self.build_guest_cmdline();
+
+        let t0 = Instant::now();
+        boot::write_cmdline(&vm.guest_mem, &cmdline)?;
+        boot::write_boot_params(
+            &vm.guest_mem,
+            &cmdline,
+            memory_mib,
+            initrd_addr,
+            initrd_size,
+            kernel_result.setup_header.as_ref(),
+        )?;
+        tracing::debug!(elapsed_us = t0.elapsed().as_micros(), "cmdline_boot_params");
+
+        let t0 = Instant::now();
+        mptable::setup_mptable(&vm.guest_mem, &self.topology)?;
+        let _acpi_layout = acpi::setup_acpi(
+            &vm.guest_mem,
+            &self.topology,
+            vm.numa_layout.as_ref().expect(
+                "numa_layout is Some by the time setup_acpi runs: \
+                 memory allocation (whether deferred or not) ran earlier \
+                 in this function and set numa_layout via \
+                 allocate_and_register_memory in src/vmm/x86_64/kvm.rs",
+            ),
+        )?;
+        tracing::debug!(elapsed_us = t0.elapsed().as_micros(), "mptable_acpi");
+
+        Ok(kernel_result)
+    }
+
+    /// Build the guest kernel cmdline (base flags + per-device `virtio_mmio.device=` tokens).
+    #[cfg(target_arch = "x86_64")]
+    fn build_guest_cmdline(&self) -> String {
         // Kernel cmdline rationale (per flag):
         //   console=ttyS0        — serial console for host-visible output.
         //   nomodules            — no out-of-tree modules are shipped; skip modprobe paths.
@@ -1403,34 +1437,7 @@ impl KtstrVm {
             cmdline.push(' ');
             cmdline.push_str(&self.cmdline_extra);
         }
-
-        let t0 = Instant::now();
-        boot::write_cmdline(&vm.guest_mem, &cmdline)?;
-        boot::write_boot_params(
-            &vm.guest_mem,
-            &cmdline,
-            memory_mib,
-            initrd_addr,
-            initrd_size,
-            kernel_result.setup_header.as_ref(),
-        )?;
-        tracing::debug!(elapsed_us = t0.elapsed().as_micros(), "cmdline_boot_params");
-
-        let t0 = Instant::now();
-        mptable::setup_mptable(&vm.guest_mem, &self.topology)?;
-        let _acpi_layout = acpi::setup_acpi(
-            &vm.guest_mem,
-            &self.topology,
-            vm.numa_layout.as_ref().expect(
-                "numa_layout is Some by the time setup_acpi runs: \
-                 memory allocation (whether deferred or not) ran earlier \
-                 in this function and set numa_layout via \
-                 allocate_and_register_memory in src/vmm/x86_64/kvm.rs",
-            ),
-        )?;
-        tracing::debug!(elapsed_us = t0.elapsed().as_micros(), "mptable_acpi");
-
-        Ok(kernel_result)
+        cmdline
     }
 
     /// Configure BSP and AP vCPUs.
