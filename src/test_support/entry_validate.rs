@@ -11,7 +11,7 @@ impl crate::test_support::KtstrTestEntry {
     /// same constraints at compile time for attribute-built entries;
     /// this method covers directly-constructed entries (library
     /// callers building `KtstrTestEntry` values to push into
-    /// [`KTSTR_TESTS`] programmatically).
+    /// [`KTSTR_TESTS`](crate::test_support::KTSTR_TESTS) programmatically).
     ///
     /// Rules:
     /// - `name` must be non-empty (empty names collapse into each

@@ -1211,8 +1211,8 @@ fn attach_enrichment(diff: &mut CtprofDiff, ctx: &CompareCtx, fudged_key_pairs: 
 /// the uptime and enrichment phases), sort the one-sided lists,
 /// fill uptime%, order the rows, and attach enrichment. The
 /// fudged-pair `(bkey, ckey)` threading is the only cross-phase
-/// data dependency: built by [`apply_cgroup_fudge`], read by
-/// [`fill_uptime_pct`] and [`attach_enrichment`].
+/// data dependency: built by `apply_cgroup_fudge`, read by
+/// `fill_uptime_pct` and `attach_enrichment`.
 pub fn compare(
     baseline: &CtprofSnapshot,
     candidate: &CtprofSnapshot,

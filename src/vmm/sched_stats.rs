@@ -491,7 +491,7 @@ impl SchedStatsClient {
     /// stale-bytes race window but does not fully close it.
     ///
     /// Closed portion — bytes already in port2_tx_buf at this
-    /// point: pre-drain empties port[2].tx_buf under the same
+    /// point: pre-drain empties `port[2].tx_buf` under the same
     /// virtio_con lock the drainer's TOKEN_DATA arm
     /// (drainer_loop) takes, so the drainer's next wake sees an
     /// empty buffer and routes nothing to response_buf.
@@ -508,7 +508,7 @@ impl SchedStatsClient {
     /// yet (e.g. coming out of a freeze rendezvous that paused
     /// every vCPU via SIGRTMIN). After our pre-drain releases
     /// virtio_con, the vCPU services the queued NOTIFY, process_tx
-    /// pushes stale guest bytes into port[2].tx_buf, kicks
+    /// pushes stale guest bytes into `port[2].tx_buf`, kicks
     /// stats_tx_evt. If this lands AFTER our in_flight=true store
     /// (in `request_raw`), the drainer wakes, sees in_flight=true,
     /// forwards the stale bytes as if they were the current
