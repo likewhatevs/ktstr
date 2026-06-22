@@ -813,7 +813,9 @@ impl KtstrVm {
     ///   (the same function-shaped symbols
     ///   [`crate::test_support::try_flush_profraw`] resolves; chosen over
     ///   the bare `__llvm_profile_runtime` marker because the marker can
-    ///   lose its `.symtab` size under `--gc-sections`). This probes the
+    ///   be dead-stripped entirely under `--gc-sections` while these
+    ///   function symbols are kept alive by that flush call's link
+    ///   reference). This probes the
     ///   PAYLOAD bytes (`self.init_binary`), NOT the host process — the
     ///   guest `/init` may be instrumented even when the host VMM binary
     ///   is not (and vice versa), so

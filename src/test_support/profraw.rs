@@ -56,8 +56,9 @@
 //!   - The target binary is NOT coverage-instrumented. Detection is a
 //!     symtab probe for the `__llvm_profile_write_buffer` /
 //!     `__llvm_profile_get_size_for_buffer` function symbols (the bare
-//!     `__llvm_profile_runtime` marker can lose its `.symtab` size under
-//!     `--gc-sections`; see `is_coverage_instrumented_binary`); the
+//!     `__llvm_profile_runtime` marker can be dead-stripped entirely
+//!     under `--gc-sections`, leaving no `.symtab` entry; see
+//!     `is_coverage_instrumented_binary`); the
 //!     guest-side flush [`try_flush_profraw`] calls those same compiler-rt
 //!     entry points directly. Non-instrumented binaries that link the
 //!     ktstr lib (e.g. `cargo-ktstr` itself in a non-coverage build)
@@ -171,7 +172,14 @@ pub(crate) fn try_flush_profraw() {
 }
 
 /// Resolve multiple symbol virtual addresses in a single pass through
-/// the ELF .symtab. Returns addresses in the same order as `names`.
+/// the ELF `.symtab`. Returns addresses in the same order as `names`.
+///
+/// Matches purely by name: a symbol is resolved regardless of its
+/// `st_size`, so zero-size symbols — e.g. gc-sections'd data markers
+/// like `__llvm_profile_runtime`, whose `st_size` is dropped on some
+/// `--gc-sections` link paths — still resolve as long as the name
+/// survives in `.symtab`. (Callers match exact, specific names, so
+/// admitting zero-size symbols cannot introduce a false positive.)
 pub(crate) fn find_symbol_vaddrs(elf: &goblin::elf::Elf<'_>, names: &[&str]) -> Vec<Option<u64>> {
     let mut results = vec![None; names.len()];
     let mut remaining = names.len();
@@ -179,9 +187,6 @@ pub(crate) fn find_symbol_vaddrs(elf: &goblin::elf::Elf<'_>, names: &[&str]) -> 
     for sym in elf.syms.iter() {
         if remaining == 0 {
             break;
-        }
-        if sym.st_size == 0 {
-            continue;
         }
         let sym_name = match elf.strtab.get_at(sym.st_name) {
             Some(n) => n,
@@ -366,19 +371,16 @@ fn is_coverage_instrumented_binary() -> bool {
     // Probe for the profile-write-buffer entry point rather than
     // the bare `__llvm_profile_runtime` marker. The marker is
     // declared `int __llvm_profile_runtime;` in compiler-rt and
-    // can lose its `.symtab` size on `--gc-sections` /
-    // `-Wl,--strip-debug` paths some toolchains apply to
-    // coverage builds, which trips
-    // [`find_symbol_vaddrs`]'s `st_size == 0` skip and silently
-    // hides instrumented binaries from this probe. The
+    // can be dead-stripped entirely by `--gc-sections` /
+    // `-Wl,--strip-debug` paths some toolchains apply to coverage
+    // builds, leaving no `.symtab` entry to resolve. The
     // function-shaped symbols [`try_flush_profraw`] already
     // resolves (`__llvm_profile_get_size_for_buffer` and
-    // `__llvm_profile_write_buffer`) keep their non-zero
-    // `st_size` because every linker path emits the function
-    // body — they are the reliable presence signal for
-    // instrumented binaries, proved empirically by the fact that
-    // coverage profraw collection in CI succeeds via the same
-    // symtab probe.
+    // `__llvm_profile_write_buffer`) are kept alive by that flush
+    // call's link reference, so they are the reliable presence
+    // signal for instrumented binaries, proved empirically by the
+    // fact that coverage profraw collection in CI succeeds via the
+    // same symtab probe.
     let vaddrs = find_symbol_vaddrs(
         &elf,
         &[
@@ -724,6 +726,38 @@ mod tests {
             v[0].is_some(),
             "__llvm_profile_write_buffer must survive --gc-sections under \
              coverage; without it the guest flush silently no-ops",
+        );
+    }
+
+    /// Regression: `find_symbol_vaddrs` must resolve a symbol by name
+    /// even when its `st_size` is 0. A prior `st_size == 0` skip
+    /// silently dropped gc-sections'd zero-size markers (e.g.
+    /// `__llvm_profile_runtime`), hiding instrumented binaries from
+    /// the coverage probe. Pick a real zero-size named symbol from
+    /// this binary's own `.symtab` (linker markers like `_edata` /
+    /// `_end` are `st_size == 0`) and assert the helper resolves it.
+    #[test]
+    fn find_symbol_vaddrs_resolves_zero_size_symbol() {
+        let exe = crate::resolve_current_exe().unwrap();
+        let data = std::fs::read(&exe).unwrap();
+        let elf = goblin::elf::Elf::parse(&data).unwrap();
+        let zero_size_name = elf
+            .syms
+            .iter()
+            .filter(|s| s.st_size == 0)
+            .filter_map(|s| elf.strtab.get_at(s.st_name))
+            .find(|n| !n.is_empty())
+            .map(str::to_string)
+            .expect(
+                "test binary's .symtab should carry at least one named \
+                 zero-size symbol (e.g. a linker marker like _edata / _end)",
+            );
+        let v = find_symbol_vaddrs(&elf, &[zero_size_name.as_str()]);
+        assert!(
+            v[0].is_some(),
+            "find_symbol_vaddrs must resolve zero-size symbol \
+             {zero_size_name:?}; the removed st_size==0 filter previously \
+             dropped such symbols, losing gc-sections'd coverage markers",
         );
     }
 }
