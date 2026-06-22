@@ -2693,3 +2693,54 @@ fn config_hash_for_key_returns_crc32_of_config_bytes() {
         "distinct .config bodies must produce distinct cache-key hashes",
     );
 }
+
+// -- read_makefile_version --
+
+/// `read_makefile_version` extracts MAJOR.MINOR.PATCH from a kernel
+/// source `Makefile` (VERSION/PATCHLEVEL/SUBLEVEL), ignoring
+/// EXTRAVERSION; a missing Makefile or any absent/non-numeric field
+/// yields None (so the acquisition records no version and the rootfs
+/// tmpfs fraction conservatively defaults to 50%).
+#[test]
+fn fetch_read_makefile_version_parses_and_guards() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let write_mk = |body: &str| {
+        std::fs::write(dir.path().join("Makefile"), body).expect("write Makefile");
+    };
+
+    // Canonical kernel Makefile head -> MAJOR.MINOR.PATCH; EXTRAVERSION ignored.
+    write_mk("# SPDX-License-Identifier: GPL-2.0\nVERSION = 6\nPATCHLEVEL = 6\nSUBLEVEL = 113\nEXTRAVERSION =\nNAME = X\n");
+    assert_eq!(super::read_makefile_version(dir.path()).as_deref(), Some("6.6.113"));
+
+    // rc release: EXTRAVERSION = -rc7 is ignored; SUBLEVEL 0 honored.
+    write_mk("VERSION = 7\nPATCHLEVEL = 1\nSUBLEVEL = 0\nEXTRAVERSION = -rc7\n");
+    assert_eq!(super::read_makefile_version(dir.path()).as_deref(), Some("7.1.0"));
+
+    // PANIC-SAFETY: a prefix-sharing decoy ("VERSION_FILE = ...") and a
+    // comment ("# VERSION = 999") must NOT false-match the canonical
+    // assignment — over-stating the version would select 90% on a
+    // non-honoring kernel and panic the guest. The real assignment wins.
+    write_mk("VERSION_FILE = include/config/kernel.release\n# VERSION = 999\nVERSION = 6\nPATCHLEVEL = 6\nSUBLEVEL = 113\n");
+    assert_eq!(super::read_makefile_version(dir.path()).as_deref(), Some("6.6.113"));
+
+    // First-match: the top-of-file assignment wins over a later duplicate.
+    write_mk("VERSION = 6\nPATCHLEVEL = 6\nSUBLEVEL = 113\nVERSION = 9\nPATCHLEVEL = 9\nSUBLEVEL = 9\n");
+    assert_eq!(super::read_makefile_version(dir.path()).as_deref(), Some("6.6.113"));
+
+    // A non-bare-integer value (trailing comment) -> that field None ->
+    // overall None -> the safe 50% default (never an over-stated version).
+    write_mk("VERSION = 7 # inline\nPATCHLEVEL = 1\nSUBLEVEL = 0\n");
+    assert_eq!(super::read_makefile_version(dir.path()), None);
+
+    // Missing SUBLEVEL -> None (all three fields are required).
+    write_mk("VERSION = 6\nPATCHLEVEL = 6\n");
+    assert_eq!(super::read_makefile_version(dir.path()), None);
+
+    // Non-numeric VERSION -> None.
+    write_mk("VERSION = x\nPATCHLEVEL = 6\nSUBLEVEL = 1\n");
+    assert_eq!(super::read_makefile_version(dir.path()), None);
+
+    // No Makefile at all -> None.
+    std::fs::remove_file(dir.path().join("Makefile")).expect("rm Makefile");
+    assert_eq!(super::read_makefile_version(dir.path()), None);
+}

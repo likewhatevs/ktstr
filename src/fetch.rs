@@ -1377,10 +1377,17 @@ pub fn git_clone(
         crate::cache_key_suffix()
     );
 
+    // Record the kernel version from the checked-out source Makefile, as
+    // local_source does — the worktree is fully checked out here, so a
+    // git-clone-acquired honoring kernel also earns the 90% tmpfs reclaim
+    // via the metadata.json sidecar. None on an unreadable/unparsable
+    // Makefile, which keeps the conservative 50% default.
+    let version = read_makefile_version(&clone_dir);
+
     Ok(AcquiredSource {
         source_dir: clone_dir,
         cache_key,
-        version: None,
+        version,
         kernel_source: crate::cache::KernelSource::git(short_hash, git_ref),
         is_temp: true,
         is_dirty: false,
@@ -1436,10 +1443,17 @@ pub fn local_source(source_path: &Path) -> Result<AcquiredSource> {
     let cache_key =
         compose_local_cache_key(arch, &short_hash, &canonical, user_config_hash.as_deref());
 
+    // Record the kernel version from the source-tree Makefile so the
+    // tmpfs-fraction gate (TmpfsFraction::for_kernel_version, via the
+    // cache metadata.json sidecar) recognizes a locally-built honoring
+    // kernel — symmetric with the tarball path. None when the Makefile
+    // is unreadable/unparsable, which keeps the conservative 50% default.
+    let version = read_makefile_version(&canonical);
+
     Ok(AcquiredSource {
         source_dir: canonical.clone(),
         cache_key,
-        version: None,
+        version,
         kernel_source: crate::cache::KernelSource::Local {
             source_tree_path: Some(canonical),
             git_hash: short_hash,
@@ -1448,6 +1462,40 @@ pub fn local_source(source_path: &Path) -> Result<AcquiredSource> {
         is_dirty,
         is_git,
     })
+}
+
+/// Parse the kernel `MAJOR.MINOR.PATCH` version from a source tree's
+/// top-level `Makefile` (`VERSION` / `PATCHLEVEL` / `SUBLEVEL`) — the
+/// authoritative version of a locally-built kernel, mirroring the
+/// version a tarball acquisition records. Returns `None` if the
+/// `Makefile` is unreadable or any of the three fields is absent or
+/// non-numeric, so the caller records no version and the rootfs tmpfs
+/// fraction conservatively defaults to 50% (the honoring gate
+/// `TmpfsFraction::for_kernel_version` keys on a positively-known
+/// version). `EXTRAVERSION` (e.g. `-rc7`) is intentionally ignored: the
+/// gate keys on `MAJOR.MINOR.PATCH` only.
+fn read_makefile_version(source_dir: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(source_dir.join("Makefile")).ok()?;
+    // Each field is a top-of-file `NAME = N` assignment; take the first
+    // matching line and require a bare integer (a trailing comment or
+    // non-numeric value yields None for that field, hence overall None).
+    let field = |name: &str| -> Option<u16> {
+        text.lines().find_map(|line| {
+            line.trim()
+                .strip_prefix(name)?
+                .trim_start()
+                .strip_prefix('=')?
+                .trim()
+                .parse::<u16>()
+                .ok()
+        })
+    };
+    Some(format!(
+        "{}.{}.{}",
+        field("VERSION")?,
+        field("PATCHLEVEL")?,
+        field("SUBLEVEL")?
+    ))
 }
 
 /// Result of [`inspect_local_source_state`] — git hash and dirty/git

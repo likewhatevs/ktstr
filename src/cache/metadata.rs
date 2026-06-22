@@ -114,7 +114,9 @@ impl KernelSource {
 #[non_exhaustive]
 pub struct KernelMetadata {
     /// Kernel version string (e.g. "6.14.2", "6.15-rc3").
-    /// `None` for local builds without a version tag.
+    /// `None` when no version could be established — a local or git
+    /// source whose `Makefile` is unreadable/unparsable, or an
+    /// acquisition path that records none.
     pub version: Option<String>,
     /// How the kernel source was acquired, with per-source payload.
     pub source: KernelSource,

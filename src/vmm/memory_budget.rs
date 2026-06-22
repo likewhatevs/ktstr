@@ -325,13 +325,17 @@ fn parse_kernel_version(release: &str) -> Option<(u16, u16, u16)> {
 /// image: `crate::cache::CacheDir` stores the boot image at
 /// `<entry>/<image_name>` and its metadata at `<entry>/metadata.json`,
 /// so the sidecar is the image's sibling. This recovers the 90% reclaim
-/// for cache-resident aarch64 kernels (whose version originates from the
-/// kernel.org tarball acquisition).
+/// for cache-resident aarch64 kernels (whose version is recorded into
+/// `metadata.json` by the acquisition: the kernel.org tarball download,
+/// or — via the source-tree Makefile — a local source tree or git
+/// clone).
 ///
 /// Returns `None` — falling to the safe [`TmpfsFraction::Half`] — for
 /// every case the version can't be positively established: a non-cache
-/// image path (raw `--kernel`, no sibling sidecar), a local-source build
-/// (`version` absent/`null`), an unreadable or malformed `metadata.json`,
+/// image path (raw `--kernel`, no sibling sidecar), an acquisition that
+/// recorded no version (`version` absent/`null` — e.g. a source build
+/// whose `Makefile` was unparsable), an unreadable or malformed
+/// `metadata.json`,
 /// or an unparsable version string. Only `version` is read (a minimal
 /// probe struct ignores the rest of the schema), keeping this decoupled
 /// from `crate::cache::KernelMetadata`'s other fields. The sidecar is
@@ -976,7 +980,8 @@ mod tests {
             "sidecar version must parse to (6, 18, 2)",
         );
 
-        // version key absent -> None (local-source build records no version).
+        // version key absent -> None (an acquisition that recorded no
+        // version, e.g. a source build whose Makefile was unparsable).
         write_sidecar(r#"{"arch":"aarch64"}"#);
         assert_eq!(
             read_kernel_version_from_metadata_sidecar(&image),
