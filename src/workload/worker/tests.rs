@@ -1338,3 +1338,215 @@ fn read_effective_cpus_reports_runner_cpuset() {
         "read_effective_cpus must report the runner's non-empty cpuset"
     );
 }
+
+// -- build_phase_slice: the per-phase finalize delta math.
+// Both the per-transition drain and the final end-of-run drain call this,
+// so these pin the math the two paths share. The production drains read the
+// clock / `/proc` to produce the snapshots; this helper is pure, so the
+// delta math is testable in isolation without booting a VM. --
+
+/// Full delta math, every field non-default. The key invariant: `off_cpu_ns`
+/// uses the thread-CPU delta (args 3->4) while `schedstat_cpu_time_ns` and
+/// `run_delay_ns` use the schedstat `sum_exec_runtime` / `run_delay` deltas —
+/// the two CPU measures are independent and must not be conflated.
+#[test]
+fn build_phase_slice_full_delta_math() {
+    let cpus: BTreeSet<usize> = [0, 2].into_iter().collect();
+    let numa: BTreeMap<usize, u64> = [(0, 100), (1, 50)].into_iter().collect();
+    let s = build_phase_slice(
+        7,                        // phase_epoch
+        1_000_000,                // wall_ns
+        500_000,                  // cpu_start_ns (thread cpu)
+        900_000,                  // cpu_end_ns -> thread-cpu delta 400_000
+        Some((10_000, 2_000, 1)), // schedstat_start (sum_exec, run_delay, ts)
+        Some((13_000, 5_000, 9)), // schedstat_end -> ss_cpu 3_000, run_delay 3_000
+        40,                       // vmstat_migrated_start
+        70,                       // vmstat_migrated_end -> 30
+        100,                      // iterations_delta (already a delta)
+        2,                        // migration_count
+        45_000_000,               // max_gap_ns -> 45 ms
+        2,                        // max_gap_cpu
+        cpus.clone(),
+        numa.clone(),
+        (vec![11, 22, 33], 5), // wake (reservoir, total)
+    );
+    assert_eq!(s.phase_epoch, 7);
+    assert_eq!(s.wall_ns, 1_000_000);
+    // off_cpu = wall - thread-cpu delta = 1_000_000 - 400_000.
+    assert_eq!(s.off_cpu_ns, 600_000);
+    // schedstat_cpu_time is the schedstat sum_exec_runtime delta (3_000),
+    // NOT the thread-cpu delta (400_000) — the two are independent measures.
+    assert_eq!(s.schedstat_cpu_time_ns, 3_000);
+    assert_eq!(s.run_delay_ns, 3_000);
+    assert_eq!(s.vmstat_numa_pages_migrated, 30);
+    assert_eq!(s.iterations, 100);
+    assert_eq!(s.migration_count, 2);
+    assert_eq!(s.max_gap_ms, 45); // 45_000_000 ns floored to ms
+    assert_eq!(s.max_gap_cpu, 2);
+    assert_eq!(s.cpus_used, cpus);
+    assert_eq!(s.numa_pages, numa);
+    assert_eq!(s.wake_latencies_ns, vec![11, 22, 33]);
+    assert_eq!(s.wake_sample_total, 5);
+}
+
+/// `off_cpu_ns` saturates at 0 when the thread-CPU delta exceeds wall — a
+/// coarse wall clock against a finer thread-CPU clock must never underflow
+/// into a near-`u64::MAX` value that would poison the host off-CPU% fold.
+#[test]
+fn build_phase_slice_off_cpu_saturates_at_zero() {
+    let s = build_phase_slice(
+        1,
+        100, // wall_ns
+        0,
+        500, // cpu_delta 500 > wall 100
+        None,
+        None,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        BTreeSet::new(),
+        BTreeMap::new(),
+        (vec![], 0),
+    );
+    assert_eq!(s.off_cpu_ns, 0);
+}
+
+/// A schedstat snapshot missing at either end yields zero run_delay and zero
+/// schedstat cpu time (the `_ => (0, 0)` arm) — never a partial read off one
+/// endpoint.
+#[test]
+fn build_phase_slice_missing_schedstat_is_zero() {
+    let mk = |start, end| {
+        build_phase_slice(
+            1,
+            1000,
+            0,
+            100,
+            start,
+            end,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            BTreeSet::new(),
+            BTreeMap::new(),
+            (vec![], 0),
+        )
+    };
+    let only_start = mk(Some((10, 20, 30)), None);
+    assert_eq!((only_start.run_delay_ns, only_start.schedstat_cpu_time_ns), (0, 0));
+    let only_end = mk(None, Some((10, 20, 30)));
+    assert_eq!((only_end.run_delay_ns, only_end.schedstat_cpu_time_ns), (0, 0));
+    let neither = mk(None, None);
+    assert_eq!((neither.run_delay_ns, neither.schedstat_cpu_time_ns), (0, 0));
+}
+
+/// Every counter delta saturates when end < start (a counter read across a
+/// reset, or a non-monotone `/proc` snapshot) — yields 0, never a wrapped
+/// near-`u64::MAX` value that would poison the host counter fold.
+#[test]
+fn build_phase_slice_counter_deltas_saturate() {
+    let s = build_phase_slice(
+        1,
+        1000,
+        0,
+        100,
+        Some((100, 100, 1)), // schedstat_start sum_exec/run_delay 100
+        Some((10, 10, 0)),   // schedstat_end 10 (< start)
+        100,                 // vmstat_migrated_start 100
+        10,                  // vmstat_migrated_end 10 (< start)
+        0,
+        0,
+        0,
+        0,
+        BTreeSet::new(),
+        BTreeMap::new(),
+        (vec![], 0),
+    );
+    assert_eq!(s.run_delay_ns, 0);
+    assert_eq!(s.schedstat_cpu_time_ns, 0);
+    assert_eq!(s.vmstat_numa_pages_migrated, 0);
+}
+
+// -- WakeRec: the twin wake-latency reservoir. push()
+// records every sample into BOTH the whole-run and per-phase reservoirs;
+// drain_phase() takes the per-phase samples+total and resets ONLY the phase
+// side, leaving the whole-run side intact. A swapped field or a missed reset
+// would silently corrupt both the per-phase and whole-run wake distributions
+// (wake_sample_total is the population weight in the cross-phase de-skew). --
+
+/// push records into both reservoirs; under both caps every sample is kept.
+#[test]
+fn wakerec_push_records_both_reservoirs() {
+    let mut w = WakeRec::new();
+    for s in [10u64, 20, 30] {
+        w.push(s);
+    }
+    let mut run = w.run.clone();
+    run.sort_unstable();
+    assert_eq!(run, vec![10, 20, 30]);
+    assert_eq!(w.run_total, 3);
+    let mut phase = w.phase.clone();
+    phase.sort_unstable();
+    assert_eq!(phase, vec![10, 20, 30]);
+    assert_eq!(w.phase_total, 3);
+}
+
+/// drain_phase takes the per-phase samples+total and resets ONLY the phase
+/// side; the whole-run reservoir is untouched, and a fresh phase accumulates
+/// independently after the reset.
+#[test]
+fn wakerec_drain_phase_takes_phase_leaves_run() {
+    let mut w = WakeRec::new();
+    for s in [10u64, 20, 30] {
+        w.push(s);
+    }
+    let (mut samples, total) = w.drain_phase();
+    samples.sort_unstable();
+    assert_eq!(samples, vec![10, 20, 30]);
+    assert_eq!(total, 3);
+    // Whole-run reservoir untouched by the phase drain.
+    let mut run = w.run.clone();
+    run.sort_unstable();
+    assert_eq!(run, vec![10, 20, 30]);
+    assert_eq!(w.run_total, 3);
+    // Phase side reset: a second drain with no intervening push is empty.
+    let (samples2, total2) = w.drain_phase();
+    assert!(samples2.is_empty());
+    assert_eq!(total2, 0);
+    // A fresh phase accumulates from zero after the reset...
+    w.push(99);
+    let (samples3, total3) = w.drain_phase();
+    assert_eq!(samples3, vec![99]);
+    assert_eq!(total3, 1);
+    // ...while the whole-run reservoir kept every sample across both phases.
+    assert_eq!(w.run.len(), 4);
+    assert_eq!(w.run_total, 4);
+}
+
+/// The phase and run caps are independent: pushing past MAX_PHASE_WAKE_SAMPLES
+/// (but below MAX_WAKE_SAMPLES) caps the drained phase vec at the phase cap
+/// while the whole-run reservoir keeps every sample. Both totals count every
+/// push regardless of the sampled vec length.
+#[test]
+fn wakerec_phase_and_run_caps_are_independent() {
+    let mut w = WakeRec::new();
+    let n = MAX_PHASE_WAKE_SAMPLES + 808; // over the phase cap, under the run cap
+    assert!(n < MAX_WAKE_SAMPLES);
+    for i in 0..n as u64 {
+        w.push(i);
+    }
+    let (samples, total) = w.drain_phase();
+    // Phase reservoir samples down to its cap but counts every push.
+    assert_eq!(samples.len(), MAX_PHASE_WAKE_SAMPLES);
+    assert_eq!(total, n as u64);
+    // Run reservoir is capped independently (and n is below its cap), so it
+    // kept all n while the phase reservoir sampled down.
+    assert_eq!(w.run.len(), n);
+    assert_eq!(w.run_total, n as u64);
+}

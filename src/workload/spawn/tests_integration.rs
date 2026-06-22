@@ -77,6 +77,22 @@ fn worker_report_serde_roundtrip() {
         // silent default-zero on serde would lose that tag.
         group_idx: 7,
         affinity_error: None,
+        phase_slices: vec![PhaseSlice {
+            phase_epoch: 1,
+            cpus_used: [2usize].into_iter().collect(),
+            wake_latencies_ns: vec![700, 900],
+            wake_sample_total: 2,
+            run_delay_ns: 12_000,
+            off_cpu_ns: 3_000,
+            wall_ns: 8_000,
+            migration_count: 1,
+            iterations: 64,
+            schedstat_cpu_time_ns: 5_000,
+            numa_pages: [(0usize, 7u64)].into_iter().collect(),
+            vmstat_numa_pages_migrated: 2,
+            max_gap_ms: 9,
+            max_gap_cpu: 2,
+        }],
     };
     let json = serde_json::to_string(&r).unwrap();
     let r2: WorkerReport = serde_json::from_str(&json).unwrap();
@@ -94,6 +110,10 @@ fn worker_report_serde_roundtrip() {
     assert_eq!(r.completed, r2.completed);
     assert_eq!(r.is_messenger, r2.is_messenger);
     assert_eq!(r.group_idx, r2.group_idx);
+    // phase_slices survive the serde roundtrip in full: PhaseSlice derives
+    // PartialEq, so this compares every field (not just a hand-picked
+    // subset) and stays complete as the struct grows.
+    assert_eq!(r.phase_slices, r2.phase_slices);
 }
 // -- Migration value-type coverage --------------------------------
 //
@@ -179,6 +199,111 @@ fn spawn_start_collect_integration() {
         assert!(!r.cpus_used.is_empty());
     }
 }
+
+/// End-to-end producer -> host-fold for the per-phase backdrop capture,
+/// WITHOUT a VM: spawn REAL backdrop workers, drive them
+/// through phase epochs exactly as the scenario engine does
+/// (set_phase_epoch at each Step boundary, the u32::MAX inter-step-gap
+/// sentinel at the end), collect their REAL phase_slices, then run the same
+/// host fold (expand_backdrop_phase_buckets) the None-arm of collect_handles
+/// uses in production. The build_phase_slice / backdrop.rs unit tests cover
+/// the math over HAND-BUILT slices; this is the only test that exercises the
+/// worker-side state machine — the epoch poll, drain-on-change, the
+/// 9-variable re-baseline, and the final drain — and proves its output
+/// partitions the run and survives the host fold into per-cgroup buckets.
+#[test]
+fn backdrop_worker_phase_slices_partition_and_fold() {
+    let config = WorkloadConfig {
+        num_workers: 2,
+        affinity: AffinityIntent::Inherit,
+        work_type: WorkType::SpinWait,
+        sched_policy: SchedPolicy::Normal,
+        ..Default::default()
+    };
+    let mut h = WorkloadHandle::spawn(&config).unwrap();
+    h.start();
+    // BASELINE (epoch 0) work, then two real phases, then the inter-step
+    // gap sentinel. CPU-bound SpinWait polls the epoch every ~1024 spins,
+    // so 150ms per window is ample for both workers to observe each
+    // transition and accumulate work in every phase.
+    let dwell = Duration::from_millis(150);
+    std::thread::sleep(dwell);
+    h.set_phase_epoch(1);
+    std::thread::sleep(dwell);
+    h.set_phase_epoch(2);
+    std::thread::sleep(dwell);
+    h.set_phase_epoch(u32::MAX);
+    std::thread::sleep(Duration::from_millis(40));
+    let reports = h.stop_and_collect();
+    assert_eq!(reports.len(), 2);
+
+    for r in &reports {
+        // The phase windows partition the whole run: every iteration the
+        // worker did falls in exactly one phase, so the per-phase iteration
+        // deltas sum EXACTLY to the whole-run total (phase_iterations_start
+        // inits to 0 and WorkerReport.iterations is the same counter). A
+        // broken re-baseline (leaked or double-counted delta) breaks this.
+        let slice_iters: u64 = r.phase_slices.iter().map(|s| s.iterations).sum();
+        assert_eq!(
+            slice_iters, r.iterations,
+            "phase-slice iterations must partition the whole-run total \
+             (worker {}): slices sum {} vs report {}",
+            r.tid, slice_iters, r.iterations,
+        );
+        // Both real phase epochs were observed. Every epoch change fires
+        // drain-on-change for the phase just ended: 0->1 emits epoch 0,
+        // 1->2 emits epoch 1, 2->u32::MAX emits epoch 2; the final drain
+        // after the loop exits emits the still-open u32::MAX gap slice
+        // (which the host discards).
+        let real: BTreeSet<u32> = r
+            .phase_slices
+            .iter()
+            .map(|s| s.phase_epoch)
+            .filter(|&e| e != 0 && e != u32::MAX)
+            .collect();
+        assert!(
+            real.contains(&1) && real.contains(&2),
+            "worker {} did not emit both real phase epochs; saw {:?}",
+            r.tid,
+            r.phase_slices.iter().map(|s| s.phase_epoch).collect::<Vec<_>>(),
+        );
+        // Each real-phase slice measured a positive window, and off_cpu never
+        // exceeds wall (the saturating off_cpu invariant, on live data).
+        for s in r
+            .phase_slices
+            .iter()
+            .filter(|s| s.phase_epoch == 1 || s.phase_epoch == 2)
+        {
+            assert!(s.wall_ns > 0, "worker {} epoch {} zero wall", r.tid, s.phase_epoch);
+            assert!(
+                s.off_cpu_ns <= s.wall_ns,
+                "worker {} epoch {}: off_cpu {} > wall {}",
+                r.tid,
+                s.phase_epoch,
+                s.off_cpu_ns,
+                s.wall_ns,
+            );
+        }
+    }
+
+    // The production host fold (collect_handles None-arm) over the REAL
+    // reports: epoch 0 (BASELINE) and u32::MAX (gap) are dropped; the two
+    // real epochs become per-cgroup buckets at step_index 1 and 2, each
+    // pooling both workers.
+    let buckets = crate::assert::expand_backdrop_phase_buckets("cg_bg", &reports, None);
+    let steps: BTreeSet<u16> = buckets.iter().map(|b| b.step_index).collect();
+    assert_eq!(steps, [1u16, 2].into_iter().collect::<BTreeSet<u16>>());
+    for b in &buckets {
+        let cg = b.per_cgroup.get("cg_bg").expect("cg_bg carrier present");
+        assert_eq!(cg.num_workers, 2, "step {} pools both workers", b.step_index);
+        assert!(
+            cg.total_iterations > 0,
+            "step {} backdrop carrier has zero iterations",
+            b.step_index,
+        );
+    }
+}
+
 #[test]
 fn spawn_auto_start_on_collect() {
     let config = WorkloadConfig {
@@ -577,6 +702,7 @@ fn worker_report_serde_edge_cases() {
         is_messenger: false,
         group_idx: 0,
         affinity_error: None,
+        phase_slices: vec![],
     };
     let json = serde_json::to_string(&r).unwrap();
     let r2: WorkerReport = serde_json::from_str(&json).unwrap();
@@ -612,6 +738,7 @@ fn worker_report_serde_edge_cases() {
         is_messenger: false,
         group_idx: usize::MAX,
         affinity_error: None,
+        phase_slices: vec![],
     };
     let json = serde_json::to_string(&r).unwrap();
     let r2: WorkerReport = serde_json::from_str(&json).unwrap();
@@ -708,6 +835,7 @@ fn worker_report_debug_shows_field_values() {
         is_messenger: false,
         group_idx: 0,
         affinity_error: None,
+        phase_slices: vec![],
     };
     let s = format!("{:?}", r);
     assert!(s.contains("42"), "must show tid value");
@@ -1227,6 +1355,22 @@ fn fully_populated_report() -> WorkerReport {
         is_messenger: true,
         group_idx: 4,
         affinity_error: None,
+        phase_slices: vec![PhaseSlice {
+            phase_epoch: 2,
+            cpus_used: [1usize, 4, 6].into_iter().collect(),
+            wake_latencies_ns: vec![500, 1500, 2500],
+            wake_sample_total: 8,
+            run_delay_ns: 444_000,
+            off_cpu_ns: 1_234_567,
+            wall_ns: 9_876_543,
+            migration_count: 3,
+            iterations: 256,
+            schedstat_cpu_time_ns: 7_000_000,
+            numa_pages: [(0usize, 11u64), (1, 22)].into_iter().collect(),
+            vmstat_numa_pages_migrated: 13,
+            max_gap_ms: 27,
+            max_gap_cpu: 4,
+        }],
     }
 }
 
@@ -1309,6 +1453,11 @@ fn assert_worker_report_eq(a: &WorkerReport, b: &WorkerReport) {
     assert_eq!(a.is_messenger, b.is_messenger, "is_messenger");
     assert_eq!(a.group_idx, b.group_idx, "group_idx");
     assert_eq!(a.affinity_error, b.affinity_error, "affinity_error");
+    // PhaseSlice derives PartialEq, so a single assert_eq! compares every
+    // field and self-maintains when a field is added — no hand-rolled
+    // per-field list to fall out of sync. The backdrop per-phase telemetry
+    // crosses the same postcard wire.
+    assert_eq!(a.phase_slices, b.phase_slices, "phase_slices");
 }
 
 /// Roundtrip a fully populated `WorkerReport` (`exit_info=None`)

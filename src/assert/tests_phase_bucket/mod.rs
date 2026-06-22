@@ -7,7 +7,8 @@
 use super::tests_common::rpt;
 use super::{
     CgroupStats, PhaseBucket, PhaseCgroupStats, ScenarioStats, cgroup_stats,
-    fold_guest_per_cgroup_into_host_buckets, percentile, phase_cgroup_stats,
+    expand_backdrop_phase_buckets, fold_guest_per_cgroup_into_host_buckets, percentile,
+    phase_cgroup_stats, phase_slice_to_cgroup_stats, pool_phase_slice_stats,
     populate_run_distribution_metrics, populate_run_distribution_metrics_from,
     reduce_sorted_distribution, reduce_weighted_sorted_distribution, step_per_cgroup_bucket,
     weighted_percentile,
@@ -61,6 +62,7 @@ fn repool_stats(
     }
 }
 
+mod backdrop;
 mod build_pipeline;
 mod display;
 mod phase_guard_a;

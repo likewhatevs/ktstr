@@ -1157,6 +1157,14 @@ fn run_scenario(
         let phase_step_index = phase_step_index(step_idx);
         ctx.current_step
             .store(phase_step_index, std::sync::atomic::Ordering::Release);
+        // Broadcast the phase to this handle's backdrop (persistent)
+        // workers so each drains its per-phase PhaseSlice at this
+        // boundary. Step-local pools are NOT bumped here — they
+        // re-spawn per step and get per-phase attribution via
+        // collect_step's step_index instead.
+        for (_, h) in &backdrop_state.handles {
+            h.set_phase_epoch(u32::from(phase_step_index));
+        }
         // Install the assert-side phase guard for the scenario
         // driver's thread for the duration of this Step. Every
         // AssertDetail / PassDetail / InfoNote constructed under
@@ -1178,6 +1186,15 @@ fn run_scenario(
             &mut sched_died_during_hold,
             &mut final_total_iterations,
         );
+
+        // Close this step's hold window for backdrop workers: write the
+        // inter-step gap sentinel so work done between this StepEnd and
+        // the next StepStart is NOT folded into step `step_idx`'s slice
+        // (matching the host's hold-only window clamp, and step-local
+        // workers, which do not exist during the inter-step gap).
+        for (_, h) in &backdrop_state.handles {
+            h.set_phase_epoch(u32::MAX);
+        }
 
         // Scheduler died during this step's hold: the kernel has
         // disabled sched_ext and the workers (step and backdrop) have
@@ -2271,8 +2288,10 @@ fn collect_backdrop(
         }),
         checks,
         Some(topo),
-        // Backdrop spans all phases (6c, taskified #36); no single-step
-        // attribution at this collect.
+        // Backdrop spans every phase: the None arm expands each worker's
+        // per-phase PhaseSlices into one per-epoch PhaseBucket
+        // (expand_backdrop_phase_buckets) — per-epoch, not single-step,
+        // attribution.
         None,
     )
 }

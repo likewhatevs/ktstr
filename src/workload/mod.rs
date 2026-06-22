@@ -105,7 +105,9 @@ pub use config::*;
 // re-exported here. `WorkerReportClaim` is the proc-macro-
 // generated companion to `WorkerReport` (see the `crate::Claim`
 // derive on the `WorkerReport` struct).
-pub use spawn::{Migration, WorkerExitInfo, WorkerReport, WorkerReportClaim, WorkloadHandle};
+pub use spawn::{
+    Migration, PhaseSlice, WorkerExitInfo, WorkerReport, WorkerReportClaim, WorkloadHandle,
+};
 // Crate-internal re-export of the wake-latency reservoir cap + the
 // Algorithm-R push so the per-phase per-cgroup carrier builder
 // (`crate::assert::phase_cgroup_stats`) re-caps the POOLED samples at the

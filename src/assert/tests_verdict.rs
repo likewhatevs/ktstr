@@ -649,6 +649,7 @@ fn claim_against_worker_report_via_derived_accessors() {
         is_messenger: false,
         group_idx: 0,
         affinity_error: None,
+        phase_slices: vec![],
     };
 
     let mut v = Verdict::new();

@@ -1509,15 +1509,29 @@ pub(crate) fn collect_handles<'a>(
         // step's 1-indexed step_index. AssertResult::merge unions per_cgroup by
         // name, so multiple cgroups in one step accumulate into the one bucket;
         // the host eval fold then unions these into the host-rebuilt buckets.
-        // None (collect_all, backdrop, the non-step staging collect) attaches
-        // nothing.
-        if let Some(idx) = step_index {
-            one.stats.phases = vec![crate::assert::step_per_cgroup_bucket(
-                &key,
-                &reports,
-                numa_nodes.as_ref(),
-                idx,
-            )];
+        // None: a backdrop handle expands each worker's PhaseSlices into
+        // per-epoch buckets (expand_backdrop_phase_buckets); collect_all and
+        // the non-step staging collect carry no PhaseSlices, so the
+        // expansion yields an empty Vec (effectively nothing).
+        match step_index {
+            Some(idx) => {
+                one.stats.phases = vec![crate::assert::step_per_cgroup_bucket(
+                    &key,
+                    &reports,
+                    numa_nodes.as_ref(),
+                    idx,
+                )];
+            }
+            None => {
+                // Backdrop (collected with no step_index): expand each
+                // worker's per-phase PhaseSlices into one PhaseBucket per
+                // epoch (BASELINE / inter-step-gap epochs skipped). The
+                // host's fold_guest_per_cgroup_into_host_buckets then
+                // unions these into the host-rebuilt buckets (matched
+                // epochs) or surfaces them as orphan not-measured windows.
+                one.stats.phases =
+                    crate::assert::expand_backdrop_phase_buckets(&key, &reports, numa_nodes.as_ref());
+            }
         }
         // Handle iteration order IS the per_cgroup fold order: AssertResult::merge
         // folds same-name carriers (a multi-WorkSpec cgroup's per-handle carriers)

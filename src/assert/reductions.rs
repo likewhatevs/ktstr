@@ -367,6 +367,141 @@ pub(crate) fn phase_cgroup_stats(
     }
 }
 
+/// Build a per-cgroup carrier from ONE already-per-phase backdrop
+/// [`crate::workload::PhaseSlice`] (no whole-run differencing — the
+/// slice's counter fields are already per-phase deltas). The single-worker
+/// analog of [`phase_cgroup_stats`]: `num_workers` is 1 and each list field
+/// carries this one worker's value, so [`PhaseCgroupStats::merge`] pools
+/// slices across backdrop workers into a per-epoch carrier identically to
+/// how [`phase_cgroup_stats`] pools whole-run reports.
+pub(crate) fn phase_slice_to_cgroup_stats(
+    slice: &crate::workload::PhaseSlice,
+    expected_nodes: Option<&BTreeSet<usize>>,
+) -> PhaseCgroupStats {
+    // Per-phase off-CPU%, one value, only when wall time was measured
+    // (wall_ns == 0 => the worker never ran this phase => EMPTY = not
+    // measured, matching phase_cgroup_stats's not-measured contract).
+    let off_cpu_pcts: Vec<f64> = if slice.wall_ns > 0 {
+        vec![slice.off_cpu_ns as f64 / slice.wall_ns as f64 * 100.0]
+    } else {
+        Vec::new()
+    };
+    let numa_pages_total: u64 = slice.numa_pages.values().copied().sum();
+    let numa_pages_local: u64 = expected_nodes
+        .map(|nodes| {
+            slice
+                .numa_pages
+                .iter()
+                .filter(|(node, _)| nodes.contains(node))
+                .map(|(_, &count)| count)
+                .sum()
+        })
+        .unwrap_or(0);
+    PhaseCgroupStats {
+        num_workers: 1,
+        cpus_used: slice.cpus_used.clone(),
+        wake_latencies_ns: slice.wake_latencies_ns.clone(),
+        wake_sample_total: slice.wake_sample_total,
+        // RAW ns, one per worker (NOT divided) — same contract as
+        // phase_cgroup_stats::run_delays_ns.
+        run_delays_ns: vec![slice.run_delay_ns],
+        off_cpu_pcts,
+        total_migrations: slice.migration_count,
+        total_iterations: slice.iterations,
+        total_cpu_time_ns: slice.schedstat_cpu_time_ns,
+        numa_pages_local,
+        numa_pages_total,
+        cross_node_migrated: slice.vmstat_numa_pages_migrated,
+        max_gap_ms: slice.max_gap_ms,
+        max_gap_cpu: slice.max_gap_cpu,
+        stripped: false,
+    }
+}
+
+/// Pool a set of backdrop [`crate::workload::PhaseSlice`]s (all for
+/// the SAME epoch, one per worker) into a single per-cgroup carrier via
+/// [`PhaseCgroupStats::merge`] — the per-phase analog of
+/// [`phase_cgroup_stats`] pooling whole-run reports. An empty input yields
+/// a zero-worker carrier (all fields empty/0, `stripped: false`) so a phase
+/// no backdrop worker observed renders as not-measured rather than
+/// panicking.
+pub(crate) fn pool_phase_slice_stats(
+    slices: &[&crate::workload::PhaseSlice],
+    expected_nodes: Option<&BTreeSet<usize>>,
+) -> PhaseCgroupStats {
+    let mut iter = slices
+        .iter()
+        .map(|s| phase_slice_to_cgroup_stats(s, expected_nodes));
+    match iter.next() {
+        Some(first) => iter.fold(first, PhaseCgroupStats::merge),
+        None => PhaseCgroupStats {
+            num_workers: 0,
+            cpus_used: BTreeSet::new(),
+            wake_latencies_ns: Vec::new(),
+            wake_sample_total: 0,
+            run_delays_ns: Vec::new(),
+            off_cpu_pcts: Vec::new(),
+            total_migrations: 0,
+            total_iterations: 0,
+            total_cpu_time_ns: 0,
+            numa_pages_local: 0,
+            numa_pages_total: 0,
+            cross_node_migrated: 0,
+            max_gap_ms: 0,
+            max_gap_cpu: 0,
+            stripped: false,
+        },
+    }
+}
+
+/// Expand a backdrop worker set's per-phase
+/// [`crate::workload::PhaseSlice`]s into one [`PhaseBucket`] per epoch,
+/// keyed by the epoch as `step_index`, each pooling that epoch's slices
+/// across workers via [`pool_phase_slice_stats`]. BASELINE (epoch 0) and
+/// inter-step-gap (`u32::MAX`) epochs are skipped — they have no paired
+/// host bucket and the host fold discards them. Called by the backdrop
+/// (None-`step_index`) arm of [`crate::scenario::collect_handles`]; the
+/// host's [`fold_guest_per_cgroup_into_host_buckets`] then unions these
+/// into the host-rebuilt buckets (matched epochs) or surfaces them as
+/// orphan not-measured windows. Extracted (rather than inlined in
+/// collect_handles, which calls `stop_and_collect`) so the grouping +
+/// per-epoch pooling is unit-testable directly.
+pub(crate) fn expand_backdrop_phase_buckets(
+    name: &str,
+    reports: &[WorkerReport],
+    expected_nodes: Option<&BTreeSet<usize>>,
+) -> Vec<PhaseBucket> {
+    let mut by_epoch: std::collections::BTreeMap<u32, Vec<&crate::workload::PhaseSlice>> =
+        std::collections::BTreeMap::new();
+    for report in reports {
+        for slice in &report.phase_slices {
+            if slice.phase_epoch == 0 || slice.phase_epoch == u32::MAX {
+                continue;
+            }
+            by_epoch.entry(slice.phase_epoch).or_default().push(slice);
+        }
+    }
+    by_epoch
+        .into_iter()
+        .map(|(epoch, slices)| {
+            let mut per_cgroup = std::collections::BTreeMap::new();
+            per_cgroup.insert(name.to_string(), pool_phase_slice_stats(&slices, expected_nodes));
+            // Lossless: a real epoch == u32::from(phase_step_index: u16),
+            // and 0 / u32::MAX are filtered above.
+            let step_index = epoch as u16;
+            PhaseBucket {
+                step_index,
+                label: Phase::from(step_index).to_string(),
+                start_ms: u64::MAX,
+                end_ms: 0,
+                sample_count: 0,
+                metrics: std::collections::BTreeMap::new(),
+                per_cgroup,
+            }
+        })
+        .collect()
+}
+
 /// Build the single-bucket guest-side per-phase carrier for one step-local
 /// cgroup: a [`PhaseBucket`] at `step_index` whose only payload is the
 /// `per_cgroup` entry `name -> phase_cgroup_stats(reports, expected_nodes)`.

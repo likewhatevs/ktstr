@@ -564,10 +564,11 @@ pub fn populate_run_pooled_iterations_per_cpu_sec(stats: &mut ScenarioStats) {
 /// where the unweighted path sums in u64 — a weighted variance cannot keep the
 /// u64 sum).
 ///
-/// CARRIER-LESS FOLD (backdrop coverage + graceful degradation): a cgroup
-/// whose raw samples are NOT in the pool — a backdrop (collected with no
-/// step_index, so no per-phase carrier; 6c/#36) or a cgroup whose carrier was
-/// stripped/empty (`strip_phase_cgroup_samples`) — is NOT dropped. Its
+/// CARRIER-LESS FOLD (graceful degradation): a cgroup whose raw samples are
+/// NOT in the pool — a backdrop epoch that fell on BASELINE or the
+/// inter-step gap (no paired host bucket, so no carrier) or a cgroup whose
+/// carrier was stripped/empty (`strip_phase_cgroup_samples`) — is NOT
+/// dropped. Its
 /// surviving per-cgroup [`CgroupStats`] reduction folds worst-wins (max — every
 /// Distribution metric is `LowerBetter`, registry-gated) into the pooled value.
 /// The CgroupStats reductions are never stripped — `stats.cgroups[]` is the
@@ -588,8 +589,9 @@ pub fn populate_run_pooled_iterations_per_cpu_sec(stats: &mut ScenarioStats) {
 /// coincide below the cap (all weights 1.0) and diverge above it; the mix is
 /// sound — a carrier-less cgroup has no per-phase weight data to
 /// population-weight (its carrier is absent by definition), and both feed the
-/// same LowerBetter worst-wins max. #36 will give backdrops a carrier so their
-/// samples join the pool.
+/// same LowerBetter worst-wins max. Backdrop step-phase carriers now join
+/// the pool directly (per-epoch expansion in `collect_handles`); only the
+/// carrier-less cases above fold worst-wins.
 ///
 /// WORSTLOWEST (the 2 iteration efficiencies): the lowest (worst) cgroup's
 /// efficiency, computed per-cgroup from the `stats.cgroups[]` COUNTERS via
@@ -625,12 +627,14 @@ pub fn populate_run_distribution_metrics(stats: &mut ScenarioStats) {
     let mut wake_pool: Vec<(u64, f64)> = Vec::new();
     let mut run_delay_pool: Vec<u64> = Vec::new();
     // Names of cgroups that contributed NON-EMPTY samples to each pool. A
-    // cgroup absent here — a backdrop (carrier attachment is step-local only,
-    // collect_handles gates on a Some step_index; backdrops collect with None,
-    // 6c/#36) or a stripped/empty carrier — is NOT dropped from the run-level
+    // cgroup absent here — a backdrop epoch that fell on BASELINE / the
+    // inter-step gap (no paired host bucket, so no carrier) or a
+    // stripped/empty carrier — is NOT dropped from the run-level
     // Distribution: the re-pool folds its surviving per-cgroup CgroupStats
-    // reduction worst-wins (see `populate_run_distribution_metrics_from`). #36
-    // will give backdrops a carrier so their raw samples join the pool.
+    // reduction worst-wins (see `populate_run_distribution_metrics_from`).
+    // Backdrop step-phase carriers now join the pool directly (per-epoch
+    // expansion in collect_handles), so a step-matched backdrop epoch pools
+    // rather than worst-wins-folds.
     //
     // The fallback dedup keys on cgroup NAME (a `stats.cgroups` entry whose
     // name is in `*_carriers` is pooled, not reduction-folded), which assumes
@@ -648,7 +652,12 @@ pub fn populate_run_distribution_metrics(stats: &mut ScenarioStats) {
     // LOSSY case is a step-(k+1) entry STRIPPED of live samples while step k
     // survives, and that cannot arise today: `strip_phase_cgroup_samples` strips
     // RUN-WIDE (every phase at once), so a run is never partially stripped per
-    // step. #36 (backdrops join the pool) dissolves the dedup entirely.
+    // step. A backdrop name now enters `*_carriers` (pooled once via its
+    // per-epoch expansion) so it is skipped from the reduction-fold — and a
+    // backdrop and a step-local cgroup cannot share a live name (cgroupfs
+    // mkdir EEXIST; a backdrop is live the whole scenario), so each
+    // stats.cgroups entry still contributes via exactly one of {pool,
+    // reduction-fold} — no double count.
     let mut wake_carriers: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
     let mut run_delay_carriers: std::collections::BTreeSet<&str> =
         std::collections::BTreeSet::new();

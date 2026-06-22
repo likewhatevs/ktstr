@@ -451,8 +451,9 @@ fn repool_mean_run_delay_pools_across_cgroups_not_max_of_per_cgroup() {
     );
 }
 
-/// Carrier-less cgroups (a backdrop — collected with step_index None, so no
-/// per-phase carrier; 6c/#36) are NOT dropped from the run-level Distribution:
+/// Carrier-less cgroups (a backdrop whose epochs all fell on BASELINE / the
+/// inter-step gap — no paired host bucket, so no carrier — or a stripped /
+/// empty carrier) are NOT dropped from the run-level Distribution:
 /// their surviving per-cgroup CgroupStats reduction folds worst-wins into the
 /// pooled value. Here cgroup "a" carries low wake samples (pooled p99 ~50 µs)
 /// and is also in stats.cgroups with a bogus p99=9999 that MUST be ignored
