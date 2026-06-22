@@ -846,3 +846,240 @@ fn format_per_group_pass_counts_one_side_missing_renders_dash() {
         "B-only group must render a=-; got: {out:?}",
     );
 }
+
+// -- ComparePartition::as_str --
+
+/// `ComparePartition::as_str` maps each variant to the one-letter
+/// label the scalar table headers use, so the per-phase tables and
+/// the scalar table share the same operator-facing side identifier.
+/// Both arms pinned: a future swap (`A => "B"`) would silently
+/// mislabel every unpaired-phase row's SIDE column.
+#[test]
+fn compare_partition_as_str_maps_each_variant_to_its_letter() {
+    assert_eq!(ComparePartition::A.as_str(), "A");
+    assert_eq!(ComparePartition::B.as_str(), "B");
+}
+
+// -- compare_partitions render-phase + summary block (e2e through
+//    the on-disk sidecar pool) --
+
+/// Build a sidecar carrying scalar `worst_spread` and the given
+/// `(step_index, label, worst_spread)` phase buckets, so a row pair
+/// produces both a scalar finding and per-phase deltas when the
+/// metric moves across sides. `phases` flows verbatim into
+/// `GauntletRow.phases` via `sidecar_to_row`, which the per-phase
+/// pass in `compare_rows_by` reads. Phase-coverage asymmetry (a step
+/// present on one side only) drives the unpaired-phase render path.
+fn phase_sidecar(
+    test_name: &str,
+    scheduler: &str,
+    passed: bool,
+    spread: f64,
+    phases: &[(u16, &str, f64)],
+) -> crate::test_support::SidecarResult {
+    let phase_buckets = phases
+        .iter()
+        .map(|(idx, label, ps)| make_phase_bucket(*idx, label, &[("worst_spread", *ps)]))
+        .collect();
+    crate::test_support::SidecarResult {
+        test_name: test_name.to_string(),
+        scheduler: scheduler.to_string(),
+        passed,
+        stats: crate::assert::ScenarioStats {
+            worst_spread: spread,
+            total_iterations: 1000,
+            phases: phase_buckets,
+            ..crate::assert::ScenarioStats::default()
+        },
+        ..crate::test_support::SidecarResult::test_fixture()
+    }
+}
+
+/// End-to-end pin on the `compare_partitions` render path that the
+/// unit-level helper tests can't reach: the phase-delta table, the
+/// phase-coverage-asymmetry table, the discovery footer hint, and
+/// the summary block (excluded_pairs + per-group + new_in_b +
+/// removed_from_a) all render inside `compare_partitions`, which
+/// pools sidecars off disk. The fixture writes a tempdir pool whose
+/// per-side filters slice on `scheduler`, so the comparison joins on
+/// the remaining pairing dims and exercises every summary counter:
+///
+/// - `paired_scn` exists on both sides with a `worst_spread`
+///   10 -> 30 move (scalar regression -> exit 1). Its BASELINE
+///   phase matches on both sides (10 -> 30) -> a per-phase
+///   regression row; the B side additionally carries a Step[0]
+///   bucket the A side lacks -> a one-sided UnpairedPhaseRow that
+///   drives the phase-coverage-asymmetry table render path.
+/// - `excl_scn` exists on both sides but the B side failed
+///   (`passed=false`) -> `excluded_pairs` line.
+/// - `new_only_b` exists only on the B side -> `new_in_b` line.
+/// - `removed_only_a` exists only on the A side -> `removed_from_a`
+///   line.
+///
+/// Asserts exit 1 (the scalar regression drives the return value)
+/// and, by running the full render under several
+/// `PhaseDisplayOptions`, that the render-phase block + its
+/// render-time `matches_phase` / `passes_delta_threshold` filters
+/// execute without panicking.
+#[test]
+fn compare_partitions_renders_phase_and_summary_blocks_via_pool() {
+    let alt_root = tempfile::TempDir::new().expect("create alt-root tempdir");
+    // One subdir per sidecar. (test_name, scheduler, passed, scalar
+    // spread, phases). scx_alpha is the A side, scx_beta the B side;
+    // scheduler is the slicing dim. The B side of paired_scn carries
+    // an extra Step[0] bucket so the matched pair has phase-coverage
+    // asymmetry (covers the unpaired-phase render path).
+    let baseline = |s: f64| vec![(0u16, "BASELINE", s)];
+    let baseline_plus_step = |s: f64| vec![(0u16, "BASELINE", s), (1u16, "Step[0]", s)];
+    let sidecars: [(&str, &str, bool, f64, Vec<(u16, &str, f64)>); 6] = [
+        // paired on both sides: 10 -> 30 scalar + BASELINE phase
+        // regression; B's extra Step[0] -> unpaired (side B) phase.
+        ("paired_scn", "scx_alpha", true, 10.0, baseline(10.0)),
+        ("paired_scn", "scx_beta", true, 30.0, baseline_plus_step(30.0)),
+        // present on both sides but B failed -> excluded_pairs.
+        ("excl_scn", "scx_alpha", true, 10.0, baseline(10.0)),
+        ("excl_scn", "scx_beta", false, 30.0, baseline(30.0)),
+        // B-only -> new_in_b.
+        ("new_only_b", "scx_beta", true, 10.0, baseline(10.0)),
+        // A-only -> removed_from_a.
+        ("removed_only_a", "scx_alpha", true, 10.0, baseline(10.0)),
+    ];
+    for (i, (name, sched, passed, spread, phases)) in sidecars.iter().enumerate() {
+        let run_dir = alt_root.path().join(format!("__phase_render_{i}__"));
+        std::fs::create_dir_all(&run_dir).expect("create run dir");
+        let sc = phase_sidecar(name, sched, *passed, *spread, phases);
+        let json = serde_json::to_string(&sc).expect("serialize sidecar");
+        std::fs::write(run_dir.join(format!("{name}_{i}.ktstr.json")), json)
+            .expect("write sidecar");
+    }
+
+    let filter_a = RowFilter {
+        schedulers: vec!["scx_alpha".to_string()],
+        ..RowFilter::default()
+    };
+    let filter_b = RowFilter {
+        schedulers: vec!["scx_beta".to_string()],
+        ..RowFilter::default()
+    };
+
+    // Default phase options: render-everything path (phase table +
+    // asymmetry table + footer hint + full summary block).
+    let exit = compare_partitions(
+        &filter_a,
+        &filter_b,
+        None,
+        &ComparisonPolicy::default(),
+        Some(alt_root.path()),
+        false,
+        &PhaseDisplayOptions::default(),
+    )
+    .expect("compare_partitions must pool the fixtures and run");
+    assert_eq!(
+        exit, 1,
+        "paired_scn's 10 -> 30 worst_spread move is a scalar regression, \
+         so the return value must be 1",
+    );
+
+    // --phase-threshold + --steps-only exercise the render-time
+    // `passes_delta_threshold` and `matches_phase` projections inside
+    // the phase block. --steps-only suppresses the BASELINE bucket
+    // (every fixture's only phase) so the phase table collapses while
+    // the scalar regression — and thus the exit code — is unchanged.
+    let opts_filtered = PhaseDisplayOptions {
+        steps_only: true,
+        phase_threshold: Some(5.0),
+        ..PhaseDisplayOptions::default()
+    };
+    let exit_filtered = compare_partitions(
+        &filter_a,
+        &filter_b,
+        None,
+        &ComparisonPolicy::default(),
+        Some(alt_root.path()),
+        false,
+        &opts_filtered,
+    )
+    .expect("compare_partitions must run under render-filter flags");
+    assert_eq!(
+        exit_filtered, 1,
+        "render-time phase filters are projection-only; the scalar \
+         regression still drives exit 1",
+    );
+
+    // --phases-only suppresses the scalar table and summary block but
+    // still returns the scalar regression count as the exit code.
+    let opts_phases_only = PhaseDisplayOptions {
+        phases_only: true,
+        ..PhaseDisplayOptions::default()
+    };
+    let exit_phases_only = compare_partitions(
+        &filter_a,
+        &filter_b,
+        None,
+        &ComparisonPolicy::default(),
+        Some(alt_root.path()),
+        false,
+        &opts_phases_only,
+    )
+    .expect("compare_partitions must run under --phases-only");
+    assert_eq!(
+        exit_phases_only, 1,
+        "--phases-only hides the scalar render but the regression \
+         count still drives the return value",
+    );
+}
+
+/// `--no-average` against a pool with two sidecars that share a
+/// pairing key on one side bails through
+/// `check_no_duplicate_pairing_keys` rather than silently latching
+/// onto the first. Drives that bail end-to-end through
+/// `compare_partitions` so the on-disk -> duplicate-detection wire
+/// is pinned (the sibling unit test pins the helper in isolation).
+#[test]
+fn compare_partitions_no_average_bails_on_duplicate_pairing_keys() {
+    let alt_root = tempfile::TempDir::new().expect("create alt-root tempdir");
+    // A side: two sidecars with the SAME scenario+topology+work_type
+    // (and every other pairing dim equal) -> identical pairing key.
+    // B side: one sidecar so the slicing-dim (scheduler) derivation
+    // is non-empty.
+    let triples = [
+        ("dup_scn", "scx_alpha"),
+        ("dup_scn", "scx_alpha"),
+        ("dup_scn", "scx_beta"),
+    ];
+    for (i, (name, sched)) in triples.iter().enumerate() {
+        let run_dir = alt_root.path().join(format!("__dup_{i}__"));
+        std::fs::create_dir_all(&run_dir).expect("create run dir");
+        let sc = phase_sidecar(name, sched, true, 10.0, &[(0, "BASELINE", 10.0)]);
+        let json = serde_json::to_string(&sc).expect("serialize sidecar");
+        std::fs::write(run_dir.join(format!("{name}_{i}.ktstr.json")), json)
+            .expect("write sidecar");
+    }
+    let filter_a = RowFilter {
+        schedulers: vec!["scx_alpha".to_string()],
+        ..RowFilter::default()
+    };
+    let filter_b = RowFilter {
+        schedulers: vec!["scx_beta".to_string()],
+        ..RowFilter::default()
+    };
+    let err = compare_partitions(
+        &filter_a,
+        &filter_b,
+        None,
+        &ComparisonPolicy::default(),
+        Some(alt_root.path()),
+        true, // no_average
+        &PhaseDisplayOptions::default(),
+    )
+    .expect_err("two A-side sidecars sharing a pairing key must bail under --no-average");
+    let rendered = format!("{err:#}");
+    assert!(
+        rendered.contains("duplicate") || rendered.contains("same pairing key"),
+        "the bail must name the duplicate-key condition; got: {rendered}",
+    );
+    assert!(
+        rendered.contains("side A"),
+        "the bail must name the offending side; got: {rendered}",
+    );
+}

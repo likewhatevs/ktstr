@@ -1135,3 +1135,260 @@ fn clean_all_sweeps_debris_alongside_published_entries() {
         "published entry must be removed by clean_all",
     );
 }
+
+// -- tail_lines coverage -------------------------------------
+
+/// `tail_lines` returns the last `n` lines joined by `\n` when the
+/// input has more than `n` lines. Pins the saturating-sub windowing
+/// at [`tail_lines`] — the function picks `start =
+/// lines.len().saturating_sub(n)` and joins from there, so a 5-line
+/// input with `n=2` yields exactly the trailing two lines.
+#[test]
+fn tail_lines_returns_last_n_lines() {
+    let text = "a\nb\nc\nd\ne";
+    assert_eq!(tail_lines(text, 2), "d\ne");
+    assert_eq!(tail_lines(text, 3), "c\nd\ne");
+}
+
+/// `tail_lines` returns the whole input (joined by `\n`) when `n`
+/// meets or exceeds the line count — `saturating_sub` floors `start`
+/// at 0 so no lines are dropped. Covers the `n >= len` branch that
+/// the trailing-stderr surface at [`build_template_via_vm`] relies on
+/// when the guest emitted fewer than `n` lines.
+#[test]
+fn tail_lines_returns_all_when_n_exceeds_line_count() {
+    let text = "one\ntwo\nthree";
+    // n equal to the line count.
+    assert_eq!(tail_lines(text, 3), "one\ntwo\nthree");
+    // n far larger than the line count — saturating_sub floors at 0.
+    assert_eq!(tail_lines(text, 100), "one\ntwo\nthree");
+}
+
+/// `tail_lines` on the empty string yields the empty string:
+/// `"".lines()` produces zero lines, `saturating_sub` floors `start`
+/// at 0, and `[].join("\n")` is `""`. Pins the no-output corner so an
+/// empty guest transcript renders cleanly in the bail message rather
+/// than panicking on an out-of-range slice.
+#[test]
+fn tail_lines_empty_input_yields_empty_string() {
+    assert_eq!(tail_lines("", 20), "");
+    assert_eq!(tail_lines("", 0), "");
+}
+
+/// `tail_lines` with `n == 0` selects zero trailing lines:
+/// `start = len.saturating_sub(0) == len`, so `lines[len..]` is an
+/// empty slice and the join is `""`. Pins the zero-window edge — a
+/// regression that used `len - n` without saturating, or off-by-one'd
+/// the slice bound, would panic or return a stray line here.
+#[test]
+fn tail_lines_zero_n_yields_empty_string() {
+    assert_eq!(tail_lines("x\ny\nz", 0), "");
+}
+
+/// `tail_lines` does not preserve a trailing newline: `str::lines`
+/// drops the final line terminator, so a `"a\nb\n"` input has two
+/// lines (`a`, `b`) and `tail_lines(.., 2)` rejoins them as `"a\nb"`
+/// (no trailing `\n`). Pins the `lines()`-then-`join("\n")` semantics
+/// so the rendered tail never carries a dangling blank line.
+#[test]
+fn tail_lines_strips_trailing_newline() {
+    assert_eq!(tail_lines("a\nb\n", 2), "a\nb");
+    // A single trailing newline = one line, no empty tail line.
+    assert_eq!(tail_lines("solo\n", 5), "solo");
+}
+
+// -- mkfs_package_hint coverage ------------------------------
+
+/// `mkfs_package_hint` returns the concrete distro-package name for
+/// [`Filesystem::Btrfs`] — `btrfs-progs`, the install target surfaced
+/// in [`locate_host_binary`]'s "binary not found" diagnostic. Pins the
+/// Btrfs arm of the exhaustive match so a regression that renames the
+/// package hint (and breaks the operator's actionable install
+/// guidance) surfaces here.
+#[test]
+fn mkfs_package_hint_btrfs_names_btrfs_progs() {
+    assert_eq!(mkfs_package_hint(Filesystem::Btrfs), "btrfs-progs");
+}
+
+/// `mkfs_package_hint` returns the documented "<none — Raw needs no
+/// formatter>" sentinel for [`Filesystem::Raw`]. The arm is
+/// unreachable in production (callers gate on
+/// `mkfs_binary_name().is_some()` first) but is retained so the match
+/// stays exhaustive at the type level; pin the sentinel text so the
+/// retained arm cannot silently drift.
+#[test]
+fn mkfs_package_hint_raw_returns_no_formatter_sentinel() {
+    assert_eq!(
+        mkfs_package_hint(Filesystem::Raw),
+        "<none — Raw needs no formatter>",
+    );
+}
+
+// -- ensure_template cache-hit fast path ---------------------
+
+/// `ensure_template(Filesystem::Raw, ..)` returns a pre-seeded cache
+/// entry WITHOUT booting a template VM. The `Raw` variant's
+/// `mkfs_binary_name()` is `None`, so `locate_host_mkfs` short-circuits
+/// to `Ok(None)` and the version fingerprint falls back to the
+/// [`NOVERSION_FP`] sentinel — no `--version` fork+exec, no PATH walk.
+/// The computed key matches [`template_cache_key`], so a same-key
+/// entry pre-published via [`store_atomic`] satisfies the first
+/// `lookup` and `ensure_template` returns at the cache-hit fast path
+/// before any `verify_cache_dir_supports_reflink` / VM-boot work.
+///
+/// This drives the cache-hit return arm of `ensure_template` (the
+/// `if let Some(hit) = lookup(...)` early return) entirely in-process:
+/// the heavy build path past the lookup is not reached because the hit
+/// short-circuits first. The empty PATH override guarantees a `Some`
+/// fingerprint result would have to be a phantom — `Raw` must not
+/// consult PATH at all.
+#[test]
+fn ensure_template_raw_returns_pre_seeded_cache_hit() {
+    let _lock = crate::test_support::test_helpers::lock_env();
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let _cache_guard =
+        crate::test_support::test_helpers::EnvVarGuard::set(crate::KTSTR_CACHE_DIR_ENV, tmp.path());
+    // Empty PATH so any (incorrect) attempt to locate a Raw formatter
+    // would fail loudly rather than silently locating a stray binary.
+    let _path_guard = crate::test_support::test_helpers::EnvVarGuard::set("PATH", tmp.path());
+
+    let capacity_bytes: u64 = 256 * 1024 * 1024;
+    // The key ensure_template computes for Raw: noversion sentinel.
+    let expected_key = template_cache_key(Filesystem::Raw, capacity_bytes, NOVERSION_FP);
+
+    // Pre-publish a fake template under that exact key so the first
+    // lookup inside ensure_template hits.
+    let cache_root_path = cache_root().unwrap();
+    std::fs::create_dir_all(&cache_root_path).unwrap();
+    let staged = cache_root_path.join("staged.img");
+    std::fs::write(&staged, b"PRE_SEEDED_RAW_TEMPLATE").unwrap();
+    let installed =
+        store_atomic(Filesystem::Raw, &expected_key, &staged).expect("pre-seed publish");
+
+    let returned = ensure_template(Filesystem::Raw, capacity_bytes)
+        .expect("ensure_template must hit the pre-seeded cache entry");
+    assert_eq!(
+        returned, installed,
+        "ensure_template must return the pre-seeded entry path via the \
+         cache-hit fast path, not rebuild",
+    );
+    // Content must be the pre-seeded body — a rebuild (which can't
+    // happen here without a VM) would have replaced it.
+    assert_eq!(
+        std::fs::read(&returned).unwrap(),
+        b"PRE_SEEDED_RAW_TEMPLATE",
+    );
+}
+
+// -- clone_to_per_test coverage ------------------------------
+
+/// `clone_to_per_test` FICLONE-clones the source into a fresh dest and
+/// returns an open RW `File` whose contents equal the source. Requires
+/// a reflink-capable cache filesystem; skipped (Ok-path asserted only)
+/// when the tempdir is not btrfs/xfs — the FICLONE ioctl returns
+/// `EOPNOTSUPP` there and the dedicated failure test
+/// (`clone_to_per_test_ficlone_failure_cleans_up_dest`) covers that
+/// branch instead.
+///
+/// On a reflink-capable host this drives the full happy path: open
+/// src (read), `create_new` the dest (RW), the FICLONE ioctl
+/// (`rc == 0`), and the returned `File`. The returned fd is opened
+/// `O_RDWR` so the assertion can read the cloned bytes straight back.
+#[test]
+fn clone_to_per_test_reflinks_source_contents_on_capable_fs() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let src = tmp.path().join("template.img");
+    let body = b"FICLONE_SOURCE_BODY_0123456789";
+    std::fs::write(&src, body).unwrap();
+    let dest = tmp.path().join("per-test.img");
+
+    match clone_to_per_test(&src, &dest) {
+        Ok(mut file) => {
+            use std::io::{Read, Seek, SeekFrom};
+            // The dest path now exists on disk.
+            assert!(dest.exists(), "FICLONE dest must exist after clone");
+            // The returned fd is RW and positioned at start; cloned
+            // bytes must equal the source verbatim.
+            file.seek(SeekFrom::Start(0)).expect("rewind cloned fd");
+            let mut got = Vec::new();
+            file.read_to_end(&mut got).expect("read cloned fd");
+            assert_eq!(
+                got, body,
+                "FICLONE clone must reproduce the source bytes exactly",
+            );
+        }
+        Err(e) => {
+            // Non-reflink tempdir (tmpfs/ext4): the ioctl fails with
+            // EOPNOTSUPP/EXDEV/EINVAL and the dest is cleaned up. The
+            // failure-path test asserts the cleanup contract; here we
+            // only confirm the error wording points the operator at a
+            // reflink-capable cache dir.
+            let msg = e.to_string();
+            assert!(
+                msg.contains("FICLONE") && msg.contains("KTSTR_CACHE_DIR"),
+                "FICLONE failure on a non-reflink fs must name the ioctl \
+                 and the cache-dir override: {msg}",
+            );
+            // Cleanup contract still holds on the failure path.
+            assert!(
+                !dest.exists(),
+                "FICLONE failure must unlink the half-written dest",
+            );
+        }
+    }
+}
+
+/// `clone_to_per_test` surfaces a pre-existing dest as a hard error
+/// via the `O_CREAT | O_EXCL` (`create_new`) open — it must NOT
+/// silently overwrite leftover per-test debris. Pins the EEXIST
+/// surface documented at the fn's "Stale per-test debris" section:
+/// the open of an already-present dest fails before the FICLONE ioctl
+/// runs, and the pre-existing file's bytes are left untouched.
+#[test]
+fn clone_to_per_test_rejects_existing_dest() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let src = tmp.path().join("template.img");
+    std::fs::write(&src, b"SRC").unwrap();
+    // Pre-create the dest so create_new (O_EXCL) trips.
+    let dest = tmp.path().join("per-test.img");
+    std::fs::write(&dest, b"LEFTOVER_DEBRIS").unwrap();
+
+    let err = clone_to_per_test(&src, &dest)
+        .expect_err("create_new must reject a pre-existing dest");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("dest path") && msg.contains("FICLONE"),
+        "EEXIST error must name the dest-open-for-FICLONE context: {msg}",
+    );
+    // The leftover file must be untouched — create_new failing must
+    // not overwrite or unlink the pre-existing debris.
+    assert_eq!(
+        std::fs::read(&dest).unwrap(),
+        b"LEFTOVER_DEBRIS",
+        "a rejected create_new must leave the pre-existing dest intact",
+    );
+}
+
+/// `clone_to_per_test` bails with the source-open context when the
+/// template source does not exist — the very first `OpenOptions::open`
+/// fails with ENOENT before any dest is created. Pins the open-src
+/// error arm: no dest file must be created when the source is missing.
+#[test]
+fn clone_to_per_test_missing_source_bails_without_creating_dest() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let missing_src = tmp.path().join("does-not-exist.img");
+    let dest = tmp.path().join("per-test.img");
+
+    let err = clone_to_per_test(&missing_src, &dest)
+        .expect_err("missing source must bail");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("open template source"),
+        "missing-source error must name the source-open context: {msg}",
+    );
+    // The dest must never be created when the source open fails first.
+    assert!(
+        !dest.exists(),
+        "a missing-source bail must not create the dest file",
+    );
+}

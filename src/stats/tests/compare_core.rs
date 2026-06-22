@@ -1743,3 +1743,96 @@ fn render_overcommit_warning_mixed_budget_per_group() {
         "one side spanning budgets across distinct scenarios -> no fold -> no warning",
     );
 }
+
+/// Mixed budgets in one pairing group with NO overcommit on either
+/// side routes through the `else` block of `render_overcommit_warning`
+/// — the "mixing two measurement conditions" message, distinct from
+/// the host-overcommit message. Each budget meets its own vCPU count
+/// (16/16, 32/32) so neither is overcommitted, but the two rows share
+/// every pairing dim and CpuBudget is sliced, so `--average` would
+/// fold them into one mean. Pins the no-overcommit-but-mixed banner
+/// text the existing per-group test never reaches (its mixed case
+/// also overcommits, taking the `if` branch).
+#[test]
+fn render_overcommit_warning_mixed_no_overcommit_uses_else_banner() {
+    let sliced = Dimension::pairing_dims(&[Dimension::CpuBudget]);
+    // Same scenario + every other pairing dim equal; two distinct
+    // budgets, each NOT overcommitted (b == v).
+    let b1 = budget_row("m", Some(16), Some(16));
+    let b2 = budget_row("m", Some(32), Some(32));
+    let clean = budget_row("n", Some(16), Some(16));
+    let text =
+        super::render_overcommit_warning(&[b1, b2], std::slice::from_ref(&clean), &sliced)
+            .expect("two non-overcommit budgets folding into one group must warn");
+    assert!(
+        text.contains("mixing two measurement conditions"),
+        "no-overcommit mixed-budget case must use the else-branch banner, \
+         not the host-overcommit banner; got: {text}",
+    );
+    assert!(
+        !text.contains("host-overcommitted run"),
+        "the else branch must NOT claim a host-overcommitted run; got: {text}",
+    );
+    assert!(
+        text.contains("side A") && text.contains("share a pairing group"),
+        "the folded side must be named with its mixed budgets; got: {text}",
+    );
+}
+
+// -- check_no_duplicate_pairing_keys --
+
+/// `check_no_duplicate_pairing_keys` returns `Ok(())` when every row
+/// on the side carries a distinct pairing key — the normal
+/// `--no-average` path where each sidecar is a unique
+/// (scenario, topology, work_type) measurement.
+#[test]
+fn check_no_duplicate_pairing_keys_ok_when_all_keys_distinct() {
+    let rows = vec![
+        cmp_row("alpha", "tiny-1llc", true, 10.0, 0),
+        cmp_row("beta", "tiny-1llc", true, 10.0, 0),
+    ];
+    assert!(
+        super::check_no_duplicate_pairing_keys(&rows, LEGACY_PAIRING_DIMS, "A").is_ok(),
+        "distinct pairing keys must pass the --no-average duplicate gate",
+    );
+    // Empty input is trivially duplicate-free.
+    assert!(
+        super::check_no_duplicate_pairing_keys(&[], LEGACY_PAIRING_DIMS, "A").is_ok(),
+        "empty side must pass the duplicate gate",
+    );
+}
+
+/// `check_no_duplicate_pairing_keys` bails when two rows on one side
+/// share a pairing key — the `--no-average` guard against
+/// `compare_rows_by` silently latching onto the first match. The bail
+/// must name the offending side and the duplicate-key condition so the
+/// operator can drop `--no-average` or add a disambiguating filter.
+#[test]
+fn check_no_duplicate_pairing_keys_bails_on_collision_and_names_side() {
+    // Two rows with the SAME (scenario, topology, work_type) under
+    // LEGACY_PAIRING_DIMS -> identical pairing key.
+    let rows = vec![
+        cmp_row("dup", "tiny-1llc", true, 10.0, 0),
+        cmp_row("dup", "tiny-1llc", true, 20.0, 0),
+    ];
+    let err = super::check_no_duplicate_pairing_keys(&rows, LEGACY_PAIRING_DIMS, "B")
+        .expect_err("two rows sharing a pairing key must bail under --no-average");
+    let rendered = format!("{err:#}");
+    assert!(
+        rendered.contains("side B"),
+        "bail must name the offending side; got: {rendered}",
+    );
+    assert!(
+        rendered.contains("same pairing key"),
+        "bail must describe the duplicate-key condition; got: {rendered}",
+    );
+    assert!(
+        rendered.contains("--no-average"),
+        "bail must point at the --no-average flag the operator can drop; got: {rendered}",
+    );
+    // The side label is lowercased into the `--b-X` suggestion.
+    assert!(
+        rendered.contains("--b-"),
+        "bail must suggest a per-side filter to disambiguate; got: {rendered}",
+    );
+}

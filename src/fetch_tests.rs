@@ -707,12 +707,15 @@ fn inspect_local_source_state_detects_mid_build_modification() {
 /// identical contents. Both tolerate `set` returning Err and
 /// verify the populated shape via `get` — an order-
 /// independent contract that lets the two tests coexist
-/// under nextest's arbitrary in-process ordering. No other
-/// test in this binary calls [`cached_releases`] or any
-/// cache-routed `fetch_*` entry
-/// ([`fetch_latest_stable_version`],
-/// [`fetch_version_for_prefix`], `latest_in_series`) with
-/// [`shared_client`] — the `expand_kernel_range`-shaped
+/// under nextest's arbitrary in-process ordering.
+/// [`series_resolution_routing_through_cache`] is the third
+/// peer that pre-populates [`RELEASES_CACHE`] with the same
+/// byte-equal synthetic vector and then drives
+/// [`fetch_version_for_prefix`], `latest_in_series`, and
+/// `version_not_found_msg` through [`shared_client`] — it
+/// follows the identical OnceLock-tolerance contract so all
+/// three populating tests coexist regardless of order. The
+/// `expand_kernel_range`-shaped
 /// tests in `cli.rs` bypass the network by calling
 /// `filter_and_sort_range` directly with synthetic
 /// releases. The
@@ -807,6 +810,166 @@ fn cached_releases_routing_singleton_path() {
         "fetch_latest_stable_version must select the first \
              stable/longterm entry with patch >= 8 from cached \
              synthetic data; got {latest:?}",
+    );
+}
+
+/// Drive the three remaining cache-routed series-resolution
+/// entries — `latest_in_series`, `version_not_found_msg`, and
+/// [`fetch_version_for_prefix`] — through the singleton +
+/// [`RELEASES_CACHE`] path, pinning their filtering / selection
+/// / message-construction arms against synthetic data with no
+/// network round-trip.
+///
+/// Coexistence: pre-populates [`RELEASES_CACHE`] with the SAME
+/// byte-equal synthetic vector that
+/// [`cached_releases_routing_singleton_path`] and
+/// [`cached_releases_with_non_singleton_bypasses_cache`] use, so
+/// whichever of the three populating tests wins the `OnceLock`
+/// `set` race leaves identical cache contents. Tolerates `set`
+/// returning Err and verifies the populated shape via `get`
+/// before asserting — the order-independent contract that lets
+/// all three coexist under nextest's arbitrary in-process
+/// ordering. Changing this vector without updating the peers
+/// would break that contract.
+///
+/// The synthetic series are `6.14.2` (stable), `6.12.81`
+/// (longterm), `6.16-rc3` (mainline). The assertions below pin:
+///
+/// - `latest_in_series` finds the in-cache `6.14.x` head;
+///   returns `None` for a sub-2-segment input (the early
+///   `parts.len() >= 2` guard); returns `None` for prefix
+///   `6.1` against a cache whose only `6.1*` rows are `6.14.x`
+///   / `6.12.x` (the `as_bytes()[prefix.len()] != b'.'` boundary
+///   guard rejects `6.14`/`6.12` as members of the `6.1` series
+///   because the byte after `6.1` is a digit, not `.`); and
+///   returns `None` for an `-rc` series (the `6.16-rc3` row's
+///   minor segment `16-rc3` fails `version_tuple`'s
+///   `parse::<u32>`).
+/// - `version_not_found_msg` emits the "latest {prefix}.x"
+///   suggestion when the series has a different head, falls back
+///   to the bare "not found" when the requested version IS the
+///   series head, and uses `version.to_string()` as the prefix
+///   for a sub-2-segment input (the `else` arm).
+/// - `fetch_version_for_prefix` selects the highest in-cache
+///   patch for a known prefix WITHOUT reaching the
+///   `probe_latest_patch` network fallback (the `6.14` series is
+///   present in the cache, so the `best.is_some()` early return
+///   fires).
+#[test]
+fn series_resolution_routing_through_cache() {
+    // SAME synthetic data the two peer cache tests use — all
+    // three populate the cache with byte-equal contents so any
+    // order leaves identical state.
+    let synthetic = vec![
+        Release {
+            moniker: "stable".to_string(),
+            version: "6.14.2".to_string(),
+        },
+        Release {
+            moniker: "longterm".to_string(),
+            version: "6.12.81".to_string(),
+        },
+        Release {
+            moniker: "mainline".to_string(),
+            version: "6.16-rc3".to_string(),
+        },
+    ];
+    let _ = super::RELEASES_CACHE.set(synthetic.clone());
+    let in_cache = super::RELEASES_CACHE.get().expect(
+        "RELEASES_CACHE must be populated after `set` — one of the \
+             three peer populating tests wins the race; all use the \
+             same synthetic so contents are byte-equal regardless of \
+             order",
+    );
+    assert_releases_eq(in_cache, &synthetic, "cache populate sanity");
+
+    let client = super::shared_client();
+
+    // -- latest_in_series --
+
+    // In-cache series: the only `6.14.x` entry is `6.14.2`, so
+    // it is the head. Proves the prefix-extraction +
+    // starts_with + `.`-boundary + version_tuple selection loop.
+    assert_eq!(
+        super::latest_in_series(client, "6.14.5").as_deref(),
+        Some("6.14.2"),
+        "latest_in_series must return the highest in-cache patch \
+             for the 6.14 series",
+    );
+    // Sub-2-segment input trips the early `parts.len() >= 2`
+    // guard and returns None before any cache iteration.
+    assert_eq!(
+        super::latest_in_series(client, "nodots"),
+        None,
+        "a single-segment version must hit the parts.len()<2 \
+             early return",
+    );
+    // Prefix `6.1` (from version `6.1.0`): the cache's `6.14.2`
+    // and `6.12.81` both start_with `6.1`, but the byte after
+    // the prefix is a digit (`4` / `2`), not `.`, so the
+    // boundary guard (`as_bytes()[prefix.len()] != b'.'`) drops
+    // both — `6.14` and `6.12` are NOT members of the `6.1`
+    // series. No `6.1.x` row exists, so the result is None.
+    assert_eq!(
+        super::latest_in_series(client, "6.1.0"),
+        None,
+        "the `.`-boundary guard must reject 6.14/6.12 as members \
+             of the 6.1 series (digit, not `.`, follows the prefix)",
+    );
+    // `-rc` series: prefix is the full `6.16-rc3` (only one dot,
+    // so split yields `[6, 16-rc3]`); the matching `6.16-rc3`
+    // row's minor segment `16-rc3` fails `version_tuple`'s
+    // `parse::<u32>`, so no tuple is produced and best stays
+    // None.
+    assert_eq!(
+        super::latest_in_series(client, "6.16-rc3"),
+        None,
+        "an -rc series resolves to None — version_tuple can't \
+             parse the `16-rc3` minor segment into a numeric tuple",
+    );
+
+    // -- version_not_found_msg --
+
+    // Requested patch absent, but the series head differs:
+    // emit the "latest {prefix}.x: {head}" suggestion arm.
+    assert_eq!(
+        super::version_not_found_msg(client, "6.14.99"),
+        "version 6.14.99 not found. latest 6.14.x: 6.14.2",
+        "a missing patch in a present series must suggest the \
+             in-cache series head",
+    );
+    // Requested version IS the series head: the
+    // `Some(latest) if latest != version` guard is false, so
+    // the bare-not-found `_` arm fires.
+    assert_eq!(
+        super::version_not_found_msg(client, "6.14.2"),
+        "version 6.14.2 not found",
+        "when the requested version equals the series head the \
+             suggestion is suppressed (latest == version guard)",
+    );
+    // Sub-2-segment input: the prefix `else` arm uses
+    // `version.to_string()` and latest_in_series returns None,
+    // so the bare-not-found `_` arm fires.
+    assert_eq!(
+        super::version_not_found_msg(client, "nodots"),
+        "version nodots not found",
+        "a single-segment version must use version.to_string() \
+             as the prefix and fall to the bare not-found arm",
+    );
+
+    // -- fetch_version_for_prefix --
+
+    // The `6.14` series is in the cache, so the selection loop
+    // finds `6.14.2` and returns via the `best.is_some()` arm —
+    // it must NOT fall through to the probe_latest_patch network
+    // fallback. A regression that skipped the cache hit would
+    // attempt a real cdn.kernel.org directory-listing GET.
+    let resolved = super::fetch_version_for_prefix(client, "6.14", "test")
+        .expect("present series must resolve from cache without network");
+    assert_eq!(
+        resolved, "6.14.2",
+        "fetch_version_for_prefix must select the highest in-cache \
+             patch for the 6.14 prefix; got {resolved:?}",
     );
 }
 

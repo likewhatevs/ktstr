@@ -1790,13 +1790,17 @@ fn result_to_exit_code_expect_auto_repro_satisfied_routes_to_pass() {
     );
 }
 
-/// Err with the marker nested inside additional `.context()`
-/// wrapping → the chain walk still surfaces it. Pins the
-/// `e.chain().any(|c| c.is::<...>())` contract against a
-/// regression that swaps the chain walk for a top-level
-/// `downcast_ref` (which would only match the outermost
-/// context). The eval layer's surrounding context wrappers
-/// (`"build ktstr_test VM"`, `"run ktstr_test VM"`) make
+/// Err with the marker attached by `.context()` and then buried under
+/// more `.context()` layers → anyhow's context-aware `downcast_ref`
+/// still surfaces it. Pins the
+/// `e.downcast_ref::<ExpectAutoReproSatisfied>().is_some()` contract:
+/// `downcast_ref` walks the full context chain, so a nested marker is
+/// found. A regression that swapped it for a `chain().any(|c| c.is::<_>())`
+/// walk would MISS the marker — anyhow boxes a context-attached value as
+/// `ContextError<C, E>`, which `is::<ExpectAutoReproSatisfied>()` never
+/// matches (the anyhow-chain-walk footgun). The test passing proves
+/// production takes the context-aware path. The eval layer's surrounding
+/// context wrappers (`"build ktstr_test VM"`, `"run ktstr_test VM"`) make
 /// nested-marker chains the production-typical shape.
 #[test]
 fn result_to_exit_code_expect_auto_repro_satisfied_works_through_nested_context() {
@@ -1807,7 +1811,7 @@ fn result_to_exit_code_expect_auto_repro_satisfied_works_through_nested_context(
     assert_eq!(
         result_to_exit_code(err, false, false),
         EXIT_PASS,
-        "nested ExpectAutoReproSatisfied must still be downcast by the chain walk"
+        "nested ExpectAutoReproSatisfied must still be found by the context-aware downcast_ref"
     );
 }
 
@@ -2404,5 +2408,380 @@ fn run_named_test_non_perf_test_skips_under_perf_only() {
     assert!(
         stderr.contains("KTSTR_PERF_ONLY is active"),
         "perf-only skip banner must explain the gate; got: {stderr}",
+    );
+}
+
+// ---------------------------------------------------------------
+// list_tests — KTSTR_BUDGET_SECS parse arms
+// ---------------------------------------------------------------
+//
+// `list_tests` (dispatch.rs:1371-1391) reads KTSTR_BUDGET_SECS and
+// branches three ways:
+//   - unset / unparseable / non-positive → fall back to
+//     `list_tests_all` (after an `eprintln!` warning for the two
+//     malformed cases),
+//   - valid positive f64 → `list_tests_budget` (which emits a
+//     `ktstr budget:` summary to stderr).
+// Each test holds `lock_env()`, clears KTSTR_KERNEL_LIST so the
+// single-kernel print path is taken, and captures stdout (the test
+// names) plus stderr (the warning / budget summary).
+
+/// A non-numeric KTSTR_BUDGET_SECS emits the parse-error warning
+/// and falls through to `list_tests_all` — the base test names
+/// still land on stdout. Pins the `Err(e) => { eprintln!(...) }`
+/// arm at dispatch.rs:1380-1383.
+#[test]
+fn list_tests_budget_non_numeric_warns_and_lists_all() {
+    use crate::test_support::test_helpers::{EnvVarGuard, capture_stderr, lock_env};
+    let _env_lock = lock_env();
+    let _budget = EnvVarGuard::set(crate::KTSTR_BUDGET_SECS_ENV, "not-a-number");
+    let _kernel_list = EnvVarGuard::remove(crate::KTSTR_KERNEL_LIST_ENV);
+    let _cargo = EnvVarGuard::remove(crate::KTSTR_CARGO_TEST_MODE_ENV);
+
+    // Nest stdout-capture inside stderr-capture so both the warning
+    // (stderr) and the fallthrough listing (stdout) are observed.
+    let ((_, stdout), stderr) =
+        capture_stderr(|| capture_stdout(|| list_tests(false)));
+    let stderr = String::from_utf8(stderr).expect("stderr is utf-8");
+    let stdout = String::from_utf8(stdout).expect("stdout is utf-8");
+    assert!(
+        stderr.contains("KTSTR_BUDGET_SECS=\"not-a-number\""),
+        "non-numeric budget must warn with the raw value; got: {stderr}",
+    );
+    assert!(
+        stderr.contains("ignoring"),
+        "parse-error warning must say it is ignoring the value; got: {stderr}",
+    );
+    // No budget summary — the budget lister was never invoked.
+    assert!(
+        !stderr.contains("ktstr budget:"),
+        "unparseable budget must NOT route through list_tests_budget; got: {stderr}",
+    );
+    // Fell through to list_tests_all: at least one base `ktstr/` line.
+    assert!(
+        stdout.lines().any(|l| l.starts_with("ktstr/") && l.ends_with(": test")),
+        "fallthrough must list base ktstr/ test names; got:\n{stdout}",
+    );
+}
+
+/// A non-positive KTSTR_BUDGET_SECS (zero / negative) emits the
+/// "must be positive" warning and falls through to
+/// `list_tests_all`. Pins the `Ok(v) => { eprintln!(...) }` arm at
+/// dispatch.rs:1376-1379, distinct from the parse-error arm above.
+#[test]
+fn list_tests_budget_non_positive_warns_and_lists_all() {
+    use crate::test_support::test_helpers::{EnvVarGuard, capture_stderr, lock_env};
+    let _env_lock = lock_env();
+    let _budget = EnvVarGuard::set(crate::KTSTR_BUDGET_SECS_ENV, "0");
+    let _kernel_list = EnvVarGuard::remove(crate::KTSTR_KERNEL_LIST_ENV);
+    let _cargo = EnvVarGuard::remove(crate::KTSTR_CARGO_TEST_MODE_ENV);
+
+    let ((_, stdout), stderr) =
+        capture_stderr(|| capture_stdout(|| list_tests(false)));
+    let stderr = String::from_utf8(stderr).expect("stderr is utf-8");
+    let stdout = String::from_utf8(stdout).expect("stdout is utf-8");
+    assert!(
+        stderr.contains("KTSTR_BUDGET_SECS=0") && stderr.contains("must be positive"),
+        "non-positive budget must warn it must be positive; got: {stderr}",
+    );
+    assert!(
+        !stderr.contains("ktstr budget:"),
+        "non-positive budget must NOT route through list_tests_budget; got: {stderr}",
+    );
+    assert!(
+        stdout.lines().any(|l| l.starts_with("ktstr/") && l.ends_with(": test")),
+        "fallthrough must list base ktstr/ test names; got:\n{stdout}",
+    );
+}
+
+/// A valid positive KTSTR_BUDGET_SECS routes through
+/// `list_tests_budget`, which emits a `ktstr budget:` summary line
+/// to stderr. Pins the `Some(budget) => list_tests_budget(...)`
+/// arm at dispatch.rs:1386-1388. A generous budget keeps the
+/// selector inclusive so the path is exercised regardless of the
+/// registered test set's estimated durations.
+#[test]
+fn list_tests_budget_valid_routes_to_budget_lister() {
+    use crate::test_support::test_helpers::{EnvVarGuard, capture_stderr, lock_env};
+    let _env_lock = lock_env();
+    let _budget = EnvVarGuard::set(crate::KTSTR_BUDGET_SECS_ENV, "100000");
+    let _kernel_list = EnvVarGuard::remove(crate::KTSTR_KERNEL_LIST_ENV);
+    let _cargo = EnvVarGuard::remove(crate::KTSTR_CARGO_TEST_MODE_ENV);
+
+    let ((_, _stdout), stderr) =
+        capture_stderr(|| capture_stdout(|| list_tests(false)));
+    let stderr = String::from_utf8(stderr).expect("stderr is utf-8");
+    assert!(
+        stderr.contains("ktstr budget:"),
+        "a valid budget must route through list_tests_budget (its \
+         `ktstr budget:` summary); got: {stderr}",
+    );
+}
+
+// ---------------------------------------------------------------
+// list_verifier_cells_all — empty / scheduler-free kernel list
+// ---------------------------------------------------------------
+
+/// With KTSTR_KERNEL_LIST unset, `list_verifier_cells_all` returns
+/// immediately and emits nothing. Pins the
+/// `if kernel_list.is_empty() { return; }` early-return at
+/// dispatch.rs:1669-1671 — the verifier matrix dimension is
+/// KTSTR_KERNEL_LIST, so an absent list means zero cells.
+#[test]
+fn list_verifier_cells_all_empty_kernel_list_emits_nothing() {
+    use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
+    let _env_lock = lock_env();
+    let _kernel_list = EnvVarGuard::remove(crate::KTSTR_KERNEL_LIST_ENV);
+
+    let (_, captured) = capture_stdout(list_verifier_cells_all);
+    let stdout = std::str::from_utf8(&captured).expect("utf-8");
+    assert!(
+        stdout.is_empty(),
+        "empty KTSTR_KERNEL_LIST must emit zero verifier cells; got:\n{stdout}",
+    );
+}
+
+/// With a populated KTSTR_KERNEL_LIST but NO declared schedulers in
+/// this binary's `KTSTR_SCHEDULERS` slice (the lib test binary
+/// registers none), `list_verifier_cells_all` runs the post-early-
+/// return setup (presets / host_capacity / no_perf_mode at
+/// dispatch.rs:1672-1674) and then iterates zero schedulers — so no
+/// `verifier/` line is ever printed. Pins that a kernel list alone
+/// does not synthesize cells without a scheduler to pair them with.
+#[test]
+fn list_verifier_cells_all_no_schedulers_emits_no_cells() {
+    use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
+    let _env_lock = lock_env();
+    let _kernel_list = EnvVarGuard::set(crate::KTSTR_KERNEL_LIST_ENV, TWO_KERNEL_LIST);
+
+    let (_, captured) = capture_stdout(list_verifier_cells_all);
+    let stdout = std::str::from_utf8(&captured).expect("utf-8");
+    assert!(
+        !stdout.lines().any(|l| l.starts_with("verifier/")),
+        "zero declared schedulers must yield zero `verifier/` cells even \
+         with a populated kernel list; got:\n{stdout}",
+    );
+}
+
+// ---------------------------------------------------------------
+// run_verifier_cell — scheduler-not-found branch (post-check_kvm)
+// ---------------------------------------------------------------
+
+/// A syntactically-valid 3-part cell name whose scheduler is not in
+/// `KTSTR_SCHEDULERS` (the lib test binary declares none) exits 1
+/// via the "no declared scheduler" branch at dispatch.rs:1786-1792.
+/// This branch is gated behind `check_kvm()` (dispatch.rs:1781), so
+/// the test runs the branch only when KVM is actually available —
+/// when `check_kvm()` errors (no /dev/kvm, or permission denied)
+/// the run_verifier_cell call would exit 1 via the KVM-preflight
+/// branch instead, so the test skips cleanly to keep the asserted
+/// branch deterministic. The cell banner (printed before every
+/// branch) lands on stdout; the not-found diagnostic on stderr.
+#[test]
+fn run_verifier_cell_unknown_scheduler_exits_one() {
+    use crate::test_support::test_helpers::capture_stderr;
+    // Gate on real KVM availability so the asserted branch is the
+    // scheduler-not-found one, not the KVM-preflight one. Mirrors the
+    // geteuid()-gate pattern the build_host_cgroup_manager tests use.
+    if crate::cli::check_kvm().is_err() {
+        return;
+    }
+    let (code, captured) = capture_stderr(|| {
+        // Banner goes to stdout; swallow it so only the diagnostic
+        // is examined. The 3 parts are sched/kernel/preset.
+        let (code, _stdout) =
+            capture_stdout(|| run_verifier_cell("verifier/__no_such_sched__/kernel_x/tiny-1llc"));
+        code
+    });
+    assert_eq!(code, 1, "unknown scheduler cell must exit 1");
+    let stderr = String::from_utf8(captured).expect("stderr is utf-8");
+    assert!(
+        stderr.contains("no declared scheduler")
+            && stderr.contains("__no_such_sched__"),
+        "exit 1 must come from the scheduler-not-found branch naming the \
+         missing scheduler; got: {stderr}",
+    );
+}
+
+/// Unconditional companion to the KVM-gated test above (which SKIPs on a
+/// no-KVM runner and would otherwise read as PASS without exercising
+/// anything). Pins the scheduler-lookup invariant the exit-1 branch
+/// depends on: a name absent from `KTSTR_SCHEDULERS` does not resolve, so
+/// the `find(|s| s.name == sched_name)` returns `None` and the cell exits
+/// 1. The lib test binary declares zero schedulers, so any name is
+/// absent; the gated test exercises the surrounding `run_verifier_cell`
+/// exit path when KVM is present. This runs everywhere, so the
+/// precondition is verified even where the gated test cannot.
+#[test]
+fn unknown_scheduler_is_absent_from_registry() {
+    assert!(
+        crate::test_support::KTSTR_SCHEDULERS
+            .iter()
+            .all(|s| s.name != "__no_such_sched__"),
+        "an unknown scheduler name must not resolve in KTSTR_SCHEDULERS — \
+         the precondition run_verifier_cell's scheduler-not-found exit-1 \
+         branch relies on",
+    );
+}
+
+// ---------------------------------------------------------------
+// run_host_only_test — host-side dispatch (no VM)
+// ---------------------------------------------------------------
+
+/// `run_host_only_test` (dispatch.rs:2204-2207) runs a host_only
+/// entry on the host with no VM: it resolves real-host sysfs
+/// topology, builds a cgroup manager (no setup), builds a Ctx, and
+/// calls the entry's `func`, then projects the AssertResult through
+/// `result_to_exit_code`. The registered `__HOST_ONLY_LISTING_ENTRY`
+/// fixture's func returns `AssertResult::pass()` and touches no
+/// cgroup, so the call needs neither root nor a VM and must exit 0.
+/// Pins the host_only dispatch wrapper against a regression that
+/// routed host_only tests through the VM path.
+#[test]
+fn run_host_only_test_passing_entry_exits_zero() {
+    use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
+    // resolve_host_cgroup_parent reads KTSTR_HOST_CGROUP_PARENT;
+    // KTSTR_CGROUP_WALK_ROOT feeds build_host_cgroup_manager. Hold the
+    // env lock and clear both so the resolve cascade takes its default
+    // path deterministically regardless of a concurrent setter.
+    let _env_lock = lock_env();
+    let _parent = EnvVarGuard::remove(crate::KTSTR_HOST_CGROUP_PARENT_ENV);
+    let _walk = EnvVarGuard::remove(crate::KTSTR_CGROUP_WALK_ROOT_ENV);
+
+    let entry = find_test(HOST_ONLY_LISTING_NAME)
+        .expect("the host_only listing fixture must be registered in KTSTR_TESTS");
+    assert!(entry.host_only, "fixture must be host_only");
+    let code = run_host_only_test(entry);
+    assert_eq!(
+        code, 0,
+        "a passing host_only entry must dispatch on the host and exit 0 \
+         (no VM, no root)",
+    );
+}
+
+// ---------------------------------------------------------------
+// run_gauntlet_test — topo derivation reached before skip gate
+// ---------------------------------------------------------------
+
+/// `run_gauntlet_test` with a registered `performance_mode` entry
+/// and a real preset name derives the per-preset TopoOverride
+/// (dispatch.rs:2406-2413: memory_mib + TopoOverride from the
+/// preset topology) and THEN hits the perf-mode skip gate
+/// (dispatch.rs:2415-2422) under KTSTR_NO_PERF_MODE, returning 0
+/// with no VM. Drives the topo-derivation lines that the existing
+/// `run_gauntlet_test_*` error-branch tests never reach (they bail
+/// at the name-parse / preset-lookup guards before topo derivation).
+/// KTSTR_SIDECAR_DIR is redirected to a tempdir so the skip
+/// sidecar `record_skip_sidecar` writes does not pollute the shared
+/// run dir.
+#[test]
+fn run_gauntlet_test_perf_mode_entry_derives_topo_then_skips() {
+    use crate::test_support::test_helpers::{EnvVarGuard, capture_stderr, lock_env};
+    let _env_lock = lock_env();
+    let _no_perf = EnvVarGuard::set(crate::KTSTR_NO_PERF_MODE_ENV, "1");
+    let _perf_only = EnvVarGuard::remove(crate::KTSTR_PERF_ONLY_ENV);
+    let sidecar_dir = tempfile::tempdir().expect("create sidecar tempdir");
+    let _sidecar = EnvVarGuard::set(crate::KTSTR_SIDECAR_DIR_ENV, sidecar_dir.path());
+
+    // `tiny-1llc` is the first gauntlet preset (gauntlet.rs:42) — a
+    // real preset so the preset-lookup guard passes and topo
+    // derivation runs.
+    let (code, captured) = capture_stderr(|| {
+        run_gauntlet_test(&format!("{PERF_MODE_SKIP_NAME}/tiny-1llc"))
+    });
+    assert_eq!(
+        code, 0,
+        "perf_mode gauntlet variant under --no-perf-mode must skip → exit 0 \
+         after deriving the preset topology",
+    );
+    let stderr = String::from_utf8(captured).expect("stderr is utf-8");
+    assert!(
+        stderr.contains("requires performance_mode but --no-perf-mode"),
+        "skip must come from the perf-mode gate (reached only AFTER topo \
+         derivation); got: {stderr}",
+    );
+}
+
+// ---------------------------------------------------------------
+// ktstr_list_only / warn_duplicate_test_names_once
+// ---------------------------------------------------------------
+
+/// `ktstr_list_only` (dispatch.rs:2547-2551) reads argv for
+/// `--ignored`, then delegates to `list_tests`, which prints the
+/// `ktstr/{name}: test` names to stdout and RETURNS (unlike
+/// `ktstr_main`, which `process::exit`s). Pins the
+/// return-don't-exit listing entry point against a regression that
+/// routed it through the exiting handler. The bucket
+/// (`--ignored`-only vs all) is read from the test process's own
+/// argv exactly as `ktstr_list_only` reads it, so the assertion is
+/// keyed on the SAME bucket the function selected: the host_only
+/// fixture is non-`demo_` (not ignored), so it appears only in the
+/// all-tests bucket — under an `--ignored` argv the bucket is empty
+/// of this fixture and the assertion correctly relaxes to "function
+/// returned without exiting".
+#[test]
+fn ktstr_list_only_prints_test_names_and_returns() {
+    use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
+    let _env_lock = lock_env();
+    // Single-kernel listing + no budget filtering so the plain
+    // `ktstr/{name}: test` shape is emitted for the host_only fixture.
+    let _kernel_list = EnvVarGuard::remove(crate::KTSTR_KERNEL_LIST_ENV);
+    let _budget = EnvVarGuard::remove(crate::KTSTR_BUDGET_SECS_ENV);
+    let _cargo = EnvVarGuard::remove(crate::KTSTR_CARGO_TEST_MODE_ENV);
+
+    // Mirror the bucket selection inside ktstr_list_only so the
+    // assertion is deterministic regardless of how the harness
+    // invoked the binary (a `--ignored` argv selects the
+    // ignored-only bucket, which excludes the non-`demo_` host_only
+    // fixture).
+    let ignored_only = std::env::args().any(|a| a == "--ignored");
+
+    let (_, captured) = capture_stdout(ktstr_list_only);
+    let stdout = std::str::from_utf8(&captured).expect("utf-8");
+    let want = format!("ktstr/{HOST_ONLY_LISTING_NAME}: test");
+    if ignored_only {
+        // Ignored-only bucket: the non-ignored host_only fixture
+        // must NOT appear; the function still returned (no exit).
+        assert!(
+            !stdout.contains(&want),
+            "the non-ignored host_only fixture must be absent from the \
+             --ignored bucket; got:\n{stdout}",
+        );
+    } else {
+        // All-tests bucket: the registered host_only fixture must
+        // appear with its bare `ktstr/<name>: test` form.
+        assert!(
+            stdout.contains(&want),
+            "ktstr_list_only must print the registered host_only fixture's \
+             base name in the all-tests bucket; got:\n{stdout}",
+        );
+    }
+}
+
+/// `warn_duplicate_test_names_once` (dispatch.rs:1306-1309) gates
+/// its walk through a process-wide `OnceLock<()>`. The walk itself
+/// (whose detection logic is pinned by the
+/// `warn_duplicate_test_names_inner_*` tests above) is fired against
+/// the real `KTSTR_TESTS` slice; this test only pins the wrapper's
+/// idempotence contract: calling it (possibly again, after the
+/// production listing path or a sibling test already fired the gate)
+/// must complete without panicking — the `get_or_init` closure runs
+/// at most once per process and is a no-op on every subsequent call.
+#[test]
+fn warn_duplicate_test_names_once_is_idempotent_and_panic_free() {
+    use crate::test_support::test_helpers::capture_stderr;
+    // Both calls are captured so the (at most one) emission does not
+    // leak onto the test runner's stderr, and so a panic inside the
+    // OnceLock closure would surface as a test failure rather than a
+    // captured-output artifact.
+    let (_, _first) = capture_stderr(warn_duplicate_test_names_once);
+    // Second call must be a pure no-op: the OnceLock is already
+    // initialized, so the closure does not run again.
+    let (_, second) = capture_stderr(warn_duplicate_test_names_once);
+    assert!(
+        second.is_empty(),
+        "the second warn_duplicate_test_names_once call must emit nothing \
+         (OnceLock already fired); got: {:?}",
+        String::from_utf8_lossy(&second),
     );
 }

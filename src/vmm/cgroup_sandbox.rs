@@ -1909,4 +1909,167 @@ mod tests {
             "hybrid input with no 0:: entry must error",
         );
     }
+
+    // ---------------------------------------------------------------
+    // sweep_orphan_sandboxes — the proceed-to-remove path
+    // ---------------------------------------------------------------
+
+    /// `sweep_orphan_sandboxes` REMOVES a `ktstr-build-{pid}` orphan
+    /// whose embedded pid is dead AND whose mtime is past
+    /// `ORPHAN_MAX_AGE`. Every existing sweep test exercises a SKIP
+    /// branch (non-ktstr name, unparseable pid, live pid, young
+    /// mtime) and so never reaches the `sweep_skip_reason(..).is_some()
+    /// == false` fall-through that builds a real `CgroupManager` and
+    /// calls `remove_cgroup`. This pins that removal path: the parent
+    /// is a plain tempdir, the orphan is a flat empty directory (so the
+    /// real `CgroupManager::remove_cgroup` short-circuits drain on the
+    /// absent `cgroup.procs` and `fs::remove_dir`s the empty entry).
+    ///
+    /// The pid is fork-then-reaped so `kill(pid, 0)` returns ESRCH;
+    /// the mtime is shifted 48h back (> ORPHAN_MAX_AGE of 24h) via
+    /// `libc::utime`, matching the gate-test helper pattern.
+    #[test]
+    fn sweep_orphan_sandboxes_removes_dead_pid_old_orphan() {
+        // Fork + reap so the pid is provably dead (ESRCH on kill).
+        // SAFETY: child runs only `_exit(0)` (no Rust destructors
+        // between fork and _exit); the parent reaps it before using
+        // the pid, so no zombie lingers and the pid is unallocated.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork must succeed");
+        if pid == 0 {
+            unsafe {
+                libc::_exit(0);
+            }
+        }
+        let mut status: libc::c_int = 0;
+        let rc = unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert_eq!(rc, pid, "waitpid must reap our child");
+
+        let parent = tempfile::Builder::new()
+            .prefix("ktstr-sandbox-remove-orphan-")
+            .tempdir()
+            .unwrap();
+        let orphan = parent.path().join(format!("ktstr-build-1700000000000-{pid}"));
+        std::fs::create_dir(&orphan).unwrap();
+
+        // Shift the orphan's mtime 48h into the past so the
+        // mtime gate (>= ORPHAN_MAX_AGE) is open.
+        let old = std::time::SystemTime::now()
+            .checked_sub(Duration::from_secs(48 * 60 * 60))
+            .expect("time arithmetic");
+        let secs = old
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("post-epoch")
+            .as_secs();
+        let buf = libc::utimbuf {
+            actime: secs as libc::time_t,
+            modtime: secs as libc::time_t,
+        };
+        let cpath = std::ffi::CString::new(orphan.to_str().expect("utf8")).expect("nul-free");
+        // SAFETY: `cpath` is a valid nul-terminated path to the
+        // just-created directory; `&buf` is a live aligned struct on
+        // this frame. utime(2) is safe with these arguments.
+        let utime_rc = unsafe { libc::utime(cpath.as_ptr(), &buf) };
+        assert_eq!(utime_rc, 0, "utime must succeed on the orphan dir");
+
+        assert!(orphan.exists(), "orphan must exist before the sweep");
+        sweep_orphan_sandboxes(parent.path());
+        assert!(
+            !orphan.exists(),
+            "dead-pid + old-mtime orphan must be removed by the sweep",
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // MockCgroupOps — every recorded trait method + return value
+    // ---------------------------------------------------------------
+
+    /// Drive every `MockCgroupOps` trait method that the rollback
+    /// tests don't touch, asserting each records its formatted call
+    /// string and returns the documented value. The rollback tests
+    /// only exercise `set_cpuset` / `set_cpuset_mems` / `move_task` /
+    /// `remove_cgroup`; this covers the remaining
+    /// `CgroupOps` arms (`parent_path`, `setup`, `create_cgroup`,
+    /// `clear_cpuset`, the `set_*` knobs, `move_tasks`,
+    /// `place_task_during_handshake`, `clear_subtree_control`,
+    /// `drain_tasks`, `read_procs`, `cleanup_all`) so a refactor that
+    /// breaks the mock's call-recording contract — which the rollback
+    /// tests rely on for their `calls_snapshot` assertions — is caught.
+    ///
+    /// Invoked through `&dyn CgroupOps` (not the concrete struct) so
+    /// the trait-object dispatch the production seam uses is what's
+    /// exercised.
+    #[test]
+    fn mock_cgroup_ops_records_every_method_and_returns() {
+        let mock = MockCgroupOps::default();
+        let ops: &dyn crate::cgroup::CgroupOps = &mock;
+
+        // parent_path is the fixed sentinel "/mock".
+        assert_eq!(
+            ops.parent_path(),
+            Path::new("/mock"),
+            "mock parent_path is the /mock sentinel",
+        );
+
+        let controllers: BTreeSet<crate::cgroup::Controller> =
+            [crate::cgroup::Controller::Cpuset].into_iter().collect();
+        ops.setup(&controllers).expect("setup ok");
+        ops.create_cgroup("c").expect("create_cgroup ok");
+        ops.clear_cpuset("c").expect("clear_cpuset ok");
+        ops.clear_cpuset_mems("c").expect("clear_cpuset_mems ok");
+        ops.set_cpu_max("c", Some(100_000), 100_000)
+            .expect("set_cpu_max ok");
+        ops.set_cpu_weight("c", 100).expect("set_cpu_weight ok");
+        ops.set_memory_max("c", Some(1 << 30))
+            .expect("set_memory_max ok");
+        ops.set_memory_high("c", None).expect("set_memory_high ok");
+        ops.set_memory_low("c", Some(0)).expect("set_memory_low ok");
+        ops.set_io_weight("c", 100).expect("set_io_weight ok");
+        ops.set_freeze("c", true).expect("set_freeze ok");
+        ops.set_pids_max("c", Some(512)).expect("set_pids_max ok");
+        ops.set_memory_swap_max("c", None)
+            .expect("set_memory_swap_max ok");
+        ops.move_tasks("c", &[7, 8]).expect("move_tasks ok");
+        ops.place_task_during_handshake("c", 9)
+            .expect("place_task_during_handshake ok");
+        ops.clear_subtree_control("c")
+            .expect("clear_subtree_control ok");
+        ops.drain_tasks("c").expect("drain_tasks ok");
+
+        // read_procs returns an empty Vec (the mock's documented
+        // "no tasks" shape).
+        let procs = ops.read_procs("c").expect("read_procs ok");
+        assert!(procs.is_empty(), "mock read_procs returns no pids");
+
+        ops.cleanup_all().expect("cleanup_all ok");
+
+        // Exact recorded order, with the `set_freeze(name,frozen)`
+        // and `place_task_during_handshake(name,pid)` formats pinned.
+        let calls = mock.calls_snapshot();
+        assert_eq!(
+            calls,
+            vec![
+                "setup".to_string(),
+                "create_cgroup(c)".to_string(),
+                "clear_cpuset(c)".to_string(),
+                "clear_cpuset_mems(c)".to_string(),
+                "set_cpu_max(c)".to_string(),
+                "set_cpu_weight(c)".to_string(),
+                "set_memory_max(c)".to_string(),
+                "set_memory_high(c)".to_string(),
+                "set_memory_low(c)".to_string(),
+                "set_io_weight(c)".to_string(),
+                "set_freeze(c,true)".to_string(),
+                "set_pids_max(c)".to_string(),
+                "set_memory_swap_max(c)".to_string(),
+                "move_tasks(c)".to_string(),
+                "place_task_during_handshake(c,9)".to_string(),
+                "clear_subtree_control(c)".to_string(),
+                "drain_tasks(c)".to_string(),
+                "read_procs(c)".to_string(),
+                "cleanup_all".to_string(),
+            ],
+            "every mock method must record its formatted call in order",
+        );
+    }
 }

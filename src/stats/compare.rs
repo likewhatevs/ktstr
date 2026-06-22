@@ -1701,7 +1701,7 @@ pub fn compare_partitions(
 /// iteration order. Names the offending key in the diagnostic
 /// so the operator can choose to either drop `--no-average` or
 /// add another per-side filter to disambiguate.
-fn check_no_duplicate_pairing_keys(
+pub(crate) fn check_no_duplicate_pairing_keys(
     rows: &[GauntletRow],
     pairing_dims: &[Dimension],
     side_label: &str,

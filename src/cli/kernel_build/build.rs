@@ -722,11 +722,7 @@ pub fn kernel_build_pipeline(
         // is force-marked dirty (see `acquire_local_source` in
         // `fetch.rs`) because dirty detection is impossible, and
         // telling the operator to "commit or stash" leads nowhere.
-        let hint = if acquired.is_git {
-            DIRTY_TREE_CACHE_SKIP_HINT
-        } else {
-            NON_GIT_TREE_CACHE_SKIP_HINT
-        };
+        let hint = dirty_cache_skip_hint(acquired.is_git);
         eprintln!("{cli_label}: {hint}");
         return Ok(KernelBuildResult {
             entry: None,
@@ -757,12 +753,11 @@ pub fn kernel_build_pipeline(
     if is_local_source {
         match crate::fetch::inspect_local_source_state(source_dir) {
             Ok(post) => {
-                let hash_changed = post.short_hash
-                    != acquired
-                        .kernel_source
-                        .as_local_git_hash()
-                        .map(str::to_string);
-                if post.is_dirty || hash_changed {
+                let (skip, hash_changed) = post_build_cache_store_skip(
+                    &post,
+                    acquired.kernel_source.as_local_git_hash(),
+                );
+                if skip {
                     eprintln!(
                         "{cli_label}: source tree changed during build \
                          (acquire-time dirty={}, post-build dirty={}; \
@@ -794,13 +789,7 @@ pub fn kernel_build_pipeline(
         }
     }
 
-    let config_path = source_dir.join(".config");
-    let config_hash = if config_path.exists() {
-        let data = std::fs::read(&config_path)?;
-        Some(format!("{:08x}", crc32fast::hash(&data)))
-    } else {
-        None
-    };
+    let config_hash = config_hash_for(source_dir)?;
 
     // Two-segment metadata: the bare baked-in hash stays in
     // `ktstr_kconfig_hash` so `kernel list`'s matches/stale/
@@ -820,21 +809,7 @@ pub fn kernel_build_pipeline(
     // case there's nothing to stat. mtime read is best-effort:
     // failure leaves the validation pair `None` and prefers the
     // pre-validation behavior for this entry.
-    let source_vmlinux_stat = vmlinux_ref.and_then(|v| {
-        let stat = std::fs::metadata(v).ok()?;
-        let mtime_secs = stat.modified().ok().and_then(|t| {
-            t.duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs() as i64)
-                .ok()
-                .or_else(|| {
-                    std::time::UNIX_EPOCH
-                        .duration_since(t)
-                        .ok()
-                        .map(|d| -(d.as_secs() as i64))
-                })
-        })?;
-        Some((stat.len(), mtime_secs))
-    });
+    let source_vmlinux_stat = source_vmlinux_stat_for(vmlinux_ref);
 
     let mut metadata = crate::cache::KernelMetadata::new(
         acquired.kernel_source.clone(),
@@ -880,6 +855,78 @@ pub fn kernel_build_pipeline(
         image_path,
         post_build_is_dirty: false,
     })
+}
+
+/// CRC32 of `<source_dir>/.config` rendered as a fixed 8-hex-digit
+/// lowercase string, or `None` when no `.config` exists. The
+/// zero-padded `{:08x}` width is the cache-key suffix contract — a
+/// `{:x}` (no pad) would drop a leading-zero nibble and silently
+/// re-key every cached build, defeating cache hits. Pulled out of
+/// [`kernel_build_pipeline`] so the derivation is unit-testable
+/// without a real `make`.
+pub(crate) fn config_hash_for(source_dir: &Path) -> std::io::Result<Option<String>> {
+    let config_path = source_dir.join(".config");
+    if config_path.exists() {
+        let data = std::fs::read(&config_path)?;
+        Ok(Some(format!("{:08x}", crc32fast::hash(&data))))
+    } else {
+        Ok(None)
+    }
+}
+
+/// `(size, mtime_secs)` of the source-tree vmlinux, or `None` when the
+/// path is absent or unstattable. `mtime_secs` is signed seconds since
+/// the epoch — a pre-epoch mtime (clock skew) maps to a negative
+/// count rather than dropping the stat. The `None` short-circuit on a
+/// missing vmlinux keeps a later `prefer_source_tree_for_dwarf`
+/// staleness check from comparing against a phantom `(0, _)`. Pulled
+/// out of [`kernel_build_pipeline`] for unit-testability.
+pub(crate) fn source_vmlinux_stat_for(vmlinux_ref: Option<&Path>) -> Option<(u64, i64)> {
+    let v = vmlinux_ref?;
+    let stat = std::fs::metadata(v).ok()?;
+    let mtime_secs = stat.modified().ok().and_then(|t| {
+        t.duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .ok()
+            .or_else(|| {
+                std::time::UNIX_EPOCH
+                    .duration_since(t)
+                    .ok()
+                    .map(|d| -(d.as_secs() as i64))
+            })
+    })?;
+    Some((stat.len(), mtime_secs))
+}
+
+/// The cache-skip hint wording for a dirty local source tree. A git
+/// repo can be remediated by commit/stash; a non-git tree is
+/// force-marked dirty (dirty detection is impossible) so commit/stash
+/// advice is unactionable — it gets the put-under-git wording
+/// instead. Pulled out of [`kernel_build_pipeline`] for
+/// unit-testability.
+pub(crate) fn dirty_cache_skip_hint(is_git: bool) -> &'static str {
+    if is_git {
+        DIRTY_TREE_CACHE_SKIP_HINT
+    } else {
+        NON_GIT_TREE_CACHE_SKIP_HINT
+    }
+}
+
+/// The post-build cache-store-skip decision. After `make` returns,
+/// `inspect_local_source_state` is re-run; the store is skipped when
+/// the worktree went dirty during the build OR HEAD advanced (a
+/// concurrent commit), because the acquire-time cache key no longer
+/// identifies the built input. Returns `(skip, hash_changed)` so the
+/// caller both decides and reports `hash_changed` in the skip message.
+/// `acquired_local_git_hash` is the acquire-time hash from
+/// [`crate::cache::KernelMetadata::as_local_git_hash`]. Pulled out of
+/// [`kernel_build_pipeline`] for unit-testability.
+pub(crate) fn post_build_cache_store_skip(
+    post: &crate::fetch::LocalSourceState,
+    acquired_local_git_hash: Option<&str>,
+) -> (bool, bool) {
+    let hash_changed = post.short_hash != acquired_local_git_hash.map(str::to_string);
+    (post.is_dirty || hash_changed, hash_changed)
 }
 
 #[cfg(test)]
@@ -2020,6 +2067,225 @@ mod tests {
             sandbox_pos < plan_pos,
             "_sandbox MUST be declared before plan so cgroup rmdir \
              runs BEFORE LLC flock release on Drop. Debug: {dbg}",
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Post-build metadata-derivation arms inside
+    // `kernel_build_pipeline`. These pure-logic blocks (config_hash
+    // CRC32, source_vmlinux_stat, the dirty-tree cache-skip hint, the
+    // post-build dirty re-check store decision) are unreachable through
+    // the public `kernel_build_pipeline` entry without a real `make`
+    // invocation, so each was extracted into a `pub(crate)` helper
+    // (`config_hash_for`, `source_vmlinux_stat_for`,
+    // `dirty_cache_skip_hint`, `post_build_cache_store_skip`) that both
+    // the pipeline and these tests call — so the tests exercise the
+    // real production code, not a copy.
+    // ---------------------------------------------------------------
+
+    /// Drives the production [`config_hash_for`] helper (extracted from
+    /// `kernel_build_pipeline`). Pins: (1) absent `.config` yields
+    /// `None`; (2) present `.config` hashes to `crc32fast::hash` of the
+    /// exact bytes; (3) the `{:08x}` zero-pad is load-bearing.
+    ///
+    /// Property (2) is checked against an INDEPENDENT `crc32fast::hash`
+    /// so a hasher swap diverges. Property (3) is checked with an input
+    /// whose CRC32 has a leading-zero nibble: a `{:x}` regression would
+    /// drop the leading zero, shortening the hash below 8 chars and
+    /// silently re-keying every cached build.
+    #[test]
+    fn config_hash_derivation_matches_crc32_and_width() {
+        let tmp = tempfile::TempDir::new().expect("config tempdir");
+        let source_dir = tmp.path();
+
+        // Absent `.config` arm: the production `else { None }` branch.
+        assert_eq!(
+            config_hash_for(source_dir).expect("absent-config read"),
+            None,
+            "no .config must yield None config_hash",
+        );
+
+        // Present `.config` arm: hash matches an independent crc32fast.
+        let body = b"CONFIG_SCHED_CLASS_EXT=y\nCONFIG_BPF=y\n";
+        std::fs::write(source_dir.join(".config"), body).expect("write .config");
+        let present = config_hash_for(source_dir).expect("present-config read");
+        let expected = format!("{:08x}", crc32fast::hash(body));
+        assert_eq!(
+            present.as_deref(),
+            Some(expected.as_str()),
+            "present .config must hash to crc32fast::hash of its bytes",
+        );
+
+        // Width guard: find an input whose CRC32 has a leading-zero
+        // nibble (< 0x1000_0000) so the `{:08x}` zero-pad is the only
+        // thing keeping the rendered hash at 8 chars. A `{:x}`
+        // regression would render it as 7 chars and fail the length
+        // assert below. The probe sequence is deterministic; ~1 in 16
+        // inputs qualifies, so 10k iterations always finds one.
+        let probe = (0u32..10_000)
+            .map(|n| format!("probe-{n}"))
+            .find(|p| crc32fast::hash(p.as_bytes()) < 0x1000_0000)
+            .expect("a leading-zero CRC32 within 10k probes");
+        std::fs::write(source_dir.join(".config"), probe.as_bytes()).expect("rewrite .config");
+        let zh = config_hash_for(source_dir)
+            .expect("probe read")
+            .expect("present .config must hash");
+        assert_eq!(zh.len(), 8, "config_hash must always be 8 hex chars ({{:08x}}): {zh}");
+        assert!(zh.starts_with('0'), "leading-zero CRC32 must keep its zero pad: {zh}");
+        assert!(
+            zh.bytes().all(|b| b.is_ascii_hexdigit()),
+            "config_hash must be lowercase hex: {zh}",
+        );
+    }
+
+    /// Drives the production [`source_vmlinux_stat_for`] helper
+    /// (extracted from `kernel_build_pipeline`). Pins three arms: a
+    /// `None` ref, a ref to a missing file, and a present file.
+    ///
+    /// Failure mode pinned: a regression that dropped the `None`
+    /// short-circuit (yielding `Some((0, _))` for an absent/missing
+    /// vmlinux) or returned the wrong size would defeat the
+    /// `prefer_source_tree_for_dwarf` staleness check that compares
+    /// this stat against a later read.
+    #[test]
+    fn source_vmlinux_stat_present_and_absent_arms() {
+        let tmp = tempfile::TempDir::new().expect("vmlinux tempdir");
+        let vmlinux_path = tmp.path().join("vmlinux");
+
+        // None ref → short-circuits to None.
+        assert_eq!(
+            source_vmlinux_stat_for(None),
+            None,
+            "a None vmlinux_ref must yield None",
+        );
+        // Ref to a non-existent file → metadata fails → None (NOT a
+        // phantom (0, _)).
+        assert_eq!(
+            source_vmlinux_stat_for(Some(vmlinux_path.as_path())),
+            None,
+            "a vmlinux_ref to a missing file must yield None, not (0, _)",
+        );
+
+        // Present file → (real length, positive post-epoch mtime).
+        let body = b"\x7fELF fake vmlinux payload bytes for stat";
+        std::fs::write(&vmlinux_path, body).expect("write vmlinux");
+        let (size, mtime_secs) = source_vmlinux_stat_for(Some(vmlinux_path.as_path()))
+            .expect("present vmlinux must stat to Some");
+        assert_eq!(
+            size,
+            body.len() as u64,
+            "stat size must equal the real source-tree vmlinux length",
+        );
+        assert!(
+            mtime_secs > 0,
+            "a freshly-written vmlinux must carry a positive post-epoch \
+             mtime in seconds, got {mtime_secs}",
+        );
+    }
+
+    /// Drives the production [`dirty_cache_skip_hint`] helper (extracted
+    /// from `kernel_build_pipeline`). A git repo with uncommitted
+    /// changes gets the "commit or stash" hint; a non-git tree
+    /// (force-marked dirty because dirty detection is impossible) gets
+    /// the "put the source under git" hint — telling a non-git operator
+    /// to "commit or stash" leads nowhere.
+    ///
+    /// Failure mode pinned: a regression that dropped the `is_git`
+    /// branch and always returned `DIRTY_TREE_CACHE_SKIP_HINT` would
+    /// give non-git operators unactionable advice. The inequality of
+    /// the two constants proves the branch the helper selects on is
+    /// load-bearing.
+    #[test]
+    fn dirty_tree_cache_skip_hint_branches_on_is_git() {
+        assert_eq!(
+            dirty_cache_skip_hint(true),
+            DIRTY_TREE_CACHE_SKIP_HINT,
+            "is_git=true must select the commit/stash hint",
+        );
+        assert_eq!(
+            dirty_cache_skip_hint(false),
+            NON_GIT_TREE_CACHE_SKIP_HINT,
+            "is_git=false must select the put-under-git hint",
+        );
+        assert_ne!(
+            DIRTY_TREE_CACHE_SKIP_HINT, NON_GIT_TREE_CACHE_SKIP_HINT,
+            "the two hints must differ so the is_git branch is \
+             load-bearing — a non-git operator must not be told to \
+             commit/stash",
+        );
+    }
+
+    /// Drives the production [`post_build_cache_store_skip`] predicate
+    /// (extracted from `kernel_build_pipeline`, DISTINCT from the
+    /// mid-wait dirty classifier above) against a real git tree for the
+    /// clean (store proceeds) and mid-build-commit (hash advanced →
+    /// skip) cases. `inspect_local_source_state` is the real probe; the
+    /// skip decision is the real predicate.
+    ///
+    /// Failure mode pinned: a regression that dropped the
+    /// `hash_changed` disjunct and trusted only `post.is_dirty` would
+    /// store a build under a cache key keyed on the pre-commit HEAD
+    /// even though the operator committed (clean worktree) on top
+    /// during the build — a future cache hit would serve a build that
+    /// no longer matches its recorded identity.
+    #[test]
+    fn post_build_dirty_recheck_skips_store_on_hash_advance() {
+        if !git_available() {
+            eprintln!(
+                "post_build_dirty_recheck_skips_store_on_hash_advance: \
+                 git unavailable, skipping"
+            );
+            return;
+        }
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let canonical = tmp.path().to_path_buf();
+        run_git(&canonical, &["init", "-q", "-b", "main"]);
+        std::fs::write(canonical.join("seed.txt"), "initial").unwrap();
+        run_git(&canonical, &["add", "seed.txt"]);
+        run_git(&canonical, &["commit", "-q", "-m", "initial"]);
+
+        // Acquire-time identity (frozen at build start in `local_source`).
+        let acquire = crate::fetch::inspect_local_source_state(&canonical)
+            .expect("acquire-time probe");
+        let acquired_hash = acquire.short_hash.clone();
+
+        // Clean post-build: same hash, clean worktree → store proceeds.
+        let post_clean = crate::fetch::inspect_local_source_state(&canonical)
+            .expect("post-build clean probe");
+        let (skip_clean, hash_changed_clean) =
+            post_build_cache_store_skip(&post_clean, acquired_hash.as_deref());
+        assert!(
+            !hash_changed_clean,
+            "an unchanged HEAD must not flag hash_changed",
+        );
+        assert!(
+            !skip_clean,
+            "an unchanged tree post-build must NOT skip the cache store",
+        );
+
+        // Mid-build commit: HEAD advanced, worktree clean → skip store.
+        std::fs::write(canonical.join("midbuild.txt"), "landed during make").unwrap();
+        run_git(&canonical, &["add", "midbuild.txt"]);
+        run_git(&canonical, &["commit", "-q", "-m", "mid-build commit"]);
+        let post_advanced = crate::fetch::inspect_local_source_state(&canonical)
+            .expect("post-build advanced probe");
+        assert!(
+            !post_advanced.is_dirty,
+            "a committed mid-build change leaves the worktree clean; the \
+             hash advance (not is_dirty) must drive the store skip",
+        );
+        let (skip_advanced, hash_changed_advanced) =
+            post_build_cache_store_skip(&post_advanced, acquired_hash.as_deref());
+        assert!(
+            hash_changed_advanced,
+            "the mid-build commit must yield a short_hash distinct from \
+             the acquire-time hash",
+        );
+        assert!(
+            skip_advanced,
+            "a HEAD advance during the build must skip the cache store so \
+             a stale identity is never recorded",
         );
     }
 }

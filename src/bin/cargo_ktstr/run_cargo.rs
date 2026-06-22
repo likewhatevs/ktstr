@@ -889,4 +889,63 @@ mod tests {
     fn kernel_set_or_bail_empty_input_is_ok_empty() {
         assert_eq!(kernel_set_or_bail(&[]), Ok(Vec::new()));
     }
+
+    // -- generate_btf_anchor (no-bpf early return) --
+    //
+    // Only the "no .bpf.o objects found -> None" path is host-isolable:
+    // it returns at the `bpf_object_dirs.is_empty()` gate BEFORE any
+    // env read (BPF_BASE_CFLAGS / BPF_CLANG / ...) and BEFORE the
+    // delegation to `btf_catalog::generate_btf_anchor`, which execs
+    // clang. Driving it past the gate would require a real `bpf.bpf.o`
+    // and would spawn clang, so the populated path is not host-testable
+    // here. These tests exercise the dir scan over a tempdir target so
+    // they touch no env and no subprocess.
+
+    /// A target dir with no `<profile>/build` directory at all: the
+    /// `read_dir(&build_root)` errors, the `if let Ok` is skipped,
+    /// `bpf_object_dirs` stays empty, and the fn returns `None` — for
+    /// BOTH profiles. Pins the `release -> "release"` / `!release ->
+    /// "debug"` selector reaching a missing build root in each case.
+    #[test]
+    fn generate_btf_anchor_missing_build_root_is_none() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert_eq!(generate_btf_anchor(dir.path(), false), None);
+        assert_eq!(generate_btf_anchor(dir.path(), true), None);
+    }
+
+    /// An existing but empty `debug/build` directory: `read_dir` now
+    /// succeeds (Ok branch taken), the entry loop runs zero iterations,
+    /// `bpf_object_dirs` is still empty, so the fn returns `None`.
+    /// Distinct from the missing-root case — exercises the loop body's
+    /// guard rather than the `read_dir` Err short-circuit.
+    #[test]
+    fn generate_btf_anchor_empty_build_root_is_none() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("debug").join("build"))
+            .expect("create debug/build");
+        assert_eq!(generate_btf_anchor(dir.path(), false), None);
+    }
+
+    /// A build-output entry whose `out/` directory exists but lacks the
+    /// `bpf.bpf.o` gate file is NOT collected: `out.join("bpf.bpf.o")
+    /// .is_file()` is false, the entry is skipped, `bpf_object_dirs`
+    /// ends empty, and the fn returns `None`. Pins the gate-file name
+    /// (`bpf.bpf.o`) — a sibling `.o` or a directory by that name must
+    /// not satisfy the `is_file()` check.
+    #[test]
+    fn generate_btf_anchor_build_entry_without_bpf_object_is_none() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = dir
+            .path()
+            .join("debug")
+            .join("build")
+            .join("scx_utils-abc123")
+            .join("out");
+        std::fs::create_dir_all(&out).expect("create out");
+        // A non-gate object and a non-empty file with a near-miss name —
+        // neither is `bpf.bpf.o`, so the entry must be skipped.
+        std::fs::write(out.join("other.bpf.o"), b"x").expect("write other.bpf.o");
+        std::fs::write(out.join("bpf.o"), b"x").expect("write bpf.o");
+        assert_eq!(generate_btf_anchor(dir.path(), false), None);
+    }
 }
