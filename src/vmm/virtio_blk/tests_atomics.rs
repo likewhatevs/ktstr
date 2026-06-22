@@ -420,7 +420,7 @@ fn interrupt_status_concurrent_set_and_ack() {
 /// asserts the read-back generation advanced by exactly N.
 ///
 /// `reset()` is the only writer of config_generation
-/// (control.rs:829, `fetch_add(1, Release)`); there is no
+/// (its `config_generation.fetch_add(1, Release)`); there is no
 /// concurrent writer in production (it runs single-threaded on
 /// the vCPU thread), so the meaningful invariant is per-reset
 /// monotone +1 as seen by the guest's config-generation read —

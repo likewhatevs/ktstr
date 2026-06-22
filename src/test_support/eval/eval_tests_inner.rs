@@ -44,11 +44,12 @@ fn count_sidecars_by_prefix(dir: &std::path::Path, prefix: &str) -> usize {
         .count()
 }
 
-// -- entry.validate() gate (mod.rs:379) --
+// -- entry.validate() gate (first statement of run_ktstr_test_inner_impl) --
 
 /// An entry whose `name` contains a path separator fails
-/// `KtstrTestEntry::validate` (entry.rs:1787) at the very first
-/// statement of `run_ktstr_test_inner_impl` (mod.rs:379), so the
+/// `KtstrTestEntry::validate` at its `self.name.contains('/')` check, hit
+/// by the `entry.validate().context("KtstrTestEntry validation")?` first
+/// statement of `run_ktstr_test_inner_impl`, so the
 /// wrapper returns `Err` BEFORE the rayon pin / `ensure_kvm` / VM boot.
 /// The `.context("KtstrTestEntry validation")` wrapper text rides the
 /// error chain, and the validate diagnostic ("must not contain path
@@ -76,7 +77,8 @@ fn run_ktstr_test_inner_invalid_entry_name_fails_validation() {
 }
 
 /// An entry with an empty `name` fails `KtstrTestEntry::validate`
-/// (entry.rs:1781) — the second branch of the same gate. Distinct from
+/// at its `self.name.is_empty()` check — the second branch of the same
+/// gate. Distinct from
 /// the path-separator case: pins that the empty-name diagnostic
 /// ("must be non-empty") also propagates through the validation
 /// `.context()` wrapper without a VM boot. `KtstrTestEntry::DEFAULT`
@@ -102,12 +104,13 @@ fn run_ktstr_test_inner_empty_entry_name_fails_validation() {
     );
 }
 
-// -- topo.validate() gate (mod.rs:380-382) --
+// -- topo.validate() gate (the `if let Some(t) = topo` block in run_ktstr_test_inner_impl) --
 
 /// A VALID entry paired with an INVALID `TopoOverride`
-/// (`memory_mib == 0`) passes `entry.validate()` (mod.rs:379) but
-/// fails `topo.validate()` (mod.rs:380-382, TopoOverride::validate at
-/// topo.rs:76). The wrapper returns `Err` carrying the
+/// (`memory_mib == 0`) passes the `entry.validate()` first statement but
+/// fails the `t.validate().context("TopoOverride validation")?` block
+/// (`TopoOverride::validate`'s `self.memory_mib == 0` check). The wrapper
+/// returns `Err` carrying the
 /// `.context("TopoOverride validation")` wrapper plus the
 /// zero-memory diagnostic as the chain root — proving the second gate
 /// fires on the `Some(t)` topo path ahead of VM boot.
@@ -135,19 +138,20 @@ fn run_ktstr_test_inner_invalid_topo_override_fails_validation() {
     );
 }
 
-// -- performance_mode skip arm under KTSTR_NO_PERF_MODE (mod.rs:437-453) --
+// -- performance_mode skip arm under KTSTR_NO_PERF_MODE (the `entry.performance_mode && no_perf_mode_active()` arm) --
 
 /// A `performance_mode` entry under an active `KTSTR_NO_PERF_MODE`
-/// takes the skip arm (mod.rs:437-453): `run_ktstr_test_inner` returns
-/// `Ok(AssertResult::skip(REASON))` and `record_skip_sidecar`
-/// (mod.rs:451) writes a skip sidecar — all BEFORE `ensure_kvm()`
-/// (mod.rs:461), so no VM boots. The returned `AssertResult` is a skip
+/// takes the `entry.performance_mode && no_perf_mode_active()` skip arm:
+/// `run_ktstr_test_inner` returns
+/// `Ok(AssertResult::skip(REASON))` and that arm's `record_skip_sidecar`
+/// call writes a skip sidecar — all BEFORE the `ensure_kvm()?`
+/// statement, so no VM boots. The returned `AssertResult` is a skip
 /// carrying the canonical REASON, and the sidecar lands in the
 /// `KTSTR_SIDECAR_DIR`-overridden temp dir.
 ///
 /// `KTSTR_PERF_ONLY` is cleared so the sibling perf-only skip arm
-/// (mod.rs:454) cannot intercept — this test pins the no-perf-mode arm
-/// specifically.
+/// (the `perf_only_skips_entry(entry)` arm) cannot intercept — this test
+/// pins the no-perf-mode arm specifically.
 #[test]
 fn run_ktstr_test_inner_skips_perf_test_under_no_perf_mode() {
     let _lock = lock_env();
@@ -185,18 +189,20 @@ fn run_ktstr_test_inner_skips_perf_test_under_no_perf_mode() {
     );
 }
 
-// -- non-perf skip arm under KTSTR_PERF_ONLY (mod.rs:454-460) --
+// -- non-perf skip arm under KTSTR_PERF_ONLY (the `perf_only_skips_entry(entry)` arm) --
 
 /// A non-`performance_mode` entry under an active `KTSTR_PERF_ONLY`
-/// takes the second skip arm (mod.rs:454-460): the run is restricted to
+/// takes the second skip arm (the `perf_only_skips_entry(entry)` arm):
+/// the run is restricted to
 /// perf-mode tests, so this entry is skipped with the perf-only REASON
-/// and `record_skip_sidecar` (mod.rs:458) emits its sidecar — again
-/// BEFORE `ensure_kvm()`. Pins the `perf_only_skips_entry` gate's
+/// and that arm's `record_skip_sidecar` call emits its sidecar — again
+/// BEFORE the `ensure_kvm()?` statement. Pins the `perf_only_skips_entry` gate's
 /// integration into the eval entry, distinct from the standalone
 /// `perf_only_skips_entry` unit tests in runtime.rs (which never drive
 /// the surrounding return + sidecar write).
 ///
-/// `KTSTR_NO_PERF_MODE` is cleared so the first skip arm (mod.rs:437)
+/// `KTSTR_NO_PERF_MODE` is cleared so the first skip arm (the
+/// `entry.performance_mode && no_perf_mode_active()` arm)
 /// cannot intercept (it would not anyway — this entry is
 /// non-perf — but clearing it pins the perf-only arm unambiguously).
 #[test]

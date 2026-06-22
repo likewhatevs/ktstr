@@ -979,7 +979,7 @@ fn evaluate_scx_bpf_error_match_both_set_one_mismatches_fails() {
 /// Multi-event scenario: when the upstream pipeline concatenates
 /// two or more `sched_ext: BPF scheduler "..." disabled (...)` exit
 /// events into one corpus (rapid load+disable cycles per
-/// `dmesg_scx.rs:157-159`), the matcher must scan the WHOLE
+/// `parse_kmsg_window`'s "back-to-back disable events" doc), the matcher must scan the WHOLE
 /// concatenated string, not stop at the first event boundary.
 ///
 /// The corpus below interleaves two distinct events; the matched

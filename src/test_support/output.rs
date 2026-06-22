@@ -1050,7 +1050,7 @@ mod tests {
     /// hand-crafted 2-line `extract_bug_summary_*` siblings above
     /// — guarding against a regression that handles the synthetic
     /// shapes but breaks on real-shaped multi-CPU interleaved
-    /// input (the find_same_cpu_body_after filter at output.rs:207
+    /// input (the `find_same_cpu_body_after` filter
     /// is the load-bearing logic; this test exercises it through
     /// the public entry point with input shaped like real
     /// trace_pipe output rather than calling the helper directly).
@@ -1171,7 +1171,8 @@ mod tests {
 
     /// Anchor in the dump takes precedence over an `scx_bpf_error`
     /// line in the sched_log fallback. The function's early return
-    /// at the end of the dump-scan loop (output.rs:163-165) must
+    /// at the end of the dump-scan loop (`extract_bug_summary`'s
+    /// `return Some(body.to_string())` inside its dump-scan loop) must
     /// fire before the fallback loop ever starts. A regression that
     /// reordered the two scans, or that concatenated their outputs,
     /// would silently change which signal source wins on tests that

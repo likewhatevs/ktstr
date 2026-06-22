@@ -112,7 +112,8 @@ const _: Migration = Migration::new(0, 1, 2);
 
 // Future contributor: if you hit an AmbiguousIfImpl compile error
 // here after adding `derive(Default)` (or a manual Default impl) on
-// Migration, the rationale is at src/workload/spawn/mod.rs:25
+// Migration, the rationale is in the doc comment on the `Migration`
+// struct in `spawn::mod`
 // (TL;DR: a zeroed Migration is `{at_ns: 0, from_cpu: 0, to_cpu: 0}`
 // which is a self-migration where source == dest — NOT a real
 // migration. Downstream analysis that assumes `from_cpu != to_cpu`
@@ -122,7 +123,8 @@ assert_not_impl_default!(Migration);
 
 // Future contributor: if you hit an AmbiguousIfImpl compile error
 // here after adding `derive(Default)` (or a manual Default impl) on
-// WorkerExitInfo, the rationale is at src/workload/spawn/mod.rs:503
+// WorkerExitInfo, the rationale is in the doc comment on the
+// `WorkerExitInfo` enum in `spawn::mod`
 // (TL;DR: every variant carries observed-outcome state; a default
 // would have to pick TimedOut, but a test using `..Default::default()`
 // would get "worker never exited within the deadline" silently,
@@ -526,8 +528,8 @@ fn spawn_pipeio_odd_workers_fails() {
 // `spawn_zero_workers` removed: same root cause as the
 // `snapshot_iterations_empty_handle` deletion below — `WorkloadHandle::
 // spawn(&cfg)` rejects `num_workers = 0` via `WorkloadConfig::validate()`
-// before any handle exists. The validate gate has dedicated coverage at
-// workload.rs:602 + 640.
+// before any handle exists. The validate gate (`WorkloadConfig::validate`'s
+// `num_workers > 0` check) has dedicated coverage in this module.
 
 #[test]
 fn worker_pids_count_matches_num_workers() {
@@ -785,7 +787,8 @@ fn migration_serde_multiple() {
 // spawn(&cfg)` rejects `num_workers = 0` via `WorkloadConfig::
 // validate()` before any handle exists — so the "empty handle"
 // (zero-workers) state is no longer reachable via the public API.
-// The validate gate itself is covered at workload.rs:602 + 640.
+// The validate gate itself (`WorkloadConfig::validate`'s `num_workers > 0`
+// check) is covered in this module.
 
 #[test]
 fn snapshot_iterations_running_workers() {

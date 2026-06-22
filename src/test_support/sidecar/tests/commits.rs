@@ -2116,7 +2116,8 @@ fn resolve_kernel_source_dir_with_cache_version_empty_cache_yields_none() {
 
 // -- resolve_kernel_source_dir Path arm --
 //
-// The Path arm at sidecar.rs:1641 routes via the shared
+// The `KernelId::Path(_)` arm of `source_dir_for` (reached via
+// `resolve_kernel_source_dir`) routes via the shared
 // `cache::recover_local_source_tree` helper: when
 // `KTSTR_KERNEL` points at a CACHE ENTRY directory (the shape
 // `cargo-ktstr` exports for clean Path specs), the helper

@@ -46,7 +46,7 @@ fn spawn_signal_storm_produces_work() {
     for r in &reports {
         assert!(
             r.work_units > 0,
-            "SignalStorm worker {} did no work — hit the futex==None break (worker/mod.rs:2660) or never reached spin_burst",
+            "SignalStorm worker {} did no work — hit the futex==None break (the SignalStorm arm's `match futex` None=>break) or never reached spin_burst",
             r.tid
         );
     }

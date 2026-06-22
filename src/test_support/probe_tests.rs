@@ -2222,7 +2222,8 @@ fn primary_reached_workload_distinguishes_payload_starting_from_scheduler_not_at
     );
 
     // CRC-bad PayloadStarting frame — not reached. The
-    // predicate filters on `crc_ok` (output.rs:283) so a
+    // predicate filters on `crc_ok` (`primary_reached_workload`'s
+    // `e.crc_ok` filter) so a
     // corrupted PayloadStarting frame must not satisfy the
     // gate. Mirrors classify_init_stage_skips_crc_bad_lifecycle_frames
     // for primary_reached_workload's parallel filter.
@@ -2413,7 +2414,7 @@ fn collect_and_print_probe_data_none_handle_leaves_stop_false() {
 /// (host no-op: the `cfg(coverage)` body early-returns when
 /// `!is_guest()`, and is absent in non-coverage builds) and
 /// `print_assert_result` -> `send_test_result` (host no-op via
-/// `write_msg`'s `assert_guest_context` guard, guest_comms.rs:122-130)
+/// `write_msg`'s `assert_guest_context` guard in `vmm::guest_comms`)
 /// run without effect. Asserting `stop == false` proves the host
 /// branch ran the collect-and-early-return path without a handle.
 #[test]
@@ -2463,14 +2464,15 @@ fn publish_result_and_collect_stash_arm_stashes_deferred() {
 // -- emit_probe_payload (empty-events path) --
 
 /// `emit_probe_payload` with empty `events` takes the
-/// `events.is_empty()` fast path at probe.rs:2262-2267 — an empty
+/// `let bpf_source_locs = if events.is_empty()` fast path — an empty
 /// `bpf_source_locs` map, skipping the libbpf `discover_bpf_symbols`
-/// / `resolve_bpf_source_locs` walk (probe.rs:2269-2281) that needs
+/// / `resolve_bpf_source_locs` walk (that `if`'s `else` branch) that needs
 /// a live BPF env. It then builds `ProbeBytes`, serializes, and
-/// `println!`s the START/JSON/END markers (probe.rs:2284-2300).
+/// `println!`s the START/JSON/END markers (the tail of `emit_probe_payload`).
 ///
-/// Two halves, landed together (see verdict issues):
-/// 1. DIRECT call for line coverage of probe.rs:2254-2267,2284-2301.
+/// Two halves, landed together:
+/// 1. DIRECT call for line coverage of `emit_probe_payload`'s
+///    empty-events fast path + marker emission.
 ///    The fn writes to process stdout, which a std unit test cannot
 ///    cleanly capture, so the direct call alone can only assert
 ///    no-panic.
@@ -2478,13 +2480,15 @@ fn publish_result_and_collect_stash_arm_stashes_deferred() {
 ///    `ProbeBytes` the empty branch builds, wrap it in the
 ///    START/END markers, and run it through `extract_probe_output`.
 ///    With default diagnostics, `format_probe_diagnostics` always
-///    pushes `"--- probe pipeline ---"` (probe.rs:1278) and, since
+///    pushes `"--- probe pipeline ---"` (its `out.push_str("--- probe pipeline ---\n")`)
+///    and, since
 ///    `events_before_stitch == 0`, the bare
-///    `"0 captured, 0 after stitch"` events line (probe.rs:1426, no
+///    `"0 captured, 0 after stitch"` events line (its
+///    `"  events:      {} captured, {} after stitch"` push, no
 ///    stitch-drop cause appended). `extract_probe_output` returns
-///    `Some(out)` (diagnostics `Some` -> out non-empty at
-///    probe.rs:1014-1016, then events empty -> `Some(out)` at
-///    probe.rs:1018-1023). Assert the exact substrings.
+///    `Some(out)` (diagnostics `Some` -> out non-empty, then events empty ->
+///    `Some(out)` via its `if payload.events.is_empty()` arm).
+///    Assert the exact substrings.
 #[test]
 fn emit_probe_payload_empty_events_round_trips_diagnostics_only() {
     // (1) Direct call: covers the empty-events fast path lines.
@@ -2523,11 +2527,12 @@ fn emit_probe_payload_empty_events_round_trips_diagnostics_only() {
     );
     assert!(
         formatted.contains("--- probe pipeline ---"),
-        "diagnostics header missing (format_probe_diagnostics at probe.rs:1278): {formatted}",
+        "diagnostics header missing (format_probe_diagnostics's `--- probe pipeline ---` push): {formatted}",
     );
     assert!(
         formatted.contains("0 captured, 0 after stitch"),
-        "empty-events stitch counters missing (probe.rs:1426, no cause \
+        "empty-events stitch counters missing (format_probe_diagnostics's \
+         `{{}} captured, {{}} after stitch` line, no cause \
          appended since events_before_stitch == 0): {formatted}",
     );
 }

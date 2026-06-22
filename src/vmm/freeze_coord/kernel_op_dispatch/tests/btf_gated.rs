@@ -7,8 +7,8 @@ use btf_rs::Btf;
 
 // ---- BTF-gated dispatch-arm tests (PerCpuField + TaskField) ----
 //
-// `resolve_per_cpu_field_pa` (kernel_op_dispatch.rs:595) and
-// `resolve_and_validate_task_field` (:1402) are the only two
+// `resolve_per_cpu_field_pa` and
+// `resolve_and_validate_task_field` are the only two
 // dispatcher paths that need BTF: both resolve a field byte offset
 // via `nested_member_byte_offset` against a kernel struct. These
 // tests build a SYNTHETIC BTF blob (via `cast_build_btf`, hoisted
@@ -51,8 +51,7 @@ fn u64_int(name_off: u32) -> CastSynType {
 // ===============================================================
 
 /// Synthetic BTF for the only per-CPU symbol these tests exercise:
-/// `runqueues`→`rq` (the `struct_name_for_per_cpu_symbol` map at
-/// kernel_op_dispatch.rs:555). The `rq` struct carries a single
+/// `runqueues`→`rq` (the `struct_name_for_per_cpu_symbol` map). The `rq` struct carries a single
 /// `nr_running@0x0` member.
 fn rq_btf() -> Vec<u8> {
     let mut strings: Vec<u8> = vec![0];

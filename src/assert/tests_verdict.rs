@@ -138,7 +138,8 @@ fn verdict_assert_verdict_attaches_threshold_config() {
 }
 
 /// Pins the lockstep contract documented at `Assert::NO_OVERRIDES`
-/// (assert/mod.rs:1818-1822): the const value and the const-fn entry
+/// (the `Assert::NO_OVERRIDES` const + `Assert::default_checks` const-fn
+/// in `assert::builder`): the const value and the const-fn entry
 /// point return the same `Assert`. `default_checks()`'s body is
 /// `Self::NO_OVERRIDES`, so the equality is structurally guaranteed
 /// today — this test catches a future regression where someone adds a

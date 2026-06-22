@@ -1895,9 +1895,10 @@ pub(super) fn wait_for_worker_state_not_trying_or_bail(
             // Guest mode: the SnapshotBridge's `accessor_worker_state`
             // is an Arc<AtomicU8> populated by the freeze coordinator's
             // accessor-init worker, which reads guest memory from the
-            // HOST process (see `src/vmm/freeze_coord/mod.rs:965-985`
-            // for the construction site; `src/vmm/freeze_coord/mod.rs:2316`
-            // for the worker spawn). The bridge is not transferable across
+            // HOST process (see `freeze_coord`'s `accessor_worker_state`
+            // allocation for the construction site, and its
+            // `accessor_init_handle` spawn for the worker spawn). The
+            // bridge is not transferable across
             // the host→guest process boundary, so a guest-side dispatcher
             // legitimately has no bridge installed. The wait observes a
             // host-side signal; in guest mode it's structurally inapplicable.

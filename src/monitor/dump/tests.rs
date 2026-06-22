@@ -27,8 +27,8 @@ use crate::monitor::test_util::name_from_str;
 
 // Future contributor: if you hit an AmbiguousIfImpl compile error
 // here after adding `derive(Default)` (or a manual Default impl) on
-// DualFailureDumpReport, the rationale is at
-// src/monitor/dump/mod.rs:1272 (TL;DR: the `late` field is required
+// DualFailureDumpReport, the rationale is in the doc comment on the
+// `DualFailureDumpReport` struct in `dump::mod` (TL;DR: the `late` field is required
 // by the doc invariant — the freeze coordinator only writes a
 // DualFailureDumpReport after the late snapshot has been captured.
 // A Default impl would produce a wrapper with an empty late report
@@ -6325,11 +6325,11 @@ fn render_map_percpu_array_truncates_at_cap() {
 /// renders only the first `MAX_HASH_ENTRIES` entries and records the cap
 /// in `error`. Unlike the index-driven ARRAY/PERCPU_ARRAY arms, the HASH
 /// arm's entry count comes from `iter_hash_map` walking real htab
-/// buckets (render_map.rs:1796-1831 `raw_entries.len() > MAX_HASH_ENTRIES`
-/// then `.take(MAX_HASH_ENTRIES)`), so this builds a 4097-element
+/// buckets (the HASH render arm's `raw_entries.len() > MAX_HASH_ENTRIES`
+/// then `.take(MAX_HASH_ENTRIES)` cap), so this builds a 4097-element
 /// `hlist_nulls` chain in bucket 0 of a synthetic `bpf_htab` and runs the
 /// real walker. The synthetic htab offsets reuse the exact field values
-/// from the htab walker unit tests (bpf_map/tests/htab_tests.rs:9-19) —
+/// from the htab walker unit tests (`bpf_map::tests::htab_tests`) —
 /// arbitrary but consistent with the walker's reads. The
 /// format-string-only `pinned_error_hash_map_truncation` stays as the
 /// cheap secondary guard.
@@ -6467,7 +6467,7 @@ fn render_map_hash_truncates_at_cap() {
     );
 }
 
-/// PERCPU_HASH render arm (render_map.rs:1839-1861) — the worst
+/// PERCPU_HASH render arm (its `BPF_MAP_TYPE_PERCPU_HASH | BPF_MAP_TYPE_LRU_PERCPU_HASH` match) — the worst
 /// materialization case (per-CPU Vecs ×num_cpus). r23 bounds the walker
 /// at MAP_MATERIALIZE_MAX+1 (via the shared `walk_htab`) so render
 /// truncates to MAX_HASH_ENTRIES and reports it. Mirror of
@@ -6612,13 +6612,13 @@ fn render_map_percpu_hash_truncates_at_cap() {
 /// A TASK_STORAGE map holding more than `MAX_HASH_ENTRIES` (4096) selems
 /// renders only the first `MAX_HASH_ENTRIES` entries and records the cap
 /// in `error`. The local-storage arm shares the HASH cap policy
-/// (render_map.rs:2059-2132 `raw_entries.len() > MAX_HASH_ENTRIES` then
-/// `.take(MAX_HASH_ENTRIES)`), and the entry count comes from
+/// (the local-storage render arm's `raw_entries.len() > MAX_HASH_ENTRIES` then
+/// `.take(MAX_HASH_ENTRIES)` cap), and the entry count comes from
 /// `iter_task_storage` walking a real `bpf_local_storage_map` hlist, so
 /// this chains 4097 `bpf_local_storage_elem`s in bucket 0 and runs the
 /// real walker. Synthetic offsets reuse the exact field values from the
 /// local-storage walker unit tests
-/// (bpf_map/tests/local_storage_tests.rs:22-40). The format-string-only
+/// (`bpf_map::tests::local_storage_tests`). The format-string-only
 /// `pinned_error_local_storage_truncation` stays as the cheap secondary
 /// guard.
 #[test]
@@ -8414,7 +8414,8 @@ fn identify_active_obj_walker_publishes_multi_copy_kvas_for_downstream_filter() 
 /// rebuild), the fallback picks the first struct_ops in iteration
 /// order regardless of which is "live". Pins this as the
 /// documented behavior — the consumer's `Snapshot::active`
-/// multi-obj fallback at view.rs:535-565 catches the mis-pick
+/// multi-obj fallback (its `NoActiveScheduler` return in
+/// `scenario::snapshot::view`) catches the mis-pick
 /// case and surfaces a NoActiveScheduler diagnostic with both
 /// prefixes named.
 #[test]

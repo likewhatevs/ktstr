@@ -917,7 +917,7 @@ fn alu_width_resolve_never_returns_widest() {
 }
 
 /// [`alu_hot_chain`] MUST bump `work_units` by exactly `steps` per
-/// invocation. The per-iteration body at mod.rs:3588 reads
+/// invocation. The per-iteration body (its `for _ in 0..steps` loop) reads
 /// `*work_units = std::hint::black_box(work_units.wrapping_add(1))`
 /// — the bump is wrapped in `black_box` so the optimizer can't
 /// elide it as a dead-store, but a refactor that removed the
@@ -946,7 +946,7 @@ fn alu_hot_chain_bumps_work_units_by_exact_step_count() {
         work_units, steps,
         "alu_hot_chain(Scalar, {steps}, &mut 0) MUST leave work_units \
          == {steps}; got {work_units}. A regression that removed the \
-         per-step bump (mod.rs:3588) would surface here as 0; one \
+         per-step bump (the loop body's `*work_units = ...wrapping_add(1)`) would surface here as 0; one \
          that moved the bump outside the loop would surface as 1; \
          one that changed the increment constant would surface as a \
          multiple of {steps}; one that introduced an off-by-one in \
@@ -980,7 +980,7 @@ fn alu_hot_chain_compound_calls_accumulate_work_units() {
 
 /// [`alu_hot_chain`] MUST bump `work_units` uniformly across every
 /// concrete [`AluWidth`] variant. Today every arm runs the same
-/// scalar multiply path per the comment at mod.rs:3567-3573 — `width`
+/// scalar multiply path per `alu_hot_chain`'s width-retention comment — `width`
 /// is retained on the signature so a future SIMD-intrinsic drop can
 /// pivot per-arm without changing the call shape. This test is
 /// mechanically redundant today (all arms execute the same code) but
@@ -989,7 +989,8 @@ fn alu_hot_chain_compound_calls_accumulate_work_units() {
 /// (e.g. forgets the `*work_units = ...` write in the Vec256 branch
 /// of a future per-arm match) would surface here as a single-variant
 /// failure. `AluWidth::Widest` is excluded because `alu_hot_chain`
-/// `debug_assert!`s against it at mod.rs:3574-3578 (resolved away by
+/// `debug_assert!`s against it (its `debug_assert!(!matches!(width, AluWidth::Widest), ...)`,
+/// resolved away by
 /// `resolve_alu_width` before reaching the chain).
 #[test]
 fn alu_hot_chain_bumps_work_units_uniformly_across_widths() {
@@ -1015,7 +1016,8 @@ fn alu_hot_chain_bumps_work_units_uniformly_across_widths() {
     }
 }
 
-/// [`alu_hot_chain`] uses `wrapping_add(1)` at mod.rs:3588 — the
+/// [`alu_hot_chain`] uses `wrapping_add(1)` in its `for _ in 0..steps`
+/// loop body — the
 /// per-step bump must wrap silently on `u64::MAX` overflow rather
 /// than panic or saturate. A regression that switched to
 /// `checked_add(1).unwrap()` would panic; one that switched to
@@ -1040,7 +1042,7 @@ fn alu_hot_chain_wraps_work_units_at_u64_max() {
 }
 
 /// [`alu_hot_chain`] with `steps=0` must be a no-op: the for-loop
-/// body (mod.rs:3583-3589) executes 0 times, work_units stays
+/// body (its `for _ in 0..steps` loop) executes 0 times, work_units stays
 /// unchanged. A regression that off-by-one'd the loop bound
 /// (e.g. `for _ in 0..=steps` instead of `for _ in 0..steps`)
 /// would surface here as work_units == 43 (one bump from the
@@ -1073,7 +1075,8 @@ fn alu_hot_chain_single_step_bumps_by_one() {
     );
 }
 
-/// [`alu_hot_chain`] has a `debug_assert!` at mod.rs:3578-3582 that
+/// [`alu_hot_chain`] has a `debug_assert!` (its
+/// `debug_assert!(!matches!(width, AluWidth::Widest), ...)`) that
 /// rejects `AluWidth::Widest` — callers MUST resolve `Widest` via
 /// `resolve_alu_width` before reaching here. Test pins the
 /// debug-build panic contract: a regression that removed the
@@ -1122,9 +1125,11 @@ fn alu_hot_chain_panics_on_widest_in_debug_build() {
 /// layer.
 ///
 /// Test guarantees retired-instructions semantics on both x86_64
-/// (CPUID 0x0A PMU v2 synthesized at `src/vmm/x86_64/topology.rs`)
-/// and aarch64 (KVM_ARM_VCPU_PMU_V3 wired at
-/// `src/vmm/aarch64/kvm.rs:268-271`). The test runs on the HOST
+/// (CPUID 0x0A PMU v2 synthesized in `x86_64::topology::generate_cpuid`'s
+/// Leaf 0xA arm)
+/// and aarch64 (KVM_ARM_VCPU_PMU_V3 wired by
+/// `aarch64::kvm`'s `init_pmuv3` plus the
+/// `kvi.features[0] |= 1 << KVM_ARM_VCPU_PMU_V3` feature set). The test runs on the HOST
 /// (this is a #[test] in a host-test module, not a guest workload),
 /// so the relevant PMU is the host's — Linux is required.
 ///

@@ -3278,7 +3278,8 @@ mod tests {
     /// separator) must reject — proves the validate gate delegates
     /// to validate_staged_scheduler_name. The exhaustive shape
     /// rejections (empty, NUL, leading dot, reserved names) are
-    /// covered at src/test_support/staged.rs:138+; this smoke test
+    /// covered by the `validate_staged_scheduler_name_*` tests in
+    /// `test_support::staged`; this smoke test
     /// pins the delegation site against a future refactor that
     /// inlines the dup-check and forgets the shape-check.
     #[test]
@@ -3300,8 +3301,9 @@ mod tests {
              through the delegate call, got: {msg}"
         );
         // The exact shape-message ("path separators") is the
-        // validate_staged_scheduler_name contract pinned at
-        // src/test_support/staged.rs:151-156, not duplicated here.
+        // validate_staged_scheduler_name contract pinned by
+        // `validate_staged_scheduler_name_rejects_path_separators` in
+        // `test_support::staged`, not duplicated here.
     }
 
     /// A staged scheduler whose `name` matches the boot
@@ -5562,7 +5564,8 @@ mod tests {
         );
     }
 
-    /// Pins the early-return semantic at entry.rs:2470: the helper
+    /// Pins the early-return semantic in `default_post_vm_periodic_fired`
+    /// (its `if result.periodic_target == 0` early return): the helper
     /// short-circuits to Ok on `periodic_target == 0` BEFORE
     /// checking `periodic_fired`. A regression that swapped these
     /// checks (e.g., "require fired matches target unconditionally")

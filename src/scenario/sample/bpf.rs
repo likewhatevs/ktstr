@@ -1421,7 +1421,9 @@ mod tests {
     /// placeholder (freeze rendezvous failed, walker unavailable),
     /// EVERY field slot for that row gets the same
     /// `PlaceholderSample` error — not just one. Pins that the
-    /// per-field substitution at bpf.rs:111-124 doesn't silently
+    /// per-field substitution (`live_bpf_vars_via`'s
+    /// `if row.report.is_placeholder` `for slot in &mut per_field` push loop)
+    /// doesn't silently
     /// drop a sample from one field while keeping it in another.
     #[test]
     fn live_bpf_vars_via_placeholder_substitutes_into_all_field_slots() {
@@ -1481,8 +1483,8 @@ mod tests {
     /// When `live_vars_via` itself fails for a row (no candidate
     /// map has all the names, or the picker returned None), the
     /// SAME error MUST be substituted into all N field slots for
-    /// that row — not split or dropped. Pins the bpf.rs:135-139
-    /// error-substitution path.
+    /// that row — not split or dropped. Pins `live_bpf_vars_via`'s
+    /// `Err(e) =>` `for slot in &mut per_field` error-substitution loop.
     #[test]
     fn live_bpf_vars_via_picker_none_substitutes_into_all_field_slots() {
         let drained = vec![(

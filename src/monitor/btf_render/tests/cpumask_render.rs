@@ -4,7 +4,7 @@ use super::*;
 //
 // The Type::Ptr arm chases a `struct bpf_cpumask`/`cpumask` kptr
 // member to a CpuList by reading the bitmap via MemReader::read_kva
-// (mod.rs:2309-2434). The existing tests only pin the no-op/skip
+// (`render_value_inner`'s `Type::Ptr(ptr)` arm). The existing tests only pin the no-op/skip
 // paths (try_render_cpumask_bits byte-decode, and
 // arena_chase_bridge_address_outside_window_is_no_op which asserts
 // deref.is_none()). These pin the SUCCESS path end-to-end: a
@@ -155,7 +155,7 @@ fn cpumask_kptr_plausibility_gate_rejects_freed_slab_pattern() {
     let val: u64 = 0xFFFF_8000_0010_0000;
     let outer_bytes = val.to_le_bytes().to_vec();
     // word0 top byte == 0xff: the freed-slab freelist-pointer pattern
-    // the plausibility gate (mod.rs:2372) rejects.
+    // the plausibility gate (in `render_value_inner`'s `Type::Ptr(ptr)` arm) rejects.
     let mut kva = std::collections::HashMap::new();
     kva.insert(val, cpumask_read_bytes(0xFF00_0000_0000_0000));
     let reader = CastStubReader {

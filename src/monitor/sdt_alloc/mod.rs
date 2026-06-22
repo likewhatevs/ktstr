@@ -1213,9 +1213,9 @@ mod tests {
     }
 
     /// `task_ctx` (exact name) wins over `*_ctx` suffix
-    /// when both same-size structs exist. The heuristic at
-    /// sdt_alloc.rs:646-651 lists arm 1 (`n == "task_ctx"`)
-    /// before arm 4 (`*_ctx` suffix). Pin the priority order so
+    /// when both same-size structs exist. `discover_payload_btf_id`'s
+    /// `patterns` list orders arm 1 (`n == "task_ctx"`)
+    /// before arm 4 (`n.ends_with("_ctx")`). Pin the priority order so
     /// a future refactor that drops the exact-name arm in favor
     /// of a single suffix-pattern walk surfaces here.
     #[test]
@@ -1284,10 +1284,12 @@ mod tests {
     /// resolution. Two structs (`cgrp_ctx` and `task_data_ctx`)
     /// both 16 bytes, neither matching exact `task_ctx`,
     /// `*_arena_ctx`, or `*_task_ctx`. Arm 4 (`*_ctx`) gets 2 hits;
-    /// the per-arm `_ => continue` at sdt_alloc.rs:670-674 advances
+    /// `discover_payload_btf_id`'s per-arm `_ => continue` (the
+    /// `match hits.len()` 2+-match arm) advances
     /// past arm 4 (the last arm) and falls through to the
-    /// post-loop "no unambiguous pattern winner" branch at
-    /// sdt_alloc.rs:677-681, returning `target_type_id = 0` with
+    /// post-loop "No unambiguous pattern winner" branch
+    /// (`reason: format!("ambiguous: {n} candidates")`),
+    /// returning `target_type_id = 0` with
     /// `reason = "ambiguous: 2 candidates"`. Pin BOTH the id (0)
     /// AND the exact reason — the reason format is wire-stable
     /// (operator-visible via SdtAllocatorSnapshot::payload_type_reason).
@@ -1360,14 +1362,14 @@ mod tests {
 
     /// Per-arm continue resolves at lower arm. TWO `*_arena_ctx`
     /// structs (ambiguous at arm 2) AND ONE `*_task_ctx` struct
-    /// (unambiguous at arm 3). Per the production code at
-    /// sdt_alloc.rs:670-674, arm 2's `_ => continue` advances to
+    /// (unambiguous at arm 3). Per `discover_payload_btf_id`'s
+    /// per-arm `_ => continue` (the `match hits.len()` 2+-match arm),
+    /// arm 2's continue advances to
     /// arm 3, which has 1 hit → returns the `*_task_ctx` id.
     ///
-    /// The docstring at sdt_alloc.rs:565-571 says "If 2+ structs
-    /// match the *same* pattern, we fall back to hex". The code
-    /// CONTRADICTS this — `continue` proceeds to the next arm
-    /// rather than aborting to the post-loop fall-through. This
+    /// `discover_payload_btf_id`'s docstring describes this:
+    /// "If 2+ structs match the same pattern arm, the heuristic
+    /// continues to lower-priority arms." This
     /// test pins the CODE's behavior; if a future fix changes
     /// either side, the test must be updated to match the new
     /// semantics, and the doc-vs-code drift reconciled in the
@@ -1453,8 +1455,8 @@ mod tests {
             choice.target_type_id, 4,
             "arm 2 ambiguous → continue; arm 3 unique my_task_ctx → return id 4. \
              Got {:?}. If this fails, the continue-on-arm-ambiguity semantics \
-             changed — verify against the docstring at sdt_alloc.rs:565-571 \
-             (which currently contradicts the code) and update both sides \
+             changed — verify against `discover_payload_btf_id`'s docstring \
+             and update both sides \
              together.",
             choice
         );

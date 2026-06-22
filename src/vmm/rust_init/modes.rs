@@ -625,11 +625,12 @@ mod tests {
     use super::*;
 
     /// `build_include_path` with `/include-files` absent must return
-    /// exactly `/bin` — the unconditional fallback the function pushes
-    /// after an empty walk (modes.rs:373-375). Exact full-string
+    /// exactly `/bin` — the unconditional fallback `build_include_path`
+    /// pushes after an empty walk. Exact full-string
     /// equality (not `.contains("/bin")`) pins three things at once:
-    /// (a) the empty-`BTreeSet` walk path is taken when `is_dir()` is
-    /// false (modes.rs:359), (b) `/bin` is pushed unconditionally, and
+    /// (a) the empty-`BTreeSet` walk path is taken when the
+    /// `/include-files` `is_dir()` is
+    /// false, (b) `/bin` is pushed unconditionally, and
     /// (c) `join(":")` of a single element produces no leading/trailing
     /// colon. The host has no `/include-files`, so the absent-dir branch
     /// is deterministic; the skip-guard keeps the exact-equality from
@@ -649,8 +650,8 @@ mod tests {
     }
 
     /// `shell_console_device` with `/dev/hvc0` absent must fall back to
-    /// COM2 (modes.rs:422, else arm). Exact equality against the COM2
-    /// const (`/dev/ttyS1`, mod.rs:30) pins the specific fallback device
+    /// COM2 (its else arm). Exact equality against the COM2
+    /// const (`/dev/ttyS1`, `rust_init::COM2`) pins the specific fallback device
     /// byte-for-byte rather than a vacuous `!is_empty()`. The const is
     /// referenced (not the bare literal) so a future COM2 path change
     /// updates the production const and this assertion together, with no
@@ -672,8 +673,8 @@ mod tests {
     }
 
     /// `cmdline_val` for a key that cannot appear in the real
-    /// `/proc/cmdline` must return `None` — the `find_map`-yields-nothing
-    /// path (modes.rs:341-344) where `strip_prefix` never matches.
+    /// `/proc/cmdline` must return `None` — `cmdline_val`'s
+    /// `find_map`-yields-nothing path where `strip_prefix` never matches.
     /// Exact `== None` pins that a non-present key returns `None` rather
     /// than `Some("")`, which a prefix-mishandling or
     /// whitespace-mishandling bug would produce. Mirrors the existing

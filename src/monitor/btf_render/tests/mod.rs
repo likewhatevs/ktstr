@@ -17,7 +17,7 @@ fn test_btf() -> Option<Btf> {
 }
 
 /// Compact constructor for [`RenderedValue::Enum`] in tests.
-/// Mirrors `uint_v` in src/scenario/snapshot/tests.rs:3443 — folds
+/// Mirrors the `uint_v` helper in `scenario::snapshot`'s test module — folds
 /// the 5-field struct literal (now that `is_signed` is part of the
 /// shape) into a one-line call so fixture sites stay readable as
 /// the variant grows.

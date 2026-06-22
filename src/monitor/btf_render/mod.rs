@@ -5004,7 +5004,7 @@ mod blueprint_coverage_tests {
     /// `discover_payload_btf_id` size-matches the unique size-8 struct,
     /// the chase reads its bytes from the arena, and the rendered `Ptr`
     /// carries `cast→arena (sdt_alloc)`. Exercises the
-    /// `mod.rs:3958` size-match success arm — dead in the `tests/`
+    /// `chase_arena_pointer`'s `alloc_size` size-match success arm — dead in the `tests/`
     /// suite because every existing `CastHit` uses `alloc_size: None`.
     #[test]
     fn cast_chase_arena_alloc_size_fallback_resolves_via_discover_payload_btf_id() {
@@ -5092,8 +5092,8 @@ mod blueprint_coverage_tests {
     /// returns `target_type_id 0` with reason `"no candidate of size 99"`,
     /// and `alloc_size_types` is empty, so the chase surfaces the
     /// labelled unresolved skip with `deref: None` and the plain
-    /// `cast→arena` annotation (sdt_alloc NOT resolved). Exercises the
-    /// `mod.rs:4018` unresolved skip arm.
+    /// `cast→arena` annotation (sdt_alloc NOT resolved). Exercises
+    /// `chase_arena_pointer`'s `alloc_size` fallback-unresolved skip arm.
     #[test]
     fn cast_chase_arena_alloc_size_fallback_unresolved_surfaces_skip_reason() {
         let (blob, outer_id, _task_ctx_id) = alloc_size_btf();
@@ -5194,7 +5194,7 @@ mod blueprint_coverage_tests {
     /// cannot slice past the header, so the chase surfaces the underrun
     /// skip with `deref: None` and the `sdt_alloc` annotation (the bridge
     /// did resolve; only the read fell short). Exercises the
-    /// `mod.rs:4135` underrun guard, which a contract-conforming
+    /// `chase_arena_pointer`'s `apply_header_skip` underrun guard, which a contract-conforming
     /// `read_arena` never reaches.
     #[test]
     fn arena_chase_header_skip_exceeds_read_surfaces_underrun_skip() {

@@ -961,8 +961,10 @@ fn host_side_llm_extract_under_offline_gate_surfaces_actionable_detail() {
     // 3. Message contains `OFFLINE_ENV` so the operator knows
     //    where to look (the framework wraps the reason verbatim;
     //    `extract_via_llm`'s offline-gate Err surfaces the env
-    //    var name in its reason string — see model.rs:1151+ for
-    //    the bail! sites that name `OFFLINE_ENV`).
+    //    var name in its reason string — see `model::ensure`'s
+    //    `if let Some(v) = read_offline_env()` block, whose
+    //    `match &st.sha_verdict` arms each `bail!` with a message
+    //    naming `OFFLINE_ENV`).
     let detail = &failures[0];
     assert_eq!(
         detail.kind,

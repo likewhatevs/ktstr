@@ -631,7 +631,7 @@ fn parse_llm_response_valid_json_produces_metrics() {
 /// stdout-primary path's stream tag is stamped — `host_side_llm_extract`
 /// passes `MetricStream::Stdout` to `extract_via_llm` for the
 /// stdout call, and `extract_via_llm` forwards
-/// the same stream tag to `parse_llm_response` (model.rs:2329),
+/// the same stream tag to `parse_llm_response`,
 /// which threads it into `walk_json_leaves`. A regression that
 /// hard-coded `Stdout` here regardless of input would slip
 /// past with this test passing — see the sibling

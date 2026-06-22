@@ -4603,7 +4603,8 @@ mod tests {
     /// with zero metrics. This is distinct from the
     /// "unparseable prose" case (`evaluate_falls_back_to_stderr_when_stdout_yields_no_metrics`
     /// above): that path fails to find any JSON document at all.
-    /// The fallback condition at src/scenario/payload_run.rs:298
+    /// The fallback condition (`evaluate`'s
+    /// `if metrics.is_empty() && !output.stderr.is_empty()` gate)
     /// gates on `metrics.is_empty()`, not on parse success, so both
     /// paths must fall back to stderr. This test pins that: the
     /// fallback must not surface the empty stdout set as the

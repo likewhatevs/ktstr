@@ -1726,15 +1726,15 @@ fn flock_timeout_substring_classification_pins_seam() {
     );
 }
 
-// -- timed-out arm: scheduler-exited reason override (mod.rs:2267-2278) --
+// -- timed-out arm: scheduler-exited reason override (the `timeout_reason` block in evaluate_vm_result's `if result.timed_out` arm) --
 
 /// Timed-out run whose stderr carries an scx-disable kmsg anchor with
 /// a NON-EMPTY parenthesized body: `parse_kmsg_window` parses the
 /// anchor and the timeout reason becomes
 /// `timed out (scheduler exited: <message>)`, OVERRIDING the default
-/// `ERR_TIMED_OUT_NO_RESULT`. Pins the
-/// `if let Some(ev) = scx_exits.last()` non-empty-message sub-arm at
-/// mod.rs:2273. The `--- watchdog ---` block still renders.
+/// `ERR_TIMED_OUT_NO_RESULT`. Pins the `timeout_reason` block's
+/// `if let Some(ev) = scx_exits.last()` non-empty-message
+/// (`!ev.message.is_empty()`) sub-arm. The `--- watchdog ---` block still renders.
 #[test]
 fn eval_timeout_sched_exited_reason_override() {
     let _lock = lock_env();
@@ -1775,8 +1775,9 @@ fn eval_timeout_sched_exited_reason_override() {
 
 /// Timed-out run whose scx-disable anchor has an EMPTY parenthesized
 /// body `()`: `parse_kmsg_window` yields an event with an empty
-/// `message`, so the timeout reason takes the empty-message sub-arm at
-/// mod.rs:2270-2271 — `timed out (scheduler <name> exited)` formatted
+/// `message`, so the timeout reason takes the `timeout_reason` block's
+/// `if ev.message.is_empty()` empty-message sub-arm —
+/// `timed out (scheduler <name> exited)` formatted
 /// from `ev.scheduler_name` (parsed as `scx_test` from the anchor).
 #[test]
 fn eval_timeout_sched_exited_empty_message() {
@@ -1815,11 +1816,12 @@ fn eval_timeout_sched_exited_empty_message() {
     );
 }
 
-// -- timed-out arm: crash_section dual-fire (mod.rs:2230-2234) --
+// -- timed-out arm: crash_section dual-fire (the `crash_section` binding in evaluate_vm_result's `if result.timed_out` arm) --
 
 /// Timed-out run that ALSO carries a structured `crash_message`: both
 /// the timeout reason AND the guest crash backtrace render. The
-/// `crash_section` true-branch (mod.rs:2231) fires only when
+/// `crash_section` `if let Some(ref guest_crash) = result.crash_message`
+/// true-branch fires only when
 /// `timed_out && crash_message.is_some()`. Timeout stays the primary
 /// classification (the host watchdog halted the run); the crash
 /// backtrace appends after it, so the ordering
@@ -1863,11 +1865,13 @@ fn eval_timeout_with_crash_renders_both() {
     );
 }
 
-// -- no-result arm: scheduler-exited reason from kmsg (mod.rs:2304-2310) --
+// -- no-result arm: scheduler-exited reason from kmsg (the `reason` ladder's `has_active_scheduling()` branch in evaluate_vm_result) --
 
 /// No parseable result, active scheduler, stderr carrying a NON-EMPTY
-/// scx-disable anchor body: the reason ladder at mod.rs:2304-2310 takes
-/// the `if let Some(ev) = scx_exits.last()` non-empty sub-arm (2309) and
+/// scx-disable anchor body: the `reason` ladder's
+/// `else if entry.scheduler.has_active_scheduling()` branch takes
+/// the `if let Some(ev) = scx_exits.last()` non-empty
+/// (`else` of `ev.message.is_empty()`) sub-arm and
 /// renders `scheduler exited: <message>`, overriding the
 /// `ERR_NO_TEST_RESULT_FROM_GUEST` fallback. crash_message is None and
 /// output is empty so the earlier crash/panic rungs are not taken.
@@ -1901,8 +1905,9 @@ fn eval_noresult_sched_exited_from_kmsg() {
 }
 
 /// No parseable result, active scheduler, scx-disable anchor with an
-/// EMPTY parenthesized body: the reason takes the empty-message sub-arm
-/// at mod.rs:2306-2307 and renders `scheduler exited (<name>)` from
+/// EMPTY parenthesized body: the `reason` ladder takes the
+/// `if ev.message.is_empty()` empty-message sub-arm
+/// and renders `scheduler exited (<name>)` from
 /// `ev.scheduler_name` (parsed `scx_test`).
 #[test]
 fn eval_noresult_sched_exited_empty_message() {
@@ -1933,14 +1938,15 @@ fn eval_noresult_sched_exited_empty_message() {
     );
 }
 
-// -- no-result arm: extract_exit_from_dump_trace fallback (mod.rs:2311-2312) --
+// -- no-result arm: extract_exit_from_dump_trace fallback (the `reason` ladder's `extract_exit_from_dump_trace` rung in evaluate_vm_result) --
 
 /// No parseable result, active scheduler, stderr that has NO
 /// `sched_ext: BPF scheduler "` kmsg anchor (so `parse_kmsg_window` is
 /// empty) BUT carries a `sched_ext_dump:` trace with a
-/// `triggered exit kind` anchor plus a same-CPU body line: the reason
-/// ladder falls through to the `extract_exit_from_dump_trace` rung at
-/// mod.rs:2311-2312 and renders `scheduler exited: <reason>` with the
+/// `triggered exit kind` anchor plus a same-CPU body line: the `reason`
+/// ladder falls through to the
+/// `else if let Some(reason) = extract_exit_from_dump_trace(...)` rung
+/// and renders `scheduler exited: <reason>` with the
 /// exact body the parser surfaces. Canonical input shape mirrors
 /// `output.rs::extract_exit_from_dump_trace_canonical`.
 #[test]
@@ -1979,12 +1985,13 @@ ktstr-1 [001] 0.501: sched_ext_dump:   apply_cell_config returned -EINVAL
     );
 }
 
-// -- failure-path info_notes section (mod.rs:1934-1943) --
+// -- failure-path info_notes section (the `info_section` binding in evaluate_vm_result's guest-fail block) --
 
 /// A FAILING guest AssertResult that ALSO carries an `info_notes`
 /// entry: the `--- info ---` section renders the note with its
 /// two-space indent, AFTER the failure-details block. Pins the
-/// `info_notes` non-empty arm (mod.rs:1934-1943) — every existing eval
+/// `info_section` `if check_result.info_notes.is_empty()` non-empty
+/// (`else`) arm — every existing eval
 /// fixture leaves `info_notes` empty.
 #[test]
 fn eval_failure_renders_info_notes_section() {
@@ -2029,12 +2036,12 @@ fn eval_failure_renders_info_notes_section() {
     );
 }
 
-// -- failure-path stats section + cgroup spread n/a (mod.rs:1961-1989) --
+// -- failure-path stats section + cgroup spread n/a (the `stats_section` binding in evaluate_vm_result's guest-fail block) --
 
 /// A FAILING guest AssertResult whose `stats.cgroups` is non-empty:
 /// the `--- stats ---` block renders, exercising BOTH the
 /// `Some(spread)` and the `None` ("n/a") arms of the per-cgroup
-/// `spread.map_or_else` at mod.rs:1979-1980. The header line renders
+/// `cg.spread.map_or_else(|| "n/a".to_string(), ...)` call. The header line renders
 /// the run-level scalars; each per-cg line carries its distinct `iter=`
 /// value so the index loop is proven to run for both cgroups.
 #[test]
@@ -2110,10 +2117,12 @@ fn eval_failure_renders_stats_section_with_spread_na() {
     );
 }
 
-// -- failure-path repro section on guest-fail (mod.rs:1944-1951) --
+// -- failure-path repro section on guest-fail (the `repro` / `repro_section` bindings in evaluate_vm_result's guest-fail block) --
 
 /// A FAILING guest AssertResult on the active-scheduler path: the
-/// repro `.map(...)` closure (mod.rs:1949-1951) fires because
+/// `repro_section`'s `repro.map(...)` chain (built from the
+/// `if entry.scheduler.has_active_scheduling() { repro_fn(output) }`
+/// binding) fires because
 /// `entry.scheduler.has_active_scheduling()` is true (sched_entry) AND
 /// `repro_fn` returns Some, rendering the `--- auto-repro ---` section
 /// with the payload. This is the GUEST-AssertResult-fail arm —
@@ -2154,7 +2163,8 @@ fn eval_failure_repro_section_on_guest_fail() {
 
 /// Contrast control for `eval_failure_repro_section_on_guest_fail`:
 /// with `eevdf_entry` (`has_active_scheduling() == false`) the repro
-/// gate at mod.rs:1944 returns None even though `repro_fn` would have
+/// gate (the `if entry.scheduler.has_active_scheduling()` guard on the
+/// `repro` binding) returns None even though `repro_fn` would have
 /// returned Some — so NO `--- auto-repro ---` section renders.
 #[test]
 fn eval_failure_no_repro_section_without_active_scheduling() {
@@ -2186,15 +2196,15 @@ fn eval_failure_no_repro_section_without_active_scheduling() {
     );
 }
 
-// -- inconclusive monitor verdict fold (mod.rs:2115-2131) --
+// -- inconclusive monitor verdict fold (the `else if verdict.is_inconclusive()` arm of the monitor-threshold block in evaluate_vm_result) --
 
 /// A PASSING guest AssertResult plus monitor data that is UNINITIALIZED
 /// (constant `rq_clock` across every CPU and sample): the monitor
 /// evaluator returns an INCONCLUSIVE verdict
-/// (`MonitorThresholds::evaluate`'s `!data_looks_valid` arm,
-/// monitor/mod.rs:1405-1407 -> summary "monitor data not yet
-/// initialized"). The `else if verdict.is_inconclusive()` arm at
-/// mod.rs:2115-2131 folds a `DetailKind::Monitor` Inconclusive outcome
+/// (`MonitorThresholds::evaluate`'s `if !Self::data_looks_valid(...)`
+/// arm -> summary "monitor data not yet
+/// initialized"). The `else if verdict.is_inconclusive()` arm of the
+/// monitor-threshold block folds a `DetailKind::Monitor` Inconclusive outcome
 /// into `check_result` instead of bailing, so `evaluate` returns Ok and
 /// the merged verdict is inconclusive.
 #[test]
@@ -2320,11 +2330,12 @@ fn eval_monitor_inconclusive_folds_into_verdict() {
     );
 }
 
-// -- verdict_word = "inconclusive" in failure header (mod.rs:2040-2044) --
+// -- verdict_word = "inconclusive" in failure header (the `verdict_word` binding in evaluate_vm_result's guest-fail block) --
 
 /// A check_result that is INCONCLUSIVE (not pass, not fail): the
-/// failure-message header uses `verdict_word = "inconclusive"` at
-/// mod.rs:2040-2044, not "failed". Built by merging an
+/// failure-message header uses the `verdict_word` binding's
+/// `if check_result.is_inconclusive() { "inconclusive" }` arm,
+/// not "failed". Built by merging an
 /// `AssertResult::inconclusive(...)` onto a passing base — the
 /// resulting lattice is `is_fail=false / is_inconclusive=true /
 /// is_pass=false`, so the failure-render block runs.
@@ -2366,12 +2377,15 @@ fn eval_inconclusive_verdict_word_in_header() {
 }
 
 // -- scx_bpf_error matcher fold + ScxBpfErrorMatcherMismatch context --
-// (mod.rs:1813-1824, 2072-2073)
+// (the `matcher_details` / `matcher_mismatch` bindings and the
+// `if matcher_mismatch { err.context(...) }` return in evaluate_vm_result)
 
 /// A configured `expect_scx_bpf_error_contains` matcher whose needle is
 /// ABSENT from the captured corpus folds a mismatch `AssertDetail` into
-/// `check_result` (mod.rs:1815-1824) and wraps the failure `Err` with
-/// the [`ScxBpfErrorMatcherMismatch`] context (mod.rs:2072-2073).
+/// `check_result` (via the `matcher_details` `evaluate_scx_bpf_error_match`
+/// fold under the `matcher_configured` gate) and wraps the failure `Err`
+/// with the [`ScxBpfErrorMatcherMismatch`] context (the
+/// `return Err(if matcher_mismatch { err.context(ScxBpfErrorMatcherMismatch) ... })`).
 ///
 /// `entry.expect_err` is set to `true` so the matcher takes the
 /// "substring not found" diagnostic path (with `expect_err = false`
@@ -2451,13 +2465,14 @@ fn eval_no_matcher_no_mismatch_context() {
     );
 }
 
-// -- post_vm_err fold on guest-AssertResult path (mod.rs:1748-1753) --
+// -- post_vm_err fold on guest-AssertResult path (the `if let Some(err) = post_vm_err` block in evaluate_vm_result's parse-success arm) --
 
 /// A host-side `post_vm` callback `Err` folds a `DetailKind::Other`
 /// failure into an otherwise-PASSING guest `check_result`
-/// (mod.rs:1748-1753), flipping the verdict to a hard failure. The
+/// (the `if let Some(err) = post_vm_err { check_result.merge(...) }`
+/// block), flipping the verdict to a hard failure. The
 /// folded detail renders the exact `post_vm callback returned Err: ...`
-/// text from mod.rs:1751.
+/// text from that block's `format!("post_vm callback returned Err: {err:#}")`.
 #[test]
 fn eval_post_vm_err_folds_into_guest_pass() {
     let assert = build_assert_result(true, vec![]);
@@ -2488,12 +2503,13 @@ fn eval_post_vm_err_folds_into_guest_pass() {
     );
 }
 
-// -- host_extract_failures fold (mod.rs:1736-1738) --
+// -- host_extract_failures fold (the `for detail in host_extract_failures` loop in evaluate_vm_result's parse-success arm) --
 
 /// A non-empty `host_extract_failures` slice (the 6th param) folds each
 /// detail into an otherwise-PASSING guest `check_result` via
-/// `check_result.merge(AssertResult::fail(detail.clone()))`
-/// (mod.rs:1736-1738), flipping the verdict to failed and rendering the
+/// the `for detail in host_extract_failures {
+/// check_result.merge(AssertResult::fail(detail.clone())) }` loop,
+/// flipping the verdict to failed and rendering the
 /// host-extract detail in the details block.
 #[test]
 fn eval_host_extract_failures_fold_into_guest_pass() {
@@ -2528,11 +2544,12 @@ fn eval_host_extract_failures_fold_into_guest_pass() {
     );
 }
 
-// -- scheduler-log >200-line truncation (mod.rs:1652-1657) --
+// -- scheduler-log >200-line truncation (the `tail` binding in evaluate_vm_result's `sched_log_section` builder) --
 
 /// A no-result run whose scheduler log carries >200 NON-verifier lines
-/// triggers the tail-truncation branch at mod.rs:1652-1657: the
-/// `!is_verifier && lines.len() > 200` arm renders
+/// triggers the tail-truncation branch in the `sched_log_section`
+/// builder's `tail` binding: the
+/// `if !is_verifier && lines.len() > 200` arm renders
 /// `[N lines truncated]` followed by the last 200 lines.
 ///
 /// The body is 250 DISTINCT `frame_<i>+0x10` lines so `collapse_cycles`
@@ -2579,14 +2596,17 @@ fn eval_sched_log_truncates_over_200_lines() {
     );
 }
 
-// -- guest-fail block bug_summary_line() closure Some-arm (mod.rs:1691-1702, 2048) --
+// -- guest-fail block bug_summary_line() closure Some-arm (the `bug_summary_line` closure in evaluate_vm_result) --
 
 /// On the guest-AssertResult-fail path the `bug_summary_line()` closure
-/// (mod.rs:1691-1702) extracts a `scx_bpf_error`-class line from the
+/// (the `|| -> String { match ...extract_bug_summary(...) }` closure)
+/// extracts a `scx_bpf_error`-class line from the
 /// scheduler-log corpus and prepends a `BUG SUMMARY: <text>\n` line to
-/// the rendered failure message (concatenated at mod.rs:2048, ahead of
+/// the rendered failure message (concatenated as the `bug_summary_line()`
+/// arg of the failure `format!`, ahead of
 /// the `ktstr_test` header). `extract_bug_summary` falls through its
-/// dump scan to the sched-log loop (output.rs:171-179), returning the
+/// dump scan to the `for line in sched_clean.lines() { if line.contains("scx_bpf_error")` loop,
+/// returning the
 /// trimmed `scx_bpf_error: cell config invalid` line. Pins the Some-arm
 /// rendering through `evaluate_vm_result`: every existing eval failure
 /// fixture either has no `scx_bpf_error` substring (so the closure
@@ -2594,13 +2614,15 @@ fn eval_sched_log_truncates_over_200_lines() {
 /// eval closure.
 ///
 /// `stderr_color()` is `false` under the captured-stderr test harness
-/// (cli/util.rs:13-17 reads `is_terminal()`, cached), so the plain
+/// (`cli::util::stderr_color` reads `std::io::stderr().is_terminal()`,
+/// cached in a `OnceLock`), so the plain
 /// `BUG SUMMARY: ` form renders — the combined substring asserted below
 /// exists only in that plain form, not the `\x1b`-wrapped one. The
 /// `output` carries the line bracketed by `SCHED_OUTPUT_START` /
 /// `SCHED_OUTPUT_END`; `guest_messages` holds only the TEST_RESULT TLV,
 /// so `concat_sched_log_chunks` is empty and `sched_log_input` falls
-/// back to `output` (mod.rs:1641-1646), the corpus the closure scans.
+/// back to `output` (the `if !sched_log_merged.is_empty() { ... } else { output }`
+/// binding of `sched_log_input`), the corpus the closure scans.
 #[test]
 fn eval_failure_renders_bug_summary_line_via_closure() {
     let _lock = lock_env();
@@ -2635,11 +2657,13 @@ fn eval_failure_renders_bug_summary_line_via_closure() {
     );
 }
 
-// -- guest-fail block periodic-samples section wiring (mod.rs:2022-2023, 2057) --
+// -- guest-fail block periodic-samples section wiring (the `periodic_section` binding + its `periodic_section` arg in evaluate_vm_result's failure format!) --
 
 /// On the guest-fail path the periodic-samples section
-/// (`format_periodic_samples_section(result)`, mod.rs:2022-2023)
-/// renders into the failure message (mod.rs:2057) when
+/// (the `periodic_section` binding's
+/// `format_periodic_samples_section(result)` call)
+/// renders into the failure message (its `periodic_section` arg of the
+/// failure `format!`) when
 /// `result.periodic_target > 0`. Every existing fail-arm eval fixture
 /// leaves `periodic_target == 0`, so the section returns `""` and never
 /// appears in an asserted failure message; the non-zero-target
@@ -2647,7 +2671,8 @@ fn eval_failure_renders_bug_summary_line_via_closure() {
 /// helpers can't set the periodic fields, so the `VmResult` is built via
 /// the `test_fixture()` struct-update idiom with the fields overridden.
 /// Exact strings per `format_periodic_samples_section`
-/// (output.rs:561-601): with `fired=2 real=2 target=4` the degraded-
+/// (its `if real < fired` / `if fired < target` line gates): with
+/// `fired=2 real=2 target=4` the degraded-
 /// placeholder line is skipped (`real < fired` false) and the
 /// missing-samples line renders (`fired < target` true).
 #[test]
@@ -2693,11 +2718,13 @@ fn eval_failure_renders_periodic_samples_section() {
     );
 }
 
-// -- guest-fail block temporal-assertions section wiring (mod.rs:2030-2031, 2058) --
+// -- guest-fail block temporal-assertions section wiring (the `temporal_section` binding + its `temporal_section` arg in evaluate_vm_result's failure format!) --
 
 /// On the guest-fail path the temporal-assertions section
-/// (`format_temporal_assertions_section(&check_result)`,
-/// mod.rs:2030-2031) renders into the failure message (mod.rs:2058)
+/// (the `temporal_section` binding's
+/// `format_temporal_assertions_section(&check_result)` call)
+/// renders into the failure message (its `temporal_section` arg of the
+/// failure `format!`)
 /// when `check_result` carries a `DetailKind::Temporal` detail.
 /// `format_temporal_assertions_section` is unit-tested directly in
 /// output.rs, but no eval test feeds a Temporal-tagged detail through
@@ -2705,7 +2732,8 @@ fn eval_failure_renders_periodic_samples_section() {
 /// roundtrip Temporal detail reaches the section — is otherwise
 /// unverified. The Temporal detail survives the postcard TLV roundtrip
 /// (`DetailKind` is a plain serde enum). Exact header per
-/// output.rs:632-637.
+/// `format_temporal_assertions_section`'s
+/// `"{n} temporal assertion entry(ies):"` push.
 #[test]
 fn eval_failure_renders_temporal_assertions_section() {
     let assert = build_assert_result(
@@ -2745,21 +2773,24 @@ fn eval_failure_renders_temporal_assertions_section() {
     );
 }
 
-// -- no-result console-suppression else arm (mod.rs:2188-2194) --
+// -- no-result console-suppression else arm (the no-result `console_section` binding in evaluate_vm_result) --
 
-/// The no-parseable-result `console_section` ternary's
-/// `else { String::new() }` arm (mod.rs:2192-2194) is reached only when
+/// The no-parseable-result `console_section` binding's
+/// `else { String::new() }` arm is reached only when
 /// `has_sched_output == true` AND `!verbose()` AND
-/// `!entry.scheduler.has_active_scheduling()`. Every existing EEVDF
+/// `!entry.scheduler.has_active_scheduling()` (the negation of its
+/// `if !has_sched_output || verbose() || entry.scheduler.has_active_scheduling()`
+/// guard). Every existing EEVDF
 /// no-result fixture lacks `SCHED_OUTPUT_START`, so `has_sched_output`
 /// is false and the diagnostics section always renders; the suppression
 /// branch is otherwise unexercised. EEVDF (`has_active_scheduling()
 /// == false`) plus `SCHED_OUTPUT_START` in `output` (sets
-/// `has_sched_output`, mod.rs:2185-2187) plus `verbose()` false drives
+/// `has_sched_output` via the `output.contains(SCHED_OUTPUT_START) || ...`
+/// binding) plus `verbose()` false drives
 /// the else arm, so no `--- diagnostics ---` appears. `verbose()` reads
-/// `RUST_BACKTRACE` (runtime.rs:123-127), removed here under
+/// `RUST_BACKTRACE` (`test_support::runtime::verbose`), removed here under
 /// `lock_env()`. The reason stays `ERR_NO_TEST_FUNCTION_OUTPUT` (EEVDF,
-/// no crash/panic, mod.rs:2316-2317).
+/// no crash/panic, the final `else` rung of the `reason` ladder).
 #[test]
 fn eval_noresult_eevdf_with_sched_output_suppresses_console_section() {
     let _lock = lock_env();
@@ -2791,18 +2822,19 @@ fn eval_noresult_eevdf_with_sched_output_suppresses_console_section() {
     );
 }
 
-// -- guest-fail block build_monitor_section() empty else arm (mod.rs:1717-1725) --
+// -- guest-fail block build_monitor_section() empty else arm (the `build_monitor_section` closure in evaluate_vm_result) --
 
-/// `build_monitor_section()`'s `String::new()` else arm
-/// (mod.rs:1722-1724): `entry.scheduler.has_active_scheduling()` is true
-/// (sched_entry) but `result.monitor` is `None`, so the `&& let
-/// Some(ref monitor)` bind (mod.rs:1718-1719) fails and the closure
+/// `build_monitor_section()`'s `String::new()` else arm:
+/// `entry.scheduler.has_active_scheduling()` is true
+/// (sched_entry) but `result.monitor` is `None`, so the closure's
+/// `if entry.scheduler.has_active_scheduling() && let Some(ref monitor) = result.monitor`
+/// guard fails and the closure
 /// returns empty — no `--- monitor ---` section despite an active
 /// scheduler. `eval_sched_exit_includes_monitor` covers the
 /// monitor=Some arm; the `eval_eevdf_*` fixtures take the
 /// `has_active_scheduling()==false` short-circuit. `make_vm_result*`
 /// sets `monitor: None`, so the guest-fail block's
-/// `build_monitor_section()` call (mod.rs:2016) takes the empty else and
+/// `let monitor_section = build_monitor_section();` call takes the empty else and
 /// the rendered failure message carries no monitor section.
 #[test]
 fn eval_sched_fail_with_no_monitor_omits_monitor_section() {

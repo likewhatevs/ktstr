@@ -89,11 +89,11 @@ const DEFAULT_MAX_LINES: usize = 3000;
 /// sibling `tests.rs`) drains the entry.
 const EXCEPTIONS: &[(&str, usize)] = &[
     ("vmm/freeze_coord/mod.rs", 13531),
-    ("scenario/ops/tests.rs", 9474),
-    ("monitor/dump/tests.rs", 9308),
-    ("test_support/entry.rs", 6038),
+    ("scenario/ops/tests.rs", 9486),
+    ("monitor/dump/tests.rs", 9309),
+    ("test_support/entry.rs", 6041),
     ("monitor/reader.rs", 5946),
-    ("scenario/payload_run.rs", 5881),
+    ("scenario/payload_run.rs", 5882),
     ("workload/spawn/mod.rs", 5483),
     ("scenario/snapshot/tests.rs", 5073),
     ("monitor/btf_render/mod.rs", 5508),
@@ -102,7 +102,7 @@ const EXCEPTIONS: &[(&str, usize)] = &[
     ("monitor/dump/mod.rs", 4125),
     ("assert/temporal.rs", 4102),
     ("workload/worker/mod.rs", 3975),
-    ("bin/cargo_ktstr/parse_tests.rs", 3898),
+    ("bin/cargo_ktstr/parse_tests.rs", 3900),
     // queued: decompose timeline.rs into submodules.
     ("timeline.rs", 3941),
     ("ctprof/mod.rs", 3571),

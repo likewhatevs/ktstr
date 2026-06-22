@@ -1658,12 +1658,12 @@ fn cross_function_fixpoint_callee_before_caller() {
 
 // -- finalize-order tests ----------------------------------------
 //
-// `Analyzer::finalize` runs the arena_stx loop (cast_analysis/mod.rs:2672)
-// BEFORE the standalone shape-inference loop (cast_analysis/mod.rs:2746).
+// `Analyzer::finalize` runs the arena_stx loop
+// BEFORE the standalone shape-inference loop.
 // The standalone loop's `if out.contains_key(&key) { continue; }`
-// gate at line 2759 prevents it from overwriting an arena_stx
+// gate prevents it from overwriting an arena_stx
 // emission for the same key. The internal shape-inference inside
-// the arena_stx loop (lines 2685-2710) computes the same candidate
+// the arena_stx loop computes the same candidate
 // intersection, so the two paths produce the same target_type_id
 // when shape inference is unique.
 //
@@ -1683,13 +1683,14 @@ fn cross_function_fixpoint_callee_before_caller() {
 /// and R both 16 bytes with `u64@0 + u64@8` shape. Shape inference
 /// on accesses (0, 8) and (8, 8) intersects to {Q, R} — TWO
 /// candidates, ambiguous. The standalone shape-inference loop drops
-/// the slot per cast_analysis/mod.rs:2810-2811 ("0 or 2+ candidates
-/// -> drop silently"). The arena_stx loop's internal inference at
-/// 2685-2709 also yields `inferred_target = None`, so it falls back
-/// to `target_type_id = 0` per line 2710 (`unwrap_or(0)`). The map
+/// the slot per `Analyzer::finalize`'s "0 or 2+ candidates
+/// -> drop silently" comment. The arena_stx loop's internal inference
+/// also yields `inferred_target = None`, so it falls back
+/// to `target_type_id = 0` per the same fn's
+/// `let target_type_id = inferred_target.unwrap_or(0)`. The map
 /// must contain `(P, 8) -> CastHit { alloc_size: None, target_type_id: 0,
 /// addr_space: Arena }` — the deferred-resolve sentinel — so the
-/// renderer's `chase_arena_pointer` special case (btf_render/mod.rs:3392)
+/// renderer's `chase_arena_pointer` special case (in `btf_render`)
 /// can call `MemReader::resolve_arena_type` at chase time.
 ///
 /// Pin both:

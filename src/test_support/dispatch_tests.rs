@@ -2018,7 +2018,10 @@ fn result_to_exit_code_post_vm_marker_wins_over_expect_auto_repro() {
 // -- result_to_exit_code: ResourceContention + TopologyInsufficient
 // skip/no-skip arms --
 //
-// Both typed errors route through the skip arms (lines 1139-1179):
+// Both typed errors route through the skip arms (the
+// `Err(e) if is_resource_contention(&e)` and
+// `Err(e) if is_topology_insufficient(&e)` arms of
+// `result_to_exit_code`):
 // with KTSTR_NO_SKIP_MODE unset they map to EXIT_PASS (the test
 // never ran — `crate::report::test_skip` is a bare eprintln!, no VM
 // needed); with KTSTR_NO_SKIP_MODE set they hard-FAIL (EXIT_FAIL).
@@ -2026,8 +2029,9 @@ fn result_to_exit_code_post_vm_marker_wins_over_expect_auto_repro() {
 // under expect_err=true a contention/insufficient error still skips
 // rather than being inverted. NOTE: the 3rd `result_to_exit_code`
 // param is `allow_inconclusive`, NOT no_skip — no_skip is read from
-// KTSTR_NO_SKIP_MODE_ENV inside the fn (dispatch.rs:1017), so the
-// FAIL branch is reached ONLY by setting that env var.
+// KTSTR_NO_SKIP_MODE_ENV inside the fn (its
+// `let no_skip = std::env::var_os(crate::KTSTR_NO_SKIP_MODE_ENV).is_some();`
+// binding), so the FAIL branch is reached ONLY by setting that env var.
 
 /// `ResourceContention` (direct and `.context`-wrapped) routes to
 /// EXIT_PASS when KTSTR_NO_SKIP_MODE is unset — including under
@@ -2070,7 +2074,8 @@ fn result_to_exit_code_resource_contention_skips_when_not_no_skip() {
 /// `TopologyInsufficient` (direct and `.context`-wrapped) routes to
 /// EXIT_PASS when KTSTR_NO_SKIP_MODE is unset — including under
 /// expect_err=true. Mirror of the ResourceContention skip test;
-/// pins the second skip arm (dispatch.rs:1160-1179).
+/// pins the second skip arm (`result_to_exit_code`'s
+/// `Err(e) if is_topology_insufficient(&e)` arm).
 #[test]
 fn result_to_exit_code_topology_insufficient_skips_when_not_no_skip() {
     use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
@@ -2103,7 +2108,9 @@ fn result_to_exit_code_topology_insufficient_skips_when_not_no_skip() {
 /// Under KTSTR_NO_SKIP_MODE, both skip-class errors hard-FAIL
 /// (EXIT_FAIL) instead of skipping, and the stderr banner names
 /// the contention/insufficiency reason. Pins the no_skip branches
-/// (dispatch.rs:1147-1154 / 1168-1174) and the reason extraction.
+/// (the `if no_skip { ... EXIT_FAIL }` arms inside
+/// `result_to_exit_code`'s `is_resource_contention` and
+/// `is_topology_insufficient` Err arms) and the reason extraction.
 #[test]
 fn result_to_exit_code_skip_class_fails_under_no_skip_mode() {
     use crate::test_support::test_helpers::{EnvVarGuard, capture_stderr, lock_env};
@@ -2151,9 +2158,9 @@ fn result_to_exit_code_skip_class_fails_under_no_skip_mode() {
 /// string. `collect_sidecars` on a directory with no
 /// `*.ktstr.json` files yields an empty Vec (the read_dir is Ok
 /// but the iterator yields nothing for an existing empty dir, so
-/// `sidecars.is_empty()` is true), exercising the
-/// `sidecars.is_empty() -> String::new()` branch at
-/// dispatch.rs:2465 — pinned via exact-empty equality, not just
+/// `sidecars.is_empty()` is true), exercising
+/// `analyze_sidecars`'s `if sidecars.is_empty() { return String::new(); }`
+/// branch — pinned via exact-empty equality, not just
 /// `.is_empty()`.
 #[test]
 fn analyze_sidecars_empty_dir_returns_empty_string() {
@@ -2223,7 +2230,9 @@ fn analyze_sidecars_single_fixture_renders_rows_only() {
 //
 // The two early guards (missing `verifier/` prefix, <3-part cell
 // name) run BEFORE the cell banner, check_kvm(), and any scheduler
-// / kernel resolution (dispatch.rs:1755-1768), so they are
+// / kernel resolution (`run_verifier_cell`'s
+// `full_name.strip_prefix("verifier/")` None arm and its
+// `if parts.len() != 3` arm), so they are
 // host-reachable with no KVM, no scheduler binary, no kernel. A
 // syntactically-valid 3-part name would fall through to
 // check_kvm() and is intentionally NOT tested here.
@@ -2265,8 +2274,8 @@ fn run_verifier_cell_too_few_parts_exits_one() {
 
 /// The `AsRef<str>` impl exposes the SANITIZED inner string, not
 /// the raw input. Mirror of `sanitized_kernel_label_as_str_returns_sanitized_form`
-/// but routed through the trait so the impl (dispatch.rs:216-219)
-/// is load-bearing rather than dead.
+/// but routed through the trait so the `impl AsRef<str> for
+/// SanitizedKernelLabel` is load-bearing rather than dead.
 #[test]
 fn sanitized_kernel_label_as_ref_returns_sanitized_form() {
     let label = SanitizedKernelLabel::new("6.14.2");
@@ -2286,11 +2295,14 @@ fn sanitized_kernel_label_as_ref_returns_sanitized_form() {
 // ---------------------------------------------------------------
 
 /// `run_ktstr_test` calls `entry.validate()?` as its first
-/// statement (dispatch.rs:930), so an entry that violates a
+/// statement, so an entry that violates a
 /// validate invariant returns Err BEFORE any VM / KVM work
-/// (932-941). A non-empty name plus `cpu_budget=Some(0)` reaches
+/// (the `if entry.host_only` / `bpf_map_write` / `run_ktstr_test_inner`
+/// body after that `entry.validate()?`). A non-empty name plus
+/// `cpu_budget=Some(0)` reaches
 /// the cpu_budget-zero bail: the empty-name check fires FIRST
-/// (entry.rs:1781), so the name MUST be set for this fixture to
+/// (`KtstrTestEntry::validate`'s `self.name.is_empty()` check), so the
+/// name MUST be set for this fixture to
 /// reach the intended message. Pinning the exact bail string
 /// proves the failure came from validate() and not a downstream
 /// VM error.
@@ -2315,7 +2327,9 @@ fn run_ktstr_test_validate_rejects_zero_cpu_budget() {
 // ---------------------------------------------------------------
 //
 // These exercise the cleanly host-only skip branches in
-// run_named_test (dispatch.rs:2170-2188): a performance_mode test
+// run_named_test (its `if entry.performance_mode &&
+// no_perf_mode_active()` and `if perf_only_skips_entry(entry)` arms):
+// a performance_mode test
 // under --no-perf-mode, and a non-performance_mode test under
 // KTSTR_PERF_ONLY. Both call `crate::report::test_skip` (a bare
 // eprintln!) and `record_skip_sidecar`, then return 0 with no VM.
@@ -2358,7 +2372,8 @@ static __PERF_ONLY_SKIP_ENTRY: KtstrTestEntry = KtstrTestEntry {
 /// exit 0 + the canonical perf-mode skip banner. KTSTR_PERF_ONLY
 /// is removed so it cannot pre-empt this branch, and
 /// KTSTR_KERNEL_LIST is removed so strip_kernel_suffix is a
-/// passthrough. Pins dispatch.rs:2170-2178.
+/// passthrough. Pins `run_named_test`'s `if entry.performance_mode &&
+/// no_perf_mode_active()` skip arm.
 #[test]
 fn run_named_test_perf_mode_test_skips_under_no_perf_mode() {
     use crate::test_support::test_helpers::{EnvVarGuard, capture_stderr, lock_env};
@@ -2387,7 +2402,7 @@ fn run_named_test_perf_mode_test_skips_under_no_perf_mode() {
 /// removed so the perf_mode branch above does not interfere (it
 /// is `false && ...` anyway for this fixture), and
 /// KTSTR_KERNEL_LIST is removed for the passthrough. Pins
-/// dispatch.rs:2180-2188.
+/// `run_named_test`'s `if perf_only_skips_entry(entry)` skip arm.
 #[test]
 fn run_named_test_non_perf_test_skips_under_perf_only() {
     use crate::test_support::test_helpers::{EnvVarGuard, capture_stderr, lock_env};
@@ -2415,7 +2430,8 @@ fn run_named_test_non_perf_test_skips_under_perf_only() {
 // list_tests — KTSTR_BUDGET_SECS parse arms
 // ---------------------------------------------------------------
 //
-// `list_tests` (dispatch.rs:1371-1391) reads KTSTR_BUDGET_SECS and
+// `list_tests` reads KTSTR_BUDGET_SECS (via its
+// `s.parse::<f64>()` match populating `budget_secs`) and
 // branches three ways:
 //   - unset / unparseable / non-positive → fall back to
 //     `list_tests_all` (after an `eprintln!` warning for the two
@@ -2429,7 +2445,7 @@ fn run_named_test_non_perf_test_skips_under_perf_only() {
 /// A non-numeric KTSTR_BUDGET_SECS emits the parse-error warning
 /// and falls through to `list_tests_all` — the base test names
 /// still land on stdout. Pins the `Err(e) => { eprintln!(...) }`
-/// arm at dispatch.rs:1380-1383.
+/// arm of `list_tests`'s `s.parse::<f64>()` match.
 #[test]
 fn list_tests_budget_non_numeric_warns_and_lists_all() {
     use crate::test_support::test_helpers::{EnvVarGuard, capture_stderr, lock_env};
@@ -2466,8 +2482,9 @@ fn list_tests_budget_non_numeric_warns_and_lists_all() {
 
 /// A non-positive KTSTR_BUDGET_SECS (zero / negative) emits the
 /// "must be positive" warning and falls through to
-/// `list_tests_all`. Pins the `Ok(v) => { eprintln!(...) }` arm at
-/// dispatch.rs:1376-1379, distinct from the parse-error arm above.
+/// `list_tests_all`. Pins the `Ok(v) => { eprintln!("...must be positive...") }`
+/// non-positive arm of `list_tests`'s `s.parse::<f64>()` match,
+/// distinct from the parse-error arm above.
 #[test]
 fn list_tests_budget_non_positive_warns_and_lists_all() {
     use crate::test_support::test_helpers::{EnvVarGuard, capture_stderr, lock_env};
@@ -2496,8 +2513,9 @@ fn list_tests_budget_non_positive_warns_and_lists_all() {
 
 /// A valid positive KTSTR_BUDGET_SECS routes through
 /// `list_tests_budget`, which emits a `ktstr budget:` summary line
-/// to stderr. Pins the `Some(budget) => list_tests_budget(...)`
-/// arm at dispatch.rs:1386-1388. A generous budget keeps the
+/// to stderr. Pins `list_tests`'s
+/// `if let Some(budget) = budget_secs { list_tests_budget(...) }`
+/// arm. A generous budget keeps the
 /// selector inclusive so the path is exercised regardless of the
 /// registered test set's estimated durations.
 #[test]
@@ -2524,8 +2542,8 @@ fn list_tests_budget_valid_routes_to_budget_lister() {
 
 /// With KTSTR_KERNEL_LIST unset, `list_verifier_cells_all` returns
 /// immediately and emits nothing. Pins the
-/// `if kernel_list.is_empty() { return; }` early-return at
-/// dispatch.rs:1669-1671 — the verifier matrix dimension is
+/// `if kernel_list.is_empty() { return; }` early-return in
+/// `list_verifier_cells_all` — the verifier matrix dimension is
 /// KTSTR_KERNEL_LIST, so an absent list means zero cells.
 #[test]
 fn list_verifier_cells_all_empty_kernel_list_emits_nothing() {
@@ -2544,8 +2562,8 @@ fn list_verifier_cells_all_empty_kernel_list_emits_nothing() {
 /// With a populated KTSTR_KERNEL_LIST but NO declared schedulers in
 /// this binary's `KTSTR_SCHEDULERS` slice (the lib test binary
 /// registers none), `list_verifier_cells_all` runs the post-early-
-/// return setup (presets / host_capacity / no_perf_mode at
-/// dispatch.rs:1672-1674) and then iterates zero schedulers — so no
+/// return setup (its `gauntlet_presets()` / `host_capacity()` /
+/// `no_perf_mode_active()` bindings) and then iterates zero schedulers — so no
 /// `verifier/` line is ever printed. Pins that a kernel list alone
 /// does not synthesize cells without a scheduler to pair them with.
 #[test]
@@ -2569,8 +2587,10 @@ fn list_verifier_cells_all_no_schedulers_emits_no_cells() {
 
 /// A syntactically-valid 3-part cell name whose scheduler is not in
 /// `KTSTR_SCHEDULERS` (the lib test binary declares none) exits 1
-/// via the "no declared scheduler" branch at dispatch.rs:1786-1792.
-/// This branch is gated behind `check_kvm()` (dispatch.rs:1781), so
+/// via the "no declared scheduler" branch (`run_verifier_cell`'s
+/// `let Some(sched) = KTSTR_SCHEDULERS.iter().find(|s| s.name == sched_name) else { ... }`).
+/// This branch is gated behind `check_kvm()` (the preceding
+/// `if let Err(e) = crate::cli::check_kvm()` preflight in the same fn), so
 /// the test runs the branch only when KVM is actually available —
 /// when `check_kvm()` errors (no /dev/kvm, or permission denied)
 /// the run_verifier_cell call would exit 1 via the KVM-preflight
@@ -2628,7 +2648,8 @@ fn unknown_scheduler_is_absent_from_registry() {
 // run_host_only_test — host-side dispatch (no VM)
 // ---------------------------------------------------------------
 
-/// `run_host_only_test` (dispatch.rs:2204-2207) runs a host_only
+/// `run_host_only_test` (the wrapper that calls
+/// `run_host_only_test_inner` then `result_to_exit_code`) runs a host_only
 /// entry on the host with no VM: it resolves real-host sysfs
 /// topology, builds a cgroup manager (no setup), builds a Ctx, and
 /// calls the entry's `func`, then projects the AssertResult through
@@ -2665,9 +2686,11 @@ fn run_host_only_test_passing_entry_exits_zero() {
 
 /// `run_gauntlet_test` with a registered `performance_mode` entry
 /// and a real preset name derives the per-preset TopoOverride
-/// (dispatch.rs:2406-2413: memory_mib + TopoOverride from the
+/// (its `derive_test_memory_mib(...)` + `TopoOverride { ... }`
+/// bindings from the
 /// preset topology) and THEN hits the perf-mode skip gate
-/// (dispatch.rs:2415-2422) under KTSTR_NO_PERF_MODE, returning 0
+/// (its `if entry.performance_mode && no_perf_mode_active()` arm)
+/// under KTSTR_NO_PERF_MODE, returning 0
 /// with no VM. Drives the topo-derivation lines that the existing
 /// `run_gauntlet_test_*` error-branch tests never reach (they bail
 /// at the name-parse / preset-lookup guards before topo derivation).
@@ -2683,7 +2706,8 @@ fn run_gauntlet_test_perf_mode_entry_derives_topo_then_skips() {
     let sidecar_dir = tempfile::tempdir().expect("create sidecar tempdir");
     let _sidecar = EnvVarGuard::set(crate::KTSTR_SIDECAR_DIR_ENV, sidecar_dir.path());
 
-    // `tiny-1llc` is the first gauntlet preset (gauntlet.rs:42) — a
+    // `tiny-1llc` is the first gauntlet preset (the first tuple in
+    // `gauntlet::gauntlet_presets()`) — a
     // real preset so the preset-lookup guard passes and topo
     // derivation runs.
     let (code, captured) = capture_stderr(|| {
@@ -2706,7 +2730,9 @@ fn run_gauntlet_test_perf_mode_entry_derives_topo_then_skips() {
 // ktstr_list_only / warn_duplicate_test_names_once
 // ---------------------------------------------------------------
 
-/// `ktstr_list_only` (dispatch.rs:2547-2551) reads argv for
+/// `ktstr_list_only` (whose body is
+/// `args.iter().any(|a| a == "--ignored")` then `list_tests(ignored_only)`)
+/// reads argv for
 /// `--ignored`, then delegates to `list_tests`, which prints the
 /// `ktstr/{name}: test` names to stdout and RETURNS (unlike
 /// `ktstr_main`, which `process::exit`s). Pins the
@@ -2758,7 +2784,8 @@ fn ktstr_list_only_prints_test_names_and_returns() {
     }
 }
 
-/// `warn_duplicate_test_names_once` (dispatch.rs:1306-1309) gates
+/// `warn_duplicate_test_names_once` (whose body is a
+/// `CHECKED.get_or_init(...)` over a `static CHECKED: OnceLock<()>`) gates
 /// its walk through a process-wide `OnceLock<()>`. The walk itself
 /// (whose detection logic is pinned by the
 /// `warn_duplicate_test_names_inner_*` tests above) is fired against

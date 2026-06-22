@@ -475,7 +475,7 @@ fn try_render_cpumask_bits_garbage_capped_at_max_cpus() {
 
 /// A multi-word inline cpumask whose trailing word carries the
 /// canonical kernel-pointer top byte (`0xff..`) but is NOT all-ones
-/// must trigger the per-word plausibility break (mod.rs:1592,
+/// must trigger the per-word plausibility break (`try_render_cpumask_bits`'s
 /// `word != u64::MAX && word >> 56 == 0xff`) — that word is slab /
 /// pointer garbage, not online CPUs. word0 = 0b11 (cpus 0,1); word1 =
 /// 0xff00_0000_0000_0000 (top byte 0xff; bits 120-127 if trusted).

@@ -251,8 +251,8 @@ fn wake_chain_pipe_no_repeat_bootstrap_invariant() {
 /// Parameters: depth=4, num_workers=8 (2 chains of 4),
 /// work_per_hop=50ms, 1000ms window. Workers `[0..4)` are
 /// chain 0, workers `[4..8)` are chain 1 — `chain_idx = i /
-/// depth` matches the spawn-side derivation at
-/// `workload.rs:4600` (`chain_pipes_base + i / depth`).
+/// depth` matches the spawn-side `let chain_idx = chain_pipes_base + i / depth`
+/// derivation in `spawn::mod`.
 /// Each chain's correct steady-state is ~20 iters total
 /// (one wake per work_per_hop, depth stages share that rate);
 /// the `[4, 30]` per-chain window catches stalls (lower
