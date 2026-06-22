@@ -275,6 +275,57 @@ impl KtstrKvm {
         let max_apic_id = max_apic_id(&topo);
         let split_irqchip = max_apic_id > MAX_XAPIC_ID;
 
+        let ioapic = Self::setup_irqchip(&vm_fd, split_irqchip)?;
+
+        Self::tune_kvm_caps(&vm_fd, performance_mode, &topo)?;
+
+        let (guest_mem, numa_layout, reservation) = match memory_mib {
+            Some(mb) => {
+                let layout =
+                    NumaMemoryLayout::compute(&topo, mb, 0, Some((MMIO_GAP_START, MMIO_GAP_END)))?;
+                let alloc =
+                    layout.allocate_and_register(&vm_fd, use_hugepages, performance_mode)?;
+                (alloc.guest_mem, Some(layout), Some(alloc.reservation))
+            }
+            None => {
+                let placeholder = GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), 4096)])
+                    .context("allocate placeholder guest memory")?;
+                (placeholder, None, None)
+            }
+        };
+
+        let vcpus = Self::create_vcpus(
+            &kvm,
+            &vm_fd,
+            &topo,
+            &numa_layout,
+            max_apic_id,
+            performance_mode,
+        )?;
+
+        Ok(KtstrKvm {
+            kvm: ManuallyDrop::new(kvm),
+            vm_fd: ManuallyDrop::new(vm_fd),
+            vcpus,
+            guest_mem: ManuallyDrop::new(guest_mem),
+            topology: topo,
+            numa_layout,
+            has_immediate_exit,
+            split_irqchip,
+            ioapic,
+            use_hugepages,
+            performance_mode,
+            _reservation: reservation,
+            cow_overlay_guards: Vec::new(),
+        })
+    }
+
+    /// Set up the IRQ chip: split (LAPIC-only + x2APIC API + userspace
+    /// IOAPIC) when `split_irqchip`, else full in-kernel PIC/IOAPIC/LAPIC + PIT.
+    fn setup_irqchip(
+        vm_fd: &VmFd,
+        split_irqchip: bool,
+    ) -> Result<Option<Arc<PiMutex<Ioapic>>>> {
         if split_irqchip {
             // Split IRQ chip: only LAPIC is emulated in kernel.
             // PIC and IOAPIC are not created — userspace handles them.
@@ -323,8 +374,12 @@ impl KtstrKvm {
         // IOAPIC there). `None` for <=254-vCPU guests. The run loops build an
         // IoapicHandle around this to translate guest RTE writes into MSI
         // routes; see `super::ioapic` and `IoapicHandle`.
-        let ioapic = split_irqchip.then(|| Arc::new(PiMutex::new(Ioapic::new())));
+        Ok(split_irqchip.then(|| Arc::new(PiMutex::new(Ioapic::new()))))
+    }
 
+    /// Tune per-VM KVM caps: disable PAUSE/HLT exits in performance mode,
+    /// else set the per-VM halt-poll interval (0 when vCPUs overcommit hosts).
+    fn tune_kvm_caps(vm_fd: &VmFd, performance_mode: bool, topo: &Topology) -> Result<()> {
         // Disable PAUSE and HLT VM exits in performance mode.
         // Two separate enable_cap calls: kvm_disable_exits() uses |=
         // (additive), so multiple calls accumulate. Separate calls
@@ -388,22 +443,20 @@ impl KtstrKvm {
                 );
             }
         }
+        Ok(())
+    }
 
-        let (guest_mem, numa_layout, reservation) = match memory_mib {
-            Some(mb) => {
-                let layout =
-                    NumaMemoryLayout::compute(&topo, mb, 0, Some((MMIO_GAP_START, MMIO_GAP_END)))?;
-                let alloc =
-                    layout.allocate_and_register(&vm_fd, use_hugepages, performance_mode)?;
-                (alloc.guest_mem, Some(layout), Some(alloc.reservation))
-            }
-            None => {
-                let placeholder = GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), 4096)])
-                    .context("allocate placeholder guest memory")?;
-                (placeholder, None, None)
-            }
-        };
-
+    /// Create the per-vCPU fds with topology-specific CPUID, after the
+    /// RAM-top / max-vcpus / max-vcpu-id host-capability checks, then probe
+    /// TSC stability via a KVM_GET_CLOCK roundtrip in performance mode.
+    fn create_vcpus(
+        kvm: &Kvm,
+        vm_fd: &VmFd,
+        topo: &Topology,
+        numa_layout: &Option<NumaMemoryLayout>,
+        max_apic_id: u32,
+        performance_mode: bool,
+    ) -> Result<Vec<VcpuFd>> {
         // Fetch host CPUID once, reuse for all vCPUs (Firecracker pattern).
         let base_cpuid = kvm
             .get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
@@ -492,8 +545,8 @@ impl KtstrKvm {
         // range can exceed the vCPU count; KVM_CREATE_VCPU requires the id be
         // < KVM_CAP_MAX_VCPU_ID. Skip cleanly if the host's cap is too low,
         // same class as the max_vcpus check above.
-        // `max_apic_id` is the u32 already bound above for the split-irqchip
-        // decision; reuse it.
+        // `max_apic_id` is passed in from `new_inner`, the same u32 it
+        // computed for the split-irqchip decision.
         let max_vcpu_id = kvm.get_max_vcpu_id();
         if (max_apic_id as usize) >= max_vcpu_id {
             return Err(anyhow::Error::new(
@@ -515,7 +568,7 @@ impl KtstrKvm {
             // so vcpu_id must equal it or sparse APIC IDs are unrouteable. The
             // vcpus Vec stays indexed by cpu_id (push order); only the KVM
             // vcpu_id changes (a no-op for dense topologies where apic==cpu_id).
-            let aid = apic_id(&topo, cpu_id);
+            let aid = apic_id(topo, cpu_id);
             let vcpu = vm_fd.create_vcpu(aid as u64).map_err(|e| {
                 crate::vmm::map_transient_to_contention(
                     e,
@@ -524,7 +577,7 @@ impl KtstrKvm {
             })?;
 
             let cpuid_entries =
-                generate_cpuid(base_cpuid.as_slice(), &topo, cpu_id, performance_mode);
+                generate_cpuid(base_cpuid.as_slice(), topo, cpu_id, performance_mode);
             let cpuid = kvm_bindings::CpuId::from_entries(&cpuid_entries).context("build CpuId")?;
             vcpu.set_cpuid2(&cpuid)
                 .with_context(|| format!("set CPUID for vCPU {cpu_id}"))?;
@@ -595,21 +648,7 @@ impl KtstrKvm {
             }
         }
 
-        Ok(KtstrKvm {
-            kvm: ManuallyDrop::new(kvm),
-            vm_fd: ManuallyDrop::new(vm_fd),
-            vcpus,
-            guest_mem: ManuallyDrop::new(guest_mem),
-            topology: topo,
-            numa_layout,
-            has_immediate_exit,
-            split_irqchip,
-            ioapic,
-            use_hugepages,
-            performance_mode,
-            _reservation: reservation,
-            cow_overlay_guards: Vec::new(),
-        })
+        Ok(vcpus)
     }
 }
 

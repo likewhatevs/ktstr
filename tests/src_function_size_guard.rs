@@ -218,7 +218,6 @@ const EXCEPTIONS: &[(&str, &str, usize)] = &[
         "VirtioNet::try_loopback_to_rx",
         376,
     ), // queued: decompose
-    ("vmm/x86_64/kvm.rs", "KtstrKvm::new_inner", 371),            // queued: decompose
     ("workload/spawn/mod.rs", "WorkloadHandle::spawn", 232),      // queued: decompose
     ("workload/spawn/mod.rs", "WorkloadHandle::spawn_group", 959), // queued: decompose
     (
