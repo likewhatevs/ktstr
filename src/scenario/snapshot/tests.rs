@@ -4215,6 +4215,102 @@ fn snapshot_active_walker_obj_name_set_but_empty_whitelist_multi_copy_errors() {
     );
 }
 
+/// Raw `var()` (no explicit `.active()`) auto-falls-back to the
+/// active-scheduler resolution when the raw scan is ambiguous.
+/// Two same-name `bpf_bpf.bss` copies expose `counter`; the walker
+/// published `active_obj_name` + a single-entry `active_map_kvas`
+/// whitelist. `var("counter")` finds 2 raw hits, takes the
+/// `active_obj.is_none() && active().is_ok()` fallback arm
+/// (view.rs:319-323), and the KVA filter narrows to the live copy.
+/// The only existing ambiguity test uses two DISTINCT obj prefixes
+/// so active() fails and execution falls to the AmbiguousVar arm;
+/// the walker-resolved fallback-SUCCESS path is exercised only here.
+#[test]
+fn snapshot_var_autofallback_to_active_resolves_ambiguity() {
+    let mut live_bss = make_global_map("bpf_bpf.bss", vec![("counter", uint_v(99))]);
+    live_bss.map_kva = 0x1000;
+    let mut stale_bss = make_global_map("bpf_bpf.bss", vec![("counter", uint_v(7))]);
+    stale_bss.map_kva = 0x2000;
+    let mut report = make_report_with_maps(vec![live_bss, stale_bss]);
+    report.active_obj_name = Some("bpf_bpf".to_string());
+    report.active_map_kvas = vec![0x1000];
+    let snap = Snapshot::new(&report);
+    // NOT snap.active().var() — raw var() must auto-narrow internally.
+    assert_eq!(
+        snap.var("counter").as_u64().unwrap(),
+        99,
+        "raw var() auto-narrows the two same-name bpf_bpf.bss copies \
+         (kva 0x1000=99 live, 0x2000=7 stale) down to the whitelisted live copy"
+    );
+}
+
+/// `active()` walker fast-path with `active_obj_name = Some` AND an
+/// EMPTY `active_map_kvas` whitelist AND a single global-section
+/// copy returns `Ok` with an empty KVA filter (view.rs:544-548).
+/// Every other `active_obj_name = Some` test carries a non-empty
+/// whitelist (the 528-534 arm); the two empty-whitelist walker
+/// tests are both multi-copy and hit the error arm (540-543). The
+/// single-copy + empty-whitelist Ok arm is reached only here.
+#[test]
+fn snapshot_active_walker_obj_name_single_copy_empty_whitelist_resolves() {
+    let mut report =
+        make_report_with_maps(vec![make_global_map("bpf_bpf.bss", vec![("counter", uint_v(55))])]);
+    report.active_obj_name = Some("bpf_bpf".to_string());
+    // active_map_kvas left empty (make_report_with_maps default).
+    let snap = Snapshot::new(&report);
+    let active = snap
+        .active()
+        .expect("active_obj_name + single copy + empty whitelist => Ok");
+    assert_eq!(active.var("counter").as_u64().unwrap(), 55);
+    assert_eq!(active.map_count(), 1);
+}
+
+/// `map_count()` reflects the active filter: an unfiltered view
+/// counts every captured map; an `active()`-filtered view counts
+/// only the active obj's maps. Three maps across two obj prefixes
+/// (alpha.bss, alpha.data, beta.bss); `active_obj_name = Some("alpha")`
+/// narrows to the two alpha.* maps and excludes beta.bss.
+#[test]
+fn snapshot_map_count_reflects_active_filter_vs_unfiltered() {
+    let mut report = make_report_with_maps(vec![
+        make_global_map("alpha.bss", vec![("counter", uint_v(1))]),
+        make_global_map("alpha.data", vec![("flag", uint_v(1))]),
+        make_global_map("beta.bss", vec![("other", uint_v(1))]),
+    ]);
+    report.active_obj_name = Some("alpha".to_string());
+    let snap = Snapshot::new(&report);
+    assert_eq!(snap.map_count(), 3, "unfiltered view counts every captured map");
+    let active = snap.active().expect("active_obj_name names a captured prefix");
+    assert_eq!(
+        active.map_count(),
+        2,
+        "active() narrows to alpha.bss + alpha.data, excludes the unrelated beta.bss"
+    );
+}
+
+/// MIXED render-failure case: a successfully-rendered global map
+/// that does NOT carry the requested name PLUS a separate errored
+/// global map. `var()` finds zero hits, then surfaces
+/// `MapRenderIncomplete` (view.rs:339-346) rather than VarNotFound
+/// — with a real map rendered, the search cannot confirm absence,
+/// so the render gap must still win. The existing render-failure
+/// test has ONLY the errored map present.
+#[test]
+fn snapshot_var_render_failure_shadows_absence_when_other_maps_render() {
+    let report = make_report_with_maps(vec![
+        make_global_map("scx_test.bss", vec![("present", uint_v(1))]),
+        make_errored_map("scx_test.rodata", "value region unreadable"),
+    ]);
+    let snap = Snapshot::new(&report);
+    match snap.var("absent_name") {
+        SnapshotField::Missing(SnapshotError::MapRenderIncomplete { map, error }) => {
+            assert_eq!(map, "scx_test.rodata");
+            assert_eq!(error, "value region unreadable");
+        }
+        other => panic!("expected MapRenderIncomplete (render gap shadows absence), got {other:?}"),
+    }
+}
+
 #[test]
 fn snapshot_var_on_placeholder_returns_placeholder_error() {
     let report = FailureDumpReport::placeholder("freeze_timed_out");

@@ -710,6 +710,45 @@ mod tests_coercion {
         ));
     }
 
+    /// REGRESSION: `peel_pointer`'s runaway-depth guard
+    /// (`if steps > 16 { break }`) stops chasing a pointer chain
+    /// deeper than the cap. A chain of 18 nested `Ptr{deref: Some}`
+    /// layers wrapping a final struct never reaches the struct: the
+    /// loop peels 17 layers then breaks with the cursor still a
+    /// `Ptr`, so the dotted-path walk lands on the Ptr (NotAStruct)
+    /// rather than the deeply-nested member. This is the load-bearing
+    /// defense against a malformed / cyclic rendered tree spinning
+    /// forever during host-side traversal of an attacker-influenced
+    /// BTF render. Without the cap, the walk would peel all 18 and
+    /// resolve `x`.
+    #[test]
+    fn peel_pointer_breaks_at_sixteen_step_cap_on_pointer_cycle() {
+        // Innermost: a struct carrying the target member.
+        let mut deep = RenderedValue::Struct {
+            type_name: Some("scx_bss".to_string()),
+            members: vec![RenderedMember {
+                name: "x".to_string(),
+                value: RenderedValue::Uint { bits: 8, value: 1 },
+            }],
+        };
+        // Wrap 18 times in Ptr{deref: Some(prev)} — past the 16-step cap.
+        for _ in 0..18 {
+            deep = RenderedValue::Ptr {
+                value: 0xff,
+                deref: Some(Box::new(deep)),
+                deref_skipped_reason: None,
+                cast_annotation: None,
+            };
+        }
+        let f = SnapshotField::Value(&deep).get("x");
+        // Peeling stopped at the cap with the cursor still a Ptr, so
+        // the struct member is unreachable: NotAStruct, not Value.
+        assert!(
+            matches!(f, SnapshotField::Missing(SnapshotError::NotAStruct { .. })),
+            "16-step cap must leave the cursor on a Ptr (NotAStruct), got {f:?}"
+        );
+    }
+
     /// `get` on a percpu-key field surfaces a TypeMismatch naming the
     /// percpu-key shape (no struct to walk into); `is_present`/`raw`/
     /// `error` reflect each variant.

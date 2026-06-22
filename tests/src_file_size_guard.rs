@@ -99,7 +99,7 @@ const EXCEPTIONS: &[(&str, usize)] = &[
     ("test_support/probe.rs", 5102),
     // queued: split the inline #[cfg(test)] mod into test_support/dispatch/tests.rs.
     ("test_support/dispatch.rs", 4996),
-    ("scenario/snapshot/tests.rs", 4974),
+    ("scenario/snapshot/tests.rs", 5070),
     ("monitor/btf_render/mod.rs", 5508),
     ("monitor/bpf_map/tests.rs", 4169),
     ("monitor/cast_analysis/mod.rs", 4154),

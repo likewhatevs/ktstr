@@ -706,6 +706,7 @@ mod bss_jumps_funcentry;
 mod btf_stack_kfunc_edge;
 mod cast_tracking;
 mod conflict_oob_finalize;
+mod frameaddr_kfunc_stx_edge;
 mod helper_map_crossfn;
 mod kptr_addrspace;
 mod register_alu_cast_misc;

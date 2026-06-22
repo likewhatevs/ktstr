@@ -945,4 +945,149 @@ mod tests {
             "error must end with KTSTR_KERNEL_HINT. got: {err}",
         );
     }
+
+    // ---------------------------------------------------------------
+    // resolve_one — defensive Range arm (internal caller contract)
+    // ---------------------------------------------------------------
+    //
+    // `resolve_one` is only ever called by `resolve_kernel_set` after
+    // it fans every Range out to per-version `Version` ids, so the
+    // Range arm is the sole arm reachable WITHOUT real I/O — it is a
+    // programming-error guard, not a user-facing path. Every other
+    // arm (Path / Version / CacheKey / Git) drives canonicalize +
+    // build / cache lookup / clone and is flagged not-host-testable.
+
+    /// The Range arm must surface the exact internal-error string —
+    /// `internal:` discriminator plus the `expand_kernel_range`
+    /// remediation pointer — so a developer who wires a Range into
+    /// `resolve_one` directly is pointed at the wrong call site. Pins
+    /// the full interpolated message (start/end splice into the
+    /// `{start}..{end}` placeholders) by exact equality, not substring.
+    #[test]
+    fn resolve_one_range_arm_returns_internal_caller_contract_error() {
+        use ktstr::kernel_path::KernelId;
+        let err = resolve_one(KernelId::Range {
+            start: "6.10".to_string(),
+            end: "6.12".to_string(),
+            syntax_inclusive: false,
+        })
+        .expect_err("Range arm must be Err — it is the defensive internal-error path");
+        assert_eq!(
+            err,
+            "internal: resolve_one called with Range 6.10..6.12; \
+             caller must expand Range via `expand_kernel_range` and \
+             call `resolve_one` per version",
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // canonicalize_cache_dir — both arms of the single `unwrap_or`
+    // ---------------------------------------------------------------
+    //
+    // `canonicalize_cache_dir` defends against a relative
+    // `KTSTR_CACHE_DIR=./cache` reaching the child with a
+    // cwd-divergent path: `canonicalize` resolves a real entry to an
+    // absolute, symlink-resolved path; a failure (the documented
+    // remove-between-lookup-and-export race) falls back to the input
+    // path verbatim rather than bailing. Both arms are pure std::fs,
+    // host-isolable, and currently untested.
+
+    /// Existing directory: the Ok arm returns the std-canonicalized
+    /// (absolute, symlink-resolved) form, NOT the input verbatim. To
+    /// genuinely distinguish the Ok arm from the `unwrap_or` fallback,
+    /// the input is a SYMLINK to a real dir — so the resolved form
+    /// (the real dir) differs from the input (the symlink path). A
+    /// plain already-canonical tempdir cannot exercise this divergence
+    /// on a host whose tempdir has no symlink component, so the
+    /// fallback (returning the input verbatim) would pass undetected.
+    #[test]
+    fn canonicalize_cache_dir_existing_dir_returns_absolute_canonical_path() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let real = tmp.path().join("real_cache");
+        std::fs::create_dir(&real).expect("create real dir");
+        let link = tmp.path().join("link_cache");
+        std::os::unix::fs::symlink(&real, &link).expect("create symlink");
+        let resolved = std::fs::canonicalize(&real).expect("canonicalize real dir");
+
+        let got = canonicalize_cache_dir(link.clone());
+        assert_eq!(
+            got, resolved,
+            "Ok arm must return the symlink-resolved real dir, not the input",
+        );
+        assert_ne!(
+            got, link,
+            "must NOT fall through to the unwrap_or fallback (input verbatim)",
+        );
+        assert!(got.is_absolute(), "canonicalized path must be absolute");
+    }
+
+    /// Nonexistent directory: `canonicalize` fails and the
+    /// `unwrap_or` fallback returns the original `PathBuf` unchanged.
+    /// Exact-equality: the output is byte-identical to the input
+    /// (proves the documented fall-back-rather-than-bail behaviour,
+    /// not a panic and not a transformed path).
+    #[test]
+    fn canonicalize_cache_dir_nonexistent_falls_back_to_input_path() {
+        let missing =
+            std::path::PathBuf::from("/this/cache/dir/does/not/exist/ktstr-canonicalize-test");
+        assert_eq!(canonicalize_cache_dir(missing.clone()), missing);
+    }
+
+    // ---------------------------------------------------------------
+    // resolve_kernel_set — preflight gate fires before any I/O
+    // ---------------------------------------------------------------
+    //
+    // `resolve_kernel_set` runs `preflight_collision_check(specs)?` as
+    // its first statement — before the bounded rayon ThreadPool is
+    // built and before any `resolve_one` I/O. `preflight_collision_check`
+    // is unit-tested directly in `wire_format.rs`; these two tests pin
+    // the INTEGRATION — that `resolve_kernel_set` wires it as the first
+    // gate, so a colliding pair or an inverted range errors locally
+    // with zero download / build / clone contact.
+
+    /// Two specs whose sanitized labels collide (`6.14.2` → Version
+    /// label, `6-14-2` → CacheKey label, both sanitize to
+    /// `kernel_6_14_2`) must abort at the preflight gate. The
+    /// preflight-distinctive prefix and the shared sanitized id pin
+    /// the gate: a regression that ran preflight AFTER resolve would
+    /// download / build before erroring (and could surface the
+    /// post-resolve `detect_label_collisions` wording, which has no
+    /// `pre-flight` prefix), failing the first assertion.
+    #[test]
+    fn resolve_kernel_set_colliding_specs_fail_at_preflight_before_io() {
+        let specs = vec!["6.14.2".to_string(), "6-14-2".to_string()];
+        let err = resolve_kernel_set(&specs)
+            .expect_err("colliding sanitized labels must abort at preflight");
+        assert!(
+            err.contains("pre-flight check found collision"),
+            "must be the preflight diagnostic, not the post-resolve one. got: {err}",
+        );
+        assert!(
+            err.contains("kernel_6_14_2"),
+            "must name the shared sanitized id. got: {err}",
+        );
+    }
+
+    /// An inverted Range (`6.15..6.14`) fails `KernelId::validate`
+    /// inside the preflight gate, before `expand_kernel_range` would
+    /// fire its `releases.json` fetch. Pins that `resolve_kernel_set`
+    /// rejects the inversion with zero network contact: a regression
+    /// that moved validation after `expand_kernel_range` would attempt
+    /// a fetch instead of erroring locally. Asserts the `--kernel`
+    /// framing (`--kernel {id}: {e}` from the preflight gate) and the
+    /// inverted-range diagnostic.
+    #[test]
+    fn resolve_kernel_set_inverted_range_fails_validation_before_io() {
+        let specs = vec!["6.15..6.14".to_string()];
+        let err = resolve_kernel_set(&specs)
+            .expect_err("inverted range must fail validation pre-resolve");
+        assert!(
+            err.contains("--kernel"),
+            "must carry `--kernel` framing. got: {err}",
+        );
+        assert!(
+            err.contains("inverted kernel range"),
+            "must surface the inversion diagnostic. got: {err}",
+        );
+    }
 }

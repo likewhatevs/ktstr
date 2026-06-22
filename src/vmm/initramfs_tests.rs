@@ -1930,3 +1930,256 @@ fn lz4_legacy_reference_cross_compat() {
     let our_result = std::fs::read(our_decompressed_path).unwrap();
     assert_eq!(our_result, data, "our lz4 output cross-compat mismatch");
 }
+
+/// [`write_symlink_entry`] must emit a cpio entry with the symlink mode
+/// `0o120777` (`S_IFLNK | 0777`) and store the link target verbatim as
+/// the entry's data payload — the on-wire shape the kernel's cpio
+/// extractor reads to materialize a symlink. No existing test packs a
+/// symlink entry, so the whole function is otherwise uncovered.
+#[test]
+fn write_symlink_entry_emits_symlink_mode_and_target() {
+    let mut archive = Vec::new();
+    write_symlink_entry(&mut archive, "usr/lib64/libc.so.6", "/lib64/libc.so.6").unwrap();
+    let entries = cpio_entries(&archive);
+    let entry = entries
+        .iter()
+        .find(|(name, ..)| name == "usr/lib64/libc.so.6")
+        .expect("symlink entry missing");
+    // 0o120777 = S_IFLNK | 0777 — the cpio newc mode for a symlink.
+    assert_eq!(entry.2, 0o120777, "symlink entry must carry S_IFLNK|0777");
+    // The link target is stored verbatim as the entry's data bytes.
+    assert_eq!(
+        cpio_entry_data(&archive, "usr/lib64/libc.so.6").unwrap(),
+        b"/lib64/libc.so.6".to_vec(),
+        "symlink target must be the entry's data payload verbatim",
+    );
+}
+
+/// [`register_parent_dirs`] walks `guest_path`'s parent into every
+/// intermediate directory component and inserts each — but NOT the file
+/// itself. A top-level file (no parent components) registers nothing.
+/// The function is otherwise only exercised transitively through
+/// [`build_initramfs_base`]; this pins its exact produced set.
+#[test]
+fn register_parent_dirs_walks_all_ancestors() {
+    let mut dirs = BTreeSet::new();
+    register_parent_dirs(&mut dirs, "a/b/c/f");
+    assert_eq!(
+        dirs,
+        BTreeSet::from([
+            "a".to_string(),
+            "a/b".to_string(),
+            "a/b/c".to_string(),
+        ]),
+        "every intermediate dir registered, the file itself excluded",
+    );
+
+    // Top-level file: Path::new("init").parent() is Some("") whose
+    // components() iterator is empty → the walk loop never inserts.
+    let mut top = BTreeSet::new();
+    register_parent_dirs(&mut top, "init");
+    assert!(
+        top.is_empty(),
+        "a top-level file registers no parent dirs: {top:?}",
+    );
+
+    // Empty path: Path::new("").parent() is None → the `let Some(parent)
+    // = ... else { return }` early-return arm fires; nothing inserted.
+    let mut empty = BTreeSet::new();
+    register_parent_dirs(&mut empty, "");
+    assert!(
+        empty.is_empty(),
+        "an empty guest_path hits the no-parent early return: {empty:?}",
+    );
+}
+
+/// [`read_cstr`] returns the UTF-8 string up to the first NUL, or `None`
+/// for both failure arms: (a) no NUL terminator in `data[offset..]`, and
+/// (b) bytes that are valid-terminated but not UTF-8. The
+/// [`parse_ld_so_cache`] tests never reach a populated string table, so
+/// these error paths are otherwise uncovered.
+#[test]
+fn read_cstr_rejects_invalid_utf8_and_missing_terminator() {
+    // Success: stop at the NUL, ignore trailing bytes.
+    assert_eq!(read_cstr(b"libc.so.6\0extra", 0), Some("libc.so.6"));
+    // Missing terminator: position(NUL) is None → ?.
+    assert_eq!(read_cstr(b"no-nul-here", 0), None);
+    // Invalid UTF-8 before the NUL: from_utf8(...).ok() is None.
+    assert_eq!(read_cstr(&[0xFF, 0xFE, 0x00], 0), None);
+}
+
+/// Build a valid glibc new-format `ld.so.cache` blob and drive it
+/// through [`parse_ld_so_cache`]. Exercises the per-entry loop body that
+/// existing tests skip (they hit only nonexistent/bad-magic/truncated
+/// early returns): a successful soname→PathBuf insert gated on
+/// `path_str.starts_with('/') && p.is_file()`, the OOB
+/// `val_off >= data.len()` `continue`, and the `or_insert` first-wins
+/// dedup when two entries share a soname.
+#[test]
+fn parse_ld_so_cache_parses_valid_entries_and_skips_oob_and_nonabsolute() {
+    let tmp_dir = tempfile::TempDir::new().unwrap();
+    // Two real regular files so the `p.is_file()` gate passes for BOTH
+    // libfoo entries — that makes `or_insert` (not the is_file filter)
+    // the sole reason the second mapping is dropped.
+    let lib_path = tmp_dir.path().join("libfoo.so");
+    std::fs::write(&lib_path, b"\x7fELF-stub").unwrap();
+    let lib_abs = lib_path.to_str().unwrap();
+    let lib2_path = tmp_dir.path().join("libfoo-second.so");
+    std::fs::write(&lib2_path, b"\x7fELF-stub2").unwrap();
+    let lib2_abs = lib2_path.to_str().unwrap();
+
+    // 3 entries:
+    //   A: soname "libfoo.so" -> lib_abs   (existing file, accepted)
+    //   B: soname "libfoo.so" -> lib2_abs  (also existing → or_insert
+    //                                        keeps A, not is_file filter)
+    //   C: soname "liboob.so", val_off == data.len()  (OOB continue)
+    let nlibs: usize = 3;
+    let header_end = LD_CACHE_HEADER_SIZE + nlibs * LD_CACHE_ENTRY_SIZE;
+
+    // Lay out the string table after the entry array; record absolute
+    // offsets (from file start) for each key/value.
+    let mut strtab: Vec<u8> = Vec::new();
+    let push_str = |s: &str, strtab: &mut Vec<u8>| -> u32 {
+        let off = (header_end + strtab.len()) as u32;
+        strtab.extend_from_slice(s.as_bytes());
+        strtab.push(0);
+        off
+    };
+    let a_key = push_str("libfoo.so", &mut strtab);
+    let a_val = push_str(lib_abs, &mut strtab);
+    let b_key = push_str("libfoo.so", &mut strtab);
+    let b_val = push_str(lib2_abs, &mut strtab);
+    let c_key = push_str("liboob.so", &mut strtab);
+
+    let mut data = Vec::new();
+    // Header: magic[20] + nlibs[4] + len_strings[4] + flags[4] + unused[16].
+    data.extend_from_slice(LD_CACHE_MAGIC);
+    data.extend_from_slice(&(nlibs as u32).to_le_bytes());
+    data.extend_from_slice(&(strtab.len() as u32).to_le_bytes());
+    data.extend_from_slice(&0u32.to_le_bytes()); // flags
+    data.extend_from_slice(&[0u8; 16]); // unused
+    assert_eq!(data.len(), LD_CACHE_HEADER_SIZE);
+
+    // Entry layout: flags[4] + key[4] + value[4] + osversion[4] + hwcap[8].
+    let total_len = header_end + strtab.len();
+    let push_entry = |key_off: u32, val_off: u32, data: &mut Vec<u8>| {
+        data.extend_from_slice(&0u32.to_le_bytes()); // flags
+        data.extend_from_slice(&key_off.to_le_bytes());
+        data.extend_from_slice(&val_off.to_le_bytes());
+        data.extend_from_slice(&0u32.to_le_bytes()); // osversion
+        data.extend_from_slice(&0u64.to_le_bytes()); // hwcap
+    };
+    push_entry(a_key, a_val, &mut data);
+    push_entry(b_key, b_val, &mut data);
+    // C's val_off points exactly at data.len() → OOB `continue`.
+    push_entry(c_key, total_len as u32, &mut data);
+    assert_eq!(data.len(), header_end);
+    data.extend_from_slice(&strtab);
+    assert_eq!(data.len(), total_len);
+
+    let cache_path = tmp_dir.path().join("ld.so.cache");
+    std::fs::write(&cache_path, &data).unwrap();
+    let map = parse_ld_so_cache(&cache_path);
+
+    // Both libfoo entries pass is_file(); or_insert keeps the FIRST.
+    assert_eq!(
+        map.get("libfoo.so"),
+        Some(&PathBuf::from(lib_abs)),
+        "or_insert first-wins: the second existing mapping is ignored",
+    );
+    // C is skipped by the OOB guard — never inserted.
+    assert!(
+        !map.contains_key("liboob.so"),
+        "out-of-bounds val_off entry must be skipped, not panic",
+    );
+}
+
+/// A header claiming more entries than the file holds (hostile/corrupt
+/// cache) must yield an empty map without panicking on the entry-offset
+/// slices. The `nlibs * ENTRY` min-size guard (distinct from the
+/// truncated-header check that stops at HEADER_SIZE) is otherwise
+/// uncovered.
+#[test]
+fn parse_ld_so_cache_rejects_nlibs_overflow() {
+    let tmp_dir = tempfile::TempDir::new().unwrap();
+    let cache_path = tmp_dir.path().join("ld.so.cache");
+    // Valid magic + full 48-byte header with an inflated nlibs and no
+    // entry/string bytes following.
+    let mut data = Vec::new();
+    data.extend_from_slice(LD_CACHE_MAGIC);
+    data.extend_from_slice(&1000u32.to_le_bytes()); // nlibs at offset 20
+    data.extend_from_slice(&0u32.to_le_bytes()); // len_strings
+    data.extend_from_slice(&0u32.to_le_bytes()); // flags
+    data.extend_from_slice(&[0u8; 16]); // unused
+    assert_eq!(data.len(), LD_CACHE_HEADER_SIZE);
+    std::fs::write(&cache_path, &data).unwrap();
+    assert!(
+        parse_ld_so_cache(&cache_path).is_empty(),
+        "an nlibs count larger than the file holds must return an empty map",
+    );
+}
+
+/// [`is_standard_interpreter`] direct-match fast path (a literal known
+/// linker, no syscall) and the canonicalize-failure `false` arm (a
+/// nonexistent custom path). Otherwise only exercised indirectly via the
+/// standard-vs-custom interpreter dispatch.
+#[test]
+fn is_standard_interpreter_matches_known_and_rejects_custom() {
+    // Direct STANDARD_INTERPRETERS membership — no FS access required.
+    assert!(
+        is_standard_interpreter("/lib64/ld-linux-x86-64.so.2"),
+        "a literal known linker matches the fast path",
+    );
+    // canonicalize() of a nonexistent path fails → false.
+    assert!(
+        !is_standard_interpreter("/opt/custom-toolchain/ld-fake.so"),
+        "a nonexistent custom interpreter path is not standard",
+    );
+}
+
+/// The `Some`-arms for `workload_root_cgroup` and
+/// `scheduler_cgroup_parent` in [`build_suffix`] emit a cpio file
+/// carrying the path verbatim with mode `0o100644` (a plain data file
+/// the guest reads, not execs). No existing test sets these fields, so
+/// both Some-arms are uncovered (the None path is covered by
+/// `suffix_omits_empty_optional_entries`).
+#[test]
+fn suffix_emits_workload_root_cgroup_and_scheduler_cgroup_parent() {
+    let exe = crate::resolve_current_exe().unwrap();
+    let base = build_initramfs_base(&exe, &[], &[], None).unwrap();
+    let suffix = build_suffix(
+        base.len(),
+        &SuffixParams {
+            workload_root_cgroup: Some("/ktstr/workload"),
+            scheduler_cgroup_parent: Some("/ktstr/sched"),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let mut archive = Vec::with_capacity(base.len() + suffix.len());
+    archive.extend_from_slice(&base);
+    archive.extend_from_slice(&suffix);
+    let entries = cpio_entries(&archive);
+
+    for (name, expected) in [
+        ("workload_root_cgroup", "/ktstr/workload"),
+        ("scheduler_cgroup_parent", "/ktstr/sched"),
+    ] {
+        let entry = entries
+            .iter()
+            .find(|(n, ..)| n == name)
+            .unwrap_or_else(|| panic!("{name} entry missing"));
+        assert_eq!(
+            entry.1 as usize,
+            expected.len(),
+            "{name} size must match the verbatim path length",
+        );
+        // 0o100644 = S_IFREG | 0o644 — a plain data file (read, not exec'd).
+        assert_eq!(entry.2, 0o100644, "{name} must be a plain data file");
+        assert_eq!(
+            cpio_entry_data(&archive, name).unwrap(),
+            expected.as_bytes().to_vec(),
+            "{name} payload must be the path written verbatim (no transform)",
+        );
+    }
+}
