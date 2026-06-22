@@ -539,6 +539,13 @@ pub(crate) fn compare_rows_by(
         .iter()
         .map(|m| policy.rel_threshold(m.name, m.default_rel))
         .collect();
+    // Same hoist for the render-suppression predicate: it is a pure
+    // function of the metric (a small fixed-slice membership scan), so
+    // probing it per (row_b x metric) re-ran the scan for nothing.
+    let suppressed: Vec<bool> = METRICS
+        .iter()
+        .map(|m| is_render_suppressed_component(m.name))
+        .collect();
 
     for row_b in rows_b {
         // Dynamic pairing key: scenario + every NON-slicing
@@ -584,7 +591,7 @@ pub(crate) fn compare_rows_by(
         for (i, m) in METRICS.iter().enumerate() {
             // Rate components are internal plumbing — suppressed from compare
             // output (they remain in storage for the cross-run re-pool).
-            if is_render_suppressed_component(m.name) {
+            if suppressed[i] {
                 continue;
             }
             let val_a = m.read(row_a).unwrap_or(0.0);
