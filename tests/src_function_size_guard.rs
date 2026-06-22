@@ -148,7 +148,6 @@ const EXCEPTIONS: &[(&str, &str, usize)] = &[
     ("monitor/dump/mod.rs", "dump_state", 1166),                  // queued: decompose
     ("monitor/dump/render_map.rs", "render_map", 583),            // queued: decompose
     ("monitor/reader.rs", "monitor_loop", 808),                   // queued: decompose
-    ("probe/btf.rs", "parse_bpf_btf_functions", 205),             // queued: decompose
     ("probe/process.rs", "attach_phase_b_fentry", 494),           // queued: decompose
     ("probe/process.rs", "run_probe_skeleton", 1295),             // queued: decompose
     (

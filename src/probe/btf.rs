@@ -913,6 +913,28 @@ pub fn resolve_bpf_source_locs(prog_ids: &[u32]) -> std::collections::HashMap<St
     locs
 }
 
+/// Resolve the struct/union name behind a BTF type id, peeling a
+/// single pointer level and skipping mods/typedefs. Returns `None`
+/// for non-struct/union types.
+fn resolve_btf_struct_name(
+    b: &libbpf_rs::btf::Btf<'_>,
+    type_id: libbpf_rs::btf::TypeId,
+) -> Option<String> {
+    use libbpf_rs::btf;
+    let t = b.type_by_id::<btf::BtfType<'_>>(type_id)?;
+    let inner = t.skip_mods_and_typedefs();
+    let deref = if inner.kind() == btf::BtfKind::Ptr {
+        inner.next_type()?.skip_mods_and_typedefs()
+    } else {
+        inner
+    };
+    if deref.kind() == btf::BtfKind::Struct || deref.kind() == btf::BtfKind::Union {
+        Some(deref.name()?.to_str()?.to_string())
+    } else {
+        None
+    }
+}
+
 /// Parse BTF from loaded BPF programs for callback signatures.
 ///
 /// For each `(display_name, prog_id)`, resolves the typed params by:
@@ -938,21 +960,6 @@ pub fn parse_bpf_btf_functions(
         Err(e) => {
             tracing::warn!(%e, "parse_bpf_btf: failed to load vmlinux BTF");
             return Vec::new();
-        }
-    };
-
-    let resolve_struct_name = |b: &btf::Btf<'_>, type_id: btf::TypeId| -> Option<String> {
-        let t = b.type_by_id::<btf::BtfType<'_>>(type_id)?;
-        let inner = t.skip_mods_and_typedefs();
-        let deref = if inner.kind() == btf::BtfKind::Ptr {
-            inner.next_type()?.skip_mods_and_typedefs()
-        } else {
-            inner
-        };
-        if deref.kind() == btf::BtfKind::Struct || deref.kind() == btf::BtfKind::Union {
-            Some(deref.name()?.to_str()?.to_string())
-        } else {
-            None
         }
     };
 
@@ -1054,7 +1061,7 @@ pub fn parse_bpf_btf_functions(
                 // Infer param name from type when vmlinux FuncProto
                 // has empty names (function pointer BTF often lacks them).
                 if name.is_empty() {
-                    let sname = resolve_struct_name(btf_for_params, param.ty);
+                    let sname = resolve_btf_struct_name(btf_for_params, param.ty);
                     name = match sname.as_deref() {
                         Some("task_struct") => "p".into(),
                         Some("rq") => "rq".into(),
@@ -1068,7 +1075,7 @@ pub fn parse_bpf_btf_functions(
                         }
                     };
                 }
-                let all_struct_name = resolve_struct_name(btf_for_params, param.ty);
+                let all_struct_name = resolve_btf_struct_name(btf_for_params, param.ty);
                 let known_struct = all_struct_name
                     .as_ref()
                     .filter(|n| STRUCT_FIELDS.iter().any(|(s, _)| *s == n.as_str()))
