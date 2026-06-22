@@ -300,7 +300,6 @@ const EXCEPTIONS: &[(&str, &str, usize)] = &[
     ("bin/cargo-ktstr.rs", "main", 239),                  // queued: decompose
     ("stats/compare.rs", "compare_partitions", 418),      // queued: decompose
     ("stats/compare.rs", "compare_rows_by", 271),         // queued: decompose
-    ("stats/group.rs", "group_and_average_by", 383),      // queued: decompose
     ("test_support/dispatch.rs", "result_to_exit_code", 247), // queued: decompose
     (
         "vmm/freeze_coord/kernel_op_dispatch.rs",

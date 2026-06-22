@@ -436,6 +436,418 @@ fn render_mixed_dirty(
     first_commit.clone()
 }
 
+/// Per-pairing-group fold accumulator for [`group_and_average_by`].
+/// Built via [`Accumulator::new`] from the group's first contributor,
+/// fed one contributor at a time via [`Accumulator::observe`], and
+/// folded into the emitted [`AveragedGroup`] via
+/// [`Accumulator::into_averaged_group`]. Split out of
+/// `group_and_average_by` only to satisfy the source-function size
+/// guard — the field set and fold math are unchanged from the
+/// in-function definition.
+struct Accumulator<'a> {
+    first: &'a GauntletRow,
+    total_observed: u32,
+    passes_observed: u32,
+    skips_observed: u32,
+    inconclusives_observed: u32,
+    failures_observed: u32,
+    any_skipped: bool,
+    any_failed: bool,
+    any_inconclusive: bool,
+    // Tracks whether contributors disagree on the `-dirty`
+    // suffix for the project_commit / kernel_commit dimensions.
+    // `any_*_clean` is true if any contributor's value is the
+    // un-suffixed form; `any_*_dirty` is true if any contributor
+    // ends in `-dirty`. When BOTH are true the aggregate is
+    // mixed-dirty and the rendered `commit` / `kernel_commit`
+    // gets a `+mixed` marker so downstream readers don't see a
+    // single arbitrary contributor's status. Tracked across
+    // EVERY contributor (passing, failing, skipped) — a mixed
+    // working-tree state is metadata about the cohort, not
+    // about the metric mean. Empty / `None` values are ignored
+    // and do not flip either flag.
+    any_project_clean: bool,
+    any_project_dirty: bool,
+    any_kernel_clean: bool,
+    any_kernel_dirty: bool,
+    // First-seen un-suffixed (clean-form) project / kernel
+    // commit string. Held separately from `first` because
+    // `first.commit` may be `Some("abc1234-dirty")` when the
+    // first contributor was dirty but later contributors carry
+    // the clean form — the rendered `+mixed` marker should
+    // still attach to the canonical un-suffixed hex so the
+    // operator sees `abc1234+mixed` not `abc1234-dirty+mixed`.
+    first_project_base: Option<String>,
+    first_kernel_base: Option<String>,
+    // Sums across passing+non-skipped contributors only.
+    // Counts are tracked per ext_metric key separately because
+    // a key may be absent from some contributors.
+    // Per-row sum for mean-fold fields (Counter / Gauge(Last) /
+    // Gauge(Avg) — though no typed Gauge(Avg) field exists
+    // today). Arithmetic mean across runs is the operator-
+    // facing cohort-comparison default; per-RUN totals are
+    // averaged to produce a comparable per-run quantity
+    // across cohorts of different run counts.
+    sum_spread: f64,
+    sum_migrations: u64,
+    sum_migration_ratio: f64,
+    sum_stuck_count: f64,
+    sum_fallback_count: i64,
+    sum_keep_last_count: i64,
+    sum_total_iterations: u64,
+    sum_page_locality: f64,
+    sum_cross_node_mig: f64,
+    // Per-row MAX-fold for Peak-kind fields. Per
+    // `MetricKind::Peak` contract, cross-RUN aggregation
+    // surfaces the worst-instant observed across the cohort —
+    // averaging Peak across runs dilutes the high-water signal
+    // (a 1-run spike at 100 averaged with 4 runs at 0 reports
+    // 20, hiding the actual peak). MAX preserves "did this
+    // peak ever fire in this cohort".
+    max_gap_ms: u64,
+    max_imbalance_ratio: f64,
+    max_max_dsq_depth: u32,
+    // Per-ext-metric (value, weight) pairs, accumulated across
+    // contributors. At emit time the kind-aware fold dispatches
+    // each key through `aggregate_samples` with `Some(&weights)`
+    // so Gauge(Avg) metrics get a weighted mean (per the F-C
+    // fix on aggregate_samples) and other kinds fold by their
+    // own semantics. Unregistered metric names (no MetricDef)
+    // fall back to arithmetic mean — same legacy semantic the
+    // previous (sum, u32) shape produced.
+    ext_pairs: BTreeMap<String, Vec<(f64, usize)>>,
+    // Sum of `run_sample_count` across contributors. Carries
+    // through to the aggregated row's `run_sample_count` so a
+    // downstream cross-RUN consumer that further folds these
+    // already-aggregated rows can apply the same weighted
+    // semantic. Currently no typed Gauge(Avg) field exists
+    // (imbalance_ratio is registered as `max_imbalance_ratio`
+    // kind=Peak, NOT Gauge(Avg) — the Gauge(Avg) sibling
+    // `avg_imbalance_ratio` lands in ext_metrics where the
+    // weighted-mean dispatch already fires); the sum is
+    // preserved here for future typed-field Gauge(Avg)
+    // additions and for downstream cohort-of-cohort
+    // aggregation that wants a meaningful weight.
+    sum_run_sample_count: usize,
+}
+
+impl<'a> Accumulator<'a> {
+    /// Seed an accumulator from the group's first contributor.
+    /// Identity is taken from `first`; every counter / sum / max
+    /// starts at its zero value. `observe` (called once per
+    /// contributor, including `first`) performs the per-row fold.
+    fn new(first: &'a GauntletRow) -> Self {
+        Accumulator {
+            first,
+            total_observed: 0,
+            passes_observed: 0,
+            skips_observed: 0,
+            inconclusives_observed: 0,
+            failures_observed: 0,
+            any_skipped: false,
+            any_failed: false,
+            any_inconclusive: false,
+            any_project_clean: false,
+            any_project_dirty: false,
+            any_kernel_clean: false,
+            any_kernel_dirty: false,
+            first_project_base: None,
+            first_kernel_base: None,
+            sum_spread: 0.0,
+            sum_migrations: 0,
+            sum_migration_ratio: 0.0,
+            sum_stuck_count: 0.0,
+            sum_fallback_count: 0,
+            sum_keep_last_count: 0,
+            sum_total_iterations: 0,
+            sum_page_locality: 0.0,
+            sum_cross_node_mig: 0.0,
+            max_gap_ms: 0,
+            max_imbalance_ratio: 0.0,
+            max_max_dsq_depth: 0,
+            ext_pairs: BTreeMap::new(),
+            sum_run_sample_count: 0,
+        }
+    }
+
+    /// Fold one contributor into the accumulator. Called once per
+    /// row in the group (including the group's first contributor).
+    /// Skip / fail / inconclusive contributors flip their verdict
+    /// bits and return early without feeding the metric sums; only
+    /// real passes contribute to the per-row sums and maxes.
+    fn observe(&mut self, row: &GauntletRow) {
+        self.total_observed += 1;
+        // Dirty-status tracking spans ALL contributors. Same hex
+        // with mixed dirty/clean across the cohort is the case the
+        // `+mixed` marker exists to surface — the per-row scope
+        // (passing, failing, skipped) is irrelevant since the
+        // marker describes WIP-vs-committed disagreement among the
+        // contributors, not their metric outcomes.
+        update_dirty_tracking(
+            &row.commit,
+            &mut self.any_project_clean,
+            &mut self.any_project_dirty,
+            &mut self.first_project_base,
+        );
+        update_dirty_tracking(
+            &row.kernel_commit,
+            &mut self.any_kernel_clean,
+            &mut self.any_kernel_dirty,
+            &mut self.first_kernel_base,
+        );
+        if row.is_skip() {
+            self.any_skipped = true;
+            self.skips_observed += 1;
+            return;
+        }
+        if row.is_fail() {
+            self.any_failed = true;
+            self.failures_observed += 1;
+            return;
+        }
+        if row.is_inconclusive() {
+            // Inconclusive contributors are not passes (the gate
+            // could not be evaluated) and carry no measured signal
+            // worth folding into the cohort means. Track the bit
+            // for the aggregated verdict's `inconclusive` field
+            // (so the aggregate row reads Inconclusive in the
+            // `Fail > Inconclusive > Pass > Skip` lattice when no
+            // contributor failed) and skip the per-row sums.
+            self.any_inconclusive = true;
+            self.inconclusives_observed += 1;
+            return;
+        }
+        self.passes_observed += 1;
+        self.sum_spread += row.spread;
+        self.sum_migrations = self.sum_migrations.saturating_add(row.migrations);
+        self.sum_migration_ratio += row.migration_ratio;
+        self.sum_stuck_count += row.stuck_count;
+        self.sum_fallback_count = self.sum_fallback_count.saturating_add(row.fallback_count);
+        self.sum_keep_last_count = self.sum_keep_last_count.saturating_add(row.keep_last_count);
+        self.sum_total_iterations = self
+            .sum_total_iterations
+            .saturating_add(row.total_iterations);
+        self.sum_page_locality += row.page_locality;
+        self.sum_cross_node_mig += row.cross_node_migration_ratio;
+        // Peak-kind typed fields: cross-RUN aggregation surfaces
+        // the worst-instant observed across the cohort, NOT the
+        // arithmetic mean (which dilutes a single peak across
+        // many quiet runs and hides the high-water signal).
+        self.max_gap_ms = self.max_gap_ms.max(row.gap_ms);
+        if row.imbalance_ratio > self.max_imbalance_ratio {
+            self.max_imbalance_ratio = row.imbalance_ratio;
+        }
+        self.max_max_dsq_depth = self.max_max_dsq_depth.max(row.max_dsq_depth);
+        self.sum_run_sample_count = self
+            .sum_run_sample_count
+            .saturating_add(row.run_sample_count);
+        for (k, v) in &row.ext_metrics {
+            self.ext_pairs
+                .entry(k.clone())
+                .or_default()
+                .push((*v, row.run_sample_count));
+        }
+    }
+
+    /// Emit the folded [`AveragedGroup`] for this group. Identity
+    /// fields are first-seen; metric fields are the kind-correct
+    /// cross-RUN fold (mean for Counter / mean-fold, MAX for Peak,
+    /// rounded mean for integer-typed fields); the verdict bits
+    /// fold under the `Fail > Inconclusive > Pass > Skip` lattice.
+    fn into_averaged_group(self) -> AveragedGroup {
+        let acc = self;
+        let n = acc.passes_observed;
+        let denom = if n == 0 { 1.0 } else { f64::from(n) };
+        // Rounded mean for integer-typed Counter / mean-fold
+        // fields. When n == 0 the sums are all zero, so dividing
+        // by 1.0 still yields 0 — the aggregate's passed=false
+        // routes the pair through excluded_pairs downstream and
+        // the metrics are never consulted. Peak-kind integer
+        // fields (max_dsq_depth) take the MAX-fold path directly
+        // and don't need a rounding helper.
+        let round_u64 = |sum: u64| -> u64 { (sum as f64 / denom).round() as u64 };
+        let round_i64 = |sum: i64| -> i64 { (sum as f64 / denom).round() as i64 };
+
+        // Mixed-dirty markers. When the cohort contains both a
+        // clean-form and dirty-form contributor for the same hex
+        // (e.g. some sidecars from a clean tree, others from a
+        // -dirty WIP), the rendered commit field carries `+mixed`
+        // appended to the canonical un-suffixed hex. The
+        // alternative — taking `acc.first.commit` verbatim — would
+        // hide WIP-vs-committed disagreement, presenting `abc1234`
+        // when half the contributors actually came from a dirty
+        // tree (or `abc1234-dirty` when half came from a clean
+        // tree). Operators reading averaged stats need to know the
+        // cohort spanned a working-tree state change, since that
+        // changes the meaning of the metric mean. `+mixed` is the
+        // chosen separator (not `-mixed`) so it cannot be confused
+        // with the existing `-dirty` suffix grammar — `dirty` is a
+        // per-record property, `mixed` is a cohort-level property.
+        let project_commit_rendered = render_mixed_dirty(
+            acc.any_project_clean,
+            acc.any_project_dirty,
+            &acc.first_project_base,
+            &acc.first.commit,
+        );
+        let kernel_commit_rendered = render_mixed_dirty(
+            acc.any_kernel_clean,
+            acc.any_kernel_dirty,
+            &acc.first_kernel_base,
+            &acc.first.kernel_commit,
+        );
+        // ext_metrics is built BEFORE the struct so Rate keys can be
+        // re-derived from the folded components as a post-pass. ONLY Rate is
+        // skipped here: its components survive cross-RUN as their own ext keys
+        // so it re-derives Σnum/Σdenom (folding two ready-made ratios would
+        // lose the re-pool, and routing a Rate through
+        // aggregate_samples_weighted would hit the aggregate_finite guard).
+        // Distribution / WorstLowest are NOT skipped — their raw components do
+        // NOT survive cross-RUN (phases are dropped), so there is no pooled set
+        // to re-derive; they fall through to aggregate_samples_weighted and
+        // fold by kind (MEAN for the percentile / CV / mean reductions and
+        // every WorstLowest, MAX for SampleReduction::Worst — the
+        // aggregate_finite arms). Dispatch by registered MetricKind so
+        // Gauge(Avg) gets the weighted-mean fold (matches the per-phase merge
+        // contract); unregistered names (no metric_def) fall back to
+        // arithmetic mean, the legacy (sum, count) semantic. Skip a key whose
+        // reduction is None (every value NaN — defensive post sidecar_to_row
+        // sanitize).
+        let ext_metrics = fold_ext_metrics(acc.ext_pairs);
+        let aggregated = GauntletRow {
+            scenario: acc.first.scenario.clone(),
+            topology: acc.first.topology.clone(),
+            work_type: acc.first.work_type.clone(),
+            scheduler: acc.first.scheduler.clone(),
+            kernel_version: acc.first.kernel_version.clone(),
+            commit: project_commit_rendered,
+            kernel_commit: kernel_commit_rendered,
+            run_source: acc.first.run_source.clone(),
+            // First-seen budget metadata, like scheduler/kernel_version
+            // above. When CpuBudget is a PAIRING dim it is part of the
+            // group key, so every contributor shares one budget and the
+            // first row's value is the group's. When the operator slices
+            // on budget (e.g. an asymmetric `--a-cpu-budget`), CpuBudget
+            // is a SLICING dim and is dropped from the pairing key, so a
+            // group's contributors may carry heterogeneous budgets — the
+            // first-seen value is then representative metadata, not a join
+            // key, and `render_overcommit_warning` surfaces the cross-budget
+            // mix on the compared sides. vcpus is likewise first-seen
+            // metadata — and is NOT a Dimension, so a TOPOLOGY-sliced group
+            // (vcpus = topology.total_cpus()) can mix vcpus too. No
+            // post-aggregation consumer reads the aggregated vcpus (the
+            // overcommit checks run pre-aggregation on the raw rows), so the
+            // first-seen value is metadata only.
+            cpu_budget: acc.first.cpu_budget,
+            vcpus: acc.first.vcpus,
+            // ALL must pass: any failed, inconclusive, or skipped
+            // contributor flips the aggregate. A group with zero
+            // passes_observed (every contributor failed, was
+            // inconclusive, or was skipped) collapses to
+            // passed=false here. The four-bit verdict is
+            // strict 4-state (exactly one of pass/skip/inconc/fail
+            // set per row); the lattice
+            // `Fail > Inconclusive > Pass > Skip` determines which
+            // bit dominates when a cohort has mixed contributors.
+            // Skip is the lowest-precedence bit — it fires only
+            // when no contributor failed AND no contributor was
+            // inconclusive AND at least one was skipped. Fail
+            // (all-false) dominates Inconclusive dominates Skip;
+            // exactly one of the four states is encoded per row.
+            passed: !acc.any_failed && !acc.any_inconclusive && !acc.any_skipped && n > 0,
+            skipped: !acc.any_failed && !acc.any_inconclusive && acc.any_skipped,
+            inconclusive: !acc.any_failed && acc.any_inconclusive,
+            // Sum across contributors so the aggregated row's
+            // weight is the cohort's total sample population. A
+            // downstream consumer that further folds these
+            // aggregated rows can apply the same weighted semantic
+            // (a 5-RUN cohort of 50-sample runs weighs 250 vs a
+            // 1-RUN cohort of 10 samples weighting 10).
+            run_sample_count: acc.sum_run_sample_count,
+            spread: acc.sum_spread / denom,
+            // Peak-kind typed fields: MAX across runs (kind-correct
+            // cross-RUN fold; arithmetic mean dilutes the
+            // worst-instant signal).
+            gap_ms: acc.max_gap_ms,
+            imbalance_ratio: acc.max_imbalance_ratio,
+            max_dsq_depth: acc.max_max_dsq_depth,
+            migrations: round_u64(acc.sum_migrations),
+            migration_ratio: acc.sum_migration_ratio / denom,
+            stuck_count: acc.sum_stuck_count / denom,
+            fallback_count: round_i64(acc.sum_fallback_count),
+            keep_last_count: round_i64(acc.sum_keep_last_count),
+            total_iterations: round_u64(acc.sum_total_iterations),
+            page_locality: acc.sum_page_locality / denom,
+            cross_node_migration_ratio: acc.sum_cross_node_mig / denom,
+            ext_metrics,
+            // Phase buckets do not aggregate cleanly across an
+            // averaged group: two contributors might run different
+            // scenarios with different phase counts, and per-phase
+            // averaging across mismatched step_index sets would
+            // invent rows neither side carried. Surface the empty
+            // slice so downstream consumers fall back to the flat
+            // bucket. A future MergeKind::Phase aware merge will
+            // revisit this once compare_partitions' cross-cardinality
+            // (per-step_index intersection + unpaired surfacing)
+            // lands and gives us a tested intersection semantic to
+            // reuse here.
+            phases: Vec::new(),
+        };
+        AveragedGroup {
+            row: aggregated,
+            passes_observed: acc.passes_observed,
+            skips_observed: acc.skips_observed,
+            inconclusives_observed: acc.inconclusives_observed,
+            failures_observed: acc.failures_observed,
+            total_observed: acc.total_observed,
+        }
+    }
+}
+
+/// Fold one group's accumulated per-ext-metric (value, weight) pairs
+/// into the aggregated row's `ext_metrics` map. ONLY Rate is skipped
+/// in the kind dispatch: its components survive cross-RUN as their own
+/// ext keys so it re-derives Σnum/Σdenom (folding two ready-made
+/// ratios would lose the re-pool, and routing a Rate through
+/// aggregate_samples_weighted would hit the aggregate_finite guard).
+/// Distribution / WorstLowest are NOT skipped — their raw components do
+/// NOT survive cross-RUN (phases are dropped), so there is no pooled set
+/// to re-derive; they fall through to aggregate_samples_weighted and
+/// fold by kind (MEAN for the percentile / CV / mean reductions and
+/// every WorstLowest, MAX for SampleReduction::Worst — the
+/// aggregate_finite arms). Dispatch by registered MetricKind so
+/// Gauge(Avg) gets the weighted-mean fold (matches the per-phase merge
+/// contract); unregistered names (no metric_def) fall back to
+/// arithmetic mean, the legacy (sum, count) semantic. Skip a key whose
+/// reduction is None (every value NaN — defensive post sidecar_to_row
+/// sanitize). Rate metrics are then re-derived from the folded
+/// components (Σnum/Σdenom) as a post-pass.
+fn fold_ext_metrics(
+    ext_pairs: BTreeMap<String, Vec<(f64, usize)>>,
+) -> BTreeMap<String, f64> {
+    let mut ext_metrics: std::collections::BTreeMap<String, f64> = ext_pairs
+        .into_iter()
+        .filter_map(|(k, pairs)| {
+            if let Some(def) = metric_def(&k) {
+                if matches!(def.kind, MetricKind::Rate { .. }) {
+                    return None;
+                }
+                aggregate_samples_weighted(&pairs, def.kind).map(|v| (k, v))
+            } else {
+                let n = pairs.len();
+                if n == 0 {
+                    None
+                } else {
+                    let sum: f64 = pairs.iter().map(|(v, _)| *v).sum();
+                    Some((k, sum / n as f64))
+                }
+            }
+        })
+        .collect();
+    // Re-derive Rate metrics from the folded components (Σnum/Σdenom).
+    derive_rate_metrics(&mut ext_metrics);
+    ext_metrics
+}
+
 /// Group `rows` by the dynamic pairing key (`scenario` plus every
 /// dimension in `pairing_dims`) and arithmetic-mean their metric
 /// fields, returning one [`AveragedGroup`] per distinct key.
@@ -522,93 +934,6 @@ pub fn group_and_average_by(
     // the map.
     type Key = PairingKey;
 
-    struct Accumulator<'a> {
-        first: &'a GauntletRow,
-        total_observed: u32,
-        passes_observed: u32,
-        skips_observed: u32,
-        inconclusives_observed: u32,
-        failures_observed: u32,
-        any_skipped: bool,
-        any_failed: bool,
-        any_inconclusive: bool,
-        // Tracks whether contributors disagree on the `-dirty`
-        // suffix for the project_commit / kernel_commit dimensions.
-        // `any_*_clean` is true if any contributor's value is the
-        // un-suffixed form; `any_*_dirty` is true if any contributor
-        // ends in `-dirty`. When BOTH are true the aggregate is
-        // mixed-dirty and the rendered `commit` / `kernel_commit`
-        // gets a `+mixed` marker so downstream readers don't see a
-        // single arbitrary contributor's status. Tracked across
-        // EVERY contributor (passing, failing, skipped) — a mixed
-        // working-tree state is metadata about the cohort, not
-        // about the metric mean. Empty / `None` values are ignored
-        // and do not flip either flag.
-        any_project_clean: bool,
-        any_project_dirty: bool,
-        any_kernel_clean: bool,
-        any_kernel_dirty: bool,
-        // First-seen un-suffixed (clean-form) project / kernel
-        // commit string. Held separately from `first` because
-        // `first.commit` may be `Some("abc1234-dirty")` when the
-        // first contributor was dirty but later contributors carry
-        // the clean form — the rendered `+mixed` marker should
-        // still attach to the canonical un-suffixed hex so the
-        // operator sees `abc1234+mixed` not `abc1234-dirty+mixed`.
-        first_project_base: Option<String>,
-        first_kernel_base: Option<String>,
-        // Sums across passing+non-skipped contributors only.
-        // Counts are tracked per ext_metric key separately because
-        // a key may be absent from some contributors.
-        // Per-row sum for mean-fold fields (Counter / Gauge(Last) /
-        // Gauge(Avg) — though no typed Gauge(Avg) field exists
-        // today). Arithmetic mean across runs is the operator-
-        // facing cohort-comparison default; per-RUN totals are
-        // averaged to produce a comparable per-run quantity
-        // across cohorts of different run counts.
-        sum_spread: f64,
-        sum_migrations: u64,
-        sum_migration_ratio: f64,
-        sum_stuck_count: f64,
-        sum_fallback_count: i64,
-        sum_keep_last_count: i64,
-        sum_total_iterations: u64,
-        sum_page_locality: f64,
-        sum_cross_node_mig: f64,
-        // Per-row MAX-fold for Peak-kind fields. Per
-        // `MetricKind::Peak` contract, cross-RUN aggregation
-        // surfaces the worst-instant observed across the cohort —
-        // averaging Peak across runs dilutes the high-water signal
-        // (a 1-run spike at 100 averaged with 4 runs at 0 reports
-        // 20, hiding the actual peak). MAX preserves "did this
-        // peak ever fire in this cohort".
-        max_gap_ms: u64,
-        max_imbalance_ratio: f64,
-        max_max_dsq_depth: u32,
-        // Per-ext-metric (value, weight) pairs, accumulated across
-        // contributors. At emit time the kind-aware fold dispatches
-        // each key through `aggregate_samples` with `Some(&weights)`
-        // so Gauge(Avg) metrics get a weighted mean (per the F-C
-        // fix on aggregate_samples) and other kinds fold by their
-        // own semantics. Unregistered metric names (no MetricDef)
-        // fall back to arithmetic mean — same legacy semantic the
-        // previous (sum, u32) shape produced.
-        ext_pairs: BTreeMap<String, Vec<(f64, usize)>>,
-        // Sum of `run_sample_count` across contributors. Carries
-        // through to the aggregated row's `run_sample_count` so a
-        // downstream cross-RUN consumer that further folds these
-        // already-aggregated rows can apply the same weighted
-        // semantic. Currently no typed Gauge(Avg) field exists
-        // (imbalance_ratio is registered as `max_imbalance_ratio`
-        // kind=Peak, NOT Gauge(Avg) — the Gauge(Avg) sibling
-        // `avg_imbalance_ratio` lands in ext_metrics where the
-        // weighted-mean dispatch already fires); the sum is
-        // preserved here for future typed-field Gauge(Avg)
-        // additions and for downstream cohort-of-cohort
-        // aggregation that wants a meaningful weight.
-        sum_run_sample_count: usize,
-    }
-
     let mut order: Vec<Key> = Vec::new();
     let mut groups: BTreeMap<Key, Accumulator<'_>> = BTreeMap::new();
 
@@ -616,109 +941,9 @@ pub fn group_and_average_by(
         let key = PairingKey::from_row(row, pairing_dims);
         let acc = groups.entry(key.clone()).or_insert_with(|| {
             order.push(key);
-            Accumulator {
-                first: row,
-                total_observed: 0,
-                passes_observed: 0,
-                skips_observed: 0,
-                inconclusives_observed: 0,
-                failures_observed: 0,
-                any_skipped: false,
-                any_failed: false,
-                any_inconclusive: false,
-                any_project_clean: false,
-                any_project_dirty: false,
-                any_kernel_clean: false,
-                any_kernel_dirty: false,
-                first_project_base: None,
-                first_kernel_base: None,
-                sum_spread: 0.0,
-                sum_migrations: 0,
-                sum_migration_ratio: 0.0,
-                sum_stuck_count: 0.0,
-                sum_fallback_count: 0,
-                sum_keep_last_count: 0,
-                sum_total_iterations: 0,
-                sum_page_locality: 0.0,
-                sum_cross_node_mig: 0.0,
-                max_gap_ms: 0,
-                max_imbalance_ratio: 0.0,
-                max_max_dsq_depth: 0,
-                ext_pairs: BTreeMap::new(),
-                sum_run_sample_count: 0,
-            }
+            Accumulator::new(row)
         });
-        acc.total_observed += 1;
-        // Dirty-status tracking spans ALL contributors. Same hex
-        // with mixed dirty/clean across the cohort is the case the
-        // `+mixed` marker exists to surface — the per-row scope
-        // (passing, failing, skipped) is irrelevant since the
-        // marker describes WIP-vs-committed disagreement among the
-        // contributors, not their metric outcomes.
-        update_dirty_tracking(
-            &row.commit,
-            &mut acc.any_project_clean,
-            &mut acc.any_project_dirty,
-            &mut acc.first_project_base,
-        );
-        update_dirty_tracking(
-            &row.kernel_commit,
-            &mut acc.any_kernel_clean,
-            &mut acc.any_kernel_dirty,
-            &mut acc.first_kernel_base,
-        );
-        if row.is_skip() {
-            acc.any_skipped = true;
-            acc.skips_observed += 1;
-            continue;
-        }
-        if row.is_fail() {
-            acc.any_failed = true;
-            acc.failures_observed += 1;
-            continue;
-        }
-        if row.is_inconclusive() {
-            // Inconclusive contributors are not passes (the gate
-            // could not be evaluated) and carry no measured signal
-            // worth folding into the cohort means. Track the bit
-            // for the aggregated verdict's `inconclusive` field
-            // (so the aggregate row reads Inconclusive in the
-            // `Fail > Inconclusive > Pass > Skip` lattice when no
-            // contributor failed) and skip the per-row sums.
-            acc.any_inconclusive = true;
-            acc.inconclusives_observed += 1;
-            continue;
-        }
-        acc.passes_observed += 1;
-        acc.sum_spread += row.spread;
-        acc.sum_migrations = acc.sum_migrations.saturating_add(row.migrations);
-        acc.sum_migration_ratio += row.migration_ratio;
-        acc.sum_stuck_count += row.stuck_count;
-        acc.sum_fallback_count = acc.sum_fallback_count.saturating_add(row.fallback_count);
-        acc.sum_keep_last_count = acc.sum_keep_last_count.saturating_add(row.keep_last_count);
-        acc.sum_total_iterations = acc
-            .sum_total_iterations
-            .saturating_add(row.total_iterations);
-        acc.sum_page_locality += row.page_locality;
-        acc.sum_cross_node_mig += row.cross_node_migration_ratio;
-        // Peak-kind typed fields: cross-RUN aggregation surfaces
-        // the worst-instant observed across the cohort, NOT the
-        // arithmetic mean (which dilutes a single peak across
-        // many quiet runs and hides the high-water signal).
-        acc.max_gap_ms = acc.max_gap_ms.max(row.gap_ms);
-        if row.imbalance_ratio > acc.max_imbalance_ratio {
-            acc.max_imbalance_ratio = row.imbalance_ratio;
-        }
-        acc.max_max_dsq_depth = acc.max_max_dsq_depth.max(row.max_dsq_depth);
-        acc.sum_run_sample_count = acc
-            .sum_run_sample_count
-            .saturating_add(row.run_sample_count);
-        for (k, v) in &row.ext_metrics {
-            acc.ext_pairs
-                .entry(k.clone())
-                .or_default()
-                .push((*v, row.run_sample_count));
-        }
+        acc.observe(row);
     }
 
     let mut out = Vec::with_capacity(order.len());
@@ -726,171 +951,7 @@ pub fn group_and_average_by(
         let acc = groups
             .remove(&key)
             .expect("first-seen key must still be in groups map");
-        let n = acc.passes_observed;
-        let denom = if n == 0 { 1.0 } else { f64::from(n) };
-        // Rounded mean for integer-typed Counter / mean-fold
-        // fields. When n == 0 the sums are all zero, so dividing
-        // by 1.0 still yields 0 — the aggregate's passed=false
-        // routes the pair through excluded_pairs downstream and
-        // the metrics are never consulted. Peak-kind integer
-        // fields (max_dsq_depth) take the MAX-fold path directly
-        // and don't need a rounding helper.
-        let round_u64 = |sum: u64| -> u64 { (sum as f64 / denom).round() as u64 };
-        let round_i64 = |sum: i64| -> i64 { (sum as f64 / denom).round() as i64 };
-
-        // Mixed-dirty markers. When the cohort contains both a
-        // clean-form and dirty-form contributor for the same hex
-        // (e.g. some sidecars from a clean tree, others from a
-        // -dirty WIP), the rendered commit field carries `+mixed`
-        // appended to the canonical un-suffixed hex. The
-        // alternative — taking `acc.first.commit` verbatim — would
-        // hide WIP-vs-committed disagreement, presenting `abc1234`
-        // when half the contributors actually came from a dirty
-        // tree (or `abc1234-dirty` when half came from a clean
-        // tree). Operators reading averaged stats need to know the
-        // cohort spanned a working-tree state change, since that
-        // changes the meaning of the metric mean. `+mixed` is the
-        // chosen separator (not `-mixed`) so it cannot be confused
-        // with the existing `-dirty` suffix grammar — `dirty` is a
-        // per-record property, `mixed` is a cohort-level property.
-        let project_commit_rendered = render_mixed_dirty(
-            acc.any_project_clean,
-            acc.any_project_dirty,
-            &acc.first_project_base,
-            &acc.first.commit,
-        );
-        let kernel_commit_rendered = render_mixed_dirty(
-            acc.any_kernel_clean,
-            acc.any_kernel_dirty,
-            &acc.first_kernel_base,
-            &acc.first.kernel_commit,
-        );
-        // ext_metrics is built BEFORE the struct so Rate keys can be
-        // re-derived from the folded components as a post-pass. ONLY Rate is
-        // skipped here: its components survive cross-RUN as their own ext keys
-        // so it re-derives Σnum/Σdenom (folding two ready-made ratios would
-        // lose the re-pool, and routing a Rate through
-        // aggregate_samples_weighted would hit the aggregate_finite guard).
-        // Distribution / WorstLowest are NOT skipped — their raw components do
-        // NOT survive cross-RUN (phases are dropped), so there is no pooled set
-        // to re-derive; they fall through to aggregate_samples_weighted and
-        // fold by kind (MEAN for the percentile / CV / mean reductions and
-        // every WorstLowest, MAX for SampleReduction::Worst — the
-        // aggregate_finite arms). Dispatch by registered MetricKind so
-        // Gauge(Avg) gets the weighted-mean fold (matches the per-phase merge
-        // contract); unregistered names (no metric_def) fall back to
-        // arithmetic mean, the legacy (sum, count) semantic. Skip a key whose
-        // reduction is None (every value NaN — defensive post sidecar_to_row
-        // sanitize).
-        let mut ext_metrics: std::collections::BTreeMap<String, f64> = acc
-            .ext_pairs
-            .into_iter()
-            .filter_map(|(k, pairs)| {
-                if let Some(def) = metric_def(&k) {
-                    if matches!(def.kind, MetricKind::Rate { .. }) {
-                        return None;
-                    }
-                    aggregate_samples_weighted(&pairs, def.kind).map(|v| (k, v))
-                } else {
-                    let n = pairs.len();
-                    if n == 0 {
-                        None
-                    } else {
-                        let sum: f64 = pairs.iter().map(|(v, _)| *v).sum();
-                        Some((k, sum / n as f64))
-                    }
-                }
-            })
-            .collect();
-        // Re-derive Rate metrics from the folded components (Σnum/Σdenom).
-        derive_rate_metrics(&mut ext_metrics);
-        let aggregated = GauntletRow {
-            scenario: acc.first.scenario.clone(),
-            topology: acc.first.topology.clone(),
-            work_type: acc.first.work_type.clone(),
-            scheduler: acc.first.scheduler.clone(),
-            kernel_version: acc.first.kernel_version.clone(),
-            commit: project_commit_rendered,
-            kernel_commit: kernel_commit_rendered,
-            run_source: acc.first.run_source.clone(),
-            // First-seen budget metadata, like scheduler/kernel_version
-            // above. When CpuBudget is a PAIRING dim it is part of the
-            // group key, so every contributor shares one budget and the
-            // first row's value is the group's. When the operator slices
-            // on budget (e.g. an asymmetric `--a-cpu-budget`), CpuBudget
-            // is a SLICING dim and is dropped from the pairing key, so a
-            // group's contributors may carry heterogeneous budgets — the
-            // first-seen value is then representative metadata, not a join
-            // key, and `render_overcommit_warning` surfaces the cross-budget
-            // mix on the compared sides. vcpus is likewise first-seen
-            // metadata — and is NOT a Dimension, so a TOPOLOGY-sliced group
-            // (vcpus = topology.total_cpus()) can mix vcpus too. No
-            // post-aggregation consumer reads the aggregated vcpus (the
-            // overcommit checks run pre-aggregation on the raw rows), so the
-            // first-seen value is metadata only.
-            cpu_budget: acc.first.cpu_budget,
-            vcpus: acc.first.vcpus,
-            // ALL must pass: any failed, inconclusive, or skipped
-            // contributor flips the aggregate. A group with zero
-            // passes_observed (every contributor failed, was
-            // inconclusive, or was skipped) collapses to
-            // passed=false here. The four-bit verdict is
-            // strict 4-state (exactly one of pass/skip/inconc/fail
-            // set per row); the lattice
-            // `Fail > Inconclusive > Pass > Skip` determines which
-            // bit dominates when a cohort has mixed contributors.
-            // Skip is the lowest-precedence bit — it fires only
-            // when no contributor failed AND no contributor was
-            // inconclusive AND at least one was skipped. Fail
-            // (all-false) dominates Inconclusive dominates Skip;
-            // exactly one of the four states is encoded per row.
-            passed: !acc.any_failed && !acc.any_inconclusive && !acc.any_skipped && n > 0,
-            skipped: !acc.any_failed && !acc.any_inconclusive && acc.any_skipped,
-            inconclusive: !acc.any_failed && acc.any_inconclusive,
-            // Sum across contributors so the aggregated row's
-            // weight is the cohort's total sample population. A
-            // downstream consumer that further folds these
-            // aggregated rows can apply the same weighted semantic
-            // (a 5-RUN cohort of 50-sample runs weighs 250 vs a
-            // 1-RUN cohort of 10 samples weighting 10).
-            run_sample_count: acc.sum_run_sample_count,
-            spread: acc.sum_spread / denom,
-            // Peak-kind typed fields: MAX across runs (kind-correct
-            // cross-RUN fold; arithmetic mean dilutes the
-            // worst-instant signal).
-            gap_ms: acc.max_gap_ms,
-            imbalance_ratio: acc.max_imbalance_ratio,
-            max_dsq_depth: acc.max_max_dsq_depth,
-            migrations: round_u64(acc.sum_migrations),
-            migration_ratio: acc.sum_migration_ratio / denom,
-            stuck_count: acc.sum_stuck_count / denom,
-            fallback_count: round_i64(acc.sum_fallback_count),
-            keep_last_count: round_i64(acc.sum_keep_last_count),
-            total_iterations: round_u64(acc.sum_total_iterations),
-            page_locality: acc.sum_page_locality / denom,
-            cross_node_migration_ratio: acc.sum_cross_node_mig / denom,
-            ext_metrics,
-            // Phase buckets do not aggregate cleanly across an
-            // averaged group: two contributors might run different
-            // scenarios with different phase counts, and per-phase
-            // averaging across mismatched step_index sets would
-            // invent rows neither side carried. Surface the empty
-            // slice so downstream consumers fall back to the flat
-            // bucket. A future MergeKind::Phase aware merge will
-            // revisit this once compare_partitions' cross-cardinality
-            // (per-step_index intersection + unpaired surfacing)
-            // lands and gives us a tested intersection semantic to
-            // reuse here.
-            phases: Vec::new(),
-        };
-        out.push(AveragedGroup {
-            row: aggregated,
-            passes_observed: acc.passes_observed,
-            skips_observed: acc.skips_observed,
-            inconclusives_observed: acc.inconclusives_observed,
-            failures_observed: acc.failures_observed,
-            total_observed: acc.total_observed,
-        });
+        out.push(acc.into_averaged_group());
     }
     out
 }
