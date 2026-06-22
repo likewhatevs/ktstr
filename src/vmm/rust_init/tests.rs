@@ -39,7 +39,10 @@ fn mkdir_p_existing_is_noop() {
 
     // Postcondition: still a directory, and the SAME directory
     // (same inode) — not unlinked and recreated.
-    assert!(path.is_dir(), "mkdir_p on an existing dir must leave it present");
+    assert!(
+        path.is_dir(),
+        "mkdir_p on an existing dir must leave it present"
+    );
     let ino_after = fs::metadata(path).unwrap().ino();
     assert_eq!(
         ino_before, ino_after,

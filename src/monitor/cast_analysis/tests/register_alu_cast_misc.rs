@@ -722,4 +722,3 @@ fn jumps_only_program_does_not_panic() {
         "all-jumps program must yield empty map: {map:?}"
     );
 }
-

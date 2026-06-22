@@ -2498,8 +2498,11 @@ fn set_affinity_random_no_op_conditions() {
     );
     // Empty pool with count>0 bails.
     assert!(
-        crate::workload::resolve_affinity(&ResolvedAffinity::random(std::iter::empty::<usize>(), 1))
-            .is_err(),
+        crate::workload::resolve_affinity(&ResolvedAffinity::random(
+            std::iter::empty::<usize>(),
+            1
+        ))
+        .is_err(),
         "empty-pool Random must bail in the consumer guard"
     );
 }

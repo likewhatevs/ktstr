@@ -820,4 +820,3 @@ fn kfunc_arena_alloc_non_allowlist_name_drops() {
              NOT seed an arena finding: {map:?}"
     );
 }
-

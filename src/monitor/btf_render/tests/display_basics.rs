@@ -624,4 +624,3 @@ fn truncated_array_element_carries_bytes_partial() {
         other => panic!("expected Truncated or Struct, got {other:?}"),
     }
 }
-

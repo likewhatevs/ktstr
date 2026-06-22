@@ -5672,7 +5672,9 @@ mod tests {
         // Distinguishing capacity (512 != DEFAULT 256) proves the
         // setter stores the SUPPLIED config, not a fresh default.
         let cfg = crate::vmm::disk_config::DiskConfig::DEFAULT.capacity_mib(512);
-        let entry = KtstrTestEntry::DEFAULT.with_name("disk_setter").with_disk(cfg);
+        let entry = KtstrTestEntry::DEFAULT
+            .with_name("disk_setter")
+            .with_disk(cfg);
         let got = entry.disk.expect("with_disk must populate Some");
         assert_eq!(
             got.capacity_mib, 512,
@@ -5748,20 +5750,14 @@ mod tests {
             .with_network(net)
             .without_disk();
         assert!(e1.disk.is_none(), "without_disk must clear disk");
-        assert!(
-            e1.network.is_some(),
-            "without_disk must NOT clear network"
-        );
+        assert!(e1.network.is_some(), "without_disk must NOT clear network");
         // Clear network only: disk must survive.
         let e2 = KtstrTestEntry::DEFAULT
             .with_name("indep_net")
             .with_disk(crate::vmm::disk_config::DiskConfig::DEFAULT.capacity_mib(512))
             .with_network(net)
             .without_network();
-        assert!(
-            e2.network.is_none(),
-            "without_network must clear network"
-        );
+        assert!(e2.network.is_none(), "without_network must clear network");
         assert!(e2.disk.is_some(), "without_network must NOT clear disk");
     }
 
@@ -5774,10 +5770,13 @@ mod tests {
     #[test]
     fn with_num_snapshots_sets_and_overrides_exact_count() {
         assert_eq!(
-            KtstrTestEntry::DEFAULT.num_snapshots, 0,
+            KtstrTestEntry::DEFAULT.num_snapshots,
+            0,
             "DEFAULT disables periodic capture (num_snapshots == 0)"
         );
-        let entry = KtstrTestEntry::DEFAULT.with_name("snap").with_num_snapshots(4);
+        let entry = KtstrTestEntry::DEFAULT
+            .with_name("snap")
+            .with_num_snapshots(4);
         assert_eq!(
             entry.num_snapshots, 4,
             "with_num_snapshots must store the exact supplied count"
@@ -5855,7 +5854,10 @@ mod tests {
             .post_vm
             .expect("conditional post_vm must survive the unconditional clear");
         assert!(
-            std::ptr::fn_addr_eq(cond, conditional_cb_ok as crate::test_support::PostVmCallback),
+            std::ptr::fn_addr_eq(
+                cond,
+                conditional_cb_ok as crate::test_support::PostVmCallback
+            ),
             "the surviving post_vm must still be the conditional callback"
         );
     }
@@ -5875,7 +5877,10 @@ mod tests {
             .post_vm_unconditional
             .expect("post_vm_unconditional set");
         assert!(
-            std::ptr::fn_addr_eq(cond, conditional_cb_ok as crate::test_support::PostVmCallback),
+            std::ptr::fn_addr_eq(
+                cond,
+                conditional_cb_ok as crate::test_support::PostVmCallback
+            ),
             "post_vm slot must hold the conditional callback"
         );
         assert!(
@@ -5989,7 +5994,10 @@ mod tests {
             );
         let json = SchedulerJson::from_scheduler(&s);
         assert_eq!(json.name, "custom");
-        assert_eq!(json.binary_kind, BinaryKindJson::Discover("scx_custom".to_string()));
+        assert_eq!(
+            json.binary_kind,
+            BinaryKindJson::Discover("scx_custom".to_string())
+        );
         assert_eq!(json.topology.num_numa_nodes, 2);
         assert_eq!(json.topology.num_llcs, 4);
         assert_eq!(json.topology.cores_per_llc, 8);
@@ -6021,7 +6029,10 @@ mod tests {
             text.contains("\"kind\":\"discover\"") && text.contains("\"value\":\"scx_rt\""),
             "Discover must serialize as kind/value adjacent tag, got: {text}"
         );
-        let back: SchedulerJson =
-            serde_json::from_str(&text).expect("deserialize SchedulerJson");
-        assert_eq!(back, json, "SchedulerJson must round-trip through serde unchanged");
-    }}
+        let back: SchedulerJson = serde_json::from_str(&text).expect("deserialize SchedulerJson");
+        assert_eq!(
+            back, json,
+            "SchedulerJson must round-trip through serde unchanged"
+        );
+    }
+}

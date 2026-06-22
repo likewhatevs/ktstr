@@ -434,4 +434,3 @@ fn rendered_value_as_bool_array_accepts_pointer_elements() {
         "an array of pointers coerces to a per-element non-null mask",
     );
 }
-

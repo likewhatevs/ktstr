@@ -1006,4 +1006,3 @@ fn cast_chase_kernel_successful_chase_top_byte_non_ff() {
     assert_eq!(bits, 64);
     assert_eq!(value, 0x42, "Q.x must reflect the bytes read_kva returned");
 }
-

@@ -289,8 +289,7 @@ mod tests {
         // the test proves usable stats, not just a non-negative
         // fd id.
         let vm = KtstrKvm::new(test_topo(1), 64, false).unwrap();
-        let fd =
-            get_stats_fd(&vm.vcpus[0]).expect("KVM_GET_STATS_FD on vCPU fd must return Some");
+        let fd = get_stats_fd(&vm.vcpus[0]).expect("KVM_GET_STATS_FD on vCPU fd must return Some");
         let buf = read_initial(fd.as_raw_fd()).expect("initial read of vCPU stats fd");
         let meta = parse_meta_from_buf(&buf).expect("parse vCPU stats metadata");
         assert!(

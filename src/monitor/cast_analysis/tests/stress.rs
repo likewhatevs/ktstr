@@ -847,4 +847,3 @@ fn btf_only_ints_no_panic() {
         "Int-only BTF must produce empty CastMap: {map:?}"
     );
 }
-

@@ -1958,8 +1958,7 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  linux-6.14.2.t
 ";
     let (_server, url, _mock) = mock_sha256sums(200, manifest);
     let client = test_client();
-    let got =
-        super::resolve_expected_sha256_from_url(&client, &url, "linux-6.14.2.tar.xz", false);
+    let got = super::resolve_expected_sha256_from_url(&client, &url, "linux-6.14.2.tar.xz", false);
     assert_eq!(
         got.as_deref(),
         Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
@@ -1982,12 +1981,7 @@ aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  linux-6.14.1.t
 ";
     let (_server, url, _mock) = mock_sha256sums(200, manifest);
     let client = test_client();
-    let got = super::resolve_expected_sha256_from_url(
-        &client,
-        &url,
-        "linux-9.99.99.tar.xz",
-        false,
-    );
+    let got = super::resolve_expected_sha256_from_url(&client, &url, "linux-9.99.99.tar.xz", false);
     assert!(
         got.is_none(),
         "no-skip path must return None when the fetched manifest \
@@ -2005,12 +1999,7 @@ aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  linux-6.14.1.t
 fn resolve_expected_sha256_no_skip_returns_none_on_fetch_error() {
     let (_server, url, _mock) = mock_sha256sums(404, "Not Found");
     let client = test_client();
-    let got = super::resolve_expected_sha256_from_url(
-        &client,
-        &url,
-        "linux-999.0.0.tar.xz",
-        false,
-    );
+    let got = super::resolve_expected_sha256_from_url(&client, &url, "linux-999.0.0.tar.xz", false);
     assert!(
         got.is_none(),
         "no-skip path must return None when the manifest fetch \
@@ -2216,13 +2205,7 @@ fn is_skippable_release_moniker_matrix() {
     // Exact-match contract: substrings and decorated variants are
     // NOT skipped. A `contains`-style implementation would wrongly
     // skip these.
-    for keep in [
-        "linux-next-20260420",
-        "linux-nextfoo",
-        "next",
-        "linux",
-        "",
-    ] {
+    for keep in ["linux-next-20260420", "linux-nextfoo", "next", "linux", ""] {
         assert!(
             !is_skippable_release_moniker(keep),
             "{keep:?} is not exactly \"linux-next\" and must NOT be skipped",

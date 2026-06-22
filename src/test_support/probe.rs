@@ -501,9 +501,7 @@ fn write_auto_repro_sidecar_artifacts(
                     .parent()
                     .expect("sidecar_dir join always has parent"),
             ) {
-                eprintln!(
-                    "ktstr_test: auto-repro: create sidecar dir for wprof trace: {e}",
-                );
+                eprintln!("ktstr_test: auto-repro: create sidecar dir for wprof trace: {e}",);
             } else if let Err(e) = std::fs::write(&wprof_path, &bulk_entry.payload) {
                 eprintln!(
                     "ktstr_test: auto-repro: write wprof trace to {}: {e}",

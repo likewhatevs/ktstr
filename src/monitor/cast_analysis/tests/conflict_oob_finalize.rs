@@ -926,4 +926,3 @@ fn finalize_max_seen_type_id_slack_finds_distant_candidate() {
              MAX_BTF_ID_PROBE: {map:?}"
     );
 }
-

@@ -1053,13 +1053,20 @@ mod tests {
         // the boundary outcome (2 entries, no above-gap split) — the
         // distinct guard vs e820_exact_3gb_two_entries (which only checks
         // the count). An off-by-one to `<` would split here and produce 3.
-        assert_eq!(3072u64 << 20, MMIO_GAP_START, "test premise: 3 GiB == gap start");
+        assert_eq!(
+            3072u64 << 20,
+            MMIO_GAP_START,
+            "test premise: 3 GiB == gap start"
+        );
         let mem = test_mem(3072); // 3 GiB
         write_boot_params(&mem, "console=ttyS0", 3072, None, None, None).unwrap();
         use linux_loader::loader::bootparam::boot_params;
         let params: boot_params = mem.read_obj(GuestAddress(BOOT_PARAMS_ADDR)).unwrap();
         let entries = { params.e820_entries };
-        assert_eq!(entries, 2, "3 GiB at gap start: low + single high, no split");
+        assert_eq!(
+            entries, 2,
+            "3 GiB at gap start: low + single high, no split"
+        );
         // The single high entry spans [HIMEM_START, 3 GiB) and there is
         // NO relocated above-gap entry.
         let addr1 = { params.e820_table[1].addr };

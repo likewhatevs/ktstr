@@ -33,7 +33,10 @@ fn as_i64_array_collects_signed_and_negative() {
     let arr = RenderedValue::Array {
         len: 3,
         elements: vec![
-            RenderedValue::Int { bits: 64, value: -5 },
+            RenderedValue::Int {
+                bits: 64,
+                value: -5,
+            },
             RenderedValue::Int { bits: 32, value: 0 },
             RenderedValue::Int {
                 bits: 64,
@@ -92,7 +95,10 @@ fn as_f64_array_collects_mixed_numeric() {
                 bits: 64,
                 value: 1.5,
             },
-            RenderedValue::Int { bits: 64, value: -2 },
+            RenderedValue::Int {
+                bits: 64,
+                value: -2,
+            },
             uint(3),
             enum_v(32, 4, Some("FOUR"), true),
         ],
@@ -153,7 +159,10 @@ fn as_bool_array_coerces_mixed_scalars_to_nonzero_mask() {
         len: 4,
         elements: vec![
             uint(0),
-            RenderedValue::Int { bits: 32, value: -1 },
+            RenderedValue::Int {
+                bits: 32,
+                value: -1,
+            },
             RenderedValue::Char { value: 0 },
             enum_v(32, 7, None, false),
         ],
@@ -295,7 +304,10 @@ fn build_sibling_scalar_pool_collects_nonzero_and_descends_one_level() {
     ];
     let pool = build_sibling_scalar_pool(&members);
     assert!(pool.contains(&5), "named scalar value collected");
-    assert!(pool.contains(&7), "single-level struct descent collected inner scalar");
+    assert!(
+        pool.contains(&7),
+        "single-level struct descent collected inner scalar"
+    );
     assert!(!pool.contains(&0), "zero values are never pooled");
     assert_eq!(pool.len(), 2);
 }
@@ -307,10 +319,16 @@ fn build_sibling_scalar_pool_signed_int_pooled_as_bit_pattern() {
     // an unsigned member dedups against it. -1 → 0xFFFF_FFFF_FFFF_FFFF.
     let members = vec![RenderedMember {
         name: "v".into(),
-        value: RenderedValue::Int { bits: 64, value: -1 },
+        value: RenderedValue::Int {
+            bits: 64,
+            value: -1,
+        },
     }];
     let pool = build_sibling_scalar_pool(&members);
-    assert!(pool.contains(&u64::MAX), "signed -1 pooled as u64::MAX bits");
+    assert!(
+        pool.contains(&u64::MAX),
+        "signed -1 pooled as u64::MAX bits"
+    );
 }
 
 #[test]
@@ -543,5 +561,8 @@ fn write_struct_multiline_column_compact_single_row() {
     );
     // Breadcrumb form, not inline braces.
     assert!(out.starts_with("counters:\n"));
-    assert!(!out.contains('{'), "multi-line must not use inline braces: {out}");
+    assert!(
+        !out.contains('{'),
+        "multi-line must not use inline braces: {out}"
+    );
 }

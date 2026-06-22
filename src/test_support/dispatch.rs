@@ -4554,5 +4554,4 @@ mod tests {
              positioning (ExpectAutoReproSatisfied alone would return EXIT_PASS)"
         );
     }
-
 }

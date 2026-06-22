@@ -609,4 +609,3 @@ fn arena_chase_pointee_fwd_anonymous() {
         "anonymous Fwd reason must mention the aggregate kind; got: {reason}"
     );
 }
-

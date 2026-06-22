@@ -866,4 +866,3 @@ fn sign_extend_mov_drops_state() {
         "sign-extend MOV must drop typed state: {map:?}"
     );
 }
-

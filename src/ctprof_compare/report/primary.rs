@@ -786,7 +786,11 @@ mod tests {
     /// three-field row.
     #[test]
     fn write_primary_section_all_renders_full_hierarchy() {
-        let diff = diff_with(vec![mk_row("/svc/api\x00gunicorn\x00gunicorn-w", "gunicorn-w", 10.0)]);
+        let diff = diff_with(vec![mk_row(
+            "/svc/api\x00gunicorn\x00gunicorn-w",
+            "gunicorn-w",
+            10.0,
+        )]);
         let cols = full_columns();
         let mut out = String::new();
         write_primary_section(

@@ -3021,12 +3021,15 @@ mod tests {
             if s.len() <= max {
                 // No truncation: returns the input verbatim, no marker.
                 assert_eq!(tail, s, "max={max}: short input must round-trip");
-                assert!(!tail.starts_with("..."), "max={max}: no marker when untruncated");
+                assert!(
+                    !tail.starts_with("..."),
+                    "max={max}: no marker when untruncated"
+                );
             } else {
                 // Truncated: leading "..." marker, then a suffix of s.
-                let body = tail
-                    .strip_prefix("...")
-                    .unwrap_or_else(|| panic!("max={max}: truncated output must carry the marker, got {tail:?}"));
+                let body = tail.strip_prefix("...").unwrap_or_else(|| {
+                    panic!("max={max}: truncated output must carry the marker, got {tail:?}")
+                });
                 assert!(
                     s.ends_with(body),
                     "max={max}: body {body:?} must be a suffix of the input {s:?}",

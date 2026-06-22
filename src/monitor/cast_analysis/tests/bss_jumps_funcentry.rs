@@ -1003,4 +1003,3 @@ fn initial_reg_struct_type_id_zero_dropped() {
         "InitialReg with struct_type_id=0 must be dropped: {map:?}"
     );
 }
-

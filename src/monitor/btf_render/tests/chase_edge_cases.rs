@@ -844,4 +844,3 @@ fn cast_intercept_modifier_chain_parent_uses_post_peel_id() {
     assert_eq!(bits, 64);
     assert_eq!(value, 0x55);
 }
-

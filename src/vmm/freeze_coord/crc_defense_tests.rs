@@ -72,7 +72,9 @@ impl SinkState {
         Self {
             kill: Arc::new(AtomicBool::new(false)),
             kill_evt: Arc::new(EventFd::new(EFD_NONBLOCK).expect("kill eventfd")),
-            sys_rdy_evt: Some(Arc::new(EventFd::new(EFD_NONBLOCK).expect("sys_rdy eventfd"))),
+            sys_rdy_evt: Some(Arc::new(
+                EventFd::new(EFD_NONBLOCK).expect("sys_rdy eventfd"),
+            )),
             snapshot_requests_pending: Vec::new(),
             kernel_op_requests_pending: Vec::new(),
             kern_phys_base: Arc::new(AtomicU64::new(0)),
@@ -280,7 +282,10 @@ fn sched_exit_torn_crc_does_not_promote_when_other_valid_frames_present() {
     // torn SCHED_EXIT-typed frame.
     let mut buf = Vec::new();
     buf.extend(frame_with_torn_crc(MSG_TYPE_SCHED_EXIT, b"first"));
-    buf.extend(frame_with_crc(crate::vmm::wire::MSG_TYPE_STIMULUS, b"valid"));
+    buf.extend(frame_with_crc(
+        crate::vmm::wire::MSG_TYPE_STIMULUS,
+        b"valid",
+    ));
     buf.extend(frame_with_torn_crc(MSG_TYPE_SCHED_EXIT, b"second"));
     let drained = a.feed(&buf);
     assert_eq!(drained.messages.len(), 3);
@@ -419,7 +424,10 @@ fn both_gates_drop_torn_frames_in_same_drain() {
     let snap_payload = snapshot_request_bytes(99, SNAPSHOT_KIND_CAPTURE, "tag");
     let mut buf = Vec::new();
     buf.extend(frame_with_torn_crc(MSG_TYPE_SCHED_EXIT, b"sched-exit"));
-    buf.extend(frame_with_torn_crc(MSG_TYPE_SNAPSHOT_REQUEST, &snap_payload));
+    buf.extend(frame_with_torn_crc(
+        MSG_TYPE_SNAPSHOT_REQUEST,
+        &snap_payload,
+    ));
     let drained = a.feed(&buf);
     assert_eq!(drained.messages.len(), 2);
     assert!(!drained.messages[0].crc_ok);
@@ -439,7 +447,10 @@ fn both_gates_drop_torn_frames_in_same_drain() {
         0,
         "torn SNAPSHOT_REQUEST must not decode"
     );
-    assert!(bucket.is_empty(), "both torn frames must drop from the bucket");
+    assert!(
+        bucket.is_empty(),
+        "both torn frames must drop from the bucket"
+    );
 }
 
 /// CRC-failed SYS_RDY MUST NOT fire the boot-complete eventfd, and
@@ -542,7 +553,10 @@ fn sys_rdy_and_sched_exit_fire_independently() {
     assert_eq!(out.counter, 1, "SYS_RDY must promote");
     assert!(!out.handle_remaining, "SYS_RDY handle must be consumed");
     assert!(out.kill, "SCHED_EXIT must promote kill");
-    assert_eq!(out.kill_evt_counter, 1, "SCHED_EXIT must write kill eventfd");
+    assert_eq!(
+        out.kill_evt_counter, 1,
+        "SCHED_EXIT must write kill eventfd"
+    );
 }
 
 /// Post-dispatch SYS_RDY observations: the boot-complete eventfd

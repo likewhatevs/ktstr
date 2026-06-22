@@ -675,4 +675,3 @@ fn render_value_without_mem_uses_u32_max_cap() {
         other => panic!("expected CpuList, got {other:?}"),
     }
 }
-

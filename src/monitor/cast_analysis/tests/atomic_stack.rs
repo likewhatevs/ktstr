@@ -932,4 +932,3 @@ fn st_imm_invalidates_stack_slot() {
         "BPF_ST imm to stack slot must invalidate, reload Unknown: {map:?}"
     );
 }
-

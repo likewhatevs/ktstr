@@ -952,4 +952,3 @@ fn nonu64_field_at_source_offset_not_tracked() {
         "u32-typed field must not seed cast: {map:?}"
     );
 }
-

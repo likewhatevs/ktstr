@@ -701,13 +701,13 @@ fn ld_imm64(dst: u8, imm: i32) -> [BpfInsn; 2] {
     [lo, hi]
 }
 
-mod cast_tracking;
-mod kptr_addrspace;
 mod atomic_stack;
-mod conflict_oob_finalize;
-mod btf_stack_kfunc_edge;
-mod register_alu_cast_misc;
 mod bss_jumps_funcentry;
+mod btf_stack_kfunc_edge;
+mod cast_tracking;
+mod conflict_oob_finalize;
+mod helper_map_crossfn;
+mod kptr_addrspace;
+mod register_alu_cast_misc;
 mod stress;
 mod stx_flow;
-mod helper_map_crossfn;

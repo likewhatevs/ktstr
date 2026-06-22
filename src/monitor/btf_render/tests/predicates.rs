@@ -554,4 +554,3 @@ fn display_ptr_with_skip_reason_surfaces_inline() {
         "skip reason render must NOT emit arrow (no actual deref): {out}"
     );
 }
-

@@ -138,8 +138,7 @@ pub(crate) fn try_flush_profraw() {
         // (guest `/init`, post-dispatch).
         unsafe extern "C" {
             fn __llvm_profile_get_size_for_buffer() -> u64;
-            fn __llvm_profile_write_buffer(buf: *mut std::os::raw::c_char)
-            -> std::os::raw::c_int;
+            fn __llvm_profile_write_buffer(buf: *mut std::os::raw::c_char) -> std::os::raw::c_int;
         }
 
         let needed = unsafe { __llvm_profile_get_size_for_buffer() } as usize;

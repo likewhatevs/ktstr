@@ -822,4 +822,3 @@ fn cast_chase_arena_hint_with_non_arena_value_falls_through_to_kernel_arm() {
         "runtime kernel dispatch must produce cast→kernel annotation"
     );
 }
-

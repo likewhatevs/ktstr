@@ -757,4 +757,3 @@ fn cast_annotation_for_all_four_cells() {
         "(Kernel, true) annotation drift",
     );
 }
-

@@ -1825,4 +1825,3 @@ fn cast_chase_kernel_cross_btf_fwd_resolve_succeeds() {
          decoded against the sibling BTF",
     );
 }
-

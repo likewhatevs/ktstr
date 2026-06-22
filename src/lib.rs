@@ -569,11 +569,11 @@ pub mod remote_cache {
 
     pub fn remote_store(_entry: &CacheEntry, _cli_label: &str) {}
 }
+pub mod gauntlet;
 pub(crate) mod sync;
 #[cfg(any(feature = "export", feature = "remote-cache"))]
 pub(crate) mod tar_util;
 pub mod verifier;
-pub mod gauntlet;
 pub(crate) mod vmm;
 pub mod worker_ready;
 

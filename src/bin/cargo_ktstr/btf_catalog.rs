@@ -526,10 +526,22 @@ mod tests {
         let btf_payload: Vec<u8> = (0u8..40).collect(); // size 40 >= 24
         let img = build_elf(
             &[
-                Sect { name: "", payload: vec![] }, // SHN_UNDEF placeholder
-                Sect { name: ".text", payload: vec![0xab; 8] },
-                Sect { name: ".BTF", payload: btf_payload.clone() },
-                Sect { name: ".shstrtab", payload: vec![] },
+                Sect {
+                    name: "",
+                    payload: vec![],
+                }, // SHN_UNDEF placeholder
+                Sect {
+                    name: ".text",
+                    payload: vec![0xab; 8],
+                },
+                Sect {
+                    name: ".BTF",
+                    payload: btf_payload.clone(),
+                },
+                Sect {
+                    name: ".shstrtab",
+                    payload: vec![],
+                },
             ],
             3,
         );
@@ -549,9 +561,18 @@ mod tests {
     fn find_btf_section_raw_absent_section_is_none() {
         let img = build_elf(
             &[
-                Sect { name: "", payload: vec![] },
-                Sect { name: ".data", payload: vec![1, 2, 3] },
-                Sect { name: ".shstrtab", payload: vec![] },
+                Sect {
+                    name: "",
+                    payload: vec![],
+                },
+                Sect {
+                    name: ".data",
+                    payload: vec![1, 2, 3],
+                },
+                Sect {
+                    name: ".shstrtab",
+                    payload: vec![],
+                },
             ],
             2,
         );
@@ -565,9 +586,18 @@ mod tests {
         let payload: Vec<u8> = (0u8..40).collect();
         let img = build_elf(
             &[
-                Sect { name: "", payload: vec![] },
-                Sect { name: ".BTF.ext", payload },
-                Sect { name: ".shstrtab", payload: vec![] },
+                Sect {
+                    name: "",
+                    payload: vec![],
+                },
+                Sect {
+                    name: ".BTF.ext",
+                    payload,
+                },
+                Sect {
+                    name: ".shstrtab",
+                    payload: vec![],
+                },
             ],
             2,
         );
@@ -580,9 +610,18 @@ mod tests {
     fn find_btf_section_raw_rejects_undersized_btf() {
         let img = build_elf(
             &[
-                Sect { name: "", payload: vec![] },
-                Sect { name: ".BTF", payload: vec![0u8; 23] }, // 23 < 24
-                Sect { name: ".shstrtab", payload: vec![] },
+                Sect {
+                    name: "",
+                    payload: vec![],
+                },
+                Sect {
+                    name: ".BTF",
+                    payload: vec![0u8; 23],
+                }, // 23 < 24
+                Sect {
+                    name: ".shstrtab",
+                    payload: vec![],
+                },
             ],
             2,
         );
@@ -595,9 +634,18 @@ mod tests {
     fn find_btf_section_raw_rejects_shstrndx_out_of_range() {
         let mut img = build_elf(
             &[
-                Sect { name: "", payload: vec![] },
-                Sect { name: ".BTF", payload: (0u8..40).collect() },
-                Sect { name: ".shstrtab", payload: vec![] },
+                Sect {
+                    name: "",
+                    payload: vec![],
+                },
+                Sect {
+                    name: ".BTF",
+                    payload: (0u8..40).collect(),
+                },
+                Sect {
+                    name: ".shstrtab",
+                    payload: vec![],
+                },
             ],
             2,
         );
@@ -611,9 +659,18 @@ mod tests {
     fn find_btf_section_raw_rejects_small_shentsize() {
         let mut img = build_elf(
             &[
-                Sect { name: "", payload: vec![] },
-                Sect { name: ".BTF", payload: (0u8..40).collect() },
-                Sect { name: ".shstrtab", payload: vec![] },
+                Sect {
+                    name: "",
+                    payload: vec![],
+                },
+                Sect {
+                    name: ".BTF",
+                    payload: (0u8..40).collect(),
+                },
+                Sect {
+                    name: ".shstrtab",
+                    payload: vec![],
+                },
             ],
             2,
         );
@@ -629,18 +686,24 @@ mod tests {
         let btf = btf_blob(24, 0, b"\0/abs/sched.bpf.c\0task_struct\0");
         let img = build_elf(
             &[
-                Sect { name: "", payload: vec![] },
-                Sect { name: ".BTF", payload: btf.clone() },
-                Sect { name: ".shstrtab", payload: vec![] },
+                Sect {
+                    name: "",
+                    payload: vec![],
+                },
+                Sect {
+                    name: ".BTF",
+                    payload: btf.clone(),
+                },
+                Sect {
+                    name: ".shstrtab",
+                    payload: vec![],
+                },
             ],
             2,
         );
         let raw = find_btf_section_raw(&img).expect(".BTF present");
         assert_eq!(raw, btf.as_slice());
-        assert_eq!(
-            btf_strings(raw),
-            vec!["/abs/sched.bpf.c", "task_struct"],
-        );
+        assert_eq!(btf_strings(raw), vec!["/abs/sched.bpf.c", "task_struct"],);
     }
 
     // ======================= is_system_header ===========================
@@ -730,11 +793,7 @@ mod tests {
     fn collect_structs_recurses_into_nested_definitions() {
         let dir = tempfile::tempdir().expect("tempdir");
         let file = dir.path().join("nested.h");
-        std::fs::write(
-            &file,
-            "struct outer { struct inner { int a; } i; int b; };",
-        )
-        .unwrap();
+        std::fs::write(&file, "struct outer { struct inner { int a; } i; int b; };").unwrap();
         let got = extract_struct_names(&[file]);
         let names: Vec<&str> = got.iter().map(String::as_str).collect();
         assert_eq!(names, vec!["inner", "outer"]);

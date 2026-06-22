@@ -34,8 +34,8 @@ use super::state::SnapshotRequest;
 use crate::vmm::bulk::HostAssembler;
 use crate::vmm::wire::{
     FRAME_HEADER_SIZE, MSG_TYPE_SCHED_EXIT, MSG_TYPE_SNAPSHOT_REPLY, MSG_TYPE_SNAPSHOT_REQUEST,
-    MSG_TYPE_STIMULUS, MSG_TYPE_SYS_RDY, MsgType, SNAPSHOT_KIND_CAPTURE, SNAPSHOT_TAG_MAX, ShmEntry,
-    ShmMessage, SnapshotRequestPayload,
+    MSG_TYPE_STIMULUS, MSG_TYPE_SYS_RDY, MsgType, SNAPSHOT_KIND_CAPTURE, SNAPSHOT_TAG_MAX,
+    ShmEntry, ShmMessage, SnapshotRequestPayload,
 };
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};

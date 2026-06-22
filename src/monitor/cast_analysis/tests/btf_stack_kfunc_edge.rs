@@ -1034,4 +1034,3 @@ fn kfunc_call_with_funcproto_id_directly() {
              type: {map:?}"
     );
 }
-
