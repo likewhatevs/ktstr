@@ -4554,4 +4554,395 @@ mod tests {
              positioning (ExpectAutoReproSatisfied alone would return EXIT_PASS)"
         );
     }
+
+    // -- result_to_exit_code: ResourceContention + TopologyInsufficient
+    // skip/no-skip arms --
+    //
+    // Both typed errors route through the skip arms (lines 1139-1179):
+    // with KTSTR_NO_SKIP_MODE unset they map to EXIT_PASS (the test
+    // never ran — `crate::report::test_skip` is a bare eprintln!, no VM
+    // needed); with KTSTR_NO_SKIP_MODE set they hard-FAIL (EXIT_FAIL).
+    // The skip arms sit ABOVE the `Err(e) if expect_err` arm, so even
+    // under expect_err=true a contention/insufficient error still skips
+    // rather than being inverted. NOTE: the 3rd `result_to_exit_code`
+    // param is `allow_inconclusive`, NOT no_skip — no_skip is read from
+    // KTSTR_NO_SKIP_MODE_ENV inside the fn (dispatch.rs:1017), so the
+    // FAIL branch is reached ONLY by setting that env var.
+
+    /// `ResourceContention` (direct and `.context`-wrapped) routes to
+    /// EXIT_PASS when KTSTR_NO_SKIP_MODE is unset — including under
+    /// expect_err=true, because the skip arm precedes the expect_err
+    /// arm. The wrapped case exercises the `chain().find_map(...)`
+    /// reason extraction + the `is_resource_contention` chain walk
+    /// through the eval-layer "build/run ktstr_test VM" wrappers.
+    #[test]
+    fn result_to_exit_code_resource_contention_skips_when_not_no_skip() {
+        use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
+        use anyhow::Context as _;
+        let _env_lock = lock_env();
+        let _no_skip = EnvVarGuard::remove(crate::KTSTR_NO_SKIP_MODE_ENV);
+
+        let direct = || -> Result<crate::assert::AssertResult> {
+            Err(anyhow::Error::new(
+                crate::vmm::host_topology::ResourceContention {
+                    reason: "no 4 consecutive CPUs available".into(),
+                },
+            ))
+        };
+        assert_eq!(result_to_exit_code(direct(), false, false), EXIT_PASS);
+        // Skip arm precedes the expect_err arm: still EXIT_PASS.
+        assert_eq!(result_to_exit_code(direct(), true, false), EXIT_PASS);
+
+        // Context-wrapped (production shape) still recognised via the
+        // chain walk → EXIT_PASS.
+        let wrapped = || -> Result<crate::assert::AssertResult> {
+            Err(anyhow::Error::new(
+                crate::vmm::host_topology::ResourceContention {
+                    reason: "no 4 consecutive CPUs available".into(),
+                },
+            ))
+            .context("build ktstr_test VM")
+            .context("run ktstr_test VM")
+        };
+        assert_eq!(result_to_exit_code(wrapped(), false, false), EXIT_PASS);
+    }
+
+    /// `TopologyInsufficient` (direct and `.context`-wrapped) routes to
+    /// EXIT_PASS when KTSTR_NO_SKIP_MODE is unset — including under
+    /// expect_err=true. Mirror of the ResourceContention skip test;
+    /// pins the second skip arm (dispatch.rs:1160-1179).
+    #[test]
+    fn result_to_exit_code_topology_insufficient_skips_when_not_no_skip() {
+        use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
+        use anyhow::Context as _;
+        let _env_lock = lock_env();
+        let _no_skip = EnvVarGuard::remove(crate::KTSTR_NO_SKIP_MODE_ENV);
+
+        let direct = || -> Result<crate::assert::AssertResult> {
+            Err(anyhow::Error::new(
+                crate::vmm::host_topology::TopologyInsufficient {
+                    reason: "host has too few CPUs".into(),
+                },
+            ))
+        };
+        assert_eq!(result_to_exit_code(direct(), false, false), EXIT_PASS);
+        assert_eq!(result_to_exit_code(direct(), true, false), EXIT_PASS);
+
+        let wrapped = || -> Result<crate::assert::AssertResult> {
+            Err(anyhow::Error::new(
+                crate::vmm::host_topology::TopologyInsufficient {
+                    reason: "host has too few CPUs".into(),
+                },
+            ))
+            .context("build ktstr_test VM")
+            .context("run ktstr_test VM")
+        };
+        assert_eq!(result_to_exit_code(wrapped(), false, false), EXIT_PASS);
+    }
+
+    /// Under KTSTR_NO_SKIP_MODE, both skip-class errors hard-FAIL
+    /// (EXIT_FAIL) instead of skipping, and the stderr banner names
+    /// the contention/insufficiency reason. Pins the no_skip branches
+    /// (dispatch.rs:1147-1154 / 1168-1174) and the reason extraction.
+    #[test]
+    fn result_to_exit_code_skip_class_fails_under_no_skip_mode() {
+        use crate::test_support::test_helpers::{EnvVarGuard, capture_stderr, lock_env};
+        let _env_lock = lock_env();
+        let _no_skip = EnvVarGuard::set(crate::KTSTR_NO_SKIP_MODE_ENV, "1");
+
+        let rc = || -> Result<crate::assert::AssertResult> {
+            Err(anyhow::Error::new(
+                crate::vmm::host_topology::ResourceContention {
+                    reason: "no 4 consecutive CPUs available".into(),
+                },
+            ))
+        };
+        let (code, captured) = capture_stderr(|| result_to_exit_code(rc(), false, false));
+        assert_eq!(code, EXIT_FAIL);
+        let stderr = String::from_utf8(captured).expect("stderr is utf-8");
+        assert!(
+            stderr.contains("resource contention under --no-skip-mode")
+                && stderr.contains("no 4 consecutive CPUs available"),
+            "no-skip RC banner must name the cause + reason; got: {stderr}",
+        );
+
+        let ti = || -> Result<crate::assert::AssertResult> {
+            Err(anyhow::Error::new(
+                crate::vmm::host_topology::TopologyInsufficient {
+                    reason: "host has too few CPUs".into(),
+                },
+            ))
+        };
+        let (code, captured) = capture_stderr(|| result_to_exit_code(ti(), false, false));
+        assert_eq!(code, EXIT_FAIL);
+        let stderr = String::from_utf8(captured).expect("stderr is utf-8");
+        assert!(
+            stderr.contains("host topology insufficient under --no-skip-mode")
+                && stderr.contains("host has too few CPUs"),
+            "no-skip TI banner must name the cause + reason; got: {stderr}",
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // analyze_sidecars — host-side sidecar collection + render
+    // ---------------------------------------------------------------
+
+    /// An empty / sidecar-free directory short-circuits to the empty
+    /// string. `collect_sidecars` on a directory with no
+    /// `*.ktstr.json` files yields an empty Vec (the read_dir is Ok
+    /// but the iterator yields nothing for an existing empty dir, so
+    /// `sidecars.is_empty()` is true), exercising the
+    /// `sidecars.is_empty() -> String::new()` branch at
+    /// dispatch.rs:2465 — pinned via exact-empty equality, not just
+    /// `.is_empty()`.
+    #[test]
+    fn analyze_sidecars_empty_dir_returns_empty_string() {
+        let d = tempfile::tempdir().expect("create tempdir");
+        assert_eq!(analyze_sidecars(Some(d.path())), "");
+    }
+
+    /// One synthetic `*.ktstr.json` sidecar (the canonical
+    /// `SidecarResult::test_fixture`, whose verifier_stats=[],
+    /// monitor=None, kvm_stats=None) renders EXACTLY
+    /// `analyze_rows(&[sidecar_to_row(loaded)])` — the verifier /
+    /// callback / kvm sub-sections all collapse to empty so the
+    /// concatenation reduces to the rows render alone. Pins the
+    /// collect → row → analyze_rows path plus the four-section
+    /// concatenation order (only the rows section emits here).
+    #[test]
+    fn analyze_sidecars_single_fixture_renders_rows_only() {
+        use crate::test_support::SidecarResult;
+        let d = tempfile::tempdir().expect("create tempdir");
+        let fixture = SidecarResult::test_fixture();
+        let json = serde_json::to_string(&fixture).expect("fixture serializes");
+        // Filename must satisfy is_sidecar_filename: `*.ktstr.json`
+        // with `.ktstr.` in the file-name component.
+        std::fs::write(d.path().join("t-0001.ktstr.json"), json).expect("write sidecar");
+
+        let out = analyze_sidecars(Some(d.path()));
+        assert!(!out.is_empty(), "one valid sidecar must render non-empty");
+
+        // Exact equality against the rows-only render computed from
+        // the SAME deserialized value collect_sidecars produces. The
+        // verifier/callback/kvm formatters return empty for the
+        // fixture, so analyze_sidecars == analyze_rows(&[row]).
+        let collected = crate::test_support::collect_sidecars(d.path());
+        assert_eq!(collected.len(), 1, "exactly one sidecar must be collected");
+        let row = crate::stats::sidecar_to_row(&collected[0]);
+        assert_eq!(
+            out,
+            crate::stats::analyze_rows(std::slice::from_ref(&row)),
+            "analyze_sidecars must equal analyze_rows of the single row \
+             (verifier/callback/kvm sections empty for the fixture)",
+        );
+
+        // Pin a concrete fixture-derived substring (the scenario name
+        // "t" rendered in the `By scenario` pane) and the section
+        // headers, so a regression that dropped the rows render or
+        // emitted a spurious verifier/callback/kvm section surfaces.
+        assert!(
+            out.contains("=== GAUNTLET ANALYSIS ==="),
+            "missing rows-section header; got: {out}",
+        );
+        assert!(
+            out.contains("By scenario (worst first):"),
+            "missing scenario pane; got: {out}",
+        );
+        assert!(
+            !out.contains("=== BPF VERIFIER STATS ===")
+                && !out.contains("=== BPF CALLBACK PROFILE ===")
+                && !out.contains("=== KVM STATS"),
+            "fixture has no verifier/callback/kvm data — those sections must NOT \
+             appear; got: {out}",
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // run_verifier_cell — pure name-parse error branches
+    // ---------------------------------------------------------------
+    //
+    // The two early guards (missing `verifier/` prefix, <3-part cell
+    // name) run BEFORE the cell banner, check_kvm(), and any scheduler
+    // / kernel resolution (dispatch.rs:1755-1768), so they are
+    // host-reachable with no KVM, no scheduler binary, no kernel. A
+    // syntactically-valid 3-part name would fall through to
+    // check_kvm() and is intentionally NOT tested here.
+
+    /// A name lacking the `verifier/` prefix exits 1 with the
+    /// missing-prefix diagnostic. Pins the strip_prefix None arm.
+    #[test]
+    fn run_verifier_cell_missing_prefix_exits_one() {
+        use crate::test_support::test_helpers::capture_stderr;
+        let (code, captured) = capture_stderr(|| run_verifier_cell("no_verifier_prefix"));
+        assert_eq!(code, 1);
+        let stderr = String::from_utf8(captured).expect("stderr is utf-8");
+        assert!(
+            stderr.contains("missing 'verifier/' prefix"),
+            "missing-prefix diagnostic must name the cause; got: {stderr}",
+        );
+    }
+
+    /// A name with the prefix but fewer than 3 slash-separated
+    /// segments after it (splitn(3) on `only_two` yields 1 part)
+    /// exits 1 with the malformed-cell diagnostic naming the
+    /// expected shape. Pins the parts.len() != 3 arm.
+    #[test]
+    fn run_verifier_cell_too_few_parts_exits_one() {
+        use crate::test_support::test_helpers::capture_stderr;
+        let (code, captured) = capture_stderr(|| run_verifier_cell("verifier/only_two"));
+        assert_eq!(code, 1);
+        let stderr = String::from_utf8(captured).expect("stderr is utf-8");
+        assert!(
+            stderr.contains("malformed cell name")
+                && stderr.contains("expected verifier/<sched>/<kernel>/<preset>"),
+            "malformed-cell diagnostic must name the expected shape; got: {stderr}",
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // AsRef<str> for SanitizedKernelLabel
+    // ---------------------------------------------------------------
+
+    /// The `AsRef<str>` impl exposes the SANITIZED inner string, not
+    /// the raw input. Mirror of `sanitized_kernel_label_as_str_returns_sanitized_form`
+    /// but routed through the trait so the impl (dispatch.rs:216-219)
+    /// is load-bearing rather than dead.
+    #[test]
+    fn sanitized_kernel_label_as_ref_returns_sanitized_form() {
+        let label = SanitizedKernelLabel::new("6.14.2");
+        // Disambiguate from the inherent `as_str()` by naming the trait.
+        assert_eq!(
+            <SanitizedKernelLabel as AsRef<str>>::as_ref(&label),
+            "kernel_6_14_2",
+        );
+        // The raw input contained `.` which sanitizes to `_`, so the
+        // AsRef view must NOT equal the raw input.
+        let via_as_ref: &str = label.as_ref();
+        assert_ne!(via_as_ref, "6.14.2");
+    }
+
+    // ---------------------------------------------------------------
+    // run_ktstr_test — entry.validate()? bail (pure host check)
+    // ---------------------------------------------------------------
+
+    /// `run_ktstr_test` calls `entry.validate()?` as its first
+    /// statement (dispatch.rs:930), so an entry that violates a
+    /// validate invariant returns Err BEFORE any VM / KVM work
+    /// (932-941). A non-empty name plus `cpu_budget=Some(0)` reaches
+    /// the cpu_budget-zero bail: the empty-name check fires FIRST
+    /// (entry.rs:1781), so the name MUST be set for this fixture to
+    /// reach the intended message. Pinning the exact bail string
+    /// proves the failure came from validate() and not a downstream
+    /// VM error.
+    #[test]
+    fn run_ktstr_test_validate_rejects_zero_cpu_budget() {
+        let invalid = KtstrTestEntry {
+            name: "__unit_test_run_ktstr_test_validate__",
+            cpu_budget: Some(0),
+            ..KtstrTestEntry::DEFAULT
+        };
+        let err = run_ktstr_test(&invalid).expect_err("validate must reject cpu_budget=Some(0)");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("cpu_budget=Some(0)")
+                && rendered.contains("zero host-CPU"),
+            "bail must be the cpu_budget-zero validate message (proving the failure \
+             came from entry.validate()? before any VM work); got: {rendered}",
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // run_named_test — performance_mode / KTSTR_PERF_ONLY skip gates
+    // ---------------------------------------------------------------
+    //
+    // These exercise the cleanly host-only skip branches in
+    // run_named_test (dispatch.rs:2170-2188): a performance_mode test
+    // under --no-perf-mode, and a non-performance_mode test under
+    // KTSTR_PERF_ONLY. Both call `crate::report::test_skip` (a bare
+    // eprintln!) and `record_skip_sidecar`, then return 0 with no VM.
+    // The `__unit_test_*__` fixture names are excluded from full-run
+    // listing (is_test_sentinel), so registering them does not add VM
+    // boots to a real run; they are reachable here only via the direct
+    // run_named_test call. KTSTR_SIDECAR_DIR is redirected to a
+    // tempdir so record_skip_sidecar does not pollute the shared run
+    // dir.
+
+    /// Stub func for the perf-skip listing fixtures. Never invoked on
+    /// the skip path (the skip returns before reaching `func`), but
+    /// must be a harmless pass for the same dispatcher-reachability
+    /// reason as `host_only_listing_stub`.
+    fn perf_skip_listing_stub(
+        _ctx: &crate::scenario::Ctx,
+    ) -> anyhow::Result<crate::assert::AssertResult> {
+        Ok(crate::assert::AssertResult::pass())
+    }
+
+    const PERF_MODE_SKIP_NAME: &str = "__unit_test_perf_mode_skip__";
+    const PERF_ONLY_SKIP_NAME: &str = "__unit_test_perf_only_skip__";
+
+    #[linkme::distributed_slice(KTSTR_TESTS)]
+    static __PERF_MODE_SKIP_ENTRY: KtstrTestEntry = KtstrTestEntry {
+        name: PERF_MODE_SKIP_NAME,
+        func: perf_skip_listing_stub,
+        performance_mode: true,
+        ..KtstrTestEntry::DEFAULT
+    };
+
+    #[linkme::distributed_slice(KTSTR_TESTS)]
+    static __PERF_ONLY_SKIP_ENTRY: KtstrTestEntry = KtstrTestEntry {
+        name: PERF_ONLY_SKIP_NAME,
+        func: perf_skip_listing_stub,
+        ..KtstrTestEntry::DEFAULT
+    };
+
+    /// A `performance_mode` test under KTSTR_NO_PERF_MODE skips:
+    /// exit 0 + the canonical perf-mode skip banner. KTSTR_PERF_ONLY
+    /// is removed so it cannot pre-empt this branch, and
+    /// KTSTR_KERNEL_LIST is removed so strip_kernel_suffix is a
+    /// passthrough. Pins dispatch.rs:2170-2178.
+    #[test]
+    fn run_named_test_perf_mode_test_skips_under_no_perf_mode() {
+        use crate::test_support::test_helpers::{EnvVarGuard, capture_stderr, lock_env};
+        let _env_lock = lock_env();
+        let _no_perf = EnvVarGuard::set(crate::KTSTR_NO_PERF_MODE_ENV, "1");
+        let _perf_only = EnvVarGuard::remove(crate::KTSTR_PERF_ONLY_ENV);
+        let _kernel_list = EnvVarGuard::remove(crate::KTSTR_KERNEL_LIST_ENV);
+        let sidecar_dir = tempfile::tempdir().expect("create sidecar tempdir");
+        let _sidecar = EnvVarGuard::set(crate::KTSTR_SIDECAR_DIR_ENV, sidecar_dir.path());
+
+        let (code, captured) =
+            capture_stderr(|| run_named_test(&format!("ktstr/{PERF_MODE_SKIP_NAME}")));
+        assert_eq!(code, 0, "perf_mode test under --no-perf-mode must skip → exit 0");
+        let stderr = String::from_utf8(captured).expect("stderr is utf-8");
+        assert!(
+            stderr.contains("requires performance_mode but --no-perf-mode"),
+            "perf-mode skip banner must explain the gate; got: {stderr}",
+        );
+    }
+
+    /// A non-`performance_mode` test under KTSTR_PERF_ONLY skips:
+    /// exit 0 + the perf-only skip banner. KTSTR_NO_PERF_MODE is
+    /// removed so the perf_mode branch above does not interfere (it
+    /// is `false && ...` anyway for this fixture), and
+    /// KTSTR_KERNEL_LIST is removed for the passthrough. Pins
+    /// dispatch.rs:2180-2188.
+    #[test]
+    fn run_named_test_non_perf_test_skips_under_perf_only() {
+        use crate::test_support::test_helpers::{EnvVarGuard, capture_stderr, lock_env};
+        let _env_lock = lock_env();
+        let _perf_only = EnvVarGuard::set(crate::KTSTR_PERF_ONLY_ENV, "1");
+        let _no_perf = EnvVarGuard::remove(crate::KTSTR_NO_PERF_MODE_ENV);
+        let _kernel_list = EnvVarGuard::remove(crate::KTSTR_KERNEL_LIST_ENV);
+        let sidecar_dir = tempfile::tempdir().expect("create sidecar tempdir");
+        let _sidecar = EnvVarGuard::set(crate::KTSTR_SIDECAR_DIR_ENV, sidecar_dir.path());
+
+        let (code, captured) =
+            capture_stderr(|| run_named_test(&format!("ktstr/{PERF_ONLY_SKIP_NAME}")));
+        assert_eq!(code, 0, "non-perf test under KTSTR_PERF_ONLY must skip → exit 0");
+        let stderr = String::from_utf8(captured).expect("stderr is utf-8");
+        assert!(
+            stderr.contains("KTSTR_PERF_ONLY is active"),
+            "perf-only skip banner must explain the gate; got: {stderr}",
+        );
+    }
 }

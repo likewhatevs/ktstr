@@ -1725,3 +1725,851 @@ fn flock_timeout_substring_classification_pins_seam() {
         "flock non-timeout error must NOT classify as flock timeout: {flock_non_timeout}",
     );
 }
+
+// -- timed-out arm: scheduler-exited reason override (mod.rs:2267-2278) --
+
+/// Timed-out run whose stderr carries an scx-disable kmsg anchor with
+/// a NON-EMPTY parenthesized body: `parse_kmsg_window` parses the
+/// anchor and the timeout reason becomes
+/// `timed out (scheduler exited: <message>)`, OVERRIDING the default
+/// `ERR_TIMED_OUT_NO_RESULT`. Pins the
+/// `if let Some(ev) = scx_exits.last()` non-empty-message sub-arm at
+/// mod.rs:2273. The `--- watchdog ---` block still renders.
+#[test]
+fn eval_timeout_sched_exited_reason_override() {
+    let _lock = lock_env();
+    let _env_bt = EnvVarGuard::set("RUST_BACKTRACE", "1");
+    let entry = sched_entry("__eval_timeout_sched_exited__");
+    // Single anchor line, body "(runnable task stall)" -> message
+    // "runnable task stall" (trimmed inside the parens by
+    // parse_kmsg_window). No follow-on lines append to the message.
+    let stderr = "[1.0] sched_ext: BPF scheduler \"scx_test\" disabled (runnable task stall)\n";
+    let result = make_vm_result("", stderr, -1, true);
+    let assertions = crate::assert::Assert::NO_OVERRIDES;
+    let err = evaluate_vm_result(
+        &entry,
+        &result,
+        &assertions,
+        &[],
+        &[],
+        &[],
+        &EVAL_TOPO,
+        &no_repro,
+        None,
+    )
+    .unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("timed out (scheduler exited: runnable task stall)"),
+        "non-empty scx-exit message must override the default timeout reason, got: {msg}",
+    );
+    assert!(
+        !msg.contains(ERR_TIMED_OUT_NO_RESULT),
+        "the override must replace the default ERR_TIMED_OUT_NO_RESULT body, got: {msg}",
+    );
+    assert!(
+        msg.contains("--- watchdog ---"),
+        "watchdog diagnostic block must render on the timed-out arm, got: {msg}",
+    );
+}
+
+/// Timed-out run whose scx-disable anchor has an EMPTY parenthesized
+/// body `()`: `parse_kmsg_window` yields an event with an empty
+/// `message`, so the timeout reason takes the empty-message sub-arm at
+/// mod.rs:2270-2271 — `timed out (scheduler <name> exited)` formatted
+/// from `ev.scheduler_name` (parsed as `scx_test` from the anchor).
+#[test]
+fn eval_timeout_sched_exited_empty_message() {
+    let _lock = lock_env();
+    let _env_bt = EnvVarGuard::set("RUST_BACKTRACE", "1");
+    let entry = sched_entry("__eval_timeout_sched_exited_empty__");
+    // Parenthesized body empty -> message_body trims to "" and no
+    // follow-on line appends, so ev.message.is_empty() is true.
+    let stderr = "[1.0] sched_ext: BPF scheduler \"scx_test\" disabled ()\n";
+    let result = make_vm_result("", stderr, -1, true);
+    let assertions = crate::assert::Assert::NO_OVERRIDES;
+    let err = evaluate_vm_result(
+        &entry,
+        &result,
+        &assertions,
+        &[],
+        &[],
+        &[],
+        &EVAL_TOPO,
+        &no_repro,
+        None,
+    )
+    .unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("timed out (scheduler scx_test exited)"),
+        "empty scx-exit message must render the scheduler-name-only form, got: {msg}",
+    );
+    assert!(
+        !msg.contains(ERR_TIMED_OUT_NO_RESULT),
+        "the override must replace the default ERR_TIMED_OUT_NO_RESULT body, got: {msg}",
+    );
+    assert!(
+        msg.contains("--- watchdog ---"),
+        "watchdog diagnostic block must render, got: {msg}",
+    );
+}
+
+// -- timed-out arm: crash_section dual-fire (mod.rs:2230-2234) --
+
+/// Timed-out run that ALSO carries a structured `crash_message`: both
+/// the timeout reason AND the guest crash backtrace render. The
+/// `crash_section` true-branch (mod.rs:2231) fires only when
+/// `timed_out && crash_message.is_some()`. Timeout stays the primary
+/// classification (the host watchdog halted the run); the crash
+/// backtrace appends after it, so the ordering
+/// `ERR_TIMED_OUT_NO_RESULT` before the backtrace frame holds.
+#[test]
+fn eval_timeout_with_crash_renders_both() {
+    let entry = eevdf_entry("__eval_timeout_with_crash__");
+    let mut result = make_vm_result("", "booting...", 0, true);
+    result.crash_message = Some("PANIC: panicked at src/x.rs:7: boom\n   0: frame_one".to_string());
+    let assertions = crate::assert::Assert::NO_OVERRIDES;
+    let err = evaluate_vm_result(
+        &entry,
+        &result,
+        &assertions,
+        &[],
+        &[],
+        &[],
+        &EVAL_TOPO,
+        &no_repro,
+        None,
+    )
+    .unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains(ERR_TIMED_OUT_NO_RESULT),
+        "timeout stays the primary classification, got: {msg}",
+    );
+    assert!(
+        msg.contains(ERR_GUEST_CRASHED_PREFIX),
+        "the crash section must render its `guest crashed:` prefix, got: {msg}",
+    );
+    assert!(
+        msg.contains("frame_one"),
+        "the crash backtrace must append, not be dropped, got: {msg}",
+    );
+    let timeout_pos = msg.find(ERR_TIMED_OUT_NO_RESULT).unwrap();
+    let crash_pos = msg.find("frame_one").unwrap();
+    assert!(
+        timeout_pos < crash_pos,
+        "timeout reason must precede the appended crash section, got: {msg}",
+    );
+}
+
+// -- no-result arm: scheduler-exited reason from kmsg (mod.rs:2304-2310) --
+
+/// No parseable result, active scheduler, stderr carrying a NON-EMPTY
+/// scx-disable anchor body: the reason ladder at mod.rs:2304-2310 takes
+/// the `if let Some(ev) = scx_exits.last()` non-empty sub-arm (2309) and
+/// renders `scheduler exited: <message>`, overriding the
+/// `ERR_NO_TEST_RESULT_FROM_GUEST` fallback. crash_message is None and
+/// output is empty so the earlier crash/panic rungs are not taken.
+#[test]
+fn eval_noresult_sched_exited_from_kmsg() {
+    let entry = sched_entry("__eval_noresult_sched_exited__");
+    let stderr = "[1.0] sched_ext: BPF scheduler \"scx_test\" disabled (BPF runtime error)\n";
+    let result = make_vm_result("", stderr, 1, false);
+    let assertions = crate::assert::Assert::NO_OVERRIDES;
+    let err = evaluate_vm_result(
+        &entry,
+        &result,
+        &assertions,
+        &[],
+        &[],
+        &[],
+        &EVAL_TOPO,
+        &no_repro,
+        None,
+    )
+    .unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("scheduler exited: BPF runtime error"),
+        "non-empty kmsg message must drive the no-result reason, got: {msg}",
+    );
+    assert!(
+        !msg.contains(ERR_NO_TEST_RESULT_FROM_GUEST),
+        "the kmsg override must replace the default no-result fallback, got: {msg}",
+    );
+}
+
+/// No parseable result, active scheduler, scx-disable anchor with an
+/// EMPTY parenthesized body: the reason takes the empty-message sub-arm
+/// at mod.rs:2306-2307 and renders `scheduler exited (<name>)` from
+/// `ev.scheduler_name` (parsed `scx_test`).
+#[test]
+fn eval_noresult_sched_exited_empty_message() {
+    let entry = sched_entry("__eval_noresult_sched_exited_empty__");
+    let stderr = "[1.0] sched_ext: BPF scheduler \"scx_test\" disabled ()\n";
+    let result = make_vm_result("", stderr, 1, false);
+    let assertions = crate::assert::Assert::NO_OVERRIDES;
+    let err = evaluate_vm_result(
+        &entry,
+        &result,
+        &assertions,
+        &[],
+        &[],
+        &[],
+        &EVAL_TOPO,
+        &no_repro,
+        None,
+    )
+    .unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("scheduler exited (scx_test)"),
+        "empty kmsg message must render the scheduler-name-only form, got: {msg}",
+    );
+    assert!(
+        !msg.contains(ERR_NO_TEST_RESULT_FROM_GUEST),
+        "the kmsg override must replace the default no-result fallback, got: {msg}",
+    );
+}
+
+// -- no-result arm: extract_exit_from_dump_trace fallback (mod.rs:2311-2312) --
+
+/// No parseable result, active scheduler, stderr that has NO
+/// `sched_ext: BPF scheduler "` kmsg anchor (so `parse_kmsg_window` is
+/// empty) BUT carries a `sched_ext_dump:` trace with a
+/// `triggered exit kind` anchor plus a same-CPU body line: the reason
+/// ladder falls through to the `extract_exit_from_dump_trace` rung at
+/// mod.rs:2311-2312 and renders `scheduler exited: <reason>` with the
+/// exact body the parser surfaces. Canonical input shape mirrors
+/// `output.rs::extract_exit_from_dump_trace_canonical`.
+#[test]
+fn eval_noresult_exit_from_dump_trace_fallback() {
+    let entry = sched_entry("__eval_noresult_dumptrace__");
+    // trace_pipe shape: anchor line + same-CPU body line, both carrying
+    // the `sched_ext_dump:` prefix; NO kmsg disable anchor. The body
+    // after `sched_ext_dump:` trims to "apply_cell_config returned -EINVAL".
+    let stderr = "\
+ktstr-1 [001] 0.500: sched_ext_dump: scheduler[1] triggered exit kind 5:
+ktstr-1 [001] 0.501: sched_ext_dump:   apply_cell_config returned -EINVAL
+";
+    let result = make_vm_result("", stderr, 1, false);
+    let assertions = crate::assert::Assert::NO_OVERRIDES;
+    let err = evaluate_vm_result(
+        &entry,
+        &result,
+        &assertions,
+        &[],
+        &[],
+        &[],
+        &EVAL_TOPO,
+        &no_repro,
+        None,
+    )
+    .unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("scheduler exited: apply_cell_config returned -EINVAL"),
+        "dump-trace fallback must surface the extracted exit reason, got: {msg}",
+    );
+    assert!(
+        !msg.contains(ERR_NO_TEST_RESULT_FROM_GUEST),
+        "the dump-trace rung must take precedence over the default fallback \
+         (no kmsg anchor was present), got: {msg}",
+    );
+}
+
+// -- failure-path info_notes section (mod.rs:1934-1943) --
+
+/// A FAILING guest AssertResult that ALSO carries an `info_notes`
+/// entry: the `--- info ---` section renders the note with its
+/// two-space indent, AFTER the failure-details block. Pins the
+/// `info_notes` non-empty arm (mod.rs:1934-1943) — every existing eval
+/// fixture leaves `info_notes` empty.
+#[test]
+fn eval_failure_renders_info_notes_section() {
+    let mut assert = build_assert_result(
+        false,
+        vec![AssertDetail::new(DetailKind::Stuck, "stuck 9000ms")],
+    );
+    assert.note("context: ran under cgroup cgA");
+    let entry = eevdf_entry("__eval_info_section__");
+    let result = make_vm_result_with_assert("", "", 0, false, &assert);
+    let assertions = crate::assert::Assert::NO_OVERRIDES;
+    let err = evaluate_vm_result(
+        &entry,
+        &result,
+        &assertions,
+        &[],
+        &[],
+        &[],
+        &EVAL_TOPO,
+        &no_repro,
+        None,
+    )
+    .unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("--- info ---"),
+        "info section must render when info_notes is non-empty, got: {msg}",
+    );
+    assert!(
+        msg.contains("context: ran under cgroup cgA"),
+        "the note text must render (survives the TLV postcard roundtrip), got: {msg}",
+    );
+    assert!(
+        msg.contains("stuck 9000ms"),
+        "the failure detail must still render in the details block, got: {msg}",
+    );
+    let detail_pos = msg.find("stuck 9000ms").unwrap();
+    let info_pos = msg.find("--- info ---").unwrap();
+    assert!(
+        detail_pos < info_pos,
+        "the info section must follow the failures block (details-vs-info split), got: {msg}",
+    );
+}
+
+// -- failure-path stats section + cgroup spread n/a (mod.rs:1961-1989) --
+
+/// A FAILING guest AssertResult whose `stats.cgroups` is non-empty:
+/// the `--- stats ---` block renders, exercising BOTH the
+/// `Some(spread)` and the `None` ("n/a") arms of the per-cgroup
+/// `spread.map_or_else` at mod.rs:1979-1980. The header line renders
+/// the run-level scalars; each per-cg line carries its distinct `iter=`
+/// value so the index loop is proven to run for both cgroups.
+#[test]
+fn eval_failure_renders_stats_section_with_spread_na() {
+    let mut assert = build_assert_result(
+        false,
+        vec![AssertDetail::new(DetailKind::Unfair, "spread too wide")],
+    );
+    assert.stats.total_workers = 6;
+    assert.stats.total_cpus = 4;
+    assert.stats.total_migrations = 11;
+    assert.stats.worst_spread = 12.5;
+    assert.stats.worst_gap_ms = 33;
+    assert.stats.cgroups = vec![
+        crate::assert::CgroupStats {
+            num_workers: 2,
+            num_cpus: 2,
+            spread: Some(12.5),
+            max_gap_ms: 33,
+            total_migrations: 7,
+            total_iterations: 900,
+            ..Default::default()
+        },
+        crate::assert::CgroupStats {
+            num_workers: 1,
+            num_cpus: 1,
+            spread: None,
+            max_gap_ms: 5,
+            total_migrations: 4,
+            total_iterations: 42,
+            ..Default::default()
+        },
+    ];
+    let entry = eevdf_entry("__eval_stats_section__");
+    let result = make_vm_result_with_assert("", "", 0, false, &assert);
+    let assertions = crate::assert::Assert::NO_OVERRIDES;
+    let err = evaluate_vm_result(
+        &entry,
+        &result,
+        &assertions,
+        &[],
+        &[],
+        &[],
+        &EVAL_TOPO,
+        &no_repro,
+        None,
+    )
+    .unwrap_err();
+    let msg = format!("{err}");
+    assert!(msg.contains("--- stats ---"), "stats section must render, got: {msg}");
+    assert!(
+        msg.contains("6 workers, 4 cpus, 11 migrations, worst_spread=12.5%, worst_gap=33ms"),
+        "the run-level header must render the scalars exactly, got: {msg}",
+    );
+    assert!(
+        msg.contains("spread=12.5%"),
+        "the Some(spread) arm must render the percentage, got: {msg}",
+    );
+    assert!(
+        msg.contains("spread=n/a"),
+        "the None spread arm must render `n/a`, not a fake 0%, got: {msg}",
+    );
+    assert!(
+        msg.contains("iter=900"),
+        "cgroup 0's distinct iteration count must render (loop ran), got: {msg}",
+    );
+    assert!(
+        msg.contains("iter=42"),
+        "cgroup 1's distinct iteration count must render (loop ran), got: {msg}",
+    );
+}
+
+// -- failure-path repro section on guest-fail (mod.rs:1944-1951) --
+
+/// A FAILING guest AssertResult on the active-scheduler path: the
+/// repro `.map(...)` closure (mod.rs:1949-1951) fires because
+/// `entry.scheduler.has_active_scheduling()` is true (sched_entry) AND
+/// `repro_fn` returns Some, rendering the `--- auto-repro ---` section
+/// with the payload. This is the GUEST-AssertResult-fail arm —
+/// distinct from `eval_sched_mid_test_exit_triggers_repro` which drives
+/// the no-parseable-result arm.
+#[test]
+fn eval_failure_repro_section_on_guest_fail() {
+    let assert = build_assert_result(
+        false,
+        vec![AssertDetail::new(DetailKind::Stuck, "worker 0 stuck")],
+    );
+    let entry = sched_entry("__eval_fail_repro_section__");
+    let result = make_vm_result_with_assert("", "", 0, false, &assert);
+    let assertions = crate::assert::Assert::NO_OVERRIDES;
+    let repro_fn = |_o: &str| Some("REPRO-PAYLOAD-X".to_string());
+    let err = evaluate_vm_result(
+        &entry,
+        &result,
+        &assertions,
+        &[],
+        &[],
+        &[],
+        &EVAL_TOPO,
+        &repro_fn,
+        None,
+    )
+    .unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("--- auto-repro ---"),
+        "active-scheduler guest-fail must render the auto-repro section, got: {msg}",
+    );
+    assert!(
+        msg.contains("REPRO-PAYLOAD-X"),
+        "the repro closure's payload must render in the section, got: {msg}",
+    );
+}
+
+/// Contrast control for `eval_failure_repro_section_on_guest_fail`:
+/// with `eevdf_entry` (`has_active_scheduling() == false`) the repro
+/// gate at mod.rs:1944 returns None even though `repro_fn` would have
+/// returned Some — so NO `--- auto-repro ---` section renders.
+#[test]
+fn eval_failure_no_repro_section_without_active_scheduling() {
+    let assert = build_assert_result(
+        false,
+        vec![AssertDetail::new(DetailKind::Stuck, "worker 0 stuck")],
+    );
+    let entry = eevdf_entry("__eval_fail_no_repro_section__");
+    let result = make_vm_result_with_assert("", "", 0, false, &assert);
+    let assertions = crate::assert::Assert::NO_OVERRIDES;
+    let repro_fn = |_o: &str| Some("REPRO-PAYLOAD-X".to_string());
+    let err = evaluate_vm_result(
+        &entry,
+        &result,
+        &assertions,
+        &[],
+        &[],
+        &[],
+        &EVAL_TOPO,
+        &repro_fn,
+        None,
+    )
+    .unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        !msg.contains("--- auto-repro ---"),
+        "EEVDF (no active scheduling) must NOT render the auto-repro section \
+         even when repro_fn returns Some, got: {msg}",
+    );
+}
+
+// -- inconclusive monitor verdict fold (mod.rs:2115-2131) --
+
+/// A PASSING guest AssertResult plus monitor data that is UNINITIALIZED
+/// (constant `rq_clock` across every CPU and sample): the monitor
+/// evaluator returns an INCONCLUSIVE verdict
+/// (`MonitorThresholds::evaluate`'s `!data_looks_valid` arm,
+/// monitor/mod.rs:1405-1407 -> summary "monitor data not yet
+/// initialized"). The `else if verdict.is_inconclusive()` arm at
+/// mod.rs:2115-2131 folds a `DetailKind::Monitor` Inconclusive outcome
+/// into `check_result` instead of bailing, so `evaluate` returns Ok and
+/// the merged verdict is inconclusive.
+#[test]
+fn eval_monitor_inconclusive_folds_into_verdict() {
+    let pass_assert = build_assert_result(true, vec![]);
+    let entry = sched_entry("__eval_monitor_inconclusive__");
+    // 30 samples, 2 CPUs each, ALL with rq_clock == 1000 -> after the
+    // 20-sample warmup trim, 10 samples * 2 readings = 20 readings, all
+    // identical -> data_looks_valid() == false -> inconclusive verdict.
+    let constant_clock_samples: Vec<crate::monitor::MonitorSample> = (0..30)
+        .map(|i| {
+            crate::monitor::MonitorSample::new(
+                (i * 100) as u64,
+                vec![
+                    crate::monitor::CpuSnapshot {
+                        nr_running: 1,
+                        scx_nr_running: 1,
+                        local_dsq_depth: 0,
+                        rq_clock: 1000,
+                        scx_flags: 0,
+                        event_counters: None,
+                        schedstat: None,
+                        vcpu_cpu_time_ns: None,
+                        vcpu_perf: None,
+                        sched_domains: None,
+                    },
+                    crate::monitor::CpuSnapshot {
+                        nr_running: 1,
+                        scx_nr_running: 1,
+                        local_dsq_depth: 0,
+                        rq_clock: 1000,
+                        scx_flags: 0,
+                        event_counters: None,
+                        schedstat: None,
+                        vcpu_cpu_time_ns: None,
+                        vcpu_perf: None,
+                        sched_domains: None,
+                    },
+                ],
+            )
+        })
+        .collect();
+    let summary =
+        crate::monitor::MonitorSummary::from_samples_with_threshold(&constant_clock_samples, 0);
+    let result = crate::vmm::VmResult {
+        success: true,
+        vcpus: 1,
+        cpu_budget: 1,
+        expect_auto_repro_satisfied: false,
+        exit_code: 0,
+        duration: std::time::Duration::from_secs(1),
+        timed_out: false,
+        output: String::new(),
+        stderr: String::new(),
+        monitor: Some(crate::monitor::MonitorReport {
+            samples: constant_clock_samples,
+            summary,
+            preemption_threshold_ns: 0,
+            watchdog_observation: None,
+            page_offset: 0,
+            boot_wait_outcome: crate::monitor::BootWaitOutcome::NotConfigured,
+        }),
+        guest_messages: Some(crate::vmm::host_comms::BulkDrainResult {
+            entries: vec![crate::test_support::test_helpers::assert_result_tlv_entry(
+                &pass_assert,
+            )],
+        }),
+        verifier_stats: Vec::new(),
+        kvm_stats: None,
+        crash_message: None,
+        cleanup_duration: None,
+        virtio_blk_counters: None,
+        virtio_net_counters: None,
+        snapshot_bridge: {
+            let cb: crate::scenario::snapshot::CaptureCallback = std::sync::Arc::new(|_| None);
+            crate::scenario::snapshot::SnapshotBridge::new(cb)
+        },
+        stats_client: None,
+        periodic_fired: 0,
+        periodic_real: 0,
+        periodic_target: 0,
+        kern_kaslr_offset: 0,
+        entry_name: None,
+        periodic_series_cache: std::sync::OnceLock::new(),
+    };
+    let assertions = crate::assert::Assert::NO_OVERRIDES
+        .max_imbalance_ratio(4.0)
+        .fail_on_stall(true)
+        .with_monitor_defaults();
+    let ar = evaluate_vm_result(
+        &entry,
+        &result,
+        &assertions,
+        &[],
+        &[],
+        &[],
+        &EVAL_TOPO,
+        &no_repro,
+        None,
+    )
+    .expect("the inconclusive monitor arm must NOT bail — it merges and returns Ok");
+    assert!(
+        ar.is_inconclusive(),
+        "the merged Inconclusive outcome must flip the verdict lattice to inconclusive",
+    );
+    let monitor_detail = ar
+        .inconclusive_details()
+        .find(|d| d.kind == DetailKind::Monitor)
+        .expect("a DetailKind::Monitor inconclusive detail must be folded in");
+    assert!(
+        monitor_detail
+            .message
+            .starts_with("monitor evaluation inconclusive:"),
+        "the folded detail must carry the inconclusive narrative, got: {}",
+        monitor_detail.message,
+    );
+    assert!(
+        monitor_detail
+            .message
+            .contains("monitor data not yet initialized"),
+        "the narrative must carry the evaluator's uninitialized-data summary, got: {}",
+        monitor_detail.message,
+    );
+}
+
+// -- verdict_word = "inconclusive" in failure header (mod.rs:2040-2044) --
+
+/// A check_result that is INCONCLUSIVE (not pass, not fail): the
+/// failure-message header uses `verdict_word = "inconclusive"` at
+/// mod.rs:2040-2044, not "failed". Built by merging an
+/// `AssertResult::inconclusive(...)` onto a passing base — the
+/// resulting lattice is `is_fail=false / is_inconclusive=true /
+/// is_pass=false`, so the failure-render block runs.
+#[test]
+fn eval_inconclusive_verdict_word_in_header() {
+    let mut assert = build_assert_result(true, vec![]);
+    assert.merge(crate::assert::AssertResult::inconclusive(AssertDetail::new(
+        DetailKind::Other,
+        "zero-denominator metric",
+    )));
+    let entry = eevdf_entry("__eval_inconclusive_word__");
+    let result = make_vm_result_with_assert("", "", 0, false, &assert);
+    let assertions = crate::assert::Assert::NO_OVERRIDES;
+    let err = evaluate_vm_result(
+        &entry,
+        &result,
+        &assertions,
+        &[],
+        &[],
+        &[],
+        &EVAL_TOPO,
+        &no_repro,
+        None,
+    )
+    .unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("] inconclusive:"),
+        "the header verdict word must be `inconclusive`, got: {msg}",
+    );
+    assert!(
+        !msg.contains("] failed:"),
+        "an inconclusive verdict must NOT render the `failed` header word, got: {msg}",
+    );
+    assert!(
+        msg.contains("zero-denominator metric"),
+        "the inconclusive detail must render (details block chains \
+         inconclusive_details), got: {msg}",
+    );
+}
+
+// -- scx_bpf_error matcher fold + ScxBpfErrorMatcherMismatch context --
+// (mod.rs:1813-1824, 2072-2073)
+
+/// A configured `expect_scx_bpf_error_contains` matcher whose needle is
+/// ABSENT from the captured corpus folds a mismatch `AssertDetail` into
+/// `check_result` (mod.rs:1815-1824) and wraps the failure `Err` with
+/// the [`ScxBpfErrorMatcherMismatch`] context (mod.rs:2072-2073).
+///
+/// `entry.expect_err` is set to `true` so the matcher takes the
+/// "substring not found" diagnostic path (with `expect_err = false`
+/// `evaluate_scx_bpf_error_match` emits the MISUSE reminder instead —
+/// the mismatch + context still fire, but the diagnostic text differs;
+/// setting `expect_err = true` pins the substring-not-found text).
+#[test]
+fn eval_scx_bpf_error_matcher_mismatch_wraps_context() {
+    let assert = build_assert_result(true, vec![]);
+    let mut entry = sched_entry("__eval_scx_matcher_mismatch__");
+    entry.expect_err = true;
+    // Corpus (output -> sched_log_input) lacks the needle.
+    let result = make_vm_result_with_assert("benign scheduler log line", "", 0, false, &assert);
+    let assertions =
+        crate::assert::Assert::NO_OVERRIDES.expect_scx_bpf_error_contains("EXPECTED-NEEDLE");
+    let err = evaluate_vm_result(
+        &entry,
+        &result,
+        &assertions,
+        &[],
+        &[],
+        &[],
+        &EVAL_TOPO,
+        &no_repro,
+        None,
+    )
+    .unwrap_err();
+    assert!(
+        err.downcast_ref::<ScxBpfErrorMatcherMismatch>().is_some(),
+        "the matcher mismatch must attach the ScxBpfErrorMatcherMismatch context \
+         (anyhow context-aware downcast), got: {err:#}",
+    );
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("substring not found in the scheduler log + sched_ext dump corpus"),
+        "the substring-not-found diagnostic must render (expect_err=true path), got: {msg}",
+    );
+}
+
+/// Negative control for `eval_scx_bpf_error_matcher_mismatch_wraps_context`:
+/// with NO matcher configured (`matcher_configured == false`), an
+/// independently-failing check_result still produces an `Err`, but it
+/// is NOT wrapped with the [`ScxBpfErrorMatcherMismatch`] context.
+///
+/// The failure must come from a SEPARATE source
+/// (`build_assert_result(false, ...)`) — a passing
+/// guest result with no matcher / monitor / host failure returns
+/// `Ok`, so there would be no `Err` to inspect.
+#[test]
+fn eval_no_matcher_no_mismatch_context() {
+    let assert = build_assert_result(
+        false,
+        vec![AssertDetail::new(DetailKind::Stuck, "independent failure")],
+    );
+    let entry = sched_entry("__eval_no_matcher_context__");
+    let result = make_vm_result_with_assert("benign scheduler log line", "", 0, false, &assert);
+    let assertions = crate::assert::Assert::NO_OVERRIDES;
+    let err = evaluate_vm_result(
+        &entry,
+        &result,
+        &assertions,
+        &[],
+        &[],
+        &[],
+        &EVAL_TOPO,
+        &no_repro,
+        None,
+    )
+    .unwrap_err();
+    assert!(
+        err.downcast_ref::<ScxBpfErrorMatcherMismatch>().is_none(),
+        "with no matcher configured the mismatch context must NOT be attached, got: {err:#}",
+    );
+    assert!(
+        format!("{err}").contains("independent failure"),
+        "the independent failure detail must still render, got: {err}",
+    );
+}
+
+// -- post_vm_err fold on guest-AssertResult path (mod.rs:1748-1753) --
+
+/// A host-side `post_vm` callback `Err` folds a `DetailKind::Other`
+/// failure into an otherwise-PASSING guest `check_result`
+/// (mod.rs:1748-1753), flipping the verdict to a hard failure. The
+/// folded detail renders the exact `post_vm callback returned Err: ...`
+/// text from mod.rs:1751.
+#[test]
+fn eval_post_vm_err_folds_into_guest_pass() {
+    let assert = build_assert_result(true, vec![]);
+    let entry = eevdf_entry("__eval_post_vm_fold__");
+    let result = make_vm_result_with_assert("", "", 0, false, &assert);
+    let assertions = crate::assert::Assert::NO_OVERRIDES;
+    let pv = anyhow::anyhow!("snapshot bridge captured nothing");
+    let err = evaluate_vm_result(
+        &entry,
+        &result,
+        &assertions,
+        &[],
+        &[],
+        &[],
+        &EVAL_TOPO,
+        &no_repro,
+        Some(&pv),
+    )
+    .unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("post_vm callback returned Err: snapshot bridge captured nothing"),
+        "the post_vm Err must fold in with its exact rendered text, got: {msg}",
+    );
+    assert!(
+        msg.contains("] failed:"),
+        "the folded Other detail is a hard Fail -> verdict word `failed`, got: {msg}",
+    );
+}
+
+// -- host_extract_failures fold (mod.rs:1736-1738) --
+
+/// A non-empty `host_extract_failures` slice (the 6th param) folds each
+/// detail into an otherwise-PASSING guest `check_result` via
+/// `check_result.merge(AssertResult::fail(detail.clone()))`
+/// (mod.rs:1736-1738), flipping the verdict to failed and rendering the
+/// host-extract detail in the details block.
+#[test]
+fn eval_host_extract_failures_fold_into_guest_pass() {
+    let assert = build_assert_result(true, vec![]);
+    let entry = eevdf_entry("__eval_host_extract_fold__");
+    let result = make_vm_result_with_assert("", "", 0, false, &assert);
+    let assertions = crate::assert::Assert::NO_OVERRIDES;
+    let host_fails = vec![AssertDetail::new(DetailKind::Other, "llm model unavailable")];
+    let err = evaluate_vm_result(
+        &entry,
+        &result,
+        &assertions,
+        &[],
+        &[],
+        &host_fails,
+        &EVAL_TOPO,
+        &no_repro,
+        None,
+    )
+    .unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("llm model unavailable"),
+        "the host-extract failure detail must render in the details block, got: {msg}",
+    );
+    assert!(
+        msg.contains("] failed:"),
+        "the folded host-extract failure must flip the verdict to failed, got: {msg}",
+    );
+}
+
+// -- scheduler-log >200-line truncation (mod.rs:1652-1657) --
+
+/// A no-result run whose scheduler log carries >200 NON-verifier lines
+/// triggers the tail-truncation branch at mod.rs:1652-1657: the
+/// `!is_verifier && lines.len() > 200` arm renders
+/// `[N lines truncated]` followed by the last 200 lines.
+///
+/// The body is 250 DISTINCT `frame_<i>+0x10` lines so `collapse_cycles`
+/// finds no repeating cycle (each line is unique -> no anchor repeats
+/// >= 3 times) and leaves all 250 intact; `is_verifier` is false (the
+/// lines contain neither "processed" nor "insns"). With exactly 250
+/// post-collapse lines the skip count is `250 - 200 = 50`, the last
+/// line (`frame_249+0x10`) survives in the kept tail, and an early line
+/// (`frame_0+0x10`) is truncated.
+#[test]
+fn eval_sched_log_truncates_over_200_lines() {
+    let body = (0..250)
+        .map(|i| format!("frame_{i}+0x10"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let log = format!("{SCHED_OUTPUT_START}\n{body}\n{SCHED_OUTPUT_END}");
+    let entry = sched_entry("__eval_sched_log_trunc__");
+    let result = make_vm_result(&log, "", 1, false);
+    let assertions = crate::assert::Assert::NO_OVERRIDES;
+    let err = evaluate_vm_result(
+        &entry,
+        &result,
+        &assertions,
+        &[],
+        &[],
+        &[],
+        &EVAL_TOPO,
+        &no_repro,
+        None,
+    )
+    .unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("[50 lines truncated]"),
+        "250 distinct non-verifier lines must truncate to the last 200 (skip 50), got: {msg}",
+    );
+    assert!(
+        msg.contains("frame_249+0x10"),
+        "the last log line must survive in the kept tail, got: {msg}",
+    );
+    assert!(
+        !msg.contains("frame_0+0x10"),
+        "an early log line must be truncated out of the kept tail, got: {msg}",
+    );
+}

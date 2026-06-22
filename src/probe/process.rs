@@ -3346,4 +3346,137 @@ mod tests {
         let map = build_task_param_idx(&func_ips, &btf, &[]);
         assert!(!map.contains_key(&99));
     }
+
+    // -- set_probe_sched_exit_state Clean encode round-trip ------------
+
+    #[test]
+    fn set_probe_sched_exit_state_clean_round_trips() {
+        // The Clean match arm in set_probe_sched_exit_state (encode
+        // Clean -> PROBE_EXIT_STATE_CLEAN=1) is the only branch the
+        // existing tests never exercise: production probe-poll code and
+        // the scenario/ops tests drive only Crashed/Unknown. This pins
+        // the encode side against the decode side in sched_exit_kind
+        // (PROBE_EXIT_STATE_CLEAN=1 -> Clean), proving the constant
+        // round-trips. PROBE_SCHED_EXIT_STATE is a process-global
+        // AtomicU32; no real probe-poll thread runs in host-unit tests,
+        // so this set/read pair is uncontended. Restore the mirror to
+        // Unknown afterward so neighbor tests start clean, per the doc
+        // on set_probe_sched_exit_state.
+        super::set_probe_sched_exit_state(SchedExitKind::Clean);
+        assert_eq!(
+            super::sched_exit_kind(),
+            SchedExitKind::Clean,
+            "encode(Clean) must decode back to Clean (PROBE_EXIT_STATE_CLEAN=1 round-trip)",
+        );
+        super::set_probe_sched_exit_state(SchedExitKind::Unknown);
+        assert_eq!(
+            super::sched_exit_kind(),
+            SchedExitKind::Unknown,
+            "reset to Unknown must clear the mirror for neighbor tests",
+        );
+    }
+
+    // -- build_field_keys 16-field cap (MAX_FIELDS) --------------------
+
+    #[test]
+    fn build_field_keys_caps_known_struct_at_sixteen() {
+        // task_struct contributes 12 STRUCT_FIELDS keys per param. Two
+        // task_struct params would naively yield 24 keys; the field_idx
+        // >= 16 break inside the known-struct branch truncates the
+        // second param after exactly 4 keys (field_idx 12..15). Pins
+        // that cap so a regression loosening the guard (or dropping it)
+        // is caught.
+        let func = super::BtfFunc {
+            name: "two_task_params".into(),
+            params: vec![
+                super::super::btf::BtfParam {
+                    name: "p1".into(),
+                    struct_name: Some("task_struct".into()),
+                    is_ptr: true,
+                    ..Default::default()
+                },
+                super::super::btf::BtfParam {
+                    name: "p2".into(),
+                    struct_name: Some("task_struct".into()),
+                    is_ptr: true,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let keys = build_field_keys(&func);
+        assert_eq!(keys.len(), 16, "cap truncates at 16, not the naive 12+12=24");
+        assert_eq!(
+            keys.iter().filter(|(k, _)| k.starts_with("p2:")).count(),
+            4,
+            "second task_struct param contributes exactly 4 keys before the cap",
+        );
+    }
+
+    #[test]
+    fn build_field_keys_caps_auto_fields_at_sixteen() {
+        // The auto_fields branch has its own field_idx >= 16 break
+        // (distinct from the known-struct break). A single param with
+        // 17 auto_fields must yield 16 keys, dropping the 17th ("f16").
+        let func = super::BtfFunc {
+            name: "wide_auto".into(),
+            params: vec![super::super::btf::BtfParam {
+                name: "ctx".into(),
+                struct_name: None,
+                is_ptr: true,
+                type_name: Some("task_ctx".into()),
+                auto_fields: (0..17)
+                    .map(|i| (format!("f{i}"), format!("->f{i}"), RenderHint::Hex))
+                    .collect(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let keys = build_field_keys(&func);
+        assert_eq!(keys.len(), 16, "17 auto_fields must be capped to 16 keys");
+        assert!(
+            !keys.iter().any(|(k, _)| k.contains(".f16")),
+            "the 17th auto field (f16) must be dropped by the cap: {keys:?}",
+        );
+    }
+
+    // -- set_rodata_slot out-of-range no-op + positive write ----------
+
+    #[test]
+    fn set_rodata_slot_ignores_slot_past_cap() {
+        // Lines 858-874 (slot 0..=3) are covered by VM-running attach
+        // tests; only the `_ => {}` no-op for slot > 3 is uncovered.
+        // The doc states "No-op for slot indices outside 0..=3" but
+        // nothing exercises that contract. Construct a host-side rodata
+        // (POD, #[repr(C)], no Default derive — built via zeroed()),
+        // write slot 4, and assert EVERY mutable field is unchanged.
+        let mut r: crate::bpf_skel::fentry::types::rodata = unsafe { std::mem::zeroed() };
+        set_rodata_slot(&mut r, 4, 0xABCD, true);
+        assert_eq!(r.ktstr_fentry_func_idx_0, 0, "slot>3 must not touch idx_0");
+        assert_eq!(r.ktstr_fentry_func_idx_1, 0, "slot>3 must not touch idx_1");
+        assert_eq!(r.ktstr_fentry_func_idx_2, 0, "slot>3 must not touch idx_2");
+        assert_eq!(r.ktstr_fentry_func_idx_3, 0, "slot>3 must not touch idx_3");
+        assert_eq!(r.ktstr_fentry_is_kernel_0, 0, "slot>3 must not touch is_kernel_0");
+        assert_eq!(r.ktstr_fentry_is_kernel_1, 0, "slot>3 must not touch is_kernel_1");
+        assert_eq!(r.ktstr_fentry_is_kernel_2, 0, "slot>3 must not touch is_kernel_2");
+        assert_eq!(r.ktstr_fentry_is_kernel_3, 0, "slot>3 must not touch is_kernel_3");
+    }
+
+    #[test]
+    fn set_rodata_slot_writes_only_target_slot() {
+        // Positive partner to the no-op test: slot 2 write lands in
+        // exactly slot 2's fields (idx and is_kernel) and leaves the
+        // other three slots untouched. is_kernel=true must encode as 1
+        // (the `as u8` cast), not a generic nonzero.
+        let mut r: crate::bpf_skel::fentry::types::rodata = unsafe { std::mem::zeroed() };
+        set_rodata_slot(&mut r, 2, 0xABCD, true);
+        assert_eq!(r.ktstr_fentry_func_idx_2, 0xABCD, "slot 2 idx must be written");
+        assert_eq!(r.ktstr_fentry_is_kernel_2, 1u8, "is_kernel=true encodes as 1u8");
+        assert_eq!(r.ktstr_fentry_func_idx_0, 0, "slot 0 untouched");
+        assert_eq!(r.ktstr_fentry_func_idx_1, 0, "slot 1 untouched");
+        assert_eq!(r.ktstr_fentry_func_idx_3, 0, "slot 3 untouched");
+        assert_eq!(r.ktstr_fentry_is_kernel_0, 0, "is_kernel_0 untouched");
+        assert_eq!(r.ktstr_fentry_is_kernel_1, 0, "is_kernel_1 untouched");
+        assert_eq!(r.ktstr_fentry_is_kernel_3, 0, "is_kernel_3 untouched");
+    }
 }

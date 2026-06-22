@@ -2369,8 +2369,17 @@ fn take_deferred_probe() -> Option<DeferredProbe> {
 /// would be marginally simpler in code but pull a dependency
 /// for sub-second savings.
 fn wait_for_sched_disabled(timeout: std::time::Duration) -> bool {
+    wait_for_sched_disabled_at("/sys/kernel/sched_ext/state", timeout)
+}
+
+/// Path-parametric core of [`wait_for_sched_disabled`]. Production passes
+/// the hardcoded `/sys/kernel/sched_ext/state`; tests pass a controlled
+/// path to drive each arm deterministically, since the live sysfs file's
+/// presence and contents vary by host — a kernel built with
+/// `CONFIG_SCHED_CLASS_EXT` and no attached scheduler reads `"disabled"`,
+/// so the production path is not reliably absent.
+fn wait_for_sched_disabled_at(path: &str, timeout: std::time::Duration) -> bool {
     let deadline = std::time::Instant::now() + timeout;
-    let path = "/sys/kernel/sched_ext/state";
     loop {
         if let Ok(s) = std::fs::read_to_string(path) {
             if s.trim() == "disabled" {
@@ -2563,6 +2572,14 @@ fn collect_and_print_probe_data(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Process-wide serialization lock for every test that touches the
+    /// global [`DEFERRED_PROBE_COLLECT`] static. Tests run in parallel
+    /// within one process, so a stash from one test interleaving with a
+    /// drain-and-assert in another would poison the assertion. Every
+    /// deferred-probe test acquires this single lock for the duration of
+    /// its stash/take exercises so the ordering is well defined.
+    static DEFERRED_PROBE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn extract_probe_output_valid_json() {
@@ -4606,16 +4623,13 @@ mod tests {
 
     #[test]
     fn deferred_probe_stash_take_invariants() {
-        // Process-wide guard: every assertion below executes under
-        // this lock so concurrent unit tests can't poison the
-        // stash. The lock is a fresh per-test static; the lock
-        // ITSELF is shared across invocations of this test (only
-        // one path actually runs the test, so this is moot in
-        // practice, but the lock ensures the order is well
-        // defined even if a future test refactor introduces
-        // parallel callers).
-        static SERIALISE: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _guard = SERIALISE.lock().unwrap();
+        // Process-wide guard: every assertion below executes under the
+        // shared `DEFERRED_PROBE_TEST_LOCK` so concurrent unit tests
+        // that also touch `DEFERRED_PROBE_COLLECT` (e.g.
+        // `finalize_probe_after_unwind_noop_*`,
+        // `publish_result_and_collect_stash_arm_*`) cannot interleave a
+        // stash between this test's drain and its assertions.
+        let _guard = DEFERRED_PROBE_TEST_LOCK.lock().unwrap();
 
         // Drain any prior state (paranoid; a prior test on the
         // same process should have cleared, but a re-entrant
@@ -4866,6 +4880,221 @@ mod tests {
             !pb.exists(),
             "crc_ok=false WprofTrace must NOT produce a sidecar file at {}",
             pb.display(),
+        );
+    }
+
+    // -- wait_for_sched_disabled --
+
+    /// `wait_for_sched_disabled_at` covers all three arms deterministically
+    /// through a controlled path. The live `/sys/kernel/sched_ext/state`
+    /// is unsuitable: a kernel built with `CONFIG_SCHED_CLASS_EXT` and no
+    /// attached scheduler reads `"disabled"`, so the file is neither
+    /// reliably absent nor reliably non-`"disabled"` across hosts.
+    ///   - file unreadable → `false` immediately (the else arm), no spin
+    ///   - contents trimming to `"disabled"` → `true` (the success arm)
+    ///   - readable but non-`"disabled"` + tiny timeout → `false` (the
+    ///     deadline arm), bounded by the deadline rather than spinning
+    #[test]
+    fn wait_for_sched_disabled_at_covers_all_arms() {
+        let tiny = std::time::Duration::from_millis(1);
+
+        // else arm: a path that does not exist → read_to_string Err →
+        // false, returned without spinning.
+        assert!(
+            !wait_for_sched_disabled_at("/nonexistent/ktstr/sched_ext/state", tiny),
+            "unreadable state path must yield a non-spinning false",
+        );
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+
+        // success arm: contents trim to "disabled" → true.
+        let disabled = tmp.path().join("disabled_state");
+        std::fs::write(&disabled, "disabled\n").expect("write disabled state");
+        assert!(
+            wait_for_sched_disabled_at(disabled.to_str().expect("utf8 path"), tiny),
+            "state reading \"disabled\" must yield true",
+        );
+
+        // deadline arm: readable but not "disabled" → loop until the tiny
+        // deadline elapses → false (never true, never an unbounded spin).
+        let enabled = tmp.path().join("enabled_state");
+        std::fs::write(&enabled, "enabled\n").expect("write enabled state");
+        assert!(
+            !wait_for_sched_disabled_at(enabled.to_str().expect("utf8 path"), tiny),
+            "non-\"disabled\" state must time out to false within the deadline",
+        );
+    }
+
+    // -- finalize_probe_after_unwind (no-op path) --
+
+    /// `finalize_probe_after_unwind` is a no-op when no `DeferredProbe`
+    /// was stashed: the `let Some(deferred) = take_deferred_probe()
+    /// else { return; }` early-return at probe.rs:2415-2417 leaves the
+    /// global `DEFERRED_PROBE_COLLECT` static untouched and never
+    /// reaches `wait_for_sched_disabled` / `collect_and_print_probe_data`.
+    /// Drain to a known-empty precondition, call the finaliser, then
+    /// assert the static is still empty — the no-op path must NOT stash
+    /// anything and must NOT panic.
+    #[test]
+    fn finalize_probe_after_unwind_noop_when_nothing_stashed() {
+        let _guard = DEFERRED_PROBE_TEST_LOCK.lock().unwrap();
+        // Drain any residue so the empty precondition is known.
+        let _ = take_deferred_probe();
+        assert!(
+            take_deferred_probe().is_none(),
+            "precondition: stash must be empty before the no-op call",
+        );
+        finalize_probe_after_unwind();
+        assert!(
+            take_deferred_probe().is_none(),
+            "no-op path must leave DEFERRED_PROBE_COLLECT empty \
+             (early-return at probe.rs:2415-2417)",
+        );
+    }
+
+    // -- collect_and_print_probe_data (handle:None path) --
+
+    /// `collect_and_print_probe_data` returns at the `let Some(ph) =
+    /// handle else { return; }` early-return (probe.rs:2505-2507) when
+    /// `handle` is `None`, BEFORE the `stop.store(true, Release)` at
+    /// probe.rs:2509. Asserting the stop flag stays `false` (not merely
+    /// "no panic") distinguishes the early-return from the join path,
+    /// which would have set it to `true`.
+    #[test]
+    fn collect_and_print_probe_data_none_handle_leaves_stop_false() {
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        collect_and_print_probe_data(stop.clone(), None);
+        assert!(
+            !stop.load(std::sync::atomic::Ordering::Acquire),
+            "None-handle path must early-return before stop.store \
+             (probe.rs:2505-2509), leaving stop == false",
+        );
+    }
+
+    // -- publish_result_and_collect (host arm / stash arm) --
+
+    /// Host arm: with `is_guest()` forced `false`, `publish_result_and_collect`
+    /// takes the else branch at probe.rs:2493
+    /// (`collect_and_print_probe_data(stop, None)`), which early-returns
+    /// on the `None` handle before `stop.store`. `try_flush_profraw`
+    /// (host no-op: the `cfg(coverage)` body early-returns when
+    /// `!is_guest()`, and is absent in non-coverage builds) and
+    /// `print_assert_result` -> `send_test_result` (host no-op via
+    /// `write_msg`'s `assert_guest_context` guard, guest_comms.rs:122-130)
+    /// run without effect. Asserting `stop == false` proves the host
+    /// branch ran the collect-and-early-return path without a handle.
+    #[test]
+    fn publish_result_and_collect_host_arm_leaves_stop_false() {
+        let _g = crate::vmm::guest_comms::IsGuestOverrideGuard::new(false);
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        publish_result_and_collect(&AssertResult::pass(), stop.clone(), None);
+        assert!(
+            !stop.load(std::sync::atomic::Ordering::Acquire),
+            "host arm calls collect_and_print_probe_data(stop, None) which \
+             early-returns before stop.store; stop must stay false",
+        );
+    }
+
+    /// Stash arm: with `is_guest()` forced `true`, `publish_result_and_collect`
+    /// takes the `stash_deferred_probe(stop, handle)` branch at
+    /// probe.rs:2491 — which stores `Some(DeferredProbe)` into the
+    /// global static even with `handle = None` (stash_deferred_probe at
+    /// probe.rs:2337-2343 always wraps in `Some`). After the call,
+    /// `take_deferred_probe()` must return `Some` (proves L2491
+    /// executed); then drain it so a subsequent deferred-probe test
+    /// starts clean. `IsGuestOverrideGuard` is thread-local
+    /// (guest_comms.rs), but the global static needs the shared
+    /// `DEFERRED_PROBE_TEST_LOCK`.
+    #[test]
+    fn publish_result_and_collect_stash_arm_stashes_deferred() {
+        let _guard = DEFERRED_PROBE_TEST_LOCK.lock().unwrap();
+        // Drain residue under the lock so the stash we observe is ours.
+        let _ = take_deferred_probe();
+        let _g = crate::vmm::guest_comms::IsGuestOverrideGuard::new(true);
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        publish_result_and_collect(&AssertResult::pass(), stop, None);
+        let stashed = take_deferred_probe();
+        assert!(
+            stashed.is_some(),
+            "guest arm must stash a DeferredProbe via stash_deferred_probe \
+             (probe.rs:2491); take_deferred_probe must return Some",
+        );
+        assert!(
+            stashed.expect("stash present").handle.is_none(),
+            "stashed handle must round-trip the None passed in",
+        );
+        // Final drain so a subsequent deferred-probe test starts clean.
+        let _ = take_deferred_probe();
+    }
+
+    // -- emit_probe_payload (empty-events path) --
+
+    /// `emit_probe_payload` with empty `events` takes the
+    /// `events.is_empty()` fast path at probe.rs:2262-2267 — an empty
+    /// `bpf_source_locs` map, skipping the libbpf `discover_bpf_symbols`
+    /// / `resolve_bpf_source_locs` walk (probe.rs:2269-2281) that needs
+    /// a live BPF env. It then builds `ProbeBytes`, serializes, and
+    /// `println!`s the START/JSON/END markers (probe.rs:2284-2300).
+    ///
+    /// Two halves, landed together (see verdict issues):
+    /// 1. DIRECT call for line coverage of probe.rs:2254-2267,2284-2301.
+    ///    The fn writes to process stdout, which a std unit test cannot
+    ///    cleanly capture, so the direct call alone can only assert
+    ///    no-panic.
+    /// 2. ROUND-TRIP behavioral assertion: reconstruct the SAME
+    ///    `ProbeBytes` the empty branch builds, wrap it in the
+    ///    START/END markers, and run it through `extract_probe_output`.
+    ///    With default diagnostics, `format_probe_diagnostics` always
+    ///    pushes `"--- probe pipeline ---"` (probe.rs:1278) and, since
+    ///    `events_before_stitch == 0`, the bare
+    ///    `"0 captured, 0 after stitch"` events line (probe.rs:1426, no
+    ///    stitch-drop cause appended). `extract_probe_output` returns
+    ///    `Some(out)` (diagnostics `Some` -> out non-empty at
+    ///    probe.rs:1014-1016, then events empty -> `Some(out)` at
+    ///    probe.rs:1018-1023). Assert the exact substrings.
+    #[test]
+    fn emit_probe_payload_empty_events_round_trips_diagnostics_only() {
+        // (1) Direct call: covers the empty-events fast path lines.
+        // Output goes to process stdout (uncapturable in a std unit
+        // test); this half pins no-panic / line coverage only.
+        emit_probe_payload(
+            &[],
+            &[],
+            &PipelineDiagnostics::default(),
+            &crate::probe::process::ProbeDiagnostics::default(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        );
+
+        // (2) Round-trip: reconstruct the exact ProbeBytes the empty
+        // branch builds and assert the host renderer's output shape.
+        let payload = ProbeBytes {
+            events: vec![],
+            func_names: vec![],
+            bpf_source_locs: std::collections::HashMap::new(),
+            diagnostics: Some(ProbeBytesDiagnostics {
+                pipeline: PipelineDiagnostics::default(),
+                skeleton: crate::probe::process::ProbeDiagnostics::default(),
+            }),
+            nr_cpus: crate::probe::output::get_nr_cpus(),
+            param_names: std::collections::HashMap::new(),
+            render_hints: std::collections::HashMap::new(),
+        };
+        let json = serde_json::to_string(&payload).expect("serialize empty-events payload");
+        let output = format!("{PROBE_OUTPUT_START}\n{json}\n{PROBE_OUTPUT_END}");
+        // Default diagnostics make format_probe_diagnostics emit a
+        // non-empty pipeline string, so extract_probe_output returns
+        // Some(out) even though events is empty (NOT None).
+        let formatted = extract_probe_output(&output, None, None)
+            .expect("empty-events payload with default diagnostics must render the pipeline header");
+        assert!(
+            formatted.contains("--- probe pipeline ---"),
+            "diagnostics header missing (format_probe_diagnostics at probe.rs:1278): {formatted}",
+        );
+        assert!(
+            formatted.contains("0 captured, 0 after stitch"),
+            "empty-events stitch counters missing (probe.rs:1426, no cause \
+             appended since events_before_stitch == 0): {formatted}",
         );
     }
 }

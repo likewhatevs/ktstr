@@ -1231,4 +1231,313 @@ mod tests {
             "name_len must bound the match to the active prefix",
         );
     }
+
+    /// A cheap real fd for a test [`PinnedMap`]. `pinned_for`
+    /// (lines 446-450) only compares names and never dereferences
+    /// `.fd`, and every accessor read path under test returns at an
+    /// early guard before the fd reaches a `bpf()` syscall — so any
+    /// open fd suffices to satisfy the `OwnedFd` field. `/dev/null`
+    /// is always present on Linux and `File` -> `OwnedFd` is the
+    /// std-only conversion (no extra libc unsafe).
+    fn dummy_fd() -> OwnedFd {
+        OwnedFd::from(
+            std::fs::File::open("/dev/null").expect("/dev/null must open on Linux test host"),
+        )
+    }
+
+    /// Build a [`PinnedMap`] from `info` + `map_extra`, carrying the
+    /// dummy fd. The fields are private to the parent module; the
+    /// `tests` child module can name and construct them directly,
+    /// which is the inject seam the blueprint requires (no live
+    /// kernel walk, no `from_running_kernel*` syscall path).
+    fn pinned(info: BpfMapInfo, map_extra: u64) -> PinnedMap {
+        PinnedMap {
+            info,
+            fd: dummy_fd(),
+            map_extra,
+        }
+    }
+
+    /// Build a [`BpfSyscallAccessor`] holding exactly `maps`. The
+    /// production constructors (`from_running_kernel*`) only ever
+    /// populate `maps` via the live bpf(2) id walk; this literal is
+    /// the host-test inject seam that lets the early-guard branches
+    /// run without a kernel.
+    fn accessor(maps: Vec<PinnedMap>) -> BpfSyscallAccessor {
+        BpfSyscallAccessor { maps }
+    }
+
+    /// `read_array` rejects before touching the fd on three guards:
+    /// no name match (`pinned_for` -> None, lines 600), wrong map
+    /// type (lines 606-608), and `key >= max_entries` (lines
+    /// 609-611). All three return `None` and run ahead of the
+    /// `bpf()` lookup at line 630, so they are host-isolable through
+    /// the inject seam. The `key < max_entries` success path is NOT
+    /// asserted here — it issues a real `BPF_MAP_LOOKUP_ELEM`.
+    #[test]
+    fn read_array_pre_lookup_guards_reject() {
+        let arr = BpfMapInfo {
+            map_type: BPF_MAP_TYPE_ARRAY,
+            max_entries: 4,
+            value_size: 8,
+            ..info_named("arr")
+        };
+        let acc = accessor(vec![pinned(arr.clone(), 0)]);
+
+        // No pinned map matches the target name -> pinned_for None.
+        assert_eq!(acc.read_array(&info_named("missing"), 0), None);
+
+        // Name matches but map_type is HASH, not ARRAY -> type-reject.
+        let hash = BpfMapInfo {
+            map_type: BPF_MAP_TYPE_HASH,
+            ..info_named("arr")
+        };
+        assert_eq!(acc.read_array(&hash, 0), None);
+
+        // key == max_entries and key > max_entries both reject before
+        // the lookup (the kernel index_mask is a Spectre bound, the
+        // explicit `key >= max_entries` is the range check).
+        assert_eq!(acc.read_array(&arr, 4), None);
+        assert_eq!(acc.read_array(&arr, 99), None);
+    }
+
+    /// `read_value` rejects before touching the fd when the target
+    /// name has no pinned match (`pinned_for` -> None, line 547) or
+    /// the map type is neither ARRAY nor STRUCT_OPS (lines 567-569,
+    /// ahead of the `bpf()` lookup at line 582). The post-lookup
+    /// window-bounds / `checked_add` guards (lines 592-595) sit past
+    /// the live lookup and are NOT asserted here.
+    #[test]
+    fn read_value_pre_lookup_type_reject() {
+        // PERCPU_HASH is neither ARRAY nor STRUCT_OPS.
+        let percpu_hash = BpfMapInfo {
+            map_type: BPF_MAP_TYPE_PERCPU_HASH,
+            value_size: 8,
+            ..info_named("v")
+        };
+        let acc = accessor(vec![pinned(percpu_hash.clone(), 0)]);
+
+        assert_eq!(acc.read_value(&info_named("nomatch"), 0, 4), None);
+        assert_eq!(acc.read_value(&percpu_hash, 0, 4), None);
+    }
+
+    /// `iter_hash_map` returns an empty `Vec` before any fd use on
+    /// the no-name-match let-else (lines 640-642) and the type-reject
+    /// (lines 649-651: only HASH and LRU_HASH proceed). The
+    /// iteration loop at line 667 needs a live hash map.
+    #[test]
+    fn iter_hash_map_pre_walk_guards_empty() {
+        let arr = BpfMapInfo {
+            map_type: BPF_MAP_TYPE_ARRAY,
+            ..info_named("h")
+        };
+        let acc = accessor(vec![pinned(arr.clone(), 0)]);
+
+        // No pinned match -> let-else returns Vec::new().
+        assert_eq!(acc.iter_hash_map(&info_named("none")).len(), 0);
+        // Name matches but map_type is ARRAY, not HASH/LRU_HASH.
+        assert_eq!(acc.iter_hash_map(&arr).len(), 0);
+    }
+
+    /// `read_percpu_array` returns an empty `Vec` (length 0) on the
+    /// three pre-lookup guards: no name match (lines 729-731), wrong
+    /// map type (lines 732-734), and `key >= max_entries` (lines
+    /// 735-737). The length distinguishes these from the
+    /// post-lookup-failure branch at line 757 which returns
+    /// `vec![None; num_cpus]` (length `num_cpus`), so the assertions
+    /// pin LENGTH 0, not just emptiness-of-content.
+    #[test]
+    fn read_percpu_array_pre_lookup_guards_empty() {
+        let pa = BpfMapInfo {
+            map_type: BPF_MAP_TYPE_PERCPU_ARRAY,
+            max_entries: 2,
+            value_size: 8,
+            ..info_named("pa")
+        };
+        let acc = accessor(vec![pinned(pa.clone(), 0)]);
+
+        // No pinned match.
+        assert_eq!(acc.read_percpu_array(&info_named("x"), 0, 4).len(), 0);
+        // Name matches but map_type is ARRAY, not PERCPU_ARRAY.
+        let arr = BpfMapInfo {
+            map_type: BPF_MAP_TYPE_ARRAY,
+            ..info_named("pa")
+        };
+        assert_eq!(acc.read_percpu_array(&arr, 0, 4).len(), 0);
+        // key == max_entries rejects with length 0 (distinct from the
+        // num_cpus-length lookup-failure vector).
+        assert_eq!(acc.read_percpu_array(&pa, 2, 4).len(), 0);
+    }
+
+    /// `iter_percpu_hash_map` returns an empty `PerCpuHashEntries`
+    /// before any fd use on the no-name-match let-else (lines
+    /// 785-787) and the type-reject (lines 788-791: only PERCPU_HASH
+    /// and LRU_PERCPU_HASH proceed). The walk loop at line 808 needs
+    /// a live map.
+    #[test]
+    fn iter_percpu_hash_map_pre_walk_guards_empty() {
+        let hash = BpfMapInfo {
+            map_type: BPF_MAP_TYPE_HASH,
+            ..info_named("ph")
+        };
+        let acc = accessor(vec![pinned(hash.clone(), 0)]);
+
+        // No pinned match.
+        assert_eq!(acc.iter_percpu_hash_map(&info_named("none"), 4).len(), 0);
+        // Name matches but map_type is HASH, not PERCPU_HASH/LRU_PERCPU_HASH.
+        assert_eq!(acc.iter_percpu_hash_map(&hash, 4).len(), 0);
+    }
+
+    /// `read_arena_pages` has three isolable, fd-free blocks ahead of
+    /// `mmap` (line 935): no name match (lines 876-878 ->
+    /// `ArenaSnapshot::default()`), wrong map type (lines 879-881 ->
+    /// default), and the declared-span math + `declared_pages == 0`
+    /// early return (lines 885-909). The span math is pure:
+    /// `declared_bytes_raw = max_entries * 4096` (saturating),
+    /// `span_capped = declared_bytes_raw > MAX_ARENA_BYTES` (4 GiB),
+    /// and the zero-page snapshot carries `user_vm_start = map_extra`.
+    /// The populated mmap/mincore path needs a live arena fd.
+    #[test]
+    fn read_arena_pages_pre_mmap_paths() {
+        // A 3-field literal: BpfArenaOffsets derives only Debug+Clone
+        // (no Default), and the value is unused on every path under
+        // test (the fn parameter `_arena_offsets` is ignored), so the
+        // concrete offsets are arbitrary.
+        let offsets = BpfArenaOffsets {
+            arena_kern_vm: 0,
+            arena_user_vm_start: 0,
+            vm_struct_addr: 0,
+        };
+
+        // max_entries == 0 -> declared_pages == 0 early return,
+        // carrying user_vm_start = map_extra.
+        let arena0 = BpfMapInfo {
+            map_type: BPF_MAP_TYPE_ARENA,
+            max_entries: 0,
+            ..info_named("a")
+        };
+        let acc = accessor(vec![pinned(arena0.clone(), 0x1000)]);
+
+        // No name match -> ArenaSnapshot::default() (all-zero).
+        let no_match = acc.read_arena_pages(&info_named("no"), &offsets);
+        assert!(no_match.pages.is_empty());
+        assert_eq!(no_match.declared_pages, 0);
+        assert_eq!(no_match.user_vm_start, 0);
+        assert!(!no_match.span_capped);
+        assert!(!no_match.truncated);
+
+        // Name matches but map_type is ARRAY, not ARENA -> default.
+        let arr = BpfMapInfo {
+            map_type: BPF_MAP_TYPE_ARRAY,
+            ..info_named("a")
+        };
+        let type_reject = acc.read_arena_pages(&arr, &offsets);
+        assert!(type_reject.pages.is_empty());
+        assert_eq!(type_reject.declared_pages, 0);
+        assert_eq!(type_reject.user_vm_start, 0);
+        assert!(!type_reject.span_capped);
+
+        // declared_pages == 0 path: empty pages, span not capped,
+        // user_vm_start carried through from map_extra.
+        let zero = acc.read_arena_pages(&arena0, &offsets);
+        assert_eq!(zero.pages.len(), 0);
+        assert_eq!(zero.declared_pages, 0);
+        assert!(!zero.span_capped);
+        assert_eq!(zero.user_vm_start, 0x1000);
+        assert!(!zero.truncated);
+
+        // max_entries == u32::MAX -> declared_bytes_raw =
+        // 0xFFFF_FFFF * 4096 > 4 GiB, so span_capped is set. With the
+        // span capped to MAX_ARENA_BYTES, declared_pages > 0, so the
+        // span-math result is only observable on this sub-case
+        // through the MAP_FAILED snapshot or a populated walk — both
+        // need a live fd. The dummy /dev/null fd makes mmap fail
+        // (MAP_FAILED), exercising the lines 945-956 early return,
+        // which carries span_capped + user_vm_start. Assert exactly
+        // those two carry-through fields, which the blueprint marks
+        // host-assertable.
+        let arena_max = BpfMapInfo {
+            map_type: BPF_MAP_TYPE_ARENA,
+            max_entries: u32::MAX,
+            ..info_named("a")
+        };
+        let acc_max = accessor(vec![pinned(arena_max.clone(), 0x2000)]);
+        let capped = acc_max.read_arena_pages(&arena_max, &offsets);
+        assert!(capped.span_capped, "u32::MAX max_entries must cap the span");
+        assert_eq!(capped.user_vm_start, 0x2000);
+    }
+
+    /// `load_program_btf` returns `None` immediately when
+    /// `btf_id == 0` (lines 1024-1027, `btf_id = map.btf_kva as u32`).
+    /// `info_named` leaves `btf_kva` at its `Default` (0), so the
+    /// guard fires before `BPF_BTF_GET_FD_BY_ID` (line 1035) and the
+    /// `base_btf` argument is never dereferenced (it is only used on
+    /// the post-fetch arms at lines 1079/1081). Only this guard is
+    /// host-assertable; the BTF-fetch path needs a live kernel BTF
+    /// object.
+    #[test]
+    fn load_program_btf_btf_id_zero_returns_none() {
+        // info_named leaves btf_kva == 0 (Default).
+        let prog = info_named("prog");
+        assert_eq!(prog.btf_kva, 0, "info_named must default btf_kva to 0");
+        let acc = accessor(vec![pinned(prog.clone(), 0)]);
+
+        // base_btf: a minimal valid BTF blob — magic 0xEB9F, version 1,
+        // 24-byte header, one Int type (id 1) so the type section is
+        // non-empty, strtab leading with NUL. Mirrors the
+        // `cast_analysis` tests' `build_btf` minimal layout. Never
+        // dereferenced on the btf_id==0 path; built only to satisfy
+        // the `&Btf` parameter.
+        let base = minimal_btf();
+        // `btf_rs::Btf` derives neither `PartialEq` nor `Debug`, so
+        // `assert_eq!(.., None)` cannot be used on `Option<Btf>`;
+        // `is_none()` is the exact discriminant check here (the
+        // btf_id==0 guard returns the `None` variant outright, with
+        // no `Btf` value to compare).
+        assert!(
+            acc.load_program_btf(&prog, &base).is_none(),
+            "btf_id==0 must short-circuit to None before any bpf() call",
+        );
+    }
+
+    /// Hand-build a minimal parseable BTF blob: a single `int` type
+    /// (id 1, named "u64", 8 bytes) plus a NUL-led string table,
+    /// wrapped in the 24-byte BTF header. Layout verified against the
+    /// in-tree `src/monitor/cast_analysis/tests/mod.rs::build_btf`
+    /// minimal path (the `empty_btf_no_panic` test proves a
+    /// single-Int blob parses via `Btf::from_bytes`).
+    fn minimal_btf() -> Btf {
+        // String table: leading NUL (offset 0 = anonymous) + "u64\0".
+        let mut strings: Vec<u8> = vec![0];
+        let n_u64 = strings.len() as u32;
+        strings.extend_from_slice(b"u64\0");
+
+        // Type section: one BTF_KIND_INT (kind 1).
+        let mut type_section: Vec<u8> = Vec::new();
+        const BTF_KIND_INT: u32 = 1;
+        type_section.extend_from_slice(&n_u64.to_le_bytes()); // name_off
+        let info = (BTF_KIND_INT << 24) & 0x1f00_0000; // vlen 0
+        type_section.extend_from_slice(&info.to_le_bytes());
+        type_section.extend_from_slice(&8u32.to_le_bytes()); // size = 8
+        // btf_int data word: encoding 0, offset 0, bits 64.
+        let int_data: u32 = 64;
+        type_section.extend_from_slice(&int_data.to_le_bytes());
+
+        let type_len = type_section.len() as u32;
+        let str_len = strings.len() as u32;
+
+        let mut blob: Vec<u8> = Vec::new();
+        blob.extend_from_slice(&0xEB9F_u16.to_le_bytes()); // magic
+        blob.push(1); // version
+        blob.push(0); // flags
+        blob.extend_from_slice(&24u32.to_le_bytes()); // hdr_len
+        blob.extend_from_slice(&0u32.to_le_bytes()); // type_off
+        blob.extend_from_slice(&type_len.to_le_bytes()); // type_len
+        blob.extend_from_slice(&type_len.to_le_bytes()); // str_off = type_len
+        blob.extend_from_slice(&str_len.to_le_bytes()); // str_len
+        blob.extend_from_slice(&type_section);
+        blob.extend_from_slice(&strings);
+
+        Btf::from_bytes(&blob).expect("minimal synthetic BTF must parse")
+    }
 }
