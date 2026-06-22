@@ -364,77 +364,15 @@ impl BuildSandbox {
         // Disagreement means the kernel narrowed the set (parent
         // restriction or invalid bits). Under `--cpu-cap` this is
         // unacceptable; without it, warn and proceed.
-        let cpu_set: BTreeSet<usize> = plan_cpus.iter().copied().collect();
-        if let Err(e) = cg.set_cpuset(&name, &cpu_set) {
-            let _ = cg.remove_cgroup(&name);
-            return Err(e).context("write cpuset.cpus");
-        }
-        let effective_cpus =
-            read_cpuset_effective(&parent_abs.join(&name).join("cpuset.cpus.effective"));
-        if let Some(eff) = &effective_cpus
-            && !cpuset_sets_equal(&cpu_set, eff)
-        {
-            // Cpuset narrowing is operational telemetry — tracing
-            // so sched-team log pipelines pick it up with the
-            // structured fields. Cross-node spill is a separate
-            // UX-facing warning that stays on eprintln!.
-            tracing::warn!(
-                cgroup = %name,
-                requested = ?cpu_set,
-                effective = ?eff,
-                "tag=resource_budget.cpuset_cpus_degraded",
-            );
-            if hard_error_on_degrade {
-                let _ = cg.remove_cgroup(&name);
-                anyhow::bail!(
-                    "--cpu-cap: cpuset.cpus narrowed by parent cgroup \
-                     (requested {cpu_set:?}, effective {eff:?}). \
-                     Run `ktstr locks --json` to inspect peers."
-                );
-            }
-        }
-
+        //
         // Step F.2: cpuset.mems — STRICTLY AFTER F.1. A cgroup with
         // empty cpuset.mems + a task in cgroup.procs would hit
         // SIGKILL on the next allocation per the kernel's
         // `cpuset_update_task_spread` path (already doc'd on
-        // CgroupManager::set_cpuset_mems).
-        if let Err(e) = cg.set_cpuset_mems(&name, plan_mems) {
-            let _ = cg.remove_cgroup(&name);
-            return Err(e).context("write cpuset.mems");
-        }
-        let effective_mems =
-            read_cpuset_effective(&parent_abs.join(&name).join("cpuset.mems.effective"));
-        if let Some(eff) = &effective_mems
-            && !cpuset_sets_equal(plan_mems, eff)
-        {
-            tracing::warn!(
-                cgroup = %name,
-                requested = ?plan_mems,
-                effective = ?eff,
-                "tag=resource_budget.cpuset_mems_degraded",
-            );
-            if hard_error_on_degrade {
-                let _ = cg.remove_cgroup(&name);
-                anyhow::bail!(
-                    "--cpu-cap: cpuset.mems narrowed by parent cgroup \
-                     (requested {plan_mems:?}, effective {eff:?}).\n\
-                     \n\
-                     Remediation:\n\
-                     \n\
-                       1. The parent cgroup's cpuset.mems is narrower than \
-                          the plan's NUMA node set. Run `ktstr locks` to \
-                          see which parent is active and `cat \
-                          /proc/self/cgroup` for the path, then either \
-                          widen that parent's cpuset.mems or move this \
-                          process under a wider cgroup (systemd-run \
-                          --user --scope -p Delegate=cpuset).\n\
-                       2. Drop --cpu-cap to build under LLC flock \
-                          coordination alone, trading NUMA enforcement \
-                          for the noisier fallback path."
-                );
-            }
-        }
+        // CgroupManager::set_cpuset_mems). The cpus-before-mems call
+        // order is a kernel ordering rule, not a stylistic choice.
+        write_and_verify_cpuset_cpus(&cg, &name, &parent_abs, plan_cpus, hard_error_on_degrade)?;
+        write_and_verify_cpuset_mems(&cg, &name, &parent_abs, plan_mems, hard_error_on_degrade)?;
 
         // Step G: migrate self into cgroup.procs AFTER both cpuset
         // writes. Use move_task (the single-pid variant) because
@@ -563,6 +501,95 @@ impl Drop for BuildSandbox {
             }
         }
     }
+}
+
+/// Write `cpuset.cpus` (Step F.1), then read back `.effective` and
+/// fail or warn on parent-narrowing per `hard_error_on_degrade`.
+fn write_and_verify_cpuset_cpus(
+    cg: &CgroupManager,
+    name: &str,
+    parent_abs: &Path,
+    plan_cpus: &[usize],
+    hard_error_on_degrade: bool,
+) -> Result<()> {
+    let cpu_set: BTreeSet<usize> = plan_cpus.iter().copied().collect();
+    if let Err(e) = cg.set_cpuset(name, &cpu_set) {
+        let _ = cg.remove_cgroup(name);
+        return Err(e).context("write cpuset.cpus");
+    }
+    let effective_cpus =
+        read_cpuset_effective(&parent_abs.join(name).join("cpuset.cpus.effective"));
+    if let Some(eff) = &effective_cpus
+        && !cpuset_sets_equal(&cpu_set, eff)
+    {
+        // Cpuset narrowing is operational telemetry — tracing
+        // so sched-team log pipelines pick it up with the
+        // structured fields. Cross-node spill is a separate
+        // UX-facing warning that stays on eprintln!.
+        tracing::warn!(
+            cgroup = %name,
+            requested = ?cpu_set,
+            effective = ?eff,
+            "tag=resource_budget.cpuset_cpus_degraded",
+        );
+        if hard_error_on_degrade {
+            let _ = cg.remove_cgroup(name);
+            anyhow::bail!(
+                "--cpu-cap: cpuset.cpus narrowed by parent cgroup \
+                 (requested {cpu_set:?}, effective {eff:?}). \
+                 Run `ktstr locks --json` to inspect peers."
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Write `cpuset.mems` (Step F.2), then read back `.effective` and
+/// fail or warn on parent-narrowing per `hard_error_on_degrade`.
+fn write_and_verify_cpuset_mems(
+    cg: &CgroupManager,
+    name: &str,
+    parent_abs: &Path,
+    plan_mems: &BTreeSet<usize>,
+    hard_error_on_degrade: bool,
+) -> Result<()> {
+    if let Err(e) = cg.set_cpuset_mems(name, plan_mems) {
+        let _ = cg.remove_cgroup(name);
+        return Err(e).context("write cpuset.mems");
+    }
+    let effective_mems =
+        read_cpuset_effective(&parent_abs.join(name).join("cpuset.mems.effective"));
+    if let Some(eff) = &effective_mems
+        && !cpuset_sets_equal(plan_mems, eff)
+    {
+        tracing::warn!(
+            cgroup = %name,
+            requested = ?plan_mems,
+            effective = ?eff,
+            "tag=resource_budget.cpuset_mems_degraded",
+        );
+        if hard_error_on_degrade {
+            let _ = cg.remove_cgroup(name);
+            anyhow::bail!(
+                "--cpu-cap: cpuset.mems narrowed by parent cgroup \
+                 (requested {plan_mems:?}, effective {eff:?}).\n\
+                 \n\
+                 Remediation:\n\
+                 \n\
+                   1. The parent cgroup's cpuset.mems is narrower than \
+                      the plan's NUMA node set. Run `ktstr locks` to \
+                      see which parent is active and `cat \
+                      /proc/self/cgroup` for the path, then either \
+                      widen that parent's cpuset.mems or move this \
+                      process under a wider cgroup (systemd-run \
+                      --user --scope -p Delegate=cpuset).\n\
+                   2. Drop --cpu-cap to build under LLC flock \
+                      coordination alone, trading NUMA enforcement \
+                      for the noisier fallback path."
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Return `true` when `parent_rel` (as emitted by

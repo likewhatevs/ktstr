@@ -177,7 +177,6 @@ const EXCEPTIONS: &[(&str, &str, usize)] = &[
         "analyze_one_object_with_btf",
         217,
     ), // queued: decompose
-    ("vmm/cgroup_sandbox.rs", "BuildSandbox::try_create", 246),   // queued: decompose
     ("vmm/disk_template/mod.rs", "build_template_via_vm", 233),   // queued: decompose
     ("vmm/freeze_coord/dispatch.rs", "dispatch_bulk_message", 534), // queued: decompose
     ("vmm/freeze_coord/mod.rs", "KtstrVm::collect_results", 474), // queued: decompose
