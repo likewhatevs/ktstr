@@ -1844,6 +1844,7 @@ mod tests {
         assert_eq!(reply.reason, "");
     }
 
+    mod common;
     mod target_validation;
 
     // ---- same-rendezvous-epoch marker-anchor test ----
@@ -1973,5 +1974,6 @@ mod tests {
         );
     }
 
+    mod dispatch_arms;
     mod task_field;
 }
