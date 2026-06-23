@@ -180,12 +180,14 @@ fn assert_api_gap_helpers(result: &VmResult) -> Result<()> {
 
     // gap 8: phase_cgroup(phase, name) surfaces one cgroup's per-phase
     // telemetry directly — the per-phase analog of result.stats.cgroups.
-    let cg0 = result.phase_cgroup(Phase::step(0), "cg_step0").ok_or_else(|| {
-        anyhow::anyhow!(
-            "phase_cgroup(Step[0], cg_step0) returned None despite the \
+    let cg0 = result
+        .phase_cgroup(Phase::step(0), "cg_step0")
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "phase_cgroup(Step[0], cg_step0) returned None despite the \
              step-local cgroup being declared in Step[0]",
-        )
-    })?;
+            )
+        })?;
     anyhow::ensure!(
         cg0.num_workers >= 1,
         "cg_step0 carrier reports {} workers; the scenario declared 2",
@@ -193,7 +195,9 @@ fn assert_api_gap_helpers(result: &VmResult) -> Result<()> {
     );
     // A cgroup that never existed in the phase is None (not a panic / wrong cgroup).
     anyhow::ensure!(
-        result.phase_cgroup(Phase::step(0), "no_such_cgroup").is_none(),
+        result
+            .phase_cgroup(Phase::step(0), "no_such_cgroup")
+            .is_none(),
         "phase_cgroup must return None for a cgroup absent from the phase",
     );
 

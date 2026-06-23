@@ -1734,7 +1734,9 @@ mod tests {
             per_cgroup,
         }];
         crate::vmm::host_comms::BulkDrainResult {
-            entries: vec![crate::test_support::test_helpers::assert_result_tlv_entry(&guest)],
+            entries: vec![crate::test_support::test_helpers::assert_result_tlv_entry(
+                &guest,
+            )],
         }
     }
 
@@ -1768,7 +1770,10 @@ mod tests {
             .expect("phase_cgroup must reach the folded carrier");
         assert_eq!(via_accessor.total_migrations, 7);
         // A cgroup the phase never had -> None (not measured).
-        assert!(r.phase_cgroup(crate::assert::Phase::step(0), "nope").is_none());
+        assert!(
+            r.phase_cgroup(crate::assert::Phase::step(0), "nope")
+                .is_none()
+        );
     }
 
     /// `phase_metric("total_migrations")` resolves the per-phase
@@ -1858,9 +1863,15 @@ mod tests {
     #[test]
     fn phase_buckets_without_guest_verdict_is_host_only() {
         let r = vm_result_with_periodic_captures(2);
-        assert!(r.guest_assert_result().is_err(), "test_fixture has no guest verdict");
+        assert!(
+            r.guest_assert_result().is_err(),
+            "test_fixture has no guest verdict"
+        );
         let buckets = r.phase_buckets();
-        assert!(!buckets.is_empty(), "host captures must still yield buckets");
+        assert!(
+            !buckets.is_empty(),
+            "host captures must still yield buckets"
+        );
         assert!(
             buckets.iter().all(|b| b.per_cgroup.is_empty()),
             "no guest carriers -> every per_cgroup stays empty",
@@ -1900,7 +1911,9 @@ mod tests {
         }];
         let r = VmResult {
             guest_messages: Some(crate::vmm::host_comms::BulkDrainResult {
-                entries: vec![crate::test_support::test_helpers::assert_result_tlv_entry(&guest)],
+                entries: vec![crate::test_support::test_helpers::assert_result_tlv_entry(
+                    &guest,
+                )],
             }),
             ..vm_result_with_periodic_captures(2)
         };
