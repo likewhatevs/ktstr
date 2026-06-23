@@ -1311,6 +1311,90 @@ fn phase_buckets_equals_stats_phases_and_post_vm_read_does_not_starve() {
     );
 }
 
+/// Sibling of the no-carrier equality pin above, WITH guest per-cgroup
+/// carriers: `VmResult::phase_buckets()` folds the guest carriers exactly as
+/// production `evaluate_vm_result` does, so the two stay equal AND both expose
+/// `per_cgroup`. Pins that the fold is applied on both paths — without it,
+/// `phase_buckets()` returned host buckets with EMPTY per_cgroup (a strict
+/// subset of `stats.phases`), so this `assert_eq!` would have failed.
+#[test]
+fn phase_buckets_equals_stats_phases_with_guest_per_cgroup_carriers() {
+    // Passing guest AssertResult carrying a per-cgroup carrier at
+    // step_index=1; the captures below stamp the same step_index, so the
+    // carrier takes the matched arm and unions its per_cgroup into that bucket.
+    let mut guest_assert = build_assert_result(true, vec![]);
+    let mut pc = std::collections::BTreeMap::new();
+    pc.insert(
+        "cellA".to_string(),
+        crate::assert::PhaseCgroupStats {
+            total_migrations: 7,
+            total_iterations: 11,
+            ..Default::default()
+        },
+    );
+    guest_assert.stats.phases = vec![crate::assert::PhaseBucket {
+        step_index: 1,
+        label: "Step[0]".to_string(),
+        // Merge-neutral window required by fold_guest_per_cgroup_into_host_buckets.
+        start_ms: u64::MAX,
+        end_ms: 0,
+        sample_count: 0,
+        metrics: std::collections::BTreeMap::new(),
+        per_cgroup: pc,
+    }];
+    let entry = sched_entry("__eval_phase_buckets_eq_carriers__");
+    let result = crate::vmm::VmResult {
+        success: true,
+        guest_messages: Some(crate::vmm::host_comms::BulkDrainResult {
+            entries: vec![crate::test_support::test_helpers::assert_result_tlv_entry(
+                &guest_assert,
+            )],
+        }),
+        periodic_fired: 3,
+        periodic_target: 3,
+        ..crate::vmm::VmResult::test_fixture()
+    };
+    for i in 0..3 {
+        result.snapshot_bridge.store_with_stats_and_step(
+            &format!("periodic_{i}"),
+            crate::monitor::dump::FailureDumpReport::default(),
+            None,
+            Some(i as u64 * 100),
+            None,
+            1,
+        );
+    }
+    // post_vm reads first; the fold must EXPOSE per_cgroup on this view.
+    let post_vm_buckets = result.phase_buckets();
+    let step0 = post_vm_buckets
+        .iter()
+        .find(|b| b.step_index == 1)
+        .expect("a Step[0] bucket from the stamped captures");
+    assert_eq!(
+        step0.per_cgroup.get("cellA").map(|c| c.total_migrations),
+        Some(7),
+        "phase_buckets() must fold the guest per_cgroup carrier",
+    );
+    let stimulus = result.stimulus_timeline();
+    let ar = evaluate_vm_result(
+        &entry,
+        &result,
+        &crate::assert::Assert::NO_OVERRIDES,
+        &stimulus,
+        &[],
+        &[],
+        &EVAL_TOPO,
+        &no_repro,
+        None,
+    )
+    .expect("pass_assert on the success arm must return Ok");
+    assert_eq!(
+        ar.stats.phases, post_vm_buckets,
+        "stats.phases must equal VmResult::phase_buckets() WITH per_cgroup \
+         carriers folded — identical two-source fold on both paths",
+    );
+}
+
 /// Eval REORDER wiring: on the GUEST-FAIL path the failure message's
 /// timeline is built from the POST-fold `check_result.stats.phases`
 /// (folded_timeline), so the per-cgroup sub-block AND orphan not-measured

@@ -983,6 +983,46 @@ impl PhaseBucket {
             )
         })
     }
+
+    /// Cross-cgroup phase total for a per-cgroup Counter metric that lives
+    /// in [`Self::per_cgroup`] but never in [`Self::metrics`] — currently
+    /// `"total_migrations"` and `"total_iterations"`.
+    ///
+    /// These are registered `MetricKind::Counter`s
+    /// (`crate::stats::METRICS`) whose per-sample source is absent
+    /// (`crate::stats::MetricDef::read_sample` returns `None` — they are
+    /// per-task guest counters not captured per tick), so
+    /// [`crate::assert::build_phase_buckets`] never folds them into
+    /// `metrics`; only the per-cgroup carrier ([`PhaseCgroupStats`], built
+    /// by `phase_cgroup_stats`) holds them. This sums them across the
+    /// phase's `per_cgroup` carriers — the SAME cross-cgroup Counter sum
+    /// [`ScenarioStats::total_migrations`] takes run-level and
+    /// `merge_matched_phase_buckets` takes per key — so the value is the
+    /// phase total, not a per-cgroup fragment.
+    ///
+    /// `None` when the phase has no `per_cgroup` carriers (NOT measured —
+    /// distinct from a measured `Some(0.0)` when carriers exist but counted
+    /// zero) or `name` is not one of the per-cgroup-sourced counters. Both
+    /// keys are in `TYPED_FIELD_NAMES`, so surfacing them here never
+    /// double-sources the run-level `ext_metrics`
+    /// (`populate_run_ext_metrics_from_phases` skips them; the typed
+    /// `GauntletRow` accessor stays the single run-level authority).
+    ///
+    /// Counterpart to [`Self::get`] (which reads `metrics` only).
+    /// [`crate::vmm::VmResult::phase_metric`] falls back to this so a
+    /// `post_vm` callback reading `phase_metric(phase, "total_migrations")`
+    /// gets the value instead of a silent `None`.
+    pub fn cgroup_counter_total(&self, name: &str) -> Option<f64> {
+        let field: fn(&PhaseCgroupStats) -> u64 = match name {
+            "total_migrations" => |c| c.total_migrations,
+            "total_iterations" => |c| c.total_iterations,
+            _ => return None,
+        };
+        if self.per_cgroup.is_empty() {
+            return None;
+        }
+        Some(self.per_cgroup.values().map(field).sum::<u64>() as f64)
+    }
 }
 
 /// Merge two [`PhaseBucket`]s sharing the same `step_index` per

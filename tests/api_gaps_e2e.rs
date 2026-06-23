@@ -154,6 +154,75 @@ fn assert_api_gap_helpers(result: &VmResult) -> Result<()> {
          per-phase buckets to post_vm even after periodic_series() ran",
     );
 
+    // gap 7: phase_buckets() folds the guest per-cgroup carriers, so each
+    // Step's bucket carries its step-local cgroup in `per_cgroup` (cg_step0
+    // declared in Step[0] = step_index 1, cg_step1 in Step[1] = step_index 2).
+    // Before the fold, phase_buckets() returned host buckets with EMPTY
+    // per_cgroup and this would fail. The carriers are emitted from worker
+    // reports at each step's collect teardown — independent of periodic
+    // captures — so this holds whether the step's bucket was captured
+    // (matched arm) or synthesized/orphaned.
+    let step0_has_cg = phase_buckets
+        .iter()
+        .find(|b| b.step_index == Phase::step(0).as_u16())
+        .is_some_and(|b| b.per_cgroup.contains_key("cg_step0"));
+    let step1_has_cg = phase_buckets
+        .iter()
+        .find(|b| b.step_index == Phase::step(1).as_u16())
+        .is_some_and(|b| b.per_cgroup.contains_key("cg_step1"));
+    anyhow::ensure!(
+        step0_has_cg && step1_has_cg,
+        "phase_buckets() must fold the step-local per_cgroup carriers: \
+         cg_step0 in Step[0] (found {step0_has_cg}), cg_step1 in Step[1] \
+         (found {step1_has_cg}); empty per_cgroup means the guest-carrier \
+         fold did not reach phase_buckets()",
+    );
+
+    // gap 8: phase_cgroup(phase, name) surfaces one cgroup's per-phase
+    // telemetry directly — the per-phase analog of result.stats.cgroups.
+    let cg0 = result
+        .phase_cgroup(Phase::step(0), "cg_step0")
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "phase_cgroup(Step[0], cg_step0) returned None despite the \
+             step-local cgroup being declared in Step[0]",
+            )
+        })?;
+    anyhow::ensure!(
+        cg0.num_workers >= 1,
+        "cg_step0 carrier reports {} workers; the scenario declared 2",
+        cg0.num_workers,
+    );
+    // A cgroup that never existed in the phase is None (not a panic / wrong cgroup).
+    anyhow::ensure!(
+        result
+            .phase_cgroup(Phase::step(0), "no_such_cgroup")
+            .is_none(),
+        "phase_cgroup must return None for a cgroup absent from the phase",
+    );
+
+    // gap 9: phase_metric resolves the per-cgroup Counter `total_migrations`
+    // (cross-cgroup sum) from post_vm — a key that lives only in per_cgroup,
+    // never in bucket.metrics. is_some()
+    // (not a fixed value): migration counts are nondeterministic, but a
+    // carrier-bearing phase must resolve to Some (Some(0.0) if no migration
+    // occurred), never None.
+    anyhow::ensure!(
+        result
+            .phase_metric(Phase::step(0), "total_migrations")
+            .is_some(),
+        "phase_metric(Step[0], total_migrations) returned None despite a \
+         step-local cgroup carrier in the phase — the per_cgroup counter \
+         fallback did not resolve",
+    );
+
+    // gap 10: the full guest verdict is reachable for power users.
+    anyhow::ensure!(
+        result.guest_assert_result().is_ok(),
+        "guest_assert_result() must decode the MSG_TYPE_TEST_RESULT frame \
+         this run emitted",
+    );
+
     Ok(())
 }
 
