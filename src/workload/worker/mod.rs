@@ -3382,10 +3382,11 @@ pub(super) fn worker_main(
     // host-side tempfile unlinked, heap buffer freed. Intentionally
     // NOT explicitly `take()`-d here so a panic between this point
     // and the function return still runs Drop.
-    // Clean up persistent PageFaultChurn mmap region.
-    if let Some((ptr, size)) = page_fault_region {
-        unsafe { libc::munmap(ptr, size) };
-    }
+    //
+    // The persistent page_fault_region mmap is NOT freed here: its munmap is
+    // deferred until after the NUMA read below, so a policy-governed
+    // working-set region (NumaWorkingSetSweep) is still mapped when
+    // read_numa_maps_region_pages samples it.
 
     // Final iteration count store for host-side sampling.
     // SAFETY: same as the iter_slot publish in the outer
@@ -3420,10 +3421,28 @@ pub(super) fn worker_main(
         _ => (0, 0, 0),
     };
 
-    // NUMA: read numa_maps and vmstat after workload.
-    let numa_pages = read_numa_maps_pages();
+    // NUMA: read numa_maps and vmstat after workload. For NumaWorkingSetSweep
+    // the locality metric must reflect ONLY the policy-governed working-set
+    // region — whole-process numa_maps is dominated by the binary/libc/stack
+    // pages COW-inherited from the parent BEFORE set_mempolicy ran, which the
+    // policy never placed (set_mempolicy governs only future faults). Scope the
+    // read to that region's VMA, which is still mapped because its munmap is
+    // deferred to just below. Other work types report the whole-process
+    // footprint as before.
+    let numa_pages = match (&work_type, page_fault_region) {
+        (WorkType::NumaWorkingSetSweep { .. }, Some((ptr, _))) => {
+            read_numa_maps_region_pages(ptr as u64)
+        }
+        _ => read_numa_maps_pages(),
+    };
     let vmstat_migrated_end = read_vmstat_numa_pages_migrated();
     let vmstat_migrated_delta = vmstat_migrated_end.saturating_sub(vmstat_migrated_start);
+
+    // Free the persistent page_fault_region mmap now that the NUMA read above
+    // has sampled it (NumaWorkingSetSweep scopes locality to this VMA).
+    if let Some((ptr, size)) = page_fault_region {
+        unsafe { libc::munmap(ptr, size) };
+    }
 
     // Final drain: a backdrop worker that observed at least one phase
     // transition has one still-open phase with no closing epoch change.

@@ -137,9 +137,11 @@ pub fn parse_numa_maps(content: &str) -> Vec<NumaMapsEntry> {
 /// `expected_nodes` (0.0-1.0). Returns 0.0 when no pages are observed
 /// — a zero-allocation workload is not vacuously local; reporting 1.0
 /// would let `min_page_locality` thresholds silently pass on broken
-/// runs that produced no NUMA signal. The expected node set is
-/// derived from the worker's
-/// [`MemPolicy`](crate::workload::MemPolicy) at evaluation time.
+/// runs that produced no NUMA signal. The expected node set is the
+/// cgroup's cpuset NUMA-node set (the nodes whose CPUs the worker is
+/// confined to), supplied by the caller — see `assert_cgroup` in
+/// `crate::assert::plan` / `crate::assert::reductions`, not the
+/// worker's [`MemPolicy`](crate::workload::MemPolicy).
 pub fn page_locality(entries: &[NumaMapsEntry], expected_nodes: &BTreeSet<usize>) -> f64 {
     let mut total: u64 = 0;
     let mut local: u64 = 0;
