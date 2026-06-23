@@ -351,44 +351,51 @@ fn assert_page_offset_randomized(result: &VmResult) -> Result<()> {
         Some(KernelOpValue::U64(v)) => *v,
         other => anyhow::bail!("expected U64, got {other:?}"),
     };
-    // 4- vs 5-level paging changes the kaslr_regions[0] base AND
-    // the region's entropy range. The kernel picks the appropriate
-    // `__PAGE_OFFSET_BASE_L{4,5}` at boot based on the LA57 CPUID
-    // bit (arch/x86/include/asm/page_64_types.h); for the entropy
-    // upper bound, kaslr_regions[0].size_tb is dynamically set to
-    // `1 << (MAX_PHYSMEM_BITS - TB_SHIFT)` (arch/x86/mm/kaslr.c)
-    // where MAX_PHYSMEM_BITS = 46 (L4) or 52 (L5). The actual
-    // entropy a given boot uses is `remain_entropy / N_regions`
-    // bounded by that size — page_offset_base can land anywhere
-    // in `[base, base + size_tb*TiB)`.
-    //
-    // Detection: observed `pob`'s upper byte. 0xff matches L5
-    // (`0xff11_0000_0000_0000` base); anything else (in practice
-    // 0xffff) falls back to L4 (`0xffff_8880_0000_0000` base).
+    // page_offset_base = vaddr_start + entropy0, where vaddr_start is the
+    // LA57-selected `__PAGE_OFFSET_BASE_L{4,5}` and entropy0 (PUD-aligned)
+    // is drawn from `remain_entropy / N_regions` — remain_entropy being the
+    // WHOLE leftover KASLR window (`vaddr_end - vaddr_start`) minus every
+    // region's padding. So the base can land far above
+    // `vaddr_start + kaslr_regions[0].size_tb`: size_tb is the region's
+    // OCCUPANCY (the padding reserved AFTER the base, and clamped DOWN to
+    // memory_tb on a small VM), NOT the placement bound. The only
+    // kernel-guaranteed ceiling on the base is vaddr_end. See
+    // `kernel_randomize_memory` in arch/x86/mm/kaslr.c.
     const DEFAULT_PAGE_OFFSET_L4: u64 = 0xffff_8880_0000_0000;
     const DEFAULT_PAGE_OFFSET_L5: u64 = 0xff11_0000_0000_0000;
-    // kaslr_regions[0].size_tb per paging mode — the upper bound
-    // on the entropy added to the base. MAX_PHYSMEM_BITS values
-    // are stable kernel constants per arch/x86/include/asm/page_*
-    // _types.h. Use the slightly-loose >> instead of `1 << (m - 40)`
-    // expressed as TiB to keep the byte arithmetic readable.
-    const REGION_SIZE_L4: u64 = 64u64 * (1u64 << 40); // 1 << (46 - 40) = 64 TiB
-    const REGION_SIZE_L5: u64 = 4096u64 * (1u64 << 40); // 1 << (52 - 40) = 4096 TiB = 4 PiB
+    // vaddr_end = CPU_ENTRY_AREA_BASE (arch/x86/include/asm/pgtable_64_types.h:
+    // CPU_ENTRY_AREA_PGD = -4, shifted by P4D_SHIFT) — the hard upper bound
+    // the randomization loop never crosses for any kaslr_regions[i].base,
+    // paging-mode-independent.
+    const VADDR_END: u64 = 0xffff_fe00_0000_0000;
     const PUD_SIZE: u64 = 1 << 30; // 1 GiB
     anyhow::ensure!(
         pob != 0,
         "page_offset_base value == 0 — derivation chain failed entirely"
     );
-    let (default_page_offset, region_size) = if (pob >> 56) == 0xff {
-        (DEFAULT_PAGE_OFFSET_L5, REGION_SIZE_L5)
+    // Paging mode by DISJOINT placement window: region 0 (page_offset_base)
+    // draws at most `remain_entropy / 3` of entropy (PUD-aligned) —
+    // kernel_randomize_memory partitions the leftover window across the
+    // three kaslr_regions (`entropy = remain_entropy / (ARRAY_SIZE - i)`,
+    // i=0) — so the L5-mode base ceiling is
+    // `__PAGE_OFFSET_BASE_L5 + (VADDR_END - __PAGE_OFFSET_BASE_L5)/3`
+    // (PUD-aligned) ≈ 0xff60_aa00_0000_0000, which is BELOW the L4 base
+    // `0xffff_8880_…` (paddings only shrink remain_entropy further). So
+    // `pob >=` the L4 base unambiguously means 4-level paging; otherwise
+    // 5-level. (The old `(pob >> 56) == 0xff` test always took the L5 arm —
+    // both bases have upper byte 0xff — so its L4 `else` arm was dead code,
+    // and a genuine 4-level system would have been mis-classified as L5.)
+    let default_page_offset = if pob >= DEFAULT_PAGE_OFFSET_L4 {
+        DEFAULT_PAGE_OFFSET_L4
     } else {
-        (DEFAULT_PAGE_OFFSET_L4, REGION_SIZE_L4)
+        DEFAULT_PAGE_OFFSET_L5
     };
     anyhow::ensure!(
-        (default_page_offset..default_page_offset.wrapping_add(region_size)).contains(&pob),
-        "page_offset_base = {pob:#x} outside {default_page_offset:#x}.. + {} TiB range \
-         (kaslr_regions[0].size_tb for this paging mode) — picked outside its assigned zone",
-        region_size / (1u64 << 40),
+        (default_page_offset..VADDR_END).contains(&pob),
+        "page_offset_base = {pob:#x} outside the KASLR randomization window \
+         [{default_page_offset:#x}, {VADDR_END:#x}) (vaddr_start..CPU_ENTRY_AREA_BASE \
+         per arch/x86/mm/kaslr.c kernel_randomize_memory) — genuinely bogus base \
+         (zero, below vaddr_start, or above vaddr_end / wrapped)",
     );
     anyhow::ensure!(
         (pob - default_page_offset).is_multiple_of(PUD_SIZE),
