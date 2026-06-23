@@ -33,17 +33,18 @@ macro_rules! skip {
 
 /// Evaluate a `Result`-returning builder (or any `anyhow::Result`
 /// expression) and either unwrap the value or skip gracefully on a
-/// skip-class error: [`crate::vmm::host_topology::ResourceContention`]
-/// (transient slot/resource shortage),
-/// [`crate::vmm::host_topology::TopologyInsufficient`] (the VM cannot boot
-/// at all on this host — the x86_64 kvm hardware caps), or
-/// [`crate::vmm::host_topology::PerfModeUnavailable`] (the host
-/// fundamentally cannot honor perf-mode — too few CPUs for an exclusive
-/// LLC + a service CPU). All are matched chain-aware
-/// (`e.chain().any(...)`) so a `.context(...)`-wrapped instance still
-/// skips. Any other error panics with `{e:#}` — including the hard-error
-/// `CpuBudgetUnsatisfiable` (an explicitly-typed cpu budget the host
-/// cannot satisfy is a FAIL, not a skip).
+/// skip-class host-insufficiency error. Routes the error through the
+/// shared `crate::test_support::classify_host_error` — the single source
+/// of truth also used by `err_to_exit_code` and the `#[ktstr_test]` macro
+/// body — so this helper can never drift from them. A `HostClass::Skip`
+/// (resource contention, topology insufficient, or perf-mode unavailable —
+/// chain-aware, so a `.context(...)`-wrapped instance still skips) emits
+/// the canonical SKIP banner and early-returns. Everything else panics
+/// with `{e:#}`: a `HostClass::Fail` (the hard-error
+/// `CpuBudgetUnsatisfiable` / `TopologyUnrepresentable`) and any
+/// non-host-class error are real failures, not skips. `no_skip` is passed
+/// `false` — this helper always skips the skip-class errors and has no
+/// `KTSTR_NO_SKIP_MODE` promotion (unchanged from its prior behavior).
 ///
 /// Replaces the recurring `match ... { Ok => v, Err(e) if
 /// ResourceContention => skip!(...), Err(e) => panic!(...) }`
@@ -53,34 +54,18 @@ macro_rules! skip_on_contention {
     ($expr:expr) => {
         match $expr {
             Ok(v) => v,
-            Err(e)
-                if e.chain().any(|cause| {
-                    cause
-                        .downcast_ref::<$crate::vmm::host_topology::ResourceContention>()
-                        .is_some()
-                }) =>
-            {
-                skip!("resource contention: {e:#}");
-            }
-            Err(e)
-                if e.chain().any(|cause| {
-                    cause
-                        .downcast_ref::<$crate::vmm::host_topology::TopologyInsufficient>()
-                        .is_some()
-                }) =>
-            {
-                skip!("host topology insufficient: {e:#}");
-            }
-            Err(e)
-                if e.chain().any(|cause| {
-                    cause
-                        .downcast_ref::<$crate::vmm::host_topology::PerfModeUnavailable>()
-                        .is_some()
-                }) =>
-            {
-                skip!("performance mode unavailable: {e:#}");
-            }
-            Err(e) => panic!("{e:#}"),
+            Err(e) => match $crate::test_support::classify_host_error(&e, false) {
+                $crate::test_support::HostClass::Skip { reason } => {
+                    skip!("{reason}");
+                }
+                // Fail (cpu-budget / topology-unrepresentable) and any
+                // non-host-class error are real failures, not skips —
+                // panic, exactly as the prior open-coded catch-all did
+                // (those were never in this helper's skip set). no_skip is
+                // false above, so the skip-class errors classify as Skip
+                // here, never Fail.
+                _ => panic!("{e:#}"),
+            },
         }
     };
 }
@@ -144,7 +129,7 @@ macro_rules! assert_not_impl_default {
 #[cfg(test)]
 mod tests {
     use crate::vmm::host_topology::{
-        PerfModeUnavailable, ResourceContention, TopologyInsufficient,
+        CpuBudgetUnsatisfiable, PerfModeUnavailable, ResourceContention, TopologyInsufficient,
     };
 
     /// Regression for the error-chain fix: a ResourceContention wrapped
@@ -284,6 +269,26 @@ mod tests {
         fn skip_fn() {
             let err =
                 anyhow::anyhow!("scheduler regression: workload did not get the CPU time it needs");
+            let _: () = skip_on_contention!(Err::<(), _>(err));
+        }
+        skip_fn();
+    }
+
+    /// A typed HARD-FAIL host error is NOT in skip_on_contention!'s skip
+    /// set: classify_host_error returns HostClass::Fail for a
+    /// CpuBudgetUnsatisfiable (an explicit cpu budget the host cannot
+    /// satisfy), which the macro's `_ =>` arm panics — a typed hard-fail
+    /// must never be swallowed as a skip. Pins the Fail->panic boundary the
+    /// classify_host_error routing depends on; the skip tests cover the
+    /// Skip set (RC/TI/perf) and the plain-NotHostClass panics, but not
+    /// this typed-Fail edge.
+    #[test]
+    #[should_panic(expected = "exceeds the allowed cpuset")]
+    fn skip_on_contention_panics_on_typed_hard_fail() {
+        fn skip_fn() {
+            let err: anyhow::Error = anyhow::Error::new(CpuBudgetUnsatisfiable {
+                reason: "cpu_budget = 999 exceeds the allowed cpuset".into(),
+            });
             let _: () = skip_on_contention!(Err::<(), _>(err));
         }
         skip_fn();
