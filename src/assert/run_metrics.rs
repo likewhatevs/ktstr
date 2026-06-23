@@ -149,8 +149,11 @@ impl ScenarioStats {
     /// gate, check `min > 0` over the same cgroups separately.
     ///
     /// Whole-run aggregate: this reads `self.cgroups`, which sums over all
-    /// phases. For a single phase's balance in a multi-phase scenario, use
-    /// the per-`Phase` variant once per-phase per-cgroup stats land.
+    /// phases. For a single phase's per-cgroup balance in a multi-phase
+    /// scenario, read each cgroup's per-phase throughput (`total_iterations`
+    /// / `num_workers`) from [`crate::vmm::VmResult::phase_cgroup`] — the
+    /// per-phase per-cgroup carriers now landed in
+    /// [`PhaseBucket::per_cgroup`].
     pub fn cgroup_balance_ratio(&self) -> Option<f64> {
         let mut min = f64::INFINITY;
         let mut max = 0.0_f64;

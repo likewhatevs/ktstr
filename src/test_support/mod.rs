@@ -60,6 +60,11 @@ mod metrics;
 #[cfg(feature = "llm")]
 mod model;
 mod output;
+// Reachable crate-wide (vmm::VmResult::guest_assert_result parses the guest
+// AssertResult from its own drained guest_messages via this helper, mirroring
+// the eval-layer use). The fn itself is pub(crate); this just lifts it out of
+// the private `output` module so the vmm layer can call it by a stable path.
+pub(crate) use output::parse_assert_result_from_drain;
 mod payload;
 mod probe;
 mod probe_metrics;

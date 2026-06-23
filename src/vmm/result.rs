@@ -686,73 +686,161 @@ impl VmResult {
         start.rate_to(end)
     }
 
-    /// The framework-computed per-phase metric buckets for this run —
-    /// the SAME [`crate::assert::PhaseBucket`] vec the framework folds
-    /// onto [`crate::assert::ScenarioStats::phases`] in
-    /// `evaluate_vm_result`.
+    /// The guest-side [`crate::assert::AssertResult`] decoded from this
+    /// run's `MSG_TYPE_TEST_RESULT` frame — the verdict the in-VM scenario
+    /// body produced, carrying the per-phase per-cgroup raw telemetry
+    /// carriers in `stats.phases[].per_cgroup`
+    /// ([`crate::assert::PhaseCgroupStats`]: `total_migrations`,
+    /// `run_delays_ns`, `cpus_used`, …) and the per-cgroup reductions in
+    /// `stats.cgroups`.
+    ///
+    /// Non-destructive: reads the already-drained `guest_messages` TLV log
+    /// (the last crc-ok `MSG_TYPE_TEST_RESULT` entry), so it composes with
+    /// the snapshot-bridge accessors and may be called repeatedly. Shares
+    /// the exact decode the eval layer uses
+    /// (`crate::test_support::parse_assert_result_from_drain`).
+    ///
+    /// `Err` when there is no guest verdict to decode — a host-only run, a
+    /// crash before the body emitted its result, or a drain with no
+    /// `MSG_TYPE_TEST_RESULT` frame.
+    ///
+    /// This is the GUEST view: the run-level distribution / `ext_metrics`
+    /// re-pools (`worst_*` wake-latency / run-delay aggregates, pooled
+    /// `iterations_per_cpu_sec`) are applied HOST-side in `evaluate_vm_result`
+    /// AFTER the body returns and are NOT on this value — only
+    /// `stats.phases[].per_cgroup` and the per-cgroup `stats.cgroups`
+    /// reductions are guest-authoritative. For the per-phase per-cgroup view
+    /// aligned to the host capture windows use [`Self::phase_buckets`] (which
+    /// folds these carriers in); for one cgroup in one phase use
+    /// [`Self::phase_cgroup`].
+    pub fn guest_assert_result(&self) -> anyhow::Result<crate::assert::AssertResult> {
+        crate::test_support::parse_assert_result_from_drain(self.guest_messages.as_ref())
+    }
+
+    /// The framework-computed per-phase metric buckets for this run — the
+    /// SAME [`crate::assert::PhaseBucket`] vec the framework folds onto
+    /// [`crate::assert::ScenarioStats::phases`] in `evaluate_vm_result`,
+    /// INCLUDING the per-phase per-cgroup carriers in
+    /// [`crate::assert::PhaseBucket::per_cgroup`].
     ///
     /// This is the answer to "my `post_vm` callback wants the per-phase
-    /// metrics the framework already built." Before this accessor, a
-    /// `post_vm` had to re-derive them by hand —
-    /// `build_phase_buckets_with_stimulus(&result.periodic_series(),
-    /// &result.stimulus_timeline())` — which both duplicated the
-    /// framework's logic AND destructively drained the bridge, leaving
-    /// the framework's own `result.stats.phases` empty (the drain-once
-    /// starvation [`Self::captures_series`] now prevents).
+    /// metrics the framework already built." It folds the same two sources
+    /// `evaluate_vm_result` does:
+    /// 1. the host-rebuilt buckets from [`Self::periodic_series`] (the
+    ///    periodic-only projection of the shared single drain — on-demand /
+    ///    watchpoint captures are off-cadence outliers excluded from
+    ///    per-phase folds) through
+    ///    [`crate::assert::build_phase_buckets_with_stimulus`] using
+    ///    [`Self::stimulus_timeline`] for the step windows (window + metric
+    ///    folds; `per_cgroup` empty by construction); and
+    /// 2. the guest per-cgroup carriers from [`Self::guest_assert_result`]
+    ///    (`stats.phases[].per_cgroup`), folded in by
+    ///    `crate::assert::fold_guest_per_cgroup_into_host_buckets` keyed by
+    ///    `step_index` (the host window + metrics win; each carrier
+    ///    contributes only its `per_cgroup`, an unmatched carrier surfacing
+    ///    as a `(0,0)`-window orphan bucket).
     ///
-    /// Folds [`Self::periodic_series`] (the periodic-only projection of
-    /// the shared single drain — on-demand / watchpoint captures are
-    /// off-cadence outliers excluded from per-phase folds) through
-    /// [`crate::assert::build_phase_buckets_with_stimulus`] using
-    /// [`Self::stimulus_timeline`] for the step windows. In production
-    /// the framework builds `stats.phases` from the same periodic-only
-    /// series and the same stimulus timeline, so this returns content
-    /// identical to `result.stats.phases` — but ONLY when there are no
-    /// step-local-cgroup per_cgroup carriers (pinned by
-    /// `phase_buckets_equals_stats_phases_and_post_vm_read_does_not_starve`,
-    /// whose fixture has none). With step-local cgroups, `evaluate_vm_result`
-    /// folds the guest per_cgroup carriers into `stats.phases` (and may append
-    /// orphan buckets) via `fold_guest_per_cgroup_into_host_buckets`, so
-    /// `stats.phases` is then a SUPERSET — this accessor still returns the
-    /// host-rebuilt buckets with EMPTY per_cgroup and no orphans, i.e. it does
-    /// NOT expose per_cgroup.
+    /// Production builds `stats.phases` from these same two sources (same
+    /// periodic-only series, same stimulus timeline, same guest carriers) and
+    /// the eval layer's later `populate_run_*` passes write only
+    /// `stats.ext_metrics` / `stats.cgroups`, never `phases[].per_cgroup`, so
+    /// this returns content IDENTICAL to `result.stats.phases` — the
+    /// no-carrier case pinned by
+    /// `phase_buckets_equals_stats_phases_and_post_vm_read_does_not_starve`
+    /// and the with-per-cgroup-carrier case by
+    /// `phase_buckets_equals_stats_phases_with_guest_per_cgroup_carriers`.
+    ///
+    /// Both sources are non-destructive on the snapshot bridge:
+    /// [`Self::periodic_series`] reads the memoized single drain
+    /// ([`Self::captures_series`]) and [`Self::guest_assert_result`] reads the
+    /// already-drained `guest_messages`. A run with no guest verdict
+    /// ([`Self::guest_assert_result`] `Err` — host-only / early crash) folds
+    /// no carriers and returns the host-rebuilt buckets alone (the prior
+    /// behavior).
     pub fn phase_buckets(&self) -> Vec<crate::assert::PhaseBucket> {
-        crate::assert::build_phase_buckets_with_stimulus(
+        let host = crate::assert::build_phase_buckets_with_stimulus(
             &self.periodic_series(),
             &self.stimulus_timeline(),
-        )
+        );
+        match self.guest_assert_result() {
+            Ok(guest) => {
+                crate::assert::fold_guest_per_cgroup_into_host_buckets(host, guest.stats.phases)
+            }
+            Err(_) => host,
+        }
+    }
+
+    /// One phase's per-cgroup telemetry for `cgroup` — the per-phase analog
+    /// of reading `result.stats.cgroups` for a single phase. Reads
+    /// [`Self::phase_buckets`] (which folds the guest per-cgroup carriers
+    /// against the host capture windows) and returns the
+    /// [`crate::assert::PhaseCgroupStats`] keyed by `cgroup` in `phase`.
+    ///
+    /// `None` when `phase` has no bucket (no capture landed in it AND no
+    /// stimulus `StepStart` synthesized one) or the phase carries no carrier
+    /// for `cgroup` (the cgroup ran no workers in that phase, or the run had
+    /// no step-local cgroups). Owned (cloned from the folded bucket) so it
+    /// composes with the `&VmResult` `post_vm` callback signature.
+    pub fn phase_cgroup(
+        &self,
+        phase: crate::assert::Phase,
+        cgroup: &str,
+    ) -> Option<crate::assert::PhaseCgroupStats> {
+        self.phase_buckets()
+            .into_iter()
+            .find(|b| b.step_index == phase.as_u16())
+            .and_then(|b| b.per_cgroup.get(cgroup).cloned())
     }
 
     /// One framework-computed per-phase metric for `phase` — the
     /// metric-name analog of [`Self::step_throughput`] /
-    /// [`Self::throughput_ratio`], covering the per-phase metrics that
-    /// are NOT iteration throughput: per-phase CPU time
-    /// (`system_time_ns`, `user_time_ns`) and scheduling quality
-    /// (`avg_imbalance_ratio`, `avg_dsq_depth`, ...). `metric` is a
-    /// `crate::stats::METRICS` registry name. (The wake-latency / run-delay
-    /// distributions are `MetricKind::Distribution`: they have no per-phase
-    /// `PhaseBucket::metrics` value — they re-pool run-level from the
-    /// per-cgroup carriers — so they are not readable here.)
+    /// [`Self::throughput_ratio`]. Resolves `metric` (a
+    /// `crate::stats::METRICS` registry name) from the folded
+    /// [`Self::phase_buckets`] bucket for `phase`, checking two stores:
+    /// 1. [`crate::assert::PhaseBucket::metrics`] (via
+    ///    [`crate::assert::PhaseBucket::get`]) — the host-folded
+    ///    per-sample / monitor / stimulus metrics: per-phase CPU time
+    ///    (`system_time_ns`, `user_time_ns`), scheduling quality
+    ///    (`avg_imbalance_ratio`, `avg_dsq_depth`, ...), and
+    ///    `iteration_rate`.
+    /// 2. failing that, the cross-cgroup phase sum of a per-cgroup Counter
+    ///    ([`crate::assert::PhaseBucket::cgroup_counter_total`]) for the
+    ///    keys whose value lives ONLY in the per-cgroup carriers —
+    ///    `"total_migrations"` and `"total_iterations"`. These are
+    ///    registered `Counter`s with no per-sample source
+    ///    (`crate::stats::MetricDef::read_sample` returns `None`), so
+    ///    they never reach `metrics`; without this fallback
+    ///    `phase_metric(phase, "total_migrations")` returned a silent
+    ///    `None` even though the value was present per-cgroup.
+    ///
+    /// The wake-latency / run-delay distributions (`MetricKind::Distribution`)
+    /// have no per-phase `metrics` value and no single per-cgroup Counter
+    /// (they re-pool run-level from the per-cgroup raw sample vectors), so
+    /// they are not readable here — read them per-cgroup via
+    /// [`Self::phase_cgroup`].
     ///
     /// Reads the SAME buckets [`Self::phase_buckets`] folds onto
     /// `result.stats.phases`, so a `post_vm` callback can compare any
     /// metric across two phases (e.g. scheduler-vs-detached-EEVDF
-    /// `system_time_ns`) without re-deriving the buckets — the
-    /// general form of the scheduler-vs-EEVDF throughput compare.
+    /// `total_migrations` or `system_time_ns`) without re-deriving the
+    /// buckets — the general form of the scheduler-vs-EEVDF throughput
+    /// compare.
+    ///
     /// `None` when `phase` has no bucket — no capture landed in it AND no
     /// stimulus `StepStart` synthesized one (e.g. `Phase::BASELINE` when
     /// the settle window fired no captures, or a `phase` past the last
-    /// step) — or the bucket carries no reading for `metric` (every
-    /// sample's per-phase reading was absent — the sentinel-free "no data"
-    /// contract, distinct from a real `Some(0.0)`). A started-but-
-    /// uncaptured step (a `StepStart` with zero captures) DOES produce a
-    /// synthesized bucket, so `phase_metric` returns its stimulus-derived
-    /// `iteration_rate` rather than `None`.
+    /// step) — or the bucket carries no reading for `metric` in either
+    /// store. Sentinel-free, distinct from a real `Some(0.0)`: a
+    /// per-cgroup counter returns `Some(0.0)` when carriers exist but
+    /// counted zero, `None` only when the phase has no carrier at all. A
+    /// started-but-uncaptured step (a `StepStart` with zero captures) DOES
+    /// produce a synthesized bucket, so `phase_metric` returns its
+    /// stimulus-derived `iteration_rate` rather than `None`.
     pub fn phase_metric(&self, phase: crate::assert::Phase, metric: &str) -> Option<f64> {
         self.phase_buckets()
             .into_iter()
             .find(|b| b.step_index == phase.as_u16())
-            .and_then(|b| b.get(metric))
+            .and_then(|b| b.get(metric).or_else(|| b.cgroup_counter_total(metric)))
     }
 
     /// Minimal "nothing happened" fixture for tests that exercise
@@ -1611,6 +1699,223 @@ mod tests {
             None,
             "a phase with no bucket yields None",
         );
+    }
+
+    /// Build a guest `AssertResult` carrying ONE per-phase per-cgroup
+    /// carrier at `step_index` (the merge-neutral `(u64::MAX, 0)` window
+    /// `fold_guest_per_cgroup_into_host_buckets` requires) and wrap it in
+    /// the `MSG_TYPE_TEST_RESULT` TLV a real run leaves on
+    /// `guest_messages`, so `VmResult::guest_assert_result` decodes it.
+    fn guest_drain_with_per_cgroup(
+        step_index: u16,
+        carriers: &[(&str, u64, u64)],
+    ) -> crate::vmm::host_comms::BulkDrainResult {
+        let mut per_cgroup = std::collections::BTreeMap::new();
+        for &(name, migrations, iters) in carriers {
+            per_cgroup.insert(
+                name.to_string(),
+                crate::assert::PhaseCgroupStats {
+                    total_migrations: migrations,
+                    total_iterations: iters,
+                    ..Default::default()
+                },
+            );
+        }
+        let mut guest = crate::test_support::test_helpers::build_assert_result(true, vec![]);
+        guest.stats.phases = vec![crate::assert::PhaseBucket {
+            step_index,
+            label: crate::assert::Phase::from(step_index).to_string(),
+            // Merge-neutral window: fold_guest_per_cgroup_into_host_buckets
+            // debug_asserts guest carriers carry exactly (u64::MAX, 0).
+            start_ms: u64::MAX,
+            end_ms: 0,
+            sample_count: 0,
+            metrics: std::collections::BTreeMap::new(),
+            per_cgroup,
+        }];
+        crate::vmm::host_comms::BulkDrainResult {
+            entries: vec![crate::test_support::test_helpers::assert_result_tlv_entry(&guest)],
+        }
+    }
+
+    /// `phase_buckets()` folds the guest per-cgroup carriers (parsed from
+    /// `guest_messages`) into the host buckets keyed by `step_index`, so the
+    /// returned buckets carry `per_cgroup`; `phase_cgroup` reads one cgroup
+    /// out of the folded bucket. Pins the guest-carrier fold: the host
+    /// captures stamp step_index=1 == `Phase::step(0)`, the carrier matches
+    /// it, and the matched arm unions the carrier's `per_cgroup` into that
+    /// bucket.
+    #[test]
+    fn phase_buckets_folds_guest_per_cgroup_carriers() {
+        let r = VmResult {
+            guest_messages: Some(guest_drain_with_per_cgroup(1, &[("cellA", 7, 11)])),
+            ..vm_result_with_periodic_captures(2)
+        };
+        let buckets = r.phase_buckets();
+        let step0 = buckets
+            .iter()
+            .find(|b| b.step_index == crate::assert::Phase::step(0).as_u16())
+            .expect("host bucket at step_index=1 from the stamped captures");
+        let cg = step0
+            .per_cgroup
+            .get("cellA")
+            .expect("matched-arm fold must carry the guest carrier's per_cgroup");
+        assert_eq!(cg.total_migrations, 7);
+        assert_eq!(cg.total_iterations, 11);
+        // phase_cgroup is the per-(phase, cgroup) accessor over the same fold.
+        let via_accessor = r
+            .phase_cgroup(crate::assert::Phase::step(0), "cellA")
+            .expect("phase_cgroup must reach the folded carrier");
+        assert_eq!(via_accessor.total_migrations, 7);
+        // A cgroup the phase never had -> None (not measured).
+        assert!(r.phase_cgroup(crate::assert::Phase::step(0), "nope").is_none());
+    }
+
+    /// `phase_metric("total_migrations")` resolves the per-phase
+    /// cross-cgroup SUM via the `cgroup_counter_total` fallback — the key
+    /// lives ONLY in `per_cgroup` (its `read_sample` is `None`, so
+    /// `build_phase_buckets` never folds it into `bucket.metrics`, so
+    /// `get()` misses). Two cgroups in the phase sum: 7 + 3 = 10. Without
+    /// the `cgroup_counter_total` fallback, `phase_metric` returns a silent
+    /// `None` for these keys.
+    #[test]
+    fn phase_metric_resolves_total_migrations_from_per_cgroup() {
+        let r = VmResult {
+            guest_messages: Some(guest_drain_with_per_cgroup(
+                1,
+                &[("cellA", 7, 5), ("cellB", 3, 6)],
+            )),
+            ..vm_result_with_periodic_captures(2)
+        };
+        assert_eq!(
+            r.phase_metric(crate::assert::Phase::step(0), "total_migrations"),
+            Some(10.0),
+            "cross-cgroup sum across per_cgroup carriers (7 + 3)",
+        );
+        // The total_iterations arm of cgroup_counter_total resolves too (5 + 6).
+        assert_eq!(
+            r.phase_metric(crate::assert::Phase::step(0), "total_iterations"),
+            Some(11.0),
+            "cross-cgroup sum of the total_iterations per_cgroup counter (5 + 6)",
+        );
+        // A carrier-bearing phase that counted zero is a measured Some(0.0),
+        // distinct from a phase with no carrier (None).
+        let r0 = VmResult {
+            guest_messages: Some(guest_drain_with_per_cgroup(1, &[("cellA", 0, 0)])),
+            ..vm_result_with_periodic_captures(2)
+        };
+        assert_eq!(
+            r0.phase_metric(crate::assert::Phase::step(0), "total_migrations"),
+            Some(0.0),
+            "carriers present but counted zero is a measured Some(0.0)",
+        );
+        // No carriers at all (guest_messages with no per_cgroup) -> None.
+        let r_none = vm_result_with_periodic_captures(2);
+        assert_eq!(
+            r_none.phase_metric(crate::assert::Phase::step(0), "total_migrations"),
+            None,
+            "no per_cgroup carrier in the phase -> None (not measured)",
+        );
+    }
+
+    /// A guest carrier whose `step_index` has NO matching host bucket takes
+    /// the fold's ORPHAN arm: it is appended with its merge-neutral
+    /// `(u64::MAX, 0)` window normalized to `(0, 0)`, and stays reachable
+    /// through the public accessors. The host captures stamp step_index=1
+    /// only, so a step_index=2 carrier is an orphan. Pins that
+    /// `phase_cgroup` reaches the orphan and the window does not underflow
+    /// duration consumers (`end_ms - start_ms == 0`, not `0 - u64::MAX`).
+    #[test]
+    fn phase_buckets_orphan_carrier_reachable_via_phase_cgroup() {
+        let r = VmResult {
+            // step_index 2 == Phase::step(1); no host capture stamps step 2.
+            guest_messages: Some(guest_drain_with_per_cgroup(2, &[("orphanCell", 4, 0)])),
+            ..vm_result_with_periodic_captures(2)
+        };
+        let buckets = r.phase_buckets();
+        let orphan = buckets
+            .iter()
+            .find(|b| b.step_index == crate::assert::Phase::step(1).as_u16())
+            .expect("orphan carrier must be appended as its own bucket");
+        assert_eq!(
+            (orphan.start_ms, orphan.end_ms),
+            (0, 0),
+            "orphan arm normalizes the (u64::MAX, 0) sentinel window to (0, 0)",
+        );
+        assert_eq!(
+            r.phase_cgroup(crate::assert::Phase::step(1), "orphanCell")
+                .map(|c| c.total_migrations),
+            Some(4),
+            "phase_cgroup must reach an orphan carrier",
+        );
+    }
+
+    /// With no guest verdict (guest_messages None — host-only run / early
+    /// crash), `guest_assert_result()` is Err and `phase_buckets()` returns
+    /// the host-rebuilt buckets ALONE: non-empty (captures landed) with every
+    /// `per_cgroup` empty. Pins the Err arm (the prior behavior) carries the
+    /// host buckets, no panic.
+    #[test]
+    fn phase_buckets_without_guest_verdict_is_host_only() {
+        let r = vm_result_with_periodic_captures(2);
+        assert!(r.guest_assert_result().is_err(), "test_fixture has no guest verdict");
+        let buckets = r.phase_buckets();
+        assert!(!buckets.is_empty(), "host captures must still yield buckets");
+        assert!(
+            buckets.iter().all(|b| b.per_cgroup.is_empty()),
+            "no guest carriers -> every per_cgroup stays empty",
+        );
+    }
+
+    /// A guest per-cgroup carrier carrying NON-EMPTY sample vectors
+    /// (run_delays_ns / off_cpu_pcts / wake_latencies_ns) survives the
+    /// guest->host postcard round-trip (assert_result_tlv_entry encode ->
+    /// guest_assert_result decode) and the fold verbatim, and the
+    /// PhaseCgroupStats summary methods reduce them post-decode. The
+    /// guest_drain_with_per_cgroup helper carries only counters (empty
+    /// vecs), so this pins the sample-vec wire fidelity that helper does not.
+    #[test]
+    fn guest_carrier_sample_vecs_survive_postcard_and_fold() {
+        let mut pc = std::collections::BTreeMap::new();
+        pc.insert(
+            "cellA".to_string(),
+            crate::assert::PhaseCgroupStats {
+                total_migrations: 2,
+                run_delays_ns: vec![10, 20, 30],
+                off_cpu_pcts: vec![1.5, 2.5],
+                wake_latencies_ns: vec![100, 200],
+                wake_sample_total: 2,
+                ..Default::default()
+            },
+        );
+        let mut guest = crate::test_support::test_helpers::build_assert_result(true, vec![]);
+        guest.stats.phases = vec![crate::assert::PhaseBucket {
+            step_index: 1,
+            label: "Step[0]".to_string(),
+            start_ms: u64::MAX,
+            end_ms: 0,
+            sample_count: 0,
+            metrics: std::collections::BTreeMap::new(),
+            per_cgroup: pc,
+        }];
+        let r = VmResult {
+            guest_messages: Some(crate::vmm::host_comms::BulkDrainResult {
+                entries: vec![crate::test_support::test_helpers::assert_result_tlv_entry(&guest)],
+            }),
+            ..vm_result_with_periodic_captures(2)
+        };
+        let cg = r
+            .phase_cgroup(crate::assert::Phase::step(0), "cellA")
+            .expect("carrier survives postcard + fold");
+        // Sample vectors round-trip byte-for-byte through the wire.
+        assert_eq!(cg.run_delays_ns, vec![10, 20, 30]);
+        assert_eq!(cg.off_cpu_pcts, vec![1.5, 2.5]);
+        assert_eq!(cg.wake_latencies_ns, vec![100, 200]);
+        // And the summary methods reduce the decoded samples (worst = max(ns)/1000).
+        let (_, worst_us) = cg
+            .run_delay_summary()
+            .expect("non-empty run_delays -> Some");
+        assert_eq!(worst_us, 30.0 / 1000.0);
     }
 
     #[cfg(feature = "wprof")]

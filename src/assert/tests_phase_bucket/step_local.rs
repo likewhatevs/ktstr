@@ -730,6 +730,77 @@ fn strip_phase_cgroup_samples_marks_stripped_only_on_carriers_with_samples() {
     );
 }
 
+/// After `strip_phase_cgroup_samples` drops the sample vectors, the per-cgroup
+/// COUNTERS survive, so `PhaseBucket::cgroup_counter_total` (the resolver behind
+/// `VmResult::phase_metric`) still returns the cross-cgroup total — while the
+/// sample-derived summary degrades to `None`. The two halves (strip preserves
+/// counters; cgroup_counter_total sums counters) are pinned separately; this
+/// pins they COMPOSE, so a stripped (size-overflow) run still resolves per-phase
+/// `total_migrations` / `total_iterations`.
+#[test]
+fn strip_preserves_cgroup_counter_total_resolution() {
+    let mut pc = BTreeMap::new();
+    pc.insert(
+        "cellA".to_string(),
+        PhaseCgroupStats {
+            total_migrations: 7,
+            total_iterations: 11,
+            wake_latencies_ns: vec![100, 200],
+            wake_sample_total: 2,
+            run_delays_ns: vec![10, 20],
+            off_cpu_pcts: vec![5.0],
+            ..Default::default()
+        },
+    );
+    pc.insert(
+        "cellB".to_string(),
+        PhaseCgroupStats {
+            total_migrations: 3,
+            total_iterations: 4,
+            run_delays_ns: vec![30],
+            ..Default::default()
+        },
+    );
+    let mut r = crate::assert::AssertResult::pass();
+    r.stats.phases = vec![PhaseBucket {
+        step_index: 1,
+        label: "Step[0]".to_string(),
+        start_ms: 0,
+        end_ms: 100,
+        sample_count: 1,
+        metrics: BTreeMap::new(),
+        per_cgroup: pc,
+    }];
+    // Cross-cgroup counter sums BEFORE the strip.
+    assert_eq!(
+        r.stats.phases[0].cgroup_counter_total("total_migrations"),
+        Some(10.0),
+    );
+    assert_eq!(
+        r.stats.phases[0].cgroup_counter_total("total_iterations"),
+        Some(15.0),
+    );
+    r.strip_phase_cgroup_samples();
+    // Counters survive the strip -> the cross-cgroup totals are unchanged.
+    assert_eq!(
+        r.stats.phases[0].cgroup_counter_total("total_migrations"),
+        Some(10.0),
+        "strip drops only sample vecs; the total_migrations counter survives",
+    );
+    assert_eq!(
+        r.stats.phases[0].cgroup_counter_total("total_iterations"),
+        Some(15.0),
+    );
+    // The sample-derived summary degrades to None (samples dropped) — the
+    // documented asymmetry: counters resolve, distributions read not-measured.
+    assert!(
+        r.stats.phases[0].per_cgroup["cellA"]
+            .run_delay_summary()
+            .is_none(),
+        "a stripped carrier's run_delay_summary is None (samples gone)",
+    );
+}
+
 /// `PhaseCgroupStats::merge` ORs `stripped`: a merged carrier is stripped if
 /// EITHER input was, so the render flag survives folding a stripped carrier with
 /// a fresh one (in any order).
