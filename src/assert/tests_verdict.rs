@@ -168,6 +168,50 @@ fn verdict_passing_into_result_matches_assert_result_pass() {
     assert_eq!(r1.outcomes, r2.outcomes);
 }
 
+/// `to_result` terminates a FLUENT chain built on a temporary `Verdict`
+/// — the one-liner `Verdict::new().claim(..).at_least(..).to_result()`
+/// that `into_result(self)` cannot express (the comparators return
+/// `&mut Verdict`, so the temporary can't be moved out from under the
+/// borrow, E0507). Compiling this test IS the regression pin for that
+/// shape; the assertions pin that it folds the recorded claims (a pass
+/// and a fail outcome) identically to the bound-local `into_result`.
+#[test]
+fn verdict_to_result_terminates_fluent_chain() {
+    // Fluent one-liner off a temporary: this is the shape that does not
+    // compile with into_result. A passing claim.
+    let r = Verdict::new()
+        .claim("answer", 42u64)
+        .at_least(40)
+        .to_result();
+    assert!(r.is_pass());
+
+    // A failing claim flows through the same by-ref terminal.
+    let r = Verdict::new()
+        .claim("answer", 42u64)
+        .at_most(10)
+        .to_result();
+    assert!(r.is_fail());
+
+    // to_result (clone from &self) and into_result (move) yield the same
+    // folded verdict for an equivalent bound local. Use a FAILING claim so
+    // the compared outcome streams are NON-empty ([Fail] == [Fail]), not the
+    // empty pass identity (which would compare vec![] == vec![] and pin
+    // nothing about how outcomes fold).
+    let mut bound = Verdict::new();
+    bound.claim("answer", 42u64).at_most(10);
+    let via_to = {
+        let mut v = Verdict::new();
+        v.claim("answer", 42u64).at_most(10);
+        v.to_result()
+    };
+    let bound_outcomes = bound.into_result().outcomes;
+    assert!(
+        !bound_outcomes.is_empty(),
+        "a failing claim must record an outcome so the equality is non-trivial",
+    );
+    assert_eq!(via_to.outcomes, bound_outcomes);
+}
+
 #[test]
 fn claim_eq_pass_returns_passing_verdict() {
     let mut v = Verdict::new();

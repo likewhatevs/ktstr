@@ -54,7 +54,8 @@ fn log_passes_default() -> bool {
 /// Carries an [`AssertResult`] under the hood and exposes the same
 /// `outcome()` / `outcomes` / `stats` shape on completion. Build via
 /// [`Verdict::new`] or [`Assert::verdict`]; finish with
-/// [`Verdict::into_result`].
+/// [`Verdict::into_result`] (a bound local, zero-clone) or
+/// [`Verdict::to_result`] (a fluent chain off a temporary).
 ///
 /// ```
 /// # use ktstr::assert::{Assert, Verdict};
@@ -63,7 +64,7 @@ fn log_passes_default() -> bool {
 /// let r = v.into_result();
 /// assert!(r.is_pass());
 /// ```
-#[must_use = "Verdict accumulates claims; call into_result() to consume"]
+#[must_use = "Verdict accumulates claims; call into_result() (bound local) or to_result() (fluent chain) to consume"]
 #[derive(Debug, Clone)]
 pub struct Verdict {
     /// Threshold config the verdict was opened against. Carried so
@@ -374,10 +375,46 @@ impl Verdict {
     }
 
     /// Consume the accumulator and return the merged [`AssertResult`].
-    /// Terminal — chain `.into_result()` at the end of a fluent claim
-    /// sequence to feed the result into the test return value.
+    /// Terminal for a BOUND verdict — zero-clone, takes `self`.
+    ///
+    /// ```
+    /// # use ktstr::assert::Verdict;
+    /// let mut v = Verdict::new();
+    /// v.claim("answer", 42u64).at_least(40);
+    /// let r = v.into_result();
+    /// assert!(r.is_pass());
+    /// ```
+    ///
+    /// Cannot terminate a fluent chain off a temporary: the comparators
+    /// return `&mut Verdict`, so `Verdict::new().claim(..).at_least(..)`
+    /// yields a borrow, and `into_result(self)` cannot move the temporary
+    /// out from under it (E0507). Use [`Self::to_result`] for the fluent
+    /// one-liner.
     pub fn into_result(self) -> AssertResult {
         self.result
+    }
+
+    /// Clone out the merged [`AssertResult`] from `&self` — the terminal
+    /// for a FLUENT chain. The comparators return `&mut Verdict`, so a
+    /// chain built on a temporary (`Verdict::new().claim(..).at_least(..)`)
+    /// only ever has a borrow at the end; [`Self::into_result`] would have
+    /// to move the temporary out from under that borrow (E0507). This
+    /// borrows instead and clones, so the one-liner compiles:
+    ///
+    /// ```
+    /// # use ktstr::assert::Verdict;
+    /// let r = Verdict::new()
+    ///     .claim("answer", 42u64)
+    ///     .at_least(40)
+    ///     .to_result();
+    /// assert!(r.is_pass());
+    /// ```
+    ///
+    /// Prefer [`Self::into_result`] when the verdict is already a bound
+    /// local (it consumes, no clone). The clone here is a test-path cost
+    /// (claim records are bounded by [`super::MAX_RECORDED_PASSES`]).
+    pub fn to_result(&self) -> AssertResult {
+        self.result.clone()
     }
 
     /// Terminal post_vm-callback helper. Equivalent to
