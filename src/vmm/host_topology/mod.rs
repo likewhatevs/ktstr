@@ -29,6 +29,156 @@ impl std::fmt::Display for ResourceContention {
 
 impl std::error::Error for ResourceContention {}
 
+/// The requested topology cannot be realized on this host, and no retry
+/// changes that. Surfaced as a SKIP by the x86_64 VM-creation caps (guest
+/// RAM top above the host MAXPHYADDR, vCPU count above KVM_CAP_MAX_VCPUS,
+/// or max APIC id at/above KVM_CAP_MAX_VCPU_ID): these fire for ANY VM of
+/// this shape, perf-mode or not, so the test cannot run here. Also
+/// returned by the `performance_mode` planner (`compute_pinning`) when the
+/// host has too few physical CPUs / LLC groups — but that perf-mode caller
+/// RE-MAPS it to [`PerfModeUnavailable`] (a host-insufficiency: skip by
+/// default, fail under `KTSTR_NO_SKIP_MODE`). Distinct
+/// from [`ResourceContention`] (a transient slot/resource shortage a retry
+/// resolves → skip); a too-small host is permanent, so the operator must
+/// provision different hardware or narrow the topology rather than retry.
+///
+/// Downcast via `anyhow::Error::downcast_ref::<TopologyInsufficient>()`
+/// (chain-aware: the `#[ktstr_test]` dispatch and `skip_on_contention!`
+/// walk the full error chain so a `.context(...)`-wrapped instance is
+/// still recognised). This typed error replaced a fragile message
+/// string-match (`"need"` + `"LLC"`/`"CPU"`) that would misclassify any
+/// unrelated error happening to contain those words.
+#[derive(Debug)]
+pub struct TopologyInsufficient {
+    pub reason: String,
+}
+
+impl std::fmt::Display for TopologyInsufficient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.reason)
+    }
+}
+
+impl std::error::Error for TopologyInsufficient {}
+
+/// The host cannot honor the `performance_mode` guarantee (an exclusive
+/// host LLC for the test's virtual LLC topology + a service CPU), and no
+/// retry changes that — a permanent host-insufficiency (e.g. a single-LLC
+/// host whose LLC spans every CPU, so LLC + 1 service never fits). Treated
+/// like [`TopologyInsufficient`] / [`ResourceContention`]: a SKIP by
+/// default (the VM never runs unisolated — it errors at build, so a
+/// visible skip informs the operator without reddening CI on a host that
+/// can never satisfy perf-mode), promoted to a hard FAIL under
+/// `KTSTR_NO_SKIP_MODE` for runs that demand perf-mode execution. The
+/// remedy is unchanged: provision a host with a spare LLC/CPU, narrow the
+/// topology, or drop `--perf-mode`.
+///
+/// Downcast via `anyhow::Error::downcast_ref::<PerfModeUnavailable>()`
+/// (chain-aware: the dispatch + macro predicates walk the full error
+/// chain, so a `.context(...)`-wrapped instance is still recognised).
+#[derive(Debug)]
+pub struct PerfModeUnavailable {
+    pub reason: String,
+}
+
+impl std::fmt::Display for PerfModeUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.reason)
+    }
+}
+
+impl std::error::Error for PerfModeUnavailable {}
+
+/// An explicit CPU budget (`--cpu-cap N` / per-test `cpu_budget = N`) the
+/// host cannot satisfy: N exceeds the CPUs this process is allowed on. A
+/// HARD ERROR, not a skip — the author typed a concrete number that does
+/// not exist on this host (a user-input error, distinct from a bare
+/// capability request). Contrast [`ResourceContention`] (a transient
+/// shortage of an otherwise-satisfiable budget → skip/retry).
+///
+/// Downcast via `anyhow::Error::downcast_ref::<CpuBudgetUnsatisfiable>()`
+/// (chain-aware).
+#[derive(Debug)]
+pub struct CpuBudgetUnsatisfiable {
+    pub reason: String,
+}
+
+impl CpuBudgetUnsatisfiable {
+    /// Construct the "explicit CPU budget exceeds the allowed cpuset"
+    /// hard error shared by the `--cpu-cap` (`CpuCap::effective_count`)
+    /// and per-test `cpu_budget` (`KtstrVmBuilder::build`) paths: both
+    /// share the same prefix, the `sched_getaffinity` framing, and the
+    /// "pick a smaller value or release the constraint" remediation.
+    /// `source` names the knob in the message (e.g. `"--cpu-cap N"`,
+    /// `"cpu_budget"`); `omit_hint` is the source-specific "or omit X to
+    /// use the default" tail.
+    pub(crate) fn exceeds_allowed(source: &str, n: usize, allowed: usize, omit_hint: &str) -> Self {
+        Self {
+            reason: format!(
+                "{source} = {n} exceeds the {allowed} CPUs this process is \
+                 allowed on (from sched_getaffinity / Cpus_allowed_list). \
+                 Pick a value ≤ {allowed}, release the cgroup/taskset \
+                 constraint restricting this process, or {omit_hint}."
+            ),
+        }
+    }
+}
+
+impl std::fmt::Display for CpuBudgetUnsatisfiable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.reason)
+    }
+}
+
+impl std::error::Error for CpuBudgetUnsatisfiable {}
+
+/// The requested topology cannot be represented by this VMM's static
+/// device layout, and the limit is host-INDEPENDENT, so no retry and no
+/// different host changes that. Concretely: the aarch64 vCPU count
+/// exceeds `MAX_VCPUS` (the capacity of the statically sized GICv3
+/// redistributor MMIO window) — with more vCPUs the redistributor region
+/// overruns the device MMIO window and shadows serial/virtio.
+///
+/// A HARD ERROR — distinct from [`TopologyInsufficient`], its deliberate
+/// counterpart. `TopologyInsufficient` is host-DEPENDENT (the VM cannot
+/// boot on *this* host, but a bigger host could → skip);
+/// `TopologyUnrepresentable` is a fixed VMM-layout limit no aarch64 host
+/// can satisfy under this VMM, so it is a test misconfiguration — the
+/// author must narrow the topology, not provision different hardware.
+/// Routes to `EXIT_FAIL` via a DEDICATED hard-fail arm (the
+/// `is_topology_unrepresentable` predicate) in both `result_to_exit_code`
+/// and the `#[ktstr_test]` macro body, placed ABOVE the `expect_err`
+/// inversion and the skip arms — mirroring `CpuBudgetUnsatisfiable` (the
+/// other dedicated hard-fail). That placement is what makes it fail even in
+/// an `expect_err` test (the generic `expect_err` arm would otherwise
+/// invert it to a pass) and keeps it out of the `skip_on_contention!` /
+/// `is_topology_insufficient` skip paths, so the misconfiguration can
+/// never masquerade as the expected failure or be turned into a skip.
+///
+/// Downcast via `anyhow::Error::downcast_ref::<TopologyUnrepresentable>()`
+/// (chain-aware: walks `e.chain()`, so a `.context(...)`-wrapped instance
+/// is still recognised) to identify it programmatically — e.g. tests
+/// asserting the over-`MAX_VCPUS` bail is this hard-fault and not a bare
+/// string-matched error.
+// Constructed only on aarch64 (the GICv3-layout over-MAX_VCPUS bail in
+// aarch64::kvm) and in cross-arch routing tests; a non-aarch64 lib-only
+// build sees no construction site. Keep the dead-code check live on
+// aarch64 (where the bail MUST construct it — a real regression if it
+// stops) and allow it only off-arch.
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+#[derive(Debug)]
+pub struct TopologyUnrepresentable {
+    pub reason: String,
+}
+
+impl std::fmt::Display for TopologyUnrepresentable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.reason)
+    }
+}
+
+impl std::error::Error for TopologyUnrepresentable {}
+
 /// A physical LLC group on the host, identified by its cache ID.
 #[derive(Debug, Clone)]
 pub struct LlcGroup {
@@ -354,25 +504,29 @@ impl HostTopology {
         let total_vcpus = llcs * vcpus_per_llc;
         let total_needed = total_vcpus as usize + if reserve_service_cpu { 1 } else { 0 };
 
-        anyhow::ensure!(
-            total_needed <= self.total_cpus(),
-            "performance_mode: need {} CPUs ({} vCPUs + {} service) \
-             but only {} host CPUs available",
-            total_needed,
-            total_vcpus,
-            if reserve_service_cpu { 1 } else { 0 },
-            self.total_cpus(),
-        );
+        if total_needed > self.total_cpus() {
+            return Err(anyhow::Error::new(TopologyInsufficient {
+                reason: format!(
+                    "performance_mode: need {} CPUs ({} vCPUs + {} service) \
+                     but only {} host CPUs available",
+                    total_needed,
+                    total_vcpus,
+                    if reserve_service_cpu { 1 } else { 0 },
+                    self.total_cpus(),
+                ),
+            }));
+        }
 
         let num_llcs = self.llc_groups.len();
-        anyhow::ensure!(
-            llcs as usize <= num_llcs,
-            "performance_mode: need {} LLCs for {} virtual LLCs, \
-             but host has {} LLC groups",
-            llcs,
-            llcs,
-            num_llcs,
-        );
+        if llcs as usize > num_llcs {
+            return Err(anyhow::Error::new(TopologyInsufficient {
+                reason: format!(
+                    "performance_mode: need {} LLCs for {} virtual LLCs, \
+                     but host has {} LLC groups",
+                    llcs, llcs, num_llcs,
+                ),
+            }));
+        }
 
         // Build the virtual-to-host LLC index mapping. When numa_nodes > 1,
         // try to place each guest NUMA node's LLCs on host LLCs within
@@ -392,15 +546,18 @@ impl HostTopology {
                 .filter(|c| !used_cpus.contains(c))
                 .collect();
 
-            anyhow::ensure!(
-                available.len() >= vcpus_per_llc as usize,
-                "performance_mode: LLC group {} has {} available CPUs, \
-                 need {} for virtual LLC {}",
-                llc_idx,
-                available.len(),
-                vcpus_per_llc,
-                llc,
-            );
+            if available.len() < vcpus_per_llc as usize {
+                return Err(anyhow::Error::new(TopologyInsufficient {
+                    reason: format!(
+                        "performance_mode: LLC group {} has {} available CPUs, \
+                         need {} for virtual LLC {}",
+                        llc_idx,
+                        available.len(),
+                        vcpus_per_llc,
+                        llc,
+                    ),
+                }));
+            }
 
             for vcpu_in_llc in 0..vcpus_per_llc {
                 let vcpu_id = llc * vcpus_per_llc + vcpu_in_llc;
@@ -416,12 +573,26 @@ impl HostTopology {
                 .iter()
                 .copied()
                 .find(|c| !used_cpus.contains(c));
-            anyhow::ensure!(
-                cpu.is_some(),
-                "performance_mode: no free host CPU for service threads \
-                 after assigning {} vCPUs",
-                total_vcpus,
-            );
+            // Defensive: the total-CPU check above already folds the +1
+            // service CPU into `total_needed`, so a passing host always
+            // has at least one online CPU beyond the assigned vCPUs and
+            // this never fires today. Typed as TopologyInsufficient (not
+            // plain anyhow) so that if a future refactor of that check ever
+            // lets it through, it is handled identically to its three
+            // sibling shortfall checks: the perf-mode caller
+            // (acquire_slot_with_locks) re-maps every compute_pinning
+            // TopologyInsufficient to PerfModeUnavailable (a host-insufficiency
+            // skip, fail under KTSTR_NO_SKIP_MODE), and
+            // the non-perf caller passes reserve_service_cpu=false so this
+            // site is unreachable there.
+            if cpu.is_none() {
+                return Err(anyhow::Error::new(TopologyInsufficient {
+                    reason: format!(
+                        "performance_mode: no free host CPU for service threads \
+                         after assigning {total_vcpus} vCPUs"
+                    ),
+                }));
+            }
             cpu
         } else {
             None
@@ -722,8 +893,10 @@ fn try_acquire_all(
 }
 
 /// Diffuse a pid across `[0, max_start)` so adjacent pids do not
-/// land on adjacent offsets. Used by [`acquire_cpu_locks`] to
-/// pick a starting window.
+/// land on adjacent offsets. Used by the default-else run-lock path
+/// (`KtstrVm::acquire_default_run_locks`) to pick a starting LLC slot so
+/// two ktstr invocations launching simultaneously don't both probe slot 0
+/// first.
 ///
 /// Bare `pid % max_start` collapses adjacent pids onto adjacent
 /// offsets (Linux's pid allocator walks `pid_max` sequentially),
@@ -731,115 +904,26 @@ fn try_acquire_all(
 /// case: nextest forks N test processes back-to-back, every pid
 /// lands within a small contiguous range, every `pid % max_start`
 /// lands within an equally small contiguous slice of the offset
-/// space, and they all probe overlapping windows on the first
+/// space, and they all probe overlapping slots on the first
 /// pass. AHasher avalanche on the pid bytes diffuses adjacent
 /// pids across the whole `[0, max_start)` range, so the
-/// walk-around-once loop in [`acquire_cpu_locks`] has a fair
-/// chance of finding a free window without burning the entire
-/// lockfile pool.
+/// slot-rotation loop has a fair chance of finding a free slot
+/// without burning the entire lockfile pool.
 ///
-/// The hash key is `AHasher::default()` — a per-run random
+/// The hasher is `ahash::AHasher` keyed with fixed zero seeds
+/// (`RandomState::with_seeds(0, 0, 0, 0)`); a per-run random
 /// seed would defeat reproducibility for unit-test fixtures and
 /// for any future debug logging that wants to confirm "pid X
-/// picks offset Y for window N".
+/// picks offset Y for slot N".
 ///
 /// Caller invariant: `max_start >= 1`. Panics on `max_start == 0`
-/// (modulo-by-zero); callers must enforce this upstream — the
-/// `count > total_host_cpus` early-bail in [`acquire_cpu_locks`]
-/// is the production guarantee.
+/// (modulo-by-zero); callers must enforce this upstream (the
+/// run-lock path floors `max_slots` at 1).
 pub(crate) fn pid_window_offset(pid: u32, max_start: usize) -> usize {
     use std::hash::{BuildHasher, Hasher};
     let mut hasher = ahash::RandomState::with_seeds(0, 0, 0, 0).build_hasher();
     hasher.write(&pid.to_le_bytes());
     (hasher.finish() as usize) % max_start
-}
-
-/// Acquire exclusive CPU locks for a non-perf VM (non-blocking).
-///
-/// Tries to flock `count` consecutive CPU files starting from a
-/// pid-derived offset, stepping by 1 if any CPU in the window is busy
-/// and wrapping around once the high end of the search range is
-/// exhausted so the lower windows (those below `start_offset`) are
-/// also probed before giving up. Returns the held fds on success, or
-/// `ResourceContention` when no window is available.
-///
-/// When `host_topo` is provided, also acquires `LOCK_SH` on the LLC lock
-/// files containing the acquired CPUs. This prevents a perf VM from
-/// grabbing exclusive LLC access while non-perf VMs hold CPUs in that LLC.
-///
-/// `total_host_cpus` bounds the search space. Single non-blocking pass;
-/// callers rely on nextest retry backoff for contention resolution.
-#[derive(Debug)]
-#[allow(dead_code)]
-pub struct CpuLockResult {
-    pub locks: Vec<std::os::fd::OwnedFd>,
-    pub cpus: Vec<usize>,
-}
-
-#[allow(dead_code)]
-pub fn acquire_cpu_locks(
-    count: usize,
-    total_host_cpus: usize,
-    host_topo: Option<&HostTopology>,
-) -> Result<CpuLockResult> {
-    if count == 0 {
-        return Ok(CpuLockResult {
-            locks: Vec::new(),
-            cpus: Vec::new(),
-        });
-    }
-
-    // No window can fit if the request exceeds the host. Bail before
-    // entering the search loop so the modular arithmetic below has a
-    // non-zero domain.
-    if count > total_host_cpus {
-        return Err(anyhow::Error::new(ResourceContention {
-            reason: format!(
-                "no {count} consecutive CPUs available on a {total_host_cpus}-CPU host\n  \
-                 hint: pass --no-perf-mode or set KTSTR_NO_PERF_MODE=1 to run without CPU reservation"
-            ),
-        }));
-    }
-
-    // Spread peers across the lockfile pool: start at a pid-derived
-    // offset so two ktstr invocations launching simultaneously don't
-    // both probe CPU 0 first. `max_start` is the count of valid
-    // window-start positions in `[0, total_host_cpus - count]`
-    // (inclusive), giving `total_host_cpus - count + 1` candidates.
-    // The `count > total_host_cpus` early-bail above guarantees
-    // `max_start >= 1`, so the modulo never divides by zero.
-    let max_start = total_host_cpus - count + 1;
-    let start_offset = pid_window_offset(std::process::id(), max_start);
-    // Walk every candidate window exactly once, wrapping around so a
-    // peer holding the high end never starves the low end. Visit
-    // order is `start_offset, start_offset+1, ..., max_start-1,
-    // 0, 1, ..., start_offset-1`.
-    for step in 0..max_start {
-        let offset = (start_offset + step) % max_start;
-        match try_acquire_cpu_window(offset, count) {
-            Ok(mut locks) => {
-                let cpus: Vec<usize> = (offset..offset + count).collect();
-                if let Some(topo) = host_topo {
-                    match acquire_llc_shared_locks(topo, &cpus) {
-                        Ok(llc_locks) => locks.extend(llc_locks),
-                        Err(_) => {
-                            drop(locks);
-                            continue;
-                        }
-                    }
-                }
-                return Ok(CpuLockResult { locks, cpus });
-            }
-            Err(_) => continue,
-        }
-    }
-
-    Err(anyhow::Error::new(ResourceContention {
-        reason: format!(
-            "no {count} consecutive CPUs available\n  \
-             hint: pass --no-perf-mode or set KTSTR_NO_PERF_MODE=1 to run without CPU reservation"
-        ),
-    }))
 }
 
 // ===========================================================================
@@ -988,9 +1072,12 @@ impl CpuCap {
     }
 
     /// Three-tier resolution: explicit CLI flag wins over env var,
-    /// which wins over "not set". Returns `None` when neither is
-    /// present, meaning "use the 30% default of the allowed CPU set"
-    /// (see `default_cpu_budget`).
+    /// which wins over "not set". Returns `None` when neither is present,
+    /// meaning "use the caller's auto-sized default": the
+    /// kernel-build/planner path expands `None` to `default_cpu_budget`
+    /// (30% of the allowed set); the no-perf VM-builder path expands it to
+    /// `no_perf_cpu_budget` (max(30%, min(vcpus, allowed)), usually the
+    /// vCPU count).
     ///
     /// Env var is `KTSTR_CPU_CAP` (integer ≥ 1, CPU count). An empty
     /// or unset env var is treated as absent; a non-numeric value
@@ -1025,23 +1112,26 @@ impl CpuCap {
 
     /// Runtime-bounded cap: returns the inner count unless it exceeds
     /// `allowed_cpus` (the calling process's sched_getaffinity cpuset
-    /// count), in which case a `ResourceContention` error steers
-    /// the caller toward an actionable message. This check lives at
-    /// acquire time — not at construction — because the allowed set
-    /// is not known until `host_allowed_cpus` reads the syscall.
+    /// count), in which case a `CpuBudgetUnsatisfiable` hard error (an
+    /// explicit cap the host cannot satisfy is a FAIL, not a transient
+    /// skip) steers the caller toward an actionable message. This check
+    /// lives at acquire time — not at construction — because the allowed
+    /// set is not known until `host_allowed_cpus` reads the syscall.
     pub fn effective_count(&self, allowed_cpus: usize) -> Result<usize> {
         let n = self.n.get();
         if n > allowed_cpus {
-            return Err(anyhow::Error::new(ResourceContention {
-                reason: format!(
-                    "--cpu-cap N = {n} exceeds the {allowed_cpus} CPUs this \
-                     process is allowed on (from sched_getaffinity / \
-                     Cpus_allowed_list). Pick a cap ≤ {allowed_cpus}, release \
-                     the cgroup/taskset constraint restricting this process, \
-                     or omit --cpu-cap to use the 30% default of the allowed \
-                     set."
-                ),
-            }));
+            // An explicit --cpu-cap the host cannot satisfy is a hard ERROR
+            // (the author typed a concrete number that does not exist here),
+            // not transient contention: CpuBudgetUnsatisfiable, not
+            // ResourceContention, so it fails rather than skips.
+            return Err(anyhow::Error::new(CpuBudgetUnsatisfiable::exceeds_allowed(
+                "--cpu-cap N",
+                n,
+                allowed_cpus,
+                "omit --cpu-cap to use the auto-sized default (30% of the \
+                 allowed set for kernel builds; the vCPU count, floored at \
+                 30%, for VMs)",
+            )));
         }
         Ok(n)
     }
@@ -1697,18 +1787,34 @@ pub fn format_llc_list(locked: &[usize], topo: &HostTopology) -> String {
 /// Placement: called by `kernel_build_pipeline` and friends right
 /// after [`acquire_llc_plan`] returns, before the sandbox mount.
 /// Extracting this into a helper rather than inlining at the call
-/// site lets tests capture stderr and assert the format without
-/// poking into the orchestrator internals.
+/// site lets the message body be unit-tested via
+/// [`cross_node_spill_warning`] without capturing stderr.
 pub fn warn_if_cross_node_spill(plan: &LlcPlan, topo: &HostTopology) {
-    if should_warn_cross_node(&plan.mems) {
-        eprintln!(
-            "ktstr: reserving LLCs {list} across {n} NUMA nodes \
-             (preferred single-node contiguous unavailable). Build \
-             will run; memory-access latency may be higher.",
-            list = format_llc_list(&plan.locked_llcs, topo),
-            n = plan.mems.len(),
-        );
+    if let Some(msg) = cross_node_spill_warning(plan, topo) {
+        eprintln!("{msg}");
     }
+}
+
+/// Build the cross-node spill warning string for `plan`, or `None`
+/// when the plan fits within a single NUMA node (the suppression
+/// case). [`warn_if_cross_node_spill`] is a thin wrapper that
+/// `eprintln!`s the `Some` value; this function holds the actual
+/// gate-and-format logic so a test can pin both halves — the
+/// predicate gate AND the rendered message — without a stderr
+/// capture seam. The returned string is exactly the bytes
+/// `warn_if_cross_node_spill` would emit (sans the trailing newline
+/// that `eprintln!` appends).
+fn cross_node_spill_warning(plan: &LlcPlan, topo: &HostTopology) -> Option<String> {
+    if !should_warn_cross_node(&plan.mems) {
+        return None;
+    }
+    Some(format!(
+        "ktstr: reserving LLCs {list} across {n} NUMA nodes \
+         (preferred single-node contiguous unavailable). Build \
+         will run; memory-access latency may be higher.",
+        list = format_llc_list(&plan.locked_llcs, topo),
+        n = plan.mems.len(),
+    ))
 }
 
 /// Pure predicate backing [`warn_if_cross_node_spill`]. Returns
@@ -1726,49 +1832,74 @@ fn should_warn_cross_node(mems: &std::collections::BTreeSet<usize>) -> bool {
     mems.len() > 1
 }
 
-/// Acquire `LOCK_SH` on LLC lock files for the LLCs containing `cpus`.
-#[allow(dead_code)]
-fn acquire_llc_shared_locks(
-    topo: &HostTopology,
-    cpus: &[usize],
-) -> std::result::Result<Vec<std::os::fd::OwnedFd>, String> {
-    let mut llc_indices: Vec<usize> = Vec::new();
-    for &cpu in cpus {
-        for (idx, group) in topo.llc_groups.iter().enumerate() {
-            if group.cpus.contains(&cpu) && !llc_indices.contains(&idx) {
-                llc_indices.push(idx);
-            }
-        }
+/// Warning text when the effective host-CPU budget is below the guest's
+/// vCPU count, else `None`. Under `effective_host_cpus < vcpus` the host
+/// time-slices the vCPU threads, so absolute work scales ~`1/oversub` and
+/// guest-scheduler timing metrics (run_delay, off-CPU, wake latency, gaps)
+/// become host-contention artifacts — the silent-wrong-answer class the
+/// no-perf budget sizing guards against (see [`no_perf_cpu_budget`]).
+///
+/// `explicit` splits severity: a per-test `cpu_budget` / `--cpu-cap` below
+/// the vCPU count is a deliberate opt-in (the test asked to oversubscribe —
+/// an INFO note), whereas an auto-collapse (the calling process's cpuset is
+/// smaller than the vCPU count, so [`no_perf_cpu_budget`]'s
+/// `vcpus.min(allowed)` floored the budget to the allowed set) is the
+/// truly-silent case nothing opted into — a louder WARNING. `watchdog_secs`
+/// folds in the tight-watchdog false-eject caveat when small.
+///
+/// Pure (returns the text) so a test pins the message + the
+/// `None`-when-not-oversubscribed polarity without capturing stderr; the
+/// caller eprintln's it once at build time, mirroring
+/// [`warn_if_cross_node_spill`].
+pub(crate) fn overcommit_warning(
+    effective_host_cpus: usize,
+    vcpus: usize,
+    explicit: bool,
+    watchdog_secs: Option<u64>,
+) -> Option<String> {
+    if effective_host_cpus >= vcpus {
+        return None;
     }
-    let mut locks = Vec::new();
-    for &llc_idx in &llc_indices {
-        let path = llc_lock_path(llc_idx);
-        match try_flock(&path, FlockMode::Shared) {
-            Ok(Some(fd)) => locks.push(fd),
-            Ok(None) => return Err(format!("LLC {llc_idx} exclusively held")),
-            Err(e) => return Err(format!("LLC {llc_idx}: {e}")),
-        }
+    let oversub = vcpus as f64 / effective_host_cpus.max(1) as f64;
+    let mut msg = if explicit {
+        format!(
+            "ktstr: cpu_budget {effective_host_cpus} host CPUs < {vcpus} vCPUs \
+             ({oversub:.1}x oversubscription, opt-in): the host time-slices the \
+             vCPU threads, so absolute iterations scale ~1/{oversub:.0} and \
+             guest-scheduler timing metrics (run_delay, off-CPU, wake latency, \
+             gaps) are host-contention artifacts. Use worst_iterations_per_cpu_sec \
+             for an overcommit-invariant per-cgroup rate."
+        )
+    } else {
+        format!(
+            "ktstr: WARNING: only {effective_host_cpus} host CPUs available for \
+             {vcpus} vCPUs ({oversub:.1}x oversubscription) — the process cpuset \
+             is smaller than the guest, so the auto-sized CPU budget collapsed \
+             to it. NOTHING opted into this. The host time-slices the vCPU \
+             threads, confounding guest-scheduler measurement (absolute work \
+             scales ~1/{oversub:.0}; timing metrics are host artifacts). Widen \
+             the process cpuset, or shrink the guest topology."
+        )
+    };
+    if watchdog_secs.is_some_and(|w| w <= 5) {
+        let w = watchdog_secs.unwrap();
+        msg.push_str(&format!(
+            " Also: watchdog_timeout_s={w} is tight under oversubscription — a \
+             host-descheduled vCPU can trip the scheduler watchdog (false stall)."
+        ));
     }
-    Ok(locks)
+    Some(msg)
 }
 
-/// Try to flock CPUs [offset..offset+count) exclusively.
-/// Returns all fds on success, or an error string on any busy CPU.
-#[allow(dead_code)]
-fn try_acquire_cpu_window(
-    offset: usize,
-    count: usize,
-) -> std::result::Result<Vec<std::os::fd::OwnedFd>, String> {
-    let mut locks = Vec::with_capacity(count);
-    for cpu in offset..offset + count {
-        let path = cpu_lock_path(cpu);
-        match try_flock(&path, FlockMode::Exclusive) {
-            Ok(Some(fd)) => locks.push(fd),
-            Ok(None) => return Err(format!("CPU {cpu} busy")),
-            Err(e) => return Err(format!("CPU {cpu}: {e}")),
-        }
-    }
-    Ok(locks)
+/// Whether [`mbind_to_nodes`] must short-circuit before touching `addr`
+/// or invoking the `mbind(2)` syscall. Returns `true` when there is no
+/// work to do — an empty node set (no policy target) or a zero-length
+/// region. This is the exact guard [`mbind_to_nodes`] consults; it is a
+/// pure predicate so the short-circuit decision can be asserted directly
+/// instead of inferred from a not-crashing call (whose pass condition the
+/// syscall's own error-swallowing would satisfy regardless of the guard).
+fn mbind_should_skip(len: usize, nodes: &[usize]) -> bool {
+    nodes.is_empty() || len == 0
 }
 
 /// Bind a memory region to specific NUMA nodes using `mbind(MPOL_BIND)`.
@@ -1788,7 +1919,7 @@ fn try_acquire_cpu_window(
 /// without dereferencing `addr`, so a null or dangling pointer is
 /// permitted in those cases.
 pub unsafe fn mbind_to_nodes(addr: *mut u8, len: usize, nodes: &[usize]) {
-    if nodes.is_empty() || len == 0 {
+    if mbind_should_skip(len, nodes) {
         return;
     }
     let node_set: std::collections::BTreeSet<usize> = nodes.iter().copied().collect();
@@ -1824,7 +1955,19 @@ use crate::topology::parse_cpu_list_lenient;
 
 /// Number of free 2MB hugepages on the host.
 pub fn hugepages_free() -> u64 {
-    std::fs::read_to_string("/sys/kernel/mm/hugepages/hugepages-2048kB/free_hugepages")
+    hugepages_free_from(std::path::Path::new(
+        "/sys/kernel/mm/hugepages/hugepages-2048kB/free_hugepages",
+    ))
+}
+
+/// Path-parameterized core of [`hugepages_free`]. Reads the
+/// `free_hugepages` sysfs file at `path`, parses the trimmed count, and
+/// returns 0 when the file is absent, unreadable, or contains a value
+/// that does not parse as a `u64`. Exposes a path seam so the parse and
+/// the documented 0-fallback can be tested against fixture files without
+/// depending on the host's hugetlbfs configuration.
+fn hugepages_free_from(path: &std::path::Path) -> u64 {
+    std::fs::read_to_string(path)
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok())
         .unwrap_or(0)

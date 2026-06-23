@@ -1068,9 +1068,18 @@ mod tests {
 
     #[test]
     fn kernel_path_find_image_nonexistent_dir() {
-        // Nonexistent explicit dir: is_dir() is false, returns None
-        // immediately with no fallthrough.
-        let _ = find_image(Some("/nonexistent/image/dir/xyz"), None);
+        // Nonexistent explicit dir: `!dir.is_dir()` in the explicit-dir
+        // branch hits `return None` (find_image ~line 592) with no
+        // fallthrough to resolve_kernel / host fallback paths. The
+        // return value None — not merely "did not panic" — is the
+        // documented short-circuit contract, so pin it. A regression
+        // that fell through to local/host search instead of
+        // short-circuiting would be caught here.
+        assert_eq!(
+            find_image(Some("/nonexistent/image/dir/xyz"), None),
+            None,
+            "nonexistent explicit dir must short-circuit to None with no fallthrough",
+        );
     }
 
     #[test]

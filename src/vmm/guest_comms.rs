@@ -147,6 +147,18 @@ pub(crate) const BULK_PORT_DEV: &str = "/dev/vport0p1";
 static BULK_PORT_FD: std::sync::OnceLock<std::sync::Mutex<Option<std::fs::File>>> =
     std::sync::OnceLock::new();
 
+/// Test-only counter of [`write_to_bulk_port`] entries. Incremented
+/// on the FIRST line of `write_to_bulk_port`, which the `is_guest()`
+/// gate in [`write_msg`] reaches only inside a guest context. A
+/// host-context sender call short-circuits in `write_msg` and never
+/// touches this counter — so a test that snapshots the count, calls a
+/// void-returning sender from host context, and re-reads the count
+/// can assert the write was SUPPRESSED (count unchanged), not merely
+/// that the call did not panic.
+#[cfg(test)]
+pub(crate) static BULK_PORT_WRITE_ATTEMPTS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// Try to open [`BULK_PORT_DEV`] for writing. Returns None when the
 /// device is not yet present — the kernel virtio_console driver
 /// creates it via `device_create` inside `add_port`
@@ -215,6 +227,12 @@ fn write_msg(msg_type: u32, payload: &[u8]) -> bool {
 /// partial frames in the byte stream, so any per-iovec virtqueue
 /// submissions reassemble correctly.
 fn write_to_bulk_port(msg_type: u32, payload: &[u8]) -> bool {
+    // Test-only: record that the guest-only write path was entered.
+    // Reached only after `write_msg`'s `is_guest()` gate passes, so a
+    // host-context sender call never bumps this. See
+    // [`BULK_PORT_WRITE_ATTEMPTS`].
+    #[cfg(test)]
+    BULK_PORT_WRITE_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let slot = BULK_PORT_FD.get_or_init(|| std::sync::Mutex::new(None));
     let mut guard = slot.lock_unpoisoned();
     if guard.is_none() {
@@ -324,34 +342,109 @@ pub fn send_exit(code: i32) {
 /// `serde::Serialize` derives, so the only failure path is OOM
 /// during the `Vec<u8>` allocation, which the surrounding eprintln
 /// guards against silent loss.
-pub fn send_test_result(result: &crate::assert::AssertResult) {
-    match postcard::to_stdvec(result) {
-        Ok(bytes) => {
-            if bytes.len() > crate::vmm::bulk::MAX_BULK_FRAME_PAYLOAD as usize {
-                tracing::error!(
-                    size = bytes.len(),
-                    max = crate::vmm::bulk::MAX_BULK_FRAME_PAYLOAD,
-                    "AssertResult exceeds bulk port frame limit, sending truncated verdict"
-                );
-                let truncated =
-                    crate::assert::AssertResult::fail(crate::assert::AssertDetail::new(
-                        crate::assert::DetailKind::Other,
-                        format!(
-                            "AssertResult postcard size {} exceeded bulk port limit {}; \
-                             original details dropped",
-                            bytes.len(),
-                            crate::vmm::bulk::MAX_BULK_FRAME_PAYLOAD,
-                        ),
-                    ));
-                if let Ok(small) = postcard::to_stdvec(&truncated) {
-                    write_msg(MsgType::TestResult.wire_value(), &small);
-                }
-            } else {
-                write_msg(MsgType::TestResult.wire_value(), &bytes);
+/// What to emit for an `AssertResult` over a `max`-byte bulk frame — the pure
+/// graceful-degradation decision, factored out of [`send_test_result`] (which
+/// owns the `write_msg` side effect) so the size-class branch selection is
+/// unit-testable without a guest wire.
+#[derive(Debug)]
+enum TestResultWire {
+    /// The encoded result fits the frame as-is.
+    Raw(Vec<u8>),
+    /// Over-frame: `dropped` per_cgroup raw samples were dropped (the encoded
+    /// `bytes` already carry the info note); the sample-free encoding now fits.
+    Stripped { bytes: Vec<u8>, dropped: usize },
+    /// Even the sample-free verdict overruns the frame; emit a truncated FAIL.
+    /// `offending` is the size of the payload that actually overran — the
+    /// sample-free size when a strip happened, else the original (incl. the rare
+    /// re-serialize-error sub-case, which keeps the pre-strip size as best-effort).
+    Truncated { offending: usize },
+}
+
+/// Classify how to emit `result` over a `max`-byte bulk frame. Pure apart from
+/// `postcard` encoding; returns `None` only on a postcard encode error (the
+/// caller logs and drops).
+///
+/// This is the first path to put RAW per-cgroup sample vectors on the bulk port,
+/// and a many-cgroup × many-step scenario accumulates non-merging carriers that
+/// can overrun the frame even with each carrier reservoir-capped. On overflow
+/// the three sample pools (wake_latencies_ns / run_delays_ns / off_cpu_pcts) are
+/// dropped — so the wake p99/median/CV and mean/worst run-delay re-pools DEGRADE
+/// to the cross-cgroup max of the surviving per-cgroup `CgroupStats` reductions
+/// (a worst-cgroup proxy, via `populate_run_distribution_metrics`), not vanish;
+/// off-CPU% has no run-level re-pool consumer so only its per-phase render
+/// is lost. The verdict, outcomes, and all scalar/counter telemetry are
+/// PRESERVED (never a PASS→FAIL flip). The truncated FAIL is reached only if the
+/// sample-free verdict ALONE overruns.
+fn classify_test_result(
+    result: &crate::assert::AssertResult,
+    max: usize,
+) -> Option<TestResultWire> {
+    let bytes = postcard::to_stdvec(result).ok()?;
+    if bytes.len() <= max {
+        return Some(TestResultWire::Raw(bytes));
+    }
+    let mut stripped = result.clone();
+    let dropped = stripped.strip_phase_cgroup_samples();
+    // Sample-free size once a strip happened — the payload that actually overruns
+    // on the Truncated path. On a re-serialize error (practically unreachable:
+    // stripping only shrinks) it stays None and the fallback reports the pre-strip
+    // size as best-effort.
+    let mut sample_free_size: Option<usize> = None;
+    if dropped > 0 {
+        stripped.note(format!(
+            "per_cgroup raw samples ({dropped}) dropped: AssertResult postcard size {} \
+             exceeded bulk port limit {max}; verdict and reduced telemetry preserved",
+            bytes.len(),
+        ));
+        if let Ok(small) = postcard::to_stdvec(&stripped) {
+            sample_free_size = Some(small.len());
+            if small.len() <= max {
+                return Some(TestResultWire::Stripped {
+                    bytes: small,
+                    dropped,
+                });
             }
         }
-        Err(e) => {
-            eprintln!("ktstr: postcard-encode AssertResult for bulk-port emit: {e}");
+    }
+    Some(TestResultWire::Truncated {
+        offending: sample_free_size.unwrap_or(bytes.len()),
+    })
+}
+
+pub fn send_test_result(result: &crate::assert::AssertResult) {
+    let max = crate::vmm::bulk::MAX_BULK_FRAME_PAYLOAD as usize;
+    match classify_test_result(result, max) {
+        Some(TestResultWire::Raw(bytes)) => {
+            write_msg(MsgType::TestResult.wire_value(), &bytes);
+        }
+        Some(TestResultWire::Stripped { bytes, dropped }) => {
+            tracing::warn!(
+                stripped = bytes.len(),
+                dropped_samples = dropped,
+                max,
+                "AssertResult exceeded bulk frame; dropped per_cgroup raw samples, verdict preserved"
+            );
+            write_msg(MsgType::TestResult.wire_value(), &bytes);
+        }
+        Some(TestResultWire::Truncated { offending }) => {
+            tracing::error!(
+                offending_size = offending,
+                max,
+                "AssertResult exceeds bulk port frame limit even after dropping samples, sending truncated verdict"
+            );
+            let truncated = crate::assert::AssertResult::fail(crate::assert::AssertDetail::new(
+                crate::assert::DetailKind::Other,
+                format!(
+                    "AssertResult postcard size {offending} exceeded bulk port limit {max}; \
+                     original details dropped",
+                ),
+            ));
+            if let Ok(small) = postcard::to_stdvec(&truncated) {
+                write_msg(MsgType::TestResult.wire_value(), &small);
+            }
+        }
+        None => {
+            eprintln!("ktstr: postcard-encode AssertResult for bulk-port emit failed");
         }
     }
 }
@@ -359,22 +452,33 @@ pub fn send_test_result(result: &crate::assert::AssertResult) {
 /// Send per-payload-invocation metrics to the host. Payload:
 /// postcard-encoded [`crate::test_support::PayloadMetrics`].
 ///
-/// Frames with [`MsgType::PayloadMetrics`].
-pub fn send_payload_metrics(metrics: &crate::test_support::PayloadMetrics) {
+/// Frames with [`MsgType::PayloadMetrics`]. Returns `true` when the
+/// frame was fully written, `false` when the bulk port was not open
+/// (handshake in flight), the write failed, the postcard encode
+/// failed, OR the call originated from host context (the
+/// [`write_msg`] -> [`assert_guest_context`] early-return). The
+/// fire-and-forget caller in
+/// `crate::scenario::payload_run::emit_payload_metrics` discards
+/// the return at statement position; the boolean exists so the
+/// host-context no-op is observable to a test rather than swallowed.
+pub fn send_payload_metrics(metrics: &crate::test_support::PayloadMetrics) -> bool {
     match postcard::to_stdvec(metrics) {
-        Ok(bytes) => {
-            write_msg(MsgType::PayloadMetrics.wire_value(), &bytes);
-        }
+        Ok(bytes) => write_msg(MsgType::PayloadMetrics.wire_value(), &bytes),
         Err(e) => {
             eprintln!("ktstr: postcard-encode PayloadMetrics for bulk-port emit: {e}");
+            false
         }
     }
 }
 
 /// Send a coverage profraw blob to the host. Payload: raw `.profraw`
-/// bytes produced by `__llvm_profile_get_data`.
+/// bytes serialized by `__llvm_profile_write_buffer`.
 ///
-/// Frames with [`MsgType::Profraw`].
+/// Frames with [`MsgType::Profraw`]. Gated on `cfg(any(test, coverage))`
+/// because the only callers are the coverage-build guest flush
+/// (`try_flush_profraw`, `cfg(coverage)`) and its host-context
+/// suppression unit test (`cfg(test)`); a plain lib build has none.
+#[cfg(any(test, coverage))]
 pub fn send_profraw(buf: &[u8]) {
     write_msg(MsgType::Profraw.wire_value(), buf);
 }
@@ -722,7 +826,6 @@ pub fn send_stderr_chunk(buf: &[u8]) -> bool {
 ///
 /// Required: caller chunks at sub-cap boundaries; same constraint
 /// as [`send_stdout_chunk`].
-#[allow(dead_code)]
 pub fn send_sched_log(buf: &[u8]) {
     write_msg(MsgType::SchedLog.wire_value(), buf);
 }
@@ -765,7 +868,6 @@ pub fn send_exec_exit(code: i32) {
 /// Frames with [`MsgType::Dmesg`]. Sent on the
 /// initramfs-extraction failure path so the host sees the kernel
 /// OOM messages without scraping COM2.
-#[allow(dead_code)]
 pub fn send_dmesg(buf: &[u8]) {
     write_msg(MsgType::Dmesg.wire_value(), buf);
 }
@@ -1339,7 +1441,18 @@ mod tests {
     //! which gates on `is_guest()`. The host-context check
     //! rejects every call from these tests — verifying that gate
     //! holds is the safest unit-test scope: it confirms the wrappers
-    //! do not accidentally write to a host process's memory.
+    //! do not write to the host's bulk-port path.
+    //!
+    //! The void-returning senders give the caller no return value to
+    //! inspect, so "did not write" is observed via
+    //! [`BULK_PORT_WRITE_ATTEMPTS`]: [`assert_no_bulk_write`] snapshots
+    //! the global write-path entry counter, runs the sender, and
+    //! asserts the counter did not advance — the concrete no-op
+    //! observation (suppression), not merely "did not panic". The
+    //! `is_guest()` override is thread-local, so the host-context gate
+    //! these tests exercise cannot be perturbed by parallel tests;
+    //! and no test calls a sender in guest context, so the global
+    //! counter is never advanced concurrently with these snapshots.
     //!
     //! End-to-end transport (guest → bulk port → host drain → TLV
     //! parse) is exercised by the integration test suite under
@@ -1347,22 +1460,44 @@ mod tests {
 
     use super::*;
 
-    /// `send_exit` from host context must be a no-op (no panic).
+    /// Run `f` (a host-context sender call) and assert it did NOT
+    /// enter `write_to_bulk_port` — i.e. the `is_guest()` gate in
+    /// `write_msg` suppressed the write. Snapshots
+    /// [`BULK_PORT_WRITE_ATTEMPTS`] before and after; a host-context
+    /// sender must leave it unchanged.
+    fn assert_no_bulk_write(label: &str, f: impl FnOnce()) {
+        use std::sync::atomic::Ordering;
+        let before = BULK_PORT_WRITE_ATTEMPTS.load(Ordering::SeqCst);
+        f();
+        let after = BULK_PORT_WRITE_ATTEMPTS.load(Ordering::SeqCst);
+        assert_eq!(
+            after, before,
+            "{label}: host-context call must NOT reach write_to_bulk_port; \
+             the is_guest() gate failed to suppress the write \
+             (before={before}, after={after})",
+        );
+    }
+
+    /// `send_exit` from host context must suppress the bulk-port write.
     #[test]
     fn send_exit_from_host_context_is_noop() {
         let _g = IsGuestOverrideGuard::new(false);
-        send_exit(0);
-        send_exit(-1);
+        assert_no_bulk_write("send_exit(0)", || send_exit(0));
+        assert_no_bulk_write("send_exit(-1)", || send_exit(-1));
     }
 
-    /// `send_test_result` from host context is a no-op.
+    /// `send_test_result` from host context suppresses the write.
     #[test]
     fn send_test_result_from_host_context_is_noop() {
         let _g = IsGuestOverrideGuard::new(false);
-        send_test_result(&crate::assert::AssertResult::pass());
+        assert_no_bulk_write("send_test_result", || {
+            send_test_result(&crate::assert::AssertResult::pass())
+        });
     }
 
-    /// `send_payload_metrics` from host context is a no-op.
+    /// `send_payload_metrics` from host context is a no-op and
+    /// reports it by returning `false` (the `assert_guest_context`
+    /// early-return inside `write_msg`), mirroring `send_sys_rdy`.
     #[test]
     fn send_payload_metrics_from_host_context_is_noop() {
         let _g = IsGuestOverrideGuard::new(false);
@@ -1371,24 +1506,27 @@ mod tests {
             metrics: vec![],
             exit_code: 0,
         };
-        send_payload_metrics(&pm);
+        assert!(
+            !send_payload_metrics(&pm),
+            "host-context send must return false (no frame written)"
+        );
     }
 
-    /// `send_profraw` from host context is a no-op.
+    /// `send_profraw` from host context suppresses the write.
     #[test]
     fn send_profraw_from_host_context_is_noop() {
         let _g = IsGuestOverrideGuard::new(false);
-        send_profraw(b"\x01\x02\x03");
+        assert_no_bulk_write("send_profraw", || send_profraw(b"\x01\x02\x03"));
     }
 
-    /// `send_stimulus` from host context is a no-op.
+    /// `send_stimulus` from host context suppresses the write.
     #[test]
     fn send_stimulus_from_host_context_is_noop() {
         let _g = IsGuestOverrideGuard::new(false);
-        send_stimulus(&[0u8; 24]);
+        assert_no_bulk_write("send_stimulus", || send_stimulus(&[0u8; 24]));
     }
 
-    /// `send_raw_payload_output` from host context is a no-op.
+    /// `send_raw_payload_output` from host context suppresses the write.
     #[test]
     fn send_raw_payload_output_from_host_context_is_noop() {
         let _g = IsGuestOverrideGuard::new(false);
@@ -1400,30 +1538,36 @@ mod tests {
             metric_hints: vec![],
             metric_bounds: None,
         };
-        send_raw_payload_output(&raw);
+        assert_no_bulk_write("send_raw_payload_output", || send_raw_payload_output(&raw));
     }
 
-    /// `send_sched_exit` from host context is a no-op.
+    /// `send_sched_exit` from host context suppresses the write.
     #[test]
     fn send_sched_exit_from_host_context_is_noop() {
         let _g = IsGuestOverrideGuard::new(false);
-        send_sched_exit(0);
-        send_sched_exit(-1);
+        assert_no_bulk_write("send_sched_exit(0)", || send_sched_exit(0));
+        assert_no_bulk_write("send_sched_exit(-1)", || send_sched_exit(-1));
     }
 
-    /// `send_scenario_start` from host context is a no-op.
+    /// `send_scenario_start` from host context suppresses the write.
+    /// `send_scenario_start` retries the write up to 5 times on a
+    /// not-yet-open port; the host-context gate must short-circuit
+    /// EVERY attempt, so the write-path counter stays put despite the
+    /// retry loop.
     #[test]
     fn send_scenario_start_from_host_context_is_noop() {
         let _g = IsGuestOverrideGuard::new(false);
-        send_scenario_start();
+        assert_no_bulk_write("send_scenario_start", send_scenario_start);
     }
 
-    /// `send_scenario_end` from host context is a no-op.
+    /// `send_scenario_end` from host context suppresses the write.
     #[test]
     fn send_scenario_end_from_host_context_is_noop() {
         let _g = IsGuestOverrideGuard::new(false);
-        send_scenario_end(0, 0);
-        send_scenario_end(u64::MAX, u64::MAX);
+        assert_no_bulk_write("send_scenario_end(0,0)", || send_scenario_end(0, 0));
+        assert_no_bulk_write("send_scenario_end(MAX,MAX)", || {
+            send_scenario_end(u64::MAX, u64::MAX)
+        });
     }
 
     /// `send_sys_rdy` from host context returns false (no-op +
@@ -1453,44 +1597,56 @@ mod tests {
         assert!(!send_stderr_chunk(b"oops"));
     }
 
-    /// `send_sched_log` from host context is a no-op.
+    /// `send_sched_log` from host context suppresses the write.
     #[test]
     fn send_sched_log_from_host_context_is_noop() {
         let _g = IsGuestOverrideGuard::new(false);
-        send_sched_log(b"---SCHED_OUTPUT_START---\n");
+        assert_no_bulk_write("send_sched_log", || {
+            send_sched_log(b"---SCHED_OUTPUT_START---\n")
+        });
     }
 
-    /// `send_lifecycle` from host context is a no-op for every
-    /// phase, including the reason-bearing variant.
+    /// `send_lifecycle` from host context suppresses the write for
+    /// every phase, including the reason-bearing variant.
     #[test]
     fn send_lifecycle_from_host_context_is_noop() {
         let _g = IsGuestOverrideGuard::new(false);
-        send_lifecycle(LifecyclePhase::InitStarted, "");
-        send_lifecycle(LifecyclePhase::PayloadStarting, "");
-        send_lifecycle(LifecyclePhase::SchedulerDied, "");
-        send_lifecycle(LifecyclePhase::SchedulerNotAttached, "verifier rejected");
+        assert_no_bulk_write("send_lifecycle(InitStarted)", || {
+            send_lifecycle(LifecyclePhase::InitStarted, "")
+        });
+        assert_no_bulk_write("send_lifecycle(PayloadStarting)", || {
+            send_lifecycle(LifecyclePhase::PayloadStarting, "")
+        });
+        assert_no_bulk_write("send_lifecycle(SchedulerDied)", || {
+            send_lifecycle(LifecyclePhase::SchedulerDied, "")
+        });
+        assert_no_bulk_write("send_lifecycle(SchedulerNotAttached)", || {
+            send_lifecycle(LifecyclePhase::SchedulerNotAttached, "verifier rejected")
+        });
     }
 
-    /// `send_exec_exit` from host context is a no-op.
+    /// `send_exec_exit` from host context suppresses the write.
     #[test]
     fn send_exec_exit_from_host_context_is_noop() {
         let _g = IsGuestOverrideGuard::new(false);
-        send_exec_exit(0);
-        send_exec_exit(-1);
+        assert_no_bulk_write("send_exec_exit(0)", || send_exec_exit(0));
+        assert_no_bulk_write("send_exec_exit(-1)", || send_exec_exit(-1));
     }
 
-    /// `send_dmesg` from host context is a no-op.
+    /// `send_dmesg` from host context suppresses the write.
     #[test]
     fn send_dmesg_from_host_context_is_noop() {
         let _g = IsGuestOverrideGuard::new(false);
-        send_dmesg(b"[    0.000000] Linux version 6.16.0\n");
+        assert_no_bulk_write("send_dmesg", || {
+            send_dmesg(b"[    0.000000] Linux version 6.16.0\n")
+        });
     }
 
-    /// `send_probe_output` from host context is a no-op.
+    /// `send_probe_output` from host context suppresses the write.
     #[test]
     fn send_probe_output_from_host_context_is_noop() {
         let _g = IsGuestOverrideGuard::new(false);
-        send_probe_output(b"{}\n");
+        assert_no_bulk_write("send_probe_output", || send_probe_output(b"{}\n"));
     }
 
     /// `request_snapshot` from host context returns `TransportError`.
@@ -1687,5 +1843,83 @@ mod tests {
         }
         // Inner dropped — outer's value is restored.
         assert!(is_guest());
+    }
+
+    /// send_test_result's overflow branch selection (the AGGREGATE payload bound
+    /// across non-merging per-cgroup-per-step carriers). Drives the pure
+    /// classify_test_result at each size class and pins verdict integrity: a PASS
+    /// with only oversized samples is degraded (samples dropped, verdict kept),
+    /// NEVER flipped to a synthetic FAIL.
+    #[test]
+    fn classify_test_result_selects_branch_by_size() {
+        use crate::assert::{AssertResult, PhaseBucket, PhaseCgroupStats};
+        let mk = |n: u64| {
+            let mut pc = std::collections::BTreeMap::new();
+            pc.insert(
+                "cg".to_string(),
+                PhaseCgroupStats {
+                    wake_latencies_ns: (0..n).collect(),
+                    wake_sample_total: n,
+                    ..Default::default()
+                },
+            );
+            let mut r = AssertResult::pass();
+            r.stats.phases = vec![PhaseBucket {
+                step_index: 1,
+                label: "Step[0]".to_string(),
+                start_ms: 0,
+                end_ms: 1,
+                sample_count: 0,
+                metrics: std::collections::BTreeMap::new(),
+                per_cgroup: pc,
+            }];
+            r
+        };
+        let r = mk(1000);
+        let full = postcard::to_stdvec(&r).unwrap().len();
+
+        // (a) fits as-is -> Raw.
+        match classify_test_result(&r, full) {
+            Some(TestResultWire::Raw(b)) => assert_eq!(b.len(), full),
+            other => panic!("expected Raw, got {other:?}"),
+        }
+        // (b) sample_free <= max < full -> Stripped: verdict PRESERVED, samples gone.
+        let max = full - 1;
+        match classify_test_result(&r, max) {
+            Some(TestResultWire::Stripped { bytes, dropped }) => {
+                assert_eq!(dropped, 1000);
+                assert!(bytes.len() <= max);
+                let decoded: AssertResult = postcard::from_bytes(&bytes).unwrap();
+                assert!(decoded.is_pass(), "verdict PRESERVED — no PASS->FAIL flip");
+                assert!(
+                    decoded.stats.phases[0].per_cgroup["cg"]
+                        .wake_latencies_ns
+                        .is_empty(),
+                    "only the samples were dropped",
+                );
+            }
+            other => panic!("expected Stripped, got {other:?}"),
+        }
+        // (c) even the sample-free verdict overruns -> Truncated. The reported
+        // `offending` is the POST-strip (sample-free, incl. the dropped-samples
+        // info note) size, NOT the pre-strip original — so it is strictly less
+        // than `full`. (max=1 guarantees the stripped result still overruns.)
+        match classify_test_result(&r, 1) {
+            Some(TestResultWire::Truncated { offending }) => {
+                assert!(offending > 1, "offending overran max=1");
+                assert!(
+                    offending < full,
+                    "offending {offending} is the post-strip size, not the pre-strip original {full}",
+                );
+            }
+            other => panic!("expected Truncated, got {other:?}"),
+        }
+        // (d) no samples to drop + over max -> Truncated, offending == original size.
+        let ns = mk(0);
+        let ns_full = postcard::to_stdvec(&ns).unwrap().len();
+        match classify_test_result(&ns, ns_full - 1) {
+            Some(TestResultWire::Truncated { offending }) => assert_eq!(offending, ns_full),
+            other => panic!("expected Truncated, got {other:?}"),
+        }
     }
 }

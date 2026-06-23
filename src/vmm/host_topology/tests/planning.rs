@@ -28,8 +28,10 @@ fn cpu_cap_effective_count_fits() {
 }
 
 /// `effective_count` when cap exceeds the allowed-CPU count
-/// returns a `ResourceContention` error naming both numbers, so
-/// the operator can fix the flag without re-running `ktstr topo`.
+/// returns a `CpuBudgetUnsatisfiable` hard error naming both
+/// numbers. An explicit `--cpu-cap` the host cannot satisfy is a
+/// user-input error (FAIL so the operator fixes the flag), NOT
+/// transient contention (skip/retry).
 #[test]
 fn cpu_cap_effective_count_exceeds_host() {
     let cap = CpuCap::new(8).unwrap();
@@ -37,11 +39,11 @@ fn cpu_cap_effective_count_exceeds_host() {
     let msg = format!("{err:#}");
     assert!(msg.contains("8"), "msg must name requested cap: {msg}");
     assert!(msg.contains("4"), "msg must name allowed-CPU count: {msg}");
-    // Must downcast to ResourceContention for nextest-retry
-    // routing per the Tier-1/Tier-2 contract.
+    // Must downcast to CpuBudgetUnsatisfiable: a hard FAIL (the typed
+    // cap does not fit the host), NOT a ResourceContention skip/retry.
     assert!(
-        err.downcast_ref::<ResourceContention>().is_some(),
-        "must be a ResourceContention for retry routing: {msg}",
+        err.downcast_ref::<CpuBudgetUnsatisfiable>().is_some(),
+        "must be a CpuBudgetUnsatisfiable hard error: {msg}",
     );
 }
 
@@ -262,10 +264,12 @@ fn numa_nodes_sorted_by_distance_skips_empty_nodes() {
 
 /// `acquire_llc_plan` with `cpu_cap == Some(cap)` and
 /// `cap > allowed-CPU count` fails at `effective_count` with a
-/// `ResourceContention` — before any /tmp side-effects. Pins
-/// that over-cap fails cleanly without touching the lock pool.
-/// The test pins a 2-CPU allowed set and caps at 3 CPUs, the
-/// minimum pair that exercises the "N > allowed" branch.
+/// `CpuBudgetUnsatisfiable` hard error — before any /tmp
+/// side-effects. An explicit cap the host cannot satisfy is a
+/// user-input FAIL, not retry-routed contention. Pins that
+/// over-cap fails cleanly without touching the lock pool. The
+/// test pins a 2-CPU allowed set and caps at 3 CPUs, the minimum
+/// pair that exercises the "N > allowed" branch.
 #[test]
 fn acquire_llc_plan_rejects_cap_over_allowed_cpus() {
     let _allowed = AllowedCpusGuard::new(vec![0, 1]);
@@ -276,8 +280,8 @@ fn acquire_llc_plan_rejects_cap_over_allowed_cpus() {
     let err =
         acquire_llc_plan(&topo, &test_topo, Some(cap)).expect_err("cap > allowed_cpus must error");
     assert!(
-        err.downcast_ref::<ResourceContention>().is_some(),
-        "must be ResourceContention: {err:#}"
+        err.downcast_ref::<CpuBudgetUnsatisfiable>().is_some(),
+        "must be CpuBudgetUnsatisfiable: {err:#}"
     );
 }
 
@@ -607,13 +611,23 @@ fn should_warn_cross_node_polarity() {
     );
 }
 
-/// `warn_if_cross_node_spill` end-to-end pin: a multi-node plan
-/// produces the formatted warning (non-empty side effect
-/// observable via the pure predicate). A single-node plan is
-/// a no-op (predicate returns false → eprintln! is skipped).
-/// Pins the coupling between the predicate and the side-
-/// effecting wrapper so a refactor that dropped the predicate
-/// call (e.g. inlined an incorrect comparison) would fail.
+/// `warn_if_cross_node_spill` is a thin `eprintln!` wrapper over
+/// [`cross_node_spill_warning`], which holds the gate-and-format
+/// logic and returns the EXACT bytes the wrapper emits (sans
+/// newline). Asserting on that `Option<String>` pins both halves of
+/// the contract that the wrapper alone can only smoke-test:
+///   - multi-node plan → `Some(message)` whose body contains the
+///     `format_llc_list` rendering (`0 (node 0)`, `1 (node 1)`) and
+///     the NUMA node count, so a refactor that dropped the
+///     `format_llc_list` call, miscounted `mems.len()`, or inverted
+///     the gate would change the returned string and fail here;
+///   - single-node plan → `None`, so a refactor that flipped the
+///     predicate to fire on single-node plans surfaces as an
+///     unexpected `Some`.
+///
+/// `warn_if_cross_node_spill` itself is still invoked to prove it
+/// stays a pure no-op on the single-node path (it must not panic and
+/// has no other observable side effect when the warning is `None`).
 #[test]
 fn warn_if_cross_node_spill_predicate_gates_stderr() {
     let topo = synth_host_topo(&[(vec![0], 0), (vec![1], 1)]);
@@ -624,11 +638,28 @@ fn warn_if_cross_node_spill_predicate_gates_stderr() {
         snapshot: Vec::new(),
         locks: Vec::new(),
     };
-    assert!(should_warn_cross_node(&multi_plan.mems));
-    // Call the wrapper — it produces stderr output but we rely
-    // on the predicate gate above to verify the "will fire" half.
-    // Directly capturing stderr in-process is fragile across
-    // test runners; the predicate test pins the decision.
+    let msg = cross_node_spill_warning(&multi_plan, &topo)
+        .expect("multi-node plan must produce a warning");
+    // The message must equal exactly what the wrapper eprintln!s and
+    // must thread the rendered LLC list + the node count through.
+    let expected = format!(
+        "ktstr: reserving LLCs {list} across {n} NUMA nodes \
+         (preferred single-node contiguous unavailable). Build \
+         will run; memory-access latency may be higher.",
+        list = format_llc_list(&multi_plan.locked_llcs, &topo),
+        n = multi_plan.mems.len(),
+    );
+    assert_eq!(msg, expected, "warning body must match the wrapper's emit");
+    assert!(
+        msg.contains("0 (node 0)") && msg.contains("1 (node 1)"),
+        "warning must carry the format_llc_list NUMA annotations: {msg}",
+    );
+    assert!(
+        msg.contains("across 2 NUMA nodes"),
+        "warning must name the spanned node count: {msg}",
+    );
+    // The wrapper threads the same Some through to eprintln! — invoke
+    // it to confirm the Some path does not panic.
     warn_if_cross_node_spill(&multi_plan, &topo);
 
     let single_plan = LlcPlan {
@@ -638,8 +669,11 @@ fn warn_if_cross_node_spill_predicate_gates_stderr() {
         snapshot: Vec::new(),
         locks: Vec::new(),
     };
-    assert!(!should_warn_cross_node(&single_plan.mems));
-    // No-op call — predicate returns false, eprintln! is skipped.
+    assert!(
+        cross_node_spill_warning(&single_plan, &topo).is_none(),
+        "single-node plan must suppress the warning (None), not emit",
+    );
+    // Wrapper must be a pure no-op on the None path.
     warn_if_cross_node_spill(&single_plan, &topo);
 }
 
@@ -654,8 +688,8 @@ fn cpu_cap_effective_count_on_zero_llc_host() {
     let cap = CpuCap::new(1).unwrap();
     let err = cap.effective_count(0).expect_err("1 > 0 must error");
     assert!(
-        err.downcast_ref::<ResourceContention>().is_some(),
-        "must be ResourceContention for retry routing",
+        err.downcast_ref::<CpuBudgetUnsatisfiable>().is_some(),
+        "must be CpuBudgetUnsatisfiable: an explicit cap > host is a hard error",
     );
 }
 
@@ -970,6 +1004,55 @@ fn default_cpu_budget_30_percent_rounded_up_min_one() {
     assert_eq!(default_cpu_budget(4), 2, "ceil(1.2) = 2");
     assert_eq!(default_cpu_budget(10), 3, "ceil(3.0) = 3");
     assert_eq!(default_cpu_budget(100), 30, "exact 30%");
+}
+
+/// `overcommit_warning`: `None` when the budget covers the vCPUs; `Some`
+/// with the right severity (explicit opt-in vs silent auto-collapse) and
+/// the tight-watchdog caveat when the budget is below the vCPU count.
+#[test]
+fn overcommit_warning_severity_and_polarity() {
+    // Budget >= vcpus: not oversubscribed -> no warning, either severity.
+    assert_eq!(overcommit_warning(32, 32, false, None), None);
+    assert_eq!(overcommit_warning(40, 32, true, None), None);
+
+    // Explicit opt-in (cpu_budget / --cpu-cap below vcpus): an opt-in note
+    // that points at the overcommit-invariant rate.
+    let m = overcommit_warning(4, 32, true, None).expect("4 < 32 => Some");
+    assert!(
+        m.contains("opt-in"),
+        "explicit case must read as opt-in: {m}"
+    );
+    assert!(
+        m.contains("worst_iterations_per_cpu_sec"),
+        "must point at the per-cgroup overcommit-invariant rate \
+         (worst_iterations_per_cpu_sec, matching the stats.rs compare hint); \
+         the bare iterations_per_cpu_sec is the pooled cohort rate: {m}",
+    );
+    assert!(
+        !m.contains("NOTHING opted into"),
+        "explicit case must not use the silent-case wording: {m}",
+    );
+
+    // Auto-collapse (process cpuset smaller than the guest): the loud,
+    // nobody-opted-in case.
+    let m = overcommit_warning(4, 32, false, None).expect("4 < 32 => Some");
+    assert!(
+        m.contains("WARNING"),
+        "auto case must be a louder WARNING: {m}"
+    );
+    assert!(
+        m.contains("NOTHING opted into"),
+        "auto case must name the silent condition: {m}",
+    );
+
+    // A tight watchdog folds in the false-eject caveat; a roomy one omits it.
+    let tight = overcommit_warning(4, 32, true, Some(5)).unwrap();
+    assert!(tight.contains("watchdog"), "tight watchdog caveat: {tight}");
+    let roomy = overcommit_warning(4, 32, true, Some(30)).unwrap();
+    assert!(
+        !roomy.contains("watchdog"),
+        "roomy watchdog must not add the caveat: {roomy}",
+    );
 }
 
 /// `acquire_llc_plan` bails with a diagnostic when the allowed

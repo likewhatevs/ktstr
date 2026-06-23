@@ -300,9 +300,10 @@ output.
 
 ### Budget
 
-The budget is a fixed 10 s base plus 150 ms per vCPU, capped at 30 s
-— `10000 + vcpus*150`, clamped to 30000. The 30 s cap is first hit at
-134 vCPUs. Worked examples:
+The budget is a fixed 10 s base plus 150 ms per vCPU, capped at 90 s
+— `10000 + vcpus*150`, clamped to 90000. The cap is first hit at 534
+vCPUs, so every realistic topology (up to the 512-vCPU `MAX_VCPUS`)
+gets its full additive budget. Worked examples:
 
 | vCPUs   | budget_ms |
 |---------|-----------|
@@ -310,10 +311,19 @@ The budget is a fixed 10 s base plus 150 ms per vCPU, capped at 30 s
 | 8       | 11200 |
 | 67      | 20050 |
 | 126     | 28900 |
-| 134+    | 30000 (cap) |
+| 256     | 48400 |
+| 512     | 86800 |
+| 534+    | 90000 (cap) |
 
 On lightly-loaded hosts the 10 s base covers the boot path
-comfortably.
+comfortably. This is the GUEST-side `send_sys_rdy` budget and is
+non-fatal — on exhaustion the guest WARNs and continues (the host
+monitor's `data_valid` gate keeps reads safe). The authoritative
+deadline is the HOST watchdog (`vm_timeout_from_entry`), which adds
+this budget as boot headroom and additionally multiplies that headroom
+by the host overcommit ratio (vCPUs / allowed host CPUs), so an
+oversubscribed boot gets proportionally longer before the watchdog
+fires.
 
 ### Fixes
 

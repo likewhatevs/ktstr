@@ -56,7 +56,7 @@ jobs:
       - name: Install ktstr
         run: cargo install --path . --locked --features remote-cache
       - name: Cache kernel images
-        uses: actions/cache@v5
+        uses: actions/cache@v4
         with:
           path: ~/.cache/ktstr/kernels
           key: ktstr-kernels-x64-${{ hashFiles('ktstr.kconfig') }}
@@ -150,7 +150,7 @@ coverage:
     - name: Install ktstr
       run: cargo install --path . --locked --features remote-cache
     - name: Cache kernel images
-      uses: actions/cache@v5
+      uses: actions/cache@v4
       with:
         path: ~/.cache/ktstr/kernels
         key: ktstr-kernels-x64-${{ hashFiles('ktstr.kconfig') }}

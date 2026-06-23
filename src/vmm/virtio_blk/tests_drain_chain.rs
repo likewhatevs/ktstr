@@ -1099,3 +1099,121 @@ fn process_requests_multiple_chains_drained_in_one_notify() {
         );
     }
 }
+
+/// A `Backing` that records the largest iovcnt passed to
+/// `preadv`/`pwritev`, so a chain test can confirm the vectored
+/// handlers build the iovec chain within the `SmallVec` inline capacity
+/// (`MAX_BLK_IOVECS`) — i.e. with no heap spill — for a legitimate
+/// multi-segment chain. The counters are `Arc<AtomicUsize>` because
+/// `Backing: Send` (backing.rs) requires the backing — and thus its
+/// fields — to be `Send`; an `Rc<Cell>` would not satisfy that bound.
+/// `fetch_max` with `Relaxed` ordering suffices (the `cfg(test)` inline
+/// engine is single-threaded, so no cross-thread ordering is needed).
+struct RecordingBacking {
+    inner: File,
+    max_read_iovcnt: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    max_write_iovcnt: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Backing for RecordingBacking {
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+        Backing::read_at(&self.inner, buf, offset)
+    }
+    fn write_at(&self, buf: &[u8], offset: u64) -> std::io::Result<usize> {
+        Backing::write_at(&self.inner, buf, offset)
+    }
+    fn sync_data(&self) -> std::io::Result<()> {
+        Backing::sync_data(&self.inner)
+    }
+    unsafe fn preadv(&self, iovs: &[libc::iovec], offset: u64) -> std::io::Result<usize> {
+        self.max_read_iovcnt
+            .fetch_max(iovs.len(), Ordering::Relaxed);
+        // SAFETY: forwards the caller's iovec-validity precondition unchanged.
+        unsafe { Backing::preadv(&self.inner, iovs, offset) }
+    }
+    unsafe fn pwritev(&self, iovs: &[libc::iovec], offset: u64) -> std::io::Result<usize> {
+        self.max_write_iovcnt
+            .fetch_max(iovs.len(), Ordering::Relaxed);
+        // SAFETY: forwards the caller's iovec-validity precondition unchanged.
+        unsafe { Backing::pwritev(&self.inner, iovs, offset) }
+    }
+}
+
+/// A legitimate maximal multi-segment read chain (`VIRTIO_BLK_SEG_MAX`
+/// = 128 device-writable data descriptors — the drain's
+/// `SCRATCH_CAP = SEG_MAX + 2` acceptance boundary — each in the single
+/// test memory region so each yields exactly one iovec) must build its
+/// iovec chain INLINE in the handler's `SmallVec<[_; MAX_BLK_IOVECS]>` —
+/// no heap spill. We cannot observe `SmallVec::spilled()` from outside
+/// the handler, so we assert the externally-observable equivalent: the
+/// iovcnt the backing sees (== the SmallVec length) is
+/// `<= MAX_BLK_IOVECS`, which guarantees a SmallVec of that capacity
+/// never spilled. Pins the zero-per-request-allocation fix (the inline
+/// `SmallVec` iovec build).
+#[test]
+fn process_requests_read_chain_builds_iovecs_inline_no_spill() {
+    let cap = 1u64 << 20; // 1 MiB backing
+    let f = make_backed_file_with_pattern(cap, 0xAB);
+    let recording_inner = f.try_clone().expect("clone backing for recording mock");
+    let mut dev = VirtioBlk::new(f, cap, DiskThrottle::default());
+    let read_iovcnt = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    dev.worker.state_mut().backing = Box::new(RecordingBacking {
+        inner: recording_inner,
+        max_read_iovcnt: read_iovcnt.clone(),
+        max_write_iovcnt: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    });
+    let mem = make_chain_test_mem();
+    let mock = MockSplitQueue::create(&mem, GuestAddress(0), 256);
+    let header_addr = GuestAddress(0x4000);
+    let status_addr = GuestAddress(0x20000);
+    write_blk_header(&mem, header_addr, VIRTIO_BLK_T_IN, 0);
+    // Header (RO) + SEG_MAX (128) device-writable 512-byte data segments
+    // + status = a 130-descriptor chain == the drain's SCRATCH_CAP
+    // (SEG_MAX + 2) acceptance boundary. The queue is 256-deep to hold
+    // the chain (wire_device_to_mock negotiates QUEUE_MAX_SIZE = 256).
+    // Each segment is placed in the single test region so get_slices
+    // yields exactly one iovec per segment (no region straddle); the
+    // 128 segments span 0x5000..0x15000, clear of the status byte at
+    // 0x20000 and the 256-deep rings below 0x4000.
+    const N_SEGS: usize = 128;
+    let mut descs = vec![RawDescriptor::from(SplitDescriptor::new(
+        header_addr.0,
+        VIRTIO_BLK_OUTHDR_SIZE as u32,
+        0, // device-readable header
+        0,
+    ))];
+    for i in 0..N_SEGS {
+        descs.push(RawDescriptor::from(SplitDescriptor::new(
+            0x5000 + (i as u64) * 0x200,
+            512,
+            VRING_DESC_F_WRITE as u16,
+            0,
+        )));
+    }
+    descs.push(RawDescriptor::from(SplitDescriptor::new(
+        status_addr.0,
+        1,
+        VRING_DESC_F_WRITE as u16,
+        0,
+    )));
+    mock.build_desc_chain(&descs).expect("build chain");
+    dev.set_mem(mem.clone());
+    wire_device_to_mock(&mut dev, &mock);
+    write_reg(&mut dev, VIRTIO_MMIO_QUEUE_NOTIFY, REQ_QUEUE as u32);
+
+    // Read completed cleanly through the SmallVec path.
+    let mut status_buf = [0u8; 1];
+    mem.read_slice(&mut status_buf, status_addr).unwrap();
+    assert_eq!(status_buf[0], VIRTIO_BLK_S_OK as u8, "read must be S_OK");
+    assert_eq!(dev.counters().reads_completed.load(Ordering::Relaxed), 1);
+
+    let seen = read_iovcnt.load(Ordering::Relaxed);
+    assert_eq!(
+        seen, N_SEGS,
+        "{N_SEGS} single-region segments must yield {N_SEGS} iovecs"
+    );
+    assert!(
+        seen <= MAX_BLK_IOVECS,
+        "iovcnt {seen} must fit the SmallVec inline cap {MAX_BLK_IOVECS} (no heap spill)",
+    );
+}

@@ -44,7 +44,7 @@ fn neg_tight_imbalance_threshold_catches_mild_imbalance() {
         summary.max_imbalance_ratio >= 1.5,
         "summary must capture ratio"
     );
-    assert!(!summary.stuck_detected, "no stall in this scenario");
+    assert_eq!(summary.stuck_count, 0, "no stall in this scenario");
     assert_eq!(summary.total_samples, 3);
     let report = MonitorReport {
         samples,
@@ -189,9 +189,9 @@ fn neg_stuck_detection_catches_frozen_rq_clock() {
         },
     ];
     let summary = MonitorSummary::from_samples(&samples);
-    assert!(
-        summary.stuck_detected,
-        "summary.stuck_detected must be true"
+    assert_eq!(
+        summary.stuck_count, 1,
+        "one stuck (cpu, pair) event: cpu0 frozen across the single window"
     );
     let report = MonitorReport {
         samples,
@@ -212,6 +212,69 @@ fn neg_stuck_detection_catches_frozen_rq_clock() {
     assert!(
         detail.contains("clock=5000"),
         "must include frozen clock value: {detail}"
+    );
+}
+
+#[test]
+fn stuck_count_accumulates_across_consecutive_windows() {
+    // cpu0 frozen across TWO consecutive windows (3 samples) counts TWICE.
+    // Pins removal of the per-RUN early break: the old 0/1 path stopped at
+    // the first stuck window. cpu1 advances so each sample stays plausible.
+    let mk = |ms: u64, rq1: u64| MonitorSample {
+        prog_stats: None,
+        elapsed_ms: ms,
+        cpus: vec![
+            CpuSnapshot {
+                nr_running: 1,
+                rq_clock: 5000,
+                ..Default::default()
+            },
+            CpuSnapshot {
+                nr_running: 1,
+                rq_clock: rq1,
+                ..Default::default()
+            },
+        ],
+    };
+    let samples = vec![mk(100, 6000), mk(200, 6100), mk(300, 6200)];
+    let summary = MonitorSummary::from_samples(&samples);
+    assert_eq!(
+        summary.stuck_count, 2,
+        "cpu0 frozen across both windows -> 2 observations (per-run break removed)"
+    );
+}
+
+#[test]
+fn stuck_count_accumulates_across_cpus_in_one_window() {
+    // TWO CPUs frozen in the SAME window count TWICE. Pins removal of the
+    // per-CPU inner early break: the old path stopped at the first stuck
+    // CPU. cpu2 advances so the sample stays plausible.
+    let mk = |ms: u64, rq2: u64| MonitorSample {
+        prog_stats: None,
+        elapsed_ms: ms,
+        cpus: vec![
+            CpuSnapshot {
+                nr_running: 1,
+                rq_clock: 5000,
+                ..Default::default()
+            },
+            CpuSnapshot {
+                nr_running: 1,
+                rq_clock: 7000,
+                ..Default::default()
+            },
+            CpuSnapshot {
+                nr_running: 1,
+                rq_clock: rq2,
+                ..Default::default()
+            },
+        ],
+    };
+    let samples = vec![mk(100, 9000), mk(200, 9100)];
+    let summary = MonitorSummary::from_samples(&samples);
+    assert_eq!(
+        summary.stuck_count, 2,
+        "cpu0 + cpu1 both frozen in the one window -> 2 observations (per-cpu break removed)"
     );
 }
 
@@ -259,7 +322,7 @@ fn neg_combined_imbalance_and_stuck_both_reported() {
         },
     ];
     let summary = MonitorSummary::from_samples(&samples);
-    assert!(summary.stuck_detected);
+    assert_eq!(summary.stuck_count, 1);
     assert!(summary.max_imbalance_ratio >= 10.0);
     let report = MonitorReport {
         samples,
@@ -334,8 +397,8 @@ fn stuck_idle_cpu_exempt() {
         },
     ];
     let summary = MonitorSummary::from_samples(&samples);
-    assert!(
-        !summary.stuck_detected,
+    assert_eq!(
+        summary.stuck_count, 0,
         "idle CPU should not trigger stall in summary"
     );
     let report = MonitorReport {
@@ -398,8 +461,8 @@ fn stuck_idle_to_busy_not_exempt() {
         },
     ];
     let summary = MonitorSummary::from_samples(&samples);
-    assert!(
-        summary.stuck_detected,
+    assert_eq!(
+        summary.stuck_count, 1,
         "busy CPU with frozen clock is a stall"
     );
     let report = MonitorReport {
@@ -552,7 +615,7 @@ fn from_samples_idle_cpu_no_stuck() {
         ],
     };
     let summary = MonitorSummary::from_samples(&[s1, s2]);
-    assert!(!summary.stuck_detected);
+    assert_eq!(summary.stuck_count, 0);
 }
 
 #[test]
@@ -677,8 +740,8 @@ fn evaluate_suppresses_stuck_when_vcpu_preempted() {
         },
     ];
     let summary = MonitorSummary::from_samples_with_threshold(&samples, 10_000_000);
-    assert!(
-        !summary.stuck_detected,
+    assert_eq!(
+        summary.stuck_count, 0,
         "preempted vCPU should not flag stall in summary"
     );
     let report = MonitorReport {
@@ -748,8 +811,8 @@ fn evaluate_catches_stuck_when_vcpu_running() {
         },
     ];
     let summary = MonitorSummary::from_samples_with_threshold(&samples, 10_000_000);
-    assert!(
-        summary.stuck_detected,
+    assert_eq!(
+        summary.stuck_count, 1,
         "running vCPU with stuck clock is a stall"
     );
     let report = MonitorReport {
@@ -809,8 +872,8 @@ fn evaluate_stuck_none_vcpu_time_falls_back_to_current_behavior() {
         },
     ];
     let summary = MonitorSummary::from_samples(&samples);
-    assert!(
-        summary.stuck_detected,
+    assert_eq!(
+        summary.stuck_count, 1,
         "None vcpu time should not suppress stall"
     );
     let report = MonitorReport {
@@ -867,8 +930,8 @@ fn from_samples_suppresses_stuck_when_vcpu_preempted() {
         ],
     };
     let summary = MonitorSummary::from_samples_with_threshold(&[s1, s2], 10_000_000);
-    assert!(
-        !summary.stuck_detected,
+    assert_eq!(
+        summary.stuck_count, 0,
         "preempted vCPU should not flag stall"
     );
 }

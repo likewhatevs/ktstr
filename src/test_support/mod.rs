@@ -20,7 +20,7 @@
 //!
 //! # Module layout
 //!
-//! Implementation is split across 17 production submodules
+//! Implementation is split across 18 production submodules
 //! re-exported at `test_support::*` for a flat public API: `args`
 //! (CLI argument extraction), `dispatch` (ktstr / cargo-ktstr CLI
 //! entry points), `entry` (scheduler + test-entry types), `eval`
@@ -34,7 +34,9 @@
 //! eval and probe so they don't circularly depend on each other),
 //! `shell_descriptor` (wire-format struct shared between the test
 //! binary's `--ktstr-shell-test=<NAME>` producer and cargo-ktstr's
-//! shell-mode consumer), `sidecar` (per-run JSON records), `staged`
+//! shell-mode consumer), `wprof` (`#[cfg(feature = "wprof")]` —
+//! Perfetto-trace wire constants + `.wprof.pb` shape assertions),
+//! `sidecar` (per-run JSON records), `staged`
 //! (`pub(crate) mod` — staged-payload writer), `timefmt` (ISO-8601
 //! + run-id helpers), and `topo` (topology override parsing).
 //!
@@ -51,7 +53,9 @@ use anyhow::Result;
 mod args;
 mod dispatch;
 mod entry;
+mod entry_validate;
 mod eval;
+mod host_class;
 mod metrics;
 #[cfg(feature = "llm")]
 mod model;
@@ -69,6 +73,8 @@ pub use shell_descriptor::{SchedulerKind, ShellTestDescriptor};
 pub mod wprof;
 #[cfg(feature = "wprof")]
 pub use wprof::{PERFETTO_TRACE_PACKETS_TAG, WPROF_PB_MIN_BYTES, assert_wprof_pb_shape};
+#[cfg(test)]
+pub(crate) mod btf_blob;
 mod sidecar;
 pub(crate) mod staged;
 #[cfg(test)]
@@ -116,8 +122,9 @@ pub use sidecar::{
 
 pub use dispatch::{
     DEFAULT_HOST_CGROUP_PARENT, EXIT_FAIL, EXIT_INCONCLUSIVE, EXIT_PASS, analyze_sidecars,
-    is_kernel_unavailable, is_resource_contention, ktstr_main, ktstr_test_early_dispatch,
-    resolve_host_cgroup_parent, run_ktstr_test, sanitize_kernel_label,
+    is_cpu_budget_unsatisfiable, is_kernel_unavailable, is_perf_mode_unavailable,
+    is_resource_contention, is_topology_insufficient, is_topology_unrepresentable, ktstr_main,
+    ktstr_test_early_dispatch, resolve_host_cgroup_parent, run_ktstr_test, sanitize_kernel_label,
 };
 pub use entry::{
     BinaryKindJson, BpfMapWrite, CgroupPath, KTSTR_SCHEDULERS, KTSTR_TESTS, KtstrTestEntry,
@@ -127,6 +134,7 @@ pub use entry::{
 };
 pub use eval::{KernelUnavailable, ResolveSource, resolve_scheduler, resolve_test_kernel};
 pub(crate) use eval::{record_skip_sidecar, run_ktstr_test_inner};
+pub use host_class::{HostClass, classify_host_error};
 pub use metrics::{
     MAX_WALK_DEPTH, WALK_TRUNCATION_SENTINEL_NAME, extract_metrics, is_truncation_sentinel_name,
     walk_json_leaves,
@@ -153,7 +161,7 @@ pub use probe_metrics::{
     thread_count,
 };
 pub use profraw::target_dir as profraw_target_dir;
-pub(crate) use profraw::try_flush_profraw;
+pub(crate) use profraw::{find_symbol_vaddrs, persist_guest_profraw, try_flush_profraw};
 pub(crate) use timefmt::now_iso8601;
 pub(crate) use topo::{TopoOverride, parse_topo_string};
 

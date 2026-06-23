@@ -9,7 +9,8 @@ ktstr has three execution domains:
 2. **Guest process** -- the same test binary running inside the VM
    as PID 1. Mounts filesystems, starts the scheduler, creates
    cgroups, forks [workers](architecture/workers.md), runs scenarios,
-   writes results to virtio-console port 1 (with COM2 fallback for panic/crash and other non-blockable diagnostics).
+   writes results to virtio-console port 1. Panics, crashes, and
+   other non-blockable diagnostics fall back to COM2.
 
 3. **[Monitor](architecture/monitor.md) thread** -- runs on the host
    while the guest executes. Reads guest VM memory directly to observe
@@ -38,12 +39,15 @@ test binary
   |                             +-- poll scheduler liveness
   |                             +-- stop workers, collect reports
   |                             +-- evaluate results
-  |                             +-- write result to virtio-console port 1 (with COM2 fallback for panic/crash and other non-blockable diagnostics)
+  |                             +-- write result to virtio-console port 1
   |                           
-  +-- read result from virtio-console port 1 (with COM2 fallback for panic/crash and other non-blockable diagnostics)
+  +-- read result from virtio-console port 1
   +-- evaluate monitor data   
   +-- report pass/fail        
 ```
+
+Results travel on virtio-console port 1; panics, crashes, and other
+non-blockable diagnostics fall back to COM2.
 
 ## Key design decisions
 

@@ -2,8 +2,9 @@
 //!
 //! Each registered metric in [`crate::ctprof_compare::CTPROF_METRICS`]
 //! has a kernel-source-grounded semantic category — counter,
-//! cumulative-time, peak high-water, instantaneous gauge, byte
-//! count, ordinal scalar, categorical, or cpuset. The aggregation
+//! cumulative-time, peak high-water (ns and bytes), instantaneous
+//! gauge, byte count, ordinal scalar, categorical, or cpuset. The
+//! aggregation
 //! pipeline reduces values per category: counters sum, peaks take
 //! max, gauges take max, ordinals carry a [min, max] range,
 //! categoricals carry the mode (most-frequent value), and cpusets
@@ -101,6 +102,11 @@
 //!   `1 thread × 1s peak` carries different meaning than
 //!   `1000 threads × 1ms peak`. Examples: `wait_max`,
 //!   `sleep_max`, `block_max`, `exec_max`, `slice_max`.
+//! - [`PeakBytes`] — lifetime high-water mark, bytes (per-process
+//!   `hiwater_rss` / `hiwater_vm` from `struct taskstats` via the
+//!   genetlink path). Same Maxable-only contract as [`PeakNs`] but
+//!   Bytes-typed, so it renders on the IEC byte ladder
+//!   (`B → KiB → MiB → GiB → TiB`) instead of the ns ladder.
 //! - [`GaugeNs`] — instantaneous gauge sampled at capture time, ns.
 //!   `fair_slice_ns` is the canonical example. Summing gauges is a
 //!   category error — N nearly-identical instantaneous samples

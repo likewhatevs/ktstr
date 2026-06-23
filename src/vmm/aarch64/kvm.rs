@@ -254,15 +254,34 @@ impl KtstrKvm {
         // device GPAs on the MMIO bus and shadows serial/virtio. Reject
         // here so an over-large topology is a clear error, not a silent
         // boot failure.
+        //
+        // Deliberately asymmetric with x86_64. There the vCPU bound is the
+        // host-dependent KVM_CAP_MAX_VCPUS, so an over-cap topology is a
+        // skippable TopologyInsufficient (a host with a larger cap could run
+        // it). Here MAX_VCPUS is a VMM-layout constant — the statically sized
+        // GICv3 redistributor MMIO window, host-INDEPENDENT — so NO aarch64
+        // host can run a wider topology under this VMM. An over-bound topology
+        // is therefore a hard ERROR (a test misconfiguration), NOT a skip.
         let total_cpus = topo.total_cpus();
-        anyhow::ensure!(
-            total_cpus <= MAX_VCPUS,
-            "topology has {} vCPUs, exceeding the maximum of {}; the GICv3 \
-             redistributor region would overrun the device MMIO window and \
-             shadow the serial/virtio devices",
-            total_cpus,
-            MAX_VCPUS,
-        );
+        if total_cpus > MAX_VCPUS {
+            // Typed hard-fault (not a bare anyhow): positively asserts this
+            // is the host-INDEPENDENT VMM-layout limit, so a future skip
+            // matcher cannot misclassify it. Routes to EXIT_FAIL via the
+            // dedicated is_topology_unrepresentable hard-fail arm in
+            // result_to_exit_code (and the matching macro host_class_arms
+            // panic), placed above the expect_err inversion and the skip
+            // arms — it is not a skip type.
+            return Err(anyhow::Error::new(
+                crate::vmm::host_topology::TopologyUnrepresentable {
+                    reason: format!(
+                        "topology has {total_cpus} vCPUs, exceeding the maximum \
+                         of {MAX_VCPUS}; the GICv3 redistributor region would \
+                         overrun the device MMIO window and shadow the \
+                         serial/virtio devices"
+                    ),
+                },
+            ));
+        }
 
         let kvm = Kvm::new().context("open /dev/kvm")?;
 
@@ -772,6 +791,15 @@ mod tests {
         assert!(
             msg.contains(&(MAX_VCPUS + 1).to_string()) && msg.contains(&MAX_VCPUS.to_string()),
             "error must name the actual count and MAX_VCPUS; got: {msg}"
+        );
+        // The bail is the typed hard-fault, not a bare anyhow: the dedicated
+        // is_topology_unrepresentable arm (above the expect_err inversion and
+        // the skip arms) routes it to EXIT_FAIL, while a skip matcher
+        // (is_topology_insufficient / skip_on_contention!) cannot intercept it.
+        assert!(
+            err.downcast_ref::<crate::vmm::host_topology::TopologyUnrepresentable>()
+                .is_some(),
+            "over-MAX_VCPUS bail must be TopologyUnrepresentable; got: {err:#}"
         );
     }
 

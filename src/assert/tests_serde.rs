@@ -10,8 +10,10 @@ use super::*;
 fn scenario_stats_serde_roundtrip() {
     let s = ScenarioStats {
         cgroups: vec![CgroupStats {
+            cgroup_name: "cg_0".to_string(),
             num_workers: 4,
-            num_cpus: 2,
+            num_cpus: 3,
+            cpus_used: [0usize, 1, 2].into_iter().collect(),
             avg_off_cpu_pct: Some(50.0),
             min_off_cpu_pct: Some(40.0),
             max_off_cpu_pct: Some(60.0),
@@ -46,6 +48,16 @@ fn scenario_stats_serde_roundtrip() {
     assert_eq!(c.min_off_cpu_pct, Some(40.0));
     assert_eq!(c.max_off_cpu_pct, Some(60.0));
     assert_eq!(c.spread, Some(20.0));
+    // The new wire fields: non-empty so a BTreeSet ordering / String
+    // encode regression on cpus_used / cgroup_name surfaces here, not
+    // only via the render path.
+    assert_eq!(c.cgroup_name, "cg_0");
+    assert_eq!(
+        c.cpus_used,
+        [0usize, 1, 2]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<usize>>(),
+    );
 }
 
 #[test]
@@ -220,8 +232,10 @@ fn cgroup_stats_missing_required_field_rejected_by_deserialize() {
     // these are legitimately optional on the wire — not a softened
     // required scalar.
     const REQUIRED_FIELDS: &[&str] = &[
+        "cgroup_name",
         "num_workers",
         "num_cpus",
+        "cpus_used",
         "max_gap_ms",
         "max_gap_cpu",
         "total_migrations",
@@ -230,6 +244,7 @@ fn cgroup_stats_missing_required_field_rejected_by_deserialize() {
         "median_wake_latency_us",
         "wake_latency_cv",
         "total_iterations",
+        "total_cpu_time_ns",
         "mean_run_delay_us",
         "worst_run_delay_us",
         "page_locality",
@@ -299,19 +314,17 @@ fn scenario_stats_missing_required_scalar_rejected_by_deserialize() {
         "worst_gap_ms",
         "worst_gap_cpu",
         "worst_migration_ratio",
-        "worst_p99_wake_latency_us",
-        "worst_median_wake_latency_us",
-        "worst_wake_latency_cv",
         "total_iterations",
-        "worst_mean_run_delay_us",
-        "worst_run_delay_us",
         "worst_page_locality",
         "worst_cross_node_migration_ratio",
-        "worst_wake_latency_tail_ratio",
-        // `worst_iterations_per_worker` is intentionally omitted: it is
-        // `Option<f64>` (None = no cgroup reported a worker), so a
-        // missing key correctly deserializes to None rather than being
-        // a softened required scalar.
+        // The wake / run-delay (worst_p99/median/cv, worst_mean_run_delay_us,
+        // worst_run_delay_us), iteration-efficiency
+        // (worst_iterations_per_worker/_per_cpu_sec), and wake-latency
+        // tail-ratio (worst_wake_latency_tail_ratio) roll-ups are intentionally
+        // omitted: they are no longer typed ScenarioStats fields — they are
+        // `MetricKind::Distribution` / `WorstLowest` / `WakeLatencyTailRatio`
+        // metrics re-pooled into `ext_metrics` post-merge by
+        // `populate_run_distribution_metrics`.
         "ext_metrics",
     ];
 

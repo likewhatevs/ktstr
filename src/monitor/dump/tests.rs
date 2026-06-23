@@ -27,8 +27,8 @@ use crate::monitor::test_util::name_from_str;
 
 // Future contributor: if you hit an AmbiguousIfImpl compile error
 // here after adding `derive(Default)` (or a manual Default impl) on
-// DualFailureDumpReport, the rationale is at
-// src/monitor/dump/mod.rs:1272 (TL;DR: the `late` field is required
+// DualFailureDumpReport, the rationale is in the doc comment on the
+// `DualFailureDumpReport` struct in `dump::mod` (TL;DR: the `late` field is required
 // by the doc invariant — the freeze coordinator only writes a
 // DualFailureDumpReport after the late snapshot has been captured.
 // A Default impl would produce a wrapper with an empty late report
@@ -2975,38 +2975,24 @@ fn mem_reader_default_impls_skip_arena() {
 // `AccessorMemReader::cast_lookup` (render_map.rs) consults its
 // `cast_map` field: `Some(map)` returns
 // `map.get(&(parent_type_id, member_byte_offset)).copied()`,
-// `None` returns `None`. The struct itself is private to
-// render_map.rs, so these tests use a stand-in `StubReader` that
-// mirrors the production method body verbatim — same convention
-// as the surrounding AccessorMemReader-shape tests
-// (`accessor_mem_reader_no_snapshot_rejects_all_addrs` and the
-// rest in this section).
+// `None` returns `None`. `AccessorMemReader` itself is private to
+// render_map.rs, but the body lives in the free helper
+// `cast_lookup_in_map` (the same extraction convention as
+// `is_arena_addr_in_snapshot` / `read_arena_in_snapshot` /
+// `resolve_arena_type_in_index`). The production `cast_lookup`
+// forwards to it, so the tests below call the helper directly and
+// therefore exercise the real lookup body — not a re-declared copy.
 
-/// `cast_lookup` with a populated [`CastMap`] returns the matching
-/// [`CastHit`] when the `(parent_type_id, member_byte_offset)` key
-/// is present, and `None` when it is not. Mirrors the production
-/// `AccessorMemReader::cast_lookup` body line-for-line so a
-/// regression in either trips this test.
+/// `cast_lookup_in_map` (the body of `AccessorMemReader::cast_lookup`)
+/// with a populated [`CastMap`] returns the matching [`CastHit`] when
+/// the `(parent_type_id, member_byte_offset)` key is present, and
+/// `None` when it is not. Drives the production helper directly so a
+/// regression in the key tuple order or the present-key semantics
+/// trips this test.
 #[test]
 fn accessor_mem_reader_cast_lookup_with_populated_map() {
-    use super::super::btf_render::CastHit;
-    use super::super::cast_analysis::{AddrSpace, CastMap};
-
-    // Production cast_lookup body (render_map.rs):
-    //   let map = self.cast_map?;
-    //   map.get(&(parent_type_id, member_byte_offset)).copied()
-    struct StubReader<'a> {
-        cast_map: Option<&'a CastMap>,
-    }
-    impl super::super::btf_render::MemReader for StubReader<'_> {
-        fn read_kva(&self, _: u64, _: usize) -> Option<Vec<u8>> {
-            None
-        }
-        fn cast_lookup(&self, parent_type_id: u32, member_byte_offset: u32) -> Option<CastHit> {
-            let map = self.cast_map?;
-            map.get(&(parent_type_id, member_byte_offset)).copied()
-        }
-    }
+    use super::super::cast_analysis::{AddrSpace, CastHit, CastMap};
+    use super::render_map::cast_lookup_in_map;
 
     // Build a CastMap with two entries: one Arena, one Kernel.
     // Parent ids and member offsets are arbitrary u32s — the
@@ -3030,13 +3016,8 @@ fn accessor_mem_reader_cast_lookup_with_populated_map() {
         },
     );
 
-    let r = StubReader {
-        cast_map: Some(&map),
-    };
-
     // Hit on (42, 8): returns the Arena CastHit.
-    let hit_arena = r
-        .cast_lookup(42, 8)
+    let hit_arena = cast_lookup_in_map(Some(&map), 42, 8)
         .expect("populated map must return CastHit for present key");
     assert_eq!(
         hit_arena.target_type_id, 99,
@@ -3048,8 +3029,7 @@ fn accessor_mem_reader_cast_lookup_with_populated_map() {
     );
 
     // Hit on (42, 16): returns the Kernel CastHit.
-    let hit_kernel = r
-        .cast_lookup(42, 16)
+    let hit_kernel = cast_lookup_in_map(Some(&map), 42, 16)
         .expect("populated map must return CastHit for present key");
     assert_eq!(hit_kernel.target_type_id, 100);
     assert!(
@@ -3059,49 +3039,39 @@ fn accessor_mem_reader_cast_lookup_with_populated_map() {
 
     // Miss on a non-present key: returns None.
     assert!(
-        r.cast_lookup(42, 24).is_none(),
+        cast_lookup_in_map(Some(&map), 42, 24).is_none(),
         "key not in map must produce None (no fallback to nearby offsets)",
     );
+    // The key tuple is `(parent_type_id, member_byte_offset)` in
+    // THAT order: swapping a present (parent, offset) pair (42, 8)
+    // to (8, 42) must miss, pinning that the helper keys on the
+    // tuple in the documented order rather than either projection.
     assert!(
-        r.cast_lookup(99, 8).is_none(),
+        cast_lookup_in_map(Some(&map), 8, 42).is_none(),
+        "swapped (offset, parent) key must miss — tuple order is (parent, offset)",
+    );
+    assert!(
+        cast_lookup_in_map(Some(&map), 99, 8).is_none(),
         "different parent_type_id must produce None even with same offset",
     );
 }
 
-/// `cast_lookup` with `cast_map = None` returns `None` for every
-/// query. The `?` operator on the Option short-circuits before the
-/// BTreeMap lookup. Production code path: when the dump pass runs
+/// `cast_lookup_in_map` with `cast_map = None` returns `None` for
+/// every query. The `?` operator on the Option short-circuits before
+/// the BTreeMap lookup. Production code path: when the dump pass runs
 /// without a cast analysis (no scheduler binary supplied), every
 /// `u64` field renders as a plain counter — no typed-pointer
-/// promotion fires.
+/// promotion fires. Drives the production helper directly so the
+/// None-short-circuit guards production, not a copy.
 #[test]
 fn accessor_mem_reader_cast_lookup_with_none_map() {
-    use super::super::cast_analysis::CastMap;
+    use super::render_map::cast_lookup_in_map;
 
-    struct StubReader<'a> {
-        cast_map: Option<&'a CastMap>,
-    }
-    impl super::super::btf_render::MemReader for StubReader<'_> {
-        fn read_kva(&self, _: u64, _: usize) -> Option<Vec<u8>> {
-            None
-        }
-        fn cast_lookup(
-            &self,
-            parent_type_id: u32,
-            member_byte_offset: u32,
-        ) -> Option<super::super::btf_render::CastHit> {
-            let map = self.cast_map?;
-            map.get(&(parent_type_id, member_byte_offset)).copied()
-        }
-    }
-
-    let r = StubReader { cast_map: None };
-
-    // Every query returns None — the `?` on `self.cast_map` fires
+    // Every query returns None — the `?` on the None map fires
     // before any map lookup happens.
-    assert!(r.cast_lookup(0, 0).is_none());
-    assert!(r.cast_lookup(42, 8).is_none());
-    assert!(r.cast_lookup(u32::MAX, u32::MAX).is_none());
+    assert!(cast_lookup_in_map(None, 0, 0).is_none());
+    assert!(cast_lookup_in_map(None, 42, 8).is_none());
+    assert!(cast_lookup_in_map(None, u32::MAX, u32::MAX).is_none());
 }
 
 // -- AccessorMemReader resolve_arena_type -------------------------
@@ -6355,11 +6325,11 @@ fn render_map_percpu_array_truncates_at_cap() {
 /// renders only the first `MAX_HASH_ENTRIES` entries and records the cap
 /// in `error`. Unlike the index-driven ARRAY/PERCPU_ARRAY arms, the HASH
 /// arm's entry count comes from `iter_hash_map` walking real htab
-/// buckets (render_map.rs:1796-1831 `raw_entries.len() > MAX_HASH_ENTRIES`
-/// then `.take(MAX_HASH_ENTRIES)`), so this builds a 4097-element
+/// buckets (the HASH render arm's `raw_entries.len() > MAX_HASH_ENTRIES`
+/// then `.take(MAX_HASH_ENTRIES)` cap), so this builds a 4097-element
 /// `hlist_nulls` chain in bucket 0 of a synthetic `bpf_htab` and runs the
 /// real walker. The synthetic htab offsets reuse the exact field values
-/// from the htab walker unit tests (bpf_map/tests/htab_tests.rs:9-19) —
+/// from the htab walker unit tests (`bpf_map::tests::htab_tests`) —
 /// arbitrary but consistent with the walker's reads. The
 /// format-string-only `pinned_error_hash_map_truncation` stays as the
 /// cheap secondary guard.
@@ -6497,7 +6467,7 @@ fn render_map_hash_truncates_at_cap() {
     );
 }
 
-/// PERCPU_HASH render arm (render_map.rs:1839-1861) — the worst
+/// PERCPU_HASH render arm (its `BPF_MAP_TYPE_PERCPU_HASH | BPF_MAP_TYPE_LRU_PERCPU_HASH` match) — the worst
 /// materialization case (per-CPU Vecs ×num_cpus). r23 bounds the walker
 /// at MAP_MATERIALIZE_MAX+1 (via the shared `walk_htab`) so render
 /// truncates to MAX_HASH_ENTRIES and reports it. Mirror of
@@ -6642,13 +6612,13 @@ fn render_map_percpu_hash_truncates_at_cap() {
 /// A TASK_STORAGE map holding more than `MAX_HASH_ENTRIES` (4096) selems
 /// renders only the first `MAX_HASH_ENTRIES` entries and records the cap
 /// in `error`. The local-storage arm shares the HASH cap policy
-/// (render_map.rs:2059-2132 `raw_entries.len() > MAX_HASH_ENTRIES` then
-/// `.take(MAX_HASH_ENTRIES)`), and the entry count comes from
+/// (the local-storage render arm's `raw_entries.len() > MAX_HASH_ENTRIES` then
+/// `.take(MAX_HASH_ENTRIES)` cap), and the entry count comes from
 /// `iter_task_storage` walking a real `bpf_local_storage_map` hlist, so
 /// this chains 4097 `bpf_local_storage_elem`s in bucket 0 and runs the
 /// real walker. Synthetic offsets reuse the exact field values from the
 /// local-storage walker unit tests
-/// (bpf_map/tests/local_storage_tests.rs:22-40). The format-string-only
+/// (`bpf_map::tests::local_storage_tests`). The format-string-only
 /// `pinned_error_local_storage_truncation` stays as the cheap secondary
 /// guard.
 #[test]
@@ -8444,7 +8414,8 @@ fn identify_active_obj_walker_publishes_multi_copy_kvas_for_downstream_filter() 
 /// rebuild), the fallback picks the first struct_ops in iteration
 /// order regardless of which is "live". Pins this as the
 /// documented behavior — the consumer's `Snapshot::active`
-/// multi-obj fallback at view.rs:535-565 catches the mis-pick
+/// multi-obj fallback (its `NoActiveScheduler` return in
+/// `scenario::snapshot::view`) catches the mis-pick
 /// case and surfaces a NoActiveScheduler diagnostic with both
 /// prefixes named.
 #[test]
@@ -8750,4 +8721,589 @@ fn failure_dump_map_zero_kva_is_no_identity_sentinel_not_real_capture() {
         back.map_kva, 0,
         "absent-in-JSON deserializes back to 0 (the sentinel)"
     );
+}
+
+// ---- try_write_entry_table + FailureDumpPercpuEntry Display ------
+//
+// Targets the table-layout decision in `try_write_entry_table` (via
+// the `FailureDumpMap` Display path) and the four-way branch in
+// `FailureDumpPercpuEntry::Display` (simple list, >64-CPU dedup-skip,
+// template/varying, and contiguous-range grouping). Every fixture is
+// a synthesized `RenderedValue` tree — no VM boot — and every
+// assertion pins the exact rendered substring the branch produces.
+
+/// Construct a `FailureDumpMap` carrying `entries` as its only
+/// populated content. All non-entry collections are empty so the
+/// rendered output is exactly the `map ...` header line followed by
+/// whatever `try_write_entry_table` (or the per-entry fallback)
+/// emits — no array / percpu / arena / ringbuf trailers to confuse
+/// substring assertions.
+fn map_with_entries(name: &str, entries: Vec<FailureDumpEntry>) -> FailureDumpMap {
+    FailureDumpMap {
+        name: name.into(),
+        map_kva: 0,
+        map_type: BPF_MAP_TYPE_HASH,
+        value_size: 8,
+        max_entries: 64,
+        value: None,
+        entries,
+        array_entries: Vec::new(),
+        percpu_entries: Vec::new(),
+        percpu_hash_entries: Vec::new(),
+        arena: None,
+        ringbuf: None,
+        stack_trace: None,
+        fd_array: None,
+        error: None,
+    }
+}
+
+/// `make_small_struct`-shaped entry: both sides are same-shape
+/// inline-scalar structs with no payload, so a batch of these is the
+/// homogeneous-table-eligible case.
+fn table_entry(
+    key_ty: &str,
+    key_fields: &[(&str, u64)],
+    val_ty: &str,
+    val_fields: &[(&str, u64)],
+) -> FailureDumpEntry {
+    FailureDumpEntry {
+        key: Some(make_small_struct(key_ty, key_fields)),
+        key_hex: "00".into(),
+        value: Some(make_small_struct(val_ty, val_fields)),
+        value_hex: "00".into(),
+        payload: None,
+    }
+}
+
+#[test]
+fn try_write_entry_table_homogeneous_exact_layout() {
+    // Two homogeneous entries with single-column key + value structs
+    // exercise the full width-measurement + right-alignment path.
+    // The body following the `map ...` header is, byte-for-byte:
+    //   "\n  id |  n"   (header: key name width 2, value name width 2)
+    //   "\n   1 |  5"   (row 0, both cells right-aligned to width 2)
+    //   "\n  10 | 50"   (row 1)
+    // Column width 2 comes from: key header "id"=2 vs cells "1"/"10";
+    // value header "n"=1 vs cells "5"/"50"=2 ⇒ max 2 each.
+    let m = map_with_entries(
+        "kc-table",
+        vec![
+            table_entry("kc", &[("id", 1)], "vc", &[("n", 5)]),
+            table_entry("kc", &[("id", 10)], "vc", &[("n", 50)]),
+        ],
+    );
+    let out = format!("{m}");
+    let body = out
+        .strip_prefix("map kc-table (type=hash, value_size=8, max_entries=64)")
+        .expect("map header prefix must match exactly");
+    assert_eq!(
+        body, "\n  id |  n\n   1 |  5\n  10 | 50",
+        "table body must be the exact right-aligned grid: {out:?}",
+    );
+    // The per-entry block form must NOT appear — the table replaced it.
+    assert!(
+        !out.contains("entry: key="),
+        "homogeneous batch must render as a table, not per-entry: {out}",
+    );
+}
+
+#[test]
+fn try_write_entry_table_two_entries_meets_minimum() {
+    // TABLE_MIN_ENTRIES is 2: a 2-entry homogeneous batch qualifies
+    // (boundary). One fewer (covered by the existing single-entry
+    // test) would not. This pins the lower boundary as table-eligible.
+    let m = map_with_entries(
+        "two",
+        vec![
+            table_entry("k", &[("a", 1)], "v", &[("b", 2)]),
+            table_entry("k", &[("a", 3)], "v", &[("b", 4)]),
+        ],
+    );
+    let out = format!("{m}");
+    assert!(out.contains(" | "), "2 entries must form a table: {out}");
+    assert!(
+        !out.contains("entry: key="),
+        "2-entry table must not fall back to per-entry: {out}",
+    );
+}
+
+#[test]
+fn try_write_entry_table_rejects_payload_present() {
+    // A single payload-bearing entry disqualifies the whole batch —
+    // the typed payload renders in a `.data` block the table can't
+    // carry, so every entry falls back to per-entry block form and
+    // the surviving payload still surfaces via `.data`.
+    let mut e0 = table_entry("k", &[("a", 1)], "v", &[("b", 2)]);
+    e0.payload = Some(RenderedValue::Uint {
+        bits: 64,
+        value: 0xDEAD,
+    });
+    let m = map_with_entries(
+        "with-payload",
+        vec![e0, table_entry("k", &[("a", 3)], "v", &[("b", 4)])],
+    );
+    let out = format!("{m}");
+    assert!(
+        !out.contains(" | "),
+        "payload-bearing batch must NOT render as a table: {out}",
+    );
+    assert!(
+        out.contains("entry: key="),
+        "payload-bearing batch must use per-entry form: {out}",
+    );
+    assert!(
+        out.contains("\n  .data "),
+        "the payload must still surface via .data: {out}",
+    );
+    assert!(
+        out.contains("57005"), // 0xDEAD in decimal
+        "the payload value must render: {out}",
+    );
+}
+
+#[test]
+fn try_write_entry_table_rejects_heterogeneous_value_type() {
+    // Same key type across both entries but DIFFERENT value type
+    // names ⇒ not homogeneous ⇒ no table. (The existing
+    // heterogeneous test varies the key type; this pins the value
+    // side of the type_name agreement check.)
+    let m = map_with_entries(
+        "het-val",
+        vec![
+            table_entry("k", &[("a", 1)], "v1", &[("b", 2)]),
+            table_entry("k", &[("a", 3)], "v2", &[("b", 4)]),
+        ],
+    );
+    let out = format!("{m}");
+    assert!(
+        !out.contains(" | "),
+        "differing value type_name must reject the table: {out}",
+    );
+    assert!(
+        out.contains("entry: key="),
+        "heterogeneous value type must use per-entry form: {out}",
+    );
+}
+
+/// Per-CPU struct slot with the given inline-scalar fields, for
+/// `FailureDumpPercpuEntry` Display tests.
+fn percpu_struct(ty: &str, fields: &[(&str, u64)]) -> Option<RenderedValue> {
+    Some(make_small_struct(ty, fields))
+}
+
+#[test]
+fn percpu_entry_display_template_varying_branch() {
+    // 3 CPUs, each a UNIQUE struct (so every group has exactly one
+    // CPU and groups.len()==3) where only `count` varies and
+    // `weight` is identical (1024). This drives the template branch:
+    // common fields rendered once, varying field as a per-CPU table.
+    let entry = FailureDumpPercpuEntry {
+        key: 0,
+        per_cpu: vec![
+            percpu_struct("ctx", &[("weight", 1024), ("count", 10)]),
+            percpu_struct("ctx", &[("weight", 1024), ("count", 20)]),
+            percpu_struct("ctx", &[("weight", 1024), ("count", 30)]),
+        ],
+    };
+    let out = format!("{entry}");
+    assert!(
+        out.contains("key 0: struct ctx (3 CPUs)"),
+        "header must name the struct + CPU count: {out}",
+    );
+    // Common (non-varying, non-zero) field shown once under `common:`.
+    assert!(
+        out.contains("\n  common:"),
+        "common section header missing: {out}",
+    );
+    assert!(
+        out.contains("\n    weight: 1024"),
+        "identical field rendered once in common: {out}",
+    );
+    // `weight` must appear EXACTLY once — proving it was hoisted to
+    // common and NOT repeated per CPU (the whole point of the branch).
+    assert_eq!(
+        out.matches("weight").count(),
+        1,
+        "identical field must not repeat per CPU: {out}",
+    );
+    // Varying field rendered as a per-CPU table with one column.
+    assert!(
+        out.contains("\n  per-cpu:"),
+        "per-cpu table header missing: {out}",
+    );
+    assert!(
+        out.contains("\n    cpu | count"),
+        "per-cpu table column header missing: {out}",
+    );
+    assert!(out.contains("| 10"), "cpu 0 varying value: {out}");
+    assert!(out.contains("| 20"), "cpu 1 varying value: {out}");
+    assert!(out.contains("| 30"), "cpu 2 varying value: {out}");
+    // The fallback per-group `cpus ...:` lines must NOT appear — the
+    // template branch returns before the fallback loop.
+    assert!(
+        !out.contains("cpu 0:"),
+        "template branch must not emit per-group rows: {out}",
+    );
+}
+
+#[test]
+fn percpu_entry_display_template_zero_common_field_suppressed() {
+    // A common field that is zero is suppressed from `common:` (the
+    // `is_zero` skip), while the non-zero common field survives and
+    // the varying field still tables. Pins the zero-suppression that
+    // sits inside the template branch.
+    let entry = FailureDumpPercpuEntry {
+        key: 7,
+        per_cpu: vec![
+            percpu_struct("s", &[("live", 5), ("dead", 0), ("v", 1)]),
+            percpu_struct("s", &[("live", 5), ("dead", 0), ("v", 2)]),
+            percpu_struct("s", &[("live", 5), ("dead", 0), ("v", 3)]),
+        ],
+    };
+    let out = format!("{entry}");
+    assert!(
+        out.contains("\n    live: 5"),
+        "non-zero common field must render: {out}",
+    );
+    assert!(
+        !out.contains("dead"),
+        "zero common field must be suppressed silently: {out}",
+    );
+    assert!(
+        out.contains("\n    cpu | v"),
+        "varying field tables under per-cpu: {out}",
+    );
+}
+
+#[test]
+fn percpu_entry_display_contiguous_range_grouping() {
+    // 4 CPUs in 2 groups (cpus 0,1 share one struct; cpus 2,3 share
+    // another). groups.len()==2 < 3 so the template branch is skipped
+    // and the fallback runs. Each >1-CPU contiguous group collapses
+    // to `cpus FIRST-LAST`. The contiguity test is the `windows(2)`
+    // adjacent-difference check.
+    let a = percpu_struct("g", &[("v", 100)]);
+    let b = percpu_struct("g", &[("v", 200)]);
+    let entry = FailureDumpPercpuEntry {
+        key: 1,
+        per_cpu: vec![a.clone(), a, b.clone(), b],
+    };
+    let out = format!("{entry}");
+    assert!(
+        out.contains("key 1: struct g (4 CPUs)"),
+        "header must name struct + CPU count: {out}",
+    );
+    assert!(
+        out.contains("\n  cpus 0-1: "),
+        "contiguous low group must render as a range: {out}",
+    );
+    assert!(
+        out.contains("\n  cpus 2-3: "),
+        "contiguous high group must render as a range: {out}",
+    );
+    // Range form, not the debug-list `cpus [0, 1]` form.
+    assert!(
+        !out.contains("cpus ["),
+        "contiguous CPUs must use the range form, not the list form: {out}",
+    );
+}
+
+#[test]
+fn percpu_entry_display_noncontiguous_group_uses_list_form() {
+    // A group whose CPUs are NOT adjacent (0 and 2, with CPU 1
+    // holding a different value) must fall through the contiguity
+    // check to the debug-list `cpus {:?}` form. Pins the
+    // `windows(2)` branch's false arm against the contiguous case
+    // above. 3 distinct-content CPUs would trip the template branch,
+    // so we use 4 CPUs forming 2 groups, one of which is split.
+    let a = percpu_struct("g", &[("v", 7)]);
+    let b = percpu_struct("g", &[("v", 9)]);
+    let entry = FailureDumpPercpuEntry {
+        key: 2,
+        // groups: v=7 → cpus [0, 2]; v=9 → cpus [1, 3].
+        per_cpu: vec![a.clone(), b.clone(), a, b],
+    };
+    let out = format!("{entry}");
+    assert!(
+        out.contains("cpus [0, 2]"),
+        "non-contiguous group must use the debug-list form: {out}",
+    );
+    assert!(
+        !out.contains("cpus 0-2"),
+        "non-contiguous group must NOT use the range form: {out}",
+    );
+}
+
+#[test]
+fn percpu_entry_display_over_64_cpus_skips_dedup() {
+    // 65 CPUs (> PERCPU_DEDUP_CPU_LIMIT = 64) bypasses the O(n²)
+    // dedup pass and emits one `cpu N:` row per CPU even though every
+    // value is identical (which below the threshold would collapse to
+    // a single `all CPUs:` group). Pins the scale-guard branch.
+    let v = percpu_struct("c", &[("x", 1)]);
+    let entry = FailureDumpPercpuEntry {
+        key: 3,
+        per_cpu: (0..65).map(|_| v.clone()).collect(),
+    };
+    let out = format!("{entry}");
+    assert!(
+        out.contains("key 3: struct c (65 CPUs)"),
+        "header must report 65 CPUs: {out}",
+    );
+    // One row per CPU — first, a middle, and last all present.
+    assert!(out.contains("\n  cpu 0: "), "cpu 0 row missing: {out}");
+    assert!(out.contains("\n  cpu 64: "), "cpu 64 row missing: {out}");
+    // Exactly 65 `cpu N: ` rows (each on its own `\n  cpu ` line).
+    assert_eq!(
+        out.matches("\n  cpu ").count(),
+        65,
+        "every CPU must get its own row above the dedup threshold: {out}",
+    );
+    // The dedup grouping (`all CPUs:`) and the template form must NOT
+    // appear — both are skipped above the threshold.
+    assert!(
+        !out.contains("all CPUs"),
+        "above-threshold render must not dedup into an all-CPUs group: {out}",
+    );
+    assert!(
+        !out.contains("common:"),
+        "above-threshold render must not use the template form: {out}",
+    );
+}
+
+#[test]
+fn percpu_entry_display_all_identical_collapses_to_all_cpus() {
+    // Below the threshold, all-identical struct slots collapse to a
+    // single `all CPUs:` group (the `cpus.len() == n_cpus` arm of the
+    // fallback). Contrast with the >64 test above, where the same
+    // all-identical input is forced to one row per CPU. 4 CPUs keeps
+    // groups.len()==1, so neither template (>=3 groups) nor range
+    // grouping applies.
+    let v = percpu_struct("c", &[("x", 42)]);
+    let entry = FailureDumpPercpuEntry {
+        key: 4,
+        per_cpu: vec![v.clone(), v.clone(), v.clone(), v],
+    };
+    let out = format!("{entry}");
+    assert!(
+        out.contains("key 4: struct c (4 CPUs)"),
+        "header must report 4 CPUs: {out}",
+    );
+    assert!(
+        out.contains("\n  all CPUs: "),
+        "all-identical slots collapse to a single all-CPUs group: {out}",
+    );
+    assert!(
+        !out.contains("\n  cpu 0:"),
+        "the collapsed form must not emit per-CPU rows: {out}",
+    );
+}
+
+#[test]
+fn percpu_entry_display_fallback_marks_unmapped_cpus() {
+    // A mix of mapped structs (2 groups, so template skipped) plus an
+    // unmapped CPU: the fallback emits each group then a trailing
+    // `cpus [..]: <unmapped>` line listing the None slots. Pins the
+    // unmapped-tail rendering in the fallback path.
+    let a = percpu_struct("g", &[("v", 1)]);
+    let b = percpu_struct("g", &[("v", 2)]);
+    let entry = FailureDumpPercpuEntry {
+        key: 5,
+        per_cpu: vec![a, b, None],
+    };
+    let out = format!("{entry}");
+    assert!(
+        out.contains("\n  cpus [2]: <unmapped>"),
+        "unmapped CPU must be listed in the fallback tail: {out}",
+    );
+}
+
+// -- count_global_sections_for_prefix ------------------------------
+//
+// The classifier is only exercised transitively through
+// `identify_active_obj_from_struct_ops` today; the per-section count
+// math and the STRUCT_OPS-skip arm are never asserted in isolation.
+
+/// Direct count: full-name equality classifies each section, the
+/// STRUCT_OPS map is skipped, and a `<prefix>.bss.shared` map is NOT
+/// counted as a `.bss` (the comparison is `n == "<prefix>.bss"`, not
+/// a prefix match). A `sched.bss` STRUCT_OPS map must NOT inflate the
+/// `.bss` total — only the ARRAY `sched.bss` counts.
+#[test]
+fn count_global_sections_for_prefix_skips_struct_ops_and_uses_full_name_equality() {
+    let maps = vec![
+        synthetic_global_section_map(0xa000, "sched.bss"),
+        synthetic_global_section_map(0xb000, "sched.data"),
+        synthetic_global_section_map(0xc000, "sched.bss.shared"),
+        synthetic_struct_ops_map(0xd000, "sched.bss", 0xe000),
+    ];
+    // (bss, data, rodata): one real `.bss` (struct_ops `sched.bss`
+    // excluded; `sched.bss.shared` is not `sched.bss`), one `.data`,
+    // zero `.rodata`.
+    assert_eq!(
+        super::count_global_sections_for_prefix(&maps, "sched"),
+        (1usize, 1usize, 0usize),
+    );
+}
+
+// -- is_scx_allocator_type / is_scx_static_type --------------------
+//
+// Both name-match helpers are only reached inside dump_state's
+// sdt_alloc / scx_static pre-passes, which need a live guest
+// snapshot. The name-match-vs-wrong-name-vs-non-struct decisions are
+// otherwise unpinned; a copy-paste literal regression would ship
+// undetected. `build_btf_with_named_struct` emits a 2-type blob:
+// id 1 = BTF_KIND_INT u64, id 2 = the named BTF_KIND_STRUCT.
+
+/// Struct-name match arm returns true only for `scx_allocator`; a
+/// wrong-name struct is rejected, and passing the INT type id (1)
+/// drives the `_ => return false` non-struct arm.
+#[test]
+fn is_scx_allocator_type_matches_named_struct_and_rejects_wrong_name_and_non_struct() {
+    let (blob_ok, struct_id) = build_btf_with_named_struct("scx_allocator");
+    let btf_ok = btf_rs::Btf::from_bytes(&blob_ok).expect("synthetic BTF parses");
+    assert!(super::is_scx_allocator_type(&btf_ok, struct_id));
+
+    let (blob_bad, other_id) = build_btf_with_named_struct("scx_other");
+    let btf_bad = btf_rs::Btf::from_bytes(&blob_bad).expect("synthetic BTF parses");
+    assert!(!super::is_scx_allocator_type(&btf_bad, other_id));
+
+    // Type id 1 is the BTF_KIND_INT u64 → non-struct `_` arm → false.
+    assert!(!super::is_scx_allocator_type(&btf_ok, 1));
+}
+
+/// Mirror of [`is_scx_allocator_type`] but matching `scx_static`.
+/// The cross-name negative (a `scx_allocator` struct must be false)
+/// guards against a copy-paste bug where `is_scx_static_type`
+/// compares against the wrong literal.
+#[test]
+fn is_scx_static_type_matches_named_struct_and_rejects_others() {
+    let (blob, struct_id) = build_btf_with_named_struct("scx_static");
+    let btf = btf_rs::Btf::from_bytes(&blob).expect("synthetic BTF parses");
+    assert!(super::is_scx_static_type(&btf, struct_id));
+
+    // INT type id 1 → non-struct `_` arm → false.
+    assert!(!super::is_scx_static_type(&btf, 1));
+
+    // Wrong-name struct (`scx_allocator`) must be rejected — pins the
+    // literal so a copy-paste of the allocator helper is caught.
+    let (b2, id2) = build_btf_with_named_struct("scx_allocator");
+    let btf2 = btf_rs::Btf::from_bytes(&b2).expect("synthetic BTF parses");
+    assert!(!super::is_scx_static_type(&btf2, id2));
+}
+
+// -- iter_bss_vars_with_type ---------------------------------------
+//
+// Both paths are uncovered: the Datasec→Var walk that yields
+// (name, offset, type_id) tuples, and the early-return-empty path
+// when `resolve_types_by_name` finds no matching section. Loads the
+// real probe BTF produced by build.rs at OUT_DIR/probe.o — the same
+// host-side fixture pattern as
+// `btf_render/tests/datasec_cpumask.rs::load_probe_btf_and_bss_id`.
+// The `.bss` var names (ktstr_err_exit_detected, ktstr_pcpu_counters)
+// are pinned as `.bss` members by that sibling test, so they are a
+// stable ground-truth set.
+
+/// The Datasec walk enumerates every `.bss` variable name; an
+/// unknown section name returns an empty Vec (the early-return path).
+#[test]
+fn iter_bss_vars_with_type_enumerates_probe_bss_vars() {
+    let probe = std::path::PathBuf::from(env!("OUT_DIR")).join("probe.o");
+    let btf = crate::monitor::btf_offsets::load_btf_from_path(&probe).unwrap_or_else(|e| {
+        panic!(
+            "load_btf_from_path({}) failed: {e}. build.rs always \
+             produces probe.o; a missing or unparseable artifact \
+             means the build pipeline is broken.",
+            probe.display()
+        )
+    });
+    let vars = super::iter_bss_vars_with_type(&btf, ".bss");
+    let names: std::collections::HashSet<&str> = vars.iter().map(|(n, _, _)| n.as_str()).collect();
+    assert!(
+        names.contains("ktstr_err_exit_detected") && names.contains("ktstr_pcpu_counters"),
+        "Datasec walk must enumerate the probe `.bss` vars. Found: {names:?}",
+    );
+    // Unknown section name → resolve_types_by_name finds nothing →
+    // empty iterator path.
+    assert!(super::iter_bss_vars_with_type(&btf, ".no_such_section").is_empty());
+}
+
+// -- EventCounterSample::from_monitor_sample (overflow clamp) -------
+//
+// The existing `event_counter_sample_sums_across_cpus` test only
+// sums small values, so the documented `saturating_add pins the sum
+// at i64::MAX rather than wrapping/panicking` contract is never
+// triggered. Two CPUs whose per-CPU s64 counter is near i64::MAX
+// would overflow plain `+`.
+
+/// Two CPUs each carrying `select_cpu_fallback = i64::MAX`: the sum
+/// clamps at i64::MAX (saturating_add) rather than wrapping to a
+/// negative or panicking. Plain `+` would overflow.
+#[test]
+fn event_counter_sample_saturates_at_i64_max_across_cpus() {
+    use super::super::{CpuSnapshot, MonitorSample, ScxEventCounters};
+    let big = ScxEventCounters {
+        select_cpu_fallback: i64::MAX,
+        ..Default::default()
+    };
+    let sample = MonitorSample {
+        elapsed_ms: 7,
+        cpus: vec![
+            CpuSnapshot {
+                event_counters: Some(big.clone()),
+                ..Default::default()
+            },
+            CpuSnapshot {
+                event_counters: Some(big),
+                ..Default::default()
+            },
+        ],
+        prog_stats: None,
+    };
+    let folded = EventCounterSample::from_monitor_sample(&sample)
+        .expect("at least one CPU has event_counters");
+    // Clamped, not wrapped to a negative.
+    assert_eq!(folded.select_cpu_fallback, i64::MAX);
+    assert_eq!(folded.elapsed_ms, 7);
+}
+
+// -- FailureDumpReport::placeholder --------------------------------
+//
+// The constructor is uncovered (0 refs to `.placeholder`). Its
+// contract — same reason cloned into all five `*_unavailable`
+// fields, `is_placeholder = true`, schema stays SCHEMA_SINGLE via
+// `..Self::default()`, every data vec empty — is unverified. A field
+// dropped from the fan-out would make a degraded capture
+// indistinguishable from a real empty dump.
+
+/// Placeholder fans the reason into all five `*_unavailable` fields,
+/// flips `is_placeholder`, keeps `schema == SCHEMA_SINGLE`, and
+/// leaves the data vecs empty.
+#[test]
+fn placeholder_report_sets_all_unavailable_reasons_and_flag() {
+    let r = FailureDumpReport::placeholder("rendezvous timed out");
+    assert_eq!(r.schema, SCHEMA_SINGLE);
+    assert!(r.is_placeholder);
+    assert_eq!(
+        r.prog_runtime_stats_unavailable.as_deref(),
+        Some("rendezvous timed out")
+    );
+    assert_eq!(
+        r.per_node_numa_unavailable.as_deref(),
+        Some("rendezvous timed out")
+    );
+    assert_eq!(
+        r.task_enrichments_unavailable.as_deref(),
+        Some("rendezvous timed out")
+    );
+    assert_eq!(
+        r.scx_walker_unavailable.as_deref(),
+        Some("rendezvous timed out")
+    );
+    assert_eq!(
+        r.sdt_alloc_unavailable.as_deref(),
+        Some("rendezvous timed out")
+    );
+    assert!(r.maps.is_empty() && r.prog_runtime_stats.is_empty());
 }

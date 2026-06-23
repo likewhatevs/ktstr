@@ -11,7 +11,9 @@
 //! runs scheduler test scenarios inside them, and evaluates results from the
 //! host via guest memory introspection. Each test creates cgroups, spawns
 //! worker processes, and checks that the scheduler handled the workload
-//! correctly. Also tests under the kernel's default EEVDF scheduler.
+//! correctly. The same scenarios also run under the kernel's default
+//! EEVDF scheduler, so a test can baseline sched_ext behavior against
+//! stock scheduling.
 //!
 //! # Quick start
 //!
@@ -114,8 +116,6 @@
 //!
 //! ```rust
 //! use ktstr::prelude::*;
-//! use ktstr::workload::WorkerReport;
-//! use std::collections::{BTreeMap, BTreeSet};
 //!
 //! // A test author would obtain `cg` and `report` from `ctx`-driven
 //! // execution; the literal here just illustrates the assertion shape.
@@ -139,7 +139,7 @@
 //! claim!(v, throughput).is_finite();                  // expression label
 //! claim!(v, cg.wake_latency_tail_ratio()).between(1.0, 5.0);
 //! let r = v.into_result();
-//! assert!(r.passed);
+//! assert!(r.is_pass());
 //! ```
 //!
 //! Every claim is labeled by `stringify!` on either a struct field name
@@ -159,7 +159,7 @@
 //!
 //! ```toml
 //! [dev-dependencies]
-//! ktstr = "0.10"
+//! ktstr = "0.16"
 //! ```
 //!
 //! Lean dev-dep (drops the host-tooling crates: tikv-jemallocator,
@@ -168,7 +168,7 @@
 //!
 //! ```toml
 //! [dev-dependencies]
-//! ktstr = { version = "0.10", default-features = false, features = ["llm"] }
+//! ktstr = { version = "0.16", default-features = false, features = ["llm"] }
 //! ```
 //!
 //! # Feature flags
@@ -184,7 +184,7 @@
 //!   the test binary. Drops `base64` from the manifest when off.
 //! - **`wprof`** — embed the wprof BPF tracer in shell-mode VMs.
 //!   First build clones `github.com/anakryiko/wprof` (requires git,
-//!   clang, elfutils-devel, zlib-devel).
+//!   make, gcc, clang, elfutils-devel, zlib-devel).
 //! - **`pretty-labels`** — grex-based regex synthesis for
 //!   `ctprof_compare` display labels. With the feature off,
 //!   labels fall back to the deterministic join key.
@@ -209,7 +209,7 @@
 //! - [`test_support`] -- `#[ktstr_test]` runtime and registration
 //! - [`topology`] -- CPU topology abstraction (LLCs, NUMA nodes)
 //! - [`verifier`] -- BPF verifier log parsing, cycle detection, and output formatting
-//! - [`worker_ready`] / [`worker_ready_wait`] -- pid-scoped marker file the alloc/test workers write before the parent samples them
+//! - [`worker_ready`] / [`worker_ready_wait`] -- pid-scoped ready-marker the alloc/test worker writes once it is work-ready, polled (`worker_ready_wait`) before the probe is launched against it
 //! - [`workload`] -- worker process types and telemetry collection
 //!
 //! ## ctprof subsystem
@@ -234,9 +234,12 @@
 //! Internal modules (not re-exported): `host_thread_probe` reads
 //! per-thread jemalloc TSD counters via ptrace, `monitor` reads
 //! live guest state, `probe` attaches BPF probes to traced
-//! functions, `vmm` owns the KVM VM lifecycle, and `timeline`
-//! correlates stimulus events with monitor samples for
-//! phase-aligned reporting.
+//! functions, and `vmm` owns the KVM VM lifecycle.
+//!
+//! [`timeline`] is a public module (its `StimulusEvent` appears in
+//! `assert::build_phase_buckets_with_stimulus`'s signature and is
+//! re-exported in the [`prelude`]); it correlates stimulus events
+//! with monitor samples for phase-aligned reporting.
 
 // `#[derive(Payload)]` expands into `::ktstr::test_support::...`
 // paths so downstream crates can use it without a `use` import.
@@ -566,11 +569,11 @@ pub mod remote_cache {
 
     pub fn remote_store(_entry: &CacheEntry, _cli_label: &str) {}
 }
+pub mod gauntlet;
 pub(crate) mod sync;
 #[cfg(any(feature = "export", feature = "remote-cache"))]
 pub(crate) mod tar_util;
 pub mod verifier;
-pub mod vm;
 pub(crate) mod vmm;
 pub mod worker_ready;
 
@@ -800,11 +803,18 @@ pub mod prelude {
     // `Scheduler` is the `test_support::Scheduler` struct — the
     // scheduler-definition record test authors build via the
     // `declare_scheduler!` macro.
+    // The `#[derive(Claim)]`-generated `<Type>Claim` extension traits carry the
+    // typed `claim_<field>(&mut verdict)` accessors. Every derive(Claim) stats
+    // type is preluded, so its Claim trait is preluded alongside it and
+    // `use ktstr::prelude::*` makes the accessors callable without a per-type
+    // trait import: the four assert-module traits below, plus `WorkerReportClaim`
+    // in the workload export block.
     pub use crate::assert::{
-        AbsoluteThresholds, Assert, AssertDetail, AssertResult, COMPARATOR_VOCABULARY,
-        ClaimBuilder, DetailKind, EachClaim, FracPair, InfoNote, MAX_RECORDED_PASSES, NoteValue,
-        Outcome, OutcomeRef, PASSES_TRUNCATION_SENTINEL_COMPARATOR,
-        PASSES_TRUNCATION_SENTINEL_NAME, PassDetail, PhaseBucket, PhaseMapExt, ScenarioStats,
+        AbsoluteThresholds, Assert, AssertDetail, AssertResult, COMPARATOR_VOCABULARY, CgroupStats,
+        CgroupStatsClaim, ClaimBuilder, DetailKind, EachClaim, FracPair, InfoNote,
+        MAX_RECORDED_PASSES, NoteValue, Outcome, OutcomeRef, PASSES_TRUNCATION_SENTINEL_COMPARATOR,
+        PASSES_TRUNCATION_SENTINEL_NAME, PassDetail, PhaseBucket, PhaseBucketClaim,
+        PhaseCgroupStats, PhaseCgroupStatsClaim, PhaseMapExt, ScenarioStats, ScenarioStatsClaim,
         SeqClaim, SeriesField, SetClaim, Verdict, assert_scx_events_clean, assert_thresholds,
         build_phase_buckets_with_stimulus,
     };
@@ -928,7 +938,7 @@ pub mod prelude {
     pub use crate::workload::{
         AffinityIntent, AluWidth, CloneMode, CustomFn, MemPolicy, Migration, MpolFlags,
         ResolvedAffinity, SchedPolicy, WorkPhase, WorkSpec, WorkType, WorkTypeValidationError,
-        WorkerCtx, WorkerReport, WorkloadConfig, WorkloadHandle,
+        WorkerCtx, WorkerReport, WorkerReportClaim, WorkloadConfig, WorkloadHandle,
     };
     // Surface `Phase` from the assert module (the scenario-step
     // bucket) so test authors can write `Phase::step(0)` /
@@ -1266,9 +1276,9 @@ pub const KTSTR_LOCK_DIR_ENV: &str = "KTSTR_LOCK_DIR";
 /// Name of the environment variable that triggers verbose logging
 /// in the VMM setup phase. Strict `v == "1"` semantics (only the
 /// literal `"1"` enables; unset / empty / any other value —
-/// including `"true"`, `"yes"`, `"0"` — is disabled). Read at
-/// `crate::vmm::setup` L1263-1266 (x86_64 cmdline) and
-/// L1680-1683 (aarch64 cmdline); both readers identical.
+/// including `"true"`, `"yes"`, `"0"` — is disabled). Read in
+/// `crate::vmm::setup` at the two cmdline-assembly sites (one per
+/// arch: x86_64 and aarch64); both readers identical.
 pub const KTSTR_VERBOSE_ENV: &str = "KTSTR_VERBOSE";
 
 /// Name of the environment variable that bypasses LLC resource
@@ -1407,9 +1417,9 @@ pub const KTSTR_GUEST_INIT_ENV: &str = "KTSTR_GUEST_INIT";
 
 /// Name of the environment variable that points at a probe binary
 /// for jemalloc-feature detection. Empty / unset leaves the probe
-/// binary unwired (the [`crate::test_support::runtime`] reader at
-/// L789-797 conditionally calls `.jemalloc_probe_binary()` only
-/// on set+non-empty — there is no `which`-based fallback). Tests
+/// binary unwired (the [`crate::test_support::runtime`]
+/// builder-wiring site calls `.jemalloc_probe_binary()` only on
+/// set+non-empty — there is no `which`-based fallback). Tests
 /// that need the probe set this var via `#[ctor]` before the
 /// harness runs (see `tests/jemalloc_probe_tests.rs`).
 pub const KTSTR_JEMALLOC_PROBE_BINARY_ENV: &str = "KTSTR_JEMALLOC_PROBE_BINARY";
@@ -1417,8 +1427,8 @@ pub const KTSTR_JEMALLOC_PROBE_BINARY_ENV: &str = "KTSTR_JEMALLOC_PROBE_BINARY";
 /// Name of the environment variable that points at a worker
 /// binary for jemalloc allocation-probe runs. Empty / unset
 /// leaves the worker binary unwired — same shape as
-/// [`KTSTR_JEMALLOC_PROBE_BINARY_ENV`]; reader at
-/// [`crate::test_support::runtime`] L799-806 conditionally calls
+/// [`KTSTR_JEMALLOC_PROBE_BINARY_ENV`]; the
+/// [`crate::test_support::runtime`] builder-wiring site calls
 /// `.jemalloc_alloc_worker_binary()` only on set+non-empty, no
 /// `which`-based fallback. Set alongside the probe via `#[ctor]`
 /// in `tests/jemalloc_probe_tests.rs`.

@@ -173,8 +173,9 @@ fn frame_reply_empty_reason_zero_pads() {
 }
 
 /// Pin three load-bearing substrings of the cold-path "kaslr_offset
-/// == 0 but link_kva is high-half" diagnostic (Fix C at
-/// `freeze_coord/snapshot.rs:316-362`) survive the wire round-trip
+/// == 0 but link_kva is high-half" diagnostic (Fix C, the
+/// `kaslr_offset == 0` high-half silent-misfire gate in
+/// `arm_user_watchpoint`) survive the wire round-trip
 /// without truncation:
 ///   - `kaslr_offset` and `kern_virt_kaslr` — the WHY the e2e test
 ///     `kaslr_off_watch_snapshot_jiffies_64_errs` greps for to verify

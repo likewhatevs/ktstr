@@ -50,42 +50,7 @@ pub(super) fn write_smaps_section<W: fmt::Write>(
         return Ok(());
     }
 
-    let mut process_keys: BTreeSet<&String> = diff.smaps_rollup_a.keys().collect();
-    process_keys.extend(diff.smaps_rollup_b.keys());
-
-    let max_field_for = |pkey: &&String, field: &str| -> u64 {
-        let a = diff
-            .smaps_rollup_a
-            .get(*pkey)
-            .and_then(|m| m.get(field).copied())
-            .unwrap_or(0);
-        let b = diff
-            .smaps_rollup_b
-            .get(*pkey)
-            .and_then(|m| m.get(field).copied())
-            .unwrap_or(0);
-        a.max(b)
-    };
-    let abs_rss_delta = |pkey: &&String| -> u64 {
-        let a = diff
-            .smaps_rollup_a
-            .get(*pkey)
-            .and_then(|m| m.get("Rss").copied())
-            .unwrap_or(0);
-        let b = diff
-            .smaps_rollup_b
-            .get(*pkey)
-            .and_then(|m| m.get("Rss").copied())
-            .unwrap_or(0);
-        (b as i128 - a as i128).unsigned_abs() as u64
-    };
-    let mut sorted_process_keys: Vec<&String> = process_keys.iter().copied().collect();
-    sorted_process_keys.sort_by(|a, b| {
-        abs_rss_delta(b)
-            .cmp(&abs_rss_delta(a))
-            .then_with(|| max_field_for(b, "Rss").cmp(&max_field_for(a, "Rss")))
-            .then_with(|| a.cmp(b))
-    });
+    let mut sorted_process_keys = sorted_smaps_process_keys(diff);
 
     // Pre-pass: any (process, key) pair with a non-equal
     // delta? Scan the FULL key set BEFORE truncating to the
@@ -94,20 +59,7 @@ pub(super) fn write_smaps_section<W: fmt::Write>(
     // section. Truncating first would suppress the header
     // when the top-N happen to carry equal baseline/candidate
     // values but lower-ranked keys carry real deltas.
-    let any_delta = sorted_process_keys.iter().any(|pkey| {
-        let a = diff.smaps_rollup_a.get(*pkey);
-        let b = diff.smaps_rollup_b.get(*pkey);
-        let mut keys: BTreeSet<&String> = a.map(|m| m.keys().collect()).unwrap_or_default();
-        if let Some(m) = b {
-            keys.extend(m.keys());
-        }
-        keys.iter().any(|k| {
-            let av = a.and_then(|m| m.get(*k).copied());
-            let bv = b.and_then(|m| m.get(*k).copied());
-            av != bv
-        })
-    });
-    if !any_delta {
+    if !smaps_has_any_delta(diff, &sorted_process_keys) {
         return Ok(());
     }
 
@@ -145,9 +97,93 @@ pub(super) fn write_smaps_section<W: fmt::Write>(
         sorted_keys.sort();
     }
 
+    emit_smaps_process_rows(&mut st, diff, &sorted_keys, is_compound, columns);
+
+    writeln!(w, "{st}")?;
+    Ok(())
+}
+
+/// Process iteration order for the `smaps_rollup` table:
+/// descending by absolute Rss delta, tiebreak by descending
+/// max-Rss across baseline and candidate, final tiebreak
+/// alphabetical. Returns the union of process keys across both
+/// snapshots in that order.
+fn sorted_smaps_process_keys(diff: &CtprofDiff) -> Vec<&String> {
+    let mut process_keys: BTreeSet<&String> = diff.smaps_rollup_a.keys().collect();
+    process_keys.extend(diff.smaps_rollup_b.keys());
+
+    let max_field_for = |pkey: &&String, field: &str| -> u64 {
+        let a = diff
+            .smaps_rollup_a
+            .get(*pkey)
+            .and_then(|m| m.get(field).copied())
+            .unwrap_or(0);
+        let b = diff
+            .smaps_rollup_b
+            .get(*pkey)
+            .and_then(|m| m.get(field).copied())
+            .unwrap_or(0);
+        a.max(b)
+    };
+    let abs_rss_delta = |pkey: &&String| -> u64 {
+        let a = diff
+            .smaps_rollup_a
+            .get(*pkey)
+            .and_then(|m| m.get("Rss").copied())
+            .unwrap_or(0);
+        let b = diff
+            .smaps_rollup_b
+            .get(*pkey)
+            .and_then(|m| m.get("Rss").copied())
+            .unwrap_or(0);
+        (b as i128 - a as i128).unsigned_abs() as u64
+    };
+    let mut sorted_process_keys: Vec<&String> = process_keys.iter().copied().collect();
+    sorted_process_keys.sort_by(|a, b| {
+        abs_rss_delta(b)
+            .cmp(&abs_rss_delta(a))
+            .then_with(|| max_field_for(b, "Rss").cmp(&max_field_for(a, "Rss")))
+            .then_with(|| a.cmp(b))
+    });
+    sorted_process_keys
+}
+
+/// Pre-pass over `keys`: true when any `(process, key)` pair
+/// carries a non-equal baseline/candidate value (absent and 0
+/// treated as equal under `Option` inequality). Callers scan the
+/// FULL key set before truncating so movers below the line limit
+/// still surface the section.
+fn smaps_has_any_delta(diff: &CtprofDiff, keys: &[&String]) -> bool {
+    keys.iter().any(|pkey| {
+        let a = diff.smaps_rollup_a.get(*pkey);
+        let b = diff.smaps_rollup_b.get(*pkey);
+        let mut keys: BTreeSet<&String> = a.map(|m| m.keys().collect()).unwrap_or_default();
+        if let Some(m) = b {
+            keys.extend(m.keys());
+        }
+        keys.iter().any(|k| {
+            let av = a.and_then(|m| m.get(*k).copied());
+            let bv = b.and_then(|m| m.get(*k).copied());
+            av != bv
+        })
+    })
+}
+
+/// Emit one row per non-equal `(process, key)` pair into `st`.
+/// Under compound (`GroupBy::All`) keys, inserts the cgroup-tree
+/// heading rows as the hierarchy advances, tracking the deepest
+/// emitted segment path in `last_segs`. Per-row cells mirror the
+/// memory.stat compare layout.
+fn emit_smaps_process_rows(
+    st: &mut comfy_table::Table,
+    diff: &CtprofDiff,
+    sorted_keys: &[&String],
+    is_compound: bool,
+    columns: &[Column],
+) {
     let mut last_segs: Vec<&str> = Vec::new();
 
-    for pkey in &sorted_keys {
+    for pkey in sorted_keys {
         let (cg_part, display_process) = if is_compound {
             pkey.split_once('\x00').unwrap_or(("", pkey))
         } else {
@@ -251,6 +287,4 @@ pub(super) fn write_smaps_section<W: fmt::Write>(
             st.add_row(cells);
         }
     }
-    writeln!(w, "{st}")?;
-    Ok(())
 }

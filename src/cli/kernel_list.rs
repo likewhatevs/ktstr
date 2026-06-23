@@ -590,8 +590,9 @@ fn run_kernel_list_range(json: bool, spec: &str) -> Result<()> {
 /// build's slots before the new one is fully exercised.
 ///
 /// `None` participates as its own bucket key value:
-/// - `version: None` (local/untagged builds) is distinct from any
-///   `Some(version)`.
+/// - `version: None` (no version could be established — an unparsable
+///   source `Makefile`, or a non-version-recording acquisition) is
+///   distinct from any `Some(version)`.
 /// - `ktstr_kconfig_hash: None` (entries that predate the field)
 ///   is distinct from any `Some(hash)`.
 /// - `extra_kconfig_hash: None` (no user extras) is distinct from

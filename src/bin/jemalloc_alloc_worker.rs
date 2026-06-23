@@ -105,10 +105,15 @@ fn touch(v: &[u8]) {
     std::hint::black_box(v.len());
 }
 
-fn main() {
-    // Parse args: first non-flag positional is bytes; `--churn`
-    // anywhere on the line enables thread-churn mode. See module doc
-    // for the argv-parsing rationale (no clap dep).
+/// Parse argv into `(bytes, churn)`.
+///
+/// First non-flag positional is `bytes`; `--churn` anywhere on the
+/// line enables thread-churn mode. See module doc for the
+/// argv-parsing rationale (no clap dep). Exits 5 on a missing
+/// positional or a non-`usize` value (the argv-parse failure code in
+/// the module doc's "Exit codes" table); returns to the caller only
+/// on success.
+fn parse_args() -> (usize, bool) {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let churn = args.iter().any(|a| a == "--churn");
     let bytes: usize = match args.iter().find(|a| !a.starts_with("--")) {
@@ -130,6 +135,82 @@ fn main() {
             std::process::exit(5);
         }
     };
+    (bytes, churn)
+}
+
+/// Fail fast if the process is not single-threaded.
+///
+/// `/proc/self/task` lists one directory entry per TID; more than one
+/// means an unexpected helper thread is running and the `tid == pid`
+/// invariant the test body relies on is already broken. Note that
+/// the test-side `thread_count(&metrics) != 1` assertion in
+/// tests/jemalloc_probe_tests.rs is the authoritative guard — this
+/// check only exits early with an actionable diagnostic instead of
+/// letting the probe observe a silently-broken worker.
+///
+/// Race against jemalloc's `background_thread` worker: the
+/// tikv-jemallocator default is `background_thread:false`, so a
+/// clean invocation reaches this self-check with exactly one TID
+/// (the main thread). An operator with `MALLOC_CONF=background_thread:true`
+/// in their shell (or a sibling test that set
+/// `_RJEM_MALLOC_CONF=background_thread:true` on an inherited env)
+/// unblocks jemalloc's helper thread during allocator init — which
+/// runs during the `std::env::args().collect()` Vec allocation in
+/// `parse_args`, BEFORE control reaches this self-check. The
+/// self-check then sees two TIDs and the worker exits 3. This is the
+/// exact branch `worker_exits_3_on_thread_count_not_one` in
+/// `tests/jemalloc_alloc_worker_exit_codes.rs` exercises on
+/// purpose; the other exit-code tests (bytes=0 → 2, marker fail → 4,
+/// argv → 5) deliberately pin
+/// `MALLOC_CONF=background_thread:false` + `_RJEM_MALLOC_CONF=…:false`
+/// so a leaky env var cannot race them into exit 3 before the branch
+/// under test fires.
+///
+/// `main` skips this under `--churn`: churn mode intentionally runs
+/// many short-lived helper threads, breaking the tid==pid invariant
+/// on purpose. The ESRCH-stress test does NOT rely on that invariant
+/// — it asserts the probe survives rapid thread exit races
+/// without crashing, using ThreadResult shape in probe JSON.
+fn assert_single_threaded() {
+    match std::fs::read_dir("/proc/self/task") {
+        Ok(iter) => {
+            let n = iter.filter(|e| e.is_ok()).count();
+            if n != 1 {
+                eprintln!(
+                    "{WORKER_STDERR_PREFIX} /proc/self/task has {n} entries, expected 1; \
+                     extra threads break the tid==pid identity. \
+                     Hint: check MALLOC_CONF / _RJEM_MALLOC_CONF for \
+                     `background_thread:true` — jemalloc spawns a helper \
+                     during init when that option is set, which trips \
+                     this self-check unless the caller pins \
+                     `background_thread:false`."
+                );
+                // Exit code 3: self-check saw >1 TID. The test
+                // body uses this to distinguish "a helper thread
+                // materialized somehow" from "procfs itself
+                // broke" (exit code 6 below) since the
+                // remediation differs (inspect the worker's
+                // build for a new dep that spawns threads, vs
+                // investigate a broken or unmounted /proc).
+                std::process::exit(3);
+            }
+        }
+        Err(e) => {
+            eprintln!("{WORKER_STDERR_PREFIX} read_dir(/proc/self/task) failed: {e}");
+            // Exit code 6: procfs itself was unreadable. Distinct
+            // from exit 3 (threads!=1) because the failure class
+            // is different — 3 points at the worker build, 6
+            // points at the guest kernel / mount config.
+            std::process::exit(6);
+        }
+    }
+}
+
+fn main() {
+    // Phase order: parse args, validate bytes, single-thread
+    // self-check (unless --churn), allocate + hold, write the ready
+    // marker, then enter the churn or park loop.
+    let (bytes, churn) = parse_args();
 
     // A zero-length allocation would indexing-panic on `v[0]` inside
     // `touch`. Reject with a dedicated exit code so the test can
@@ -143,71 +224,12 @@ fn main() {
         std::process::exit(2);
     }
 
-    // Fail fast if the process is not single-threaded. `/proc/self/task`
-    // lists one directory entry per TID; more than one means an
-    // unexpected helper thread is running and the `tid == pid`
-    // invariant the test body relies on is already broken. Note that
-    // the test-side `thread_count(&metrics) != 1` assertion in
-    // tests/jemalloc_probe_tests.rs is the authoritative guard — this
-    // check only exits early with an actionable diagnostic instead of
-    // letting the probe observe a silently-broken worker.
-    //
-    // Race against jemalloc's `background_thread` worker: the
-    // tikv-jemallocator default is `background_thread:false`, so a
-    // clean invocation reaches this self-check with exactly one TID
-    // (the main thread). An operator with `MALLOC_CONF=background_thread:true`
-    // in their shell (or a sibling test that set
-    // `_RJEM_MALLOC_CONF=background_thread:true` on an inherited env)
-    // unblocks jemalloc's helper thread during allocator init — which
-    // runs during the `std::env::args().collect()` Vec allocation above,
-    // BEFORE control reaches this self-check. The self-check then sees
-    // two TIDs and the worker exits 3. This is the exact branch
-    // `worker_exits_3_on_thread_count_not_one` in
-    // `tests/jemalloc_alloc_worker_exit_codes.rs` exercises on
-    // purpose; the other exit-code tests (bytes=0 → 2, marker fail → 4,
-    // argv → 5) deliberately pin
-    // `MALLOC_CONF=background_thread:false` + `_RJEM_MALLOC_CONF=…:false`
-    // so a leaky env var cannot race them into exit 3 before the branch
-    // under test fires.
-    //
-    // Skipped under `--churn`: churn mode intentionally runs many
-    // short-lived helper threads, breaking the tid==pid invariant on
-    // purpose. The ESRCH-stress test does NOT rely on that invariant
-    // — it asserts the probe survives rapid thread exit races
-    // without crashing, using ThreadResult shape in probe JSON.
+    // Skipped under `--churn` (see `assert_single_threaded` doc): churn
+    // mode breaks the tid==pid invariant on purpose. Runs BEFORE the
+    // allocation below so the probe never observes a silently-broken
+    // worker that already materialized its heap buffer.
     if !churn {
-        match std::fs::read_dir("/proc/self/task") {
-            Ok(iter) => {
-                let n = iter.filter(|e| e.is_ok()).count();
-                if n != 1 {
-                    eprintln!(
-                        "{WORKER_STDERR_PREFIX} /proc/self/task has {n} entries, expected 1; \
-                         extra threads break the tid==pid identity. \
-                         Hint: check MALLOC_CONF / _RJEM_MALLOC_CONF for \
-                         `background_thread:true` — jemalloc spawns a helper \
-                         during init when that option is set, which trips \
-                         this self-check unless the caller pins \
-                         `background_thread:false`."
-                    );
-                    // Exit code 3: self-check saw >1 TID. The test
-                    // body uses this to distinguish "a helper thread
-                    // materialized somehow" from "procfs itself
-                    // broke" (exit code 6 below) since the
-                    // remediation differs (inspect the worker's
-                    // build for a new dep that spawns threads, vs
-                    // investigate a broken or unmounted /proc).
-                    std::process::exit(3);
-                }
-            }
-            Err(e) => {
-                eprintln!("{WORKER_STDERR_PREFIX} read_dir(/proc/self/task) failed: {e}");
-                // Exit code 6: procfs itself was unreadable. Distinct
-                // from exit 3 (threads!=1) because the failure class
-                // is different — 3 points at the worker build, 6
-                // points at the guest kernel / mount config.
-                std::process::exit(6);
-            }
-        }
+        assert_single_threaded();
     }
 
     // Allocate + hold under black_box so the optimizer cannot elide

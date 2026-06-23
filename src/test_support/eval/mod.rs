@@ -29,7 +29,6 @@ use super::output::{
     parse_assert_result_from_drain, sched_log_fingerprint,
 };
 use super::probe::attempt_auto_repro;
-use super::profraw::write_profraw;
 use super::sidecar::{write_sidecar, write_skip_sidecar};
 use super::topo::TopoOverride;
 use super::{KtstrTestEntry, SchedulerSpec, Topology};
@@ -153,13 +152,19 @@ pub(crate) const ERR_GUEST_CRASHED_PREFIX: &str = "guest crashed:";
 /// Public-crate entry point. Thin wrapper around
 /// [`run_ktstr_test_inner_impl`] that records a skip sidecar as a
 /// **defensive late catch-all** whenever the inner pipeline bails
-/// with a [`crate::vmm::host_topology::ResourceContention`].
+/// with a skip-class host-resource error —
+/// [`crate::vmm::host_topology::ResourceContention`] (transient slot
+/// shortage), [`crate::vmm::host_topology::TopologyInsufficient`]
+/// (the VM cannot boot at all on this host -- the x86_64 kvm hardware
+/// caps), or [`crate::vmm::host_topology::PerfModeUnavailable`] (a
+/// perf-mode-too-small host — also skip-class, recorded here too).
 ///
-/// No pre-build path constructs `ResourceContention` today. Every
-/// `ResourceContention` construction site in the crate
-/// (`vmm::host_topology` and `vmm::mod`) fires from inside
-/// `builder.build()` or `vm.run()` — both already record their
-/// own sidecar at the bail point via the per-site
+/// No pre-build path constructs any of these errors today. Every
+/// `ResourceContention` / `TopologyInsufficient` / `PerfModeUnavailable`
+/// construction site in the crate (`vmm::host_topology`, `vmm::mod`, and
+/// the `validate_performance_mode` / `acquire_slot_with_locks` pre-checks in
+/// `vmm::builder`) fires from inside `builder.build()` or `vm.run()` — all
+/// already record their own sidecar at the bail point via the per-site
 /// `record_skip_sidecar` calls in the match arms below. The
 /// pre-build helpers (`ensure_kvm`, `resolve_test_kernel`,
 /// `acquire_test_kernel_lock_if_cached`, `resolve_scheduler`)
@@ -180,33 +185,34 @@ pub(crate) const ERR_GUEST_CRASHED_PREFIX: &str = "guest crashed:";
 /// strict sense: the wrapper's write overwrites the per-site
 /// write's `run_id` and timestamp with fresh values produced at
 /// wrapper-return time. Both recordings carry the same skip
-/// classification (the same `ResourceContention` reason flowing
-/// through the same `write_skip_sidecar`), so the final sidecar
-/// is correct for stats tooling — only the run_id / timestamp
-/// shift between the two writes, and downstream tooling keys on
-/// (test name, skip classification), not on those volatile
-/// fields.
+/// classification (the same skip-class reason flowing through the
+/// same `write_skip_sidecar`), so the final sidecar is correct for
+/// stats tooling — only the run_id / timestamp shift between the two
+/// writes, and downstream tooling keys on (test name, skip
+/// classification), not on those volatile fields.
 pub(crate) fn run_ktstr_test_inner(
     entry: &KtstrTestEntry,
     topo: Option<&TopoOverride>,
 ) -> Result<AssertResult> {
     let result = run_ktstr_test_inner_impl(entry, topo);
     if let Err(ref e) = result
-        && super::is_resource_contention(e)
+        && (super::is_resource_contention(e)
+            || super::is_topology_insufficient(e)
+            || super::is_perf_mode_unavailable(e))
     {
-        // Late catch-all for ResourceContention from any early-
-        // bail path before the existing per-site `record_skip_sidecar`
-        // calls in builder.build()/vm.run() arms below. Walks the
-        // FULL `anyhow::Error` chain via `is_resource_contention`
-        // (which uses `e.chain().any(...)`) so a contention wrapped
-        // in `.context(...)` (e.g. the `"build ktstr_test VM"` and
-        // `"run ktstr_test VM"` wrappers in `evaluate_vm_result`)
-        // is still recognised — without the chain walk, a wrapped
-        // contention would skip the catch-all and the run would
-        // not record a skip sidecar. Not strictly idempotent — a
-        // second write refreshes run_id and timestamp — but the
-        // skip classification round-trips identically, so stats
-        // tooling sees the same outcome.
+        // Late catch-all for a skip-class error (ResourceContention,
+        // TopologyInsufficient, or PerfModeUnavailable) from any early-bail
+        // path before the
+        // existing per-site `record_skip_sidecar` calls in
+        // builder.build()/vm.run() arms below. All three predicates walk
+        // the FULL `anyhow::Error` chain via `e.chain().any(...)` so an error
+        // wrapped in `.context(...)` (e.g. the `"build ktstr_test VM"` and
+        // `"run ktstr_test VM"` wrappers in `evaluate_vm_result`) is still
+        // recognised — without the chain walk, a wrapped error
+        // would skip the catch-all and the run would not record a skip
+        // sidecar. Not strictly idempotent — a second write refreshes
+        // run_id and timestamp — but the skip classification round-trips
+        // identically, so stats tooling sees the same outcome.
         record_skip_sidecar(entry);
     }
     // `expect_auto_repro = true` inversion: when the primary VM
@@ -370,6 +376,35 @@ fn write_placeholder_failure_dump_if_missing(path: &std::path::Path, result: &vm
     }
 }
 
+/// Pre-boot overcommit auto-skip, extracted from
+/// [`run_ktstr_test_inner_impl`] so the predicate-to-skip WIRING is
+/// unit-testable without booting a VM (the sibling `performance_mode` /
+/// `perf_only` skips are env-driven; this one is topology-driven). When
+/// the host cannot run the entry's topology without racing the
+/// oversub-scaled boot watchdog
+/// ([`super::runtime::overcommit_skip_reason`]), emits the operator SKIP
+/// banner, records the skip sidecar, and returns the skip
+/// [`AssertResult`]; otherwise returns `None` to proceed to boot. Only
+/// the AUTO-collapse case skips — an explicit `cpu_budget` (a deliberate
+/// oversubscription opt-in) returns `None` and RUNs. The skip cap is
+/// stricter for an `expect_auto_repro` entry (its two-VM wprof-trace
+/// inversion chain is fragile under time-slicing): such an entry skips at
+/// `EXPECT_AUTO_REPRO_SKIP_RATIO`, while a boot-only wide-SMP test runs up
+/// to `OVERCOMMIT_SKIP_RATIO` — so a 256-vCPU guest at the ~1.3x of the
+/// design-target runner validates boot (and the auto-repro hop) there
+/// rather than silently skipping.
+fn overcommit_skip(entry: &KtstrTestEntry, host_cpus: &[usize]) -> Option<AssertResult> {
+    let reason = super::runtime::overcommit_skip_reason(
+        entry.topology.total_cpus(),
+        host_cpus.len(),
+        entry.cpu_budget,
+        entry.expect_auto_repro,
+    )?;
+    crate::report::test_skip(format_args!("{}: {reason}", entry.name));
+    record_skip_sidecar(entry);
+    Some(AssertResult::skip(reason))
+}
+
 fn run_ktstr_test_inner_impl(
     entry: &KtstrTestEntry,
     topo: Option<&TopoOverride>,
@@ -455,6 +490,15 @@ fn run_ktstr_test_inner_impl(
         crate::report::test_skip(format_args!("{}: {REASON}", entry.name));
         record_skip_sidecar(entry);
         return Ok(AssertResult::skip(REASON));
+    }
+    // Auto-skip a default/no-perf overcommit so severe the guest boot
+    // would race even the oversub-scaled host watchdog — the "overcommit
+    // OR auto-skip, never hard-fail" contract. See `overcommit_skip` for
+    // the full rationale; it skips ONLY the auto-collapse case past
+    // `OVERCOMMIT_SKIP_RATIO`, so an explicit `cpu_budget` and the CI
+    // ~1.3x case both RUN and are validated here, never masked.
+    if let Some(skip) = overcommit_skip(entry, &host_cpus) {
+        return Ok(skip);
     }
     ensure_kvm()?;
     let kernel = resolve_test_kernel()?;
@@ -936,8 +980,13 @@ fn run_ktstr_test_inner_impl(
     let vm = match builder.build() {
         Ok(vm) => vm,
         Err(e) => {
-            if e.downcast_ref::<crate::vmm::host_topology::ResourceContention>()
-                .is_some()
+            // Chain-aware (the error can arrive .context()-wrapped, e.g.
+            // KtstrKvm::new's "create VM"): walk the chain so a wrapped
+            // skip-class error is still recorded here, matching the late
+            // catch-all in run_ktstr_test_inner.
+            if super::is_resource_contention(&e)
+                || super::is_topology_insufficient(&e)
+                || super::is_perf_mode_unavailable(&e)
             {
                 record_skip_sidecar(entry);
             }
@@ -947,8 +996,10 @@ fn run_ktstr_test_inner_impl(
     let mut result = match vm.run() {
         Ok(r) => r,
         Err(e) => {
-            if e.downcast_ref::<crate::vmm::host_topology::ResourceContention>()
-                .is_some()
+            // Chain-aware, as in the build arm above.
+            if super::is_resource_contention(&e)
+                || super::is_topology_insufficient(&e)
+                || super::is_perf_mode_unavailable(&e)
             {
                 record_skip_sidecar(entry);
             }
@@ -1165,14 +1216,6 @@ fn run_ktstr_test_inner_impl(
         for bulk_entry in &bulk.entries {
             let kind = crate::vmm::wire::MsgType::from_wire(bulk_entry.msg_type);
             match kind {
-                Some(crate::vmm::wire::MsgType::Profraw) => {
-                    if bulk_entry.crc_ok
-                        && !bulk_entry.payload.is_empty()
-                        && let Err(e) = write_profraw(&bulk_entry.payload)
-                    {
-                        eprintln!("ktstr_test: write guest profraw: {e}");
-                    }
-                }
                 Some(crate::vmm::wire::MsgType::WprofTrace) => {
                     // wprof Perfetto trace captured during the
                     // guest's auto-repro window. Write next to the
@@ -1230,20 +1273,26 @@ fn run_ktstr_test_inner_impl(
                 // timeline: StepEnd is decoded via
                 // `StimulusEvent::from_step_end` alongside Stimulus's
                 // `from_wire` and ScenarioEnd's terminal), so they are
-                // no-ops in this loop. The remaining verdict-bearing
-                // variants in this arm (TestResult, Exit, SchedExit,
-                // ScenarioStart, ScenarioPause, ScenarioResume, Stdout,
-                // SchedLog, Lifecycle, ExecExit, Dmesg, ProbeOutput,
-                // SnapshotReply, Crash) are consumed by other walkers
-                // further down the pipeline (parse_assert_result_from_drain,
-                // bulk_exit lookup in collect_results, lifecycle
-                // classifier, sched_log concatenator, etc.). No
-                // per-entry side effect here. (Stderr is NOT in this arm —
-                // it has its own arm below that streams to host stderr.)
+                // no-ops in this loop. Profraw is persisted centrally
+                // in `crate::vmm::KtstrVm::run` (every run() caller
+                // funnels through there), so re-extracting it here would
+                // write the same payload twice and make
+                // `llvm-profdata merge` double-count the counters. The
+                // remaining verdict-bearing variants in this arm
+                // (TestResult, Exit, SchedExit, ScenarioStart,
+                // ScenarioPause, ScenarioResume, Stdout, SchedLog,
+                // Lifecycle, ExecExit, Dmesg, ProbeOutput, SnapshotReply,
+                // Crash) are consumed by other walkers further down the
+                // pipeline (parse_assert_result_from_drain, bulk_exit
+                // lookup in collect_results, lifecycle classifier,
+                // sched_log concatenator, etc.). No per-entry side effect
+                // here. (Stderr is NOT in this arm — it has its own arm
+                // below that streams to host stderr.)
                 Some(
                     crate::vmm::wire::MsgType::Stimulus
                     | crate::vmm::wire::MsgType::StepEnd
                     | crate::vmm::wire::MsgType::ScenarioEnd
+                    | crate::vmm::wire::MsgType::Profraw
                     | crate::vmm::wire::MsgType::TestResult
                     | crate::vmm::wire::MsgType::Exit
                     | crate::vmm::wire::MsgType::SchedExit
@@ -1519,47 +1568,59 @@ pub(crate) fn apply_expect_auto_repro_inversion(
         let Ok(repro_path) = result.repro_wprof_pb_path() else {
             return;
         };
-        if crate::test_support::wprof::assert_wprof_pb_shape(&repro_path).is_ok() {
-            result.expect_auto_repro_satisfied = true;
+        match crate::test_support::wprof::assert_wprof_pb_shape(&repro_path) {
+            Ok(()) => result.expect_auto_repro_satisfied = true,
+            Err(e) => {
+                // The repro VM did not land a shape-valid .repro.wprof.pb,
+                // so the inversion does NOT fire and the forced failure
+                // surfaces as a real nextest FAIL. Without this diagnostic
+                // the operator sees only the generic body-fail message and
+                // cannot distinguish a missing/truncated artifact (e.g. a
+                // repro VM that raced its system-wide wprof transport under
+                // host oversubscription) from a broken inversion gate. The
+                // pre-boot overcommit auto-skip (overcommit_skip_reason,
+                // expect_auto_repro-aware) is the primary guard against the
+                // oversubscription case; this logs whatever still reaches
+                // here so a future failure is debuggable from CI stderr.
+                eprintln!(
+                    "ktstr: expect_auto_repro: repro wprof trace at {} is not \
+                     shape-valid ({e:#}); inversion NOT applied — forced failure stands",
+                    repro_path.display()
+                );
+            }
         }
     }
 }
 
-/// Evaluate a VM result and produce the appropriate error or Ok.
-///
-/// This is the core result-evaluation logic, extracted from
-/// `run_ktstr_test_inner` so that error message formatting can be tested
-/// without booting a VM. The `repro_fn` callback handles auto-repro
-/// (which requires a second VM boot) when provided. `payload_metrics`
-/// is the per-invocation accumulator drained from the guest SHM ring;
-/// the sidecar writer receives it verbatim so stats tooling sees one
-/// entry per `ctx.payload(X).run()` / `.spawn().wait()`.
-///
-/// `host_extract_failures` carries the universal-invariant +
-/// model-load failures produced by [`host_side_llm_extract`] when
-/// the run's `OutputFormat::LlmExtract` payloads were resolved on
-/// the host. The folded details are appended to the test's
-/// AssertResult so a host-side LlmExtract failure surfaces in the
-/// same failure-rendering pipeline as a guest-emitted check failure.
-#[allow(clippy::too_many_arguments)]
-fn evaluate_vm_result(
-    entry: &KtstrTestEntry,
+/// Format the failure-message timeline section for a given timeline (or none).
+/// Skips a phaseless timeline. Shared by every error branch so the section is
+/// rendered identically regardless of which timeline (the pre-fold monitor
+/// fallback, or the post-fold per-cgroup-bearing one) the branch holds.
+fn format_timeline_section(
+    timeline: Option<&crate::timeline::Timeline>,
+    ctx: &crate::timeline::TimelineContext,
+) -> String {
+    timeline
+        .filter(|t| !t.phases.is_empty())
+        .map(|t| format!("\n\n{}", t.format_with_context(ctx)))
+        .unwrap_or_default()
+}
+
+/// Build the early periodic series, host phase buckets, and pre-fold timeline
+/// that the failure-message renderer drives from. Returns the periodic-only
+/// `SampleSeries`, the host phase buckets keyed by step_index, and the
+/// pre-fold `Timeline` (from the buckets, or the monitor-sample fallback when
+/// no buckets exist). The phase buckets are returned `mut` because the
+/// guest-AssertResult path takes them via `std::mem::take` when folding the
+/// guest per_cgroup carriers.
+fn precompute_early_series(
     result: &vmm::VmResult,
-    merged_assert: &crate::assert::Assert,
     stimulus_events: &[StimulusEvent],
-    payload_metrics: &[crate::test_support::PayloadMetrics],
-    host_extract_failures: &[crate::assert::AssertDetail],
-    topo: &Topology,
-    repro_fn: &dyn Fn(&str) -> Option<String>,
-    // Optional Err captured from `KtstrTestEntry::post_vm` so the
-    // host-side assertion failure flows through the SAME failure
-    // path as a guest-side `result.success=false`: same scheduler
-    // log / sched_ext dump / monitor diagnostic, same auto-repro
-    // dispatch. Folded into `check_result` as an AssertDetail
-    // below the parse-success arm so the existing failure-message
-    // construction picks it up without a parallel renderer.
-    post_vm_err: Option<&anyhow::Error>,
-) -> Result<AssertResult> {
+) -> (
+    crate::scenario::sample::SampleSeries,
+    Vec<crate::assert::PhaseBucket>,
+    Option<crate::timeline::Timeline>,
+) {
     // Build phase buckets early so the failure-message timeline
     // renderer can drive from the unified PhaseBucket source
     // (Timeline::from_phase_buckets) rather than re-deriving phases
@@ -1572,9 +1633,12 @@ fn evaluate_vm_result(
     // fills on the failure paths too. The buckets use this function's
     // `stimulus_events` param (the production caller passes
     // `result.stimulus_timeline()`, which is exactly what
-    // `result.phase_buckets()` uses — so `stats.phases` and
-    // `result.phase_buckets()` carry identical content; pinned by
-    // `phase_buckets_equals_stats_phases`).
+    // `result.phase_buckets()` uses). These host-rebuilt buckets equal
+    // `result.phase_buckets()` ONLY when there are no guest per_cgroup carriers
+    // — the no-carrier baseline pinned by `phase_buckets_equals_stats_phases`.
+    // With step-local cgroups, the per-phase fold below additionally merges the guest
+    // per_cgroup into `stats.phases` (and may append orphan buckets), so
+    // `stats.phases` is then a superset of `result.phase_buckets()`.
     //
     // Bucket the PERIODIC-ONLY view: on-demand `Op::CaptureSnapshot` and
     // watchpoint-fire captures are off-cadence outliers (see
@@ -1582,67 +1646,56 @@ fn evaluate_vm_result(
     // metric folds. `periodic_series()` reads the same memoized
     // single-drain `captures_series()` cache, so this does not re-drain.
     let early_periodic_series = result.periodic_series();
-    let mut early_phase_buckets =
+    let early_phase_buckets =
         crate::assert::build_phase_buckets_with_stimulus(&early_periodic_series, stimulus_events);
-    // Build timeline from the pre-bucketed phases. When no
-    // PhaseBuckets exist (scenario had no periodic captures,
-    // e.g. single-phase tests) but monitor samples ARE present,
-    // fall back to the legacy Timeline::build path so the
-    // failure-message timeline still renders monitor-derived
-    // metrics. The fallback preserves operator-facing diagnostic
-    // continuity for monitor-only runs — the new from_phase_buckets
-    // path requires snapshot-bridge captures to materialise
-    // PhaseBuckets, which monitor-only runs don't produce.
-    let timeline = if !early_phase_buckets.is_empty() {
+    // PRE-FOLD timeline from the host phase buckets (per_cgroup empty by
+    // construction), used by the NO-guest-AssertResult error path (where no
+    // guest carriers exist to fold). When no PhaseBuckets exist (scenario had
+    // no periodic captures, e.g. single-phase tests) but monitor samples ARE
+    // present, fall back to the legacy Timeline::build path so the
+    // failure-message timeline still renders monitor-derived metrics. The
+    // guest-AssertResult path below REBUILDS the timeline from the POST-fold
+    // `check_result.stats.phases` so the per-cgroup sub-block + orphan
+    // not-measured markers render.
+    let early_timeline = if !early_phase_buckets.is_empty() {
         Some(crate::timeline::Timeline::from_phase_buckets(
             &early_phase_buckets,
             stimulus_events,
             &crate::timeline::TimelineContext::default(),
         ))
     } else {
-        result
-            .monitor
-            .as_ref()
-            .map(|m| crate::timeline::Timeline::build(stimulus_events, &m.samples))
+        result.monitor.as_ref().map(|m| {
+            crate::timeline::Timeline::build(stimulus_events, &m.samples, m.preemption_threshold_ns)
+        })
     };
+    (early_periodic_series, early_phase_buckets, early_timeline)
+}
 
+/// Compute the owned failure-message section inputs that every error branch
+/// shares: the `[sched=...]` label, the raw sched_ext dump + its delimited
+/// section, the colored fingerprint line, and the timeline-render context.
+/// `sched_log_input` is the already-selected log corpus (`&str`) so the
+/// fingerprint extraction reads the same bytes as the inline `sched_log_section`
+/// build. Returns the values as a tuple in the driver's binding order.
+fn precompute_failure_sections(
+    entry: &KtstrTestEntry,
+    result: &vmm::VmResult,
+    sched_log_input: &str,
+    topo: &Topology,
+) -> (
+    String,
+    String,
+    String,
+    String,
+    crate::timeline::TimelineContext,
+) {
     let sched_label = reporting::scheduler_label(&entry.scheduler.binary);
-    let output = &result.output;
     let raw_dump = extract_sched_ext_dump(&result.stderr).unwrap_or_default();
     let dump_section = if raw_dump.is_empty() {
         String::new()
     } else {
         format!("\n\n--- sched_ext dump ---\n{raw_dump}")
     };
-    // Concatenate bulk-port `MSG_TYPE_SCHED_LOG` chunks then run
-    // the marker-pair extractor on the merged stream — pre-bulk-port
-    // migration the markers travelled in `output` (COM2). Either
-    // source feeds `parse_sched_output` byte-for-byte; falling back
-    // to `output` when the bulk-port drain has no SchedLog frames
-    // covers verifier-only paths.
-    let sched_log_merged = crate::verifier::concat_sched_log_chunks(result.guest_messages.as_ref());
-    let sched_log_input: &str = if !sched_log_merged.is_empty() {
-        &sched_log_merged
-    } else {
-        output
-    };
-    let sched_log_section = parse_sched_output(sched_log_input)
-        .map(|s| {
-            let collapsed = crate::verifier::collapse_cycles(s);
-            let is_verifier = collapsed.contains("processed") && collapsed.contains("insns");
-            let lines: Vec<&str> = collapsed.lines().collect();
-            let tail = if !is_verifier && lines.len() > 200 {
-                let skipped = lines.len() - 200;
-                format!(
-                    "[{skipped} lines truncated]\n{}",
-                    lines[lines.len() - 200..].join("\n")
-                )
-            } else {
-                collapsed
-            };
-            format!("\n\n--- scheduler log ---\n{tail}")
-        })
-        .unwrap_or_default();
     let fingerprint_line = sched_log_fingerprint(sched_log_input)
         .map(|fp| {
             if crate::cli::stderr_color() {
@@ -1652,37 +1705,6 @@ fn evaluate_vm_result(
             }
         })
         .unwrap_or_default();
-    // Hoist the first actionable `scx_bpf_error`-class line to the
-    // TOP of the failure message (above the existing noisy sections
-    // like sched_log / sched_ext dump / monitor). Without this hint
-    // the test author had to scroll past ~200 lines of trace_pipe
-    // dump output to find the line that explains why the scheduler
-    // exited; see KTSTR_API_ISSUES_FROM_SCX_MITOSIS.md B4 for the
-    // motivating user report. Extraction is suppressed when there
-    // is nothing actionable to surface so passing tests stay quiet.
-    //
-    // Gated behind a closure: every failure return path below renders
-    // exactly one failure message and calls the closure exactly once,
-    // and a passing test takes the `return Ok(check_result)` at the
-    // end of the parse-success arm without invoking any failure
-    // formatter — so the `extract_bug_summary` scan over sched_log +
-    // dump never runs on the pass path. The eager `match` this
-    // replaces ran the scan unconditionally on every test, paying the
-    // ANSI strip + line walk for passing tests that would never
-    // render the result.
-    let bug_summary_line = || -> String {
-        match crate::test_support::output::extract_bug_summary(sched_log_input, &raw_dump) {
-            Some(text) => {
-                if crate::cli::stderr_color() {
-                    format!("\x1b[1;31mBUG SUMMARY:\x1b[0m {text}\n")
-                } else {
-                    format!("BUG SUMMARY: {text}\n")
-                }
-            }
-            None => String::new(),
-        }
-    };
-
     let tl_ctx = crate::timeline::TimelineContext {
         kernel: extract_kernel_version(&result.stderr),
         topology: Some(format!("{topo} ({} cpus)", topo.total_cpus())),
@@ -1690,391 +1712,421 @@ fn evaluate_vm_result(
         scenario: Some(entry.name.to_string()),
         duration_s: Some(result.duration.as_secs_f64()),
     };
+    (
+        sched_label,
+        raw_dump,
+        dump_section,
+        fingerprint_line,
+        tl_ctx,
+    )
+}
 
-    // Section builders shared by every error branch in this function.
-    // Timeline skips phaseless runs; monitor only reports when an
-    // active scheduler exposes rq data (EEVDF reads would be junk).
-    let build_timeline_section = || -> String {
-        timeline
-            .as_ref()
-            .filter(|t| !t.phases.is_empty())
-            .map(|t| format!("\n\n{}", t.format_with_context(&tl_ctx)))
-            .unwrap_or_default()
-    };
-    let build_monitor_section = || -> String {
-        if entry.scheduler.has_active_scheduling()
-            && let Some(ref monitor) = result.monitor
-        {
-            reporting::format_monitor_section(monitor, merged_assert)
-        } else {
-            String::new()
-        }
-    };
-
-    if let Ok(mut check_result) = parse_assert_result_from_drain(result.guest_messages.as_ref()) {
-        // Fold host-side LlmExtract failures into the guest's
-        // AssertResult before the sidecar write so per-run stats
-        // tooling sees the host-extracted verdict, not the guest's
-        // placeholder pass(). Each host-side failure is appended as
-        // an `AssertDetail` exactly as if it had been raised inside
-        // the guest's `evaluate_checks` — same kind, same prose
-        // shape — so failure-rendering downstream is uniform across
-        // sources.
-        for detail in host_extract_failures {
-            check_result.merge(AssertResult::fail(detail.clone()));
-        }
-
-        // Fold the host-side `post_vm` callback's Err into the
-        // verdict so it flows through the same failure path as
-        // host-extract failures and the guest-stamped check
-        // result. The downstream failure formatter renders the
-        // `--- scheduler log ---` / `--- sched_ext dump ---` /
-        // `--- monitor ---` sections + dispatches `repro_fn`
-        // (auto-repro) from this single point — no parallel
-        // handler needed.
-        if let Some(err) = post_vm_err {
-            check_result.merge(AssertResult::fail(crate::assert::AssertDetail::new(
-                crate::assert::DetailKind::Other,
-                format!("post_vm callback returned Err: {err:#}"),
-            )));
-        }
-
-        // Cleanup-budget enforcement. When the entry sets
-        // `cleanup_budget` and `collect_results` produced a measurement
-        // (i.e. `run_vm` returned normally — see
-        // `VmResult::cleanup_duration`), fold a failing
-        // `AssertDetail` into the test verdict if teardown overran the
-        // budget. Skipped when either side is `None`: an absent budget
-        // means the entry opted out, an absent measurement means the
-        // run never reached `collect_results` (BSP panic propagated
-        // through `?`, or any pre-BSP setup error returning an `Err`
-        // before `VmRunState` is constructed). Note: a host-watchdog
-        // timeout is NOT a `None` case — `run_bsp_loop` exits cleanly
-        // with `timed_out = true` and `collect_results` still
-        // populates `cleanup_duration` to `Some(_)`, per the field
-        // contract documented at `src/vmm/mod.rs` for
-        // `VmResult::cleanup_duration`. The surrounding error path
-        // (BSP panic propagation, pre-BSP setup `Err`) already
-        // produces a failure verdict in the absent-measurement case,
-        // so a budget check here would double-report.
-        //
-        // Contract: this check only fires inside the parse-success arm
-        // (the `if let Ok(mut check_result)` above) — i.e. when the
-        // guest-side test body emitted a parseable AssertResult into
-        // SHM or COM2. Tests whose body panics or fails to write a
-        // result skip budget enforcement entirely; the watchdog
-        // timeout / no-parseable-result branch below produces its own
-        // verdict in those cases. Tests that opt into
-        // `cleanup_budget_ms` MUST ensure their body returns
-        // `Ok(AssertResult)` (e.g. `Ok(AssertResult::pass())`) before
-        // teardown begins, otherwise the budget knob is silently
-        // inert.
-        if let (Some(budget), Some(measured)) = (entry.cleanup_budget, result.cleanup_duration)
-            && measured > budget
-        {
-            check_result.merge(AssertResult::fail(crate::assert::AssertDetail::new(
-                crate::assert::DetailKind::Other,
-                format!(
-                    "vm cleanup overran budget: measured {:.3}s, budget {:.3}s. \
-                     Likely a regression in host-side teardown — investigate \
-                     the post-BSP-exit join/drain path \
-                     (`vmm::KtstrVm::collect_results`).",
-                    measured.as_secs_f64(),
-                    budget.as_secs_f64(),
-                ),
-            )));
-        }
-
-        // Reproducer-mode scx_bpf_error matcher. Runs the configured
-        // `expect_scx_bpf_error_contains` / `_matches` patterns against
-        // the combined scheduler log + sched_ext dump corpus — the two
-        // host-side surfaces where scx_bpf_error printk text lands.
-        // Matcher details (mismatch + misuse diagnostics) fold into
-        // `check_result.details` so the failure-message construction
-        // path renders them alongside the rest of the verdict.
-        //
-        // Gated on at least one matcher being configured so the
-        // common-path (no matcher) doesn't allocate the corpus string
-        // — the evaluator's own early-return covers the no-matcher
-        // case but only after the format! has already run.
-        let matcher_configured = merged_assert.expect_scx_bpf_error_contains.is_some()
-            || merged_assert.expect_scx_bpf_error_matches.is_some();
-        let matcher_details = if matcher_configured {
-            let matcher_corpus = format!("{sched_log_input}\n{dump_section}");
-            merged_assert.evaluate_scx_bpf_error_match(&matcher_corpus, entry.expect_err)
-        } else {
-            Vec::new()
-        };
-        let matcher_mismatch = !matcher_details.is_empty();
-        for d in matcher_details {
-            check_result.merge(AssertResult::fail(d));
-        }
-
-        // Populate per-phase telemetry + cross-RUN ext_metrics on
-        // check_result BEFORE write_sidecar below: the sidecar is the
-        // durable telemetry every cross-run comparison reads, so it must
-        // carry stats.phases + stats.ext_metrics, not the empty defaults
-        // (previously these were filled AFTER write_sidecar, so the
-        // persisted sidecar dropped both). Phase buckets were built at
-        // evaluate_vm_result entry from result.periodic_series()
-        // (off-cadence on-demand / watchpoint captures excluded); reuse the
-        // pre-built vec + already-drained series rather than re-draining.
-        // The cross-RUN ext_metrics fill covers METRICS entries with a
-        // read_sample wire but no typed GauntletRow field
-        // (populate_run_ext_metrics) plus the phase-only metrics whose
-        // read_sample returns None — avg_imbalance_ratio, iteration_rate,
-        // system_time_ns / user_time_ns (populate_run_ext_metrics_from_phases).
-        // Without it those keys never reach the sidecar and
-        // `cargo ktstr stats compare` silently drops the rows.
-        check_result.stats.phases = std::mem::take(&mut early_phase_buckets);
-        crate::assert::populate_run_ext_metrics(
-            &early_periodic_series,
-            &mut check_result.stats.ext_metrics,
-        );
-        crate::assert::populate_run_ext_metrics_from_phases(
-            &check_result.stats.phases,
-            &mut check_result.stats.ext_metrics,
-        );
-
-        // Write sidecar before checking pass/fail so both outcomes are captured.
-        // A sidecar write failure is logged but not propagated: the test
-        // verdict itself is still valid — only post-run stats tooling
-        // loses visibility.
-        let args: Vec<String> = std::env::args().collect();
-        let work_type =
-            super::args::extract_work_type_arg(&args).unwrap_or_else(|| "SpinWait".to_string());
-        if let Err(e) = write_sidecar(
-            entry,
-            result,
-            stimulus_events,
-            &check_result,
-            &work_type,
-            payload_metrics,
-        ) {
-            eprintln!("ktstr_test: {e:#}");
-        }
-
-        if !check_result.is_pass() {
-            let details = check_result
-                .failure_details()
-                .chain(check_result.inconclusive_details())
-                .chain(check_result.skip_details())
-                .map(|d| d.message.as_str())
-                .collect::<Vec<_>>()
-                .join("\n  ");
-            // Render info_notes in their own delineated section
-            // (mirrors --- stats --- / --- auto-repro --- pattern)
-            // so the structural details-vs-info separation that
-            // sidecar consumers rely on is also visible at the
-            // operator-facing failure-dump boundary. An undelineated
-            // append into the failures block would interleave
-            // failure messages with context lines and undo the
-            // split's "details = failures" invariant at the human
-            // surface.
-            let info_section = if check_result.info_notes.is_empty() {
-                String::new()
-            } else {
-                let lines: Vec<String> = check_result
-                    .info_notes
-                    .iter()
-                    .map(|n| format!("  {}", n.message))
-                    .collect();
-                format!("\n\n--- info ---\n{}", lines.join("\n"))
-            };
-            let repro = if entry.scheduler.has_active_scheduling() {
-                repro_fn(output)
-            } else {
-                None
-            };
-            let repro_section = repro
-                .map(|r| format!("\n\n--- auto-repro ---\n{r}"))
-                .unwrap_or_default();
-            let timeline_section = build_timeline_section();
-            // Per-cgroup telemetry is now built unconditionally per
-            // declared cgroup (collect_handles no longer gates it behind
-            // has_worker_checks), so an empty `cgroups` here means NO
-            // cgroup was declared (e.g. a host_only run), not "no worker
-            // check was configured" — suppress the section in that case.
-            let stats_section = if !check_result.stats.cgroups.is_empty() {
-                let s = &check_result.stats;
-                let mut lines = vec![format!(
-                    "\n\n--- stats ---\n{} workers, {} cpus, {} migrations, worst_spread={:.1}%, worst_gap={}ms",
-                    s.total_workers,
-                    s.total_cpus,
-                    s.total_migrations,
-                    s.worst_spread,
-                    s.worst_gap_ms,
-                )];
-                for (i, cg) in s.cgroups.iter().enumerate() {
-                    lines.push(format!(
-                        "  cg{}: workers={} cpus={} spread={} gap={}ms migrations={} iter={}",
-                        i,
-                        cg.num_workers,
-                        cg.num_cpus,
-                        // None = off-CPU% not measured (no worker with
-                        // wall time); show "n/a" rather than a fake 0%.
-                        cg.spread
-                            .map_or_else(|| "n/a".to_string(), |s| format!("{s:.1}%")),
-                        cg.max_gap_ms,
-                        cg.total_migrations,
-                        cg.total_iterations,
-                    ));
-                }
-                lines.join("\n")
-            } else {
-                String::new()
-            };
-            // Structural filter for the console-dump gate: match on the
-            // three scheduler-liveness `DetailKind` variants
-            // (`SchedulerCrashed` / `SchedulerExitedCleanly` /
-            // `SchedulerDiedUnknownReason`) below. Every scheduler-exit
-            // emit site in this crate tags its `AssertDetail` with one
-            // of those variants (see the ops.rs / scenario/mod.rs call
-            // sites plus the `format_sched_died_*` helpers in
-            // `assert.rs`), so filtering by kind is sufficient — the
-            // prior `is_scheduler_death()` prefix-match fallback was
-            // removed once every production emitter was audited as
-            // kind-tagging its details. `verbose()` forces the
-            // section on for operator debugging runs.
-            let console_section = if check_result.failure_details().any(|d| {
-                matches!(
-                    d.kind,
-                    crate::assert::DetailKind::SchedulerCrashed
-                        | crate::assert::DetailKind::SchedulerExitedCleanly
-                        | crate::assert::DetailKind::SchedulerDiedUnknownReason
-                )
-            }) || verbose()
-            {
-                let init_stage = classify_init_stage(result.guest_messages.as_ref());
-                format_console_diagnostics(&result.stderr, result.exit_code, init_stage)
-            } else {
-                String::new()
-            };
-            let monitor_section = build_monitor_section();
-            // Periodic-sample coverage gauge: fires when the entry
-            // configured `num_snapshots > 0`. Renders the
-            // fired/target ratio; suppressed when the entry did
-            // not request periodic capture so non-periodic tests
-            // produce uncluttered failure output.
-            let periodic_section =
-                crate::test_support::output::format_periodic_samples_section(result);
-            // Temporal-assertion summary: aggregates every
-            // [`DetailKind::Temporal`] detail into a single block
-            // so a test author chasing a violated periodic-sample
-            // pattern sees the offending sample tag(s) at the top
-            // of the section instead of scrolling through scalar
-            // claim failures.
-            let temporal_section =
-                crate::test_support::output::format_temporal_assertions_section(&check_result);
-            // Skip-only results take an early exit through
-            // `record_skip_sidecar` upstream, so this block only
-            // sees Fail or Inconclusive. Render the lattice verdict
-            // accurately — "failed" for a hard Fail, "inconclusive"
-            // for a zero-denominator Inconclusive — so a CI human
-            // reading the dump can triage without inferring from
-            // exit code alone (dispatch.rs projects Inconclusive to
-            // exit code 2; the verdict word here mirrors that).
-            let verdict_word = if check_result.is_inconclusive() {
-                "inconclusive"
-            } else {
-                "failed"
-            };
-            let msg = format!(
-                "{}{}ktstr_test '{}'{} [topo={}] {verdict_word}:\n  {}{}{}{}{}{}{}{}{}{}{}",
-                fingerprint_line,
-                bug_summary_line(),
-                entry.name,
-                sched_label,
-                topo,
-                details,
-                info_section,
-                stats_section,
-                console_section,
-                timeline_section,
-                periodic_section,
-                temporal_section,
-                sched_log_section,
-                monitor_section,
-                dump_section,
-                repro_section,
-            );
-            // When the scx_bpf_error matcher contributed a mismatch
-            // detail, wrap the Err with [`ScxBpfErrorMatcherMismatch`]
-            // so the dispatch-time expect_err inversion bypasses this
-            // failure (a reproducer with a matcher mismatch fails the
-            // test even though expect_err = true would normally invert
-            // a failure into a pass). When the matcher matched (or was
-            // unset), the normal expect_err inversion path applies.
-            let err = anyhow::anyhow!("{msg}");
-            return Err(if matcher_mismatch {
-                err.context(ScxBpfErrorMatcherMismatch)
-            } else {
-                err
-            });
-        }
-
-        // Evaluate monitor data against thresholds when a scheduler is running.
-        // Without a scheduler (EEVDF), monitor reads rq data that may be
-        // uninitialized or irrelevant — skip evaluation in that case.
-        //
-        // Skip early monitor warmup samples: during boot, BPF verification,
-        // and initramfs unpacking the scheduler tick may not fire for hundreds
-        // of milliseconds. These transient stalls are real but not indicative
-        // of scheduler bugs.
-        if entry.scheduler.has_active_scheduling()
-            && merged_assert.has_monitor_thresholds()
-            && let Some(ref monitor) = result.monitor
-        {
-            let eval_report = reporting::trim_settle_samples(monitor);
-            let thresholds = merged_assert.monitor_thresholds();
-            let verdict = thresholds.evaluate(&eval_report);
-            if verdict.is_fail() {
-                let details = verdict.details.join("\n  ");
-                let timeline_section = build_timeline_section();
-                let monitor_section = reporting::format_monitor_section(monitor, merged_assert);
-                let msg = format!(
-                    "{}{}ktstr_test '{}'{} [topo={}] {ERR_MONITOR_FAILED_AFTER_SCENARIO}:\n  {}{}{}{}{}",
-                    fingerprint_line,
-                    bug_summary_line(),
-                    entry.name,
-                    sched_label,
-                    topo,
-                    details,
-                    timeline_section,
-                    monitor_section,
-                    sched_log_section,
-                    dump_section,
-                );
-                anyhow::bail!("{msg}");
-            } else if verdict.is_inconclusive() {
-                // Monitor reached the evaluator but had no signal —
-                // no samples, or data that failed the plausibility
-                // check (uninitialized guest memory). Record on
-                // `check_result` as an Inconclusive outcome so the
-                // sidecar / exit-code surface reflects "couldn't
-                // measure" rather than silently passing. Bailing
-                // would conflate Inconclusive with the Fail arm
-                // above; folding into the outcome stream lets the
-                // 4-state pipeline classify the run correctly.
-                check_result.merge(crate::assert::AssertResult::inconclusive(
-                    crate::assert::AssertDetail::new(
-                        crate::assert::DetailKind::Monitor,
-                        format!("monitor evaluation inconclusive: {}", verdict.summary),
-                    ),
-                ));
-            }
-        }
-
-        // (Per-phase telemetry + cross-RUN ext_metrics were populated on
-        // check_result above, BEFORE write_sidecar, so the persisted
-        // sidecar carries them — see the populate block at the sidecar
-        // write site. stats.phases feeds both the failure-message Timeline
-        // render and the test author's result.stats.phases; the sentinel-
-        // free renderer paints an empty metrics map as "no data".)
-
-        return Ok(check_result);
+/// Fold the verdict inputs (host-extract failures, the `post_vm` callback's
+/// Err, the cleanup-budget overrun, and the reproducer-mode `scx_bpf_error`
+/// matcher) into `check_result`. Returns whether the matcher contributed a
+/// mismatch detail (`matcher_mismatch`) so the caller wraps the failure Err
+/// with [`ScxBpfErrorMatcherMismatch`].
+#[allow(clippy::too_many_arguments)]
+fn evaluate_verdict_folds(
+    check_result: &mut AssertResult,
+    entry: &KtstrTestEntry,
+    result: &vmm::VmResult,
+    merged_assert: &crate::assert::Assert,
+    host_extract_failures: &[crate::assert::AssertDetail],
+    post_vm_err: Option<&anyhow::Error>,
+    sched_log_input: &str,
+    dump_section: &str,
+) -> bool {
+    // Fold host-side LlmExtract failures into the guest's
+    // AssertResult before the sidecar write so per-run stats
+    // tooling sees the host-extracted verdict, not the guest's
+    // placeholder pass(). Each host-side failure is appended as
+    // an `AssertDetail` exactly as if it had been raised inside
+    // the guest's `evaluate_checks` — same kind, same prose
+    // shape — so failure-rendering downstream is uniform across
+    // sources.
+    for detail in host_extract_failures {
+        check_result.merge(AssertResult::fail(detail.clone()));
     }
 
+    // Fold the host-side `post_vm` callback's Err into the
+    // verdict so it flows through the same failure path as
+    // host-extract failures and the guest-stamped check
+    // result. The downstream failure formatter renders the
+    // `--- scheduler log ---` / `--- sched_ext dump ---` /
+    // `--- monitor ---` sections + dispatches `repro_fn`
+    // (auto-repro) from this single point — no parallel
+    // handler needed.
+    if let Some(err) = post_vm_err {
+        check_result.merge(AssertResult::fail(crate::assert::AssertDetail::new(
+            crate::assert::DetailKind::Other,
+            format!("post_vm callback returned Err: {err:#}"),
+        )));
+    }
+
+    // Cleanup-budget enforcement. When the entry sets
+    // `cleanup_budget` and `collect_results` produced a measurement
+    // (i.e. `run_vm` returned normally — see
+    // `VmResult::cleanup_duration`), fold a failing
+    // `AssertDetail` into the test verdict if teardown overran the
+    // budget. Skipped when either side is `None`: an absent budget
+    // means the entry opted out, an absent measurement means the
+    // run never reached `collect_results` (BSP panic propagated
+    // through `?`, or any pre-BSP setup error returning an `Err`
+    // before `VmRunState` is constructed). Note: a host-watchdog
+    // timeout is NOT a `None` case — `run_bsp_loop` exits cleanly
+    // with `timed_out = true` and `collect_results` still
+    // populates `cleanup_duration` to `Some(_)`, per the field
+    // contract documented at `src/vmm/mod.rs` for
+    // `VmResult::cleanup_duration`. The surrounding error path
+    // (BSP panic propagation, pre-BSP setup `Err`) already
+    // produces a failure verdict in the absent-measurement case,
+    // so a budget check here would double-report.
+    //
+    // Contract: this check only fires inside the parse-success arm
+    // (the `if let Ok(mut check_result)` above) — i.e. when the
+    // guest-side test body emitted a parseable AssertResult into
+    // SHM or COM2. Tests whose body panics or fails to write a
+    // result skip budget enforcement entirely; the watchdog
+    // timeout / no-parseable-result branch below produces its own
+    // verdict in those cases. Tests that opt into
+    // `cleanup_budget_ms` MUST ensure their body returns
+    // `Ok(AssertResult)` (e.g. `Ok(AssertResult::pass())`) before
+    // teardown begins, otherwise the budget knob is silently
+    // inert.
+    if let (Some(budget), Some(measured)) = (entry.cleanup_budget, result.cleanup_duration)
+        && measured > budget
+    {
+        check_result.merge(AssertResult::fail(crate::assert::AssertDetail::new(
+            crate::assert::DetailKind::Other,
+            format!(
+                "vm cleanup overran budget: measured {:.3}s, budget {:.3}s. \
+                 Likely a regression in host-side teardown — investigate \
+                 the post-BSP-exit join/drain path \
+                 (`vmm::KtstrVm::collect_results`).",
+                measured.as_secs_f64(),
+                budget.as_secs_f64(),
+            ),
+        )));
+    }
+
+    // Reproducer-mode scx_bpf_error matcher. Runs the configured
+    // `expect_scx_bpf_error_contains` / `_matches` patterns against
+    // the combined scheduler log + sched_ext dump corpus — the two
+    // host-side surfaces where scx_bpf_error printk text lands.
+    // Matcher details (mismatch + misuse diagnostics) fold into
+    // `check_result.details` so the failure-message construction
+    // path renders them alongside the rest of the verdict.
+    //
+    // Gated on at least one matcher being configured so the
+    // common-path (no matcher) doesn't allocate the corpus string
+    // — the evaluator's own early-return covers the no-matcher
+    // case but only after the format! has already run.
+    let matcher_configured = merged_assert.expect_scx_bpf_error_contains.is_some()
+        || merged_assert.expect_scx_bpf_error_matches.is_some();
+    let matcher_details = if matcher_configured {
+        let matcher_corpus = format!("{sched_log_input}\n{dump_section}");
+        merged_assert.evaluate_scx_bpf_error_match(&matcher_corpus, entry.expect_err)
+    } else {
+        Vec::new()
+    };
+    let matcher_mismatch = !matcher_details.is_empty();
+    for d in matcher_details {
+        check_result.merge(AssertResult::fail(d));
+    }
+    matcher_mismatch
+}
+
+/// Populate per-phase telemetry + cross-RUN ext_metrics on `check_result`
+/// (folding the guest per_cgroup carriers into the host phase buckets,
+/// then the ext_metrics / pooled-rate / distribution re-pools) and return
+/// the POST-fold timeline built from `check_result.stats.phases`. Takes the
+/// host phase buckets and periodic series by reference so the two
+/// `std::mem::take`s drain them into the fold. Runs BEFORE the sidecar write
+/// so the persisted sidecar carries the populated stats.
+fn populate_run_stats_and_folded_timeline(
+    check_result: &mut AssertResult,
+    early_phase_buckets: &mut Vec<crate::assert::PhaseBucket>,
+    early_periodic_series: &crate::scenario::sample::SampleSeries,
+    stimulus_events: &[StimulusEvent],
+) -> Option<crate::timeline::Timeline> {
+    // Populate per-phase telemetry + cross-RUN ext_metrics on
+    // check_result BEFORE write_sidecar below: the sidecar is the
+    // durable telemetry every cross-run comparison reads, so it must
+    // carry stats.phases + stats.ext_metrics, not the empty defaults
+    // (previously these were filled AFTER write_sidecar, so the
+    // persisted sidecar dropped both). Phase buckets were built at
+    // evaluate_vm_result entry from result.periodic_series()
+    // (off-cadence on-demand / watchpoint captures excluded); reuse the
+    // pre-built vec + already-drained series rather than re-draining.
+    // The cross-RUN ext_metrics fill covers METRICS entries with a
+    // read_sample wire but no typed GauntletRow field
+    // (populate_run_ext_metrics) plus the phase-only metrics whose
+    // read_sample returns None — avg_imbalance_ratio, iteration_rate,
+    // system_time_ns / user_time_ns (populate_run_ext_metrics_from_phases).
+    // Without it those keys never reach the sidecar and
+    // `cargo ktstr stats compare` silently drops the rows.
+    // Fold the guest-collected per-phase per_cgroup carriers
+    // (parsed into check_result.stats.phases from the guest's
+    // AssertResult above) into the host-rebuilt buckets keyed by
+    // step_index, instead of clobbering them. The host buckets own the
+    // real window + metric folds (their per_cgroup is empty by
+    // construction); the guest carriers contribute only per_cgroup.
+    // Guest and host step_index are the identical 1-indexed value
+    // (step_idx + 1), so the pairing is exact. With no guest carriers
+    // (a run with no step-local cgroups) this returns the host buckets
+    // unchanged — the prior behavior.
+    let host_phase_buckets = std::mem::take(early_phase_buckets);
+    let guest_phase_buckets = std::mem::take(&mut check_result.stats.phases);
+    check_result.stats.phases = crate::assert::fold_guest_per_cgroup_into_host_buckets(
+        host_phase_buckets,
+        guest_phase_buckets,
+    );
+    crate::assert::populate_run_ext_metrics(
+        early_periodic_series,
+        &mut check_result.stats.ext_metrics,
+    );
+    crate::assert::populate_run_ext_metrics_from_phases(
+        &check_result.stats.phases,
+        &mut check_result.stats.ext_metrics,
+    );
+    // Pooled cross-cgroup CPU-time efficiency (the cross-cgroup re-pool):
+    // sum total_iterations / total_cpu_time over the MEASURED merged
+    // cgroups (those with on-CPU time; mirrors the per-cgroup None-on-zero)
+    // and derive iterations_per_cpu_sec. MUST run here — AFTER the
+    // cgroup-bearing merges (check_result.stats.cgroups is complete) and
+    // BEFORE the sidecar write — so the worst-by-polarity merge fold never
+    // sees its components. The trailing monitor-verdict merge below is
+    // verdict-only (inconclusive with empty stats), so it is safe to follow.
+    crate::assert::populate_run_pooled_iterations_per_cpu_sec(&mut check_result.stats);
+    // Run-level distributional re-pool (Distribution + WorstLowest kinds):
+    // pool the per-cgroup raw sample sets in stats.phases across phases +
+    // cgroups and recompute the wake / run-delay distributions, and select
+    // the lowest-wins iteration efficiencies from stats.cgroups counters.
+    // MUST run here for the same reason as the pooled rate above — AFTER the
+    // per-cgroup carrier fold + cgroup merges, BEFORE the sidecar write — so
+    // these ext_metrics keys are the sole source for the |_| None accessors.
+    crate::assert::populate_run_distribution_metrics(&mut check_result.stats);
+
+    // POST-fold timeline for this (guest-AssertResult) path: rebuild from
+    // the folded `check_result.stats.phases` so the per-cgroup sub-block
+    // and orphan not-measured markers render. Falls back to
+    // `early_timeline` (the monitor-only / phaseless fallback) when no
+    // folded buckets exist. The folded vec includes the orphan (0,0)
+    // carriers the pre-fold `early_timeline` omitted — surfaced as
+    // "window not measured" by `phase_from_bucket`'s shape detection.
+    (!check_result.stats.phases.is_empty()).then(|| {
+        crate::timeline::Timeline::from_phase_buckets(
+            &check_result.stats.phases,
+            stimulus_events,
+            &crate::timeline::TimelineContext::default(),
+        )
+    })
+}
+
+/// Render the failure-verdict message for a non-passing `check_result` and
+/// return it as the `anyhow::Error` the driver returns. Wraps the Error with
+/// [`ScxBpfErrorMatcherMismatch`] when `matcher_mismatch` so dispatch-time
+/// `expect_err` inversion bypasses a reproducer matcher mismatch. The
+/// precomputed section strings + the two failure-formatter closures are
+/// passed in so this renders identically to the driver's other branches.
+#[allow(clippy::too_many_arguments)]
+fn render_failure_verdict_message(
+    entry: &KtstrTestEntry,
+    result: &vmm::VmResult,
+    check_result: &AssertResult,
+    topo: &Topology,
+    sched_label: &str,
+    fingerprint_line: &str,
+    sched_log_section: &str,
+    dump_section: &str,
+    folded_timeline: Option<&crate::timeline::Timeline>,
+    early_timeline: Option<&crate::timeline::Timeline>,
+    tl_ctx: &crate::timeline::TimelineContext,
+    matcher_mismatch: bool,
+    repro_fn: &dyn Fn(&str) -> Option<String>,
+    bug_summary_line: &dyn Fn() -> String,
+    build_monitor_section: &dyn Fn() -> String,
+) -> anyhow::Error {
+    let output = &result.output;
+    let details = check_result
+        .failure_details()
+        .chain(check_result.inconclusive_details())
+        .chain(check_result.skip_details())
+        .map(|d| d.message.as_str())
+        .collect::<Vec<_>>()
+        .join("\n  ");
+    // Render info_notes in their own delineated section
+    // (mirrors --- stats --- / --- auto-repro --- pattern)
+    // so the structural details-vs-info separation that
+    // sidecar consumers rely on is also visible at the
+    // operator-facing failure-dump boundary. An undelineated
+    // append into the failures block would interleave
+    // failure messages with context lines and undo the
+    // split's "details = failures" invariant at the human
+    // surface.
+    let info_section = if check_result.info_notes.is_empty() {
+        String::new()
+    } else {
+        let lines: Vec<String> = check_result
+            .info_notes
+            .iter()
+            .map(|n| format!("  {}", n.message))
+            .collect();
+        format!("\n\n--- info ---\n{}", lines.join("\n"))
+    };
+    let repro = if entry.scheduler.has_active_scheduling() {
+        repro_fn(output)
+    } else {
+        None
+    };
+    let repro_section = repro
+        .map(|r| format!("\n\n--- auto-repro ---\n{r}"))
+        .unwrap_or_default();
+    let timeline_section = format_timeline_section(folded_timeline.or(early_timeline), tl_ctx);
+    // Per-cgroup telemetry is now built unconditionally per
+    // declared cgroup (collect_handles no longer gates it behind
+    // has_worker_checks), so an empty `cgroups` here means NO
+    // cgroup was declared (e.g. a host_only run), not "no worker
+    // check was configured" — suppress the section in that case.
+    let stats_section = if !check_result.stats.cgroups.is_empty() {
+        let s = &check_result.stats;
+        let mut lines = vec![format!(
+            "\n\n--- stats ---\n{} workers, {} cpus, {} migrations, worst_spread={:.1}%, worst_gap={}ms",
+            s.total_workers, s.total_cpus, s.total_migrations, s.worst_spread, s.worst_gap_ms,
+        )];
+        for (i, cg) in s.cgroups.iter().enumerate() {
+            lines.push(format!(
+                "  cg{}: workers={} cpus={} spread={} gap={}ms migrations={} iter={}",
+                i,
+                cg.num_workers,
+                cg.num_cpus,
+                // None = off-CPU% not measured (no worker with
+                // wall time); show "n/a" rather than a fake 0%.
+                cg.spread
+                    .map_or_else(|| "n/a".to_string(), |s| format!("{s:.1}%")),
+                cg.max_gap_ms,
+                cg.total_migrations,
+                cg.total_iterations,
+            ));
+        }
+        lines.join("\n")
+    } else {
+        String::new()
+    };
+    // Structural filter for the console-dump gate: match on the
+    // three scheduler-liveness `DetailKind` variants
+    // (`SchedulerCrashed` / `SchedulerExitedCleanly` /
+    // `SchedulerDiedUnknownReason`) below. Every scheduler-exit
+    // emit site in this crate tags its `AssertDetail` with one
+    // of those variants (see the ops.rs / scenario/mod.rs call
+    // sites plus the `format_sched_died_*` helpers in
+    // `assert.rs`), so filtering by kind is sufficient — the
+    // prior `is_scheduler_death()` prefix-match fallback was
+    // removed once every production emitter was audited as
+    // kind-tagging its details. `verbose()` forces the
+    // section on for operator debugging runs.
+    let console_section = if check_result.failure_details().any(|d| {
+        matches!(
+            d.kind,
+            crate::assert::DetailKind::SchedulerCrashed
+                | crate::assert::DetailKind::SchedulerExitedCleanly
+                | crate::assert::DetailKind::SchedulerDiedUnknownReason
+        )
+    }) || verbose()
+    {
+        let init_stage = classify_init_stage(result.guest_messages.as_ref());
+        format_console_diagnostics(&result.stderr, result.exit_code, init_stage)
+    } else {
+        String::new()
+    };
+    let monitor_section = build_monitor_section();
+    // Periodic-sample coverage gauge: fires when the entry
+    // configured `num_snapshots > 0`. Renders the
+    // fired/target ratio; suppressed when the entry did
+    // not request periodic capture so non-periodic tests
+    // produce uncluttered failure output.
+    let periodic_section = crate::test_support::output::format_periodic_samples_section(result);
+    // Temporal-assertion summary: aggregates every
+    // [`DetailKind::Temporal`] detail into a single block
+    // so a test author chasing a violated periodic-sample
+    // pattern sees the offending sample tag(s) at the top
+    // of the section instead of scrolling through scalar
+    // claim failures.
+    let temporal_section =
+        crate::test_support::output::format_temporal_assertions_section(check_result);
+    // Skip-only results take an early exit before this render
+    // path: the `check_result.is_skip()` guard in
+    // evaluate_vm_result returns Ok for an in-VM scenario skip,
+    // and host-side skips route through `record_skip_sidecar`
+    // upstream — so this block only sees Fail or Inconclusive.
+    // Render the lattice verdict
+    // accurately — "failed" for a hard Fail, "inconclusive"
+    // for a zero-denominator Inconclusive — so a CI human
+    // reading the dump can triage without inferring from
+    // exit code alone (dispatch.rs projects Inconclusive to
+    // exit code 2; the verdict word here mirrors that).
+    let verdict_word = if check_result.is_inconclusive() {
+        "inconclusive"
+    } else {
+        "failed"
+    };
+    let msg = format!(
+        "{}{}ktstr_test '{}'{} [topo={}] {verdict_word}:\n  {}{}{}{}{}{}{}{}{}{}{}",
+        fingerprint_line,
+        bug_summary_line(),
+        entry.name,
+        sched_label,
+        topo,
+        details,
+        info_section,
+        stats_section,
+        console_section,
+        timeline_section,
+        periodic_section,
+        temporal_section,
+        sched_log_section,
+        monitor_section,
+        dump_section,
+        repro_section,
+    );
+    // When the scx_bpf_error matcher contributed a mismatch
+    // detail, wrap the Err with [`ScxBpfErrorMatcherMismatch`]
+    // so the dispatch-time expect_err inversion bypasses this
+    // failure (a reproducer with a matcher mismatch fails the
+    // test even though expect_err = true would normally invert
+    // a failure into a pass). When the matcher matched (or was
+    // unset), the normal expect_err inversion path applies.
+    let err = anyhow::anyhow!("{msg}");
+    if matcher_mismatch {
+        err.context(ScxBpfErrorMatcherMismatch)
+    } else {
+        err
+    }
+}
+
+/// Render the no-parseable-result failure message (no AssertResult arrived via
+/// the bulk port or COM2) and return it as the `anyhow::Error` the driver
+/// returns. Covers both the timed-out arm and the no-result/crash arm. The
+/// precomputed section strings + the two failure-formatter closures are passed
+/// in so this renders identically to the parse-success failure branch.
+#[allow(clippy::too_many_arguments)]
+fn render_no_result_message(
+    entry: &KtstrTestEntry,
+    result: &vmm::VmResult,
+    topo: &Topology,
+    sched_label: &str,
+    fingerprint_line: &str,
+    sched_log_section: &str,
+    dump_section: &str,
+    early_timeline: Option<&crate::timeline::Timeline>,
+    tl_ctx: &crate::timeline::TimelineContext,
+    post_vm_err: Option<&anyhow::Error>,
+    repro_fn: &dyn Fn(&str) -> Option<String>,
+    bug_summary_line: &dyn Fn() -> String,
+    build_monitor_section: &dyn Fn() -> String,
+) -> anyhow::Error {
+    let output = &result.output;
     // No parseable result — no AssertResult found via the bulk port
     // or COM2. With an scx scheduler under test this typically
     // means the scheduler exited (crash, BPF verifier reject,
@@ -2122,7 +2174,9 @@ fn evaluate_vm_result(
             String::new()
         };
 
-    let timeline_section = build_timeline_section();
+    // No-guest-AssertResult path: no guest carriers were folded, so the
+    // pre-fold early_timeline is authoritative (it has no per_cgroup either).
+    let timeline_section = format_timeline_section(early_timeline, tl_ctx);
 
     // Build monitor section for error paths where neither the bulk
     // port nor COM2 had a parseable result.
@@ -2179,16 +2233,19 @@ fn evaluate_vm_result(
             "\n\n--- watchdog ---\n\
              elapsed={:?} (VM run wall-clock)\n\
              vm_timeout={:?} (host watchdog deadline = max(watchdog_timeout, \
-             duration, 1s) + vCPU-scaled vm_boot_headroom [+ 30s cold-BTF \
-             budget for bpf_map_write tests])\n\
+             duration, 1s) + overcommit-scaled vCPU vm_boot_headroom [+ 30s \
+             cold-BTF budget for bpf_map_write tests])\n\
              watchdog_timeout={:?} (scx_sched.watchdog_timeout override)\n\
              duration={:?} (workload duration)\n\
              hint: if the test body needs more wall time, increase \
              duration (the `duration` field on `KtstrTestEntry` / \
              `#[ktstr_test(duration_ms = ...)]`); the VM timeout adds \
-             vCPU-scaled boot headroom on top of max(watchdog_timeout, \
-             duration, 1s), so raising duration also extends the host \
-             watchdog deadline",
+             vCPU-scaled boot headroom — itself multiplied by the host \
+             overcommit ratio (vCPUs / allowed host CPUs, clamped) so an \
+             oversubscribed boot gets proportionally longer — on top of \
+             max(watchdog_timeout, duration, 1s). Raising duration extends \
+             the deadline; widening the process cpuset shrinks the \
+             overcommit multiplier",
             result.duration, vm_timeout, entry.watchdog_timeout, entry.duration,
         );
         let timeout_reason = {
@@ -2220,7 +2277,7 @@ fn evaluate_vm_result(
             monitor_section,
             repro_section,
         );
-        anyhow::bail!("{msg}");
+        return anyhow::anyhow!("{msg}");
     }
 
     let reason = if let Some(ref guest_crash) = result.crash_message {
@@ -2258,13 +2315,326 @@ fn evaluate_vm_result(
         monitor_section,
         repro_section,
     );
-    anyhow::bail!("{msg}")
+    anyhow::anyhow!("{msg}")
+}
+
+/// Evaluate monitor data against thresholds for the parse-success path. Returns
+/// `Err` (the rendered `--- monitor ---` failure message) when the verdict
+/// fails, folds an Inconclusive `AssertResult` into `check_result` when the
+/// verdict is inconclusive, and returns `Ok(())` otherwise (including when no
+/// scheduler is active or no thresholds are configured). Driven by `?` in the
+/// caller so the fail arm propagates as a verdict identically to the prior
+/// inline `bail!`.
+#[allow(clippy::too_many_arguments)]
+fn eval_monitor_thresholds(
+    check_result: &mut AssertResult,
+    entry: &KtstrTestEntry,
+    result: &vmm::VmResult,
+    merged_assert: &crate::assert::Assert,
+    topo: &Topology,
+    sched_label: &str,
+    fingerprint_line: &str,
+    sched_log_section: &str,
+    dump_section: &str,
+    folded_timeline: Option<&crate::timeline::Timeline>,
+    early_timeline: Option<&crate::timeline::Timeline>,
+    tl_ctx: &crate::timeline::TimelineContext,
+    bug_summary_line: &dyn Fn() -> String,
+) -> Result<()> {
+    // Evaluate monitor data against thresholds when a scheduler is running.
+    // Without a scheduler (EEVDF), monitor reads rq data that may be
+    // uninitialized or irrelevant — skip evaluation in that case.
+    //
+    // Skip early monitor warmup samples: during boot, BPF verification,
+    // and initramfs unpacking the scheduler tick may not fire for hundreds
+    // of milliseconds. These transient stalls are real but not indicative
+    // of scheduler bugs.
+    if entry.scheduler.has_active_scheduling()
+        && merged_assert.has_monitor_thresholds()
+        && let Some(ref monitor) = result.monitor
+    {
+        let eval_report = reporting::trim_settle_samples(monitor);
+        let thresholds = merged_assert.monitor_thresholds();
+        let verdict = thresholds.evaluate(&eval_report);
+        if verdict.is_fail() {
+            let details = verdict.details.join("\n  ");
+            let timeline_section =
+                format_timeline_section(folded_timeline.or(early_timeline), tl_ctx);
+            let monitor_section = reporting::format_monitor_section(monitor, merged_assert);
+            let msg = format!(
+                "{}{}ktstr_test '{}'{} [topo={}] {ERR_MONITOR_FAILED_AFTER_SCENARIO}:\n  {}{}{}{}{}",
+                fingerprint_line,
+                bug_summary_line(),
+                entry.name,
+                sched_label,
+                topo,
+                details,
+                timeline_section,
+                monitor_section,
+                sched_log_section,
+                dump_section,
+            );
+            anyhow::bail!("{msg}");
+        } else if verdict.is_inconclusive() {
+            // Monitor reached the evaluator but had no signal —
+            // no samples, or data that failed the plausibility
+            // check (uninitialized guest memory). Record on
+            // `check_result` as an Inconclusive outcome so the
+            // sidecar / exit-code surface reflects "couldn't
+            // measure" rather than silently passing. Bailing
+            // would conflate Inconclusive with the Fail arm
+            // above; folding into the outcome stream lets the
+            // 4-state pipeline classify the run correctly.
+            check_result.merge(crate::assert::AssertResult::inconclusive(
+                crate::assert::AssertDetail::new(
+                    crate::assert::DetailKind::Monitor,
+                    format!("monitor evaluation inconclusive: {}", verdict.summary),
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Evaluate a VM result and produce the appropriate error or Ok.
+///
+/// This is the core result-evaluation logic, extracted from
+/// `run_ktstr_test_inner` so that error message formatting can be tested
+/// without booting a VM. The `repro_fn` callback handles auto-repro
+/// (which requires a second VM boot) when provided. `payload_metrics`
+/// is the per-invocation accumulator drained from the guest SHM ring;
+/// the sidecar writer receives it verbatim so stats tooling sees one
+/// entry per `ctx.payload(X).run()` / `.spawn().wait()`.
+///
+/// `host_extract_failures` carries the universal-invariant +
+/// model-load failures produced by [`host_side_llm_extract`] when
+/// the run's `OutputFormat::LlmExtract` payloads were resolved on
+/// the host. The folded details are appended to the test's
+/// AssertResult so a host-side LlmExtract failure surfaces in the
+/// same failure-rendering pipeline as a guest-emitted check failure.
+#[allow(clippy::too_many_arguments)]
+fn evaluate_vm_result(
+    entry: &KtstrTestEntry,
+    result: &vmm::VmResult,
+    merged_assert: &crate::assert::Assert,
+    stimulus_events: &[StimulusEvent],
+    payload_metrics: &[crate::test_support::PayloadMetrics],
+    host_extract_failures: &[crate::assert::AssertDetail],
+    topo: &Topology,
+    repro_fn: &dyn Fn(&str) -> Option<String>,
+    // Optional Err captured from `KtstrTestEntry::post_vm` so the
+    // host-side assertion failure flows through the SAME failure
+    // path as a guest-side `result.success=false`: same scheduler
+    // log / sched_ext dump / monitor diagnostic, same auto-repro
+    // dispatch. Folded into `check_result` as an AssertDetail
+    // below the parse-success arm so the existing failure-message
+    // construction picks it up without a parallel renderer.
+    post_vm_err: Option<&anyhow::Error>,
+) -> Result<AssertResult> {
+    let (early_periodic_series, mut early_phase_buckets, early_timeline) =
+        precompute_early_series(result, stimulus_events);
+
+    let output = &result.output;
+    // Concatenate bulk-port `MSG_TYPE_SCHED_LOG` chunks then run
+    // the marker-pair extractor on the merged stream — pre-bulk-port
+    // migration the markers travelled in `output` (COM2). Either
+    // source feeds `parse_sched_output` byte-for-byte; falling back
+    // to `output` when the bulk-port drain has no SchedLog frames
+    // covers verifier-only paths.
+    let sched_log_merged = crate::verifier::concat_sched_log_chunks(result.guest_messages.as_ref());
+    let sched_log_input: &str = if !sched_log_merged.is_empty() {
+        &sched_log_merged
+    } else {
+        output
+    };
+    let (sched_label, raw_dump, dump_section, fingerprint_line, tl_ctx) =
+        precompute_failure_sections(entry, result, sched_log_input, topo);
+    let sched_log_section = parse_sched_output(sched_log_input)
+        .map(|s| {
+            let collapsed = crate::verifier::collapse_cycles(s);
+            let is_verifier = collapsed.contains("processed") && collapsed.contains("insns");
+            let lines: Vec<&str> = collapsed.lines().collect();
+            let tail = if !is_verifier && lines.len() > 200 {
+                let skipped = lines.len() - 200;
+                format!(
+                    "[{skipped} lines truncated]\n{}",
+                    lines[lines.len() - 200..].join("\n")
+                )
+            } else {
+                collapsed
+            };
+            format!("\n\n--- scheduler log ---\n{tail}")
+        })
+        .unwrap_or_default();
+    // Hoist the first actionable `scx_bpf_error`-class line to the
+    // TOP of the failure message (above the existing noisy sections
+    // like sched_log / sched_ext dump / monitor). Without this hint
+    // the test author had to scroll past ~200 lines of trace_pipe
+    // dump output to find the line that explains why the scheduler
+    // exited. Extraction is suppressed when there is nothing
+    // actionable to surface so passing tests stay quiet.
+    //
+    // Gated behind a closure: every failure return path below renders
+    // exactly one failure message and calls the closure exactly once,
+    // and a passing test takes the `return Ok(check_result)` at the
+    // end of the parse-success arm without invoking any failure
+    // formatter — so the `extract_bug_summary` scan over sched_log +
+    // dump never runs on the pass path. The eager `match` this
+    // replaces ran the scan unconditionally on every test, paying the
+    // ANSI strip + line walk for passing tests that would never
+    // render the result.
+    let bug_summary_line = || -> String {
+        match crate::test_support::output::extract_bug_summary(sched_log_input, &raw_dump) {
+            Some(text) => {
+                if crate::cli::stderr_color() {
+                    format!("\x1b[1;31mBUG SUMMARY:\x1b[0m {text}\n")
+                } else {
+                    format!("BUG SUMMARY: {text}\n")
+                }
+            }
+            None => String::new(),
+        }
+    };
+
+    // Section builders shared by every error branch in this function.
+    // The timeline section is rendered via `format_timeline_section` per
+    // branch (the guest-AssertResult path passes the post-fold per-cgroup
+    // timeline; other paths pass `early_timeline`). Monitor only reports when
+    // an active scheduler exposes rq data (EEVDF reads would be junk).
+    let build_monitor_section = || -> String {
+        if entry.scheduler.has_active_scheduling()
+            && let Some(ref monitor) = result.monitor
+        {
+            reporting::format_monitor_section(monitor, merged_assert)
+        } else {
+            String::new()
+        }
+    };
+
+    if let Ok(mut check_result) = parse_assert_result_from_drain(result.guest_messages.as_ref()) {
+        let matcher_mismatch = evaluate_verdict_folds(
+            &mut check_result,
+            entry,
+            result,
+            merged_assert,
+            host_extract_failures,
+            post_vm_err,
+            sched_log_input,
+            &dump_section,
+        );
+
+        let folded_timeline = populate_run_stats_and_folded_timeline(
+            &mut check_result,
+            &mut early_phase_buckets,
+            &early_periodic_series,
+            stimulus_events,
+        );
+
+        // Write sidecar before checking pass/fail so both outcomes are captured.
+        // A sidecar write failure is logged but not propagated: the test
+        // verdict itself is still valid — only post-run stats tooling
+        // loses visibility.
+        let args: Vec<String> = std::env::args().collect();
+        let work_type =
+            super::args::extract_work_type_arg(&args).unwrap_or_else(|| "SpinWait".to_string());
+        if let Err(e) = write_sidecar(
+            entry,
+            result,
+            stimulus_events,
+            &check_result,
+            &work_type,
+            payload_metrics,
+        ) {
+            eprintln!("ktstr_test: {e:#}");
+        }
+
+        // An in-VM scenario skip (AssertResult::skip — e.g. the booted
+        // topology is below the scenario's CPU/LLC floor) is a
+        // legitimate skip, NOT a failure. Project it to Ok here so the
+        // exit-code path maps it to EXIT_PASS (matching host-side skips
+        // routed through record_skip_sidecar) rather than falling into
+        // the `!is_pass()` failure-render path below (a skip-only result
+        // is not is_pass), which would mis-report a skip as a test
+        // failure. The sidecar was already written above, so the skip
+        // is recorded.
+        if check_result.is_skip() {
+            return Ok(check_result);
+        }
+
+        if !check_result.is_pass() {
+            return Err(render_failure_verdict_message(
+                entry,
+                result,
+                &check_result,
+                topo,
+                &sched_label,
+                &fingerprint_line,
+                &sched_log_section,
+                &dump_section,
+                folded_timeline.as_ref(),
+                early_timeline.as_ref(),
+                &tl_ctx,
+                matcher_mismatch,
+                repro_fn,
+                &bug_summary_line,
+                &build_monitor_section,
+            ));
+        }
+
+        eval_monitor_thresholds(
+            &mut check_result,
+            entry,
+            result,
+            merged_assert,
+            topo,
+            &sched_label,
+            &fingerprint_line,
+            &sched_log_section,
+            &dump_section,
+            folded_timeline.as_ref(),
+            early_timeline.as_ref(),
+            &tl_ctx,
+            &bug_summary_line,
+        )?;
+
+        // (Per-phase telemetry + cross-RUN ext_metrics were populated on
+        // check_result above, BEFORE write_sidecar, so the persisted sidecar
+        // carries them — see the populate block at the sidecar write site. The
+        // failure-message Timeline on THIS path is `folded_timeline`, built
+        // from the POST-fold `check_result.stats.phases` so the per-cgroup
+        // sub-block renders and orphan (0,0)-window carriers surface as "window
+        // not measured" rather than being omitted — the
+        // `early_timeline` built pre-fold is the fallback only for the
+        // no-guest-AssertResult path below. The post-fold `stats.phases` is what
+        // the test author reads and what the sidecar persists; the
+        // sentinel-free renderer paints an empty metrics map as "no data".)
+
+        return Ok(check_result);
+    }
+
+    Err(render_no_result_message(
+        entry,
+        result,
+        topo,
+        &sched_label,
+        &fingerprint_line,
+        &sched_log_section,
+        &dump_section,
+        early_timeline.as_ref(),
+        &tl_ctx,
+        post_vm_err,
+        repro_fn,
+        &bug_summary_line,
+        &build_monitor_section,
+    ))
 }
 
 #[cfg(test)]
 mod eval_tests;
 #[cfg(test)]
 mod eval_tests_eval;
+#[cfg(test)]
+mod eval_tests_inner;
 #[cfg(test)]
 mod eval_tests_llm;
 #[cfg(test)]

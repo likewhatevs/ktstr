@@ -25,7 +25,8 @@ use super::super::config::SchedPolicy;
 ///   leader stats), so reading it from a thread worker reports
 ///   the test runner's stats, not the worker's. The
 ///   `/proc/self/task/<tid>` path returns the per-task
-///   schedstat stored on `task->sched_info`. Available on Linux
+///   schedstat: field 1 = `task->se.sum_exec_runtime` (on-CPU ns),
+///   fields 2/3 = `task->sched_info.run_delay`/`pcount`. Available on Linux
 ///   2.6+; ktstr's 6.16 kernel floor guarantees it.
 ///
 /// Returns `None` when the file cannot be opened (kernel built
@@ -84,12 +85,28 @@ pub(super) fn parse_schedstat_line(data: &str) -> Option<(u64, u64, u64)> {
 /// `CONFIG_SCHEDSTATS`.
 pub(super) fn warn_schedstat_unavailable_once() {
     static WARNED: std::sync::Once = std::sync::Once::new();
-    WARNED.call_once(|| {
+    if claim_warn_slot(&WARNED) {
         eprintln!(
             "workload: /proc/self/schedstat unavailable (CONFIG_SCHEDSTATS off?); \
              schedstat_* fields in WorkerReport will be zero"
         );
-    });
+    }
+}
+
+/// Claim the one-shot warning slot guarded by `once`. Returns `true`
+/// exactly once across the lifetime of a given `Once` (the first
+/// call), `false` on every subsequent call. This is the testable
+/// core of the "warn at most once" gate: the caller emits its
+/// warning only when this returns `true`, so a regression that
+/// dropped the gate (warning on every call) would make this return
+/// `true` repeatedly and trip the unit test. Backed by
+/// [`std::sync::Once::call_once`] so the first-call determination is
+/// race-free across the worker threads that share a process-wide
+/// `Once`.
+pub(super) fn claim_warn_slot(once: &std::sync::Once) -> bool {
+    let mut first = false;
+    once.call_once(|| first = true);
+    first
 }
 
 /// Aggregate per-node page counts from `/proc/self/numa_maps`.
@@ -104,6 +121,44 @@ pub(super) fn read_numa_maps_pages() -> BTreeMap<usize, u64> {
     for entry in &entries {
         for (&node, &count) in &entry.node_pages {
             *totals.entry(node).or_insert(0) += count;
+        }
+    }
+    totals
+}
+
+/// Per-node page counts for a SINGLE VMA — the one whose `/proc/self/numa_maps`
+/// start address equals `region_addr`. Returns empty when no VMA matches (the
+/// region was unmapped, never faulted, or the address is wrong).
+///
+/// Whole-process [`read_numa_maps_pages`] is dominated by the binary/libc/stack
+/// pages COW-inherited from the parent BEFORE the worker called
+/// `set_mempolicy` — pages the policy never placed (`set_mempolicy` governs only
+/// future faults). For a `MemPolicy` locality test the metric must reflect ONLY
+/// the policy-governed allocation, so scope the count to the worker's own
+/// working-set region (an `mmap` first-touched under the policy on the
+/// cpuset-confined node). The region must still be mapped when this runs.
+pub(super) fn read_numa_maps_region_pages(region_addr: u64) -> BTreeMap<usize, u64> {
+    let content = match std::fs::read_to_string("/proc/self/numa_maps") {
+        Ok(c) => c,
+        Err(_) => return BTreeMap::new(),
+    };
+    sum_region_node_pages(&crate::assert::parse_numa_maps(&content), region_addr)
+}
+
+/// Sum per-node page counts across only the parsed numa_maps entries whose VMA
+/// start address equals `region_addr`. Pure core of
+/// [`read_numa_maps_region_pages`], split out so the VMA-address selection is
+/// unit-testable without `/proc`.
+fn sum_region_node_pages(
+    entries: &[crate::assert::NumaMapsEntry],
+    region_addr: u64,
+) -> BTreeMap<usize, u64> {
+    let mut totals: BTreeMap<usize, u64> = BTreeMap::new();
+    for entry in entries {
+        if entry.addr == region_addr {
+            for (&node, &count) in &entry.node_pages {
+                *totals.entry(node).or_insert(0) += count;
+            }
         }
     }
     totals
@@ -364,4 +419,40 @@ pub(super) fn set_sched_policy(pid: libc::pid_t, policy: SchedPolicy) -> Result<
         anyhow::bail!("sched_setscheduler: {}", std::io::Error::last_os_error());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::assert::parse_numa_maps;
+
+    /// The region-scoped read must sum `N<node>=` ONLY for the VMA whose start
+    /// address equals `region_addr`, excluding every other (COW-inherited) VMA —
+    /// this is what makes `page_locality` measure the policy-governed allocation
+    /// rather than the whole-process RSS.
+    #[test]
+    fn region_pages_scopes_to_matching_vma() {
+        // A decoy inherited file-backed VMA at 0x400000 plus the policy-governed
+        // anon region VMA at 0x7f0000000000.
+        let content = "\
+00400000 default file=/usr/bin/x mapped=300 N0=200 N1=100\n\
+7f0000000000 default anon=16384 dirty=16384 N0=16384\n";
+        let entries = parse_numa_maps(content);
+        let region = sum_region_node_pages(&entries, 0x7f00_0000_0000);
+        assert_eq!(region.get(&0), Some(&16384), "region node-0 pages summed");
+        assert_eq!(region.get(&1), None, "region has no node-1 pages");
+        let total: u64 = region.values().sum();
+        assert_eq!(
+            total, 16384,
+            "decoy file VMA (N0=200,N1=100) must be excluded from the region scope"
+        );
+    }
+
+    /// No VMA matches `region_addr` -> empty map. The caller turns this into
+    /// total=0 -> page_locality 0.0 -> a hard FAIL, never a vacuous pass.
+    #[test]
+    fn region_pages_empty_when_no_vma_matches() {
+        let entries = parse_numa_maps("00400000 default anon=10 N0=10\n");
+        assert!(sum_region_node_pages(&entries, 0xdead_beef).is_empty());
+    }
 }

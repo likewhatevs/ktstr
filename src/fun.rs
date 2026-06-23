@@ -749,8 +749,14 @@ fn funify_json_with_context(
 // Petname dictionary
 // ---------------------------------------------------------------------------
 //
-// 272 adjectives x 264 animals = 71 808 distinct (adjective, animal)
-// pairs. Words are common-language, public-domain, single-word
+// 272 adjectives x 264 animals are listed, but `petname_for` masks
+// each index with `& 0xff` (0..=255) before the `% .len()` modulo,
+// so only the first 256 of each are reachable: 256 x 256 = 65 536
+// selectable (adjective, animal) pairs (the count the module doc on
+// `petname_for` bases its birthday-collision math on). Entries past
+// index 255 — the last 16 adjectives and last 8 animals — are
+// currently unreachable. Words are common-language, public-domain,
+// single-word
 // (no spaces or hyphens) so the rendered name is always a clean
 // `adjective-animal` token suitable for downstream tooling.
 //

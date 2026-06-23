@@ -59,8 +59,13 @@ needs both views from the same series.
   the stats axis: `stats_live_u64(path)` / `_i64(path)` / `_f64(path)`.
 - `bpf_map(map_name)` / `stats_path(path)` — typed auto-projection
   helpers (see [Auto-projection](#auto-projection)).
-- `by_phase()` — groups samples by phase, keyed by `u16` step_index
-  (`BTreeMap<u16, Vec<Sample>>`).
+- `by_stamped_phase()` — groups samples by the raw bridge-stamped
+  scenario phase, keyed by `u16` step_index (`BTreeMap<u16,
+  Vec<Sample>>`); `0` = BASELINE, `1..=N` = Step ordinals. Prefer
+  `by_stimulus_phase(stimulus_events)` when a stimulus timeline is
+  available — it re-derives the phase from each sample's
+  `boundary_offset_ms` and is immune to deferred-fire bursts that
+  collapse stamped phases.
 
 The per-phase reducers (`counter_delta_per_phase`, `last_per_phase`,
 `first_per_phase`, `value_at_phase(phase)`, `phase(p)`) and

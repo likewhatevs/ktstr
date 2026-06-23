@@ -18,7 +18,10 @@ use vm_memory::{Bytes, GuestAddress, GuestMemory, GuestMemoryMmap};
 
 use super::KtstrVm;
 use super::initramfs_cache::{BaseKey, BaseRef, get_or_build_base, get_or_compress_base_shm};
-use super::memory_budget::{MemoryBudget, initramfs_min_memory_mib, read_kernel_init_size};
+use super::memory_budget::{
+    MemoryBudget, TmpfsFraction, initramfs_min_memory_mib, read_kernel_init_size,
+    read_kernel_version, read_kernel_version_from_metadata_sidecar,
+};
 use super::pi_mutex::PiMutex;
 use super::{disk_config, disk_template, host_topology, initramfs, virtio_blk, virtio_net};
 
@@ -182,8 +185,11 @@ fn base_guest_cmdline(arch_extra: &str) -> String {
     // __vm_enough_memory rejects a single mapping larger than free RAM,
     // so on a deferred-sized guest the /init aborts with "memory
     // allocation of N bytes failed" before the workload runs. ALWAYS mode
-    // admits the mapping; the small resident set stays within guest RAM
-    // so no OOM-kill follows. (arm64's arch_mm_preinit auto-enables
+    // admits the mapping; the resident set then stays within guest RAM
+    // so no OOM-kill follows (a coverage-instrumented /init's larger
+    // resident set — the live __llvm_prf_cnts + __llvm_prf_data
+    // sections — is covered by the memory_budget coverage reserve).
+    // (arm64's arch_mm_preinit auto-enables
     // ALWAYS only for PAGE_SIZE>=16K with <=128 physpages.)
     format!(
         "console=ttyS0 nomodules mitigations=off random.trust_cpu=on \
@@ -193,6 +199,26 @@ fn base_guest_cmdline(arch_extra: &str) -> String {
          sysctl.kernel.task_delayacct=1 sysctl.vm.overcommit_memory=1 \
          {arch_extra} KTSTR_GUEST=1"
     )
+}
+
+/// NUMA-balancing cmdline token. The kernel handler
+/// `setup_numabalancing` (mm/mempolicy.c) accepts ONLY the strings
+/// "enable" / "disable" via `strcmp`; any other value (e.g. "0")
+/// leaves the parse result 0, logs `pr_warn("Unable to parse
+/// numa_balancing=")`, and is IGNORED — so the kernel keeps its
+/// compiled CONFIG_NUMA_BALANCING_DEFAULT_ENABLED state instead of
+/// being turned off. Memory-only (CXL) topologies want balancing ON to
+/// migrate pages toward CPU-bearing nodes; the uniform/default case
+/// wants it OFF to keep scheduler measurements free of migration
+/// noise. Extracted (like `base_guest_cmdline`) so the x86_64
+/// (`build_guest_cmdline`) and aarch64 (`finish_aarch64_setup`) sites
+/// share one definition and a host unit test can pin both branches.
+fn numa_balancing_cmdline_token(topology: &crate::vmm::topology::Topology) -> &'static str {
+    if topology.has_memory_only_nodes() {
+        " numa_balancing=enable"
+    } else {
+        " numa_balancing=disable"
+    }
 }
 
 /// Pure helper: assemble the `extras` slice and the [`BaseKey`] from
@@ -744,7 +770,7 @@ impl KtstrVm {
         // Try COW overlay: mmap compressed base from SHM fd directly
         // into guest memory, sharing physical pages across VMs.
         let t0 = Instant::now();
-        let cow_guard = self.try_cow_overlay(&vm.guest_mem, key, lz4_base.len(), load_addr);
+        let cow_guard = Self::try_cow_overlay(&vm.guest_mem, key, lz4_base.len(), load_addr);
         // IMPORTANT: stash the guard on the VM IMMEDIATELY — before
         // any fallible operation below. If a `?` unwinds this function
         // with a locally-held guard still on the stack, the guard
@@ -800,6 +826,103 @@ impl KtstrVm {
         Ok(total_compressed as u32)
     }
 
+    /// Select the guest rootfs tmpfs fraction for the budget formula by
+    /// reading the kernel's version and gating on the honoring versions
+    /// (mainline 6.18+ or a stable series at/above its backport floor)
+    /// via [`TmpfsFraction::for_kernel_version`].
+    ///
+    /// Mirrors [`Self::init_payload_coverage_reserve`]: a `&self` accessor
+    /// that derives a conservatively-defaulting value threaded into
+    /// [`MemoryBudget`] at every budget call site. The version is read
+    /// from the image's own setup_header where it is embedded
+    /// ([`read_kernel_version`], the x86_64 bzImage), falling
+    /// back to the cache `metadata.json` sidecar
+    /// ([`read_kernel_version_from_metadata_sidecar`]) for images without
+    /// an embedded version — notably the aarch64 `Image`. Both sources
+    /// return `None` on any uncertainty, so
+    /// [`TmpfsFraction::for_kernel_version`] yields the safe
+    /// [`TmpfsFraction::Half`] unless the kernel is positively confirmed
+    /// to honor the token — 90% is never taken on a guess.
+    fn tmpfs_fraction(&self) -> TmpfsFraction {
+        let version = read_kernel_version(&self.kernel)
+            .or_else(|| read_kernel_version_from_metadata_sidecar(&self.kernel));
+        TmpfsFraction::for_kernel_version(version)
+    }
+
+    /// Probe the `/init` payload for LLVM coverage instrumentation and,
+    /// when instrumented, compute the extra resident memory the
+    /// instrumented runtime needs.
+    ///
+    /// Returns `(instrumented, reserve_bytes)`:
+    /// - `instrumented` is `true` when the payload's `.symtab` carries
+    ///   `__llvm_profile_write_buffer` / `__llvm_profile_get_size_for_buffer`
+    ///   (the same function-shaped symbols
+    ///   [`crate::test_support::try_flush_profraw`] resolves; chosen over
+    ///   the bare `__llvm_profile_runtime` marker because the marker can
+    ///   be dead-stripped entirely under `--gc-sections` while these
+    ///   function symbols are kept alive by that flush call's link
+    ///   reference). This probes the
+    ///   PAYLOAD bytes (`self.init_binary`), NOT the host process — the
+    ///   guest `/init` may be instrumented even when the host VMM binary
+    ///   is not (and vice versa), so
+    ///   `current_binary_is_coverage_instrumented` (which probes
+    ///   `/proc/self/exe`) is the wrong signal here.
+    /// - `reserve_bytes` is the summed `sh_size` of the payload's
+    ///   `__llvm_prf_cnts` + `__llvm_prf_data` sections — the live
+    ///   coverage-counter and profile-metadata arrays. This is the floor
+    ///   on the heap buffer `__llvm_profile_write_buffer` serializes into
+    ///   at flush time. `0` (and `instrumented = false`) on any failure
+    ///   path (no payload, unreadable file, ELF parse error, symbols
+    ///   absent) — the conservative outcome, leaving the budget at its
+    ///   non-instrumented size.
+    ///
+    /// Reads the payload via `memmap2::Mmap` (matching the
+    /// `try_flush_profraw` idiom) so a ~1 GiB coverage binary is not
+    /// copied into the heap just to read its section table.
+    fn init_payload_coverage_reserve(&self) -> (bool, u64) {
+        let Some(path) = self.init_binary.as_ref() else {
+            return (false, 0);
+        };
+        let Ok(file) = std::fs::File::open(path) else {
+            return (false, 0);
+        };
+        // SAFETY: `path` is the test-author-supplied `/init` payload;
+        // ktstr never writes to it during a VM build, satisfying
+        // memmap2's no-concurrent-modification invariant. The fd pins
+        // the inode for the mapping's lifetime.
+        let Ok(mmap) = (unsafe { memmap2::Mmap::map(&file) }) else {
+            return (false, 0);
+        };
+        let Ok(elf) = goblin::elf::Elf::parse(&mmap) else {
+            return (false, 0);
+        };
+
+        let vaddrs = crate::test_support::find_symbol_vaddrs(
+            &elf,
+            &[
+                "__llvm_profile_write_buffer",
+                "__llvm_profile_get_size_for_buffer",
+            ],
+        );
+        let instrumented = vaddrs.iter().any(|v| matches!(v, Some(va) if *va != 0));
+        if !instrumented {
+            return (false, 0);
+        }
+
+        // Sum the live profile sections' resident sizes. `sh_size` is
+        // the in-memory size (the counter/metadata arrays the runtime
+        // keeps resident and serializes at flush time).
+        let mut reserve_bytes: u64 = 0;
+        for sh in &elf.section_headers {
+            if let Some(name) = elf.shdr_strtab.get_at(sh.sh_name)
+                && (name == "__llvm_prf_cnts" || name == "__llvm_prf_data")
+            {
+                reserve_bytes = reserve_bytes.saturating_add(sh.sh_size);
+            }
+        }
+        (true, reserve_bytes)
+    }
+
     /// Join the initramfs thread and load the result into guest memory.
     /// Memory must already be allocated (non-deferred path). Validates
     /// that allocated memory is sufficient for the initramfs.
@@ -844,11 +967,16 @@ impl KtstrVm {
         let lz4_base = self.get_or_compress_base(base_bytes, &key)?;
         let lz4_suffix = initramfs::lz4_legacy_compress(&suffix);
         let compressed_size = lz4_base.len() + lz4_suffix.len();
-        let kernel_init_size = read_kernel_init_size(&self.kernel).unwrap_or(0) as u64;
+        let kernel_init_size = read_kernel_init_size(&self.kernel)?;
+        let (init_coverage_instrumented, instrumented_reserve_bytes) =
+            self.init_payload_coverage_reserve();
         let budget = MemoryBudget {
             uncompressed_initramfs_bytes: uncompressed_size as u64,
             compressed_initrd_bytes: compressed_size as u64,
             kernel_init_size,
+            init_coverage_instrumented,
+            instrumented_reserve_bytes,
+            tmpfs_fraction: self.tmpfs_fraction(),
         };
         let min_mib = initramfs_min_memory_mib(&budget);
         if memory_mib < min_mib {
@@ -916,17 +1044,24 @@ impl KtstrVm {
 
         // Compute memory from actual sizes, honoring the
         // topology-requested minimum when non-zero.
-        let kernel_init_size = read_kernel_init_size(&self.kernel).unwrap_or(0) as u64;
+        let kernel_init_size = read_kernel_init_size(&self.kernel)?;
+        let (init_coverage_instrumented, instrumented_reserve_bytes) =
+            self.init_payload_coverage_reserve();
         let budget = MemoryBudget {
             uncompressed_initramfs_bytes: uncompressed_size as u64,
             compressed_initrd_bytes: compressed_size as u64,
             kernel_init_size,
+            init_coverage_instrumented,
+            instrumented_reserve_bytes,
+            tmpfs_fraction: self.tmpfs_fraction(),
         };
         let memory_mib = initramfs_min_memory_mib(&budget).max(self.memory_min_mib);
         tracing::debug!(
             uncompressed_mib = uncompressed_size >> 20,
             compressed_mib = compressed_size >> 20,
             init_size_mib = kernel_init_size >> 20,
+            coverage_instrumented = init_coverage_instrumented,
+            coverage_reserve_mib = instrumented_reserve_bytes >> 20,
             memory_min_mib = self.memory_min_mib,
             memory_mib,
             "deferred_memory_computed",
@@ -968,8 +1103,14 @@ impl KtstrVm {
     /// (typically the VM lifetime). Validates the segment starts with
     /// LZ4 legacy magic to reject stale data from a previous
     /// compression format.
+    ///
+    /// Associated function (no `&self`): the COW path is a pure
+    /// transform of `(guest_mem, key, expected_len, load_addr)` —
+    /// it reads the SHM segment keyed by `key.0` and maps it into
+    /// `guest_mem`, touching no VM instance state. Keeping it
+    /// `self`-free lets the unit test drive the real overlay logic
+    /// without constructing a full `KtstrVm`.
     fn try_cow_overlay(
-        &self,
         guest_mem: &GuestMemoryMmap,
         key: &BaseKey,
         expected_len: usize,
@@ -1168,6 +1309,40 @@ impl KtstrVm {
         // Resolve effective memory_mib for boot params / ACPI / SHM.
         let memory_mib = self.effective_memory_mib(&vm.guest_mem);
 
+        let cmdline = self.build_guest_cmdline();
+
+        let t0 = Instant::now();
+        boot::write_cmdline(&vm.guest_mem, &cmdline)?;
+        boot::write_boot_params(
+            &vm.guest_mem,
+            &cmdline,
+            memory_mib,
+            initrd_addr,
+            initrd_size,
+            kernel_result.setup_header.as_ref(),
+        )?;
+        tracing::debug!(elapsed_us = t0.elapsed().as_micros(), "cmdline_boot_params");
+
+        let t0 = Instant::now();
+        mptable::setup_mptable(&vm.guest_mem, &self.topology)?;
+        let _acpi_layout = acpi::setup_acpi(
+            &vm.guest_mem,
+            &self.topology,
+            vm.numa_layout.as_ref().expect(
+                "numa_layout is Some by the time setup_acpi runs: \
+                 memory allocation (whether deferred or not) ran earlier \
+                 in this function and set numa_layout via \
+                 allocate_and_register_memory in src/vmm/x86_64/kvm.rs",
+            ),
+        )?;
+        tracing::debug!(elapsed_us = t0.elapsed().as_micros(), "mptable_acpi");
+
+        Ok(kernel_result)
+    }
+
+    /// Build the guest kernel cmdline (base flags + per-device `virtio_mmio.device=` tokens).
+    #[cfg(target_arch = "x86_64")]
+    fn build_guest_cmdline(&self) -> String {
         // Kernel cmdline rationale (per flag):
         //   console=ttyS0        — serial console for host-visible output.
         //   nomodules            — no out-of-tree modules are shipped; skip modprobe paths.
@@ -1298,11 +1473,7 @@ impl KtstrVm {
                 kvm::VIRTIO_NET_IRQ,
             ));
         }
-        if self.topology.has_memory_only_nodes() {
-            cmdline.push_str(" numa_balancing=enable");
-        } else {
-            cmdline.push_str(" numa_balancing=0");
-        }
+        cmdline.push_str(numa_balancing_cmdline_token(&self.topology));
         #[cfg(feature = "wprof")]
         if let Some(wprof) = self.wprof.as_ref() {
             cmdline.push_str(" KTSTR_WPROF_ARGS=");
@@ -1312,34 +1483,7 @@ impl KtstrVm {
             cmdline.push(' ');
             cmdline.push_str(&self.cmdline_extra);
         }
-
-        let t0 = Instant::now();
-        boot::write_cmdline(&vm.guest_mem, &cmdline)?;
-        boot::write_boot_params(
-            &vm.guest_mem,
-            &cmdline,
-            memory_mib,
-            initrd_addr,
-            initrd_size,
-            kernel_result.setup_header.as_ref(),
-        )?;
-        tracing::debug!(elapsed_us = t0.elapsed().as_micros(), "cmdline_boot_params");
-
-        let t0 = Instant::now();
-        mptable::setup_mptable(&vm.guest_mem, &self.topology)?;
-        let _acpi_layout = acpi::setup_acpi(
-            &vm.guest_mem,
-            &self.topology,
-            vm.numa_layout.as_ref().expect(
-                "numa_layout is Some by the time setup_acpi runs: \
-                 memory allocation (whether deferred or not) ran earlier \
-                 in this function and set numa_layout via \
-                 allocate_and_register_memory in src/vmm/x86_64/kvm.rs",
-            ),
-        )?;
-        tracing::debug!(elapsed_us = t0.elapsed().as_micros(), "mptable_acpi");
-
-        Ok(kernel_result)
+        cmdline
     }
 
     /// Configure BSP and AP vCPUs.
@@ -1488,11 +1632,16 @@ impl KtstrVm {
         // initramfs budget. Mirrors the x86_64 join_and_load_initramfs
         // contract: a builder with too-small memory_mib fails fast here
         // instead of OOMing during boot.
-        let kernel_init_size = read_kernel_init_size(&self.kernel).unwrap_or(0) as u64;
+        let kernel_init_size = read_kernel_init_size(&self.kernel)?;
+        let (init_coverage_instrumented, instrumented_reserve_bytes) =
+            self.init_payload_coverage_reserve();
         let budget = MemoryBudget {
             uncompressed_initramfs_bytes: uncompressed_size as u64,
             compressed_initrd_bytes: compressed_size as u64,
             kernel_init_size,
+            init_coverage_instrumented,
+            instrumented_reserve_bytes,
+            tmpfs_fraction: self.tmpfs_fraction(),
         };
         let min_mib = initramfs_min_memory_mib(&budget);
         if memory_mib < min_mib {
@@ -1558,17 +1707,24 @@ impl KtstrVm {
             "deferred_lz4_compress",
         );
 
-        let kernel_init_size = read_kernel_init_size(&self.kernel).unwrap_or(0) as u64;
+        let kernel_init_size = read_kernel_init_size(&self.kernel)?;
+        let (init_coverage_instrumented, instrumented_reserve_bytes) =
+            self.init_payload_coverage_reserve();
         let budget = MemoryBudget {
             uncompressed_initramfs_bytes: uncompressed_size as u64,
             compressed_initrd_bytes: compressed_size as u64,
             kernel_init_size,
+            init_coverage_instrumented,
+            instrumented_reserve_bytes,
+            tmpfs_fraction: self.tmpfs_fraction(),
         };
         let memory_mib = initramfs_min_memory_mib(&budget).max(self.memory_min_mib);
         tracing::debug!(
             uncompressed_mib = uncompressed_size >> 20,
             compressed_mib = compressed_size >> 20,
             init_size_mib = kernel_init_size >> 20,
+            coverage_instrumented = init_coverage_instrumented,
+            coverage_reserve_mib = instrumented_reserve_bytes >> 20,
             memory_min_mib = self.memory_min_mib,
             memory_mib,
             "deferred_memory_computed",
@@ -1644,11 +1800,7 @@ impl KtstrVm {
             let disk = &self.disks[0];
             cmdline.push_str(&disk_auto_mount_cmdline_tokens(disk));
         }
-        if self.topology.has_memory_only_nodes() {
-            cmdline.push_str(" numa_balancing=enable");
-        } else {
-            cmdline.push_str(" numa_balancing=0");
-        }
+        cmdline.push_str(numa_balancing_cmdline_token(&self.topology));
         #[cfg(feature = "wprof")]
         if let Some(wprof) = self.wprof.as_ref() {
             cmdline.push_str(" KTSTR_WPROF_ARGS=");

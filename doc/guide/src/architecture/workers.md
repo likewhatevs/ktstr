@@ -92,9 +92,10 @@ for the total observation count when the cap is exceeded.
 `group_idx` is `0` for the primary group and `1..=N` for composed
 `WorkSpec` entries in declaration order (mirrors
 `WorkloadConfig::composed`). `affinity_error` is `Some(reason)`
-when the worker's `sched_setaffinity` / `mbind` setup failed; the
-worker still runs and produces a report but the field documents
-the divergence from the requested affinity contract.
+when the worker's `sched_setaffinity` (CPU-affinity) setup failed;
+the worker still runs and produces a report but the field documents
+the divergence from the requested affinity contract. `mbind` /
+mem-policy failures are not surfaced here.
 
 Three fields worth calling out explicitly:
 

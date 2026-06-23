@@ -40,8 +40,9 @@ provides:
 - Runtime fields: `balance_interval`, `nr_balance_failed`,
   `max_newidle_lb_cost`.
 - Optional fields: `newidle_call`, `newidle_success`,
-  `newidle_ratio` — added in 7.0, backported to 6.18.5+ and
-  6.12.65+; absent on 6.16-6.18.4.
+  `newidle_ratio` — added together in 6.19 (proportional newidle
+  balance, kernel commit 33cf66d88306); resolved as optional and
+  absent on pre-6.19 kernels.
 
 When `CONFIG_SCHEDSTATS` is also enabled, each domain additionally
 provides load-balancing stats: `lb_count`, `lb_failed`, `lb_balanced`,
@@ -196,9 +197,12 @@ Map discovery walks the kernel's `map_idr` xarray:
    `translate_any_kva` which handles both paths rather than assuming
    either.
 
-`find_map` searches by **name suffix** (e.g. `".bss"` matches
-`"mitosis.bss"`). Only `BPF_MAP_TYPE_ARRAY` maps are returned.
-Use `maps()` to enumerate all map types without filtering.
+`find_map` searches by name suffix (e.g. `".bss"` matches
+`"mitosis.bss"`) and returns the first name-matching map of any
+type. The sibling `find_array_map` applies the same suffix match
+but returns only `BPF_MAP_TYPE_ARRAY` maps (the value-region
+read/write path needs `value_kva`, which is populated only for
+ARRAY maps). Use `maps()` to enumerate all maps without filtering.
 
 Value access for `BPF_MAP_TYPE_ARRAY` maps reads/writes the inline
 `bpf_array.value` flex array at the BTF-resolved offset. The value
@@ -226,7 +230,7 @@ Find a scheduler's `.bss` map and write a crash variable:
 ```rust,ignore
 let offsets = BpfMapOffsets::from_vmlinux(vmlinux)?;
 let accessor = GuestMemMapAccessor::from_guest_kernel(&kernel, &offsets)?;
-let bss = accessor.find_map(".bss").expect(".bss map not found");
+let bss = accessor.find_array_map(".bss").expect(".bss map not found");
 accessor.write_value_u32(&bss, crash_offset, 1);
 ```
 
@@ -255,7 +259,7 @@ fn crash_test(ctx: &Ctx) -> Result<AssertResult> {
 }
 ```
 
-The map is discovered by name suffix via `GuestMemMapAccessor::find_map`.
+The map is discovered by name suffix via `GuestMemMapAccessor::find_array_map`.
 Only `BPF_MAP_TYPE_ARRAY` maps are supported. The write targets a
 u32 at the specified byte offset within the map's value region.
 

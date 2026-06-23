@@ -73,6 +73,17 @@ pub struct VmResult {
     /// Overall success flag: `true` when the test reported a pass AND
     /// the VM exited cleanly without crash, timeout, or watchdog.
     pub success: bool,
+    /// Guest vCPU count for this run (topology llcs*cores*threads),
+    /// carried from `KtstrVm` to the sidecar `(vcpus, cpu_budget)` stamp.
+    pub vcpus: u32,
+    /// Effective host-CPU budget the vCPU threads ran on; stamped to the
+    /// sidecar. Normally `KtstrVm::effective_cpu_budget` (the build-time
+    /// plan's CPU count), but the default-overcommit path (host too small
+    /// for a 1:1 pin) overrides it in `run()` with the actual masked
+    /// host-CPU count, since the build-time value assumes 1:1 pinning.
+    /// Below `vcpus` means host overcommit, which confounds the
+    /// guest-scheduler timing metrics.
+    pub cpu_budget: u32,
     /// True when the `#[ktstr_test(expect_auto_repro)]` attribute set
     /// `expect_auto_repro = true` on the entry AND the auto-repro
     /// path fired with a valid repro artifact during the run — the
@@ -610,6 +621,71 @@ impl VmResult {
         out
     }
 
+    /// Worker-iteration throughput (iterations/sec) for one scenario
+    /// [`Phase`](crate::assert::Phase), from the stimulus timeline's
+    /// `StepStart[k]` -> `StepEnd[k]` step-local window (the per-event rate
+    /// via [`crate::timeline::StimulusEvent::rate_to`]).
+    ///
+    /// `None` when the phase has no `StepStart` ([`crate::assert::Phase::BASELINE`], or a
+    /// step the run never reached), no right boundary (no `StepEnd`, no
+    /// later step, and no scenario-end terminal), or the rate is
+    /// unmeasurable (zero-length window / counter went backward). A step
+    /// whose workers made zero forward progress over a positive hold
+    /// returns `Some(0.0)` (measured zero), not `None`.
+    ///
+    /// Collapse-immune: the stimulus timeline carries per-step boundaries
+    /// independent of the periodic-capture pipeline, so this works even for
+    /// `--cell-parent-cgroup` schedulers where the capture-derived
+    /// [`PhaseBucket`](crate::assert::PhaseBucket) path can collapse.
+    pub fn step_throughput(&self, phase: crate::assert::Phase) -> Option<f64> {
+        Self::step_throughput_in(&self.stimulus_timeline(), phase)
+    }
+
+    /// Ratio `step_throughput(a) / step_throughput(b)` — e.g.
+    /// scheduler-vs-EEVDF throughput when phase `b` runs on the detached
+    /// kernel default ([`crate::scenario::ops::Op::detach_scheduler`]).
+    /// Walks the stimulus timeline once. `None` when either phase has no
+    /// measurable throughput; a `Some(0.0)` denominator yields `inf` so a
+    /// collapsed/stalled phase `b` surfaces rather than vanishing to `None`.
+    pub fn throughput_ratio(
+        &self,
+        a: crate::assert::Phase,
+        b: crate::assert::Phase,
+    ) -> Option<f64> {
+        let timeline = self.stimulus_timeline();
+        let ta = Self::step_throughput_in(&timeline, a)?;
+        let tb = Self::step_throughput_in(&timeline, b)?;
+        Some(ta / tb)
+    }
+
+    /// Shared core for [`Self::step_throughput`] / [`Self::throughput_ratio`]
+    /// over an already-built timeline: pair the phase's `StepStart` with its
+    /// own `StepEnd` (step-local), falling back to the next step's
+    /// `StepStart` then the scenario-end terminal for the last step on
+    /// legacy/sched-died data that lacks a `StepEnd`. Mirrors the boundary
+    /// selection in [`crate::timeline::Timeline::build`].
+    fn step_throughput_in(
+        timeline: &[crate::timeline::StimulusEvent],
+        phase: crate::assert::Phase,
+    ) -> Option<f64> {
+        let start = timeline
+            .iter()
+            .find(|e| !e.is_terminal && !e.is_step_end && e.phase() == Some(phase))?;
+        let end = timeline
+            .iter()
+            .find(|e| e.is_step_end && e.phase() == Some(phase))
+            .or_else(|| {
+                timeline
+                    .iter()
+                    .filter(|e| {
+                        !e.is_terminal && !e.is_step_end && e.phase().is_some_and(|p| p > phase)
+                    })
+                    .min_by_key(|e| e.elapsed_ms)
+            })
+            .or_else(|| timeline.iter().find(|e| e.is_terminal))?;
+        start.rate_to(end)
+    }
+
     /// The framework-computed per-phase metric buckets for this run —
     /// the SAME [`crate::assert::PhaseBucket`] vec the framework folds
     /// onto [`crate::assert::ScenarioStats::phases`] in
@@ -631,13 +707,52 @@ impl VmResult {
     /// [`Self::stimulus_timeline`] for the step windows. In production
     /// the framework builds `stats.phases` from the same periodic-only
     /// series and the same stimulus timeline, so this returns content
-    /// identical to `result.stats.phases` (pinned by a
-    /// `phase_buckets() == stats.phases` test).
+    /// identical to `result.stats.phases` — but ONLY when there are no
+    /// step-local-cgroup per_cgroup carriers (pinned by
+    /// `phase_buckets_equals_stats_phases_and_post_vm_read_does_not_starve`,
+    /// whose fixture has none). With step-local cgroups, `evaluate_vm_result`
+    /// folds the guest per_cgroup carriers into `stats.phases` (and may append
+    /// orphan buckets) via `fold_guest_per_cgroup_into_host_buckets`, so
+    /// `stats.phases` is then a SUPERSET — this accessor still returns the
+    /// host-rebuilt buckets with EMPTY per_cgroup and no orphans, i.e. it does
+    /// NOT expose per_cgroup.
     pub fn phase_buckets(&self) -> Vec<crate::assert::PhaseBucket> {
         crate::assert::build_phase_buckets_with_stimulus(
             &self.periodic_series(),
             &self.stimulus_timeline(),
         )
+    }
+
+    /// One framework-computed per-phase metric for `phase` — the
+    /// metric-name analog of [`Self::step_throughput`] /
+    /// [`Self::throughput_ratio`], covering the per-phase metrics that
+    /// are NOT iteration throughput: per-phase CPU time
+    /// (`system_time_ns`, `user_time_ns`) and scheduling quality
+    /// (`avg_imbalance_ratio`, `avg_dsq_depth`, ...). `metric` is a
+    /// `crate::stats::METRICS` registry name. (The wake-latency / run-delay
+    /// distributions are `MetricKind::Distribution`: they have no per-phase
+    /// `PhaseBucket::metrics` value — they re-pool run-level from the
+    /// per-cgroup carriers — so they are not readable here.)
+    ///
+    /// Reads the SAME buckets [`Self::phase_buckets`] folds onto
+    /// `result.stats.phases`, so a `post_vm` callback can compare any
+    /// metric across two phases (e.g. scheduler-vs-detached-EEVDF
+    /// `system_time_ns`) without re-deriving the buckets — the
+    /// general form of the scheduler-vs-EEVDF throughput compare.
+    /// `None` when `phase` has no bucket — no capture landed in it AND no
+    /// stimulus `StepStart` synthesized one (e.g. `Phase::BASELINE` when
+    /// the settle window fired no captures, or a `phase` past the last
+    /// step) — or the bucket carries no reading for `metric` (every
+    /// sample's per-phase reading was absent — the sentinel-free "no data"
+    /// contract, distinct from a real `Some(0.0)`). A started-but-
+    /// uncaptured step (a `StepStart` with zero captures) DOES produce a
+    /// synthesized bucket, so `phase_metric` returns its stimulus-derived
+    /// `iteration_rate` rather than `None`.
+    pub fn phase_metric(&self, phase: crate::assert::Phase, metric: &str) -> Option<f64> {
+        self.phase_buckets()
+            .into_iter()
+            .find(|b| b.step_index == phase.as_u16())
+            .and_then(|b| b.get(metric))
     }
 
     /// Minimal "nothing happened" fixture for tests that exercise
@@ -664,6 +779,8 @@ impl VmResult {
     pub fn test_fixture() -> Self {
         Self {
             success: true,
+            vcpus: 1,
+            cpu_budget: 1,
             expect_auto_repro_satisfied: false,
             exit_code: 0,
             duration: Duration::from_secs(1),
@@ -1115,6 +1232,62 @@ pub(crate) struct VmRunState {
 mod tests {
     use super::*;
 
+    /// A StepStart/StepEnd/terminal `StimulusEvent` for the
+    /// `step_throughput_in` pairing tests.
+    fn ev(
+        elapsed_ms: u64,
+        step_index: Option<u16>,
+        iters: Option<u64>,
+        is_step_end: bool,
+        is_terminal: bool,
+    ) -> crate::timeline::StimulusEvent {
+        crate::timeline::StimulusEvent {
+            elapsed_ms,
+            label: String::new(),
+            op_kind: None,
+            detail: None,
+            total_iterations: iters,
+            step_index,
+            is_terminal,
+            is_step_end,
+        }
+    }
+
+    /// `step_throughput_in` pairs `StepStart[k]` -> `StepEnd[k]` of the SAME
+    /// `Phase` for the step-local rate; falls back to the next step then the
+    /// scenario-end terminal when a StepEnd is absent; a flat counter over a
+    /// positive window is measured-zero `Some(0.0)` (not `None`); BASELINE /
+    /// an absent step is `None`.
+    #[test]
+    fn step_throughput_in_pairs_step_local_and_handles_edges() {
+        use crate::assert::Phase;
+        let tl = vec![
+            ev(0, Some(1), Some(0), false, false),       // StepStart[0]
+            ev(1000, Some(1), Some(5000), true, false),  // StepEnd[0] -> 5000/s
+            ev(1100, Some(2), Some(5000), false, false), // StepStart[1]
+            ev(2100, Some(2), Some(5000), true, false),  // StepEnd[1] -> 0/s (flat)
+            ev(2200, Some(3), Some(5000), false, false), // StepStart[2] (no StepEnd)
+            crate::timeline::StimulusEvent::terminal(3200, 11000), // right boundary for step 2
+        ];
+        // Step 0: (5000-0)/1s = 5000/s.
+        assert_eq!(
+            VmResult::step_throughput_in(&tl, Phase::step(0)),
+            Some(5000.0)
+        );
+        // Step 1: counter flat over a positive window -> measured zero
+        // Some(0.0), NOT None.
+        assert_eq!(VmResult::step_throughput_in(&tl, Phase::step(1)), Some(0.0));
+        // Step 2: no StepEnd -> falls back to the terminal:
+        // (11000-5000)/1s = 6000/s.
+        assert_eq!(
+            VmResult::step_throughput_in(&tl, Phase::step(2)),
+            Some(6000.0)
+        );
+        // BASELINE and an absent step have no StepStart -> None.
+        assert_eq!(VmResult::step_throughput_in(&tl, Phase::BASELINE), None);
+        assert_eq!(VmResult::step_throughput_in(&tl, Phase::step(9)), None);
+    }
+
     #[test]
     fn kvm_stats_try_sum_distinguishes_absent_from_zero() {
         let totals = KvmStatsTotals {
@@ -1219,7 +1392,7 @@ mod tests {
             total_samples: 5,
             max_imbalance_ratio: 3.5,
             max_local_dsq_depth: 10,
-            stuck_detected: true,
+            stuck_count: 1,
             event_deltas: None,
             schedstat_deltas: None,
             ..Default::default()
@@ -1242,7 +1415,7 @@ mod tests {
         assert_eq!(mon.summary.total_samples, 5);
         assert!((mon.summary.max_imbalance_ratio - 3.5).abs() < f64::EPSILON);
         assert_eq!(mon.summary.max_local_dsq_depth, 10);
-        assert!(mon.summary.stuck_detected);
+        assert!(mon.summary.stuck_count > 0);
         assert!(r.timed_out);
         assert_eq!(r.exit_code, 1);
         assert_eq!(r.stderr, "kernel panic");
@@ -1396,6 +1569,47 @@ mod tests {
             cloned, original,
             "a clone taken after cache population must carry the same \
              buckets (category-3 independent-once-populated semantics)"
+        );
+    }
+
+    /// `phase_metric` keys by `Phase` (1-indexed wire `step_index`) and
+    /// delegates to the matching bucket's `get()`: it returns each
+    /// present metric's value, `None` for an unknown metric on an
+    /// existing phase, and `None` for a phase with no bucket. (The
+    /// Some-value read itself is `PhaseBucket::get`, pinned by its own
+    /// tests; this pins the phase-keying and the None contract.)
+    #[test]
+    fn phase_metric_keys_by_phase_and_delegates_to_bucket_get() {
+        let r = vm_result_with_periodic_captures(2);
+        // The captures are stamped step_index=1 -> Phase::step(0).
+        let p0 = crate::assert::Phase::step(0);
+        let buckets = r.phase_buckets();
+        let step0 = buckets
+            .iter()
+            .find(|b| b.step_index == p0.as_u16())
+            .expect("a Step[0] bucket from the stamped captures (keys by step_index)");
+        // Some-path delegation: for every metric the matching bucket
+        // carries, phase_metric returns that exact value. The
+        // default-report fixture may fold no metrics, so this loop can be
+        // empty — the keying + None assertions below pin the rest.
+        for (name, val) in &step0.metrics {
+            assert_eq!(
+                r.phase_metric(p0, name),
+                Some(*val),
+                "phase_metric must return the matching bucket's value for present metric '{name}'",
+            );
+        }
+        // A name absent from the bucket -> None (the bucket is still found).
+        assert_eq!(
+            r.phase_metric(p0, "definitely_not_a_registry_metric"),
+            None,
+            "an unknown metric name yields None even when the phase has a bucket",
+        );
+        // A phase with no bucket -> None (not a panic, not a wrong bucket).
+        assert_eq!(
+            r.phase_metric(crate::assert::Phase::step(99), "iteration_rate"),
+            None,
+            "a phase with no bucket yields None",
         );
     }
 

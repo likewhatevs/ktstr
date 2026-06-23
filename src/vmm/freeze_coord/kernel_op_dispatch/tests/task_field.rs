@@ -1,107 +1,14 @@
 use super::super::*;
+use super::common::{
+    DEFAULT_START_TIME, EXT_KVA, build_test_kernel, paint_valid_task, synth_task,
+    synth_validation_offsets,
+};
 
 // ---- TaskField walker + validation tests ----
-
-/// Synthetic task_struct field layout used by every TaskField test
-/// fixture below. Real kernel offsets are BTF-derived at runtime;
-/// these synthetic values just need to be (a) distinct, (b)
-/// non-overlapping for the 32/64-bit reads, and (c) within the
-/// 4 KiB test buffer.
-mod synth_task {
-    pub(super) const PID_OFF: usize = 0x10;
-    pub(super) const START_TIME_OFF: usize = 0x18;
-    pub(super) const STATE_OFF: usize = 0x20;
-    pub(super) const ON_RQ_OFF: usize = 0x28;
-    pub(super) const SCHED_CLASS_OFF: usize = 0x30;
-    pub(super) const START_BOOTTIME_OFF: usize = 0x40;
-    pub(super) const SCX_DSQ_OFF: usize = 0x48;
-    pub(super) const SCX_RUNNABLE_NODE_OFF: usize = 0x50;
-    pub(super) const TASKS_OFF: usize = 0x60;
-    pub(super) const SIGNAL_OFF: usize = 0x70;
-    pub(super) const SIGNAL_THREAD_HEAD_OFF: usize = 0x10;
-    pub(super) const THREAD_NODE_OFF: usize = 0x78;
-}
-
-fn synth_validation_offsets() -> TaskValidationOffsets {
-    TaskValidationOffsets {
-        pid: synth_task::PID_OFF,
-        start_time: synth_task::START_TIME_OFF,
-        state: synth_task::STATE_OFF,
-        on_rq: synth_task::ON_RQ_OFF,
-        sched_class: synth_task::SCHED_CLASS_OFF,
-        start_boottime: synth_task::START_BOOTTIME_OFF,
-        scx_dsq: synth_task::SCX_DSQ_OFF,
-        scx_runnable_node: synth_task::SCX_RUNNABLE_NODE_OFF,
-        tasks: synth_task::TASKS_OFF,
-        signal: synth_task::SIGNAL_OFF,
-        signal_thread_head: synth_task::SIGNAL_THREAD_HEAD_OFF,
-        thread_node: synth_task::THREAD_NODE_OFF,
-    }
-}
-
-const EXT_KVA: u64 = 0xFFFF_FFFF_8200_0100;
-const DEFAULT_START_TIME: u64 = 1_700_000_000_000;
-
-/// Paint a complete "live, SCX-managed, sleepable" task_struct
-/// at PA `pa` into `buf`. After painting, the task passes all 8
-/// validation layers. Caller mutates individual fields to
-/// trigger specific rejections.
-fn paint_valid_task(buf: &mut [u8], pa: usize, pid: u32) {
-    const PAGE_OFFSET: u64 = 0xFFFF_8880_0000_0000;
-    // pid (u32 LE)
-    buf[pa + synth_task::PID_OFF..pa + synth_task::PID_OFF + 4].copy_from_slice(&pid.to_le_bytes());
-    // start_time = arbitrary
-    buf[pa + synth_task::START_TIME_OFF..pa + synth_task::START_TIME_OFF + 8]
-        .copy_from_slice(&DEFAULT_START_TIME.to_le_bytes());
-    // state = TASK_RUNNING (0) — not TASK_DEAD
-    buf[pa + synth_task::STATE_OFF..pa + synth_task::STATE_OFF + 4]
-        .copy_from_slice(&0u32.to_le_bytes());
-    // on_rq = 0 (sleeping)
-    buf[pa + synth_task::ON_RQ_OFF..pa + synth_task::ON_RQ_OFF + 4]
-        .copy_from_slice(&0u32.to_le_bytes());
-    // sched_class = EXT_KVA
-    buf[pa + synth_task::SCHED_CLASS_OFF..pa + synth_task::SCHED_CLASS_OFF + 8]
-        .copy_from_slice(&EXT_KVA.to_le_bytes());
-    // start_boottime = arbitrary non-zero (1 hour in ns)
-    buf[pa + synth_task::START_BOOTTIME_OFF..pa + synth_task::START_BOOTTIME_OFF + 8]
-        .copy_from_slice(&3_600_000_000_000u64.to_le_bytes());
-    // scx.dsq = NULL (not queued)
-    buf[pa + synth_task::SCX_DSQ_OFF..pa + synth_task::SCX_DSQ_OFF + 8]
-        .copy_from_slice(&0u64.to_le_bytes());
-    // scx.runnable_node = list-empty (next points at self)
-    // task_kva = task_pa + PAGE_OFFSET; runnable_node KVA =
-    // task_kva + SCX_RUNNABLE_NODE_OFF.
-    let task_kva = (pa as u64).wrapping_add(PAGE_OFFSET);
-    let self_kva = task_kva.wrapping_add(synth_task::SCX_RUNNABLE_NODE_OFF as u64);
-    buf[pa + synth_task::SCX_RUNNABLE_NODE_OFF..pa + synth_task::SCX_RUNNABLE_NODE_OFF + 8]
-        .copy_from_slice(&self_kva.to_le_bytes());
-}
-
-/// Build a synthetic GuestKernel; PAGE_OFFSET set so PA 0 → KVA
-/// 0xFFFF_8880_0000_0000 (matches real direct-map layout for
-/// slab-allocated task_structs).
-fn build_test_kernel(
-    buf: &mut [u8],
-    symbols: std::collections::HashMap<String, u64>,
-) -> crate::monitor::guest::GuestKernel {
-    const PAGE_OFFSET: u64 = 0xFFFF_8880_0000_0000;
-    // SAFETY: buf outlives the kernel by virtue of caller keeping
-    // it on the stack; GuestMem::new requires the backing buffer
-    // remain valid for the GuestMem's lifetime.
-    let mem = unsafe {
-        std::sync::Arc::new(crate::monitor::reader::GuestMem::new(
-            buf.as_mut_ptr(),
-            buf.len() as u64,
-        ))
-    };
-    crate::monitor::guest::GuestKernel::new_for_test(
-        mem,
-        symbols,
-        PAGE_OFFSET,
-        0,     // cr3_pa unused for direct-map translation
-        false, // l5 = false (4-level)
-    )
-}
+//
+// Synthetic task_struct fixtures (offset layout, valid-task painter,
+// synthetic GuestKernel builder) live in `super::common` and are
+// shared with the `dispatch_arms` walker tests.
 
 fn validate(
     kernel: &crate::monitor::guest::GuestKernel,

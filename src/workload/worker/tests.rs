@@ -855,13 +855,40 @@ fn parse_schedstat_line_non_u64_token_returns_none() {
     assert!(parse_schedstat_line("99999999999999999999 2 3").is_none());
 }
 #[test]
+fn claim_warn_slot_grants_first_call_only() {
+    // The once-only warning contract lives in `claim_warn_slot`:
+    // the warning helper emits its eprintln only when this returns
+    // `true`, and it must return `true` exactly once per `Once`.
+    // Drive it against a fresh `Once` so the assertion is
+    // independent of any process-global state that peer tests may
+    // have already tripped — direct stderr-emission capture is not
+    // possible because `#[test]` threads share fd 2. A regression
+    // that dropped the gate (emitting on every call) would make
+    // this return `true` repeatedly and fail the false-on-repeat
+    // assertions below.
+    let once = std::sync::Once::new();
+    assert!(
+        claim_warn_slot(&once),
+        "first call on a fresh Once must claim the slot (return true)",
+    );
+    for i in 0..10 {
+        assert!(
+            !claim_warn_slot(&once),
+            "call {i} after the first must NOT re-claim the slot \
+                 (the at-most-once emission contract)",
+        );
+    }
+}
+
+#[test]
 fn warn_schedstat_unavailable_once_does_not_panic_on_repeat() {
-    // `std::sync::Once::call_once` guarantees at most one
-    // eprintln regardless of how many times the gate fires.
-    // Smoke-check that repeated calls don't panic — direct
-    // stderr-emission assertions require a process-global
-    // capture gate (`#[test]` threads share fd 2), which is
-    // out of scope for this unit test.
+    // The process-wide warning helper must tolerate the 2N calls a
+    // full worker fan-out makes (each worker calls read_schedstat
+    // twice). The once-only emission itself is pinned by
+    // `claim_warn_slot_grants_first_call_only`; here we only
+    // confirm the public wrapper is panic-free across repeats
+    // (stderr-capture is unavailable since `#[test]` threads share
+    // fd 2).
     for _ in 0..10 {
         warn_schedstat_unavailable_once();
     }
@@ -890,7 +917,7 @@ fn alu_width_resolve_never_returns_widest() {
 }
 
 /// [`alu_hot_chain`] MUST bump `work_units` by exactly `steps` per
-/// invocation. The per-iteration body at mod.rs:3588 reads
+/// invocation. The per-iteration body (its `for _ in 0..steps` loop) reads
 /// `*work_units = std::hint::black_box(work_units.wrapping_add(1))`
 /// — the bump is wrapped in `black_box` so the optimizer can't
 /// elide it as a dead-store, but a refactor that removed the
@@ -919,7 +946,7 @@ fn alu_hot_chain_bumps_work_units_by_exact_step_count() {
         work_units, steps,
         "alu_hot_chain(Scalar, {steps}, &mut 0) MUST leave work_units \
          == {steps}; got {work_units}. A regression that removed the \
-         per-step bump (mod.rs:3588) would surface here as 0; one \
+         per-step bump (the loop body's `*work_units = ...wrapping_add(1)`) would surface here as 0; one \
          that moved the bump outside the loop would surface as 1; \
          one that changed the increment constant would surface as a \
          multiple of {steps}; one that introduced an off-by-one in \
@@ -953,7 +980,7 @@ fn alu_hot_chain_compound_calls_accumulate_work_units() {
 
 /// [`alu_hot_chain`] MUST bump `work_units` uniformly across every
 /// concrete [`AluWidth`] variant. Today every arm runs the same
-/// scalar multiply path per the comment at mod.rs:3567-3573 — `width`
+/// scalar multiply path per `alu_hot_chain`'s width-retention comment — `width`
 /// is retained on the signature so a future SIMD-intrinsic drop can
 /// pivot per-arm without changing the call shape. This test is
 /// mechanically redundant today (all arms execute the same code) but
@@ -962,7 +989,8 @@ fn alu_hot_chain_compound_calls_accumulate_work_units() {
 /// (e.g. forgets the `*work_units = ...` write in the Vec256 branch
 /// of a future per-arm match) would surface here as a single-variant
 /// failure. `AluWidth::Widest` is excluded because `alu_hot_chain`
-/// `debug_assert!`s against it at mod.rs:3574-3578 (resolved away by
+/// `debug_assert!`s against it (its `debug_assert!(!matches!(width, AluWidth::Widest), ...)`,
+/// resolved away by
 /// `resolve_alu_width` before reaching the chain).
 #[test]
 fn alu_hot_chain_bumps_work_units_uniformly_across_widths() {
@@ -988,7 +1016,8 @@ fn alu_hot_chain_bumps_work_units_uniformly_across_widths() {
     }
 }
 
-/// [`alu_hot_chain`] uses `wrapping_add(1)` at mod.rs:3588 — the
+/// [`alu_hot_chain`] uses `wrapping_add(1)` in its `for _ in 0..steps`
+/// loop body — the
 /// per-step bump must wrap silently on `u64::MAX` overflow rather
 /// than panic or saturate. A regression that switched to
 /// `checked_add(1).unwrap()` would panic; one that switched to
@@ -1013,7 +1042,7 @@ fn alu_hot_chain_wraps_work_units_at_u64_max() {
 }
 
 /// [`alu_hot_chain`] with `steps=0` must be a no-op: the for-loop
-/// body (mod.rs:3583-3589) executes 0 times, work_units stays
+/// body (its `for _ in 0..steps` loop) executes 0 times, work_units stays
 /// unchanged. A regression that off-by-one'd the loop bound
 /// (e.g. `for _ in 0..=steps` instead of `for _ in 0..steps`)
 /// would surface here as work_units == 43 (one bump from the
@@ -1046,7 +1075,8 @@ fn alu_hot_chain_single_step_bumps_by_one() {
     );
 }
 
-/// [`alu_hot_chain`] has a `debug_assert!` at mod.rs:3578-3582 that
+/// [`alu_hot_chain`] has a `debug_assert!` (its
+/// `debug_assert!(!matches!(width, AluWidth::Widest), ...)`) that
 /// rejects `AluWidth::Widest` — callers MUST resolve `Widest` via
 /// `resolve_alu_width` before reaching here. Test pins the
 /// debug-build panic contract: a regression that removed the
@@ -1095,9 +1125,11 @@ fn alu_hot_chain_panics_on_widest_in_debug_build() {
 /// layer.
 ///
 /// Test guarantees retired-instructions semantics on both x86_64
-/// (CPUID 0x0A PMU v2 synthesized at `src/vmm/x86_64/topology.rs`)
-/// and aarch64 (KVM_ARM_VCPU_PMU_V3 wired at
-/// `src/vmm/aarch64/kvm.rs:268-271`). The test runs on the HOST
+/// (CPUID 0x0A PMU v2 synthesized in `x86_64::topology::generate_cpuid`'s
+/// Leaf 0xA arm)
+/// and aarch64 (KVM_ARM_VCPU_PMU_V3 wired by
+/// `aarch64::kvm`'s `init_pmuv3` plus the
+/// `kvi.features[0] |= 1 << KVM_ARM_VCPU_PMU_V3` feature set). The test runs on the HOST
 /// (this is a #[test] in a host-test module, not a guest workload),
 /// so the relevant PMU is the host's — Linux is required.
 ///
@@ -1305,4 +1337,225 @@ fn read_effective_cpus_reports_runner_cpuset() {
         !read_effective_cpus().is_empty(),
         "read_effective_cpus must report the runner's non-empty cpuset"
     );
+}
+
+// -- build_phase_slice: the per-phase finalize delta math.
+// Both the per-transition drain and the final end-of-run drain call this,
+// so these pin the math the two paths share. The production drains read the
+// clock / `/proc` to produce the snapshots; this helper is pure, so the
+// delta math is testable in isolation without booting a VM. --
+
+/// Full delta math, every field non-default. The key invariant: `off_cpu_ns`
+/// uses the thread-CPU delta (args 3->4) while `schedstat_cpu_time_ns` and
+/// `run_delay_ns` use the schedstat `sum_exec_runtime` / `run_delay` deltas —
+/// the two CPU measures are independent and must not be conflated.
+#[test]
+fn build_phase_slice_full_delta_math() {
+    let cpus: BTreeSet<usize> = [0, 2].into_iter().collect();
+    let numa: BTreeMap<usize, u64> = [(0, 100), (1, 50)].into_iter().collect();
+    let s = build_phase_slice(
+        7,                        // phase_epoch
+        1_000_000,                // wall_ns
+        500_000,                  // cpu_start_ns (thread cpu)
+        900_000,                  // cpu_end_ns -> thread-cpu delta 400_000
+        Some((10_000, 2_000, 1)), // schedstat_start (sum_exec, run_delay, ts)
+        Some((13_000, 5_000, 9)), // schedstat_end -> ss_cpu 3_000, run_delay 3_000
+        40,                       // vmstat_migrated_start
+        70,                       // vmstat_migrated_end -> 30
+        100,                      // iterations_delta (already a delta)
+        2,                        // migration_count
+        45_000_000,               // max_gap_ns -> 45 ms
+        2,                        // max_gap_cpu
+        cpus.clone(),
+        numa.clone(),
+        (vec![11, 22, 33], 5), // wake (reservoir, total)
+    );
+    assert_eq!(s.phase_epoch, 7);
+    assert_eq!(s.wall_ns, 1_000_000);
+    // off_cpu = wall - thread-cpu delta = 1_000_000 - 400_000.
+    assert_eq!(s.off_cpu_ns, 600_000);
+    // schedstat_cpu_time is the schedstat sum_exec_runtime delta (3_000),
+    // NOT the thread-cpu delta (400_000) — the two are independent measures.
+    assert_eq!(s.schedstat_cpu_time_ns, 3_000);
+    assert_eq!(s.run_delay_ns, 3_000);
+    assert_eq!(s.vmstat_numa_pages_migrated, 30);
+    assert_eq!(s.iterations, 100);
+    assert_eq!(s.migration_count, 2);
+    assert_eq!(s.max_gap_ms, 45); // 45_000_000 ns floored to ms
+    assert_eq!(s.max_gap_cpu, 2);
+    assert_eq!(s.cpus_used, cpus);
+    assert_eq!(s.numa_pages, numa);
+    assert_eq!(s.wake_latencies_ns, vec![11, 22, 33]);
+    assert_eq!(s.wake_sample_total, 5);
+}
+
+/// `off_cpu_ns` saturates at 0 when the thread-CPU delta exceeds wall — a
+/// coarse wall clock against a finer thread-CPU clock must never underflow
+/// into a near-`u64::MAX` value that would poison the host off-CPU% fold.
+#[test]
+fn build_phase_slice_off_cpu_saturates_at_zero() {
+    let s = build_phase_slice(
+        1,
+        100, // wall_ns
+        0,
+        500, // cpu_delta 500 > wall 100
+        None,
+        None,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        BTreeSet::new(),
+        BTreeMap::new(),
+        (vec![], 0),
+    );
+    assert_eq!(s.off_cpu_ns, 0);
+}
+
+/// A schedstat snapshot missing at either end yields zero run_delay and zero
+/// schedstat cpu time (the `_ => (0, 0)` arm) — never a partial read off one
+/// endpoint.
+#[test]
+fn build_phase_slice_missing_schedstat_is_zero() {
+    let mk = |start, end| {
+        build_phase_slice(
+            1,
+            1000,
+            0,
+            100,
+            start,
+            end,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            BTreeSet::new(),
+            BTreeMap::new(),
+            (vec![], 0),
+        )
+    };
+    let only_start = mk(Some((10, 20, 30)), None);
+    assert_eq!(
+        (only_start.run_delay_ns, only_start.schedstat_cpu_time_ns),
+        (0, 0)
+    );
+    let only_end = mk(None, Some((10, 20, 30)));
+    assert_eq!(
+        (only_end.run_delay_ns, only_end.schedstat_cpu_time_ns),
+        (0, 0)
+    );
+    let neither = mk(None, None);
+    assert_eq!(
+        (neither.run_delay_ns, neither.schedstat_cpu_time_ns),
+        (0, 0)
+    );
+}
+
+/// Every counter delta saturates when end < start (a counter read across a
+/// reset, or a non-monotone `/proc` snapshot) — yields 0, never a wrapped
+/// near-`u64::MAX` value that would poison the host counter fold.
+#[test]
+fn build_phase_slice_counter_deltas_saturate() {
+    let s = build_phase_slice(
+        1,
+        1000,
+        0,
+        100,
+        Some((100, 100, 1)), // schedstat_start sum_exec/run_delay 100
+        Some((10, 10, 0)),   // schedstat_end 10 (< start)
+        100,                 // vmstat_migrated_start 100
+        10,                  // vmstat_migrated_end 10 (< start)
+        0,
+        0,
+        0,
+        0,
+        BTreeSet::new(),
+        BTreeMap::new(),
+        (vec![], 0),
+    );
+    assert_eq!(s.run_delay_ns, 0);
+    assert_eq!(s.schedstat_cpu_time_ns, 0);
+    assert_eq!(s.vmstat_numa_pages_migrated, 0);
+}
+
+// -- WakeRec: the twin wake-latency reservoir. push()
+// records every sample into BOTH the whole-run and per-phase reservoirs;
+// drain_phase() takes the per-phase samples+total and resets ONLY the phase
+// side, leaving the whole-run side intact. A swapped field or a missed reset
+// would silently corrupt both the per-phase and whole-run wake distributions
+// (wake_sample_total is the population weight in the cross-phase de-skew). --
+
+/// push records into both reservoirs; under both caps every sample is kept.
+#[test]
+fn wakerec_push_records_both_reservoirs() {
+    let mut w = WakeRec::new();
+    for s in [10u64, 20, 30] {
+        w.push(s);
+    }
+    let mut run = w.run.clone();
+    run.sort_unstable();
+    assert_eq!(run, vec![10, 20, 30]);
+    assert_eq!(w.run_total, 3);
+    let mut phase = w.phase.clone();
+    phase.sort_unstable();
+    assert_eq!(phase, vec![10, 20, 30]);
+    assert_eq!(w.phase_total, 3);
+}
+
+/// drain_phase takes the per-phase samples+total and resets ONLY the phase
+/// side; the whole-run reservoir is untouched, and a fresh phase accumulates
+/// independently after the reset.
+#[test]
+fn wakerec_drain_phase_takes_phase_leaves_run() {
+    let mut w = WakeRec::new();
+    for s in [10u64, 20, 30] {
+        w.push(s);
+    }
+    let (mut samples, total) = w.drain_phase();
+    samples.sort_unstable();
+    assert_eq!(samples, vec![10, 20, 30]);
+    assert_eq!(total, 3);
+    // Whole-run reservoir untouched by the phase drain.
+    let mut run = w.run.clone();
+    run.sort_unstable();
+    assert_eq!(run, vec![10, 20, 30]);
+    assert_eq!(w.run_total, 3);
+    // Phase side reset: a second drain with no intervening push is empty.
+    let (samples2, total2) = w.drain_phase();
+    assert!(samples2.is_empty());
+    assert_eq!(total2, 0);
+    // A fresh phase accumulates from zero after the reset...
+    w.push(99);
+    let (samples3, total3) = w.drain_phase();
+    assert_eq!(samples3, vec![99]);
+    assert_eq!(total3, 1);
+    // ...while the whole-run reservoir kept every sample across both phases.
+    assert_eq!(w.run.len(), 4);
+    assert_eq!(w.run_total, 4);
+}
+
+/// The phase and run caps are independent: pushing past MAX_PHASE_WAKE_SAMPLES
+/// (but below MAX_WAKE_SAMPLES) caps the drained phase vec at the phase cap
+/// while the whole-run reservoir keeps every sample. Both totals count every
+/// push regardless of the sampled vec length.
+#[test]
+fn wakerec_phase_and_run_caps_are_independent() {
+    let mut w = WakeRec::new();
+    let n = MAX_PHASE_WAKE_SAMPLES + 808; // over the phase cap, under the run cap
+    assert!(n < MAX_WAKE_SAMPLES);
+    for i in 0..n as u64 {
+        w.push(i);
+    }
+    let (samples, total) = w.drain_phase();
+    // Phase reservoir samples down to its cap but counts every push.
+    assert_eq!(samples.len(), MAX_PHASE_WAKE_SAMPLES);
+    assert_eq!(total, n as u64);
+    // Run reservoir is capped independently (and n is below its cap), so it
+    // kept all n while the phase reservoir sampled down.
+    assert_eq!(w.run.len(), n);
+    assert_eq!(w.run_total, n as u64);
 }

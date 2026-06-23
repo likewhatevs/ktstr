@@ -3,7 +3,7 @@
 //! Most tests use the declarative ops API from the [`ops`] submodule:
 //! - [`ops::CgroupDef`] -- declarative cgroup definition (name + cpuset + workload)
 //! - [`ops::Step`] -- a sequence of ops followed by a hold period
-//! - [`ops::Op`] -- atomic cgroup topology operation
+//! - [`ops::Op`] -- an atomic scenario operation (cgroup/worker topology, payload run/wait/kill, freeze, snapshot, kernel read/write, scheduler attach/detach/restart/replace, BPF map pin)
 //! - [`ops::CpusetSpec`] -- how to compute a cpuset from topology
 //! - [`ops::HoldSpec`] -- how long to hold after a step
 //! - [`backdrop::Backdrop`] -- persistent scenario state shared across every Step
@@ -481,8 +481,7 @@ impl std::fmt::Debug for Ctx<'_> {
 }
 
 impl Ctx<'_> {
-    /// Scheduler pid, filtered to the `> 0` range that
-    /// `process_alive` treats as signalable.
+    /// Read the live scheduler identity published by the
     ///
     /// `Ctx::sched_pid` documents `None` as the "no scheduler
     /// configured" state, and the liveness sites destructure with
@@ -546,6 +545,44 @@ impl Ctx<'_> {
         crate::vmm::rust_init::current_scheduler()
     }
 
+    /// Scheduler pid, filtered to the `> 0` range that
+    /// `process_alive` treats as signalable.
+    ///
+    /// `Ctx::sched_pid` documents `None` as the "no scheduler
+    /// configured" state, and the liveness sites destructure with
+    /// `if let Some(pid)`. Nothing in the builder, however, prevents
+    /// a caller from passing `Some(0)` or a negative pid — an easy
+    /// mistake for callers used to the workload module's internal
+    /// 0-sentinel pid slot (see the note on `sched_pid` above — the
+    /// sentinel lives on a module-private `AtomicI32` in
+    /// `src/workload.rs`, not on this `Option<pid_t>`). A bare
+    /// `Some(0)` would reach
+    /// `process_alive`, which returns `false` for any pid `<= 0`,
+    /// and the liveness sites would then bail with `scheduler died`
+    /// even though no scheduler was ever running — a false
+    /// positive that turns a misconfiguration into a misleading
+    /// scheduler-death diagnostic.
+    ///
+    /// Centralising the filter here means every liveness callsite
+    /// (`run_scenario` post-settle bail, workload-phase polling,
+    /// `setup_cgroups` post-settle bail) uses the same predicate:
+    /// only a positive pid is "configured". Callers must use this
+    /// accessor rather than destructuring `sched_pid` directly.
+    ///
+    /// A `Some(n)` where `n <= 0` is a caller bug — the builder
+    /// documents `None` as the unconfigured shape, and every
+    /// positive value flows through unchanged. When the accessor
+    /// squashes such a value to `None`, it emits a `tracing::warn!`
+    /// naming the offending pid so the misuse surfaces in
+    /// structured logs instead of manifesting downstream as a
+    /// silent "scheduler died" verdict or, worse, a `kill(0, …)`
+    /// reaching the caller's own process group. The warn is
+    /// bounded: there are exactly three callsites
+    /// (`run_scenario` post-settle bail, workload-phase polling,
+    /// `setup_cgroups` post-settle bail), so the volume is O(3)
+    /// per scenario run even for a sustained
+    /// misconfiguration — tight enough to leave in place without
+    /// a rate limiter.
     pub(crate) fn active_sched_pid(&self) -> Option<libc::pid_t> {
         match self.sched_pid {
             Some(p) if p > 0 => Some(p),
@@ -1435,15 +1472,76 @@ pub fn setup_cgroups<'a>(
 /// `ScenarioStats.cgroups` empty for tests that read the telemetry
 /// without configuring a check.)
 pub(crate) fn collect_handles<'a>(
-    handles: impl IntoIterator<Item = (WorkloadHandle, Option<&'a BTreeSet<usize>>)>,
+    handles: impl IntoIterator<Item = (String, WorkloadHandle, Option<&'a BTreeSet<usize>>)>,
     checks: &crate::assert::Assert,
     topo: Option<&crate::topology::TestTopology>,
+    step_index: Option<u16>,
 ) -> AssertResult {
     let mut r = AssertResult::pass();
-    for (h, cpuset) in handles {
+    for (name, h, cpuset) in handles {
+        // Bind the cgroup name before it is moved into cg.cgroup_name below,
+        // so the per-phase per_cgroup carrier can key on it.
+        let key = name.clone();
         let reports = h.stop_and_collect();
         let numa_nodes = cpuset.and_then(|cs| topo.map(|t| t.numa_nodes_for_cpuset(cs)));
-        r.merge(checks.assert_cgroup_with_numa(&reports, cpuset, numa_nodes.as_ref()));
+        let mut one = checks.assert_cgroup_with_numa(&reports, cpuset, numa_nodes.as_ref());
+        // `assert_cgroup_with_numa` produces exactly one CgroupStats entry
+        // (scenario_stats_for_cgroup); no sub-check populates stats.cgroups,
+        // so last_mut() is that entry. Label it with the cgroup name here —
+        // the name is in scope only at the collection layer; cgroup_stats
+        // sees only the reports. merge() extends cgroups, so the label
+        // survives the roll-up and surfaces per-cgroup on a passing run.
+        // The debug_assert trips immediately (in any debug-build test path)
+        // if a future sub-assert ever adds a second cgroups entry, which
+        // would make last_mut() mislabel the wrong one.
+        debug_assert_eq!(
+            one.stats.cgroups.len(),
+            1,
+            "assert_cgroup_with_numa must yield exactly one cgroup entry for \
+             collect_handles to label correctly; got {}",
+            one.stats.cgroups.len(),
+        );
+        if let Some(cg) = one.stats.cgroups.last_mut() {
+            cg.cgroup_name = name;
+        }
+        // For a step-local cgroup (step_index Some), attach the per-phase
+        // RAW per-cgroup components as a single-bucket phases entry keyed by the
+        // step's 1-indexed step_index. AssertResult::merge unions per_cgroup by
+        // name, so multiple cgroups in one step accumulate into the one bucket;
+        // the host eval fold then unions these into the host-rebuilt buckets.
+        // None: a backdrop handle expands each worker's PhaseSlices into
+        // per-epoch buckets (expand_backdrop_phase_buckets); collect_all and
+        // the non-step staging collect carry no PhaseSlices, so the
+        // expansion yields an empty Vec (effectively nothing).
+        match step_index {
+            Some(idx) => {
+                one.stats.phases = vec![crate::assert::step_per_cgroup_bucket(
+                    &key,
+                    &reports,
+                    numa_nodes.as_ref(),
+                    idx,
+                )];
+            }
+            None => {
+                // Backdrop (collected with no step_index): expand each
+                // worker's per-phase PhaseSlices into one PhaseBucket per
+                // epoch (BASELINE / inter-step-gap epochs skipped). The
+                // host's fold_guest_per_cgroup_into_host_buckets then
+                // unions these into the host-rebuilt buckets (matched
+                // epochs) or surfaces them as orphan not-measured windows.
+                one.stats.phases = crate::assert::expand_backdrop_phase_buckets(
+                    &key,
+                    &reports,
+                    numa_nodes.as_ref(),
+                );
+            }
+        }
+        // Handle iteration order IS the per_cgroup fold order: AssertResult::merge
+        // folds same-name carriers (a multi-WorkSpec cgroup's per-handle carriers)
+        // in this order, and PhaseCgroupStats::merge's coupled-gap last-wins
+        // tie-break depends on it matching the order cgroup_stats pools the reports
+        // (also handle order) for gap-CPU parity. A reorder here would desync them.
+        r.merge(one);
     }
     r
 }
@@ -1453,7 +1551,13 @@ pub(crate) fn collect_handles<'a>(
 /// Uses `checks` for worker evaluation. Returns a merged
 /// [`AssertResult`] across all workers.
 pub fn collect_all(handles: Vec<WorkloadHandle>, checks: &crate::assert::Assert) -> AssertResult {
-    collect_handles(handles.into_iter().map(|h| (h, None)), checks, None)
+    collect_handles(
+        handles.into_iter().map(|h| (String::new(), h, None)),
+        checks,
+        None,
+        // No step concept for the bare collect_all path -> no phase attribution.
+        None,
+    )
 }
 
 /// Default [`WorkloadConfig`] with `ctx.workers_per_cgroup` workers.

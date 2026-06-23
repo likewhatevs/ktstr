@@ -18,7 +18,8 @@ KVM_HINTS_REALTIME CPUID, halt poll) are not available.
 
 Host-side `KVM_CAP_HALT_POLL` is explicitly skipped on x86_64 —
 the guest haltpoll cpuidle driver disables it via
-`MSR_KVM_POLL_CONTROL` (see below):
+`MSR_KVM_POLL_CONTROL` (see the "Skip host-side halt poll" item
+below).
 
 **vCPU pinning** -- each virtual LLC is mapped to a physical LLC
 group on the host. vCPU threads are pinned to cores within their
@@ -130,7 +131,13 @@ run at normal priority (results may be noisy).
 `validate_performance_mode()` runs during VM build and applies two
 levels of checks:
 
-**Errors (fatal):**
+**Host-insufficiency -- all surface as `PerfModeUnavailable`, a permanent
+host-insufficiency that skips by default (exit 0 / SKIP, with a visible
+banner and a recorded skip sidecar) and is promoted to a hard FAIL
+(exit 1) only under `KTSTR_NO_SKIP_MODE`, mirroring `ResourceContention` /
+`TopologyInsufficient`. The VM never runs unisolated (the build errors
+before boot), so the explicitly requested isolation guarantee is never
+silently violated:**
 - Total vCPUs + 1 service CPU exceed available host CPUs.
 - Virtual LLCs exceed available LLC groups.
 - Pinning plan cannot be satisfied (an LLC group has fewer available
@@ -237,8 +244,13 @@ When `performance_mode` is enabled, the build step validates LLC
 exclusivity: each virtual LLC must reserve the entire physical
 LLC group it maps to. The validation sums the actual CPU count of
 each LLC group and checks the total (plus service CPU) fits within
-the host's online CPUs. If validation fails, the build returns an
-error (tests skip with `ResourceContention`).
+the host's online CPUs. If validation fails, the build returns
+`PerfModeUnavailable`, a permanent host-insufficiency: it skips by
+default (exit 0 / SKIP) and is promoted to a hard FAIL only under
+`KTSTR_NO_SKIP_MODE`. A too-small host can never honor the perf-mode
+isolation guarantee, so this is a permanent skip — distinct from the
+transient all-slots-busy `ResourceContention` skip above, which a retry
+can resolve.
 
 ## Three-way mode tier
 
@@ -307,25 +319,104 @@ branch never consults `CpuCap::resolve`.
 See [Resource Budget](resource-budget.md) for the `CpuCap`,
 `LlcPlan`, and `ktstr locks` surfaces in detail.
 
-### Tier 3: default (per-CPU window + LLC LOCK_SH)
+### Tier 3: default (LLC LOCK_SH + per-CPU LOCK_EX)
 
 Selected when neither `performance_mode=true` nor
 `--no-perf-mode`/`KTSTR_NO_PERF_MODE` is set — the default path
 for `#[ktstr_test]` entries that don't declare `performance_mode`
 (entry.rs `KtstrTestEntry::DEFAULT` sets `performance_mode:
-false`). `acquire_cpu_locks` (in `vmm/host_topology/mod.rs`) walks a
-contiguous CPU window, takes `LOCK_EX` on each window CPU's
-`/tmp/ktstr-cpu-{C}.lock`, then additionally takes `LOCK_SH` on
-the LLC lockfiles covering those CPUs so a perf-mode (tier 1)
-VM cannot grab `LOCK_EX` on an LLC that this path is using. No
-pinning, no isolation, no cgroup sandbox — the per-CPU reservation
-is purely for host-scheduling-noise avoidance between concurrent
-VMs.
+false`). `KtstrVm::acquire_run_locks` (its default-else arm, in
+`vmm/mod.rs`) picks a starting LLC slot via `pid_window_offset`,
+walks the LLC offsets computing a `compute_pinning` candidate per
+offset, and acquires that plan through `acquire_resource_locks` in
+`LlcLockMode::Shared` (`vmm/host_topology/mod.rs`): it takes
+`LOCK_SH` on the plan's LLC lockfiles (`/tmp/ktstr-llc-{N}.lock`),
+then `LOCK_EX` on each assigned host CPU's lockfile
+(`/tmp/ktstr-cpu-{C}.lock`) over the plan's vCPU→CPU assignments.
+(Tier 3 reserves no service CPU: its `compute_pinning` call passes
+`reserve_service_cpu=false`, so the plan's `service_cpu` is
+`None`.) The LLC `LOCK_SH` prevents a perf-mode (tier 1) VM from
+grabbing `LOCK_EX` on an LLC this path is using.
+No pinning, no isolation, no cgroup sandbox — the per-CPU
+reservation is purely for host-scheduling-noise avoidance between
+concurrent VMs.
 
 This is the ONLY tier that actually flocks per-CPU lockfiles.
-Tier 1 skips them (LLC EX already covers all CPUs in the group);
-tier 2 skips them (capped LLC SH is enforced via the cgroup
-cpuset and the flock is sufficient per-LLC coordination).
+`try_acquire_all` takes per-CPU `LOCK_EX` only when the LLC mode
+is non-exclusive AND the plan carries real vCPU→CPU assignments.
+Tier 1 skips them: its `Exclusive` LLC lock already covers every
+CPU in the group, so the per-CPU loop is bypassed. Tier 2 is
+`Shared` (non-exclusive) but passes an empty-`assignments` stub
+plan, so its per-CPU loop iterates zero times — its capped LLC
+`SH` is enforced via the cgroup cpuset, and the per-LLC flock is
+sufficient coordination.
+
+When the default path cannot place the topology 1:1 it does NOT skip.
+`acquire_run_locks` tracks whether any LLC offset produced a valid
+`compute_pinning` candidate, which splits the two ways the offset walk
+comes up empty:
+
+- **No candidate (topology cannot be placed)** — `compute_pinning`
+  fails for every offset: the host has either fewer online CPUs than
+  the guest needs, or enough CPUs but too few LLC groups (it rejects
+  `virtual_llcs > host_llc_groups` regardless of CPU count). Both gates
+  read the host's online topology. Rather than skipping, the run masks
+  every vCPU thread onto `host_allowed_cpus()` and overrides the sidecar
+  `cpu_budget` to that masked allowed-CPU count. Whether the overcommit
+  is surfaced turns on the ALLOWED cpuset, not the online count: when
+  `host_allowed_cpus()` is SMALLER than `vcpus` — genuine
+  oversubscription, including a process cpuset narrower than the guest
+  (a CI runner or systemd slice can be narrower than the online host) —
+  an overcommit warning is emitted, the stamped `cpu_budget` falls below
+  `vcpus`, and the A/B-compare overcommit marker fires, so the confound
+  is durable, not silent. When the allowed cpuset still covers at least
+  `vcpus` CPUs (the candidate failed only on LLC-group count), the vCPUs
+  mask onto the full allowed set with no oversubscription, so neither
+  the warning nor the marker fires. The no-cached-topology case (sysfs
+  unreadable at build time) takes the same masked fallback.
+- **A candidate exists but every offset is busy (transient)** — a 1:1
+  plan maps, but a peer holds the lock on every offset (a perf-mode
+  `LOCK_EX` on the LLC, or a non-perf peer on the per-CPU `LOCK_EX`
+  set). The run returns `ResourceContention` (exit 0, skip); nextest
+  retries after the holder releases. It does NOT overcommit, so a
+  default test never runs on the CPUs a concurrent perf-mode test
+  reserved.
+
+## Sizing the host for tight balance
+
+"Tight balance" is running a topology on a host with just enough CPUs
+— or several `performance_mode` tests concurrently, each needing its
+own LLC. The three tiers diverge when the host cannot fit the requested
+topology, so the mode choice determines whether a too-small host fails,
+skips, or runs degraded:
+
+| Tier | Host too small for the topology | Exit |
+|------|----------------------------------|------|
+| Tier 1 (`performance_mode`) | `PerfModeUnavailable` — the isolation guarantee cannot be honored | 0 / SKIP (1 / FAIL under `KTSTR_NO_SKIP_MODE`) |
+| Tier 2 — explicit `--cpu-cap` / per-test `cpu_budget` exceeds the allowed cpuset | `CpuBudgetUnsatisfiable` — the requested cap is impossible | 1 / FAIL |
+| Tier 2 — default budget (no explicit cap) | sizes down to `max(30%, min(vcpus, allowed))` and runs | 0 |
+| Tier 3 (default) | masks onto the allowed CPUs; warns + marks the sidecar only when that set is smaller than `vcpus` | 0 |
+
+The asymmetry is deliberate: an EXPLICIT request for a guarantee the host
+cannot provide must never silently downscale into a measurement that does
+not match what was asked for. A too-small `performance_mode` host honors
+that by SKIPPING — the VM never runs unisolated, so no wrong measurement
+ships; `KTSTR_NO_SKIP_MODE` turns the skip into a hard FAIL for runs that
+demand perf-mode execution. An explicit `--cpu-cap` / `cpu_budget` the host
+cannot satisfy stays a hard error (`CpuBudgetUnsatisfiable`): a user-typed
+number that does not exist on this host is a misconfiguration, not a
+host-capability gap. The DEFAULT path instead makes the test run
+regardless, surfacing any oversubscription confound through the overcommit
+warning and the sidecar `cpu_budget` stamp rather than failing.
+
+To size a host so a `performance_mode` test passes (Tier 1), provide
+`(llcs * cores * threads) + 1` online CPUs and at least `llcs` LLC
+groups (see [Prerequisites](#prerequisites)). To run `K`
+`performance_mode` tests CONCURRENTLY without `ResourceContention`
+skips, the host needs `K * llcs` free LLC groups — each perf-mode test
+holds `LOCK_EX` on its LLCs for the run's duration (see
+[Nextest parallelism](#nextest-parallelism)); a host with fewer LLCs
+serializes the excess via the flock retry.
 
 ## Disabling performance mode
 

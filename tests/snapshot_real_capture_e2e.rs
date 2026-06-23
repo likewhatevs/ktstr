@@ -112,13 +112,6 @@ fn assert_bridge_has_real_capture_wide_smp(result: &VmResult) -> Result<()> {
     post_vm = assert_bridge_has_real_capture,
 )]
 fn snapshot_real_capture_op_snapshot(ctx: &ktstr::scenario::Ctx) -> Result<AssertResult> {
-    if ktstr::test_support::current_binary_is_coverage_instrumented() {
-        return Ok(AssertResult::skip(
-            "coverage-instrumented /init AP-kill — same surface as \
-             boot_kernel_with_monitor; deferred until non-instrumented \
-             init binary is wired",
-        ));
-    }
     let steps = vec![Step {
         setup: vec![ctx.cgroup_def("cg_0")].into(),
         ops: vec![Op::capture_snapshot("mid_run")],
@@ -137,13 +130,6 @@ fn snapshot_real_capture_op_snapshot(ctx: &ktstr::scenario::Ctx) -> Result<Asser
     post_vm = assert_bridge_has_real_capture,
 )]
 fn snapshot_real_capture_op_watch_snapshot(ctx: &ktstr::scenario::Ctx) -> Result<AssertResult> {
-    if ktstr::test_support::current_binary_is_coverage_instrumented() {
-        return Ok(AssertResult::skip(
-            "coverage-instrumented /init AP-kill — same surface as \
-             boot_kernel_with_monitor; deferred until non-instrumented \
-             init binary is wired",
-        ));
-    }
     let steps = vec![Step {
         setup: vec![ctx.cgroup_def("cg_0")].into(),
         ops: vec![Op::watch_snapshot("jiffies_64")],
@@ -278,12 +264,6 @@ fn principled_active_scheduler_walker_resolves_active_obj(
     post_vm = assert_bridge_has_real_capture_wide_smp,
 )]
 fn snapshot_real_capture_wide_smp(ctx: &ktstr::scenario::Ctx) -> Result<AssertResult> {
-    if ktstr::test_support::current_binary_is_coverage_instrumented() {
-        return Ok(AssertResult::skip(
-            "coverage-instrumented /init AP-kill — same surface as the \
-             sibling captures; deferred until a non-instrumented init binary",
-        ));
-    }
     let total = ctx.topo.total_cpus();
     anyhow::ensure!(
         total > 254,

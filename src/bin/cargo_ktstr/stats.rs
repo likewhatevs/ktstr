@@ -65,6 +65,7 @@ pub(crate) fn run_stats(command: &Option<StatsCommand>) -> Result<(), String> {
             project_commit,
             kernel_commit,
             run_source,
+            cpu_budget,
             scheduler,
             topology,
             work_type,
@@ -72,6 +73,7 @@ pub(crate) fn run_stats(command: &Option<StatsCommand>) -> Result<(), String> {
             a_project_commit,
             a_kernel_commit,
             a_run_source,
+            a_cpu_budget,
             a_scheduler,
             a_topology,
             a_work_type,
@@ -79,6 +81,7 @@ pub(crate) fn run_stats(command: &Option<StatsCommand>) -> Result<(), String> {
             b_project_commit,
             b_kernel_commit,
             b_run_source,
+            b_cpu_budget,
             b_scheduler,
             b_topology,
             b_work_type,
@@ -88,134 +91,259 @@ pub(crate) fn run_stats(command: &Option<StatsCommand>) -> Result<(), String> {
             steps_only,
             phase,
             phase_threshold,
-        }) => {
-            // Resolve `--threshold N` / `--policy PATH` / neither into
-            // a single `ComparisonPolicy` via the shared resolver (also
-            // used by `perf-delta`). Clap's `conflicts_with` enforces
-            // mutual exclusion at parse time; the resolver's
-            // both-set-is-error branch is the unreachable backstop.
-            let resolved_policy =
-                ktstr::cli::ComparisonPolicy::from_cli_flags(*threshold, policy.as_deref())
-                    .map_err(|e| format!("{e:#}"))?;
-            // Resolve git revspecs in `--project-commit` /
-            // `--kernel-commit` flags (HEAD~1, tags, branch names,
-            // `A..B` ranges) into 7-char short hashes BEFORE
-            // constructing BuildCompareFilters. The shared and
-            // per-side vecs each go through `resolve_commit_specs`
-            // independently so a per-side override that uses a
-            // revspec ("--a-project-commit HEAD~1") expands the
-            // same way a shared one would.
-            //
-            // Project-side repo: `gix::discover` from cwd, mirroring
-            // `detect_project_commit`'s open mode at sidecar-write
-            // time. `gix::discover` walks parents until it finds a
-            // `.git` marker so the operator can run `cargo ktstr
-            // stats compare` from anywhere inside the project tree;
-            // failure (cwd outside any repo) collapses to `None`
-            // and every input passes through as a literal — matching
-            // the documented "literal fallback" contract.
-            //
-            // Kernel-side repo: `gix::open` against the path in
-            // `KTSTR_KERNEL`, mirroring `detect_kernel_commit`'s
-            // open mode. `KTSTR_KERNEL` unset / empty / non-git
-            // collapses to `None` — every input passes through as
-            // a literal. `KTSTR_KERNEL` may carry a Version /
-            // CacheKey (not a path) on the test/coverage paths;
-            // here on the stats path the caller is doing post-hoc
-            // analysis, so a path is the relevant interpretation.
-            // A non-path value falls through to literal too.
-            let project_repo = std::env::current_dir()
-                .ok()
-                .and_then(|cwd| gix::discover(cwd).ok());
-            // Probe `KTSTR_KERNEL` for the kernel-side git repo.
-            // Path-spec resolution in cargo-ktstr now exports the
-            // CACHE ENTRY directory for clean source trees (see
-            // [`ktstr::cli::resolve_kernel_dir_to_entry`]); a
-            // direct `gix::open` against that dir would fail
-            // because the cache entry is not a git repo. The
-            // shared `recover_local_source_tree` helper reads
-            // `metadata.json` and returns the recorded
-            // `source_tree_path` when present; when absent (the
-            // env value is itself a source tree — the dirty
-            // build-every-time path), fall back to opening the
-            // env value verbatim.
-            let kernel_repo = ktstr::ktstr_kernel_env()
-                .map(std::path::PathBuf::from)
-                .and_then(|p| {
-                    let target = ktstr::cache::recover_local_source_tree(&p).unwrap_or(p);
-                    gix::open(target).ok()
-                });
-            let project_commit =
-                resolve_commit_specs(project_repo.as_ref(), project_commit, "project-commit");
-            let kernel_commit =
-                resolve_commit_specs(kernel_repo.as_ref(), kernel_commit, "kernel-commit");
-            let a_project_commit =
-                resolve_commit_specs(project_repo.as_ref(), a_project_commit, "a-project-commit");
-            let a_kernel_commit =
-                resolve_commit_specs(kernel_repo.as_ref(), a_kernel_commit, "a-kernel-commit");
-            let b_project_commit =
-                resolve_commit_specs(project_repo.as_ref(), b_project_commit, "b-project-commit");
-            let b_kernel_commit =
-                resolve_commit_specs(kernel_repo.as_ref(), b_kernel_commit, "b-kernel-commit");
-            // Construct the BuildCompareFilters from the raw CLI
-            // inputs. Sugar logic (shared `--X` pins both sides;
-            // per-side `--a-X` / `--b-X` REPLACES the shared value
-            // for that side) lives inside `build()` so it's
-            // unit-testable in isolation. The dispatch site stays
-            // a dumb data carrier.
-            let build = BuildCompareFilters {
-                shared_kernel: kernel.clone(),
-                shared_project_commit: project_commit,
-                shared_kernel_commit: kernel_commit,
-                shared_run_source: run_source.clone(),
-                shared_scheduler: scheduler.clone(),
-                shared_topology: topology.clone(),
-                shared_work_type: work_type.clone(),
-                a_kernel: a_kernel.clone(),
-                a_project_commit,
-                a_kernel_commit,
-                a_run_source: a_run_source.clone(),
-                a_scheduler: a_scheduler.clone(),
-                a_topology: a_topology.clone(),
-                a_work_type: a_work_type.clone(),
-                b_kernel: b_kernel.clone(),
-                b_project_commit,
-                b_kernel_commit,
-                b_run_source: b_run_source.clone(),
-                b_scheduler: b_scheduler.clone(),
-                b_topology: b_topology.clone(),
-                b_work_type: b_work_type.clone(),
-            };
-            let (filter_a, filter_b) = build.build();
-            // Bundle the 5 phase-display flags into a single
-            // `PhaseDisplayOptions` value the renderer reads.
-            // Clap's `conflicts_with_all` already enforces the
-            // mutex constraints at parse time, so the struct
-            // construction here can dereference each flag
-            // independently.
-            let phase_opts = ktstr::cli::PhaseDisplayOptions {
-                no_phases: *no_phases,
-                phases_only: *phases_only,
-                steps_only: *steps_only,
-                phase: *phase,
-                phase_threshold: *phase_threshold,
-            };
-            let exit = cli::compare_partitions(
-                &filter_a,
-                &filter_b,
-                filter.as_deref(),
-                &resolved_policy,
-                dir.as_deref(),
-                *no_average,
-                &phase_opts,
-            )
-            .map_err(|e| format!("{e:#}"))?;
-            if exit != 0 {
-                std::process::exit(exit);
-            }
-            Ok(())
-        }
+        }) => run_stats_compare(CompareArgs {
+            filter,
+            threshold,
+            policy,
+            dir,
+            kernel,
+            project_commit,
+            kernel_commit,
+            run_source,
+            cpu_budget,
+            scheduler,
+            topology,
+            work_type,
+            a_kernel,
+            a_project_commit,
+            a_kernel_commit,
+            a_run_source,
+            a_cpu_budget,
+            a_scheduler,
+            a_topology,
+            a_work_type,
+            b_kernel,
+            b_project_commit,
+            b_kernel_commit,
+            b_run_source,
+            b_cpu_budget,
+            b_scheduler,
+            b_topology,
+            b_work_type,
+            no_average,
+            no_phases,
+            phases_only,
+            steps_only,
+            phase,
+            phase_threshold,
+        }),
     }
+}
+
+/// Borrowed view of the `StatsCommand::Compare` variant's fields,
+/// passed to [`run_stats_compare`]. A single struct keeps the
+/// dispatch-to-helper boundary a 1:1 field handoff (vs a 34-arg
+/// positional call); every field is a borrow because the dispatcher
+/// matches on `&Option<StatsCommand>` so the variant is never owned.
+struct CompareArgs<'a> {
+    filter: &'a Option<String>,
+    threshold: &'a Option<f64>,
+    policy: &'a Option<std::path::PathBuf>,
+    dir: &'a Option<std::path::PathBuf>,
+    kernel: &'a Vec<String>,
+    project_commit: &'a Vec<String>,
+    kernel_commit: &'a Vec<String>,
+    run_source: &'a Vec<String>,
+    cpu_budget: &'a Vec<String>,
+    scheduler: &'a Vec<String>,
+    topology: &'a Vec<String>,
+    work_type: &'a Vec<String>,
+    a_kernel: &'a Vec<String>,
+    a_project_commit: &'a Vec<String>,
+    a_kernel_commit: &'a Vec<String>,
+    a_run_source: &'a Vec<String>,
+    a_cpu_budget: &'a Vec<String>,
+    a_scheduler: &'a Vec<String>,
+    a_topology: &'a Vec<String>,
+    a_work_type: &'a Vec<String>,
+    b_kernel: &'a Vec<String>,
+    b_project_commit: &'a Vec<String>,
+    b_kernel_commit: &'a Vec<String>,
+    b_run_source: &'a Vec<String>,
+    b_cpu_budget: &'a Vec<String>,
+    b_scheduler: &'a Vec<String>,
+    b_topology: &'a Vec<String>,
+    b_work_type: &'a Vec<String>,
+    no_average: &'a bool,
+    no_phases: &'a bool,
+    phases_only: &'a bool,
+    steps_only: &'a bool,
+    phase: &'a Option<u16>,
+    phase_threshold: &'a Option<f64>,
+}
+
+/// Dispatch body for `cargo ktstr stats compare`: resolve
+/// `--threshold` / `--policy` into a `ktstr::cli::ComparisonPolicy`,
+/// resolve the project-side / kernel-side git revspecs in the
+/// `--{,a-,b-}{project,kernel}-commit` flags into 7-char short
+/// hashes via [`resolve_commit_specs`], fold the shared / per-side
+/// filter flags into the two `ktstr::cli::RowFilter` instances
+/// through [`BuildCompareFilters`], and call
+/// `cli::compare_partitions`, propagating its exit code.
+fn run_stats_compare(args: CompareArgs<'_>) -> Result<(), String> {
+    let CompareArgs {
+        filter,
+        threshold,
+        policy,
+        dir,
+        kernel,
+        project_commit,
+        kernel_commit,
+        run_source,
+        cpu_budget,
+        scheduler,
+        topology,
+        work_type,
+        a_kernel,
+        a_project_commit,
+        a_kernel_commit,
+        a_run_source,
+        a_cpu_budget,
+        a_scheduler,
+        a_topology,
+        a_work_type,
+        b_kernel,
+        b_project_commit,
+        b_kernel_commit,
+        b_run_source,
+        b_cpu_budget,
+        b_scheduler,
+        b_topology,
+        b_work_type,
+        no_average,
+        no_phases,
+        phases_only,
+        steps_only,
+        phase,
+        phase_threshold,
+    } = args;
+    // Resolve `--threshold N` / `--policy PATH` / neither into
+    // a single `ComparisonPolicy` via the shared resolver (also
+    // used by `perf-delta`). Clap's `conflicts_with` enforces
+    // mutual exclusion at parse time; the resolver's
+    // both-set-is-error branch is the unreachable backstop.
+    let resolved_policy =
+        ktstr::cli::ComparisonPolicy::from_cli_flags(*threshold, policy.as_deref())
+            .map_err(|e| format!("{e:#}"))?;
+    // Resolve git revspecs in `--project-commit` /
+    // `--kernel-commit` flags (HEAD~1, tags, branch names,
+    // `A..B` ranges) into 7-char short hashes BEFORE
+    // constructing BuildCompareFilters. The shared and
+    // per-side vecs each go through `resolve_commit_specs`
+    // independently so a per-side override that uses a
+    // revspec ("--a-project-commit HEAD~1") expands the
+    // same way a shared one would.
+    //
+    // Project-side repo: `gix::discover` from cwd, mirroring
+    // `detect_project_commit`'s open mode at sidecar-write
+    // time. `gix::discover` walks parents until it finds a
+    // `.git` marker so the operator can run `cargo ktstr
+    // stats compare` from anywhere inside the project tree;
+    // failure (cwd outside any repo) collapses to `None`
+    // and every input passes through as a literal — matching
+    // the documented "literal fallback" contract.
+    //
+    // Kernel-side repo: `gix::open` against the path in
+    // `KTSTR_KERNEL`, mirroring `detect_kernel_commit`'s
+    // open mode. `KTSTR_KERNEL` unset / empty / non-git
+    // collapses to `None` — every input passes through as
+    // a literal. `KTSTR_KERNEL` may carry a Version /
+    // CacheKey (not a path) on the test/coverage paths;
+    // here on the stats path the caller is doing post-hoc
+    // analysis, so a path is the relevant interpretation.
+    // A non-path value falls through to literal too.
+    let project_repo = std::env::current_dir()
+        .ok()
+        .and_then(|cwd| gix::discover(cwd).ok());
+    // Probe `KTSTR_KERNEL` for the kernel-side git repo.
+    // Path-spec resolution in cargo-ktstr now exports the
+    // CACHE ENTRY directory for clean source trees (see
+    // [`ktstr::cli::resolve_kernel_dir_to_entry`]); a
+    // direct `gix::open` against that dir would fail
+    // because the cache entry is not a git repo. The
+    // shared `recover_local_source_tree` helper reads
+    // `metadata.json` and returns the recorded
+    // `source_tree_path` when present; when absent (the
+    // env value is itself a source tree — the dirty
+    // build-every-time path), fall back to opening the
+    // env value verbatim.
+    let kernel_repo = ktstr::ktstr_kernel_env()
+        .map(std::path::PathBuf::from)
+        .and_then(|p| {
+            let target = ktstr::cache::recover_local_source_tree(&p).unwrap_or(p);
+            gix::open(target).ok()
+        });
+    let project_commit =
+        resolve_commit_specs(project_repo.as_ref(), project_commit, "project-commit");
+    let kernel_commit = resolve_commit_specs(kernel_repo.as_ref(), kernel_commit, "kernel-commit");
+    let a_project_commit =
+        resolve_commit_specs(project_repo.as_ref(), a_project_commit, "a-project-commit");
+    let a_kernel_commit =
+        resolve_commit_specs(kernel_repo.as_ref(), a_kernel_commit, "a-kernel-commit");
+    let b_project_commit =
+        resolve_commit_specs(project_repo.as_ref(), b_project_commit, "b-project-commit");
+    let b_kernel_commit =
+        resolve_commit_specs(kernel_repo.as_ref(), b_kernel_commit, "b-kernel-commit");
+    // Construct the BuildCompareFilters from the raw CLI
+    // inputs. Sugar logic (shared `--X` pins both sides;
+    // per-side `--a-X` / `--b-X` REPLACES the shared value
+    // for that side) lives inside `build()` so it's
+    // unit-testable in isolation. The dispatch site stays
+    // a dumb data carrier.
+    let build = BuildCompareFilters {
+        shared_kernel: kernel.clone(),
+        shared_project_commit: project_commit,
+        shared_kernel_commit: kernel_commit,
+        shared_run_source: run_source.clone(),
+        shared_cpu_budget: cpu_budget.clone(),
+        shared_scheduler: scheduler.clone(),
+        shared_topology: topology.clone(),
+        shared_work_type: work_type.clone(),
+        a_kernel: a_kernel.clone(),
+        a_project_commit,
+        a_kernel_commit,
+        a_run_source: a_run_source.clone(),
+        a_cpu_budget: a_cpu_budget.clone(),
+        a_scheduler: a_scheduler.clone(),
+        a_topology: a_topology.clone(),
+        a_work_type: a_work_type.clone(),
+        b_kernel: b_kernel.clone(),
+        b_project_commit,
+        b_kernel_commit,
+        b_run_source: b_run_source.clone(),
+        b_cpu_budget: b_cpu_budget.clone(),
+        b_scheduler: b_scheduler.clone(),
+        b_topology: b_topology.clone(),
+        b_work_type: b_work_type.clone(),
+    };
+    let (filter_a, filter_b) = build.build();
+    // Bundle the 5 phase-display flags into a single
+    // `PhaseDisplayOptions` value the renderer reads.
+    // Clap's `conflicts_with_all` already enforces the
+    // mutex constraints at parse time, so the struct
+    // construction here can dereference each flag
+    // independently.
+    let phase_opts = ktstr::cli::PhaseDisplayOptions {
+        no_phases: *no_phases,
+        phases_only: *phases_only,
+        steps_only: *steps_only,
+        phase: *phase,
+        phase_threshold: *phase_threshold,
+    };
+    let exit = cli::compare_partitions(
+        &filter_a,
+        &filter_b,
+        filter.as_deref(),
+        &resolved_policy,
+        dir.as_deref(),
+        *no_average,
+        &phase_opts,
+    )
+    .map_err(|e| format!("{e:#}"))?;
+    if exit != 0 {
+        std::process::exit(exit);
+    }
+    Ok(())
 }
 
 /// Match the on-disk `project_commit` / `kernel_commit` shape:
@@ -479,6 +607,7 @@ pub(crate) struct BuildCompareFilters {
     pub(crate) shared_project_commit: Vec<String>,
     pub(crate) shared_kernel_commit: Vec<String>,
     pub(crate) shared_run_source: Vec<String>,
+    pub(crate) shared_cpu_budget: Vec<String>,
     pub(crate) shared_scheduler: Vec<String>,
     pub(crate) shared_topology: Vec<String>,
     pub(crate) shared_work_type: Vec<String>,
@@ -486,6 +615,7 @@ pub(crate) struct BuildCompareFilters {
     pub(crate) a_project_commit: Vec<String>,
     pub(crate) a_kernel_commit: Vec<String>,
     pub(crate) a_run_source: Vec<String>,
+    pub(crate) a_cpu_budget: Vec<String>,
     pub(crate) a_scheduler: Vec<String>,
     pub(crate) a_topology: Vec<String>,
     pub(crate) a_work_type: Vec<String>,
@@ -493,6 +623,7 @@ pub(crate) struct BuildCompareFilters {
     pub(crate) b_project_commit: Vec<String>,
     pub(crate) b_kernel_commit: Vec<String>,
     pub(crate) b_run_source: Vec<String>,
+    pub(crate) b_cpu_budget: Vec<String>,
     pub(crate) b_scheduler: Vec<String>,
     pub(crate) b_topology: Vec<String>,
     pub(crate) b_work_type: Vec<String>,
@@ -520,6 +651,7 @@ impl BuildCompareFilters {
             project_commits: pick_vec(&self.a_project_commit, &self.shared_project_commit),
             kernel_commits: pick_vec(&self.a_kernel_commit, &self.shared_kernel_commit),
             run_sources: pick_vec(&self.a_run_source, &self.shared_run_source),
+            cpu_budgets: pick_vec(&self.a_cpu_budget, &self.shared_cpu_budget),
             schedulers: pick_vec(&self.a_scheduler, &self.shared_scheduler),
             topologies: pick_vec(&self.a_topology, &self.shared_topology),
             work_types: pick_vec(&self.a_work_type, &self.shared_work_type),
@@ -529,6 +661,7 @@ impl BuildCompareFilters {
             project_commits: pick_vec(&self.b_project_commit, &self.shared_project_commit),
             kernel_commits: pick_vec(&self.b_kernel_commit, &self.shared_kernel_commit),
             run_sources: pick_vec(&self.b_run_source, &self.shared_run_source),
+            cpu_budgets: pick_vec(&self.b_cpu_budget, &self.shared_cpu_budget),
             schedulers: pick_vec(&self.b_scheduler, &self.shared_scheduler),
             topologies: pick_vec(&self.b_topology, &self.shared_topology),
             work_types: pick_vec(&self.b_work_type, &self.shared_work_type),
@@ -614,6 +747,29 @@ mod tests {
             vec![ktstr::cli::Dimension::KernelCommit],
             "differing per-side kernel-commit must derive as a single \
              KernelCommit slicing dim",
+        );
+    }
+
+    /// Disjoint per-side `--a-cpu-budget` / `--b-cpu-budget` derive
+    /// CpuBudget as the slicing dim at the CLI/BuildCompareFilters
+    /// boundary — mirrors the kernel-commit / scheduler slicing tests so
+    /// every sliceable dim has CLI-level coverage of the wiring.
+    #[test]
+    fn build_compare_filters_disjoint_per_side_cpu_budget_slices() {
+        let b = BuildCompareFilters {
+            a_cpu_budget: vec!["4".to_string()],
+            b_cpu_budget: vec!["32".to_string()],
+            ..BuildCompareFilters::default()
+        };
+        let (fa, fb) = b.build();
+        assert_eq!(fa.cpu_budgets, vec!["4"]);
+        assert_eq!(fb.cpu_budgets, vec!["32"]);
+        let slicing = ktstr::cli::derive_slicing_dims(&fa, &fb);
+        assert_eq!(
+            slicing,
+            vec![ktstr::cli::Dimension::CpuBudget],
+            "differing per-side cpu-budget must derive as a single \
+             CpuBudget slicing dim",
         );
     }
 

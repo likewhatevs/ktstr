@@ -499,67 +499,69 @@ pub(super) fn emit_entry_static(input: ItemFn, attrs: AttrValues) -> proc_macro2
         };
     };
 
-    // Both expect_err and expect_ok test bodies share the same
-    // skip-handling arms (harness-not-configured and resource-
-    // contention bailouts) — they only differ on the success arm
-    // and the unconditional-Err arm. Factor the shared arms into
-    // one TokenStream so a future change to skip semantics lands
-    // in one place and both branches inherit it.
-    let skip_arms = quote! {
-        Err(e) if ::ktstr::test_support::is_kernel_unavailable(&e) => {
-            // Harness not configured (no kernel resolved): the
-            // binary was likely invoked outside `cargo ktstr test`,
-            // which builds and injects a kernel automatically.
-            // Skip cleanly so a developer running `cargo nextest
-            // run` directly sees a SKIP banner rather than a
-            // confusing "no kernel found" panic. Applies in both
-            // the expect_err and expect_ok directions — an
-            // expect_err test that never ran is also a non-failure.
-            eprintln!("ktstr: SKIP: harness not configured: {e:#}");
-            return;
-        }
-        Err(e) if ::ktstr::test_support::is_resource_contention(&e) => {
-            // Resource contention is host-infra, not a test
-            // outcome: emit the canonical SKIP banner and early-
-            // return so libtest sees pass. The skip sidecar is
-            // recorded inside `run_ktstr_test_inner` at every
-            // contention site, so stats tooling still sees the
-            // skip without a panic-driven retry. For expect_err
-            // tests this also prevents host contention from
-            // masquerading as the expected failure (a false-
-            // positive pass for the wrong reason).
-            //
-            // KTSTR_NO_SKIP_MODE inverts the policy: CI runs that
-            // demand every test execute against the available
-            // hardware promote contention to a hard failure so a
-            // misconfigured host surfaces instead of silently
-            // passing.
-            if ::std::env::var_os("KTSTR_NO_SKIP_MODE").is_some() {
-                panic!(
-                    "ktstr: FAIL: resource contention under --no-skip-mode: {e:#}. \
-                     Either provision hardware that satisfies the test's topology \
-                     requirement, or drop --no-skip-mode / KTSTR_NO_SKIP_MODE to \
-                     accept the skip."
-                );
-            }
-            eprintln!("ktstr: SKIP: resource contention: {e:#}");
-            return;
+    // Host-error handling shared by the expect_err and expect_ok test
+    // bodies. All SIX host-insufficiency types — KernelUnavailable plus the
+    // five host_topology types — route through the shared
+    // `test_support::classify_host_error`, the single source of truth for
+    // the guard order + per-class skip/fail policy, shared with
+    // `err_to_exit_code` so the two sites cannot drift. (KernelUnavailable
+    // is "harness not configured" — no kernel resolved; classify_host_error
+    // makes it a SKIP by default, a FAIL under KTSTR_NO_SKIP_MODE, same as
+    // the dispatch path.) `classify_host_error` returns a verdict; the
+    // libtest control flow (eprintln + return for a skip, panic for a fail)
+    // lives HERE, in the generated test fn body, so a fail panics in the
+    // test frame. The bare `reason` gets its `ktstr: SKIP:` / `ktstr: FAIL:`
+    // prefix at the emit site, matching the dispatch channels. The trailing
+    // NotHostClass behavior differs per direction (expect_err swallows a
+    // non-host failure; expect_ok panics with it), so it is interpolated.
+    let host_arms = |not_host_class: proc_macro2::TokenStream| {
+        quote! {
+            Err(e) => match ::ktstr::test_support::classify_host_error(
+                &e,
+                ::std::env::var_os("KTSTR_NO_SKIP_MODE").is_some(),
+            ) {
+                ::ktstr::test_support::HostClass::Skip { reason } => {
+                    eprintln!("ktstr: SKIP: {reason}");
+                    return;
+                }
+                ::ktstr::test_support::HostClass::Fail { reason } => {
+                    panic!("ktstr: FAIL: {reason}");
+                }
+                ::ktstr::test_support::HostClass::NotHostClass => #not_host_class,
+            },
         }
     };
     let test_body = if expect_err {
+        // NotHostClass under expect_err: a non-host failure IS the
+        // expected failure, so swallow it. The host-class arms above win
+        // over this swallow (a host-insufficiency skip/fail is never the
+        // test's expected logical failure).
+        let host_arms = host_arms(quote! { {} });
         quote! {
             match ::ktstr::test_support::run_ktstr_test(&#entry_name) {
+                // A skip returns Ok(AssertResult::skip), NOT an Err —
+                // e.g. the overcommit auto-skip, performance_mode /
+                // perf_only skips, or an in-VM scenario topology-floor
+                // skip (all via test_support::eval). A skipped run did
+                // not actually execute, so it is a non-failure in BOTH
+                // directions: an expect_err test that never ran did not
+                // "pass". Route is_skip first (mirroring ok_to_exit_code's
+                // is_skip -> EXIT_PASS precedence) so the skip is not
+                // mistaken for the expected failure. The SKIP banner +
+                // sidecar are already emitted inside run_ktstr_test_inner.
+                Ok(r) if r.is_skip() => {}
                 Ok(_) => panic!("expected test to fail but it passed"),
-                #skip_arms
-                Err(_) => {}
+                #host_arms
             }
         }
     } else {
+        // NotHostClass under expect_ok: a non-host failure is a real
+        // test failure — panic with the full error chain.
+        let host_arms = host_arms(quote! { panic!("{e:#}") });
         quote! {
             match ::ktstr::test_support::run_ktstr_test(&#entry_name) {
                 Ok(_) => {}
-                #skip_arms
-                Err(e) => panic!("{e:#}"),
+                #host_arms
             }
         }
     };

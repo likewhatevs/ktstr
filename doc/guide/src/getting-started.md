@@ -6,7 +6,9 @@
 it does not build or run on other platforms.
 
 - Linux host with KVM access (`/dev/kvm`)
-- Rust toolchain (stable, >= 1.94.1; pinned via `rust-toolchain.toml`)
+- Rust >= 1.94.1 (the crate's MSRV). The ktstr repo itself pins
+  toolchain 1.94.1 via `rust-toolchain.toml`; dev-dependency
+  consumers only need a stable toolchain at or above the MSRV.
 - clang (BPF skeleton compilation)
 - pkg-config, make, gcc
 - autotools (autoconf, autopoint, flex, bison, gawk) -- vendored
@@ -60,7 +62,7 @@ Add ktstr as a dev-dependency:
 
 ```toml
 [dev-dependencies]
-ktstr = { version = "0.15" }
+ktstr = { version = "0.16" }
 ```
 
 ## Kernel discovery

@@ -2208,6 +2208,8 @@ mod tests {
             monitor: None,
             periodic_fired: 0,
             periodic_target: 0,
+            vcpus: 1,
+            cpu_budget: 1,
             stimulus_events: Vec::new(),
             work_type: "SpinWait".to_string(),
             verifier_stats: Vec::new(),
@@ -2710,5 +2712,152 @@ mod tests {
         }
         s.push_str(" not_a_number trailing garbage");
         assert_eq!(parse_start_time_from_stat(&s), None);
+    }
+
+    /// `parse_start_time_from_stat` at the exact 19-vs-20-token edge:
+    /// a stat line with exactly 19 whitespace tokens after the comm
+    /// close-paren consumes all 19 skip iterations (fields 3..=21)
+    /// then the terminating `fields.next()?` finds nothing (field 22
+    /// absent) -> None. Adding ONE more token makes field 22 present
+    /// -> Some. The existing `too_few_fields` test stops at 11 tokens
+    /// (fails mid-skip-loop), never reaching this post-loop read.
+    #[test]
+    fn start_time_parser_field21_present_field22_absent_is_at_edge() {
+        // "S" + 18 numbers = 19 tokens after ')'; field 22 missing.
+        let mut s = String::from("1234 (comm) S");
+        for i in 0..18 {
+            s.push(' ');
+            s.push_str(&i.to_string());
+        }
+        assert_eq!(parse_start_time_from_stat(&s), None);
+        // One more token lands exactly on field 22 -> Some.
+        let mut s2 = s.clone();
+        s2.push_str(" 555");
+        assert_eq!(parse_start_time_from_stat(&s2), Some(555));
+    }
+
+    // ---- comm / start_time /proc accessors ----
+
+    /// `format_comm_suffix` Some arm prepends `" comm="` unconditionally
+    /// (including for an empty `&str`, proving no inner is_empty guard);
+    /// None arm yields the empty string via `unwrap_or_default`.
+    #[test]
+    fn format_comm_suffix_some_and_none_arms() {
+        assert_eq!(format_comm_suffix(Some("worker-0")), " comm=worker-0");
+        assert_eq!(format_comm_suffix(None), "");
+        assert_eq!(format_comm_suffix(Some("")), " comm=");
+    }
+
+    /// `read_thread_comm` success arm reads + trims the kernel's
+    /// trailing-newline comm; the read-failure arm (nonexistent tid)
+    /// returns None. Drives the success path against the test
+    /// process's own main thread comm via `/proc/self/task/<tid>/comm`.
+    #[test]
+    fn read_thread_comm_self_nonempty_and_missing_none() {
+        let pid = self_pid();
+        // SAFETY: `gettid(2)` takes no arguments and returns the
+        // calling thread's tid; always safe. Same pattern as main().
+        let main_tid = unsafe { libc::syscall(libc::SYS_gettid) } as i32;
+        let c = read_thread_comm(pid, main_tid).expect("self comm must be readable");
+        assert!(!c.is_empty(), "self comm must be non-empty");
+        assert_eq!(c, c.trim(), "trailing newline must be stripped");
+        // tid=i32::MAX cannot exist under Linux pid_max <= 2^22, so
+        // the /proc read fails -> None.
+        assert_eq!(read_thread_comm(pid, i32::MAX), None);
+    }
+
+    /// `read_thread_start_time` success arm threads real
+    /// `/proc/<pid>/task/<tid>/stat` field-22 through
+    /// `parse_start_time_from_stat`; the read-failure arm
+    /// (nonexistent tid) returns None.
+    #[test]
+    fn read_thread_start_time_self_some_and_missing_none() {
+        let pid = self_pid();
+        // SAFETY: `gettid(2)` takes no arguments; always safe.
+        let main_tid = unsafe { libc::syscall(libc::SYS_gettid) } as i32;
+        let st = read_thread_start_time(pid, main_tid).expect("self starttime must be readable");
+        assert!(
+            st > 0,
+            "starttime jiffies since boot must be nonzero for a running thread; got {st}",
+        );
+        assert_eq!(read_thread_start_time(pid, i32::MAX), None);
+    }
+
+    /// `append_probe_output_to_sidecar` empty-extension arm of the
+    /// lock_path closure: a sidecar path with NO extension produces a
+    /// bare `<stem>.lock` sibling (not `<ext>.lock`). Every other
+    /// sidecar test uses a `*.json` path, hitting only the
+    /// `format!("{ext}.lock")` arm.
+    #[test]
+    fn sidecar_lock_path_empty_extension_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sidecar_no_ext");
+        std::fs::write(&path, minimal_sidecar_json()).unwrap();
+
+        append_probe_output_to_sidecar(&path, &probe_output_fixture(), 0)
+            .expect("append against extension-less sidecar path");
+
+        let lock = dir.path().join("sidecar_no_ext.lock");
+        assert!(
+            lock.exists(),
+            "empty-ext path must produce a bare `<stem>.lock` sibling at {}",
+            lock.display(),
+        );
+        // The extension-less sidecar still received the appended metric.
+        let sc: ktstr::test_support::SidecarResult =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(sc.metrics.len(), 1, "one appended PayloadMetrics");
+    }
+
+    /// `synthesize_payload_metrics` over an interrupted/empty-snapshots
+    /// `ProbeOutput` (the `RunOutcome::Ok` early-out emits this when
+    /// CLEANUP_REQUESTED fired before snapshot 0): `walk_json_leaves`
+    /// yields only top-level scalar leaves (schema_version / pid /
+    /// started_at_unix_sec) and NO per-thread `.allocated_bytes` /
+    /// `.tid` leaves. `tool_version` (string) and `interrupted` (bool)
+    /// are skipped by the walker. The prefix is still applied to the
+    /// top-level scalars; exit_code / payload_index pass through.
+    #[test]
+    fn synthesize_payload_metrics_empty_snapshots() {
+        let out = ProbeOutput {
+            schema_version: SCHEMA_VERSION,
+            pid: 999,
+            tool_version: "0.0.0",
+            started_at_unix_sec: 1_700_000_000,
+            interval_ms: None,
+            interrupted: true,
+            snapshots: Vec::new(),
+        };
+        let pm = synthesize_payload_metrics(&out, 1, 3).expect("synthesize empty-snapshots");
+        assert_eq!(pm.exit_code, 1);
+        assert_eq!(pm.payload_index, 3);
+        assert!(
+            pm.metrics
+                .iter()
+                .all(|m| m.name.starts_with(&format!("{SIDECAR_METRIC_PREFIX}."))),
+            "every metric name must carry the probe prefix",
+        );
+        assert_eq!(
+            pm.metrics
+                .iter()
+                .filter(|m| m.name.ends_with(".allocated_bytes"))
+                .count(),
+            0,
+            "empty snapshots produce no per-thread allocated_bytes leaf",
+        );
+        assert_eq!(
+            pm.metrics
+                .iter()
+                .filter(|m| m.name.ends_with(".tid"))
+                .count(),
+            0,
+            "empty snapshots produce no per-thread tid leaf",
+        );
+        assert!(
+            pm.metrics
+                .iter()
+                .any(|m| m.name == "jemalloc_probe.pid" && m.value == 999.0),
+            "top-level pid scalar must surface as `jemalloc_probe.pid` == 999.0",
+        );
     }
 }

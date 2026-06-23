@@ -152,6 +152,102 @@ fn scheduler_profile_env(release: bool, release_scheduler: bool) -> Option<&'sta
     (release || release_scheduler).then_some("release")
 }
 
+/// Assemble the cargo `Command` argv + the flag-gated env vars that are
+/// driven purely by the CLI flags — `--cargo-profile release` injection,
+/// the `--no-perf-mode` / `--no-skip-mode` env passthroughs, and the
+/// scheduler-profile env. Split out of [`run_cargo_sub`] as a pure
+/// `Command` factory (no `std::env` reads, no fs, no exec) so the argv
+/// ordering and the flag->env coupling are unit-testable via the stable
+/// [`Command::get_args`] / [`Command::get_envs`] APIs; `run_cargo_sub`
+/// itself execs cargo and can't be inspected directly.
+///
+/// `scheduler_profile` is the already-resolved
+/// [`scheduler_profile_env`] result, threaded in so this builder wires
+/// it without re-deriving the truth table — the wiring (Some -> set the
+/// env, None -> leave it absent) is what these tests pin.
+///
+/// `--cargo-profile release` is prepended BEFORE the user's trailing
+/// `args` so the profile selection applies to the whole invocation.
+/// nextest reads `--cargo-profile` directly; `cargo llvm-cov nextest`
+/// forwards it to its inner nextest invocation. For `cargo llvm-cov
+/// <sub>` (the raw-passthrough binding) the caller passes `release ==
+/// false`, so the release arg is never injected — the raw path relies on
+/// user-supplied `--release` / `--profile`.
+///
+/// The `std::env`-reading envs (prebuilt-blob paths, `LLVM_PROFILE_FILE`
+/// profraw injection) and the kernel-resolution envs are layered on by
+/// `run_cargo_sub` AFTER this returns — they read process env / probe
+/// the kernel cache and are not part of the pure flag->argv/env shape.
+fn build_cargo_command(
+    sub_argv: &[&str],
+    release: bool,
+    no_perf_mode: bool,
+    no_skip_mode: bool,
+    scheduler_profile: Option<&str>,
+    args: &[String],
+) -> Command {
+    let mut cmd = Command::new("cargo");
+    cmd.args(sub_argv);
+    if release {
+        cmd.args(["--cargo-profile", "release"]);
+    }
+    cmd.args(args);
+    if no_perf_mode {
+        cmd.env(ktstr::KTSTR_NO_PERF_MODE_ENV, "1");
+    }
+    if no_skip_mode {
+        cmd.env(ktstr::KTSTR_NO_SKIP_MODE_ENV, "1");
+    }
+    // Build the scheduler-under-test release when either `--release`
+    // (everything release) or `--release-scheduler` (only the scheduler,
+    // harness stays dev) is set. The test binary's `build_and_find_binary`
+    // reads this and adds `--release` to its `cargo build -p <scheduler>`,
+    // decoupling the scheduler profile from the harness profile.
+    if let Some(profile) = scheduler_profile {
+        cmd.env(ktstr::KTSTR_SCHEDULER_PROFILE_ENV, profile);
+    }
+    cmd
+}
+
+/// Consume the resolved `--kernel` set, bailing if a non-empty `kernel`
+/// vec resolved to nothing.
+///
+/// `resolve_kernel_set` skips arguments that trim to empty, so `--kernel
+/// ""` or `--kernel "  "` produce `Ok(vec![])` without ever entering the
+/// per-spec resolve branch. An empty input `kernel` (flag omitted)
+/// likewise yields `Ok(vec![])` — but that is the auto-discovery path,
+/// not an error. This helper distinguishes the two: only an
+/// all-whitespace `--kernel` (non-empty input, empty resolution) is an
+/// operator error worth surfacing; an omitted flag returns `Ok(vec![])`
+/// so the caller falls through to the `find_kernel` chain.
+///
+/// Split out of [`run_cargo_sub`] so the bail diagnostic is unit-testable
+/// without the exec/fs tail — all-whitespace specs reach `resolve_kernel_set`
+/// but `filter_map` drops them before any `KernelId::parse`, so this path
+/// does no network/build I/O.
+fn kernel_set_or_bail(kernel: &[String]) -> Result<Vec<(String, PathBuf)>, String> {
+    if kernel.is_empty() {
+        return Ok(Vec::new());
+    }
+    let resolved = resolve_kernel_set(kernel)?;
+    if resolved.is_empty() {
+        // `resolve_kernel_set` skips arguments that trim to
+        // empty, so `--kernel ""` or `--kernel "  "` reach
+        // here without ever entering the per-spec resolve
+        // branch. Bail with an actionable error rather than
+        // letting the child reach for `find_kernel` as if
+        // `--kernel` had never been passed (which would mask
+        // the operator's intent).
+        return Err(
+            "--kernel: every supplied value parsed to empty / whitespace; \
+             omit the flag for auto-discovery, or supply a kernel \
+             identifier"
+                .to_string(),
+        );
+    }
+    Ok(resolved)
+}
+
 // Private internal dispatch helper with a cohesive run-config arg list
 // (sub-command identity + the four CLI flags + passthrough args);
 // bundling into a struct would not improve clarity for a fn called from
@@ -167,33 +263,14 @@ fn run_cargo_sub(
     release_scheduler: bool,
     args: Vec<String>,
 ) -> Result<(), String> {
-    let mut cmd = Command::new("cargo");
-    cmd.args(sub_argv);
-    if release {
-        // Prepend `--cargo-profile release` BEFORE the user's
-        // trailing args so the profile selection applies to the
-        // whole invocation. nextest reads `--cargo-profile` directly;
-        // `cargo llvm-cov nextest` forwards it to its inner nextest
-        // invocation. For `cargo llvm-cov <sub>` (the raw-passthrough
-        // binding), the release arg is never passed here — the raw
-        // path relies on user-supplied `--release` / `--profile`.
-        cmd.args(["--cargo-profile", "release"]);
-    }
-    cmd.args(&args);
-    if no_perf_mode {
-        cmd.env(ktstr::KTSTR_NO_PERF_MODE_ENV, "1");
-    }
-    if no_skip_mode {
-        cmd.env(ktstr::KTSTR_NO_SKIP_MODE_ENV, "1");
-    }
-    // Build the scheduler-under-test release when either `--release`
-    // (everything release) or `--release-scheduler` (only the scheduler,
-    // harness stays dev) is set. The test binary's `build_and_find_binary`
-    // reads this and adds `--release` to its `cargo build -p <scheduler>`,
-    // decoupling the scheduler profile from the harness profile.
-    if let Some(profile) = scheduler_profile_env(release, release_scheduler) {
-        cmd.env(ktstr::KTSTR_SCHEDULER_PROFILE_ENV, profile);
-    }
+    let mut cmd = build_cargo_command(
+        sub_argv,
+        release,
+        no_perf_mode,
+        no_skip_mode,
+        scheduler_profile_env(release, release_scheduler),
+        &args,
+    );
 
     // Hand the child build cargo-ktstr's embedded busybox / wprof so its
     // build.rs copies them instead of re-downloading (see
@@ -211,23 +288,11 @@ fn run_cargo_sub(
         cmd.env("LLVM_PROFILE_FILE", pat);
     }
 
-    if !kernel.is_empty() {
-        let resolved = resolve_kernel_set(&kernel)?;
-        if resolved.is_empty() {
-            // `resolve_kernel_set` skips arguments that trim to
-            // empty, so `--kernel ""` or `--kernel "  "` reach
-            // here without ever entering the per-spec resolve
-            // branch. Bail with an actionable error rather than
-            // letting the child reach for `find_kernel` as if
-            // `--kernel` had never been passed (which would mask
-            // the operator's intent).
-            return Err(
-                "--kernel: every supplied value parsed to empty / whitespace; \
-                 omit the flag for auto-discovery, or supply a kernel \
-                 identifier"
-                    .to_string(),
-            );
-        }
+    // Empty `kernel` (flag omitted) -> empty set, auto-discovery path.
+    // Non-empty but all-whitespace -> actionable bail (see
+    // `kernel_set_or_bail`). Otherwise the resolved (label, dir) set.
+    let resolved = kernel_set_or_bail(&kernel)?;
+    if !resolved.is_empty() {
         // `KTSTR_KERNEL` always points at the first resolved entry
         // so downstream code that inspects the env directly (e.g.
         // budget listing's vmlinux probe in `dispatch.rs`) sees a
@@ -683,5 +748,211 @@ mod tests {
             vec![("KTSTR_BUSYBOX_BIN", std::ffi::OsString::from("/run/bb"))],
             "busybox present, wprof absent → only the busybox pair",
         );
+    }
+
+    // -- build_cargo_command --
+    //
+    // The pure `Command` factory split out of `run_cargo_sub` so the
+    // argv ordering and flag->env wiring are inspectable via
+    // `Command::get_args` / `Command::get_envs` without execing cargo or
+    // mutating process env. `get_envs` reflects only the explicit
+    // `.env()` mutations on the Command (not the inherited process env),
+    // so these assertions are deterministic under parallel nextest.
+
+    /// Collect a `Command`'s explicitly-set env mutations into a map for
+    /// exact presence/value/absence assertions.
+    fn cmd_env_map(
+        cmd: &Command,
+    ) -> std::collections::BTreeMap<std::ffi::OsString, Option<std::ffi::OsString>> {
+        cmd.get_envs()
+            .map(|(k, v)| (k.to_os_string(), v.map(|v| v.to_os_string())))
+            .collect()
+    }
+
+    /// `release=true` prepends `--cargo-profile release` BEFORE the
+    /// user's trailing args so the profile applies to the whole
+    /// invocation. Byte-exact full argv (order included) — a regression
+    /// that appended the profile after the user args, or dropped the
+    /// prepend, flips this vector.
+    #[test]
+    fn build_cargo_command_release_prepends_profile_before_user_args() {
+        let cmd = build_cargo_command(
+            TEST_SUB_ARGV,
+            true,
+            false,
+            false,
+            None,
+            &["-E".to_string(), "test(foo)".to_string()],
+        );
+        let argv: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
+        assert_eq!(
+            argv,
+            [
+                "nextest",
+                "run",
+                "--cargo-profile",
+                "release",
+                "-E",
+                "test(foo)"
+            ]
+            .map(std::ffi::OsStr::new),
+        );
+    }
+
+    /// `release=false` injects no `--cargo-profile` token, so the user's
+    /// args follow `sub_argv` directly. This is the `run_llvm_cov`
+    /// raw-passthrough contract (`release` hardcoded false): a regression
+    /// that always-prepended the profile would add two tokens and corrupt
+    /// the passthrough argv the user fully controls.
+    #[test]
+    fn build_cargo_command_no_release_omits_profile_flag() {
+        let cmd = build_cargo_command(
+            LLVM_COV_SUB_ARGV,
+            false,
+            false,
+            false,
+            None,
+            &["report".to_string()],
+        );
+        let argv: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
+        assert_eq!(argv, ["llvm-cov", "report"].map(std::ffi::OsStr::new));
+    }
+
+    /// Each of `--no-perf-mode` / `--no-skip-mode` independently gates
+    /// one env var to the literal "1", absent when its flag is false.
+    /// Two invocations — (perf=true,skip=false) and (perf=false,skip=true)
+    /// — pin all four (var, gate-outcome) states: each asserts both the
+    /// presence+value of its own env var AND the absence of the other, so
+    /// a regression swapping the two env names, or dropping a gate, is
+    /// caught.
+    #[test]
+    fn build_cargo_command_perf_and_skip_env_gates() {
+        // perf=true, skip=false → only KTSTR_NO_PERF_MODE="1".
+        let cmd = build_cargo_command(TEST_SUB_ARGV, false, true, false, None, &[]);
+        let map = cmd_env_map(&cmd);
+        assert_eq!(
+            map.get(std::ffi::OsStr::new(ktstr::KTSTR_NO_PERF_MODE_ENV)),
+            Some(&Some(std::ffi::OsString::from("1"))),
+        );
+        assert!(!map.contains_key(std::ffi::OsStr::new(ktstr::KTSTR_NO_SKIP_MODE_ENV)));
+
+        // perf=false, skip=true → only KTSTR_NO_SKIP_MODE="1".
+        let cmd = build_cargo_command(TEST_SUB_ARGV, false, false, true, None, &[]);
+        let map = cmd_env_map(&cmd);
+        assert_eq!(
+            map.get(std::ffi::OsStr::new(ktstr::KTSTR_NO_SKIP_MODE_ENV)),
+            Some(&Some(std::ffi::OsString::from("1"))),
+        );
+        assert!(!map.contains_key(std::ffi::OsStr::new(ktstr::KTSTR_NO_PERF_MODE_ENV)));
+    }
+
+    /// The `scheduler_profile` Option result is wired into the
+    /// `KTSTR_SCHEDULER_PROFILE` env: `Some("release")` sets the var to
+    /// "release"; `None` leaves it absent. `scheduler_profile_env` has
+    /// its own truth-table test; this pins the WIRING (correct var name +
+    /// value, and the absent corner) that a dropped `.env()` call would
+    /// pass past the pure-fn test.
+    #[test]
+    fn build_cargo_command_scheduler_profile_env_wired_from_flags() {
+        // release=false, release_scheduler=true → Some("release").
+        let profile = scheduler_profile_env(false, true);
+        let cmd = build_cargo_command(TEST_SUB_ARGV, false, false, false, profile, &[]);
+        let map = cmd_env_map(&cmd);
+        assert_eq!(
+            map.get(std::ffi::OsStr::new(ktstr::KTSTR_SCHEDULER_PROFILE_ENV)),
+            Some(&Some(std::ffi::OsString::from("release"))),
+        );
+
+        // release=false, release_scheduler=false → None, var absent.
+        let profile = scheduler_profile_env(false, false);
+        let cmd = build_cargo_command(TEST_SUB_ARGV, false, false, false, profile, &[]);
+        let map = cmd_env_map(&cmd);
+        assert!(!map.contains_key(std::ffi::OsStr::new(ktstr::KTSTR_SCHEDULER_PROFILE_ENV)));
+    }
+
+    // -- kernel_set_or_bail --
+    //
+    // resolve_kernel_set drops whitespace-only specs before any
+    // KernelId::parse, so all-whitespace `--kernel` input does no
+    // network/build I/O and the bail is host-isolable.
+
+    /// A non-empty `--kernel` whose every value trims to empty resolves
+    /// to nothing → actionable bail instead of silently falling through
+    /// to auto-discovery (which would mask the operator's intent).
+    #[test]
+    fn kernel_set_or_bail_all_whitespace_bails() {
+        let err = kernel_set_or_bail(&["".to_string(), "  \t ".to_string()])
+            .expect_err("all-whitespace --kernel must bail, not auto-discover");
+        assert!(
+            err.starts_with("--kernel: every supplied value parsed to empty"),
+            "unexpected bail message: {err}",
+        );
+    }
+
+    /// An omitted `--kernel` flag (empty input vec) is the auto-discovery
+    /// path, NOT an error: returns `Ok(empty)` so the caller falls
+    /// through to the `find_kernel` chain without exporting KTSTR_KERNEL.
+    #[test]
+    fn kernel_set_or_bail_empty_input_is_ok_empty() {
+        assert_eq!(kernel_set_or_bail(&[]), Ok(Vec::new()));
+    }
+
+    // -- generate_btf_anchor (no-bpf early return) --
+    //
+    // Only the "no .bpf.o objects found -> None" path is host-isolable:
+    // it returns at the `bpf_object_dirs.is_empty()` gate BEFORE any
+    // env read (BPF_BASE_CFLAGS / BPF_CLANG / ...) and BEFORE the
+    // delegation to `btf_catalog::generate_btf_anchor`, which execs
+    // clang. Driving it past the gate would require a real `bpf.bpf.o`
+    // and would spawn clang, so the populated path is not host-testable
+    // here. These tests exercise the dir scan over a tempdir target so
+    // they touch no env and no subprocess.
+
+    /// A target dir with no `<profile>/build` directory at all: the
+    /// `read_dir(&build_root)` errors, the `if let Ok` is skipped,
+    /// `bpf_object_dirs` stays empty, and the fn returns `None` — for
+    /// BOTH profiles. Pins the `release -> "release"` / `!release ->
+    /// "debug"` selector reaching a missing build root in each case.
+    #[test]
+    fn generate_btf_anchor_missing_build_root_is_none() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert_eq!(generate_btf_anchor(dir.path(), false), None);
+        assert_eq!(generate_btf_anchor(dir.path(), true), None);
+    }
+
+    /// An existing but empty `debug/build` directory: `read_dir` now
+    /// succeeds (Ok branch taken), the entry loop runs zero iterations,
+    /// `bpf_object_dirs` is still empty, so the fn returns `None`.
+    /// Distinct from the missing-root case — exercises the loop body's
+    /// guard rather than the `read_dir` Err short-circuit.
+    #[test]
+    fn generate_btf_anchor_empty_build_root_is_none() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("debug").join("build"))
+            .expect("create debug/build");
+        assert_eq!(generate_btf_anchor(dir.path(), false), None);
+    }
+
+    /// A build-output entry whose `out/` directory exists but lacks the
+    /// `bpf.bpf.o` gate file is NOT collected: `out.join("bpf.bpf.o")
+    /// .is_file()` is false, the entry is skipped, `bpf_object_dirs`
+    /// ends empty, and the fn returns `None`. Pins the gate-file name
+    /// (`bpf.bpf.o`) — a sibling `.o` or a directory by that name must
+    /// not satisfy the `is_file()` check.
+    #[test]
+    fn generate_btf_anchor_build_entry_without_bpf_object_is_none() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = dir
+            .path()
+            .join("debug")
+            .join("build")
+            .join("scx_utils-abc123")
+            .join("out");
+        std::fs::create_dir_all(&out).expect("create out");
+        // A non-gate object and a non-empty file with a near-miss name —
+        // neither is `bpf.bpf.o`, so the entry must be skipped.
+        std::fs::write(out.join("other.bpf.o"), b"x").expect("write other.bpf.o");
+        std::fs::write(out.join("bpf.o"), b"x").expect("write bpf.o");
+        assert_eq!(generate_btf_anchor(dir.path(), false), None);
     }
 }

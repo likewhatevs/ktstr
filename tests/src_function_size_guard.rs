@@ -116,44 +116,12 @@ const DEFAULT_FN_MAX_LINES: usize = 200;
 /// share one deferred task — the mega-function decomposition campaign);
 /// the guard's panic template emits it on every suggested entry.
 const EXCEPTIONS: &[(&str, &str, usize)] = &[
-    ("assert/mod.rs", "AssertPlan::assert_cgroup", 218), // queued: decompose
-    ("bin/cargo_ktstr/kernel/mod.rs", "resolve_kernel_set", 210), // queued: decompose
-    ("bin/cargo_ktstr/stats.rs", "run_stats", 226),      // queued: decompose
-    ("bin/jemalloc_alloc_worker.rs", "main", 206),       // queued: decompose
-    ("bin/ktstr.rs", "write_show", 714),                 // queued: decompose
-    (
-        "cache/cache_dir_tests.rs",
-        "store_in_lock_recheck_mixed_content_peers_publish_one_per_group",
-        215,
-    ), // queued: decompose
-    ("cli/kernel_build/build.rs", "kernel_build_pipeline", 492), // queued: decompose
-    ("ctprof/mod.rs", "capture_with", 473),              // queued: decompose
-    (
-        "ctprof/tests_capture.rs",
-        "capture_with_synthetic_tree_assembles_thread_state",
-        202,
-    ), // queued: decompose
-    ("ctprof_compare/compare.rs", "compare", 710),       // queued: decompose
-    ("ctprof_compare/report/smaps.rs", "write_smaps_section", 212), // queued: decompose
-    ("ctprof_compare/runner.rs", "write_metric_list", 212), // queued: decompose
-    (
-        "ctprof_compare/tests_diff_types.rs",
-        "spec_thread_grouping_verbatim",
-        220,
-    ), // queued: decompose
-    (
-        "ctprof_compare/tests_metrics.rs",
-        "registry_tag_matrix_is_pinned",
-        348,
-    ), // queued: decompose
-    ("export.rs", "generate_preamble", 416),             // queued: decompose
-    ("host_context.rs", "HostContext::diff", 226),       // queued: decompose
-    ("host_thread_probe.rs", "find_jemalloc_via_maps_at", 240), // queued: decompose
+    ("ctprof/mod.rs", "capture_with", 473), // queued: decompose
     ("monitor/btf_render/mod.rs", "chase_arena_pointer", 367), // queued: decompose
     ("monitor/btf_render/mod.rs", "render_cast_pointer", 206), // queued: decompose
     ("monitor/btf_render/mod.rs", "render_value_inner", 461), // queued: decompose
     ("monitor/btf_render/mod.rs", "write_rendered_value", 348), // queued: decompose
-    ("monitor/btf_render/mod.rs", "write_struct", 276),  // queued: decompose
+    ("monitor/btf_render/mod.rs", "write_struct", 276), // queued: decompose
     (
         "monitor/cast_analysis/mod.rs",
         "Analyzer < 'a >::finalize",
@@ -171,72 +139,31 @@ const EXCEPTIONS: &[(&str, &str, usize)] = &[
     ), // queued: decompose
     ("monitor/cast_analysis/mod.rs", "Analyzer < 'a >::run", 226), // queued: decompose
     ("monitor/cast_analysis/mod.rs", "Analyzer < 'a >::step", 391), // queued: decompose
-    ("monitor/cast_analysis/tests.rs", "build_btf", 223), // queued: decompose
+    ("monitor/cast_analysis/tests/mod.rs", "build_btf", 223), // queued: decompose
     (
-        "monitor/cast_analysis/tests.rs",
+        "monitor/cast_analysis/tests/helper_map_crossfn.rs",
         "helper_map_update_then_lookup_propagates_arena_through_map_value",
         220,
     ), // queued: decompose
-    (
-        "monitor/dump/display.rs",
-        "<FailureDumpReport as std :: fmt :: Display>::fmt",
-        240,
-    ), // queued: decompose
-    ("monitor/dump/mod.rs", "dump_state", 1164),         // queued: decompose
-    ("monitor/dump/render_map.rs", "render_map", 583),   // queued: decompose
-    ("monitor/reader.rs", "monitor_loop", 808),          // queued: decompose
-    ("probe/btf.rs", "parse_bpf_btf_functions", 205),    // queued: decompose
-    ("probe/output.rs", "format_probe_events_inner", 330), // queued: decompose
-    ("probe/process.rs", "attach_phase_b_fentry", 494),  // queued: decompose
-    ("probe/process.rs", "run_probe_skeleton", 1295),    // queued: decompose
-    ("scenario/ops/dispatch.rs", "apply_ops", 1122),     // queued: decompose
-    ("scenario/ops/mod.rs", "run_scenario", 379),        // queued: decompose
-    ("scenario/ops/setup.rs", "apply_setup", 562),       // queued: decompose
-    ("scenario/ops/tests.rs", "op_discriminant_values", 210), // queued: decompose
-    (
-        "scenario/snapshot/error.rs",
-        "<SnapshotError as std :: fmt :: Display>::fmt",
-        260,
-    ), // queued: decompose
-    ("stats.rs", "compare_partitions", 413),             // queued: decompose
-    ("stats.rs", "compare_rows_by", 253),                // queued: decompose
-    ("stats.rs", "group_and_average_by", 381),           // queued: decompose
-    (
-        "taskstats.rs",
-        "parse_taskstats_payload_version_boundary_truncation",
-        249,
-    ), // queued: decompose
-    ("test_support/entry.rs", "KtstrTestEntry::validate", 338), // queued: decompose
-    ("test_support/eval/mod.rs", "evaluate_vm_result", 702), // queued: decompose
+    ("monitor/dump/mod.rs", "dump_state", 1166), // queued: decompose
+    ("monitor/dump/render_map.rs", "render_map", 583), // queued: decompose
+    ("monitor/reader.rs", "monitor_loop", 808), // queued: decompose
+    ("probe/process.rs", "attach_phase_b_fentry", 494), // queued: decompose
+    ("probe/process.rs", "run_probe_skeleton", 1295), // queued: decompose
     (
         "test_support/eval/mod.rs",
         "run_ktstr_test_inner_impl",
-        1083,
+        1097,
     ), // queued: decompose
-    ("test_support/probe.rs", "attempt_auto_repro", 450), // queued: decompose
-    (
-        "test_support/probe.rs",
-        "maybe_dispatch_vm_test_with_args",
-        215,
-    ), // queued: decompose
-    (
-        "test_support/probe.rs",
-        "maybe_dispatch_vm_test_with_phase_a",
-        247,
-    ), // queued: decompose
-    ("topology.rs", "TestTopology::from_system", 228),   // queued: decompose
-    ("vmm/builder.rs", "KtstrVmBuilder::build", 288),    // queued: decompose
     (
         "vmm/cast_analysis_load/mod.rs",
         "analyze_one_object_with_btf",
         217,
     ), // queued: decompose
-    ("vmm/cgroup_sandbox.rs", "BuildSandbox::try_create", 246), // queued: decompose
-    ("vmm/disk_template/mod.rs", "build_template_via_vm", 233), // queued: decompose
-    ("vmm/freeze_coord/dispatch.rs", "dispatch_bulk_message", 528), // queued: decompose
-    ("vmm/freeze_coord/mod.rs", "KtstrVm::collect_results", 457), // queued: decompose
+    ("vmm/freeze_coord/dispatch.rs", "dispatch_bulk_message", 534), // queued: decompose
+    ("vmm/freeze_coord/mod.rs", "KtstrVm::collect_results", 474), // queued: decompose
     ("vmm/freeze_coord/mod.rs", "KtstrVm::run_bsp_loop", 328), // queued: decompose
-    ("vmm/freeze_coord/mod.rs", "KtstrVm::run_vm", 9310), // queued: decompose
+    ("vmm/freeze_coord/mod.rs", "KtstrVm::run_vm", 9326), // queued: decompose
     (
         "vmm/freeze_coord/mod.rs",
         "KtstrVm::start_bpf_map_write",
@@ -244,18 +171,9 @@ const EXCEPTIONS: &[(&str, &str, usize)] = &[
     ), // queued: decompose
     ("vmm/freeze_coord/mod.rs", "KtstrVm::start_monitor", 796), // queued: decompose
     ("vmm/freeze_coord/snapshot.rs", "arm_user_watchpoint", 237), // queued: decompose
-    ("vmm/initramfs.rs", "build_initramfs_base", 277),   // queued: decompose
-    ("vmm/mod.rs", "KtstrVm::run_interactive", 813),     // queued: decompose
-    (
-        "vmm/numa_mem.rs",
-        "NumaMemoryLayout::allocate_and_register",
-        212,
-    ), // queued: decompose
+    ("vmm/mod.rs", "KtstrVm::run_interactive", 813), // queued: decompose
     ("vmm/rust_init/dump.rs", "start_sched_exit_monitor", 222), // queued: decompose
-    ("vmm/rust_init/init.rs", "ktstr_guest_init", 765),  // queued: decompose
-    ("vmm/rust_init/relay.rs", "run_relay_session", 209), // queued: decompose
-    ("vmm/sched_stats.rs", "SchedStatsClient::request_raw", 230), // queued: decompose
-    ("vmm/setup/mod.rs", "KtstrVm::setup_memory", 223),  // queued: decompose
+    ("vmm/rust_init/init.rs", "ktstr_guest_init", 765), // queued: decompose
     ("vmm/virtio_blk/control.rs", "VirtioBlk::set_status", 420), // queued: decompose
     (
         "vmm/virtio_blk/device.rs",
@@ -264,23 +182,6 @@ const EXCEPTIONS: &[(&str, &str, usize)] = &[
     ), // queued: decompose
     ("vmm/virtio_blk/drain.rs", "drain_bracket_impl", 1197), // queued: decompose
     ("vmm/virtio_blk/worker.rs", "worker_thread_main", 515), // queued: decompose
-    (
-        "vmm/virtio_net/device.rs",
-        "VirtioNet::pop_and_capture_tx",
-        233,
-    ), // queued: decompose
-    (
-        "vmm/virtio_net/device.rs",
-        "VirtioNet::process_tx_loopback",
-        291,
-    ), // queued: decompose
-    (
-        "vmm/virtio_net/device.rs",
-        "VirtioNet::try_loopback_to_rx",
-        376,
-    ), // queued: decompose
-    ("vmm/x86_64/kvm.rs", "KtstrKvm::new_inner", 353),   // queued: decompose
-    ("vmm/x86_64/topology/mod.rs", "generate_cpuid", 323), // queued: decompose
     ("workload/spawn/mod.rs", "WorkloadHandle::spawn", 232), // queued: decompose
     ("workload/spawn/mod.rs", "WorkloadHandle::spawn_group", 959), // queued: decompose
     (
@@ -294,7 +195,9 @@ const EXCEPTIONS: &[(&str, &str, usize)] = &[
         539,
     ), // queued: decompose
     ("workload/spawn/mod.rs", "spawn_pcomm_container", 781), // queued: decompose
-    ("workload/worker/mod.rs", "worker_main", 3268),     // queued: decompose
+    ("workload/worker/mod.rs", "worker_main", 3275), // queued: decompose
+                                            // Added for post-fmt + recent-work growth; path order is cosmetic
+                                            // (the guard collects EXCEPTIONS into a BTreeMap). queued: decompose.
 ];
 
 fn src_root() -> PathBuf {

@@ -12,7 +12,7 @@ use anyhow::{Context, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
 use std::os::unix::io::FromRawFd;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use super::affinity::{AffinityIntent, ResolvedAffinity, resolve_affinity, set_thread_affinity};
@@ -115,12 +115,50 @@ pub(super) const FUTEX_WAIT_TIMEOUT: libc::timespec = libc::timespec {
 /// downstream assertions.
 pub(super) const FAN_OUT_POST_WAKE_SPIN_ITERS: u64 = 256;
 
+/// Outcome of [`apply_mempolicy_with_flags`].
+///
+/// Makes each branch of the apply path observable to tests and any
+/// future caller that wants to react to the result (the production
+/// worker-setup caller in `worker::worker_main` discards it — applying
+/// the policy is best-effort there, matching the `setpriority` /
+/// `set_sched_policy` soft-fail idiom). The variants partition the
+/// function's exits exactly:
+///
+/// - [`SkippedDefault`](MempolicyOutcome::SkippedDefault): `policy ==
+///   MemPolicy::Default` — no syscall (inherit the parent's policy).
+/// - [`SkippedEmpty`](MempolicyOutcome::SkippedEmpty): a
+///   node-set-bearing variant (`Bind` / `Interleave` /
+///   `PreferredMany` / `WeightedInterleave`) carried an empty set — no
+///   `set_mempolicy(2)` is issued. Issuing one with an empty mask
+///   would be a different (and wrong) request to the kernel, so the
+///   skip is the contract, not merely "did not crash".
+/// - [`Applied`](MempolicyOutcome::Applied): `set_mempolicy(2)`
+///   returned 0.
+/// - [`Failed`](MempolicyOutcome::Failed): `set_mempolicy(2)` returned
+///   non-zero; the errno is logged to stderr and carried here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum MempolicyOutcome {
+    /// `MemPolicy::Default` — no syscall.
+    SkippedDefault,
+    /// A node-set variant with an empty set — no syscall.
+    SkippedEmpty,
+    /// `set_mempolicy(2)` succeeded.
+    Applied,
+    /// `set_mempolicy(2)` failed; carries the errno.
+    Failed(i32),
+}
+
 /// Call `set_mempolicy(2)` for the current process with mode flags.
 ///
-/// No-op for `MemPolicy::Default`. Logs a warning on syscall failure.
-pub(super) fn apply_mempolicy_with_flags(policy: &MemPolicy, flags: MpolFlags) {
+/// No-op for `MemPolicy::Default` (returns
+/// [`MempolicyOutcome::SkippedDefault`]) and for a node-set variant
+/// with an empty set (returns [`MempolicyOutcome::SkippedEmpty`]).
+/// Logs a warning on syscall failure and returns
+/// [`MempolicyOutcome::Failed`]; returns [`MempolicyOutcome::Applied`]
+/// on success.
+pub(super) fn apply_mempolicy_with_flags(policy: &MemPolicy, flags: MpolFlags) -> MempolicyOutcome {
     let (mode, node_set): (i32, BTreeSet<usize>) = match policy {
-        MemPolicy::Default => return,
+        MemPolicy::Default => return MempolicyOutcome::SkippedDefault,
         MemPolicy::Bind(nodes) => (libc::MPOL_BIND, nodes.clone()),
         MemPolicy::Preferred(node) => (libc::MPOL_PREFERRED, [*node].into_iter().collect()),
         MemPolicy::Interleave(nodes) => (libc::MPOL_INTERLEAVE, nodes.clone()),
@@ -136,17 +174,16 @@ pub(super) fn apply_mempolicy_with_flags(policy: &MemPolicy, flags: MpolFlags) {
                 )
             };
             if rc != 0 {
-                eprintln!(
-                    "ktstr: set_mempolicy(MPOL_LOCAL) failed: {}",
-                    std::io::Error::last_os_error(),
-                );
+                let err = std::io::Error::last_os_error();
+                eprintln!("ktstr: set_mempolicy(MPOL_LOCAL) failed: {err}");
+                return MempolicyOutcome::Failed(err.raw_os_error().unwrap_or(0));
             }
-            return;
+            return MempolicyOutcome::Applied;
         }
     };
     if node_set.is_empty() {
         eprintln!("ktstr: set_mempolicy: empty node set, skipping");
-        return;
+        return MempolicyOutcome::SkippedEmpty;
     }
     let (mask, maxnode) = build_nodemask(&node_set);
     let effective_mode = mode | flags.bits() as i32;
@@ -159,13 +196,11 @@ pub(super) fn apply_mempolicy_with_flags(policy: &MemPolicy, flags: MpolFlags) {
         )
     };
     if rc != 0 {
-        eprintln!(
-            "ktstr: set_mempolicy(mode={}, nodes={:?}) failed: {}",
-            mode,
-            node_set,
-            std::io::Error::last_os_error(),
-        );
+        let err = std::io::Error::last_os_error();
+        eprintln!("ktstr: set_mempolicy(mode={mode}, nodes={node_set:?}) failed: {err}");
+        return MempolicyOutcome::Failed(err.raw_os_error().unwrap_or(0));
     }
+    MempolicyOutcome::Applied
 }
 
 /// Terminate the calling forked-child worker with success status (code 0).
@@ -427,9 +462,25 @@ pub struct WorkerReport {
     /// (`completed: false, iterations: 0` — the sentinel shape).
     pub completed: bool,
     /// Per-NUMA-node page counts from `/proc/self/numa_maps` after workload.
-    /// Keyed by node ID. Empty when numa_maps is unavailable.
+    /// Keyed by node ID. Empty when numa_maps is unavailable. numa_maps reports
+    /// the per-node RESIDENT pages of the calling task's mm. For
+    /// [`CloneMode::Fork`] workers (the scenario-engine default) each worker has
+    /// a disjoint mm, so SUMming across workers is the true cgroup page total;
+    /// for [`CloneMode::Thread`] siblings share one mm and each reports the SAME
+    /// residency, so a SUM counts shared pages once per thread. Consumers
+    /// (cgroup_stats / phase_cgroup_stats) SUM
+    /// this — correct for the Fork default; the Thread-mode caveat is inherited
+    /// identically by both reducers (no per-phase divergence).
     pub numa_pages: BTreeMap<usize, u64>,
-    /// Delta of `/proc/vmstat` `numa_pages_migrated` over the work loop.
+    /// Delta of `/proc/vmstat` `numa_pages_migrated` over the work loop. This is
+    /// the SYSTEM-WIDE vmstat `NUMA_PAGE_MIGRATE` vm_event (summed across all
+    /// CPUs), NOT the per-task `task_struct` field of the same name surfaced in
+    /// `/proc/PID/sched`. Because every worker reads the same system-wide
+    /// counter, consumers fold it as MAX across workers (a SUM would inflate it
+    /// by the worker count) — see `PhaseCgroupStats::cross_node_migrated`. The vm_event is bumped only by
+    /// NUMA balancing (the source of NUMA page migrations), so the delta is 0 on
+    /// kernels/configs without it (a measurement-availability caveat, not a wrong
+    /// value).
     pub vmstat_numa_pages_migrated: u64,
     /// Diagnostic attached only to sentinel reports — populated when
     /// `stop_and_collect` synthesized the entry because no (or
@@ -526,6 +577,91 @@ pub struct WorkerReport {
     /// Option<…> tag (one byte) is the only overhead on the
     /// success path.
     pub affinity_error: Option<String>,
+    /// Per-phase telemetry slices for a backdrop (persistent) worker
+    /// that spanned multiple scenario steps. EMPTY for step-local
+    /// workers and for any backdrop worker that observed no phase
+    /// boundary: the worker pushes a [`PhaseSlice`] only when the
+    /// parent-driven `phase_epoch` actually changes, so a worker whose
+    /// epoch never moved (step-local pools are never bumped) ships none
+    /// — keeping the wire empty on the common path. Each slice carries
+    /// the per-phase subset of the whole-run telemetry above, scoped to
+    /// one phase's hold window; the host expands these into per-epoch
+    /// `PhaseBucket` entries — the per-phase attribution a backdrop
+    /// worker otherwise lacks, since it is collected once with
+    /// `step_index = None`.
+    ///
+    /// Appended LAST so the positional postcard decode order of every
+    /// prior field is unchanged. `#[claim(skip)]`: there is no
+    /// test-author claim surface for the raw wire slices — assertions
+    /// run against the host-expanded `PhaseCgroupStats` carriers, which
+    /// carry their own `#[derive(Claim)]`.
+    #[claim(skip)]
+    pub phase_slices: Vec<PhaseSlice>,
+}
+
+/// Per-phase telemetry for one backdrop worker over one scenario
+/// step's HOLD window `[StepStart(k), StepEnd(k))`. A backdrop worker
+/// spans every phase, so it accumulates a fresh slice between each
+/// parent-driven `phase_epoch` transition and finalizes it when the
+/// epoch moves (drain-on-change). Carries the per-phase subset of
+/// [`WorkerReport`]'s whole-run telemetry that has a host-side
+/// per-cgroup carrier (`PhaseCgroupStats`), so the host can pool slices
+/// across workers into per-epoch `PhaseBucket`s. Counter fields are
+/// per-phase deltas (`end_snap − start_snap`, re-baselined at each
+/// boundary); `cpus_used` and `numa_pages` are per-phase observations
+/// (gauges). Excludes `iteration_costs_ns` — that reservoir has no
+/// per-cgroup carrier at any level (it feeds only the run-level
+/// benchmark gate).
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PhaseSlice {
+    /// The 1-indexed phase this slice covers (scenario Step k → k+1;
+    /// `0` = BASELINE, `u32::MAX` = inter-step gap). The host maps this
+    /// to a `PhaseBucket.step_index`; gap- and baseline-tagged slices
+    /// have no host bucket and are discarded.
+    pub phase_epoch: u32,
+    /// CPUs this worker ran on DURING this phase.
+    pub cpus_used: BTreeSet<usize>,
+    /// Per-wakeup latency samples (ns) recorded during this phase,
+    /// reservoir-clamped to at most `MAX_PHASE_WAKE_SAMPLES` — a
+    /// smaller cap than the whole-run `MAX_WAKE_SAMPLES` so a worker
+    /// spanning many phases stays within the report pipe. The host
+    /// re-caps the merged per-cgroup pool at the larger
+    /// `MAX_WAKE_SAMPLES`.
+    pub wake_latencies_ns: Vec<u64>,
+    /// Total wake observations during this phase, INCLUDING any the
+    /// reservoir dropped — the true population for unbiased
+    /// cross-phase weighting.
+    pub wake_sample_total: u64,
+    /// `/proc/self/schedstat` run_delay (field 2) delta over this phase (ns).
+    pub run_delay_ns: u64,
+    /// Off-CPU time during this phase (ns): `wall_ns − cpu_time` over
+    /// the phase. Paired with `wall_ns` so the host derives the
+    /// off-CPU fraction and skips the not-measured `wall_ns == 0` case
+    /// rather than dividing by zero.
+    pub off_cpu_ns: u64,
+    /// Wall-clock duration of this phase as the worker observed it
+    /// (ns) — the denominator for the off-CPU fraction. `0` for a
+    /// phase the worker never ran in (not-measured).
+    pub wall_ns: u64,
+    /// CPU migrations observed during this phase.
+    pub migration_count: u64,
+    /// Outer-loop iterations during this phase.
+    pub iterations: u64,
+    /// `/proc/self/schedstat` cpu_time (field 1, sum_exec_runtime)
+    /// delta over this phase (ns).
+    pub schedstat_cpu_time_ns: u64,
+    /// Per-NUMA-node resident page counts observed at this phase's end
+    /// (`/proc/self/numa_maps`). A gauge, not a delta.
+    pub numa_pages: BTreeMap<usize, u64>,
+    /// `/proc/vmstat numa_pages_migrated` delta over this phase
+    /// (system-wide counter; host folds as MAX across workers).
+    pub vmstat_numa_pages_migrated: u64,
+    /// Longest checkpoint-to-checkpoint wall gap during this phase (ms).
+    pub max_gap_ms: u64,
+    /// CPU where this phase's longest gap happened — coupled with
+    /// `max_gap_ms` as an argmax pair (a bare max would desync the gap
+    /// from its CPU).
+    pub max_gap_cpu: usize,
 }
 
 /// Reason a sentinel [`WorkerReport`] was synthesized — attached to
@@ -949,6 +1085,20 @@ pub struct WorkloadHandle {
     iter_counters: *mut AtomicU64,
     /// Number of AtomicU64 slots in iter_counters (== num_workers at spawn time).
     iter_counter_len: usize,
+    /// MAP_SHARED single-word phase-epoch region. The scenario engine
+    /// stores the current 1-indexed phase here (0 = BASELINE, Step k →
+    /// k + 1, `u32::MAX` = inter-step gap); every backdrop worker of
+    /// this handle reads the SAME pointer (not a per-worker slot — the
+    /// epoch is a broadcast value, all the handle's workers transition
+    /// phases together) to attribute its per-phase `PhaseSlice`s. A
+    /// single `AtomicU32`, not the per-worker `AtomicU64` layout of
+    /// `iter_counters`, because one shared word suffices. Null until
+    /// the spawn-site mmap installs it.
+    phase_epoch: *mut AtomicU32,
+    /// Byte length of the `phase_epoch` mmap, for `munmap` on drop
+    /// (`size_of::<AtomicU32>()`; the kernel rounds the mapping up to a
+    /// page).
+    phase_epoch_bytes: usize,
     /// Inter-worker paired pipes `(ab, ba)` for PipeIo / CachePipe.
     /// Transferred from [`SpawnGuard`] on success; closed by
     /// [`WorkloadHandle::drop`] AFTER worker shutdown so Thread-mode
@@ -1011,6 +1161,10 @@ pub(super) fn futex_region_size_for(work_type: &WorkType) -> usize {
             let q = std::cmp::min(*queue_depth_target as usize, usize::MAX / 8 - 4);
             32 + q * 8
         }
+        // SignalStorm exchanges two u32 tid slots through the region
+        // (worker 0's tid @ offset 0, worker 1's @ offset 4), so it
+        // needs 8 bytes, not the default single u32.
+        WorkType::SignalStorm { .. } => 2 * std::mem::size_of::<u32>(),
         _ => std::mem::size_of::<u32>(),
     }
 }
@@ -1064,6 +1218,11 @@ pub(super) struct SpawnGuard {
     /// Typed matches the handle field; see `WorkloadHandle::iter_counters`.
     iter_counters: *mut AtomicU64,
     iter_counter_bytes: usize,
+    /// Per-handle phase-epoch region (transferred to handle on
+    /// success). Single `AtomicU32` word shared by all the handle's
+    /// workers; see `WorkloadHandle::phase_epoch`.
+    phase_epoch: *mut AtomicU32,
+    phase_epoch_bytes: usize,
     /// Already-forked children (either conventional workers or
     /// pcomm containers) with their parent-side pipe fds and
     /// per-child decoding shape (transferred to handle on success).
@@ -1084,6 +1243,8 @@ impl SpawnGuard {
             futex_region_sizes: Vec::new(),
             iter_counters: std::ptr::null_mut(),
             iter_counter_bytes: 0,
+            phase_epoch: std::ptr::null_mut(),
+            phase_epoch_bytes: 0,
             children: Vec::new(),
             threads: Vec::new(),
         }
@@ -1109,6 +1270,8 @@ impl SpawnGuard {
         let iter_counters = std::mem::replace(&mut self.iter_counters, std::ptr::null_mut());
         let iter_counter_bytes = std::mem::replace(&mut self.iter_counter_bytes, 0);
         let iter_counter_len = iter_counter_bytes / std::mem::size_of::<AtomicU64>();
+        let phase_epoch = std::mem::replace(&mut self.phase_epoch, std::ptr::null_mut());
+        let phase_epoch_bytes = std::mem::replace(&mut self.phase_epoch_bytes, 0);
         let pipe_pairs = std::mem::take(&mut self.pipe_pairs);
         let chain_pipes = std::mem::take(&mut self.chain_pipes);
         WorkloadHandle {
@@ -1119,6 +1282,8 @@ impl SpawnGuard {
             futex_region_sizes,
             iter_counters,
             iter_counter_len,
+            phase_epoch,
+            phase_epoch_bytes,
             pipe_pairs,
             chain_pipes,
         }
@@ -1208,10 +1373,18 @@ impl Drop for SpawnGuard {
                 );
             }
         }
+        if !self.phase_epoch.is_null() && self.phase_epoch_bytes > 0 {
+            unsafe {
+                libc::munmap(
+                    self.phase_epoch as *mut libc::c_void,
+                    self.phase_epoch_bytes,
+                );
+            }
+        }
     }
 }
 
-// SAFETY: futex_ptrs and iter_counters are MAP_SHARED anonymous pages
+// SAFETY: futex_ptrs, iter_counters, and phase_epoch are MAP_SHARED anonymous pages
 // created before fork, so every forked child inherits a pointer copy
 // of the same underlying kernel object. Children read/write their own
 // futex word — via `std::ptr::read_volatile`/`write_volatile` for
@@ -1251,6 +1424,13 @@ impl Drop for SpawnGuard {
 //   MAP_SHARED region is allocated once before any worker spawns
 //   and `munmap`ped after every worker has been joined, so the
 //   underlying kernel object outlives every alias.
+//
+// `phase_epoch` follows the same MAP_SHARED aliasing rules with the
+// roles reversed: the parent (scenario engine) is the sole WRITER of
+// the single `AtomicU32` word (Release stores at each step boundary)
+// and the backdrop workers are READERS (Relaxed loads). It is
+// telemetry — no happens-before edge is required, matching the
+// `iter_counters` Relaxed-store / Relaxed-read precedent.
 unsafe impl Send for WorkloadHandle {}
 unsafe impl Sync for WorkloadHandle {}
 
@@ -1296,6 +1476,23 @@ impl SendIterSlotPtr {
 
     fn into_raw(self) -> *mut AtomicU64 {
         self.0 as *mut AtomicU64
+    }
+}
+
+/// Send-safe carrier for the single shared `phase_epoch` word (the SAME
+/// pointer for every worker in a group), mirroring [`SendIterSlotPtr`].
+/// Round-trips the address through `usize` so a worker closure's capture
+/// set stays `Send` (no raw-pointer field in the closure type).
+#[derive(Clone, Copy)]
+pub(super) struct SendPhaseEpochPtr(usize);
+
+impl SendPhaseEpochPtr {
+    fn new(p: *mut AtomicU32) -> Self {
+        SendPhaseEpochPtr(p as usize)
+    }
+
+    fn into_raw(self) -> *mut AtomicU32 {
+        self.0 as *mut AtomicU32
     }
 }
 
@@ -1658,6 +1855,7 @@ pub(super) fn spawn_thread_worker(
     worker_pipe_fds: Option<(i32, i32)>,
     worker_futex: Option<(*mut u32, usize)>,
     iter_slot: *mut AtomicU64,
+    phase_epoch: *mut AtomicU32,
 ) -> Result<()> {
     use std::sync::Arc;
     use std::sync::atomic::AtomicI32;
@@ -1718,6 +1916,7 @@ pub(super) fn spawn_thread_worker(
     // raw-pointer field appears in the closure type).
     let futex_send = SendFutexPtr::new(worker_futex);
     let iter_slot_send = SendIterSlotPtr::new(iter_slot);
+    let phase_epoch_send = SendPhaseEpochPtr::new(phase_epoch);
 
     let join = std::thread::Builder::new()
         .name(format!("ktstr-worker-g{group_idx}-{}", guard.threads.len()))
@@ -1777,6 +1976,7 @@ pub(super) fn spawn_thread_worker(
             // live when worker_main dereferences them.
             let futex = futex_send.into_raw();
             let slot = iter_slot_send.into_raw();
+            let epoch = phase_epoch_send.into_raw();
 
             worker_main(
                 affinity,
@@ -1792,6 +1992,7 @@ pub(super) fn spawn_thread_worker(
                 worker_pipe_fds,
                 futex,
                 slot,
+                epoch,
                 &stop_thread,
                 group_idx,
             )
@@ -2296,6 +2497,7 @@ pub(super) fn spawn_pcomm_container(
             let chain_pipes_snapshot: Vec<Vec<[i32; 2]>> = guard.chain_pipes.clone();
             let futex_ptrs_snapshot: Vec<*mut u32> = guard.futex_ptrs.clone();
             let iter_counters_base = guard.iter_counters;
+            let phase_epoch_base = guard.phase_epoch;
 
             for (group, res) in groups.iter().zip(resources.iter()) {
                 let num_workers = group.num_workers;
@@ -2377,6 +2579,7 @@ pub(super) fn spawn_pcomm_container(
                     // wrapper pattern `spawn_thread_worker` uses).
                     let futex_send = SendFutexPtr::new(worker_futex);
                     let iter_slot_send = SendIterSlotPtr::new(iter_slot);
+                    let phase_epoch_send = SendPhaseEpochPtr::new(phase_epoch_base);
 
                     let work_type = group.work_type.clone();
                     let sched_policy = group.sched_policy;
@@ -2446,6 +2649,7 @@ pub(super) fn spawn_pcomm_container(
 
                             let futex = futex_send.into_raw();
                             let slot = iter_slot_send.into_raw();
+                            let epoch = phase_epoch_send.into_raw();
                             worker_main(
                                 affinity,
                                 work_type,
@@ -2460,6 +2664,7 @@ pub(super) fn spawn_pcomm_container(
                                 worker_pipe_fds,
                                 futex,
                                 slot,
+                                epoch,
                                 &STOP,
                                 group_idx,
                             )
@@ -2945,6 +3150,34 @@ impl WorkloadHandle {
         guard.iter_counters = ptr as *mut AtomicU64;
         guard.iter_counter_bytes = size;
 
+        // Single shared phase-epoch word (MAP_SHARED, zero-init to
+        // 0 = BASELINE) — same role as in `WorkloadHandle::spawn`: the
+        // scenario engine bumps it per step boundary and backdrop
+        // workers read it for per-phase attribution.
+        let epoch_size = std::mem::size_of::<AtomicU32>();
+        let epoch_ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                epoch_size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if epoch_ptr == libc::MAP_FAILED {
+            let errno = std::io::Error::last_os_error();
+            let hint = mmap_shared_anon_errno_hint(errno.raw_os_error());
+            anyhow::bail!(
+                "mmap(MAP_SHARED|MAP_ANONYMOUS, {epoch_size} bytes) for the \
+                 phase-epoch word (pcomm={pcomm:?}) failed: {errno}{hint}; \
+                 this single AtomicU32 broadcasts the current phase to \
+                 backdrop workers for per-phase attribution.",
+            );
+        }
+        guard.phase_epoch = epoch_ptr as *mut AtomicU32;
+        guard.phase_epoch_bytes = epoch_size;
+
         // Per-group resource allocation (pipe pairs, chain pipes,
         // futex regions). Same shape as `WorkloadHandle::spawn_group`'s
         // prologue but inlined here so the per-group bookkeeping
@@ -3294,6 +3527,35 @@ impl WorkloadHandle {
             }
             guard.iter_counters = ptr as *mut AtomicU64;
             guard.iter_counter_bytes = size;
+            // Single shared phase-epoch word (MAP_SHARED, MAP_ANONYMOUS
+            // zero-inits it to 0 = BASELINE). The scenario engine bumps
+            // it at each step boundary; backdrop workers read it to
+            // attribute per-phase telemetry. Allocated for every handle
+            // — a step-local pool whose epoch is never bumped simply
+            // observes no change and emits no PhaseSlices.
+            let epoch_size = std::mem::size_of::<AtomicU32>();
+            let epoch_ptr = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    epoch_size,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_SHARED | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+            };
+            if epoch_ptr == libc::MAP_FAILED {
+                let errno = std::io::Error::last_os_error();
+                let hint = mmap_shared_anon_errno_hint(errno.raw_os_error());
+                anyhow::bail!(
+                    "mmap(MAP_SHARED|MAP_ANONYMOUS, {epoch_size} bytes) for the \
+                     phase-epoch word failed: {errno}{hint}; this single \
+                     AtomicU32 lets the scenario engine broadcast the current \
+                     phase to backdrop workers for per-phase attribution.",
+                );
+            }
+            guard.phase_epoch = epoch_ptr as *mut AtomicU32;
+            guard.phase_epoch_bytes = epoch_size;
         }
 
         // Spawn each group in declaration order. `iter_offset`
@@ -3557,6 +3819,11 @@ impl WorkloadHandle {
             } else {
                 std::ptr::null_mut()
             };
+            // Single shared phase-epoch word — the SAME pointer for every
+            // worker (no per-worker offset). Non-null for every handle; the
+            // scenario bumps it only for backdrop handles, so step-local
+            // workers observe no change and emit no slices.
+            let phase_epoch_ptr: *mut AtomicU32 = guard.phase_epoch;
 
             // Per-mode dispatch. Thread-mode workers do not need
             // pipes — the rendezvous and report channels are
@@ -3572,6 +3839,7 @@ impl WorkloadHandle {
                         worker_pipe_fds,
                         worker_futex,
                         iter_slot,
+                        phase_epoch_ptr,
                     )?;
                     continue;
                 }
@@ -4230,6 +4498,7 @@ impl WorkloadHandle {
                                 worker_pipe_fds,
                                 worker_futex,
                                 iter_slot,
+                                phase_epoch_ptr,
                                 &STOP,
                                 group.group_idx,
                             );
@@ -4541,6 +4810,26 @@ impl WorkloadHandle {
                 unsafe { &*self.iter_counters.add(i) }.load(Ordering::Relaxed)
             })
             .collect()
+    }
+
+    /// Broadcast the current scenario phase to this handle's workers.
+    /// The scenario engine calls this at each step boundary — the
+    /// 1-indexed phase (Step k → k + 1) at StepStart, `u32::MAX` (the
+    /// inter-step gap sentinel) at StepEnd — so a backdrop worker
+    /// drains a per-phase `PhaseSlice` on each transition. No-op when
+    /// the handle has no `phase_epoch` region. Release store pairs with
+    /// the worker's Relaxed load; it is telemetry, so no happens-before
+    /// edge is required (see the `unsafe impl Send for WorkloadHandle`
+    /// SAFETY note), but Release keeps the store promptly visible.
+    pub(crate) fn set_phase_epoch(&self, epoch: u32) {
+        if self.phase_epoch.is_null() {
+            return;
+        }
+        // SAFETY: alignment + atomic-only-access invariant established
+        // at the phase_epoch mmap site in `WorkloadHandle::spawn` /
+        // `spawn_pcomm_cgroup` and carried by the `*mut AtomicU32`
+        // type. The parent is the sole writer; workers are readers.
+        unsafe { &*self.phase_epoch }.store(epoch, Ordering::Release);
     }
 
     /// Stop all workers, collect their reports, and wait for exit.
@@ -5347,6 +5636,14 @@ impl Drop for WorkloadHandle {
                 libc::munmap(
                     self.iter_counters as *mut libc::c_void,
                     self.iter_counter_len * std::mem::size_of::<u64>(),
+                );
+            }
+        }
+        if !self.phase_epoch.is_null() && self.phase_epoch_bytes > 0 {
+            unsafe {
+                libc::munmap(
+                    self.phase_epoch as *mut libc::c_void,
+                    self.phase_epoch_bytes,
                 );
             }
         }

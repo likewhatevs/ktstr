@@ -22,13 +22,21 @@ pub struct TopoPreset {
 
 /// Topology presets used by gauntlet mode.
 ///
-/// Ranges from `tiny-1llc` (4 CPUs) to `max-cpu` (252 CPUs, near
-/// the KVM vCPU limit). Includes multi-NUMA presets (`numa2-*`,
-/// `numa4-*`) for cross-node scheduling; filtered by default
-/// (`max_numa_nodes: Some(1)`). On aarch64, presets with SMT
-/// (`threads_per_core > 1`) are excluded because ARM64 CPUs do not
-/// have SMT. Non-SMT medium/large/max presets ensure ARM64 still
-/// gets full topology scale coverage.
+/// Covers topologies from `tiny-1llc` (4 CPUs) up to the
+/// `max-cpu` / `max-cpu-nosmt` presets (252 CPUs, near the KVM
+/// vCPU limit), spanning SMT, non-SMT (`-nosmt`), and multi-NUMA
+/// (`numa2-*`, `numa4-*`) families. Returned in `defs` / `numa_defs`
+/// declaration order, not by size.
+///
+/// The full set is returned unconditionally; the only filter applied
+/// here is the aarch64 retain below, which drops SMT presets
+/// (`threads_per_core > 1`) because ARM64 CPUs have no SMT (the
+/// non-SMT medium/large/max presets keep ARM64's topology scale
+/// coverage). The multi-NUMA presets are *not* filtered here: the
+/// default [`crate::test_support::TopologyConstraints`]
+/// (`max_numa_nodes: Some(1)`) excludes them at test-selection time
+/// (via `accepts` / `accepts_no_perf_mode`) unless a test raises
+/// the bound.
 pub fn gauntlet_presets() -> Vec<TopoPreset> {
     let defs: &[(&str, &str, u32, u32, u32, usize)] = &[
         ("tiny-1llc", "4 CPUs, 1 LLC", 1, 4, 1, 2048),

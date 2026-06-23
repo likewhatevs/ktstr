@@ -1,43 +1,139 @@
 //! Unit coverage for the TOKEN_TX dispatch's CRC-gated promotion
 //! and decode paths.
 //!
-//! Two production gates inspect each `BulkMessage` the streaming
-//! [`crate::vmm::bulk::HostAssembler`] yields from the
-//! virtio-console port-1 TX byte stream:
+//! Two production gates inside [`dispatch_bulk_message`] inspect each
+//! `BulkMessage` the streaming [`crate::vmm::bulk::HostAssembler`]
+//! yields from the virtio-console port-1 TX byte stream:
 //!
-//!   * `msg.msg_type == MSG_TYPE_SCHED_EXIT && msg.crc_ok` — flips
-//!     the run-wide kill flag and writes the kill eventfd so the
-//!     BSP loop and the watchdog exit promptly. CRC failures must
-//!     NOT promote — a torn frame would otherwise let a hostile
-//!     guest force a false early exit.
-//!   * `msg.msg_type == MSG_TYPE_SNAPSHOT_REQUEST && msg.crc_ok &&
+//!   * `MSG_TYPE_SCHED_EXIT && crc_ok` — flips the run-wide kill flag
+//!     and writes the kill eventfd so the BSP loop and the watchdog
+//!     exit promptly. CRC failures must NOT promote — a torn frame
+//!     would otherwise let a hostile guest force a false early exit.
+//!   * `MSG_TYPE_SNAPSHOT_REQUEST && crc_ok &&
 //!     decode_snapshot_request(payload).is_some()` — pushes the
 //!     decoded request onto the per-iteration pending list for
 //!     dispatch to `freeze_and_capture` / `arm_user_watchpoint`.
-//!     CRC failures must NOT decode — a torn snapshot request
-//!     would otherwise let a hostile guest force a spurious
-//!     capture or watchpoint arm.
+//!     CRC failures must NOT decode — a torn snapshot request would
+//!     otherwise let a hostile guest force a spurious capture or
+//!     watchpoint arm.
+//!   * `MSG_TYPE_SYS_RDY && crc_ok && payload.is_empty()` — fires the
+//!     boot-complete eventfd exactly once (`Option::take`). CRC
+//!     failures must NOT fire — a torn frame would race ahead of
+//!     percpu/KASLR setup.
 //!
-//! These gates live inside the freeze coordinator's run-loop
-//! closure where the kill eventfd, the snapshot-pending vec, and
-//! the streaming assembler are all in scope; they cannot be
-//! exercised through a public function call. The tests below
-//! reproduce the production path end-to-end: build a torn-CRC
-//! TLV byte stream, run it through the same `HostAssembler::feed`
-//! the closure uses, and apply the gate predicates against the
-//! resulting `BulkMessage`. A passing test means the assembler
-//! flagged the frame as `crc_ok=false` AND the gate predicate
-//! short-circuits before triggering the side effect (kill flip /
-//! decode).
-use super::*;
+//! These gates are exercised through the production
+//! [`dispatch_bulk_message`] (a `pub(super)` fn reachable from this
+//! freeze-coord child module) driving a real [`BulkDispatchSinks`]:
+//! build a CRC-mangled TLV byte stream, run it through the same
+//! `HostAssembler::feed` the closure uses, dispatch each resulting
+//! `BulkMessage`, then assert on the sinks (kill flag / kill_evt
+//! counter / sys_rdy take + counter / snapshot-pending len) and the
+//! returned `Option<ShmEntry>`. A regression that drops a `crc_ok`
+//! clause in the real dispatch fails here.
+use super::dispatch::{BulkDispatchSinks, dispatch_bulk_message};
+use super::state::SnapshotRequest;
 use crate::vmm::bulk::HostAssembler;
 use crate::vmm::wire::{
     FRAME_HEADER_SIZE, MSG_TYPE_SCHED_EXIT, MSG_TYPE_SNAPSHOT_REQUEST, MSG_TYPE_SYS_RDY,
-    SNAPSHOT_KIND_CAPTURE, SNAPSHOT_TAG_MAX, ShmMessage, SnapshotRequestPayload,
+    SNAPSHOT_KIND_CAPTURE, SNAPSHOT_TAG_MAX, ShmEntry, ShmMessage, SnapshotRequestPayload,
 };
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64};
+use std::time::Instant;
 use vmm_sys_util::eventfd::{EFD_NONBLOCK, EventFd};
 use zerocopy::IntoBytes;
+
+/// Owns every backing value a [`BulkDispatchSinks`] borrows so a test
+/// can drive the production [`dispatch_bulk_message`] and then read
+/// the post-dispatch state out of the same owned values. Mirrors the
+/// freeze-coordinator closure scope: the kill flag + eventfd, the
+/// SysRdy one-shot handle, the snapshot/kernel-op pending vecs, the
+/// KASLR slots, and the watchdog/scenario atoms (all zero/`None`
+/// initialised — the CRC gates under test never touch them).
+struct SinkState {
+    kill: Arc<AtomicBool>,
+    kill_evt: Arc<EventFd>,
+    sys_rdy_evt: Option<Arc<EventFd>>,
+    snapshot_requests_pending: Vec<SnapshotRequest>,
+    kernel_op_requests_pending: Vec<crate::vmm::wire::KernelOpRequestPayload>,
+    kern_phys_base: Arc<AtomicU64>,
+    kern_phys_base_evt: EventFd,
+    kern_virt_kaslr: Arc<AtomicU64>,
+    kern_virt_kaslr_evt: EventFd,
+    watchdog_pause_ns: AtomicU64,
+    scenario_start_ns: AtomicU64,
+    scenario_pause_cumulative_ns: AtomicU64,
+    run_start: Instant,
+    current_step: Arc<AtomicU16>,
+}
+
+impl SinkState {
+    fn new() -> Self {
+        Self {
+            kill: Arc::new(AtomicBool::new(false)),
+            kill_evt: Arc::new(EventFd::new(EFD_NONBLOCK).expect("kill eventfd")),
+            sys_rdy_evt: Some(Arc::new(
+                EventFd::new(EFD_NONBLOCK).expect("sys_rdy eventfd"),
+            )),
+            snapshot_requests_pending: Vec::new(),
+            kernel_op_requests_pending: Vec::new(),
+            kern_phys_base: Arc::new(AtomicU64::new(0)),
+            kern_phys_base_evt: EventFd::new(EFD_NONBLOCK).expect("phys_base eventfd"),
+            kern_virt_kaslr: Arc::new(AtomicU64::new(0)),
+            kern_virt_kaslr_evt: EventFd::new(EFD_NONBLOCK).expect("virt_kaslr eventfd"),
+            watchdog_pause_ns: AtomicU64::new(0),
+            scenario_start_ns: AtomicU64::new(0),
+            scenario_pause_cumulative_ns: AtomicU64::new(0),
+            run_start: Instant::now(),
+            current_step: Arc::new(AtomicU16::new(0)),
+        }
+    }
+
+    fn sinks(&mut self) -> BulkDispatchSinks<'_> {
+        BulkDispatchSinks {
+            kill: &self.kill,
+            kill_evt: &self.kill_evt,
+            sys_rdy_evt: &mut self.sys_rdy_evt,
+            snapshot_requests_pending: &mut self.snapshot_requests_pending,
+            kernel_op_requests_pending: &mut self.kernel_op_requests_pending,
+            kern_phys_base: &self.kern_phys_base,
+            kern_phys_base_evt: &self.kern_phys_base_evt,
+            kern_virt_kaslr: &self.kern_virt_kaslr,
+            kern_virt_kaslr_evt: &self.kern_virt_kaslr_evt,
+            kernel_text_link_kva: 0,
+            watchdog_reset: None,
+            watchdog_pause_ns: &self.watchdog_pause_ns,
+            scenario_start_ns: &self.scenario_start_ns,
+            scenario_pause_cumulative_ns: &self.scenario_pause_cumulative_ns,
+            run_start: self.run_start,
+            current_step: &self.current_step,
+        }
+    }
+}
+
+/// Dispatch every message through the production
+/// [`dispatch_bulk_message`], collecting the verdict-bearing entries
+/// into a bucket — exactly the freeze-coordinator's per-iteration
+/// loop. Returns `(state, bucket)` so a test can read the sink
+/// post-state and inspect what bucketed.
+fn run_dispatch(messages: &[crate::vmm::bulk::BulkMessage]) -> (SinkState, Vec<ShmEntry>) {
+    let mut state = SinkState::new();
+    let mut bucket = Vec::new();
+    {
+        let mut sinks = state.sinks();
+        for msg in messages {
+            if let Some(entry) = dispatch_bulk_message(msg, &mut sinks) {
+                bucket.push(entry);
+            }
+        }
+    }
+    (state, bucket)
+}
+
+/// Read an EFD_NONBLOCK eventfd's accumulated counter (0 if EAGAIN).
+fn read_counter(evt: &EventFd) -> u64 {
+    evt.read().unwrap_or(0)
+}
 
 /// Build a TLV frame whose header CRC matches the supplied payload
 /// — `HostAssembler::feed` will produce a `BulkMessage` with
@@ -96,68 +192,11 @@ fn snapshot_request_bytes(request_id: u32, kind: u32, tag: &str) -> Vec<u8> {
     .to_vec()
 }
 
-/// Apply the production SCHED_EXIT promotion gate (the
-/// `msg.msg_type == MSG_TYPE_SCHED_EXIT && msg.crc_ok` branch in
-/// the freeze coordinator's TOKEN_TX handler) against a slice of
-/// `BulkMessage` values. Returns `(kill_flag_value,
-/// kill_evt_fired)` so the test can assert both side effects of
-/// the gate. The eventfd is created `EFD_NONBLOCK` to mirror the
-/// closure's `freeze_coord_kill_evt`; `read()` returns `EAGAIN`
-/// instead of blocking when the counter is zero.
-fn run_sched_exit_gate(messages: &[crate::vmm::bulk::BulkMessage]) -> (bool, bool) {
-    let kill = AtomicBool::new(false);
-    let kill_evt = EventFd::new(EFD_NONBLOCK).expect("eventfd construction");
-    for msg in messages {
-        // Exact predicate copied from the production closure;
-        // the test's value comes from this expression staying
-        // in lockstep with the in-tree gate. If the production
-        // gate ever drops the `crc_ok` clause, this test must
-        // be updated in the same change so the regression is
-        // visible.
-        if msg.msg_type == MSG_TYPE_SCHED_EXIT && msg.crc_ok {
-            kill.store(true, Ordering::Release);
-            let _ = kill_evt.write(1);
-        }
-    }
-    let kill_value = kill.load(Ordering::Acquire);
-    // Drain the eventfd to detect a write — `read` returns the
-    // accumulated counter (1 here) on success or `EAGAIN` if the
-    // gate did not write. Either outcome is a non-zero / zero
-    // distinguisher for the test's verdict.
-    let evt_fired = kill_evt.read().is_ok();
-    (kill_value, evt_fired)
-}
-
-/// Apply the production SNAPSHOT_REQUEST decode-and-stash gate
-/// (the `msg.msg_type == MSG_TYPE_SNAPSHOT_REQUEST && msg.crc_ok
-/// && let Some(req) = decode_snapshot_request(...)` branch in
-/// the closure) against a slice of `BulkMessage` values. Returns
-/// the count of requests pushed onto the per-iteration pending
-/// list — zero means the gate dropped the frame, non-zero means
-/// the gate accepted and decoded it.
-fn run_snapshot_request_gate(messages: &[crate::vmm::bulk::BulkMessage]) -> usize {
-    let mut pending: Vec<SnapshotRequest> = Vec::new();
-    for msg in messages {
-        // Exact predicate copied from the production closure.
-        // Note: `decode_snapshot_request` is the same helper the
-        // closure calls, so the decode-side defense (size /
-        // KIND_NONE / request_id == 0) is exercised end-to-end
-        // alongside the CRC gate.
-        if msg.msg_type == MSG_TYPE_SNAPSHOT_REQUEST
-            && msg.crc_ok
-            && let Some(req) = decode_snapshot_request(&msg.payload[..])
-        {
-            pending.push(req);
-        }
-    }
-    pending.len()
-}
-
-/// CRC-failed SCHED_EXIT MUST NOT promote the run-wide kill flag.
-/// A torn or hostile-guest frame would otherwise let an attacker
-/// force the BSP loop and the watchdog to exit early, ending a
-/// test before its scheduler under test had a chance to
-/// misbehave.
+/// CRC-failed SCHED_EXIT MUST NOT promote the run-wide kill flag,
+/// write the kill eventfd, or bucket a verdict entry. A torn or
+/// hostile-guest frame would otherwise let an attacker force the BSP
+/// loop and the watchdog to exit early, ending a test before its
+/// scheduler under test had a chance to misbehave.
 #[test]
 fn sched_exit_with_torn_crc_does_not_promote_kill() {
     let mut a = HostAssembler::new();
@@ -172,26 +211,31 @@ fn sched_exit_with_torn_crc_does_not_promote_kill() {
         drained.messages[0].msg_type, MSG_TYPE_SCHED_EXIT,
         "msg_type unaffected by CRC mismatch — gate dispatch is by type"
     );
-    let (kill, evt_fired) = run_sched_exit_gate(&drained.messages);
+    let (state, bucket) = run_dispatch(&drained.messages);
     assert!(
-        !kill,
+        !state.kill.load(std::sync::atomic::Ordering::Acquire),
         "kill flag must NOT flip on CRC-failed SCHED_EXIT — \
-             hostile guest must not force early exit"
+         hostile guest must not force early exit"
+    );
+    assert_eq!(
+        read_counter(&state.kill_evt),
+        0,
+        "kill eventfd must NOT be written on CRC-failed SCHED_EXIT — \
+         the BSP loop and watchdog must not be woken"
     );
     assert!(
-        !evt_fired,
-        "kill eventfd must NOT be written on CRC-failed SCHED_EXIT — \
-             the BSP loop and watchdog must not be woken"
+        bucket.is_empty(),
+        "CRC-failed SCHED_EXIT must NOT surface as a verdict entry"
     );
 }
 
-/// Positive control: a CRC-valid SCHED_EXIT DOES promote. Pins the
-/// test against a degenerate case where the gate is broken and
-/// the negative test passes for the wrong reason (i.e. kill never
-/// promotes regardless of input). Without this control, a fix
-/// that accidentally inverts the predicate
-/// (`!msg.crc_ok` instead of `msg.crc_ok`) would still pass the
-/// torn-CRC test but break production.
+/// Positive control: a CRC-valid SCHED_EXIT DOES promote and bucket.
+/// Pins the test against a degenerate case where the gate is broken
+/// and the negative test passes for the wrong reason (kill never
+/// promotes regardless of input). Without this control, a fix that
+/// accidentally inverts the predicate (`!msg.crc_ok` instead of
+/// `msg.crc_ok`) would still pass the torn-CRC test but break
+/// production.
 #[test]
 fn sched_exit_with_valid_crc_does_promote_kill() {
     let mut a = HostAssembler::new();
@@ -202,32 +246,40 @@ fn sched_exit_with_valid_crc_does_promote_kill() {
         drained.messages[0].crc_ok,
         "matching CRC must surface as crc_ok=true"
     );
-    let (kill, evt_fired) = run_sched_exit_gate(&drained.messages);
+    let (state, bucket) = run_dispatch(&drained.messages);
     assert!(
-        kill,
+        state.kill.load(std::sync::atomic::Ordering::Acquire),
         "kill flag MUST flip on CRC-valid SCHED_EXIT — promotion is \
-             the load-bearing path that ends a test promptly"
+         the load-bearing path that ends a test promptly"
     );
-    assert!(
-        evt_fired,
-        "kill eventfd MUST be written on CRC-valid SCHED_EXIT — \
-             the BSP loop and watchdog need an epoll wake to exit \
-             the run loop"
+    assert_eq!(
+        read_counter(&state.kill_evt),
+        1,
+        "kill eventfd MUST be written once on CRC-valid SCHED_EXIT — \
+         the BSP loop and watchdog need an epoll wake to exit"
     );
+    assert_eq!(
+        bucket.len(),
+        1,
+        "CRC-valid SCHED_EXIT must bucket exactly once"
+    );
+    assert_eq!(bucket[0].msg_type, MSG_TYPE_SCHED_EXIT);
+    assert_eq!(bucket[0].payload, b"exit-payload"[..]);
+    assert!(bucket[0].crc_ok);
 }
 
-/// Mixed batch: a CRC-failed SCHED_EXIT alongside other
-/// CRC-valid frames must not promote. The gate is per-message,
-/// not per-batch — every CRC failure must short-circuit
-/// independently regardless of what arrived alongside it. This
-/// catches a regression where the gate erroneously walks the
-/// batch and trusts the first valid frame to authorise the rest.
+/// Mixed batch: a CRC-failed SCHED_EXIT alongside other CRC-valid
+/// frames must not promote. The gate is per-message, not per-batch —
+/// every CRC failure must short-circuit independently regardless of
+/// what arrived alongside it. This catches a regression where the
+/// gate erroneously walks the batch and trusts the first valid frame
+/// to authorise the rest.
 #[test]
 fn sched_exit_torn_crc_does_not_promote_when_other_valid_frames_present() {
     let mut a = HostAssembler::new();
-    // Build a batch: torn SCHED_EXIT first, then a valid
-    // STIMULUS frame (not a SCHED_EXIT — must not promote on
-    // its own), then a torn SCHED_EXIT-typed frame.
+    // Build a batch: torn SCHED_EXIT first, then a valid STIMULUS
+    // frame (not a SCHED_EXIT — must not promote on its own), then a
+    // torn SCHED_EXIT-typed frame.
     let mut buf = Vec::new();
     buf.extend(frame_with_torn_crc(MSG_TYPE_SCHED_EXIT, b"first"));
     buf.extend(frame_with_crc(
@@ -240,22 +292,33 @@ fn sched_exit_torn_crc_does_not_promote_when_other_valid_frames_present() {
     assert!(!drained.messages[0].crc_ok);
     assert!(drained.messages[1].crc_ok);
     assert!(!drained.messages[2].crc_ok);
-    let (kill, evt_fired) = run_sched_exit_gate(&drained.messages);
+    let (state, bucket) = run_dispatch(&drained.messages);
     assert!(
-        !kill,
+        !state.kill.load(std::sync::atomic::Ordering::Acquire),
         "neither torn SCHED_EXIT may promote even though a CRC-valid \
-             non-SCHED_EXIT frame arrived alongside them"
+         non-SCHED_EXIT frame arrived alongside them"
     );
-    assert!(!evt_fired, "kill eventfd must remain undisturbed");
+    assert_eq!(
+        read_counter(&state.kill_evt),
+        0,
+        "kill eventfd must remain undisturbed"
+    );
+    // The STIMULUS frame still buckets (it is verdict-bearing); the
+    // two torn SCHED_EXITs do not.
+    assert_eq!(
+        bucket.len(),
+        1,
+        "only the CRC-valid STIMULUS buckets; both torn SCHED_EXITs drop"
+    );
+    assert_eq!(bucket[0].msg_type, crate::vmm::wire::MSG_TYPE_STIMULUS);
 }
 
 /// CRC-failed SNAPSHOT_REQUEST MUST be dropped before
-/// `decode_snapshot_request` runs. A torn or hostile-guest
-/// snapshot request would otherwise let an attacker force a
-/// spurious `freeze_and_capture` (host-side stall, dump
-/// allocation) or `arm_user_watchpoint` (DR slot consumption,
-/// `KVM_SET_GUEST_DEBUG` reprogram) without ever generating a
-/// matching CRC.
+/// `decode_snapshot_request` runs. A torn or hostile-guest snapshot
+/// request would otherwise let an attacker force a spurious
+/// `freeze_and_capture` (host-side stall, dump allocation) or
+/// `arm_user_watchpoint` (DR slot consumption, `KVM_SET_GUEST_DEBUG`
+/// reprogram) without ever generating a matching CRC.
 #[test]
 fn snapshot_request_with_torn_crc_is_dropped() {
     let mut a = HostAssembler::new();
@@ -271,17 +334,22 @@ fn snapshot_request_with_torn_crc_is_dropped() {
         drained.messages[0].msg_type, MSG_TYPE_SNAPSHOT_REQUEST,
         "msg_type unaffected by CRC mismatch"
     );
-    let pushed = run_snapshot_request_gate(&drained.messages);
+    let (state, bucket) = run_dispatch(&drained.messages);
     assert_eq!(
-        pushed, 0,
+        state.snapshot_requests_pending.len(),
+        0,
         "CRC-failed SNAPSHOT_REQUEST must NOT decode — \
-             hostile guest must not force a capture or watchpoint arm"
+         hostile guest must not force a capture or watchpoint arm"
+    );
+    assert!(
+        bucket.is_empty(),
+        "SNAPSHOT_REQUEST is coordinator-internal — never buckets"
     );
 }
 
-/// Positive control: a CRC-valid SNAPSHOT_REQUEST with a
-/// well-formed payload IS pushed onto the pending list. Same
-/// degenerate-pass guard rationale as the SCHED_EXIT positive
+/// Positive control: a CRC-valid SNAPSHOT_REQUEST with a well-formed
+/// payload IS pushed onto the pending list with the decoded fields.
+/// Same degenerate-pass guard rationale as the SCHED_EXIT positive
 /// control above.
 #[test]
 fn snapshot_request_with_valid_crc_is_pushed() {
@@ -294,18 +362,27 @@ fn snapshot_request_with_valid_crc_is_pushed() {
         drained.messages[0].crc_ok,
         "matching CRC must surface as crc_ok=true"
     );
-    let pushed = run_snapshot_request_gate(&drained.messages);
+    let (state, bucket) = run_dispatch(&drained.messages);
     assert_eq!(
-        pushed, 1,
+        state.snapshot_requests_pending.len(),
+        1,
         "CRC-valid well-formed SNAPSHOT_REQUEST MUST decode and push"
+    );
+    assert_eq!(
+        state.snapshot_requests_pending[0].request_id, 42,
+        "decoded request_id must round-trip through the gate"
+    );
+    assert!(
+        bucket.is_empty(),
+        "SNAPSHOT_REQUEST is coordinator-internal — never buckets"
     );
 }
 
 /// Mixed batch: CRC-failed SNAPSHOT_REQUEST sandwiched between
-/// CRC-valid SNAPSHOT_REQUESTs. Only the valid ones must push;
-/// the torn frame must drop independently. Pins the per-message
-/// gate behaviour against a regression that decodes the whole
-/// batch when any CRC matches.
+/// CRC-valid SNAPSHOT_REQUESTs. Only the valid ones must push; the
+/// torn frame must drop independently. Pins the per-message gate
+/// behaviour against a regression that decodes the whole batch when
+/// any CRC matches.
 #[test]
 fn snapshot_request_torn_crc_dropped_in_mixed_batch() {
     let mut a = HostAssembler::new();
@@ -321,17 +398,24 @@ fn snapshot_request_torn_crc_dropped_in_mixed_batch() {
     assert!(drained.messages[0].crc_ok);
     assert!(!drained.messages[1].crc_ok);
     assert!(drained.messages[2].crc_ok);
-    let pushed = run_snapshot_request_gate(&drained.messages);
+    let (state, _bucket) = run_dispatch(&drained.messages);
     assert_eq!(
-        pushed, 2,
+        state.snapshot_requests_pending.len(),
+        2,
         "exactly the two CRC-valid SNAPSHOT_REQUESTs must push; \
-             the torn middle frame must drop independently"
+         the torn middle frame must drop independently"
     );
+    let ids: Vec<u32> = state
+        .snapshot_requests_pending
+        .iter()
+        .map(|r| r.request_id)
+        .collect();
+    assert_eq!(ids, vec![1, 3], "torn id=2 must be filtered out");
 }
 
-/// CRC-failed SCHED_EXIT followed by CRC-failed SNAPSHOT_REQUEST
-/// in a single drain: BOTH gates must short-circuit. A regression
-/// where the SCHED_EXIT gate's `crc_ok` check is correct but the
+/// CRC-failed SCHED_EXIT followed by CRC-failed SNAPSHOT_REQUEST in a
+/// single drain: BOTH gates must short-circuit. A regression where
+/// the SCHED_EXIT gate's `crc_ok` check is correct but the
 /// SNAPSHOT_REQUEST gate's check is dropped would still pass the
 /// SCHED_EXIT-only test; this multi-gate test catches that.
 #[test]
@@ -348,52 +432,32 @@ fn both_gates_drop_torn_frames_in_same_drain() {
     assert_eq!(drained.messages.len(), 2);
     assert!(!drained.messages[0].crc_ok);
     assert!(!drained.messages[1].crc_ok);
-    let (kill, evt_fired) = run_sched_exit_gate(&drained.messages);
-    let pushed = run_snapshot_request_gate(&drained.messages);
-    assert!(!kill, "torn SCHED_EXIT must not promote kill");
-    assert!(!evt_fired, "torn SCHED_EXIT must not write kill eventfd");
-    assert_eq!(pushed, 0, "torn SNAPSHOT_REQUEST must not decode");
+    let (state, bucket) = run_dispatch(&drained.messages);
+    assert!(
+        !state.kill.load(std::sync::atomic::Ordering::Acquire),
+        "torn SCHED_EXIT must not promote kill"
+    );
+    assert_eq!(
+        read_counter(&state.kill_evt),
+        0,
+        "torn SCHED_EXIT must not write kill eventfd"
+    );
+    assert_eq!(
+        state.snapshot_requests_pending.len(),
+        0,
+        "torn SNAPSHOT_REQUEST must not decode"
+    );
+    assert!(
+        bucket.is_empty(),
+        "both torn frames must drop from the bucket"
+    );
 }
 
-/// Apply the production SYS_RDY promotion gate (the
-/// `msg.msg_type == MSG_TYPE_SYS_RDY && msg.crc_ok && let
-/// Some(evt) = sys_rdy_evt.take()` branch in the freeze
-/// coordinator's TOKEN_TX handler) against a slice of
-/// `BulkMessage` values. Returns `(eventfd_counter,
-/// remaining_handle_present)` so the test can assert both
-/// the fire-once semantics (counter at most 1) and the
-/// `Option::take` ownership transfer (remaining=false after
-/// any successful promotion). The outer Arc clone lets the
-/// caller read the counter after the gate moved its handle
-/// into the predicate body.
-fn run_sys_rdy_gate(messages: &[crate::vmm::bulk::BulkMessage]) -> (u32, bool) {
-    let evt = std::sync::Arc::new(EventFd::new(EFD_NONBLOCK).expect("eventfd construction"));
-    let mut sys_rdy_evt: Option<std::sync::Arc<EventFd>> = Some(evt.clone());
-    for msg in messages {
-        // Exact predicate copied from the production closure.
-        if msg.msg_type == MSG_TYPE_SYS_RDY
-            && msg.crc_ok
-            && let Some(evt) = sys_rdy_evt.take()
-        {
-            let _ = evt.write(1);
-        }
-    }
-    let remaining = sys_rdy_evt.is_some();
-    // `read()` on EFD_NONBLOCK eventfd returns the accumulated
-    // counter or EAGAIN when zero. With take()-based fire-once
-    // semantics, at most one write can occur.
-    let counter = match evt.read() {
-        Ok(n) => n as u32,
-        Err(_) => 0,
-    };
-    (counter, remaining)
-}
-
-/// CRC-failed SYS_RDY MUST NOT fire the boot-complete eventfd.
-/// A torn or hostile-guest frame would otherwise let an attacker
-/// race ahead of `setup_per_cpu_areas` / KASLR randomization,
-/// causing the monitor's first sample iteration to read against
-/// pre-boot zeros.
+/// CRC-failed SYS_RDY MUST NOT fire the boot-complete eventfd, and
+/// MUST leave the one-shot handle intact for a later valid frame. A
+/// torn or hostile-guest frame would otherwise let an attacker race
+/// ahead of `setup_per_cpu_areas` / KASLR randomization, causing the
+/// monitor's first sample iteration to read against pre-boot zeros.
 #[test]
 fn sys_rdy_with_torn_crc_does_not_fire_eventfd() {
     let mut a = HostAssembler::new();
@@ -408,21 +472,23 @@ fn sys_rdy_with_torn_crc_does_not_fire_eventfd() {
         drained.messages[0].msg_type, MSG_TYPE_SYS_RDY,
         "msg_type unaffected by CRC mismatch"
     );
-    let (counter, remaining) = run_sys_rdy_gate(&drained.messages);
+    // Capture the handle before dispatch so the counter is readable
+    // post-dispatch even though the gate would have `take`n it.
+    let evt_handle = run_dispatch_sys_rdy(&drained.messages);
     assert_eq!(
-        counter, 0,
+        evt_handle.counter, 0,
         "boot-complete eventfd must NOT be written on CRC-failed \
-             SYS_RDY — hostile guest must not race ahead of percpu/KASLR"
+         SYS_RDY — hostile guest must not race ahead of percpu/KASLR"
     );
     assert!(
-        remaining,
+        evt_handle.handle_remaining,
         "Option::take must NOT consume the handle on a dropped frame — \
-             a later CRC-valid SYS_RDY must still be able to promote"
+         a later CRC-valid SYS_RDY must still be able to promote"
     );
 }
 
-/// Positive control: a CRC-valid SYS_RDY DOES fire the eventfd
-/// and consumes the Option (fire-once semantics).
+/// Positive control: a CRC-valid SYS_RDY DOES fire the eventfd and
+/// consumes the Option (fire-once semantics).
 #[test]
 fn sys_rdy_with_valid_crc_fires_eventfd_once() {
     let mut a = HostAssembler::new();
@@ -433,24 +499,23 @@ fn sys_rdy_with_valid_crc_fires_eventfd_once() {
         drained.messages[0].crc_ok,
         "matching CRC must surface as crc_ok=true"
     );
-    let (counter, remaining) = run_sys_rdy_gate(&drained.messages);
+    let out = run_dispatch_sys_rdy(&drained.messages);
     assert_eq!(
-        counter, 1,
+        out.counter, 1,
         "boot-complete eventfd MUST receive a single write on \
-             CRC-valid SYS_RDY"
+         CRC-valid SYS_RDY"
     );
     assert!(
-        !remaining,
+        !out.handle_remaining,
         "Option::take must consume the handle so subsequent \
-             SYS_RDY frames do not pump the counter"
+         SYS_RDY frames do not pump the counter"
     );
 }
 
-/// Two CRC-valid SYS_RDY frames in sequence: the first
-/// promotes, every subsequent frame drops. Pins `Option::take`
-/// semantics so a hostile or buggy guest resending SYS_RDY
-/// cannot pump the eventfd counter into EAGAIN territory or
-/// wedge a later boot signal.
+/// Two CRC-valid SYS_RDY frames in sequence: the first promotes,
+/// every subsequent frame drops. Pins `Option::take` semantics so a
+/// hostile or buggy guest resending SYS_RDY cannot pump the eventfd
+/// counter into EAGAIN territory or wedge a later boot signal.
 #[test]
 fn sys_rdy_with_valid_crc_fires_once_then_subsequent_drops() {
     let mut a = HostAssembler::new();
@@ -461,19 +526,19 @@ fn sys_rdy_with_valid_crc_fires_once_then_subsequent_drops() {
     assert_eq!(drained.messages.len(), 2);
     assert!(drained.messages[0].crc_ok);
     assert!(drained.messages[1].crc_ok);
-    let (counter, remaining) = run_sys_rdy_gate(&drained.messages);
+    let out = run_dispatch_sys_rdy(&drained.messages);
     assert_eq!(
-        counter, 1,
+        out.counter, 1,
         "second SYS_RDY must NOT pump the eventfd — \
-             Option::take consumed the handle on the first promotion"
+         Option::take consumed the handle on the first promotion"
     );
-    assert!(!remaining);
+    assert!(!out.handle_remaining);
 }
 
 /// CRC-valid SYS_RDY alongside CRC-valid SCHED_EXIT in the same
 /// drain: both gates fire independently. Pins per-message gate
-/// dispatch — a regression that aliased the two type checks
-/// would let one gate's failure mask the other.
+/// dispatch — a regression that aliased the two type checks would let
+/// one gate's failure mask the other.
 #[test]
 fn sys_rdy_and_sched_exit_fire_independently() {
     let mut a = HostAssembler::new();
@@ -484,10 +549,47 @@ fn sys_rdy_and_sched_exit_fire_independently() {
     assert_eq!(drained.messages.len(), 2);
     assert!(drained.messages[0].crc_ok);
     assert!(drained.messages[1].crc_ok);
-    let (rdy_counter, rdy_remaining) = run_sys_rdy_gate(&drained.messages);
-    let (kill, kill_evt_fired) = run_sched_exit_gate(&drained.messages);
-    assert_eq!(rdy_counter, 1, "SYS_RDY must promote");
-    assert!(!rdy_remaining, "SYS_RDY handle must be consumed");
-    assert!(kill, "SCHED_EXIT must promote kill");
-    assert!(kill_evt_fired, "SCHED_EXIT must write kill eventfd");
+    let out = run_dispatch_sys_rdy(&drained.messages);
+    assert_eq!(out.counter, 1, "SYS_RDY must promote");
+    assert!(!out.handle_remaining, "SYS_RDY handle must be consumed");
+    assert!(out.kill, "SCHED_EXIT must promote kill");
+    assert_eq!(
+        out.kill_evt_counter, 1,
+        "SCHED_EXIT must write kill eventfd"
+    );
+}
+
+/// Post-dispatch SYS_RDY observations: the boot-complete eventfd
+/// counter, whether the one-shot handle survived, and (for the
+/// joint-fire test) the kill flag + kill eventfd counter. Reading the
+/// SYS_RDY counter requires holding a clone of the handle the gate
+/// `take`s, so this drives the dispatch with an out-of-band clone.
+struct SysRdyOutcome {
+    counter: u64,
+    handle_remaining: bool,
+    kill: bool,
+    kill_evt_counter: u64,
+}
+
+fn run_dispatch_sys_rdy(messages: &[crate::vmm::bulk::BulkMessage]) -> SysRdyOutcome {
+    let mut state = SinkState::new();
+    // Clone the SYS_RDY eventfd Arc so the counter is readable even
+    // after the gate `take`s the sink's handle.
+    let evt_clone = state
+        .sys_rdy_evt
+        .as_ref()
+        .expect("sys_rdy handle present at start")
+        .clone();
+    {
+        let mut sinks = state.sinks();
+        for msg in messages {
+            let _ = dispatch_bulk_message(msg, &mut sinks);
+        }
+    }
+    SysRdyOutcome {
+        counter: read_counter(&evt_clone),
+        handle_remaining: state.sys_rdy_evt.is_some(),
+        kill: state.kill.load(std::sync::atomic::Ordering::Acquire),
+        kill_evt_counter: read_counter(&state.kill_evt),
+    }
 }

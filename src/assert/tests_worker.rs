@@ -577,3 +577,29 @@ fn not_starved_no_double_count() {
     );
     assert_eq!(r.stats.total_workers, 2);
 }
+
+/// `cgroup_stats` retains the UNION of every worker's `cpus_used` as the
+/// per-cgroup `cpus_used` set (not just the `num_cpus` count), and leaves
+/// `cgroup_name` empty (the collection layer labels it). Pins the
+/// capture: which CPUs a cgroup ran on is available on every run, not
+/// only the failure-path scheduler dump.
+#[test]
+fn cgroup_stats_retains_cpus_used_union_and_leaves_name_empty() {
+    let reports = vec![
+        rpt(1, 100, 1_000_000, 0, &[0, 1], 10),
+        rpt(2, 100, 1_000_000, 0, &[1, 2, 3], 10),
+    ];
+    let cg = cgroup_stats(&reports);
+    assert_eq!(
+        cg.cpus_used,
+        [0usize, 1, 2, 3]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<usize>>(),
+        "cpus_used must be the union of every worker's cpus_used",
+    );
+    assert_eq!(cg.num_cpus, 4, "num_cpus stays the union length");
+    assert!(
+        cg.cgroup_name.is_empty(),
+        "cgroup_stats leaves the name empty; collect_handles labels it",
+    );
+}

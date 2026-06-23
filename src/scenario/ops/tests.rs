@@ -461,21 +461,97 @@ fn op_discriminant_unique() {
     }
 }
 
+/// Pin one Op variant's discriminant to `want`. `#[track_caller]`
+/// reports a mismatch at the call site (the specific variant), and
+/// `name` labels the variant in the panic message — so a
+/// multi-variant failure is operator-readable from the cargo-test
+/// output without a source cross-reference.
+#[track_caller]
+fn assert_discriminant(op: Op, want: u32, name: &str) {
+    assert_eq!(op.discriminant(), want, "{name}");
+}
+
 /// Pins every Op variant's exact discriminant value against the
 /// canonical `OpKind::bit_index` match in types.rs. A renumbering
 /// or reordering surfaces here naming the specific variant that
-/// moved — complementing `op_kind_bit_indices_are_unique_and_contiguous`
+/// moved (via [`assert_discriminant`]'s `name` label) —
+/// complementing `op_kind_bit_indices_are_unique_and_contiguous`
 /// (whose contiguity arm surfaces gaps as sorted indices only,
 /// not the offending variant; its uniqueness arm DOES name
 /// variants via the `{:?}` of `(OpKind, bit_index)` pairs) and
 /// `op_discriminant_unique` (which proves no collisions via the
-/// `BTreeSet::insert` "duplicate discriminant" panic). The
-/// variant-name label on each `assert_eq!` 3rd arg makes a
-/// multi-variant failure operator-readable: the cargo-test output
-/// names each variant whose discriminant drifted, no
-/// source-cross-reference needed.
+/// `BTreeSet::insert` "duplicate discriminant" panic).
+///
+/// The pin is split into theme-grouped sub-tests
+/// (`op_discriminant_cgroup_ops`, `op_discriminant_workload_ops`,
+/// `op_discriminant_payload_ops`,
+/// `op_discriminant_freeze_snapshot_kernel_ops`,
+/// `op_discriminant_scheduler_ops`); their union covers every Op
+/// variant (discriminants 0..=26) exactly once, in source order.
 #[test]
-fn op_discriminant_values() {
+fn op_discriminant_cgroup_ops() {
+    assert_discriminant(Op::AddCgroup { name: "a".into() }, 0, "AddCgroup");
+    assert_discriminant(
+        Op::AddCgroupDef {
+            def: CgroupDef::named("a"),
+        },
+        1,
+        "AddCgroupDef",
+    );
+    assert_discriminant(Op::RemoveCgroup { cgroup: "a".into() }, 2, "RemoveCgroup");
+    assert_discriminant(
+        Op::SetCpuset {
+            cgroup: "a".into(),
+            cpus: CpusetSpec::Llc(0),
+        },
+        3,
+        "SetCpuset",
+    );
+    assert_discriminant(Op::ClearCpuset { cgroup: "a".into() }, 4, "ClearCpuset");
+    assert_discriminant(
+        Op::SwapCpusets {
+            a: "a".into(),
+            b: "b".into(),
+        },
+        5,
+        "SwapCpusets",
+    );
+}
+
+/// Discriminant pin for the workload/placement Op variants
+/// (discriminants 6..=9). See [`op_discriminant_cgroup_ops`] for the
+/// full pin rationale.
+#[test]
+fn op_discriminant_workload_ops() {
+    assert_discriminant(
+        Op::spawn(SpawnPlacement::cgroup("a"), WorkSpec::default()),
+        6,
+        "Spawn",
+    );
+    assert_discriminant(Op::StopCgroup { cgroup: "a".into() }, 7, "StopCgroup");
+    assert_discriminant(
+        Op::SetAffinity {
+            cgroup: "a".into(),
+            affinity: AffinityIntent::Inherit,
+        },
+        8,
+        "SetAffinity",
+    );
+    assert_discriminant(
+        Op::MoveAllTasks {
+            from: "a".into(),
+            to: "b".into(),
+        },
+        9,
+        "MoveAllTasks",
+    );
+}
+
+/// Discriminant pin for the payload Op variants (discriminants
+/// 10..=12). See [`op_discriminant_cgroup_ops`] for the full pin
+/// rationale.
+#[test]
+fn op_discriminant_payload_ops() {
     use crate::test_support::{OutputFormat, Payload, PayloadKind};
     static TRUE_BIN: Payload = Payload {
         name: "true_bin",
@@ -489,198 +565,126 @@ fn op_discriminant_values() {
         known_flags: None,
         metric_bounds: None,
     };
-    assert_eq!(
-        Op::AddCgroup { name: "a".into() }.discriminant(),
-        0,
-        "AddCgroup",
-    );
-    assert_eq!(
-        Op::AddCgroupDef {
-            def: CgroupDef::named("a")
-        }
-        .discriminant(),
-        1,
-        "AddCgroupDef",
-    );
-    assert_eq!(
-        Op::RemoveCgroup { cgroup: "a".into() }.discriminant(),
-        2,
-        "RemoveCgroup",
-    );
-    assert_eq!(
-        Op::SetCpuset {
-            cgroup: "a".into(),
-            cpus: CpusetSpec::Llc(0),
-        }
-        .discriminant(),
-        3,
-        "SetCpuset",
-    );
-    assert_eq!(
-        Op::ClearCpuset { cgroup: "a".into() }.discriminant(),
-        4,
-        "ClearCpuset",
-    );
-    assert_eq!(
-        Op::SwapCpusets {
-            a: "a".into(),
-            b: "b".into(),
-        }
-        .discriminant(),
-        5,
-        "SwapCpusets",
-    );
-    assert_eq!(
-        Op::spawn(SpawnPlacement::cgroup("a"), WorkSpec::default()).discriminant(),
-        6,
-        "Spawn",
-    );
-    assert_eq!(
-        Op::StopCgroup { cgroup: "a".into() }.discriminant(),
-        7,
-        "StopCgroup",
-    );
-    assert_eq!(
-        Op::SetAffinity {
-            cgroup: "a".into(),
-            affinity: AffinityIntent::Inherit,
-        }
-        .discriminant(),
-        8,
-        "SetAffinity",
-    );
-    assert_eq!(
-        Op::MoveAllTasks {
-            from: "a".into(),
-            to: "b".into()
-        }
-        .discriminant(),
-        9,
-        "MoveAllTasks",
-    );
-    assert_eq!(
+    assert_discriminant(
         Op::RunPayload {
             payload: &TRUE_BIN,
             args: vec![],
             cgroup: None,
-        }
-        .discriminant(),
+        },
         10,
         "RunPayload",
     );
-    assert_eq!(
+    assert_discriminant(
         Op::WaitPayload {
             name: "p".into(),
             cgroup: None,
-        }
-        .discriminant(),
+        },
         11,
         "WaitPayload",
     );
-    assert_eq!(
+    assert_discriminant(
         Op::KillPayload {
             name: "p".into(),
             cgroup: None,
-        }
-        .discriminant(),
+        },
         12,
         "KillPayload",
     );
-    assert_eq!(
-        Op::FreezeCgroup { cgroup: "a".into() }.discriminant(),
-        13,
-        "FreezeCgroup",
-    );
-    assert_eq!(
-        Op::UnfreezeCgroup { cgroup: "a".into() }.discriminant(),
+}
+
+/// Discriminant pin for the freeze, snapshot, and kernel-I/O Op
+/// variants (discriminants 13..=20). See [`op_discriminant_cgroup_ops`]
+/// for the full pin rationale.
+#[test]
+fn op_discriminant_freeze_snapshot_kernel_ops() {
+    assert_discriminant(Op::FreezeCgroup { cgroup: "a".into() }, 13, "FreezeCgroup");
+    assert_discriminant(
+        Op::UnfreezeCgroup { cgroup: "a".into() },
         14,
         "UnfreezeCgroup",
     );
-    assert_eq!(
+    assert_discriminant(
         Op::CaptureSnapshot {
-            name: "snap".into()
-        }
-        .discriminant(),
+            name: "snap".into(),
+        },
         15,
         "Snapshot",
     );
-    assert_eq!(
+    assert_discriminant(
         Op::WatchSnapshot {
-            symbol: "kernel.x".into()
-        }
-        .discriminant(),
+            symbol: "kernel.x".into(),
+        },
         16,
         "WatchSnapshot",
     );
-    assert_eq!(
+    assert_discriminant(
         Op::WriteKernelHot {
-            writes: vec![(KernelTarget::symbol("x"), KernelValue::u64(0))]
-        }
-        .discriminant(),
+            writes: vec![(KernelTarget::symbol("x"), KernelValue::u64(0))],
+        },
         17,
         "WriteKernelHot",
     );
-    assert_eq!(
+    assert_discriminant(
         Op::WriteKernelCold {
-            writes: vec![(KernelTarget::symbol("x"), KernelValue::u64(0))]
-        }
-        .discriminant(),
+            writes: vec![(KernelTarget::symbol("x"), KernelValue::u64(0))],
+        },
         18,
         "WriteKernelCold",
     );
-    assert_eq!(
+    assert_discriminant(
         Op::ReadKernelHot {
             tag: "t".into(),
             target: KernelTarget::symbol("x"),
             width: KernelValueWidth::u64(),
-        }
-        .discriminant(),
+        },
         19,
         "ReadKernelHot",
     );
-    assert_eq!(
+    assert_discriminant(
         Op::ReadKernelCold {
             tag: "t".into(),
             target: KernelTarget::symbol("x"),
             width: KernelValueWidth::u64(),
-        }
-        .discriminant(),
+        },
         20,
         "ReadKernelCold",
     );
+}
+
+/// Discriminant pin for the scheduler-control Op variants plus
+/// `PinBpfMap`/`CaptureCgroupProcs` (discriminants 21..=26). See
+/// [`op_discriminant_cgroup_ops`] for the full pin rationale.
+#[test]
+fn op_discriminant_scheduler_ops() {
     static SCHED_FIXTURE: crate::test_support::Scheduler = crate::test_support::Scheduler::EEVDF;
-    assert_eq!(
+    assert_discriminant(
         Op::AttachScheduler {
             scheduler: &SCHED_FIXTURE,
-        }
-        .discriminant(),
+        },
         21,
         "AttachScheduler",
     );
-    assert_eq!(Op::DetachScheduler.discriminant(), 22, "DetachScheduler",);
-    assert_eq!(Op::RestartScheduler.discriminant(), 23, "RestartScheduler",);
-    assert_eq!(
+    assert_discriminant(Op::DetachScheduler, 22, "DetachScheduler");
+    assert_discriminant(Op::RestartScheduler, 23, "RestartScheduler");
+    assert_discriminant(
         Op::ReplaceScheduler {
             scheduler: &SCHED_FIXTURE,
-        }
-        .discriminant(),
+        },
         24,
         "ReplaceScheduler",
     );
-    assert_eq!(
+    assert_discriminant(
         Op::PinBpfMap {
             name: "scx_test.bss".into(),
-        }
-        .discriminant(),
+        },
         25,
         "PinBpfMap",
     );
-    assert_eq!(
+    assert_discriminant(
         Op::CaptureCgroupProcs {
             tag: "snap".into(),
             cgroup: "a".into(),
-        }
-        .discriminant(),
+        },
         26,
         "CaptureCgroupProcs",
     );
@@ -796,7 +800,7 @@ fn holdspec_loop() {
 }
 
 /// Drive `HoldSpec::Loop` end-to-end via `execute_steps` against
-/// the mock CgroupOps. The Loop arm of `run_step` (mod.rs:1163-1180)
+/// the mock CgroupOps. The `HoldSpec::Loop { interval }` arm of `run_step`
 /// fires `apply_ops` repeatedly at `interval` until `ctx.duration`
 /// elapses; each iteration's SetCpuset op records a
 /// `CgroupCall::SetCpuset` in the mock. After the scenario
@@ -804,7 +808,9 @@ fn holdspec_loop() {
 /// repeated — distinguishing the Loop path from the Fixed/Frac
 /// single-apply path. `sched_pid = None` (inherited from `mock_ctx`)
 /// makes `hold_or_sched_died` a plain sleep with no liveness probe
-/// (verified at mod.rs:993-996), so the loop exits cleanly on the
+/// (verified by `hold_or_sched_died`'s `let Some(pid) = sched_pid else { ... }`
+/// no-pid arm, which polls only the crash latch with no pidfd liveness
+/// probe), so the loop exits cleanly on the
 /// duration deadline rather than on a spurious dead-scheduler signal.
 /// `duration` is overridden to 150ms (vs `mock_ctx`'s 1-second
 /// default) to keep the unit-test runtime short. Lower bound is
@@ -835,19 +841,20 @@ fn holdspec_loop_apply_path_repeats_ops_until_duration_elapses() {
     assert!(
         set_cpuset_calls >= 2,
         "HoldSpec::Loop with interval=30ms over duration=150ms must fire \
-             SetCpuset at least twice; got {set_cpuset_calls} calls. The Loop \
-             arm of run_step (mod.rs:1163) must invoke apply_ops repeatedly \
+             SetCpuset at least twice; got {set_cpuset_calls} calls. The \
+             `HoldSpec::Loop` arm of run_step must invoke apply_ops repeatedly \
              until the deadline; a regression that single-shotted the ops \
              would surface here as exactly 1 call.",
     );
 }
 
-/// The Loop arm's setup pass at mod.rs:1165-1168 runs `apply_setup`
+/// The Loop arm's setup pass (its `if !step.setup.is_empty()` block,
+/// placed before the `while` loop) runs `apply_setup`
 /// ONCE before entering the while loop, NOT per-iteration. A
 /// regression that moved the `if !step.setup.is_empty()` block
 /// inside the loop would attempt to re-create the same cgroup
 /// every iteration and bail on the second iteration's collision
-/// check (apply_setup's `cgroup_name_is_tracked` at mod.rs:1568).
+/// check (apply_setup's `cgroup_name_is_tracked` guard).
 /// Test pins this by counting `CreateCgroup` calls — must be
 /// exactly 1 even though the loop body iterates multiple times
 /// (verified separately via the SetCpuset count).
@@ -881,7 +888,7 @@ fn holdspec_loop_apply_path_setup_runs_once_not_per_iteration() {
         "Loop arm's setup pass must run exactly ONCE before the loop body; \
              got {create_calls} CreateCgroup calls. A regression that moved \
              the `if !step.setup.is_empty()` block inside the while loop \
-             (mod.rs:1165) would surface here as N > 1 calls (the second \
+             (the Loop arm's pre-loop setup pass) would surface here as N > 1 calls (the second \
              iteration's apply_setup would also fail the collision check, \
              but counting reveals the bug source).",
     );
@@ -903,9 +910,10 @@ fn holdspec_loop_apply_path_setup_runs_once_not_per_iteration() {
 /// the first apply_ops + sleep). Pins the exact-iteration
 /// contract via `assert_eq!(..., 1)` — catches BOTH a regression
 /// that skipped the first apply_ops (0 calls) AND a regression
-/// in the deadline-min logic at mod.rs:1175 that let the second
-/// iteration's sleep underflow (2+ calls). The boundary behavior
-/// at mod.rs:1175-1179 (`hold_or_sched_died(remaining.min(interval), ...)`)
+/// in the deadline-min logic (the Loop arm's
+/// `hold_or_sched_died(remaining.min(interval), ...)` call) that let the second
+/// iteration's sleep underflow (2+ calls). That boundary behavior
+/// (`hold_or_sched_died(remaining.min(interval), ...)`)
 /// ensures sleep is capped at the remaining time so the loop
 /// exits promptly on the next deadline check.
 #[test]
@@ -937,7 +945,7 @@ fn holdspec_loop_apply_path_fires_exactly_once_when_interval_exceeds_duration() 
              iteration: enter loop (now < deadline) → apply_ops → sleep \
              min(remaining, interval) = ~30ms → next deadline check fails. \
              0 calls = a regression that skipped the first apply_ops; 2+ \
-             calls = a regression in the deadline-min logic at mod.rs:1175 \
+             calls = a regression in the Loop arm's deadline-min logic \
              that let the second iteration's sleep underflow.",
     );
 }
@@ -997,11 +1005,13 @@ fn holdspec_loop_rejects_capture_snapshot_inside_ops_vec() {
     );
 }
 
-/// The Loop arm's sched-died-early-exit path (mod.rs:1177-1180)
+/// The Loop arm's sched-died-early-exit path (its
+/// `if hold_or_sched_died(...) { *sched_died_during_hold = true; return Ok(()); }`)
 /// fires when `hold_or_sched_died` observes the scheduler pid
 /// has exited mid-loop. Setting `sched_died_during_hold = true`
 /// and returning `Ok(())` is the contract — the outer caller
-/// (mod.rs:911-922) reads the flag and stamps one of
+/// (`run_scenario`'s `if sched_died_during_hold` block) reads the flag
+/// and stamps one of
 /// `DetailKind::SchedulerCrashed` /
 /// `DetailKind::SchedulerExitedCleanly` /
 /// `DetailKind::SchedulerDiedUnknownReason` (chosen by
@@ -1020,7 +1030,7 @@ fn holdspec_loop_rejects_capture_snapshot_inside_ops_vec() {
 ///
 /// Pins: (1) `sched_pid` carrying a dead pid into the Loop arm
 /// exits the while-loop after the first apply_ops iteration;
-/// (2) the `sched_died_during_hold = true` write at mod.rs:1178
+/// (2) the Loop arm's `*sched_died_during_hold = true` write
 /// reaches the outer caller; (3) the outer caller pushes
 /// one of the three sched-died `DetailKind` variants and marks
 /// `passed = false`. A regression that DROPPED the early-exit
@@ -1093,7 +1103,7 @@ fn holdspec_loop_arm_exits_early_when_sched_dies_during_hold() {
         sched_died_details.len(),
         1,
         "must push exactly one sched-died DetailKind detail (from \
-             mod.rs:911-922); got {} sched-died failures out of {} total \
+             `run_scenario`'s `if sched_died_during_hold` block); got {} sched-died failures out of {} total \
              failures: {:?}",
         sched_died_details.len(),
         result.failure_details().count(),
@@ -1104,8 +1114,8 @@ fn holdspec_loop_arm_exits_early_when_sched_dies_during_hold() {
         .iter()
         .filter(|c| matches!(c, CgroupCall::SetCpuset(name, _) if name == "died_test"))
         .count();
-    // First iteration's apply_ops at mod.rs:1175 fires BEFORE
-    // hold_or_sched_died at mod.rs:1177, so a sched-died-from-
+    // First iteration's `apply_ops` in the Loop arm fires BEFORE
+    // that arm's `hold_or_sched_died` call, so a sched-died-from-
     // entry still records exactly one SetCpuset call. A
     // regression that DROPPED the early-exit (loop runs all
     // iterations after the death is observed) would surface as
@@ -1266,10 +1276,12 @@ fn hold_aborts_on_err_exit_latch_not_process_exit() {
 }
 
 /// The Loop arm's apply_ops error-propagation path: an
-/// `apply_ops` Err on iteration N at mod.rs:1175 exits the loop
-/// via the `drain_on_err!` macro (mod.rs:1151-1161) which
+/// `apply_ops` Err on a Loop iteration (the arm's
+/// `drain_on_err!(scenario, apply_ops(...))` call) exits the loop
+/// via the `drain_on_err!` macro (defined at the top of `run_step`)
+/// which
 /// propagates the Err up through `run_step`. The outer caller
-/// at mod.rs:883-901 converts the Err to
+/// (`run_scenario`'s `if let Err(err) = step_res` block) converts the Err to
 /// `Ok(AssertResult { passed: false, details: [...
 /// DetailKind::Other ...] })` so a mid-scenario failure still
 /// returns the merged prior-step results plus the error context
@@ -1277,8 +1289,8 @@ fn hold_aborts_on_err_exit_latch_not_process_exit() {
 ///
 /// Implementation: `MockCgroupOps::fail_call_at(2, "...")` fails
 /// the third cgroup call. The cgroup call sequence is:
-/// - Index 0: `Setup` (run_scenario at mod.rs:706-708 calls
-///   `cgroups.setup(&required)` before any step runs)
+/// - Index 0: `Setup` (`run_scenario`'s `ctx.cgroups.setup(&required)`
+///   call before any step runs)
 /// - Index 1: Iteration 1's SetCpuset → Ok
 /// - Index 2: Iteration 2's SetCpuset → Err (injected)
 ///
@@ -1307,7 +1319,8 @@ fn holdspec_loop_arm_propagates_apply_ops_error() {
     // Inject an error at the THIRD cgroup call (index 2). The
     // sequence is: Setup (index 0) + iter-1 SetCpuset (index 1,
     // Ok) + iter-2 SetCpuset (index 2, Err injected). See
-    // run_scenario at mod.rs:706-708 for the Setup-first call.
+    // `run_scenario`'s `ctx.cgroups.setup(&required)` call for the
+    // Setup-first call.
     mock.fail_call_at(2, "injected SetCpuset error mid-iteration");
     let topo = mock_topo();
     let mut ctx = mock_ctx(&mock, &topo);
@@ -1320,7 +1333,7 @@ fn holdspec_loop_arm_propagates_apply_ops_error() {
     )];
     let result = execute_steps(&ctx, steps).expect(
         "execute_steps converts step Err to Ok(passed=false) per \
-             mod.rs:883-901; the Err must NOT propagate to the caller",
+             run_scenario's `if let Err(err) = step_res` block; the Err must NOT propagate to the caller",
     );
     assert!(
         !result.is_pass(),
@@ -1403,7 +1416,7 @@ fn holdspec_loop_arm_drain_on_err_kills_live_payload_via_kill_not_drop() {
 
     let mock = MockCgroupOps::new();
     // Index sequence (cgroup-op counts only):
-    //   0 = run_scenario Setup (mod.rs:706-708)
+    //   0 = run_scenario Setup (its `ctx.cgroups.setup(&required)` call)
     //   1 = iter-1 SetCpuset (Ok)
     //   2 = iter-2 SetCpuset (Err injected here)
     // Op::run_payload without an explicit cgroup arg does NOT go
@@ -1657,19 +1670,35 @@ fn cpusetspec_disjoint_two_partitions() {
 
 #[test]
 fn cpusetspec_disjoint_remainder_to_last() {
-    // 7 usable CPUs / 3 partitions = chunk=2, so partition 0=[0,1], 1=[2,3], 2=[4,5,6].
-    // Last partition gets the remainder.
+    // 8 CPUs, last reserved → 7 usable [0..6]. 7/3 = chunk 2, so
+    // partition 0=[0,1], 1=[2,3], and the last partition (index 2)
+    // gets `usable[start..usable.len()]` = [4,5,6] — chunk PLUS the
+    // remainder CPU (6). Pin the exact set: a regression in the
+    // last-partition branch that computed `end = (index+1)*chunk = 6`
+    // instead of `usable.len() = 7` would drop CPU 6, yielding [4,5]
+    // (len 2). An inequality `len >= chunk` would still accept that
+    // bug; the exact-set assertion catches it.
     let (cg, topo) = make_ctx(1, 8, 1);
     let ctx = ctx_from(&cg, &topo);
-    let usable_len = ctx.topo.usable_cpus().len();
+    let usable = ctx.topo.usable_cpus();
+    assert_eq!(
+        usable,
+        [0, 1, 2, 3, 4, 5, 6],
+        "fixture assumption: 8 CPUs minus 1 reserved = 7 usable [0..6]"
+    );
     let c = CpusetSpec::Disjoint { index: 2, of: 3 }.resolve(&ctx);
-    let chunk = usable_len / 3;
-    // Last partition should be >= chunk size (gets remainder).
+    let expected: BTreeSet<usize> = [4, 5, 6].into_iter().collect();
+    assert_eq!(
+        c, expected,
+        "last partition must absorb the remainder CPU (the tail of \
+         usable), got {c:?}"
+    );
+    // Explicitly pin that the tail usable CPU is in the last partition
+    // — the property the remainder-to-last contract guarantees.
     assert!(
-        c.len() >= chunk,
-        "last partition {}: expected >= {}",
-        c.len(),
-        chunk
+        c.contains(usable.last().unwrap()),
+        "last partition must include the final usable CPU {}",
+        usable.last().unwrap()
     );
 }
 
@@ -2397,28 +2426,98 @@ fn execute_steps_with_bails_on_invalid_hold_before_ops() {
     let _ = std::fs::remove_dir_all(&parent);
 }
 
-/// The SetAffinity dispatcher's `ResolvedAffinity::Random` arm is
-/// guarded by `!from.is_empty() && *count > 0` (see the
-/// `ResolvedAffinity::Random` arm with that same guard in
-/// `apply_ops`). This test mirrors that classification to lock
-/// the contract in place: future refactors that drop either
-/// side of the AND must update this test alongside the dispatch.
-/// The live dispatcher path is partially covered by the
-/// `apply_setup_*` tests via `MockCgroupOps`, but the SetAffinity
-/// arm specifically still requires a running workload handle to
-/// exercise end-to-end and is therefore only covered by its
-/// classification guard here.
+/// The SetAffinity dispatcher resolves its intent via the real
+/// `crate::scenario::resolve_affinity_for_cgroup` (see
+/// `Op::SetAffinity` in dispatch.rs) and the resulting
+/// `ResolvedAffinity::Random` is consumed by the spawn-pipeline
+/// guard `crate::workload::resolve_affinity`. Both production
+/// functions reject the no-op conditions the test name names —
+/// empty pool and `count == 0` — because an empty
+/// `sched_setaffinity` mask is rejected by the kernel with EINVAL
+/// (no-silent-drops invariant). This drives BOTH real guards
+/// rather than a re-declared copy of the `!from.is_empty() &&
+/// count > 0` classification, so flipping `||` to `&&`, dropping a
+/// side of the condition, or removing the bail in either
+/// production function fails this test.
 #[test]
 fn set_affinity_random_no_op_conditions() {
-    fn should_apply(from: &BTreeSet<usize>, count: usize) -> bool {
-        !from.is_empty() && count > 0
-    }
+    use crate::workload::ResolvedAffinity;
+
+    let (cg, topo) = make_ctx(1, 8, 1);
+    let ctx = ctx_from(&cg, &topo);
     let pool: BTreeSet<usize> = [0, 1, 2].into_iter().collect();
-    let empty: BTreeSet<usize> = BTreeSet::new();
-    assert!(should_apply(&pool, 2));
-    assert!(!should_apply(&pool, 0), "count=0 → no-op");
-    assert!(!should_apply(&empty, 1), "empty pool → no-op");
-    assert!(!should_apply(&empty, 0), "both zero → no-op");
+
+    // -- Upstream resolver (the function dispatch.rs calls at
+    // Op::SetAffinity) --
+
+    // Valid pool + count>0 resolves to Random with the pool intact.
+    let resolved = crate::scenario::resolve_affinity_for_cgroup(
+        &AffinityIntent::random_subset(pool.iter().copied(), 2),
+        None,
+        ctx.topo,
+    )
+    .expect("non-empty pool + count>0 must resolve");
+    match &resolved {
+        ResolvedAffinity::Random { from, count } => {
+            assert_eq!(*from, pool, "resolved pool must equal the intent pool");
+            assert_eq!(*count, 2, "resolved count must equal the intent count");
+        }
+        other => panic!("expected ResolvedAffinity::Random, got {other:?}"),
+    }
+
+    // count == 0 bails before any allocation.
+    let err = crate::scenario::resolve_affinity_for_cgroup(
+        &AffinityIntent::random_subset(pool.iter().copied(), 0),
+        None,
+        ctx.topo,
+    )
+    .expect_err("count=0 must bail (no-op condition)");
+    assert!(
+        format!("{err:#}").contains("count=0"),
+        "count=0 diagnostic expected, got: {err:#}"
+    );
+
+    // Empty pool with count>0 bails (no CPU to sample).
+    let err = crate::scenario::resolve_affinity_for_cgroup(
+        &AffinityIntent::random_subset(std::iter::empty::<usize>(), 1),
+        None,
+        ctx.topo,
+    )
+    .expect_err("empty pool must bail (no-op condition)");
+    assert!(
+        format!("{err:#}").contains("empty `from` pool"),
+        "empty-pool diagnostic expected, got: {err:#}"
+    );
+
+    // -- Downstream consumer guard (the spawn pipeline's
+    // ResolvedAffinity::Random consumer) — drives the SAME no-op
+    // classification that dispatch.rs's per-worker Random arm
+    // unreachable!()s on if it is ever reached. --
+
+    // Valid Random samples exactly `count` CPUs, all from the pool.
+    let sampled = crate::workload::resolve_affinity(&ResolvedAffinity::random([0, 1, 2], 2))
+        .expect("valid Random must resolve")
+        .expect("Random yields a concrete CPU set");
+    assert_eq!(sampled.len(), 2, "must sample exactly count CPUs");
+    assert!(
+        sampled.is_subset(&pool),
+        "sampled CPUs {sampled:?} must come from the pool {pool:?}"
+    );
+
+    // count == 0 bails.
+    assert!(
+        crate::workload::resolve_affinity(&ResolvedAffinity::random([0, 1, 2], 0)).is_err(),
+        "count=0 Random must bail in the consumer guard"
+    );
+    // Empty pool with count>0 bails.
+    assert!(
+        crate::workload::resolve_affinity(&ResolvedAffinity::random(
+            std::iter::empty::<usize>(),
+            1
+        ))
+        .is_err(),
+        "empty-pool Random must bail in the consumer guard"
+    );
 }
 
 #[test]
@@ -4541,8 +4640,10 @@ fn render_cgroup_key_handles_empty_and_populated() {
 
 /// An Err return from `execute_steps_with` (here: a vacuous
 /// `HoldSpec::Frac(0.0)` caught by up-front validation — `Frac`
-/// rejects `f <= 0.0` per types.rs:1859, while `Fixed(ZERO)` is
-/// deliberately valid for op-only settle steps per types.rs:1854)
+/// rejects `f <= 0.0` per `HoldSpec::validate`'s
+/// `HoldSpec::Frac(f) if *f <= 0.0` arm, while `Fixed(ZERO)` is
+/// deliberately valid for op-only settle steps per the same fn's
+/// `HoldSpec::Fixed(_) => Ok(())` arm)
 /// leaves no live payload_handles because no setup/ops ran.
 /// Pins the invariant that the pre-ops validation path does
 /// not spawn anything that could then leak.
@@ -7712,7 +7813,8 @@ fn workers_pct_rounding_is_ceil_not_round_or_floor() {
 /// Setup-spawned workers (workers from apply_setup-time
 /// `workers_pct` resolution) keep their pid set across
 /// subsequent `Op::SetCpuset` cpuset changes. Pins that
-/// `Op::SetCpuset`'s apply arm at mod.rs:2063-2074 is NOT a
+/// `Op::SetCpuset`'s apply arm (`Op::SetCpuset { cgroup, cpus }`
+/// in `dispatch.rs`'s `apply_op`) is NOT a
 /// `resolve_workers_pct` call site — the arm validates +
 /// resolves the CpusetSpec, calls `ctx.cgroups.set_cpuset`,
 /// and records the new cpuset via `state.record_cpuset`, but
@@ -7800,7 +7902,7 @@ fn workers_pct_setup_workers_survive_op_setcpuset_narrowing() {
 
 /// Pathological `workers_pct` values rejected at construction:
 /// NaN, INFINITY, negative values, and zero all panic via
-/// `CgroupDef::workers_pct`'s `assert!` at types.rs:1097-1100.
+/// `CgroupDef::workers_pct`'s `assert!` (its `pct must be finite and > 0.0` check).
 /// Pin all four rejection paths so a future regression that
 /// loosens the gate (e.g. accepts NaN as "use default") fails
 /// here loudly.
@@ -7950,7 +8052,7 @@ fn workers_pct_empty_cpuset_dual_set_bails_with_dedicated_error() {
 /// (4 * 0.1) as usize = 0`, yielding an empty slice. This is
 /// the canonical "passes validate but resolves to empty" case
 /// — `Range { 0.0, 0.0 }` would be rejected by validate's
-/// `start_frac >= end_frac` guard at types.rs:2149, so the
+/// `start_frac >= end_frac` guard in `CpusetSpec::validate`, so the
 /// fraction must be small but non-zero to thread the needle.
 /// Distinct from the `workers_pct`-driven empty-cpuset bails:
 /// no fraction is set, so the diagnostic should cite the

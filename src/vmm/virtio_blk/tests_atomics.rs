@@ -25,7 +25,6 @@ fn dummy_worker_state() -> BlkWorkerState {
         ops_bucket: TokenBucket::unlimited(),
         bytes_bucket: TokenBucket::unlimited(),
         all_descs_scratch: Vec::new(),
-        io_buf_scratch: Vec::new(),
         capacity_bytes: 0,
         read_only: false,
         counters: Arc::new(VirtioBlkCounters::default()),
@@ -413,61 +412,55 @@ fn interrupt_status_concurrent_set_and_ack() {
     );
 }
 
-/// Concurrent `fetch_add` on `config_generation` from N
-/// threads. The post-race value must equal the sum of every
-/// thread's increments — no lost updates. Models the
-/// reset() bumping config_generation while a vCPU thread reads
-/// it via `mmio_read(CONFIG_GENERATION)` (Acquire).
+/// Each production `reset()` bumps `config_generation` by
+/// exactly 1, observable through the production
+/// `mmio_read(CONFIG_GENERATION)` (Acquire) path. Drives N
+/// resets through the real FSM (STATUS=ACK then STATUS=0) and
+/// asserts the read-back generation advanced by exactly N.
 ///
-/// Currently only `reset()` writes config_generation, but the
-/// AtomicU32-on-VirtioBlk shape is defense-in-depth for future
-/// runtime config changes from non-vCPU threads. This test
-/// pins the atomicity invariant the field's API contract
-/// promises.
+/// `reset()` is the only writer of config_generation
+/// (its `config_generation.fetch_add(1, Release)`); there is no
+/// concurrent writer in production (it runs single-threaded on
+/// the vCPU thread), so the meaningful invariant is per-reset
+/// monotone +1 as seen by the guest's config-generation read —
+/// NOT a multi-thread no-lost-updates property of a surrogate
+/// AtomicU32. `reset_bumps_config_generation` (tests_fsm.rs)
+/// pins one cycle; this pins exact accumulation across many,
+/// reading the device field both directly and via mmio_read so
+/// the two agree.
 #[test]
-fn config_generation_concurrent_fetch_add_load() {
-    use std::sync::Barrier;
+fn reset_bumps_config_generation_by_exactly_one_each() {
+    let mut dev = make_device(VIRTIO_BLK_DEFAULT_CAPACITY_BYTES, DiskThrottle::default());
 
-    let dev = make_device(VIRTIO_BLK_DEFAULT_CAPACITY_BYTES, DiskThrottle::default());
-    // config_generation is an AtomicU32 directly on the
-    // device; we need a shareable handle for the threads.
-    // Use Arc to wrap the mutation point — but the field
-    // itself is not Arc'd in production. For the test we
-    // model the atomicity invariant by directly grabbing the
-    // raw AtomicU32 reference under an Arc<&'static …>
-    // surrogate — except we can't borrow with 'static. The
-    // cleanest approach is to do the test against a
-    // standalone AtomicU32 that mirrors the production type.
-    // The point of the test is the atomicity primitive, not
-    // the field's location.
-    let initial = dev.config_generation.load(Ordering::Acquire);
-    let counter = Arc::new(AtomicU32::new(initial));
-    const NUM_WRITERS: u32 = 16;
-    const ITERATIONS_PER_WRITER: u32 = 1_000;
-    let barrier = Arc::new(Barrier::new(NUM_WRITERS as usize + 1));
-    let mut handles = Vec::with_capacity(NUM_WRITERS as usize);
-    for _ in 0..NUM_WRITERS {
-        let counter_w = Arc::clone(&counter);
-        let barrier_w = Arc::clone(&barrier);
-        handles.push(thread::spawn(move || {
-            barrier_w.wait();
-            for _ in 0..ITERATIONS_PER_WRITER {
-                counter_w.fetch_add(1, Ordering::Release);
-            }
-        }));
-    }
-    barrier.wait();
-    for h in handles {
-        h.join().expect("writer join");
-    }
-    let final_value = counter.load(Ordering::Acquire);
-    let expected = initial.wrapping_add(NUM_WRITERS * ITERATIONS_PER_WRITER);
+    // Baseline from the production read path AND the field —
+    // they must agree at every step.
+    let initial = read_reg(&dev, VIRTIO_MMIO_CONFIG_GENERATION);
     assert_eq!(
-        final_value, expected,
-        "fetch_add atomicity violated: expected {expected}, got \
-             {final_value} (lost updates means the counter advanced \
-             less than NUM_WRITERS * ITERATIONS_PER_WRITER)",
+        initial,
+        dev.config_generation.load(Ordering::Acquire),
+        "mmio_read(CONFIG_GENERATION) must match the device field",
     );
+
+    const RESETS: u32 = 16;
+    for n in 1..=RESETS {
+        // Production reset trigger: ACK then write 0 walks the
+        // FSM through reset(), which fetch_adds config_generation.
+        write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_ACK);
+        write_reg(&mut dev, VIRTIO_MMIO_STATUS, 0);
+
+        let via_mmio = read_reg(&dev, VIRTIO_MMIO_CONFIG_GENERATION);
+        let via_field = dev.config_generation.load(Ordering::Acquire);
+        assert_eq!(
+            via_mmio, via_field,
+            "mmio_read and the device field must agree after reset {n}",
+        );
+        assert_eq!(
+            via_mmio,
+            initial.wrapping_add(n),
+            "reset {n} must advance config_generation to initial+{n} \
+                 (each reset is exactly +1); got {via_mmio}",
+        );
+    }
 }
 
 /// Concurrent `fetch_add` on every `VirtioBlkCounters` field
@@ -573,29 +566,49 @@ fn counters_concurrent_fetch_add_no_lost_updates() {
 }
 
 /// Pre-condition for the cross-thread atomic semantics tested
-/// above: the production cfg path actually shares
-/// `interrupt_status` via Arc with the worker thread. cfg(test)
-/// has no production worker, so we assert the Arc count
-/// indicates an additional referent beyond the device's own
-/// borrow — the device-side handle on the Arc plus any
-/// snapshot we just cloned.
+/// above: `interrupt_status` is an `Arc<AtomicU32>` the device
+/// and the worker thread genuinely share, so a `fetch_or` from
+/// a moved-into-thread clone is observed through the device-side
+/// handle — exactly the worker→vCPU interrupt-bit propagation
+/// the production design relies on.
 ///
-/// This is an invariant smoke test: a regression that converted
-/// `interrupt_status` from `Arc<AtomicU32>` to a bare
-/// `AtomicU32` would silently break the worker's ability to
-/// share the atomic with the vCPU. The Arc-strong-count check
-/// catches that at the type-level.
+/// Two guards in one:
+///  * compile-time: `Arc::clone(&dev.interrupt_status)` only
+///    type-checks while the field is `Arc<AtomicU32>`. A
+///    regression to a bare `AtomicU32` fails to compile here.
+///  * runtime: the spawned thread's `fetch_or(BIT, Release)`
+///    must be visible via the device handle's `load(Acquire)`
+///    after join — proving the clone aliases the SAME atomic
+///    cell, not a copy. A regression that handed the worker an
+///    independent atomic (e.g. cloning the value instead of the
+///    Arc) would leave the device handle reading 0.
 #[test]
 fn interrupt_status_is_arc_shareable() {
     let dev = make_device(VIRTIO_BLK_DEFAULT_CAPACITY_BYTES, DiskThrottle::default());
-    let cloned = Arc::clone(&dev.interrupt_status);
-    // The device holds 1 strong reference; cloning makes 2.
-    // (In production the worker's clone makes it 3.)
-    assert!(
-        Arc::strong_count(&cloned) >= 2,
-        "interrupt_status must be Arc-shareable — strong_count \
-             after clone is {}",
-        Arc::strong_count(&cloned),
+    // Fresh device starts with no interrupt bits asserted.
+    assert_eq!(
+        dev.interrupt_status.load(Ordering::Acquire),
+        0,
+        "fresh device must have interrupt_status=0",
+    );
+
+    const BIT: u32 = 1 << 0; // VIRTIO_MMIO_INT_VRING shape.
+    // Move a clone into a worker-stand-in thread; it sets BIT
+    // on the shared cell exactly as `drain_bracket_impl` does.
+    let worker_handle = Arc::clone(&dev.interrupt_status);
+    thread::spawn(move || {
+        worker_handle.fetch_or(BIT, Ordering::Release);
+    })
+    .join()
+    .expect("interrupt-bit setter thread join");
+
+    // The DEVICE-side handle (not the clone) must observe the
+    // bit — proof the two Arcs alias one atomic cell.
+    assert_eq!(
+        dev.interrupt_status.load(Ordering::Acquire) & BIT,
+        BIT,
+        "device-side interrupt_status must observe the worker's \
+             fetch_or — the clone must alias the same atomic cell",
     );
 }
 

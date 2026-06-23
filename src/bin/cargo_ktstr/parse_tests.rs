@@ -3049,12 +3049,14 @@ fn kernel_list_long_about_exposes_range_mode_json_keys() {
          so a `kernel list --help` reader sees the range-mode \
          entry point: got: {about:?}",
     );
-    // The exact phrase from kernel_cmd.rs:416 splits across a
+    // The exact phrase from KERNEL_LIST_LONG_ABOUT's
+    // `SWITCHES to range-preview\nmode` line splits across a
     // line break (`...range-preview\nmode...`), so pin the
     // unambiguous hyphenated token directly. Plain "range mode"
     // also appears in surrounding prose (e.g. help text — see
+    // KERNEL_LIST_LONG_ABOUT's
     // `the `range` key (range mode) versus `entries` key (list mode)`
-    // at kernel_cmd.rs:437) so a disjunction would re-introduce
+    // line) so a disjunction would re-introduce
     // false-positive risk.
     assert!(
         about.contains("range-preview"),

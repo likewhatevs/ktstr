@@ -917,7 +917,6 @@ impl VirtioBlk {
         engine.state.ops_bucket = ops_bucket;
         engine.state.bytes_bucket = bytes_bucket;
         engine.state.all_descs_scratch.clear();
-        engine.state.io_buf_scratch.clear();
         // Reset throttle-stall gauge state. q.reset() above
         // cleared the queue cursor, so any chain that was
         // rolled-back-pending is now lost from the device's
@@ -1199,10 +1198,10 @@ impl VirtioBlk {
     /// return the device to its initial state, and bucket fill is
     /// part of that state).
     ///
-    /// Scratch buffers (`all_descs_scratch`, `io_buf_scratch`) are
-    /// `clear()`-ed (length zeroed, capacity retained) so the
-    /// next worker iteration starts with no stale entries but
-    /// without paying re-allocation cost on the first request.
+    /// The `all_descs_scratch` buffer is `clear()`-ed (length
+    /// zeroed, capacity retained) so the next worker iteration
+    /// starts with no stale entries but without paying
+    /// re-allocation cost on the first request.
     ///
     /// # Failure consequences
     ///
@@ -1226,7 +1225,6 @@ impl VirtioBlk {
         state.ops_bucket = ops_bucket;
         state.bytes_bucket = bytes_bucket;
         state.all_descs_scratch.clear();
-        state.io_buf_scratch.clear();
         // Reset throttle-stall gauge state. q.reset() (run by
         // the caller before this) cleared the queue cursor, so
         // any chain that was rolled-back-pending is now lost

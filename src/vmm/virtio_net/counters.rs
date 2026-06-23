@@ -299,8 +299,8 @@ impl VirtioNetCounters {
     /// bytes hit an unmapped GPA. Mutually exclusive PER CHAIN with
     /// [`Self::record_rx_chain_invalid`]: a chain rejected for
     /// shape NEVER also bumps this counter, and vice versa. The
-    /// caller routes via the `InvalidReason` enum inside
-    /// `try_loopback_to_rx`.
+    /// caller routes via the module-scope `InvalidReason` enum (set
+    /// in `write_rx_chain`, routed in `finalize_rx`).
     pub(crate) fn record_rx_write_failed(&self) {
         self.rx_write_failed.fetch_add(1, Ordering::Relaxed);
     }
@@ -321,8 +321,9 @@ impl VirtioNetCounters {
 
     /// Record one observed `Error::InvalidAvailRingIndex` event
     /// from `Queue::iter`. Called by `process_tx_loopback` /
-    /// `try_loopback_to_rx` when the avail ring's `idx` is more
-    /// than `queue.size` ahead of `next_avail` — a virtio-spec
+    /// `pop_rx_chain` (the RX-pull phase of `try_loopback_to_rx`)
+    /// when the avail ring's `idx` is more than `queue.size` ahead
+    /// of `next_avail` — a virtio-spec
     /// violation by the guest. The caller also sets
     /// `VirtioNet::queue_poisoned` so a single hostile-guest event
     /// produces exactly one bump regardless of how many subsequent

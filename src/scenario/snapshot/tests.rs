@@ -1651,10 +1651,9 @@ fn snapshot_bridge_dispatch_kernel_op_drain_log_is_ordered() {
 
 /// Filling [`SnapshotBridge`] beyond [`MAX_STORED_SNAPSHOTS`]
 /// must FIFO-evict the oldest tag and keep the newest. Pins
-/// the cap-and-evict invariant the doc on
-/// [`SnapshotBridge::store`] claims (see lines 579–598 / 606–
-/// 621): the `while reports.len() > MAX_STORED_SNAPSHOTS` loop
-/// pops `order.front()` (the oldest insertion) and removes the
+/// the cap-and-evict invariant of `store_internal`'s
+/// `while reports.len() > MAX_STORED_SNAPSHOTS` loop: it
+/// `order.pop_front()`s the oldest insertion and removes the
 /// corresponding entry from `reports`. A regression that drops
 /// the sweep, replaces FIFO with LIFO, or skips the
 /// `reports.remove` step would surface here as either an
@@ -1708,10 +1707,10 @@ fn snapshot_bridge_store_fifo_evicts_oldest() {
 /// Storing the same tag twice must REPLACE the report and
 /// move the tag to the BACK of the FIFO order — refreshing
 /// its position so a hot-rewritten tag does not stay near
-/// the eviction front. Pins the overwrite-refresh invariant
-/// the doc at lines 593–603 claims: on insert collision the
-/// loop searches `order` for the existing tag, removes it,
-/// then `push_back`s the fresh occurrence.
+/// the eviction front. Pins the overwrite-refresh invariant in
+/// `store_internal`'s insert-collision branch: it searches
+/// `order` via `order.iter().position(|k| k == name)`, removes
+/// that slot, then `order.push_back`s the fresh occurrence.
 ///
 /// The proof shape: pre-fill to cap with tag_0 .. tag_{cap-1},
 /// re-store tag_0 (refreshing its position to back), then
@@ -3461,8 +3460,9 @@ fn snapshot_bridge_events_capped_at_max_stored_events() {
 }
 
 /// Pushing EXACTLY [`MAX_STORED_EVENTS`] events must NOT trigger
-/// any eviction — the cap-enforcement predicate at L766 is
-/// `>=`, so the cap-th push fits without dropping. Drain then
+/// any eviction — `push_event`'s cap-enforcement predicate
+/// (`events.len() >= MAX_STORED_EVENTS`) is `>=`, so the cap-th
+/// push fits without dropping. Drain then
 /// yields exactly `cap` events with NO `EventLogTruncated` tail
 /// marker. Pins the boundary: a regression that changed `>=`
 /// to `>` would silently shift the cap by one and only be
@@ -4215,6 +4215,113 @@ fn snapshot_active_walker_obj_name_set_but_empty_whitelist_multi_copy_errors() {
     );
 }
 
+/// Raw `var()` (no explicit `.active()`) auto-falls-back to the
+/// active-scheduler resolution when the raw scan is ambiguous.
+/// Two same-name `bpf_bpf.bss` copies expose `counter`; the walker
+/// published `active_obj_name` + a single-entry `active_map_kvas`
+/// whitelist. `var("counter")` finds 2 raw hits, takes `var()`'s
+/// `active_obj.is_none() && let Ok(active) = self.active()`
+/// fallback arm, and the KVA filter narrows to the live copy.
+/// The only existing ambiguity test uses two DISTINCT obj prefixes
+/// so active() fails and execution falls to the AmbiguousVar arm;
+/// the walker-resolved fallback-SUCCESS path is exercised only here.
+#[test]
+fn snapshot_var_autofallback_to_active_resolves_ambiguity() {
+    let mut live_bss = make_global_map("bpf_bpf.bss", vec![("counter", uint_v(99))]);
+    live_bss.map_kva = 0x1000;
+    let mut stale_bss = make_global_map("bpf_bpf.bss", vec![("counter", uint_v(7))]);
+    stale_bss.map_kva = 0x2000;
+    let mut report = make_report_with_maps(vec![live_bss, stale_bss]);
+    report.active_obj_name = Some("bpf_bpf".to_string());
+    report.active_map_kvas = vec![0x1000];
+    let snap = Snapshot::new(&report);
+    // NOT snap.active().var() — raw var() must auto-narrow internally.
+    assert_eq!(
+        snap.var("counter").as_u64().unwrap(),
+        99,
+        "raw var() auto-narrows the two same-name bpf_bpf.bss copies \
+         (kva 0x1000=99 live, 0x2000=7 stale) down to the whitelisted live copy"
+    );
+}
+
+/// `active()` walker fast-path with `active_obj_name = Some` AND an
+/// EMPTY `active_map_kvas` whitelist AND a single global-section
+/// copy returns `Ok` with an empty (`&[]`) KVA filter — the
+/// post-multi-copy-guard `Ok` arm. Every other
+/// `active_obj_name = Some` test carries a non-empty whitelist (the
+/// `!active_map_kvas.is_empty()` arm); the two empty-whitelist
+/// walker tests are both multi-copy and hit the multi-copy
+/// `NoActiveScheduler` error arm. The single-copy + empty-whitelist
+/// Ok arm is reached only here.
+#[test]
+fn snapshot_active_walker_obj_name_single_copy_empty_whitelist_resolves() {
+    let mut report = make_report_with_maps(vec![make_global_map(
+        "bpf_bpf.bss",
+        vec![("counter", uint_v(55))],
+    )]);
+    report.active_obj_name = Some("bpf_bpf".to_string());
+    // active_map_kvas left empty (make_report_with_maps default).
+    let snap = Snapshot::new(&report);
+    let active = snap
+        .active()
+        .expect("active_obj_name + single copy + empty whitelist => Ok");
+    assert_eq!(active.var("counter").as_u64().unwrap(), 55);
+    assert_eq!(active.map_count(), 1);
+}
+
+/// `map_count()` reflects the active filter: an unfiltered view
+/// counts every captured map; an `active()`-filtered view counts
+/// only the active obj's maps. Three maps across two obj prefixes
+/// (alpha.bss, alpha.data, beta.bss); `active_obj_name = Some("alpha")`
+/// narrows to the two alpha.* maps and excludes beta.bss.
+#[test]
+fn snapshot_map_count_reflects_active_filter_vs_unfiltered() {
+    let mut report = make_report_with_maps(vec![
+        make_global_map("alpha.bss", vec![("counter", uint_v(1))]),
+        make_global_map("alpha.data", vec![("flag", uint_v(1))]),
+        make_global_map("beta.bss", vec![("other", uint_v(1))]),
+    ]);
+    report.active_obj_name = Some("alpha".to_string());
+    let snap = Snapshot::new(&report);
+    assert_eq!(
+        snap.map_count(),
+        3,
+        "unfiltered view counts every captured map"
+    );
+    let active = snap
+        .active()
+        .expect("active_obj_name names a captured prefix");
+    assert_eq!(
+        active.map_count(),
+        2,
+        "active() narrows to alpha.bss + alpha.data, excludes the unrelated beta.bss"
+    );
+}
+
+/// MIXED render-failure case: a successfully-rendered global map
+/// that does NOT carry the requested name PLUS a separate errored
+/// global map. `var()` finds zero hits, then surfaces
+/// `MapRenderIncomplete` from its render-gap arm (the
+/// `value.is_none() && error.is_some()` map probe) rather than
+/// VarNotFound — with a real map rendered, the search cannot
+/// confirm absence, so the render gap must still win. The existing
+/// render-failure test has ONLY the errored map present.
+#[test]
+fn snapshot_var_render_failure_shadows_absence_when_other_maps_render() {
+    let report = make_report_with_maps(vec![
+        make_global_map("scx_test.bss", vec![("present", uint_v(1))]),
+        make_errored_map("scx_test.rodata", "value region unreadable"),
+    ]);
+    let snap = Snapshot::new(&report);
+    match snap.var("absent_name") {
+        SnapshotField::Missing(SnapshotError::MapRenderIncomplete { map, error }) => {
+            assert_eq!(map, "scx_test.rodata");
+            assert_eq!(error, "value region unreadable");
+        }
+        other => panic!("expected MapRenderIncomplete (render gap shadows absence), got {other:?}"),
+    }
+}
+
 #[test]
 fn snapshot_var_on_placeholder_returns_placeholder_error() {
     let report = FailureDumpReport::placeholder("freeze_timed_out");
@@ -4945,12 +5052,12 @@ fn live_vars_via_with_max_by_sum_u64_picks_active_instance() {
 
 #[test]
 fn live_var_via_placeholder_snapshot_surfaces_placeholder_error() {
-    // Pin sibling-accessor parity: var() and map() both check
-    // is_placeholder first and return SnapshotError::PlaceholderSnapshot
-    // (view.rs:139, 172). live_var_via must do the same — otherwise a
-    // placeholder snapshot silently surfaces as VarNotFound with an
-    // empty `available` list, hiding the real freeze-rendezvous-failed
-    // signal from the caller's match arm.
+    // Pin sibling-accessor parity: var() and map() both short-circuit
+    // on is_placeholder before any lookup and return
+    // SnapshotError::PlaceholderSnapshot. live_var_via must do the same
+    // — otherwise a placeholder snapshot silently surfaces as
+    // VarNotFound with an empty `available` list, hiding the real
+    // freeze-rendezvous-failed signal from the caller's match arm.
     let r = FailureDumpReport {
         is_placeholder: true,
         ..Default::default()

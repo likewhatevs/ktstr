@@ -364,77 +364,15 @@ impl BuildSandbox {
         // Disagreement means the kernel narrowed the set (parent
         // restriction or invalid bits). Under `--cpu-cap` this is
         // unacceptable; without it, warn and proceed.
-        let cpu_set: BTreeSet<usize> = plan_cpus.iter().copied().collect();
-        if let Err(e) = cg.set_cpuset(&name, &cpu_set) {
-            let _ = cg.remove_cgroup(&name);
-            return Err(e).context("write cpuset.cpus");
-        }
-        let effective_cpus =
-            read_cpuset_effective(&parent_abs.join(&name).join("cpuset.cpus.effective"));
-        if let Some(eff) = &effective_cpus
-            && !cpuset_sets_equal(&cpu_set, eff)
-        {
-            // Cpuset narrowing is operational telemetry — tracing
-            // so sched-team log pipelines pick it up with the
-            // structured fields. Cross-node spill is a separate
-            // UX-facing warning that stays on eprintln!.
-            tracing::warn!(
-                cgroup = %name,
-                requested = ?cpu_set,
-                effective = ?eff,
-                "tag=resource_budget.cpuset_cpus_degraded",
-            );
-            if hard_error_on_degrade {
-                let _ = cg.remove_cgroup(&name);
-                anyhow::bail!(
-                    "--cpu-cap: cpuset.cpus narrowed by parent cgroup \
-                     (requested {cpu_set:?}, effective {eff:?}). \
-                     Run `ktstr locks --json` to inspect peers."
-                );
-            }
-        }
-
+        //
         // Step F.2: cpuset.mems — STRICTLY AFTER F.1. A cgroup with
         // empty cpuset.mems + a task in cgroup.procs would hit
         // SIGKILL on the next allocation per the kernel's
         // `cpuset_update_task_spread` path (already doc'd on
-        // CgroupManager::set_cpuset_mems).
-        if let Err(e) = cg.set_cpuset_mems(&name, plan_mems) {
-            let _ = cg.remove_cgroup(&name);
-            return Err(e).context("write cpuset.mems");
-        }
-        let effective_mems =
-            read_cpuset_effective(&parent_abs.join(&name).join("cpuset.mems.effective"));
-        if let Some(eff) = &effective_mems
-            && !cpuset_sets_equal(plan_mems, eff)
-        {
-            tracing::warn!(
-                cgroup = %name,
-                requested = ?plan_mems,
-                effective = ?eff,
-                "tag=resource_budget.cpuset_mems_degraded",
-            );
-            if hard_error_on_degrade {
-                let _ = cg.remove_cgroup(&name);
-                anyhow::bail!(
-                    "--cpu-cap: cpuset.mems narrowed by parent cgroup \
-                     (requested {plan_mems:?}, effective {eff:?}).\n\
-                     \n\
-                     Remediation:\n\
-                     \n\
-                       1. The parent cgroup's cpuset.mems is narrower than \
-                          the plan's NUMA node set. Run `ktstr locks` to \
-                          see which parent is active and `cat \
-                          /proc/self/cgroup` for the path, then either \
-                          widen that parent's cpuset.mems or move this \
-                          process under a wider cgroup (systemd-run \
-                          --user --scope -p Delegate=cpuset).\n\
-                       2. Drop --cpu-cap to build under LLC flock \
-                          coordination alone, trading NUMA enforcement \
-                          for the noisier fallback path."
-                );
-            }
-        }
+        // CgroupManager::set_cpuset_mems). The cpus-before-mems call
+        // order is a kernel ordering rule, not a stylistic choice.
+        write_and_verify_cpuset_cpus(&cg, &name, &parent_abs, plan_cpus, hard_error_on_degrade)?;
+        write_and_verify_cpuset_mems(&cg, &name, &parent_abs, plan_mems, hard_error_on_degrade)?;
 
         // Step G: migrate self into cgroup.procs AFTER both cpuset
         // writes. Use move_task (the single-pid variant) because
@@ -565,6 +503,95 @@ impl Drop for BuildSandbox {
     }
 }
 
+/// Write `cpuset.cpus` (Step F.1), then read back `.effective` and
+/// fail or warn on parent-narrowing per `hard_error_on_degrade`.
+fn write_and_verify_cpuset_cpus(
+    cg: &CgroupManager,
+    name: &str,
+    parent_abs: &Path,
+    plan_cpus: &[usize],
+    hard_error_on_degrade: bool,
+) -> Result<()> {
+    let cpu_set: BTreeSet<usize> = plan_cpus.iter().copied().collect();
+    if let Err(e) = cg.set_cpuset(name, &cpu_set) {
+        let _ = cg.remove_cgroup(name);
+        return Err(e).context("write cpuset.cpus");
+    }
+    let effective_cpus =
+        read_cpuset_effective(&parent_abs.join(name).join("cpuset.cpus.effective"));
+    if let Some(eff) = &effective_cpus
+        && !cpuset_sets_equal(&cpu_set, eff)
+    {
+        // Cpuset narrowing is operational telemetry — tracing
+        // so sched-team log pipelines pick it up with the
+        // structured fields. Cross-node spill is a separate
+        // UX-facing warning that stays on eprintln!.
+        tracing::warn!(
+            cgroup = %name,
+            requested = ?cpu_set,
+            effective = ?eff,
+            "tag=resource_budget.cpuset_cpus_degraded",
+        );
+        if hard_error_on_degrade {
+            let _ = cg.remove_cgroup(name);
+            anyhow::bail!(
+                "--cpu-cap: cpuset.cpus narrowed by parent cgroup \
+                 (requested {cpu_set:?}, effective {eff:?}). \
+                 Run `ktstr locks --json` to inspect peers."
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Write `cpuset.mems` (Step F.2), then read back `.effective` and
+/// fail or warn on parent-narrowing per `hard_error_on_degrade`.
+fn write_and_verify_cpuset_mems(
+    cg: &CgroupManager,
+    name: &str,
+    parent_abs: &Path,
+    plan_mems: &BTreeSet<usize>,
+    hard_error_on_degrade: bool,
+) -> Result<()> {
+    if let Err(e) = cg.set_cpuset_mems(name, plan_mems) {
+        let _ = cg.remove_cgroup(name);
+        return Err(e).context("write cpuset.mems");
+    }
+    let effective_mems =
+        read_cpuset_effective(&parent_abs.join(name).join("cpuset.mems.effective"));
+    if let Some(eff) = &effective_mems
+        && !cpuset_sets_equal(plan_mems, eff)
+    {
+        tracing::warn!(
+            cgroup = %name,
+            requested = ?plan_mems,
+            effective = ?eff,
+            "tag=resource_budget.cpuset_mems_degraded",
+        );
+        if hard_error_on_degrade {
+            let _ = cg.remove_cgroup(name);
+            anyhow::bail!(
+                "--cpu-cap: cpuset.mems narrowed by parent cgroup \
+                 (requested {plan_mems:?}, effective {eff:?}).\n\
+                 \n\
+                 Remediation:\n\
+                 \n\
+                   1. The parent cgroup's cpuset.mems is narrower than \
+                      the plan's NUMA node set. Run `ktstr locks` to \
+                      see which parent is active and `cat \
+                      /proc/self/cgroup` for the path, then either \
+                      widen that parent's cpuset.mems or move this \
+                      process under a wider cgroup (systemd-run \
+                      --user --scope -p Delegate=cpuset).\n\
+                   2. Drop --cpu-cap to build under LLC flock \
+                      coordination alone, trading NUMA enforcement \
+                      for the noisier fallback path."
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Return `true` when `parent_rel` (as emitted by
 /// [`read_self_cgroup_path`]) identifies the cgroup v2 root. The
 /// root has no parent `subtree_control` to write `+cpuset` into,
@@ -595,8 +622,30 @@ pub(crate) fn is_root_cgroup(parent_rel: &str) -> bool {
 /// verbatim — leading slash preserved, suitable for callers that
 /// `trim_start_matches('/').join()` against `/sys/fs/cgroup` to
 /// form the absolute parent cgroup path.
+///
+/// The `/proc/self/cgroup` read is the only side effect; parsing is
+/// delegated to [`parse_self_cgroup_line`] so the line-selection +
+/// strip + trim logic is unit-testable without a fixed-path read.
 fn read_self_cgroup_path() -> Result<String> {
     let text = std::fs::read_to_string("/proc/self/cgroup").context("read /proc/self/cgroup")?;
+    parse_self_cgroup_line(&text)
+}
+
+/// Parse `/proc/self/cgroup` contents and return the cgroup v2
+/// relative path.
+///
+/// cgroup v2 line format is `0::/path`. Hybrid cgroup v1+v2 hosts
+/// also emit v1 controller-specific lines that start with a
+/// non-zero hierarchy id (e.g. `3:cpuset:/legacy`); those are
+/// skipped, and only the `0::` entry is returned. The matched
+/// path's leading slash is preserved while trailing whitespace
+/// (the line's `\n`) is trimmed. Bails when no `0::` entry exists.
+///
+/// Extracted from [`read_self_cgroup_path`] (which hardcodes the
+/// `/proc/self/cgroup` path and is therefore not host-isolable) so
+/// the parse logic is unit-testable on string input — mirroring the
+/// [`is_root_cgroup`] extraction.
+pub(crate) fn parse_self_cgroup_line(text: &str) -> Result<String> {
     for line in text.lines() {
         // cgroup v2 line format: `0::/path`. Hybrid cgroup v1+v2
         // may also list `0::/path`; ignore v1 controller-specific
@@ -1629,6 +1678,430 @@ mod tests {
         assert!(
             !calls.iter().any(|c| c.starts_with("remove_cgroup")),
             "remove_cgroup must NOT fire on success: {calls:?}",
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // degraded_or_err — hard-error remediation + soft round-trip
+    // ---------------------------------------------------------------
+
+    /// `degraded_or_err(kind, true)` builds the full `--cpu-cap`
+    /// hard-error: the interpolated `{kind}` Display verbatim AND all
+    /// four numbered remediation steps. The try_create-driven test
+    /// (`build_sandbox_try_create_hard_error_converts_degrade`)
+    /// short-circuits to `Ok(Active)` on any functional cgroup v2
+    /// host, leaving this arm host-dependent; calling the private fn
+    /// directly forces it deterministically with no filesystem.
+    ///
+    /// Pins the `{kind}` interpolation across all five variants so a
+    /// future Display refactor that desynchronized the message body
+    /// from the variant text would be caught.
+    #[test]
+    fn degraded_or_err_hard_error_renders_full_remediation() {
+        let e = BuildSandbox::degraded_or_err(SandboxDegraded::NoCpusetController, true)
+            .expect_err("hard_error_on_degrade=true must return Err");
+        let m = format!("{e:#}");
+        // {kind} Display interpolated verbatim after "--cpu-cap: ".
+        assert!(
+            m.contains("--cpu-cap: parent cgroup does not expose cpuset controller."),
+            "kind Display must interpolate verbatim: {m}",
+        );
+        // Remediation step 1: systemd transient scope.
+        assert!(
+            m.contains("systemd-run --user --scope"),
+            "step 1 (systemd-run) must be present: {m}",
+        );
+        // Remediation step 2: sudo -E preserving env.
+        assert!(
+            m.contains("sudo -E cargo ktstr kernel build"),
+            "step 2 (sudo -E) must be present: {m}",
+        );
+        // Remediation step 3: cpuset delegation needs CAP_SYS_ADMIN.
+        assert!(
+            m.contains("requires CAP_SYS_ADMIN"),
+            "step 3 (CAP_SYS_ADMIN) must be present: {m}",
+        );
+        // Remediation step 4: drop --cpu-cap, fall back to LLC flock.
+        assert!(
+            m.contains("falls back to LLC flock"),
+            "step 4 (LLC flock fallback) must be present: {m}",
+        );
+
+        // Every variant's Display must interpolate verbatim into the
+        // message — pins the {kind} substitution per variant.
+        for kind in [
+            SandboxDegraded::NoCgroupV2,
+            SandboxDegraded::NoCpusetController,
+            SandboxDegraded::SubtreeControlRefused,
+            SandboxDegraded::PermissionDenied,
+            SandboxDegraded::RootCgroupRefused,
+        ] {
+            let want = format!("--cpu-cap: {kind}.");
+            let err =
+                BuildSandbox::degraded_or_err(kind.clone(), true).expect_err("hard error required");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains(&want),
+                "kind {kind:?} Display must interpolate verbatim: {msg}",
+            );
+        }
+    }
+
+    /// `degraded_or_err(kind, false)` returns
+    /// `Ok(BuildSandbox::Degraded(kind))` with the exact kind passed
+    /// in — the soft path that a cap-unset caller takes. No existing
+    /// test calls the fn directly to confirm the kind round-trips
+    /// (try_create-driven tests only assert non-empty Display and the
+    /// host may take Active). Pins the kind round-trip across all 5
+    /// `SandboxDegraded` variants, mirroring the hard-error sibling
+    /// `degraded_or_err_hard_error_renders_full_remediation`.
+    /// `SandboxDegraded` derives Debug+Clone but not PartialEq, so the
+    /// assertion uses a per-kind nested `matches!` pattern rather than
+    /// `assert_eq!`.
+    #[test]
+    fn degraded_or_err_soft_returns_degraded_preserving_kind() {
+        for kind in [
+            SandboxDegraded::NoCgroupV2,
+            SandboxDegraded::NoCpusetController,
+            SandboxDegraded::SubtreeControlRefused,
+            SandboxDegraded::PermissionDenied,
+            SandboxDegraded::RootCgroupRefused,
+        ] {
+            let s =
+                BuildSandbox::degraded_or_err(kind.clone(), false).expect("soft path must be Ok");
+            // No PartialEq on SandboxDegraded — pick the expected
+            // nested Degraded pattern per kind, then matches! it.
+            let preserved = match kind {
+                SandboxDegraded::NoCgroupV2 => {
+                    matches!(s, BuildSandbox::Degraded(SandboxDegraded::NoCgroupV2))
+                }
+                SandboxDegraded::NoCpusetController => matches!(
+                    s,
+                    BuildSandbox::Degraded(SandboxDegraded::NoCpusetController)
+                ),
+                SandboxDegraded::SubtreeControlRefused => matches!(
+                    s,
+                    BuildSandbox::Degraded(SandboxDegraded::SubtreeControlRefused)
+                ),
+                SandboxDegraded::PermissionDenied => {
+                    matches!(s, BuildSandbox::Degraded(SandboxDegraded::PermissionDenied))
+                }
+                SandboxDegraded::RootCgroupRefused => matches!(
+                    s,
+                    BuildSandbox::Degraded(SandboxDegraded::RootCgroupRefused)
+                ),
+            };
+            assert!(
+                preserved,
+                "soft path must preserve the exact kind in Degraded",
+            );
+            assert!(!s.is_active(), "Degraded must report !is_active()");
+            // s is Degraded — Drop is a no-op per the Drop impl's early
+            // return on the non-Active arm.
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // parent_controllers_include — readable-file token-match branches
+    // ---------------------------------------------------------------
+
+    /// `parent_controllers_include` returns `true` for a controller
+    /// token present anywhere in a readable `cgroup.controllers`
+    /// file. Covers the `Ok(contents)` + `.any(==)` TRUE branch
+    /// (`parent_controllers_include_missing_file` only covers the
+    /// `Err(_) => false` arm). Asserts a mid-list and an end-of-list
+    /// token both match.
+    #[test]
+    fn parent_controllers_include_present_returns_true() {
+        let tmp = tempfile::Builder::new()
+            .prefix("ktstr-controllers-present-")
+            .tempdir()
+            .unwrap();
+        let dir = tmp.path();
+        std::fs::write(
+            dir.join("cgroup.controllers"),
+            "cpuset cpu io memory pids\n",
+        )
+        .unwrap();
+        // First token.
+        assert!(
+            parent_controllers_include(dir, "cpuset"),
+            "cpuset (first token) must match",
+        );
+        // Last token.
+        assert!(
+            parent_controllers_include(dir, "pids"),
+            "pids (last token) must match",
+        );
+        // Middle token.
+        assert!(
+            parent_controllers_include(dir, "io"),
+            "io (middle token) must match",
+        );
+    }
+
+    /// `parent_controllers_include` returns `false` when the file is
+    /// readable but the requested controller is absent — distinct
+    /// from the `Err(_)` missing-file branch. Also pins that the
+    /// match is token-exact (`==`), not `contains()`: a file listing
+    /// `cpu` must NOT satisfy a request for `cpuset` despite the
+    /// substring collision.
+    #[test]
+    fn parent_controllers_include_present_but_absent_returns_false() {
+        let tmp = tempfile::Builder::new()
+            .prefix("ktstr-controllers-absent-")
+            .tempdir()
+            .unwrap();
+        let dir = tmp.path();
+        std::fs::write(dir.join("cgroup.controllers"), "cpu io memory\n").unwrap();
+        assert!(
+            !parent_controllers_include(dir, "cpuset"),
+            "cpuset absent despite the cpu prefix-collision token must be false",
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // read_cpuset_effective — present-file parse + empty-vs-absent
+    // ---------------------------------------------------------------
+
+    /// `read_cpuset_effective` parses a readable `.effective` file
+    /// into a `BTreeSet<usize>`: covers the `Some(...)` success path
+    /// (`read_cpuset_effective_missing_file_returns_none` covers only
+    /// the `None` read-error branch). Pins the
+    /// `parse_cpu_list_lenient` wiring — trailing-newline trim plus
+    /// range-expansion (`0-2` → `{0,1,2}`) into the set.
+    #[test]
+    fn read_cpuset_effective_parses_present_file() {
+        let tmp = tempfile::Builder::new()
+            .prefix("ktstr-effective-parse-")
+            .tempdir()
+            .unwrap();
+        let path = tmp.path().join("cpuset.cpus.effective");
+        std::fs::write(&path, "0-2,4\n").unwrap();
+        assert_eq!(
+            read_cpuset_effective(&path),
+            Some(BTreeSet::from([0usize, 1, 2, 4])),
+            "range 0-2 expands and 4 appends into the set after trim",
+        );
+    }
+
+    /// `read_cpuset_effective` on an existing-but-empty file yields
+    /// `Some(empty BTreeSet)`, NOT `None`. This pins the load-bearing
+    /// absent-vs-empty distinction: in `try_create`,
+    /// `cpuset_sets_equal(requested, empty)` would be `false` and
+    /// drive the degrade warn, whereas `None` means "cannot verify"
+    /// and is silently tolerated. The two must not collapse.
+    #[test]
+    fn read_cpuset_effective_empty_file_is_empty_set_not_none() {
+        let tmp = tempfile::Builder::new()
+            .prefix("ktstr-effective-empty-")
+            .tempdir()
+            .unwrap();
+        let path = tmp.path().join("cpuset.cpus.effective");
+        // Whitespace-only content: read_to_string is Ok, the trim +
+        // parse yields an empty list → Some(empty set).
+        std::fs::write(&path, "\n").unwrap();
+        assert_eq!(
+            read_cpuset_effective(&path),
+            Some(BTreeSet::new()),
+            "existing-but-empty file is Some(empty), explicitly NOT None",
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // parse_self_cgroup_line — pure parse seam
+    // ---------------------------------------------------------------
+
+    /// `parse_self_cgroup_line` strips the `0::` prefix and trims the
+    /// trailing newline, skips v1 controller-specific lines to select
+    /// the v2 entry, and errors when no `0::` entry exists. The
+    /// host-reading `read_self_cgroup_returns_path` only asserts
+    /// `starts_with('/')`; the multi-line skip, the trim, and the
+    /// no-v2-entry error are pinned here on pure string input.
+    #[test]
+    fn parse_self_cgroup_line_strips_prefix_and_selects_v2() {
+        // Single v2 line: prefix stripped, trailing newline trimmed.
+        assert_eq!(
+            parse_self_cgroup_line("0::/user.slice/x.scope\n").unwrap(),
+            "/user.slice/x.scope",
+            "0:: prefix stripped and trailing newline trimmed",
+        );
+        // Hybrid: a v1 controller line precedes the 0:: line; the
+        // v2 line is selected.
+        assert_eq!(
+            parse_self_cgroup_line("3:cpuset:/legacy\n0::/good\n").unwrap(),
+            "/good",
+            "v1 lines skipped, 0:: line selected",
+        );
+        // No 0:: entry: bail.
+        assert!(
+            parse_self_cgroup_line("3:cpuset:/legacy\n").is_err(),
+            "hybrid input with no 0:: entry must error",
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // sweep_orphan_sandboxes — the proceed-to-remove path
+    // ---------------------------------------------------------------
+
+    /// `sweep_orphan_sandboxes` REMOVES a `ktstr-build-{pid}` orphan
+    /// whose embedded pid is dead AND whose mtime is past
+    /// `ORPHAN_MAX_AGE`. Every existing sweep test exercises a SKIP
+    /// branch (non-ktstr name, unparseable pid, live pid, young
+    /// mtime) and so never reaches the `sweep_skip_reason(..).is_some()
+    /// == false` fall-through that builds a real `CgroupManager` and
+    /// calls `remove_cgroup`. This pins that removal path: the parent
+    /// is a plain tempdir, the orphan is a flat empty directory (so the
+    /// real `CgroupManager::remove_cgroup` short-circuits drain on the
+    /// absent `cgroup.procs` and `fs::remove_dir`s the empty entry).
+    ///
+    /// The pid is fork-then-reaped so `kill(pid, 0)` returns ESRCH;
+    /// the mtime is shifted 48h back (> ORPHAN_MAX_AGE of 24h) via
+    /// `libc::utime`, matching the gate-test helper pattern.
+    #[test]
+    fn sweep_orphan_sandboxes_removes_dead_pid_old_orphan() {
+        // Fork + reap so the pid is provably dead (ESRCH on kill).
+        // SAFETY: child runs only `_exit(0)` (no Rust destructors
+        // between fork and _exit); the parent reaps it before using
+        // the pid, so no zombie lingers and the pid is unallocated.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork must succeed");
+        if pid == 0 {
+            unsafe {
+                libc::_exit(0);
+            }
+        }
+        let mut status: libc::c_int = 0;
+        let rc = unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert_eq!(rc, pid, "waitpid must reap our child");
+
+        let parent = tempfile::Builder::new()
+            .prefix("ktstr-sandbox-remove-orphan-")
+            .tempdir()
+            .unwrap();
+        let orphan = parent
+            .path()
+            .join(format!("ktstr-build-1700000000000-{pid}"));
+        std::fs::create_dir(&orphan).unwrap();
+
+        // Shift the orphan's mtime 48h into the past so the
+        // mtime gate (>= ORPHAN_MAX_AGE) is open.
+        let old = std::time::SystemTime::now()
+            .checked_sub(Duration::from_secs(48 * 60 * 60))
+            .expect("time arithmetic");
+        let secs = old
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("post-epoch")
+            .as_secs();
+        let buf = libc::utimbuf {
+            actime: secs as libc::time_t,
+            modtime: secs as libc::time_t,
+        };
+        let cpath = std::ffi::CString::new(orphan.to_str().expect("utf8")).expect("nul-free");
+        // SAFETY: `cpath` is a valid nul-terminated path to the
+        // just-created directory; `&buf` is a live aligned struct on
+        // this frame. utime(2) is safe with these arguments.
+        let utime_rc = unsafe { libc::utime(cpath.as_ptr(), &buf) };
+        assert_eq!(utime_rc, 0, "utime must succeed on the orphan dir");
+
+        assert!(orphan.exists(), "orphan must exist before the sweep");
+        sweep_orphan_sandboxes(parent.path());
+        assert!(
+            !orphan.exists(),
+            "dead-pid + old-mtime orphan must be removed by the sweep",
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // MockCgroupOps — every recorded trait method + return value
+    // ---------------------------------------------------------------
+
+    /// Drive every `MockCgroupOps` trait method that the rollback
+    /// tests don't touch, asserting each records its formatted call
+    /// string and returns the documented value. The rollback tests
+    /// only exercise `set_cpuset` / `set_cpuset_mems` / `move_task` /
+    /// `remove_cgroup`; this covers the remaining
+    /// `CgroupOps` arms (`parent_path`, `setup`, `create_cgroup`,
+    /// `clear_cpuset`, the `set_*` knobs, `move_tasks`,
+    /// `place_task_during_handshake`, `clear_subtree_control`,
+    /// `drain_tasks`, `read_procs`, `cleanup_all`) so a refactor that
+    /// breaks the mock's call-recording contract — which the rollback
+    /// tests rely on for their `calls_snapshot` assertions — is caught.
+    ///
+    /// Invoked through `&dyn CgroupOps` (not the concrete struct) so
+    /// the trait-object dispatch the production seam uses is what's
+    /// exercised.
+    #[test]
+    fn mock_cgroup_ops_records_every_method_and_returns() {
+        let mock = MockCgroupOps::default();
+        let ops: &dyn crate::cgroup::CgroupOps = &mock;
+
+        // parent_path is the fixed sentinel "/mock".
+        assert_eq!(
+            ops.parent_path(),
+            Path::new("/mock"),
+            "mock parent_path is the /mock sentinel",
+        );
+
+        let controllers: BTreeSet<crate::cgroup::Controller> =
+            [crate::cgroup::Controller::Cpuset].into_iter().collect();
+        ops.setup(&controllers).expect("setup ok");
+        ops.create_cgroup("c").expect("create_cgroup ok");
+        ops.clear_cpuset("c").expect("clear_cpuset ok");
+        ops.clear_cpuset_mems("c").expect("clear_cpuset_mems ok");
+        ops.set_cpu_max("c", Some(100_000), 100_000)
+            .expect("set_cpu_max ok");
+        ops.set_cpu_weight("c", 100).expect("set_cpu_weight ok");
+        ops.set_memory_max("c", Some(1 << 30))
+            .expect("set_memory_max ok");
+        ops.set_memory_high("c", None).expect("set_memory_high ok");
+        ops.set_memory_low("c", Some(0)).expect("set_memory_low ok");
+        ops.set_io_weight("c", 100).expect("set_io_weight ok");
+        ops.set_freeze("c", true).expect("set_freeze ok");
+        ops.set_pids_max("c", Some(512)).expect("set_pids_max ok");
+        ops.set_memory_swap_max("c", None)
+            .expect("set_memory_swap_max ok");
+        ops.move_tasks("c", &[7, 8]).expect("move_tasks ok");
+        ops.place_task_during_handshake("c", 9)
+            .expect("place_task_during_handshake ok");
+        ops.clear_subtree_control("c")
+            .expect("clear_subtree_control ok");
+        ops.drain_tasks("c").expect("drain_tasks ok");
+
+        // read_procs returns an empty Vec (the mock's documented
+        // "no tasks" shape).
+        let procs = ops.read_procs("c").expect("read_procs ok");
+        assert!(procs.is_empty(), "mock read_procs returns no pids");
+
+        ops.cleanup_all().expect("cleanup_all ok");
+
+        // Exact recorded order, with the `set_freeze(name,frozen)`
+        // and `place_task_during_handshake(name,pid)` formats pinned.
+        let calls = mock.calls_snapshot();
+        assert_eq!(
+            calls,
+            vec![
+                "setup".to_string(),
+                "create_cgroup(c)".to_string(),
+                "clear_cpuset(c)".to_string(),
+                "clear_cpuset_mems(c)".to_string(),
+                "set_cpu_max(c)".to_string(),
+                "set_cpu_weight(c)".to_string(),
+                "set_memory_max(c)".to_string(),
+                "set_memory_high(c)".to_string(),
+                "set_memory_low(c)".to_string(),
+                "set_io_weight(c)".to_string(),
+                "set_freeze(c,true)".to_string(),
+                "set_pids_max(c)".to_string(),
+                "set_memory_swap_max(c)".to_string(),
+                "move_tasks(c)".to_string(),
+                "place_task_during_handshake(c,9)".to_string(),
+                "clear_subtree_control(c)".to_string(),
+                "drain_tasks(c)".to_string(),
+                "read_procs(c)".to_string(),
+                "cleanup_all".to_string(),
+            ],
+            "every mock method must record its formatted call in order",
         );
     }
 }

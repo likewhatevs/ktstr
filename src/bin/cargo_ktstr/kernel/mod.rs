@@ -317,77 +317,156 @@ pub(crate) fn resolve_one(id: ktstr::kernel_path::KernelId) -> Result<(String, P
 /// applies the `kernel_` prefix and `[a-z0-9_]+` normalisation; this
 /// label is the human-meaningful payload it operates on.
 pub(crate) fn resolve_kernel_set(specs: &[String]) -> Result<Vec<(String, PathBuf)>, String> {
+    preflight_collision_check(specs)?;
+    let resolved = resolve_specs_parallel(specs)?;
+    let resolved = dedupe_resolved(resolved);
+    detect_label_collisions(&resolved)?;
+    Ok(resolved)
+}
+
+/// Resolve one trimmed `--kernel` spec into the `(label, path)`
+/// results it expands to.
+///
+/// Returns a `Vec` so the caller can splice it into the rayon
+/// `flat_map_iter` parent iterator via `.into_iter()`: a Range
+/// yields one element per expanded version, every other spec
+/// yields exactly one element. Each element is an opaque
+/// `Result<(String, PathBuf), String>` driven by
+/// [`resolve_one_with_progress`]; the caller's `collect` on
+/// `Result` short-circuits on the first error.
+///
+/// Each spec resolves independently:
+///   - Path → cache lookup → maybe build (no network).
+///     Clean source trees hit the local-source cache key
+///     `local-{hash7}-{arch}-kc{suffix}`; cache miss reaches
+///     the same `kernel_build_pipeline` Version/CacheKey/Git
+///     specs use, with the result stored back at the same key.
+///     Dirty trees skip the cache store and build in place.
+///   - Version / CacheKey → cache lookup → maybe download +
+///     build.
+///   - Range → fetch releases.json once, then per-version
+///     cache lookup → maybe download + build for each
+///     expanded version.
+///   - Git → shallow clone → cache lookup → maybe build.
+///
+/// Two phases of work happen behind the per-spec resolvers:
+/// (1) network I/O — kernel.org tarball download or
+///     `git_clone` shallow fetch — which is independent
+///     across specs and overlaps freely.
+/// (2) build — `make -j$(nproc)` invoked under an LLC flock
+///     plus a cgroup v2 sandbox (`acquire_build_reservation`
+///     in `kernel_build_pipeline`). The flock serializes
+///     concurrent builders against each other, so parallel
+///     resolvers queue at the LLC level even when their
+///     downloads overlapped.
+///
+/// Net effect: parallelizing `resolve_kernel_set` overlaps
+/// every download / clone phase, while the build phase
+/// remains serialized via the LLC flock the build pipeline
+/// already holds. `make -j$(nproc)` inside a single build
+/// saturates CPU on its own — running multiple builds
+/// concurrently would only contend with the active build's
+/// reserved LLCs, so the flock-driven serialization is the
+/// correct ceiling. The cache-store path is also flock-
+/// protected (`store_succeeds_under_internal_exclusive_lock`
+/// in `cache.rs`) so concurrent stores against different
+/// cache keys are safe.
+///
+/// Concurrent resolves of the SAME spec (e.g. a duplicated
+/// `--kernel 6.14.2` flag) racing on the same cache key are
+/// also safe — the cache's exclusive store lock means the
+/// second resolver re-checks the cache after acquiring its
+/// own lock and finds the just-written entry, skipping the
+/// redundant build.
+///
+/// `flat_map_iter` flattens Range expansion under one rayon
+/// worker: this fn resolves every version of a single
+/// Range spec sequentially via `.map(...).collect::<Vec<_>>()`
+/// before returning the Vec, so a 5-version range
+/// serializes its five resolves against itself within one
+/// worker. Peer specs (other top-level `--kernel` arguments)
+/// still parallelize across workers — only versions WITHIN
+/// one Range are serial. The serialization is acceptable
+/// because the per-version build phase is already serialized
+/// at the LLC-flock layer (see comment above), so the lost
+/// intra-range download overlap is a small fraction of total
+/// wall time on multi-version Range invocations.
+fn resolve_one_spec(trimmed: String) -> Vec<Result<(String, PathBuf), String>> {
     use ktstr::kernel_path::KernelId;
+
+    // Validation runs first so an inverted Range bails
+    // before any I/O — same diagnostic timing the
+    // sequential loop preserved.
+    let id = KernelId::parse(&trimmed);
+    if let Err(e) = id.validate() {
+        return vec![Err(format!("--kernel {id}: {e}"))];
+    }
+    match id {
+        KernelId::Range { start, end, .. } => {
+            match ktstr::cli::expand_kernel_range(&start, &end, "cargo ktstr") {
+                Ok(versions) => versions
+                    .into_iter()
+                    .map(|ver| {
+                        resolve_one_with_progress(KernelId::Version(ver.clone()))
+                            .map_err(|e| format!("resolve kernel {ver}: {e}"))
+                    })
+                    .collect::<Vec<_>>(),
+                Err(e) => vec![Err(format!("{e:#}"))],
+            }
+        }
+        other => vec![resolve_one_with_progress(other)],
+    }
+}
+
+/// `resolve_one` plus per-resolve progress feedback.
+///
+/// A user passing `--kernel 6.10..6.20` (10+ versions) sees
+/// `cargo ktstr: resolved kernel "6.10"` lines as each version
+/// finishes its download+build cycle, instead of staring at
+/// silence for the multi-minute resolve. Emitted at the Ok-arm
+/// of each `resolve_one` call so failures still propagate via
+/// the existing fail-fast `collect::<Result<_, _>>?` chain
+/// upstream — only successful resolves print. Single-kernel
+/// runs emit ONE line; that's negligible noise versus the
+/// multi-kernel UX gain. Output is `eprintln!` (stderr) so
+/// it doesn't pollute stdout pipelines that consume the
+/// tool's other output (e.g. shell scripts piping through
+/// jq).
+///
+/// `tracing::info!` would respect `RUST_LOG`, but the
+/// command spends most of its wall time in
+/// `resolve_kernel_set` and operators expect progress
+/// visibility by default — gating it behind a verbosity
+/// flag would defeat the point. Keep it as unconditional
+/// `eprintln!` matching the pattern other long-running
+/// helpers (`expand_kernel_range`, `kernel_build_pipeline`)
+/// already use.
+fn resolve_one_with_progress(
+    id: ktstr::kernel_path::KernelId,
+) -> Result<(String, PathBuf), String> {
+    let result = resolve_one(id);
+    if let Ok((label, _)) = &result {
+        eprintln!("cargo ktstr: resolved kernel {label:?}");
+    }
+    result
+}
+
+/// Resolve every spec in parallel under a bounded rayon ThreadPool,
+/// returning the flat (label, path) list before dedup / collision
+/// detection.
+///
+/// Result-collecting fail-fast: rayon's `collect` on
+/// `Result<_, _>` short-circuits on the first error, so a
+/// single failed spec aborts the rest. This matches the
+/// pre-parallel loop's `?` propagation; the operator sees
+/// the first failure even though peers may still be in
+/// flight (their cleanup is owned by their tempdirs going
+/// out of scope, see `download_and_cache_version` /
+/// `resolve_git_kernel` for the `tempfile::TempDir`-driven
+/// teardown).
+fn resolve_specs_parallel(specs: &[String]) -> Result<Vec<(String, PathBuf)>, String> {
     use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
-    preflight_collision_check(specs)?;
-
-    // Each spec resolves independently:
-    //   - Path → cache lookup → maybe build (no network).
-    //     Clean source trees hit the local-source cache key
-    //     `local-{hash7}-{arch}-kc{suffix}`; cache miss reaches
-    //     the same `kernel_build_pipeline` Version/CacheKey/Git
-    //     specs use, with the result stored back at the same key.
-    //     Dirty trees skip the cache store and build in place.
-    //   - Version / CacheKey → cache lookup → maybe download +
-    //     build.
-    //   - Range → fetch releases.json once, then per-version
-    //     cache lookup → maybe download + build for each
-    //     expanded version.
-    //   - Git → shallow clone → cache lookup → maybe build.
-    //
-    // Two phases of work happen behind the per-spec resolvers:
-    // (1) network I/O — kernel.org tarball download or
-    //     `git_clone` shallow fetch — which is independent
-    //     across specs and overlaps freely.
-    // (2) build — `make -j$(nproc)` invoked under an LLC flock
-    //     plus a cgroup v2 sandbox (`acquire_build_reservation`
-    //     in `kernel_build_pipeline`). The flock serializes
-    //     concurrent builders against each other, so parallel
-    //     resolvers queue at the LLC level even when their
-    //     downloads overlapped.
-    //
-    // Net effect: parallelizing `resolve_kernel_set` overlaps
-    // every download / clone phase, while the build phase
-    // remains serialized via the LLC flock the build pipeline
-    // already holds. `make -j$(nproc)` inside a single build
-    // saturates CPU on its own — running multiple builds
-    // concurrently would only contend with the active build's
-    // reserved LLCs, so the flock-driven serialization is the
-    // correct ceiling. The cache-store path is also flock-
-    // protected (`store_succeeds_under_internal_exclusive_lock`
-    // in `cache.rs`) so concurrent stores against different
-    // cache keys are safe.
-    //
-    // Concurrent resolves of the SAME spec (e.g. a duplicated
-    // `--kernel 6.14.2` flag) racing on the same cache key are
-    // also safe — the cache's exclusive store lock means the
-    // second resolver re-checks the cache after acquiring its
-    // own lock and finds the just-written entry, skipping the
-    // redundant build.
-    //
-    // `flat_map_iter` flattens Range expansion under one rayon
-    // worker: the closure resolves every version of a single
-    // Range spec sequentially via `.map(...).collect::<Vec<_>>()`
-    // before yielding the iterator, so a 5-version range
-    // serializes its five resolves against itself within one
-    // worker. Peer specs (other top-level `--kernel` arguments)
-    // still parallelize across workers — only versions WITHIN
-    // one Range are serial. The serialization is acceptable
-    // because the per-version build phase is already serialized
-    // at the LLC-flock layer (see comment above), so the lost
-    // intra-range download overlap is a small fraction of total
-    // wall time on multi-version Range invocations.
-    //
-    // Result-collecting fail-fast: rayon's `collect` on
-    // `Result<_, _>` short-circuits on the first error, so a
-    // single failed spec aborts the rest. This matches the
-    // pre-parallel loop's `?` propagation; the operator sees
-    // the first failure even though peers may still be in
-    // flight (their cleanup is owned by their tempdirs going
-    // out of scope, see `download_and_cache_version` /
-    // `resolve_git_kernel` for the `tempfile::TempDir`-driven
-    // teardown).
     // Cap rayon parallelism via a bounded ThreadPool installed
     // ONLY for this resolve pipeline. Without the cap, an
     // operator passing `--kernel A --kernel B ... --kernel Z`
@@ -437,36 +516,6 @@ pub(crate) fn resolve_kernel_set(specs: &[String]) -> Result<Vec<(String, PathBu
         .build()
         .ok();
 
-    // Per-resolve progress feedback. A user passing `--kernel
-    // 6.10..6.20` (10+ versions) sees `cargo ktstr: resolved
-    // kernel "6.10"` lines as each version finishes its
-    // download+build cycle, instead of staring at silence for
-    // the multi-minute resolve. Emitted at the Ok-arm of each
-    // `resolve_one` call so failures still propagate via the
-    // existing fail-fast `collect::<Result<_, _>>?` chain
-    // upstream — only successful resolves print. Single-kernel
-    // runs emit ONE line; that's negligible noise versus the
-    // multi-kernel UX gain. Output is `eprintln!` (stderr) so
-    // it doesn't pollute stdout pipelines that consume the
-    // tool's other output (e.g. shell scripts piping through
-    // jq).
-    //
-    // `tracing::info!` would respect `RUST_LOG`, but the
-    // command spends most of its wall time in
-    // `resolve_kernel_set` and operators expect progress
-    // visibility by default — gating it behind a verbosity
-    // flag would defeat the point. Keep it as unconditional
-    // `eprintln!` matching the pattern other long-running
-    // helpers (`expand_kernel_range`, `kernel_build_pipeline`)
-    // already use.
-    let resolve_one_with_progress = |id: KernelId| -> Result<(String, PathBuf), String> {
-        let result = resolve_one(id);
-        if let Ok((label, _)) = &result {
-            tracing::debug!("cargo ktstr: resolved kernel {label:?}");
-        }
-        result
-    };
-
     let resolve_in_pool = || -> Result<Vec<(String, PathBuf)>, String> {
         specs
             .into_par_iter()
@@ -478,53 +527,13 @@ pub(crate) fn resolve_kernel_set(specs: &[String]) -> Result<Vec<(String, PathBu
                     Some(trimmed.to_string())
                 }
             })
-            .flat_map_iter(|trimmed| {
-                // `flat_map_iter` returns an iterator per input. The
-                // Range arm below pre-collects every version's
-                // `resolve_one` result into a Vec before yielding,
-                // so versions WITHIN a single Range spec resolve
-                // sequentially under one rayon worker; only PEER
-                // specs (other top-level `--kernel` args) parallelize
-                // across workers. Each yielded item is an opaque
-                // `Result<(String, PathBuf), String>` driven by the
-                // shared `resolve_one` helper; rayon's `collect` on
-                // `Result` short-circuits on the first error.
-                //
-                // Validation runs first so an inverted Range bails
-                // before any I/O — same diagnostic timing the
-                // sequential loop preserved.
-                let id = KernelId::parse(&trimmed);
-                if let Err(e) = id.validate() {
-                    return vec![Err(format!("--kernel {id}: {e}"))].into_iter();
-                }
-                match id {
-                    KernelId::Range { start, end, .. } => {
-                        match ktstr::cli::expand_kernel_range(&start, &end, "cargo ktstr") {
-                            Ok(versions) => versions
-                                .into_iter()
-                                .map(|ver| {
-                                    resolve_one_with_progress(KernelId::Version(ver.clone()))
-                                        .map_err(|e| format!("resolve kernel {ver}: {e}"))
-                                })
-                                .collect::<Vec<_>>()
-                                .into_iter(),
-                            Err(e) => vec![Err(format!("{e:#}"))].into_iter(),
-                        }
-                    }
-                    other => vec![resolve_one_with_progress(other)].into_iter(),
-                }
-            })
+            .flat_map_iter(|trimmed| resolve_one_spec(trimmed).into_iter())
             .collect::<Result<Vec<_>, _>>()
     };
-    let resolved: Vec<(String, PathBuf)> = match bounded_pool {
-        Some(pool) => pool.install(resolve_in_pool)?,
-        None => resolve_in_pool()?,
-    };
-
-    let resolved = dedupe_resolved(resolved);
-
-    detect_label_collisions(&resolved)?;
-    Ok(resolved)
+    match bounded_pool {
+        Some(pool) => pool.install(resolve_in_pool),
+        None => resolve_in_pool(),
+    }
 }
 
 /// Acquire source, configure, build, and cache a kernel image.
@@ -943,6 +952,151 @@ mod tests {
         assert!(
             err.contains(ktstr::KTSTR_KERNEL_HINT),
             "error must end with KTSTR_KERNEL_HINT. got: {err}",
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // resolve_one — defensive Range arm (internal caller contract)
+    // ---------------------------------------------------------------
+    //
+    // `resolve_one` is only ever called by `resolve_kernel_set` after
+    // it fans every Range out to per-version `Version` ids, so the
+    // Range arm is the sole arm reachable WITHOUT real I/O — it is a
+    // programming-error guard, not a user-facing path. Every other
+    // arm (Path / Version / CacheKey / Git) drives canonicalize +
+    // build / cache lookup / clone and is flagged not-host-testable.
+
+    /// The Range arm must surface the exact internal-error string —
+    /// `internal:` discriminator plus the `expand_kernel_range`
+    /// remediation pointer — so a developer who wires a Range into
+    /// `resolve_one` directly is pointed at the wrong call site. Pins
+    /// the full interpolated message (start/end splice into the
+    /// `{start}..{end}` placeholders) by exact equality, not substring.
+    #[test]
+    fn resolve_one_range_arm_returns_internal_caller_contract_error() {
+        use ktstr::kernel_path::KernelId;
+        let err = resolve_one(KernelId::Range {
+            start: "6.10".to_string(),
+            end: "6.12".to_string(),
+            syntax_inclusive: false,
+        })
+        .expect_err("Range arm must be Err — it is the defensive internal-error path");
+        assert_eq!(
+            err,
+            "internal: resolve_one called with Range 6.10..6.12; \
+             caller must expand Range via `expand_kernel_range` and \
+             call `resolve_one` per version",
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // canonicalize_cache_dir — both arms of the single `unwrap_or`
+    // ---------------------------------------------------------------
+    //
+    // `canonicalize_cache_dir` defends against a relative
+    // `KTSTR_CACHE_DIR=./cache` reaching the child with a
+    // cwd-divergent path: `canonicalize` resolves a real entry to an
+    // absolute, symlink-resolved path; a failure (the documented
+    // remove-between-lookup-and-export race) falls back to the input
+    // path verbatim rather than bailing. Both arms are pure std::fs,
+    // host-isolable, and currently untested.
+
+    /// Existing directory: the Ok arm returns the std-canonicalized
+    /// (absolute, symlink-resolved) form, NOT the input verbatim. To
+    /// genuinely distinguish the Ok arm from the `unwrap_or` fallback,
+    /// the input is a SYMLINK to a real dir — so the resolved form
+    /// (the real dir) differs from the input (the symlink path). A
+    /// plain already-canonical tempdir cannot exercise this divergence
+    /// on a host whose tempdir has no symlink component, so the
+    /// fallback (returning the input verbatim) would pass undetected.
+    #[test]
+    fn canonicalize_cache_dir_existing_dir_returns_absolute_canonical_path() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let real = tmp.path().join("real_cache");
+        std::fs::create_dir(&real).expect("create real dir");
+        let link = tmp.path().join("link_cache");
+        std::os::unix::fs::symlink(&real, &link).expect("create symlink");
+        let resolved = std::fs::canonicalize(&real).expect("canonicalize real dir");
+
+        let got = canonicalize_cache_dir(link.clone());
+        assert_eq!(
+            got, resolved,
+            "Ok arm must return the symlink-resolved real dir, not the input",
+        );
+        assert_ne!(
+            got, link,
+            "must NOT fall through to the unwrap_or fallback (input verbatim)",
+        );
+        assert!(got.is_absolute(), "canonicalized path must be absolute");
+    }
+
+    /// Nonexistent directory: `canonicalize` fails and the
+    /// `unwrap_or` fallback returns the original `PathBuf` unchanged.
+    /// Exact-equality: the output is byte-identical to the input
+    /// (proves the documented fall-back-rather-than-bail behaviour,
+    /// not a panic and not a transformed path).
+    #[test]
+    fn canonicalize_cache_dir_nonexistent_falls_back_to_input_path() {
+        let missing =
+            std::path::PathBuf::from("/this/cache/dir/does/not/exist/ktstr-canonicalize-test");
+        assert_eq!(canonicalize_cache_dir(missing.clone()), missing);
+    }
+
+    // ---------------------------------------------------------------
+    // resolve_kernel_set — preflight gate fires before any I/O
+    // ---------------------------------------------------------------
+    //
+    // `resolve_kernel_set` runs `preflight_collision_check(specs)?` as
+    // its first statement — before the bounded rayon ThreadPool is
+    // built and before any `resolve_one` I/O. `preflight_collision_check`
+    // is unit-tested directly in `wire_format.rs`; these two tests pin
+    // the INTEGRATION — that `resolve_kernel_set` wires it as the first
+    // gate, so a colliding pair or an inverted range errors locally
+    // with zero download / build / clone contact.
+
+    /// Two specs whose sanitized labels collide (`6.14.2` → Version
+    /// label, `6-14-2` → CacheKey label, both sanitize to
+    /// `kernel_6_14_2`) must abort at the preflight gate. The
+    /// preflight-distinctive prefix and the shared sanitized id pin
+    /// the gate: a regression that ran preflight AFTER resolve would
+    /// download / build before erroring (and could surface the
+    /// post-resolve `detect_label_collisions` wording, which has no
+    /// `pre-flight` prefix), failing the first assertion.
+    #[test]
+    fn resolve_kernel_set_colliding_specs_fail_at_preflight_before_io() {
+        let specs = vec!["6.14.2".to_string(), "6-14-2".to_string()];
+        let err = resolve_kernel_set(&specs)
+            .expect_err("colliding sanitized labels must abort at preflight");
+        assert!(
+            err.contains("pre-flight check found collision"),
+            "must be the preflight diagnostic, not the post-resolve one. got: {err}",
+        );
+        assert!(
+            err.contains("kernel_6_14_2"),
+            "must name the shared sanitized id. got: {err}",
+        );
+    }
+
+    /// An inverted Range (`6.15..6.14`) fails `KernelId::validate`
+    /// inside the preflight gate, before `expand_kernel_range` would
+    /// fire its `releases.json` fetch. Pins that `resolve_kernel_set`
+    /// rejects the inversion with zero network contact: a regression
+    /// that moved validation after `expand_kernel_range` would attempt
+    /// a fetch instead of erroring locally. Asserts the `--kernel`
+    /// framing (`--kernel {id}: {e}` from the preflight gate) and the
+    /// inverted-range diagnostic.
+    #[test]
+    fn resolve_kernel_set_inverted_range_fails_validation_before_io() {
+        let specs = vec!["6.15..6.14".to_string()];
+        let err = resolve_kernel_set(&specs)
+            .expect_err("inverted range must fail validation pre-resolve");
+        assert!(
+            err.contains("--kernel"),
+            "must carry `--kernel` framing. got: {err}",
+        );
+        assert!(
+            err.contains("inverted kernel range"),
+            "must surface the inversion diagnostic. got: {err}",
         );
     }
 }

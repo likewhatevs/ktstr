@@ -458,4 +458,206 @@ mod tests {
             assert_eq!(d.works[0].num_workers, Some(1));
         }
     }
+
+    /// Pins the `.min(64)` clamp arm in `per_cpu_defs`: with 66 CPUs,
+    /// `n = (66 - 1).min(64) = 64` while an unclamped `len - 1` would be
+    /// 65, so asserting exactly 64 defs genuinely kills a deleted/wrong
+    /// clamp (the existing 4-CPU test only exercises the `len - 1` path).
+    #[test]
+    fn per_cpu_factory_clamps_at_64_for_topology_above_65_cpus() {
+        let cgroups = CgroupManager::new("/nonexistent");
+        let topo =
+            TestTopology::from_vm_topology(&crate::vmm::topology::Topology::new(1, 1, 66, 1));
+        let ctx = ctx_for_test(&cgroups, &topo);
+
+        // 66 single-LLC CPUs: (66-1)=65 clamps DOWN to 64; without the
+        // .min(64) the factory would emit 65 defs.
+        assert_eq!(ctx.topo.all_cpus().len(), 66);
+
+        let steps = cgroup_per_cpu_steps(&ctx);
+        let factory = match steps[0].setup {
+            Setup::Factory(f) => f,
+            Setup::Defs(_) => panic!("per_cpu should use Factory setup"),
+        };
+        let defs = factory(&ctx);
+        assert_eq!(defs.len(), 64);
+        assert_eq!(defs.last().unwrap().name, "many_63");
+        assert_eq!(defs[0].cpuset, Some(CpusetSpec::exact([0])));
+        assert_eq!(defs[63].cpuset, Some(CpusetSpec::exact([63])));
+    }
+
+    /// Pins the per-def cpuset CONTENT (`Exact([all[i]])`) and the
+    /// `Duration::from_secs(1) + ctx.duration` hold arithmetic that the
+    /// existing test only checked with a vacuous `is_some()`.
+    #[test]
+    fn per_cpu_factory_pins_exact_single_cpu_cpuset_and_hold() {
+        let cgroups = CgroupManager::new("/nonexistent");
+        let topo = TestTopology::from_vm_topology(&crate::vmm::topology::Topology::new(1, 1, 4, 1));
+        let ctx = ctx_for_test(&cgroups, &topo);
+
+        let steps = cgroup_per_cpu_steps(&ctx);
+        assert_eq!(
+            steps[0].hold,
+            HoldSpec::Fixed(Duration::from_secs(1) + ctx.duration)
+        );
+
+        let factory = match steps[0].setup {
+            Setup::Factory(f) => f,
+            Setup::Defs(_) => panic!("per_cpu should use Factory setup"),
+        };
+        let defs = factory(&ctx);
+        assert_eq!(defs.len(), 3);
+        for (i, d) in defs.iter().enumerate() {
+            assert_eq!(d.cpuset, Some(CpusetSpec::exact([i])));
+        }
+    }
+
+    /// Pins the `.min(15)` clamp and odd-`n` half-division in
+    /// `cgroup_exhaust_reuse_steps` / `reuse_defs`: with 16 CPUs,
+    /// `n = (17-1).min(15) = 15` (an unclamped `len - 1` would be 16)
+    /// and `half = 15/2 = 7`, distinct from the existing 8-CPU fixture's
+    /// 7/3 counts — so the asserted 15/30/7/7 kill a deleted/wrong clamp.
+    #[test]
+    fn exhaust_reuse_clamps_n_at_15_and_half_at_7() {
+        let cgroups = CgroupManager::new("/nonexistent");
+        let topo =
+            TestTopology::from_vm_topology(&crate::vmm::topology::Topology::new(1, 1, 17, 1));
+        let ctx = ctx_for_test(&cgroups, &topo);
+
+        let steps = cgroup_exhaust_reuse_steps(&ctx);
+        assert_eq!(steps.len(), 3);
+
+        // Phase 1: n = (17-1).min(15) = 15 cgroups (unclamped 16), paired AddCgroup+SetCpuset.
+        let adds = steps[0]
+            .ops
+            .iter()
+            .filter(|o| matches!(o, Op::AddCgroup { .. }))
+            .count();
+        let sets = steps[0]
+            .ops
+            .iter()
+            .filter(|o| matches!(o, Op::SetCpuset { .. }))
+            .count();
+        assert_eq!(adds, 15);
+        assert_eq!(sets, 15);
+        assert_eq!(steps[0].ops.len(), 30);
+
+        // Phase 2: remove first half = 15/2 = 7.
+        let removes = steps[1]
+            .ops
+            .iter()
+            .filter(|o| matches!(o, Op::RemoveCgroup { .. }))
+            .count();
+        assert_eq!(removes, 7);
+        assert_eq!(steps[1].ops.len(), 7);
+
+        // Phase 3: factory-built half = 7 replacement cgroups, each 1 worker.
+        let factory = match steps[2].setup {
+            Setup::Factory(f) => f,
+            Setup::Defs(_) => panic!("phase 3 should use Factory setup"),
+        };
+        let defs = factory(&ctx);
+        assert_eq!(defs.len(), 7);
+        for d in &defs {
+            assert_eq!(d.works[0].num_workers, Some(1));
+        }
+    }
+
+    /// Pins the `< 4 CPUs` early-skip arm of `custom_cgroup_dsq_contention`
+    /// (returns before any cgroup op or workload spawn, so host-isolable).
+    #[test]
+    fn dsq_contention_skips_below_4_cpus() {
+        let cgroups = CgroupManager::new("/nonexistent");
+        let topo = TestTopology::from_vm_topology(&crate::vmm::topology::Topology::new(1, 1, 2, 1));
+        let ctx = ctx_for_test(&cgroups, &topo);
+
+        let r = custom_cgroup_dsq_contention(&ctx).unwrap();
+        assert!(r.is_skip());
+        let msgs: Vec<&str> = r.skip_details().map(|d| d.message.as_str()).collect();
+        assert_eq!(msgs, vec!["need >=4 CPUs"]);
+    }
+
+    /// Pins the `< 6 CPUs` early-skip arm of `custom_cgroup_workload_variety`
+    /// (returns before `spawn_diverse`).
+    #[test]
+    fn workload_variety_skips_below_6_cpus() {
+        let cgroups = CgroupManager::new("/nonexistent");
+        let topo = TestTopology::from_vm_topology(&crate::vmm::topology::Topology::new(1, 1, 4, 1));
+        let ctx = ctx_for_test(&cgroups, &topo);
+
+        let r = custom_cgroup_workload_variety(&ctx).unwrap();
+        assert!(r.is_skip());
+        let msgs: Vec<&str> = r.skip_details().map(|d| d.message.as_str()).collect();
+        assert_eq!(msgs, vec!["need >=6 CPUs for 5 cgroups"]);
+    }
+
+    /// Pins the `< 6 CPUs` early-skip arm of
+    /// `custom_cgroup_cpuset_workload_variety`. Asserts the distinct
+    /// message ("need >=6 CPUs") so it cannot be swapped with the
+    /// non-cpuset variety fn's "need >=6 CPUs for 5 cgroups".
+    #[test]
+    fn cpuset_workload_variety_skips_below_6_cpus() {
+        let cgroups = CgroupManager::new("/nonexistent");
+        let topo = TestTopology::from_vm_topology(&crate::vmm::topology::Topology::new(1, 1, 4, 1));
+        let ctx = ctx_for_test(&cgroups, &topo);
+
+        let r = custom_cgroup_cpuset_workload_variety(&ctx).unwrap();
+        assert!(r.is_skip());
+        let msgs: Vec<&str> = r.skip_details().map(|d| d.message.as_str()).collect();
+        assert_eq!(msgs, vec!["need >=6 CPUs"]);
+    }
+
+    /// Pins the `< 5 CPUs` early-skip arm of
+    /// `custom_cgroup_dynamic_workload_variety`. 4 CPUs hits this
+    /// 5-threshold skip (the fn has only the one gate).
+    #[test]
+    fn dynamic_workload_variety_skips_below_5_cpus() {
+        let cgroups = CgroupManager::new("/nonexistent");
+        let topo = TestTopology::from_vm_topology(&crate::vmm::topology::Topology::new(1, 1, 4, 1));
+        let ctx = ctx_for_test(&cgroups, &topo);
+
+        let r = custom_cgroup_dynamic_workload_variety(&ctx).unwrap();
+        assert!(r.is_skip());
+        let msgs: Vec<&str> = r.skip_details().map(|d| d.message.as_str()).collect();
+        assert_eq!(msgs, vec!["need >=5 CPUs for dynamic cgroup add"]);
+    }
+
+    /// Pins the `num_llcs() < 2` early-skip arm of
+    /// `custom_cgroup_cpuset_cross_llc_race` (single-LLC topology
+    /// returns before any LLC-aligned cpuset or cgroup op).
+    #[test]
+    fn cross_llc_race_skips_with_single_llc() {
+        let cgroups = CgroupManager::new("/nonexistent");
+        let topo = TestTopology::from_vm_topology(&crate::vmm::topology::Topology::new(1, 1, 4, 1));
+        let ctx = ctx_for_test(&cgroups, &topo);
+
+        assert_eq!(ctx.topo.num_llcs(), 1);
+        let r = custom_cgroup_cpuset_cross_llc_race(&ctx).unwrap();
+        assert!(r.is_skip());
+        let msgs: Vec<&str> = r.skip_details().map(|d| d.message.as_str()).collect();
+        assert_eq!(msgs, vec!["need >=2 LLCs"]);
+    }
+
+    /// Pins the deepest host-reachable skip in
+    /// `custom_cgroup_cpuset_cross_llc_race`: the
+    /// `LLC0 too small after reserving for cg_0` arm. A 2-LLC topology
+    /// with one CPU per LLC passes the `num_llcs() >= 2` and
+    /// non-empty-LLC gates, then reserving LLC0's only CPU leaves LLC0
+    /// empty.
+    #[test]
+    fn cross_llc_race_skips_when_llc0_single_cpu_after_reserve() {
+        let cgroups = CgroupManager::new("/nonexistent");
+        // numa=1, llcs=2, cores=1, threads=1 -> 2 CPUs, LLC0={0}, LLC1={1}.
+        let topo = TestTopology::from_vm_topology(&crate::vmm::topology::Topology::new(1, 2, 1, 1));
+        let ctx = ctx_for_test(&cgroups, &topo);
+
+        assert_eq!(ctx.topo.num_llcs(), 2);
+        assert_eq!(ctx.topo.llc_aligned_cpuset(0), BTreeSet::from([0]));
+        assert_eq!(ctx.topo.llc_aligned_cpuset(1), BTreeSet::from([1]));
+
+        let r = custom_cgroup_cpuset_cross_llc_race(&ctx).unwrap();
+        assert!(r.is_skip());
+        let msgs: Vec<&str> = r.skip_details().map(|d| d.message.as_str()).collect();
+        assert_eq!(msgs, vec!["LLC0 too small after reserving for cg_0"]);
+    }
 }

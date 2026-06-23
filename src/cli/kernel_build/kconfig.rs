@@ -640,38 +640,103 @@ mod tests {
     }
 
     // -- warn_extra_kconfig_overrides_baked_in --
+    //
+    // The function's only observable behavior is the `tracing::warn!`
+    // it emits when a user line overrides a baked-in symbol. Each
+    // test installs a capturing subscriber via `traced_test` and
+    // asserts on the rendered warning (or its absence) — a no-panic
+    // assertion would not catch a dropped emit, a mis-rendered
+    // was/now value, or a spurious warning. Mirrors
+    // `vmm::rust_init::tests::send_sys_rdy_retry_exits_when_budget_exhausted`.
 
+    /// CONFIG_BPF is baked in as `=y` (ktstr.kconfig); a
+    /// `# CONFIG_BPF is not set` user line is an actual override and
+    /// must fire the WARN naming the symbol and rendering the
+    /// before/after values (`=y` → `is not set`).
     #[test]
-    fn warn_extra_kconfig_overrides_does_not_panic_on_empty_fragment() {
-        warn_extra_kconfig_overrides_baked_in("", "test");
+    #[tracing_test::traced_test]
+    fn warn_extra_kconfig_overrides_emits_on_actual_override() {
+        assert!(
+            EMBEDDED_KCONFIG.lines().any(|l| l.trim() == "CONFIG_BPF=y"),
+            "fixture invariant: CONFIG_BPF must be baked in as =y",
+        );
+        let user = "# CONFIG_BPF is not set\n";
+        warn_extra_kconfig_overrides_baked_in(user, "test");
+        assert!(
+            logs_contain("overrides baked-in CONFIG_BPF"),
+            "override of a baked-in symbol must emit the WARN naming it",
+        );
+        // Rendered before/after tokens: baked `=y`, user `is not set`.
+        assert!(
+            logs_contain("(was =y, now is not set)"),
+            "WARN must render the baked before-value and the user after-value",
+        );
+        // Structured fields rendered into the line.
+        for field in [
+            "symbol=\"CONFIG_BPF\"",
+            "was=\"CONFIG_BPF=y\"",
+            "now=\"# CONFIG_BPF is not set\"",
+            "cli_label=\"test\"",
+        ] {
+            assert!(
+                logs_contain(field),
+                "WARN must include structured field `{field}`",
+            );
+        }
     }
 
     #[test]
-    fn warn_extra_kconfig_overrides_does_not_panic_on_no_overrides() {
+    #[tracing_test::traced_test]
+    fn warn_extra_kconfig_overrides_silent_on_empty_fragment() {
+        warn_extra_kconfig_overrides_baked_in("", "test");
+        assert!(
+            !logs_contain("overrides baked-in"),
+            "an empty fragment overrides nothing — no WARN",
+        );
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn warn_extra_kconfig_overrides_silent_on_novel_symbol() {
         let novel = "CONFIG_KTSTR_TEST_NOVEL_SYMBOL_OVERRIDE_TEST=y\n";
         assert!(
             !EMBEDDED_KCONFIG.contains("CONFIG_KTSTR_TEST_NOVEL_SYMBOL_OVERRIDE_TEST"),
             "test fixture must use a symbol absent from EMBEDDED_KCONFIG"
         );
         warn_extra_kconfig_overrides_baked_in(novel, "test");
+        assert!(
+            !logs_contain("overrides baked-in"),
+            "a symbol not present in EMBEDDED_KCONFIG overrides nothing — no WARN",
+        );
     }
 
+    /// `CONFIG_BPF=y` matches the baked-in line byte-for-byte, so the
+    /// `*baked_line == line` guard suppresses the WARN. A regression
+    /// that warned on an identical value would surface here.
     #[test]
-    fn warn_extra_kconfig_overrides_does_not_panic_on_actual_override() {
-        let user = "# CONFIG_BPF is not set\n";
-        warn_extra_kconfig_overrides_baked_in(user, "test");
-    }
-
-    #[test]
-    fn warn_extra_kconfig_overrides_skips_matching_assignments() {
+    #[tracing_test::traced_test]
+    fn warn_extra_kconfig_overrides_silent_on_matching_assignment() {
+        assert!(
+            EMBEDDED_KCONFIG.lines().any(|l| l.trim() == "CONFIG_BPF=y"),
+            "fixture invariant: CONFIG_BPF must be baked in as =y",
+        );
         let user = "CONFIG_BPF=y\n";
         warn_extra_kconfig_overrides_baked_in(user, "test");
+        assert!(
+            !logs_contain("overrides baked-in"),
+            "a user line identical to the baked-in line is not an override — no WARN",
+        );
     }
 
     #[test]
-    fn warn_extra_kconfig_overrides_skips_free_text_comments() {
+    #[tracing_test::traced_test]
+    fn warn_extra_kconfig_overrides_silent_on_free_text_comments() {
         let user = "# this is a comment about something\n# another comment\n";
         warn_extra_kconfig_overrides_baked_in(user, "test");
+        assert!(
+            !logs_contain("overrides baked-in"),
+            "free-text `#` comments are not kconfig assignments — no WARN",
+        );
     }
 
     // -- read_extra_kconfig --
@@ -767,32 +832,76 @@ mod tests {
     }
 
     // -- warn_dropped_extra_kconfig_lines --
+    //
+    // The function exists to emit a `tracing::warn!` when a requested
+    // `--extra-kconfig` line did not survive `make olddefconfig`. Each
+    // test installs a capturing subscriber via `traced_test` and
+    // asserts the WARN fires (with the enriched `final_state`) for the
+    // dropped/rewritten cases, and stays silent for the present /
+    // missing-config / free-text cases — a no-panic assertion would
+    // catch none of those regressions.
 
+    /// No `.config` on disk: the `read_to_string` Err arm returns
+    /// silently (best-effort), so no WARN even though the requested
+    /// line is "missing".
     #[test]
+    #[tracing_test::traced_test]
     fn warn_dropped_extra_kconfig_lines_silent_when_config_missing() {
         let dir = tempfile::TempDir::new().unwrap();
         let extra = "CONFIG_FOO=y\n";
         warn_dropped_extra_kconfig_lines(dir.path(), extra, "test");
+        assert!(
+            !logs_contain("did not survive"),
+            "a missing .config collapses to a silent return — no WARN",
+        );
     }
 
     #[test]
+    #[tracing_test::traced_test]
     fn warn_dropped_extra_kconfig_lines_silent_when_all_present() {
         let dir = tempfile::TempDir::new().unwrap();
         std::fs::write(dir.path().join(".config"), "CONFIG_FOO=y\nCONFIG_BAR=m\n").unwrap();
         let extra = "CONFIG_FOO=y\nCONFIG_BAR=m\n";
         warn_dropped_extra_kconfig_lines(dir.path(), extra, "test");
+        assert!(
+            !logs_contain("did not survive"),
+            "every requested line present verbatim in .config — no WARN",
+        );
     }
 
+    /// A requested assignment whose symbol is entirely absent from the
+    /// final `.config` (dropped by olddefconfig) must fire the WARN
+    /// naming the requested line and the absent-symbol `final_state`
+    /// sentinel.
     #[test]
-    fn warn_dropped_extra_kconfig_lines_does_not_panic_on_dropped_line() {
+    #[tracing_test::traced_test]
+    fn warn_dropped_extra_kconfig_lines_emits_on_dropped_line() {
         let dir = tempfile::TempDir::new().unwrap();
         std::fs::write(dir.path().join(".config"), "CONFIG_BPF=y\n").unwrap();
         let extra = "CONFIG_KTSTR_DROPPED_TEST_NOVEL=y\n";
         warn_dropped_extra_kconfig_lines(dir.path(), extra, "test");
+        assert!(
+            logs_contain("did not survive"),
+            "a dropped requested line must emit the WARN",
+        );
+        assert!(
+            logs_contain("requested=\"CONFIG_KTSTR_DROPPED_TEST_NOVEL=y\""),
+            "WARN must carry the requested line",
+        );
+        // Absent symbol: `final_state` falls to the sentinel string.
+        assert!(
+            logs_contain("symbol not present in .config"),
+            "WARN's final_state must surface the absent-symbol sentinel",
+        );
     }
 
+    /// A requested `=y` that olddefconfig rewrote to `is not set`
+    /// (unmet dependency) is "missing" from `.config` verbatim, so the
+    /// WARN fires with the rewritten `# CONFIG_X is not set` line as
+    /// the enriched `final_state`.
     #[test]
-    fn warn_dropped_extra_kconfig_lines_does_not_panic_on_rewritten_line() {
+    #[tracing_test::traced_test]
+    fn warn_dropped_extra_kconfig_lines_emits_on_rewritten_line() {
         let dir = tempfile::TempDir::new().unwrap();
         std::fs::write(
             dir.path().join(".config"),
@@ -801,14 +910,35 @@ mod tests {
         .unwrap();
         let extra = "CONFIG_KTSTR_REWRITE_TEST=y\n";
         warn_dropped_extra_kconfig_lines(dir.path(), extra, "test");
+        assert!(
+            logs_contain("did not survive"),
+            "a rewritten requested line must emit the WARN",
+        );
+        assert!(
+            logs_contain("requested=\"CONFIG_KTSTR_REWRITE_TEST=y\""),
+            "WARN must carry the requested =y line",
+        );
+        // `final_state` enrichment: the actual rewritten .config line.
+        assert!(
+            logs_contain("final_state=\"# CONFIG_KTSTR_REWRITE_TEST is not set\""),
+            "WARN must enrich final_state with the rewritten .config value",
+        );
     }
 
+    /// A free-text `#` header is not a kconfig assignment nor a disable
+    /// directive, so it is skipped; the lone real assignment is present
+    /// — no WARN.
     #[test]
-    fn warn_dropped_extra_kconfig_lines_skips_free_text_comments() {
+    #[tracing_test::traced_test]
+    fn warn_dropped_extra_kconfig_lines_silent_on_free_text_comments() {
         let dir = tempfile::TempDir::new().unwrap();
         std::fs::write(dir.path().join(".config"), "CONFIG_BPF=y\n").unwrap();
         let extra = "# decorative header\nCONFIG_BPF=y\n";
         warn_dropped_extra_kconfig_lines(dir.path(), extra, "test");
+        assert!(
+            !logs_contain("did not survive"),
+            "free-text comments are skipped and the assignment is present — no WARN",
+        );
     }
 
     // -- configure_kernel --

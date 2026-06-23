@@ -871,6 +871,13 @@ fn write_struct(
         .iter()
         .any(|m| m.name.is_empty() && matches!(m.value, RenderedValue::Struct { .. }))
     {
+        // Pool the NAMED siblings' scalar values BEFORE flatten
+        // consumes the anonymous overlays, so a union overlay that
+        // only re-views named fields is suppressed rather than
+        // flattened into duplicate sibling columns. (Building the pool
+        // after flatten — the previous order — left it unable to see
+        // the empty-name Structs at all, so the dedup never fired.)
+        let pool = build_sibling_scalar_pool(members);
         flat_members = Vec::with_capacity(members.len());
         for m in members {
             if m.name.is_empty()
@@ -878,6 +885,12 @@ fn write_struct(
                     members: ref inner, ..
                 } = m.value
             {
+                // Suppress an anonymous union overlay that merely
+                // duplicates named-sibling scalars; otherwise flatten
+                // its inner fields onto the parent.
+                if !pool.is_empty() && anon_duplicates_pool(&m.value, &pool) {
+                    continue;
+                }
                 flat_members.extend_from_slice(inner);
                 continue;
             }
@@ -886,13 +899,6 @@ fn write_struct(
         flat_members.as_slice()
     } else {
         members
-    };
-
-    let any_anon = members.iter().any(|m| m.name.is_empty());
-    let sibling_scalar_pool: Option<std::collections::HashSet<u64>> = if any_anon {
-        Some(build_sibling_scalar_pool(members))
-    } else {
-        None
     };
 
     // Single-pass filter + pre-render. `visible_rendered` carries
@@ -910,12 +916,6 @@ fn write_struct(
             continue;
         }
         if (m.name.contains("___fmt") || m.name.contains("____fmt")) && is_string_value(&m.value) {
-            continue;
-        }
-        if m.name.is_empty()
-            && let Some(pool) = sibling_scalar_pool.as_ref()
-            && anon_duplicates_pool(&m.value, pool)
-        {
             continue;
         }
         // Pre-render the value to a single-line string for flat
@@ -1344,6 +1344,12 @@ fn scalar_numeric_value(v: &RenderedValue) -> Option<u64> {
 fn build_sibling_scalar_pool(members: &[RenderedMember]) -> std::collections::HashSet<u64> {
     let mut sibling_values: std::collections::HashSet<u64> = std::collections::HashSet::new();
     for s in members {
+        // Pool only NAMED siblings: the anonymous overlays are the
+        // values being deduped against this pool, so including their
+        // own scalars would make the dedup self-referential.
+        if s.name.is_empty() {
+            continue;
+        }
         if let Some(n) = scalar_numeric_value(&s.value) {
             if n != 0 {
                 sibling_values.insert(n);
@@ -1367,6 +1373,14 @@ fn build_sibling_scalar_pool(members: &[RenderedMember]) -> std::collections::Ha
 /// already present in `pool`. Companion to
 /// [`build_sibling_scalar_pool`]: caller builds the pool once,
 /// queries it once per anonymous member.
+///
+/// Heuristic bound: the match is by scalar VALUE, not by field
+/// offset, so an overlay whose every non-zero leaf coincidentally
+/// equals an unrelated named sibling's value is also suppressed. The
+/// effect is display-only (a hidden render row — never a
+/// counter/verdict effect) and grows vanishingly unlikely as the leaf
+/// count rises; offset-aware dedup would be the precise fix but is
+/// unwarranted for a renderer.
 fn anon_duplicates_pool(anon: &RenderedValue, pool: &std::collections::HashSet<u64>) -> bool {
     let RenderedValue::Struct { members, .. } = anon else {
         return false;
@@ -4774,3 +4788,720 @@ fn sign_extend(raw: u64, bits: usize) -> u64 {
 
 #[cfg(test)]
 mod tests;
+
+/// Host-unit coverage for renderer decode and chase branches that the
+/// `tests/` submodule leaves unexercised: the `render_float` byte-decode
+/// arms, the `chase_arena_pointer` deferred-resolve `alloc_size`
+/// fallback (both the size-match success and the unresolved skip), the
+/// `apply_header_skip` underrun guard, the raw `MAX_RENDER_DEPTH`
+/// backstop, the flex-array (`BTF len=0`) arm, and the
+/// `MemReader::alloc_size_types` / `resolve_arena_type_meta_fallback`
+/// trait defaults. Each test asserts the exact rendered value so a
+/// behavioural regression fails the assertion rather than slipping
+/// through a vacuous `is_some()` check.
+///
+/// Local `MemReader` stubs are defined here rather than reusing the
+/// `tests/` submodule's `CastStubReader`: the `tests/` types are private
+/// to that module tree, and the underrun test needs a reader whose
+/// `read_arena` returns a SHORTER slice than requested (a page-tail
+/// crop) — behaviour the shared `CastStubReader` deliberately does not
+/// have (it returns `None` on a short read).
+#[cfg(test)]
+mod blueprint_coverage_tests {
+    use super::*;
+    use crate::monitor::cast_analysis::{AddrSpace, CastHit, CastMap};
+    use crate::test_support::btf_blob::{CastSynMember, CastSynType, cast_build_btf};
+
+    /// Append a NUL-terminated `name` to a BTF string section and
+    /// return its byte offset. Mirrors the `push` closure the `tests/`
+    /// submodule fixtures use.
+    fn push_name(strings: &mut Vec<u8>, name: &str) -> u32 {
+        let off = strings.len() as u32;
+        strings.extend_from_slice(name.as_bytes());
+        strings.push(0);
+        off
+    }
+
+    /// Build a BTF blob carrying one 4-byte `BTF_KIND_FLOAT` (id 1) and
+    /// one 8-byte `BTF_KIND_FLOAT` (id 2). Returns `(blob, f32_id,
+    /// f64_id)`.
+    fn float_btf_f32_and_f64() -> (Vec<u8>, u32, u32) {
+        let mut strings: Vec<u8> = vec![0];
+        let n_f32 = push_name(&mut strings, "f32");
+        let n_f64 = push_name(&mut strings, "f64");
+        let types = vec![
+            CastSynType::Float {
+                name_off: n_f32,
+                size: 4,
+            },
+            CastSynType::Float {
+                name_off: n_f64,
+                size: 8,
+            },
+        ];
+        (cast_build_btf(&types, &strings), 1, 2)
+    }
+
+    /// Build a BTF blob with a single `BTF_KIND_FLOAT` of `size` bytes
+    /// (id 1). Returns `(blob, float_id)`.
+    fn float_btf_with_size(size: u32) -> (Vec<u8>, u32) {
+        let mut strings: Vec<u8> = vec![0];
+        let n = push_name(&mut strings, "flt");
+        let types = vec![CastSynType::Float { name_off: n, size }];
+        (cast_build_btf(&types, &strings), 1)
+    }
+
+    /// `render_float` decodes a 4-byte BTF float via `f32::from_le_bytes`
+    /// and an 8-byte one via `f64::from_le_bytes`, reached through the
+    /// `Type::Float` arm of `render_value_inner`. 1.5 (f32) and -2.25
+    /// (f64) are exactly representable, so the `f64` equality is exact.
+    #[test]
+    fn render_float_f32_and_f64_decode_via_btf() {
+        let (blob, f32_id, f64_id) = float_btf_f32_and_f64();
+        let btf = Btf::from_bytes(&blob).expect("synthetic float BTF parses");
+        assert_eq!(
+            render_value(&btf, f32_id, &1.5f32.to_le_bytes()),
+            RenderedValue::Float {
+                bits: 32,
+                value: 1.5,
+            },
+        );
+        assert_eq!(
+            render_value(&btf, f64_id, &(-2.25f64).to_le_bytes()),
+            RenderedValue::Float {
+                bits: 64,
+                value: -2.25,
+            },
+        );
+    }
+
+    /// A BTF float whose declared `size` is neither 4 nor 8 (here 2, a
+    /// `_Float16` / `bf16` width) routes `render_float` to the
+    /// `Unsupported` arm. The input slice is exactly `size` bytes so the
+    /// `bytes.len() < size` truncation guard does not fire first.
+    #[test]
+    fn render_float_unsupported_size_yields_unsupported() {
+        let (blob, f16_id) = float_btf_with_size(2);
+        let btf = Btf::from_bytes(&blob).expect("synthetic float BTF parses");
+        assert_eq!(
+            render_value(&btf, f16_id, &[0u8; 2]),
+            RenderedValue::Unsupported {
+                reason: "unsupported float size 2".to_string(),
+            },
+        );
+    }
+
+    /// Fewer bytes than the float's declared size trips the truncation
+    /// guard in `render_float`, carrying the available bytes as a
+    /// lowercase space-separated hex `Bytes` partial. Mirrors the
+    /// dedicated Int / Enum / Enum64 truncation tests, which `render_float`
+    /// previously lacked.
+    #[test]
+    fn render_float_truncated_carries_bytes_partial() {
+        let (blob, f64_id) = float_btf_with_size(8);
+        let btf = Btf::from_bytes(&blob).expect("synthetic float BTF parses");
+        assert_eq!(
+            render_value(&btf, f64_id, &[0xaa, 0xbb]),
+            RenderedValue::Truncated {
+                needed: 8,
+                had: 2,
+                partial: Box::new(RenderedValue::Bytes {
+                    hex: "aa bb".to_string(),
+                }),
+            },
+        );
+    }
+
+    /// Stub `MemReader` for the deferred-resolve arena chase tests. The
+    /// cast intercept fires only for the keyed `(parent_type_id, off)`
+    /// pairs in `cast_map`, so the inner payload struct's own `u64`
+    /// member is NOT mis-chased as a pointer. `resolve_arena_type`
+    /// returns `None` (bridge miss) so the chase falls through to the
+    /// `alloc_size` path; `alloc_size_types` keeps the trait default
+    /// (empty) so the cross-BTF fallback loop is empty.
+    #[derive(Default)]
+    struct AllocSizeStubReader {
+        arena_window: Option<(u64, u64)>,
+        arena_bytes_at: std::collections::HashMap<u64, Vec<u8>>,
+        cast_map: CastMap,
+    }
+    impl MemReader for AllocSizeStubReader {
+        fn read_kva(&self, _kva: u64, _len: usize) -> Option<Vec<u8>> {
+            None
+        }
+        fn is_arena_addr(&self, addr: u64) -> bool {
+            match self.arena_window {
+                Some((lo, hi)) => addr >= lo && addr < hi,
+                None => false,
+            }
+        }
+        fn read_arena(&self, addr: u64, len: usize) -> Option<Vec<u8>> {
+            let bytes = self.arena_bytes_at.get(&addr)?;
+            if bytes.len() < len {
+                return None;
+            }
+            Some(bytes[..len].to_vec())
+        }
+        fn cast_lookup(&self, parent_type_id: u32, member_byte_offset: u32) -> Option<CastHit> {
+            self.cast_map
+                .get(&(parent_type_id, member_byte_offset))
+                .copied()
+        }
+        // resolve_arena_type intentionally left at the trait default
+        // (None) so the deferred-resolve chase takes the alloc_size
+        // fallback path rather than the bridge path.
+    }
+
+    /// Build a BTF for the `alloc_size` fallback tests:
+    ///   - id 1: u64 (plain unsigned, the cast field's wire type)
+    ///   - id 2: struct task_ctx { u64 weight @ 0 } size 8 — the ONLY
+    ///     size-8 struct, so `discover_payload_btf_id(btf, 8, "")`
+    ///     resolves it unambiguously
+    ///   - id 3: struct outer { u64 p @ 0 } size 16 — the cast-carrying
+    ///     parent; size 16 keeps it OUT of the size-8 candidate set so
+    ///     task_ctx is the unique size-8 match
+    ///
+    /// Returns `(blob, outer_id, task_ctx_id)`.
+    fn alloc_size_btf() -> (Vec<u8>, u32, u32) {
+        let mut strings: Vec<u8> = vec![0];
+        let n_u64 = push_name(&mut strings, "u64");
+        let n_task = push_name(&mut strings, "task_ctx");
+        let n_weight = push_name(&mut strings, "weight");
+        let n_outer = push_name(&mut strings, "outer");
+        let n_p = push_name(&mut strings, "p");
+        let types = vec![
+            CastSynType::Int {
+                name_off: n_u64,
+                size: 8,
+                encoding: 0,
+                offset: 0,
+                bits: 64,
+            },
+            CastSynType::Struct {
+                name_off: n_task,
+                size: 8,
+                members: vec![CastSynMember {
+                    name_off: n_weight,
+                    type_id: 1,
+                    byte_offset: 0,
+                }],
+            },
+            CastSynType::Struct {
+                name_off: n_outer,
+                size: 16,
+                members: vec![CastSynMember {
+                    name_off: n_p,
+                    type_id: 1,
+                    byte_offset: 0,
+                }],
+            },
+        ];
+        (cast_build_btf(&types, &strings), 3, 2)
+    }
+
+    /// Deferred-resolve arena cast (`target_type_id == 0`) where the
+    /// `resolve_arena_type` bridge misses and `alloc_size = Some(8)`:
+    /// `discover_payload_btf_id` size-matches the unique size-8 struct,
+    /// the chase reads its bytes from the arena, and the rendered `Ptr`
+    /// carries `cast→arena (sdt_alloc)`. Exercises the
+    /// `chase_arena_pointer`'s `alloc_size` size-match success arm — dead in the `tests/`
+    /// suite because every existing `CastHit` uses `alloc_size: None`.
+    #[test]
+    fn cast_chase_arena_alloc_size_fallback_resolves_via_discover_payload_btf_id() {
+        let (blob, outer_id, task_ctx_id) = alloc_size_btf();
+        let btf = Btf::from_bytes(&blob).expect("synthetic BTF parses");
+        // task_ctx_id is distinct from outer_id so the keyed cast_map
+        // hit on (outer_id, 0) does not re-fire when the inner
+        // task_ctx.weight member is rendered.
+        assert_ne!(task_ctx_id, outer_id);
+
+        const ARENA_LO: u64 = 0x10_0000_0000;
+        const ARENA_HI: u64 = 0x10_0001_0000;
+        const TARGET_ADDR: u64 = 0x10_0000_1000;
+        // outer { p: TARGET_ADDR } in 16 bytes (cast field @ 0).
+        let mut outer_bytes = vec![0u8; 16];
+        outer_bytes[0..8].copy_from_slice(&TARGET_ADDR.to_le_bytes());
+        // task_ctx at TARGET_ADDR: weight = 0x42.
+        let inner_bytes = 0x42u64.to_le_bytes().to_vec();
+        let mut arena_bytes = std::collections::HashMap::new();
+        arena_bytes.insert(TARGET_ADDR, inner_bytes);
+        let mut cast_map = CastMap::new();
+        cast_map.insert(
+            (outer_id, 0),
+            CastHit {
+                target_type_id: 0,
+                addr_space: AddrSpace::Arena,
+                alloc_size: Some(8),
+            },
+        );
+        let reader = AllocSizeStubReader {
+            arena_window: Some((ARENA_LO, ARENA_HI)),
+            arena_bytes_at: arena_bytes,
+            cast_map,
+        };
+
+        let v = render_value_with_mem(&btf, outer_id, &outer_bytes, &reader);
+        let RenderedValue::Struct { ref members, .. } = v else {
+            panic!("expected outer Struct render, got {v:?}");
+        };
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0].name, "p");
+        let RenderedValue::Ptr {
+            value,
+            ref deref,
+            ref deref_skipped_reason,
+            ref cast_annotation,
+        } = members[0].value
+        else {
+            panic!("cast field must render as Ptr, got {:?}", members[0].value);
+        };
+        assert_eq!(value, TARGET_ADDR);
+        assert!(
+            deref_skipped_reason.is_none(),
+            "alloc_size size-match resolve must not surface a skip reason; got {deref_skipped_reason:?}",
+        );
+        assert_eq!(
+            cast_annotation.as_deref(),
+            Some("cast→arena (sdt_alloc)"),
+            "deferred-resolve size-match sets the sdt_alloc-flavoured cast annotation",
+        );
+        let inner = deref
+            .as_deref()
+            .expect("alloc_size size-match must produce a deref");
+        let RenderedValue::Struct {
+            type_name: ref inner_name,
+            members: ref inner_members,
+        } = *inner
+        else {
+            panic!("deref payload must be the resolved task_ctx struct, got {inner:?}");
+        };
+        assert_eq!(inner_name.as_deref(), Some("task_ctx"));
+        assert_eq!(inner_members.len(), 1);
+        assert_eq!(inner_members[0].name, "weight");
+        assert_eq!(
+            inner_members[0].value,
+            RenderedValue::Uint {
+                bits: 64,
+                value: 0x42,
+            },
+        );
+    }
+
+    /// Deferred-resolve arena cast where the bridge misses and
+    /// `alloc_size = Some(99)` matches no struct: `discover_payload_btf_id`
+    /// returns `target_type_id 0` with reason `"no candidate of size 99"`,
+    /// and `alloc_size_types` is empty, so the chase surfaces the
+    /// labelled unresolved skip with `deref: None` and the plain
+    /// `cast→arena` annotation (sdt_alloc NOT resolved). Exercises
+    /// `chase_arena_pointer`'s `alloc_size` fallback-unresolved skip arm.
+    #[test]
+    fn cast_chase_arena_alloc_size_fallback_unresolved_surfaces_skip_reason() {
+        let (blob, outer_id, _task_ctx_id) = alloc_size_btf();
+        let btf = Btf::from_bytes(&blob).expect("synthetic BTF parses");
+
+        const ARENA_LO: u64 = 0x10_0000_0000;
+        const ARENA_HI: u64 = 0x10_0001_0000;
+        const TARGET_ADDR: u64 = 0x10_0000_1000;
+        let mut outer_bytes = vec![0u8; 16];
+        outer_bytes[0..8].copy_from_slice(&TARGET_ADDR.to_le_bytes());
+        // No arena bytes needed: the size-99 discover_payload_btf_id
+        // miss returns the unresolved skip BEFORE any arena read, and
+        // alloc_size_types() is empty (trait default) so the cross-BTF
+        // fallback loop never runs.
+        let arena_bytes: std::collections::HashMap<u64, Vec<u8>> = std::collections::HashMap::new();
+        let mut cast_map = CastMap::new();
+        cast_map.insert(
+            (outer_id, 0),
+            CastHit {
+                target_type_id: 0,
+                addr_space: AddrSpace::Arena,
+                alloc_size: Some(99),
+            },
+        );
+        let reader = AllocSizeStubReader {
+            arena_window: Some((ARENA_LO, ARENA_HI)),
+            arena_bytes_at: arena_bytes,
+            cast_map,
+        };
+
+        let v = render_value_with_mem(&btf, outer_id, &outer_bytes, &reader);
+        let RenderedValue::Struct { ref members, .. } = v else {
+            panic!("expected outer Struct render, got {v:?}");
+        };
+        let RenderedValue::Ptr {
+            ref deref,
+            ref deref_skipped_reason,
+            ref cast_annotation,
+            ..
+        } = members[0].value
+        else {
+            panic!("cast field must render as Ptr, got {:?}", members[0].value);
+        };
+        assert!(deref.is_none(), "size-99 miss must not produce a deref");
+        assert_eq!(
+            deref_skipped_reason.as_deref(),
+            Some(
+                "arena chase: STX-flow path tagged slot as Arena with \
+                 deferred resolve; alloc_size=99 fallback unresolved \
+                 (no candidate of size 99)"
+            ),
+        );
+        assert_eq!(
+            cast_annotation.as_deref(),
+            Some("cast→arena"),
+            "unresolved deferred-resolve keeps the plain (non-sdt_alloc) annotation",
+        );
+    }
+
+    /// Stub `MemReader` whose `read_arena` returns a slice SHORTER than
+    /// the requested length — modelling a page-tail crop in the captured
+    /// arena snapshot. The shared `CastStubReader` returns `None` on a
+    /// short read, which routes to the read-failed branch; this reader
+    /// returns the truncated slice so the chase reaches
+    /// `apply_header_skip`'s underrun guard specifically.
+    struct ShortReadArenaReader {
+        arena_window: (u64, u64),
+        /// Bytes returned for the chased address regardless of the
+        /// requested length — capped at what is stored (the page-tail
+        /// crop).
+        bytes_at: std::collections::HashMap<u64, Vec<u8>>,
+        arena_type_at: std::collections::HashMap<u64, ArenaResolveHit>,
+    }
+    impl MemReader for ShortReadArenaReader {
+        fn read_kva(&self, _kva: u64, _len: usize) -> Option<Vec<u8>> {
+            None
+        }
+        fn is_arena_addr(&self, addr: u64) -> bool {
+            addr >= self.arena_window.0 && addr < self.arena_window.1
+        }
+        fn read_arena(&self, addr: u64, len: usize) -> Option<Vec<u8>> {
+            // Page-tail crop: return min(stored, requested) bytes — a
+            // successful-but-short read, distinct from the shared
+            // reader's None-on-short-read behaviour.
+            let bytes = self.bytes_at.get(&addr)?;
+            let n = bytes.len().min(len);
+            Some(bytes[..n].to_vec())
+        }
+        fn resolve_arena_type(&self, addr: u64) -> Option<ArenaResolveHit> {
+            self.arena_type_at.get(&addr).copied()
+        }
+    }
+
+    /// `BTF_KIND_FWD`-pointee `Type::Ptr` chase where the
+    /// `resolve_arena_type` bridge fires with `header_skip = 16` but the
+    /// arena read returns only 8 bytes (page-tail crop): `apply_header_skip`
+    /// cannot slice past the header, so the chase surfaces the underrun
+    /// skip with `deref: None` and the `sdt_alloc` annotation (the bridge
+    /// did resolve; only the read fell short). Exercises the
+    /// `chase_arena_pointer`'s `apply_header_skip` underrun guard, which a contract-conforming
+    /// `read_arena` never reaches.
+    #[test]
+    fn arena_chase_header_skip_exceeds_read_surfaces_underrun_skip() {
+        // BTF: id1 u64; id2 Fwd struct sdt_data (no body); id3 Ptr->id2;
+        // id4 struct outer { sdt_data *data @ 0 } size 8; id5 struct
+        // task_ctx { u64 weight @ 0 } size 8 (the bridge-resolved
+        // payload, btf_size = 8).
+        let mut strings: Vec<u8> = vec![0];
+        let n_u64 = push_name(&mut strings, "u64");
+        let n_fwd = push_name(&mut strings, "sdt_data");
+        let n_outer = push_name(&mut strings, "outer");
+        let n_data = push_name(&mut strings, "data");
+        let n_task = push_name(&mut strings, "task_ctx");
+        let n_weight = push_name(&mut strings, "weight");
+        let types = vec![
+            CastSynType::Int {
+                name_off: n_u64,
+                size: 8,
+                encoding: 0,
+                offset: 0,
+                bits: 64,
+            },
+            CastSynType::Fwd {
+                name_off: n_fwd,
+                is_union: false,
+            },
+            CastSynType::Ptr { type_id: 2 },
+            CastSynType::Struct {
+                name_off: n_outer,
+                size: 8,
+                members: vec![CastSynMember {
+                    name_off: n_data,
+                    type_id: 3,
+                    byte_offset: 0,
+                }],
+            },
+            CastSynType::Struct {
+                name_off: n_task,
+                size: 8,
+                members: vec![CastSynMember {
+                    name_off: n_weight,
+                    type_id: 1,
+                    byte_offset: 0,
+                }],
+            },
+        ];
+        let blob = cast_build_btf(&types, &strings);
+        let btf = Btf::from_bytes(&blob).expect("synthetic BTF parses");
+        let (outer_id, task_ctx_id) = (4u32, 5u32);
+
+        const ARENA_LO: u64 = 0x10_0000_0000;
+        const ARENA_HI: u64 = 0x10_0001_0000;
+        const SLOT_ADDR: u64 = 0x10_0000_1000;
+        let outer_bytes = SLOT_ADDR.to_le_bytes().to_vec();
+        // Seed only 8 bytes at SLOT_ADDR. The chase needs
+        // header_skip(16) + btf_size(8) = 24 bytes; read_arena returns
+        // 8 (page-tail crop), which is < header_skip, so apply_header_skip
+        // cannot land on the payload.
+        let mut bytes_at = std::collections::HashMap::new();
+        bytes_at.insert(SLOT_ADDR, vec![0u8; 8]);
+        let mut arena_type_at = std::collections::HashMap::new();
+        arena_type_at.insert(
+            SLOT_ADDR,
+            ArenaResolveHit {
+                target_type_id: task_ctx_id,
+                header_skip: 16,
+            },
+        );
+        let reader = ShortReadArenaReader {
+            arena_window: (ARENA_LO, ARENA_HI),
+            bytes_at,
+            arena_type_at,
+        };
+
+        let v = render_value_with_mem(&btf, outer_id, &outer_bytes, &reader);
+        let RenderedValue::Struct { ref members, .. } = v else {
+            panic!("expected outer Struct render, got {v:?}");
+        };
+        assert_eq!(members[0].name, "data");
+        let RenderedValue::Ptr {
+            ref deref,
+            ref deref_skipped_reason,
+            ref cast_annotation,
+            ..
+        } = members[0].value
+        else {
+            panic!("data field must render as Ptr, got {:?}", members[0].value);
+        };
+        assert!(deref.is_none(), "underrun must not produce a deref");
+        assert_eq!(
+            deref_skipped_reason.as_deref(),
+            Some(
+                "arena read at 0x1000001000 returned 8 bytes; \
+                 sdt_alloc bridge needs at least 16 for header skip"
+            ),
+        );
+        assert_eq!(
+            cast_annotation.as_deref(),
+            Some("sdt_alloc"),
+            "the bridge resolved (sdt_alloc) even though the read fell short",
+        );
+    }
+
+    /// Stub `MemReader` for the depth-cap chain: every seeded arena
+    /// address stores the NEXT distinct arena address, so the renderer
+    /// recurses through a non-cycling pointer chain. Distinct addresses
+    /// keep the visited-set cycle check from firing before the raw
+    /// `MAX_RENDER_DEPTH` backstop.
+    struct ChainArenaReader {
+        arena_window: (u64, u64),
+        bytes_at: std::collections::HashMap<u64, Vec<u8>>,
+    }
+    impl MemReader for ChainArenaReader {
+        fn read_kva(&self, _kva: u64, _len: usize) -> Option<Vec<u8>> {
+            None
+        }
+        fn is_arena_addr(&self, addr: u64) -> bool {
+            addr >= self.arena_window.0 && addr < self.arena_window.1
+        }
+        fn read_arena(&self, addr: u64, len: usize) -> Option<Vec<u8>> {
+            let bytes = self.bytes_at.get(&addr)?;
+            if bytes.len() < len {
+                return None;
+            }
+            Some(bytes[..len].to_vec())
+        }
+    }
+
+    /// A non-cycling chain of >32 distinct addresses (each `node`
+    /// pointing at a fresh address) exhausts the recursion depth before
+    /// any address repeats, so the raw `MAX_RENDER_DEPTH` backstop fires
+    /// — the deepest deref is `Unsupported { reason: "render depth 32
+    /// exceeded" }` — rather than the visited-set cycle check. The
+    /// existing `tests/` cycle cases all trip the visited check first, so
+    /// this is the only test that reaches the depth cap.
+    #[test]
+    fn render_value_inner_depth_cap_yields_unsupported() {
+        // id1: struct node { node *next @ 0 } size 8; id2: Ptr -> id1.
+        let mut strings: Vec<u8> = vec![0];
+        let n_node = push_name(&mut strings, "node");
+        let n_next = push_name(&mut strings, "next");
+        let types = vec![
+            CastSynType::Struct {
+                name_off: n_node,
+                size: 8,
+                members: vec![CastSynMember {
+                    name_off: n_next,
+                    type_id: 2,
+                    byte_offset: 0,
+                }],
+            },
+            CastSynType::Ptr { type_id: 1 },
+        ];
+        let blob = cast_build_btf(&types, &strings);
+        let btf = Btf::from_bytes(&blob).expect("synthetic node BTF parses");
+        let node_id = 1u32;
+
+        const ARENA_BASE: u64 = 0x10_0000_0000;
+        const ARENA_HI: u64 = 0x10_0010_0000;
+        // A_i = ARENA_BASE + (i+1) * 0x1000, all distinct, all in window.
+        // 41 nodes is well past the ~16 levels needed to reach depth 32.
+        let addr = |i: usize| ARENA_BASE + ((i as u64) + 1) * 0x1000;
+        let mut bytes_at = std::collections::HashMap::new();
+        for i in 0..41 {
+            bytes_at.insert(addr(i), addr(i + 1).to_le_bytes().to_vec());
+        }
+        let reader = ChainArenaReader {
+            arena_window: (ARENA_BASE, ARENA_HI),
+            bytes_at,
+        };
+
+        // Outer node whose `next` points at A_0.
+        let outer = addr(0).to_le_bytes().to_vec();
+        let v = render_value_with_mem(&btf, node_id, &outer, &reader);
+
+        // Descend the Struct -> Ptr -> deref chain to the terminal node.
+        // A Struct yields its sole member's value; a Ptr surfaces its
+        // skip reason (assert none is a cycle) then descends into its
+        // deref; an Unsupported is the terminal.
+        let mut current = &v;
+        let mut terminal_reason: Option<String> = None;
+        for _ in 0..200 {
+            match current {
+                RenderedValue::Struct { members, .. } => {
+                    assert_eq!(members.len(), 1, "node has exactly one member");
+                    current = &members[0].value;
+                }
+                RenderedValue::Ptr {
+                    deref,
+                    deref_skipped_reason,
+                    ..
+                } => {
+                    if let Some(reason) = deref_skipped_reason {
+                        assert!(
+                            !reason.contains("cycle"),
+                            "distinct-address chain must NOT trip the cycle check: {reason}",
+                        );
+                    }
+                    match deref {
+                        Some(inner) => current = inner.as_ref(),
+                        None => {
+                            // A null/no-deref Ptr terminates the walk
+                            // without reaching the depth cap — that would
+                            // be a setup bug (the chain ran dry early).
+                            panic!(
+                                "chain terminated at a Ptr with no deref and no depth-cap \
+                                 Unsupported; skip reason {deref_skipped_reason:?}",
+                            );
+                        }
+                    }
+                }
+                RenderedValue::Unsupported { reason } => {
+                    terminal_reason = Some(reason.clone());
+                    break;
+                }
+                other => panic!("unexpected node in depth-cap chain: {other:?}"),
+            }
+        }
+        assert_eq!(
+            terminal_reason.as_deref(),
+            Some("render depth 32 exceeded"),
+            "the deepest node must be the MAX_RENDER_DEPTH backstop",
+        );
+    }
+
+    /// A `BTF_KIND_ARRAY` with `nelems == 0` (a `T[]` / `T[0]` flex
+    /// member) over a non-zero-size element, rendered against a
+    /// non-empty byte slice, surfaces `Unsupported` with the flex-array
+    /// reason carrying the available byte count. `CastSynType` has no
+    /// Array variant, so the array + a u32 element are hand-emitted on
+    /// the wire (the `tests/` suite uses the same pattern for nelems=3).
+    #[test]
+    fn render_array_flex_len_zero_yields_unsupported() {
+        const BTF_KIND_ARRAY: u32 = 3;
+        let mut strings: Vec<u8> = vec![0];
+        let n_u32 = push_name(&mut strings, "u32");
+
+        let mut type_section = Vec::new();
+        // id1: BTF_KIND_INT u32 (size 4).
+        type_section.extend_from_slice(&n_u32.to_le_bytes());
+        type_section.extend_from_slice(&((1u32 << 24) & 0x1f00_0000).to_le_bytes());
+        type_section.extend_from_slice(&4u32.to_le_bytes());
+        type_section.extend_from_slice(&32u32.to_le_bytes());
+        // id2: BTF_KIND_ARRAY of id1, nelems = 0 (flex). btf_array
+        // { type(4), index_type(4), nelems(4) }; the type record's
+        // size_type word is unused for arrays.
+        type_section.extend_from_slice(&0u32.to_le_bytes()); // name_off
+        type_section.extend_from_slice(&((BTF_KIND_ARRAY << 24) & 0x1f00_0000).to_le_bytes());
+        type_section.extend_from_slice(&0u32.to_le_bytes()); // size_type (unused)
+        type_section.extend_from_slice(&1u32.to_le_bytes()); // elem type id
+        type_section.extend_from_slice(&1u32.to_le_bytes()); // index type id
+        type_section.extend_from_slice(&0u32.to_le_bytes()); // nelems = 0
+
+        let type_len = type_section.len() as u32;
+        let str_len = strings.len() as u32;
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&0xEB9Fu16.to_le_bytes());
+        blob.push(1);
+        blob.push(0);
+        blob.extend_from_slice(&24u32.to_le_bytes());
+        blob.extend_from_slice(&0u32.to_le_bytes());
+        blob.extend_from_slice(&type_len.to_le_bytes());
+        blob.extend_from_slice(&type_len.to_le_bytes());
+        blob.extend_from_slice(&str_len.to_le_bytes());
+        blob.extend_from_slice(&type_section);
+        blob.extend_from_slice(&strings);
+
+        let btf = Btf::from_bytes(&blob).expect("synthetic flex-array BTF parses");
+        let arr_id = 2u32;
+        match render_value(&btf, arr_id, &[0u8; 8]) {
+            RenderedValue::Unsupported { reason } => {
+                assert!(
+                    reason.starts_with("flex array (BTF len=0)")
+                        && reason.contains("8 bytes available at site"),
+                    "flex-array reason names the kind and the available bytes: {reason}",
+                );
+            }
+            other => panic!("expected Unsupported flex-array render, got {other:?}"),
+        }
+    }
+
+    /// `MemReader::alloc_size_types` and
+    /// `MemReader::resolve_arena_type_meta_fallback` trait defaults: a
+    /// reader overriding only `read_kva` returns an empty slice and
+    /// `None` respectively. Pins the defaults that keep every existing
+    /// reader correct, mirroring the existing
+    /// `mem_reader_default_resolve_arena_type_is_none` /
+    /// `mem_reader_default_nr_cpu_ids_is_u32_max` pins.
+    #[test]
+    fn mem_reader_default_alloc_size_types_and_meta_fallback_are_empty_and_none() {
+        struct DefaultReader;
+        impl MemReader for DefaultReader {
+            fn read_kva(&self, _: u64, _: usize) -> Option<Vec<u8>> {
+                None
+            }
+        }
+        let r = DefaultReader;
+        assert!(
+            r.alloc_size_types().is_empty(),
+            "default alloc_size_types must be empty",
+        );
+        assert!(
+            r.resolve_arena_type_meta_fallback(0x10_0000_1000).is_none(),
+            "default resolve_arena_type_meta_fallback must be None for an arena-window address",
+        );
+        assert!(
+            r.resolve_arena_type_meta_fallback(0).is_none(),
+            "default resolve_arena_type_meta_fallback must be None for null too",
+        );
+    }
+}

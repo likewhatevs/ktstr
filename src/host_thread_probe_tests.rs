@@ -955,3 +955,572 @@ fn is_jemalloc_tsd_tls_symbol_rejects_lookalikes() {
     assert!(!is_jemalloc_tsd_tls_symbol(""));
     assert!(!is_jemalloc_tsd_tls_symbol("tls"));
 }
+
+// ===================================================================
+// Synthetic-ELF section-parser tests.
+//
+// `read_build_id`, `read_gnu_debuglink`, `find_section_slice`,
+// `section_is_populated`, and `extract_pt_tls_layout` are exercised
+// elsewhere only against the real test binary, whose exact section
+// bytes are unknown — so those tests can pin shape (lowercase hex,
+// non-empty) but not the byte-determined output. The fixtures below
+// stage section-bearing ELF64-LE blobs with KNOWN payloads so each
+// parser's output (or precise None / Err) can be asserted exactly.
+//
+// `build_elf64` + `SecSpec` are copied (not re-exported) from
+// `src/vmm/cast_analysis_load/tests/mod.rs` so this module owns its
+// fixtures and moving the cast-loader's builder cannot break either
+// suite. The builder emits zero program headers (`e_phnum=0`), so a
+// `PT_TLS` segment is never present — which is exactly what the
+// `extract_pt_tls_layout_errors_when_no_pt_tls_segment` test relies
+// on.
+// ===================================================================
+
+mod elf_fixture {
+    use goblin::elf::header as h;
+    use goblin::elf::section_header as sh;
+    use std::io::Write;
+
+    /// One section in a synthetic ELF64. Only the fields the
+    /// host_thread_probe parsers read are populated; `sh_link`,
+    /// `sh_info`, and `sh_entsize` default to 0 because none of
+    /// these parsers inspect them.
+    pub(super) struct SecSpec {
+        name: &'static str,
+        sh_type: u32,
+        sh_flags: u64,
+        sh_addr: u64,
+        /// Section payload bytes. Empty payload still produces a
+        /// section header (e.g. a populated-vs-empty distinction).
+        data: Vec<u8>,
+        sh_link: u32,
+        sh_info: u32,
+        sh_entsize: u64,
+    }
+
+    impl SecSpec {
+        pub(super) fn new(name: &'static str, sh_type: u32) -> Self {
+            Self {
+                name,
+                sh_type,
+                sh_flags: 0,
+                sh_addr: 0,
+                data: Vec::new(),
+                sh_link: 0,
+                sh_info: 0,
+                sh_entsize: 0,
+            }
+        }
+        pub(super) fn flags(mut self, f: u64) -> Self {
+            self.sh_flags = f;
+            self
+        }
+        pub(super) fn data(mut self, d: Vec<u8>) -> Self {
+            self.data = d;
+            self
+        }
+    }
+
+    /// Build a synthetic ELF64 little-endian byte blob from a list
+    /// of [`SecSpec`]s. Produces blobs that pass
+    /// [`goblin::elf::Elf::parse`].
+    ///
+    /// Layout:
+    /// 1. ELF header at offset 0 (64 bytes).
+    /// 2. Section data packed back-to-back starting at offset 64.
+    /// 3. shstrtab (auto-generated) appended after the user data.
+    /// 4. Section header table appended last.
+    ///
+    /// A leading `SHT_NULL` section is prepended automatically (the
+    /// ELF spec mandates `shdr[0]` is null); the shstrtab section is
+    /// appended automatically and `e_shstrndx` points at it.
+    /// `e_phoff`/`e_phnum` are zero, so the blob carries no program
+    /// headers (hence never a `PT_TLS` segment).
+    pub(super) fn build_elf64(sections: Vec<SecSpec>, e_machine: u16, e_type: u16) -> Vec<u8> {
+        // 1. shstrtab payload up front so each section's sh_name
+        //    offset is known.
+        let mut shstrtab: Vec<u8> = vec![0u8]; // index 0 = empty string.
+        let null_name_off = 0u32;
+        let mut sec_name_offs: Vec<u32> = Vec::new();
+        for s in &sections {
+            sec_name_offs.push(shstrtab.len() as u32);
+            shstrtab.extend_from_slice(s.name.as_bytes());
+            shstrtab.push(0);
+        }
+        let shstrtab_self_name_off = shstrtab.len() as u32;
+        shstrtab.extend_from_slice(b".shstrtab");
+        shstrtab.push(0);
+
+        // 2. ELF64 sizes per goblin: SIZEOF_EHDR=64, SIZEOF_SHDR=64.
+        let ehdr_size: usize = 64;
+        let shdr_size: usize = 64;
+
+        // 3. Lay out section data after the header. NULL section
+        //    (index 0) has zero size at offset 0.
+        let mut data_blob: Vec<u8> = Vec::new();
+        let mut sec_file_off: Vec<u64> = Vec::new();
+        sec_file_off.push(0);
+        let mut cursor: u64 = ehdr_size as u64;
+        for s in &sections {
+            sec_file_off.push(cursor);
+            data_blob.extend_from_slice(&s.data);
+            cursor += s.data.len() as u64;
+        }
+        let shstrtab_file_off = cursor;
+        data_blob.extend_from_slice(&shstrtab);
+        cursor += shstrtab.len() as u64;
+        let shoff = cursor;
+
+        // 4. Total section count: NULL + user + shstrtab.
+        let shnum = (1 + sections.len() + 1) as u16;
+        let shstrndx = (1 + sections.len()) as u16;
+
+        // 5. ELF header.
+        let mut blob: Vec<u8> = Vec::with_capacity(ehdr_size);
+        blob.extend_from_slice(h::ELFMAG); // \x7FELF
+        blob.push(h::ELFCLASS64); // EI_CLASS=2
+        blob.push(h::ELFDATA2LSB); // EI_DATA=1
+        blob.push(h::EV_CURRENT); // EI_VERSION=1
+        blob.push(0); // EI_OSABI=0 (System V)
+        blob.push(0); // EI_ABIVERSION
+        blob.extend_from_slice(&[0u8; 7]); // EI_PAD
+        blob.extend_from_slice(&e_type.to_le_bytes());
+        blob.extend_from_slice(&e_machine.to_le_bytes());
+        blob.extend_from_slice(&1u32.to_le_bytes()); // EV_CURRENT=1
+        blob.extend_from_slice(&0u64.to_le_bytes()); // e_entry
+        blob.extend_from_slice(&0u64.to_le_bytes()); // e_phoff (no phdrs)
+        blob.extend_from_slice(&shoff.to_le_bytes()); // e_shoff
+        blob.extend_from_slice(&0u32.to_le_bytes()); // e_flags
+        blob.extend_from_slice(&(ehdr_size as u16).to_le_bytes()); // e_ehsize
+        blob.extend_from_slice(&0u16.to_le_bytes()); // e_phentsize
+        blob.extend_from_slice(&0u16.to_le_bytes()); // e_phnum
+        blob.extend_from_slice(&(shdr_size as u16).to_le_bytes()); // e_shentsize
+        blob.extend_from_slice(&shnum.to_le_bytes()); // e_shnum
+        blob.extend_from_slice(&shstrndx.to_le_bytes()); // e_shstrndx
+
+        // 6. Section data + shstrtab payload.
+        blob.extend_from_slice(&data_blob);
+
+        // 7. Section header table.
+        let mut write_shdr = |sh_name: u32,
+                              sh_type: u32,
+                              sh_flags: u64,
+                              sh_addr: u64,
+                              sh_offset: u64,
+                              sh_size: u64,
+                              sh_link: u32,
+                              sh_info: u32,
+                              sh_addralign: u64,
+                              sh_entsize: u64| {
+            blob.write_all(&sh_name.to_le_bytes()).unwrap();
+            blob.write_all(&sh_type.to_le_bytes()).unwrap();
+            blob.write_all(&sh_flags.to_le_bytes()).unwrap();
+            blob.write_all(&sh_addr.to_le_bytes()).unwrap();
+            blob.write_all(&sh_offset.to_le_bytes()).unwrap();
+            blob.write_all(&sh_size.to_le_bytes()).unwrap();
+            blob.write_all(&sh_link.to_le_bytes()).unwrap();
+            blob.write_all(&sh_info.to_le_bytes()).unwrap();
+            blob.write_all(&sh_addralign.to_le_bytes()).unwrap();
+            blob.write_all(&sh_entsize.to_le_bytes()).unwrap();
+        };
+        write_shdr(null_name_off, sh::SHT_NULL, 0, 0, 0, 0, 0, 0, 0, 0);
+        for (i, s) in sections.iter().enumerate() {
+            write_shdr(
+                sec_name_offs[i],
+                s.sh_type,
+                s.sh_flags,
+                s.sh_addr,
+                sec_file_off[i + 1],
+                s.data.len() as u64,
+                s.sh_link,
+                s.sh_info,
+                1,
+                s.sh_entsize,
+            );
+        }
+        write_shdr(
+            shstrtab_self_name_off,
+            sh::SHT_STRTAB,
+            0,
+            0,
+            shstrtab_file_off,
+            shstrtab.len() as u64,
+            0,
+            0,
+            1,
+            0,
+        );
+
+        blob
+    }
+}
+
+// ------------------------------------------------------------
+// `parse_maps_elf_path` field-tokenizer edge cases.
+// ------------------------------------------------------------
+
+/// `parse_maps_elf_path` tokenizes on whitespace and takes only the
+/// FIRST whitespace-delimited token as the 7th (pathname) field. A
+/// maps pathname containing a space therefore yields the truncated
+/// leading fragment, not the full path. This is a latent behavior of
+/// the `split_whitespace` parser; pinning it makes any future switch
+/// to a column-bounded parser a deliberate, test-visible change
+/// rather than a silent semantic shift.
+#[test]
+fn parse_maps_elf_path_truncates_path_with_spaces() {
+    assert_eq!(
+        parse_maps_elf_path("5583e6f7a000-5583e6f7b000 r-xp 00000000 fe:00 12345 /opt/my app/bin"),
+        Some(PathBuf::from("/opt/my")),
+    );
+}
+
+/// A line that PASSES the executable-perms gate (`r-xp` contains
+/// `x`) but runs out of whitespace fields before the path column
+/// returns `None` via one of the `iter.next()?` operators on
+/// offset/dev/inode/path. Distinct from the anon/bracket/non-exec
+/// rejections already covered: those stop at the perms gate or the
+/// path-prefix gate; these stop at a missing column.
+#[test]
+fn parse_maps_elf_path_returns_none_on_too_few_fields() {
+    // Has range, perms(x), offset, dev — but no inode/path columns.
+    assert_eq!(
+        parse_maps_elf_path("5583e6f7a000-5583e6f7b000 r-xp 00000000 fe:00"),
+        None,
+    );
+    // Has range + perms(x) only — `iter.next()?` for offset is None.
+    assert_eq!(parse_maps_elf_path("5583e6f7a000-5583e6f7b000 r-xp"), None);
+}
+
+// ------------------------------------------------------------
+// `member_offset` DWARF constant-form widening.
+// ------------------------------------------------------------
+
+/// `member_offset` accepts every DWARF constant-class form a
+/// `DW_AT_data_member_location` can take and widens it to `u64`. The
+/// `None` (absent attribute) arm yields `Ok(None)`. Each constant
+/// form (`Udata`, `Data1`/`Data2`/`Data4`/`Data8`, non-negative
+/// `Sdata`) yields `Ok(Some(<value>))` with the exact widened value.
+#[test]
+fn member_offset_accepts_every_constant_dwarf_form() {
+    type R = gimli::EndianSlice<'static, gimli::LittleEndian>;
+    assert_eq!(member_offset::<R>(None).unwrap(), None);
+    assert_eq!(
+        member_offset::<R>(Some(gimli::AttributeValue::Udata(264))).unwrap(),
+        Some(264),
+    );
+    assert_eq!(
+        member_offset::<R>(Some(gimli::AttributeValue::Data1(7))).unwrap(),
+        Some(7),
+    );
+    assert_eq!(
+        member_offset::<R>(Some(gimli::AttributeValue::Data2(513))).unwrap(),
+        Some(513),
+    );
+    assert_eq!(
+        member_offset::<R>(Some(gimli::AttributeValue::Data4(70000))).unwrap(),
+        Some(70000),
+    );
+    // u32::MAX + 1 — proves Data8 is read as a full u64, not
+    // truncated to 32 bits.
+    assert_eq!(
+        member_offset::<R>(Some(gimli::AttributeValue::Data8(u32::MAX as u64 + 1))).unwrap(),
+        Some(4_294_967_296),
+    );
+    assert_eq!(
+        member_offset::<R>(Some(gimli::AttributeValue::Sdata(40))).unwrap(),
+        Some(40),
+    );
+}
+
+/// A negative `Sdata` fails the `v >= 0` guard and falls through to
+/// the catch-all `Err` arm rather than being silently coerced to a
+/// huge `u64` — guarding the downstream TLS address arithmetic
+/// against a wraparound base. The error message carries both the
+/// form-rejection text and the DWARF-expression-unsupported note.
+#[test]
+fn member_offset_rejects_negative_sdata_and_expr_forms() {
+    type R = gimli::EndianSlice<'static, gimli::LittleEndian>;
+    let e = member_offset::<R>(Some(gimli::AttributeValue::Sdata(-1))).unwrap_err();
+    let msg = format!("{e}");
+    assert!(
+        msg.contains("unexpected DW_AT_data_member_location form"),
+        "got: {msg}",
+    );
+    assert!(
+        msg.contains("DWARF expression forms are not supported"),
+        "got: {msg}",
+    );
+
+    // Expr-form (a DWARF location expression) must ALSO be rejected via
+    // the same catch-all Err arm — silently coercing a location
+    // expression to a u64 offset would corrupt the TLS base. This is a
+    // path distinct from negative Sdata (the name's `_and_expr_forms`
+    // half); a future special-case returning Ok for an expr form would
+    // regress here but not via the Sdata path alone.
+    let expr = member_offset::<R>(Some(gimli::AttributeValue::Block(gimli::EndianSlice::new(
+        &[0x91, 0x00],
+        gimli::LittleEndian,
+    ))));
+    assert!(
+        expr.is_err(),
+        "DWARF expression (Block) form must be rejected, got: {expr:?}",
+    );
+}
+
+// ------------------------------------------------------------
+// `read_gnu_debuglink` synthetic-section parsing.
+// ------------------------------------------------------------
+
+/// Happy path: a `.gnu_debuglink` section holding a NUL-terminated
+/// name, padded to a 4-byte boundary, followed by a little-endian
+/// u32 CRC. Name `"foo.debug"` is 9 bytes; the NUL lands at index 9;
+/// `(9+1).next_multiple_of(4) == 12`, so two pad bytes precede the
+/// CRC at bytes 12..16. CRC LE bytes `78 56 34 12` decode to
+/// `0x12345678`. Pins the padding arithmetic and the `from_le_bytes`
+/// decode together against an exact known section.
+#[test]
+fn read_gnu_debuglink_parses_name_and_crc_from_synthetic_section() {
+    use elf_fixture::{SecSpec, build_elf64};
+    use goblin::elf::header::{EM_X86_64, ET_REL};
+    use goblin::elf::section_header::SHT_PROGBITS;
+
+    // "foo.debug"(9) + NUL(idx9) + pad(idx10,11) + CRC LE(idx12..16).
+    let section = vec![
+        b'f', b'o', b'o', b'.', b'd', b'e', b'b', b'u', b'g', 0, 0, 0, 0x78, 0x56, 0x34, 0x12,
+    ];
+    let data = build_elf64(
+        vec![SecSpec::new(".gnu_debuglink", SHT_PROGBITS).data(section)],
+        EM_X86_64,
+        ET_REL,
+    );
+    let elf = goblin::elf::Elf::parse(&data).expect("parse synthetic ELF");
+    assert_eq!(
+        read_gnu_debuglink(&elf, &data),
+        Some(("foo.debug".to_string(), 0x1234_5678)),
+    );
+}
+
+/// Two malformed `.gnu_debuglink` sections each return `None`,
+/// distinct from the absent-section path the real-binary test
+/// covers:
+/// (a) no NUL byte at all → the `position(|b| b == 0)?` returns
+///     `None`;
+/// (b) NUL present but the CRC is truncated → `after_name + 4 >
+///     bytes.len()` returns `None`. With name `"a"` (NUL at idx1),
+///     `(1+1).next_multiple_of(4) == 4` and `4 + 4 == 8 > 2`.
+#[test]
+fn read_gnu_debuglink_returns_none_on_missing_nul_and_truncated_crc() {
+    use elf_fixture::{SecSpec, build_elf64};
+    use goblin::elf::header::{EM_X86_64, ET_REL};
+    use goblin::elf::section_header::SHT_PROGBITS;
+
+    // (a) No NUL byte → position() is None.
+    let data_no_nul = build_elf64(
+        vec![SecSpec::new(".gnu_debuglink", SHT_PROGBITS).data(b"abcd".to_vec())],
+        EM_X86_64,
+        ET_REL,
+    );
+    let elf_no_nul = goblin::elf::Elf::parse(&data_no_nul).expect("parse no-nul ELF");
+    assert_eq!(read_gnu_debuglink(&elf_no_nul, &data_no_nul), None);
+
+    // (b) name "a" + NUL but the 4-byte CRC does not fit.
+    let data_short = build_elf64(
+        vec![SecSpec::new(".gnu_debuglink", SHT_PROGBITS).data(b"a\0".to_vec())],
+        EM_X86_64,
+        ET_REL,
+    );
+    let elf_short = goblin::elf::Elf::parse(&data_short).expect("parse short-crc ELF");
+    assert_eq!(read_gnu_debuglink(&elf_short, &data_short), None);
+}
+
+// ------------------------------------------------------------
+// `read_build_id` synthetic-note parsing.
+// ------------------------------------------------------------
+
+/// Happy path with a KNOWN descriptor: a `.note.gnu.build-id`
+/// `NT_GNU_BUILD_ID` note (`namesz=4`, `descsz=4`, `type=3`, name
+/// `"GNU\0"`, descriptor `[0xde,0xad,0xbe,0xef]`). The descriptor
+/// renders byte-by-byte via `{:02x}` to `"deadbeef"`. Pins the
+/// name-padding offset math (`namesz.next_multiple_of(4)`) and the
+/// hex encoder together — the real-binary test cannot, because it
+/// never knows the descriptor bytes.
+#[test]
+fn read_build_id_renders_descriptor_as_lowercase_hex() {
+    use elf_fixture::{SecSpec, build_elf64};
+    use goblin::elf::header::{EM_X86_64, ET_REL};
+    use goblin::elf::section_header::SHT_NOTE;
+
+    let mut note: Vec<u8> = Vec::new();
+    note.extend_from_slice(&4u32.to_le_bytes()); // namesz
+    note.extend_from_slice(&4u32.to_le_bytes()); // descsz
+    note.extend_from_slice(&3u32.to_le_bytes()); // type = NT_GNU_BUILD_ID
+    note.extend_from_slice(b"GNU\0"); // name, already 4-aligned
+    note.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef]); // descriptor
+
+    let data = build_elf64(
+        vec![SecSpec::new(".note.gnu.build-id", SHT_NOTE).data(note)],
+        EM_X86_64,
+        ET_REL,
+    );
+    let elf = goblin::elf::Elf::parse(&data).expect("parse build-id ELF");
+    assert_eq!(read_build_id(&elf, &data), Some("deadbeef".to_string()));
+}
+
+/// Two malformed notes each return `None` rather than panicking on
+/// an out-of-bounds slice:
+/// (a) section shorter than the 12-byte note header → `bytes.len() <
+///     12` returns `None`;
+/// (b) `descsz` claims more bytes than the section holds →
+///     `desc_end > bytes.len()` returns `None`. Here `namesz=4`,
+///     `descsz=99`, name `"GNU\0"`, only 4 descriptor bytes present,
+///     so `desc_end = 16 + 99 = 115 > 20`.
+#[test]
+fn read_build_id_returns_none_on_short_section_and_overlong_descsz() {
+    use elf_fixture::{SecSpec, build_elf64};
+    use goblin::elf::header::{EM_X86_64, ET_REL};
+    use goblin::elf::section_header::SHT_NOTE;
+
+    // (a) 8-byte payload < 12.
+    let data_short = build_elf64(
+        vec![SecSpec::new(".note.gnu.build-id", SHT_NOTE).data(vec![0u8; 8])],
+        EM_X86_64,
+        ET_REL,
+    );
+    let elf_short = goblin::elf::Elf::parse(&data_short).expect("parse short note ELF");
+    assert_eq!(read_build_id(&elf_short, &data_short), None);
+
+    // (b) descsz claims 99 bytes; only 4 present.
+    let mut over: Vec<u8> = Vec::new();
+    over.extend_from_slice(&4u32.to_le_bytes()); // namesz
+    over.extend_from_slice(&99u32.to_le_bytes()); // descsz (overlong)
+    over.extend_from_slice(&3u32.to_le_bytes()); // type
+    over.extend_from_slice(b"GNU\0"); // name
+    over.extend_from_slice(&[0xaa, 0xbb, 0xcc, 0xdd]); // 4 desc bytes
+    let data_over = build_elf64(
+        vec![SecSpec::new(".note.gnu.build-id", SHT_NOTE).data(over)],
+        EM_X86_64,
+        ET_REL,
+    );
+    let elf_over = goblin::elf::Elf::parse(&data_over).expect("parse overlong note ELF");
+    assert_eq!(read_build_id(&elf_over, &data_over), None);
+}
+
+// ------------------------------------------------------------
+// `find_section_slice` / `section_is_populated` primitives.
+// ------------------------------------------------------------
+
+/// `find_section_slice` returns the EXACT payload bytes for a present
+/// section and `None` for an absent one. The positive byte-range
+/// slice is never pinned by the real-binary tests (which only reach
+/// it indirectly via `read_gnu_debuglink`), so pin the exact 8-byte
+/// payload here against a known section name + payload.
+#[test]
+fn find_section_slice_returns_none_for_absent_section_and_slice_for_present() {
+    use elf_fixture::{SecSpec, build_elf64};
+    use goblin::elf::header::{EM_X86_64, ET_REL};
+    use goblin::elf::section_header::SHT_PROGBITS;
+
+    let data = build_elf64(
+        vec![SecSpec::new(".mydata", SHT_PROGBITS).data(b"PAYLOAD!".to_vec())],
+        EM_X86_64,
+        ET_REL,
+    );
+    let elf = goblin::elf::Elf::parse(&data).expect("parse section-slice ELF");
+    assert_eq!(
+        find_section_slice(&elf, &data, ".mydata"),
+        Some(&b"PAYLOAD!"[..]),
+    );
+    assert_eq!(find_section_slice(&elf, &data, ".absent"), None);
+}
+
+/// `section_is_populated` distinguishes three states as exact
+/// booleans: a present non-empty section → `true`; a present but
+/// EMPTY section → `false`; an absent section → `false`. This
+/// gates the inline-`.debug_info` fast path against the slow DWARF
+/// walk in the attach cascade, so a regression flipping the
+/// empty-section branch to `true` would route a stripped binary
+/// down the wrong resolution path.
+#[test]
+fn section_is_populated_distinguishes_empty_present_and_absent() {
+    use elf_fixture::{SecSpec, build_elf64};
+    use goblin::elf::header::{EM_X86_64, ET_REL};
+    use goblin::elf::section_header::SHT_PROGBITS;
+
+    let data = build_elf64(
+        vec![
+            SecSpec::new(".full", SHT_PROGBITS).data(vec![1, 2, 3]),
+            SecSpec::new(".empty", SHT_PROGBITS),
+        ],
+        EM_X86_64,
+        ET_REL,
+    );
+    let elf = goblin::elf::Elf::parse(&data).expect("parse populated/empty ELF");
+    assert!(section_is_populated(&elf, &data, ".full"));
+    assert!(!section_is_populated(&elf, &data, ".empty"));
+    assert!(!section_is_populated(&elf, &data, ".absent"));
+}
+
+// ------------------------------------------------------------
+// `extract_pt_tls_layout` precondition error.
+// ------------------------------------------------------------
+
+/// An ELF with no `PT_TLS` program header surfaces a precise error
+/// rather than reaching the layout math with garbage. The
+/// fixture builder emits zero program headers (`e_phnum=0`), so
+/// `find(PT_TLS)` is `None` and the `ok_or_else` error fires. Pins
+/// the static-TLS precondition: a target without static TLS is
+/// rejected with both the "no PT_TLS segment" and "does not use
+/// static TLS" message fragments.
+#[test]
+fn extract_pt_tls_layout_errors_when_no_pt_tls_segment() {
+    use elf_fixture::{SecSpec, build_elf64};
+    use goblin::elf::header::{EM_X86_64, ET_REL};
+    use goblin::elf::section_header::{SHF_EXECINSTR, SHT_PROGBITS};
+
+    let data = build_elf64(
+        vec![SecSpec::new(".text", SHT_PROGBITS).flags(SHF_EXECINSTR.into())],
+        EM_X86_64,
+        ET_REL,
+    );
+    let elf = goblin::elf::Elf::parse(&data).expect("parse no-PT_TLS ELF");
+    let err = extract_pt_tls_layout(&elf).unwrap_err();
+    let msg = format!("{err}");
+    assert!(msg.contains("ELF has no PT_TLS segment"), "got: {msg}");
+    assert!(msg.contains("does not use static TLS"), "got: {msg}");
+}
+
+// ------------------------------------------------------------
+// `attach_jemalloc_at` MapsReadFailure classification.
+// ------------------------------------------------------------
+
+/// Stage a synthetic `<tmp>/<pid>/` with a valid `exe` symlink but
+/// NO `maps` file. The readlink step succeeds first; the maps read
+/// fails second — producing the precise `MapsReadFailure` classifier
+/// rather than degrading. Mirrors the inverse of
+/// `attach_at_returns_readlink_failure_when_exe_symlink_missing`
+/// (present exe, absent maps) and pins the operation ordering inside
+/// `find_jemalloc_via_maps_at`.
+#[test]
+fn attach_at_returns_maps_read_failure_when_maps_absent() {
+    // exe symlink target need only be readlink-resolvable; the maps
+    // read fails before the symlink target is ever opened, so any
+    // path works. Use a path guaranteed present on a Linux host.
+    let exe_target = PathBuf::from("/bin/sh");
+    if !exe_target.exists() {
+        eprintln!("skipping — /bin/sh unavailable for exe symlink target");
+        return;
+    }
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let pid: i32 = 4244;
+    let pid_dir = tmp.path().join(pid.to_string());
+    std::fs::create_dir_all(&pid_dir).expect("mkdir pid_dir");
+
+    // exe symlink present → readlink succeeds.
+    std::os::unix::fs::symlink(&exe_target, pid_dir.join("exe")).expect("symlink exe");
+    // DELIBERATELY NO maps file — the maps read must fail.
+
+    match attach_jemalloc_at(tmp.path(), pid) {
+        Err(AttachError::MapsReadFailure(_)) => {}
+        other => panic!("expected MapsReadFailure when maps file is absent, got {other:?}"),
+    }
+}

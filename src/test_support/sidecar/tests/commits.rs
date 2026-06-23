@@ -171,6 +171,8 @@ fn sidecar_payload_and_metrics_always_emit_when_empty() {
         test_name: _,
         topology: _,
         scheduler: _,
+        vcpus: _,
+        cpu_budget: _,
         scheduler_commit,
         project_commit,
         payload,
@@ -718,6 +720,54 @@ fn sidecar_variant_hash_excludes_run_source() {
         sidecar_variant_hash(&archive),
         "run_source must not influence variant hash — \
          Some(\"ci\") vs Some(\"archive\") case",
+    );
+}
+
+/// cpu_budget / vcpus must NOT influence the variant hash: a budget
+/// change is a different MEASUREMENT, separated downstream by the
+/// `Dimension::CpuBudget` pairing, not by shattering the identity bucket.
+/// Two runs of the same semantic variant at different budgets must still
+/// bucket together so `stats compare` can diff them — mirrors the
+/// commit / run_source exclusion tests.
+#[test]
+fn sidecar_variant_hash_excludes_cpu_budget() {
+    let wide = SidecarResult {
+        topology: "1n8l16c2t".to_string(),
+        vcpus: 256,
+        cpu_budget: 256,
+        ..SidecarResult::test_fixture()
+    };
+    let overcommit = SidecarResult {
+        topology: "1n8l16c2t".to_string(),
+        vcpus: 256,
+        cpu_budget: 4,
+        ..SidecarResult::test_fixture()
+    };
+    assert_eq!(
+        sidecar_variant_hash(&wide),
+        sidecar_variant_hash(&overcommit),
+        "cpu_budget must not influence the variant hash — cross-budget runs \
+         of the same variant must bucket together (separated by the \
+         CpuBudget Dimension, not the identity hash)",
+    );
+    // vcpus exclusion (the field docs name this test as the pin for BOTH):
+    // vary ONLY the numeric vcpus field, holding the hashed `topology`
+    // STRING and cpu_budget equal, and assert the hash is unchanged. The
+    // topology string is deliberately identical to `overcommit` so only
+    // the vcpus u32 field differs (a different topology string WOULD
+    // change the hash — topology IS hashed).
+    let same_topo_fewer_vcpus = SidecarResult {
+        topology: "1n8l16c2t".to_string(),
+        vcpus: 16,
+        cpu_budget: 4,
+        ..SidecarResult::test_fixture()
+    };
+    assert_eq!(
+        sidecar_variant_hash(&overcommit),
+        sidecar_variant_hash(&same_topo_fewer_vcpus),
+        "vcpus must not influence the variant hash either — only the \
+         test-identity fields (topology/scheduler/payload/work_type/\
+         sysctls/kargs) feed it",
     );
 }
 
@@ -2066,7 +2116,8 @@ fn resolve_kernel_source_dir_with_cache_version_empty_cache_yields_none() {
 
 // -- resolve_kernel_source_dir Path arm --
 //
-// The Path arm at sidecar.rs:1641 routes via the shared
+// The `KernelId::Path(_)` arm of `source_dir_for` (reached via
+// `resolve_kernel_source_dir`) routes via the shared
 // `cache::recover_local_source_tree` helper: when
 // `KTSTR_KERNEL` points at a CACHE ENTRY directory (the shape
 // `cargo-ktstr` exports for clean Path specs), the helper

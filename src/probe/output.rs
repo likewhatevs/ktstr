@@ -352,6 +352,192 @@ fn format_field_line(
     }
 }
 
+/// Extract struct name from a field key like `"p:task_struct.field"`.
+/// Returns `""` when no struct context is present.
+fn struct_from_key(key: &str) -> &str {
+    let (param_part, _) = key.split_once('.').unwrap_or((key, key));
+    let (_, sname) = param_part.split_once(':').unwrap_or(("", ""));
+    if sname == "val" { "" } else { sname }
+}
+
+/// Render an event with no struct field specs: show args with BTF
+/// param names when available, falling back to arg0/arg1/... Caps to
+/// the BTF param count to avoid showing garbage register values
+/// beyond the actual params, falling back to all 6 when BTF
+/// resolution failed (empty params).
+fn format_event_args(
+    out: &mut String,
+    event: &super::process::ProbeEvent,
+    name: &str,
+    param_names: &std::collections::HashMap<String, Vec<(String, String)>>,
+    max_field_w: usize,
+) {
+    let fw = max_field_w;
+    let params = param_names.get(name);
+    let arg_cap = params
+        .map(|ps| ps.len())
+        .filter(|&n| n > 0)
+        .unwrap_or(6)
+        .min(6);
+    for (i, &val) in event.args[..arg_cap].iter().enumerate() {
+        if val != 0 || i == 0 {
+            let (label, decoded) = if let Some(p) = params.and_then(|ps| ps.get(i)) {
+                let (pname, ptype) = p;
+                let lbl = if ptype.is_empty() {
+                    pname.clone()
+                } else {
+                    format!("{pname} ({ptype})")
+                };
+                let dec = if ptype.contains("task_struct") {
+                    format!("ptr:{:04x}", val & 0xffff)
+                } else if ptype == "ptr" {
+                    format_raw_arg(val)
+                } else {
+                    decode_named_value("", pname, &val.to_string())
+                };
+                (lbl, dec)
+            } else {
+                (format!("arg{i}"), format_raw_arg(val))
+            };
+            out.push_str(&format!("      {label:<fw$}  {decoded}\n"));
+        }
+    }
+}
+
+/// Render an event with struct field specs: coalesce cpumask words,
+/// pair entry/exit values, group fields by parameter (emitting type
+/// headers for struct params), and emit aligned field lines with an
+/// arrow column for fields whose exit value differs from entry.
+fn format_event_fields(
+    out: &mut String,
+    event: &super::process::ProbeEvent,
+    nr_cpus: Option<u32>,
+    render_hints: &std::collections::HashMap<String, super::btf::RenderHint>,
+    max_field_w: usize,
+) {
+    // Coalesce cpumask words before grouping: collect
+    // cpumask_0..cpumask_3 raw values, decode as one field.
+    let mut cpumask_words: [u64; 4] = [0; 4];
+    for (key, val) in &event.fields {
+        let (_, field) = key.split_once('.').unwrap_or((key, key));
+        match field {
+            "cpumask_0" => cpumask_words[0] = *val,
+            "cpumask_1" => cpumask_words[1] = *val,
+            "cpumask_2" => cpumask_words[2] = *val,
+            "cpumask_3" => cpumask_words[3] = *val,
+            _ => {}
+        }
+    }
+    let merged_cpumask_str = format_cpumask_display(&cpumask_words, nr_cpus);
+
+    // Build exit field lookup for paired display.
+    let mut exit_cpumask_words: [u64; 4] = [0; 4];
+    let exit_map: std::collections::HashMap<&str, u64> = event
+        .exit_fields
+        .iter()
+        .map(|(k, v)| {
+            let (_, field) = k.split_once('.').unwrap_or((k, k));
+            match field {
+                "cpumask_0" => exit_cpumask_words[0] = *v,
+                "cpumask_1" => exit_cpumask_words[1] = *v,
+                "cpumask_2" => exit_cpumask_words[2] = *v,
+                "cpumask_3" => exit_cpumask_words[3] = *v,
+                _ => {}
+            }
+            (field, *v)
+        })
+        .collect();
+    let exit_cpumask_str = if !event.exit_fields.is_empty() {
+        Some(format_cpumask_display(&exit_cpumask_words, nr_cpus))
+    } else {
+        None
+    };
+    let has_exit = !event.exit_fields.is_empty();
+
+    // Group fields by parameter, emit type headers for struct params.
+    let mut groups: Vec<FieldGroup> = Vec::new();
+    for (key, val) in &event.fields {
+        let (param_part, field) = key.split_once('.').unwrap_or((key, key));
+        // Skip cpumask_1..3 — merged into cpumask_0 display.
+        if matches!(field, "cpumask_1" | "cpumask_2" | "cpumask_3") {
+            continue;
+        }
+        let (pname, ptype) = param_part.split_once(':').unwrap_or((param_part, ""));
+        let label = if ptype == "val" {
+            pname.to_string()
+        } else if ptype.ends_with('*') || !ptype.is_empty() {
+            format!("{ptype} *{pname}")
+        } else {
+            pname.to_string()
+        };
+        let sname = struct_from_key(key);
+        let hint = render_hints.get(key).copied();
+        let entry_decoded = if field == "cpumask_0" {
+            merged_cpumask_str.clone()
+        } else {
+            decode_named_value_hinted(sname, field, &val.to_string(), hint)
+        };
+        let exit_decoded = if has_exit {
+            if field == "cpumask_0" {
+                exit_cpumask_str.clone()
+            } else {
+                exit_map
+                    .get(field)
+                    .map(|ev| decode_named_value_hinted(sname, field, &ev.to_string(), hint))
+            }
+        } else {
+            None
+        };
+        let display_field = if field == "cpumask_0" {
+            "cpus_ptr".to_string()
+        } else {
+            field.to_string()
+        };
+        if let Some(grp) = groups.iter_mut().find(|(l, _)| l == &label) {
+            grp.1.push((display_field, entry_decoded, exit_decoded));
+        } else {
+            groups.push((label, vec![(display_field, entry_decoded, exit_decoded)]));
+        }
+    }
+
+    // Collect struct field name→value for scalar dedup.
+    let struct_field_vals: std::collections::HashSet<(&str, &str)> = groups
+        .iter()
+        .filter(|(l, _)| l.contains('*'))
+        .flat_map(|(_, fields)| fields.iter().map(|(f, v, _)| (f.as_str(), v.as_str())))
+        .collect();
+
+    // Compute arrow column: max entry value length across
+    // changed fields (where exit differs from entry).
+    let arrow_col: usize = groups
+        .iter()
+        .flat_map(|(_, fields)| fields.iter())
+        .filter_map(|(_, ev, xv)| {
+            xv.as_ref()
+                .filter(|x| x.as_str() != ev.as_str())
+                .map(|_| ev.len())
+        })
+        .max()
+        .unwrap_or(0);
+
+    let fw = max_field_w;
+    for (label, fields) in &groups {
+        if fields.len() == 1 && !label.contains('*') {
+            let (fname, entry_val, exit_val) = &fields[0];
+            // Suppress scalar if identical name+value exists in a struct group.
+            if struct_field_vals.contains(&(fname.as_str(), entry_val.as_str())) {
+                continue;
+            }
+            format_field_line(out, label, entry_val, exit_val.as_deref(), fw, arrow_col);
+        } else {
+            out.push_str(&format!("    {label}\n"));
+            for (fname, entry_val, exit_val) in fields {
+                format_field_line(out, fname, entry_val, exit_val.as_deref(), fw, arrow_col);
+            }
+        }
+    }
+}
+
 fn format_probe_events_inner(
     events: &[super::process::ProbeEvent],
     func_names: &[(u32, String)],
@@ -439,14 +625,6 @@ fn format_probe_events_inner(
         }
     }
 
-    /// Extract struct name from a field key like `"p:task_struct.field"`.
-    /// Returns `""` when no struct context is present.
-    fn struct_from_key(key: &str) -> &str {
-        let (param_part, _) = key.split_once('.').unwrap_or((key, key));
-        let (_, sname) = param_part.split_once(':').unwrap_or(("", ""));
-        if sname == "val" { "" } else { sname }
-    }
-
     // Dynamic field name width for column alignment.
     let max_field_w: usize = events
         .iter()
@@ -508,177 +686,9 @@ fn format_probe_events_inner(
         }
 
         if event.fields.is_empty() {
-            // No struct field specs — show args with BTF param names
-            // when available, fall back to arg0/arg1/... otherwise.
-            // Cap to BTF param count to avoid showing garbage register
-            // values beyond actual params. Fall back to all 6 when
-            // BTF resolution failed (empty params).
-            let fw = max_field_w;
-            let params = param_names.get(name);
-            let arg_cap = params
-                .map(|ps| ps.len())
-                .filter(|&n| n > 0)
-                .unwrap_or(6)
-                .min(6);
-            for (i, &val) in event.args[..arg_cap].iter().enumerate() {
-                if val != 0 || i == 0 {
-                    let (label, decoded) = if let Some(p) = params.and_then(|ps| ps.get(i)) {
-                        let (pname, ptype) = p;
-                        let lbl = if ptype.is_empty() {
-                            pname.clone()
-                        } else {
-                            format!("{pname} ({ptype})")
-                        };
-                        let dec = if ptype.contains("task_struct") {
-                            format!("ptr:{:04x}", val & 0xffff)
-                        } else if ptype == "ptr" {
-                            format_raw_arg(val)
-                        } else {
-                            decode_named_value("", pname, &val.to_string())
-                        };
-                        (lbl, dec)
-                    } else {
-                        (format!("arg{i}"), format_raw_arg(val))
-                    };
-                    out.push_str(&format!("      {label:<fw$}  {decoded}\n"));
-                }
-            }
+            format_event_args(&mut out, event, name, param_names, max_field_w);
         } else {
-            // Coalesce cpumask words before grouping: collect
-            // cpumask_0..cpumask_3 raw values, decode as one field.
-            let mut cpumask_words: [u64; 4] = [0; 4];
-            for (key, val) in &event.fields {
-                let (_, field) = key.split_once('.').unwrap_or((key, key));
-                match field {
-                    "cpumask_0" => cpumask_words[0] = *val,
-                    "cpumask_1" => cpumask_words[1] = *val,
-                    "cpumask_2" => cpumask_words[2] = *val,
-                    "cpumask_3" => cpumask_words[3] = *val,
-                    _ => {}
-                }
-            }
-            let merged_cpumask_str = format_cpumask_display(&cpumask_words, nr_cpus);
-
-            // Build exit field lookup for paired display.
-            let mut exit_cpumask_words: [u64; 4] = [0; 4];
-            let exit_map: std::collections::HashMap<&str, u64> = event
-                .exit_fields
-                .iter()
-                .map(|(k, v)| {
-                    let (_, field) = k.split_once('.').unwrap_or((k, k));
-                    match field {
-                        "cpumask_0" => exit_cpumask_words[0] = *v,
-                        "cpumask_1" => exit_cpumask_words[1] = *v,
-                        "cpumask_2" => exit_cpumask_words[2] = *v,
-                        "cpumask_3" => exit_cpumask_words[3] = *v,
-                        _ => {}
-                    }
-                    (field, *v)
-                })
-                .collect();
-            let exit_cpumask_str = if !event.exit_fields.is_empty() {
-                Some(format_cpumask_display(&exit_cpumask_words, nr_cpus))
-            } else {
-                None
-            };
-            let has_exit = !event.exit_fields.is_empty();
-
-            // Group fields by parameter, emit type headers for struct params.
-            let mut groups: Vec<FieldGroup> = Vec::new();
-            for (key, val) in &event.fields {
-                let (param_part, field) = key.split_once('.').unwrap_or((key, key));
-                // Skip cpumask_1..3 — merged into cpumask_0 display.
-                if matches!(field, "cpumask_1" | "cpumask_2" | "cpumask_3") {
-                    continue;
-                }
-                let (pname, ptype) = param_part.split_once(':').unwrap_or((param_part, ""));
-                let label = if ptype == "val" {
-                    pname.to_string()
-                } else if ptype.ends_with('*') || !ptype.is_empty() {
-                    format!("{ptype} *{pname}")
-                } else {
-                    pname.to_string()
-                };
-                let sname = struct_from_key(key);
-                let hint = render_hints.get(key).copied();
-                let entry_decoded = if field == "cpumask_0" {
-                    merged_cpumask_str.clone()
-                } else {
-                    decode_named_value_hinted(sname, field, &val.to_string(), hint)
-                };
-                let exit_decoded = if has_exit {
-                    if field == "cpumask_0" {
-                        exit_cpumask_str.clone()
-                    } else {
-                        exit_map.get(field).map(|ev| {
-                            decode_named_value_hinted(sname, field, &ev.to_string(), hint)
-                        })
-                    }
-                } else {
-                    None
-                };
-                let display_field = if field == "cpumask_0" {
-                    "cpus_ptr".to_string()
-                } else {
-                    field.to_string()
-                };
-                if let Some(grp) = groups.iter_mut().find(|(l, _)| l == &label) {
-                    grp.1.push((display_field, entry_decoded, exit_decoded));
-                } else {
-                    groups.push((label, vec![(display_field, entry_decoded, exit_decoded)]));
-                }
-            }
-
-            // Collect struct field name→value for scalar dedup.
-            let struct_field_vals: std::collections::HashSet<(&str, &str)> = groups
-                .iter()
-                .filter(|(l, _)| l.contains('*'))
-                .flat_map(|(_, fields)| fields.iter().map(|(f, v, _)| (f.as_str(), v.as_str())))
-                .collect();
-
-            // Compute arrow column: max entry value length across
-            // changed fields (where exit differs from entry).
-            let arrow_col: usize = groups
-                .iter()
-                .flat_map(|(_, fields)| fields.iter())
-                .filter_map(|(_, ev, xv)| {
-                    xv.as_ref()
-                        .filter(|x| x.as_str() != ev.as_str())
-                        .map(|_| ev.len())
-                })
-                .max()
-                .unwrap_or(0);
-
-            let fw = max_field_w;
-            for (label, fields) in &groups {
-                if fields.len() == 1 && !label.contains('*') {
-                    let (fname, entry_val, exit_val) = &fields[0];
-                    // Suppress scalar if identical name+value exists in a struct group.
-                    if struct_field_vals.contains(&(fname.as_str(), entry_val.as_str())) {
-                        continue;
-                    }
-                    format_field_line(
-                        &mut out,
-                        label,
-                        entry_val,
-                        exit_val.as_deref(),
-                        fw,
-                        arrow_col,
-                    );
-                } else {
-                    out.push_str(&format!("    {label}\n"));
-                    for (fname, entry_val, exit_val) in fields {
-                        format_field_line(
-                            &mut out,
-                            fname,
-                            entry_val,
-                            exit_val.as_deref(),
-                            fw,
-                            arrow_col,
-                        );
-                    }
-                }
-            }
+            format_event_fields(&mut out, event, nr_cpus, render_hints, max_field_w);
         }
 
         // Display captured string value.
@@ -1272,5 +1282,305 @@ mod tests {
         let result =
             resolve_addrs_from_elf(std::path::Path::new("/nonexistent/vmlinux"), &func_names);
         assert!(result.is_empty());
+    }
+
+    // -- entry→exit diff rendering (exit_fields) --
+
+    /// A field whose exit value differs from entry renders the
+    /// `entry → exit` diff line. Pins the `Some(ev) if ev != entry_val`
+    /// arm of `format_field_line` plus the `arrow_col` computation; no
+    /// existing test populates `exit_fields`, so this arm and the arrow
+    /// column were previously dead. `vtime` decodes passthrough, so
+    /// 100/200 are stable. Host-only, no VM.
+    #[test]
+    fn format_probe_events_entry_exit_diff_arrow() {
+        use crate::probe::process::ProbeEvent;
+
+        let events = vec![ProbeEvent {
+            func_idx: 0,
+            fields: vec![("p:task_struct.vtime".to_string(), 100)],
+            exit_fields: vec![("p:task_struct.vtime".to_string(), 200)],
+            ..Default::default()
+        }];
+        let func_names = vec![(0u32, "do_probe".to_string())];
+        let out = format_probe_events(&events, &func_names, None, None);
+
+        // max_field_w = "vtime".len().max(8) = 8; arrow_col = "100".len() = 3.
+        // col = arrow_col.max(entry.len()) = 3. Build the block with the
+        // same arithmetic as format_field_line's Some(diff) arm.
+        let fw = 8usize;
+        let col = 3usize;
+        let field_line = format!(
+            "      {field:<fw$}  {entry:<col$}  →  {exit}\n",
+            field = "vtime",
+            entry = "100",
+            exit = "200"
+        );
+        let expected = format!("    task_struct *p\n{field_line}");
+        assert!(
+            out.contains(&expected),
+            "expected entry→exit diff block:\n{expected}\ngot:\n{out}",
+        );
+        assert!(out.contains('→'), "diff arm must render an arrow: {out}");
+    }
+
+    /// An exit value equal to the entry value falls to the no-arrow
+    /// `_ =>` arm even though `exit_fields` is non-empty. Distinct from
+    /// the None-exit path the other tests cover: it pins that an
+    /// unchanged field is NOT rendered with `→`. `weight` decodes
+    /// passthrough. Host-only.
+    #[test]
+    fn format_probe_events_exit_equal_no_arrow() {
+        use crate::probe::process::ProbeEvent;
+
+        let events = vec![ProbeEvent {
+            func_idx: 0,
+            fields: vec![("p:task_struct.weight".to_string(), 100)],
+            exit_fields: vec![("p:task_struct.weight".to_string(), 100)],
+            ..Default::default()
+        }];
+        let func_names = vec![(0u32, "do_probe".to_string())];
+        let out = format_probe_events(&events, &func_names, None, None);
+
+        // fw = "weight".len().max(8) = 8; no arrow (equal exit).
+        let fw = 8usize;
+        let field_line = format!(
+            "      {field:<fw$}  {entry}\n",
+            field = "weight",
+            entry = "100"
+        );
+        let expected = format!("    task_struct *p\n{field_line}");
+        assert!(
+            out.contains(&expected),
+            "expected no-arrow block:\n{expected}\ngot:\n{out}",
+        );
+        assert!(
+            !out.contains('→'),
+            "equal exit must not render an arrow: {out}",
+        );
+    }
+
+    // -- build_param_names --
+
+    /// Covers the four type_label arms (struct pointer, typed pointer,
+    /// untyped ptr, scalar) and the variadic .take(6)/pad-to-6 loop.
+    /// Pure host call — BtfFunc/BtfParam are struct literals, no BTF
+    /// parse, no VM.
+    #[test]
+    fn build_param_names_struct_ptr_and_scalar_and_variadic_pad() {
+        use crate::probe::btf::{BtfFunc, BtfParam};
+
+        let f = BtfFunc {
+            name: "f".to_string(),
+            params: vec![
+                BtfParam {
+                    name: "p".to_string(),
+                    struct_name: Some("task_struct".to_string()),
+                    ..Default::default()
+                },
+                BtfParam {
+                    name: "c".to_string(),
+                    ..Default::default()
+                },
+                BtfParam {
+                    name: "q".to_string(),
+                    is_ptr: true,
+                    ..Default::default()
+                },
+                BtfParam {
+                    name: "t".to_string(),
+                    type_name: Some("myt".to_string()),
+                    ..Default::default()
+                },
+            ],
+            is_variadic: false,
+        };
+        let v = BtfFunc {
+            name: "v".to_string(),
+            params: vec![BtfParam {
+                name: "a".to_string(),
+                ..Default::default()
+            }],
+            is_variadic: true,
+        };
+
+        let map = build_param_names(&[f, v]);
+        assert_eq!(
+            map["f"],
+            vec![
+                ("p".to_string(), "task_struct *".to_string()),
+                ("c".to_string(), String::new()),
+                ("q".to_string(), "ptr".to_string()),
+                ("t".to_string(), "myt *".to_string()),
+            ],
+        );
+        // Variadic padded to 6 with arg{i} entries.
+        assert_eq!(map["v"].len(), 6);
+        assert_eq!(map["v"][0], ("a".to_string(), String::new()));
+        assert_eq!(map["v"][5], ("arg5".to_string(), String::new()));
+    }
+
+    // -- build_render_hints --
+
+    /// Covers the three insert arms: known struct in STRUCT_FIELDS
+    /// (every field → Hex), non-empty auto_fields (each field → its own
+    /// hint, with the type_name → "void" fallback), and scalar !is_ptr
+    /// (→ Hex under the `val.` key). Host-only struct literals.
+    #[test]
+    fn build_render_hints_known_struct_autofields_and_scalar() {
+        use crate::probe::btf::{BtfFunc, BtfParam, RenderHint};
+
+        let f = BtfFunc {
+            name: "f".to_string(),
+            params: vec![
+                // Known struct → STRUCT_FIELDS loop, every field = Hex.
+                BtfParam {
+                    name: "p".to_string(),
+                    struct_name: Some("task_struct".to_string()),
+                    ..Default::default()
+                },
+                // auto_fields with a named type → carries the field's hint.
+                BtfParam {
+                    name: "x".to_string(),
+                    type_name: Some("myt".to_string()),
+                    auto_fields: vec![(
+                        "count".to_string(),
+                        "->count".to_string(),
+                        RenderHint::Decimal,
+                    )],
+                    ..Default::default()
+                },
+                // auto_fields with type_name=None → "void" fallback.
+                BtfParam {
+                    name: "v".to_string(),
+                    auto_fields: vec![("z".to_string(), "->z".to_string(), RenderHint::Signed)],
+                    ..Default::default()
+                },
+                // Scalar (!is_ptr, no struct, no auto_fields) → val.<name> = Hex.
+                BtfParam {
+                    name: "n".to_string(),
+                    ..Default::default()
+                },
+            ],
+            is_variadic: false,
+        };
+
+        let hints = build_render_hints(&[f]);
+        // Known-struct entry: task_struct.pid is in STRUCT_FIELDS → Hex.
+        assert_eq!(hints["p:task_struct.pid"], RenderHint::Hex);
+        // auto_fields carry their own hint under {pname}:{tname}.{fname}.
+        assert_eq!(hints["x:myt.count"], RenderHint::Decimal);
+        // type_name=None falls back to "void".
+        assert_eq!(hints["v:void.z"], RenderHint::Signed);
+        // Scalar param gets a val.<name> = Hex entry.
+        assert_eq!(hints["n:val.n"], RenderHint::Hex);
+    }
+
+    // -- empty-fields branch with BTF param names --
+
+    /// The no-fields branch with a non-empty param_names map. Covers the
+    /// typed-label `{pname} ({ptype})`, the task_struct arm
+    /// (`ptr:{val&0xffff:04x}`), the `ptype == "ptr"` → format_raw_arg
+    /// arm, the scalar decode_named_value arm, and arg_cap derived from
+    /// the param count. Host-only — loc resolution misses the synthetic
+    /// func name and falls back to empty.
+    #[test]
+    fn format_probe_events_param_names_task_ptr_and_typed_label() {
+        use crate::probe::process::ProbeEvent;
+
+        let events = vec![ProbeEvent {
+            func_idx: 0,
+            args: [0xDEAD, 3, 0xffff_8881_0012_3456, 0, 0, 0],
+            fields: vec![], // forces the empty-fields branch
+            ..Default::default()
+        }];
+        let func_names = vec![(0u32, "do_probe".to_string())];
+        let mut param_names = std::collections::HashMap::new();
+        param_names.insert(
+            "do_probe".to_string(),
+            vec![
+                ("prev".to_string(), "task_struct *".to_string()),
+                ("cpu".to_string(), String::new()),
+                ("rq".to_string(), "ptr".to_string()),
+            ],
+        );
+        let out = format_probe_events_with_bpf_locs(
+            &events,
+            &func_names,
+            None,
+            &std::collections::HashMap::new(),
+            None,
+            &param_names,
+            &std::collections::HashMap::new(),
+        );
+
+        // fw = max_field_w = 8 (no fields → unwrap_or(8).max(8)).
+        // i=0: task_struct arm → "ptr:dead" (0xDEAD & 0xffff = 0xdead).
+        // i=1: scalar "cpu" → decode_named_value("","cpu","3") = "3".
+        // i=2: label "rq (ptr)" (a non-empty ptype gets the "(ptype)"
+        //      suffix); value via the "ptr" arm → "ptr:3456".
+        let fw = 8usize;
+        let line0 = format!(
+            "      {l:<fw$}  {d}\n",
+            l = "prev (task_struct *)",
+            d = "ptr:dead"
+        );
+        let line1 = format!("      {l:<fw$}  {d}\n", l = "cpu", d = "3");
+        let line2 = format!("      {l:<fw$}  {d}\n", l = "rq (ptr)", d = "ptr:3456");
+        let block = format!("{line0}{line1}{line2}");
+        assert!(
+            out.contains(&block),
+            "expected param-name block:\n{block}\ngot:\n{out}",
+        );
+    }
+
+    // -- format_cpumask_display partial-word masking --
+
+    /// A non-multiple-of-64 nr_cpus exercises the `valid_bits < 64`
+    /// partial-word mask (line 59): garbage high bits beyond CPU 9 are
+    /// stripped from the displayed hex word. Existing cpumask tests use
+    /// Some(64)/Some(128) where in-range words have valid_bits >= 64, so
+    /// only the unmasked line ran. Host-only direct call.
+    #[test]
+    fn format_cpumask_display_partial_word_masking() {
+        // word 0 = all bits set, nr_cpus = 10 → valid_bits = 10 →
+        // masked word = (1<<10)-1 = 0x3ff; merged decode = "0-9".
+        assert_eq!(
+            format_cpumask_display(&[u64::MAX, 0, 0, 0], Some(10)),
+            "0x3ff(0-9)",
+        );
+    }
+
+    // -- multi-field group header --
+
+    /// A group with >1 field emits a standalone `{label}` header then
+    /// indents each field. Pins exact ordering, indentation, and column
+    /// width for two distinct fields under one struct-pointer label.
+    /// pid/weight decode passthrough; no exit_fields (no arrows).
+    /// Host-only.
+    #[test]
+    fn format_probe_events_multi_field_group_header() {
+        use crate::probe::process::ProbeEvent;
+
+        let events = vec![ProbeEvent {
+            func_idx: 0,
+            fields: vec![
+                ("p:task_struct.pid".to_string(), 42),
+                ("p:task_struct.weight".to_string(), 100),
+            ],
+            ..Default::default()
+        }];
+        let func_names = vec![(0u32, "do_probe".to_string())];
+        let out = format_probe_events(&events, &func_names, None, None);
+
+        // fw = "weight".len().max(8) = 8 (longest field name is "weight").
+        let fw = 8usize;
+        let pid_line = format!("      {f:<fw$}  {v}\n", f = "pid", v = "42");
+        let weight_line = format!("      {f:<fw$}  {v}\n", f = "weight", v = "100");
+        let block = format!("    task_struct *p\n{pid_line}{weight_line}");
+        assert!(
+            out.contains(&block),
+            "expected multi-field group block:\n{block}\ngot:\n{out}",
+        );
     }
 }

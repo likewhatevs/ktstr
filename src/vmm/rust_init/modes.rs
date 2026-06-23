@@ -619,3 +619,76 @@ fn proxy_serial_pty(master: &OwnedFd, child_pid: u32) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `build_include_path` with `/include-files` absent must return
+    /// exactly `/bin` — the unconditional fallback `build_include_path`
+    /// pushes after an empty walk. Exact full-string
+    /// equality (not `.contains("/bin")`) pins three things at once:
+    /// (a) the empty-`BTreeSet` walk path is taken when the
+    /// `/include-files` `is_dir()` is
+    /// false, (b) `/bin` is pushed unconditionally, and
+    /// (c) `join(":")` of a single element produces no leading/trailing
+    /// colon. The host has no `/include-files`, so the absent-dir branch
+    /// is deterministic; the skip-guard keeps the exact-equality from
+    /// tripping on a host that happens to expose a real `/include-files`
+    /// (where the WalkDir loop would add directories and the result
+    /// would no longer be `/bin` alone) — the multi-dir walk branch is
+    /// host-untestable without a path-parameter refactor.
+    #[test]
+    fn build_include_path_returns_bin_only_when_include_dir_absent() {
+        if Path::new("/include-files").exists() {
+            // Only the absent-dir terminal branch is host-reachable;
+            // a present /include-files would make this exact-equality
+            // assert the wrong state. Skip rather than weaken it.
+            return;
+        }
+        assert_eq!(build_include_path(), "/bin");
+    }
+
+    /// `shell_console_device` with `/dev/hvc0` absent must fall back to
+    /// COM2 (its else arm). Exact equality against the COM2
+    /// const (`/dev/ttyS1`, `rust_init::COM2`) pins the specific fallback device
+    /// byte-for-byte rather than a vacuous `!is_empty()`. The const is
+    /// referenced (not the bare literal) so a future COM2 path change
+    /// updates the production const and this assertion together, with no
+    /// drift window. The host has no virtio-console node, so the else
+    /// arm is taken deterministically; the skip-guard prevents the
+    /// assertion from firing on the wrong branch on a host that does
+    /// expose `/dev/hvc0`. The HVC0-present branch needs the device node
+    /// (root + mknod, or a VM) and is not covered here.
+    #[test]
+    fn shell_console_device_falls_back_to_com2_when_hvc0_absent() {
+        if Path::new(HVC0).exists() {
+            return;
+        }
+        assert_eq!(shell_console_device(), super::super::COM2);
+        // Cross-check the const resolves to the documented COM2 path so
+        // the byte-for-byte pin is anchored to a concrete value, not
+        // just to whatever the const happens to be.
+        assert_eq!(shell_console_device(), "/dev/ttyS1");
+    }
+
+    /// `cmdline_val` for a key that cannot appear in the real
+    /// `/proc/cmdline` must return `None` — `cmdline_val`'s
+    /// `find_map`-yields-nothing path where `strip_prefix` never matches.
+    /// Exact `== None` pins that a non-present key returns `None` rather
+    /// than `Some("")`, which a prefix-mishandling or
+    /// whitespace-mishandling bug would produce. Mirrors the existing
+    /// `shell_mode_not_requested_in_test` pattern (tests.rs) that leans
+    /// on the real `/proc/cmdline` lacking the token. This covers only
+    /// the `None` branch; the `Some(value)` extraction path is
+    /// host-untestable because `cmdline_val` hardcodes the
+    /// `/proc/cmdline` read with no injectable path (see the deferred
+    /// list) — a host cannot plant the key in the real cmdline.
+    #[test]
+    fn cmdline_val_absent_key_is_none() {
+        assert_eq!(
+            cmdline_val("KTSTR_UNIT_TEST_SENTINEL_KEY_DOES_NOT_EXIST"),
+            None,
+        );
+    }
+}

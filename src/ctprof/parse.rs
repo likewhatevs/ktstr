@@ -38,8 +38,8 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 /// Parse one PSI file's contents. The kernel emits one or two
-/// lines (`some` then `full`), each formatted by `seq_printf` at
-/// `kernel/sched/psi.c:1284`. Lines are tokenized by whitespace;
+/// lines (`some` then `full`), each formatted by `seq_printf` in
+/// `psi_show()` (`kernel/sched/psi.c`). Lines are tokenized by whitespace;
 /// each token is `key=value`. Unknown keys are ignored so a
 /// future kernel that adds a 4th avg or new field doesn't break
 /// the parser. Missing fields default to 0 (matching the
@@ -72,7 +72,7 @@ pub(super) fn parse_psi(raw: &str) -> PsiResource {
     out
 }
 
-/// Convert `"N.NN"` (kernel `%lu.%02lu` format from psi.c:1284)
+/// Convert `"N.NN"` (kernel `%lu.%02lu` format from `psi_show()`)
 /// to `N * 100 + NN` (centi-percent integer). On malformed input
 /// returns 0, matching the absent-counter default contract.
 /// Saturates at u16::MAX to guard against pathological input.
@@ -176,7 +176,7 @@ pub(super) fn read_sysfs_u64(path: &Path) -> u64 {
 
 /// Read per-cgroup PSI files (`<cgroup>/{cpu,memory,io,irq}.pressure`)
 /// and populate a [`Psi`] bundle. The four files are exposed by
-/// `kernel/cgroup/cgroup.c:5453-5482`; the per-cgroup interface
+/// `cgroup_psi_files[]` (`kernel/cgroup/cgroup.c`); the per-cgroup interface
 /// uses the `<resource>.pressure` filename pattern rather than
 /// the host-level `pressure/<resource>` directory layout.
 pub(super) fn read_cgroup_psi_at(cgroup_root: &Path, path: &str) -> Psi {
@@ -422,15 +422,15 @@ pub(super) struct StatFields {
     pub(super) utime_clock_ticks: Option<u64>,
     pub(super) stime_clock_ticks: Option<u64>,
     /// Field 18: kernel-internal priority (signed, distinct
-    /// from `nice`). `seq_put_decimal_ll(m, " ", priority)` at
-    /// `fs/proc/array.c:602`; the value is the post-bias
+    /// from `nice`). `seq_put_decimal_ll(m, " ", priority)` in
+    /// `do_task_stat()` (`fs/proc/array.c`); the value is the post-bias
     /// scheduler priority (`task_prio(task)`).
     pub(super) priority: Option<i32>,
     pub(super) nice: Option<i32>,
     pub(super) start_time_clock_ticks: Option<u64>,
     pub(super) processor: Option<i32>,
     /// Field 40: real-time priority. `seq_put_decimal_ull(m,
-    /// " ", task->rt_priority)` at `fs/proc/array.c:637`.
+    /// " ", task->rt_priority)` in `do_task_stat()` (`fs/proc/array.c`).
     /// Stored as `u32` to match `unsigned int
     /// task_struct::rt_priority` from `include/linux/sched.h`;
     /// non-zero only when the task runs SCHED_FIFO / SCHED_RR.
@@ -530,9 +530,15 @@ pub(super) fn parse_schedstat(raw: &str) -> (Option<u64>, Option<u64>, Option<u6
 }
 
 /// Read `<proc_root>/<tgid>/task/<tid>/schedstat`. Three-tuple
-/// of `Option<u64>` — kernel without `CONFIG_SCHEDSTATS` yields
-/// all-`None`. Records a `"schedstat"` failure on read error
-/// when a tally is supplied.
+/// of `Option<u64>` — when `CONFIG_SCHED_INFO` is off the proc
+/// entry is absent (the registration is `#ifdef CONFIG_SCHED_INFO`
+/// in `fs/proc/base.c`), so the read fails with ENOENT and yields
+/// all-`None`; the kernel's "0 0 0" zero-fill branch is dead code
+/// for this file (it compiles only when `CONFIG_SCHED_INFO` is on).
+/// `CONFIG_SCHEDSTATS` selects `CONFIG_SCHED_INFO`, so a SCHEDSTATS
+/// kernel always has the file; SCHED_INFO is the minimal gate.
+/// Records a `"schedstat"` failure on read error when a tally is
+/// supplied.
 pub(super) fn read_schedstat_at_with_tally(
     proc_root: &Path,
     tgid: i32,
@@ -625,7 +631,7 @@ pub(super) struct StatusFields {
     /// long enough for the syscall without a race.
     pub(super) cpus_allowed: Option<Vec<u32>>,
     /// `Threads:` value — `signal_struct->nr_threads` snapshot
-    /// per `fs/proc/array.c:290`. Identical across every thread
+    /// per `task_sig()` (`fs/proc/array.c`). Identical across every thread
     /// of the same tgid. The capture site dedups by populating
     /// [`ThreadState::nr_threads`] only on tid == tgid threads
     /// (see `capture_thread_at_with_tally`).
@@ -661,7 +667,7 @@ pub(super) fn parse_status(raw: &str) -> StatusFields {
                 out.cpus_allowed = crate::cpu_util::parse_cpu_list(value);
             }
             // `Threads:\t<num_threads>\n` per
-            // `fs/proc/array.c:290`. Same value across every
+            // `task_sig()` (`fs/proc/array.c`). Same value across every
             // thread of the same tgid; capture-side dedup picks
             // only the leader thread to avoid double-counting.
             "Threads" => {
@@ -764,11 +770,11 @@ pub(super) struct SchedFields {
     pub(super) exec_max: Option<u64>,
     pub(super) slice_max: Option<u64>,
     /// `core_forceidle_sum` from `/proc/<tid>/sched`, emitted via
-    /// `PN_SCHEDSTAT(core_forceidle_sum)` at
-    /// `kernel/sched/debug.c:1335`, build-gated on
+    /// `PN_SCHEDSTAT(core_forceidle_sum)` in
+    /// `proc_sched_show_task()` (`kernel/sched/debug.c`), build-gated on
     /// `CONFIG_SCHED_CORE`. Emission additionally lives inside
-    /// the `if (schedstat_enabled())` block at
-    /// `kernel/sched/debug.c:1285`, so on a host with schedstat
+    /// the `if (schedstat_enabled())` block in
+    /// `proc_sched_show_task()` (`kernel/sched/debug.c`), so on a host with schedstat
     /// off at runtime the line is absent and the parser arm
     /// never fires — leaving the field at `None`.
     /// Dotted ms.ns format like the other PN_SCHEDSTAT fields —
@@ -779,7 +785,7 @@ pub(super) struct SchedFields {
     /// SMT cohort never accumulated forceidle.
     pub(super) core_forceidle_sum: Option<u64>,
     /// `se.slice` from `/proc/<tid>/sched`, emitted via
-    /// `P(se.slice)` at `kernel/sched/debug.c:1364`. Plain
+    /// `P(se.slice)` in `proc_sched_show_task()` (`kernel/sched/debug.c`). Plain
     /// `%lld` integer (NOT dotted ns; the `P` macro uses
     /// `%lld`, not `PN`'s `%lld.%06ld`). Per-thread
     /// `p->se.slice` in nanoseconds. For fair-class tasks
@@ -789,7 +795,7 @@ pub(super) struct SchedFields {
     /// because ext-class schedulers maintain slice in
     /// `p->scx.slice` and do not refresh `p->se.slice`. The
     /// kernel emits this line ONLY when `fair_policy(p->policy)`
-    /// holds, which (per `kernel/sched/sched.h:194,203`) is
+    /// holds, which (per `normal_policy()`/`fair_policy()` (`kernel/sched/sched.h`)) is
     /// true for SCHED_NORMAL, SCHED_BATCH, AND — under
     /// `CONFIG_SCHED_CLASS_EXT` — SCHED_EXT. `None` for
     /// SCHED_DEADLINE / SCHED_RR / SCHED_FIFO / SCHED_IDLE.
@@ -910,8 +916,11 @@ pub(super) fn parsed_ns_from_dotted(value: &str) -> Result<u64, ParseDottedNs> {
     }
 }
 
-/// Parse `/proc/<tgid>/task/<tid>/sched`. Requires
-/// `CONFIG_SCHED_DEBUG`. Format is many lines of `key : value`
+/// Parse `/proc/<tgid>/task/<tid>/sched`. The file is registered
+/// unconditionally (always present); the schedstat-prefixed fields
+/// this reads are emitted only under `CONFIG_SCHEDSTATS` (the
+/// kernel's `if (schedstat_enabled())` block) and are absent
+/// otherwise. Format is many lines of `key : value`
 /// where the key is dot-delimited (`se.statistics.nr_wakeups`);
 /// different kernel versions use `se.statistics.`, `stats.`,
 /// or bare names. The reader matches on the LAST dot-delimited
@@ -1005,8 +1014,8 @@ pub(super) fn parse_sched(raw: &str, tally: &mut Option<&mut ParseTally>) -> Sch
             // ms.ns reconstruction as wait_sum / block_sum.
             "core_forceidle_sum" => out.core_forceidle_sum = parse_dotted(value),
             // P plain integer in ns. The kernel emits this only
-            // for fair-policy tasks (`fair_policy(p->policy)` at
-            // debug.c:1363); for other policies the line is absent
+            // for fair-policy tasks (`fair_policy(p->policy)` in
+            // `proc_sched_show_task()`); for other policies the line is absent
             // and `parsed_u64()` collapses to None.
             "slice" => out.fair_slice_ns = parsed_u64(),
             _ => {}
@@ -1036,12 +1045,12 @@ pub(super) fn read_sched_at_with_tally(
 }
 
 /// Parse `/proc/<pid>/smaps_rollup` contents into a key→u64-kB
-/// map. Format per `__show_smap()` at
-/// `fs/proc/task_mmu.c:1330-1368`: each kv line is
+/// map. Format per `__show_smap()`
+/// (`fs/proc/task_mmu.c`): each kv line is
 /// `<Name>:<whitespace><u64><whitespace>kB`. The kernel ALSO
 /// emits a `<addr_start>-<addr_end> ---p <off> XX:XX <inode> [rollup]`
 /// header line (built by `show_vma_header_prefix()` then
-/// `seq_puts(m, "[rollup]\n")` at `task_mmu.c:1500-1503`). That
+/// `seq_puts(m, "[rollup]\n")` in `show_smaps_rollup()`). That
 /// header CONTAINS a `:` (the device-major:minor pair `XX:XX`),
 /// so a naive `split_once(':')` would mis-extract a junk key
 /// (the whitespace-laden address range + flags + offset prefix)
@@ -1229,8 +1238,8 @@ pub(super) fn parse_max_or_u64_str(s: &str) -> Option<u64> {
 
 /// Default CFS bandwidth period when `cpu.max` is absent or its
 /// period token is unreadable. Matches the kernel default
-/// returned by `default_bw_period_us()` at
-/// `kernel/sched/sched.h:441`; child cgroups inherit this when
+/// returned by `default_bw_period_us()`
+/// (`kernel/sched/sched.h`); child cgroups inherit this when
 /// `cpu.max` is unset.
 pub(super) const CPU_MAX_DEFAULT_PERIOD_US: u64 = 100_000;
 

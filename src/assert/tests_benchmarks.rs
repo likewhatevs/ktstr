@@ -92,8 +92,8 @@ fn assert_benchmarks_p99_n100_below_old_p100_passes() {
 
 #[test]
 fn assert_not_starved_p99_n100_is_99_microseconds() {
-    // assert_not_starved exposes p99 as microseconds via
-    // ScenarioStats. Samples = [1000, 2000, ..., 100_000] ns
+    // assert_not_starved computes p99 as microseconds on the per-cgroup
+    // CgroupStats. Samples = [1000, 2000, ..., 100_000] ns
     // (100 values at kilo-ns spacing) so the reported p99 is
     // exactly 99.0us with the correct index
     // (sorted[ceil(100*0.99) - 1] = sorted[98] = 99_000ns = 99us).
@@ -102,9 +102,9 @@ fn assert_not_starved_p99_n100_is_99_microseconds() {
     let reports = [rpt_with_latencies(1, latencies, 100, 5_000_000_000)];
     let r = assert_not_starved(&reports);
     assert_eq!(
-        r.stats.worst_p99_wake_latency_us, 99.0,
+        r.stats.cgroups[0].p99_wake_latency_us, 99.0,
         "p99 must equal 99.0us (sorted[98] = 99_000ns), got {}us",
-        r.stats.worst_p99_wake_latency_us
+        r.stats.cgroups[0].p99_wake_latency_us
     );
 }
 
@@ -167,15 +167,14 @@ fn assert_p99_ns_threshold_compares_against_ns_latencies() {
          1000 (treating it as µs)",
     );
 
-    // Cross-check the reporting path: `assert_not_starved`
-    // populates `worst_p99_wake_latency_us` in MICROSECONDS
-    // (ns / 1000). A regression that conflated the reporting
-    // field with the threshold input would surface as either
-    // `us == ns` (forgot to divide) or `us == ns/1_000_000`
-    // (double-converted).
+    // Cross-check the reporting path: `assert_not_starved` computes
+    // `CgroupStats::p99_wake_latency_us` in MICROSECONDS (ns / 1000). A
+    // regression that conflated the reporting field with the threshold input
+    // would surface as either `us == ns` (forgot to divide) or
+    // `us == ns/1_000_000` (double-converted).
     let stats = assert_not_starved(&reports);
     assert_eq!(
-        stats.stats.worst_p99_wake_latency_us, 5.0,
+        stats.stats.cgroups[0].p99_wake_latency_us, 5.0,
         "5000 ns / 1000 = 5.0 µs — if this renders as 5000 (forgot /1000) \
          or 0.005 (extra /1000), the reporting-path unit conversion drifted",
     );
@@ -350,6 +349,13 @@ fn assert_benchmarks_wake_latency_cv_zero_mean_yields_inconclusive() {
 }
 
 // -- wake latency stats in assert_not_starved --
+//
+// These assert the PER-CGROUP reductions (`r.stats.cgroups[0].*`), the
+// source CgroupStats fields. The run-level surface that re-pools them
+// (the deleted `r.stats.worst_*` roll-ups, now ext-sourced Distribution
+// metrics) is covered separately: `repool_distribution_value_for_value_
+// with_cgroup_stats` (tests_phase_bucket.rs) pins that a single-cgroup
+// run's run-level pooled value reproduces these cgroup_stats reductions.
 
 #[test]
 fn not_starved_wake_latency_stats() {
@@ -359,13 +365,13 @@ fn not_starved_wake_latency_stats() {
     ];
     let r = assert_not_starved(&reports);
     assert!(r.is_pass(), "{:?}", r.outcomes);
-    let s = &r.stats;
+    let cg = &r.stats.cgroups[0];
     // p99 of [1000,2000,3000,4000,5000,6000,7000,8000,9000,10000] in us:
     // sorted, percentile index = ceil(10*0.99) - 1 = 9 -> sorted[9] = 10000ns = 10.0us
     assert!(
-        s.worst_p99_wake_latency_us > 9.0,
+        cg.p99_wake_latency_us > 9.0,
         "p99: {}",
-        s.worst_p99_wake_latency_us
+        cg.p99_wake_latency_us
     );
     // median of 10 samples via `percentile(sorted, 0.5)`:
     // nearest-rank index = ceil(10 * 0.5) - 1 = 4 →
@@ -373,16 +379,12 @@ fn not_starved_wake_latency_stats() {
     // bound matches the convention documented on
     // `CgroupStats::median_wake_latency_us`.
     assert!(
-        (s.worst_median_wake_latency_us - 5.0).abs() < 0.1,
+        (cg.median_wake_latency_us - 5.0).abs() < 0.1,
         "median: {}",
-        s.worst_median_wake_latency_us
+        cg.median_wake_latency_us
     );
-    assert!(
-        s.worst_wake_latency_cv > 0.0,
-        "cv: {}",
-        s.worst_wake_latency_cv
-    );
-    assert_eq!(s.total_iterations, 300);
+    assert!(cg.wake_latency_cv > 0.0, "cv: {}", cg.wake_latency_cv);
+    assert_eq!(r.stats.total_iterations, 300);
 }
 
 #[test]
@@ -390,9 +392,9 @@ fn not_starved_empty_latencies_zero_stats() {
     let reports = [rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 50)];
     let r = assert_not_starved(&reports);
     assert!(r.is_pass());
-    assert_eq!(r.stats.worst_p99_wake_latency_us, 0.0);
-    assert_eq!(r.stats.worst_median_wake_latency_us, 0.0);
-    assert_eq!(r.stats.worst_wake_latency_cv, 0.0);
+    assert_eq!(r.stats.cgroups[0].p99_wake_latency_us, 0.0);
+    assert_eq!(r.stats.cgroups[0].median_wake_latency_us, 0.0);
+    assert_eq!(r.stats.cgroups[0].wake_latency_cv, 0.0);
 }
 
 #[test]
@@ -405,15 +407,15 @@ fn not_starved_run_delay_stats() {
     assert!(r.is_pass(), "{:?}", r.outcomes);
     // mean_run_delay = (100 + 300) / 2 = 200us
     assert!(
-        (r.stats.worst_mean_run_delay_us - 200.0).abs() < 0.1,
+        (r.stats.cgroups[0].mean_run_delay_us - 200.0).abs() < 0.1,
         "mean: {}",
-        r.stats.worst_mean_run_delay_us
+        r.stats.cgroups[0].mean_run_delay_us
     );
     // worst_run_delay = 300us
     assert!(
-        (r.stats.worst_run_delay_us - 300.0).abs() < 0.1,
+        (r.stats.cgroups[0].worst_run_delay_us - 300.0).abs() < 0.1,
         "worst: {}",
-        r.stats.worst_run_delay_us
+        r.stats.cgroups[0].worst_run_delay_us
     );
 }
 

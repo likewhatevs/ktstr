@@ -182,6 +182,7 @@ fn fault_under_lock(ctx: &WorkerCtx) -> WorkerReport {
         is_messenger: false,
         group_idx: 0,
         affinity_error: None,
+        phase_slices: vec![],
     }
 }
 
@@ -213,6 +214,7 @@ fn zeroed_report(tid: libc::pid_t, start: Instant) -> WorkerReport {
         is_messenger: false,
         group_idx: 0,
         affinity_error: None,
+        phase_slices: vec![],
     }
 }
 

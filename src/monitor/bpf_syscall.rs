@@ -98,10 +98,15 @@ const MAX_ARENA_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const MAX_ARENA_PAGES: u64 = 16 * 1024;
 
 // `bpf_attr` is a uapi union with many command-specific shapes. Rather
-// than declare a full union we lay out per-command structs that match
-// the relevant union arm exactly (uapi-stable size + field order). The
-// kernel verifies the size passed to the syscall matches one of the
-// recognized arm lengths; we pass `size_of::<arm>()` for each.
+// than declare the full union we lay out per-command structs covering
+// the fields each command reads, in uapi field order; some are a prefix
+// of the full arm (e.g. `BpfAttrGetId` omits the trailing token fd). The
+// kernel does NOT match the passed size against a per-arm length:
+// `__sys_bpf` (kernel/bpf/syscall.c) calls `bpf_check_uarg_tail_zero`,
+// clamps `size = min(size, sizeof(union bpf_attr))`, zero-fills `attr`,
+// then dispatches on `cmd`. Any size up to `sizeof(union bpf_attr)` is
+// accepted provided bytes past `size` are zero; we pass
+// `size_of::<arm>()` and the kernel zero-fills the union tail we omit.
 
 /// `bpf_attr` arm for `BPF_MAP_*_ELEM` and `BPF_MAP_GET_NEXT_KEY`.
 /// Source: `include/uapi/linux/bpf.h::union bpf_attr` (the
@@ -181,13 +186,18 @@ struct BpfBtfInfoUapi {
 
 /// Raw `bpf(2)` syscall wrapper. Returns the kernel's return value as
 /// `i64` so callers can check for `< 0` and inspect `errno`. The
-/// kernel's `__sys_bpf` (`kernel/bpf/syscall.c`) verifies the `size`
-/// argument matches a recognized `bpf_attr` arm length.
+/// kernel's `__sys_bpf` (`kernel/bpf/syscall.c`) accepts any `size` up
+/// to `sizeof(union bpf_attr)`: `bpf_check_uarg_tail_zero` rejects only
+/// bytes past `size` that are nonzero, then it clamps to
+/// `sizeof(union bpf_attr)`, zero-fills the rest, and dispatches on
+/// `cmd` — there is no per-arm length match.
 ///
-/// SAFETY: `attr_ptr` must be a valid pointer to `attr_size` bytes of
-/// the appropriate `bpf_attr` arm. The kernel reads the union by size,
-/// so passing a smaller-than-required arm causes -EINVAL; passing a
-/// larger one is rejected as well.
+/// SAFETY: `attr_ptr` must point to `attr_size` valid bytes laid out as
+/// the command's `bpf_attr` arm (or a zero-tailed prefix of it). A size
+/// smaller than the command needs is accepted — the kernel zero-fills
+/// the omitted fields — so the caller, not the kernel, must supply every
+/// field the command requires. A size above `PAGE_SIZE`, or one whose
+/// bytes past the union are nonzero, returns `-E2BIG`.
 unsafe fn bpf_syscall(cmd: u32, attr_ptr: *const u8, attr_size: usize) -> i64 {
     // SAFETY: caller must ensure attr_ptr/attr_size validity. The
     // syscall itself is signal-safe and reentrant.
@@ -438,16 +448,41 @@ impl BpfSyscallAccessor {
     /// Look up the pinned fd for a map identified by its
     /// `BpfMapInfo`. Returns `None` when no pinned map matches.
     ///
-    /// Match key: `name` field. Map ids would be more precise but
-    /// they're not part of `BpfMapInfo` today (a known follow-up if
-    /// the live-host backend grows other consumers); within a single
-    /// scheduler instance, names are unique and stable for the
-    /// duration of the run.
+    /// Match key: `name` field (via [`info_name_matches`]). Map ids
+    /// would be more precise but they're not part of `BpfMapInfo`
+    /// today (a known follow-up if the live-host backend grows other
+    /// consumers); within a single scheduler instance, names are
+    /// unique and stable for the duration of the run.
     fn pinned_for(&self, target: &BpfMapInfo) -> Option<&PinnedMap> {
         self.maps
             .iter()
-            .find(|p| p.info.name_bytes_active() == target.name_bytes_active())
+            .find(|p| info_name_matches(&p.info, target))
     }
+}
+
+/// Match key for [`BpfSyscallAccessor::pinned_for`] and the
+/// construction-time predicate filter: two `BpfMapInfo`s identify the
+/// same map iff their active name bytes
+/// ([`BpfMapInfo::name_bytes_active`]) are byte-equal. Extracted as a
+/// free fn so the keep/discard semantics are exercisable over a
+/// hand-built `&[BpfMapInfo]` fixture without the live-kernel walk.
+fn info_name_matches(a: &BpfMapInfo, b: &BpfMapInfo) -> bool {
+    a.name_bytes_active() == b.name_bytes_active()
+}
+
+/// Pure mirror of the construction-time keep/discard step in
+/// [`BpfSyscallAccessor::from_running_kernel_filtered`]: returns the
+/// subset of `infos` for which `predicate` returns `true`, preserving
+/// order. The production constructor applies the same
+/// `if !predicate(&info) { continue; }` gate inline against each map
+/// freshly fetched from the kernel; this fn lets a test pin the
+/// filter's keep/discard contract over a deterministic fixture.
+#[cfg(test)]
+fn select_keeping<F>(infos: &[BpfMapInfo], mut predicate: F) -> Vec<&BpfMapInfo>
+where
+    F: FnMut(&BpfMapInfo) -> bool,
+{
+    infos.iter().filter(|info| predicate(info)).collect()
 }
 
 /// Fetch `bpf_map_info` for an open map fd via
@@ -1075,9 +1110,12 @@ mod tests {
 
     #[test]
     fn bpf_attr_get_id_size() {
-        // GET_NEXT_ID / GET_FD_BY_ID arm: 12 bytes (4 + 4 + 4)
-        // — the kernel doesn't pad this struct to 8 bytes; size
-        // matches the union arm exactly.
+        // GET_NEXT_ID / GET_FD_BY_ID: we pass a 12-byte prefix
+        // (start_id/id + next_id + open_flags) =
+        // offsetofend(union bpf_attr, open_flags). The full kernel arm
+        // is 16 bytes — it adds a trailing fd_by_id_token_fd, which the
+        // kernel zero-fills since we omit it (matching how libbpf sizes
+        // these calls). This pins our 12-byte prefix, NOT the arm.
         assert_eq!(std::mem::size_of::<BpfAttrGetId>(), 12);
     }
 
@@ -1087,31 +1125,45 @@ mod tests {
         assert_eq!(std::mem::size_of::<BpfAttrInfoByFd>(), 16);
     }
 
-    /// `bpf_map_info` must be at least the historical minimum
-    /// (the kernel rejects info_len smaller than its known floor).
-    /// Modern kernels accept the full struct including map_extra.
+    /// Pin every field offset of [`BpfMapInfoUapi`] against the kernel
+    /// `struct bpf_map_info` (include/uapi/linux/bpf.h). The kernel
+    /// writes this struct on `BPF_OBJ_GET_INFO_BY_FD`, so a single
+    /// shifted offset makes `obj_get_info_map` read garbage from the
+    /// wrong field (e.g. `value_size` out of `max_entries`) with no
+    /// runtime error. Pinning only `map_type`@0 and `name`@24 would miss
+    /// a field insertion between `map_flags` and the tail, so every
+    /// offset the struct exposes is asserted explicitly.
     ///
-    /// Verdict-routed so a multi-field uapi-shape regression
-    /// surfaces every drift in one run rather than failing on
-    /// the first mismatch.
+    /// Verdict-routed so a multi-field uapi-shape regression surfaces
+    /// every drift in one run rather than failing on the first mismatch.
     #[test]
     fn bpf_map_info_uapi_layout() {
         use crate::assert::Verdict;
-
-        let off_map_type = std::mem::offset_of!(BpfMapInfoUapi, map_type);
-        let off_name = std::mem::offset_of!(BpfMapInfoUapi, name);
-        let total_size = std::mem::size_of::<BpfMapInfoUapi>();
-        let off_map_extra = std::mem::offset_of!(BpfMapInfoUapi, map_extra);
-        let map_extra_tail = off_map_extra + 8;
+        use std::mem::offset_of;
 
         let mut v = Verdict::new();
-        // map_type at offset 0 per uapi.
-        crate::claim!(v, off_map_type).eq(0usize);
-        // name at offset 24 per uapi.
-        crate::claim!(v, off_name).eq(24usize);
-        // map_extra is the trailing field — its offset + 8 should
-        // equal total struct size.
-        crate::claim!(v, map_extra_tail).eq(total_size);
+        // Offsets per `struct bpf_map_info`: u32 fields packed, name[16]
+        // at 24, u64 fields 8-aligned. Matches the kernel header.
+        crate::claim!(v, offset_of!(BpfMapInfoUapi, map_type)).eq(0usize);
+        crate::claim!(v, offset_of!(BpfMapInfoUapi, id)).eq(4usize);
+        crate::claim!(v, offset_of!(BpfMapInfoUapi, key_size)).eq(8usize);
+        crate::claim!(v, offset_of!(BpfMapInfoUapi, value_size)).eq(12usize);
+        crate::claim!(v, offset_of!(BpfMapInfoUapi, max_entries)).eq(16usize);
+        crate::claim!(v, offset_of!(BpfMapInfoUapi, map_flags)).eq(20usize);
+        crate::claim!(v, offset_of!(BpfMapInfoUapi, name)).eq(24usize);
+        crate::claim!(v, offset_of!(BpfMapInfoUapi, ifindex)).eq(40usize);
+        crate::claim!(v, offset_of!(BpfMapInfoUapi, btf_vmlinux_value_type_id)).eq(44usize);
+        crate::claim!(v, offset_of!(BpfMapInfoUapi, netns_dev)).eq(48usize);
+        crate::claim!(v, offset_of!(BpfMapInfoUapi, netns_ino)).eq(56usize);
+        crate::claim!(v, offset_of!(BpfMapInfoUapi, btf_id)).eq(64usize);
+        crate::claim!(v, offset_of!(BpfMapInfoUapi, btf_key_type_id)).eq(68usize);
+        crate::claim!(v, offset_of!(BpfMapInfoUapi, btf_value_type_id)).eq(72usize);
+        // `_pad` mirrors the kernel's `btf_vmlinux_id` at offset 76.
+        crate::claim!(v, offset_of!(BpfMapInfoUapi, _pad)).eq(76usize);
+        crate::claim!(v, offset_of!(BpfMapInfoUapi, map_extra)).eq(80usize);
+        // `map_extra` is the trailing field we read; our struct ends at
+        // offset 88 (the kernel's hash/hash_size past it are not read).
+        crate::claim!(v, std::mem::size_of::<BpfMapInfoUapi>()).eq(88usize);
         let r = v.into_result();
         assert!(
             r.is_pass(),
@@ -1139,22 +1191,392 @@ mod tests {
         }
     }
 
-    /// Sized return for an empty enumeration is an empty vec, not
-    /// an error. Construction must succeed even on systems with no
-    /// BPF maps (rare but possible — minimal containers, fresh
-    /// boots before any BPF program loads).
+    /// Build a `BpfMapInfo` whose only populated field is the active
+    /// name — the key both the construction-time predicate filter
+    /// and `pinned_for` match on.
+    fn info_named(name: &str) -> BpfMapInfo {
+        let bytes = name.as_bytes();
+        assert!(bytes.len() <= BPF_OBJ_NAME_LEN, "test name too long");
+        let mut name_bytes = [0u8; BPF_OBJ_NAME_LEN];
+        name_bytes[..bytes.len()].copy_from_slice(bytes);
+        BpfMapInfo {
+            name_bytes,
+            name_len: bytes.len() as u8,
+            ..Default::default()
+        }
+    }
+
+    /// The construction-time keep/discard filter
+    /// ([`select_keeping`], the pure mirror of
+    /// `from_running_kernel_filtered`'s inline predicate gate) keeps
+    /// exactly the maps the predicate accepts: a predicate matching
+    /// no names yields the empty set; a name-suffix predicate yields
+    /// exactly the matching subset, in order.
     #[test]
     fn predicate_filters_pinned_set() {
-        // We can't actually invoke the kernel from this test
-        // without root + a running scheduler, but we can verify
-        // that the predicate signature compiles and the explicit
-        // type annotation matches the trait shape callers will
-        // use.
-        fn _check_predicate_shape() {
-            let _ =
-                BpfSyscallAccessor::from_running_kernel_filtered(|_info: &BpfMapInfo| -> bool {
-                    false
-                });
+        let infos = vec![
+            info_named("scx_central"),
+            info_named("central_dsq"),
+            info_named("cilium_lb"),
+            info_named("central_data"),
+        ];
+
+        // Match-nothing predicate ⇒ empty kept set.
+        let none = select_keeping(&infos, |_| false);
+        assert!(none.is_empty(), "false predicate must discard every map");
+
+        // Match-everything predicate ⇒ full set, order preserved.
+        let all = select_keeping(&infos, |_| true);
+        assert_eq!(all.len(), 4, "true predicate must keep every map");
+        assert_eq!(all[0].name(), "scx_central");
+        assert_eq!(all[3].name(), "central_data");
+
+        // Name-suffix predicate ⇒ exactly the "central"-bearing subset.
+        let kept = select_keeping(&infos, |i| i.name().contains("central"));
+        let kept_names: Vec<String> = kept.iter().map(|i| i.name().to_string()).collect();
+        assert_eq!(
+            kept_names,
+            vec!["scx_central", "central_dsq", "central_data"],
+            "suffix predicate must keep exactly the matching subset, in order",
+        );
+
+        // The same name-match key drives pinned_for: a target sharing
+        // active name bytes matches; a differing name does not.
+        assert!(
+            info_name_matches(&info_named("central_dsq"), &info_named("central_dsq")),
+            "identical active name bytes must match",
+        );
+        assert!(
+            !info_name_matches(&info_named("central_dsq"), &info_named("central_data")),
+            "differing active name bytes must NOT match",
+        );
+        // name_len bounds the compared region: a longer NUL-padded
+        // buffer with a shorter name_len compares only the active
+        // prefix, so "scx" (len 3) does not match "scx_central".
+        assert!(
+            !info_name_matches(&info_named("scx"), &info_named("scx_central")),
+            "name_len must bound the match to the active prefix",
+        );
+    }
+
+    /// A cheap real fd for a test [`PinnedMap`]. `pinned_for` only
+    /// compares names and never dereferences `.fd`, and every accessor
+    /// read path under test returns at an early guard before the fd
+    /// reaches a `bpf()` syscall — so any open fd suffices to satisfy
+    /// the `OwnedFd` field. `/dev/null`
+    /// is always present on Linux and `File` -> `OwnedFd` is the
+    /// std-only conversion (no extra libc unsafe).
+    fn dummy_fd() -> OwnedFd {
+        OwnedFd::from(
+            std::fs::File::open("/dev/null").expect("/dev/null must open on Linux test host"),
+        )
+    }
+
+    /// Build a [`PinnedMap`] from `info` + `map_extra`, carrying the
+    /// dummy fd. The fields are private to the parent module; the
+    /// `tests` child module can name and construct them directly,
+    /// which is the inject seam the blueprint requires (no live
+    /// kernel walk, no `from_running_kernel*` syscall path).
+    fn pinned(info: BpfMapInfo, map_extra: u64) -> PinnedMap {
+        PinnedMap {
+            info,
+            fd: dummy_fd(),
+            map_extra,
         }
+    }
+
+    /// Build a [`BpfSyscallAccessor`] holding exactly `maps`. The
+    /// production constructors (`from_running_kernel*`) only ever
+    /// populate `maps` via the live bpf(2) id walk; this literal is
+    /// the host-test inject seam that lets the early-guard branches
+    /// run without a kernel.
+    fn accessor(maps: Vec<PinnedMap>) -> BpfSyscallAccessor {
+        BpfSyscallAccessor { maps }
+    }
+
+    /// `read_array` returns `None` on three rejections. Two are
+    /// structurally pre-fd through the inject seam: the no-name-match
+    /// (`pinned_for` -> None) returns before there is any fd, and the
+    /// wrong-map-type guard returns before building the lookup attr.
+    /// The `key >= max_entries` guard also returns `None`, but on this
+    /// dummy-fd accessor that is indistinguishable from letting the
+    /// `bpf()` `BPF_MAP_LOOKUP_ELEM` run on the bad fd
+    /// (`-EINVAL` -> `None`) — so for a scalar `Option` return the
+    /// key-bound case pins the rejection VALUE, not guard-precedence
+    /// over the syscall (proving that needs a live map). The
+    /// `key < max_entries` success path issues a real lookup and is NOT
+    /// asserted here.
+    #[test]
+    fn read_array_pre_lookup_guards_reject() {
+        let arr = BpfMapInfo {
+            map_type: BPF_MAP_TYPE_ARRAY,
+            max_entries: 4,
+            value_size: 8,
+            ..info_named("arr")
+        };
+        let acc = accessor(vec![pinned(arr.clone(), 0)]);
+
+        // No pinned map matches the target name -> pinned_for None.
+        assert_eq!(acc.read_array(&info_named("missing"), 0), None);
+
+        // Name matches but map_type is HASH, not ARRAY -> type-reject.
+        let hash = BpfMapInfo {
+            map_type: BPF_MAP_TYPE_HASH,
+            ..info_named("arr")
+        };
+        assert_eq!(acc.read_array(&hash, 0), None);
+
+        // key == max_entries and key > max_entries both reject before
+        // the lookup (the kernel index_mask is a Spectre bound, the
+        // explicit `key >= max_entries` is the range check).
+        assert_eq!(acc.read_array(&arr, 4), None);
+        assert_eq!(acc.read_array(&arr, 99), None);
+    }
+
+    /// `read_value` returns `None` on two rejections. The no-name-match
+    /// (`pinned_for` -> None) is structurally pre-fd — there is no map,
+    /// hence no fd to look up. The wrong-map-type rejection (neither
+    /// ARRAY nor STRUCT_OPS) also returns `None`, but on this dummy-fd
+    /// accessor that is indistinguishable from letting the `bpf()`
+    /// lookup run on the bad fd (`-EINVAL` -> `None`), so it pins the
+    /// rejection VALUE rather than guard-precedence over the syscall.
+    /// The post-lookup window-bounds / `checked_add` guards sit past the
+    /// live lookup and need a real map; they are NOT asserted here.
+    #[test]
+    fn read_value_pre_lookup_type_reject() {
+        // PERCPU_HASH is neither ARRAY nor STRUCT_OPS.
+        let percpu_hash = BpfMapInfo {
+            map_type: BPF_MAP_TYPE_PERCPU_HASH,
+            value_size: 8,
+            ..info_named("v")
+        };
+        let acc = accessor(vec![pinned(percpu_hash.clone(), 0)]);
+
+        assert_eq!(acc.read_value(&info_named("nomatch"), 0, 4), None);
+        assert_eq!(acc.read_value(&percpu_hash, 0, 4), None);
+    }
+
+    /// `iter_hash_map` returns an empty `Vec`. The no-name-match
+    /// let-else is structurally pre-fd (no map, no fd). The type-reject
+    /// (only HASH and LRU_HASH proceed) also returns empty, but on this
+    /// dummy-fd accessor that is indistinguishable from the walk loop
+    /// issuing `BPF_MAP_GET_NEXT_KEY` on the bad fd and breaking on the
+    /// error — so it pins the empty RESULT, not guard-precedence over
+    /// the syscall. The populated iteration path needs a live hash map.
+    #[test]
+    fn iter_hash_map_pre_walk_guards_empty() {
+        let arr = BpfMapInfo {
+            map_type: BPF_MAP_TYPE_ARRAY,
+            ..info_named("h")
+        };
+        let acc = accessor(vec![pinned(arr.clone(), 0)]);
+
+        // No pinned match -> let-else returns Vec::new().
+        assert_eq!(acc.iter_hash_map(&info_named("none")).len(), 0);
+        // Name matches but map_type is ARRAY, not HASH/LRU_HASH.
+        assert_eq!(acc.iter_hash_map(&arr).len(), 0);
+    }
+
+    /// `read_percpu_array` returns an empty `Vec` (length 0) on the
+    /// three pre-lookup guards: the no-name-match (`pinned_for` ->
+    /// None), the wrong-map-type guard, and the `key >= max_entries`
+    /// guard. The length distinguishes these from the
+    /// post-lookup-failure branch which returns `vec![None; num_cpus]`
+    /// (length `num_cpus`), so the assertions pin LENGTH 0, not just
+    /// emptiness-of-content.
+    #[test]
+    fn read_percpu_array_pre_lookup_guards_empty() {
+        let pa = BpfMapInfo {
+            map_type: BPF_MAP_TYPE_PERCPU_ARRAY,
+            max_entries: 2,
+            value_size: 8,
+            ..info_named("pa")
+        };
+        let acc = accessor(vec![pinned(pa.clone(), 0)]);
+
+        // No pinned match.
+        assert_eq!(acc.read_percpu_array(&info_named("x"), 0, 4).len(), 0);
+        // Name matches but map_type is ARRAY, not PERCPU_ARRAY.
+        let arr = BpfMapInfo {
+            map_type: BPF_MAP_TYPE_ARRAY,
+            ..info_named("pa")
+        };
+        assert_eq!(acc.read_percpu_array(&arr, 0, 4).len(), 0);
+        // key == max_entries rejects with length 0 (distinct from the
+        // num_cpus-length lookup-failure vector).
+        assert_eq!(acc.read_percpu_array(&pa, 2, 4).len(), 0);
+    }
+
+    /// `iter_percpu_hash_map` returns an empty `PerCpuHashEntries`. The
+    /// no-name-match let-else is structurally pre-fd (no map, no fd).
+    /// The type-reject (only PERCPU_HASH and LRU_PERCPU_HASH proceed)
+    /// also returns empty, but on this dummy-fd accessor that is
+    /// indistinguishable from the walk loop breaking on the bad fd — so
+    /// it pins the empty RESULT, not guard-precedence over the syscall.
+    /// The populated walk path needs a live map.
+    #[test]
+    fn iter_percpu_hash_map_pre_walk_guards_empty() {
+        let hash = BpfMapInfo {
+            map_type: BPF_MAP_TYPE_HASH,
+            ..info_named("ph")
+        };
+        let acc = accessor(vec![pinned(hash.clone(), 0)]);
+
+        // No pinned match.
+        assert_eq!(acc.iter_percpu_hash_map(&info_named("none"), 4).len(), 0);
+        // Name matches but map_type is HASH, not PERCPU_HASH/LRU_PERCPU_HASH.
+        assert_eq!(acc.iter_percpu_hash_map(&hash, 4).len(), 0);
+    }
+
+    /// `read_arena_pages` has three isolable, fd-free blocks ahead of
+    /// the `mmap`: the no-name-match (`pinned_for` -> None ->
+    /// `ArenaSnapshot::default()`), the wrong-map-type guard (->
+    /// default), and the declared-span math + `declared_pages == 0`
+    /// early return. The span math is pure:
+    /// `declared_bytes_raw = max_entries * 4096` (saturating),
+    /// `span_capped = declared_bytes_raw > MAX_ARENA_BYTES` (4 GiB),
+    /// and the zero-page snapshot carries `user_vm_start = map_extra`.
+    /// The populated mmap/mincore path needs a live arena fd.
+    #[test]
+    fn read_arena_pages_pre_mmap_paths() {
+        // A 3-field literal: BpfArenaOffsets derives only Debug+Clone
+        // (no Default), and the value is unused on every path under
+        // test (the fn parameter `_arena_offsets` is ignored), so the
+        // concrete offsets are arbitrary.
+        let offsets = BpfArenaOffsets {
+            arena_kern_vm: 0,
+            arena_user_vm_start: 0,
+            vm_struct_addr: 0,
+        };
+
+        // max_entries == 0 -> declared_pages == 0 early return,
+        // carrying user_vm_start = map_extra.
+        let arena0 = BpfMapInfo {
+            map_type: BPF_MAP_TYPE_ARENA,
+            max_entries: 0,
+            ..info_named("a")
+        };
+        let acc = accessor(vec![pinned(arena0.clone(), 0x1000)]);
+
+        // No name match -> ArenaSnapshot::default() (all-zero).
+        let no_match = acc.read_arena_pages(&info_named("no"), &offsets);
+        assert!(no_match.pages.is_empty());
+        assert_eq!(no_match.declared_pages, 0);
+        assert_eq!(no_match.user_vm_start, 0);
+        assert!(!no_match.span_capped);
+        assert!(!no_match.truncated);
+
+        // Name matches but map_type is ARRAY, not ARENA -> default.
+        let arr = BpfMapInfo {
+            map_type: BPF_MAP_TYPE_ARRAY,
+            ..info_named("a")
+        };
+        let type_reject = acc.read_arena_pages(&arr, &offsets);
+        assert!(type_reject.pages.is_empty());
+        assert_eq!(type_reject.declared_pages, 0);
+        assert_eq!(type_reject.user_vm_start, 0);
+        assert!(!type_reject.span_capped);
+
+        // declared_pages == 0 path: empty pages, span not capped,
+        // user_vm_start carried through from map_extra.
+        let zero = acc.read_arena_pages(&arena0, &offsets);
+        assert_eq!(zero.pages.len(), 0);
+        assert_eq!(zero.declared_pages, 0);
+        assert!(!zero.span_capped);
+        assert_eq!(zero.user_vm_start, 0x1000);
+        assert!(!zero.truncated);
+
+        // max_entries == u32::MAX -> declared_bytes_raw =
+        // 0xFFFF_FFFF * 4096 > 4 GiB, so span_capped is set. With the
+        // span capped to MAX_ARENA_BYTES, declared_pages > 0, so the
+        // span-math result is only observable on this sub-case
+        // through the MAP_FAILED snapshot or a populated walk — both
+        // need a live fd. The dummy /dev/null fd makes mmap fail
+        // (MAP_FAILED), exercising the MAP_FAILED early return,
+        // which carries span_capped + user_vm_start. Assert exactly
+        // those two carry-through fields, which the blueprint marks
+        // host-assertable.
+        let arena_max = BpfMapInfo {
+            map_type: BPF_MAP_TYPE_ARENA,
+            max_entries: u32::MAX,
+            ..info_named("a")
+        };
+        let acc_max = accessor(vec![pinned(arena_max.clone(), 0x2000)]);
+        let capped = acc_max.read_arena_pages(&arena_max, &offsets);
+        assert!(capped.span_capped, "u32::MAX max_entries must cap the span");
+        assert_eq!(capped.user_vm_start, 0x2000);
+    }
+
+    /// `load_program_btf` returns `None` immediately when
+    /// `btf_id == 0` (`btf_id = map.btf_kva as u32`). `info_named`
+    /// leaves `btf_kva` at its `Default` (0), so the guard fires before
+    /// the `BPF_BTF_GET_FD_BY_ID` syscall and the `base_btf` argument is
+    /// never dereferenced (it is only used on the post-fetch arms). Only
+    /// this guard is host-assertable; the BTF-fetch path needs a live
+    /// kernel BTF object.
+    #[test]
+    fn load_program_btf_btf_id_zero_returns_none() {
+        // info_named leaves btf_kva == 0 (Default).
+        let prog = info_named("prog");
+        assert_eq!(prog.btf_kva, 0, "info_named must default btf_kva to 0");
+        let acc = accessor(vec![pinned(prog.clone(), 0)]);
+
+        // base_btf: a minimal valid BTF blob — magic 0xEB9F, version 1,
+        // 24-byte header, one Int type (id 1) so the type section is
+        // non-empty, strtab leading with NUL. Mirrors the
+        // `cast_analysis` tests' `build_btf` minimal layout. Never
+        // dereferenced on the btf_id==0 path; built only to satisfy
+        // the `&Btf` parameter.
+        let base = minimal_btf();
+        // `btf_rs::Btf` derives neither `PartialEq` nor `Debug`, so
+        // `assert_eq!(.., None)` cannot be used on `Option<Btf>`;
+        // `is_none()` is the exact discriminant check here (the
+        // btf_id==0 guard returns the `None` variant outright, with
+        // no `Btf` value to compare).
+        assert!(
+            acc.load_program_btf(&prog, &base).is_none(),
+            "btf_id==0 must short-circuit to None before any bpf() call",
+        );
+    }
+
+    /// Hand-build a minimal parseable BTF blob: a single `int` type
+    /// (id 1, named "u64", 8 bytes) plus a NUL-led string table,
+    /// wrapped in the 24-byte BTF header. Layout verified against the
+    /// in-tree `src/monitor/cast_analysis/tests/mod.rs::build_btf`
+    /// minimal path (the `empty_btf_no_panic` test proves a
+    /// single-Int blob parses via `Btf::from_bytes`).
+    fn minimal_btf() -> Btf {
+        // String table: leading NUL (offset 0 = anonymous) + "u64\0".
+        let mut strings: Vec<u8> = vec![0];
+        let n_u64 = strings.len() as u32;
+        strings.extend_from_slice(b"u64\0");
+
+        // Type section: one BTF_KIND_INT (kind 1).
+        let mut type_section: Vec<u8> = Vec::new();
+        const BTF_KIND_INT: u32 = 1;
+        type_section.extend_from_slice(&n_u64.to_le_bytes()); // name_off
+        let info = (BTF_KIND_INT << 24) & 0x1f00_0000; // vlen 0
+        type_section.extend_from_slice(&info.to_le_bytes());
+        type_section.extend_from_slice(&8u32.to_le_bytes()); // size = 8
+        // btf_int data word: encoding 0, offset 0, bits 64.
+        let int_data: u32 = 64;
+        type_section.extend_from_slice(&int_data.to_le_bytes());
+
+        let type_len = type_section.len() as u32;
+        let str_len = strings.len() as u32;
+
+        let mut blob: Vec<u8> = Vec::new();
+        blob.extend_from_slice(&0xEB9F_u16.to_le_bytes()); // magic
+        blob.push(1); // version
+        blob.push(0); // flags
+        blob.extend_from_slice(&24u32.to_le_bytes()); // hdr_len
+        blob.extend_from_slice(&0u32.to_le_bytes()); // type_off
+        blob.extend_from_slice(&type_len.to_le_bytes()); // type_len
+        blob.extend_from_slice(&type_len.to_le_bytes()); // str_off = type_len
+        blob.extend_from_slice(&str_len.to_le_bytes()); // str_len
+        blob.extend_from_slice(&type_section);
+        blob.extend_from_slice(&strings);
+
+        Btf::from_bytes(&blob).expect("minimal synthetic BTF must parse")
     }
 }

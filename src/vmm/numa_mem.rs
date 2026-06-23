@@ -320,10 +320,14 @@ impl NumaMemoryLayout {
 
     /// If the relocated RAM top exceeds the guest's addressable physical
     /// space (`1 << phys_bits`), return that top GPA; otherwise `None`.
-    /// Without rejecting this, RAM above the guest MAXPHYADDR is SILENTLY
-    /// truncated by the guest kernel (e820__end_ram_pfn caps last_pfn at
-    /// max_arch_pfn), so the guest boots with less RAM than advertised.
-    /// `phys_bits >= 64` means no limit (the full u64 GPA space).
+    /// Bits above the guest MAXPHYADDR are architecturally reserved in guest
+    /// PTEs (KVM sets `reserved_gpa_bits = rsvd_bits(cpuid_maxphyaddr, 63)`),
+    /// so a PTE mapping a GPA above `1 << phys_bits` faults on the MMU walk's
+    /// reserved-bits check — RAM placed there is unreachable; rejecting it
+    /// keeps the guest from booting with RAM it cannot reach. (Distinct from
+    /// the kernel's separate, wider e820 cap at `max_arch_pfn =
+    /// 1 << MAX_PHYSMEM_BITS` (46/52), which does not key on the CPUID
+    /// MAXPHYADDR.) `phys_bits >= 64` means no limit (the full u64 GPA space).
     ///
     /// x86_64-only: `phys_bits` is the guest's CPUID 0x8000_0008
     /// MAXPHYADDR and the sole caller is `x86_64::kvm`. There is
@@ -467,6 +471,43 @@ impl NumaMemoryLayout {
         // using hugepages (no-op for base pages: va_align == 1).
         let base = round_up(reservation as usize) as *mut libc::c_void;
 
+        // Per-node MAP_FIXED into the reservation + KVM slot registration.
+        // `guard` is held here across the call, so the reservation backing
+        // every sub-mapping outlives the loop; it is moved into the
+        // returned `AllocatedMemory` on success.
+        let guest_regions = self.map_and_register_regions(vm_fd, base, &va_spans, use_hugepages)?;
+
+        // Step 6: Build multi-region GuestMemoryMmap.
+        let guest_mem = GuestMemoryMmap::from_regions(guest_regions)
+            .context("create multi-region GuestMemoryMmap")?;
+
+        Ok(AllocatedMemory {
+            guest_mem,
+            reservation: guard,
+        })
+    }
+
+    /// MAP_FIXED each node into the VA reservation at `base` and register
+    /// its KVM memory slot, returning the per-node `GuestRegionMmap`s.
+    ///
+    /// `base` must point into a PROT_NONE reservation (owned by the
+    /// caller's `ReservationGuard`) that stays mapped for the whole call
+    /// and is at least `sum(va_spans) + (va_align - 1)` bytes; `va_spans`
+    /// is per-node host-VA span (hugepage-rounded when `use_hugepages`)
+    /// and must have one entry per `self.regions` entry in order.
+    ///
+    /// SAFETY: each `libc::mmap(MAP_FIXED)` writes within the caller's
+    /// reservation (packed offsets sum to <= the reservation size); the
+    /// resulting pointers are passed to `MmapRegion::build_raw` (owned=
+    /// false, so Drop is a no-op) and to KVM, all within the reservation's
+    /// lifetime guaranteed by the caller holding the guard across the call.
+    fn map_and_register_regions(
+        &self,
+        vm_fd: &kvm_ioctls::VmFd,
+        base: *mut libc::c_void,
+        va_spans: &[usize],
+        use_hugepages: bool,
+    ) -> Result<Vec<GuestRegionMmap>> {
         let mut guest_regions: Vec<GuestRegionMmap> = Vec::with_capacity(self.regions.len());
 
         // Host VA is PACKED (gap-free): the reservation is sum-of-sizes,
@@ -578,14 +619,7 @@ impl NumaMemoryLayout {
             }
         }
 
-        // Step 6: Build multi-region GuestMemoryMmap.
-        let guest_mem = GuestMemoryMmap::from_regions(guest_regions)
-            .context("create multi-region GuestMemoryMmap")?;
-
-        Ok(AllocatedMemory {
-            guest_mem,
-            reservation: guard,
-        })
+        Ok(guest_regions)
     }
 
     /// Bind each node's region to the corresponding host NUMA node(s),
@@ -1229,7 +1263,8 @@ mod tests {
     fn ram_top_exceeds_phys_bits_rejects_above_maxphyaddr() {
         // 8 GiB single node on x86 relocates above the 4 GiB MMIO gap -> top
         // GPA ~9 GiB. A 33-bit guest MAXPHYADDR (8 GiB) is exceeded -> must
-        // reject (else the guest silently truncates RAM); a 40-bit one
+        // reject (else the RAM above the MAXPHYADDR is unreachable — a guest
+        // access faults on the MMU reserved-bits check); a 40-bit one
         // (1 TiB) is not; >=64 means no limit.
         let topo = Topology {
             llcs: 1,

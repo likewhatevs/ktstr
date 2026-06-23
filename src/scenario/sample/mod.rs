@@ -438,18 +438,9 @@ impl SampleSeries {
         stimulus_events: &[crate::timeline::StimulusEvent],
     ) -> std::collections::BTreeMap<u16, Vec<Sample<'_>>> {
         // Step-start timeline in scenario-relative (guest monotonic) ms
-        // — the same frame as `boundary_offset_ms`. Only step-START
-        // events anchor a step window: the terminal scenario-end event
-        // (step_index None) is excluded, and per-step StepEnd events
-        // (is_step_end, which carry their step's step_index) are excluded
-        // so a step's window is anchored by its start, not its
-        // end-of-hold marker.
-        let mut step_starts: Vec<(u64, u16)> = stimulus_events
-            .iter()
-            .filter(|e| !e.is_step_end)
-            .filter_map(|e| e.step_index.map(|k| (e.elapsed_ms, k)))
-            .collect();
-        step_starts.sort_by_key(|(ms, _)| *ms);
+        // — the same frame as `boundary_offset_ms`. See
+        // [`step_starts_from_stimulus`] for the step-START selection.
+        let step_starts = step_starts_from_stimulus(stimulus_events);
         let mut by_phase: std::collections::BTreeMap<u16, Vec<Sample<'_>>> =
             std::collections::BTreeMap::new();
         for sample in self.iter_samples() {
@@ -461,6 +452,31 @@ impl SampleSeries {
         }
         by_phase
     }
+}
+
+/// Step-start timeline in scenario-relative (guest monotonic) ms — the
+/// frame shared with `boundary_offset_ms`. Only step-START stimulus
+/// events anchor a step window: the terminal scenario-end event
+/// (`step_index` `None`) is dropped by the `filter_map`, and per-step
+/// StepEnd events (`is_step_end`, which carry their step's `step_index`)
+/// are excluded so a step's window is anchored by its start, not its
+/// end-of-hold marker. Returned sorted ascending by `elapsed_ms`.
+///
+/// Shared by [`SampleSeries::by_stimulus_phase`] (which remaps each
+/// capture to the step active at its offset) and
+/// [`crate::assert::build_phase_buckets_with_stimulus`] (which enumerates
+/// the steps that must have a bucket even when they captured no samples)
+/// so the two step-START selections cannot drift.
+pub(crate) fn step_starts_from_stimulus(
+    stimulus_events: &[crate::timeline::StimulusEvent],
+) -> Vec<(u64, u16)> {
+    let mut step_starts: Vec<(u64, u16)> = stimulus_events
+        .iter()
+        .filter(|e| !e.is_step_end)
+        .filter_map(|e| e.step_index.map(|k| (e.elapsed_ms, k)))
+        .collect();
+    step_starts.sort_by_key(|(ms, _)| *ms);
+    step_starts
 }
 
 /// Map a capture's workload-relative boundary offset (ms since scenario

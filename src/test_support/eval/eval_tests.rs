@@ -805,3 +805,97 @@ fn scheduler_label_path() {
         " [sched=/usr/bin/sched]"
     );
 }
+
+// -- overcommit_skip wiring tests --
+//
+// Pin the auto-skip WIRING extracted from run_ktstr_test_inner_impl: a
+// severe auto-collapse must yield a SKIP AssertResult (never a
+// hard-fail), while the CI ~1.3x ratio and an explicit cpu_budget must
+// RUN (None) so wide-SMP boot is validated on a typical runner rather
+// than silently skipped. The pure predicate
+// runtime::overcommit_skip_reason is unit-tested separately in
+// runtime.rs; these pin that Some(reason) -> Ok(AssertResult::skip) and
+// None -> proceed-to-boot at the eval call site.
+
+fn wide_smp_topology() -> crate::vmm::topology::Topology {
+    // 16 LLCs × 16 cores × 1 thread = 256 vCPUs (the wide-SMP class).
+    crate::vmm::topology::Topology {
+        llcs: 16,
+        cores_per_llc: 16,
+        threads_per_core: 1,
+        numa_nodes: 1,
+        nodes: None,
+        distances: None,
+    }
+}
+
+#[test]
+fn overcommit_skip_returns_skip_for_severe_auto_collapse() {
+    let mut entry = eevdf_entry("overcommit_skip_severe");
+    entry.topology = wide_smp_topology();
+    entry.cpu_budget = None;
+    // 256 vCPUs auto-collapse onto 8 host CPUs = 32x ≥ 6x → SKIP, not a
+    // hard-fail.
+    let skip = super::overcommit_skip(&entry, &[0, 1, 2, 3, 4, 5, 6, 7])
+        .expect("32x auto-collapse must auto-skip");
+    assert!(skip.is_skip(), "severe overcommit must yield a SKIP result");
+}
+
+#[test]
+fn overcommit_skip_runs_at_ci_wide_smp_ratio() {
+    let mut entry = eevdf_entry("overcommit_skip_ci");
+    entry.topology = wide_smp_topology();
+    entry.cpu_budget = None;
+    // 256 vCPUs on a 192-CPU CI runner = 1.33x < 6x → RUN (None), so
+    // wide-SMP boot is validated on CI, never masked.
+    let host: Vec<usize> = (0..192).collect();
+    assert!(
+        super::overcommit_skip(&entry, &host).is_none(),
+        "wide-SMP boot must RUN at the CI ~1.3x ratio",
+    );
+}
+
+#[test]
+fn overcommit_skip_never_skips_explicit_budget() {
+    let mut entry = eevdf_entry("overcommit_skip_explicit");
+    entry.topology = wide_smp_topology();
+    entry.cpu_budget = Some(4); // deliberate oversubscription opt-in
+    // Even 256 vCPUs on 8 host CPUs: an explicit cpu_budget is a
+    // contention-testing opt-in and must never auto-skip.
+    assert!(
+        super::overcommit_skip(&entry, &[0, 1, 2, 3, 4, 5, 6, 7]).is_none(),
+        "explicit cpu_budget must never auto-skip",
+    );
+}
+
+#[test]
+fn overcommit_skip_uses_stricter_cap_for_expect_auto_repro() {
+    // Pin the expect_auto_repro field-threading at the eval call site
+    // (entry.expect_auto_repro -> overcommit_skip_reason's stricter
+    // EXPECT_AUTO_REPRO_SKIP_RATIO=2.0 cap). The SAME 256-vCPU-on-96-host
+    // ratio (2.67x) that a boot-only wide test RUNS at must SKIP when
+    // expect_auto_repro is set — a regression that hardcoded `false` or
+    // dropped the arg would still pass the false-default tests above but
+    // fail here.
+    let host: Vec<usize> = (0..96).collect(); // 256 / 96 = 2.67x
+
+    let mut boot_only = eevdf_entry("overcommit_skip_boot_only");
+    boot_only.topology = wide_smp_topology();
+    boot_only.cpu_budget = None;
+    boot_only.expect_auto_repro = false;
+    assert!(
+        super::overcommit_skip(&boot_only, &host).is_none(),
+        "boot-only wide test must RUN at 2.67x (< 6x boot cap)",
+    );
+
+    let mut auto_repro = eevdf_entry("overcommit_skip_auto_repro");
+    auto_repro.topology = wide_smp_topology();
+    auto_repro.cpu_budget = None;
+    auto_repro.expect_auto_repro = true;
+    let skip = super::overcommit_skip(&auto_repro, &host)
+        .expect("expect_auto_repro chain must auto-skip at 2.67x (>= 2.0x cap)");
+    assert!(
+        skip.is_skip(),
+        "expect_auto_repro overcommit must yield a SKIP result",
+    );
+}

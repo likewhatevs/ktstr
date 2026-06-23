@@ -275,6 +275,54 @@ impl KtstrKvm {
         let max_apic_id = max_apic_id(&topo);
         let split_irqchip = max_apic_id > MAX_XAPIC_ID;
 
+        let ioapic = Self::setup_irqchip(&vm_fd, split_irqchip)?;
+
+        Self::tune_kvm_caps(&vm_fd, performance_mode, &topo)?;
+
+        let (guest_mem, numa_layout, reservation) = match memory_mib {
+            Some(mb) => {
+                let layout =
+                    NumaMemoryLayout::compute(&topo, mb, 0, Some((MMIO_GAP_START, MMIO_GAP_END)))?;
+                let alloc =
+                    layout.allocate_and_register(&vm_fd, use_hugepages, performance_mode)?;
+                (alloc.guest_mem, Some(layout), Some(alloc.reservation))
+            }
+            None => {
+                let placeholder = GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), 4096)])
+                    .context("allocate placeholder guest memory")?;
+                (placeholder, None, None)
+            }
+        };
+
+        let vcpus = Self::create_vcpus(
+            &kvm,
+            &vm_fd,
+            &topo,
+            &numa_layout,
+            max_apic_id,
+            performance_mode,
+        )?;
+
+        Ok(KtstrKvm {
+            kvm: ManuallyDrop::new(kvm),
+            vm_fd: ManuallyDrop::new(vm_fd),
+            vcpus,
+            guest_mem: ManuallyDrop::new(guest_mem),
+            topology: topo,
+            numa_layout,
+            has_immediate_exit,
+            split_irqchip,
+            ioapic,
+            use_hugepages,
+            performance_mode,
+            _reservation: reservation,
+            cow_overlay_guards: Vec::new(),
+        })
+    }
+
+    /// Set up the IRQ chip: split (LAPIC-only + x2APIC API + userspace
+    /// IOAPIC) when `split_irqchip`, else full in-kernel PIC/IOAPIC/LAPIC + PIT.
+    fn setup_irqchip(vm_fd: &VmFd, split_irqchip: bool) -> Result<Option<Arc<PiMutex<Ioapic>>>> {
         if split_irqchip {
             // Split IRQ chip: only LAPIC is emulated in kernel.
             // PIC and IOAPIC are not created — userspace handles them.
@@ -323,8 +371,12 @@ impl KtstrKvm {
         // IOAPIC there). `None` for <=254-vCPU guests. The run loops build an
         // IoapicHandle around this to translate guest RTE writes into MSI
         // routes; see `super::ioapic` and `IoapicHandle`.
-        let ioapic = split_irqchip.then(|| Arc::new(PiMutex::new(Ioapic::new())));
+        Ok(split_irqchip.then(|| Arc::new(PiMutex::new(Ioapic::new()))))
+    }
 
+    /// Tune per-VM KVM caps: disable PAUSE/HLT exits in performance mode,
+    /// else set the per-VM halt-poll interval (0 when vCPUs overcommit hosts).
+    fn tune_kvm_caps(vm_fd: &VmFd, performance_mode: bool, topo: &Topology) -> Result<()> {
         // Disable PAUSE and HLT VM exits in performance mode.
         // Two separate enable_cap calls: kvm_disable_exits() uses |=
         // (additive), so multiple calls accumulate. Separate calls
@@ -388,44 +440,52 @@ impl KtstrKvm {
                 );
             }
         }
+        Ok(())
+    }
 
-        let (guest_mem, numa_layout, reservation) = match memory_mib {
-            Some(mb) => {
-                let layout =
-                    NumaMemoryLayout::compute(&topo, mb, 0, Some((MMIO_GAP_START, MMIO_GAP_END)))?;
-                let alloc =
-                    layout.allocate_and_register(&vm_fd, use_hugepages, performance_mode)?;
-                (alloc.guest_mem, Some(layout), Some(alloc.reservation))
-            }
-            None => {
-                let placeholder = GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), 4096)])
-                    .context("allocate placeholder guest memory")?;
-                (placeholder, None, None)
-            }
-        };
-
+    /// Create the per-vCPU fds with topology-specific CPUID, after the
+    /// RAM-top / max-vcpus / max-vcpu-id host-capability checks, then probe
+    /// TSC stability via a KVM_GET_CLOCK roundtrip in performance mode.
+    fn create_vcpus(
+        kvm: &Kvm,
+        vm_fd: &VmFd,
+        topo: &Topology,
+        numa_layout: &Option<NumaMemoryLayout>,
+        max_apic_id: u32,
+        performance_mode: bool,
+    ) -> Result<Vec<VcpuFd>> {
         // Fetch host CPUID once, reuse for all vCPUs (Firecracker pattern).
         let base_cpuid = kvm
             .get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
             .context("get_supported_cpuid")?;
 
-        // Reject (rather than silently truncate) a VM whose RAM relocates
-        // above the guest's addressable physical space. generate_cpuid leaves
-        // CPUID leaf 0x8000_0008 EAX = the host's MAXPHYADDR (it patches only
-        // ECX), so the guest's phys-addr width is the host's. If the relocated
-        // RAM top exceeds 1<<phys_bits, the guest kernel silently caps
-        // last_pfn at max_arch_pfn (e820__end_ram_pfn) and boots with less RAM
-        // than advertised — a silent data drop. Surface it as a
-        // host-capability skip, same class as the max_vcpus check below.
+        // Reject a VM whose RAM relocates above the guest's addressable
+        // physical space. generate_cpuid leaves CPUID leaf 0x8000_0008 EAX =
+        // the host's MAXPHYADDR (it patches only ECX), so the guest's
+        // phys-addr width is the host's. Bits above the guest MAXPHYADDR are
+        // architecturally reserved in guest PTEs (KVM sets reserved_gpa_bits
+        // = rsvd_bits(cpuid_maxphyaddr, 63)), so a PTE mapping a GPA above
+        // 1<<phys_bits faults on the MMU walk's reserved-bits check — RAM with
+        // a top above it is unreachable even though it is advertised. Reject
+        // pre-create: a permanent host-capability
+        // shortfall (the host MAXPHYADDR is fixed hardware), same skip class
+        // as the max_vcpus check below. (Distinct from the kernel's separate,
+        // wider e820 cap at max_arch_pfn = 1<<MAX_PHYSMEM_BITS (46/52), which
+        // does not key on the CPUID MAXPHYADDR.)
         //
-        // Reference note: qemu likewise rejects (its phys-bits-too-low
-        // hard-fail), never truncates. cloud-hypervisor instead caps the
-        // guest MAXPHYADDR at 46 and sizes the MMIO/device area from it (migration
-        // portability); ktstr has no migration, so it exposes the host's
-        // MAXPHYADDR and rejects. libkrun and firecracker also leave the
-        // host's MAXPHYADDR but lack this RAM bound, so the check is a
-        // correct superset. Bounds the RAM top only; widen to max(RAM, MMIO)
-        // top if a high MMIO window above RAM is ever added.
+        // Reference note (how other VMMs treat the host MAXPHYADDR): qemu
+        // hard-fails ("phys-bits too low") against a WIDER bound — phys_bits
+        // vs pc_max_used_gpa = max(RAM top, high-MMIO top). cloud-hypervisor
+        // caps the guest MAXPHYADDR at min(host, max_phys_bits) (default 46)
+        // and sizes the MMIO area from it, with no RAM-top rejection.
+        // firecracker and libkrun leave the host MAXPHYADDR with no
+        // 1<<phys_bits RAM bound. ktstr exposes
+        // the host MAXPHYADDR unmodified and rejects: a SUBSET of qemu's wider
+        // bound (equal today — ktstr's sole MMIO window is the sub-4G gap,
+        // below relocated RAM, so RAM top is the true max GPA) and a superset
+        // of the firecracker/libkrun no-bound case. Bounds the RAM top only;
+        // widen to max(RAM, MMIO) top if a high MMIO window above RAM is ever
+        // added.
         if let Some(layout) = &numa_layout {
             let phys_bits = base_cpuid
                 .as_slice()
@@ -435,12 +495,13 @@ impl KtstrKvm {
                 .unwrap_or(36);
             if let Some(top) = layout.ram_top_exceeds_phys_bits(phys_bits) {
                 return Err(anyhow::Error::new(
-                    crate::vmm::host_topology::ResourceContention {
+                    crate::vmm::host_topology::TopologyInsufficient {
                         reason: format!(
                             "guest RAM top {top:#x} exceeds the guest MAXPHYADDR \
                              (1<<{phys_bits}); this host's physical-address \
-                             width cannot back a VM this large without the guest \
-                             silently truncating RAM"
+                             width cannot back a VM this large — RAM above the \
+                             MAXPHYADDR is unreachable (a guest access faults on \
+                             the MMU reserved-bits check)"
                         ),
                     },
                 ));
@@ -456,13 +517,20 @@ impl KtstrKvm {
         // A topology wider than the host's KVM_CAP_MAX_VCPUS cannot run
         // here; surface it as a clean skip (a host-capability limit, same
         // SKIP class as overcommit) before the per-vCPU create loop, rather
-        // than a mid-loop create_vcpu errno. KVM_CAP_MAX_VCPUS is
-        // host-dependent (commonly 1024; CONFIG_KVM_MAX_NR_VCPUS,
-        // arch/x86/kvm/Kconfig).
+        // than a mid-loop create_vcpu errno. KVM_CAP_MAX_VCPUS returns the
+        // per-VM kvm->max_vcpus (arch/x86/kvm/x86.c), which defaults to
+        // KVM_MAX_VCPUS (= CONFIG_KVM_MAX_NR_VCPUS, commonly 1024) — a
+        // host-dependent value. Because the cap is host-dependent, an over-cap
+        // topology is a skippable TopologyInsufficient — a host with a larger
+        // cap could run it. This is the deliberate counterpart to aarch64,
+        // where the vCPU bound is a VMM-layout constant (the GICv3 redistributor
+        // window) that is host-independent (no host can run a wider topology
+        // under this VMM), so an over-bound topology there is a hard error, not
+        // a skip.
         let max_vcpus = kvm.get_max_vcpus();
         if total as usize > max_vcpus {
             return Err(anyhow::Error::new(
-                crate::vmm::host_topology::ResourceContention {
+                crate::vmm::host_topology::TopologyInsufficient {
                     reason: format!(
                         "topology requires {total} vCPUs but this host's \
                      KVM_CAP_MAX_VCPUS is {max_vcpus}; cannot run a VM this wide"
@@ -474,12 +542,12 @@ impl KtstrKvm {
         // range can exceed the vCPU count; KVM_CREATE_VCPU requires the id be
         // < KVM_CAP_MAX_VCPU_ID. Skip cleanly if the host's cap is too low,
         // same class as the max_vcpus check above.
-        // `max_apic_id` is the u32 already bound above for the split-irqchip
-        // decision; reuse it.
+        // `max_apic_id` is passed in from `new_inner`, the same u32 it
+        // computed for the split-irqchip decision.
         let max_vcpu_id = kvm.get_max_vcpu_id();
         if (max_apic_id as usize) >= max_vcpu_id {
             return Err(anyhow::Error::new(
-                crate::vmm::host_topology::ResourceContention {
+                crate::vmm::host_topology::TopologyInsufficient {
                     reason: format!(
                         "topology's max APIC ID {max_apic_id} (the KVM vcpu_id) is \
                          >= this host's KVM_CAP_MAX_VCPU_ID {max_vcpu_id}; cannot \
@@ -497,7 +565,7 @@ impl KtstrKvm {
             // so vcpu_id must equal it or sparse APIC IDs are unrouteable. The
             // vcpus Vec stays indexed by cpu_id (push order); only the KVM
             // vcpu_id changes (a no-op for dense topologies where apic==cpu_id).
-            let aid = apic_id(&topo, cpu_id);
+            let aid = apic_id(topo, cpu_id);
             let vcpu = vm_fd.create_vcpu(aid as u64).map_err(|e| {
                 crate::vmm::map_transient_to_contention(
                     e,
@@ -506,7 +574,7 @@ impl KtstrKvm {
             })?;
 
             let cpuid_entries =
-                generate_cpuid(base_cpuid.as_slice(), &topo, cpu_id, performance_mode);
+                generate_cpuid(base_cpuid.as_slice(), topo, cpu_id, performance_mode);
             let cpuid = kvm_bindings::CpuId::from_entries(&cpuid_entries).context("build CpuId")?;
             vcpu.set_cpuid2(&cpuid)
                 .with_context(|| format!("set CPUID for vCPU {cpu_id}"))?;
@@ -577,21 +645,7 @@ impl KtstrKvm {
             }
         }
 
-        Ok(KtstrKvm {
-            kvm: ManuallyDrop::new(kvm),
-            vm_fd: ManuallyDrop::new(vm_fd),
-            vcpus,
-            guest_mem: ManuallyDrop::new(guest_mem),
-            topology: topo,
-            numa_layout,
-            has_immediate_exit,
-            split_irqchip,
-            ioapic,
-            use_hugepages,
-            performance_mode,
-            _reservation: reservation,
-            cow_overlay_guards: Vec::new(),
-        })
+        Ok(vcpus)
     }
 }
 

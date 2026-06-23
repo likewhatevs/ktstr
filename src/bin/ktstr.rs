@@ -11,6 +11,19 @@ use ktstr::ctprof;
 use ktstr::ctprof_compare;
 use ktstr::topology::TestTopology;
 
+/// Per-section render helpers for `write_show`, factored into
+/// `src/bin/ktstr/show_render.rs` to keep this file under the size
+/// guard. `write_show` stays here and orchestrates; the per-section
+/// writers live in the submodule and reach back to the PSI helpers
+/// and the `ctprof_compare` alias via `use super::*`.
+///
+/// `#[path]` is required: a `[[bin]]` crate root resolves `mod foo;`
+/// to a sibling `foo.rs`, not a `ktstr/`-stem subdir, so the explicit
+/// path points at the submodule file (mirrors the cargo-ktstr bin's
+/// `#[path = "cargo_ktstr/..."]` declarations).
+#[path = "ktstr/show_render.rs"]
+mod show_render;
+
 #[derive(Parser)]
 #[command(
     name = "ktstr",
@@ -961,602 +974,42 @@ fn write_show<W: std::fmt::Write>(
         keys
     };
 
-    // Primary table renders rows whose metric.section is
-    // enabled. Two sections share the table — Section::Primary
-    // (52 non-taskstats rows) and Section::TaskstatsDelay (34
-    // taskstats genetlink rows). The outer gate keeps the table
-    // open while EITHER section is enabled. Mirrors the
-    // ctprof_compare::write_diff outer-gate semantics so
-    // `--sections taskstats-delay` works identically across
-    // compare and show.
-    if display_options.is_section_enabled(ctprof_compare::Section::Primary)
-        || display_options.is_section_enabled(ctprof_compare::Section::TaskstatsDelay)
-    {
-        writeln!(w, "## Primary metrics")?;
-        let mut table = display_options.new_table();
-        let header_row: Vec<&str> = resolved_columns
-            .iter()
-            .map(|c| c.header(group_header))
-            .collect();
-        table.set_header(header_row);
+    show_render::write_show_primary(
+        w,
+        &display_options,
+        &groups,
+        &group_order,
+        &resolved_columns,
+        group_header,
+        group_by,
+        no_thread_normalize,
+    )?;
 
-        for key in &group_order {
-            let group = &groups[*key];
-            // Display key: pattern grouping under Comm or Pcomm
-            // uses grex to turn the join-key skeleton into a regex
-            // label; every other grouping (CommExact, Cgroup, or
-            // either pattern axis under `--no-thread-normalize`)
-            // renders the join key directly.
-            let display_key = if matches!(
-                group_by,
-                ctprof_compare::GroupBy::Comm | ctprof_compare::GroupBy::Pcomm
-            ) && !no_thread_normalize
-            {
-                ctprof_compare::pattern_display_label(key, &group.members)
-            } else {
-                (*key).clone()
-            };
-            for metric in ctprof_compare::CTPROF_METRICS {
-                // `--metrics` filter: skip metrics not on the
-                // operator-supplied allowlist. Empty allowlist
-                // = no filter (default) per
-                // `is_metric_enabled`'s default-empty contract.
-                if !display_options.is_metric_enabled(metric.name) {
-                    continue;
-                }
-                // Per-row section gate: skip metrics whose
-                // `section` is not enabled by `--sections`. The
-                // outer gate above keeps the table open while
-                // either section is enabled; this inner gate
-                // restricts which rows appear inside the table.
-                if !display_options.is_section_enabled(metric.section) {
-                    continue;
-                }
-                let Some(agg) = group.metrics.get(metric.name) else {
-                    continue;
-                };
-                let metric_name = ctprof_compare::metric_display_name(metric).to_string();
-                let value_cell = ctprof_compare::format_value_cell(agg, metric.rule.ladder());
-                let tags_cell = ctprof_compare::metric_tags(metric);
-                let cells: Vec<String> = resolved_columns
-                    .iter()
-                    .map(|c| match c {
-                        ctprof_compare::Column::Group => display_key.clone(),
-                        ctprof_compare::Column::Threads => group.thread_count.to_string(),
-                        ctprof_compare::Column::Metric => metric_name.clone(),
-                        ctprof_compare::Column::Value => value_cell.clone(),
-                        ctprof_compare::Column::Tags => tags_cell.clone(),
-                        ctprof_compare::Column::Uptime => "-".to_string(),
-                        _ => "-".to_string(),
-                    })
-                    .collect();
-                table.add_row(cells);
-            }
-        }
-        writeln!(w, "{table}")?;
-    }
+    show_render::write_show_derived(
+        w,
+        &display_options,
+        &groups,
+        &group_order,
+        &resolved_columns,
+        group_header,
+        group_by,
+        no_thread_normalize,
+    )?;
 
-    // Derived metrics: one row per (group, derivation) pair.
-    // Mirrors the `## Derived metrics` section emitted by
-    // ctprof_compare::write_diff but adapted for the
-    // single-snapshot show layout (no baseline/candidate split,
-    // one value cell per row).
-    // Derived-table outer gate mirrors write_diff: open the
-    // table when EITHER `Section::Derived` OR
-    // `Section::TaskstatsDelay` is enabled. Per-row gating below
-    // keeps `--sections taskstats-delay` from leaking
-    // non-taskstats derivations.
-    if (display_options.is_section_enabled(ctprof_compare::Section::Derived)
-        || display_options.is_section_enabled(ctprof_compare::Section::TaskstatsDelay))
-        && !groups.is_empty()
-    {
-        let mut dt = display_options.new_table();
-        let header_row: Vec<&str> = resolved_columns
-            .iter()
-            .map(|c| c.header(group_header))
-            .collect();
-        dt.set_header(header_row);
-        // Iterate groups in the same order as the main table —
-        // group_order has been computed once and applies to
-        // every section emitted afterwards.
-        for key in &group_order {
-            let group = &groups[*key];
-            let display_key = if matches!(
-                group_by,
-                ctprof_compare::GroupBy::Comm | ctprof_compare::GroupBy::Pcomm
-            ) && !no_thread_normalize
-            {
-                ctprof_compare::pattern_display_label(key, &group.members)
-            } else {
-                (*key).clone()
-            };
-            for d in ctprof_compare::CTPROF_DERIVED_METRICS {
-                if !display_options.is_metric_enabled(d.name) {
-                    continue;
-                }
-                // Per-row section gate: same shape as the primary
-                // table loop. Skip derivations whose section is
-                // not enabled.
-                if !display_options.is_section_enabled(d.section) {
-                    continue;
-                }
-                let value_cell = match (d.compute)(&group.metrics) {
-                    Some(v) => ctprof_compare::format_derived_value_cell(v, d.ladder, d.is_ratio),
-                    None => "-".to_string(),
-                };
-                let cells: Vec<String> = resolved_columns
-                    .iter()
-                    .map(|c| match c {
-                        ctprof_compare::Column::Group => display_key.clone(),
-                        ctprof_compare::Column::Threads => group.thread_count.to_string(),
-                        ctprof_compare::Column::Metric => d.name.to_string(),
-                        ctprof_compare::Column::Value => value_cell.clone(),
-                        ctprof_compare::Column::Tags => String::new(),
-                        ctprof_compare::Column::Uptime => "-".to_string(),
-                        _ => "-".to_string(),
-                    })
-                    .collect();
-                dt.add_row(ctprof_compare::color_derived_cells(cells));
-            }
-        }
-        writeln!(w)?;
-        writeln!(w, "## Derived metrics")?;
-        writeln!(w, "{dt}")?;
-    }
+    show_render::write_show_cgroup_sections(
+        w,
+        &display_options,
+        snap,
+        group_by,
+        &flatten,
+        cgroup_key_map.as_ref(),
+    )?;
 
-    // Cgroup grouping carries cgroup_stats enrichment alongside
-    // the per-thread aggregates. Render a second table when
-    // present so the show output mirrors compare's two-table
-    // layout for `--group-by cgroup`. The `--sections` filter is
-    // re-checked per sub-table below so a user can request
-    // `--sections pressure` and get only the PSI rollups even
-    // though the cgroup-stats prefix is present in the snapshot.
-    if group_by == ctprof_compare::GroupBy::Cgroup && !snap.cgroup_stats.is_empty() {
-        let stats = ctprof_compare::flatten_cgroup_stats(
-            &snap.cgroup_stats,
-            &flatten,
-            cgroup_key_map.as_ref(),
-        );
-        if !stats.is_empty() {
-            if display_options.is_section_enabled(ctprof_compare::Section::CgroupStats) {
-                writeln!(w)?;
-                let mut ct = display_options.new_table();
-                ct.set_header(vec![
-                    "cgroup",
-                    "cpu_usage_usec",
-                    "nr_throttled",
-                    "throttled_usec",
-                    "memory_current",
-                ]);
-                // Route every scalar through `format_scaled_u64` so
-                // the same auto-scale ladder that compare's enrichment
-                // table uses applies here too — `7.500GiB` instead of
-                // `8053063680`, `1.235s` instead of `1234567` µs.
-                // Compare's table renders a baseline→candidate→delta
-                // triple via `cgroup_cell`; show has a single snapshot
-                // so each cell stands alone — `format_scaled_u64`
-                // gives just the scaled value with no `→` arrow and
-                // no `(+0…)` zero-delta tail. Units mirror compare's
-                // call sites:
-                //   cpu_usage_usec, throttled_usec → "µs"
-                //   memory_current                  → "B"
-                //   nr_throttled                    → "" (unitless count)
-                for (key, s) in &stats {
-                    ct.add_row(vec![
-                        key.clone(),
-                        ctprof_compare::format_scaled_u64(
-                            s.cpu.usage_usec,
-                            ctprof_compare::ScaleLadder::Us,
-                        ),
-                        ctprof_compare::format_scaled_u64(
-                            s.cpu.nr_throttled,
-                            ctprof_compare::ScaleLadder::Unitless,
-                        ),
-                        ctprof_compare::format_scaled_u64(
-                            s.cpu.throttled_usec,
-                            ctprof_compare::ScaleLadder::Us,
-                        ),
-                        ctprof_compare::format_scaled_u64(
-                            s.memory.current,
-                            ctprof_compare::ScaleLadder::Bytes,
-                        ),
-                    ]);
-                }
-                writeln!(w, "{ct}")?;
-            }
+    show_render::write_show_host_pressure(w, &display_options, snap)?;
 
-            // Per-cgroup limits / knobs sub-table — operator-set
-            // configuration that's typically static across a run
-            // but matters when comparing two snapshots that
-            // straddle a deployment. `cpu.max`, `cpu.weight`,
-            // `memory.max`, `memory.high`, `pids.current/max` per
-            // [`CgroupCpuStats`] / [`CgroupMemoryStats`] /
-            // [`CgroupPidsStats`]. Suppressed entirely when no
-            // cgroup in the bucket exposes any of these (root
-            // cgroup, or a host without pids/memory controllers
-            // enabled).
-            if display_options.is_section_enabled(ctprof_compare::Section::Limits)
-                && stats.values().any(|s| {
-                    s.cpu.max_quota_us.is_some()
-                        || s.cpu.weight.is_some()
-                        || s.memory.max.is_some()
-                        || s.memory.high.is_some()
-                        || s.pids.current.is_some()
-                        || s.pids.max.is_some()
-                })
-            {
-                writeln!(w)?;
-                writeln!(w, "## Cgroup limits / knobs")?;
-                let mut lt = display_options.new_table();
-                lt.set_header(vec![
-                    "cgroup",
-                    "cpu.max",
-                    "cpu.weight",
-                    "memory.max",
-                    "memory.high",
-                    "pids.current",
-                    "pids.max",
-                ]);
-                for (key, s) in &stats {
-                    // Per-row gate: skip rows where every column
-                    // is unset (the cgroup has no caps, no
-                    // weight set, no pids accounting). Without
-                    // this, a system-wide table can render N
-                    // empty rows for every host-controller
-                    // cgroup that doesn't expose any of these.
-                    let row_has_data = s.cpu.max_quota_us.is_some()
-                        || s.cpu.weight.is_some()
-                        || s.memory.max.is_some()
-                        || s.memory.high.is_some()
-                        || s.pids.current.is_some()
-                        || s.pids.max.is_some();
-                    if !row_has_data {
-                        continue;
-                    }
-                    lt.add_row(vec![
-                        key.clone(),
-                        ctprof_compare::format_cpu_max(s.cpu.max_quota_us, s.cpu.max_period_us),
-                        s.cpu
-                            .weight
-                            .map(|v| {
-                                ctprof_compare::format_scaled_u64(
-                                    v,
-                                    ctprof_compare::ScaleLadder::Unitless,
-                                )
-                            })
-                            .unwrap_or_else(|| "-".to_string()),
-                        ctprof_compare::format_optional_limit(
-                            s.memory.max,
-                            ctprof_compare::ScaleLadder::Bytes,
-                        ),
-                        ctprof_compare::format_optional_limit(
-                            s.memory.high,
-                            ctprof_compare::ScaleLadder::Bytes,
-                        ),
-                        s.pids
-                            .current
-                            .map(|v| {
-                                ctprof_compare::format_scaled_u64(
-                                    v,
-                                    ctprof_compare::ScaleLadder::Unitless,
-                                )
-                            })
-                            .unwrap_or_else(|| "-".to_string()),
-                        ctprof_compare::format_optional_limit(
-                            s.pids.max,
-                            ctprof_compare::ScaleLadder::Unitless,
-                        ),
-                    ]);
-                }
-                writeln!(w, "{lt}")?;
-            }
+    show_render::write_show_smaps(w, &display_options, snap, no_thread_normalize)?;
 
-            // Per-cgroup memory.stat sub-table — kernel-emitted
-            // memory counters per cgroup. Up to 71 keys on a
-            // recent kernel. Renders as one row per (cgroup,
-            // key) pair to keep column width bounded; sorted by
-            // key for stable output. Suppressed when every
-            // bucketed cgroup has an empty `memory.stat` map.
-            // Show-side zero-suppression: a typical workload
-            // touches only a handful of memory.stat keys, so
-            // rendering all 71 rows × N cgroups creates a
-            // massive table dominated by zeros. Skip rows where
-            // the value is exactly 0; if every key in a cgroup
-            // is zero, that cgroup contributes no rows. The
-            // section still renders if any cgroup has any
-            // non-zero key. This trims output ~10x for typical
-            // runs.
-            if display_options.is_section_enabled(ctprof_compare::Section::MemoryStat)
-                && stats
-                    .values()
-                    .any(|s| s.memory.stat.values().any(|v| *v != 0))
-            {
-                writeln!(w)?;
-                writeln!(w, "## memory.stat")?;
-                let mut mt = display_options.new_table();
-                mt.set_header(vec!["cgroup", "key", "value"]);
-                for (key, s) in &stats {
-                    for (stat_key, stat_value) in &s.memory.stat {
-                        if *stat_value == 0 {
-                            continue;
-                        }
-                        mt.add_row(vec![
-                            key.clone(),
-                            stat_key.clone(),
-                            ctprof_compare::format_scaled_u64(
-                                *stat_value,
-                                ctprof_compare::ScaleLadder::Unitless,
-                            ),
-                        ]);
-                    }
-                }
-                writeln!(w, "{mt}")?;
-            }
-
-            // Per-cgroup memory.events sub-table — pressure-event
-            // counters (low / high / max / oom / oom_kill etc.).
-            // Same long-table layout as memory.stat with the
-            // same zero-row suppression.
-            if display_options.is_section_enabled(ctprof_compare::Section::MemoryEvents)
-                && stats
-                    .values()
-                    .any(|s| s.memory.events.values().any(|v| *v != 0))
-            {
-                writeln!(w)?;
-                writeln!(w, "## memory.events")?;
-                let mut et = display_options.new_table();
-                et.set_header(vec!["cgroup", "event", "count"]);
-                for (key, s) in &stats {
-                    for (event_key, event_value) in &s.memory.events {
-                        if *event_value == 0 {
-                            continue;
-                        }
-                        et.add_row(vec![
-                            key.clone(),
-                            event_key.clone(),
-                            ctprof_compare::format_scaled_u64(
-                                *event_value,
-                                ctprof_compare::ScaleLadder::Unitless,
-                            ),
-                        ]);
-                    }
-                }
-                writeln!(w, "{et}")?;
-            }
-
-            // Per-cgroup PSI sub-tables — one per resource.
-            // Q8 ruling: per-resource sub-tables, all fields
-            // rendered (no --verbose gate). Each resource shows
-            // a `some` row + a `full` row with `avg10/avg60/avg300/total`
-            // columns. avg fields are stored as centi-percent
-            // (0..=10099, see [`PsiHalf`] doc for the kernel's
-            // EWMA rounding ceiling); render as `N.NN%` for
-            // human-friendliness. total is microseconds; the
-            // auto_scale "µs" ladder applies via
-            // `format_scaled_u64`. Per-resource zero-suppression
-            // mirrors the compare-side write_diff path: skip a
-            // resource sub-table when no cgroup in the bucket
-            // has any non-zero data for it.
-            if display_options.is_section_enabled(ctprof_compare::Section::Pressure) {
-                for (resource_name, accessor) in psi_resources() {
-                    let any_data = stats.values().any(|s| {
-                        let r = accessor(&s.psi);
-                        psi_resource_has_data(&r)
-                    });
-                    if !any_data {
-                        continue;
-                    }
-                    writeln!(w)?;
-                    writeln!(w, "## Pressure / {resource_name}")?;
-                    let mut pt = display_options.new_table();
-                    pt.set_header(vec!["cgroup", "row", "avg10", "avg60", "avg300", "total"]);
-                    for (key, s) in &stats {
-                        let r = accessor(&s.psi);
-                        pt.add_row(vec![
-                            key.clone(),
-                            "some".into(),
-                            format_psi_avg(r.some.avg10),
-                            format_psi_avg(r.some.avg60),
-                            format_psi_avg(r.some.avg300),
-                            ctprof_compare::format_scaled_u64(
-                                r.some.total_usec,
-                                ctprof_compare::ScaleLadder::Us,
-                            ),
-                        ]);
-                        pt.add_row(vec![
-                            key.clone(),
-                            "full".into(),
-                            format_psi_avg(r.full.avg10),
-                            format_psi_avg(r.full.avg60),
-                            format_psi_avg(r.full.avg300),
-                            ctprof_compare::format_scaled_u64(
-                                r.full.total_usec,
-                                ctprof_compare::ScaleLadder::Us,
-                            ),
-                        ]);
-                    }
-                    writeln!(w, "{pt}")?;
-                }
-            }
-        }
-    }
-
-    // Host-level PSI — surface above the per-thread table when
-    // any resource has nonzero data. Renders as four per-resource
-    // sub-tables (cpu / memory / io / irq) with a `some`+`full`
-    // row each, matching the per-cgroup layout above.
-    if display_options.is_section_enabled(ctprof_compare::Section::HostPressure)
-        && host_psi_has_data(&snap.psi)
-    {
-        for (resource_name, accessor) in psi_resources() {
-            let r = accessor(&snap.psi);
-            if !psi_resource_has_data(&r) {
-                continue;
-            }
-            writeln!(w)?;
-            writeln!(w, "## Host pressure / {resource_name}")?;
-            let mut pt = display_options.new_table();
-            pt.set_header(vec!["row", "avg10", "avg60", "avg300", "total"]);
-            pt.add_row(vec![
-                "some".into(),
-                format_psi_avg(r.some.avg10),
-                format_psi_avg(r.some.avg60),
-                format_psi_avg(r.some.avg300),
-                ctprof_compare::format_scaled_u64(
-                    r.some.total_usec,
-                    ctprof_compare::ScaleLadder::Us,
-                ),
-            ]);
-            pt.add_row(vec![
-                "full".into(),
-                format_psi_avg(r.full.avg10),
-                format_psi_avg(r.full.avg60),
-                format_psi_avg(r.full.avg300),
-                ctprof_compare::format_scaled_u64(
-                    r.full.total_usec,
-                    ctprof_compare::ScaleLadder::Us,
-                ),
-            ]);
-            writeln!(w, "{pt}")?;
-        }
-    }
-
-    // Per-process smaps_rollup sub-table. Routes through the
-    // shared [`ctprof_compare::collect_smaps_rollup`] so the
-    // show-side keying and aggregation match the compare-side
-    // exactly: under default normalization the key is
-    // `pattern_key(&t.pcomm)` (tgid dropped) and per-PID rows
-    // sharing the same pcomm pattern have their byte counts
-    // field-summed; under `--no-thread-normalize` the literal
-    // `pcomm[tgid]` shape is preserved so each PID stays
-    // attributable. Process iteration order: descending by Rss,
-    // tiebreak descending Pss, final tiebreak alphabetical
-    // (mirrors the compare-side sort). Skip zero-valued entries
-    // per-row to keep output bounded — Pss for an unmapped
-    // process is meaningfully zero, but ShmemPmdMapped=0 etc.
-    // are noise rows. Suppressed when no captured thread has a
-    // populated map (older kernels, stripped permissions,
-    // synthetic fixtures).
-    //
-    // Smaps keys can differ from primary-table Pcomm group
-    // keys for singleton digit pcomms — smaps always normalizes
-    // (`worker-{N}` even when only one PID matches), while the
-    // primary table reverts singletons to the literal pcomm
-    // (`worker-7`); see [`ctprof_compare::collect_smaps_rollup`]
-    // for the asymmetry and its rationale (cross-snapshot diff
-    // joining vs. intra-snapshot fleet aggregation).
-    //
-    // Smaps keying is independent of `--group-by`: the keys
-    // reflect the per-process pcomm pattern regardless of
-    // whether the operator selected `cgroup`, `comm`, `pcomm`,
-    // or `comm-exact` for the primary table. The smaps section
-    // reads pcomm directly off each leader thread, not the
-    // post-grouping bucket key.
-    if display_options.is_section_enabled(ctprof_compare::Section::Smaps) {
-        let smaps = ctprof_compare::collect_smaps_rollup(snap, no_thread_normalize);
-        if !smaps.is_empty() {
-            let mut process_keys: Vec<&String> = smaps.keys().collect();
-            process_keys.sort_by(|a, b| {
-                let max_for = |pkey: &&String, field: &str| -> u64 {
-                    smaps
-                        .get(*pkey)
-                        .and_then(|m| m.get(field).copied())
-                        .unwrap_or(0)
-                };
-                max_for(b, "Rss")
-                    .cmp(&max_for(a, "Rss"))
-                    .then_with(|| max_for(b, "Pss").cmp(&max_for(a, "Pss")))
-                    .then_with(|| a.cmp(b))
-            });
-            // Pre-pass: every (process, key) pair with non-zero
-            // value emits a row. Suppress the section header when
-            // no rows would render (e.g. every value is zero).
-            let any_row = process_keys.iter().any(|pkey| {
-                smaps
-                    .get(*pkey)
-                    .map(|m| m.values().any(|v| *v != 0))
-                    .unwrap_or(false)
-            });
-            if any_row {
-                writeln!(w)?;
-                writeln!(w, "## smaps_rollup")?;
-                let mut st = display_options.new_table();
-                st.set_header(vec!["process", "key", "value"]);
-                for pkey in &process_keys {
-                    // `process_keys` is built from `smaps.keys()`,
-                    // so every entry resolves — index directly to
-                    // make the invariant explicit.
-                    let m = &smaps[*pkey];
-                    for (key, bytes) in m {
-                        if *bytes == 0 {
-                            continue;
-                        }
-                        st.add_row(vec![
-                            (*pkey).clone(),
-                            key.clone(),
-                            ctprof_compare::format_scaled_u64(
-                                *bytes,
-                                ctprof_compare::ScaleLadder::Bytes,
-                            ),
-                        ]);
-                    }
-                }
-                writeln!(w, "{st}")?;
-            }
-        }
-    }
-
-    // Global sched_ext sysfs section. Suppressed when the
-    // snapshot's `sched_ext` field is None (CONFIG_SCHED_CLASS_EXT=n
-    // build, or sysfs directory absent). Single 5-row table
-    // mirroring the kernel's exposed scx_global_attrs[] surface.
-    if display_options.is_section_enabled(ctprof_compare::Section::SchedExt)
-        && let Some(scx) = &snap.sched_ext
-    {
-        writeln!(w)?;
-        writeln!(w, "## sched_ext")?;
-        let mut at = display_options.new_table();
-        at.set_header(vec!["attr", "value"]);
-        // state cell: render "-" when the file was unreadable
-        // (empty string) so "no observation" stays visually
-        // distinct from an actual scx_enable_state_str[] value.
-        // Mirrors the compare-side rendering.
-        let state_cell = if scx.state.is_empty() {
-            "-".to_string()
-        } else {
-            scx.state.clone()
-        };
-        at.add_row(vec!["state".into(), state_cell]);
-        at.add_row(vec![
-            "switch_all".into(),
-            ctprof_compare::format_scaled_u64(
-                scx.switch_all,
-                ctprof_compare::ScaleLadder::Unitless,
-            ),
-        ]);
-        at.add_row(vec![
-            "nr_rejected".into(),
-            ctprof_compare::format_scaled_u64(
-                scx.nr_rejected,
-                ctprof_compare::ScaleLadder::Unitless,
-            ),
-        ]);
-        at.add_row(vec![
-            "hotplug_seq".into(),
-            ctprof_compare::format_scaled_u64(
-                scx.hotplug_seq,
-                ctprof_compare::ScaleLadder::Unitless,
-            ),
-        ]);
-        at.add_row(vec![
-            "enable_seq".into(),
-            ctprof_compare::format_scaled_u64(
-                scx.enable_seq,
-                ctprof_compare::ScaleLadder::Unitless,
-            ),
-        ]);
-        writeln!(w, "{at}")?;
-    }
+    show_render::write_show_sched_ext(w, &display_options, snap)?;
 
     Ok(())
 }
@@ -1582,8 +1035,9 @@ fn psi_resources() -> [PsiAccessor; 4] {
 }
 
 /// Render a centi-percent PSI average as `N.NN%`. The kernel
-/// emits `LOAD_INT.LOAD_FRAC` at `kernel/sched/psi.c:1284` with
-/// 2-decimal-digit precision — preserve that on display.
+/// emits `LOAD_INT.LOAD_FRAC` from the `psi_show` seq_printf in
+/// `kernel/sched/psi.c` with 2-decimal-digit precision — preserve
+/// that on display.
 fn format_psi_avg(centi_percent: u16) -> String {
     let int = centi_percent / 100;
     let frac = centi_percent % 100;
@@ -1629,8 +1083,8 @@ mod psi_show_tests {
         assert_eq!(format_psi_avg(50), "0.50%");
         assert_eq!(format_psi_avg(1859), "18.59%");
         assert_eq!(format_psi_avg(10000), "100.00%");
-        // Kernel EWMA rounding ceiling per
-        // include/linux/sched/loadavg.h:35; render the boundary
+        // Kernel EWMA rounding ceiling from `calc_load` in
+        // include/linux/sched/loadavg.h; render the boundary
         // verbatim rather than clamping.
         assert_eq!(format_psi_avg(10099), "100.99%");
     }
@@ -2996,6 +2450,551 @@ mod tests {
             "smaps must sort by Rss desc — bash (100 MiB) ahead of \
              zulu (1 MiB) regardless of alphabetical order; \
              bash@{bash_pos} zulu@{zulu_pos}\nafter:\n{after}",
+        );
+    }
+
+    /// Build the canonical single-cgroup fixture: one thread
+    /// pinned to `/app` so `build_groups` produces a `Cgroup`
+    /// bucket and `write_show`'s cgroup-stats sub-tables render.
+    /// Mirrors the per-field-assignment pattern the existing
+    /// cgroup test uses (the `ktstr` binary is a separate
+    /// translation unit from `ctprof`, so the `#[non_exhaustive]`
+    /// markers on `CtprofSnapshot` / `ThreadState` / `CgroupStats`
+    /// block struct-literal construction here). The caller mutates
+    /// the returned `CgroupStats` and inserts it under `/app`.
+    fn cgroup_fixture() -> (ktstr::ctprof::CtprofSnapshot, ktstr::ctprof::CgroupStats) {
+        let mut snap = ktstr::ctprof::CtprofSnapshot::default();
+        let mut t = ktstr::ctprof::ThreadState::default();
+        t.pcomm = "worker".to_string();
+        t.comm = "w".to_string();
+        t.cgroup = "/app".to_string();
+        snap.threads.push(t);
+        (snap, ktstr::ctprof::CgroupStats::default())
+    }
+
+    /// `write_show` under `GroupBy::Cgroup` emits the
+    /// `## Cgroup limits / knobs` sub-table when at least one
+    /// bucketed cgroup exposes a cpu.max / weight / memory.max /
+    /// pids value. Pins the `stats.values().any(...)` section gate
+    /// and each cell's formatter routing:
+    /// `format_cpu_max` for the cpu.max pair, `format_scaled_u64`
+    /// for the unitless weight / pids.current, `format_optional_limit`
+    /// for memory.max (`Some` → scaled) and for memory.high /
+    /// pids.max (`None` → the `max` token). The existing
+    /// cgroup-stats test sets only cpu.usage / memory.current, so
+    /// this whole block is otherwise dead in tests.
+    #[test]
+    fn write_show_emits_cgroup_limits_table_with_scaled_knobs() {
+        let (mut snap, mut cgs) = cgroup_fixture();
+        // cpu.max quota=50_000µs period=100_000µs →
+        // format_cpu_max → "50.000ms/100.000ms".
+        cgs.cpu.max_quota_us = Some(50_000);
+        cgs.cpu.max_period_us = 100_000;
+        // cpu.weight=200 → format_scaled_u64(200, Unitless),
+        // below the 1e3 ladder step → bare "200".
+        cgs.cpu.weight = Some(200);
+        // memory.max=2 GiB → format_optional_limit(Some, Bytes)
+        // → "2.000GiB". memory.high=None → "max".
+        cgs.memory.max = Some(2 * 1024 * 1024 * 1024);
+        // memory.current must be set so the CgroupStats sub-table
+        // gate (non-empty cgroup_stats) is satisfied; the limits
+        // gate is independent but the fixture stays realistic.
+        cgs.memory.current = 1;
+        // pids.current=7 → format_scaled_u64(7, Unitless) → "7".
+        // pids.max=None → format_optional_limit(None, Unitless)
+        // → "max".
+        cgs.pids.current = Some(7);
+        snap.cgroup_stats.insert("/app".to_string(), cgs);
+
+        let mut out = String::new();
+        write_show(
+            &mut out,
+            &snap,
+            ctprof_compare::GroupBy::Cgroup,
+            &[],
+            false,
+            false,
+            &[],
+            &[],
+            &[],
+            &[],
+            false,
+        )
+        .expect("write_show into String must not fail");
+
+        assert!(
+            out.contains("## Cgroup limits / knobs"),
+            "limits section must render when a cgroup exposes a knob:\n{out}",
+        );
+        assert!(
+            out.contains("50.000ms/100.000ms"),
+            "cpu.max 50_000µs/100_000µs must render via format_cpu_max \
+             as '50.000ms/100.000ms':\n{out}",
+        );
+        assert!(
+            out.contains(" 200 "),
+            "cpu.weight 200 must render via format_scaled_u64(Unitless) \
+             as the bare integer 200:\n{out}",
+        );
+        assert!(
+            out.contains("2.000GiB"),
+            "memory.max 2 GiB must render via format_optional_limit(Bytes) \
+             as '2.000GiB':\n{out}",
+        );
+        assert!(
+            out.contains(" 7 "),
+            "pids.current 7 must render via format_scaled_u64(Unitless) \
+             as the bare integer 7:\n{out}",
+        );
+        // memory.high=None and pids.max=None both render the `max`
+        // token (format_optional_limit's None arm). The column
+        // headers (`cpu.max`, `memory.max`, `pids.max`) carry
+        // `max` as a substring of a dotted token, so assert the
+        // space-padded standalone cell `" max "` to prove the
+        // None→`max` rendering rather than matching a header.
+        assert!(
+            out.contains(" max "),
+            "memory.high=None / pids.max=None must render the standalone \
+             `max` cell via format_optional_limit's None arm:\n{out}",
+        );
+    }
+
+    /// `write_show` under `GroupBy::Cgroup` emits the
+    /// `## memory.stat` long-table and suppresses zero-valued
+    /// rows. Pins the section gate
+    /// (`any(|v| *v != 0)`) and the per-row
+    /// `if *stat_value == 0 { continue; }` skip: a
+    /// non-zero `anon` key renders one row (`format_scaled_u64`
+    /// steps `4096` up to `4.096K`), while a zero `file` key is
+    /// suppressed entirely.
+    #[test]
+    fn write_show_emits_memory_stat_table_suppressing_zero_rows() {
+        let (mut snap, mut cgs) = cgroup_fixture();
+        cgs.memory.stat.insert("anon".to_string(), 4096);
+        cgs.memory.stat.insert("file".to_string(), 0);
+        snap.cgroup_stats.insert("/app".to_string(), cgs);
+
+        let mut out = String::new();
+        write_show(
+            &mut out,
+            &snap,
+            ctprof_compare::GroupBy::Cgroup,
+            &[],
+            false,
+            false,
+            &[],
+            &[],
+            &[],
+            &[],
+            false,
+        )
+        .expect("write_show into String must not fail");
+
+        assert!(
+            out.contains("## memory.stat"),
+            "memory.stat section must render when any key is non-zero:\n{out}",
+        );
+        assert!(
+            out.contains("anon"),
+            "non-zero `anon` key must render a row:\n{out}",
+        );
+        assert!(
+            out.contains("4.096K"),
+            "anon=4096 must render via format_scaled_u64(Unitless) \
+             stepping up to '4.096K':\n{out}",
+        );
+        assert!(
+            !out.contains("file"),
+            "zero-valued `file` key must be suppressed by the if *stat_value == 0 \
+             continue:\n{out}",
+        );
+    }
+
+    /// `write_show` under `GroupBy::Cgroup` emits the
+    /// `## memory.events` long-table and suppresses zero-count
+    /// events. Pins the section gate and the per-row
+    /// `if *event_value == 0 { continue; }` skip: a
+    /// non-zero `oom_kill` event renders one row (`3` below the
+    /// 1e3 ladder step → bare integer), while a zero `low` event
+    /// is suppressed.
+    #[test]
+    fn write_show_emits_memory_events_table_suppressing_zero_rows() {
+        let (mut snap, mut cgs) = cgroup_fixture();
+        cgs.memory.events.insert("oom_kill".to_string(), 3);
+        cgs.memory.events.insert("low".to_string(), 0);
+        snap.cgroup_stats.insert("/app".to_string(), cgs);
+
+        let mut out = String::new();
+        write_show(
+            &mut out,
+            &snap,
+            ctprof_compare::GroupBy::Cgroup,
+            &[],
+            false,
+            false,
+            &[],
+            &[],
+            &[],
+            &[],
+            false,
+        )
+        .expect("write_show into String must not fail");
+
+        assert!(
+            out.contains("## memory.events"),
+            "memory.events section must render when any event is non-zero:\n{out}",
+        );
+        assert!(
+            out.contains("oom_kill"),
+            "non-zero `oom_kill` event must render a row:\n{out}",
+        );
+        assert!(
+            out.contains(" 3 "),
+            "oom_kill=3 must render via format_scaled_u64(Unitless) \
+             as the bare integer 3:\n{out}",
+        );
+        assert!(
+            !out.contains("low"),
+            "zero-count `low` event must be suppressed by the if *event_value == 0 \
+             continue:\n{out}",
+        );
+    }
+
+    /// `write_show` under `GroupBy::Cgroup` emits per-cgroup
+    /// `## Pressure / <resource>` sub-tables and skips resources
+    /// with no data. Pins the section gate, the
+    /// per-resource `if !any_data { continue; }` skip,
+    /// and the `some`/`full` row rendering via `format_psi_avg`
+    /// (centi-percent → `N.NN%`) + `format_scaled_u64(Us)`. Only
+    /// `cpu.some` is populated, so the `cpu` sub-table renders
+    /// while `memory` / `io` (all-zero) are skipped.
+    #[test]
+    fn write_show_emits_per_cgroup_pressure_tables_skipping_zero_resources() {
+        let (mut snap, mut cgs) = cgroup_fixture();
+        // cpu.some.avg10=1859 centi-percent → format_psi_avg →
+        // "18.59%". cpu.some.total_usec=1_500_000 →
+        // format_scaled_u64(Us) → "1.500s".
+        cgs.psi.cpu.some.avg10 = 1859;
+        cgs.psi.cpu.some.total_usec = 1_500_000;
+        snap.cgroup_stats.insert("/app".to_string(), cgs);
+
+        let mut out = String::new();
+        write_show(
+            &mut out,
+            &snap,
+            ctprof_compare::GroupBy::Cgroup,
+            &[],
+            false,
+            false,
+            &[],
+            &[],
+            &[],
+            &[],
+            false,
+        )
+        .expect("write_show into String must not fail");
+
+        assert!(
+            out.contains("## Pressure / cpu"),
+            "cpu pressure sub-table must render when cpu PSI has data:\n{out}",
+        );
+        assert!(
+            out.contains("18.59%"),
+            "cpu.some.avg10=1859 must render via format_psi_avg as '18.59%':\n{out}",
+        );
+        assert!(
+            out.contains("1.500s"),
+            "cpu.some.total_usec=1_500_000 must render via \
+             format_scaled_u64(Us) as '1.500s':\n{out}",
+        );
+        assert!(
+            out.contains("some"),
+            "the `some` PSI row must render:\n{out}",
+        );
+        assert!(
+            out.contains("full"),
+            "the `full` PSI row must render:\n{out}",
+        );
+        assert!(
+            !out.contains("## Pressure / memory"),
+            "all-zero memory PSI must be skipped by the if !any_data \
+             continue:\n{out}",
+        );
+        assert!(
+            !out.contains("## Pressure / io"),
+            "all-zero io PSI must be skipped by the if !any_data \
+             continue:\n{out}",
+        );
+    }
+
+    /// `write_show` emits host-level `## Host pressure / <resource>`
+    /// sub-tables (group-by-independent) and skips resources with
+    /// no data. Pins the section gate
+    /// (`host_psi_has_data`), the per-resource
+    /// `if !psi_resource_has_data(&r) { continue; }` skip,
+    /// and the `some`/`full` row render. Only
+    /// `memory.full` is populated, so the `memory` sub-table
+    /// renders while `cpu` (all-zero) is skipped. The host PSI
+    /// header is `row | avg10 | avg60 | avg300 | total` with no
+    /// `cgroup` column — assert the cgroup token is absent from
+    /// the host-pressure region.
+    #[test]
+    fn write_show_emits_host_pressure_tables_skipping_zero_resources() {
+        let mut snap = ktstr::ctprof::CtprofSnapshot::default();
+        // A thread keeps the primary table populated, but the host
+        // PSI block is independent of grouping.
+        let mut t = ktstr::ctprof::ThreadState::default();
+        t.pcomm = "worker".to_string();
+        t.comm = "w".to_string();
+        snap.threads.push(t);
+        // memory.full.avg60=500 centi-percent → format_psi_avg →
+        // "5.00%". memory.full.total_usec=2_000_000 →
+        // format_scaled_u64(Us) → "2.000s".
+        snap.psi.memory.full.avg60 = 500;
+        snap.psi.memory.full.total_usec = 2_000_000;
+
+        let mut out = String::new();
+        write_show(
+            &mut out,
+            &snap,
+            ctprof_compare::GroupBy::Pcomm,
+            &[],
+            false,
+            false,
+            &[],
+            &[],
+            &[],
+            &[],
+            false,
+        )
+        .expect("write_show into String must not fail");
+
+        let host_at = out
+            .find("## Host pressure / memory")
+            .expect("host memory pressure sub-table must render");
+        assert!(
+            out.contains("5.00%"),
+            "memory.full.avg60=500 must render via format_psi_avg as '5.00%':\n{out}",
+        );
+        assert!(
+            out.contains("2.000s"),
+            "memory.full.total_usec=2_000_000 must render via \
+             format_scaled_u64(Us) as '2.000s':\n{out}",
+        );
+        assert!(
+            !out.contains("## Host pressure / cpu"),
+            "all-zero host cpu PSI must be skipped by the \
+             psi_resource_has_data continue:\n{out}",
+        );
+        // The host-pressure header omits the `cgroup` column the
+        // per-cgroup PSI tables carry. Slice from the host-pressure
+        // index so a `cgroup` token elsewhere in the output (the
+        // primary table never carries one under Pcomm, but be
+        // precise) cannot mask a regression that re-added the
+        // column to the host header.
+        let host_region = &out[host_at..];
+        assert!(
+            !host_region.contains("cgroup"),
+            "host pressure header is `row | avg10 | avg60 | avg300 | total` \
+             with no cgroup column:\n{host_region}",
+        );
+    }
+
+    /// `write_show` emits the `## sched_ext` table when the
+    /// snapshot carries `sched_ext = Some(..)`. Pins the section
+    /// gate, the non-empty-state branch of the
+    /// `state_cell` ternary (`state="enabled"` renders
+    /// verbatim, NOT the `-` sentinel), and the five counter rows
+    /// rendered via `format_scaled_u64(Unitless)`
+    /// (`enable_seq=1234` steps up to `1.234K`; `switch_all=1`
+    /// stays the bare integer). `snap.sched_ext` defaults to
+    /// `None`, so this block is otherwise dead in tests. The
+    /// counter-cell assertions are sliced from the `## sched_ext`
+    /// index so the single-digit cells (`switch_all=1`) can't
+    /// match the primary table's threads count.
+    #[test]
+    fn write_show_emits_sched_ext_table_with_state_and_scaled_counters() {
+        let mut snap = ktstr::ctprof::CtprofSnapshot::default();
+        let mut t = ktstr::ctprof::ThreadState::default();
+        t.pcomm = "worker".to_string();
+        t.comm = "w".to_string();
+        snap.threads.push(t);
+        // `SchedExtSysfs` is `#[non_exhaustive]` in the lib — build
+        // via Default + per-field assignment.
+        let mut scx = ktstr::ctprof::SchedExtSysfs::default();
+        scx.state = "enabled".to_string();
+        scx.switch_all = 1;
+        scx.nr_rejected = 2;
+        scx.hotplug_seq = 3;
+        scx.enable_seq = 1234;
+        snap.sched_ext = Some(scx);
+
+        let mut out = String::new();
+        write_show(
+            &mut out,
+            &snap,
+            ctprof_compare::GroupBy::Pcomm,
+            &[],
+            false,
+            false,
+            &[],
+            &[],
+            &[],
+            &[],
+            false,
+        )
+        .expect("write_show into String must not fail");
+
+        let scx_at = out
+            .find("## sched_ext")
+            .expect("sched_ext section must render when snap.sched_ext is Some");
+        let scx_region = &out[scx_at..];
+        assert!(
+            scx_region.contains("state"),
+            "sched_ext table must carry the `state` attr row:\n{scx_region}",
+        );
+        assert!(
+            scx_region.contains("enabled"),
+            "non-empty state must render verbatim ('enabled'), NOT the `-` \
+             sentinel:\n{scx_region}",
+        );
+        assert!(
+            scx_region.contains("switch_all"),
+            "sched_ext table must carry the `switch_all` row:\n{scx_region}",
+        );
+        assert!(
+            scx_region.contains("nr_rejected"),
+            "sched_ext table must carry the `nr_rejected` row:\n{scx_region}",
+        );
+        assert!(
+            scx_region.contains("1.234K"),
+            "enable_seq=1234 must render via format_scaled_u64(Unitless) \
+             stepping up to '1.234K':\n{scx_region}",
+        );
+        assert!(
+            scx_region.contains(" 1 "),
+            "switch_all=1 must render via format_scaled_u64(Unitless) \
+             as the bare integer 1:\n{scx_region}",
+        );
+    }
+
+    /// `write_show` with a non-empty `sections` whitelist
+    /// restricts output to the named sections. Pins the
+    /// restrict-to-named-entries branch of
+    /// `DisplayOptions::is_section_enabled`: `--sections derived`
+    /// suppresses the `## Primary metrics` outer gate (neither
+    /// Primary nor TaskstatsDelay enabled) while still
+    /// emitting `## Derived metrics`; the converse
+    /// `--sections primary` does the inverse. Every existing
+    /// write_show test passes `&[]` (empty = all-on), so this
+    /// branch is otherwise uncovered. The fixture mirrors
+    /// `write_show_emits_derived_section` so `avg_slice_ns`
+    /// resolves to a real derived row.
+    #[test]
+    fn write_show_sections_filter_suppresses_unnamed_sections() {
+        let mut snap = ktstr::ctprof::CtprofSnapshot::default();
+        let mut t = ktstr::ctprof::ThreadState::default();
+        t.pcomm = "worker".to_string();
+        t.comm = "w".to_string();
+        t.run_time_ns = MonotonicNs(4_000);
+        t.timeslices = MonotonicCount(8);
+        snap.threads.push(t);
+
+        // `--sections derived`: Primary outer gate is false
+        // (neither Primary nor TaskstatsDelay enabled), Derived
+        // gate is true.
+        let mut derived_only = String::new();
+        write_show(
+            &mut derived_only,
+            &snap,
+            ctprof_compare::GroupBy::Pcomm,
+            &[],
+            false,
+            false,
+            &[],
+            &[],
+            &[ctprof_compare::Section::Derived],
+            &[],
+            false,
+        )
+        .expect("write_show into String must not fail");
+        assert!(
+            !derived_only.contains("## Primary metrics"),
+            "`--sections derived` must suppress the Primary section:\n{derived_only}",
+        );
+        assert!(
+            derived_only.contains("## Derived metrics"),
+            "`--sections derived` must still emit the Derived section:\n{derived_only}",
+        );
+
+        // Converse: `--sections primary` emits Primary, suppresses
+        // Derived.
+        let mut primary_only = String::new();
+        write_show(
+            &mut primary_only,
+            &snap,
+            ctprof_compare::GroupBy::Pcomm,
+            &[],
+            false,
+            false,
+            &[],
+            &[],
+            &[ctprof_compare::Section::Primary],
+            &[],
+            false,
+        )
+        .expect("write_show into String must not fail");
+        assert!(
+            primary_only.contains("## Primary metrics"),
+            "`--sections primary` must emit the Primary section:\n{primary_only}",
+        );
+        assert!(
+            !primary_only.contains("## Derived metrics"),
+            "`--sections primary` must suppress the Derived section:\n{primary_only}",
+        );
+    }
+
+    /// `run_show` parses `--sort-by` BEFORE loading the snapshot:
+    /// an invalid spec must surface its parse
+    /// error even when the snapshot path does not exist, proving
+    /// the parse precedes the load. Pins the fail-fast ordering
+    /// contract — the flattened error chain carries the
+    /// `parse --sort-by` context label and NOT the
+    /// `load snapshot` label. No existing test drives
+    /// `run_show`; the parse guards are otherwise uncovered.
+    #[test]
+    fn run_show_fails_fast_on_invalid_sort_by_before_snapshot_load() {
+        let args = CtprofShowArgs {
+            snapshot: std::path::PathBuf::from("/nonexistent/snap.ctprof.zst"),
+            group_by: ShowGroupBy::Pcomm,
+            cgroup_flatten: vec![],
+            no_thread_normalize: false,
+            no_cg_normalize: false,
+            // Invalid direction `bogusdir` makes parse_sort_by bail
+            // before the snapshot is touched.
+            sort_by: "not_a_metric:bogusdir".to_string(),
+            columns: String::new(),
+            sections: String::new(),
+            metrics: String::new(),
+            wrap: false,
+            limit: 0,
+        };
+        let err = run_show(&args).expect_err(
+            "an invalid --sort-by spec must fail before the absent snapshot \
+             is loaded",
+        );
+        // `{:#}` flattens the anyhow context chain so the
+        // context-label substrings are reachable.
+        let flat = format!("{err:#}");
+        assert!(
+            flat.contains("parse --sort-by"),
+            "error must come from the sort-by parser (the `parse --sort-by` \
+             with_context label), got: {flat}",
+        );
+        assert!(
+            !flat.contains("load snapshot"),
+            "the snapshot load must not run — its `load snapshot` context \
+             label must be absent, proving the parse fails first, got: {flat}",
         );
     }
 }

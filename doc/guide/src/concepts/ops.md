@@ -93,8 +93,10 @@ docstring at `Op::MoveAllTasks` for the asymmetric-ownership table.
 `WriteKernelHot`, `WriteKernelCold`, `ReadKernelHot`, `ReadKernelCold`,
 `AttachScheduler`, `DetachScheduler`, `RestartScheduler`,
 `ReplaceScheduler`, `PinBpfMap`, `CaptureCgroupProcs`) with none of the
-inner fields, so it is cheap to copy and use as a map key. Framework code uses `OpKind` when it
-only cares WHICH operation ran (per-op statistics, stimulus-event
+inner fields, so it is `Copy` and cheap to pass around — framework
+code maps each variant to a unique bit index via `OpKind::bit_index()`
+to build the per-step `op_kinds` bitmask. Framework code uses `OpKind`
+when it only cares WHICH operation ran (per-op statistics, stimulus-event
 tagging, verifier/monitor bookkeeping) without the payload. Test
 authors rarely spell `OpKind` directly — the `strum::EnumIter`
 derive also lets tooling enumerate every `OpKind` variant for

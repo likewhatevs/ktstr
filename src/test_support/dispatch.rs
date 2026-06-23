@@ -28,20 +28,32 @@ use crate::assert::AssertResult;
 #[cfg(feature = "export")]
 use super::extract_export_output_arg;
 use super::{
-    KTSTR_TESTS, KtstrTestEntry, TopoOverride, collect_sidecars, extract_export_test_arg,
-    extract_shell_test_arg, extract_test_fn_arg, extract_topo_arg, find_test,
-    format_callback_profile, format_kvm_stats, format_verifier_stats, maybe_dispatch_vm_test,
-    parse_topo_string, propagate_rust_env_from_cmdline, record_skip_sidecar, resolve_test_kernel,
-    run_ktstr_test_inner, sidecar_dir, try_flush_profraw,
+    HostClass, KTSTR_TESTS, KtstrTestEntry, TopoOverride, classify_host_error, collect_sidecars,
+    extract_export_test_arg, extract_shell_test_arg, extract_test_fn_arg, extract_topo_arg,
+    find_test, format_callback_profile, format_kvm_stats, format_verifier_stats,
+    maybe_dispatch_vm_test, parse_topo_string, propagate_rust_env_from_cmdline,
+    record_skip_sidecar, resolve_test_kernel, run_ktstr_test_inner, sidecar_dir, try_flush_profraw,
 };
 
-/// Check if an error is a host topology mismatch (e.g. test
-/// requests 2 LLCs but host has 1). String-match because the
-/// error is a plain `anyhow::Error`, not a typed error.
+/// Check if an error is a host topology mismatch (e.g. test requests
+/// 2 LLCs but host has 1, or more CPUs than the host carries).
+///
+/// Walks the FULL error chain via `e.chain().any(...)` so a
+/// [`TopologyInsufficient`] wrapped in `.context(...)` (the
+/// `crate::test_support::eval` `"build ktstr_test VM"` / `"run
+/// ktstr_test VM"` wrappers) is still recognised — mirrors
+/// [`is_resource_contention`]. Replaced a fragile message string-match
+/// (`"need"` + `"LLC"`/`"CPU"`) that would misclassify any unrelated
+/// error happening to contain those words as a topology skip.
+///
+/// [`TopologyInsufficient`]: crate::vmm::host_topology::TopologyInsufficient
 #[doc(hidden)]
 pub fn is_topology_insufficient(e: &anyhow::Error) -> bool {
-    let msg = format!("{e:#}");
-    msg.contains("need") && (msg.contains("LLC") || msg.contains("CPU"))
+    e.chain().any(|cause| {
+        cause
+            .downcast_ref::<crate::vmm::host_topology::TopologyInsufficient>()
+            .is_some()
+    })
 }
 
 /// Check if an `anyhow::Error` carries a [`ResourceContention`].
@@ -73,21 +85,91 @@ pub fn is_resource_contention(e: &anyhow::Error) -> bool {
     })
 }
 
+/// Check if an `anyhow::Error` carries a [`PerfModeUnavailable`].
+///
+/// Chain-aware (walks `e.chain()`), like [`is_topology_insufficient`].
+/// A `PerfModeUnavailable` is a HOST-INSUFFICIENCY skip, like RC/TI: the
+/// host fundamentally cannot honor an explicitly-requested perf-mode
+/// guarantee (too few CPUs for an exclusive host LLC + a service CPU).
+/// The VM is never run unisolated (it errors at build), so
+/// `result_to_exit_code` and the macro body route it to a VISIBLE skip
+/// by default, promoted to a FAIL banner under `KTSTR_NO_SKIP_MODE`.
+///
+/// [`PerfModeUnavailable`]: crate::vmm::host_topology::PerfModeUnavailable
+#[doc(hidden)]
+pub fn is_perf_mode_unavailable(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| {
+        cause
+            .downcast_ref::<crate::vmm::host_topology::PerfModeUnavailable>()
+            .is_some()
+    })
+}
+
+/// Check if an `anyhow::Error` carries a [`CpuBudgetUnsatisfiable`].
+///
+/// Chain-aware. A `CpuBudgetUnsatisfiable` is a HARD ERROR (an explicit
+/// `--cpu-cap` / `cpu_budget` number the host cannot satisfy), NOT a skip.
+///
+/// [`CpuBudgetUnsatisfiable`]: crate::vmm::host_topology::CpuBudgetUnsatisfiable
+#[doc(hidden)]
+pub fn is_cpu_budget_unsatisfiable(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| {
+        cause
+            .downcast_ref::<crate::vmm::host_topology::CpuBudgetUnsatisfiable>()
+            .is_some()
+    })
+}
+
+/// Check if an `anyhow::Error` carries a [`TopologyUnrepresentable`].
+///
+/// Chain-aware. A `TopologyUnrepresentable` is a HARD ERROR (a topology no
+/// host can represent under this VMM's static device layout — the aarch64
+/// over-`MAX_VCPUS` GICv3-redistributor case), NOT a skip.
+/// `classify_host_error` classifies it as `HostClass::Fail`, checked above
+/// the RC/TI skip types and handled above the `expect_err` inversion in
+/// both `err_to_exit_code` and the macro body, so a too-wide aarch64
+/// topology can neither masquerade as the expected failure nor be turned
+/// into a silent skip. Distinct from [`is_topology_insufficient`], which
+/// matches the host-DEPENDENT skip type.
+///
+/// [`TopologyUnrepresentable`]: crate::vmm::host_topology::TopologyUnrepresentable
+#[doc(hidden)]
+pub fn is_topology_unrepresentable(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| {
+        cause
+            .downcast_ref::<crate::vmm::host_topology::TopologyUnrepresentable>()
+            .is_some()
+    })
+}
+
 /// Predicate: walks the [`anyhow::Error`] chain looking for a
-/// [`KernelUnavailable`] cause. Used by the `#[ktstr_test]`
-/// macro's wrapper to distinguish "harness not configured" (skip)
-/// from "test failed" (panic).
+/// [`KernelUnavailable`] cause. Used by `classify_host_error` to classify
+/// a no-kernel host as a skip-class host-insufficiency.
 ///
 /// The harness signals "I have no kernel to boot, the binary was
 /// likely invoked outside `cargo ktstr test`" by surfacing
-/// [`KernelUnavailable`] rather than a generic
-/// `anyhow::bail!`. The macro wrapper emits the canonical
-/// `ktstr: SKIP: harness not configured: ...` banner and
-/// early-returns so libtest sees pass — same shape as the
-/// resource-contention SKIP arm. `pub` because the macro-generated
-/// `#[test]` body in `ktstr-macros` references it by absolute
-/// path; `#[doc(hidden)]` keeps it out of rustdoc — plumbing, not
-/// user API.
+/// [`KernelUnavailable`] rather than a generic `anyhow::bail!`.
+/// `classify_host_error` maps it to `HostClass::Skip` (the canonical
+/// `ktstr: SKIP: harness not configured: ...` banner), promoted to a FAIL
+/// under `KTSTR_NO_SKIP_MODE` — same shape as the resource-contention skip.
+/// `pub` + `#[doc(hidden)]`: plumbing re-exported from `test_support`
+/// alongside the sibling `is_*` predicates, not user API.
+///
+/// Both consumers route a `KernelUnavailable` through the shared
+/// [`classify_host_error`] (a no-kernel host is a skip-class
+/// host-insufficiency): `err_to_exit_code` and the `#[ktstr_test]` macro
+/// body both SKIP it by default, promoted to a FAIL under
+/// `KTSTR_NO_SKIP_MODE`. Under nextest the plain `#[test]` wrapper is
+/// suppressed, so an entry dispatches as `ktstr/{name}` via `run_named_test`
+/// → `err_to_exit_code` — meaning a developer running `cargo nextest run`,
+/// or `cargo ktstr test` without `--kernel`, on a kernel-less host gets a
+/// clean skip rather than a hard fail on every entry. This cannot mask a CI
+/// kernel-build failure: a requested `--kernel` that fails to build bails in
+/// cargo-ktstr (`resolve_kernel_set`) before nextest is spawned, so a
+/// `KernelUnavailable` here only ever means "no kernel was requested".
+/// Pinned by `result_to_exit_code_kernel_unavailable_skips_on_dispatch_path`.
+///
+/// [`classify_host_error`]: crate::test_support::classify_host_error
 ///
 /// [`KernelUnavailable`]: crate::test_support::eval::KernelUnavailable
 #[doc(hidden)]
@@ -495,7 +577,7 @@ pub fn ktstr_test_early_dispatch() {
         // and is reachable ONLY under nextest. Every real ktstr
         // entry produces topology-preset variants under nextest
         // (`for_each_gauntlet_variant` iterates
-        // `crate::vm::gauntlet_presets()`). Without nextest those
+        // `crate::gauntlet::gauntlet_presets()`). Without nextest those
         // variants would silently not run — coverage loss with no
         // error. Emit a one-shot stderr `warning:` diagnostic (see
         // the `eprintln!` below) when the binary carries any real
@@ -851,42 +933,6 @@ fn maybe_dispatch_host_test() -> Option<i32> {
     }
 }
 
-/// Coverage-skip name list for VM-booting tests whose guest /init
-/// trips an AP-kill exit early in boot under coverage-instrumented
-/// `current_exe` binaries. See [`run_ktstr_test`] for the gate that
-/// consumes this list and the rationale for skipping at host scope.
-fn coverage_skip_under_instrumented_init(name: &str) -> bool {
-    matches!(
-        name,
-        "live_var_resolves_across_same_binary_swap"
-            | "snapshot_real_capture_op_snapshot"
-            | "snapshot_real_capture_op_watch_snapshot"
-            | "snapshot_real_capture_wide_smp"
-            | "principled_active_scheduler_walker_resolves_active_obj"
-            | "stats_bridge_round_trip"
-            | "op_spawn_cgroup_empty_string_bails_with_actionable_diagnostic"
-    )
-}
-
-/// Whether a resolved test entry must be coverage-skipped on host
-/// before any VM boots: the binary is coverage-instrumented AND the
-/// entry is a VM-booting (non-`host_only`) test on the
-/// [`coverage_skip_under_instrumented_init`] list (those trip an
-/// AP-kill exit in the guest /init under an instrumented `current_exe`).
-///
-/// Takes the resolved `entry`, not a name string, so a caller cannot
-/// pass a decorated `{name}/{kernel_label}` form by mistake — the
-/// lookup key is always `entry.name`, the bare name the list matches
-/// on. (Passing the decorated form was the bug this gate had in
-/// `run_named_test`: exact-match `find_test` never resolved it, so the
-/// guard silently never fired for multi-kernel runs.) `instrumented`
-/// is injected rather than read from
-/// `current_binary_is_coverage_instrumented`'s `OnceLock` detector so
-/// the decision is unit-testable without an ELF-symtab seam.
-fn should_coverage_skip(instrumented: bool, entry: &KtstrTestEntry) -> bool {
-    instrumented && !entry.host_only && coverage_skip_under_instrumented_init(entry.name)
-}
-
 /// Host-side entry point: build a VM, boot it with `--ktstr-test-fn=NAME`,
 /// extract profraw from SHM, and return the test result.
 ///
@@ -899,28 +945,6 @@ pub fn run_ktstr_test(entry: &KtstrTestEntry) -> Result<AssertResult> {
     // dynamically) hit the same bail messages the macro produces at
     // compile time.
     entry.validate()?;
-
-    // Host-side coverage skip for VM-booting tests whose guest /init
-    // trips an AP-kill exit under coverage-instrumented `current_exe`
-    // binaries. Per-test in-body skip checks cannot save these tests:
-    // the guest either dies during boot before the body runs, or boots
-    // and the body returns Skip but the always-honored host-side post_vm
-    // callback then fails on the absent capture. Catching the case here,
-    // on host, before any VM is built, lets nextest surface a clean SKIP
-    // instead of burning the 31-retry budget on a doomed boot path.
-    // The hardcoded list mirrors the coverage-skip surface other
-    // sites guard locally; deferral until a non-instrumented /init
-    // binary is wired stays the principled fix.
-    if should_coverage_skip(
-        crate::test_support::current_binary_is_coverage_instrumented(),
-        entry,
-    ) {
-        return Ok(AssertResult::skip(format!(
-            "coverage-instrumented /init AP-kill — {}; deferred until \
-             non-instrumented /init binary is wired",
-            entry.name,
-        )));
-    }
 
     if entry.host_only {
         return run_host_only_test_inner(entry);
@@ -1009,191 +1033,212 @@ fn result_to_exit_code(
 ) -> i32 {
     let no_skip = std::env::var_os(crate::KTSTR_NO_SKIP_MODE_ENV).is_some();
     match result {
-        // A Skip degenerates to EXIT_PASS regardless of expect_err — the
-        // test never evaluated, so there is no guest failure to "expect"
-        // (the `Fail > Inconclusive > Pass > Skip` projection; mirrors the
-        // ResourceContention Err arm below, but on the Ok side). Without
-        // this arm a post_vm_skip under expect_err falls into the
-        // `Ok(r) if expect_err` arm and surfaces as "expected error but
-        // test passed" (EXIT_FAIL) — a load-starvation placeholder-dump
-        // skip becomes a flaky failure. End-to-end chain: a post_vm
-        // callback returns Err(post_vm_skip(..)) → the eval gate detects
-        // the HostSkipRequest marker, reports via report::test_skip, and
-        // returns Ok(AssertResult::skip) → this arm maps it to EXIT_PASS.
-        // is_skip() is true only when `outcomes` is non-empty and every
-        // outcome is Outcome::Skip (assert/mod.rs); the empty-outcomes
-        // Pass identity has is_skip()==false and falls through to the
-        // `Ok(_) => EXIT_PASS` arm.
-        Ok(r) if r.is_skip() => EXIT_PASS,
-        Ok(r) if expect_err => {
-            // expect_err inverts on Pass and on Inconclusive: both
-            // are "not a failure" in the operator's mental model,
-            // and an expect_err scenario that produces an
-            // Inconclusive verdict (denominator zero) failed to
-            // produce the expected failure just like a Pass would.
-            // Surface the inconclusive as exit code 2 to preserve
-            // the distinct verdict, but treat it as expect_err
-            // satisfaction failure (exit 1) — the test author
-            // wanted a Fail, not "the gate could not run".
-            //
-            // `allow_inconclusive` does NOT relax the expect_err
-            // contract: expect_err demands a real Fail, and an
-            // Inconclusive verdict does not satisfy that
-            // regardless of how the test author scopes
-            // Inconclusive elsewhere. The dominant gate wins;
-            // `allow_inconclusive` only relaxes the
-            // EXIT_INCONCLUSIVE projection on the no-expect_err
-            // path below.
-            if r.is_inconclusive() {
-                eprintln!(
-                    "expected error but test produced an Inconclusive verdict — \
-                     zero-denominator gate could not evaluate; expect_err is \
-                     unsatisfied"
-                );
-                EXIT_FAIL
-            } else {
-                eprintln!("expected error but test passed");
-                EXIT_FAIL
-            }
-        }
-        Ok(r) if r.is_inconclusive() => {
-            // `allow_inconclusive` opt-in: a test author may have
-            // declared `#[ktstr_test(allow_inconclusive)]` to
-            // signal "this test's Inconclusive arm is acceptable —
-            // don't fail the CI gate." Route to EXIT_PASS in that
-            // case (Inconclusive is still recorded in the sidecar
-            // for stats tooling and the operator-facing failure
-            // dump still renders the diagnostic). When the flag
-            // is unset (the default) the verdict surfaces as
-            // EXIT_INCONCLUSIVE so the operator triages it.
-            if allow_inconclusive {
-                eprintln!(
-                    "test produced an Inconclusive verdict but \
-                     `allow_inconclusive` is set — routing to EXIT_PASS \
-                     for CI gate, sidecar still records Inconclusive"
-                );
-                EXIT_PASS
-            } else {
-                EXIT_INCONCLUSIVE
-            }
-        }
-        Ok(_) => EXIT_PASS,
-        Err(e) if is_resource_contention(&e) => {
-            let reason = e
-                .chain()
-                .find_map(|c| {
-                    c.downcast_ref::<crate::vmm::host_topology::ResourceContention>()
-                        .map(|rc| rc.reason.clone())
-                })
-                .unwrap_or_else(|| "<unknown>".to_string());
-            if no_skip {
-                eprintln!(
-                    "ktstr: FAIL: resource contention under --no-skip-mode: {reason}. \
-                     Either provision hardware that satisfies the test's topology \
-                     requirement, or drop --no-skip-mode / KTSTR_NO_SKIP_MODE to \
-                     accept the skip."
-                );
-                EXIT_FAIL
-            } else {
-                crate::report::test_skip(format_args!("resource contention: {reason}"));
-                EXIT_PASS
-            }
-        }
-        Err(e) if is_topology_insufficient(&e) => {
-            if no_skip {
-                eprintln!(
-                    "ktstr: FAIL: host topology insufficient under --no-skip-mode: {e:#}. \
-                     Either provision a host with the required CPU / LLC count, or drop \
-                     --no-skip-mode / KTSTR_NO_SKIP_MODE to accept the skip."
-                );
-                EXIT_FAIL
-            } else {
-                crate::report::test_skip(format_args!("host topology insufficient: {e:#}"));
-                EXIT_PASS
-            }
-        }
-        Err(e)
-            if e.downcast_ref::<crate::test_support::eval::PostVmAssertionFailure>()
-                .is_some() =>
-        {
-            // A host-side post_vm / post_vm_unconditional callback
-            // failed. This is a real regression that must surface
-            // regardless of expect_err / expect_auto_repro inversion —
-            // those invert a GUEST-side expected failure, but a
-            // HOST-side check is always honored. Positioned AFTER the
-            // resource-contention / topology skip arms (a skip means
-            // the test never ran, so there was no host-side state to
-            // assert) but BEFORE the ExpectAutoReproSatisfied and
-            // expect_err inversion arms so the host-side regression
-            // wins. `downcast_ref` walks the anyhow context+source
-            // chain (the marker rides as `.context(...)` from
-            // run_ktstr_test_inner_impl); a raw `chain().any(is::<C>())`
-            // would miss it (anyhow boxes context as ContextError<C,E>).
-            eprintln!("{e:#}");
-            EXIT_FAIL
-        }
-        Err(e)
-            if e.downcast_ref::<crate::test_support::eval::ExpectAutoReproSatisfied>()
-                .is_some() =>
-        {
-            // `expect_auto_repro = true` was satisfied: the primary
-            // VM produced a Fail AND the auto-repro VM landed a
-            // shape-valid `.repro.wprof.pb`. The eval layer attached
-            // the marker as `anyhow::Context`. `downcast_ref` walks
-            // the anyhow context+source chain (per anyhow's
-            // documentation: "For errors with context, this method
-            // returns true if E matches the type of the context C or
-            // the type of the error on which the context has been
-            // attached"). A `chain().any(|c| c.is::<E>())` walk on
-            // the raw `&dyn StdError` chain would MISS the marker
-            // because anyhow boxes context as `ContextError<C, E>`
-            // whose underlying `is::<C>()` check returns false. The
-            // diagnostic is printed so the operator sees both the
-            // original failure trail and the inversion notice — the
-            // verdict flips to PASS without erasing the failure
-            // detail. Positioned AFTER the ResourceContention /
-            // TopologyInsufficient arms so a skip-class outcome still
-            // wins over inversion (a skip is a skip regardless of the
-            // satisfaction signal). The macro-parse cross-attribute
-            // check rejects `expect_auto_repro` combined with
-            // `expect_err`, so the two inversion paths are mutually
-            // exclusive at the entry layer.
-            eprintln!("{e:#}");
-            EXIT_PASS
-        }
-        Err(e) if expect_err => {
-            // expect_err inverts a failure into a pass — UNLESS the
-            // failure carries the
-            // [`crate::test_support::eval::ScxBpfErrorMatcherMismatch`]
-            // marker, which signals that the reproducer's scx_bpf_error
-            // matcher rejected this particular failure. A matcher-
-            // mismatch failure must surface even when expect_err = true:
-            // the user authored the matcher to pin THIS specific bug,
-            // and a different bug firing is itself a regression.
-            //
-            // `downcast_ref` walks the anyhow context+source chain
-            // (anyhow's documented "For errors with context, this
-            // method returns true if E matches the type of the context
-            // C or the type of the error on which the context has been
-            // attached" semantics). A `chain().any(|c| c.is::<E>())`
-            // walk on the raw `&dyn StdError` chain would MISS the
-            // marker because anyhow boxes context as
-            // `ContextError<C, E>` whose underlying `is::<C>()` check
-            // returns false.
-            if e.downcast_ref::<crate::test_support::eval::ScxBpfErrorMatcherMismatch>()
-                .is_some()
-            {
-                eprintln!("{e:#}");
-                EXIT_FAIL
-            } else {
-                EXIT_PASS
-            }
-        }
-        Err(e) => {
-            eprintln!("{e:#}");
-            EXIT_FAIL
+        Ok(r) => ok_to_exit_code(r, expect_err, allow_inconclusive),
+        Err(e) => err_to_exit_code(e, expect_err, no_skip),
+    }
+}
+
+/// Map an `Ok(AssertResult)` verdict to an exit code.
+///
+/// The sequential guards preserve the original `match` arm precedence
+/// (first matching guard wins): `is_skip()` → `expect_err` →
+/// `is_inconclusive()` → the trailing `EXIT_PASS` (the former
+/// `Ok(_) => EXIT_PASS` arm). Reordering these would change which
+/// verdict fires for a result matching more than one guard.
+fn ok_to_exit_code(r: AssertResult, expect_err: bool, allow_inconclusive: bool) -> i32 {
+    // A Skip degenerates to EXIT_PASS regardless of expect_err — the
+    // test never evaluated, so there is no guest failure to "expect"
+    // (the `Fail > Inconclusive > Pass > Skip` projection; mirrors the
+    // ResourceContention Err branch in `err_to_exit_code`, but on the
+    // Ok side). Without this guard a post_vm_skip under expect_err
+    // falls into the `expect_err` guard below and surfaces as "expected
+    // error but test passed" (EXIT_FAIL) — a load-starvation
+    // placeholder-dump skip becomes a flaky failure. End-to-end chain:
+    // a post_vm callback returns Err(post_vm_skip(..)) → the eval gate
+    // detects the HostSkipRequest marker, reports via report::test_skip,
+    // and returns Ok(AssertResult::skip) → this guard maps it to
+    // EXIT_PASS. is_skip() is true only when `outcomes` is non-empty and
+    // every outcome is Outcome::Skip (assert/mod.rs); the empty-outcomes
+    // Pass identity has is_skip()==false and falls through to the
+    // trailing `EXIT_PASS`.
+    if r.is_skip() {
+        return EXIT_PASS;
+    }
+    if expect_err {
+        // expect_err inverts on Pass and on Inconclusive: both
+        // are "not a failure" in the operator's mental model,
+        // and an expect_err scenario that produces an
+        // Inconclusive verdict (denominator zero) failed to
+        // produce the expected failure just like a Pass would.
+        // Surface the inconclusive as exit code 2 to preserve
+        // the distinct verdict, but treat it as expect_err
+        // satisfaction failure (exit 1) — the test author
+        // wanted a Fail, not "the gate could not run".
+        //
+        // `allow_inconclusive` does NOT relax the expect_err
+        // contract: expect_err demands a real Fail, and an
+        // Inconclusive verdict does not satisfy that
+        // regardless of how the test author scopes
+        // Inconclusive elsewhere. The dominant gate wins;
+        // `allow_inconclusive` only relaxes the
+        // EXIT_INCONCLUSIVE projection on the no-expect_err
+        // path below.
+        if r.is_inconclusive() {
+            eprintln!(
+                "expected error but test produced an Inconclusive verdict — \
+                 zero-denominator gate could not evaluate; expect_err is \
+                 unsatisfied"
+            );
+            return EXIT_FAIL;
+        } else {
+            eprintln!("expected error but test passed");
+            return EXIT_FAIL;
         }
     }
+    if r.is_inconclusive() {
+        // `allow_inconclusive` opt-in: a test author may have
+        // declared `#[ktstr_test(allow_inconclusive)]` to
+        // signal "this test's Inconclusive arm is acceptable —
+        // don't fail the CI gate." Route to EXIT_PASS in that
+        // case (Inconclusive is still recorded in the sidecar
+        // for stats tooling and the operator-facing failure
+        // dump still renders the diagnostic). When the flag
+        // is unset (the default) the verdict surfaces as
+        // EXIT_INCONCLUSIVE so the operator triages it.
+        if allow_inconclusive {
+            eprintln!(
+                "test produced an Inconclusive verdict but \
+                 `allow_inconclusive` is set — routing to EXIT_PASS \
+                 for CI gate, sidecar still records Inconclusive"
+            );
+            return EXIT_PASS;
+        } else {
+            return EXIT_INCONCLUSIVE;
+        }
+    }
+    EXIT_PASS
+}
+
+/// Map an `Err(anyhow::Error)` outcome to an exit code.
+///
+/// The sequential guards preserve the original `match` arm precedence
+/// (first matching guard wins): the host-insufficiency classification
+/// ([`classify_host_error`], covering kernel-unavailable → perf-mode →
+/// cpu-budget → topology-unrepresentable → resource-contention →
+/// topology-insufficient, shared with the `#[ktstr_test]` macro body) runs
+/// FIRST, then the
+/// marker-typed guards (`PostVmAssertionFailure` →
+/// `ExpectAutoReproSatisfied`), then the `expect_err` inversion, then
+/// the catch-all (the former `Err(e) => …` arm) operating on the
+/// now-owned `e`. Reordering these would change which guard fires for an
+/// error matching more than one guard. The host-insufficiency guard
+/// order + per-class skip/fail policy live in `classify_host_error`, not
+/// here, so this site and the macro cannot drift apart.
+fn err_to_exit_code(e: anyhow::Error, expect_err: bool, no_skip: bool) -> i32 {
+    // Host-insufficiency classification (kernel-unavailable, perf-mode,
+    // cpu-budget, topology-unrepresentable, resource-contention,
+    // topology-insufficient) is shared with the `#[ktstr_test]` macro body via
+    // `classify_host_error` — the single source of truth for the guard
+    // ORDER and the per-class skip/fail policy. This site renders the
+    // verdict as an exit code; the macro renders the same `HostClass` as
+    // libtest control flow. The bare `reason` carries no prefix: the skip
+    // channel (`report::test_skip`) prepends `ktstr: SKIP:`, the fail
+    // channel prepends `ktstr: FAIL:`. Placed first so a host-insufficiency
+    // returns before the marker / expect_err / catch-all arms below — a
+    // skip is a skip and an unconditional hard fail is a hard fail
+    // regardless of `expect_err`.
+    match classify_host_error(&e, no_skip) {
+        HostClass::Skip { reason } => {
+            crate::report::test_skip(format_args!("{reason}"));
+            return EXIT_PASS;
+        }
+        HostClass::Fail { reason } => {
+            eprintln!("ktstr: FAIL: {reason}");
+            return EXIT_FAIL;
+        }
+        HostClass::NotHostClass => {}
+    }
+    if e.downcast_ref::<crate::test_support::eval::PostVmAssertionFailure>()
+        .is_some()
+    {
+        // A host-side post_vm / post_vm_unconditional callback
+        // failed. This is a real regression that must surface
+        // regardless of expect_err / expect_auto_repro inversion —
+        // those invert a GUEST-side expected failure, but a
+        // HOST-side check is always honored. Positioned AFTER the
+        // resource-contention / topology skip guards (a skip means
+        // the test never ran, so there was no host-side state to
+        // assert) but BEFORE the ExpectAutoReproSatisfied and
+        // expect_err inversion guards so the host-side regression
+        // wins. `downcast_ref` walks the anyhow context+source
+        // chain (the marker rides as `.context(...)` from
+        // run_ktstr_test_inner_impl); a raw `chain().any(is::<C>())`
+        // would miss it (anyhow boxes context as ContextError<C,E>).
+        eprintln!("{e:#}");
+        return EXIT_FAIL;
+    }
+    if e.downcast_ref::<crate::test_support::eval::ExpectAutoReproSatisfied>()
+        .is_some()
+    {
+        // `expect_auto_repro = true` was satisfied: the primary
+        // VM produced a Fail AND the auto-repro VM landed a
+        // shape-valid `.repro.wprof.pb`. The eval layer attached
+        // the marker as `anyhow::Context`. `downcast_ref` walks
+        // the anyhow context+source chain (per anyhow's
+        // documentation: "For errors with context, this method
+        // returns true if E matches the type of the context C or
+        // the type of the error on which the context has been
+        // attached"). A `chain().any(|c| c.is::<E>())` walk on
+        // the raw `&dyn StdError` chain would MISS the marker
+        // because anyhow boxes context as `ContextError<C, E>`
+        // whose underlying `is::<C>()` check returns false. The
+        // diagnostic is printed so the operator sees both the
+        // original failure trail and the inversion notice — the
+        // verdict flips to PASS without erasing the failure
+        // detail. Positioned AFTER the ResourceContention /
+        // TopologyInsufficient guards so a skip-class outcome still
+        // wins over inversion (a skip is a skip regardless of the
+        // satisfaction signal). The macro-parse cross-attribute
+        // check rejects `expect_auto_repro` combined with
+        // `expect_err`, so the two inversion paths are mutually
+        // exclusive at the entry layer.
+        eprintln!("{e:#}");
+        return EXIT_PASS;
+    }
+    if expect_err {
+        // expect_err inverts a failure into a pass — UNLESS the
+        // failure carries the
+        // [`crate::test_support::eval::ScxBpfErrorMatcherMismatch`]
+        // marker, which signals that the reproducer's scx_bpf_error
+        // matcher rejected this particular failure. A matcher-
+        // mismatch failure must surface even when expect_err = true:
+        // the user authored the matcher to pin THIS specific bug,
+        // and a different bug firing is itself a regression.
+        //
+        // `downcast_ref` walks the anyhow context+source chain
+        // (anyhow's documented "For errors with context, this
+        // method returns true if E matches the type of the context
+        // C or the type of the error on which the context has been
+        // attached" semantics). A `chain().any(|c| c.is::<E>())`
+        // walk on the raw `&dyn StdError` chain would MISS the
+        // marker because anyhow boxes context as
+        // `ContextError<C, E>` whose underlying `is::<C>()` check
+        // returns false.
+        if e.downcast_ref::<crate::test_support::eval::ScxBpfErrorMatcherMismatch>()
+            .is_some()
+        {
+            eprintln!("{e:#}");
+            return EXIT_FAIL;
+        } else {
+            return EXIT_PASS;
+        }
+    }
+    // Catch-all: a non-host-class, non-marker, non-expect_err error is a
+    // real failure. (A KernelUnavailable does NOT reach here — it is a
+    // skip-class host-insufficiency handled by the classify_host_error match
+    // at the top.)
+    eprintln!("{e:#}");
+    EXIT_FAIL
 }
 
 /// Whether a base test entry is "ignored" (skipped by default).
@@ -1331,13 +1376,13 @@ fn list_tests(ignored_only: bool) {
 /// listers in `list_tests_*`.
 fn for_each_gauntlet_variant<F>(
     entry: &KtstrTestEntry,
-    presets: &[crate::vm::TopoPreset],
+    presets: &[crate::gauntlet::TopoPreset],
     host_cpus: u32,
     host_llcs: u32,
     host_max_cpus_per_llc: u32,
     mut visit: F,
 ) where
-    F: FnMut(&crate::vm::TopoPreset),
+    F: FnMut(&crate::gauntlet::TopoPreset),
 {
     let no_perf_mode = super::runtime::no_perf_mode_for_entry(entry);
     for preset in presets {
@@ -1383,7 +1428,7 @@ fn for_each_gauntlet_variant<F>(
 /// the listing matches what the dispatch path will actually run.
 fn list_tests_all(ignored_only: bool) {
     let cargo_test_mode = crate::cargo_test_mode::cargo_test_mode_active();
-    let presets = crate::vm::gauntlet_presets();
+    let presets = crate::gauntlet::gauntlet_presets();
     let has_vmlinux = resolve_test_kernel()
         .ok()
         .and_then(|k| crate::vmm::find_vmlinux(&k))
@@ -1604,7 +1649,7 @@ fn list_verifier_cells_all() {
     if kernel_list.is_empty() {
         return;
     }
-    let presets = crate::vm::gauntlet_presets();
+    let presets = crate::gauntlet::gauntlet_presets();
     let (host_cpus, host_llcs, host_max_cpus_per_llc) = super::host_capacity();
     let no_perf_mode = super::runtime::no_perf_mode_active();
 
@@ -1660,7 +1705,7 @@ fn list_verifier_cells_all() {
 
 /// Parse `verifier/<sched_name>/<kernel_label>/<preset_name>`, look
 /// up the declared scheduler in [`super::KTSTR_SCHEDULERS`] + the
-/// gauntlet preset in [`crate::vm::gauntlet_presets`] + the kernel
+/// gauntlet preset in [`crate::gauntlet::gauntlet_presets`] + the kernel
 /// in [`KTSTR_KERNEL_LIST_ENV`](crate::KTSTR_KERNEL_LIST_ENV),
 /// resolve the scheduler binary path per
 /// [`super::SchedulerSpec`], boot the verifier VM via
@@ -1726,7 +1771,7 @@ fn run_verifier_cell(full_name: &str) -> i32 {
         return 1;
     };
 
-    let preset_list = crate::vm::gauntlet_presets();
+    let preset_list = crate::gauntlet::gauntlet_presets();
     let Some(preset) = preset_list.iter().find(|p| p.name == preset_name) else {
         eprintln!("ktstr verifier: no gauntlet preset {preset_name:?} (cell {full_name:?})",);
         return 1;
@@ -1854,7 +1899,7 @@ fn list_tests_budget(ignored_only: bool, budget_secs: f64) {
     use crate::budget::{TestCandidate, estimate_duration, extract_features, select};
 
     let cargo_test_mode = crate::cargo_test_mode::cargo_test_mode_active();
-    let presets = crate::vm::gauntlet_presets();
+    let presets = crate::gauntlet::gauntlet_presets();
     let has_vmlinux = resolve_test_kernel()
         .ok()
         .and_then(|k| crate::vmm::find_vmlinux(&k))
@@ -2102,29 +2147,6 @@ pub(crate) fn run_named_test(test_name: &str) -> i32 {
         return run_host_only_test(entry);
     }
 
-    // Coverage-skip guard, mirroring run_ktstr_test's: a VM-booting test
-    // whose guest /init trips an AP-kill exit under a coverage-
-    // instrumented `current_exe` must skip cleanly here too, or the
-    // ctor -> run_named_test dispatch burns the retry budget on a doomed
-    // boot (the per-test in-body skip cannot prevent it: the guest dies
-    // during boot, or its body's Skip is overridden by the honored
-    // host-side post_vm check). Runs against the suffix-peeled `entry`:
-    // the pre-peel lookup misses multi-kernel names
-    // (`{name}/{kernel_label}`) because find_test is exact-match on the
-    // bare name, so the guard never fired for multi-kernel runs.
-    if should_coverage_skip(
-        crate::test_support::current_binary_is_coverage_instrumented(),
-        entry,
-    ) {
-        crate::report::test_skip(format_args!(
-            "coverage-instrumented /init AP-kill — {}; deferred until \
-             non-instrumented /init binary is wired",
-            entry.name,
-        ));
-        record_skip_sidecar(entry);
-        return EXIT_PASS;
-    }
-
     if entry.performance_mode && super::runtime::no_perf_mode_active() {
         crate::report::test_skip(format_args!(
             "{}: test requires performance_mode but --no-perf-mode or KTSTR_NO_PERF_MODE is active",
@@ -2349,26 +2371,7 @@ pub(crate) fn run_gauntlet_test(rest: &str) -> i32 {
         }
     };
 
-    // Coverage-skip guard, mirroring run_named_test / run_ktstr_test: a
-    // VM-booting test whose guest /init trips an AP-kill exit under a
-    // coverage-instrumented current_exe must skip cleanly here too. The
-    // old DEFERRED_DISPATCH path reached run_ktstr_test's guard before
-    // gauntlet topology resolution; the new direct
-    // run_named_test -> run_gauntlet_test path needs its own.
-    if should_coverage_skip(
-        crate::test_support::current_binary_is_coverage_instrumented(),
-        entry,
-    ) {
-        crate::report::test_skip(format_args!(
-            "coverage-instrumented /init AP-kill — {}; deferred until \
-             non-instrumented /init binary is wired",
-            entry.name,
-        ));
-        record_skip_sidecar(entry);
-        return EXIT_PASS;
-    }
-
-    let presets = crate::vm::gauntlet_presets();
+    let presets = crate::gauntlet::gauntlet_presets();
     let preset = match presets.iter().find(|p| p.name == preset_name) {
         Some(p) => p,
         None => {
@@ -2566,1870 +2569,5 @@ pub fn ktstr_main() -> ! {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::sync::MutexExt;
-
-    // ---------------------------------------------------------------
-    // is_test_sentinel — convention-based sentinel-name predicate
-    // ---------------------------------------------------------------
-
-    /// Accepted shapes: `__unit_test_*__` (the established
-    /// sentinel convention — double-underscore prefix with
-    /// `unit_test_` tag, arbitrary inner suffix, double-underscore
-    /// suffix).
-    #[test]
-    fn is_test_sentinel_accepts_convention_shaped_names() {
-        assert!(is_test_sentinel("__unit_test_dummy__"));
-        assert!(is_test_sentinel("__unit_test_panics__"));
-        // Any inner body after the prefix is accepted, as long as
-        // the `__` suffix is also present.
-        assert!(is_test_sentinel("__unit_test_foo_bar_baz__"));
-    }
-
-    /// Rejected shapes: real user names, unrelated
-    /// double-underscore names, and partial matches.
-    #[test]
-    fn is_test_sentinel_rejects_non_convention_names() {
-        // Real user-authored name.
-        assert!(!is_test_sentinel("my_test"));
-        // Double-underscore wrapping but not the `__unit_test_` tag.
-        assert!(!is_test_sentinel("__foo__"));
-        // Empty string.
-        assert!(!is_test_sentinel(""));
-        // Has the prefix but no `__` suffix (ends with just `_`).
-        assert!(!is_test_sentinel("__unit_test_"));
-        // Has the prefix, has `__` suffix, but the prefix itself
-        // is truncated — missing the trailing `_` of `__unit_test_`.
-        assert!(!is_test_sentinel("__unit__"));
-    }
-
-    // ---------------------------------------------------------------
-    // run_named_test / run_gauntlet_test — nextest dispatch routing
-    // ---------------------------------------------------------------
-    //
-    // These tests cover the `test_name → function` routing without
-    // booting a VM. The happy paths require KVM and a kernel image,
-    // so the assertions here target the failure branches that return
-    // exit code 1 before any VM spawn:
-    //   - `ktstr/` prefix with unknown bare name
-    //   - `gauntlet/` prefix with malformed parts / unknown preset
-    //   - bare names fall through to `ktstr/` lookup
-    //
-    // The routing invariant: `gauntlet/` always delegates to
-    // `run_gauntlet_test`, every other prefix (including none)
-    // delegates to the base-test path inside `run_named_test`.
-
-    #[test]
-    fn run_named_test_gauntlet_prefix_routes_to_run_gauntlet_test() {
-        // Gauntlet names require two slash-separated parts after the
-        // prefix (`{name}/{preset}`); a single-segment name is
-        // rejected by `run_gauntlet_test`, proving the prefix routed
-        // there and not into the base-test path (which would print
-        // `unknown test: gauntlet/...` instead of the gauntlet-
-        // specific error and still return 1 but via a different
-        // branch).
-        let exit = run_named_test("gauntlet/__unit_test_dummy__");
-        assert_eq!(exit, 1, "malformed gauntlet names must exit 1");
-    }
-
-    #[test]
-    fn run_named_test_bare_unknown_exits_nonzero() {
-        // `run_named_test` strips `ktstr/` when present; a bare
-        // unknown name falls through to `find_test` which returns
-        // None, producing exit code 1.
-        let exit = run_named_test("__definitely_not_a_real_test__");
-        assert_eq!(exit, 1);
-    }
-
-    #[test]
-    fn run_named_test_ktstr_prefix_unknown_exits_nonzero() {
-        // `ktstr/` prefix is stripped; the bare name (also unknown)
-        // returns 1 via the find_test None path.
-        let exit = run_named_test("ktstr/__definitely_not_a_real_test__");
-        assert_eq!(exit, 1);
-    }
-
-    #[test]
-    fn run_gauntlet_test_rejects_name_with_fewer_than_two_parts() {
-        // `rest` must split into exactly 2 parts (`{name}/{preset}`).
-        // A single-segment name has no preset and is a format error.
-        let exit = run_gauntlet_test("some_test_no_preset");
-        assert_eq!(exit, 1);
-    }
-
-    #[test]
-    fn run_gauntlet_test_rejects_empty_rest() {
-        // Empty rest splits into one empty string — also a format
-        // error.
-        let exit = run_gauntlet_test("");
-        assert_eq!(exit, 1);
-    }
-
-    #[test]
-    fn run_gauntlet_test_rejects_unknown_test_name() {
-        // Well-formed two-part name whose test is not registered
-        // in KTSTR_TESTS. Returns 1 via the find_test None branch,
-        // never reaching preset lookup or VM spawn.
-        let exit = run_gauntlet_test("__not_a_test__/tiny-1llc");
-        assert_eq!(exit, 1);
-    }
-
-    #[test]
-    fn run_gauntlet_test_rejects_unknown_preset() {
-        // `__unit_test_dummy__` is registered in test_support::tests;
-        // combined with a preset name that is not in
-        // `gauntlet_presets`, the function returns 1 at the preset-
-        // lookup branch.
-        let exit = run_gauntlet_test("__unit_test_dummy__/__no_such_preset__");
-        assert_eq!(exit, 1);
-    }
-
-    // ---------------------------------------------------------------
-    // warn_duplicate_test_names_inner — pure duplicate-walker
-    // ---------------------------------------------------------------
-    //
-    // The OnceLock-gated `warn_duplicate_test_names_once` wrapper is
-    // process-wide and reads `KTSTR_TESTS` directly, so its emit-once
-    // semantics aren't observable from a unit test (the gate may
-    // already have fired from the production listing path during
-    // nextest discovery, or from a sibling test in this file). The
-    // pure inner walker is exposed exactly so its detection logic
-    // is testable without that global state — these tests pin the
-    // dedup invariants that actually matter:
-    //   1. No duplicates → no output (zero-emit on clean input).
-    //   2. Each duplicate name surfaces EXACTLY once even when the
-    //      same name appears 3+ times (the warned-set prevents
-    //      double-prints).
-    //   3. The emitted line embeds the offending name in
-    //      double-quoted form (the canonical `{name:?}` debug
-    //      format the production message uses) so tooling can
-    //      grep operator output for the collision.
-    //   4. Distinct duplicate names each produce one line —
-    //      independent collision groups must not blur into one.
-    //   5. An empty input is a no-op (defensive: exhaust early
-    //      before any HashSet alloc).
-
-    /// No duplicates → empty sink. Pins the zero-emit base case.
-    #[test]
-    fn warn_duplicate_test_names_inner_no_duplicates_writes_nothing() {
-        let mut sink = Vec::<u8>::new();
-        warn_duplicate_test_names_inner(["alpha", "beta", "gamma"], &mut sink);
-        assert!(
-            sink.is_empty(),
-            "clean input must produce zero diagnostic bytes; got {:?}",
-            String::from_utf8_lossy(&sink),
-        );
-    }
-
-    /// Empty input → no walking, no output. Defensive against a
-    /// regression that would crash on a zero-element HashSet
-    /// allocation or emit a spurious line on the empty path.
-    #[test]
-    fn warn_duplicate_test_names_inner_empty_input_writes_nothing() {
-        let mut sink = Vec::<u8>::new();
-        warn_duplicate_test_names_inner(std::iter::empty::<&str>(), &mut sink);
-        assert!(
-            sink.is_empty(),
-            "empty input must emit nothing; got {:?}",
-            String::from_utf8_lossy(&sink),
-        );
-    }
-
-    /// One duplicate name appearing twice → exactly one warning
-    /// line containing the duplicated name. Pins the basic
-    /// emit-on-collision contract.
-    #[test]
-    fn warn_duplicate_test_names_inner_emits_warning_for_duplicate() {
-        let mut sink = Vec::<u8>::new();
-        warn_duplicate_test_names_inner(["alpha", "beta", "alpha"], &mut sink);
-        let out = String::from_utf8(sink).expect("sink is utf-8");
-        let lines: Vec<&str> = out.lines().collect();
-        assert_eq!(
-            lines.len(),
-            1,
-            "single duplicate must emit exactly one line; got {lines:?}",
-        );
-        let line = lines[0];
-        assert!(
-            line.contains("warning: ktstr_test:"),
-            "warning prefix must be present (operator-actionable signal); \
-             got line: {line:?}",
-        );
-        // The duplicated name must appear in the canonical `{name:?}`
-        // double-quoted form so grep tooling can pull it out.
-        assert!(
-            line.contains("\"alpha\""),
-            "the duplicated name must appear in quoted form; got: {line:?}",
-        );
-        assert!(
-            !line.contains("\"beta\""),
-            "non-duplicate names must NOT appear in any warning; got: {line:?}",
-        );
-    }
-
-    /// A triple-collision (same name appearing 3 times) emits the
-    /// warning EXACTLY ONCE — the inner `warned` HashSet
-    /// suppresses the second and third occurrences. Pins the
-    /// "one warning per duplicated name" contract documented on
-    /// the public wrapper.
-    #[test]
-    fn warn_duplicate_test_names_inner_triple_collision_emits_once() {
-        let mut sink = Vec::<u8>::new();
-        warn_duplicate_test_names_inner(["dup", "dup", "dup"], &mut sink);
-        let out = String::from_utf8(sink).expect("sink is utf-8");
-        let lines: Vec<&str> = out.lines().collect();
-        assert_eq!(
-            lines.len(),
-            1,
-            "triple-collision must emit exactly one warning, not one-per-extra; \
-             got {lines:?} — a regression that drops the warned-set guard would \
-             surface here as 2 lines (one for the second, one for the third).",
-        );
-        assert!(
-            lines[0].contains("\"dup\""),
-            "warning must name the duplicated entry; got: {:?}",
-            lines[0],
-        );
-    }
-
-    /// Two distinct duplicate names → two warning lines (one per
-    /// collision group). A regression that collapses every
-    /// duplicate into a single warning would surface here as one
-    /// line instead of two.
-    #[test]
-    fn warn_duplicate_test_names_inner_independent_duplicates_each_warn() {
-        let mut sink = Vec::<u8>::new();
-        warn_duplicate_test_names_inner(["alpha", "beta", "alpha", "gamma", "beta"], &mut sink);
-        let out = String::from_utf8(sink).expect("sink is utf-8");
-        let lines: Vec<&str> = out.lines().collect();
-        assert_eq!(
-            lines.len(),
-            2,
-            "two independent collision groups must produce two warnings; \
-             got {lines:?}",
-        );
-        let body = lines.join("\n");
-        assert!(
-            body.contains("\"alpha\""),
-            "first duplicate name must appear in output; got: {body:?}",
-        );
-        assert!(
-            body.contains("\"beta\""),
-            "second duplicate name must appear in output; got: {body:?}",
-        );
-        assert!(
-            !body.contains("\"gamma\""),
-            "non-duplicate `gamma` must NOT trigger a warning; got: {body:?}",
-        );
-    }
-
-    // -- host_capacity --
-
-    #[test]
-    fn host_capacity_returns_plausible_triple() {
-        // `host_capacity` reads `available_parallelism` and sysfs topology.
-        // The exact values depend on the test host, but the invariants
-        // hold on any sane Linux machine:
-        //   - cpus >= 1
-        //   - llcs >= 1 (at least one cache domain)
-        //   - max_cpus_per_llc >= 1
-        //   - max_cpus_per_llc <= cpus (no LLC wider than the whole host)
-        let (cpus, llcs, max_cpus_per_llc) = super::super::host_capacity();
-        assert!(cpus >= 1, "cpus >= 1, got {cpus}");
-        assert!(llcs >= 1, "llcs >= 1, got {llcs}");
-        assert!(
-            max_cpus_per_llc >= 1,
-            "max_cpus_per_llc >= 1, got {max_cpus_per_llc}"
-        );
-        assert!(
-            max_cpus_per_llc <= cpus,
-            "max_cpus_per_llc ({max_cpus_per_llc}) must not exceed cpus ({cpus})"
-        );
-    }
-
-    // -- for_each_gauntlet_variant --
-
-    #[test]
-    fn for_each_gauntlet_variant_skips_presets_exceeding_host_capacity() {
-        // Pass host_cpus=1/host_llcs=1 against the preset list: every
-        // current preset has total_cpus >= 4 (see `gauntlet_presets()`
-        // in src/vm.rs), so every preset fails
-        // `TopologyConstraints::accepts` and `visit` must never be
-        // called. Any entry works since the constraint check runs
-        // before the visit — use the test dummy.
-        let presets = crate::vm::gauntlet_presets();
-        // Precondition for the assertion below: if a future preset
-        // with total_cpus <= 1 is added, this test must be updated to
-        // account for it instead of silently under-asserting.
-        let every_preset_needs_more_than_one_cpu = presets
-            .iter()
-            .all(|p| p.topology.total_cpus() > 1 || p.topology.llcs > 1);
-        assert!(
-            presets.is_empty() || every_preset_needs_more_than_one_cpu,
-            "test assumes every preset requires >1 CPU or >1 LLC; \
-             found a single-CPU preset — update the assertion below"
-        );
-
-        let mut visited: Vec<String> = Vec::new();
-        for_each_gauntlet_variant(
-            find_test("__unit_test_dummy__").unwrap(),
-            &presets,
-            1,
-            1,
-            1,
-            |preset| visited.push(preset.name.to_string()),
-        );
-        assert!(
-            visited.is_empty(),
-            "with host_cpus=1 host_llcs=1, no preset should be visited; \
-             visited: {visited:?}"
-        );
-    }
-
-    #[test]
-    fn for_each_gauntlet_variant_visit_count_equals_accepted_preset_count() {
-        // With generous host capacity (u32::MAX cpus/llcs/per-LLC),
-        // every preset that `entry.constraints.accepts(...)` admits
-        // must yield exactly one visit — no profile multiplier, no
-        // duplicate visits per preset. Computing the expected count
-        // from the same `accepts` predicate the function calls means
-        // this assertion catches both directions of regression:
-        //
-        //   - a regression that double-visits each accepted preset
-        //     produces `count == 2 * expected` (the weaker `>= 1`
-        //     assertion this test replaced would have silently
-        //     passed),
-        //   - a regression that skips accepted presets (e.g. an
-        //     inverted condition) produces `count < expected`.
-        let presets = crate::vm::gauntlet_presets();
-        let entry = find_test("__unit_test_dummy__").unwrap();
-        let expected: usize = presets
-            .iter()
-            .filter(|p| {
-                entry
-                    .constraints
-                    .accepts(&p.topology, u32::MAX, u32::MAX, u32::MAX)
-            })
-            .count();
-        let mut count = 0;
-        for_each_gauntlet_variant(entry, &presets, u32::MAX, u32::MAX, u32::MAX, |_| {
-            count += 1
-        });
-        assert_eq!(
-            count, expected,
-            "post-flag-kill: visit count must equal the number of presets the \
-             entry's constraints accept; one visit per preset, no profile multiplier",
-        );
-    }
-
-    #[test]
-    fn for_each_gauntlet_variant_monotonic_in_host_capacity() {
-        // Comparative-baseline: giving the function MORE host capacity
-        // can only let MORE presets pass the cap-size filter, never
-        // fewer. The upper-bound assertion in
-        // `for_each_gauntlet_variant_skips_presets_exceeding_host_capacity`
-        // and the lower-bound assertion in
-        // `..._visits_every_fitting_preset` both check one extreme;
-        // this test anchors the monotonic relationship between them.
-        // A regression that inverted the host-cap comparison (e.g.
-        // `host_cpus < preset_cpus` → accept) would pass both
-        // endpoint tests but fail here.
-        let presets = crate::vm::gauntlet_presets();
-        if presets.is_empty() {
-            return;
-        }
-        let entry = find_test("__unit_test_dummy__").unwrap();
-        let count_for = |cpus: u32, llcs: u32| {
-            let mut n = 0;
-            for_each_gauntlet_variant(entry, &presets, cpus, llcs, u32::MAX, |_| n += 1);
-            n
-        };
-        let tight = count_for(1, 1);
-        let loose = count_for(u32::MAX, u32::MAX);
-        assert!(
-            loose >= tight,
-            "host-capacity monotonicity violated: tight=(1,1) yielded {tight} \
-             visits, loose=(u32::MAX,u32::MAX) yielded {loose}; loose \
-             must admit at least as many presets as tight",
-        );
-    }
-
-    // ---------------------------------------------------------------
-    // KTSTR_KERNEL_LIST parsing + sanitization + suffix dispatch
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn parse_kernel_list_empty_returns_empty() {
-        assert!(parse_kernel_list("").is_empty());
-        assert!(parse_kernel_list(";").is_empty());
-        assert!(parse_kernel_list(";;;").is_empty());
-        assert!(parse_kernel_list("   ").is_empty());
-    }
-
-    #[test]
-    fn parse_kernel_list_basic_pair() {
-        // Producer emits semantic labels (the version string for
-        // Version specs); the parser is shape-agnostic and just
-        // splits on `;` and `=` then sanitizes. A version-only
-        // label sanitizes to `kernel_6_14_2`.
-        let entries = parse_kernel_list("6.14.2=/cache/foo");
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].kernel_dir, PathBuf::from("/cache/foo"));
-        assert_eq!(entries[0].sanitized, "kernel_6_14_2");
-    }
-
-    #[test]
-    fn parse_kernel_list_two_entries() {
-        let entries = parse_kernel_list("6.14.2=/a;6.15.0=/b");
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].kernel_dir, PathBuf::from("/a"));
-        assert_eq!(entries[0].sanitized, "kernel_6_14_2");
-        assert_eq!(entries[1].kernel_dir, PathBuf::from("/b"));
-        assert_eq!(entries[1].sanitized, "kernel_6_15_0");
-    }
-
-    #[test]
-    fn parse_kernel_list_drops_malformed() {
-        // Missing `=`, empty label, empty path — all silently
-        // dropped. Producer is `cargo ktstr` which encodes the
-        // format under our control; a malformed entry indicates a
-        // regression in the producer rather than operator input
-        // that deserves a clear error.
-        let entries = parse_kernel_list("noeq;=onlypath;onlylabel=;valid=/foo");
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].kernel_dir, PathBuf::from("/foo"));
-    }
-
-    #[test]
-    fn parse_kernel_list_trims_whitespace() {
-        let entries = parse_kernel_list("  6.14.2=/a  ;  6.15.0=/b  ");
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].sanitized, "kernel_6_14_2");
-        assert_eq!(entries[1].sanitized, "kernel_6_15_0");
-    }
-
-    /// `KernelEntry.label` preserves the producer-side label
-    /// string verbatim. Pinned because the
-    /// `sched_kernel_filter_accepts` range-membership branch reads
-    /// the raw label to feed into `decompose_version_for_compare`
-    /// (the sanitized form has lost dot separators required for
-    /// version parsing).
-    #[test]
-    fn parse_kernel_list_preserves_label() {
-        let entries = parse_kernel_list("6.14.2=/a;git_tj_sched_ext_main=/b;6.15-rc3=/c");
-        assert_eq!(entries.len(), 3);
-        assert_eq!(entries[0].label, "6.14.2");
-        assert_eq!(entries[1].label, "git_tj_sched_ext_main");
-        assert_eq!(entries[2].label, "6.15-rc3");
-    }
-
-    // ---------------------------------------------------------------
-    // sched_kernel_filter_accepts + entry_matches_spec
-    // (coverage for the per-scheduler kernel filter that gates
-    // verifier cell emission against KTSTR_KERNEL_LIST)
-    // ---------------------------------------------------------------
-
-    /// Build a `KernelEntry` for filter testing without round-
-    /// tripping through `parse_kernel_list`. Wraps the test-only
-    /// `SanitizedKernelLabel::from_pre_sanitized_for_test` so
-    /// fixtures can hand-write the exact label strings the
-    /// production parser would emit.
-    fn mk_entry(raw: &str, sanitized: &str, dir: &str) -> KernelEntry {
-        KernelEntry {
-            label: raw.to_string(),
-            sanitized: SanitizedKernelLabel::from_pre_sanitized_for_test(sanitized),
-            kernel_dir: PathBuf::from(dir),
-        }
-    }
-
-    #[test]
-    fn filter_accepts_everything_when_declared_empty() {
-        // Empty sched.kernels means "no per-scheduler filter" — every
-        // KTSTR_KERNEL_LIST entry passes.
-        let e = mk_entry("6.14.2", "kernel_6_14_2", "/a");
-        assert!(sched_kernel_filter_accepts(&[], &e));
-        let weird = mk_entry("anything", "kernel_anything", "/b");
-        assert!(sched_kernel_filter_accepts(&[], &weird));
-    }
-
-    #[test]
-    fn filter_matches_version_by_label() {
-        let e = mk_entry("6.14.2", "kernel_6_14_2", "/a");
-        // Exact raw-label equality is the primary match path.
-        assert!(entry_matches_spec(&e, "6.14.2"));
-        // sched.kernels = ["6.14.2"] accepts this entry.
-        assert!(sched_kernel_filter_accepts(&["6.14.2"], &e));
-    }
-
-    #[test]
-    fn filter_matches_version_by_sanitized_label() {
-        // Different raw label but the spec sanitizes to the same
-        // sanitized form — match via the sanitized-equality fallback.
-        // Example: spec "6.14.2" sanitizes to "kernel_6_14_2" and
-        // the entry's sanitized label is the same.
-        let e = mk_entry("6.14.2-tarball-x86_64-kcabc", "kernel_6_14_2", "/a");
-        // label != "6.14.2", but sanitized matches.
-        assert!(entry_matches_spec(&e, "6.14.2"));
-    }
-
-    #[test]
-    fn filter_rejects_version_mismatch() {
-        let e = mk_entry("6.15.0", "kernel_6_15_0", "/a");
-        // Neither raw nor sanitized matches "6.14.2".
-        assert!(!entry_matches_spec(&e, "6.14.2"));
-        assert!(!sched_kernel_filter_accepts(&["6.14.2"], &e));
-    }
-
-    #[test]
-    fn filter_matches_range_membership_inclusive() {
-        // Range "6.14..6.16" (both endpoints inclusive). Entries
-        // inside the range match; outside reject.
-        let inside_low = mk_entry("6.14", "kernel_6_14", "/a");
-        let inside_mid = mk_entry("6.15.3", "kernel_6_15_3", "/b");
-        let inside_high = mk_entry("6.16", "kernel_6_16", "/c");
-        let below = mk_entry("6.13.7", "kernel_6_13_7", "/d");
-        let above = mk_entry("6.17.0", "kernel_6_17_0", "/e");
-
-        assert!(entry_matches_spec(&inside_low, "6.14..6.16"));
-        assert!(entry_matches_spec(&inside_mid, "6.14..6.16"));
-        assert!(entry_matches_spec(&inside_high, "6.14..6.16"));
-        assert!(!entry_matches_spec(&below, "6.14..6.16"));
-        assert!(!entry_matches_spec(&above, "6.14..6.16"));
-    }
-
-    #[test]
-    fn filter_matches_range_inclusive_form_too() {
-        // `..=` spelling produces the same inclusive range as `..`
-        // per KernelId::parse (both inclusive on both endpoints).
-        let inside = mk_entry("6.15.0", "kernel_6_15_0", "/a");
-        assert!(entry_matches_spec(&inside, "6.14..=6.16"));
-        let above = mk_entry("6.17.0", "kernel_6_17_0", "/b");
-        assert!(!entry_matches_spec(&above, "6.14..=6.16"));
-    }
-
-    #[test]
-    fn filter_handles_unparseable_entry_label_in_range() {
-        // Entry whose label isn't version-shaped (e.g. a Git
-        // label) can't be in a version range — reject.
-        let git_entry = mk_entry(
-            "git_tj_sched_ext_main",
-            "kernel_git_tj_sched_ext_main",
-            "/a",
-        );
-        assert!(!entry_matches_spec(&git_entry, "6.14..6.16"));
-    }
-
-    #[test]
-    fn filter_matches_path_spec_by_sanitized() {
-        // Path specs match by sanitized-label equality.
-        let e = mk_entry("path_linux_a3f2b1", "kernel_path_linux_a3f2b1", "/some/dir");
-        // The matching spec for a Path uses the path-derived sanitized
-        // form. A user-supplied "../linux" sanitizes differently from
-        // the producer's path_kernel_label output, so a Path spec in
-        // sched.kernels typically wouldn't be useful — but pin the
-        // sanitized-equality path anyway.
-        let same_path_spec = "/some/dir";
-        // KernelId::parse("/some/dir") → Path. sanitize_kernel_label
-        // turns it into "kernel_some_dir" — not equal to the entry's
-        // "kernel_path_linux_a3f2b1". Reject.
-        assert!(!entry_matches_spec(&e, same_path_spec));
-    }
-
-    #[test]
-    fn filter_matches_cache_key_spec_by_sanitized() {
-        // CacheKey spec matches when sanitized labels align.
-        let e = mk_entry(
-            "6.14.2-tarball-x86_64-kcabc",
-            "kernel_6_14_2_tarball_x86_64_kcabc",
-            "/cache/foo",
-        );
-        // The spec parsed as CacheKey sanitizes to the same form.
-        assert!(entry_matches_spec(&e, "6.14.2-tarball-x86_64-kcabc",));
-    }
-
-    #[test]
-    fn filter_accepts_when_any_declared_spec_matches() {
-        // Multiple declared specs; entry matches one of them.
-        let e = mk_entry("6.15.3", "kernel_6_15_3", "/a");
-        assert!(sched_kernel_filter_accepts(
-            &["6.14.2", "6.14..6.16", "git+https://example.com/r#main"],
-            &e,
-        ));
-    }
-
-    #[test]
-    fn filter_rejects_when_no_declared_spec_matches() {
-        let e = mk_entry("7.0.0", "kernel_7_0_0", "/a");
-        assert!(!sched_kernel_filter_accepts(&["6.14.2", "6.14..6.16"], &e,));
-    }
-
-    // ---------------------------------------------------------------
-    // Pin the exact diagnostic strings emitted by run_verifier_cell
-    // when the kernel-list lookup fails. Tests exercise the formatter
-    // helpers directly — no need to spawn a separate test binary
-    // because the eprintln! call sites now route through these pure
-    // formatters.
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn format_empty_kernel_list_error_names_cell_and_dispatcher() {
-        let s = format_empty_kernel_list_error("verifier/sched_foo/kernel_6_14_2/tiny-1llc");
-        // Cell name appears verbatim so the operator can grep their
-        // own invocation for the failing cell.
-        assert!(
-            s.contains("verifier/sched_foo/kernel_6_14_2/tiny-1llc"),
-            "missing cell name in: {s}",
-        );
-        // Root cause is named explicitly.
-        assert!(
-            s.contains("KTSTR_KERNEL_LIST is empty"),
-            "missing cause: {s}"
-        );
-        // Actionable hint points back at the dispatcher subcommand
-        // (the only supported entry point).
-        assert!(
-            s.contains("cargo ktstr verifier"),
-            "missing actionable hint: {s}",
-        );
-    }
-
-    #[test]
-    fn format_unknown_kernel_label_error_lists_present_labels_and_both_fix_paths() {
-        let present = vec!["kernel_6_14_2", "kernel_6_15_0"];
-        let s = format_unknown_kernel_label_error(
-            "verifier/sched_foo/kernel_7_0_0/tiny-1llc",
-            "kernel_7_0_0",
-            "sched_foo",
-            &present,
-        );
-        // Cell name + missing label appear so operators see exactly
-        // which lookup failed.
-        assert!(
-            s.contains("verifier/sched_foo/kernel_7_0_0/tiny-1llc"),
-            "missing cell name: {s}",
-        );
-        // Debug-formatted missing label (`{kernel_label:?}` produces
-        // double-quoted output).
-        assert!(s.contains("\"kernel_7_0_0\""), "missing debug label: {s}");
-        // Present-labels enumeration: every entry must appear so the
-        // operator can see what IS available.
-        assert!(s.contains("kernel_6_14_2"), "missing present[0]: {s}");
-        assert!(s.contains("kernel_6_15_0"), "missing present[1]: {s}");
-        // Scheduler name surfaces in the declaration-side fix hint.
-        assert!(s.contains("sched_foo"), "missing scheduler name: {s}");
-        // Both fix paths are documented: add a kernel to the
-        // dispatcher OR drop the matching entry from the declaration.
-        assert!(
-            s.contains("add --kernel"),
-            "missing dispatcher-side fix: {s}"
-        );
-        assert!(
-            s.contains("declare_scheduler!"),
-            "missing declaration-side fix: {s}",
-        );
-    }
-
-    #[test]
-    fn format_unknown_kernel_label_error_empty_present_renders_empty_brackets() {
-        // Edge case: kernel_list has entries that fail the find()
-        // (string equality drifted) but the present slice the caller
-        // assembles is empty — still surfaces the bracket pair so the
-        // diagnostic format is uniform with the non-empty case.
-        let s =
-            format_unknown_kernel_label_error("verifier/foo/kernel_x/tiny", "kernel_x", "foo", &[]);
-        assert!(
-            s.contains("Present labels: []"),
-            "missing empty brackets: {s}"
-        );
-    }
-
-    #[test]
-    fn format_unknown_kernel_label_error_joins_present_with_comma_space() {
-        // Three-entry present slice must render comma-space separated
-        // to match the `present.join(", ")` contract.
-        let present = vec!["a", "b", "c"];
-        let s = format_unknown_kernel_label_error(
-            "verifier/foo/kernel_x/tiny",
-            "kernel_x",
-            "foo",
-            &present,
-        );
-        assert!(
-            s.contains("Present labels: [a, b, c]"),
-            "wrong join delimiter: {s}",
-        );
-    }
-
-    #[test]
-    fn sanitize_kernel_label_pure_version() {
-        assert_eq!(sanitize_kernel_label("6.14.2"), "kernel_6_14_2");
-    }
-
-    #[test]
-    fn sanitize_kernel_label_rc_suffix() {
-        assert_eq!(sanitize_kernel_label("6.15-rc3"), "kernel_6_15_rc3");
-    }
-
-    /// The sanitizer is shape-agnostic — it normalizes any input
-    /// that happens to flow in. The producer-side encoder now
-    /// emits semantic labels, but a future regression that
-    /// surfaced a raw cache-key basename would still produce a
-    /// valid (if uglier) nextest identifier rather than crashing.
-    /// Pinned via a synthetic full-cache-key input.
-    #[test]
-    fn sanitize_kernel_label_handles_full_cache_key_shape() {
-        assert_eq!(
-            sanitize_kernel_label("6.14.2-tarball-x86_64-kcabc1234"),
-            "kernel_6_14_2_tarball_x86_64_kcabc1234",
-        );
-    }
-
-    /// Git-source semantic label `git_tj_sched_ext_for-next` from
-    /// the producer-side encoder maps to the dash-stripped form
-    /// the sanitizer produces.
-    #[test]
-    fn sanitize_kernel_label_git_semantic_label() {
-        assert_eq!(
-            sanitize_kernel_label("git_tj_sched_ext_for-next"),
-            "kernel_git_tj_sched_ext_for_next",
-        );
-    }
-
-    /// Path-source semantic label `path_linux_a3f2b1` is already
-    /// `[a-z0-9_]+` so the sanitizer only adds the `kernel_`
-    /// prefix.
-    #[test]
-    fn sanitize_kernel_label_path_semantic_label() {
-        assert_eq!(
-            sanitize_kernel_label("path_linux_a3f2b1"),
-            "kernel_path_linux_a3f2b1",
-        );
-    }
-
-    #[test]
-    fn sanitize_kernel_label_lowercases() {
-        assert_eq!(sanitize_kernel_label("ABC-DEF"), "kernel_abc_def");
-    }
-
-    #[test]
-    fn sanitize_kernel_label_collapses_repeated_separators() {
-        assert_eq!(sanitize_kernel_label("a..b...c"), "kernel_a_b_c");
-    }
-
-    #[test]
-    fn sanitize_kernel_label_strips_trailing_underscore() {
-        assert_eq!(sanitize_kernel_label("for-next-"), "kernel_for_next");
-    }
-
-    #[test]
-    fn sanitize_kernel_label_empty_input() {
-        assert_eq!(sanitize_kernel_label(""), "kernel_");
-    }
-
-    // ---------------------------------------------------------------
-    // SanitizedKernelLabel — newtype invariants
-    // ---------------------------------------------------------------
-    //
-    // `SanitizedKernelLabel::new(raw)` is the only production
-    // path that yields a value of the type, and it always routes
-    // through `sanitize_kernel_label`. The tests below pin each
-    // surface (constructor, accessors, `PartialEq` impls) directly
-    // so a regression that bypassed the sanitizer (e.g. a future
-    // `From<String>` impl that wraps verbatim) or dropped one of
-    // the comparison-ergonomics impls would surface as a unit-test
-    // failure rather than as a downstream filter mismatch.
-
-    /// `SanitizedKernelLabel::new(raw)` yields a value whose
-    /// `as_str()` equals `sanitize_kernel_label(raw)` byte-for-
-    /// byte. Pins the constructor's "always sanitize" contract:
-    /// the only path that builds a `SanitizedKernelLabel` MUST run
-    /// `sanitize_kernel_label`, otherwise a future caller could
-    /// stuff a raw label into the field via a regression that
-    /// forgot to invoke the sanitizer. Multiple inputs covered to
-    /// distinguish "happens to match" from "truly routes through
-    /// the sanitizer" — version, RC suffix, mixed case, embedded
-    /// dots-vs-dashes.
-    #[test]
-    fn sanitized_kernel_label_new_runs_sanitizer() {
-        for raw in [
-            "6.14.2",
-            "6.15-rc3",
-            "ABC-DEF",
-            "git_tj_sched_ext_for-next",
-            "",
-        ] {
-            let label = SanitizedKernelLabel::new(raw);
-            assert_eq!(
-                label.as_str(),
-                sanitize_kernel_label(raw),
-                "SanitizedKernelLabel::new({raw:?}).as_str() must equal \
-                 sanitize_kernel_label({raw:?}); a regression that wrapped \
-                 raw input verbatim would surface here",
-            );
-        }
-    }
-
-    /// `as_str()` returns the sanitized inner string, NOT the raw
-    /// input. Round-trip through `as_str()` matches what the
-    /// sanitizer produced — distinct from
-    /// `sanitized_kernel_label_new_runs_sanitizer` which checks
-    /// the constructor wires through; this checks that read-side
-    /// access exposes the SAME bytes the constructor wrote.
-    #[test]
-    fn sanitized_kernel_label_as_str_returns_sanitized_form() {
-        let label = SanitizedKernelLabel::new("6.14.2");
-        assert_eq!(label.as_str(), "kernel_6_14_2");
-        // A regression that returned the raw input from `as_str()`
-        // would surface here because the raw input contains `.`
-        // which is `_` after sanitization.
-        assert_ne!(label.as_str(), "6.14.2");
-    }
-
-    /// `PartialEq<&str>` lets `assert_eq!(label, "kernel_6_14_2")`
-    /// stay readable at every consumer (and is what
-    /// `parse_kernel_list_*` tests already use). A regression that
-    /// dropped or narrowed the impl (e.g. switched to `PartialEq<
-    /// String>` only) would force every consumer to chain
-    /// `.as_str()` and break the existing test suite.
-    #[test]
-    fn sanitized_kernel_label_partial_eq_with_str_ref() {
-        let label = SanitizedKernelLabel::new("6.14.2");
-        let want: &str = "kernel_6_14_2";
-        assert_eq!(label, want);
-        // Symmetric inequality: distinct sanitization output must
-        // NOT compare equal to a different `&str`.
-        let other: &str = "kernel_6_15_0";
-        assert_ne!(label, other);
-    }
-
-    /// `PartialEq<str>` covers the unsized-`str` comparison path
-    /// (e.g. dereferenced `String` slice) distinct from the
-    /// `&str` path above. Both impls are explicit because Rust's
-    /// auto-deref to `&str` does not bridge the `PartialEq<str>`
-    /// case for some assert macros / generic comparators. A
-    /// regression that dropped just the `PartialEq<str>` impl
-    /// would compile most consumer sites but break callers that
-    /// land on the unsized form.
-    #[test]
-    fn sanitized_kernel_label_partial_eq_with_str_unsized() {
-        let label = SanitizedKernelLabel::new("6.14.2");
-        let owned: String = "kernel_6_14_2".to_string();
-        // `*owned` is `str` (unsized) — exercises `PartialEq<str>`
-        // rather than `PartialEq<&str>`. Wrap with `&` to satisfy
-        // `PartialEq::eq`'s `&Self`-vs-`&Other` shape; the impl
-        // body still operates on the unsized `str`.
-        assert!(
-            label == *owned.as_str(),
-            "PartialEq<str> impl missing — assert against unsized str failed",
-        );
-        // Symmetric inequality for the unsized path.
-        let other: String = "kernel_6_15_0".to_string();
-        assert!(label != *other.as_str());
-    }
-
-    /// `strip_kernel_suffix` is a no-op for single-kernel mode (0 or
-    /// 1 entries) — returns the input verbatim and signals "no
-    /// kernel override needed."
-    #[test]
-    fn strip_kernel_suffix_single_kernel_passthrough() {
-        let kernel_list = vec![KernelEntry {
-            label: "6.14.2".to_string(),
-            sanitized: SanitizedKernelLabel::from_pre_sanitized_for_test("kernel_6_14_2"),
-            kernel_dir: PathBuf::from("/a"),
-        }];
-        let (stripped, entry) = strip_kernel_suffix("gauntlet/eevdf/2llc", &kernel_list).unwrap();
-        assert_eq!(stripped, "gauntlet/eevdf/2llc");
-        assert!(entry.is_none());
-
-        let (stripped, entry) = strip_kernel_suffix("ktstr/eevdf", &[]).unwrap();
-        assert_eq!(stripped, "ktstr/eevdf");
-        assert!(entry.is_none());
-    }
-
-    /// In multi-kernel mode (2+ entries), the suffix is required and
-    /// peeled off. The matching `KernelEntry` is returned.
-    #[test]
-    fn strip_kernel_suffix_multi_kernel_peels_suffix() {
-        let kernel_list = vec![
-            KernelEntry {
-                label: "6.14.2".to_string(),
-                sanitized: SanitizedKernelLabel::from_pre_sanitized_for_test("kernel_6_14_2"),
-                kernel_dir: PathBuf::from("/a"),
-            },
-            KernelEntry {
-                label: "6.15.0".to_string(),
-                sanitized: SanitizedKernelLabel::from_pre_sanitized_for_test("kernel_6_15_0"),
-                kernel_dir: PathBuf::from("/b"),
-            },
-        ];
-        let (stripped, entry) =
-            strip_kernel_suffix("gauntlet/eevdf/2llc/kernel_6_14_2", &kernel_list).unwrap();
-        assert_eq!(stripped, "gauntlet/eevdf/2llc");
-        assert_eq!(entry.unwrap().kernel_dir, PathBuf::from("/a"));
-
-        let (stripped, entry) =
-            strip_kernel_suffix("gauntlet/eevdf/2llc/kernel_6_15_0", &kernel_list).unwrap();
-        assert_eq!(stripped, "gauntlet/eevdf/2llc");
-        assert_eq!(entry.unwrap().kernel_dir, PathBuf::from("/b"));
-    }
-
-    /// In multi-kernel mode, a test name that lacks the kernel
-    /// suffix surfaces an actionable error rather than silently
-    /// using the first kernel — the suffix is part of every test
-    /// name `--list` emitted, so a missing suffix indicates
-    /// operator hand-construction or stale tooling.
-    #[test]
-    fn strip_kernel_suffix_multi_kernel_missing_suffix_errors() {
-        let kernel_list = vec![
-            KernelEntry {
-                label: "6.14.2".to_string(),
-                sanitized: SanitizedKernelLabel::from_pre_sanitized_for_test("kernel_6_14_2"),
-                kernel_dir: PathBuf::from("/a"),
-            },
-            KernelEntry {
-                label: "6.15.0".to_string(),
-                sanitized: SanitizedKernelLabel::from_pre_sanitized_for_test("kernel_6_15_0"),
-                kernel_dir: PathBuf::from("/b"),
-            },
-        ];
-        let err = strip_kernel_suffix("gauntlet/eevdf/2llc", &kernel_list)
-            .expect_err("missing suffix in multi-kernel mode must error");
-        assert!(
-            err.contains("no recognised kernel suffix"),
-            "error must mention missing suffix, got: {err}",
-        );
-    }
-
-    /// Suffix peeling is anchored at the end of the test name —
-    /// gauntlet variants whose body contains `/` (the test / preset
-    /// separator) are not accidentally peeled. A naive
-    /// `rsplit_once('/')` would peel the preset segment instead.
-    #[test]
-    fn strip_kernel_suffix_does_not_peel_preset_segment() {
-        let kernel_list = vec![
-            KernelEntry {
-                label: "6.14.2".to_string(),
-                sanitized: SanitizedKernelLabel::from_pre_sanitized_for_test("kernel_6_14_2"),
-                kernel_dir: PathBuf::from("/a"),
-            },
-            KernelEntry {
-                label: "6.15.0".to_string(),
-                sanitized: SanitizedKernelLabel::from_pre_sanitized_for_test("kernel_6_15_0"),
-                kernel_dir: PathBuf::from("/b"),
-            },
-        ];
-        // The preset name is `2llc`, NOT `kernel_6_14_2` — the
-        // peeler must require an EXACT match against a known
-        // sanitized label, not just any `/<word>` ending.
-        let (stripped, entry) =
-            strip_kernel_suffix("gauntlet/eevdf/2llc/kernel_6_14_2", &kernel_list).unwrap();
-        // Stripped name still contains both of the original path
-        // segments (eevdf, 2llc).
-        assert_eq!(stripped, "gauntlet/eevdf/2llc");
-        assert!(entry.is_some());
-    }
-
-    // ---------------------------------------------------------------
-    // host_only kernel-suffix skip — multi-kernel listing
-    // ---------------------------------------------------------------
-    //
-    // `list_tests_all` and `list_tests_budget` short-circuit
-    // `host_only` entries: a host_only test never boots a VM, so the
-    // kernel never affects what runs. Both listers emit ONE entry per
-    // host_only test regardless of `KTSTR_KERNEL_LIST` cardinality —
-    // otherwise N identical copies of the same host-side function
-    // would land in nextest's plan.
-    //
-    // The tests below register a dedicated `host_only=true` entry in
-    // `KTSTR_TESTS` via `linkme::distributed_slice`, set
-    // `KTSTR_KERNEL_LIST` to a 2-entry payload, and capture stdout
-    // while invoking each lister. The capture asserts the host_only
-    // entry name appears EXACTLY once and never with a `/kernel_…`
-    // suffix.
-
-    /// Process-wide mutex serializing every stdout-capture call in
-    /// this module. `fd 1 → tempfile` redirection is a non-reentrant
-    /// process-global mutation — two concurrent callers would see
-    /// each other's output land in their sink. Mirrors the
-    /// `STDERR_CAPTURE_LOCK` pattern in `test_support::test_helpers`
-    /// (see `capture_stderr_serializes_concurrent_callers` for the
-    /// rationale and the failure mode without serialization).
-    static STDOUT_CAPTURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// RAII guard that restores the saved stdout fd on Drop, even if
-    /// the captured closure panics under the `panic = "unwind"` test
-    /// profile. Without this guard a panicking closure would leak the
-    /// fd-1 swap and every subsequent stdout write in the test
-    /// process would land in the orphaned tempfile. `saved` is
-    /// `Option` so Drop can `take()` and consume it without an `&mut`
-    /// borrow fight. Mirrors `StderrRestoreGuard` in
-    /// `test_support::test_helpers`.
-    struct StdoutRestoreGuard {
-        saved: Option<std::os::fd::OwnedFd>,
-    }
-    impl Drop for StdoutRestoreGuard {
-        fn drop(&mut self) {
-            if let Some(saved) = self.saved.take() {
-                let _ = nix::unistd::dup2_stdout(&saved);
-            }
-        }
-    }
-
-    /// Run `f` with stdout redirected to an in-memory tempfile;
-    /// return both `f`'s value and the captured bytes. Uses
-    /// [`STDOUT_CAPTURE_LOCK`] to serialize against every other
-    /// stdout-capture call in this module. The RAII
-    /// [`StdoutRestoreGuard`] restores fd 1 even if `f` panics
-    /// under `panic = "unwind"`. Mirrors `capture_stderr` in
-    /// `test_support::test_helpers`.
-    fn capture_stdout<R>(f: impl FnOnce() -> R) -> (R, Vec<u8>) {
-        use std::io::{Read, Seek, SeekFrom, Write};
-        let _lock = STDOUT_CAPTURE_LOCK.lock_unpoisoned();
-        let mut sink = tempfile::tempfile().expect("create stdout-capture tempfile");
-        // Flush before redirect: println! is line-buffered behind
-        // the Stdout lock; pre-call bytes need to reach the
-        // ORIGINAL fd 1 or they leak into the captured tempfile.
-        std::io::stdout().flush().ok();
-        let saved = nix::unistd::dup(std::io::stdout()).expect("dup(stdout)");
-        nix::unistd::dup2_stdout(&sink).expect("dup2_stdout(sink)");
-        let guard = StdoutRestoreGuard { saved: Some(saved) };
-        let result = f();
-        std::io::stdout().flush().ok();
-        drop(guard);
-        sink.seek(SeekFrom::Start(0)).expect("rewind sink");
-        let mut bytes = Vec::new();
-        sink.read_to_end(&mut bytes).expect("read sink");
-        (result, bytes)
-    }
-
-    /// Stub func for the host_only listing-test entry. The listers
-    /// (`list_tests_all` / `list_tests_budget`) only iterate
-    /// `KTSTR_TESTS` to emit names and never call `func` — but every
-    /// `KTSTR_TESTS` entry is ALSO reachable by the run dispatcher: a
-    /// full `cargo ktstr test` run executes it, exactly like the sibling
-    /// `__unit_test_dummy__` sentinel. So the func must be a harmless
-    /// pass, not an error. `host_only = true` runs it on the host with
-    /// no VM and it asserts nothing. (An earlier Err-bailing stub
-    /// assumed the entry was never dispatched, which made every full
-    /// run fail when the dispatcher reached it.)
-    fn host_only_listing_stub(
-        _ctx: &crate::scenario::Ctx,
-    ) -> anyhow::Result<crate::assert::AssertResult> {
-        Ok(crate::assert::AssertResult::pass())
-    }
-
-    /// Distinct sentinel name so the listing-output filters in the
-    /// tests below match this entry and not the `__unit_test_dummy__`
-    /// (also registered in `KTSTR_TESTS` from the
-    /// `test_support::tests` module) or any other entry that may be
-    /// added later. The `__unit_test_…__` shape collides with
-    /// `is_test_sentinel` (see the predicate at the top of this
-    /// module) so the `cargo test` harness still classifies it as a
-    /// sentinel and the early-dispatch warning logic does not
-    /// double-fire.
-    const HOST_ONLY_LISTING_NAME: &str = "__unit_test_host_only_listing__";
-
-    #[linkme::distributed_slice(KTSTR_TESTS)]
-    static __HOST_ONLY_LISTING_ENTRY: KtstrTestEntry = KtstrTestEntry {
-        name: HOST_ONLY_LISTING_NAME,
-        func: host_only_listing_stub,
-        host_only: true,
-        ..KtstrTestEntry::DEFAULT
-    };
-
-    /// Two-kernel KTSTR_KERNEL_LIST payload reused by the listing
-    /// tests below. Both labels sanitize to distinct nextest
-    /// suffixes (`kernel_6_14_2`, `kernel_6_15_0`), so a regression
-    /// that started emitting `/kernel_…` suffixes for the host_only
-    /// entry would surface as either `2` matches (one per kernel)
-    /// rather than the expected `1`, or as suffix substrings on the
-    /// emitted line.
-    const TWO_KERNEL_LIST: &str = "6.14.2=/cache/a;6.15.0=/cache/b";
-
-    /// Filter the captured listing output to only the lines that
-    /// reference `HOST_ONLY_LISTING_NAME`. Other lines from the
-    /// `__unit_test_dummy__` entry (and from any future entries
-    /// registered in this binary's `KTSTR_TESTS`) are intentionally
-    /// dropped so the assertions key on this fixture's behaviour
-    /// alone.
-    fn host_only_listing_lines(captured: &[u8]) -> Vec<String> {
-        std::str::from_utf8(captured)
-            .expect("capture must be UTF-8")
-            .lines()
-            .filter(|l| l.contains(HOST_ONLY_LISTING_NAME))
-            .map(str::to_owned)
-            .collect()
-    }
-
-    /// `list_tests_all` in multi-kernel mode emits exactly ONE line
-    /// for a `host_only` entry, with NO `/kernel_…` suffix. Pins the
-    /// `if entry.host_only { println!("ktstr/{}: test", entry.name); }`
-    /// branch at the top of `list_tests_all` against a regression
-    /// that fell through into the kernel-suffix loop. A regression
-    /// would yield 2 matches (one per kernel) and at least one line
-    /// would carry a `/kernel_6_14_2` or `/kernel_6_15_0` suffix.
-    ///
-    /// Holds [`crate::test_support::test_helpers::lock_env`] for the
-    /// full save/mutate/restore window — `KTSTR_KERNEL_LIST` is
-    /// process-wide, and the budget-test sibling below also rewrites
-    /// env vars. Without the lock, a concurrent test mutating a
-    /// different env key could observe a transiently-corrupt
-    /// `KTSTR_KERNEL_LIST` value.
-    #[test]
-    fn list_tests_all_host_only_skips_kernel_suffix_under_multi_kernel() {
-        use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
-        let _env_lock = lock_env();
-        let _kernel_list = EnvVarGuard::set(crate::KTSTR_KERNEL_LIST_ENV, TWO_KERNEL_LIST);
-        // Suppress the budget-mode branch — `KTSTR_BUDGET_SECS` would
-        // route the dispatcher through `list_tests_budget` instead of
-        // `list_tests_all`, but we are calling the lister directly so
-        // the dispatcher path is irrelevant. Removing the env var here
-        // is defensive against a parallel test that set it without
-        // restoring (would not affect this call's output, but keeps
-        // the test's runtime hypothesis explicit).
-        let _budget_guard = EnvVarGuard::remove(crate::KTSTR_BUDGET_SECS_ENV);
-
-        let (_, captured) = capture_stdout(|| list_tests_all(false));
-        let lines = host_only_listing_lines(&captured);
-
-        assert_eq!(
-            lines.len(),
-            1,
-            "list_tests_all must emit exactly 1 line for a host_only entry \
-             under multi-kernel mode (saw {n}): {lines:?}",
-            n = lines.len(),
-        );
-        let line = &lines[0];
-        // Expected exact form (mirrors the `println!("ktstr/{}: test", entry.name)`
-        // in the host_only branch of `list_tests_all`).
-        assert_eq!(
-            line,
-            &format!("ktstr/{HOST_ONLY_LISTING_NAME}: test"),
-            "host_only line must be `ktstr/<name>: test` with no kernel suffix",
-        );
-        // Belt-and-suspenders: neither sanitized kernel label appears
-        // anywhere on the line, even as a substring.
-        assert!(
-            !line.contains("kernel_6_14_2") && !line.contains("kernel_6_15_0"),
-            "host_only line must carry NO sanitized kernel suffix — \
-             a regression that emitted `/kernel_…` would surface here. line: {line:?}",
-        );
-    }
-
-    /// `list_tests_budget` mirror: in multi-kernel mode, the
-    /// budget-selecting lister emits exactly ONE candidate for a
-    /// `host_only` entry without a kernel suffix. Pins the second
-    /// `if entry.host_only { … } else { … }` branch in
-    /// `list_tests_budget` against the same regression class as the
-    /// `list_tests_all` sibling.
-    ///
-    /// Budget is set generously (10000 secs) so the greedy selector
-    /// in `crate::budget::select` picks every distinct-feature
-    /// candidate including this fixture (the `HOST_ONLY_SHIFT` bit
-    /// in `extract_features` makes the host_only entry's feature set
-    /// uniquely contributory — see `budget::extract_features`).
-    /// The selector prints to stdout AND `eprintln!`s a summary
-    /// line to stderr; only stdout is captured here, so the stderr
-    /// summary lands on the test runner's normal stderr.
-    #[test]
-    fn list_tests_budget_host_only_skips_kernel_suffix_under_multi_kernel() {
-        use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
-        let _env_lock = lock_env();
-        let _kernel_list = EnvVarGuard::set(crate::KTSTR_KERNEL_LIST_ENV, TWO_KERNEL_LIST);
-
-        let (_, captured) = capture_stdout(|| list_tests_budget(false, 10_000.0));
-        let lines = host_only_listing_lines(&captured);
-
-        assert_eq!(
-            lines.len(),
-            1,
-            "list_tests_budget must emit exactly 1 candidate line for a \
-             host_only entry under multi-kernel mode (saw {n}): {lines:?}",
-            n = lines.len(),
-        );
-        let line = &lines[0];
-        assert_eq!(
-            line,
-            &format!("ktstr/{HOST_ONLY_LISTING_NAME}: test"),
-            "host_only candidate name must be `ktstr/<name>: test` with no kernel suffix",
-        );
-        assert!(
-            !line.contains("kernel_6_14_2") && !line.contains("kernel_6_15_0"),
-            "host_only candidate must carry NO sanitized kernel suffix — \
-             a regression that emitted `/kernel_…` would surface here. line: {line:?}",
-        );
-    }
-
-    // ---------------------------------------------------------------
-    // KTSTR_CARGO_TEST_MODE listing behavior
-    // ---------------------------------------------------------------
-    //
-    // `list_tests_all` and `list_tests_budget` skip gauntlet
-    // emission when `KTSTR_CARGO_TEST_MODE` is active. Pins the
-    // dispatch contract: bare `cargo test` runs each test once
-    // with its declared topology, no per-preset fan-out.
-    // Multi-kernel suffix emission is also suppressed because the
-    // cargo-ktstr resolver that produces `KTSTR_KERNEL_LIST` is
-    // not on the cargo-test path.
-
-    /// Under `KTSTR_CARGO_TEST_MODE=1`, `list_tests_all` emits
-    /// exactly one `ktstr/{name}: test` line per registered entry
-    /// — no `gauntlet/...` lines. Pins the gauntlet-skip branch.
-    #[test]
-    fn list_tests_all_cargo_test_mode_skips_gauntlet() {
-        use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
-        let _env_lock = lock_env();
-        let _cargo = EnvVarGuard::set(crate::KTSTR_CARGO_TEST_MODE_ENV, "1");
-        let _no_kernel_list = EnvVarGuard::remove(crate::KTSTR_KERNEL_LIST_ENV);
-        let _budget_guard = EnvVarGuard::remove(crate::KTSTR_BUDGET_SECS_ENV);
-
-        let (_, captured) = capture_stdout(|| list_tests_all(false));
-        let stdout = std::str::from_utf8(&captured).expect("utf-8");
-        let gauntlet_lines: Vec<&str> = stdout
-            .lines()
-            .filter(|l| l.starts_with("gauntlet/"))
-            .collect();
-        assert!(
-            gauntlet_lines.is_empty(),
-            "cargo-test-mode must suppress every `gauntlet/...` line; \
-             got {} lines: {gauntlet_lines:?}",
-            gauntlet_lines.len(),
-        );
-    }
-
-    /// `result_to_exit_code` maps the 4-state verdict lattice
-    /// (`Fail > Inconclusive > Pass > Skip`) to 3 distinct
-    /// nextest-dispatch exit codes: Pass → 0, Inconclusive → 2,
-    /// Fail → 1. The distinct Inconclusive code lets CI tooling
-    /// triage zero-denominator runs separately from real
-    /// regressions. A regression that mapped Inconclusive into
-    /// the Pass branch (`Ok(_) => 0`) would silently let a test
-    /// whose ratio gate could not evaluate slip past the CI
-    /// summary as a green run.
-    #[test]
-    fn result_to_exit_code_inconclusive_maps_to_distinct_code() {
-        use crate::assert::{AssertDetail, AssertResult, DetailKind};
-        // Pass → 0 (no expect_err inversion, no allow_inconclusive).
-        assert_eq!(
-            result_to_exit_code(Ok(AssertResult::pass()), false, false),
-            0
-        );
-        // Inconclusive → 2 — distinct from Pass and Fail when
-        // allow_inconclusive is unset.
-        let inc = AssertResult::inconclusive(AssertDetail::new(
-            DetailKind::Benchmark,
-            "zero-denominator",
-        ));
-        assert_eq!(result_to_exit_code(Ok(inc), false, false), 2);
-        // expect_err + Pass → 1 (the test was supposed to fail).
-        assert_eq!(
-            result_to_exit_code(Ok(AssertResult::pass()), true, false),
-            1
-        );
-        // expect_err + Inconclusive → 1 (the test was supposed to
-        // produce a real failure; an Inconclusive verdict does
-        // not satisfy expect_err since the gate could not even
-        // evaluate). Distinct surfaced message in stderr.
-        let inc2 = AssertResult::inconclusive(AssertDetail::new(
-            DetailKind::Benchmark,
-            "zero-denominator under expect_err",
-        ));
-        assert_eq!(result_to_exit_code(Ok(inc2), true, false), 1);
-    }
-
-    /// A Skip verdict maps to EXIT_PASS regardless of expect_err — the
-    /// test never evaluated, so there is no guest failure to "expect."
-    /// Regression guard: a `post_vm_skip` (e.g. a placeholder failure
-    /// dump under VM load) on an `expect_err` test previously fell into
-    /// the `Ok(r) if expect_err` arm and surfaced as "expected error but
-    /// test passed" (EXIT_FAIL), turning a load-starvation skip into a
-    /// flaky failure. The `is_skip()` arm must precede the expect_err
-    /// arms.
-    #[test]
-    fn result_to_exit_code_skip_maps_to_pass_even_under_expect_err() {
-        use crate::assert::AssertResult;
-        // Skip without expect_err → 0 (the `Ok(_)` arm already covers
-        // this; pinned against a match-reorder regression).
-        assert_eq!(
-            result_to_exit_code(
-                Ok(AssertResult::skip("inconclusive: placeholder dump")),
-                false,
-                false
-            ),
-            0
-        );
-        // Skip WITH expect_err → 0. The is_skip arm dominates: a skip is
-        // never "the expected error failed to appear" because the test
-        // never evaluated.
-        assert_eq!(
-            result_to_exit_code(
-                Ok(AssertResult::skip("inconclusive: placeholder dump")),
-                true,
-                false
-            ),
-            0
-        );
-    }
-
-    /// `allow_inconclusive = true` routes a terminal Inconclusive
-    /// verdict to EXIT_PASS at the dispatch layer, opting the test
-    /// out of the EXIT_INCONCLUSIVE projection. Used by tests that
-    /// have an explicit reason to accept "couldn't evaluate" as
-    /// not-a-failure (e.g. exploratory benchmarks under hosts
-    /// whose topology may legitimately starve the workload).
-    /// expect_err still dominates: an expect_err scenario whose
-    /// result is Inconclusive maps to EXIT_FAIL regardless of
-    /// allow_inconclusive — expect_err demands a real Fail.
-    #[test]
-    fn result_to_exit_code_allow_inconclusive_routes_to_pass() {
-        use crate::assert::{AssertDetail, AssertResult, DetailKind};
-        let inc = AssertResult::inconclusive(AssertDetail::new(
-            DetailKind::Benchmark,
-            "zero-denominator (allow_inconclusive=true)",
-        ));
-        // allow_inconclusive=true, expect_err=false: Inconclusive → 0.
-        assert_eq!(result_to_exit_code(Ok(inc), false, true), 0);
-
-        // Pass + allow_inconclusive=true: still Pass → 0 (no
-        // behavior change on the Pass arm).
-        assert_eq!(
-            result_to_exit_code(Ok(AssertResult::pass()), false, true),
-            0
-        );
-
-        // expect_err + Inconclusive + allow_inconclusive: still
-        // → 1. The expect_err gate dominates; allow_inconclusive
-        // only relaxes the EXIT_INCONCLUSIVE projection on the
-        // no-expect_err path.
-        let inc2 = AssertResult::inconclusive(AssertDetail::new(
-            DetailKind::Benchmark,
-            "zero-denominator under expect_err + allow_inconclusive",
-        ));
-        assert_eq!(result_to_exit_code(Ok(inc2), true, true), 1);
-    }
-
-    /// Multi-kernel suffix emission is suppressed in
-    /// cargo-test mode even when `KTSTR_KERNEL_LIST` is set —
-    /// the bare `cargo test` path doesn't drive the cargo-ktstr
-    /// resolver, so any `KTSTR_KERNEL_LIST` is a stale leftover
-    /// from a prior session and must not influence listing.
-    #[test]
-    fn list_tests_all_cargo_test_mode_ignores_kernel_list() {
-        use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
-        let _env_lock = lock_env();
-        let _cargo = EnvVarGuard::set(crate::KTSTR_CARGO_TEST_MODE_ENV, "1");
-        let _kernel_list = EnvVarGuard::set(crate::KTSTR_KERNEL_LIST_ENV, TWO_KERNEL_LIST);
-        let _budget_guard = EnvVarGuard::remove(crate::KTSTR_BUDGET_SECS_ENV);
-
-        let (_, captured) = capture_stdout(|| list_tests_all(false));
-        let stdout = std::str::from_utf8(&captured).expect("utf-8");
-        assert!(
-            !stdout.contains("kernel_6_14_2") && !stdout.contains("kernel_6_15_0"),
-            "cargo-test-mode must suppress multi-kernel suffix emission \
-             even when KTSTR_KERNEL_LIST is set; got stdout containing a \
-             sanitized kernel label:\n{stdout}",
-        );
-    }
-
-    // ---------------------------------------------------------------
-    // build_host_cgroup_manager — KTSTR_CGROUP_WALK_ROOT_ENV roundtrip
-    // ---------------------------------------------------------------
-
-    /// `build_host_cgroup_manager` threads a non-empty
-    /// `KTSTR_CGROUP_WALK_ROOT_ENV` value into
-    /// `CgroupManager::with_walk_root`. Pins the env-var → walk_root
-    /// wire-up against a refactor that drops the threading.
-    /// Requires root because the no-env-set fallback path bails for
-    /// non-root operators (delegated subtree without explicit walk_root
-    /// would EACCES downstream); skipped on non-root.
-    #[test]
-    fn build_host_cgroup_manager_threads_env_walk_root() {
-        use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
-        let _env_lock = lock_env();
-        let _g = EnvVarGuard::set(
-            crate::KTSTR_CGROUP_WALK_ROOT_ENV,
-            "/sys/fs/cgroup/delegated",
-        );
-        let cg = build_host_cgroup_manager("/sys/fs/cgroup/delegated/ktstr")
-            .expect("env-set walk_root must thread into CgroupManager");
-        assert_eq!(
-            cg.walk_root(),
-            std::path::Path::new("/sys/fs/cgroup/delegated"),
-            "walk_root must match the env value verbatim",
-        );
-    }
-
-    /// Empty `KTSTR_CGROUP_WALK_ROOT_ENV` is observationally
-    /// identical to unset (the empty-string-equals-unset contract).
-    /// Pins the
-    /// `Ok(walk_root) if !walk_root.is_empty()` gate at the
-    /// build_host_cgroup_manager match arm.
-    /// Root-gated: the unset arm bails for non-root operators.
-    #[test]
-    fn build_host_cgroup_manager_empty_env_treated_as_unset() {
-        if unsafe { libc::geteuid() } != 0 {
-            return;
-        }
-        use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
-        let _env_lock = lock_env();
-        let _g = EnvVarGuard::set(crate::KTSTR_CGROUP_WALK_ROOT_ENV, "");
-        let cg = build_host_cgroup_manager("/sys/fs/cgroup/ktstr")
-            .expect("empty env must fall through to default (root-only)");
-        assert_eq!(
-            cg.walk_root(),
-            std::path::Path::new("/sys/fs/cgroup"),
-            "empty env must select the canonical-root default",
-        );
-    }
-
-    /// Unset `KTSTR_CGROUP_WALK_ROOT_ENV` selects the canonical-root
-    /// default `/sys/fs/cgroup` (Mode A).
-    /// Root-gated: see sibling test for the rationale.
-    #[test]
-    fn build_host_cgroup_manager_unset_env_uses_default() {
-        if unsafe { libc::geteuid() } != 0 {
-            return;
-        }
-        use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
-        let _env_lock = lock_env();
-        let _g = EnvVarGuard::remove(crate::KTSTR_CGROUP_WALK_ROOT_ENV);
-        let cg = build_host_cgroup_manager("/sys/fs/cgroup/ktstr")
-            .expect("unset env must fall through to default (root-only)");
-        assert_eq!(
-            cg.walk_root(),
-            std::path::Path::new("/sys/fs/cgroup"),
-            "unset env must select the canonical-root default",
-        );
-    }
-
-    /// With `KTSTR_CGROUP_WALK_ROOT_ENV` unset, `build_host_cgroup_manager`
-    /// returns the manager unconditionally (NOT root-gated): the non-root
-    /// precondition moved to a lazy check at `CgroupManager::setup` (first
-    /// real cgroup use), so host_only tests that never create a cgroup run
-    /// without root. The lazy euid gate itself is locked in by
-    /// `CgroupManager::default_root_requires_root`'s truth table
-    /// (cgroup_tests.rs); this pins that CONSTRUCTION no longer bails for a
-    /// non-root caller (the prior eager bail at this layer was removed).
-    #[test]
-    fn build_host_cgroup_manager_unset_env_defers_non_root_check_to_setup() {
-        use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
-        let _env_lock = lock_env();
-        let _g = EnvVarGuard::remove(crate::KTSTR_CGROUP_WALK_ROOT_ENV);
-        // No euid gate: construction must succeed regardless of euid (the
-        // prior eager non-root bail at this layer was deleted).
-        let cg = build_host_cgroup_manager("/sys/fs/cgroup/ktstr")
-            .expect("build defers the non-root check to setup; construction must succeed");
-        assert_eq!(
-            cg.walk_root(),
-            std::path::Path::new("/sys/fs/cgroup"),
-            "unset env selects the canonical default walk root",
-        );
-    }
-
-    /// `KTSTR_CGROUP_WALK_ROOT_ENV` values outside `/sys/fs/cgroup`
-    /// MUST bail upfront (defensive guard mirroring the
-    /// sibling `KTSTR_HOST_CGROUP_PARENT_ENV` check). Catches
-    /// operator typos like `/tmp/foo` at config-validation time
-    /// instead of as a downstream fs::write EACCES.
-    #[test]
-    fn build_host_cgroup_manager_env_outside_cgroupfs_bails() {
-        use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
-        let _env_lock = lock_env();
-        let _g = EnvVarGuard::set(crate::KTSTR_CGROUP_WALK_ROOT_ENV, "/tmp/foo");
-        let err = build_host_cgroup_manager("/tmp/foo/ktstr")
-            .expect_err("walk_root outside /sys/fs/cgroup MUST bail");
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("/sys/fs/cgroup") && msg.contains("KTSTR_CGROUP_WALK_ROOT"),
-            "bail message must name both the required prefix and the \
-             env var so the operator can fix the config; got: {msg}",
-        );
-    }
-
-    /// `resolve_host_cgroup_parent` with `KTSTR_HOST_CGROUP_PARENT`
-    /// unset falls back to `DEFAULT_HOST_CGROUP_PARENT`. Pure env-read
-    /// and string logic (no fs, no syscall, no root), so unlike the
-    /// `build_host_cgroup_manager_*` tests above these need no geteuid
-    /// gate. Converted from the former host_mode_e2e.rs host_only test
-    /// (which ignored ctx and only exercised this pure cascade — a VM
-    /// boot for nothing).
-    #[test]
-    fn resolve_host_cgroup_parent_env_unset_returns_default() {
-        use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
-        let _env_lock = lock_env();
-        let _g = EnvVarGuard::remove(crate::KTSTR_HOST_CGROUP_PARENT_ENV);
-        let resolved = resolve_host_cgroup_parent().expect("unset env resolves to default");
-        assert_eq!(resolved, DEFAULT_HOST_CGROUP_PARENT);
-    }
-
-    /// Empty `KTSTR_HOST_CGROUP_PARENT` is treated as unset (the
-    /// `Ok(s) if !s.is_empty()` gate) and falls back to the default.
-    #[test]
-    fn resolve_host_cgroup_parent_env_empty_returns_default() {
-        use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
-        let _env_lock = lock_env();
-        let _g = EnvVarGuard::set(crate::KTSTR_HOST_CGROUP_PARENT_ENV, "");
-        let resolved = resolve_host_cgroup_parent().expect("empty env resolves to default");
-        assert_eq!(resolved, DEFAULT_HOST_CGROUP_PARENT);
-    }
-
-    /// A valid override rooted under `/sys/fs/cgroup` (and naming a
-    /// subdirectory) is returned verbatim.
-    #[test]
-    fn resolve_host_cgroup_parent_env_override_returns_value() {
-        use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
-        let _env_lock = lock_env();
-        let _g = EnvVarGuard::set(
-            crate::KTSTR_HOST_CGROUP_PARENT_ENV,
-            "/sys/fs/cgroup/ktstr-foo",
-        );
-        let resolved = resolve_host_cgroup_parent().expect("valid override resolves");
-        assert_eq!(resolved, "/sys/fs/cgroup/ktstr-foo");
-    }
-
-    /// Both invalid-override branches bail: a path outside
-    /// `/sys/fs/cgroup`, and the bare mount root itself (which is not
-    /// a usable parent — it needs a subdirectory). The message names
-    /// the required prefix and the default fallback.
-    #[test]
-    fn resolve_host_cgroup_parent_env_invalid_bails() {
-        use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
-        let _env_lock = lock_env();
-        {
-            let _g = EnvVarGuard::set(crate::KTSTR_HOST_CGROUP_PARENT_ENV, "/tmp/foo");
-            let err = resolve_host_cgroup_parent()
-                .expect_err("override outside /sys/fs/cgroup must bail");
-            let msg = format!("{err:#}");
-            assert!(
-                msg.contains("/sys/fs/cgroup") && msg.contains(DEFAULT_HOST_CGROUP_PARENT),
-                "bail message must name the required prefix and the default \
-                 fallback so the operator can fix the config; got: {msg}",
-            );
-        }
-        {
-            let _g = EnvVarGuard::set(crate::KTSTR_HOST_CGROUP_PARENT_ENV, "/sys/fs/cgroup");
-            resolve_host_cgroup_parent()
-                .expect_err("the bare /sys/fs/cgroup mount root must bail (needs a subdir)");
-        }
-    }
-
-    /// Value-drift canary: `DEFAULT_HOST_CGROUP_PARENT`'s literal must
-    /// stay `/sys/fs/cgroup/ktstr`. Catches an asymmetric change to
-    /// the const value (vs its name) that a rename-only refactor
-    /// wouldn't. Mirrors the LITERAL_DEFAULT canary the host_mode e2e
-    /// test carried before it was converted to these unit tests.
-    #[test]
-    fn default_host_cgroup_parent_literal_pin() {
-        assert_eq!(DEFAULT_HOST_CGROUP_PARENT, "/sys/fs/cgroup/ktstr");
-    }
-
-    // -- result_to_exit_code: ExpectAutoReproSatisfied marker tests --
-    //
-    // Pin the dispatch-side verdict flip that consumes the marker
-    // wrapped onto the failure Err by run_ktstr_test_inner_impl
-    // when apply_expect_auto_repro_inversion signaled satisfaction.
-    // The eval-side helper's gates are exercised separately at the
-    // `crate::test_support::eval` tests module; these pin the dispatch-arm match-order
-    // contract.
-
-    /// Err with [`ExpectAutoReproSatisfied`] attached directly →
-    /// the dispatch arm downcasts and routes to [`EXIT_PASS`]. The
-    /// canonical happy-path: helper set the marker, no other arm
-    /// matches first, verdict flips.
-    #[test]
-    fn result_to_exit_code_expect_auto_repro_satisfied_routes_to_pass() {
-        let err: Result<crate::assert::AssertResult> = Err(anyhow::anyhow!("primary VM failure")
-            .context(crate::test_support::eval::ExpectAutoReproSatisfied));
-        assert_eq!(
-            result_to_exit_code(err, false, false),
-            EXIT_PASS,
-            "ExpectAutoReproSatisfied marker must route Err → EXIT_PASS"
-        );
-    }
-
-    /// Err with the marker nested inside additional `.context()`
-    /// wrapping → the chain walk still surfaces it. Pins the
-    /// `e.chain().any(|c| c.is::<...>())` contract against a
-    /// regression that swaps the chain walk for a top-level
-    /// `downcast_ref` (which would only match the outermost
-    /// context). The eval layer's surrounding context wrappers
-    /// (`"build ktstr_test VM"`, `"run ktstr_test VM"`) make
-    /// nested-marker chains the production-typical shape.
-    #[test]
-    fn result_to_exit_code_expect_auto_repro_satisfied_works_through_nested_context() {
-        let err: Result<crate::assert::AssertResult> = Err(anyhow::anyhow!("primary VM failure")
-            .context(crate::test_support::eval::ExpectAutoReproSatisfied)
-            .context("run ktstr_test VM")
-            .context("dispatch wrapper"));
-        assert_eq!(
-            result_to_exit_code(err, false, false),
-            EXIT_PASS,
-            "nested ExpectAutoReproSatisfied must still be downcast by the chain walk"
-        );
-    }
-
-    /// Baseline control: Err WITHOUT the marker → [`EXIT_FAIL`].
-    /// Guards against an arm regression that routes every Err to
-    /// EXIT_PASS — the marker's presence MUST be load-bearing for
-    /// the verdict flip. Pairs with the direct-marker test above
-    /// so a one-arm-too-broad regression fails this baseline
-    /// instead of silently green-lighting every failure.
-    #[test]
-    fn result_to_exit_code_plain_err_without_marker_routes_to_fail() {
-        let err: Result<crate::assert::AssertResult> = Err(anyhow::anyhow!(
-            "primary VM failure without inversion marker"
-        ));
-        assert_eq!(
-            result_to_exit_code(err, false, false),
-            EXIT_FAIL,
-            "Err without ExpectAutoReproSatisfied must route to EXIT_FAIL"
-        );
-    }
-
-    /// `expect_err = true` + both markers attached → the
-    /// ExpectAutoReproSatisfied arm wins because it is positioned
-    /// BEFORE the expect_err arm in the dispatch match. The two
-    /// inversion paths are mutually exclusive at macro-parse (the
-    /// cross-attr check in ktstr_test rejects the combination), so
-    /// this pin guards the order invariant rather than a
-    /// runtime-reachable combo: a programmatic-construction path
-    /// that bypassed the macro MUST still route consistently. The
-    /// scenario also attaches ScxBpfErrorMatcherMismatch so the
-    /// alternative arm has a distinguishing outcome
-    /// (EXIT_FAIL via the matcher-mismatch branch) — without the
-    /// second marker, both arms would converge on EXIT_PASS and the
-    /// precedence claim would not be falsifiable.
-    #[test]
-    fn result_to_exit_code_marker_arm_wins_over_expect_err_arm() {
-        let err: Result<crate::assert::AssertResult> = Err(anyhow::anyhow!("primary VM failure")
-            .context(crate::test_support::eval::ScxBpfErrorMatcherMismatch)
-            .context(crate::test_support::eval::ExpectAutoReproSatisfied));
-        assert_eq!(
-            result_to_exit_code(err, true, false),
-            EXIT_PASS,
-            "marker arm must win over expect_err arm by match-order positioning \
-             (expect_err arm with ScxBpfErrorMatcherMismatch would return EXIT_FAIL)"
-        );
-    }
-
-    // -- result_to_exit_code: ScxBpfErrorMatcherMismatch (expect_err
-    // arm) tests --
-    //
-    // Pin the two-way verdict the expect_err arm produces depending
-    // on whether the scx_bpf_error matcher mismatch marker is
-    // attached. Until this batch, no test exercised the marker
-    // detection path; the chain walk shape was untested at the
-    // dispatch layer and only protected by the `crate::test_support::eval` structural
-    // source-pin.
-
-    /// `expect_err = true` + Err WITHOUT a matcher-mismatch marker
-    /// → the expect_err arm inverts to [`EXIT_PASS`]. The canonical
-    /// `expected error happened` path.
-    #[test]
-    fn result_to_exit_code_expect_err_without_matcher_marker_routes_to_pass() {
-        let err: Result<crate::assert::AssertResult> =
-            Err(anyhow::anyhow!("primary VM failure (no matcher mismatch)"));
-        assert_eq!(
-            result_to_exit_code(err, true, false),
-            EXIT_PASS,
-            "expect_err arm must invert plain Err to EXIT_PASS"
-        );
-    }
-
-    /// `expect_err = true` + Err WITH the matcher-mismatch marker
-    /// → the expect_err arm REFUSES to invert and returns
-    /// [`EXIT_FAIL`]. The reproducer's matcher narrowed which bug
-    /// counts; a different bug firing must surface as a regression
-    /// even though `expect_err = true` would normally invert.
-    #[test]
-    fn result_to_exit_code_expect_err_with_matcher_mismatch_routes_to_fail() {
-        let err: Result<crate::assert::AssertResult> =
-            Err(anyhow::anyhow!("primary VM failure (matcher mismatch)")
-                .context(crate::test_support::eval::ScxBpfErrorMatcherMismatch));
-        assert_eq!(
-            result_to_exit_code(err, true, false),
-            EXIT_FAIL,
-            "expect_err arm must refuse inversion when ScxBpfErrorMatcherMismatch is attached"
-        );
-    }
-
-    /// `expect_err = true` + Err with the matcher-mismatch marker
-    /// nested INSIDE additional `.context()` wrapping → the
-    /// expect_err arm STILL refuses to invert because anyhow's
-    /// `downcast_ref` walks the context+source chain. Sibling pin
-    /// to `result_to_exit_code_expect_auto_repro_satisfied_works_through_nested_context`
-    /// — the eval-layer wrappers (`"build ktstr_test VM"`,
-    /// `"run ktstr_test VM"`) routinely wrap the inner Err with
-    /// additional context, so nested-marker chains are the
-    /// production-typical shape. A regression that swapped
-    /// `downcast_ref` for a top-level downcast would only match
-    /// the outermost context wrapper — passing the unnested
-    /// sibling test above but silently inverting nested-marker
-    /// regressions in production.
-    #[test]
-    fn result_to_exit_code_matcher_mismatch_through_nested_context_routes_to_fail() {
-        let err: Result<crate::assert::AssertResult> = Err(anyhow::anyhow!("primary VM failure")
-            .context(crate::test_support::eval::ScxBpfErrorMatcherMismatch)
-            .context("run ktstr_test VM")
-            .context("dispatch wrapper"));
-        assert_eq!(
-            result_to_exit_code(err, true, false),
-            EXIT_FAIL,
-            "nested ScxBpfErrorMatcherMismatch must still be downcast by anyhow's context-aware downcast_ref"
-        );
-    }
-
-    // -- result_to_exit_code: PostVmAssertionFailure marker tests --
-    //
-    // Pin the dispatch-side verdict the PostVmAssertionFailure arm
-    // produces: a host-side post_vm callback failure is honored even
-    // under expect_err (expect_err inverts a GUEST-side expected
-    // failure, not a HOST-side assertion), and wins over the
-    // ExpectAutoReproSatisfied arm by match-order positioning. The
-    // marker is wrapped onto the failure Err by run_ktstr_test_inner_impl
-    // when post_vm_err is Some.
-
-    /// `expect_err = true` + Err WITH the PostVmAssertionFailure marker
-    /// → the dispatch arm refuses to invert and returns [`EXIT_FAIL`].
-    /// The anti-hollow-test guarantee: a failure-dump render test
-    /// triggers an expected stall (which expect_err would invert to
-    /// PASS) and asserts the dump in post_vm — a wrong render MUST fail
-    /// the test, not silently invert.
-    #[test]
-    fn result_to_exit_code_post_vm_assertion_failure_under_expect_err_routes_to_fail() {
-        let err: Result<crate::assert::AssertResult> = Err(anyhow::anyhow!(
-            "post_vm callback returned Err: dump render wrong"
-        )
-        .context(crate::test_support::eval::PostVmAssertionFailure));
-        assert_eq!(
-            result_to_exit_code(err, true, false),
-            EXIT_FAIL,
-            "PostVmAssertionFailure marker must refuse expect_err inversion → EXIT_FAIL"
-        );
-    }
-
-    /// Baseline control: `expect_err = true` + Err WITHOUT the marker
-    /// → the expect_err arm inverts to [`EXIT_PASS`]. Pairs with the
-    /// test above so the marker's presence is load-bearing (a
-    /// one-arm-too-broad regression that failed every expect_err Err
-    /// would fail this baseline).
-    #[test]
-    fn result_to_exit_code_expect_err_without_post_vm_marker_routes_to_pass() {
-        let err: Result<crate::assert::AssertResult> = Err(anyhow::anyhow!(
-            "expected guest-side stall, no host-side check"
-        ));
-        assert_eq!(
-            result_to_exit_code(err, true, false),
-            EXIT_PASS,
-            "expect_err arm must invert a plain Err (no PostVmAssertionFailure) to EXIT_PASS"
-        );
-    }
-
-    /// PostVmAssertionFailure nested INSIDE additional `.context()`
-    /// wrapping → the dispatch arm STILL refuses to invert because
-    /// anyhow's `downcast_ref` walks the context+source chain. The
-    /// eval-layer wrappers (`"build ktstr_test VM"`, `"run ktstr_test
-    /// VM"`) routinely wrap the inner Err, so nested-marker chains are
-    /// the production-typical shape.
-    #[test]
-    fn result_to_exit_code_post_vm_marker_through_nested_context_routes_to_fail() {
-        let err: Result<crate::assert::AssertResult> = Err(anyhow::anyhow!(
-            "post_vm callback returned Err: dump render wrong"
-        )
-        .context(crate::test_support::eval::PostVmAssertionFailure)
-        .context("run ktstr_test VM")
-        .context("dispatch wrapper"));
-        assert_eq!(
-            result_to_exit_code(err, true, false),
-            EXIT_FAIL,
-            "nested PostVmAssertionFailure must still be downcast by anyhow's context-aware downcast_ref"
-        );
-    }
-
-    /// Both PostVmAssertionFailure AND ExpectAutoReproSatisfied
-    /// attached → the PostVmAssertionFailure arm wins (EXIT_FAIL)
-    /// because it is positioned BEFORE the ExpectAutoReproSatisfied arm
-    /// in the dispatch match. A real host-side regression must override
-    /// an auto-repro satisfaction inversion: the dump assertion failing
-    /// is a regression regardless of whether the repro artifact landed.
-    /// Without the PostVmAssertionFailure marker this same Err would
-    /// route to EXIT_PASS via the ExpectAutoReproSatisfied arm, so the
-    /// precedence claim is falsifiable.
-    #[test]
-    fn result_to_exit_code_post_vm_marker_wins_over_expect_auto_repro() {
-        let err: Result<crate::assert::AssertResult> = Err(anyhow::anyhow!("primary VM failure")
-            .context(crate::test_support::eval::ExpectAutoReproSatisfied)
-            .context(crate::test_support::eval::PostVmAssertionFailure));
-        assert_eq!(
-            result_to_exit_code(err, false, false),
-            EXIT_FAIL,
-            "PostVmAssertionFailure arm must win over ExpectAutoReproSatisfied by match-order \
-             positioning (ExpectAutoReproSatisfied alone would return EXIT_PASS)"
-        );
-    }
-
-    /// Pins the [`coverage_skip_under_instrumented_init`] name list: all
-    /// seven listed tests match, an unlisted name does not, and the
-    /// decorated multi-kernel form (`{name}/{kernel_label}`) does not.
-    /// The list had zero tests; a rename of any listed test or a typo'd
-    /// addition would silently stop the host-side coverage skip,
-    /// re-exposing the doomed boot path it guards.
-    #[test]
-    fn coverage_skip_list_matches_exactly_the_seven_listed_tests() {
-        for name in [
-            "live_var_resolves_across_same_binary_swap",
-            "snapshot_real_capture_op_snapshot",
-            "snapshot_real_capture_op_watch_snapshot",
-            "snapshot_real_capture_wide_smp",
-            "principled_active_scheduler_walker_resolves_active_obj",
-            "stats_bridge_round_trip",
-            "op_spawn_cgroup_empty_string_bails_with_actionable_diagnostic",
-        ] {
-            assert!(
-                coverage_skip_under_instrumented_init(name),
-                "{name} must be on the coverage-skip list",
-            );
-        }
-        assert!(
-            !coverage_skip_under_instrumented_init("a_normal_vm_test"),
-            "an unlisted test must NOT be coverage-skipped",
-        );
-        // The decorated multi-kernel form must NOT match — the gate keys
-        // on the bare name. Feeding the decorated form was the bug
-        // run_named_test had pre-peel; should_coverage_skip's
-        // entry-typed signature now structurally prevents it.
-        assert!(
-            !coverage_skip_under_instrumented_init("stats_bridge_round_trip/v6_15"),
-            "decorated {{name}}/{{kernel_label}} form must not match the bare-name list",
-        );
-    }
-
-    /// [`should_coverage_skip`] fires only when ALL hold: binary
-    /// instrumented, entry on the skip list, AND entry not `host_only`.
-    /// Drives the full decision matrix. The live gate's
-    /// `current_binary_is_coverage_instrumented` detector is a
-    /// non-injectable `OnceLock` ELF-symtab walk, so the boolean is
-    /// injected here to make the decision unit-testable.
-    #[test]
-    fn should_coverage_skip_requires_instrumented_listed_and_not_host_only() {
-        let listed = |host_only: bool| KtstrTestEntry {
-            name: "stats_bridge_round_trip",
-            host_only,
-            ..KtstrTestEntry::DEFAULT
-        };
-        let unlisted = KtstrTestEntry {
-            name: "a_normal_vm_test",
-            host_only: false,
-            ..KtstrTestEntry::DEFAULT
-        };
-        // Instrumented + listed + VM-booting → skip.
-        assert!(should_coverage_skip(true, &listed(false)));
-        // Not instrumented → never skip, even if listed.
-        assert!(!should_coverage_skip(false, &listed(false)));
-        // host_only listed test → never skip (no VM boot, no AP-kill).
-        assert!(!should_coverage_skip(true, &listed(true)));
-        // Instrumented but unlisted → no skip.
-        assert!(!should_coverage_skip(true, &unlisted));
-    }
-}
+#[path = "dispatch_tests.rs"]
+mod tests;

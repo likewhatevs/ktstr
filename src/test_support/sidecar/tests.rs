@@ -269,6 +269,8 @@ fn sidecar_result_roundtrip() {
         test_name: "my_test".to_string(),
         topology: "1n2l4c2t".to_string(),
         scheduler: "scx_mitosis".to_string(),
+        vcpus: 16,
+        cpu_budget: 4,
         scheduler_commit: Some("abc123".to_string()),
         project_commit: Some("def4567".to_string()),
         payload: None,
@@ -302,7 +304,7 @@ fn sidecar_result_roundtrip() {
             total_samples: 10,
             max_imbalance_ratio: 1.5,
             max_local_dsq_depth: 3,
-            stuck_detected: false,
+            stuck_count: 0,
             event_deltas: Some(crate::monitor::ScxEventDeltas {
                 total_fallback: 7,
                 fallback_rate: 0.5,
@@ -357,6 +359,8 @@ fn sidecar_result_roundtrip() {
         test_name,
         topology,
         scheduler,
+        vcpus,
+        cpu_budget,
         scheduler_commit,
         project_commit,
         payload,
@@ -387,6 +391,9 @@ fn sidecar_result_roundtrip() {
     assert_eq!(topology, "1n2l4c2t");
     assert_eq!(scheduler, "scx_mitosis");
     assert_eq!(work_type, "SpinWait");
+    // (vcpus, cpu_budget) round-trip — distinct values catch a field swap.
+    assert_eq!(vcpus, 16, "vcpus must round-trip the literal");
+    assert_eq!(cpu_budget, 4, "cpu_budget must round-trip the literal");
     // Nullable string metadata fields.
     assert_eq!(scheduler_commit.as_deref(), Some("abc123"));
     assert_eq!(project_commit.as_deref(), Some("def4567"));
@@ -432,7 +439,7 @@ fn sidecar_result_roundtrip() {
     assert_eq!(mon.total_samples, 10);
     assert_eq!(mon.max_imbalance_ratio, 1.5);
     assert_eq!(mon.max_local_dsq_depth, 3);
-    assert!(!mon.stuck_detected);
+    assert_eq!(mon.stuck_count, 0);
     let deltas = mon.event_deltas.unwrap();
     assert_eq!(deltas.total_fallback, 7);
     assert_eq!(deltas.total_dispatch_keep_last, 3);
@@ -505,6 +512,8 @@ fn sidecar_result_roundtrip_all_fields_round_trip() {
         test_name: "audit".to_string(),
         topology: "8n8l16c2t".to_string(),
         scheduler: "scx_audit".to_string(),
+        vcpus: 256,
+        cpu_budget: 95,
         scheduler_commit: Some("deadbeef1234567890abcdef".to_string()),
         project_commit: Some("cafebab-dirty".to_string()),
         payload: Some("audit_payload".to_string()),
@@ -529,6 +538,15 @@ fn sidecar_result_roundtrip_all_fields_round_trip() {
                 ..Default::default()
             }],
             total_workers: 3,
+            // ext_metrics carries the derived Rates + their Counter components
+            // (e.g. the pooled iterations_per_cpu_sec re-pool); it is the
+            // durable surface every cross-run compare reads, so it MUST survive
+            // sidecar serialize -> deserialize.
+            ext_metrics: std::collections::BTreeMap::from([
+                ("iterations_per_cpu_sec".to_string(), 101.0),
+                ("total_iterations_pooled".to_string(), 1010.0),
+                ("total_cpu_time_sec".to_string(), 10.0),
+            ]),
             ..Default::default()
         },
         monitor: Some(MonitorSummary {
@@ -611,6 +629,30 @@ fn sidecar_result_roundtrip_all_fields_round_trip() {
     assert_eq!(loaded.stats.total_workers, 3);
     assert_eq!(loaded.stats.cgroups.len(), 1);
     assert_eq!(loaded.stats.cgroups[0].num_workers, 3);
+    // ext_metrics (the pooled iterations_per_cpu_sec Rate + its Counter
+    // components) must round-trip — the sidecar is the durable surface every
+    // cross-run `stats compare` reads.
+    assert_eq!(
+        loaded
+            .stats
+            .ext_metrics
+            .get("iterations_per_cpu_sec")
+            .copied(),
+        Some(101.0),
+        "pooled rate must survive sidecar serialization",
+    );
+    assert_eq!(
+        loaded
+            .stats
+            .ext_metrics
+            .get("total_iterations_pooled")
+            .copied(),
+        Some(1010.0),
+    );
+    assert_eq!(
+        loaded.stats.ext_metrics.get("total_cpu_time_sec").copied(),
+        Some(10.0),
+    );
     let mon = loaded.monitor.expect("monitor round-trips");
     assert_eq!(mon.total_samples, 17);
     assert_eq!(loaded.stimulus_events.len(), 1);
@@ -741,6 +783,10 @@ fn sidecar_result_missing_required_field_rejected_by_deserialize() {
         "kargs",
         "timestamp",
         "run_id",
+        "periodic_fired",
+        "periodic_target",
+        "vcpus",
+        "cpu_budget",
     ];
 
     let fixture = SidecarResult::test_fixture();
@@ -771,6 +817,28 @@ fn sidecar_result_missing_required_field_rejected_by_deserialize() {
         assert!(
             msg.contains(field),
             "missing-field error for `{field}` must name the field; got: {msg}",
+        );
+    }
+
+    // Reverse completeness: a field is required-on-deserialize IFF it is
+    // listed above. serde defaults a missing `Option<T>` to None, so an
+    // Option field is removable (deserialize succeeds) while a non-Option
+    // field errors on removal. Iterating EVERY serialized key catches a
+    // NEW required field added to the struct but omitted from the list —
+    // the gap the forward loop alone cannot see.
+    for key in full.keys() {
+        let mut obj = full.clone();
+        obj.remove(key);
+        let removable =
+            serde_json::from_str::<SidecarResult>(&serde_json::Value::Object(obj).to_string())
+                .is_ok();
+        let listed = REQUIRED_NON_OPTION_FIELDS.contains(&key.as_str());
+        assert_eq!(
+            !removable, listed,
+            "field `{key}`: required-on-deserialize={} but listed-in-\
+             REQUIRED_NON_OPTION_FIELDS={} — the list has drifted from the \
+             struct's non-Option fields",
+            !removable, listed,
         );
     }
 }
@@ -2674,6 +2742,7 @@ fn sidecar_round_trip_preserves_phases() {
     let stats = ScenarioStats {
         phases: vec![
             PhaseBucket {
+                per_cgroup: Default::default(),
                 step_index: 0,
                 label: "BASELINE".to_string(),
                 start_ms: 0,
@@ -2682,6 +2751,7 @@ fn sidecar_round_trip_preserves_phases() {
                 metrics: BTreeMap::new(),
             },
             PhaseBucket {
+                per_cgroup: Default::default(),
                 step_index: 1,
                 label: "Step[0]".to_string(),
                 start_ms: 500,
@@ -2690,6 +2760,7 @@ fn sidecar_round_trip_preserves_phases() {
                 metrics: s0_metrics.clone(),
             },
             PhaseBucket {
+                per_cgroup: Default::default(),
                 step_index: 2,
                 label: "Step[1]".to_string(),
                 start_ms: 5500,

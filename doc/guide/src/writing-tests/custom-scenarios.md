@@ -39,12 +39,14 @@ See [CgroupGroup](../architecture/cgroup-group.md) for drop semantics.
 > example above is required — `use ktstr::prelude::*;` alone does
 > not bring them into scope.
 
-**`collect_all(handles, checks)`** -- stops all workers, collects
-reports, runs worker-level checks when `checks.has_worker_checks()`
-is true; when no worker checks are configured the merge step is
-skipped entirely and the result stays `pass` (no implicit
-"`assert_not_starved` fallback"). Merges results: if any worker
-group fails an enabled check, the overall result fails.
+**`collect_all(handles, checks)`** -- stops all workers and collects
+reports. Per-cgroup telemetry (`CgroupStats`) is always produced for
+every handle, regardless of which checks are configured; only the
+worker-check assertion outcomes are recorded for the checks the caller
+enabled. With no checks enabled the result stays `pass` because no
+failing outcome is recorded (there is no implicit `assert_not_starved`
+fallback). If any handle fails an enabled check, the overall result
+fails.
 
 **`dfl_wl(ctx)`** -- creates a `WorkloadConfig` with
 `ctx.workers_per_cgroup` workers and default settings.

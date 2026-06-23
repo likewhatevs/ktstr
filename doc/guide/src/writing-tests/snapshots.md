@@ -16,8 +16,8 @@ specific symbol, see [Watch Snapshots](watch-snapshots.md). For
 [Periodic Capture](periodic-capture.md) — it produces a time-ordered
 [`SampleSeries`](temporal-assertions.md#sampleseries) that flows into
 the [temporal-assertion](temporal-assertions.md) patterns
-(`nondecreasing`, `rate_within`, `steady_within`, `converges_to`,
-`always_true`, `ratio_within`).
+(`nondecreasing`, `strictly_increasing`, `rate_within`,
+`steady_within`, `converges_to`, `always_true`, `ratio_within`).
 
 ## Issuing a snapshot
 
@@ -334,9 +334,10 @@ needed to fix the call site without re-running the test:
   placeholder never falsely registers as zero progress against a
   monotonicity / rate / steady / ratio band. `reason` carries the
   rendezvous-timeout cause text.
-- `MissingStats { tag }` — a [`SampleSeries::stats`](temporal-assertions.md#projecting-from-scx_stats-json)
-  projection ran on a sample whose `stats` slot is `None` (stats
-  client not wired or per-sample stats request failed). Distinct
+- `MissingStats { tag, reason }` — a [`SampleSeries::stats`](temporal-assertions.md#projecting-from-scx_stats-json)
+  projection ran on a sample whose `stats` slot is `Err(reason)`
+  (stats client not wired or per-sample stats request failed);
+  `reason` (a `MissingStatsReason`) identifies the cause. Distinct
   from in-JSON path misses (`FieldNotFound` / `TypeMismatch`) so the
   assertion site can branch on the cause without re-walking the
   source.

@@ -3701,7 +3701,7 @@ dependencies = [
 
 [[package]]
 name = "ktstr"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "ahash",
  "anyhow",
@@ -3766,6 +3766,7 @@ dependencies = [
  "serde_path_to_error",
  "sha2 0.11.0",
  "siphasher",
+ "smallvec",
  "strsim",
  "strum 0.28.0",
  "syn 2.0.117",
@@ -3795,7 +3796,7 @@ dependencies = [
 
 [[package]]
 name = "ktstr-macros"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "proc-macro2",
  "quote",

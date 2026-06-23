@@ -25,12 +25,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use anyhow::{Context, Result};
 
 use crate::scenario::Ctx;
-use crate::workload::{ResolvedAffinity, WorkloadConfig, WorkloadHandle};
+use crate::workload::{AffinityIntent, ResolvedAffinity, WorkSpec, WorkloadConfig, WorkloadHandle};
 
 use super::setup::{append_placement_log, apply_setup};
 use super::{
-    KernelTarget, KernelValue, Op, PayloadEntry, PayloadSource, ScenarioState, SpawnPlacement,
-    validate_known_flags, validate_mempolicy_cpuset,
+    CgroupDef, CpusetSpec, KernelTarget, KernelValue, KernelValueWidth, Op, PayloadEntry,
+    PayloadSource, ScenarioState, SpawnPlacement, validate_known_flags, validate_mempolicy_cpuset,
 };
 
 /// Latched once `Op::CaptureSnapshot` / `Op::WatchSnapshot` observes a
@@ -87,168 +87,240 @@ pub(super) fn apply_ops(
     let merged = merge_adjacent_cold_writes(ops);
     for op in &merged {
         match op {
-            Op::AddCgroup { name } => {
-                // Mirror the collision check in `apply_setup`
-                // (`CgroupDef`) so the same name declared via `Op`
-                // is rejected the same way. Without this, an
-                // `Op::AddCgroup` could silently shadow a
-                // Backdrop-owned or step-local `CgroupDef`-created
-                // cgroup and the two writers could clobber each
-                // other's cpuset / subtree_control state.
-                if state.cgroup_name_is_tracked(name) {
-                    anyhow::bail!(
-                        "Op::AddCgroup '{}' collides with a cgroup already \
-                         tracked (by a prior Backdrop or step-local CgroupDef) — \
-                         declare it in exactly one place; use a fresh name for \
-                         the step-local cgroup",
-                        name,
-                    );
-                }
-                state.target_cgroups().add_cgroup_no_cpuset(name)?;
+            Op::AddCgroup { name } => apply_add_cgroup(state, name)?,
+            Op::AddCgroupDef { def } => apply_add_cgroup_def(ctx, state, def)?,
+            Op::RemoveCgroup { cgroup } => apply_remove_cgroup(ctx, state, cgroup)?,
+            Op::SetCpuset { cgroup, cpus } => apply_set_cpuset(ctx, state, cgroup, cpus)?,
+            Op::ClearCpuset { cgroup } => apply_clear_cpuset(ctx, state, cgroup)?,
+            Op::SwapCpusets { a, b } => apply_swap_cpusets(ctx, state, a, b)?,
+            Op::Spawn { placement, work } => apply_spawn(ctx, state, placement, work)?,
+            Op::StopCgroup { cgroup } => apply_stop_cgroup(state, cgroup)?,
+            Op::SetAffinity { cgroup, affinity } => {
+                apply_set_affinity(ctx, state, cgroup, affinity)?
             }
-            Op::AddCgroupDef { def } => {
-                // Delegate to `apply_setup` so cpuset, cpu / memory /
-                // io / pids knobs, and worker spawning all run
-                // through the same code path that a Step's
-                // `with_defs` setup pass uses. The collision check
-                // and workers_pct / empty-cpuset diagnostics carry
-                // over via the delegation; controller-required
-                // tracking is a sibling concern wired separately at
-                // `required_controllers` (see absorb_op's
-                // Op::AddCgroupDef arm) so the parent's
-                // subtree_control has the def's controllers enabled
-                // before this dispatch runs. The only difference
-                // from Step::with_defs is the timing (apply-ops vs
-                // setup).
-                apply_setup(ctx, state, std::slice::from_ref(def))?;
+            Op::MoveAllTasks { from, to } => apply_move_all_tasks(ctx, state, from, to)?,
+            Op::RunPayload {
+                payload,
+                args,
+                cgroup,
+            } => apply_run_payload(ctx, state, payload, args, cgroup)?,
+            Op::WaitPayload { name, cgroup } => apply_wait_payload(state, name, cgroup)?,
+            Op::KillPayload { name, cgroup } => apply_kill_payload(state, name, cgroup)?,
+            Op::FreezeCgroup { cgroup } => apply_freeze_cgroup(ctx, cgroup)?,
+            Op::UnfreezeCgroup { cgroup } => apply_unfreeze_cgroup(ctx, cgroup)?,
+            Op::CaptureSnapshot { name } => apply_capture_snapshot(ctx, in_loop, name)?,
+            Op::WatchSnapshot { symbol } => apply_watch_snapshot(symbol)?,
+            Op::WriteKernelHot { writes } => apply_write_kernel_hot(writes)?,
+            Op::WriteKernelCold { writes } => apply_write_kernel_cold(writes)?,
+            Op::ReadKernelHot { tag, target, width } => apply_read_kernel_hot(tag, target, width)?,
+            Op::ReadKernelCold { tag, target, width } => {
+                apply_read_kernel_cold(tag, target, width)?
             }
-            Op::RemoveCgroup { cgroup } => {
-                // Stop workers + payload binaries in this cgroup
-                // before the cgroupfs removal. A live process in the
-                // cgroup makes `rmdir` fail with EBUSY; kill the
-                // payload handles first so the cgroup frees up.
-                state.drain_payloads_for_cgroup(cgroup);
-                state.drop_handles_for_cgroup(cgroup);
-                state.forget_cpuset(cgroup);
-                // Diagnostic breadcrumbs for the typo-late-surfacing
-                // failure mode that permissive RemoveCgroup makes
-                // possible: a typo'd cgroup name now no-ops silently
-                // against the kernel, then a downstream op
-                // referencing the intended Backdrop cgroup hits
-                // kernel-level "cgroup missing" with no obvious link
-                // back to the typo. Two complementary warns:
-                //
-                // (1) RemoveCgroup against a Backdrop-tracked name
-                //     — operator can grep the log to correlate a
-                //     later "cgroup missing" error with the
-                //     intentional removal source.
-                // (2) RemoveCgroup against a name NOT in any tracked
-                //     set — could be a typo OR a second-remove of a
-                //     name already forgotten by a prior RemoveCgroup;
-                //     dump both the Backdrop and step-local cgroup
-                //     name lists so the operator can compare and
-                //     find the off-by-one. Fires unconditionally on
-                //     unknown names (no `backdrop non-empty` gate)
-                //     so typos in step-local-only scenarios are also
-                //     caught.
-                //
-                // Order matters: these membership checks must run
-                // BEFORE the `forget` calls below. Reordering them
-                // after `forget` would prune the name from both
-                // `names()` lists, making `in_backdrop` and `in_step`
-                // both observe `false` — warn (1) would never fire and
-                // warn (2) would fire spuriously on every RemoveCgroup.
-                let in_backdrop = state
-                    .backdrop
-                    .cgroups
-                    .names()
-                    .iter()
-                    .any(|n| n == &**cgroup);
-                let in_step = state.step.cgroups.names().iter().any(|n| n == &**cgroup);
-                if in_backdrop {
-                    tracing::warn!(
-                        cgroup = %cgroup,
-                        "Op::RemoveCgroup removed a Backdrop-owned cgroup mid-scenario; \
-                         unless this name is re-added by a later Op::AddCgroup, \
-                         downstream ops referencing it will see kernel-level \
-                         `cgroup missing` errors. If this removal was unintended \
-                         (e.g. typo'd cgroup name that coincidentally matched a \
-                         Backdrop entry), check the test source for the intended \
-                         Backdrop cgroup.",
-                    );
-                } else if !in_step {
-                    tracing::warn!(
-                        cgroup = %cgroup,
-                        backdrop_cgroups = ?state.backdrop.cgroups.names(),
-                        step_cgroups = ?state.step.cgroups.names(),
-                        "Op::RemoveCgroup target '{cgroup}' matches no step-local \
-                         or Backdrop-owned cgroup — could be a typo or a \
-                         second-remove of an already-forgotten name. Compare \
-                         against the listed Backdrop and step cgroups; if a \
-                         downstream op later hits kernel-level `cgroup missing` \
-                         on a similar name, the typo here is the probable source.",
-                    );
-                }
-                // Drop the name from step/backdrop tracking BEFORE
-                // the rmdir so a later AddCgroup with the same name
-                // doesn't collide against a stale entry, and the
-                // CgroupGroup::drop teardown path doesn't attempt
-                // to rmdir an already-removed dir.
-                state.step.cgroups.forget(cgroup);
-                state.backdrop.cgroups.forget(cgroup);
-                // ENOENT is expected here only as a TOCTOU outcome:
-                // `CgroupManager::remove_cgroup` first checks
-                // `p.exists()` and returns `Ok(())` when the dir is
-                // already gone, so a clean "already removed by a
-                // prior op" case never reaches this error arm. The
-                // remaining ENOENT path is the narrow race where the
-                // dir is unlinked by another process between
-                // `exists()` and `fs::remove_dir(&p)`, which is
-                // benign — the post-condition we want (no dir) still
-                // holds. Every other error — EBUSY from a surviving
-                // task, EACCES from a permissions regression, I/O
-                // errors from a broken cgroupfs mount — gets logged
-                // so the failure surfaces in test output instead of
-                // being swallowed by `let _ = `.
-                if let Err(err) = ctx.cgroups.remove_cgroup(cgroup)
-                    && !crate::scenario::is_io_not_found(&err)
-                {
-                    let hint = crate::scenario::remove_cgroup_errno_hint(&err).unwrap_or("");
-                    tracing::warn!(
-                        cgroup = %cgroup,
-                        err = %format!("{err:#}"),
-                        hint,
-                        "Op::RemoveCgroup: remove_cgroup returned non-ENOENT error",
-                    );
-                }
-            }
-            Op::SetCpuset { cgroup, cpus } => {
-                if let Err(reason) = cpus.validate(ctx) {
-                    anyhow::bail!(
-                        "cgroup '{}': CpusetSpec validation failed: {}",
-                        cgroup,
-                        reason
-                    );
-                }
-                let resolved = cpus.resolve_quiet(ctx);
-                // Symmetric with apply_setup's empty-resolved bail.
-                // An Op::SetCpuset that narrows mid-scenario to 0
-                // CPUs would silently re-mask the cgroup to empty
-                // and break every running worker that depended on
-                // it. Example cases that pass validate but resolve
-                // to empty: `Range { start, end }` where the slice
-                // math truncates to an empty range on a small
-                // topology (the `op_set_cpuset_narrow_to_empty_bails`
-                // test exercises `Range { 0.0, 0.1 }` on 4 CPUs),
-                // or `Llc(N)` on a pathological topology where the
-                // Nth LLC has no associated CPUs (memory-only NUMA
-                // node attached to a separate LLC). Bail with the
-                // spec context so the operator can see which
-                // mid-scenario narrow produced the empty
-                // resolution.
-                if resolved.is_empty() {
-                    anyhow::bail!(
-                        "cgroup '{}': Op::SetCpuset spec {:?} \
+            Op::AttachScheduler { scheduler } => apply_attach_scheduler(scheduler)?,
+            Op::DetachScheduler => apply_detach_scheduler()?,
+            Op::RestartScheduler => apply_restart_scheduler()?,
+            Op::ReplaceScheduler { scheduler } => apply_replace_scheduler(scheduler)?,
+            Op::PinBpfMap { name } => apply_pin_bpf_map(state, name)?,
+            Op::CaptureCgroupProcs { tag, cgroup } => apply_capture_cgroup_procs(ctx, tag, cgroup)?,
+        }
+    }
+    Ok(())
+}
+
+/// `Op::AddCgroup` body: declare an empty step/backdrop cgroup.
+fn apply_add_cgroup(state: &mut ScenarioState<'_, '_>, name: &str) -> Result<()> {
+    // Mirror the collision check in `apply_setup`
+    // (`CgroupDef`) so the same name declared via `Op`
+    // is rejected the same way. Without this, an
+    // `Op::AddCgroup` could silently shadow a
+    // Backdrop-owned or step-local `CgroupDef`-created
+    // cgroup and the two writers could clobber each
+    // other's cpuset / subtree_control state.
+    if state.cgroup_name_is_tracked(name) {
+        anyhow::bail!(
+            "Op::AddCgroup '{}' collides with a cgroup already \
+             tracked (by a prior Backdrop or step-local CgroupDef) — \
+             declare it in exactly one place; use a fresh name for \
+             the step-local cgroup",
+            name,
+        );
+    }
+    state.target_cgroups().add_cgroup_no_cpuset(name)?;
+    Ok(())
+}
+
+/// `Op::AddCgroupDef` body: materialize a full `CgroupDef` mid-step.
+fn apply_add_cgroup_def(
+    ctx: &Ctx,
+    state: &mut ScenarioState<'_, '_>,
+    def: &CgroupDef,
+) -> Result<()> {
+    {
+        // Delegate to `apply_setup` so cpuset, cpu / memory /
+        // io / pids knobs, and worker spawning all run
+        // through the same code path that a Step's
+        // `with_defs` setup pass uses. The collision check
+        // and workers_pct / empty-cpuset diagnostics carry
+        // over via the delegation; controller-required
+        // tracking is a sibling concern wired separately at
+        // `required_controllers` (see absorb_op's
+        // Op::AddCgroupDef arm) so the parent's
+        // subtree_control has the def's controllers enabled
+        // before this dispatch runs. The only difference
+        // from Step::with_defs is the timing (apply-ops vs
+        // setup).
+        apply_setup(ctx, state, std::slice::from_ref(def))?;
+    }
+    Ok(())
+}
+
+/// `Op::RemoveCgroup` body: stop workers then rmdir the cgroup.
+// ptr_arg allow: private single-call helper; the `&Cow` param keeps this a
+// byte-faithful extraction of the Op match-arm binding (the dispatcher is the
+// only caller and already holds a `&Cow`).
+#[allow(clippy::ptr_arg)]
+fn apply_remove_cgroup(
+    ctx: &Ctx,
+    state: &mut ScenarioState<'_, '_>,
+    cgroup: &std::borrow::Cow<'static, str>,
+) -> Result<()> {
+    {
+        // Stop workers + payload binaries in this cgroup
+        // before the cgroupfs removal. A live process in the
+        // cgroup makes `rmdir` fail with EBUSY; kill the
+        // payload handles first so the cgroup frees up.
+        state.drain_payloads_for_cgroup(cgroup);
+        state.drop_handles_for_cgroup(cgroup);
+        state.forget_cpuset(cgroup);
+        // Diagnostic breadcrumbs for the typo-late-surfacing
+        // failure mode that permissive RemoveCgroup makes
+        // possible: a typo'd cgroup name now no-ops silently
+        // against the kernel, then a downstream op
+        // referencing the intended Backdrop cgroup hits
+        // kernel-level "cgroup missing" with no obvious link
+        // back to the typo. Two complementary warns:
+        //
+        // (1) RemoveCgroup against a Backdrop-tracked name
+        //     — operator can grep the log to correlate a
+        //     later "cgroup missing" error with the
+        //     intentional removal source.
+        // (2) RemoveCgroup against a name NOT in any tracked
+        //     set — could be a typo OR a second-remove of a
+        //     name already forgotten by a prior RemoveCgroup;
+        //     dump both the Backdrop and step-local cgroup
+        //     name lists so the operator can compare and
+        //     find the off-by-one. Fires unconditionally on
+        //     unknown names (no `backdrop non-empty` gate)
+        //     so typos in step-local-only scenarios are also
+        //     caught.
+        //
+        // Order matters: these membership checks must run
+        // BEFORE the `forget` calls below. Reordering them
+        // after `forget` would prune the name from both
+        // `names()` lists, making `in_backdrop` and `in_step`
+        // both observe `false` — warn (1) would never fire and
+        // warn (2) would fire spuriously on every RemoveCgroup.
+        let in_backdrop = state
+            .backdrop
+            .cgroups
+            .names()
+            .iter()
+            .any(|n| n == &**cgroup);
+        let in_step = state.step.cgroups.names().iter().any(|n| n == &**cgroup);
+        if in_backdrop {
+            tracing::warn!(
+                cgroup = %cgroup,
+                "Op::RemoveCgroup removed a Backdrop-owned cgroup mid-scenario; \
+                 unless this name is re-added by a later Op::AddCgroup, \
+                 downstream ops referencing it will see kernel-level \
+                 `cgroup missing` errors. If this removal was unintended \
+                 (e.g. typo'd cgroup name that coincidentally matched a \
+                 Backdrop entry), check the test source for the intended \
+                 Backdrop cgroup.",
+            );
+        } else if !in_step {
+            tracing::warn!(
+                cgroup = %cgroup,
+                backdrop_cgroups = ?state.backdrop.cgroups.names(),
+                step_cgroups = ?state.step.cgroups.names(),
+                "Op::RemoveCgroup target '{cgroup}' matches no step-local \
+                 or Backdrop-owned cgroup — could be a typo or a \
+                 second-remove of an already-forgotten name. Compare \
+                 against the listed Backdrop and step cgroups; if a \
+                 downstream op later hits kernel-level `cgroup missing` \
+                 on a similar name, the typo here is the probable source.",
+            );
+        }
+        // Drop the name from step/backdrop tracking BEFORE
+        // the rmdir so a later AddCgroup with the same name
+        // doesn't collide against a stale entry, and the
+        // CgroupGroup::drop teardown path doesn't attempt
+        // to rmdir an already-removed dir.
+        state.step.cgroups.forget(cgroup);
+        state.backdrop.cgroups.forget(cgroup);
+        // ENOENT is expected here only as a TOCTOU outcome:
+        // `CgroupManager::remove_cgroup` first checks
+        // `p.exists()` and returns `Ok(())` when the dir is
+        // already gone, so a clean "already removed by a
+        // prior op" case never reaches this error arm. The
+        // remaining ENOENT path is the narrow race where the
+        // dir is unlinked by another process between
+        // `exists()` and `fs::remove_dir(&p)`, which is
+        // benign — the post-condition we want (no dir) still
+        // holds. Every other error — EBUSY from a surviving
+        // task, EACCES from a permissions regression, I/O
+        // errors from a broken cgroupfs mount — gets logged
+        // so the failure surfaces in test output instead of
+        // being swallowed by `let _ = `.
+        if let Err(err) = ctx.cgroups.remove_cgroup(cgroup)
+            && !crate::scenario::is_io_not_found(&err)
+        {
+            let hint = crate::scenario::remove_cgroup_errno_hint(&err).unwrap_or("");
+            tracing::warn!(
+                cgroup = %cgroup,
+                err = %format!("{err:#}"),
+                hint,
+                "Op::RemoveCgroup: remove_cgroup returned non-ENOENT error",
+            );
+        }
+    }
+    Ok(())
+}
+
+/// `Op::SetCpuset` body: resolve+apply a cpuset to a live cgroup.
+fn apply_set_cpuset(
+    ctx: &Ctx,
+    state: &mut ScenarioState<'_, '_>,
+    cgroup: &str,
+    cpus: &CpusetSpec,
+) -> Result<()> {
+    {
+        if let Err(reason) = cpus.validate(ctx) {
+            anyhow::bail!(
+                "cgroup '{}': CpusetSpec validation failed: {}",
+                cgroup,
+                reason
+            );
+        }
+        let resolved = cpus.resolve_quiet(ctx);
+        // Symmetric with apply_setup's empty-resolved bail.
+        // An Op::SetCpuset that narrows mid-scenario to 0
+        // CPUs would silently re-mask the cgroup to empty
+        // and break every running worker that depended on
+        // it. Example cases that pass validate but resolve
+        // to empty: `Range { start, end }` where the slice
+        // math truncates to an empty range on a small
+        // topology (the `op_set_cpuset_narrow_to_empty_bails`
+        // test exercises `Range { 0.0, 0.1 }` on 4 CPUs),
+        // or `Llc(N)` on a pathological topology where the
+        // Nth LLC has no associated CPUs (memory-only NUMA
+        // node attached to a separate LLC). Bail with the
+        // spec context so the operator can see which
+        // mid-scenario narrow produced the empty
+        // resolution.
+        if resolved.is_empty() {
+            anyhow::bail!(
+                "cgroup '{}': Op::SetCpuset spec {:?} \
                          resolved to 0 CPU(s); narrowing a live \
                          cgroup to empty would leave running \
                          workers without CPUs and downstream \
@@ -258,858 +330,989 @@ pub(super) fn apply_ops(
                          Op::ClearCpuset if the intent was to \
                          release the cpuset restriction (allow all \
                          CPUs)",
-                        cgroup,
-                        cpus,
-                    );
-                }
-                ctx.cgroups.set_cpuset(cgroup, &resolved)?;
-                state.record_cpuset(cgroup, resolved);
+                cgroup,
+                cpus,
+            );
+        }
+        ctx.cgroups.set_cpuset(cgroup, &resolved)?;
+        state.record_cpuset(cgroup, resolved);
+    }
+    Ok(())
+}
+
+/// `Op::ClearCpuset` body: release a cgroup's cpuset restriction.
+fn apply_clear_cpuset(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, cgroup: &str) -> Result<()> {
+    {
+        ctx.cgroups.clear_cpuset(cgroup)?;
+        state.forget_cpuset(cgroup);
+    }
+    Ok(())
+}
+
+/// `Op::SwapCpusets` body: read both cgroups' cpusets and exchange them.
+fn apply_swap_cpusets(
+    ctx: &Ctx,
+    state: &mut ScenarioState<'_, '_>,
+    a: &str,
+    b: &str,
+) -> Result<()> {
+    {
+        // Read current cpusets from the cgroup filesystem, swap them.
+        let cpus_a = read_cpuset(ctx, a);
+        let cpus_b = read_cpuset(ctx, b);
+        if let Some(ca) = cpus_a {
+            ctx.cgroups.set_cpuset(b, &ca)?;
+            state.record_cpuset(b, ca);
+        }
+        if let Some(cb) = cpus_b {
+            ctx.cgroups.set_cpuset(a, &cb)?;
+            state.record_cpuset(a, cb);
+        }
+    }
+    Ok(())
+}
+
+/// `Op::Spawn` body: spawn workers per the `placement`.
+fn apply_spawn(
+    ctx: &Ctx,
+    state: &mut ScenarioState<'_, '_>,
+    placement: &SpawnPlacement,
+    work: &WorkSpec,
+) -> Result<()> {
+    match placement {
+        SpawnPlacement::RunnerCgroup => {
+            if let Err(reason) = work.mem_policy.validate() {
+                anyhow::bail!("Op::Spawn(RunnerCgroup): {}", reason);
             }
-            Op::ClearCpuset { cgroup } => {
-                ctx.cgroups.clear_cpuset(cgroup)?;
-                state.forget_cpuset(cgroup);
-            }
-            Op::SwapCpusets { a, b } => {
-                // Read current cpusets from the cgroup filesystem, swap them.
-                let cpus_a = read_cpuset(ctx, a);
-                let cpus_b = read_cpuset(ctx, b);
-                if let Some(ca) = cpus_a {
-                    ctx.cgroups.set_cpuset(b, &ca)?;
-                    state.record_cpuset(b, ca);
-                }
-                if let Some(cb) = cpus_b {
-                    ctx.cgroups.set_cpuset(a, &cb)?;
-                    state.record_cpuset(a, cb);
-                }
-            }
-            Op::Spawn { placement, work } => match placement {
-                SpawnPlacement::RunnerCgroup => {
-                    if let Err(reason) = work.mem_policy.validate() {
-                        anyhow::bail!("Op::Spawn(RunnerCgroup): {}", reason);
-                    }
-                    // RunnerCgroup placement has no managed cgroup
-                    // whose cpuset would scale `workers_pct`. Bail
-                    // loud — silent fallback to ctx.workers_per_cgroup
-                    // would discard the operator's intent.
-                    if work.workers_pct.is_some() {
-                        anyhow::bail!(
-                            "Op::Spawn with SpawnPlacement::RunnerCgroup does not support \
+            // RunnerCgroup placement has no managed cgroup
+            // whose cpuset would scale `workers_pct`. Bail
+            // loud — silent fallback to ctx.workers_per_cgroup
+            // would discard the operator's intent.
+            if work.workers_pct.is_some() {
+                anyhow::bail!(
+                    "Op::Spawn with SpawnPlacement::RunnerCgroup does not support \
                              `WorkSpec::workers_pct` — RunnerCgroup spawns workers in the \
                              test runner's own cgroup, with no managed cgroup whose cpuset \
                              would scale the fraction against (workers_pct = `ceil(cpuset_cpus \
                              * pct)`). Either set an explicit `.workers(N)` count, or switch \
                              to SpawnPlacement::Cgroup(name) against a cgroup whose cpuset \
                              gives `workers_pct` a denominator.",
-                        );
-                    }
-                    let n = crate::scenario::resolve_num_workers(
-                        work,
-                        ctx.workers_per_cgroup,
-                        "<runner>",
-                    )?;
-                    let affinity =
-                        crate::scenario::intent_for_spawn(&work.affinity, None, ctx.topo)?;
-                    let wl = WorkloadConfig::for_scenario_engine(
-                        work,
-                        n,
-                        affinity,
-                        work.work_type.clone(),
-                    )?;
-                    let mut h = WorkloadHandle::spawn(&wl)?;
-                    h.start();
-                    // Empty-string key: workers stay in the runner's
-                    // own cgroup (no managed cgroup membership) —
-                    // see SpawnPlacement::RunnerCgroup doc.
-                    state.target_handles().push((String::new(), h));
-                }
-                SpawnPlacement::Cgroup(cgroup) => {
-                    // Reject empty-string cgroup at the dispatch
-                    // entry: `move_tasks` further down also rejects
-                    // it, but the resulting error mentions
-                    // `cgroup ''` after workers have already been
-                    // spawned (Drop SIGKILLs them, but the wasted
-                    // spawn churns the kernel). Bail upfront with an
-                    // actionable redirect.
-                    if cgroup.is_empty() {
-                        anyhow::bail!(
-                            "Op::Spawn(SpawnPlacement::Cgroup): cgroup name is empty — \
+                );
+            }
+            let n = crate::scenario::resolve_num_workers(work, ctx.workers_per_cgroup, "<runner>")?;
+            let affinity = crate::scenario::intent_for_spawn(&work.affinity, None, ctx.topo)?;
+            let wl =
+                WorkloadConfig::for_scenario_engine(work, n, affinity, work.work_type.clone())?;
+            let mut h = WorkloadHandle::spawn(&wl)?;
+            h.start();
+            // Empty-string key: workers stay in the runner's
+            // own cgroup (no managed cgroup membership) —
+            // see SpawnPlacement::RunnerCgroup doc.
+            state.target_handles().push((String::new(), h));
+        }
+        SpawnPlacement::Cgroup(cgroup) => {
+            // Reject empty-string cgroup at the dispatch
+            // entry: `move_tasks` further down also rejects
+            // it, but the resulting error mentions
+            // `cgroup ''` after workers have already been
+            // spawned (Drop SIGKILLs them, but the wasted
+            // spawn churns the kernel). Bail upfront with an
+            // actionable redirect.
+            if cgroup.is_empty() {
+                anyhow::bail!(
+                    "Op::Spawn(SpawnPlacement::Cgroup): cgroup name is empty — \
                              use SpawnPlacement::runner_cgroup() to spawn workers in \
                              the test runner's own cgroup, or pass a non-empty name \
                              via SpawnPlacement::cgroup(name)",
-                        );
-                    }
-                    // Pre-validate that the cgroup exists in step or
-                    // backdrop tracking BEFORE WorkloadHandle::spawn
-                    // burns clone(2) syscalls. Without this gate
-                    // `move_tasks` would fail with kernel ENOENT
-                    // AFTER the workers spawn (and get SIGKILLed via
-                    // Drop on the failure path) — wasted spawn
-                    // churn AND a less actionable error (kernel
-                    // ENOENT does not include the registry of
-                    // known cgroup names). Bail upfront with a
-                    // diagnostic that lists the tracked names so
-                    // the test author spots a typo immediately.
-                    if !state.cgroup_name_is_tracked(cgroup) {
-                        anyhow::bail!(
-                            "Op::Spawn(SpawnPlacement::Cgroup('{cgroup}')): \
+                );
+            }
+            // Pre-validate that the cgroup exists in step or
+            // backdrop tracking BEFORE WorkloadHandle::spawn
+            // burns clone(2) syscalls. Without this gate
+            // `move_tasks` would fail with kernel ENOENT
+            // AFTER the workers spawn (and get SIGKILLed via
+            // Drop on the failure path) — wasted spawn
+            // churn AND a less actionable error (kernel
+            // ENOENT does not include the registry of
+            // known cgroup names). Bail upfront with a
+            // diagnostic that lists the tracked names so
+            // the test author spots a typo immediately.
+            if !state.cgroup_name_is_tracked(cgroup) {
+                anyhow::bail!(
+                    "Op::Spawn(SpawnPlacement::Cgroup('{cgroup}')): \
                              cgroup '{cgroup}' is not tracked by the scenario state — \
                              declare it via CgroupDef in Step.setup, \
                              Op::add_cgroup / Op::add_cgroup_def earlier in the \
                              same step, or on the persistent Backdrop. Tracked \
                              step-local cgroups: {step:?}; tracked Backdrop \
                              cgroups: {backdrop:?}",
-                            step = state.step.cgroups.names(),
-                            backdrop = state.backdrop.cgroups.names(),
-                        );
-                    }
-                    if let Err(reason) = work.mem_policy.validate() {
-                        anyhow::bail!("Op::Spawn(Cgroup '{}'): {}", cgroup, reason);
-                    }
-                    let cgroup_cpuset: Option<BTreeSet<usize>> =
-                        state.lookup_cpuset(cgroup).cloned();
-                    let cpuset_size = cgroup_cpuset
-                        .as_ref()
-                        .map_or_else(|| ctx.topo.usable_cpuset().len(), |s| s.len());
-                    let work = work.clone().resolve_workers_pct(cpuset_size, cgroup)?;
-                    let n = crate::scenario::resolve_num_workers(
-                        &work,
-                        ctx.workers_per_cgroup,
-                        cgroup,
-                    )?;
-                    if let Some(ref resolved) = cgroup_cpuset {
-                        validate_mempolicy_cpuset(
-                            &work.mem_policy,
-                            work.mpol_flags,
-                            resolved,
-                            ctx,
-                            cgroup,
-                        )?;
-                    }
-                    let affinity = crate::scenario::intent_for_spawn(
-                        &work.affinity,
-                        cgroup_cpuset.as_ref(),
-                        ctx.topo,
-                    )?;
-                    // for_scenario_engine pins Fork in the constructor
-                    // so the runtime assert that used to live here is
-                    // redundant.  WorkSpec::pcomm is intentionally
-                    // dropped on this path — see WorkSpec::pcomm doc:
-                    // Fork-mode worker pcomm derives from the parent
-                    // process's name, not from WorkSpec, so the
-                    // pcomm field has no effect for spawn ops.
-                    let wl = WorkloadConfig::for_scenario_engine(
-                        &work,
-                        n,
-                        affinity,
-                        work.work_type.clone(),
-                    )?;
-                    let mut h = WorkloadHandle::spawn(&wl)?;
-                    ctx.cgroups.move_tasks(cgroup, &h.worker_pids())?;
-                    h.start();
-                    state.target_handles().push((cgroup.to_string(), h));
-                }
-            },
-            Op::StopCgroup { cgroup } => {
-                state.drain_payloads_for_cgroup(cgroup);
-                state.drop_handles_for_cgroup(cgroup);
+                    step = state.step.cgroups.names(),
+                    backdrop = state.backdrop.cgroups.names(),
+                );
             }
-            Op::SetAffinity { cgroup, affinity } => {
-                let cgroup_cpuset: Option<BTreeSet<usize>> = state.lookup_cpuset(cgroup).cloned();
-                let resolved = crate::scenario::resolve_affinity_for_cgroup(
-                    affinity,
-                    cgroup_cpuset.as_ref(),
-                    ctx.topo,
+            if let Err(reason) = work.mem_policy.validate() {
+                anyhow::bail!("Op::Spawn(Cgroup '{}'): {}", cgroup, reason);
+            }
+            let cgroup_cpuset: Option<BTreeSet<usize>> = state.lookup_cpuset(cgroup).cloned();
+            let cpuset_size = cgroup_cpuset
+                .as_ref()
+                .map_or_else(|| ctx.topo.usable_cpuset().len(), |s| s.len());
+            let work = work.clone().resolve_workers_pct(cpuset_size, cgroup)?;
+            let n = crate::scenario::resolve_num_workers(&work, ctx.workers_per_cgroup, cgroup)?;
+            if let Some(ref resolved) = cgroup_cpuset {
+                validate_mempolicy_cpuset(
+                    &work.mem_policy,
+                    work.mpol_flags,
+                    resolved,
+                    ctx,
+                    cgroup,
                 )?;
-                // Materialise the Random pool into a Vec once before
-                // walking handles. `IndexedRandom::sample` requires
-                // slice indexing, which `BTreeSet` does not provide;
-                // without this hoist the per-handle inner arm would
-                // re-collect the same pool on every matching handle
-                // (and a single cgroup name can carry multiple handles
-                // when a `CgroupDef::works` vec or repeated
-                // `Op::Spawn(SpawnPlacement::Cgroup)` populates more
-                // than one). The pool is invariant
-                // across handles for a given resolved affinity.
-                //
-                // Invariant: `resolve_affinity_for_cgroup` bails on
-                // `RandomSubset` with an empty pool or `count == 0`
-                // before this match, so the Random arm here always
-                // sees a non-empty pool and count > 0. The match
-                // guard is gone; the former defensive no-op arm is
-                // replaced with an `unreachable!()` inside the Random
-                // arm — a regression that reintroduced the empty case
-                // would trip the panic at this site (both debug and
-                // release) instead of silently no-op'ing a
-                // SetAffinity. Mirrors the same enforcement in
-                // `flatten_for_spawn` at
-                // `crate::scenario::flatten_for_spawn`, so both
-                // consumer sites of ResolvedAffinity::Random share
-                // identical regression surfaces.
-                let random_pool: Vec<usize> =
-                    if let ResolvedAffinity::Random { from, .. } = &resolved {
-                        from.iter().copied().collect()
-                    } else {
-                        Vec::new()
-                    };
-                for (name, handle) in state.all_handles() {
-                    if name.as_str() == *cgroup {
-                        match &resolved {
-                            ResolvedAffinity::None => {}
-                            ResolvedAffinity::Fixed(cpus) => {
-                                for idx in 0..handle.worker_pids().len() {
-                                    if let Err(e) = handle.set_affinity(idx, cpus) {
-                                        tracing::warn!(
-                                            cgroup = %cgroup,
-                                            idx,
-                                            err = %format!("{e:#}"),
-                                            "Op::SetAffinity Fixed: handle.set_affinity failed; \
-                                             worker keeps prior affinity"
-                                        );
-                                    }
-                                }
+            }
+            let affinity = crate::scenario::intent_for_spawn(
+                &work.affinity,
+                cgroup_cpuset.as_ref(),
+                ctx.topo,
+            )?;
+            // for_scenario_engine pins Fork in the constructor
+            // so the runtime assert that used to live here is
+            // redundant.  WorkSpec::pcomm is intentionally
+            // dropped on this path — see WorkSpec::pcomm doc:
+            // Fork-mode worker pcomm derives from the parent
+            // process's name, not from WorkSpec, so the
+            // pcomm field has no effect for spawn ops.
+            let wl =
+                WorkloadConfig::for_scenario_engine(&work, n, affinity, work.work_type.clone())?;
+            let mut h = WorkloadHandle::spawn(&wl)?;
+            ctx.cgroups.move_tasks(cgroup, &h.worker_pids())?;
+            h.start();
+            state.target_handles().push((cgroup.to_string(), h));
+        }
+    }
+    Ok(())
+}
+
+/// `Op::StopCgroup` body: stop a cgroup's workers/payloads, keep the dir.
+fn apply_stop_cgroup(state: &mut ScenarioState<'_, '_>, cgroup: &str) -> Result<()> {
+    {
+        state.drain_payloads_for_cgroup(cgroup);
+        state.drop_handles_for_cgroup(cgroup);
+    }
+    Ok(())
+}
+
+/// `Op::SetAffinity` body: re-pin a cgroup's worker affinity.
+// ptr_arg allow: private single-call helper; the `&Cow` param keeps this a
+// byte-faithful extraction of the Op match-arm binding (the dispatcher is the
+// only caller and already holds a `&Cow`).
+#[allow(clippy::ptr_arg)]
+fn apply_set_affinity(
+    ctx: &Ctx,
+    state: &mut ScenarioState<'_, '_>,
+    cgroup: &std::borrow::Cow<'static, str>,
+    affinity: &AffinityIntent,
+) -> Result<()> {
+    {
+        let cgroup_cpuset: Option<BTreeSet<usize>> = state.lookup_cpuset(cgroup).cloned();
+        let resolved = crate::scenario::resolve_affinity_for_cgroup(
+            affinity,
+            cgroup_cpuset.as_ref(),
+            ctx.topo,
+        )?;
+        // Materialise the Random pool into a Vec once before
+        // walking handles. `IndexedRandom::sample` requires
+        // slice indexing, which `BTreeSet` does not provide;
+        // without this hoist the per-handle inner arm would
+        // re-collect the same pool on every matching handle
+        // (and a single cgroup name can carry multiple handles
+        // when a `CgroupDef::works` vec or repeated
+        // `Op::Spawn(SpawnPlacement::Cgroup)` populates more
+        // than one). The pool is invariant
+        // across handles for a given resolved affinity.
+        //
+        // Invariant: `resolve_affinity_for_cgroup` bails on
+        // `RandomSubset` with an empty pool or `count == 0`
+        // before this match, so the Random arm here always
+        // sees a non-empty pool and count > 0. The match
+        // guard is gone; the former defensive no-op arm is
+        // replaced with an `unreachable!()` inside the Random
+        // arm — a regression that reintroduced the empty case
+        // would trip the panic at this site (both debug and
+        // release) instead of silently no-op'ing a
+        // SetAffinity. Mirrors the same enforcement in
+        // `flatten_for_spawn` at
+        // `crate::scenario::flatten_for_spawn`, so both
+        // consumer sites of ResolvedAffinity::Random share
+        // identical regression surfaces.
+        let random_pool: Vec<usize> = if let ResolvedAffinity::Random { from, .. } = &resolved {
+            from.iter().copied().collect()
+        } else {
+            Vec::new()
+        };
+        for (name, handle) in state.all_handles() {
+            if name.as_str() == *cgroup {
+                match &resolved {
+                    ResolvedAffinity::None => {}
+                    ResolvedAffinity::Fixed(cpus) => {
+                        for idx in 0..handle.worker_pids().len() {
+                            if let Err(e) = handle.set_affinity(idx, cpus) {
+                                tracing::warn!(
+                                    cgroup = %cgroup,
+                                    idx,
+                                    err = %format!("{e:#}"),
+                                    "Op::SetAffinity Fixed: handle.set_affinity failed; \
+                                     worker keeps prior affinity"
+                                );
                             }
-                            ResolvedAffinity::Random { from, count } => {
-                                if from.is_empty() || *count == 0 {
-                                    // Invariant: resolve_affinity_for_cgroup
-                                    // bails on empty pool / count=0 before
-                                    // this match. Reaching here means a
-                                    // future caller constructed
-                                    // ResolvedAffinity::Random directly
-                                    // (bypassing the resolver). Panic loudly
-                                    // so the regression surfaces at the
-                                    // construction site instead of producing
-                                    // an empty sched_setaffinity mask that
-                                    // the kernel rejects with EINVAL —
-                                    // matches the unreachable!() pattern in
-                                    // flatten_for_spawn (scenario/mod.rs).
-                                    unreachable!(
-                                        "ResolvedAffinity::Random {{ from={from:?}, count={count} }} \
+                        }
+                    }
+                    ResolvedAffinity::Random { from, count } => {
+                        if from.is_empty() || *count == 0 {
+                            // Invariant: resolve_affinity_for_cgroup
+                            // bails on empty pool / count=0 before
+                            // this match. Reaching here means a
+                            // future caller constructed
+                            // ResolvedAffinity::Random directly
+                            // (bypassing the resolver). Panic loudly
+                            // so the regression surfaces at the
+                            // construction site instead of producing
+                            // an empty sched_setaffinity mask that
+                            // the kernel rejects with EINVAL —
+                            // matches the unreachable!() pattern in
+                            // flatten_for_spawn (scenario/mod.rs).
+                            unreachable!(
+                                "ResolvedAffinity::Random {{ from={from:?}, count={count} }} \
                                          reached Op::SetAffinity with empty pool or count==0 — \
                                          resolve_affinity_for_cgroup is supposed to bail on those \
                                          cases (no-silent-drops invariant). Audit the new caller \
                                          that constructed it.",
-                                    );
-                                }
-                                use rand::seq::IndexedRandom;
-                                for idx in 0..handle.worker_pids().len() {
-                                    let chosen: BTreeSet<usize> = random_pool
-                                        .sample(&mut rand::rng(), *count)
-                                        .copied()
-                                        .collect();
-                                    if let Err(e) = handle.set_affinity(idx, &chosen) {
-                                        tracing::warn!(
-                                            cgroup = %cgroup,
-                                            idx,
-                                            err = %format!("{e:#}"),
-                                            "Op::SetAffinity Random: handle.set_affinity failed; \
-                                             worker keeps prior affinity"
-                                        );
-                                    }
-                                }
+                            );
+                        }
+                        use rand::seq::IndexedRandom;
+                        for idx in 0..handle.worker_pids().len() {
+                            let chosen: BTreeSet<usize> = random_pool
+                                .sample(&mut rand::rng(), *count)
+                                .copied()
+                                .collect();
+                            if let Err(e) = handle.set_affinity(idx, &chosen) {
+                                tracing::warn!(
+                                    cgroup = %cgroup,
+                                    idx,
+                                    err = %format!("{e:#}"),
+                                    "Op::SetAffinity Random: handle.set_affinity failed; \
+                                     worker keeps prior affinity"
+                                );
                             }
-                            ResolvedAffinity::SingleCpu(cpu) => {
-                                let cpus: BTreeSet<usize> = [*cpu].into_iter().collect();
-                                for idx in 0..handle.worker_pids().len() {
-                                    if let Err(e) = handle.set_affinity(idx, &cpus) {
-                                        tracing::warn!(
-                                            cgroup = %cgroup,
-                                            idx,
-                                            cpu = *cpu,
-                                            err = %format!("{e:#}"),
-                                            "Op::SetAffinity SingleCpu: handle.set_affinity failed; \
-                                             worker keeps prior affinity"
-                                        );
-                                    }
-                                }
+                        }
+                    }
+                    ResolvedAffinity::SingleCpu(cpu) => {
+                        let cpus: BTreeSet<usize> = [*cpu].into_iter().collect();
+                        for idx in 0..handle.worker_pids().len() {
+                            if let Err(e) = handle.set_affinity(idx, &cpus) {
+                                tracing::warn!(
+                                    cgroup = %cgroup,
+                                    idx,
+                                    cpu = *cpu,
+                                    err = %format!("{e:#}"),
+                                    "Op::SetAffinity SingleCpu: handle.set_affinity failed; \
+                                     worker keeps prior affinity"
+                                );
                             }
                         }
                     }
                 }
             }
-            Op::MoveAllTasks { from, to } => {
-                // Self-move is a silent no-op: cgroup.procs writes are
-                // idempotent on same-cgroup targets and rename_handles
-                // collapses to identity when from == to. The op
-                // burns a freeze cycle + worker-state walk +
-                // clear_subtree_control roundtrip for zero observable
-                // effect. Bail so the test author surfaces real intent
-                // (remove the stale op, or fix a typo where the two
-                // names accidentally collapsed onto the same string)
-                // instead of debugging an absent move. Symmetric with
-                // the empty-string RunnerCgroup-capture pattern: an
-                // explicit `from == to == ""` self-move is also
-                // rejected here — moving RunnerCgroup-placement
-                // workers to "self" doesn't materialize them under a
-                // named cgroup.
-                if from == to {
-                    anyhow::bail!(
-                        "Op::MoveAllTasks from '{}' to '{}' is a self-move \
+        }
+    }
+    Ok(())
+}
+
+/// `Op::MoveAllTasks` body: migrate every worker between two cgroups.
+// ptr_arg allow: private single-call helper; the `&Cow` params keep this a
+// byte-faithful extraction of the Op match-arm bindings (the dispatcher is the
+// only caller and already holds `&Cow`s).
+#[allow(clippy::ptr_arg)]
+fn apply_move_all_tasks(
+    ctx: &Ctx,
+    state: &mut ScenarioState<'_, '_>,
+    from: &std::borrow::Cow<'static, str>,
+    to: &std::borrow::Cow<'static, str>,
+) -> Result<()> {
+    {
+        // Self-move is a silent no-op: cgroup.procs writes are
+        // idempotent on same-cgroup targets and rename_handles
+        // collapses to identity when from == to. The op
+        // burns a freeze cycle + worker-state walk +
+        // clear_subtree_control roundtrip for zero observable
+        // effect. Bail so the test author surfaces real intent
+        // (remove the stale op, or fix a typo where the two
+        // names accidentally collapsed onto the same string)
+        // instead of debugging an absent move. Symmetric with
+        // the empty-string RunnerCgroup-capture pattern: an
+        // explicit `from == to == ""` self-move is also
+        // rejected here — moving RunnerCgroup-placement
+        // workers to "self" doesn't materialize them under a
+        // named cgroup.
+        if from == to {
+            anyhow::bail!(
+                "Op::MoveAllTasks from '{}' to '{}' is a self-move \
                          and a silent no-op (cgroup.procs is idempotent on \
                          same-cgroup writes); remove the op or correct the \
                          typo on whichever side was intended to differ",
-                        from,
-                        to,
-                    );
-                }
-                // A step-local MoveAllTasks that pulls from a
-                // Backdrop-owned cgroup into a step-local cgroup
-                // would strand persistent workers inside a cgroup
-                // that gets rmdir'd at step boundary. Reject
-                // explicitly. Ops running inside the Backdrop's
-                // own setup pass (`target_backdrop`) stay exempt.
-                if !state.target_backdrop
-                    && state.cgroup_name_is_backdrop(from)
-                    && !state.cgroup_name_is_backdrop(to)
-                {
-                    anyhow::bail!(
-                        "Op::MoveAllTasks from Backdrop-owned '{}' to step-local '{}' \
+                from,
+                to,
+            );
+        }
+        // A step-local MoveAllTasks that pulls from a
+        // Backdrop-owned cgroup into a step-local cgroup
+        // would strand persistent workers inside a cgroup
+        // that gets rmdir'd at step boundary. Reject
+        // explicitly. Ops running inside the Backdrop's
+        // own setup pass (`target_backdrop`) stay exempt.
+        if !state.target_backdrop
+            && state.cgroup_name_is_backdrop(from)
+            && !state.cgroup_name_is_backdrop(to)
+        {
+            anyhow::bail!(
+                "Op::MoveAllTasks from Backdrop-owned '{}' to step-local '{}' \
                          would leave persistent workers in a cgroup that disappears \
                          at step boundary; declare `{}` in the Backdrop too, or \
                          move the workers back into a Backdrop-owned cgroup",
-                        from,
-                        to,
-                        to,
-                    );
-                }
-                // Surface destination typos with a warn that dumps
-                // both tracking sets. The kernel-level ENOENT from
-                // `move_tasks` below names `to` literally but
-                // doesn't compare against tracked names, so an
-                // operator who typed "dts" for "dst" otherwise
-                // hits a bare ENOENT with no hint that a similar
-                // tracked name exists. Don't bail — the operator
-                // may be moving into a hand-mkdir'd cgroup outside
-                // ktstr's tracking, in which case the warn is
-                // informational only. Mirrors Op::RemoveCgroup's
-                // typo-late-surfacing pattern.
-                if !state.cgroup_name_is_tracked(to) {
-                    tracing::warn!(
-                        cgroup = %to,
-                        backdrop_cgroups = ?state.backdrop.cgroups.names(),
-                        step_cgroups = ?state.step.cgroups.names(),
-                        "Op::MoveAllTasks destination '{to}' matches no \
-                         step-local or Backdrop-owned cgroup — could be a \
-                         typo or a move into an externally-managed cgroup. \
-                         Compare against the listed Backdrop and step \
-                         cgroups; if the subsequent move fails with a \
-                         kernel-level `cgroup.procs ENOENT`, the typo here \
-                         is the probable source.",
-                    );
-                }
-                // Clear subtree_control on the destination before moving
-                // tasks. The kernel's no-internal-process constraint
-                // (cgroup_migrate_vet_dst) returns EBUSY when writing to
-                // cgroup.procs of a cgroup with subtree_control set.
-                if let Err(e) = ctx.cgroups.clear_subtree_control(to) {
-                    tracing::warn!(
-                        cgroup = to.as_ref(),
-                        err = %e,
-                        "failed to clear subtree_control before task move"
-                    );
-                }
-                // Collect every matching handle's pid list first so
-                // partial-failure semantics are bounded: if any per-pid
-                // cgroup.procs write fails, we have not yet mutated
-                // `state`, so handles remain keyed under `from`. The
-                // kernel side may still be partially migrated (writes
-                // before the failing pid succeeded), but the in-process
-                // tracking does not also drift — subsequent ops looking
-                // up by `from` find the same set they would have found
-                // before this op ran.
-                let pid_batches: Vec<Vec<libc::pid_t>> = state
-                    .all_handles()
-                    .filter(|(name, _)| name.as_str() == *from)
-                    .map(|(_, handle)| handle.worker_pids())
-                    .collect();
-                // Snapshot the source cgroup.procs right before we
-                // dispatch the move so the apply_setup log records
-                // whether the kernel still sees the workers we are
-                // about to migrate. A divergence between pid_batches
-                // (in-process handle's worker list) and the source-
-                // side cgroup.procs (kernel's per-cgroup tasks set)
-                // proves workers exited between apply_setup completion
-                // and this op — the silent self-exit window that
-                // move_tasks_inner's per-pid ESRCH tolerance would
-                // otherwise mask.
-                let from_procs_path = ctx
-                    .cgroups
-                    .parent_path()
-                    .join(from.as_ref())
-                    .join("cgroup.procs");
-                let from_procs_pre = std::fs::read_to_string(&from_procs_path)
-                    .unwrap_or_else(|e| format!("<read {}: {e}>", from_procs_path.display()));
-                append_placement_log(&format!(
-                    "Op::MoveAllTasks pre-move from={} to={} batches={:?} src_cgroup.procs={:?}",
-                    from,
-                    to,
-                    pid_batches,
-                    from_procs_pre.trim(),
-                ));
-                for pids in &pid_batches {
-                    ctx.cgroups.move_tasks(to, pids)?;
-                }
-                // Post-move snapshot of the destination cgroup.procs.
-                // Combined with the pre-move source snapshot, this
-                // shows whether the kernel observed the migration.
-                // Workers present in both src_cgroup.procs pre-move
-                // AND dest cgroup.procs post-move means migration
-                // succeeded and any later disappearance is downstream
-                // (post-move exit, scheduler eviction, etc.).
-                let to_procs_path = ctx
-                    .cgroups
-                    .parent_path()
-                    .join(to.as_ref())
-                    .join("cgroup.procs");
-                let to_procs_post = std::fs::read_to_string(&to_procs_path)
-                    .unwrap_or_else(|e| format!("<read {}: {e}>", to_procs_path.display()));
-                append_placement_log(&format!(
-                    "Op::MoveAllTasks post-move to={} dest_cgroup.procs={:?}",
-                    to,
-                    to_procs_post.trim(),
-                ));
-                // Re-key handles under `to` and transfer ownership
-                // when required. A step-local handle whose `to`
-                // names a Backdrop cgroup moves into the backdrop
-                // slot so its lifetime extends with the destination
-                // cgroup — without the transfer, the step's
-                // teardown would SIGKILL the worker even though the
-                // user moved it into a persistent cgroup. Backdrop
-                // handles always stay in the backdrop slot
-                // regardless of `to`; "Backdrop is persistent" does
-                // not degrade to step-local ownership because a
-                // later MoveAllTasks targets a step-local cgroup.
-                // Only run after every kernel write succeeded —
-                // partial failure leaves `state` un-renamed.
-                state.rename_handles(from, to);
-            }
-            Op::RunPayload {
-                payload,
-                args,
-                cgroup,
-            } => {
-                if payload.is_scheduler() {
-                    anyhow::bail!(
-                        "Op::RunPayload called with scheduler-kind Payload ('{}'); \
+                from,
+                to,
+                to,
+            );
+        }
+        // Surface destination typos with a warn that dumps
+        // both tracking sets. The kernel-level ENOENT from
+        // `move_tasks` below names `to` literally but
+        // doesn't compare against tracked names, so an
+        // operator who typed "dts" for "dst" otherwise
+        // hits a bare ENOENT with no hint that a similar
+        // tracked name exists. Don't bail — the operator
+        // may be moving into a hand-mkdir'd cgroup outside
+        // ktstr's tracking, in which case the warn is
+        // informational only. Mirrors Op::RemoveCgroup's
+        // typo-late-surfacing pattern.
+        if !state.cgroup_name_is_tracked(to) {
+            tracing::warn!(
+                cgroup = %to,
+                backdrop_cgroups = ?state.backdrop.cgroups.names(),
+                step_cgroups = ?state.step.cgroups.names(),
+                "Op::MoveAllTasks destination '{to}' matches no \
+                 step-local or Backdrop-owned cgroup — could be a \
+                 typo or a move into an externally-managed cgroup. \
+                 Compare against the listed Backdrop and step \
+                 cgroups; if the subsequent move fails with a \
+                 kernel-level `cgroup.procs ENOENT`, the typo here \
+                 is the probable source.",
+            );
+        }
+        // Clear subtree_control on the destination before moving
+        // tasks. The kernel's no-internal-process constraint
+        // (cgroup_migrate_vet_dst) returns EBUSY when writing to
+        // cgroup.procs of a cgroup with subtree_control set.
+        if let Err(e) = ctx.cgroups.clear_subtree_control(to) {
+            tracing::warn!(
+                cgroup = to.as_ref(),
+                err = %e,
+                "failed to clear subtree_control before task move"
+            );
+        }
+        // Collect every matching handle's pid list first so
+        // partial-failure semantics are bounded: if any per-pid
+        // cgroup.procs write fails, we have not yet mutated
+        // `state`, so handles remain keyed under `from`. The
+        // kernel side may still be partially migrated (writes
+        // before the failing pid succeeded), but the in-process
+        // tracking does not also drift — subsequent ops looking
+        // up by `from` find the same set they would have found
+        // before this op ran.
+        let pid_batches: Vec<Vec<libc::pid_t>> = state
+            .all_handles()
+            .filter(|(name, _)| name.as_str() == *from)
+            .map(|(_, handle)| handle.worker_pids())
+            .collect();
+        // Snapshot the source cgroup.procs right before we
+        // dispatch the move so the apply_setup log records
+        // whether the kernel still sees the workers we are
+        // about to migrate. A divergence between pid_batches
+        // (in-process handle's worker list) and the source-
+        // side cgroup.procs (kernel's per-cgroup tasks set)
+        // proves workers exited between apply_setup completion
+        // and this op — the silent self-exit window that
+        // move_tasks_inner's per-pid ESRCH tolerance would
+        // otherwise mask.
+        let from_procs_path = ctx
+            .cgroups
+            .parent_path()
+            .join(from.as_ref())
+            .join("cgroup.procs");
+        let from_procs_pre = std::fs::read_to_string(&from_procs_path)
+            .unwrap_or_else(|e| format!("<read {}: {e}>", from_procs_path.display()));
+        append_placement_log(&format!(
+            "Op::MoveAllTasks pre-move from={} to={} batches={:?} src_cgroup.procs={:?}",
+            from,
+            to,
+            pid_batches,
+            from_procs_pre.trim(),
+        ));
+        for pids in &pid_batches {
+            ctx.cgroups.move_tasks(to, pids)?;
+        }
+        // Post-move snapshot of the destination cgroup.procs.
+        // Combined with the pre-move source snapshot, this
+        // shows whether the kernel observed the migration.
+        // Workers present in both src_cgroup.procs pre-move
+        // AND dest cgroup.procs post-move means migration
+        // succeeded and any later disappearance is downstream
+        // (post-move exit, scheduler eviction, etc.).
+        let to_procs_path = ctx
+            .cgroups
+            .parent_path()
+            .join(to.as_ref())
+            .join("cgroup.procs");
+        let to_procs_post = std::fs::read_to_string(&to_procs_path)
+            .unwrap_or_else(|e| format!("<read {}: {e}>", to_procs_path.display()));
+        append_placement_log(&format!(
+            "Op::MoveAllTasks post-move to={} dest_cgroup.procs={:?}",
+            to,
+            to_procs_post.trim(),
+        ));
+        // Re-key handles under `to` and transfer ownership
+        // when required. A step-local handle whose `to`
+        // names a Backdrop cgroup moves into the backdrop
+        // slot so its lifetime extends with the destination
+        // cgroup — without the transfer, the step's
+        // teardown would SIGKILL the worker even though the
+        // user moved it into a persistent cgroup. Backdrop
+        // handles always stay in the backdrop slot
+        // regardless of `to`; "Backdrop is persistent" does
+        // not degrade to step-local ownership because a
+        // later MoveAllTasks targets a step-local cgroup.
+        // Only run after every kernel write succeeded —
+        // partial failure leaves `state` un-renamed.
+        state.rename_handles(from, to);
+    }
+    Ok(())
+}
+
+/// `Op::RunPayload` body: spawn and track a userspace payload binary.
+fn apply_run_payload(
+    ctx: &Ctx,
+    state: &mut ScenarioState<'_, '_>,
+    payload: &'static crate::test_support::Payload,
+    args: &[String],
+    cgroup: &Option<std::borrow::Cow<'static, str>>,
+) -> Result<()> {
+    {
+        if payload.is_scheduler() {
+            anyhow::bail!(
+                "Op::RunPayload called with scheduler-kind Payload ('{}'); \
                          only PayloadKind::Binary payloads can be spawned by step ops",
-                        payload.name,
-                    );
-                }
-                // Known-flags allowlist: if the Payload declared
-                // one, surface typos as scenario-execution-time
-                // errors instead of silent no-ops at payload
-                // runtime.
-                validate_known_flags(payload, args)?;
-                // Compute the cgroup key now so the composite-key
-                // dedup sees the same `(name, cgroup)` pair the
-                // spawn is about to record.
-                let cgroup_key = cgroup.as_ref().map(|c| c.to_string()).unwrap_or_default();
-                if let Some(existing) =
-                    state.find_live_payload_with_cgroup(payload.name, &cgroup_key)
-                {
-                    // Same payload in the same cgroup is still a
-                    // collision: two concurrent runs would write
-                    // overlapping metrics to the sidecar and there's
-                    // no way for a subsequent WaitPayload / KillPayload
-                    // to tell them apart. Same payload in a DIFFERENT
-                    // cgroup is now legitimate (placement-disambiguated).
-                    // Name the surface that spawned the live handle
-                    // so the user can find the original site without
-                    // guessing.
-                    anyhow::bail!(
-                        "Op::RunPayload: payload '{}' already running in cgroup {} (spawned by {}) — \
+                payload.name,
+            );
+        }
+        // Known-flags allowlist: if the Payload declared
+        // one, surface typos as scenario-execution-time
+        // errors instead of silent no-ops at payload
+        // runtime.
+        validate_known_flags(payload, args)?;
+        // Compute the cgroup key now so the composite-key
+        // dedup sees the same `(name, cgroup)` pair the
+        // spawn is about to record.
+        let cgroup_key = cgroup.as_ref().map(|c| c.to_string()).unwrap_or_default();
+        if let Some(existing) = state.find_live_payload_with_cgroup(payload.name, &cgroup_key) {
+            // Same payload in the same cgroup is still a
+            // collision: two concurrent runs would write
+            // overlapping metrics to the sidecar and there's
+            // no way for a subsequent WaitPayload / KillPayload
+            // to tell them apart. Same payload in a DIFFERENT
+            // cgroup is now legitimate (placement-disambiguated).
+            // Name the surface that spawned the live handle
+            // so the user can find the original site without
+            // guessing.
+            anyhow::bail!(
+                "Op::RunPayload: payload '{}' already running in cgroup {} (spawned by {}) — \
                          WaitPayload/KillPayload it before spawning another with the same name in the same cgroup",
-                        payload.name,
-                        render_cgroup_key(&existing.cgroup),
-                        existing.source.describe(),
-                    );
-                }
-                let mut run = crate::scenario::payload_run::PayloadRun::new(ctx, payload);
-                if !args.is_empty() {
-                    run = run.args(args.iter().cloned());
-                }
-                if let Some(c) = cgroup {
-                    run = run.in_cgroup(c.clone());
-                }
-                let handle = run.spawn().with_context(|| {
-                    format!(
-                        "Op::RunPayload: spawn payload '{}' in cgroup {}",
-                        payload.name,
-                        render_cgroup_key(&cgroup_key),
-                    )
-                })?;
-                state.target_payload_handles().push(PayloadEntry {
-                    cgroup: cgroup_key,
-                    source: PayloadSource::OpRunPayload,
-                    handle,
-                });
-            }
-            Op::WaitPayload { name, cgroup } => {
-                let entry = take_payload_for_op(
-                    state,
-                    "Op::WaitPayload",
-                    "waiting",
-                    "Op::wait_payload_in_cgroup",
-                    name,
-                    cgroup.as_deref(),
-                )?;
-                // Check verdicts + metrics are recorded to the sidecar
-                // via the SHM ring inside `handle.wait()`; the returned
-                // tuple is discarded here because step-ops surface per-
-                // payload results through the sidecar, not the ops API.
-                let _result = entry
-                    .handle
-                    .wait()
-                    .with_context(|| format!("Op::WaitPayload: wait payload '{name}'"))?;
-            }
-            Op::KillPayload { name, cgroup } => {
-                let entry = take_payload_for_op(
-                    state,
-                    "Op::KillPayload",
-                    "killing",
-                    "Op::kill_payload_in_cgroup",
-                    name,
-                    cgroup.as_deref(),
-                )?;
-                let _result = entry
-                    .handle
-                    .kill()
-                    .with_context(|| format!("Op::KillPayload: kill payload '{name}'"))?;
-            }
-            Op::FreezeCgroup { cgroup } => {
-                ctx.cgroups
-                    .set_freeze(cgroup, true)
-                    .with_context(|| format!("Op::FreezeCgroup: cgroup '{cgroup}'"))?;
-            }
-            Op::UnfreezeCgroup { cgroup } => {
-                ctx.cgroups
-                    .set_freeze(cgroup, false)
-                    .with_context(|| format!("Op::UnfreezeCgroup: cgroup '{cgroup}'"))?;
-            }
-            Op::CaptureSnapshot { name } => {
-                // Reject CaptureSnapshot inside any HoldSpec::Loop
-                // step. Each capture forces a freeze
-                // rendezvous; inside a Loop generating a high-rate
-                // pattern (e.g. 100Hz iteration burst), one capture
-                // per iteration would destroy the workload pattern
-                // via 100 freezes/sec. Boundary captures emitted from
-                // a non-Loop Step before/after the Loop step still
-                // give the operator pre/post bracketing.
-                if in_loop {
-                    anyhow::bail!(
-                        "Op::CaptureSnapshot('{name}') inside HoldSpec::Loop forces a freeze \
+                payload.name,
+                render_cgroup_key(&existing.cgroup),
+                existing.source.describe(),
+            );
+        }
+        let mut run = crate::scenario::payload_run::PayloadRun::new(ctx, payload);
+        if !args.is_empty() {
+            run = run.args(args.iter().cloned());
+        }
+        if let Some(c) = cgroup {
+            run = run.in_cgroup(c.clone());
+        }
+        let handle = run.spawn().with_context(|| {
+            format!(
+                "Op::RunPayload: spawn payload '{}' in cgroup {}",
+                payload.name,
+                render_cgroup_key(&cgroup_key),
+            )
+        })?;
+        state.target_payload_handles().push(PayloadEntry {
+            cgroup: cgroup_key,
+            source: PayloadSource::OpRunPayload,
+            handle,
+        });
+    }
+    Ok(())
+}
+
+/// `Op::WaitPayload` body: block on a payload's natural exit.
+fn apply_wait_payload(
+    state: &mut ScenarioState<'_, '_>,
+    name: &str,
+    cgroup: &Option<std::borrow::Cow<'static, str>>,
+) -> Result<()> {
+    {
+        let entry = take_payload_for_op(
+            state,
+            "Op::WaitPayload",
+            "waiting",
+            "Op::wait_payload_in_cgroup",
+            name,
+            cgroup.as_deref(),
+        )?;
+        // Check verdicts + metrics are recorded to the sidecar
+        // via the SHM ring inside `handle.wait()`; the returned
+        // tuple is discarded here because step-ops surface per-
+        // payload results through the sidecar, not the ops API.
+        let _result = entry
+            .handle
+            .wait()
+            .with_context(|| format!("Op::WaitPayload: wait payload '{name}'"))?;
+    }
+    Ok(())
+}
+
+/// `Op::KillPayload` body: SIGKILL and reap a tracked payload.
+fn apply_kill_payload(
+    state: &mut ScenarioState<'_, '_>,
+    name: &str,
+    cgroup: &Option<std::borrow::Cow<'static, str>>,
+) -> Result<()> {
+    {
+        let entry = take_payload_for_op(
+            state,
+            "Op::KillPayload",
+            "killing",
+            "Op::kill_payload_in_cgroup",
+            name,
+            cgroup.as_deref(),
+        )?;
+        let _result = entry
+            .handle
+            .kill()
+            .with_context(|| format!("Op::KillPayload: kill payload '{name}'"))?;
+    }
+    Ok(())
+}
+
+/// `Op::FreezeCgroup` body: write `cgroup.freeze` = 1.
+fn apply_freeze_cgroup(ctx: &Ctx, cgroup: &str) -> Result<()> {
+    {
+        ctx.cgroups
+            .set_freeze(cgroup, true)
+            .with_context(|| format!("Op::FreezeCgroup: cgroup '{cgroup}'"))?;
+    }
+    Ok(())
+}
+
+/// `Op::UnfreezeCgroup` body: write `cgroup.freeze` = 0.
+fn apply_unfreeze_cgroup(ctx: &Ctx, cgroup: &str) -> Result<()> {
+    {
+        ctx.cgroups
+            .set_freeze(cgroup, false)
+            .with_context(|| format!("Op::UnfreezeCgroup: cgroup '{cgroup}'"))?;
+    }
+    Ok(())
+}
+
+/// `Op::CaptureSnapshot` body: drive a host-side diagnostic snapshot.
+fn apply_capture_snapshot(ctx: &Ctx, in_loop: bool, name: &str) -> Result<()> {
+    {
+        // Reject CaptureSnapshot inside any HoldSpec::Loop
+        // step. Each capture forces a freeze
+        // rendezvous; inside a Loop generating a high-rate
+        // pattern (e.g. 100Hz iteration burst), one capture
+        // per iteration would destroy the workload pattern
+        // via 100 freezes/sec. Boundary captures emitted from
+        // a non-Loop Step before/after the Loop step still
+        // give the operator pre/post bracketing.
+        if in_loop {
+            anyhow::bail!(
+                "Op::CaptureSnapshot('{name}') inside HoldSpec::Loop forces a freeze \
                          rendezvous every loop iteration, freezing every vCPU on each iteration \
                          so the workload no longer runs at the rate you wrote; move the capture \
                          into a non-Loop Step before or after the Loop step"
-                    );
-                }
-                // Two execution contexts:
-                //   1. Test fixture: a thread-local SnapshotBridge is
-                //      installed (e.g. by the `snapshot_e2e.rs`
-                //      smoke tests). Drive its capture callback
-                //      directly — no SHM, no doorbell — so the
-                //      pure-host unit tests still exercise the
-                //      executor + bridge wiring.
-                //   2. Production: the scenario runs inside the
-                //      guest VM. The freeze coordinator owns the
-                //      bridge on the host. Publish a request
-                //      through SHM, fire the doorbell, and wait
-                //      for the host to stamp a matching reply id.
-                //      The host's coordinator stores the captured
-                //      report on its bridge; the test code drains
-                //      the bridge after VM exit.
-                // Stamp the capture with the current scenario phase
-                // (1-indexed: 0 = BASELINE, 1..=N = Step ordinals)
-                // so the drained sample buckets directly into the
-                // matching PhaseBucket without a later reindex.
-                // Reads the per-VM `Ctx::current_step` Arc the Step
-                // loop publishes via `Release` just before
-                // `run_step`; `Acquire` here pairs with that store
-                // for a happens-after on Step state setup.
-                let phase = ctx.current_step.load(std::sync::atomic::Ordering::Acquire);
-                let invoked = crate::scenario::snapshot::with_active_bridge(|b| {
-                    let captured = b.capture_with_step(name, phase);
-                    if captured {
-                        tracing::info!(
-                            name = %name,
-                            stored = b.len(),
-                            step_index = phase,
-                            "Op::CaptureSnapshot: captured diagnostic snapshot"
-                        );
-                    }
-                    captured
-                });
-                if invoked.is_none() {
-                    if crate::vmm::guest_comms::is_guest() {
-                        if SNAPSHOT_TRANSPORT_DEAD.load(Ordering::Relaxed) {
-                            // A prior request observed a transport
-                            // failure. The host-side coordinator is
-                            // unreachable until the process restarts.
-                            // Fail loud: returning Ok here would
-                            // silently mask a structural transport
-                            // loss — tests would pass with no
-                            // captured snapshot. Bail with a typed
-                            // reason instead.
-                            anyhow::bail!(
-                                "Op::CaptureSnapshot('{name}'): snapshot transport latched dead; \
+            );
+        }
+        // Two execution contexts:
+        //   1. Test fixture: a thread-local SnapshotBridge is
+        //      installed (e.g. by the `snapshot_e2e.rs`
+        //      smoke tests). Drive its capture callback
+        //      directly — no SHM, no doorbell — so the
+        //      pure-host unit tests still exercise the
+        //      executor + bridge wiring.
+        //   2. Production: the scenario runs inside the
+        //      guest VM. The freeze coordinator owns the
+        //      bridge on the host. Publish a request
+        //      through SHM, fire the doorbell, and wait
+        //      for the host to stamp a matching reply id.
+        //      The host's coordinator stores the captured
+        //      report on its bridge; the test code drains
+        //      the bridge after VM exit.
+        // Stamp the capture with the current scenario phase
+        // (1-indexed: 0 = BASELINE, 1..=N = Step ordinals)
+        // so the drained sample buckets directly into the
+        // matching PhaseBucket without a later reindex.
+        // Reads the per-VM `Ctx::current_step` Arc the Step
+        // loop publishes via `Release` just before
+        // `run_step`; `Acquire` here pairs with that store
+        // for a happens-after on Step state setup.
+        let phase = ctx.current_step.load(std::sync::atomic::Ordering::Acquire);
+        let invoked = crate::scenario::snapshot::with_active_bridge(|b| {
+            let captured = b.capture_with_step(name, phase);
+            if captured {
+                tracing::info!(
+                    name = %name,
+                    stored = b.len(),
+                    step_index = phase,
+                    "Op::CaptureSnapshot: captured diagnostic snapshot"
+                );
+            }
+            captured
+        });
+        if invoked.is_none() {
+            if crate::vmm::guest_comms::is_guest() {
+                if SNAPSHOT_TRANSPORT_DEAD.load(Ordering::Relaxed) {
+                    // A prior request observed a transport
+                    // failure. The host-side coordinator is
+                    // unreachable until the process restarts.
+                    // Fail loud: returning Ok here would
+                    // silently mask a structural transport
+                    // loss — tests would pass with no
+                    // captured snapshot. Bail with a typed
+                    // reason instead.
+                    anyhow::bail!(
+                        "Op::CaptureSnapshot('{name}'): snapshot transport latched dead; \
                                  a prior request observed TransportError and the latch only flips \
                                  on transport failure (host-side coordinator unreachable until \
                                  process restart)"
+                    );
+                } else {
+                    let timeout = std::time::Duration::from_secs(30);
+                    match crate::vmm::guest_comms::request_snapshot(
+                        crate::vmm::wire::SNAPSHOT_KIND_CAPTURE,
+                        name,
+                        timeout,
+                    ) {
+                        crate::vmm::wire::SnapshotRequestResult::Ok => {
+                            tracing::info!(
+                                name = %name,
+                                "Op::CaptureSnapshot: host captured diagnostic snapshot via TLV stream"
                             );
-                        } else {
-                            let timeout = std::time::Duration::from_secs(30);
-                            match crate::vmm::guest_comms::request_snapshot(
-                                crate::vmm::wire::SNAPSHOT_KIND_CAPTURE,
-                                name,
-                                timeout,
-                            ) {
-                                crate::vmm::wire::SnapshotRequestResult::Ok => {
-                                    tracing::info!(
-                                        name = %name,
-                                        "Op::CaptureSnapshot: host captured diagnostic snapshot via TLV stream"
-                                    );
-                                }
-                                crate::vmm::wire::SnapshotRequestResult::HostError { reason } => {
-                                    anyhow::bail!(
-                                        "Op::CaptureSnapshot('{name}'): host rejected capture: {reason}"
-                                    );
-                                }
-                                crate::vmm::wire::SnapshotRequestResult::TransportError {
-                                    reason,
-                                } => {
-                                    SNAPSHOT_TRANSPORT_DEAD.store(true, Ordering::Relaxed);
-                                    anyhow::bail!(
-                                        "Op::CaptureSnapshot('{name}'): port-1 transport failure: {reason}"
-                                    );
-                                }
-                            }
                         }
-                    } else {
-                        // host_only-vs-snapshot is a documented mutex
-                        // (the host-only-mode contract); the
-                        // C2 host-mode lever made this path reachable
-                        // at scenario-engine dispatch for the first
-                        // time. Per the no-silent-drops policy, bail
-                        // loud rather than tracing::warn-then-skip —
-                        // a test author writing
-                        // `Op::capture_snapshot("phase1")` in a
-                        // host_only test would otherwise see PASS
-                        // with no captured snapshot data backing the
-                        // assertions that rely on it.
-                        anyhow::bail!(
-                            "Op::CaptureSnapshot('{name}'): not supported in host_only mode \
+                        crate::vmm::wire::SnapshotRequestResult::HostError { reason } => {
+                            anyhow::bail!(
+                                "Op::CaptureSnapshot('{name}'): host rejected capture: {reason}"
+                            );
+                        }
+                        crate::vmm::wire::SnapshotRequestResult::TransportError { reason } => {
+                            SNAPSHOT_TRANSPORT_DEAD.store(true, Ordering::Relaxed);
+                            anyhow::bail!(
+                                "Op::CaptureSnapshot('{name}'): port-1 transport failure: {reason}"
+                            );
+                        }
+                    }
+                }
+            } else {
+                // host_only-vs-snapshot is a documented mutex
+                // (the host-only-mode contract); the
+                // C2 host-mode lever made this path reachable
+                // at scenario-engine dispatch for the first
+                // time. Per the no-silent-drops policy, bail
+                // loud rather than tracing::warn-then-skip —
+                // a test author writing
+                // `Op::capture_snapshot("phase1")` in a
+                // host_only test would otherwise see PASS
+                // with no captured snapshot data backing the
+                // assertions that rely on it.
+                anyhow::bail!(
+                    "Op::CaptureSnapshot('{name}'): not supported in host_only mode \
                              (no guest VM, no test-fixture SnapshotBridge installed); \
                              snapshot capture is mutually exclusive with host_only — \
                              either drop the snapshot op or convert the test to non-host_only",
-                        );
-                    }
-                }
+                );
             }
-            Op::WatchSnapshot { symbol } => {
-                // Two execution contexts mirroring `Op::CaptureSnapshot`:
-                //   1. Test fixture: thread-local SnapshotBridge
-                //      drives the register callback directly.
-                //   2. Production: in-guest scenario sends a
-                //      `SNAPSHOT_KIND_WATCH` request through the
-                //      virtio-console port-1 TLV stream. The host
-                //      coordinator resolves the
-                //      symbol via the parsed vmlinux ELF +
-                //      direct-mapping translation, allocates a
-                //      free user watchpoint slot, programs the
-                //      hardware watchpoint via
-                //      `KVM_SET_GUEST_DEBUG` on every vCPU, and
-                //      replies OK. A future guest write to the
-                //      resolved KVA fires the corresponding debug
-                //      exit; the vCPU dispatcher identifies the
-                //      slot and latches `WatchpointSlot::hit`. The
-                //      coordinator then runs
-                //      `freeze_and_capture(false)` and stores the
-                //      report on the bridge keyed by the symbol.
-                let registered =
-                    crate::scenario::snapshot::with_active_bridge(|b| b.register_watch(symbol));
-                match registered {
-                    Some(Ok(())) => {
-                        tracing::info!(
-                            symbol = %symbol,
-                            "Op::WatchSnapshot: registered hardware-watchpoint snapshot"
-                        );
-                    }
-                    Some(Err(err)) => {
+        }
+    }
+    Ok(())
+}
+
+/// `Op::WatchSnapshot` body: arm a hardware-watchpoint snapshot on a symbol.
+fn apply_watch_snapshot(symbol: &str) -> Result<()> {
+    {
+        // Two execution contexts mirroring `Op::CaptureSnapshot`:
+        //   1. Test fixture: thread-local SnapshotBridge
+        //      drives the register callback directly.
+        //   2. Production: in-guest scenario sends a
+        //      `SNAPSHOT_KIND_WATCH` request through the
+        //      virtio-console port-1 TLV stream. The host
+        //      coordinator resolves the
+        //      symbol via the parsed vmlinux ELF +
+        //      direct-mapping translation, allocates a
+        //      free user watchpoint slot, programs the
+        //      hardware watchpoint via
+        //      `KVM_SET_GUEST_DEBUG` on every vCPU, and
+        //      replies OK. A future guest write to the
+        //      resolved KVA fires the corresponding debug
+        //      exit; the vCPU dispatcher identifies the
+        //      slot and latches `WatchpointSlot::hit`. The
+        //      coordinator then runs
+        //      `freeze_and_capture(false)` and stores the
+        //      report on the bridge keyed by the symbol.
+        let registered =
+            crate::scenario::snapshot::with_active_bridge(|b| b.register_watch(symbol));
+        match registered {
+            Some(Ok(())) => {
+                tracing::info!(
+                    symbol = %symbol,
+                    "Op::WatchSnapshot: registered hardware-watchpoint snapshot"
+                );
+            }
+            Some(Err(err)) => {
+                anyhow::bail!("Op::WatchSnapshot: register watch on '{symbol}' failed: {err}",);
+            }
+            None => {
+                if crate::vmm::guest_comms::is_guest() {
+                    if SNAPSHOT_TRANSPORT_DEAD.load(Ordering::Relaxed) {
+                        // Fail loud: returning Ok here would
+                        // silently mask a structural transport
+                        // loss — a WatchSnapshot that never
+                        // arms looks identical to a healthy
+                        // passing run.
                         anyhow::bail!(
-                            "Op::WatchSnapshot: register watch on '{symbol}' failed: {err}",
-                        );
-                    }
-                    None => {
-                        if crate::vmm::guest_comms::is_guest() {
-                            if SNAPSHOT_TRANSPORT_DEAD.load(Ordering::Relaxed) {
-                                // Fail loud: returning Ok here would
-                                // silently mask a structural transport
-                                // loss — a WatchSnapshot that never
-                                // arms looks identical to a healthy
-                                // passing run.
-                                anyhow::bail!(
-                                    "Op::WatchSnapshot('{symbol}'): snapshot transport latched \
+                            "Op::WatchSnapshot('{symbol}'): snapshot transport latched \
                                      dead; a prior request observed TransportError and the latch \
                                      only flips on transport failure (host-side coordinator \
                                      unreachable until process restart)"
+                        );
+                    } else {
+                        let timeout = std::time::Duration::from_secs(30);
+                        match crate::vmm::guest_comms::request_snapshot(
+                            crate::vmm::wire::SNAPSHOT_KIND_WATCH,
+                            symbol,
+                            timeout,
+                        ) {
+                            crate::vmm::wire::SnapshotRequestResult::Ok => {
+                                tracing::info!(
+                                    symbol = %symbol,
+                                    "Op::WatchSnapshot: host armed hardware-watchpoint via TLV stream"
                                 );
-                            } else {
-                                let timeout = std::time::Duration::from_secs(30);
-                                match crate::vmm::guest_comms::request_snapshot(
-                                    crate::vmm::wire::SNAPSHOT_KIND_WATCH,
-                                    symbol,
-                                    timeout,
-                                ) {
-                                    crate::vmm::wire::SnapshotRequestResult::Ok => {
-                                        tracing::info!(
-                                            symbol = %symbol,
-                                            "Op::WatchSnapshot: host armed hardware-watchpoint via TLV stream"
-                                        );
-                                    }
-                                    crate::vmm::wire::SnapshotRequestResult::HostError {
-                                        reason,
-                                    } => {
-                                        anyhow::bail!(
-                                            "Op::WatchSnapshot('{symbol}'): host rejected: {reason}"
-                                        );
-                                    }
-                                    crate::vmm::wire::SnapshotRequestResult::TransportError {
-                                        reason,
-                                    } => {
-                                        SNAPSHOT_TRANSPORT_DEAD.store(true, Ordering::Relaxed);
-                                        anyhow::bail!(
-                                            "Op::WatchSnapshot('{symbol}'): port-1 transport failure: {reason}"
-                                        );
-                                    }
-                                }
                             }
-                        } else {
-                            // Same host_only-vs-snapshot mutex as
-                            // Op::CaptureSnapshot above — C2 made the
-                            // host-mode dispatch path reachable for
-                            // both ops at once, so this sibling site
-                            // needs the same loud bail per the
-                            // no-silent-drops policy. A
-                            // test author writing
-                            // `Op::watch_snapshot("kernel_symbol")`
-                            // in a host_only test would otherwise see
-                            // PASS with no watchpoint armed, then
-                            // wonder why every subsequent assertion
-                            // that relied on the watch firing
-                            // vacuously passes.
-                            anyhow::bail!(
-                                "Op::WatchSnapshot('{symbol}'): not supported in host_only mode \
+                            crate::vmm::wire::SnapshotRequestResult::HostError { reason } => {
+                                anyhow::bail!(
+                                    "Op::WatchSnapshot('{symbol}'): host rejected: {reason}"
+                                );
+                            }
+                            crate::vmm::wire::SnapshotRequestResult::TransportError { reason } => {
+                                SNAPSHOT_TRANSPORT_DEAD.store(true, Ordering::Relaxed);
+                                anyhow::bail!(
+                                    "Op::WatchSnapshot('{symbol}'): port-1 transport failure: {reason}"
+                                );
+                            }
+                        }
+                    }
+                } else {
+                    // Same host_only-vs-snapshot mutex as
+                    // Op::CaptureSnapshot above — C2 made the
+                    // host-mode dispatch path reachable for
+                    // both ops at once, so this sibling site
+                    // needs the same loud bail per the
+                    // no-silent-drops policy. A
+                    // test author writing
+                    // `Op::watch_snapshot("kernel_symbol")`
+                    // in a host_only test would otherwise see
+                    // PASS with no watchpoint armed, then
+                    // wonder why every subsequent assertion
+                    // that relied on the watch firing
+                    // vacuously passes.
+                    anyhow::bail!(
+                        "Op::WatchSnapshot('{symbol}'): not supported in host_only mode \
                                  (no guest VM, no test-fixture SnapshotBridge installed); \
                                  hardware-watchpoint snapshots are mutually exclusive with \
                                  host_only — either drop the watch op or convert the test to \
                                  non-host_only",
-                            );
-                        }
-                    }
+                    );
                 }
             }
-            Op::WriteKernelHot { writes } => {
-                let payload = build_kernel_op_request(
-                    crate::vmm::wire::KernelOpMode::Hot,
-                    crate::vmm::wire::KernelOpDirection::Write,
-                    String::new(),
-                    write_entries_from_writes(writes),
-                );
-                dispatch_kernel_op_request("Op::WriteKernelHot", payload)?;
-            }
-            Op::WriteKernelCold { writes } => {
-                let payload = build_kernel_op_request(
-                    crate::vmm::wire::KernelOpMode::Cold,
-                    crate::vmm::wire::KernelOpDirection::Write,
-                    String::new(),
-                    write_entries_from_writes(writes),
-                );
-                dispatch_kernel_op_request("Op::WriteKernelCold", payload)?;
-            }
-            Op::ReadKernelHot { tag, target, width } => {
-                let payload = build_kernel_op_request(
-                    crate::vmm::wire::KernelOpMode::Hot,
-                    crate::vmm::wire::KernelOpDirection::Read,
-                    tag.to_string(),
-                    vec![crate::vmm::wire::KernelOpEntry {
-                        target: target.into(),
-                        value: width.into(),
-                    }],
-                );
-                dispatch_kernel_op_request("Op::ReadKernelHot", payload)?;
-            }
-            Op::ReadKernelCold { tag, target, width } => {
-                let payload = build_kernel_op_request(
-                    crate::vmm::wire::KernelOpMode::Cold,
-                    crate::vmm::wire::KernelOpDirection::Read,
-                    tag.to_string(),
-                    vec![crate::vmm::wire::KernelOpEntry {
-                        target: target.into(),
-                        value: width.into(),
-                    }],
-                );
-                dispatch_kernel_op_request("Op::ReadKernelCold", payload)?;
-            }
-            // Scheduler-lifecycle Op dispatch. apply_ops runs
-            // guest-side (the test scenario executes inside the VM
-            // as part of the guest binary), so each arm calls into
-            // the `vmm::rust_init` spawn/kill primitives directly —
-            // no host-to-guest wire format is needed. The Op variant
-            // payload carries the target `&'static Scheduler`; the
-            // composer derives staging archive paths via the
-            // `test_support::staged` helpers so the spawn path
-            // matches the cpio entries packed by the initramfs
-            // composer.
-            //
-            // SCHED_PID is the single source of truth for "which
-            // scheduler is currently running". Each arm reads it
-            // (Detach/Replace/Restart) or writes it (Attach via the
-            // spawn helper's internal store) to keep the existing
-            // monitor / sched-stats / probe consumers consistent.
-            Op::AttachScheduler { scheduler } => {
-                dispatch_attach_scheduler(scheduler)?;
-                crate::vmm::rust_init::set_current_scheduler(Some(&scheduler.binary));
-            }
-            Op::DetachScheduler => {
-                dispatch_detach_scheduler()?;
-                crate::vmm::rust_init::set_current_scheduler(None);
-            }
-            Op::RestartScheduler => {
-                dispatch_restart_scheduler()?;
-                // RestartScheduler re-spawns the BOOT scheduler;
-                // CURRENT_SCHEDULER stays as the prior identity
-                // (whatever the last Attach/Replace published, or
-                // None if the test only ever used the boot
-                // scheduler). A future iteration tracking the
-                // "currently-attached scheduler identity" on the
-                // boot path (matching the spawn_scheduler_from_paths
-                // side channel in rust_init) would let
-                // RestartScheduler restore the published identity
-                // explicitly; for v0 the slot keeps its last value
-                // and consumers reading the post-Op state see the
-                // same identity they would have seen pre-Op.
-            }
-            Op::ReplaceScheduler { scheduler } => {
-                dispatch_replace_scheduler(scheduler)?;
-                crate::vmm::rust_init::set_current_scheduler(Some(&scheduler.binary));
-            }
-            Op::PinBpfMap { name } => {
-                // Idempotent — pinning the same name twice no-ops.
-                // The first pin's OwnedFd already holds one extra
-                // refcount via `__bpf_map_inc_not_zero`
-                // (kernel/bpf/syscall.c:4859), which is sufficient
-                // to keep the map alive past any scheduler teardown.
-                // A second pin would bump the kernel refcount AGAIN
-                // and consume another host fd slot, but the test
-                // cannot observe the difference (one extra refcount
-                // and two are both "alive"), so we skip the work.
-                let name_key = name.as_ref().to_string();
-                if let std::collections::hash_map::Entry::Vacant(slot) =
-                    state.backdrop.pinned_bpf_maps.entry(name_key)
-                {
-                    let fd = crate::scenario::bpf_pin::open_bpf_map_fd_by_name(name.as_ref())
-                        .map_err(|e| {
-                            anyhow::anyhow!(
-                                "Op::PinBpfMap({name:?}): {e:#}\n\
+        }
+    }
+    Ok(())
+}
+
+/// `Op::WriteKernelHot` body: live-vCPU batched kernel write.
+fn apply_write_kernel_hot(writes: &[(KernelTarget, KernelValue)]) -> Result<()> {
+    {
+        let payload = build_kernel_op_request(
+            crate::vmm::wire::KernelOpMode::Hot,
+            crate::vmm::wire::KernelOpDirection::Write,
+            String::new(),
+            write_entries_from_writes(writes),
+        );
+        dispatch_kernel_op_request("Op::WriteKernelHot", payload)?;
+    }
+    Ok(())
+}
+
+/// `Op::WriteKernelCold` body: freeze-rendezvous batched kernel write.
+fn apply_write_kernel_cold(writes: &[(KernelTarget, KernelValue)]) -> Result<()> {
+    {
+        let payload = build_kernel_op_request(
+            crate::vmm::wire::KernelOpMode::Cold,
+            crate::vmm::wire::KernelOpDirection::Write,
+            String::new(),
+            write_entries_from_writes(writes),
+        );
+        dispatch_kernel_op_request("Op::WriteKernelCold", payload)?;
+    }
+    Ok(())
+}
+
+/// `Op::ReadKernelHot` body: live-vCPU kernel read into the bridge log.
+fn apply_read_kernel_hot(tag: &str, target: &KernelTarget, width: &KernelValueWidth) -> Result<()> {
+    {
+        let payload = build_kernel_op_request(
+            crate::vmm::wire::KernelOpMode::Hot,
+            crate::vmm::wire::KernelOpDirection::Read,
+            tag.to_string(),
+            vec![crate::vmm::wire::KernelOpEntry {
+                target: target.into(),
+                value: width.into(),
+            }],
+        );
+        dispatch_kernel_op_request("Op::ReadKernelHot", payload)?;
+    }
+    Ok(())
+}
+
+/// `Op::ReadKernelCold` body: freeze-rendezvous kernel read into the bridge log.
+fn apply_read_kernel_cold(
+    tag: &str,
+    target: &KernelTarget,
+    width: &KernelValueWidth,
+) -> Result<()> {
+    {
+        let payload = build_kernel_op_request(
+            crate::vmm::wire::KernelOpMode::Cold,
+            crate::vmm::wire::KernelOpDirection::Read,
+            tag.to_string(),
+            vec![crate::vmm::wire::KernelOpEntry {
+                target: target.into(),
+                value: width.into(),
+            }],
+        );
+        dispatch_kernel_op_request("Op::ReadKernelCold", payload)?;
+    }
+    Ok(())
+}
+
+/// `Op::AttachScheduler` body.
+///
+/// Scheduler-lifecycle Op dispatch. apply_ops runs
+/// guest-side (the test scenario executes inside the VM
+/// as part of the guest binary), so each arm calls into
+/// the `vmm::rust_init` spawn/kill primitives directly —
+/// no host-to-guest wire format is needed. The Op variant
+/// payload carries the target `&'static Scheduler`; the
+/// composer derives staging archive paths via the
+/// `test_support::staged` helpers so the spawn path
+/// matches the cpio entries packed by the initramfs
+/// composer.
+///
+/// SCHED_PID is the single source of truth for "which
+/// scheduler is currently running". Each arm reads it
+/// (Detach/Replace/Restart) or writes it (Attach via the
+/// spawn helper's internal store) to keep the existing
+/// monitor / sched-stats / probe consumers consistent.
+fn apply_attach_scheduler(scheduler: &'static crate::test_support::Scheduler) -> Result<()> {
+    {
+        dispatch_attach_scheduler(scheduler)?;
+        crate::vmm::rust_init::set_current_scheduler(Some(&scheduler.binary));
+    }
+    Ok(())
+}
+
+/// `Op::DetachScheduler` body: kill the current scheduler, clear SCHED_PID.
+fn apply_detach_scheduler() -> Result<()> {
+    {
+        dispatch_detach_scheduler()?;
+        crate::vmm::rust_init::set_current_scheduler(None);
+    }
+    Ok(())
+}
+
+/// `Op::RestartScheduler` body: kill the current scheduler, respawn boot.
+fn apply_restart_scheduler() -> Result<()> {
+    {
+        dispatch_restart_scheduler()?;
+        // RestartScheduler re-spawns the BOOT scheduler;
+        // CURRENT_SCHEDULER stays as the prior identity
+        // (whatever the last Attach/Replace published, or
+        // None if the test only ever used the boot
+        // scheduler). A future iteration tracking the
+        // "currently-attached scheduler identity" on the
+        // boot path (matching the spawn_scheduler_from_paths
+        // side channel in rust_init) would let
+        // RestartScheduler restore the published identity
+        // explicitly; for v0 the slot keeps its last value
+        // and consumers reading the post-Op state see the
+        // same identity they would have seen pre-Op.
+    }
+    Ok(())
+}
+
+/// `Op::ReplaceScheduler` body: atomically swap to a staged scheduler.
+fn apply_replace_scheduler(scheduler: &'static crate::test_support::Scheduler) -> Result<()> {
+    {
+        dispatch_replace_scheduler(scheduler)?;
+        crate::vmm::rust_init::set_current_scheduler(Some(&scheduler.binary));
+    }
+    Ok(())
+}
+
+/// `Op::PinBpfMap` body: hold a named BPF map fd for the scenario lifetime.
+// ptr_arg allow: private single-call helper; the `&Cow` param keeps this a
+// byte-faithful extraction of the Op match-arm binding (the dispatcher is the
+// only caller and already holds a `&Cow`).
+#[allow(clippy::ptr_arg)]
+fn apply_pin_bpf_map(
+    state: &mut ScenarioState<'_, '_>,
+    name: &std::borrow::Cow<'static, str>,
+) -> Result<()> {
+    {
+        // Idempotent — pinning the same name twice no-ops.
+        // The first pin's OwnedFd already holds one extra
+        // refcount via `__bpf_map_inc_not_zero`
+        // (kernel/bpf/syscall.c:4859), which is sufficient
+        // to keep the map alive past any scheduler teardown.
+        // A second pin would bump the kernel refcount AGAIN
+        // and consume another host fd slot, but the test
+        // cannot observe the difference (one extra refcount
+        // and two are both "alive"), so we skip the work.
+        let name_key = name.as_ref().to_string();
+        if let std::collections::hash_map::Entry::Vacant(slot) =
+            state.backdrop.pinned_bpf_maps.entry(name_key)
+        {
+            let fd =
+                crate::scenario::bpf_pin::open_bpf_map_fd_by_name(name.as_ref()).map_err(|e| {
+                    anyhow::anyhow!(
+                        "Op::PinBpfMap({name:?}): {e:#}\n\
                                  \n\
                                  Common causes:\n  \
                                  (a) Target scheduler's BPF object hasn't finished \
@@ -1125,39 +1328,44 @@ pub(super) fn apply_ops(
                                  loaded — compare against the observed names in the \
                                  error above; the kernel-visible name is the \
                                  truncated form."
-                            )
-                        })?;
-                    slot.insert(fd);
-                }
-            }
-            Op::CaptureCgroupProcs { tag, cgroup } => {
-                if tag.is_empty() {
-                    anyhow::bail!(
-                        "Op::CaptureCgroupProcs: tag is empty; the tag is the \
+                    )
+                })?;
+            slot.insert(fd);
+        }
+    }
+    Ok(())
+}
+
+/// `Op::CaptureCgroupProcs` body: record a cgroup's `cgroup.procs` to the bridge.
+fn apply_capture_cgroup_procs(ctx: &Ctx, tag: &str, cgroup: &str) -> Result<()> {
+    {
+        if tag.is_empty() {
+            anyhow::bail!(
+                "Op::CaptureCgroupProcs: tag is empty; the tag is the \
                          snapshot key consumers use to find the capture in \
                          `SnapshotBridge::drain_cgroup_procs` — supply a \
                          non-empty identifier (e.g. \"after_spawn\", \
                          \"post_migrate\")"
-                    );
-                }
-                if cgroup.is_empty() {
-                    anyhow::bail!(
-                        "Op::CaptureCgroupProcs(tag={tag:?}): cgroup name is empty. \
+            );
+        }
+        if cgroup.is_empty() {
+            anyhow::bail!(
+                "Op::CaptureCgroupProcs(tag={tag:?}): cgroup name is empty. \
                          Provide a cgroup name registered via `Op::AddCgroup`, a \
                          `CgroupDef` in setup, or pushed on the Backdrop; an empty \
                          name would resolve to the runner's own cgroup, which is \
                          almost certainly not the test author's intent"
-                    );
-                }
-                // Bridge-presence pre-check BEFORE the read_procs syscall.
-                // Burning the syscall when there's no recipient hides
-                // the actionable missing-bridge diagnostic behind any
-                // unrelated read failure (e.g. flaky cgroupfs); the
-                // pattern matches Op::Spawn(SpawnPlacement::Cgroup(""))
-                // bail-before-spawn at L2540-2553.
-                if crate::scenario::snapshot::with_active_bridge(|_| ()).is_none() {
-                    anyhow::bail!(
-                        "Op::CaptureCgroupProcs(tag={tag:?}, cgroup={cgroup:?}): \
+            );
+        }
+        // Bridge-presence pre-check BEFORE the read_procs syscall.
+        // Burning the syscall when there's no recipient hides
+        // the actionable missing-bridge diagnostic behind any
+        // unrelated read failure (e.g. flaky cgroupfs); the
+        // pattern matches Op::Spawn(SpawnPlacement::Cgroup(""))
+        // bail-before-spawn at L2540-2553.
+        if crate::scenario::snapshot::with_active_bridge(|_| ()).is_none() {
+            anyhow::bail!(
+                "Op::CaptureCgroupProcs(tag={tag:?}, cgroup={cgroup:?}): \
                          no SnapshotBridge installed for this thread; bailing \
                          before the cgroup.procs read so the misconfiguration \
                          surfaces without burning a syscall (a silent record \
@@ -1165,28 +1373,26 @@ pub(super) fn apply_ops(
                          masking the missing-bridge bug). Install a bridge via \
                          `SnapshotBridge::set_thread_local` (RAII via \
                          `BridgeGuard`) before `execute_scenario` runs the op"
-                    );
-                }
-                let pids = ctx.cgroups.read_procs(cgroup).with_context(|| {
-                    format!(
-                        "Op::CaptureCgroupProcs(tag={tag:?}, cgroup={cgroup:?}): \
-                         CgroupOps::read_procs failed",
-                    )
-                })?;
-                let pid_count = pids.len();
-                // The bridge-presence pre-check above guarantees the
-                // bridge is installed; record without re-checking.
-                crate::scenario::snapshot::with_active_bridge(|b| {
-                    b.record_cgroup_procs(tag.to_string(), cgroup.to_string(), pids);
-                });
-                tracing::info!(
-                    tag = %tag,
-                    cgroup = %cgroup,
-                    pid_count,
-                    "Op::CaptureCgroupProcs: captured cgroup.procs snapshot"
-                );
-            }
+            );
         }
+        let pids = ctx.cgroups.read_procs(cgroup).with_context(|| {
+            format!(
+                "Op::CaptureCgroupProcs(tag={tag:?}, cgroup={cgroup:?}): \
+                         CgroupOps::read_procs failed",
+            )
+        })?;
+        let pid_count = pids.len();
+        // The bridge-presence pre-check above guarantees the
+        // bridge is installed; record without re-checking.
+        crate::scenario::snapshot::with_active_bridge(|b| {
+            b.record_cgroup_procs(tag.to_string(), cgroup.to_string(), pids);
+        });
+        tracing::info!(
+            tag = %tag,
+            cgroup = %cgroup,
+            pid_count,
+            "Op::CaptureCgroupProcs: captured cgroup.procs snapshot"
+        );
     }
     Ok(())
 }
@@ -1895,9 +2101,10 @@ pub(super) fn wait_for_worker_state_not_trying_or_bail(
             // Guest mode: the SnapshotBridge's `accessor_worker_state`
             // is an Arc<AtomicU8> populated by the freeze coordinator's
             // accessor-init worker, which reads guest memory from the
-            // HOST process (see `src/vmm/freeze_coord/mod.rs:965-985`
-            // for the construction site; `src/vmm/freeze_coord/mod.rs:2316`
-            // for the worker spawn). The bridge is not transferable across
+            // HOST process (see `freeze_coord`'s `accessor_worker_state`
+            // allocation for the construction site, and its
+            // `accessor_init_handle` spawn for the worker spawn). The
+            // bridge is not transferable across
             // the host→guest process boundary, so a guest-side dispatcher
             // legitimately has no bridge installed. The wait observes a
             // host-side signal; in guest mode it's structurally inapplicable.

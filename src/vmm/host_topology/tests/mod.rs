@@ -1,5 +1,4 @@
 use super::*;
-use crate::sync::MutexExt;
 
 // ─── SYNTHETIC-TOPOLOGY OFFSET CONVENTION ────────────────────
 //
@@ -9,7 +8,7 @@ use crate::sync::MutexExt;
 // sockets top out around 1024 LLCs). Per-test offsets are
 // subdivided by 100:
 //   90000-90999: acquire_resource_locks / per-CPU path tests
-//   91000-91999: acquire_cpu_locks tests
+//   91000-91999: reserved (former per-CPU-window tests, removed)
 //   92000-92999: reserved
 //   93000-93999: acquire_llc_plan (none-cap, EX-peer, SH-peer)
 //                — each sub-test picks its own sub-range
@@ -129,18 +128,18 @@ impl Drop for CpuLockPrefixGuard {
     }
 }
 
-/// RAII bundle that installs BOTH [`LlcLockPrefixGuard`] AND
-/// [`CpuLockPrefixGuard`] in one call. Used by any test that hits
-/// both LLC and CPU lockfile families — `acquire_resource_locks`
-/// (LLC + per-CPU), `acquire_cpu_locks` (CPU + the LLC shared lock
-/// from `acquire_llc_shared_locks`), or any future helper that
-/// composes the two. Each test gets its own per-tempdir prefix for
-/// both lockfile families, so cross-run / cross-process
-/// collisions on `/tmp/ktstr-llc-*.lock` and `/tmp/ktstr-cpu-*.lock`
-/// cannot occur. When in doubt about which guard to pick, default
-/// to this bundle — over-provisioning a tempdir is cheap and is
-/// always safe; under-provisioning leaks production-path test
-/// collisions.
+/// RAII bundle that installs BOTH [`LlcLockPrefixGuard`]
+/// AND [`CpuLockPrefixGuard`] in one call. Used by any
+/// test that hits both LLC and CPU lockfile families —
+/// `acquire_resource_locks` (LLC + per-CPU), or any
+/// future helper that composes the two. Each test gets
+/// its own per-tempdir prefix for both lockfile families,
+/// so cross-run / cross-process collisions on
+/// `/tmp/ktstr-llc-*.lock` and `/tmp/ktstr-cpu-*.lock`
+/// cannot occur. When in doubt about which guard to pick,
+/// default to this bundle — over-provisioning a tempdir
+/// is cheap and is always safe; under-provisioning leaks
+/// production-path test collisions.
 struct LockPrefixesGuard {
     _cpu: CpuLockPrefixGuard,
     _llc: LlcLockPrefixGuard,
@@ -222,16 +221,16 @@ fn expect_unavailable(outcome: LockOutcome, ctx: Option<&str>) -> String {
 /// Serialize KTSTR_CPU_CAP env-var mutation across test threads.
 /// std::env::set_var is process-wide (unsafe in edition 2024);
 /// parallel tests would race if each mutated the same variable
-/// without coordination. Every env-touching test below takes
-/// this mutex for the duration of the test body.
+/// without coordination. Delegates to the ONE crate-wide env mutex
+/// ([`crate::test_support::test_helpers::lock_env`]) so KTSTR_CPU_CAP
+/// mutation here serializes against EVERY env-touching test in the
+/// lib-test binary — including the builder tests that read it via
+/// CpuCap::resolve and the KTSTR_BYPASS_LLC_LOCKS tests. A
+/// module-local mutex left those cross-module process-wide env reads
+/// racing.
 fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-    use std::sync::{Mutex, OnceLock};
-    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    // `lock().unwrap()` would panic on poison from an earlier
-    // panicking test, cascading failures. Recover by taking the
-    // inner guard — the test that panicked already failed; the
-    // current test's env cleanup still runs.
-    ENV_LOCK.get_or_init(|| Mutex::new(())).lock_unpoisoned()
+    // lock_env() already recovers from poison.
+    crate::test_support::test_helpers::lock_env()
 }
 
 /// RAII guard for scoped `std::env::set_var` mutation inside a

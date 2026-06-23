@@ -204,171 +204,88 @@ fn amd_cache_subleaf(
     }
 }
 
-/// Generate CPUID entries for a specific vCPU with topology information.
-/// Takes a pre-fetched base CPUID (from `get_supported_cpuid`) and patches
-/// topology-related leaves. The base should be fetched once and reused for
-/// all vCPUs — each call clones and patches per-vCPU fields (APIC ID etc).
-///
-/// Leaf 0x8000001E ECX is NUMA-aware: sets node ID from
-/// `Topology::numa_node_of` and nodes-per-processor from `numa_nodes`.
-///
-/// When `performance_mode` is true, sets KVM_HINTS_REALTIME (CPUID leaf
-/// 0x40000001 EDX bit 0). This disables PV spinlocks, PV TLB flush, and
-/// PV sched_yield in the guest, and enables haltpoll cpuidle. PV spinlocks
-/// require CONFIG_PARAVIRT_SPINLOCKS (not in ktstr.kconfig, so no-op for
-/// ktstr guests).
-pub fn generate_cpuid(
-    base_cpuid: &[kvm_cpuid_entry2],
+/// Patch leaf 0x1 (Feature Information): APIC ID, max logical processors, HTT.
+fn patch_leaf_feature_info(entry: &mut kvm_cpuid_entry2, apic: u32, total_cpus: u32) {
+    // EBX[31:24] = initial APIC ID (8-bit)
+    entry.ebx = (entry.ebx & 0x00ffffff) | ((apic & 0xff) << 24);
+    // EBX[23:16] = max addressable logical processors in the
+    // package (all CPUs, rounded up to a power of two, clamped to
+    // the field's 8-bit max of 255). LLC-scoped here would tell
+    // the guest the package is one LLC. For >255 CPUs the guest
+    // uses leaf 0xB EDX (32-bit) under x2APIC, not this legacy
+    // field.
+    let lpc = total_cpus.next_power_of_two().min(255);
+    entry.ebx = (entry.ebx & 0xff00ffff) | (lpc << 16);
+    // EBX[15:8] = CLFLUSH line size — preserved from KVM
+    // ECX.31 = hypervisor — preserved from KVM
+    // EDX bit 28 = HTT
+    if total_cpus > 1 {
+        entry.edx |= 1 << 28;
+    }
+}
+
+/// Patch leaf 0xA (Intel Architectural Performance Monitoring) to a PMU v2 surface.
+fn patch_leaf_pmu(entry: &mut kvm_cpuid_entry2) {
+    if entry.eax & 0xff != 0 {
+        entry.eax = PMU_ARCH_PERFMON_VERSION
+            | (PMU_NUM_GP_COUNTERS << 8)
+            | (PMU_GP_COUNTER_WIDTH << 16)
+            | (PMU_EVENT_MASK_LENGTH << 24);
+        entry.ebx = 0;
+        entry.ecx = 0;
+        entry.edx = PMU_NUM_FIXED_COUNTERS | (PMU_FIXED_COUNTER_WIDTH << 5);
+    }
+}
+
+/// Patch leaf 0x80000008 (address sizes): ECX threads-per-package and APIC-ID size.
+fn patch_leaf_addr_sizes(entry: &mut kvm_cpuid_entry2, total_cpus: u32, pkg_shift: u32) {
+    if total_cpus > 1 {
+        // ECX[15:12] = APIC-ID bits covering all CPUs in the
+        // package (= the CORE domain shift the AMD topology
+        // parser uses for the package boundary, apic >> shift).
+        // ECX[7:0] = threads-per-package - 1, SATURATED to the
+        // 8-bit field: a >256-CPU package would otherwise wrap to
+        // a small NC and collapse the package. NC is only the
+        // AMD fallback when leaf 0xB is absent (we always emit
+        // 0xB), but saturating avoids advertising a wrong, small
+        // count. Both must be package-scoped, not LLC-scoped.
+        entry.ecx = (pkg_shift << 12) | ((total_cpus - 1).min(0xff));
+    } else {
+        entry.ecx = 0;
+    }
+}
+
+/// Patch leaf 0x8000001E (AMD Extended APIC ID / Topology): APIC ID, core/node IDs.
+fn patch_leaf_amd_ext_topology(
+    entry: &mut kvm_cpuid_entry2,
+    apic: u32,
     topo: &Topology,
     cpu_id: u32,
-    performance_mode: bool,
-) -> Vec<kvm_cpuid_entry2> {
-    let mut entries: Vec<kvm_cpuid_entry2> = base_cpuid.to_vec();
+) {
+    // EAX = Extended APIC ID
+    entry.eax = apic;
+    // EBX[7:0] = Compute Unit (core) ID
+    // EBX[15:8] = Threads per compute unit - 1
+    let (llc_id, core_id, _) = topo.decompose(cpu_id);
+    entry.ebx = ((topo.threads_per_core - 1) << 8) | (core_id & 0xff);
+    // ECX[7:0] = Node ID
+    // ECX[10:8] = Nodes per processor - 1
+    let node_id = topo.numa_node_of(llc_id);
+    entry.ecx = node_id | ((topo.numa_nodes - 1) << 8);
+    // EDX = reserved
+    entry.edx = 0;
+}
 
-    let vendor = detect_vendor(&entries);
-    let apic = apic_id(topo, cpu_id);
-    let smt = smt_shift(topo);
-    let core = core_shift(topo);
-    // The whole machine is one package: the LLCs are sub-domains carved by
-    // the cache leaf (0x4 / 0x8000001D), not separate packages. `pkg_shift`
-    // is the APIC-ID width below the package, so `apic >> pkg_shift == 0`
-    // for every CPU -> the guest kernel groups all CPUs into one package.
-    // One multi-core package is the precondition for the kernel to build
-    // multi-core sibling masks at all (has_mp); the LLC sub-domain within it
-    // is then carved by llc_id from the cache leaf, not by the package id.
-    let total_cpus = topo.total_cpus();
-    let pkg_shift = bits_needed(max_apic_id(topo) + 1);
-
-    for entry in entries.iter_mut() {
-        match entry.function {
-            // Leaf 0x1: Feature Information (vendor-independent)
-            0x1 => {
-                // EBX[31:24] = initial APIC ID (8-bit)
-                entry.ebx = (entry.ebx & 0x00ffffff) | ((apic & 0xff) << 24);
-                // EBX[23:16] = max addressable logical processors in the
-                // package (all CPUs, rounded up to a power of two, clamped to
-                // the field's 8-bit max of 255). LLC-scoped here would tell
-                // the guest the package is one LLC. For >255 CPUs the guest
-                // uses leaf 0xB EDX (32-bit) under x2APIC, not this legacy
-                // field.
-                let lpc = total_cpus.next_power_of_two().min(255);
-                entry.ebx = (entry.ebx & 0xff00ffff) | (lpc << 16);
-                // EBX[15:8] = CLFLUSH line size — preserved from KVM
-                // ECX.31 = hypervisor — preserved from KVM
-                // EDX bit 28 = HTT
-                if total_cpus > 1 {
-                    entry.edx |= 1 << 28;
-                }
-            }
-
-            // Leaf 0x4: Deterministic Cache Parameters (Intel only)
-            0x4 if vendor == CpuVendor::Intel => {
-                patch_cache_topology_eax(entry, smt, core, topo.cores_per_llc);
-            }
-
-            // Leaves 0xB / 0x1F (Extended Topology) are SYNTHESIZED after
-            // this loop, not patched here: KVM's get_supported_cpuid zeroes
-            // these leaves (eax=ebx=ecx=0, no Core subleaf 1 — KVM leaves a
-            // "valid topology ... subleaf 1" for the VMM to populate), so
-            // patching in place cannot add the Core-level subleaf the guest
-            // needs to form a single package. See below.
-
-            // Leaf 0x8000001D (AMD Cache Topology) is SYNTHESIZED after this
-            // loop, not patched here: patching only rewrites host-provided
-            // subleaves, so a host whose 0x8000001D omits the L3 (type=3,
-            // level=3) subleaf would leave the guest's llc_id unset and
-            // collapse every CPU into one LLC. See the synthesis block below.
-
-            // Leaf 0xA: Architectural Performance Monitoring (Intel SDM,
-            // Architectural Performance Monitoring). Synthesized to a
-            // conservative PMU v2 surface so guest sched_ext schedulers
-            // (scx_layered, scx_cosmos) get usable perf counters
-            // regardless of host hardware. AMD CPUs ignore leaf 0xA and
-            // use MSR-based counters; populating it is a no-op on AMD.
-            // See PMU_* consts at the top of this file for field
-            // semantics.
-            //
-            // Gated on the ORIGINAL entry's version (EAX[7:0]) being non-zero.
-            // On a kvm.enable_pmu=0 host, KVM zeros leaf 0xA before exposing
-            // it via get_supported_cpuid; overwriting with v2 would tell the
-            // guest "PMU available" while intel_pmu_refresh clamps every
-            // counter count back to 0 — silent failures inside the guest.
-            // Leaving zeros lets the guest's intel_pmu_init see version=0 and
-            // graceful-fail the same way it does on a no-PMU bare-metal host.
-            0xa => {
-                if entry.eax & 0xff != 0 {
-                    entry.eax = PMU_ARCH_PERFMON_VERSION
-                        | (PMU_NUM_GP_COUNTERS << 8)
-                        | (PMU_GP_COUNTER_WIDTH << 16)
-                        | (PMU_EVENT_MASK_LENGTH << 24);
-                    entry.ebx = 0;
-                    entry.ecx = 0;
-                    entry.edx = PMU_NUM_FIXED_COUNTERS | (PMU_FIXED_COUNTER_WIDTH << 5);
-                }
-            }
-
-            // Leaf 0x80000001: AMD extended feature identification (AMD only)
-            0x8000_0001 if vendor == CpuVendor::Amd && total_cpus > 1 => {
-                // ECX bit 1 = CmpLegacy: multi-core chip
-                // ECX bit 22 = TopologyExtensions: enables leaves 0x8000001D/1E
-                entry.ecx |= (1 << 1) | (1 << 22);
-            }
-
-            // Leaf 0x80000006: AMD L2 (ECX) and L3 (EDX) cache descriptors.
-            // EDX MUST be non-zero: the guest kernel gates AMD L3 detection
-            // on cpuid_amd_hygon_has_l3_cache() == (cpuid_edx(0x80000006) != 0)
-            // (arch/x86/include/asm/cpuid/api.h). KVM passes the host value
-            // through; a host that masks the L3-size field to 0 makes the
-            // guest see no L3 and collapse every CPU into its own LLC.
-            // Synthesize L2/L3 to match the 0x8000001D geometry below so the
-            // gate holds host-independently; EAX/EBX (TLB) are left as the
-            // host reported them. 16-way associativity encodes to 0x8.
-            0x8000_0006 if vendor == CpuVendor::Amd => {
-                entry.ecx = L80000006_ECX; // L2: size KiB<<16 | assoc<<12 | lines/tag<<8 | line
-                entry.edx = L80000006_EDX; // L3: size/512KiB<<18 | assoc<<12 | lines/tag<<8 | line
-            }
-
-            // Leaf 0x80000008: virtual/physical address sizes (vendor-independent)
-            // ECX[7:0] = number of physical threads - 1
-            // ECX[15:12] = APIC ID size (bits needed for thread IDs in package)
-            0x8000_0008 => {
-                if total_cpus > 1 {
-                    // ECX[15:12] = APIC-ID bits covering all CPUs in the
-                    // package (= the CORE domain shift the AMD topology
-                    // parser uses for the package boundary, apic >> shift).
-                    // ECX[7:0] = threads-per-package - 1, SATURATED to the
-                    // 8-bit field: a >256-CPU package would otherwise wrap to
-                    // a small NC and collapse the package. NC is only the
-                    // AMD fallback when leaf 0xB is absent (we always emit
-                    // 0xB), but saturating avoids advertising a wrong, small
-                    // count. Both must be package-scoped, not LLC-scoped.
-                    entry.ecx = (pkg_shift << 12) | ((total_cpus - 1).min(0xff));
-                } else {
-                    entry.ecx = 0;
-                }
-            }
-
-            // Leaf 0x8000001E: AMD Extended APIC ID / Topology (AMD only)
-            0x8000_001e if vendor == CpuVendor::Amd => {
-                // EAX = Extended APIC ID
-                entry.eax = apic;
-                // EBX[7:0] = Compute Unit (core) ID
-                // EBX[15:8] = Threads per compute unit - 1
-                let (llc_id, core_id, _) = topo.decompose(cpu_id);
-                entry.ebx = ((topo.threads_per_core - 1) << 8) | (core_id & 0xff);
-                // ECX[7:0] = Node ID
-                // ECX[10:8] = Nodes per processor - 1
-                let node_id = topo.numa_node_of(llc_id);
-                entry.ecx = node_id | ((topo.numa_nodes - 1) << 8);
-                // EDX = reserved
-                entry.edx = 0;
-            }
-
-            _ => {}
-        }
-    }
-
-    // Synthesize the Extended-Topology leaves (0xB, and 0x1F for Intel).
+/// Synthesize the Extended-Topology leaves (0xB, and 0x1F for Intel).
+fn synthesize_extended_topology(
+    entries: &mut Vec<kvm_cpuid_entry2>,
+    vendor: CpuVendor,
+    smt: u32,
+    pkg_shift: u32,
+    topo: &Topology,
+    total_cpus: u32,
+    apic: u32,
+) {
     // KVM's get_supported_cpuid zeroes these leaves (eax=ebx=ecx=0, no Core
     // subleaf 1 — it leaves a "valid topology ... subleaf 1" for the VMM to
     // populate) — so a Core-level subleaf whose shift spans the WHOLE
@@ -393,8 +310,15 @@ pub fn generate_cpuid(
         // Subleaf 2: terminator (level type 0 ends enumeration).
         entries.push(topo_subleaf(func, 2, 0, 0, 0, apic));
     }
+}
 
-    // Synthesize the AMD cache-topology leaf 0x8000001D (host-independent).
+/// Synthesize the AMD cache-topology leaf 0x8000001D (host-independent).
+fn synthesize_amd_cache_topology(
+    entries: &mut Vec<kvm_cpuid_entry2>,
+    vendor: CpuVendor,
+    smt: u32,
+    core: u32,
+) {
     // The old code PATCHED the host's 0x8000001D subleaves in place, which
     // depends on the host exposing a complete L1/L2/L3 chain; a host whose
     // 0x8000001D lacks an L3 (type=3, level=3) subleaf would leave the
@@ -477,6 +401,122 @@ pub fn generate_cpuid(
             });
         }
     }
+}
+
+/// Generate CPUID entries for a specific vCPU with topology information.
+/// Takes a pre-fetched base CPUID (from `get_supported_cpuid`) and patches
+/// topology-related leaves. The base should be fetched once and reused for
+/// all vCPUs — each call clones and patches per-vCPU fields (APIC ID etc).
+///
+/// Leaf 0x8000001E ECX is NUMA-aware: sets node ID from
+/// `Topology::numa_node_of` and nodes-per-processor from `numa_nodes`.
+///
+/// When `performance_mode` is true, sets KVM_HINTS_REALTIME (CPUID leaf
+/// 0x40000001 EDX bit 0). This disables PV spinlocks, PV TLB flush, and
+/// PV sched_yield in the guest, and enables haltpoll cpuidle. PV spinlocks
+/// require CONFIG_PARAVIRT_SPINLOCKS (not in ktstr.kconfig, so no-op for
+/// ktstr guests).
+pub fn generate_cpuid(
+    base_cpuid: &[kvm_cpuid_entry2],
+    topo: &Topology,
+    cpu_id: u32,
+    performance_mode: bool,
+) -> Vec<kvm_cpuid_entry2> {
+    let mut entries: Vec<kvm_cpuid_entry2> = base_cpuid.to_vec();
+
+    let vendor = detect_vendor(&entries);
+    let apic = apic_id(topo, cpu_id);
+    let smt = smt_shift(topo);
+    let core = core_shift(topo);
+    // The whole machine is one package: the LLCs are sub-domains carved by
+    // the cache leaf (0x4 / 0x8000001D), not separate packages. `pkg_shift`
+    // is the APIC-ID width below the package, so `apic >> pkg_shift == 0`
+    // for every CPU -> the guest kernel groups all CPUs into one package.
+    // One multi-core package is the precondition for the kernel to build
+    // multi-core sibling masks at all (has_mp); the LLC sub-domain within it
+    // is then carved by llc_id from the cache leaf, not by the package id.
+    let total_cpus = topo.total_cpus();
+    let pkg_shift = bits_needed(max_apic_id(topo) + 1);
+
+    for entry in entries.iter_mut() {
+        match entry.function {
+            // Leaf 0x1: Feature Information (vendor-independent)
+            0x1 => patch_leaf_feature_info(entry, apic, total_cpus),
+
+            // Leaf 0x4: Deterministic Cache Parameters (Intel only)
+            0x4 if vendor == CpuVendor::Intel => {
+                patch_cache_topology_eax(entry, smt, core, topo.cores_per_llc);
+            }
+
+            // Leaves 0xB / 0x1F (Extended Topology) are SYNTHESIZED after
+            // this loop, not patched here: KVM's get_supported_cpuid zeroes
+            // these leaves (eax=ebx=ecx=0, no Core subleaf 1 — KVM leaves a
+            // "valid topology ... subleaf 1" for the VMM to populate), so
+            // patching in place cannot add the Core-level subleaf the guest
+            // needs to form a single package. See below.
+
+            // Leaf 0x8000001D (AMD Cache Topology) is SYNTHESIZED after this
+            // loop, not patched here: patching only rewrites host-provided
+            // subleaves, so a host whose 0x8000001D omits the L3 (type=3,
+            // level=3) subleaf would leave the guest's llc_id unset and
+            // collapse every CPU into one LLC. See the synthesis block below.
+
+            // Leaf 0xA: Architectural Performance Monitoring (Intel SDM,
+            // Architectural Performance Monitoring). Synthesized to a
+            // conservative PMU v2 surface so guest sched_ext schedulers
+            // (scx_layered, scx_cosmos) get usable perf counters
+            // regardless of host hardware. AMD CPUs ignore leaf 0xA and
+            // use MSR-based counters; populating it is a no-op on AMD.
+            // See PMU_* consts at the top of this file for field
+            // semantics.
+            //
+            // Gated on the ORIGINAL entry's version (EAX[7:0]) being non-zero.
+            // On a kvm.enable_pmu=0 host, KVM zeros leaf 0xA before exposing
+            // it via get_supported_cpuid; overwriting with v2 would tell the
+            // guest "PMU available" while intel_pmu_refresh clamps every
+            // counter count back to 0 — silent failures inside the guest.
+            // Leaving zeros lets the guest's intel_pmu_init see version=0 and
+            // graceful-fail the same way it does on a no-PMU bare-metal host.
+            0xa => patch_leaf_pmu(entry),
+
+            // Leaf 0x80000001: AMD extended feature identification (AMD only)
+            0x8000_0001 if vendor == CpuVendor::Amd && total_cpus > 1 => {
+                // ECX bit 1 = CmpLegacy: multi-core chip
+                // ECX bit 22 = TopologyExtensions: enables leaves 0x8000001D/1E
+                entry.ecx |= (1 << 1) | (1 << 22);
+            }
+
+            // Leaf 0x80000006: AMD L2 (ECX) and L3 (EDX) cache descriptors.
+            // EDX MUST be non-zero: the guest kernel gates AMD L3 detection
+            // on cpuid_amd_hygon_has_l3_cache() == (cpuid_edx(0x80000006) != 0)
+            // (arch/x86/include/asm/cpuid/api.h). KVM passes the host value
+            // through; a host that masks the L3-size field to 0 makes the
+            // guest see no L3 and collapse every CPU into its own LLC.
+            // Synthesize L2/L3 to match the 0x8000001D geometry below so the
+            // gate holds host-independently; EAX/EBX (TLB) are left as the
+            // host reported them. 16-way associativity encodes to 0x8.
+            0x8000_0006 if vendor == CpuVendor::Amd => {
+                entry.ecx = L80000006_ECX; // L2: size KiB<<16 | assoc<<12 | lines/tag<<8 | line
+                entry.edx = L80000006_EDX; // L3: size/512KiB<<18 | assoc<<12 | lines/tag<<8 | line
+            }
+
+            // Leaf 0x80000008: virtual/physical address sizes (vendor-independent)
+            // ECX[7:0] = number of physical threads - 1
+            // ECX[15:12] = APIC ID size (bits needed for thread IDs in package)
+            0x8000_0008 => patch_leaf_addr_sizes(entry, total_cpus, pkg_shift),
+
+            // Leaf 0x8000001E: AMD Extended APIC ID / Topology (AMD only)
+            0x8000_001e if vendor == CpuVendor::Amd => {
+                patch_leaf_amd_ext_topology(entry, apic, topo, cpu_id)
+            }
+
+            _ => {}
+        }
+    }
+
+    synthesize_extended_topology(&mut entries, vendor, smt, pkg_shift, topo, total_cpus, apic);
+
+    synthesize_amd_cache_topology(&mut entries, vendor, smt, core);
 
     // Add hypervisor identification leaf (0x40000000) if not present.
     // Guest OS uses leaf 0x1 ECX.31 to detect hypervisor, then reads

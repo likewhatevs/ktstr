@@ -288,13 +288,6 @@ fn assert_live_var_resolves_across_swap(result: &VmResult) -> Result<()> {
     post_vm = assert_live_var_resolves_across_swap,
 )]
 fn live_var_resolves_across_same_binary_swap(ctx: &Ctx) -> Result<AssertResult> {
-    if ktstr::test_support::current_binary_is_coverage_instrumented() {
-        return Ok(AssertResult::skip(
-            "coverage-instrumented /init AP-kill — same surface as \
-             boot_kernel_with_monitor; deferred until non-instrumented \
-             init binary is wired",
-        ));
-    }
     use std::time::Duration;
     let steps = vec![
         // Phase 1 (Phase::step(0) → tag u16=1): primary scheduler

@@ -539,50 +539,119 @@ fn translate_kva_tlb_cr3_mismatch_invalidates() {
     assert_eq!(mem.read_u64(pa_a2.unwrap(), 0), 0xAAAA_AAAA_AAAA_AAAA);
 }
 
+/// Build one buffer where the SAME `(cr3, kva)` resolves to two
+/// DIFFERENT data PAs depending on the walk mode, so the `l5` cache
+/// key can be observed directly (mirroring [`setup_two_page_tables`]'s
+/// cr3-distinguishing trick, but distinguishing on the `l5` flag).
+///
+/// The single root table at `cr3_pa` doubles as the 4-level PGD AND
+/// the 5-level PML5 because the two walkers index it at different
+/// slots:
+/// - `walk_4level` reads the PGD entry at `cr3 + pgd_idx*8`
+///   (`pgd_idx` = KVA bits 47:39).
+/// - `walk_5level` reads the PML5 entry at `cr3 + pml5_idx*8`
+///   (`pml5_idx` = KVA bits 56:48), descends to a P4D, then runs a
+///   4-level walk from there (re-using `pgd_idx` into the P4D).
+///
+/// The KVA is chosen so `pml5_idx != pgd_idx`, so the two roots'
+/// entries never collide. The 4-level chain ends at `data_4`
+/// (marker `0xAAAA…`); the 5-level chain ends at `data_5`
+/// (marker `0xBBBB…`).
+///
+/// Returns `(buf, cr3_pa, kva, data_4, data_5)`.
+#[cfg(target_arch = "x86_64")]
+fn setup_l5_vs_l4_page_tables() -> (Vec<u8>, u64, u64, u64, u64) {
+    // pml5_idx=0x111, pgd_idx=0x22, pud_idx=0, pmd_idx=0, pte_idx=5.
+    let kva: u64 = 0xFF11_1100_0000_5000;
+    let pml5_idx = (kva >> 48) & 0x1FF;
+    let pgd_idx = (kva >> 39) & 0x1FF;
+    let pud_idx = (kva >> 30) & 0x1FF;
+    let pmd_idx = (kva >> 21) & 0x1FF;
+    let pte_idx = (kva >> 12) & 0x1FF;
+    assert_ne!(pml5_idx, pgd_idx, "root slots must not collide");
+
+    // Shared root table at `cr3`. 4-level reads slot `pgd_idx`;
+    // 5-level reads slot `pml5_idx`. Both fit in one 4 KiB page.
+    let root_pa: u64 = 0x10000;
+    // 4-level chain tables.
+    let pud4_pa: u64 = root_pa + 0x1000;
+    let pmd4_pa: u64 = pud4_pa + 0x1000;
+    let pte4_pa: u64 = pmd4_pa + 0x1000;
+    let data4_pa: u64 = pte4_pa + 0x1000;
+    // 5-level chain tables (P4D + its own PUD/PMD/PTE).
+    let p4d5_pa: u64 = data4_pa + 0x1000;
+    let pud5_pa: u64 = p4d5_pa + 0x1000;
+    let pmd5_pa: u64 = pud5_pa + 0x1000;
+    let pte5_pa: u64 = pmd5_pa + 0x1000;
+    let data5_pa: u64 = pte5_pa + 0x1000;
+
+    let size = (data5_pa + 0x1000) as usize;
+    let mut buf = vec![0u8; size];
+
+    let write_entry = |buf: &mut Vec<u8>, base: u64, idx: u64, val: u64| {
+        let off = (base + idx * 8) as usize;
+        buf[off..off + 8].copy_from_slice(&val.to_ne_bytes());
+    };
+
+    // 4-level walk: root[pgd_idx] -> pud4 -> pmd4 -> pte4 -> data4.
+    write_entry(&mut buf, root_pa, pgd_idx, (pud4_pa + PTE_BASE) | 0x63);
+    write_entry(&mut buf, pud4_pa, pud_idx, (pmd4_pa + PTE_BASE) | 0x63);
+    write_entry(&mut buf, pmd4_pa, pmd_idx, (pte4_pa + PTE_BASE) | 0x63);
+    write_entry(&mut buf, pte4_pa, pte_idx, (data4_pa + PTE_BASE) | 0x63);
+
+    // 5-level walk: root[pml5_idx] -> p4d5; then walk_4level(p4d5)
+    // re-indexes p4d5[pgd_idx] -> pud5 -> pmd5 -> pte5 -> data5.
+    write_entry(&mut buf, root_pa, pml5_idx, (p4d5_pa + PTE_BASE) | 0x63);
+    write_entry(&mut buf, p4d5_pa, pgd_idx, (pud5_pa + PTE_BASE) | 0x63);
+    write_entry(&mut buf, pud5_pa, pud_idx, (pmd5_pa + PTE_BASE) | 0x63);
+    write_entry(&mut buf, pmd5_pa, pmd_idx, (pte5_pa + PTE_BASE) | 0x63);
+    write_entry(&mut buf, pte5_pa, pte_idx, (data5_pa + PTE_BASE) | 0x63);
+
+    // Distinguishable marker bytes: an l5-blind cache hit would
+    // surface the wrong marker, not just the wrong PA.
+    buf[data4_pa as usize..data4_pa as usize + 8]
+        .copy_from_slice(&0xAAAA_AAAA_AAAA_AAAAu64.to_ne_bytes());
+    buf[data5_pa as usize..data5_pa as usize + 8]
+        .copy_from_slice(&0xBBBB_BBBB_BBBB_BBBBu64.to_ne_bytes());
+
+    (buf, root_pa, kva, data4_pa, data5_pa)
+}
+
 /// TLB cache invalidation on l5 mismatch: a `(cr3, kva)` cached
-/// under `l5=false` must not alias under `l5=true`. The L5 walker
-/// reads a PML5 entry at `cr3 + pml5_idx*8` whose bytes have no
-/// reason to match the 4-level walk's PML4 entry; the resulting
-/// translation (success or None) is whatever the L5 walker computes
-/// independently. The invariant the cache key enforces: regardless
-/// of what the L5 walk returns, a subsequent `l5=false` lookup
-/// must still return the original data PA. If the L5 result had
-/// overwritten the cache slot under the same key, the next
-/// `l5=false` lookup would return the L5 walker's PA (or miss and
-/// re-walk to the correct value); with the `l5` field in the key,
-/// the slots are independent and the 4-level result survives.
+/// under `l5=false` must not alias under `l5=true`. Uses
+/// [`setup_l5_vs_l4_page_tables`], which maps the same KVA to
+/// distinct PAs (with distinct marker bytes) under each walk mode,
+/// so a wrong-`l5` cache hit would surface the WRONG marker — making
+/// the `l5` cache-key contamination directly observable, exactly as
+/// [`translate_kva_tlb_cr3_mismatch_invalidates`] does for `cr3`.
 #[test]
 #[cfg(target_arch = "x86_64")]
 fn translate_kva_tlb_l5_mismatch_invalidates() {
-    let (buf, cr3_pa, kva, data_pa) = setup_page_table();
+    let (buf, cr3_pa, kva, data_4, data_5) = setup_l5_vs_l4_page_tables();
     // SAFETY: buf is a live local buffer.
     let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
 
-    // Populate cache with l5=false.
-    let pa1 = mem.translate_kva(cr3_pa, Kva(kva), false, 0);
-    assert_eq!(pa1, Some(data_pa));
+    // Populate the single-slot cache under l5=false. The 4-level
+    // walk resolves to data_4 with the 0xAAAA… marker.
+    let pa_4a = mem.translate_kva(cr3_pa, Kva(kva), false, 0);
+    assert_eq!(pa_4a, Some(data_4));
+    assert_eq!(mem.read_u64(pa_4a.unwrap(), 0), 0xAAAA_AAAA_AAAA_AAAA);
 
-    // Cross-mode lookup. We do not assert the L5 result itself
-    // because the buffer is not a valid 5-level layout; the walker
-    // may succeed (composing a different chain through the same
-    // bytes) or fail. What matters: the lookup must not be served
-    // from the l5=false cache slot.
-    let _ = mem.translate_kva(cr3_pa, Kva(kva), true, 0);
+    // l5=true lookup for the SAME KVA must walk fresh (the cached
+    // entry's `l5` field is false) and resolve to data_5 with the
+    // 0xBBBB… marker. This overwrites the single cache slot with an
+    // `l5=true` entry whose `pa_page` is data_5's page.
+    let pa_5 = mem.translate_kva(cr3_pa, Kva(kva), true, 0);
+    assert_eq!(pa_5, Some(data_5));
+    assert_eq!(mem.read_u64(pa_5.unwrap(), 0), 0xBBBB_BBBB_BBBB_BBBB);
 
-    // The 4-level result must still be correct. With `l5` in the
-    // cache key the L5 walk wrote a separate slot key (or no slot
-    // at all if it failed), so the original 4-level entry is either
-    // intact or freshly walked — both produce the right PA. Without
-    // the gate, the L5 walk would have evicted the 4-level entry
-    // by writing under the same key, and the next 4-level lookup
-    // would either hit the (wrong) L5-cached PA or miss and re-
-    // walk; both paths return the correct PA from the buffer's
-    // 4-level layout, so this test alone is not sufficient to
-    // observe the bug. Pair with the cr3-mismatch test above which
-    // makes the contamination directly observable through marker
-    // bytes.
-    let pa3 = mem.translate_kva(cr3_pa, Kva(kva), false, 0);
-    assert_eq!(pa3, Some(data_pa));
+    // With `l5` in the cache key, this l5=false lookup MISSES the
+    // l5=true slot, re-walks 4-level, and returns data_4 (0xAAAA…).
+    // An l5-blind cache key would hit the l5=true slot and return
+    // data_5's page — surfacing the WRONG 0xBBBB… marker.
+    let pa_4b = mem.translate_kva(cr3_pa, Kva(kva), false, 0);
+    assert_eq!(pa_4b, Some(data_4));
+    assert_eq!(mem.read_u64(pa_4b.unwrap(), 0), 0xAAAA_AAAA_AAAA_AAAA);
 }
 
 // -- write_bpf_map_value tests --
@@ -2944,50 +3013,17 @@ fn write_value_rejects_out_of_bounds() {
 }
 
 // -- BpfMapInfo btf fields --
-
-#[test]
-fn bpf_map_info_btf_fields_default_zero() {
-    let info = BpfMapInfo {
-        map_pa: 0x1000,
-        map_kva: 0,
-        name_bytes: name_from_str("test").0,
-        name_len: name_from_str("test").1,
-        map_type: BPF_MAP_TYPE_ARRAY,
-        map_flags: 0,
-        key_size: 0,
-        value_size: 32,
-        max_entries: 0,
-        value_kva: None,
-        btf_kva: 0,
-        btf_value_type_id: 0,
-        btf_vmlinux_value_type_id: 0,
-        btf_key_type_id: 0,
-    };
-    assert_eq!(info.btf_kva, 0);
-    assert_eq!(info.btf_value_type_id, 0);
-}
-
-#[test]
-fn bpf_map_info_btf_fields_populated() {
-    let info = BpfMapInfo {
-        map_pa: 0x1000,
-        map_kva: 0,
-        name_bytes: name_from_str("test").0,
-        name_len: name_from_str("test").1,
-        map_type: BPF_MAP_TYPE_ARRAY,
-        map_flags: 0,
-        key_size: 0,
-        value_size: 32,
-        max_entries: 0,
-        value_kva: None,
-        btf_kva: 0xFFFF_8880_0001_0000,
-        btf_value_type_id: 42,
-        btf_vmlinux_value_type_id: 0,
-        btf_key_type_id: 0,
-    };
-    assert_eq!(info.btf_kva, 0xFFFF_8880_0001_0000);
-    assert_eq!(info.btf_value_type_id, 42);
-}
+//
+// The literal-roundtrip tautologies that asserted hand-written
+// `btf_kva` / `btf_value_type_id` struct-literal values back out of a
+// `BpfMapInfo` are deleted: those fields are plain `pub` members
+// (mod.rs `struct BpfMapInfo`) with no accessor or derivation, so the
+// assertions exercised no production logic. The live BTF-field decode
+// from guest memory (`meta.u64_at(offsets.map_btf)` /
+// `meta.u32_at(offsets.map_btf_value_type_id)`) is genuinely covered
+// by `find_all_bpf_maps_populates_btf_fields` below, which writes
+// nonzero bytes into the guest buffer and asserts `find_all_bpf_maps`
+// reads them back.
 
 #[test]
 #[cfg(target_arch = "x86_64")]

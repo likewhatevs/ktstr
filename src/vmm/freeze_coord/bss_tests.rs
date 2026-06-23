@@ -365,8 +365,8 @@ fn bss_state_label_not_resolved() {
 }
 
 /// Wildcard-trap anchor: bss_state_label MUST only emit labels in
-/// the operator-known allowlist. The production match at
-/// mod.rs:188-195 is exhaustive, so a NEW BssReadState variant
+/// the operator-known allowlist. `bss_state_label`'s production match
+/// is exhaustive, so a NEW BssReadState variant
 /// fails to compile until it gets an explicit label arm — but a
 /// future refactor that adds any wildcard
 /// (`_ => "unknown"`, `_ => "other"`, `_ => "unhandled"`,

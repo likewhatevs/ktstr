@@ -3,10 +3,39 @@ use ktstr::assert::AssertResult;
 use ktstr::scenario::Ctx;
 use ktstr::scenario::ops::{CpusetSpec, HoldSpec, Step, execute_steps, execute_steps_with};
 use ktstr::test_support::{KtstrTestEntry, NumaDistance, NumaNode, Topology, TopologyConstraints};
-use ktstr::workload::{MemPolicy, MpolFlags};
+use ktstr::workload::{MemPolicy, MpolFlags, WorkType};
 
 // All NUMA tests use auto_repro: false — these verify topology plumbing,
 // not scheduler behavior, so BPF crash probes add no diagnostic value.
+
+// Per-worker working-set region (KiB) for the mem-policy locality tests.
+//
+// The default WorkType::SpinWait allocates nothing under the policy, and
+// set_mempolicy governs only FUTURE faults (it cannot relocate the
+// binary/libc/stack pages COW-inherited from the parent before the worker
+// ran). So without a policy-governed allocation the locality metric reflects
+// inherited placement, not the policy. NumaWorkingSetSweep first-touches this
+// region under the cgroup's mem_policy, and the worker scopes page_locality to
+// exactly this region's VMA (src/workload/worker/sched.rs
+// read_numa_maps_region_pages), so the size only needs enough pages for a
+// stable ratio — it does NOT need to dominate the inherited RSS. 64 MiB is
+// well under the per-node guest memory, avoiding node-0 capacity pressure that
+// would spill the allocation.
+const NUMA_LOCALITY_REGION_KIB: usize = 65536; // 64 MiB
+
+// NumaWorkingSetSweep with an EMPTY target_nodes list mmaps a per-worker
+// anonymous region and first-touches every page WITHOUT any mbind override
+// (src/workload/worker/mod.rs) — so the region faults under the cgroup's
+// inherited set_mempolicy on the cpuset-confined (node 0) CPU. sweep_period_ms
+// = 0 keeps the worker CPU-bound (no off-cpu sleep) so the non-locality
+// default_checks behave as they did under SpinWait.
+fn numa_locality_work() -> WorkType {
+    WorkType::NumaWorkingSetSweep {
+        region_kib: NUMA_LOCALITY_REGION_KIB,
+        sweep_period_ms: 0,
+        target_nodes: vec![],
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Multi-NUMA boot: 2 NUMA nodes, uniform memory, default 10/20 distances
@@ -117,7 +146,8 @@ fn scenario_mempolicy_bind_locality(ctx: &Ctx) -> Result<AssertResult> {
         setup: vec![
             ctx.cgroup_def("cg_0")
                 .cpuset(CpusetSpec::Numa(0))
-                .mem_policy(MemPolicy::bind([0])),
+                .mem_policy(MemPolicy::bind([0]))
+                .work_type(numa_locality_work()),
         ]
         .into(),
         ops: vec![],
@@ -184,6 +214,10 @@ static __KTSTR_ENTRY_VMSTAT_MIGRATION: KtstrTestEntry = KtstrTestEntry {
 // across nodes 0 and 1, so the locality assertion sets a low minimum.
 // Exercises the round-robin nodemask path that Bind/Preferred don't reach.
 //
+// The cgroup runs a NumaWorkingSetSweep region (see `numa_locality_work`)
+// first-touched under this policy, so `page_locality` measures the
+// policy-governed allocation rather than the worker's COW-inherited RSS.
+//
 // `MpolFlags::STATIC_NODES` is required because without it the kernel
 // silently intersects the interleave nodemask with the task's cpuset —
 // which would degenerate to "interleave across {0} only" and defeat the
@@ -197,7 +231,8 @@ fn scenario_mempolicy_interleave_cross_node(ctx: &Ctx) -> Result<AssertResult> {
             ctx.cgroup_def("cg_0")
                 .cpuset(CpusetSpec::Numa(0))
                 .mem_policy(MemPolicy::interleave([0, 1]))
-                .mpol_flags(MpolFlags::STATIC_NODES),
+                .mpol_flags(MpolFlags::STATIC_NODES)
+                .work_type(numa_locality_work()),
         ]
         .into(),
         ops: vec![],
@@ -230,6 +265,13 @@ static __KTSTR_ENTRY_MEMPOLICY_INTERLEAVE: KtstrTestEntry = KtstrTestEntry {
 // Exercises the MPOL_PREFERRED_MANY (kernel 5.15+) path that
 // `MemPolicy::Preferred` cannot express.
 //
+// The cgroup runs a NumaWorkingSetSweep region (see `numa_locality_work`)
+// first-touched under this policy. MPOL_PREFERRED_MANY is local-first
+// (the running CPU's node leads the zonelist), so on the node-0-pinned
+// worker the region lands on node 0. `page_locality` is scoped to this
+// region's VMA, so it measures the policy-governed allocation, not the
+// worker's COW-inherited whole-process RSS.
+//
 // `MpolFlags::STATIC_NODES` is required so node 1 stays in the preferred
 // set — without it the kernel narrows the nodemask to the cpuset (node 0
 // only), collapsing the PreferredMany semantics into a single-node
@@ -243,7 +285,8 @@ fn scenario_mempolicy_preferred_many_locality(ctx: &Ctx) -> Result<AssertResult>
             ctx.cgroup_def("cg_0")
                 .cpuset(CpusetSpec::Numa(0))
                 .mem_policy(MemPolicy::preferred_many([0, 1]))
-                .mpol_flags(MpolFlags::STATIC_NODES),
+                .mpol_flags(MpolFlags::STATIC_NODES)
+                .work_type(numa_locality_work()),
         ]
         .into(),
         ops: vec![],

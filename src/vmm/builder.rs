@@ -267,6 +267,15 @@ impl Default for KtstrVmBuilder {
     }
 }
 
+/// Run-time CPU/memory placement plans resolved by
+/// [`KtstrVmBuilder::resolve_run_plans`].
+struct RunPlans {
+    pinning_plan: Option<host_topology::PinningPlan>,
+    mbind_node_map: Vec<Vec<usize>>,
+    no_perf_plan: Option<host_topology::LlcPlan>,
+    host_topo: Option<host_topology::HostTopology>,
+}
+
 impl KtstrVmBuilder {
     /// Path to the guest kernel: either a source directory (the VMM
     /// extracts `arch/*/boot/{bzImage,Image}`) or a prebuilt image.
@@ -400,8 +409,9 @@ impl KtstrVmBuilder {
     /// vCPU count; setting `budget` < vcpus forces CPU overcommit (used by
     /// `#[ktstr_test(cpu_budget = N)]` for contention tests). Only takes
     /// effect on the no-perf path; an explicit `--cpu-cap` / `KTSTR_CPU_CAP`
-    /// overrides it. A `budget` of 0 is floored to 1 here so this low-level
-    /// setter never produces a zero-CPU mask; the `#[ktstr_test]` macro and
+    /// overrides it. This setter stores `budget` verbatim; a value of 0 is
+    /// clamped to >= 1 only when `build()` resolves the no-perf CPU cap, so
+    /// no zero-CPU mask is ever produced. The `#[ktstr_test]` macro and
     /// `KtstrTestEntry::validate` reject 0 before it reaches this setter.
     pub fn cpu_budget(mut self, budget: u32) -> Self {
         self.cpu_budget = Some(budget);
@@ -611,8 +621,12 @@ impl KtstrVmBuilder {
     /// KVM_CAP_HALT_POLL skipped (guest haltpoll cpuidle disables
     /// host halt polling via MSR_KVM_POLL_CONTROL). On aarch64, KVM
     /// exit suppression and CPUID hints are not available. Validated
-    /// at build time -- oversubscription returns `ResourceContention`,
-    /// insufficient hugepages is a warning.
+    /// at build time -- a host with too few CPUs / LLC groups for the
+    /// requested perf topology returns `PerfModeUnavailable` (a
+    /// host-insufficiency: a visible skip by default, promoted to a hard
+    /// fail under `KTSTR_NO_SKIP_MODE`); busy LLC slots return
+    /// `ResourceContention` (skip-class, transient); insufficient
+    /// hugepages is a warning.
     #[allow(dead_code)]
     pub fn performance_mode(mut self, enabled: bool) -> Self {
         self.performance_mode = enabled;
@@ -838,9 +852,12 @@ impl KtstrVmBuilder {
     ///
     /// Returns `Err` for missing required inputs (kernel, init binary),
     /// invalid topology, or host resources insufficient to satisfy
-    /// `performance_mode` requirements (the last surfaces as
-    /// `ResourceContention`, which callers typically treat as a
-    /// skip rather than a failure).
+    /// `performance_mode` requirements (a too-small host surfaces as
+    /// `PerfModeUnavailable` — a host-insufficiency: skip-class by default,
+    /// promoted to a hard fail under `KTSTR_NO_SKIP_MODE`; busy LLC slots
+    /// surface as `ResourceContention`, also skip-class). An explicit
+    /// over-budget `--cpu-cap` / `cpu_budget` surfaces as
+    /// `CpuBudgetUnsatisfiable` (a hard error).
     pub fn build(mut self) -> Result<KtstrVm> {
         // Periodic capture's boundary computation requires
         // `workload_duration` to slice. Without it the
@@ -864,9 +881,149 @@ impl KtstrVmBuilder {
             self.performance_mode = false;
         }
 
+        let RunPlans {
+            pinning_plan,
+            mbind_node_map,
+            no_perf_plan,
+            host_topo: cached_host_topo,
+        } = self.resolve_run_plans(no_perf_mode)?;
+
+        let kernel = self.kernel.context("kernel path required")?;
+        anyhow::ensure!(kernel.exists(), "kernel not found: {}", kernel.display());
+        let t = &self.topology;
+        anyhow::ensure!(t.llcs > 0, "llcs must be > 0");
+        anyhow::ensure!(t.cores_per_llc > 0, "cores_per_llc must be > 0");
+        anyhow::ensure!(t.threads_per_core > 0, "threads_per_core must be > 0");
+        anyhow::ensure!(t.numa_nodes > 0, "numa_nodes must be > 0");
+        // `memory_mib == Some(0)` would forward a literal `-m 0` to the
+        // VMM backend (KVM rejects it at ioctl time with an opaque
+        // error). Catch it here with a clear message so the caller
+        // learns they set 0 explicitly rather than seeing a generic
+        // kvm failure later. `None` falls back to the default (256 MiB).
+        if matches!(self.memory_mib, Some(0)) {
+            anyhow::bail!(
+                "memory_mib must be > 0 (a VM with zero memory cannot boot); \
+                 omit `.memory_mib(...)` to use the builder default"
+            );
+        }
+        if let Some(ref bin) = self.init_binary
+            && !bin.starts_with("/proc/")
+        {
+            anyhow::ensure!(bin.exists(), "init binary not found: {}", bin.display());
+        }
+        if let Some(ref bin) = self.scheduler_binary {
+            anyhow::ensure!(
+                bin.exists(),
+                "scheduler binary not found: {}",
+                bin.display()
+            );
+        }
+
+        // Build a lazy on-demand BPF cast-analysis handle for the
+        // scheduler binary. NO file I/O and NO analyzer work runs
+        // here — the handle just captures the scheduler binary
+        // path and a `OnceLock` slot. The actual analyzer (file
+        // read + raw ELF parse + BTF parse + register-state walk
+        // over BPF instructions; no libbpf, no kernel interaction,
+        // no CAP_BPF) defers until the failure-dump path first
+        // calls
+        // [`super::cast_analysis_load::LazyCastMap::get_full`]
+        // (production accessor — `.get()` is `#[allow(dead_code)]`
+        // and used only by the lazy-handle unit tests).
+        // Schedulers whose tests pass never trigger analyzer
+        // work — the dominant case for nextest's process-per-test
+        // execution model where steady-state tests boot a VM,
+        // run, and exit without ever touching the dump path.
+        //
+        // When `.get_full()` does fire, it consults the process-
+        // wide content-hash cache via
+        // [`super::cast_analysis_load::cached_cast_analysis_for_scheduler`].
+        // Within a single process (auto-repro after a primary
+        // failure, future in-process multi-test drivers), two VMs
+        // resolving to the same scheduler binary content share
+        // one analyzer run.
+        let cast_map = std::sync::Arc::new(super::cast_analysis_load::LazyCastMap::new(
+            self.scheduler_binary.clone(),
+        ));
+
+        // Pre-materialize the (name, args) tuple view so the VM's
+        // `suffix_params()` helper can borrow it without leaking
+        // `StagedScheduler` into the `pub SuffixParams` field
+        // signature. Cheap clone (name is short, args are small);
+        // the duplication is the price for keeping the public
+        // initramfs-suffix surface free of crate-private types.
+        let staged_sched_args_packed: Vec<(String, Vec<String>)> = self
+            .staged_schedulers
+            .iter()
+            .map(|s| (s.name.clone(), s.sched_args.clone()))
+            .collect();
+
+        let vcpus = t.total_cpus();
+        let effective_cpu_budget =
+            resolve_effective_cpu_budget(&no_perf_plan, cached_host_topo.is_some(), vcpus);
+
+        Ok(KtstrVm {
+            kernel,
+            init_binary: self.init_binary,
+            scheduler_binary: self.scheduler_binary,
+            staged_schedulers: self.staged_schedulers,
+            staged_sched_args_packed,
+            run_args: self.run_args,
+            sched_args: self.sched_args,
+            topology: self.topology,
+            vcpus,
+            effective_cpu_budget,
+            memory_mib: self.memory_mib,
+            memory_min_mib: self.memory_min_mib,
+            cmdline_extra: self.cmdline_extra,
+            timeout: self.timeout,
+            monitor_thresholds: self.monitor_thresholds,
+            watchdog_timeout: self.watchdog_timeout,
+            rendezvous_timeout: self.rendezvous_timeout,
+            bpf_map_writes: self.bpf_map_writes,
+            performance_mode: self.performance_mode,
+            no_perf_mode,
+            pinning_plan,
+            mbind_node_map,
+            no_perf_plan,
+            host_topo: cached_host_topo,
+            sched_enable_cmds: self.sched_enable_cmds,
+            sched_disable_cmds: self.sched_disable_cmds,
+            include_files: self.include_files,
+            disks: self.disks,
+            network: self.network,
+            busybox_bytes: self.busybox_bytes,
+            #[cfg(feature = "wprof")]
+            wprof: self.wprof,
+            dmesg: self.dmesg,
+            exec_cmd: self.exec_cmd,
+            exec_timeout: self.exec_timeout,
+            jemalloc_probe_binary: self.jemalloc_probe_binary,
+            jemalloc_alloc_worker_binary: self.jemalloc_alloc_worker_binary,
+            failure_dump_path: self.failure_dump_path,
+            dual_snapshot: self.dual_snapshot,
+            template_staging_image: self.template_staging_image,
+            workload_duration: self.workload_duration,
+            num_snapshots: self.num_snapshots,
+            workload_root_cgroup: self.workload_root_cgroup,
+            scheduler_cgroup_parent: self.scheduler_cgroup_parent,
+            cast_map,
+        })
+    }
+
+    /// Resolve the run-time CPU/memory placement plans: the no-perf
+    /// CPU-budget LLC reservation, the perf-mode pinning plan + NUMA
+    /// mbind map, or the deferred-default (neither) path, and cache the
+    /// host topology for [`KtstrVm::run`]'s deferred-lock branch. Returns
+    /// the three plan slots plus the cached topology bundled in
+    /// [`RunPlans`]. `no_perf_mode` selects the first arm; otherwise
+    /// `self.performance_mode` selects the perf-mode arm, else the
+    /// deferred default.
+    fn resolve_run_plans(&mut self, no_perf_mode: bool) -> Result<RunPlans> {
         // `host_topo` is cached on KtstrVm so `KtstrVm::run`'s
         // default-else branch (neither perf-mode nor no-perf-mode)
-        // can call `acquire_cpu_locks` without re-reading sysfs.
+        // can call `compute_pinning` per LLC offset and take `LOCK_SH`
+        // via `acquire_resource_locks` without re-reading sysfs.
         // The no-perf-mode and perf-mode branches reuse their
         // stored plans' `locked_llcs` / `llc_indices` directly
         // through `acquire_resource_locks` and do not need the
@@ -942,25 +1099,44 @@ impl KtstrVmBuilder {
                 // oversubscription). Computed here rather than folded into
                 // `cpu_cap` so the bypass-conflict check above still keys on
                 // the *explicit* cap only.
-                let effective_cap = match cpu_cap {
-                    Some(c) => Some(c),
-                    None => {
-                        let allowed = host_topology::host_allowed_cpus().len();
-                        let vcpus = (self.topology.llcs
-                            * self.topology.cores_per_llc
-                            * self.topology.threads_per_core)
-                            as usize;
-                        // A per-test `cpu_budget` (#[ktstr_test]) overrides the
-                        // auto-size: clamp to [1, allowed] so a test can force
-                        // overcommit (budget < vcpus) without exceeding the host
-                        // allowance. Absent → size to the vCPU count.
-                        let budget = match self.cpu_budget {
-                            Some(n) => (n as usize).clamp(1, allowed.max(1)),
-                            None => host_topology::no_perf_cpu_budget(allowed, vcpus),
-                        };
-                        Some(host_topology::CpuCap::new(budget)?)
+                let effective_cap = resolve_cpu_budget(
+                    cpu_cap,
+                    self.cpu_budget,
+                    host_topology::host_allowed_cpus().len(),
+                    self.topology.total_cpus() as usize,
+                )?;
+                // Oversubscription warning: when the resolved host-CPU
+                // budget is below the guest vCPU count the host time-slices
+                // the vCPU threads, confounding guest-scheduler measurement
+                // (see host_topology::overcommit_warning). Computed HERE —
+                // after effective_cap resolves — so the explicit
+                // --cpu-cap arm (which short-circuits the match above and
+                // never reaches the vcpus comparison) is covered too, not
+                // just the auto-size arm. `explicit` keys severity:
+                // cpu_budget / --cpu-cap is an opt-in; an auto-collapse to a
+                // too-small process cpuset is the silent case.
+                if let Some(cap) = effective_cap {
+                    let allowed = host_topology::host_allowed_cpus().len();
+                    let vcpus = self.topology.total_cpus() as usize;
+                    let eff = cap.effective_count(allowed).unwrap_or(allowed);
+                    let explicit = cpu_cap.is_some() || self.cpu_budget.is_some();
+                    if let Some(msg) = host_topology::overcommit_warning(
+                        eff,
+                        vcpus,
+                        explicit,
+                        self.watchdog_timeout.map(|d| d.as_secs()),
+                    ) {
+                        // KTSTR_CARGO_TEST_MODE does not enforce the budget
+                        // (acquire_llc_plan masks to the full allowed cpuset
+                        // and ignores cpu_cap), so the would-be-overcommit
+                        // warning is misleading there — the stamped budget
+                        // shows no overcommit and the sidecar marker stays
+                        // silent. Suppress the build-time warning to match.
+                        if !crate::cargo_test_mode::cargo_test_mode_active() {
+                            eprintln!("{msg}");
+                        }
                     }
-                };
+                }
                 // Compute the plan and immediately drop the flocks:
                 // we want the plan SHAPE on KtstrVm but not the
                 // RAII fds. `run()` re-takes fresh `LOCK_SH` on
@@ -1013,128 +1189,26 @@ impl KtstrVmBuilder {
             (None, Vec::new(), None)
         };
 
-        let kernel = self.kernel.context("kernel path required")?;
-        anyhow::ensure!(kernel.exists(), "kernel not found: {}", kernel.display());
-        let t = &self.topology;
-        anyhow::ensure!(t.llcs > 0, "llcs must be > 0");
-        anyhow::ensure!(t.cores_per_llc > 0, "cores_per_llc must be > 0");
-        anyhow::ensure!(t.threads_per_core > 0, "threads_per_core must be > 0");
-        anyhow::ensure!(t.numa_nodes > 0, "numa_nodes must be > 0");
-        // `memory_mib == Some(0)` would forward a literal `-m 0` to the
-        // VMM backend (KVM rejects it at ioctl time with an opaque
-        // error). Catch it here with a clear message so the caller
-        // learns they set 0 explicitly rather than seeing a generic
-        // kvm failure later. `None` falls back to the default (256 MiB).
-        if matches!(self.memory_mib, Some(0)) {
-            anyhow::bail!(
-                "memory_mib must be > 0 (a VM with zero memory cannot boot); \
-                 omit `.memory_mib(...)` to use the builder default"
-            );
-        }
-        if let Some(ref bin) = self.init_binary
-            && !bin.starts_with("/proc/")
-        {
-            anyhow::ensure!(bin.exists(), "init binary not found: {}", bin.display());
-        }
-        if let Some(ref bin) = self.scheduler_binary {
-            anyhow::ensure!(
-                bin.exists(),
-                "scheduler binary not found: {}",
-                bin.display()
-            );
-        }
-
-        // Build a lazy on-demand BPF cast-analysis handle for the
-        // scheduler binary. NO file I/O and NO analyzer work runs
-        // here — the handle just captures the scheduler binary
-        // path and a `OnceLock` slot. The actual analyzer (file
-        // read + raw ELF parse + BTF parse + register-state walk
-        // over BPF instructions; no libbpf, no kernel interaction,
-        // no CAP_BPF) defers until the failure-dump path first
-        // calls
-        // [`super::cast_analysis_load::LazyCastMap::get_full`]
-        // (production accessor — `.get()` is `#[allow(dead_code)]`
-        // and used only by the lazy-handle unit tests).
-        // Schedulers whose tests pass never trigger analyzer
-        // work — the dominant case for nextest's process-per-test
-        // execution model where steady-state tests boot a VM,
-        // run, and exit without ever touching the dump path.
-        //
-        // When `.get_full()` does fire, it consults the process-
-        // wide content-hash cache via
-        // [`super::cast_analysis_load::cached_cast_analysis_for_scheduler`].
-        // Within a single process (auto-repro after a primary
-        // failure, future in-process multi-test drivers), two VMs
-        // resolving to the same scheduler binary content share
-        // one analyzer run.
-        let cast_map = std::sync::Arc::new(super::cast_analysis_load::LazyCastMap::new(
-            self.scheduler_binary.clone(),
-        ));
-
-        // Pre-materialize the (name, args) tuple view so the VM's
-        // `suffix_params()` helper can borrow it without leaking
-        // `StagedScheduler` into the `pub SuffixParams` field
-        // signature. Cheap clone (name is short, args are small);
-        // the duplication is the price for keeping the public
-        // initramfs-suffix surface free of crate-private types.
-        let staged_sched_args_packed: Vec<(String, Vec<String>)> = self
-            .staged_schedulers
-            .iter()
-            .map(|s| (s.name.clone(), s.sched_args.clone()))
-            .collect();
-
-        Ok(KtstrVm {
-            kernel,
-            init_binary: self.init_binary,
-            scheduler_binary: self.scheduler_binary,
-            staged_schedulers: self.staged_schedulers,
-            staged_sched_args_packed,
-            run_args: self.run_args,
-            sched_args: self.sched_args,
-            topology: self.topology,
-            memory_mib: self.memory_mib,
-            memory_min_mib: self.memory_min_mib,
-            cmdline_extra: self.cmdline_extra,
-            timeout: self.timeout,
-            monitor_thresholds: self.monitor_thresholds,
-            watchdog_timeout: self.watchdog_timeout,
-            rendezvous_timeout: self.rendezvous_timeout,
-            bpf_map_writes: self.bpf_map_writes,
-            performance_mode: self.performance_mode,
-            no_perf_mode,
+        Ok(RunPlans {
             pinning_plan,
             mbind_node_map,
             no_perf_plan,
             host_topo: cached_host_topo,
-            sched_enable_cmds: self.sched_enable_cmds,
-            sched_disable_cmds: self.sched_disable_cmds,
-            include_files: self.include_files,
-            disks: self.disks,
-            network: self.network,
-            busybox_bytes: self.busybox_bytes,
-            #[cfg(feature = "wprof")]
-            wprof: self.wprof,
-            dmesg: self.dmesg,
-            exec_cmd: self.exec_cmd,
-            exec_timeout: self.exec_timeout,
-            jemalloc_probe_binary: self.jemalloc_probe_binary,
-            jemalloc_alloc_worker_binary: self.jemalloc_alloc_worker_binary,
-            failure_dump_path: self.failure_dump_path,
-            dual_snapshot: self.dual_snapshot,
-            template_staging_image: self.template_staging_image,
-            workload_duration: self.workload_duration,
-            num_snapshots: self.num_snapshots,
-            workload_root_cgroup: self.workload_root_cgroup,
-            scheduler_cgroup_parent: self.scheduler_cgroup_parent,
-            cast_map,
         })
     }
 
     /// Validate host resources for performance_mode and compute the
     /// pinning plan. Returns both the plan and the host topology (needed
-    /// for NUMA node discovery). Returns `ResourceContention` when the
-    /// host lacks CPUs or LLC slots. Warnings are printed for degraded
-    /// conditions (hugepages, host load).
+    /// for NUMA node discovery). Returns `PerfModeUnavailable` when the
+    /// host has too few CPUs / LLC groups for the requested perf topology
+    /// (the explicit isolation guarantee cannot be honored — a permanent
+    /// host-insufficiency the dispatch/macro treat as a SKIP by default,
+    /// promoted to a hard FAIL under `KTSTR_NO_SKIP_MODE`; from the pre-check
+    /// here and via the `compute_pinning` re-map in `acquire_slot_with_locks`),
+    /// or `ResourceContention` when the host is
+    /// big enough but all LLC slots are currently busy (transient →
+    /// skip/retry). Warnings are printed for degraded conditions
+    /// (hugepages, host load).
     fn validate_performance_mode(
         &mut self,
     ) -> Result<(host_topology::PinningPlan, host_topology::HostTopology)> {
@@ -1156,7 +1230,13 @@ impl KtstrVmBuilder {
             .sum();
         let total_reserved = reserved + 1; // +1 for service CPU
         if total_reserved > host_topo.total_cpus() {
-            return Err(anyhow::Error::new(host_topology::ResourceContention {
+            // The host has fewer CPUs than perf-mode must reserve: the
+            // explicitly-requested isolation guarantee cannot be honored on
+            // this host. PerfModeUnavailable — a host-insufficiency the
+            // dispatch/macro treat as a SKIP by default (FAIL under
+            // KTSTR_NO_SKIP_MODE); the operator provisions a bigger host,
+            // narrows the topology, or drops --perf-mode.
+            return Err(anyhow::Error::new(host_topology::PerfModeUnavailable {
                 reason: format!(
                     "performance_mode: need {} CPUs ({} across {} LLCs + 1 service) \
                      but only {} host CPUs available\n  \
@@ -1226,10 +1306,109 @@ fn build_per_node_map(
     map.into_iter().map(|s| s.into_iter().collect()).collect()
 }
 
+// Stamp the run's guest vCPU count + the EFFECTIVE host-CPU budget
+// for the sidecar (budget Dimension + overcommit marker) — the
+// number of distinct host CPUs the vCPU threads actually run on.
+// no-perf reserves a CPU budget (the no_perf_plan's cpus) and masks
+// every vCPU thread onto it (the overcommit-relevant path: budget
+// may be < vcpus). Under KTSTR_CARGO_TEST_MODE the plan reserves
+// nothing and its cpus == the full allowed cpuset (a no-op mask), so
+// the stamp records the unrestricted set the vCPUs floated across —
+// still the true CPU count the threads ran on.
+// perf-mode AND the deferred default both attempt a 1:1 pinning
+// plan at run time — perf-mode via `validate_performance_mode`, the
+// default via `run()`'s LOCK_SH offset search — hard-pinning each
+// vCPU thread to one distinct host CPU (`compute_pinning` emits
+// exactly `vcpus` 1:1 assignments). Both cache the host topology, so
+// `cached_host_topo.is_some()` predicts a 1:1 pin and the build-time
+// budget is the vCPU count. Two run-time outcomes diverge from that
+// estimate: perf-mode aborts with ResourceContention if its LOCK_EX
+// is unavailable (no sidecar written), and the default path
+// OVERCOMMITS when no offset can map the topology (host too small) —
+// `run()` then overrides `VmResult.cpu_budget` with the actual
+// masked host-CPU count (`RunLocks::default_cpu_mask` length), so a
+// too-small host stamps the real overcommit, not this `vcpus`
+// estimate. Only when no affinity is applied (no-perf bypass, sysfs
+// unreadable, or the deferred default with no cached host topology)
+// do the vCPU threads fall to the allowed-cpuset size below. The
+// earlier `no_perf_plan` arm wins first, so the `cached_host_topo`
+// arm is only reached with no no-perf plan (perf-mode / deferred
+// default), never the no-perf masked path.
+fn resolve_effective_cpu_budget(
+    no_perf_plan: &Option<host_topology::LlcPlan>,
+    has_cached_host_topo: bool,
+    vcpus: u32,
+) -> u32 {
+    if let Some(p) = no_perf_plan {
+        p.cpus.len() as u32
+    } else if has_cached_host_topo {
+        vcpus
+    } else {
+        // No affinity applied (bypass / sysfs-unreadable): the threads
+        // float across the allowed cpuset. host_allowed_cpus() returns
+        // empty only when BOTH sched_getaffinity AND /proc/self/status
+        // fail (a host that can barely run); clamp to >= 1 so a genuinely
+        // booted run never stamps 0, which sidecar_to_row maps to None
+        // and explain renders as the "skip; VM not booted" sentinel —
+        // misclassifying a real run as a skip.
+        (host_topology::host_allowed_cpus().len() as u32).max(1)
+    }
+}
+
+/// Resolve the effective per-VM CPU cap from an explicit cap, a per-test
+/// `cpu_budget`, and the host allowance.
+///
+/// - An explicit `--cpu-cap`/`KTSTR_CPU_CAP` (`cpu_cap = Some`) wins verbatim.
+/// - Otherwise a per-test `cpu_budget` (`#[ktstr_test]`) is honored: a budget
+///   exceeding `allowed` host CPUs is a [`host_topology::CpuBudgetUnsatisfiable`]
+///   hard error (the author named a concrete number the host cannot satisfy,
+///   symmetric with `--cpu-cap`); at or below the allowance it stands (floored
+///   at 1) so a test can force overcommit (`cpu_budget < vcpus`).
+/// - Absent both, the budget auto-sizes to the VM's vCPU count via
+///   [`host_topology::no_perf_cpu_budget`] so a wide VM's boot-time parallel AP
+///   bringup is not throttled by the 30% default mask.
+///
+/// Extracted from `build()` as a pure function so the budget-resolution policy
+/// is unit-testable without booting a VM.
+fn resolve_cpu_budget(
+    cpu_cap: Option<host_topology::CpuCap>,
+    per_test_budget: Option<u32>,
+    allowed: usize,
+    vcpus: usize,
+) -> Result<Option<host_topology::CpuCap>> {
+    match cpu_cap {
+        Some(c) => Ok(Some(c)),
+        None => {
+            let budget = match per_test_budget {
+                Some(n) => {
+                    let n = n as usize;
+                    if n > allowed {
+                        return Err(anyhow::Error::new(
+                            host_topology::CpuBudgetUnsatisfiable::exceeds_allowed(
+                                "cpu_budget",
+                                n,
+                                allowed,
+                                "omit cpu_budget to auto-size it",
+                            ),
+                        ));
+                    }
+                    n.max(1)
+                }
+                None => host_topology::no_perf_cpu_budget(allowed, vcpus),
+            };
+            Ok(Some(host_topology::CpuCap::new(budget)?))
+        }
+    }
+}
+
 /// Try each LLC slot, compute a pinning plan, and acquire resource
 /// locks (non-blocking). Single pass through all available slots.
-/// Returns `ResourceContention` when all slots are busy; callers
-/// rely on nextest retry backoff for contention resolution.
+/// Returns `PerfModeUnavailable` when `compute_pinning` reports the host is
+/// too small for the perf topology (the isolation guarantee cannot be
+/// honored — a permanent host-insufficiency: a SKIP by default, a hard FAIL
+/// under `KTSTR_NO_SKIP_MODE`), or `ResourceContention` when the host fits
+/// but all slots are currently busy (transient; callers rely on nextest
+/// retry backoff for contention resolution).
 fn acquire_slot_with_locks(
     host_topo: &host_topology::HostTopology,
     topo: &topology::Topology,
@@ -1242,9 +1421,25 @@ fn acquire_slot_with_locks(
     for slot in 0..max_slots {
         let offset = slot * llcs_needed;
 
-        let candidate = host_topo
-            .compute_pinning(topo, true, offset)
-            .context("performance_mode: topology mapping")?;
+        let candidate = match host_topo.compute_pinning(topo, true, offset) {
+            Ok(c) => c,
+            // compute_pinning returns TopologyInsufficient when the host has
+            // too few CPUs/LLCs for the requested perf topology. For a
+            // perf-mode test that means the isolation guarantee cannot be
+            // honored here -> PerfModeUnavailable, a host-insufficiency the
+            // dispatch/macro SKIP by default (FAIL under KTSTR_NO_SKIP_MODE);
+            // distinct from the transient all-slots-busy ResourceContention
+            // below.
+            Err(e)
+                if e.downcast_ref::<host_topology::TopologyInsufficient>()
+                    .is_some() =>
+            {
+                return Err(anyhow::Error::new(host_topology::PerfModeUnavailable {
+                    reason: format!("performance_mode: {e:#}"),
+                }));
+            }
+            Err(e) => return Err(e).context("performance_mode: topology mapping"),
+        };
 
         match host_topology::acquire_resource_locks(&candidate, &candidate.llc_indices, llc_mode)? {
             host_topology::LockOutcome::Acquired { locks, .. } => {
@@ -1279,11 +1474,97 @@ mod tests {
         assert_eq!(b.topology.total_cpus(), 1);
     }
 
+    /// resolve_cpu_budget: an explicit cap wins verbatim and ignores the
+    /// per-test cpu_budget — even a per-test budget that would otherwise be a
+    /// hard error (999 > allowed 10) is bypassed by the explicit cap.
+    #[test]
+    fn resolve_cpu_budget_explicit_cap_wins() {
+        let cap = host_topology::CpuCap::new(5).unwrap();
+        let resolved = resolve_cpu_budget(Some(cap), Some(999), 10, 8)
+            .unwrap()
+            .expect("explicit cap resolves to Some");
+        assert_eq!(resolved.effective_count(10).unwrap(), 5);
+    }
+
+    /// resolve_cpu_budget: a per-test cpu_budget at or below the host allowance
+    /// stands (floored at 1) so a test can force overcommit (budget < vcpus).
+    #[test]
+    fn resolve_cpu_budget_per_test_budget_within_allowance_stands() {
+        let resolved = resolve_cpu_budget(None, Some(4), 10, 8)
+            .unwrap()
+            .expect("budget resolves to Some");
+        assert_eq!(resolved.effective_count(10).unwrap(), 4);
+    }
+
+    /// resolve_cpu_budget over-allowance gate: a per-test cpu_budget exceeding the host
+    /// allowance is a TYPED CpuBudgetUnsatisfiable hard error (symmetric with
+    /// --cpu-cap), not a silent clamp — the author named a concrete number the
+    /// host cannot satisfy.
+    #[test]
+    fn resolve_cpu_budget_per_test_budget_over_allowance_errors() {
+        let err = resolve_cpu_budget(None, Some(100), 10, 8)
+            .expect_err("budget 100 > allowed 10 must error");
+        assert!(
+            err.downcast_ref::<host_topology::CpuBudgetUnsatisfiable>()
+                .is_some(),
+            "must be a typed CpuBudgetUnsatisfiable, got: {err:#}",
+        );
+    }
+
+    /// resolve_cpu_budget auto-size default: absent both an explicit cap and a
+    /// per-test budget, the budget auto-sizes via no_perf_cpu_budget (so a wide
+    /// VM is not throttled by the 30% default mask). Pins the DELEGATION to
+    /// no_perf_cpu_budget, not a re-derived constant.
+    #[test]
+    fn resolve_cpu_budget_auto_sizes_to_no_perf_budget() {
+        let allowed = 100;
+        let vcpus = 50;
+        let resolved = resolve_cpu_budget(None, None, allowed, vcpus)
+            .unwrap()
+            .expect("auto-size resolves to Some");
+        assert_eq!(
+            resolved.effective_count(allowed).unwrap(),
+            host_topology::no_perf_cpu_budget(allowed, vcpus),
+            "absent-both must delegate to no_perf_cpu_budget",
+        );
+    }
+
+    /// acquire_slot_with_locks perf-mode re-map: when the host is too small
+    /// for the requested perf topology, compute_pinning's TopologyInsufficient
+    /// is re-mapped to a TYPED PerfModeUnavailable (a permanent
+    /// host-insufficiency — the isolation guarantee cannot be honored on ANY
+    /// slot of this host), distinct from the transient ResourceContention.
+    /// Host = 1 LLC / 2 CPUs; request = 4 vCPUs. The shortfall is detected by
+    /// compute_pinning BEFORE any resource lock, so the synthetic host needs
+    /// no flock fixture.
+    #[test]
+    fn acquire_slot_with_locks_host_too_small_is_perf_mode_unavailable() {
+        let host = host_topology::HostTopology::new_for_tests(&[(vec![0, 1], 0)]);
+        let topo = topology::Topology::new(1, 1, 4, 1);
+        let err = acquire_slot_with_locks(&host, &topo)
+            .expect_err("4 vCPUs on a 2-CPU host cannot satisfy the perf topology");
+        assert!(
+            err.downcast_ref::<host_topology::PerfModeUnavailable>()
+                .is_some(),
+            "host-too-small must re-map TopologyInsufficient -> PerfModeUnavailable \
+             (a host-insufficiency, distinct from the transient ResourceContention): {err:#}",
+        );
+    }
+
     /// Explicit `memory_mib(0)` must be rejected at build time rather
     /// than surfacing as an opaque KVM ioctl failure later. The
     /// builder default (None→256) passes.
     #[test]
     fn builder_rejects_explicit_zero_memory() {
+        // build()'s no-perf path reads KTSTR_BYPASS_LLC_LOCKS + KTSTR_CPU_CAP
+        // before the memory_mib guard. Under the shared env lock, pin
+        // bypass=1 + cpu_cap unset so build() short-circuits the slot/LLC
+        // acquire path (no acquire_llc_plan contention; cpu_cap=None avoids
+        // the bypass+cpu_cap bail), leaving the memory_mib(0) rejection.
+        use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
+        let _l = lock_env();
+        let _g = EnvVarGuard::set(crate::KTSTR_BYPASS_LLC_LOCKS_ENV, "1");
+        let _c = EnvVarGuard::remove(crate::KTSTR_CPU_CAP_ENV);
         // Point at a real file so the kernel-existence check
         // (which runs before the memory_mib guard) does not short-
         // circuit. /bin/true exists on every host the tests care

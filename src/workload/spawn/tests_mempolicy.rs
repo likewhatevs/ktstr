@@ -47,15 +47,38 @@ fn build_nodemask_high_node() {
 }
 #[test]
 fn apply_mempolicy_default_is_noop() {
-    apply_mempolicy_with_flags(&MemPolicy::Default, MpolFlags::NONE);
+    // `MemPolicy::Default` must take the no-syscall arm and report it.
+    // Asserting the typed outcome (not merely "did not panic") pins the
+    // early `return MempolicyOutcome::SkippedDefault` at the top of
+    // `apply_mempolicy_with_flags`: a regression that fell through to a
+    // `set_mempolicy(2)` call would change the worker's inherited policy
+    // and surface here as `Applied`/`Failed`.
+    assert_eq!(
+        apply_mempolicy_with_flags(&MemPolicy::Default, MpolFlags::NONE),
+        MempolicyOutcome::SkippedDefault,
+    );
 }
 #[test]
 fn apply_mempolicy_empty_bind_skipped() {
-    apply_mempolicy_with_flags(&MemPolicy::Bind(BTreeSet::new()), MpolFlags::NONE);
+    // An empty `Bind` node set MUST skip the syscall entirely — issuing
+    // `set_mempolicy(MPOL_BIND)` with an empty mask is a different (and
+    // wrong) request to the kernel. The typed `SkippedEmpty` outcome
+    // makes the skip observable; a regression that built an empty mask
+    // and called the syscall would return `Applied`/`Failed` instead.
+    assert_eq!(
+        apply_mempolicy_with_flags(&MemPolicy::Bind(BTreeSet::new()), MpolFlags::NONE),
+        MempolicyOutcome::SkippedEmpty,
+    );
 }
 #[test]
 fn apply_mempolicy_empty_interleave_skipped() {
-    apply_mempolicy_with_flags(&MemPolicy::Interleave(BTreeSet::new()), MpolFlags::NONE);
+    // Same skip contract as the empty-bind case for `Interleave`: an
+    // empty node set must NOT reach `set_mempolicy(2)`. Pinning
+    // `SkippedEmpty` proves the empty-set guard covers this variant too.
+    assert_eq!(
+        apply_mempolicy_with_flags(&MemPolicy::Interleave(BTreeSet::new()), MpolFlags::NONE),
+        MempolicyOutcome::SkippedEmpty,
+    );
 }
 /// `WorkType::NumaWorkingSetSweep` smoke test. Empty
 /// `target_nodes` disables binding (per the variant's doc:

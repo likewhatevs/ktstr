@@ -230,7 +230,9 @@ pub(crate) fn derive_claim_inner(input: DeriveInput) -> syn::Result<proc_macro2:
          `&mut Verdict` as the accumulator; container fields (`BTreeSet`/`Vec`) \
          route through `SetClaim`/`SeqClaim`. Method dispatch keys on the \
          stats struct's type, so identical field names across distinct stats \
-         structs do not collide. Brought into scope via `use ktstr::prelude::*`.",
+         structs do not collide. For prelude-exported stats types the trait is \
+         preluded, so `use ktstr::prelude::*` brings the accessors into scope; \
+         otherwise import the trait from the stats type's module.",
         name = struct_name,
     );
 

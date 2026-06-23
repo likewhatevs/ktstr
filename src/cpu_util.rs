@@ -110,9 +110,11 @@ pub fn parse_cpu_list(s: &str) -> Option<Vec<u32>> {
 }
 
 /// Read the effective CPU affinity for a task via the
-/// `sched_getaffinity(2)` syscall. Kernel accepts any pid/tid in
-/// the caller's namespace; root or same-uid required per the
-/// kernel's ptrace-access check. Returns sorted CPU ids.
+/// `sched_getaffinity(2)` syscall. The kernel gates
+/// `sched_getaffinity` on `security_task_getscheduler(p)` only —
+/// under the default DAC config this is unrestricted (any task may
+/// read any other task's affinity); an active LSM (SELinux/Yama)
+/// may return EPERM. Returns sorted CPU ids.
 /// `None` on syscall failure (EPERM, ESRCH) or when the kernel's
 /// mask exceeds [`AFFINITY_MAX_BITS`] (hosts beyond 262144 CPUs).
 ///
@@ -144,9 +146,11 @@ pub fn parse_cpu_list(s: &str) -> Option<Vec<u32>> {
 ///   ceiling is reached, then surface None.
 /// - `EPERM` / `ESRCH` → real access / process-identity failures.
 ///   Return None so the caller falls back to the procfs
-///   `Cpus_allowed_list:` path, which bypasses the permission
-///   check (reading `/proc/<tid>/status` only requires directory
-///   traversal permission, not `PTRACE_MODE_READ`).
+///   `Cpus_allowed_list:` path. That field is emitted in
+///   `/proc/<tid>/status` and is governed by procfs DAC (open /
+///   directory-traversal permission), not the syscall's
+///   `security_task_getscheduler` LSM hook, so it can succeed
+///   where an active LSM denied the syscall.
 /// - Any other error → return None. The procfs fallback will
 ///   produce the correct value or its own None.
 ///

@@ -322,79 +322,6 @@ fn resource_lock_service_cpu_contention() {
     drop(holder);
 }
 
-#[test]
-fn cpu_lock_window_success() {
-    let _cpu_prefix = CpuLockPrefixGuard::new();
-    let locks = try_acquire_cpu_window(91300, 3).unwrap();
-    assert_eq!(locks.len(), 3);
-}
-
-#[test]
-fn cpu_lock_window_contention_all_or_nothing() {
-    let _cpu_prefix = CpuLockPrefixGuard::new();
-    let cpu_400 = cpu_lock_path(91400);
-    let cpu_401 = cpu_lock_path(91401);
-
-    let holder = try_flock(&cpu_400, FlockMode::Exclusive).unwrap().unwrap();
-
-    let result = try_acquire_cpu_window(91400, 2);
-    assert!(result.is_err(), "should fail when first CPU is held");
-
-    // Hold 91401 instead — 91400 acquires then drops on failure.
-    drop(holder);
-
-    let holder2 = try_flock(&cpu_401, FlockMode::Exclusive).unwrap().unwrap();
-    let result2 = try_acquire_cpu_window(91400, 2);
-    assert!(result2.is_err(), "should fail when second CPU is held");
-
-    // 91400 was acquired then dropped (all-or-nothing). Verify
-    // it's available.
-    let reacquire = try_flock(&cpu_400, FlockMode::Exclusive)
-        .unwrap()
-        .expect("CPU 91400 should be released after all-or-nothing");
-    drop(reacquire);
-    drop(holder2);
-}
-
-#[test]
-fn cpu_lock_zero_count() {
-    let result = acquire_cpu_locks(0, 4, None).unwrap();
-    assert!(result.locks.is_empty());
-    assert!(result.cpus.is_empty());
-}
-
-#[test]
-fn cpu_lock_contention_slides_window() {
-    let _cpu_prefix = CpuLockPrefixGuard::new();
-    // Hold CPU at offset 91500, verify next window succeeds
-    // via try_acquire_cpu_window (unit-level sliding test).
-    let holder = try_flock(cpu_lock_path(91500), FlockMode::Exclusive)
-        .unwrap()
-        .unwrap();
-
-    let result = try_acquire_cpu_window(91500, 2);
-    assert!(result.is_err(), "window starting at held CPU should fail");
-
-    let locks = try_acquire_cpu_window(91501, 2).unwrap();
-    assert_eq!(locks.len(), 2);
-
-    drop(locks);
-    drop(holder);
-}
-
-#[test]
-fn cpu_lock_acquire_success() {
-    let result = match acquire_cpu_locks(3, 100, None) {
-        Ok(r) => r,
-        Err(e) if e.downcast_ref::<ResourceContention>().is_some() => {
-            panic!("{e}");
-        }
-        Err(e) => panic!("{e:#}"),
-    };
-    assert_eq!(result.locks.len(), 3);
-    assert_eq!(result.cpus.len(), 3);
-}
-
 /// `pid_window_offset` must diffuse adjacent pids across the
 /// offset space so a batch-spawn (e.g. nextest forking N test
 /// processes back-to-back, common pid range like
@@ -429,7 +356,7 @@ fn pid_window_offset_spreads_adjacent_pids() {
         );
     }
 
-    // Unique-offset count: SipHash13's avalanche makes
+    // Unique-offset count: AHasher's avalanche makes
     // adjacent pid landings independent of each other, so
     // 100 pids over 33 offsets should hit roughly all 33
     // offsets. Pin >= 25 to absorb the natural birthday-
@@ -442,7 +369,7 @@ fn pid_window_offset_spreads_adjacent_pids() {
     // modulo. The "adjacent-pid landings differ by 1"
     // assertion below catches that case: bare modulo gives
     // |offset[i+1] - offset[i]| == 1 always (the cyclic
-    // step), whereas SipHash13 produces a fully randomized
+    // step), whereas AHasher produces a fully randomized
     // step distribution.
     let unique: std::collections::HashSet<_> = offsets.iter().copied().collect();
     assert!(
@@ -456,14 +383,14 @@ fn pid_window_offset_spreads_adjacent_pids() {
     // bare modulo on consecutive pids gives consecutive
     // offsets (gap of exactly 1 modulo max_start). Count how
     // many adjacent pid pairs land at exactly +/-1 offset
-    // (handling the wrap at the boundary). For SipHash13,
+    // (handling the wrap at the boundary). For AHasher,
     // each adjacent pair has a 2/max_start ≈ 6% probability
     // of landing at +/-1 by chance, so over 99 pairs the
     // expected count is ~6 with stddev ~2.4. The bare
     // modulo baseline produces 99/99. Pin <= 30 (well above
     // the random-noise expected value, well below the bare-
     // modulo signature) so a regression that drops the
-    // SipHash mixer trips this without flaking on the
+    // AHasher mixer trips this without flaking on the
     // hashed distribution.
     let adjacent_step_count = offsets
         .windows(2)
@@ -476,7 +403,7 @@ fn pid_window_offset_spreads_adjacent_pids() {
         adjacent_step_count <= 30,
         "{adjacent_step_count} of {} adjacent pid pairs landed at +/-1 offset \
          (max_start={max_start}); the bare `pid % {max_start}` baseline produces \
-         99/99 such pairs. SipHash13 avalanche should give ~6. offsets: {offsets:?}",
+         99/99 such pairs. AHasher avalanche should give ~6. offsets: {offsets:?}",
         offsets.len() - 1,
     );
 
@@ -484,7 +411,7 @@ fn pid_window_offset_spreads_adjacent_pids() {
     // signal that distinguishes "diffused" (gap >> 1) from
     // "adjacent collapse" (gap == 1, the bare `pid % 33`
     // shape that this fix replaces). Compute mean absolute
-    // difference; SipHash13 avalanche should give average
+    // difference; AHasher avalanche should give average
     // gap near `max_start / 3` (uniform random walk on a
     // circular space of size N has expected step `N/3`).
     let gaps: Vec<usize> = offsets
@@ -499,7 +426,7 @@ fn pid_window_offset_spreads_adjacent_pids() {
     assert!(
         mean_gap > 5.0,
         "mean offset gap between adjacent pids = {mean_gap:.2}, expected > 5 \
-         (the bare `pid % {max_start}` baseline produces gap = 1; SipHash13 \
+         (the bare `pid % {max_start}` baseline produces gap = 1; AHasher \
          avalanche should produce >> 5). offsets: {offsets:?}",
     );
 }
@@ -527,117 +454,6 @@ fn pid_window_offset_max_start_one() {
     for &pid in &[0u32, 1, 100, u32::MAX] {
         assert_eq!(pid_window_offset(pid, 1), 0);
     }
-}
-
-#[test]
-fn cpu_lock_acquire_slides_past_held() {
-    let _cpu_prefix = CpuLockPrefixGuard::new();
-    let cpu0 = cpu_lock_path(0);
-    let holder = try_flock(&cpu0, FlockMode::Exclusive).unwrap().unwrap();
-
-    let result = match acquire_cpu_locks(2, 100, None) {
-        Ok(r) => r,
-        Err(e) if e.downcast_ref::<ResourceContention>().is_some() => {
-            drop(holder);
-            panic!("{e}");
-        }
-        Err(e) => panic!("{e:#}"),
-    };
-    assert_eq!(result.locks.len(), 2);
-    assert_eq!(result.cpus.len(), 2);
-    // The whole point: the acquired window slid PAST the held CPU 0. A
-    // len-only check passes even if production reported a window that
-    // still contained 0 (e.g. an off-by-one slide, or reporting the
-    // probe offset instead of the acquired offset). Pin exclusion +
-    // distinctness.
-    assert!(
-        !result.cpus.contains(&0),
-        "acquired window must exclude the held CPU 0, got {:?}",
-        result.cpus,
-    );
-    assert_ne!(
-        result.cpus[0], result.cpus[1],
-        "the two acquired CPUs must be distinct, got {:?}",
-        result.cpus,
-    );
-
-    drop(result);
-    drop(holder);
-}
-
-#[test]
-fn cpu_lock_acquire_no_windows_fit() {
-    // count > total_host_cpus: loop condition never satisfied,
-    // returns ResourceContention without touching any files.
-    let err = acquire_cpu_locks(2, 0, None).unwrap_err();
-    assert!(
-        err.downcast_ref::<ResourceContention>().is_some(),
-        "error should be ResourceContention: {err}",
-    );
-}
-
-#[test]
-fn cpu_lock_acquire_with_llc_shared() {
-    // Uses per-test lockfile prefixes so the LLC group can sit
-    // at index 0 instead of padding to 92000. The production
-    // `acquire_cpu_locks` path threads through `llc_lock_path`
-    // and `cpu_lock_path`, both of which honor the test-only
-    // prefix overrides.
-    let _prefixes = LockPrefixesGuard::new();
-
-    let topo = HostTopology::new_for_tests(&[((0..100).collect(), 0)]);
-
-    let result = match acquire_cpu_locks(2, 100, Some(&topo)) {
-        Ok(r) => r,
-        Err(e) if e.downcast_ref::<ResourceContention>().is_some() => {
-            panic!("{e}");
-        }
-        Err(e) => panic!("{e:#}"),
-    };
-    assert_eq!(result.locks.len(), 3);
-    assert_eq!(result.cpus.len(), 2);
-
-    // The LLC lock is shared — another shared should coexist.
-    let llc_path = llc_lock_path(0);
-    let shared2 = try_flock(&llc_path, FlockMode::Shared)
-        .unwrap()
-        .expect("second shared LLC should coexist");
-    // Exclusive should fail while shared is held.
-    let excl = try_flock(&llc_path, FlockMode::Exclusive).unwrap();
-    assert!(
-        excl.is_none(),
-        "exclusive LLC should fail while shared is held",
-    );
-
-    drop(shared2);
-    drop(result);
-}
-
-#[test]
-fn cpu_lock_llc_shared_protection() {
-    // Tests acquire_llc_shared_locks directly: verifies shared lock
-    // acquired, shared coexistence, and exclusive blocking.
-    // Uses a per-test lockfile prefix so the LLC group can sit
-    // at index 0 with real CPU ids (no 92100-entry padding).
-    let _llc_prefix = LlcLockPrefixGuard::new();
-    let topo = HostTopology::new_for_tests(&[(vec![91200, 91201], 0)]);
-
-    let cpus = vec![91200usize, 91201];
-    let llc_locks = acquire_llc_shared_locks(&topo, &cpus).unwrap();
-    assert_eq!(llc_locks.len(), 1);
-
-    let llc_path = llc_lock_path(0);
-    let shared2 = try_flock(&llc_path, FlockMode::Shared)
-        .unwrap()
-        .expect("second shared LLC should coexist");
-    let excl = try_flock(&llc_path, FlockMode::Exclusive).unwrap();
-    assert!(
-        excl.is_none(),
-        "exclusive LLC should fail while shared is held",
-    );
-
-    drop(shared2);
-    drop(llc_locks);
 }
 
 /// `acquire_llc_plan` with `cpu_cap: None` reserves exactly 30%

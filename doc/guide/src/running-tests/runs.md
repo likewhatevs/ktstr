@@ -176,10 +176,10 @@ tree copied off a CI host). They do NOT consult
    Per-side filters (`--a-*` / `--b-*`) partition the sidecar pool
    into two sides; shared filters (`--kernel`, `--scheduler`,
    `--project-commit`, `--kernel-commit`, `--run-source`, etc.)
-   pin both sides. The seven slicing dimensions are `kernel`,
+   pin both sides. The eight slicing dimensions are `kernel`,
    `scheduler`, `topology`, `work-type`, `project-commit`,
-   `kernel-commit`, and `run-source`; differing on any subset of
-   them defines the A/B contrast. Per-metric deltas are
+   `kernel-commit`, `run-source`, and `cpu-budget`; differing on
+   any subset of them defines the A/B contrast. Per-metric deltas are
    computed using the unified `MetricDef` registry (polarity,
    absolute and relative thresholds). Output is colored: red for
    regressions, green for improvements. The command exits non-zero
@@ -193,9 +193,10 @@ tree copied off a CI host). They do NOT consult
    cargo ktstr stats
    ```
 
-   Picks the newest subdirectory under `target/ktstr/` by mtime and
-   prints gauntlet analysis, BPF verifier stats, callback profile,
-   and KVM stats.
+   Honors `KTSTR_SIDECAR_DIR` when set (non-empty); otherwise picks
+   the newest subdirectory under `target/ktstr/` by mtime. Prints
+   gauntlet analysis, BPF verifier stats, callback profile, and KVM
+   stats.
 
 6. **Inspect the archived host context** for a specific run:
 

@@ -1087,15 +1087,13 @@ pub(crate) fn drain_bracket_impl(
                 // chain-level proptest / handler-level test surface
                 // is not perturbed by this change.
                 //
-                // `state.io_buf_scratch` is no longer used on the
-                // production path; the vectored helpers write
-                // directly into guest memory via `mem.get_slices`
-                // host pointers, eliminating the kernel→scratch→
-                // guest two-stage memcpy of the legacy path. The
-                // scratch field stays on `BlkWorkerState` because
-                // it is still consumed by the cfg(test) test
-                // wrappers' calls into `handle_read_impl` /
-                // `handle_write_impl`. `data_len` is passed
+                // The vectored helpers write directly into guest
+                // memory via `mem.get_slices` host pointers — no
+                // device-resident IO scratch — eliminating the
+                // kernel→scratch→guest two-stage memcpy of the
+                // legacy path. The cfg(test) wrappers' calls into
+                // `handle_read_impl` / `handle_write_impl` allocate
+                // their own local scratch. `data_len` is passed
                 // already-computed so the helpers don't re-derive
                 // it.
                 match req_type {

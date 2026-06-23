@@ -139,13 +139,16 @@ fn merge_accumulates_totals() {
 /// plus `ScenarioStats` headline fields) must:
 ///   - append every per-cgroup entry into `stats.cgroups` in
 ///     merge order, preserving cardinality;
-///   - pick the worst value of every higher-is-worse
+///   - pick the worst value of every merge-folded higher-is-worse
 ///     `worst_*` field across all merged cgroups;
 ///   - pick the lowest-non-zero value of `worst_page_locality`
-///     and `worst_iterations_per_worker` (0.0 is the unreported
-///     sentinel for both fields, matching the accumulator-pass
+///     (0.0 is the unreported sentinel, matching the accumulator-pass
 ///     convention in `AssertResult::pass().merge(real)`);
 ///   - SUM `total_iterations` across all cgroups, not max it.
+///
+/// (The wake / run-delay distributions and the iteration efficiencies are
+/// no longer merge-folded — they re-pool post-merge; see the `repool_*`
+/// tests.)
 ///
 /// Sibling `merge_scenario_stats_worst_wins_and_iterations_sum`
 /// already covers the 2-cgroup case with headline fields only;
@@ -158,10 +161,8 @@ fn merge_three_cgroups_worst_wins_and_iterations_sum() {
     fn mk(
         worst_spread: f64,
         worst_mig: f64,
-        worst_p99_us: f64,
-        total_iters: u64,
         page_locality: f64,
-        iters_per_worker: f64,
+        total_iters: u64,
         cg_total_iters: u64,
     ) -> AssertResult {
         let cg = CgroupStats {
@@ -169,10 +170,11 @@ fn merge_three_cgroups_worst_wins_and_iterations_sum() {
             page_locality,
             ..CgroupStats::default()
         };
-        // `iters_per_worker` flows into the ScenarioStats roll-up
-        // below; the per-cgroup [`CgroupStats::iterations_per_worker`]
-        // is now method-only and recomputed on read from
-        // `total_iterations / num_workers`.
+        // The wake/run-delay and iteration-efficiency roll-ups are no longer
+        // ScenarioStats fields (they are Distribution / WorstLowest, re-pooled
+        // post-merge); this test now covers only the merge-folded worst-wins
+        // (`worst_spread`, `worst_migration_ratio`, `worst_page_locality`),
+        // `total_iterations`, and the `cgroups.extend` accumulation.
         AssertResult {
             outcomes: vec![],
             passes: vec![],
@@ -180,9 +182,7 @@ fn merge_three_cgroups_worst_wins_and_iterations_sum() {
                 total_iterations: total_iters,
                 worst_spread,
                 worst_migration_ratio: worst_mig,
-                worst_p99_wake_latency_us: worst_p99_us,
                 worst_page_locality: page_locality,
-                worst_iterations_per_worker: Some(iters_per_worker),
                 cgroups: vec![cg],
                 ..ScenarioStats::default()
             },
@@ -196,9 +196,9 @@ fn merge_three_cgroups_worst_wins_and_iterations_sum() {
     // cgroup — a regression that folded only within-cgroup
     // would still produce a plausible-looking aggregate on a
     // 2-cgroup test but would fail here.
-    let mut acc = mk(10.0, 0.1, 50.0, 100, 0.8, 300.0, 100);
-    acc.merge(mk(5.0, 0.3, 20.0, 200, 0.5, 150.0, 200));
-    acc.merge(mk(20.0, 0.2, 70.0, 400, 0.9, 500.0, 400));
+    let mut acc = mk(10.0, 0.1, 0.8, 100, 100);
+    acc.merge(mk(5.0, 0.3, 0.5, 200, 200));
+    acc.merge(mk(20.0, 0.2, 0.9, 400, 400));
 
     let s = &acc.stats;
     assert_eq!(
@@ -214,23 +214,11 @@ fn merge_three_cgroups_worst_wins_and_iterations_sum() {
     // Worst-wins across 3 cgroups (higher-is-worse):
     assert_eq!(s.worst_spread, 20.0, "third cgroup's 20.0 is worst");
     assert_eq!(s.worst_migration_ratio, 0.3, "second cgroup's 0.3 is worst");
-    assert_eq!(
-        s.worst_p99_wake_latency_us, 70.0,
-        "third cgroup's 70.0us p99 is worst",
-    );
-    // Lower-is-worse rollups across 3 cgroups (every value is
-    // strictly positive so the sentinel/None branches are never
-    // taken). `worst_page_locality` uses `fold_lowest_nonzero`;
-    // `worst_iterations_per_worker` uses the None-aware
-    // `fold_lowest_some`:
+    // Lower-is-worse rollup (`worst_page_locality`, `fold_lowest_nonzero`):
+    // every value is strictly positive so the 0-sentinel branch never wins.
     assert_eq!(
         s.worst_page_locality, 0.5,
         "second cgroup's 0.5 is the lowest-non-zero — 0 sentinel never wins",
-    );
-    assert_eq!(
-        s.worst_iterations_per_worker,
-        Some(150.0),
-        "second cgroup's 150 is the lowest per-worker throughput",
     );
     // total_iterations SUMS across cgroups, not maxes:
     assert_eq!(
@@ -269,101 +257,448 @@ fn iterations_per_worker_distinguishes_no_workers_from_ran_zero() {
 }
 
 #[test]
-fn merge_worst_iterations_per_worker_lets_measured_zero_win() {
-    // The regression this pins: a cgroup that ran zero iterations
-    // (Some(0.0)) is the worst possible per-worker throughput and MUST
-    // win the "lowest" bucket. The old `fold_lowest_nonzero` treated
-    // 0.0 as an unreported sentinel and discarded it, hiding the
-    // starved cgroup behind a healthier one's reading.
-    fn with_worst(v: Option<f64>) -> AssertResult {
-        AssertResult {
-            outcomes: vec![],
-            passes: vec![],
-            stats: ScenarioStats {
-                worst_iterations_per_worker: v,
-                ..ScenarioStats::default()
-            },
-            measurements: std::collections::BTreeMap::new(),
-            info_notes: vec![],
-        }
+fn repool_worst_iterations_per_worker_lets_measured_zero_win() {
+    // A cgroup that ran zero iterations (per-cgroup Some(0.0)) is the worst
+    // per-worker throughput and MUST win the lowest bucket; a later healthy
+    // reading does not displace it. `populate_run_distribution_metrics`
+    // selects lowest-wins None-aware over the per-cgroup
+    // `iterations_per_worker()` — the semantic the deleted cross-cgroup
+    // `fold_lowest_some` carried.
+    fn cg(num_workers: usize, total_iterations: u64) -> AssertResult {
+        let mut r = AssertResult::pass();
+        r.stats.cgroups = vec![CgroupStats {
+            num_workers,
+            total_iterations,
+            ..CgroupStats::default()
+        }];
+        r
     }
-
-    // Accumulator starts None (Default).
     let mut acc = AssertResult::pass();
-    assert_eq!(acc.stats.worst_iterations_per_worker, None);
-
-    // Fold a healthy reading, then a measured zero: the zero wins.
-    acc.merge(with_worst(Some(100.0)));
-    acc.merge(with_worst(Some(0.0)));
+    acc.merge(cg(1, 100)); // iterations_per_worker == 100.0
+    acc.merge(cg(4, 0)); // iterations_per_worker == Some(0.0) (ran zero)
+    acc.merge(cg(1, 250)); // iterations_per_worker == 250.0
+    populate_run_distribution_metrics(&mut acc.stats);
     assert_eq!(
-        acc.stats.worst_iterations_per_worker,
+        acc.stats
+            .ext_metrics
+            .get("worst_iterations_per_worker")
+            .copied(),
         Some(0.0),
         "a cgroup that ran zero iterations must win the worst bucket",
     );
-
-    // A later healthy reading does not displace the worst zero.
-    acc.merge(with_worst(Some(250.0)));
-    assert_eq!(acc.stats.worst_iterations_per_worker, Some(0.0));
 }
 
 #[test]
-fn merge_worst_iterations_per_worker_skips_no_data() {
-    // None contributors (cgroups with no workers) are skipped, never
-    // treated as zero — they must not displace a real reading nor
-    // fabricate a Some(0.0).
-    fn with_worst(v: Option<f64>) -> AssertResult {
-        AssertResult {
-            outcomes: vec![],
-            passes: vec![],
-            stats: ScenarioStats {
-                worst_iterations_per_worker: v,
-                ..ScenarioStats::default()
-            },
-            measurements: std::collections::BTreeMap::new(),
-            info_notes: vec![],
-        }
+fn repool_worst_iterations_per_worker_skips_no_data() {
+    // No-worker cgroups (num_workers == 0 → iterations_per_worker() None) are
+    // skipped, never treated as zero: an all-None cohort writes NO key
+    // (absence preserved, distinct from a measured 0.0), and a None never
+    // displaces a real reading.
+    fn cg(num_workers: usize, total_iterations: u64) -> AssertResult {
+        let mut r = AssertResult::pass();
+        r.stats.cgroups = vec![CgroupStats {
+            num_workers,
+            total_iterations,
+            ..CgroupStats::default()
+        }];
+        r
     }
-
-    // Only None folded in → stays None (no data, not a zero).
     let mut acc = AssertResult::pass();
-    acc.merge(with_worst(None));
-    acc.merge(with_worst(None));
-    assert_eq!(acc.stats.worst_iterations_per_worker, None);
+    acc.merge(cg(0, 0));
+    acc.merge(cg(0, 0));
+    populate_run_distribution_metrics(&mut acc.stats);
+    assert_eq!(
+        acc.stats.ext_metrics.get("worst_iterations_per_worker"),
+        None,
+        "all-None cohort must write no key (absence != measured 0.0)",
+    );
 
-    // None does not displace a real reading.
-    acc.merge(with_worst(Some(75.0)));
-    acc.merge(with_worst(None));
-    assert_eq!(acc.stats.worst_iterations_per_worker, Some(75.0));
+    let mut acc2 = AssertResult::pass();
+    acc2.merge(cg(1, 75)); // Some(75.0)
+    acc2.merge(cg(0, 0)); // None, skipped
+    populate_run_distribution_metrics(&mut acc2.stats);
+    assert_eq!(
+        acc2.stats
+            .ext_metrics
+            .get("worst_iterations_per_worker")
+            .copied(),
+        Some(75.0),
+        "a None contributor must not displace a real reading",
+    );
+}
+
+#[test]
+fn repool_worst_iterations_per_cpu_sec_lowest_wins_none_aware() {
+    // worst_iterations_per_cpu_sec (overcommit-invariant efficiency) uses the
+    // same lowest-wins None-aware re-pool: the least-efficient cgroup wins, a
+    // measured Some(0.0) beats a healthy reading, and None (no workers or no
+    // on-CPU time) is skipped, never fabricated as zero.
+    fn cg(num_workers: usize, total_iterations: u64, cpu_ns: u64) -> AssertResult {
+        let mut r = AssertResult::pass();
+        r.stats.cgroups = vec![CgroupStats {
+            num_workers,
+            total_iterations,
+            total_cpu_time_ns: cpu_ns,
+            ..CgroupStats::default()
+        }];
+        r
+    }
+    let mut acc = AssertResult::pass();
+    acc.merge(cg(0, 0, 0)); // None (no workers / no on-CPU time), skipped
+    acc.merge(cg(1, 900, 1_000_000_000)); // 900 / 1.0s == 900.0
+    acc.merge(cg(1, 0, 1_000_000_000)); // 0 / 1.0s == Some(0.0), worst
+    acc.merge(cg(1, 1500, 1_000_000_000)); // 1500.0, does not displace 0.0
+    populate_run_distribution_metrics(&mut acc.stats);
+    assert_eq!(
+        acc.stats
+            .ext_metrics
+            .get("worst_iterations_per_cpu_sec")
+            .copied(),
+        Some(0.0),
+        "least-efficient cgroup (measured 0.0) wins; None skipped",
+    );
+}
+
+/// The POOLED `iterations_per_cpu_sec` Rate (the cross-cgroup re-pool) is
+/// Σiterations / Σcpu-seconds across cgroups — NOT a mean of per-cgroup
+/// ratios, NOT the worst single cgroup. Unequal per-cgroup cpu-time makes
+/// the three distinct: re-pool 101.0 vs mean-of-ratios ~500.6 vs worst ~1.11
+/// (the value the rejected merge-fold route would wrongly produce). The new
+/// pooled metric must NOT mutate the existing worst_iterations_per_cpu_sec
+/// (the min-fold starvation selector).
+#[test]
+fn populate_run_pooled_iterations_per_cpu_sec_repools_across_cgroups() {
+    // cg1: 1000 iters over 1.0 cpu-s -> 1000/cpu-s.
+    let cg1 = CgroupStats {
+        total_iterations: 1000,
+        total_cpu_time_ns: 1_000_000_000,
+        num_workers: 1,
+        ..CgroupStats::default()
+    };
+    // cg2: 10 iters over 9.0 cpu-s -> ~1.11/cpu-s.
+    let cg2 = CgroupStats {
+        total_iterations: 10,
+        total_cpu_time_ns: 9_000_000_000,
+        num_workers: 1,
+        ..CgroupStats::default()
+    };
+    let stats_for = |cg: &CgroupStats| ScenarioStats {
+        total_iterations: cg.total_iterations,
+        cgroups: vec![cg.clone()],
+        ..ScenarioStats::default()
+    };
+    let mk = |cg: &CgroupStats| AssertResult {
+        outcomes: vec![],
+        passes: vec![],
+        stats: stats_for(cg),
+        measurements: std::collections::BTreeMap::new(),
+        info_notes: vec![],
+    };
+    let mut acc = mk(&cg1);
+    acc.merge(mk(&cg2));
+    populate_run_pooled_iterations_per_cpu_sec(&mut acc.stats);
+
+    // Σiters / Σcpu-s = (1000 + 10) / ((1e9 + 9e9)/1e9) = 1010 / 10.0 = 101.0.
+    assert_eq!(
+        acc.stats.ext_metrics.get("iterations_per_cpu_sec").copied(),
+        Some(101.0),
+        "pooled rate must be Σiters/Σcpu-s = 101.0, NOT mean-of-ratios \
+         (~500.6) or the worst cgroup (~1.11); got {:?}",
+        acc.stats.ext_metrics.get("iterations_per_cpu_sec"),
+    );
+    // BOTH cgroups have measured cpu-time, so the ext-only pooled numerator
+    // equals the merge-summed typed total_iterations (both Σ over all
+    // cgroups). They diverge only when a zero-cpu-time cgroup is excluded from
+    // the pooled sum — see populate_run_pooled_..._excludes_zero_cpu_cgroup.
+    assert_eq!(acc.stats.total_iterations, 1010);
+    assert_eq!(
+        acc.stats
+            .ext_metrics
+            .get("total_iterations_pooled")
+            .copied(),
+        Some(acc.stats.total_iterations as f64),
+        "total_iterations_pooled must equal the merge-summed typed total_iterations \
+         when every cgroup is measured",
+    );
+    // The WorstLowest worst_iterations_per_cpu_sec (lowest-wins starvation
+    // selector) is DISTINCT from the pooled rate: re-pooled separately by
+    // populate_run_distribution_metrics, the lower per-cgroup rate (cg2's
+    // 10/9) wins. The pooled iterations_per_cpu_sec Rate above is unaffected.
+    populate_run_distribution_metrics(&mut acc.stats);
+    let worst = acc
+        .stats
+        .ext_metrics
+        .get("worst_iterations_per_cpu_sec")
+        .copied()
+        .expect("worst_iterations_per_cpu_sec present in ext_metrics");
+    assert!(
+        (worst - 10.0 / 9.0).abs() < 1e-9,
+        "worst_iterations_per_cpu_sec stays the lowest-wins selector (~1.11), \
+         distinct from the pooled rate; got {worst}",
+    );
+}
+
+/// Host-only / no-schedstat run: every cgroup reports zero on-CPU time, so
+/// the pooled rate is undefined. The helper inserts NEITHER component
+/// (both-or-neither) so no rate derives — matching
+/// `CgroupStats::iterations_per_cpu_sec`'s None-on-zero.
+#[test]
+fn populate_run_pooled_iterations_per_cpu_sec_absent_on_zero_cpu_time() {
+    let cg = CgroupStats {
+        total_iterations: 500,
+        total_cpu_time_ns: 0,
+        num_workers: 1,
+        ..CgroupStats::default()
+    };
+    let mut acc = AssertResult {
+        outcomes: vec![],
+        passes: vec![],
+        stats: ScenarioStats {
+            total_iterations: cg.total_iterations,
+            cgroups: vec![cg],
+            ..ScenarioStats::default()
+        },
+        measurements: std::collections::BTreeMap::new(),
+        info_notes: vec![],
+    };
+    populate_run_pooled_iterations_per_cpu_sec(&mut acc.stats);
+    assert!(
+        !acc.stats.ext_metrics.contains_key("iterations_per_cpu_sec"),
+        "no pooled rate when Σcpu-time is 0",
+    );
+    assert!(
+        !acc.stats.ext_metrics.contains_key("total_cpu_time_sec")
+            && !acc
+                .stats
+                .ext_metrics
+                .contains_key("total_iterations_pooled"),
+        "both-or-neither: neither component inserted when Σcpu-time is 0",
+    );
+}
+
+/// Mixed run: one cgroup has iterations but ZERO measured cpu-time (schedstat
+/// gap), the other has both. The zero-cpu cgroup is EXCLUDED from BOTH pooled
+/// sums (mirroring the per-cgroup None-on-zero) — its iterations are NOT
+/// credited against the measured cgroup's cpu-seconds, which would inflate the
+/// cohort efficiency. So the pooled rate is the measured cgroup's rate, and
+/// total_iterations_pooled (measured only) is strictly LESS than the
+/// merge-summed typed total_iterations (which includes both).
+#[test]
+fn populate_run_pooled_iterations_per_cpu_sec_excludes_zero_cpu_cgroup() {
+    // Unmeasured: 500 iters, 0 cpu-time (schedstat unavailable).
+    let unmeasured = CgroupStats {
+        total_iterations: 500,
+        total_cpu_time_ns: 0,
+        num_workers: 1,
+        ..CgroupStats::default()
+    };
+    // Measured: 1000 iters over 1.0 cpu-s -> 1000/cpu-s.
+    let measured = CgroupStats {
+        total_iterations: 1000,
+        total_cpu_time_ns: 1_000_000_000,
+        num_workers: 1,
+        ..CgroupStats::default()
+    };
+    let mk = |cg: &CgroupStats| AssertResult {
+        outcomes: vec![],
+        passes: vec![],
+        stats: ScenarioStats {
+            total_iterations: cg.total_iterations,
+            cgroups: vec![cg.clone()],
+            ..ScenarioStats::default()
+        },
+        measurements: std::collections::BTreeMap::new(),
+        info_notes: vec![],
+    };
+    let mut acc = mk(&unmeasured);
+    acc.merge(mk(&measured));
+    populate_run_pooled_iterations_per_cpu_sec(&mut acc.stats);
+
+    // Pooled rate excludes the zero-cpu cgroup: 1000 / 1.0 == 1000.0, NOT
+    // (500 + 1000) / 1.0 == 1500.0 (which would credit un-costed iters).
+    assert_eq!(
+        acc.stats.ext_metrics.get("iterations_per_cpu_sec").copied(),
+        Some(1000.0),
+        "zero-cpu cgroup's iters must NOT inflate the pooled rate; got {:?}",
+        acc.stats.ext_metrics.get("iterations_per_cpu_sec"),
+    );
+    // The pooled numerator counts only the measured cgroup (1000) and is
+    // strictly LESS than the merge-summed typed total_iterations (1500).
+    assert_eq!(
+        acc.stats
+            .ext_metrics
+            .get("total_iterations_pooled")
+            .copied(),
+        Some(1000.0),
+    );
+    assert_eq!(acc.stats.total_iterations, 1500);
+}
+
+/// Single measured cgroup: the pooled rate is exactly that cgroup's per-cgroup
+/// rate (degenerate Σ over one element).
+#[test]
+fn populate_run_pooled_iterations_per_cpu_sec_single_cgroup() {
+    let cg = CgroupStats {
+        total_iterations: 750,
+        total_cpu_time_ns: 3_000_000_000,
+        num_workers: 1,
+        ..CgroupStats::default()
+    };
+    let mut acc = AssertResult {
+        outcomes: vec![],
+        passes: vec![],
+        stats: ScenarioStats {
+            total_iterations: cg.total_iterations,
+            cgroups: vec![cg.clone()],
+            ..ScenarioStats::default()
+        },
+        measurements: std::collections::BTreeMap::new(),
+        info_notes: vec![],
+    };
+    populate_run_pooled_iterations_per_cpu_sec(&mut acc.stats);
+    // 750 / 3.0 == 250.0 == the per-cgroup rate.
+    assert_eq!(
+        acc.stats.ext_metrics.get("iterations_per_cpu_sec").copied(),
+        cg.iterations_per_cpu_sec(),
+    );
+    assert_eq!(
+        acc.stats.ext_metrics.get("iterations_per_cpu_sec").copied(),
+        Some(250.0),
+    );
+}
+
+/// Empty cgroups vec: nothing to pool, no keys inserted (both-or-neither).
+#[test]
+fn populate_run_pooled_iterations_per_cpu_sec_empty_cgroups() {
+    let mut stats = ScenarioStats::default();
+    populate_run_pooled_iterations_per_cpu_sec(&mut stats);
+    assert!(
+        stats.ext_metrics.is_empty(),
+        "no components inserted for an empty cgroups vec",
+    );
+}
+
+/// Costed-yet-idle cgroup INCLUDED in both sums (the symmetric counterpart of
+/// excludes_zero_cpu_cgroup): a cgroup with measured cpu-time but ZERO
+/// iterations (a stalled/spinning worker that burned CPU doing no work). The
+/// filter gates on total_cpu_time_ns > 0 (NOT on iterations), so this cgroup IS
+/// included — its CPU adds to the denominator and its 0 iters add nothing to
+/// the numerator, correctly diluting the cohort rate downward (burning CPU with
+/// no work IS less efficient).
+#[test]
+fn populate_run_pooled_iterations_per_cpu_sec_includes_costed_idle_cgroup() {
+    // Costed but idle: 0 iters over 2.0 cpu-s.
+    let idle = CgroupStats {
+        total_iterations: 0,
+        total_cpu_time_ns: 2_000_000_000,
+        num_workers: 1,
+        ..CgroupStats::default()
+    };
+    // Productive: 1000 iters over 1.0 cpu-s.
+    let busy = CgroupStats {
+        total_iterations: 1000,
+        total_cpu_time_ns: 1_000_000_000,
+        num_workers: 1,
+        ..CgroupStats::default()
+    };
+    let mk = |cg: &CgroupStats| AssertResult {
+        outcomes: vec![],
+        passes: vec![],
+        stats: ScenarioStats {
+            total_iterations: cg.total_iterations,
+            cgroups: vec![cg.clone()],
+            ..ScenarioStats::default()
+        },
+        measurements: std::collections::BTreeMap::new(),
+        info_notes: vec![],
+    };
+    let mut acc = mk(&idle);
+    acc.merge(mk(&busy));
+    populate_run_pooled_iterations_per_cpu_sec(&mut acc.stats);
+
+    // The idle cgroup's CPU MUST count: rate = 1000 / ((2e9+1e9)/1e9) = 1000/3.0
+    // == ~333.33, NOT 1000/1.0 == 1000 (which would ignore the wasted CPU).
+    let rate = acc
+        .stats
+        .ext_metrics
+        .get("iterations_per_cpu_sec")
+        .copied()
+        .expect("pooled rate present");
+    assert!(
+        (rate - 1000.0 / 3.0).abs() < 1e-9,
+        "costed-idle cgroup's CPU must dilute the rate to ~333.33, not 1000; got {rate}",
+    );
+    // Numerator = 0 + 1000; denominator counts the idle cgroup's 2.0s too.
+    assert_eq!(
+        acc.stats
+            .ext_metrics
+            .get("total_iterations_pooled")
+            .copied(),
+        Some(1000.0),
+    );
+    assert_eq!(
+        acc.stats.ext_metrics.get("total_cpu_time_sec").copied(),
+        Some(3.0),
+    );
+}
+
+/// Tiny-denominator finite-quotient guard: a cgroup with total_cpu_time_ns=1
+/// (total_cpu_time_sec = 1e-9) and a large iteration count yields a
+/// finite-but-enormous rate (~1e12). derive_rate_metrics_from's finite guard
+/// KEEPS it — an absent rate is reserved for a zero or non-finite denominator,
+/// not a tiny one — and the pooled wrapper feeds that same guard. (u64-summed
+/// ns cannot overflow within centuries, so no overflow case is reachable.)
+#[test]
+fn populate_run_pooled_iterations_per_cpu_sec_tiny_denominator_stays_finite() {
+    let cg = CgroupStats {
+        total_iterations: 1000,
+        total_cpu_time_ns: 1,
+        num_workers: 1,
+        ..CgroupStats::default()
+    };
+    let mut acc = AssertResult {
+        outcomes: vec![],
+        passes: vec![],
+        stats: ScenarioStats {
+            total_iterations: cg.total_iterations,
+            cgroups: vec![cg],
+            ..ScenarioStats::default()
+        },
+        measurements: std::collections::BTreeMap::new(),
+        info_notes: vec![],
+    };
+    populate_run_pooled_iterations_per_cpu_sec(&mut acc.stats);
+    let rate = acc
+        .stats
+        .ext_metrics
+        .get("iterations_per_cpu_sec")
+        .copied()
+        .expect("tiny-denom rate present (finite, not dropped)");
+    assert!(
+        rate.is_finite() && rate > 0.0,
+        "tiny-denom rate must be finite-but-enormous (~1e12), not inf/absent; got {rate}",
+    );
 }
 
 #[test]
 fn merge_scenario_stats_worst_wins_and_iterations_sum() {
-    // Aggregates-across-cgroups contract: every `worst_*` field on
-    // ScenarioStats takes the larger value between the two cgroups,
-    // and `total_iterations` sums. Exercises fields that are not
-    // covered by the narrower merge_takes_worst_* tests: the wake-
-    // latency trio, the run-delay pair, the migration ratio, and
-    // the cross-node migration ratio.
+    // Aggregates-across-cgroups contract for the MERGE-FOLDED worst-wins
+    // fields: each takes the larger value (higher-is-worse max) and
+    // `total_iterations` sums. The wake-latency / run-delay roll-ups and the
+    // wake-latency tail ratio are no longer merge-folded (they are derived
+    // `MetricKind`s re-pooled post-merge — see the `repool_*` tests); this
+    // covers `worst_spread`, `worst_migration_ratio`, and
+    // `worst_cross_node_migration_ratio`.
     let mut a = AssertResult::pass();
     a.stats.total_iterations = 100;
     a.stats.worst_spread = 5.0;
     a.stats.worst_migration_ratio = 0.1;
-    a.stats.worst_p99_wake_latency_us = 20.0;
-    a.stats.worst_median_wake_latency_us = 10.0;
-    a.stats.worst_wake_latency_cv = 0.2;
-    a.stats.worst_run_delay_us = 50.0;
-    a.stats.worst_mean_run_delay_us = 30.0;
     a.stats.worst_cross_node_migration_ratio = 0.05;
 
     let mut b = AssertResult::pass();
     b.stats.total_iterations = 400;
     b.stats.worst_spread = 15.0;
     b.stats.worst_migration_ratio = 0.4;
-    b.stats.worst_p99_wake_latency_us = 80.0;
-    b.stats.worst_median_wake_latency_us = 40.0;
-    b.stats.worst_wake_latency_cv = 0.5;
-    b.stats.worst_run_delay_us = 120.0;
-    b.stats.worst_mean_run_delay_us = 90.0;
     b.stats.worst_cross_node_migration_ratio = 0.25;
 
     a.merge(b);
@@ -371,140 +706,23 @@ fn merge_scenario_stats_worst_wins_and_iterations_sum() {
     assert_eq!(a.stats.total_iterations, 500);
     assert_eq!(a.stats.worst_spread, 15.0);
     assert_eq!(a.stats.worst_migration_ratio, 0.4);
-    assert_eq!(a.stats.worst_p99_wake_latency_us, 80.0);
-    assert_eq!(a.stats.worst_median_wake_latency_us, 40.0);
-    assert_eq!(a.stats.worst_wake_latency_cv, 0.5);
-    assert_eq!(a.stats.worst_run_delay_us, 120.0);
-    assert_eq!(a.stats.worst_mean_run_delay_us, 90.0);
     assert_eq!(a.stats.worst_cross_node_migration_ratio, 0.25);
-}
-
-/// `ScenarioStats::merge` rolls up the new derived-ratio fields
-/// across cgroups with opposite polarities: `worst_wake_latency_tail_ratio`
-/// is higher-is-worse (max), `worst_iterations_per_worker` is
-/// lower-is-worse (`fold_lowest_nonzero` — 0.0 is the unreported
-/// sentinel matching the accumulator-pass convention; the
-/// `AssertResult::pass().merge(real)` pattern relies on a
-/// positive `other` overriding `self`'s default-zero rather
-/// than being masked by it).  A regression that merged either
-/// with the wrong polarity would surface a regression as an
-/// improvement or vice versa — exactly the kind of sign-flip
-/// that would silently break `stats compare`.
-#[test]
-fn merge_derived_ratios_use_correct_polarities() {
-    let mut a = AssertResult::pass();
-    a.stats.worst_wake_latency_tail_ratio = 2.0;
-    a.stats.worst_iterations_per_worker = Some(500.0);
-
-    let mut b = AssertResult::pass();
-    b.stats.worst_wake_latency_tail_ratio = 8.0;
-    b.stats.worst_iterations_per_worker = Some(100.0);
-
-    a.merge(b);
-
-    assert_eq!(
-        a.stats.worst_wake_latency_tail_ratio, 8.0,
-        "tail ratio uses max — 8.0 is worse than 2.0 (more \
-         amplification); got {}",
-        a.stats.worst_wake_latency_tail_ratio,
-    );
-    assert_eq!(
-        a.stats.worst_iterations_per_worker,
-        Some(100.0),
-        "iterations_per_worker uses lowest — 100.0 is worse than \
-         500.0 (less throughput per worker); got {:?}",
-        a.stats.worst_iterations_per_worker,
-    );
-
-    // No-data convention, direction 1: a `None` reading on `other`
-    // (no cgroup reported a worker) MUST NOT clobber self's real
-    // measurement. `fold_lowest_some` skips None contributors.
-    let mut c = AssertResult::pass();
-    c.stats.worst_iterations_per_worker = Some(300.0);
-    let mut empty = AssertResult::pass();
-    empty.stats.worst_iterations_per_worker = None;
-    c.merge(empty);
-    assert_eq!(
-        c.stats.worst_iterations_per_worker,
-        Some(300.0),
-        "self=Some(300) must be retained when other=None (no data); \
-         got {:?}",
-        c.stats.worst_iterations_per_worker,
-    );
-
-    // No-data convention, direction 2: `self` starts at None (the
-    // accumulator default from `AssertResult::pass()`) and `other`
-    // reports a real reading. self must adopt other's measurement;
-    // this is the load-bearing case for
-    // `AssertResult::pass().merge(real)`.
-    let mut d = AssertResult::pass();
-    assert_eq!(
-        d.stats.worst_iterations_per_worker, None,
-        "accumulator default must be None",
-    );
-    let mut real = AssertResult::pass();
-    real.stats.worst_iterations_per_worker = Some(300.0);
-    d.merge(real);
-    assert_eq!(
-        d.stats.worst_iterations_per_worker,
-        Some(300.0),
-        "self=None (accumulator default) must adopt other=Some(300) \
-         — the `AssertResult::pass().merge(real)` pattern depends \
-         on this; got {:?}",
-        d.stats.worst_iterations_per_worker,
-    );
-
-    // Both-None: no data on either side stays None. A measured
-    // Some(0.0) winning the bucket is covered separately by
-    // `merge_worst_iterations_per_worker_lets_measured_zero_win`.
-    let mut e = AssertResult::pass();
-    e.stats.worst_iterations_per_worker = None;
-    let mut f = AssertResult::pass();
-    f.stats.worst_iterations_per_worker = None;
-    e.merge(f);
-    assert_eq!(
-        e.stats.worst_iterations_per_worker, None,
-        "both-None must stay None; got {:?}",
-        e.stats.worst_iterations_per_worker,
-    );
-
-    // Tail-ratio polarity, reverse direction: when `self`
-    // starts at the higher value and `other` is smaller,
-    // `self` must retain its larger worst. Pair with the
-    // forward direction above (self=2, other=8 → 8) so both
-    // branches of the `.max()` are pinned — otherwise a
-    // regression that silently flipped to `.min()` would
-    // pass the forward-direction assertion and surface
-    // only here.
-    let mut g = AssertResult::pass();
-    g.stats.worst_wake_latency_tail_ratio = 8.0;
-    let mut h = AssertResult::pass();
-    h.stats.worst_wake_latency_tail_ratio = 2.0;
-    g.merge(h);
-    assert_eq!(
-        g.stats.worst_wake_latency_tail_ratio, 8.0,
-        "tail_ratio uses max: self=8.0, other=2.0 → self \
-         retains 8.0 (higher is worse); got {}",
-        g.stats.worst_wake_latency_tail_ratio,
-    );
 }
 
 #[test]
 fn merge_scenario_stats_worst_wins_when_other_is_smaller() {
     // Symmetric case: when `other` reports smaller values, `self`
-    // retains its larger worst. Covers the "self wins" branch of
-    // every scalar worst-comparison in merge (9 fields total:
-    // 8 `.max()` calls + the coupled `worst_gap_ms` guard).
+    // retains its larger worst. Covers the "self wins" branch of the
+    // merge-folded scalar worst-comparisons: worst_spread,
+    // worst_migration_ratio, worst_cross_node_migration_ratio (all `.max()`)
+    // and the coupled worst_gap_ms/cpu guard. (Wake-latency / run-delay
+    // roll-ups and the wake-latency tail ratio moved to the post-merge
+    // re-pool — see the repool_* tests.)
     let mut a = AssertResult::pass();
     a.stats.worst_spread = 30.0;
     a.stats.worst_gap_ms = 500;
     a.stats.worst_gap_cpu = 7;
     a.stats.worst_migration_ratio = 0.9;
-    a.stats.worst_p99_wake_latency_us = 100.0;
-    a.stats.worst_median_wake_latency_us = 60.0;
-    a.stats.worst_wake_latency_cv = 0.7;
-    a.stats.worst_run_delay_us = 300.0;
-    a.stats.worst_mean_run_delay_us = 200.0;
     a.stats.worst_cross_node_migration_ratio = 0.35;
     a.stats.total_iterations = 500;
 
@@ -513,11 +731,6 @@ fn merge_scenario_stats_worst_wins_when_other_is_smaller() {
     b.stats.worst_gap_ms = 100;
     b.stats.worst_gap_cpu = 3;
     b.stats.worst_migration_ratio = 0.1;
-    b.stats.worst_p99_wake_latency_us = 10.0;
-    b.stats.worst_median_wake_latency_us = 5.0;
-    b.stats.worst_wake_latency_cv = 0.1;
-    b.stats.worst_run_delay_us = 40.0;
-    b.stats.worst_mean_run_delay_us = 20.0;
     b.stats.worst_cross_node_migration_ratio = 0.05;
     b.stats.total_iterations = 50;
 
@@ -529,11 +742,6 @@ fn merge_scenario_stats_worst_wins_when_other_is_smaller() {
     // index when `self` wins on `worst_gap_ms`.
     assert_eq!(a.stats.worst_gap_cpu, 7);
     assert_eq!(a.stats.worst_migration_ratio, 0.9);
-    assert_eq!(a.stats.worst_p99_wake_latency_us, 100.0);
-    assert_eq!(a.stats.worst_median_wake_latency_us, 60.0);
-    assert_eq!(a.stats.worst_wake_latency_cv, 0.7);
-    assert_eq!(a.stats.worst_run_delay_us, 300.0);
-    assert_eq!(a.stats.worst_mean_run_delay_us, 200.0);
     assert_eq!(a.stats.worst_cross_node_migration_ratio, 0.35);
     // Totals always sum, independent of worst-wins direction.
     assert_eq!(a.stats.total_iterations, 550);
@@ -848,6 +1056,7 @@ fn phase_bucket(
     metrics: &[(&str, f64)],
 ) -> PhaseBucket {
     PhaseBucket {
+        per_cgroup: Default::default(),
         step_index,
         label: label.to_string(),
         start_ms,
@@ -912,6 +1121,207 @@ fn assert_result_merge_per_phase_peak_takes_max() {
     )];
     a.merge(b);
     assert_eq!(a.stats.phases[0].metrics["worst_gap_ms"], 12.0);
+}
+
+#[test]
+fn assert_result_merge_per_phase_per_cgroup_unions_and_folds() {
+    use crate::assert::PhaseCgroupStats;
+    use std::collections::BTreeSet;
+    // Two same-step buckets. cg_0 is shared — its RAW components FOLD by class:
+    // sample Vecs (latencies/run_delays/off_cpu_pcts) CONCAT, cpus_used UNIONs,
+    // genuine counters (num_workers, migrations, iterations, cpu time, numa
+    // pages, wake_sample_total) SUM — num_workers included, because two carriers
+    // for one cgroup name are per-handle subsets covering DISJOINT workers — and
+    // the one Peak cross_node_migrated [system-wide vmstat delta] takes MAX while
+    // the coupled gap takes ARGMAX. cg_x (shared) pins not-measured (empty
+    // off_cpu_pcts) UNION measured. cg_a/cg_b are one-sided and carried verbatim
+    // BY VALUE. Pins the per_cgroup union in merge_matched_phase_buckets.
+    let mut a = AssertResult::pass();
+    let mut a_bucket = phase_bucket(1, "Step[0]", 0, 100, 5, &[]);
+    a_bucket.per_cgroup.insert(
+        "cg_0".to_string(),
+        PhaseCgroupStats {
+            num_workers: 4,
+            cpus_used: BTreeSet::from([0, 1]),
+            wake_latencies_ns: vec![10, 20],
+            wake_sample_total: 2,
+            run_delays_ns: vec![1_000],
+            off_cpu_pcts: vec![5.0, 20.0],
+            total_migrations: 3,
+            total_iterations: 100,
+            total_cpu_time_ns: 1_000,
+            numa_pages_local: 90,
+            numa_pages_total: 100,
+            cross_node_migrated: 100,
+            max_gap_ms: 7,
+            max_gap_cpu: 3,
+            stripped: false,
+        },
+    );
+    a_bucket.per_cgroup.insert(
+        "cg_x".to_string(),
+        PhaseCgroupStats {
+            off_cpu_pcts: vec![], // not measured on a's side
+            ..Default::default()
+        },
+    );
+    a_bucket.per_cgroup.insert(
+        "cg_a".to_string(),
+        PhaseCgroupStats {
+            num_workers: 1,
+            ..Default::default()
+        },
+    );
+    a.stats.phases = vec![a_bucket];
+
+    let mut b = AssertResult::pass();
+    let mut b_bucket = phase_bucket(1, "Step[0]", 0, 100, 5, &[]);
+    b_bucket.per_cgroup.insert(
+        "cg_0".to_string(),
+        PhaseCgroupStats {
+            num_workers: 4,
+            cpus_used: BTreeSet::from([1, 2]),
+            wake_latencies_ns: vec![30],
+            wake_sample_total: 1,
+            run_delays_ns: vec![2_000, 3_000],
+            off_cpu_pcts: vec![3.0, 15.0],
+            total_migrations: 2,
+            total_iterations: 50,
+            total_cpu_time_ns: 500,
+            numa_pages_local: 40,
+            numa_pages_total: 50,
+            cross_node_migrated: 50,
+            max_gap_ms: 9,
+            max_gap_cpu: 5,
+            stripped: false,
+        },
+    );
+    b_bucket.per_cgroup.insert(
+        "cg_x".to_string(),
+        PhaseCgroupStats {
+            off_cpu_pcts: vec![7.0], // measured on b's side
+            ..Default::default()
+        },
+    );
+    b_bucket.per_cgroup.insert(
+        "cg_b".to_string(),
+        PhaseCgroupStats {
+            num_workers: 2,
+            ..Default::default()
+        },
+    );
+    b.stats.phases = vec![b_bucket];
+
+    a.merge(b);
+    let pc = &a.stats.phases[0].per_cgroup;
+    // One-sided cgroups carried verbatim BY VALUE (not just key presence).
+    assert_eq!(pc["cg_a"].num_workers, 1, "cg_a (a-only) carried by value");
+    assert_eq!(pc["cg_b"].num_workers, 2, "cg_b (b-only) carried by value");
+    // Shared cg_0 folded component-wise.
+    let cg0 = &pc["cg_0"];
+    assert_eq!(cg0.wake_latencies_ns, vec![10, 20, 30], "latencies concat");
+    assert_eq!(cg0.wake_sample_total, 3, "wake_sample_total sums");
+    assert_eq!(
+        cg0.run_delays_ns,
+        vec![1_000, 2_000, 3_000],
+        "run_delays concat (raw ns)"
+    );
+    assert_eq!(
+        cg0.off_cpu_pcts,
+        vec![5.0, 20.0, 3.0, 15.0],
+        "off_cpu_pcts concat (mean + spread re-pool from these raw samples)",
+    );
+    assert_eq!(cg0.cpus_used, BTreeSet::from([0, 1, 2]), "cpus_used union");
+    assert_eq!(cg0.total_migrations, 5, "migrations sum (3+2)");
+    assert_eq!(cg0.total_iterations, 150, "iterations sum (100+50)");
+    assert_eq!(cg0.total_cpu_time_ns, 1_500, "cpu time sum (1000+500)");
+    assert_eq!(cg0.numa_pages_local, 130, "numa_pages_local sum (90+40)");
+    assert_eq!(cg0.numa_pages_total, 150, "numa_pages_total sum (100+50)");
+    assert_eq!(
+        cg0.cross_node_migrated, 100,
+        "cross_node_migrated MAX(100,50)=100 NOT 150 — system-wide vmstat delta",
+    );
+    // Coupled worst gap folds as an ARGMAX: b has the larger gap (9 > 7) so
+    // BOTH ms and cpu come from b — never desynced into a's cpu.
+    assert_eq!(
+        cg0.max_gap_ms, 9,
+        "gap ms = argmax-by-ms(7@cpu3, 9@cpu5) = 9"
+    );
+    assert_eq!(
+        cg0.max_gap_cpu, 5,
+        "gap cpu coupled to the winning gap (b's 5, NOT a's 3)",
+    );
+    assert_eq!(
+        cg0.num_workers, 8,
+        "num_workers SUMs (4+4) — a Counter over disjoint per-handle worker \
+         subsets, not a Peak",
+    );
+    // Not-measured (empty) UNION measured = measured (empty concat is a no-op).
+    assert_eq!(
+        pc["cg_x"].off_cpu_pcts,
+        vec![7.0],
+        "empty off_cpu_pcts (not measured) ∪ measured = measured",
+    );
+}
+
+/// Cross-STEP per_cgroup survival through `AssertResult::merge`: two DIFFERENT
+/// step_index carriers (step 1 cgA, step 2 cgB) BOTH reach the merged output via
+/// the unpaired-step-index arm. This is the cross-phase core invariant — each
+/// step's per_cgroup survives the guest-side merge, not just a single matched
+/// step. The per_cgroup union test above only exercises a SINGLE matched
+/// step_index; this pins the unpaired (different-step) path carries per_cgroup.
+#[test]
+fn assert_result_merge_keeps_per_cgroup_across_distinct_steps() {
+    use crate::assert::{PhaseBucket, PhaseCgroupStats};
+    let bucket = |idx: u16, name: &str, iters: u64| {
+        let mut pc = std::collections::BTreeMap::new();
+        pc.insert(
+            name.to_string(),
+            PhaseCgroupStats {
+                total_iterations: iters,
+                ..Default::default()
+            },
+        );
+        PhaseBucket {
+            step_index: idx,
+            label: format!("Step[{}]", idx - 1),
+            start_ms: 0,
+            end_ms: 100,
+            sample_count: 0,
+            metrics: std::collections::BTreeMap::new(),
+            per_cgroup: pc,
+        }
+    };
+    let mut a = AssertResult::pass();
+    a.stats.phases = vec![bucket(1, "cgA", 11)];
+    let mut b = AssertResult::pass();
+    b.stats.phases = vec![bucket(2, "cgB", 22)];
+    a.merge(b);
+    assert_eq!(
+        a.stats.phases.len(),
+        2,
+        "both distinct-step buckets survive"
+    );
+    let s1 = a
+        .stats
+        .phases
+        .iter()
+        .find(|p| p.step_index == 1)
+        .expect("step 1 survives");
+    let s2 = a
+        .stats
+        .phases
+        .iter()
+        .find(|p| p.step_index == 2)
+        .expect("step 2 survives");
+    assert_eq!(
+        s1.per_cgroup["cgA"].total_iterations, 11,
+        "step 1 per_cgroup carried"
+    );
+    assert_eq!(
+        s2.per_cgroup["cgB"].total_iterations, 22,
+        "step 2 per_cgroup carried"
+    );
 }
 
 #[test]
@@ -1103,5 +1513,73 @@ fn merge_kind_enum_exhaustively_covers_metric_kind_variants() {
     assert_eq!(
         MetricKind::Timestamp.merge_kind(),
         MergeKind::NonCommutative,
+    );
+    assert_eq!(MetricKind::DeltaSum.merge_kind(), MergeKind::Commutative);
+    assert_eq!(
+        MetricKind::Rate {
+            numerator: "n",
+            denominator: "d",
+        }
+        .merge_kind(),
+        MergeKind::Recompute,
+    );
+}
+
+/// merge_matched_phase_buckets must INCLUDE a synthesized
+/// (sample_count==0) bucket's capture-independent iteration_rate when
+/// merging it against a captured bucket at the same step_index. Since
+/// iteration_rate is a MetricKind::Rate, the merge sums each side's
+/// Counter components (total_phase_iterations / total_phase_duration_sec)
+/// and re-derives the rate as Σiters/Σseconds — so the synthesized side's
+/// iterations are pooled in, never dropped. Guards the no-silent-drops
+/// invariant for any cross-result phase merge (e.g. the per-cgroup
+/// phase-bucket fold). Unequal durations make the re-pool (450) distinct
+/// from a mean-of-ratios (500) and a dropped-synthesized result (400).
+#[test]
+fn merge_matched_phase_buckets_repools_synthesized_zero_count() {
+    use std::collections::BTreeMap;
+    let synth = PhaseBucket {
+        per_cgroup: Default::default(),
+        step_index: 2,
+        label: "Step[1]".to_string(),
+        start_ms: 2000,
+        end_ms: 3000,
+        sample_count: 0, // synthesized zero-capture bucket: 600 iters / 1s
+        metrics: BTreeMap::from([
+            ("total_phase_iterations".to_string(), 600.0),
+            ("total_phase_duration_sec".to_string(), 1.0),
+        ]),
+    };
+    let captured = PhaseBucket {
+        per_cgroup: Default::default(),
+        step_index: 2,
+        label: "Step[1]".to_string(),
+        start_ms: 2000,
+        end_ms: 3000,
+        sample_count: 5, // 1200 iters / 3s
+        metrics: BTreeMap::from([
+            ("total_phase_iterations".to_string(), 1200.0),
+            ("total_phase_duration_sec".to_string(), 3.0),
+        ]),
+    };
+    let merged = merge_matched_phase_buckets(synth, captured);
+    // Re-pool: Σiters / Σseconds = (600 + 1200) / (1 + 3) = 1800/4 = 450/s.
+    // The synthesized side's 600 iters are SUMMED in (Counter merge), so
+    // 450 — NOT 400 (synthesized dropped, captured 1200/3) and NOT 500
+    // (mean of the two ready ratios 600 and 400).
+    let r = merged
+        .metrics
+        .get("iteration_rate")
+        .copied()
+        .expect("merged bucket carries the re-derived iteration_rate");
+    assert!(
+        (r - 450.0).abs() < f64::EPSILON,
+        "synthesized rate's iterations must pool into Σiters/Σseconds = 450, \
+         not be dropped (400) or averaged as ratios (500); got {r}",
+    );
+    assert_eq!(
+        merged.metrics.get("total_phase_iterations").copied(),
+        Some(1800.0),
+        "iteration components sum across the merged buckets",
     );
 }

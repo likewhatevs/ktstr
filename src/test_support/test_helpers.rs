@@ -240,6 +240,8 @@ pub(crate) fn make_vm_result(
 ) -> crate::vmm::VmResult {
     crate::vmm::VmResult {
         success: !timed_out && exit_code == 0,
+        vcpus: 1,
+        cpu_budget: 1,
         expect_auto_repro_satisfied: false,
         exit_code,
         duration: std::time::Duration::from_secs(1),

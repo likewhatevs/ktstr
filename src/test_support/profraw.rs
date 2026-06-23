@@ -5,11 +5,11 @@
 //! `.profraw` at process exit. Inside a ktstr guest VM, `std::process::exit`
 //! bypasses the atexit handler when the ktstr `#[ctor]` runs first
 //! (the ordering between `.init_array` entries is unspecified). To keep
-//! coverage data from being dropped, [`try_flush_profraw`] resolves the
-//! LLVM runtime symbols via ELF `.symtab` (they have hidden visibility,
-//! so `dlsym` can't see them), serializes profraw into a heap buffer
-//! via `__llvm_profile_write_buffer`, and publishes it through the
-//! guest-to-host SHM ring under `MSG_TYPE_PROFRAW`.
+//! coverage data from being dropped, [`try_flush_profraw`] calls the
+//! compiler-rt buffer API (`__llvm_profile_get_size_for_buffer` +
+//! `__llvm_profile_write_buffer`) directly under `cfg(coverage)`,
+//! serializes profraw into a heap buffer, and publishes it through the
+//! guest-to-host bulk channel under `MSG_TYPE_PROFRAW`.
 //!
 //! VP data scope: the buffer flush covers coverage counters and
 //! bitmaps only; PGO value-profile data is not preserved.
@@ -53,10 +53,14 @@
 //!   - `LLVM_PROFILE_FILE` is already set (operator override or
 //!     wrapper injection takes precedence — same `existing_env.is_some()`
 //!     short-circuit `cargo-ktstr.rs::profraw_inject_for` applies).
-//!   - The target binary is NOT coverage-instrumented. Detection is
-//!     a symtab probe for `__llvm_profile_runtime` — the same
-//!     compiler-rt symbol [`try_flush_profraw`] resolves for the
-//!     guest-side flush. Non-instrumented binaries that link the
+//!   - The target binary is NOT coverage-instrumented. Detection is a
+//!     symtab probe for the `__llvm_profile_write_buffer` /
+//!     `__llvm_profile_get_size_for_buffer` function symbols (the bare
+//!     `__llvm_profile_runtime` marker can be dead-stripped entirely
+//!     under `--gc-sections`, leaving no `.symtab` entry; see
+//!     `is_coverage_instrumented_binary`); the
+//!     guest-side flush [`try_flush_profraw`] calls those same compiler-rt
+//!     entry points directly. Non-instrumented binaries that link the
 //!     ktstr lib (e.g. `cargo-ktstr` itself in a non-coverage build)
 //!     must NOT set the env, otherwise the env propagates to spawned
 //!     child test binaries, which then short-circuit their own
@@ -66,130 +70,116 @@
 //!     binaries live in `target/{profile}/deps/`, so the two
 //!     `current_exe`-relative target dirs differ).
 //!
-//! Supporting helpers:
+//! Supporting helper:
 //! - [`find_symbol_vaddrs`] walks `.symtab` in one pass for multiple
-//!   symbols at once.
-//! - [`pie_load_bias`] computes the ASLR slide for PIE binaries so
-//!   symbol virtual addresses can be rebased to runtime pointers.
+//!   symbols at once, used by the coverage-instrumentation detection
+//!   probes (in-process and on the host-side `/init` payload).
 //!
-//! `/proc/self/exe` is read via `memmap2::Mmap` rather than
+//! Those probes read the binary via `memmap2::Mmap` rather than
 //! `std::fs::read` so the kernel page cache backs the bytes goblin
 //! parses; for coverage-instrumented binaries (hundreds of MiB up to
-//! ~1 GiB) this avoids the heap allocation + copy of the entire
-//! binary on every flush. The ELF is parsed once and reused across
-//! [`pie_load_bias`] and [`find_symbol_vaddrs`] so a single
-//! `goblin::elf::Elf::parse` covers both lookups.
+//! ~1 GiB) this avoids the heap allocation + copy of the entire binary
+//! just to read its symbol table. [`try_flush_profraw`] itself no
+//! longer parses the ELF — under `cfg(coverage)` it calls the
+//! buffer-API entry points directly.
 
 use anyhow::{Context, Result};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
+#[cfg(coverage)]
 use crate::vmm;
-
-/// Bulk-channel message type for profraw data.
-///
-/// Derived from the ASCII bytes `b"PRAW"` in big-endian order so the
-/// constant reads as the tag it represents in a hex dump, not as an
-/// opaque 32-bit magic number. Equivalent to `0x50524157`.
-#[cfg(test)]
-pub(crate) const MSG_TYPE_PROFRAW: u32 = u32::from_be_bytes(*b"PRAW");
 
 /// Flush LLVM coverage profraw to the host through the bulk channel.
 ///
-/// Resolves `__llvm_profile_get_size_for_buffer` and
-/// `__llvm_profile_write_buffer` from the test binary's `.symtab`,
-/// allocates a heap buffer of the reported size, calls
-/// `__llvm_profile_write_buffer` to serialize the profile counters
-/// into it, and publishes the buffer through the virtio-console
-/// bulk port for host-side extraction.
+/// Under `-C instrument-coverage` (cargo-llvm-cov sets `cfg(coverage)`)
+/// the compiler-rt profile runtime is linked, so the buffer-API entry
+/// points `__llvm_profile_get_size_for_buffer` and
+/// `__llvm_profile_write_buffer` are defined. This calls them directly:
+/// it allocates a buffer of the reported size, serializes the live
+/// profile counters into it, and publishes the buffer through the
+/// virtio-console bulk port for host-side extraction.
 ///
-/// All symbols have hidden visibility in compiler-rt, so we resolve
-/// them via ELF `.symtab` parsing (dlsym cannot find hidden symbols).
+/// Calling `__llvm_profile_write_buffer` directly is also what keeps it
+/// alive under `--gc-sections`: the call site is a link-time reference.
+/// Resolving it by name through the ELF `.symtab` at runtime instead
+/// (an earlier approach) was NOT a link reference, so the linker
+/// dead-stripped `write_buffer` — nothing else in the retained graph
+/// called it (the runtime's own `write_file` path is stripped too) — and
+/// the flush silently no-op'd, leaving guest coverage at 0%.
 ///
-/// No-op when built without `-C instrument-coverage` or when called
-/// from host context.
+/// No-op when not coverage-instrumented (the `cfg(coverage)` body is
+/// absent, so the symbols are never referenced and the build links
+/// without the profile runtime) or when called from host context.
 pub(crate) fn try_flush_profraw() {
-    if !vmm::guest_comms::is_guest() {
-        return;
+    #[cfg(coverage)]
+    {
+        if !vmm::guest_comms::is_guest() {
+            return;
+        }
+
+        // Flush at most once per process. The guest `/init` (pid 1) can
+        // reach `try_flush_profraw` from several paths in the same
+        // process — the post-dispatch site (rust_init Phase 5), the
+        // probe result-publish path, and the ctor / nextest `--exact`
+        // dispatch paths (which flush then `process::exit`). A second
+        // flush emits a second `Profraw` frame and `llvm-profdata merge`
+        // would double-count the counters. First flush per process wins.
+        {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static FLUSHED: AtomicBool = AtomicBool::new(false);
+            if FLUSHED.swap(true, Ordering::SeqCst) {
+                return;
+            }
+        }
+
+        // SAFETY: both are stable compiler-rt buffer-API entry points,
+        // defined whenever `-C instrument-coverage` linked the profile
+        // runtime (guaranteed under `cfg(coverage)`). `get_size` is
+        // `uint64_t (void)`; `write_buffer` is `int (char *)`, returning
+        // 0 on success after serializing the live counters into the
+        // caller's buffer. The dispatch context is single-threaded
+        // (guest `/init`, post-dispatch).
+        unsafe extern "C" {
+            fn __llvm_profile_get_size_for_buffer() -> u64;
+            fn __llvm_profile_write_buffer(buf: *mut std::os::raw::c_char) -> std::os::raw::c_int;
+        }
+
+        let needed = unsafe { __llvm_profile_get_size_for_buffer() } as usize;
+        if needed == 0 {
+            // Reliable Dmesg frame (NOT eprintln — the Phase-2 stdio->bulk
+            // redirect is lossy near reboot) so a zero-coverage run is never
+            // silent (frames sent, no profraw, no error).
+            vmm::guest_comms::send_dmesg(
+                b"ktstr coverage: __llvm_profile_get_size_for_buffer returned 0; no guest profile to flush\n",
+            );
+            return;
+        }
+
+        let mut buf: Vec<u8> = vec![0u8; needed];
+        // `__llvm_profile_write_buffer` returns 0 on success.
+        if unsafe { __llvm_profile_write_buffer(buf.as_mut_ptr().cast::<std::os::raw::c_char>()) }
+            != 0
+        {
+            vmm::guest_comms::send_dmesg(
+                b"ktstr coverage: __llvm_profile_write_buffer failed; guest coverage lost for this run\n",
+            );
+            return;
+        }
+
+        vmm::guest_comms::send_profraw(&buf);
     }
-
-    // Memory-map the test binary's executable image. memmap2's `Mmap`
-    // borrows from the underlying file mapping; the page cache is the
-    // backing store, so goblin's parse + symtab walk reads pages on
-    // demand instead of paying for a full read+copy of the (possibly
-    // ~1 GiB) coverage-instrumented binary.
-    //
-    // SAFETY: `/proc/self/exe` is a kernel symlink to the running
-    // binary's underlying file (proc(5)); File::open captures an fd
-    // that pins the inode for the mmap's lifetime, so even a concurrent
-    // binary replacement on disk leaves the mapped pages valid. No part
-    // of ktstr or its callers writes to the test binary during a run,
-    // satisfying memmap2's no-concurrent-modification invariant.
-    let exe_file = match File::open("/proc/self/exe") {
-        Ok(f) => f,
-        Err(_) => return,
-    };
-    let mmap = match unsafe { memmap2::Mmap::map(&exe_file) } {
-        Ok(m) => m,
-        Err(_) => return,
-    };
-    let bytes: &[u8] = &mmap;
-
-    // Parse the ELF once and reuse it for both `pie_load_bias` and
-    // `find_symbol_vaddrs`; a second parse cost a measurable share of
-    // teardown latency on coverage builds.
-    let elf = match goblin::elf::Elf::parse(bytes) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-
-    let slide = pie_load_bias(&elf);
-
-    // Resolve both buffer-API symbols in a single pass through the
-    // ELF .symtab.
-    let vaddrs = find_symbol_vaddrs(
-        &elf,
-        &[
-            "__llvm_profile_get_size_for_buffer",
-            "__llvm_profile_write_buffer",
-        ],
-    );
-
-    let size_vaddr = match vaddrs[0] {
-        Some(v) if v != 0 => v,
-        _ => return,
-    };
-    let write_vaddr = match vaddrs[1] {
-        Some(v) if v != 0 => v,
-        _ => return,
-    };
-
-    // SAFETY: vaddr + slide is the runtime address of the
-    // hidden-visibility compiler-rt entry point with the C signature
-    // `uint64_t (void)`; treating it as `extern "C" fn() -> u64`
-    // matches that ABI. The dispatch context is single-threaded.
-    let get_size: extern "C" fn() -> u64 =
-        unsafe { std::mem::transmute((size_vaddr as usize).wrapping_add(slide)) };
-    // SAFETY: same, for `int (char *)` → `extern "C" fn(*mut c_char) -> i32`.
-    let write_buffer: extern "C" fn(*mut std::os::raw::c_char) -> i32 =
-        unsafe { std::mem::transmute((write_vaddr as usize).wrapping_add(slide)) };
-
-    let needed = get_size() as usize;
-    if needed == 0 {
-        return;
-    }
-
-    let mut buf: Vec<u8> = vec![0u8; needed];
-    // `__llvm_profile_write_buffer` returns 0 on success.
-    if write_buffer(buf.as_mut_ptr().cast::<std::os::raw::c_char>()) != 0 {
-        return;
-    }
-
-    vmm::guest_comms::send_profraw(&buf);
 }
 
 /// Resolve multiple symbol virtual addresses in a single pass through
-/// the ELF .symtab. Returns addresses in the same order as `names`.
+/// the ELF `.symtab`. Returns addresses in the same order as `names`.
+///
+/// Matches purely by name: a symbol is resolved regardless of its
+/// `st_size`, so zero-size symbols — e.g. gc-sections'd data markers
+/// like `__llvm_profile_runtime`, whose `st_size` is dropped on some
+/// `--gc-sections` link paths — still resolve as long as the name
+/// survives in `.symtab`. (Callers match exact, specific names, so
+/// admitting zero-size symbols cannot introduce a false positive.)
 pub(crate) fn find_symbol_vaddrs(elf: &goblin::elf::Elf<'_>, names: &[&str]) -> Vec<Option<u64>> {
     let mut results = vec![None; names.len()];
     let mut remaining = names.len();
@@ -197,9 +187,6 @@ pub(crate) fn find_symbol_vaddrs(elf: &goblin::elf::Elf<'_>, names: &[&str]) -> 
     for sym in elf.syms.iter() {
         if remaining == 0 {
             break;
-        }
-        if sym.st_size == 0 {
-            continue;
         }
         let sym_name = match elf.strtab.get_at(sym.st_name) {
             Some(n) => n,
@@ -216,29 +203,39 @@ pub(crate) fn find_symbol_vaddrs(elf: &goblin::elf::Elf<'_>, names: &[&str]) -> 
     results
 }
 
-/// Compute the ASLR load bias for a PIE binary.
-///
-/// For ET_DYN (PIE), the kernel loads the binary at an arbitrary base.
-/// The bias is `runtime_phdr_addr - file_phdr_offset`. We get the
-/// runtime phdr address from AT_PHDR (via getauxval) and the file
-/// offset from e_phoff.
-///
-/// Returns 0 for ET_EXEC (non-PIE), where st_value is already absolute.
-pub(crate) fn pie_load_bias(elf: &goblin::elf::Elf<'_>) -> usize {
-    if elf.header.e_type != goblin::elf::header::ET_DYN {
-        return 0;
-    }
-
-    let phdr_file_offset = elf.header.e_phoff as usize;
-    // SAFETY: AT_PHDR is a well-defined auxiliary vector key.
-    let phdr_runtime = unsafe { libc::getauxval(libc::AT_PHDR) } as usize;
-    if phdr_runtime == 0 {
-        return 0;
-    }
-    phdr_runtime.wrapping_sub(phdr_file_offset)
-}
-
 static PROFRAW_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Persist every coverage-profraw frame in a post-run guest bulk drain
+/// to the llvm-cov-target directory.
+///
+/// Walks the [`crate::vmm::host_comms::BulkDrainResult`] the host
+/// bucketed into [`crate::vmm::result::VmResult::guest_messages`] and,
+/// for each [`MsgType::Profraw`](crate::vmm::wire::MsgType::Profraw)
+/// frame that passed its per-frame CRC and carries a non-empty payload,
+/// calls [`write_profraw`]. Mirrors the CRC + non-empty gate the
+/// per-frame eval/probe dispatch applied so a corrupted or empty frame
+/// is never written.
+///
+/// Called from [`crate::vmm::KtstrVm::run`] so the direct
+/// `KtstrVm::run()` path persists guest coverage like the
+/// eval (`run_ktstr_test_inner`) and auto-repro (`probe`) paths do —
+/// previously the direct path silently dropped the profraw the guest
+/// `/init` flushed. The eval and probe paths funnel through
+/// `KtstrVm::run`, so they no longer extract `Profraw` frames
+/// themselves; doing so here AND there would write the same payload
+/// twice and `llvm-profdata merge` would double-count the counters.
+pub(crate) fn persist_guest_profraw(messages: &crate::vmm::host_comms::BulkDrainResult) {
+    use crate::vmm::wire::MsgType;
+    for entry in &messages.entries {
+        if MsgType::from_wire(entry.msg_type) == Some(MsgType::Profraw)
+            && entry.crc_ok
+            && !entry.payload.is_empty()
+            && let Err(e) = write_profraw(&entry.payload)
+        {
+            eprintln!("ktstr_test: persist guest profraw: {e}");
+        }
+    }
+}
 
 /// Write profraw data to the llvm-cov-target directory.
 pub(crate) fn write_profraw(data: &[u8]) -> Result<()> {
@@ -374,19 +371,16 @@ fn is_coverage_instrumented_binary() -> bool {
     // Probe for the profile-write-buffer entry point rather than
     // the bare `__llvm_profile_runtime` marker. The marker is
     // declared `int __llvm_profile_runtime;` in compiler-rt and
-    // can lose its `.symtab` size on `--gc-sections` /
-    // `-Wl,--strip-debug` paths some toolchains apply to
-    // coverage builds, which trips
-    // [`find_symbol_vaddrs`]'s `st_size == 0` skip and silently
-    // hides instrumented binaries from this probe. The
+    // can be dead-stripped entirely by `--gc-sections` /
+    // `-Wl,--strip-debug` paths some toolchains apply to coverage
+    // builds, leaving no `.symtab` entry to resolve. The
     // function-shaped symbols [`try_flush_profraw`] already
     // resolves (`__llvm_profile_get_size_for_buffer` and
-    // `__llvm_profile_write_buffer`) keep their non-zero
-    // `st_size` because every linker path emits the function
-    // body — they are the reliable presence signal for
-    // instrumented binaries, proved empirically by the fact that
-    // coverage profraw collection in CI succeeds via the same
-    // symtab probe.
+    // `__llvm_profile_write_buffer`) are kept alive by that flush
+    // call's link reference, so they are the reliable presence
+    // signal for instrumented binaries, proved empirically by the
+    // fact that coverage profraw collection in CI succeeds via the
+    // same symtab probe.
     let vaddrs = find_symbol_vaddrs(
         &elf,
         &[
@@ -397,27 +391,28 @@ fn is_coverage_instrumented_binary() -> bool {
     vaddrs.iter().any(|v| matches!(v, Some(va) if *va != 0))
 }
 
-/// Process-wide cached version of [`is_coverage_instrumented_binary`]
-/// exposed to test sites that need to skip-vs-coverage. Symbol-table
-/// walk runs once per process and is memoised in a `OnceLock<bool>`
-/// so a test that probes the flag at the top of every iteration only
-/// pays the ELF parse once.
+/// Process-wide cached version of [`is_coverage_instrumented_binary`]:
+/// whether the HOST process (`/proc/self/exe`) is built with
+/// `-C instrument-coverage`. The symbol-table walk runs once per
+/// process and is memoised in a `OnceLock<bool>` so repeated probes
+/// only pay the ELF parse once.
 ///
-/// Used by VM-booting tests that pass `current_exe()` as the guest
-/// `/init` and trip an AP-kill exit early in boot under coverage —
-/// the instrumented binary's profile-runtime init does not run
-/// cleanly as PID 1 inside the guest's minimal initramfs, surfacing
-/// as `kill set by AP` within a couple of seconds of boot. Affected
-/// surface includes the unit tests
-/// `boot_kernel_with_monitor`,
-/// `monitor_data_valid_latch_records_live_page_offset`,
-/// `sched_domain_data_populated` plus integration tests that drive
-/// `Op::watch_snapshot` / `Op::capture_snapshot` (the host-side
-/// dispatch chain needs a healthy guest-side scheduler attach).
-/// These tests exercise host-side behaviour with no coverage-relevant
-/// code paths, so skipping them under coverage loses no real
-/// assertion coverage; the real fix is a non-instrumented `/init`
-/// binary plumbed through `init_binary`, deferred to follow-up work.
+/// History: VM-booting tests once used this to skip themselves under
+/// coverage, because the instrumented `current_exe` used as the guest
+/// `/init` OOMed early in boot (the budget in
+/// `crate::vmm::memory_budget` was payload-agnostic, sizing the
+/// non-instrumented case). That skip list is gone:
+/// [`crate::vmm::memory_budget::initramfs_min_memory_mib`] now
+/// detects an instrumented `/init` payload and reserves the extra
+/// resident memory (`__llvm_prf_cnts` + `__llvm_prf_data`), so the
+/// instrumented `/init` boots and its coverage is captured via
+/// [`persist_guest_profraw`].
+///
+/// This probes the HOST process, not the `/init` payload — the budget
+/// path probes the payload bytes directly (see
+/// `KtstrVm::init_payload_coverage_reserve`). Retained as a
+/// `#[doc(hidden)]` `pub` capability for out-of-tree consumers that
+/// want to branch on host-process instrumentation.
 ///
 /// `pub` (not `pub(crate)`) so integration tests in `tests/*.rs`
 /// can reach the helper. `#[doc(hidden)]` keeps it out of the
@@ -481,15 +476,16 @@ fn redirect_default_profraw_path() {
     // actually has a decision to make. cargo-ktstr-wrapped runs and
     // cargo-llvm-cov runs both pre-set `LLVM_PROFILE_FILE`, so
     // `existing.is_some()` short-circuits before
-    // `is_coverage_instrumented_binary` mmaps `/proc/self/exe` and
-    // walks the symtab. pid=1 (in-VM init) similarly avoids the
+    // `current_binary_is_coverage_instrumented` mmaps `/proc/self/exe`
+    // and walks the symtab (first call only; memoised). pid=1 (in-VM
+    // init) similarly avoids the
     // probe — the SHM-ring flush owns guest-side coverage.
     let pid = unsafe { libc::getpid() };
     let existing = std::env::var_os("LLVM_PROFILE_FILE");
     if pid == 1 || existing.is_some() {
         return;
     }
-    let instrumented = is_coverage_instrumented_binary();
+    let instrumented = current_binary_is_coverage_instrumented();
     if let Some(pattern) = redirect_pattern_for(pid, existing, instrumented, target_dir) {
         // SAFETY: this ctor runs from `.init_array.0`, before any
         // user thread has spawned. The env block is single-writer,
@@ -671,14 +667,6 @@ mod tests {
         );
     }
 
-    // -- MSG_TYPE_PROFRAW encoding --
-
-    #[test]
-    fn msg_type_profraw_ascii() {
-        let bytes = MSG_TYPE_PROFRAW.to_be_bytes();
-        assert_eq!(&bytes, b"PRAW");
-    }
-
     // -- find_symbol_vaddrs --
 
     #[test]
@@ -717,85 +705,59 @@ mod tests {
         assert!(results[1].is_none(), "nonexistent should not resolve");
     }
 
-    // -- pie_load_bias --
+    // -- profile buffer-API retention (regression) --
 
-    /// `pie_load_bias` on the running test binary returns a non-zero
-    /// slide. Rust's default release/test build is PIE (`ET_DYN`), and
-    /// on a stock Linux kernel (`randomize_va_space=2`) ASLR places
-    /// the image at a random base, so `runtime_phdr - file_phdr_offset`
-    /// is virtually always a large non-zero value. Guards both that
-    /// the function takes the ET_DYN path AND that the AT_PHDR /
-    /// e_phoff arithmetic produces something usable.
+    /// `--gc-sections` dead-strips `__llvm_profile_write_buffer` unless a
+    /// link-time reference keeps it — [`try_flush_profraw`]'s direct call
+    /// under `cfg(coverage)` is that reference. This test references the
+    /// symbol by NAME only (a `.symtab` lookup, not a link reference of
+    /// its own), so it fails if that call is ever removed and the linker
+    /// strips the function — the exact regression that left guest
+    /// coverage at 0% before the direct-call fix. Coverage-only: the
+    /// symbol does not exist in non-instrumented builds.
+    #[cfg(coverage)]
     #[test]
-    fn pie_load_bias_returns_nonzero_slide_on_pie_test_binary() {
+    fn write_buffer_symbol_retained_under_coverage() {
         let exe = crate::resolve_current_exe().unwrap();
         let data = std::fs::read(&exe).unwrap();
         let elf = goblin::elf::Elf::parse(&data).unwrap();
-        // Sanity: the test binary really is ET_DYN. If a future
-        // toolchain change flips the default to ET_EXEC, this guard
-        // surfaces the change before the slide assertion fails for
-        // the wrong reason.
-        assert_eq!(
-            elf.header.e_type,
-            goblin::elf::header::ET_DYN,
-            "Rust test binaries default to PIE (ET_DYN); got e_type={}",
-            elf.header.e_type,
-        );
-        let slide = pie_load_bias(&elf);
-        assert_ne!(
-            slide, 0,
-            "ET_DYN binary under default ASLR must produce a non-zero \
-             load bias; if this assertion fails check that \
-             /proc/sys/kernel/randomize_va_space is non-zero",
+        let v = find_symbol_vaddrs(&elf, &["__llvm_profile_write_buffer"]);
+        assert!(
+            v[0].is_some(),
+            "__llvm_profile_write_buffer must survive --gc-sections under \
+             coverage; without it the guest flush silently no-ops",
         );
     }
 
-    /// Mutating `e_type` to ET_EXEC routes `pie_load_bias` through
-    /// the early-exit branch and returns 0 — the contract for non-PIE
-    /// binaries where `st_value` is already absolute.
-    ///
-    /// The mutation writes `ET_EXEC` (= 2) into the `e_type` field at
-    /// byte offset 16 (= `SIZEOF_IDENT` in `goblin::elf::header`).
-    /// Endianness is chosen from `e_ident[EI_DATA]` (= byte 5, see
-    /// `EI_DATA`, `ELFDATA2LSB`, `ELFDATA2MSB` in
-    /// `goblin::elf::header`) so the test
-    /// works on both little-endian (x86_64, aarch64) and big-endian
-    /// hosts. Re-parsing the mutated buffer yields a synthetic
-    /// `Elf<'_>` whose header reports ET_EXEC; everything else
-    /// (sections, segments, strtab) stays consistent because we only
-    /// touched the type byte.
+    /// Regression: `find_symbol_vaddrs` must resolve a symbol by name
+    /// even when its `st_size` is 0. A prior `st_size == 0` skip
+    /// silently dropped gc-sections'd zero-size markers (e.g.
+    /// `__llvm_profile_runtime`), hiding instrumented binaries from
+    /// the coverage probe. Pick a real zero-size named symbol from
+    /// this binary's own `.symtab` (linker markers like `_edata` /
+    /// `_end` are `st_size == 0`) and assert the helper resolves it.
     #[test]
-    fn pie_load_bias_returns_zero_for_et_exec() {
+    fn find_symbol_vaddrs_resolves_zero_size_symbol() {
         let exe = crate::resolve_current_exe().unwrap();
-        let mut data = std::fs::read(&exe).unwrap();
-
-        // EI_DATA byte tells us the file's endianness.
-        let little_endian = match data[goblin::elf::header::EI_DATA] {
-            goblin::elf::header::ELFDATA2LSB => true,
-            goblin::elf::header::ELFDATA2MSB => false,
-            other => panic!("unexpected EI_DATA byte: 0x{other:02x}"),
-        };
-        let et_exec_bytes: [u8; 2] = if little_endian {
-            goblin::elf::header::ET_EXEC.to_le_bytes()
-        } else {
-            goblin::elf::header::ET_EXEC.to_be_bytes()
-        };
-        // e_type sits immediately after e_ident (which is SIZEOF_IDENT
-        // = 16 bytes). Overwrite both bytes of the u16.
-        data[goblin::elf::header::SIZEOF_IDENT] = et_exec_bytes[0];
-        data[goblin::elf::header::SIZEOF_IDENT + 1] = et_exec_bytes[1];
-
+        let data = std::fs::read(&exe).unwrap();
         let elf = goblin::elf::Elf::parse(&data).unwrap();
-        assert_eq!(
-            elf.header.e_type,
-            goblin::elf::header::ET_EXEC,
-            "byte mutation should have made the parsed header report ET_EXEC",
-        );
-        assert_eq!(
-            pie_load_bias(&elf),
-            0,
-            "ET_EXEC binary must short-circuit to 0; absolute st_value \
-             needs no slide",
+        let zero_size_name = elf
+            .syms
+            .iter()
+            .filter(|s| s.st_size == 0)
+            .filter_map(|s| elf.strtab.get_at(s.st_name))
+            .find(|n| !n.is_empty())
+            .map(str::to_string)
+            .expect(
+                "test binary's .symtab should carry at least one named \
+                 zero-size symbol (e.g. a linker marker like _edata / _end)",
+            );
+        let v = find_symbol_vaddrs(&elf, &[zero_size_name.as_str()]);
+        assert!(
+            v[0].is_some(),
+            "find_symbol_vaddrs must resolve zero-size symbol \
+             {zero_size_name:?}; the removed st_size==0 filter previously \
+             dropped such symbols, losing gc-sections'd coverage markers",
         );
     }
 }

@@ -396,3 +396,387 @@ fn assemble_extras_and_key_threads_staged_into_basekey_in_both_modes() {
          BaseKey constructor",
     );
 }
+
+/// Drive the REAL `try_cow_overlay` against a live LZ4 SHM segment and a
+/// two-region `GuestMemoryMmap`. The overlay must succeed (return
+/// `Some`), map the SHM bytes into region A, and leave the adjacent
+/// marker region B byte-for-byte untouched. Exercises the full prod
+/// path — `shm_open_lz4`, the LZ4-magic pread validation, the rounded-
+/// length bounds check, and the `MAP_FIXED` overlay via `cow_overlay` —
+/// not a re-implementation of the bounds check.
+#[test]
+fn try_cow_overlay_maps_segment_and_preserves_adjacent_region() {
+    use vm_memory::{Bytes, GuestAddress};
+
+    let page = host_page_size() as usize;
+    // Region A holds the overlay target; region B holds a marker that
+    // must survive. Each is several host pages so the rounded-up overlay
+    // length fits comfortably inside region A.
+    let region_a_size = page * 4;
+    let region_b_size = page * 4;
+    let region_a_start: u64 = 0;
+    let region_b_start: u64 = (region_a_size as u64) + (1 << 20); // 1 MiB gap
+    let mem = GuestMemoryMmap::<()>::from_ranges(&[
+        (GuestAddress(region_a_start), region_a_size),
+        (GuestAddress(region_b_start), region_b_size),
+    ])
+    .unwrap();
+
+    // Plant a detectable marker across the whole of region B.
+    let marker: Vec<u8> = (0..region_b_size).map(|i| (i & 0xff) as u8).collect();
+    mem.write_slice(&marker, GuestAddress(region_b_start))
+        .unwrap();
+
+    // Store a real LZ4-magic SHM segment (one host page of content) and
+    // key the overlay off its content hash. Use a hash unlikely to
+    // collide with any concurrent test's segment.
+    let hash = 0xC0FF_EE00_DEAD_F00Du64;
+    let _ = rustix::shm::unlink(initramfs::shm_lz4_segment_name(hash).as_str());
+    let mut segment = initramfs::LZ4_LEGACY_MAGIC.to_vec();
+    segment.extend((segment.len()..page).map(|i| (i & 0xff) as u8));
+    assert_eq!(segment.len(), page, "segment sized to one host page");
+    initramfs::shm_store_lz4(hash, &segment).unwrap();
+
+    let key = BaseKey(hash);
+    let guard = KtstrVm::try_cow_overlay(&mem, &key, segment.len(), region_a_start);
+    assert!(
+        guard.is_some(),
+        "overlay of a valid, in-bounds, page-aligned segment must succeed",
+    );
+
+    // Region A now reflects the SHM segment content (MAP_PRIVATE reads
+    // see the backing bytes until first write).
+    let mut a_readback = vec![0u8; segment.len()];
+    mem.read_slice(&mut a_readback, GuestAddress(region_a_start))
+        .unwrap();
+    assert_eq!(
+        a_readback, segment,
+        "region A must reflect the COW-mapped segment bytes",
+    );
+
+    // Region B is byte-for-byte untouched — the overlay never reached it.
+    let mut b_readback = vec![0u8; region_b_size];
+    mem.read_slice(&mut b_readback, GuestAddress(region_b_start))
+        .unwrap();
+    assert_eq!(
+        b_readback, marker,
+        "adjacent region B must be untouched by the overlay",
+    );
+
+    // Match the prod teardown order (x86_64/kvm.rs, aarch64 mirror):
+    // guest memory unmaps the MAP_FIXED COW region FIRST, then the guard
+    // releases LOCK_SH + closes the fd.
+    drop(mem);
+    drop(guard);
+    let _ = rustix::shm::unlink(initramfs::shm_lz4_segment_name(hash).as_str());
+}
+
+/// Drive the REAL `try_cow_overlay` with a request whose rounded length
+/// overruns region A into the inter-region gap. The prod bounds check
+/// (`get_slice` on the rounded length) must reject it: `try_cow_overlay`
+/// returns `None`, never invokes `MAP_FIXED`, and the adjacent marker
+/// region survives. Unlike the dependency-contract pin in
+/// `initramfs_tests.rs` (which calls `get_slice` directly), this routes
+/// through the production function, so dropping the guard or bounds-
+/// checking `len` instead of `rounded_len` would fail here.
+#[test]
+fn try_cow_overlay_rejects_oversized_request_and_preserves_region() {
+    use vm_memory::{Bytes, GuestAddress};
+
+    let page = host_page_size() as usize;
+    let region_a_size = page * 2;
+    let region_b_size = page * 2;
+    let region_a_start: u64 = 0;
+    let region_b_start: u64 = (region_a_size as u64) + (1 << 20); // 1 MiB gap
+    let mem = GuestMemoryMmap::<()>::from_ranges(&[
+        (GuestAddress(region_a_start), region_a_size),
+        (GuestAddress(region_b_start), region_b_size),
+    ])
+    .unwrap();
+
+    let marker: Vec<u8> = (0..region_b_size).map(|i| (i & 0xff) as u8).collect();
+    mem.write_slice(&marker, GuestAddress(region_b_start))
+        .unwrap();
+
+    // Segment one host page LARGER than region A: the rounded overlay
+    // length cannot fit, so the bounds check must reject it.
+    let hash = 0xBADC_0DE0_0BAD_F00Du64;
+    let _ = rustix::shm::unlink(initramfs::shm_lz4_segment_name(hash).as_str());
+    let oversized_len = region_a_size + page;
+    let mut segment = initramfs::LZ4_LEGACY_MAGIC.to_vec();
+    segment.extend((segment.len()..oversized_len).map(|i| (i & 0xff) as u8));
+    assert_eq!(segment.len(), oversized_len);
+    initramfs::shm_store_lz4(hash, &segment).unwrap();
+
+    let key = BaseKey(hash);
+    let guard = KtstrVm::try_cow_overlay(&mem, &key, segment.len(), region_a_start);
+    assert!(
+        guard.is_none(),
+        "an overlay whose rounded length overruns region A must be rejected",
+    );
+
+    // Region B is untouched: MAP_FIXED was never invoked.
+    let mut b_readback = vec![0u8; region_b_size];
+    mem.read_slice(&mut b_readback, GuestAddress(region_b_start))
+        .unwrap();
+    assert_eq!(
+        b_readback, marker,
+        "region B must survive a rejected overlay",
+    );
+
+    drop(mem);
+    let _ = rustix::shm::unlink(initramfs::shm_lz4_segment_name(hash).as_str());
+}
+
+/// Drive the REAL `try_cow_overlay` against a stored SHM segment whose
+/// length matches `expected_len` but whose first 4 bytes are NOT the
+/// LZ4 legacy magic. The magic-validation arm (`if magic !=
+/// initramfs::LZ4_LEGACY_MAGIC`) must reject it: `try_cow_overlay`
+/// closes the fd and returns `None`, never reaching the `MAP_FIXED`
+/// overlay, so the adjacent marker region stays byte-identical. The two
+/// existing overlay tests only store segments whose header IS the magic,
+/// so this stale-format rejection arm was never executed.
+#[test]
+fn try_cow_overlay_rejects_stale_non_lz4_magic_segment() {
+    use vm_memory::{Bytes, GuestAddress};
+
+    let page = host_page_size() as usize;
+    // Same two-region fixture as the success path: region A is the
+    // overlay target, region B holds a marker that must survive.
+    let region_a_size = page * 4;
+    let region_b_size = page * 4;
+    let region_a_start: u64 = 0;
+    let region_b_start: u64 = (region_a_size as u64) + (1 << 20); // 1 MiB gap
+    let mem = GuestMemoryMmap::<()>::from_ranges(&[
+        (GuestAddress(region_a_start), region_a_size),
+        (GuestAddress(region_b_start), region_b_size),
+    ])
+    .unwrap();
+
+    let marker: Vec<u8> = (0..region_b_size).map(|i| (i & 0xff) as u8).collect();
+    mem.write_slice(&marker, GuestAddress(region_b_start))
+        .unwrap();
+
+    // One host page of content whose first 4 bytes are 0xAB.. — never
+    // the LZ4 legacy magic (0x184C2102 little-endian). `expected_len`
+    // equals the stored length so the len check passes and execution
+    // reaches the magic pread.
+    let hash = 0x5741_4C45_F00D_BEEFu64;
+    let _ = rustix::shm::unlink(initramfs::shm_lz4_segment_name(hash).as_str());
+    let segment: Vec<u8> = vec![0xABu8; page];
+    assert_ne!(
+        segment[..4],
+        initramfs::LZ4_LEGACY_MAGIC,
+        "fixture header must NOT be the LZ4 legacy magic",
+    );
+    initramfs::shm_store_lz4(hash, &segment).unwrap();
+
+    let key = BaseKey(hash);
+    let guard = KtstrVm::try_cow_overlay(&mem, &key, segment.len(), region_a_start);
+    assert!(
+        guard.is_none(),
+        "a segment without the LZ4 legacy magic must be rejected",
+    );
+
+    // Region B is byte-for-byte untouched — MAP_FIXED never ran.
+    let mut b_readback = vec![0u8; region_b_size];
+    mem.read_slice(&mut b_readback, GuestAddress(region_b_start))
+        .unwrap();
+    assert_eq!(
+        b_readback, marker,
+        "region B must survive a magic-rejected overlay",
+    );
+
+    drop(mem);
+    let _ = rustix::shm::unlink(initramfs::shm_lz4_segment_name(hash).as_str());
+}
+
+/// Drive the REAL `try_cow_overlay` with a non-host-page-aligned
+/// `load_addr`. The alignment gate (`if load_addr & (host_page - 1) !=
+/// 0`) must reject it: `try_cow_overlay` returns `None` and never
+/// invokes `MAP_FIXED` (mmap would return `EINVAL` on a mid-page
+/// target). The segment carries a VALID LZ4 magic so execution passes
+/// the magic check and reaches the alignment gate; `load_addr = 1` sits
+/// inside region A's bounds yet fails the page-alignment test on every
+/// supported host page size. The two existing overlay tests pass
+/// `load_addr = 0` (page-aligned), so this arm was never executed.
+#[test]
+fn try_cow_overlay_rejects_unaligned_load_addr() {
+    use vm_memory::{Bytes, GuestAddress};
+
+    let page = host_page_size() as usize;
+    let region_a_size = page * 4;
+    let region_b_size = page * 4;
+    let region_a_start: u64 = 0;
+    let region_b_start: u64 = (region_a_size as u64) + (1 << 20); // 1 MiB gap
+    let mem = GuestMemoryMmap::<()>::from_ranges(&[
+        (GuestAddress(region_a_start), region_a_size),
+        (GuestAddress(region_b_start), region_b_size),
+    ])
+    .unwrap();
+
+    let marker: Vec<u8> = (0..region_b_size).map(|i| (i & 0xff) as u8).collect();
+    mem.write_slice(&marker, GuestAddress(region_b_start))
+        .unwrap();
+
+    // Valid one-host-page LZ4 segment so the magic + len + bounds checks
+    // all pass; only the alignment gate must trip.
+    let hash = 0x0FF5_E700_A11A_BEEFu64;
+    let _ = rustix::shm::unlink(initramfs::shm_lz4_segment_name(hash).as_str());
+    let mut segment = initramfs::LZ4_LEGACY_MAGIC.to_vec();
+    segment.extend((segment.len()..page).map(|i| (i & 0xff) as u8));
+    assert_eq!(segment.len(), page, "segment sized to one host page");
+    initramfs::shm_store_lz4(hash, &segment).unwrap();
+
+    // load_addr = 1: inside region A [0, region_a_size) but not aligned
+    // to any host page size (4 KiB or 16 KiB).
+    let unaligned_addr: u64 = 1;
+    let key = BaseKey(hash);
+    let guard = KtstrVm::try_cow_overlay(&mem, &key, segment.len(), unaligned_addr);
+    assert!(
+        guard.is_none(),
+        "a non-host-page-aligned load_addr must be rejected",
+    );
+
+    // No overlay touched memory: region B (and region A's marker-free
+    // start) survive. Assert region B against its planted marker.
+    let mut b_readback = vec![0u8; region_b_size];
+    mem.read_slice(&mut b_readback, GuestAddress(region_b_start))
+        .unwrap();
+    assert_eq!(
+        b_readback, marker,
+        "region B must survive an alignment-rejected overlay",
+    );
+
+    drop(mem);
+    let _ = rustix::shm::unlink(initramfs::shm_lz4_segment_name(hash).as_str());
+}
+
+/// `aarch64_initrd_addr` must return a host-page-aligned load address —
+/// the exact invariant the COW `MAP_FIXED` overlay relies on (the
+/// function header cites `EINVAL` on a mid-host-page target). The
+/// existing aarch64 tests bound the address (`>= DRAM_START`,
+/// `load + max <= pvtime_base`) and check the oversized `Err` path but
+/// never assert host-page alignment. Each fixture size is chosen so the
+/// pre-mask `pvtime_base - size` is NOT page-aligned, proving the mask
+/// rounds it down rather than passing trivially.
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn aarch64_initrd_addr_returns_host_page_aligned_address() {
+    use crate::vmm::{aarch64::fdt::pvtime_base, kvm::DRAM_START};
+    let page = host_page_size();
+    for &(mem, cpus) in &[(512u32, 2u32), (512, 8), (2048, 256), (4096, 512)] {
+        let pvt = pvtime_base(mem, cpus);
+        // Size chosen so `pvt - size = DRAM_START + 12345`, whose low
+        // bits (12345) are not page-aligned: the mask must round down.
+        let size = pvt - DRAM_START - 12345;
+        let load = aarch64_initrd_addr(mem, cpus, size)
+            .expect("non-oversized initrd must produce a load address");
+        assert_eq!(
+            load & (page - 1),
+            0,
+            "initrd load addr {load:#x} not host-page-aligned \
+             (mem={mem} cpus={cpus} size={size:#x} page={page:#x})",
+        );
+        // The pre-mask top was deliberately unaligned, so the mask did
+        // real work: the aligned result must be strictly below it.
+        let pre_mask_top = pvt - size;
+        assert_ne!(
+            pre_mask_top & (page - 1),
+            0,
+            "fixture must present a non-page-aligned pre-mask top so the \
+             mask is exercised (mem={mem} cpus={cpus})",
+        );
+        assert!(
+            load < pre_mask_top,
+            "masked load {load:#x} must round DOWN from unaligned top \
+             {pre_mask_top:#x} (mem={mem} cpus={cpus})",
+        );
+    }
+}
+
+/// Pin the EXACT `aarch64_initrd_addr` arithmetic against an
+/// independently-computed reference: `(pvtime_base(mem,cpus) - size) &
+/// !(host_page_size() - 1)`. The existing aarch64 tests only bound the
+/// result, so a drift that swapped the ceiling (`pvtime_base` vs
+/// `fdt_address`) or changed the alignment granule would still satisfy
+/// their inequalities but fail this exact-equality pin.
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn aarch64_initrd_addr_exact_value_for_aligned_fit() {
+    use crate::vmm::aarch64::fdt::pvtime_base;
+    let page = host_page_size();
+    for &(mem, cpus, size) in &[(512u32, 2u32, 1u64 << 20), (2048, 256, 7_000_000)] {
+        let expected = (pvtime_base(mem, cpus) - size) & !(page - 1);
+        assert_eq!(
+            aarch64_initrd_addr(mem, cpus, size).unwrap(),
+            expected,
+            "exact load addr drift (mem={mem} cpus={cpus} size={size:#x})",
+        );
+    }
+}
+
+/// `base_guest_cmdline` must splice the arch-specific tail in and pin
+/// the cross-arch common flags. The free fn was extracted so a flag
+/// added once applies to BOTH arches — the doc cites a past per-arch
+/// drift that left `sysctl.vm.overcommit_memory=1` on x86 only and
+/// OOM-ed the aarch64 guest /init. Neither caller (`setup_memory`,
+/// `finish_aarch64_setup`) is host-testable, so this directly pins the
+/// assembled string: the cross-arch invariant flags, the spliced arch
+/// tail, and the `console=ttyS0` / `KTSTR_GUEST=1` anchors.
+#[test]
+fn base_guest_cmdline_splices_arch_tail_and_pins_common_flags() {
+    let s = base_guest_cmdline("KFENCE_TAIL_MARKER");
+    // Cross-arch common flags (the drift this fn exists to prevent).
+    assert!(
+        s.contains("sysctl.vm.overcommit_memory=1"),
+        "missing overcommit_memory=1 (the OOM-prevention flag); got {s:?}",
+    );
+    assert!(
+        s.contains("sysctl.kernel.sched_schedstats=1"),
+        "missing sched_schedstats=1; got {s:?}",
+    );
+    assert!(s.contains("delayacct"), "missing delayacct; got {s:?}");
+    // The arch tail is spliced in verbatim.
+    assert!(
+        s.contains("KFENCE_TAIL_MARKER"),
+        "arch_extra tail not spliced in; got {s:?}",
+    );
+    // Start/end anchors: cmdline opens with console=ttyS0 and the
+    // KTSTR_GUEST=1 trailer is the final token.
+    assert!(
+        s.starts_with("console=ttyS0"),
+        "cmdline must open with console=ttyS0; got {s:?}",
+    );
+    assert!(
+        s.ends_with("KTSTR_GUEST=1"),
+        "cmdline must end with the KTSTR_GUEST=1 trailer; got {s:?}",
+    );
+}
+
+#[test]
+fn numa_balancing_token_uses_kernel_accepted_spellings() {
+    use crate::vmm::topology::{NumaNode, Topology};
+    // Uniform topology has no memory-only nodes -> disable. The token
+    // MUST be the kernel-accepted "disable" string: setup_numabalancing
+    // (mm/mempolicy.c) strcmp-rejects everything but "enable"/"disable",
+    // so the old "numa_balancing=0" was silently ignored, leaving NUMA
+    // balancing at its CONFIG default instead of off.
+    let uniform = Topology::new(1, 1, 2, 1);
+    assert!(!uniform.has_memory_only_nodes());
+    assert_eq!(
+        numa_balancing_cmdline_token(&uniform),
+        " numa_balancing=disable",
+        "disable token must be the kernel-accepted 'disable' string, not '0'",
+    );
+    // Memory-only (CXL) topology -> enable (migrate pages toward
+    // CPU-bearing nodes).
+    static NODES: [NumaNode; 3] = [
+        NumaNode::new(2, 512),
+        NumaNode::new(2, 512),
+        NumaNode::new(0, 1024),
+    ];
+    let cxl = Topology::with_nodes(4, 1, &NODES);
+    assert!(cxl.has_memory_only_nodes());
+    assert_eq!(numa_balancing_cmdline_token(&cxl), " numa_balancing=enable");
+}

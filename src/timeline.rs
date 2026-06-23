@@ -106,7 +106,7 @@ pub struct StimulusEvent {
     /// by `step_index`) — and the terminal is then NOT consumed for a
     /// rate: the snapshot path's attribution loop skips the
     /// `(StepEnd[N], terminal)` pair via its `is_step_end` guard (before
-    /// `rate_to` is reached), and `Timeline::build` reaches for the
+    /// `rate_components` is reached), and `Timeline::build` reaches for the
     /// terminal only when a step's `StepEnd` lookup misses. The terminal
     /// is consumed as a step's rate boundary ONLY for legacy/synthetic
     /// data that carries a `ScenarioEnd` frame but no `StepEnd` frames
@@ -232,8 +232,12 @@ impl StimulusEvent {
     /// guest-clock elapsed-ms delta between them. Returns `None` ONLY when
     /// the measurement is genuinely undefined: either event lacks a
     /// `total_iterations` sample, the window is zero-length, or the count
-    /// went BACKWARD (`next < self` — a worker-population reset; the delta
-    /// is unmeasurable, not zero).
+    /// went BACKWARD (`next < self` — a counter reset; the delta is
+    /// unmeasurable, not zero). The backward case is reachable only for the
+    /// guard-skipped cross-step pairing or legacy/synthetic data, NOT for
+    /// the live step-local `StepStart[k]` -> `StepEnd[k]` pair: teardown
+    /// runs after `StepEnd` is emitted, so the handle set is stable within
+    /// a step and the per-worker counters are monotone across the pair.
     ///
     /// MEASURED ZERO is distinct from not-measured: a step whose workers
     /// made exactly zero forward progress over a positive hold
@@ -248,12 +252,30 @@ impl StimulusEvent {
     /// `before > 0.0` gate avoids a div-by-zero — but an *unchanged* zero
     /// is not a degradation.)
     ///
-    /// This is the SINGLE iteration_rate formula shared by
+    /// This is the SINGLE iteration-rate formula, shared via its
+    /// decomposition [`Self::rate_components`] by
     /// [`crate::assert::build_phase_buckets_with_stimulus`] (per-step
     /// windows attributed by `step_index`) and [`Timeline::build`]
     /// (per-phase windows attributed by index) — the two callers pair
-    /// events differently but must compute the rate identically.
-    pub(crate) fn rate_to(&self, next: &StimulusEvent) -> Option<f64> {
+    /// events differently but must compute the rate identically. The
+    /// per-step metric producer inserts the `rate_components` pair (the
+    /// `iteration_rate` Rate's `total_phase_iterations` /
+    /// `total_phase_duration_sec` components); `rate_to` (the quotient) is
+    /// the display/comparison form used by `Timeline::build` and the
+    /// result-helper ratios.
+    pub fn rate_to(&self, next: &StimulusEvent) -> Option<f64> {
+        self.rate_components(next).map(|(iters, secs)| iters / secs)
+    }
+
+    /// The `(iteration_delta, window_seconds)` components of [`Self::rate_to`]
+    /// — same `None` conditions (missing `total_iterations`, backward count,
+    /// or zero-length window). The per-phase metric pipeline inserts these as
+    /// the `total_phase_iterations` / `total_phase_duration_sec` Counter
+    /// components rather than the ready ratio, so the `iteration_rate` Rate
+    /// re-pools across phases/runs as `Σdelta / Σseconds`, not a mean of
+    /// per-phase ratios. The ms→s `/1000` lives HERE (the seconds component)
+    /// because `derive_rate_metrics` does a bare num/den with no scaling.
+    pub fn rate_components(&self, next: &StimulusEvent) -> Option<(f64, f64)> {
         let s = self.total_iterations?;
         let e = next.total_iterations?;
         if e < s {
@@ -263,7 +285,24 @@ impl StimulusEvent {
         if duration_ms == 0 {
             return None;
         }
-        Some((e - s) as f64 / (duration_ms as f64 / 1000.0))
+        Some(((e - s) as f64, duration_ms as f64 / 1000.0))
+    }
+
+    /// The scenario [`Phase`](crate::assert::Phase) this event belongs to,
+    /// or `None` for the terminal scenario-end boundary (which seeds no
+    /// phase). Use THIS — not the raw [`Self::step_index`] field — to key
+    /// per-phase lookups. `step_index` carries the bridge 1-indexed wire
+    /// convention (`Step k` -> `Some(k + 1)`) while `label` renders the
+    /// 0-indexed `k`, so reading the field directly invites the 0-vs-1
+    /// off-by-one this method removes: it maps the wire value onto the same
+    /// [`Phase`](crate::assert::Phase) newtype the
+    /// [`ScenarioStats`](crate::assert::ScenarioStats) /
+    /// [`PhaseBucket`](crate::assert::PhaseBucket) accessors are keyed by
+    /// (`Phase::step(k)`). Step events carry `step_index >= 1`, so the
+    /// `saturating_sub(1)` is exact.
+    pub fn phase(&self) -> Option<crate::assert::Phase> {
+        self.step_index
+            .map(|si| crate::assert::Phase::step(si.saturating_sub(1)))
     }
 }
 
@@ -336,6 +375,22 @@ pub struct Phase {
     pub metrics: PhaseMetrics,
     /// Changes detected at this phase's stimulus boundary.
     pub changes: Vec<PhaseChange>,
+    /// Per-cgroup raw telemetry for this phase, keyed by cgroup name. Carried
+    /// from [`crate::assert::PhaseBucket::per_cgroup`] on the
+    /// [`Self`]-via-`from_phase_buckets` path; empty on the monitor-only
+    /// [`Timeline::build`] path (which has no carriers). Rendered as a
+    /// per-cgroup sub-block by display-time reduction
+    /// ([`crate::assert::PhaseCgroupStats::off_cpu_summary`] etc.); never a
+    /// change-detection input (those are [`PhaseMetrics`] scalars only).
+    pub per_cgroup: std::collections::BTreeMap<String, crate::assert::PhaseCgroupStats>,
+    /// True when `(start_ms, end_ms)` is the normalized `(0, 0)` of an ORPHAN
+    /// carrier (no measured host window) rather than a real window. Set in
+    /// `phase_from_bucket` by the orphan shape signature `(0,0)` + empty
+    /// `metrics` + non-empty `per_cgroup` (unique to
+    /// `crate::assert::fold_guest_per_cgroup_into_host_buckets`'s orphan arm).
+    /// The render shows "window not measured" instead of a misleading `0ms`.
+    /// Always `false` on the [`Timeline::build`] path.
+    pub not_measured_window: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -392,6 +447,103 @@ fn detect_change(
     })
 }
 
+/// Per-boundary change set between two adjacent phases, shared by both
+/// [`Timeline::build`] and [`Timeline::from_phase_buckets`].
+///
+/// Throughput (`iteration_rate`) is compared whenever BOTH phases carry
+/// a rate and the earlier one is positive — INCLUDING a synthesized
+/// zero-capture step, whose rate is stimulus-derived (total_iterations
+/// deltas) rather than sampled. Throughput is the one metric that
+/// survives a capture gap, so a throughput collapse entering or leaving
+/// a synthesized step must still be flagged; gating it on `sample_count`
+/// (as both call sites did before) silently dropped exactly the
+/// degradation this timeline exists to surface.
+///
+/// Asymmetry from the `bi > 0.0` div-by-zero guard: a COLLAPSE into a
+/// zero-rate (incl. a synthesized measured-zero) step is flagged
+/// (before > 0), but a RECOVERY out of one (before == 0 -> positive) is
+/// not — there is no relative baseline to divide by. This is a
+/// deliberate tradeoff, not an oversight: an unchanged zero is genuinely
+/// not a degradation, and the collapse direction (the one this task
+/// targets) is caught.
+///
+/// The monitor-derived metrics (imbalance, dsq depth, fallback rate,
+/// keep_last rate) ARE gated on both phases having real samples. The
+/// values themselves can be real even on a synthesized phase (monitor
+/// windows fold into the bucket), but they come from a DIFFERENT
+/// sampling basis (folded monitor window vs captured periodic samples)
+/// than a captured neighbor's, so cross-comparing them is
+/// apples-to-oranges — suppressed. Throughput is exempt because it is
+/// the same stimulus-derived quantity on both sides.
+fn detect_boundary_changes(before: &PhaseMetrics, after: &PhaseMetrics) -> Vec<PhaseChange> {
+    let mut changes = Vec::new();
+
+    // Monitor-derived metrics (absolute-unit gauges/rates with
+    // fixed-magnitude thresholds) — gated on both phases having real
+    // samples. Pushed FIRST to preserve the historical render order
+    // (these before throughput in a multi-change boundary; format_phases
+    // renders changes in vec order).
+    if before.sample_count > 0 && after.sample_count > 0 {
+        if let (Some(bi), Some(ai)) = (before.avg_imbalance, after.avg_imbalance) {
+            changes.extend(detect_change(
+                bi,
+                ai,
+                IMBALANCE_THRESHOLD,
+                "imbalance",
+                true,
+            ));
+        }
+        if let (Some(bd), Some(ad)) = (before.avg_dsq_depth, after.avg_dsq_depth) {
+            changes.extend(detect_change(bd, ad, DSQ_THRESHOLD, "dsq_depth", true));
+        }
+        if let (Some(bf), Some(af)) = (before.fallback_rate, after.fallback_rate) {
+            changes.extend(detect_change(
+                bf,
+                af,
+                FALLBACK_RATE_THRESHOLD,
+                "fallback",
+                true,
+            ));
+        }
+        if let (Some(bk), Some(ak)) = (before.keep_last_rate, after.keep_last_rate) {
+            changes.extend(detect_change(
+                bk,
+                ak,
+                KEEP_LAST_RATE_THRESHOLD,
+                "keep_last",
+                true,
+            ));
+        }
+    }
+
+    // Throughput is the SOLE rate-class field (counter-delta / elapsed), so
+    // it uses a RELATIVE threshold (rel = (ai-bi)/bi vs
+    // ITERATION_RATE_REL_THRESHOLD) and cannot route through detect_change's
+    // absolute-delta gate above — fixed-unit metrics get absolute
+    // thresholds, this gets a relative one (a semantic-class decision, not
+    // arbitrary). Strict `>`: an exactly-at-threshold relative change is not
+    // flagged. Pushed last so it renders after the monitor metrics.
+    if let (Some(bi), Some(ai)) = (before.iteration_rate, after.iteration_rate)
+        && bi > 0.0
+    {
+        let rel = (ai - bi) / bi;
+        if rel.abs() > ITERATION_RATE_REL_THRESHOLD {
+            changes.push(PhaseChange {
+                direction: if rel < 0.0 {
+                    ChangeDirection::Degraded
+                } else {
+                    ChangeDirection::Improved
+                },
+                metric: "throughput".to_string(),
+                before: bi,
+                after: ai,
+            });
+        }
+    }
+
+    changes
+}
+
 impl Timeline {
     /// Build a timeline from stimulus events and monitor samples.
     ///
@@ -405,21 +557,41 @@ impl Timeline {
     /// Build a Timeline from stimulus events + raw monitor
     /// samples via the per-window `compute_metrics` reduction.
     /// The production success path uses [`Self::from_phase_buckets`]
-    /// (which folds pre-bucketed PhaseBuckets) ; `build` is the
-    /// fallback evaluate_vm_result takes for monitor-only runs
-    /// (no snapshot bridge captures → PhaseBuckets vec is empty
-    /// but monitor samples exist) so the failure-message
-    /// timeline still renders. Both entry points produce the
-    /// same Timeline field shape; from_phase_buckets is
-    /// preferred when buckets are available because it avoids
-    /// the per-MonitorSample reduction.
-    pub fn build(stimulus_events: &[StimulusEvent], monitor_samples: &[MonitorSample]) -> Self {
+    /// (which folds pre-bucketed PhaseBuckets); `build` is the fallback
+    /// evaluate_vm_result takes only for a run with an EMPTY PhaseBuckets
+    /// vec but monitor samples present — i.e. no periodic captures AND no
+    /// stimulus Steps. A monitor-only run that DID run Steps now
+    /// synthesizes a capture-free bucket per StepStart (see
+    /// [`crate::assert::build_phase_buckets_with_stimulus`]), so its vec is
+    /// non-empty and it takes the from_phase_buckets path (whose
+    /// fold_monitor_into_bucket recovers the same monitor-derived metric
+    /// set this path computes). Both entry points produce the same
+    /// Timeline field shape; from_phase_buckets is preferred when buckets
+    /// are available because it avoids the per-MonitorSample reduction.
+    ///
+    /// `preemption_threshold_ns` threads the vCPU-preemption exemption
+    /// window into the per-phase stall predicate (see `compute_metrics`);
+    /// the production caller passes the run's
+    /// `MonitorReport::preemption_threshold_ns`. `0` derives it from the
+    /// guest kernel `CONFIG_HZ`.
+    pub fn build(
+        stimulus_events: &[StimulusEvent],
+        monitor_samples: &[MonitorSample],
+        preemption_threshold_ns: u64,
+    ) -> Self {
         if stimulus_events.is_empty() || monitor_samples.is_empty() {
             return Self { phases: Vec::new() };
         }
 
         let mut events = stimulus_events.to_vec();
-        events.sort_by_key(|e| e.elapsed_ms);
+        // Total-order on an elapsed_ms tie: StepEnd before StepStart
+        // (`!is_step_end` is false=0 for StepEnd) so a zero-length
+        // inter-step gap at the guest's coarse-ms clock attributes the
+        // step-local StepStart[k]->StepEnd[k] rate to bucket k, never the
+        // cross-step StepStart[k]->StepStart[k+1] delta. Mirrors the same
+        // sort in build_phase_buckets_with_stimulus so the two rate
+        // consumers stay identical.
+        events.sort_by_key(|e| (e.elapsed_ms, !e.is_step_end));
 
         // Clock alignment: find the offset between guest stimulus time
         // and host monitor time. The first stimulus event (ScenarioStart)
@@ -492,15 +664,32 @@ impl Timeline {
                 .filter(|s| s.elapsed_ms >= start && s.elapsed_ms < end && sample_looks_valid(s))
                 .collect();
 
-            let metrics = compute_metrics(&phase_samples);
+            let metrics = compute_metrics(&phase_samples, preemption_threshold_ns);
 
             phases.push(Phase {
+                // Enumerate position over the phase-bearing step_events,
+                // NOT the bucket step_index `phase_from_bucket` uses. This
+                // path's input is a monitor-only / legacy / test stream with
+                // no step_index-bearing Stimulus frames (the settle is
+                // step_events[0]; later events follow), so enumerate IS the
+                // step identity and `index == 0 => BASELINE` holds for this
+                // model. It diverges from the step_index model ONLY for a
+                // step_index-bearing stream with no leading settle (the
+                // production stimulus shape), which never reaches `build`:
+                // build is the monitor-only fallback, taken only when there
+                // are no PhaseBuckets, i.e. no StepStarts
+                // (build_phase_buckets_with_stimulus synthesizes a bucket
+                // per StepStart) — so a step_index-bearing production stream
+                // always takes from_phase_buckets, never this path.
                 index: idx,
                 start_ms: start,
                 end_ms: end,
                 stimulus,
                 metrics,
                 changes: Vec::new(),
+                // Monitor-only path: no per-cgroup carriers, real window.
+                per_cgroup: std::collections::BTreeMap::new(),
+                not_measured_window: false,
             });
         }
 
@@ -540,8 +729,12 @@ impl Timeline {
                     terminal
                 }
             });
-            // Shared formula with build_phase_buckets_with_stimulus via
-            // StimulusEvent::rate_to (the sole iteration_rate site).
+            // Timeline::build's display fallback: compute this phase's rate
+            // directly via rate_to. The metric-pipeline producer
+            // build_phase_buckets_with_stimulus shares the same rate
+            // semantics via rate_components (it emits the two Counter
+            // components that derive_rate_metrics re-pools into
+            // iteration_rate); this display field reads the quotient.
             if let Some(next_ev) = next
                 && let Some(rate) = this.rate_to(next_ev)
             {
@@ -549,63 +742,12 @@ impl Timeline {
             }
         }
 
-        // Detect changes at each phase boundary.
+        // Detect changes at each phase boundary. Throughput is compared
+        // even across synthesized zero-capture steps; monitor-derived
+        // metrics stay gated on both phases having real samples (see
+        // [`detect_boundary_changes`]).
         for i in 1..phases.len() {
-            let before = &phases[i - 1].metrics;
-            let after_metrics = &phases[i].metrics;
-            let mut changes = Vec::new();
-
-            if before.sample_count > 0 && after_metrics.sample_count > 0 {
-                if let (Some(bi), Some(ai)) = (before.avg_imbalance, after_metrics.avg_imbalance) {
-                    changes.extend(detect_change(
-                        bi,
-                        ai,
-                        IMBALANCE_THRESHOLD,
-                        "imbalance",
-                        true,
-                    ));
-                }
-                if let (Some(bd), Some(ad)) = (before.avg_dsq_depth, after_metrics.avg_dsq_depth) {
-                    changes.extend(detect_change(bd, ad, DSQ_THRESHOLD, "dsq_depth", true));
-                }
-                if let (Some(bf), Some(af)) = (before.fallback_rate, after_metrics.fallback_rate) {
-                    changes.extend(detect_change(
-                        bf,
-                        af,
-                        FALLBACK_RATE_THRESHOLD,
-                        "fallback",
-                        true,
-                    ));
-                }
-                if let (Some(bk), Some(ak)) = (before.keep_last_rate, after_metrics.keep_last_rate)
-                {
-                    changes.extend(detect_change(
-                        bk,
-                        ak,
-                        KEEP_LAST_RATE_THRESHOLD,
-                        "keep_last",
-                        true,
-                    ));
-                }
-                if let (Some(bi), Some(ai)) = (before.iteration_rate, after_metrics.iteration_rate)
-                    && bi > 0.0
-                {
-                    let rel_delta = (ai - bi) / bi;
-                    if rel_delta.abs() > ITERATION_RATE_REL_THRESHOLD {
-                        changes.push(PhaseChange {
-                            direction: if rel_delta < 0.0 {
-                                ChangeDirection::Degraded
-                            } else {
-                                ChangeDirection::Improved
-                            },
-                            metric: "throughput".to_string(),
-                            before: bi,
-                            after: ai,
-                        });
-                    }
-                }
-            }
-
+            let changes = detect_boundary_changes(&phases[i - 1].metrics, &phases[i].metrics);
             phases[i].changes = changes;
         }
 
@@ -667,12 +809,21 @@ impl Timeline {
     fn format_phases(&self, out: &mut String) {
         for phase in &self.phases {
             let duration_ms = phase.end_ms.saturating_sub(phase.start_ms);
+            // An orphan carrier carries a normalized (0,0) window that is NOT a
+            // measured zero-duration step; surface it as not-measured rather
+            // than a misleading 0ms (the None-vs-Some discipline the per-metric
+            // renders use, applied to the window).
+            let window = if phase.not_measured_window {
+                "window not measured".to_string()
+            } else {
+                format!("{duration_ms}ms")
+            };
 
             if phase.index == 0 {
                 // Phase 0 is the settle window before any stimulus.
                 out.push_str(&format!(
-                    "\nBASELINE (settle, {}ms, {} samples):\n",
-                    duration_ms, phase.metrics.sample_count,
+                    "\nBASELINE (settle, {}, {} samples):\n",
+                    window, phase.metrics.sample_count,
                 ));
             } else {
                 let label_start = phase
@@ -689,13 +840,29 @@ impl Timeline {
                     .unwrap_or_else(|| "?".to_string());
 
                 out.push_str(&format!(
-                    "\nPhase {}: {} ({}ms, {} samples):\n",
-                    phase.index, label_start, duration_ms, phase.metrics.sample_count,
+                    "\nPhase {}: {} ({}, {} samples):\n",
+                    phase.index, label_start, window, phase.metrics.sample_count,
                 ));
             }
 
             let m = &phase.metrics;
-            if m.sample_count > 0 {
+            // Render the metric block whenever the phase carries
+            // monitor-derived metrics, not only when it captured periodic
+            // samples: a SYNTHESIZED zero-capture bucket
+            // (build_phase_buckets_with_stimulus) has sample_count 0 but
+            // fold_monitor_into_bucket fills its imbalance / dsq / fallback
+            // / stall from in-window monitor samples — render them for
+            // parity with the legacy Timeline::build path (which a
+            // zero-capture-with-monitor run took before the synthesize
+            // seam flipped it onto from_phase_buckets).
+            let has_monitor_metrics = m.avg_imbalance.is_some()
+                || m.max_imbalance.is_some()
+                || m.avg_dsq_depth.is_some()
+                || m.max_dsq_depth > 0
+                || m.fallback_rate.is_some()
+                || m.keep_last_rate.is_some()
+                || m.stall_count > 0;
+            if m.sample_count > 0 || has_monitor_metrics {
                 out.push_str(&format!(
                     "  imbalance: avg={} max={} | dsq: avg={} max={}",
                     m.avg_imbalance
@@ -713,15 +880,36 @@ impl Timeline {
                     out.push_str(&format!(" | keep_last: {:.0}/s", kl));
                 }
                 if let Some(ir) = m.iteration_rate {
-                    out.push_str(&format!(" | throughput: {:.0} iter/s", ir));
+                    // A synthesized (sample_count==0) step's rate is
+                    // stimulus-derived; label it consistently with the
+                    // no-monitor-metrics branch below.
+                    let suffix = if m.sample_count == 0 {
+                        " (stimulus-derived)"
+                    } else {
+                        ""
+                    };
+                    out.push_str(&format!(" | throughput: {ir:.0} iter/s{suffix}"));
                 }
                 out.push('\n');
                 if m.stall_count > 0 {
                     out.push_str(&format!("  stalls: {}\n", m.stall_count));
                 }
+            } else if let Some(ir) = m.iteration_rate {
+                // Synthesized zero-capture step (the
+                // build_phase_buckets_with_stimulus seam): no periodic
+                // captures landed, but the stimulus StepStart/StepEnd
+                // deltas still yield a throughput. Surface it so a short
+                // interior step's recovered rate is visible in the
+                // rendered timeline, not only via the structured
+                // phase_metric/step_metric API.
+                out.push_str(&format!(
+                    "  [no samples] | throughput: {ir:.0} iter/s (stimulus-derived)\n"
+                ));
             } else {
                 out.push_str("  [no samples]\n");
             }
+
+            format_phase_cgroups(out, &phase.per_cgroup);
 
             if let Some(ref stim) = phase.stimulus {
                 let detail = stim.detail.as_deref().unwrap_or("");
@@ -769,7 +957,7 @@ impl Timeline {
     /// Rate fields (`fallback_rate`, `keep_last_rate`) are computed
     /// by dividing the bucket's reduced counter delta by the
     /// bucket's window duration in seconds
-    /// (`end_ms - start_ms / 1000.0`). When the window has zero
+    /// (`(end_ms - start_ms) / 1000.0`). When the window has zero
     /// duration (degenerate bucket) the rate stays `None`.
     ///
     /// Every PhaseMetrics field has a PhaseBucket source — but
@@ -810,70 +998,29 @@ impl Timeline {
         sorted_events.sort_by_key(|e| e.elapsed_ms);
         let mut phases: Vec<Phase> = sorted
             .into_iter()
-            .enumerate()
-            .map(|(idx, b)| phase_from_bucket(idx, b, &sorted_events))
+            .map(|b| phase_from_bucket(b, &sorted_events))
             .collect();
-        // Boundary-change detection — same per-pair diffing logic
-        // [`Self::build`] applies. Walks each adjacent (prev, curr)
-        // pair and records significant deltas on the LATER phase's
-        // `changes` vec so the operator sees "what changed when
-        // entering this phase". Skips pairs where either side had
-        // no samples — those phases produce default-zero metrics
-        // and a diff would falsely paint every metric as changed.
+        // Boundary-change detection — shares [`detect_boundary_changes`]
+        // with [`Self::build`]. Walks each adjacent (prev, curr) pair and
+        // records significant deltas on the LATER phase's `changes` vec so
+        // the operator sees "what changed when entering this phase".
+        // Throughput is compared even when a side is a SYNTHESIZED
+        // zero-capture bucket (build_phase_buckets_with_stimulus): its
+        // `iteration_rate` is stimulus-derived and real, so a throughput
+        // collapse entering or leaving it must surface. The monitor-derived
+        // metrics (imbalance / dsq depth / fallback / keep_last) stay gated
+        // inside the helper on both phases having real samples, so a
+        // partial-metric phase never paints a phantom non-throughput change.
+        // An orphan phase (a not-measured (0,0) window with all-None
+        // PhaseMetrics) sits between its neighbors here, so detect_boundary_changes
+        // compares each real neighbor against the orphan's None metrics — which
+        // the helper gates away (both sides must be Some) — rather than across
+        // the unmeasured window. INTENTIONAL: there is no data for the orphan's
+        // step, so flagging a phase-k-1 -> phase-k+1 change as if they were
+        // adjacent would assert a transition over an unmeasured interval. This is
+        // render-only (Phase.changes has no verdict/sidecar/A-B consumer).
         for i in 1..phases.len() {
-            let before = phases[i - 1].metrics.clone();
-            let after = &phases[i].metrics;
-            if before.sample_count == 0 || after.sample_count == 0 {
-                continue;
-            }
-            let mut changes = Vec::new();
-            if let (Some(bi), Some(ai)) = (before.avg_imbalance, after.avg_imbalance) {
-                changes.extend(detect_change(
-                    bi,
-                    ai,
-                    IMBALANCE_THRESHOLD,
-                    "imbalance",
-                    true,
-                ));
-            }
-            if let (Some(bd), Some(ad)) = (before.avg_dsq_depth, after.avg_dsq_depth) {
-                changes.extend(detect_change(bd, ad, DSQ_THRESHOLD, "dsq_depth", true));
-            }
-            if let (Some(bf), Some(af)) = (before.fallback_rate, after.fallback_rate) {
-                changes.extend(detect_change(
-                    bf,
-                    af,
-                    FALLBACK_RATE_THRESHOLD,
-                    "fallback",
-                    true,
-                ));
-            }
-            if let (Some(bk), Some(ak)) = (before.keep_last_rate, after.keep_last_rate) {
-                changes.extend(detect_change(
-                    bk,
-                    ak,
-                    KEEP_LAST_RATE_THRESHOLD,
-                    "keep_last",
-                    true,
-                ));
-            }
-            if let (Some(bi), Some(ai)) = (before.iteration_rate, after.iteration_rate)
-                && bi > 0.0
-            {
-                let rel = (ai - bi) / bi;
-                if rel.abs() > ITERATION_RATE_REL_THRESHOLD {
-                    changes.push(PhaseChange {
-                        direction: if rel < 0.0 {
-                            ChangeDirection::Degraded
-                        } else {
-                            ChangeDirection::Improved
-                        },
-                        metric: "throughput".to_string(),
-                        before: bi,
-                        after: ai,
-                    });
-                }
-            }
+            let changes = detect_boundary_changes(&phases[i - 1].metrics, &phases[i].metrics);
             phases[i].changes = changes;
         }
         Self { phases }
@@ -901,18 +1048,19 @@ impl Timeline {
 // PhaseBucket → Phase conversion
 // ---------------------------------------------------------------------------
 
-/// Build a [`Phase`] from a [`crate::assert::PhaseBucket`]. The
-/// bucket's `step_index` becomes the phase index; the metric map
-/// is projected onto the named `PhaseMetrics` fields per the table
-/// in [`Timeline::from_phase_buckets`]. Phase 0 (BASELINE) emits
-/// `stimulus = None`; later phases synthesize a [`StimulusEvent`]
-/// whose label / op_kind come from the bucket label so the
-/// failure-message renderer prints a recognizable phase header.
-fn phase_from_bucket(
-    idx: usize,
-    b: &crate::assert::PhaseBucket,
-    sorted_events: &[&StimulusEvent],
-) -> Phase {
+/// Build a [`Phase`] from a [`crate::assert::PhaseBucket`]. The phase
+/// index is the bucket's `step_index` (BASELINE = 0, scenario Step k =
+/// k + 1), NOT the enumerate position in the vec — so `format_phases`
+/// keys its BASELINE-vs-Step label on the true phase identity, and a run
+/// whose first bucket is a Step (no BASELINE bucket, e.g. under
+/// `--cell-parent-cgroup` where BASELINE captured nothing) renders that
+/// Step correctly rather than mislabeling it as BASELINE. The metric map
+/// is projected onto the named `PhaseMetrics` fields per the table in
+/// [`Timeline::from_phase_buckets`]. BASELINE (`step_index` 0) emits
+/// `stimulus = None`; later phases synthesize a [`StimulusEvent`] whose
+/// label / op_kind come from the bucket label so the failure-message
+/// renderer prints a recognizable phase header.
+fn phase_from_bucket(b: &crate::assert::PhaseBucket, sorted_events: &[&StimulusEvent]) -> Phase {
     let duration_s = if b.end_ms > b.start_ms {
         (b.end_ms - b.start_ms) as f64 / 1000.0
     } else {
@@ -944,9 +1092,11 @@ fn phase_from_bucket(
             .unwrap_or(0),
         fallback_rate: rate("total_fallback"),
         keep_last_rate: rate("total_keep_last"),
-        // iteration_rate is already a rate per-phase, not a
-        // counter-over-window — read it verbatim from the
-        // bucket map; do NOT divide by duration.
+        // iteration_rate is a derived Rate: derive_rate_metrics already
+        // placed the Σiterations/Σseconds quotient into the bucket map, so
+        // read it verbatim — do NOT divide by duration (unlike
+        // fallback_rate / keep_last_rate above, which divide their Counter
+        // by the window).
         iteration_rate: b.metrics.get("iteration_rate").copied(),
     };
     let stimulus = if b.step_index == 0 {
@@ -984,13 +1134,99 @@ fn phase_from_bucket(
             }),
         }
     };
+    // Orphan signature: fold_guest_per_cgroup_into_host_buckets normalizes a
+    // guest carrier with no paired host bucket to a (0,0) window carrying ONLY
+    // per_cgroup (empty metrics). A captured bucket has metrics, so the
+    // (0,0)+empty-metrics+non-empty-per_cgroup shape is the orphan arm's on
+    // every NON-zero-duration window. The one other producer is a ZERO-duration
+    // step at scenario start (StepStart[k] == StepEnd[k] == 0 -> a synthesized
+    // host (0,0) window with empty metrics, since duration 0 yields no rate and
+    // no in-window monitor sample, then MATCHED with a same-step guest carrier),
+    // but that collision is HARMLESS: a zero-duration step has no window to
+    // measure, so "window not measured" reads the same as the "0ms" it would
+    // otherwise show. Display-only, with no verdict/sidecar consumer,
+    // so the marker needs no serialized PhaseBucket flag.
+    let not_measured_window =
+        b.start_ms == 0 && b.end_ms == 0 && b.metrics.is_empty() && !b.per_cgroup.is_empty();
     Phase {
-        index: idx,
+        index: b.step_index as usize,
         start_ms: b.start_ms,
         end_ms: b.end_ms,
         stimulus,
         metrics,
         changes: Vec::new(),
+        per_cgroup: b.per_cgroup.clone(),
+        not_measured_window,
+    }
+}
+
+/// Cap on per-cgroup lines rendered per phase, bounding the failure-message
+/// size for a many-cgroup scenario (the sched_log render caps similarly).
+/// Truncation is by BTreeMap NAME order (deterministic, no ranking math); a
+/// "+J more" note records the drop so the cap never reads as "all cgroups".
+const MAX_RENDERED_CGROUPS: usize = 16;
+
+/// Render the per-cgroup sub-block for one phase: one line per cgroup in
+/// BTreeMap (name) order, reduced at display time via the
+/// [`crate::assert::PhaseCgroupStats`] summaries. Empty `per_cgroup` (the
+/// monitor-only path, or a phase that carried no per-cgroup components)
+/// renders nothing. The None-vs-Some(0.0)
+/// discipline carries through: an absent off-CPU reduction renders `n/a` (NOT
+/// `0.0%`), and an empty wake / run-delay pool OMITS that segment rather than
+/// painting a misleading `0µs`.
+fn format_phase_cgroups(
+    out: &mut String,
+    per_cgroup: &std::collections::BTreeMap<String, crate::assert::PhaseCgroupStats>,
+) {
+    if per_cgroup.is_empty() {
+        return;
+    }
+    out.push_str("  per-cgroup:\n");
+    for (name, pcg) in per_cgroup.iter().take(MAX_RENDERED_CGROUPS) {
+        out.push_str(&format!("    {name}: "));
+        // A stripped carrier had its raw sample vectors dropped to fit the bulk
+        // frame, so off-cpu / wake / run-delay summaries are all absent — but
+        // that is NOT "not measured". Surface the size-limit drop explicitly so
+        // the operator does not read it as a quiet cgroup.
+        if pcg.stripped {
+            out.push_str("samples stripped (size limit)");
+        } else {
+            match pcg.off_cpu_summary() {
+                Some((avg, min, max, spread)) => out.push_str(&format!(
+                    "off-cpu avg={avg:.1}% min={min:.1}% max={max:.1}% spread={spread:.1}%"
+                )),
+                None => out.push_str("off-cpu n/a"),
+            }
+            if let Some((p99, median)) = pcg.wake_summary() {
+                out.push_str(&format!(
+                    " | wake p99={p99:.0}\u{00b5}s median={median:.0}\u{00b5}s"
+                ));
+            }
+            if let Some((mean, worst)) = pcg.run_delay_summary() {
+                out.push_str(&format!(
+                    " | run-delay mean={mean:.0}\u{00b5}s worst={worst:.0}\u{00b5}s"
+                ));
+            }
+        }
+        out.push_str(&format!(
+            " | iters={} migrations={}",
+            pcg.total_iterations, pcg.total_migrations
+        ));
+        // Gap is a Peak with no Option: 0 means "no notable gap", so omit it
+        // rather than print a noisy gap=0ms on every quiet cgroup.
+        if pcg.max_gap_ms > 0 {
+            out.push_str(&format!(
+                " | gap={}ms@cpu{}",
+                pcg.max_gap_ms, pcg.max_gap_cpu
+            ));
+        }
+        out.push('\n');
+    }
+    let total = per_cgroup.len();
+    if total > MAX_RENDERED_CGROUPS {
+        let dropped = total - MAX_RENDERED_CGROUPS;
+        let noun = if dropped == 1 { "cgroup" } else { "cgroups" };
+        out.push_str(&format!("    (+{dropped} more {noun})\n"));
     }
 }
 
@@ -998,7 +1234,23 @@ fn phase_from_bucket(
 // Metric computation
 // ---------------------------------------------------------------------------
 
-fn compute_metrics(samples: &[&MonitorSample]) -> PhaseMetrics {
+/// Reduce a phase's monitor samples to [`PhaseMetrics`].
+///
+/// `preemption_threshold_ns` is the vCPU-preemption exemption window for
+/// stall detection: a non-advancing `rq_clock` on a CPU whose
+/// `vcpu_cpu_time_ns` advanced by less than this is a host-preemption
+/// artifact, not a scheduler stall, and is exempt. Pass `0` to derive it
+/// from the guest kernel's `CONFIG_HZ` via
+/// `crate::monitor::vcpu_preemption_threshold_ns` — the same resolution
+/// [`MonitorSummary::from_samples_with_threshold`](crate::monitor::MonitorSummary::from_samples_with_threshold)
+/// applies, so the per-phase `stall_count` applies the SAME per-(CPU,
+/// window) `is_cpu_stuck` predicate as the run-level
+/// `MonitorSummary::stuck_count` (run-level `>=` Σ per-phase: it also
+/// windows across phase boundaries).
+pub(crate) fn compute_metrics(
+    samples: &[&MonitorSample],
+    preemption_threshold_ns: u64,
+) -> PhaseMetrics {
     if samples.is_empty() {
         return PhaseMetrics::default();
     }
@@ -1044,16 +1296,23 @@ fn compute_metrics(samples: &[&MonitorSample]) -> PhaseMetrics {
     }
 
     // Stall detection between consecutive valid samples in this phase.
+    // Route through `is_cpu_stuck` (the shared predicate the run-level
+    // `MonitorSummary` path also uses) so the per-phase stall count and the
+    // run-level stuck count apply the identical NOHZ-idle and
+    // vCPU-preemption exemptions — the per-phase count uses the SAME
+    // predicate as the run-level one (run-level `>=` Σ per-phase: it also
+    // counts the boundary-straddling window pair and out-of-phase samples).
+    let threshold = if preemption_threshold_ns > 0 {
+        preemption_threshold_ns
+    } else {
+        crate::monitor::vcpu_preemption_threshold_ns(None)
+    };
     for w in valid.windows(2) {
         let prev = w[0];
         let curr = w[1];
         let cpu_count = prev.cpus.len().min(curr.cpus.len());
         for cpu in 0..cpu_count {
-            let idle = curr.cpus[cpu].nr_running == 0 && prev.cpus[cpu].nr_running == 0;
-            if curr.cpus[cpu].rq_clock != 0
-                && curr.cpus[cpu].rq_clock == prev.cpus[cpu].rq_clock
-                && !idle
-            {
+            if crate::monitor::reader::is_cpu_stuck(&prev.cpus[cpu], &curr.cpus[cpu], threshold) {
                 stall_count += 1;
             }
         }
@@ -1121,6 +1380,30 @@ mod tests {
     use super::*;
     use crate::monitor::{CpuSnapshot, MonitorSample};
 
+    /// `StimulusEvent::phase()` maps the 1-indexed wire `step_index` onto the
+    /// canonical [`crate::assert::Phase`] (StepStart and StepEnd of step `k`
+    /// both -> `Phase::step(k)`); the scenario-end terminal seeds no phase.
+    #[test]
+    fn stimulus_event_phase_maps_wire_step_index_to_phase() {
+        use crate::assert::Phase;
+        // Wire step_index 1 (Step 0) -> Phase::step(0); 2 (Step 1) -> step(1).
+        assert_eq!(
+            StimulusEvent::from_wire(&wire_event(0, 1, 0)).phase(),
+            Some(Phase::step(0)),
+        );
+        assert_eq!(
+            StimulusEvent::from_wire(&wire_event(100, 2, 50)).phase(),
+            Some(Phase::step(1)),
+        );
+        // StepEnd carries the same step_index -> same Phase as its StepStart.
+        assert_eq!(
+            StimulusEvent::from_step_end(&wire_event(200, 2, 90)).phase(),
+            Some(Phase::step(1)),
+        );
+        // The terminal boundary is not a step -> no Phase.
+        assert_eq!(StimulusEvent::terminal(300, 100).phase(), None);
+    }
+
     fn sample(elapsed_ms: u64, cpus: Vec<(u32, u32, u64)>) -> MonitorSample {
         MonitorSample {
             prog_stats: None,
@@ -1158,21 +1441,21 @@ mod tests {
 
     #[test]
     fn empty_inputs_empty_timeline() {
-        let t = Timeline::build(&[], &[]);
+        let t = Timeline::build(&[], &[], 0);
         assert!(t.phases.is_empty());
     }
 
     #[test]
     fn no_stimulus_empty_timeline() {
         let samples = vec![sample(1000, vec![(2, 1, 100)])];
-        let t = Timeline::build(&[], &samples);
+        let t = Timeline::build(&[], &samples, 0);
         assert!(t.phases.is_empty());
     }
 
     #[test]
     fn no_monitor_empty_timeline() {
         let events = vec![stimulus(0, "ScenarioStart")];
-        let t = Timeline::build(&events, &[]);
+        let t = Timeline::build(&events, &[], 0);
         assert!(t.phases.is_empty());
     }
 
@@ -1183,7 +1466,7 @@ mod tests {
             sample(600, vec![(2, 1, 100), (2, 1, 200)]),
             sample(700, vec![(2, 1, 300), (2, 1, 400)]),
         ];
-        let t = Timeline::build(&events, &samples);
+        let t = Timeline::build(&events, &samples, 0);
         assert_eq!(t.phases.len(), 1);
         // Both samples — including the one AT last_monitor_ms (700) —
         // must fall inside the single phase's [start, last_monitor_ms+1)
@@ -1199,7 +1482,7 @@ mod tests {
         let samples: Vec<MonitorSample> = (5..65)
             .map(|i| sample(i * 100, vec![(2, 1, i * 1000), (2, 1, i * 1000 + 100)]))
             .collect();
-        let t = Timeline::build(&events, &samples);
+        let t = Timeline::build(&events, &samples, 0);
         assert_eq!(t.phases.len(), 2);
         // Pin WHERE the boundary fell, not just non-emptiness: 60 samples
         // at i*100 (i in 5..65 → 500..6400); the >500 warmup drops the
@@ -1234,7 +1517,7 @@ mod tests {
                 vec![(2, 1, i * 1000), (2, 1, i * 1000 + 100)],
             ));
         }
-        let t = Timeline::build(&events, &samples);
+        let t = Timeline::build(&events, &samples, 0);
         let improvements: Vec<_> = t
             .phases
             .iter()
@@ -1250,11 +1533,662 @@ mod tests {
         let samples: Vec<MonitorSample> = (5..25)
             .map(|i| sample(i * 100, vec![(2, 1, i * 1000), (2, 1, i * 1000 + 100)]))
             .collect();
-        let t = Timeline::build(&events, &samples);
+        let t = Timeline::build(&events, &samples, 0);
         let formatted = t.format_with_context(&TimelineContext::default());
         assert!(formatted.contains("BASELINE"));
         assert!(formatted.contains("Phase 1"));
         assert!(formatted.contains("imbalance"));
+    }
+
+    /// A synthesized zero-capture step (sample_count==0) still renders its
+    /// stimulus-derived throughput in the formatted timeline, not only
+    /// "[no samples]". Pins the synthesized-step visibility in format_phases. The
+    /// BASELINE bucket holds step_index 0 (its phase index, the settle
+    /// render) so the synthesized step lands at a Phase index that takes
+    /// the metric path.
+    #[test]
+    fn format_renders_synthesized_step_throughput() {
+        let buckets = vec![
+            crate::assert::PhaseBucket {
+                per_cgroup: Default::default(),
+                step_index: 0,
+                label: "BASELINE".to_string(),
+                start_ms: 0,
+                end_ms: 1000,
+                sample_count: 2,
+                metrics: std::collections::BTreeMap::new(),
+            },
+            crate::assert::PhaseBucket {
+                per_cgroup: Default::default(),
+                step_index: 1,
+                label: "Step[0]".to_string(),
+                start_ms: 1000,
+                end_ms: 2000,
+                sample_count: 0, // synthesized zero-capture step
+                metrics: std::collections::BTreeMap::from([("iteration_rate".to_string(), 1500.0)]),
+            },
+        ];
+        let t = Timeline::from_phase_buckets(&buckets, &[], &TimelineContext::default());
+        let formatted = t.format_with_context(&TimelineContext::default());
+        assert!(
+            formatted.contains("throughput: 1500 iter/s (stimulus-derived)"),
+            "a synthesized step must render its stimulus-derived throughput, \
+             not only '[no samples]'; got:\n{formatted}",
+        );
+    }
+
+    // -- orphan not-measured marker + per-cgroup sub-block render --
+
+    /// An orphan bucket — the unique (0,0)-window + empty-metrics +
+    /// non-empty-per_cgroup shape from the fold's orphan arm — renders "window
+    /// not measured", NOT a misleading "0ms".
+    #[test]
+    fn format_renders_orphan_window_as_not_measured() {
+        let mut per_cgroup = std::collections::BTreeMap::new();
+        per_cgroup.insert(
+            "cg".to_string(),
+            crate::assert::PhaseCgroupStats {
+                off_cpu_pcts: vec![80.0],
+                total_iterations: 900_000,
+                ..Default::default()
+            },
+        );
+        let buckets = vec![crate::assert::PhaseBucket {
+            per_cgroup,
+            step_index: 1,
+            label: "Step[0]".to_string(),
+            start_ms: 0,
+            end_ms: 0,
+            sample_count: 0,
+            metrics: std::collections::BTreeMap::new(),
+        }];
+        let t = Timeline::from_phase_buckets(&buckets, &[], &TimelineContext::default());
+        let formatted = t.format_with_context(&TimelineContext::default());
+        assert!(
+            formatted.contains("window not measured"),
+            "orphan window must render not-measured; got:\n{formatted}",
+        );
+        assert!(
+            !formatted.contains("(0ms,"),
+            "orphan must NOT render as 0ms; got:\n{formatted}",
+        );
+        // The whole point of routing orphan carriers through the render (vs the
+        // pre-fold path that dropped them) is that their per-cgroup telemetry —
+        // an orphan's ONLY payload — SURFACES alongside the not-measured marker.
+        assert!(
+            formatted.contains("per-cgroup:"),
+            "orphan's per-cgroup sub-block must render; got:\n{formatted}",
+        );
+        assert!(
+            formatted.contains("cg: off-cpu avg=80.0%"),
+            "orphan carrier's off-cpu reduction must render; got:\n{formatted}",
+        );
+        assert!(
+            formatted.contains("iters=900000"),
+            "orphan carrier's counters must render; got:\n{formatted}",
+        );
+        // The cg carrier has off-cpu but NO wake/run-delay pools — pin the
+        // per-line omit when off-cpu is the sole reduction present (the most
+        // likely real orphan-carrier shape).
+        let cg_line = formatted
+            .lines()
+            .find(|l| l.contains("cg: off-cpu"))
+            .expect("cg line");
+        assert!(!cg_line.contains("wake p99="), "got:\n{formatted}");
+        assert!(!cg_line.contains("run-delay mean="), "got:\n{formatted}");
+    }
+
+    /// Orphan-adjacency suppression: an orphan phase (all-None
+    /// PhaseMetrics) BETWEEN two real phases makes detect_boundary_changes
+    /// compare each real neighbor against the orphan's gated-away None metrics,
+    /// NOT across the unmeasured window — so a step1->step3 throughput collapse
+    /// is NOT flagged on step3 (no data for the intervening orphan step).
+    /// INTENTIONAL + render-only; pins the documented from_phase_buckets behavior.
+    #[test]
+    fn format_orphan_phase_suppresses_cross_orphan_change_detection() {
+        let real = |step: u16, rate: f64| crate::assert::PhaseBucket {
+            per_cgroup: Default::default(),
+            step_index: step,
+            label: format!("Step[{}]", step - 1),
+            start_ms: step as u64 * 1000,
+            end_ms: step as u64 * 1000 + 500,
+            sample_count: 5,
+            metrics: std::collections::BTreeMap::from([("iteration_rate".to_string(), rate)]),
+        };
+        let mut orphan_pc = std::collections::BTreeMap::new();
+        orphan_pc.insert(
+            "cg".to_string(),
+            crate::assert::PhaseCgroupStats {
+                off_cpu_pcts: vec![50.0],
+                ..Default::default()
+            },
+        );
+        let orphan = crate::assert::PhaseBucket {
+            per_cgroup: orphan_pc,
+            step_index: 2,
+            label: "Step[1]".to_string(),
+            start_ms: 0,
+            end_ms: 0,
+            sample_count: 0,
+            metrics: std::collections::BTreeMap::new(),
+        };
+        // CONTROL: step1 (rate 10000) adjacent to step3 (rate 1000) — a 90%
+        // collapse (> the 30% rel threshold) IS flagged as a change on step3.
+        let ctrl = Timeline::from_phase_buckets(
+            &[real(1, 10000.0), real(3, 1000.0)],
+            &[],
+            &TimelineContext::default(),
+        );
+        let ctrl_step3 = ctrl.phases.iter().find(|p| p.index == 3).expect("step3");
+        assert!(
+            !ctrl_step3.changes.is_empty(),
+            "control: adjacent step1->step3 throughput collapse IS flagged; got: {:?}",
+            ctrl_step3.changes,
+        );
+        // With the orphan between, step3 is compared against the orphan's None
+        // metrics -> the change is suppressed (no data for the gap).
+        let t = Timeline::from_phase_buckets(
+            &[real(1, 10000.0), orphan, real(3, 1000.0)],
+            &[],
+            &TimelineContext::default(),
+        );
+        let step3 = t.phases.iter().find(|p| p.index == 3).expect("step3");
+        assert!(
+            step3.changes.is_empty(),
+            "orphan between suppresses the cross-orphan change; got: {:?}",
+            step3.changes,
+        );
+        assert!(
+            t.format_with_context(&TimelineContext::default())
+                .contains("window not measured"),
+            "the orphan still renders not-measured",
+        );
+    }
+
+    /// The orphan signature is GUARDED on empty metrics: a (0,0)-window bucket
+    /// that carries metrics is a captured bucket (or a measured zero-duration
+    /// step), NOT an orphan — it renders 0ms, never "window not measured".
+    #[test]
+    fn format_does_not_mark_not_measured_when_metrics_present() {
+        let mut per_cgroup = std::collections::BTreeMap::new();
+        per_cgroup.insert(
+            "cg".to_string(),
+            crate::assert::PhaseCgroupStats {
+                off_cpu_pcts: vec![50.0],
+                ..Default::default()
+            },
+        );
+        let buckets = vec![crate::assert::PhaseBucket {
+            per_cgroup,
+            step_index: 1,
+            label: "Step[0]".to_string(),
+            start_ms: 0,
+            end_ms: 0,
+            sample_count: 1,
+            metrics: std::collections::BTreeMap::from([("avg_imbalance_ratio".to_string(), 1.0)]),
+        }];
+        let t = Timeline::from_phase_buckets(&buckets, &[], &TimelineContext::default());
+        let formatted = t.format_with_context(&TimelineContext::default());
+        assert!(
+            !formatted.contains("window not measured"),
+            "a (0,0) window WITH metrics is captured, not an orphan; got:\n{formatted}",
+        );
+        assert!(
+            formatted.contains("(0ms,"),
+            "a measured zero-duration window renders 0ms; got:\n{formatted}",
+        );
+    }
+
+    /// The per-cgroup sub-block renders one line per cgroup (name order), with
+    /// the None-vs-Some discipline: a not-measured off-CPU reduction renders
+    /// `n/a` (not `0.0%`), and an empty wake/run-delay pool omits that segment.
+    #[test]
+    fn format_renders_per_cgroup_subblock_none_aware() {
+        let mut per_cgroup = std::collections::BTreeMap::new();
+        per_cgroup.insert(
+            "cg_a".to_string(),
+            crate::assert::PhaseCgroupStats {
+                off_cpu_pcts: vec![80.0, 84.0],
+                wake_latencies_ns: vec![100_000, 120_000],
+                run_delays_ns: vec![45_000],
+                total_iterations: 900_000,
+                total_migrations: 12,
+                max_gap_ms: 8,
+                max_gap_cpu: 3,
+                ..Default::default()
+            },
+        );
+        per_cgroup.insert(
+            "cg_b".to_string(),
+            crate::assert::PhaseCgroupStats {
+                off_cpu_pcts: vec![],
+                total_iterations: 80_000,
+                ..Default::default()
+            },
+        );
+        let buckets = vec![crate::assert::PhaseBucket {
+            per_cgroup,
+            step_index: 1,
+            label: "Step[0]".to_string(),
+            start_ms: 1000,
+            end_ms: 6000,
+            sample_count: 10,
+            metrics: std::collections::BTreeMap::from([("avg_imbalance_ratio".to_string(), 1.5)]),
+        }];
+        let t = Timeline::from_phase_buckets(&buckets, &[], &TimelineContext::default());
+        let formatted = t.format_with_context(&TimelineContext::default());
+        assert!(
+            formatted.contains("per-cgroup:"),
+            "sub-block header; got:\n{formatted}"
+        );
+        assert!(
+            formatted.contains("cg_a: off-cpu avg=82.0% min=80.0% max=84.0% spread=4.0%"),
+            "got:\n{formatted}",
+        );
+        assert!(
+            formatted.contains("wake p99="),
+            "wake segment present; got:\n{formatted}"
+        );
+        assert!(
+            formatted.contains("run-delay mean="),
+            "run-delay segment present; got:\n{formatted}",
+        );
+        assert!(
+            formatted.contains("iters=900000 migrations=12"),
+            "counters present; got:\n{formatted}",
+        );
+        assert!(
+            formatted.contains("cg_b: off-cpu n/a"),
+            "not-measured off-cpu is n/a, NOT 0.0%; got:\n{formatted}",
+        );
+        // cg_a has a coupled gap (8ms @ cpu 3) -> rendered with its cpu.
+        assert!(
+            formatted.contains("gap=8ms@cpu3"),
+            "coupled gap renders ms@cpu; got:\n{formatted}",
+        );
+        // cg_b has no wake/run-delay pools AND max_gap_ms==0 -> those segments
+        // omitted on its line (gap is omitted at 0, not printed as gap=0ms).
+        let cg_b_line = formatted
+            .lines()
+            .find(|l| l.contains("cg_b:"))
+            .expect("cg_b line");
+        assert!(!cg_b_line.contains("wake p99="), "got:\n{formatted}");
+        assert!(
+            !cg_b_line.contains("gap="),
+            "gap omitted at 0; got:\n{formatted}"
+        );
+        // BTreeMap name order: cg_a before cg_b.
+        assert!(
+            formatted.find("cg_a:").unwrap() < formatted.find("cg_b:").unwrap(),
+            "cgroups render in name order; got:\n{formatted}",
+        );
+    }
+
+    /// A stripped carrier (raw sample vectors dropped to fit the size-limited
+    /// bulk frame) renders "samples stripped (size limit)" — distinct from a
+    /// not-measured carrier's "off-cpu n/a" — so an operator does not read a
+    /// size-limit drop as a quiet cgroup. The surviving counters still render.
+    #[test]
+    fn format_renders_stripped_carrier_distinctly() {
+        let mut per_cgroup = std::collections::BTreeMap::new();
+        per_cgroup.insert(
+            "cg_stripped".to_string(),
+            crate::assert::PhaseCgroupStats {
+                stripped: true,
+                total_iterations: 500_000,
+                total_migrations: 9,
+                ..Default::default()
+            },
+        );
+        per_cgroup.insert(
+            "cg_quiet".to_string(),
+            // Genuinely measured nothing (NOT stripped).
+            crate::assert::PhaseCgroupStats {
+                total_iterations: 1_000,
+                ..Default::default()
+            },
+        );
+        let buckets = vec![crate::assert::PhaseBucket {
+            per_cgroup,
+            step_index: 1,
+            label: "Step[0]".to_string(),
+            start_ms: 1000,
+            end_ms: 6000,
+            sample_count: 10,
+            metrics: std::collections::BTreeMap::from([("avg_imbalance_ratio".to_string(), 1.5)]),
+        }];
+        let t = Timeline::from_phase_buckets(&buckets, &[], &TimelineContext::default());
+        let formatted = t.format_with_context(&TimelineContext::default());
+        assert!(
+            formatted.contains("cg_stripped: samples stripped (size limit)"),
+            "stripped carrier shows the size-limit marker; got:\n{formatted}",
+        );
+        assert!(
+            formatted.contains("iters=500000 migrations=9"),
+            "stripped carrier still renders its surviving counters; got:\n{formatted}",
+        );
+        assert!(
+            formatted.contains("cg_quiet: off-cpu n/a"),
+            "a not-stripped, not-measured carrier stays n/a; got:\n{formatted}",
+        );
+        assert!(
+            !formatted.contains("cg_quiet: samples stripped"),
+            "a not-stripped carrier must NOT show the stripped marker; got:\n{formatted}",
+        );
+    }
+
+    /// Measured-zero off-CPU renders `0.0%` (a real zero), distinct from the
+    /// `n/a` not-measured state — the kind-specific None-vs-Some(0.0) boundary.
+    #[test]
+    fn format_renders_measured_zero_off_cpu_as_zero_not_na() {
+        let mut per_cgroup = std::collections::BTreeMap::new();
+        per_cgroup.insert(
+            "cg".to_string(),
+            crate::assert::PhaseCgroupStats {
+                off_cpu_pcts: vec![0.0, 0.0],
+                ..Default::default()
+            },
+        );
+        let buckets = vec![crate::assert::PhaseBucket {
+            per_cgroup,
+            step_index: 1,
+            label: "Step[0]".to_string(),
+            start_ms: 1000,
+            end_ms: 2000,
+            sample_count: 1,
+            metrics: std::collections::BTreeMap::from([("avg_imbalance_ratio".to_string(), 1.0)]),
+        }];
+        let t = Timeline::from_phase_buckets(&buckets, &[], &TimelineContext::default());
+        let formatted = t.format_with_context(&TimelineContext::default());
+        assert!(
+            formatted.contains("off-cpu avg=0.0%"),
+            "measured zero off-cpu is 0.0%, not n/a; got:\n{formatted}",
+        );
+        assert!(!formatted.contains("off-cpu n/a"), "got:\n{formatted}");
+    }
+
+    /// Symmetric with the off-cpu measured-zero test for wake + run-delay: a
+    /// NON-empty pool of zeros is a measured zero (Some) and renders `0µs`, NOT
+    /// omitted (which only an EMPTY pool -> None does). Guards against a refactor
+    /// that special-cased a zero reduction to None (collapsing measured-zero
+    /// into not-measured), silently omitting a real zero-latency reading.
+    #[test]
+    fn format_renders_measured_zero_wake_and_run_delay_not_omitted() {
+        let mut per_cgroup = std::collections::BTreeMap::new();
+        per_cgroup.insert(
+            "cg".to_string(),
+            crate::assert::PhaseCgroupStats {
+                off_cpu_pcts: vec![5.0],
+                wake_latencies_ns: vec![0],
+                run_delays_ns: vec![0],
+                ..Default::default()
+            },
+        );
+        let buckets = vec![crate::assert::PhaseBucket {
+            per_cgroup,
+            step_index: 1,
+            label: "Step[0]".to_string(),
+            start_ms: 1000,
+            end_ms: 2000,
+            sample_count: 1,
+            metrics: std::collections::BTreeMap::from([("avg_imbalance_ratio".to_string(), 1.0)]),
+        }];
+        let t = Timeline::from_phase_buckets(&buckets, &[], &TimelineContext::default());
+        let formatted = t.format_with_context(&TimelineContext::default());
+        assert!(
+            formatted.contains("wake p99=0\u{00b5}s"),
+            "measured-zero wake renders 0µs, not omitted; got:\n{formatted}",
+        );
+        assert!(
+            formatted.contains("run-delay mean=0\u{00b5}s"),
+            "measured-zero run-delay renders 0µs, not omitted; got:\n{formatted}",
+        );
+    }
+
+    /// The per-cgroup sub-block caps at MAX_RENDERED_CGROUPS (16) by name
+    /// order, with a "+J more" note — bounding failure-message size.
+    #[test]
+    fn format_caps_per_cgroup_subblock() {
+        let mut per_cgroup = std::collections::BTreeMap::new();
+        for i in 0..20 {
+            per_cgroup.insert(
+                format!("cg{i:02}"),
+                crate::assert::PhaseCgroupStats {
+                    off_cpu_pcts: vec![10.0],
+                    ..Default::default()
+                },
+            );
+        }
+        let buckets = vec![crate::assert::PhaseBucket {
+            per_cgroup,
+            step_index: 1,
+            label: "Step[0]".to_string(),
+            start_ms: 1000,
+            end_ms: 2000,
+            sample_count: 1,
+            metrics: std::collections::BTreeMap::from([("avg_imbalance_ratio".to_string(), 1.0)]),
+        }];
+        let t = Timeline::from_phase_buckets(&buckets, &[], &TimelineContext::default());
+        let formatted = t.format_with_context(&TimelineContext::default());
+        assert!(
+            formatted.contains("(+4 more cgroups)"),
+            "20 cgroups capped at 16 -> +4 more; got:\n{formatted}",
+        );
+        assert!(
+            formatted.contains("cg15:"),
+            "first 16 rendered; got:\n{formatted}"
+        );
+        assert!(
+            !formatted.contains("cg16:"),
+            "cg16 is beyond the cap; got:\n{formatted}",
+        );
+    }
+
+    /// No per-cgroup sub-block when the phase carries no carriers (the
+    /// monitor-only path, or a phase with empty per_cgroup).
+    #[test]
+    fn format_omits_per_cgroup_subblock_when_empty() {
+        let buckets = vec![crate::assert::PhaseBucket {
+            per_cgroup: Default::default(),
+            step_index: 1,
+            label: "Step[0]".to_string(),
+            start_ms: 1000,
+            end_ms: 2000,
+            sample_count: 1,
+            metrics: std::collections::BTreeMap::from([("avg_imbalance_ratio".to_string(), 1.0)]),
+        }];
+        let t = Timeline::from_phase_buckets(&buckets, &[], &TimelineContext::default());
+        let formatted = t.format_with_context(&TimelineContext::default());
+        assert!(
+            !formatted.contains("per-cgroup:"),
+            "no sub-block when carriers absent; got:\n{formatted}",
+        );
+    }
+
+    /// Cap off-by-one boundary: EXACTLY 16 cgroups render all 16 with NO
+    /// "more cgroups" note (total > MAX is false); 17 render 16 + "(+1 more
+    /// cgroups)". Pins the `>` vs `>=` / `take(N)` edge against a silent drop
+    /// (one cgroup gone, no note) or a "(+0 more)" lie.
+    #[test]
+    fn format_per_cgroup_cap_boundary_16_and_17() {
+        let mk = |n: usize| {
+            let mut per_cgroup = std::collections::BTreeMap::new();
+            for i in 0..n {
+                per_cgroup.insert(
+                    format!("cg{i:02}"),
+                    crate::assert::PhaseCgroupStats {
+                        off_cpu_pcts: vec![10.0],
+                        ..Default::default()
+                    },
+                );
+            }
+            let buckets = vec![crate::assert::PhaseBucket {
+                per_cgroup,
+                step_index: 1,
+                label: "Step[0]".to_string(),
+                start_ms: 1000,
+                end_ms: 2000,
+                sample_count: 1,
+                metrics: std::collections::BTreeMap::from([(
+                    "avg_imbalance_ratio".to_string(),
+                    1.0,
+                )]),
+            }];
+            Timeline::from_phase_buckets(&buckets, &[], &TimelineContext::default())
+                .format_with_context(&TimelineContext::default())
+        };
+        let at16 = mk(16);
+        assert!(at16.contains("cg15:"), "16th cgroup renders; got:\n{at16}");
+        assert!(
+            !at16.contains("more cgroups"),
+            "exactly 16 has NO truncation note; got:\n{at16}",
+        );
+        let at17 = mk(17);
+        assert!(at17.contains("cg15:"), "got:\n{at17}");
+        assert!(
+            !at17.contains("cg16:"),
+            "17th is past the cap; got:\n{at17}"
+        );
+        assert!(
+            at17.contains("(+1 more cgroup)") && !at17.contains("(+1 more cgroups)"),
+            "17 cgroups -> exactly +1 more (singular 'cgroup'); got:\n{at17}",
+        );
+    }
+
+    /// A synthesized (sample_count==0) bucket carrying monitor-derived
+    /// metrics renders the imbalance/dsq block, not just "[no samples]" —
+    /// the render-layer half of the monitor-parity handling. format_phases
+    /// gates that block on `has_monitor_metrics`, not `sample_count > 0`.
+    #[test]
+    fn format_renders_synthesized_step_monitor_metrics() {
+        let buckets = vec![
+            crate::assert::PhaseBucket {
+                per_cgroup: Default::default(),
+                step_index: 0,
+                label: "BASELINE".to_string(),
+                start_ms: 0,
+                end_ms: 1000,
+                sample_count: 2,
+                metrics: std::collections::BTreeMap::new(),
+            },
+            crate::assert::PhaseBucket {
+                per_cgroup: Default::default(),
+                step_index: 1,
+                label: "Step[0]".to_string(),
+                start_ms: 1000,
+                end_ms: 2000,
+                sample_count: 0, // synthesized zero-capture step
+                metrics: std::collections::BTreeMap::from([
+                    ("avg_imbalance_ratio".to_string(), 2.0),
+                    ("max_imbalance_ratio".to_string(), 3.0),
+                    ("avg_dsq_depth".to_string(), 5.0),
+                    ("max_dsq_depth".to_string(), 7.0),
+                ]),
+            },
+        ];
+        let t = Timeline::from_phase_buckets(&buckets, &[], &TimelineContext::default());
+        let formatted = t.format_with_context(&TimelineContext::default());
+        assert!(
+            formatted.contains("imbalance: avg=2.0 max=3.0"),
+            "synthesized bucket's folded imbalance must render, not \
+             '[no samples]'; got:\n{formatted}",
+        );
+        assert!(
+            formatted.contains("dsq: avg=5 max=7"),
+            "synthesized bucket's folded dsq must render; got:\n{formatted}",
+        );
+    }
+
+    /// A from_phase_buckets render whose first bucket is a Step (no
+    /// BASELINE bucket — e.g. under --cell-parent-cgroup where BASELINE
+    /// captured nothing) must NOT mislabel that Step as "BASELINE".
+    /// phase.index is the bucket's step_index, so format_phases' index==0
+    /// BASELINE check fires only for a real BASELINE bucket.
+    #[test]
+    fn format_no_baseline_bucket_does_not_mislabel_first_step() {
+        let buckets = vec![
+            crate::assert::PhaseBucket {
+                per_cgroup: Default::default(),
+                step_index: 1, // scenario Step 0; NO BASELINE bucket present
+                label: "Step[0]".to_string(),
+                start_ms: 1000,
+                end_ms: 2000,
+                sample_count: 3,
+                metrics: std::collections::BTreeMap::from([(
+                    "avg_imbalance_ratio".to_string(),
+                    1.0,
+                )]),
+            },
+            crate::assert::PhaseBucket {
+                per_cgroup: Default::default(),
+                step_index: 2,
+                label: "Step[1]".to_string(),
+                start_ms: 2000,
+                end_ms: 3000,
+                sample_count: 3,
+                metrics: std::collections::BTreeMap::from([(
+                    "avg_imbalance_ratio".to_string(),
+                    1.0,
+                )]),
+            },
+        ];
+        let t = Timeline::from_phase_buckets(&buckets, &[], &TimelineContext::default());
+        let formatted = t.format_with_context(&TimelineContext::default());
+        assert!(
+            !formatted.contains("BASELINE"),
+            "no BASELINE bucket -> no BASELINE label; the first Step must not \
+             be mislabeled as BASELINE; got:\n{formatted}",
+        );
+        assert!(
+            formatted.contains("Phase 1"),
+            "the first Step renders as 'Phase 1' (its step_index), not \
+             'Phase 0'/BASELINE; got:\n{formatted}",
+        );
+    }
+
+    /// Sparse / non-contiguous step_index renders the TRUE step number:
+    /// BASELINE(0) + a Step at step_index 3 renders "Phase 3", not the
+    /// enumerate-position "Phase 1". Pins index == step_index for a
+    /// non-zero, non-contiguous label — the case that distinguishes
+    /// step_index from the old enumerate index (a revert to enumerate
+    /// would pass the contiguous tests but fail this one).
+    #[test]
+    fn format_sparse_step_index_renders_true_step_number() {
+        let buckets = vec![
+            crate::assert::PhaseBucket {
+                per_cgroup: Default::default(),
+                step_index: 0,
+                label: "BASELINE".to_string(),
+                start_ms: 0,
+                end_ms: 100,
+                sample_count: 2,
+                metrics: std::collections::BTreeMap::new(),
+            },
+            crate::assert::PhaseBucket {
+                per_cgroup: Default::default(),
+                step_index: 3, // sparse: Steps 0/1 absent, only step_index 3
+                label: "Step[2]".to_string(),
+                start_ms: 200,
+                end_ms: 300,
+                sample_count: 2,
+                metrics: std::collections::BTreeMap::from([(
+                    "avg_imbalance_ratio".to_string(),
+                    1.0,
+                )]),
+            },
+        ];
+        let t = Timeline::from_phase_buckets(&buckets, &[], &TimelineContext::default());
+        let formatted = t.format_with_context(&TimelineContext::default());
+        assert!(
+            formatted.contains("Phase 3"),
+            "a sparse Step at step_index 3 must render 'Phase 3' (its \
+             step_index), not the enumerate-position 'Phase 1'; got:\n{formatted}",
+        );
+        assert!(
+            !formatted.contains("Phase 1"),
+            "the enumerate-position 'Phase 1' must NOT appear for a \
+             step_index-3 bucket; got:\n{formatted}",
+        );
     }
 
     #[test]
@@ -1263,7 +2197,7 @@ mod tests {
         let samples: Vec<MonitorSample> = (5..35)
             .map(|i| sample(i * 100, vec![(2, 1, i * 1000), (2, 1, i * 1000 + 100)]))
             .collect();
-        let t = Timeline::build(&events, &samples);
+        let t = Timeline::build(&events, &samples, 0);
         assert_eq!(t.phases.len(), 2);
         // First phase should be from ScenarioStart (earliest).
         assert!(t.phases[0].stimulus.is_none());
@@ -1276,13 +2210,56 @@ mod tests {
             sample(600, vec![(1, 0, 5000), (1, 0, 6000)]),
             sample(700, vec![(1, 0, 5000), (1, 0, 7000)]), // cpu0 stalled
         ];
-        let t = Timeline::build(&events, &samples);
+        let t = Timeline::build(&events, &samples, 0);
         assert_eq!(t.phases[0].metrics.stall_count, 1);
     }
 
     #[test]
+    fn compute_metrics_stall_count_accumulates_across_windows() {
+        // cpu0 frozen across TWO consecutive windows -> stall_count == 2.
+        // Pins that the per-phase path counts every stuck (CPU, window),
+        // mirroring the run-level accumulation (both breaks removed).
+        let s1 = sample(100, vec![(1, 0, 5000), (1, 0, 6000)]);
+        let s2 = sample(200, vec![(1, 0, 5000), (1, 0, 6100)]);
+        let s3 = sample(300, vec![(1, 0, 5000), (1, 0, 6200)]);
+        let refs: Vec<&MonitorSample> = vec![&s1, &s2, &s3];
+        let m = compute_metrics(&refs, 0);
+        assert_eq!(m.stall_count, 2);
+    }
+
+    #[test]
+    fn run_level_stuck_count_ge_sum_of_per_phase() {
+        // Same is_cpu_stuck predicate, different windowing domains: the
+        // run-level path windows(2) over the FULL stream and counts the
+        // pair straddling a phase split; partitioning the stream into
+        // per-phase subsets drops that boundary pair. So run-level >= Σ
+        // per-phase (strict here) — pins the documented inequality.
+        let s1 = sample(100, vec![(1, 0, 5000), (1, 0, 6000)]);
+        let s2 = sample(200, vec![(1, 0, 5000), (1, 0, 6100)]);
+        let s3 = sample(300, vec![(1, 0, 5000), (1, 0, 6200)]);
+        let samples = vec![s1, s2, s3];
+        // Run-level: windows(2) over all 3 -> cpu0 frozen in both windows.
+        let run_level = crate::monitor::MonitorSummary::from_samples(&samples).stuck_count;
+        assert_eq!(run_level, 2);
+        // Partition after s2 (phase A = [s1,s2], phase B = [s3]): the
+        // (s2,s3) boundary pair is in neither phase's windows(2).
+        let phase_a: Vec<&MonitorSample> = vec![&samples[0], &samples[1]];
+        let phase_b: Vec<&MonitorSample> = vec![&samples[2]];
+        let sum_per_phase =
+            compute_metrics(&phase_a, 0).stall_count + compute_metrics(&phase_b, 0).stall_count;
+        assert_eq!(
+            sum_per_phase, 1,
+            "the (s2,s3) boundary pair is in neither phase"
+        );
+        assert!(
+            run_level > sum_per_phase,
+            "run-level counts the boundary-straddling pair the per-phase partition drops"
+        );
+    }
+
+    #[test]
     fn compute_metrics_empty() {
-        let m = compute_metrics(&[]);
+        let m = compute_metrics(&[], 0);
         assert_eq!(m.sample_count, 0);
         // No samples -> no measurement, not a false 0.0 (the sentinel fix).
         assert_eq!(m.avg_imbalance, None);
@@ -1307,7 +2284,7 @@ mod tests {
         let samples: Vec<MonitorSample> = (5..25)
             .map(|i| sample(i * 100, vec![(2, 1, i * 1000), (2, 1, i * 1000 + 100)]))
             .collect();
-        let t = Timeline::build(&events, &samples);
+        let t = Timeline::build(&events, &samples, 0);
         let formatted = t.format_with_context(&TimelineContext::default());
         assert!(formatted.contains("SetCpuset"));
         assert!(formatted.contains("4 cpus"));
@@ -1321,7 +2298,7 @@ mod tests {
         let samples: Vec<MonitorSample> = (5..55)
             .map(|i| sample(i * 100, vec![(2, 1, i * 1000)]))
             .collect();
-        let t = Timeline::build(&events, &samples);
+        let t = Timeline::build(&events, &samples, 0);
         assert_eq!(t.phases.len(), 10);
     }
 
@@ -1330,7 +2307,7 @@ mod tests {
         let s1 = sample(600, vec![(1, 3, 100), (4, 5, 200)]); // ratio=4, avg_dsq=4
         let s2 = sample(700, vec![(2, 1, 300), (2, 7, 400)]); // ratio=1, avg_dsq=4
         let refs: Vec<&MonitorSample> = vec![&s1, &s2];
-        let m = compute_metrics(&refs);
+        let m = compute_metrics(&refs, 0);
         assert_eq!(m.sample_count, 2);
         assert!((m.avg_imbalance.unwrap() - 2.5).abs() < 0.01); // (4+1)/2
         assert!((m.max_imbalance.unwrap() - 4.0).abs() < 0.01);
@@ -1392,7 +2369,7 @@ mod tests {
             }],
         };
         let refs: Vec<&MonitorSample> = vec![&s1, &s2];
-        let m = compute_metrics(&refs);
+        let m = compute_metrics(&refs, 0);
         // fallback delta: 110 - 10 = 100 over 1.0s = 100.0/s
         assert!((m.fallback_rate.unwrap() - 100.0).abs() < 0.01);
         // keep_last delta: 55 - 5 = 50 over 1.0s = 50.0/s
@@ -1404,7 +2381,7 @@ mod tests {
         let s1 = sample(600, vec![(2, 1, 100)]);
         let s2 = sample(700, vec![(2, 1, 200)]);
         let refs: Vec<&MonitorSample> = vec![&s1, &s2];
-        let m = compute_metrics(&refs);
+        let m = compute_metrics(&refs, 0);
         assert!(m.fallback_rate.is_none());
         assert!(m.keep_last_rate.is_none());
     }
@@ -1459,7 +2436,7 @@ mod tests {
             }],
         };
         let refs: Vec<&MonitorSample> = vec![&s1, &s2];
-        let m = compute_metrics(&refs);
+        let m = compute_metrics(&refs, 0);
         let fb = m.fallback_rate.expect("reset still produces Some rate");
         let kl = m.keep_last_rate.expect("reset still produces Some rate");
         assert!(
@@ -1481,7 +2458,7 @@ mod tests {
             sample(600, vec![(1, 0, 5000), (1, 0, 6000)]),
             sample(700, vec![(1, 0, 5000), (1, 0, 7000)]), // cpu0 stalled
         ];
-        let t = Timeline::build(&events, &samples);
+        let t = Timeline::build(&events, &samples, 0);
         let formatted = t.format_with_context(&TimelineContext::default());
         assert!(formatted.contains("stalls: 1"));
     }
@@ -1501,7 +2478,7 @@ mod tests {
         let samples: Vec<MonitorSample> = (5..15)
             .map(|i| sample(i * 100, vec![(2, 1, i * 1000)]))
             .collect();
-        let t = Timeline::build(&events, &samples);
+        let t = Timeline::build(&events, &samples, 0);
         let formatted = t.format_with_context(&TimelineContext::default());
         // The last phase (50000+offset to end) should have no samples.
         assert!(formatted.contains("[no samples]"));
@@ -1563,7 +2540,7 @@ mod tests {
                 }],
             });
         }
-        let t = Timeline::build(&events, &samples);
+        let t = Timeline::build(&events, &samples, 0);
         let degs: Vec<_> = t
             .degradations()
             .into_iter()
@@ -1581,7 +2558,7 @@ mod tests {
             sample(600, vec![(2, 1, 100), (2, 1, 200)]),
             sample(700, vec![(2, 1, 300), (2, 1, 400)]),
         ];
-        let t = Timeline::build(&events, &samples);
+        let t = Timeline::build(&events, &samples, 0);
         let ctx = TimelineContext {
             kernel: Some("6.14.0-rc3+".to_string()),
             topology: Some("2n4l4c2t (16 cpus)".to_string()),
@@ -1603,7 +2580,7 @@ mod tests {
     fn format_with_context_partial_fields() {
         let events = vec![stimulus(0, "ScenarioStart")];
         let samples = vec![sample(600, vec![(2, 1, 100)])];
-        let t = Timeline::build(&events, &samples);
+        let t = Timeline::build(&events, &samples, 0);
         let ctx = TimelineContext {
             kernel: None,
             topology: Some("1n1l1c1t (1 cpus)".to_string()),
@@ -1633,7 +2610,7 @@ mod tests {
     fn format_with_context_empty_context() {
         let events = vec![stimulus(0, "ScenarioStart")];
         let samples = vec![sample(600, vec![(2, 1, 100)])];
-        let t = Timeline::build(&events, &samples);
+        let t = Timeline::build(&events, &samples, 0);
         let ctx = TimelineContext::default();
         let formatted = t.format_with_context(&ctx);
         // Should have the timeline header and phases but no context line.
@@ -1666,7 +2643,7 @@ mod tests {
             // Valid sample.
             sample(700, vec![(2, 3, 2000)]),
         ];
-        let t = Timeline::build(&events, &samples);
+        let t = Timeline::build(&events, &samples, 0);
         assert_eq!(t.phases.len(), 1);
         // Only the valid sample should be counted.
         assert_eq!(t.phases[0].metrics.sample_count, 1);
@@ -1686,7 +2663,7 @@ mod tests {
                 ..Default::default()
             }],
         }];
-        let t = Timeline::build(&events, &samples);
+        let t = Timeline::build(&events, &samples, 0);
         assert_eq!(t.phases[0].metrics.sample_count, 0);
     }
 
@@ -1710,7 +2687,7 @@ mod tests {
                 vec![(1, 1, i * 1000), (10, 1, i * 1000 + 100)],
             ));
         }
-        let t = Timeline::build(&events, &samples);
+        let t = Timeline::build(&events, &samples, 0);
         assert_eq!(t.phases.len(), 2, "must have 2 phases");
         assert!(!t.degradations().is_empty());
 
@@ -1796,7 +2773,7 @@ mod tests {
                 vec![(2, 20, i * 1000), (2, 20, i * 1000 + 100)],
             ));
         }
-        let t = Timeline::build(&events, &samples);
+        let t = Timeline::build(&events, &samples, 0);
         assert!(
             !t.degradations().is_empty(),
             "DSQ depth jump must be detected"
@@ -1846,7 +2823,7 @@ mod tests {
                 vec![(2, 1, i * 1000), (2, 1, i * 1000 + 100)],
             ));
         }
-        let t = Timeline::build(&events, &samples);
+        let t = Timeline::build(&events, &samples, 0);
         assert_eq!(t.phases.len(), 2, "must have 2 phases");
         assert!(t.phases[0].metrics.sample_count > 0);
         assert!(t.phases[1].metrics.sample_count > 0);
@@ -1904,6 +2881,136 @@ mod tests {
         assert!(detect_change(1.0, 1.5, 0.5, "imbalance", true).is_none());
     }
 
+    // -- detect_boundary_changes: throughput across synthesized steps --
+
+    /// Throughput is flagged across a SYNTHESIZED zero-capture phase
+    /// (sample_count 0) — its iteration_rate is stimulus-derived and
+    /// real — while monitor-derived metrics stay gated on samples, so
+    /// the synthesized side never paints a phantom imbalance change.
+    /// This is the collapse-suppression invariant: a throughput collapse entering or
+    /// leaving a capture-free step must not be silently dropped.
+    #[test]
+    fn detect_boundary_changes_flags_throughput_across_synthesized_phase() {
+        let before = PhaseMetrics {
+            sample_count: 30,
+            iteration_rate: Some(1000.0),
+            avg_imbalance: Some(1.0),
+            ..Default::default()
+        };
+        let after = PhaseMetrics {
+            sample_count: 0,             // synthesized zero-capture step
+            iteration_rate: Some(300.0), // 70% collapse
+            avg_imbalance: Some(99.0),   // partial/default — must be ignored
+            ..Default::default()
+        };
+        let changes = detect_boundary_changes(&before, &after);
+        let throughput: Vec<_> = changes
+            .iter()
+            .filter(|c| c.metric == "throughput")
+            .collect();
+        assert_eq!(
+            throughput.len(),
+            1,
+            "throughput collapse across a synthesized step must be flagged: {changes:?}",
+        );
+        assert_eq!(throughput[0].direction, ChangeDirection::Degraded);
+        assert!(
+            !changes.iter().any(|c| c.metric == "imbalance"),
+            "monitor metrics must stay gated when a side has 0 samples: {changes:?}",
+        );
+    }
+
+    /// The monitor-metric gate only suppresses a ZERO-sample side: when
+    /// both phases captured samples, monitor-derived changes still
+    /// surface. Guards the collapse suppression from over-suppressing the normal
+    /// captured-to-captured boundary.
+    #[test]
+    fn detect_boundary_changes_reports_monitor_metrics_when_both_sampled() {
+        let before = PhaseMetrics {
+            sample_count: 30,
+            iteration_rate: Some(1000.0),
+            avg_imbalance: Some(1.0),
+            ..Default::default()
+        };
+        let after = PhaseMetrics {
+            sample_count: 30,
+            iteration_rate: Some(1000.0), // unchanged throughput
+            avg_imbalance: Some(5.0),     // imbalance jump > IMBALANCE_THRESHOLD
+            ..Default::default()
+        };
+        let changes = detect_boundary_changes(&before, &after);
+        assert!(
+            changes.iter().any(|c| c.metric == "imbalance"),
+            "imbalance change must surface when both sides sampled: {changes:?}",
+        );
+        assert!(
+            !changes.iter().any(|c| c.metric == "throughput"),
+            "unchanged throughput must not be flagged: {changes:?}",
+        );
+    }
+
+    /// Throughput uses a STRICT relative threshold: a change of exactly
+    /// ITERATION_RATE_REL_THRESHOLD (30%) is NOT flagged. Pins the `>`
+    /// boundary so a future `>` -> `>=` flip is caught (the absolute
+    /// detect_change gate is a different code path, tested separately).
+    #[test]
+    fn detect_boundary_changes_throughput_exactly_at_threshold_not_flagged() {
+        let before = PhaseMetrics {
+            sample_count: 30,
+            iteration_rate: Some(1000.0),
+            ..Default::default()
+        };
+        let after = PhaseMetrics {
+            sample_count: 30,
+            iteration_rate: Some(700.0), // rel = -0.3 exactly
+            ..Default::default()
+        };
+        assert_eq!((700.0 - 1000.0) / 1000.0, -ITERATION_RATE_REL_THRESHOLD);
+        assert!(
+            !detect_boundary_changes(&before, &after)
+                .iter()
+                .any(|c| c.metric == "throughput"),
+            "an exactly-30% relative change must not flag (strict >)",
+        );
+    }
+
+    /// synthesized -> synthesized boundary (BOTH sides sample_count 0,
+    /// both carrying a real stimulus-derived rate): throughput is still
+    /// compared (the gate is symmetric and sample_count-independent for
+    /// throughput) and monitor metrics stay suppressed on both sides.
+    /// Pins the zero->zero cell of the transition matrix against a future
+    /// edit that re-couples throughput to a per-side sample_count check.
+    #[test]
+    fn detect_boundary_changes_synthesized_to_synthesized_flags_throughput() {
+        let before = PhaseMetrics {
+            sample_count: 0,
+            iteration_rate: Some(1000.0),
+            avg_imbalance: Some(1.0),
+            ..Default::default()
+        };
+        let after = PhaseMetrics {
+            sample_count: 0,
+            iteration_rate: Some(300.0), // 70% collapse
+            avg_imbalance: Some(99.0),   // wild — must stay gated
+            ..Default::default()
+        };
+        let changes = detect_boundary_changes(&before, &after);
+        let throughput: Vec<_> = changes
+            .iter()
+            .filter(|c| c.metric == "throughput")
+            .collect();
+        assert_eq!(
+            throughput.len(),
+            1,
+            "zero->zero throughput collapse must flag: {changes:?}"
+        );
+        assert_eq!(throughput[0].direction, ChangeDirection::Degraded);
+        assert!(
+            !changes.iter().any(|c| c.metric == "imbalance"),
+            "monitor metrics gated on both zero-sample sides: {changes:?}",
+        );
+    }
+
     // -- iteration_rate computation tests --
 
     fn stimulus_with_iters(elapsed_ms: u64, label: &str, total_iterations: u64) -> StimulusEvent {
@@ -1930,7 +3037,7 @@ mod tests {
         let samples: Vec<MonitorSample> = (5..35)
             .map(|i| sample(i * 100, vec![(2, 1, i * 1000), (2, 1, i * 1000 + 100)]))
             .collect();
-        let t = Timeline::build(&events, &samples);
+        let t = Timeline::build(&events, &samples, 0);
         assert_eq!(t.phases.len(), 2);
         let rate = t.phases[0].metrics.iteration_rate;
         assert!(rate.is_some(), "phase 0 should have iteration_rate");
@@ -1947,7 +3054,7 @@ mod tests {
         let samples: Vec<MonitorSample> = (5..35)
             .map(|i| sample(i * 100, vec![(2, 1, i * 1000), (2, 1, i * 1000 + 100)]))
             .collect();
-        let t = Timeline::build(&events, &samples);
+        let t = Timeline::build(&events, &samples, 0);
         assert!(t.phases[0].metrics.iteration_rate.is_none());
         assert!(t.phases[1].metrics.iteration_rate.is_none());
     }
@@ -2019,7 +3126,7 @@ mod tests {
         let samples: Vec<MonitorSample> = (5..35)
             .map(|i| sample(i * 100, vec![(2, 1, i * 1000), (2, 1, i * 1000 + 100)]))
             .collect();
-        let t = Timeline::build(&events, &samples);
+        let t = Timeline::build(&events, &samples, 0);
         assert!(
             t.phases[0].metrics.iteration_rate.is_some(),
             "first phase must get a rate from the 0 baseline",
@@ -2040,7 +3147,7 @@ mod tests {
         let samples: Vec<MonitorSample> = (5..45)
             .map(|i| sample(i * 100, vec![(2, 1, i * 1000)]))
             .collect();
-        let t = Timeline::build(&events, &samples);
+        let t = Timeline::build(&events, &samples, 0);
         assert_eq!(
             t.phases.len(),
             2,
@@ -2068,7 +3175,7 @@ mod tests {
         let samples: Vec<MonitorSample> = (5..35)
             .map(|i| sample(i * 100, vec![(2, 1, i * 1000)]))
             .collect();
-        let t = Timeline::build(&events, &samples);
+        let t = Timeline::build(&events, &samples, 0);
         assert_eq!(
             t.phases.len(),
             2,
@@ -2095,7 +3202,7 @@ mod tests {
         let samples: Vec<MonitorSample> = (1..30)
             .map(|i| sample(i * 100, vec![(2, 1, i * 1000)]))
             .collect();
-        let t = Timeline::build(&events, &samples);
+        let t = Timeline::build(&events, &samples, 0);
         assert_eq!(
             t.phases.len(),
             2,
@@ -2131,7 +3238,7 @@ mod tests {
         let samples: Vec<MonitorSample> = (1..30)
             .map(|i| sample(i * 100, vec![(2, 1, i * 1000)]))
             .collect();
-        let t = Timeline::build(&events, &samples);
+        let t = Timeline::build(&events, &samples, 0);
         assert_eq!(t.phases.len(), 2);
         assert_eq!(
             t.phases[0].metrics.iteration_rate,
@@ -2158,7 +3265,7 @@ mod tests {
         let samples: Vec<MonitorSample> = (5..35)
             .map(|i| sample(i * 100, vec![(2, 1, i * 1000)]))
             .collect();
-        let t = Timeline::build(&events, &samples);
+        let t = Timeline::build(&events, &samples, 0);
         assert_eq!(
             t.phases.len(),
             1,
@@ -2186,7 +3293,7 @@ mod tests {
         let samples: Vec<MonitorSample> = (5..45)
             .map(|i| sample(i * 100, vec![(2, 1, i * 1000)]))
             .collect();
-        let t = Timeline::build(&events, &samples);
+        let t = Timeline::build(&events, &samples, 0);
         assert_eq!(t.phases.len(), 2);
         assert_eq!(
             t.phases[1].metrics.iteration_rate,
@@ -2214,7 +3321,7 @@ mod tests {
         let samples: Vec<MonitorSample> = (5..35)
             .map(|i| sample(i * 100, vec![(2, 1, i * 1000)]))
             .collect();
-        let t = Timeline::build(&events, &samples);
+        let t = Timeline::build(&events, &samples, 0);
         // phase 1 is step 2 (frame iters 5000 -> next 1000): decrease.
         assert!(
             t.phases[1].metrics.iteration_rate.is_none(),
@@ -2234,7 +3341,7 @@ mod tests {
         let samples: Vec<MonitorSample> = (5..35)
             .map(|i| sample(i * 100, vec![(2, 1, i * 1000)]))
             .collect();
-        let t = Timeline::build(&events, &samples);
+        let t = Timeline::build(&events, &samples, 0);
         assert!(
             t.phases[0].metrics.iteration_rate.is_none(),
             "zero-duration pair must not divide; rate stays None",
@@ -2258,7 +3365,7 @@ mod tests {
         let samples: Vec<MonitorSample> = (5..45)
             .map(|i| sample(i * 100, vec![(2, 1, i * 1000)]))
             .collect();
-        let t = Timeline::build(&events, &samples);
+        let t = Timeline::build(&events, &samples, 0);
         // Two step events -> two phases regardless of terminal position.
         assert_eq!(
             t.phases.len(),
@@ -2287,7 +3394,7 @@ mod tests {
         let samples: Vec<MonitorSample> = (5..45)
             .map(|i| sample(i * 100, vec![(2, 1, i * 1000), (2, 1, i * 1000 + 100)]))
             .collect();
-        let t = Timeline::build(&events, &samples);
+        let t = Timeline::build(&events, &samples, 0);
         assert_eq!(t.phases.len(), 3);
         // Phase 0 should have high iteration_rate.
         assert!(t.phases[0].metrics.iteration_rate.is_some());
@@ -2328,7 +3435,7 @@ mod tests {
         let samples: Vec<MonitorSample> = (5..45)
             .map(|i| sample(i * 100, vec![(2, 1, i * 1000)]))
             .collect();
-        let t = Timeline::build(&events, &samples);
+        let t = Timeline::build(&events, &samples, 0);
         assert_eq!(
             t.phases[1].metrics.iteration_rate,
             Some(0.0),
@@ -2360,7 +3467,7 @@ mod tests {
         let samples: Vec<MonitorSample> = (5..45)
             .map(|i| sample(i * 100, vec![(2, 1, i * 1000), (2, 1, i * 1000 + 100)]))
             .collect();
-        let t = Timeline::build(&events, &samples);
+        let t = Timeline::build(&events, &samples, 0);
         let improvements: Vec<_> = t
             .phases
             .iter()
@@ -2386,7 +3493,7 @@ mod tests {
         let samples: Vec<MonitorSample> = (5..45)
             .map(|i| sample(i * 100, vec![(2, 1, i * 1000), (2, 1, i * 1000 + 100)]))
             .collect();
-        let t = Timeline::build(&events, &samples);
+        let t = Timeline::build(&events, &samples, 0);
         let throughput_changes: Vec<_> = t
             .phases
             .iter()
@@ -2411,6 +3518,7 @@ mod tests {
         s0_metrics.insert("total_fallback".to_string(), 200.0);
         let buckets = vec![
             PhaseBucket {
+                per_cgroup: Default::default(),
                 step_index: 0,
                 label: "BASELINE".to_string(),
                 start_ms: 0,
@@ -2419,6 +3527,7 @@ mod tests {
                 metrics: BTreeMap::new(),
             },
             PhaseBucket {
+                per_cgroup: Default::default(),
                 step_index: 1,
                 label: "Step[0]".to_string(),
                 start_ms: 1000,
@@ -2458,6 +3567,72 @@ mod tests {
         assert!(formatted.contains("Step[0]"));
     }
 
+    /// Collapse-suppression production path: a throughput collapse INTO a synthesized
+    /// zero-capture step surfaces through from_phase_buckets (the path
+    /// `evaluate_vm_result` prefers), not only via the helper unit test.
+    /// BASELINE captures samples + an iteration_rate; Step[0] is
+    /// synthesized (sample_count 0) with a collapsed iteration_rate AND a
+    /// divergent imbalance that must stay gated. Re-adding the old
+    /// `if sample_count==0 { continue }` gate at this call site makes
+    /// phases[1].changes empty, so this test fails — it is the
+    /// regression pin for the removed gate. The producer half — that
+    /// build_phase_buckets_with_stimulus actually populates a synthesized
+    /// bucket's iteration_rate from stimulus deltas — is pinned by
+    /// assert::tests_phase_bucket::build_phase_buckets_with_stimulus_synthesizes_zero_capture_step_bucket;
+    /// together they pin the full producer->consumer chain.
+    #[test]
+    fn from_phase_buckets_flags_throughput_into_synthesized_step() {
+        use crate::assert::PhaseBucket;
+        use std::collections::BTreeMap;
+        let mut baseline_metrics = BTreeMap::new();
+        baseline_metrics.insert("iteration_rate".to_string(), 1000.0);
+        baseline_metrics.insert("avg_imbalance_ratio".to_string(), 1.0);
+        let mut step_metrics = BTreeMap::new();
+        step_metrics.insert("iteration_rate".to_string(), 300.0); // 70% collapse
+        step_metrics.insert("avg_imbalance_ratio".to_string(), 99.0); // must stay gated
+        let buckets = vec![
+            PhaseBucket {
+                per_cgroup: Default::default(),
+                step_index: 0,
+                label: "BASELINE".to_string(),
+                start_ms: 0,
+                end_ms: 1000,
+                sample_count: 5,
+                metrics: baseline_metrics,
+            },
+            PhaseBucket {
+                per_cgroup: Default::default(),
+                step_index: 1,
+                label: "Step[0]".to_string(),
+                start_ms: 1000,
+                end_ms: 6000,
+                sample_count: 0, // synthesized zero-capture step
+                metrics: step_metrics,
+            },
+        ];
+        let t = Timeline::from_phase_buckets(&buckets, &[], &TimelineContext::default());
+        assert_eq!(t.phases[1].metrics.sample_count, 0);
+        assert_eq!(t.phases[1].metrics.iteration_rate, Some(300.0));
+        let throughput: Vec<_> = t.phases[1]
+            .changes
+            .iter()
+            .filter(|c| c.metric == "throughput")
+            .collect();
+        assert_eq!(
+            throughput.len(),
+            1,
+            "throughput collapse into a synthesized step must surface via \
+             from_phase_buckets: {:?}",
+            t.phases[1].changes,
+        );
+        assert_eq!(throughput[0].direction, ChangeDirection::Degraded);
+        assert!(
+            !t.phases[1].changes.iter().any(|c| c.metric == "imbalance"),
+            "monitor metrics must stay gated for a zero-sample side: {:?}",
+            t.phases[1].changes,
+        );
+    }
+
     /// Boundary change-detection on the from_phase_buckets path — the
     /// PRODUCTION success path (`evaluate_vm_result` prefers
     /// from_phase_buckets over `build`). Two adjacent metric-bearing
@@ -2480,6 +3655,7 @@ mod tests {
         step.insert("avg_dsq_depth".to_string(), 6.0); // +5.0 > 3.0 threshold
         let buckets = vec![
             PhaseBucket {
+                per_cgroup: Default::default(),
                 step_index: 0,
                 label: "BASELINE".to_string(),
                 start_ms: 0,
@@ -2488,6 +3664,7 @@ mod tests {
                 metrics: base,
             },
             PhaseBucket {
+                per_cgroup: Default::default(),
                 step_index: 1,
                 label: "Step[0]".to_string(),
                 start_ms: 1000,
@@ -2533,6 +3710,7 @@ mod tests {
         step.insert("avg_dsq_depth".to_string(), 2.0); // +1.0 < 3.0
         let buckets = vec![
             PhaseBucket {
+                per_cgroup: Default::default(),
                 step_index: 0,
                 label: "BASELINE".to_string(),
                 start_ms: 0,
@@ -2541,6 +3719,7 @@ mod tests {
                 metrics: base,
             },
             PhaseBucket {
+                per_cgroup: Default::default(),
                 step_index: 1,
                 label: "Step[0]".to_string(),
                 start_ms: 1000,
@@ -2569,6 +3748,7 @@ mod tests {
         step.insert("avg_imbalance_ratio".to_string(), 1.0); // -1.0, |delta|>0.5, after<before
         let buckets = vec![
             PhaseBucket {
+                per_cgroup: Default::default(),
                 step_index: 0,
                 label: "BASELINE".to_string(),
                 start_ms: 0,
@@ -2577,6 +3757,7 @@ mod tests {
                 metrics: base,
             },
             PhaseBucket {
+                per_cgroup: Default::default(),
                 step_index: 1,
                 label: "Step[0]".to_string(),
                 start_ms: 1000,
@@ -2621,6 +3802,7 @@ mod tests {
         };
         let buckets = vec![
             PhaseBucket {
+                per_cgroup: Default::default(),
                 step_index: 0,
                 label: "BASELINE".to_string(),
                 start_ms: 0,
@@ -2629,6 +3811,7 @@ mod tests {
                 metrics: BTreeMap::new(),
             },
             PhaseBucket {
+                per_cgroup: Default::default(),
                 step_index: 1,
                 label: "Step[0]".to_string(),
                 start_ms: 1000,
@@ -2657,6 +3840,7 @@ mod tests {
         let mut metrics = BTreeMap::new();
         metrics.insert("total_fallback".to_string(), 100.0);
         let bucket = PhaseBucket {
+            per_cgroup: Default::default(),
             step_index: 1,
             label: "Step[0]".to_string(),
             start_ms: 500,
@@ -2679,6 +3863,7 @@ mod tests {
         use crate::assert::PhaseBucket;
         use std::collections::BTreeMap;
         let bucket = PhaseBucket {
+            per_cgroup: Default::default(),
             step_index: 1,
             label: "Step[0]".to_string(),
             start_ms: 100,
@@ -2702,6 +3887,7 @@ mod tests {
         // how the caller arranged the input vec.
         let buckets = vec![
             PhaseBucket {
+                per_cgroup: Default::default(),
                 step_index: 2,
                 label: "Step[1]".to_string(),
                 start_ms: 2000,
@@ -2710,6 +3896,7 @@ mod tests {
                 metrics: BTreeMap::new(),
             },
             PhaseBucket {
+                per_cgroup: Default::default(),
                 step_index: 0,
                 label: "BASELINE".to_string(),
                 start_ms: 0,
@@ -2718,6 +3905,7 @@ mod tests {
                 metrics: BTreeMap::new(),
             },
             PhaseBucket {
+                per_cgroup: Default::default(),
                 step_index: 1,
                 label: "Step[0]".to_string(),
                 start_ms: 500,
@@ -2742,7 +3930,7 @@ mod tests {
         let samples: Vec<MonitorSample> = (5..25)
             .map(|i| sample(i * 100, vec![(2, 1, i * 1000), (2, 1, i * 1000 + 100)]))
             .collect();
-        let t = Timeline::build(&events, &samples);
+        let t = Timeline::build(&events, &samples, 0);
         let formatted = t.format_with_context(&TimelineContext::default());
         assert!(
             formatted.contains("throughput:"),

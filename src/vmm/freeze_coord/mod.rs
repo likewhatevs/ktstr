@@ -12378,6 +12378,8 @@ impl KtstrVm {
 
         Ok(VmResult {
             success: !timed_out && exit_code == 0,
+            vcpus: self.vcpus,
+            cpu_budget: self.effective_cpu_budget,
             // Default false at construction — set true (when applicable)
             // by the eval-layer inversion site that runs AFTER
             // evaluate_vm_result, preserving the original success +
@@ -13322,5 +13324,208 @@ mod kvm_clock_save_semantics_tests {
             save.borrow_mut().take().is_none(),
             "skip-freeze path means no capture → take() must yield None"
         );
+    }
+}
+
+#[cfg(test)]
+mod compute_err_triggered_tests {
+    //! Full truth table for [`compute_err_triggered`] — the run-loop's
+    //! "fire this iteration" verdict from the `(watchpoint_hit,
+    //! BssReadState)` pair. The matrix is the complete cross-product
+    //! (2 watchpoint states × every [`BssReadState`] variant = 8 cells)
+    //! so a regression that widens the bss arm (e.g. treating
+    //! `OutOfBounds` or `NotResolved` as a fire) surfaces here as the
+    //! corresponding `(false, …)` cell flipping from `false` to `true`.
+    //!
+    //! Semantic anchor (`mod.rs`): the verdict is
+    //! `watchpoint_hit || matches!(bss_state, Triggered)`. The
+    //! production binding at the run loop computes exactly this from the
+    //! sticky watchpoint `hit` latch and the `bss_read_state(...)`
+    //! result. Only `Triggered` counts on the bss path — `OutOfBounds`,
+    //! `NotResolved`, and `NotTriggered` are all "no observable fire",
+    //! so a stale cached PA after probe unload cannot synthesise a
+    //! phantom fire from arbitrary DRAM bytes.
+    use super::{BssReadState, compute_err_triggered};
+
+    /// Every `BssReadState` variant, in declaration order. Drives the
+    /// matrix tests so adding a 5th variant to the enum forces a
+    /// compile-time decision here (the array literal must be extended)
+    /// rather than silently leaving the new variant untested.
+    const ALL_STATES: [BssReadState; 4] = [
+        BssReadState::NotResolved,
+        BssReadState::NotTriggered,
+        BssReadState::Triggered,
+        BssReadState::OutOfBounds,
+    ];
+
+    /// Watchpoint NOT hit: the bss path is the only signal. Only
+    /// `Triggered` fires; the other three variants resolve to "no fire".
+    /// Pins the bss-only arm of the disjunction — the fallback path used
+    /// when the hardware watchpoint could not be armed.
+    #[test]
+    fn no_watchpoint_only_triggered_bss_fires() {
+        assert!(
+            !compute_err_triggered(false, BssReadState::NotResolved),
+            "wp=false + NotResolved (pre-boot / cache unset) is no fire"
+        );
+        assert!(
+            !compute_err_triggered(false, BssReadState::NotTriggered),
+            "wp=false + NotTriggered (latch still 0) is no fire"
+        );
+        assert!(
+            compute_err_triggered(false, BssReadState::Triggered),
+            "wp=false + Triggered (bss latch flipped) is THE bss-fallback fire"
+        );
+        assert!(
+            !compute_err_triggered(false, BssReadState::OutOfBounds),
+            "wp=false + OutOfBounds (stale PA) must NOT fire — a recycled \
+             vmalloc page must not synthesise a phantom fire"
+        );
+    }
+
+    /// Watchpoint hit: the verdict is the primary path and short-circuits
+    /// true regardless of the bss state. Pins that the watchpoint signal
+    /// alone is sufficient — including when the bss latch reports
+    /// `OutOfBounds` / `NotResolved` (the bss fallback degraded but the
+    /// hardware watchpoint still caught the write).
+    #[test]
+    fn watchpoint_hit_fires_for_every_bss_state() {
+        for st in ALL_STATES {
+            assert!(
+                compute_err_triggered(true, st),
+                "wp=true must fire regardless of bss state {st:?}; the \
+                 hardware watchpoint is the primary, sufficient signal"
+            );
+        }
+    }
+
+    /// Exhaustive 8-cell cross-product asserted against the independent
+    /// reference `watchpoint_hit || st == Triggered`. The reference is
+    /// computed WITHOUT `matches!` (direct `==`, which `BssReadState`
+    /// supports via `PartialEq`) so it is not a copy of the production
+    /// expression — a regression to either side is caught by divergence
+    /// from the other.
+    #[test]
+    fn full_matrix_matches_disjunction_reference() {
+        for wp in [false, true] {
+            for st in ALL_STATES {
+                let expected = wp || st == BssReadState::Triggered;
+                assert_eq!(
+                    compute_err_triggered(wp, st),
+                    expected,
+                    "cell (watchpoint_hit={wp}, bss={st:?}) must equal \
+                     `wp || st == Triggered`"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod compute_watchpoint_only_trigger_tests {
+    //! Full truth table for [`compute_watchpoint_only_trigger`] — the
+    //! predicate that selects the `gate_on_exit_kind` argument at the
+    //! `freeze_and_dispatch` Capture call site. The matrix is the
+    //! complete cross-product (2 watchpoint states × every
+    //! [`BssReadState`] variant = 8 cells).
+    //!
+    //! Semantic anchor (`mod.rs`): the predicate is
+    //! `watchpoint_hit && !matches!(bss_state, Triggered)`. True =
+    //! "watchpoint fired but the bss latch did NOT confirm the
+    //! error-class exit" → the dispatch GATES on `kind >= SCX_EXIT_ERROR`
+    //! because the watchpoint catches every write to `*scx_root->
+    //! exit_kind` (including the clean init/teardown NONE/DONE values
+    //! that would synthesise a bogus dump without the gate). False on a
+    //! bss-confirmed `Triggered` (the tp_btf handler already proved
+    //! `kind >= SCX_EXIT_ERROR`, so the gate is redundant) and false
+    //! whenever the watchpoint did not fire (there is no
+    //! watchpoint-only event to gate).
+    //!
+    //! Relationship to [`super::compute_err_triggered`]: this is the
+    //! AND-NOT counterpart of the OR. The two share the `bss ==
+    //! Triggered` term but compose it oppositely, so a regression that
+    //! collapsed one into the other would flip the `(true, Triggered)`
+    //! cell — caught by `triggered_bss_is_never_watchpoint_only` below.
+    use super::{BssReadState, compute_watchpoint_only_trigger};
+
+    /// Every `BssReadState` variant, declaration order — same role as
+    /// the sibling module's array: a new enum variant forces a
+    /// compile-time extension here rather than a silent coverage gap.
+    const ALL_STATES: [BssReadState; 4] = [
+        BssReadState::NotResolved,
+        BssReadState::NotTriggered,
+        BssReadState::Triggered,
+        BssReadState::OutOfBounds,
+    ];
+
+    /// Watchpoint NOT hit: there is no watchpoint event to gate, so the
+    /// predicate is false for every bss state. Pins the left conjunct —
+    /// a regression dropping the `watchpoint_hit &&` term would flip
+    /// these (the bss-only-fired path must NOT request the exit_kind
+    /// gate, because a bss `Triggered` already proved the error class).
+    #[test]
+    fn no_watchpoint_never_watchpoint_only() {
+        for st in ALL_STATES {
+            assert!(
+                !compute_watchpoint_only_trigger(false, st),
+                "wp=false has no watchpoint event to gate; bss state \
+                 {st:?} is irrelevant — predicate must be false"
+            );
+        }
+    }
+
+    /// Watchpoint hit, bss NOT `Triggered`: the watchpoint-only case.
+    /// True for the three non-`Triggered` states — the watchpoint caught
+    /// a write the bss latch has not (yet) confirmed as error-class, so
+    /// the dispatch must gate on `kind >= SCX_EXIT_ERROR` to suppress the
+    /// clean init/teardown NONE/DONE writes.
+    #[test]
+    fn watchpoint_hit_without_bss_triggered_is_watchpoint_only() {
+        assert!(
+            compute_watchpoint_only_trigger(true, BssReadState::NotResolved),
+            "wp=true + NotResolved is watchpoint-only → must gate on exit_kind"
+        );
+        assert!(
+            compute_watchpoint_only_trigger(true, BssReadState::NotTriggered),
+            "wp=true + NotTriggered is watchpoint-only → must gate on exit_kind"
+        );
+        assert!(
+            compute_watchpoint_only_trigger(true, BssReadState::OutOfBounds),
+            "wp=true + OutOfBounds is watchpoint-only (bss fallback stale) → \
+             must gate on exit_kind"
+        );
+    }
+
+    /// Watchpoint hit AND bss `Triggered`: NOT watchpoint-only. The bss
+    /// latch independently confirmed the error class, so the dispatch
+    /// skips the gate (it is redundant). This is the single cell that
+    /// distinguishes this predicate from a plain `watchpoint_hit`
+    /// pass-through — the right conjunct's `!Triggered` term.
+    #[test]
+    fn triggered_bss_is_never_watchpoint_only() {
+        assert!(
+            !compute_watchpoint_only_trigger(true, BssReadState::Triggered),
+            "wp=true + Triggered: bss already proved kind >= SCX_EXIT_ERROR, \
+             so the dispatch skips the exit_kind gate — NOT watchpoint-only"
+        );
+    }
+
+    /// Exhaustive 8-cell cross-product asserted against the independent
+    /// reference `watchpoint_hit && st != Triggered` (direct `!=`, not a
+    /// `matches!` copy of the production expression). Divergence on any
+    /// cell fails the test.
+    #[test]
+    fn full_matrix_matches_and_not_reference() {
+        for wp in [false, true] {
+            for st in ALL_STATES {
+                let expected = wp && st != BssReadState::Triggered;
+                assert_eq!(
+                    compute_watchpoint_only_trigger(wp, st),
+                    expected,
+                    "cell (watchpoint_hit={wp}, bss={st:?}) must equal \
+                     `wp && st != Triggered`"
+                );
+            }
+        }
     }
 }

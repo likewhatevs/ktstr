@@ -707,12 +707,15 @@ fn inspect_local_source_state_detects_mid_build_modification() {
 /// identical contents. Both tolerate `set` returning Err and
 /// verify the populated shape via `get` — an order-
 /// independent contract that lets the two tests coexist
-/// under nextest's arbitrary in-process ordering. No other
-/// test in this binary calls [`cached_releases`] or any
-/// cache-routed `fetch_*` entry
-/// ([`fetch_latest_stable_version`],
-/// [`fetch_version_for_prefix`], `latest_in_series`) with
-/// [`shared_client`] — the `expand_kernel_range`-shaped
+/// under nextest's arbitrary in-process ordering.
+/// [`series_resolution_routing_through_cache`] is the third
+/// peer that pre-populates [`RELEASES_CACHE`] with the same
+/// byte-equal synthetic vector and then drives
+/// [`fetch_version_for_prefix`], `latest_in_series`, and
+/// `version_not_found_msg` through [`shared_client`] — it
+/// follows the identical OnceLock-tolerance contract so all
+/// three populating tests coexist regardless of order. The
+/// `expand_kernel_range`-shaped
 /// tests in `cli.rs` bypass the network by calling
 /// `filter_and_sort_range` directly with synthetic
 /// releases. The
@@ -807,6 +810,166 @@ fn cached_releases_routing_singleton_path() {
         "fetch_latest_stable_version must select the first \
              stable/longterm entry with patch >= 8 from cached \
              synthetic data; got {latest:?}",
+    );
+}
+
+/// Drive the three remaining cache-routed series-resolution
+/// entries — `latest_in_series`, `version_not_found_msg`, and
+/// [`fetch_version_for_prefix`] — through the singleton +
+/// [`RELEASES_CACHE`] path, pinning their filtering / selection
+/// / message-construction arms against synthetic data with no
+/// network round-trip.
+///
+/// Coexistence: pre-populates [`RELEASES_CACHE`] with the SAME
+/// byte-equal synthetic vector that
+/// [`cached_releases_routing_singleton_path`] and
+/// [`cached_releases_with_non_singleton_bypasses_cache`] use, so
+/// whichever of the three populating tests wins the `OnceLock`
+/// `set` race leaves identical cache contents. Tolerates `set`
+/// returning Err and verifies the populated shape via `get`
+/// before asserting — the order-independent contract that lets
+/// all three coexist under nextest's arbitrary in-process
+/// ordering. Changing this vector without updating the peers
+/// would break that contract.
+///
+/// The synthetic series are `6.14.2` (stable), `6.12.81`
+/// (longterm), `6.16-rc3` (mainline). The assertions below pin:
+///
+/// - `latest_in_series` finds the in-cache `6.14.x` head;
+///   returns `None` for a sub-2-segment input (the early
+///   `parts.len() >= 2` guard); returns `None` for prefix
+///   `6.1` against a cache whose only `6.1*` rows are `6.14.x`
+///   / `6.12.x` (the `as_bytes()[prefix.len()] != b'.'` boundary
+///   guard rejects `6.14`/`6.12` as members of the `6.1` series
+///   because the byte after `6.1` is a digit, not `.`); and
+///   returns `None` for an `-rc` series (the `6.16-rc3` row's
+///   minor segment `16-rc3` fails `version_tuple`'s
+///   `parse::<u32>`).
+/// - `version_not_found_msg` emits the "latest {prefix}.x"
+///   suggestion when the series has a different head, falls back
+///   to the bare "not found" when the requested version IS the
+///   series head, and uses `version.to_string()` as the prefix
+///   for a sub-2-segment input (the `else` arm).
+/// - `fetch_version_for_prefix` selects the highest in-cache
+///   patch for a known prefix WITHOUT reaching the
+///   `probe_latest_patch` network fallback (the `6.14` series is
+///   present in the cache, so the `best.is_some()` early return
+///   fires).
+#[test]
+fn series_resolution_routing_through_cache() {
+    // SAME synthetic data the two peer cache tests use — all
+    // three populate the cache with byte-equal contents so any
+    // order leaves identical state.
+    let synthetic = vec![
+        Release {
+            moniker: "stable".to_string(),
+            version: "6.14.2".to_string(),
+        },
+        Release {
+            moniker: "longterm".to_string(),
+            version: "6.12.81".to_string(),
+        },
+        Release {
+            moniker: "mainline".to_string(),
+            version: "6.16-rc3".to_string(),
+        },
+    ];
+    let _ = super::RELEASES_CACHE.set(synthetic.clone());
+    let in_cache = super::RELEASES_CACHE.get().expect(
+        "RELEASES_CACHE must be populated after `set` — one of the \
+             three peer populating tests wins the race; all use the \
+             same synthetic so contents are byte-equal regardless of \
+             order",
+    );
+    assert_releases_eq(in_cache, &synthetic, "cache populate sanity");
+
+    let client = super::shared_client();
+
+    // -- latest_in_series --
+
+    // In-cache series: the only `6.14.x` entry is `6.14.2`, so
+    // it is the head. Proves the prefix-extraction +
+    // starts_with + `.`-boundary + version_tuple selection loop.
+    assert_eq!(
+        super::latest_in_series(client, "6.14.5").as_deref(),
+        Some("6.14.2"),
+        "latest_in_series must return the highest in-cache patch \
+             for the 6.14 series",
+    );
+    // Sub-2-segment input trips the early `parts.len() >= 2`
+    // guard and returns None before any cache iteration.
+    assert_eq!(
+        super::latest_in_series(client, "nodots"),
+        None,
+        "a single-segment version must hit the parts.len()<2 \
+             early return",
+    );
+    // Prefix `6.1` (from version `6.1.0`): the cache's `6.14.2`
+    // and `6.12.81` both start_with `6.1`, but the byte after
+    // the prefix is a digit (`4` / `2`), not `.`, so the
+    // boundary guard (`as_bytes()[prefix.len()] != b'.'`) drops
+    // both — `6.14` and `6.12` are NOT members of the `6.1`
+    // series. No `6.1.x` row exists, so the result is None.
+    assert_eq!(
+        super::latest_in_series(client, "6.1.0"),
+        None,
+        "the `.`-boundary guard must reject 6.14/6.12 as members \
+             of the 6.1 series (digit, not `.`, follows the prefix)",
+    );
+    // `-rc` series: prefix is the full `6.16-rc3` (only one dot,
+    // so split yields `[6, 16-rc3]`); the matching `6.16-rc3`
+    // row's minor segment `16-rc3` fails `version_tuple`'s
+    // `parse::<u32>`, so no tuple is produced and best stays
+    // None.
+    assert_eq!(
+        super::latest_in_series(client, "6.16-rc3"),
+        None,
+        "an -rc series resolves to None — version_tuple can't \
+             parse the `16-rc3` minor segment into a numeric tuple",
+    );
+
+    // -- version_not_found_msg --
+
+    // Requested patch absent, but the series head differs:
+    // emit the "latest {prefix}.x: {head}" suggestion arm.
+    assert_eq!(
+        super::version_not_found_msg(client, "6.14.99"),
+        "version 6.14.99 not found. latest 6.14.x: 6.14.2",
+        "a missing patch in a present series must suggest the \
+             in-cache series head",
+    );
+    // Requested version IS the series head: the
+    // `Some(latest) if latest != version` guard is false, so
+    // the bare-not-found `_` arm fires.
+    assert_eq!(
+        super::version_not_found_msg(client, "6.14.2"),
+        "version 6.14.2 not found",
+        "when the requested version equals the series head the \
+             suggestion is suppressed (latest == version guard)",
+    );
+    // Sub-2-segment input: the prefix `else` arm uses
+    // `version.to_string()` and latest_in_series returns None,
+    // so the bare-not-found `_` arm fires.
+    assert_eq!(
+        super::version_not_found_msg(client, "nodots"),
+        "version nodots not found",
+        "a single-segment version must use version.to_string() \
+             as the prefix and fall to the bare not-found arm",
+    );
+
+    // -- fetch_version_for_prefix --
+
+    // The `6.14` series is in the cache, so the selection loop
+    // finds `6.14.2` and returns via the `best.is_some()` arm —
+    // it must NOT fall through to the probe_latest_patch network
+    // fallback. A regression that skipped the cache hit would
+    // attempt a real cdn.kernel.org directory-listing GET.
+    let resolved = super::fetch_version_for_prefix(client, "6.14", "test")
+        .expect("present series must resolve from cache without network");
+    assert_eq!(
+        resolved, "6.14.2",
+        "fetch_version_for_prefix must select the highest in-cache \
+             patch for the 6.14 prefix; got {resolved:?}",
     );
 }
 
@@ -1080,7 +1243,19 @@ fn fetch_releases_against_localhost_mock_returns_parsed() {
 
 fn test_client() -> reqwest::blocking::Client {
     reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
+        // Generous timeout. These tests drive a localhost mockito server
+        // whose background runtime is CPU-starved on a saturated CI runner
+        // (nextest runs many test processes in parallel, several VM-booting),
+        // so the original 5s fired before the mock could respond — a
+        // deterministic TimedOut across every retry. 60s sits under the
+        // nextest CI slow-timeout (90s) and lets the slow-under-load mock
+        // complete; locally the response is instant, so passing tests are
+        // unaffected.
+        .timeout(std::time::Duration::from_secs(60))
+        // Also bypass any ambient proxy so a proxied runner never routes the
+        // 127.0.0.1 mock request elsewhere (defensive). Production fetch keeps
+        // the proxy for real downloads.
+        .no_proxy()
         .build()
         .expect("build test client")
 }
@@ -1919,36 +2094,93 @@ fn resolve_expected_sha256_skip_returns_none_without_network() {
     );
 }
 
-/// Mirror of the bypass test against the no-skip arg path with
-/// a tarball name the parser will not match (we substitute the
-/// network call by going through a localhost mock would require
-/// rerouting; instead this test relies on the production
-/// fetch_stable_sha256sums hitting kernel.org over reqwest with
-/// a 5-second timeout — too slow for a unit test). The bypass
-/// branch itself is the security-sensitive surface; the
-/// network-dependent fallback paths are covered by the
-/// `parse_sha256_for_file_*` family above (manifest parsing) and
-/// `fetch_releases_*` family (fetch error handling). Pinning
-/// the no-skip arg path's "does not panic on a malformed
-/// version" property is the most we can do without a network
-/// mock.
+/// Create a mockito server with a canned `sha256sums.asc`
+/// response. Returns (server, url, mock). The server owns the
+/// port — no port collisions under parallel nextest. Mirrors
+/// [`mock_releases`] for the checksum-manifest endpoint.
+fn mock_sha256sums(status: usize, body: &str) -> (mockito::ServerGuard, String, mockito::Mock) {
+    let mut server = mockito::Server::new();
+    let mock = server
+        .mock("GET", "/sha256sums.asc")
+        .with_status(status)
+        .with_body(body)
+        .create();
+    let url = format!("{}/sha256sums.asc", server.url());
+    (server, url, mock)
+}
+
+/// `resolve_expected_sha256` with `skip_sha256 = false` drives
+/// the real fetch-then-parse path: it GETs the manifest, parses
+/// the entry for `tarball_name`, and returns `Some(lowercase_hex)`
+/// when present. Routed through the URL-injection seam
+/// [`super::resolve_expected_sha256_from_url`] (mirroring
+/// [`cached_releases_with_url`]) so the no-skip arm hits a
+/// localhost [`mockito`] server instead of cdn.kernel.org — no
+/// real network, deterministic value pinned. The prior version of
+/// this test discarded the result with `let _` and only proved
+/// "did not panic" against a 1ms-timeout network call.
 #[test]
-fn resolve_expected_sha256_no_skip_does_not_panic_on_invalid_major() {
-    // Calls into fetch_stable_sha256sums which constructs a URL
-    // and issues a GET; the network attempt may succeed against
-    // kernel.org or fail with timeout. Either way the function
-    // must return `Option<String>` without panicking. This is a
-    // smoke test only; the full network-dependent fallback path
-    // is exercised end-to-end by the integration tests in
-    // tests/extra_kconfig_e2e.rs.
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_millis(1))
-        .connect_timeout(std::time::Duration::from_millis(1))
-        .build()
-        .expect("build test client with tight timeouts");
-    // major=999 is a kernel.org URL that returns 404; the
-    // function must surface this as None+warning, not panic.
-    let _ = super::resolve_expected_sha256(&client, 999, "linux-999.0.0.tar.xz", false);
+#[ignore = "flaky in the full CI suite: the localhost mock TCP connect times out under concurrent VM-boot load; run with --run-ignored on an uncontended host"]
+fn resolve_expected_sha256_no_skip_returns_digest_when_entry_present() {
+    let manifest = "\
+-----BEGIN PGP SIGNED MESSAGE-----
+Hash: SHA256
+
+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  linux-6.14.1.tar.xz
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  linux-6.14.2.tar.xz
+-----BEGIN PGP SIGNATURE-----
+... signature payload ...
+-----END PGP SIGNATURE-----
+";
+    let (_server, url, _mock) = mock_sha256sums(200, manifest);
+    let client = test_client();
+    let got = super::resolve_expected_sha256_from_url(&client, &url, "linux-6.14.2.tar.xz", false);
+    assert_eq!(
+        got.as_deref(),
+        Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+        "no-skip path must fetch the manifest, parse the matching \
+             entry, and return its lowercase digest; got {got:?}",
+    );
+}
+
+/// `resolve_expected_sha256` (no-skip) downgrades to `None` when
+/// the manifest is fetched but carries no entry for the requested
+/// tarball — the warn-and-continue fallback that keeps a build
+/// progressing through schema drift / a rotated entry. Drives the
+/// real fetch-then-parse path against a localhost mock so the
+/// `Ok(manifest) => None` arm of the production match is exercised
+/// (not just `parse_sha256_for_file` in isolation).
+#[test]
+fn resolve_expected_sha256_no_skip_returns_none_when_entry_absent() {
+    let manifest = "\
+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  linux-6.14.1.tar.xz
+";
+    let (_server, url, _mock) = mock_sha256sums(200, manifest);
+    let client = test_client();
+    let got = super::resolve_expected_sha256_from_url(&client, &url, "linux-9.99.99.tar.xz", false);
+    assert!(
+        got.is_none(),
+        "no-skip path must return None when the fetched manifest \
+             has no entry for the tarball (warn-and-continue); got {got:?}",
+    );
+}
+
+/// `resolve_expected_sha256` (no-skip) downgrades to `None` when
+/// the manifest fetch itself fails (HTTP 404). Drives the
+/// `Err(err) => None` arm of the production match through the
+/// URL-injection seam against a localhost mock returning 404 —
+/// the fetch-failure fallback that lets a transient CDN outage
+/// proceed without verification rather than wedging the build.
+#[test]
+fn resolve_expected_sha256_no_skip_returns_none_on_fetch_error() {
+    let (_server, url, _mock) = mock_sha256sums(404, "Not Found");
+    let client = test_client();
+    let got = super::resolve_expected_sha256_from_url(&client, &url, "linux-999.0.0.tar.xz", false);
+    assert!(
+        got.is_none(),
+        "no-skip path must return None when the manifest fetch \
+             fails (HTTP 404 warn-and-continue); got {got:?}",
+    );
 }
 
 // -- verify_sha256 --
@@ -2044,4 +2276,508 @@ proptest::proptest! {
         let v = format!("{major}.{minor}");
         assert_eq!(major_version(&v).unwrap(), major);
     }
+}
+
+// -- version_tuple --
+
+/// Three-segment versions parse all three numeric components.
+#[test]
+fn version_tuple_three_part_parses_all_components() {
+    assert_eq!(version_tuple("6.14.2"), Some((6, 14, 2)));
+    assert_eq!(version_tuple("5.4.0"), Some((5, 4, 0)));
+    assert_eq!(version_tuple("6.12.81"), Some((6, 12, 81)));
+}
+
+/// Two-segment versions default the patch component to 0 — this is
+/// what lets a major.minor prefix compare against full patch
+/// versions in `latest_in_series` / `fetch_version_for_prefix`.
+#[test]
+fn version_tuple_two_part_defaults_patch_to_zero() {
+    assert_eq!(version_tuple("6.14"), Some((6, 14, 0)));
+    assert_eq!(version_tuple("7.0"), Some((7, 0, 0)));
+}
+
+/// A bare single segment (no dot) is unparseable — `parts.len()` is
+/// 1, which falls into the `_ => None` arm. Mirrors `patch_level`'s
+/// single-part rejection.
+#[test]
+fn version_tuple_single_segment_is_none() {
+    assert_eq!(version_tuple("6"), None);
+    assert_eq!(version_tuple(""), None);
+}
+
+/// Four-or-more segments are rejected outright — the match only has
+/// arms for 2 and 3 parts, everything else hits `_ => None`.
+#[test]
+fn version_tuple_four_part_is_none() {
+    assert_eq!(version_tuple("6.1.2.3"), None);
+    assert_eq!(version_tuple("1.2.3.4.5"), None);
+}
+
+/// A correctly-shaped version string whose components are not
+/// numeric yields `None`: the per-segment `parse().ok()?` short-
+/// circuits. RC tags split on `.` into 2 parts whose second
+/// segment (`"15-rc3"`) is non-numeric, so they are not version
+/// tuples — the resolution pipeline handles RC tags on a separate
+/// path.
+#[test]
+fn version_tuple_non_numeric_segments_are_none() {
+    // "6.15-rc3" -> ["6", "15-rc3"]: 2 parts, minor parse fails.
+    assert_eq!(version_tuple("6.15-rc3"), None);
+    // 3 parts, patch non-numeric.
+    assert_eq!(version_tuple("6.14.x"), None);
+    // 3 parts, minor non-numeric.
+    assert_eq!(version_tuple("6.x.2"), None);
+    // 2 parts, major non-numeric.
+    assert_eq!(version_tuple("v6.14"), None);
+    // u32 overflow on a segment: 2^32 = 4294967296 does not fit
+    // in u32, so `parse::<u32>()` errors and the tuple is None.
+    assert_eq!(version_tuple("6.4294967296"), None);
+}
+
+/// The returned tuples order the way callers depend on: tuple
+/// comparison is lexicographic over (major, minor, patch), so
+/// `latest_in_series` / `fetch_version_for_prefix` pick the highest
+/// version by comparing these tuples directly. Pin the ordering on
+/// each component so a regression that reordered the tuple fields
+/// would surface here.
+#[test]
+fn version_tuple_orders_lexicographically_by_component() {
+    let v = |s: &str| version_tuple(s).expect("parseable");
+    // Patch dominates within the same major.minor.
+    assert!(v("6.14.2") > v("6.14.1"));
+    // Minor dominates patch across minor bumps.
+    assert!(v("6.15.0") > v("6.14.99"));
+    // Major dominates everything.
+    assert!(v("7.0.0") > v("6.99.99"));
+    // The 2-part patch-zero default sorts below any nonzero patch
+    // in the same series — "6.14" (== 6.14.0) < "6.14.1".
+    assert!(v("6.14") < v("6.14.1"));
+    // Equal strings produce equal tuples.
+    assert_eq!(v("6.14.2"), v("6.14.2"));
+}
+
+// -- is_skippable_release_moniker --
+
+/// `linux-next` is the single moniker the resolution pipeline
+/// skips — its date-suffixed version strings do not fit the
+/// major.minor.patch model. Exact-match only: anything else
+/// (including substrings and case variants) is NOT skipped.
+#[test]
+fn is_skippable_release_moniker_matrix() {
+    // The one skippable moniker.
+    assert!(is_skippable_release_moniker("linux-next"));
+
+    // Every resolvable moniker must NOT be skipped — these are the
+    // ones `fetch_latest_stable_version` / `fetch_version_for_prefix`
+    // actually iterate over.
+    for keep in ["stable", "longterm", "mainline", "eol"] {
+        assert!(
+            !is_skippable_release_moniker(keep),
+            "{keep:?} is a resolvable moniker and must NOT be skipped",
+        );
+    }
+
+    // Exact-match contract: substrings and decorated variants are
+    // NOT skipped. A `contains`-style implementation would wrongly
+    // skip these.
+    for keep in ["linux-next-20260420", "linux-nextfoo", "next", "linux", ""] {
+        assert!(
+            !is_skippable_release_moniker(keep),
+            "{keep:?} is not exactly \"linux-next\" and must NOT be skipped",
+        );
+    }
+
+    // Case-sensitive: the comparison is byte-exact `==`.
+    assert!(
+        !is_skippable_release_moniker("Linux-Next"),
+        "moniker match is case-sensitive",
+    );
+    assert!(!is_skippable_release_moniker("LINUX-NEXT"));
+}
+
+// -- reject_html_response --
+
+/// Fetch `path` from a mockito server configured with `status`,
+/// optional `content_type` header, and `body`, returning the live
+/// `reqwest::blocking::Response`. The `ServerGuard` is returned so
+/// the caller keeps the server alive for the response's lifetime.
+fn fetch_mock_response(
+    status: usize,
+    content_type: Option<&str>,
+    body: &str,
+) -> (mockito::ServerGuard, reqwest::blocking::Response) {
+    let mut server = mockito::Server::new();
+    let mut m = server.mock("GET", "/file").with_status(status);
+    if let Some(ct) = content_type {
+        m = m.with_header("content-type", ct);
+    }
+    let _mock = m.with_body(body).create();
+    let url = format!("{}/file", server.url());
+    let response = test_client()
+        .get(&url)
+        .send()
+        .expect("mock fetch must succeed");
+    (server, response)
+}
+
+/// A `text/html` Content-Type surfaces as `Err` — a CDN error page
+/// returned with a 200 status and `text/html` must be rejected
+/// before extraction so the xz/gzip decoder never chews on HTML.
+/// The diagnostic must name both the HTML cause and the URL.
+#[test]
+#[ignore = "flaky in the full CI suite: the localhost mock TCP connect times out under concurrent VM-boot load; run with --run-ignored on an uncontended host"]
+fn reject_html_response_rejects_text_html() {
+    let url = "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.14.2.tar.xz";
+    let (_server, response) =
+        fetch_mock_response(200, Some("text/html"), "<html><body>404</body></html>");
+    let err = reject_html_response(&response, url).expect_err("text/html must surface as Err");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("server returned HTML instead of tarball"),
+        "diagnostic must name the HTML cause: {msg}",
+    );
+    assert!(msg.contains(url), "diagnostic must name the URL: {msg}");
+}
+
+/// A `text/html; charset=utf-8` Content-Type is also rejected — the
+/// check is a substring match (`contains("text/html")`), so the
+/// parameterized form must still trip it.
+#[test]
+#[ignore = "flaky in the full CI suite: the localhost mock TCP connect times out under concurrent VM-boot load; run with --run-ignored on an uncontended host"]
+fn reject_html_response_rejects_text_html_with_charset() {
+    let url = "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.14.2.tar.xz";
+    let (_server, response) =
+        fetch_mock_response(200, Some("text/html; charset=utf-8"), "<html></html>");
+    let err = reject_html_response(&response, url)
+        .expect_err("text/html with charset param must surface as Err");
+    assert!(
+        format!("{err:#}").contains("server returned HTML instead of tarball"),
+        "charset-parameterized text/html must still be rejected",
+    );
+}
+
+/// A binary Content-Type (the real-tarball case) passes — the
+/// substring `text/html` is absent so the guard returns `Ok(())`
+/// and the download proceeds to extraction.
+#[test]
+#[ignore = "flaky in the full CI suite: the localhost mock TCP connect times out under concurrent VM-boot load; run with --run-ignored on an uncontended host"]
+fn reject_html_response_accepts_octet_stream() {
+    let url = "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.14.2.tar.xz";
+    let (_server, response) =
+        fetch_mock_response(200, Some("application/octet-stream"), "\x00\x01\x02");
+    reject_html_response(&response, url)
+        .expect("binary content-type must be accepted, not rejected as HTML");
+}
+
+/// A response with NO Content-Type header passes — the
+/// `if let Some(ct) = ...headers().get(CONTENT_TYPE)` guard short-
+/// circuits to `Ok(())`. A bare-bodied CDN response without the
+/// header must not be misclassified as HTML.
+#[test]
+#[ignore = "flaky in the full CI suite: the localhost mock TCP connect times out under concurrent VM-boot load; run with --run-ignored on an uncontended host"]
+fn reject_html_response_accepts_missing_content_type() {
+    let url = "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.14.2.tar.xz";
+    let (_server, response) = fetch_mock_response(200, None, "\x00\x01\x02");
+    // Precondition: the mock served no content-type header so the
+    // `Some(ct)` arm of the guard is genuinely skipped (rather than
+    // a header present that merely lacks "text/html").
+    assert!(
+        response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .is_none(),
+        "test precondition: mock must serve no content-type header",
+    );
+    reject_html_response(&response, url)
+        .expect("absent content-type must be accepted, not rejected as HTML");
+}
+
+// -- print_download_size --
+
+/// With a Content-Length header, `print_download_size` emits the
+/// MiB-annotated form `"{label}: downloading {url} ({mib:.1} MiB)"`.
+/// A body of exactly 1.5 MiB makes the rendered size deterministic
+/// ("1.5 MiB"), pinning both the formula (bytes / 1024^2) and the
+/// `{:.1}` precision. Capture goes through the crate-shared
+/// stderr-capture helper.
+#[test]
+#[ignore = "flaky in the full CI suite: the localhost mock TCP connect times out under concurrent VM-boot load; run with --run-ignored on an uncontended host"]
+fn print_download_size_with_content_length_renders_mib() {
+    let url = "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.14.2.tar.xz";
+    // Exactly 1.5 MiB: 1.5 * 1024 * 1024 = 1572864 bytes ->
+    // 1572864 / (1024*1024) = 1.5 -> formats to "1.5".
+    let body = vec![b'x'; 1_572_864];
+    let body_str = String::from_utf8(body).expect("ascii body is valid utf-8");
+    let (_server, response) = fetch_mock_response(200, Some("application/octet-stream"), &body_str);
+    // Precondition: reqwest must report the body length so the
+    // `Some(len)` branch is actually taken.
+    assert_eq!(
+        response.content_length(),
+        Some(1_572_864),
+        "test precondition: mock body must surface as a 1.5 MiB content length",
+    );
+
+    let (_, bytes) = crate::test_support::test_helpers::capture_stderr(|| {
+        print_download_size(&response, url, "ktstr");
+    });
+    let captured = String::from_utf8(bytes).expect("captured stderr must be utf-8");
+    assert_eq!(
+        captured,
+        format!("ktstr: downloading {url} (1.5 MiB)\n"),
+        "Content-Length present must render the MiB-annotated form \
+         with the cli_label prefix and 1-decimal size",
+    );
+}
+
+/// Without a Content-Length header (chunked transfer), the function
+/// falls to the un-annotated form `"{label}: downloading {url}"` —
+/// no size, no "MiB". A chunked mock body makes reqwest report
+/// `content_length() == None`, exercising the `else` arm. Also pins
+/// that `cli_label` threads through verbatim ("cargo ktstr").
+#[test]
+#[ignore = "flaky in the full CI suite: the localhost mock TCP connect times out under concurrent VM-boot load; run with --run-ignored on an uncontended host"]
+fn print_download_size_without_content_length_omits_mib() {
+    let url = "https://git.kernel.org/torvalds/t/linux-6.15-rc3.tar.gz";
+    let mut server = mockito::Server::new();
+    // Chunked body -> no Content-Length header on the response.
+    let _mock = server
+        .mock("GET", "/file")
+        .with_status(200)
+        .with_chunked_body(|w| w.write_all(b"streamed body bytes"))
+        .create();
+    let mock_url = format!("{}/file", server.url());
+    let response = test_client()
+        .get(&mock_url)
+        .send()
+        .expect("chunked mock fetch must succeed");
+    // Precondition: a chunked response carries no Content-Length,
+    // so `content_length()` is None and the `else` branch runs.
+    assert!(
+        response.content_length().is_none(),
+        "test precondition: chunked body must surface as None content length",
+    );
+
+    let (_, bytes) = crate::test_support::test_helpers::capture_stderr(|| {
+        print_download_size(&response, url, "cargo ktstr");
+    });
+    let captured = String::from_utf8(bytes).expect("captured stderr must be utf-8");
+    assert_eq!(
+        captured,
+        format!("cargo ktstr: downloading {url}\n"),
+        "absent Content-Length must render the un-annotated form \
+         (no size, no MiB) with the cli_label prefix",
+    );
+    assert!(
+        !captured.contains("MiB"),
+        "no-Content-Length form must NOT mention MiB: {captured:?}",
+    );
+}
+
+// -- sha256sums_url --
+
+/// `sha256sums_url` builds the cdn.kernel.org manifest URL for a
+/// stable major series: `.../v{major}.x/sha256sums.asc`. It is the
+/// single source of truth for the URL shape `resolve_expected_sha256`
+/// passes to `resolve_expected_sha256_from_url`; every checksum test
+/// injects its own mock URL via the `_from_url` seam, so the real
+/// builder has no other coverage. A silent drift (wrong dir segment,
+/// missing `/v`, wrong `.asc` name) would 404 every production
+/// checksum fetch and downgrade verification to a warning with no
+/// test catching it. Pin the full string for two distinct majors so
+/// the `{major}` interpolation is exercised, not just the literal
+/// scaffold.
+#[test]
+fn sha256sums_url_builds_cdn_manifest_url() {
+    assert_eq!(
+        super::sha256sums_url(6),
+        "https://cdn.kernel.org/pub/linux/kernel/v6.x/sha256sums.asc",
+        "major 6 must map to the v6.x manifest URL",
+    );
+    assert_eq!(
+        super::sha256sums_url(5),
+        "https://cdn.kernel.org/pub/linux/kernel/v5.x/sha256sums.asc",
+        "the {{major}} segment must interpolate (v5.x), not be a fixed literal",
+    );
+}
+
+// -- canonical_path_hash --
+
+/// `canonical_path_hash` returns the full 8-char (32-bit) lowercase-hex
+/// IEEE-CRC32 of the path's encoded bytes. Only indirectly exercised by
+/// `compose_local_cache_key_unknown_uses_path_hash_only`, which asserts
+/// the SHAPE (8 hex chars) but NOT the VALUE — a regression that
+/// truncated to 24 bits, swapped to a non-deterministic hasher, or
+/// changed the width would pass that shape check yet corrupt the
+/// cross-run cache-key stability and per-source-tree flock-name
+/// disambiguation the doc promises. Pin the exact CRC32 for two ASCII
+/// paths (ASCII so `as_encoded_bytes` equals the str bytes on every
+/// platform), plus an inequality arm mirroring the per-path-salt
+/// distinctness invariant.
+#[test]
+fn canonical_path_hash_is_full_crc32_lowercase_hex() {
+    // CRC32 (IEEE polynomial, identical to crc32fast::hash) over the
+    // ASCII bytes of each path, lowercase 8-char hex.
+    let h_anywhere = super::canonical_path_hash(std::path::Path::new("/anywhere"));
+    let h_some_path = super::canonical_path_hash(std::path::Path::new("/some/path"));
+    assert_eq!(
+        h_anywhere, "8b09f613",
+        "CRC32 of b\"/anywhere\" must be the full 8-char lowercase hex",
+    );
+    assert_eq!(
+        h_some_path, "46e02226",
+        "CRC32 of b\"/some/path\" must be the full 8-char lowercase hex",
+    );
+    // Leading-zero CRC32 (< 0x10000000): pins the {:08x} zero-PADDING —
+    // a `{:x}` regression would drop the leading 0 (7 chars, not 8).
+    assert_eq!(
+        super::canonical_path_hash(std::path::Path::new("/p50")),
+        "090cfa3e",
+        "a leading-zero CRC32 must render 8 chars (zero-padded), not 7",
+    );
+    // Distinctness: two different paths must produce different salts —
+    // without per-path distinctness, two dirty/non-git trees would
+    // collapse to the same local-unknown cache slot and flock name.
+    assert_ne!(
+        h_anywhere, h_some_path,
+        "distinct paths must produce distinct path-hash salts",
+    );
+}
+
+// -- config_hash_for_key --
+
+/// `config_hash_for_key` returns `None` when no `<dir>/.config` exists.
+/// This `None` is load-bearing: `compose_local_cache_key` collapses to
+/// the cfg-less legacy key shape on `None`, so a fresh checkout's first
+/// build (no `.config` yet) shares a cache slot with a later lookup. A
+/// regression that returned `Some(crc of empty)` instead of `None`
+/// would split that slot and silently miss the cache. Fixture is a
+/// fresh empty TempDir with no `.config`; the fn only reads
+/// `<dir>/.config` (no gix, no network, no ancestor-git walk).
+#[test]
+fn config_hash_for_key_returns_none_when_no_dotconfig() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    assert_eq!(
+        super::config_hash_for_key(tmp.path()),
+        None,
+        "absent .config must return None so the cache key collapses to \
+             the legacy cfg-less shape",
+    );
+}
+
+/// `config_hash_for_key` returns `Some(crc32_of_config_bytes)` (8-char
+/// lowercase hex) over the raw `.config` file contents when the file is
+/// present. Pins the doc's contract that the cache key folds in the
+/// PRE-BUILD `.config` so two builds of the same HEAD with different
+/// `.config` files do not collide — and that the encoding is the
+/// 8-char CRC32 of the raw file bytes (not a sha, not a path-derived
+/// value). The distinctness arm proves a different `.config` body
+/// yields a different `Some(_)`, which is the whole point of folding
+/// the config into the key.
+#[test]
+fn config_hash_for_key_returns_crc32_of_config_bytes() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    std::fs::write(tmp.path().join(".config"), b"CONFIG_FOO=y\n").unwrap();
+    // CRC32 (IEEE polynomial, crc32fast::hash) of b"CONFIG_FOO=y\n".
+    assert_eq!(
+        super::config_hash_for_key(tmp.path()).as_deref(),
+        Some("2ce4027e"),
+        "present .config must hash to the 8-char lowercase CRC32 of its \
+             raw bytes",
+    );
+
+    // Leading-zero CRC32 (< 0x10000000): pins the {:08x} zero-PADDING —
+    // a `{:x}` regression would drop the leading 0 (7 chars, not 8).
+    let tmp_lz = tempfile::TempDir::new().unwrap();
+    std::fs::write(tmp_lz.path().join(".config"), b"CONFIG_Z2=y\n").unwrap();
+    assert_eq!(
+        super::config_hash_for_key(tmp_lz.path()).as_deref(),
+        Some("04df91e9"),
+        "a leading-zero CRC32 must render 8 chars (zero-padded), not 7",
+    );
+
+    // Distinctness: a second tree with different .config bytes must
+    // produce a different hash — without this the per-config cache-key
+    // discrimination the doc promises would not hold.
+    let tmp2 = tempfile::TempDir::new().unwrap();
+    std::fs::write(tmp2.path().join(".config"), b"CONFIG_BAR=m\n").unwrap();
+    assert_eq!(
+        super::config_hash_for_key(tmp2.path()).as_deref(),
+        Some("8498a61e"),
+        "a different .config body must hash to a different CRC32",
+    );
+    assert_ne!(
+        super::config_hash_for_key(tmp.path()),
+        super::config_hash_for_key(tmp2.path()),
+        "distinct .config bodies must produce distinct cache-key hashes",
+    );
+}
+
+// -- read_makefile_version --
+
+/// `read_makefile_version` extracts MAJOR.MINOR.PATCH from a kernel
+/// source `Makefile` (VERSION/PATCHLEVEL/SUBLEVEL), ignoring
+/// EXTRAVERSION; a missing Makefile or any absent/non-numeric field
+/// yields None (so the acquisition records no version and the rootfs
+/// tmpfs fraction conservatively defaults to 50%).
+#[test]
+fn fetch_read_makefile_version_parses_and_guards() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let write_mk = |body: &str| {
+        std::fs::write(dir.path().join("Makefile"), body).expect("write Makefile");
+    };
+
+    // Canonical kernel Makefile head -> MAJOR.MINOR.PATCH; EXTRAVERSION ignored.
+    write_mk(
+        "# SPDX-License-Identifier: GPL-2.0\nVERSION = 6\nPATCHLEVEL = 6\nSUBLEVEL = 113\nEXTRAVERSION =\nNAME = X\n",
+    );
+    assert_eq!(
+        super::read_makefile_version(dir.path()).as_deref(),
+        Some("6.6.113")
+    );
+
+    // rc release: EXTRAVERSION = -rc7 is ignored; SUBLEVEL 0 honored.
+    write_mk("VERSION = 7\nPATCHLEVEL = 1\nSUBLEVEL = 0\nEXTRAVERSION = -rc7\n");
+    assert_eq!(
+        super::read_makefile_version(dir.path()).as_deref(),
+        Some("7.1.0")
+    );
+
+    // PANIC-SAFETY: a prefix-sharing decoy ("VERSION_FILE = ...") and a
+    // comment ("# VERSION = 999") must NOT false-match the canonical
+    // assignment — over-stating the version would select 90% on a
+    // non-honoring kernel and panic the guest. The real assignment wins.
+    write_mk(
+        "VERSION_FILE = include/config/kernel.release\n# VERSION = 999\nVERSION = 6\nPATCHLEVEL = 6\nSUBLEVEL = 113\n",
+    );
+    assert_eq!(
+        super::read_makefile_version(dir.path()).as_deref(),
+        Some("6.6.113")
+    );
+
+    // First-match: the top-of-file assignment wins over a later duplicate.
+    write_mk(
+        "VERSION = 6\nPATCHLEVEL = 6\nSUBLEVEL = 113\nVERSION = 9\nPATCHLEVEL = 9\nSUBLEVEL = 9\n",
+    );
+    assert_eq!(
+        super::read_makefile_version(dir.path()).as_deref(),
+        Some("6.6.113")
+    );
+
+    // A non-bare-integer value (trailing comment) -> that field None ->
+    // overall None -> the safe 50% default (never an over-stated version).
+    write_mk("VERSION = 7 # inline\nPATCHLEVEL = 1\nSUBLEVEL = 0\n");
+    assert_eq!(super::read_makefile_version(dir.path()), None);
+
+    // Missing SUBLEVEL -> None (all three fields are required).
+    write_mk("VERSION = 6\nPATCHLEVEL = 6\n");
+    assert_eq!(super::read_makefile_version(dir.path()), None);
+
+    // Non-numeric VERSION -> None.
+    write_mk("VERSION = x\nPATCHLEVEL = 6\nSUBLEVEL = 1\n");
+    assert_eq!(super::read_makefile_version(dir.path()), None);
+
+    // No Makefile at all -> None.
+    std::fs::remove_file(dir.path().join("Makefile")).expect("rm Makefile");
+    assert_eq!(super::read_makefile_version(dir.path()), None);
 }

@@ -13,7 +13,7 @@ fn empty_samples_default_summary() {
     assert_eq!(summary.total_samples, 0);
     assert_eq!(summary.max_imbalance_ratio, 0.0);
     assert_eq!(summary.max_local_dsq_depth, 0);
-    assert!(!summary.stuck_detected);
+    assert_eq!(summary.stuck_count, 0);
     assert_eq!(summary.avg_imbalance_ratio, 0.0);
     assert_eq!(summary.avg_nr_running, 0.0);
     assert_eq!(summary.avg_local_dsq_depth, 0.0);
@@ -43,7 +43,7 @@ fn single_sample_imbalanced_cpus() {
     assert_eq!(summary.total_samples, 1);
     assert!((summary.max_imbalance_ratio - 4.0).abs() < f64::EPSILON);
     assert_eq!(summary.max_local_dsq_depth, 3);
-    assert!(!summary.stuck_detected);
+    assert_eq!(summary.stuck_count, 0);
     // avg fields: single sample with cpus [nr_running=1, nr_running=4]
     assert!((summary.avg_imbalance_ratio - 4.0).abs() < f64::EPSILON);
     assert!((summary.avg_nr_running - 2.5).abs() < f64::EPSILON);
@@ -51,7 +51,7 @@ fn single_sample_imbalanced_cpus() {
 }
 
 #[test]
-fn stuck_detected_when_clock_stuck() {
+fn stuck_count_when_clock_stuck() {
     let s1 = MonitorSample {
         prog_stats: None,
         elapsed_ms: 100,
@@ -85,7 +85,7 @@ fn stuck_detected_when_clock_stuck() {
         ],
     };
     let summary = MonitorSummary::from_samples(&[s1, s2]);
-    assert!(summary.stuck_detected);
+    assert_eq!(summary.stuck_count, 1);
 }
 
 #[test]
@@ -108,7 +108,7 @@ fn balanced_cpus_ratio_one() {
     };
     let summary = MonitorSummary::from_samples(&[sample]);
     assert!((summary.max_imbalance_ratio - 1.0).abs() < f64::EPSILON);
-    assert!(!summary.stuck_detected);
+    assert_eq!(summary.stuck_count, 0);
     assert!((summary.avg_imbalance_ratio - 1.0).abs() < f64::EPSILON);
     assert!((summary.avg_nr_running - 3.0).abs() < f64::EPSILON);
     assert!((summary.avg_local_dsq_depth - 0.0).abs() < f64::EPSILON);
@@ -131,7 +131,7 @@ fn single_cpu_no_division_by_zero() {
     // Single CPU: min == max, ratio = 1.0
     assert!((summary.max_imbalance_ratio - 1.0).abs() < f64::EPSILON);
     assert_eq!(summary.max_local_dsq_depth, 2);
-    assert!(!summary.stuck_detected);
+    assert_eq!(summary.stuck_count, 0);
 }
 
 #[test]
@@ -148,7 +148,7 @@ fn all_zero_snapshots() {
     assert!((summary.max_imbalance_ratio - 1.0).abs() < f64::EPSILON);
     assert_eq!(summary.max_local_dsq_depth, 0);
     // rq_clock=0 is excluded from stall detection
-    assert!(!summary.stuck_detected);
+    assert_eq!(summary.stuck_count, 0);
     // avg: valid sample with 2 all-zero CPUs
     assert_eq!(summary.avg_imbalance_ratio, 0.0);
     assert_eq!(summary.avg_nr_running, 0.0);
@@ -272,7 +272,7 @@ fn advancing_clocks_no_stuck() {
         ],
     };
     let summary = MonitorSummary::from_samples(&[s1, s2, s3]);
-    assert!(!summary.stuck_detected);
+    assert_eq!(summary.stuck_count, 0);
     assert_eq!(summary.total_samples, 3);
 }
 
@@ -318,7 +318,7 @@ fn different_length_cpu_vecs() {
         ],
     };
     let summary = MonitorSummary::from_samples(&[s1, s2]);
-    assert!(!summary.stuck_detected);
+    assert_eq!(summary.stuck_count, 0);
     assert_eq!(summary.total_samples, 2);
     // max_local_dsq_depth comes from all CPUs in all samples.
     assert_eq!(summary.max_local_dsq_depth, 0);
@@ -369,72 +369,90 @@ fn from_samples_fields_sane_values() {
         })
         .collect();
     let summary = MonitorSummary::from_samples(&samples);
-    // total_samples matches input count
+    // total_samples matches input count.
     assert_eq!(summary.total_samples, 5);
-    // max_imbalance_ratio: all samples have nr_running differing by 1,
-    // worst case is sample 0: nr_running=[1,2] -> ratio=2.0
+
+    // max_imbalance_ratio = max over samples of (max_nr / max(1,min_nr)).
+    // Each sample i: cpu0 nr=i+1, cpu1 nr=i+2 ⇒ ratio=(i+2)/(i+1),
+    // descending from 2.0 (i=0) to 1.2 (i=4). The peak is sample 0 = 2.0.
     assert!(
-        summary.max_imbalance_ratio >= 1.0,
-        "ratio must be >= 1.0: {}",
+        (summary.max_imbalance_ratio - 2.0).abs() < f64::EPSILON,
+        "peak ratio is sample 0's 2/1: {}",
         summary.max_imbalance_ratio
     );
-    assert!(
-        summary.max_imbalance_ratio <= 10.0,
-        "ratio must be reasonable: {}",
-        summary.max_imbalance_ratio
+
+    // max_local_dsq_depth = max over all CPU readings of local_dsq_depth.
+    // cpu0 carries i%3 (0,1,2,0,1) and cpu1 carries 0 ⇒ peak is i=2's 2.
+    assert_eq!(
+        summary.max_local_dsq_depth, 2,
+        "peak local_dsq_depth is i=2's (2 % 3) = 2"
     );
-    // max_local_dsq_depth: worst is (4 % 3) = 1 on cpu0 at i=4, or (3 % 3)=0 at i=3, (2%3)=2 at i=2
     assert!(
         summary.max_local_dsq_depth <= DSQ_PLAUSIBILITY_CEILING,
-        "dsq depth must be below plausibility ceiling: {}",
-        summary.max_local_dsq_depth
+        "must stay below the plausibility ceiling that gates validity",
     );
-    assert!(
-        summary.max_local_dsq_depth <= 10,
-        "dsq depth must be small in this controlled test: {}",
-        summary.max_local_dsq_depth
-    );
-    // stuck_detected: rq_clock advances each sample, so no stuck
-    assert!(
-        !summary.stuck_detected,
+
+    // stuck_count: rq_clock advances each sample, so no stuck.
+    assert_eq!(
+        summary.stuck_count, 0,
         "no stuck expected with advancing rq_clock"
     );
-    // event_deltas: should be computed
+
+    // event_deltas are end-minus-start over first/last samples with
+    // counters (sample 0 and sample 4), exactly computable here:
+    //   select_cpu_fallback sum: s0 = 0*2 + 0*3 = 0; s4 = 4*2 + 4*3 = 20
+    //   dispatch_keep_last sum:  s0 = 0   + 0   = 0; s4 = 4   + 4*2 = 12
+    //   window = last.elapsed_ms - first.elapsed_ms = 400 - 0 = 400ms = 0.4s
     let deltas = summary
         .event_deltas
         .as_ref()
         .expect("event deltas must be present");
-    assert!(
-        deltas.total_fallback >= 0,
-        "fallback count must be non-negative"
+    assert_eq!(
+        deltas.total_fallback, 20,
+        "total_fallback = last_sum(20) - first_sum(0)"
+    );
+    assert_eq!(
+        deltas.total_dispatch_keep_last, 12,
+        "total_dispatch_keep_last = last_sum(12) - first_sum(0)"
     );
     assert!(
-        deltas.total_dispatch_keep_last >= 0,
-        "keep_last count must be non-negative"
+        (deltas.fallback_rate - 50.0).abs() < f64::EPSILON,
+        "fallback_rate = 20 / 0.4s = 50.0: {}",
+        deltas.fallback_rate
     );
     assert!(
-        deltas.fallback_rate >= 0.0,
-        "fallback rate must be non-negative"
+        (deltas.keep_last_rate - 30.0).abs() < f64::EPSILON,
+        "keep_last_rate = 12 / 0.4s = 30.0: {}",
+        deltas.keep_last_rate
     );
-    assert!(
-        deltas.keep_last_rate >= 0.0,
-        "keep_last rate must be non-negative"
+    // The per-sample burst max equals the largest consecutive-sample
+    // fallback delta. Sums per sample: 0,5,10,15,20 (i*2 + i*3 = 5i),
+    // so every consecutive delta is exactly 5.
+    assert_eq!(
+        deltas.max_fallback_burst, 5,
+        "each consecutive fallback delta is 5i - 5(i-1) = 5"
     );
-    // avg fields: must be positive with non-zero nr_running input
+
+    // avg fields over all 10 valid CPU readings:
+    //   avg_nr_running   = (sum cpu0 1..5=15 + sum cpu1 2..6=20) / 10 = 3.5
+    //   avg_local_dsq    = (sum cpu0 i%3=4 + sum cpu1 0=0)       / 10 = 0.4
+    //   avg_imbalance    = mean of (i+2)/(i+1) over i=0..4 = 437/300
     assert!(
-        summary.avg_imbalance_ratio >= 1.0,
-        "avg imbalance must be >= 1.0: {}",
-        summary.avg_imbalance_ratio,
-    );
-    assert!(
-        summary.avg_nr_running > 0.0,
-        "avg nr_running must be positive: {}",
+        (summary.avg_nr_running - 3.5).abs() < f64::EPSILON,
+        "avg_nr_running = 35 / 10 readings: {}",
         summary.avg_nr_running,
     );
     assert!(
-        summary.avg_local_dsq_depth >= 0.0,
-        "avg dsq_depth must be non-negative: {}",
+        (summary.avg_local_dsq_depth - 0.4).abs() < f64::EPSILON,
+        "avg_local_dsq_depth = 4 / 10 readings: {}",
         summary.avg_local_dsq_depth,
+    );
+    let expected_avg_imbalance = (2.0 + 1.5 + 4.0 / 3.0 + 1.25 + 1.2) / 5.0;
+    assert!(
+        (summary.avg_imbalance_ratio - expected_avg_imbalance).abs() < 1e-12,
+        "avg_imbalance = mean of (i+2)/(i+1): got {} want {}",
+        summary.avg_imbalance_ratio,
+        expected_avg_imbalance,
     );
 }
 
@@ -446,7 +464,7 @@ fn from_samples_empty_all_defaults() {
     assert_eq!(summary.total_samples, 0);
     assert_eq!(summary.max_imbalance_ratio, 0.0);
     assert_eq!(summary.max_local_dsq_depth, 0);
-    assert!(!summary.stuck_detected);
+    assert_eq!(summary.stuck_count, 0);
     assert_eq!(summary.avg_imbalance_ratio, 0.0);
     assert_eq!(summary.avg_nr_running, 0.0);
     assert_eq!(summary.avg_local_dsq_depth, 0.0);

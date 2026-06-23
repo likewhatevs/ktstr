@@ -45,7 +45,8 @@ git worktree add ~/opensource/scx-main upstream/main
 
 ## Collect both runs into a shared run root
 
-Each `cargo nextest run --workspace` writes its sidecars into
+Each `cargo ktstr test` run (which drives cargo nextest under the
+hood) writes its sidecars into
 `target/ktstr/{kernel}-{project_commit}/`. The `{project_commit}`
 half is the project tree's HEAD short hex captured at first
 sidecar write (suffixed `-dirty` when the worktree differs from
@@ -63,7 +64,7 @@ snapshot of (kernel, project commit).
 > pre-clear and the comparison degenerates to "identical pool of
 > sidecars." Confirm distinct commits with `git -C ~/opensource/scx
 > rev-parse HEAD` and `git -C ~/opensource/scx-main rev-parse
-> HEAD` before invoking the second `cargo nextest run`.
+> HEAD` before invoking the second `cargo ktstr test`.
 
 Every sidecar also carries its own `project_commit` field (read
 from the project tree's git HEAD at sidecar-write time), so

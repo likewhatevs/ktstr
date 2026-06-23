@@ -297,6 +297,25 @@ pub struct KtstrVm {
     /// independently of where the framework places the scheduler).
     pub(crate) scheduler_cgroup_parent: Option<String>,
     pub(crate) topology: Topology,
+    /// Guest vCPU count (topology llcs*cores*threads). Stamped onto the
+    /// sidecar so `cargo ktstr stats` can pair/compare runs by their
+    /// (vcpus, cpu_budget) and flag overcommit (cpu_budget < vcpus).
+    pub(crate) vcpus: u32,
+    /// Effective host-CPU budget the vCPU threads actually run on: the
+    /// Build-time ESTIMATE of the host-CPU budget the vCPU threads will
+    /// run on: the reserved plan's CPU count under no-perf-mode; the guest
+    /// vCPU count under perf-mode (always) and under the deferred default
+    /// WHEN host sysfs topology is readable (both then attempt a 1:1
+    /// hard-pin of each vCPU thread to one host CPU). Falls back to the
+    /// process's full allowed cpuset when no affinity is applied: no-perf
+    /// bypass, sysfs unreadable, or the deferred default with no cached
+    /// host topology. When the deferred default cannot 1:1-pin (host too
+    /// small) it overcommits at run time and `run()` overrides
+    /// `VmResult.cpu_budget` with the actual masked host-CPU count, so this
+    /// estimate reaches the sidecar only when it held. Below `vcpus` means
+    /// the host time-slices the guest's vCPUs (overcommit), confounding the
+    /// guest-scheduler timing metrics.
+    pub(crate) effective_cpu_budget: u32,
     /// Guest memory in MiB. `None` = deferred: computed from actual
     /// initramfs size after the initramfs build completes.
     pub(crate) memory_mib: Option<u32>,
@@ -339,8 +358,9 @@ pub struct KtstrVm {
     /// flag is needed at `run()` time so the lock-acquisition switch
     /// can distinguish "no-perf-mode bypass / degraded-sysfs" (no
     /// locks, no plans, no acquire) from the default-else path that
-    /// reserves a per-CPU window via `acquire_cpu_locks` whenever
-    /// neither `performance_mode` nor `no_perf_mode` is in effect.
+    /// takes an LLC `LOCK_SH` set via `compute_pinning` +
+    /// `acquire_resource_locks` (per LLC offset) whenever neither
+    /// `performance_mode` nor `no_perf_mode` is in effect.
     /// Persisted on KtstrVm so the deferred-lock contract in
     /// `KtstrVm::run` does not need to re-read the env every spawn.
     pub(crate) no_perf_mode: bool,
@@ -386,8 +406,9 @@ pub struct KtstrVm {
     pub(crate) no_perf_plan: Option<host_topology::LlcPlan>,
     /// Cached host topology snapshot read once at `build()` time
     /// from `/sys/devices/system/cpu`. `KtstrVm::run`'s default-else
-    /// branch threads this through `acquire_cpu_locks` to take a
-    /// fresh per-CPU window without re-reading sysfs. `None` only on
+    /// branch threads this through `compute_pinning` per LLC offset,
+    /// then takes `LOCK_SH` via `acquire_resource_locks`, without
+    /// re-reading sysfs. `None` only on
     /// the degraded-sysfs no-perf-mode branch, where no LLC
     /// reservation is possible to begin with — `KtstrVm::run`
     /// short-circuits to "no locks" in that case.
@@ -685,13 +706,40 @@ impl KtstrVm {
             run_locks.default_cpu_mask.as_deref(),
             effective_plan,
         )?;
+        // The default-overcommit path masks every vCPU thread to a CPU set
+        // SMALLER than vcpus (host too small for a 1:1 pin). build()'s
+        // effective_cpu_budget assumed this path either 1:1-pins or aborts, so
+        // it stamped the full vcpu count; capture the true masked host-CPU
+        // count here (clamped >= 1, mirroring the builder.rs sentinel) so the
+        // sidecar records the real overcommit and render_overcommit_warning's
+        // b<v test fires. None on every non-overcommit path, so the build-time
+        // effective_cpu_budget stands.
+        let overcommit_budget = run_locks
+            .default_cpu_mask
+            .as_ref()
+            .map(|m| (m.len() as u32).max(1));
         drop(run_locks);
 
         let mut result = self.collect_results(start, run)?;
+        if let Some(budget) = overcommit_budget {
+            result.cpu_budget = budget;
+        }
 
         // Read cumulative KVM stats after VM exit.
         if let Some(ctx) = stats_ctx {
             result.kvm_stats = Some(ctx.read_stats());
+        }
+
+        // Persist any coverage-profraw the guest /init flushed
+        // (`try_flush_profraw`) and the host bucketed into
+        // `guest_messages`. Every `KtstrVm::run` caller — the eval
+        // path, the auto-repro path, and direct callers — funnels
+        // through here, so this is the single profraw-persistence
+        // site: the eval/probe per-frame dispatch intentionally does
+        // NOT re-extract `Profraw` frames (a second write would make
+        // `llvm-profdata merge` double-count the counters).
+        if let Some(ref msgs) = result.guest_messages {
+            crate::test_support::persist_guest_profraw(msgs);
         }
 
         Ok(result)
@@ -719,10 +767,21 @@ impl KtstrVm {
     ///   `acquire_resource_locks`. ResourceContention surfaces
     ///   verbatim so callers route it to the existing
     ///   `skip_on_contention!` path.
-    /// * default else: re-acquires the per-CPU window via
-    ///   `acquire_cpu_locks` with the cached `host_topo`. This is
-    ///   the path test fixtures take when neither `--perf-mode`
-    ///   nor `--no-perf-mode` is in effect.
+    /// * default else: walks LLC offsets, computing a
+    ///   `compute_pinning` candidate per offset and taking `LOCK_SH`
+    ///   on the LLC plus `LOCK_EX` on each assigned CPU via
+    ///   `acquire_resource_locks` until one succeeds (the LLC `LOCK_SH`
+    ///   is compatible with other non-perf `LOCK_SH` holders, blocked
+    ///   by perf-mode `LOCK_EX`). If a 1:1 candidate exists but every
+    ///   offset is busy (a perf-mode `LOCK_EX` peer on the LLC, or a
+    ///   non-perf peer on the per-CPU `LOCK_EX` set) it yields
+    ///   `ResourceContention` (transient → skip/retry). If NO offset can
+    ///   map the topology (the host is too small), or no host topology
+    ///   was cached at build time (sysfs unreadable), it OVERCOMMITS
+    ///   instead of skipping (via `acquire_default_run_locks` ->
+    ///   `build_overcommit_run_locks`). This is the path
+    ///   test fixtures take when neither `--perf-mode` nor `--no-perf-mode`
+    ///   is in effect.
     fn acquire_run_locks(&self) -> Result<RunLocks> {
         if self.no_perf_mode {
             // Reuse the build-time plan's LLC selection rather than
@@ -804,50 +863,129 @@ impl KtstrVm {
             // succeeds. LOCK_SH is compatible with other LOCK_SH
             // holders (multiple non-perf VMs share), but blocked by
             // perf-mode's LOCK_EX. On contention, move to the next
-            // offset. If all offsets busy, ResourceContention →
-            // nextest retries after the perf-mode test finishes.
-            if let Some(ref host_topo) = self.host_topo {
-                let num_llcs = host_topo.llc_groups.len();
-                let llcs_needed = (self.topology.llcs as usize).max(1);
-                let max_slots = num_llcs.checked_div(llcs_needed).unwrap_or(1).max(1);
-                let start = host_topology::pid_window_offset(std::process::id(), max_slots);
+            // offset. If every offset is busy but a 1:1 plan exists,
+            // ResourceContention → nextest retries after the holding
+            // peer finishes; if no offset maps the topology, overcommit
+            // (see the produced_candidate split below).
+            Self::acquire_default_run_locks(
+                self.host_topo.as_ref(),
+                &self.topology,
+                self.watchdog_timeout,
+            )
+        }
+    }
 
-                for i in 0..max_slots {
-                    let slot = (start + i) % max_slots;
-                    let offset = slot * llcs_needed;
-                    let Ok(candidate) = host_topo.compute_pinning(&self.topology, false, offset)
-                    else {
-                        continue;
-                    };
-                    match host_topology::acquire_resource_locks(
-                        &candidate,
-                        &candidate.llc_indices,
-                        host_topology::LlcLockMode::Shared,
-                    )? {
-                        host_topology::LockOutcome::Acquired { locks, .. } => {
-                            return Ok(RunLocks {
-                                locks,
-                                default_cpu_mask: None,
-                                pinning_plan: Some(candidate),
-                            });
-                        }
-                        host_topology::LockOutcome::Unavailable(_) => continue,
-                    }
+    /// Default (non-perf, non-no-perf) run-lock acquisition: try each LLC offset
+    /// for a 1:1 LOCK_SH pin. If a candidate MAPS but every offset's locks are
+    /// busy -> transient ResourceContention (nextest retry resolves it after the
+    /// holding peer finishes; NOT overcommitted, which would run on CPUs a peer
+    /// reserved and perturb its isolation). If NO offset maps the topology, or
+    /// there is no cached host topology, the host is too small for a 1:1 pin ->
+    /// OVERCOMMIT (the host-gate policy: make it work, overcommit if
+    /// topologically impossible). Associated fn (no `&self`) over
+    /// host_topo/topology/watchdog so the overcommit-vs-contention decision is
+    /// unit-testable with a synthetic HostTopology (acquire_resource_locks
+    /// short-circuits to Acquired in cargo-test mode, so a fitting host yields a
+    /// pin and a too-small host yields overcommit).
+    fn acquire_default_run_locks(
+        host_topo: Option<&host_topology::HostTopology>,
+        topology: &Topology,
+        watchdog_timeout: Option<std::time::Duration>,
+    ) -> Result<RunLocks> {
+        let Some(host_topo) = host_topo else {
+            // No cached host topology (sysfs unreadable at build time): no
+            // topology to plan a 1:1 pin against -> overcommit directly.
+            return Ok(Self::build_overcommit_run_locks(
+                host_topology::host_allowed_cpus(),
+                topology.total_cpus() as usize,
+                watchdog_timeout,
+            ));
+        };
+        let num_llcs = host_topo.llc_groups.len();
+        let llcs_needed = (topology.llcs as usize).max(1);
+        let max_slots = num_llcs.checked_div(llcs_needed).unwrap_or(1).max(1);
+        let start = host_topology::pid_window_offset(std::process::id(), max_slots);
+        let mut produced_candidate = false;
+        for i in 0..max_slots {
+            let slot = (start + i) % max_slots;
+            let offset = slot * llcs_needed;
+            let Ok(candidate) = host_topo.compute_pinning(topology, false, offset) else {
+                continue;
+            };
+            produced_candidate = true;
+            match host_topology::acquire_resource_locks(
+                &candidate,
+                &candidate.llc_indices,
+                host_topology::LlcLockMode::Shared,
+            )? {
+                host_topology::LockOutcome::Acquired { locks, .. } => {
+                    return Ok(RunLocks {
+                        locks,
+                        default_cpu_mask: None,
+                        pinning_plan: Some(candidate),
+                    });
                 }
-                Err(anyhow::Error::new(host_topology::ResourceContention {
-                    reason: format!(
-                        "all {max_slots} LLC slots busy (LOCK_SH)\n  \
-                         hint: a performance_mode test may hold LOCK_EX; \
-                         nextest retry will resolve after it finishes"
-                    ),
-                }))
-            } else {
-                Ok(RunLocks {
-                    locks: Vec::new(),
-                    default_cpu_mask: None,
-                    pinning_plan: None,
-                })
+                host_topology::LockOutcome::Unavailable(_) => continue,
             }
+        }
+        if produced_candidate {
+            // A 1:1 plan exists but every offset is busy -> transient
+            // ResourceContention; nextest retry resolves it after the holders
+            // finish. NOT overcommitted (would perturb a peer's isolation).
+            Err(anyhow::Error::new(host_topology::ResourceContention {
+                reason: format!(
+                    "all {max_slots} LLC slots busy (LOCK_SH)\n  \
+                     hint: a performance_mode test may hold LOCK_EX; \
+                     nextest retry will resolve after it finishes"
+                ),
+            }))
+        } else {
+            // No offset could map the topology: host too small for a 1:1
+            // placement. Overcommit instead of skipping.
+            Ok(Self::build_overcommit_run_locks(
+                host_topology::host_allowed_cpus(),
+                topology.total_cpus() as usize,
+                watchdog_timeout,
+            ))
+        }
+    }
+
+    /// Build the overcommit `RunLocks` from a resolved allowed-CPU set: no
+    /// resource locks, the allowed cpuset as the default mask, and an
+    /// `overcommit_warning` when the mask is narrower than the vCPU count.
+    ///
+    /// This is the default (non-perf, non-no-perf) path's fallback when no 1:1
+    /// pinning plan can map the topology onto the host (the host is too small,
+    /// or no host topology was cached at build time). Rather than skipping, the
+    /// VM runs OVERCOMMITTED — every vCPU thread masked to the host's allowed
+    /// CPUs (oversubscribed + time-sliced). The mask is the run-time budget
+    /// source: the orchestrator (`run`) reads the returned `default_cpu_mask`
+    /// and overrides `VmResult.cpu_budget` with the masked host-CPU count so the
+    /// sidecar records the overcommit (not the build-time vCPU count). This is
+    /// the only place the default path fires the overcommit warning — `build()`
+    /// computes the `no_perf_plan` warning only under `no_perf_mode`. When the
+    /// allowed set is empty (a host that cannot enumerate its own affinity),
+    /// `set_thread_cpumask` no-ops and the warning is the sole signal.
+    ///
+    /// Pure (the allowed set is passed in) so the mask + warning policy is
+    /// unit-testable without reading the host cpuset.
+    fn build_overcommit_run_locks(
+        allowed: Vec<usize>,
+        vcpus: usize,
+        watchdog_timeout: Option<std::time::Duration>,
+    ) -> RunLocks {
+        if let Some(w) = host_topology::overcommit_warning(
+            allowed.len(),
+            vcpus,
+            false,
+            watchdog_timeout.map(|d| d.as_secs()),
+        ) {
+            eprintln!("{w}");
+        }
+        RunLocks {
+            locks: Vec::new(),
+            default_cpu_mask: Some(allowed),
+            pinning_plan: None,
         }
     }
 

@@ -175,18 +175,8 @@ use super::{CpuLimits, CpusetSpec, IoLimits, MemoryLimits, PidsLimits};
 /// // The binary runs inside the same cgroup as the WorkSpec handles;
 /// // both spawn in apply_setup, the WorkSpec groups first, then the
 /// // Payload after the cpuset settles.
-/// # use ktstr::test_support::{OutputFormat, Payload, PayloadKind};
-/// # const BENCH: Payload = Payload {
-/// #     name: "bench",
-/// #     kind: PayloadKind::Binary("bench"),
-/// #     output: OutputFormat::ExitCode,
-/// #     default_args: &[],
-/// #     default_checks: &[],
-/// #     metrics: &[],
-/// #     include_files: &[],
-/// #     uses_parent_pgrp: false,
-/// #     known_flags: None,
-/// # };
+/// # use ktstr::test_support::Payload;
+/// # const BENCH: Payload = Payload::binary("bench", "bench");
 /// let def = CgroupDef::named("io_and_spin")
 ///     .cpuset(CpusetSpec::disjoint(0, 2))
 ///     .workers(2)

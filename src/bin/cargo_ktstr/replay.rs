@@ -729,6 +729,8 @@ mod tests {
             test_name: test_name.to_string(),
             topology: "synth".into(),
             scheduler: "synth".into(),
+            vcpus: 1,
+            cpu_budget: 1,
             scheduler_commit: None,
             project_commit: None,
             payload: None,

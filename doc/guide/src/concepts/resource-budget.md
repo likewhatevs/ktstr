@@ -58,7 +58,9 @@ is the three-tier precedence:
 
 `CpuCap::effective_count(allowed_cpus: usize) -> Result<usize>`
 clamps at acquire time, not construction time.
-`N > allowed_cpus` returns a `ResourceContention` error naming
+`N > allowed_cpus` returns a `CpuBudgetUnsatisfiable` hard error
+(exit 1 / FAIL -- an explicit cap the host cannot satisfy is a
+user-input error, not transient contention) naming
 both numbers — operators reading the error see immediately that
 the cap exceeds the process's `sched_getaffinity` cpuset, not the
 host's total online CPU count. Fixing the cap requires either
@@ -172,17 +174,19 @@ floor guards against `make -j0` (unbounded on GNU make).
 `ktstr locks` (or `cargo ktstr locks`) prints every ktstr flock
 currently held on the host, cross-referenced against
 `/proc/locks` to name each holder by PID + truncated cmdline.
-Read-only — takes no flocks. Five categories:
+Read-only — takes no flocks. Four categories:
 
 1. **LLC locks** under `{KTSTR_LOCK_DIR or /tmp}/ktstr-llc-*.lock`
 2. **Per-CPU locks** under `{KTSTR_LOCK_DIR or /tmp}/ktstr-cpu-*.lock`
-3. **Cache-entry locks** under `{cache_root}/.locks/*.lock`
-4. **Source-tree build locks** at
-   `{cache_root}/.locks/source-{path_hash}.lock` — held for the
-   duration of `cargo ktstr kernel build --source` (and any kernel
-   build resolving a path-spec) so concurrent builds against the
-   same source tree serialize.
-5. **Run-dir locks** under
+3. **Cache-entry locks** under `{cache_root}/.locks/*.lock`. This
+   table also surfaces the source-tree build locks at
+   `{cache_root}/.locks/source-{path_hash}.lock` — they share the
+   same `.locks/` directory, so they appear here as ordinary
+   cache rows with a `source-{hash}` cache key. A source-tree lock
+   is held for the duration of a path-spec kernel build (a `cargo
+   ktstr test --kernel <path>` or `kernel build` resolving a source
+   tree) so concurrent builds against that tree serialize.
+4. **Run-dir locks** under
    `{runs_root}/.locks/{leaf-dir-name}.lock` (the leaf is
    conventionally `{kernel}-{project_commit}`) — held for the
    duration of the (pre-clear + write) cycle by

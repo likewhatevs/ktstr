@@ -437,10 +437,10 @@ impl SchedStatsClient {
     /// — callers pass JSON or any other line-shaped payload as a
     /// `&str` and never have to worry about framing.
     pub fn request_raw(&self, line: &str) -> Result<Vec<u8>, SchedStatsError> {
-        // Compute the on-wire byte length (line + trailing '\n')
-        // and reject before touching the device or the lock so a
-        // misuse that exceeds MAX_REQUEST_BYTES does not stall a
-        // concurrent caller.
+        // Phase A: on-wire byte length (line + trailing '\n') cap +
+        // freeze + cancel pre-checks. Reject before touching the
+        // device or the lock so a misuse that exceeds
+        // MAX_REQUEST_BYTES does not stall a concurrent caller.
         let on_wire_len = line.len().saturating_add(1);
         if on_wire_len > MAX_REQUEST_BYTES {
             return Err(SchedStatsError::RequestTooLarge {
@@ -468,100 +468,112 @@ impl SchedStatsClient {
         // thread could leave broken.
         let _request_guard = self.shared.request_lock.lock_unpoisoned();
 
-        // Drain any stale guest→host bytes from port2_tx_buf BEFORE
-        // flipping in_flight=true. This NARROWS the stale-bytes race
-        // window but does not fully close it.
-        //
-        // Closed portion — bytes already in port2_tx_buf at this
-        // point: pre-drain empties port[2].tx_buf under the same
-        // virtio_con lock the drainer's TOKEN_DATA arm
-        // (drainer_loop) takes, so the drainer's next wake sees an
-        // empty buffer and routes nothing to response_buf.
-        // discarded_bytes counter bumps so stuck-stats post-mortem
-        // can see this path firing.
-        //
-        // Residual portion — bytes that arrive after pre-drain release:
-        // `VirtioConsole::process_tx` (port-id 2, defined in
-        // virtio_console.rs) runs only when the vCPU services a
-        // QUEUE_NOTIFY MMIO write on port-2 TX (q7 per the multiport
-        // queue numbering in virtio_console.rs). The guest can
-        // publish a chain to the avail ring + issue NOTIFY BEFORE
-        // our pre-drain, but the vCPU MMIO handler may not have run
-        // yet (e.g. coming out of a freeze rendezvous that paused
-        // every vCPU via SIGRTMIN). After our pre-drain releases
-        // virtio_con, the vCPU services the queued NOTIFY, process_tx
-        // pushes stale guest bytes into port[2].tx_buf, kicks
-        // stats_tx_evt. If this lands AFTER our in_flight=true store
-        // below, the drainer wakes, sees in_flight=true, forwards the
-        // stale bytes as if they were the current request's response.
-        //
-        // The realistic trigger is cancellation-followed-by-immediate-
-        // new-request (freeze-rendezvous cancel, watchdog cancel)
-        // where the guest is still flushing a prior abandoned
-        // request's response. A hostile guest can also exploit this
-        // window deliberately.
-        //
-        // Fully closing this is NOT possible from host-side alone.
-        // Two protocol-level paths were investigated:
-        //   (A) per-request token echoed by the guest scheduler —
-        //       requires patching scx_stats (StatsResponse hardcodes
-        //       `{resp: ...}` with no echo of request fields) AND
-        //       every scheduler binary that uses it. Out of ktstr's
-        //       scope.
-        //   (B) generation counter on response_buf chunks — provably
-        //       fails: generation tracks DRAIN time (when the drainer
-        //       processes bytes), not PRODUCTION time (when the guest
-        //       emitted them). Stale-but-late bytes from a freeze /
-        //       cancel window get stamped with the current generation
-        //       at drain time, so the wait-loop accepts them.
-        // The residual class is a documentation note about an
-        // upstream-protocol limitation, not an actionable host-side
-        // follow-up.
-        //
-        // Race partner: the drainer's TOKEN_DATA arm in drainer_loop
-        // (`fn drainer_loop` later in this file) reads in_flight
-        // (Acquire) after the drain-under-virtio_con-lock completes
-        // and the lock is released — that's where the racing append
-        // happens.
-        {
-            let stale = {
-                let mut g = self.shared.virtio_con.lock();
-                g.drain_port2_bulk()
-            };
-            if !stale.is_empty() {
-                let stale_len = stale.len();
-                let total = self
-                    .shared
-                    .discarded_bytes
-                    .fetch_add(stale_len as u64, Ordering::Relaxed)
-                    .saturating_add(stale_len as u64);
-                tracing::debug!(
-                    stale_bytes = stale_len,
-                    total_discarded = total,
-                    "scx_stats request_raw: drained stale port2_tx_buf bytes \
-                     before flipping in_flight=true (stale-bytes race-close)"
-                );
-            }
-        }
+        self.predrain_stale_port2_tx();
 
         // Mark in-flight so the drainer routes drained bytes to the
         // response buffer instead of discarding them. RAII clear on
-        // scope exit covers every error-return path below.
+        // scope exit covers every error-return path below. The store
+        // and guard stay HERE (not in a helper): in_flight is set
+        // after the pre-drain and before the clear/wait, and the
+        // guard's Drop spans the wait and fires on return.
         self.shared.request_in_flight.store(true, Ordering::Release);
         let _in_flight_guard = InFlightGuard {
             flag: &self.shared.request_in_flight,
         };
 
-        let (lock, cvar) = &*self.shared.response_buf;
-        // Drain any stale bytes left over from a prior incomplete
-        // call. scx_stats is strict request/response — anything
-        // sitting in the buffer when a fresh request starts is
-        // either a torn previous response or relay-restart
-        // residue. Log the discard so a stuck-relay diagnosis can
-        // see how many bytes were thrown away on each request,
-        // and bump `discarded_bytes` so the counter exposed via
-        // [`Self::discarded_bytes`] reflects this path too — not
-        // just the drainer's no-request-in-flight discards.
+        self.clear_stale_response_buf()?;
+        self.push_request_to_port2(line);
+        self.wait_for_response_line()
+    }
+
+    /// Drain any stale guest→host bytes from port2_tx_buf BEFORE
+    /// `request_raw` flips in_flight=true. This NARROWS the
+    /// stale-bytes race window but does not fully close it.
+    ///
+    /// Closed portion — bytes already in port2_tx_buf at this
+    /// point: pre-drain empties `port[2].tx_buf` under the same
+    /// virtio_con lock the drainer's TOKEN_DATA arm
+    /// (drainer_loop) takes, so the drainer's next wake sees an
+    /// empty buffer and routes nothing to response_buf.
+    /// discarded_bytes counter bumps so stuck-stats post-mortem
+    /// can see this path firing.
+    ///
+    /// Residual portion — bytes that arrive after pre-drain release:
+    /// `VirtioConsole::process_tx` (port-id 2, defined in
+    /// virtio_console.rs) runs only when the vCPU services a
+    /// QUEUE_NOTIFY MMIO write on port-2 TX (q7 per the multiport
+    /// queue numbering in virtio_console.rs). The guest can
+    /// publish a chain to the avail ring + issue NOTIFY BEFORE
+    /// our pre-drain, but the vCPU MMIO handler may not have run
+    /// yet (e.g. coming out of a freeze rendezvous that paused
+    /// every vCPU via SIGRTMIN). After our pre-drain releases
+    /// virtio_con, the vCPU services the queued NOTIFY, process_tx
+    /// pushes stale guest bytes into `port[2].tx_buf`, kicks
+    /// stats_tx_evt. If this lands AFTER our in_flight=true store
+    /// (in `request_raw`), the drainer wakes, sees in_flight=true,
+    /// forwards the stale bytes as if they were the current
+    /// request's response.
+    ///
+    /// The realistic trigger is cancellation-followed-by-immediate-
+    /// new-request (freeze-rendezvous cancel, watchdog cancel)
+    /// where the guest is still flushing a prior abandoned
+    /// request's response. A hostile guest can also exploit this
+    /// window deliberately.
+    ///
+    /// Fully closing this is NOT possible from host-side alone.
+    /// Two protocol-level paths were investigated:
+    ///   (A) per-request token echoed by the guest scheduler —
+    ///       requires patching scx_stats (StatsResponse hardcodes
+    ///       `{resp: ...}` with no echo of request fields) AND
+    ///       every scheduler binary that uses it. Out of ktstr's
+    ///       scope.
+    ///   (B) generation counter on response_buf chunks — provably
+    ///       fails: generation tracks DRAIN time (when the drainer
+    ///       processes bytes), not PRODUCTION time (when the guest
+    ///       emitted them). Stale-but-late bytes from a freeze /
+    ///       cancel window get stamped with the current generation
+    ///       at drain time, so the wait-loop accepts them.
+    /// The residual class is a documentation note about an
+    /// upstream-protocol limitation, not an actionable host-side
+    /// follow-up.
+    ///
+    /// Race partner: the drainer's TOKEN_DATA arm in drainer_loop
+    /// (`fn drainer_loop` later in this file) reads in_flight
+    /// (Acquire) after the drain-under-virtio_con-lock completes
+    /// and the lock is released — that's where the racing append
+    /// happens.
+    fn predrain_stale_port2_tx(&self) {
+        let stale = {
+            let mut g = self.shared.virtio_con.lock();
+            g.drain_port2_bulk()
+        };
+        if !stale.is_empty() {
+            let stale_len = stale.len();
+            let total = self
+                .shared
+                .discarded_bytes
+                .fetch_add(stale_len as u64, Ordering::Relaxed)
+                .saturating_add(stale_len as u64);
+            tracing::debug!(
+                stale_bytes = stale_len,
+                total_discarded = total,
+                "scx_stats request_raw: drained stale port2_tx_buf bytes \
+                 before flipping in_flight=true (stale-bytes race-close)"
+            );
+        }
+    }
+
+    /// Drain any stale bytes left over from a prior incomplete
+    /// call. scx_stats is strict request/response — anything
+    /// sitting in the buffer when a fresh request starts is
+    /// either a torn previous response or relay-restart
+    /// residue. Log the discard so a stuck-relay diagnosis can
+    /// see how many bytes were thrown away on each request,
+    /// and bump `discarded_bytes` so the counter exposed via
+    /// [`Self::discarded_bytes`] reflects this path too — not
+    /// just the drainer's no-request-in-flight discards.
+    fn clear_stale_response_buf(&self) -> Result<(), SchedStatsError> {
+        let (lock, _cvar) = &*self.shared.response_buf;
         {
             let mut buf = lock.lock().map_err(|_| SchedStatsError::Poisoned)?;
             if !buf.is_empty() {
@@ -579,50 +591,54 @@ impl SchedStatsClient {
                 buf.clear();
             }
         }
+        Ok(())
+    }
 
-        // Push the request bytes onto port 2 RX. Append the
-        // trailing newline scx_stats expects. Bound the device
-        // mutex critical section to the queue_input_port2 call.
-        //
-        // Drop any host→guest bytes that are still sitting in
-        // `port2_pending_rx` from a prior request that was abandoned
-        // mid-push (e.g. a freeze rendezvous landed before the guest
-        // read those bytes). Without this clear, the new request
-        // would be concatenated onto the dead tail of the previous
-        // one and the guest relay would forward torn JSON to the
-        // scheduler. Account for the discard via `discarded_bytes`
-        // so a stuck-stats post-mortem can see it.
-        {
-            let mut g = self.shared.virtio_con.lock();
-            let stale_in = g.clear_port2_pending_rx();
-            if stale_in > 0 {
-                let total = self
-                    .shared
-                    .discarded_bytes
-                    .fetch_add(stale_in as u64, Ordering::Relaxed)
-                    .saturating_add(stale_in as u64);
-                tracing::debug!(
-                    stale_pending_rx = stale_in,
-                    total_discarded = total,
-                    "scx_stats request_raw: clearing stale port2_pending_rx \
-                     (prior request abandoned mid-push)"
-                );
-            }
-            // Two pushes are equivalent to one combined push from
-            // the device's perspective — the bytes land in the
-            // pending-RX deque in order.
-            g.queue_input_port2(line.as_bytes());
-            g.queue_input_port2(b"\n");
+    /// Push the request bytes onto port 2 RX. Append the
+    /// trailing newline scx_stats expects. Bound the device
+    /// mutex critical section to the queue_input_port2 call.
+    ///
+    /// Drop any host→guest bytes that are still sitting in
+    /// `port2_pending_rx` from a prior request that was abandoned
+    /// mid-push (e.g. a freeze rendezvous landed before the guest
+    /// read those bytes). Without this clear, the new request
+    /// would be concatenated onto the dead tail of the previous
+    /// one and the guest relay would forward torn JSON to the
+    /// scheduler. Account for the discard via `discarded_bytes`
+    /// so a stuck-stats post-mortem can see it.
+    fn push_request_to_port2(&self, line: &str) {
+        let mut g = self.shared.virtio_con.lock();
+        let stale_in = g.clear_port2_pending_rx();
+        if stale_in > 0 {
+            let total = self
+                .shared
+                .discarded_bytes
+                .fetch_add(stale_in as u64, Ordering::Relaxed)
+                .saturating_add(stale_in as u64);
+            tracing::debug!(
+                stale_pending_rx = stale_in,
+                total_discarded = total,
+                "scx_stats request_raw: clearing stale port2_pending_rx \
+                 (prior request abandoned mid-push)"
+            );
         }
+        // Two pushes are equivalent to one combined push from
+        // the device's perspective — the bytes land in the
+        // pending-RX deque in order.
+        g.queue_input_port2(line.as_bytes());
+        g.queue_input_port2(b"\n");
+    }
 
-        // Wait (no timeout) for a complete line, freeze, or cancel.
-        // The drainer notifies the cvar on every appended byte AND
-        // when its kill_drainer eventfd fires (cancel edge or
-        // last-Arc drop), so a blocked `cvar.wait` always wakes
-        // promptly without polling. The host watchdog is the only
-        // backstop "timeout" — when it fires it sets `cancel`,
-        // writes the cancel_evt, and the drainer's notify_all
-        // wakes us into the cancel-check below.
+    /// Wait (no timeout) for a complete line, freeze, or cancel.
+    /// The drainer notifies the cvar on every appended byte AND
+    /// when its kill_drainer eventfd fires (cancel edge or
+    /// last-Arc drop), so a blocked `cvar.wait` always wakes
+    /// promptly without polling. The host watchdog is the only
+    /// backstop "timeout" — when it fires it sets `cancel`,
+    /// writes the cancel_evt, and the drainer's notify_all
+    /// wakes us into the cancel-check below.
+    fn wait_for_response_line(&self) -> Result<Vec<u8>, SchedStatsError> {
+        let (lock, cvar) = &*self.shared.response_buf;
         let mut buf = lock.lock().map_err(|_| SchedStatsError::Poisoned)?;
         loop {
             if let Some(idx) = buf.iter().position(|&b| b == b'\n') {
@@ -799,7 +815,7 @@ impl std::fmt::Debug for SchedStatsClient {
 }
 
 /// RAII guard: clear `request_in_flight` on drop. Prevents a
-/// stuck-true flag if `request_raw_with_timeout` returns early via
+/// stuck-true flag if `request_raw` returns early via
 /// `?` from any of the lock / mutex calls.
 struct InFlightGuard<'a> {
     flag: &'a Arc<AtomicBool>,

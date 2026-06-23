@@ -305,24 +305,44 @@ fn llama_context_params_default_threading_caps_at_4() {
     );
 }
 
-/// `std::thread::available_parallelism` returns at least 1 on
-/// every supported platform (this is the documented contract).
-/// `invoke_with_model` consumes the value via `.ok().and_then(|p|
-/// i32::try_from(p.get()).ok()).unwrap_or(4)`. Pin the
-/// "available_parallelism is positive" half of the contract so a
-/// regression that returned 0 (which `i32::try_from` would
-/// silently accept) does not let an n_threads=0 setting reach
-/// llama.cpp — n_threads=0 in llama.cpp's context-init code
-/// historically wedged matmul, so the floor matters.
+/// The value `invoke_with_model` feeds `with_n_threads` /
+/// `with_n_threads_batch` is `inference_thread_count(...)`; it must
+/// NEVER be < 1, because n_threads=0 in llama.cpp's context-init
+/// code historically wedged matmul. Pin that floor on the
+/// production consumer across its entire input domain — the `None`
+/// fallback arm, the `i32::try_from` overflow arm, the
+/// `NonZero(1)` floor, and large clamp inputs — rather than
+/// re-asserting std's `available_parallelism >= 1` contract (which
+/// exercises no ktstr code). `inference_thread_count` takes
+/// `Option<NonZero<usize>>`, so a 0 can never enter as `Some`; the
+/// floor that matters is the function's output, and this guards it
+/// directly.
 #[test]
-fn available_parallelism_returns_positive_count() {
-    let p = std::thread::available_parallelism()
-        .expect("available_parallelism must succeed on the test host");
+fn inference_thread_count_output_is_always_at_least_one() {
+    // None (available_parallelism failed) → fallback default arm.
     assert!(
-        p.get() >= 1,
-        "available_parallelism must report >= 1 (got {})",
-        p.get(),
+        inference_thread_count(None) >= 1,
+        "fallback arm fed n_threads={} (< 1 wedges llama.cpp matmul)",
+        inference_thread_count(None),
     );
+    // i32::try_from overflow → fallback default arm.
+    let overflow = std::num::NonZero::<usize>::new(usize::MAX).unwrap();
+    assert!(
+        inference_thread_count(Some(overflow)) >= 1,
+        "overflow arm fed n_threads={} (< 1 wedges llama.cpp matmul)",
+        inference_thread_count(Some(overflow)),
+    );
+    // Pass-through, floor, and clamp inputs: every realistic core
+    // count must still produce >= 1.
+    for cores in [1usize, 2, 4, 16, 64, 4096] {
+        let p = std::num::NonZero::<usize>::new(cores).unwrap();
+        let got = inference_thread_count(Some(p));
+        assert!(
+            got >= 1,
+            "{cores}-core host fed n_threads={got} (< 1 wedges \
+                 llama.cpp matmul)",
+        );
+    }
 }
 
 /// `InferenceError::ModelLoad` Display includes the path (so an
@@ -1771,7 +1791,8 @@ fn memoized_inference_concurrent_first_call_loads_exactly_once() {
 // output.
 //
 // These tests drive `encoding_rs::UTF_8.new_decoder()` directly
-// (the exact API call site at model.rs:2336) without loading
+// (the same API as `extract_via_llm`'s `encoding_rs::UTF_8.new_decoder()`
+// stream-decode call) without loading
 // the model, pinning the decoder's contract independent of any
 // upstream llama-cpp-2 changes. A regression that swapped the
 // decoder for `String::from_utf8_lossy` (which is NOT stateful)

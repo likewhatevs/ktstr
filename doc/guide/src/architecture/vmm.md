@@ -73,11 +73,13 @@ physical pages across concurrent VMs.
 ## Guest-host communication
 
 **Serial console** -- COM2 is the canonical crash-diagnostic
-transport (guest stdout/stderr travels over the virtio-console port-1
-bulk stream as `MsgType::Stdout`/`Stderr` frames). The guest panic hook writes
+transport. The guest panic hook writes
 `PANIC: <info>\n<bt>\n` to COM2; the host parses it via
 `extract_panic_message` and surfaces the backtrace in test failure
-output. The legacy COM2 result / exit-code fallback (delimited
+output. (Ordinary guest stdout/stderr does NOT use COM2 — it
+travels over the virtio-console port-1 bulk stream as
+`MsgType::Stdout`/`Stderr` frames; see below.) The legacy COM2
+result / exit-code fallback (delimited
 `===KTSTR_TEST_RESULT_START===` / `_END===` sentinels and
 `KTSTR_EXIT=N` lines) was removed pre-1.0 — virtio-console port-1
 (below) is the only result transport.
@@ -168,7 +170,7 @@ that built it.
 1. Load kernel (bzImage on x86_64, Image on aarch64) via `linux-loader`.
 2. Set up KVM vCPUs with the specified topology. vCPU creation
    takes `kvm->lock` twice in the kernel (`kvm_vm_ioctl_create_vcpu`
-   at `virt/kvm/kvm_main.c:4158`): once for the
+   in `virt/kvm/kvm_main.c`): once for the
    `created_vcpus` counter + per-arch precreate hook, then released
    before the per-vCPU allocations, and reacquired for vcpu-list
    insertion. The largest cost — the per-vCPU FPU `vzalloc` on

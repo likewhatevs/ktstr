@@ -817,7 +817,8 @@ fn resolve_cache_root_rejects_relative_home() {
 
 /// Non-UTF-8 KTSTR_CACHE_DIR must bail with the actionable
 /// diagnostic the shared validation surfaces. Pre-unification
-/// (model.rs:806) the model resolver silently fell through on
+/// the model-side cache resolver (now folded into `resolve_cache_root`)
+/// silently fell through on
 /// `Err(VarError::NotUnicode)` and the operator's override
 /// vanished without a trace; the shared helper now catches
 /// this for both caches.

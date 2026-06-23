@@ -716,23 +716,76 @@ mod tests {
         assert_eq!(&dtb[..4], &[0xd0, 0x0d, 0xfe, 0xed]);
     }
 
+    /// The initrd branch in `write_chosen` (fdt.rs `if let (Some, Some)`)
+    /// must emit `/chosen/linux,initrd-start = addr` and
+    /// `linux,initrd-end = addr + size`. Parse the DTB and pin both
+    /// values — in particular the `addr + size` arithmetic for the end
+    /// property, which is the whole point of the branch. A regression
+    /// that dropped a property, swapped start/end, or got the math wrong
+    /// would change the byte values here. The companion
+    /// `create_fdt_no_initrd_props_absent` pins the `None` arm.
     #[test]
     fn create_fdt_with_initrd() {
         let topo = default_topo();
         let mpidrs = fake_mpidrs(topo.total_cpus());
+        const ADDR: u64 = 0x4020_0000;
+        const SIZE: u32 = 0x10_0000;
         let dtb = test_fdt(
             &topo,
             &mpidrs,
             256,
             "console=ttyS0",
-            Some(0x4020_0000),
-            Some(0x10_0000),
+            Some(ADDR),
+            Some(SIZE),
             0,
             false,
+        )
+        .unwrap();
+        let props = parse_dtb_props(&dtb);
+
+        assert_eq!(
+            prop_u64(&props, "chosen", "linux,initrd-start"),
+            Some(ADDR),
+            "linux,initrd-start must equal initrd_addr",
         );
-        assert!(dtb.is_ok());
+        assert_eq!(
+            prop_u64(&props, "chosen", "linux,initrd-end"),
+            Some(ADDR + SIZE as u64),
+            "linux,initrd-end must equal initrd_addr + initrd_size",
+        );
     }
 
+    /// With `initrd_addr = None` the `if let (Some, Some)` gate in
+    /// `write_chosen` must NOT emit either initrd property. Pinning the
+    /// absence proves the gate, not just the populated branch — a
+    /// regression that emitted the properties unconditionally (e.g. with
+    /// a zero/garbage address) would trip here.
+    #[test]
+    fn create_fdt_no_initrd_props_absent() {
+        let topo = default_topo();
+        let mpidrs = fake_mpidrs(topo.total_cpus());
+        let dtb = test_fdt(&topo, &mpidrs, 256, "console=ttyS0", None, None, 0, false).unwrap();
+        let props = parse_dtb_props(&dtb);
+
+        assert_eq!(
+            prop_u64(&props, "chosen", "linux,initrd-start"),
+            None,
+            "linux,initrd-start must be absent when initrd_addr is None",
+        );
+        assert_eq!(
+            prop_u64(&props, "chosen", "linux,initrd-end"),
+            None,
+            "linux,initrd-end must be absent when initrd_addr is None",
+        );
+    }
+
+    /// Large SMP topology: 2 LLCs * 4 cores * 2 threads = 16 vCPUs,
+    /// `hw_cache_level = 2` (chain_depth = 1: each CPU points at its
+    /// LLC's single L2 node). Distinct from `fdt_cache_topology_multi_llc`
+    /// (4 vCPUs, hw_cache_level = 3, chain_depth = 2): this pins the
+    /// per-CPU node count for a 16-vCPU shape AND the single-hop L2
+    /// terminal-cache chain. Parses the DTB and asserts generated content
+    /// rather than mere non-panic.
     #[test]
     fn create_fdt_smp() {
         let topo = Topology {
@@ -743,9 +796,59 @@ mod tests {
             nodes: None,
             distances: None,
         };
+        assert_eq!(topo.total_cpus(), 16);
         let mpidrs = fake_mpidrs(topo.total_cpus());
-        let dtb = test_fdt(&topo, &mpidrs, 1024, "console=ttyS0", None, None, 2, false);
-        assert!(dtb.is_ok());
+        let dtb = test_fdt(&topo, &mpidrs, 1024, "console=ttyS0", None, None, 2, false).unwrap();
+        let props = parse_dtb_props(&dtb);
+
+        // All 16 cpu@N nodes must exist (device_type present) and point
+        // at their LLC's L2 node via next-level-cache.
+        for cpu_id in 0..topo.total_cpus() {
+            let node_path = format!("cpus/cpu@{cpu_id}");
+            assert_eq!(
+                prop_str(&props, &node_path, "device_type").as_deref(),
+                Some("cpu"),
+                "cpu {cpu_id}: missing cpu node",
+            );
+            assert!(
+                prop_u32(&props, &node_path, "next-level-cache").is_some(),
+                "cpu {cpu_id}: missing next-level-cache (chain_depth=1)",
+            );
+        }
+
+        // chain_depth=1: each LLC emits exactly one terminal L2 node at
+        // level 2 with NO next-level-cache, and the two LLCs' L2 nodes
+        // carry distinct phandles.
+        for llc in 0..topo.llcs {
+            let l2_path = format!("cpus/l2-cache{llc}");
+            assert_eq!(
+                prop_u32(&props, &l2_path, "cache-level"),
+                Some(2),
+                "L2 cache{llc}: wrong cache-level",
+            );
+            assert!(
+                prop_u32(&props, &l2_path, "next-level-cache").is_none(),
+                "L2 cache{llc}: terminal node must not chain further (chain_depth=1)",
+            );
+        }
+        let l2_0 = prop_u32(&props, "cpus/l2-cache0", "phandle").unwrap();
+        let l2_1 = prop_u32(&props, "cpus/l2-cache1", "phandle").unwrap();
+        assert_ne!(l2_0, l2_1, "per-LLC L2 phandles must differ");
+
+        // No L3 node exists for hw_cache_level=2.
+        assert!(
+            prop_u32(&props, "cpus/l3-cache0", "cache-level").is_none(),
+            "hw_cache_level=2 must not emit an L3 node",
+        );
+
+        // CPUs sharing an LLC share the L2 phandle; CPUs in different
+        // LLCs differ. cpu@0..@7 are LLC 0, cpu@8..@15 are LLC 1
+        // (8 vCPUs per LLC: 4 cores * 2 threads).
+        let cpu0 = prop_u32(&props, "cpus/cpu@0", "next-level-cache").unwrap();
+        let cpu7 = prop_u32(&props, "cpus/cpu@7", "next-level-cache").unwrap();
+        let cpu8 = prop_u32(&props, "cpus/cpu@8", "next-level-cache").unwrap();
+        assert_eq!(cpu0, cpu7, "cpu@0 and cpu@7 share LLC 0");
+        assert_ne!(cpu0, cpu8, "cpu@0 (LLC 0) and cpu@8 (LLC 1) differ");
     }
 
     #[test]
@@ -763,6 +866,15 @@ mod tests {
         assert!(dtb.is_ok(), "FDT creation failed: {:?}", dtb.err());
     }
 
+    /// 3-NUMA topology: 6 LLCs across 3 nodes (2 LLCs/node), SMT. The
+    /// distance-matrix for this exact shape is covered by
+    /// `fdt_distance_map`; here we pin the per-CPU `numa-node-id` and the
+    /// three per-node `/memory` regions, which `fdt_cpu_numa_node_ids` /
+    /// `fdt_memory_nodes_multi_numa` only exercise for the 2-NUMA case.
+    /// `check_cpu_numa_node_ids` / `check_memory_nodes` derive the
+    /// expected node assignment and region layout from the production
+    /// `numa_node_of` / `NumaMemoryLayout::compute`, so the emitted FDT
+    /// is checked against the layout, not mere non-panic.
     #[test]
     fn create_fdt_three_numa_nodes() {
         let topo = Topology {
@@ -774,8 +886,33 @@ mod tests {
             distances: None,
         };
         let mpidrs = fake_mpidrs(topo.total_cpus());
-        let dtb = test_fdt(&topo, &mpidrs, 1024, "console=ttyS0", None, None, 2, false);
-        assert!(dtb.is_ok());
+        let memory_mib: u32 = 1024;
+        let dtb = test_fdt(
+            &topo,
+            &mpidrs,
+            memory_mib,
+            "console=ttyS0",
+            None,
+            None,
+            2,
+            false,
+        )
+        .unwrap();
+        let props = parse_dtb_props(&dtb);
+
+        check_cpu_numa_node_ids(&topo, &props);
+        check_memory_nodes(&topo, &props, memory_mib);
+
+        // Exactly three /memory nodes, one per NUMA node (no extra or
+        // missing region for the 3-node case).
+        let mem_node_count = props
+            .iter()
+            .filter(|(n, p, _)| n.starts_with("memory@") && p == "device_type")
+            .count();
+        assert_eq!(
+            mem_node_count, 3,
+            "3-NUMA must emit one /memory node per node",
+        );
     }
 
     #[test]
@@ -876,6 +1013,37 @@ mod tests {
         props.iter().find_map(|(n, p, d)| {
             if n == node && p == name && d.len() == 4 {
                 Some(u32::from_be_bytes(d[..4].try_into().unwrap()))
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Extract a u64 property value from parsed props. FDT u64 cells
+    /// are big-endian; `property_u64` (used for initrd bounds and the
+    /// kaslr seed) writes them that way.
+    fn prop_u64(props: &[(String, String, Vec<u8>)], node: &str, name: &str) -> Option<u64> {
+        props.iter().find_map(|(n, p, d)| {
+            if n == node && p == name && d.len() == 8 {
+                Some(u64::from_be_bytes(d[..8].try_into().unwrap()))
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Extract a string property value from parsed props. FDT
+    /// `property_string` writes a null-terminated string; the trailing
+    /// NUL is stripped.
+    fn prop_str(props: &[(String, String, Vec<u8>)], node: &str, name: &str) -> Option<String> {
+        props.iter().find_map(|(n, p, d)| {
+            if n == node && p == name {
+                Some(
+                    std::str::from_utf8(d)
+                        .unwrap()
+                        .trim_end_matches('\0')
+                        .to_string(),
+                )
             } else {
                 None
             }

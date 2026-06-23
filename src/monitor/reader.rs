@@ -1757,12 +1757,19 @@ pub(crate) fn evaluate_preempted(prev: Option<u64>, curr: Option<u64>, threshold
 /// task that hasn't run. The two conditions can co-occur but have
 /// different root causes and detection paths.
 ///
-/// This helper exists to keep the post-hoc `MonitorSummary::from_samples`
-/// path and the reactive `MonitorThresholds::evaluate` path in lock-step:
-/// previously each site re-implemented the same four-condition conjunction
-/// and drifting one half would let the SysRq-D trigger fire on conditions
-/// the post-hoc verdict accepted (or vice versa). Both callers now agree
-/// on a single definition of "stuck" by construction.
+/// This helper exists to keep the stall-detection paths in lock-step: the
+/// post-hoc `MonitorSummary::from_samples` (run-level `stuck_count`), the
+/// reactive `MonitorThresholds::evaluate` (SysRq-D trigger), and the
+/// per-phase `crate::timeline::compute_metrics` (`stall_count`) all route
+/// through this predicate. Previously each site re-implemented the same
+/// conjunction and drifting one would let the SysRq-D trigger fire on
+/// conditions the post-hoc verdict accepted (or vice versa), and let the
+/// per-phase count classify a window differently from the run-level one.
+/// All callers now agree on a single definition of "stuck", so the
+/// per-phase `stall_count` and the run-level `stuck_count` apply an
+/// identical predicate; the run-level count is `>=` the sum of per-phase
+/// counts (it also windows across phase boundaries and over out-of-phase
+/// samples that no phase covers).
 ///
 /// `rq_clock == 0` is treated as "never sampled" and returns false —
 /// the first sample interval typically reads zero before the kernel
@@ -2724,14 +2731,11 @@ pub(crate) fn monitor_loop(
             let t = &trigger.thresholds;
             let sample_idx = samples.len();
 
-            // Imbalance check — use the shared sample method so the
-            // min_nr.max(1)/max_nr calculation matches post-hoc.
-            let tmp_sample = MonitorSample {
-                elapsed_ms: 0,
-                cpus: cpus.clone(),
-                prog_stats: None,
-            };
-            let ratio = tmp_sample.imbalance_ratio();
+            // Imbalance check — share the exact min_nr.max(1)/max_nr
+            // computation with the post-hoc verdict via the extracted
+            // `imbalance_ratio_of`, reading `cpus` by reference so no
+            // throwaway `MonitorSample` is cloned per sample.
+            let ratio = super::imbalance_ratio_of(&cpus);
             imbalance_tracker.record(ratio > t.max_imbalance_ratio, ratio, sample_idx);
 
             // DSQ depth check.
@@ -4669,8 +4673,8 @@ mod tests {
 
         // Evaluate: from_samples should not detect stuck.
         let summary = super::super::MonitorSummary::from_samples(&samples);
-        assert!(
-            !summary.stuck_detected,
+        assert_eq!(
+            summary.stuck_count, 0,
             "from_samples: idle CPU should not flag stuck"
         );
 
