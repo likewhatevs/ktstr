@@ -259,6 +259,11 @@ fn bench_boot_time() {
             .build()
         {
             Ok(vm) => vm,
+            // Bespoke, not skip_on_contention!: this is a per-config LOOP
+            // that `continue`s to the next topology on contention, and the
+            // SKIP banner carries the current config's `{label}`.
+            // skip_on_contention! would `return` from the whole test and
+            // cannot inject the label, so its semantics don't fit here.
             Err(e)
                 if e.downcast_ref::<host_topology::ResourceContention>()
                     .is_some() =>
@@ -1094,6 +1099,11 @@ fn builder_performance_mode_false_no_validation() {
         .topology(Topology::new(1, 1, 1, 1))
         .performance_mode(false)
         .build();
+    // Bespoke, not skip_on_contention!: the `Err(e) => panic!` carries this
+    // test's NEGATIVE assertion — "performance_mode=false should not
+    // validate host topology" — which skip_on_contention!'s generic
+    // panic!("{e:#}") would erase. Only RC skips here; the trivial 1×1×1×1
+    // topology never reaches the TI / perf-mode classes.
     match result {
         Ok(_) => {}
         Err(e)
