@@ -500,33 +500,22 @@ pub(super) fn emit_entry_static(input: ItemFn, attrs: AttrValues) -> proc_macro2
     };
 
     // Host-error handling shared by the expect_err and expect_ok test
-    // bodies. One macro-only arm precedes the shared classifier:
-    // KernelUnavailable (the harness has no kernel — the binary was run
-    // outside `cargo ktstr test`, which injects one). It stays macro-only:
-    // err_to_exit_code has no KernelUnavailable arm (a KernelUnavailable
-    // reaching the dispatch path falls through to the catch-all EXIT_FAIL
-    // there), so handling it only here is behavior-preserving (see
-    // test_support::host_class). The remaining FIVE host-insufficiency
-    // types route through `test_support::classify_host_error` — the single
-    // source of truth for the guard order + per-class skip/fail policy,
-    // shared with `err_to_exit_code` so the two sites cannot drift.
-    // `classify_host_error` returns a verdict; the libtest control flow
-    // (eprintln + return for a skip, panic for a fail) lives HERE, in the
-    // generated test fn body, so a fail panics in the test frame. The
-    // bare `reason` gets its `ktstr: SKIP:` / `ktstr: FAIL:` prefix at the
-    // emit site, matching the dispatch channels. The trailing
+    // bodies. All SIX host-insufficiency types — KernelUnavailable plus the
+    // five host_topology types — route through the shared
+    // `test_support::classify_host_error`, the single source of truth for
+    // the guard order + per-class skip/fail policy, shared with
+    // `err_to_exit_code` so the two sites cannot drift. (KernelUnavailable
+    // is "harness not configured" — no kernel resolved; classify_host_error
+    // makes it a SKIP by default, a FAIL under KTSTR_NO_SKIP_MODE, same as
+    // the dispatch path.) `classify_host_error` returns a verdict; the
+    // libtest control flow (eprintln + return for a skip, panic for a fail)
+    // lives HERE, in the generated test fn body, so a fail panics in the
+    // test frame. The bare `reason` gets its `ktstr: SKIP:` / `ktstr: FAIL:`
+    // prefix at the emit site, matching the dispatch channels. The trailing
     // NotHostClass behavior differs per direction (expect_err swallows a
     // non-host failure; expect_ok panics with it), so it is interpolated.
     let host_arms = |not_host_class: proc_macro2::TokenStream| {
         quote! {
-            Err(e) if ::ktstr::test_support::is_kernel_unavailable(&e) => {
-                // Harness not configured: skip cleanly so a developer
-                // running the binary directly sees a SKIP banner rather
-                // than a confusing "no kernel found" panic. Non-failure
-                // in both the expect_err and expect_ok directions.
-                eprintln!("ktstr: SKIP: harness not configured: {e:#}");
-                return;
-            }
             Err(e) => match ::ktstr::test_support::classify_host_error(
                 &e,
                 ::std::env::var_os("KTSTR_NO_SKIP_MODE").is_some(),

@@ -15,18 +15,22 @@
 //! divergence (the two sites previously ordered the same guards
 //! differently, correct only by the types' mutual exclusivity).
 //!
-//! Scope: the FIVE host-insufficiency types BOTH sites classify —
-//! [`PerfModeUnavailable`], [`CpuBudgetUnsatisfiable`],
+//! Scope: the SIX host-insufficiency types BOTH sites classify —
+//! [`KernelUnavailable`] (no kernel image resolved — the harness cannot
+//! boot a VM here), [`PerfModeUnavailable`], [`CpuBudgetUnsatisfiable`],
 //! [`TopologyUnrepresentable`], [`ResourceContention`], and
-//! [`TopologyInsufficient`]. [`KernelUnavailable`] is deliberately NOT
-//! here: it stays a macro-only arm ahead of the shared classification.
-//! `err_to_exit_code` has never carried a `KernelUnavailable` arm (before
-//! or after this extraction), so a `KernelUnavailable` that does reach the
-//! dispatch path — e.g. a raw `cargo nextest run` with no kernel injected,
-//! via `resolve_test_kernel` — falls through to the catch-all `EXIT_FAIL`,
-//! exactly as before. Handling it only in the macro is therefore
-//! behavior-preserving; whether dispatch SHOULD skip it instead is a
-//! separate open decision.
+//! [`TopologyInsufficient`]. A `KernelUnavailable` reaches this classifier
+//! on every nextest invocation: nextest suppresses the plain `#[test]`
+//! wrapper, so the entry runs as `ktstr/{name}` via the `--exact` dispatch
+//! → `run_named_test` → `err_to_exit_code`, NOT the macro body. It is a SKIP
+//! by default — a developer running `cargo nextest run`, or `cargo ktstr
+//! test` without `--kernel`, on a kernel-less host gets a clean skip rather
+//! than a hard fail on every entry — promoted to a FAIL under
+//! `KTSTR_NO_SKIP_MODE`. This cannot mask a CI kernel-build failure: a
+//! `--kernel` the orchestrator FAILS to build bails in cargo-ktstr
+//! (`resolve_kernel_set`) before nextest is spawned, so `KernelUnavailable`
+//! here only ever means "no kernel was requested", never "a requested
+//! kernel failed to build".
 //!
 //! [`PerfModeUnavailable`]: crate::vmm::host_topology::PerfModeUnavailable
 //! [`CpuBudgetUnsatisfiable`]: crate::vmm::host_topology::CpuBudgetUnsatisfiable
@@ -36,9 +40,10 @@
 //! [`KernelUnavailable`]: crate::test_support::eval::KernelUnavailable
 
 use super::{
-    is_cpu_budget_unsatisfiable, is_perf_mode_unavailable, is_resource_contention,
-    is_topology_insufficient, is_topology_unrepresentable,
+    is_cpu_budget_unsatisfiable, is_kernel_unavailable, is_perf_mode_unavailable,
+    is_resource_contention, is_topology_insufficient, is_topology_unrepresentable,
 };
+use crate::test_support::eval::KernelUnavailable;
 use crate::vmm::host_topology::{
     CpuBudgetUnsatisfiable, PerfModeUnavailable, ResourceContention, TopologyInsufficient,
     TopologyUnrepresentable,
@@ -56,7 +61,7 @@ use crate::vmm::host_topology::{
 /// prefixes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostClass {
-    /// Not one of the five host-insufficiency types — the consumer
+    /// Not one of the six host-insufficiency types — the consumer
     /// applies its own per-site handling (dispatch: the
     /// `PostVmAssertionFailure` / `ExpectAutoReproSatisfied` /
     /// `expect_err` / catch-all arms; macro: the `expect_err` swallow or
@@ -106,6 +111,30 @@ where
 /// the exact banners the two sites emitted before this was extracted
 /// (minus the prefix, which the consumer adds).
 pub fn classify_host_error(e: &anyhow::Error, no_skip: bool) -> HostClass {
+    if is_kernel_unavailable(e) {
+        // No kernel image resolved: the harness cannot boot a VM here (the
+        // binary was run outside `cargo ktstr test`, or `cargo ktstr test`
+        // was run without `--kernel` on a host with no cached/discoverable
+        // kernel). A skip by default — a missing kernel on the runner is a
+        // "not configured here" condition, not a test failure — promoted to
+        // a FAIL under KTSTR_NO_SKIP_MODE for runs that demand execution. A
+        // requested-but-unbuildable `--kernel` bails in cargo-ktstr before
+        // nextest spawns, so this never masks a CI kernel-build failure.
+        let reason = extract_reason::<KernelUnavailable, _>(e, |k| k.diagnostic.clone());
+        return if no_skip {
+            HostClass::Fail {
+                reason: format!(
+                    "harness not configured under --no-skip-mode: {reason}. \
+                     Provide a kernel via --kernel or KTSTR_TEST_KERNEL, or drop \
+                     --no-skip-mode."
+                ),
+            }
+        } else {
+            HostClass::Skip {
+                reason: format!("harness not configured: {reason}"),
+            }
+        };
+    }
     if is_perf_mode_unavailable(e) {
         let reason = extract_reason::<PerfModeUnavailable, _>(e, |p| p.reason.clone());
         return if no_skip {
@@ -173,6 +202,32 @@ pub fn classify_host_error(e: &anyhow::Error, no_skip: bool) -> HostClass {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A no-kernel host (KernelUnavailable) skips by default — a missing
+    /// kernel on the runner is "not configured here", not a test failure —
+    /// and is promoted to a hard fail under `no_skip`. The bare reason is
+    /// the extracted diagnostic.
+    #[test]
+    fn kernel_unavailable_skip_then_fail() {
+        let mk = || {
+            anyhow::Error::new(KernelUnavailable {
+                diagnostic: "no kernel image resolved".into(),
+            })
+        };
+        match classify_host_error(&mk(), false) {
+            HostClass::Skip { reason } => {
+                assert_eq!(reason, "harness not configured: no kernel image resolved");
+            }
+            other => panic!("expected Skip, got {other:?}"),
+        }
+        match classify_host_error(&mk(), true) {
+            HostClass::Fail { reason } => {
+                assert!(reason.starts_with("harness not configured under --no-skip-mode:"));
+                assert!(reason.contains("no kernel image resolved"));
+            }
+            other => panic!("expected Fail, got {other:?}"),
+        }
+    }
 
     /// A perf-mode-too-small error skips by default and is promoted to a
     /// hard fail only under `no_skip`. The reason text is the bare,

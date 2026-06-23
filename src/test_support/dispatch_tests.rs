@@ -1491,38 +1491,34 @@ fn result_to_exit_code_cpu_budget_unsatisfiable_fails_even_under_expect_err() {
     assert_eq!(result_to_exit_code(mk(), true, false), EXIT_FAIL);
 }
 
-/// `KernelUnavailable` on the dispatch exit-code path routes to EXIT_FAIL
-/// via the catch-all — it has NO dedicated arm in `err_to_exit_code`, by
-/// design. This pins the INTENTIONAL macro-skip / dispatch-fail divergence:
-/// the `#[ktstr_test]` macro body skips a missing kernel (a developer ran
-/// `cargo nextest run` directly, outside `cargo ktstr test`), but on the
-/// dispatch/CI protocol path a kernel is always injected, so a
-/// `KernelUnavailable` is a harness misconfiguration that must FAIL loudly
-/// rather than silently skip-green and mask a broken CI kernel build. A
-/// future refactor that folded kernel-unavailable into `classify_host_error`
-/// (making the dispatch path skip it) would fail the first assertion.
-///
-/// Under `expect_err = true` a `KernelUnavailable` is instead INVERTED to
-/// EXIT_PASS by the generic `expect_err` arm — like any non-marker error,
-/// the harness misconfiguration is (wrongly, but per the existing
-/// inversion semantics) treated as "the expected error appeared". The
-/// second assertion pins that current behavior; the
-/// carve-it-out-of-the-inversion question is tracked separately. expect_err
-/// tests are rare and the CI dispatch path always injects a kernel, so this
-/// edge does not arise in practice today.
+/// `KernelUnavailable` on the dispatch exit-code path is a skip-class
+/// host-insufficiency: `classify_host_error` maps it to `HostClass::Skip`
+/// (default), which `err_to_exit_code` routes to EXIT_PASS — and because
+/// the host-class match precedes the `expect_err` inversion, BOTH polarities
+/// skip. Under nextest the plain `#[test]` wrapper is suppressed, so an
+/// entry dispatches as `ktstr/{name}` via `run_named_test` ->
+/// `err_to_exit_code`; this means a developer running `cargo nextest run`,
+/// or `cargo ktstr test` without `--kernel`, on a kernel-less host gets a
+/// clean skip rather than a hard fail on every entry. (A requested
+/// `--kernel` that fails to build bails in cargo-ktstr before nextest
+/// spawns, so this never masks a CI kernel-build failure.) The
+/// `KTSTR_NO_SKIP_MODE` -> FAIL promotion is pinned by
+/// `result_to_exit_code_skip_class_fails_under_no_skip_mode`.
 #[test]
-fn result_to_exit_code_kernel_unavailable_fails_on_dispatch_path() {
+fn result_to_exit_code_kernel_unavailable_skips_on_dispatch_path() {
+    use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
     use anyhow::Context as _;
+    let _env_lock = lock_env();
+    let _no_skip = EnvVarGuard::remove(crate::KTSTR_NO_SKIP_MODE_ENV);
     let mk = || -> Result<crate::assert::AssertResult> {
         Err(anyhow::Error::new(crate::test_support::KernelUnavailable {
             diagnostic: "no kernel image resolved; run via `cargo ktstr test`".to_string(),
         }))
         .context("run ktstr_test VM")
     };
-    // Normal (expect_err = false) path: a missing kernel FAILs loudly.
-    assert_eq!(result_to_exit_code(mk(), false, false), EXIT_FAIL);
-    // expect_err = true: the generic inversion turns it into a pass (no
-    // dedicated kernel-unavailable arm to escape the inversion).
+    // Skip-class: EXIT_PASS for both expect_err polarities — the host-class
+    // skip arm precedes the expect_err inversion.
+    assert_eq!(result_to_exit_code(mk(), false, false), EXIT_PASS);
     assert_eq!(result_to_exit_code(mk(), true, false), EXIT_PASS);
 }
 
@@ -2156,11 +2152,11 @@ fn result_to_exit_code_topology_insufficient_skips_when_not_no_skip() {
     assert_eq!(result_to_exit_code(wrapped(), false, false), EXIT_PASS);
 }
 
-/// Under KTSTR_NO_SKIP_MODE, all three skip-class errors hard-FAIL
+/// Under KTSTR_NO_SKIP_MODE, all four skip-class errors hard-FAIL
 /// (EXIT_FAIL) instead of skipping, and the stderr banner names
-/// the contention/insufficiency reason. Pins the no_skip branches
-/// (the `no_skip` → `HostClass::Fail` arms in the shared
-/// `classify_host_error` for perf-mode, resource-contention, and
+/// the cause/reason. Pins the no_skip branches (the `no_skip` →
+/// `HostClass::Fail` arms in the shared `classify_host_error` for
+/// kernel-unavailable, perf-mode, resource-contention, and
 /// topology-insufficient, surfaced via `result_to_exit_code`) and the
 /// reason extraction.
 #[test]
@@ -2215,6 +2211,20 @@ fn result_to_exit_code_skip_class_fails_under_no_skip_mode() {
         stderr.contains("performance mode unavailable under --no-skip-mode")
             && stderr.contains("host too small for perf topology"),
         "no-skip perf-mode banner must name the cause + reason; got: {stderr}",
+    );
+
+    let kernel = || -> Result<crate::assert::AssertResult> {
+        Err(anyhow::Error::new(crate::test_support::KernelUnavailable {
+            diagnostic: "no kernel image resolved".into(),
+        }))
+    };
+    let (code, captured) = capture_stderr(|| result_to_exit_code(kernel(), false, false));
+    assert_eq!(code, EXIT_FAIL);
+    let stderr = String::from_utf8(captured).expect("stderr is utf-8");
+    assert!(
+        stderr.contains("harness not configured under --no-skip-mode")
+            && stderr.contains("no kernel image resolved"),
+        "no-skip kernel-unavailable banner must name the cause + reason; got: {stderr}",
     );
 }
 

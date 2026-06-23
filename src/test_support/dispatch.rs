@@ -143,36 +143,33 @@ pub fn is_topology_unrepresentable(e: &anyhow::Error) -> bool {
 }
 
 /// Predicate: walks the [`anyhow::Error`] chain looking for a
-/// [`KernelUnavailable`] cause. Used by the `#[ktstr_test]`
-/// macro's wrapper to distinguish "harness not configured" (skip)
-/// from "test failed" (panic).
+/// [`KernelUnavailable`] cause. Used by `classify_host_error` to classify
+/// a no-kernel host as a skip-class host-insufficiency.
 ///
 /// The harness signals "I have no kernel to boot, the binary was
 /// likely invoked outside `cargo ktstr test`" by surfacing
-/// [`KernelUnavailable`] rather than a generic
-/// `anyhow::bail!`. The macro wrapper emits the canonical
-/// `ktstr: SKIP: harness not configured: ...` banner and
-/// early-returns so libtest sees pass — same shape as the
-/// resource-contention SKIP arm. `pub` because the macro-generated
-/// `#[test]` body in `ktstr-macros` references it by absolute
-/// path; `#[doc(hidden)]` keeps it out of rustdoc — plumbing, not
-/// user API.
+/// [`KernelUnavailable`] rather than a generic `anyhow::bail!`.
+/// `classify_host_error` maps it to `HostClass::Skip` (the canonical
+/// `ktstr: SKIP: harness not configured: ...` banner), promoted to a FAIL
+/// under `KTSTR_NO_SKIP_MODE` — same shape as the resource-contention skip.
+/// `pub` + `#[doc(hidden)]`: plumbing re-exported from `test_support`
+/// alongside the sibling `is_*` predicates, not user API.
 ///
-/// The dispatch exit-code path (`err_to_exit_code`) deliberately has NO
-/// kernel-unavailable arm: on the default `expect_err = false` path a
-/// `KernelUnavailable` falls through to the catch-all `EXIT_FAIL`. This
-/// macro-skip / dispatch-fail divergence is INTENTIONAL — the macro body
-/// runs under a bare `cargo nextest run` (no kernel means "invoked outside
-/// `cargo ktstr test`", a developer mistake to skip cleanly), but the
-/// dispatch/CI protocol path always injects a kernel, so a
-/// `KernelUnavailable` reaching `err_to_exit_code` is a genuine harness
-/// misconfiguration that must FAIL loudly rather than silently skip-green
-/// and mask a broken CI kernel build. Do NOT fold kernel-unavailable into
-/// the shared `classify_host_error` (that would make the dispatch path skip
-/// it too). (Under `expect_err = true` the generic inversion turns it into
-/// a pass like any non-marker error — a rare edge, since expect_err tests
-/// are few and CI always injects a kernel.) Pinned by
-/// `result_to_exit_code_kernel_unavailable_fails_on_dispatch_path`.
+/// Both consumers route a `KernelUnavailable` through the shared
+/// [`classify_host_error`] (a no-kernel host is a skip-class
+/// host-insufficiency): `err_to_exit_code` and the `#[ktstr_test]` macro
+/// body both SKIP it by default, promoted to a FAIL under
+/// `KTSTR_NO_SKIP_MODE`. Under nextest the plain `#[test]` wrapper is
+/// suppressed, so an entry dispatches as `ktstr/{name}` via `run_named_test`
+/// → `err_to_exit_code` — meaning a developer running `cargo nextest run`,
+/// or `cargo ktstr test` without `--kernel`, on a kernel-less host gets a
+/// clean skip rather than a hard fail on every entry. This cannot mask a CI
+/// kernel-build failure: a requested `--kernel` that fails to build bails in
+/// cargo-ktstr (`resolve_kernel_set`) before nextest is spawned, so a
+/// `KernelUnavailable` here only ever means "no kernel was requested".
+/// Pinned by `result_to_exit_code_kernel_unavailable_skips_on_dispatch_path`.
+///
+/// [`classify_host_error`]: crate::test_support::classify_host_error
 ///
 /// [`KernelUnavailable`]: crate::test_support::eval::KernelUnavailable
 #[doc(hidden)]
@@ -1126,9 +1123,10 @@ fn ok_to_exit_code(r: AssertResult, expect_err: bool, allow_inconclusive: bool) 
 ///
 /// The sequential guards preserve the original `match` arm precedence
 /// (first matching guard wins): the host-insufficiency classification
-/// ([`classify_host_error`], covering perf-mode → cpu-budget →
-/// topology-unrepresentable → resource-contention → topology-insufficient,
-/// shared with the `#[ktstr_test]` macro body) runs FIRST, then the
+/// ([`classify_host_error`], covering kernel-unavailable → perf-mode →
+/// cpu-budget → topology-unrepresentable → resource-contention →
+/// topology-insufficient, shared with the `#[ktstr_test]` macro body) runs
+/// FIRST, then the
 /// marker-typed guards (`PostVmAssertionFailure` →
 /// `ExpectAutoReproSatisfied`), then the `expect_err` inversion, then
 /// the catch-all (the former `Err(e) => …` arm) operating on the
@@ -1137,9 +1135,9 @@ fn ok_to_exit_code(r: AssertResult, expect_err: bool, allow_inconclusive: bool) 
 /// order + per-class skip/fail policy live in `classify_host_error`, not
 /// here, so this site and the macro cannot drift apart.
 fn err_to_exit_code(e: anyhow::Error, expect_err: bool, no_skip: bool) -> i32 {
-    // Host-insufficiency classification (perf-mode, cpu-budget,
-    // topology-unrepresentable, resource-contention, topology-insufficient)
-    // is shared with the `#[ktstr_test]` macro body via
+    // Host-insufficiency classification (kernel-unavailable, perf-mode,
+    // cpu-budget, topology-unrepresentable, resource-contention,
+    // topology-insufficient) is shared with the `#[ktstr_test]` macro body via
     // `classify_host_error` — the single source of truth for the guard
     // ORDER and the per-class skip/fail policy. This site renders the
     // verdict as an exit code; the macro renders the same `HostClass` as
@@ -1236,12 +1234,9 @@ fn err_to_exit_code(e: anyhow::Error, expect_err: bool, no_skip: bool) -> i32 {
         }
     }
     // Catch-all: a non-host-class, non-marker, non-expect_err error is a
-    // real failure. A KernelUnavailable lands HERE (no dedicated arm, by
-    // design — see is_kernel_unavailable): on the dispatch/CI path a kernel
-    // is always injected, so a missing kernel is a harness misconfiguration
-    // that must FAIL loudly, not silently skip-green (the macro body skips
-    // it for the developer's bare `cargo nextest run`; the divergence is
-    // intentional).
+    // real failure. (A KernelUnavailable does NOT reach here — it is a
+    // skip-class host-insufficiency handled by the classify_host_error match
+    // at the top.)
     eprintln!("{e:#}");
     EXIT_FAIL
 }

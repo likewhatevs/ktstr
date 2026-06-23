@@ -37,8 +37,9 @@ macro_rules! skip {
 /// shared `crate::test_support::classify_host_error` — the single source
 /// of truth also used by `err_to_exit_code` and the `#[ktstr_test]` macro
 /// body — so this helper can never drift from them. A `HostClass::Skip`
-/// (resource contention, topology insufficient, or perf-mode unavailable —
-/// chain-aware, so a `.context(...)`-wrapped instance still skips) emits
+/// (no kernel resolved, resource contention, topology insufficient, or
+/// perf-mode unavailable — chain-aware, so a `.context(...)`-wrapped
+/// instance still skips) emits
 /// the canonical SKIP banner and early-returns. Everything else panics
 /// with `{e:#}`: a `HostClass::Fail` (the hard-error
 /// `CpuBudgetUnsatisfiable` / `TopologyUnrepresentable`) and any
