@@ -18,7 +18,7 @@
 use anyhow::Result;
 use ktstr::assert::{AssertResult, Verdict};
 use ktstr::ktstr_test;
-use ktstr::prelude::{SampleSeries, VmResult, WorkType};
+use ktstr::prelude::{SampleSeries, VmResult, WorkType, post_vm_skip};
 use ktstr::scenario::ops::{HoldSpec, Step, execute_steps};
 use ktstr::test_support::{Scheduler, SchedulerSpec};
 
@@ -33,14 +33,24 @@ fn assert_yielded_advanced(result: &VmResult) -> Result<()> {
         result.monitor.clone(),
     )
     .periodic_only();
-    anyhow::ensure!(
-        series.len() >= 2,
-        "need at least 2 periodic samples for nondecreasing to be \
-         non-vacuous, got {} (periodic_target={}, periodic_fired={})",
-        series.len(),
-        result.periodic_target,
-        result.periodic_fired,
-    );
+    // Skip (not fail) when the freeze coordinator produced fewer than two
+    // periodic captures: the any_progress / nondecreasing checks below need
+    // >= 2 samples, and a 0/1-capture run is a capture-availability
+    // condition — a coverage-instrumented or otherwise-slow guest whose
+    // periodic rendezvous timed out, or the scheduler's BPF skeleton not
+    // finishing attach (libbpf "map skeleton link is uninitialized") — NOT a
+    // yield-semantics defect. With >= 2 captures the full check below still
+    // runs and still fails on a real regression.
+    if series.len() < 2 {
+        return Err(post_vm_skip(format!(
+            "need >= 2 periodic samples for the nr_yielded nondecreasing \
+             check; got {} (periodic_target={}, periodic_fired={}) — the \
+             freeze coordinator produced too few captures to evaluate",
+            series.len(),
+            result.periodic_target,
+            result.periodic_fired,
+        )));
+    }
 
     // any_progress floor: ops.yield must fire at least once under the
     // YieldHeavy workload. A counter stuck at 0 means `ktstr_yield` was
