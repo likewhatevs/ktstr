@@ -1491,6 +1491,41 @@ fn result_to_exit_code_cpu_budget_unsatisfiable_fails_even_under_expect_err() {
     assert_eq!(result_to_exit_code(mk(), true, false), EXIT_FAIL);
 }
 
+/// `KernelUnavailable` on the dispatch exit-code path routes to EXIT_FAIL
+/// via the catch-all — it has NO dedicated arm in `err_to_exit_code`, by
+/// design. This pins the INTENTIONAL macro-skip / dispatch-fail divergence:
+/// the `#[ktstr_test]` macro body skips a missing kernel (a developer ran
+/// `cargo nextest run` directly, outside `cargo ktstr test`), but on the
+/// dispatch/CI protocol path a kernel is always injected, so a
+/// `KernelUnavailable` is a harness misconfiguration that must FAIL loudly
+/// rather than silently skip-green and mask a broken CI kernel build. A
+/// future refactor that folded kernel-unavailable into `classify_host_error`
+/// (making the dispatch path skip it) would fail the first assertion.
+///
+/// Under `expect_err = true` a `KernelUnavailable` is instead INVERTED to
+/// EXIT_PASS by the generic `expect_err` arm — like any non-marker error,
+/// the harness misconfiguration is (wrongly, but per the existing
+/// inversion semantics) treated as "the expected error appeared". The
+/// second assertion pins that current behavior; the
+/// carve-it-out-of-the-inversion question is tracked separately. expect_err
+/// tests are rare and the CI dispatch path always injects a kernel, so this
+/// edge does not arise in practice today.
+#[test]
+fn result_to_exit_code_kernel_unavailable_fails_on_dispatch_path() {
+    use anyhow::Context as _;
+    let mk = || -> Result<crate::assert::AssertResult> {
+        Err(anyhow::Error::new(crate::test_support::KernelUnavailable {
+            diagnostic: "no kernel image resolved; run via `cargo ktstr test`".to_string(),
+        }))
+        .context("run ktstr_test VM")
+    };
+    // Normal (expect_err = false) path: a missing kernel FAILs loudly.
+    assert_eq!(result_to_exit_code(mk(), false, false), EXIT_FAIL);
+    // expect_err = true: the generic inversion turns it into a pass (no
+    // dedicated kernel-unavailable arm to escape the inversion).
+    assert_eq!(result_to_exit_code(mk(), true, false), EXIT_PASS);
+}
+
 /// `TopologyUnrepresentable` routes to EXIT_FAIL via its DEDICATED
 /// hard-fail arm (above the `expect_err` inversion) even under
 /// expect_err — a fixed VMM-layout limit no host can satisfy is a test

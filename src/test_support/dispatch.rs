@@ -158,6 +158,22 @@ pub fn is_topology_unrepresentable(e: &anyhow::Error) -> bool {
 /// path; `#[doc(hidden)]` keeps it out of rustdoc — plumbing, not
 /// user API.
 ///
+/// The dispatch exit-code path (`err_to_exit_code`) deliberately has NO
+/// kernel-unavailable arm: on the default `expect_err = false` path a
+/// `KernelUnavailable` falls through to the catch-all `EXIT_FAIL`. This
+/// macro-skip / dispatch-fail divergence is INTENTIONAL — the macro body
+/// runs under a bare `cargo nextest run` (no kernel means "invoked outside
+/// `cargo ktstr test`", a developer mistake to skip cleanly), but the
+/// dispatch/CI protocol path always injects a kernel, so a
+/// `KernelUnavailable` reaching `err_to_exit_code` is a genuine harness
+/// misconfiguration that must FAIL loudly rather than silently skip-green
+/// and mask a broken CI kernel build. Do NOT fold kernel-unavailable into
+/// the shared `classify_host_error` (that would make the dispatch path skip
+/// it too). (Under `expect_err = true` the generic inversion turns it into
+/// a pass like any non-marker error — a rare edge, since expect_err tests
+/// are few and CI always injects a kernel.) Pinned by
+/// `result_to_exit_code_kernel_unavailable_fails_on_dispatch_path`.
+///
 /// [`KernelUnavailable`]: crate::test_support::eval::KernelUnavailable
 #[doc(hidden)]
 pub fn is_kernel_unavailable(e: &anyhow::Error) -> bool {
@@ -1219,6 +1235,13 @@ fn err_to_exit_code(e: anyhow::Error, expect_err: bool, no_skip: bool) -> i32 {
             return EXIT_PASS;
         }
     }
+    // Catch-all: a non-host-class, non-marker, non-expect_err error is a
+    // real failure. A KernelUnavailable lands HERE (no dedicated arm, by
+    // design — see is_kernel_unavailable): on the dispatch/CI path a kernel
+    // is always injected, so a missing kernel is a harness misconfiguration
+    // that must FAIL loudly, not silently skip-green (the macro body skips
+    // it for the developer's bare `cargo nextest run`; the divergence is
+    // intentional).
     eprintln!("{e:#}");
     EXIT_FAIL
 }
