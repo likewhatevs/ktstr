@@ -312,7 +312,23 @@ fn cover_cache_pressure_imbalance(ctx: &Ctx) -> Result<AssertResult> {
     ktstr::scenario::performance::custom_cache_pressure_imbalance(ctx)
 }
 
-#[ktstr_test(llcs = 2, cores = 4, threads = 1, memory_mib = 2048)]
+// performance_mode is REQUIRED here, unlike the sibling perf-coverage
+// scenarios: this one binds each cgroup to a SEPARATE guest LLC
+// (CpusetSpec::llc(0)/llc(1)) to make cross-LLC wake-affine placement
+// observable, then asserts a tight wake-latency CV. Without perf-mode's
+// host-LLC pinning, the two guest LLCs float on shared host CPUs; under
+// host oversubscription (CI runs `-j $(nproc)`) one LLC's vCPUs starve, so
+// that cgroup's worker does zero work (exit=TimedOut) and the CV/throughput
+// asserts measure noise rather than scheduler behavior. Pinning gives each
+// guest LLC dedicated host CPUs; on a contended host the test
+// ResourceContention-skips instead of hard-failing.
+#[ktstr_test(
+    llcs = 2,
+    cores = 4,
+    threads = 1,
+    memory_mib = 2048,
+    performance_mode = true
+)]
 fn cover_cache_yield_wake_affine(ctx: &Ctx) -> Result<AssertResult> {
     ktstr::scenario::performance::custom_cache_yield_wake_affine(ctx)
 }
