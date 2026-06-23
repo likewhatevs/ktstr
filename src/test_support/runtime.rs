@@ -712,6 +712,22 @@ pub(crate) const OVERCOMMIT_SKIP_RATIO: f64 = 6.0;
 /// extreme the author budgets for via `duration`/`watchdog_timeout`.
 const OVERCOMMIT_HEADROOM_CAP: f64 = OVERCOMMIT_SKIP_RATIO;
 
+/// Stricter skip ratio for the `expect_auto_repro` chain. That inversion
+/// boots a SECOND wide-SMP VM which must replay the forced failure and land
+/// a shape-valid `.repro.wprof.pb` — a far more fragile path under host
+/// time-slicing than a single boot: the repro VM's system-wide wprof
+/// capture over hundreds of vCPUs stops reliably producing a transportable
+/// trace once the host oversubscribes (the boots themselves still finish
+/// inside the oversub-scaled deadline; the trace transport is what breaks).
+/// So this chain auto-skips well below the generic [`OVERCOMMIT_SKIP_RATIO`],
+/// while single-VM wide-SMP BOOT tests keep running (and validating boot) up
+/// to the generic cap. Tuned to sit between the ~1.3x a 256-vCPU guest hits
+/// on the 192-CPU wide-SMP design-target runner (which still RUNS the
+/// auto-repro hop, so it is validated there) and the ~2.7x of a 96-CPU host
+/// (which skips cleanly instead of hard-failing — the "overcommit OR
+/// auto-skip, never hard-fail" contract).
+pub(crate) const EXPECT_AUTO_REPRO_SKIP_RATIO: f64 = 2.0;
+
 /// Host overcommit ratio for a `vcpus`-wide guest given the host's
 /// allowed-CPU count and the test's optional explicit `cpu_budget`:
 /// vCPUs divided by the host CPUs the vCPU threads actually land on.
@@ -760,18 +776,33 @@ pub(crate) fn overcommit_skip_reason(
     vcpus: u32,
     allowed_cpus: usize,
     cpu_budget: Option<u32>,
+    expect_auto_repro: bool,
 ) -> Option<String> {
     if cpu_budget.is_some() || allowed_cpus == 0 {
         return None;
     }
     let oversub = overcommit_ratio(vcpus, allowed_cpus, None);
-    if oversub < OVERCOMMIT_SKIP_RATIO {
+    // The two-VM expect_auto_repro inversion uses a much stricter cap
+    // ([`EXPECT_AUTO_REPRO_SKIP_RATIO`]) than a single-VM boot test: its
+    // repro-VM wprof-trace transport is fragile under time-slicing, so it
+    // skips at an oversubscription a boot-only wide-SMP test still runs at.
+    let skip_ratio = if expect_auto_repro {
+        EXPECT_AUTO_REPRO_SKIP_RATIO
+    } else {
+        OVERCOMMIT_SKIP_RATIO
+    };
+    if oversub < skip_ratio {
         return None;
     }
+    let chain = if expect_auto_repro {
+        " for the expect_auto_repro inversion chain"
+    } else {
+        ""
+    };
     Some(format!(
         "host topology insufficient: {vcpus} vCPUs auto-collapse onto \
          {allowed_cpus} allowed host CPUs = {oversub:.1}x oversubscription \
-         (>= {OVERCOMMIT_SKIP_RATIO:.0}x skip cap); widen the process cpuset \
+         (>= {skip_ratio:.0}x skip cap{chain}); widen the process cpuset \
          or shrink the guest topology"
     ))
 }
@@ -2417,7 +2448,8 @@ mod tests {
     #[test]
     fn overcommit_skip_reason_skips_severe_auto_collapse() {
         // 256 vCPUs auto-collapse onto 8 host CPUs = 32x ≥ 6x → skip.
-        let r = overcommit_skip_reason(256, 8, None);
+        // (boot-only path: expect_auto_repro = false.)
+        let r = overcommit_skip_reason(256, 8, None, false);
         assert!(
             r.as_deref()
                 .is_some_and(|m| m.contains("host topology insufficient")),
@@ -2429,29 +2461,60 @@ mod tests {
     fn overcommit_skip_reason_runs_ci_wide_smp_ratio() {
         // 256 vCPUs on a 192-CPU CI runner = 1.33x < 6x → RUNS (None),
         // so wide-SMP boot is validated there, never masked.
-        assert_eq!(overcommit_skip_reason(256, 192, None), None);
+        assert_eq!(overcommit_skip_reason(256, 192, None, false), None);
     }
 
     #[test]
     fn overcommit_skip_reason_never_skips_explicit_budget() {
         // An explicit cpu_budget is a deliberate oversubscription opt-in
         // (contention testing): even 256 vCPUs on 8 host CPUs runs.
-        assert_eq!(overcommit_skip_reason(256, 8, Some(4)), None);
+        assert_eq!(overcommit_skip_reason(256, 8, Some(4), false), None);
     }
 
     #[test]
     fn overcommit_skip_reason_runs_on_empty_cpuset() {
         // An unenumerable cpuset (allowed = 0) cannot compute a ratio →
         // does not skip; the overcommit warning is the sole signal there.
-        assert_eq!(overcommit_skip_reason(256, 0, None), None);
+        assert_eq!(overcommit_skip_reason(256, 0, None, false), None);
     }
 
     #[test]
     fn overcommit_skip_reason_boundary_is_inclusive_at_cap() {
         // ≥ cap skips, just-below runs. 48 vCPUs on 8 = exactly 6.0x → skip;
-        // 47 on 8 = 5.875x < 6.0 → run.
-        assert!(overcommit_skip_reason(48, 8, None).is_some());
-        assert_eq!(overcommit_skip_reason(47, 8, None), None);
+        // 47 on 8 = 5.875x < 6.0 → run. (boot-only path.)
+        assert!(overcommit_skip_reason(48, 8, None, false).is_some());
+        assert_eq!(overcommit_skip_reason(47, 8, None, false), None);
+    }
+
+    #[test]
+    fn overcommit_skip_reason_expect_auto_repro_uses_stricter_cap() {
+        // The expect_auto_repro inversion chain skips at a much lower
+        // ratio (EXPECT_AUTO_REPRO_SKIP_RATIO = 2.0x) than a boot-only
+        // wide test. Pins the failing CI case: 256 vCPUs on a 96-CPU host
+        // = 2.67x.
+        //   - 2.67x WITH expect_auto_repro -> SKIP (the two-VM wprof chain
+        //     cannot run cleanly under that time-slicing).
+        let skip = overcommit_skip_reason(256, 96, None, true);
+        assert!(
+            skip.as_deref().is_some_and(
+                |m| m.contains("host topology insufficient") && m.contains("expect_auto_repro")
+            ),
+            "2.67x with expect_auto_repro must skip naming the chain, got {skip:?}",
+        );
+        //   - same 2.67x WITHOUT expect_auto_repro -> RUNS (a single-VM
+        //     wide-SMP boot test still validates boot at 2.67x < 6.0x).
+        assert_eq!(overcommit_skip_reason(256, 96, None, false), None);
+        //   - the 192-CPU design-target runner (256/192 = 1.33x) RUNS the
+        //     auto-repro hop even with expect_auto_repro (1.33x < 2.0x), so
+        //     the >255 inversion is still validated there.
+        assert_eq!(overcommit_skip_reason(256, 192, None, true), None);
+        //   - an explicit cpu_budget stays a deliberate opt-in: no skip
+        //     even with expect_auto_repro.
+        assert_eq!(overcommit_skip_reason(256, 8, Some(4), true), None);
+        //   - boundary: exactly 2.0x with expect_auto_repro skips (>= is
+        //     inclusive); just below runs.
+        assert!(overcommit_skip_reason(16, 8, None, true).is_some());
+        assert_eq!(overcommit_skip_reason(15, 8, None, true), None);
     }
 
     #[test]

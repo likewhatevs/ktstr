@@ -867,3 +867,35 @@ fn overcommit_skip_never_skips_explicit_budget() {
         "explicit cpu_budget must never auto-skip",
     );
 }
+
+#[test]
+fn overcommit_skip_uses_stricter_cap_for_expect_auto_repro() {
+    // Pin the expect_auto_repro field-threading at the eval call site
+    // (entry.expect_auto_repro -> overcommit_skip_reason's stricter
+    // EXPECT_AUTO_REPRO_SKIP_RATIO=2.0 cap). The SAME 256-vCPU-on-96-host
+    // ratio (2.67x) that a boot-only wide test RUNS at must SKIP when
+    // expect_auto_repro is set — a regression that hardcoded `false` or
+    // dropped the arg would still pass the false-default tests above but
+    // fail here.
+    let host: Vec<usize> = (0..96).collect(); // 256 / 96 = 2.67x
+
+    let mut boot_only = eevdf_entry("overcommit_skip_boot_only");
+    boot_only.topology = wide_smp_topology();
+    boot_only.cpu_budget = None;
+    boot_only.expect_auto_repro = false;
+    assert!(
+        super::overcommit_skip(&boot_only, &host).is_none(),
+        "boot-only wide test must RUN at 2.67x (< 6x boot cap)",
+    );
+
+    let mut auto_repro = eevdf_entry("overcommit_skip_auto_repro");
+    auto_repro.topology = wide_smp_topology();
+    auto_repro.cpu_budget = None;
+    auto_repro.expect_auto_repro = true;
+    let skip = super::overcommit_skip(&auto_repro, &host)
+        .expect("expect_auto_repro chain must auto-skip at 2.67x (>= 2.0x cap)");
+    assert!(
+        skip.is_skip(),
+        "expect_auto_repro overcommit must yield a SKIP result",
+    );
+}

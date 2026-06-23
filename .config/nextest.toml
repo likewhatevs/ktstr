@@ -163,8 +163,14 @@ retries = 3
 # duration, 1) + vm_boot_headroom(256)=58.4s × 6). The binding case is
 # pos_expect_auto_repro_satisfied_wide_smp: it boots TWO 256-vCPU VMs
 # sequentially (primary + auto-repro), each with its OWN ~470s watchdog,
-# so a healthy two-VM run on a small runner just above the skip boundary
-# can reach ~940s. slow-timeout 960s/terminate-after 1 covers that two-VM
+# so a healthy two-VM run can reach ~940s. That two-VM wprof-inversion
+# chain now auto-skips above EXPECT_AUTO_REPRO_SKIP_RATIO (2.0x) — far
+# below the 6x boot cap — because its repro-VM trace transport is fragile
+# under host time-slicing; so it RUNS (and can reach ~940s) only on a host
+# with MORE than 128 CPUs (256 vCPUs at < 2.0x; exactly 128 CPUs = 2.0x
+# SKIPS, the cap being inclusive) and SKIPS cleanly on a 96-CPU runner
+# (2.7x) instead of hard-failing, while single-VM wide-SMP boot tests keep
+# the 6x cap. slow-timeout 960s/terminate-after 1 covers that two-VM
 # worst running case so the per-VM framework watchdog fires FIRST (a
 # clean failure dump) rather than nextest blunt-killing a still-booting
 # second VM; single-VM wide tests fail at their ≤470s watchdog long

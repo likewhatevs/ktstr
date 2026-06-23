@@ -386,14 +386,19 @@ fn write_placeholder_failure_dump_if_missing(path: &std::path::Path, result: &vm
 /// banner, records the skip sidecar, and returns the skip
 /// [`AssertResult`]; otherwise returns `None` to proceed to boot. Only
 /// the AUTO-collapse case skips — an explicit `cpu_budget` (a deliberate
-/// oversubscription opt-in) and the CI ~1.3x case both return `None` and
-/// RUN, so wide-SMP boot is validated there rather than silently
-/// skipped.
+/// oversubscription opt-in) returns `None` and RUNs. The skip cap is
+/// stricter for an `expect_auto_repro` entry (its two-VM wprof-trace
+/// inversion chain is fragile under time-slicing): such an entry skips at
+/// `EXPECT_AUTO_REPRO_SKIP_RATIO`, while a boot-only wide-SMP test runs up
+/// to `OVERCOMMIT_SKIP_RATIO` — so a 256-vCPU guest at the ~1.3x of the
+/// design-target runner validates boot (and the auto-repro hop) there
+/// rather than silently skipping.
 fn overcommit_skip(entry: &KtstrTestEntry, host_cpus: &[usize]) -> Option<AssertResult> {
     let reason = super::runtime::overcommit_skip_reason(
         entry.topology.total_cpus(),
         host_cpus.len(),
         entry.cpu_budget,
+        entry.expect_auto_repro,
     )?;
     crate::report::test_skip(format_args!("{}: {reason}", entry.name));
     record_skip_sidecar(entry);
@@ -1563,8 +1568,26 @@ pub(crate) fn apply_expect_auto_repro_inversion(
         let Ok(repro_path) = result.repro_wprof_pb_path() else {
             return;
         };
-        if crate::test_support::wprof::assert_wprof_pb_shape(&repro_path).is_ok() {
-            result.expect_auto_repro_satisfied = true;
+        match crate::test_support::wprof::assert_wprof_pb_shape(&repro_path) {
+            Ok(()) => result.expect_auto_repro_satisfied = true,
+            Err(e) => {
+                // The repro VM did not land a shape-valid .repro.wprof.pb,
+                // so the inversion does NOT fire and the forced failure
+                // surfaces as a real nextest FAIL. Without this diagnostic
+                // the operator sees only the generic body-fail message and
+                // cannot distinguish a missing/truncated artifact (e.g. a
+                // repro VM that raced its system-wide wprof transport under
+                // host oversubscription) from a broken inversion gate. The
+                // pre-boot overcommit auto-skip (overcommit_skip_reason,
+                // expect_auto_repro-aware) is the primary guard against the
+                // oversubscription case; this logs whatever still reaches
+                // here so a future failure is debuggable from CI stderr.
+                eprintln!(
+                    "ktstr: expect_auto_repro: repro wprof trace at {} is not \
+                     shape-valid ({e:#}); inversion NOT applied — forced failure stands",
+                    repro_path.display()
+                );
+            }
         }
     }
 }
