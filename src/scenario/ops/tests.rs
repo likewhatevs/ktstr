@@ -1541,6 +1541,7 @@ fn cpusetspec_exact_is_passthrough() {
         wait_for_map_write: false,
         current_step: std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0)),
         entry_name: None,
+        variant_hash: 0,
     };
     let resolved = spec.resolve(&ctx);
     assert_eq!(resolved, cpus);
@@ -1649,6 +1650,7 @@ fn ctx_from<'a>(
         wait_for_map_write: false,
         current_step: std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0)),
         entry_name: None,
+        variant_hash: 0,
     }
 }
 
@@ -3269,6 +3271,7 @@ fn mock_ctx<'a>(mock: &'a MockCgroupOps, topo: &'a crate::topology::TestTopology
         wait_for_map_write: false,
         current_step: std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0)),
         entry_name: None,
+        variant_hash: 0,
     }
 }
 

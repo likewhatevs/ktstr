@@ -256,6 +256,55 @@ fn resolved_topology_distinguishes_presets_and_unifies_skip_run() {
     );
 }
 
+/// The two variant-hash derivations MUST agree: `variant_hash_from_parts`
+/// (from entry + resolved topology + work_type — used for the dump
+/// filename and the Ctx/VmResult stamp BEFORE any sidecar exists) and
+/// `sidecar_variant_hash` (from a written `SidecarResult` — used for the
+/// sidecar filename). If they drifted, a gauntlet preset's dump and its
+/// sidecar would carry different variant keys and the footer could not
+/// correlate them. Both route through `variant_hash_of`; this pins the
+/// equality end-to-end through the real `write_sidecar`.
+#[test]
+fn variant_hash_from_parts_matches_sidecar_variant_hash() {
+    use crate::vmm::topology::Topology;
+    let _lock = lock_env();
+    let tmp = tempfile::Builder::new()
+        .prefix("ktstr-variant-hash-pin-")
+        .tempdir()
+        .expect("create tempdir");
+    let _env_sidecar = EnvVarGuard::set(crate::KTSTR_SIDECAR_DIR_ENV, tmp.path());
+
+    fn dummy(_ctx: &Ctx) -> Result<AssertResult> {
+        Ok(AssertResult::pass())
+    }
+    let entry = KtstrTestEntry {
+        name: "__vh_pin__",
+        func: dummy,
+        auto_repro: false,
+        ..KtstrTestEntry::DEFAULT
+    };
+    let resolved = Topology::new(2, 2, 2, 2);
+    let work_type = "SpinWait";
+    let vm_result = crate::vmm::VmResult::test_fixture();
+    let ok = AssertResult::pass();
+    write_sidecar(&entry, &vm_result, &[], &ok, work_type, &[], &resolved).unwrap();
+
+    let path = find_single_sidecar_by_prefix(tmp.path(), "__vh_pin__-");
+    let sc: SidecarResult = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let from_parts = variant_hash_from_parts(&entry, &resolved, work_type);
+    assert_eq!(
+        sidecar_variant_hash(&sc),
+        from_parts,
+        "variant_hash_from_parts must equal sidecar_variant_hash for the same config",
+    );
+    // The on-disk sidecar filename embeds exactly that hash, so the dump
+    // (keyed by variant_hash_from_parts) and the sidecar share the key.
+    assert_eq!(
+        path.file_name().unwrap().to_str().unwrap(),
+        format!("__vh_pin__-{from_parts:016x}.ktstr.json"),
+    );
+}
+
 /// When the sidecar directory cannot be created (path collision
 /// with a regular file), `write_skip_sidecar` must return `Err`
 /// rather than silently eating the failure. Stats tooling relies

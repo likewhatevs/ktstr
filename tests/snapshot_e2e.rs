@@ -434,7 +434,8 @@ static __KTSTR_ENTRY_SNAPSHOT_OP_IN_VM: ktstr::test_support::KtstrTestEntry =
 /// callback. Test invokes scx-ktstr with `--stall-after=1` so the
 /// scheduler's `tp_btf/sched_ext_exit` handler fires
 /// `SCX_EXIT_ERROR_STALL`, the freeze coordinator dumps the live
-/// scheduler `.bss` to `{sidecar_dir()}/{test_name}.failure-dump.json`,
+/// scheduler `.bss` to the variant-keyed
+/// `{sidecar_dir()}/{test_name}-{variant_hash:016x}.failure-dump.json`,
 /// and the test reads that file back, deserializes into a
 /// `FailureDumpReport`, manually drives `bridge.capture("exit_kind")`
 /// to simulate the watchpoint fire, and walks the captured snapshot's

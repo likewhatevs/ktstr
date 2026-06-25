@@ -454,6 +454,14 @@ pub struct Ctx<'a> {
     /// `ctx.failure_dump_path()` and the host-side
     /// `result.failure_dump_path()` resolve to identical paths).
     pub entry_name: Option<&'static str>,
+    /// The run's variant hash (see `variant_hash_from_parts`),
+    /// stamped at the macro dispatch site alongside [`Self::entry_name`].
+    /// The body-side `failure_dump_path` / `wprof_pb_path` derivations
+    /// embed it as the `-{16-hex}` filename suffix so a gauntlet test's
+    /// per-preset dumps don't clobber and each matches its sidecar's
+    /// variant hash. `0` on a manually-built fixture (which has
+    /// `entry_name = None` and thus bails before reading this).
+    pub variant_hash: u64,
 }
 
 impl std::fmt::Debug for Ctx<'_> {
@@ -476,6 +484,7 @@ impl std::fmt::Debug for Ctx<'_> {
                 &self.current_step.load(std::sync::atomic::Ordering::Relaxed),
             )
             .field("entry_name", &self.entry_name)
+            .field("variant_hash", &self.variant_hash)
             .finish()
     }
 }
@@ -721,7 +730,10 @@ impl Ctx<'_> {
                  #[ktstr_test], not for builder-driven fixtures."
             )
         })?;
-        Ok(crate::test_support::sidecar_dir().join(format!("{name}.failure-dump.json")))
+        Ok(crate::test_support::sidecar_dir().join(format!(
+            "{name}-{:016x}.failure-dump.json",
+            self.variant_hash
+        )))
     }
 
     /// Per-test wprof Perfetto-trace sidecar path. Mirror of
@@ -748,7 +760,8 @@ impl Ctx<'_> {
                  for the manually-constructed-Ctx workaround."
             )
         })?;
-        Ok(crate::test_support::sidecar_dir().join(format!("{name}.wprof.pb")))
+        Ok(crate::test_support::sidecar_dir()
+            .join(format!("{name}-{:016x}.wprof.pb", self.variant_hash)))
     }
 
     #[cfg(feature = "wprof")]
@@ -761,7 +774,8 @@ impl Ctx<'_> {
                  the manually-constructed-Ctx workaround."
             )
         })?;
-        Ok(crate::test_support::sidecar_dir().join(format!("{name}.repro.wprof.pb")))
+        Ok(crate::test_support::sidecar_dir()
+            .join(format!("{name}-{:016x}.repro.wprof.pb", self.variant_hash)))
     }
 }
 
@@ -810,6 +824,7 @@ pub struct CtxBuilder<'a> {
     wait_for_map_write: bool,
     current_step: Arc<AtomicU16>,
     entry_name: Option<&'static str>,
+    variant_hash: u64,
 }
 
 impl<'a> CtxBuilder<'a> {
@@ -908,6 +923,16 @@ impl<'a> CtxBuilder<'a> {
         self
     }
 
+    /// Stamp the run's variant hash (see `variant_hash_from_parts`) so the
+    /// body-side `failure_dump_path` / `wprof_pb_path` derivations embed
+    /// it as the `-{16-hex}` filename suffix. Set at the macro dispatch
+    /// site alongside [`Self::entry_name`]; ad-hoc fixtures leave it `0`.
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn variant_hash(mut self, hash: u64) -> Self {
+        self.variant_hash = hash;
+        self
+    }
+
     /// Materialise the configured [`Ctx`].
     #[must_use = "dropping a Ctx without running the scenario discards the test setup"]
     pub fn build(self) -> Ctx<'a> {
@@ -923,6 +948,7 @@ impl<'a> CtxBuilder<'a> {
             wait_for_map_write: self.wait_for_map_write,
             current_step: self.current_step,
             entry_name: self.entry_name,
+            variant_hash: self.variant_hash,
         }
     }
 }
@@ -948,6 +974,7 @@ impl<'a> Ctx<'a> {
             wait_for_map_write: false,
             current_step: Arc::new(AtomicU16::new(0)),
             entry_name: None,
+            variant_hash: 0,
         }
     }
 

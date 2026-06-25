@@ -594,6 +594,20 @@ mod snapshot_tagged_path_tests {
         assert_eq!(out, PathBuf::from("/tmp/run/coord.snapshot.mid_run.json"));
     }
 
+    /// Variant-keyed dump base ({test}-{16-hex}.failure-dump.json): the
+    /// `.failure-dump` suffix strip is prefix-agnostic, so the variant
+    /// hash flows through to the snapshot tagged path verbatim — no code
+    /// change was needed for variant-keyed dumps, only this pin.
+    #[test]
+    fn strips_failure_dump_suffix_preserving_variant_hash() {
+        let base = Path::new("/tmp/run/scx_t-000000000000000a.failure-dump.json");
+        let out = snapshot_tagged_path(base, "mid_run");
+        assert_eq!(
+            out,
+            PathBuf::from("/tmp/run/scx_t-000000000000000a.snapshot.mid_run.json")
+        );
+    }
+
     /// Tag with a path-traversal character (`/`) is sanitised to
     /// `_`. A hostile guest publishing a tag like `../etc/passwd`
     /// must NOT escape the directory the base path lives in.

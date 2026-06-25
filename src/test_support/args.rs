@@ -99,6 +99,27 @@ pub(crate) fn current_work_type() -> String {
     extract_work_type_arg(&args).unwrap_or_else(|| "SpinWait".to_string())
 }
 
+/// Extract `--ktstr-variant-hash=<16-hex>` from the argument list as a
+/// `u64`. The host (`run_ktstr_test_inner_impl`) computes the run's
+/// authoritative variant hash from the resolved config and injects it
+/// into the guest's argv so the in-VM scenario [`Ctx`]'s
+/// `failure_dump_path` / `wprof_pb_path` derive the SAME variant-keyed
+/// paths the host writes — the guest cannot recompute the hash (its
+/// argv lacks `--ktstr-work-type` and its topology is sysfs-observed).
+/// `None` when absent (a manually-invoked guest) or unparseable; the
+/// consumer falls back to `0`, and the `Ctx` path methods bail on
+/// `entry_name == None` before a `0` hash could mislead.
+///
+/// [`Ctx`]: crate::scenario::Ctx
+pub(crate) fn extract_variant_hash_arg(args: &[String]) -> Option<u64> {
+    for a in args {
+        if let Some(val) = a.strip_prefix("--ktstr-variant-hash=") {
+            return u64::from_str_radix(val, 16).ok();
+        }
+    }
+    None
+}
+
 /// Extract `--ktstr-export-test=NAME` from the argument list. Used by
 /// the test binary's ctor to detect a `cargo ktstr export` self-export
 /// dispatch (the binary embeds itself rather than letting cargo-ktstr

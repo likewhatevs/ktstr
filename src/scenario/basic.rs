@@ -105,6 +105,7 @@ mod tests {
             wait_for_map_write: false,
             current_step: std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0)),
             entry_name: None,
+            variant_hash: 0,
         }
     }
 

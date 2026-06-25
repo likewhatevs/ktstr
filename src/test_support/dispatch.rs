@@ -2356,6 +2356,14 @@ fn run_host_only_test_inner(entry: &KtstrTestEntry) -> Result<AssertResult> {
         .settle(std::time::Duration::ZERO)
         .assert(merged_assert)
         .entry_name(entry.name)
+        // host_only is host-side with no VM: the resolved topology is
+        // the declared entry.topology (resolve_vm_topology(entry, None)),
+        // so compute the variant hash directly rather than threading.
+        .variant_hash(super::sidecar::variant_hash_from_parts(
+            entry,
+            &entry.topology,
+            &super::args::current_work_type(),
+        ))
         .build();
     (entry.func)(&ctx)
 }

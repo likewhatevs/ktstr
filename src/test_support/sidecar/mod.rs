@@ -1370,7 +1370,27 @@ enum RunArtifactKind {
     ReproWprof,
 }
 
-/// Parse a run-directory filename into `(test_name, kind)`.
+/// Split a `{test}-{16-hex variant hash}` stem into `(test, hash)`.
+///
+/// Test function names are Rust identifiers (never contain `-`), so the
+/// LAST `-` is the variant-hash separator. Falls back to `(stem, 0)`
+/// when the trailing token is not a valid 16-hex hash — so a NON-variant
+/// dump (a stale pre-variant-keying file, or a future writer that omits
+/// the hash) still classifies by its full prefix instead of vanishing
+/// (the "no silent drops" rule). The mtime gate already excludes stale
+/// prior-run files; the fallback removes the silent-drop risk entirely.
+fn split_variant_stem(stem: &str) -> (&str, u64) {
+    if let Some((test, hash)) = stem.rsplit_once('-')
+        && hash.len() == 16
+        && let Ok(h) = u64::from_str_radix(hash, 16)
+    {
+        (test, h)
+    } else {
+        (stem, 0)
+    }
+}
+
+/// Parse a run-directory filename into `(test_name, variant_hash, kind)`.
 ///
 /// Returns `None` for filenames that are not a recognized per-test
 /// artifact — `.ktstr.json.tmp.<pid>.<run_id>` atomic-write staging
@@ -1378,34 +1398,48 @@ enum RunArtifactKind {
 /// lacks the `-{16-hex variant hash}` suffix [`write_sidecar`]
 /// always appends.
 ///
+/// The `variant_hash` lets the footer correlate each artifact with the
+/// SAME-variant sidecar (a gauntlet test's per-preset dumps + sidecars
+/// carry distinct hashes): a failure dump whose variant has no parsed
+/// sidecar is a per-variant pre-sidecar failure even when a sibling
+/// preset passed. failure-dump / wprof names fall back to `(stem, 0)`
+/// when un-hashed (see [`split_variant_stem`]); a `.ktstr.json` sidecar
+/// is ALWAYS variant-keyed by [`write_sidecar`], so a non-hashed one is
+/// malformed and is dropped (`None`).
+///
 /// Suffix order is load-bearing: the `.repro.` shapes are checked
 /// BEFORE their bare counterparts so `{test}.repro.failure-dump.json`
 /// classifies as [`RunArtifactKind::ReproFailureDump`] with
 /// `test_name = {test}` rather than the bare-`.failure-dump.json`
 /// branch stripping less and yielding `{test}.repro`.
-fn classify_run_artifact(name: &str) -> Option<(&str, RunArtifactKind)> {
-    if let Some(t) = name.strip_suffix(".repro.failure-dump.json") {
-        return Some((t, RunArtifactKind::ReproFailureDump));
+fn classify_run_artifact(name: &str) -> Option<(&str, u64, RunArtifactKind)> {
+    if let Some(stem) = name.strip_suffix(".repro.failure-dump.json") {
+        let (test, hash) = split_variant_stem(stem);
+        return Some((test, hash, RunArtifactKind::ReproFailureDump));
     }
-    if let Some(t) = name.strip_suffix(".failure-dump.json") {
-        return Some((t, RunArtifactKind::FailureDump));
+    if let Some(stem) = name.strip_suffix(".failure-dump.json") {
+        let (test, hash) = split_variant_stem(stem);
+        return Some((test, hash, RunArtifactKind::FailureDump));
     }
-    if let Some(t) = name.strip_suffix(".repro.wprof.pb") {
-        return Some((t, RunArtifactKind::ReproWprof));
+    if let Some(stem) = name.strip_suffix(".repro.wprof.pb") {
+        let (test, hash) = split_variant_stem(stem);
+        return Some((test, hash, RunArtifactKind::ReproWprof));
     }
-    if let Some(t) = name.strip_suffix(".wprof.pb") {
-        return Some((t, RunArtifactKind::Wprof));
+    if let Some(stem) = name.strip_suffix(".wprof.pb") {
+        let (test, hash) = split_variant_stem(stem);
+        return Some((test, hash, RunArtifactKind::Wprof));
     }
     if let Some(stem) = name.strip_suffix(".ktstr.json") {
-        // `{test}-{variant_hash}` — the hash is 16 lowercase hex
-        // ({:016x} in serialize_and_write_sidecar). Test function
-        // names never contain `-` (Rust identifiers), so the last
-        // `-` is the hash separator. Validating the hash shape
-        // rejects a hand-named `foo.ktstr.json` that lacks the
-        // suffix.
+        // A sidecar is ALWAYS `{test}-{16-hex}` ({:016x} in
+        // serialize_and_write_sidecar). A stem without a valid hash
+        // suffix is a hand-named / malformed file — drop it (unlike the
+        // dump arms, there's no un-hashed-sidecar writer to be lenient
+        // for).
         let (test, hash) = stem.rsplit_once('-')?;
-        if hash.len() == 16 && hash.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return Some((test, RunArtifactKind::StatsSidecar));
+        if hash.len() == 16
+            && let Ok(h) = u64::from_str_radix(hash, 16)
+        {
+            return Some((test, h, RunArtifactKind::StatsSidecar));
         }
     }
     None
@@ -1430,7 +1464,7 @@ fn summarize_one_run_dir(
     dir: &std::path::Path,
     since: std::time::SystemTime,
 ) -> Option<RunDirSummary> {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     #[derive(Default)]
     struct Acc {
         // Shared per test name (the writer names these `{test}.…`,
@@ -1450,13 +1484,17 @@ fn summarize_one_run_dir(
         // verdict, so a passing expect_err / expect_auto_repro test
         // reads `false` here even though its scenario failed.
         any_fail: bool,
-        // True once ANY variant's stats sidecar parsed. A failure dump
-        // with NO parsed sidecar is a pre-sidecar failure (scheduler
-        // load / VM boot) that still flags FAILED; a dump alongside a
-        // parsed non-failing sidecar is an expected-failure run whose
-        // dump must NOT flag — the sidecar's final verdict already
-        // classified it.
-        any_sidecar_parsed: bool,
+        // Variant hashes whose stats sidecar PARSED, and variant hashes
+        // that left a failure dump. The gate is PER-VARIANT: a dump whose
+        // variant has no parsed sidecar is a pre-sidecar failure
+        // (scheduler load / VM boot crash) for THAT preset and flags
+        // FAILED even when a sibling preset's sidecar parsed; a dump whose
+        // variant DID parse a (final, non-failing) sidecar is an
+        // expected-failure run whose dump must NOT flag — the sidecar's
+        // finalized verdict already classified it. (A gauntlet test's
+        // per-preset dumps + sidecars carry distinct variant hashes.)
+        parsed_sidecar_hashes: BTreeSet<u64>,
+        dump_hashes: BTreeSet<u64>,
         // (scheduler, topology) of the FIRST failing variant seen,
         // for the FAILED block header; `None` when no variant sidecar
         // parsed as a failure (a dump-only pre-sidecar failure).
@@ -1481,13 +1519,19 @@ fn summarize_one_run_dir(
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
-        let Some((test, kind)) = classify_run_artifact(name) else {
+        let Some((test, variant_hash, kind)) = classify_run_artifact(name) else {
             continue;
         };
         let acc = by_test.entry(test.to_string()).or_default();
         match kind {
-            RunArtifactKind::FailureDump => acc.failure_dump = Some(path),
-            RunArtifactKind::ReproFailureDump => acc.repro_failure_dump = Some(path),
+            RunArtifactKind::FailureDump => {
+                acc.dump_hashes.insert(variant_hash);
+                acc.failure_dump = Some(path);
+            }
+            RunArtifactKind::ReproFailureDump => {
+                acc.dump_hashes.insert(variant_hash);
+                acc.repro_failure_dump = Some(path);
+            }
             RunArtifactKind::Wprof => {
                 wprof_traces += 1;
                 acc.wprof = Some(path);
@@ -1503,7 +1547,7 @@ fn summarize_one_run_dir(
                     .and_then(|s| serde_json::from_str::<SidecarResult>(&s).ok())
                 {
                     Some(sc) => {
-                        acc.any_sidecar_parsed = true;
+                        acc.parsed_sidecar_hashes.insert(variant_hash);
                         if sc.is_fail() {
                             acc.any_fail = true;
                             if acc.fail_variant.is_none() {
@@ -1543,8 +1587,13 @@ fn summarize_one_run_dir(
         // must NOT flag: the sidecar's finalized verdict is authoritative.
         // The `is_fail` aggregate covers in-VM assertion failures,
         // including one failing gauntlet variant among passing siblings.
-        let has_dump = acc.failure_dump.is_some() || acc.repro_failure_dump.is_some();
-        let dump_only_failure = has_dump && !acc.any_sidecar_parsed;
+        // Per-variant dump gate: a failure dump whose variant has NO
+        // parsed sidecar is a pre-sidecar failure for that preset and
+        // flags — even when a SIBLING preset's sidecar parsed. (If every
+        // dump-variant has a parsed sidecar, dump_hashes ⊆ parsed and the
+        // sidecars' finalized verdicts are authoritative.) Closes the
+        // mixed-gauntlet masking the old test-name-granularity gate had.
+        let dump_only_failure = !acc.dump_hashes.is_subset(&acc.parsed_sidecar_hashes);
         if !acc.any_fail && !dump_only_failure {
             continue;
         }
@@ -2484,18 +2533,32 @@ fn kernel_commit_for_sidecar() -> Option<String> {
 /// mutating host state during a run own the ordering themselves
 /// (e.g. by writing to a different `KTSTR_SIDECAR_DIR` per host
 /// snapshot).
-pub(crate) fn sidecar_variant_hash(sidecar: &SidecarResult) -> u64 {
+/// The single canonical-JSON + siphash site for the variant hash.
+///
+/// [`sidecar_variant_hash`] (from a written [`SidecarResult`]) and
+/// [`variant_hash_from_parts`] (from a test entry + resolved topology +
+/// work_type, before any sidecar exists) both route through this so the
+/// two derivations can never drift. `sysctls`/`kargs` are sorted here
+/// for order-independence.
+fn variant_hash_of(
+    topology: &str,
+    scheduler: &str,
+    payload: Option<&str>,
+    work_type: &str,
+    sysctls: &[String],
+    kargs: &[String],
+) -> u64 {
     use siphasher::sip::SipHasher13;
     use std::hash::Hasher;
-    let mut sorted_sysctls = sidecar.sysctls.clone();
+    let mut sorted_sysctls = sysctls.to_vec();
     sorted_sysctls.sort();
-    let mut sorted_kargs = sidecar.kargs.clone();
+    let mut sorted_kargs = kargs.to_vec();
     sorted_kargs.sort();
     let canonical = serde_json::json!({
-        "topology": sidecar.topology,
-        "scheduler": sidecar.scheduler,
-        "payload": sidecar.payload,
-        "work_type": sidecar.work_type,
+        "topology": topology,
+        "scheduler": scheduler,
+        "payload": payload,
+        "work_type": work_type,
         "sysctls": sorted_sysctls,
         "kargs": sorted_kargs,
     });
@@ -2503,6 +2566,41 @@ pub(crate) fn sidecar_variant_hash(sidecar: &SidecarResult) -> u64 {
     let mut h = SipHasher13::new_with_keys(0, 0);
     h.write(&bytes);
     h.finish()
+}
+
+pub(crate) fn sidecar_variant_hash(sidecar: &SidecarResult) -> u64 {
+    variant_hash_of(
+        &sidecar.topology,
+        &sidecar.scheduler,
+        sidecar.payload.as_deref(),
+        &sidecar.work_type,
+        &sidecar.sysctls,
+        &sidecar.kargs,
+    )
+}
+
+/// The variant hash for a test entry's run at a given resolved topology
+/// and `work_type`, computed BEFORE any sidecar exists — the
+/// failure-dump path (and the Ctx/VmResult `variant_hash` stamp) need
+/// the identity at VM-build time. Mirrors [`write_sidecar`]'s field
+/// derivation (topology = the resolved topology, scheduler/sysctls/kargs
+/// = [`scheduler_fingerprint`], payload = `entry.payload`) so the dump
+/// filename carries the SAME variant hash the sidecar will. Pinned
+/// equal to [`sidecar_variant_hash`] by a roundtrip test.
+pub(crate) fn variant_hash_from_parts(
+    entry: &KtstrTestEntry,
+    resolved_topology: &crate::vmm::topology::Topology,
+    work_type: &str,
+) -> u64 {
+    let fp = scheduler_fingerprint(entry);
+    variant_hash_of(
+        &resolved_topology.to_string(),
+        &fp.scheduler,
+        entry.payload.map(|p| p.name),
+        work_type,
+        &fp.sysctls,
+        &fp.kargs,
+    )
 }
 
 /// Entry-derived scheduler metadata that every sidecar carries
@@ -2851,10 +2949,13 @@ pub(crate) fn finalize_sidecar_verdict(
 /// footer consistent with nextest's pass. Best-effort: a missing dump
 /// (the normal clean-pass case) is fine. A genuine pre-sidecar failure
 /// (final = Fail) does NOT call this, so its dump still flags.
-pub(crate) fn suppress_failure_dumps(test_name: &str) {
+pub(crate) fn suppress_failure_dumps(test_name: &str, variant_hash: u64) {
     let dir = sidecar_dir();
+    // Remove THIS variant's dumps by the precise `{test}-{hash}` key, not
+    // a `{test}-*` glob: a glob would also delete a SIBLING gauntlet
+    // preset's legitimately-failing dump in the same run dir.
     for suffix in [".failure-dump.json", ".repro.failure-dump.json"] {
-        let _ = std::fs::remove_file(dir.join(format!("{test_name}{suffix}")));
+        let _ = std::fs::remove_file(dir.join(format!("{test_name}-{variant_hash:016x}{suffix}")));
     }
 }
 

@@ -757,6 +757,7 @@ fn eval_monitor_fail_has_fingerprint() {
         periodic_target: 0,
         kern_kaslr_offset: 0,
         entry_name: None,
+        variant_hash: 0,
         periodic_series_cache: std::sync::OnceLock::new(),
     };
     let assertions = crate::assert::Assert::NO_OVERRIDES
@@ -1121,6 +1122,7 @@ fn eval_sched_exit_includes_monitor() {
         periodic_target: 0,
         kern_kaslr_offset: 0,
         entry_name: None,
+        variant_hash: 0,
         periodic_series_cache: std::sync::OnceLock::new(),
     };
     let assertions = crate::assert::Assert::NO_OVERRIDES;
@@ -1226,6 +1228,7 @@ fn eval_monitor_fail_includes_sched_log() {
         periodic_target: 0,
         kern_kaslr_offset: 0,
         entry_name: None,
+        variant_hash: 0,
         periodic_series_cache: std::sync::OnceLock::new(),
     };
     let assertions = crate::assert::Assert::NO_OVERRIDES
@@ -2449,6 +2452,7 @@ fn eval_monitor_inconclusive_folds_into_verdict() {
         periodic_target: 0,
         kern_kaslr_offset: 0,
         entry_name: None,
+        variant_hash: 0,
         periodic_series_cache: std::sync::OnceLock::new(),
     };
     let assertions = crate::assert::Assert::NO_OVERRIDES

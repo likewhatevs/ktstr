@@ -304,6 +304,7 @@ pub(crate) fn make_vm_result(
         periodic_target: 0,
         kern_kaslr_offset: 0,
         entry_name: None,
+        variant_hash: 0,
         periodic_series_cache: std::sync::OnceLock::new(),
     }
 }

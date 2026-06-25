@@ -263,6 +263,23 @@ pub(crate) fn run_ktstr_test_inner(
         entry.allow_inconclusive,
     )
     .sidecar_bits();
+    // This run's variant hash — same (entry, resolved topology,
+    // work_type) the impl keyed the dump filename with — so suppression
+    // targets THIS variant's dumps, never a sibling preset's.
+    //
+    // LOCKSTEP: this is the SECOND host site computing the variant hash;
+    // the first is `run_ktstr_test_inner_impl` (the dump-filename + the
+    // --ktstr-variant-hash thread + the VmResult stamp). Both derive it
+    // from variant_hash_from_parts(entry, resolve_vm_topology(entry,
+    // topo).0, current_work_type()) — all pure of the same inputs, so the
+    // two agree. A change to either site's topology/work_type resolution
+    // MUST change the other, or suppression would target a different file
+    // than the dump writer wrote.
+    let variant_hash = super::sidecar::variant_hash_from_parts(
+        entry,
+        &super::runtime::resolve_vm_topology(entry, topo).0,
+        &super::args::current_work_type(),
+    );
     match crate::test_support::sidecar::take_last_sidecar_path() {
         // A sidecar was written (the guest produced a parseable result):
         // overwrite its raw verdict with the final one and set
@@ -284,7 +301,7 @@ pub(crate) fn run_ktstr_test_inner(
         // nextest's pass. A genuine pre-sidecar failure (final = Fail)
         // keeps its dump and is still flagged.
         None if passed || skipped => {
-            crate::test_support::sidecar::suppress_failure_dumps(entry.name)
+            crate::test_support::sidecar::suppress_failure_dumps(entry.name, variant_hash)
         }
         None => {}
     }
@@ -563,7 +580,7 @@ fn run_ktstr_test_inner_impl(
     })?;
     let ktstr_bin = crate::resolve_current_exe()?;
 
-    let guest_args = vec![
+    let mut guest_args = vec![
         "run".to_string(),
         "--ktstr-test-fn".to_string(),
         entry.name.to_string(),
@@ -572,6 +589,23 @@ fn run_ktstr_test_inner_impl(
     let cmdline_extra = super::runtime::build_cmdline_extra(entry);
 
     let (vm_topology, memory_mib) = super::runtime::resolve_vm_topology(entry, topo);
+
+    // The run's variant hash, from the SAME six fields the sidecar
+    // hashes (resolved topology + scheduler/payload/work_type/sysctls/
+    // kargs). Computed once here and used for BOTH the failure-dump
+    // filename (so a gauntlet test's per-preset dumps don't clobber and
+    // each dump matches its sidecar's variant hash) AND the VmResult
+    // stamp below (for the post-VM `failure_dump_path` mirror). work_type
+    // is resolved identically to the write_sidecar path.
+    let work_type = super::args::current_work_type();
+    let variant_hash = super::sidecar::variant_hash_from_parts(entry, &vm_topology, &work_type);
+    // Thread the HOST's authoritative variant hash to the guest so the
+    // in-VM scenario Ctx's `failure_dump_path` / `wprof_pb_path` mirror
+    // the host's variant-keyed artifact paths exactly. The guest cannot
+    // recompute it: its argv lacks --ktstr-work-type and its topology is
+    // sysfs-observed (TestTopology), which need not render byte-identical
+    // to the host's resolved topology. One authoritative value, threaded.
+    guest_args.push(format!("--ktstr-variant-hash={variant_hash:016x}"));
 
     let no_perf_mode = super::runtime::no_perf_mode_for_entry(entry);
 
@@ -590,10 +624,14 @@ fn run_ktstr_test_inner_impl(
     // coord's own write would overwrite a stale file in
     // practice; the warn flags permission / fs anomalies for the
     // operator).
-    let primary_dump_path =
-        super::sidecar::sidecar_dir().join(format!("{}.failure-dump.json", entry.name));
-    let repro_dump_path =
-        super::sidecar::sidecar_dir().join(format!("{}.repro.failure-dump.json", entry.name));
+    let primary_dump_path = super::sidecar::sidecar_dir().join(format!(
+        "{}-{variant_hash:016x}.failure-dump.json",
+        entry.name
+    ));
+    let repro_dump_path = super::sidecar::sidecar_dir().join(format!(
+        "{}-{variant_hash:016x}.repro.failure-dump.json",
+        entry.name
+    ));
     for stale in [&primary_dump_path, &repro_dump_path] {
         match std::fs::remove_file(stale) {
             Ok(()) => {}
@@ -1058,6 +1096,12 @@ fn run_ktstr_test_inner_impl(
     // loud when the derivation methods are called without a stamped
     // name.
     result.entry_name = Some(entry.name);
+    // Stamp the run's variant hash alongside entry_name (freeze_coord
+    // builds the VmResult entry-agnostic with variant_hash = 0). The
+    // post-VM `failure_dump_path` / `wprof_pb_path` mirrors embed it so
+    // they resolve to the SAME variant-keyed paths the inline writer +
+    // wprof writer use.
+    result.variant_hash = variant_hash;
     // When the primary VM failed but the freeze coordinator never
     // wrote the real failure-dump (i.e. pre-attach failures:
     // send_sys_rdy timeout, VM boot failure, scheduler binary load

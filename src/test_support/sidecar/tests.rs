@@ -2978,27 +2978,39 @@ fn write_sidecar_fixture(
 
 #[test]
 fn classify_run_artifact_recognizes_each_shape() {
+    // Variant-keyed dumps/wprof carry the 16-hex variant hash (0xa here).
     assert!(matches!(
-        classify_run_artifact("t.failure-dump.json"),
-        Some(("t", RunArtifactKind::FailureDump))
+        classify_run_artifact("t-000000000000000a.failure-dump.json"),
+        Some(("t", 0xa, RunArtifactKind::FailureDump))
     ));
     // `.repro.` must win over the bare suffix (else test_name would
     // strip to "t.repro").
     assert!(matches!(
-        classify_run_artifact("t.repro.failure-dump.json"),
-        Some(("t", RunArtifactKind::ReproFailureDump))
+        classify_run_artifact("t-000000000000000a.repro.failure-dump.json"),
+        Some(("t", 0xa, RunArtifactKind::ReproFailureDump))
     ));
     assert!(matches!(
-        classify_run_artifact("t.wprof.pb"),
-        Some(("t", RunArtifactKind::Wprof))
+        classify_run_artifact("t-000000000000000a.wprof.pb"),
+        Some(("t", 0xa, RunArtifactKind::Wprof))
     ));
     assert!(matches!(
-        classify_run_artifact("t.repro.wprof.pb"),
-        Some(("t", RunArtifactKind::ReproWprof))
+        classify_run_artifact("t-000000000000000a.repro.wprof.pb"),
+        Some(("t", 0xa, RunArtifactKind::ReproWprof))
     ));
     assert!(matches!(
         classify_run_artifact("t-000000000000000a.ktstr.json"),
-        Some(("t", RunArtifactKind::StatsSidecar))
+        Some(("t", 0xa, RunArtifactKind::StatsSidecar))
+    ));
+    // Un-hashed dump (stale pre-variant-keying file, or a non-variant
+    // writer): falls back to the whole prefix + hash 0 rather than
+    // vanishing — no silent drops (the mtime gate excludes stale files).
+    assert!(matches!(
+        classify_run_artifact("t.failure-dump.json"),
+        Some(("t", 0, RunArtifactKind::FailureDump))
+    ));
+    assert!(matches!(
+        classify_run_artifact("t.repro.failure-dump.json"),
+        Some(("t", 0, RunArtifactKind::ReproFailureDump))
     ));
 }
 
@@ -3077,7 +3089,15 @@ fn summarize_dump_with_passing_sidecar_not_flagged() {
     let run = root.path().join("7.1.0-abc1234");
     std::fs::create_dir(&run).unwrap();
     write_sidecar_fixture(&run, "expectfail", true, "scx_mitosis", "1n4l4c1t");
-    std::fs::write(run.join("expectfail.failure-dump.json"), b"{}").unwrap();
+    // The dump carries the SAME variant hash as the sidecar (0xa, the
+    // fixture's hash) — in production a run's dump + sidecar share the
+    // variant identity. The per-variant gate then sees the dump's variant
+    // HAS a parsed (passing) sidecar and does not flag it.
+    std::fs::write(
+        run.join("expectfail-000000000000000a.failure-dump.json"),
+        b"{}",
+    )
+    .unwrap();
     let s = summarize_run_artifacts(root.path(), std::time::UNIX_EPOCH);
     assert_eq!(s.len(), 1);
     assert!(
@@ -3136,15 +3156,45 @@ fn suppress_failure_dumps_removes_only_named_tests_dumps() {
     let _sd = isolated_sidecar_dir();
     let dir = crate::test_support::sidecar::sidecar_dir();
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("crashpass.failure-dump.json"), b"{}").unwrap();
-    std::fs::write(dir.join("crashpass.repro.failure-dump.json"), b"{}").unwrap();
-    std::fs::write(dir.join("other.failure-dump.json"), b"{}").unwrap();
-    suppress_failure_dumps("crashpass");
-    assert!(!dir.join("crashpass.failure-dump.json").exists());
-    assert!(!dir.join("crashpass.repro.failure-dump.json").exists());
+    // Variant A of crashpass (to suppress) + a SIBLING variant B of the
+    // same test + a different test — both siblings must survive
+    // (precise-hash removal, not a {test}-* glob that would nuke a
+    // sibling gauntlet preset's legitimately-failing dump).
+    std::fs::write(
+        dir.join("crashpass-000000000000000a.failure-dump.json"),
+        b"{}",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("crashpass-000000000000000a.repro.failure-dump.json"),
+        b"{}",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("crashpass-000000000000000b.failure-dump.json"),
+        b"{}",
+    )
+    .unwrap();
+    std::fs::write(dir.join("other-000000000000000a.failure-dump.json"), b"{}").unwrap();
+    suppress_failure_dumps("crashpass", 0xa);
     assert!(
-        dir.join("other.failure-dump.json").exists(),
-        "only the named test's dumps are removed",
+        !dir.join("crashpass-000000000000000a.failure-dump.json")
+            .exists()
+    );
+    assert!(
+        !dir.join("crashpass-000000000000000a.repro.failure-dump.json")
+            .exists()
+    );
+    assert!(
+        dir.join("crashpass-000000000000000b.failure-dump.json")
+            .exists(),
+        "a sibling gauntlet preset's dump (different variant hash) must \
+         survive — suppression is precise-hash, not a {{test}}-* glob",
+    );
+    assert!(
+        dir.join("other-000000000000000a.failure-dump.json")
+            .exists(),
+        "only the named test's named-variant dumps are removed",
     );
 }
 
@@ -3202,6 +3252,46 @@ fn summarize_failing_variant_not_masked_by_passing_sibling() {
         Some("2n2l2c2t"),
         "header shows the failing variant"
     );
+}
+
+#[test]
+fn summarize_per_variant_dump_not_masked_by_sibling_sidecar() {
+    // Mixed gauntlet: preset A crashes BEFORE writing a sidecar (leaves
+    // only its variant-keyed failure dump, hash 0xa); preset B passes
+    // (writes a sidecar, hash 0xb). The PER-VARIANT dump gate must surface
+    // A as FAILED even though a SIBLING variant (B) parsed a passing
+    // sidecar — the old test-name-granularity gate
+    // (has_dump && !any_sidecar_parsed) masked A because B's sidecar set
+    // any_sidecar_parsed=true.
+    let root = tempfile::TempDir::new().unwrap();
+    let run = root.path().join("7.1.0-abc1234");
+    std::fs::create_dir(&run).unwrap();
+    let pass = SidecarResult {
+        test_name: "gauntlet_t".to_string(),
+        passed: true,
+        scheduler: "scx_x".to_string(),
+        topology: "1n1l1c1t".to_string(),
+        ..SidecarResult::test_fixture()
+    };
+    std::fs::write(
+        run.join("gauntlet_t-000000000000000b.ktstr.json"),
+        serde_json::to_string(&pass).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        run.join("gauntlet_t-000000000000000a.failure-dump.json"),
+        b"{}",
+    )
+    .unwrap();
+    let s = summarize_run_artifacts(root.path(), std::time::UNIX_EPOCH);
+    assert_eq!(s.len(), 1);
+    assert_eq!(
+        s[0].failed.len(),
+        1,
+        "preset A's pre-sidecar dump (variant 0xa) must surface as FAILED \
+         despite preset B's passing sidecar (variant 0xb)",
+    );
+    assert_eq!(s[0].failed[0].test_name, "gauntlet_t");
 }
 
 #[test]

@@ -25,7 +25,8 @@ use std::time::{Duration, Instant};
 use crate::assert::AssertResult;
 
 use super::args::{
-    extract_probe_stack_arg, extract_test_fn_arg, extract_work_type_arg, resolve_cgroup_root,
+    extract_probe_stack_arg, extract_test_fn_arg, extract_variant_hash_arg, extract_work_type_arg,
+    resolve_cgroup_root,
 };
 use super::entry::find_test;
 use super::output::{extract_sched_ext_dump, print_assert_result};
@@ -591,8 +592,19 @@ fn build_repro_vm_builder(
     // auto-repro path: `build_vm_builder_base` deliberately does
     // not attach a path, so the primary dump is never touched
     // during auto-repro.
-    let repro_dump_path =
-        super::sidecar::sidecar_dir().join(format!("{}.repro.failure-dump.json", entry.name));
+    // Same authoritative variant hash the primary uses (same entry +
+    // resolved topology + work_type), so the repro dump is variant-keyed
+    // to match its sidecar and a gauntlet preset's repro dump doesn't
+    // clobber a sibling's.
+    let variant_hash = super::sidecar::variant_hash_from_parts(
+        entry,
+        &vm_topology,
+        &super::args::current_work_type(),
+    );
+    let repro_dump_path = super::sidecar::sidecar_dir().join(format!(
+        "{}-{variant_hash:016x}.repro.failure-dump.json",
+        entry.name
+    ));
     builder = builder.failure_dump_path(&repro_dump_path);
 
     // Repro VM gets the dual-snapshot freeze coordinator. The
@@ -1654,6 +1666,12 @@ pub(crate) fn maybe_dispatch_vm_test_with_args(args: &[String]) -> Option<i32> {
         .assert(merged_assert)
         .wait_for_map_write(!entry.bpf_map_write.is_empty())
         .entry_name(entry.name)
+        // Host-threaded authoritative variant hash (see
+        // extract_variant_hash_arg); `0` only if the guest was invoked
+        // without it, in which case the entry_name=Some bail does not
+        // fire but the path simply carries the 0 suffix — production
+        // always injects it (run_ktstr_test_inner_impl).
+        .variant_hash(extract_variant_hash_arg(args).unwrap_or(0))
         .build();
 
     // Send SCENARIO_START so the host-side watchdog resets its hard
@@ -2166,6 +2184,12 @@ pub(crate) fn maybe_dispatch_vm_test_with_phase_a(
         .assert(merged_assert)
         .wait_for_map_write(!entry.bpf_map_write.is_empty())
         .entry_name(entry.name)
+        // Host-threaded authoritative variant hash (see
+        // extract_variant_hash_arg); `0` only if the guest was invoked
+        // without it, in which case the entry_name=Some bail does not
+        // fire but the path simply carries the 0 suffix — production
+        // always injects it (run_ktstr_test_inner_impl).
+        .variant_hash(extract_variant_hash_arg(args).unwrap_or(0))
         .build();
 
     // Build the ProbeHandle up front from the destructured Phase A

@@ -8,7 +8,9 @@
 //!
 //! The freeze coordinator writes the JSON-pretty `FailureDumpReport`
 //! to a per-test path inside the run's sidecar directory
-//! (`{sidecar_dir()}/{test_name}.failure-dump.json`). The test
+//! (`{sidecar_dir()}/{test_name}-{variant_hash:016x}.failure-dump.json`,
+//! variant-keyed so a gauntlet test's per-preset dumps don't clobber;
+//! read back via `result.failure_dump_path()`). The test
 //! framework's primary dispatch
 //! (`test_support::eval::run_ktstr_test_inner`) attaches that
 //! path on every VM builder it constructs — no env var required,

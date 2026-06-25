@@ -454,6 +454,14 @@ pub struct VmResult {
     /// hardcoded literal silently, where the method-form derives
     /// from this field automatically.
     pub entry_name: Option<&'static str>,
+    /// The run's variant hash (see `variant_hash_from_parts`),
+    /// stamped alongside [`Self::entry_name`] after `vm.run()` returns.
+    /// The post-VM `failure_dump_path` / `wprof_pb_path` derivations
+    /// embed it as the `-{16-hex}` filename suffix so a gauntlet test's
+    /// per-preset dumps don't clobber and each matches its sidecar's
+    /// variant hash. `0` on a synthesized/fixture result (which has
+    /// `entry_name = None` and thus bails before reading this).
+    pub variant_hash: u64,
     /// Memoized single drain of [`Self::snapshot_bridge`].
     ///
     /// The snapshot bridge yields each capture exactly once, but two
@@ -890,6 +898,7 @@ impl VmResult {
             periodic_target: 0,
             kern_kaslr_offset: 0,
             entry_name: None,
+            variant_hash: 0,
             periodic_series_cache: std::sync::OnceLock::new(),
         }
     }
@@ -910,7 +919,8 @@ impl VmResult {
                  before calling .wprof_pb_path()."
             )
         })?;
-        Ok(crate::test_support::sidecar_dir().join(format!("{name}.wprof.pb")))
+        Ok(crate::test_support::sidecar_dir()
+            .join(format!("{name}-{:016x}.wprof.pb", self.variant_hash)))
     }
 
     /// Per-test sidecar path for the `.repro.wprof.pb` artifact.
@@ -928,7 +938,8 @@ impl VmResult {
                  manually before calling."
             )
         })?;
-        Ok(crate::test_support::sidecar_dir().join(format!("{name}.repro.wprof.pb")))
+        Ok(crate::test_support::sidecar_dir()
+            .join(format!("{name}-{:016x}.repro.wprof.pb", self.variant_hash)))
     }
 
     /// Per-test failure-dump sidecar path. Derives
@@ -967,7 +978,10 @@ impl VmResult {
                  assign entry_name manually before calling."
             )
         })?;
-        Ok(crate::test_support::sidecar_dir().join(format!("{name}.failure-dump.json")))
+        Ok(crate::test_support::sidecar_dir().join(format!(
+            "{name}-{:016x}.failure-dump.json",
+            self.variant_hash
+        )))
     }
 
     /// Concatenated guest `/dev/kmsg` content forwarded via
@@ -1954,18 +1968,20 @@ mod tests {
     fn vm_result_wprof_pb_path_returns_writer_mirror_path() {
         let r = VmResult {
             entry_name: Some("vm_result_wprof_pb_path_returns_writer_mirror_path_fixture"),
+            variant_hash: 0xab,
             ..VmResult::test_fixture()
         };
         let path = r.wprof_pb_path().expect("Some entry_name must Ok");
-        // The path's file_name must exactly match `<entry_name>.wprof.pb`
-        // — the writer in `run_ktstr_test_inner_impl` uses the same `format!("{}.wprof.pb",
-        // entry.name)` pattern. A divergence here would mean the
-        // method derives a different path than the writer wrote to,
-        // surfacing as ENOENT in the post_vm callback.
+        // The path's file_name must exactly match
+        // `<entry_name>-<variant_hash:016x>.wprof.pb` — the writer uses
+        // the same variant-keyed pattern (the wprof writer reads this
+        // very method). A divergence would mean the method derives a
+        // different path than the writer wrote to, surfacing as ENOENT in
+        // the post_vm callback.
         let file_name = path.file_name().and_then(|n| n.to_str()).unwrap();
         assert_eq!(
             file_name,
-            "vm_result_wprof_pb_path_returns_writer_mirror_path_fixture.wprof.pb",
+            "vm_result_wprof_pb_path_returns_writer_mirror_path_fixture-00000000000000ab.wprof.pb",
         );
     }
 
@@ -1986,13 +2002,14 @@ mod tests {
     fn vm_result_repro_wprof_pb_path_returns_writer_mirror_path() {
         let r = VmResult {
             entry_name: Some("vm_result_repro_wprof_pb_path_fixture"),
+            variant_hash: 0xab,
             ..VmResult::test_fixture()
         };
         let path = r.repro_wprof_pb_path().expect("Some entry_name must Ok");
         let file_name = path.file_name().and_then(|n| n.to_str()).unwrap();
         assert_eq!(
             file_name,
-            "vm_result_repro_wprof_pb_path_fixture.repro.wprof.pb"
+            "vm_result_repro_wprof_pb_path_fixture-00000000000000ab.repro.wprof.pb"
         );
     }
 
