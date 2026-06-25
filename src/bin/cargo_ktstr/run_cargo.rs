@@ -370,33 +370,62 @@ fn run_cargo_sub(
     }
 
     tracing::debug!("cargo ktstr: running {label}");
+    // Capture the run-start instant BEFORE the nextest build+run so
+    // the footer's mtime gate (`format_run_artifact_footer`) can
+    // distinguish this run's artifacts from stale ones left in a
+    // reused `{kernel}-{project_commit}` run directory. The build
+    // runs first, so genuine artifacts are written well after this
+    // instant.
+    let run_start = std::time::SystemTime::now();
+    // Stamp a per-invocation SESSION TOKEN so every child test
+    // process's `pre_clear_run_dir_once` spares sidecars written THIS
+    // run by peer processes. nextest is process-per-test and all
+    // tests sharing one {kernel}-{project_commit} dir would otherwise
+    // have a later process's pre-clear delete an earlier peer's fresh
+    // .ktstr.json — silent stats loss across the suite. The value is
+    // opaque (only per-invocation uniqueness matters); `run_start`
+    // nanos serve, and double as the footer's mtime boundary below.
+    if let Ok(d) = run_start.duration_since(std::time::UNIX_EPOCH) {
+        cmd.env(ktstr::KTSTR_RUN_EPOCH_ENV, d.as_nanos().to_string());
+    }
     let status = cmd
         .status()
         .map_err(|e| format!("spawn cargo {}: {e}", sub_argv.join(" ")))?;
     cleanup_shm();
-    // Surface where per-test debugging artefacts live so an operator
-    // investigating a failure does not have to grep through `target/`
-    // to find them. Every test that boots a VM may write any of the
-    // artefacts listed in the eprintln block below. The dir is per
-    // (kernel, project commit) so failures from different runs of
-    // the same test don't stomp each other. Printed on BOTH success
-    // and failure: even passing runs leave per-test stats sidecars
-    // — and wprof-tagged passing runs leave a Perfetto `.pb` trace
-    // — worth inspecting.
-    let sidecar_dir = ktstr::test_support::sidecar_dir();
-    eprintln!();
-    eprintln!("cargo ktstr: test outputs in:");
-    eprintln!("  {}", sidecar_dir.display());
-    eprintln!("    *.failure-dump.json       — VM-state JSON when a test crashed or asserted");
-    eprintln!("    *.repro.failure-dump.json — VM-state JSON from the auto-repro retry");
-    eprintln!("    *.ktstr.json              — per-scenario stats + scheduler metadata");
-    eprintln!("    *.wprof.pb                — Perfetto trace from #[ktstr_test(wprof)] tests");
-    eprintln!("    *.repro.wprof.pb          — Perfetto trace from the auto-repro retry");
-    eprintln!(
-        "  (run `cargo ktstr replay --dir {}` to step through a captured failure)",
-        sidecar_dir.display()
-    );
-    eprintln!();
+    // Surface per-test debugging artefacts: name each test that
+    // FAILED this run and the concrete path to each of its artifacts
+    // (failure dump, auto-repro dump, stats sidecar, wprof trace), so
+    // an operator does not have to guess which `*.failure-dump.json`
+    // in a reused run directory belongs to the test that just failed.
+    // `format_run_artifact_footer` scans every run dir under
+    // `runs_root()` and keeps only files written at/after `run_start`
+    // (mtime gate) — this excludes stale artifacts from a prior run
+    // at the same `{kernel}-{project_commit}` key, and captures the
+    // real output dir(s) for single-kernel AND gauntlet runs without
+    // re-deriving the leaf name from the orchestrator's env (which
+    // carries no `KTSTR_KERNEL`, unlike the child test processes).
+    let runs_root = ktstr::test_support::runs_root();
+    let footer = ktstr::test_support::format_run_artifact_footer(&runs_root, run_start);
+    if !footer.is_empty() {
+        eprint!("{footer}");
+    }
+    if !status.success() {
+        // nextest is the authoritative pass/fail signal. The footer
+        // above lists per-test artifacts for failures that produced
+        // them; a failure that left NO artifact — a build / vm.run
+        // error, a pre-build host error (kvm probe, kernel/scheduler
+        // resolve, validation), a host panic, or an unparseable guest
+        // result — never reaches the dump / sidecar write sites, so it
+        // has no entry above. Defer to the nextest summary for the
+        // authoritative failed-test set rather than implying the
+        // artifact list is exhaustive.
+        eprintln!(
+            "\ncargo ktstr: nextest reported failures (see its summary above); \
+             per-test artifacts for failures that produced them are listed above. \
+             Artifacts under {}.",
+            runs_root.display(),
+        );
+    }
     if status.success() {
         Ok(())
     } else {

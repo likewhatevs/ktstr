@@ -1274,15 +1274,26 @@ fn format_run_dirname_both_unknown_collide() {
 //    fires its own pre-clear.
 //
 // Each test uses a fresh tempdir so the per-process cache never
-// collides across tests; tests do NOT need `lock_env` because
-// they do not touch any environment variable — pre_clear is
-// env-independent.
+// collides across tests. `pre_clear_run_dir_once` reads
+// KTSTR_RUN_EPOCH (the session token — see its sentinel logic), so
+// every test in this group holds `lock_env` and unsets that var via
+// `EnvVarGuard::remove` to pin the no-token wipe path
+// deterministically; the token/sentinel paths are covered by the
+// pre_clear_*_session tests below.
 
 /// `pre_clear_run_dir_once` removes every `*.ktstr.json` file in
 /// the immediate directory on its first call against that dir.
 /// Pins the wipe-on-first-call invariant.
 #[test]
 fn pre_clear_run_dir_once_wipes_existing_sidecars() {
+    // Run in the no-session-token mode so the wipe leaves the dir
+    // empty. A session token (KTSTR_RUN_EPOCH, set by `cargo ktstr
+    // test`) would also write the `.ktstr_run_epoch` sentinel — that
+    // path is covered by the pre_clear_*_session tests below. Unset it
+    // here so this wipe-invariant pin is deterministic regardless of
+    // how the suite is launched.
+    let _lock = lock_env();
+    let _epoch = EnvVarGuard::remove(crate::KTSTR_RUN_EPOCH_ENV);
     let tmp_dir = tempfile::TempDir::new().unwrap();
     let tmp = tmp_dir.path();
     std::fs::write(tmp.join("test_a-0000.ktstr.json"), b"{}").unwrap();
@@ -1314,6 +1325,8 @@ fn pre_clear_run_dir_once_wipes_existing_sidecars() {
 /// invocation's pre-clear.
 #[test]
 fn pre_clear_run_dir_once_skips_subdirs_and_non_sidecars() {
+    let _lock = lock_env();
+    let _epoch = EnvVarGuard::remove(crate::KTSTR_RUN_EPOCH_ENV);
     let tmp_dir = tempfile::TempDir::new().unwrap();
     let tmp = tmp_dir.path();
     // Top-level sidecar: should be wiped.
@@ -1365,6 +1378,8 @@ fn pre_clear_run_dir_once_skips_subdirs_and_non_sidecars() {
 /// from unit tests that probe the missing-dir edge.
 #[test]
 fn pre_clear_run_dir_once_silent_on_missing_dir() {
+    let _lock = lock_env();
+    let _epoch = EnvVarGuard::remove(crate::KTSTR_RUN_EPOCH_ENV);
     let tmp_dir = tempfile::TempDir::new().unwrap();
     let nonexistent = tmp_dir.path().join("does_not_exist_yet");
     assert!(
@@ -1402,6 +1417,8 @@ fn pre_clear_run_dir_once_silent_on_missing_dir() {
 /// `.tmp.…` files surviving the pre-clear call.
 #[test]
 fn pre_clear_run_dir_once_wipes_staging_files() {
+    let _lock = lock_env();
+    let _epoch = EnvVarGuard::remove(crate::KTSTR_RUN_EPOCH_ENV);
     let tmp_dir = tempfile::TempDir::new().unwrap();
     let tmp = tmp_dir.path();
     // Two orphaned staging files in the canonical
@@ -1466,6 +1483,8 @@ fn pre_clear_run_dir_once_wipes_staging_files() {
 /// HashSet has separate entries per dir.
 #[test]
 fn pre_clear_run_dir_once_keys_per_directory() {
+    let _lock = lock_env();
+    let _epoch = EnvVarGuard::remove(crate::KTSTR_RUN_EPOCH_ENV);
     let tmp_a = tempfile::TempDir::new().unwrap();
     let tmp_b = tempfile::TempDir::new().unwrap();
 
@@ -2799,6 +2818,317 @@ fn sidecar_round_trip_preserves_phases() {
     let step1 = &loaded.stats.phases[2];
     assert_eq!(step1.step_index, 2);
     assert_eq!(step1.metrics, s1_metrics);
+}
+
+// -- summarize_run_artifacts / format_run_artifact_footer --
+//
+// The post-run footer attributes every artifact to its test by
+// filename prefix, marks a test FAILED via dump-presence OR an
+// is_fail sidecar, and gates on mtime so a stale artifact left in
+// a reused {kernel}-{project_commit} run dir never surfaces.
+
+/// Set a file's mtime via `utimes(2)` so the mtime-gate test is
+/// deterministic without a wall-clock sleep. Mirrors the helper in
+/// `model/tests_cache.rs`.
+fn set_mtime(path: &std::path::Path, t: std::time::SystemTime) {
+    use std::os::unix::ffi::OsStrExt;
+    let secs = t
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("mtime before UNIX_EPOCH")
+        .as_secs() as i64;
+    let tv = libc::timeval {
+        tv_sec: secs,
+        tv_usec: 0,
+    };
+    let times = [tv, tv];
+    let cstr = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+    let rc = unsafe { libc::utimes(cstr.as_ptr(), times.as_ptr()) };
+    assert_eq!(rc, 0, "utimes must succeed for the test helper");
+}
+
+/// Write a `{test}-{hash}.ktstr.json` sidecar fixture with the given
+/// verdict + scheduler/topology, matching the production filename
+/// shape (`{:016x}` variant hash).
+fn write_sidecar_fixture(
+    dir: &std::path::Path,
+    name: &str,
+    passed: bool,
+    scheduler: &str,
+    topology: &str,
+) {
+    let sc = SidecarResult {
+        test_name: name.to_string(),
+        passed,
+        scheduler: scheduler.to_string(),
+        topology: topology.to_string(),
+        ..SidecarResult::test_fixture()
+    };
+    let path = dir.join(format!("{name}-000000000000000a.ktstr.json"));
+    std::fs::write(&path, serde_json::to_string(&sc).unwrap()).unwrap();
+}
+
+#[test]
+fn classify_run_artifact_recognizes_each_shape() {
+    assert!(matches!(
+        classify_run_artifact("t.failure-dump.json"),
+        Some(("t", RunArtifactKind::FailureDump))
+    ));
+    // `.repro.` must win over the bare suffix (else test_name would
+    // strip to "t.repro").
+    assert!(matches!(
+        classify_run_artifact("t.repro.failure-dump.json"),
+        Some(("t", RunArtifactKind::ReproFailureDump))
+    ));
+    assert!(matches!(
+        classify_run_artifact("t.wprof.pb"),
+        Some(("t", RunArtifactKind::Wprof))
+    ));
+    assert!(matches!(
+        classify_run_artifact("t.repro.wprof.pb"),
+        Some(("t", RunArtifactKind::ReproWprof))
+    ));
+    assert!(matches!(
+        classify_run_artifact("t-000000000000000a.ktstr.json"),
+        Some(("t", RunArtifactKind::StatsSidecar))
+    ));
+}
+
+#[test]
+fn classify_run_artifact_rejects_non_artifacts() {
+    // Atomic-write staging residue (does not end in `.ktstr.json`).
+    assert!(classify_run_artifact("t-000000000000000a.ktstr.json.tmp.42.run").is_none());
+    // `.ktstr.json` without a 16-hex variant-hash suffix.
+    assert!(classify_run_artifact("hand_named.ktstr.json").is_none());
+    assert!(classify_run_artifact("t-zz.ktstr.json").is_none());
+    // Unrelated file.
+    assert!(classify_run_artifact("random.txt").is_none());
+}
+
+#[test]
+fn summarize_detects_dump_only_failure_without_sidecar() {
+    // A scheduler-load failure writes only a placeholder
+    // failure-dump (no sidecar): must still be flagged failed, with
+    // no scheduler/topology and not replayable (replay selects from
+    // is_fail sidecars).
+    let root = tempfile::TempDir::new().unwrap();
+    let run = root.path().join("7.1.0-abc1234");
+    std::fs::create_dir(&run).unwrap();
+    std::fs::write(run.join("load_fail.failure-dump.json"), b"{}").unwrap();
+    let s = summarize_run_artifacts(root.path(), std::time::UNIX_EPOCH);
+    assert_eq!(s.len(), 1);
+    assert_eq!(s[0].failed.len(), 1);
+    let f = &s[0].failed[0];
+    assert_eq!(f.test_name, "load_fail");
+    assert!(f.scheduler.is_none());
+    assert!(f.topology.is_none());
+    assert!(f.failure_dump.is_some());
+    assert!(!f.replayable);
+}
+
+#[test]
+fn summarize_detects_is_fail_sidecar_with_metadata() {
+    let root = tempfile::TempDir::new().unwrap();
+    let run = root.path().join("7.1.0-abc1234");
+    std::fs::create_dir(&run).unwrap();
+    write_sidecar_fixture(&run, "asserted", false, "scx_mitosis", "1n4l4c1t");
+    let s = summarize_run_artifacts(root.path(), std::time::UNIX_EPOCH);
+    assert_eq!(s.len(), 1);
+    assert_eq!(s[0].stats_sidecars, 1);
+    assert_eq!(s[0].failed.len(), 1);
+    let f = &s[0].failed[0];
+    assert_eq!(f.test_name, "asserted");
+    assert_eq!(f.scheduler.as_deref(), Some("scx_mitosis"));
+    assert_eq!(f.topology.as_deref(), Some("1n4l4c1t"));
+    assert_eq!(f.stats_sidecars.len(), 1);
+    assert!(f.replayable);
+}
+
+#[test]
+fn summarize_excludes_passing_tests_and_counts_wprof() {
+    let root = tempfile::TempDir::new().unwrap();
+    let run = root.path().join("7.1.0-abc1234");
+    std::fs::create_dir(&run).unwrap();
+    write_sidecar_fixture(&run, "good", true, "eevdf", "1n1l1c1t");
+    std::fs::write(run.join("good.wprof.pb"), b"x").unwrap();
+    let s = summarize_run_artifacts(root.path(), std::time::UNIX_EPOCH);
+    assert_eq!(s.len(), 1);
+    assert!(s[0].failed.is_empty());
+    assert_eq!(s[0].stats_sidecars, 1);
+    assert_eq!(s[0].wprof_traces, 1);
+}
+
+#[test]
+fn summarize_failing_variant_not_masked_by_passing_sibling() {
+    // A gauntlet test writes one sidecar per topology variant under
+    // the SAME bare name (distinct variant hashes). A passing variant
+    // must NOT mask a failing sibling — the test must still surface as
+    // FAILED. Regression for the by-bare-name overwrite bug.
+    let root = tempfile::TempDir::new().unwrap();
+    let run = root.path().join("7.1.0-abc1234");
+    std::fs::create_dir(&run).unwrap();
+    let pass = SidecarResult {
+        test_name: "gauntlet_t".to_string(),
+        passed: true,
+        scheduler: "scx_x".to_string(),
+        topology: "1n1l1c1t".to_string(),
+        ..SidecarResult::test_fixture()
+    };
+    let fail = SidecarResult {
+        test_name: "gauntlet_t".to_string(),
+        passed: false,
+        scheduler: "scx_x".to_string(),
+        topology: "2n2l2c2t".to_string(),
+        ..SidecarResult::test_fixture()
+    };
+    std::fs::write(
+        run.join("gauntlet_t-000000000000000a.ktstr.json"),
+        serde_json::to_string(&pass).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        run.join("gauntlet_t-000000000000000b.ktstr.json"),
+        serde_json::to_string(&fail).unwrap(),
+    )
+    .unwrap();
+    let s = summarize_run_artifacts(root.path(), std::time::UNIX_EPOCH);
+    assert_eq!(s.len(), 1);
+    assert_eq!(s[0].stats_sidecars, 2);
+    assert_eq!(
+        s[0].failed.len(),
+        1,
+        "the failing variant must surface despite a passing sibling"
+    );
+    let f = &s[0].failed[0];
+    assert_eq!(f.test_name, "gauntlet_t");
+    assert!(f.replayable);
+    assert_eq!(f.stats_sidecars.len(), 2, "both variant sidecars listed");
+    assert_eq!(
+        f.topology.as_deref(),
+        Some("2n2l2c2t"),
+        "header shows the failing variant"
+    );
+}
+
+#[test]
+fn summarize_mtime_gate_excludes_stale_artifacts() {
+    let root = tempfile::TempDir::new().unwrap();
+    let run = root.path().join("7.1.0-abc1234");
+    std::fs::create_dir(&run).unwrap();
+    let stale = run.join("old_fail.failure-dump.json");
+    std::fs::write(&stale, b"{}").unwrap();
+    set_mtime(
+        &stale,
+        std::time::SystemTime::now() - std::time::Duration::from_secs(3600),
+    );
+    // `since` 30 min ago: the 1-hour-old dump is excluded.
+    let since = std::time::SystemTime::now() - std::time::Duration::from_secs(1800);
+    assert!(
+        summarize_run_artifacts(root.path(), since).is_empty(),
+        "stale dump older than `since` must not surface"
+    );
+    // A dump written now IS included.
+    std::fs::write(run.join("new_fail.failure-dump.json"), b"{}").unwrap();
+    let s = summarize_run_artifacts(root.path(), since);
+    assert_eq!(s.len(), 1);
+    assert_eq!(s[0].failed.len(), 1);
+    assert_eq!(s[0].failed[0].test_name, "new_fail");
+}
+
+#[test]
+fn format_footer_names_failed_tests_and_paths() {
+    let root = tempfile::TempDir::new().unwrap();
+    let run = root.path().join("7.1.0-abc1234");
+    std::fs::create_dir(&run).unwrap();
+    std::fs::write(run.join("load_fail.failure-dump.json"), b"{}").unwrap();
+    write_sidecar_fixture(&run, "asserted", false, "scx_mitosis", "1n4l4c1t");
+    let out = format_run_artifact_footer(root.path(), std::time::UNIX_EPOCH);
+    assert!(out.contains("FAILED  load_fail"), "footer: {out}");
+    assert!(out.contains("load_fail.failure-dump.json"), "footer: {out}");
+    assert!(
+        out.contains("FAILED  asserted  [scx_mitosis 1n4l4c1t]"),
+        "footer: {out}"
+    );
+    assert!(
+        out.contains("cargo ktstr replay --filter asserted --exec"),
+        "is_fail sidecar must get a replay hint: {out}"
+    );
+    assert!(
+        !out.contains("replay --filter load_fail"),
+        "dump-only failure must NOT get a replay hint: {out}"
+    );
+}
+
+#[test]
+fn format_footer_empty_without_fresh_artifacts() {
+    let root = tempfile::TempDir::new().unwrap();
+    assert!(format_run_artifact_footer(root.path(), std::time::SystemTime::now()).is_empty());
+}
+
+// -- pre_clear_run_dir_once session sentinel (cross-test loss fix) --
+
+#[test]
+fn pre_clear_skips_when_session_sentinel_matches() {
+    // A peer test process in the same session already cleared the dir
+    // (recorded the token in `.ktstr_run_epoch`). A later peer (this
+    // call) whose KTSTR_RUN_EPOCH matches must SKIP the wipe, sparing
+    // the peer's current-session sidecar — else cross-test silent
+    // stats loss.
+    let _lock = lock_env();
+    let _g = EnvVarGuard::set(crate::KTSTR_RUN_EPOCH_ENV, "session-token-A");
+    let dir = tempfile::TempDir::new().unwrap();
+    let d = dir.path();
+    std::fs::write(d.join(".ktstr_run_epoch"), b"session-token-A").unwrap();
+    let peer = d.join("peer_test-000000000000000a.ktstr.json");
+    std::fs::write(&peer, b"{}").unwrap();
+    pre_clear_run_dir_once(d);
+    assert!(
+        peer.exists(),
+        "peer's current-session sidecar must survive a matching-sentinel skip"
+    );
+}
+
+#[test]
+fn pre_clear_wipes_and_records_on_new_session() {
+    // A differing sentinel (prior session) + a prior sidecar: this
+    // session wipes the prior sidecar and records its own token.
+    let _lock = lock_env();
+    let _g = EnvVarGuard::set(crate::KTSTR_RUN_EPOCH_ENV, "session-token-NEW");
+    let dir = tempfile::TempDir::new().unwrap();
+    let d = dir.path();
+    std::fs::write(d.join(".ktstr_run_epoch"), b"session-token-OLD").unwrap();
+    let prior = d.join("prior_test-000000000000000a.ktstr.json");
+    std::fs::write(&prior, b"{}").unwrap();
+    pre_clear_run_dir_once(d);
+    assert!(
+        !prior.exists(),
+        "prior-session sidecar must be wiped on a new session"
+    );
+    assert_eq!(
+        std::fs::read_to_string(d.join(".ktstr_run_epoch")).unwrap(),
+        "session-token-NEW",
+        "the new session token must be recorded in the sentinel"
+    );
+}
+
+#[test]
+fn pre_clear_without_token_wipes_all_sidecars() {
+    // No KTSTR_RUN_EPOCH (raw `cargo nextest run`): wipe every
+    // sidecar match (status quo) and write no sentinel.
+    let _lock = lock_env();
+    let _g = EnvVarGuard::remove(crate::KTSTR_RUN_EPOCH_ENV);
+    let dir = tempfile::TempDir::new().unwrap();
+    let d = dir.path();
+    let f = d.join("any_test-000000000000000a.ktstr.json");
+    std::fs::write(&f, b"{}").unwrap();
+    pre_clear_run_dir_once(d);
+    assert!(
+        !f.exists(),
+        "without a session token, pre_clear wipes all sidecars"
+    );
+    assert!(
+        !d.join(".ktstr_run_epoch").exists(),
+        "no sentinel is written without a session token"
+    );
 }
 
 mod commits;

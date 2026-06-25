@@ -1059,6 +1059,23 @@ pub const KTSTR_KERNEL_COMMIT_ENV: &str = "KTSTR_KERNEL_COMMIT";
 /// marker discriminates the two cases.
 pub const KTSTR_ORCHESTRATED_ENV: &str = "KTSTR_ORCHESTRATED";
 
+/// Name of the environment variable carrying the `cargo ktstr test`
+/// SESSION EPOCH: nanoseconds since the Unix epoch, stamped ONCE by
+/// the orchestrator (`cargo_ktstr::run_cargo`) before it spawns
+/// nextest, inherited by every per-test child process.
+///
+/// `test_support::sidecar::pre_clear_run_dir_once` uses it as an
+/// opaque per-invocation session token: nextest is process-per-test
+/// and every test sharing one `{kernel}-{project_commit}` run
+/// directory would otherwise have a later process's pre-clear delete
+/// an earlier peer's freshly-written `{test}-{hash}.ktstr.json`
+/// (silent stats loss). The first process to clear a dir records
+/// this token in a `.ktstr_run_epoch` sentinel; a later peer whose
+/// token matches skips its wipe, sparing the peers' sidecars. Unset
+/// under raw `cargo nextest run` (no orchestrator) — pre-clear then
+/// falls back to its per-process wipe-everything behavior.
+pub const KTSTR_RUN_EPOCH_ENV: &str = "KTSTR_RUN_EPOCH";
+
 /// Name of the environment variable that overrides the default
 /// host-mode cgroup parent (where `host_only` tests' workload
 /// cgroups land). Empty / unset falls back to the canonical
