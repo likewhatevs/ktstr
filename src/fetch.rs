@@ -1486,14 +1486,19 @@ fn is_full_sha(git_ref: &str) -> bool {
 /// network, auth, or an unadvertised ref — so the caller falls through
 /// to the clone, which resolves the ref authoritatively.
 ///
-/// A full 40-hex `git_ref` is used directly (no handshake): a clone of
-/// that commit would yield the same short hash. The first-7 rendering
+/// A full 40-hex `git_ref` is taken directly (no handshake): its first-7
 /// matches [`git_clone`]'s post-clone `head_id` byte-for-byte (gix
-/// `Id`/`ObjectId` `Display` both emit the full lowercase hex), so a hit
-/// keys the same cache entry the clone would write — see
-/// [`git_cache_key`]. The ad-hoc bare repo (`gix::init` on a tempdir)
-/// carries no working tree and fetches no pack; `ref_map` only lists the
-/// remote's advertised refs.
+/// `Id`/`ObjectId` `Display` both emit the full lowercase hex), so it
+/// builds the key a sha-clone would write — see [`git_cache_key`].
+/// [`git_clone`] currently REJECTS a raw-sha `git_ref` (a bare commit
+/// cannot be fetched), so for a sha this probe always misses and the
+/// clone then surfaces the actionable error; the branch is kept because
+/// it avoids a handshake on that reject path and is ready for a future
+/// sha-capable clone. It trusts the hex verbatim (no remote validation) —
+/// harmless while sha-clone is rejected, since an unbuildable sha has no
+/// cache entry. The ad-hoc bare repo (`gix::init` on a tempdir) carries
+/// no working tree and fetches no pack; `ref_map` only lists the remote's
+/// advertised refs.
 pub fn ls_remote_short_hash(url: &str, git_ref: &str) -> Option<String> {
     if is_full_sha(git_ref) {
         return Some(git_ref[..7].to_ascii_lowercase());
@@ -1518,6 +1523,20 @@ pub fn git_clone(
     cli_label: &str,
     mp: Option<&crate::cli::FetchProgress>,
 ) -> Result<AcquiredSource> {
+    // A raw 40-hex commit SHA cannot be cloned here: gix's
+    // `prepare_clone(...).with_ref_name(<object-id>)` panics at
+    // `fetch_then_checkout` (gix `clone/access.rs`), and fetching a bare
+    // commit needs server-side allow-sha-in-want support this path does
+    // not implement. Reject with an actionable error (use a branch or
+    // tag) rather than panic. Placed at the single clone entry so every
+    // caller (auto-discovery + `kernel build`) is covered.
+    if is_full_sha(git_ref) {
+        anyhow::bail!(
+            "git+{url}#{git_ref}: cannot fetch a kernel by raw commit SHA — \
+             use a branch or tag name instead (the resolved commit is recorded \
+             in the cache key after a branch/tag clone)"
+        );
+    }
     let cloning = format!("{cli_label}: cloning {url} (ref: {git_ref}, depth: 1)");
     match mp {
         Some(fp) => fp.println(&cloning),

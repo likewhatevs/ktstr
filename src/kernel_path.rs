@@ -95,22 +95,27 @@ pub enum KernelId {
         /// message round-trip the operator's typed form.
         syntax_inclusive: bool,
     },
-    /// Git source: clone `url`, check out `git_ref`. `git_ref` may be
-    /// a branch, tag, or sha, stored verbatim by `KernelId::parse` with
-    /// no remote contact. At cache-resolution time `resolve_git_kernel`
-    /// ls-remote-resolves `git_ref` to its tip's short hash and probes
-    /// the cache before cloning, so a re-run against an unchanged tip
-    /// skips the clone. The cache key embeds `git_ref` verbatim
-    /// alongside that short hash; collapsing identical-sha-different-
-    /// spelling refs to one content-addressed `(URL, resolved_sha)`
-    /// entry remains future work.
+    /// Git source: clone `url`, check out `git_ref` (a branch or tag),
+    /// stored verbatim by `KernelId::parse` with no remote contact. At
+    /// cache-resolution time `resolve_git_kernel` ls-remote-resolves
+    /// `git_ref` to its tip's short hash and probes the cache before
+    /// cloning, so a re-run against an unchanged tip skips the clone. The
+    /// cache key embeds `git_ref` verbatim alongside that short hash;
+    /// collapsing identical-sha-different-spelling refs to one
+    /// content-addressed `(URL, resolved_sha)` entry remains future work.
+    ///
+    /// A raw 40-hex commit SHA is NOT supported and is rejected with an
+    /// actionable error at clone time: fetching a bare commit needs
+    /// server-side allow-sha-in-want support the clone path does not
+    /// implement (a separate future feature). Use a branch or tag.
     Git {
         /// Remote URL (https or git@).
         url: String,
-        /// Branch name, tag, or sha. Stored verbatim by `parse`;
+        /// Branch or tag name. Stored verbatim by `parse`;
         /// ls-remote-resolved to its tip short hash at cache-resolution
         /// time (see `resolve_git_kernel`) so a cached build is reused
-        /// without re-cloning.
+        /// without re-cloning. A raw 40-hex commit SHA is rejected at
+        /// clone time (not supported — see the variant doc).
         git_ref: String,
     },
 }
