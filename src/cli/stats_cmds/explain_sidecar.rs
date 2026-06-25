@@ -1756,6 +1756,9 @@ mod tests {
         let _lock = lock_env();
         let tmp = tempfile::tempdir().unwrap();
         let _env_target = EnvVarGuard::set("CARGO_TARGET_DIR", tmp.path());
+        // Clear the orchestrator's KTSTR_RUNS_ROOT so runs_root() resolves
+        // via CARGO_TARGET_DIR (the default this test pins).
+        let _env_runs_root = EnvVarGuard::remove(crate::KTSTR_RUNS_ROOT_ENV);
         let _env_sidecar = EnvVarGuard::remove(crate::KTSTR_SIDECAR_DIR_ENV);
         let runs_root = tmp.path().join("ktstr");
         let run_dir = runs_root.join("run-default-root");

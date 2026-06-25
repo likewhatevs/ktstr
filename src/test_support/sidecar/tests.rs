@@ -1072,6 +1072,10 @@ fn write_sidecar_defaults_to_target_dir_without_env() {
     let _lock = lock_env();
     let target_dir = tempfile::TempDir::new().unwrap();
     let _env_target = EnvVarGuard::set("CARGO_TARGET_DIR", target_dir.path());
+    // The cargo-ktstr orchestrator stamps KTSTR_RUNS_ROOT (absolute),
+    // which runs_root() prefers over CARGO_TARGET_DIR; clear it so
+    // this test exercises the CARGO_TARGET_DIR default it pins.
+    let _env_runs_root = EnvVarGuard::remove(crate::KTSTR_RUNS_ROOT_ENV);
     let _env_sidecar = EnvVarGuard::remove(crate::KTSTR_SIDECAR_DIR_ENV);
     let _env_kernel = EnvVarGuard::remove(crate::KTSTR_KERNEL_ENV);
 
@@ -1159,6 +1163,9 @@ fn sidecar_dir_empty_override_falls_back_to_default() {
     let _lock = lock_env();
     let target_dir = tempfile::TempDir::new().unwrap();
     let _env_target = EnvVarGuard::set("CARGO_TARGET_DIR", target_dir.path());
+    // Clear the orchestrator's KTSTR_RUNS_ROOT so runs_root() resolves
+    // via CARGO_TARGET_DIR (the default path this test pins).
+    let _env_runs_root = EnvVarGuard::remove(crate::KTSTR_RUNS_ROOT_ENV);
     // EnvVarGuard::set with an empty path covers the
     // defensively-cleared `KTSTR_SIDECAR_DIR=""` operator
     // pattern. EnvVarGuard accepts AsRef<OsStr>, and a
@@ -1640,6 +1647,9 @@ fn newest_run_dir_skips_dotfile_subdirectories() {
     let _lock = lock_env();
     let target_dir = tempfile::TempDir::new().unwrap();
     let _env_target = EnvVarGuard::set("CARGO_TARGET_DIR", target_dir.path());
+    // Clear the orchestrator's KTSTR_RUNS_ROOT so runs_root() resolves
+    // under this tempdir's CARGO_TARGET_DIR rather than the real run dir.
+    let _env_runs_root = EnvVarGuard::remove(crate::KTSTR_RUNS_ROOT_ENV);
     // `runs_root()` returns `{CARGO_TARGET_DIR}/ktstr/`, so
     // create that intermediate before populating run subdirs.
     let runs = target_dir.path().join("ktstr");
@@ -1674,6 +1684,9 @@ fn newest_run_dir_yields_none_when_only_dotfiles_exist() {
     let _lock = lock_env();
     let target_dir = tempfile::TempDir::new().unwrap();
     let _env_target = EnvVarGuard::set("CARGO_TARGET_DIR", target_dir.path());
+    // Clear the orchestrator's KTSTR_RUNS_ROOT so runs_root() resolves
+    // under this tempdir's CARGO_TARGET_DIR rather than the real run dir.
+    let _env_runs_root = EnvVarGuard::remove(crate::KTSTR_RUNS_ROOT_ENV);
     let runs = target_dir.path().join("ktstr");
     std::fs::create_dir(&runs).expect("mkdir runs root");
     std::fs::create_dir(runs.join(".locks")).expect("mkdir .locks");
@@ -2091,6 +2104,10 @@ fn write_sidecar_default_path_two_writes_both_survive() {
     let _lock = lock_env();
     let target_dir = tempfile::TempDir::new().unwrap();
     let _env_target = EnvVarGuard::set("CARGO_TARGET_DIR", target_dir.path());
+    // Clear the orchestrator's KTSTR_RUNS_ROOT so both writes land under
+    // this tempdir (the per-test isolation this case relies on), not the
+    // real run dir the orchestrator stamps.
+    let _env_runs_root = EnvVarGuard::remove(crate::KTSTR_RUNS_ROOT_ENV);
     let _env_sidecar = EnvVarGuard::remove(crate::KTSTR_SIDECAR_DIR_ENV);
     let _env_kernel = EnvVarGuard::remove(crate::KTSTR_KERNEL_ENV);
 
@@ -3062,6 +3079,49 @@ fn format_footer_names_failed_tests_and_paths() {
 fn format_footer_empty_without_fresh_artifacts() {
     let root = tempfile::TempDir::new().unwrap();
     assert!(format_run_artifact_footer(root.path(), std::time::SystemTime::now()).is_empty());
+}
+
+// -- runs_root KTSTR_RUNS_ROOT anchoring (workspace footer fix) --
+
+#[test]
+fn runs_root_honors_absolute_override() {
+    // The cargo-ktstr orchestrator pins KTSTR_RUNS_ROOT (absolute) so
+    // its footer/stats/replay reads AND the child test processes'
+    // sidecar writes resolve the SAME dir regardless of CWD — the fix
+    // for the empty-footer-in-a-workspace bug. The override must win
+    // over the CWD-relative CARGO_TARGET_DIR/"target" default.
+    let _lock = lock_env();
+    let dir = tempfile::TempDir::new().unwrap();
+    let abs = dir.path().join("runs");
+    let _g1 = EnvVarGuard::set(crate::KTSTR_RUNS_ROOT_ENV, abs.as_os_str());
+    let _g2 = EnvVarGuard::set("CARGO_TARGET_DIR", "/some/other/target");
+    assert_eq!(runs_root(), abs);
+    assert!(
+        runs_root().is_absolute(),
+        "the override anchors an absolute, CWD-independent root"
+    );
+}
+
+#[test]
+fn runs_root_falls_back_without_override() {
+    // No KTSTR_RUNS_ROOT (raw `cargo nextest run`): fall back to
+    // {CARGO_TARGET_DIR or "target"}/ktstr.
+    let _lock = lock_env();
+    let _g0 = EnvVarGuard::remove(crate::KTSTR_RUNS_ROOT_ENV);
+    let _g1 = EnvVarGuard::set("CARGO_TARGET_DIR", "/custom/target");
+    assert_eq!(runs_root(), std::path::Path::new("/custom/target/ktstr"));
+    let _g2 = EnvVarGuard::remove("CARGO_TARGET_DIR");
+    assert_eq!(runs_root(), std::path::PathBuf::from("target/ktstr"));
+}
+
+#[test]
+fn runs_root_empty_override_falls_through() {
+    // An empty KTSTR_RUNS_ROOT must NOT alias the runs root to a bare
+    // path — it falls through to the default.
+    let _lock = lock_env();
+    let _g0 = EnvVarGuard::set(crate::KTSTR_RUNS_ROOT_ENV, "");
+    let _g1 = EnvVarGuard::remove("CARGO_TARGET_DIR");
+    assert_eq!(runs_root(), std::path::PathBuf::from("target/ktstr"));
 }
 
 // -- pre_clear_run_dir_once session sentinel (cross-test loss fix) --

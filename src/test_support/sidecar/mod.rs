@@ -1201,9 +1201,26 @@ fn format_run_dirname(kernel: Option<&str>, commit: Option<&str>) -> String {
 
 /// Resolve the parent directory that holds all test-run subdirectories.
 ///
-/// `{CARGO_TARGET_DIR or "target"}/ktstr/`. Used by `cargo ktstr stats`
-/// to enumerate runs without needing to reconstruct a specific run key.
+/// Resolution order:
+/// 1. [`crate::KTSTR_RUNS_ROOT_ENV`] (absolute) — the `cargo ktstr`
+///    orchestrator stamps this once at startup so its footer / `stats`
+///    / `replay` reads AND the child test processes' sidecar writes
+///    resolve the SAME directory regardless of CWD. This is the
+///    primary path under `cargo ktstr`.
+/// 2. `{CARGO_TARGET_DIR}/ktstr` when that env is set non-empty.
+/// 3. `target/ktstr` (CWD-relative) — the raw `cargo nextest run`
+///    fallback. CWD-relative is fragile across a Cargo workspace (the
+///    test binary's CWD is the package dir, which differs from a
+///    workspace-root invocation), which is exactly why the
+///    orchestrator pins the absolute override above; raw nextest has
+///    no footer to mismatch, so the fallback is acceptable there.
+///
+/// Used by `cargo ktstr stats` / `replay` and the post-run footer to
+/// enumerate runs without reconstructing a specific run key.
 pub fn runs_root() -> PathBuf {
+    if let Some(root) = std::env::var_os(crate::KTSTR_RUNS_ROOT_ENV).filter(|v| !v.is_empty()) {
+        return PathBuf::from(root);
+    }
     let target = std::env::var("CARGO_TARGET_DIR")
         .ok()
         .filter(|d| !d.is_empty())

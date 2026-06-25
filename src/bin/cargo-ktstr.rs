@@ -93,6 +93,14 @@ fn main() {
         eprintln!("error: extract embedded blobs: {e}");
         std::process::exit(1);
     }
+    // Pin KTSTR_RUNS_ROOT to the absolute cargo target dir's ktstr
+    // subdir so this orchestrator's footer / stats / replay reads and
+    // the child test processes' sidecar writes resolve the SAME dir
+    // regardless of CWD (CWD-relative runs_root() otherwise splits them
+    // across a Cargo workspace). MUST run here — before tracing init
+    // or anything that spawns a thread — for the same `set_var` safety
+    // reason as `blobs::install_env` above; child processes inherit it.
+    run_cargo::install_runs_root_env();
     // Mirror `ktstr`'s tracing init (src/bin/ktstr.rs main()) so
     // `tracing::warn!` calls inside `cli::` / `test_support::` surface
     // on stderr instead of being silently dropped. Default to `warn`

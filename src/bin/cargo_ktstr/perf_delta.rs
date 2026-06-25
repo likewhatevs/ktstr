@@ -278,6 +278,12 @@ fn dual_run(
     kernel: &str,
     filter: Option<&str>,
 ) -> Result<()> {
+    // runs_root() is absolute under the cargo-ktstr orchestrator
+    // (install_runs_root_env stamps KTSTR_RUNS_ROOT), so this join
+    // yields that shared dir — Path::join discards `repo_root` against
+    // an absolute rhs, and both the baseline worktree child and HEAD
+    // inherit KTSTR_RUNS_ROOT and write there. join() also anchors the
+    // relative raw-nextest fallback to repo_root; correct for both.
     let runs_root_abs = repo_root.join(ktstr::test_support::runs_root());
     let leaf = baseline_sidecar_leaf(&runs_root_abs, baseline_short);
     let wt_dir = worktree_checkout_dir(&std::env::temp_dir(), baseline_short);
@@ -505,6 +511,8 @@ pub(crate) fn run(args: &PerfDeltaArgs<'_>) -> Result<i32> {
         // rather than letting the compare bail on an empty pool. HEAD
         // runs the same selection, so a zero-baseline implies no delta
         // is computable regardless of HEAD's output.
+        // Absolute runs_root() (orchestrator-stamped) makes this join
+        // return the shared dir; relative falls back anchored to cwd.
         let leaf = baseline_sidecar_leaf(&cwd.join(ktstr::test_support::runs_root()), &baseline);
         if count_sidecars(&leaf) == 0 {
             println!(

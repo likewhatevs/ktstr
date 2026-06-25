@@ -1076,6 +1076,28 @@ pub const KTSTR_ORCHESTRATED_ENV: &str = "KTSTR_ORCHESTRATED";
 /// falls back to its per-process wipe-everything behavior.
 pub const KTSTR_RUN_EPOCH_ENV: &str = "KTSTR_RUN_EPOCH";
 
+/// Name of the environment variable that pins the sidecar runs-root
+/// to an ABSOLUTE path, overriding the CWD-relative
+/// `{CARGO_TARGET_DIR or "target"}/ktstr` default of
+/// [`test_support::runs_root`].
+///
+/// The `cargo ktstr` orchestrator (`cargo-ktstr` main) stamps this
+/// once at startup to the cargo target dir's `ktstr` subdir (resolved
+/// via `cargo metadata`), so its post-run footer / `stats` / `replay`
+/// reads AND the child test processes' sidecar writes resolve the
+/// SAME directory regardless of CWD. Without it, in a Cargo workspace
+/// the test binaries (CWD = package dir, set by nextest) write to
+/// `{package}/target/ktstr` while the orchestrator (CWD = invocation
+/// dir) scans elsewhere, so the post-run footer finds nothing.
+///
+/// Set ONCE by the parent and inherited by every child test process —
+/// children never re-run `cargo metadata` (it would be one subprocess
+/// spawn per test process on the hot path). Unset under raw `cargo
+/// nextest run` (no orchestrator): [`test_support::runs_root`] falls
+/// back to its CWD-relative default, which is fine because raw nextest
+/// has no footer to mismatch.
+pub const KTSTR_RUNS_ROOT_ENV: &str = "KTSTR_RUNS_ROOT";
+
 /// Name of the environment variable that overrides the default
 /// host-mode cgroup parent (where `host_only` tests' workload
 /// cgroups land). Empty / unset falls back to the canonical

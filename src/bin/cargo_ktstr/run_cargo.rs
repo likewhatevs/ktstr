@@ -351,9 +351,9 @@ fn run_cargo_sub(
         }
     }
 
-    precompute_cast_cache();
-
     let target_dir_path = resolve_target_dir();
+
+    precompute_cast_cache(&target_dir_path);
 
     // BTF type anchor: if a prior build left .bpf.o files, extract
     // struct definitions from the BPF source tree and generate a
@@ -439,11 +439,44 @@ fn run_cargo_sub(
     }
 }
 
-fn precompute_cast_cache() {
-    let target_dir = std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_| "target".to_string());
+/// Precompute cast analysis for the built scheduler binaries so the
+/// first test needing it doesn't pay the analysis cost inline.
+///
+/// `target_dir` is the resolved (absolute) cargo target dir, passed in
+/// rather than re-read from `CARGO_TARGET_DIR`/"target": in a Cargo
+/// workspace invoked from a member-dir CWD a relative "target" points
+/// at a package dir that holds no built binaries (they live under the
+/// shared workspace target), so the scan would silently find nothing.
+/// The caller resolves it once via [`resolve_target_dir`] and shares it
+/// with [`generate_btf_anchor`] — no extra `cargo metadata` spawn here.
+fn precompute_cast_cache(target_dir: &std::path::Path) {
+    let binaries = collect_scheduler_binaries(target_dir);
+    if binaries.is_empty() {
+        return;
+    }
+    eprintln!(
+        "cargo ktstr: precomputing cast analysis for {} scheduler binaries",
+        binaries.len()
+    );
+    for binary in binaries {
+        let path = binary.clone();
+        std::thread::spawn(move || {
+            ktstr::precompute_cast_analysis(&path);
+        });
+    }
+}
+
+/// Collect built scheduler binaries (`scx_*`, no extension) under
+/// `{target_dir}/{debug,release}`. The no-dot filter rejects build
+/// byproducts that share the `scx_` prefix (e.g. `scx_foo.d` depfiles,
+/// `scx_foo.rlib`); only the bare executable matches, and the
+/// `is_file` gate excludes same-named directories. Split out from
+/// [`precompute_cast_cache`] so the scan/filter is unit-testable
+/// without spawning the per-binary analysis threads.
+fn collect_scheduler_binaries(target_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     let mut binaries = Vec::new();
     for profile in ["debug", "release"] {
-        let dir = std::path::Path::new(&target_dir).join(profile);
+        let dir = target_dir.join(profile);
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
@@ -460,19 +493,7 @@ fn precompute_cast_cache() {
             }
         }
     }
-    if binaries.is_empty() {
-        return;
-    }
-    eprintln!(
-        "cargo ktstr: precomputing cast analysis for {} scheduler binaries",
-        binaries.len()
-    );
-    for binary in binaries {
-        let path = binary.clone();
-        std::thread::spawn(move || {
-            ktstr::precompute_cast_analysis(&path);
-        });
-    }
+    binaries
 }
 
 fn generate_btf_anchor(target_dir: &std::path::Path, release: bool) -> Option<std::path::PathBuf> {
@@ -549,6 +570,62 @@ fn resolve_target_dir() -> std::path::PathBuf {
         return std::path::PathBuf::from(dir);
     }
     std::path::PathBuf::from("target")
+}
+
+/// Pin [`ktstr::KTSTR_RUNS_ROOT_ENV`] to the absolute cargo target
+/// dir's `ktstr` subdir so the orchestrator's footer / `stats` /
+/// `replay` reads AND the child test processes' sidecar writes resolve
+/// the SAME directory regardless of CWD.
+///
+/// Without this, [`ktstr::test_support::runs_root`] is CWD-relative
+/// (`{CARGO_TARGET_DIR or "target"}/ktstr`): in a Cargo workspace the
+/// test binaries run with CWD = the package dir (nextest), writing
+/// sidecars to `{package}/target/ktstr`, while this orchestrator —
+/// invoked from a different CWD (e.g. the workspace root) — scans
+/// elsewhere, so the post-run footer finds nothing.
+///
+/// Resolved ONCE here (a single `cargo metadata` via
+/// [`resolve_target_dir`]) and exported so child test processes
+/// inherit it; they never re-run `cargo metadata` (it would be one
+/// subprocess spawn per test process on the hot path). A relative
+/// target dir (a relative `CARGO_TARGET_DIR`, or the `"target"`
+/// fallback when `cargo metadata` is unavailable) is anchored to this
+/// process's cwd so the exported value is always absolute — cargo
+/// resolves a relative `CARGO_TARGET_DIR` against the cargo-invocation
+/// cwd, which is this orchestrator's cwd. No-ops only when already set
+/// non-empty (operator / test override) or when the cwd cannot be read.
+///
+/// SAFETY: called from `cargo-ktstr` `main` before any thread is
+/// spawned (alongside `blobs::install_env`), so the `set_var` has no
+/// concurrent env reader — see `blobs::install_env`'s safety doc.
+pub(crate) fn install_runs_root_env() {
+    if std::env::var_os(ktstr::KTSTR_RUNS_ROOT_ENV)
+        .filter(|v| !v.is_empty())
+        .is_some()
+    {
+        return;
+    }
+    let runs_root = resolve_target_dir().join("ktstr");
+    let runs_root = if runs_root.is_absolute() {
+        runs_root
+    } else {
+        // A relative root would leave the orchestrator and the child
+        // test processes resolving it against DIFFERENT cwds in a
+        // workspace (nextest runs each test with cwd = its package dir),
+        // reintroducing the empty-footer split. Anchor it to this
+        // process's cwd: cargo resolves a relative CARGO_TARGET_DIR
+        // against the cargo-invocation cwd, which is this orchestrator's
+        // cwd (build_cargo_command spawns cargo without overriding
+        // current_dir), so this matches where the artifacts land.
+        let Ok(cwd) = std::env::current_dir() else {
+            return;
+        };
+        cwd.join(runs_root)
+    };
+    // SAFETY: see the function doc — startup, before any threads.
+    unsafe {
+        std::env::set_var(ktstr::KTSTR_RUNS_ROOT_ENV, &runs_root);
+    }
 }
 
 fn cleanup_shm() {
@@ -651,6 +728,142 @@ pub(crate) fn run_llvm_cov(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    /// Serialize env mutation across this binary's tests. nextest runs
+    /// tests as parallel threads in ONE process, and `set_var` is
+    /// process-global; the lib's `lock_env`/`EnvVarGuard` are
+    /// `pub(crate)` to the `ktstr` crate and unreachable from this
+    /// binary crate, so the orchestrator-env tests carry their own
+    /// lock + save/restore guard.
+    fn env_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Save-and-restore guard for a single env var; restores the prior
+    /// value (or absence) on drop. Hold the [`env_lock`] for its life.
+    struct EnvVar {
+        key: &'static str,
+        prev: Option<OsString>,
+    }
+
+    impl EnvVar {
+        fn set(key: &'static str, val: impl AsRef<std::ffi::OsStr>) -> Self {
+            let prev = std::env::var_os(key);
+            // SAFETY: `env_lock` serializes env-mutating tests; no other
+            // test reads CARGO_TARGET_DIR / KTSTR_RUNS_ROOT concurrently.
+            unsafe { std::env::set_var(key, val) };
+            Self { key, prev }
+        }
+        fn remove(key: &'static str) -> Self {
+            let prev = std::env::var_os(key);
+            // SAFETY: see `set`.
+            unsafe { std::env::remove_var(key) };
+            Self { key, prev }
+        }
+    }
+
+    impl Drop for EnvVar {
+        fn drop(&mut self) {
+            // SAFETY: see `EnvVar::set`.
+            unsafe {
+                match &self.prev {
+                    Some(v) => std::env::set_var(self.key, v),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
+    /// The orchestrator stamps `KTSTR_RUNS_ROOT` = `{target}/ktstr`
+    /// (absolute) so child test processes' sidecar writes AND the
+    /// post-run footer reader resolve the SAME dir — the workspace
+    /// empty-footer fix. With an absolute `CARGO_TARGET_DIR` and no
+    /// pre-set override, `install_runs_root_env` must export that path.
+    #[test]
+    fn install_runs_root_env_stamps_absolute_target_subdir() {
+        let _lock = env_lock();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _g0 = EnvVar::remove(ktstr::KTSTR_RUNS_ROOT_ENV);
+        let _g1 = EnvVar::set("CARGO_TARGET_DIR", tmp.path());
+        install_runs_root_env();
+        assert_eq!(
+            std::env::var_os(ktstr::KTSTR_RUNS_ROOT_ENV).map(std::path::PathBuf::from),
+            Some(tmp.path().join("ktstr")),
+            "orchestrator must export the absolute {{target}}/ktstr so the \
+             child writers and the footer reader agree on one dir",
+        );
+    }
+
+    /// A pre-set `KTSTR_RUNS_ROOT` (operator override, or a test that
+    /// pinned its own root) must win — `install_runs_root_env` no-ops
+    /// rather than clobbering it with the cargo target dir.
+    #[test]
+    fn install_runs_root_env_is_idempotent_when_already_set() {
+        let _lock = env_lock();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let preset = tmp.path().join("operator-chosen-root");
+        let _g0 = EnvVar::set(ktstr::KTSTR_RUNS_ROOT_ENV, &preset);
+        let _g1 = EnvVar::set("CARGO_TARGET_DIR", tmp.path());
+        install_runs_root_env();
+        assert_eq!(
+            std::env::var_os(ktstr::KTSTR_RUNS_ROOT_ENV).map(std::path::PathBuf::from),
+            Some(preset),
+            "a pre-set KTSTR_RUNS_ROOT must survive install (no clobber)",
+        );
+    }
+
+    /// A RELATIVE `CARGO_TARGET_DIR` is anchored to the orchestrator's
+    /// cwd and exported ABSOLUTE — so child test processes (which run
+    /// with a different cwd under nextest in a workspace) resolve the
+    /// SAME runs root. A relative export would reintroduce the
+    /// empty-footer split.
+    #[test]
+    fn install_runs_root_env_absolutizes_relative_target() {
+        let _lock = env_lock();
+        let _g0 = EnvVar::remove(ktstr::KTSTR_RUNS_ROOT_ENV);
+        let _g1 = EnvVar::set("CARGO_TARGET_DIR", "relative/target");
+        install_runs_root_env();
+        let got = std::env::var_os(ktstr::KTSTR_RUNS_ROOT_ENV).map(std::path::PathBuf::from);
+        let expected = std::env::current_dir()
+            .unwrap()
+            .join("relative/target/ktstr");
+        assert_eq!(
+            got,
+            Some(expected),
+            "a relative CARGO_TARGET_DIR must be anchored to the orchestrator cwd \
+             and exported absolute, not skipped",
+        );
+    }
+
+    /// `collect_scheduler_binaries` returns only bare `scx_*`
+    /// executables under `{target}/{debug,release}`: build byproducts
+    /// sharing the prefix (`scx_foo.d`), non-`scx_` files, and
+    /// same-named directories are excluded; a missing profile dir is a
+    /// no-op (not an error).
+    #[test]
+    fn collect_scheduler_binaries_filters_to_bare_scx_executables() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // No debug/release dirs yet -> nothing collected.
+        assert!(collect_scheduler_binaries(tmp.path()).is_empty());
+
+        let debug = tmp.path().join("debug");
+        std::fs::create_dir(&debug).unwrap();
+        std::fs::write(debug.join("scx_ktstr"), b"x").unwrap(); // collected
+        std::fs::write(debug.join("scx_ktstr.d"), b"x").unwrap(); // .d byproduct -> excluded
+        std::fs::write(debug.join("ktstr"), b"x").unwrap(); // no scx_ prefix -> excluded
+        std::fs::create_dir(debug.join("scx_subdir")).unwrap(); // dir -> excluded by is_file
+
+        assert_eq!(
+            collect_scheduler_binaries(tmp.path()),
+            vec![debug.join("scx_ktstr")],
+            "only the bare scx_* executable is collected",
+        );
+    }
 
     /// Truth table for the flag->scheduler-profile coupling:
     /// EITHER --release (everything release) or --release-scheduler
