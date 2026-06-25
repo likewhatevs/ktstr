@@ -14,6 +14,8 @@
 use std::path::PathBuf;
 use std::process::Command;
 
+use cargo_metadata::semver::Version;
+
 use crate::kernel::{encode_kernel_list, resolve_kernel_set};
 
 /// Cargo sub-argv that `run_test` passes to `run_cargo_sub`. Named
@@ -659,6 +661,89 @@ fn cleanup_shm() {
     }
 }
 
+/// Outcome of comparing the cargo-ktstr CLI's own ktstr version with the
+/// `ktstr` dependency version the test project was built against.
+#[derive(Debug, PartialEq, Eq)]
+enum VersionGuard {
+    /// Versions match — proceed silently.
+    Ok,
+    /// Versions differ but the test's ktstr is OLDER than the CLI —
+    /// usually drivable, but the skew is worth surfacing.
+    Warn(String),
+    /// The test's ktstr is NEWER than the CLI — the CLI predates the API
+    /// the test was built against and cannot drive it; abort.
+    Error(String),
+}
+
+/// Pure CLI-vs-test ktstr-version comparison — the testable core of the
+/// version guard. Full-version comparison (major.minor.patch): ktstr is
+/// pre-1.0, where a minor bump is breaking, so any test > cli aborts.
+fn version_guard(cli: &Version, test: &Version) -> VersionGuard {
+    use std::cmp::Ordering;
+    match test.cmp(cli) {
+        Ordering::Equal => VersionGuard::Ok,
+        Ordering::Less => VersionGuard::Warn(format!(
+            "the test was built against ktstr {test} but the cargo-ktstr CLI \
+             is {cli} — version skew. Align them (bump the test's ktstr \
+             dependency, or use a matching CLI) to avoid surprises."
+        )),
+        Ordering::Greater => VersionGuard::Error(format!(
+            "the test was built against ktstr {test} but the cargo-ktstr CLI \
+             is {cli} — the CLI is older than the ktstr the test depends on \
+             and cannot drive it. Upgrade the CLI: `cargo install ktstr` \
+             (or `cargo install --path .` in the ktstr repo)."
+        )),
+    }
+}
+
+/// Guard CLI↔test ktstr-version skew before running the suite.
+///
+/// Reads the test project's RESOLVED `ktstr` dependency version (what the
+/// test binaries link) from `cargo metadata` and compares it with the
+/// CLI's own compiled-in version. Warns on any mismatch; errors —
+/// aborting the run — when the test's ktstr is newer than the CLI.
+///
+/// Best-effort: a project with no `ktstr` dependency, or a `cargo
+/// metadata` failure, skips the guard. The guard must never block a run
+/// it cannot assess — only one it can prove incompatible.
+fn check_ktstr_version_compat() -> Result<(), String> {
+    let cli = Version::parse(env!("CARGO_PKG_VERSION"))
+        .expect("cargo-ktstr's own CARGO_PKG_VERSION is valid semver");
+    let meta = match cargo_metadata::MetadataCommand::new().exec() {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!(error = %e, "ktstr version guard: cargo metadata failed; skipping");
+            return Ok(());
+        }
+    };
+    // The test binaries link the resolved `ktstr` dependency. If the
+    // graph resolved more than one `ktstr` (a version conflict), take the
+    // MAX so the error check catches the highest version a test could be
+    // built against. This over-approximates in the rare dual-ktstr graph
+    // (a second, higher ktstr pulled in transitively that the test
+    // targets do not actually link); the resolve-graph walk (resolve.root
+    // -> test-target nodes -> ktstr dep) would be exact, but two ktstr
+    // versions in a ktstr test project is pathological, and the max is
+    // safe for the error direction — it never misses a too-new link.
+    let Some(test) = meta
+        .packages
+        .iter()
+        .filter(|p| p.name == "ktstr")
+        .map(|p| &p.version)
+        .max()
+    else {
+        // No `ktstr` dependency — running outside a ktstr-dependent
+        // project; nothing to guard.
+        return Ok(());
+    };
+    match version_guard(&cli, test) {
+        VersionGuard::Ok => {}
+        VersionGuard::Warn(msg) => eprintln!("cargo ktstr: warning: {msg}"),
+        VersionGuard::Error(msg) => return Err(msg),
+    }
+    Ok(())
+}
+
 pub(crate) fn run_test(
     kernel: Vec<String>,
     no_perf_mode: bool,
@@ -669,6 +754,7 @@ pub(crate) fn run_test(
 ) -> Result<(), String> {
     ktstr::cli::check_kvm().map_err(|e| format!("{e:#}"))?;
     ktstr::cli::check_tools(&["cargo-nextest"]).map_err(|e| format!("{e:#}"))?;
+    check_ktstr_version_compat()?;
     run_cargo_sub(
         TEST_SUB_ARGV,
         "tests",
@@ -691,6 +777,10 @@ pub(crate) fn run_coverage(
 ) -> Result<(), String> {
     ktstr::cli::check_kvm().map_err(|e| format!("{e:#}"))?;
     ktstr::cli::check_tools(&["cargo-nextest", "cargo-llvm-cov"]).map_err(|e| format!("{e:#}"))?;
+    // `coverage` runs the SAME test suite (cargo llvm-cov nextest), so it
+    // hits the same CLI-too-old incompatibility `test` does — guard it
+    // identically.
+    check_ktstr_version_compat()?;
     run_cargo_sub(
         COVERAGE_SUB_ARGV,
         "coverage",
@@ -713,6 +803,13 @@ pub(crate) fn run_llvm_cov(
     // argument after the subcommand name, including any profile
     // selection. `release: false` / `release_scheduler: false` here
     // mean "don't inject a profile ourselves"; the user decides.
+    //
+    // No ktstr version guard here (unlike `test` / `coverage`): a
+    // passthrough subcommand like `llvm-cov report` does NOT rebuild or
+    // run the tests, so guarding would wrongly block a pure-report
+    // invocation under a version-skewed project. A `cargo ktstr llvm-cov
+    // nextest` that DOES run tests is the user's explicit raw-passthrough
+    // choice; they own the version in that case.
     run_cargo_sub(
         LLVM_COV_SUB_ARGV,
         "llvm-cov",
@@ -730,6 +827,50 @@ mod tests {
     use super::*;
     use std::ffi::OsString;
     use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    fn v(s: &str) -> Version {
+        Version::parse(s).expect("test version literal is valid semver")
+    }
+
+    #[test]
+    fn version_guard_equal_is_ok() {
+        assert_eq!(version_guard(&v("0.19.0"), &v("0.19.0")), VersionGuard::Ok);
+    }
+
+    #[test]
+    fn version_guard_test_older_warns() {
+        // test 0.18 < CLI 0.19 -> warn (skew; the newer CLI can usually
+        // still drive an older test).
+        assert!(matches!(
+            version_guard(&v("0.19.0"), &v("0.18.0")),
+            VersionGuard::Warn(_)
+        ));
+    }
+
+    #[test]
+    fn version_guard_test_newer_errors() {
+        // test 0.20 > CLI 0.19 -> error (the CLI predates the test's ktstr
+        // and cannot drive it).
+        assert!(matches!(
+            version_guard(&v("0.19.0"), &v("0.20.0")),
+            VersionGuard::Error(_)
+        ));
+    }
+
+    #[test]
+    fn version_guard_patch_delta_full_version_compare() {
+        // ktstr is pre-1.0, so the guard compares the full version — even
+        // a patch delta is significant. test newer-by-patch -> error;
+        // older-by-patch -> warn.
+        assert!(matches!(
+            version_guard(&v("0.19.0"), &v("0.19.1")),
+            VersionGuard::Error(_)
+        ));
+        assert!(matches!(
+            version_guard(&v("0.19.1"), &v("0.19.0")),
+            VersionGuard::Warn(_)
+        ));
+    }
 
     /// Serialize env mutation across this binary's tests. nextest runs
     /// tests as parallel threads in ONE process, and `set_var` is

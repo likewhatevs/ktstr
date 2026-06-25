@@ -3710,6 +3710,7 @@ dependencies = [
  "base64",
  "blazesym",
  "btf-rs",
+ "cargo_metadata",
  "cc",
  "clap",
  "clap_complete",
