@@ -1241,6 +1241,123 @@ fn err_to_exit_code(e: anyhow::Error, expect_err: bool, no_skip: bool) -> i32 {
     EXIT_FAIL
 }
 
+/// The final test verdict — the 4-state lattice `Fail > Inconclusive >
+/// Pass > Skip` that [`result_to_exit_code`] projects to a process exit
+/// code. Distinct from the exit code because the exit code collapses
+/// `Skip` into [`EXIT_PASS`]; the sidecar finalize ([`final_outcome`])
+/// needs all four to set the persisted `passed`/`skipped`/`inconclusive`
+/// bits to the POST-inversion outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Verdict {
+    Pass,
+    Fail,
+    Skip,
+    Inconclusive,
+}
+
+impl Verdict {
+    /// Project to the process exit code, matching the
+    /// `EXIT_PASS`/`EXIT_FAIL`/`EXIT_INCONCLUSIVE` mapping
+    /// [`result_to_exit_code`] produces (Skip degenerates to
+    /// [`EXIT_PASS`]). Test-only: the anti-drift truth-table test
+    /// (`final_outcome_projects_to_result_to_exit_code`) is its sole
+    /// caller — production reads the [`Verdict`] directly via
+    /// [`Verdict::sidecar_bits`].
+    #[cfg(test)]
+    pub(crate) fn to_exit_code(self) -> i32 {
+        match self {
+            Verdict::Pass | Verdict::Skip => EXIT_PASS,
+            Verdict::Fail => EXIT_FAIL,
+            Verdict::Inconclusive => EXIT_INCONCLUSIVE,
+        }
+    }
+
+    /// The persisted-sidecar verdict bits `(passed, skipped,
+    /// inconclusive)` for this outcome. `Fail` is all-false (the
+    /// [`crate::test_support::SidecarResult::is_fail`] "none set"
+    /// encoding). Lets the sidecar finalize record the final verdict
+    /// without [`crate::test_support::sidecar`] depending on this enum.
+    pub(crate) fn sidecar_bits(self) -> (bool, bool, bool) {
+        match self {
+            Verdict::Pass => (true, false, false),
+            Verdict::Skip => (false, true, false),
+            Verdict::Inconclusive => (false, false, true),
+            Verdict::Fail => (false, false, false),
+        }
+    }
+}
+
+/// Classify a test result into the final [`Verdict`] — the same
+/// classification [`result_to_exit_code`] performs, as a 4-state value
+/// (it does not collapse `Skip` into `Pass` the way the exit code does)
+/// and WITHOUT the operator-facing `eprintln` diagnostics.
+///
+/// Used to record the FINAL (post-`expect_err` / post-marker) outcome on
+/// the sidecar so the footer, `stats` analysis, and `replay` reflect the
+/// test's real pass/fail (matching nextest's exit code) rather than the
+/// raw scenario verdict written mid-run.
+///
+/// MUST stay in lockstep with [`result_to_exit_code`]: the truth-table
+/// test `final_outcome_projects_to_result_to_exit_code` asserts
+/// `final_outcome(...).to_exit_code() == result_to_exit_code(...)` over a
+/// matrix including the marker-carrying error arms, so the two cannot
+/// drift. The arm order mirrors [`ok_to_exit_code`] / [`err_to_exit_code`]
+/// first-match precedence exactly.
+pub(crate) fn final_outcome(
+    result: &Result<AssertResult>,
+    expect_err: bool,
+    allow_inconclusive: bool,
+) -> Verdict {
+    let no_skip = std::env::var_os(crate::KTSTR_NO_SKIP_MODE_ENV).is_some();
+    match result {
+        Ok(r) => {
+            if r.is_skip() {
+                return Verdict::Skip;
+            }
+            if expect_err {
+                // expect_err on an Ok result is always a failure
+                // (expected an error, got a non-error verdict) — both the
+                // Pass and Inconclusive arms of ok_to_exit_code map here.
+                return Verdict::Fail;
+            }
+            if r.is_inconclusive() {
+                return if allow_inconclusive {
+                    Verdict::Pass
+                } else {
+                    Verdict::Inconclusive
+                };
+            }
+            Verdict::Pass
+        }
+        Err(e) => {
+            match classify_host_error(e, no_skip) {
+                HostClass::Skip { .. } => return Verdict::Skip,
+                HostClass::Fail { .. } => return Verdict::Fail,
+                HostClass::NotHostClass => {}
+            }
+            if e.downcast_ref::<crate::test_support::eval::PostVmAssertionFailure>()
+                .is_some()
+            {
+                return Verdict::Fail;
+            }
+            if e.downcast_ref::<crate::test_support::eval::ExpectAutoReproSatisfied>()
+                .is_some()
+            {
+                return Verdict::Pass;
+            }
+            if expect_err {
+                if e.downcast_ref::<crate::test_support::eval::ScxBpfErrorMatcherMismatch>()
+                    .is_some()
+                {
+                    return Verdict::Fail;
+                }
+                return Verdict::Pass;
+            }
+            Verdict::Fail
+        }
+    }
+}
+
 /// Whether a base test entry is "ignored" (skipped by default).
 ///
 /// Tests whose names start with `demo_` are ignored -- they are

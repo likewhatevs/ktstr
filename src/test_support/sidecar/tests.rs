@@ -1,4 +1,4 @@
-use super::super::test_helpers::{EnvVarGuard, lock_env};
+use super::super::test_helpers::{EnvVarGuard, isolated_sidecar_dir, lock_env};
 use super::*;
 use crate::assert::{AssertResult, CgroupStats};
 use crate::scenario::Ctx;
@@ -278,6 +278,10 @@ fn sidecar_result_roundtrip() {
         passed: true,
         skipped: false,
         inconclusive: false,
+        // passed=true + expected_failure=true is the production
+        // expect_err combination (a real failure inverted to a pass);
+        // a non-default value here catches a dropped serde field.
+        expected_failure: true,
         stats: crate::assert::ScenarioStats {
             cgroups: vec![CgroupStats {
                 num_workers: 4,
@@ -368,6 +372,7 @@ fn sidecar_result_roundtrip() {
         passed,
         skipped,
         inconclusive,
+        expected_failure,
         stats,
         monitor,
         periodic_fired: _,
@@ -421,6 +426,10 @@ fn sidecar_result_roundtrip() {
     assert!(passed);
     assert!(!skipped, "fixture declared skipped=false");
     assert!(!inconclusive, "fixture declared inconclusive=false");
+    assert!(
+        expected_failure,
+        "fixture declared expected_failure=true; must round-trip",
+    );
     // Empty-Vec collections — regression guard against a serde
     // regression that dropped `[]` on round-trip.
     assert!(metrics.is_empty(), "fixture declared empty metrics");
@@ -532,6 +541,7 @@ fn sidecar_result_roundtrip_all_fields_round_trip() {
         passed: false,
         skipped: true,
         inconclusive: true,
+        expected_failure: false,
         stats: ScenarioStats {
             cgroups: vec![CgroupStats {
                 num_workers: 3,
@@ -775,6 +785,7 @@ fn sidecar_result_missing_required_field_rejected_by_deserialize() {
         "passed",
         "skipped",
         "inconclusive",
+        "expected_failure",
         "stats",
         "stimulus_events",
         "work_type",
@@ -2972,6 +2983,88 @@ fn summarize_excludes_passing_tests_and_counts_wprof() {
     assert!(s[0].failed.is_empty());
     assert_eq!(s[0].stats_sidecars, 1);
     assert_eq!(s[0].wprof_traces, 1);
+}
+
+#[test]
+fn summarize_dump_with_passing_sidecar_not_flagged() {
+    // Dump-gating: an expect_err / expect_auto_repro run finalizes
+    // its sidecar to a PASS but leaves the induced-crash failure-dump
+    // behind. The dump must NOT surface the test as FAILED — a parsed,
+    // non-failing sidecar is authoritative; only a dump with NO parsed
+    // sidecar (a pre-sidecar failure) flags.
+    let root = tempfile::TempDir::new().unwrap();
+    let run = root.path().join("7.1.0-abc1234");
+    std::fs::create_dir(&run).unwrap();
+    write_sidecar_fixture(&run, "expectfail", true, "scx_mitosis", "1n4l4c1t");
+    std::fs::write(run.join("expectfail.failure-dump.json"), b"{}").unwrap();
+    let s = summarize_run_artifacts(root.path(), std::time::UNIX_EPOCH);
+    assert_eq!(s.len(), 1);
+    assert!(
+        s[0].failed.is_empty(),
+        "a passing sidecar's failure-dump must not surface as FAILED (dump-gating)",
+    );
+    assert_eq!(s[0].stats_sidecars, 1);
+}
+
+#[test]
+fn finalize_sidecar_verdict_records_inversion_and_no_ops_ordinary() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    // A raw Fail sidecar finalized to Pass (an expect_err inversion):
+    // the verdict bits flip to pass AND expected_failure is set (so
+    // `stats compare` still excludes the failure-mode telemetry).
+    let fail_path = tmp.path().join("t-0000000000000000.ktstr.json");
+    let mut fail = SidecarResult::test_fixture();
+    fail.passed = false; // raw Fail = the all-false verdict
+    fail.skipped = false;
+    fail.inconclusive = false;
+    fail.expected_failure = false;
+    std::fs::write(&fail_path, serde_json::to_string(&fail).unwrap()).unwrap();
+    finalize_sidecar_verdict(&fail_path, true, false, false);
+    let after: SidecarResult =
+        serde_json::from_str(&std::fs::read_to_string(&fail_path).unwrap()).unwrap();
+    assert!(
+        after.passed && !after.skipped && !after.inconclusive,
+        "a Fail finalized to Pass flips the verdict bits",
+    );
+    assert!(
+        after.expected_failure,
+        "an inverted-to-pass failure sets expected_failure",
+    );
+
+    // An ordinary pass finalized to pass: no-op, expected_failure stays false.
+    let pass_path = tmp.path().join("p-0000000000000000.ktstr.json");
+    let pass = SidecarResult::test_fixture(); // test_fixture is a pass
+    std::fs::write(&pass_path, serde_json::to_string(&pass).unwrap()).unwrap();
+    finalize_sidecar_verdict(&pass_path, true, false, false);
+    let after2: SidecarResult =
+        serde_json::from_str(&std::fs::read_to_string(&pass_path).unwrap()).unwrap();
+    assert!(
+        after2.passed && !after2.expected_failure,
+        "an ordinary pass stays pass with expected_failure=false (no inversion)",
+    );
+}
+
+#[test]
+fn suppress_failure_dumps_removes_only_named_tests_dumps() {
+    // Residual dump-gating: an expect_err run that crashes before any sidecar
+    // (host-triggered BPF crash) leaves a dump but no sidecar. On a
+    // pass/skip final verdict, run_ktstr_test_inner calls
+    // suppress_failure_dumps so the footer's dump-only trigger does not
+    // surface the passing test — without masking a different test's dump.
+    let _lock = lock_env();
+    let _sd = isolated_sidecar_dir();
+    let dir = crate::test_support::sidecar::sidecar_dir();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("crashpass.failure-dump.json"), b"{}").unwrap();
+    std::fs::write(dir.join("crashpass.repro.failure-dump.json"), b"{}").unwrap();
+    std::fs::write(dir.join("other.failure-dump.json"), b"{}").unwrap();
+    suppress_failure_dumps("crashpass");
+    assert!(!dir.join("crashpass.failure-dump.json").exists());
+    assert!(!dir.join("crashpass.repro.failure-dump.json").exists());
+    assert!(
+        dir.join("other.failure-dump.json").exists(),
+        "only the named test's dumps are removed",
+    );
 }
 
 #[test]

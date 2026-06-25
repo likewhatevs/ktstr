@@ -179,6 +179,15 @@ pub struct GauntletRow {
     /// real regressions.
     #[serde(default)]
     pub inconclusive: bool,
+    /// True when this row's source run was an `expect_err` /
+    /// `expect_auto_repro` test whose actual scenario failure was
+    /// inverted to a pass — its telemetry is failure-mode-dominated
+    /// (short / stalled run), so [`compare_rows_by`] excludes it from
+    /// the regression math even though [`passed`](Self::passed) is now
+    /// `true`. Carried from `SidecarResult::expected_failure`;
+    /// OR-folded across a cohort in `group_and_average_by`.
+    #[serde(default)]
+    pub expected_failure: bool,
     /// Number of monitor samples this run was averaged over —
     /// the natural per-RUN weight for `Gauge(Avg)` metrics when
     /// folded across multiple runs at cross-RUN comparison time

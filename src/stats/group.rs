@@ -454,6 +454,7 @@ struct Accumulator<'a> {
     any_skipped: bool,
     any_failed: bool,
     any_inconclusive: bool,
+    any_expected_failure: bool,
     // Tracks whether contributors disagree on the `-dirty`
     // suffix for the project_commit / kernel_commit dimensions.
     // `any_*_clean` is true if any contributor's value is the
@@ -547,6 +548,7 @@ impl<'a> Accumulator<'a> {
             any_skipped: false,
             any_failed: false,
             any_inconclusive: false,
+            any_expected_failure: false,
             any_project_clean: false,
             any_project_dirty: false,
             any_kernel_clean: false,
@@ -595,6 +597,15 @@ impl<'a> Accumulator<'a> {
             &mut self.any_kernel_dirty,
             &mut self.first_kernel_base,
         );
+        if row.expected_failure {
+            // An expect_err / expect_auto_repro run inverted to a pass:
+            // OR the flag so the aggregated row stays OUT of the
+            // ab-compare regression math (its telemetry is
+            // failure-mode-dominated). Its metrics may still fold into
+            // the cohort sums below, but compare_rows_by excludes any
+            // expected_failure row, so the aggregate is never read.
+            self.any_expected_failure = true;
+        }
         if row.is_skip() {
             self.any_skipped = true;
             self.skips_observed += 1;
@@ -756,6 +767,7 @@ impl<'a> Accumulator<'a> {
             passed: !acc.any_failed && !acc.any_inconclusive && !acc.any_skipped && n > 0,
             skipped: !acc.any_failed && !acc.any_inconclusive && acc.any_skipped,
             inconclusive: !acc.any_failed && acc.any_inconclusive,
+            expected_failure: acc.any_expected_failure,
             // Sum across contributors so the aggregated row's
             // weight is the cohort's total sample population. A
             // downstream consumer that further folds these
@@ -1028,6 +1040,7 @@ pub fn sidecar_to_row(sc: &crate::test_support::SidecarResult) -> GauntletRow {
         passed: sc.is_pass(),
         skipped: sc.is_skip(),
         inconclusive: sc.is_inconclusive(),
+        expected_failure: sc.expected_failure,
         run_sample_count: sc.monitor.as_ref().map(|m| m.total_samples).unwrap_or(0),
         spread: finite_or_zero("spread", sc.stats.worst_spread),
         gap_ms: sc.stats.worst_gap_ms,

@@ -1399,6 +1399,99 @@ fn result_to_exit_code_inconclusive_maps_to_distinct_code() {
     assert_eq!(result_to_exit_code(Ok(inc2), true, false), 1);
 }
 
+/// Anti-drift truth table: `final_outcome(&r, e, a).to_exit_code()` MUST
+/// equal `result_to_exit_code(r, e, a)` for every (result, expect_err,
+/// allow_inconclusive). They are two encodings of one classification —
+/// the sidecar finalize records [`final_outcome`], nextest reads
+/// [`result_to_exit_code`] — so any divergence silently mis-records a
+/// test's pass/fail across the footer, `stats`, and `replay`. Covers the
+/// Ok arms (pass / skip / inconclusive) and the Err arms (plain + each
+/// marker), exercising `final_outcome`'s replicated first-match
+/// precedence and context-aware marker downcasts.
+#[test]
+fn final_outcome_projects_to_result_to_exit_code() {
+    use crate::assert::{AssertDetail, AssertResult, DetailKind};
+    type ResultBuilder = fn() -> Result<AssertResult>;
+    let cases: [(ResultBuilder, &str); 7] = [
+        (|| Ok(AssertResult::pass()), "ok_pass"),
+        (|| Ok(AssertResult::skip("skip reason")), "ok_skip"),
+        (
+            || {
+                Ok(AssertResult::inconclusive(AssertDetail::new(
+                    DetailKind::Benchmark,
+                    "zero-denominator",
+                )))
+            },
+            "ok_inconclusive",
+        ),
+        (|| Err(anyhow::anyhow!("plain failure")), "err_plain"),
+        (
+            || Err(anyhow::anyhow!("f").context(crate::test_support::eval::PostVmAssertionFailure)),
+            "err_post_vm_assertion",
+        ),
+        (
+            || {
+                Err(anyhow::anyhow!("f")
+                    .context(crate::test_support::eval::ExpectAutoReproSatisfied))
+            },
+            "err_expect_auto_repro_satisfied",
+        ),
+        (
+            || {
+                Err(anyhow::anyhow!("f")
+                    .context(crate::test_support::eval::ScxBpfErrorMatcherMismatch))
+            },
+            "err_scx_bpf_matcher_mismatch",
+        ),
+    ];
+    for (build, label) in cases {
+        for expect_err in [false, true] {
+            for allow_inconclusive in [false, true] {
+                let via_final =
+                    final_outcome(&build(), expect_err, allow_inconclusive).to_exit_code();
+                let via_dispatch = result_to_exit_code(build(), expect_err, allow_inconclusive);
+                assert_eq!(
+                    via_final, via_dispatch,
+                    "verdict drift: {label} expect_err={expect_err} \
+                     allow_inconclusive={allow_inconclusive}: final_outcome->{via_final} \
+                     result_to_exit_code->{via_dispatch}",
+                );
+            }
+        }
+    }
+}
+
+/// `Verdict::sidecar_bits` mapping + the Pass-vs-Skip distinction in
+/// `final_outcome`. The truth-table above asserts `to_exit_code()`
+/// equivalence, but `to_exit_code` collapses BOTH Pass and Skip to
+/// `EXIT_PASS` — so a Pass<->Skip drift in `final_outcome` is invisible
+/// there yet would set the WRONG persisted sidecar bits (passed vs
+/// skipped). This pins the four `sidecar_bits` tuples AND that
+/// `final_outcome` keeps Pass and Skip distinct (incl. Skip dominating
+/// `expect_err`).
+#[test]
+fn verdict_sidecar_bits_and_pass_vs_skip_distinction() {
+    use crate::assert::AssertResult;
+    assert_eq!(Verdict::Pass.sidecar_bits(), (true, false, false));
+    assert_eq!(Verdict::Skip.sidecar_bits(), (false, true, false));
+    assert_eq!(Verdict::Inconclusive.sidecar_bits(), (false, false, true));
+    assert_eq!(Verdict::Fail.sidecar_bits(), (false, false, false));
+
+    assert_eq!(
+        final_outcome(&Ok(AssertResult::pass()), false, false),
+        Verdict::Pass,
+    );
+    assert_eq!(
+        final_outcome(&Ok(AssertResult::skip("s")), false, false),
+        Verdict::Skip,
+    );
+    assert_eq!(
+        final_outcome(&Ok(AssertResult::skip("s")), true, false),
+        Verdict::Skip,
+        "Skip dominates expect_err (the test never evaluated)",
+    );
+}
+
 /// A Skip verdict maps to EXIT_PASS regardless of expect_err — the
 /// test never evaluated, so there is no guest failure to "expect."
 /// Regression guard: a `post_vm_skip` (e.g. a placeholder failure

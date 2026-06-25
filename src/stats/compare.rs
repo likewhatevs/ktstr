@@ -583,6 +583,8 @@ pub(crate) fn compare_rows_by(
             || row_b.is_inconclusive()
             || row_a.is_skip()
             || row_b.is_skip()
+            || row_a.expected_failure
+            || row_b.expected_failure
         {
             report.excluded_pairs += 1;
             continue;

@@ -738,6 +738,7 @@ mod tests {
             passed,
             skipped,
             inconclusive: false,
+            expected_failure: false,
             stats: ktstr::assert::ScenarioStats::default(),
             monitor: None,
             periodic_fired: 0,

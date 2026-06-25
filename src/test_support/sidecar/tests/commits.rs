@@ -180,6 +180,7 @@ fn sidecar_payload_and_metrics_always_emit_when_empty() {
         passed: _,
         skipped: _,
         inconclusive: _,
+        expected_failure: _,
         stats: _,
         monitor,
         periodic_fired: _,

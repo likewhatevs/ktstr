@@ -238,7 +238,7 @@ pub(crate) fn run_ktstr_test_inner(
     // only `ExpectAutoReproSatisfied` with no post_vm failure converts
     // to `Ok(pass)`. The diagnostic surfaces via the `eprintln!` and
     // the per-test stderr capture's original failure trail.
-    match result {
+    let final_result = match result {
         Err(e) => {
             if e.downcast_ref::<PostVmAssertionFailure>().is_some() {
                 Err(e)
@@ -250,7 +250,45 @@ pub(crate) fn run_ktstr_test_inner(
             }
         }
         Ok(r) => Ok(r),
+    };
+    // Finalize the persisted artifacts to the test's FINAL
+    // (post-inversion) verdict — the same `result_to_exit_code` projects
+    // to the exit code nextest reads — so the footer / `stats` / `replay`
+    // never surface a passing `expect_err` / `expect_auto_repro` test as a
+    // failure. `final_outcome` mirrors `result_to_exit_code` (pinned by a
+    // truth-table test) so the persisted verdict matches the exit code.
+    let (passed, skipped, inconclusive) = crate::test_support::dispatch::final_outcome(
+        &final_result,
+        entry.expect_err,
+        entry.allow_inconclusive,
+    )
+    .sidecar_bits();
+    match crate::test_support::sidecar::take_last_sidecar_path() {
+        // A sidecar was written (the guest produced a parseable result):
+        // overwrite its raw verdict with the final one and set
+        // `expected_failure` so `stats compare` still excludes the
+        // failure-mode-dominated telemetry of an inverted failure.
+        Some(path) => crate::test_support::sidecar::finalize_sidecar_verdict(
+            &path,
+            passed,
+            skipped,
+            inconclusive,
+        ),
+        // No sidecar was written — the run crashed BEFORE the guest
+        // produced a parseable result (e.g. an `expect_err` test with a
+        // host-triggered BPF crash). The freeze coordinator still wrote
+        // an unconditional failure-dump; if the FINAL verdict is a
+        // pass/skip (the failure was expected and inverted), that dump
+        // would otherwise surface this PASSING test as FAILED via the
+        // footer's dump-only trigger. Suppress it so the footer matches
+        // nextest's pass. A genuine pre-sidecar failure (final = Fail)
+        // keeps its dump and is still flagged.
+        None if passed || skipped => {
+            crate::test_support::sidecar::suppress_failure_dumps(entry.name)
+        }
+        None => {}
     }
+    final_result
 }
 
 /// Write a placeholder `failure-dump.json` at `path` when the file

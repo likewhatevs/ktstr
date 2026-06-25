@@ -214,6 +214,22 @@ pub struct SidecarResult {
     /// variant the zero-denominator case fell out as Pass) or as
     /// hard failures.
     pub inconclusive: bool,
+    /// True when the persisted verdict (`passed`/`skipped`/
+    /// `inconclusive`) is the POST-inversion FINAL outcome of a run
+    /// whose underlying scenario actually failed — i.e. an
+    /// `expect_err` / `expect_auto_repro` test whose induced failure was
+    /// inverted to a pass. Set by the sidecar finalize
+    /// (`finalize_sidecar_verdict`) after dispatch resolves the
+    /// verdict; `false` for an ordinary pass/skip/fail.
+    ///
+    /// The verdict bits carry the FINAL outcome so the footer, `stats`
+    /// analysis, and `replay` match nextest's exit code. This flag
+    /// preserves the one fact that overwrite loses: that the run's
+    /// telemetry is failure-mode-dominated (a deliberately short /
+    /// stalled run). `stats compare` ORs it into its exclusion guard so
+    /// an inverted-to-pass row is still kept OUT of the regression math
+    /// (its induced-crash telemetry is not real scheduler behavior).
+    pub expected_failure: bool,
     /// Aggregate per-cgroup statistics merged across every worker.
     pub stats: ScenarioStats,
     /// Monitor summary. `None` means the monitor loop did not run
@@ -553,6 +569,7 @@ impl SidecarResult {
             passed: true,
             skipped: false,
             inconclusive: false,
+            expected_failure: false,
             stats: crate::assert::ScenarioStats::default(),
             monitor: None,
             periodic_fired: 0,
@@ -1429,7 +1446,17 @@ fn summarize_one_run_dir(
         // failing sibling.
         stats_sidecars: Vec<PathBuf>,
         // OR of `is_fail` across all of this name's variant sidecars.
+        // Post-finalize the sidecar carries the FINAL (post-inversion)
+        // verdict, so a passing expect_err / expect_auto_repro test
+        // reads `false` here even though its scenario failed.
         any_fail: bool,
+        // True once ANY variant's stats sidecar parsed. A failure dump
+        // with NO parsed sidecar is a pre-sidecar failure (scheduler
+        // load / VM boot) that still flags FAILED; a dump alongside a
+        // parsed non-failing sidecar is an expected-failure run whose
+        // dump must NOT flag — the sidecar's final verdict already
+        // classified it.
+        any_sidecar_parsed: bool,
         // (scheduler, topology) of the FIRST failing variant seen,
         // for the FAILED block header; `None` when no variant sidecar
         // parsed as a failure (a dump-only pre-sidecar failure).
@@ -1476,6 +1503,7 @@ fn summarize_one_run_dir(
                     .and_then(|s| serde_json::from_str::<SidecarResult>(&s).ok())
                 {
                     Some(sc) => {
+                        acc.any_sidecar_parsed = true;
                         if sc.is_fail() {
                             acc.any_fail = true;
                             if acc.fail_variant.is_none() {
@@ -1505,15 +1533,19 @@ fn summarize_one_run_dir(
     }
     let mut failed = Vec::new();
     for (test_name, mut acc) in by_test {
-        // A test FAILED this run if ANY of its variant sidecars
-        // records `is_fail`, or it left a failure dump (real or
-        // placeholder). Dump presence covers pre-sidecar failures
-        // (scheduler load failure, VM boot failure) that never reach
-        // `write_sidecar`; the `is_fail` aggregate covers in-VM
-        // assertion failures — including one failing gauntlet variant
-        // among passing siblings.
+        // A test FAILED this run if ANY of its variant sidecars records
+        // `is_fail` (the FINAL post-inversion verdict), OR it left a
+        // failure dump WITHOUT any parsed sidecar. A dump with no sidecar
+        // is a pre-sidecar failure (scheduler load / VM boot) that never
+        // reached `write_sidecar` — it must still flag. But a dump
+        // alongside a parsed, non-failing sidecar is an expected-failure
+        // run (expect_err / expect_auto_repro) whose induced-crash dump
+        // must NOT flag: the sidecar's finalized verdict is authoritative.
+        // The `is_fail` aggregate covers in-VM assertion failures,
+        // including one failing gauntlet variant among passing siblings.
         let has_dump = acc.failure_dump.is_some() || acc.repro_failure_dump.is_some();
-        if !acc.any_fail && !has_dump {
+        let dump_only_failure = has_dump && !acc.any_sidecar_parsed;
+        if !acc.any_fail && !dump_only_failure {
             continue;
         }
         let (scheduler, topology) = match acc.fail_variant {
@@ -2712,7 +2744,118 @@ fn serialize_and_write_sidecar(sidecar: &SidecarResult, label: &str) -> anyhow::
             path.display(),
         )));
     }
+    LAST_SIDECAR_PATH.with(|p| *p.borrow_mut() = Some(path.clone()));
     Ok(())
+}
+
+thread_local! {
+    /// Absolute path of the most recent sidecar this thread wrote (via
+    /// [`serialize_and_write_sidecar`]). The dispatch run loop
+    /// ([`crate::test_support::eval::run_ktstr_test_inner`]) reads and
+    /// clears it after the run to finalize the persisted verdict to the
+    /// test's FINAL (post-inversion) outcome. nextest is process-per-test
+    /// so a run writes one sidecar; a value left from an earlier phase is
+    /// overwritten by the current write, so the take always yields this
+    /// run's sidecar.
+    static LAST_SIDECAR_PATH: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Take (read + clear) the path of the sidecar most recently written on
+/// this thread, or `None` when no sidecar was written this run (an
+/// early bail before any write). See [`LAST_SIDECAR_PATH`].
+///
+/// MUST be drained exactly once per run — `run_ktstr_test_inner` does
+/// this after each dispatch. The thread-local persists across calls in
+/// a process, so a caller that writes a sidecar WITHOUT a following take
+/// would leave a stale path for the next take to consume; in practice
+/// only `run_ktstr_test_inner` pairs a write with a take, and a stale
+/// path points at a dropped tempdir so the finalize read fails benignly.
+pub(crate) fn take_last_sidecar_path() -> Option<PathBuf> {
+    LAST_SIDECAR_PATH.with(|p| p.borrow_mut().take())
+}
+
+/// Overwrite a written sidecar's verdict bits with the test's FINAL
+/// (post-inversion) `(passed, skipped, inconclusive)` outcome — see
+/// [`crate::test_support::dispatch::Verdict::sidecar_bits`] — and set
+/// [`SidecarResult::expected_failure`] when an actual scenario
+/// failure/inconclusive was inverted to a pass/skip. Rewrites the file
+/// atomically (temp + rename).
+///
+/// A no-op when the final verdict already matches what was persisted (an
+/// ordinary pass/fail/skip — no `expect_err`/`expect_auto_repro`
+/// inversion). Best-effort: a read/parse/serialize/write error is
+/// surfaced on stderr and swallowed so the raw sidecar stands (the
+/// footer then falls back to it) rather than failing the run.
+pub(crate) fn finalize_sidecar_verdict(
+    path: &std::path::Path,
+    passed: bool,
+    skipped: bool,
+    inconclusive: bool,
+) {
+    let Ok(json) = std::fs::read_to_string(path) else {
+        return;
+    };
+    let Ok(mut sc) = serde_json::from_str::<SidecarResult>(&json) else {
+        eprintln!(
+            "ktstr: finalize_sidecar_verdict: unparseable sidecar {}",
+            path.display()
+        );
+        return;
+    };
+    // The run's telemetry is failure-mode-dominated when its scenario
+    // actually failed/was-inconclusive but the final verdict is a
+    // pass/skip (an inversion) — `stats compare` excludes such rows.
+    let raw_failed = sc.is_fail() || sc.is_inconclusive();
+    let expected_failure = raw_failed && (passed || skipped);
+    if sc.passed == passed
+        && sc.skipped == skipped
+        && sc.inconclusive == inconclusive
+        && sc.expected_failure == expected_failure
+    {
+        return;
+    }
+    sc.passed = passed;
+    sc.skipped = skipped;
+    sc.inconclusive = inconclusive;
+    sc.expected_failure = expected_failure;
+    let Ok(out) = serde_json::to_string_pretty(&sc) else {
+        return;
+    };
+    // Stage with a `.ktstr.json.tmp.…` suffix (append, NOT
+    // `with_extension`, which would drop `.json`) so a hard-crash orphan
+    // — write succeeded but rename did not — is reaped by
+    // `pre_clear_run_dir_once` via `is_sidecar_staging_filename`, the
+    // same way the primary write's staging file is.
+    let pid = std::process::id();
+    let mut staging = path.as_os_str().to_owned();
+    staging.push(format!(".tmp.finalize.{pid}"));
+    let staging = std::path::PathBuf::from(staging);
+    if std::fs::write(&staging, &out).is_ok() && std::fs::rename(&staging, path).is_err() {
+        let _ = std::fs::remove_file(&staging);
+    }
+}
+
+/// Remove the failure-dump artifacts (`{test}.failure-dump.json` and
+/// `{test}.repro.failure-dump.json`) for `test_name` in the current
+/// sidecar dir.
+///
+/// Called when a run's FINAL outcome is a pass/skip but it wrote NO
+/// sidecar — the run crashed before the guest produced a parseable
+/// result (e.g. an `expect_err` test with a host-triggered BPF crash),
+/// so [`finalize_sidecar_verdict`] had nothing to finalize. The freeze
+/// coordinator wrote the dump unconditionally; without a sidecar to mark
+/// the pass, the footer's dump-only trigger
+/// ([`summarize_one_run_dir`] flags a dump with no parsed sidecar) would
+/// surface this PASSING test as FAILED. Removing the dump keeps the
+/// footer consistent with nextest's pass. Best-effort: a missing dump
+/// (the normal clean-pass case) is fine. A genuine pre-sidecar failure
+/// (final = Fail) does NOT call this, so its dump still flags.
+pub(crate) fn suppress_failure_dumps(test_name: &str) {
+    let dir = sidecar_dir();
+    for suffix in [".failure-dump.json", ".repro.failure-dump.json"] {
+        let _ = std::fs::remove_file(dir.join(format!("{test_name}{suffix}")));
+    }
 }
 
 /// `Some(path)` when `KTSTR_SIDECAR_DIR` is set non-empty,
@@ -3238,6 +3381,7 @@ pub(crate) fn write_skip_sidecar(entry: &KtstrTestEntry) -> anyhow::Result<()> {
         passed: false,
         skipped: true,
         inconclusive: false,
+        expected_failure: false,
         stats: Default::default(),
         monitor: None,
         // A skip never ran the VM, so no periodic captures fired.
@@ -3313,6 +3457,10 @@ pub(crate) fn write_sidecar(
         passed: check_result.is_pass(),
         skipped: check_result.is_skip(),
         inconclusive: check_result.is_inconclusive(),
+        // Raw scenario verdict at write time; the dispatch-layer
+        // finalize (finalize_sidecar_verdict) overwrites these bits with
+        // the post-inversion outcome and sets expected_failure.
+        expected_failure: false,
         stats: check_result.stats.clone(),
         monitor: vm_result.monitor.as_ref().map(|m| m.summary.clone()),
         periodic_fired: vm_result.periodic_fired,
