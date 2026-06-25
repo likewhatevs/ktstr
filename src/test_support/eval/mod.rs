@@ -2572,9 +2572,7 @@ fn evaluate_vm_result(
         // A sidecar write failure is logged but not propagated: the test
         // verdict itself is still valid — only post-run stats tooling
         // loses visibility.
-        let args: Vec<String> = std::env::args().collect();
-        let work_type =
-            super::args::extract_work_type_arg(&args).unwrap_or_else(|| "SpinWait".to_string());
+        let work_type = super::args::current_work_type();
         if let Err(e) = write_sidecar(
             entry,
             result,

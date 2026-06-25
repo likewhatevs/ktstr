@@ -3332,10 +3332,12 @@ fn acquire_run_dir_flock_with_timeout(
 ///      VM never booted).
 ///
 ///    These paths write a MINIMAL sidecar: empty VM telemetry,
-///    `work_type = "skipped"`, and `payload` pinned to the entry's
-///    declared payload so stats can still attribute the skip to
-///    the correct gauntlet variant. There is no VmResult to drain
-///    because the VM didn't boot.
+///    `skipped: true`, and BOTH `payload` and `work_type` resolved
+///    exactly as a run of this config would (the entry's declared
+///    payload and [`crate::test_support::args::current_work_type`]) so
+///    the skip shares the run's variant identity — a later run of the
+///    same config overwrites this skip's sidecar instead of coexisting
+///    with it. There is no VmResult to drain because the VM didn't boot.
 ///
 /// 2. **In-VM `AssertResult::skip` returns** — e.g. the
 ///    empty-cpuset skip in `scenario::run_scenario`
@@ -3389,14 +3391,21 @@ pub(crate) fn write_skip_sidecar(entry: &KtstrTestEntry) -> anyhow::Result<()> {
         periodic_target: 0,
         // A skip never booted the VM, so it has no measured budget. 0/0
         // maps to None on the GauntletRow's cpu_budget dim (skips carry no
-        // budget identity, like work_type="skipped").
+        // budget identity; the skipped=true flag, not a sentinel field
+        // value, marks them).
         vcpus: 0,
         cpu_budget: 0,
         stimulus_events: Vec::new(),
-        // Skip paths never ran a workload; work_type is "skipped"
-        // so stats tooling that groups by work_type puts these in a
-        // distinguishable bucket.
-        work_type: "skipped".to_string(),
+        // A skip never ran the workload, but it carries the SAME
+        // work_type a run of this config would (current_work_type reads
+        // the per-variant --ktstr-work-type arg, identical across nextest
+        // retry attempts). That keeps the skip's variant_hash equal to
+        // the run's, so a flaky test that skips on one attempt and runs
+        // on the retry writes one sidecar (the retry overwrites the skip)
+        // rather than two coexisting files the footer would both flag.
+        // Skips stay identified by skipped=true, not by a work_type
+        // sentinel (see the variant-hash + skipped-bool contract above).
+        work_type: super::args::current_work_type(),
         verifier_stats: Vec::new(),
         kvm_stats: None,
         sysctls,

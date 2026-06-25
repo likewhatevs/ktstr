@@ -69,6 +69,36 @@ pub(crate) fn extract_work_type_arg(args: &[String]) -> Option<String> {
     None
 }
 
+/// The current run's `work_type` label, read from this process's args.
+///
+/// `--ktstr-work-type=NAME` (set per payload-gauntlet variant by the
+/// dispatch) when present, else `"SpinWait"` — the default for a plain
+/// test that drives no parameterized workload.
+///
+/// Distinct from [`crate::workload::resolve_work_type`], which resolves
+/// a workload's effective [`WorkType`] (override + swappable logic)
+/// during scenario setup; this returns the label STRING recorded in the
+/// sidecar.
+///
+/// This is the SINGLE source of the `work_type` that flows into a
+/// sidecar's `work_type` field and thus into [`sidecar_variant_hash`].
+/// Both the run path (`run_ktstr_test_inner`) and the pre-VM-boot skip
+/// path ([`write_skip_sidecar`]) call it, so a skip and a run of the
+/// SAME config compute the IDENTICAL `work_type` — and therefore the
+/// same variant hash, so a flaky test that skips on one attempt and
+/// runs on a retry writes to one sidecar file (the retry overwrites the
+/// skip) instead of two coexisting files. `std::env::args()` is the
+/// same across nextest retry attempts of one test (same invocation), so
+/// the value is stable per config.
+///
+/// [`WorkType`]: crate::workload::WorkType
+/// [`sidecar_variant_hash`]: crate::test_support::sidecar::sidecar_variant_hash
+/// [`write_skip_sidecar`]: crate::test_support::sidecar::write_skip_sidecar
+pub(crate) fn current_work_type() -> String {
+    let args: Vec<String> = std::env::args().collect();
+    extract_work_type_arg(&args).unwrap_or_else(|| "SpinWait".to_string())
+}
+
 /// Extract `--ktstr-export-test=NAME` from the argument list. Used by
 /// the test binary's ctor to detect a `cargo ktstr export` self-export
 /// dispatch (the binary embeds itself rather than letting cargo-ktstr

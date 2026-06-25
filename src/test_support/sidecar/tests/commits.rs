@@ -63,8 +63,18 @@ fn write_skip_sidecar_records_skip_mutex() {
         "skip sidecar must read exclusively as Skip — not Pass, Fail, or Inconclusive",
     );
     assert_eq!(
+        loaded.work_type,
+        crate::test_support::args::current_work_type(),
+        "the skip sidecar carries the SAME work_type a run of this config would \
+         (current_work_type), so a skip and a run of one config share a variant_hash \
+         and a retry overwrites the prior attempt instead of leaving two coexisting \
+         sidecars the footer would both flag — skips stay marked by skipped=true, not \
+         a work_type sentinel",
+    );
+    assert_ne!(
         loaded.work_type, "skipped",
-        "skip path uses the 'skipped' work_type bucket so grouping keeps the skip distinguishable",
+        "the 'skipped' work_type sentinel is retired; skips are identified by the \
+         skipped=true bool, and the work_type must match the run path's value",
     );
     // write_skip_sidecar shares the host-context capture with
     // write_sidecar (same `collect_host_context()` builder line)
@@ -91,6 +101,84 @@ fn write_skip_sidecar_records_skip_mutex() {
     assert!(
         host.kernel_release.is_some(),
         "write_skip_sidecar must capture kernel_release (syscall-sourced)",
+    );
+}
+
+/// Regression lock. The footer false-positive came from a flaky
+/// test that host-SKIPPED on one nextest attempt and RAN on the retry:
+/// the skip path hardcoded `work_type="skipped"` while the run used the
+/// real work_type, so the two sidecars got DIFFERENT variant_hashes,
+/// coexisted in the run dir, and `summarize_one_run_dir`'s any_fail OR
+/// flagged the test. Now both paths resolve work_type via
+/// `current_work_type`, so a skip and a run of ONE config share a
+/// variant_hash (and thus a filename) and the retry's run OVERWRITES the
+/// skip — one sidecar on disk, footer clean.
+///
+/// The lock is the second `find_single_sidecar_by_prefix`: if the hashes
+/// diverged again it would find TWO files and fail its `len == 1`
+/// assertion, naming both stale paths.
+#[test]
+fn skip_then_run_of_same_config_overwrites_one_sidecar() {
+    let _lock = lock_env();
+    let tmp = tempfile::Builder::new()
+        .prefix("ktstr-sidecar-skip-run-overwrite-test-")
+        .tempdir()
+        .expect("create tempdir");
+    let _env_sidecar = EnvVarGuard::set(crate::KTSTR_SIDECAR_DIR_ENV, tmp.path());
+
+    fn dummy(_ctx: &Ctx) -> Result<AssertResult> {
+        Ok(AssertResult::pass())
+    }
+    let entry = KtstrTestEntry {
+        name: "__skip_run_overwrite__",
+        func: dummy,
+        auto_repro: false,
+        ..KtstrTestEntry::DEFAULT
+    };
+
+    // Attempt 1: pre-VM-boot host skip (e.g. ResourceContention).
+    write_skip_sidecar(&entry).expect("skip sidecar must write");
+    let skip_path = find_single_sidecar_by_prefix(tmp.path(), "__skip_run_overwrite__-");
+    let skip: SidecarResult =
+        serde_json::from_str(&std::fs::read_to_string(&skip_path).unwrap()).unwrap();
+    assert!(skip.skipped, "attempt 1 is a skip");
+
+    // Attempt 2 (the retry): a real run of the SAME config. The run path
+    // forwards current_work_type() — the same value write_skip_sidecar
+    // resolved internally — so the variant_hash, and thus the filename,
+    // matches and this write overwrites attempt 1's file.
+    let vm_result = crate::vmm::VmResult::test_fixture();
+    let ok = AssertResult::pass();
+    write_sidecar(
+        &entry,
+        &vm_result,
+        &[],
+        &ok,
+        &crate::test_support::args::current_work_type(),
+        &[],
+    )
+    .unwrap();
+
+    // The retry OVERWROTE the skip: still exactly one sidecar for this
+    // test (find_single_sidecar_by_prefix asserts len == 1), at the same
+    // path, now reading as a run rather than a skip.
+    let run_path = find_single_sidecar_by_prefix(tmp.path(), "__skip_run_overwrite__-");
+    assert_eq!(
+        run_path, skip_path,
+        "the run's variant_hash must equal the skip's so the retry \
+         overwrites the SAME file — divergent hashes would coexist and the \
+         footer would flag the stale skip attempt",
+    );
+    let run: SidecarResult =
+        serde_json::from_str(&std::fs::read_to_string(&run_path).unwrap()).unwrap();
+    assert!(
+        !run.skipped && run.passed,
+        "the retry's run sidecar overwrote the skip — final on-disk state is the pass",
+    );
+    assert_eq!(
+        sidecar_variant_hash(&skip),
+        sidecar_variant_hash(&run),
+        "core invariant: a skip and a run of one config share a variant_hash",
     );
 }
 
