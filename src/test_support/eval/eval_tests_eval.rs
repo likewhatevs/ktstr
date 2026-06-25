@@ -5,8 +5,9 @@ use super::super::output::{
     STAGE_INIT_NOT_STARTED, STAGE_INIT_STARTED_NO_PAYLOAD, STAGE_PAYLOAD_STARTED_NO_RESULT,
 };
 use super::super::test_helpers::{
-    EVAL_TOPO, EnvVarGuard, build_assert_result, eevdf_entry, isolated_cache_dir, lifecycle_drain,
-    lock_env, make_vm_result, make_vm_result_with_assert, no_repro, sched_entry,
+    EVAL_TOPO, EnvVarGuard, build_assert_result, eevdf_entry, isolated_cache_dir,
+    isolated_sidecar_dir, lifecycle_drain, lock_env, make_vm_result, make_vm_result_with_assert,
+    no_repro, sched_entry,
 };
 use super::*;
 use crate::assert::{AssertDetail, DetailKind};
@@ -302,6 +303,8 @@ fn eval_sched_ext_dump_included() {
 
 #[test]
 fn eval_check_result_passed_returns_ok() {
+    let _lock = lock_env();
+    let _sd = isolated_sidecar_dir();
     let assert = build_assert_result(true, vec![]);
     let entry = eevdf_entry("__eval_pass__");
     let result = make_vm_result_with_assert("", "", 0, false, &assert);
@@ -325,6 +328,8 @@ fn eval_check_result_passed_returns_ok() {
 
 #[test]
 fn eval_check_result_skip_returns_ok() {
+    let _lock = lock_env();
+    let _sd = isolated_sidecar_dir();
     // Regression: an in-VM scenario skip (AssertResult::skip — e.g. the
     // booted topology is below the scenario's CPU/LLC floor) must
     // project to Ok so the exit-code path maps it to EXIT_PASS, NOT be
@@ -355,6 +360,8 @@ fn eval_check_result_skip_returns_ok() {
 
 #[test]
 fn eval_check_result_failed_includes_details() {
+    let _lock = lock_env();
+    let _sd = isolated_sidecar_dir();
     let assert = build_assert_result(
         false,
         vec![
@@ -397,6 +404,8 @@ fn eval_check_result_failed_includes_details() {
 /// `bail!` error string downstream.
 #[test]
 fn eval_cleanup_budget_overshoot_folds_failing_detail() {
+    let _lock = lock_env();
+    let _sd = isolated_sidecar_dir();
     let assert = build_assert_result(true, vec![]);
     let mut entry = eevdf_entry("__eval_cleanup_overshoot__");
     entry.cleanup_budget = Some(std::time::Duration::from_secs(1));
@@ -441,6 +450,8 @@ fn eval_cleanup_budget_overshoot_folds_failing_detail() {
 /// [`eval_cleanup_budget_equal_passes`].
 #[test]
 fn eval_cleanup_budget_under_passes() {
+    let _lock = lock_env();
+    let _sd = isolated_sidecar_dir();
     let assert = build_assert_result(true, vec![]);
     let mut entry = eevdf_entry("__eval_cleanup_under__");
     entry.cleanup_budget = Some(std::time::Duration::from_secs(5));
@@ -474,6 +485,8 @@ fn eval_cleanup_budget_under_passes() {
 /// {<, ==, >} comparator triplet.
 #[test]
 fn eval_cleanup_budget_equal_passes() {
+    let _lock = lock_env();
+    let _sd = isolated_sidecar_dir();
     let assert = build_assert_result(true, vec![]);
     let mut entry = eevdf_entry("__eval_cleanup_equal__");
     entry.cleanup_budget = Some(std::time::Duration::from_secs(5));
@@ -500,6 +513,8 @@ fn eval_cleanup_budget_equal_passes() {
 
 #[test]
 fn eval_assert_failure_includes_sched_log() {
+    let _lock = lock_env();
+    let _sd = isolated_sidecar_dir();
     let assert = build_assert_result(
         false,
         vec![AssertDetail::new(
@@ -538,6 +553,8 @@ fn eval_assert_failure_includes_sched_log() {
 
 #[test]
 fn eval_assert_failure_has_fingerprint() {
+    let _lock = lock_env();
+    let _sd = isolated_sidecar_dir();
     let assert = build_assert_result(
         false,
         vec![AssertDetail::new(DetailKind::Stuck, "stuck 3000ms")],
@@ -634,6 +651,8 @@ fn eval_no_result_has_fingerprint() {
 
 #[test]
 fn eval_no_sched_output_no_fingerprint() {
+    let _lock = lock_env();
+    let _sd = isolated_sidecar_dir();
     let assert = build_assert_result(false, vec![AssertDetail::new(DetailKind::Stuck, "stuck")]);
     let entry = eevdf_entry("__eval_no_fp__");
     let result = make_vm_result_with_assert("", "", 0, false, &assert);
@@ -658,6 +677,8 @@ fn eval_no_sched_output_no_fingerprint() {
 
 #[test]
 fn eval_monitor_fail_has_fingerprint() {
+    let _lock = lock_env();
+    let _sd = isolated_sidecar_dir();
     let pass_assert = build_assert_result(true, vec![]);
     let error_line = "Error: imbalance detected internally";
     let output = format!("{SCHED_OUTPUT_START}\nstarting\n{error_line}\n{SCHED_OUTPUT_END}",);
@@ -1008,6 +1029,8 @@ fn eval_crash_message_from_field() {
 
 #[test]
 fn eval_sched_exit_includes_console() {
+    let _lock = lock_env();
+    let _sd = isolated_sidecar_dir();
     let assert = build_assert_result(
         false,
         vec![AssertDetail::new(
@@ -1040,6 +1063,8 @@ fn eval_sched_exit_includes_console() {
 
 #[test]
 fn eval_sched_exit_includes_monitor() {
+    let _lock = lock_env();
+    let _sd = isolated_sidecar_dir();
     let assert = build_assert_result(
         false,
         vec![AssertDetail::new(
@@ -1120,6 +1145,8 @@ fn eval_sched_exit_includes_monitor() {
 
 #[test]
 fn eval_monitor_fail_includes_sched_log() {
+    let _lock = lock_env();
+    let _sd = isolated_sidecar_dir();
     let pass_assert = build_assert_result(true, vec![]);
     let output = format!("{SCHED_OUTPUT_START}\nscheduler debug output here\n{SCHED_OUTPUT_END}",);
     let entry = sched_entry("__eval_monitor_fail_sched__");
@@ -1247,6 +1274,8 @@ fn eval_monitor_fail_includes_sched_log() {
 ///    loudly.
 #[test]
 fn phase_buckets_equals_stats_phases_and_post_vm_read_does_not_starve() {
+    let _lock = lock_env();
+    let _sd = isolated_sidecar_dir();
     let pass_assert = build_assert_result(true, vec![]);
     let entry = sched_entry("__eval_phase_buckets_eq__");
     let result = crate::vmm::VmResult {
@@ -1319,6 +1348,8 @@ fn phase_buckets_equals_stats_phases_and_post_vm_read_does_not_starve() {
 /// subset of `stats.phases`), so this `assert_eq!` would have failed.
 #[test]
 fn phase_buckets_equals_stats_phases_with_guest_per_cgroup_carriers() {
+    let _lock = lock_env();
+    let _sd = isolated_sidecar_dir();
     // Passing guest AssertResult carrying a per-cgroup carrier at
     // step_index=1; the captures below stamp the same step_index, so the
     // carrier takes the matched arm and unions its per_cgroup into that bucket.
@@ -1407,6 +1438,8 @@ fn phase_buckets_equals_stats_phases_with_guest_per_cgroup_carriers() {
 /// otherwise green.
 #[test]
 fn evaluate_failure_message_renders_per_cgroup_via_folded_timeline() {
+    let _lock = lock_env();
+    let _sd = isolated_sidecar_dir();
     use crate::timeline::StimulusEvent;
     // A FAILING guest AssertResult -> evaluate_vm_result takes the failure arm
     // (returns Err with the rendered message).
@@ -1524,6 +1557,8 @@ fn evaluate_failure_message_renders_per_cgroup_via_folded_timeline() {
 /// from_phase_buckets path.
 #[test]
 fn evaluate_synthesizes_phase_buckets_for_uncaptured_steps() {
+    let _lock = lock_env();
+    let _sd = isolated_sidecar_dir();
     use crate::timeline::StimulusEvent;
     let pass_assert = build_assert_result(true, vec![]);
     let entry = sched_entry("__eval_synthesize_uncaptured__");
@@ -1603,6 +1638,8 @@ fn evaluate_synthesizes_phase_buckets_for_uncaptured_steps() {
 /// check_result.stats.phases (the durable sidecar telemetry).
 #[test]
 fn evaluate_folds_guest_per_cgroup_into_host_phase_buckets() {
+    let _lock = lock_env();
+    let _sd = isolated_sidecar_dir();
     use crate::timeline::StimulusEvent;
     let mut guest_assert = build_assert_result(true, vec![]);
     let mut per_cgroup = std::collections::BTreeMap::new();
@@ -2109,6 +2146,8 @@ ktstr-1 [001] 0.501: sched_ext_dump:   apply_cell_config returned -EINVAL
 /// fixture leaves `info_notes` empty.
 #[test]
 fn eval_failure_renders_info_notes_section() {
+    let _lock = lock_env();
+    let _sd = isolated_sidecar_dir();
     let mut assert = build_assert_result(
         false,
         vec![AssertDetail::new(DetailKind::Stuck, "stuck 9000ms")],
@@ -2160,6 +2199,8 @@ fn eval_failure_renders_info_notes_section() {
 /// value so the index loop is proven to run for both cgroups.
 #[test]
 fn eval_failure_renders_stats_section_with_spread_na() {
+    let _lock = lock_env();
+    let _sd = isolated_sidecar_dir();
     let mut assert = build_assert_result(
         false,
         vec![AssertDetail::new(DetailKind::Unfair, "spread too wide")],
@@ -2244,6 +2285,8 @@ fn eval_failure_renders_stats_section_with_spread_na() {
 /// the no-parseable-result arm.
 #[test]
 fn eval_failure_repro_section_on_guest_fail() {
+    let _lock = lock_env();
+    let _sd = isolated_sidecar_dir();
     let assert = build_assert_result(
         false,
         vec![AssertDetail::new(DetailKind::Stuck, "worker 0 stuck")],
@@ -2282,6 +2325,8 @@ fn eval_failure_repro_section_on_guest_fail() {
 /// returned Some — so NO `--- auto-repro ---` section renders.
 #[test]
 fn eval_failure_no_repro_section_without_active_scheduling() {
+    let _lock = lock_env();
+    let _sd = isolated_sidecar_dir();
     let assert = build_assert_result(
         false,
         vec![AssertDetail::new(DetailKind::Stuck, "worker 0 stuck")],
@@ -2323,6 +2368,8 @@ fn eval_failure_no_repro_section_without_active_scheduling() {
 /// the merged verdict is inconclusive.
 #[test]
 fn eval_monitor_inconclusive_folds_into_verdict() {
+    let _lock = lock_env();
+    let _sd = isolated_sidecar_dir();
     let pass_assert = build_assert_result(true, vec![]);
     let entry = sched_entry("__eval_monitor_inconclusive__");
     // 30 samples, 2 CPUs each, ALL with rq_clock == 1000 -> after the
@@ -2455,6 +2502,8 @@ fn eval_monitor_inconclusive_folds_into_verdict() {
 /// is_pass=false`, so the failure-render block runs.
 #[test]
 fn eval_inconclusive_verdict_word_in_header() {
+    let _lock = lock_env();
+    let _sd = isolated_sidecar_dir();
     let mut assert = build_assert_result(true, vec![]);
     assert.merge(crate::assert::AssertResult::inconclusive(
         AssertDetail::new(DetailKind::Other, "zero-denominator metric"),
@@ -2508,6 +2557,8 @@ fn eval_inconclusive_verdict_word_in_header() {
 /// setting `expect_err = true` pins the substring-not-found text).
 #[test]
 fn eval_scx_bpf_error_matcher_mismatch_wraps_context() {
+    let _lock = lock_env();
+    let _sd = isolated_sidecar_dir();
     let assert = build_assert_result(true, vec![]);
     let mut entry = sched_entry("__eval_scx_matcher_mismatch__");
     entry.expect_err = true;
@@ -2550,6 +2601,8 @@ fn eval_scx_bpf_error_matcher_mismatch_wraps_context() {
 /// `Ok`, so there would be no `Err` to inspect.
 #[test]
 fn eval_no_matcher_no_mismatch_context() {
+    let _lock = lock_env();
+    let _sd = isolated_sidecar_dir();
     let assert = build_assert_result(
         false,
         vec![AssertDetail::new(DetailKind::Stuck, "independent failure")],
@@ -2589,6 +2642,8 @@ fn eval_no_matcher_no_mismatch_context() {
 /// text from that block's `format!("post_vm callback returned Err: {err:#}")`.
 #[test]
 fn eval_post_vm_err_folds_into_guest_pass() {
+    let _lock = lock_env();
+    let _sd = isolated_sidecar_dir();
     let assert = build_assert_result(true, vec![]);
     let entry = eevdf_entry("__eval_post_vm_fold__");
     let result = make_vm_result_with_assert("", "", 0, false, &assert);
@@ -2627,6 +2682,8 @@ fn eval_post_vm_err_folds_into_guest_pass() {
 /// host-extract detail in the details block.
 #[test]
 fn eval_host_extract_failures_fold_into_guest_pass() {
+    let _lock = lock_env();
+    let _sd = isolated_sidecar_dir();
     let assert = build_assert_result(true, vec![]);
     let entry = eevdf_entry("__eval_host_extract_fold__");
     let result = make_vm_result_with_assert("", "", 0, false, &assert);
@@ -2740,6 +2797,7 @@ fn eval_sched_log_truncates_over_200_lines() {
 #[test]
 fn eval_failure_renders_bug_summary_line_via_closure() {
     let _lock = lock_env();
+    let _sd = isolated_sidecar_dir();
     let assert = build_assert_result(false, vec![AssertDetail::new(DetailKind::Stuck, "stuck")]);
     let output =
         format!("{SCHED_OUTPUT_START}\nscx_bpf_error: cell config invalid\n{SCHED_OUTPUT_END}",);
@@ -2791,6 +2849,8 @@ fn eval_failure_renders_bug_summary_line_via_closure() {
 /// missing-samples line renders (`fired < target` true).
 #[test]
 fn eval_failure_renders_periodic_samples_section() {
+    let _lock = lock_env();
+    let _sd = isolated_sidecar_dir();
     let assert = build_assert_result(false, vec![AssertDetail::new(DetailKind::Stuck, "stuck")]);
     let entry = eevdf_entry("__eval_periodic_section__");
     let result = crate::vmm::VmResult {
@@ -2850,6 +2910,8 @@ fn eval_failure_renders_periodic_samples_section() {
 /// `"{n} temporal assertion entry(ies):"` push.
 #[test]
 fn eval_failure_renders_temporal_assertions_section() {
+    let _lock = lock_env();
+    let _sd = isolated_sidecar_dir();
     let assert = build_assert_result(
         false,
         vec![AssertDetail::new(
@@ -2952,6 +3014,8 @@ fn eval_noresult_eevdf_with_sched_output_suppresses_console_section() {
 /// the rendered failure message carries no monitor section.
 #[test]
 fn eval_sched_fail_with_no_monitor_omits_monitor_section() {
+    let _lock = lock_env();
+    let _sd = isolated_sidecar_dir();
     let assert = build_assert_result(
         false,
         vec![AssertDetail::new(DetailKind::Stuck, "worker 0 stuck")],
