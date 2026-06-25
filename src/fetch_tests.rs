@@ -2865,6 +2865,37 @@ fn ls_remote_short_hash_uses_full_sha_directly_without_network() {
     );
 }
 
+/// Regression: `ls_remote_short_hash` must resolve a BRANCH ref. The
+/// bug was gix's default `Options` (`prefix_from_spec_as_filter_on_remote
+/// = true`): over a protocol-v2 `ls-refs` it derives ref-prefix filters
+/// from the anonymous remote's refspecs, and with empty fetch specs +
+/// `fetch_tags = Included` that ls-refs prefix is `refs/tags` ONLY — so
+/// `refs/heads/*` never reach `remote_refs` and a branch ref resolves to
+/// `None`, defeating `resolve_git_kernel`'s clone-skip (every run
+/// re-cloned). The fix sets the flag `false`. A `Some(_)` here is only
+/// reachable once `refs/heads/for-next` reaches `remote_refs`, so
+/// reverting the flag turns this red — the sole test that pins the
+/// `ref_map` Options path (the `match_ref_short_hash_*` unit tests feed
+/// synthetic ref vectors and never exercise it).
+///
+/// `#[ignore]`: hits the live sched_ext remote over the network (project
+/// convention for network-fetch tests). The filtering is protocol-v2
+/// `ls-refs` behavior — a v1 handshake advertises all refs, so a local
+/// v1 mock would not reproduce it. Run with `--run-ignored` on a
+/// networked host.
+#[test]
+#[ignore = "network: live ls-remote against git.kernel.org sched_ext (protocol v2)"]
+fn ls_remote_short_hash_resolves_branch_over_v2() {
+    let url = "https://git.kernel.org/pub/scm/linux/kernel/git/tj/sched_ext.git";
+    let hash = ls_remote_short_hash(url, "for-next")
+        .expect("for-next branch must resolve over v2 ls-refs — the prefix filter must be off");
+    assert_eq!(hash.len(), 7, "short hash is the first 7 hex chars: {hash}");
+    assert!(
+        hash.bytes().all(|b| b.is_ascii_hexdigit()),
+        "short hash must be hex: {hash}",
+    );
+}
+
 fn direct_ref(name: &str, hex: &str) -> gix::protocol::handshake::Ref {
     gix::protocol::handshake::Ref::Direct {
         full_ref_name: name.into(),

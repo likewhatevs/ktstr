@@ -1497,8 +1497,9 @@ fn is_full_sha(git_ref: &str) -> bool {
 /// sha-capable clone. It trusts the hex verbatim (no remote validation) —
 /// harmless while sha-clone is rejected, since an unbuildable sha has no
 /// cache entry. The ad-hoc bare repo (`gix::init` on a tempdir) carries
-/// no working tree and fetches no pack; `ref_map` only lists the remote's
-/// advertised refs.
+/// no working tree and fetches no pack; `ref_map` lists every advertised
+/// ref (remote-side ref-prefix filtering is disabled — see the body) without
+/// fetching a pack.
 pub fn ls_remote_short_hash(url: &str, git_ref: &str) -> Option<String> {
     if is_full_sha(git_ref) {
         return Some(git_ref[..7].to_ascii_lowercase());
@@ -1510,7 +1511,20 @@ pub fn ls_remote_short_hash(url: &str, git_ref: &str) -> Option<String> {
     let (refmap, _handshake) = conn
         .ref_map(
             gix::progress::Discard,
-            gix::remote::ref_map::Options::default(),
+            gix::remote::ref_map::Options {
+                // ls-remote semantics: list EVERY advertised ref. gix's
+                // default (`prefix_from_spec_as_filter_on_remote = true`)
+                // derives protocol-v2 `ls-refs` `ref-prefix` filters from the
+                // remote's fetch refspecs; an anonymous `remote_at` has none,
+                // and `fetch_tags = Included` injects only `refs/tags/*`, so
+                // the server returns TAGS ONLY and `refs/heads/*` never
+                // arrive — a branch `git_ref` then resolves to `None` and the
+                // clone-skip never fires (every run re-clones). Disabling the
+                // remote-side filter returns all refs, so a branch, tag, or
+                // HEAD `git_ref` all resolve.
+                prefix_from_spec_as_filter_on_remote: false,
+                ..Default::default()
+            },
         )
         .ok()?;
     match_ref_short_hash(&refmap.remote_refs, git_ref)
