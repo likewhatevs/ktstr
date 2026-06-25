@@ -1402,42 +1402,50 @@ fn probe_latest_patch(client: &Client, prefix: &str, cli_label: &str) -> Result<
     }
 }
 
-/// Clone a git repository with shallow depth.
-///
-/// `cli_label` prefixes diagnostic status output (e.g. `"ktstr"` or
-/// `"cargo ktstr"`).
-///
-/// `mp` is the progress group a determinate clone bar is added to;
-/// `None` disables the bar and passes `gix::progress::Discard` to gix
-/// exactly as before (the single-shot `kernel build` paths and unit
-/// tests pass `None`). The bar shows real object/file counts + ETA
-/// during the receiving / resolving / checkout phases that gix reports
-/// a bounded total for; see the `crate::cli::progress` module.
 /// Cache key for a git-cloned kernel: the raw user ref verbatim, the
-/// resolved commit's short hash (first 7 hex chars of the 40-hex), the
-/// target arch, and the kconfig-fragment suffix. The SINGLE
-/// construction site, shared by [`git_clone`] (post-clone, from
-/// `head_id`) and the pre-clone ls-remote cache probe in
-/// `resolve_git_kernel` — a drift between the two would make the probe
-/// miss the entry the clone wrote and defeat the clone-skip.
-pub fn git_cache_key(git_ref: &str, short_hash: &str) -> String {
+/// resolved commit's FULL hash, the target arch, and the
+/// kconfig-fragment suffix. The SINGLE construction site, shared by
+/// [`git_clone`] (post-clone, from `head_id`) and the pre-clone
+/// ls-remote cache probe in `resolve_git_kernel` — a drift between the
+/// two would make the probe miss the entry the clone wrote and defeat
+/// the clone-skip.
+///
+/// The FULL 40-hex commit hash keys the entry (not a 7-hex prefix): a
+/// branch/tag tip moves over time, so the `{git_ref}` segment alone
+/// cannot distinguish successive commits — only the hash does. A 7-hex
+/// (28-bit) prefix would let a moved tip whose new commit shares the
+/// first 7 hex with the cached old commit hit the stale entry and serve
+/// the wrong kernel build under the new ref. The full id removes that
+/// collision class; the probe and clone both render full lowercase hex
+/// before any truncation, so keying on it is drift-free.
+pub fn git_cache_key(git_ref: &str, commit_hash: &str) -> String {
     let (arch, _) = arch_info();
     format!(
-        "{git_ref}-git-{short_hash}-{arch}-kc{}",
+        "{git_ref}-git-{commit_hash}-{arch}-kc{}",
         crate::cache_key_suffix()
     )
 }
 
-/// Resolve `git_ref` to its tip COMMIT's short hash (first 7 hex chars)
-/// among the `refs` a remote advertised, mirroring git's ref precedence
-/// so the result keys the same cache entry a clone (`with_ref_name`)
-/// would write: an explicit `refs/` path, else `refs/heads/{ref}`, else
+/// Resolve `git_ref` to its tip COMMIT's full hash among the `refs` a
+/// remote advertised, for the pre-clone cache probe. Precedence: an
+/// explicit `refs/` path, else `refs/heads/{ref}`, else
 /// `refs/tags/{ref}`, else `HEAD`. For an annotated tag (`Ref::Peeled`)
 /// the peeled commit (`object`) is used, never the tag object;
 /// `Ref::Unborn` carries no commit and is skipped. `None` when no ref
 /// matches. Pure over `refs` so the precedence + tag-peeling are
 /// unit-testable without a network handshake.
-fn match_ref_short_hash(refs: &[gix::protocol::handshake::Ref], git_ref: &str) -> Option<String> {
+///
+/// This is a best-effort guess at the commit a clone would land on; it
+/// does NOT perfectly mirror the shallow clone in every case. This probe
+/// applies heads-before-tags precedence, whereas the shallow clone
+/// ([`git_clone`], `DepthAtRemote(1)`) resolves the bare ref via gix's
+/// DWIM across heads AND tags and errors `RefNameAmbiguous` when a remote
+/// advertises both a branch and a tag of that name — where this probe
+/// instead returns the branch commit. A mismatch only costs a redundant
+/// clone (the post-clone re-check in `resolve_git_kernel` is
+/// authoritative); it never serves a wrong build, since [`git_cache_key`]
+/// embeds the full commit hash returned here.
+fn match_ref_commit_hash(refs: &[gix::protocol::handshake::Ref], git_ref: &str) -> Option<String> {
     let pick = |target: &str| -> Option<gix::hash::ObjectId> {
         refs.iter().find_map(|r| {
             let (name, object) = match r {
@@ -1467,42 +1475,43 @@ fn match_ref_short_hash(refs: &[gix::protocol::handshake::Ref], git_ref: &str) -
         .or_else(|| pick(&format!("refs/heads/{git_ref}")))
         .or_else(|| pick(&format!("refs/tags/{git_ref}")))
         .or_else(|| (git_ref == "HEAD").then(|| pick("HEAD")).flatten())?;
-    Some(format!("{object}").chars().take(7).collect())
+    Some(format!("{object}"))
 }
 
 /// True when `git_ref` is a full 40-char hex commit id — recognizable
 /// as a sha without a remote handshake. A 39/41-char ref, or any
 /// 40-char ref carrying a non-hex byte, is a name (branch/tag) and
 /// falls through to ls-remote. Case is not normalized here (the caller
-/// lowercases the kept prefix to match `git_clone`'s rendering).
+/// lowercases the full hash to match `git_clone`'s rendering).
 fn is_full_sha(git_ref: &str) -> bool {
     git_ref.len() == 40 && git_ref.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-/// Resolve `git_ref` to its tip commit's short hash (first 7 hex)
-/// WITHOUT cloning, via an ls-remote handshake, so
-/// [`crate::cli::resolve_git_kernel`] can probe the cache before the
-/// expensive full clone. Returns `None` (best-effort) on ANY failure —
-/// network, auth, or an unadvertised ref — so the caller falls through
-/// to the clone, which resolves the ref authoritatively.
+/// Resolve `git_ref` to its tip commit's FULL hash WITHOUT cloning, via
+/// an ls-remote handshake, so [`crate::cli::resolve_git_kernel`] can
+/// probe the cache before the expensive full clone. Returns `None`
+/// (best-effort) on ANY failure — network, auth, or an unadvertised ref
+/// — so the caller falls through to the clone, which resolves the ref
+/// authoritatively.
 ///
-/// A full 40-hex `git_ref` is taken directly (no handshake): its first-7
-/// matches [`git_clone`]'s post-clone `head_id` byte-for-byte (gix
-/// `Id`/`ObjectId` `Display` both emit the full lowercase hex), so it
-/// builds the key a sha-clone would write — see [`git_cache_key`].
-/// [`git_clone`] currently REJECTS a raw-sha `git_ref` (a bare commit
-/// cannot be fetched), so for a sha this probe always misses and the
-/// clone then surfaces the actionable error; the branch is kept because
-/// it avoids a handshake on that reject path and is ready for a future
-/// sha-capable clone. It trusts the hex verbatim (no remote validation) —
-/// harmless while sha-clone is rejected, since an unbuildable sha has no
-/// cache entry. The ad-hoc bare repo (`gix::init` on a tempdir) carries
-/// no working tree and fetches no pack; `ref_map` lists every advertised
-/// ref (remote-side ref-prefix filtering is disabled — see the body) without
-/// fetching a pack.
-pub fn ls_remote_short_hash(url: &str, git_ref: &str) -> Option<String> {
+/// A full 40-hex `git_ref` is taken directly (no handshake): it matches
+/// [`git_clone`]'s post-clone `head_id` byte-for-byte (gix `Id` /
+/// `ObjectId` `Display` both emit the full lowercase hex), so it builds
+/// the key a sha-clone would write — see [`git_cache_key`]. [`git_clone`]
+/// currently REJECTS a raw-sha `git_ref` (a bare commit cannot be
+/// fetched), so for a sha this probe always misses and the clone then
+/// surfaces the actionable error; the branch is kept because it avoids a
+/// handshake on that reject path and is ready for a future sha-capable
+/// clone. It trusts the hex verbatim (no remote validation) — harmless
+/// while sha-clone is rejected, since an unbuildable sha has no cache
+/// entry. The ad-hoc bare repo (`gix::init` on a tempdir) carries no
+/// working tree and fetches no pack; `ref_map` lists every advertised ref
+/// (remote-side ref-prefix filtering is disabled — see the body) without
+/// fetching a pack. See `match_ref_commit_hash` for the rare branch/tag
+/// same-name caveat where this guess and the clone diverge.
+pub fn ls_remote_commit_hash(url: &str, git_ref: &str) -> Option<String> {
     if is_full_sha(git_ref) {
-        return Some(git_ref[..7].to_ascii_lowercase());
+        return Some(git_ref.to_ascii_lowercase());
     }
     let tmp = tempfile::TempDir::new().ok()?;
     let repo = gix::init(tmp.path()).ok()?;
@@ -1527,9 +1536,20 @@ pub fn ls_remote_short_hash(url: &str, git_ref: &str) -> Option<String> {
             },
         )
         .ok()?;
-    match_ref_short_hash(&refmap.remote_refs, git_ref)
+    match_ref_commit_hash(&refmap.remote_refs, git_ref)
 }
 
+/// Clone a git repository with shallow depth.
+///
+/// `cli_label` prefixes diagnostic status output (e.g. `"ktstr"` or
+/// `"cargo ktstr"`).
+///
+/// `mp` is the progress group a determinate clone bar is added to;
+/// `None` disables the bar and passes `gix::progress::Discard` to gix
+/// exactly as before (the single-shot `kernel build` paths and unit
+/// tests pass `None`). The bar shows real object/file counts + ETA
+/// during the receiving / resolving / checkout phases that gix reports
+/// a bounded total for; see the `crate::cli::progress` module.
 pub fn git_clone(
     url: &str,
     git_ref: &str,
@@ -1602,9 +1622,13 @@ pub fn git_clone(
 
     let repo = gix::open(&clone_dir).with_context(|| "open cloned repo")?;
     let head = repo.head_id().with_context(|| "read HEAD")?;
-    let short_hash = format!("{}", head).chars().take(7).collect::<String>();
+    // FULL commit hash keys the cache (see `git_cache_key` — a 7-hex
+    // prefix risks a moved-tip collision serving a stale build); the
+    // 7-hex `short_hash` is kept only for the human-facing source record.
+    let commit_hash = format!("{head}");
+    let short_hash = commit_hash.chars().take(7).collect::<String>();
 
-    let cache_key = git_cache_key(git_ref, &short_hash);
+    let cache_key = git_cache_key(git_ref, &commit_hash);
 
     // Record the kernel version from the checked-out source Makefile, as
     // local_source does — the worktree is fully checked out here, so a

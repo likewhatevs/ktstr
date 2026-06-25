@@ -2835,11 +2835,12 @@ fn fetch_read_makefile_version_parses_and_guards() {
 // -- git cache key + ls-remote ref pre-resolution --
 
 #[test]
-fn git_cache_key_embeds_ref_short_hash_arch_and_suffix() {
-    let key = git_cache_key("for-next", "abc1234");
+fn git_cache_key_embeds_ref_full_hash_arch_and_suffix() {
+    let h = "abc1234abc1234abc1234abc1234abc1234abc12";
+    let key = git_cache_key("for-next", h);
     assert!(
-        key.starts_with("for-next-git-abc1234-"),
-        "key must lead with the raw ref, the -git- marker, and the short hash: {key}"
+        key.starts_with(&format!("for-next-git-{h}-")),
+        "key must lead with the raw ref, the -git- marker, and the full commit hash: {key}"
     );
     let (arch, _) = arch_info();
     assert!(
@@ -2848,24 +2849,41 @@ fn git_cache_key_embeds_ref_short_hash_arch_and_suffix() {
     );
 }
 
+/// Two distinct commits sharing a 7-hex prefix must produce DIFFERENT
+/// cache keys — the FULL hash keys the entry, so a moved branch/tag tip
+/// whose new commit collides in the first 7 hex with the cached old
+/// commit can never hit the stale entry (closes the wrong-build-served
+/// class a 28-bit short prefix risked).
 #[test]
-fn ls_remote_short_hash_uses_full_sha_directly_without_network() {
-    // A full 40-hex ref short-circuits the handshake (the bogus URL is
-    // never contacted) and is lowercased to match git_clone's head
-    // rendering.
-    let sha = "1234567890abcdef1234567890abcdef12345678";
-    assert_eq!(
-        ls_remote_short_hash("https://invalid.invalid/nope.git", sha),
-        Some("1234567".to_string()),
-    );
-    let upper = "ABCDEF1234567890ABCDEF1234567890ABCDEF12";
-    assert_eq!(
-        ls_remote_short_hash("https://invalid.invalid/nope.git", upper),
-        Some("abcdef1".to_string()),
+fn git_cache_key_full_hash_distinguishes_7hex_prefix_collision() {
+    let a = "abc1234000000000000000000000000000000000";
+    let b = "abc1234ffffffffffffffffffffffffffffffffff";
+    assert_eq!(&a[..7], &b[..7], "fixture precondition: same 7-hex prefix");
+    assert_ne!(
+        git_cache_key("for-next", a),
+        git_cache_key("for-next", b),
+        "full-hash key must distinguish two commits sharing a 7-hex prefix",
     );
 }
 
-/// Regression: `ls_remote_short_hash` must resolve a BRANCH ref. The
+#[test]
+fn ls_remote_commit_hash_uses_full_sha_directly_without_network() {
+    // A full 40-hex ref short-circuits the handshake (the bogus URL is
+    // never contacted) and is returned in full, lowercased to match
+    // git_clone's head rendering (the cache key needs the full id).
+    let sha = "1234567890abcdef1234567890abcdef12345678";
+    assert_eq!(
+        ls_remote_commit_hash("https://invalid.invalid/nope.git", sha),
+        Some(sha.to_string()),
+    );
+    let upper = "ABCDEF1234567890ABCDEF1234567890ABCDEF12";
+    assert_eq!(
+        ls_remote_commit_hash("https://invalid.invalid/nope.git", upper),
+        Some(upper.to_ascii_lowercase()),
+    );
+}
+
+/// Regression: `ls_remote_commit_hash` must resolve a BRANCH ref. The
 /// bug was gix's default `Options` (`prefix_from_spec_as_filter_on_remote
 /// = true`): over a protocol-v2 `ls-refs` it derives ref-prefix filters
 /// from the anonymous remote's refspecs, and with empty fetch specs +
@@ -2875,7 +2893,7 @@ fn ls_remote_short_hash_uses_full_sha_directly_without_network() {
 /// re-cloned). The fix sets the flag `false`. A `Some(_)` here is only
 /// reachable once `refs/heads/for-next` reaches `remote_refs`, so
 /// reverting the flag turns this red — the sole test that pins the
-/// `ref_map` Options path (the `match_ref_short_hash_*` unit tests feed
+/// `ref_map` Options path (the `match_ref_commit_hash_*` unit tests feed
 /// synthetic ref vectors and never exercise it).
 ///
 /// `#[ignore]`: hits the live sched_ext remote over the network (project
@@ -2885,14 +2903,14 @@ fn ls_remote_short_hash_uses_full_sha_directly_without_network() {
 /// networked host.
 #[test]
 #[ignore = "network: live ls-remote against git.kernel.org sched_ext (protocol v2)"]
-fn ls_remote_short_hash_resolves_branch_over_v2() {
+fn ls_remote_commit_hash_resolves_branch_over_v2() {
     let url = "https://git.kernel.org/pub/scm/linux/kernel/git/tj/sched_ext.git";
-    let hash = ls_remote_short_hash(url, "for-next")
+    let hash = ls_remote_commit_hash(url, "for-next")
         .expect("for-next branch must resolve over v2 ls-refs — the prefix filter must be off");
-    assert_eq!(hash.len(), 7, "short hash is the first 7 hex chars: {hash}");
+    assert_eq!(hash.len(), 40, "a full commit hash is 40 hex chars: {hash}");
     assert!(
         hash.bytes().all(|b| b.is_ascii_hexdigit()),
-        "short hash must be hex: {hash}",
+        "commit hash must be hex: {hash}",
     );
 }
 
@@ -2904,31 +2922,30 @@ fn direct_ref(name: &str, hex: &str) -> gix::protocol::handshake::Ref {
 }
 
 #[test]
-fn match_ref_short_hash_resolves_branch_tag_head_and_precedence() {
+fn match_ref_commit_hash_resolves_branch_tag_head_and_precedence() {
     let a = "1111111111111111111111111111111111111111";
     let b = "2222222222222222222222222222222222222222";
     let c = "3333333333333333333333333333333333333333";
 
-    // Branch under refs/heads.
+    // Branch under refs/heads — returns the FULL commit hash.
     let refs = vec![direct_ref("refs/heads/for-next", a)];
-    assert_eq!(
-        match_ref_short_hash(&refs, "for-next"),
-        Some("1111111".into())
-    );
+    assert_eq!(match_ref_commit_hash(&refs, "for-next"), Some(a.into()));
 
     // Lightweight tag (Direct under refs/tags).
     let refs = vec![direct_ref("refs/tags/v6.10", b)];
-    assert_eq!(match_ref_short_hash(&refs, "v6.10"), Some("2222222".into()));
+    assert_eq!(match_ref_commit_hash(&refs, "v6.10"), Some(b.into()));
 
-    // heads wins over tags for the same bare name (git precedence).
+    // heads wins over tags for the same bare name (the probe's documented
+    // precedence; the rare divergence from the shallow clone is handled by
+    // the post-clone re-check — see match_ref_commit_hash).
     let refs = vec![direct_ref("refs/tags/x", b), direct_ref("refs/heads/x", a)];
-    assert_eq!(match_ref_short_hash(&refs, "x"), Some("1111111".into()));
+    assert_eq!(match_ref_commit_hash(&refs, "x"), Some(a.into()));
 
     // An explicit refs/ path matches exactly.
     let refs = vec![direct_ref("refs/heads/main", c)];
     assert_eq!(
-        match_ref_short_hash(&refs, "refs/heads/main"),
-        Some("3333333".into())
+        match_ref_commit_hash(&refs, "refs/heads/main"),
+        Some(c.into())
     );
 
     // HEAD via a Symbolic ref resolves to its ultimate object.
@@ -2938,15 +2955,15 @@ fn match_ref_short_hash_resolves_branch_tag_head_and_precedence() {
         tag: None,
         object: gix::hash::ObjectId::from_hex(c.as_bytes()).unwrap(),
     }];
-    assert_eq!(match_ref_short_hash(&refs, "HEAD"), Some("3333333".into()));
+    assert_eq!(match_ref_commit_hash(&refs, "HEAD"), Some(c.into()));
 
     // No matching ref -> None.
     let refs = vec![direct_ref("refs/heads/main", a)];
-    assert_eq!(match_ref_short_hash(&refs, "does-not-exist"), None);
+    assert_eq!(match_ref_commit_hash(&refs, "does-not-exist"), None);
 }
 
 #[test]
-fn match_ref_short_hash_annotated_tag_uses_peeled_commit_not_tag() {
+fn match_ref_commit_hash_annotated_tag_uses_peeled_commit_not_tag() {
     // An annotated tag advertises Peeled { tag: <tag object>, object:
     // <peeled commit> }. The key must use the peeled COMMIT (object):
     // git_clone checks out the commit (HEAD = commit), so the tag
@@ -2958,16 +2975,16 @@ fn match_ref_short_hash_annotated_tag_uses_peeled_commit_not_tag() {
         tag: gix::hash::ObjectId::from_hex(tag_obj.as_bytes()).unwrap(),
         object: gix::hash::ObjectId::from_hex(commit.as_bytes()).unwrap(),
     }];
-    assert_eq!(match_ref_short_hash(&refs, "v1.0"), Some("bbbbbbb".into()));
+    assert_eq!(match_ref_commit_hash(&refs, "v1.0"), Some(commit.into()));
 }
 
 #[test]
-fn match_ref_short_hash_skips_unborn() {
+fn match_ref_commit_hash_skips_unborn() {
     let refs = vec![gix::protocol::handshake::Ref::Unborn {
         full_ref_name: "refs/heads/new".into(),
         target: "refs/heads/new".into(),
     }];
-    assert_eq!(match_ref_short_hash(&refs, "new"), None);
+    assert_eq!(match_ref_commit_hash(&refs, "new"), None);
 }
 
 #[test]

@@ -669,7 +669,7 @@ fn filter_and_sort_range(
 /// Mirrors [`download_and_cache_version`] for the git source path. To
 /// avoid an unconditional clone, it FIRST ls-remote-resolves `REF` to
 /// its tip commit (no clone, no working tree — see
-/// [`crate::fetch::ls_remote_short_hash`]) and probes the cache for the
+/// [`crate::fetch::ls_remote_commit_hash`]) and probes the cache for the
 /// key that resolution produces ([`crate::fetch::git_cache_key`]); on a
 /// hit it returns the cached entry WITHOUT cloning. On a cache miss — or
 /// any ls-remote failure (network, auth, an unadvertised ref), which is
@@ -705,16 +705,18 @@ pub fn resolve_git_kernel(
     let cache = crate::cache::CacheDir::new()?;
 
     // Probe the cache BEFORE the expensive full clone: ls-remote
-    // resolves `git_ref` to its tip short_hash, which with the raw
+    // resolves `git_ref` to its tip commit hash, which with the raw
     // `git_ref` keys the same entry `git_clone` would write — a hit
     // returns without cloning. ls-remote failure is non-fatal: fall
     // through to the clone, which resolves the tip authoritatively (and
     // surfaces a clearer error if the remote is genuinely unreachable).
-    if let Some(short_hash) = crate::fetch::ls_remote_short_hash(url, git_ref) {
-        let cache_key = crate::fetch::git_cache_key(git_ref, &short_hash);
+    if let Some(commit_hash) = crate::fetch::ls_remote_commit_hash(url, git_ref) {
+        let cache_key = crate::fetch::git_cache_key(git_ref, &commit_hash);
         if let Some(entry) = cache_lookup(&cache, &cache_key, cli_label) {
+            // Full hash keys the entry; show the familiar 7-hex prefix.
+            let short = &commit_hash[..7.min(commit_hash.len())];
             let msg =
-                format!("{cli_label}: git+{url}#{git_ref} -> {short_hash} cached; skipping clone");
+                format!("{cli_label}: git+{url}#{git_ref} -> {short} cached; skipping clone");
             match mp {
                 Some(fp) => fp.println(&msg),
                 None => eprintln!("{msg}"),
