@@ -676,11 +676,18 @@ enum VersionGuard {
 }
 
 /// Pure CLI-vs-test ktstr-version comparison — the testable core of the
-/// version guard. Full-version comparison (major.minor.patch): ktstr is
-/// pre-1.0, where a minor bump is breaking, so any test > cli aborts.
+/// version guard. Compares by semver PRECEDENCE (major.minor.patch +
+/// pre-release, IGNORING build metadata): ktstr is pre-1.0, where a minor
+/// bump is breaking, so any test > cli aborts.
 fn version_guard(cli: &Version, test: &Version) -> VersionGuard {
     use std::cmp::Ordering;
-    match test.cmp(cli) {
+    // `cmp_precedence`, NOT the derived `Version::cmp`: the derived `Ord`
+    // includes build metadata as a final tie-breaker (and
+    // `BuildMetadata::EMPTY < non-empty`), so a `+build`-tagged path/git
+    // ktstr dep — the `cargo install --path .` flow this guard recommends —
+    // would compare unequal to a plain-version CLI and spuriously
+    // abort/warn two identical releases. Precedence ignores build metadata.
+    match test.cmp_precedence(cli) {
         Ordering::Equal => VersionGuard::Ok,
         Ordering::Less => VersionGuard::Warn(format!(
             "the test was built against ktstr {test} but the cargo-ktstr CLI \
@@ -694,6 +701,74 @@ fn version_guard(cli: &Version, test: &Version) -> VersionGuard {
              (or `cargo install --path .` in the ktstr repo)."
         )),
     }
+}
+
+/// The `ktstr` version the about-to-run test/bin targets actually LINK,
+/// resolved from the `cargo metadata` graph — NOT a `.max()` over all
+/// `ktstr` packages. ktstr is pre-1.0, so two `0.x` are
+/// semver-incompatible and cargo keeps BOTH in a dual-ktstr graph; a
+/// `.max()` would pick a higher TRANSITIVE ktstr the run's targets do not
+/// link and false-abort a compatible run — violating the contract below
+/// ("never block a run it cannot assess").
+///
+/// `None` (→ guard skips) when there is no resolve graph (`--no-deps`), or
+/// the root is not `ktstr` and has no linked `ktstr` dep. The root package
+/// itself being `ktstr` (the in-repo workspace, whose own bins/tests link
+/// itself) yields its own version. cargo metadata's resolve graph is
+/// per-PACKAGE, not per-target, so "which ktstr the test targets link"
+/// reduces to the root package's `ktstr` lib edge: `deps` (rename-aware),
+/// Normal/Development kind (a pure build-dep is not linked by tests).
+///
+/// LIMITATION: a platform-gated `ktstr` (a `[target.'cfg(...)'.dependencies]`
+/// edge) is matched by name regardless of `DepKindInfo.target`; host-triple
+/// `Platform` matching is intentionally omitted (it needs the full host cfg
+/// set). A cfg-gated ktstr test-driver dependency the host does not link is
+/// exotic; if hit, the failure direction is a false-abort — accepted over
+/// the matching complexity for that case.
+fn resolved_ktstr_version(meta: &cargo_metadata::Metadata) -> Option<&Version> {
+    let resolve = meta.resolve.as_ref()?;
+    // The run executes the targets of the root package, or — in a virtual
+    // workspace (no root package) — of every workspace member.
+    let root_ids: Vec<&cargo_metadata::PackageId> = match &resolve.root {
+        Some(root) => vec![root],
+        None => meta.workspace_members.iter().collect(),
+    };
+    for root_id in root_ids {
+        let Some(root_pkg) = meta.packages.iter().find(|p| &p.id == root_id) else {
+            continue;
+        };
+        // The root package may BE ktstr (the in-repo workspace).
+        if root_pkg.name == "ktstr" {
+            return Some(&root_pkg.version);
+        }
+        // Else: the ktstr the root's bins/tests link is its `ktstr` dep edge.
+        let Some(node) = resolve.nodes.iter().find(|n| &n.id == root_id) else {
+            continue;
+        };
+        for dep in &node.deps {
+            let Some(dep_pkg) = meta.packages.iter().find(|p| p.id == dep.pkg) else {
+                continue;
+            };
+            if dep_pkg.name != "ktstr" {
+                continue;
+            }
+            // A pure build-dependency edge is not linked by the test/bin
+            // targets; require a Normal/Development kind. Empty dep_kinds
+            // (older cargo metadata) → treat as a normal link.
+            let linked = dep.dep_kinds.is_empty()
+                || dep.dep_kinds.iter().any(|dk| {
+                    matches!(
+                        dk.kind,
+                        cargo_metadata::DependencyKind::Normal
+                            | cargo_metadata::DependencyKind::Development
+                    )
+                });
+            if linked {
+                return Some(&dep_pkg.version);
+            }
+        }
+    }
+    None
 }
 
 /// Guard CLI↔test ktstr-version skew before running the suite.
@@ -716,24 +791,11 @@ fn check_ktstr_version_compat() -> Result<(), String> {
             return Ok(());
         }
     };
-    // The test binaries link the resolved `ktstr` dependency. If the
-    // graph resolved more than one `ktstr` (a version conflict), take the
-    // MAX so the error check catches the highest version a test could be
-    // built against. This over-approximates in the rare dual-ktstr graph
-    // (a second, higher ktstr pulled in transitively that the test
-    // targets do not actually link); the resolve-graph walk (resolve.root
-    // -> test-target nodes -> ktstr dep) would be exact, but two ktstr
-    // versions in a ktstr test project is pathological, and the max is
-    // safe for the error direction — it never misses a too-new link.
-    let Some(test) = meta
-        .packages
-        .iter()
-        .filter(|p| p.name == "ktstr")
-        .map(|p| &p.version)
-        .max()
-    else {
-        // No `ktstr` dependency — running outside a ktstr-dependent
-        // project; nothing to guard.
+    // The version the run's test/bin targets actually LINK (resolve-graph
+    // walk, not a `.max()` over the graph — see `resolved_ktstr_version`).
+    let Some(test) = resolved_ktstr_version(&meta) else {
+        // No linked `ktstr` (or no resolve graph) — running outside a
+        // ktstr-dependent project, or cannot assess; nothing to guard.
         return Ok(());
     };
     match version_guard(&cli, test) {
@@ -870,6 +932,157 @@ mod tests {
             version_guard(&v("0.19.1"), &v("0.19.0")),
             VersionGuard::Warn(_)
         ));
+    }
+
+    #[test]
+    fn version_guard_ignores_build_metadata() {
+        // Semver precedence ignores build metadata, so a `+build`-tagged
+        // path/git ktstr dep against a plain-version CLI is the SAME release
+        // — Ok, not a spurious abort/warn. Regression guard for the
+        // derived-`Ord` bug (it ordered `BuildMetadata::EMPTY < non-empty`,
+        // making these compare unequal: `0.19.0+abc` > `0.19.0` -> Error).
+        assert_eq!(
+            version_guard(&v("0.19.0"), &v("0.19.0+abc")),
+            VersionGuard::Ok,
+        );
+        assert_eq!(
+            version_guard(&v("0.19.0+abc"), &v("0.19.0")),
+            VersionGuard::Ok,
+        );
+    }
+
+    /// A `cargo metadata` Package JSON object with every required field
+    /// (Options as `null`, collections empty); only name/version/id/source
+    /// vary across the fixture's packages.
+    fn pkg_json(name: &str, version: &str, id: &str, source: &str) -> String {
+        format!(
+            r#"{{"name":"{name}","version":"{version}","id":"{id}","source":{source},"description":null,"dependencies":[],"license":null,"license_file":null,"targets":[],"features":{{}},"manifest_path":"/w/{name}/Cargo.toml","readme":null,"repository":null,"homepage":null,"documentation":null,"links":null,"publish":null,"default_run":null}}"#
+        )
+    }
+
+    /// Regression: in a dual-ktstr resolve graph,
+    /// `resolved_ktstr_version` must return the ktstr the ROOT's targets
+    /// LINK, not the `.max()` over the graph. The user project links ktstr
+    /// 0.16 directly while an unrelated dep pulls ktstr 0.20 transitively
+    /// (ktstr is pre-1.0, so the two semver-incompatible 0.x coexist).
+    /// `.max()` would pick 0.20 and false-abort a run the CLI can drive;
+    /// the walk must pick 0.16.
+    #[test]
+    fn resolved_ktstr_version_picks_linked_not_max() {
+        let crates_io = r#""registry+https://github.com/rust-lang/crates.io-index""#;
+        let root = "userproj 0.1.0 (path+file:///w/userproj)";
+        let k016 = "ktstr 0.16.0 (registry+https://github.com/rust-lang/crates.io-index)";
+        let k020 = "ktstr 0.20.0 (registry+https://github.com/rust-lang/crates.io-index)";
+        let other = "otherdep 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)";
+        let json = format!(
+            r#"{{
+              "packages":[{up},{a},{b},{o}],
+              "workspace_members":["{root}"],
+              "resolve":{{
+                "root":"{root}",
+                "nodes":[
+                  {{"id":"{root}","deps":[{{"name":"ktstr","pkg":"{k016}","dep_kinds":[{{"kind":null,"target":null}}]}},{{"name":"otherdep","pkg":"{other}","dep_kinds":[{{"kind":null,"target":null}}]}}],"dependencies":["{k016}","{other}"],"features":[]}},
+                  {{"id":"{other}","deps":[{{"name":"ktstr","pkg":"{k020}","dep_kinds":[{{"kind":null,"target":null}}]}}],"dependencies":["{k020}"],"features":[]}},
+                  {{"id":"{k016}","deps":[],"dependencies":[],"features":[]}},
+                  {{"id":"{k020}","deps":[],"dependencies":[],"features":[]}}
+                ]
+              }},
+              "workspace_root":"/w","target_directory":"/w/target","version":1
+            }}"#,
+            up = pkg_json("userproj", "0.1.0", root, "null"),
+            a = pkg_json("ktstr", "0.16.0", k016, crates_io),
+            b = pkg_json("ktstr", "0.20.0", k020, crates_io),
+            o = pkg_json("otherdep", "0.1.0", other, crates_io),
+        );
+        let meta: cargo_metadata::Metadata =
+            serde_json::from_str(&json).expect("fixture deserializes as cargo metadata");
+        assert_eq!(
+            resolved_ktstr_version(&meta),
+            Some(&v("0.16.0")),
+            "must pick the LINKED ktstr (root's direct dep), not the .max() (0.20.0)",
+        );
+    }
+
+    /// `resolved_ktstr_version` when the ROOT package IS ktstr (the in-repo
+    /// workspace, whose own bins/tests link itself) → its own version.
+    #[test]
+    fn resolved_ktstr_version_root_is_ktstr() {
+        let root = "ktstr 0.19.0 (path+file:///w)";
+        let json = format!(
+            r#"{{
+              "packages":[{k}],
+              "workspace_members":["{root}"],
+              "resolve":{{"root":"{root}","nodes":[{{"id":"{root}","deps":[],"dependencies":[],"features":[]}}]}},
+              "workspace_root":"/w","target_directory":"/w/target","version":1
+            }}"#,
+            k = pkg_json("ktstr", "0.19.0", root, "null"),
+        );
+        let meta: cargo_metadata::Metadata =
+            serde_json::from_str(&json).expect("fixture deserializes");
+        assert_eq!(resolved_ktstr_version(&meta), Some(&v("0.19.0")));
+    }
+
+    /// Never-false-abort: a ktstr edge that is ONLY a build-dependency
+    /// (the test/bin targets do not link it) must NOT be picked — yields
+    /// `None` so the guard SKIPS rather than aborting on an unlinked
+    /// version. This is the load-bearing safe-direction branch.
+    #[test]
+    fn resolved_ktstr_version_skips_build_only_edge() {
+        let crates_io = r#""registry+https://github.com/rust-lang/crates.io-index""#;
+        let root = "userproj 0.1.0 (path+file:///w/userproj)";
+        let kb = "ktstr 0.20.0 (registry+https://github.com/rust-lang/crates.io-index)";
+        let json = format!(
+            r#"{{
+              "packages":[{up},{k}],
+              "workspace_members":["{root}"],
+              "resolve":{{
+                "root":"{root}",
+                "nodes":[
+                  {{"id":"{root}","deps":[{{"name":"ktstr","pkg":"{kb}","dep_kinds":[{{"kind":"build","target":null}}]}}],"dependencies":["{kb}"],"features":[]}},
+                  {{"id":"{kb}","deps":[],"dependencies":[],"features":[]}}
+                ]
+              }},
+              "workspace_root":"/w","target_directory":"/w/target","version":1
+            }}"#,
+            up = pkg_json("userproj", "0.1.0", root, "null"),
+            k = pkg_json("ktstr", "0.20.0", kb, crates_io),
+        );
+        let meta: cargo_metadata::Metadata =
+            serde_json::from_str(&json).expect("fixture deserializes");
+        assert_eq!(
+            resolved_ktstr_version(&meta),
+            None,
+            "a build-only ktstr edge is not linked by test/bin targets — skip, not abort",
+        );
+    }
+
+    /// Virtual workspace: no root package (`resolve.root` = null) — the
+    /// walk falls back to every workspace member; a member linking ktstr
+    /// resolves to that version.
+    #[test]
+    fn resolved_ktstr_version_virtual_workspace_walks_members() {
+        let crates_io = r#""registry+https://github.com/rust-lang/crates.io-index""#;
+        let member = "memberproj 0.1.0 (path+file:///w/memberproj)";
+        let k = "ktstr 0.17.0 (registry+https://github.com/rust-lang/crates.io-index)";
+        let json = format!(
+            r#"{{
+              "packages":[{m},{kp}],
+              "workspace_members":["{member}"],
+              "resolve":{{
+                "root":null,
+                "nodes":[
+                  {{"id":"{member}","deps":[{{"name":"ktstr","pkg":"{k}","dep_kinds":[{{"kind":null,"target":null}}]}}],"dependencies":["{k}"],"features":[]}},
+                  {{"id":"{k}","deps":[],"dependencies":[],"features":[]}}
+                ]
+              }},
+              "workspace_root":"/w","target_directory":"/w/target","version":1
+            }}"#,
+            m = pkg_json("memberproj", "0.1.0", member, "null"),
+            kp = pkg_json("ktstr", "0.17.0", k, crates_io),
+        );
+        let meta: cargo_metadata::Metadata =
+            serde_json::from_str(&json).expect("fixture deserializes");
+        assert_eq!(resolved_ktstr_version(&meta), Some(&v("0.17.0")));
     }
 
     /// Serialize env mutation across this binary's tests. nextest runs
