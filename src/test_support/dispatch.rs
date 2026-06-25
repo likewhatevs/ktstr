@@ -2270,7 +2270,9 @@ pub(crate) fn run_named_test(test_name: &str) -> i32 {
             bare_name,
         ));
         // See run_ktstr_test_inner for the sidecar-emission rationale.
-        record_skip_sidecar(entry);
+        // Plain (non-gauntlet) dispatch: no TopoOverride, so the skip
+        // records entry.topology (declared == booted for a plain test).
+        record_skip_sidecar(entry, None);
         return 0;
     }
 
@@ -2280,7 +2282,7 @@ pub(crate) fn run_named_test(test_name: &str) -> i32 {
         ));
         // Skip sidecar so the perf-delta pool records the skip (excluded
         // from the A/B compare) rather than a phantom missing result.
-        record_skip_sidecar(entry);
+        record_skip_sidecar(entry, None);
         return 0;
     }
 
@@ -2514,7 +2516,10 @@ pub(crate) fn run_gauntlet_test(rest: &str) -> i32 {
             "{}: test requires performance_mode but --no-perf-mode or KTSTR_NO_PERF_MODE is active",
             test_name,
         ));
-        record_skip_sidecar(entry);
+        // Gauntlet preset: record the preset's RESOLVED topology
+        // (Topology::from(&topo)) so this skip shares a variant_hash
+        // with a run of the same preset and distinguishes other presets.
+        record_skip_sidecar(entry, Some(&topo));
         return 0;
     }
 
@@ -2522,7 +2527,9 @@ pub(crate) fn run_gauntlet_test(rest: &str) -> i32 {
         crate::report::test_skip(format_args!(
             "{test_name}: KTSTR_PERF_ONLY is active and this test is not a performance_mode test",
         ));
-        record_skip_sidecar(entry);
+        // Gauntlet preset: record the preset's RESOLVED topology so the
+        // skip shares a variant_hash with a run of the same preset.
+        record_skip_sidecar(entry, Some(&topo));
         return 0;
     }
 

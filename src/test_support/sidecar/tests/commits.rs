@@ -1,6 +1,6 @@
 use super::super::super::test_helpers::{EnvVarGuard, lock_env};
 use super::super::*;
-use super::find_single_sidecar_by_prefix;
+use super::{find_sidecars_by_prefix, find_single_sidecar_by_prefix};
 use crate::assert::AssertResult;
 use crate::scenario::Ctx;
 use anyhow::Result;
@@ -36,7 +36,7 @@ fn write_skip_sidecar_records_skip_mutex() {
         auto_repro: false,
         ..KtstrTestEntry::DEFAULT
     };
-    write_skip_sidecar(&entry).expect("skip sidecar must write");
+    write_skip_sidecar(&entry, &entry.topology).expect("skip sidecar must write");
 
     let path = find_single_sidecar_by_prefix(tmp.path(), "__skip_sidecar_test__-");
     let data = std::fs::read_to_string(&path).unwrap();
@@ -137,7 +137,7 @@ fn skip_then_run_of_same_config_overwrites_one_sidecar() {
     };
 
     // Attempt 1: pre-VM-boot host skip (e.g. ResourceContention).
-    write_skip_sidecar(&entry).expect("skip sidecar must write");
+    write_skip_sidecar(&entry, &entry.topology).expect("skip sidecar must write");
     let skip_path = find_single_sidecar_by_prefix(tmp.path(), "__skip_run_overwrite__-");
     let skip: SidecarResult =
         serde_json::from_str(&std::fs::read_to_string(&skip_path).unwrap()).unwrap();
@@ -156,6 +156,7 @@ fn skip_then_run_of_same_config_overwrites_one_sidecar() {
         &ok,
         &crate::test_support::args::current_work_type(),
         &[],
+        &entry.topology,
     )
     .unwrap();
 
@@ -179,6 +180,79 @@ fn skip_then_run_of_same_config_overwrites_one_sidecar() {
         sidecar_variant_hash(&skip),
         sidecar_variant_hash(&run),
         "core invariant: a skip and a run of one config share a variant_hash",
+    );
+}
+
+/// Regression lock for the topology-gauntlet clobber. A gauntlet
+/// runs ONE entry under per-preset TopoOverrides, so the sidecar must
+/// record the RESOLVED (booted) topology, not the declared entry value
+/// — otherwise every preset shares one variant_hash and clobbers,
+/// leaving only the last preset's sidecar. Pins two invariants through
+/// the PRODUCTION writers:
+///   (a) two distinct resolved topologies for one entry produce two
+///       distinct variant_hashes, so both sidecars coexist (no clobber);
+///   (b) a preset's host-skip and its run record the SAME resolved
+///       topology, so they share a variant_hash and the run overwrites
+///       the skip (the skip-vs-run invariant, now for topology).
+#[test]
+fn resolved_topology_distinguishes_presets_and_unifies_skip_run() {
+    use crate::vmm::topology::Topology;
+    let _lock = lock_env();
+    let tmp = tempfile::Builder::new()
+        .prefix("ktstr-sidecar-resolved-topo-test-")
+        .tempdir()
+        .expect("create tempdir");
+    let _env_sidecar = EnvVarGuard::set(crate::KTSTR_SIDECAR_DIR_ENV, tmp.path());
+
+    fn dummy(_ctx: &Ctx) -> Result<AssertResult> {
+        Ok(AssertResult::pass())
+    }
+    let vm_result = crate::vmm::VmResult::test_fixture();
+    let ok = AssertResult::pass();
+    // Two presets the gauntlet would boot from one entry. Distinct
+    // resolved topologies -> distinct Display strings -> distinct hashes.
+    let preset_a = Topology::new(1, 1, 1, 1);
+    let preset_b = Topology::new(2, 2, 2, 2);
+
+    // (a) Same entry, two resolved topologies -> two coexisting sidecars.
+    let entry = KtstrTestEntry {
+        name: "__resolved_topo_presets__",
+        func: dummy,
+        auto_repro: false,
+        ..KtstrTestEntry::DEFAULT
+    };
+    write_sidecar(&entry, &vm_result, &[], &ok, "SpinWait", &[], &preset_a).unwrap();
+    write_sidecar(&entry, &vm_result, &[], &ok, "SpinWait", &[], &preset_b).unwrap();
+    let files = find_sidecars_by_prefix(tmp.path(), "__resolved_topo_presets__-");
+    assert_eq!(
+        files.len(),
+        2,
+        "two distinct resolved topologies must yield two coexisting \
+         sidecars (no clobber) — recording the declared topology would \
+         collapse both presets to one file: {files:?}",
+    );
+
+    // (b) Same entry + same resolved topology, host-skip then run -> the
+    // run overwrites the skip (one sidecar, the final pass).
+    let entry2 = KtstrTestEntry {
+        name: "__resolved_topo_skiprun__",
+        func: dummy,
+        auto_repro: false,
+        ..KtstrTestEntry::DEFAULT
+    };
+    write_skip_sidecar(&entry2, &preset_a).unwrap();
+    write_sidecar(&entry2, &vm_result, &[], &ok, "SpinWait", &[], &preset_a).unwrap();
+    let after = find_single_sidecar_by_prefix(tmp.path(), "__resolved_topo_skiprun__-");
+    let sc: SidecarResult =
+        serde_json::from_str(&std::fs::read_to_string(&after).unwrap()).unwrap();
+    assert!(
+        !sc.skipped && sc.passed,
+        "the run overwrote the same-preset skip — final state is the pass",
+    );
+    assert_eq!(
+        sc.topology,
+        preset_a.to_string(),
+        "the sidecar records the RESOLVED topology, not the declared one",
     );
 }
 
@@ -210,7 +284,7 @@ fn write_skip_sidecar_returns_err_when_dir_cannot_be_created() {
         auto_repro: false,
         ..KtstrTestEntry::DEFAULT
     };
-    let result = write_skip_sidecar(&entry);
+    let result = write_skip_sidecar(&entry, &entry.topology);
     assert!(
         result.is_err(),
         "skip sidecar write must return Err when the target is a regular file",
@@ -404,7 +478,16 @@ fn write_sidecar_records_entry_payload_name() {
     };
     let vm_result = crate::vmm::VmResult::test_fixture();
     let ok = AssertResult::pass();
-    write_sidecar(&entry, &vm_result, &[], &ok, "SpinWait", &[]).unwrap();
+    write_sidecar(
+        &entry,
+        &vm_result,
+        &[],
+        &ok,
+        "SpinWait",
+        &[],
+        &entry.topology,
+    )
+    .unwrap();
 
     let path = find_single_sidecar_by_prefix(tmp.path(), "__payload_name_test__-");
     let data = std::fs::read_to_string(&path).unwrap();
@@ -461,7 +544,16 @@ fn write_sidecar_forwards_payload_metrics_slice() {
             exit_code: 2,
         },
     ];
-    write_sidecar(&entry, &vm_result, &[], &ok, "SpinWait", &metrics).unwrap();
+    write_sidecar(
+        &entry,
+        &vm_result,
+        &[],
+        &ok,
+        "SpinWait",
+        &metrics,
+        &entry.topology,
+    )
+    .unwrap();
 
     let path = find_single_sidecar_by_prefix(tmp.path(), "__metrics_slice_test__-");
     let data = std::fs::read_to_string(&path).unwrap();
@@ -512,7 +604,7 @@ fn write_skip_sidecar_records_entry_payload_name() {
         payload: Some(&STRESS),
         ..KtstrTestEntry::DEFAULT
     };
-    write_skip_sidecar(&entry).unwrap();
+    write_skip_sidecar(&entry, &entry.topology).unwrap();
 
     let path = find_single_sidecar_by_prefix(tmp.path(), "__skip_payload_name_test__-");
     let data = std::fs::read_to_string(&path).unwrap();

@@ -3361,7 +3361,10 @@ fn acquire_run_dir_flock_with_timeout(
 /// JSON cannot be serialized, or the file write fails. Callers that
 /// ignore the Result accept the risk of stats-tooling blind spots on
 /// this run.
-pub(crate) fn write_skip_sidecar(entry: &KtstrTestEntry) -> anyhow::Result<()> {
+pub(crate) fn write_skip_sidecar(
+    entry: &KtstrTestEntry,
+    resolved_topology: &crate::vmm::topology::Topology,
+) -> anyhow::Result<()> {
     let SchedulerFingerprint {
         scheduler,
         scheduler_commit,
@@ -3370,7 +3373,16 @@ pub(crate) fn write_skip_sidecar(entry: &KtstrTestEntry) -> anyhow::Result<()> {
     } = scheduler_fingerprint(entry);
     let sidecar = SidecarResult {
         test_name: entry.name.to_string(),
-        topology: entry.topology.to_string(),
+        // The RESOLVED topology a run of this preset would boot
+        // (resolve_vm_topology(entry, topo)), NOT the declared
+        // entry.topology — for a topology gauntlet each preset boots a
+        // distinct topology, so recording the declared value would make
+        // every preset share one variant_hash and clobber. For a plain
+        // test (no override) resolved == declared. The skip and the run
+        // of one preset thus share a variant_hash (the run path records
+        // the same resolved topology), so a flaky test that skips on one
+        // attempt and runs on the retry writes one sidecar.
+        topology: resolved_topology.to_string(),
         scheduler,
         scheduler_commit,
         project_commit: detect_project_commit(),
@@ -3448,6 +3460,7 @@ pub(crate) fn write_sidecar(
     check_result: &AssertResult,
     work_type: &str,
     payload_metrics: &[PayloadMetrics],
+    resolved_topology: &crate::vmm::topology::Topology,
 ) -> anyhow::Result<()> {
     let SchedulerFingerprint {
         scheduler,
@@ -3457,7 +3470,12 @@ pub(crate) fn write_sidecar(
     } = scheduler_fingerprint(entry);
     let sidecar = SidecarResult {
         test_name: entry.name.to_string(),
-        topology: entry.topology.to_string(),
+        // The RESOLVED topology this run booted (resolve_vm_topology
+        // result), NOT the declared entry.topology — a topology gauntlet
+        // boots a distinct topology per preset, so the declared value
+        // would collapse every preset to one variant_hash. resolved ==
+        // declared for a plain test (no override).
+        topology: resolved_topology.to_string(),
         scheduler,
         scheduler_commit,
         project_commit: detect_project_commit(),

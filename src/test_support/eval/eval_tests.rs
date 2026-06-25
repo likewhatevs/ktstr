@@ -836,7 +836,7 @@ fn overcommit_skip_returns_skip_for_severe_auto_collapse() {
     entry.cpu_budget = None;
     // 256 vCPUs auto-collapse onto 8 host CPUs = 32x ≥ 6x → SKIP, not a
     // hard-fail.
-    let skip = super::overcommit_skip(&entry, &[0, 1, 2, 3, 4, 5, 6, 7])
+    let skip = super::overcommit_skip(&entry, &[0, 1, 2, 3, 4, 5, 6, 7], None)
         .expect("32x auto-collapse must auto-skip");
     assert!(skip.is_skip(), "severe overcommit must yield a SKIP result");
 }
@@ -850,7 +850,7 @@ fn overcommit_skip_runs_at_ci_wide_smp_ratio() {
     // wide-SMP boot is validated on CI, never masked.
     let host: Vec<usize> = (0..192).collect();
     assert!(
-        super::overcommit_skip(&entry, &host).is_none(),
+        super::overcommit_skip(&entry, &host, None).is_none(),
         "wide-SMP boot must RUN at the CI ~1.3x ratio",
     );
 }
@@ -863,7 +863,7 @@ fn overcommit_skip_never_skips_explicit_budget() {
     // Even 256 vCPUs on 8 host CPUs: an explicit cpu_budget is a
     // contention-testing opt-in and must never auto-skip.
     assert!(
-        super::overcommit_skip(&entry, &[0, 1, 2, 3, 4, 5, 6, 7]).is_none(),
+        super::overcommit_skip(&entry, &[0, 1, 2, 3, 4, 5, 6, 7], None).is_none(),
         "explicit cpu_budget must never auto-skip",
     );
 }
@@ -884,7 +884,7 @@ fn overcommit_skip_uses_stricter_cap_for_expect_auto_repro() {
     boot_only.cpu_budget = None;
     boot_only.expect_auto_repro = false;
     assert!(
-        super::overcommit_skip(&boot_only, &host).is_none(),
+        super::overcommit_skip(&boot_only, &host, None).is_none(),
         "boot-only wide test must RUN at 2.67x (< 6x boot cap)",
     );
 
@@ -892,7 +892,7 @@ fn overcommit_skip_uses_stricter_cap_for_expect_auto_repro() {
     auto_repro.topology = wide_smp_topology();
     auto_repro.cpu_budget = None;
     auto_repro.expect_auto_repro = true;
-    let skip = super::overcommit_skip(&auto_repro, &host)
+    let skip = super::overcommit_skip(&auto_repro, &host, None)
         .expect("expect_auto_repro chain must auto-skip at 2.67x (>= 2.0x cap)");
     assert!(
         skip.is_skip(),

@@ -450,8 +450,18 @@ pub(crate) fn invoke_post_vm_callback(
 /// tooling but cannot meaningfully handle a sidecar-write failure
 /// beyond logging it — the skip itself is still valid; only post-run
 /// stats tooling loses visibility.
-pub(crate) fn record_skip_sidecar(entry: &KtstrTestEntry) {
-    if let Err(e) = write_skip_sidecar(entry) {
+pub(crate) fn record_skip_sidecar(
+    entry: &KtstrTestEntry,
+    topo: Option<&crate::test_support::topo::TopoOverride>,
+) {
+    // Resolve the topology the run of this (entry, override) WOULD boot,
+    // via the same resolve_vm_topology the run path uses, so a preset's
+    // skip and run record the identical topology -> identical
+    // variant_hash -> the retry overwrites instead of coexisting. For a
+    // plain test (topo = None) this is entry.topology.
+    let (resolved_topology, _memory_mib) =
+        crate::test_support::runtime::resolve_vm_topology(entry, topo);
+    if let Err(e) = write_skip_sidecar(entry, &resolved_topology) {
         // Dual-emit at warn level: an unwritten skip sidecar costs
         // the run no correctness — the test still skipped — but
         // silently drops post-run stats tooling's visibility into

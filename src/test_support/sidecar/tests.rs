@@ -1115,7 +1115,16 @@ fn write_sidecar_defaults_to_target_dir_without_env() {
     };
     let vm_result = crate::vmm::VmResult::test_fixture();
     let check_result = AssertResult::pass();
-    write_sidecar(&entry, &vm_result, &[], &check_result, "SpinWait", &[]).unwrap();
+    write_sidecar(
+        &entry,
+        &vm_result,
+        &[],
+        &check_result,
+        "SpinWait",
+        &[],
+        &entry.topology,
+    )
+    .unwrap();
 
     // The actual on-disk filename embeds a variant-hash suffix
     // (see `serialize_and_write_sidecar`), so a fixed
@@ -1960,7 +1969,16 @@ fn write_sidecar_same_dir_is_last_writer_wins_after_pre_clear() {
     };
     let vm_result = crate::vmm::VmResult::test_fixture();
     let ok = AssertResult::pass();
-    write_sidecar(&entry_a, &vm_result, &[], &ok, "SpinWait", &[]).unwrap();
+    write_sidecar(
+        &entry_a,
+        &vm_result,
+        &[],
+        &ok,
+        "SpinWait",
+        &[],
+        &entry_a.topology,
+    )
+    .unwrap();
     // Confirm the first invocation's sidecar is on disk.
     assert_eq!(
         find_sidecars_by_prefix(tmp, "__reuse_first_run__-").len(),
@@ -1990,7 +2008,16 @@ fn write_sidecar_same_dir_is_last_writer_wins_after_pre_clear() {
         auto_repro: false,
         ..KtstrTestEntry::DEFAULT
     };
-    write_sidecar(&entry_b, &vm_result, &[], &ok, "SpinWait", &[]).unwrap();
+    write_sidecar(
+        &entry_b,
+        &vm_result,
+        &[],
+        &ok,
+        "SpinWait",
+        &[],
+        &entry_b.topology,
+    )
+    .unwrap();
 
     // Final state: only the second invocation's sidecar is
     // present. The first invocation is gone, the second is
@@ -2044,7 +2071,16 @@ fn write_sidecar_override_does_not_pre_clear() {
     };
     let vm_result = crate::vmm::VmResult::test_fixture();
     let ok = AssertResult::pass();
-    write_sidecar(&entry, &vm_result, &[], &ok, "SpinWait", &[]).unwrap();
+    write_sidecar(
+        &entry,
+        &vm_result,
+        &[],
+        &ok,
+        "SpinWait",
+        &[],
+        &entry.topology,
+    )
+    .unwrap();
 
     // The pre-existing sidecar must still be there. A regression
     // that fired pre_clear on the override path would have
@@ -2150,7 +2186,16 @@ fn write_sidecar_default_path_two_writes_both_survive() {
     // canonicalize-fails (dir missing) → cache key under raw
     // path → wipe was a no-op (dir didn't exist) → created
     // dir → wrote sidecar 1.
-    write_sidecar(&entry_first, &vm_result, &[], &ok, "SpinWait", &[]).unwrap();
+    write_sidecar(
+        &entry_first,
+        &vm_result,
+        &[],
+        &ok,
+        "SpinWait",
+        &[],
+        &entry_first.topology,
+    )
+    .unwrap();
     // Confirm sidecar 1 lands.
     assert_eq!(
         find_sidecars_by_prefix(&dir, "__b3_first__-").len(),
@@ -2166,7 +2211,16 @@ fn write_sidecar_default_path_two_writes_both_survive() {
     // both calls, both canonicalize against an existing dir,
     // both produce the same canonicalized key, and the second
     // call hits the cache → no wipe → both survive.
-    write_sidecar(&entry_second, &vm_result, &[], &ok, "SpinWait", &[]).unwrap();
+    write_sidecar(
+        &entry_second,
+        &vm_result,
+        &[],
+        &ok,
+        "SpinWait",
+        &[],
+        &entry_second.topology,
+    )
+    .unwrap();
 
     // Both sidecars must be present. A regression to the buggy
     // ordering would surface here as `__b3_first__-` count = 0.
@@ -2205,7 +2259,16 @@ fn write_sidecar_writes_file() {
     };
     let vm_result = crate::vmm::VmResult::test_fixture();
     let check_result = AssertResult::pass();
-    write_sidecar(&entry, &vm_result, &[], &check_result, "SpinWait", &[]).unwrap();
+    write_sidecar(
+        &entry,
+        &vm_result,
+        &[],
+        &check_result,
+        "SpinWait",
+        &[],
+        &entry.topology,
+    )
+    .unwrap();
 
     // Sidecar filename now includes a variant hash suffix so
     // gauntlet variants don't clobber each other. Use the
@@ -2361,8 +2424,26 @@ fn write_sidecar_variant_hash_distinguishes_work_types() {
     };
     let vm_result = crate::vmm::VmResult::test_fixture();
     let ok = AssertResult::pass();
-    write_sidecar(&entry, &vm_result, &[], &ok, "SpinWait", &[]).unwrap();
-    write_sidecar(&entry, &vm_result, &[], &ok, "YieldHeavy", &[]).unwrap();
+    write_sidecar(
+        &entry,
+        &vm_result,
+        &[],
+        &ok,
+        "SpinWait",
+        &[],
+        &entry.topology,
+    )
+    .unwrap();
+    write_sidecar(
+        &entry,
+        &vm_result,
+        &[],
+        &ok,
+        "YieldHeavy",
+        &[],
+        &entry.topology,
+    )
+    .unwrap();
 
     let paths = find_sidecars_by_prefix(tmp, "__variant_test__-");
     assert_eq!(
@@ -3072,7 +3153,11 @@ fn summarize_failing_variant_not_masked_by_passing_sibling() {
     // A gauntlet test writes one sidecar per topology variant under
     // the SAME bare name (distinct variant hashes). A passing variant
     // must NOT mask a failing sibling — the test must still surface as
-    // FAILED. Regression for the by-bare-name overwrite bug.
+    // FAILED. Regression for the by-bare-name overwrite bug. This
+    // distinct-hash-per-topology-variant shape is production-reachable
+    // now that the sidecar records the RESOLVED (booted) topology rather
+    // than the declared entry value (resolved_topology_distinguishes_presets_and_unifies_skip_run
+    // pins the writer side); this test pins the footer reader side.
     let root = tempfile::TempDir::new().unwrap();
     let run = root.path().join("7.1.0-abc1234");
     std::fs::create_dir(&run).unwrap();

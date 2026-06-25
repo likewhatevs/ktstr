@@ -213,7 +213,7 @@ pub(crate) fn run_ktstr_test_inner(
         // sidecar. Not strictly idempotent — a second write refreshes
         // run_id and timestamp — but the skip classification round-trips
         // identically, so stats tooling sees the same outcome.
-        record_skip_sidecar(entry);
+        record_skip_sidecar(entry, topo);
     }
     // `expect_auto_repro = true` inversion: when the primary VM
     // failed AND the auto-repro VM landed a shape-valid
@@ -431,7 +431,11 @@ fn write_placeholder_failure_dump_if_missing(path: &std::path::Path, result: &vm
 /// to `OVERCOMMIT_SKIP_RATIO` — so a 256-vCPU guest at the ~1.3x of the
 /// design-target runner validates boot (and the auto-repro hop) there
 /// rather than silently skipping.
-fn overcommit_skip(entry: &KtstrTestEntry, host_cpus: &[usize]) -> Option<AssertResult> {
+fn overcommit_skip(
+    entry: &KtstrTestEntry,
+    host_cpus: &[usize],
+    topo: Option<&TopoOverride>,
+) -> Option<AssertResult> {
     let reason = super::runtime::overcommit_skip_reason(
         entry.topology.total_cpus(),
         host_cpus.len(),
@@ -439,7 +443,7 @@ fn overcommit_skip(entry: &KtstrTestEntry, host_cpus: &[usize]) -> Option<Assert
         entry.expect_auto_repro,
     )?;
     crate::report::test_skip(format_args!("{}: {reason}", entry.name));
-    record_skip_sidecar(entry);
+    record_skip_sidecar(entry, topo);
     Some(AssertResult::skip(reason))
 }
 
@@ -519,14 +523,14 @@ fn run_ktstr_test_inner_impl(
         // not just the ones that made it to the VM-run site. A sidecar
         // write failure is logged but not propagated: the skip itself
         // is still valid — only post-run stats tooling loses visibility.
-        record_skip_sidecar(entry);
+        record_skip_sidecar(entry, topo);
         return Ok(AssertResult::skip(REASON));
     }
     if super::runtime::perf_only_skips_entry(entry) {
         const REASON: &str =
             "KTSTR_PERF_ONLY is active and this test is not a performance_mode test";
         crate::report::test_skip(format_args!("{}: {REASON}", entry.name));
-        record_skip_sidecar(entry);
+        record_skip_sidecar(entry, topo);
         return Ok(AssertResult::skip(REASON));
     }
     // Auto-skip a default/no-perf overcommit so severe the guest boot
@@ -535,7 +539,7 @@ fn run_ktstr_test_inner_impl(
     // the full rationale; it skips ONLY the auto-collapse case past
     // `OVERCOMMIT_SKIP_RATIO`, so an explicit `cpu_budget` and the CI
     // ~1.3x case both RUN and are validated here, never masked.
-    if let Some(skip) = overcommit_skip(entry, &host_cpus) {
+    if let Some(skip) = overcommit_skip(entry, &host_cpus, topo) {
         return Ok(skip);
     }
     ensure_kvm()?;
@@ -1026,7 +1030,7 @@ fn run_ktstr_test_inner_impl(
                 || super::is_topology_insufficient(&e)
                 || super::is_perf_mode_unavailable(&e)
             {
-                record_skip_sidecar(entry);
+                record_skip_sidecar(entry, topo);
             }
             return Err(e.context("build ktstr_test VM"));
         }
@@ -1039,7 +1043,7 @@ fn run_ktstr_test_inner_impl(
                 || super::is_topology_insufficient(&e)
                 || super::is_perf_mode_unavailable(&e)
             {
-                record_skip_sidecar(entry);
+                record_skip_sidecar(entry, topo);
             }
             return Err(e.context("run ktstr_test VM"));
         }
@@ -1406,7 +1410,7 @@ fn run_ktstr_test_inner_impl(
     {
         let reason = format!("{err:#}");
         crate::report::test_skip(format_args!("{}: {}", entry.name, reason));
-        record_skip_sidecar(entry);
+        record_skip_sidecar(entry, topo);
         return Ok(AssertResult::skip(reason));
     }
 
@@ -1430,7 +1434,7 @@ fn run_ktstr_test_inner_impl(
         should_skip_on_llm_model_load_failure(&host_extract_failures, post_vm_err.is_some())
     {
         crate::report::test_skip(format_args!("{}: {}", entry.name, skip_reason));
-        record_skip_sidecar(entry);
+        record_skip_sidecar(entry, topo);
         return Ok(AssertResult::skip(skip_reason));
     }
 
@@ -2580,6 +2584,7 @@ fn evaluate_vm_result(
             &check_result,
             &work_type,
             payload_metrics,
+            topo,
         ) {
             eprintln!("ktstr_test: {e:#}");
         }
