@@ -664,11 +664,16 @@ fn kernel_build_one(
 
     // Acquire source.
     let client = fetch::shared_client();
+    // Progress group for this build: hosts the download/clone bar AND
+    // (via `kernel_build_pipeline`) the build phase, so one renderer
+    // covers the whole operation. The `--source` path adds no fetch bar
+    // but the same group still hosts the build bar.
+    let fetch_progress = cli::FetchProgress::new();
     let mut acquired = if let Some(ref src_path) = source {
         fetch::local_source(src_path)?
     } else if let Some(ref url) = git {
         let ref_name = git_ref.as_deref().expect("clap requires --ref with --git");
-        fetch::git_clone(url, ref_name, tmp_dir.path(), "ktstr")?
+        fetch::git_clone(url, ref_name, tmp_dir.path(), "ktstr", Some(&fetch_progress))?
     } else {
         // Tarball download: explicit version, prefix, or latest stable.
         let ver = match version {
@@ -695,9 +700,14 @@ fn kernel_build_one(
             eprintln!("ktstr: use --force to rebuild");
             return Ok(());
         }
-        let sp = cli::Spinner::start("Downloading kernel...");
-        let result = fetch::download_tarball(client, &ver, tmp_dir.path(), "ktstr", skip_sha256);
-        drop(sp);
+        let result = fetch::download_tarball(
+            client,
+            &ver,
+            tmp_dir.path(),
+            "ktstr",
+            skip_sha256,
+            Some(&fetch_progress),
+        );
         let mut acquired = result?;
         // `download_tarball` builds its `cache_key` against the bare
         // `cache_key_suffix()` (see `fetch::download_tarball`).
@@ -749,6 +759,7 @@ fn kernel_build_one(
         source.is_some(),
         resolved_cap,
         extra_kconfig,
+        Some(&fetch_progress),
     )?;
 
     Ok(())

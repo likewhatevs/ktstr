@@ -187,7 +187,10 @@ pub(crate) fn canonicalize_cache_dir(cache_dir: PathBuf) -> PathBuf {
 /// the wrong shape for "fan out N items into the parent
 /// iterator." See the parallel comment block in
 /// [`resolve_kernel_set`] for the full strategy.
-pub(crate) fn resolve_one(id: ktstr::kernel_path::KernelId) -> Result<(String, PathBuf), String> {
+pub(crate) fn resolve_one(
+    id: ktstr::kernel_path::KernelId,
+    mp: Option<&ktstr::cli::FetchProgress>,
+) -> Result<(String, PathBuf), String> {
     use ktstr::kernel_path::KernelId;
     match id {
         KernelId::Path(p) => {
@@ -235,13 +238,13 @@ pub(crate) fn resolve_one(id: ktstr::kernel_path::KernelId) -> Result<(String, P
             Ok((label, dir))
         }
         KernelId::Version(ref ver) => {
-            let cache_dir = ktstr::cli::resolve_cached_kernel(&id, "cargo ktstr")
+            let cache_dir = ktstr::cli::resolve_cached_kernel(&id, "cargo ktstr", mp)
                 .map_err(|e| format!("{e:#}"))?;
             let dir = canonicalize_cache_dir(cache_dir);
             Ok((ver.clone(), dir))
         }
         KernelId::CacheKey(ref key) => {
-            let cache_dir = ktstr::cli::resolve_cached_kernel(&id, "cargo ktstr")
+            let cache_dir = ktstr::cli::resolve_cached_kernel(&id, "cargo ktstr", mp)
                 .map_err(|e| format!("{e:#}"))?;
             let dir = canonicalize_cache_dir(cache_dir);
             // Extract a discriminating label from the cache key —
@@ -258,7 +261,7 @@ pub(crate) fn resolve_one(id: ktstr::kernel_path::KernelId) -> Result<(String, P
             ref url,
             ref git_ref,
         } => {
-            let cache_dir = ktstr::cli::resolve_git_kernel(url, git_ref, "cargo ktstr")
+            let cache_dir = ktstr::cli::resolve_git_kernel(url, git_ref, "cargo ktstr", mp)
                 .map_err(|e| format!("resolve git+{url}#{git_ref}: {e:#}"))?;
             let dir = canonicalize_cache_dir(cache_dir);
             let label = git_kernel_label(url, git_ref);
@@ -318,8 +321,16 @@ pub(crate) fn resolve_one(id: ktstr::kernel_path::KernelId) -> Result<(String, P
 /// label is the human-meaningful payload it operates on.
 pub(crate) fn resolve_kernel_set(specs: &[String]) -> Result<Vec<(String, PathBuf)>, String> {
     preflight_collision_check(specs)?;
-    let resolved = resolve_specs_parallel(specs)?;
-    let resolved = dedupe_resolved(resolved);
+    // One progress group shared across every parallel worker: each
+    // download/clone adds its own bar to the group's MultiProgress
+    // (concurrent bars coordinate; off-TTY they are hidden). Cleared
+    // after the parallel resolve — on success and on error — so no
+    // bars linger into the build/test phase. `?` is applied AFTER the
+    // clear so an error path still tidies the terminal.
+    let mp = ktstr::cli::FetchProgress::new();
+    let resolved = resolve_specs_parallel(specs, &mp);
+    mp.clear();
+    let resolved = dedupe_resolved(resolved?);
     detect_label_collisions(&resolved)?;
     Ok(resolved)
 }
@@ -355,22 +366,22 @@ pub(crate) fn resolve_kernel_set(specs: &[String]) -> Result<Vec<(String, PathBu
 ///     across specs and overlaps freely.
 /// (2) build — `make -j$(nproc)` invoked under an LLC flock
 ///     plus a cgroup v2 sandbox (`acquire_build_reservation`
-///     in `kernel_build_pipeline`). The flock serializes
-///     concurrent builders against each other, so parallel
-///     resolvers queue at the LLC level even when their
-///     downloads overlapped.
+///     in `kernel_build_pipeline`). The LLC flock is taken
+///     SHARED (`LOCK_SH`), so it does NOT serialize concurrent
+///     builders against each other — distinct `--kernel` specs
+///     build concurrently across rayon workers. The shared lock
+///     coordinates a build against a perf-mode test run (which
+///     takes the LLC `LOCK_EX`), not build-vs-build.
 ///
-/// Net effect: parallelizing `resolve_kernel_set` overlaps
-/// every download / clone phase, while the build phase
-/// remains serialized via the LLC flock the build pipeline
-/// already holds. `make -j$(nproc)` inside a single build
-/// saturates CPU on its own — running multiple builds
-/// concurrently would only contend with the active build's
-/// reserved LLCs, so the flock-driven serialization is the
-/// correct ceiling. The cache-store path is also flock-
-/// protected (`store_succeeds_under_internal_exclusive_lock`
-/// in `cache.rs`) so concurrent stores against different
-/// cache keys are safe.
+/// Net effect: parallelizing `resolve_kernel_set` overlaps the
+/// download / clone phase AND concurrent builds. Because builds
+/// run concurrently, the build phase renders its progress through
+/// the shared `FetchProgress` group (whose `MultiProgress::add`
+/// is `RwLock`-serialized) rather than a process-global `Spinner`.
+/// Builds of the SAME source path still serialize via a separate
+/// exclusive source-tree flock, and concurrent stores against
+/// different cache keys are safe (the cache's per-key exclusive
+/// store lock).
 ///
 /// Concurrent resolves of the SAME spec (e.g. a duplicated
 /// `--kernel 6.14.2` flag) racing on the same cache key are
@@ -391,7 +402,10 @@ pub(crate) fn resolve_kernel_set(specs: &[String]) -> Result<Vec<(String, PathBu
 /// at the LLC-flock layer (see comment above), so the lost
 /// intra-range download overlap is a small fraction of total
 /// wall time on multi-version Range invocations.
-fn resolve_one_spec(trimmed: String) -> Vec<Result<(String, PathBuf), String>> {
+fn resolve_one_spec(
+    trimmed: String,
+    mp: &ktstr::cli::FetchProgress,
+) -> Vec<Result<(String, PathBuf), String>> {
     use ktstr::kernel_path::KernelId;
 
     // Validation runs first so an inverted Range bails
@@ -407,14 +421,14 @@ fn resolve_one_spec(trimmed: String) -> Vec<Result<(String, PathBuf), String>> {
                 Ok(versions) => versions
                     .into_iter()
                     .map(|ver| {
-                        resolve_one_with_progress(KernelId::Version(ver.clone()))
+                        resolve_one_with_progress(KernelId::Version(ver.clone()), mp)
                             .map_err(|e| format!("resolve kernel {ver}: {e}"))
                     })
                     .collect::<Vec<_>>(),
                 Err(e) => vec![Err(format!("{e:#}"))],
             }
         }
-        other => vec![resolve_one_with_progress(other)],
+        other => vec![resolve_one_with_progress(other, mp)],
     }
 }
 
@@ -443,8 +457,9 @@ fn resolve_one_spec(trimmed: String) -> Vec<Result<(String, PathBuf), String>> {
 /// already use.
 fn resolve_one_with_progress(
     id: ktstr::kernel_path::KernelId,
+    mp: &ktstr::cli::FetchProgress,
 ) -> Result<(String, PathBuf), String> {
-    let result = resolve_one(id);
+    let result = resolve_one(id, Some(mp));
     if let Ok((label, _)) = &result {
         eprintln!("cargo ktstr: resolved kernel {label:?}");
     }
@@ -464,7 +479,10 @@ fn resolve_one_with_progress(
 /// out of scope, see `download_and_cache_version` /
 /// `resolve_git_kernel` for the `tempfile::TempDir`-driven
 /// teardown).
-fn resolve_specs_parallel(specs: &[String]) -> Result<Vec<(String, PathBuf)>, String> {
+fn resolve_specs_parallel(
+    specs: &[String],
+    mp: &ktstr::cli::FetchProgress,
+) -> Result<Vec<(String, PathBuf)>, String> {
     use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
     // Cap rayon parallelism via a bounded ThreadPool installed
@@ -484,10 +502,10 @@ fn resolve_specs_parallel(specs: &[String]) -> Result<Vec<(String, PathBuf)>, St
     // logical CPU count, std-lib provided so no extra dependency
     // is pulled in. Saturating local parallelism is the right
     // ceiling: download streams shouldn't outnumber the threads
-    // the host can drive without thrashing, and the build phase
-    // is already serialized at the LLC-flock layer (see comment
-    // above) so additional download fan-out wouldn't accelerate
-    // builds anyway.
+    // the host can drive without thrashing. (Concurrent builds are
+    // NOT serialized against each other — the LLC flock is shared
+    // (LOCK_SH) — but `make -j$(nproc)` already saturates CPU, so
+    // additional in-flight downloads wouldn't speed the builds up.)
     //
     // Operators can override the cap via the
     // `KTSTR_KERNEL_PARALLELISM` env var (see
@@ -527,7 +545,7 @@ fn resolve_specs_parallel(specs: &[String]) -> Result<Vec<(String, PathBuf)>, St
                     Some(trimmed.to_string())
                 }
             })
-            .flat_map_iter(|trimmed| resolve_one_spec(trimmed).into_iter())
+            .flat_map_iter(|trimmed| resolve_one_spec(trimmed, mp).into_iter())
             .collect::<Result<Vec<_>, _>>()
     };
     match bounded_pool {
@@ -715,11 +733,16 @@ fn kernel_build_one(
 
     // Acquire source.
     let client = fetch::shared_client();
+    // Progress group for this build: hosts the download/clone bar AND
+    // (via `kernel_build_pipeline`) the build phase, so one renderer
+    // covers the whole operation. The `--source` path adds no fetch bar
+    // but the same group still hosts the build bar.
+    let fetch_progress = cli::FetchProgress::new();
     let mut acquired = if let Some(ref src_path) = source {
         fetch::local_source(src_path).map_err(|e| format!("{e:#}"))?
     } else if let Some(ref url) = git {
         let ref_name = git_ref.as_deref().expect("clap requires --ref with --git");
-        fetch::git_clone(url, ref_name, tmp_dir.path(), "cargo ktstr")
+        fetch::git_clone(url, ref_name, tmp_dir.path(), "cargo ktstr", Some(&fetch_progress))
             .map_err(|e| format!("{e:#}"))?
     } else {
         // Tarball download: explicit version, prefix, or latest stable.
@@ -749,10 +772,14 @@ fn kernel_build_one(
             eprintln!("cargo ktstr: use --force to rebuild");
             return Ok(());
         }
-        let sp = cli::Spinner::start("Downloading kernel...");
-        let result =
-            fetch::download_tarball(client, &ver, tmp_dir.path(), "cargo ktstr", skip_sha256);
-        drop(sp);
+        let result = fetch::download_tarball(
+            client,
+            &ver,
+            tmp_dir.path(),
+            "cargo ktstr",
+            skip_sha256,
+            Some(&fetch_progress),
+        );
         let mut acquired = result.map_err(|e| format!("{e:#}"))?;
         // `download_tarball` builds its `cache_key` using the bare
         // `cache_key_suffix()` (see `fetch::download_tarball`).
@@ -804,6 +831,7 @@ fn kernel_build_one(
         source.is_some(),
         resolved_cap,
         extra_kconfig,
+        Some(&fetch_progress),
     )
     .map_err(|e| format!("{e:#}"))?;
 
@@ -975,11 +1003,14 @@ mod tests {
     #[test]
     fn resolve_one_range_arm_returns_internal_caller_contract_error() {
         use ktstr::kernel_path::KernelId;
-        let err = resolve_one(KernelId::Range {
-            start: "6.10".to_string(),
-            end: "6.12".to_string(),
-            syntax_inclusive: false,
-        })
+        let err = resolve_one(
+            KernelId::Range {
+                start: "6.10".to_string(),
+                end: "6.12".to_string(),
+                syntax_inclusive: false,
+            },
+            None,
+        )
         .expect_err("Range arm must be Err — it is the defensive internal-error path");
         assert_eq!(
             err,

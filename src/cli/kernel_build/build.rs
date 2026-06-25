@@ -16,7 +16,7 @@ use super::super::kernel_cmd::{
     DIRTY_TREE_CACHE_SKIP_HINT, EMBEDDED_KCONFIG, NON_GIT_TREE_CACHE_SKIP_HINT,
     embedded_kconfig_hash,
 };
-use super::super::util::{Spinner, success, warn};
+use super::super::util::{success, warn};
 use super::kconfig::{
     all_fragment_lines_present, configure_kernel, validate_kernel_config,
     warn_dropped_extra_kconfig_lines, warn_extra_kconfig_overrides_baked_in,
@@ -381,6 +381,7 @@ fn cache_hit_diagnostic(cache_key: &str) -> String {
 ///
 /// Callers that don't expose `--extra-kconfig` (test/coverage/
 /// shell/verifier) pass `None`.
+#[allow(clippy::too_many_arguments)]
 pub fn kernel_build_pipeline(
     acquired: &crate::fetch::AcquiredSource,
     cache: &crate::cache::CacheDir,
@@ -389,9 +390,26 @@ pub fn kernel_build_pipeline(
     is_local_source: bool,
     cpu_cap: Option<crate::vmm::host_topology::CpuCap>,
     extra_kconfig: Option<&str>,
+    progress: Option<&crate::cli::FetchProgress>,
 ) -> Result<KernelBuildResult> {
     let source_dir = &acquired.source_dir;
     let (arch, image_name) = crate::fetch::arch_info();
+
+    // Bind a guaranteed-live progress group for the build phase: the
+    // caller's group (the parallel resolve's shared group, or a
+    // single-shot caller's local one), or a fresh local group when the
+    // caller passed none. The build phase renders through this group and
+    // NEVER through a standalone `Spinner`, so concurrent builds in the
+    // parallel resolve cannot race the process-global `SPINNER_ACTIVE`
+    // guard. Off-TTY the group is hidden and inert.
+    let owned_group;
+    let progress = match progress {
+        Some(p) => p,
+        None => {
+            owned_group = crate::cli::FetchProgress::new();
+            &owned_group
+        }
+    };
 
     // Two-phase reservation. A concurrent perf-mode test run must
     // not have its measured CPUs stomped by a `make -j$(nproc)`
@@ -513,7 +531,7 @@ pub fn kernel_build_pipeline(
         }
     }
 
-    reconfigure_and_build(source_dir, extra_kconfig, cli_label, make_jobs)?;
+    reconfigure_and_build(source_dir, extra_kconfig, cli_label, make_jobs, progress)?;
 
     // Validate critical config options were not silently disabled.
     // When `--extra-kconfig` is set, attach an actionable hint
@@ -535,7 +553,7 @@ pub fn kernel_build_pipeline(
     })?;
 
     if !acquired.is_temp {
-        generate_compile_commands(source_dir)?;
+        generate_compile_commands(source_dir, progress)?;
     }
 
     let (image_path, vmlinux_opt) = find_built_image(source_dir, cli_label)?;
@@ -689,6 +707,7 @@ fn reconfigure_and_build(
     extra_kconfig: Option<&str>,
     cli_label: &str,
     make_jobs: Option<usize>,
+    progress: &crate::cli::FetchProgress,
 ) -> Result<()> {
     let merged_fragment = crate::merge_kconfig_fragments(EMBEDDED_KCONFIG, extra_kconfig);
 
@@ -709,10 +728,9 @@ fn reconfigure_and_build(
     let needs_configure =
         extra_kconfig.is_some() || !all_fragment_lines_present(&merged_fragment, &config_now);
     if needs_configure {
-        let configure_result =
-            Spinner::with_progress("Configuring kernel...", "Kernel configured", |_| {
-                configure_kernel(source_dir, &merged_fragment)
-            });
+        let bar = progress.step_bar("Configuring kernel...");
+        let configure_result = configure_kernel(source_dir, &merged_fragment);
+        bar.finish();
         // Wrap configure errors with `--extra-kconfig` context when
         // extras are present so the user can pinpoint which input is
         // responsible for an olddefconfig failure (e.g. a malformed
@@ -742,9 +760,10 @@ fn reconfigure_and_build(
         }
     }
 
-    Spinner::with_progress("Building kernel...", "Kernel built", |sp| {
-        make_kernel_with_output(source_dir, Some(sp), make_jobs)
-    })?;
+    let bar = progress.step_bar("Building kernel...");
+    let build_result = make_kernel_with_output(source_dir, Some(progress), make_jobs);
+    bar.finish();
+    build_result?;
     Ok(())
 }
 
@@ -757,18 +776,20 @@ fn reconfigure_and_build(
 /// the compile_commands.json rule.  Build the same `-jN +
 /// KCFLAGS=-Wno-error` prefix via `build_make_args`, then append
 /// the target.
-fn generate_compile_commands(source_dir: &Path) -> Result<()> {
+fn generate_compile_commands(
+    source_dir: &Path,
+    progress: &crate::cli::FetchProgress,
+) -> Result<()> {
     let nproc = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1);
     let mut cc_args = build_make_args(nproc);
     cc_args.push("compile_commands.json".into());
     let cc_arg_refs: Vec<&str> = cc_args.iter().map(|s| s.as_str()).collect();
-    Spinner::with_progress(
-        "Generating compile_commands.json...",
-        "compile_commands.json generated",
-        |sp| run_make_with_output(source_dir, &cc_arg_refs, Some(sp)),
-    )?;
+    let bar = progress.step_bar("Generating compile_commands.json...");
+    let cc_result = run_make_with_output(source_dir, &cc_arg_refs, Some(progress));
+    bar.finish();
+    cc_result?;
     Ok(())
 }
 

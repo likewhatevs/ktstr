@@ -1840,7 +1840,8 @@ fn download_stream_finalizes_sha256_over_streamed_bytes() {
     // hasher.update + last_progress reset on the typical
     // streaming path.
     let payload: Vec<u8> = (0..32 * 1024).map(|i| (i % 251) as u8).collect();
-    let mut stream = super::DownloadStream::new(std::io::Cursor::new(payload.clone()));
+    let mut stream =
+        super::DownloadStream::with_progress(std::io::Cursor::new(payload.clone()), None);
     let mut sink: Vec<u8> = Vec::new();
     std::io::copy(&mut stream, &mut sink).expect("copy must drain Cursor");
     assert_eq!(
@@ -1881,6 +1882,7 @@ fn download_stream_errors_on_no_progress_timeout() {
         // is the only branch that can produce TimedOut.
         last_progress: std::time::Instant::now() - std::time::Duration::from_secs(3600),
         no_progress_timeout: std::time::Duration::from_millis(1),
+        progress: None,
     };
     let mut buf = [0u8; 16];
     let err = stream
@@ -1917,6 +1919,7 @@ fn download_stream_resets_progress_clock_on_byte_producing_read() {
         // watchdog check and the `inner.read()` call cannot
         // exceed 1s on any sane machine.
         no_progress_timeout: std::time::Duration::from_secs(60),
+        progress: None,
     };
     let mut buf = [0u8; 16];
     let n = stream.read(&mut buf).expect("first read must succeed");
@@ -1947,6 +1950,7 @@ fn download_stream_eof_does_not_reset_progress_clock() {
         // the EOF path updated it.
         last_progress: std::time::Instant::now() - std::time::Duration::from_secs(1800),
         no_progress_timeout: std::time::Duration::from_secs(7200),
+        progress: None,
     };
     let pre_progress = stream.last_progress;
     let mut buf = [0u8; 16];
@@ -1959,6 +1963,48 @@ fn download_stream_eof_does_not_reset_progress_clock() {
         "Ok(0) must NOT update last_progress — only byte-\
              producing reads count as progress",
     );
+}
+
+/// The download bar advances in lockstep with the bytes the
+/// `DownloadStream` accounts: after draining a known-size payload the
+/// bar's position equals both the payload length and the stream's
+/// `finalize()` byte count — no double-count, no drift. Exercises the
+/// production path (the decoder reads through `DownloadStream`, whose
+/// `read` calls `pb.inc(n)` beside its own `bytes_total += n`).
+#[test]
+fn download_stream_bar_position_equals_streamed_bytes() {
+    let payload = vec![7u8; 4096];
+    let pb = indicatif::ProgressBar::hidden();
+    pb.set_length(payload.len() as u64);
+    let mut stream =
+        super::DownloadStream::with_progress(std::io::Cursor::new(payload.clone()), Some(pb.clone()));
+    let mut sink = Vec::new();
+    std::io::copy(&mut stream, &mut sink).expect("copy through the wrapped stream");
+    let (_, bytes_total) = stream.finalize();
+    assert_eq!(
+        pb.position(),
+        payload.len() as u64,
+        "bar must reach the payload length",
+    );
+    assert_eq!(
+        pb.position(),
+        bytes_total,
+        "bar position must equal the stream's accounted bytes (no double-count)",
+    );
+}
+
+/// With no Content-Length the attached bar has no length but still
+/// advances as a byte counter — the indeterminate-download arm.
+#[test]
+fn download_stream_advances_indeterminate_bar() {
+    let payload = vec![1u8; 1000];
+    let pb = indicatif::ProgressBar::hidden();
+    let mut stream =
+        super::DownloadStream::with_progress(std::io::Cursor::new(payload.clone()), Some(pb.clone()));
+    let mut sink = Vec::new();
+    std::io::copy(&mut stream, &mut sink).expect("copy");
+    assert_eq!(pb.position(), payload.len() as u64);
+    assert_eq!(pb.length(), None, "no Content-Length ⇒ indeterminate bar");
 }
 
 // -- parse_sha256_for_file --
@@ -2519,7 +2565,7 @@ fn print_download_size_with_content_length_renders_mib() {
     );
 
     let (_, bytes) = crate::test_support::test_helpers::capture_stderr(|| {
-        print_download_size(&response, url, "ktstr");
+        print_download_size(&response, url, "ktstr", None);
     });
     let captured = String::from_utf8(bytes).expect("captured stderr must be utf-8");
     assert_eq!(
@@ -2559,7 +2605,7 @@ fn print_download_size_without_content_length_omits_mib() {
     );
 
     let (_, bytes) = crate::test_support::test_helpers::capture_stderr(|| {
-        print_download_size(&response, url, "cargo ktstr");
+        print_download_size(&response, url, "cargo ktstr", None);
     });
     let captured = String::from_utf8(bytes).expect("captured stderr must be utf-8");
     assert_eq!(

@@ -277,6 +277,7 @@ pub fn cache_lookup(
 pub fn resolve_cached_kernel(
     id: &crate::kernel_path::KernelId,
     cli_label: &str,
+    mp: Option<&crate::cli::FetchProgress>,
 ) -> Result<std::path::PathBuf> {
     use crate::kernel_path::KernelId;
     match id {
@@ -305,7 +306,7 @@ pub fn resolve_cached_kernel(
             // explicit `kernel build` / `shell --no-perf-mode` paths
             // only; the auto-build-on-miss codepath is outside that
             // scope by design.
-            download_and_cache_version(&resolved, cli_label, None)
+            download_and_cache_version(&resolved, cli_label, None, mp)
         }
         KernelId::CacheKey(key) => {
             let cache = crate::cache::CacheDir::new()?;
@@ -403,7 +404,7 @@ pub fn resolve_kernel_image(
                 }
             }
             id @ (KernelId::Version(_) | KernelId::CacheKey(_)) => {
-                let cache_dir = resolve_cached_kernel(&id, policy.cli_label)?;
+                let cache_dir = resolve_cached_kernel(&id, policy.cli_label, None)?;
                 crate::kernel_path::find_image_in_dir(&cache_dir).ok_or_else(|| {
                     anyhow::anyhow!("no kernel image found in {}", cache_dir.display())
                 })
@@ -453,7 +454,7 @@ pub fn auto_download_kernel(cli_label: &str) -> Result<std::path::PathBuf> {
     let ver = crate::fetch::fetch_latest_stable_version(crate::fetch::shared_client(), cli_label)?;
     sp.finish(format!("Latest stable: {ver}"));
 
-    let cache_dir = download_and_cache_version(&ver, cli_label, None)?;
+    let cache_dir = download_and_cache_version(&ver, cli_label, None, None)?;
     let (_, image_name) = crate::fetch::arch_info();
     Ok(cache_dir.join(image_name))
 }
@@ -469,10 +470,19 @@ pub fn auto_download_kernel(cli_label: &str) -> Result<std::path::PathBuf> {
 /// the LLC flock + cgroup sandbox phases honour it. `None` means
 /// "reserve 30% of the allowed-CPU set" (see
 /// [`CpuCap::resolve`](crate::vmm::host_topology::CpuCap::resolve)).
+///
+/// `mp` is the progress group spanning BOTH the download and the build:
+/// the parallel resolve's shared group, or `None` for a single-shot
+/// caller (shell auto-fetch, monitor, auto-download), in which case a
+/// local group is created here and passed through to
+/// `kernel_build_pipeline`. The build renders through this same group
+/// (as `step_bar` spinners), so the group stays live across the build
+/// with no standalone `Spinner` to collide with.
 pub fn download_and_cache_version(
     version: &str,
     cli_label: &str,
     cpu_cap: Option<crate::vmm::host_topology::CpuCap>,
+    mp: Option<&crate::cli::FetchProgress>,
 ) -> Result<std::path::PathBuf> {
     let (arch, _) = crate::fetch::arch_info();
     let cache_key = format!("{version}-tarball-{arch}-kc{}", crate::cache_key_suffix());
@@ -486,24 +496,47 @@ pub fn download_and_cache_version(
 
     let tmp_dir = tempfile::TempDir::new()?;
 
-    let sp = Spinner::start("Downloading kernel...");
+    // One progress group spans BOTH the download and the build: the
+    // parallel resolve's shared group via `mp`, or a local group for
+    // single-shot callers (`mp == None`). The build now renders through
+    // this same group rather than a standalone Spinner, so the group
+    // legitimately stays live across the build with no Spinner to
+    // collide with.
+    //
     // `skip_sha256 = false`: the auto-resolve path (test/coverage
     // /llvm-cov / shell auto-fetch) never bypasses checksum
     // verification. The bypass is reachable only via the explicit
     // `kernel build --skip-sha256` flag — auto-resolution must keep
     // the strong manifest guarantee since the operator has not
     // opted into the unverified fallback.
+    let owned_group;
+    let group = match mp {
+        Some(fp) => fp,
+        None => {
+            owned_group = crate::cli::FetchProgress::new();
+            &owned_group
+        }
+    };
     let acquired = crate::fetch::download_tarball(
         crate::fetch::shared_client(),
         version,
         tmp_dir.path(),
         cli_label,
         false,
+        Some(group),
     )?;
-    sp.finish("Downloaded");
 
     let cache = crate::cache::CacheDir::new()?;
-    let result = kernel_build_pipeline(&acquired, &cache, cli_label, false, false, cpu_cap, None)?;
+    let result = kernel_build_pipeline(
+        &acquired,
+        &cache,
+        cli_label,
+        false,
+        false,
+        cpu_cap,
+        None,
+        Some(group),
+    )?;
 
     match result.entry {
         Some(entry) => Ok(entry.path),
@@ -656,10 +689,19 @@ fn filter_and_sort_range(
 /// (`download_and_cache_version`, `resolve_kernel_dir`) use:
 /// it prefixes diagnostic status output and is threaded into
 /// [`kernel_build_pipeline`].
-pub fn resolve_git_kernel(url: &str, git_ref: &str, cli_label: &str) -> Result<std::path::PathBuf> {
+///
+/// `mp` is the progress group the clone bar is added to (the parallel
+/// resolve's shared group). Forwarded to [`crate::fetch::git_clone`];
+/// `None` disables the bar.
+pub fn resolve_git_kernel(
+    url: &str,
+    git_ref: &str,
+    cli_label: &str,
+    mp: Option<&crate::cli::FetchProgress>,
+) -> Result<std::path::PathBuf> {
     let tmp_dir = tempfile::TempDir::new()?;
 
-    let acquired = crate::fetch::git_clone(url, git_ref, tmp_dir.path(), cli_label)?;
+    let acquired = crate::fetch::git_clone(url, git_ref, tmp_dir.path(), cli_label, mp)?;
 
     // Open cache once, reuse for both lookup (post-clone cache_key
     // embeds the resolved short_hash, so a repeat invocation against
@@ -677,7 +719,7 @@ pub fn resolve_git_kernel(url: &str, git_ref: &str, cli_label: &str) -> Result<s
     // extra_kconfig = None: this entry path serves auto-discovery
     // (cargo ktstr test/coverage/llvm-cov), which doesn't expose
     // `--extra-kconfig`. The flag is `cargo ktstr kernel build`-only.
-    let result = kernel_build_pipeline(&acquired, &cache, cli_label, false, false, None, None)?;
+    let result = kernel_build_pipeline(&acquired, &cache, cli_label, false, false, None, None, mp)?;
 
     match result.entry {
         Some(entry) => Ok(entry.path),
@@ -860,7 +902,8 @@ pub fn resolve_kernel_dir_to_entry(
     // which expose `--extra-kconfig`. The flag is `cargo ktstr
     // kernel build`-only and feeds extras directly through that
     // dispatch.
-    let result = kernel_build_pipeline(&acquired, &cache, cli_label, false, true, cpu_cap, None)?;
+    let result =
+        kernel_build_pipeline(&acquired, &cache, cli_label, false, true, cpu_cap, None, None)?;
 
     // Prefer the cached entry directory (stable across rebuilds).
     // For dirty trees, `entry` is `None` — fall back to the
@@ -928,7 +971,8 @@ pub fn resolve_kernel_dir(
     // extra_kconfig = None: matches the sibling
     // `resolve_kernel_dir_to_entry` rationale — `--extra-kconfig` is
     // a `cargo ktstr kernel build`-only flag.
-    let result = kernel_build_pipeline(&acquired, &cache, cli_label, false, true, cpu_cap, None)?;
+    let result =
+        kernel_build_pipeline(&acquired, &cache, cli_label, false, true, cpu_cap, None, None)?;
 
     // Prefer the cached image path (stable across rebuilds).
     match result.entry {
@@ -1085,7 +1129,8 @@ mod tests {
             end: "6.12".to_string(),
             syntax_inclusive: false,
         };
-        let err = resolve_cached_kernel(&id, "ktstr-test").expect_err("inverted range must error");
+        let err =
+            resolve_cached_kernel(&id, "ktstr-test", None).expect_err("inverted range must error");
         let msg = format!("{err:#}");
         assert!(
             msg.contains("inverted kernel range"),

@@ -290,7 +290,7 @@ pub fn find_test_vmlinux() -> Option<std::path::PathBuf> {
             // `resolve_btf(None)` still tries the local-tree / sysfs
             // fallbacks — a test running with a stale env pointer
             // shouldn't be any worse off than a test with no env set.
-            crate::cli::resolve_cached_kernel(&id, "ktstr test")
+            crate::cli::resolve_cached_kernel(&id, "ktstr test", None)
                 .ok()
                 .and_then(|p| p.into_os_string().into_string().ok())
         }

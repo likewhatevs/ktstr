@@ -465,12 +465,24 @@ fn reject_html_response(response: &reqwest::blocking::Response, url: &str) -> Re
 ///
 /// `cli_label` prefixes the diagnostic line so the message matches the
 /// binary the user invoked (`"ktstr"` vs `"cargo ktstr"`).
-fn print_download_size(response: &reqwest::blocking::Response, url: &str, cli_label: &str) {
-    if let Some(len) = response.content_length() {
+fn print_download_size(
+    response: &reqwest::blocking::Response,
+    url: &str,
+    cli_label: &str,
+    mp: Option<&crate::cli::FetchProgress>,
+) {
+    let line = if let Some(len) = response.content_length() {
         let mib = len as f64 / (1024.0 * 1024.0);
-        eprintln!("{cli_label}: downloading {url} ({mib:.1} MiB)");
+        format!("{cli_label}: downloading {url} ({mib:.1} MiB)")
     } else {
-        eprintln!("{cli_label}: downloading {url}");
+        format!("{cli_label}: downloading {url}")
+    };
+    // Route through the progress group so the line coordinates with
+    // concurrent bars on a TTY (and still reaches piped/CI stderr when
+    // the group is hidden); raw `eprintln!` when no group is present.
+    match mp {
+        Some(fp) => fp.println(&line),
+        None => eprintln!("{line}"),
     }
 }
 
@@ -547,22 +559,37 @@ struct DownloadStream<R: Read> {
     /// timeouts in tests) lands without touching the watchdog
     /// logic.
     no_progress_timeout: Duration,
+    /// Optional indicatif download bar, advanced by `inc(n)` on
+    /// every byte-producing read in lockstep with `bytes_total`.
+    /// `None` is the no-bar path (non-TTY, or no progress group
+    /// threaded in) and carries zero per-read overhead beyond the
+    /// `Option` check. Advancing here — the single byte-accounting
+    /// site — guarantees `bar.position() == finalize().1`, so the
+    /// bar can never drift from the bytes the hasher and watchdog
+    /// observed.
+    progress: Option<indicatif::ProgressBar>,
 }
 
 impl<R: Read> DownloadStream<R> {
-    /// Construct a fresh streaming wrapper around `inner` with the
-    /// production no-progress budget. `last_progress` is set to
-    /// "now" so the watchdog clock starts at construction; the
-    /// downstream decoder may take an indeterminate amount of time
-    /// between construction and the first `read()`, but ANY actual
-    /// progress resets the clock.
-    fn new(inner: R) -> Self {
+    /// Construct a streaming wrapper around `inner` with the production
+    /// no-progress budget, optionally attaching an indicatif progress
+    /// bar. `last_progress` is set to "now" so the watchdog clock starts
+    /// at construction; the downstream decoder may take an indeterminate
+    /// time before the first `read()`, but any actual progress resets
+    /// the clock. The optional bar is advanced by `inc(n)` on every
+    /// byte-producing read (see the `progress` field); `progress = None`
+    /// is the non-TTY / no-group path (no bar). The bar is a pure
+    /// observer — it never affects the watchdog gate or the streaming
+    /// sha256, so a stalled or truncated download still surfaces its
+    /// error unchanged.
+    fn with_progress(inner: R, progress: Option<indicatif::ProgressBar>) -> Self {
         Self {
             inner,
             hasher: Sha256::new(),
             bytes_total: 0,
             last_progress: Instant::now(),
             no_progress_timeout: DOWNLOAD_NO_PROGRESS_TIMEOUT,
+            progress,
         }
     }
 
@@ -609,6 +636,12 @@ impl<R: Read> Read for DownloadStream<R> {
                 self.hasher.update(&buf[..n]);
                 self.bytes_total += n as u64;
                 self.last_progress = Instant::now();
+                // Advance the bar in lockstep with `bytes_total` (same
+                // `n`, same reads) so `position()` and `finalize().1`
+                // never diverge. No-op when no bar is attached.
+                if let Some(pb) = &self.progress {
+                    pb.inc(n as u64);
+                }
                 Ok(n)
             }
             Err(e) => Err(e),
@@ -863,6 +896,7 @@ fn download_stable_tarball(
     dest_dir: &Path,
     cli_label: &str,
     skip_sha256: bool,
+    mp: Option<&crate::cli::FetchProgress>,
 ) -> Result<PathBuf> {
     let major = major_version(version)?;
     let tarball_name = format!("linux-{version}.tar.xz");
@@ -883,9 +917,20 @@ fn download_stable_tarball(
         anyhow::bail!("download {url}: HTTP {}", response.status());
     }
     reject_html_response(&response, &url)?;
-    print_download_size(&response, &url, cli_label);
+    print_download_size(&response, &url, cli_label, mp);
+    // Capture the total before `response` is moved into the stream so a
+    // determinate (percent + ETA) bar can be built; `None` when the
+    // server sent no Content-Length, in which case the bar degrades to
+    // a live byte counter.
+    let total = response.content_length();
 
-    eprintln!("{cli_label}: extracting tarball (xz)");
+    // Route status lines through the progress group (see
+    // `print_download_size`); `eprintln!` when no group is threaded in.
+    let status = |line: &str| match mp {
+        Some(fp) => fp.println(line),
+        None => eprintln!("{line}"),
+    };
+    status(&format!("{cli_label}: extracting tarball (xz)"));
     // Stage extraction inside `dest_dir` (same filesystem) so the
     // final `fs::rename` into place is atomic and a verification
     // failure leaves `dest_dir` untouched. A bad mirror that serves
@@ -895,7 +940,8 @@ fn download_stable_tarball(
     // sweeps every entry the malicious archive deposited.
     let staging =
         tempfile::TempDir::new_in(dest_dir).with_context(|| "create extraction staging dir")?;
-    let stream = DownloadStream::new(response);
+    let download_bar = mp.map(|fp| fp.download_bar(version, total));
+    let stream = DownloadStream::with_progress(response, download_bar.as_ref().map(|b| b.bar()));
     let decoder = xz2::read::XzDecoder::new(stream);
     let mut archive = tar::Archive::new(decoder);
     archive
@@ -908,9 +954,16 @@ fn download_stable_tarball(
     // unpack so we don't compute over a partial stream.
     let stream = archive.into_inner().into_inner();
     let (actual_hex, bytes_total) = stream.finalize();
+    // Download is complete (every byte streamed) — clear the bar
+    // before emitting the verification status so the two don't overlap.
+    if let Some(bar) = &download_bar {
+        bar.finish();
+    }
     if let Some(expected) = expected_sha256.as_deref() {
         verify_sha256(&actual_hex, expected, &url)?;
-        eprintln!("{cli_label}: sha256 verified ({bytes_total} bytes, hash {actual_hex})");
+        status(&format!(
+            "{cli_label}: sha256 verified ({bytes_total} bytes, hash {actual_hex})"
+        ));
     } else if !skip_sha256 {
         // Skip path already emitted its bespoke bypass warning
         // before the download; firing again here under "no
@@ -979,6 +1032,7 @@ fn download_rc_tarball(
     version: &str,
     dest_dir: &Path,
     cli_label: &str,
+    mp: Option<&crate::cli::FetchProgress>,
 ) -> Result<PathBuf> {
     let url = format!("https://git.kernel.org/torvalds/t/linux-{version}.tar.gz");
     tracing::info!(%url, "downloading RC kernel tarball (requires network)");
@@ -998,9 +1052,17 @@ fn download_rc_tarball(
         anyhow::bail!("download {url}: HTTP {}", response.status());
     }
     reject_html_response(&response, &url)?;
-    print_download_size(&response, &url, cli_label);
+    print_download_size(&response, &url, cli_label, mp);
+    // RC tarballs are gitweb-generated and often arrive without a
+    // Content-Length, so `total` is frequently `None` and the bar
+    // degrades to a live byte counter (rate, no ETA).
+    let total = response.content_length();
 
-    eprintln!("{cli_label}: extracting tarball (gzip)");
+    let status = |line: &str| match mp {
+        Some(fp) => fp.println(line),
+        None => eprintln!("{line}"),
+    };
+    status(&format!("{cli_label}: extracting tarball (gzip)"));
     // Stage extraction inside `dest_dir` (same filesystem) so the
     // final atomic rename keeps `dest_dir` clean when a bad mirror
     // serves a wrong-version archive or sneaks stray top-level
@@ -1009,7 +1071,8 @@ fn download_rc_tarball(
     // only defence against a hostile gitweb response.
     let staging =
         tempfile::TempDir::new_in(dest_dir).with_context(|| "create extraction staging dir")?;
-    let stream = DownloadStream::new(response);
+    let download_bar = mp.map(|fp| fp.download_bar(version, total));
+    let stream = DownloadStream::with_progress(response, download_bar.as_ref().map(|b| b.bar()));
     let decoder = flate2::read::GzDecoder::new(stream);
     let mut archive = tar::Archive::new(decoder);
     archive
@@ -1023,6 +1086,9 @@ fn download_rc_tarball(
     // re-fetch.
     let stream = archive.into_inner().into_inner();
     let (actual_hex, bytes_total) = stream.finalize();
+    if let Some(bar) = &download_bar {
+        bar.finish();
+    }
     tracing::warn!(
         url = %url,
         bytes = bytes_total,
@@ -1049,18 +1115,23 @@ fn download_rc_tarball(
 /// the RC path always runs unverified and emits its own warning,
 /// so `skip_sha256` is a no-op on the RC arm. `--source` and
 /// `--git` callers do not reach this function at all.
+///
+/// `mp` is the progress group the determinate download bar is added
+/// to; `None` disables the bar (the single-shot `kernel build` paths
+/// and unit tests pass `None`).
 pub fn download_tarball(
     client: &Client,
     version: &str,
     dest_dir: &Path,
     cli_label: &str,
     skip_sha256: bool,
+    mp: Option<&crate::cli::FetchProgress>,
 ) -> Result<AcquiredSource> {
     let (arch, _) = arch_info();
     let source_dir = if is_rc(version) {
-        download_rc_tarball(client, version, dest_dir, cli_label)?
+        download_rc_tarball(client, version, dest_dir, cli_label, mp)?
     } else {
-        download_stable_tarball(client, version, dest_dir, cli_label, skip_sha256)?
+        download_stable_tarball(client, version, dest_dir, cli_label, skip_sha256, mp)?
     };
 
     Ok(AcquiredSource {
@@ -1335,14 +1406,26 @@ fn probe_latest_patch(client: &Client, prefix: &str, cli_label: &str) -> Result<
 ///
 /// `cli_label` prefixes diagnostic status output (e.g. `"ktstr"` or
 /// `"cargo ktstr"`).
+///
+/// `mp` is the progress group a determinate clone bar is added to;
+/// `None` disables the bar and passes `gix::progress::Discard` to gix
+/// exactly as before (the single-shot `kernel build` paths and unit
+/// tests pass `None`). The bar shows real object/file counts + ETA
+/// during the receiving / resolving / checkout phases that gix reports
+/// a bounded total for; see the `crate::cli::progress` module.
 pub fn git_clone(
     url: &str,
     git_ref: &str,
     dest_dir: &Path,
     cli_label: &str,
+    mp: Option<&crate::cli::FetchProgress>,
 ) -> Result<AcquiredSource> {
     let (arch, _) = arch_info();
-    eprintln!("{cli_label}: cloning {url} (ref: {git_ref}, depth: 1)");
+    let cloning = format!("{cli_label}: cloning {url} (ref: {git_ref}, depth: 1)");
+    match mp {
+        Some(fp) => fp.println(&cloning),
+        None => eprintln!("{cloning}"),
+    }
 
     let clone_dir = dest_dir.join("linux");
 
@@ -1354,19 +1437,38 @@ pub fn git_clone(
         .with_ref_name(Some(git_ref))
         .with_context(|| "set ref name")?;
 
-    let (mut checkout, _outcome) = prep
-        .fetch_then_checkout(
-            gix::progress::Discard,
-            &std::sync::atomic::AtomicBool::new(false),
-        )
-        .with_context(|| "clone fetch")?;
+    // Drive a determinate clone bar from gix's progress tree (see
+    // [`crate::cli::progress::CloneProgress`]). `None` when no progress
+    // group is threaded in; the gix calls then pass `Discard` exactly
+    // as before. One interrupt flag (never set) is shared by both
+    // phases, matching the prior per-call `AtomicBool::new(false)`.
+    let clone_progress = mp.map(|fp| fp.clone_progress(git_ref));
+    let interrupt = std::sync::atomic::AtomicBool::new(false);
 
-    let (_repo, _outcome) = checkout
-        .main_worktree(
-            gix::progress::Discard,
-            &std::sync::atomic::AtomicBool::new(false),
-        )
-        .with_context(|| "checkout")?;
+    let (mut checkout, _outcome) = match &clone_progress {
+        Some(cp) => prep
+            .fetch_then_checkout(cp.item(), &interrupt)
+            .with_context(|| "clone fetch")?,
+        None => prep
+            .fetch_then_checkout(gix::progress::Discard, &interrupt)
+            .with_context(|| "clone fetch")?,
+    };
+
+    let (_repo, _outcome) = match &clone_progress {
+        Some(cp) => checkout
+            .main_worktree(cp.item(), &interrupt)
+            .with_context(|| "checkout")?,
+        None => checkout
+            .main_worktree(gix::progress::Discard, &interrupt)
+            .with_context(|| "checkout")?,
+    };
+
+    // Clone + checkout done — stop the poll thread, join it, clear the
+    // bar. On any error path above, `clone_progress` is dropped
+    // instead, and its `Drop` performs the same shutdown (leak-proof).
+    if let Some(cp) = clone_progress {
+        cp.finish();
+    }
 
     let repo = gix::open(&clone_dir).with_context(|| "open cloned repo")?;
     let head = repo.head_id().with_context(|| "read HEAD")?;

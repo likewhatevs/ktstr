@@ -1420,6 +1420,7 @@ dependencies = [
  "gix-worktree-state 0.30.0",
  "gix-worktree-stream 0.32.0",
  "nonempty",
+ "prodash",
  "smallvec",
  "thiserror",
 ]
