@@ -742,8 +742,14 @@ fn kernel_build_one(
         fetch::local_source(src_path).map_err(|e| format!("{e:#}"))?
     } else if let Some(ref url) = git {
         let ref_name = git_ref.as_deref().expect("clap requires --ref with --git");
-        fetch::git_clone(url, ref_name, tmp_dir.path(), "cargo ktstr", Some(&fetch_progress))
-            .map_err(|e| format!("{e:#}"))?
+        fetch::git_clone(
+            url,
+            ref_name,
+            tmp_dir.path(),
+            "cargo ktstr",
+            Some(&fetch_progress),
+        )
+        .map_err(|e| format!("{e:#}"))?
     } else {
         // Tarball download: explicit version, prefix, or latest stable.
         let ver = match version {

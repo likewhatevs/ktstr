@@ -902,8 +902,9 @@ pub fn resolve_kernel_dir_to_entry(
     // which expose `--extra-kconfig`. The flag is `cargo ktstr
     // kernel build`-only and feeds extras directly through that
     // dispatch.
-    let result =
-        kernel_build_pipeline(&acquired, &cache, cli_label, false, true, cpu_cap, None, None)?;
+    let result = kernel_build_pipeline(
+        &acquired, &cache, cli_label, false, true, cpu_cap, None, None,
+    )?;
 
     // Prefer the cached entry directory (stable across rebuilds).
     // For dirty trees, `entry` is `None` — fall back to the
@@ -971,8 +972,9 @@ pub fn resolve_kernel_dir(
     // extra_kconfig = None: matches the sibling
     // `resolve_kernel_dir_to_entry` rationale — `--extra-kconfig` is
     // a `cargo ktstr kernel build`-only flag.
-    let result =
-        kernel_build_pipeline(&acquired, &cache, cli_label, false, true, cpu_cap, None, None)?;
+    let result = kernel_build_pipeline(
+        &acquired, &cache, cli_label, false, true, cpu_cap, None, None,
+    )?;
 
     // Prefer the cached image path (stable across rebuilds).
     match result.entry {

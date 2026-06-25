@@ -196,7 +196,8 @@ impl FetchProgress {
         let root = Root::new();
         let bar = self.multi.add(ProgressBar::new_spinner());
         bar.set_style(
-            ProgressStyle::with_template(CLONE_TEMPLATE_SPINNER).expect("valid clone spinner template"),
+            ProgressStyle::with_template(CLONE_TEMPLATE_SPINNER)
+                .expect("valid clone spinner template"),
         );
         bar.set_message(format!("cloning {label}"));
 
@@ -594,7 +595,10 @@ mod tests {
         let mut snapshot = Vec::new();
         poll_tick(&root, &bar, &mut determinate, "for-next", &mut snapshot);
 
-        assert!(determinate, "a bounded task must switch the bar to determinate");
+        assert!(
+            determinate,
+            "a bounded task must switch the bar to determinate"
+        );
         assert_eq!(bar.length(), Some(200));
         assert_eq!(bar.position(), 80);
     }
@@ -705,7 +709,11 @@ mod tests {
     fn step_bar_no_counter_no_panic() {
         let fp = hidden_group();
         let bar = fp.step_bar("Building kernel...");
-        assert_eq!(bar.pb.length(), None, "a step bar has no quantifiable total");
+        assert_eq!(
+            bar.pb.length(),
+            None,
+            "a step bar has no quantifiable total"
+        );
         bar.finish();
         // Drop-without-finish (the build error path) must also be clean.
         drop(fp.step_bar("Configuring kernel..."));

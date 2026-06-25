@@ -1976,8 +1976,10 @@ fn download_stream_bar_position_equals_streamed_bytes() {
     let payload = vec![7u8; 4096];
     let pb = indicatif::ProgressBar::hidden();
     pb.set_length(payload.len() as u64);
-    let mut stream =
-        super::DownloadStream::with_progress(std::io::Cursor::new(payload.clone()), Some(pb.clone()));
+    let mut stream = super::DownloadStream::with_progress(
+        std::io::Cursor::new(payload.clone()),
+        Some(pb.clone()),
+    );
     let mut sink = Vec::new();
     std::io::copy(&mut stream, &mut sink).expect("copy through the wrapped stream");
     let (_, bytes_total) = stream.finalize();
@@ -1999,8 +2001,10 @@ fn download_stream_bar_position_equals_streamed_bytes() {
 fn download_stream_advances_indeterminate_bar() {
     let payload = vec![1u8; 1000];
     let pb = indicatif::ProgressBar::hidden();
-    let mut stream =
-        super::DownloadStream::with_progress(std::io::Cursor::new(payload.clone()), Some(pb.clone()));
+    let mut stream = super::DownloadStream::with_progress(
+        std::io::Cursor::new(payload.clone()),
+        Some(pb.clone()),
+    );
     let mut sink = Vec::new();
     std::io::copy(&mut stream, &mut sink).expect("copy");
     assert_eq!(pb.position(), payload.len() as u64);
