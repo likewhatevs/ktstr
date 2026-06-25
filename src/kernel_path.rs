@@ -96,20 +96,21 @@ pub enum KernelId {
         syntax_inclusive: bool,
     },
     /// Git source: clone `url`, check out `git_ref`. `git_ref` may be
-    /// a branch, tag, or sha — current `KernelId::parse` stores it
-    /// verbatim with no remote contact. Branches will be resolved to
-    /// a sha at cache-resolution time (Stage 3 wiring; the resolver
-    /// will call `git ls-remote` once per branch ref to anchor
-    /// cached builds to a content-addressable
-    /// `(URL, resolved_sha)` cache key so identical underlying
-    /// commits collapse to one cache entry regardless of which
-    /// spelling produced them).
+    /// a branch, tag, or sha, stored verbatim by `KernelId::parse` with
+    /// no remote contact. At cache-resolution time `resolve_git_kernel`
+    /// ls-remote-resolves `git_ref` to its tip's short hash and probes
+    /// the cache before cloning, so a re-run against an unchanged tip
+    /// skips the clone. The cache key embeds `git_ref` verbatim
+    /// alongside that short hash; collapsing identical-sha-different-
+    /// spelling refs to one content-addressed `(URL, resolved_sha)`
+    /// entry remains future work.
     Git {
         /// Remote URL (https or git@).
         url: String,
         /// Branch name, tag, or sha. Stored verbatim by `parse`;
-        /// branches will be resolved to a sha at cache-resolution
-        /// time so cached builds remain content-addressed.
+        /// ls-remote-resolved to its tip short hash at cache-resolution
+        /// time (see `resolve_git_kernel`) so a cached build is reused
+        /// without re-cloning.
         git_ref: String,
     },
 }

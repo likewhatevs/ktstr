@@ -666,24 +666,25 @@ fn filter_and_sort_range(
 
 /// Resolve a `git+URL#REF` kernel spec to a cache-entry directory.
 ///
-/// Mirrors [`download_and_cache_version`] for the git source path:
-/// shallow-clones the repo into a temp directory via
-/// [`crate::fetch::git_clone`], checks the resulting cache key for an
-/// existing entry (so two consecutive `cargo ktstr test --kernel
-/// git+URL#main` invocations against an unchanged tip skip the rebuild),
-/// and on miss delegates to [`kernel_build_pipeline`] for
-/// configure/build/validate/cache. Returns the cache entry directory
-/// path — the same shape `download_and_cache_version` returns and the
-/// same shape callers feed into the [`crate::KTSTR_KERNEL_ENV`] export.
+/// Mirrors [`download_and_cache_version`] for the git source path. To
+/// avoid an unconditional clone, it FIRST ls-remote-resolves `REF` to
+/// its tip commit (no clone, no working tree — see
+/// [`crate::fetch::ls_remote_short_hash`]) and probes the cache for the
+/// key that resolution produces ([`crate::fetch::git_cache_key`]); on a
+/// hit it returns the cached entry WITHOUT cloning. On a cache miss — or
+/// any ls-remote failure (network, auth, an unadvertised ref), which is
+/// non-fatal — it shallow-clones into a temp directory via
+/// [`crate::fetch::git_clone`], re-checks the cache (the clone resolves
+/// the tip authoritatively), and on miss delegates to
+/// [`kernel_build_pipeline`] for configure/build/validate/cache. Returns
+/// the cache entry directory path — the same shape
+/// `download_and_cache_version` returns and callers feed into the
+/// [`crate::KTSTR_KERNEL_ENV`] export.
 ///
-/// Branches resolve at clone time (the shallow fetch lands on the
-/// branch's current tip; the resulting `short_hash` is what the cache
-/// key embeds). Two operators cloning `git+URL#main` at different
-/// times produce different cache keys when the branch tip has moved
-/// — that is intentional for this stage. A future Stage 3 ls-remote
-/// pre-resolution would collapse identical-sha-different-spelling
-/// invocations to one cache entry; until then the doc comment on
-/// [`crate::kernel_path::KernelId::Git`] tracks that as future work.
+/// The cache key embeds `REF` verbatim alongside the resolved tip
+/// `short_hash`, so two invocations with identical-sha-different-`REF`
+/// spellings remain distinct cache entries (collapsing those to one is
+/// separate future work — see [`crate::kernel_path::KernelId::Git`]).
 ///
 /// `cli_label` matches the contract the sibling helpers
 /// (`download_and_cache_version`, `resolve_kernel_dir`) use:
@@ -699,15 +700,36 @@ pub fn resolve_git_kernel(
     cli_label: &str,
     mp: Option<&crate::cli::FetchProgress>,
 ) -> Result<std::path::PathBuf> {
-    let tmp_dir = tempfile::TempDir::new()?;
+    // Open the cache once: reused by the pre-clone ls-remote probe, the
+    // post-clone lookup, and the build pipeline below.
+    let cache = crate::cache::CacheDir::new()?;
 
+    // Probe the cache BEFORE the expensive full clone: ls-remote
+    // resolves `git_ref` to its tip short_hash, which with the raw
+    // `git_ref` keys the same entry `git_clone` would write — a hit
+    // returns without cloning. ls-remote failure is non-fatal: fall
+    // through to the clone, which resolves the tip authoritatively (and
+    // surfaces a clearer error if the remote is genuinely unreachable).
+    if let Some(short_hash) = crate::fetch::ls_remote_short_hash(url, git_ref) {
+        let cache_key = crate::fetch::git_cache_key(git_ref, &short_hash);
+        if let Some(entry) = cache_lookup(&cache, &cache_key, cli_label) {
+            let msg =
+                format!("{cli_label}: git+{url}#{git_ref} -> {short_hash} cached; skipping clone");
+            match mp {
+                Some(fp) => fp.println(&msg),
+                None => eprintln!("{msg}"),
+            }
+            return Ok(entry.path);
+        }
+    }
+
+    let tmp_dir = tempfile::TempDir::new()?;
     let acquired = crate::fetch::git_clone(url, git_ref, tmp_dir.path(), cli_label, mp)?;
 
-    // Open cache once, reuse for both lookup (post-clone cache_key
-    // embeds the resolved short_hash, so a repeat invocation against
-    // an unchanged branch tip skips the rebuild) and the build
-    // pipeline below on miss.
-    let cache = crate::cache::CacheDir::new()?;
+    // Re-check the cache post-clone: the clone resolves the tip
+    // authoritatively, catching a hit the ls-remote probe missed (a
+    // ref-name resolution difference, or a probe that failed) so an
+    // unchanged tip still skips the rebuild.
     if let Some(entry) = cache_lookup(&cache, &acquired.cache_key, cli_label) {
         return Ok(entry.path);
     }

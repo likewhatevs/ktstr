@@ -2831,3 +2831,125 @@ fn fetch_read_makefile_version_parses_and_guards() {
     std::fs::remove_file(dir.path().join("Makefile")).expect("rm Makefile");
     assert_eq!(super::read_makefile_version(dir.path()), None);
 }
+
+// -- git cache key + ls-remote ref pre-resolution --
+
+#[test]
+fn git_cache_key_embeds_ref_short_hash_arch_and_suffix() {
+    let key = git_cache_key("for-next", "abc1234");
+    assert!(
+        key.starts_with("for-next-git-abc1234-"),
+        "key must lead with the raw ref, the -git- marker, and the short hash: {key}"
+    );
+    let (arch, _) = arch_info();
+    assert!(
+        key.contains(&format!("-{arch}-kc")),
+        "key must carry the target arch before the kc suffix: {key}"
+    );
+}
+
+#[test]
+fn ls_remote_short_hash_uses_full_sha_directly_without_network() {
+    // A full 40-hex ref short-circuits the handshake (the bogus URL is
+    // never contacted) and is lowercased to match git_clone's head
+    // rendering.
+    let sha = "1234567890abcdef1234567890abcdef12345678";
+    assert_eq!(
+        ls_remote_short_hash("https://invalid.invalid/nope.git", sha),
+        Some("1234567".to_string()),
+    );
+    let upper = "ABCDEF1234567890ABCDEF1234567890ABCDEF12";
+    assert_eq!(
+        ls_remote_short_hash("https://invalid.invalid/nope.git", upper),
+        Some("abcdef1".to_string()),
+    );
+}
+
+fn direct_ref(name: &str, hex: &str) -> gix::protocol::handshake::Ref {
+    gix::protocol::handshake::Ref::Direct {
+        full_ref_name: name.into(),
+        object: gix::hash::ObjectId::from_hex(hex.as_bytes()).expect("valid hex"),
+    }
+}
+
+#[test]
+fn match_ref_short_hash_resolves_branch_tag_head_and_precedence() {
+    let a = "1111111111111111111111111111111111111111";
+    let b = "2222222222222222222222222222222222222222";
+    let c = "3333333333333333333333333333333333333333";
+
+    // Branch under refs/heads.
+    let refs = vec![direct_ref("refs/heads/for-next", a)];
+    assert_eq!(
+        match_ref_short_hash(&refs, "for-next"),
+        Some("1111111".into())
+    );
+
+    // Lightweight tag (Direct under refs/tags).
+    let refs = vec![direct_ref("refs/tags/v6.10", b)];
+    assert_eq!(match_ref_short_hash(&refs, "v6.10"), Some("2222222".into()));
+
+    // heads wins over tags for the same bare name (git precedence).
+    let refs = vec![direct_ref("refs/tags/x", b), direct_ref("refs/heads/x", a)];
+    assert_eq!(match_ref_short_hash(&refs, "x"), Some("1111111".into()));
+
+    // An explicit refs/ path matches exactly.
+    let refs = vec![direct_ref("refs/heads/main", c)];
+    assert_eq!(
+        match_ref_short_hash(&refs, "refs/heads/main"),
+        Some("3333333".into())
+    );
+
+    // HEAD via a Symbolic ref resolves to its ultimate object.
+    let refs = vec![gix::protocol::handshake::Ref::Symbolic {
+        full_ref_name: "HEAD".into(),
+        target: "refs/heads/main".into(),
+        tag: None,
+        object: gix::hash::ObjectId::from_hex(c.as_bytes()).unwrap(),
+    }];
+    assert_eq!(match_ref_short_hash(&refs, "HEAD"), Some("3333333".into()));
+
+    // No matching ref -> None.
+    let refs = vec![direct_ref("refs/heads/main", a)];
+    assert_eq!(match_ref_short_hash(&refs, "does-not-exist"), None);
+}
+
+#[test]
+fn match_ref_short_hash_annotated_tag_uses_peeled_commit_not_tag() {
+    // An annotated tag advertises Peeled { tag: <tag object>, object:
+    // <peeled commit> }. The key must use the peeled COMMIT (object):
+    // git_clone checks out the commit (HEAD = commit), so the tag
+    // object's hash would never match a clone-produced cache key.
+    let tag_obj = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let commit = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let refs = vec![gix::protocol::handshake::Ref::Peeled {
+        full_ref_name: "refs/tags/v1.0".into(),
+        tag: gix::hash::ObjectId::from_hex(tag_obj.as_bytes()).unwrap(),
+        object: gix::hash::ObjectId::from_hex(commit.as_bytes()).unwrap(),
+    }];
+    assert_eq!(match_ref_short_hash(&refs, "v1.0"), Some("bbbbbbb".into()));
+}
+
+#[test]
+fn match_ref_short_hash_skips_unborn() {
+    let refs = vec![gix::protocol::handshake::Ref::Unborn {
+        full_ref_name: "refs/heads/new".into(),
+        target: "refs/heads/new".into(),
+    }];
+    assert_eq!(match_ref_short_hash(&refs, "new"), None);
+}
+
+#[test]
+fn is_full_sha_gate_recognizes_only_40_char_hex() {
+    // Exactly 40 hex chars (either case) is a sha -> fast path.
+    assert!(is_full_sha(&"a".repeat(40)), "40 lowercase hex is a sha");
+    assert!(is_full_sha(&"A".repeat(40)), "40 uppercase hex is a sha");
+    // Off-by-one lengths are names, not shas -> fall through to ls-remote.
+    assert!(!is_full_sha(&"a".repeat(39)), "39 chars is not a sha");
+    assert!(!is_full_sha(&"a".repeat(41)), "41 chars is not a sha");
+    // 40 chars but a non-hex byte is a ref name, not a sha.
+    assert!(
+        !is_full_sha(&format!("{}g", "a".repeat(39))),
+        "40-char non-hex is not a sha"
+    );
+}
