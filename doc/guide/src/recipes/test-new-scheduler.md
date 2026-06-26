@@ -197,3 +197,63 @@ See [The #\[ktstr_test\] Macro](../writing-tests/ktstr-test-macro.md)
 for all available attributes and
 [Scheduler Definitions](../writing-tests/scheduler-definitions.md)
 for the full `Scheduler` type and the `declare_scheduler!` macro.
+
+## 9. Host a ktstr test in an external scheduler crate
+
+A scheduler that lives in its own crate (outside the ktstr
+workspace) can host ktstr tests directly. Gate ktstr behind a
+feature so it never enters a normal build — ktstr pulls in
+Linux-only, heavyweight dependencies (KVM, libbpf, a kernel
+loader, guest memory) that would break non-Linux development and
+bloat ordinary CI.
+
+In the scheduler crate's `Cargo.toml`:
+
+```toml
+[dependencies]
+# Optional + exact-pinned: ktstr is pre-1.0, so a minor bump can
+# break the test-facing API. The pin MUST equal the installed
+# cargo-ktstr (see "Version compatibility" in the README). It must
+# be an optional [dependencies] entry, not a dev-dependency, because
+# `dep:ktstr` in [features] only resolves an optional normal dep
+# (Cargo has no optional dev-dependencies).
+ktstr = { version = "=0.19.0", optional = true }
+
+[features]
+# Enabling the feature pulls ktstr in; without it the crate builds
+# with no ktstr dependency at all.
+ktstr-tests = ["dep:ktstr"]
+
+[dev-dependencies]
+# Only if a test body uses raw libc (e.g. fork / _exit); the
+# prelude does not re-export libc.
+libc = "0.2"
+```
+
+The test file gates its whole contents on the feature, so the
+crate compiles to nothing extra when the feature is off:
+
+```rust,ignore
+#![cfg(feature = "ktstr-tests")]
+
+use ktstr::prelude::*;
+
+// `MY_SCHED` is your scheduler's `declare_scheduler!(MY_SCHED, { ... })`
+// constant (see section 1). Drop the `scheduler =` attribute to run the
+// test under the kernel's default EEVDF instead.
+#[ktstr_test(scheduler = MY_SCHED)]
+fn my_sched_runs(ctx: &Ctx) -> Result<AssertResult> {
+    ktstr::scenario::basic::custom_sched_mixed(ctx)
+}
+```
+
+Build a kernel once (see section 3), then run the gated tests.
+The feature flag rides the nextest passthrough after `--`:
+
+```sh
+cargo ktstr kernel build --source /path/to/linux
+cargo ktstr test --kernel /path/to/linux -- --features ktstr-tests
+```
+
+`cargo ktstr test` forwards everything after `--` to `cargo nextest
+run`, which routes `--features ktstr-tests` to the test compile.

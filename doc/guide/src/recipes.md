@@ -18,7 +18,8 @@ Standalone examples for common tasks. Each recipe is self-contained.
 > Both binaries are installed by `cargo install ktstr`.
 
 - [Test a new scheduler](recipes/test-new-scheduler.md) -- end-to-end
-  from binary to integration tests
+  from binary to integration tests; includes
+  [hosting ktstr tests in an external scheduler crate](recipes/test-new-scheduler.md#9-host-a-ktstr-test-in-an-external-scheduler-crate)
 - [Investigate a crash](recipes/investigate-crash.md) -- auto-repro,
   reading BPF probe output
 - [A/B compare branches](recipes/ab-compare.md) -- worktree setup,
