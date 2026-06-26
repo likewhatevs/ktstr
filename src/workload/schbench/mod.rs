@@ -11,8 +11,9 @@
 //! and schedstat run-delay capture). [`run::run`] backs the
 //! [`Schbench`](crate::workload::WorkType::Schbench) workload and the per-phase
 //! metric path; [`run_standalone`] drives the same engine host-side, outside a
-//! VM, for the side-by-side validation against the reference schbench. The RPS
-//! injector + auto-rps remain a follow-up.
+//! VM, for the side-by-side validation against the reference schbench. The
+//! RPS-injector mode (`-R`) and its auto-RPS rate control (`-A`) are part of the
+//! engine; the control thread also samples the per-second RPS distribution.
 
 pub(crate) mod handshake;
 pub(crate) mod percpu_lock;
@@ -58,7 +59,29 @@ pub struct StandaloneReport {
     pub request_max_us: u32,
     /// Number of request-latency samples folded into the percentiles.
     pub nr_request_samples: u64,
-    /// Requests completed per second over the run window (schbench's RPS line).
+    /// Per-second achieved-RPS percentiles (requests/sec), in
+    /// [`SCHBENCH_PERCENTILES`] order — schbench's `rps_stats` table sampled once
+    /// per second by the control thread (`schbench.c:1777`). Unitless rate, not
+    /// µs, so no `_us` suffix.
+    pub rps_pcts: [u32; 5],
+    /// Differenced per-bucket sample count at each RPS percentile, in
+    /// [`SCHBENCH_PERCENTILES`] order.
+    pub rps_counts: [u64; 5],
+    /// Minimum observed per-second RPS sample.
+    pub rps_min: u32,
+    /// Maximum observed per-second RPS sample.
+    pub rps_max: u32,
+    /// Number of per-second RPS samples folded into the percentiles.
+    pub nr_rps_samples: u64,
+    /// Auto-RPS final TOTAL target rate at run exit (per-thread live rate *
+    /// message_threads), schbench's `final rps goal` (`schbench.c:1995`). Equal to
+    /// the seeded total for fixed `-R`/default mode; diverges only under auto-RPS.
+    pub final_rps_goal: usize,
+    /// Completed work cycles per second over the TRUE elapsed run window
+    /// (`loop_count / elapsed`). NOT schbench's `average rps` summary line, which
+    /// divides by the integer `-r` runtime — `schbench_validate` prints that
+    /// (`loop_count / runtime_secs`) separately; this field is the measured
+    /// elapsed-window rate.
     pub achieved_rps: f64,
     /// Mean message-thread run-queue wait (ns), schedstat mean-of-means.
     pub sched_delay_msg_ns: u64,
@@ -109,6 +132,12 @@ pub fn run_standalone(config: &SchbenchConfig, run_secs: u64) -> StandaloneRepor
         request_min_us: w.request.min,
         request_max_us: w.request.max,
         nr_request_samples: w.request.nr_samples,
+        rps_pcts: w.rps.values,
+        rps_counts: w.rps.counts,
+        rps_min: w.rps.min,
+        rps_max: w.rps.max,
+        nr_rps_samples: w.rps.nr_samples,
+        final_rps_goal: w.final_rps_goal,
         achieved_rps: w.achieved_rps,
         sched_delay_msg_ns: w.sched_delay_msg_ns,
         sched_delay_worker_ns: w.sched_delay_worker_ns,
@@ -124,14 +153,16 @@ mod tests {
     /// projection fills every [`StandaloneReport`] field from the whole-run
     /// aggregate. Pins the pub entry the `ktstr-schbench-validate` bin depends
     /// on. Minimal topology (1 message thread, 1 worker, no think-sleep) over a
-    /// 1-second window — enough for the wakeup/request loop to record samples.
+    /// 2-second window — the wakeup/request loop records latency samples, and the
+    /// control thread fires at the 1-second tick so at least one per-second RPS
+    /// sample lands before stop (a 1s window would race the single tick).
     #[test]
     fn run_standalone_fills_report_from_a_real_run() {
         let config = SchbenchConfig::default()
             .message_threads(1)
             .worker_threads(1)
             .sleep_usec(0);
-        let report = run_standalone(&config, 1);
+        let report = run_standalone(&config, 2);
 
         // The engine did work and paced requests over the window.
         assert!(report.loop_count > 0, "loop_count: {}", report.loop_count);
@@ -141,6 +172,10 @@ mod tests {
         assert!(report.nr_wakeup_samples > 0, "wakeup samples");
         assert!(report.nr_request_samples > 0, "request samples");
 
+        // The control thread sampled the per-second RPS distribution (default
+        // mode samples every second; the 1s tick lands inside the 2s window).
+        assert!(report.nr_rps_samples > 0, "rps samples: {}", report.nr_rps_samples);
+
         // Percentile values projected in order: a distribution is monotonic
         // non-decreasing across p20..p99.9 (a higher percentile sits at a
         // higher histogram bucket). Catches a transposed/garbled values array.
@@ -149,6 +184,9 @@ mod tests {
         }
         for w in report.request_pcts_us.windows(2) {
             assert!(w[0] <= w[1], "request percentiles monotonic: {:?}", report.request_pcts_us);
+        }
+        for w in report.rps_pcts.windows(2) {
+            assert!(w[0] <= w[1], "rps percentiles monotonic: {:?}", report.rps_pcts);
         }
 
         // Per-row counts carried through (not zeroed by the projection). They are
@@ -167,6 +205,12 @@ mod tests {
             "request counts {rc} in (0, {}]",
             report.nr_request_samples
         );
+        let rpsc: u64 = report.rps_counts.iter().sum();
+        assert!(
+            rpsc > 0 && rpsc <= report.nr_rps_samples,
+            "rps counts {rpsc} in (0, {}]",
+            report.nr_rps_samples
+        );
 
         // min/max projected (carried, not swapped); min <= max is the
         // invariant. NOT `min <= pcts[0]` / `pcts[4] <= max`: min/max are exact
@@ -176,5 +220,6 @@ mod tests {
         // pcts[0]) -- a real value, not a bug, so bracketing would flake.
         assert!(report.wakeup_min_us <= report.wakeup_max_us);
         assert!(report.request_min_us <= report.request_max_us);
+        assert!(report.rps_min <= report.rps_max);
     }
 }

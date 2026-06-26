@@ -6,14 +6,12 @@
 //! (`schbench.c:552`). It is the artifact for the side-by-side validation:
 //! invoke this and the reference `schbench` with identical flags and compare the
 //! percentile tables (output identity), and compare `perf stat` / `strace -c` of
-//! the two processes (effects identity).
+//! the two processes (effects identity). The output mirrors schbench's final
+//! summary (`schbench.c:1985-2004`): the Wakeup, Request, and RPS percentile
+//! tables, then either `average rps` (fixed/default mode) or `final rps goal was`
+//! (auto-RPS), then the `sched delay` line.
 //!
-//! Divergence from the reference output: schbench samples a *per-second* RPS
-//! distribution and prints its percentiles; the engine reports a single
-//! whole-run mean RPS (`loop_count / runtime`), printed here as `average rps`.
-//! The per-second RPS distribution is part of the RPS-injector follow-up.
-//!
-//! The trailing `sched delay` line also diverges, and the engine's value is the
+//! The trailing `sched delay` line diverges, and the engine's value is the
 //! more accurate one: schbench's FINAL summary runs `collect_sched_delay` after
 //! every thread has exited — each message thread joins its workers
 //! (`schbench.c:1599-1602`) before main joins the message threads
@@ -62,6 +60,10 @@ struct Args {
     /// message-handshake mode), non-zero drives the RPS-injector mode.
     #[arg(short = 'R', long, default_value_t = 0)]
     rps: usize,
+    /// Auto-RPS target CPU-busy percentage (schbench `-A`); 0 = off. Non-zero
+    /// turns on closed-loop rate control (seeds the rate to 10 when `-R` is 0).
+    #[arg(short = 'A', long, default_value_t = 0)]
+    auto_rps: usize,
 }
 
 fn main() {
@@ -73,45 +75,72 @@ fn main() {
         .operations(args.operations)
         .sleep_usec(args.sleep_usec)
         .skip_locking(args.skip_locking)
-        .requests_per_sec(args.rps);
+        .requests_per_sec(args.rps)
+        .auto_rps(args.auto_rps);
 
     let report = run_standalone(&config, args.runtime_secs);
-    print_report(&report, args.runtime_secs);
+    print_report(&report, args.runtime_secs, args.auto_rps);
 }
 
 /// schbench's `PLIST_FOR_LAT` masks the 20.0th percentile off latency tables
-/// (`schbench.c:129`) — only the RPS table uses it (`PLIST_FOR_RPS`). The bin
-/// renders no RPS table, so the 20.0th (index 0) is never printed; latency
-/// tables show 50/90/99/99.9 starred at p99 (`PLIST_99`, index 3 —
-/// `schbench.c:126,1801`).
+/// (`schbench.c:129`), showing 50/90/99/99.9 starred at p99 (`PLIST_99`, index 3
+/// — `schbench.c:126,1801`).
 const LAT_ROW_INDICES: [usize; 4] = [1, 2, 3, 4];
 const LAT_STAR_INDEX: usize = 3;
 
-/// Print the report in schbench's `show_latencies` shape (`schbench.c:552`).
-fn print_report(r: &StandaloneReport, runtime_secs: u64) {
+/// schbench's `PLIST_FOR_RPS` shows 20/50/90 starred at p50 (`PLIST_50`, index 1
+/// — `schbench.c:130,1808`).
+const RPS_ROW_INDICES: [usize; 3] = [0, 1, 2];
+const RPS_STAR_INDEX: usize = 1;
+
+/// Print the report in schbench's final-summary shape (`schbench.c:1985-2004`):
+/// the Wakeup, Request, and RPS percentile tables, then the RPS-goal/average
+/// line, then sched delay. `auto_rps` selects the schbench branch for that line.
+fn print_report(r: &StandaloneReport, runtime_secs: u64, auto_rps: usize) {
     print_distribution(
         "Wakeup Latencies",
+        "usec",
         runtime_secs,
         r.nr_wakeup_samples,
         &r.wakeup_pcts_us,
         &r.wakeup_counts,
         r.wakeup_min_us,
         r.wakeup_max_us,
+        &LAT_ROW_INDICES,
+        LAT_STAR_INDEX,
     );
     print_distribution(
         "Request Latencies",
+        "usec",
         runtime_secs,
         r.nr_request_samples,
         &r.request_pcts_us,
         &r.request_counts,
         r.request_min_us,
         r.request_max_us,
+        &LAT_ROW_INDICES,
+        LAT_STAR_INDEX,
     );
-    // The engine reports a scalar mean RPS, not schbench's per-second RPS
-    // distribution (see the module doc); print it as schbench's trailing
-    // `average rps` line.
-    println!("average rps: {:.2}", r.achieved_rps);
-    // schbench prints sched delay in usec on one line (`schbench.c:1809-1812`,
+    print_distribution(
+        "RPS",
+        "requests",
+        runtime_secs,
+        r.nr_rps_samples,
+        &r.rps_pcts,
+        &r.rps_counts,
+        r.rps_min,
+        r.rps_max,
+        &RPS_ROW_INDICES,
+        RPS_STAR_INDEX,
+    );
+    // schbench prints `final rps goal was N` under auto-RPS, else `average rps`
+    // as loop_count / runtime (`schbench.c:1991-1997`).
+    if auto_rps != 0 {
+        println!("final rps goal was {}", r.final_rps_goal);
+    } else {
+        println!("average rps: {:.2}", r.loop_count as f64 / runtime_secs as f64);
+    }
+    // schbench prints sched delay in usec on one line (`schbench.c:2001-2004`,
     // the run_delay ns / 1000); mirror that exactly.
     println!(
         "sched delay: message {} (usec) worker {} (usec)",
@@ -120,22 +149,26 @@ fn print_report(r: &StandaloneReport, runtime_secs: u64) {
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn print_distribution(
     label: &str,
+    units: &str,
     runtime_secs: u64,
     nr_samples: u64,
     pcts: &[u32; 5],
     counts: &[u64; 5],
     min: u32,
     max: u32,
+    rows: &[usize],
+    star: usize,
 ) {
     println!(
-        "{label} percentiles (usec) runtime {runtime_secs} (s) ({nr_samples} total samples)"
+        "{label} percentiles ({units}) runtime {runtime_secs} (s) ({nr_samples} total samples)"
     );
-    // SCHBENCH_PERCENTILES labels each row; LAT_ROW_INDICES applies schbench's
-    // PLIST_FOR_LAT mask (no 20.0th for latency tables) — no hard-coded labels.
-    for &i in &LAT_ROW_INDICES {
-        let marker = if i == LAT_STAR_INDEX { "* " } else { "  " };
+    // SCHBENCH_PERCENTILES labels each row; `rows` applies schbench's per-table
+    // mask (PLIST_FOR_LAT / PLIST_FOR_RPS) — no hard-coded labels.
+    for &i in rows {
+        let marker = if i == star { "* " } else { "  " };
         println!(
             "\t{marker}{:.1}th: {:<10} ({} samples)",
             SCHBENCH_PERCENTILES[i], pcts[i], counts[i]

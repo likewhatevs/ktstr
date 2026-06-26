@@ -1,9 +1,10 @@
 //! schbench's run engine, ported faithfully from `schbench.c`: the
 //! message-thread / worker-thread topology, the lockless wait-list, the
 //! handshake-driven wakeup-latency loop, and the matrix work under the
-//! per-CPU lock. This is the default (non-RPS) mode -- the wakeup-latency +
-//! request-latency benchmark, with per-phase schedstat (run-delay) capture. The
-//! RPS injector, request queue, and auto-rps are a later phase.
+//! per-CPU lock. The default (non-RPS) mode is the wakeup-latency +
+//! request-latency benchmark, with per-phase schedstat (run-delay) capture; the
+//! RPS-injector mode (`-R`) and its auto-RPS closed-loop rate control (`-A`)
+//! layer on the request queue + once-per-second control thread.
 //!
 //! # Topology (`schbench.c` `message_thread` :1540, `worker_thread` :1419)
 //!
@@ -33,7 +34,9 @@
 
 use core::cell::UnsafeCell;
 use core::ptr;
-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 
 use super::percpu_lock::PerCpuLocks;
 use super::plat::{Percentiles, PlatStats};
@@ -134,8 +137,9 @@ impl<T: Linked> TreiberStack<T> {
 /// matching schbench's per-request malloc/free (part of the syscall profile the
 /// standalone validation compares). schbench's `start_time` field is set
 /// (`:951`) but never read, so it is omitted: the wakeup latency is measured
-/// from the worker's `wake_time` (stamped by the RPS thread at enqueue) and the
-/// request latency from a local work-start -- neither reads `start_time`.
+/// from the worker's `wake_time` (stamped by the RPS thread at enqueue, and by
+/// the worker itself before it blocks -- see [`rps_wait`]) and the request
+/// latency from a local work-start -- neither reads `start_time`.
 /// Omitting it also drops schbench's per-request `gettimeofday` for that dead
 /// field (`:951`) -- one fewer clock syscall per request, consistent with the
 /// engine's `CLOCK_MONOTONIC`-vs-`gettimeofday` clock divergence.
@@ -193,6 +197,13 @@ pub struct SchbenchConfig {
     /// dedicated thread enqueues `requests_per_sec` requests/second round-robin
     /// across the workers (`schbench.c` `run_rps_thread`, `:1258`).
     pub requests_per_sec: usize,
+    /// Auto-RPS target CPU-busy percentage (`schbench.c` `-A`, default 0 = off).
+    /// Non-zero turns on closed-loop rate control: a once-per-second control
+    /// thread grows/shrinks the live request rate toward this host-busy% target
+    /// (`schbench.c` `auto_scale_rps`, `:1180`). Setting it seeds the rate to 10
+    /// when `requests_per_sec` is 0 (`schbench.c:286`), so auto-RPS starts low
+    /// and climbs.
+    pub auto_rps: usize,
 }
 
 impl Default for SchbenchConfig {
@@ -206,6 +217,7 @@ impl Default for SchbenchConfig {
             sleep_usec: 100,
             skip_locking: false,
             requests_per_sec: 0,
+            auto_rps: 0,
         }
     }
 }
@@ -255,6 +267,13 @@ impl SchbenchConfig {
         self.requests_per_sec = rps;
         self
     }
+    /// Set the auto-RPS target host-busy percentage (schbench `-A`); 0 disables
+    /// auto-scaling. Non-zero seeds the rate to 10 when `requests_per_sec` is 0.
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn auto_rps(mut self, target_pct: usize) -> Self {
+        self.auto_rps = target_pct;
+        self
+    }
 
     /// Matrix dimension from the cache footprint, identical to schbench
     /// (`schbench.c:1880`: `sqrt(cache_footprint_kb * 1024 / 3 /
@@ -270,17 +289,33 @@ impl SchbenchConfig {
         }
     }
 
-    /// Per-message-thread request rate: the user's total `requests_per_sec`
-    /// (`-R`) divided across the message threads, each of which runs its own RPS
-    /// thread. schbench divides once at startup (`requests_per_sec /=
-    /// message_threads`, `schbench.c:1899`) BEFORE the per-thread mode gate
-    /// (`if (requests_per_sec)`, `schbench.c:1594`), so this value drives BOTH
-    /// the injection rate AND the RPS-vs-default mode selection: when the total
-    /// rate is below the message-thread count it rounds to 0, and the thread runs
-    /// the DEFAULT message-handshake mode (not a zero-rate RPS mode), exactly as
-    /// schbench does. Integer division drops the remainder, matching schbench.
+    /// The effective TOTAL request rate after schbench's startup seed: the user's
+    /// `requests_per_sec`, or 10 when auto-RPS is on and no fixed rate was given
+    /// (`schbench.c:286`: auto-RPS starts at 10 and climbs toward its target).
+    /// Both the mode gate ([`rps_per_message_thread`](Self::rps_per_message_thread))
+    /// and the live auto-scaled injection rate seed from this.
+    pub(crate) fn normalized_total_rps(&self) -> usize {
+        if self.auto_rps != 0 && self.requests_per_sec == 0 {
+            10
+        } else {
+            self.requests_per_sec
+        }
+    }
+
+    /// Per-message-thread request rate driving the RPS-vs-default MODE GATE: the
+    /// normalized total ([`normalized_total_rps`](Self::normalized_total_rps))
+    /// divided across the message threads, each of which runs its own RPS thread.
+    /// schbench divides once at startup (`requests_per_sec /= message_threads`,
+    /// `schbench.c:1899`) BEFORE the per-thread mode gate (`if (requests_per_sec)`,
+    /// `schbench.c:1594`), so the gate sees the divided value: a total below the
+    /// message-thread count rounds to 0 and the thread runs the DEFAULT
+    /// message-handshake mode (not a zero-rate RPS). The gate is decided ONCE from
+    /// this seeded value; the actual injection rate is the live auto-scaled total
+    /// (which may climb above the seed). Integer division drops the remainder,
+    /// matching schbench -- so auto-RPS with more than 10 message threads (seed
+    /// 10 / m = 0) degenerates to default mode, exactly as schbench does.
     pub(crate) fn rps_per_message_thread(&self) -> usize {
-        self.requests_per_sec / self.message_threads.max(1)
+        self.normalized_total_rps() / self.message_threads.max(1)
     }
 }
 
@@ -512,15 +547,29 @@ fn msg_and_wait(
 }
 
 /// Worker side of one RPS-injector cycle. Faithful to schbench's `msg_and_wait`
-/// RPS branch (`schbench.c:1011-1037`): reset `pending`, splice this worker's
-/// request queue (FIFO). If non-empty, return the chain immediately (fast path,
-/// no wait, no wakeup sample -- `:1014-1017`). If empty, block on this worker's
-/// own futex until the RPS thread posts it (the RPS thread stamped `wake_time`
-/// at enqueue, `:1294`), record the wakeup (scheduler) latency, then splice
-/// whatever it queued (null on a spurious wake or the shutdown wake-all). Unlike
+/// RPS branch (`schbench.c:1007-1037`): stamp our own `wake_time`, reset
+/// `pending`, then splice this worker's request queue (FIFO). If non-empty,
+/// return the chain immediately (fast path, no wait, no wakeup sample --
+/// `:1014-1017`). If empty, block on this worker's own futex until the RPS thread
+/// posts it, record the wakeup (scheduler) latency, then splice whatever it
+/// queued (null on a spurious wake or the shutdown wake-all). Unlike
 /// [`msg_and_wait`], the worker does NOT enqueue on the message thread's
 /// wait-list or post a message thread -- the RPS thread is the sole waker.
+///
+/// `wake_time` is stamped HERE before the splice (schbench `:1008`) AND by the
+/// RPS thread at enqueue (`:1294`). On a TRUE block the RPS thread's stamp wins
+/// (it overwrites ours before posting), so `now - wake_time` is the enqueue->run
+/// scheduler latency. But on a FAST wake -- a leftover RUNNING futex token from a
+/// request the worker already drained via splice (the word is consumed by splice,
+/// not by `wait`, so it stays RUNNING) -- the RPS thread does NOT re-stamp, so our
+/// own stamp makes the delta measure THIS block decision (near-zero), not the
+/// stale enqueue time of the already-served request. Omitting it inflates the
+/// fast-wake samples to the full inter-request gap (the wakeup-p50 bug: 543ms
+/// vs schbench's 7µs).
 fn rps_wait(td: &ThreadData, stop: &AtomicBool) -> *mut Request {
+    // Stamp our own wake_time before splicing (schbench `:1008`); see the doc for
+    // why this is what keeps fast-wake samples honest.
+    td.wake_time.store(monotonic_nanos(), Ordering::Release);
     // Reset the backpressure counter before draining (schbench `td->pending = 0`,
     // `:1012`): the RPS thread stops enqueuing while pending exceeds the batch
     // cap, so clearing it re-opens this worker for the next batch.
@@ -532,10 +581,21 @@ fn rps_wait(td: &ThreadData, stop: &AtomicBool) -> *mut Request {
     if stop.load(Ordering::Acquire) {
         return ptr::null_mut();
     }
-    // Empty queue: block until the RPS thread posts our futex. It stamped
-    // `wake_time` at enqueue, so `now - wake_time` is the scheduler wakeup
-    // latency (schbench `fwait` NULL then add_lat, `:1032`/`:1034-1037`).
+    // Empty queue: block until the RPS thread posts our futex, then `now -
+    // wake_time` is the scheduler wakeup latency (schbench `fwait` NULL then
+    // add_lat, `:1032`/`:1034-1037`).
     td.futex.wait_forever();
+    // Shutdown wake: if stop is set, the wake came from run_rps_thread's stop-path
+    // wake-all (`:1308-1312`), which posts every worker WITHOUT restamping
+    // wake_time. A worker blocked between bursts when stop fires would otherwise
+    // record `now - (its own stale block-time stamp)` -- the whole inter-burst
+    // gap -- as a phantom wakeup, one garbage tail sample per worker. That is not
+    // a request-driven wakeup, so skip the sample (schbench's `if (!stopping)
+    // fwait` guard, `:1030`, encodes the same intent: shutdown is not a latency
+    // event). Return any leftover requests for the caller to free.
+    if stop.load(Ordering::Acquire) {
+        return td.requests.splice_reversed();
+    }
     let now = monotonic_nanos();
     let wake = td.wake_time.load(Ordering::Acquire);
     let delta_us = now.saturating_sub(wake) / 1000;
@@ -544,7 +604,7 @@ fn rps_wait(td: &ThreadData, stop: &AtomicBool) -> *mut Request {
         unsafe { (*td.wakeup_stats.get()).add_lat(delta_us.min(u32::MAX as u64) as u32) };
     }
     // Splice whatever the RPS thread enqueued before posting us (null if the post
-    // was the shutdown wake-all with nothing queued).
+    // was a spurious wake with nothing queued).
     td.requests.splice_reversed()
 }
 
@@ -651,18 +711,13 @@ fn run_msg_thread(
 fn run_rps_thread(
     workers: &[ThreadData],
     msg_td: &ThreadData,
-    config: &SchbenchConfig,
     stop: &AtomicBool,
     phase_epoch: Option<&AtomicU32>,
+    live_rate: &AtomicUsize,
 ) {
     let tid = gettid_self();
     let mut cur_epoch = phase_epoch.map_or(0, |e| e.load(Ordering::Relaxed));
     let mut phase_ss_start = read_schedstat_raw(tid);
-    // Per-message-thread rate (the `-R` total / message_threads); see
-    // [`SchbenchConfig::rps_per_message_thread`]. Reaching this function means
-    // the mode gate already saw the SAME per-thread rate non-zero, so it is >= 1
-    // here (a sub-1-per-thread total selects default mode, not this path).
-    let requests_per_sec = config.rps_per_message_thread();
     // schbench's per-worker queue-depth cap before the injector backs off
     // (`schbench.c:1267`).
     const BATCH: u64 = 128;
@@ -670,6 +725,12 @@ fn run_rps_thread(
     let worker_count = workers.len().max(1);
     let mut cur_tid: usize = 0;
     while !stop.load(Ordering::Acquire) {
+        // Re-read the live per-message-thread rate each second. `live_rate` is
+        // already the per-thread value (schbench's post-`/= message_threads`
+        // global `requests_per_sec`, `:1899`), injected directly with no further
+        // division (`schbench.c:1290`). Auto-RPS retargets it from the control
+        // thread; a fixed `-R` leaves it constant.
+        let requests_per_sec = live_rate.load(Ordering::Relaxed);
         let start = monotonic_nanos();
         for _ in 0..requests_per_sec {
             if stop.load(Ordering::Acquire) {
@@ -1020,8 +1081,18 @@ fn resolve_cpu_topology() -> (usize, usize) {
 pub(crate) struct SchbenchResult {
     pub(crate) wakeup: Percentiles,
     pub(crate) request: Percentiles,
+    /// Per-second achieved-RPS distribution (schbench's `rps_stats`), sampled
+    /// once per second by the control thread. For auto-RPS, samples are gated
+    /// until the target is hit (`schbench.c:1781`); for fixed/default mode every
+    /// second is sampled.
+    pub(crate) rps: Percentiles,
     pub(crate) loop_count: u64,
     pub(crate) achieved_rps: f64,
+    /// Auto-RPS final TOTAL target rate at run exit: the live per-message-thread
+    /// rate * message_threads (schbench's `requests_per_sec * message_threads`,
+    /// `schbench.c:1995`). For fixed `-R` and default mode this equals the seeded
+    /// total; only auto-RPS makes it diverge as the control loop retargets.
+    pub(crate) final_rps_goal: usize,
     /// Mean message-thread run-queue wait (ns), averaged across message threads
     /// (schbench's `message_thread_delay`, `schbench.c:1673`).
     pub(crate) sched_delay_msg_ns: u64,
@@ -1064,6 +1135,7 @@ fn run_one_message_thread(
     stop: &AtomicBool,
     progress: &AtomicU64,
     phase_epoch: Option<&AtomicU32>,
+    live_rate: &AtomicUsize,
 ) -> MessageThreadResult {
     let workers: Vec<ThreadData> = (0..worker_threads).map(|_| ThreadData::new()).collect();
     let msg_td = ThreadData::new();
@@ -1087,7 +1159,7 @@ fn run_one_message_thread(
         // calling thread and record the dispatcher's run-delay into `msg_td`
         // (schbench `message_thread`, `:1594`).
         if config.rps_per_message_thread() != 0 {
-            run_rps_thread(&workers, &msg_td, config, stop, phase_epoch);
+            run_rps_thread(&workers, &msg_td, stop, phase_epoch, live_rate);
         } else {
             run_msg_thread(&msg_td, &wait_list, stop, phase_epoch);
         }
@@ -1154,6 +1226,224 @@ fn run_one_message_thread(
     }
 }
 
+/// Persistent /proc/stat reader state for auto-RPS, carrying the previous
+/// cumulative totals so each call computes a delta over the interval (schbench
+/// keeps one fd + the prior total/idle, `schbench.c` `read_busy`, `:1046`).
+#[derive(Default)]
+struct ReadBusyState {
+    fd: Option<File>,
+    prev_total: u64,
+    prev_idle: u64,
+}
+
+/// Host-busy percentage over the interval since the last call, from the
+/// aggregate `cpu` line of /proc/stat (schbench `read_busy`,
+/// `schbench.c:1046-1112`). `None` means "no usable reading this tick": the first
+/// call (baseline seed, schbench's `first_run`) OR a zero jiffy-delta (two reads
+/// in the same tick -- schbench has no guard and divides by zero into a NaN that
+/// spuriously trips its target-hit `else` branch; we skip the tick instead). A
+/// real reading is `Some(0.0..=100.0)`, including a genuine fully-idle `Some(0.0)`
+/// -- distinguished from the seed via the `prev_total` state, NOT via the value,
+/// so an idle interval still drives a grow (the bug a `busy == 0.0` test had). In
+/// the guest VM /proc/stat covers exactly the allocated cpuset (the guest has
+/// only `cores=N`), so this system-wide read is correctly scoped to the
+/// workload's CPUs. f32 to match schbench's `float` arithmetic.
+fn read_busy(s: &mut ReadBusyState) -> Option<f32> {
+    if s.fd.is_none() {
+        s.fd = File::open("/proc/stat").ok();
+    }
+    let f = s.fd.as_mut()?;
+    f.seek(SeekFrom::Start(0)).ok()?;
+    let mut buf = [0u8; 512];
+    let n = f.read(&mut buf).ok()?;
+    let text = core::str::from_utf8(&buf[..n]).ok()?;
+    // First line only; first token must be "cpu" (the aggregate line). Sum every
+    // numeric field -> total; field index 3 (after "cpu") is idle -- kernel
+    // show_stat order is user/nice/system/IDLE/iowait/irq/softirq/steal/guest/
+    // guest_nice. `split_whitespace` collapses the "cpu  " double space, matching
+    // schbench's `strtok_r` (`schbench.c:1082-1096`).
+    let line = text.lines().next().unwrap_or("");
+    let mut fields = line.split_whitespace();
+    if fields.next() != Some("cpu") {
+        return None;
+    }
+    let mut total = 0u64;
+    let mut idle = 0u64;
+    for (i, tok) in fields.enumerate() {
+        let v: u64 = tok.parse().unwrap_or(0);
+        if i == 3 {
+            idle = v;
+        }
+        total += v;
+    }
+    // First call: seed the baseline, no busy% yet (`schbench.c:1098-1101`).
+    if s.prev_total == 0 {
+        s.prev_total = total;
+        s.prev_idle = idle;
+        return None;
+    }
+    let dt = total.saturating_sub(s.prev_total);
+    let di = idle.saturating_sub(s.prev_idle);
+    s.prev_total = total;
+    s.prev_idle = idle;
+    if dt == 0 {
+        // Zero jiffy-delta: skip rather than NaN (see the doc; schbench diverges).
+        return None;
+    }
+    Some(100.0 - (di as f32 / dt as f32) * 100.0)
+}
+
+/// Grow or shrink the live per-message-thread request rate toward `target_pct`
+/// host-busy, given an already-read `busy` percentage (schbench `auto_scale_rps`'s
+/// scaling body, `schbench.c:1203-1250`). Pure: no I/O, so the scaling decision is
+/// unit-tested with injected `busy` values. Stores the new per-thread rate into
+/// `live_rate` -- schbench scales its global `requests_per_sec` (already per-thread
+/// after `:1899`) and writes it back at `:1250`. Returns true on the transition
+/// INTO the near-target band (when `target_hit` flips false->true), so the caller
+/// resets the rps histogram (schbench memsets `rps_stats` on that transition). The
+/// near-target test reads the delta AFTER its damping reassignment, exactly as
+/// schbench does (`:1210`,`:1233`). f32 math + `ceil` (grow) / `floor` (shrink)
+/// match schbench's float deltas + rounding.
+fn scale_rps_for_busy(
+    busy: f32,
+    live_rate: &AtomicUsize,
+    target_hit: &AtomicBool,
+    target_pct: usize,
+) -> bool {
+    let target = target_pct as f32;
+    let rps = live_rate.load(Ordering::Relaxed) as f32;
+    let already_hit = target_hit.load(Ordering::Relaxed);
+    let mut just_hit = false;
+    let new_rate: usize = if busy < target {
+        // Under target: grow (`schbench.c:1203-1224`).
+        let mut delta = target / busy;
+        if delta > 3.0 {
+            delta = 3.0;
+        } else if delta < 1.2 {
+            delta = 1.0 + (delta - 1.0) / 8.0;
+            // Threshold check AFTER the damping reassignment (`schbench.c:1209-1213`).
+            if delta < 1.05 && !already_hit {
+                just_hit = true;
+            }
+        } else if delta < 1.5 {
+            delta = 1.0 + (delta - 1.0) / 4.0;
+        }
+        let t = (rps * delta).ceil();
+        // Not enough capacity to reach the target -> hold (`schbench.c:1219-1224`).
+        if t >= (1u64 << 31) as f32 {
+            rps as usize
+        } else {
+            t as usize
+        }
+    } else if busy > target {
+        // Over target: shrink (`schbench.c:1226-1242`).
+        let mut delta = target / busy;
+        if delta < 0.3 {
+            delta = 0.3;
+        } else if delta > 0.9 {
+            delta += (1.0 - delta) / 8.0;
+            // Threshold check AFTER the damping reassignment (`schbench.c:1232-1236`).
+            if delta > 0.95 && !already_hit {
+                just_hit = true;
+            }
+        } else if delta > 0.8 {
+            delta += (1.0 - delta) / 4.0;
+        }
+        (rps * delta).floor().max(0.0) as usize
+    } else {
+        // Exactly on target (`schbench.c:1243-1248`).
+        if !already_hit {
+            just_hit = true;
+        }
+        rps as usize
+    };
+    live_rate.store(new_rate, Ordering::Relaxed);
+    if just_hit {
+        target_hit.store(true, Ordering::Relaxed);
+    }
+    just_hit
+}
+
+/// Read host-busy from /proc/stat and scale the live rate toward the target
+/// (schbench `auto_scale_rps`, `schbench.c:1180-1251`). The first read only seeds
+/// the baseline (schbench's `first_run` early return, `:1201`); a zero-delta tick
+/// is skipped (see [`read_busy`]). Returns [`scale_rps_for_busy`]'s just-hit flag.
+fn auto_scale_rps(
+    busy_state: &mut ReadBusyState,
+    live_rate: &AtomicUsize,
+    target_hit: &AtomicBool,
+    target_pct: usize,
+) -> bool {
+    let Some(busy) = read_busy(busy_state) else {
+        return false;
+    };
+    scale_rps_for_busy(busy, live_rate, target_hit, target_pct)
+}
+
+/// The once-per-second control thread, schbench's main control loop
+/// (`schbench.c:1756-1827`): sample the achieved per-second RPS into `rps_stats`
+/// and -- when auto-RPS is on -- adjust the live rate toward the target. Returns
+/// the accumulated `rps_stats` on exit (the owning thread moves it out on join).
+/// The 1-second cadence is the workload's defined sampling/scaling interval (a
+/// workload duration like the per-request think-sleep), not a synchronization
+/// wait; it observes `stop` after each interval.
+fn control_loop(
+    progress: &AtomicU64,
+    stop: &AtomicBool,
+    config: &SchbenchConfig,
+    live_rate: &AtomicUsize,
+    target_hit: &AtomicBool,
+) -> PlatStats {
+    let mut rps_stats = PlatStats::default();
+    let mut last_loop = 0u64;
+    let mut last_t = monotonic_nanos();
+    let mut busy_state = ReadBusyState::default();
+    while !stop.load(Ordering::Acquire) {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        // Sample the just-elapsed interval BEFORE re-checking stop at the loop
+        // top: it is a complete second of data even if stop fired during the
+        // sleep (the common integer-window case), so an early break here would
+        // silently drop a full valid sample. schbench likewise samples the
+        // boundary interval in which its run expires (`schbench.c:1756,1781`).
+        // The interval that races stop is understated (workers halt partway) --
+        // the same property schbench's final boundary sample has.
+        let now = monotonic_nanos();
+        let lc = progress.load(Ordering::Relaxed);
+        let dt = now.saturating_sub(last_t);
+        // The `dt > 0` guard drops a zero-Δt tick rather than recording
+        // schbench's `isfinite(rps) ? rps : 0` substitution (`schbench.c:1782`);
+        // combined with the sleep-FIRST loop shape, it also omits schbench's
+        // first ~µs-window sample (schbench reads `now` immediately at loop start,
+        // `schbench.c:1757`, before any work). Both are unreachable on the
+        // monotonic clock (dt is ~1e9 ns/tick, never 0) -- a deliberate, cleaner
+        // divergence like read_busy's dt==0 NaN-skip. A short fixed-`-R` rps
+        // side-by-side can still differ by schbench's one garbage first sample.
+        if dt > 0 {
+            // Achieved per-second rate = Δcompleted-cycles / Δt (schbench
+            // `combine_message_thread_rps` over the shared loop count, `:1777`).
+            let rps = lc.saturating_sub(last_loop) as f64 * 1e9 / dt as f64;
+            // Gate: for auto-RPS, sample only once the target is hit
+            // (`schbench.c:1781`); fixed/default mode samples every second.
+            if config.auto_rps == 0 || target_hit.load(Ordering::Relaxed) {
+                rps_stats.add_lat((rps as u64).min(u32::MAX as u64) as u32);
+            }
+        }
+        last_loop = lc;
+        last_t = now;
+        if config.auto_rps != 0 {
+            let just_hit = auto_scale_rps(&mut busy_state, live_rate, target_hit, config.auto_rps);
+            if just_hit {
+                // Discard the pre-target samples (schbench memsets rps_stats on
+                // the target-hit transition -- the grow, shrink, and on-target
+                // bands all funnel through scale_rps_for_busy's just_hit,
+                // `schbench.c:1212`/`:1235`/`:1247`).
+                rps_stats = PlatStats::default();
+            }
+        }
+    }
+    rps_stats
+}
+
 /// Run the schbench workload until `stop` is set, returning the whole-run
 /// percentiles + achieved rate AND the per-phase aggregates. `progress` is the
 /// live count of completed work cycles across all workers. `phase_epoch` (when
@@ -1185,15 +1475,49 @@ pub(crate) fn run(
     let mut all_phases: std::collections::BTreeMap<u32, SchbenchPhaseStats> =
         std::collections::BTreeMap::new();
 
+    // The live PER-MESSAGE-THREAD request rate the RPS injectors read each second
+    // -- schbench's global `requests_per_sec` AFTER its startup `/= message_threads`
+    // (`schbench.c:1899`), which is exactly the value `auto_scale_rps` scales
+    // (`schbench.c:1250`) and each `run_rps_thread` injects directly with no
+    // further division (`schbench.c:1290`). Seeded from `rps_per_message_thread()`
+    // (the -R total / m, or the auto-RPS seed 10 / m). The control thread
+    // auto-scales it when auto-RPS is on; otherwise it stays constant -- a fixed
+    // -R then injects that seed rate unchanged. `target_hit` gates the rps_stats sampling
+    // for auto-RPS (`schbench.c:1781`); `rps_stats` is moved out of the control
+    // thread on join. `live_rate` is read back after the scope as the auto-RPS
+    // "final rps goal" (`schbench.c:1995`, per-thread * m).
+    //
+    // Ordering: both atomics are lone scalars that gate NO coupled memory --
+    // `live_rate` is a plain count the RPS thread loops on (the requests it
+    // enqueues publish via the Treiber stack's own AcqRel), and `target_hit` is
+    // touched only by the control thread. So Relaxed is correct (a 1-second-stale
+    // read is benign within the auto-RPS cadence; schbench reads its global with
+    // no sync at all). The final read after the scope is synchronized by the join.
+    let live_rate = AtomicUsize::new(config.rps_per_message_thread());
+    let target_hit = AtomicBool::new(false);
+    let mut rps_stats = PlatStats::default();
+
     std::thread::scope(|outer| {
         let handles: Vec<_> = (0..config.message_threads)
             .map(|_| {
                 let locks = locks.as_ref();
+                let live_rate = &live_rate;
                 outer.spawn(move || {
-                    run_one_message_thread(worker_threads, locks, config, stop, progress, phase_epoch)
+                    run_one_message_thread(
+                        worker_threads,
+                        locks,
+                        config,
+                        stop,
+                        progress,
+                        phase_epoch,
+                        live_rate,
+                    )
                 })
             })
             .collect();
+        // Control thread: schbench's main control loop -- once/sec, sample the
+        // achieved RPS into rps_stats and (for auto-RPS) auto-scale `live_rate`.
+        let control = outer.spawn(|| control_loop(progress, stop, config, &live_rate, &target_hit));
         for h in handles {
             let mtr = h.join().expect("schbench message thread panicked");
             all_wakeup.combine(&mtr.whole_wakeup);
@@ -1205,8 +1529,13 @@ pub(crate) fn run(
                 all_phases.entry(epoch).or_default().merge(&sps);
             }
         }
+        rps_stats = control.join().expect("schbench control thread panicked");
     });
 
+    // The auto-RPS "final rps goal" (`schbench.c:1995`): the live per-thread rate
+    // at exit * message_threads. Read after the scope (all threads joined, so the
+    // control loop's last store is visible).
+    let final_rps_goal = live_rate.load(Ordering::Relaxed) * config.message_threads;
     let loop_count = progress.load(Ordering::Relaxed);
     let elapsed_ns = monotonic_nanos().saturating_sub(start);
     let achieved_rps = if elapsed_ns > 0 {
@@ -1226,8 +1555,10 @@ pub(crate) fn run(
         whole_run: SchbenchResult {
             wakeup: all_wakeup.percentiles(),
             request: all_request.percentiles(),
+            rps: rps_stats.percentiles(),
             loop_count,
             achieved_rps,
+            final_rps_goal,
             sched_delay_msg_ns,
             sched_delay_worker_ns,
         },
@@ -1346,6 +1677,7 @@ mod tests {
             sleep_usec: 0,
             skip_locking: false,
             requests_per_sec: 0,
+            auto_rps: 0,
         };
         let stop = AtomicBool::new(false);
         let progress = AtomicU64::new(0);
@@ -1387,6 +1719,7 @@ mod tests {
             sleep_usec: 0,
             skip_locking: false,
             requests_per_sec: 0,
+            auto_rps: 0,
         };
         let stop = AtomicBool::new(false);
         let progress = AtomicU64::new(0);
@@ -1425,6 +1758,7 @@ mod tests {
             sleep_usec: 0,
             skip_locking: false,
             requests_per_sec: 10_000,
+            auto_rps: 0,
         };
         let stop = AtomicBool::new(false);
         let progress = AtomicU64::new(0);
@@ -1468,6 +1802,7 @@ mod tests {
             sleep_usec: 0,
             skip_locking: false,
             requests_per_sec: 1, // 1 / 2 message threads = 0 per thread -> default
+            auto_rps: 0,
         };
         let stop = AtomicBool::new(false);
         let progress = AtomicU64::new(0);
@@ -1487,6 +1822,104 @@ mod tests {
     }
 
     #[test]
+    fn auto_scale_grows_when_idle_and_shrinks_when_busy() {
+        // Pure scaling math (no /proc/stat I/O) at injected busy levels, matching
+        // schbench's auto_scale_rps body (`schbench.c:1203-1250`).
+
+        // Far under target: delta = 80/10 = 8, capped to 3 -> ceil(100*3) = 300.
+        // Not a near-target transition, so just_hit is false (the >3 cap branch
+        // never trips target_hit).
+        let rate = AtomicUsize::new(100);
+        let hit = AtomicBool::new(false);
+        assert!(!scale_rps_for_busy(10.0, &rate, &hit, 80));
+        assert_eq!(rate.load(Ordering::Acquire), 300);
+        assert!(!hit.load(Ordering::Acquire));
+
+        // Far over target: delta = 20/100 = 0.2, clamped to 0.3 -> floor(300*0.3)
+        // = 90. Also not a near-target transition.
+        let rate = AtomicUsize::new(300);
+        let hit = AtomicBool::new(false);
+        assert!(!scale_rps_for_busy(100.0, &rate, &hit, 20));
+        assert_eq!(rate.load(Ordering::Acquire), 90);
+        assert!(!hit.load(Ordering::Acquire));
+
+        // Exactly on target: rate held, target_hit set on the first arrival
+        // (`schbench.c:1243-1248`).
+        let rate = AtomicUsize::new(123);
+        let hit = AtomicBool::new(false);
+        assert!(scale_rps_for_busy(50.0, &rate, &hit, 50));
+        assert_eq!(rate.load(Ordering::Acquire), 123);
+        assert!(hit.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn auto_scale_target_hit_uses_post_damping_delta() {
+        // The near-target test reads the delta AFTER its damping reassignment
+        // (`schbench.c:1209-1213` grow, `:1232-1236` shrink) -- the bug the
+        // pre-reassignment check had. These cases trip target_hit ONLY under the
+        // correct post-damping order.
+
+        // Grow band: busy 90, target 100 -> delta 1.111 (NOT < 1.05), damped to
+        // 1 + 0.111/8 = 1.0139 (< 1.05) -> target_hit. A pre-damping check on
+        // 1.111 would miss it.
+        let rate = AtomicUsize::new(1000);
+        let hit = AtomicBool::new(false);
+        assert!(scale_rps_for_busy(90.0, &rate, &hit, 100));
+        assert!(hit.load(Ordering::Acquire));
+
+        // Shrink band: busy 100, target 95 -> delta 0.95 (NOT > 0.95), damped to
+        // 0.95 + 0.05/8 = 0.95625 (> 0.95) -> target_hit. A pre-damping check on
+        // 0.95 would miss it.
+        let rate = AtomicUsize::new(1000);
+        let hit = AtomicBool::new(false);
+        assert!(scale_rps_for_busy(100.0, &rate, &hit, 95));
+        assert!(hit.load(Ordering::Acquire));
+
+        // Already hit: no second transition is reported (just_hit guards on
+        // !already_hit), even on an exact-target tick.
+        let rate = AtomicUsize::new(1000);
+        let hit = AtomicBool::new(true);
+        assert!(!scale_rps_for_busy(50.0, &rate, &hit, 50));
+    }
+
+    #[test]
+    fn engine_auto_rps_mode_runs_and_terminates() {
+        // auto_rps != 0 turns on the once-per-second control thread that
+        // auto-scales the live rate toward the busy target. Seeded with an
+        // explicit -R so the injector services requests immediately (progress
+        // hits 50 well before the first 1s control tick), this proves the
+        // auto-RPS path boots, injects, and run() terminates cleanly (the control
+        // thread observes stop; a hang is the nextest timeout). The scaling MATH
+        // is pinned by the scale_rps_for_busy unit tests; host-busy + target-hit
+        // timing is environment-dependent, so there is no sample-count assertion.
+        let config = SchbenchConfig {
+            message_threads: 1,
+            worker_threads: 2,
+            cache_footprint_kib: 16,
+            operations: 1,
+            sleep_usec: 0,
+            skip_locking: false,
+            requests_per_sec: 10_000,
+            auto_rps: 50,
+        };
+        let stop = AtomicBool::new(false);
+        let progress = AtomicU64::new(0);
+        let outcome = std::thread::scope(|s| {
+            let runner = s.spawn(|| run(&config, &stop, &progress, None));
+            while progress.load(Ordering::Relaxed) < 50 {
+                core::hint::spin_loop();
+            }
+            stop.store(true, Ordering::Release);
+            runner.join().expect("run panicked")
+        });
+        assert!(
+            outcome.whole_run.loop_count >= 50,
+            "auto-RPS injector serviced requests: {}",
+            outcome.whole_run.loop_count
+        );
+    }
+
+    #[test]
     fn engine_splits_stats_across_phase_epochs() {
         // Drive the shared phase_epoch 1 -> 2 mid-run and confirm the engine
         // partitions its histograms + loop_count into per-epoch snapshots
@@ -1500,6 +1933,7 @@ mod tests {
             sleep_usec: 0,
             skip_locking: false,
             requests_per_sec: 0,
+            auto_rps: 0,
         };
         let stop = AtomicBool::new(false);
         let progress = AtomicU64::new(0);

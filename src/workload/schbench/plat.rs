@@ -171,11 +171,13 @@ impl PlatStats {
     /// Record one sample. Faithful port of `schbench.c` `add_lat` (:743):
     /// updates max/min (with the `min == 0` sentinel) and increments the
     /// bucket + sample count. Does NOT gate `us == 0` — the caller decides
-    /// whether a zero is a real sample. (For reference, schbench's latency
-    /// callers GATE on `delta > 0`: a non-positive delta is dropped, not
-    /// recorded, `schbench.c:1035-1037,1481-1483`; its RPS caller instead
-    /// substitutes 0 for a non-finite rate, `schbench.c:1782`. The
-    /// schbench_rs callers that apply that gating arrive in a later phase.)
+    /// whether a zero is a real sample. schbench's latency callers GATE on
+    /// `delta > 0` (a non-positive delta is dropped, `schbench.c:1035-1037,
+    /// 1481-1483`); schbench_rs mirrors that in `msg_and_wait` / `rps_wait`.
+    /// schbench's RPS caller instead substitutes 0 for a non-finite rate
+    /// (`schbench.c:1782`); schbench_rs's RPS caller (`control_loop`) DROPS the
+    /// tick via its `dt > 0` guard — unreachable on the monotonic clock and a
+    /// cleaner estimator (no synthetic 0 in bucket 0).
     ///
     /// The `u32` bucket increments with `+= 1`: in a debug build this
     /// panics if a single bucket exceeds 2^32 samples; in release it wraps,
