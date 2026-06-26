@@ -73,14 +73,54 @@ fn plat_idx_to_val(idx: usize) -> u32 {
 /// schbench's per-stat latency histogram (`schbench.c` `struct stats`
 /// :112). ~19 KiB (the `plat` array dominates) — same footprint the C
 /// carries per `thread_data`.
-#[derive(Clone)]
+///
+/// `Serialize`/`Deserialize` + `Eq` make this the per-phase wire carrier
+/// (rides inside `PhaseSlice` guest→host). Every field is integer, so the
+/// histogram re-pools across workers via [`PlatStats::combine`] (bucket-count
+/// addition) host-side — percentiles are NEVER averaged, the only correct
+/// cross-worker pooling. The `plat` array uses a `#[serde(with)]` adapter
+/// because serde has no array impl past length 32.
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct PlatStats {
+    #[serde(with = "plat_array_serde")]
     plat: [u32; PLAT_NR],
     nr_samples: u64,
     max: u32,
     /// `0` is the unset sentinel (`schbench.c` `add_lat`/`combine_stats`),
     /// so a genuine 0-usec sample does NOT update `min`.
     min: u32,
+}
+
+/// serde adapter for [`PlatStats`]'s fixed `[u32; PLAT_NR]` histogram. serde
+/// 1.x has no `Serialize`/`Deserialize` for arrays longer than 32 and this
+/// crate does not depend on `serde_big_array`, so the array is carried as a
+/// length-prefixed sequence. Deserialization is FAIL-LOUD on a wrong length: a
+/// truncated or over-long payload is a corrupt carrier, never silently padded
+/// or clipped (the no-silent-wrong-answer rule).
+mod plat_array_serde {
+    use super::PLAT_NR;
+    use serde::Deserialize;
+    use serde::de::Error as _;
+
+    pub(super) fn serialize<S>(arr: &[u32; PLAT_NR], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.collect_seq(arr.iter())
+    }
+
+    pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<[u32; PLAT_NR], D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let v: Vec<u32> = Vec::deserialize(deserializer)?;
+        let len = v.len();
+        v.try_into().map_err(|_| {
+            D::Error::custom(format!(
+                "PlatStats histogram length {len} != PLAT_NR {PLAT_NR}"
+            ))
+        })
+    }
 }
 
 impl Default for PlatStats {
@@ -92,6 +132,18 @@ impl Default for PlatStats {
             max: 0,
             min: 0,
         }
+    }
+}
+
+// Manual Debug: a derived one would dump all 4864 buckets, which is useless in
+// a `PhaseSlice` diagnostic. Summarize by the non-array fields instead.
+impl core::fmt::Debug for PlatStats {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("PlatStats")
+            .field("nr_samples", &self.nr_samples)
+            .field("min", &self.min)
+            .field("max", &self.max)
+            .finish_non_exhaustive()
     }
 }
 
@@ -462,5 +514,37 @@ mod tests {
         s.add_lat(300);
         assert_eq!(s.percentiles().nr_samples, 1);
         assert_eq!(s.percentiles().min, 300);
+    }
+
+    #[test]
+    fn platstats_serde_roundtrips_json_and_postcard() {
+        // The per-phase carrier rides PlatStats over postcard (guest->host) and
+        // is also JSON-serializable for the worker report pipe. Both must
+        // preserve the full 4864-bucket histogram + nr_samples/max/min, since
+        // the host re-derives percentiles from the deserialized buckets.
+        let mut s = PlatStats::default();
+        s.add_lat(5);
+        s.add_lat(9000);
+        s.add_lat(0); // bucket 0, min stays sentinel
+        let json = serde_json::to_string(&s).expect("serialize json");
+        let back: PlatStats = serde_json::from_str(&json).expect("deserialize json");
+        assert_eq!(s, back, "json roundtrip preserves histogram + extremes");
+        let bytes = postcard::to_stdvec(&s).expect("serialize postcard");
+        let back2: PlatStats = postcard::from_bytes(&bytes).expect("deserialize postcard");
+        assert_eq!(s, back2, "postcard roundtrip preserves histogram + extremes");
+        // The deserialized histogram yields identical percentiles (the host path).
+        assert_eq!(back2.percentiles().values, s.percentiles().values);
+    }
+
+    #[test]
+    fn platstats_deserialize_wrong_len_is_fail_loud() {
+        // A short plat array is a corrupt carrier: the adapter rejects it rather
+        // than padding/truncating (the no-silent-wrong-answer rule).
+        let bad = r#"{"plat":[1,2,3],"nr_samples":0,"max":0,"min":0}"#;
+        let err = serde_json::from_str::<PlatStats>(bad).expect_err("wrong-len must fail");
+        assert!(
+            err.to_string().contains("PLAT_NR"),
+            "error names the length mismatch: {err}"
+        );
     }
 }

@@ -92,6 +92,7 @@ fn worker_report_serde_roundtrip() {
             vmstat_numa_pages_migrated: 2,
             max_gap_ms: 9,
             max_gap_cpu: 2,
+            schbench: None,
         }],
     };
     let json = serde_json::to_string(&r).unwrap();
@@ -1382,6 +1383,7 @@ fn fully_populated_report() -> WorkerReport {
             vmstat_numa_pages_migrated: 13,
             max_gap_ms: 27,
             max_gap_cpu: 4,
+            schbench: None,
         }],
     }
 }

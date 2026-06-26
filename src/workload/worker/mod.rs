@@ -150,6 +150,9 @@ fn build_phase_slice(
         vmstat_numa_pages_migrated: vmstat_migrated_end.saturating_sub(vmstat_migrated_start),
         max_gap_ms: max_gap_ns / 1_000_000,
         max_gap_cpu,
+        // Generic (non-schbench) drain path: the schbench engine emits its own
+        // PhaseSlices directly in the WorkType::Schbench arm.
+        schbench: None,
     }
 }
 
@@ -1457,13 +1460,45 @@ pub(super) fn worker_main(
             WorkType::Schbench { ref config } => {
                 // Run schbench's full message/worker thread topology to
                 // completion -- run() blocks until `stop` -- driven by this one
-                // ktstr worker process. Completed work cycles feed work_units;
-                // the latency percentiles in the result are surfaced by the
-                // metric-attribution path (a follow-up), not here.
+                // ktstr worker process. The engine is phase-aware: it watches
+                // the shared `phase_epoch` and splits its histograms at each
+                // step boundary (e.g. scx -> detached-EEVDF), returning one
+                // SchbenchPhaseStats per phase. Each becomes a PhaseSlice here.
+                //
+                // The generic phase machinery never fires for Schbench: run()
+                // blocks until stop, so this outer loop runs exactly ONCE,
+                // `observed_change` stays false, and the generic drain-on-change
+                // / final drain are skipped. These hand-pushed slices are the
+                // only ones, so there is no double-count.
                 let progress = AtomicU64::new(0);
-                let result = crate::workload::schbench::run::run(config, stop, &progress);
-                work_units = work_units.saturating_add(result.loop_count);
+                let pe = if phase_epoch.is_null() {
+                    None
+                } else {
+                    // SAFETY: `phase_epoch` is the shared per-phase word the
+                    // parent set up for this (backdrop) handle; valid for the
+                    // worker's lifetime and only read here (shared access).
+                    Some(unsafe { &*phase_epoch })
+                };
+                let outcome = crate::workload::schbench::run::run(config, stop, &progress, pe);
+                work_units = work_units.saturating_add(outcome.whole_run.loop_count);
+                for (epoch, stats) in outcome.phases {
+                    phase_slices.push(PhaseSlice {
+                        phase_epoch: epoch,
+                        schbench: Some(stats),
+                        ..Default::default()
+                    });
+                }
                 iterations += 1;
+                // run() owns the whole worker lifetime and only returns once
+                // `stop` is set, so this outer loop runs exactly once. break out
+                // BEFORE the generic drain block below: on fall-through it would
+                // fire spuriously — `cur_epoch` is the spawn-time epoch but the
+                // scenario bumped `phase_epoch` across steps during run(), so
+                // `epoch_changed` would push a generic PhaseSlice AND set
+                // `observed_change`, causing the post-loop final drain to push a
+                // second — both polluting the per-epoch buckets alongside the
+                // schbench slices above. The post-loop report build still runs.
+                break;
             }
             WorkType::PageFaultChurn {
                 region_kib,

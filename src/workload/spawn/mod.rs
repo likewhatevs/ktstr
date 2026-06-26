@@ -662,6 +662,16 @@ pub struct PhaseSlice {
     /// `max_gap_ms` as an argmax pair (a bare max would desync the gap
     /// from its CPU).
     pub max_gap_cpu: usize,
+    /// Per-phase schbench engine metrics, present ONLY for a
+    /// `WorkType::Schbench` backdrop worker (`None` for every other work
+    /// type — the generic drain leaves it `None`). Carries the phase's merged
+    /// wakeup/request histograms + run-delay raw pairs; the host re-pools these
+    /// across workers ([`crate::workload::schbench::run::SchbenchPhaseStats`])
+    /// and derives per-phase percentiles into `PhaseBucket.metrics`.
+    /// `pub(crate)`: an internal carrier (test authors read `PhaseBucket`, not
+    /// `PhaseSlice`) whose element type is `pub(crate)`. Integer-only, so it
+    /// preserves `PhaseSlice`'s `Eq`.
+    pub(crate) schbench: Option<crate::workload::schbench::run::SchbenchPhaseStats>,
 }
 
 /// Reason a sentinel [`WorkerReport`] was synthesized — attached to
