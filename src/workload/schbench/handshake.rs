@@ -3,9 +3,12 @@
 //! `FUTEX_BLOCKED`/`FUTEX_RUNNING` constants :808-815). A [`Handshake`] wraps
 //! one futex word that ping-pongs between BLOCKED (0) and RUNNING (1):
 //! [`Handshake::post`] hands the word to a waiter and wakes it; [`wait`] blocks
-//! until posted (or times out).
+//! until posted (or times out), and [`wait_forever`] blocks with no deadline
+//! (schbench's `fwait` with a NULL timeout, used by the message/worker loops).
 //!
 //! [`wait`]: Handshake::wait
+//! [`wait_forever`]: Handshake::wait_forever
+//! [`post`]: Handshake::post
 //!
 //! # Fidelity
 //!
@@ -131,6 +134,26 @@ impl Handshake {
     /// and `EAGAIN` (the word changed before the kernel enqueued us) just loop
     /// -- the CAS re-checks the state, so neither loses a post.
     pub(crate) fn wait(&self, timeout: &libc::timespec) -> WaitOutcome {
+        self.wait_inner(Some(timeout))
+    }
+
+    /// Wait indefinitely for a posted token -- schbench's `fwait` with a NULL
+    /// timeout (`schbench.c:1032`, `:1176`), used by the message/worker loops
+    /// where there is no deadline. The `FUTEX_WAIT` cannot time out, so this
+    /// always returns once posted.
+    pub(crate) fn wait_forever(&self) {
+        let outcome = self.wait_inner(None);
+        debug_assert_eq!(
+            outcome,
+            WaitOutcome::Posted,
+            "a NULL-timeout wait cannot time out"
+        );
+    }
+
+    /// Shared CAS-consume / `FUTEX_WAIT` loop. `None` waits indefinitely (NULL
+    /// timeout, never returns [`WaitOutcome::TimedOut`]); `Some(ts)` returns
+    /// `TimedOut` once `ts` elapses.
+    fn wait_inner(&self, timeout: Option<&libc::timespec>) -> WaitOutcome {
         loop {
             if self
                 .word
@@ -139,15 +162,20 @@ impl Handshake {
             {
                 return WaitOutcome::Posted;
             }
+            let ts_ptr = match timeout {
+                Some(ts) => ts as *const libc::timespec,
+                None => core::ptr::null::<libc::timespec>(),
+            };
             // SAFETY: `self.word.as_ptr()` is a live `u32` reachable by every
-            // thread that might post this word; the timespec outlives the call.
+            // thread that might post this word; the timespec (when `Some`)
+            // outlives the call, and a NULL pointer requests an indefinite wait.
             let rc = unsafe {
                 libc::syscall(
                     libc::SYS_futex,
                     self.word.as_ptr(),
                     FUTEX_WAIT_PRIVATE,
                     FUTEX_BLOCKED,
-                    timeout as *const libc::timespec,
+                    ts_ptr,
                     core::ptr::null::<u32>(),
                     0u32,
                 )
@@ -158,6 +186,7 @@ impl Handshake {
             if rc == -1 {
                 match std::io::Error::last_os_error().raw_os_error() {
                     // schbench returns -ETIMEDOUT here (`schbench.c:854-855`).
+                    // Unreachable when `timeout` is `None` (NULL timeout).
                     Some(libc::ETIMEDOUT) => return WaitOutcome::TimedOut,
                     // EAGAIN (== EWOULDBLOCK on Linux): the word changed before
                     // the kernel enqueued us (a post raced in). EINTR: a signal.
@@ -220,5 +249,16 @@ mod tests {
             h.post();
             assert_eq!(waiter.join().unwrap(), WaitOutcome::Posted);
         });
+    }
+
+    #[test]
+    fn wait_forever_consumes_posted_token() {
+        // post sets RUNNING; wait_forever's CAS consumes it without entering
+        // FUTEX_WAIT. Only the fast path is exercised here (there is no timeout
+        // to guard a hang); the blocking + wake path shares `wait_inner` with
+        // the timeout-guarded cross_thread test above.
+        let h = Handshake::new();
+        h.post();
+        h.wait_forever(); // returns immediately; would hang if the token were missed
     }
 }
