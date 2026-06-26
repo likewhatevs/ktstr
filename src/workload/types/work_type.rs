@@ -75,6 +75,92 @@ impl PartialEq for CustomFn {
     }
 }
 
+/// Plain-old-data config payload for [`WorkType::Custom`]. Every field is
+/// `Copy` (integers / bools / a fixed byte array) so the whole struct
+/// survives `fork()` byte-faithfully in the child address space — no heap
+/// pointer, no shared mapping required. Read post-fork by the worker
+/// dispatch and handed to the closure via [`WorkerCtx::cfg`].
+///
+/// Variable-length data is intentionally NOT supported here: a `Vec` /
+/// `String` field stores a heap pointer; across `fork` the pointer is
+/// copied verbatim but the backing buffer is copy-on-write PRIVATE (not
+/// shared), so the child sees its own duplicate, never the parent's live
+/// data. For variable-length or genuinely shared state, allocate a
+/// `MAP_SHARED` region in the test body and pass its address through a
+/// `u64` slot (see `tests/preempt_regression.rs`); small inline blobs fit
+/// in `blob` + `blob_len`.
+///
+/// Slot meanings are caller-defined — the framework cannot know the schema
+/// of an arbitrary user closure, so it provides indexed typed arrays the
+/// test author assigns meaning to (e.g. `u64s[0]` = a shared region
+/// address). Construct with [`CustomCfg::default`] + the chainable setters.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct CustomCfg {
+    /// General-purpose 64-bit slots (a common use: a `MAP_SHARED` region
+    /// address as a `u64`).
+    pub u64s: [u64; 4],
+    /// General-purpose pointer-width slots (sizes, counts, indices).
+    pub usizes: [usize; 4],
+    /// General-purpose signed 32-bit slots (nice levels, fds, flags).
+    pub i32s: [i32; 4],
+    /// General-purpose boolean flags.
+    pub bools: [bool; 4],
+    /// Fixed inline byte blob for small variable-length payloads; the valid
+    /// prefix length is [`Self::blob_len`].
+    pub blob: [u8; 32],
+    /// Number of valid leading bytes in [`Self::blob`] (`0..=32`).
+    pub blob_len: usize,
+}
+
+impl CustomCfg {
+    /// Set slot `i` of [`Self::u64s`], returning `self` for chaining.
+    ///
+    /// # Panics
+    /// Panics if `i >= 4` (the array length).
+    pub const fn u64_slot(mut self, i: usize, v: u64) -> Self {
+        self.u64s[i] = v;
+        self
+    }
+
+    /// Set slot `i` of [`Self::usizes`], returning `self` for chaining.
+    ///
+    /// # Panics
+    /// Panics if `i >= 4` (the array length).
+    pub const fn usize_slot(mut self, i: usize, v: usize) -> Self {
+        self.usizes[i] = v;
+        self
+    }
+
+    /// Set slot `i` of [`Self::i32s`], returning `self` for chaining.
+    ///
+    /// # Panics
+    /// Panics if `i >= 4` (the array length).
+    pub const fn i32_slot(mut self, i: usize, v: i32) -> Self {
+        self.i32s[i] = v;
+        self
+    }
+
+    /// Set slot `i` of [`Self::bools`], returning `self` for chaining.
+    ///
+    /// # Panics
+    /// Panics if `i >= 4` (the array length).
+    pub const fn bool_slot(mut self, i: usize, v: bool) -> Self {
+        self.bools[i] = v;
+        self
+    }
+
+    /// Copy up to 32 bytes into [`Self::blob`] and set [`Self::blob_len`].
+    /// Input longer than 32 bytes is truncated to 32. Non-`const` (unlike
+    /// the integer/bool slot setters) because it copies a runtime slice,
+    /// which a `const fn` cannot express today.
+    pub fn blob(mut self, bytes: &[u8]) -> Self {
+        let n = bytes.len().min(self.blob.len());
+        self.blob[..n].copy_from_slice(&bytes[..n]);
+        self.blob_len = n;
+        self
+    }
+}
+
 /// Execution context handed to a [`WorkType::Custom`] worker function.
 ///
 /// Exposes the worker's stop flag plus the parts of its runtime
@@ -95,6 +181,7 @@ pub struct WorkerCtx<'a> {
     cpus: &'a [usize],
     sibling_pids: &'a [libc::pid_t],
     cgroup_dir: Option<&'a std::path::Path>,
+    cfg: CustomCfg,
 }
 
 impl<'a> WorkerCtx<'a> {
@@ -106,12 +193,14 @@ impl<'a> WorkerCtx<'a> {
         cpus: &'a [usize],
         sibling_pids: &'a [libc::pid_t],
         cgroup_dir: Option<&'a std::path::Path>,
+        cfg: CustomCfg,
     ) -> Self {
         WorkerCtx {
             stop,
             cpus,
             sibling_pids,
             cgroup_dir,
+            cfg,
         }
     }
 
@@ -153,6 +242,17 @@ impl<'a> WorkerCtx<'a> {
     #[inline]
     pub fn cgroup_dir(&self) -> Option<&std::path::Path> {
         self.cgroup_dir
+    }
+
+    /// The [`CustomCfg`] payload declared on this worker's
+    /// [`WorkType::Custom`] (or [`CustomCfg::default`] — all-zero — when
+    /// the worker was built with [`WorkType::custom`] rather than
+    /// [`WorkType::custom_with`]). Copy POD, inherited byte-faithfully
+    /// across `fork`, so a Custom closure reads its per-worker config from
+    /// here instead of a `static`/global.
+    #[inline]
+    pub fn cfg(&self) -> CustomCfg {
+        self.cfg
     }
 }
 
@@ -223,16 +323,16 @@ impl<'a> WorkerCtx<'a> {
 /// up automatically without editing a parallel list.
 #[derive(Debug, Clone, PartialEq, strum::VariantNames, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
-// `#[serde(bound(...))]` overrides the auto-derived lifetime bound. The
-// `Custom` variant is `#[serde(skip)]` (it carries a non-portable `fn`
-// pointer + a `&'static str` name), but the derive still walks every
-// variant's field types to compute the implied `Deserialize<'de>`
-// bound. Without this override the compiler infers `'de: 'static`
-// from `Custom { name: &'static str }`, which makes the type
-// unusable from any non-`'static` deserializer (i.e. all real
-// deserializers). Explicit empty bounds tell serde to skip the
-// auto-inference; the skipped variant is never deserialized so no
-// `&'static str` ever needs to be reconstructed.
+// `#[serde(bound(...))]` overrides serde's auto-derived bounds. The
+// `Custom` variant is `#[serde(skip)]` — it carries a non-portable `fn`
+// pointer (`CustomFn`) plus a `String` name and a `CustomCfg` payload —
+// but the derive still walks every variant's field types when computing
+// the implied `Deserialize<'de>` bound. `CustomFn` is a raw fn pointer
+// and does not implement `Deserialize`, so without the explicit empty
+// bound the derive would require `CustomFn: Deserialize` and `WorkType`
+// would not deserialize at all. The empty bounds skip the auto-inference;
+// the skipped variant is never (de)serialized, so its fields never need
+// reconstruction.
 #[serde(bound(deserialize = ""))]
 pub enum WorkType {
     /// Tight CPU spin loop (1024 iterations per cycle).
@@ -539,15 +639,23 @@ pub enum WorkType {
     /// # Construction
     ///
     /// Prefer the [`WorkType::custom`] constructor — it takes a
-    /// bare `fn` pointer and transparently wraps it in [`CustomFn`]:
-    /// `WorkType::custom("my_workload", my_fn)`. Struct-literal
-    /// construction requires the wrap explicitly: `WorkType::Custom
-    /// { name: "my_workload".into(), run: CustomFn(my_fn) }`. The
-    /// constructor path is the supported user-facing API; the
-    /// struct-literal form exists for test-internal construction
-    /// where the call site already deals with the newtype directly.
+    /// bare `fn` pointer and transparently wraps it in [`CustomFn`],
+    /// defaulting `cfg` to [`CustomCfg::default`]:
+    /// `WorkType::custom("my_workload", my_fn)`. To pass a fork-safe
+    /// config payload, use [`WorkType::custom_with`] with a [`CustomCfg`]
+    /// (Copy POD; for variable-length / shared state pass a `MAP_SHARED`
+    /// region address through a `u64` slot). Struct-literal construction
+    /// requires the wrap explicitly: `WorkType::Custom { name:
+    /// "my_workload".into(), run: CustomFn(my_fn), cfg:
+    /// CustomCfg::default() }`. The constructor path is the supported
+    /// user-facing API; the struct-literal form exists for test-internal
+    /// construction where the call site already deals with the newtype.
     #[serde(skip)]
-    Custom { name: String, run: CustomFn },
+    Custom {
+        name: String,
+        run: CustomFn,
+        cfg: CustomCfg,
+    },
     /// One waker, N waiters on a SINGLE global futex word, repeated
     /// in batches with a sleep gap. Distinct from
     /// [`FutexFanOut`](Self::FutexFanOut) which uses one futex per

@@ -480,7 +480,7 @@ pub(super) fn worker_main(
     // once at start via sched_getaffinity (read_effective_cpus).
     // Custom: hand the user function a WorkerCtx. Affinity and
     // sched_policy are already applied above.
-    if let WorkType::Custom { name, run, .. } = &work_type {
+    if let WorkType::Custom { name, run, cfg, .. } = &work_type {
         // The ctx exposes the same effective cpuset and cgroup-sibling
         // pids the built-in affinity-churn variants compute, so a
         // custom probe need not re-roll sched_getaffinity or
@@ -489,7 +489,7 @@ pub(super) fn worker_main(
         let cpus = read_effective_cpus();
         let sibling_pids = read_sibling_pids();
         let cgroup_dir = read_self_cgroup_dir();
-        let ctx = WorkerCtx::new(stop, &cpus, &sibling_pids, cgroup_dir.as_deref());
+        let ctx = WorkerCtx::new(stop, &cpus, &sibling_pids, cgroup_dir.as_deref(), *cfg);
         let report = run.call(&ctx);
         // Telltale for the work_units-vs-iterations footgun: a closure that
         // counted work but left the outer-loop counter at zero reads as zero

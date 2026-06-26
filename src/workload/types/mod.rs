@@ -72,7 +72,7 @@ impl WorkPhase {
 mod methods;
 mod work_type;
 
-pub use work_type::{CustomFn, WorkType, WorkerCtx};
+pub use work_type::{CustomCfg, CustomFn, WorkType, WorkerCtx};
 
 /// Spawn-time validation failures for [`WorkType`] preconditions.
 ///

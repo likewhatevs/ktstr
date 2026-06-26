@@ -803,7 +803,7 @@ mod partial_eq {
         }
         let cf = CustomFn(marker);
         let stop = AtomicBool::new(false);
-        let ctx = WorkerCtx::new(&stop, &[], &[], None);
+        let ctx = WorkerCtx::new(&stop, &[], &[], None, CustomCfg::default());
         let via_call = cf.call(&ctx);
         assert_eq!(
             via_call.work_units, 0xdeadbeef,
@@ -832,6 +832,95 @@ mod partial_eq {
         let b = WorkType::custom("x", g);
         assert_eq!(a, a2, "same fn ptr + same name → equal");
         assert_ne!(a, b, "different fn ptr → unequal even with same name");
+    }
+
+    #[test]
+    fn custom_cfg_default_is_zero() {
+        let d = CustomCfg::default();
+        assert_eq!(d.u64s, [0u64; 4]);
+        assert_eq!(d.usizes, [0usize; 4]);
+        assert_eq!(d.i32s, [0i32; 4]);
+        assert_eq!(d.bools, [false; 4]);
+        assert_eq!(d.blob, [0u8; 32]);
+        assert_eq!(d.blob_len, 0);
+    }
+
+    #[test]
+    fn custom_cfg_setters_chain() {
+        let c = CustomCfg::default()
+            .u64_slot(0, 7)
+            .usize_slot(1, 9)
+            .i32_slot(2, -3)
+            .bool_slot(3, true)
+            .blob(b"hi");
+        assert_eq!(c.u64s[0], 7);
+        assert_eq!(c.usizes[1], 9);
+        assert_eq!(c.i32s[2], -3);
+        assert!(c.bools[3]);
+        assert_eq!(&c.blob[..2], b"hi");
+        assert_eq!(c.blob_len, 2);
+        // A blob longer than 32 bytes truncates to 32.
+        let big = CustomCfg::default().blob(&[0xAB; 64]);
+        assert_eq!(big.blob_len, 32);
+        assert_eq!(big.blob, [0xAB; 32]);
+    }
+
+    #[test]
+    fn custom_with_carries_cfg() {
+        let cfg = CustomCfg::default().u64_slot(0, 0xDEAD);
+        match WorkType::custom_with("x", stub_custom_fn, cfg) {
+            WorkType::Custom { cfg: got, .. } => assert_eq!(got, cfg),
+            other => panic!("custom_with must build a Custom variant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn custom_defaults_cfg() {
+        match WorkType::custom("x", stub_custom_fn) {
+            WorkType::Custom { cfg, .. } => assert_eq!(cfg, CustomCfg::default()),
+            other => panic!("custom must build a Custom variant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn custom_partial_eq_includes_cfg() {
+        let a = WorkType::custom_with("x", stub_custom_fn, CustomCfg::default().u64_slot(0, 1));
+        let a2 = WorkType::custom_with("x", stub_custom_fn, CustomCfg::default().u64_slot(0, 1));
+        let b = WorkType::custom_with("x", stub_custom_fn, CustomCfg::default().u64_slot(0, 2));
+        assert_eq!(a, a2, "same name + fn + cfg → equal");
+        assert_ne!(a, b, "same name + fn but different cfg → unequal");
+    }
+
+    #[test]
+    fn worker_ctx_exposes_cfg() {
+        let stop = AtomicBool::new(false);
+        let cfg = CustomCfg::default().u64_slot(0, 0xBEEF);
+        let ctx = WorkerCtx::new(&stop, &[], &[], None, cfg);
+        assert_eq!(ctx.cfg().u64s[0], 0xBEEF);
+        assert_eq!(ctx.cfg(), cfg);
+    }
+
+    #[test]
+    fn custom_cfg_is_hashset_key() {
+        use std::collections::HashSet;
+        // Eq + Hash (all fields are integer/bool/array — no float) let
+        // CustomCfg key a set, matching the POD-config sibling AluWidth
+        // (config/sched.rs), which also derives Eq + Hash.
+        let mut s = HashSet::new();
+        s.insert(CustomCfg::default());
+        s.insert(CustomCfg::default().u64_slot(0, 1));
+        assert!(s.contains(&CustomCfg::default()));
+        assert!(s.contains(&CustomCfg::default().u64_slot(0, 1)));
+        assert!(!s.contains(&CustomCfg::default().u64_slot(0, 2)));
+        assert_eq!(s.len(), 2);
+    }
+
+    #[test]
+    #[should_panic]
+    fn custom_cfg_slot_setter_panics_out_of_range() {
+        // Indexed slot setters panic past the array length (documented
+        // `# Panics`); the arrays are length 4, so index 4 is out of range.
+        let _ = CustomCfg::default().u64_slot(4, 1);
     }
 
     #[test]

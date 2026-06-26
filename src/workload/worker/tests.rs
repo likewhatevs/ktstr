@@ -1376,7 +1376,7 @@ fn worker_ctx_accessors_return_borrowed_state() {
     let cpus = [3usize, 7, 11];
     let siblings: [libc::pid_t; 2] = [100, 200];
     let cg = std::path::Path::new("/sys/fs/cgroup/ktstr/cgA");
-    let ctx = WorkerCtx::new(&stop, &cpus, &siblings, Some(cg));
+    let ctx = WorkerCtx::new(&stop, &cpus, &siblings, Some(cg), CustomCfg::default());
     assert_eq!(
         ctx.cpus(),
         cpus.as_slice(),
@@ -1393,7 +1393,7 @@ fn worker_ctx_accessors_return_borrowed_state() {
         "cgroup_dir() returns the borrowed cgroup path"
     );
     assert_eq!(
-        WorkerCtx::new(&stop, &cpus, &siblings, None).cgroup_dir(),
+        WorkerCtx::new(&stop, &cpus, &siblings, None, CustomCfg::default()).cgroup_dir(),
         None,
         "cgroup_dir() is None for the root / non-v2 case"
     );

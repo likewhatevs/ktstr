@@ -138,9 +138,10 @@ pub enum WorkType {
     },
 
     // User-supplied
-    Custom {                                            // User-supplied work function (name + fn pointer).
+    Custom {                                            // User-supplied work function (name, fn pointer, config).
         name: String,
         run: CustomFn,                                  // newtype over fn(&WorkerCtx) -> WorkerReport
+        cfg: CustomCfg,                                 // fork-safe Copy POD config payload
     },
 }
 ```
@@ -344,11 +345,13 @@ lock-holder preemption cascading stalls, and futex wait/wake
 contention paths. Requires `num_workers` divisible by `contenders`.
 
 **`Custom`** -- user-supplied work function. The `run` function pointer
-receives a `&WorkerCtx` (exposing the stop flag via `ctx.stop()` — a
-`&AtomicBool` set by SIGUSR1 in `CloneMode::Fork` — plus `ctx.cpus()`,
-`ctx.sibling_pids()`, and `ctx.cgroup_dir()`, the worker's own
-cgroup-v2 dir or `None` in the root cgroup / when cgroup v2 is
-unavailable) and returns a `WorkerReport` when the stop flag becomes
+receives a `&WorkerCtx` exposing the stop flag via `ctx.stop()` (a
+`&AtomicBool` set by SIGUSR1 in `CloneMode::Fork`), plus `ctx.cpus()`,
+`ctx.sibling_pids()`, `ctx.cgroup_dir()` (the worker's own cgroup-v2
+dir, or `None` in the root cgroup / when cgroup v2 is unavailable), and
+`ctx.cfg()` (the fork-safe `CustomCfg` config payload — default-zero
+unless the work type was built with `WorkType::custom_with`). It returns
+a `WorkerReport` when the stop flag becomes
 `true`. The
 framework handles fork, cgroup placement, affinity, scheduling policy,
 and signal setup; the user function owns the work loop and all
@@ -374,6 +377,14 @@ before returning the `WorkerReport`.
 Function pointers (`fn(&WorkerCtx) -> WorkerReport`) are fork-safe
 because they carry no captured state across the fork boundary. Closures
 are not supported. Cannot be constructed via `WorkType::from_name()`.
+
+To pass per-worker configuration without a closure (or an unsafe
+`static`), build the work type with `WorkType::custom_with(name, run,
+cfg)` and read it via `ctx.cfg()`. `CustomCfg` is a Copy POD payload
+(integer / bool / fixed-array slots) inherited byte-faithfully across
+`fork`; for variable-length or genuinely shared state, allocate a
+`MAP_SHARED` region and pass its address through a `u64` slot —
+`tests/preempt_regression.rs` does this for a shared futex word.
 
 ```rust,ignore
 use std::sync::atomic::Ordering;

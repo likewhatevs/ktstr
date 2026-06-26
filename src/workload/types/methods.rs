@@ -11,7 +11,7 @@ use crate::workload::schbench::run::SchbenchConfig;
 
 use crate::workload::WorkerReport;
 
-use super::{WorkPhase, WorkType, WorkTypeValidationError, WorkerCtx};
+use super::{CustomCfg, WorkPhase, WorkType, WorkTypeValidationError, WorkerCtx};
 
 impl WorkType {
     /// PascalCase names for all built-in variants, matching the enum arm names.
@@ -846,8 +846,10 @@ impl WorkType {
     /// `run` receives a [`WorkerCtx`] exposing the worker's stop flag
     /// (flipped per-mode: the SIGUSR1 handler for `CloneMode::Fork`, a
     /// per-worker `AtomicBool` for `CloneMode::Thread`) plus its
-    /// effective cpuset and cgroup-sibling pids, and must return a
-    /// [`WorkerReport`] when the stop flag becomes `true`. The
+    /// effective cpuset, cgroup-sibling pids, own cgroup-v2 dir, and a
+    /// default-zero [`CustomCfg`] payload (use [`Self::custom_with`] to pass
+    /// a non-default cfg), and must return a [`WorkerReport`] when the stop
+    /// flag becomes `true`. The
     /// framework handles fork / thread spawn, cgroup placement,
     /// affinity, scheduling policy, and signal setup (Fork mode only);
     /// `run` owns only the work loop.
@@ -861,6 +863,24 @@ impl WorkType {
         WorkType::Custom {
             name: name.into(),
             run: super::work_type::CustomFn(run),
+            cfg: CustomCfg::default(),
+        }
+    }
+
+    /// Like [`Self::custom`] but carries a [`CustomCfg`] payload, surfaced
+    /// to the closure via [`WorkerCtx::cfg`]. The payload is Copy POD,
+    /// inherited byte-faithfully across `fork`, so a Custom worker reads its
+    /// per-worker config from `ctx.cfg()` instead of a `static` / global —
+    /// see `tests/preempt_regression.rs` for the shared-futex pattern.
+    pub fn custom_with(
+        name: impl Into<String>,
+        run: fn(&WorkerCtx) -> WorkerReport,
+        cfg: CustomCfg,
+    ) -> Self {
+        WorkType::Custom {
+            name: name.into(),
+            run: super::work_type::CustomFn(run),
+            cfg,
         }
     }
 }

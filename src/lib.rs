@@ -936,7 +936,7 @@ pub mod prelude {
     pub use crate::scenario::host_stall::{StallDiagnostic, StallReport};
     pub use crate::vmm::wire::{KernelOpReplyPayload, KernelOpValue};
     pub use crate::workload::{
-        AffinityIntent, AluWidth, CloneMode, CustomFn, MemPolicy, Migration, MpolFlags,
+        AffinityIntent, AluWidth, CloneMode, CustomCfg, CustomFn, MemPolicy, Migration, MpolFlags,
         ResolvedAffinity, SchbenchConfig, SchedPolicy, WorkPhase, WorkSpec, WorkType,
         WorkTypeValidationError, WorkerCtx, WorkerReport, WorkerReportClaim, WorkloadConfig,
         WorkloadHandle,
