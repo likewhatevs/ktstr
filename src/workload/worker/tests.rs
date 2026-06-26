@@ -203,6 +203,32 @@ fn matrix_multiply_mismatched_len_panics_in_debug() {
     let mut work_units = 0u64;
     matrix_multiply(&mut data, 2, &mut work_units);
 }
+#[test]
+fn matrix_multiply_shared_2x2_against_reference() {
+    use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    // Same reference product as matrix_multiply_2x2_against_reference, but driven
+    // through the ATOMIC shared kernel: A=[[1,2],[3,4]] B=[[5,6],[7,8]] =>
+    // C=[[19,22],[43,50]]. Pins matrix_multiply_shared's m1/m2/m3 indexing -- a
+    // transposition or wrong stride would still pass the concurrency smoke
+    // (engine_split_runs_shared_matrix_concurrently), which only checks the loop
+    // ran (loop_count), not that the product is correct. Single-threaded, so the
+    // result is fully deterministic.
+    let size = 2;
+    let stride = size * size;
+    let data: Vec<AtomicU64> = (0..3 * stride).map(|_| AtomicU64::new(0)).collect();
+    // A region data[0..stride], B region data[stride..2*stride].
+    for (i, &v) in [1u64, 2, 3, 4, 5, 6, 7, 8].iter().enumerate() {
+        data[i].store(v, Relaxed);
+    }
+    let mut work_units = 0u64;
+    matrix_multiply_shared(&data, size, &mut work_units);
+    assert_eq!(data[2 * stride].load(Relaxed), 19);
+    assert_eq!(data[2 * stride + 1].load(Relaxed), 22);
+    assert_eq!(data[2 * stride + 2].load(Relaxed), 43);
+    assert_eq!(data[2 * stride + 3].load(Relaxed), 50);
+    // Read-back sink folds C[0] (=19) into work_units, like matrix_multiply.
+    assert_eq!(work_units, 19, "post-loop sink folds C[0] into work_units");
+}
 // -- RAII unit tests for the IO scratch / backing wrappers --
 //
 // Pin the contracts each Drop documents: DirectIoBuf returns a

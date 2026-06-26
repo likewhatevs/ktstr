@@ -286,7 +286,10 @@ plus its chainable setters) that maps schbench's
 `-m`/`-t`/`-F`/`-n`/`-s`/`-L`/`-R`/`-A` flags onto config fields; see the
 `SchbenchConfig` rustdoc for the full schbench(8) CLI-parity table —
 which flags map to fields, which are set by ktstr topology, and which
-schbench modes (`-p` pipe, `--split`, `-C` calibrate) are not ported.
+schbench modes (`-p` pipe, `-C` calibrate) are not ported. The `--split`
+knob (`split_percent`) partitions the cache footprint into a per-thread
+private matrix and one process-global shared matrix all workers contend
+on, reproducing cross-core cache contention.
 Use a single ktstr worker (`workers(1)`); the message/worker parallelism
 is this variant's internal thread topology, not ktstr worker processes.
 

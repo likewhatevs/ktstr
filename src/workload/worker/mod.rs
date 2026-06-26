@@ -4289,10 +4289,14 @@ pub(super) fn alu_hot_chain(width: AluWidth, steps: u64, work_units: &mut u64) {
 /// (kills the DCE) — so the compute path the workload claims to exercise
 /// actually executes under `-O2`/`-O3`.
 ///
-/// The barrier is on the SLICE, not per LOAD: a per-load `black_box` also
-/// blocks vectorization of the inner loop, which de-optimized do_work ~1.3x
-/// vs schbench's `-O2` `do_some_math`. One entry barrier stays fold-safe
-/// while leaving the loop vectorizable, matching schbench's compute cost.
+/// The barrier is on the SLICE, not per LOAD: a per-load `black_box` forces
+/// every operand through a register barrier, blocking the fused memory-operand
+/// `imul` and loop unrolling LLVM emits otherwise -- which de-optimized do_work
+/// ~1.3x vs schbench's `-O2` `do_some_math`. One entry barrier stays fold-safe
+/// while leaving the scalar inner loop intact, matching schbench's compute cost.
+/// The loop does NOT auto-vectorize either way (no SIMD `u64` multiply on the
+/// `x86-64-v3` target and the serial accumulator blocks SLP -- schbench's `-O2`
+/// kernel is likewise scalar `imul`), so the entry barrier costs no SIMD.
 ///
 /// `#[inline(never)]` matches `spin_burst` / `cache_rmw_loop` — the boundary
 /// keeps the caller's zero-init from flowing in; the entry `black_box` closes
@@ -4306,7 +4310,9 @@ pub(super) fn matrix_multiply(data: &mut [u64], size: usize, work_units: &mut u6
     // fold the multiply to a constant). #[inline(never)] hides the caller's
     // zero-init across the call boundary; this also closes the residual
     // thin-LTO IPO path (Cargo.toml `lto = "thin"`). Unlike a per-load
-    // black_box, one barrier on the slice leaves the inner loop vectorizable.
+    // black_box, one barrier on the slice leaves the inner loop's scalar
+    // codegen intact (fused memory-operand `imul`, unrolling) instead of
+    // forcing every operand through a register barrier.
     let data = std::hint::black_box(data);
     for i in 0..size {
         for j in 0..size {
@@ -4332,6 +4338,59 @@ pub(super) fn matrix_multiply(data: &mut [u64], size: usize, work_units: &mut u6
     // beyond the volatile store. `data[2 * stride]` is in-bounds because the
     // caller only invokes matrix_multiply when `matrix_size > 0`.
     *work_units = work_units.wrapping_add(data[2 * stride]);
+}
+
+/// Shared-matrix variant of [`matrix_multiply`] for schbench's `--split` shared
+/// matrix, which every worker thread RMW-multiplies concurrently. A/B are loaded
+/// and C is stored with `Ordering::Relaxed`. On x86-64 a Relaxed atomic
+/// load/store lowers to a plain `MOV` (only read-modify-write atomics take
+/// `LOCK`), and the multiply does separate loads + a single store per C cell (no
+/// atomic RMW), so the per-instruction cost equals the plain variant; the extra
+/// cost over a private matrix is the cross-core cache-line contention on the
+/// shared C region -- which is the POINT of split mode. Sound: every concurrent
+/// access goes through an atomic, so there is no data race (no UB), unlike a
+/// plain shared `&mut` buffer.
+///
+/// No `black_box` / `write_volatile` / read-back barrier (unlike
+/// [`matrix_multiply`], whose barriers stop the optimizer constant-folding the
+/// zero-init A/B and DCE-ing the C store on the single-thread plain path): an
+/// atomic `load(Relaxed)` is un-foldable (the optimizer cannot assume it returns
+/// the zero-init value -- another thread may have stored) and an atomic
+/// `store(Relaxed)` is un-elidable (a cross-thread-visible side effect). Neither
+/// this nor [`matrix_multiply`] auto-vectorizes (the serial accumulator
+/// reduction blocks SLP for both), so dropping the barriers costs no
+/// vectorization here.
+///
+/// Takes `&[AtomicU64]` (a shared ref, interior mutability), which is what lets
+/// every worker share one `Arc<[AtomicU64]>`. `#[inline(never)]` matches
+/// [`matrix_multiply`] so the per-call boundary cost is the same.
+#[inline(never)]
+pub(super) fn matrix_multiply_shared(
+    data: &[core::sync::atomic::AtomicU64],
+    size: usize,
+    work_units: &mut u64,
+) {
+    use core::sync::atomic::Ordering::Relaxed;
+    debug_assert_eq!(data.len(), 3 * size * size);
+    let stride = size * size;
+    for i in 0..size {
+        for j in 0..size {
+            let mut acc: u64 = 0;
+            for k in 0..size {
+                acc = acc.wrapping_add(
+                    data[i * size + k]
+                        .load(Relaxed)
+                        .wrapping_mul(data[stride + k * size + j].load(Relaxed)),
+                );
+            }
+            data[2 * stride + i * size + j].store(acc, Relaxed);
+        }
+    }
+    // Route one computed C value into the observable `work_units` for
+    // loop-accounting parity with `matrix_multiply` (NOT a DCE barrier -- the
+    // atomic store above is already non-elidable). In-bounds: the caller invokes
+    // this only when the shared matrix size is > 0.
+    *work_units = work_units.wrapping_add(data[2 * stride].load(Relaxed));
 }
 
 /// Write 1 byte to partner, poll for response, read, record wake latency.

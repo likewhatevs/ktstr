@@ -31,11 +31,17 @@
 //!   on the hot path, so the syscall profile stays futex-dominated like
 //!   schbench's. (schbench hand-duplicates this for its thread list and its
 //!   request list; schbench_rs shares one generic implementation.)
-//! - do_work timing: the matrix multiply is written to vectorize under
-//!   optimization, matching schbench's `-O2` (its Makefile `CFLAGS = -Wall
-//!   -O2`). A debug build (opt-level 0) does NOT vectorize, so request latency
-//!   runs higher than reference schbench's. ABSOLUTE side-by-side fidelity vs
-//!   the reference (the `ktstr-schbench-validate` comparison) therefore needs a
+//! - do_work timing: the matrix multiply compiles to the SAME scalar inner loop
+//!   as schbench's `-O2` `do_some_math` -- a `u64` multiply-accumulate
+//!   (`imul` with a fused memory operand, then `add`), NOT SIMD. It does not
+//!   auto-vectorize: there is no vector `u64` multiply on the build target
+//!   (`x86-64-v3`; `vpmullq` is AVX-512) and the serial accumulator reduction
+//!   blocks SLP -- exactly as for schbench's `-O2` build (its Makefile
+//!   `CFLAGS = -Wall -O2`, no `-march`, likewise scalar; verified by disassembly
+//!   of both). A debug build (opt-level 0) emits far more overhead (no register
+//!   allocation, unrolling, or memory-operand fusion), so request latency runs
+//!   higher than reference schbench's. ABSOLUTE side-by-side fidelity vs the
+//!   reference (the `ktstr-schbench-validate` comparison) therefore needs a
 //!   release build. The in-ktstr A/B comparison (perf-delta / per-phase claims)
 //!   is build-invariant -- both sides use the same build -- so it is unaffected.
 
@@ -195,6 +201,7 @@ impl Linked for Request {
 /// | `-L` no-locking | `skip_locking` |
 /// | `-R` rps | `requests_per_sec` |
 /// | `-A` auto-rps | `auto_rps` |
+/// | `--split` (long-only) | `split_percent` (`None` = no split, all-private) |
 /// | `-r` runtime | in-VM: the scenario engine's run window (the engine runs until `stop`); host-side: the `run_secs` argument to [`run_standalone`](crate::workload::run_standalone) |
 ///
 /// ## Set by ktstr topology, not a flag
@@ -219,14 +226,22 @@ impl Linked for Request {
 /// sidecar -- so these have no flag equivalent. `ktstr-schbench-validate`
 /// reproduces schbench's stderr-table shape for a side-by-side comparison.
 ///
+/// ## Split mode (`--split`)
+///
+/// `Some(p)` partitions `cache_footprint_kib` into a per-thread private matrix
+/// (`p`%) and ONE process-global shared matrix (`100-p`%) that every worker
+/// RMW-multiplies concurrently, reproducing schbench's cross-core
+/// shared-working-set cache contention (`schbench.c:1390-1404`, `:1858-1863`).
+/// ktstr models the shared matrix with `AtomicU64` `Relaxed` load/store: on
+/// x86-64 these lower to a plain `MOV` (the multiply has no atomic RMW), so the
+/// contention is identical to schbench's plain shared-memory race -- with zero
+/// unsafe. `None` (default) is the legacy all-private single matrix.
+///
 /// ## Modes not ported
 ///
 /// - `-p` (pipe): schbench's pipe-transfer test -- a separate workload from the
 ///   matrix-work default this port re-expresses (`schbench.c:177`). Not
 ///   available.
-/// - `--split` (long-only; no short flag): schbench's private/shared
-///   cache-footprint split (`schbench.c:184`). This port uses the single
-///   all-private working set (`matrix_size`); there is no split knob.
 /// - `-C` (calibrate): a tuning aid that times schbench's own work loop and
 ///   forces `-L` (`schbench.c:166`, `:389`). Intentionally out of scope -- ktstr
 ///   measures through the metric path.
@@ -266,6 +281,20 @@ pub struct SchbenchConfig {
     /// when `requests_per_sec` is 0 (`schbench.c:286`), so auto-RPS starts low
     /// and climbs.
     pub auto_rps: usize,
+    /// Percent of the cache footprint that is PRIVATE per worker thread
+    /// (`schbench.c` `--split`, long-only, 0-100). `None` = no split:
+    /// schbench's legacy all-private single matrix (`schbench.c:1405-1408`,
+    /// `:1879-1880`). `Some(p)` partitions `cache_footprint_kib` into a
+    /// per-thread private matrix (`p`%) and ONE process-global shared matrix
+    /// (`100-p`%) that every worker RMW-multiplies concurrently, reproducing
+    /// schbench's cross-core shared-working-set cache contention
+    /// (`schbench.c:1390-1404`, `:1858-1863`). `Some(0)` = all shared,
+    /// `Some(100)` = all private (same matrix sizes as `None`, but routed
+    /// through the split branch, matching schbench's `split_specified` path).
+    /// Out-of-range `Some(p > 100)` panics when the engine consumes it
+    /// (`schbench.c:362-365` exits on the same); the builder also debug-asserts
+    /// the bound.
+    pub split_percent: Option<usize>,
 }
 
 impl Default for SchbenchConfig {
@@ -280,6 +309,7 @@ impl Default for SchbenchConfig {
             skip_locking: false,
             requests_per_sec: 0,
             auto_rps: 0,
+            split_percent: None,
         }
     }
 }
@@ -336,6 +366,21 @@ impl SchbenchConfig {
         self.auto_rps = target_pct;
         self
     }
+    /// Set the private/shared cache-footprint split percentage (schbench
+    /// `--split`); `None` (default) = no split, all-private single matrix.
+    /// `Some(p)` requires `p <= 100`: the builder debug-asserts it for early
+    /// feedback, and the engine hard-panics on an out-of-range value at the
+    /// consumption boundary in `run` -- the analog of schbench exiting on a bad
+    /// `--split` (`schbench.c:362-365`).
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn split_percent(mut self, percent: Option<usize>) -> Self {
+        debug_assert!(
+            percent.is_none_or(|p| p <= 100),
+            "split_percent must be 0..=100"
+        );
+        self.split_percent = percent;
+        self
+    }
 
     /// Matrix dimension from the cache footprint, identical to schbench
     /// (`schbench.c:1880`: `sqrt(cache_footprint_kb * 1024 / 3 /
@@ -348,6 +393,34 @@ impl SchbenchConfig {
                 as usize
         } else {
             0
+        }
+    }
+
+    /// Shared-matrix dimension for `--split` (`schbench.c:1859,1862`:
+    /// `sqrt(cache_footprint_kb*(100-split)/100 * 1024/3/sizeof(ulong))`).
+    /// `None` split (or 0 `operations`/`cache_footprint_kib`) => 0 (no shared
+    /// matrix); `Some(100)` => 0 (all private, no shared work).
+    pub(crate) fn shared_matrix_size(&self) -> usize {
+        match self.split_percent {
+            Some(p) if self.operations > 0 && self.cache_footprint_kib > 0 => {
+                let shared_kb = self.cache_footprint_kib * (100 - p) / 100;
+                ((shared_kb * 1024 / 3 / core::mem::size_of::<u64>()) as f64).sqrt() as usize
+            }
+            _ => 0,
+        }
+    }
+
+    /// Private (per-worker) matrix dimension. `Some(p)` (`schbench.c:1860,1863`):
+    /// `sqrt(cache_footprint_kb*split/100 * 1024/3/sizeof(ulong))`. `None`
+    /// (legacy): the full-footprint [`matrix_size`](Self::matrix_size)
+    /// (`schbench.c:1880`, the all-private single matrix).
+    pub(crate) fn private_matrix_size(&self) -> usize {
+        match self.split_percent {
+            Some(p) if self.operations > 0 && self.cache_footprint_kib > 0 => {
+                let private_kb = self.cache_footprint_kib * p / 100;
+                ((private_kb * 1024 / 3 / core::mem::size_of::<u64>()) as f64).sqrt() as usize
+            }
+            _ => self.matrix_size(),
         }
     }
 
@@ -585,22 +658,71 @@ fn think_sleep(usec: u64) {
     std::thread::sleep(std::time::Duration::from_micros(usec));
 }
 
+/// schbench's `--split` op partition (`schbench.c:1391-1392`): of `operations`
+/// total, `p`% run on the private matrix and the rest on the shared matrix.
+/// Returns `(ops_shared, ops_private)`. Extracted so the integer-division split
+/// is pinned by a unit test rather than re-implemented inline in `do_work`.
+fn ops_split(operations: usize, p: usize) -> (usize, usize) {
+    let ops_private = (operations * p) / 100;
+    let ops_shared = operations - ops_private;
+    (ops_shared, ops_private)
+}
+
 /// One work cycle's matrix multiplications under the per-CPU lock. Faithful to
-/// schbench's `do_work` (`schbench.c:1379`): take the current CPU's mutex
-/// (unless `skip_locking`), run `operations` matrix multiplies on the worker's
-/// buffer, unlock. The guard drops at the end of this function, holding the
-/// lock across all operations exactly as schbench does (`:1387`/`:1411`).
+/// schbench's `do_work` (`schbench.c:1379-1413`): take the current CPU's mutex
+/// (unless `skip_locking`), run `operations` matrix multiplies, unlock. With
+/// `split_percent` set, the ops are partitioned (`schbench.c:1390-1404`):
+/// `ops_shared` run on the ONE process-global shared matrix (every worker
+/// contends), then `ops_private` on this worker's private buffer; `None` is the
+/// legacy all-private single matrix (`:1406-1408`). The guard drops at the end,
+/// holding the lock across all operations exactly as schbench does (`:1387`/
+/// `:1411`).
 fn do_work(
-    matrix_buf: &mut [u64],
-    matrix_size: usize,
+    private_buf: &mut [u64],
+    private_matrix_size: usize,
+    shared_buf: &[core::sync::atomic::AtomicU64],
+    shared_matrix_size: usize,
+    split_percent: Option<usize>,
     operations: usize,
     locks: Option<&PerCpuLocks>,
     work_units: &mut u64,
 ) {
     let _guard = locks.map(|l| l.lock_this_cpu());
-    for _ in 0..operations {
-        if matrix_size > 0 {
-            crate::workload::worker::matrix_multiply(matrix_buf, matrix_size, work_units);
+    match split_percent {
+        Some(p) => {
+            let (ops_shared, ops_private) = ops_split(operations, p);
+            // schbench.c:1395-1398: shared ops first, on the global matrix.
+            if shared_matrix_size > 0 && ops_shared > 0 {
+                for _ in 0..ops_shared {
+                    crate::workload::worker::matrix_multiply_shared(
+                        shared_buf,
+                        shared_matrix_size,
+                        work_units,
+                    );
+                }
+            }
+            // schbench.c:1401-1404: private ops second, on this worker's buffer.
+            if private_matrix_size > 0 && ops_private > 0 {
+                for _ in 0..ops_private {
+                    crate::workload::worker::matrix_multiply(
+                        private_buf,
+                        private_matrix_size,
+                        work_units,
+                    );
+                }
+            }
+        }
+        None => {
+            // schbench.c:1406-1408: legacy all-private single matrix.
+            for _ in 0..operations {
+                if private_matrix_size > 0 {
+                    crate::workload::worker::matrix_multiply(
+                        private_buf,
+                        private_matrix_size,
+                        work_units,
+                    );
+                }
+            }
         }
     }
 }
@@ -985,6 +1107,10 @@ struct WorkerCtx<'a> {
     stop: &'a AtomicBool,
     progress: &'a AtomicU64,
     phase_epoch: Option<&'a AtomicU32>,
+    /// The ONE process-global shared matrix (`--split` mode), shared across
+    /// every worker of every message thread; empty slice when not splitting.
+    shared: &'a [core::sync::atomic::AtomicU64],
+    shared_matrix_size: usize,
 }
 
 /// One worker thread's loop. Faithful to schbench's `worker_thread`
@@ -1011,11 +1137,16 @@ fn worker_loop(td: &ThreadData, ctx: &WorkerCtx) {
         stop,
         progress,
         phase_epoch,
+        shared,
+        shared_matrix_size,
     } = *ctx;
     let tid = gettid_self();
-    let matrix_size = config.matrix_size();
-    let mut matrix_buf = if matrix_size > 0 {
-        vec![0u64; 3 * matrix_size * matrix_size]
+    // Per-worker PRIVATE matrix (schbench.c:1568-1574: private_matrix_size when
+    // splitting, else the full matrix_size). The shared matrix (split mode) is
+    // the process-global `shared` allocated once in run().
+    let private_matrix_size = config.private_matrix_size();
+    let mut private_buf = if private_matrix_size > 0 {
+        vec![0u64; 3 * private_matrix_size * private_matrix_size]
     } else {
         Vec::new()
     };
@@ -1064,8 +1195,11 @@ fn worker_loop(td: &ThreadData, ctx: &WorkerCtx) {
                 think_sleep(config.sleep_usec);
             }
             do_work(
-                &mut matrix_buf,
-                matrix_size,
+                &mut private_buf,
+                private_matrix_size,
+                shared,
+                shared_matrix_size,
+                config.split_percent,
                 config.operations,
                 locks,
                 &mut work_units,
@@ -1225,6 +1359,8 @@ fn run_one_message_thread(
     progress: &AtomicU64,
     phase_epoch: Option<&AtomicU32>,
     live_rate: &AtomicUsize,
+    shared: &[core::sync::atomic::AtomicU64],
+    shared_matrix_size: usize,
 ) -> MessageThreadResult {
     let workers: Vec<ThreadData> = (0..worker_threads).map(|_| ThreadData::new()).collect();
     let msg_td = ThreadData::new();
@@ -1237,6 +1373,8 @@ fn run_one_message_thread(
         stop,
         progress,
         phase_epoch,
+        shared,
+        shared_matrix_size,
     };
 
     std::thread::scope(|inner| {
@@ -1582,6 +1720,33 @@ pub(crate) fn run(
     } else {
         Some(PerCpuLocks::new(lock_array_size))
     };
+    // schbench rejects a `--split` outside 0..=100 at parse and exits
+    // (schbench.c:362-365). ktstr's analog is a loud panic here at the
+    // consumption boundary -- before any matrix sizing or the shared Arc
+    // allocation below -- so an out-of-range config (a `pub split_percent` set
+    // via struct literal bypasses the builder's debug_assert) can never
+    // underflow `100 - p` (a release `usize` wrap that would size a garbage
+    // shared matrix and OOM the allocation) or silently mis-split.
+    if let Some(p) = config.split_percent {
+        assert!(
+            p <= 100,
+            "schbench split_percent must be in 0..=100, got {p} (schbench.c:362-365 rejects out of range)"
+        );
+    }
+    // schbench.c:1871-1872: ONE process-global shared matrix for `--split`,
+    // allocated once and shared (interior-mutable AtomicU64) by every worker
+    // across all message threads. Empty when not splitting (`None`) or when the
+    // shared portion rounds to 0 (split=100): the `shared_matrix_size > 0`
+    // guard in do_work then skips the shared branch, so the empty slice is
+    // never indexed.
+    let shared_matrix_size = config.shared_matrix_size();
+    let shared: std::sync::Arc<[core::sync::atomic::AtomicU64]> = if shared_matrix_size > 0 {
+        (0..3 * shared_matrix_size * shared_matrix_size)
+            .map(|_| core::sync::atomic::AtomicU64::new(0))
+            .collect()
+    } else {
+        std::sync::Arc::from([] as [core::sync::atomic::AtomicU64; 0])
+    };
 
     let start = monotonic_nanos();
     let mut all_wakeup = PlatStats::default();
@@ -1618,6 +1783,7 @@ pub(crate) fn run(
             .map(|_| {
                 let locks = locks.as_ref();
                 let live_rate = &live_rate;
+                let shared = &shared;
                 outer.spawn(move || {
                     run_one_message_thread(
                         worker_threads,
@@ -1627,6 +1793,8 @@ pub(crate) fn run(
                         progress,
                         phase_epoch,
                         live_rate,
+                        &shared[..],
+                        shared_matrix_size,
                     )
                 })
             })
@@ -1760,6 +1928,118 @@ mod tests {
     }
 
     #[test]
+    fn split_matrix_sizes_match_schbench_formula() {
+        // schbench.c:1858-1863: with --split=p the footprint splits into a
+        // private matrix (p%) and a shared matrix (100-p%); each dimension is
+        // sqrt(kib*frac/100 * 1024/3/sizeof(ulong)). None => the legacy single
+        // all-private matrix (full footprint) and no shared matrix.
+        let cfg = |split| SchbenchConfig {
+            cache_footprint_kib: 256,
+            operations: 5,
+            split_percent: split,
+            ..Default::default()
+        };
+        // None: private == the full-footprint matrix_size (104), no shared.
+        assert_eq!(cfg(None).private_matrix_size(), 104);
+        assert_eq!(cfg(None).shared_matrix_size(), 0);
+        // 0%: nothing private; the whole footprint is the shared matrix.
+        assert_eq!(cfg(Some(0)).private_matrix_size(), 0);
+        assert_eq!(cfg(Some(0)).shared_matrix_size(), 104);
+        // 25%: 64 KiB private (sqrt(64*1024/3/8)=52), 192 KiB shared (=90).
+        assert_eq!(cfg(Some(25)).private_matrix_size(), 52);
+        assert_eq!(cfg(Some(25)).shared_matrix_size(), 90);
+        // 100%: all private (full footprint), no shared work.
+        assert_eq!(cfg(Some(100)).private_matrix_size(), 104);
+        assert_eq!(cfg(Some(100)).shared_matrix_size(), 0);
+        // Zero operations -> no matrix work either way.
+        let none_ops = SchbenchConfig {
+            operations: 0,
+            split_percent: Some(50),
+            ..Default::default()
+        };
+        assert_eq!(none_ops.private_matrix_size(), 0);
+        assert_eq!(none_ops.shared_matrix_size(), 0);
+    }
+
+    #[test]
+    fn ops_split_matches_schbench_integer_division() {
+        // schbench.c:1391-1392: ops_private = operations*split/100 (integer
+        // truncation), ops_shared = operations - ops_private. Returns
+        // (ops_shared, ops_private).
+        assert_eq!(ops_split(5, 0), (5, 0)); // all shared
+        assert_eq!(ops_split(5, 25), (4, 1)); // 5*25/100 = 1 private
+        assert_eq!(ops_split(5, 50), (3, 2)); // 5*50/100 = 2 private
+        assert_eq!(ops_split(5, 100), (0, 5)); // all private
+    }
+
+    #[test]
+    fn engine_split_runs_shared_matrix_concurrently() {
+        // --split with two workers: both RMW-multiply the ONE process-global
+        // shared AtomicU64 matrix concurrently (the deliberate cache contention
+        // schbench models). Reaching the assertion proves the shared-matrix path
+        // neither deadlocks nor trips a data-race trap -- the atomics make the
+        // shared race sound (vs schbench's plain shared-memory race). operations=8
+        // @ split=50 => 4 shared + 4 private ops/cycle, so both paths run. Stop is
+        // event-driven (spin on the progress counter, not a sleep).
+        let config = SchbenchConfig {
+            message_threads: 1,
+            worker_threads: 2,
+            cache_footprint_kib: 16,
+            operations: 8,
+            sleep_usec: 0,
+            skip_locking: false,
+            requests_per_sec: 0,
+            auto_rps: 0,
+            split_percent: Some(50),
+        };
+        // Sanity: both split matrices are non-empty at this footprint, so the
+        // test exercises shared + private work, not a degenerate 0-dim path.
+        assert!(config.shared_matrix_size() > 0, "shared matrix present");
+        assert!(config.private_matrix_size() > 0, "private matrix present");
+        let stop = AtomicBool::new(false);
+        let progress = AtomicU64::new(0);
+        let outcome = std::thread::scope(|s| {
+            let runner = s.spawn(|| run(&config, &stop, &progress, None));
+            while progress.load(Ordering::Relaxed) < 50 {
+                core::hint::spin_loop();
+            }
+            stop.store(true, Ordering::Release);
+            runner.join().expect("run panicked")
+        });
+        assert!(
+            outcome.whole_run.loop_count >= 50,
+            "engine did split work: {}",
+            outcome.whole_run.loop_count
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "split_percent must be in 0..=100")]
+    fn engine_panics_on_out_of_range_split() {
+        // Regression pin for the out-of-range finding: a `pub split_percent` set
+        // past 100 via STRUCT LITERAL (the path that bypasses the builder's
+        // debug_assert) must fail LOUDLY at the run() consumption boundary in
+        // every build profile -- the analog of schbench exiting on a bad
+        // `--split` -- never silently underflow `100 - p` into a garbage-huge
+        // shared matrix. The assert fires before any thread spawn or allocation,
+        // so this is cheap (`stop` is pre-set just in case).
+        let config = SchbenchConfig {
+            message_threads: 1,
+            worker_threads: 1,
+            cache_footprint_kib: 16,
+            operations: 1,
+            sleep_usec: 0,
+            skip_locking: false,
+            requests_per_sec: 0,
+            auto_rps: 0,
+            split_percent: Some(101),
+        };
+        let stop = AtomicBool::new(true);
+        let progress = AtomicU64::new(0);
+        let _ = run(&config, &stop, &progress, None);
+    }
+
+    #[test]
     fn stack_add_splice_is_lifo() {
         let a = TestNode::new();
         let b = TestNode::new();
@@ -1830,6 +2110,7 @@ mod tests {
             skip_locking: false,
             requests_per_sec: 0,
             auto_rps: 0,
+            split_percent: None,
         };
         let stop = AtomicBool::new(false);
         let progress = AtomicU64::new(0);
@@ -1880,6 +2161,7 @@ mod tests {
             skip_locking: false,
             requests_per_sec: 0,
             auto_rps: 0,
+            split_percent: None,
         };
         let stop = AtomicBool::new(false);
         let progress = AtomicU64::new(0);
@@ -1919,6 +2201,7 @@ mod tests {
             skip_locking: false,
             requests_per_sec: 10_000,
             auto_rps: 0,
+            split_percent: None,
         };
         let stop = AtomicBool::new(false);
         let progress = AtomicU64::new(0);
@@ -1963,6 +2246,7 @@ mod tests {
             skip_locking: false,
             requests_per_sec: 1, // 1 / 2 message threads = 0 per thread -> default
             auto_rps: 0,
+            split_percent: None,
         };
         let stop = AtomicBool::new(false);
         let progress = AtomicU64::new(0);
@@ -2077,6 +2361,7 @@ mod tests {
             skip_locking: false,
             requests_per_sec: 10_000,
             auto_rps: 50,
+            split_percent: None,
         };
         let stop = AtomicBool::new(false);
         let progress = AtomicU64::new(0);
@@ -2110,6 +2395,7 @@ mod tests {
             skip_locking: false,
             requests_per_sec: 0,
             auto_rps: 0,
+            split_percent: None,
         };
         let stop = AtomicBool::new(false);
         let progress = AtomicU64::new(0);
@@ -2233,6 +2519,7 @@ mod tests {
             skip_locking: false,
             requests_per_sec: 0,
             auto_rps: 0,
+            split_percent: None,
         };
         let stop = AtomicBool::new(false);
         let progress = AtomicU64::new(0);
@@ -2282,7 +2569,10 @@ mod tests {
             .cache_footprint_kib(512)
             .operations(9)
             .sleep_usec(250)
-            .skip_locking(true);
+            .skip_locking(true)
+            // Exercise the new field's Some(p) serde surface, not just the None
+            // default (the API-review roundtrip requirement).
+            .split_percent(Some(33));
         let json = serde_json::to_string(&cfg).expect("SchbenchConfig must serialize");
         let back: SchbenchConfig =
             serde_json::from_str(&json).expect("SchbenchConfig must deserialize");

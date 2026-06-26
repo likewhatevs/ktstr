@@ -64,6 +64,11 @@ struct Args {
     /// turns on closed-loop rate control (seeds the rate to 10 when `-R` is 0).
     #[arg(short = 'A', long, default_value_t = 0)]
     auto_rps: usize,
+    /// Private/shared cache-footprint split percentage (schbench `--split`,
+    /// long-only): percent of the footprint that is private per thread. Omit
+    /// for no split (the legacy all-private single matrix).
+    #[arg(long)]
+    split: Option<usize>,
 }
 
 fn main() {
@@ -76,7 +81,8 @@ fn main() {
         .sleep_usec(args.sleep_usec)
         .skip_locking(args.skip_locking)
         .requests_per_sec(args.rps)
-        .auto_rps(args.auto_rps);
+        .auto_rps(args.auto_rps)
+        .split_percent(args.split);
 
     let report = run_standalone(&config, args.runtime_secs);
     print_report(&report, args.runtime_secs, args.auto_rps);
