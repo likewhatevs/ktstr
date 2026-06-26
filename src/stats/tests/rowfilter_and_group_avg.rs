@@ -410,6 +410,42 @@ fn row_filter_run_sources_or_combined_matches_any_listed() {
     );
 }
 
+/// Repeatable `--resolve-source A --resolve-source B` is OR-combined: a
+/// row matches iff its `resolve_source` equals ANY listed entry; a row
+/// whose `resolve_source` is `None` never matches a populated filter.
+/// Mirror of `row_filter_run_sources_or_combined_matches_any_listed` for
+/// the `resolve_source` dimension.
+#[test]
+fn row_filter_resolve_sources_or_combined_matches_any_listed() {
+    let mut row_auto = make_filter_row("t", "scx_a", "1n2l4c1t", "SpinWait", None);
+    row_auto.resolve_source = Some("auto_built".to_string());
+    let mut row_debug = make_filter_row("t", "scx_a", "1n2l4c1t", "SpinWait", None);
+    row_debug.resolve_source = Some("target_debug".to_string());
+    let mut row_path = make_filter_row("t", "scx_a", "1n2l4c1t", "SpinWait", None);
+    row_path.resolve_source = Some("path".to_string());
+    let row_none = make_filter_row("t", "scx_a", "1n2l4c1t", "SpinWait", None);
+    let filter = RowFilter {
+        resolve_sources: vec!["auto_built".to_string(), "target_debug".to_string()],
+        ..RowFilter::default()
+    };
+    assert!(
+        filter.matches(&row_auto),
+        "first listed resolve_source must match",
+    );
+    assert!(
+        filter.matches(&row_debug),
+        "second listed resolve_source must match",
+    );
+    assert!(
+        !filter.matches(&row_path),
+        "resolve_source outside the listed set must reject",
+    );
+    assert!(
+        !filter.matches(&row_none),
+        "None resolve_source must never match a populated filter (opt-in policy)",
+    );
+}
+
 /// `--run-source` and `--kernel-commit` filter on DISTINCT row
 /// fields. Pins the field non-aliasing: a row whose
 /// `run_source` matches but whose `kernel_commit` does not

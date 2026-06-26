@@ -280,6 +280,7 @@ pub(crate) fn make_vm_result(
         success: !timed_out && exit_code == 0,
         vcpus: 1,
         cpu_budget: 1,
+        resolve_source: None,
         expect_auto_repro_satisfied: false,
         exit_code,
         duration: std::time::Duration::from_secs(1),

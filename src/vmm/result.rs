@@ -84,6 +84,16 @@ pub struct VmResult {
     /// Below `vcpus` means host overcommit, which confounds the
     /// guest-scheduler timing metrics.
     pub cpu_budget: u32,
+    /// How the userspace scheduler binary was resolved for this run —
+    /// the snake_case `crate::test_support::ResolveSource::as_str` tag
+    /// (`"auto_built"`, `"target_debug"`, `"path"`, ...). Stamped by the
+    /// host eval layer (`run_ktstr_test_inner_impl`) AFTER the run,
+    /// alongside `entry_name` / `variant_hash`, then carried to the
+    /// sidecar `resolve_source` stamp the same way `vcpus` / `cpu_budget`
+    /// are. `None` for VmResults built outside the host eval path (the
+    /// freeze coordinator, test fixtures) — those resolve no scheduler
+    /// binary.
+    pub resolve_source: Option<String>,
     /// True when the `#[ktstr_test(expect_auto_repro)]` attribute set
     /// `expect_auto_repro = true` on the entry AND the auto-repro
     /// path fired with a valid repro artifact during the run — the
@@ -973,6 +983,7 @@ impl VmResult {
             success: true,
             vcpus: 1,
             cpu_budget: 1,
+            resolve_source: None,
             expect_auto_repro_satisfied: false,
             exit_code: 0,
             duration: Duration::from_secs(1),

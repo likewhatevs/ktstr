@@ -1,9 +1,9 @@
 use super::*;
 
-/// One of the eight dimensions that compose a `GauntletRow`'s
+/// One of the nine dimensions that compose a `GauntletRow`'s
 /// identity in the comparison pipeline: `kernel`, `scheduler`,
 /// `topology`, `work-type`, `project-commit`, `kernel-commit`,
-/// `run-source`, `cpu-budget`. Each maps to the corresponding
+/// `run-source`, `resolve-source`, `cpu-budget`. Each maps to the corresponding
 /// `RowFilter` field and `GauntletRow` field; the dimension
 /// model lets `compare_partitions` derive its slicing dims and
 /// dynamic pairing key without hardcoding the dimension list at
@@ -22,7 +22,7 @@ use super::*;
 /// matches the order operators read in the CLI flags
 /// (`--kernel` / `--scheduler` / `--topology` / `--work-type` /
 /// `--project-commit` / `--kernel-commit` / `--run-source` /
-/// `--cpu-budget`), so generated labels and error messages list
+/// `--resolve-source` / `--cpu-budget`), so generated labels and error messages list
 /// dims in a stable, predictable order.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Dimension {
@@ -33,6 +33,7 @@ pub enum Dimension {
     ProjectCommit,
     KernelCommit,
     RunSource,
+    ResolveSource,
     CpuBudget,
 }
 
@@ -49,6 +50,7 @@ impl Dimension {
         Dimension::ProjectCommit,
         Dimension::KernelCommit,
         Dimension::RunSource,
+        Dimension::ResolveSource,
         Dimension::CpuBudget,
     ];
 
@@ -80,6 +82,7 @@ impl Dimension {
             Dimension::ProjectCommit => "project-commit",
             Dimension::KernelCommit => "kernel-commit",
             Dimension::RunSource => "run-source",
+            Dimension::ResolveSource => "resolve-source",
             Dimension::CpuBudget => "cpu-budget",
         }
     }
@@ -107,7 +110,7 @@ pub(crate) const LEGACY_PAIRING_DIMS: &[Dimension] = &[Dimension::Topology, Dime
 /// Comparison shape per dimension: every dim uses the same
 /// SORTED-DEDUPED `Vec<&str>` comparison — order and multiplicity
 /// don't matter (`--a-kernel 6.14 --a-kernel 6.15` and
-/// `--b-kernel 6.15 --b-kernel 6.14` are NOT a slice). All eight
+/// `--b-kernel 6.15 --b-kernel 6.14` are NOT a slice). All nine
 /// dimensions are repeatable Vec filters; the previously
 /// `Option<String>`-typed `scheduler` / `topology` / `work_type`
 /// dims were promoted to `Vec<String>` so the operator-visible
@@ -138,6 +141,9 @@ pub fn derive_slicing_dims(filter_a: &RowFilter, filter_b: &RowFilter) -> Vec<Di
             }
             Dimension::RunSource => {
                 sorted_dedup(&filter_a.run_sources) != sorted_dedup(&filter_b.run_sources)
+            }
+            Dimension::ResolveSource => {
+                sorted_dedup(&filter_a.resolve_sources) != sorted_dedup(&filter_b.resolve_sources)
             }
             Dimension::CpuBudget => {
                 sorted_dedup(&filter_a.cpu_budgets) != sorted_dedup(&filter_b.cpu_budgets)
@@ -190,6 +196,7 @@ pub(crate) fn render_side_label(
             Dimension::ProjectCommit => render_vec_dim(&filter.project_commits, bare_label),
             Dimension::KernelCommit => render_vec_dim(&filter.kernel_commits, bare_label),
             Dimension::RunSource => render_vec_dim(&filter.run_sources, bare_label),
+            Dimension::ResolveSource => render_vec_dim(&filter.resolve_sources, bare_label),
             Dimension::CpuBudget => render_vec_dim(&filter.cpu_budgets, bare_label),
         };
         parts.push(part);
@@ -261,6 +268,7 @@ impl PairingKey {
                 Dimension::ProjectCommit => commit_pairing_key_part(&row.commit),
                 Dimension::KernelCommit => commit_pairing_key_part(&row.kernel_commit),
                 Dimension::RunSource => row.run_source.clone().unwrap_or_default(),
+                Dimension::ResolveSource => row.resolve_source.clone().unwrap_or_default(),
                 // Cross-budget rows never pair: a row's budget value
                 // becomes part of its pairing key (None -> empty, distinct
                 // from any real budget). A skip (None) only pairs with
@@ -733,6 +741,7 @@ impl<'a> Accumulator<'a> {
             commit: project_commit_rendered,
             kernel_commit: kernel_commit_rendered,
             run_source: acc.first.run_source.clone(),
+            resolve_source: acc.first.resolve_source.clone(),
             // First-seen budget metadata, like scheduler/kernel_version
             // above. When CpuBudget is a PAIRING dim it is part of the
             // group key, so every contributor shares one budget and the
@@ -1041,6 +1050,7 @@ pub fn sidecar_to_row(sc: &crate::test_support::SidecarResult) -> GauntletRow {
         commit: sc.project_commit.clone(),
         kernel_commit: sc.kernel_commit.clone(),
         run_source: sc.run_source.clone(),
+        resolve_source: sc.resolve_source.clone(),
         // 0 = skip rows (never booted) -> None: skips carry no budget
         // identity, so they don't pair into a "budget 0" bucket.
         cpu_budget: (sc.cpu_budget != 0).then_some(sc.cpu_budget),

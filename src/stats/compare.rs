@@ -1206,6 +1206,45 @@ pub(crate) fn zero_match_diagnostic(
         }
     }
 
+    // Unknown-resolve-source hint. Mirrors the run_sources hint for the
+    // scheduler-resolution-path dimension: fires when a `--resolve-source`
+    // value is not among the resolve_sources present in the pool.
+    if !filter.resolve_sources.is_empty() {
+        let pool_resolve_sources: std::collections::BTreeSet<&str> = rows
+            .iter()
+            .filter_map(|r| r.resolve_source.as_deref())
+            .collect();
+        let unknowns: Vec<&str> = filter
+            .resolve_sources
+            .iter()
+            .map(String::as_str)
+            .filter(|want| !pool_resolve_sources.contains(*want))
+            .collect();
+        if !unknowns.is_empty() {
+            let mut present: Vec<&str> = pool_resolve_sources.iter().copied().collect();
+            present.sort_unstable();
+            let unknown_list = unknowns
+                .iter()
+                .map(|s| format!("`{s}`"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let present_list = if present.is_empty() {
+                "(none — every row has `resolve_source: null`)".to_string()
+            } else {
+                present
+                    .iter()
+                    .map(|s| format!("`{s}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            msg.push_str(&format!(
+                "\nhint: --resolve-source {unknown_list} not found in pool; \
+                 distinct values present: {present_list}. Values are \
+                 case-sensitive (`auto_built` \u{2260} `Auto_Built`)."
+            ));
+        }
+    }
+
     // Unknown-cpu-budget hint. Mirrors the run_sources hint for the
     // numeric budget dimension: fires when a `--cpu-budget` value is
     // not among the budgets present in the pool (the budgets render

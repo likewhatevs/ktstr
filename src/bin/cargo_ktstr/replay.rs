@@ -732,6 +732,7 @@ mod tests {
             vcpus: 1,
             cpu_budget: 1,
             scheduler_commit: None,
+            resolve_source: None,
             project_commit: None,
             payload: None,
             metrics: Vec::new(),

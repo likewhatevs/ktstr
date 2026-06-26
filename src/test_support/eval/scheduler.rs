@@ -156,6 +156,26 @@ pub enum ResolveSource {
     NotFound,
 }
 
+impl ResolveSource {
+    /// Stable snake_case tag for the sidecar `resolve_source` field and
+    /// the `stats` `--resolve-source` filter — the string analog of the
+    /// variant, mirroring the `run_source` tag convention so the
+    /// persisted JSON shape does not depend on this enum's Rust
+    /// representation. Variant order matches the discovery cascade.
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Path => "path",
+            Self::EnvVar => "env_var",
+            Self::PathLookup => "path_lookup",
+            Self::SiblingDir => "sibling_dir",
+            Self::TargetDebug => "target_debug",
+            Self::TargetRelease => "target_release",
+            Self::AutoBuilt => "auto_built",
+            Self::NotFound => "not_found",
+        }
+    }
+}
+
 /// Walk `$PATH` directories in order looking for an executable
 /// named `name`. Returns the first match that is a regular file
 /// with at least one execute permission bit set. None when `PATH`

@@ -409,6 +409,7 @@ fn sidecar_payload_and_metrics_always_emit_when_empty() {
         host,
         cleanup_duration_ms,
         run_source,
+        resolve_source,
     } = loaded;
     assert!(payload.is_none());
     assert!(metrics.is_empty());
@@ -430,6 +431,12 @@ fn sidecar_payload_and_metrics_always_emit_when_empty() {
     assert!(
         run_source.is_none(),
         "absent run_source must round-trip as None, \
+         matching the symmetric serialize/deserialize \
+         contract enforced for every other nullable field",
+    );
+    assert!(
+        resolve_source.is_none(),
+        "absent resolve_source must round-trip as None, \
          matching the symmetric serialize/deserialize \
          contract enforced for every other nullable field",
     );
@@ -950,6 +957,46 @@ fn sidecar_variant_hash_excludes_run_source() {
         sidecar_variant_hash(&archive),
         "run_source must not influence variant hash — \
          Some(\"ci\") vs Some(\"archive\") case",
+    );
+}
+
+/// `resolve_source` (the scheduler discovery-path tag) must not
+/// influence the variant hash. Two runs of the same semantic variant
+/// resolved via different paths — one auto-built from the workspace
+/// HEAD, one from a possibly-stale `target/` binary — must produce the
+/// same sidecar filename so `compare_partitions` can diff them across
+/// the resolution boundary. Mirrors the commit / run_source exclusion
+/// tests: covers `None` vs `Some` and two distinct populated tags so a
+/// regression distinguishing only one pair is still caught.
+#[test]
+fn sidecar_variant_hash_excludes_resolve_source() {
+    let none = SidecarResult {
+        topology: "1n1l2c1t".to_string(),
+        resolve_source: None,
+        ..SidecarResult::test_fixture()
+    };
+    let auto = SidecarResult {
+        topology: "1n1l2c1t".to_string(),
+        resolve_source: Some("auto_built".to_string()),
+        ..SidecarResult::test_fixture()
+    };
+    assert_eq!(
+        sidecar_variant_hash(&none),
+        sidecar_variant_hash(&auto),
+        "resolve_source must not influence variant hash — None vs \
+         Some(\"auto_built\") case",
+    );
+
+    let stale = SidecarResult {
+        topology: "1n1l2c1t".to_string(),
+        resolve_source: Some("target_debug".to_string()),
+        ..SidecarResult::test_fixture()
+    };
+    assert_eq!(
+        sidecar_variant_hash(&auto),
+        sidecar_variant_hash(&stale),
+        "resolve_source must not influence variant hash — \
+         Some(\"auto_built\") vs Some(\"target_debug\") case",
     );
 }
 

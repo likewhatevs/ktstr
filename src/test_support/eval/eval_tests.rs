@@ -766,6 +766,28 @@ fn target_dir_probe_order_prefers_profile_match() {
     assert_eq!(dbg[1], ("target/release", ResolveSource::TargetRelease));
 }
 
+/// `ResolveSource::as_str` is the load-bearing enum -> persisted-tag
+/// bridge: it produces the snake_case string stamped into
+/// `SidecarResult::resolve_source` (eval/mod.rs stamps it post-run) and
+/// surfaced by `stats compare --resolve-source` / `stats list-values`. The
+/// roundtrip / propagation tests pin
+/// the String values INDEPENDENTLY (they hardcode the expected tags), so
+/// a typo here (e.g. `SiblingDir => "sibling-dir"`) would silently ship
+/// a malformed JSON contract without failing those tests. Pin every
+/// variant -> tag mapping; the exhaustive match in `as_str` (no wildcard)
+/// already forces a new variant to add an arm, and this fixes the string.
+#[test]
+fn resolve_source_as_str_tags() {
+    assert_eq!(ResolveSource::Path.as_str(), "path");
+    assert_eq!(ResolveSource::EnvVar.as_str(), "env_var");
+    assert_eq!(ResolveSource::PathLookup.as_str(), "path_lookup");
+    assert_eq!(ResolveSource::SiblingDir.as_str(), "sibling_dir");
+    assert_eq!(ResolveSource::TargetDebug.as_str(), "target_debug");
+    assert_eq!(ResolveSource::TargetRelease.as_str(), "target_release");
+    assert_eq!(ResolveSource::AutoBuilt.as_str(), "auto_built");
+    assert_eq!(ResolveSource::NotFound.as_str(), "not_found");
+}
+
 /// The `BIN` infix keeps the per-name namespace disjoint from the
 /// `KTSTR_SCHEDULER_*` meta-variables: a scheduler named "profile" must NOT
 /// derive the build-profile selector `KTSTR_SCHEDULER_PROFILE`

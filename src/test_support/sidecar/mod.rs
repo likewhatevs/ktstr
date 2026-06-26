@@ -128,6 +128,29 @@ pub struct SidecarResult {
     /// doc for the full asymmetric contract that governs every
     /// nullable on this struct.
     pub scheduler_commit: Option<String>,
+    /// How the userspace scheduler binary was resolved for this run —
+    /// the snake_case [`crate::test_support::ResolveSource::as_str`] tag
+    /// (`"path"`, `"env_var"`, `"path_lookup"`, `"sibling_dir"`,
+    /// `"target_debug"`, `"target_release"`, `"auto_built"`,
+    /// `"not_found"`). Provenance, not identity: distinct from
+    /// [`SidecarResult::scheduler_commit`] (the binary's git commit) —
+    /// this records the discovery PATH, so the stats CLI can answer "was
+    /// this run's scheduler auto-built from the workspace HEAD, or
+    /// resolved from a possibly-stale `target/` or `$PATH` binary?".
+    /// `"auto_built"` is the only tag whose source commit is known to
+    /// match the workspace tree; every other tag carries the stale-binary
+    /// hazard documented on the [`crate::test_support::ResolveSource`]
+    /// variant.
+    ///
+    /// Writer always emits (`"resolve_source": null` on absence — the
+    /// skip-sidecar path resolves no binary). Reader-side: serde's native
+    /// `Option<T>` deserialize tolerates absence (a missing key parses as
+    /// `None`); see the module-level doc for the full asymmetric
+    /// contract. Excluded from `sidecar_variant_hash` for the same
+    /// cross-host grouping reason as `scheduler_commit` / `run_source`:
+    /// two runs of the same semantic variant resolved via different
+    /// discovery paths must still bucket together.
+    pub resolve_source: Option<String>,
     /// Best-effort git HEAD of the ktstr project tree at sidecar-
     /// write time. Captured by `detect_project_commit` via
     /// `gix::discover` from the test process's current working
@@ -563,6 +586,7 @@ impl SidecarResult {
             topology: "1n1l1c1t".to_string(),
             scheduler: "eevdf".to_string(),
             scheduler_commit: None,
+            resolve_source: None,
             project_commit: None,
             payload: None,
             metrics: Vec::new(),
@@ -2490,7 +2514,8 @@ fn kernel_commit_for_sidecar() -> Option<String> {
 /// payload, work_type, sysctls, kargs) — NOT over
 /// [`crate::host_context::HostContext`], NOT over `scheduler_commit`, NOT over
 /// `project_commit`, NOT over `kernel_commit`, NOT over
-/// `run_source`, and NOT over `cpu_budget` / `vcpus`. The
+/// `run_source`, NOT over `resolve_source`, and NOT over
+/// `cpu_budget` / `vcpus`. The
 /// [`crate::host_context::HostContext`] exclusion is pinned by
 /// `sidecar_variant_hash_excludes_host_context`; the
 /// `scheduler_commit` exclusion by
@@ -2501,14 +2526,17 @@ fn kernel_commit_for_sidecar() -> Option<String> {
 /// `sidecar_variant_hash_excludes_kernel_commit`; the
 /// `run_source` exclusion by
 /// `sidecar_variant_hash_excludes_run_source`; the
+/// `resolve_source` exclusion by
+/// `sidecar_variant_hash_excludes_resolve_source`; the
 /// `cpu_budget` / `vcpus` exclusion by
-/// `sidecar_variant_hash_excludes_cpu_budget`. All six are
+/// `sidecar_variant_hash_excludes_cpu_budget`. All seven are
 /// deliberate for the same cross-host grouping reason — a
 /// gauntlet rebuilt against a different userspace scheduler
 /// commit, a bumped ktstr checkout, a kernel source tree at a
-/// different HEAD, a different CI runner / developer machine, or
-/// a run that confined its vCPUs to a different host-CPU budget
-/// must still bucket with the same-named variant so
+/// different HEAD, a different CI runner / developer machine, a
+/// run that resolved its scheduler via a different discovery
+/// path, or a run that confined its vCPUs to a different
+/// host-CPU budget must still bucket with the same-named variant so
 /// `compare_partitions` can diff two runs of the "same" test
 /// without the commit hash, run-source tag, or budget shattering
 /// them into one-row-per-commit islands. `cpu_budget` / `vcpus`
@@ -2519,10 +2547,11 @@ fn kernel_commit_for_sidecar() -> Option<String> {
 /// [`SidecarResult::scheduler_commit`] /
 /// [`SidecarResult::project_commit`] /
 /// [`SidecarResult::kernel_commit`] /
-/// [`SidecarResult::run_source`] directly (the latter three via
-/// `--project-commit` / `--kernel-commit` / `--run-source` on
-/// `stats compare`); the filename stays stable across commits
-/// and run environments by design.
+/// [`SidecarResult::run_source`] /
+/// [`SidecarResult::resolve_source`] directly (via
+/// `--project-commit` / `--kernel-commit` / `--run-source` /
+/// `--resolve-source` on `stats compare`); the filename stays stable
+/// across commits and run environments by design.
 ///
 /// The corollary of the HostContext exclusion: if the host's
 /// observable state mutates mid-suite — NUMA hotplug, hugepage
@@ -3486,6 +3515,9 @@ pub(crate) fn write_skip_sidecar(
         topology: resolved_topology.to_string(),
         scheduler,
         scheduler_commit,
+        // A skip resolves no scheduler binary (no run), so there is no
+        // discovery path to record.
+        resolve_source: None,
         project_commit: detect_project_commit(),
         // A skip never runs the payload. Still record the declared
         // payload name so stats tooling can attribute the skip to
@@ -3579,6 +3611,11 @@ pub(crate) fn write_sidecar(
         topology: resolved_topology.to_string(),
         scheduler,
         scheduler_commit,
+        // Scheduler-resolution provenance, carried on VmResult from the
+        // host eval path (run_ktstr_test_inner_impl resolves the binary
+        // once and stamps the source), mirroring how vcpus / cpu_budget
+        // ride VmResult to this stamp.
+        resolve_source: vm_result.resolve_source.clone(),
         project_commit: detect_project_commit(),
         payload: entry.payload.map(|p| p.name.to_string()),
         metrics: payload_metrics.to_vec(),

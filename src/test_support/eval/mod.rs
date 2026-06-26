@@ -570,12 +570,13 @@ fn run_ktstr_test_inner_impl(
     // blocked during the multi-second extraction phase. `None`
     // on non-cache kernels — those don't need coordination.
     let kernel_lock = acquire_test_kernel_lock_if_cached(&kernel)?;
-    // Drop the ResolveSource on this path — the downstream sites (VM
-    // builder, auto_repro) only need the PathBuf. Consumers that want
-    // provenance (sidecar stamping, cache-key construction) must call
-    // resolve_scheduler directly on the same spec; the source is
-    // stable across identical inputs within a single process run.
-    let scheduler = resolve_scheduler(&entry.scheduler.binary)?.0;
+    // Capture the scheduler's ResolveSource (the discovery path) so the
+    // sidecar records where this run's binary came from — write_sidecar
+    // stamps it into SidecarResult::resolve_source below. The downstream
+    // sites (VM builder, auto_repro) take only the PathBuf; the source is
+    // a Copy enum that rides to the sidecar write unchanged.
+    let (scheduler, scheduler_resolve_source) =
+        resolve_scheduler(&entry.scheduler.binary)?;
     let resolved_staged = resolve_staged_schedulers_strict(entry, |spec| {
         resolve_scheduler(spec).map(|(opt, _src)| opt)
     })?;
@@ -1103,6 +1104,11 @@ fn run_ktstr_test_inner_impl(
     // they resolve to the SAME variant-keyed paths the inline writer +
     // wprof writer use.
     result.variant_hash = variant_hash;
+    // Stamp the scheduler-resolution provenance captured pre-boot (the
+    // discovery path the binary was found via) so write_sidecar carries
+    // it into SidecarResult::resolve_source — mirrors entry_name /
+    // variant_hash above (eval-layer fields the VM run does not set).
+    result.resolve_source = Some(scheduler_resolve_source.as_str().to_string());
     // When the primary VM failed but the freeze coordinator never
     // wrote the real failure-dump (i.e. pre-attach failures:
     // send_sys_rdy timeout, VM boot failure, scheduler binary load

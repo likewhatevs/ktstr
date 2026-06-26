@@ -336,6 +336,43 @@ fn sidecar_to_row_propagates_run_source() {
     );
 }
 
+/// `sidecar_to_row` must copy `SidecarResult::resolve_source` into
+/// `GauntletRow::resolve_source` verbatim so the `--resolve-source`
+/// compare filter and `stats list-values` surface the discovery-path tag
+/// the sidecar writer recorded. A regression leaving the row field at
+/// `Option::default()` (`None`) would silently drop the resolve-source
+/// dimension. Mirrors `sidecar_to_row_propagates_run_source`; pinned for
+/// `None` and the canonical discovery-path tags.
+#[test]
+fn sidecar_to_row_propagates_resolve_source() {
+    use crate::test_support;
+    for tag in ["auto_built", "target_debug", "path"] {
+        let sc = test_support::SidecarResult {
+            test_name: format!("resolve_source_{tag}_test"),
+            topology: "1n1l2c1t".to_string(),
+            resolve_source: Some(tag.to_string()),
+            ..test_support::SidecarResult::test_fixture()
+        };
+        let row = sidecar_to_row(&sc);
+        assert_eq!(
+            row.resolve_source.as_deref(),
+            Some(tag),
+            "populated resolve_source `{tag}` must propagate verbatim",
+        );
+    }
+
+    let sc_none = test_support::SidecarResult {
+        test_name: "no_resolve_source_test".to_string(),
+        topology: "1n1l2c1t".to_string(),
+        resolve_source: None,
+        ..test_support::SidecarResult::test_fixture()
+    };
+    assert!(
+        sidecar_to_row(&sc_none).resolve_source.is_none(),
+        "absent resolve_source must propagate as None",
+    );
+}
+
 #[test]
 fn sidecar_to_row_no_stall() {
     use crate::monitor;
@@ -999,6 +1036,7 @@ fn list_values_empty_pool_text_has_sentinel_per_dim() {
         "commit:",
         "kernel_commit:",
         "source:",
+        "resolve_source:",
         "cpu_budget:",
         "scheduler:",
         "topology:",
@@ -1009,16 +1047,16 @@ fn list_values_empty_pool_text_has_sentinel_per_dim() {
             "text output must include heading for {dim}: {out}",
         );
     }
-    // Each dim should report the empty-pool sentinel exactly eight
+    // Each dim should report the empty-pool sentinel exactly nine
     // times — one per dim — so a regression that dropped the
     // sentinel for one dim falls out as a count mismatch.
     let sentinel_count = out.matches("(no sidecars in pool)").count();
     assert_eq!(
-        sentinel_count, 8,
+        sentinel_count, 9,
         "empty pool must surface the no-sidecars sentinel under every \
-             one of the 8 dims (kernel/commit/kernel_commit/source/\
-             cpu_budget/scheduler/topology/work_type); got {sentinel_count} \
-             occurrences in:\n{out}",
+             one of the 9 dims (kernel/commit/kernel_commit/source/\
+             resolve_source/cpu_budget/scheduler/topology/work_type); got \
+             {sentinel_count} occurrences in:\n{out}",
     );
 }
 
@@ -1035,6 +1073,7 @@ fn list_values_empty_pool_json_emits_empty_arrays() {
         "commit",
         "kernel_commit",
         "source",
+        "resolve_source",
         "cpu_budget",
         "scheduler",
         "topology",
@@ -1129,23 +1168,26 @@ fn list_values_text_dedupes_and_sorts_per_dim() {
     // kernel_commit set's None bucket renders one `unknown`
     // line as well. Total: 3 occurrences.
     //
-    // `run_source` is the fourth optional dim but does NOT
-    // contribute an `unknown` here: `list_values(_, Some(dir))`
-    // calls `apply_archive_source_override` on the loaded pool
-    // (the `--dir` flag treats the supplied root as an archive),
-    // which rewrites every `run_source: None` to
-    // `Some("archive")` BEFORE the dimension-set is built. Every
-    // fixture above leaves `run_source` at its `test_fixture`
-    // default (None), but they all surface as `archive` after
-    // the override — the run_source set never holds a None
-    // entry on this code path, so no `unknown` line is emitted
-    // for it.
+    // `run_source` is an optional dim but does NOT contribute an
+    // `unknown` here: `list_values(_, Some(dir))` calls
+    // `apply_archive_source_override` on the loaded pool (the `--dir`
+    // flag treats the supplied root as an archive), which rewrites
+    // every `run_source: None` to `Some("archive")` BEFORE the
+    // dimension-set is built. Every fixture above leaves `run_source`
+    // at its `test_fixture` default (None), but they all surface as
+    // `archive` after the override — the run_source set never holds a
+    // None entry on this code path, so no `unknown` line is emitted
+    // for it. `resolve_source` IS the fourth `unknown`-contributing
+    // optional dim: the archive override touches only `run_source`,
+    // so `resolve_source` (None on every fixture here) keeps its None
+    // entry and renders one `unknown` line. Total: kernel + commit +
+    // kernel_commit + resolve_source = 4.
     let unknown_count = out.matches("unknown").count();
     assert_eq!(
-        unknown_count, 3,
+        unknown_count, 4,
         "`unknown` must render once per optional dim with a None \
-             entry (kernel + commit + kernel_commit = 3); got \
-             {unknown_count} in:\n{out}",
+             entry (kernel + commit + kernel_commit + resolve_source = \
+             4); got {unknown_count} in:\n{out}",
     );
 
     // Sort: both schedulers in ascending lex order means
@@ -1252,12 +1294,14 @@ fn list_values_json_carries_null_for_optional_dims() {
             test_name: "t_known".to_string(),
             kernel_version: Some("6.14.2".to_string()),
             project_commit: Some("abcdef1".to_string()),
+            resolve_source: Some("auto_built".to_string()),
             ..SidecarResult::test_fixture()
         },
         SidecarResult {
             test_name: "t_unknown".to_string(),
             kernel_version: None,
             project_commit: None,
+            resolve_source: None,
             ..SidecarResult::test_fixture()
         },
     ];
@@ -1292,6 +1336,25 @@ fn list_values_json_carries_null_for_optional_dims() {
     assert!(
         commit.iter().any(|v| v.as_str() == Some("abcdef1")),
         "commit array must include the populated value abcdef1; got {commit:?}",
+    );
+
+    // resolve_source is the ninth list-values dimension (JSON key
+    // "resolve_source"); it carries null for the None fixture and the
+    // populated discovery-path tag for the other. Unlike run_source, the
+    // `--dir` archive override does NOT touch resolve_source, so the None
+    // entry stays null here.
+    let resolve = parsed
+        .get("resolve_source")
+        .expect("resolve_source key")
+        .as_array()
+        .unwrap();
+    assert!(
+        resolve.iter().any(|v| v.is_null()),
+        "resolve_source array must include a literal null for the None entry; got {resolve:?}",
+    );
+    assert!(
+        resolve.iter().any(|v| v.as_str() == Some("auto_built")),
+        "resolve_source array must include the populated tag auto_built; got {resolve:?}",
     );
 }
 

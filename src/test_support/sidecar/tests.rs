@@ -272,6 +272,7 @@ fn sidecar_result_roundtrip() {
         vcpus: 16,
         cpu_budget: 4,
         scheduler_commit: Some("abc123".to_string()),
+        resolve_source: Some("path".to_string()),
         project_commit: Some("def4567".to_string()),
         payload: None,
         metrics: vec![],
@@ -390,6 +391,7 @@ fn sidecar_result_roundtrip() {
         host,
         cleanup_duration_ms,
         run_source,
+        resolve_source,
     } = loaded;
     // Hash-participating string fields round-trip verbatim.
     assert_eq!(test_name, "my_test");
@@ -465,6 +467,12 @@ fn sidecar_result_roundtrip() {
         "run_source must round-trip the literal `local` populated on \
          the write side, including the absent-vs-populated distinction",
     );
+    assert_eq!(
+        resolve_source.as_deref(),
+        Some("path"),
+        "resolve_source must round-trip the literal discovery-path tag \
+         populated on the write side",
+    );
 }
 
 /// Exhaustive schema-audit gate for `SidecarResult`'s serde
@@ -524,6 +532,7 @@ fn sidecar_result_roundtrip_all_fields_round_trip() {
         vcpus: 256,
         cpu_budget: 95,
         scheduler_commit: Some("deadbeef1234567890abcdef".to_string()),
+        resolve_source: Some("auto_built".to_string()),
         project_commit: Some("cafebab-dirty".to_string()),
         payload: Some("audit_payload".to_string()),
         metrics: vec![PayloadMetrics {
@@ -706,6 +715,13 @@ fn sidecar_result_roundtrip_all_fields_round_trip() {
          regression that mapped one tag onto another would \
          surface in this audit pass even if the sibling test \
          did not detect it.",
+    );
+    assert_eq!(
+        loaded.resolve_source.as_deref(),
+        Some("auto_built"),
+        "resolve_source must round-trip the literal discovery-path tag \
+         (`auto_built`) populated on the write side — distinct from the \
+         sibling roundtrip's `path` so a write-vs-read field-swap surfaces.",
     );
 }
 

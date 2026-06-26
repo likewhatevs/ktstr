@@ -152,6 +152,21 @@ pub struct GauntletRow {
     /// local), this describes the run-environment provenance.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_source: Option<String>,
+    /// Scheduler-resolution provenance carried from
+    /// [`crate::test_support::sidecar::SidecarResult::resolve_source`] —
+    /// the snake_case discovery-path tag (`"auto_built"`,
+    /// `"target_debug"`, `"path"`, ...). `None` for sidecars produced
+    /// before the field existed (pre-1.0 disposable schema) and for skip
+    /// rows (no binary resolved). Surfaced via the typed
+    /// [`RowFilter::resolve_sources`] (`--resolve-source` /
+    /// `--a-resolve-source` / `--b-resolve-source`) for narrowing +
+    /// pairing — same opt-in policy as `run_source` — and listed by
+    /// `stats list-values`. Provenance, not identity: distinct
+    /// from `scheduler` / `kernel_commit` — it records HOW the scheduler
+    /// binary was found, so a reader can tell an auto-built-from-HEAD run
+    /// from a possibly-stale `target/` or `$PATH` binary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolve_source: Option<String>,
     /// True when the underlying [`crate::assert::AssertResult::is_pass`] returned
     /// true at sidecar emission time — a real pass with at least one
     /// observed outcome and no Fail/Inconclusive/Skip. Mutually
@@ -496,6 +511,18 @@ pub struct RowFilter {
     /// [`crate::cache::KernelSource`] — those describe the kernel
     /// build's input, this describes the run-environment provenance.
     pub run_sources: Vec<String>,
+    /// Repeatable scheduler-resolution-source filter, OR-combined: a
+    /// row matches iff its `GauntletRow::resolve_source` equals ANY
+    /// entry. Empty vec disables the filter. A row whose
+    /// `resolve_source` is `None` (sidecar pre-dates the field, or a
+    /// skip resolved no binary) never matches a non-empty filter —
+    /// same opt-in semantic as `run_sources`. Values are the
+    /// [`crate::test_support::ResolveSource::as_str`] tags
+    /// (`"auto_built"`, `"target_debug"`, `"path"`, ...). Distinct from
+    /// `run_sources` (the run ENVIRONMENT): this is HOW the scheduler
+    /// binary was found. Backs the [`Dimension::ResolveSource`] slice
+    /// (`--resolve-source` / `--a-resolve-source` / `--b-resolve-source`).
+    pub resolve_sources: Vec<String>,
     /// Repeatable cpu-budget filter, OR-combined: a row matches iff its
     /// `GauntletRow::cpu_budget` (the effective host-CPU budget, as a
     /// decimal string) equals ANY entry. Empty vec disables the filter.
@@ -609,6 +636,22 @@ impl RowFilter {
                 .run_sources
                 .iter()
                 .any(|want| row_run_source == Some(want.as_str()));
+            if !any {
+                return false;
+            }
+        }
+        if !self.resolve_sources.is_empty() {
+            // OR-combined match against `GauntletRow::resolve_source`,
+            // mirroring the `run_sources` opt-in policy: a row whose
+            // `resolve_source` is `None` (sidecar pre-dates the field,
+            // or a skip resolved no binary) never matches a populated
+            // filter, so a `--resolve-source` argument demands a tagged
+            // row rather than acting as a wildcard.
+            let row_resolve_source = row.resolve_source.as_deref();
+            let any = self
+                .resolve_sources
+                .iter()
+                .any(|want| row_resolve_source == Some(want.as_str()));
             if !any {
                 return false;
             }

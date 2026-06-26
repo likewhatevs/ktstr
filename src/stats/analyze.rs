@@ -603,11 +603,12 @@ pub(crate) fn sorted_run_entries(root: &std::path::Path) -> std::io::Result<Vec<
 /// Pool every sidecar under the runs root (or `dir` when set) and
 /// emit the distinct values present on each filterable dimension.
 ///
-/// Eight dimensions are reported: `kernel` (from
+/// Nine dimensions are reported: `kernel` (from
 /// `SidecarResult::kernel_version`), `scheduler`, `topology`,
 /// `work_type`, `commit` (from `SidecarResult::project_commit`),
 /// `kernel_commit` (from `SidecarResult::kernel_commit`), `source`
-/// (from `SidecarResult::run_source`), and `cpu_budget` (from
+/// (from `SidecarResult::run_source`), `resolve_source` (from
+/// `SidecarResult::resolve_source`), and `cpu_budget` (from
 /// `SidecarResult::cpu_budget`). The dimension catalogue here matches
 /// what `cargo ktstr stats compare` accepts as `--X` and `--a-X` /
 /// `--b-X` filter flags — the command exists so an operator can answer
@@ -622,10 +623,10 @@ pub(crate) fn sorted_run_entries(root: &std::path::Path) -> std::io::Result<Vec<
 /// of only skips renders the `(all runs skipped — no budget recorded)`
 /// sentinel rather than `null` / `unknown`.
 ///
-/// `kernel_version`, `project_commit`, `kernel_commit`, and
-/// `run_source` are `Option<String>` on the source sidecar;
-/// absence is reported as a literal JSON `null` in the JSON
-/// shape and the textual sentinel `unknown` in the table shape.
+/// `kernel_version`, `project_commit`, `kernel_commit`,
+/// `run_source`, and `resolve_source` are `Option<String>` on the
+/// source sidecar; absence is reported as a literal JSON `null` in
+/// the JSON shape and the textual sentinel `unknown` in the table shape.
 /// The set is sorted by the type's natural ordering (`BTreeSet`);
 /// `None` collates before any populated value in `Option<String>`
 /// ordering, so `null` / `unknown` always lands at the top of the
@@ -633,8 +634,9 @@ pub(crate) fn sorted_run_entries(root: &std::path::Path) -> std::io::Result<Vec<
 ///
 /// `json=true` emits a JSON object keyed by dimension name with
 /// arrays of values (with `null` interleaved for absent
-/// `kernel`, `commit`, `kernel_commit`, or `source` entries —
-/// the four optional dimensions); `json=false` emits a
+/// `kernel`, `commit`, `kernel_commit`, `source`, or
+/// `resolve_source` entries — the five optional dimensions);
+/// `json=false` emits a
 /// per-dimension human-readable block with the values one per
 /// line.
 ///
@@ -661,6 +663,7 @@ pub fn list_values(json: bool, dir: Option<&std::path::Path>) -> anyhow::Result<
     let mut project_commits: BTreeSet<Option<String>> = BTreeSet::new();
     let mut kernel_commits: BTreeSet<Option<String>> = BTreeSet::new();
     let mut run_sources: BTreeSet<Option<String>> = BTreeSet::new();
+    let mut resolve_sources: BTreeSet<Option<String>> = BTreeSet::new();
     let mut cpu_budgets: BTreeSet<u32> = BTreeSet::new();
     let mut schedulers: BTreeSet<String> = BTreeSet::new();
     let mut topologies: BTreeSet<String> = BTreeSet::new();
@@ -671,6 +674,7 @@ pub fn list_values(json: bool, dir: Option<&std::path::Path>) -> anyhow::Result<
         project_commits.insert(sc.project_commit.clone());
         kernel_commits.insert(sc.kernel_commit.clone());
         run_sources.insert(sc.run_source.clone());
+        resolve_sources.insert(sc.resolve_source.clone());
         // 0 = skip rows (never booted); exclude — they carry no budget.
         if sc.cpu_budget != 0 {
             cpu_budgets.insert(sc.cpu_budget);
@@ -709,6 +713,13 @@ pub fn list_values(json: bool, dir: Option<&std::path::Path>) -> anyhow::Result<
                 None => serde_json::Value::Null,
             })
             .collect();
+        let resolve_sources_json: Vec<serde_json::Value> = resolve_sources
+            .iter()
+            .map(|opt| match opt {
+                Some(s) => serde_json::Value::String(s.clone()),
+                None => serde_json::Value::Null,
+            })
+            .collect();
         // JSON keys stay as `commit` / `source` — operator-visible
         // wire contract for `cargo ktstr stats list-values --json`
         // does not rename when the internal field/variable does.
@@ -724,6 +735,7 @@ pub fn list_values(json: bool, dir: Option<&std::path::Path>) -> anyhow::Result<
             "commit": project_commits_json,
             "kernel_commit": kernel_commits_json,
             "source": run_sources_json,
+            "resolve_source": resolve_sources_json,
             "cpu_budget": cpu_budgets.iter().collect::<Vec<_>>(),
             "scheduler": schedulers.iter().collect::<Vec<_>>(),
             "topology": topologies.iter().collect::<Vec<_>>(),
@@ -775,6 +787,7 @@ pub fn list_values(json: bool, dir: Option<&std::path::Path>) -> anyhow::Result<
     render_opt_set(&mut out, "commit:", &project_commits);
     render_opt_set(&mut out, "kernel_commit:", &kernel_commits);
     render_opt_set(&mut out, "source:", &run_sources);
+    render_opt_set(&mut out, "resolve_source:", &resolve_sources);
     out.push_str("cpu_budget:\n");
     if cpu_budgets.is_empty() {
         // cpu_budgets excludes budget-0 skip rows, so an empty set on a

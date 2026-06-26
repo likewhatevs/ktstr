@@ -12380,6 +12380,10 @@ impl KtstrVm {
             success: !timed_out && exit_code == 0,
             vcpus: self.vcpus,
             cpu_budget: self.effective_cpu_budget,
+            // Stamped None here; the host eval layer
+            // (run_ktstr_test_inner_impl) sets the scheduler's discovery
+            // path post-run. The VM run does not resolve the binary.
+            resolve_source: None,
             // Default false at construction — set true (when applicable)
             // by the eval-layer inversion site that runs AFTER
             // evaluate_vm_result, preserving the original success +

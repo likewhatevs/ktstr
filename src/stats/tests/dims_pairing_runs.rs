@@ -2,7 +2,7 @@ use super::*;
 
 // -- Dimension / derive_slicing_dims / pairing dims --
 
-/// `Dimension::ALL` lists all eight dims in canonical order.
+/// `Dimension::ALL` lists all nine dims in canonical order.
 /// Order matters for [`PairingKey::from_row`] and for header
 /// rendering — a regression that reordered the slice would
 /// silently shift every dynamic key, splitting previously-
@@ -19,6 +19,7 @@ fn dimension_all_canonical_order() {
             Dimension::ProjectCommit,
             Dimension::KernelCommit,
             Dimension::RunSource,
+            Dimension::ResolveSource,
             Dimension::CpuBudget,
         ],
     );
@@ -39,6 +40,7 @@ fn dimension_pairing_dims_complements_slicing() {
             Dimension::WorkType,
             Dimension::KernelCommit,
             Dimension::RunSource,
+            Dimension::ResolveSource,
             Dimension::CpuBudget,
         ],
     );
@@ -160,6 +162,41 @@ fn derive_slicing_dims_source_only_diff() {
     assert!(
         derive_slicing_dims(&f_c, &f_d).is_empty(),
         "same run_source set in different order/multiplicity must NOT slice",
+    );
+}
+
+/// Resolve-source-only diff: filters that disagree on
+/// `resolve_sources` and agree on every other dimension produce a
+/// slicing-dim set containing exactly `Dimension::ResolveSource`. Pins
+/// the ResolveSource arm of [`derive_slicing_dims`] — mirror of
+/// `derive_slicing_dims_source_only_diff` for the resolve_source dim.
+#[test]
+fn derive_slicing_dims_resolve_source_only_diff() {
+    let f_a = RowFilter {
+        resolve_sources: vec!["auto_built".to_string()],
+        ..RowFilter::default()
+    };
+    let f_b = RowFilter {
+        resolve_sources: vec!["target_debug".to_string()],
+        ..RowFilter::default()
+    };
+    assert_eq!(
+        derive_slicing_dims(&f_a, &f_b),
+        vec![Dimension::ResolveSource],
+        "differing `resolve_sources` must surface ResolveSource as a slicing dim",
+    );
+    // Sorted-deduped set semantics on the ResolveSource arm too.
+    let f_c = RowFilter {
+        resolve_sources: vec!["auto_built".to_string(), "path".to_string()],
+        ..RowFilter::default()
+    };
+    let f_d = RowFilter {
+        resolve_sources: vec!["path".to_string(), "auto_built".to_string(), "path".to_string()],
+        ..RowFilter::default()
+    };
+    assert!(
+        derive_slicing_dims(&f_c, &f_d).is_empty(),
+        "same resolve_source set in different order/multiplicity must NOT slice",
     );
 }
 
@@ -482,6 +519,53 @@ fn pairing_key_from_row_includes_run_source_when_pairing() {
         PairingKey::from_row(&row_local, &slice_dims),
         PairingKey::from_row(&row_ci, &slice_dims),
         "rows differing only on the slicing dim (Source) must \
+             produce equal pairing keys",
+    );
+}
+
+/// `PairingKey::from_row` includes the row's `resolve_source` when
+/// ResolveSource is a pairing dim, and excludes it when it is the
+/// slicing dim. Mirror of
+/// `pairing_key_from_row_includes_run_source_when_pairing` — a
+/// regression substituting `row.run_source` for `row.resolve_source`
+/// in the from_row arm would surface here.
+#[test]
+fn pairing_key_from_row_includes_resolve_source_when_pairing() {
+    let mut row_auto = make_filter_row("scn", "scx_a", "1n1l", "SpinWait", Some("6.14"));
+    row_auto.resolve_source = Some("auto_built".to_string());
+    let mut row_debug = make_filter_row("scn", "scx_a", "1n1l", "SpinWait", Some("6.14"));
+    row_debug.resolve_source = Some("target_debug".to_string());
+    let mut row_none = make_filter_row("scn", "scx_a", "1n1l", "SpinWait", Some("6.14"));
+    row_none.resolve_source = None;
+
+    let pair_dims = &[Dimension::ResolveSource];
+    let key_auto = PairingKey::from_row(&row_auto, pair_dims);
+    let key_debug = PairingKey::from_row(&row_debug, pair_dims);
+    let key_none = PairingKey::from_row(&row_none, pair_dims);
+    assert_eq!(
+        key_auto.0,
+        vec!["scn".to_string(), "auto_built".to_string()],
+        "Some(resolve_source) must occupy the second slot verbatim",
+    );
+    assert_eq!(
+        key_debug.0,
+        vec!["scn".to_string(), "target_debug".to_string()]
+    );
+    assert_eq!(
+        key_none.0,
+        vec!["scn".to_string(), String::new()],
+        "None resolve_source must collapse to an empty slot",
+    );
+    assert_ne!(
+        key_auto, key_debug,
+        "two rows differing on resolve_source must produce distinct \
+             pairing keys when ResolveSource is a pairing dim",
+    );
+    let slice_dims = Dimension::pairing_dims(&[Dimension::ResolveSource]);
+    assert_eq!(
+        PairingKey::from_row(&row_auto, &slice_dims),
+        PairingKey::from_row(&row_debug, &slice_dims),
+        "rows differing only on the slicing dim (ResolveSource) must \
              produce equal pairing keys",
     );
 }
@@ -835,6 +919,39 @@ fn render_side_label_source_arm_renders_filter_value() {
     );
 }
 
+/// `render_side_label` for the ResolveSource arm renders
+/// `filter.resolve_sources` via render_vec_dim. Mirror of
+/// `render_side_label_source_arm_renders_filter_value` — a regression
+/// substituting another field would surface here instead of silently
+/// rendering the bare label even when the filter is populated.
+#[test]
+fn render_side_label_resolve_source_arm_renders_filter_value() {
+    let f_one = RowFilter {
+        resolve_sources: vec!["auto_built".to_string()],
+        ..RowFilter::default()
+    };
+    assert_eq!(
+        render_side_label(&f_one, &[Dimension::ResolveSource], "A"),
+        "auto_built",
+        "single resolve_source value must render verbatim",
+    );
+    let f_two = RowFilter {
+        resolve_sources: vec!["target_debug".to_string(), "auto_built".to_string()],
+        ..RowFilter::default()
+    };
+    assert_eq!(
+        render_side_label(&f_two, &[Dimension::ResolveSource], "A"),
+        "auto_built|target_debug",
+        "≤3 resolve_source values must join sorted with `|`",
+    );
+    let f_empty = RowFilter::default();
+    assert_eq!(
+        render_side_label(&f_empty, &[Dimension::ResolveSource], "B"),
+        "B",
+        "empty resolve_sources Vec must fall back to the bare letter",
+    );
+}
+
 /// `zero_match_diagnostic` flags a `--run-source` value that is
 /// not present in the pool, naming the unknown value AND the
 /// distinct values actually seen. Guards against the
@@ -867,6 +984,76 @@ fn zero_match_diagnostic_unknown_run_source_lists_present_values() {
     assert!(
         msg.contains("case-sensitive"),
         "must mention case sensitivity (`ci` ≠ `CI`); got:\n{msg}",
+    );
+}
+
+/// resolve_source equivalent of
+/// `zero_match_diagnostic_unknown_run_source_lists_present_values`:
+/// a `--resolve-source` typo names the unknown value + lists the
+/// discovery-path tags actually present.
+#[test]
+fn zero_match_diagnostic_unknown_resolve_source_lists_present_values() {
+    let mut row_auto = make_row("scn", "1n1l1c1t", true, 1.0);
+    row_auto.resolve_source = Some("auto_built".to_string());
+    let mut row_debug = make_row("scn", "1n1l1c1t", true, 1.0);
+    row_debug.resolve_source = Some("target_debug".to_string());
+    let rows = vec![row_auto, row_debug];
+    let filter = RowFilter {
+        resolve_sources: vec!["auto_bui".to_string()],
+        ..Default::default()
+    };
+    let msg = zero_match_diagnostic("A", &filter, &rows, rows.len());
+    assert!(
+        msg.contains("--resolve-source `auto_bui` not found"),
+        "must name the unknown value verbatim; got:\n{msg}",
+    );
+    assert!(
+        msg.contains("`auto_built`") && msg.contains("`target_debug`"),
+        "must list distinct resolve_source tags present in the pool; got:\n{msg}",
+    );
+    assert!(
+        msg.contains("case-sensitive"),
+        "must mention case sensitivity; got:\n{msg}",
+    );
+}
+
+/// resolve_source equivalent of the empty-pool absence-explainer:
+/// when every row has `resolve_source: None`, the hint surfaces the
+/// "(none — every row has `resolve_source: null`)" form.
+#[test]
+fn zero_match_diagnostic_unknown_resolve_source_with_empty_pool_explains_absence() {
+    let row = make_row("scn", "1n1l1c1t", true, 1.0);
+    let rows = vec![row];
+    let filter = RowFilter {
+        resolve_sources: vec!["auto_built".to_string()],
+        ..Default::default()
+    };
+    let msg = zero_match_diagnostic("A", &filter, &rows, rows.len());
+    assert!(
+        msg.contains("--resolve-source `auto_built` not found"),
+        "must name the unknown value; got:\n{msg}",
+    );
+    assert!(
+        msg.contains("none — every row has `resolve_source: null`"),
+        "must explain the empty-distinct-values case; got:\n{msg}",
+    );
+}
+
+/// A `--resolve-source` value that DOES match a row must NOT fire the
+/// unknown hint. Mirror of the known_run_source variant.
+#[test]
+fn zero_match_diagnostic_known_resolve_source_does_not_fire_unknown_hint() {
+    let mut row = make_row("scn", "1n1l1c1t", true, 1.0);
+    row.resolve_source = Some("auto_built".to_string());
+    let rows = vec![row];
+    let filter = RowFilter {
+        resolve_sources: vec!["auto_built".to_string()],
+        ..Default::default()
+    };
+    let msg = zero_match_diagnostic("A", &filter, &rows, rows.len());
+    assert!(
+        !msg.contains("--resolve-source `auto_built` not found"),
+        "a present resolve_source must not fire the unknown hint; got:\n{msg}",
     );
 }
 
