@@ -1685,7 +1685,7 @@ pub(crate) fn maybe_dispatch_vm_test_with_args(args: &[String]) -> Option<i32> {
         crate::vmm::guest_comms::send_scenario_start();
     }
 
-    let result = match (entry.func)(&ctx) {
+    let mut result = match (entry.func)(&ctx) {
         Ok(r) => r,
         Err(e) => {
             let r = AssertResult::fail_msg(format!("{e:#}"));
@@ -1693,6 +1693,10 @@ pub(crate) fn maybe_dispatch_vm_test_with_args(args: &[String]) -> Option<i32> {
             return Some(1);
         }
     };
+    // survives_storm: re-check scheduler liveness here so a non-execute_*
+    // scenario that hand-rolls Op dispatch (running no in-hold liveness probe)
+    // still fails if the scheduler died during the run.
+    enforce_survives_storm_liveness(&mut result, entry.survives_storm);
 
     let exit_code = exit_code_for_result(&result);
     publish_result_and_collect(&result, probe_stop, probe_handle);
@@ -2211,7 +2215,7 @@ pub(crate) fn maybe_dispatch_vm_test_with_phase_a(
     if crate::vmm::guest_comms::is_guest() {
         crate::vmm::guest_comms::send_scenario_start();
     }
-    let result = match (entry.func)(&ctx) {
+    let mut result = match (entry.func)(&ctx) {
         Ok(r) => r,
         Err(e) => {
             let r = AssertResult::fail_msg(format!("{e:#}"));
@@ -2219,6 +2223,10 @@ pub(crate) fn maybe_dispatch_vm_test_with_phase_a(
             return Some(1);
         }
     };
+    // survives_storm: re-check scheduler liveness here so a non-execute_*
+    // scenario that hand-rolls Op dispatch (running no in-hold liveness probe)
+    // still fails if the scheduler died during the run.
+    enforce_survives_storm_liveness(&mut result, entry.survives_storm);
 
     let exit_code = exit_code_for_result(&result);
     publish_result_and_collect(&result, stop, Some(handle));
@@ -2574,6 +2582,43 @@ fn exit_code_for_result(result: &AssertResult) -> i32 {
         2
     } else {
         1
+    }
+}
+
+/// When `survives_storm` is asserted, actively re-check scheduler liveness at
+/// the guest-side test-function choke point and fold a scheduler-death fail into
+/// `result` if the scheduler died/went down and `result` does not already carry
+/// one. Closes the vacuous-pass hole for `survives_storm` scenarios whose test
+/// function hand-rolls `Op` dispatch without an `execute_*` driver: those run no
+/// in-hold liveness probe, so a scheduler that died mid-test would otherwise
+/// leave a passing `AssertResult` and the host's `survives_storm` marker (which
+/// keys on a `Scheduler*` detail) would never attach. For `execute_*` scenarios
+/// the in-hold probe already recorded the death, so the already-present guard
+/// makes this a no-op (no double-record). Folding the fail makes
+/// `result.is_pass()` false, which drops the dispatch exit code to 1 and lets
+/// the host eval attach the `SurvivesStormViolated` marker.
+fn enforce_survives_storm_liveness(result: &mut AssertResult, survives_storm: bool) {
+    use crate::assert::DetailKind;
+    if !survives_storm {
+        return;
+    }
+    // An execute_* in-hold probe already attributed the death — don't double-record.
+    let already_recorded = result.failure_details().any(|d| {
+        matches!(
+            d.kind,
+            DetailKind::SchedulerCrashed
+                | DetailKind::SchedulerExitedCleanly
+                | DetailKind::SchedulerDiedUnknownReason
+        )
+    });
+    if already_recorded {
+        return;
+    }
+    if let Some(kind) = crate::scenario::ops::sched_liveness_failure_kind() {
+        result.record_fail(crate::assert::AssertDetail::new(
+            kind,
+            crate::assert::format_sched_died_survives_storm(),
+        ));
     }
 }
 

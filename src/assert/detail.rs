@@ -199,6 +199,22 @@ pub(crate) fn format_sched_died_during_workload(elapsed_s: f64) -> String {
     format!("{SCHED_DIED_PREFIX} unexpectedly during workload ({elapsed_s:.1}s into test)")
 }
 
+/// Format the scheduler-died message for the guest-side `survives_storm`
+/// post-function liveness probe: the test asserted the scheduler survives, but
+/// after the test function returned it was found dead or down (the leader pid
+/// ESRCH'd, or the scx state went `disabling`/`disabled`) while still expected
+/// to run. Fires for scenarios that do NOT drive an `execute_*` in-hold probe
+/// (which records its own scheduler-death detail via the `format_sched_died_*`
+/// helpers above). Begins with [`SCHED_DIED_PREFIX`] verbatim; structural
+/// routing is via one of [`DetailKind::SchedulerCrashed`] /
+/// [`DetailKind::SchedulerExitedCleanly`] /
+/// [`DetailKind::SchedulerDiedUnknownReason`] on the emitted detail.
+pub(crate) fn format_sched_died_survives_storm() -> String {
+    format!(
+        "{SCHED_DIED_PREFIX} during a survives_storm workload (detected after the test function returned)"
+    )
+}
+
 /// A single diagnostic message from an assertion, paired with a
 /// structural [`DetailKind`] so filtering is robust to wording changes.
 ///

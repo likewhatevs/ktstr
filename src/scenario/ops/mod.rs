@@ -76,6 +76,11 @@ use dispatch::{
     wait_for_worker_state_not_trying_or_bail, write_entries_from_writes,
 };
 use dispatch::{apply_ops, render_cgroup_key};
+// Re-export the scx-state test seam so the guest-side survives_storm probe's
+// host unit test (`test_support::probe_tests`) can drive scheduler liveness on
+// the host without a VM. `dispatch` is otherwise private to `ops`.
+#[cfg(test)]
+pub(crate) use dispatch::{ScxState, set_test_scx_state};
 
 use std::collections::BTreeSet;
 use std::thread;
@@ -538,6 +543,28 @@ fn sched_died_detail_kind() -> crate::assert::DetailKind {
         SchedExitKind::Crashed => DetailKind::SchedulerCrashed,
         SchedExitKind::Clean => DetailKind::SchedulerExitedCleanly,
         SchedExitKind::Unknown => DetailKind::SchedulerDiedUnknownReason,
+    }
+}
+
+/// Classify scheduler liveness for the guest-side `survives_storm` probe:
+/// `Some(kind)` when a scheduler is still expected to run (`sched_pid` set) but
+/// has died or gone down — the leader pid ESRCH'd OR the scx state reads
+/// `disabling`/`disabled` ([`dispatch::scx_down`]) — and `None` otherwise.
+///
+/// Mirrors the inter-step / post-loop liveness gate `run_scenario` runs for
+/// `execute_*` scenarios (`!process_alive(pid) || dispatch::scx_down()`, gated
+/// on `sched_pid()` being set), so a clean `Op::DetachScheduler` — which clears
+/// the pid before this would observe `disabled` — does not trip it. The kind
+/// comes from [`sched_died_detail_kind`]; in the primary test VM the BPF
+/// err-exit latch is unread, so the kind is
+/// [`crate::assert::DetailKind::SchedulerDiedUnknownReason`] (the scx state is
+/// kind-less — a crash and a clean unregister both read `disabling`/`disabled`).
+pub(crate) fn sched_liveness_failure_kind() -> Option<crate::assert::DetailKind> {
+    let pid = crate::vmm::rust_init::sched_pid()?;
+    if !process_alive(pid) || dispatch::scx_down() {
+        Some(sched_died_detail_kind())
+    } else {
+        None
     }
 }
 

@@ -111,6 +111,155 @@ fn exit_code_for_result_pass_inconc_fail_skip_lattice() {
     assert_eq!(exit_code_for_result(&inc_plus_pass), 2);
 }
 
+/// Process-wide serialization lock for tests that mutate the global
+/// scheduler-liveness signals — `SCHED_PID`
+/// ([`set_sched_pid`](crate::vmm::rust_init::set_sched_pid)) and the
+/// `TEST_SCX_STATE` scx-state override. Mirrors [`DEFERRED_PROBE_TEST_LOCK`]:
+/// tests run in parallel within one process, so a test that flips these
+/// globals holds this lock and resets them on the way out so a peer test
+/// never observes a poisoned signal.
+static SCHED_LIVENESS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// RAII reset for the scheduler-liveness globals: restores `SCHED_PID` to the
+/// unset sentinel and clears the scx-state override on drop, even if the test
+/// panics mid-way.
+struct SchedLivenessGuard;
+impl Drop for SchedLivenessGuard {
+    fn drop(&mut self) {
+        crate::vmm::rust_init::set_sched_pid(0);
+        crate::scenario::ops::set_test_scx_state(None);
+    }
+}
+
+/// `enforce_survives_storm_liveness` is the guest-side post-function probe that
+/// closes the `survives_storm` vacuous-pass hole for scenarios which hand-roll
+/// `Op` dispatch without an `execute_*` driver (so no in-hold liveness probe
+/// runs). Host-runnable — it drives the `TEST_SCX_STATE` override plus a
+/// synthetic `SCHED_PID`, so CI without `/dev/kvm` actively proves the fold
+/// logic rather than relying on the VM e2e (which SKIPs there; see the
+/// "skipping e2e masks bugs" lesson).
+///
+/// Pins both levers of the helper's `!process_alive(pid) || scx_down()` OR and
+/// the pid-unset short-circuit. Cases 1-4 hold our own (live, signalable) pid
+/// so `process_alive` reads true and the scx-state override is the sole lever;
+/// case 5 clears the pid (the short-circuit); case 6 uses a nonexistent pid to
+/// isolate the `!process_alive` lever while scx reads `enabled`:
+/// 1. `survives_storm` off → never folds, even with the scheduler down.
+/// 2. scheduler healthy (scx `enabled`, pid alive) → no fold; stays a pass.
+/// 3. scheduler down (scx `disabling`, pid alive) → folds exactly one
+///    `Scheduler*` fail, flipping `is_pass()` to false — the hole this closes.
+/// 4. a result already carrying a `Scheduler*` detail (the `execute_*` in-hold
+///    probe path) → the guard skips, so no double-record.
+/// 5. no scheduler expected (`sched_pid` unset, e.g. a clean detach) → no fold
+///    even when scx reads down.
+/// 6. scheduler process gone (a nonexistent pid) while scx still reads
+///    `enabled` → folds via the `!process_alive` lever alone.
+#[test]
+fn enforce_survives_storm_liveness_folds_only_on_unattributed_death() {
+    use crate::assert::{AssertDetail, AssertResult, DetailKind};
+    use crate::scenario::ops::{ScxState, set_test_scx_state};
+    use crate::vmm::rust_init::set_sched_pid;
+
+    let _lock = SCHED_LIVENESS_TEST_LOCK.lock().unwrap();
+    let _reset = SchedLivenessGuard;
+
+    let self_pid = std::process::id() as libc::pid_t;
+    let scheduler_fail_count = |r: &AssertResult| {
+        r.failure_details()
+            .filter(|d| {
+                matches!(
+                    d.kind,
+                    DetailKind::SchedulerCrashed
+                        | DetailKind::SchedulerExitedCleanly
+                        | DetailKind::SchedulerDiedUnknownReason
+                )
+            })
+            .count()
+    };
+
+    // (1) survives_storm off → never folds, even with the scheduler down.
+    set_sched_pid(self_pid);
+    set_test_scx_state(Some(ScxState::Disabling));
+    let mut r = AssertResult::pass();
+    enforce_survives_storm_liveness(&mut r, false);
+    assert!(r.is_pass(), "survives_storm off must not fold a fail");
+    assert_eq!(scheduler_fail_count(&r), 0);
+
+    // (2) scheduler healthy (enabled, pid alive) → no fold.
+    set_test_scx_state(Some(ScxState::Enabled));
+    let mut r = AssertResult::pass();
+    enforce_survives_storm_liveness(&mut r, true);
+    assert!(r.is_pass(), "a surviving scheduler must stay a pass");
+    assert_eq!(scheduler_fail_count(&r), 0);
+
+    // (3) scheduler down (disabling) with a live pid → folds exactly one
+    //     Scheduler* fail onto an otherwise-passing result. The exact variant
+    //     is left to sched_died_detail_kind (a separate global the BPF latch
+    //     drives); this pins only that a death was recorded.
+    set_test_scx_state(Some(ScxState::Disabling));
+    let mut r = AssertResult::pass();
+    enforce_survives_storm_liveness(&mut r, true);
+    assert!(
+        !r.is_pass(),
+        "a downed scheduler must fail the survives_storm run"
+    );
+    assert_eq!(
+        scheduler_fail_count(&r),
+        1,
+        "exactly one Scheduler* fail folded onto the passing result"
+    );
+
+    // (4) a result already carrying a Scheduler* detail (an execute_* in-hold
+    //     probe recorded it) → guard skips, no double-record.
+    set_test_scx_state(Some(ScxState::Disabled));
+    let mut r = AssertResult::pass();
+    r.record_fail(AssertDetail::new(
+        DetailKind::SchedulerCrashed,
+        "recorded by the execute_* in-hold probe",
+    ));
+    enforce_survives_storm_liveness(&mut r, true);
+    assert_eq!(
+        scheduler_fail_count(&r),
+        1,
+        "must not double-record when a Scheduler* detail is already present"
+    );
+    assert!(
+        r.failure_details()
+            .any(|d| d.kind == DetailKind::SchedulerCrashed),
+        "the pre-existing crash detail is preserved"
+    );
+
+    // (5) no scheduler expected (sched_pid unset, e.g. a clean detach) → no
+    //     fold even when scx reads down.
+    set_sched_pid(0);
+    set_test_scx_state(Some(ScxState::Disabled));
+    let mut r = AssertResult::pass();
+    enforce_survives_storm_liveness(&mut r, true);
+    assert!(
+        r.is_pass(),
+        "an unset sched_pid (clean detach) must not trip the probe"
+    );
+    assert_eq!(scheduler_fail_count(&r), 0);
+
+    // (6) scheduler process gone (pid set to a nonexistent pid) while scx still
+    //     reads enabled → folds via the `!process_alive` lever ALONE, the OR's
+    //     other branch (cases 1-5 only exercise scx_down). pid_t::MAX is
+    //     reliably unused (mirrors scenario::tests::process_alive_nonexistent_pid).
+    set_sched_pid(libc::pid_t::MAX);
+    set_test_scx_state(Some(ScxState::Enabled));
+    let mut r = AssertResult::pass();
+    enforce_survives_storm_liveness(&mut r, true);
+    assert!(
+        !r.is_pass(),
+        "a dead scheduler process must fail even when scx still reads enabled"
+    );
+    assert_eq!(
+        scheduler_fail_count(&r),
+        1,
+        "the !process_alive lever alone must fold exactly one Scheduler* fail"
+    );
+}
+
 #[test]
 fn extract_probe_output_enriched_fields() {
     use crate::probe::process::ProbeEvent;

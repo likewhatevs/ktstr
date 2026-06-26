@@ -1357,13 +1357,15 @@ pub struct KtstrTestEntry {
     /// records a `DetailKind::Scheduler*` fail via the scenario liveness
     /// probe (`crate::scenario::ops` `build_sched_died_*`), which already
     /// fails the run through the failure→Err→EXIT_FAIL path. Setting this
-    /// flag makes the intent explicit in source, attaches a survival-
-    /// specific failure explainer that names the asserted intent, and is
-    /// enforced for every scenario driven through
-    /// `execute_defs`/`execute_steps`/`execute_scenario` (the entry points
-    /// that run the liveness probe — the storm/churn use case). A raw
-    /// scenario that hand-rolls `Op` dispatch without one of those runs no
-    /// probe, so survival is not actively re-checked there.
+    /// flag makes the intent explicit in source and attaches a survival-
+    /// specific failure explainer that names the asserted intent. It is
+    /// enforced for EVERY scenario: those driven through
+    /// `execute_defs`/`execute_steps`/`execute_scenario` re-check liveness
+    /// between steps and inside every hold, and a guest-side post-function
+    /// probe (`enforce_survives_storm_liveness`) re-checks once more after the
+    /// test function returns — so even a scenario that hand-rolls `Op`
+    /// dispatch without an `execute_*` driver actively fails if the scheduler
+    /// died or went down (scx state `disabling`/`disabled`) during the run.
     ///
     /// Mutually exclusive with both [`Self::expect_err`] (one demands
     /// failure, the other survival) and [`Self::expect_auto_repro`] (both
