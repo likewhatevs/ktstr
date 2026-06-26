@@ -2198,6 +2198,7 @@ mod tests {
             topology: "1n1l1c1t".to_string(),
             scheduler: "eevdf".to_string(),
             scheduler_commit: None,
+            resolve_source: None,
             project_commit: None,
             payload: None,
             metrics: Vec::new(),
