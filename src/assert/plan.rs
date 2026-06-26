@@ -395,14 +395,30 @@ impl AssertResult {
                 // drop, so the render distinguishes "stripped for size" from a
                 // carrier that genuinely measured nothing (already-empty vecs
                 // stay not-stripped).
+                // schbench per-phase histograms (wakeup + request, ~19 KiB each)
+                // also multiply by carrier count, so a many-carrier overflow
+                // with schbench carriers present must drop them too (a
+                // worker_count>1 schbench cgroup can emit several). Dropping
+                // schbench loses only the per-phase schbench percentiles (the
+                // derivation finds None → emits no key → the claim reads the
+                // metric as ABSENT, a loud degradation), never the verdict.
+                let schbench_samples = pc
+                    .schbench
+                    .as_ref()
+                    .map(|s| s.wakeup.sample_count() + s.request.sample_count())
+                    .unwrap_or(0);
                 let had_samples = !pc.wake_latencies_ns.is_empty()
                     || !pc.run_delays_ns.is_empty()
-                    || !pc.off_cpu_pcts.is_empty();
-                dropped +=
-                    pc.wake_latencies_ns.len() + pc.run_delays_ns.len() + pc.off_cpu_pcts.len();
+                    || !pc.off_cpu_pcts.is_empty()
+                    || schbench_samples > 0;
+                dropped += pc.wake_latencies_ns.len()
+                    + pc.run_delays_ns.len()
+                    + pc.off_cpu_pcts.len()
+                    + schbench_samples as usize;
                 pc.wake_latencies_ns = Vec::new();
                 pc.run_delays_ns = Vec::new();
                 pc.off_cpu_pcts = Vec::new();
+                pc.schbench = None;
                 if had_samples {
                     pc.stripped = true;
                 }

@@ -364,6 +364,9 @@ pub(crate) fn phase_cgroup_stats(
         max_gap_cpu,
         // Fresh carrier built from worker reports — never stripped.
         stripped: false,
+        // schbench rides PhaseSlice (the backdrop per-phase carrier), not the
+        // whole-run WorkerReports this fn pools, so it is always None here.
+        schbench: None,
     }
 }
 
@@ -415,6 +418,9 @@ pub(crate) fn phase_slice_to_cgroup_stats(
         max_gap_ms: slice.max_gap_ms,
         max_gap_cpu: slice.max_gap_cpu,
         stripped: false,
+        // Carry the per-phase schbench engine metrics through (None for every
+        // non-schbench backdrop slice); PhaseCgroupStats::merge pools them.
+        schbench: slice.schbench.clone(),
     }
 }
 
@@ -450,6 +456,7 @@ pub(crate) fn pool_phase_slice_stats(
             max_gap_ms: 0,
             max_gap_cpu: 0,
             stripped: false,
+            schbench: None,
         },
     }
 }

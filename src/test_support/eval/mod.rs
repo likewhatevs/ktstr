@@ -1993,6 +1993,12 @@ fn populate_run_stats_and_folded_timeline(
     // per-cgroup carrier fold + cgroup merges, BEFORE the sidecar write — so
     // these ext_metrics keys are the sole source for the |_| None accessors.
     crate::assert::populate_run_distribution_metrics(&mut check_result.stats);
+    // schbench per-phase scalars: derive into each phase bucket from the folded
+    // per_cgroup schbench carriers (post-fold, so the merge's is_derived skip
+    // can't drop them). A no-op for non-schbench runs. Mirrors the
+    // VmResult::phase_buckets derive so the sidecar / timeline render and the
+    // per-phase A/B claim agree.
+    crate::assert::derive_schbench_phase_metrics(&mut check_result.stats.phases);
 
     // POST-fold timeline for this (guest-AssertResult) path: rebuild from
     // the folded `check_result.stats.phases` so the per-cgroup sub-block

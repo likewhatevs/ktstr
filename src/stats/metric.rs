@@ -284,6 +284,23 @@ pub enum MetricKind {
     /// the deleted typed cross-RUN fold summed every passing run's raw ratio
     /// over `passes_observed`, folding noisy low-N runs in as real values).
     WakeLatencyTailRatio,
+    /// Per-phase-only scalar derived ONCE per phase from a phase-scoped
+    /// carrier, NOT from monitor samples and NOT re-pooled run-level. The sole
+    /// producer is the schbench per-phase derivation
+    /// (`crate::assert::derive_schbench_phase_metrics`): it pools each phase's
+    /// `crate::assert::PhaseCgroupStats` schbench carriers, re-derives a
+    /// percentile (from the merged latency histogram), a sample-weighted mean
+    /// (run-delay), or a count (loop_count), and writes the value DIRECTLY into
+    /// the phase's `crate::assert::PhaseBucket::metrics` for a per-phase A/B
+    /// claim to read via `phase_metric`. It is [`MetricKind::is_derived`] (so
+    /// the within-run reducers — [`aggregate_samples_for_phase`] and the
+    /// phase-bucket merge loop — skip it) and has NO run-level producer; it is
+    /// ADDITIONALLY gated out of the cross-RUN ext fold (`fold_ext_metrics`),
+    /// since a per-phase percentile has no meaningful cross-run aggregate. A
+    /// unit marker (no payload): the schbench derivation owns the
+    /// metric-name→computation mapping, so the kind need not carry a percentile
+    /// selector (which would leak `plat::Pct` through this public enum).
+    PerPhase,
 }
 
 /// Sub-classification for [`MetricKind::Gauge`] picking the
@@ -470,6 +487,11 @@ impl MetricKind {
             // skips and re-derives it — classification-only, like the other
             // derived kinds.
             MetricKind::WakeLatencyTailRatio => MergeKind::Recompute,
+            // PerPhase is derived directly into PhaseBucket.metrics post-merge
+            // by the schbench derivation; the per-phase merge loop skips it
+            // (is_derived) and never re-derives via a kind — classification-only,
+            // like the other derived kinds.
+            MetricKind::PerPhase => MergeKind::Recompute,
         }
     }
 
@@ -489,13 +511,16 @@ impl MetricKind {
     /// key then re-derive.
     ///
     /// NOT a uniform cross-RUN skip: at the cross-RUN ext fold
-    /// ([`group_and_average_by`]) ONLY [`MetricKind::Rate`] is skipped —
-    /// its components survive cross-RUN so it re-derives there — while
+    /// ([`group_and_average_by`]) [`MetricKind::Rate`] AND
+    /// [`MetricKind::PerPhase`] are skipped — Rate's components survive
+    /// cross-RUN so it re-derives there, and PerPhase is a per-phase-only
+    /// scalar with no meaningful cross-RUN aggregate (its skip also keeps
+    /// [`aggregate_finite`]'s `PerPhase => unreachable!` unreachable) — while
     /// Distribution / WorstLowest / WakeLatencyTailRatio, whose components do
     /// NOT survive cross-RUN, fall through to be plainly folded (MEAN, or MAX for
     /// [`SampleReduction::Worst`]) by [`aggregate_finite`]. So callers
     /// gate on `is_derived` for the within-run sites and on
-    /// `matches!(.., Rate { .. })` for the cross-RUN ext fold.
+    /// `matches!(.., Rate { .. } | PerPhase)` for the cross-RUN ext fold.
     pub fn is_derived(self) -> bool {
         matches!(
             self,
@@ -503,6 +528,7 @@ impl MetricKind {
                 | MetricKind::Distribution { .. }
                 | MetricKind::WorstLowest { .. }
                 | MetricKind::WakeLatencyTailRatio
+                | MetricKind::PerPhase
         )
     }
 }
@@ -697,6 +723,15 @@ fn aggregate_finite(
         // `derive_rate_metrics`. So reaching here is a routing bug.
         MetricKind::Rate { .. } => unreachable!(
             "MetricKind::Rate must be derived via derive_rate_metrics, \
+             not reduced from a sample slice"
+        ),
+        // PerPhase is derived directly into PhaseBucket.metrics by the schbench
+        // per-phase pass and is gated out of the cross-RUN ext fold
+        // (fold_ext_metrics) + the within-run reducers (is_derived), so it never
+        // reaches a sample-slice reduction. Reaching here is a routing bug (the
+        // gate or is_derived was bypassed).
+        MetricKind::PerPhase => unreachable!(
+            "MetricKind::PerPhase is derived into PhaseBucket.metrics, \
              not reduced from a sample slice"
         ),
     })
@@ -1100,6 +1135,25 @@ impl MetricDef {
 /// [`GauntletRow::spread`] field (adds the
 /// [`ScenarioStats::worst_spread`](crate::assert::ScenarioStats::worst_spread)
 /// upstream source as a fourth name).
+/// Registry names for the schbench per-phase metrics ([`MetricKind::PerPhase`]).
+/// Shared by the [`METRICS`] entries below and the schbench per-phase derivation
+/// (`crate::assert::derive_schbench_phase_metrics`) so the registered name and
+/// the key the derivation writes into `crate::assert::PhaseBucket::metrics` are
+/// one source of truth. Latency keys are µs (the unit `plat` buckets in);
+/// sched-delay keys are µs (converted from ns at derivation); loop_count is a
+/// bare count.
+pub(crate) const SCHBENCH_WAKEUP_P50_US: &str = "wakeup_p50_latency_us";
+pub(crate) const SCHBENCH_WAKEUP_P90_US: &str = "wakeup_p90_latency_us";
+pub(crate) const SCHBENCH_WAKEUP_P99_US: &str = "wakeup_p99_latency_us";
+pub(crate) const SCHBENCH_WAKEUP_P999_US: &str = "wakeup_p999_latency_us";
+pub(crate) const SCHBENCH_REQUEST_P50_US: &str = "request_p50_latency_us";
+pub(crate) const SCHBENCH_REQUEST_P90_US: &str = "request_p90_latency_us";
+pub(crate) const SCHBENCH_REQUEST_P99_US: &str = "request_p99_latency_us";
+pub(crate) const SCHBENCH_REQUEST_P999_US: &str = "request_p999_latency_us";
+pub(crate) const SCHBENCH_SCHED_DELAY_MSG_US: &str = "sched_delay_msg_us";
+pub(crate) const SCHBENCH_SCHED_DELAY_WORKER_US: &str = "sched_delay_worker_us";
+pub(crate) const SCHBENCH_LOOP_COUNT: &str = "schbench_loop_count";
+
 pub static METRICS: &[MetricDef] = &[
     MetricDef {
         // `"worst_spread"` is the wire/surface name — emitted in
@@ -1676,6 +1730,114 @@ pub static METRICS: &[MetricDef] = &[
         default_rel: 0.20,
         display_unit: "",
         accessor: |r| Some(r.cross_node_migration_ratio),
+    },
+    // -- schbench per-phase metrics (MetricKind::PerPhase) --
+    // Derived ONCE per phase by `crate::assert::derive_schbench_phase_metrics`
+    // from the phase's pooled schbench histograms / run-delay raw pairs, written
+    // directly into `PhaseBucket::metrics`. is_derived (skipped by the within-run
+    // reducers + the phase-bucket merge) with no run-level producer; a per-phase
+    // A/B claim reads them via `phase_metric`. `accessor: |_| None` — they never
+    // live on a `GauntletRow`. Latency p50/p90 mirror worst_median_wake_latency_us
+    // (abs 20), p99/p999 + sched-delay mirror worst_p99/mean (abs 50); all rel 0.25.
+    MetricDef {
+        name: SCHBENCH_WAKEUP_P50_US,
+        polarity: crate::test_support::Polarity::LowerBetter,
+        kind: MetricKind::PerPhase,
+        default_abs: 20.0,
+        default_rel: 0.25,
+        display_unit: "\u{00b5}s",
+        accessor: |_| None,
+    },
+    MetricDef {
+        name: SCHBENCH_WAKEUP_P90_US,
+        polarity: crate::test_support::Polarity::LowerBetter,
+        kind: MetricKind::PerPhase,
+        default_abs: 20.0,
+        default_rel: 0.25,
+        display_unit: "\u{00b5}s",
+        accessor: |_| None,
+    },
+    MetricDef {
+        name: SCHBENCH_WAKEUP_P99_US,
+        polarity: crate::test_support::Polarity::LowerBetter,
+        kind: MetricKind::PerPhase,
+        default_abs: 50.0,
+        default_rel: 0.25,
+        display_unit: "\u{00b5}s",
+        accessor: |_| None,
+    },
+    MetricDef {
+        name: SCHBENCH_WAKEUP_P999_US,
+        polarity: crate::test_support::Polarity::LowerBetter,
+        kind: MetricKind::PerPhase,
+        default_abs: 50.0,
+        default_rel: 0.25,
+        display_unit: "\u{00b5}s",
+        accessor: |_| None,
+    },
+    MetricDef {
+        name: SCHBENCH_REQUEST_P50_US,
+        polarity: crate::test_support::Polarity::LowerBetter,
+        kind: MetricKind::PerPhase,
+        default_abs: 20.0,
+        default_rel: 0.25,
+        display_unit: "\u{00b5}s",
+        accessor: |_| None,
+    },
+    MetricDef {
+        name: SCHBENCH_REQUEST_P90_US,
+        polarity: crate::test_support::Polarity::LowerBetter,
+        kind: MetricKind::PerPhase,
+        default_abs: 20.0,
+        default_rel: 0.25,
+        display_unit: "\u{00b5}s",
+        accessor: |_| None,
+    },
+    MetricDef {
+        name: SCHBENCH_REQUEST_P99_US,
+        polarity: crate::test_support::Polarity::LowerBetter,
+        kind: MetricKind::PerPhase,
+        default_abs: 50.0,
+        default_rel: 0.25,
+        display_unit: "\u{00b5}s",
+        accessor: |_| None,
+    },
+    MetricDef {
+        name: SCHBENCH_REQUEST_P999_US,
+        polarity: crate::test_support::Polarity::LowerBetter,
+        kind: MetricKind::PerPhase,
+        default_abs: 50.0,
+        default_rel: 0.25,
+        display_unit: "\u{00b5}s",
+        accessor: |_| None,
+    },
+    MetricDef {
+        name: SCHBENCH_SCHED_DELAY_MSG_US,
+        polarity: crate::test_support::Polarity::LowerBetter,
+        kind: MetricKind::PerPhase,
+        default_abs: 50.0,
+        default_rel: 0.25,
+        display_unit: "\u{00b5}s",
+        accessor: |_| None,
+    },
+    MetricDef {
+        name: SCHBENCH_SCHED_DELAY_WORKER_US,
+        polarity: crate::test_support::Polarity::LowerBetter,
+        kind: MetricKind::PerPhase,
+        default_abs: 50.0,
+        default_rel: 0.25,
+        display_unit: "\u{00b5}s",
+        accessor: |_| None,
+    },
+    MetricDef {
+        // Completed work cycles in the phase — more is better (throughput).
+        name: SCHBENCH_LOOP_COUNT,
+        polarity: crate::test_support::Polarity::HigherBetter,
+        kind: MetricKind::PerPhase,
+        default_abs: 10.0,
+        default_rel: 0.30,
+        display_unit: "",
+        accessor: |_| None,
     },
 ];
 

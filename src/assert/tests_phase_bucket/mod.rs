@@ -68,6 +68,7 @@ mod display;
 mod phase_guard_a;
 mod phase_guard_b;
 mod repool;
+mod schbench;
 mod serde_tests;
 mod step_local;
 mod weighted;

@@ -770,12 +770,19 @@ impl VmResult {
             &self.periodic_series(),
             &self.stimulus_timeline(),
         );
-        match self.guest_assert_result() {
+        let mut buckets = match self.guest_assert_result() {
             Ok(guest) => {
                 crate::assert::fold_guest_per_cgroup_into_host_buckets(host, guest.stats.phases)
             }
             Err(_) => host,
-        }
+        };
+        // Derive the schbench per-phase scalars into the now-final (post-fold)
+        // buckets so a per-phase A/B claim reads them via phase_metric. A no-op
+        // for non-schbench runs (no schbench carrier in any per_cgroup); must
+        // run post-fold (the merge skips is_derived keys, so an earlier derive
+        // would be dropped).
+        crate::assert::derive_schbench_phase_metrics(&mut buckets);
+        buckets
     }
 
     /// One phase's per-cgroup telemetry for `cgroup` — the per-phase analog

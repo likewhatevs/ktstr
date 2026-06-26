@@ -1429,6 +1429,93 @@ fn phase_buckets_equals_stats_phases_with_guest_per_cgroup_carriers() {
     );
 }
 
+/// Production-hook pin: `VmResult::phase_buckets()` — the method a per-phase A/B
+/// claim reads via `phase_metric` — must DERIVE the schbench per-phase scalars
+/// into `PhaseBucket.metrics`. A guest carrier with a `SchbenchPhaseStats` at
+/// step_index=1 must surface e.g. `wakeup_p99_latency_us` in that bucket's
+/// metrics. Guards the WIRING (a refactor that dropped the
+/// `derive_schbench_phase_metrics` call at the `phase_buckets()` site would keep
+/// every direct-derive unit test green while production silently stopped
+/// emitting the metrics — the mirror-tests-pin-nothing class). Also exercises
+/// the schbench carrier's postcard roundtrip guest→host (the TLV entry below).
+#[test]
+fn phase_buckets_derives_schbench_perphase_metrics() {
+    let _lock = lock_env();
+    let _sd = isolated_sidecar_dir();
+    // A schbench carrier: 100-sample wakeup histogram (99×10µs + 1×10000µs, so
+    // p99 = 10µs), msg run-delay 50000ns over 5 schedules, loop_count 42.
+    let mut wakeup = crate::workload::schbench::plat::PlatStats::default();
+    for _ in 0..99 {
+        wakeup.add_lat(10);
+    }
+    wakeup.add_lat(10_000);
+    let schbench = crate::workload::schbench::run::SchbenchPhaseStats {
+        wakeup,
+        request: crate::workload::schbench::plat::PlatStats::default(),
+        msg_run_delay_ns: 50_000,
+        msg_pcount: 5,
+        worker_run_delay_ns: 0,
+        worker_pcount: 0,
+        loop_count: 42,
+    };
+    let mut guest_assert = build_assert_result(true, vec![]);
+    let mut pc = std::collections::BTreeMap::new();
+    pc.insert(
+        "cg".to_string(),
+        crate::assert::PhaseCgroupStats {
+            schbench: Some(schbench),
+            ..Default::default()
+        },
+    );
+    guest_assert.stats.phases = vec![crate::assert::PhaseBucket {
+        step_index: 1,
+        label: "Step[0]".to_string(),
+        start_ms: u64::MAX,
+        end_ms: 0,
+        sample_count: 0,
+        metrics: std::collections::BTreeMap::new(),
+        per_cgroup: pc,
+    }];
+    let result = crate::vmm::VmResult {
+        success: true,
+        guest_messages: Some(crate::vmm::host_comms::BulkDrainResult {
+            entries: vec![crate::test_support::test_helpers::assert_result_tlv_entry(
+                &guest_assert,
+            )],
+        }),
+        periodic_fired: 3,
+        periodic_target: 3,
+        ..crate::vmm::VmResult::test_fixture()
+    };
+    for i in 0..3 {
+        result.snapshot_bridge.store_with_stats_and_step(
+            &format!("periodic_{i}"),
+            crate::monitor::dump::FailureDumpReport::default(),
+            None,
+            Some(i as u64 * 100),
+            None,
+            1,
+        );
+    }
+    let buckets = result.phase_buckets();
+    let step0 = buckets
+        .iter()
+        .find(|b| b.step_index == 1)
+        .expect("a Step[0] bucket from the stamped captures");
+    // The production hook derived the schbench per-phase scalars (and the carrier
+    // survived the postcard TLV roundtrip).
+    assert_eq!(
+        step0.metrics.get("wakeup_p99_latency_us"),
+        Some(&10.0),
+        "phase_buckets() must derive the schbench per-phase metrics (production hook)",
+    );
+    assert_eq!(step0.metrics.get("schbench_loop_count"), Some(&42.0));
+    assert_eq!(step0.metrics.get("sched_delay_msg_us"), Some(&10.0));
+    // worker pcount 0 -> ABSENT, request empty -> ABSENT (no false zeros).
+    assert!(!step0.metrics.contains_key("sched_delay_worker_us"));
+    assert!(!step0.metrics.contains_key("request_p99_latency_us"));
+}
+
 /// Eval REORDER wiring: on the GUEST-FAIL path the failure message's
 /// timeline is built from the POST-fold `check_result.stats.phases`
 /// (folded_timeline), so the per-cgroup sub-block AND orphan not-measured

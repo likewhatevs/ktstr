@@ -838,7 +838,15 @@ fn fold_ext_metrics(ext_pairs: BTreeMap<String, Vec<(f64, usize)>>) -> BTreeMap<
         .into_iter()
         .filter_map(|(k, pairs)| {
             if let Some(def) = metric_def(&k) {
-                if matches!(def.kind, MetricKind::Rate { .. }) {
+                // Rate re-derives from its folded components (post-pass below);
+                // PerPhase is a per-phase-only scalar with no meaningful
+                // cross-RUN aggregate — both are skipped here. The PerPhase skip
+                // is also load-bearing: a PerPhase key reaching
+                // aggregate_samples_weighted would hit aggregate_finite's
+                // unreachable!() arm. (PerPhase keys should never reach here —
+                // populate_run_ext_metrics_from_phases skips is_derived keys —
+                // so this is defensive belt-and-suspenders.)
+                if matches!(def.kind, MetricKind::Rate { .. } | MetricKind::PerPhase) {
                     return None;
                 }
                 aggregate_samples_weighted(&pairs, def.kind).map(|v| (k, v))

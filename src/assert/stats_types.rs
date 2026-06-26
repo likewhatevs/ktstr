@@ -411,6 +411,17 @@ pub struct PhaseCgroupStats {
     /// only on a carrier that actually HAD samples to drop; ORs across `merge` so
     /// a merged carrier is stripped if either input was.
     pub stripped: bool,
+    /// Per-phase schbench engine metrics for a `WorkType::Schbench` backdrop
+    /// cgroup (`None` for every non-schbench carrier). Pooled across the
+    /// cgroup's workers by [`PhaseCgroupStats::merge`] (histogram
+    /// bucket-add + integer-add of the run-delay raw pairs). The schbench
+    /// per-phase derivation reads it, pools across cgroups, and derives the
+    /// per-phase percentile / run-delay-mean / loop-count scalars into
+    /// [`PhaseBucket::metrics`]. `pub(crate)`: the element type is `pub(crate)`
+    /// and a per-phase carrier is internal — test authors read `PhaseBucket`,
+    /// not this. Non-`pub` so the `crate::Claim` derive skips it (a percentile
+    /// histogram has no meaningful scalar claim accessor).
+    pub(crate) schbench: Option<crate::workload::schbench::run::SchbenchPhaseStats>,
 }
 
 impl PhaseCgroupStats {
@@ -488,6 +499,19 @@ impl PhaseCgroupStats {
         } else {
             (a.max_gap_ms, a.max_gap_cpu)
         };
+        // Per-phase schbench: OR-with-combine. Both Some → merge the pooled
+        // histograms + integer-add the run-delay raw pairs / loop_count
+        // (SchbenchPhaseStats::merge, the SAME associative+commutative op the
+        // guest engine uses to pool across message threads); one Some → carry
+        // it; both None (non-schbench cgroup) → None.
+        let schbench = match (a.schbench, b.schbench) {
+            (Some(mut x), Some(y)) => {
+                x.merge(&y);
+                Some(x)
+            }
+            (Some(x), None) | (None, Some(x)) => Some(x),
+            (None, None) => None,
+        };
         PhaseCgroupStats {
             num_workers: a.num_workers + b.num_workers,
             cpus_used,
@@ -504,6 +528,7 @@ impl PhaseCgroupStats {
             max_gap_ms,
             max_gap_cpu,
             stripped: a.stripped || b.stripped,
+            schbench,
         }
     }
 
@@ -1319,8 +1344,9 @@ fn merge_metric_values(
         Some(MetricKind::Rate { .. })
         | Some(MetricKind::Distribution { .. })
         | Some(MetricKind::WorstLowest { .. })
-        | Some(MetricKind::WakeLatencyTailRatio) => unreachable!(
-            "derived metrics (Rate/Distribution/WorstLowest/WakeLatencyTailRatio) are produced post-merge, not merged as values"
+        | Some(MetricKind::WakeLatencyTailRatio)
+        | Some(MetricKind::PerPhase) => unreachable!(
+            "derived metrics (Rate/Distribution/WorstLowest/WakeLatencyTailRatio/PerPhase) are produced post-merge, not merged as values"
         ),
         // Unregistered metric: commutative mean fallback. Sum
         // would over-count Gauge values; max would lose Counter

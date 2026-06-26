@@ -92,7 +92,7 @@
 
 mod affinity;
 mod config;
-mod schbench;
+pub(crate) mod schbench;
 mod spawn;
 mod types;
 mod worker;

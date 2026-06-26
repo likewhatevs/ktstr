@@ -71,19 +71,23 @@ fn plat_idx_to_val(idx: usize) -> u32 {
 }
 
 /// schbench's per-stat latency histogram (`schbench.c` `struct stats`
-/// :112). ~19 KiB (the `plat` array dominates) — same footprint the C
-/// carries per `thread_data`.
+/// :112). The ~19 KiB `plat` array is HEAP-boxed (`Box<[u32; PLAT_NR]>`), not
+/// inline: this type is the per-phase wire carrier and rides inside
+/// `PhaseSlice` / `PhaseCgroupStats`, which serde constructs on the stack
+/// during (de)serialization — an inline 19 KiB array (×2 in
+/// `SchbenchPhaseStats`) overflows the bounded test/worker thread stack in
+/// serde's recursive descent. Boxing keeps the struct pointer-sized; the
+/// behavior is byte-identical to schbench's inline `unsigned int plat[]`.
 ///
-/// `Serialize`/`Deserialize` + `Eq` make this the per-phase wire carrier
-/// (rides inside `PhaseSlice` guest→host). Every field is integer, so the
-/// histogram re-pools across workers via [`PlatStats::combine`] (bucket-count
-/// addition) host-side — percentiles are NEVER averaged, the only correct
-/// cross-worker pooling. The `plat` array uses a `#[serde(with)]` adapter
-/// because serde has no array impl past length 32.
+/// `Serialize`/`Deserialize` + `Eq` make it the carrier. Every field is
+/// integer, so the histogram re-pools across workers via [`PlatStats::combine`]
+/// (bucket-count addition) host-side — percentiles are NEVER averaged, the only
+/// correct cross-worker pooling. The `plat` array uses a `#[serde(with)]`
+/// adapter because serde has no array impl past length 32.
 #[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct PlatStats {
     #[serde(with = "plat_array_serde")]
-    plat: [u32; PLAT_NR],
+    plat: Box<[u32; PLAT_NR]>,
     nr_samples: u64,
     max: u32,
     /// `0` is the unset sentinel (`schbench.c` `add_lat`/`combine_stats`),
@@ -102,20 +106,31 @@ mod plat_array_serde {
     use serde::Deserialize;
     use serde::de::Error as _;
 
-    pub(super) fn serialize<S>(arr: &[u32; PLAT_NR], serializer: S) -> Result<S::Ok, S::Error>
+    // `&Box<[u32; PLAT_NR]>` (not `&[u32; PLAT_NR]`) is mandated by serde's
+    // `#[serde(with)]` contract: the field type is `Box<[u32; PLAT_NR]>`, so
+    // `serialize` receives `&FieldType`. clippy's borrowed_box does not apply.
+    #[allow(clippy::borrowed_box)]
+    pub(super) fn serialize<S>(
+        arr: &Box<[u32; PLAT_NR]>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
     {
         serializer.collect_seq(arr.iter())
     }
 
-    pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<[u32; PLAT_NR], D::Error>
+    pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<Box<[u32; PLAT_NR]>, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
         let v: Vec<u32> = Vec::deserialize(deserializer)?;
         let len = v.len();
-        v.try_into().map_err(|_| {
+        // Convert the heap Vec directly to a heap-boxed array — no intermediate
+        // stack array (the whole point of boxing): `Box<[u32]>` -> `Box<[u32;
+        // PLAT_NR]>` is a heap-only length check. FAIL-LOUD on a wrong length.
+        let boxed: Box<[u32]> = v.into_boxed_slice();
+        boxed.try_into().map_err(|_| {
             D::Error::custom(format!(
                 "PlatStats histogram length {len} != PLAT_NR {PLAT_NR}"
             ))
@@ -125,9 +140,14 @@ mod plat_array_serde {
 
 impl Default for PlatStats {
     fn default() -> Self {
-        // [u32; 4864] does not derive Default; construct explicitly.
+        // Heap-allocate the zeroed histogram directly (a zeroed Vec → boxed
+        // slice → boxed array): no `[0; PLAT_NR]` stack array, so even
+        // `PlatStats::default()` never materializes 19 KiB on the stack.
         Self {
-            plat: [0; PLAT_NR],
+            plat: vec![0u32; PLAT_NR]
+                .into_boxed_slice()
+                .try_into()
+                .expect("PLAT_NR-length zeroed histogram"),
             nr_samples: 0,
             max: 0,
             min: 0,
@@ -258,6 +278,14 @@ impl PlatStats {
     /// percentiles, e.g. scx vs detached-EEVDF in one run).
     pub(crate) fn take(&mut self) -> PlatStats {
         std::mem::take(self)
+    }
+
+    /// Number of samples recorded (`schbench.c` `nr_samples`). O(1) — reads the
+    /// running count without scanning the histogram, so callers can gate an
+    /// empty histogram (no metric emitted) or tally dropped samples without the
+    /// `percentiles()` scan.
+    pub(crate) fn sample_count(&self) -> u64 {
+        self.nr_samples
     }
 }
 

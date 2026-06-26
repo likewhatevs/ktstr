@@ -302,6 +302,28 @@ pub(crate) struct SchbenchPhaseStats {
     pub(crate) loop_count: u64,
 }
 
+impl SchbenchPhaseStats {
+    /// Merge `other` into `self`: combine the wakeup + request histograms
+    /// (bucket-count addition, [`PlatStats::combine`]) and integer-add the
+    /// run-delay raw pairs + loop_count. Associative AND commutative (combine +
+    /// `saturating_add` both are), so pooling is order-independent — the SAME
+    /// operation whether pooling per-engine across message threads (in [`run`])
+    /// or per-cgroup across workers host-side
+    /// (`crate::assert::PhaseCgroupStats::merge`). Percentiles are NEVER
+    /// merged; the merged histogram is re-derived to percentiles by the reader.
+    pub(crate) fn merge(&mut self, other: &SchbenchPhaseStats) {
+        self.wakeup.combine(&other.wakeup);
+        self.request.combine(&other.request);
+        self.msg_run_delay_ns = self.msg_run_delay_ns.saturating_add(other.msg_run_delay_ns);
+        self.msg_pcount = self.msg_pcount.saturating_add(other.msg_pcount);
+        self.worker_run_delay_ns = self
+            .worker_run_delay_ns
+            .saturating_add(other.worker_run_delay_ns);
+        self.worker_pcount = self.worker_pcount.saturating_add(other.worker_pcount);
+        self.loop_count = self.loop_count.saturating_add(other.loop_count);
+    }
+}
+
 impl Linked for ThreadData {
     fn next_link(&self) -> &AtomicPtr<Self> {
         &self.next
@@ -863,15 +885,7 @@ pub(crate) fn run(
             total_worker_sched_delay =
                 total_worker_sched_delay.saturating_add(mtr.workers_sched_delay_sum);
             for (epoch, sps) in mtr.phases {
-                let e = all_phases.entry(epoch).or_default();
-                e.wakeup.combine(&sps.wakeup);
-                e.request.combine(&sps.request);
-                e.msg_run_delay_ns = e.msg_run_delay_ns.saturating_add(sps.msg_run_delay_ns);
-                e.msg_pcount = e.msg_pcount.saturating_add(sps.msg_pcount);
-                e.worker_run_delay_ns =
-                    e.worker_run_delay_ns.saturating_add(sps.worker_run_delay_ns);
-                e.worker_pcount = e.worker_pcount.saturating_add(sps.worker_pcount);
-                e.loop_count = e.loop_count.saturating_add(sps.loop_count);
+                all_phases.entry(epoch).or_default().merge(&sps);
             }
         }
     });
