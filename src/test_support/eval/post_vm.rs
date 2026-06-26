@@ -272,6 +272,32 @@ impl std::fmt::Display for ExpectAutoReproSatisfied {
 
 impl std::error::Error for ExpectAutoReproSatisfied {}
 
+/// Marker error type attached as `anyhow::Context` to the failure `Err`
+/// [`render_failure_verdict_message`](super::render_failure_verdict_message)
+/// builds when `entry.survives_storm` is set AND the failing
+/// [`AssertResult`](crate::assert::AssertResult) carries a scheduler-death
+/// `DetailKind` (`SchedulerCrashed` / `SchedulerExitedCleanly` /
+/// `SchedulerDiedUnknownReason`). `err_to_exit_code` downcasts it and forces
+/// `EXIT_FAIL` with a survival-specific explainer, positioned BEFORE the
+/// [`ExpectAutoReproSatisfied`] / `expect_err` inversion arms so a survival
+/// violation can never be inverted to PASS (the validate-time
+/// `survives_storm`/`expect_err` mutex already forbids that combination;
+/// the ordering is defense-in-depth). Mirrors [`ScxBpfErrorMatcherMismatch`].
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SurvivesStormViolated;
+
+impl std::fmt::Display for SurvivesStormViolated {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "survives_storm asserted but the scx scheduler did not survive \
+             the run — it died or was ejected during a hold"
+        )
+    }
+}
+
+impl std::error::Error for SurvivesStormViolated {}
+
 /// Combine the conditional and unconditional `post_vm` failure
 /// signals. When both callbacks fail in the same run, surface
 /// BOTH errors in a single chained message so a debugging

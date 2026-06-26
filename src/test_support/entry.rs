@@ -1349,6 +1349,30 @@ pub struct KtstrTestEntry {
     /// When true, the test expects run_ktstr_test to return Err.
     /// Disables auto_repro (no point probing a deliberately failing test).
     pub expect_err: bool,
+    /// When true, assert the scx scheduler SURVIVES the run — it must NOT
+    /// die or get ejected during any hold. The positive inverse of
+    /// [`Self::expect_err`].
+    ///
+    /// Survival is otherwise IMPLICIT: a scheduler that dies during a hold
+    /// records a `DetailKind::Scheduler*` fail via the scenario liveness
+    /// probe (`crate::scenario::ops` `build_sched_died_*`), which already
+    /// fails the run through the failure→Err→EXIT_FAIL path. Setting this
+    /// flag makes the intent explicit in source, attaches a survival-
+    /// specific failure explainer that names the asserted intent, and is
+    /// enforced for every scenario driven through
+    /// `execute_defs`/`execute_steps`/`execute_scenario` (the entry points
+    /// that run the liveness probe — the storm/churn use case). A raw
+    /// scenario that hand-rolls `Op` dispatch without one of those runs no
+    /// probe, so survival is not actively re-checked there.
+    ///
+    /// Mutually exclusive with both [`Self::expect_err`] (one demands
+    /// failure, the other survival) and [`Self::expect_auto_repro`] (both
+    /// invert the scheduler-death-fail signal — survives_storm forces it to
+    /// EXIT_FAIL, expect_auto_repro inverts a crash-with-repro fail to
+    /// PASS), and requires an active scheduler
+    /// ([`SchedulerSpec::has_active_scheduling`]); all three are rejected by
+    /// `validate`.
+    pub survives_storm: bool,
     /// When true, a terminal Inconclusive verdict (e.g. zero-denominator
     /// ratio gate that couldn't evaluate) routes to EXIT_PASS instead
     /// of EXIT_INCONCLUSIVE at the dispatch layer. The test process
@@ -1736,6 +1760,7 @@ impl KtstrTestEntry {
         no_perf_mode: false,
         duration: Duration::from_secs(12),
         expect_err: false,
+        survives_storm: false,
         allow_inconclusive: false,
         host_only: false,
         extra_include_files: &[],
@@ -1973,6 +1998,13 @@ impl KtstrTestEntry {
     #[must_use = "builder methods consume self; bind the result"]
     pub fn with_expect_err(mut self, expect_err: bool) -> Self {
         self.expect_err = expect_err;
+        self
+    }
+
+    /// Override [`Self::survives_storm`].
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn with_survives_storm(mut self, survives_storm: bool) -> Self {
+        self.survives_storm = survives_storm;
         self
     }
 
@@ -2557,6 +2589,7 @@ mod tests {
         assert!(!d.no_perf_mode);
         assert_eq!(d.duration, Duration::from_secs(12));
         assert!(!d.expect_err);
+        assert!(!d.survives_storm);
         assert!(!d.host_only);
         // Payload slot defaults to None (scheduler-only entry); workloads
         // slice defaults to empty. Macro emits these as explicit None/&[]
@@ -3599,6 +3632,94 @@ mod tests {
             msg.contains("bad_matches"),
             "error must name the offending entry: {msg}",
         );
+    }
+
+    /// `survives_storm = true` + `expect_err = true` is rejected at
+    /// validate (the programmatic path that bypasses the macro mutex) —
+    /// contradictory polarity. The expect_err mutex is checked before the
+    /// no-scheduler one, so this fires even on the DEFAULT (no-scheduler)
+    /// entry.
+    #[test]
+    fn validate_rejects_survives_storm_with_expect_err() {
+        fn good_test_func(_: &Ctx) -> Result<AssertResult> {
+            Ok(AssertResult::pass())
+        }
+        let entry = KtstrTestEntry {
+            name: "bad_survives_expect_err",
+            func: good_test_func,
+            survives_storm: true,
+            expect_err: true,
+            ..KtstrTestEntry::DEFAULT
+        };
+        let err = entry
+            .validate()
+            .expect_err("survives_storm + expect_err must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("survives_storm") && msg.contains("expect_err"),
+            "diagnostic must name both survives_storm and expect_err: {msg}",
+        );
+        assert!(
+            msg.contains("bad_survives_expect_err"),
+            "error must name the offending entry: {msg}",
+        );
+    }
+
+    /// `survives_storm = true` with no active scheduler (the DEFAULT
+    /// kernel-default) is rejected — nothing to die or be ejected.
+    #[test]
+    fn validate_rejects_survives_storm_without_active_scheduler() {
+        fn good_test_func(_: &Ctx) -> Result<AssertResult> {
+            Ok(AssertResult::pass())
+        }
+        let entry = KtstrTestEntry {
+            name: "bad_survives_no_sched",
+            func: good_test_func,
+            survives_storm: true,
+            ..KtstrTestEntry::DEFAULT
+        };
+        let err = entry
+            .validate()
+            .expect_err("survives_storm without an active scheduler must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("survives_storm") && msg.contains("scheduler"),
+            "diagnostic must name survives_storm and the missing scheduler: {msg}",
+        );
+    }
+
+    /// `survives_storm = true` + `expect_auto_repro = true` is rejected at
+    /// validate — both are inversion intents (survives_storm forces a
+    /// death fail to EXIT_FAIL; expect_auto_repro inverts a crash-with-repro
+    /// fail to PASS), contradictory like survives_storm + expect_err. The
+    /// macro twin is `macro_rejects_survives_storm_with_expect_auto_repro`.
+    #[test]
+    fn validate_rejects_survives_storm_with_expect_auto_repro() {
+        fn good_test_func(_: &Ctx) -> Result<AssertResult> {
+            Ok(AssertResult::pass())
+        }
+        let entry = KtstrTestEntry {
+            name: "bad_survives_expect_auto_repro",
+            func: good_test_func,
+            survives_storm: true,
+            expect_auto_repro: true,
+            ..KtstrTestEntry::DEFAULT
+        };
+        let err = entry
+            .validate()
+            .expect_err("survives_storm + expect_auto_repro must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("survives_storm") && msg.contains("expect_auto_repro"),
+            "diagnostic must name both survives_storm and expect_auto_repro: {msg}",
+        );
+    }
+
+    /// `with_survives_storm` setter roundtrips onto the entry.
+    #[test]
+    fn with_survives_storm_sets_field() {
+        let e = KtstrTestEntry::DEFAULT.with_survives_storm(true);
+        assert!(e.survives_storm);
     }
 
     /// Happy path: scx_bpf_error matchers paired with

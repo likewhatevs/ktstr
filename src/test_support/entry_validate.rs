@@ -230,6 +230,32 @@ impl crate::test_support::KtstrTestEntry {
                 self.name,
             );
         }
+        if self.survives_storm && self.expect_err {
+            anyhow::bail!(
+                "KtstrTestEntry '{}' sets both survives_storm and expect_err — \
+                 contradictory: survives_storm asserts the run passes with the \
+                 scheduler alive, expect_err asserts the run fails. Pick one.",
+                self.name,
+            );
+        }
+        if self.survives_storm && self.expect_auto_repro {
+            anyhow::bail!(
+                "KtstrTestEntry '{}' sets both survives_storm and \
+                 expect_auto_repro — contradictory: survives_storm forces a \
+                 scheduler-death failure to EXIT_FAIL, expect_auto_repro \
+                 inverts a crash-with-repro failure to PASS. Pick one.",
+                self.name,
+            );
+        }
+        if self.survives_storm && !self.scheduler.has_active_scheduling() {
+            anyhow::bail!(
+                "KtstrTestEntry '{}' sets survives_storm with no active scx \
+                 scheduler — the kernel default has no scheduler to eject, so \
+                 survival is vacuous. Declare a scheduler = ... or drop \
+                 survives_storm.",
+                self.name,
+            );
+        }
         Ok(())
     }
 

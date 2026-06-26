@@ -229,8 +229,8 @@ fn inherited_constraint_tokens(
 /// against the known attribute list, so multi-segment paths can never
 /// resolve. The diagnostic names both correct forms with three
 /// concrete value-attr examples (a scheduler path, a payload path, an
-/// integer) plus the full enumeration of the 10 bool attrs that
-/// accept the bare form, so the operator can identify their fix
+/// integer) plus the full enumeration of the bool attrs (BOOL_ATTR_NAMES)
+/// that accept the bare form, so the operator can identify their fix
 /// directly from the error text.
 fn multi_segment_attr_error(path: &syn::Path) -> syn::Error {
     let path_repr = path.to_token_stream().to_string();
@@ -306,6 +306,7 @@ const BOOL_ATTR_NAMES: &[&str] = &[
     "no_perf_mode",
     "requires_smt",
     "expect_err",
+    "survives_storm",
     "allow_inconclusive",
     "fail_on_stall",
     "host_only",
@@ -407,6 +408,8 @@ pub(crate) struct AttrValues {
     pub(crate) no_perf_mode_set: bool,
     pub(crate) expect_err: bool,
     pub(crate) expect_err_set: bool,
+    pub(crate) survives_storm: bool,
+    pub(crate) survives_storm_set: bool,
     pub(crate) allow_inconclusive: bool,
     pub(crate) allow_inconclusive_set: bool,
     pub(crate) host_only: bool,
@@ -506,6 +509,8 @@ impl Default for AttrValues {
             no_perf_mode_set: false,
             expect_err: false,
             expect_err_set: false,
+            survives_storm: false,
+            survives_storm_set: false,
             allow_inconclusive: false,
             allow_inconclusive_set: false,
             host_only: false,
@@ -564,6 +569,10 @@ impl AttrValues {
             "expect_err" => {
                 self.expect_err = value;
                 self.expect_err_set = true;
+            }
+            "survives_storm" => {
+                self.survives_storm = value;
+                self.survives_storm_set = true;
             }
             "allow_inconclusive" => {
                 self.allow_inconclusive = value;
@@ -691,6 +700,44 @@ fn validate_expect_auto_repro_mutex(attrs: &AttrValues) -> syn::Result<()> {
              nothing to relaunch and the assertion could never be \
              satisfied. Add a scheduler = ... attribute or drop \
              expect_auto_repro = true.",
+        ));
+    }
+    Ok(())
+}
+
+/// Reject `survives_storm` combinations the assertion cannot honor:
+/// `survives_storm = true` with `expect_err = true` (contradictory — one
+/// demands the run pass with the scheduler alive, the other demands it
+/// fail), and `survives_storm = true` with no scheduler (the kernel default
+/// has no scx scheduler to die/eject, so survival is vacuous). Mirrors
+/// [`validate_expect_auto_repro_mutex`]; called only when `survives_storm`
+/// is set. The runtime `KtstrTestEntry::validate` re-checks both for
+/// programmatically-built entries that bypass the macro.
+fn validate_survives_storm_mutex(attrs: &AttrValues) -> syn::Result<()> {
+    if attrs.expect_err {
+        return Err(syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "survives_storm = true and expect_err = true are mutually \
+             exclusive — survives_storm asserts the scheduler SURVIVES (the \
+             run passes), expect_err asserts the run FAILS. Pick one.",
+        ));
+    }
+    if attrs.expect_auto_repro {
+        return Err(syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "survives_storm = true and expect_auto_repro = true are mutually \
+             exclusive — survives_storm forces a scheduler-death failure to \
+             EXIT_FAIL, while expect_auto_repro inverts a crash-with-repro \
+             failure to PASS. Pick one.",
+        ));
+    }
+    if attrs.scheduler.is_none() {
+        return Err(syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "survives_storm = true requires a scheduler — the kernel default \
+             (EEVDF) has no scx scheduler to die or be ejected, so survival \
+             is vacuous. Add a scheduler = ... attribute or drop \
+             survives_storm.",
         ));
     }
     Ok(())
@@ -862,6 +909,9 @@ fn validate_cross_attr(attrs: &AttrValues) -> syn::Result<()> {
     }
     if attrs.expect_auto_repro_set && attrs.expect_auto_repro {
         validate_expect_auto_repro_mutex(attrs)?;
+    }
+    if attrs.survives_storm_set && attrs.survives_storm {
+        validate_survives_storm_mutex(attrs)?;
     }
     if (attrs.expect_scx_bpf_error_contains_tokens.is_some()
         || attrs.expect_scx_bpf_error_matches_tokens.is_some())
@@ -1426,7 +1476,7 @@ pub(crate) fn ktstr_test_impl(
                         return Err(syn::Error::new_spanned(
                             path,
                             format!(
-                                "unknown attribute `{ident}`, expected: llcs, cores, threads, numa_nodes, memory_mib, scheduler, staged_schedulers, payload, workloads, auto_repro, not_starved, isolation, max_gap_ms, max_spread_pct, max_throughput_cv, min_work_rate, max_p99_wake_latency_ns, max_wake_latency_cv, min_iteration_rate, max_migration_ratio, max_imbalance_ratio, max_local_dsq_depth, fail_on_stall, sustained_samples, max_fallback_rate, max_keep_last_rate, min_page_locality, max_cross_node_migration_ratio, max_slow_tier_ratio, expect_scx_bpf_error_contains, expect_scx_bpf_error_matches, extra_sched_args, extra_include_files, min_numa_nodes, min_llcs, requires_smt, min_cpus, max_llcs, max_numa_nodes, max_cpus, cpu_budget, watchdog_timeout_s, performance_mode, no_perf_mode, duration_s, bpf_map_write, expect_err, allow_inconclusive, host_only, ignore, cleanup_budget_ms, post_vm, post_vm_unconditional, config, disk, network, num_snapshots, wprof, wprof_args"
+                                "unknown attribute `{ident}`, expected: llcs, cores, threads, numa_nodes, memory_mib, scheduler, staged_schedulers, payload, workloads, auto_repro, expect_auto_repro, not_starved, isolation, max_gap_ms, max_spread_pct, max_throughput_cv, min_work_rate, max_p99_wake_latency_ns, max_wake_latency_cv, min_iteration_rate, max_migration_ratio, max_imbalance_ratio, max_local_dsq_depth, fail_on_stall, sustained_samples, max_fallback_rate, max_keep_last_rate, min_page_locality, max_cross_node_migration_ratio, max_slow_tier_ratio, expect_scx_bpf_error_contains, expect_scx_bpf_error_matches, extra_sched_args, extra_include_files, workload_root_cgroup, min_numa_nodes, min_llcs, requires_smt, min_cpus, max_llcs, max_numa_nodes, max_cpus, cpu_budget, watchdog_timeout_s, performance_mode, no_perf_mode, duration_s, bpf_map_write, expect_err, survives_storm, allow_inconclusive, host_only, ignore, kaslr, cleanup_budget_ms, post_vm, post_vm_unconditional, config, disk, network, num_snapshots, wprof, wprof_args"
                             ),
                         ));
                     }
@@ -1434,8 +1484,8 @@ pub(crate) fn ktstr_test_impl(
             }
             Meta::Path(p) => {
                 // Sugar: a bare bool attr (e.g. `#[ktstr_test(host_only)]`)
-                // is equivalent to `key = true`. Only the ten bool
-                // attributes accept this form; bare ints/floats/paths
+                // is equivalent to `key = true`. Only the bool
+                // attributes (BOOL_ATTR_NAMES) accept this form; bare ints/floats/paths
                 // still error so a typo on a non-bool attr ("threads"
                 // instead of "threads = 4") routes to a targeted
                 // diagnostic rather than the generic Meta catch-all.

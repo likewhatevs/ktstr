@@ -1,0 +1,7 @@
+error: survives_storm = true and expect_err = true are mutually exclusive — survives_storm asserts the scheduler SURVIVES (the run passes), expect_err asserts the run FAILS. Pick one.
+ --> tests/compile_fail/ktstr_test_survives_storm_with_expect_err.rs:9:1
+  |
+9 | #[ktstr_test(scheduler = SCHED, survives_storm, expect_err = true)]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the attribute macro `ktstr_test` (in Nightly builds, run with -Z macro-backtrace for more info)

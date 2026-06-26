@@ -23,15 +23,16 @@ mod scheduler;
 ///    inside it.
 ///
 /// Every attribute is optional. Most take a `key = value` form; the
-/// thirteen boolean attributes (`auto_repro`, `not_starved`, `isolation`,
-/// `performance_mode`, `no_perf_mode`, `requires_smt`, `expect_err`,
-/// `allow_inconclusive`, `fail_on_stall`, `host_only`, `ignore`, `kaslr`,
-/// `wprof`) also accept a bare form as shorthand for `= true` — e.g.
+/// fifteen boolean attributes (`auto_repro`, `expect_auto_repro`,
+/// `not_starved`, `isolation`, `performance_mode`, `no_perf_mode`,
+/// `requires_smt`, `expect_err`, `survives_storm`, `allow_inconclusive`,
+/// `fail_on_stall`, `host_only`, `ignore`, `kaslr`, `wprof`) also accept a
+/// bare form as shorthand for `= true` — e.g.
 /// `#[ktstr_test(host_only)]` is equivalent to
-/// `#[ktstr_test(host_only = true)]`. Of the thirteen, `auto_repro`
+/// `#[ktstr_test(host_only = true)]`. Of the fifteen, `auto_repro`
 /// and `kaslr` are the two whose default is `true`, so the bare form
 /// is a no-op; `auto_repro = false` / `kaslr = false` are the only
-/// way to disable each. The other eleven default to `false`, so the
+/// way to disable each. The other thirteen default to `false`, so the
 /// bare form is the meaningful shorthand.
 ///
 /// The accepted attributes and their defaults are the fields of
@@ -192,6 +193,15 @@ mod scheduler;
 ///     Bare `\b` slips the gate (no word characters in `""`); see
 ///     `Assert::expect_scx_bpf_error_matches` for the operator
 ///     direction.
+///   - `survives_storm` — assert the scx scheduler SURVIVES the run
+///     (does not die or get ejected during any hold); the positive
+///     inverse of `expect_err`. Requires an active scheduler and is
+///     mutually exclusive with both `expect_err` and `expect_auto_repro`
+///     (rejected at macro-parse and by `KtstrTestEntry::validate`).
+///     Enforced on scenarios driven through `execute_defs` /
+///     `execute_steps` / `execute_scenario` (which run the scheduler
+///     liveness probe); a survival violation surfaces as a failing exit
+///     with a survival-specific explainer.
 ///   - `extra_include_files = ["PATH", "PATH", ...]` — host-side
 ///     file paths to bundle into the guest initramfs beyond what
 ///     the entry's `scheduler` / `payload` / `workloads` already
@@ -900,6 +910,109 @@ mod tests {
             field_value_in_static_entry::<bool>(&out, "expect_auto_repro"),
             None,
             "omitted attribute must NOT emit any `expect_auto_repro` field — DEFAULT spread carries the false"
+        );
+    }
+
+    /// `#[ktstr_test(scheduler = SCHED, survives_storm)]` emits
+    /// `survives_storm: true`. Pins BOOL_ATTR_NAMES + assign_bool + codegen.
+    /// A scheduler token is present so the mutex does not reject.
+    #[test]
+    fn macro_parses_survives_storm_bare_to_true() {
+        let attr = quote! { scheduler = SCHED, survives_storm };
+        let item = quote! {
+            fn t(_: &ktstr::scenario::Ctx) -> anyhow::Result<ktstr::assert::AssertResult> {
+                Ok(ktstr::assert::AssertResult::pass())
+            }
+        };
+        let out = ktstr_test::ktstr_test_impl(attr, item)
+            .expect("bare survives_storm with a scheduler must parse");
+        assert_eq!(
+            field_value_in_static_entry::<bool>(&out, "survives_storm"),
+            Some(true),
+            "bare `survives_storm` must emit `survives_storm: true`"
+        );
+    }
+
+    /// `#[ktstr_test(survives_storm = false)]` emits `survives_storm: false`
+    /// and needs no scheduler (the mutex only fires on the true value).
+    #[test]
+    fn macro_parses_survives_storm_explicit_false() {
+        let attr = quote! { survives_storm = false };
+        let item = quote! {
+            fn t(_: &ktstr::scenario::Ctx) -> anyhow::Result<ktstr::assert::AssertResult> {
+                Ok(ktstr::assert::AssertResult::pass())
+            }
+        };
+        let out = ktstr_test::ktstr_test_impl(attr, item)
+            .expect("explicit-false survives_storm must parse");
+        assert_eq!(
+            field_value_in_static_entry::<bool>(&out, "survives_storm"),
+            Some(false),
+            "explicit `survives_storm = false` must emit `survives_storm: false`"
+        );
+    }
+
+    /// `survives_storm` + `expect_err` is rejected at macro parse —
+    /// contradictory polarity. Pins the `validate_survives_storm_mutex`
+    /// expect_err arm.
+    #[test]
+    fn macro_rejects_survives_storm_with_expect_err() {
+        let attr = quote! { scheduler = SCHED, survives_storm, expect_err = true };
+        let item = quote! {
+            fn t(_: &ktstr::scenario::Ctx) -> anyhow::Result<ktstr::assert::AssertResult> {
+                Ok(ktstr::assert::AssertResult::pass())
+            }
+        };
+        let err = ktstr_test::ktstr_test_impl(attr, item)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("survives_storm") && err.to_string().contains("expect_err"),
+            "diagnostic must name both survives_storm and expect_err: {err}"
+        );
+    }
+
+    /// `survives_storm` without a scheduler is rejected at macro parse —
+    /// the kernel default has no scx scheduler to die or be ejected.
+    #[test]
+    fn macro_rejects_survives_storm_without_scheduler() {
+        let attr = quote! { survives_storm };
+        let item = quote! {
+            fn t(_: &ktstr::scenario::Ctx) -> anyhow::Result<ktstr::assert::AssertResult> {
+                Ok(ktstr::assert::AssertResult::pass())
+            }
+        };
+        let err = ktstr_test::ktstr_test_impl(attr, item)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("survives_storm") && err.to_string().contains("scheduler"),
+            "diagnostic must name survives_storm and the missing scheduler: {err}"
+        );
+    }
+
+    /// `survives_storm` + `expect_auto_repro` is rejected at macro parse —
+    /// both are inversion intents (survives_storm forces a death fail to
+    /// EXIT_FAIL; expect_auto_repro inverts a crash-with-repro fail to
+    /// PASS). Feature-agnostic: `validate_cross_attr` runs the
+    /// survives_storm mutex (which fires on the `expect_auto_repro` arm)
+    /// BEFORE the `#[cfg(not(feature = "wprof"))]` wprof-required rejection,
+    /// so the diagnostic names both regardless of the `wprof` feature —
+    /// unlike the positive parse tests, which need `--features wprof` to
+    /// reach codegen successfully. The runtime twin is
+    /// `validate_rejects_survives_storm_with_expect_auto_repro`.
+    #[test]
+    fn macro_rejects_survives_storm_with_expect_auto_repro() {
+        let attr = quote! { scheduler = SCHED, wprof, survives_storm, expect_auto_repro };
+        let item = quote! {
+            fn t(_: &ktstr::scenario::Ctx) -> anyhow::Result<ktstr::assert::AssertResult> {
+                Ok(ktstr::assert::AssertResult::pass())
+            }
+        };
+        let err = ktstr_test::ktstr_test_impl(attr, item)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("survives_storm")
+                && err.to_string().contains("expect_auto_repro"),
+            "diagnostic must name both survives_storm and expect_auto_repro: {err}"
         );
     }
 

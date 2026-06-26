@@ -98,6 +98,8 @@ pub(super) fn emit_entry_static(input: ItemFn, attrs: AttrValues) -> proc_macro2
         no_perf_mode_set,
         expect_err,
         expect_err_set,
+        survives_storm,
+        survives_storm_set,
         allow_inconclusive,
         allow_inconclusive_set,
         host_only,
@@ -392,6 +394,11 @@ pub(super) fn emit_entry_static(input: ItemFn, attrs: AttrValues) -> proc_macro2
         quote! { expect_err },
         quote! { #expect_err },
     );
+    let survives_storm_field = entry_field(
+        survives_storm_set,
+        quote! { survives_storm },
+        quote! { #survives_storm },
+    );
     let allow_inconclusive_field = entry_field(
         allow_inconclusive_set,
         quote! { allow_inconclusive },
@@ -662,6 +669,7 @@ pub(super) fn emit_entry_static(input: ItemFn, attrs: AttrValues) -> proc_macro2
             #duration_field
             #num_snapshots_field
             #expect_err_field
+            #survives_storm_field
             #allow_inconclusive_field
             #host_only_field
             #extra_include_files_field

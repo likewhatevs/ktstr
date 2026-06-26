@@ -1412,7 +1412,7 @@ fn result_to_exit_code_inconclusive_maps_to_distinct_code() {
 fn final_outcome_projects_to_result_to_exit_code() {
     use crate::assert::{AssertDetail, AssertResult, DetailKind};
     type ResultBuilder = fn() -> Result<AssertResult>;
-    let cases: [(ResultBuilder, &str); 8] = [
+    let cases: [(ResultBuilder, &str); 9] = [
         (|| Ok(AssertResult::pass()), "ok_pass"),
         (|| Ok(AssertResult::skip("skip reason")), "ok_skip"),
         (
@@ -1449,6 +1449,13 @@ fn final_outcome_projects_to_result_to_exit_code() {
                     .context(crate::test_support::eval::SchedulerBuildRefused))
             },
             "err_scheduler_build_refused",
+        ),
+        (
+            || {
+                Err(anyhow::anyhow!("f")
+                    .context(crate::test_support::eval::SurvivesStormViolated))
+            },
+            "err_survives_storm_violated",
         ),
     ];
     for (build, label) in cases {
@@ -2004,6 +2011,89 @@ fn result_to_exit_code_marker_arm_wins_over_expect_err_arm() {
         EXIT_PASS,
         "marker arm must win over expect_err arm by match-order positioning \
          (expect_err arm with ScxBpfErrorMatcherMismatch would return EXIT_FAIL)"
+    );
+}
+
+// -- result_to_exit_code: SurvivesStormViolated marker tests --
+//
+// Pin the dispatch-side EXIT_FAIL the survives_storm assertion produces.
+// The marker is attached by render_failure_verdict_message ONLY when
+// entry.survives_storm was set AND the failure carried a scheduler-death
+// DetailKind, so its presence alone is load-bearing (no flag param,
+// mirroring the other marker arms). The eval-side attach gate is exercised
+// in the eval tests; these pin the dispatch-arm contract + match order.
+
+/// Err with [`SurvivesStormViolated`] attached → the dispatch arm
+/// downcasts and forces [`EXIT_FAIL`].
+#[test]
+fn result_to_exit_code_survives_storm_violated_routes_to_fail() {
+    let err: Result<crate::assert::AssertResult> =
+        Err(anyhow::anyhow!("scheduler died during hold")
+            .context(crate::test_support::eval::SurvivesStormViolated));
+    assert_eq!(
+        result_to_exit_code(err, false, false),
+        EXIT_FAIL,
+        "SurvivesStormViolated marker must route Err → EXIT_FAIL"
+    );
+}
+
+/// Marker buried under more `.context()` layers → the context-aware
+/// `downcast_ref` still surfaces it (the anyhow-chain-walk footgun: a
+/// `chain().any(|c| c.is::<_>())` walk would miss the ContextError-boxed
+/// marker). The eval layer's surrounding context wrappers make
+/// nested-marker chains the production-typical shape.
+#[test]
+fn result_to_exit_code_survives_storm_violated_through_nested_context() {
+    let err: Result<crate::assert::AssertResult> =
+        Err(anyhow::anyhow!("scheduler died during hold")
+            .context(crate::test_support::eval::SurvivesStormViolated)
+            .context("run ktstr_test VM")
+            .context("dispatch wrapper"));
+    assert_eq!(
+        result_to_exit_code(err, false, false),
+        EXIT_FAIL,
+        "nested SurvivesStormViolated must still be found by the context-aware downcast_ref"
+    );
+}
+
+/// `expect_err = true` + SurvivesStormViolated → the survives_storm arm
+/// wins because it is positioned BEFORE the expect_err inversion arm in the
+/// dispatch match. The two are mutually exclusive at validate
+/// (survives_storm ⊕ expect_err), so this guards the order invariant for a
+/// programmatic path that bypassed the macro: a survival violation must
+/// never invert to PASS via expect_err. Falsifiable — without the
+/// survives_storm arm, the expect_err arm would route this Err to
+/// EXIT_PASS.
+#[test]
+fn result_to_exit_code_survives_storm_violated_wins_over_expect_err() {
+    let err: Result<crate::assert::AssertResult> =
+        Err(anyhow::anyhow!("scheduler died during hold")
+            .context(crate::test_support::eval::SurvivesStormViolated));
+    assert_eq!(
+        result_to_exit_code(err, true, false),
+        EXIT_FAIL,
+        "SurvivesStormViolated must win over the expect_err inversion (positioned before it)"
+    );
+}
+
+/// `SurvivesStormViolated` + `ExpectAutoReproSatisfied` both attached →
+/// the survives_storm arm wins (positioned BEFORE the ExpectAutoReproSatisfied
+/// arm), so the survival violation resolves to EXIT_FAIL and is NOT inverted
+/// to PASS. The two are mutually exclusive at validate (survives_storm ⊕
+/// expect_auto_repro), so this guards the order invariant for a programmatic
+/// path that bypassed the macro. Falsifiable — without the survives_storm arm
+/// (or if mispositioned after it), the ExpectAutoReproSatisfied arm would
+/// route this Err to EXIT_PASS.
+#[test]
+fn result_to_exit_code_survives_storm_violated_wins_over_expect_auto_repro() {
+    let err: Result<crate::assert::AssertResult> =
+        Err(anyhow::anyhow!("scheduler died during hold")
+            .context(crate::test_support::eval::ExpectAutoReproSatisfied)
+            .context(crate::test_support::eval::SurvivesStormViolated));
+    assert_eq!(
+        result_to_exit_code(err, false, false),
+        EXIT_FAIL,
+        "SurvivesStormViolated must win over ExpectAutoReproSatisfied (positioned before it)"
     );
 }
 

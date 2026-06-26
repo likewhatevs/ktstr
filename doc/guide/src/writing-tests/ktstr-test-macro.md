@@ -56,14 +56,14 @@ the function inside it.
 ## Attributes
 
 All attributes are optional with defaults. Most take `key = value`;
-the fourteen bool attributes (`auto_repro`, `expect_auto_repro`,
+the fifteen bool attributes (`auto_repro`, `expect_auto_repro`,
 `not_starved`, `isolation`, `performance_mode`, `no_perf_mode`,
-`requires_smt`, `expect_err`, `allow_inconclusive`, `fail_on_stall`,
-`host_only`, `ignore`, `kaslr`, `wprof`) also accept a bare form as
-shorthand for `= true` — `#[ktstr_test(host_only)]` is equivalent to
+`requires_smt`, `expect_err`, `survives_storm`, `allow_inconclusive`,
+`fail_on_stall`, `host_only`, `ignore`, `kaslr`, `wprof`) also accept a
+bare form as shorthand for `= true` — `#[ktstr_test(host_only)]` is equivalent to
 `#[ktstr_test(host_only = true)]`. `auto_repro` and `kaslr` default to
 `true`, so bare `auto_repro` / `kaslr` is a no-op; use
-`auto_repro = false` / `kaslr = false` to disable. The other twelve
+`auto_repro = false` / `kaslr = false` to disable. The other thirteen
 default to `false` (or `None`), so the bare form is the meaningful
 shorthand for those.
 
@@ -190,6 +190,7 @@ example.
 | `duration_s` | 12 | Per-scenario duration in seconds |
 | `cpu_budget = N` | `None` | Explicit host-CPU mask size for no-perf mode (must be > 0); overrides the auto-derived budget. An explicit `--cpu-cap` / `KTSTR_CPU_CAP` still takes precedence. |
 | `expect_err` | `false` | Test expects `run_ktstr_test` to return `Err`; disables auto-repro |
+| `survives_storm` | `false` | Assert the scx scheduler SURVIVES the run (does not die or get ejected during any hold) — the positive inverse of `expect_err`. Requires an active scheduler; mutually exclusive with `expect_err` and `expect_auto_repro` (rejected at compile time and by `KtstrTestEntry::validate`). Enforced on scenarios driven through `execute_defs` / `execute_steps` / `execute_scenario` (which run the liveness probe); a survival violation surfaces as EXIT_FAIL with a survival-specific explainer. |
 | `allow_inconclusive` | `false` | Permit an Inconclusive verdict to pass instead of failing the test (routes the per-test exit code from `2` to `0`). `expect_err` still dominates. |
 | `bpf_map_write = CONST` | empty | Rust const path to a `BpfMapWrite`; host writes this value to a BPF map after the scheduler loads. The entry field is a slice; the macro wraps the single path in a one-element slice. |
 | `host_only` | `false` | Run the test function directly on the host instead of inside a VM. Use for tests that need host tools (e.g. cargo, nested VMs) unavailable in the guest initramfs. |

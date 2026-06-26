@@ -1127,8 +1127,9 @@ fn ok_to_exit_code(r: AssertResult, expect_err: bool, allow_inconclusive: bool) 
 /// cpu-budget → topology-unrepresentable → resource-contention →
 /// topology-insufficient, shared with the `#[ktstr_test]` macro body) runs
 /// FIRST, then the
-/// marker-typed guards (`PostVmAssertionFailure` →
-/// `ExpectAutoReproSatisfied`), then the `expect_err` inversion, then
+/// marker-typed guards (`PostVmAssertionFailure` → `SchedulerBuildRefused`
+/// → `SurvivesStormViolated` → `ExpectAutoReproSatisfied`), then the
+/// `expect_err` inversion, then
 /// the catch-all (the former `Err(e) => …` arm) operating on the
 /// now-owned `e`. Reordering these would change which guard fires for an
 /// error matching more than one guard. The host-insufficiency guard
@@ -1187,6 +1188,29 @@ fn err_to_exit_code(e: anyhow::Error, expect_err: bool, no_skip: bool) -> i32 {
         // (mirrors PostVmAssertionFailure above): an expect_err test must not
         // let a broken build masquerade as the guest-side expected failure.
         eprintln!("{e:#}");
+        return EXIT_FAIL;
+    }
+    if e.downcast_ref::<crate::test_support::eval::SurvivesStormViolated>()
+        .is_some()
+    {
+        // The marker rides ONLY when `entry.survives_storm` was set AND the
+        // failure cause was a scheduler death (see
+        // `render_failure_verdict_message`), so its presence alone proves the
+        // survival assertion was violated — no `survives_storm` param needed
+        // (mirrors the marker-presence arms for PostVmAssertionFailure /
+        // SchedulerBuildRefused / ExpectAutoReproSatisfied below). Force
+        // EXIT_FAIL with a survival-specific explainer. Positioned AFTER the
+        // host-insufficiency / PostVmAssertionFailure / SchedulerBuildRefused
+        // guards (a skip or host-side fault still dominates) but BEFORE the
+        // ExpectAutoReproSatisfied and expect_err inversion arms so a survival
+        // violation can never be inverted to PASS (defense-in-depth: the
+        // validate-time survives_storm/expect_err mutex already forbids that
+        // pairing). `downcast_ref` walks the anyhow context chain (the marker
+        // rides as `.context(...)`).
+        eprintln!(
+            "ktstr: FAIL: survives_storm asserted but the scheduler did not \
+             survive the run:\n{e:#}"
+        );
         return EXIT_FAIL;
     }
     if e.downcast_ref::<crate::test_support::eval::ExpectAutoReproSatisfied>()
@@ -1355,6 +1379,17 @@ pub(crate) fn final_outcome(
             if e.downcast_ref::<crate::test_support::eval::SchedulerBuildRefused>()
                 .is_some()
             {
+                return Verdict::Fail;
+            }
+            if e.downcast_ref::<crate::test_support::eval::SurvivesStormViolated>()
+                .is_some()
+            {
+                // Lockstep with err_to_exit_code's SurvivesStormViolated arm
+                // (same position: after SchedulerBuildRefused, before
+                // ExpectAutoReproSatisfied / expect_err) so the persisted
+                // sidecar verdict matches the exit code for a survival
+                // violation — including the defense-in-depth bypass case
+                // (marker + expect_err) the mutex normally forbids.
                 return Verdict::Fail;
             }
             if e.downcast_ref::<crate::test_support::eval::ExpectAutoReproSatisfied>()
