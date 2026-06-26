@@ -715,8 +715,7 @@ pub fn resolve_git_kernel(
         if let Some(entry) = cache_lookup(&cache, &cache_key, cli_label) {
             // Full hash keys the entry; show the familiar 7-hex prefix.
             let short = &commit_hash[..7.min(commit_hash.len())];
-            let msg =
-                format!("{cli_label}: git+{url}#{git_ref} -> {short} cached; skipping clone");
+            let msg = format!("{cli_label}: git+{url}#{git_ref} -> {short} cached; skipping clone");
             match mp {
                 Some(fp) => fp.println(&msg),
                 None => eprintln!("{msg}"),
