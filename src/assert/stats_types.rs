@@ -750,11 +750,11 @@ impl PhaseCgroupStats {
 
     /// Wake-latency coefficient of variation (stddev / mean) over the pooled
     /// [`Self::wake_latencies_ns`] (`n = len`), or `None` when the pool is
-    /// empty (the not-measured state — so [`crate::assert::run_metrics`]'s
-    /// carrier writer omits all three wake keys together). `Some(0.0)` when
+    /// empty (the not-measured state — so the `run_metrics` carrier writer
+    /// omits all three wake keys together). `Some(0.0)` when
     /// the mean is zero is a MEASURED zero. Reproduces [`cgroup_stats`]'s
     /// `wake_latency_cv` value-for-value for the ≤cap pool (`Σv` in `u64`,
-    /// same accumulation); above [`MAX_WAKE_SAMPLES`] the pool is a
+    /// same accumulation); above `MAX_WAKE_SAMPLES` the pool is a
     /// distribution-preserving reservoir subsample, so the CV is then
     /// distribution-equivalent, not byte-identical.
     pub fn wake_cv(&self) -> Option<f64> {

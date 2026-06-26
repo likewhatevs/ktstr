@@ -3957,7 +3957,7 @@ pub(crate) fn read_self_cgroup_dir() -> Option<std::path::PathBuf> {
 /// (no fs access) so both error branches are testable. Single-sources
 /// the sibling resolution shared by [`WorkerCtx::open_sibling_cgroup_procs`]
 /// (the Custom-worker affordance) and the
-/// [`WorkType::CgroupAttachStorm`](crate::workload::WorkType::CgroupAttachStorm)
+/// [`WorkType::CgroupAttachStorm`]
 /// built-in dispatch arm so the two address the same target by
 /// construction.
 pub(crate) fn resolve_sibling_cgroup_procs(

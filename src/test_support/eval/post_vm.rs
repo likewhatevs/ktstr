@@ -273,9 +273,9 @@ impl std::fmt::Display for ExpectAutoReproSatisfied {
 impl std::error::Error for ExpectAutoReproSatisfied {}
 
 /// Marker error type attached as `anyhow::Context` to the failure `Err`
-/// [`render_failure_verdict_message`](super::render_failure_verdict_message)
+/// [`render_failure_verdict_message`]
 /// builds when `entry.survives_storm` is set AND the failing
-/// [`AssertResult`](crate::assert::AssertResult) carries a scheduler-death
+/// [`AssertResult`] carries a scheduler-death
 /// `DetailKind` (`SchedulerCrashed` / `SchedulerExitedCleanly` /
 /// `SchedulerDiedUnknownReason`). `err_to_exit_code` downcasts it and forces
 /// `EXIT_FAIL` with a survival-specific explainer, positioned BEFORE the

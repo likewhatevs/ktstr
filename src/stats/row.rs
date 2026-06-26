@@ -153,7 +153,7 @@ pub struct GauntletRow {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_source: Option<String>,
     /// Scheduler-resolution provenance carried from
-    /// [`crate::test_support::sidecar::SidecarResult::resolve_source`] —
+    /// [`crate::test_support::SidecarResult::resolve_source`] —
     /// the snake_case discovery-path tag (`"auto_built"`,
     /// `"target_debug"`, `"path"`, ...). `None` for sidecars produced
     /// before the field existed (pre-1.0 disposable schema) and for skip
