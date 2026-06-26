@@ -858,6 +858,41 @@ impl VmResult {
             .and_then(|b| b.get(metric).or_else(|| b.cgroup_counter_total(metric)))
     }
 
+    /// Polarity-aware "is the `candidate` phase better than the `baseline` phase
+    /// on `metric`?" comparator — the per-phase A/B primitive for "assert
+    /// scheduler X beats EEVDF across phases" (e.g. an scx Step vs the EEVDF
+    /// Step after `Op::DetachScheduler`). Resolves both per-phase values via
+    /// [`Self::phase_metric`] and the metric's polarity via
+    /// `crate::stats::metric_def`, then returns a
+    /// [`crate::assert::temporal::BetterThanPhase`] builder whose terminal
+    /// (`better_than` / `by_at_least`) records the outcome into `verdict`.
+    /// "Better" is oriented from the registry polarity, so the SAME call works
+    /// for a LowerBetter latency (`wakeup_p99_latency_us`) and a HigherBetter
+    /// throughput (`schbench_loop_count`) with no caller-specified direction.
+    ///
+    /// A post_vm callback collapses the verdict to its `anyhow::Result` via
+    /// [`crate::assert::Verdict::into_anyhow_or_log`], which bails on a Fail OR
+    /// an Inconclusive — so a missing metric (a phase with no schbench carrier),
+    /// an undirected metric, or a zero-baseline fractional-margin comparison
+    /// does NOT silently pass.
+    pub fn better_across_phases<'v>(
+        &self,
+        verdict: &'v mut crate::assert::Verdict,
+        baseline: crate::assert::Phase,
+        candidate: crate::assert::Phase,
+        metric: &str,
+    ) -> crate::assert::temporal::BetterThanPhase<'v> {
+        crate::assert::temporal::BetterThanPhase::new(
+            metric.to_string(),
+            verdict,
+            baseline,
+            candidate,
+            self.phase_metric(baseline, metric),
+            self.phase_metric(candidate, metric),
+            crate::stats::metric_def(metric).map(|m| m.polarity),
+        )
+    }
+
     /// Minimal "nothing happened" fixture for tests that exercise
     /// code consuming a [`VmResult`] without actually booting a VM
     /// (the sidecar-write tests in `src/test_support/sidecar.rs`

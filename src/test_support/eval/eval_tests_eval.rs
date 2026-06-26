@@ -1516,6 +1516,149 @@ fn phase_buckets_derives_schbench_perphase_metrics() {
     assert!(!step0.metrics.contains_key("request_p99_latency_us"));
 }
 
+/// Wiring pin for VmResult::better_across_phases — the per-phase A/B
+/// primitive. Two phases carry schbench wakeup p99 = 10µs (scx, step_index 1)
+/// vs 100µs (EEVDF, step_index 2); the comparator must orient "better" from the
+/// LowerBetter polarity (registry) so scx (candidate) beats EEVDF (baseline)
+/// and the reverse framing fails, and a metric absent in a phase is
+/// Inconclusive→Err (no silent pass). Guards that better_across_phases resolves
+/// both phases via phase_metric + the polarity via metric_def and records the
+/// right verdict — a swapped baseline/candidate or wrong polarity source fails
+/// here, not in the pure better_outcome unit tests.
+#[test]
+fn better_across_phases_orients_by_polarity_end_to_end() {
+    let _lock = lock_env();
+    let _sd = isolated_sidecar_dir();
+    // A schbench carrier whose wakeup p99 == `us` (100 identical samples) and
+    // whose loop_count == `loops` (the HigherBetter throughput key).
+    let carrier = |us: u32, loops: u64| {
+        let mut wakeup = crate::workload::schbench::plat::PlatStats::default();
+        for _ in 0..100 {
+            wakeup.add_lat(us);
+        }
+        crate::assert::PhaseCgroupStats {
+            schbench: Some(crate::workload::schbench::run::SchbenchPhaseStats {
+                wakeup,
+                request: crate::workload::schbench::plat::PlatStats::default(),
+                msg_run_delay_ns: 0,
+                msg_pcount: 0,
+                worker_run_delay_ns: 0,
+                worker_pcount: 0,
+                loop_count: loops,
+            }),
+            ..Default::default()
+        }
+    };
+    let phase_bucket = |idx: u16, us: u32, loops: u64| {
+        let mut pc = std::collections::BTreeMap::new();
+        pc.insert("cg".to_string(), carrier(us, loops));
+        crate::assert::PhaseBucket {
+            step_index: idx,
+            label: format!("Step[{}]", idx - 1),
+            start_ms: u64::MAX,
+            end_ms: 0,
+            sample_count: 0,
+            metrics: std::collections::BTreeMap::new(),
+            per_cgroup: pc,
+        }
+    };
+    let mut guest_assert = build_assert_result(true, vec![]);
+    // scx (step_index 1): p99 10µs, loop_count 200; EEVDF (step_index 2): p99
+    // 100µs, loop_count 50. scx wins on BOTH a LowerBetter (latency) and a
+    // HigherBetter (throughput) key.
+    guest_assert.stats.phases = vec![phase_bucket(1, 10, 200), phase_bucket(2, 100, 50)];
+    let result = crate::vmm::VmResult {
+        success: true,
+        guest_messages: Some(crate::vmm::host_comms::BulkDrainResult {
+            entries: vec![crate::test_support::test_helpers::assert_result_tlv_entry(
+                &guest_assert,
+            )],
+        }),
+        periodic_fired: 4,
+        periodic_target: 4,
+        ..crate::vmm::VmResult::test_fixture()
+    };
+    // Stamp captures in BOTH steps so phase_buckets() builds step_index 1 and 2.
+    for &(i, step) in &[(0u64, 1u16), (1, 1), (2, 2), (3, 2)] {
+        result.snapshot_bridge.store_with_stats_and_step(
+            &format!("periodic_{i}"),
+            crate::monitor::dump::FailureDumpReport::default(),
+            None,
+            Some(i * 100),
+            None,
+            step,
+        );
+    }
+    let scx = crate::assert::Phase::step(0); // step_index 1
+    let eevdf = crate::assert::Phase::step(1); // step_index 2
+    // scx (candidate) p99 10µs is strictly better than EEVDF (baseline) 100µs.
+    let mut v = crate::assert::Verdict::new();
+    result
+        .better_across_phases(&mut v, eevdf, scx, "wakeup_p99_latency_us")
+        .better_than();
+    assert!(
+        v.into_anyhow_or_log().is_ok(),
+        "scx p99 10µs is strictly better than EEVDF 100µs (LowerBetter)"
+    );
+    // Reverse framing: EEVDF (candidate) is NOT better than scx (baseline) -> Err.
+    let mut v2 = crate::assert::Verdict::new();
+    result
+        .better_across_phases(&mut v2, scx, eevdf, "wakeup_p99_latency_us")
+        .better_than();
+    assert!(
+        v2.into_anyhow_or_log().is_err(),
+        "EEVDF p99 100µs is not better than scx 10µs"
+    );
+    // A metric absent in the phases (empty request histogram -> request keys
+    // never derived) is Inconclusive -> Err, never a silent pass.
+    let mut v3 = crate::assert::Verdict::new();
+    result
+        .better_across_phases(&mut v3, eevdf, scx, "request_p99_latency_us")
+        .better_than();
+    assert!(
+        v3.into_anyhow_or_log().is_err(),
+        "absent metric -> inconclusive -> Err (no silent pass)"
+    );
+    // HigherBetter through production: schbench_loop_count is HigherBetter, so
+    // scx (candidate, loop 200) beats EEVDF (baseline, loop 50) — proving the
+    // SAME call orients a HigherBetter metric, direction from the registry (not
+    // just the LowerBetter latency above).
+    let mut v4 = crate::assert::Verdict::new();
+    result
+        .better_across_phases(&mut v4, eevdf, scx, "schbench_loop_count")
+        .better_than();
+    assert!(
+        v4.into_anyhow_or_log().is_ok(),
+        "scx loop_count 200 > EEVDF 50 (HigherBetter)"
+    );
+    let mut v5 = crate::assert::Verdict::new();
+    result
+        .better_across_phases(&mut v5, scx, eevdf, "schbench_loop_count")
+        .better_than();
+    assert!(
+        v5.into_anyhow_or_log().is_err(),
+        "EEVDF loop_count 50 is not > scx 200"
+    );
+    // by_at_least(margin) through production: scx p99 10µs is a 90% improvement
+    // over EEVDF 100µs — clears a 50% margin, falls short of a 95% margin.
+    let mut v6 = crate::assert::Verdict::new();
+    result
+        .better_across_phases(&mut v6, eevdf, scx, "wakeup_p99_latency_us")
+        .by_at_least(0.5);
+    assert!(
+        v6.into_anyhow_or_log().is_ok(),
+        "90% improvement clears a 50% margin"
+    );
+    let mut v7 = crate::assert::Verdict::new();
+    result
+        .better_across_phases(&mut v7, eevdf, scx, "wakeup_p99_latency_us")
+        .by_at_least(0.95);
+    assert!(
+        v7.into_anyhow_or_log().is_err(),
+        "90% improvement is short of a 95% margin"
+    );
+}
+
 /// Eval REORDER wiring: on the GUEST-FAIL path the failure message's
 /// timeline is built from the POST-fold `check_result.stats.phases`
 /// (folded_timeline), so the per-cgroup sub-block AND orphan not-measured

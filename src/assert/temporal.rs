@@ -695,6 +695,237 @@ where
     }
 }
 
+/// The polarity-resolved outcome of a [`BetterThanPhase`] comparison, factored
+/// out as a PURE decision so it is exhaustively unit-testable without a
+/// `VmResult` or `Verdict`. The builder maps each variant to a verdict record +
+/// message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BetterOutcome {
+    /// Candidate is better than baseline (strictly, or by the required margin).
+    Pass,
+    /// Candidate is NOT better — worse, or short of the margin.
+    Fail,
+    /// A non-finite endpoint — a corrupt value the comparison can't trust
+    /// (Fail, not Inconclusive: a `<` on NaN is silently false, so an unguarded
+    /// corrupt value would falsely pass).
+    Corrupt,
+    /// One or both phases carried no value for the metric (no signal).
+    Missing,
+    /// The metric has no LowerBetter/HigherBetter polarity (TargetValue /
+    /// Unknown / unregistered), so "better" has no direction.
+    Undirected,
+    /// A fractional margin was requested against a zero baseline — nothing to
+    /// scale the margin against.
+    ZeroBaseline,
+}
+
+/// Pure better-than decision: is `candidate` better than `baseline` for a metric
+/// of the given `polarity`, by the optional `margin` (a FRACTION of the
+/// baseline; `None` = strictly better, any improvement)? The whole point is the
+/// SAME call works for a LowerBetter metric (latency) and a HigherBetter one
+/// (throughput) with no caller-specified direction — the direction comes from
+/// the registry-declared polarity.
+fn better_outcome(
+    baseline: Option<f64>,
+    candidate: Option<f64>,
+    polarity: Option<crate::test_support::Polarity>,
+    margin: Option<f64>,
+) -> BetterOutcome {
+    use crate::test_support::Polarity;
+    let (Some(b), Some(c)) = (baseline, candidate) else {
+        return BetterOutcome::Missing;
+    };
+    if !b.is_finite() || !c.is_finite() {
+        return BetterOutcome::Corrupt;
+    }
+    let lower_better = match polarity {
+        Some(Polarity::LowerBetter) => true,
+        Some(Polarity::HigherBetter) => false,
+        // TargetValue / Unknown / unregistered: no "better" direction.
+        _ => return BetterOutcome::Undirected,
+    };
+    let pass = match margin {
+        // Strictly better (any improvement).
+        None => {
+            if lower_better {
+                c < b
+            } else {
+                c > b
+            }
+        }
+        // Better by at least `m` (a fraction of the baseline). A zero baseline
+        // has nothing to scale the fractional margin against.
+        Some(m) => {
+            if b == 0.0 {
+                return BetterOutcome::ZeroBaseline;
+            }
+            // Relative improvement as a fraction of the baseline, the DIVISION
+            // form `(improvement)/baseline >= m` rather than the
+            // algebraically-equivalent multiplicative `c <= b*(1-m)`: the
+            // `b*(1-m)` intermediate (e.g. `100.0*(1.0-0.1)` = 89.999…) rejects
+            // an EXACTLY-`m`-better candidate by an f64 epsilon, whereas
+            // `(b-c)/b` is exact at round-number boundaries (`10.0/100.0` is the
+            // same f64 bit pattern as the `0.1` literal). The
+            // percentile-f64-threshold-rounding footgun.
+            if lower_better {
+                (b - c) / b >= m
+            } else {
+                (c - b) / b >= m
+            }
+        }
+    };
+    if pass {
+        BetterOutcome::Pass
+    } else {
+        BetterOutcome::Fail
+    }
+}
+
+/// Cross-phase "is the candidate phase better than the baseline phase on this
+/// metric?" comparator, returned by
+/// [`crate::vmm::VmResult::better_across_phases`]. The polarity-aware sibling of
+/// [`CrossPhaseRatio`]: it reads two PER-PHASE scalars (via `phase_metric`, not
+/// a sampled series) and orients "better" from the metric's registry-declared
+/// polarity, so the same call expresses "scheduler beats EEVDF" for a
+/// LowerBetter latency AND a HigherBetter throughput without the test author
+/// naming a direction. A missing/undirected/zero-baseline comparison is
+/// Inconclusive (never a silent pass); a non-finite value is a Fail.
+#[must_use = "BetterThanPhase records nothing until better_than / by_at_least is invoked"]
+pub struct BetterThanPhase<'v> {
+    metric: String,
+    verdict: &'v mut Verdict,
+    baseline: crate::assert::Phase,
+    candidate: crate::assert::Phase,
+    baseline_value: Option<f64>,
+    candidate_value: Option<f64>,
+    polarity: Option<crate::test_support::Polarity>,
+}
+
+impl<'v> BetterThanPhase<'v> {
+    /// Build from already-resolved per-phase values + polarity. Only
+    /// [`crate::vmm::VmResult::better_across_phases`] constructs this — it
+    /// resolves the values via `phase_metric` and the polarity via
+    /// `crate::stats::metric_def`.
+    pub(crate) fn new(
+        metric: String,
+        verdict: &'v mut Verdict,
+        baseline: crate::assert::Phase,
+        candidate: crate::assert::Phase,
+        baseline_value: Option<f64>,
+        candidate_value: Option<f64>,
+        polarity: Option<crate::test_support::Polarity>,
+    ) -> Self {
+        Self {
+            metric,
+            verdict,
+            baseline,
+            candidate,
+            baseline_value,
+            candidate_value,
+            polarity,
+        }
+    }
+
+    /// Pass iff the candidate is STRICTLY better than the baseline per the
+    /// metric's polarity (LowerBetter: candidate < baseline; HigherBetter:
+    /// candidate > baseline) — any improvement, no margin.
+    pub fn better_than(self) -> &'v mut Verdict {
+        self.evaluate(None)
+    }
+
+    /// Pass iff the candidate improves on the baseline by at least `margin`, a
+    /// FRACTION of the baseline (`0.10` = 10% better): LowerBetter requires
+    /// `candidate <= baseline * (1 - margin)`, HigherBetter requires
+    /// `candidate >= baseline * (1 + margin)`. `by_at_least(0.0)` means "no
+    /// regression" (at least as good). A zero baseline is Inconclusive (nothing
+    /// to scale the fractional margin against).
+    pub fn by_at_least(self, margin: f64) -> &'v mut Verdict {
+        self.evaluate(Some(margin))
+    }
+
+    fn evaluate(self, margin: Option<f64>) -> &'v mut Verdict {
+        let outcome = better_outcome(
+            self.baseline_value,
+            self.candidate_value,
+            self.polarity,
+            margin,
+        );
+        let dir = match self.polarity {
+            Some(crate::test_support::Polarity::LowerBetter) => "lower-is-better",
+            Some(crate::test_support::Polarity::HigherBetter) => "higher-is-better",
+            _ => "no-better-direction",
+        };
+        let b_str = self
+            .baseline_value
+            .map(|v| format!("{v}"))
+            .unwrap_or_else(|| "<no-value>".to_string());
+        let c_str = self
+            .candidate_value
+            .map(|v| format!("{v}"))
+            .unwrap_or_else(|| "<no-value>".to_string());
+        let req = match margin {
+            None => "strictly better".to_string(),
+            Some(m) => format!("better by >= {m:.4} fraction"),
+        };
+        let metric = &self.metric;
+        let base = self.baseline;
+        let cand = self.candidate;
+        match outcome {
+            BetterOutcome::Pass => {
+                self.verdict.note(format!(
+                    "[{metric}] candidate {cand}={c_str} {req} than baseline {base}={b_str} ({dir})"
+                ));
+            }
+            BetterOutcome::Fail => {
+                push_detail(
+                    self.verdict,
+                    format!(
+                        "{metric}: candidate {cand}={c_str} is NOT {req} than baseline \
+                         {base}={b_str} ({dir})"
+                    ),
+                );
+            }
+            BetterOutcome::Corrupt => {
+                push_detail(
+                    self.verdict,
+                    format!(
+                        "{metric}: non-finite value (baseline {base}={b_str}, candidate \
+                         {cand}={c_str}) — cannot compare"
+                    ),
+                );
+            }
+            BetterOutcome::Missing => {
+                push_inconclusive(
+                    self.verdict,
+                    format!(
+                        "{metric}: better_across_phases({base}->{cand}) inconclusive: \
+                         needs both phases — baseline={b_str}, candidate={c_str}"
+                    ),
+                );
+            }
+            BetterOutcome::Undirected => {
+                push_inconclusive(
+                    self.verdict,
+                    format!(
+                        "{metric}: better_across_phases inconclusive: metric has no \
+                         lower/higher-is-better polarity — cannot orient 'better'"
+                    ),
+                );
+            }
+            BetterOutcome::ZeroBaseline => {
+                push_inconclusive(
+                    self.verdict,
+                    format!(
+                        "{metric}: better_across_phases inconclusive: baseline {base}=0, no \
+                         baseline to scale the fractional margin ({req})"
+                    ),
+                );
+            }
+        }
+        self.verdict
+    }
+}
+
 /// Extension trait that lets a pre-reduced per-phase map
 /// (typically the output of [`SeriesField::counter_delta_per_phase`],
 /// [`SeriesField::last_per_phase`], or
@@ -1943,6 +2174,141 @@ mod tests {
     use super::*;
     use crate::scenario::sample::SampleSeries;
     use crate::scenario::snapshot::{SnapshotError, SnapshotResult};
+    use crate::test_support::Polarity;
+
+    // -- BetterThanPhase polarity decision (the pure better_outcome core) --
+
+    #[test]
+    fn better_outcome_lower_is_better_strict() {
+        let p = Some(Polarity::LowerBetter);
+        assert_eq!(
+            better_outcome(Some(100.0), Some(50.0), p, None),
+            BetterOutcome::Pass
+        );
+        assert_eq!(
+            better_outcome(Some(50.0), Some(100.0), p, None),
+            BetterOutcome::Fail
+        );
+        assert_eq!(
+            better_outcome(Some(50.0), Some(50.0), p, None),
+            BetterOutcome::Fail,
+            "equal is not STRICTLY better"
+        );
+    }
+
+    #[test]
+    fn better_outcome_higher_is_better_strict() {
+        let p = Some(Polarity::HigherBetter);
+        assert_eq!(
+            better_outcome(Some(50.0), Some(100.0), p, None),
+            BetterOutcome::Pass
+        );
+        assert_eq!(
+            better_outcome(Some(100.0), Some(50.0), p, None),
+            BetterOutcome::Fail
+        );
+        assert_eq!(
+            better_outcome(Some(50.0), Some(50.0), p, None),
+            BetterOutcome::Fail
+        );
+    }
+
+    #[test]
+    fn better_outcome_margin_is_a_baseline_fraction() {
+        let lb = Some(Polarity::LowerBetter);
+        let hb = Some(Polarity::HigherBetter);
+        // LOWER: 10% better = candidate <= 90.
+        assert_eq!(
+            better_outcome(Some(100.0), Some(90.0), lb, Some(0.1)),
+            BetterOutcome::Pass
+        );
+        assert_eq!(
+            better_outcome(Some(100.0), Some(91.0), lb, Some(0.1)),
+            BetterOutcome::Fail,
+            "9% short of the required 10%"
+        );
+        // HIGHER: 10% better = candidate >= 110.
+        assert_eq!(
+            better_outcome(Some(100.0), Some(110.0), hb, Some(0.1)),
+            BetterOutcome::Pass
+        );
+        assert_eq!(
+            better_outcome(Some(100.0), Some(109.0), hb, Some(0.1)),
+            BetterOutcome::Fail
+        );
+        // margin 0.0 = "no regression": equal passes, worse fails.
+        assert_eq!(
+            better_outcome(Some(100.0), Some(100.0), lb, Some(0.0)),
+            BetterOutcome::Pass
+        );
+        assert_eq!(
+            better_outcome(Some(100.0), Some(101.0), lb, Some(0.0)),
+            BetterOutcome::Fail
+        );
+    }
+
+    #[test]
+    fn better_outcome_inconclusive_variants() {
+        let lb = Some(Polarity::LowerBetter);
+        // Missing: either value None (no signal in a phase).
+        assert_eq!(
+            better_outcome(None, Some(1.0), lb, None),
+            BetterOutcome::Missing
+        );
+        assert_eq!(
+            better_outcome(Some(1.0), None, lb, None),
+            BetterOutcome::Missing
+        );
+        // Undirected: TargetValue / Unknown / unregistered (None) polarity.
+        assert_eq!(
+            better_outcome(Some(1.0), Some(2.0), Some(Polarity::Unknown), None),
+            BetterOutcome::Undirected
+        );
+        assert_eq!(
+            better_outcome(Some(1.0), Some(2.0), Some(Polarity::TargetValue(5.0)), None),
+            BetterOutcome::Undirected
+        );
+        assert_eq!(
+            better_outcome(Some(1.0), Some(2.0), None, None),
+            BetterOutcome::Undirected
+        );
+        // ZeroBaseline: a fractional margin against a 0 baseline.
+        assert_eq!(
+            better_outcome(Some(0.0), Some(1.0), lb, Some(0.1)),
+            BetterOutcome::ZeroBaseline
+        );
+        // ...but a STRICT (None-margin) compare against a 0 baseline is a plain
+        // compare, not ZeroBaseline (1 < 0 is just false → Fail).
+        assert_eq!(
+            better_outcome(Some(0.0), Some(1.0), lb, None),
+            BetterOutcome::Fail
+        );
+    }
+
+    #[test]
+    fn better_outcome_corrupt_nonfinite_is_fail_not_silent_pass() {
+        let lb = Some(Polarity::LowerBetter);
+        assert_eq!(
+            better_outcome(Some(f64::NAN), Some(1.0), lb, None),
+            BetterOutcome::Corrupt
+        );
+        assert_eq!(
+            better_outcome(Some(1.0), Some(f64::INFINITY), lb, None),
+            BetterOutcome::Corrupt
+        );
+        // Precedence: non-finite is checked before polarity, so a NaN with an
+        // undirected polarity is Corrupt (not Undirected) — a `<` on NaN is
+        // silently false, so this must NOT collapse to a silent pass.
+        assert_eq!(
+            better_outcome(Some(f64::NAN), Some(1.0), None, None),
+            BetterOutcome::Corrupt
+        );
+        // Missing (None) still wins over Corrupt — no value at all short-circuits.
+        assert_eq!(
+            better_outcome(None, Some(f64::NAN), lb, None),
+            BetterOutcome::Missing
+        );
+    }
 
     fn synthetic_field<T: Copy>(label: &'static str, values: Vec<(u64, T)>) -> SeriesField<T> {
         let tags: Vec<String> = (0..values.len())
