@@ -232,10 +232,15 @@ pub(crate) fn resolve_work_type(
 /// | [`WorkType::ForkExit`]  | OK   | reject |
 ///
 /// `ForkExit + Thread` is rejected because the worker body calls
-/// `libc::fork()` from inside a thread of the parent's tgid; the
-/// child then calls `_exit(0)`, which the kernel routes through
-/// `do_exit`, tearing down the entire tgid (every sibling thread
-/// dies). Use [`CloneMode::Fork`] for [`WorkType::ForkExit`].
+/// `libc::fork()` from inside a thread of the multi-threaded harness:
+/// the fork duplicates only the calling thread, so any lock another
+/// thread holds at fork time stays locked forever in the child. The
+/// child only `_exit`s here — and `fork()` omits `CLONE_THREAD`, so the
+/// child is its own singleton tgid; its `_exit` invokes `exit_group(2)`,
+/// but that tgid has no sibling threads to tear down, so it ends only
+/// the child — but the fork/exit lifecycle is faithfully exercised only
+/// when each worker is its own process. Use [`CloneMode::Fork`] for
+/// [`WorkType::ForkExit`].
 ///
 /// Other Thread-mode interactions worth knowing:
 ///

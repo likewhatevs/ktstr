@@ -475,7 +475,7 @@ pub enum WorkType {
     },
     /// Rapid fork+_exit cycling. Each iteration forks a child that
     /// immediately calls _exit(0). Parent waitpid's then repeats.
-    /// Exercises wake_up_new_task, do_exit, wait_task_zombie.
+    /// Exercises wake_up_new_task, exit_group/do_group_exit, wait_task_zombie.
     ForkExit,
     /// Cycle nice level from -20 to 19 across iterations. Each
     /// iteration: spin_burst → setpriority → yield. Exercises
@@ -658,13 +658,18 @@ pub enum WorkType {
     /// disposition table, the file descriptor table, cwd, and
     /// every other process-scoped attribute with every sibling
     /// worker AND with the test harness. Do NOT call
-    /// `_exit()`/`exit()`, `fork()`/`vfork()`/`clone()`,
-    /// `setpgid()`/`setsid()`, `execve()`, `chdir()`/`chroot()`,
-    /// `setresuid()`/`setresgid()`, `prctl(PR_SET_*)` or any other
-    /// process-scoping syscall — these affect the entire process,
-    /// including all sibling workers and the test runner itself,
-    /// and will produce silent cross-worker corruption,
-    /// unexpected test-harness exits, or both. The supported
+    /// `_exit()`/`exit()`, `setpgid()`/`setsid()`, `execve()`,
+    /// `chdir()`/`chroot()`, `setresuid()`/`setresgid()`,
+    /// `prctl(PR_SET_*)` or any other process-scoping syscall —
+    /// these affect the entire process, including all sibling
+    /// workers and the test harness itself, and will produce silent
+    /// cross-worker corruption, unexpected test-harness exits, or
+    /// both. `fork()`/`vfork()`/`clone()` are equally unsupported but
+    /// for a distinct reason: a fork from a thread of this
+    /// multi-threaded process duplicates only the calling thread, so
+    /// any lock another thread holds at fork time (glibc malloc
+    /// arena, internal mutexes) stays locked forever in the child.
+    /// The supported
     /// shutdown contract is: observe the `&AtomicBool` argument's
     /// `stop.load()` flag and return the [`WorkerReport`] when it
     /// flips. This is a runtime contract, not a static check —

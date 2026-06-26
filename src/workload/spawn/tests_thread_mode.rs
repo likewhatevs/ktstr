@@ -178,9 +178,10 @@ fn spawn_thread_clone_mode_runs_to_completion() {
     }
 }
 /// `CloneMode::Thread + WorkType::ForkExit` MUST bail at spawn
-/// time. Pin the diagnostic message names both the variant and
-/// the structural reason (forked child's `_exit` tears down the
-/// whole tgid via `do_exit`).
+/// time. Pin the diagnostic: it names both incompatible variants
+/// and the structural reason (a fork from a thread of the
+/// multi-threaded harness inherits sibling-held locks the child
+/// cannot release).
 #[test]
 fn spawn_thread_with_forkexit_rejected_at_spawn_time() {
     let config = WorkloadConfig {

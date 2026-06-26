@@ -3382,24 +3382,35 @@ impl WorkloadHandle {
         for group in &groups {
             // Thread mode + ForkExit is incompatible. ForkExit's worker
             // body calls `libc::fork()` from inside `worker_main` to
-            // exercise wake_up_new_task / do_exit / wait_task_zombie;
-            // under [`CloneMode::Thread`] the worker is a thread inside
-            // the parent's tgid, so its `fork()` produces a child that
-            // shares tgid with the parent and every sibling thread. The
-            // child then calls `libc::_exit(0)` which the kernel routes
-            // through `do_exit` — and `do_exit` for a thread-group leader
-            // tears down the whole tgid (every worker thread dies). This
-            // converts the workload into a fratricidal sibling kill on
-            // the very first ForkExit iteration. Reject at spawn time
-            // with an actionable diagnostic; CloneMode::Fork is the
-            // correct choice for ForkExit and will continue to work.
+            // exercise the fork -> exit -> wait lifecycle. Under
+            // [`CloneMode::Thread`] the worker is one thread of the
+            // harness's multi-threaded tgid, and a `fork()` from a thread
+            // of a multi-threaded process duplicates ONLY the calling
+            // thread: any lock another harness thread holds at fork time
+            // (glibc malloc arena, internal mutexes) stays locked forever
+            // in the child, which has no thread left to release it. The
+            // child here only `_exit`s (async-signal-safe), so it survives
+            // this in practice — but the hazard is real and the
+            // fork -> exit primitive is faithfully exercised only when each
+            // worker is its own process. (The child does NOT share the
+            // harness tgid: `fork()` omits CLONE_THREAD, so copy_process
+            // gives it group_leader=self / tgid=pid, a fresh singleton
+            // group. Its `libc::_exit(0)` issues exit_group(2) ->
+            // `do_group_exit` -> `zap_other_threads`, but a singleton tgid
+            // has no other threads for `zap_other_threads` to SIGKILL, so
+            // the teardown ends only the child; the harness tgid is
+            // untouched.) Reject at spawn with an actionable diagnostic;
+            // CloneMode::Fork gives each worker its own tgid and a
+            // lock-clean address space.
             if matches!(dispatch, Dispatch::Thread) && matches!(group.work_type, WorkType::ForkExit)
             {
                 anyhow::bail!(
                     "CloneMode::Thread is incompatible with WorkType::ForkExit \
-                     (group {}) — ForkExit forks inside the worker, which under \
-                     a thread-group worker tears down every sibling thread on \
-                     the child's _exit. Use CloneMode::Fork for ForkExit workloads.",
+                     (group {}) — ForkExit forks inside the worker, and a fork \
+                     from a thread of the multi-threaded harness inherits \
+                     sibling-held locks the child cannot release; only a \
+                     separate process faithfully exercises the fork/exit \
+                     lifecycle. Use CloneMode::Fork for ForkExit workloads.",
                     group.group_idx,
                 );
             }
@@ -3500,10 +3511,12 @@ impl WorkloadHandle {
             // [`validate_workload_admission`] and are shared with
             // [`Self::spawn_pcomm_cgroup`]. The
             // CloneMode-vs-WorkType compat checks above stay
-            // dispatch-specific because their reasoning differs
-            // per dispatch (Thread+ForkExit vs pcomm+ForkExit are
-            // rejected for different reasons; Fork+EpollStorm has
-            // no pcomm equivalent).
+            // dispatch-specific because each dispatch path gates
+            // independently: Thread+ForkExit (here) and pcomm+ForkExit
+            // ([`Self::spawn_pcomm_cgroup`]) reject for the SAME reason
+            // (a fork from a thread of a multi-threaded process inherits
+            // sibling-held locks the child cannot release) via separate
+            // per-path gates; Fork+EpollStorm has no pcomm equivalent.
             validate_workload_admission(group)?;
         }
 
