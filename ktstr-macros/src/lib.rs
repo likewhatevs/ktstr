@@ -243,8 +243,9 @@ mod scheduler;
 /// `crate::host_only = true`) is rejected with a targeted message
 /// naming both valid forms with concrete examples — the macro only
 /// accepts bare single-segment idents because routing dispatches on
-/// the ident string against `BOOL_ATTR_NAMES` or the value-attr
-/// table. `#[ktstr_test(host_only(false))]` (parenthesised
+/// the ident string against `BOOL_ATTR_NAMES` or the value-attr match
+/// arms (enumerated in `VALUE_ATTR_NAMES`).
+/// `#[ktstr_test(host_only(false))]` (parenthesised
 /// arguments) is rejected with a separate targeted message naming
 /// the attribute and the two valid forms (`= value` or bare); the
 /// same diagnostic fires for `crate::host_only(false)` so the
@@ -518,6 +519,43 @@ mod tests {
         let opt: Option<bool> = Some(true);
         let ts = ktstr_test::option_tokens(&opt);
         assert_eq!(ts.to_string(), quote! { Some(true) }.to_string());
+    }
+
+    /// Pins the two attribute-name registries the unknown-attribute diagnostic
+    /// is derived from: they must be internally duplicate-free, disjoint (a
+    /// name is a bool flag XOR a value attr, never both), and sum to the full
+    /// accepted set. A maintainer adding an attribute to the wrong slice — or
+    /// to both — silently shifts the user-facing "expected:" list; this catches
+    /// it. (The complementary direction — a name in a slice with no handling
+    /// match arm — is guarded at parse time by the unknown-attribute catch-all
+    /// `assert!`.)
+    #[test]
+    fn attr_name_registries_disjoint_and_complete() {
+        use std::collections::HashSet;
+        let bool_names = ktstr_test::BOOL_ATTR_NAMES;
+        let value_names = ktstr_test::VALUE_ATTR_NAMES;
+        let bool_set: HashSet<&str> = bool_names.iter().copied().collect();
+        let value_set: HashSet<&str> = value_names.iter().copied().collect();
+        // No duplicates within either slice.
+        assert_eq!(
+            bool_set.len(),
+            bool_names.len(),
+            "BOOL_ATTR_NAMES has duplicate entries",
+        );
+        assert_eq!(
+            value_set.len(),
+            value_names.len(),
+            "VALUE_ATTR_NAMES has duplicate entries",
+        );
+        // Disjoint: an attribute is a bool flag XOR a value attr.
+        let overlap: Vec<&str> = bool_set.intersection(&value_set).copied().collect();
+        assert!(
+            overlap.is_empty(),
+            "BOOL_ATTR_NAMES and VALUE_ATTR_NAMES overlap: {overlap:?}",
+        );
+        // Cardinality pin: 15 bool + 48 value = 63 accepted attributes.
+        assert_eq!(bool_names.len(), 15, "bool attribute count changed");
+        assert_eq!(value_names.len(), 48, "value attribute count changed");
     }
 
     /// Contract pin: `ktstr_test::AttrValues::default()` is the single source of

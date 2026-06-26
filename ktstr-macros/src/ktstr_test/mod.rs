@@ -297,7 +297,7 @@ pub(crate) const DEFAULT_MEMORY_MIB: u32 = 2048;
 /// matching default in [`AttrValues::default`]); (4) the codegen
 /// gate that conditionally emits the new field; (5) `KtstrTestEntry`
 /// + its `DEFAULT` in `src/test_support/entry.rs` (cross-crate).
-const BOOL_ATTR_NAMES: &[&str] = &[
+pub(crate) const BOOL_ATTR_NAMES: &[&str] = &[
     "auto_repro",
     "expect_auto_repro",
     "not_starved",
@@ -313,6 +313,74 @@ const BOOL_ATTR_NAMES: &[&str] = &[
     "ignore",
     "kaslr",
     "wprof",
+];
+
+/// Canonical list of value-taking attributes the `#[ktstr_test]` parser
+/// accepts (the `key = value` forms — paths, strings, integers, floats,
+/// arrays). Companion to [`BOOL_ATTR_NAMES`]; the two together are the full
+/// accepted set the unknown-attribute diagnostic suggests. The NameValue
+/// match arms in [`ktstr_test_impl`] are the matching per-attr dispatch; this
+/// slice mirrors their idents. Adding a new value attribute touches: (1) this
+/// slice; (2) the matching arm (an own arm, or the integer/float/array group
+/// pattern); (3) the matching field(s) on [`AttrValues`] (and the matching
+/// default in [`AttrValues::default`]); (4) the codegen that emits the field.
+/// The unknown-attribute catch-all `assert!`s that no name in either slice
+/// reaches it (a name here with no handling arm is a const-vs-dispatch
+/// divergence), and a unit test pins disjointness from [`BOOL_ATTR_NAMES`]
+/// plus the total cardinality.
+pub(crate) const VALUE_ATTR_NAMES: &[&str] = &[
+    // Path / string / token (own arms):
+    "scheduler",
+    "payload",
+    "workloads",
+    "staged_schedulers",
+    "bpf_map_write",
+    "post_vm",
+    "post_vm_unconditional",
+    "disk",
+    "network",
+    "config",
+    "expect_scx_bpf_error_contains",
+    "expect_scx_bpf_error_matches",
+    "wprof_args",
+    "workload_root_cgroup",
+    // Array-of-path/string (own arms):
+    "extra_sched_args",
+    "extra_include_files",
+    // Integer (group pattern):
+    "llcs",
+    "cores",
+    "threads",
+    "numa_nodes",
+    "memory_mib",
+    "sustained_samples",
+    "max_gap_ms",
+    "watchdog_timeout_s",
+    "duration_s",
+    "max_local_dsq_depth",
+    "min_numa_nodes",
+    "min_llcs",
+    "min_cpus",
+    "max_llcs",
+    "max_numa_nodes",
+    "max_cpus",
+    "cpu_budget",
+    "max_p99_wake_latency_ns",
+    "cleanup_budget_ms",
+    "num_snapshots",
+    // Float (group pattern):
+    "max_imbalance_ratio",
+    "max_fallback_rate",
+    "max_keep_last_rate",
+    "max_spread_pct",
+    "max_throughput_cv",
+    "min_work_rate",
+    "max_wake_latency_cv",
+    "min_iteration_rate",
+    "max_migration_ratio",
+    "min_page_locality",
+    "max_cross_node_migration_ratio",
+    "max_slow_tier_ratio",
 ];
 
 /// Owned bundle of every `#[ktstr_test]` attribute slot. The parse
@@ -1473,10 +1541,28 @@ pub(crate) fn ktstr_test_impl(
                         ));
                     }
                     _ => {
+                        // The unknown-attribute "expected:" list is DERIVED from
+                        // the two name registries (sorted for a scannable
+                        // diagnostic), not hand-maintained. A name in either
+                        // registry must have matched an arm above; reaching here
+                        // with such a name is a const-vs-dispatch divergence — the
+                        // same soft-invariant the bool path guards via the
+                        // BOOL_ATTR_NAMES `assert!`.
+                        let s = ident.as_str();
+                        assert!(
+                            !BOOL_ATTR_NAMES.contains(&s) && !VALUE_ATTR_NAMES.contains(&s),
+                            "internal: `{ident}` is a known attribute (in \
+                             BOOL_ATTR_NAMES/VALUE_ATTR_NAMES) but reached the \
+                             unknown-attribute arm — const-vs-dispatch divergence",
+                        );
+                        let mut expected: Vec<&str> =
+                            BOOL_ATTR_NAMES.iter().chain(VALUE_ATTR_NAMES).copied().collect();
+                        expected.sort_unstable();
                         return Err(syn::Error::new_spanned(
                             path,
                             format!(
-                                "unknown attribute `{ident}`, expected: llcs, cores, threads, numa_nodes, memory_mib, scheduler, staged_schedulers, payload, workloads, auto_repro, expect_auto_repro, not_starved, isolation, max_gap_ms, max_spread_pct, max_throughput_cv, min_work_rate, max_p99_wake_latency_ns, max_wake_latency_cv, min_iteration_rate, max_migration_ratio, max_imbalance_ratio, max_local_dsq_depth, fail_on_stall, sustained_samples, max_fallback_rate, max_keep_last_rate, min_page_locality, max_cross_node_migration_ratio, max_slow_tier_ratio, expect_scx_bpf_error_contains, expect_scx_bpf_error_matches, extra_sched_args, extra_include_files, workload_root_cgroup, min_numa_nodes, min_llcs, requires_smt, min_cpus, max_llcs, max_numa_nodes, max_cpus, cpu_budget, watchdog_timeout_s, performance_mode, no_perf_mode, duration_s, bpf_map_write, expect_err, survives_storm, allow_inconclusive, host_only, ignore, kaslr, cleanup_budget_ms, post_vm, post_vm_unconditional, config, disk, network, num_snapshots, wprof, wprof_args"
+                                "unknown attribute `{ident}`, expected: {}",
+                                expected.join(", "),
                             ),
                         ));
                     }
