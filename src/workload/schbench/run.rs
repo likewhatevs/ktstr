@@ -672,6 +672,16 @@ fn worker_loop(td: &ThreadData, ctx: &WorkerCtx) {
             }
         }
     }
+    // Shutdown wake: the loop exits on `stop` without a final `msg_and_wait`, so
+    // the message thread may still be parked in `wait_forever` (its only waker is
+    // a worker post). schbench's MAIN thread handles this -- it fposts each
+    // message thread after `stopping = 1` (`schbench.c:1832`, `:1933`) -- but our
+    // `run()` joins passively and `msg_td` is private to `run_one_message_thread`,
+    // so the exiting worker wakes its own message thread instead. Without this, a
+    // worker that exits mid-`do_work` leaves the message thread parked forever and
+    // `run()` deadlocks. Idempotent across workers: the first post the message
+    // thread observes makes it re-check `stop` and break; later posts are no-ops.
+    msg_td.futex.post();
     // Final drain: close the still-open phase. When non-phasic this is the only
     // snapshot (`cur_epoch` 0), so run() builds the whole-run result uniformly
     // from snapshots.
@@ -1048,6 +1058,44 @@ mod tests {
         // epoch 0, which the host discards. No per-phase metrics are emitted.
         assert_eq!(outcome.phases.len(), 1, "non-phasic => single baseline phase");
         assert_eq!(outcome.phases[0].0, 0, "the lone phase is BASELINE epoch 0");
+    }
+
+    #[test]
+    fn engine_terminates_when_lone_worker_stops() {
+        // Regression for the shutdown deadlock: with a SINGLE worker there is no
+        // second worker to post the message thread, so a worker that exits on
+        // `stop` while the message thread is parked in `wait_forever` must wake it
+        // (the unconditional post at worker_loop's exit), or run() hangs forever.
+        // Reaching the assertion at all proves run() returned. `sleep_usec` 0
+        // keeps the lone worker almost always mid-`do_work` when stop fires (the
+        // deadlock-prone window). engine_runs / engine_splits use 2 workers and
+        // missed this -- a second worker posting the message thread masks the bug;
+        // a hang here is the nextest timeout, exactly how the bug first surfaced.
+        let config = SchbenchConfig {
+            message_threads: 1,
+            worker_threads: 1,
+            cache_footprint_kib: 256,
+            operations: 5,
+            sleep_usec: 0,
+            skip_locking: false,
+        };
+        let stop = AtomicBool::new(false);
+        let progress = AtomicU64::new(0);
+        let outcome = std::thread::scope(|s| {
+            let runner = s.spawn(|| run(&config, &stop, &progress, None));
+            while progress.load(Ordering::Relaxed) < 10 {
+                core::hint::spin_loop();
+            }
+            stop.store(true, Ordering::Release);
+            // Deadlocks here on regression: the lone worker exits without waking
+            // the parked message thread, so this join never returns.
+            runner.join().expect("run panicked")
+        });
+        assert!(
+            outcome.whole_run.loop_count >= 10,
+            "engine did work and returned: {}",
+            outcome.whole_run.loop_count
+        );
     }
 
     #[test]
