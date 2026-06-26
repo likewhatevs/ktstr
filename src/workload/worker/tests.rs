@@ -1350,6 +1350,98 @@ fn parse_cgroup_rel_and_self_dir_discipline() {
     }
 }
 
+/// WorkerCtx::open_sibling_cgroup_procs: resolves
+/// `cgroup_dir().parent()/<name>/cgroup.procs`, opens it write-mode (the
+/// writability precheck), rejects escaping names before any fs access, and
+/// surfaces NotFound (missing sibling / no cgroup_dir) loudly. Uses a
+/// synthetic cgroup tree under a tempdir (no real cgroupfs).
+#[test]
+fn open_sibling_cgroup_procs_resolves_opens_and_validates() {
+    use std::io::{ErrorKind, Write};
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let root = tmp.path().join("root");
+    let worker = root.join("worker");
+    std::fs::create_dir_all(&worker).unwrap();
+    std::fs::create_dir_all(root.join("dest")).unwrap();
+    std::fs::write(root.join("dest").join("cgroup.procs"), b"").unwrap();
+    let stop = AtomicBool::new(false);
+    let ctx = WorkerCtx::new(&stop, &[], &[], Some(&worker), CustomCfg::default());
+
+    // Resolves + opens the sibling's cgroup.procs write-mode.
+    let mut f = ctx
+        .open_sibling_cgroup_procs("dest")
+        .expect("dest sibling cgroup.procs must open write-mode");
+    assert!(f.write_all(b"").is_ok(), "the returned handle is writable");
+
+    // Missing sibling -> NotFound, with the resolved path enriched into the
+    // message (the .map_err layer the doc promises).
+    let miss = ctx.open_sibling_cgroup_procs("no_such").unwrap_err();
+    assert_eq!(miss.kind(), ErrorKind::NotFound);
+    assert!(
+        miss.to_string().contains("no_such/cgroup.procs"),
+        "the open error must name the resolved sibling path; got: {miss}"
+    );
+
+    // Escaping / malformed names rejected as InvalidInput (the
+    // validation-before-fs class — a dropped validation would instead surface
+    // these as NotFound, since parent.join(name) would resolve).
+    for bad in ["", "..", "a/../b", "/abs", ".hidden"] {
+        assert_eq!(
+            ctx.open_sibling_cgroup_procs(bad).unwrap_err().kind(),
+            ErrorKind::InvalidInput,
+            "name {bad:?} must be rejected as InvalidInput"
+        );
+    }
+
+    // No cgroup_dir (root / non-v2 worker) -> NotFound, never a fabricated path.
+    let ctx_root = WorkerCtx::new(&stop, &[], &[], None, CustomCfg::default());
+    assert_eq!(
+        ctx_root.open_sibling_cgroup_procs("dest").unwrap_err().kind(),
+        ErrorKind::NotFound
+    );
+
+    // cgroup_dir == "/" (parent() is None) -> NotFound (the documented
+    // no-parent branch), not a malformed join.
+    let ctx_slash = WorkerCtx::new(
+        &stop,
+        &[],
+        &[],
+        Some(std::path::Path::new("/")),
+        CustomCfg::default(),
+    );
+    assert_eq!(
+        ctx_slash.open_sibling_cgroup_procs("dest").unwrap_err().kind(),
+        ErrorKind::NotFound
+    );
+}
+
+/// An unwritable sibling `cgroup.procs` surfaces as PermissionDenied
+/// (errno-kind preserved). Gated on non-root — root bypasses DAC mode bits
+/// on a regular file, so the EACCES path is only observable unprivileged
+/// (ktstr's VM runs as root, where this skips).
+#[test]
+fn open_sibling_cgroup_procs_unwritable_is_permission_denied() {
+    if unsafe { libc::geteuid() } == 0 {
+        return; // root bypasses the 0o400 mode bit; EACCES is unobservable.
+    }
+    use std::io::ErrorKind;
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let worker = tmp.path().join("root").join("worker");
+    let dest = tmp.path().join("root").join("dest");
+    std::fs::create_dir_all(&worker).unwrap();
+    std::fs::create_dir_all(&dest).unwrap();
+    let procs = dest.join("cgroup.procs");
+    std::fs::write(&procs, b"").unwrap();
+    std::fs::set_permissions(&procs, std::fs::Permissions::from_mode(0o400)).unwrap();
+    let stop = AtomicBool::new(false);
+    let ctx = WorkerCtx::new(&stop, &[], &[], Some(&worker), CustomCfg::default());
+    assert_eq!(
+        ctx.open_sibling_cgroup_procs("dest").unwrap_err().kind(),
+        ErrorKind::PermissionDenied
+    );
+}
+
 /// `custom_iterations_telltale` flags ONLY the `work_units > 0` +
 /// `iterations == 0` footgun shape (the naive-Custom-author trap the dispatch
 /// warn-once targets), and nothing else — so the advisory never fires on a

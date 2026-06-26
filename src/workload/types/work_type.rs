@@ -165,10 +165,12 @@ impl CustomCfg {
 ///
 /// Exposes the worker's stop flag plus the parts of its runtime
 /// environment a scheduler probe most often needs — its effective
-/// cpuset, its cgroup-sibling pids, and its own cgroup-v2 directory —
-/// so a custom worker does not re-roll `sched_getaffinity`,
-/// `cgroup.procs`, or `/proc/self/cgroup` parsing. All are captured
-/// once, at worker entry, before the work loop runs.
+/// cpuset, its cgroup-sibling pids, its own cgroup-v2 directory, and a
+/// fork-safe [`CustomCfg`] payload — plus `open_sibling_cgroup_procs()` to
+/// open a sibling cgroup's `cgroup.procs`, so a custom worker does not
+/// re-roll `sched_getaffinity`, `cgroup.procs`, or `/proc/self/cgroup`
+/// parsing. The captured fields are read once, at worker entry, before
+/// the work loop runs.
 ///
 /// Borrowed, not owned: the framework constructs a `WorkerCtx`
 /// pointing at stack-local data in `worker_main` and passes it by
@@ -253,6 +255,63 @@ impl<'a> WorkerCtx<'a> {
     #[inline]
     pub fn cfg(&self) -> CustomCfg {
         self.cfg
+    }
+
+    /// Open the `cgroup.procs` of a SIBLING cgroup (a child of this worker's
+    /// cgroup parent) for writing — the ready-to-use migration target a
+    /// Custom worker needs without re-parsing `/proc/self/cgroup` or
+    /// hand-rolling a writability precheck. The sibling resolves to
+    /// `cgroup_dir().parent()/<name>/cgroup.procs`.
+    ///
+    /// The write-mode open IS the precheck: a successful return means the
+    /// sibling's `cgroup.procs` exists and was openable for write. The
+    /// kernel checks `cgroup.procs` WRITE permission at write time (against
+    /// the open-time credentials), so a returned `File` can still fail on
+    /// the actual write — the caller must handle write errors too.
+    ///
+    /// # Errors
+    /// - `InvalidInput` if `name` is empty, absolute, contains a NUL, or has
+    ///   a `.`/`..`/leading-dot/empty path component (rejected before any fs
+    ///   access, so a hostile name cannot escape the parent via join).
+    /// - `NotFound` if the worker has no resolvable cgroup-v2 dir (root /
+    ///   non-v2 — run it in a dedicated cgroup) or its cgroup has no parent.
+    /// - the underlying open error (`NotFound` for a missing sibling,
+    ///   `PermissionDenied` for an unwritable one, …) with `ErrorKind`
+    ///   preserved and the resolved path in the message.
+    pub fn open_sibling_cgroup_procs(&self, name: &str) -> std::io::Result<std::fs::File> {
+        // Validate before touching the fs: `name` is user-supplied, and an
+        // unchecked `.`/`..`/absolute name would escape the parent via
+        // Path::join. Delegate to cgroup.rs::validate_cgroup_name so the
+        // per-class diagnostic (which rule fired) stays in lockstep with the
+        // managed-cgroup creator instead of collapsing to one generic message.
+        crate::cgroup::validate_cgroup_name(name)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?;
+        let cg = self.cgroup_dir().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "open_sibling_cgroup_procs: worker has no resolvable cgroup-v2 \
+                 dir (run it in a dedicated cgroup, not the root / a non-v2 host)",
+            )
+        })?;
+        let parent = cg.parent().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "open_sibling_cgroup_procs: the worker's cgroup has no parent",
+            )
+        })?;
+        let path = parent.join(name).join("cgroup.procs");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .map_err(|e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!(
+                        "open_sibling_cgroup_procs({name:?}) -> {}: {e}",
+                        path.display()
+                    ),
+                )
+            })
     }
 }
 
