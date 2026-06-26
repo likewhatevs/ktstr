@@ -188,7 +188,7 @@ impl Linked for Request {
 /// | schbench flag | ktstr |
 /// |---|---|
 /// | `-m` message-threads | `message_threads` |
-/// | `-t` threads | `worker_threads` (workers per message thread; the `0` default diverges -- see below) |
+/// | `-t` threads | `worker_threads` (workers per message thread; `0` = `ceil(cpuset_cpus / message_threads)`, see below) |
 /// | `-F` cache_footprint | `cache_footprint_kib` |
 /// | `-n` operations | `operations` |
 /// | `-s` sleep_usec | `sleep_usec` |
@@ -199,15 +199,14 @@ impl Linked for Request {
 ///
 /// ## Set by ktstr topology, not a flag
 ///
-/// - `-t` default: with `worker_threads = 0`, ktstr spawns one worker per CPU in
-///   the worker's `sched_getaffinity` mask (the allocated guest cpuset, set by
-///   the scenario's topology / `CgroupDef`) PER message thread. schbench's `-t`
-///   0-default instead divides its CPU count across the message threads
-///   (`ceil(num_cpus / message_threads)` per thread, `schbench.c:1852`), keeping
-///   its total worker count near `num_cpus`. ktstr does NOT divide, so at
-///   `message_threads > 1` it spawns `message_threads`x as many workers; the two
-///   coincide only at the default `message_threads = 1`. An explicit non-zero
-///   `worker_threads` is workers-per-message-thread in both.
+/// - `-t` default: with `worker_threads = 0`, ktstr matches schbench's `-t`
+///   0-default -- it divides the CPU count across the message threads,
+///   `ceil(cpus / message_threads)` per thread (`schbench.c:1849-1852`), so the
+///   total worker count stays near the CPU count. ktstr scopes "cpus" to the
+///   allocated guest cpuset (the worker's `sched_getaffinity` mask, set by the
+///   scenario's topology / `CgroupDef`) rather than schbench's `get_nprocs`, so
+///   the total is ≈ the cpuset's CPU count. An explicit non-zero `worker_threads`
+///   is workers-per-message-thread in both.
 /// - `-M` (message-cpus) / `-W` (worker-cpus) thread pinning: ktstr places
 ///   threads through its affinity / cpuset layer, so there is deliberately no
 ///   per-thread-pin knob.
@@ -236,12 +235,12 @@ impl Linked for Request {
 pub struct SchbenchConfig {
     /// Number of message threads (`schbench.c` `-m`, default 1).
     pub message_threads: usize,
-    /// Worker threads per message thread (`schbench.c` `-t`). 0 resolves to one
-    /// per CPU in the allocated guest cpuset (the worker's `sched_getaffinity`
-    /// mask, per ruling), spawned PER message thread -- which diverges from
-    /// schbench's 0-default, which divides its CPU count across the message
-    /// threads (`ceil(num_cpus / message_threads)`, `schbench.c:1852`); the two
-    /// coincide only at `message_threads = 1`. See the CLI-parity section above.
+    /// Worker threads per message thread (`schbench.c` `-t`). 0 resolves to
+    /// `ceil(cpuset_cpus / message_threads)` -- the CPU count of the allocated
+    /// guest cpuset (the worker's `sched_getaffinity` mask, per ruling) divided
+    /// across the message threads, matching schbench's 0-default
+    /// (`schbench.c:1849-1852`) scoped to the cpuset rather than `get_nprocs`.
+    /// See `resolve_worker_count` and the CLI-parity section above.
     pub worker_threads: usize,
     /// Per-worker matrix cache footprint in KiB (`schbench.c` `-F`, default
     /// 256); sets the matrix dimension.
@@ -379,6 +378,24 @@ impl SchbenchConfig {
     /// 10 / m = 0) degenerates to default mode, exactly as schbench does.
     pub(crate) fn rps_per_message_thread(&self) -> usize {
         self.normalized_total_rps() / self.message_threads.max(1)
+    }
+
+    /// Effective per-message-thread worker count for [`run`]. A non-zero
+    /// `worker_threads` is workers-per-message-thread as-is; the `0` default
+    /// mirrors schbench's `-t` 0-default (`schbench.c:1849-1852`:
+    /// `worker_threads = (num_cpus + message_threads - 1) / message_threads`)
+    /// but over the allocated guest cpuset (`allowed_count` from
+    /// [`resolve_cpu_topology`], per the ktstr cpuset ruling) instead of
+    /// `get_nprocs`: it divides the cpuset CPU count across the message threads
+    /// (ceil), so the TOTAL worker count (`message_threads * this`) stays ≈ the
+    /// cpuset CPU count -- matching schbench's total ≈ `num_cpus`.
+    /// `message_threads` floors at 1 to avoid a zero divisor; the divide is a
+    /// no-op at the default `message_threads = 1`.
+    pub(crate) fn resolve_worker_count(&self, allowed_count: usize) -> usize {
+        if self.worker_threads != 0 {
+            return self.worker_threads;
+        }
+        allowed_count.div_ceil(self.message_threads.max(1))
     }
 }
 
@@ -1559,11 +1576,7 @@ pub(crate) fn run(
     phase_epoch: Option<&AtomicU32>,
 ) -> SchbenchOutcome {
     let (allowed_count, lock_array_size) = resolve_cpu_topology();
-    let worker_threads = if config.worker_threads == 0 {
-        allowed_count
-    } else {
-        config.worker_threads
-    };
+    let worker_threads = config.resolve_worker_count(allowed_count);
     let locks = if config.skip_locking {
         None
     } else {
@@ -1699,6 +1712,28 @@ mod tests {
                 next: AtomicPtr::new(ptr::null_mut()),
             }
         }
+    }
+
+    #[test]
+    fn resolve_worker_count_divides_cpuset_across_message_threads() {
+        // Explicit non-zero worker_threads is honored as-is (per message thread).
+        let c = SchbenchConfig::default().worker_threads(3).message_threads(4);
+        assert_eq!(c.resolve_worker_count(8), 3);
+
+        // 0-default mirrors schbench's ceil(cpuset_cpus / message_threads)
+        // (schbench.c:1849-1852), scoped to the cpuset count:
+        //   m=1: 8/1 = 8 per thread, total 8 (== the cpuset count; no divide).
+        let c = SchbenchConfig::default().message_threads(1);
+        assert_eq!(c.resolve_worker_count(8), 8);
+        //   m=2: 8/2 = 4 per thread, total 8.
+        let c = SchbenchConfig::default().message_threads(2);
+        assert_eq!(c.resolve_worker_count(8), 4);
+        //   m=3: ceil(8/3) = 3 per thread, total 9 (≈ 8; schbench rounds up too).
+        let c = SchbenchConfig::default().message_threads(3);
+        assert_eq!(c.resolve_worker_count(8), 3);
+        //   message_threads floored at 1 — no div-by-zero.
+        let c = SchbenchConfig::default().message_threads(0);
+        assert_eq!(c.resolve_worker_count(8), 8);
     }
 
     #[test]
