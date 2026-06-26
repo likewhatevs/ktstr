@@ -230,12 +230,19 @@ impl Linked for Request {
 ///
 /// `Some(p)` partitions `cache_footprint_kib` into a per-thread private matrix
 /// (`p`%) and ONE process-global shared matrix (`100-p`%) that every worker
-/// RMW-multiplies concurrently, reproducing schbench's cross-core
+/// multiplies into concurrently, reproducing schbench's cross-core
 /// shared-working-set cache contention (`schbench.c:1390-1404`, `:1858-1863`).
-/// ktstr models the shared matrix with `AtomicU64` `Relaxed` load/store: on
-/// x86-64 these lower to a plain `MOV` (the multiply has no atomic RMW), so the
-/// contention is identical to schbench's plain shared-memory race -- with zero
-/// unsafe. `None` (default) is the legacy all-private single matrix.
+/// ktstr models the shared matrix with `AtomicU64` `Relaxed` accesses. Like
+/// schbench's emitted code, the shared kernel keeps the running sum in a register
+/// and STORES it to each shared C cell on every inner (`k`) iteration -- C is
+/// write-only in the loop (A and B are loaded each `k`, C is never reloaded), and
+/// that per-k store is what generates the contention. Both gcc and clang keep the
+/// per-k store: `do_some_math` reads `m1`/`m2`/`m3` as offsets into one base
+/// pointer, so neither can prove the `m3` store doesn't alias the next `k`'s
+/// `m1`/`m2` loads. On x86-64 a `Relaxed` load/store lowers to a plain `MOV` (no
+/// `LOCK`), so the contention is identical to schbench's plain shared-memory race
+/// -- but sound (atomics, no data race), with zero unsafe. `None` (default) is
+/// the legacy all-private single matrix.
 ///
 /// ## Modes not ported
 ///
@@ -286,7 +293,7 @@ pub struct SchbenchConfig {
     /// schbench's legacy all-private single matrix (`schbench.c:1405-1408`,
     /// `:1879-1880`). `Some(p)` partitions `cache_footprint_kib` into a
     /// per-thread private matrix (`p`%) and ONE process-global shared matrix
-    /// (`100-p`%) that every worker RMW-multiplies concurrently, reproducing
+    /// (`100-p`%) that every worker multiplies into concurrently, reproducing
     /// schbench's cross-core shared-working-set cache contention
     /// (`schbench.c:1390-1404`, `:1858-1863`). `Some(0)` = all shared,
     /// `Some(100)` = all private (same matrix sizes as `None`, but routed
@@ -1974,9 +1981,10 @@ mod tests {
 
     #[test]
     fn engine_split_runs_shared_matrix_concurrently() {
-        // --split with two workers: both RMW-multiply the ONE process-global
-        // shared AtomicU64 matrix concurrently (the deliberate cache contention
-        // schbench models). Reaching the assertion proves the shared-matrix path
+        // --split with two workers: both concurrently multiply into the ONE
+        // process-global shared AtomicU64 matrix (per-k stores to the shared C
+        // cells -- the deliberate cache contention schbench models). Reaching the
+        // assertion proves the shared-matrix path
         // neither deadlocks nor trips a data-race trap -- the atomics make the
         // shared race sound (vs schbench's plain shared-memory race). operations=8
         // @ split=50 => 4 shared + 4 private ops/cycle, so both paths run. Stop is

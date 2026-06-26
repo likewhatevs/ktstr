@@ -7,8 +7,8 @@
 //! multiplies on ONE process-global shared matrix (modeled with `AtomicU64`
 //! `Relaxed` load/store, so the shared race is sound) and the rest on a per-worker
 //! private matrix (schbench.c:1390-1404). Two worker threads concurrently
-//! RMW-multiply the shared matrix, so this exercises the real concurrent shared
-//! path in a guest. The gate is the FRAMEWORK INVARIANT: the split workload boots,
+//! multiply into the shared matrix (per-k stores to the shared C cells), so this
+//! exercises the real concurrent shared path in a guest. The gate is the FRAMEWORK INVARIANT: the split workload boots,
 //! runs, and emits its per-phase latency metrics -- it does NOT gate on absolute
 //! latency (scx-ktstr is a fixture, not a performance scheduler). A deadlock,
 //! panic, or data-race trap in the shared-matrix path would produce no metric and
@@ -69,7 +69,7 @@ fn schbench_split_runs_in_vm(ctx: &Ctx) -> Result<AssertResult> {
 
     // split_percent(Some(50)): half the cache footprint is the per-thread private
     // matrix, half is the ONE shared matrix every worker contends on. Two worker
-    // threads make the shared-matrix RMW genuinely concurrent. WorkType::Schbench
+    // threads make the shared-matrix writes genuinely concurrent. WorkType::Schbench
     // mandates a single ktstr worker (the message/worker topology is internal).
     let cfg = SchbenchConfig::default()
         .worker_threads(2)

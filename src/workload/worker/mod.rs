@@ -4341,25 +4341,40 @@ pub(super) fn matrix_multiply(data: &mut [u64], size: usize, work_units: &mut u6
 }
 
 /// Shared-matrix variant of [`matrix_multiply`] for schbench's `--split` shared
-/// matrix, which every worker thread RMW-multiplies concurrently. A/B are loaded
-/// and C is stored with `Ordering::Relaxed`. On x86-64 a Relaxed atomic
-/// load/store lowers to a plain `MOV` (only read-modify-write atomics take
-/// `LOCK`), and the multiply does separate loads + a single store per C cell (no
-/// atomic RMW), so the per-instruction cost equals the plain variant; the extra
-/// cost over a private matrix is the cross-core cache-line contention on the
-/// shared C region -- which is the POINT of split mode. Sound: every concurrent
-/// access goes through an atomic, so there is no data race (no UB), unlike a
-/// plain shared `&mut` buffer.
+/// matrix, which every worker thread writes concurrently. It mirrors what gcc and
+/// clang actually emit for schbench's shared `do_some_math` (`m3[..] = 0; for k:
+/// m3[..] += m1[..]*m2[..]`): the running sum is kept in a register, but both
+/// compilers STORE it to the shared C cell every `k` (`size^3` shared-C stores
+/// per matrix, not one) and do NOT reload it. The store is kept because
+/// `do_some_math` reads `m1`/`m2`/`m3` as offsets into one base pointer (its
+/// `data` param), so neither compiler can prove the `m3` store doesn't alias the
+/// next `k`'s `m1`/`m2` loads -- this is in-function aliasing (the SAME
+/// `do_some_math` schbench uses for the private matrix; one symbol, three call
+/// sites in the gcc binary), not anything specific to the shared global. That
+/// per-k store is the source of `--split`'s cross-core cache-line contention, so
+/// this kernel accumulates in a register AND stores `acc` to the shared C cell
+/// every `k`; storing once per cell would under-generate the contention split
+/// exists to model. (The private [`matrix_multiply`] does store once per cell --
+/// non-split, ktstr stays within schbench's gcc-vs-clang throughput envelope with
+/// no contention to amplify the difference, and a faithful per-k store there
+/// would need DCE-defeating volatile writes.) A and B are loaded each `k`
+/// (`size^3` shared loads); C is write-only in the loop. All accesses use
+/// `Ordering::Relaxed`: on x86-64 each lowers to a plain `MOV` (only read-modify-
+/// write atomics take `LOCK`), so the contention matches schbench's plain
+/// shared-memory race -- but it is sound (every concurrent access goes through an
+/// atomic, so there is no data race / no UB, unlike a plain shared `&mut` buffer;
+/// the C result races exactly as schbench's does, which the contention workload
+/// does not depend on).
 ///
 /// No `black_box` / `write_volatile` / read-back barrier (unlike
 /// [`matrix_multiply`], whose barriers stop the optimizer constant-folding the
-/// zero-init A/B and DCE-ing the C store on the single-thread plain path): an
-/// atomic `load(Relaxed)` is un-foldable (the optimizer cannot assume it returns
-/// the zero-init value -- another thread may have stored) and an atomic
-/// `store(Relaxed)` is un-elidable (a cross-thread-visible side effect). Neither
-/// this nor [`matrix_multiply`] auto-vectorizes (the serial accumulator
-/// reduction blocks SLP for both), so dropping the barriers costs no
-/// vectorization here.
+/// zero-init A/B and DCE-ing the single C store on the single-thread plain path):
+/// an atomic `load(Relaxed)` is un-foldable and an atomic `store(Relaxed)` is
+/// un-elidable (a cross-thread-visible side effect), so the per-k C stores cannot
+/// be collapsed back to a single store. Neither this nor [`matrix_multiply`]
+/// auto-vectorizes (the serial accumulator reduction blocks SLP for both; there
+/// is no SIMD `u64` multiply on the `x86-64-v3` target -- verified by disassembly
+/// of ktstr and of gcc- and clang-built schbench).
 ///
 /// Takes `&[AtomicU64]` (a shared ref, interior mutability), which is what lets
 /// every worker share one `Arc<[AtomicU64]>`. `#[inline(never)]` matches
@@ -4375,21 +4390,32 @@ pub(super) fn matrix_multiply_shared(
     let stride = size * size;
     for i in 0..size {
         for j in 0..size {
+            // Mirror what gcc and clang actually emit for schbench's shared
+            // `do_some_math` (`m3[..] += m1[..]*m2[..]`): keep the running sum in
+            // a register, but STORE it to the shared C cell every k. Both keep the
+            // per-k store because m1/m2/m3 are offsets into one base pointer, so
+            // neither can prove the m3 store doesn't alias the next k's m1/m2
+            // loads (in-function aliasing -- the same do_some_math is used for the
+            // private matrix). That per-k store (size^3 shared-C stores per
+            // matrix, no reload) is the source of --split's cross-core cache
+            // contention, so we store `acc` every k; a single store per cell would
+            // under-generate it.
+            let c = &data[2 * stride + i * size + j];
+            c.store(0, Relaxed);
             let mut acc: u64 = 0;
             for k in 0..size {
-                acc = acc.wrapping_add(
-                    data[i * size + k]
-                        .load(Relaxed)
-                        .wrapping_mul(data[stride + k * size + j].load(Relaxed)),
-                );
+                let prod = data[i * size + k]
+                    .load(Relaxed)
+                    .wrapping_mul(data[stride + k * size + j].load(Relaxed));
+                acc = acc.wrapping_add(prod);
+                c.store(acc, Relaxed);
             }
-            data[2 * stride + i * size + j].store(acc, Relaxed);
         }
     }
     // Route one computed C value into the observable `work_units` for
     // loop-accounting parity with `matrix_multiply` (NOT a DCE barrier -- the
-    // atomic store above is already non-elidable). In-bounds: the caller invokes
-    // this only when the shared matrix size is > 0.
+    // per-k atomic stores above are already non-elidable). In-bounds: the caller
+    // invokes this only when the shared matrix size is > 0.
     *work_units = work_units.wrapping_add(data[2 * stride].load(Relaxed));
 }
 
