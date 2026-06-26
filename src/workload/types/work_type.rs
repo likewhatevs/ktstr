@@ -79,20 +79,22 @@ impl PartialEq for CustomFn {
 ///
 /// Exposes the worker's stop flag plus the parts of its runtime
 /// environment a scheduler probe most often needs — its effective
-/// cpuset and its cgroup-sibling pids — so a custom worker does not
-/// re-roll `sched_getaffinity` or `cgroup.procs` parsing. All three
-/// are captured once, at worker entry, before the work loop runs.
+/// cpuset, its cgroup-sibling pids, and its own cgroup-v2 directory —
+/// so a custom worker does not re-roll `sched_getaffinity`,
+/// `cgroup.procs`, or `/proc/self/cgroup` parsing. All are captured
+/// once, at worker entry, before the work loop runs.
 ///
 /// Borrowed, not owned: the framework constructs a `WorkerCtx`
 /// pointing at stack-local data in `worker_main` and passes it by
 /// reference for the duration of the call. A worker that needs the
-/// sibling set or cpuset to outlive a single read should copy what
-/// it needs out of the returned slices.
+/// sibling set, cpuset, or cgroup dir to outlive a single read should
+/// copy what it needs out of the returned slices / path.
 #[derive(Copy, Clone, Debug)]
 pub struct WorkerCtx<'a> {
     stop: &'a AtomicBool,
     cpus: &'a [usize],
     sibling_pids: &'a [libc::pid_t],
+    cgroup_dir: Option<&'a std::path::Path>,
 }
 
 impl<'a> WorkerCtx<'a> {
@@ -103,11 +105,13 @@ impl<'a> WorkerCtx<'a> {
         stop: &'a AtomicBool,
         cpus: &'a [usize],
         sibling_pids: &'a [libc::pid_t],
+        cgroup_dir: Option<&'a std::path::Path>,
     ) -> Self {
         WorkerCtx {
             stop,
             cpus,
             sibling_pids,
+            cgroup_dir,
         }
     }
 
@@ -136,6 +140,19 @@ impl<'a> WorkerCtx<'a> {
     #[inline]
     pub fn sibling_pids(&self) -> &[libc::pid_t] {
         self.sibling_pids
+    }
+
+    /// The worker's own cgroup-v2 directory (`/sys/fs/cgroup<rel>`),
+    /// captured at entry from `/proc/self/cgroup` — or `None` when the
+    /// worker runs in the root cgroup or cgroup v2 is unavailable. A
+    /// Custom worker that needs to address a sibling cgroup (write its
+    /// `cgroup.procs`, read a peer's members) resolves the target from
+    /// here instead of re-parsing `/proc/self/cgroup` itself. `None`,
+    /// never a bogus `/sys/fs/cgroup`, so the root is never mistaken for
+    /// a dedicated cgroup.
+    #[inline]
+    pub fn cgroup_dir(&self) -> Option<&std::path::Path> {
+        self.cgroup_dir
     }
 }
 

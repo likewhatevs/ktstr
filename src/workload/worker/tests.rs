@@ -1300,6 +1300,56 @@ fn read_sibling_pids_excludes_self() {
     );
 }
 
+/// `parse_cgroup_rel` extracts the cgroup-v2 `0::/<rel>` path, and
+/// `read_self_cgroup_dir` maps it to `/sys/fs/cgroup<rel>`, returning
+/// `None` for the root cgroup so a worker never mistakes the root for a
+/// dedicated cgroup. Pins the parse + rel->dir mapping that
+/// `WorkerCtx::cgroup_dir` is built on (its only consumer).
+#[test]
+fn parse_cgroup_rel_and_self_dir_discipline() {
+    // A v2 single `0::` line yields the trimmed `<rel>`.
+    assert_eq!(
+        parse_cgroup_rel("0::/ktstr/cgA\n").as_deref(),
+        Some("/ktstr/cgA")
+    );
+    // The root cgroup line parses to "/".
+    assert_eq!(parse_cgroup_rel("0::/\n").as_deref(), Some("/"));
+    // A cgroup-v1-only file (no `0::` line) yields None.
+    assert_eq!(
+        parse_cgroup_rel("3:cpu,cpuacct:/foo\n1:name=systemd:/bar\n"),
+        None
+    );
+    // Hybrid host: v1 controller lines interleaved with the unified
+    // `0::` line — the `0::` line is found regardless of its position.
+    assert_eq!(
+        parse_cgroup_rel("3:cpu,cpuacct:/foo\n0::/ktstr/cgA\n1:name=systemd:/bar\n")
+            .as_deref(),
+        Some("/ktstr/cgA")
+    );
+    // The rel->dir mapping pinned deterministically on literals (the
+    // live check below only exercises whichever branch its own cgroup
+    // hits): the root maps to None — never a bogus "/sys/fs/cgroup" —
+    // and a dedicated rel maps under it.
+    assert_eq!(cgroup_dir_from_rel("/"), None);
+    // An empty rel (reachable from a `0::\n` literal via parse_cgroup_rel)
+    // also maps to None — never the bare /sys/fs/cgroup sentinel.
+    assert_eq!(cgroup_dir_from_rel(""), None);
+    assert_eq!(
+        cgroup_dir_from_rel("/ktstr/cgA"),
+        Some(std::path::PathBuf::from("/sys/fs/cgroup/ktstr/cgA"))
+    );
+    // The live process: read_self_cgroup_dir is either None (root /
+    // non-v2) or an absolute path strictly under /sys/fs/cgroup — never
+    // the bare "/sys/fs/cgroup" root sentinel.
+    if let Some(dir) = read_self_cgroup_dir() {
+        assert!(
+            dir.starts_with("/sys/fs/cgroup")
+                && dir != std::path::Path::new("/sys/fs/cgroup"),
+            "read_self_cgroup_dir must be a dedicated cgroup dir, got {dir:?}"
+        );
+    }
+}
+
 /// `WorkerCtx` accessors return the borrowed worker state verbatim,
 /// and `stop()` exposes the live flag — a flip is observable through
 /// the ctx. Pins the read-only contract a `Custom` worker relies on.
@@ -1308,7 +1358,8 @@ fn worker_ctx_accessors_return_borrowed_state() {
     let stop = AtomicBool::new(false);
     let cpus = [3usize, 7, 11];
     let siblings: [libc::pid_t; 2] = [100, 200];
-    let ctx = WorkerCtx::new(&stop, &cpus, &siblings);
+    let cg = std::path::Path::new("/sys/fs/cgroup/ktstr/cgA");
+    let ctx = WorkerCtx::new(&stop, &cpus, &siblings, Some(cg));
     assert_eq!(
         ctx.cpus(),
         cpus.as_slice(),
@@ -1318,6 +1369,16 @@ fn worker_ctx_accessors_return_borrowed_state() {
         ctx.sibling_pids(),
         siblings.as_slice(),
         "sibling_pids() returns the borrowed peer set"
+    );
+    assert_eq!(
+        ctx.cgroup_dir(),
+        Some(cg),
+        "cgroup_dir() returns the borrowed cgroup path"
+    );
+    assert_eq!(
+        WorkerCtx::new(&stop, &cpus, &siblings, None).cgroup_dir(),
+        None,
+        "cgroup_dir() is None for the root / non-v2 case"
     );
     assert!(!ctx.stop().load(Ordering::Relaxed));
     stop.store(true, Ordering::Relaxed);

@@ -803,7 +803,7 @@ mod partial_eq {
         }
         let cf = CustomFn(marker);
         let stop = AtomicBool::new(false);
-        let ctx = WorkerCtx::new(&stop, &[], &[]);
+        let ctx = WorkerCtx::new(&stop, &[], &[], None);
         let via_call = cf.call(&ctx);
         assert_eq!(
             via_call.work_units, 0xdeadbeef,

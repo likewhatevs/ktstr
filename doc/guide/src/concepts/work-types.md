@@ -345,9 +345,11 @@ contention paths. Requires `num_workers` divisible by `contenders`.
 
 **`Custom`** -- user-supplied work function. The `run` function pointer
 receives a `&WorkerCtx` (exposing the stop flag via `ctx.stop()` — a
-`&AtomicBool` set by SIGUSR1 in `CloneMode::Fork` — plus `ctx.cpus()`
-and `ctx.sibling_pids()`) and returns a `WorkerReport` when the stop
-flag becomes `true`. The
+`&AtomicBool` set by SIGUSR1 in `CloneMode::Fork` — plus `ctx.cpus()`,
+`ctx.sibling_pids()`, and `ctx.cgroup_dir()`, the worker's own
+cgroup-v2 dir or `None` in the root cgroup / when cgroup v2 is
+unavailable) and returns a `WorkerReport` when the stop flag becomes
+`true`. The
 framework handles fork, cgroup placement, affinity, scheduling policy,
 and signal setup; the user function owns the work loop and all
 `WorkerReport` field population. Framework telemetry (migration

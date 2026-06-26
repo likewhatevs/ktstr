@@ -488,7 +488,8 @@ pub(super) fn worker_main(
         // control to the user function.
         let cpus = read_effective_cpus();
         let sibling_pids = read_sibling_pids();
-        let ctx = WorkerCtx::new(stop, &cpus, &sibling_pids);
+        let cgroup_dir = read_self_cgroup_dir();
+        let ctx = WorkerCtx::new(stop, &cpus, &sibling_pids, cgroup_dir.as_deref());
         return run.call(&ctx);
     }
 
@@ -3685,25 +3686,66 @@ fn read_effective_cpus() -> Vec<usize> {
     }
 }
 
+/// Parse a cgroup-v2 relative path from the contents of
+/// `/proc/self/cgroup` — the single `0::/<rel>` line. Returns the
+/// `<rel>` portion (e.g. `/ktstr/cgA`), trimmed; `None` when no `0::`
+/// line is present (a cgroup-v1-only host). Pure so it is testable on a
+/// literal without a live `/proc`.
+fn parse_cgroup_rel(proc_self_cgroup: &str) -> Option<String> {
+    proc_self_cgroup
+        .lines()
+        .find_map(|l| l.strip_prefix("0::").map(|s| s.trim().to_string()))
+}
+
+/// The calling task's cgroup-v2 relative path, read from
+/// `/proc/self/cgroup`. `None` when the file is unreadable or carries no
+/// `0::` line. Single-sources the `0::` parse for [`read_sibling_pids`]
+/// and [`read_self_cgroup_dir`].
+fn read_self_cgroup_rel() -> Option<String> {
+    parse_cgroup_rel(&std::fs::read_to_string("/proc/self/cgroup").ok()?)
+}
+
+/// Map a cgroup-v2 relative path (as produced by [`parse_cgroup_rel`])
+/// to the absolute cgroup-v2 directory `/sys/fs/cgroup<rel>`. `None` for
+/// the root (`rel == "/"`) or an empty `rel` so the bare
+/// `/sys/fs/cgroup` root is never mistaken for a dedicated cgroup. Pure
+/// so both branches are testable on a literal.
+fn cgroup_dir_from_rel(rel: &str) -> Option<std::path::PathBuf> {
+    if rel == "/" || rel.is_empty() {
+        return None;
+    }
+    Some(std::path::PathBuf::from(format!("/sys/fs/cgroup{rel}")))
+}
+
+/// The calling worker's absolute cgroup-v2 directory
+/// (`/sys/fs/cgroup<rel>`), or `None` for the root cgroup (`rel == "/"`)
+/// or when cgroup v2 is unavailable. `None` — never a bogus
+/// `/sys/fs/cgroup` — so a caller never mistakes the root for a
+/// dedicated cgroup. Backs [`WorkerCtx::cgroup_dir`] (the production
+/// consumer); `pub(crate)` so the cross-module wiring regression-pin
+/// (`spawn::tests_lifecycle::custom_worker_receives_wired_ctx`) can
+/// assert the `worker_main` hand-off threads this value through.
+pub(crate) fn read_self_cgroup_dir() -> Option<std::path::PathBuf> {
+    cgroup_dir_from_rel(&read_self_cgroup_rel()?)
+}
+
 /// Read the calling worker's sibling pids from its cgroup's
 /// `cgroup.procs`, excluding the caller's own pid. Used by the
 /// [`WorkType::CrossAffinityChurn`] arm and by
 /// `WorkerCtx::sibling_pids` so a Custom worker gets the same peer
 /// set without re-deriving it from `/proc`+`/sys`.
 ///
-/// cgroup v2: `/proc/self/cgroup` is a single `0::/<rel>` line; the
-/// members live in `/sys/fs/cgroup<rel>/cgroup.procs`. The set is the
-/// worker's CGROUP membership, so this is only meaningful in a
-/// dedicated cgroup (see the `CrossAffinityChurn` doc). Any read
-/// error yields an empty set (the caller treats "no siblings" as a
-/// no-op).
+/// cgroup v2: `/proc/self/cgroup` is a single `0::/<rel>` line (parsed
+/// by [`read_self_cgroup_rel`]); the members live in
+/// `/sys/fs/cgroup<rel>/cgroup.procs`. The set is the worker's CGROUP
+/// membership, so this is only meaningful in a dedicated cgroup (see the
+/// `CrossAffinityChurn` doc). A missing `0::` line OR an unreadable
+/// `/proc/self/cgroup` falls back to the root (`/`); only a
+/// `cgroup.procs` read error yields an empty set (the caller treats
+/// "no siblings" as a no-op).
 pub(super) fn read_sibling_pids() -> Vec<libc::pid_t> {
     let me = unsafe { libc::getpid() };
-    let rel = std::fs::read_to_string("/proc/self/cgroup")
-        .unwrap_or_default()
-        .lines()
-        .find_map(|l| l.strip_prefix("0::").map(|s| s.trim().to_string()))
-        .unwrap_or_else(|| "/".to_string());
+    let rel = read_self_cgroup_rel().unwrap_or_else(|| "/".to_string());
     let procs_path = format!("/sys/fs/cgroup{rel}/cgroup.procs");
     std::fs::read_to_string(&procs_path)
         .unwrap_or_default()
