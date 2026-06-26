@@ -76,6 +76,77 @@ fn compare_rows_by_emits_phase_deltas_when_both_sides_have_matched_phases() {
     assert_eq!(step0.delta, 7.0);
 }
 
+/// The schbench per-phase metrics drive perf-delta's cross-run per-phase A/B
+/// view ([`push_phase_deltas`]) with their REGISTERED polarity, in both
+/// directions: `wakeup_p99_latency_us` is LowerBetter (a candidate whose p99
+/// rises across a phase is a regression; falling is an improvement) and
+/// `schbench_loop_count` is HigherBetter (falling throughput is a regression).
+/// The sibling per-phase tests use the generic `max_dsq_depth` metric; this
+/// pins that the SCHBENCH-registered names resolve through `metric_def` -- the
+/// `.expect()` would fail if one were unregistered, since `push_phase_deltas`
+/// skips unknown names -- and that polarity (not raw delta sign) orients the
+/// verdict. This is the exact path a `cargo ktstr perf-delta` schbench A/B
+/// (baseline-vs-candidate, partitioned per side) renders per phase. Deltas are
+/// sized well above each metric's dual gate (p99 abs 50µs / loop_count abs 10)
+/// so the classification exercises the regression branch, not the below-gate
+/// `unchanged` one.
+#[test]
+fn schbench_per_phase_metrics_drive_cross_run_verdict_with_registry_polarity() {
+    // LowerBetter latency, regression: B's Step[0] p99 rises 1000 -> 2000 µs
+    // (delta 1000 >> 50µs abs, rel 1.0 >> 0.25).
+    let mut a = make_row("perf_scn", "tiny-1llc", true, 0.0);
+    let mut b = make_row("perf_scn", "tiny-1llc", true, 0.0);
+    a.phases = vec![make_phase_bucket(1, "Step[0]", &[("wakeup_p99_latency_us", 1000.0)])];
+    b.phases = vec![make_phase_bucket(1, "Step[0]", &[("wakeup_p99_latency_us", 2000.0)])];
+    let report = compare_rows_by(&[a], &[b], &[], None, &ComparisonPolicy::default());
+    let lat = report
+        .phase_deltas
+        .iter()
+        .find(|d| d.metric.name == "wakeup_p99_latency_us")
+        .expect("wakeup_p99_latency_us must resolve to a registered metric_def and emit a delta");
+    assert_eq!(lat.delta, 1000.0);
+    assert!(
+        lat.is_regression,
+        "a rising p99 on a LowerBetter metric is a regression",
+    );
+
+    // The converse direction: B lowers p99 2000 -> 1000 -> improvement, NOT a
+    // regression (proves polarity orients the verdict, not the raw delta sign).
+    let mut a2 = make_row("perf_scn", "tiny-1llc", true, 0.0);
+    let mut b2 = make_row("perf_scn", "tiny-1llc", true, 0.0);
+    a2.phases = vec![make_phase_bucket(1, "Step[0]", &[("wakeup_p99_latency_us", 2000.0)])];
+    b2.phases = vec![make_phase_bucket(1, "Step[0]", &[("wakeup_p99_latency_us", 1000.0)])];
+    let report2 = compare_rows_by(&[a2], &[b2], &[], None, &ComparisonPolicy::default());
+    let lat2 = report2
+        .phase_deltas
+        .iter()
+        .find(|d| d.metric.name == "wakeup_p99_latency_us")
+        .expect("delta present");
+    assert!(
+        !lat2.is_regression,
+        "a falling p99 on a LowerBetter metric is an improvement",
+    );
+
+    // HigherBetter throughput, regression: B's Step[0] loop_count falls
+    // 5000 -> 1000 (delta -4000, abs 4000 >> 10, rel 0.8 >> 0.30). The OPPOSITE
+    // polarity from the latency metric, so a NEGATIVE delta is the regression.
+    let mut a3 = make_row("perf_scn", "tiny-1llc", true, 0.0);
+    let mut b3 = make_row("perf_scn", "tiny-1llc", true, 0.0);
+    a3.phases = vec![make_phase_bucket(1, "Step[0]", &[("schbench_loop_count", 5000.0)])];
+    b3.phases = vec![make_phase_bucket(1, "Step[0]", &[("schbench_loop_count", 1000.0)])];
+    let report3 = compare_rows_by(&[a3], &[b3], &[], None, &ComparisonPolicy::default());
+    let lc = report3
+        .phase_deltas
+        .iter()
+        .find(|d| d.metric.name == "schbench_loop_count")
+        .expect("schbench_loop_count must resolve to a registered metric_def and emit a delta");
+    assert_eq!(lc.delta, -4000.0);
+    assert!(
+        lc.is_regression,
+        "falling loop_count on a HigherBetter metric is a regression (less throughput)",
+    );
+}
+
 /// A-side has phase [0, 1]; B-side has phase [0, 2].
 /// Matched phases (step_index = 0) emit PhaseDeltaRow;
 /// step_index = 1 emits UnpairedPhaseRow side=A;
