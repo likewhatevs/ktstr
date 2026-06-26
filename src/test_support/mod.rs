@@ -51,6 +51,10 @@ use crate::scenario::Ctx;
 use anyhow::Result;
 
 mod args;
+// Re-exported for the workload-side CgroupChurn worker, which resolves the
+// same workload cgroup root the host-side setup uses but lives outside the
+// private `args` module's subtree.
+pub(crate) use args::resolve_cgroup_root;
 mod dispatch;
 mod entry;
 mod entry_validate;

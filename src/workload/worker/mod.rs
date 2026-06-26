@@ -582,9 +582,31 @@ pub(super) fn worker_main(
     // on the next iteration.
     let cgroup_churn_paths: Vec<String> = if let WorkType::CgroupChurn { groups, .. } = &work_type {
         let groups_count = (*groups).max(1);
-        (0..groups_count)
-            .map(|i| format!("/sys/fs/cgroup/wt-cgroup-churn-{i}/cgroup.procs"))
-            .collect()
+        // Resolve the workload cgroup root the framework places test cgroups
+        // under (default /sys/fs/cgroup/ktstr; per-test override via
+        // `workload_root_cgroup` stamped into /workload_root_cgroup) — the same
+        // resolver the host-side CgroupManager uses, so the auto-created paths
+        // below and the dispatch paths agree by construction. (Previously a
+        // hardcoded top-level /sys/fs/cgroup/wt-cgroup-churn-<i> sat outside
+        // any managed root and was never created by the framework.)
+        let root = crate::test_support::resolve_cgroup_root(&[]);
+        // Auto-provision the rotation cgroups as LEAF cgroups under the root.
+        // `create_cgroup` on a single-component name validates + mkdirs and
+        // leaves the leaf's `cgroup.subtree_control` EMPTY (enable_subtree_cpuset
+        // no-ops for <2 components), which the kernel no-internal-process
+        // constraint requires: `cgroup_migrate_vet_dst` returns -EBUSY for a
+        // `cgroup.procs` migration into a dst whose subtree_control is set
+        // (kernel/cgroup/cgroup.c). Best-effort — a create failure (e.g. a
+        // non-root host-unit context) falls through to the dispatch arm's
+        // lazy-open warn-and-continue, so the variant stays observable.
+        let mgr = crate::cgroup::CgroupManager::new(&root);
+        for i in 0..groups_count {
+            let name = churn_cgroup_name(i);
+            if let Err(e) = mgr.create_cgroup(&name) {
+                tracing::warn!(?e, %name, %root, "CgroupChurn: auto-create failed");
+            }
+        }
+        churn_cgroup_procs_paths(&root, groups_count)
     } else {
         Vec::new()
     };
@@ -2577,15 +2599,16 @@ pub(super) fn worker_main(
             }
             WorkType::CgroupChurn { groups, cycle_ms } => {
                 // Rotate the worker's cgroup membership by writing
-                // tid to `wt-cgroup-churn-<i>/cgroup.procs` under
-                // the worker's parent cgroup. Drives
-                // `sched_move_task` and the `scx_cgroup_move_task`
-                // ops callback. The host-side scenario harness is
-                // responsible for creating the sibling cgroups; if
-                // they are absent the open() fails and the worker
-                // logs and continues spinning so the variant is
-                // observable but does not panic on a misconfigured
-                // topology.
+                // tid to `wt-cgroup-churn-<i>/cgroup.procs` under the
+                // resolved workload cgroup root (default
+                // /sys/fs/cgroup/ktstr, or the per-test
+                // `workload_root_cgroup`). Drives `sched_move_task`
+                // and the `scx_cgroup_move_task` ops callback. The
+                // worker auto-creates these leaf cgroups at entry (see
+                // the `cgroup_churn_paths` setup); if a create or open
+                // fails the worker logs and continues spinning so the
+                // variant is observable but does not panic on a
+                // misconfigured topology.
                 //
                 // The path strings and the `tid\n` write payload are
                 // pre-formatted at worker entry into
@@ -3735,6 +3758,23 @@ fn cgroup_dir_from_rel(rel: &str) -> Option<std::path::PathBuf> {
 /// assert the `worker_main` hand-off threads this value through.
 pub(crate) fn read_self_cgroup_dir() -> Option<std::path::PathBuf> {
     cgroup_dir_from_rel(&read_self_cgroup_rel()?)
+}
+
+/// The cgroup name a [`WorkType::CgroupChurn`] worker rotates target `i`
+/// through: `wt-cgroup-churn-<i>`. Single-sourced so auto-creation and
+/// path-building agree.
+fn churn_cgroup_name(i: usize) -> String {
+    format!("wt-cgroup-churn-{i}")
+}
+
+/// The per-target `cgroup.procs` paths a [`WorkType::CgroupChurn`] worker
+/// writes its tid to — `<root>/wt-cgroup-churn-<i>/cgroup.procs` for `i in
+/// 0..groups` (at least one). Shared by the worker dispatch and its unit
+/// test so the layout under the workload root is single-sourced.
+fn churn_cgroup_procs_paths(root: &str, groups: usize) -> Vec<String> {
+    (0..groups.max(1))
+        .map(|i| format!("{root}/{}/cgroup.procs", churn_cgroup_name(i)))
+        .collect()
 }
 
 /// True for the `work_units`-vs-`iterations` footgun shape: a `Custom`

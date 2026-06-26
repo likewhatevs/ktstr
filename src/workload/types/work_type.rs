@@ -1003,17 +1003,21 @@ pub enum WorkType {
     /// write lock and exercises the per-class `sched_move_task` /
     /// `task_change_group` callbacks. Zero coverage today.
     ///
-    /// Sibling cgroups must already exist under the worker's parent
-    /// cgroup with names `wt-cgroup-churn-<i>` for `i in
-    /// 0..groups`; the test harness or scenario setup creates them.
-    /// Each iteration the worker writes its tid to the next sibling
-    /// in rotation. `worker_group_size = None` (any worker count
+    /// The worker auto-creates the rotation cgroups
+    /// `wt-cgroup-churn-<i>` for `i in 0..groups` under the workload
+    /// cgroup root (default `/sys/fs/cgroup/ktstr`, or the per-test
+    /// `#[ktstr_test(workload_root_cgroup = "/path")]` root) at entry,
+    /// as empty leaf cgroups (no `subtree_control`) so they accept
+    /// `cgroup.procs` migration. Each iteration the worker writes its
+    /// tid to the next sibling in rotation. `worker_group_size = None`
+    /// (any worker count
     /// valid; each worker rotates independently). Per-iteration
     /// budget is one `write` syscall to `cgroup.procs`.
     CgroupChurn {
-        /// Number of sibling cgroups to rotate through. The harness
-        /// creates `wt-cgroup-churn-0` … `wt-cgroup-churn-(groups-1)`
-        /// before spawn.
+        /// Number of sibling cgroups to rotate through. The worker
+        /// auto-creates `wt-cgroup-churn-0` …
+        /// `wt-cgroup-churn-(groups-1)` under the workload root at
+        /// entry.
         groups: usize,
         /// Wall-clock interval between cgroup rewrites (ms). Lower
         /// values increase contention on `cgroup_threadgroup_rwsem`

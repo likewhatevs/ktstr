@@ -1300,6 +1300,25 @@ fn read_sibling_pids_excludes_self() {
     );
 }
 
+/// CgroupChurn rotation paths are built under the resolved workload
+/// root (not the former hardcoded top-level path), as single-component leaf
+/// cgroups. Production (`cgroup_churn_paths` setup) and this test share
+/// `churn_cgroup_procs_paths`, so the layout is pinned at one site.
+#[test]
+fn churn_cgroup_procs_paths_are_under_the_root() {
+    assert_eq!(
+        churn_cgroup_procs_paths("/sys/fs/cgroup/ktstr", 2),
+        vec![
+            "/sys/fs/cgroup/ktstr/wt-cgroup-churn-0/cgroup.procs".to_string(),
+            "/sys/fs/cgroup/ktstr/wt-cgroup-churn-1/cgroup.procs".to_string(),
+        ]
+    );
+    // groups == 0 still yields one target (the .max(1) floor) so the
+    // dispatch arm's index-by-target is always in-bounds.
+    assert_eq!(churn_cgroup_procs_paths("/r", 0).len(), 1);
+    assert_eq!(churn_cgroup_name(3), "wt-cgroup-churn-3");
+}
+
 /// `parse_cgroup_rel` extracts the cgroup-v2 `0::/<rel>` path, and
 /// `read_self_cgroup_dir` maps it to `/sys/fs/cgroup<rel>`, returning
 /// `None` for the root cgroup so a worker never mistakes the root for a
