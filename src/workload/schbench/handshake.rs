@@ -133,6 +133,12 @@ impl Handshake {
     /// [`WaitOutcome::TimedOut`] if `timeout` elapses first. Spurious wakeups
     /// and `EAGAIN` (the word changed before the kernel enqueued us) just loop
     /// -- the CAS re-checks the state, so neither loses a post.
+    ///
+    /// Production message/worker loops wait with a NULL timeout via
+    /// [`wait_forever`](Self::wait_forever); this timed entry is the faithful
+    /// `fwait`-with-timeout half of the handshake and is exercised by the
+    /// timeout tests until a timed-wait caller (e.g. RPS pacing) lands.
+    #[allow(dead_code)]
     pub(crate) fn wait(&self, timeout: &libc::timespec) -> WaitOutcome {
         self.wait_inner(Some(timeout))
     }

@@ -124,9 +124,12 @@ pub(crate) use worker::{MAX_WAKE_SAMPLES, reservoir_push};
 // in-crate path to the helper.
 pub(crate) use spawn::build_nodemask;
 pub use types::*;
-// schbench_rs is otherwise a private submodule; only its user-facing config
-// type is re-exported (the WorkType::Schbench variant carries it).
-pub use schbench::SchbenchConfig;
+// schbench_rs is otherwise a private submodule. Its user-facing config type is
+// re-exported (the WorkType::Schbench variant carries it), as are the standalone
+// host-side validation entry point and its report type / percentile labels (used
+// by the gated `ktstr-schbench-validate` bin for the side-by-side comparison
+// against the reference schbench).
+pub use schbench::{run_standalone, SchbenchConfig, StandaloneReport, SCHBENCH_PERCENTILES};
 
 // `FanOutCompute` stores its u64 generation counter at offset 0 of
 // a 16-byte shared region and relies on the low 4 bytes of that

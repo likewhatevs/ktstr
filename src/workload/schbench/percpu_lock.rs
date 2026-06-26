@@ -99,7 +99,11 @@ impl PerCpuLocks {
         Self { locks }
     }
 
-    /// Number of per-CPU locks.
+    /// Number of per-CPU locks. Production sizes the array via the
+    /// `lock_array_size` passed to [`new`](Self::new) and indexes with
+    /// `self.locks.len()` internally; this accessor gives the lock-count test
+    /// clean read access without reaching into the private field.
+    #[allow(dead_code)]
     pub(crate) fn len(&self) -> usize {
         self.locks.len()
     }

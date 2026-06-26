@@ -510,6 +510,11 @@ name = "ktstr-jemalloc-alloc-worker"
 path = "src/bin/jemalloc_alloc_worker.rs"
 required-features = ["cli-bins", "integration"]
 
+[[bin]]
+name = "ktstr-schbench-validate"
+path = "src/bin/schbench_validate.rs"
+required-features = ["cli-bins", "integration"]
+
 [[test]]
 name = "ktstr_sched_tests"
 
