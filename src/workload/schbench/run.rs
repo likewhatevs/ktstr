@@ -103,6 +103,59 @@ impl<T: Linked> TreiberStack<T> {
     fn splice(&self) -> *mut T {
         self.head.swap(ptr::null_mut(), Ordering::AcqRel)
     }
+
+    /// Atomically take the whole stack and return the chain in FIFO (insertion)
+    /// order -- the reverse of [`splice`](Self::splice)'s LIFO. Faithful port of
+    /// `request_splice` (`schbench.c:920-940`): swap to null, then reverse the
+    /// spliced chain so the consumer services the oldest queued request first
+    /// (request order matters, unlike the thread wait-list). Returns null if
+    /// empty. Single-consumer: only the owning worker drains its own queue.
+    fn splice_reversed(&self) -> *mut T {
+        let mut cur = self.head.swap(ptr::null_mut(), Ordering::AcqRel);
+        let mut rev: *mut T = ptr::null_mut();
+        while !cur.is_null() {
+            // SAFETY: `cur` is a node that was published on the stack and whose
+            // storage the caller owns; the single consumer reverses the chain it
+            // just took exclusive ownership of, so no other thread touches these
+            // links concurrently.
+            let link = unsafe { (*cur).next_link() };
+            let next = link.load(Ordering::Acquire);
+            link.store(rev, Ordering::Relaxed);
+            rev = cur;
+            cur = next;
+        }
+        rev
+    }
+}
+
+/// A queued work request in RPS-injector mode (`schbench.c` `struct request`,
+/// `:757`). The RPS thread heap-allocates one (`Box`) per request and links it
+/// onto the target worker's queue; the worker drains its queue and frees each --
+/// matching schbench's per-request malloc/free (part of the syscall profile the
+/// standalone validation compares). schbench's `start_time` field is set
+/// (`:951`) but never read, so it is omitted: the wakeup latency is measured
+/// from the worker's `wake_time` (stamped by the RPS thread at enqueue) and the
+/// request latency from a local work-start -- neither reads `start_time`.
+/// Omitting it also drops schbench's per-request `gettimeofday` for that dead
+/// field (`:951`) -- one fewer clock syscall per request, consistent with the
+/// engine's `CLOCK_MONOTONIC`-vs-`gettimeofday` clock divergence.
+struct Request {
+    /// Intrusive link for the per-worker request [`TreiberStack`].
+    next: AtomicPtr<Request>,
+}
+
+impl Request {
+    fn new() -> Self {
+        Self {
+            next: AtomicPtr::new(ptr::null_mut()),
+        }
+    }
+}
+
+impl Linked for Request {
+    fn next_link(&self) -> &AtomicPtr<Self> {
+        &self.next
+    }
 }
 
 /// Declarative config for the [`Schbench`](crate::workload::WorkType::Schbench)
@@ -134,6 +187,12 @@ pub struct SchbenchConfig {
     /// Skip the per-CPU lock around the matrix work (`schbench.c` `-L`,
     /// default false: locking on).
     pub skip_locking: bool,
+    /// Fixed request rate, requests/second (`schbench.c` `-R`, default 0 = off).
+    /// 0 selects the default message-handshake mode (each worker is woken by its
+    /// message thread); non-zero switches to the RPS-injector mode, where a
+    /// dedicated thread enqueues `requests_per_sec` requests/second round-robin
+    /// across the workers (`schbench.c` `run_rps_thread`, `:1258`).
+    pub requests_per_sec: usize,
 }
 
 impl Default for SchbenchConfig {
@@ -146,6 +205,7 @@ impl Default for SchbenchConfig {
             operations: 5,
             sleep_usec: 100,
             skip_locking: false,
+            requests_per_sec: 0,
         }
     }
 }
@@ -188,6 +248,13 @@ impl SchbenchConfig {
         self.skip_locking = skip;
         self
     }
+    /// Set the fixed request rate in requests/second (schbench `-R`); 0 selects
+    /// the default message-handshake mode, non-zero the RPS-injector mode.
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn requests_per_sec(mut self, rps: usize) -> Self {
+        self.requests_per_sec = rps;
+        self
+    }
 
     /// Matrix dimension from the cache footprint, identical to schbench
     /// (`schbench.c:1880`: `sqrt(cache_footprint_kb * 1024 / 3 /
@@ -201,6 +268,19 @@ impl SchbenchConfig {
         } else {
             0
         }
+    }
+
+    /// Per-message-thread request rate: the user's total `requests_per_sec`
+    /// (`-R`) divided across the message threads, each of which runs its own RPS
+    /// thread. schbench divides once at startup (`requests_per_sec /=
+    /// message_threads`, `schbench.c:1899`) BEFORE the per-thread mode gate
+    /// (`if (requests_per_sec)`, `schbench.c:1594`), so this value drives BOTH
+    /// the injection rate AND the RPS-vs-default mode selection: when the total
+    /// rate is below the message-thread count it rounds to 0, and the thread runs
+    /// the DEFAULT message-handshake mode (not a zero-rate RPS mode), exactly as
+    /// schbench does. Integer division drops the remainder, matching schbench.
+    pub(crate) fn rps_per_message_thread(&self) -> usize {
+        self.requests_per_sec / self.message_threads.max(1)
     }
 }
 
@@ -238,6 +318,16 @@ pub(crate) struct ThreadData {
     /// histogram cells. Empty when run non-phasic (`phase_epoch == None`) until
     /// the single end-of-run drain.
     phase_snapshots: UnsafeCell<Vec<PhaseSnapshot>>,
+    /// RPS-injector mode: this worker's pending request queue. The RPS thread
+    /// pushes heap-allocated [`Request`]s (round-robin across workers); the
+    /// owning worker drains via `splice_reversed` (FIFO) and frees each. Unused
+    /// in the default message-handshake mode (`requests_per_sec == 0`).
+    requests: TreiberStack<Request>,
+    /// RPS-injector backpressure counter (`schbench.c` `thread_data->pending`,
+    /// `:779`): incremented by the RPS thread per enqueue, reset to 0 by the
+    /// owning worker at each splice. The RPS thread stops enqueuing to a worker
+    /// whose `pending` exceeds the batch cap (`:1284`).
+    pending: AtomicU64,
 }
 
 /// One thread's latency + run-queue-delay accumulation over a single phase
@@ -330,16 +420,21 @@ impl Linked for ThreadData {
     }
 }
 
-// SAFETY: `ThreadData` is shared across threads only via the lockless
-// wait-list, whose operations touch exclusively the atomic fields (`next`,
-// `futex`, `wake_time`) -- all internally synchronized. The `UnsafeCell`
-// fields (`wakeup_stats`, `request_stats`, `sched_delay_ns`,
-// `phase_snapshots`) are written and read ONLY by the single worker thread
-// that owns this `ThreadData`, and only the main thread reads/drains them
-// after all workers have joined (a happens-before via the join). The
-// per-phase drain (`worker_loop` / `run_msg_thread`) `take`s and pushes into
-// the owning thread's own cells, never another's. No two threads ever touch a
-// cell concurrently, so sharing `&ThreadData` across threads is sound.
+// SAFETY: `ThreadData` is shared across threads only via the lockless wait-list
+// and (in RPS mode) the per-worker request queue, whose operations touch
+// exclusively the atomic fields (`next`, `futex`, `wake_time`, `requests`,
+// `pending`) -- all internally synchronized. `requests` is single-producer /
+// single-consumer: the RPS thread is the only pusher to a given worker's queue
+// (round-robin assignment) and the owning worker is the only drainer, with the
+// push's Release CAS / drain's Acquire swap establishing happens-before;
+// `pending` is plain atomic counting. The `UnsafeCell` fields (`wakeup_stats`,
+// `request_stats`, `sched_delay_ns`, `phase_snapshots`) are written and read
+// ONLY by the single worker thread that owns this `ThreadData`, and only the
+// main thread reads/drains them after all workers have joined (a happens-before
+// via the join). The per-phase drain (`worker_loop` / `run_msg_thread`) `take`s
+// and pushes into the owning thread's own cells, never another's. No two threads
+// ever touch a cell concurrently, so sharing `&ThreadData` across threads is
+// sound.
 unsafe impl Sync for ThreadData {}
 
 impl ThreadData {
@@ -352,6 +447,8 @@ impl ThreadData {
             request_stats: UnsafeCell::new(PlatStats::default()),
             sched_delay_ns: UnsafeCell::new(0),
             phase_snapshots: UnsafeCell::new(Vec::new()),
+            requests: TreiberStack::new(),
+            pending: AtomicU64::new(0),
         }
     }
 }
@@ -411,6 +508,58 @@ fn msg_and_wait(
     if delta_us > 0 {
         // SAFETY: only this worker thread accesses its own wakeup_stats cell.
         unsafe { (*td.wakeup_stats.get()).add_lat(delta_us.min(u32::MAX as u64) as u32) };
+    }
+}
+
+/// Worker side of one RPS-injector cycle. Faithful to schbench's `msg_and_wait`
+/// RPS branch (`schbench.c:1011-1037`): reset `pending`, splice this worker's
+/// request queue (FIFO). If non-empty, return the chain immediately (fast path,
+/// no wait, no wakeup sample -- `:1014-1017`). If empty, block on this worker's
+/// own futex until the RPS thread posts it (the RPS thread stamped `wake_time`
+/// at enqueue, `:1294`), record the wakeup (scheduler) latency, then splice
+/// whatever it queued (null on a spurious wake or the shutdown wake-all). Unlike
+/// [`msg_and_wait`], the worker does NOT enqueue on the message thread's
+/// wait-list or post a message thread -- the RPS thread is the sole waker.
+fn rps_wait(td: &ThreadData, stop: &AtomicBool) -> *mut Request {
+    // Reset the backpressure counter before draining (schbench `td->pending = 0`,
+    // `:1012`): the RPS thread stops enqueuing while pending exceeds the batch
+    // cap, so clearing it re-opens this worker for the next batch.
+    td.pending.store(0, Ordering::Release);
+    let chain = td.requests.splice_reversed();
+    if !chain.is_null() {
+        return chain; // work already queued: serve it without blocking
+    }
+    if stop.load(Ordering::Acquire) {
+        return ptr::null_mut();
+    }
+    // Empty queue: block until the RPS thread posts our futex. It stamped
+    // `wake_time` at enqueue, so `now - wake_time` is the scheduler wakeup
+    // latency (schbench `fwait` NULL then add_lat, `:1032`/`:1034-1037`).
+    td.futex.wait_forever();
+    let now = monotonic_nanos();
+    let wake = td.wake_time.load(Ordering::Acquire);
+    let delta_us = now.saturating_sub(wake) / 1000;
+    if delta_us > 0 {
+        // SAFETY: only this worker thread accesses its own wakeup_stats cell.
+        unsafe { (*td.wakeup_stats.get()).add_lat(delta_us.min(u32::MAX as u64) as u32) };
+    }
+    // Splice whatever the RPS thread enqueued before posting us (null if the post
+    // was the shutdown wake-all with nothing queued).
+    td.requests.splice_reversed()
+}
+
+/// Free a chain of [`Request`]s spliced off a worker's queue but not processed
+/// (the shutdown path, and the post-join cleanup of any requests the RPS thread
+/// enqueued after a worker's last splice). Each node was `Box::into_raw`'d by the
+/// RPS thread; the draining/cleaning thread owns them exclusively after the
+/// splice, so each is freed exactly once.
+fn free_request_chain(mut req: *mut Request) {
+    while !req.is_null() {
+        // SAFETY: `req` is a node taken via `splice_reversed` (exclusive
+        // ownership); freed exactly once.
+        let next = unsafe { (*req).next.load(Ordering::Acquire) };
+        drop(unsafe { Box::from_raw(req) });
+        req = next;
     }
 }
 
@@ -481,6 +630,104 @@ fn run_msg_thread(
     // Record the message thread's whole-run mean run-queue wait (`schbench.c:1664`),
     // reusing the cumulative `ss_end` pair just read — one /proc read, so the mean
     // and the final-phase delta derive from one consistent snapshot.
+    // SAFETY: owner-only access to msg_td's sched_delay_ns cell.
+    unsafe { *msg_td.sched_delay_ns.get() = mean_sched_delay(ss_end) };
+}
+
+/// The RPS-injector dispatcher loop, replacing [`run_msg_thread`] when
+/// `requests_per_sec != 0`. Faithful to schbench's `run_rps_thread`
+/// (`schbench.c:1258-1314`): once per second, enqueue `requests_per_sec`
+/// requests round-robin across this group's `workers`, skipping a worker whose
+/// `pending` exceeds the batch cap (backpressure), then sleep to fill the
+/// remainder of the second; on stop, wake every worker and exit. Runs on the
+/// message thread's calling thread, so — like [`run_msg_thread`] — it records
+/// the dispatcher thread's per-phase + whole-run run-queue wait into `msg_td`
+/// (the "message thread delay" in RPS mode, `schbench.c:1664-1670`).
+///
+/// The per-second fill-sleep and the bounded backpressure usleep are schbench's
+/// defined injector behavior (the `-R` "N requests/second" cadence), workload-
+/// defined durations like the per-request think-sleep — not synchronization
+/// waits. Uses `CLOCK_MONOTONIC` (ruling), not schbench's `gettimeofday`.
+fn run_rps_thread(
+    workers: &[ThreadData],
+    msg_td: &ThreadData,
+    config: &SchbenchConfig,
+    stop: &AtomicBool,
+    phase_epoch: Option<&AtomicU32>,
+) {
+    let tid = gettid_self();
+    let mut cur_epoch = phase_epoch.map_or(0, |e| e.load(Ordering::Relaxed));
+    let mut phase_ss_start = read_schedstat_raw(tid);
+    // Per-message-thread rate (the `-R` total / message_threads); see
+    // [`SchbenchConfig::rps_per_message_thread`]. Reaching this function means
+    // the mode gate already saw the SAME per-thread rate non-zero, so it is >= 1
+    // here (a sub-1-per-thread total selects default mode, not this path).
+    let requests_per_sec = config.rps_per_message_thread();
+    // schbench's per-worker queue-depth cap before the injector backs off
+    // (`schbench.c:1267`).
+    const BATCH: u64 = 128;
+    const ONE_SEC_NS: u64 = 1_000_000_000;
+    let worker_count = workers.len().max(1);
+    let mut cur_tid: usize = 0;
+    while !stop.load(Ordering::Acquire) {
+        let start = monotonic_nanos();
+        for _ in 0..requests_per_sec {
+            if stop.load(Ordering::Acquire) {
+                break;
+            }
+            let worker = &workers[cur_tid % worker_count];
+            cur_tid += 1;
+            // Backpressure: don't queue more to a worker already `BATCH` deep
+            // (`schbench.c:1284-1290`). The bounded usleep is schbench's injector
+            // throttle (workload behavior), not a sync poll. The round-robin
+            // cursor already advanced, so the skipped slot moves to the next
+            // worker, matching schbench (the request for this slot is dropped).
+            if worker.pending.load(Ordering::Acquire) > BATCH {
+                std::thread::sleep(std::time::Duration::from_micros(100));
+                continue;
+            }
+            worker.pending.fetch_add(1, Ordering::AcqRel);
+            // schbench mallocs one request per enqueue; the worker frees it after
+            // processing (`schbench.c:1292`/`:1476`). Box matches that profile.
+            let req = Box::into_raw(Box::new(Request::new()));
+            worker.requests.add(req);
+            // Stamp the target's wake_time so it measures wakeup latency as
+            // now - enqueue (`schbench.c:1294`), then post it.
+            worker.wake_time.store(monotonic_nanos(), Ordering::Release);
+            worker.futex.post();
+        }
+        // Rate-limit: fill the remainder of the second (`schbench.c:1300-1306`).
+        let elapsed = monotonic_nanos().saturating_sub(start);
+        if !stop.load(Ordering::Acquire) && elapsed < ONE_SEC_NS {
+            std::thread::sleep(std::time::Duration::from_nanos(ONE_SEC_NS - elapsed));
+        }
+        // Dispatcher per-phase run-delay drain (mirrors run_msg_thread): on epoch
+        // change, finalize this thread's run-delay for the ended phase. Empty
+        // histograms (the dispatcher records only run-delay).
+        if let Some(pe) = phase_epoch {
+            let new_epoch = pe.load(Ordering::Relaxed);
+            if new_epoch != cur_epoch {
+                let ss_end = read_schedstat_raw(tid);
+                // SAFETY: this thread owns msg_td (the dispatcher's ThreadData).
+                unsafe { drain_phase(msg_td, cur_epoch, phase_ss_start, ss_end, 0) };
+                cur_epoch = new_epoch;
+                phase_ss_start = ss_end;
+            }
+        }
+        if stop.load(Ordering::Acquire) {
+            // Wake every worker so a blocked one observes stop and exits
+            // (`schbench.c:1308-1312`).
+            for w in workers {
+                w.futex.post();
+            }
+            break;
+        }
+    }
+    // Final drain + whole-run mean run-delay for the dispatcher thread, matching
+    // run_msg_thread's exit (`schbench.c:1664`).
+    let ss_end = read_schedstat_raw(tid);
+    // SAFETY: this thread owns msg_td.
+    unsafe { drain_phase(msg_td, cur_epoch, phase_ss_start, ss_end, 0) };
     // SAFETY: owner-only access to msg_td's sched_delay_ns cell.
     unsafe { *msg_td.sched_delay_ns.get() = mean_sched_delay(ss_end) };
 }
@@ -629,32 +876,72 @@ fn worker_loop(td: &ThreadData, ctx: &WorkerCtx) {
     let mut cur_epoch = phase_epoch.map_or(0, |e| e.load(Ordering::Relaxed));
     let mut phase_ss_start = read_schedstat_raw(tid);
     let mut phase_loop_count = 0u64;
+    // RPS mode iff the per-thread rate is non-zero (the `-R` total covers at
+    // least one request/sec per message thread). Below that it rounds to 0 and
+    // the worker runs the default message-handshake mode -- matching schbench's
+    // startup-divide-before-gate ([`SchbenchConfig::rps_per_message_thread`]).
+    let rps_mode = config.rps_per_message_thread() != 0;
     while !stop.load(Ordering::Acquire) {
-        msg_and_wait(td, msg_td, wait_list, stop);
-        if stop.load(Ordering::Acquire) {
-            break;
+        // Acquire work. Default mode: the message-thread handshake (records
+        // wakeup latency; no request chain -> a single work cycle). RPS mode:
+        // splice this worker's request queue, blocking on its own futex until
+        // the RPS thread posts; returns the spliced chain (FIFO) to drain.
+        let mut req: *mut Request = if rps_mode {
+            let chain = rps_wait(td, stop);
+            if stop.load(Ordering::Acquire) {
+                // Free any spliced-but-unprocessed requests, then exit.
+                free_request_chain(chain);
+                break;
+            }
+            if chain.is_null() {
+                continue; // spurious wake with an empty queue
+            }
+            chain
+        } else {
+            msg_and_wait(td, msg_td, wait_list, stop);
+            if stop.load(Ordering::Acquire) {
+                break;
+            }
+            ptr::null_mut()
+        };
+        // Process the work: one cycle in default mode (`req` null), or one cycle
+        // per queued request in RPS mode (freeing each). `work_start` is stamped
+        // before the think-sleep so the request latency covers think-time +
+        // matrix work (`schbench.c:1464-1481`).
+        loop {
+            let work_start = monotonic_nanos();
+            if config.sleep_usec > 0 {
+                think_sleep(config.sleep_usec);
+            }
+            do_work(
+                &mut matrix_buf,
+                matrix_size,
+                config.operations,
+                locks,
+                &mut work_units,
+            );
+            let now = monotonic_nanos();
+            let delta_us = now.saturating_sub(work_start) / 1000;
+            if delta_us > 0 {
+                // SAFETY: only this worker thread accesses its own request_stats cell.
+                unsafe { (*td.request_stats.get()).add_lat(delta_us.min(u32::MAX as u64) as u32) };
+            }
+            progress.fetch_add(1, Ordering::Relaxed);
+            phase_loop_count += 1;
+            if req.is_null() {
+                break; // default mode: a single work cycle
+            }
+            // RPS mode: advance to the next queued request and free this one.
+            // SAFETY: `req` was `Box::into_raw`'d by the RPS thread and handed to
+            // this worker exclusively via the queue splice; we own it and free it
+            // exactly once here.
+            let next = unsafe { (*req).next.load(Ordering::Acquire) };
+            drop(unsafe { Box::from_raw(req) });
+            req = next;
+            if req.is_null() {
+                break;
+            }
         }
-        // `work_start` is stamped before the think-sleep so the request latency
-        // covers think-time + matrix work (`schbench.c:1464-1481`).
-        let work_start = monotonic_nanos();
-        if config.sleep_usec > 0 {
-            think_sleep(config.sleep_usec);
-        }
-        do_work(
-            &mut matrix_buf,
-            matrix_size,
-            config.operations,
-            locks,
-            &mut work_units,
-        );
-        let now = monotonic_nanos();
-        let delta_us = now.saturating_sub(work_start) / 1000;
-        if delta_us > 0 {
-            // SAFETY: only this worker thread accesses its own request_stats cell.
-            unsafe { (*td.request_stats.get()).add_lat(delta_us.min(u32::MAX as u64) as u32) };
-        }
-        progress.fetch_add(1, Ordering::Relaxed);
-        phase_loop_count += 1;
         // Drain-on-change: when the parent advances `phase_epoch`, finalize the
         // phase just ended (tagged with the OLD epoch the samples were recorded
         // under) and re-baseline. A worker blocked across a whole phase simply
@@ -681,6 +968,8 @@ fn worker_loop(td: &ThreadData, ctx: &WorkerCtx) {
     // worker that exits mid-`do_work` leaves the message thread parked forever and
     // `run()` deadlocks. Idempotent across workers: the first post the message
     // thread observes makes it re-check `stop` and break; later posts are no-ops.
+    // In RPS mode this is itself a harmless no-op: the dispatcher runs
+    // `run_rps_thread` (which never parks on `msg_td`) and observes `stop` itself.
     msg_td.futex.post();
     // Final drain: close the still-open phase. When non-phasic this is the only
     // snapshot (`cur_epoch` 0), so run() builds the whole-run result uniformly
@@ -793,7 +1082,15 @@ fn run_one_message_thread(
         for w in &workers {
             inner.spawn(|| worker_loop(w, &ctx));
         }
-        run_msg_thread(&msg_td, &wait_list, stop, phase_epoch);
+        // Dispatcher: RPS-injector mode runs the rate-driven request thread;
+        // default mode runs the message-thread handshake. Both run on this
+        // calling thread and record the dispatcher's run-delay into `msg_td`
+        // (schbench `message_thread`, `:1594`).
+        if config.rps_per_message_thread() != 0 {
+            run_rps_thread(&workers, &msg_td, config, stop, phase_epoch);
+        } else {
+            run_msg_thread(&msg_td, &wait_list, stop, phase_epoch);
+        }
         // Stop is set: wake every worker so a blocked one observes stop and
         // exits (schbench fposts each worker before joining, `:1599-1602`).
         for w in &workers {
@@ -801,6 +1098,16 @@ fn run_one_message_thread(
         }
         // The inner scope joins the workers here.
     });
+
+    // RPS mode: free any requests the RPS thread enqueued after a worker's last
+    // splice (the worker exited on stop without draining them). After the join,
+    // this is the sole access to each worker's queue, so no request leaks across
+    // run() calls.
+    if config.rps_per_message_thread() != 0 {
+        for w in &workers {
+            free_request_chain(w.requests.splice_reversed());
+        }
+    }
 
     // After join (happens-before): drain each thread's owner-only phase
     // snapshots into the whole-run histograms + the per-epoch aggregate.
@@ -1038,6 +1345,7 @@ mod tests {
             operations: 1,
             sleep_usec: 0,
             skip_locking: false,
+            requests_per_sec: 0,
         };
         let stop = AtomicBool::new(false);
         let progress = AtomicU64::new(0);
@@ -1078,6 +1386,7 @@ mod tests {
             operations: 5,
             sleep_usec: 0,
             skip_locking: false,
+            requests_per_sec: 0,
         };
         let stop = AtomicBool::new(false);
         let progress = AtomicU64::new(0);
@@ -1099,6 +1408,85 @@ mod tests {
     }
 
     #[test]
+    fn engine_rps_mode_injects_drains_and_terminates() {
+        // RPS-injector mode (requests_per_sec != 0): a dedicated thread enqueues
+        // requests round-robin across the workers, which splice + drain their
+        // queues instead of the message-thread handshake. Verify the RPS path
+        // runs (loop_count + request samples) and terminates cleanly -- run()
+        // returns (no deadlock: the RPS thread is the waker, the worker the
+        // waitee, and shutdown wakes the workers via run_one_message_thread's
+        // worker-wake + the RPS thread's stop-time fpost-all; a hang is the
+        // nextest timeout) with no request leak (the post-join free).
+        let config = SchbenchConfig {
+            message_threads: 1,
+            worker_threads: 2,
+            cache_footprint_kib: 16,
+            operations: 1,
+            sleep_usec: 0,
+            skip_locking: false,
+            requests_per_sec: 10_000,
+        };
+        let stop = AtomicBool::new(false);
+        let progress = AtomicU64::new(0);
+        let outcome = std::thread::scope(|s| {
+            let runner = s.spawn(|| run(&config, &stop, &progress, None));
+            while progress.load(Ordering::Relaxed) < 50 {
+                core::hint::spin_loop();
+            }
+            stop.store(true, Ordering::Release);
+            // Deadlocks here on regression: a worker parked in rps_wait that the
+            // shutdown path fails to wake, or the RPS thread failing to observe
+            // stop, would hang this join.
+            runner.join().expect("run panicked")
+        });
+        let result = &outcome.whole_run;
+        assert!(
+            result.loop_count >= 50,
+            "RPS workers serviced requests: {}",
+            result.loop_count
+        );
+        assert!(
+            result.request.nr_samples > 0,
+            "RPS request-latency samples recorded"
+        );
+    }
+
+    #[test]
+    fn engine_rps_below_message_threads_falls_to_default() {
+        // Regression: when the -R total is below the message-thread count,
+        // the per-thread rate (rps_per_message_thread) rounds to 0, and the
+        // engine must run the DEFAULT message-handshake mode -- workers do real
+        // wake-cycle work -- matching schbench's startup-divide-before-gate. NOT
+        // a zero-rate RPS mode (which would leave the workers parked with no
+        // requests, never advancing progress -- the spin below would then hang,
+        // caught by the nextest timeout).
+        let config = SchbenchConfig {
+            message_threads: 2,
+            worker_threads: 1,
+            cache_footprint_kib: 16,
+            operations: 1,
+            sleep_usec: 0,
+            skip_locking: false,
+            requests_per_sec: 1, // 1 / 2 message threads = 0 per thread -> default
+        };
+        let stop = AtomicBool::new(false);
+        let progress = AtomicU64::new(0);
+        let outcome = std::thread::scope(|s| {
+            let runner = s.spawn(|| run(&config, &stop, &progress, None));
+            while progress.load(Ordering::Relaxed) < 50 {
+                core::hint::spin_loop();
+            }
+            stop.store(true, Ordering::Release);
+            runner.join().expect("run panicked")
+        });
+        assert!(
+            outcome.whole_run.loop_count >= 50,
+            "sub-1-per-thread RPS ran default-mode work: {}",
+            outcome.whole_run.loop_count
+        );
+    }
+
+    #[test]
     fn engine_splits_stats_across_phase_epochs() {
         // Drive the shared phase_epoch 1 -> 2 mid-run and confirm the engine
         // partitions its histograms + loop_count into per-epoch snapshots
@@ -1111,6 +1499,7 @@ mod tests {
             operations: 1,
             sleep_usec: 0,
             skip_locking: false,
+            requests_per_sec: 0,
         };
         let stop = AtomicBool::new(false);
         let progress = AtomicU64::new(0);

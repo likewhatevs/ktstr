@@ -30,7 +30,7 @@ use clap::Parser;
 use ktstr::workload::{run_standalone, SchbenchConfig, StandaloneReport, SCHBENCH_PERCENTILES};
 
 /// schbench-compatible flags. The short forms match schbench (`-m`/`-t`/`-F`/
-/// `-n`/`-s`/`-L`/`-r`) so one invocation drives both programs identically.
+/// `-n`/`-s`/`-L`/`-r`/`-R`) so one invocation drives both programs identically.
 #[derive(Parser)]
 #[command(
     name = "ktstr-schbench-validate",
@@ -58,6 +58,10 @@ struct Args {
     /// Benchmark runtime in seconds (schbench `-r`, default 30 — same as schbench).
     #[arg(short = 'r', long, default_value_t = 30)]
     runtime_secs: u64,
+    /// Fixed request rate, requests/second (schbench `-R`); 0 = off (the default
+    /// message-handshake mode), non-zero drives the RPS-injector mode.
+    #[arg(short = 'R', long, default_value_t = 0)]
+    rps: usize,
 }
 
 fn main() {
@@ -68,7 +72,8 @@ fn main() {
         .cache_footprint_kib(args.cache_footprint_kib)
         .operations(args.operations)
         .sleep_usec(args.sleep_usec)
-        .skip_locking(args.skip_locking);
+        .skip_locking(args.skip_locking)
+        .requests_per_sec(args.rps);
 
     let report = run_standalone(&config, args.runtime_secs);
     print_report(&report, args.runtime_secs);
