@@ -480,7 +480,7 @@ pub(super) fn worker_main(
     // once at start via sched_getaffinity (read_effective_cpus).
     // Custom: hand the user function a WorkerCtx. Affinity and
     // sched_policy are already applied above.
-    if let WorkType::Custom { run, .. } = &work_type {
+    if let WorkType::Custom { name, run, .. } = &work_type {
         // The ctx exposes the same effective cpuset and cgroup-sibling
         // pids the built-in affinity-churn variants compute, so a
         // custom probe need not re-roll sched_getaffinity or
@@ -490,7 +490,15 @@ pub(super) fn worker_main(
         let sibling_pids = read_sibling_pids();
         let cgroup_dir = read_self_cgroup_dir();
         let ctx = WorkerCtx::new(stop, &cpus, &sibling_pids, cgroup_dir.as_deref());
-        return run.call(&ctx);
+        let report = run.call(&ctx);
+        // Telltale for the work_units-vs-iterations footgun: a closure that
+        // counted work but left the outer-loop counter at zero reads as zero
+        // throughput (total_iterations / the per-worker rates read
+        // `iterations`). Warn once; do not mutate the verbatim report.
+        if custom_iterations_telltale(&report) {
+            warn_custom_iterations_zero_once(name);
+        }
+        return report;
     }
 
     let affinity_churn_cpus: Vec<usize> = if matches!(
@@ -3727,6 +3735,32 @@ fn cgroup_dir_from_rel(rel: &str) -> Option<std::path::PathBuf> {
 /// assert the `worker_main` hand-off threads this value through.
 pub(crate) fn read_self_cgroup_dir() -> Option<std::path::PathBuf> {
     cgroup_dir_from_rel(&read_self_cgroup_rel()?)
+}
+
+/// True for the `work_units`-vs-`iterations` footgun shape: a `Custom`
+/// worker counted work (`work_units > 0`) but left the outer-loop counter
+/// at zero (`iterations == 0`), so headline throughput — which reads
+/// `WorkerReport::iterations` — reads zero. See the `WorkType::Custom`
+/// telemetry contract. Pure so it is testable on a literal report.
+fn custom_iterations_telltale(r: &WorkerReport) -> bool {
+    r.work_units > 0 && r.iterations == 0
+}
+
+/// Warn ONCE per process that a `Custom` worker returned the
+/// [`custom_iterations_telltale`] shape. Mirrors the `std::sync::Once`
+/// idiom of `warn_setpriority_failed_once`; advisory only — it inspects
+/// and prints, never mutates the verbatim report.
+fn warn_custom_iterations_zero_once(name: &str) {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        eprintln!(
+            "workload: Custom worker '{name}' returned work_units>0 but \
+             iterations==0; headline throughput (total_iterations / \
+             iterations_per_worker / iterations_per_cpu_sec) reads \
+             WorkerReport::iterations and will read zero — populate iterations \
+             (commonly = work_units). See the WorkType::Custom telemetry contract."
+        );
+    });
 }
 
 /// Read the calling worker's sibling pids from its cgroup's

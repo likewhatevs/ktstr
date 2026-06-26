@@ -457,6 +457,22 @@ pub enum WorkType {
     /// compute wake-latency percentiles will produce zero/degenerate
     /// numbers against a `Custom` report that did not record them.
     ///
+    /// **`work_units` vs `iterations` — which assertion reads which:** the
+    /// two `WorkerReport` counters are NOT interchangeable. Headline
+    /// throughput — `CgroupStats::total_iterations` and the derived rates
+    /// `iterations_per_worker` / `iterations_per_cpu_sec` and
+    /// `migration_ratio` — sums `WorkerReport::iterations`, NOT `work_units`.
+    /// The default fairness/starvation gate (`assert_not_starved` and the
+    /// `min_work_units` floor) and `assert_throughput_parity` read
+    /// `WorkerReport::work_units`, NOT `iterations`. Populate BOTH (set them
+    /// equal when the closure has a single loop counter, as the `custom_spin_fn`
+    /// fixture does), or set each to the quantity the assertions you
+    /// target will read. A report with `work_units > 0, iterations == 0`
+    /// passes the starvation gate but reports zero throughput, so
+    /// `claim_total_iterations(..).at_least(N)` silently fails; the inverse
+    /// (`iterations > 0, work_units == 0`) reports throughput but the
+    /// starvation gate flags every worker.
+    ///
     /// **Process-group lifecycle (per `CloneMode`):**
     ///
     /// _Fork mode_ — every worker calls `setpgid(0, 0)` immediately

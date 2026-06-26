@@ -1350,6 +1350,23 @@ fn parse_cgroup_rel_and_self_dir_discipline() {
     }
 }
 
+/// `custom_iterations_telltale` flags ONLY the `work_units > 0` +
+/// `iterations == 0` footgun shape (the naive-Custom-author trap the dispatch
+/// warn-once targets), and nothing else — so the advisory never fires on a
+/// balanced, throughput-only, or empty report.
+#[test]
+fn custom_iterations_telltale_flags_only_work_units_without_iterations() {
+    let mk = |work_units, iterations| WorkerReport {
+        work_units,
+        iterations,
+        ..Default::default()
+    };
+    assert!(custom_iterations_telltale(&mk(1000, 0)));
+    assert!(!custom_iterations_telltale(&mk(0, 1000)));
+    assert!(!custom_iterations_telltale(&mk(1000, 1000)));
+    assert!(!custom_iterations_telltale(&mk(0, 0)));
+}
+
 /// `WorkerCtx` accessors return the borrowed worker state verbatim,
 /// and `stop()` exposes the live flag — a flip is observable through
 /// the ctx. Pins the read-only contract a `Custom` worker relies on.

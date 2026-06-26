@@ -29,6 +29,59 @@ fn starved_fail() {
     );
 }
 
+/// work_units-vs-iterations split: a report with `work_units > 0` but
+/// `iterations == 0` (the naive-Custom-author footgun; `rpt` always sets
+/// `iterations: 0`) reports ZERO throughput — `CgroupStats::total_iterations`
+/// reads `iterations`, not `work_units` — yet PASSES the starvation gate,
+/// which reads `work_units`. Pins both halves of the split and would catch a
+/// forbidden silent `iterations == 0 ? work_units` fallback in the reducer.
+#[test]
+fn work_units_without_iterations_is_zero_throughput_but_not_starved() {
+    let reports = [
+        rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0, 1], 50),
+        rpt(2, 1000, 5e9 as u64, 6e8 as u64, &[0, 1], 50),
+    ];
+    assert_eq!(
+        cgroup_stats(&reports).total_iterations,
+        0,
+        "total_iterations reads WorkerReport::iterations (0), NOT work_units (1000)"
+    );
+    assert!(
+        assert_not_starved(&reports).is_pass(),
+        "the starvation gate reads work_units (1000 > 0), so it must pass"
+    );
+}
+
+/// Inverse: `work_units == 0` but `iterations > 0` reports throughput
+/// (`total_iterations` sums `iterations`) yet trips the starvation gate
+/// (which reads `work_units == 0`). Pins that the two counters are not
+/// interchangeable in either direction.
+#[test]
+fn iterations_without_work_units_reports_throughput_but_starves() {
+    let reports = [
+        WorkerReport {
+            iterations: 1000,
+            ..rpt(1, 0, 5e9 as u64, 5e8 as u64, &[0, 1], 50)
+        },
+        WorkerReport {
+            iterations: 1000,
+            ..rpt(2, 0, 5e9 as u64, 6e8 as u64, &[0, 1], 50)
+        },
+    ];
+    assert_eq!(
+        cgroup_stats(&reports).total_iterations,
+        2000,
+        "total_iterations sums WorkerReport::iterations (1000+1000), independent of work_units (0)"
+    );
+    let r = assert_not_starved(&reports);
+    assert!(r.is_fail(), "work_units == 0 must trip the starvation gate");
+    assert!(
+        r.failure_details()
+            .any(|d| matches!(d.kind, DetailKind::Starved)),
+        "the starvation gate reads work_units == 0 → Starved"
+    );
+}
+
 #[test]
 fn unfair_spread_fail() {
     let r = assert_not_starved(&[

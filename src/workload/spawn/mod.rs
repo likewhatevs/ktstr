@@ -340,6 +340,11 @@ pub struct WorkerReport {
     /// (kill/waitpid/Pid::from_raw).
     pub tid: i32,
     /// Cumulative work iterations (incremented by `spin_burst` or I/O loops).
+    /// Read by the fairness/starvation gate (`assert_not_starved` /
+    /// `min_work_units`) and `assert_throughput_parity`; NOT summed into
+    /// `CgroupStats::total_iterations`, which reads [`iterations`](Self::iterations).
+    /// A `Custom` worker that wants throughput assertions must also populate
+    /// [`iterations`](Self::iterations).
     pub work_units: u64,
     /// Thread CPU time from `CLOCK_THREAD_CPUTIME_ID` (ns).
     pub cpu_time_ns: u64,
@@ -437,7 +442,12 @@ pub struct WorkerReport {
     /// observed" read this field; distribution computations read
     /// `iteration_costs_ns` directly.
     pub iteration_cost_sample_total: u64,
-    /// Outer-loop iteration count.
+    /// Outer-loop iteration count. What `CgroupStats::total_iterations` sums
+    /// and what the derived throughput rates (`iterations_per_worker` /
+    /// `iterations_per_cpu_sec`) and `migration_ratio` divide by; NOT read by
+    /// the starvation gate, which reads [`work_units`](Self::work_units). A
+    /// `Custom` worker that wants the starvation / `min_work_units` gate
+    /// honored must also populate [`work_units`](Self::work_units).
     pub iterations: u64,
     /// Delta of /proc/self/schedstat field 2 (run_delay) over the work loop.
     pub schedstat_run_delay_ns: u64,
