@@ -98,7 +98,7 @@ pub struct StandaloneReport {
 ///
 /// The `run_secs` window mirrors schbench's `-r <secs>`: it is the benchmark's
 /// own defined runtime — the workload behavior, like the per-request think-sleep
-/// in [`run`] — not a harness poll or synchronization wait. The engine itself
+/// in `run` — not a harness poll or synchronization wait. The engine itself
 /// stays stop-gated and event-driven; this wrapper is the only place a
 /// wall-clock timer drives it, bounding the benchmark window the way `-r` does
 /// upstream.
