@@ -3938,72 +3938,61 @@ pub(super) fn alu_hot_chain(width: AluWidth, steps: u64, work_units: &mut u64) {
 /// `&mut [u8]` and cast to `*mut u64`, which was UB because a
 /// `Vec<u8>` is only 1-byte aligned.
 ///
-/// Optimization-elimination barrier: every multiplicand load goes
-/// through `black_box`, the accumulator is `black_box`-clobbered
-/// before the write, and the C-region store uses `write_volatile`.
-/// Volatile is load-bearing on the write side: `matrix_buf` in
-/// `worker_main` is a process-local `Vec<u64>` whose C region (the
-/// upper third) is NEVER read by `matrix_multiply` or by any caller
-/// — every subsequent iteration overwrites the same C indices and
-/// the buffer is dropped at worker-exit without being inspected.
-/// LLVM is therefore free to mark the store dead and elide both the
-/// store AND the multiplication chain feeding it (load-load-mul-add
-/// dependency collapses to nothing without an observable sink). The
-/// per-load `black_box` and the post-mul `black_box(acc)` keep the
-/// arithmetic live, but a non-volatile write on a dead-output slot
-/// remains DCE-eligible. `write_volatile` makes the store non-
-/// elidable, so the compute path the workload claims to exercise
+/// Optimization-elimination barrier: the slice is `black_box`-clobbered
+/// ONCE at entry, the C-region store uses `write_volatile`, and one C value
+/// is read back into the observable `work_units`. `matrix_buf` in
+/// `worker_main` is a process-local `Vec<u64>` whose C region (the upper
+/// third) is NEVER read by `matrix_multiply` or any caller, and the A/B
+/// regions stay zero-initialized — so LLVM is otherwise free to (a) prove
+/// the loads are zero and fold the multiply to a constant, and (b) mark the
+/// store dead and elide the chain feeding it. The entry `black_box` makes
+/// the buffer opaque (kills the fold); the `write_volatile` makes the store
+/// non-elidable and the read-back gives the chain a load-bearing consumer
+/// (kills the DCE) — so the compute path the workload claims to exercise
 /// actually executes under `-O2`/`-O3`.
 ///
-/// `#[inline(never)]` matches `spin_burst` / `cache_rmw_loop` —
-/// forcing out-of-line keeps the volatile-store and per-iteration
-/// `black_box` wrappers visible as distinct boundaries the
-/// optimizer can't collapse against the caller's arithmetic.
+/// The barrier is on the SLICE, not per LOAD: a per-load `black_box` also
+/// blocks vectorization of the inner loop, which de-optimized do_work ~1.3x
+/// vs schbench's `-O2` `do_some_math`. One entry barrier stays fold-safe
+/// while leaving the loop vectorizable, matching schbench's compute cost.
+///
+/// `#[inline(never)]` matches `spin_burst` / `cache_rmw_loop` — the boundary
+/// keeps the caller's zero-init from flowing in; the entry `black_box` closes
+/// the residual thin-LTO IPO path (`Cargo.toml` `lto = "thin"`).
 #[inline(never)]
 pub(super) fn matrix_multiply(data: &mut [u64], size: usize, work_units: &mut u64) {
     debug_assert_eq!(data.len(), 3 * size * size);
     let stride = size * size;
+    // Clobber the buffer ONCE so the optimizer treats it as opaque and cannot
+    // prove the zero-initialized A/B regions are all-zero (which would let it
+    // fold the multiply to a constant). #[inline(never)] hides the caller's
+    // zero-init across the call boundary; this also closes the residual
+    // thin-LTO IPO path (Cargo.toml `lto = "thin"`). Unlike a per-load
+    // black_box, one barrier on the slice leaves the inner loop vectorizable.
+    let data = std::hint::black_box(data);
     for i in 0..size {
         for j in 0..size {
             let mut acc: u64 = 0;
             for k in 0..size {
-                acc = acc.wrapping_add(
-                    std::hint::black_box(data[i * size + k])
-                        .wrapping_mul(std::hint::black_box(data[stride + k * size + j])),
-                );
+                acc = acc.wrapping_add(data[i * size + k].wrapping_mul(data[stride + k * size + j]));
             }
-            // SAFETY: `2 * stride + i * size + j` is in-bounds for a
-            // slice of length `3 * stride` whenever `i, j < size`,
-            // which the surrounding `for` ranges enforce. The
-            // `debug_assert_eq!` above pins the length contract; the
-            // slice's element type (`u64`) is naturally aligned via
-            // `Vec<u64>` allocation. A non-volatile `data[idx] = ...`
-            // would be DCE-eligible because no later code reads the
-            // C region; the volatile store is the documented escape
-            // hatch.
+            // SAFETY: `2 * stride + i * size + j` is in-bounds for a slice of
+            // length `3 * stride` whenever `i, j < size`, which the surrounding
+            // `for` ranges enforce; the `debug_assert_eq!` above pins the length
+            // contract and `u64` is naturally aligned via the `Vec<u64>` backing.
+            // The volatile store makes the C-region write non-elidable, so the
+            // multiply chain feeding `acc` executes under `-O2`/`-O3` (no later
+            // code reads the C region, so a plain store would be DCE-eligible).
             unsafe {
-                std::ptr::write_volatile(
-                    &mut data[2 * stride + i * size + j] as *mut u64,
-                    std::hint::black_box(acc),
-                );
+                std::ptr::write_volatile(&mut data[2 * stride + i * size + j] as *mut u64, acc);
             }
         }
     }
-    // Defense-in-depth read-back sink: route a single C-region
-    // value back into `work_units` through `black_box`. The
-    // `write_volatile` above is the primary defense — volatility
-    // forces every store to materialize — but a future LLVM that
-    // reasons more aggressively about volatility provenance could
-    // still mark the entire C region as a write-only buffer whose
-    // contents the program never inspects, and elide the multiply
-    // chain feeding the volatile sink. By feeding one extracted
-    // value back into the observable `work_units` accumulator the
-    // multiply chain has a load-bearing consumer that flows into
-    // the worker report. `data[2 * stride]` is the first slot of
-    // the C region, in-bounds because `size >= 1` is enforced by
-    // the call site (the worker only invokes matrix_multiply when
-    // `matrix_size > 0`).
-    *work_units = work_units.wrapping_add(std::hint::black_box(data[2 * stride]));
+    // Defense-in-depth read-back sink: route one C-region value into the
+    // observable `work_units` so the multiply chain has a load-bearing consumer
+    // beyond the volatile store. `data[2 * stride]` is in-bounds because the
+    // caller only invokes matrix_multiply when `matrix_size > 0`.
+    *work_units = work_units.wrapping_add(data[2 * stride]);
 }
 
 /// Write 1 byte to partner, poll for response, read, record wake latency.
