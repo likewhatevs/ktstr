@@ -31,6 +31,13 @@
 //!   on the hot path, so the syscall profile stays futex-dominated like
 //!   schbench's. (schbench hand-duplicates this for its thread list and its
 //!   request list; schbench_rs shares one generic implementation.)
+//! - do_work timing: the matrix multiply is written to vectorize under
+//!   optimization, matching schbench's `-O2` (its Makefile `CFLAGS = -Wall
+//!   -O2`). A debug build (opt-level 0) does NOT vectorize, so request latency
+//!   runs higher than reference schbench's. ABSOLUTE side-by-side fidelity vs
+//!   the reference (the `ktstr-schbench-validate` comparison) therefore needs a
+//!   release build. The in-ktstr A/B comparison (perf-delta / per-phase claims)
+//!   is build-invariant -- both sides use the same build -- so it is unaffected.
 
 use core::cell::UnsafeCell;
 use core::ptr;
