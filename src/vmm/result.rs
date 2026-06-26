@@ -776,12 +776,14 @@ impl VmResult {
             }
             Err(_) => host,
         };
-        // Derive the schbench per-phase scalars into the now-final (post-fold)
-        // buckets so a per-phase A/B claim reads them via phase_metric. A no-op
-        // for non-schbench runs (no schbench carrier in any per_cgroup); must
-        // run post-fold (the merge skips is_derived keys, so an earlier derive
-        // would be dropped).
-        crate::assert::derive_schbench_phase_metrics(&mut buckets);
+        // Derive the per-phase scalars into the now-final (post-fold) buckets so
+        // a per-phase A/B claim reads them via phase_metric / phase_cgroup_metric:
+        // the non-schbench carrier scalars (every cgroup) into each pc.metrics,
+        // and the schbench scalars into pc.metrics + the pooled bucket.metrics.
+        // A no-op only when no phase carries a per-cgroup carrier; must run
+        // post-fold (the merge skips is_derived keys, so an earlier derive would
+        // be dropped).
+        crate::assert::derive_phase_metrics(&mut buckets);
         buckets
     }
 
@@ -821,7 +823,8 @@ impl VmResult {
     /// 2. failing that, the cross-cgroup phase sum of a per-cgroup Counter
     ///    ([`crate::assert::PhaseBucket::cgroup_counter_total`]) for the
     ///    keys whose value lives ONLY in the per-cgroup carriers —
-    ///    `"total_migrations"` and `"total_iterations"`. These are
+    ///    `"total_migrations"`, `"total_iterations"`, and
+    ///    `"total_cpu_time_ns"`. These are
     ///    registered `Counter`s with no per-sample source
     ///    (`crate::stats::MetricDef::read_sample` returns `None`), so
     ///    they never reach `metrics`; without this fallback
@@ -901,8 +904,9 @@ impl VmResult {
     /// cgroup's per-phase carrier via [`crate::assert::PhaseCgroupStats::get`] (its
     /// derived `metrics` map), falling back to
     /// [`crate::assert::PhaseCgroupStats::cgroup_counter`] for the per-cgroup
-    /// Counters `total_migrations`/`total_iterations` (carrier fields, not derived) —
-    /// symmetric with [`Self::phase_metric`]'s `cgroup_counter_total` fallback.
+    /// Counters `total_migrations`/`total_iterations`/`total_cpu_time_ns` (carrier
+    /// fields, not derived) — symmetric with [`Self::phase_metric`]'s
+    /// `cgroup_counter_total` fallback.
     /// `None` when `phase` has no bucket, the bucket has no carrier for `cgroup`, or
     /// the carrier carried no finite value for the metric — sentinel-free, distinct
     /// from a real `Some(0.0)`.

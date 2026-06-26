@@ -1,4 +1,5 @@
 use super::*;
+use crate::assert::derive_phase_metrics;
 
 // -- run-level distributional re-pool (populate_run_distribution_metrics) --
 
@@ -123,6 +124,168 @@ fn repool_distribution_value_for_value_with_cgroup_stats() {
     assert!((ext("worst_wake_latency_cv") - cg.wake_latency_cv).abs() < 1e-9);
     assert!((ext("worst_mean_run_delay_us") - cg.mean_run_delay_us).abs() < 1e-9);
     assert!((ext("worst_run_delay_us") - cg.worst_run_delay_us).abs() < 1e-9);
+}
+
+/// Per-cgroup NON-schbench parity: `derive_phase_metrics` writes each carrier's
+/// reduced scalars into `pc.metrics` value-for-value with the single-cgroup
+/// `cgroup_stats` reduction (RATIOS / COUNTERS / DISTRIBUTIONS), the pooled
+/// RATIOS re-pool deterministically from the concatenated reports, but the
+/// DISTRIBUTION families are deliberately NOT pooled==per-cgroup (the pooled
+/// value comes from the host sample fold, not a carrier re-pool — see
+/// `repool_distribution_pools_wake_across_cgroups_not_max_of_per_cgroup`).
+#[test]
+fn derive_writes_non_schbench_per_cgroup_value_for_value() {
+    let nodes: std::collections::BTreeSet<usize> = std::collections::BTreeSet::from([0usize]);
+    // cgroup A: 2 workers, ≤cap wake pools so the carrier IS the full pool and
+    // the percentile re-derives value-for-value.
+    let reports_a = vec![
+        WorkerReport {
+            migration_count: 3,
+            iterations: 1000,
+            schedstat_cpu_time_ns: 2_000_000_000, // 2s on-CPU
+            schedstat_run_delay_ns: 4000,
+            wake_latencies_ns: vec![1000, 2000, 3000, 4000, 5000],
+            wake_sample_total: 5,
+            numa_pages: [(0usize, 100u64), (1usize, 50u64)].into_iter().collect(),
+            vmstat_numa_pages_migrated: 10,
+            ..rpt(1, 1000, 1_000_000, 200_000, &[0], 0) // wall 1ms, off-cpu 0.2ms -> 20%
+        },
+        WorkerReport {
+            migration_count: 1,
+            iterations: 1000,
+            schedstat_cpu_time_ns: 2_000_000_000,
+            schedstat_run_delay_ns: 6000,
+            wake_latencies_ns: vec![6000, 7000, 8000, 9000, 10000],
+            wake_sample_total: 5,
+            numa_pages: [(0usize, 200u64), (1usize, 50u64)].into_iter().collect(),
+            vmstat_numa_pages_migrated: 20,
+            ..rpt(2, 1000, 1_000_000, 100_000, &[1], 0) // 10%
+        },
+    ];
+    let cg_a = cgroup_stats(&reports_a);
+    let carrier_a = phase_cgroup_stats(&reports_a, Some(&nodes));
+
+    // cgroup B: high-magnitude wake pool so the cross-cgroup union p99 differs
+    // from either cgroup's own p99 (the distribution thesis).
+    let reports_b = vec![WorkerReport {
+        migration_count: 7,
+        iterations: 500,
+        schedstat_cpu_time_ns: 1_000_000_000,
+        schedstat_run_delay_ns: 99000,
+        wake_latencies_ns: vec![100_000, 200_000, 300_000],
+        wake_sample_total: 3,
+        numa_pages: [(0usize, 10u64), (1usize, 90u64)].into_iter().collect(),
+        vmstat_numa_pages_migrated: 5,
+        ..rpt(3, 500, 1_000_000, 500_000, &[0], 0) // 50%
+    }];
+    let cg_b = cgroup_stats(&reports_b);
+    let carrier_b = phase_cgroup_stats(&reports_b, Some(&nodes));
+
+    let mut bucket = PhaseBucket::default();
+    bucket.per_cgroup.insert("a".to_string(), carrier_a);
+    bucket.per_cgroup.insert("b".to_string(), carrier_b);
+    derive_phase_metrics(std::slice::from_mut(&mut bucket));
+
+    let a = &bucket.per_cgroup["a"];
+    let m = |n: &str| -> f64 {
+        *a.metrics
+            .get(n)
+            .unwrap_or_else(|| panic!("missing per-cgroup key {n}"))
+    };
+
+    // RATIOS — per-cgroup == single-carrier cgroup_stats value-for-value.
+    assert!((m("migration_ratio") - cg_a.migration_ratio).abs() < 1e-12);
+    assert!((m("iterations_per_worker") - cg_a.iterations_per_worker().unwrap()).abs() < 1e-9);
+    assert!((m("iterations_per_cpu_sec") - cg_a.iterations_per_cpu_sec().unwrap()).abs() < 1e-9);
+    assert!((m("cross_node_migration_ratio") - cg_a.cross_node_migration_ratio).abs() < 1e-12);
+    // page_locality: cgroup_stats hardcodes 0.0 (no NUMA node context in the
+    // reports-only builder), so parity is against the hand-derived value from
+    // the carrier (expected nodes {0}: local 100+200=300, total 400).
+    assert!((m("page_locality") - (300.0 / 400.0)).abs() < 1e-12);
+
+    // COUNTER — total_cpu_time_ns resolves via the carrier counter (not pc.metrics).
+    assert_eq!(
+        a.cgroup_counter("total_cpu_time_ns"),
+        Some(cg_a.total_cpu_time_ns as f64)
+    );
+
+    // DISTRIBUTIONS — per-cgroup == single-carrier reduction (≤cap, value-for-value).
+    assert!((m("p99_wake_latency_us") - cg_a.p99_wake_latency_us).abs() < 1e-9);
+    assert!((m("median_wake_latency_us") - cg_a.median_wake_latency_us).abs() < 1e-9);
+    assert!((m("wake_latency_cv") - cg_a.wake_latency_cv).abs() < 1e-9);
+    assert!((m("mean_run_delay_us") - cg_a.mean_run_delay_us).abs() < 1e-9);
+    assert!((m("max_run_delay_us") - cg_a.worst_run_delay_us).abs() < 1e-9);
+    assert!((m("avg_off_cpu_pct") - cg_a.avg_off_cpu_pct.unwrap()).abs() < 1e-9);
+    assert!((m("min_off_cpu_pct") - cg_a.min_off_cpu_pct.unwrap()).abs() < 1e-9);
+    assert!((m("max_off_cpu_pct") - cg_a.max_off_cpu_pct.unwrap()).abs() < 1e-9);
+    assert!((m("off_cpu_spread_pct") - cg_a.spread.unwrap()).abs() < 1e-9);
+
+    // POOLED RATIOS re-pool deterministically from the concatenated reports:
+    // pooled migration_ratio == migration_ratio_of(Σmig, Σiters).
+    let sum_mig = cg_a.total_migrations + cg_b.total_migrations;
+    let sum_iters = cg_a.total_iterations + cg_b.total_iterations;
+    let mut concat = reports_a.clone();
+    concat.extend(reports_b.clone());
+    let cg_concat = cgroup_stats(&concat);
+    assert!(
+        (cg_concat.migration_ratio
+            - crate::assert::reductions::migration_ratio_of(sum_mig, sum_iters))
+        .abs()
+            < 1e-12
+    );
+
+    // DISTRIBUTIONS are NOT pooled==per-cgroup: cg_b's high-magnitude wake pool
+    // gives it a distinct per-cgroup p99; the per-cgroup keys are present and
+    // equal the single carrier (asserted above), NOT a shared pooled value (the
+    // host sample fold owns the pooled distribution).
+    let b = &bucket.per_cgroup["b"];
+    assert_ne!(
+        a.metrics.get("p99_wake_latency_us"),
+        b.metrics.get("p99_wake_latency_us"),
+        "distinct cgroups must have distinct per-cgroup p99 — not a shared pool",
+    );
+    // And the pooled bucket map is NOT written for the non-schbench families
+    // (only pc.metrics is); the pooled value is the host-sample-fold's job.
+    assert!(!bucket.metrics.contains_key("p99_wake_latency_us"));
+    assert!(!bucket.metrics.contains_key("migration_ratio"));
+}
+
+/// ABSENT discipline: a default (no-sample) carrier emits ONLY `migration_ratio`
+/// (a measured 0.0 when no iterations ran) — every distribution / ratio / counter
+/// key whose source is empty/zero is ABSENT (reads as missing, never a false 0).
+#[test]
+fn derive_non_schbench_absent_discipline() {
+    let mut bucket = PhaseBucket::default();
+    bucket
+        .per_cgroup
+        .insert("cg".to_string(), PhaseCgroupStats::default());
+    derive_phase_metrics(std::slice::from_mut(&mut bucket));
+    let m = &bucket.per_cgroup["cg"].metrics;
+    assert_eq!(
+        m.get("migration_ratio"),
+        Some(&0.0),
+        "migration_ratio is ALWAYS present (measured 0.0 when no iterations)",
+    );
+    for absent in [
+        "p99_wake_latency_us",
+        "median_wake_latency_us",
+        "wake_latency_cv",
+        "mean_run_delay_us",
+        "max_run_delay_us",
+        "avg_off_cpu_pct",
+        "min_off_cpu_pct",
+        "max_off_cpu_pct",
+        "off_cpu_spread_pct",
+        "iterations_per_worker",
+        "iterations_per_cpu_sec",
+        "page_locality",
+        "cross_node_migration_ratio",
+    ] {
+        assert!(
+            !m.contains_key(absent),
+            "{absent} must be ABSENT for a default carrier (no false 0)",
+        );
+    }
 }
 
 /// `WakeLatencyTailRatio` producer contract: `populate_run_distribution_metrics`

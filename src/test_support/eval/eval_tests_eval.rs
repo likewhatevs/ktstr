@@ -1434,7 +1434,7 @@ fn phase_buckets_equals_stats_phases_with_guest_per_cgroup_carriers() {
 /// into `PhaseBucket.metrics`. A guest carrier with a `SchbenchPhaseStats` at
 /// step_index=1 must surface e.g. `wakeup_p99_latency_us` in that bucket's
 /// metrics. Guards the WIRING (a refactor that dropped the
-/// `derive_schbench_phase_metrics` call at the `phase_buckets()` site would keep
+/// `derive_phase_metrics` call at the `phase_buckets()` site would keep
 /// every direct-derive unit test green while production silently stopped
 /// emitting the metrics — the mirror-tests-pin-nothing class). Also exercises
 /// the schbench carrier's postcard roundtrip guest→host (the TLV entry below).

@@ -216,6 +216,28 @@ fn assert_api_gap_helpers(result: &VmResult) -> Result<()> {
          fallback did not resolve",
     );
 
+    // gap 11: phase_cgroup_metric resolves a per-cgroup NON-schbench DERIVED
+    // metric (migration_ratio) and a per-cgroup carrier Counter
+    // (total_cpu_time_ns) from post_vm — the per-cgroup analog of gap 9. Both
+    // are produced per cgroup by derive_phase_metrics post-fold (migration_ratio
+    // into pc.metrics, total_cpu_time_ns via the carrier cgroup_counter), so a
+    // carrier-bearing phase must resolve them to Some (Some(0.0) when the
+    // underlying count is zero), never None.
+    anyhow::ensure!(
+        result
+            .phase_cgroup_metric(Phase::step(0), "cg_step0", "migration_ratio")
+            .is_some(),
+        "phase_cgroup_metric(Step[0], cg_step0, migration_ratio) returned None — \
+         the per-cgroup non-schbench derived metric did not resolve",
+    );
+    anyhow::ensure!(
+        result
+            .phase_cgroup_metric(Phase::step(0), "cg_step0", "total_cpu_time_ns")
+            .is_some(),
+        "phase_cgroup_metric(Step[0], cg_step0, total_cpu_time_ns) returned None — \
+         the per-cgroup carrier counter did not resolve",
+    );
+
     // gap 10: the full guest verdict is reachable for power users.
     anyhow::ensure!(
         result.guest_assert_result().is_ok(),

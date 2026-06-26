@@ -286,20 +286,29 @@ pub enum MetricKind {
     WakeLatencyTailRatio,
     /// Per-phase-only scalar derived ONCE per phase from a phase-scoped
     /// carrier, NOT from monitor samples and NOT re-pooled run-level. The sole
-    /// producer is the schbench per-phase derivation
-    /// (`crate::assert::derive_schbench_phase_metrics`): it pools each phase's
-    /// `crate::assert::PhaseCgroupStats` schbench carriers, re-derives a
-    /// percentile (from the merged latency histogram), a sample-weighted mean
-    /// (run-delay), or a count (loop_count), and writes the value DIRECTLY into
-    /// the phase's `crate::assert::PhaseBucket::metrics` for a per-phase A/B
-    /// claim to read via `phase_metric`. It is [`MetricKind::is_derived`] (so
-    /// the within-run reducers — [`aggregate_samples_for_phase`] and the
-    /// phase-bucket merge loop — skip it) and has NO run-level producer; it is
-    /// ADDITIONALLY gated out of the cross-RUN ext fold (`fold_ext_metrics`),
-    /// since a per-phase percentile has no meaningful cross-run aggregate. A
-    /// unit marker (no payload): the schbench derivation owns the
-    /// metric-name→computation mapping, so the kind need not carry a percentile
-    /// selector (which would leak `plat::Pct` through this public enum).
+    /// producer is [`crate::assert::derive_phase_metrics`], which derives two
+    /// families per phase:
+    /// - the schbench scalars: it pools each phase's
+    ///   `crate::assert::PhaseCgroupStats` schbench carriers and re-derives a
+    ///   percentile (from the merged latency histogram), a sample-weighted mean
+    ///   (run-delay), or a count (loop_count), writing them into BOTH each
+    ///   carrier's `PhaseCgroupStats::metrics` (per-cgroup, read via
+    ///   `phase_cgroup_metric`) AND the pooled
+    ///   `crate::assert::PhaseBucket::metrics` (read via `phase_metric`).
+    /// - the NON-schbench carrier scalars (wake/run-delay/off-cpu distributions
+    ///   + migration/iterations/locality ratios, via `write_carrier_scalars`):
+    ///   written ONLY into each `PhaseCgroupStats::metrics` (per-cgroup, read
+    ///   via `phase_cgroup_metric`) — these have NO pooled
+    ///   `crate::assert::PhaseBucket::metrics` entry; their run-level aggregate
+    ///   is the `worst_*` ext-metrics key.
+    /// It is [`MetricKind::is_derived`] (so the within-run reducers —
+    /// [`aggregate_samples_for_phase`] and the phase-bucket merge loop — skip
+    /// it) and has NO run-level producer; it is ADDITIONALLY gated out of the
+    /// cross-RUN ext fold (`fold_ext_metrics`), since a per-phase scalar has no
+    /// meaningful cross-run aggregate. A unit marker (no payload): the
+    /// derivation owns the metric-name→computation mapping, so the kind need not
+    /// carry a percentile selector (which would leak `plat::Pct` through this
+    /// public enum).
     PerPhase,
 }
 
@@ -342,9 +351,10 @@ pub enum SampleSource {
     WakeLatencyNs,
     /// Per-worker schedstat run-delay samples in ns
     /// (`crate::assert::PhaseCgroupStats::run_delays_ns`). One sample per worker
-    /// — each is that worker's whole-run cumulative `sched_info.run_delay`
-    /// delta (last-minus-first), so the pool size is the worker count, NOT a
-    /// per-wakeup stream like `WakeLatencyNs`.
+    /// — each is that worker's `sched_info.run_delay` delta over the carrier's
+    /// window (whole-run last-minus-first for the step-local carrier; the
+    /// per-phase delta for the backdrop slice carrier), so the pool size is the
+    /// worker count, NOT a per-wakeup stream like `WakeLatencyNs`.
     RunDelayNs,
 }
 
@@ -487,10 +497,11 @@ impl MetricKind {
             // skips and re-derives it — classification-only, like the other
             // derived kinds.
             MetricKind::WakeLatencyTailRatio => MergeKind::Recompute,
-            // PerPhase is derived directly into PhaseBucket.metrics post-merge
-            // by the schbench derivation; the per-phase merge loop skips it
-            // (is_derived) and never re-derives via a kind — classification-only,
-            // like the other derived kinds.
+            // PerPhase is derived post-merge by `derive_phase_metrics` (schbench
+            // scalars into PhaseBucket.metrics + PhaseCgroupStats::metrics;
+            // non-schbench carrier scalars into PhaseCgroupStats::metrics only);
+            // the per-phase merge loop skips it (is_derived) and never re-derives
+            // via a kind — classification-only, like the other derived kinds.
             MetricKind::PerPhase => MergeKind::Recompute,
         }
     }
@@ -725,13 +736,13 @@ fn aggregate_finite(
             "MetricKind::Rate must be derived via derive_rate_metrics, \
              not reduced from a sample slice"
         ),
-        // PerPhase is derived directly into PhaseBucket.metrics by the schbench
-        // per-phase pass and is gated out of the cross-RUN ext fold
-        // (fold_ext_metrics) + the within-run reducers (is_derived), so it never
-        // reaches a sample-slice reduction. Reaching here is a routing bug (the
-        // gate or is_derived was bypassed).
+        // PerPhase is derived post-merge by derive_phase_metrics (into
+        // PhaseBucket.metrics and/or PhaseCgroupStats::metrics) and is gated out
+        // of the cross-RUN ext fold (fold_ext_metrics) + the within-run reducers
+        // (is_derived), so it never reaches a sample-slice reduction. Reaching
+        // here is a routing bug (the gate or is_derived was bypassed).
         MetricKind::PerPhase => unreachable!(
-            "MetricKind::PerPhase is derived into PhaseBucket.metrics, \
+            "MetricKind::PerPhase is derived by derive_phase_metrics, \
              not reduced from a sample slice"
         ),
     })
@@ -1137,7 +1148,7 @@ impl MetricDef {
 /// upstream source as a fourth name).
 /// Registry names for the schbench per-phase metrics ([`MetricKind::PerPhase`]).
 /// Shared by the [`METRICS`] entries below and the schbench per-phase derivation
-/// (`crate::assert::derive_schbench_phase_metrics`) so the registered name and
+/// (`crate::assert::derive_phase_metrics`) so the registered name and
 /// the key the derivation writes into `crate::assert::PhaseBucket::metrics` are
 /// one source of truth. Latency keys are µs (the unit `plat` buckets in);
 /// sched-delay keys are µs (converted from ns at derivation); loop_count is a
@@ -1748,7 +1759,7 @@ pub static METRICS: &[MetricDef] = &[
         accessor: |r| Some(r.cross_node_migration_ratio),
     },
     // -- schbench per-phase metrics (MetricKind::PerPhase) --
-    // Derived ONCE per phase by `crate::assert::derive_schbench_phase_metrics`
+    // Derived ONCE per phase by `crate::assert::derive_phase_metrics`
     // from the phase's pooled schbench histograms / run-delay raw pairs, written
     // directly into `PhaseBucket::metrics`. is_derived (skipped by the within-run
     // reducers + the phase-bucket merge) with no run-level producer; a per-phase
@@ -1967,6 +1978,144 @@ pub static METRICS: &[MetricDef] = &[
         default_abs: 100.0,
         default_rel: 0.10,
         display_unit: "req/s",
+        accessor: |_| None,
+    },
+    // -- Per-cgroup per-phase NON-schbench families. PerPhase, `accessor:
+    // |_| None`: read from `PhaseCgroupStats::metrics` by name (written by
+    // `write_carrier_scalars`), never from a `GauntletRow`. BARE per-cgroup
+    // names (NOT the run-level `worst_*`): a single cgroup's value is not a
+    // "worst across cgroups", and reusing `worst_*` would collide
+    // `is_known_metric` with the run-level selector. Thresholds mirror the
+    // analogous `worst_*` entries. (`iterations_per_cpu_sec` is intentionally
+    // absent — it is already a Rate entry above; the per-cgroup value resolves
+    // through that name without a second registration.)
+    MetricDef {
+        name: "p99_wake_latency_us",
+        polarity: crate::test_support::Polarity::LowerBetter,
+        kind: MetricKind::PerPhase,
+        default_abs: 50.0,
+        default_rel: 0.25,
+        display_unit: "\u{00b5}s",
+        accessor: |_| None,
+    },
+    MetricDef {
+        name: "median_wake_latency_us",
+        polarity: crate::test_support::Polarity::LowerBetter,
+        kind: MetricKind::PerPhase,
+        default_abs: 20.0,
+        default_rel: 0.25,
+        display_unit: "\u{00b5}s",
+        accessor: |_| None,
+    },
+    MetricDef {
+        name: "wake_latency_cv",
+        polarity: crate::test_support::Polarity::LowerBetter,
+        kind: MetricKind::PerPhase,
+        default_abs: 0.10,
+        default_rel: 0.25,
+        display_unit: "",
+        accessor: |_| None,
+    },
+    MetricDef {
+        name: "mean_run_delay_us",
+        polarity: crate::test_support::Polarity::LowerBetter,
+        kind: MetricKind::PerPhase,
+        default_abs: 50.0,
+        default_rel: 0.25,
+        display_unit: "\u{00b5}s",
+        accessor: |_| None,
+    },
+    MetricDef {
+        name: "max_run_delay_us",
+        polarity: crate::test_support::Polarity::LowerBetter,
+        kind: MetricKind::PerPhase,
+        default_abs: 100.0,
+        default_rel: 0.50,
+        display_unit: "\u{00b5}s",
+        accessor: |_| None,
+    },
+    MetricDef {
+        name: "avg_off_cpu_pct",
+        polarity: crate::test_support::Polarity::LowerBetter,
+        kind: MetricKind::PerPhase,
+        default_abs: 5.0,
+        default_rel: 0.25,
+        display_unit: "%",
+        accessor: |_| None,
+    },
+    MetricDef {
+        name: "min_off_cpu_pct",
+        polarity: crate::test_support::Polarity::LowerBetter,
+        kind: MetricKind::PerPhase,
+        default_abs: 5.0,
+        default_rel: 0.25,
+        display_unit: "%",
+        accessor: |_| None,
+    },
+    MetricDef {
+        name: "max_off_cpu_pct",
+        polarity: crate::test_support::Polarity::LowerBetter,
+        kind: MetricKind::PerPhase,
+        default_abs: 5.0,
+        default_rel: 0.25,
+        display_unit: "%",
+        accessor: |_| None,
+    },
+    MetricDef {
+        name: "off_cpu_spread_pct",
+        polarity: crate::test_support::Polarity::LowerBetter,
+        kind: MetricKind::PerPhase,
+        default_abs: 5.0,
+        default_rel: 0.25,
+        display_unit: "%",
+        accessor: |_| None,
+    },
+    MetricDef {
+        name: "migration_ratio",
+        polarity: crate::test_support::Polarity::LowerBetter,
+        kind: MetricKind::PerPhase,
+        default_abs: 0.05,
+        default_rel: 0.20,
+        display_unit: "",
+        accessor: |_| None,
+    },
+    MetricDef {
+        name: "iterations_per_worker",
+        polarity: crate::test_support::Polarity::HigherBetter,
+        kind: MetricKind::PerPhase,
+        default_abs: 10.0,
+        default_rel: 0.10,
+        display_unit: "",
+        accessor: |_| None,
+    },
+    MetricDef {
+        name: "page_locality",
+        polarity: crate::test_support::Polarity::HigherBetter,
+        kind: MetricKind::PerPhase,
+        default_abs: 0.05,
+        default_rel: 0.10,
+        display_unit: "",
+        accessor: |_| None,
+    },
+    MetricDef {
+        name: "cross_node_migration_ratio",
+        polarity: crate::test_support::Polarity::LowerBetter,
+        kind: MetricKind::PerPhase,
+        default_abs: 0.05,
+        default_rel: 0.20,
+        display_unit: "",
+        accessor: |_| None,
+    },
+    // Per-cgroup carrier counter (read via `cgroup_counter` /
+    // `cgroup_counter_total`), Counter kind, `accessor: |_| None` (no
+    // GauntletRow field). Mirrors `total_iterations`' HigherBetter polarity.
+    MetricDef {
+        name: "total_cpu_time_ns",
+        polarity: crate::test_support::Polarity::HigherBetter,
+        kind: MetricKind::Counter,
+        default_abs: 100.0,
+        default_rel: 0.10,
+        display_unit: "ns",
         accessor: |_| None,
     },
 ];

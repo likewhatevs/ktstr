@@ -935,9 +935,25 @@ fn list_metrics_text_preserves_registry_order() {
     let out = list_metrics(false).expect("text render must succeed");
     let mut last_pos = 0usize;
     for m in METRICS {
+        // Match m.name as a WHOLE name, not a substring of a longer one: a bare
+        // per-cgroup name (e.g. `migration_ratio`) is a substring of its
+        // run-level `worst_*` sibling (`worst_migration_ratio`), so a plain
+        // `find` would match the earlier `worst_` row and report a false
+        // out-of-order. Accept only an occurrence whose preceding char is not a
+        // name char (alphanumeric or `_`) — i.e. the start of a NAME-column cell.
         let pos = out
-            .find(m.name)
-            .unwrap_or_else(|| panic!("metric {} must appear in text output", m.name));
+            .match_indices(m.name)
+            .find(|(i, _)| {
+                *i == 0
+                    || !out[..*i]
+                        .chars()
+                        .next_back()
+                        .is_some_and(|c| c.is_alphanumeric() || c == '_')
+            })
+            .map(|(i, _)| i)
+            .unwrap_or_else(|| {
+                panic!("metric {} must appear as a whole name in text output", m.name)
+            });
         assert!(
             pos >= last_pos,
             "metric {} appears before a prior metric — text output must \

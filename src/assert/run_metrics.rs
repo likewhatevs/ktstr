@@ -119,8 +119,8 @@ impl ScenarioStats {
     /// Two stores are checked: [`PhaseBucket::metrics`] (via
     /// [`PhaseBucket::get`]) and, failing that, the cross-cgroup phase
     /// SUM of a per-cgroup Counter ([`PhaseBucket::cgroup_counter_total`])
-    /// for `"total_migrations"` / `"total_iterations"` — registered
-    /// `Counter`s with no per-sample source, so they live ONLY in the
+    /// for `"total_migrations"` / `"total_iterations"` / `"total_cpu_time_ns"` —
+    /// registered `Counter`s with no per-sample source, so they live ONLY in the
     /// per-cgroup carriers; without this fallback the pooled lookup
     /// returned a silent `None` while the per-cgroup
     /// [`Self::phase_cgroup_metric`] surfaced the value. Symmetric with
@@ -200,7 +200,7 @@ impl ScenarioStats {
     /// `step_index = 0` is BASELINE): look up `metric` for a named `cgroup` in a
     /// phase, via that cgroup's per-phase carrier ([`PhaseCgroupStats::get`]),
     /// falling back to [`PhaseCgroupStats::cgroup_counter`] for the per-cgroup
-    /// Counters `total_migrations`/`total_iterations`. `None` when the phase has no bucket, no
+    /// Counters `total_migrations`/`total_iterations`/`total_cpu_time_ns`. `None` when the phase has no bucket, no
     /// carrier for `cgroup`, the carrier carried no finite value for the metric, OR
     /// the metric name is a typo (an unregistered name yields `None` — disambiguate
     /// with [`Self::is_known_metric`], same as [`Self::phase_metric`]). The
@@ -1156,25 +1156,33 @@ pub fn populate_run_ext_metrics(
     crate::stats::derive_rate_metrics(target);
 }
 
-/// Derive the schbench per-phase scalar metrics
-/// ([`crate::stats::MetricKind::PerPhase`]) into each phase's
-/// [`PhaseBucket::metrics`]. For every phase carrying at least one schbench
-/// backdrop cgroup, pool the cgroups' `SchbenchPhaseStats` (combine the latency
-/// histograms + integer-add the run-delay raw pairs — percentiles MUST come
-/// from the POOLED histogram, never an average of per-cgroup percentiles), then
-/// write the registered keys: wakeup/request latency percentiles (re-derived
-/// from the merged histogram, µs — the unit `plat` buckets in), the
-/// sample-weighted run-delay means (ns→µs, ABSENT when `pcount == 0` so a
-/// never-scheduled class is not a false `0`), and the loop count.
+/// Derive the per-phase scalar metrics ([`crate::stats::MetricKind::PerPhase`])
+/// for every cgroup carrier in each phase. Two families:
+///
+/// 1. NON-schbench carrier scalars (via [`write_carrier_scalars`], for EVERY
+///    cgroup regardless of work type): the wake/run-delay/off-cpu distributions
+///    + the migration/iterations/locality ratios + the carrier counters,
+///    written ONLY into each carrier's `PhaseCgroupStats::metrics` (per-cgroup,
+///    read via `phase_cgroup_metric`) — NO pooled [`PhaseBucket::metrics`]
+///    entry; their run-level aggregate is the `worst_*` ext-metrics key.
+/// 2. schbench scalars (via [`write_schbench_scalars`], only for cgroups
+///    carrying a `SchbenchPhaseStats`): written per-cgroup into
+///    `PhaseCgroupStats::metrics` AND, pooled across the phase's schbench
+///    carriers, into [`PhaseBucket::metrics`] (read via `phase_metric`).
+///    Percentiles MUST come from the POOLED histogram (combine the latency
+///    histograms + integer-add the run-delay raw pairs), never an average of
+///    per-cgroup percentiles; the run-delay means are ABSENT when `pcount == 0`
+///    so a never-scheduled class is not a false `0`.
 ///
 /// MUST run POST-merge: the buckets are final and keyed by `step_index`, so a
-/// per-phase A/B claim reads the value via `phase_metric`. It runs after the
-/// per-cgroup carriers are folded ([`fold_guest_per_cgroup_into_host_buckets`])
-/// and after any [`merge_matched_phase_buckets`] — both SKIP is_derived keys
-/// (the `continue` in the merge loop), so deriving earlier would DROP the keys.
-/// Idempotent (overwrites the keys), so callers that rebuild buckets per call
-/// (e.g. `VmResult::phase_buckets`) may re-run it freely.
-pub(crate) fn derive_schbench_phase_metrics(phases: &mut [PhaseBucket]) {
+/// per-phase A/B claim reads the value via `phase_metric` /
+/// `phase_cgroup_metric`. It runs after the per-cgroup carriers are folded
+/// ([`fold_guest_per_cgroup_into_host_buckets`]) and after any
+/// [`merge_matched_phase_buckets`] — both SKIP is_derived keys (the `continue`
+/// in the merge loop), so deriving earlier would DROP the keys. Idempotent
+/// (overwrites the keys), so callers that rebuild buckets per call (e.g.
+/// `VmResult::phase_buckets`) may re-run it freely.
+pub(crate) fn derive_phase_metrics(phases: &mut [PhaseBucket]) {
     use crate::workload::schbench::run::SchbenchPhaseStats;
 
     for bucket in phases.iter_mut() {
@@ -1187,6 +1195,14 @@ pub(crate) fn derive_schbench_phase_metrics(phases: &mut [PhaseBucket]) {
         // bucket-count add, never averaged), and pooled == cross-cgroup re-pool.
         let mut pooled: Option<SchbenchPhaseStats> = None;
         for pc in bucket.per_cgroup.values_mut() {
+            // Non-schbench carrier-derived metrics (wake/run-delay/off-cpu
+            // distributions + the migration/iterations/locality ratios + the
+            // carrier counters), emitted for EVERY cgroup regardless of work
+            // type. Runs BEFORE the schbench block: `write_carrier_scalars`
+            // takes `&mut pc` (its summaries read many `pc` fields, then it
+            // writes `pc.metrics`), so it cannot share the iteration with the
+            // disjoint-field borrow the schbench block relies on.
+            write_carrier_scalars(pc);
             // Disjoint field borrows: `s` reads pc.schbench, the reducer writes
             // pc.metrics — different fields, so the immutable + mutable borrows of
             // `*pc` coexist.
@@ -1205,6 +1221,86 @@ pub(crate) fn derive_schbench_phase_metrics(phases: &mut [PhaseBucket]) {
         if let Some(p) = pooled {
             write_schbench_scalars(&p, &mut bucket.metrics);
         }
+    }
+}
+
+/// Write the per-phase per-cgroup NON-schbench DERIVED scalars from ONE
+/// carrier into `pc.metrics`, keyed by registry [`crate::stats::MetricDef`]
+/// name — the per-cgroup analog of the run-level reductions, single-sourced
+/// through the shared ratio helpers in [`crate::assert::reductions`] (so the
+/// per-cgroup value and the run-level `worst_*` fold agree by construction)
+/// and the carrier summary methods. Each gate mirrors the carrier's ABSENT
+/// discipline: an empty wake pool, a not-measured off-CPU state, a
+/// zero-worker cgroup, or a no-NUMA-pages cgroup emits no key (reads as
+/// missing, never a false 0); `migration_ratio` is ALWAYS present (a measured
+/// 0.0 when no iterations ran).
+///
+/// Unlike the schbench families, these families have NO pooled
+/// `PhaseBucket::metrics` entry at all: as PerPhase / is_derived metrics whose
+/// `read_sample` is `None`, the per-phase fold never writes them to
+/// `bucket.metrics`. Their run-level aggregate is the `worst_*` key
+/// `populate_run_distribution_metrics` writes into the run-level
+/// `ScenarioStats::ext_metrics` map; per-phase they are queryable ONLY per-cgroup
+/// via `pc.metrics`. So this writes ONLY `pc.metrics`, never `bucket.metrics` —
+/// the per-cgroup carrier value is authoritative for the per-cgroup question.
+///
+/// Takes `&mut PhaseCgroupStats` (not `(&pc, &mut pc.metrics)`): it reads many
+/// `pc` fields AND writes `pc.metrics`, so the summaries/ratios are bound to
+/// locals from `&*pc` first, then the `&mut pc.metrics` borrow is taken once.
+fn write_carrier_scalars(pc: &mut PhaseCgroupStats) {
+    use crate::assert::reductions::{
+        cross_node_migration_ratio_of, iterations_per_cpu_sec_of, iterations_per_worker_of,
+        migration_ratio_of, page_locality_of,
+    };
+    // Read everything from &*pc into locals BEFORE the &mut pc.metrics borrow.
+    let wake = pc.wake_summary().zip(pc.wake_cv());
+    let run_delay = pc.run_delay_summary();
+    let off_cpu = pc.off_cpu_summary();
+    let migration_ratio = migration_ratio_of(pc.total_migrations, pc.total_iterations);
+    let ipw = iterations_per_worker_of(pc.num_workers, pc.total_iterations);
+    let ipcs =
+        iterations_per_cpu_sec_of(pc.num_workers, pc.total_cpu_time_ns, pc.total_iterations);
+    let numa = if pc.numa_pages_total > 0 {
+        Some((
+            page_locality_of(pc.numa_pages_local, pc.numa_pages_total),
+            cross_node_migration_ratio_of(pc.cross_node_migrated, pc.numa_pages_total),
+        ))
+    } else {
+        None
+    };
+
+    let m = &mut pc.metrics;
+    // WAKE — all three or none (wake_summary + wake_cv share the empty-pool gate).
+    if let Some(((p99, median), cv)) = wake {
+        m.insert("p99_wake_latency_us".to_string(), p99);
+        m.insert("median_wake_latency_us".to_string(), median);
+        m.insert("wake_latency_cv".to_string(), cv);
+    }
+    // RUN-DELAY — both or none.
+    if let Some((mean, worst)) = run_delay {
+        m.insert("mean_run_delay_us".to_string(), mean);
+        m.insert("max_run_delay_us".to_string(), worst);
+    }
+    // OFF-CPU — four or none (None == not-measured).
+    if let Some((avg, min, max, spread)) = off_cpu {
+        m.insert("avg_off_cpu_pct".to_string(), avg);
+        m.insert("min_off_cpu_pct".to_string(), min);
+        m.insert("max_off_cpu_pct".to_string(), max);
+        m.insert("off_cpu_spread_pct".to_string(), spread);
+    }
+    // RATIOS — migration_ratio ALWAYS (measured 0.0 when no iterations ran).
+    m.insert("migration_ratio".to_string(), migration_ratio);
+    if let Some(v) = ipw {
+        m.insert("iterations_per_worker".to_string(), v);
+    }
+    if let Some(v) = ipcs {
+        m.insert("iterations_per_cpu_sec".to_string(), v);
+    }
+    // NUMA ratios only when pages were observed (mirrors the carrier's
+    // numa_pages_total>0 gate; absent is more honest than a 0.0 default).
+    if let Some((locality, cross_node)) = numa {
+        m.insert("page_locality".to_string(), locality);
+        m.insert("cross_node_migration_ratio".to_string(), cross_node);
     }
 }
 

@@ -1,13 +1,13 @@
 //! Unit tests for the schbench per-phase host fold + derivation (layer 2):
 //! - [`PhaseCgroupStats::merge`] pooling the `schbench` carrier across workers
 //!   (histogram bucket-add + integer-sum of the run-delay raw pairs/loop_count).
-//! - `derive_schbench_phase_metrics` re-deriving the per-phase percentile /
+//! - `derive_phase_metrics` re-deriving the per-phase percentile /
 //!   run-delay-mean / loop-count scalars into `PhaseBucket::metrics`, with the
 //!   pcount==0 / empty-histogram ABSENT guards and cross-cgroup pooling.
 //! - the [`crate::stats::MetricKind::PerPhase`] registry entries.
 
 use super::*;
-use crate::assert::derive_schbench_phase_metrics;
+use crate::assert::derive_phase_metrics;
 use crate::stats::{MetricKind, metric_def};
 use crate::workload::PhaseSlice;
 use crate::workload::schbench::plat::{Pct, PlatStats};
@@ -108,7 +108,7 @@ fn derive_writes_perphase_scalars_with_absent_guards() {
     };
     let mut bucket = PhaseBucket::default();
     bucket.per_cgroup.insert("cg".to_string(), pc);
-    derive_schbench_phase_metrics(std::slice::from_mut(&mut bucket));
+    derive_phase_metrics(std::slice::from_mut(&mut bucket));
     // Wakeup percentiles re-derived from the merged histogram (µs).
     assert_eq!(bucket.metrics.get("wakeup_p50_latency_us"), Some(&10.0));
     assert_eq!(bucket.metrics.get("wakeup_p99_latency_us"), Some(&10.0));
@@ -140,7 +140,7 @@ fn derive_is_noop_for_non_schbench_phase() {
     bucket
         .per_cgroup
         .insert("cg".to_string(), PhaseCgroupStats::default());
-    derive_schbench_phase_metrics(std::slice::from_mut(&mut bucket));
+    derive_phase_metrics(std::slice::from_mut(&mut bucket));
     assert!(
         bucket.metrics.is_empty(),
         "no schbench carrier -> no schbench keys"
@@ -159,7 +159,7 @@ fn derive_pools_schbench_across_cgroups() {
     let mut bucket = PhaseBucket::default();
     bucket.per_cgroup.insert("cg_a".to_string(), mk());
     bucket.per_cgroup.insert("cg_b".to_string(), mk());
-    derive_schbench_phase_metrics(std::slice::from_mut(&mut bucket));
+    derive_phase_metrics(std::slice::from_mut(&mut bucket));
     // loop_count pools: 10 + 10 = 20.
     assert_eq!(bucket.metrics.get("schbench_loop_count"), Some(&20.0));
     // sched_delay_msg = Σrd/Σpc = (50000+50000)/(5+5) = 10000ns -> 10µs.
@@ -200,7 +200,7 @@ fn derive_rps_distribution_values_and_absent_guard() {
     };
     let mut bucket = PhaseBucket::default();
     bucket.per_cgroup.insert("cg".to_string(), pc);
-    derive_schbench_phase_metrics(std::slice::from_mut(&mut bucket));
+    derive_phase_metrics(std::slice::from_mut(&mut bucket));
     // Each key reads its OWN percentile slot — pins the Pct->key wiring.
     assert_eq!(
         bucket.metrics.get("rps_p20"),
@@ -241,7 +241,7 @@ fn derive_pools_rps_across_cgroups() {
     bucket
         .per_cgroup
         .insert("cg_b".to_string(), mk(10_000, 20_000));
-    derive_schbench_phase_metrics(std::slice::from_mut(&mut bucket));
+    derive_phase_metrics(std::slice::from_mut(&mut bucket));
     // Pooled extremes span BOTH cgroups -> min from cg_a, max from cg_b.
     assert_eq!(bucket.metrics.get("rps_min"), Some(&100.0));
     assert_eq!(bucket.metrics.get("rps_max"), Some(&20_000.0));
@@ -267,7 +267,7 @@ fn derive_request_min_max_value_pins() {
     };
     let mut bucket = PhaseBucket::default();
     bucket.per_cgroup.insert("cg".to_string(), pc);
-    derive_schbench_phase_metrics(std::slice::from_mut(&mut bucket));
+    derive_phase_metrics(std::slice::from_mut(&mut bucket));
     // 50×30µs + 1×9000µs: min=30, max=9000.
     assert_eq!(bucket.metrics.get("request_min_latency_us"), Some(&30.0));
     assert_eq!(bucket.metrics.get("request_max_latency_us"), Some(&9_000.0));
@@ -354,7 +354,7 @@ fn derive_populates_per_cgroup_metrics_and_pooled_matches_repool() {
             ..Default::default()
         },
     );
-    derive_schbench_phase_metrics(std::slice::from_mut(&mut bucket));
+    derive_phase_metrics(std::slice::from_mut(&mut bucket));
     // Per-cgroup: each carrier's OWN loop_count, independently queryable.
     assert_eq!(
         bucket.per_cgroup["cg_a"].get("schbench_loop_count"),
@@ -384,7 +384,7 @@ fn derive_populates_per_cgroup_metrics_and_pooled_matches_repool() {
     bucket2
         .per_cgroup
         .insert("cg".to_string(), PhaseCgroupStats::default());
-    derive_schbench_phase_metrics(std::slice::from_mut(&mut bucket2));
+    derive_phase_metrics(std::slice::from_mut(&mut bucket2));
     assert!(
         bucket2.per_cgroup["cg"]
             .get("schbench_loop_count")
@@ -397,8 +397,9 @@ fn derive_mixed_schbench_and_plain_cgroups_pool_undiluted() {
     // A phase mixing ONE schbench carrier + ONE plain (non-schbench) carrier: the
     // pooled bucket.metrics equals the schbench carrier's set (the plain carrier does
     // NOT dilute the pool with a phantom zero-loop_count — the loop seeds `pooled`
-    // only from schbench.is_some() carriers), and the plain carrier's pc.metrics stays
-    // empty.
+    // only from schbench.is_some() carriers), and the plain carrier gets NO schbench
+    // keys (its pc.metrics carries only the always-present non-schbench migration_ratio,
+    // since write_carrier_scalars runs on EVERY carrier regardless of work type).
     let mut bucket = PhaseBucket::default();
     bucket.per_cgroup.insert(
         "cg_sch".to_string(),
@@ -410,7 +411,7 @@ fn derive_mixed_schbench_and_plain_cgroups_pool_undiluted() {
     bucket
         .per_cgroup
         .insert("cg_plain".to_string(), PhaseCgroupStats::default());
-    derive_schbench_phase_metrics(std::slice::from_mut(&mut bucket));
+    derive_phase_metrics(std::slice::from_mut(&mut bucket));
     assert_eq!(
         bucket.get("schbench_loop_count"),
         Some(40.0),
@@ -425,6 +426,14 @@ fn derive_mixed_schbench_and_plain_cgroups_pool_undiluted() {
             .get("schbench_loop_count")
             .is_none(),
         "the plain (non-schbench) carrier gets no schbench keys"
+    );
+    // ...but it DOES get the always-present non-schbench migration_ratio (0.0):
+    // write_carrier_scalars runs on every carrier, so a plain carrier's pc.metrics
+    // is NOT empty — it holds the unconditional migration_ratio (no iterations -> 0.0).
+    assert_eq!(
+        bucket.per_cgroup["cg_plain"].get("migration_ratio"),
+        Some(0.0),
+        "the plain carrier still gets the always-present non-schbench migration_ratio"
     );
 }
 
@@ -463,7 +472,7 @@ fn derive_pooled_percentile_is_the_combined_histogram() {
             ..Default::default()
         },
     );
-    derive_schbench_phase_metrics(std::slice::from_mut(&mut bucket));
+    derive_phase_metrics(std::slice::from_mut(&mut bucket));
     let pooled_p50 = bucket.get("wakeup_p50_latency_us").expect("pooled p50");
     let a_p50 = bucket.per_cgroup["cg_a"]
         .get("wakeup_p50_latency_us")
@@ -491,7 +500,7 @@ fn derive_per_cgroup_absent_discipline() {
             ..Default::default()
         },
     );
-    derive_schbench_phase_metrics(std::slice::from_mut(&mut bucket));
+    derive_phase_metrics(std::slice::from_mut(&mut bucket));
     let pc = &bucket.per_cgroup["cg"];
     assert_eq!(
         pc.get("wakeup_p99_latency_us"),

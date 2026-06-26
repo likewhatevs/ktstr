@@ -312,7 +312,7 @@ pub(crate) struct Percentiles {
 pub(crate) enum Pct {
     /// `PLIST[0]` = 20.0 — schbench's RPS-distribution percentile
     /// (`PLIST_FOR_RPS`, `schbench.c:130`). Read by the per-phase RPS derivation
-    /// (`run_metrics.rs` `derive_schbench_phase_metrics`, `rps_p20`); the latency
+    /// (`run_metrics.rs` `derive_phase_metrics`, `rps_p20`); the latency
     /// metrics use P50-P999.
     P20,
     P50,

@@ -169,11 +169,7 @@ pub fn cgroup_stats(reports: &[WorkerReport]) -> CgroupStats {
     let worst_run_delay = run_delays.iter().cloned().reduce(f64::max).unwrap_or(0.0);
 
     let total_mig: u64 = reports.iter().map(|w| w.migration_count).sum();
-    let mig_ratio = if total_iters > 0 {
-        total_mig as f64 / total_iters as f64
-    } else {
-        0.0
-    };
+    let mig_ratio = migration_ratio_of(total_mig, total_iters);
 
     // Cross-node page-migration ratio: pages migrated cross-node over the
     // cgroup's total allocated pages. `vmstat_numa_pages_migrated` is a
@@ -193,11 +189,7 @@ pub fn cgroup_stats(reports: &[WorkerReport]) -> CgroupStats {
         .map(|w| w.vmstat_numa_pages_migrated)
         .max()
         .unwrap_or(0);
-    let cross_node_ratio = if total_numa_pages > 0 {
-        migrated_pages as f64 / total_numa_pages as f64
-    } else {
-        0.0
-    };
+    let cross_node_ratio = cross_node_migration_ratio_of(migrated_pages, total_numa_pages);
 
     CgroupStats {
         // Empty here; collect_handles labels the entry post-hoc (it has
@@ -229,6 +221,65 @@ pub fn cgroup_stats(reports: &[WorkerReport]) -> CgroupStats {
         cross_node_migration_ratio: cross_node_ratio,
         ext_metrics: BTreeMap::new(),
     }
+}
+
+/// Migrations per iteration; `0.0` when no iterations ran (a measured-zero,
+/// not a rate over zero). Single-sourced so the per-phase carrier
+/// (`write_carrier_scalars`) and [`cgroup_stats`] (whose `migration_ratio`
+/// feeds the run-level `worst_migration_ratio` fold) compute it identically.
+pub(crate) fn migration_ratio_of(total_migrations: u64, total_iterations: u64) -> f64 {
+    if total_iterations > 0 {
+        total_migrations as f64 / total_iterations as f64
+    } else {
+        0.0
+    }
+}
+
+/// Peak cross-node migrated pages over the cgroup-wide total allocated pages;
+/// `0.0` when no NUMA pages were seen. Single-sourced with [`cgroup_stats`].
+pub(crate) fn cross_node_migration_ratio_of(migrated_pages: u64, total_numa_pages: u64) -> f64 {
+    if total_numa_pages > 0 {
+        migrated_pages as f64 / total_numa_pages as f64
+    } else {
+        0.0
+    }
+}
+
+/// Fraction of allocated pages on the expected NUMA nodes; `0.0` when no NUMA
+/// pages were seen. Single-sourced with the per-phase carrier.
+pub(crate) fn page_locality_of(numa_pages_local: u64, numa_pages_total: u64) -> f64 {
+    if numa_pages_total > 0 {
+        numa_pages_local as f64 / numa_pages_total as f64
+    } else {
+        0.0
+    }
+}
+
+/// Iterations per worker; `None` when there are no workers (undefined,
+/// distinct from a measured zero). Single-sourced with
+/// [`CgroupStats::iterations_per_worker`](crate::assert::CgroupStats::iterations_per_worker)
+/// so the run-level WorstLowest fold stays bit-identical.
+pub(crate) fn iterations_per_worker_of(num_workers: usize, total_iterations: u64) -> Option<f64> {
+    if num_workers > 0 {
+        Some(total_iterations as f64 / num_workers as f64)
+    } else {
+        None
+    }
+}
+
+/// Worker iterations per CPU-second (`total_iterations / (total_cpu_time_ns /
+/// 1e9)`); `None` when there are no workers or no on-CPU time captured.
+/// Single-sourced with
+/// [`CgroupStats::iterations_per_cpu_sec`](crate::assert::CgroupStats::iterations_per_cpu_sec).
+pub(crate) fn iterations_per_cpu_sec_of(
+    num_workers: usize,
+    total_cpu_time_ns: u64,
+    total_iterations: u64,
+) -> Option<f64> {
+    if num_workers == 0 || total_cpu_time_ns == 0 {
+        return None;
+    }
+    Some(total_iterations as f64 / (total_cpu_time_ns as f64 / 1e9))
 }
 
 /// Per-phase per-cgroup RAW-component builder — the sibling of [`cgroup_stats`]
@@ -364,7 +415,7 @@ pub(crate) fn phase_cgroup_stats(
         max_gap_cpu,
         // Fresh carrier built from worker reports — never stripped.
         stripped: false,
-        // Derived scalars are filled post-build by derive_schbench_phase_metrics.
+        // Derived scalars are filled post-build by derive_phase_metrics.
         metrics: std::collections::BTreeMap::new(),
         // schbench rides PhaseSlice (the backdrop per-phase carrier), not the
         // whole-run WorkerReports this fn pools, so it is always None here.
@@ -420,7 +471,7 @@ pub(crate) fn phase_slice_to_cgroup_stats(
         max_gap_ms: slice.max_gap_ms,
         max_gap_cpu: slice.max_gap_cpu,
         stripped: false,
-        // Derived scalars are filled post-build by derive_schbench_phase_metrics.
+        // Derived scalars are filled post-build by derive_phase_metrics.
         metrics: std::collections::BTreeMap::new(),
         // Carry the per-phase schbench engine metrics through (None for every
         // non-schbench backdrop slice); PhaseCgroupStats::merge pools them.
