@@ -659,15 +659,20 @@ impl SchedExitStop {
 /// child exits (pidfd POLLIN edge from the kernel's `do_notify_pidfd`)
 /// or the cleanup site fires the stop-eventfd. `/proc/{pid}` is
 /// re-checked post-wake to catch the rare "pidfd opened after kernel
-/// reaped" race. When `suppress_com2` is false (normal mode), writes
-/// MSG_TYPE_SCHED_EXIT to the bulk port and dumps the scheduler log
-/// over the bulk port (via `dump_sched_output` -> `send_sched_log`).
-/// The host detects the bulk message and can terminate the VM early.
-/// When `suppress_com2` is true (probes active), both the SCHED_EXIT
-/// signal and the bulk-port log dump are suppressed — the probe
-/// pipeline handles crash detection via tp_btf/sched_ext_exit
-/// instead, and the VM must stay alive for the probe thread to emit
-/// output.
+/// reaped" race. On the scheduler's exit two things are gated
+/// independently:
+///   - `suppress_sched_log` gates the scheduler-log dump only: false
+///     (normal mode) dumps the log over the bulk port (`dump_sched_output`
+///     -> `send_sched_log`); true (probes active) instead waits on the
+///     probe thread's `output_done` latch — keeping the VM alive until the
+///     probe has emitted its payload — and skips the dump (the probe
+///     pipeline handles crash detection via tp_btf/sched_ext_exit).
+///   - the SCHED_EXIT signal (MSG_TYPE_SCHED_EXIT, which lets the host
+///     terminate the VM early) is then sent UNLESS the `stop` flag is set
+///     (a host-initiated kill, where the exit is expected). It is gated by
+///     `stop`, NOT by `suppress_sched_log` — so with probes active and a
+///     genuine crash it still fires, but only after the `output_done` wait
+///     above, so the probe payload is already out.
 ///
 /// Uses procfs instead of waitpid because SIGCHLD is SIG_IGN (the kernel
 /// auto-reaps children, making waitpid return ECHILD).
@@ -685,7 +690,7 @@ impl SchedExitStop {
 pub(crate) fn start_sched_exit_monitor(
     sched_pid: Option<u32>,
     log_path: Option<&str>,
-    suppress_com2: Arc<AtomicBool>,
+    suppress_sched_log: Arc<AtomicBool>,
     probe_output_done: Option<Arc<crate::sync::Latch>>,
 ) -> Option<SchedExitStop> {
     let pid = sched_pid?;
@@ -829,7 +834,7 @@ pub(crate) fn start_sched_exit_monitor(
                     !Path::new(&proc_path).exists()
                 };
                 if exited {
-                    if suppress_com2.load(Ordering::Acquire) {
+                    if suppress_sched_log.load(Ordering::Acquire) {
                         // Probes active: wait event-driven on the
                         // probe thread's `output_done` latch.
                         // Outer wall-clock VM timeout is the

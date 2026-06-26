@@ -541,12 +541,13 @@ pub(crate) fn ktstr_guest_init() -> ! {
     // the test, the thread writes MSG_TYPE_SCHED_EXIT via bulk port so the host
     // can detect early death without waiting for the watchdog.
     //
-    // When probes are active, suppress the sched-exit SCHED_EXIT signal
-    // and the bulk-port scheduler-log dump: the probe pipeline handles
-    // crash detection (tp_btf/sched_ext_exit) and the VM must stay alive
-    // for the probe thread to emit its payload. (The `suppress_com2`
-    // name is legacy from the pre-bulk-port-migration COM2 dump path.)
-    let suppress_com2 = Arc::new(AtomicBool::new(probes_active));
+    // When probes are active, `suppress_sched_log` suppresses only the
+    // bulk-port scheduler-log dump (the monitor waits on the probe's
+    // output_done instead, keeping the VM alive for the probe to emit its
+    // payload); the probe pipeline handles crash detection via
+    // tp_btf/sched_ext_exit. The SCHED_EXIT signal is gated independently by
+    // the stop flag (host-initiated kill), not by this flag.
+    let suppress_sched_log = Arc::new(AtomicBool::new(probes_active));
     let probe_output_done = probe_phase_a
         .as_ref()
         .map(|pa| pa.pipeline.output_done.clone());
@@ -566,10 +567,10 @@ pub(crate) fn ktstr_guest_init() -> ! {
     let boot_stop = start_sched_exit_monitor(
         sched_child.as_ref().map(|c| c.id()),
         sched_log_path.as_deref(),
-        suppress_com2.clone(),
+        suppress_sched_log.clone(),
         probe_output_done.clone(),
     );
-    install_initial_sched_exit_monitor(boot_stop, suppress_com2, probe_output_done);
+    install_initial_sched_exit_monitor(boot_stop, suppress_sched_log, probe_output_done);
 
     // Phase 5: Dispatch.
     let _s_phase5 = tracing::debug_span!("phase5_dispatch").entered();

@@ -3,8 +3,8 @@
 //! When a scheduler crash is observed in a ktstr_test VM, the framework
 //! boots a second "repro" VM with BPF kprobes/fentries attached to the
 //! functions that appeared in the crash stack. Probe output is
-//! serialized on the guest (COM2) and deserialized + formatted on the
-//! host where DWARF is available.
+//! serialized on the guest (bulk port, via the stdout forwarder) and
+//! deserialized + formatted on the host where DWARF is available.
 //!
 //! Probe attachment runs in two phases:
 //! - **Phase A** ([`start_probe_phase_a`]) attaches kprobes, fexits,
@@ -101,7 +101,8 @@ fn parse_rust_env_from_cmdline(cmdline: &str) -> Vec<(&'static str, &str)> {
     out
 }
 
-/// Delimiters for probe output in guest COM2 (written by emit_probe_payload).
+/// Delimiters for probe output, emitted by emit_probe_payload via println! to
+/// the bulk-port stdout forwarder.
 pub(crate) const PROBE_OUTPUT_START: &str = "===PROBE_OUTPUT_START===";
 pub(crate) const PROBE_OUTPUT_END: &str = "===PROBE_OUTPUT_END===";
 
@@ -698,13 +699,13 @@ fn build_repro_vm_builder(
     Some((builder, repro_dump_path))
 }
 
-/// Attempt auto-repro: extract stack functions from COM2 scheduler output
-/// or COM1 kernel console (fallback), boot a second VM with BPF probes
+/// Attempt auto-repro: extract stack functions from the repro VM's scheduler
+/// log or COM1 kernel console (fallback), boot a second VM with BPF probes
 /// attached, and return formatted probe data. When no stack functions are
 /// available (e.g. BPF text error without backtrace), falls back to
 /// dynamic BPF program discovery in the repro VM.
-/// `console_output` is COM1 kernel console text, used when COM2 has no
-/// extractable functions (e.g. scheduler died before writing output).
+/// `console_output` is COM1 kernel console text, used when the scheduler log
+/// has no extractable functions (e.g. scheduler died before writing output).
 ///
 /// Returns `None` if repro cannot be attempted or yields no data.
 ///
@@ -733,21 +734,21 @@ pub(crate) fn attempt_auto_repro(
     // regression in a single phase is invisible against the aggregate.
     let auto_repro_start = Instant::now();
 
-    // Extract scheduler log from COM2 output.
+    // Extract scheduler log from the repro VM's captured output.
     let has_sched_start = first_vm_output.contains(SCHED_OUTPUT_START);
     let has_sched_end = first_vm_output.contains(SCHED_OUTPUT_END);
     eprintln!(
-        "ktstr_test: auto-repro: COM2 length={} has_sched_start={has_sched_start} has_sched_end={has_sched_end}",
+        "ktstr_test: auto-repro: captured-output length={} has_sched_start={has_sched_start} has_sched_end={has_sched_end}",
         first_vm_output.len(),
     );
     // `parse_sched_output_partial` accepts a missing SCHED_OUTPUT_END
     // (scheduler crashed mid-run, never wrote the closing delimiter)
     // and falls back to the slice from SCHED_OUTPUT_START to end of
-    // buffer. Discarding partial COM2 output and skipping straight to
+    // buffer. Discarding partial scheduler-log output and skipping straight to
     // COM1 would lose the crash stack the probe pipeline needs.
     let sched_output = parse_sched_output_partial(first_vm_output);
 
-    // Extract function names from COM2 scheduler log first, then
+    // Extract function names from the scheduler log first, then
     // fall back to COM1 kernel console (which has kernel backtraces
     // including sched_ext_dump output).
     let stack_funcs = if let Some(sched) = sched_output {
@@ -755,17 +756,17 @@ pub(crate) fn attempt_auto_repro(
         if funcs.is_empty() {
             if has_sched_start && !has_sched_end {
                 eprintln!(
-                    "ktstr_test: auto-repro: no functions from partial COM2 (missing \
-                     SCHED_OUTPUT_END), trying COM1",
+                    "ktstr_test: auto-repro: no functions from partial scheduler log \
+                     (missing SCHED_OUTPUT_END), trying COM1",
                 );
             } else {
-                eprintln!("ktstr_test: auto-repro: no functions from COM2, trying COM1");
+                eprintln!("ktstr_test: auto-repro: no functions from scheduler log, trying COM1");
             }
             extract_stack_functions_all(console_output)
         } else {
             if has_sched_start && !has_sched_end {
                 eprintln!(
-                    "ktstr_test: auto-repro: extracted {} functions from partial COM2 \
+                    "ktstr_test: auto-repro: extracted {} functions from partial scheduler log \
                      (missing SCHED_OUTPUT_END)",
                     funcs.len(),
                 );
@@ -773,7 +774,7 @@ pub(crate) fn attempt_auto_repro(
             funcs
         }
     } else {
-        eprintln!("ktstr_test: auto-repro: no scheduler output on COM2, trying COM1");
+        eprintln!("ktstr_test: auto-repro: no scheduler output on the scheduler-log channel, trying COM1");
         extract_stack_functions_all(console_output)
     };
     let func_names: Vec<String> = stack_funcs.iter().map(|f| f.raw_name.clone()).collect();
@@ -900,10 +901,10 @@ fn format_repro_output(
     // booted to reproduce.
     write_auto_repro_sidecar_artifacts(entry, repro_result);
 
-    // Forward guest stderr (COM1) and COM2 probe lines when verbose.
+    // Forward guest stderr (COM1) and bulk-port stdout probe lines when verbose.
     if verbose() {
         eprintln!(
-            "ktstr_test: auto-repro: COM1 stderr length={} COM2 stdout length={}",
+            "ktstr_test: auto-repro: COM1 stderr length={} stdout length={}",
             repro_result.stderr.len(),
             repro_result.output.len(),
         );
@@ -916,7 +917,7 @@ fn format_repro_output(
                 in_probe = true;
             }
             if in_probe {
-                eprintln!("  repro-vm-com2: {line}");
+                eprintln!("  repro-vm-stdout: {line}");
             }
         }
     }
@@ -1048,7 +1049,7 @@ fn format_repro_output(
     Some(out)
 }
 
-/// Extract probe JSON from guest COM2, deserialize, and format on the
+/// Extract probe JSON from the guest's bulk-port stdout, deserialize, and format on the
 /// host where vmlinux (DWARF) is available for source locations.
 ///
 /// `partial_dump_path` (when `Some`) names a file under the sidecar
@@ -1349,7 +1350,7 @@ pub(crate) fn format_probe_diagnostics(
     // ProbeHandle setup): every name in `filter_dropped` is a member
     // of the original `raw_functions` whose count became
     // `stack_extracted`, so `filter_dropped.len() <= stack_extracted`.
-    // `PipelineDiagnostics` is serde-serialized over COM2 though, and
+    // `PipelineDiagnostics` is serde-serialized into the probe payload (bulk-port stdout) though, and
     // the format runs on the failure-reporting path. `saturating_sub`
     // keeps a corrupt or partial payload from masking the real failure
     // with a subtract-with-overflow panic during diagnostic rendering.
@@ -1523,7 +1524,7 @@ pub(crate) fn format_probe_diagnostics(
 }
 
 /// Guest-side dispatch: check for `--ktstr-test-fn=NAME` in args, run the
-/// registered function, write the result to SHM and stdout (COM2),
+/// registered function, write the result to SHM and stdout (bulk port),
 /// and exit. Profraw data is flushed via `try_flush_profraw()`
 /// inline on both the success and failure paths before
 /// `std::process::exit()` is invoked.
@@ -1810,7 +1811,7 @@ fn setup_probe_handle(stack_input: &str, pipeline: &ProbePipeline) -> Option<Pro
         };
         // Serialize probe output after the trigger fires or stop
         // is signaled. Runs before the thread returns so output
-        // reaches COM2 even if the main thread is blocked.
+        // reaches the host (bulk-port stdout) even if the main thread is blocked.
         emit_probe_payload(
             events.as_deref().unwrap_or(&[]),
             emit_fn_names,
@@ -1852,7 +1853,7 @@ type ProbeThreadResult = (
 /// needs on the stop side: function-name registry for event rendering,
 /// pipeline diagnostics captured before skeleton spawn, the
 /// `output_done` flag the thread flips when it has already written
-/// `PROBE_PAYLOAD_*` to COM2, and the param-name / render-hint maps
+/// `PROBE_OUTPUT_START`/`PROBE_OUTPUT_END` to the bulk port (stdout), and the param-name / render-hint maps
 /// used to pretty-print parameters.
 struct ProbeHandle {
     thread: std::thread::JoinHandle<ProbeThreadResult>,
@@ -1868,7 +1869,7 @@ struct ProbeHandle {
 /// Groups the three signals the probe setup path has to hand to its
 /// worker thread: `stop` (main thread asks the probe thread to shut
 /// down), `output_done` (probe thread tells the main thread it has
-/// already emitted `PROBE_PAYLOAD_*`), and `probes_ready` (probe
+/// already emitted `PROBE_OUTPUT_START`/`PROBE_OUTPUT_END`), and `probes_ready` (probe
 /// thread signals the main thread that kprobes/kfentries have
 /// attached). `stop` is an `AtomicBool` because the probe thread's
 /// ring-buffer poll loop checks it via `load(Acquire)` between
@@ -2324,7 +2325,7 @@ fn run_phase_b_attach(
     }
 }
 
-/// Serialized probe data sent from guest to host via COM2.
+/// Serialized probe data sent from guest to host via the bulk port (stdout).
 /// The host deserializes and formats with kernel_dir for source locations.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub(crate) struct ProbeBytes {
@@ -2352,7 +2353,7 @@ pub(crate) struct ProbeBytesDiagnostics {
     pub skeleton: crate::probe::process::ProbeDiagnostics,
 }
 
-/// Serialize probe payload to stdout (COM2) between delimiters.
+/// Serialize probe payload to stdout (bulk port) between delimiters.
 /// Resolves BPF source locations from loaded programs before serializing.
 ///
 /// Skips the BPF symbol discovery + source-loc resolution walk when
@@ -2671,7 +2672,7 @@ fn collect_and_print_probe_data(
         Err(payload) => {
             // Stamp the panic payload onto a fresh diagnostics
             // record. Without this, the empty events vec + default
-            // diag emitted on the host COM2 channel is byte-for-byte
+            // diag emitted on the host via the bulk-port stdout channel is byte-for-byte
             // identical to a clean run where the trigger simply
             // never fired — the host can't tell that the probe
             // thread crashed and would silently record the test as
