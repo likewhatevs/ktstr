@@ -422,6 +422,14 @@ pub(crate) struct SchbenchPhaseStats {
     pub(crate) wakeup: PlatStats,
     /// Request-latency histogram merged across the phase's workers.
     pub(crate) request: PlatStats,
+    /// Per-phase achieved-RPS distribution: the control thread's per-second
+    /// samples attributed to this phase's epoch (the whole-run rps is unchanged;
+    /// this is purely additive). A 1s sample straddling an epoch boundary lands
+    /// wholly in the sample-time epoch (bounded fuzz, <=1 sample/transition, like
+    /// the msg-thread late-drain). Empty for a phase shorter than the ~1s control
+    /// cadence -- the host gates on `sample_count() > 0` so a sub-second phase
+    /// reads ABSENT, never rps=0. A rate; re-derived from the merged histogram.
+    pub(crate) rps: PlatStats,
     /// Σ message-thread `run_delay` (ns) over the phase.
     pub(crate) msg_run_delay_ns: u64,
     /// Σ message-thread `pcount` over the phase (the mean's denominator).
@@ -446,6 +454,7 @@ impl SchbenchPhaseStats {
     pub(crate) fn merge(&mut self, other: &SchbenchPhaseStats) {
         self.wakeup.combine(&other.wakeup);
         self.request.combine(&other.request);
+        self.rps.combine(&other.rps);
         self.msg_run_delay_ns = self.msg_run_delay_ns.saturating_add(other.msg_run_delay_ns);
         self.msg_pcount = self.msg_pcount.saturating_add(other.msg_pcount);
         self.worker_run_delay_ns = self
@@ -1387,21 +1396,43 @@ fn auto_scale_rps(
     scale_rps_for_busy(busy, live_rate, target_hit, target_pct)
 }
 
+/// Reset BOTH per-phase rps accumulators in LOCKSTEP at an auto-RPS target-hit.
+/// schbench memsets `rps_stats` on the target-hit transition to discard the
+/// pre-target ramp; the per-epoch map MUST reset with it, or the per-phase view
+/// keeps ramp samples the whole-run view dropped and `Σ per-epoch == whole-run`
+/// breaks (asymmetric-counter-bookkeeping).
+fn reset_rps_accumulators(
+    whole: &mut PlatStats,
+    per_epoch: &mut std::collections::BTreeMap<u32, PlatStats>,
+) {
+    *whole = PlatStats::default();
+    per_epoch.clear();
+}
+
 /// The once-per-second control thread, schbench's main control loop
 /// (`schbench.c:1756-1827`): sample the achieved per-second RPS into `rps_stats`
 /// and -- when auto-RPS is on -- adjust the live rate toward the target. Returns
-/// the accumulated `rps_stats` on exit (the owning thread moves it out on join).
-/// The 1-second cadence is the workload's defined sampling/scaling interval (a
-/// workload duration like the per-request think-sleep), not a synchronization
-/// wait; it observes `stop` after each interval.
+/// BOTH the whole-run `rps_stats` AND a per-epoch RPS map (the same samples
+/// bucketed by the phase epoch observed at sample time), moved out on join. The
+/// whole-run `rps_stats` is byte-identical to the pre-per-phase behavior -- the
+/// per-epoch map is PURELY ADDITIVE (each sample lands in the whole-run histogram
+/// AND exactly one epoch bucket), so `Σ per-epoch == whole-run`. `phase_epoch` is
+/// read Relaxed (telemetry, gates no coupled memory); a 1s sample straddling an
+/// epoch change is attributed wholly to the sample-time epoch (bounded fuzz,
+/// mirroring the worker drain-on-change). The 1-second cadence is the workload's
+/// defined sampling/scaling interval, not a synchronization wait; it observes
+/// `stop` after each interval.
 fn control_loop(
     progress: &AtomicU64,
     stop: &AtomicBool,
     config: &SchbenchConfig,
     live_rate: &AtomicUsize,
     target_hit: &AtomicBool,
-) -> PlatStats {
+    phase_epoch: Option<&AtomicU32>,
+) -> (PlatStats, std::collections::BTreeMap<u32, PlatStats>) {
     let mut rps_stats = PlatStats::default();
+    let mut per_epoch_rps: std::collections::BTreeMap<u32, PlatStats> =
+        std::collections::BTreeMap::new();
     let mut last_loop = 0u64;
     let mut last_t = monotonic_nanos();
     let mut busy_state = ReadBusyState::default();
@@ -1432,7 +1463,14 @@ fn control_loop(
             // Gate: for auto-RPS, sample only once the target is hit
             // (`schbench.c:1781`); fixed/default mode samples every second.
             if config.auto_rps == 0 || target_hit.load(Ordering::Relaxed) {
-                rps_stats.add_lat((rps as u64).min(u32::MAX as u64) as u32);
+                let sample = (rps as u64).min(u32::MAX as u64) as u32;
+                rps_stats.add_lat(sample);
+                // Per-phase parity: also bucket the sample by the epoch observed
+                // NOW (the sample-time epoch; a straddling 1s sample lands wholly
+                // here, bounded fuzz). 0/u32::MAX sentinel epochs route into the
+                // same all_phases entries the host discards (the run() merge).
+                let epoch = phase_epoch.map_or(0, |e| e.load(Ordering::Relaxed));
+                per_epoch_rps.entry(epoch).or_default().add_lat(sample);
             }
         }
         last_loop = lc;
@@ -1440,15 +1478,17 @@ fn control_loop(
         if config.auto_rps != 0 {
             let just_hit = auto_scale_rps(&mut busy_state, live_rate, target_hit, config.auto_rps);
             if just_hit {
-                // Discard the pre-target samples (schbench memsets rps_stats on
-                // the target-hit transition -- the grow, shrink, and on-target
-                // bands all funnel through scale_rps_for_busy's just_hit,
-                // `schbench.c:1212`/`:1235`/`:1247`).
-                rps_stats = PlatStats::default();
+                // Discard ALL pre-target ramp samples (schbench memsets rps_stats
+                // on the target-hit transition -- grow/shrink/on-target bands all
+                // funnel through just_hit, `schbench.c:1212`/`:1235`/`:1247`). The
+                // per-epoch map resets in LOCKSTEP so the per-phase view never
+                // includes ramp samples the whole-run view discards (the
+                // Σ-per-epoch == whole-run invariant survives the reset).
+                reset_rps_accumulators(&mut rps_stats, &mut per_epoch_rps);
             }
         }
     }
-    rps_stats
+    (rps_stats, per_epoch_rps)
 }
 
 /// Run the schbench workload until `stop` is set, returning the whole-run
@@ -1524,7 +1564,8 @@ pub(crate) fn run(
             .collect();
         // Control thread: schbench's main control loop -- once/sec, sample the
         // achieved RPS into rps_stats and (for auto-RPS) auto-scale `live_rate`.
-        let control = outer.spawn(|| control_loop(progress, stop, config, &live_rate, &target_hit));
+        let control = outer
+            .spawn(|| control_loop(progress, stop, config, &live_rate, &target_hit, phase_epoch));
         for h in handles {
             let mtr = h.join().expect("schbench message thread panicked");
             all_wakeup.combine(&mtr.whole_wakeup);
@@ -1536,7 +1577,16 @@ pub(crate) fn run(
                 all_phases.entry(epoch).or_default().merge(&sps);
             }
         }
-        rps_stats = control.join().expect("schbench control thread panicked");
+        let (whole_rps, control_per_epoch_rps) =
+            control.join().expect("schbench control thread panicked");
+        rps_stats = whole_rps;
+        // Merge the control thread's per-epoch RPS into the per-phase aggregate
+        // EXACTLY ONCE, post-join, OUTSIDE the per-message-thread loop above (else
+        // it would double-count by message_threads). The control thread is the
+        // SOLE rps source; the workers contribute empty rps via mtr.phases.
+        for (epoch, hist) in control_per_epoch_rps {
+            all_phases.entry(epoch).or_default().rps.combine(&hist);
+        }
     });
 
     // The auto-RPS "final rps goal" (`schbench.c:1995`): the live per-thread rate
@@ -1667,7 +1717,11 @@ mod tests {
             // SAFETY: cur is one of the live `nodes`; next is its link.
             cur = unsafe { (*cur).next.load(Ordering::Acquire) };
         }
-        assert_eq!(seen.len(), THREADS * PER_THREAD, "no node lost under contention");
+        assert_eq!(
+            seen.len(),
+            THREADS * PER_THREAD,
+            "no node lost under contention"
+        );
     }
 
     #[test]
@@ -1697,13 +1751,21 @@ mod tests {
             runner.join().expect("run panicked")
         });
         let result = &outcome.whole_run;
-        assert!(result.loop_count >= 50, "engine did work: {}", result.loop_count);
+        assert!(
+            result.loop_count >= 50,
+            "engine did work: {}",
+            result.loop_count
+        );
         assert!(result.wakeup.nr_samples > 0, "wakeup samples recorded");
         assert!(result.request.nr_samples > 0, "request samples recorded");
         assert!(result.achieved_rps > 0.0, "positive achieved rps");
         // Non-phasic (phase_epoch None): the only snapshot is the baseline
         // epoch 0, which the host discards. No per-phase metrics are emitted.
-        assert_eq!(outcome.phases.len(), 1, "non-phasic => single baseline phase");
+        assert_eq!(
+            outcome.phases.len(),
+            1,
+            "non-phasic => single baseline phase"
+        );
         assert_eq!(outcome.phases[0].0, 0, "the lone phase is BASELINE epoch 0");
     }
 
@@ -1890,6 +1952,22 @@ mod tests {
     }
 
     #[test]
+    fn reset_rps_accumulators_clears_both_in_lockstep() {
+        // The auto-RPS target-hit reset MUST clear the whole-run AND per-epoch rps
+        // accumulators together; if a future edit drops one, Σ-per-epoch != whole-run
+        // (asymmetric-counter-bookkeeping). Pins the lockstep deterministically — the
+        // engine just_hit path is timing-dependent (the controller must reach target).
+        let mut whole = PlatStats::default();
+        whole.add_lat(500);
+        let mut per_epoch: std::collections::BTreeMap<u32, PlatStats> =
+            std::collections::BTreeMap::new();
+        per_epoch.entry(1).or_default().add_lat(500);
+        reset_rps_accumulators(&mut whole, &mut per_epoch);
+        assert_eq!(whole.sample_count(), 0, "whole-run rps reset");
+        assert!(per_epoch.is_empty(), "per-epoch rps reset in lockstep");
+    }
+
+    #[test]
     fn engine_auto_rps_mode_runs_and_terminates() {
         // auto_rps != 0 turns on the once-per-second control thread that
         // auto-scales the live rate toward the busy target. Seeded with an
@@ -1978,8 +2056,14 @@ mod tests {
         // while the msg thread is scheduled on every wake. run_delay_ns itself
         // is NOT asserted: it can be 0 on an uncontended host, so a value check
         // would flake; pcount>0 pins that the class was measured and folded.
-        assert!(p1.worker_pcount > 0, "phase 1 worker run-delay split populated");
-        assert!(p2.worker_pcount > 0, "phase 2 worker run-delay split populated");
+        assert!(
+            p1.worker_pcount > 0,
+            "phase 1 worker run-delay split populated"
+        );
+        assert!(
+            p2.worker_pcount > 0,
+            "phase 2 worker run-delay split populated"
+        );
         assert!(p1.msg_pcount > 0, "phase 1 msg run-delay split populated");
         assert!(p2.msg_pcount > 0, "phase 2 msg run-delay split populated");
         // loop_count partitions across phases, summing to the global progress —
@@ -2010,6 +2094,92 @@ mod tests {
             outcome.whole_run.wakeup.nr_samples, phase_wakeup_sum,
             "whole-run wakeup count == Σ per-phase counts"
         );
+        // Per-phase RPS: the additive invariant (deterministic) + a timing-tolerant
+        // bound on the brief first phase. These phases run far under the 1s control
+        // cadence, so phase 1 normally gets ZERO rps ticks (the ~1s tick lands in
+        // phase 2, epoch already advanced); on a slow/contended host phase 1 may catch
+        // a single straddle tick, so we tolerate <= 1 rather than a wall-clock-fragile
+        // == 0. The deterministic empty-rps -> ABSENT contract is pinned by
+        // derive_rps_distribution_values_and_absent_guard; this bound still catches
+        // gross mis-attribution of the bulk of rps to the brief first phase.
+        assert!(
+            p1.rps.sample_count() <= 1,
+            "brief phase 1 gets at most one straddle rps tick, got {}",
+            p1.rps.sample_count()
+        );
+        let phase_rps_sum: u64 = outcome
+            .phases
+            .iter()
+            .map(|(_, s)| s.rps.sample_count())
+            .sum();
+        assert_eq!(
+            outcome.whole_run.rps.nr_samples, phase_rps_sum,
+            "whole-run rps count == Σ per-phase rps counts"
+        );
+    }
+
+    #[test]
+    fn engine_per_phase_rps_populates_and_sums_to_whole_run() {
+        // POPULATED per-phase RPS: the control thread samples once/sec, so a phase
+        // window >= ~2s gets multiple per-phase rps samples. Time-gated (the 1s
+        // control cadence is the granularity floor) -- the progress-gated
+        // engine_splits phases are too short to tick. Drive epoch 1 for ~2.2s then
+        // epoch 2 for ~2.2s and confirm BOTH epochs carry rps samples AND the
+        // per-epoch samples sum to the whole-run count (the additive invariant:
+        // every sample lands in one epoch bucket AND the whole-run histogram).
+        // The ~4.4s wall-clock is the irreducible cost of exercising the real 1s control
+        // cadence end-to-end (2 ticks/epoch for robustness against a delayed tick on a
+        // loaded host); the deterministic per-epoch invariants — the lockstep reset and
+        // Σ-per-epoch==whole-run — are pinned sleep-free by
+        // reset_rps_accumulators_clears_both_in_lockstep + engine_splits_stats_across_phase_epochs.
+        // This test uniquely confirms the LIVE control thread POPULATES both epochs.
+        let config = SchbenchConfig {
+            message_threads: 1,
+            worker_threads: 2,
+            cache_footprint_kib: 16,
+            operations: 1,
+            sleep_usec: 0,
+            skip_locking: false,
+            requests_per_sec: 0,
+            auto_rps: 0,
+        };
+        let stop = AtomicBool::new(false);
+        let progress = AtomicU64::new(0);
+        let epoch = AtomicU32::new(1);
+        let outcome = std::thread::scope(|s| {
+            let runner = s.spawn(|| run(&config, &stop, &progress, Some(&epoch)));
+            // ~2.2s per epoch => >= 2 control ticks each (first tick at ~1s).
+            std::thread::sleep(std::time::Duration::from_millis(2200));
+            epoch.store(2, Ordering::Release);
+            std::thread::sleep(std::time::Duration::from_millis(2200));
+            stop.store(true, Ordering::Release);
+            runner.join().expect("run panicked")
+        });
+        let by_epoch: std::collections::BTreeMap<u32, &SchbenchPhaseStats> =
+            outcome.phases.iter().map(|(e, s)| (*e, s)).collect();
+        let p1 = by_epoch.get(&1).expect("phase 1 present");
+        let p2 = by_epoch.get(&2).expect("phase 2 present");
+        assert!(
+            p1.rps.sample_count() > 0,
+            "phase 1 per-phase rps populated: {}",
+            p1.rps.sample_count()
+        );
+        assert!(
+            p2.rps.sample_count() > 0,
+            "phase 2 per-phase rps populated: {}",
+            p2.rps.sample_count()
+        );
+        // Additive invariant (no auto-RPS reset in default mode, so EXACT): Σ
+        // per-epoch rps samples == whole-run rps samples.
+        let phase_rps_sum: u64 = outcome
+            .phases
+            .iter()
+            .map(|(_, s)| s.rps.sample_count())
+            .sum();
+        assert_eq!(
+            phase_rps_sum, outcome.whole_run.rps.nr_samples,
+            "Σ per-epoch rps samples == whole-run rps samples"
+        );
     }
 
     #[test]
@@ -2032,7 +2202,9 @@ mod tests {
     fn worktype_schbench_registration_and_serde() {
         use crate::workload::WorkType;
         let wt = WorkType::schbench(
-            SchbenchConfig::default().message_threads(2).worker_threads(4),
+            SchbenchConfig::default()
+                .message_threads(2)
+                .worker_threads(4),
         );
         assert_eq!(wt.name(), "Schbench");
         // from_name yields the default-config variant.
@@ -2044,7 +2216,8 @@ mod tests {
         );
         // The variant serde-roundtrips, carrying its config.
         let json = serde_json::to_string(&wt).expect("WorkType::Schbench must serialize");
-        let back: WorkType = serde_json::from_str(&json).expect("WorkType::Schbench must deserialize");
+        let back: WorkType =
+            serde_json::from_str(&json).expect("WorkType::Schbench must deserialize");
         assert_eq!(wt, back);
     }
 

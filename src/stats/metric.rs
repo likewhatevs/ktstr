@@ -1153,6 +1153,22 @@ pub(crate) const SCHBENCH_REQUEST_P999_US: &str = "request_p999_latency_us";
 pub(crate) const SCHBENCH_SCHED_DELAY_MSG_US: &str = "sched_delay_msg_us";
 pub(crate) const SCHBENCH_SCHED_DELAY_WORKER_US: &str = "sched_delay_worker_us";
 pub(crate) const SCHBENCH_LOOP_COUNT: &str = "schbench_loop_count";
+// Per-phase latency min/max (schbench's `min=`/`max=` table footer,
+// `schbench.c:579`): the per-phase PlatStats already carries them, so these are
+// emitted from `q.min`/`q.max`. LowerBetter (a higher min/max latency is worse).
+pub(crate) const SCHBENCH_WAKEUP_MIN_US: &str = "wakeup_min_latency_us";
+pub(crate) const SCHBENCH_WAKEUP_MAX_US: &str = "wakeup_max_latency_us";
+pub(crate) const SCHBENCH_REQUEST_MIN_US: &str = "request_min_latency_us";
+pub(crate) const SCHBENCH_REQUEST_MAX_US: &str = "request_max_latency_us";
+// Per-phase achieved-RPS distribution (schbench's RPS table, PLIST_FOR_RPS =
+// 20/50/90, `schbench.c:130`) + its min/max. HigherBetter (more requests/sec =
+// more throughput); the min/max INVERT the latency polarity (a higher worst-
+// second rate is better). A per-second RATE, so no `_us` suffix.
+pub(crate) const SCHBENCH_RPS_P20: &str = "rps_p20";
+pub(crate) const SCHBENCH_RPS_P50: &str = "rps_p50";
+pub(crate) const SCHBENCH_RPS_P90: &str = "rps_p90";
+pub(crate) const SCHBENCH_RPS_MIN: &str = "rps_min";
+pub(crate) const SCHBENCH_RPS_MAX: &str = "rps_max";
 
 pub static METRICS: &[MetricDef] = &[
     MetricDef {
@@ -1837,6 +1853,120 @@ pub static METRICS: &[MetricDef] = &[
         default_abs: 10.0,
         default_rel: 0.30,
         display_unit: "",
+        accessor: |_| None,
+    },
+    // Per-phase latency min/max. LowerBetter (a higher min/max latency is worse).
+    // min is a low-tail value → p50/p90 abs tier (20). max is a PEAK (a single
+    // extreme sample, the flakiest latency stat) → the peak rel tolerance (0.50,
+    // matching worst_gap_ms) so one outlier spike does not fabricate a regression.
+    MetricDef {
+        name: SCHBENCH_WAKEUP_MIN_US,
+        polarity: crate::test_support::Polarity::LowerBetter,
+        kind: MetricKind::PerPhase,
+        default_abs: 20.0,
+        default_rel: 0.25,
+        display_unit: "\u{00b5}s",
+        accessor: |_| None,
+    },
+    MetricDef {
+        name: SCHBENCH_WAKEUP_MAX_US,
+        polarity: crate::test_support::Polarity::LowerBetter,
+        kind: MetricKind::PerPhase,
+        default_abs: 50.0,
+        default_rel: 0.50,
+        display_unit: "\u{00b5}s",
+        accessor: |_| None,
+    },
+    MetricDef {
+        name: SCHBENCH_REQUEST_MIN_US,
+        polarity: crate::test_support::Polarity::LowerBetter,
+        kind: MetricKind::PerPhase,
+        default_abs: 20.0,
+        default_rel: 0.25,
+        display_unit: "\u{00b5}s",
+        accessor: |_| None,
+    },
+    MetricDef {
+        name: SCHBENCH_REQUEST_MAX_US,
+        polarity: crate::test_support::Polarity::LowerBetter,
+        kind: MetricKind::PerPhase,
+        default_abs: 50.0,
+        default_rel: 0.50,
+        display_unit: "\u{00b5}s",
+        accessor: |_| None,
+    },
+    // Per-phase achieved-RPS distribution (PLIST_FOR_RPS = 20/50/90, schbench.c:130)
+    // + min/max (schbench.c:579 stderr footer + :713-714/:1963 JSON — parity with
+    // what schbench emits, not an extension). HigherBetter (more requests/sec = more
+    // throughput) — note min/max INVERT the latency polarity (a higher worst-second
+    // rate is better). A per-second RATE spanning tens..tens-of-thousands, so
+    // rel-dominant (rel 0.10) with a small abs floor (100) — NOT loop_count's
+    // count-style abs 10/rel 0.30.
+    //
+    // rps min/max keep the percentile-tier rel (0.10), NOT the loosened latency-max
+    // tier (0.50): each rps sample is a 1-second-AVERAGED rate (cycles completed that
+    // second), not a single event like a latency sample, so an rps extreme is the
+    // worst/best SECOND — far less flaky than a latency per-request peak, and the
+    // worst-second is a meaningful scheduler-tail signal worth a tight gate. (The
+    // latency-max 0.50 loosening guards single-request spikes that do not exist in the
+    // 1s-averaged rps series.)
+    //
+    // rps_min is UNRELIABLE when any 0-rps (starvation) second occurs: TWO independent
+    // paths drop a real 0 from the min. (1) Within a histogram, add_lat's min==0
+    // sentinel (plat.rs `if min==0 || us<min`) treats 0 as "unset" — a 0 sets min=0 but
+    // the next sample replaces it (e.g. [100,0,200] -> min=200), so min reads 0 only
+    // when a 0 is the last min-lowering sample. (2) Across cgroups, PlatStats::combine's
+    // `other.min != 0` guard (plat.rs:227 — correct for latency, where 0 means empty)
+    // skips a starved cgroup's min=0 when pooling, so a 0-rps cgroup pooled with a
+    // nonzero one leaves rps_min nonzero. rps_min is thus a trustworthy worst-second
+    // floor only absent 0-seconds. Sustained starvation (0-seconds >= 20% of the
+    // window) still shows in rps_p20, which reads the pooled histogram's bucket 0
+    // (folded unconditionally, plat.rs:221) in both cases; a single 0-second in a longer
+    // window is below p20 and lost from rps_min — invisible to both. Faithful to
+    // schbench's add_lat min sentinel.
+    MetricDef {
+        name: SCHBENCH_RPS_P20,
+        polarity: crate::test_support::Polarity::HigherBetter,
+        kind: MetricKind::PerPhase,
+        default_abs: 100.0,
+        default_rel: 0.10,
+        display_unit: "req/s",
+        accessor: |_| None,
+    },
+    MetricDef {
+        name: SCHBENCH_RPS_P50,
+        polarity: crate::test_support::Polarity::HigherBetter,
+        kind: MetricKind::PerPhase,
+        default_abs: 100.0,
+        default_rel: 0.10,
+        display_unit: "req/s",
+        accessor: |_| None,
+    },
+    MetricDef {
+        name: SCHBENCH_RPS_P90,
+        polarity: crate::test_support::Polarity::HigherBetter,
+        kind: MetricKind::PerPhase,
+        default_abs: 100.0,
+        default_rel: 0.10,
+        display_unit: "req/s",
+        accessor: |_| None,
+    },
+    MetricDef {
+        name: SCHBENCH_RPS_MIN,
+        polarity: crate::test_support::Polarity::HigherBetter,
+        kind: MetricKind::PerPhase,
+        default_abs: 100.0,
+        default_rel: 0.10,
+        display_unit: "req/s",
+        accessor: |_| None,
+    },
+    MetricDef {
+        name: SCHBENCH_RPS_MAX,
+        polarity: crate::test_support::Polarity::HigherBetter,
+        kind: MetricKind::PerPhase,
+        default_abs: 100.0,
+        default_rel: 0.10,
+        display_unit: "req/s",
         accessor: |_| None,
     },
 ];

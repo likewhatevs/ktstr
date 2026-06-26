@@ -405,7 +405,9 @@ impl AssertResult {
                 let schbench_samples = pc
                     .schbench
                     .as_ref()
-                    .map(|s| s.wakeup.sample_count() + s.request.sample_count())
+                    .map(|s| {
+                        s.wakeup.sample_count() + s.request.sample_count() + s.rps.sample_count()
+                    })
                     .unwrap_or(0);
                 let had_samples = !pc.wake_latencies_ns.is_empty()
                     || !pc.run_delays_ns.is_empty()

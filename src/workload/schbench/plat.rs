@@ -311,10 +311,9 @@ pub(crate) struct Percentiles {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Pct {
     /// `PLIST[0]` = 20.0 — schbench's RPS-distribution percentile
-    /// (`PLIST_FOR_RPS`, `schbench.c:130`). The latency metrics read P50-P999
-    /// (`run_metrics.rs`), so P20 is exercised only by the index-mapping test
-    /// until the RPS-distribution path lands.
-    #[allow(dead_code)]
+    /// (`PLIST_FOR_RPS`, `schbench.c:130`). Read by the per-phase RPS derivation
+    /// (`run_metrics.rs` `derive_schbench_phase_metrics`, `rps_p20`); the latency
+    /// metrics use P50-P999.
     P20,
     P50,
     P90,

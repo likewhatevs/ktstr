@@ -1452,6 +1452,7 @@ fn phase_buckets_derives_schbench_perphase_metrics() {
     let schbench = crate::workload::schbench::run::SchbenchPhaseStats {
         wakeup,
         request: crate::workload::schbench::plat::PlatStats::default(),
+        rps: crate::workload::schbench::plat::PlatStats::default(),
         msg_run_delay_ns: 50_000,
         msg_pcount: 5,
         worker_run_delay_ns: 0,
@@ -1540,6 +1541,7 @@ fn better_across_phases_orients_by_polarity_end_to_end() {
             schbench: Some(crate::workload::schbench::run::SchbenchPhaseStats {
                 wakeup,
                 request: crate::workload::schbench::plat::PlatStats::default(),
+                rps: crate::workload::schbench::plat::PlatStats::default(),
                 msg_run_delay_ns: 0,
                 msg_pcount: 0,
                 worker_run_delay_ns: 0,

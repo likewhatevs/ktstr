@@ -1135,10 +1135,13 @@ pub fn populate_run_ext_metrics(
 /// (e.g. `VmResult::phase_buckets`) may re-run it freely.
 pub(crate) fn derive_schbench_phase_metrics(phases: &mut [PhaseBucket]) {
     use crate::stats::{
-        SCHBENCH_LOOP_COUNT, SCHBENCH_REQUEST_P50_US, SCHBENCH_REQUEST_P90_US,
-        SCHBENCH_REQUEST_P99_US, SCHBENCH_REQUEST_P999_US, SCHBENCH_SCHED_DELAY_MSG_US,
-        SCHBENCH_SCHED_DELAY_WORKER_US, SCHBENCH_WAKEUP_P50_US, SCHBENCH_WAKEUP_P90_US,
-        SCHBENCH_WAKEUP_P99_US, SCHBENCH_WAKEUP_P999_US,
+        SCHBENCH_LOOP_COUNT, SCHBENCH_REQUEST_MAX_US, SCHBENCH_REQUEST_MIN_US,
+        SCHBENCH_REQUEST_P50_US, SCHBENCH_REQUEST_P90_US, SCHBENCH_REQUEST_P99_US,
+        SCHBENCH_REQUEST_P999_US, SCHBENCH_RPS_MAX, SCHBENCH_RPS_MIN, SCHBENCH_RPS_P20,
+        SCHBENCH_RPS_P50, SCHBENCH_RPS_P90, SCHBENCH_SCHED_DELAY_MSG_US,
+        SCHBENCH_SCHED_DELAY_WORKER_US, SCHBENCH_WAKEUP_MAX_US, SCHBENCH_WAKEUP_MIN_US,
+        SCHBENCH_WAKEUP_P50_US, SCHBENCH_WAKEUP_P90_US, SCHBENCH_WAKEUP_P99_US,
+        SCHBENCH_WAKEUP_P999_US,
     };
     use crate::workload::schbench::plat::Pct;
     use crate::workload::schbench::run::SchbenchPhaseStats;
@@ -1166,33 +1169,76 @@ pub(crate) fn derive_schbench_phase_metrics(phases: &mut [PhaseBucket]) {
         };
         if p.wakeup.sample_count() > 0 {
             let q = p.wakeup.percentiles();
+            bucket.metrics.insert(
+                SCHBENCH_WAKEUP_P50_US.to_string(),
+                q.value_at(Pct::P50) as f64,
+            );
+            bucket.metrics.insert(
+                SCHBENCH_WAKEUP_P90_US.to_string(),
+                q.value_at(Pct::P90) as f64,
+            );
+            bucket.metrics.insert(
+                SCHBENCH_WAKEUP_P99_US.to_string(),
+                q.value_at(Pct::P99) as f64,
+            );
+            bucket.metrics.insert(
+                SCHBENCH_WAKEUP_P999_US.to_string(),
+                q.value_at(Pct::P999) as f64,
+            );
             bucket
                 .metrics
-                .insert(SCHBENCH_WAKEUP_P50_US.to_string(), q.value_at(Pct::P50) as f64);
+                .insert(SCHBENCH_WAKEUP_MIN_US.to_string(), q.min as f64);
             bucket
                 .metrics
-                .insert(SCHBENCH_WAKEUP_P90_US.to_string(), q.value_at(Pct::P90) as f64);
-            bucket
-                .metrics
-                .insert(SCHBENCH_WAKEUP_P99_US.to_string(), q.value_at(Pct::P99) as f64);
-            bucket
-                .metrics
-                .insert(SCHBENCH_WAKEUP_P999_US.to_string(), q.value_at(Pct::P999) as f64);
+                .insert(SCHBENCH_WAKEUP_MAX_US.to_string(), q.max as f64);
         }
         if p.request.sample_count() > 0 {
             let q = p.request.percentiles();
+            bucket.metrics.insert(
+                SCHBENCH_REQUEST_P50_US.to_string(),
+                q.value_at(Pct::P50) as f64,
+            );
+            bucket.metrics.insert(
+                SCHBENCH_REQUEST_P90_US.to_string(),
+                q.value_at(Pct::P90) as f64,
+            );
+            bucket.metrics.insert(
+                SCHBENCH_REQUEST_P99_US.to_string(),
+                q.value_at(Pct::P99) as f64,
+            );
+            bucket.metrics.insert(
+                SCHBENCH_REQUEST_P999_US.to_string(),
+                q.value_at(Pct::P999) as f64,
+            );
             bucket
                 .metrics
-                .insert(SCHBENCH_REQUEST_P50_US.to_string(), q.value_at(Pct::P50) as f64);
+                .insert(SCHBENCH_REQUEST_MIN_US.to_string(), q.min as f64);
             bucket
                 .metrics
-                .insert(SCHBENCH_REQUEST_P90_US.to_string(), q.value_at(Pct::P90) as f64);
+                .insert(SCHBENCH_REQUEST_MAX_US.to_string(), q.max as f64);
+        }
+        // Per-phase achieved-RPS distribution (the control thread's per-second
+        // samples attributed to this epoch). Gated on sample_count()>0 so a phase
+        // shorter than the ~1s control cadence reads ABSENT, never rps=0 (the
+        // SchbenchPhaseStats.rps field doc + the cross-phase ruling). schbench's
+        // RPS table is PLIST_FOR_RPS = 20/50/90 (schbench.c:130) + min/max.
+        if p.rps.sample_count() > 0 {
+            let r = p.rps.percentiles();
             bucket
                 .metrics
-                .insert(SCHBENCH_REQUEST_P99_US.to_string(), q.value_at(Pct::P99) as f64);
+                .insert(SCHBENCH_RPS_P20.to_string(), r.value_at(Pct::P20) as f64);
             bucket
                 .metrics
-                .insert(SCHBENCH_REQUEST_P999_US.to_string(), q.value_at(Pct::P999) as f64);
+                .insert(SCHBENCH_RPS_P50.to_string(), r.value_at(Pct::P50) as f64);
+            bucket
+                .metrics
+                .insert(SCHBENCH_RPS_P90.to_string(), r.value_at(Pct::P90) as f64);
+            bucket
+                .metrics
+                .insert(SCHBENCH_RPS_MIN.to_string(), r.min as f64);
+            bucket
+                .metrics
+                .insert(SCHBENCH_RPS_MAX.to_string(), r.max as f64);
         }
         // Sample-weighted run-delay mean (Σrun_delay / Σpcount), ns→µs; ABSENT
         // when pcount==0 (a never-scheduled class) so it reads as missing, not 0.
