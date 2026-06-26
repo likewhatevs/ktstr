@@ -937,8 +937,9 @@ pub mod prelude {
     pub use crate::vmm::wire::{KernelOpReplyPayload, KernelOpValue};
     pub use crate::workload::{
         AffinityIntent, AluWidth, CloneMode, CustomFn, MemPolicy, Migration, MpolFlags,
-        ResolvedAffinity, SchedPolicy, WorkPhase, WorkSpec, WorkType, WorkTypeValidationError,
-        WorkerCtx, WorkerReport, WorkerReportClaim, WorkloadConfig, WorkloadHandle,
+        ResolvedAffinity, SchbenchConfig, SchedPolicy, WorkPhase, WorkSpec, WorkType,
+        WorkTypeValidationError, WorkerCtx, WorkerReport, WorkerReportClaim, WorkloadConfig,
+        WorkloadHandle,
     };
     // Surface `Phase` from the assert module (the scenario-step
     // bucket) so test authors can write `Phase::step(0)` /

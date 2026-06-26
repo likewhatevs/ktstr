@@ -677,6 +677,7 @@ fn is_unmapped_work_type(w: &WorkType) -> bool {
         | WorkType::CrossAffinityChurn { .. }
         | WorkType::PolicyChurn { .. }
         | WorkType::FanOutCompute { .. }
+        | WorkType::Schbench { .. }
         | WorkType::PageFaultChurn { .. }
         | WorkType::MutexContention { .. }
         | WorkType::Custom { .. }
@@ -928,6 +929,7 @@ fn render_work_type(w: &WorkType) -> String {
         WorkType::CrossAffinityChurn { .. } => render_work_type_todo("CrossAffinityChurn"),
         WorkType::PolicyChurn { .. } => render_work_type_todo("PolicyChurn"),
         WorkType::FanOutCompute { .. } => render_work_type_todo("FanOutCompute"),
+        WorkType::Schbench { .. } => render_work_type_todo("Schbench"),
         WorkType::PageFaultChurn { .. } => render_work_type_todo("PageFaultChurn"),
         WorkType::MutexContention { .. } => render_work_type_todo("MutexContention"),
         WorkType::Custom { .. } => render_work_type_todo("Custom"),

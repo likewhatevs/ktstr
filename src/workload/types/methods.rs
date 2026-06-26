@@ -7,6 +7,7 @@
 use std::time::Duration;
 
 use crate::workload::config::{AluWidth, FutexLockMode, SchedClass, WakeMechanism, defaults};
+use crate::workload::schbench::run::SchbenchConfig;
 
 use crate::workload::WorkerReport;
 
@@ -47,6 +48,7 @@ impl WorkType {
             WorkType::CrossAffinityChurn { .. } => "CrossAffinityChurn",
             WorkType::PolicyChurn { .. } => "PolicyChurn",
             WorkType::FanOutCompute { .. } => "FanOutCompute",
+            WorkType::Schbench { .. } => "Schbench",
             WorkType::PageFaultChurn { .. } => "PageFaultChurn",
             WorkType::MutexContention { .. } => "MutexContention",
             WorkType::Custom { name, .. } => name.as_str(),
@@ -123,6 +125,9 @@ impl WorkType {
                 cache_footprint_kib: defaults::FAN_OUT_COMPUTE_CACHE_FOOTPRINT_KIB,
                 operations: defaults::FAN_OUT_COMPUTE_OPERATIONS,
                 sleep_usec: defaults::FAN_OUT_COMPUTE_SLEEP_USEC,
+            }),
+            "Schbench" => Some(WorkType::Schbench {
+                config: SchbenchConfig::default(),
             }),
             "PageFaultChurn" => Some(WorkType::PageFaultChurn {
                 region_kib: defaults::PAGE_FAULT_CHURN_REGION_KIB,
@@ -513,6 +518,15 @@ impl WorkType {
             operations,
             sleep_usec,
         }
+    }
+
+    /// The `schbench_rs` workload (schbench's default mode), configured by
+    /// `config`. Build the config with [`SchbenchConfig::default`] plus its
+    /// chainable setters, e.g.
+    /// `WorkType::schbench(SchbenchConfig::default().message_threads(2))`. Use
+    /// with a single ktstr worker; see the [`WorkType::Schbench`] variant doc.
+    pub const fn schbench(config: SchbenchConfig) -> Self {
+        WorkType::Schbench { config }
     }
 
     /// Rapid page fault cycling with `spin_iters` CPU work between cycles.

@@ -1454,6 +1454,17 @@ pub(super) fn worker_main(
                 last_iter_time = Instant::now();
                 iterations += 1;
             }
+            WorkType::Schbench { ref config } => {
+                // Run schbench's full message/worker thread topology to
+                // completion -- run() blocks until `stop` -- driven by this one
+                // ktstr worker process. Completed work cycles feed work_units;
+                // the latency percentiles in the result are surfaced by the
+                // metric-attribution path (a follow-up), not here.
+                let progress = AtomicU64::new(0);
+                let result = crate::workload::schbench::run::run(config, stop, &progress);
+                work_units = work_units.saturating_add(result.loop_count);
+                iterations += 1;
+            }
             WorkType::PageFaultChurn {
                 region_kib,
                 touches_per_cycle,

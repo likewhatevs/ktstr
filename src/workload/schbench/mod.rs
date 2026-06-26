@@ -18,3 +18,6 @@ pub(crate) mod handshake;
 pub(crate) mod percpu_lock;
 pub(crate) mod plat;
 pub(crate) mod run;
+
+/// User-facing config for the [`Schbench`](crate::workload::WorkType::Schbench) workload.
+pub use run::SchbenchConfig;

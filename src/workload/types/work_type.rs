@@ -15,6 +15,7 @@ use std::time::Duration;
 use crate::workload::config::{
     AluWidth, FutexLockMode, SchedClass, WakeMechanism, humantime_serde_helper,
 };
+use crate::workload::schbench::run::SchbenchConfig;
 
 use crate::workload::WorkerReport;
 
@@ -386,6 +387,17 @@ pub enum WorkType {
         operations: usize,
         sleep_usec: u64,
     },
+    /// schbench's default-mode benchmark, re-expressed natively (the
+    /// `schbench_rs` port). One worker process runs schbench's
+    /// message-thread / worker-thread topology with native threads: message
+    /// threads batch-wake worker threads (measuring scheduler wakeup latency),
+    /// and each worker think-sleeps then does matrix work under a per-CPU lock
+    /// (measuring request latency). The carried [`SchbenchConfig`] sets the
+    /// thread counts, cache footprint, think-time, and locking; build it with
+    /// [`SchbenchConfig::default`] plus its chainable setters. Use a single
+    /// ktstr worker (`workers(1)`) -- the message/worker parallelism is this
+    /// variant's internal thread topology, not ktstr worker processes.
+    Schbench { config: SchbenchConfig },
     /// Rapid page fault cycling. Workers mmap a `region_kib` KiB region with
     /// `MADV_NOHUGEPAGE` (forcing 4 KiB pages), touch `touches_per_cycle`
     /// random pages via write faults, then `MADV_DONTNEED` to zap PTEs and

@@ -105,28 +105,35 @@ impl<T: Linked> TreiberStack<T> {
     }
 }
 
-/// Declarative config for the schbench workload (the subset the default-mode
-/// engine consumes). `pub(crate)` for now; the public `WorkType::Schbench`
-/// surface + builder is a later step.
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct SchbenchConfig {
+/// Declarative config for the [`Schbench`](crate::workload::WorkType::Schbench)
+/// workload. Construct via [`SchbenchConfig::default`] (schbench's own
+/// defaults) plus the chainable setters, e.g.
+/// `SchbenchConfig::default().message_threads(2).worker_threads(4)`. Derives
+/// Clone/Debug/PartialEq/Eq/Hash/serde; the builder shape follows
+/// [`WorkloadConfig`](crate::workload::WorkloadConfig), but `Eq`+`Hash` (which
+/// `WorkloadConfig` and `WorkSpec` omit because of their transitive `f64`) are
+/// available here since every field is integer/bool -- the ktstr f64-free
+/// leaf-config convention.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct SchbenchConfig {
     /// Number of message threads (`schbench.c` `-m`, default 1).
-    pub(crate) message_threads: usize,
+    pub message_threads: usize,
     /// Worker threads per message thread (`schbench.c` `-t`). 0 means "one per
     /// CPU in the allocated cpuset" (schbench's `get_nprocs` default, scoped to
     /// the guest cpuset per ruling).
-    pub(crate) worker_threads: usize,
+    pub worker_threads: usize,
     /// Per-worker matrix cache footprint in KiB (`schbench.c` `-F`, default
     /// 256); sets the matrix dimension.
-    pub(crate) cache_footprint_kib: usize,
+    pub cache_footprint_kib: usize,
     /// Matrix multiplications per work cycle (`schbench.c` `-n`, default 5).
-    pub(crate) operations: usize,
+    pub operations: usize,
     /// Think-time sleep before the matrix work, microseconds (`schbench.c`
     /// `-s`, default 100); simulates networking. 0 disables.
-    pub(crate) sleep_usec: u64,
+    pub sleep_usec: u64,
     /// Skip the per-CPU lock around the matrix work (`schbench.c` `-L`,
     /// default false: locking on).
-    pub(crate) skip_locking: bool,
+    pub skip_locking: bool,
 }
 
 impl Default for SchbenchConfig {
@@ -144,6 +151,44 @@ impl Default for SchbenchConfig {
 }
 
 impl SchbenchConfig {
+    /// Set the number of message threads (schbench `-m`).
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn message_threads(mut self, n: usize) -> Self {
+        self.message_threads = n;
+        self
+    }
+    /// Set worker threads per message thread (schbench `-t`); 0 = one per
+    /// allocated CPU.
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn worker_threads(mut self, n: usize) -> Self {
+        self.worker_threads = n;
+        self
+    }
+    /// Set the per-worker matrix cache footprint in KiB (schbench `-F`).
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn cache_footprint_kib(mut self, kib: usize) -> Self {
+        self.cache_footprint_kib = kib;
+        self
+    }
+    /// Set the matrix multiplications per work cycle (schbench `-n`).
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn operations(mut self, n: usize) -> Self {
+        self.operations = n;
+        self
+    }
+    /// Set the think-time sleep in microseconds (schbench `-s`); 0 disables.
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn sleep_usec(mut self, usec: u64) -> Self {
+        self.sleep_usec = usec;
+        self
+    }
+    /// Skip the per-CPU lock around the matrix work (schbench `-L`).
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn skip_locking(mut self, skip: bool) -> Self {
+        self.skip_locking = skip;
+        self
+    }
+
     /// Matrix dimension from the cache footprint, identical to schbench
     /// (`schbench.c:1880`: `sqrt(cache_footprint_kb * 1024 / 3 /
     /// sizeof(unsigned long))`) and to ktstr's `FanOutCompute` precompute. Zero
@@ -605,5 +650,50 @@ mod tests {
         assert!(result.wakeup.nr_samples > 0, "wakeup samples recorded");
         assert!(result.request.nr_samples > 0, "request samples recorded");
         assert!(result.achieved_rps > 0.0, "positive achieved rps");
+    }
+
+    #[test]
+    fn schbench_config_serde_roundtrips() {
+        // The new serialized type roundtrips unchanged.
+        let cfg = SchbenchConfig::default()
+            .message_threads(3)
+            .worker_threads(7)
+            .cache_footprint_kib(512)
+            .operations(9)
+            .sleep_usec(250)
+            .skip_locking(true);
+        let json = serde_json::to_string(&cfg).expect("SchbenchConfig must serialize");
+        let back: SchbenchConfig =
+            serde_json::from_str(&json).expect("SchbenchConfig must deserialize");
+        assert_eq!(cfg, back, "config roundtrips unchanged");
+    }
+
+    #[test]
+    fn worktype_schbench_registration_and_serde() {
+        use crate::workload::WorkType;
+        let wt = WorkType::schbench(
+            SchbenchConfig::default().message_threads(2).worker_threads(4),
+        );
+        assert_eq!(wt.name(), "Schbench");
+        // from_name yields the default-config variant.
+        assert_eq!(
+            WorkType::from_name("Schbench"),
+            Some(WorkType::Schbench {
+                config: SchbenchConfig::default()
+            })
+        );
+        // The variant serde-roundtrips, carrying its config.
+        let json = serde_json::to_string(&wt).expect("WorkType::Schbench must serialize");
+        let back: WorkType = serde_json::from_str(&json).expect("WorkType::Schbench must deserialize");
+        assert_eq!(wt, back);
+    }
+
+    #[test]
+    fn schbench_config_reachable_via_prelude() {
+        // Regression-pin the prelude placement: test authors construct the
+        // config via `use ktstr::prelude::*`. Dropping SchbenchConfig from the
+        // prelude would fail this compile. Also exercises the Eq derive.
+        let cfg: crate::prelude::SchbenchConfig = crate::prelude::SchbenchConfig::default();
+        assert_eq!(cfg, SchbenchConfig::default());
     }
 }
