@@ -1177,6 +1177,18 @@ fn err_to_exit_code(e: anyhow::Error, expect_err: bool, no_skip: bool) -> i32 {
         eprintln!("{e:#}");
         return EXIT_FAIL;
     }
+    if e.downcast_ref::<crate::test_support::eval::SchedulerBuildRefused>()
+        .is_some()
+    {
+        // An orchestrated scheduler build expected to succeed FAILED and the
+        // resolver refused to validate against a possibly-stale pre-built
+        // binary (KTSTR_SCHEDULER_ALLOW_STALE_FALLBACK unset). A host-side
+        // build-infra fault — always EXIT_FAIL, never inverted by expect_err
+        // (mirrors PostVmAssertionFailure above): an expect_err test must not
+        // let a broken build masquerade as the guest-side expected failure.
+        eprintln!("{e:#}");
+        return EXIT_FAIL;
+    }
     if e.downcast_ref::<crate::test_support::eval::ExpectAutoReproSatisfied>()
         .is_some()
     {
@@ -1336,6 +1348,11 @@ pub(crate) fn final_outcome(
                 HostClass::NotHostClass => {}
             }
             if e.downcast_ref::<crate::test_support::eval::PostVmAssertionFailure>()
+                .is_some()
+            {
+                return Verdict::Fail;
+            }
+            if e.downcast_ref::<crate::test_support::eval::SchedulerBuildRefused>()
                 .is_some()
             {
                 return Verdict::Fail;

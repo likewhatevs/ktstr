@@ -41,8 +41,8 @@ pub(crate) use llm_extract::host_side_llm_extract;
 pub use post_vm::post_vm_skip;
 pub(crate) use post_vm::{
     ExpectAutoReproSatisfied, HostSkipRequest, LLM_MODEL_LOAD_FAILED_PREFIX,
-    PostVmAssertionFailure, ScxBpfErrorMatcherMismatch, record_skip_sidecar, run_post_vm_callbacks,
-    should_skip_on_llm_model_load_failure,
+    PostVmAssertionFailure, SchedulerBuildRefused, ScxBpfErrorMatcherMismatch, record_skip_sidecar,
+    run_post_vm_callbacks, should_skip_on_llm_model_load_failure,
 };
 mod reporting;
 mod scheduler;

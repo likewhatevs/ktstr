@@ -159,7 +159,7 @@
 //!
 //! ```toml
 //! [dev-dependencies]
-//! ktstr = "0.16"
+//! ktstr = "0.19.0"
 //! ```
 //!
 //! Lean dev-dep (drops the host-tooling crates: tikv-jemallocator,
@@ -168,7 +168,7 @@
 //!
 //! ```toml
 //! [dev-dependencies]
-//! ktstr = { version = "0.16", default-features = false, features = ["llm"] }
+//! ktstr = { version = "0.19.0", default-features = false, features = ["llm"] }
 //! ```
 //!
 //! # Feature flags
@@ -1728,6 +1728,21 @@ pub fn find_kernel() -> anyhow::Result<Option<std::path::PathBuf>> {
 /// runs optimized while the harness keeps its dev-profile assertion
 /// thresholds and `catch_unwind` behavior; `--release` sets both.
 pub const KTSTR_SCHEDULER_PROFILE_ENV: &str = "KTSTR_SCHEDULER_PROFILE";
+
+/// Name of the presence-only opt-out env var that re-enables the
+/// pre-built-binary fallback after a FAILED orchestrated scheduler
+/// build. When set to a NON-EMPTY value, a failed `cargo build -p
+/// <sched>` in the non-cargo-test `Discover` path falls back to a
+/// sibling / `target/{debug,release}/` binary AS-IS instead of failing
+/// the test. Default (unset / empty) REFUSES the stale fallback so a
+/// build that fails for a new reason cannot silently validate the test
+/// against an old scheduler. Empty-string rejection mirrors
+/// `KTSTR_CARGO_TEST_MODE` (`cargo_test_mode_active`) — NOT the
+/// presence-only [`KTSTR_ORCHESTRATED_ENV`], which activates on an empty
+/// value — so a stray `KTSTR_SCHEDULER_ALLOW_STALE_FALLBACK=` cannot
+/// re-enable the hazard.
+pub const KTSTR_SCHEDULER_ALLOW_STALE_FALLBACK_ENV: &str =
+    "KTSTR_SCHEDULER_ALLOW_STALE_FALLBACK";
 
 /// Build a cargo binary package and return its output path.
 ///

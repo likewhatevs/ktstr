@@ -1412,7 +1412,7 @@ fn result_to_exit_code_inconclusive_maps_to_distinct_code() {
 fn final_outcome_projects_to_result_to_exit_code() {
     use crate::assert::{AssertDetail, AssertResult, DetailKind};
     type ResultBuilder = fn() -> Result<AssertResult>;
-    let cases: [(ResultBuilder, &str); 7] = [
+    let cases: [(ResultBuilder, &str); 8] = [
         (|| Ok(AssertResult::pass()), "ok_pass"),
         (|| Ok(AssertResult::skip("skip reason")), "ok_skip"),
         (
@@ -1442,6 +1442,13 @@ fn final_outcome_projects_to_result_to_exit_code() {
                     .context(crate::test_support::eval::ScxBpfErrorMatcherMismatch))
             },
             "err_scx_bpf_matcher_mismatch",
+        ),
+        (
+            || {
+                Err(anyhow::anyhow!("f")
+                    .context(crate::test_support::eval::SchedulerBuildRefused))
+            },
+            "err_scheduler_build_refused",
         ),
     ];
     for (build, label) in cases {
@@ -2064,6 +2071,50 @@ fn result_to_exit_code_matcher_mismatch_through_nested_context_routes_to_fail() 
         result_to_exit_code(err, true, false),
         EXIT_FAIL,
         "nested ScxBpfErrorMatcherMismatch must still be downcast by anyhow's context-aware downcast_ref"
+    );
+}
+
+// -- result_to_exit_code: SchedulerBuildRefused (expect_err arm) tests --
+//
+// A failed orchestrated scheduler build the resolver refused to serve stale
+// carries the SchedulerBuildRefused marker; like the other host-side
+// hard-fail markers it must force EXIT_FAIL even under expect_err — a broken
+// build must never masquerade as the expect_err test's expected failure.
+
+/// `expect_err = true` + Err WITH the SchedulerBuildRefused marker → the
+/// dispatch guard forces [`EXIT_FAIL`], refusing the expect_err inversion.
+/// Without the marker (the bug this fixes) a build refusal would be a plain
+/// Err and the expect_err arm would invert it to a false PASS.
+#[test]
+fn result_to_exit_code_expect_err_with_scheduler_build_refused_routes_to_fail() {
+    let err: Result<crate::assert::AssertResult> = Err(anyhow::anyhow!(
+        "cargo build -p scx_x failed"
+    )
+    .context(crate::test_support::eval::SchedulerBuildRefused));
+    assert_eq!(
+        result_to_exit_code(err, true, false),
+        EXIT_FAIL,
+        "expect_err must NOT invert a SchedulerBuildRefused failure to PASS"
+    );
+}
+
+/// Production-typical shape: the resolver attaches the marker INNER then wraps
+/// the operator-facing refusal message OUTER
+/// (`e.context(SchedulerBuildRefused).context("... refusing ...")`), so the
+/// marker is nested. anyhow's context-aware `downcast_ref` still finds it →
+/// [`EXIT_FAIL`] under expect_err.
+#[test]
+fn result_to_exit_code_scheduler_build_refused_through_nested_context_routes_to_fail() {
+    let err: Result<crate::assert::AssertResult> = Err(anyhow::anyhow!(
+        "cargo build -p scx_x failed"
+    )
+    .context(crate::test_support::eval::SchedulerBuildRefused)
+    .context("ktstr_test: refusing to validate against a stale binary")
+    .context("dispatch wrapper"));
+    assert_eq!(
+        result_to_exit_code(err, true, false),
+        EXIT_FAIL,
+        "nested SchedulerBuildRefused must still be downcast and force EXIT_FAIL"
     );
 }
 

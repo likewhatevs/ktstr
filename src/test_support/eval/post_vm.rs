@@ -136,6 +136,40 @@ impl std::fmt::Display for ScxBpfErrorMatcherMismatch {
 
 impl std::error::Error for ScxBpfErrorMatcherMismatch {}
 
+/// Marker error type attached as `anyhow::Context` to the `Err`
+/// `resolve_scheduler` returns when an orchestrated `cargo build -p
+/// <sched>` (expected to succeed in the non-cargo-test `Discover` path)
+/// FAILED and the operator did not set
+/// `KTSTR_SCHEDULER_ALLOW_STALE_FALLBACK` — the resolver refuses to
+/// validate the test against a possibly-stale pre-built binary.
+///
+/// Dispatch (`crate::test_support::dispatch`) downcasts the error chain
+/// for this marker and forces a hard FAIL EVEN under `expect_err = true`.
+/// The semantic boundary mirrors [`PostVmAssertionFailure`]: `expect_err`
+/// inverts a GUEST-side expected failure, but a build-infra failure is a
+/// HOST-side fault that must never masquerade as the expected guest
+/// failure — without the marker an `expect_err` test whose scheduler
+/// build broke would silently invert to PASS, re-creating the
+/// stale-validation hazard the refusal exists to eliminate. Same
+/// `anyhow::Context` attachment + `downcast_ref` chain-walk as the
+/// sibling markers; the dispatch guard sits with the other host-side
+/// hard-fail markers, before the `expect_err` inversion.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SchedulerBuildRefused;
+
+impl std::fmt::Display for SchedulerBuildRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "scheduler build refused — an orchestrated build expected to \
+             succeed failed; refusing to validate against a possibly-stale \
+             pre-built binary (expect_err inversion bypassed)"
+        )
+    }
+}
+
+impl std::error::Error for SchedulerBuildRefused {}
+
 /// Marker error type attached as `anyhow::Context` to the failure
 /// `Err` produced by `run_ktstr_test_inner_impl` when a host-side
 /// `post_vm` / `post_vm_unconditional` callback returned `Err`

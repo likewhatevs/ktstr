@@ -229,6 +229,22 @@ where
     Ok(out)
 }
 
+/// True when `KTSTR_SCHEDULER_ALLOW_STALE_FALLBACK` is set to a
+/// NON-EMPTY value — the knowing-operator opt-out that lets a failed
+/// orchestrated `cargo build -p <sched>` fall back to a pre-built
+/// sibling / `target/{debug,release}/` binary AS-IS instead of failing
+/// the test. Default (unset / empty) refuses the stale fallback so a
+/// build that fails for a new reason cannot silently validate against an
+/// old scheduler. Empty-string rejection mirrors
+/// [`crate::cargo_test_mode::cargo_test_mode_active`] so a stray
+/// `KTSTR_SCHEDULER_ALLOW_STALE_FALLBACK=` from a CI shell cannot
+/// re-enable the hazard.
+fn allow_stale_scheduler_fallback() -> bool {
+    std::env::var(crate::KTSTR_SCHEDULER_ALLOW_STALE_FALLBACK_ENV)
+        .map(|v| !v.is_empty())
+        .unwrap_or(false)
+}
+
 /// Resolve a scheduler binary from a `SchedulerSpec`.
 ///
 /// Returns the resolved path (if any) paired with the
@@ -250,8 +266,12 @@ where
 ///   `current_exe` ([`SiblingDir`](ResolveSource::SiblingDir)),
 ///   `target/debug/` ([`TargetDebug`](ResolveSource::TargetDebug)),
 ///   `target/release/` ([`TargetRelease`](ResolveSource::TargetRelease)),
-///   on-demand build ([`AutoBuilt`](ResolveSource::AutoBuilt)).
-///   Exhausting every branch is a hard error. The PATH lookup is
+///   on-demand build ([`AutoBuilt`](ResolveSource::AutoBuilt)). In the
+///   orchestrated (non-cargo-test) flow the on-demand build runs FIRST
+///   and a build FAILURE REFUSES (returns the error) rather than serving
+///   a stale pre-built binary, unless
+///   [`KTSTR_SCHEDULER_ALLOW_STALE_FALLBACK`](crate::KTSTR_SCHEDULER_ALLOW_STALE_FALLBACK_ENV)
+///   is set. Exhausting every branch is a hard error. The PATH lookup is
 ///   only enabled in cargo-test mode so the existing nextest /
 ///   `cargo ktstr test` discovery cascade remains canonical
 ///   (sibling-of-test-binary first) — pulling a system-wide
@@ -319,20 +339,49 @@ pub fn resolve_scheduler(spec: &SchedulerSpec) -> Result<(Option<PathBuf>, Resol
             // its build.rs) changed and is a fast no-op when
             // up-to-date, so an edited scheduler never runs stale. The
             // sibling / target-dir cascade below returns a pre-built
-            // binary AS-IS with no staleness check — which silently
-            // served a stale scheduler after a source edit. Fall
-            // through to that cascade only when the build cannot run
-            // (cargo or sources unavailable, e.g. a packaged standalone
-            // test binary). cargo-test-mode is excluded: it targets an
+            // binary AS-IS with no staleness check, so serving it after
+            // a build that was expected to succeed would silently
+            // validate the test against a stale scheduler. Therefore a
+            // build FAILURE here REFUSES by default — it returns the
+            // error, which propagates to a hard test failure on the
+            // result surface (not a swallowed eprintln). The cascade
+            // below is reached on this path ONLY when
+            // KTSTR_SCHEDULER_ALLOW_STALE_FALLBACK is set (the knowing-
+            // operator opt-out for a momentarily-broken cargo). build_*
+            // also errors when cargo is absent or no bin artifact is
+            // produced; the refusal covers all three — a run that cannot
+            // produce a fresh binary must not silently use a stale one.
+            // cargo-test-mode is excluded entirely: it targets an
             // installed scheduler (PATH lookup above) without a
-            // workspace build.
+            // workspace build, so its cascade is legitimate.
             if !crate::cargo_test_mode::cargo_test_mode_active() {
                 match crate::build_and_find_binary(name) {
                     Ok(path) => return Ok((Some(path), ResolveSource::AutoBuilt)),
-                    Err(e) => eprintln!(
-                        "ktstr_test: workspace build of scheduler '{name}' failed \
-                         ({e:#}); falling back to a pre-built binary if present"
-                    ),
+                    Err(e) => {
+                        if !allow_stale_scheduler_fallback() {
+                            // Attach the SchedulerBuildRefused marker (inner) so
+                            // dispatch forces a hard FAIL even under expect_err,
+                            // then the operator-facing message (outer, shown first
+                            // by {e:#}). build_and_find_binary's cargo-stderr stays
+                            // innermost in the chain.
+                            return Err(e
+                                .context(crate::test_support::eval::SchedulerBuildRefused)
+                                .context(format!(
+                                    "ktstr_test: workspace build of scheduler \
+                                     '{name}' failed; refusing to validate against \
+                                     a possibly-stale pre-built binary. Fix the \
+                                     build, or set \
+                                     KTSTR_SCHEDULER_ALLOW_STALE_FALLBACK=1 to fall \
+                                     back to a pre-built sibling/target-dir binary \
+                                     AS-IS."
+                                )));
+                        }
+                        eprintln!(
+                            "ktstr_test: workspace build of scheduler '{name}' \
+                             failed ({e:#}); KTSTR_SCHEDULER_ALLOW_STALE_FALLBACK \
+                             set — falling back to a pre-built binary if present"
+                        );
+                    }
                 }
             }
 
@@ -373,14 +422,21 @@ pub fn resolve_scheduler(spec: &SchedulerSpec) -> Result<(Option<PathBuf>, Resol
                 }
             }
 
-            // 5. Build the scheduler package on demand. Reached in
-            // cargo-test-mode (which skips the build-first step 1c) when
-            // the PATH / sibling / target-dir lookups all miss; in the
-            // non-cargo-test-mode flow step 1c already attempted the
-            // build, so this is a last-resort retry before bailing.
-            match crate::build_and_find_binary(name) {
-                Ok(path) => return Ok((Some(path), ResolveSource::AutoBuilt)),
-                Err(e) => eprintln!("ktstr_test: auto-build scheduler '{name}' failed: {e:#}"),
+            // 5. Build the scheduler package on demand — ONLY in
+            // cargo-test-mode, which skips the build-first step 1c, so this
+            // is its FIRST build attempt when the PATH / sibling / target-dir
+            // lookups all miss. The non-cargo-test flow already ran the build
+            // in step 1c (returning Ok, refusing on failure, or — under the
+            // opt-out — falling through here intending a PRE-BUILT binary), so
+            // re-running the build here would be redundant; skip straight to
+            // the bail.
+            if crate::cargo_test_mode::cargo_test_mode_active() {
+                match crate::build_and_find_binary(name) {
+                    Ok(path) => return Ok((Some(path), ResolveSource::AutoBuilt)),
+                    Err(e) => {
+                        eprintln!("ktstr_test: auto-build scheduler '{name}' failed: {e:#}")
+                    }
+                }
             }
 
             anyhow::bail!(

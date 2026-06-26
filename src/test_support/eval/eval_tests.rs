@@ -586,6 +586,77 @@ fn resolve_scheduler_discover_missing() {
     assert!(result.is_err());
 }
 
+/// Core fix: in the orchestrated (non-cargo-test) Discover path a
+/// failed `cargo build -p <name>` REFUSES — it returns the build error
+/// rather than silently falling through to a possibly-stale pre-built
+/// binary. Pinned at the seam: a non-package name makes
+/// `build_and_find_binary` error, and with the opt-out unset
+/// `resolve_scheduler` returns that error wrapped with the refusal
+/// context, proving it returned BEFORE the sibling/target-dir cascade.
+#[test]
+fn resolve_scheduler_discover_build_failure_refuses_stale_fallback() {
+    let _lock = lock_env();
+    let _no_global = EnvVarGuard::remove(crate::KTSTR_SCHEDULER_ENV);
+    let _no_cargo_test_mode = EnvVarGuard::remove(crate::KTSTR_CARGO_TEST_MODE_ENV);
+    let _no_optout = EnvVarGuard::remove(crate::KTSTR_SCHEDULER_ALLOW_STALE_FALLBACK_ENV);
+    let result = resolve_scheduler(&SchedulerSpec::Discover("__nonexistent_scheduler_pkg__"));
+    let rendered = format!(
+        "{:#}",
+        result.expect_err("a failed build must refuse, not serve a stale binary")
+    );
+    assert!(
+        rendered.contains("refusing")
+            && rendered.contains("KTSTR_SCHEDULER_ALLOW_STALE_FALLBACK"),
+        "the refusal error must name the hazard + the opt-out; got: {rendered}"
+    );
+}
+
+/// Escape hatch: with `KTSTR_SCHEDULER_ALLOW_STALE_FALLBACK` set a
+/// failed orchestrated build no longer returns early — control falls
+/// through to the sibling/target-dir cascade, which (for a bogus name
+/// with no env/sibling/target hit) bails with the cascade-exhaustion
+/// "not found" error, NOT the refusal. Pins that the opt-out is wired
+/// and the legacy fallthrough still works.
+#[test]
+fn resolve_scheduler_discover_build_failure_env_optout_falls_through() {
+    let _lock = lock_env();
+    let _no_global = EnvVarGuard::remove(crate::KTSTR_SCHEDULER_ENV);
+    let _no_cargo_test_mode = EnvVarGuard::remove(crate::KTSTR_CARGO_TEST_MODE_ENV);
+    let _optout = EnvVarGuard::set(crate::KTSTR_SCHEDULER_ALLOW_STALE_FALLBACK_ENV, "1");
+    let result = resolve_scheduler(&SchedulerSpec::Discover("__nonexistent_scheduler_pkg__"));
+    let rendered = format!(
+        "{:#}",
+        result.expect_err("a bogus name still bails after the cascade")
+    );
+    assert!(
+        rendered.contains("not found") && !rendered.contains("refusing"),
+        "with the opt-out set the error must be the cascade-exhaustion bail, \
+         not the refusal; got: {rendered}"
+    );
+}
+
+/// Empty-string rejection: `KTSTR_SCHEDULER_ALLOW_STALE_FALLBACK=""`
+/// (a stray CI pass-through) must NOT enable the stale fallback — the
+/// presence-only contract treats empty as unset, so a failed build still
+/// refuses. Mirrors `cargo_test_mode_active`'s empty-string rejection.
+#[test]
+fn resolve_scheduler_allow_stale_fallback_empty_string_rejected() {
+    let _lock = lock_env();
+    let _no_global = EnvVarGuard::remove(crate::KTSTR_SCHEDULER_ENV);
+    let _no_cargo_test_mode = EnvVarGuard::remove(crate::KTSTR_CARGO_TEST_MODE_ENV);
+    let _empty = EnvVarGuard::set(crate::KTSTR_SCHEDULER_ALLOW_STALE_FALLBACK_ENV, "");
+    let result = resolve_scheduler(&SchedulerSpec::Discover("__nonexistent_scheduler_pkg__"));
+    let rendered = format!(
+        "{:#}",
+        result.expect_err("empty opt-out must still refuse")
+    );
+    assert!(
+        rendered.contains("refusing"),
+        "empty-string KTSTR_SCHEDULER_ALLOW_STALE_FALLBACK must NOT enable the \
+         stale fallback (presence-only contract); got: {rendered}"
+    );
+}
+
 #[test]
 fn resolve_scheduler_discover_via_env() {
     let _lock = lock_env();
@@ -744,15 +815,14 @@ fn resolve_scheduler_discover_path_lookup_under_cargo_test_mode() {
 }
 
 /// Without `KTSTR_CARGO_TEST_MODE`, the `$PATH` lookup branch is
-/// inert: the cascade falls through to the sibling-dir / target-
-/// dir / build path even when the requested binary IS on PATH.
+/// inert: the orchestrated path runs the workspace build
+/// FIRST, so a bogus package name errors there (the build fails and
+/// is refused, `KTSTR_SCHEDULER_ALLOW_STALE_FALLBACK` unset) before
+/// the `$PATH` / sibling / target-dir branches are ever consulted.
 /// Pins the production-path contract: gauntlet runs land on the
-/// workspace-built scheduler revision, never a system-wide
-/// install. The test stages a stub on PATH but expects the
-/// resolution to NOT pick it up — instead it should bail with
-/// the "not found" error from the cascade exhaustion (or hit
-/// some other branch, e.g. `target/debug/`, that does not match
-/// the staged stub's name).
+/// workspace-built scheduler revision, never a system-wide install.
+/// The test stages a stub on PATH but expects the resolution to NOT
+/// pick it up (never report `PathLookup`) — it errors instead.
 #[test]
 fn resolve_scheduler_discover_path_lookup_inert_without_cargo_test_mode() {
     use std::os::unix::fs::PermissionsExt;
@@ -766,19 +836,20 @@ fn resolve_scheduler_discover_path_lookup_inert_without_cargo_test_mode() {
     perms.set_mode(0o755);
     std::fs::set_permissions(&bin_path, perms).expect("chmod 0755");
     let _path_env = EnvVarGuard::set("PATH", dir.path());
-    // Without the cargo-test-mode flag the cascade falls
-    // through to the sibling-dir / target-dir / build branches,
-    // none of which know about `__test_inert_path_scheduler__`,
-    // so the call must error rather than report PathLookup.
+    // Without the cargo-test-mode flag the orchestrated
+    // workspace build runs first; `cargo build -p
+    // __test_inert_path_scheduler__` fails (bogus package) and is
+    // refused (opt-out unset), so the call errors at the build step — before
+    // the $PATH / sibling / target-dir branches — never PathLookup.
     let result = resolve_scheduler(&SchedulerSpec::Discover("__test_inert_path_scheduler__"));
     match result {
         Ok((_, source)) => {
             panic!("PATH lookup must be inert without KTSTR_CARGO_TEST_MODE; got source {source:?}",)
         }
         Err(_) => {
-            // Expected: cascade exhausted because the staged
-            // stub is on PATH but not in any of the production
-            // branches the cascade walks.
+            // Expected: the workspace build of the bogus package failed
+            // and was refused, so the $PATH lookup never ran. The
+            // staged stub on PATH is deliberately ignored.
         }
     }
 }
