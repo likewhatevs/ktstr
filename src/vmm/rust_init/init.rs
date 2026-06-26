@@ -509,11 +509,11 @@ pub(crate) fn ktstr_guest_init() -> ! {
     exec_shell_script("/sched_enable");
     // Plumb the probe pipeline's `stop` + `output_done` into
     // `start_scheduler` so the early-bail paths (Died / not
-    // attached / spawn error) can drain probe JSON to COM2 before
-    // calling `force_reboot()`. Without the drain, every path that
-    // crashes the scheduler before the test dispatches loses its
-    // probe payload to the reboot — exactly the diagnostic the
-    // probes were attached to capture.
+    // attached / spawn error) can drain probe JSON over the bulk port
+    // (via the stdout forwarder) before calling `force_reboot()`.
+    // Without the drain, every path that crashes the scheduler before
+    // the test dispatches loses its probe payload to the reboot —
+    // exactly the diagnostic the probes were attached to capture.
     let probe_drain = probe_phase_a.as_ref().map(|pa| ProbeDrain {
         stop: pa.pipeline.stop.clone(),
         output_done: pa.pipeline.output_done.clone(),
@@ -524,7 +524,16 @@ pub(crate) fn ktstr_guest_init() -> ! {
     // Phase 4: hvc0 polling + trace pipe (background threads).
     let _s_phase4 = tracing::debug_span!("phase4_vc_poll").entered();
     let (trace_stop, trace_handle) = start_trace_pipe();
-    let vc_poll_stop = start_hvc0_poll(trace_stop.clone());
+    // Thread the probe pipeline's `stop` + `output_done` into the hvc0 poll
+    // loop so its graceful-shutdown (watchdog soft-shutdown) handler can drain
+    // captured crash-arg probe output (emitted over the virtio bulk port via
+    // the stdout forwarder) before the guest reboots — the only drain site for
+    // a repro scenario that hangs inside the test function.
+    let hvc0_probe_drain = probe_phase_a.as_ref().map(|pa| ProbeDrain {
+        stop: pa.pipeline.stop.clone(),
+        output_done: pa.pipeline.output_done.clone(),
+    });
+    let vc_poll_stop = start_hvc0_poll(trace_stop.clone(), hvc0_probe_drain);
     drop(_s_phase4);
 
     // Phase 4b: Scheduler death monitor.
@@ -532,8 +541,11 @@ pub(crate) fn ktstr_guest_init() -> ! {
     // the test, the thread writes MSG_TYPE_SCHED_EXIT via bulk port so the host
     // can detect early death without waiting for the watchdog.
     //
-    // When probes are active, suppress COM2 log dump to avoid
-    // interleaving with probe JSON output on the same serial port.
+    // When probes are active, suppress the sched-exit SCHED_EXIT signal
+    // and the bulk-port scheduler-log dump: the probe pipeline handles
+    // crash detection (tp_btf/sched_ext_exit) and the VM must stay alive
+    // for the probe thread to emit its payload. (The `suppress_com2`
+    // name is legacy from the pre-bulk-port-migration COM2 dump path.)
     let suppress_com2 = Arc::new(AtomicBool::new(probes_active));
     let probe_output_done = probe_phase_a
         .as_ref()

@@ -282,20 +282,25 @@ pub(crate) fn poll_startup(
 
 /// Probe-pipeline drain handles passed to [`start_scheduler`] so the
 /// early-bail paths (scheduler Died, not Attached, spawn Err) can
-/// flush probe output to COM2 before calling `force_reboot()`. The
-/// success path's drain runs in [`start_sched_exit_monitor`]
-/// instead — it sees the scheduler exit notification and waits on
-/// `output_done` there.
+/// flush probe output before calling `force_reboot()`, and to the hvc0
+/// graceful-shutdown handler so it can drain on the watchdog
+/// soft-shutdown path. The success path's drain runs in
+/// [`start_sched_exit_monitor`] instead — it sees the scheduler exit
+/// notification and waits on `output_done` there. The payload travels
+/// the virtio bulk port (the probe thread `println!`s it to stdout,
+/// which `redirect_stdio_to_bulk_port` ships over the bulk port), NOT
+/// COM2; the host recovers it when it drains that port.
 pub(crate) struct ProbeDrain {
     /// Probe-thread stop request. Setting this wakes the probe
     /// thread out of its ring-buffer poll loop; the thread then
     /// emits its payload and sets `output_done`.
     pub(crate) stop: Arc<AtomicBool>,
-    /// One-shot signal: set by the probe thread after writing
-    /// `PROBE_PAYLOAD_END` to COM2. Waited on event-driven; the
-    /// outer VM wall-clock timeout is the only safety net for a
-    /// hung probe (per the queue-management policy: don't add
-    /// arbitrary local timeouts when an event source exists).
+    /// One-shot signal: set by the probe thread after `println!`ing
+    /// `PROBE_OUTPUT_END` (the payload goes to stdout → the bulk-port
+    /// forwarder, not COM2). Waited on event-driven on the early-bail
+    /// paths, where the outer VM wall-clock timeout is the only safety
+    /// net for a hung probe; the hvc0 shutdown drain wraps it in a
+    /// bounded wait instead (the watchdog is the net there).
     pub(crate) output_done: Arc<crate::sync::Latch>,
 }
 
@@ -303,7 +308,8 @@ pub(crate) struct ProbeDrain {
 /// `output_done`. Called from each early-bail path in
 /// [`start_scheduler`] before `force_reboot()` so the probe
 /// payload (or the diagnostic-only payload the probe thread emits
-/// on a forced stop) reaches COM2's host-side capture buffer.
+/// on a forced stop) reaches the host — emitted over the virtio bulk
+/// port by the stdout forwarder, recovered when the host drains it.
 ///
 /// `drain` is `None` when no probe stack was supplied — every
 /// caller is a no-op in that case.
@@ -662,8 +668,8 @@ pub(crate) fn spawn_scheduler_from_paths(
                 "",
             );
             crate::vmm::guest_comms::send_exit(1);
-            // Drain the probe pipeline before reboot so
-            // PROBE_OUTPUT_END hits COM2 ahead of force_reboot.
+            // Drain the probe pipeline before reboot so PROBE_OUTPUT_END
+            // is emitted over the bulk port ahead of force_reboot.
             // No-op when no probe stack was supplied.
             drain_probe_pipeline(probe_drain.as_ref());
             force_reboot();
