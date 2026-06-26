@@ -301,6 +301,216 @@ fn phase_cgroup_schbench_serde_roundtrips() {
     assert_eq!(s.loop_count, 42);
     assert_eq!(s.msg_pcount, 5);
     assert_eq!(s.worker_pcount, 3);
+
+    // Postcard roundtrip (the bulk-TLV port format — NON-self-describing /
+    // POSITIONAL): pins that the derived `metrics` field (EMPTY here) is ALWAYS
+    // serialized. A `skip_serializing_if` on it would omit the empty map and desync
+    // the positional byte stream, corrupting the `schbench` field that follows it in
+    // the struct — exactly the regression this catches at the unit level (the
+    // integration path that first surfaced it is phase_buckets_derives_*).
+    let bytes = postcard::to_stdvec(&pc).expect("serialize postcard");
+    let back2: PhaseCgroupStats = postcard::from_bytes(&bytes).expect("deserialize postcard");
+    assert_eq!(back2, pc, "postcard-roundtrips with an EMPTY metrics map");
+    assert!(
+        back2.schbench.is_some(),
+        "schbench survives the postcard roundtrip (no empty-metrics-field desync)"
+    );
+    // A populated per-cgroup `metrics` map also postcard-roundtrips.
+    let mut pc2 = pc.clone();
+    pc2.metrics.insert("schbench_loop_count".to_string(), 42.0);
+    pc2.metrics
+        .insert("wakeup_p99_latency_us".to_string(), 10.0);
+    let bytes2 = postcard::to_stdvec(&pc2).expect("serialize postcard");
+    let back3: PhaseCgroupStats = postcard::from_bytes(&bytes2).expect("deserialize postcard");
+    assert_eq!(
+        back3, pc2,
+        "populated per-cgroup metrics postcard-roundtrip"
+    );
+    assert_eq!(back3.metrics.get("schbench_loop_count"), Some(&42.0));
+    assert!(
+        back3.schbench.is_some(),
+        "schbench survives with a populated metrics map"
+    );
+}
+
+#[test]
+fn derive_populates_per_cgroup_metrics_and_pooled_matches_repool() {
+    // The per-cgroup exposure: N cgroups -> N queryable metric sets, each from
+    // its OWN carrier, AND the pooled bucket.metrics == the cross-cgroup re-pool.
+    // Two cgroups with distinct loop_counts (10, 30): per-cgroup reads 10 / 30, the
+    // pooled aggregate reads 40 (the sum) — both produced by the SAME reducer.
+    let mut bucket = PhaseBucket::default();
+    bucket.per_cgroup.insert(
+        "cg_a".to_string(),
+        PhaseCgroupStats {
+            schbench: Some(sps(10, 5, 5)),
+            ..Default::default()
+        },
+    );
+    bucket.per_cgroup.insert(
+        "cg_b".to_string(),
+        PhaseCgroupStats {
+            schbench: Some(sps(30, 3, 3)),
+            ..Default::default()
+        },
+    );
+    derive_schbench_phase_metrics(std::slice::from_mut(&mut bucket));
+    // Per-cgroup: each carrier's OWN loop_count, independently queryable.
+    assert_eq!(
+        bucket.per_cgroup["cg_a"].get("schbench_loop_count"),
+        Some(10.0)
+    );
+    assert_eq!(
+        bucket.per_cgroup["cg_b"].get("schbench_loop_count"),
+        Some(30.0)
+    );
+    // Pooled aggregate == cross-cgroup re-pool (sum): 10 + 30 = 40, unchanged from
+    // the pre-refactor pooled-only behavior (so the refactor preserved the pooled set).
+    assert_eq!(bucket.get("schbench_loop_count"), Some(40.0));
+    // The per-cgroup wakeup percentile is from THAT cgroup's histogram (both carry
+    // wakeup_hist -> p99 = 10µs), as queryable as the pooled value.
+    assert_eq!(
+        bucket.per_cgroup["cg_a"].get("wakeup_p99_latency_us"),
+        Some(10.0)
+    );
+    assert_eq!(bucket.get("wakeup_p99_latency_us"), Some(10.0));
+    // expect_metric resolves a present key.
+    assert_eq!(
+        bucket.per_cgroup["cg_b"].expect_metric("schbench_loop_count"),
+        30.0
+    );
+    // A non-schbench carrier (no schbench data) gets no per-cgroup schbench keys.
+    let mut bucket2 = PhaseBucket::default();
+    bucket2
+        .per_cgroup
+        .insert("cg".to_string(), PhaseCgroupStats::default());
+    derive_schbench_phase_metrics(std::slice::from_mut(&mut bucket2));
+    assert!(
+        bucket2.per_cgroup["cg"]
+            .get("schbench_loop_count")
+            .is_none()
+    );
+}
+
+#[test]
+fn derive_mixed_schbench_and_plain_cgroups_pool_undiluted() {
+    // A phase mixing ONE schbench carrier + ONE plain (non-schbench) carrier: the
+    // pooled bucket.metrics equals the schbench carrier's set (the plain carrier does
+    // NOT dilute the pool with a phantom zero-loop_count — the loop seeds `pooled`
+    // only from schbench.is_some() carriers), and the plain carrier's pc.metrics stays
+    // empty.
+    let mut bucket = PhaseBucket::default();
+    bucket.per_cgroup.insert(
+        "cg_sch".to_string(),
+        PhaseCgroupStats {
+            schbench: Some(sps(40, 5, 5)),
+            ..Default::default()
+        },
+    );
+    bucket
+        .per_cgroup
+        .insert("cg_plain".to_string(), PhaseCgroupStats::default());
+    derive_schbench_phase_metrics(std::slice::from_mut(&mut bucket));
+    assert_eq!(
+        bucket.get("schbench_loop_count"),
+        Some(40.0),
+        "pool is the schbench carrier alone, undiluted by the plain cgroup"
+    );
+    assert_eq!(
+        bucket.per_cgroup["cg_sch"].get("schbench_loop_count"),
+        Some(40.0)
+    );
+    assert!(
+        bucket.per_cgroup["cg_plain"]
+            .get("schbench_loop_count")
+            .is_none(),
+        "the plain (non-schbench) carrier gets no schbench keys"
+    );
+}
+
+#[test]
+fn derive_pooled_percentile_is_the_combined_histogram() {
+    // The load-bearing re-pool claim: a pooled percentile is the percentile of the
+    // COMBINED (bucket-added) histogram, NOT an average or single-source of the
+    // per-cgroup percentiles. cg_a = 50×10µs + 50×100µs, cg_b = 50×1000µs +
+    // 50×10000µs -> the pooled p50 lands in the 100µs bucket (the combined median),
+    // strictly BETWEEN cg_a's own p50 (10µs bucket) and cg_b's (1000µs bucket) — a
+    // value present in NEITHER constituent.
+    let mk = |a: u32, b: u32| {
+        let mut s = sps(1, 5, 5);
+        let mut w = PlatStats::default();
+        for _ in 0..50 {
+            w.add_lat(a);
+        }
+        for _ in 0..50 {
+            w.add_lat(b);
+        }
+        s.wakeup = w;
+        s
+    };
+    let mut bucket = PhaseBucket::default();
+    bucket.per_cgroup.insert(
+        "cg_a".to_string(),
+        PhaseCgroupStats {
+            schbench: Some(mk(10, 100)),
+            ..Default::default()
+        },
+    );
+    bucket.per_cgroup.insert(
+        "cg_b".to_string(),
+        PhaseCgroupStats {
+            schbench: Some(mk(1_000, 10_000)),
+            ..Default::default()
+        },
+    );
+    derive_schbench_phase_metrics(std::slice::from_mut(&mut bucket));
+    let pooled_p50 = bucket.get("wakeup_p50_latency_us").expect("pooled p50");
+    let a_p50 = bucket.per_cgroup["cg_a"]
+        .get("wakeup_p50_latency_us")
+        .expect("cg_a p50");
+    let b_p50 = bucket.per_cgroup["cg_b"]
+        .get("wakeup_p50_latency_us")
+        .expect("cg_b p50");
+    assert!(
+        a_p50 < pooled_p50 && pooled_p50 < b_p50,
+        "pooled p50 {pooled_p50} must be strictly between cg_a {a_p50} and cg_b {b_p50} \
+         (the combined-histogram median, not a per-cgroup value or an average)"
+    );
+}
+
+#[test]
+fn derive_per_cgroup_absent_discipline() {
+    // The ABSENT discipline holds on the PER-CGROUP map (not only the pooled map): an
+    // empty request histogram + worker_pcount 0 -> those keys absent on pc.metrics,
+    // while wakeup + loop_count are present (None vs a false 0).
+    let mut bucket = PhaseBucket::default();
+    bucket.per_cgroup.insert(
+        "cg".to_string(),
+        PhaseCgroupStats {
+            schbench: Some(sps(7, 5, 0)), // worker_pcount 0; request + rps empty
+            ..Default::default()
+        },
+    );
+    derive_schbench_phase_metrics(std::slice::from_mut(&mut bucket));
+    let pc = &bucket.per_cgroup["cg"];
+    assert_eq!(
+        pc.get("wakeup_p99_latency_us"),
+        Some(10.0),
+        "wakeup present per-cgroup"
+    );
+    assert_eq!(pc.get("schbench_loop_count"), Some(7.0));
+    assert!(
+        pc.get("request_p99_latency_us").is_none(),
+        "empty request -> absent per-cgroup"
+    );
+    assert!(
+        pc.get("rps_p20").is_none(),
+        "empty rps -> absent per-cgroup"
+    );
+    assert!(
+        pc.get("sched_delay_worker_us").is_none(),
+        "worker_pcount 0 -> absent per-cgroup (no false 0)"
+    );
 }
 
 #[test]

@@ -116,6 +116,16 @@ impl ScenarioStats {
     /// (c) `metric` is not a registered metric name (typo case —
     ///     [`Self::is_known_metric`] surfaces it).
     ///
+    /// Two stores are checked: [`PhaseBucket::metrics`] (via
+    /// [`PhaseBucket::get`]) and, failing that, the cross-cgroup phase
+    /// SUM of a per-cgroup Counter ([`PhaseBucket::cgroup_counter_total`])
+    /// for `"total_migrations"` / `"total_iterations"` — registered
+    /// `Counter`s with no per-sample source, so they live ONLY in the
+    /// per-cgroup carriers; without this fallback the pooled lookup
+    /// returned a silent `None` while the per-cgroup
+    /// [`Self::phase_cgroup_metric`] surfaced the value. Symmetric with
+    /// [`crate::vmm::VmResult::phase_metric`].
+    ///
     /// Sentinel-free: `Some(0.0)` means the reducer produced a
     /// real zero from finite samples, NOT "missing data". See
     /// [`PhaseBucket::metrics`] for the registry source. When
@@ -128,7 +138,8 @@ impl ScenarioStats {
     /// first Step. Use [`Self::step_metric`] for the 0-indexed
     /// scenario-Step lookup.
     pub fn phase_metric(&self, step_index: u16, metric: &str) -> Option<f64> {
-        self.phase(step_index).and_then(|p| p.get(metric))
+        self.phase(step_index)
+            .and_then(|p| p.get(metric).or_else(|| p.cgroup_counter_total(metric)))
     }
 
     /// Cross-cgroup balance: the ratio of the busiest cell's per-worker
@@ -181,7 +192,37 @@ impl ScenarioStats {
     /// for the None-cause taxonomy and
     /// [`Self::is_known_metric`] for typo-debugging.
     pub fn step_metric(&self, scenario_step_idx: u16, metric: &str) -> Option<f64> {
-        self.step(scenario_step_idx).and_then(|p| p.get(metric))
+        self.step(scenario_step_idx)
+            .and_then(|p| p.get(metric).or_else(|| p.cgroup_counter_total(metric)))
+    }
+
+    /// Per-cgroup analog of [`Self::phase_metric`] (same 1-indexed Step encoding:
+    /// `step_index = 0` is BASELINE): look up `metric` for a named `cgroup` in a
+    /// phase, via that cgroup's per-phase carrier ([`PhaseCgroupStats::get`]),
+    /// falling back to [`PhaseCgroupStats::cgroup_counter`] for the per-cgroup
+    /// Counters `total_migrations`/`total_iterations`. `None` when the phase has no bucket, no
+    /// carrier for `cgroup`, the carrier carried no finite value for the metric, OR
+    /// the metric name is a typo (an unregistered name yields `None` — disambiguate
+    /// with [`Self::is_known_metric`], same as [`Self::phase_metric`]). The
+    /// N-cgroups-to-N-queryable-sets surface on the AssertResult-holding path (the
+    /// in-VM `post_vm` path uses [`crate::vmm::VmResult::phase_cgroup_metric`]).
+    pub fn phase_cgroup_metric(&self, step_index: u16, cgroup: &str, metric: &str) -> Option<f64> {
+        self.phase(step_index)
+            .and_then(|p| p.per_cgroup.get(cgroup))
+            .and_then(|pc| pc.get(metric).or_else(|| pc.cgroup_counter(metric)))
+    }
+
+    /// Per-cgroup analog of [`Self::step_metric`] (0-indexed scenario Step). See
+    /// [`Self::phase_cgroup_metric`] for the None-cause taxonomy.
+    pub fn step_cgroup_metric(
+        &self,
+        scenario_step_idx: u16,
+        cgroup: &str,
+        metric: &str,
+    ) -> Option<f64> {
+        self.step(scenario_step_idx)
+            .and_then(|p| p.per_cgroup.get(cgroup))
+            .and_then(|pc| pc.get(metric).or_else(|| pc.cgroup_counter(metric)))
     }
 
     /// True when `name` matches a registered metric (see
@@ -1134,6 +1175,52 @@ pub fn populate_run_ext_metrics(
 /// Idempotent (overwrites the keys), so callers that rebuild buckets per call
 /// (e.g. `VmResult::phase_buckets`) may re-run it freely.
 pub(crate) fn derive_schbench_phase_metrics(phases: &mut [PhaseBucket]) {
+    use crate::workload::schbench::run::SchbenchPhaseStats;
+
+    for bucket in phases.iter_mut() {
+        // Derive the schbench scalars BOTH per cgroup (into pc.metrics — the
+        // per-cgroup set: N cgroups -> N queryable sets) AND pooled across the
+        // phase's cgroups (into bucket.metrics — the aggregate). Both go through the
+        // SAME reducer (write_schbench_scalars) from the SAME carriers, so the
+        // pooled set is the cross-cgroup re-pool of the per-cgroup carriers (a
+        // percentile re-derives from the pooled histogram via PlatStats::combine =
+        // bucket-count add, never averaged), and pooled == cross-cgroup re-pool.
+        let mut pooled: Option<SchbenchPhaseStats> = None;
+        for pc in bucket.per_cgroup.values_mut() {
+            // Disjoint field borrows: `s` reads pc.schbench, the reducer writes
+            // pc.metrics — different fields, so the immutable + mutable borrows of
+            // `*pc` coexist.
+            if let Some(s) = pc.schbench.as_ref() {
+                write_schbench_scalars(s, &mut pc.metrics);
+                // `take()` completes the borrow before the reassignment in both arms.
+                match pooled.take() {
+                    Some(mut acc) => {
+                        acc.merge(s);
+                        pooled = Some(acc);
+                    }
+                    None => pooled = Some(s.clone()),
+                }
+            }
+        }
+        if let Some(p) = pooled {
+            write_schbench_scalars(&p, &mut bucket.metrics);
+        }
+    }
+}
+
+/// Write the per-phase schbench scalar metrics derived from ONE
+/// `SchbenchPhaseStats` (a single cgroup's carrier, or the cross-cgroup pool)
+/// into `out`, keyed by registry [`crate::stats::MetricDef`] name. The sole
+/// producer of these keys for both the per-cgroup ([`PhaseCgroupStats::metrics`])
+/// and pooled ([`PhaseBucket::metrics`]) maps — one derivation, no duplicated
+/// percentile / min/max / rps / sched-delay math. Each gate mirrors the carrier's
+/// ABSENT discipline: an empty histogram or a zero pcount emits no key (reads as
+/// missing, never a false 0); loop_count is always present (0 = a real measured
+/// no-cycles outcome).
+fn write_schbench_scalars(
+    p: &crate::workload::schbench::run::SchbenchPhaseStats,
+    out: &mut std::collections::BTreeMap<String, f64>,
+) {
     use crate::stats::{
         SCHBENCH_LOOP_COUNT, SCHBENCH_REQUEST_MAX_US, SCHBENCH_REQUEST_MIN_US,
         SCHBENCH_REQUEST_P50_US, SCHBENCH_REQUEST_P90_US, SCHBENCH_REQUEST_P99_US,
@@ -1144,121 +1231,73 @@ pub(crate) fn derive_schbench_phase_metrics(phases: &mut [PhaseBucket]) {
         SCHBENCH_WAKEUP_P999_US,
     };
     use crate::workload::schbench::plat::Pct;
-    use crate::workload::schbench::run::SchbenchPhaseStats;
 
-    for bucket in phases.iter_mut() {
-        // Pool schbench across the phase's cgroups: the flat metrics map holds
-        // ONE set, and a percentile must be re-derived from the pooled
-        // histogram (PlatStats::combine = bucket-count add), never averaged.
-        let mut pooled: Option<SchbenchPhaseStats> = None;
-        for pc in bucket.per_cgroup.values() {
-            if let Some(s) = pc.schbench.as_ref() {
-                // `take()` completes the &mut borrow before the match body, so
-                // the `pooled = ...` reassignment in both arms is borrow-clean.
-                match pooled.take() {
-                    Some(mut acc) => {
-                        acc.merge(s);
-                        pooled = Some(acc);
-                    }
-                    None => pooled = Some(s.clone()),
-                }
-            }
-        }
-        let Some(p) = pooled else {
-            continue;
-        };
-        if p.wakeup.sample_count() > 0 {
-            let q = p.wakeup.percentiles();
-            bucket.metrics.insert(
-                SCHBENCH_WAKEUP_P50_US.to_string(),
-                q.value_at(Pct::P50) as f64,
-            );
-            bucket.metrics.insert(
-                SCHBENCH_WAKEUP_P90_US.to_string(),
-                q.value_at(Pct::P90) as f64,
-            );
-            bucket.metrics.insert(
-                SCHBENCH_WAKEUP_P99_US.to_string(),
-                q.value_at(Pct::P99) as f64,
-            );
-            bucket.metrics.insert(
-                SCHBENCH_WAKEUP_P999_US.to_string(),
-                q.value_at(Pct::P999) as f64,
-            );
-            bucket
-                .metrics
-                .insert(SCHBENCH_WAKEUP_MIN_US.to_string(), q.min as f64);
-            bucket
-                .metrics
-                .insert(SCHBENCH_WAKEUP_MAX_US.to_string(), q.max as f64);
-        }
-        if p.request.sample_count() > 0 {
-            let q = p.request.percentiles();
-            bucket.metrics.insert(
-                SCHBENCH_REQUEST_P50_US.to_string(),
-                q.value_at(Pct::P50) as f64,
-            );
-            bucket.metrics.insert(
-                SCHBENCH_REQUEST_P90_US.to_string(),
-                q.value_at(Pct::P90) as f64,
-            );
-            bucket.metrics.insert(
-                SCHBENCH_REQUEST_P99_US.to_string(),
-                q.value_at(Pct::P99) as f64,
-            );
-            bucket.metrics.insert(
-                SCHBENCH_REQUEST_P999_US.to_string(),
-                q.value_at(Pct::P999) as f64,
-            );
-            bucket
-                .metrics
-                .insert(SCHBENCH_REQUEST_MIN_US.to_string(), q.min as f64);
-            bucket
-                .metrics
-                .insert(SCHBENCH_REQUEST_MAX_US.to_string(), q.max as f64);
-        }
-        // Per-phase achieved-RPS distribution (the control thread's per-second
-        // samples attributed to this epoch). Gated on sample_count()>0 so a phase
-        // shorter than the ~1s control cadence reads ABSENT, never rps=0 (the
-        // SchbenchPhaseStats.rps field doc + the cross-phase ruling). schbench's
-        // RPS table is PLIST_FOR_RPS = 20/50/90 (schbench.c:130) + min/max.
-        if p.rps.sample_count() > 0 {
-            let r = p.rps.percentiles();
-            bucket
-                .metrics
-                .insert(SCHBENCH_RPS_P20.to_string(), r.value_at(Pct::P20) as f64);
-            bucket
-                .metrics
-                .insert(SCHBENCH_RPS_P50.to_string(), r.value_at(Pct::P50) as f64);
-            bucket
-                .metrics
-                .insert(SCHBENCH_RPS_P90.to_string(), r.value_at(Pct::P90) as f64);
-            bucket
-                .metrics
-                .insert(SCHBENCH_RPS_MIN.to_string(), r.min as f64);
-            bucket
-                .metrics
-                .insert(SCHBENCH_RPS_MAX.to_string(), r.max as f64);
-        }
-        // Sample-weighted run-delay mean (Σrun_delay / Σpcount), ns→µs; ABSENT
-        // when pcount==0 (a never-scheduled class) so it reads as missing, not 0.
-        if p.msg_pcount > 0 {
-            let mean_us = p.msg_run_delay_ns as f64 / p.msg_pcount as f64 / 1000.0;
-            bucket
-                .metrics
-                .insert(SCHBENCH_SCHED_DELAY_MSG_US.to_string(), mean_us);
-        }
-        if p.worker_pcount > 0 {
-            let mean_us = p.worker_run_delay_ns as f64 / p.worker_pcount as f64 / 1000.0;
-            bucket
-                .metrics
-                .insert(SCHBENCH_SCHED_DELAY_WORKER_US.to_string(), mean_us);
-        }
-        // loop_count is always present for a schbench phase: 0 = no cycles ran
-        // (a real measured value; HigherBetter → worst), distinct from a
-        // non-schbench phase which has no schbench carrier at all (skipped above).
-        bucket
-            .metrics
-            .insert(SCHBENCH_LOOP_COUNT.to_string(), p.loop_count as f64);
+    if p.wakeup.sample_count() > 0 {
+        let q = p.wakeup.percentiles();
+        out.insert(
+            SCHBENCH_WAKEUP_P50_US.to_string(),
+            q.value_at(Pct::P50) as f64,
+        );
+        out.insert(
+            SCHBENCH_WAKEUP_P90_US.to_string(),
+            q.value_at(Pct::P90) as f64,
+        );
+        out.insert(
+            SCHBENCH_WAKEUP_P99_US.to_string(),
+            q.value_at(Pct::P99) as f64,
+        );
+        out.insert(
+            SCHBENCH_WAKEUP_P999_US.to_string(),
+            q.value_at(Pct::P999) as f64,
+        );
+        out.insert(SCHBENCH_WAKEUP_MIN_US.to_string(), q.min as f64);
+        out.insert(SCHBENCH_WAKEUP_MAX_US.to_string(), q.max as f64);
     }
+    if p.request.sample_count() > 0 {
+        let q = p.request.percentiles();
+        out.insert(
+            SCHBENCH_REQUEST_P50_US.to_string(),
+            q.value_at(Pct::P50) as f64,
+        );
+        out.insert(
+            SCHBENCH_REQUEST_P90_US.to_string(),
+            q.value_at(Pct::P90) as f64,
+        );
+        out.insert(
+            SCHBENCH_REQUEST_P99_US.to_string(),
+            q.value_at(Pct::P99) as f64,
+        );
+        out.insert(
+            SCHBENCH_REQUEST_P999_US.to_string(),
+            q.value_at(Pct::P999) as f64,
+        );
+        out.insert(SCHBENCH_REQUEST_MIN_US.to_string(), q.min as f64);
+        out.insert(SCHBENCH_REQUEST_MAX_US.to_string(), q.max as f64);
+    }
+    // Per-phase achieved-RPS distribution (the control thread's per-second samples
+    // attributed to this epoch). Gated on sample_count()>0 so a phase shorter than
+    // the ~1s control cadence reads ABSENT, never rps=0. schbench's RPS table is
+    // PLIST_FOR_RPS = 20/50/90 (schbench.c:130) + min/max.
+    if p.rps.sample_count() > 0 {
+        let r = p.rps.percentiles();
+        out.insert(SCHBENCH_RPS_P20.to_string(), r.value_at(Pct::P20) as f64);
+        out.insert(SCHBENCH_RPS_P50.to_string(), r.value_at(Pct::P50) as f64);
+        out.insert(SCHBENCH_RPS_P90.to_string(), r.value_at(Pct::P90) as f64);
+        out.insert(SCHBENCH_RPS_MIN.to_string(), r.min as f64);
+        out.insert(SCHBENCH_RPS_MAX.to_string(), r.max as f64);
+    }
+    // Sample-weighted run-delay mean (Σrun_delay / Σpcount), ns→µs; ABSENT when
+    // pcount==0 (a never-scheduled class) so it reads as missing, not 0.
+    if p.msg_pcount > 0 {
+        let mean_us = p.msg_run_delay_ns as f64 / p.msg_pcount as f64 / 1000.0;
+        out.insert(SCHBENCH_SCHED_DELAY_MSG_US.to_string(), mean_us);
+    }
+    if p.worker_pcount > 0 {
+        let mean_us = p.worker_run_delay_ns as f64 / p.worker_pcount as f64 / 1000.0;
+        out.insert(SCHBENCH_SCHED_DELAY_WORKER_US.to_string(), mean_us);
+    }
+    // loop_count is always present for a schbench carrier: 0 = no cycles ran (a real
+    // measured value; HigherBetter → worst), distinct from a non-schbench carrier
+    // which has no schbench data at all (the caller skips it).
+    out.insert(SCHBENCH_LOOP_COUNT.to_string(), p.loop_count as f64);
 }

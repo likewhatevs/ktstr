@@ -1661,6 +1661,252 @@ fn better_across_phases_orients_by_polarity_end_to_end() {
     );
 }
 
+/// per-cgroup query API end-to-end through the production VmResult path:
+/// VmResult::phase_cgroup_metric reads the NAMED cgroup (distinct per cgroup, not
+/// the pool), the counter fallback exposes total_migrations, the None taxonomy
+/// holds, and better_across_phases_cgroup orients per-cgroup (opposite outcomes for
+/// two cgroups proves it reads the named one, not the aggregate).
+#[test]
+fn phase_cgroup_metric_and_better_across_phases_cgroup_end_to_end() {
+    let _lock = lock_env();
+    let _sd = isolated_sidecar_dir();
+    let carrier = |us: u32, loops: u64, migs: u64| {
+        let mut wakeup = crate::workload::schbench::plat::PlatStats::default();
+        for _ in 0..100 {
+            wakeup.add_lat(us);
+        }
+        crate::assert::PhaseCgroupStats {
+            schbench: Some(crate::workload::schbench::run::SchbenchPhaseStats {
+                wakeup,
+                request: crate::workload::schbench::plat::PlatStats::default(),
+                rps: crate::workload::schbench::plat::PlatStats::default(),
+                msg_run_delay_ns: 0,
+                msg_pcount: 0,
+                worker_run_delay_ns: 0,
+                worker_pcount: 0,
+                loop_count: loops,
+            }),
+            total_migrations: migs,
+            ..Default::default()
+        }
+    };
+    // Two cgroups per phase with DISTINCT values, so a per-cgroup lookup is
+    // distinguishable from the pooled aggregate.
+    let phase_bucket = |idx: u16, a: (u32, u64, u64), b: (u32, u64, u64)| {
+        let mut pc = std::collections::BTreeMap::new();
+        pc.insert("cg_a".to_string(), carrier(a.0, a.1, a.2));
+        pc.insert("cg_b".to_string(), carrier(b.0, b.1, b.2));
+        crate::assert::PhaseBucket {
+            step_index: idx,
+            label: format!("Step[{}]", idx - 1),
+            start_ms: u64::MAX,
+            end_ms: 0,
+            sample_count: 0,
+            metrics: std::collections::BTreeMap::new(),
+            per_cgroup: pc,
+        }
+    };
+    let mut guest_assert = build_assert_result(true, vec![]);
+    // step 1 (scx): cg_a loop 200 / cg_b loop 80; step 2 (eevdf): cg_a loop 50 / cg_b loop 90.
+    guest_assert.stats.phases = vec![
+        phase_bucket(1, (10, 200, 7), (50, 80, 3)),
+        phase_bucket(2, (100, 50, 4), (40, 90, 9)),
+    ];
+    let result = crate::vmm::VmResult {
+        success: true,
+        guest_messages: Some(crate::vmm::host_comms::BulkDrainResult {
+            entries: vec![crate::test_support::test_helpers::assert_result_tlv_entry(
+                &guest_assert,
+            )],
+        }),
+        periodic_fired: 4,
+        periodic_target: 4,
+        ..crate::vmm::VmResult::test_fixture()
+    };
+    for &(i, step) in &[(0u64, 1u16), (1, 1), (2, 2), (3, 2)] {
+        result.snapshot_bridge.store_with_stats_and_step(
+            &format!("periodic_{i}"),
+            crate::monitor::dump::FailureDumpReport::default(),
+            None,
+            Some(i * 100),
+            None,
+            step,
+        );
+    }
+    let scx = crate::assert::Phase::step(0); // step_index 1
+    let eevdf = crate::assert::Phase::step(1); // step_index 2
+    // phase_cgroup_metric reads the NAMED cgroup, distinct per cgroup (not pooled).
+    assert_eq!(
+        result.phase_cgroup_metric(scx, "cg_a", "schbench_loop_count"),
+        Some(200.0)
+    );
+    assert_eq!(
+        result.phase_cgroup_metric(scx, "cg_b", "schbench_loop_count"),
+        Some(80.0)
+    );
+    // Counter fallback (carrier field, not a derived metric): cg_a step-1 migrations 7.
+    assert_eq!(
+        result.phase_cgroup_metric(scx, "cg_a", "total_migrations"),
+        Some(7.0)
+    );
+    // None taxonomy: missing cgroup, typo metric.
+    assert_eq!(
+        result.phase_cgroup_metric(scx, "missing", "schbench_loop_count"),
+        None
+    );
+    assert_eq!(
+        result.phase_cgroup_metric(scx, "cg_a", "not_a_metric"),
+        None
+    );
+    // better_across_phases_cgroup orients per-cgroup: cg_a scx loop 200 > eevdf 50
+    // (HigherBetter) -> better; the reverse framing -> Err.
+    let mut v = crate::assert::Verdict::new();
+    result
+        .better_across_phases_cgroup(&mut v, eevdf, scx, "cg_a", "schbench_loop_count")
+        .better_than();
+    assert!(
+        v.into_anyhow_or_log().is_ok(),
+        "cg_a scx loop 200 > eevdf 50 (HigherBetter)"
+    );
+    let mut v2 = crate::assert::Verdict::new();
+    result
+        .better_across_phases_cgroup(&mut v2, scx, eevdf, "cg_a", "schbench_loop_count")
+        .better_than();
+    assert!(
+        v2.into_anyhow_or_log().is_err(),
+        "cg_a eevdf loop 50 is not > scx 200"
+    );
+    // The per-cgroup orientation for cg_b is OPPOSITE (scx loop 80 < eevdf 90), so
+    // scx is NOT better for cg_b — proving the lookup reads cg_b, not the pool.
+    let mut v3 = crate::assert::Verdict::new();
+    result
+        .better_across_phases_cgroup(&mut v3, eevdf, scx, "cg_b", "schbench_loop_count")
+        .better_than();
+    assert!(
+        v3.into_anyhow_or_log().is_err(),
+        "cg_b scx loop 80 is not > eevdf 90 (distinct from cg_a)"
+    );
+}
+
+/// ScenarioStats per-cgroup lookups (the AssertResult-holding path):
+/// phase_cgroup_metric (1-indexed) / step_cgroup_metric (0-indexed) read a named
+/// cgroup's derived metric, fall back to the carrier Counters, and return None for
+/// a missing cgroup / typo metric / missing phase.
+#[test]
+fn scenario_stats_phase_cgroup_metric_and_counter_fallback() {
+    let _lock = lock_env();
+    let mut ar = build_assert_result(true, vec![]);
+    let mut metrics = std::collections::BTreeMap::new();
+    metrics.insert("schbench_loop_count".to_string(), 10.0);
+    let mut pc = std::collections::BTreeMap::new();
+    pc.insert(
+        "cg_a".to_string(),
+        crate::assert::PhaseCgroupStats {
+            metrics,
+            total_migrations: 7,
+            ..Default::default()
+        },
+    );
+    ar.stats.phases = vec![crate::assert::PhaseBucket {
+        step_index: 1,
+        label: "Step[0]".to_string(),
+        start_ms: u64::MAX,
+        end_ms: 0,
+        sample_count: 0,
+        metrics: std::collections::BTreeMap::new(),
+        per_cgroup: pc,
+    }];
+    // phase_cgroup_metric: 1-indexed (step_index 1 == Step[0]); reads the derived map.
+    assert_eq!(
+        ar.stats
+            .phase_cgroup_metric(1, "cg_a", "schbench_loop_count"),
+        Some(10.0)
+    );
+    // Counter fallback (carrier field, not derived).
+    assert_eq!(
+        ar.stats.phase_cgroup_metric(1, "cg_a", "total_migrations"),
+        Some(7.0)
+    );
+    // None: missing cgroup / typo metric / missing phase.
+    assert_eq!(
+        ar.stats
+            .phase_cgroup_metric(1, "missing", "schbench_loop_count"),
+        None
+    );
+    assert_eq!(
+        ar.stats.phase_cgroup_metric(1, "cg_a", "not_a_metric"),
+        None
+    );
+    assert_eq!(
+        ar.stats
+            .phase_cgroup_metric(9, "cg_a", "schbench_loop_count"),
+        None
+    );
+    // step_cgroup_metric: 0-indexed Step[0] == step_index 1.
+    assert_eq!(
+        ar.stats
+            .step_cgroup_metric(0, "cg_a", "schbench_loop_count"),
+        Some(10.0)
+    );
+}
+
+/// pooled-path counter symmetry (the AssertResult-holding path): ScenarioStats
+/// phase_metric / step_metric resolve the per-cgroup Counters total_migrations /
+/// total_iterations as the cross-cgroup SUM via PhaseBucket::cgroup_counter_total,
+/// symmetric with the per-cgroup phase_cgroup_metric (which surfaces each cgroup's
+/// own value) and with VmResult::phase_metric. These two Counters have read_sample
+/// == None, so they live ONLY in the per-cgroup carriers (never in
+/// PhaseBucket.metrics); without the fallback the pooled lookup returned a silent
+/// None while the per-cgroup sibling surfaced the value.
+#[test]
+fn scenario_stats_phase_metric_pools_per_cgroup_counters() {
+    let _lock = lock_env();
+    let mut ar = build_assert_result(true, vec![]);
+    let mut pc = std::collections::BTreeMap::new();
+    pc.insert(
+        "cg_a".to_string(),
+        crate::assert::PhaseCgroupStats {
+            total_migrations: 7,
+            total_iterations: 100,
+            ..Default::default()
+        },
+    );
+    pc.insert(
+        "cg_b".to_string(),
+        crate::assert::PhaseCgroupStats {
+            total_migrations: 4,
+            total_iterations: 50,
+            ..Default::default()
+        },
+    );
+    ar.stats.phases = vec![crate::assert::PhaseBucket {
+        step_index: 1,
+        label: "Step[0]".to_string(),
+        start_ms: u64::MAX,
+        end_ms: 0,
+        sample_count: 0,
+        metrics: std::collections::BTreeMap::new(),
+        per_cgroup: pc,
+    }];
+    // Pooled lookup resolves the carrier-only Counters as the cross-cgroup SUM.
+    assert_eq!(ar.stats.phase_metric(1, "total_migrations"), Some(11.0)); // 7 + 4
+    assert_eq!(ar.stats.phase_metric(1, "total_iterations"), Some(150.0)); // 100 + 50
+    // step_metric: 0-indexed Step[0] == step_index 1, same pooled-counter fallback.
+    assert_eq!(ar.stats.step_metric(0, "total_migrations"), Some(11.0));
+    // Per-cgroup sibling surfaces each cgroup's own value (the symmetry the fix restores).
+    assert_eq!(
+        ar.stats.phase_cgroup_metric(1, "cg_a", "total_migrations"),
+        Some(7.0)
+    );
+    assert_eq!(
+        ar.stats.phase_cgroup_metric(1, "cg_b", "total_migrations"),
+        Some(4.0)
+    );
+    // typo metric / missing phase -> None (sentinel-free).
+    assert_eq!(ar.stats.phase_metric(1, "not_a_metric"), None);
+    assert_eq!(ar.stats.phase_metric(9, "total_migrations"), None);
+}
+
 /// Eval REORDER wiring: on the GUEST-FAIL path the failure message's
 /// timeline is built from the POST-fold `check_result.stats.phases`
 /// (folded_timeline), so the per-cgroup sub-block AND orphan not-measured

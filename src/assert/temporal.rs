@@ -783,9 +783,11 @@ fn better_outcome(
 
 /// Cross-phase "is the candidate phase better than the baseline phase on this
 /// metric?" comparator, returned by
-/// [`crate::vmm::VmResult::better_across_phases`]. The polarity-aware sibling of
-/// [`CrossPhaseRatio`]: it reads two PER-PHASE scalars (via `phase_metric`, not
-/// a sampled series) and orients "better" from the metric's registry-declared
+/// [`crate::vmm::VmResult::better_across_phases`] (pooled aggregate) and
+/// [`crate::vmm::VmResult::better_across_phases_cgroup`] (one named cgroup). The
+/// polarity-aware sibling of [`CrossPhaseRatio`]: it reads two PER-PHASE scalars
+/// (via `phase_metric` / `phase_cgroup_metric`, not a sampled series) and orients
+/// "better" from the metric's registry-declared
 /// polarity, so the same call expresses "scheduler beats EEVDF" for a
 /// LowerBetter latency AND a HigherBetter throughput without the test author
 /// naming a direction. A missing/undirected/zero-baseline comparison is
@@ -799,13 +801,22 @@ pub struct BetterThanPhase<'v> {
     baseline_value: Option<f64>,
     candidate_value: Option<f64>,
     polarity: Option<crate::test_support::Polarity>,
+    /// Optional scope label (the cgroup name) for the per-cgroup producer
+    /// (`better_across_phases_cgroup`); `None` for the pooled producer. Surfaced in
+    /// the Inconclusive/Fail diagnostics so a per-cgroup outcome names its cgroup.
+    scope: Option<String>,
 }
 
 impl<'v> BetterThanPhase<'v> {
-    /// Build from already-resolved per-phase values + polarity. Only
-    /// [`crate::vmm::VmResult::better_across_phases`] constructs this — it
-    /// resolves the values via `phase_metric` and the polarity via
-    /// `crate::stats::metric_def`.
+    /// Build from already-resolved per-phase values + polarity. Constructed by
+    /// [`crate::vmm::VmResult::better_across_phases`] (values via `phase_metric`)
+    /// and [`crate::vmm::VmResult::better_across_phases_cgroup`] (values via
+    /// `phase_cgroup_metric`), each resolving polarity via `crate::stats::metric_def`.
+    /// `scope` is the per-cgroup cgroup name (`None` for the pooled producer),
+    /// surfaced in the diagnostics.
+    // 8 args: a field-setting constructor (each arg is one BetterThanPhase field),
+    // with only 2 well-structured call sites (the two VmResult producers).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         metric: String,
         verdict: &'v mut Verdict,
@@ -814,6 +825,7 @@ impl<'v> BetterThanPhase<'v> {
         baseline_value: Option<f64>,
         candidate_value: Option<f64>,
         polarity: Option<crate::test_support::Polarity>,
+        scope: Option<String>,
     ) -> Self {
         Self {
             metric,
@@ -823,6 +835,7 @@ impl<'v> BetterThanPhase<'v> {
             baseline_value,
             candidate_value,
             polarity,
+            scope,
         }
     }
 
@@ -870,17 +883,24 @@ impl<'v> BetterThanPhase<'v> {
         let metric = &self.metric;
         let base = self.baseline;
         let cand = self.candidate;
+        // Scope suffix (the cgroup name) for the per-cgroup producer; empty for the
+        // pooled producer — so a per-cgroup outcome names its cgroup.
+        let scope_str = self
+            .scope
+            .as_deref()
+            .map(|s| format!(" [cgroup {s}]"))
+            .unwrap_or_default();
         match outcome {
             BetterOutcome::Pass => {
                 self.verdict.note(format!(
-                    "[{metric}] candidate {cand}={c_str} {req} than baseline {base}={b_str} ({dir})"
+                    "[{metric}]{scope_str} candidate {cand}={c_str} {req} than baseline {base}={b_str} ({dir})"
                 ));
             }
             BetterOutcome::Fail => {
                 push_detail(
                     self.verdict,
                     format!(
-                        "{metric}: candidate {cand}={c_str} is NOT {req} than baseline \
+                        "{metric}{scope_str}: candidate {cand}={c_str} is NOT {req} than baseline \
                          {base}={b_str} ({dir})"
                     ),
                 );
@@ -889,7 +909,7 @@ impl<'v> BetterThanPhase<'v> {
                 push_detail(
                     self.verdict,
                     format!(
-                        "{metric}: non-finite value (baseline {base}={b_str}, candidate \
+                        "{metric}{scope_str}: non-finite value (baseline {base}={b_str}, candidate \
                          {cand}={c_str}) — cannot compare"
                     ),
                 );
@@ -898,7 +918,7 @@ impl<'v> BetterThanPhase<'v> {
                 push_inconclusive(
                     self.verdict,
                     format!(
-                        "{metric}: better_across_phases({base}->{cand}) inconclusive: \
+                        "{metric}: cross-phase better-than({base}->{cand}){scope_str} inconclusive: \
                          needs both phases — baseline={b_str}, candidate={c_str}"
                     ),
                 );
@@ -907,7 +927,7 @@ impl<'v> BetterThanPhase<'v> {
                 push_inconclusive(
                     self.verdict,
                     format!(
-                        "{metric}: better_across_phases inconclusive: metric has no \
+                        "{metric}: cross-phase better-than{scope_str} inconclusive: metric has no \
                          lower/higher-is-better polarity — cannot orient 'better'"
                     ),
                 );
@@ -916,7 +936,7 @@ impl<'v> BetterThanPhase<'v> {
                 push_inconclusive(
                     self.verdict,
                     format!(
-                        "{metric}: better_across_phases inconclusive: baseline {base}=0, no \
+                        "{metric}: cross-phase better-than{scope_str} inconclusive: baseline {base}=0, no \
                          baseline to scale the fractional margin ({req})"
                     ),
                 );
@@ -2307,6 +2327,97 @@ mod tests {
         assert_eq!(
             better_outcome(None, Some(f64::NAN), lb, None),
             BetterOutcome::Missing
+        );
+    }
+
+    #[test]
+    fn better_than_phase_scope_label_renders_per_cgroup_in_messages() {
+        // Pins the BetterThanPhase `scope` rendering: a per-cgroup comparator
+        // (Some(scope)) names its cgroup in EVERY outcome message, and the
+        // Inconclusive wording is producer-neutral ('cross-phase better-than', not the
+        // literal 'better_across_phases'). A None scope (the pooled producer) renders
+        // no cgroup suffix. Without this, dropping `scope_str` or reverting the wording
+        // would pass the suite green (the e2e only checks Ok/Err).
+        use crate::assert::Phase;
+        let (b, c) = (Phase::step(0), Phase::step(1));
+        // Pass (HigherBetter, candidate 200 > baseline 100): the note names the cgroup.
+        let mut v = Verdict::new();
+        BetterThanPhase::new(
+            "schbench_loop_count".to_string(),
+            &mut v,
+            b,
+            c,
+            Some(100.0),
+            Some(200.0),
+            Some(Polarity::HigherBetter),
+            Some("cg_x".to_string()),
+        )
+        .better_than();
+        assert!(
+            v.into_result()
+                .info_notes
+                .iter()
+                .any(|n| n.message.contains("[cgroup cg_x]")),
+            "Pass note names the cgroup"
+        );
+        // Fail (candidate 100 < baseline 200, HigherBetter): the detail names it.
+        let mut v = Verdict::new();
+        BetterThanPhase::new(
+            "schbench_loop_count".to_string(),
+            &mut v,
+            b,
+            c,
+            Some(200.0),
+            Some(100.0),
+            Some(Polarity::HigherBetter),
+            Some("cg_x".to_string()),
+        )
+        .better_than();
+        assert!(
+            v.into_result()
+                .failure_details()
+                .any(|d| d.message.contains("[cgroup cg_x]")),
+            "Fail detail names the cgroup"
+        );
+        // Inconclusive (Missing: no candidate value): producer-neutral wording + cgroup.
+        let mut v = Verdict::new();
+        BetterThanPhase::new(
+            "schbench_loop_count".to_string(),
+            &mut v,
+            b,
+            c,
+            Some(100.0),
+            None,
+            Some(Polarity::HigherBetter),
+            Some("cg_x".to_string()),
+        )
+        .better_than();
+        assert!(
+            v.into_result().inconclusive_details().any(|d| {
+                d.message.contains("[cgroup cg_x]")
+                    && d.message.contains("cross-phase better-than")
+                    && !d.message.contains("better_across_phases")
+            }),
+            "Inconclusive names the cgroup + uses the producer-neutral wording"
+        );
+        // None scope (pooled producer): no cgroup suffix anywhere.
+        let mut v = Verdict::new();
+        BetterThanPhase::new(
+            "schbench_loop_count".to_string(),
+            &mut v,
+            b,
+            c,
+            Some(100.0),
+            None,
+            Some(Polarity::HigherBetter),
+            None,
+        )
+        .better_than();
+        assert!(
+            !v.into_result()
+                .inconclusive_details()
+                .any(|d| d.message.contains("[cgroup")),
+            "None scope -> no cgroup suffix"
         );
     }
 

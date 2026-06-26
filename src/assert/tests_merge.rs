@@ -1156,6 +1156,7 @@ fn assert_result_merge_per_phase_per_cgroup_unions_and_folds() {
             max_gap_ms: 7,
             max_gap_cpu: 3,
             stripped: false,
+            metrics: std::collections::BTreeMap::new(),
             schbench: None,
         },
     );
@@ -1195,6 +1196,7 @@ fn assert_result_merge_per_phase_per_cgroup_unions_and_folds() {
             max_gap_ms: 9,
             max_gap_cpu: 5,
             stripped: false,
+            metrics: std::collections::BTreeMap::new(),
             schbench: None,
         },
     );

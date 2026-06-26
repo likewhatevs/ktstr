@@ -64,6 +64,7 @@ fn phase_bucket_per_cgroup_round_trips_and_defaults_empty() {
             max_gap_ms: 13,
             max_gap_cpu: 2,
             stripped: false,
+            metrics: std::collections::BTreeMap::new(),
             schbench: None,
         },
     );

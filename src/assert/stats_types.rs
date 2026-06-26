@@ -411,6 +411,25 @@ pub struct PhaseCgroupStats {
     /// only on a carrier that actually HAD samples to drop; ORs across `merge` so
     /// a merged carrier is stripped if either input was.
     pub stripped: bool,
+    /// Per-cgroup DERIVED scalar metrics for this (phase, cgroup), keyed by
+    /// `crate::stats::MetricDef` name — the per-cgroup analog of
+    /// [`PhaseBucket::metrics`] (which is the pooled-across-cgroups set). Populated
+    /// post-fold by `derive_schbench_phase_metrics` (the schbench per-phase family;
+    /// the non-schbench families are a follow-on) from the SAME reducers that fill
+    /// the pooled map, so a
+    /// test can query "metric M of cgroup C in phase P" as readily as the phase
+    /// aggregate (N cgroups -> N queryable sets + the pooled aggregate). DERIVED, not a
+    /// raw component: `PhaseCgroupStats::merge` leaves it empty and it is (re)derived
+    /// POST-merge, exactly as the pooled map skips is_derived keys in
+    /// `merge_matched_phase_buckets`. ALWAYS serialized (no `skip_serializing_if`):
+    /// PhaseCgroupStats rides the postcard bulk-TLV port, a NON-self-describing
+    /// POSITIONAL format — a conditionally-omitted field desyncs the byte stream and
+    /// corrupts the fields after it (here `schbench`), so the field must always be
+    /// present. No `serde(default)` either: pre-1.0, old sidecar/cache data is
+    /// disposable and regenerates (no compat shim). Read via [`Self::get`]; the
+    /// `crate::Claim` derive skips a `BTreeMap` field (matching
+    /// [`PhaseBucket::metrics`], which has no Claim accessor either).
+    pub metrics: std::collections::BTreeMap<String, f64>,
     /// Per-phase schbench engine metrics for a `WorkType::Schbench` backdrop
     /// cgroup (`None` for every non-schbench carrier). Pooled across the
     /// cgroup's workers by [`PhaseCgroupStats::merge`] (histogram
@@ -528,7 +547,55 @@ impl PhaseCgroupStats {
             max_gap_ms,
             max_gap_cpu,
             stripped: a.stripped || b.stripped,
+            // DERIVED, not a raw component: left EMPTY here and (re)derived post-merge
+            // by derive_schbench_phase_metrics (the fold runs derive AFTER merging, the
+            // same reason the pooled map skips is_derived keys in
+            // merge_matched_phase_buckets). Folding stale per-operand metrics would
+            // double-count; the post-merge re-derive is the sole producer.
+            metrics: std::collections::BTreeMap::new(),
             schbench,
+        }
+    }
+
+    /// Look up this cgroup's per-phase DERIVED value for `metric_name` — the
+    /// per-cgroup analog of [`PhaseBucket::get`] (see [`Self::metrics`]). `None`
+    /// when this cgroup carried no finite samples for the metric (the ABSENT
+    /// discipline), distinct from `Some(0.0)` (a real reducer zero).
+    pub fn get(&self, metric_name: &str) -> Option<f64> {
+        self.metrics.get(metric_name).copied()
+    }
+
+    /// Like [`Self::get`] but panics citing the metric keys actually present when
+    /// the metric is absent — use when the caller knows this cgroup MUST carry the
+    /// metric in the phase.
+    pub fn expect_metric(&self, metric_name: &str) -> f64 {
+        self.get(metric_name).unwrap_or_else(|| {
+            panic!(
+                "PhaseCgroupStats::expect_metric: metric '{}' absent from this \
+                 per-cgroup carrier (num_workers={}, stripped={}); keys present: {:?}. \
+                 Causes: (a) the cgroup produced no finite samples for it; (b) metric \
+                 name typo; (c) a non-schbench carrier has no schbench keys.",
+                metric_name,
+                self.num_workers,
+                self.stripped,
+                self.metrics.keys().collect::<Vec<_>>(),
+            )
+        })
+    }
+
+    /// The per-cgroup analog of [`PhaseBucket::cgroup_counter_total`] for the two
+    /// per-cgroup Counters that live ONLY on the carrier (no derived `metrics`
+    /// entry): `total_migrations` and `total_iterations`. Lets
+    /// [`crate::vmm::VmResult::phase_cgroup_metric`] expose them by metric name
+    /// symmetrically with the pooled [`crate::vmm::VmResult::phase_metric`]
+    /// `cgroup_counter_total` fallback (the pooled `_total` suffix marks the
+    /// cross-cgroup SUM; this per-cgroup form returns one cgroup's value). `None`
+    /// for any other name (derived metrics are read via [`Self::get`]).
+    pub fn cgroup_counter(&self, name: &str) -> Option<f64> {
+        match name {
+            "total_migrations" => Some(self.total_migrations as f64),
+            "total_iterations" => Some(self.total_iterations as f64),
+            _ => None,
         }
     }
 

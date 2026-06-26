@@ -890,6 +890,56 @@ impl VmResult {
             self.phase_metric(baseline, metric),
             self.phase_metric(candidate, metric),
             crate::stats::metric_def(metric).map(|m| m.polarity),
+            None, // pooled producer — no per-cgroup scope label
+        )
+    }
+
+    /// One per-phase, PER-CGROUP derived metric — the per-cgroup analog of
+    /// [`Self::phase_metric`], answering "metric M of cgroup C in phase P" as
+    /// readily as the phase aggregate (the N-cgroups-to-N-queryable-sets goal).
+    /// Resolves `metric` (a `crate::stats::METRICS` registry name) from this
+    /// cgroup's per-phase carrier via [`crate::assert::PhaseCgroupStats::get`] (its
+    /// derived `metrics` map), falling back to
+    /// [`crate::assert::PhaseCgroupStats::cgroup_counter`] for the per-cgroup
+    /// Counters `total_migrations`/`total_iterations` (carrier fields, not derived) —
+    /// symmetric with [`Self::phase_metric`]'s `cgroup_counter_total` fallback.
+    /// `None` when `phase` has no bucket, the bucket has no carrier for `cgroup`, or
+    /// the carrier carried no finite value for the metric — sentinel-free, distinct
+    /// from a real `Some(0.0)`.
+    pub fn phase_cgroup_metric(
+        &self,
+        phase: crate::assert::Phase,
+        cgroup: &str,
+        metric: &str,
+    ) -> Option<f64> {
+        self.phase_cgroup(phase, cgroup)
+            .and_then(|pc| pc.get(metric).or_else(|| pc.cgroup_counter(metric)))
+    }
+
+    /// Per-cgroup analog of [`Self::better_across_phases`]: "is `metric` of
+    /// `cgroup` better in the `candidate` phase than the `baseline` phase?",
+    /// oriented from the registry polarity. Reuses the SAME
+    /// [`crate::assert::temporal::BetterThanPhase`] comparator/verdict machinery;
+    /// only value resolution is re-scoped from the pooled aggregate to the named
+    /// cgroup, so a missing carrier / undirected metric / zero-baseline margin
+    /// collapses to Inconclusive (not a silent pass), exactly as the pooled form.
+    pub fn better_across_phases_cgroup<'v>(
+        &self,
+        verdict: &'v mut crate::assert::Verdict,
+        baseline: crate::assert::Phase,
+        candidate: crate::assert::Phase,
+        cgroup: &str,
+        metric: &str,
+    ) -> crate::assert::temporal::BetterThanPhase<'v> {
+        crate::assert::temporal::BetterThanPhase::new(
+            metric.to_string(),
+            verdict,
+            baseline,
+            candidate,
+            self.phase_cgroup_metric(baseline, cgroup, metric),
+            self.phase_cgroup_metric(candidate, cgroup, metric),
+            crate::stats::metric_def(metric).map(|m| m.polarity),
+            Some(cgroup.to_string()), // per-cgroup scope label for the diagnostics
         )
     }
 
