@@ -43,6 +43,15 @@
 //!   - [`WorkType::EpollStorm`] / [`WorkType::CgroupChurn`] — Thread-only
 //!     and Fork-rejected respectively; driven by the sibling
 //!     `tests/worktype_coverage_thread_gauntlet_e2e.rs`.
+//!   - [`WorkType::CgroupAttachStorm`] — Fork-compatible, but needs a
+//!     sibling `dest` cgroup (created via `Op::add_cgroup`) that this
+//!     direct-spawn path does not provide; here it would no-op (the
+//!     dest is unresolvable). Driven by the dedicated
+//!     `tests/cgroup_attach_storm_e2e.rs`.
+//!   - [`WorkType::Schbench`] — driven by its own schbench engine (a
+//!     message-thread + worker-thread pool, not the generic
+//!     per-iteration worker body); covered by
+//!     `tests/performance_mode_e2e.rs`.
 
 use anyhow::Result;
 use ktstr::assert::{AssertDetail, AssertResult, DetailKind};

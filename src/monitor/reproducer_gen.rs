@@ -689,6 +689,7 @@ fn is_unmapped_work_type(w: &WorkType) -> bool {
         | WorkType::WakeChain { .. }
         | WorkType::NumaWorkingSetSweep { .. }
         | WorkType::CgroupChurn { .. }
+        | WorkType::CgroupAttachStorm { .. }
         | WorkType::SignalStorm { .. }
         | WorkType::PreemptStorm { .. }
         | WorkType::EpollStorm { .. }
@@ -943,6 +944,7 @@ fn render_work_type(w: &WorkType) -> String {
         WorkType::WakeChain { .. } => render_work_type_todo("WakeChain"),
         WorkType::NumaWorkingSetSweep { .. } => render_work_type_todo("NumaWorkingSetSweep"),
         WorkType::CgroupChurn { .. } => render_work_type_todo("CgroupChurn"),
+        WorkType::CgroupAttachStorm { .. } => render_work_type_todo("CgroupAttachStorm"),
         WorkType::SignalStorm { .. } => render_work_type_todo("SignalStorm"),
         WorkType::PreemptStorm { .. } => render_work_type_todo("PreemptStorm"),
         WorkType::EpollStorm { .. } => render_work_type_todo("EpollStorm"),

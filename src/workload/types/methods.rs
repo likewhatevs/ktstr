@@ -6,7 +6,9 @@
 
 use std::time::Duration;
 
-use crate::workload::config::{AluWidth, FutexLockMode, SchedClass, WakeMechanism, defaults};
+use crate::workload::config::{
+    AluWidth, FutexLockMode, ReapMode, SchedClass, WakeMechanism, defaults,
+};
 use crate::workload::schbench::run::SchbenchConfig;
 
 use crate::workload::WorkerReport;
@@ -60,6 +62,7 @@ impl WorkType {
             WorkType::WakeChain { .. } => "WakeChain",
             WorkType::NumaWorkingSetSweep { .. } => "NumaWorkingSetSweep",
             WorkType::CgroupChurn { .. } => "CgroupChurn",
+            WorkType::CgroupAttachStorm { .. } => "CgroupAttachStorm",
             WorkType::SignalStorm { .. } => "SignalStorm",
             WorkType::PreemptStorm { .. } => "PreemptStorm",
             WorkType::EpollStorm { .. } => "EpollStorm",
@@ -187,6 +190,10 @@ impl WorkType {
             "CgroupChurn" => Some(WorkType::CgroupChurn {
                 groups: defaults::CGROUP_CHURN_GROUPS,
                 cycle_ms: defaults::CGROUP_CHURN_CYCLE_MS,
+            }),
+            "CgroupAttachStorm" => Some(WorkType::CgroupAttachStorm {
+                dest: defaults::CGROUP_ATTACH_STORM_DEST.into(),
+                reap: ReapMode::default(),
             }),
             "SignalStorm" => Some(WorkType::SignalStorm {
                 signals_per_iter: defaults::SIGNAL_STORM_SIGNALS_PER_ITER,
@@ -711,6 +718,22 @@ impl WorkType {
     /// [`WorkType::CgroupChurn`] variant doc for preconditions.
     pub const fn cgroup_churn(groups: usize, cycle_ms: u64) -> Self {
         WorkType::CgroupChurn { groups, cycle_ms }
+    }
+
+    /// Construct a [`WorkType::CgroupAttachStorm`].
+    ///
+    /// `dest` is the sibling cgroup name each forked child is migrated
+    /// into; it must already exist at run time (e.g. created via
+    /// [`Op::add_cgroup`](crate::scenario::ops::Op::add_cgroup)). Non-`const`
+    /// because `Into::<String>::into` allocates (mirrors
+    /// [`custom`](Self::custom)). Validation fires at spawn time, not
+    /// construction time; see the [`WorkType::CgroupAttachStorm`] variant
+    /// doc for preconditions.
+    pub fn cgroup_attach_storm(dest: impl Into<String>, reap: ReapMode) -> Self {
+        WorkType::CgroupAttachStorm {
+            dest: dest.into(),
+            reap,
+        }
     }
 
     /// Construct a [`WorkType::SignalStorm`].

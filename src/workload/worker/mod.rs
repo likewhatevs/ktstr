@@ -12,7 +12,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use super::affinity::{sched_getcpu, set_thread_affinity};
-use super::config::{AluWidth, FutexLockMode, MemPolicy, MpolFlags, SchedPolicy, WakeMechanism};
+use super::config::{
+    AluWidth, FutexLockMode, MemPolicy, MpolFlags, ReapMode, SchedPolicy, WakeMechanism,
+};
 use super::spawn::{
     FAN_OUT_POST_WAKE_SPIN_ITERS, FUTEX_WAIT_TIMEOUT, Migration, PhaseSlice, WorkerReport,
     apply_mempolicy_with_flags, apply_nice, build_nodemask, stop_requested,
@@ -624,6 +626,67 @@ pub(super) fn worker_main(
     } else {
         (0..cgroup_churn_paths.len()).map(|_| None).collect()
     };
+
+    // CgroupAttachStorm: resolve the sibling `<dest>/cgroup.procs`
+    // migration target once — a SIBLING of the worker's own cgroup,
+    // resolved with the same helper `WorkerCtx::open_sibling_cgroup_procs`
+    // uses (the shared `read_self_cgroup_dir` resolver + name validation +
+    // `<parent>/<dest>/cgroup.procs`), so the built-in arm and the
+    // Custom-worker affordance address the same target by construction.
+    // Pre-flight its writability and, under `ReapMode::SigIgn`, install
+    // `SIGCHLD = SIG_IGN` once so each forked child auto-reaps concurrent
+    // with the parent's write. The path is resolved here; the dispatch arm
+    // caches the fd lazily and invalidates it on error (CgroupChurn
+    // posture).
+    let (cgroup_attach_storm_path, cgroup_attach_storm_writable): (
+        Option<std::path::PathBuf>,
+        bool,
+    ) = if let WorkType::CgroupAttachStorm { dest, reap } = &work_type {
+        match resolve_sibling_cgroup_procs(read_self_cgroup_dir().as_deref(), dest) {
+            Ok(path) => {
+                // Pre-flight writability (fail-loud per no-silent-drops): an
+                // unwritable dest migrates nothing and the scheduler
+                // "survives" vacuously. One warn + a no-op gate keeps the
+                // worker observable without panicking.
+                let writable = match std::fs::OpenOptions::new().write(true).open(&path) {
+                    Ok(_) => true,
+                    Err(e) => {
+                        tracing::warn!(
+                            ?e,
+                            path = %path.display(),
+                            "CgroupAttachStorm: dest cgroup.procs not writable — storm will no-op"
+                        );
+                        false
+                    }
+                };
+                if writable && matches!(reap, ReapMode::SigIgn) {
+                    // SAFETY: signal disposition is process-local; this worker
+                    // is its own process under CloneMode::Fork (Thread mode is
+                    // rejected at spawn). SIG_IGN here auto-reaps only the
+                    // worker's own forked children; the spawn side waitpid's
+                    // the WORKER pid, which this disposition does not affect.
+                    unsafe {
+                        libc::signal(libc::SIGCHLD, libc::SIG_IGN);
+                    }
+                }
+                (Some(path), writable)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    ?e,
+                    %dest,
+                    "CgroupAttachStorm: could not resolve sibling dest cgroup — storm will no-op"
+                );
+                (None, false)
+            }
+        }
+    } else {
+        (None, false)
+    };
+    // Lazy single-dest fd cache + a reusable child-pid scratch buffer so
+    // the dispatch arm allocates nothing per iteration after warm-up.
+    let mut cgroup_attach_storm_file: Option<std::fs::File> = None;
+    let mut cgroup_attach_storm_pid_buf = String::new();
 
     // NumaWorkingSetSweep: pre-compute one (nodemask, maxnode) pair
     // per entry in `target_nodes`. The dispatch arm rotates through
@@ -2683,6 +2746,132 @@ pub(super) fn worker_main(
                 last_iter_time = Instant::now();
                 iterations += 1;
             }
+            WorkType::CgroupAttachStorm { reap, .. } => {
+                // Fork a transient child and migrate it — the whole process
+                // — into the sibling `<dest>/cgroup.procs` by writing its
+                // pid, while the child immediately `_exit`s. The write drives
+                // `cgroup_attach_task`'s threadgroup walk →
+                // `TRACE_CGROUP_PATH(attach_task)` (kernel/cgroup/cgroup.c);
+                // racing the child's teardown is the leader-acquire surface a
+                // scheduler's cgroup-attach handler must survive. The dest
+                // path is resolved at worker entry; the fd is cached lazily
+                // and invalidated on error (mirrors CgroupChurn), and the
+                // child pid is formatted into a reused scratch buffer so the
+                // hot path allocates nothing after warm-up.
+                if !cgroup_attach_storm_writable {
+                    // The pre-flight warn already fired (fail-loud per
+                    // no-silent-drops). No-op the storm WITHOUT bumping
+                    // `work_units` so a caller can detect the vacuous
+                    // survive (work_units stays 0); advance `iterations`
+                    // and yield so the loop still progresses to the stop
+                    // check.
+                    unsafe {
+                        libc::sched_yield();
+                    }
+                    iterations += 1;
+                } else {
+                    let pid = unsafe { libc::fork() };
+                    match pid {
+                        -1 => {
+                            // EAGAIN under fork pressure — sched_yield to back
+                            // off, then count the cycle. Bumps the same
+                            // work_units + iterations as ForkExit's -1 arm but
+                            // adds a yield, since the storm forks at a higher
+                            // rate and benefits from ceding the CPU on EAGAIN.
+                            unsafe {
+                                libc::sched_yield();
+                            }
+                            work_units = std::hint::black_box(work_units.wrapping_add(1));
+                            iterations += 1;
+                        }
+                        0 => {
+                            // Child: async-signal-safe immediate exit, racing
+                            // the parent's write + (SigIgn) auto-reap.
+                            unsafe { libc::_exit(0) };
+                        }
+                        child => {
+                            // Parent: write the child pid to the sibling dest
+                            // `cgroup.procs` (lazy-open + invalidate on error,
+                            // like CgroupChurn).
+                            if cgroup_attach_storm_file.is_none() {
+                                if let Some(path) = &cgroup_attach_storm_path {
+                                    match std::fs::OpenOptions::new().write(true).open(path) {
+                                        Ok(f) => cgroup_attach_storm_file = Some(f),
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                ?e,
+                                                path = %path.display(),
+                                                "CgroupAttachStorm open failed"
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                            if let Some(f) = cgroup_attach_storm_file.take() {
+                                use std::fmt::Write as _;
+                                use std::io::Write as _;
+                                cgroup_attach_storm_pid_buf.clear();
+                                // Infallible for `String`; reuses the buffer's
+                                // retained capacity after the first iteration.
+                                let _ = write!(cgroup_attach_storm_pid_buf, "{child}");
+                                match (&f).write_all(cgroup_attach_storm_pid_buf.as_bytes()) {
+                                    Ok(()) => {
+                                        cgroup_attach_storm_file = Some(f);
+                                    }
+                                    Err(e) if e.raw_os_error() == Some(libc::ESRCH) => {
+                                        // Expected ReapMode::SigIgn-race
+                                        // outcome: the child `_exit`ed and
+                                        // auto-reaped before the migrate write
+                                        // resolved its pid, so the kernel
+                                        // resolves the pid via
+                                        // find_task_by_vpid -> NULL ->
+                                        // ERR_PTR(-ESRCH) (kernel/cgroup/
+                                        // cgroup.c, propagated through
+                                        // __cgroup_procs_write). The dest
+                                        // cgroup is still live, so KEEP the
+                                        // cached fd (no re-open) and do NOT
+                                        // warn — the write losing the race to
+                                        // the child exit is the storm working,
+                                        // not a failure. The fork+attempt is
+                                        // still counted as a cycle below.
+                                        cgroup_attach_storm_file = Some(f);
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            ?e,
+                                            "CgroupAttachStorm write failed; invalidating cached fd"
+                                        );
+                                        // A genuine dead fd (e.g. -ENODEV from
+                                        // an rmdir'd dest kernfs node, surfaced
+                                        // by cgroup_kn_lock_live): dropping `f`
+                                        // closes it so the next iteration
+                                        // re-opens, picking up a recreate.
+                                    }
+                                }
+                            }
+                            match reap {
+                                ReapMode::Waitpid => {
+                                    // Non-racing control: block until the
+                                    // child is reaped, feeding the interval
+                                    // into the wake reservoir on the same
+                                    // contract as ForkExit's waitpid.
+                                    let mut status = 0i32;
+                                    let before_wait = Instant::now();
+                                    unsafe { libc::waitpid(child, &mut status, 0) };
+                                    wake.push(before_wait.elapsed().as_nanos() as u64);
+                                }
+                                ReapMode::SigIgn => {
+                                    // SIGCHLD = SIG_IGN (installed at entry)
+                                    // auto-reaps the child; the write above
+                                    // races its exit. Nothing to do here.
+                                }
+                            }
+                            work_units = std::hint::black_box(work_units.wrapping_add(1));
+                            iterations += 1;
+                        }
+                    }
+                }
+            }
             WorkType::SignalStorm {
                 signals_per_iter,
                 work_iters,
@@ -3758,6 +3947,39 @@ fn cgroup_dir_from_rel(rel: &str) -> Option<std::path::PathBuf> {
 /// assert the `worker_main` hand-off threads this value through.
 pub(crate) fn read_self_cgroup_dir() -> Option<std::path::PathBuf> {
     cgroup_dir_from_rel(&read_self_cgroup_rel()?)
+}
+
+/// Resolve the `cgroup.procs` path of a SIBLING cgroup — a child of
+/// `cgroup_dir`'s parent named `name` — validating `name` first so a
+/// hostile `.`/`..`/absolute/NUL component cannot escape the parent via
+/// `Path::join`. `Err(InvalidInput)` for a bad name; `Err(NotFound)`
+/// when `cgroup_dir` is `None` (root / non-v2) or has no parent. Pure
+/// (no fs access) so both error branches are testable. Single-sources
+/// the sibling resolution shared by [`WorkerCtx::open_sibling_cgroup_procs`]
+/// (the Custom-worker affordance) and the
+/// [`WorkType::CgroupAttachStorm`](crate::workload::WorkType::CgroupAttachStorm)
+/// built-in dispatch arm so the two address the same target by
+/// construction.
+pub(crate) fn resolve_sibling_cgroup_procs(
+    cgroup_dir: Option<&std::path::Path>,
+    name: &str,
+) -> std::io::Result<std::path::PathBuf> {
+    crate::cgroup::validate_cgroup_name(name)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?;
+    let cg = cgroup_dir.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "open_sibling_cgroup_procs: worker has no resolvable cgroup-v2 \
+             dir (run it in a dedicated cgroup, not the root / a non-v2 host)",
+        )
+    })?;
+    let parent = cg.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "open_sibling_cgroup_procs: the worker's cgroup has no parent",
+        )
+    })?;
+    Ok(parent.join(name).join("cgroup.procs"))
 }
 
 /// The cgroup name a [`WorkType::CgroupChurn`] worker rotates target `i`

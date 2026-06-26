@@ -25,7 +25,7 @@ mod work;
 mod workload;
 
 pub use mempolicy::{MemPolicy, MpolFlags};
-pub use sched::{AluWidth, FutexLockMode, SchedClass, SchedPolicy, WakeMechanism};
+pub use sched::{AluWidth, FutexLockMode, ReapMode, SchedClass, SchedPolicy, WakeMechanism};
 pub use work::WorkSpec;
 pub(crate) use work::validate_task_comm_string;
 pub use workload::WorkloadConfig;
@@ -135,6 +135,10 @@ pub mod defaults {
     // CgroupChurn
     pub const CGROUP_CHURN_GROUPS: usize = 2;
     pub const CGROUP_CHURN_CYCLE_MS: u64 = 100;
+    // CgroupAttachStorm — sentinel sibling-cgroup name used by
+    // `from_name("CgroupAttachStorm")`; the author sets a real `dest`
+    // (matching an `Op::add_cgroup`) before the storm migrates anything.
+    pub const CGROUP_ATTACH_STORM_DEST: &str = "dest";
     // SignalStorm
     pub const SIGNAL_STORM_SIGNALS_PER_ITER: u64 = 16;
     pub const SIGNAL_STORM_WORK_ITERS: u64 = 1024;

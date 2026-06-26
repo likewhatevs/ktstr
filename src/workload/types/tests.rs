@@ -305,6 +305,81 @@ fn mutex_contention_needs_shared_mem() {
 fn mutex_contention_no_cache_buf() {
     assert!(!WorkType::mutex_contention(4, 256, 1024).needs_cache_buf());
 }
+// -- CgroupAttachStorm tests --
+
+#[test]
+fn cgroup_attach_storm_name_roundtrip() {
+    let wt = WorkType::from_name("CgroupAttachStorm").unwrap();
+    assert_eq!(wt.name(), "CgroupAttachStorm");
+}
+#[test]
+fn cgroup_attach_storm_from_name_defaults() {
+    let wt = WorkType::from_name("CgroupAttachStorm").unwrap();
+    match wt {
+        WorkType::CgroupAttachStorm { dest, reap } => {
+            assert_eq!(dest, "dest");
+            assert_eq!(reap, ReapMode::SigIgn);
+        }
+        _ => panic!("expected CgroupAttachStorm"),
+    }
+}
+#[test]
+fn cgroup_attach_storm_group_size_none() {
+    let wt = WorkType::cgroup_attach_storm("dest", ReapMode::SigIgn);
+    assert_eq!(wt.worker_group_size(), None);
+}
+#[test]
+fn cgroup_attach_storm_ctor_field_equality() {
+    let wt = WorkType::cgroup_attach_storm("sib", ReapMode::Waitpid);
+    match wt {
+        WorkType::CgroupAttachStorm { dest, reap } => {
+            assert_eq!(dest, "sib");
+            assert_eq!(reap, ReapMode::Waitpid);
+        }
+        _ => panic!("expected CgroupAttachStorm"),
+    }
+}
+/// Both `ReapMode` values roundtrip through JSON with `dest` (a
+/// `String`, not `Cow<'static, str>`) preserved — pinning that the
+/// owned-string field does not re-impose serde's `'de: 'static` bound
+/// the `#[serde(bound(deserialize = ""))]` escape exists to drop.
+#[test]
+fn cgroup_attach_storm_serde_roundtrip_both_reap_modes() {
+    for reap in [ReapMode::SigIgn, ReapMode::Waitpid] {
+        let wt = WorkType::cgroup_attach_storm("dst", reap);
+        let json = serde_json::to_string(&wt).unwrap();
+        let back: WorkType = serde_json::from_str(&json).unwrap();
+        match back {
+            WorkType::CgroupAttachStorm { dest, reap: r } => {
+                assert_eq!(dest, "dst");
+                assert_eq!(r, reap);
+            }
+            _ => panic!("roundtrip lost CgroupAttachStorm variant"),
+        }
+    }
+}
+/// `ReapMode` serializes snake_case and defaults to `SigIgn` (the race
+/// shape — the variant's reason to exist).
+#[test]
+fn reap_mode_serde_snake_case_and_default() {
+    assert_eq!(
+        serde_json::to_string(&ReapMode::SigIgn).unwrap(),
+        r#""sig_ign""#
+    );
+    assert_eq!(
+        serde_json::to_string(&ReapMode::Waitpid).unwrap(),
+        r#""waitpid""#
+    );
+    assert_eq!(
+        serde_json::from_str::<ReapMode>(r#""sig_ign""#).unwrap(),
+        ReapMode::SigIgn
+    );
+    assert_eq!(
+        serde_json::from_str::<ReapMode>(r#""waitpid""#).unwrap(),
+        ReapMode::Waitpid
+    );
+    assert_eq!(ReapMode::default(), ReapMode::SigIgn);
+}
 /// `WorkPhase` Duration fields serialize as humantime strings, not
 /// `{secs, nanos}` objects. Pins the readable wire format that
 /// makes captured `WorkSpec` configs operator-editable.
@@ -641,10 +716,13 @@ fn suggest_rejects_whitespace_padded_inputs() {
 
 #[test]
 fn work_type_all_names_count() {
-    // 39 = 20 historical + 2 fundamental + 7 pathology + 5 coverage-gap
-    //    + 1 idle-transition + 3 compute-primitive + 1 cross-affinity
-    //    (CrossAffinityChurn) variant.
-    assert_eq!(WorkType::ALL_NAMES.len(), 39);
+    // `ALL_NAMES` is derived by `strum::VariantNames` from the `WorkType`
+    // enum, so its length is exactly the variant count (currently 41,
+    // including the serde-skipped `Custom`, which strum still names).
+    // Pinning it catches a variant added or removed without the parallel
+    // `name()` / `from_name()` / dispatch maintenance; bump it when the
+    // variant set changes intentionally.
+    assert_eq!(WorkType::ALL_NAMES.len(), 41);
 }
 
 #[test]

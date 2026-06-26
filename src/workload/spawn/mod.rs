@@ -3463,6 +3463,37 @@ impl WorkloadHandle {
                     group.group_idx,
                 );
             }
+            // Thread mode + CgroupAttachStorm is incompatible because the
+            // worker installs `SIGCHLD = SIG_IGN` at entry (under
+            // ReapMode::SigIgn) to auto-reap its forked children. Under
+            // [`CloneMode::Thread`] the worker is a pthread of the harness
+            // thread group and shares the harness `sighand` (CLONE_THREAD
+            // implies CLONE_SIGHAND), so that install changes SIGCHLD
+            // disposition for the WHOLE harness process — corrupting the
+            // harness's own child reaping — not just this worker. (fork()
+            // from a thread of the multithreaded harness is also fragile;
+            // the forked child is safe here only because it does nothing
+            // but `_exit`.) Under [`CloneMode::Fork`] each worker is its
+            // own process with a private sighand, so the SIG_IGN install
+            // and the forked-child lifecycle stay confined to that worker.
+            // Note: the storm writes the forked CHILD's pid (its own tgid)
+            // to cgroup.procs, so — unlike CgroupChurn's own-tid write —
+            // the migration never moves the harness; the hazard is the
+            // shared-sighand SIG_IGN install, not tgid migration. Reject at
+            // spawn time with an actionable diagnostic.
+            if matches!(dispatch, Dispatch::Thread)
+                && matches!(group.work_type, WorkType::CgroupAttachStorm { .. })
+            {
+                anyhow::bail!(
+                    "CloneMode::Thread is incompatible with WorkType::CgroupAttachStorm \
+                     (group {}) — the worker installs SIGCHLD=SIG_IGN to auto-reap its \
+                     forked children, but a thread-group worker shares the harness \
+                     sighand, so that install corrupts the harness's own child reaping. \
+                     Use CloneMode::Fork for CgroupAttachStorm workloads so each worker \
+                     has its own process and private sighand.",
+                    group.group_idx,
+                );
+            }
             // Dispatch-agnostic admission rules
             // (worker_group_size divisibility, chain depth >= 2,
             // IdleChurn / IpcVariance zero-rejections) live in

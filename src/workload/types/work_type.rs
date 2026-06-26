@@ -13,7 +13,7 @@ use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use crate::workload::config::{
-    AluWidth, FutexLockMode, SchedClass, WakeMechanism, humantime_serde_helper,
+    AluWidth, FutexLockMode, ReapMode, SchedClass, WakeMechanism, humantime_serde_helper,
 };
 use crate::workload::schbench::run::SchbenchConfig;
 
@@ -257,11 +257,12 @@ impl<'a> WorkerCtx<'a> {
         self.cfg
     }
 
-    /// Open the `cgroup.procs` of a SIBLING cgroup (a child of this worker's
-    /// cgroup parent) for writing — the ready-to-use migration target a
-    /// Custom worker needs without re-parsing `/proc/self/cgroup` or
-    /// hand-rolling a writability precheck. The sibling resolves to
-    /// `cgroup_dir().parent()/<name>/cgroup.procs`.
+    /// Open the `cgroup.procs` of a cgroup under this worker's cgroup parent
+    /// for writing — the ready-to-use migration target a Custom worker needs
+    /// without re-parsing `/proc/self/cgroup` or hand-rolling a writability
+    /// precheck. Resolves to `cgroup_dir().parent()/<name>/cgroup.procs`: a
+    /// single-component `name` is a sibling of this worker's cgroup, a
+    /// multi-component `name` a nested descendant of that parent.
     ///
     /// The write-mode open IS the precheck: a successful return means the
     /// sibling's `cgroup.procs` exists and was openable for write. The
@@ -279,27 +280,15 @@ impl<'a> WorkerCtx<'a> {
     ///   `PermissionDenied` for an unwritable one, …) with `ErrorKind`
     ///   preserved and the resolved path in the message.
     pub fn open_sibling_cgroup_procs(&self, name: &str) -> std::io::Result<std::fs::File> {
-        // Validate before touching the fs: `name` is user-supplied, and an
-        // unchecked `.`/`..`/absolute name would escape the parent via
-        // Path::join. Delegate to cgroup.rs::validate_cgroup_name so the
-        // per-class diagnostic (which rule fired) stays in lockstep with the
-        // managed-cgroup creator instead of collapsing to one generic message.
-        crate::cgroup::validate_cgroup_name(name)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?;
-        let cg = self.cgroup_dir().ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "open_sibling_cgroup_procs: worker has no resolvable cgroup-v2 \
-                 dir (run it in a dedicated cgroup, not the root / a non-v2 host)",
-            )
-        })?;
-        let parent = cg.parent().ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "open_sibling_cgroup_procs: the worker's cgroup has no parent",
-            )
-        })?;
-        let path = parent.join(name).join("cgroup.procs");
+        // Resolve + validate via the shared sibling resolver — single-sourced
+        // with the `WorkType::CgroupAttachStorm` built-in dispatch arm so both
+        // address the same `<parent>/<name>/cgroup.procs` target by
+        // construction. `name` is user-supplied; the resolver rejects a
+        // `.`/`..`/absolute/NUL component (which would escape the parent via
+        // `Path::join`) before any fs access. The write-mode open below IS the
+        // precheck.
+        let path =
+            crate::workload::worker::resolve_sibling_cgroup_procs(self.cgroup_dir(), name)?;
         std::fs::OpenOptions::new()
             .write(true)
             .open(&path)
@@ -1023,6 +1012,67 @@ pub enum WorkType {
         /// values increase contention on `cgroup_threadgroup_rwsem`
         /// and the per-class `task_change_group` paths.
         cycle_ms: u64,
+    },
+    /// Each iteration the worker `fork`s a transient child and migrates
+    /// it — the whole process — into a sibling cgroup by writing the
+    /// child's pid to `<dest>/cgroup.procs`, while the child immediately
+    /// `_exit`s. The `cgroup.procs` write drives the kernel's
+    /// threadgroup-wide attach path: `cgroup_procs_write` →
+    /// `cgroup_attach_task(dst, leader, threadgroup=true)` walks
+    /// `while_each_thread(leader, task)` and migrates every member of the
+    /// tgid, then fires `TRACE_CGROUP_PATH(attach_task, …)`
+    /// (`kernel/cgroup/cgroup.c`). A whole-process `cgroup.procs` write of
+    /// an *exiting* child is the leader-acquire race a `tp_btf` /
+    /// `cgroup_attach_task` BPF handler must survive — migrating a task
+    /// that is concurrently tearing down.
+    ///
+    /// Distinct from both sibling primitives, and not expressible by
+    /// either:
+    /// - [`ForkExit`](Self::ForkExit) forks and `waitpid`s its child but
+    ///   never writes `cgroup.procs` — no migration, no attach path.
+    /// - [`CgroupChurn`](Self::CgroupChurn) writes its *own* tid to
+    ///   rotate cgroups but never forks — no transient-child leader race.
+    ///
+    /// `reap` ([`ReapMode`]) selects the disposition that decides whether
+    /// the migration races the child's teardown:
+    /// [`SigIgn`](ReapMode::SigIgn) (default) installs `SIGCHLD = SIG_IGN`
+    /// once so children auto-reap concurrent with the write — the race;
+    /// [`Waitpid`](ReapMode::Waitpid) blocking-reaps each child after the
+    /// write — a non-racing A/B control.
+    ///
+    /// `dest` is the name of a cgroup that must already exist under the
+    /// worker cgroup's parent, typically created via
+    /// [`Op::add_cgroup`](crate::scenario::ops::Op::add_cgroup). The target
+    /// resolves to `<worker-cgroup>.parent()/<dest>/cgroup.procs` from
+    /// the worker's resolved cgroup-v2 dir (the same resolution
+    /// [`WorkerCtx::open_sibling_cgroup_procs`] uses), so the worker must
+    /// run in a dedicated cgroup — not the root. A single-component `dest`
+    /// names a sibling of the worker cgroup; a multi-component `dest`
+    /// (e.g. `a/b`) addresses a nested descendant of that parent. If
+    /// `dest` cannot be resolved or its `cgroup.procs` is not writable the
+    /// worker logs a warning once and the storm no-ops (a vacuous
+    /// "scheduler survived" is surfaced loudly, never silently);
+    /// `work_units` stays zero so a caller can detect the no-op.
+    ///
+    /// Exclusive to [`CloneMode::Fork`](crate::workload::CloneMode::Fork):
+    /// the worker installs `SIGCHLD = SIG_IGN` to auto-reap its forked
+    /// children (under [`ReapMode::SigIgn`]), and a thread-group worker
+    /// shares the harness `sighand`, so that install would corrupt the
+    /// harness's own child reaping; fork from a thread of the harness is
+    /// also fragile. [`CloneMode::Thread`](crate::workload::CloneMode::Thread)
+    /// is therefore rejected at spawn. `worker_group_size = None` (any
+    /// worker count valid; each worker storms independently).
+    CgroupAttachStorm {
+        /// Name of the cgroup whose `cgroup.procs` each forked child is
+        /// migrated into, resolved relative to the worker cgroup's parent
+        /// (a single-component name is a sibling; a multi-component name a
+        /// nested descendant). Must already exist (e.g. via
+        /// [`Op::add_cgroup`](crate::scenario::ops::Op::add_cgroup)).
+        dest: String,
+        /// How the worker reaps the children it forks — the race
+        /// ([`SigIgn`](ReapMode::SigIgn)) or the control
+        /// ([`Waitpid`](ReapMode::Waitpid)).
+        reap: ReapMode,
     },
     /// Paired workers signal each other with `kill(partner,
     /// SIGUSR1)`. Each worker installs a SIGUSR1 handler via
