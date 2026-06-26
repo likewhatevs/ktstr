@@ -2204,6 +2204,7 @@ mod tests {
             passed: true,
             skipped: false,
             inconclusive: false,
+            expected_failure: false,
             stats: ktstr::assert::ScenarioStats::default(),
             monitor: None,
             periodic_fired: 0,
