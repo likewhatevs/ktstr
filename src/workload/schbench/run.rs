@@ -225,6 +225,9 @@ pub(crate) struct ThreadData {
     /// Request (work-cycle) latency histogram (`schbench.c` `request_stats`,
     /// `:795`). Owner-thread-only.
     request_stats: UnsafeCell<PlatStats>,
+    /// Mean per-schedule run-queue wait (ns), read from `/proc/<tid>/schedstat`
+    /// at thread exit (schbench's `read_sched_delay`, `:1118`). Owner-only.
+    sched_delay_ns: UnsafeCell<u64>,
 }
 
 impl Linked for ThreadData {
@@ -236,9 +239,10 @@ impl Linked for ThreadData {
 // SAFETY: `ThreadData` is shared across threads only via the lockless
 // wait-list, whose operations touch exclusively the atomic fields (`next`,
 // `futex`, `wake_time`) -- all internally synchronized. The `UnsafeCell`
-// fields (`wakeup_stats`, `request_stats`) are written and read ONLY by the
-// single worker thread that owns this `ThreadData`, and only the main thread
-// reads them after all workers have joined (a happens-before via the join). No
+// fields (`wakeup_stats`, `request_stats`, `sched_delay_ns`) are written and
+// read ONLY by the single worker thread that owns this `ThreadData`, and only
+// the main thread reads them after all workers have joined (a happens-before
+// via the join). No
 // two threads ever touch a cell concurrently, so sharing `&ThreadData` across
 // threads is sound.
 unsafe impl Sync for ThreadData {}
@@ -251,6 +255,7 @@ impl ThreadData {
             wake_time: AtomicU64::new(0),
             wakeup_stats: UnsafeCell::new(PlatStats::default()),
             request_stats: UnsafeCell::new(PlatStats::default()),
+            sched_delay_ns: UnsafeCell::new(0),
         }
     }
 }
@@ -347,6 +352,55 @@ fn run_msg_thread(msg_td: &ThreadData, wait_list: &TreiberStack<ThreadData>, sto
         }
         msg_td.futex.wait_forever();
     }
+    // Record the message thread's mean run-queue wait (`schbench.c:1664`).
+    // SAFETY: owner-only access to msg_td's sched_delay_ns cell.
+    unsafe { *msg_td.sched_delay_ns.get() = read_sched_delay(gettid_self()) };
+}
+
+/// The calling thread's kernel tid (`gettid`), for reading its own schedstat.
+fn gettid_self() -> libc::pid_t {
+    // SAFETY: gettid takes no arguments and only returns the caller's tid.
+    unsafe { libc::syscall(libc::SYS_gettid) as libc::pid_t }
+}
+
+/// Mean per-schedule run-queue wait (ns) for thread `tid` -- schbench's
+/// `read_sched_delay` (`schbench.c:1118`). Reads `/proc/<tid>/schedstat`; an
+/// absent file (the thread exited) yields 0, like schbench's fopen-failure
+/// path. A present file is parsed by [`parse_sched_delay`].
+///
+/// `CONFIG_SCHED_INFO` (selected by `CONFIG_SCHEDSTATS`, and also by
+/// `CONFIG_TASK_DELAY_ACCT` -- ktstr.kconfig enables both) populates these
+/// fields even under sched_ext and regardless of the `kernel.sched_schedstats`
+/// sysctl (that sysctl gates the separate per-rq/domain counters, not
+/// `sched_info`).
+fn read_sched_delay(tid: libc::pid_t) -> u64 {
+    match std::fs::read_to_string(format!("/proc/{tid}/schedstat")) {
+        Ok(s) => parse_sched_delay(&s),
+        // The thread may have exited; schbench's fopen-failure path also -> 0.
+        Err(_) => 0,
+    }
+}
+
+/// Parse a `/proc/<tid>/schedstat` line into the mean run-queue wait (ns):
+/// field 2 (run_delay ns) / field 3 (pcount = timeslices). Guards pcount == 0
+/// (a never-scheduled thread, or the `!sched_info_on()` "0 0 0" line) to 0,
+/// where schbench divides by zero (`schbench.c:1146`). The kernel's
+/// `proc_pid_schedstat` always emits three integer fields, so a malformed
+/// *present* line is a kernel/parse bug: panic rather than silently report 0
+/// (matching the handshake's fail-loud stance + the no-silent-wrong-answer
+/// rule). An absent file is the caller's concern, handled there as 0.
+fn parse_sched_delay(s: &str) -> u64 {
+    let mut fields = s.split_whitespace();
+    let _run = fields.next(); // field 1: sum_exec_runtime (on-CPU ns), unused
+    let run_delay: u64 = fields
+        .next()
+        .and_then(|f| f.parse().ok())
+        .expect("schedstat field 2 (run_delay) must be a present integer");
+    let pcount: u64 = fields
+        .next()
+        .and_then(|f| f.parse().ok())
+        .expect("schedstat field 3 (pcount) must be a present integer");
+    if pcount == 0 { 0 } else { run_delay / pcount }
 }
 
 /// One worker thread's loop. Faithful to schbench's `worker_thread`
@@ -396,6 +450,10 @@ fn worker_loop(
         }
         progress.fetch_add(1, Ordering::Relaxed);
     }
+    // Record this worker's mean run-queue wait at exit (schbench reads each
+    // thread's schedstat for the final aggregate, `schbench.c:1664-1670`).
+    // SAFETY: owner-only access to this thread's sched_delay_ns cell.
+    unsafe { *td.sched_delay_ns.get() = read_sched_delay(gettid_self()) };
 }
 
 /// Resolve the worker-thread default and the per-CPU lock-array size from the
@@ -431,6 +489,12 @@ pub(crate) struct SchbenchResult {
     pub(crate) request: Percentiles,
     pub(crate) loop_count: u64,
     pub(crate) achieved_rps: f64,
+    /// Mean message-thread run-queue wait (ns), averaged across message threads
+    /// (schbench's `message_thread_delay`, `schbench.c:1673`).
+    pub(crate) sched_delay_msg_ns: u64,
+    /// Mean worker-thread run-queue wait (ns), averaged across all workers
+    /// (schbench's `worker_thread_delay`, `schbench.c:1674`).
+    pub(crate) sched_delay_worker_ns: u64,
 }
 
 /// Run one message thread plus its workers, returning the combined per-worker
@@ -442,7 +506,7 @@ fn run_one_message_thread(
     config: &SchbenchConfig,
     stop: &AtomicBool,
     progress: &AtomicU64,
-) -> (PlatStats, PlatStats) {
+) -> (PlatStats, PlatStats, u64, u64) {
     let workers: Vec<ThreadData> = (0..worker_threads).map(|_| ThreadData::new()).collect();
     let msg_td = ThreadData::new();
     let wait_list = TreiberStack::new();
@@ -462,15 +526,21 @@ fn run_one_message_thread(
 
     let mut wakeup = PlatStats::default();
     let mut request = PlatStats::default();
+    let mut workers_sched_delay_sum = 0u64;
     for w in &workers {
         // SAFETY: every worker has joined (inner scope ended), so this is the
-        // sole access to their histogram cells.
+        // sole access to their cells.
         unsafe {
             wakeup.combine(&*w.wakeup_stats.get());
             request.combine(&*w.request_stats.get());
+            workers_sched_delay_sum =
+                workers_sched_delay_sum.saturating_add(*w.sched_delay_ns.get());
         }
     }
-    (wakeup, request)
+    // SAFETY: run_msg_thread ran on this thread inside the scope above (before
+    // the join), so msg_td's sched_delay_ns is settled and this is sole access.
+    let msg_sched_delay = unsafe { *msg_td.sched_delay_ns.get() };
+    (wakeup, request, msg_sched_delay, workers_sched_delay_sum)
 }
 
 /// Run the schbench workload until `stop` is set, returning the combined wakeup
@@ -492,6 +562,8 @@ pub(crate) fn run(config: &SchbenchConfig, stop: &AtomicBool, progress: &AtomicU
     let start = monotonic_nanos();
     let mut all_wakeup = PlatStats::default();
     let mut all_request = PlatStats::default();
+    let mut total_msg_sched_delay = 0u64;
+    let mut total_worker_sched_delay = 0u64;
 
     std::thread::scope(|outer| {
         let handles: Vec<_> = (0..config.message_threads)
@@ -503,9 +575,12 @@ pub(crate) fn run(config: &SchbenchConfig, stop: &AtomicBool, progress: &AtomicU
             })
             .collect();
         for h in handles {
-            let (w, r) = h.join().expect("schbench message thread panicked");
+            let (w, r, msg_sd, workers_sd_sum) =
+                h.join().expect("schbench message thread panicked");
             all_wakeup.combine(&w);
             all_request.combine(&r);
+            total_msg_sched_delay = total_msg_sched_delay.saturating_add(msg_sd);
+            total_worker_sched_delay = total_worker_sched_delay.saturating_add(workers_sd_sum);
         }
     });
 
@@ -516,12 +591,20 @@ pub(crate) fn run(config: &SchbenchConfig, stop: &AtomicBool, progress: &AtomicU
     } else {
         0.0
     };
+    // Average the per-thread run-queue waits, matching schbench's
+    // collect_sched_delay (`schbench.c:1673-1674`): message delay over
+    // message_threads, worker delay over all workers.
+    let sched_delay_msg_ns = total_msg_sched_delay / (config.message_threads.max(1) as u64);
+    let total_workers = (config.message_threads * worker_threads).max(1) as u64;
+    let sched_delay_worker_ns = total_worker_sched_delay / total_workers;
 
     SchbenchResult {
         wakeup: all_wakeup.percentiles(),
         request: all_request.percentiles(),
         loop_count,
         achieved_rps,
+        sched_delay_msg_ns,
+        sched_delay_worker_ns,
     }
 }
 
@@ -695,5 +778,39 @@ mod tests {
         // prelude would fail this compile. Also exercises the Eq derive.
         let cfg: crate::prelude::SchbenchConfig = crate::prelude::SchbenchConfig::default();
         assert_eq!(cfg, SchbenchConfig::default());
+    }
+
+    #[test]
+    fn read_sched_delay_parses_own_and_handles_missing() {
+        // The current thread has been scheduled, so its /proc/<tid>/schedstat
+        // parses without panic.
+        let _own = read_sched_delay(gettid_self());
+        // A non-existent tid -> 0 via the file-read-failure path (thread
+        // exited), matching schbench's fopen-failure handling. The parse
+        // boundaries (incl. the pcount==0 guard) are covered by the
+        // parse_sched_delay tests below.
+        assert_eq!(read_sched_delay(-1), 0, "absent schedstat yields 0, no panic");
+    }
+
+    #[test]
+    fn parse_sched_delay_mean_and_pcount_guard() {
+        assert_eq!(parse_sched_delay("123456 50 5"), 10); // run_delay/pcount = 50/5
+        assert_eq!(parse_sched_delay("123456 50 0"), 0); // pcount==0 guard, no div-by-zero
+        assert_eq!(parse_sched_delay("0 0 0"), 0); // !sched_info_on() "0 0 0" line
+        assert_eq!(parse_sched_delay("100 0 5"), 0); // 0 run_delay -> 0 mean
+    }
+
+    #[test]
+    #[should_panic(expected = "schedstat field 3")]
+    fn parse_sched_delay_short_line_panics() {
+        // A present-but-short line is a kernel/parse bug: fail loud, not a
+        // silent 0 (the fail-loud ruling).
+        parse_sched_delay("100 50");
+    }
+
+    #[test]
+    #[should_panic(expected = "schedstat field 2")]
+    fn parse_sched_delay_nonnumeric_panics() {
+        parse_sched_delay("alpha beta gamma");
     }
 }
