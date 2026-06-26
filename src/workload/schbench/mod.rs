@@ -166,7 +166,11 @@ mod tests {
 
         // The engine did work and paced requests over the window.
         assert!(report.loop_count > 0, "loop_count: {}", report.loop_count);
-        assert!(report.achieved_rps > 0.0, "achieved_rps: {}", report.achieved_rps);
+        assert!(
+            report.achieved_rps > 0.0,
+            "achieved_rps: {}",
+            report.achieved_rps
+        );
 
         // Both latency distributions recorded samples.
         assert!(report.nr_wakeup_samples > 0, "wakeup samples");
@@ -174,19 +178,35 @@ mod tests {
 
         // The control thread sampled the per-second RPS distribution (default
         // mode samples every second; the 1s tick lands inside the 2s window).
-        assert!(report.nr_rps_samples > 0, "rps samples: {}", report.nr_rps_samples);
+        assert!(
+            report.nr_rps_samples > 0,
+            "rps samples: {}",
+            report.nr_rps_samples
+        );
 
         // Percentile values projected in order: a distribution is monotonic
         // non-decreasing across p20..p99.9 (a higher percentile sits at a
         // higher histogram bucket). Catches a transposed/garbled values array.
         for w in report.wakeup_pcts_us.windows(2) {
-            assert!(w[0] <= w[1], "wakeup percentiles monotonic: {:?}", report.wakeup_pcts_us);
+            assert!(
+                w[0] <= w[1],
+                "wakeup percentiles monotonic: {:?}",
+                report.wakeup_pcts_us
+            );
         }
         for w in report.request_pcts_us.windows(2) {
-            assert!(w[0] <= w[1], "request percentiles monotonic: {:?}", report.request_pcts_us);
+            assert!(
+                w[0] <= w[1],
+                "request percentiles monotonic: {:?}",
+                report.request_pcts_us
+            );
         }
         for w in report.rps_pcts.windows(2) {
-            assert!(w[0] <= w[1], "rps percentiles monotonic: {:?}", report.rps_pcts);
+            assert!(
+                w[0] <= w[1],
+                "rps percentiles monotonic: {:?}",
+                report.rps_pcts
+            );
         }
 
         // Per-row counts carried through (not zeroed by the projection). They are

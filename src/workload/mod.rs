@@ -129,7 +129,7 @@ pub use types::*;
 // host-side validation entry point and its report type / percentile labels (used
 // by the gated `ktstr-schbench-validate` bin for the side-by-side comparison
 // against the reference schbench).
-pub use schbench::{run_standalone, SchbenchConfig, StandaloneReport, SCHBENCH_PERCENTILES};
+pub use schbench::{SCHBENCH_PERCENTILES, SchbenchConfig, StandaloneReport, run_standalone};
 
 // `FanOutCompute` stores its u64 generation counter at offset 0 of
 // a 16-byte shared region and relies on the low 4 bytes of that

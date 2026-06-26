@@ -32,7 +32,11 @@ fn plat_val_to_idx(val: u32) -> usize {
     // C: `msb = 31 - __builtin_clz(val)`, with `clz(0)` UB-guarded to
     // `msb = 0`. Rust `u32::leading_zeros(0) == 32` would underflow, so
     // guard `val == 0` explicitly (the documented divergence point).
-    let msb = if val == 0 { 0 } else { 31 - val.leading_zeros() };
+    let msb = if val == 0 {
+        0
+    } else {
+        31 - val.leading_zeros()
+    };
 
     // MSB within PLAT_BITS: every bit is significant, index == value.
     if msb <= PLAT_BITS {
@@ -110,10 +114,7 @@ mod plat_array_serde {
     // `#[serde(with)]` contract: the field type is `Box<[u32; PLAT_NR]>`, so
     // `serialize` receives `&FieldType`. clippy's borrowed_box does not apply.
     #[allow(clippy::borrowed_box)]
-    pub(super) fn serialize<S>(
-        arr: &Box<[u32; PLAT_NR]>,
-        serializer: S,
-    ) -> Result<S::Ok, S::Error>
+    pub(super) fn serialize<S>(arr: &Box<[u32; PLAT_NR]>, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
     {
@@ -566,7 +567,10 @@ mod tests {
         assert_eq!(s, back, "json roundtrip preserves histogram + extremes");
         let bytes = postcard::to_stdvec(&s).expect("serialize postcard");
         let back2: PlatStats = postcard::from_bytes(&bytes).expect("deserialize postcard");
-        assert_eq!(s, back2, "postcard roundtrip preserves histogram + extremes");
+        assert_eq!(
+            s, back2,
+            "postcard roundtrip preserves histogram + extremes"
+        );
         // The deserialized histogram yields identical percentiles (the host path).
         assert_eq!(back2.percentiles().values, s.percentiles().values);
     }

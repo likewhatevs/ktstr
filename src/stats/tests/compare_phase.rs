@@ -96,8 +96,16 @@ fn schbench_per_phase_metrics_drive_cross_run_verdict_with_registry_polarity() {
     // (delta 1000 >> 50µs abs, rel 1.0 >> 0.25).
     let mut a = make_row("perf_scn", "tiny-1llc", true, 0.0);
     let mut b = make_row("perf_scn", "tiny-1llc", true, 0.0);
-    a.phases = vec![make_phase_bucket(1, "Step[0]", &[("wakeup_p99_latency_us", 1000.0)])];
-    b.phases = vec![make_phase_bucket(1, "Step[0]", &[("wakeup_p99_latency_us", 2000.0)])];
+    a.phases = vec![make_phase_bucket(
+        1,
+        "Step[0]",
+        &[("wakeup_p99_latency_us", 1000.0)],
+    )];
+    b.phases = vec![make_phase_bucket(
+        1,
+        "Step[0]",
+        &[("wakeup_p99_latency_us", 2000.0)],
+    )];
     let report = compare_rows_by(&[a], &[b], &[], None, &ComparisonPolicy::default());
     let lat = report
         .phase_deltas
@@ -114,8 +122,16 @@ fn schbench_per_phase_metrics_drive_cross_run_verdict_with_registry_polarity() {
     // regression (proves polarity orients the verdict, not the raw delta sign).
     let mut a2 = make_row("perf_scn", "tiny-1llc", true, 0.0);
     let mut b2 = make_row("perf_scn", "tiny-1llc", true, 0.0);
-    a2.phases = vec![make_phase_bucket(1, "Step[0]", &[("wakeup_p99_latency_us", 2000.0)])];
-    b2.phases = vec![make_phase_bucket(1, "Step[0]", &[("wakeup_p99_latency_us", 1000.0)])];
+    a2.phases = vec![make_phase_bucket(
+        1,
+        "Step[0]",
+        &[("wakeup_p99_latency_us", 2000.0)],
+    )];
+    b2.phases = vec![make_phase_bucket(
+        1,
+        "Step[0]",
+        &[("wakeup_p99_latency_us", 1000.0)],
+    )];
     let report2 = compare_rows_by(&[a2], &[b2], &[], None, &ComparisonPolicy::default());
     let lat2 = report2
         .phase_deltas
@@ -132,8 +148,16 @@ fn schbench_per_phase_metrics_drive_cross_run_verdict_with_registry_polarity() {
     // polarity from the latency metric, so a NEGATIVE delta is the regression.
     let mut a3 = make_row("perf_scn", "tiny-1llc", true, 0.0);
     let mut b3 = make_row("perf_scn", "tiny-1llc", true, 0.0);
-    a3.phases = vec![make_phase_bucket(1, "Step[0]", &[("schbench_loop_count", 5000.0)])];
-    b3.phases = vec![make_phase_bucket(1, "Step[0]", &[("schbench_loop_count", 1000.0)])];
+    a3.phases = vec![make_phase_bucket(
+        1,
+        "Step[0]",
+        &[("schbench_loop_count", 5000.0)],
+    )];
+    b3.phases = vec![make_phase_bucket(
+        1,
+        "Step[0]",
+        &[("schbench_loop_count", 1000.0)],
+    )];
     let report3 = compare_rows_by(&[a3], &[b3], &[], None, &ComparisonPolicy::default());
     let lc = report3
         .phase_deltas

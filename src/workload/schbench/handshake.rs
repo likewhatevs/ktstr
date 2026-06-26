@@ -98,7 +98,12 @@ impl Handshake {
     pub(crate) fn post(&self) {
         if self
             .word
-            .compare_exchange(FUTEX_BLOCKED, FUTEX_RUNNING, Ordering::SeqCst, Ordering::SeqCst)
+            .compare_exchange(
+                FUTEX_BLOCKED,
+                FUTEX_RUNNING,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
             .is_ok()
         {
             // SAFETY: `self.word.as_ptr()` is a live `u32` reachable by every
@@ -163,7 +168,12 @@ impl Handshake {
         loop {
             if self
                 .word
-                .compare_exchange(FUTEX_RUNNING, FUTEX_BLOCKED, Ordering::SeqCst, Ordering::SeqCst)
+                .compare_exchange(
+                    FUTEX_RUNNING,
+                    FUTEX_BLOCKED,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                )
                 .is_ok()
             {
                 return WaitOutcome::Posted;

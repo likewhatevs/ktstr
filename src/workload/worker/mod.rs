@@ -3974,7 +3974,8 @@ pub(super) fn matrix_multiply(data: &mut [u64], size: usize, work_units: &mut u6
         for j in 0..size {
             let mut acc: u64 = 0;
             for k in 0..size {
-                acc = acc.wrapping_add(data[i * size + k].wrapping_mul(data[stride + k * size + j]));
+                acc =
+                    acc.wrapping_add(data[i * size + k].wrapping_mul(data[stride + k * size + j]));
             }
             // SAFETY: `2 * stride + i * size + j` is in-bounds for a slice of
             // length `3 * stride` whenever `i, j < size`, which the surrounding

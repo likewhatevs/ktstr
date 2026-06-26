@@ -25,7 +25,7 @@
 
 use clap::Parser;
 
-use ktstr::workload::{run_standalone, SchbenchConfig, StandaloneReport, SCHBENCH_PERCENTILES};
+use ktstr::workload::{SCHBENCH_PERCENTILES, SchbenchConfig, StandaloneReport, run_standalone};
 
 /// schbench-compatible flags. The short forms match schbench (`-m`/`-t`/`-F`/
 /// `-n`/`-s`/`-L`/`-r`/`-R`) so one invocation drives both programs identically.
@@ -138,7 +138,10 @@ fn print_report(r: &StandaloneReport, runtime_secs: u64, auto_rps: usize) {
     if auto_rps != 0 {
         println!("final rps goal was {}", r.final_rps_goal);
     } else {
-        println!("average rps: {:.2}", r.loop_count as f64 / runtime_secs as f64);
+        println!(
+            "average rps: {:.2}",
+            r.loop_count as f64 / runtime_secs as f64
+        );
     }
     // schbench prints sched delay in usec on one line (`schbench.c:2001-2004`,
     // the run_delay ns / 1000); mirror that exactly.
