@@ -178,14 +178,70 @@ impl Linked for Request {
 /// `WorkloadConfig` and `WorkSpec` omit because of their transitive `f64`) are
 /// available here since every field is integer/bool -- the ktstr f64-free
 /// leaf-config convention.
+///
+/// # schbench(8) CLI parity
+///
+/// This port re-expresses schbench's default (matrix-work) mode natively, so
+/// its tunables are config fields and topology rather than CLI flags. The
+/// mapping to schbench's option table (`schbench.c:138-187`):
+///
+/// | schbench flag | ktstr |
+/// |---|---|
+/// | `-m` message-threads | `message_threads` |
+/// | `-t` threads | `worker_threads` (workers per message thread; the `0` default diverges -- see below) |
+/// | `-F` cache_footprint | `cache_footprint_kib` |
+/// | `-n` operations | `operations` |
+/// | `-s` sleep_usec | `sleep_usec` |
+/// | `-L` no-locking | `skip_locking` |
+/// | `-R` rps | `requests_per_sec` |
+/// | `-A` auto-rps | `auto_rps` |
+/// | `-r` runtime | in-VM: the scenario engine's run window (the engine runs until `stop`); host-side: the `run_secs` argument to [`run_standalone`](crate::workload::run_standalone) |
+///
+/// ## Set by ktstr topology, not a flag
+///
+/// - `-t` default: with `worker_threads = 0`, ktstr spawns one worker per CPU in
+///   the worker's `sched_getaffinity` mask (the allocated guest cpuset, set by
+///   the scenario's topology / `CgroupDef`) PER message thread. schbench's `-t`
+///   0-default instead divides its CPU count across the message threads
+///   (`ceil(num_cpus / message_threads)` per thread, `schbench.c:1852`), keeping
+///   its total worker count near `num_cpus`. ktstr does NOT divide, so at
+///   `message_threads > 1` it spawns `message_threads`x as many workers; the two
+///   coincide only at the default `message_threads = 1`. An explicit non-zero
+///   `worker_threads` is workers-per-message-thread in both.
+/// - `-M` (message-cpus) / `-W` (worker-cpus) thread pinning: ktstr places
+///   threads through its affinity / cpuset layer, so there is deliberately no
+///   per-thread-pin knob.
+///
+/// ## Observability flags -> the metric API
+///
+/// schbench's `-w` (warmuptime), `-i` (intervaltime), `-z` (zerotime), `-j`
+/// (json), and `-J` (jobname) shape its streaming stderr/JSON report. ktstr's
+/// numbers flow through the metric API instead -- per-phase attribution and the
+/// sidecar -- so these have no flag equivalent. `ktstr-schbench-validate`
+/// reproduces schbench's stderr-table shape for a side-by-side comparison.
+///
+/// ## Modes not ported
+///
+/// - `-p` (pipe): schbench's pipe-transfer test -- a separate workload from the
+///   matrix-work default this port re-expresses (`schbench.c:177`). Not
+///   available.
+/// - `--split` (long-only; no short flag): schbench's private/shared
+///   cache-footprint split (`schbench.c:184`). This port uses the single
+///   all-private working set (`matrix_size`); there is no split knob.
+/// - `-C` (calibrate): a tuning aid that times schbench's own work loop and
+///   forces `-L` (`schbench.c:166`, `:389`). Intentionally out of scope -- ktstr
+///   measures through the metric path.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct SchbenchConfig {
     /// Number of message threads (`schbench.c` `-m`, default 1).
     pub message_threads: usize,
-    /// Worker threads per message thread (`schbench.c` `-t`). 0 means "one per
-    /// CPU in the allocated cpuset" (schbench's `get_nprocs` default, scoped to
-    /// the guest cpuset per ruling).
+    /// Worker threads per message thread (`schbench.c` `-t`). 0 resolves to one
+    /// per CPU in the allocated guest cpuset (the worker's `sched_getaffinity`
+    /// mask, per ruling), spawned PER message thread -- which diverges from
+    /// schbench's 0-default, which divides its CPU count across the message
+    /// threads (`ceil(num_cpus / message_threads)`, `schbench.c:1852`); the two
+    /// coincide only at `message_threads = 1`. See the CLI-parity section above.
     pub worker_threads: usize,
     /// Per-worker matrix cache footprint in KiB (`schbench.c` `-F`, default
     /// 256); sets the matrix dimension.

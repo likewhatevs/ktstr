@@ -53,6 +53,7 @@ pub enum WorkType {
         operations: usize,
         sleep_usec: u64,
     },
+    Schbench { config: SchbenchConfig },                // schbench's message/worker wakeup + request-latency benchmark, re-expressed natively.
     AsymmetricWaker {                                   // Paired workers in mismatched scheduling classes share one futex word.
         waker_class: SchedClass,
         wakee_class: SchedClass,
@@ -85,6 +86,7 @@ pub enum WorkType {
     PolicyChurn { spin_iters: u64 },                    // Cycle SCHED_OTHER -> BATCH -> IDLE (-> FIFO/RR if CAP_SYS_NICE).
     NumaMigrationChurn { period_ms: u64 },              // Rotate sched_setaffinity across NUMA nodes.
     CgroupChurn { groups: usize, cycle_ms: u64 },       // Cycle cgroup membership between sibling cgroups.
+    CgroupAttachStorm { dest: String, reap: ReapMode }, // Fork a transient child, migrate it into a sibling cgroup.procs, child _exit's (attach-path leader race).
 
     // Memory pressure / NUMA
     PageFaultChurn {                                    // mmap NOHUGEPAGE -> touch random pages -> MADV_DONTNEED, repeat.
@@ -147,7 +149,9 @@ pub enum WorkType {
 ```
 
 > **Imports:** `WorkType`, `WorkPhase`, `SchedPolicy`, `AluWidth`,
-> `WorkSpec`, and `WorkloadConfig` are in `ktstr::prelude::*`.
+> `WorkSpec`, `WorkloadConfig`, `SchbenchConfig` (the `Schbench`
+> config), and `ReapMode` (the `CgroupAttachStorm` reap mode) are in
+> `ktstr::prelude::*`.
 > (Note: the prelude also exports an unrelated `Phase` from
 > `crate::assert` — the temporal-assertion phase bucket. The
 > `WorkType::Sequence` variant uses `WorkPhase`, not `Phase`.) The
@@ -199,6 +203,7 @@ time via `WorkType::ipc_variance`.
 | Scheduling class transitions | `PolicyChurn` |
 | Page fault / TLB pressure | `PageFaultChurn` |
 | Lock contention / convoy effect | `MutexContention` |
+| Wakeup + request latency (schbench parity) | `Schbench` |
 | Arbitrary user-defined workload | `Custom` |
 
 ## Variants
@@ -271,6 +276,19 @@ messenger per group stamps a `CLOCK_MONOTONIC` timestamp then wakes
 iterations of naive matrix multiply over a `cache_footprint_kib`-sized
 working set (three square matrices of u64, O(n^3)). Requires
 `num_workers` divisible by `fan_out + 1`.
+
+**`Schbench`** -- schbench's default-mode benchmark re-expressed natively
+(the `schbench_rs` port): message threads batch-wake worker threads
+(measuring scheduler wakeup latency), and each worker think-sleeps then
+does matrix work under a per-CPU lock (measuring request latency).
+Carries a `SchbenchConfig` (build it with `SchbenchConfig::default()`
+plus its chainable setters) that maps schbench's
+`-m`/`-t`/`-F`/`-n`/`-s`/`-L`/`-R`/`-A` flags onto config fields; see the
+`SchbenchConfig` rustdoc for the full schbench(8) CLI-parity table —
+which flags map to fields, which are set by ktstr topology, and which
+schbench modes (`-p` pipe, `--split`, `-C` calibrate) are not ported.
+Use a single ktstr worker (`workers(1)`); the message/worker parallelism
+is this variant's internal thread topology, not ktstr worker processes.
 
 **`Sequence`** -- compound work pattern: loop through phases in order,
 repeat. Each phase runs for its specified duration before the next
