@@ -69,7 +69,9 @@ below are from that disassembly run (the dumps themselves are not committed):
 One table per axis. Each cell is the avg-of-3 with the `[min–max]` run spread; the
 verdict is `yes` if ktstr's avg-of-3 lies within `[min(gcc,clang), max(gcc,clang)]`,
 else `NO (±x%)` where x is the signed distance from the nearer gcc/clang avg edge
-(`(ktstr − nearest)/nearest`). `wakeup p99` is reported as `noise` — see [1].
+(`(ktstr − nearest)/nearest`). `wakeup p99` is reported as `noise` — see [1]. The
+`-p` pipe axis uses n=5 and reports per-worker memory-transfer throughput, also
+`noise` — see [2].
 
 ### Default (no flags beyond topology)
 
@@ -284,6 +286,39 @@ else `NO (±x%)` where x is the signed distance from the nearer gcc/clang avg ed
 | rps p50 | 466.0 [464–468] | 494.3 [493–496] | 481.3 [481–482] | yes |
 | avg rps | 467.3 [465.8–469.4] | 494.8 [493.1–496.7] | 482.1 [481.0–483.9] | yes |
 
+### `-p` pipe-transfer = 4 KiB
+
+`-m 1 -t 2 -r 10 -p 4096` (n=5 per impl; pipe mode reports PER-WORKER
+memory-transfer throughput, no request/rps tables — higher=better). Throughput is
+`avg worker transfer × transfer size` in schbench's ÷1024 units (`MB` = MiB).
+
+| metric | schbench-gcc | schbench-clang | ktstr | ktstr in gcc↔clang envelope |
+|---|---|---|---|---|
+| avg worker transfer (ops/sec) | 176626 [148667–223797] | 208624 [174388–243977] | 179714 [159112–198351] | noise [2] |
+| throughput (per-worker) | ~690 MB/s | ~815 MB/s | ~702 MB/s | noise [2] |
+| wakeup p99 (us) | 4.8 [4–5] | 4.4 [4–5] | 4.0 [4–4] | noise [1] |
+
+### `-p` pipe-transfer = 64 KiB
+
+`-m 1 -t 2 -r 10 -p 65536` (n=5 per impl; per-worker throughput, higher=better)
+
+| metric | schbench-gcc | schbench-clang | ktstr | ktstr in gcc↔clang envelope |
+|---|---|---|---|---|
+| avg worker transfer (ops/sec) | 117608 [104592–127504] | 111554 [94503–126730] | 112928 [101909–127000] | noise [2] |
+| throughput (per-worker) | ~7.18 GB/s | ~6.81 GB/s | ~6.89 GB/s | noise [2] |
+| wakeup p99 (us) | 4.6 [4–5] | 4.8 [4–5] | 4.0 [4–4] | noise [1] |
+
+### `-p` pipe-transfer = 1 MiB
+
+`-m 1 -t 2 -r 10 -p 1048576` (n=5 per impl; per-worker throughput, higher=better;
+1 MiB is the `PIPE_TRANSFER_BUFFER` cap)
+
+| metric | schbench-gcc | schbench-clang | ktstr | ktstr in gcc↔clang envelope |
+|---|---|---|---|---|
+| avg worker transfer (ops/sec) | 23762 [16190–26558] | 22767 [19047–26310] | 20796 [17694–22312] | noise [2] |
+| throughput (per-worker) | ~23.2 GB/s | ~22.2 GB/s | ~20.3 GB/s | noise [2] |
+| wakeup p99 (us) | 4.8 [4–6] | 5.0 [5–5] | 5.0 [5–5] | noise [1] |
+
 ## Reading the results
 
 - **[1] `wakeup p99` is reported as `noise`.** Wakeup latency is 5-10 microseconds
@@ -294,6 +329,16 @@ else `NO (±x%)` where x is the signed distance from the nearer gcc/clang avg ed
   (Under `-R 1000` the envelope is additionally
   degenerate: clang's front-loaded backlog drives its wakeup p99 to ~329ms while
   ktstr stays at 6us, so a numeric comparison there is meaningless regardless.)
+- **[2] pipe-mode `avg worker transfer` is reported as `noise`.** The per-worker
+  transfer rate is scheduling-dominated (each cycle is a wakeup handshake plus a
+  memset) and varies widely run-to-run (full spreads ~20–44%, single runs up to
+  ±32% of the mean) — e.g. ktstr `-p 4096` spans 159k–198k
+  ops/sec across 5 runs, and every implementation's spread overlaps the others'
+  entirely, so the avg-to-avg envelope is too tight to assign a verdict. That it is
+  noise rather than a divergence is confirmed by the out-of-envelope cell MOVING
+  with the sample: a 3-run sample flagged `-p 65536` as +8.3% out, while the 5-run
+  sample flagged `-p 1 MiB` as −8.7% instead. ktstr's per-worker rate sits inside
+  both schbench builds' run-to-run ranges at all three transfer sizes.
 - **`-F 64` (tiny footprint):** ktstr's request latency runs ~5-11% higher and
   rps ~6% lower. At a 64 KiB footprint the matrix is small (dim ~26) and
   per-request cost is dominated by fixed per-cycle overhead rather than the matrix
@@ -316,7 +361,7 @@ else `NO (±x%)` where x is the signed distance from the nearer gcc/clang avg ed
 ## Summary
 
 Across the full flag surface -- `-m`, `-t`, `-F`, `-n`, `-s`, `-L`, `-R`,
-`--split`, and the default -- ktstr's wakeup/request latency percentiles and
+`--split`, `-p`, and the default -- ktstr's wakeup/request latency percentiles and
 throughput land **within the envelope that the reference schbench itself spans
 between its gcc and clang builds** on the large majority of axes, which is the
 strongest fidelity statement available: the port behaves like a third compilation
@@ -331,3 +376,6 @@ many-core host, where the busy target is physically unreachable by 2 workers and
 the controller goal runs away in *both* implementations. The matrix compute is
 byte-faithful (identical scalar `imul` to both compilers, observed by
 disassembly), and `--split` reproduces schbench's per-k shared-C cache contention.
+The `-p` pipe mode reproduces schbench's per-worker memory-transfer report; its
+throughput is scheduling-dominated and lands within both schbench builds'
+run-to-run spread (`noise` [2]).
