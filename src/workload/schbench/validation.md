@@ -154,3 +154,27 @@ else `NO (±x%)` where x is the signed distance from the nearer gcc/clang avg ed
 | request p99 (us) | 36160.0 [35904–36416] | 36800.0 [36416–37184] | 36714.7 [36288–37056] | yes |
 | rps p50 | 56.7 [56–57] | 55.0 [55–55] | 55.3 [55–56] | yes |
 | avg rps | 57.8 [57.6–58.0] | 56.3 [56.2–56.4] | 56.9 [56.7–57.1] | yes |
+
+### `-n` operations = 1
+
+`-m 1 -t 2 -n 1 -r 10` (n=3 per impl; lower=better except rps)
+
+| metric | schbench-gcc | schbench-clang | ktstr | ktstr in gcc↔clang envelope |
+|---|---|---|---|---|
+| wakeup p99 (us) | 11.7 [8–18] | 14.3 [9–18] | 9.0 [8–10] | noise [1] |
+| request p50 (us) | 973.0 [973–973] | 927.7 [925–931] | 959.0 [957–963] | yes |
+| request p99 (us) | 1059.3 [1058–1062] | 1178.0 [995–1542] | 1032.3 [1021–1038] | NO (-2.5%) |
+| rps p50 | 2039.3 [2034–2046] | 2124.0 [2108–2132] | 2081.3 [2068–2092] | yes |
+| avg rps | 2040.0 [2034.3–2044.4] | 2116.5 [2109.9–2125.4] | 2085.1 [2074.2–2095.9] | yes |
+
+### `-n` operations = 20
+
+`-m 1 -t 2 -n 20 -r 10` (n=3 per impl; lower=better except rps)
+
+| metric | schbench-gcc | schbench-clang | ktstr | ktstr in gcc↔clang envelope |
+|---|---|---|---|---|
+| wakeup p99 (us) | 9.0 [9–9] | 8.3 [7–9] | 7.7 [7–8] | noise [1] |
+| request p50 (us) | 16693.3 [16672–16736] | 15696.0 [15664–15728] | 16229.3 [16144–16304] | yes |
+| request p99 (us) | 17440.0 [17376–17504] | 16112.0 [16080–16144] | 17269.3 [17056–17632] | yes |
+| rps p50 | 118.7 [118–119] | 126.0 [126–126] | 122.0 [121–123] | yes |
+| avg rps | 119.8 [119.6–120.1] | 127.0 [126.9–127.2] | 123.2 [122.7–123.9] | yes |
