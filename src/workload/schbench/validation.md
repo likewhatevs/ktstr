@@ -283,3 +283,51 @@ else `NO (±x%)` where x is the signed distance from the nearer gcc/clang avg ed
 | request p99 (us) | 4573.3 [4552–4584] | 4226.7 [4200–4264] | 4552.0 [4472–4664] | yes |
 | rps p50 | 466.0 [464–468] | 494.3 [493–496] | 481.3 [481–482] | yes |
 | avg rps | 467.3 [465.8–469.4] | 494.8 [493.1–496.7] | 482.1 [481.0–483.9] | yes |
+
+## Reading the results
+
+- **[1] `wakeup p99` is reported as `noise`.** Wakeup latency is 5-10 microseconds
+  (single-digit integer buckets); 1us run-to-run jitter reads as a large
+  *percentage* but is not a real divergence, so no envelope verdict is assigned.
+  ktstr's wakeup latency is comparable to both schbench builds -- lower on most
+  axes, within a few microseconds (occasionally a hair higher) on the rest.
+  (Under `-R 1000` the envelope is additionally
+  degenerate: clang's front-loaded backlog drives its wakeup p99 to ~329ms while
+  ktstr stays at 6us, so a numeric comparison there is meaningless regardless.)
+- **`-F 64` (tiny footprint):** ktstr's request latency runs ~5-11% higher and
+  rps ~6% lower. At a 64 KiB footprint the matrix is small (dim ~26) and
+  per-request cost is dominated by fixed per-cycle overhead rather than the matrix
+  work, so small constant-factor differences in the engine show up proportionally;
+  at the default and larger footprints (256-1024 KiB) ktstr is within the
+  envelope.
+- **`-R 1000` (over capacity):** ktstr delivers ~494 rps -- full worker capacity
+  -- while schbench delivers ~394 (gcc) / ~418 (clang). ktstr is *above* the
+  envelope because it uses the full capacity with a bounded queue (6us wakeup p99),
+  whereas schbench front-loads each second and lets a backlog build (clang's wakeup
+  p99 tail reaches ~329ms). Within capacity (`-R` <= ~400, not shown over-cap)
+  ktstr delivers the requested rate exactly. This is the paced-injector behavior.
+- **`--split` edge "NO" verdicts (<=1.7%):** on split, ktstr's *throughput* (avg
+  rps) sits fractionally ABOVE both gcc and clang -- highest of the three --
+  nearest the clang edge on `--split 0` (+0.6%) and nearest gcc on `--split 50`
+  (+0.0%: ktstr 1330.8 vs gcc 1330.6); its *latency* on these cells sits below
+  both. After the per-k shared-C store fix ktstr tracks the gcc end of the
+  contention envelope.
+
+## Summary
+
+Across the full flag surface -- `-m`, `-t`, `-F`, `-n`, `-s`, `-L`, `-R`,
+`--split`, and the default -- ktstr's wakeup/request latency percentiles and
+throughput land **within the envelope that the reference schbench itself spans
+between its gcc and clang builds** on the large majority of axes, which is the
+strongest fidelity statement available: the port behaves like a third compilation
+of the same workload. The out-of-envelope cells are small and explained in
+*Reading the results*: `-F 64`'s tiny-footprint constant-factor regime (the
+largest, ~5-11%), the `--split` edges (<=1.7%, ktstr at the gcc end of the
+contention envelope), and `-n 1` request p99 (-2.5%). Two departures are
+qualitatively distinct: (1) the `-R` over-capacity regime, where ktstr is *more*
+faithful to the `-R` contract (delivers the requested rate / full capacity with
+bounded latency) than schbench's burst-and-backlog, and (2) `-A` on this
+many-core host, where the busy target is physically unreachable by 2 workers and
+the controller goal runs away in *both* implementations. The matrix compute is
+byte-faithful (identical scalar `imul` to both compilers, observed by
+disassembly), and `--split` reproduces schbench's per-k shared-C cache contention.
