@@ -1204,6 +1204,16 @@ pub(crate) const SCHBENCH_REQUEST_P999_US: &str = "request_p999_latency_us";
 pub(crate) const SCHBENCH_SCHED_DELAY_MSG_US: &str = "sched_delay_msg_us";
 pub(crate) const SCHBENCH_SCHED_DELAY_WORKER_US: &str = "sched_delay_worker_us";
 pub(crate) const SCHBENCH_LOOP_COUNT: &str = "schbench_loop_count";
+// taobench per-phase metric keys (the WorkType::Taobench engine's qps + hit
+// ratios, derived per-phase by write_taobench_scalars; MetricKind::PerPhase).
+// total/fast qps are HigherBetter; slow_qps + hit_ratio + hit_rate are
+// Informational (slow_qps is a component, not a direction; the hit numbers are
+// run-validity signals, not regression directions).
+pub(crate) const TAOBENCH_TOTAL_QPS: &str = "taobench_total_qps";
+pub(crate) const TAOBENCH_FAST_QPS: &str = "taobench_fast_qps";
+pub(crate) const TAOBENCH_SLOW_QPS: &str = "taobench_slow_qps";
+pub(crate) const TAOBENCH_HIT_RATIO: &str = "taobench_hit_ratio";
+pub(crate) const TAOBENCH_HIT_RATE: &str = "taobench_hit_rate";
 // Per-phase latency min/max (schbench's `min=`/`max=` table footer,
 // `schbench.c:579`): the per-phase PlatStats already carries them, so these are
 // emitted from `q.min`/`q.max`. LowerBetter (a higher min/max latency is worse).
@@ -2060,6 +2070,55 @@ pub static METRICS: &[MetricDef] = &[
         kind: MetricKind::PerPhase,
         default_abs: 10.0,
         default_rel: 0.30,
+        display_unit: "",
+        accessor: |_| None,
+    },
+    // taobench per-phase qps + hit ratios (WorkType::Taobench engine, derived by
+    // write_taobench_scalars). total/fast qps HigherBetter (throughput); slow_qps
+    // + hit_ratio + hit_rate Informational (a component / run-validity signals,
+    // never a regression direction — see classify_direction).
+    MetricDef {
+        name: TAOBENCH_TOTAL_QPS,
+        polarity: crate::test_support::Polarity::HigherBetter,
+        kind: MetricKind::PerPhase,
+        default_abs: 1000.0,
+        default_rel: 0.10,
+        display_unit: "ops/s",
+        accessor: |_| None,
+    },
+    MetricDef {
+        name: TAOBENCH_FAST_QPS,
+        polarity: crate::test_support::Polarity::HigherBetter,
+        kind: MetricKind::PerPhase,
+        default_abs: 1000.0,
+        default_rel: 0.10,
+        display_unit: "ops/s",
+        accessor: |_| None,
+    },
+    MetricDef {
+        name: TAOBENCH_SLOW_QPS,
+        polarity: crate::test_support::Polarity::Informational,
+        kind: MetricKind::PerPhase,
+        default_abs: 1000.0,
+        default_rel: 0.10,
+        display_unit: "ops/s",
+        accessor: |_| None,
+    },
+    MetricDef {
+        name: TAOBENCH_HIT_RATIO,
+        polarity: crate::test_support::Polarity::Informational,
+        kind: MetricKind::PerPhase,
+        default_abs: 0.02,
+        default_rel: 0.05,
+        display_unit: "",
+        accessor: |_| None,
+    },
+    MetricDef {
+        name: TAOBENCH_HIT_RATE,
+        polarity: crate::test_support::Polarity::Informational,
+        kind: MetricKind::PerPhase,
+        default_abs: 0.02,
+        default_rel: 0.05,
         display_unit: "",
         accessor: |_| None,
     },

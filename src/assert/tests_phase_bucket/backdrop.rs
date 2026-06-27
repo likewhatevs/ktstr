@@ -30,6 +30,7 @@ fn slice(epoch: u32) -> PhaseSlice {
         // Generic-fold tests; the schbench per-phase carrier is covered by its
         // own host-fold tests in layer 2.
         schbench: None,
+        taobench: None,
     }
 }
 

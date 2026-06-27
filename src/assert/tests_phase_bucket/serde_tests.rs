@@ -66,6 +66,7 @@ fn phase_bucket_per_cgroup_round_trips_and_defaults_empty() {
             stripped: false,
             metrics: std::collections::BTreeMap::new(),
             schbench: None,
+            taobench: None,
         },
     );
     let json = serde_json::to_string(&bucket).expect("serialize");

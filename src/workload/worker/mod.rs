@@ -155,6 +155,7 @@ fn build_phase_slice(
         // Generic (non-schbench) drain path: the schbench engine emits its own
         // PhaseSlices directly in the WorkType::Schbench arm.
         schbench: None,
+        taobench: None,
     }
 }
 
@@ -1592,6 +1593,34 @@ pub(super) fn worker_main(
                 // `observed_change`, causing the post-loop final drain to push a
                 // second — both polluting the per-epoch buckets alongside the
                 // schbench slices above. The post-loop report build still runs.
+                break;
+            }
+            WorkType::Taobench { ref config } => {
+                // Mirror the Schbench arm: run() blocks until `stop`, is
+                // phase-aware (watches `phase_epoch`, splitting its per-phase op
+                // counters at each step boundary), and returns one
+                // TaobenchPhaseStats per phase. The generic phase machinery never
+                // fires (this loop runs exactly once); break before the generic
+                // drain so it cannot push a duplicate slice.
+                let progress = AtomicU64::new(0);
+                let pe = if phase_epoch.is_null() {
+                    None
+                } else {
+                    // SAFETY: as in the Schbench arm — `phase_epoch` is the
+                    // shared per-phase word the parent set up for this backdrop
+                    // handle; valid for the worker's lifetime, read-only here.
+                    Some(unsafe { &*phase_epoch })
+                };
+                let outcome = crate::workload::taobench::run::run(config, stop, &progress, pe);
+                work_units = work_units.saturating_add(outcome.whole_run.total_ops());
+                for (epoch, stats) in outcome.phases {
+                    phase_slices.push(PhaseSlice {
+                        phase_epoch: epoch,
+                        taobench: Some(stats),
+                        ..Default::default()
+                    });
+                }
+                iterations += 1;
                 break;
             }
             WorkType::PageFaultChurn {

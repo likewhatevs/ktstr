@@ -515,6 +515,11 @@ name = "ktstr-schbench-validate"
 path = "src/bin/schbench_validate.rs"
 required-features = ["cli-bins", "integration"]
 
+[[bin]]
+name = "ktstr-taobench-validate"
+path = "src/bin/taobench_validate.rs"
+required-features = ["cli-bins", "integration"]
+
 [[test]]
 name = "ktstr_sched_tests"
 

@@ -420,6 +420,7 @@ pub(crate) fn phase_cgroup_stats(
         // schbench rides PhaseSlice (the backdrop per-phase carrier), not the
         // whole-run WorkerReports this fn pools, so it is always None here.
         schbench: None,
+        taobench: None,
     }
 }
 
@@ -476,6 +477,9 @@ pub(crate) fn phase_slice_to_cgroup_stats(
         // Carry the per-phase schbench engine metrics through (None for every
         // non-schbench backdrop slice); PhaseCgroupStats::merge pools them.
         schbench: slice.schbench.clone(),
+        // Carry the per-phase taobench engine metrics through (None for every
+        // non-taobench backdrop slice); PhaseCgroupStats::merge pools them.
+        taobench: slice.taobench,
     }
 }
 
@@ -513,6 +517,7 @@ pub(crate) fn pool_phase_slice_stats(
             stripped: false,
             metrics: std::collections::BTreeMap::new(),
             schbench: None,
+            taobench: None,
         },
     }
 }

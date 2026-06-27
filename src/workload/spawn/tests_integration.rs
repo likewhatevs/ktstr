@@ -93,6 +93,7 @@ fn worker_report_serde_roundtrip() {
             max_gap_ms: 9,
             max_gap_cpu: 2,
             schbench: None,
+            taobench: None,
         }],
     };
     let json = serde_json::to_string(&r).unwrap();
@@ -1384,6 +1385,7 @@ fn fully_populated_report() -> WorkerReport {
             max_gap_ms: 27,
             max_gap_cpu: 4,
             schbench: None,
+            taobench: None,
         }],
     }
 }

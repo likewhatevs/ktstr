@@ -682,6 +682,16 @@ pub struct PhaseSlice {
     /// `PhaseSlice`) whose element type is `pub(crate)`. Integer-only, so it
     /// preserves `PhaseSlice`'s `Eq`.
     pub(crate) schbench: Option<crate::workload::schbench::run::SchbenchPhaseStats>,
+    /// Per-phase taobench engine metrics, present ONLY for a
+    /// `WorkType::Taobench` backdrop worker (`None` for every other work type —
+    /// the generic drain leaves it `None`). Carries the phase's request- and
+    /// response-time op counters
+    /// ([`crate::workload::taobench::run::TaobenchPhaseStats`]); the host derives
+    /// per-phase qps / hit-ratio into `PhaseBucket.metrics`. `pub(crate)`: an
+    /// internal carrier (test authors read `PhaseBucket`, not `PhaseSlice`) whose
+    /// element type is `pub(crate)`. Integer-only, so it preserves `PhaseSlice`'s
+    /// `Eq`.
+    pub(crate) taobench: Option<crate::workload::taobench::run::TaobenchPhaseStats>,
 }
 
 /// Reason a sentinel [`WorkerReport`] was synthesized — attached to

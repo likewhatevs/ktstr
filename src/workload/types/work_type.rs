@@ -16,6 +16,7 @@ use crate::workload::config::{
     AluWidth, FutexLockMode, ReapMode, SchedClass, WakeMechanism, humantime_serde_helper,
 };
 use crate::workload::schbench::run::SchbenchConfig;
+use crate::workload::taobench::run::TaobenchConfig;
 
 use crate::workload::WorkerReport;
 
@@ -563,6 +564,18 @@ pub enum WorkType {
     /// ktstr worker (`workers(1)`) -- the message/worker parallelism is this
     /// variant's internal thread topology, not ktstr worker processes.
     Schbench { config: SchbenchConfig },
+    /// A bounded, evicting key-value cache workload, re-expressed natively (the
+    /// `taobench_rs` port of the taobench object-cache benchmark). One worker
+    /// process runs a closed-loop client population over an in-process sharded
+    /// cache: a fast in-cache hit path and a slow backing-store-miss path (a
+    /// dispatcher-thread sleep), driven to a steady-state hit ratio by sizing the
+    /// key range against the cache capacity. The carried [`TaobenchConfig`] sets
+    /// the thread counts, cache capacity, target hit ratio, and slow-path
+    /// latency; build it with [`TaobenchConfig::default`] plus its chainable
+    /// setters. Use a single ktstr worker (`workers(1)`) -- the client/fast/slow
+    /// parallelism is this variant's internal thread topology, not ktstr worker
+    /// processes.
+    Taobench { config: TaobenchConfig },
     /// Rapid page fault cycling. Workers mmap a `region_kib` KiB region with
     /// `MADV_NOHUGEPAGE` (forcing 4 KiB pages), touch `touches_per_cycle`
     /// random pages via write faults, then `MADV_DONTNEED` to zap PTEs and

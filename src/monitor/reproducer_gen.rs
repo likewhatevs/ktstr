@@ -678,6 +678,7 @@ fn is_unmapped_work_type(w: &WorkType) -> bool {
         | WorkType::PolicyChurn { .. }
         | WorkType::FanOutCompute { .. }
         | WorkType::Schbench { .. }
+        | WorkType::Taobench { .. }
         | WorkType::PageFaultChurn { .. }
         | WorkType::MutexContention { .. }
         | WorkType::Custom { .. }
@@ -931,6 +932,7 @@ fn render_work_type(w: &WorkType) -> String {
         WorkType::PolicyChurn { .. } => render_work_type_todo("PolicyChurn"),
         WorkType::FanOutCompute { .. } => render_work_type_todo("FanOutCompute"),
         WorkType::Schbench { .. } => render_work_type_todo("Schbench"),
+        WorkType::Taobench { .. } => render_work_type_todo("Taobench"),
         WorkType::PageFaultChurn { .. } => render_work_type_todo("PageFaultChurn"),
         WorkType::MutexContention { .. } => render_work_type_todo("MutexContention"),
         WorkType::Custom { .. } => render_work_type_todo("Custom"),

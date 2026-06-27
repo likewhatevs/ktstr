@@ -445,6 +445,13 @@ pub struct PhaseCgroupStats {
     /// not this. Non-`pub` so the `crate::Claim` derive skips it (a percentile
     /// histogram has no meaningful scalar claim accessor).
     pub(crate) schbench: Option<crate::workload::schbench::run::SchbenchPhaseStats>,
+    /// Per-phase taobench engine metrics for a `WorkType::Taobench` backdrop
+    /// cgroup (`None` for every non-taobench carrier). Pooled across the cgroup's
+    /// workers by [`PhaseCgroupStats::merge`] (counter-add, wall-window MAX). The
+    /// taobench per-phase derivation reads it, pools across cgroups, and derives
+    /// the per-phase qps / hit-ratio scalars into [`PhaseBucket::metrics`].
+    /// `pub(crate)`: an internal carrier whose element type is `pub(crate)`.
+    pub(crate) taobench: Option<crate::workload::taobench::run::TaobenchPhaseStats>,
 }
 
 impl PhaseCgroupStats {
@@ -535,6 +542,17 @@ impl PhaseCgroupStats {
             (Some(x), None) | (None, Some(x)) => Some(x),
             (None, None) => None,
         };
+        // Per-phase taobench: OR-with-merge — both Some → counter-add + wall-window
+        // MAX (TaobenchPhaseStats::merge, the SAME op the guest engine pools with);
+        // one Some → carry; both None (non-taobench cgroup) → None.
+        let taobench = match (a.taobench, b.taobench) {
+            (Some(mut x), Some(y)) => {
+                x.merge(&y);
+                Some(x)
+            }
+            (Some(x), None) | (None, Some(x)) => Some(x),
+            (None, None) => None,
+        };
         PhaseCgroupStats {
             num_workers: a.num_workers + b.num_workers,
             cpus_used,
@@ -558,6 +576,7 @@ impl PhaseCgroupStats {
             // double-count; the post-merge re-derive is the sole producer.
             metrics: std::collections::BTreeMap::new(),
             schbench,
+            taobench,
         }
     }
 

@@ -1158,6 +1158,7 @@ fn assert_result_merge_per_phase_per_cgroup_unions_and_folds() {
             stripped: false,
             metrics: std::collections::BTreeMap::new(),
             schbench: None,
+            taobench: None,
         },
     );
     a_bucket.per_cgroup.insert(
@@ -1198,6 +1199,7 @@ fn assert_result_merge_per_phase_per_cgroup_unions_and_folds() {
             stripped: false,
             metrics: std::collections::BTreeMap::new(),
             schbench: None,
+            taobench: None,
         },
     );
     b_bucket.per_cgroup.insert(

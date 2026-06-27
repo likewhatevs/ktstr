@@ -93,6 +93,7 @@
 mod affinity;
 mod config;
 pub(crate) mod schbench;
+pub(crate) mod taobench;
 mod spawn;
 mod types;
 mod worker;
@@ -133,6 +134,14 @@ pub use types::*;
 pub use schbench::{
     PipeTransferReport, SCHBENCH_PERCENTILES, SchbenchConfig, StandaloneReport,
     pipe_transfer_report, run_standalone,
+};
+// taobench_rs is a private submodule like schbench_rs above. Its user-facing
+// config type + the host-side validation runner/report are re-exported here (the
+// WorkType::Taobench variant carries the config; the runner backs the
+// ktstr-taobench-validate driver). `run_standalone` is aliased to avoid colliding
+// with schbench's flat `run_standalone` re-export above.
+pub use taobench::{
+    TaobenchConfig, TaobenchStandaloneReport, run_standalone as taobench_run_standalone,
 };
 
 // `FanOutCompute` stores its u64 generation counter at offset 0 of

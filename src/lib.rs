@@ -938,7 +938,8 @@ pub mod prelude {
     pub use crate::workload::{
         AffinityIntent, AluWidth, CloneMode, CustomCfg, CustomFn, FutexLockMode, MemPolicy,
         Migration, MpolFlags, ReapMode, ResolvedAffinity, SchbenchConfig, SchedClass, SchedPolicy,
-        WakeMechanism, WorkPhase, WorkSpec, WorkType, WorkTypeValidationError, WorkerCtx,
+        TaobenchConfig, WakeMechanism, WorkPhase, WorkSpec, WorkType, WorkTypeValidationError,
+        WorkerCtx,
         WorkerReport, WorkerReportClaim, WorkloadConfig, WorkloadHandle,
     };
     // Surface `Phase` from the assert module (the scenario-step

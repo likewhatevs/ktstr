@@ -1197,6 +1197,7 @@ pub(crate) fn derive_phase_metrics(phases: &mut [PhaseBucket]) {
         // percentile re-derives from the pooled histogram via PlatStats::combine =
         // bucket-count add, never averaged), and pooled == cross-cgroup re-pool.
         let mut pooled: Option<SchbenchPhaseStats> = None;
+        let mut pooled_taobench: Option<crate::workload::taobench::run::TaobenchPhaseStats> = None;
         for pc in bucket.per_cgroup.values_mut() {
             // Non-schbench carrier-derived metrics (wake/run-delay/off-cpu
             // distributions + the migration/iterations/locality ratios + the
@@ -1220,9 +1221,24 @@ pub(crate) fn derive_phase_metrics(phases: &mut [PhaseBucket]) {
                     None => pooled = Some(s.clone()),
                 }
             }
+            // taobench per-phase: same disjoint-field-borrow pattern (`t` reads
+            // pc.taobench, the reducer writes pc.metrics) + pool across cgroups.
+            if let Some(t) = pc.taobench.as_ref() {
+                write_taobench_scalars(t, &mut pc.metrics);
+                match pooled_taobench.take() {
+                    Some(mut acc) => {
+                        acc.merge(t);
+                        pooled_taobench = Some(acc);
+                    }
+                    None => pooled_taobench = Some(*t),
+                }
+            }
         }
         if let Some(p) = pooled {
             write_schbench_scalars(&p, &mut bucket.metrics);
+        }
+        if let Some(t) = pooled_taobench {
+            write_taobench_scalars(&t, &mut bucket.metrics);
         }
     }
 }
@@ -1399,4 +1415,38 @@ fn write_schbench_scalars(
     // measured value; HigherBetter → worst), distinct from a non-schbench carrier
     // which has no schbench data at all (the caller skips it).
     out.insert(SCHBENCH_LOOP_COUNT.to_string(), p.loop_count as f64);
+}
+
+/// Write the per-phase taobench scalar metrics derived from ONE
+/// `TaobenchPhaseStats` (a single cgroup's carrier, or the cross-cgroup pool)
+/// into `out`, keyed by registry [`crate::stats::MetricDef`] name. The sole
+/// producer of these keys for both the per-cgroup ([`PhaseCgroupStats::metrics`])
+/// and pooled ([`PhaseBucket::metrics`]) maps. ABSENT discipline: the qps keys
+/// only when the wall window was measured (`elapsed_ns > 0`); hit_ratio only when
+/// ops completed (`total > 0`); hit_rate only when lookups were issued
+/// (`get_cmds > 0`) — a not-measured value reads as missing, never a false 0.
+fn write_taobench_scalars(
+    p: &crate::workload::taobench::run::TaobenchPhaseStats,
+    out: &mut std::collections::BTreeMap<String, f64>,
+) {
+    use crate::stats::{
+        TAOBENCH_FAST_QPS, TAOBENCH_HIT_RATE, TAOBENCH_HIT_RATIO, TAOBENCH_SLOW_QPS,
+        TAOBENCH_TOTAL_QPS,
+    };
+    let total = p.total_ops();
+    if p.elapsed_ns > 0 {
+        let secs = p.elapsed_ns as f64 / 1e9;
+        out.insert(TAOBENCH_TOTAL_QPS.to_string(), total as f64 / secs);
+        out.insert(TAOBENCH_FAST_QPS.to_string(), p.fast_ops as f64 / secs);
+        out.insert(TAOBENCH_SLOW_QPS.to_string(), p.slow_ops as f64 / secs);
+    }
+    if total > 0 {
+        out.insert(TAOBENCH_HIT_RATIO.to_string(), p.fast_ops as f64 / total as f64);
+    }
+    if p.get_cmds > 0 {
+        out.insert(
+            TAOBENCH_HIT_RATE.to_string(),
+            1.0 - (p.get_misses as f64 / p.get_cmds as f64),
+        );
+    }
 }

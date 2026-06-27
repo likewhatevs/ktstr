@@ -10,6 +10,7 @@ use crate::workload::config::{
     AluWidth, FutexLockMode, ReapMode, SchedClass, WakeMechanism, defaults,
 };
 use crate::workload::schbench::run::SchbenchConfig;
+use crate::workload::taobench::run::TaobenchConfig;
 
 use crate::workload::WorkerReport;
 
@@ -51,6 +52,7 @@ impl WorkType {
             WorkType::PolicyChurn { .. } => "PolicyChurn",
             WorkType::FanOutCompute { .. } => "FanOutCompute",
             WorkType::Schbench { .. } => "Schbench",
+            WorkType::Taobench { .. } => "Taobench",
             WorkType::PageFaultChurn { .. } => "PageFaultChurn",
             WorkType::MutexContention { .. } => "MutexContention",
             WorkType::Custom { name, .. } => name.as_str(),
@@ -131,6 +133,9 @@ impl WorkType {
             }),
             "Schbench" => Some(WorkType::Schbench {
                 config: SchbenchConfig::default(),
+            }),
+            "Taobench" => Some(WorkType::Taobench {
+                config: TaobenchConfig::default(),
             }),
             "PageFaultChurn" => Some(WorkType::PageFaultChurn {
                 region_kib: defaults::PAGE_FAULT_CHURN_REGION_KIB,
@@ -534,6 +539,15 @@ impl WorkType {
     /// with a single ktstr worker; see the [`WorkType::Schbench`] variant doc.
     pub const fn schbench(config: SchbenchConfig) -> Self {
         WorkType::Schbench { config }
+    }
+
+    /// The `taobench_rs` workload (a bounded, evicting key-value cache),
+    /// configured by `config`. Build the config with [`TaobenchConfig::default`]
+    /// plus its chainable setters, e.g.
+    /// `WorkType::taobench(TaobenchConfig::default().target_hit_pct(95))`. Use
+    /// with a single ktstr worker; see the [`WorkType::Taobench`] variant doc.
+    pub const fn taobench(config: TaobenchConfig) -> Self {
+        WorkType::Taobench { config }
     }
 
     /// Rapid page fault cycling with `spin_iters` CPU work between cycles.
