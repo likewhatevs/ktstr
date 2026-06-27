@@ -823,6 +823,7 @@ pub mod prelude {
     // no-stimulus-timeline case.
     pub use crate::cgroup::CgroupManager;
     pub use crate::claim;
+    pub use crate::claim_present;
     pub use crate::declare_scheduler;
     pub use crate::distributed_slice;
     pub use crate::host_context::HostContext;

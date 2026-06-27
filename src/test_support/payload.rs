@@ -1021,6 +1021,17 @@ impl MetricCheck {
     /// composes in `const` payload-check tables exactly like [`Self::min`]. Use
     /// this for a registered built-in metric; keep [`Self::min`] for the dynamic
     /// keyspace (dotted LLM-extraction paths, scheduler-runtime keys).
+    ///
+    /// ```
+    /// use ktstr::prelude::*;
+    /// // The typed checks compose into a `const` table — exactly the
+    /// // `&'static [MetricCheck]` a `Payload` carries in `default_checks`:
+    /// const CHECKS: &[MetricCheck] = &[
+    ///     MetricCheck::min_builtin(BuiltinMetric::TaobenchTotalQps, 1000.0),
+    ///     MetricCheck::exists_builtin(BuiltinMetric::SchbenchLoopCount),
+    /// ];
+    /// assert_eq!(CHECKS.len(), 2);
+    /// ```
     pub const fn min_builtin(metric: crate::stats::BuiltinMetric, value: f64) -> MetricCheck {
         MetricCheck::Min {
             metric: metric.wire_name(),
@@ -1332,6 +1343,50 @@ mod tests {
             MetricCheck::Exists(metric) => assert_eq!(metric, "schbench_loop_count"),
             other => panic!("exists_builtin must produce Exists, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn metric_check_builtin_constructors_compose_into_a_const_default_checks_table() {
+        use crate::stats::BuiltinMetric;
+        // The *_builtin constructors are `const fn`, so a typed check table is a
+        // plain `const` `&'static [MetricCheck]` — exactly the type of
+        // `Payload::default_checks`. This pins const-composition (the property the
+        // `const fn` buys) and documents the intended usage: a typo-proof
+        // default_checks table built from BuiltinMetric variants, not bare strings.
+        const CHECKS: &[MetricCheck] = &[
+            MetricCheck::min_builtin(BuiltinMetric::TaobenchTotalQps, 1000.0),
+            MetricCheck::max_builtin(BuiltinMetric::TaobenchSlowQps, 5.0),
+            MetricCheck::range_builtin(BuiltinMetric::WakeupP99LatencyUs, 1.0, 2.0),
+            MetricCheck::exists_builtin(BuiltinMetric::SchbenchLoopCount),
+        ];
+        // Same wire names the string constructors would store, in declaration order.
+        assert_eq!(CHECKS.len(), 4);
+        assert!(matches!(
+            CHECKS[0],
+            MetricCheck::Min {
+                metric: "taobench_total_qps",
+                ..
+            }
+        ));
+        assert!(matches!(
+            CHECKS[1],
+            MetricCheck::Max {
+                metric: "taobench_slow_qps",
+                ..
+            }
+        ));
+        assert!(matches!(
+            CHECKS[2],
+            MetricCheck::Range {
+                metric: "wakeup_p99_latency_us",
+                ..
+            }
+        ));
+        assert!(matches!(CHECKS[3], MetricCheck::Exists("schbench_loop_count")));
+
+        // The typed table IS a `&'static [MetricCheck]` — it drops straight into
+        // a Payload's default_checks slot (the composition the const fn enables).
+        const _: &'static [MetricCheck] = CHECKS;
     }
 
     #[test]

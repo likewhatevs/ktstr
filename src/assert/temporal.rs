@@ -947,6 +947,149 @@ impl<'v> BetterThanPhase<'v> {
     }
 }
 
+/// Direct-claim "is this candidate better than this baseline on a
+/// registered metric?" comparator, returned by [`Verdict::claim_better`].
+/// The polarity-aware sibling of
+/// [`crate::vmm::VmResult::better_across_phases`] for the case where the
+/// test already HOLDS two scalar values (not two phases): it orients
+/// "better" from the metric's registry-declared polarity, so the SAME
+/// call expresses "candidate beats baseline" for a LowerBetter latency
+/// AND a HigherBetter throughput without the test author naming a
+/// direction. A metric with no lower/higher-better polarity
+/// (`TargetValue` / `Unknown` / `Informational` / an unregistered or
+/// typo'd name) is INCONCLUSIVE (never a silent pass); a non-finite
+/// endpoint is a `Fail`.
+#[must_use = "ClaimBetter records nothing until .than(..) / .than_by(..) is invoked"]
+pub struct ClaimBetter<'a> {
+    verdict: &'a mut Verdict,
+    label: String,
+    candidate: f64,
+    polarity: Option<crate::test_support::Polarity>,
+}
+
+impl<'a> ClaimBetter<'a> {
+    /// Pass iff the candidate is STRICTLY better than `baseline` per the
+    /// metric's polarity (LowerBetter: candidate < baseline;
+    /// HigherBetter: candidate > baseline) — any improvement, no margin.
+    pub fn than(self, baseline: f64) -> &'a mut Verdict {
+        self.evaluate(baseline, None)
+    }
+
+    /// Pass iff the candidate improves on `baseline` by at least
+    /// `margin`, a FRACTION of the baseline (`0.10` = 10% better).
+    /// `than_by(b, 0.0)` means "no regression" (at least as good). A
+    /// zero baseline is Inconclusive (nothing to scale the margin
+    /// against).
+    pub fn than_by(self, baseline: f64, margin: f64) -> &'a mut Verdict {
+        self.evaluate(baseline, Some(margin))
+    }
+
+    fn evaluate(self, baseline: f64, margin: Option<f64>) -> &'a mut Verdict {
+        let ClaimBetter {
+            verdict,
+            label,
+            candidate,
+            polarity,
+        } = self;
+        let outcome = better_outcome(Some(baseline), Some(candidate), polarity, margin);
+        let dir = match polarity {
+            Some(crate::test_support::Polarity::LowerBetter) => "lower-is-better",
+            Some(crate::test_support::Polarity::HigherBetter) => "higher-is-better",
+            _ => "no-better-direction",
+        };
+        let req = match margin {
+            None => "strictly better".to_string(),
+            Some(m) => format!("better by >= {m:.4} fraction"),
+        };
+        match outcome {
+            BetterOutcome::Pass => {
+                verdict.note(format!(
+                    "[{label}] candidate {candidate} {req} than baseline {baseline} ({dir})"
+                ));
+            }
+            BetterOutcome::Fail => {
+                push_detail(
+                    verdict,
+                    format!(
+                        "{label}: candidate {candidate} is NOT {req} than baseline {baseline} ({dir})"
+                    ),
+                );
+            }
+            BetterOutcome::Corrupt => {
+                push_detail(
+                    verdict,
+                    format!(
+                        "{label}: non-finite value (baseline {baseline}, candidate {candidate}) \
+                         — cannot compare"
+                    ),
+                );
+            }
+            BetterOutcome::Missing => {
+                push_inconclusive(
+                    verdict,
+                    format!("{label}: better-than inconclusive: no value to compare"),
+                );
+            }
+            BetterOutcome::Undirected => {
+                push_inconclusive(
+                    verdict,
+                    format!(
+                        "{label}: better-than inconclusive: metric has no lower/higher-is-better \
+                         polarity — cannot orient 'better' (an unregistered or typo'd metric name \
+                         resolves here)"
+                    ),
+                );
+            }
+            BetterOutcome::ZeroBaseline => {
+                push_inconclusive(
+                    verdict,
+                    format!(
+                        "{label}: better-than inconclusive: baseline=0, no baseline to scale the \
+                         fractional margin ({req})"
+                    ),
+                );
+            }
+        }
+        verdict
+    }
+}
+
+impl Verdict {
+    /// Claim that `candidate` is better than a baseline on a registered
+    /// metric, oriented by the metric's registry-declared polarity — the
+    /// direct-value sibling of
+    /// [`crate::vmm::VmResult::better_across_phases`]. Pass the metric as
+    /// a typed [`BuiltinMetric`](crate::stats::BuiltinMetric) (typo-proof)
+    /// or a string (a registered wire-name resolves; an unregistered or
+    /// typo'd name has no polarity → the comparison is Inconclusive, the
+    /// no-guessed-direction guardrail). Chain [`ClaimBetter::than`]
+    /// (strictly better) or [`ClaimBetter::than_by`] (a fractional
+    /// margin).
+    ///
+    /// ```
+    /// # use ktstr::{assert::Verdict, prelude::BuiltinMetric};
+    /// let mut v = Verdict::new();
+    /// // wakeup p99 latency is lower-is-better — candidate 40 < baseline 50 passes:
+    /// v.claim_better(BuiltinMetric::WakeupP99LatencyUs, 40.0).than(50.0);
+    /// let r = v.into_result();
+    /// assert!(r.is_pass());
+    /// ```
+    pub fn claim_better(
+        &mut self,
+        metric: impl Into<crate::stats::MetricId>,
+        candidate: f64,
+    ) -> ClaimBetter<'_> {
+        let id = metric.into();
+        let polarity = id.def().map(|m| m.polarity);
+        ClaimBetter {
+            label: id.as_str().to_string(),
+            verdict: self,
+            candidate,
+            polarity,
+        }
+    }
+}
+
 /// Extension trait that lets a pre-reduced per-phase map
 /// (typically the output of [`SeriesField::counter_delta_per_phase`],
 /// [`SeriesField::last_per_phase`], or
