@@ -570,6 +570,3 @@ required-features = ["integration"]
 [[test]]
 name = "ctprof_pipeline_e2e"
 required-features = ["integration"]
-
-[[test]]
-name = "live_host_pipeline_e2e"

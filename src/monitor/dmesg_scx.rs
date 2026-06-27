@@ -1,9 +1,8 @@
 //! Parse `sched_ext` disable events from kernel-message buffer
 //! (dmesg / `/dev/kmsg`) output.
 //!
-//! Companion to [`super::live_host_kernel`] (kernel discovery) and
-//! [`super::debug_capture`] (capture record format). The live-host
-//! pipeline tails `/dev/kmsg`, anchors on the kernel's
+//! Companion to [`super::live_host_kernel`] (kernel discovery). The
+//! live-host pipeline tails `/dev/kmsg`, anchors on the kernel's
 //! `sched_ext: BPF scheduler "X" disabled (...)` line, and extracts
 //! the stack-trace symbols the kernel printed via `%pS`. Those
 //! symbol names feed the auto-repro instrumentation: the live-host
