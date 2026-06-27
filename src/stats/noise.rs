@@ -261,6 +261,7 @@ mod tests {
     ///    verdict must coincide with the `too_noisy` gate firing (the gate is the
     ///    backstop; a confident significant verdict on identical configs would be
     ///    a false positive).
+    ///
     /// Prints the observed spreads + verdicts so the behavior is inspectable.
     #[test]
     fn schbench_noise_adjust_demonstration() {
