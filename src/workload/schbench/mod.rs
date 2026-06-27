@@ -22,6 +22,11 @@ pub(crate) mod run;
 
 /// User-facing config for the [`Schbench`](crate::workload::WorkType::Schbench) workload.
 pub use run::SchbenchConfig;
+/// Pipe-mode (`-p`) throughput reporting used by the `ktstr-schbench-validate`
+/// driver to mirror schbench's `avg worker transfer` line; clamps the transfer
+/// size + scales bytes/sec exactly like schbench (`schbench.c:1979-1982`). Not in
+/// the prelude (validation-tool surface, like [`StandaloneReport`]).
+pub use run::{PipeTransferReport, pipe_transfer_report};
 
 /// The five latency percentiles reported by [`StandaloneReport`] and the
 /// per-phase metric path, in column order: 20.0, 50.0, 90.0, 99.0, 99.9. Matches
@@ -89,6 +94,10 @@ pub struct StandaloneReport {
     pub sched_delay_worker_ns: u64,
     /// Total work-loop iterations across all worker threads.
     pub loop_count: u64,
+    /// Resolved total worker count (`message_threads * worker_threads`). Divisor
+    /// for the PER-WORKER pipe-mode `avg worker transfer` rate — see
+    /// [`pipe_transfer_report`](crate::workload::pipe_transfer_report).
+    pub nr_workers: usize,
 }
 
 /// Run the schbench engine standalone — host-side, no VM, no phases — for
@@ -142,6 +151,7 @@ pub fn run_standalone(config: &SchbenchConfig, run_secs: u64) -> StandaloneRepor
         sched_delay_msg_ns: w.sched_delay_msg_ns,
         sched_delay_worker_ns: w.sched_delay_worker_ns,
         loop_count: w.loop_count,
+        nr_workers: w.nr_workers,
     }
 }
 

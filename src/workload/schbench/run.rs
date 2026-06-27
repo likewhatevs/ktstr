@@ -4,7 +4,8 @@
 //! per-CPU lock. The default (non-RPS) mode is the wakeup-latency +
 //! request-latency benchmark, with per-phase schedstat (run-delay) capture; the
 //! RPS-injector mode (`-R`) and its auto-RPS closed-loop rate control (`-A`)
-//! layer on the request queue + once-per-second control thread.
+//! layer on the request queue + once-per-second control thread; pipe mode (`-p`)
+//! swaps the matrix work for a memory-transfer simulation over the same handshake.
 //!
 //! # Topology (`schbench.c` `message_thread` :1540, `worker_thread` :1419)
 //!
@@ -202,6 +203,7 @@ impl Linked for Request {
 /// | `-R` rps | `requests_per_sec` |
 /// | `-A` auto-rps | `auto_rps` |
 /// | `--split` (long-only) | `split_percent` (`None` = no split, all-private) |
+/// | `-p` pipe (also `--pipe`) | `pipe_transfer_bytes` (`0` = off; memory-transfer mode, no matrix work) |
 /// | `-r` runtime | in-VM: the scenario engine's run window (the engine runs until `stop`); host-side: the `run_secs` argument to [`run_standalone`](crate::workload::run_standalone) |
 ///
 /// ## Set by ktstr topology, not a flag
@@ -244,11 +246,33 @@ impl Linked for Request {
 /// -- but sound (atomics, no data race), with zero unsafe. `None` (default) is
 /// the legacy all-private single matrix.
 ///
+/// ## Pipe mode (`-p`)
+///
+/// `pipe_transfer_bytes > 0` REPLACES the matrix workload with schbench's
+/// memory-transfer simulation (`schbench.c:177`, `pipe_test`). It rides the
+/// message-handshake path: the message thread memsets each woken worker's
+/// per-thread page to `1` (`schbench.c:980-981`) and the worker memsets its own
+/// page to `2` before blocking (`schbench.c:1003-1004`), `pipe_transfer_bytes`
+/// bytes each per handshake cycle (clamped to 1 MiB, `PIPE_TRANSFER_BUFFER`).
+/// `do_work` and the think-sleep are skipped (`schbench.c:1448`), so the only
+/// per-cycle work is the wakeup handshake + the two memsets; the report is the
+/// PER-WORKER memory-transfer throughput (`avg worker transfer` = the aggregate
+/// rate divided by the worker count, `schbench.c:1697,1942-1943,1979`) alongside
+/// the wakeup-latency table, not request latency.
+///
+/// ktstr does NOT compose `-p` with `-R`: in pipe mode it always runs the
+/// message-handshake waker (so BOTH pipe memsets fire — a full transfer) and never
+/// starts the RPS injector. schbench instead COMPOSES them, half-broken: it has no
+/// precedence (`-R` alone picks the waker, `schbench.c:1594`), so `-p -R` runs the
+/// RPS injector while the worker-side memset still fires unconditionally
+/// (`schbench.c:1003-1004`) but the waker-side memset — which lives only in
+/// `xlist_wake_all` (`schbench.c:980-981`) — does not, yielding a degenerate
+/// half-pipe. ktstr's full pipe is the more faithful `-p` behavior; the realistic
+/// use is `-p` without `-R`. schbench also zeroes warmuptime in pipe mode
+/// (`schbench.c:296`); ktstr has no warmuptime concept, so that is a no-op here.
+///
 /// ## Modes not ported
 ///
-/// - `-p` (pipe): schbench's pipe-transfer test -- a separate workload from the
-///   matrix-work default this port re-expresses (`schbench.c:177`). Not
-///   available.
 /// - `-C` (calibrate): a tuning aid that times schbench's own work loop and
 ///   forces `-L` (`schbench.c:166`, `:389`). Intentionally out of scope -- ktstr
 ///   measures through the metric path.
@@ -302,6 +326,79 @@ pub struct SchbenchConfig {
     /// (`schbench.c:362-365` exits on the same); the builder also debug-asserts
     /// the bound.
     pub split_percent: Option<usize>,
+    /// Pipe-mode transfer size in bytes (`schbench.c` `-p`/`--pipe`, default 0 =
+    /// off, clamped to 1 MiB `PIPE_TRANSFER_BUFFER`). Non-zero REPLACES the
+    /// matrix workload with schbench's memory-transfer simulation: the message
+    /// thread memsets each woken worker's per-thread page to `1` and the worker
+    /// memsets its own page to `2` (`schbench.c:980-981`/`:1003-1004`),
+    /// `pipe_transfer_bytes` bytes each per cycle, while `do_work` + the
+    /// think-sleep are skipped (`schbench.c:1448`). Reports PER-WORKER
+    /// memory-transfer throughput (`avg worker transfer`) rather than request
+    /// latency.
+    pub pipe_transfer_bytes: usize,
+}
+
+/// schbench's `PIPE_TRANSFER_BUFFER` (`schbench.c:41`): the per-thread pipe page
+/// is 1 MiB; a larger `pipe_transfer_bytes` is clamped to it (schbench clamps and
+/// warns, `schbench.c:291-294`).
+pub(crate) const PIPE_TRANSFER_BUFFER: usize = 1024 * 1024;
+
+/// schbench's pipe-mode (`-p`) throughput summary — the `avg worker transfer`
+/// line (`schbench.c:1979-1982`): the per-worker transfer rate as ops/sec plus
+/// the pretty-scaled bytes/sec. Built by [`pipe_transfer_report`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PipeTransferReport {
+    /// Completed transfer cycles per second, PER WORKER (`loop_count / Σ worker
+    /// runtimes`, `schbench.c:1942-1943`).
+    pub ops_per_sec: f64,
+    /// Bytes transferred per second PER WORKER, scaled into [`unit`](Self::unit)
+    /// (÷1024 per step, `pretty_size`).
+    pub scaled: f64,
+    /// The unit `scaled` is expressed in: `B`/`KB`/`MB`/`GB`/`TB`/`PB`/`EB`
+    /// (`schbench.c:1606`).
+    pub unit: &'static str,
+}
+
+/// Derive the pipe-mode `avg worker transfer` line from a run's aggregate
+/// `achieved_rps` (completed cycles/sec over the true elapsed window), the
+/// requested `pipe_transfer_bytes`, and the resolved `nr_workers`. The figure is
+/// PER WORKER: schbench divides by `loop_runtime` = Σ each worker's runtime
+/// (`schbench.c:1697` sums `worker->runtime`; `:1942-1943`/`:1979` divide by it),
+/// and `Σ worker runtimes ≈ nr_workers * elapsed`, so the per-worker rate is the
+/// aggregate `achieved_rps / nr_workers` — the label is literally "avg WORKER
+/// transfer". (Dividing the aggregate by wall-clock alone would over-report by
+/// `nr_workers`×.) The transfer size is CLAMPED to `PIPE_TRANSFER_BUFFER` first —
+/// the engine moves only the clamped size per cycle (`run` applies the same
+/// `.min()`), matching schbench's parse-time clamp (`schbench.c:291-294`) — so the
+/// throughput reflects the bytes ACTUALLY moved. Scaling is schbench's
+/// `pretty_size` (`schbench.c:1606`). `nr_workers` is floored at 1 (no division by
+/// zero).
+pub fn pipe_transfer_report(
+    achieved_rps: f64,
+    pipe_transfer_bytes: usize,
+    nr_workers: usize,
+) -> PipeTransferReport {
+    let n = nr_workers.max(1) as f64;
+    let bytes = pipe_transfer_bytes.min(PIPE_TRANSFER_BUFFER);
+    // PER-WORKER: schbench's loops_per_sec/mb_per_sec divide the aggregate by
+    // Σ worker runtimes (≈ nr_workers * elapsed), i.e. `achieved_rps / nr_workers`.
+    let ops_per_sec = achieved_rps / n;
+    let bytes_per_sec = achieved_rps * bytes as f64 / n;
+    let (scaled, unit) = pretty_size(bytes_per_sec);
+    PipeTransferReport { ops_per_sec, scaled, unit }
+}
+
+/// schbench's `pretty_size` (`schbench.c:1606-1620`): scale a byte count by 1024
+/// into B/KB/MB/GB/TB/PB/EB. Stops at the last unit (matches schbench's
+/// `units[divs + 1] == NULL` break — never overflows the table).
+fn pretty_size(mut number: f64) -> (f64, &'static str) {
+    const UNITS: [&str; 7] = ["B", "KB", "MB", "GB", "TB", "PB", "EB"];
+    let mut divs = 0;
+    while number >= 1024.0 && divs + 1 < UNITS.len() {
+        divs += 1;
+        number /= 1024.0;
+    }
+    (number, UNITS[divs])
 }
 
 impl Default for SchbenchConfig {
@@ -317,6 +414,7 @@ impl Default for SchbenchConfig {
             requests_per_sec: 0,
             auto_rps: 0,
             split_percent: None,
+            pipe_transfer_bytes: 0,
         }
     }
 }
@@ -386,6 +484,16 @@ impl SchbenchConfig {
             "split_percent must be 0..=100"
         );
         self.split_percent = percent;
+        self
+    }
+    /// Set the pipe-mode transfer size in bytes (schbench `-p`/`--pipe`); 0
+    /// (default) = off (the matrix workload). Non-zero switches to schbench's
+    /// memory-transfer simulation; values above 1 MiB (`PIPE_TRANSFER_BUFFER`)
+    /// are clamped when the engine consumes it (schbench clamps the same,
+    /// `schbench.c:291-294`).
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn pipe_transfer_bytes(mut self, bytes: usize) -> Self {
+        self.pipe_transfer_bytes = bytes;
         self
     }
 
@@ -523,6 +631,17 @@ pub(crate) struct ThreadData {
     /// owning worker at each splice. The RPS thread stops enqueuing to a worker
     /// whose `pending` exceeds the batch cap (`:1284`).
     pending: AtomicU64,
+    /// Pipe-mode (`-p`) transfer size in bytes (0 = not pipe mode); the length of
+    /// [`Self::pipe_page`] and the per-cycle memset. Plain `Copy`, set once at
+    /// construction, read-only thereafter.
+    pipe_bytes: usize,
+    /// Pipe-mode per-thread transfer page (`schbench.c` `thread_data->pipe_page`,
+    /// `:801`). The worker memsets it to `2` before blocking and the waker memsets
+    /// it to `1` when waking the worker; the bytes are never read back (the point
+    /// is the memory-transfer cost). `UnsafeCell` because the WAKER writes the
+    /// worker's page (cross-thread) -- see the `Sync` SAFETY note for the
+    /// wait-list/futex ordering that keeps it race-free. Empty unless pipe mode.
+    pipe_page: UnsafeCell<Box<[u8]>>,
 }
 
 /// One thread's latency + run-queue-delay accumulation over a single phase
@@ -636,13 +755,28 @@ impl Linked for ThreadData {
 // ONLY by the single worker thread that owns this `ThreadData`, and only the
 // main thread reads/drains them after all workers have joined (a happens-before
 // via the join). The per-phase drain (`worker_loop` / `run_msg_thread`) `take`s
-// and pushes into the owning thread's own cells, never another's. No two threads
-// ever touch a cell concurrently, so sharing `&ThreadData` across threads is
-// sound.
+// and pushes into the owning thread's own cells, never another's. The `pipe_page`
+// cell (pipe mode) is the one cross-thread `UnsafeCell`: the owning worker memsets
+// it (to 2) and the message thread memsets it (to 1). They never overlap, via two
+// happens-before edges:
+//   - SAME cycle (worker fill-2 vs waker fill-1): the worker's fill-2 is SEQUENCED
+//     BEFORE its `wait_list.add` (Release CAS), and the waker's `splice` (Acquire
+//     swap) observes that add, giving fill-2 -> add -> splice -> waker fill-1. The
+//     load-bearing fact is "fill-2 precedes add", which holds UNCONDITIONALLY --
+//     including the no-block shutdown path (stop set, worker skips the futex wait):
+//     the worker still added itself after fill-2, so a waker that then splices and
+//     fills it is ordered after the fill-2, and the worker's exit path never
+//     touches the page again. Blocking is NOT what makes it safe.
+//   - NEXT cycle (worker's fill-2 vs the waker's prior fill-1): the futex
+//     post/consume CAS (SeqCst, `Handshake`) orders waker fill-1 -> post -> the
+//     worker's consume -> its next fill-2; the worker cannot reach its next fill-2
+//     until it consumes the token the waker published after fill-1.
+// So the two threads never touch `pipe_page` concurrently. No two threads ever
+// touch a cell concurrently, so sharing `&ThreadData` across threads is sound.
 unsafe impl Sync for ThreadData {}
 
 impl ThreadData {
-    fn new() -> Self {
+    fn new(pipe_bytes: usize) -> Self {
         Self {
             next: AtomicPtr::new(ptr::null_mut()),
             futex: super::handshake::Handshake::new(),
@@ -653,7 +787,36 @@ impl ThreadData {
             phase_snapshots: UnsafeCell::new(Vec::new()),
             requests: TreiberStack::new(),
             pending: AtomicU64::new(0),
+            pipe_bytes,
+            pipe_page: UnsafeCell::new(vec![0u8; pipe_bytes].into_boxed_slice()),
         }
+    }
+
+    /// Pipe-mode transfer: fill this thread's `pipe_page` (`pipe_bytes` bytes) with
+    /// `val`. The page is never read back, so the fill would be DCE-eligible. The
+    /// trailing `black_box(page.as_ptr())` ESCAPES THE ADDRESS (not a loaded value):
+    /// the optimizer must then assume the opaque call may read through the pointer,
+    /// so every byte of the fill must be in place at that point -- the fill is
+    /// retained. This is stronger than `black_box(value)`, which only keeps a value
+    /// live and (per the optimization-resistance note in `worker::worker_main`) does
+    /// NOT by itself stop a backing STORE from being elided -- which is why the
+    /// cache-pressure workloads there use `write_volatile`. Here the faithful
+    /// schbench op is a memset (`schbench.c:980-981`/`:1003-1004`) and `slice::fill`
+    /// lowers to one; a `write_volatile` byte loop would not. The memory traffic IS
+    /// the workload.
+    ///
+    /// SAFETY: the caller guarantees no concurrent access to `pipe_page`. The only
+    /// callers are the owning worker (before it adds itself to the wait-list) and
+    /// the message thread (after it splices the worker off the wait-list); the
+    /// load-bearing edge is fill-2-before-add (holding even on the no-block
+    /// shutdown path), so the add/splice + futex handshake order these with no
+    /// overlap (see the `Sync` SAFETY note).
+    unsafe fn pipe_fill(&self, val: u8) {
+        // SAFETY: exclusive access per the caller contract; the box lives for the
+        // `ThreadData`'s lifetime.
+        let page = unsafe { &mut *self.pipe_page.get() };
+        page.fill(val);
+        std::hint::black_box(page.as_ptr());
     }
 }
 
@@ -747,6 +910,15 @@ fn msg_and_wait(
     stop: &AtomicBool,
 ) {
     // Our futex is BLOCKED here (consumed by the prior wait, or fresh).
+    // Pipe mode: write our transfer page to 2 (schbench memsets td->pipe_page
+    // before blocking, schbench.c:1003-1004). Done before we enqueue on the
+    // wait-list, so the waker's fill-to-1 (after it splices us off) never races --
+    // see the Sync SAFETY note.
+    if td.pipe_bytes > 0 {
+        // SAFETY: we own this page and have not yet enqueued, so the waker cannot
+        // touch it concurrently.
+        unsafe { td.pipe_fill(2) };
+    }
     td.wake_time.store(monotonic_nanos(), Ordering::Release);
     wait_list.add(td as *const ThreadData as *mut ThreadData);
     msg_td.futex.post();
@@ -846,6 +1018,9 @@ fn free_request_chain(mut req: *mut Request) {
 /// (`schbench.c:969`): splice the whole list, read the clock ONCE, stamp every
 /// worker with that single time, then post each. The single clock read is what
 /// detects the scheduler preempting the waker mid-batch (`schbench.c:961-964`).
+/// Pipe mode (`-p`) diverges, matching schbench (`schbench.c:980-984`): it memsets
+/// each worker's transfer page to `1` and re-reads the clock PER worker (so the
+/// memset cost is not charged to that worker's wakeup latency).
 fn wake_all(wait_list: &TreiberStack<ThreadData>) {
     let mut cur = wait_list.splice();
     let now = monotonic_nanos();
@@ -855,7 +1030,20 @@ fn wake_all(wait_list: &TreiberStack<ThreadData>) {
         let td = unsafe { &*cur };
         let next = td.next.load(Ordering::Acquire);
         td.next.store(ptr::null_mut(), Ordering::Relaxed);
-        td.wake_time.store(now, Ordering::Release);
+        if td.pipe_bytes > 0 {
+            // Pipe mode: write this woken worker's transfer page to 1 (schbench
+            // memsets list->pipe_page in the wake loop, schbench.c:980-981). We
+            // spliced it off the wait-list and it is still blocked (our `post`
+            // below wakes it), so no concurrent access -- see the Sync SAFETY note.
+            // SAFETY: `td` is off the wait-list and blocked here.
+            unsafe { td.pipe_fill(1) };
+            // schbench re-reads the clock per worker in pipe mode (after the
+            // memset, schbench.c:982) so the fill is not charged to the worker's
+            // wakeup latency; non-pipe uses the single batched `now`.
+            td.wake_time.store(monotonic_nanos(), Ordering::Release);
+        } else {
+            td.wake_time.store(now, Ordering::Release);
+        }
         td.futex.post();
         cur = next;
     }
@@ -1220,7 +1408,12 @@ fn worker_loop(td: &ThreadData, ctx: &WorkerCtx) {
     // least one request/sec per message thread). Below that it rounds to 0 and
     // the worker runs the default message-handshake mode -- matching schbench's
     // startup-divide-before-gate ([`SchbenchConfig::rps_per_message_thread`]).
-    let rps_mode = config.rps_per_message_thread() != 0;
+    // Pipe mode (`-p`): the memory-transfer workload. It runs the message-handshake
+    // path (where the pipe-page memsets live), NOT the RPS injector -- a ktstr
+    // divergence; schbench composes -p+-R half-broken (see the `pipe_transfer_bytes`
+    // field doc).
+    let pipe_mode = config.pipe_transfer_bytes > 0;
+    let rps_mode = !pipe_mode && config.rps_per_message_thread() != 0;
     while !stop.load(Ordering::Acquire) {
         // Acquire work. Default mode: the message-thread handshake (records
         // wakeup latency; no request chain -> a single work cycle). RPS mode:
@@ -1250,19 +1443,25 @@ fn worker_loop(td: &ThreadData, ctx: &WorkerCtx) {
         // matrix work (`schbench.c:1464-1481`).
         loop {
             let work_start = monotonic_nanos();
-            if config.sleep_usec > 0 {
-                think_sleep(config.sleep_usec);
+            // Pipe mode: the per-cycle transfer is the wake/block memsets
+            // (msg_and_wait fills our page to 2; wake_all fills it to 1). The work
+            // loop only counts cycles for the MB/s throughput; schbench likewise
+            // skips do_work + the think-sleep in pipe mode (schbench.c:1448).
+            if !pipe_mode {
+                if config.sleep_usec > 0 {
+                    think_sleep(config.sleep_usec);
+                }
+                do_work(
+                    &mut private_buf,
+                    private_matrix_size,
+                    shared,
+                    shared_matrix_size,
+                    config.split_percent,
+                    config.operations,
+                    locks,
+                    &mut work_units,
+                );
             }
-            do_work(
-                &mut private_buf,
-                private_matrix_size,
-                shared,
-                shared_matrix_size,
-                config.split_percent,
-                config.operations,
-                locks,
-                &mut work_units,
-            );
             let now = monotonic_nanos();
             let delta_us = now.saturating_sub(work_start) / 1000;
             if delta_us > 0 {
@@ -1369,6 +1568,12 @@ pub(crate) struct SchbenchResult {
     /// second is sampled.
     pub(crate) rps: Percentiles,
     pub(crate) loop_count: u64,
+    /// Resolved total worker-thread count (`message_threads * worker_threads`).
+    /// Divisor for schbench's PER-WORKER pipe-mode rate (`avg worker transfer`):
+    /// schbench reports `loop_count / Σ worker runtimes` (`schbench.c:1697`,
+    /// `:1942-1943`/`:1979`), and `Σ worker runtimes ≈ nr_workers * elapsed`, so
+    /// the per-worker rate is `achieved_rps / nr_workers`.
+    pub(crate) nr_workers: usize,
     pub(crate) achieved_rps: f64,
     /// Auto-RPS final TOTAL target rate at run exit: the live per-message-thread
     /// rate * message_threads (schbench's `requests_per_sec * message_threads`,
@@ -1421,8 +1626,12 @@ fn run_one_message_thread(
     shared: &[core::sync::atomic::AtomicU64],
     shared_matrix_size: usize,
 ) -> MessageThreadResult {
-    let workers: Vec<ThreadData> = (0..worker_threads).map(|_| ThreadData::new()).collect();
-    let msg_td = ThreadData::new();
+    // schbench clamps -p to PIPE_TRANSFER_BUFFER (schbench.c:291-294). Workers get
+    // the per-thread transfer page; the message thread (waker) needs none.
+    let pipe_bytes = config.pipe_transfer_bytes.min(PIPE_TRANSFER_BUFFER);
+    let workers: Vec<ThreadData> =
+        (0..worker_threads).map(|_| ThreadData::new(pipe_bytes)).collect();
+    let msg_td = ThreadData::new(0);
     let wait_list = TreiberStack::new();
     let ctx = WorkerCtx {
         msg_td: &msg_td,
@@ -1444,7 +1653,14 @@ fn run_one_message_thread(
         // default mode runs the message-thread handshake. Both run on this
         // calling thread and record the dispatcher's run-delay into `msg_td`
         // (schbench `message_thread`, `:1594`).
-        if config.rps_per_message_thread() != 0 {
+        // Pipe mode (`-p`) uses the message-handshake waker (run_msg_thread does
+        // the per-worker pipe-page fill in wake_all) and takes precedence over -R.
+        // This DIVERGES from schbench, where -R alone picks the path
+        // (`schbench.c:1594`): schbench's `-p -R` runs the RPS injector (no
+        // xlist_wake_all -> no waker-side memset -> a half-pipe). ktstr runs the
+        // full pipe; the realistic use is `-p` alone. Otherwise -R selects the
+        // injector.
+        if config.pipe_transfer_bytes == 0 && config.rps_per_message_thread() != 0 {
             run_rps_thread(&workers, &msg_td, stop, phase_epoch, live_rate);
         } else {
             run_msg_thread(&msg_td, &wait_list, stop, phase_epoch);
@@ -1910,6 +2126,7 @@ pub(crate) fn run(
             request: all_request.percentiles(),
             rps: rps_stats.percentiles(),
             loop_count,
+            nr_workers: total_workers as usize,
             achieved_rps,
             final_rps_goal,
             sched_delay_msg_ns,
@@ -2051,6 +2268,7 @@ mod tests {
             requests_per_sec: 0,
             auto_rps: 0,
             split_percent: Some(50),
+            pipe_transfer_bytes: 0,
         };
         // Sanity: both split matrices are non-empty at this footprint, so the
         // test exercises shared + private work, not a degenerate 0-dim path.
@@ -2069,6 +2287,137 @@ mod tests {
         assert!(
             outcome.whole_run.loop_count >= 50,
             "engine did split work: {}",
+            outcome.whole_run.loop_count
+        );
+    }
+
+    #[test]
+    fn pipe_fill_writes_every_byte_and_sizes_the_page() {
+        // pipe_fill is the per-cycle memory transfer (schbench's pipe_page memset,
+        // schbench.c:980-981/:1003-1004): it must touch EVERY byte of a
+        // pipe_bytes-sized page. The bytes are never read back, so a dead-store
+        // elision would silently zero the workload -- the black_box in pipe_fill
+        // prevents that; this pins the observable effect (every byte written).
+        let td = ThreadData::new(64);
+        assert_eq!(td.pipe_bytes, 64);
+        // SAFETY: single-threaded test, exclusive access to this td's page.
+        unsafe { td.pipe_fill(2) };
+        // SAFETY: same thread; no concurrent access.
+        assert_eq!(unsafe { &*td.pipe_page.get() }.len(), 64, "page sized to pipe_bytes");
+        assert!(
+            unsafe { &*td.pipe_page.get() }.iter().all(|&b| b == 2),
+            "worker fill (2) touches every byte"
+        );
+        // SAFETY: exclusive.
+        unsafe { td.pipe_fill(1) };
+        assert!(
+            unsafe { &*td.pipe_page.get() }.iter().all(|&b| b == 1),
+            "waker fill (1) overwrites every byte"
+        );
+        // Non-pipe ThreadData (pipe_bytes == 0) allocates an empty page: no transfer.
+        let none = ThreadData::new(0);
+        assert_eq!(none.pipe_bytes, 0);
+        // SAFETY: exclusive.
+        assert_eq!(unsafe { &*none.pipe_page.get() }.len(), 0);
+    }
+
+    #[test]
+    fn pipe_transfer_bytes_clamps_to_one_mib() {
+        // schbench clamps -p to PIPE_TRANSFER_BUFFER (schbench.c:41,291-294); run()
+        // applies the same `.min()` before sizing each worker's page.
+        assert_eq!(PIPE_TRANSFER_BUFFER, 1024 * 1024);
+        assert_eq!(
+            (2 * PIPE_TRANSFER_BUFFER).min(PIPE_TRANSFER_BUFFER),
+            PIPE_TRANSFER_BUFFER,
+            "over-cap pipe size clamps to the 1 MiB buffer"
+        );
+        // At/under-cap values pass through unchanged.
+        assert_eq!(4096_usize.min(PIPE_TRANSFER_BUFFER), 4096);
+    }
+
+    #[test]
+    fn pipe_transfer_report_is_per_worker_scales_and_clamps() {
+        // PER-WORKER: ops/sec = achieved_rps / nr_workers
+        // (schbench.c:1942-1943 divide by Σ worker runtimes ≈ nr_workers*elapsed).
+        // 2048 aggregate cycles/sec / 2 workers = 1024 per-worker ops/sec.
+        let r = pipe_transfer_report(2048.0, 1, 2);
+        assert_eq!(r.ops_per_sec, 1024.0);
+        // pretty_size (schbench.c:1606-1620): 1024 per-worker B/s -> 1.00 KB/s.
+        assert_eq!((r.scaled, r.unit), (1.0, "KB"));
+        // 1 worker, 1 B/cycle @ 1 cycle/s -> 1.00 B/s.
+        let one = pipe_transfer_report(1.0, 1, 1);
+        assert_eq!((one.ops_per_sec, one.scaled, one.unit), (1.0, 1.0, "B"));
+        // 1 MiB/cycle @ 1 cycle/s/worker -> 1.00 MB/s.
+        assert_eq!(pipe_transfer_report(1.0, 1 << 20, 1).unit, "MB");
+        // CLAMP: an over-cap pipe size reports the clamped 1 MiB, not
+        // the requested 2 MiB -- the engine moves only the clamped size per cycle
+        // (schbench clamps at parse, schbench.c:291-294).
+        let over = pipe_transfer_report(1.0, 2 << 20, 1);
+        let cap = pipe_transfer_report(1.0, 1 << 20, 1);
+        assert_eq!(
+            (over.scaled, over.unit),
+            (cap.scaled, cap.unit),
+            "over-cap pipe size clamps to 1 MiB"
+        );
+        // EB cap: a huge byte rate never scales past the last unit (no overflow).
+        assert_eq!(pipe_transfer_report(f64::MAX, 1 << 20, 1).unit, "EB");
+        // nr_workers 0 -> floored at 1, never a division by zero.
+        assert_eq!(pipe_transfer_report(100.0, 4096, 0).ops_per_sec, 100.0);
+    }
+
+    #[test]
+    fn engine_pipe_mode_transfers_without_matrix_work() {
+        // Pipe mode (-p): the worker loop skips do_work + the think-sleep, and the
+        // per-cycle work is the cross-thread pipe_page handshake -- the worker
+        // memsets its page to 2 before blocking, the waker memsets it to 1 on wake
+        // (schbench.c:980-981/:1003-1004). Two workers exercise the concurrent
+        // waker->worker page writes. Reaching the assertions proves the handshake
+        // runs to completion: no deadlock and no data-race trap on the cross-thread
+        // `pipe_page` UnsafeCell (the wait-list + futex ordering keeps it race-free,
+        // see the Sync SAFETY note). `operations`/`cache_footprint_kib` are set
+        // LARGE on purpose: if do_work erroneously ran, every cycle would log a
+        // multi-us request-latency sample -- the second assertion would then fail.
+        // Stop is event-driven (spin on the progress counter, not a sleep).
+        let config = SchbenchConfig::default()
+            .message_threads(1)
+            .worker_threads(2)
+            .sleep_usec(0)
+            .operations(50)
+            .cache_footprint_kib(256)
+            .pipe_transfer_bytes(4096);
+        assert!(config.pipe_transfer_bytes > 0, "pipe mode engaged");
+        assert!(
+            config.matrix_size() > 0,
+            "matrix work would be non-trivial if do_work ran (regression guard)"
+        );
+        let stop = AtomicBool::new(false);
+        let progress = AtomicU64::new(0);
+        let outcome = std::thread::scope(|s| {
+            let runner = s.spawn(|| run(&config, &stop, &progress, None));
+            while progress.load(Ordering::Relaxed) < 50 {
+                core::hint::spin_loop();
+            }
+            stop.store(true, Ordering::Release);
+            runner.join().expect("run panicked")
+        });
+        // loop_count accrues one per completed transfer cycle (schbench.c:1479),
+        // proving the pipe handshake + memsets ran end-to-end without deadlock.
+        assert!(
+            outcome.whole_run.loop_count >= 50,
+            "pipe engine transferred {} cycles",
+            outcome.whole_run.loop_count
+        );
+        // Discriminating assertion: do_work is SKIPPED, so the
+        // back-to-back work_start->now span yields sub-us request deltas that the
+        // `delta_us > 0` filter drops -- request stats stay ~empty. If matrix work
+        // erroneously ran at operations=50/256KiB, nearly every cycle would record a
+        // >0 request delta and request samples would approach loop_count, failing
+        // this. (A rare us-straddle may record a handful; `* 4 < loop_count` tolerates
+        // that while still catching a real do_work regression.)
+        assert!(
+            outcome.whole_run.request.nr_samples * 4 < outcome.whole_run.loop_count,
+            "pipe mode skips matrix work: {} request samples vs {} cycles",
+            outcome.whole_run.request.nr_samples,
             outcome.whole_run.loop_count
         );
     }
@@ -2093,6 +2442,7 @@ mod tests {
             requests_per_sec: 0,
             auto_rps: 0,
             split_percent: Some(101),
+            pipe_transfer_bytes: 0,
         };
         let stop = AtomicBool::new(true);
         let progress = AtomicU64::new(0);
@@ -2171,6 +2521,7 @@ mod tests {
             requests_per_sec: 0,
             auto_rps: 0,
             split_percent: None,
+            pipe_transfer_bytes: 0,
         };
         let stop = AtomicBool::new(false);
         let progress = AtomicU64::new(0);
@@ -2222,6 +2573,7 @@ mod tests {
             requests_per_sec: 0,
             auto_rps: 0,
             split_percent: None,
+            pipe_transfer_bytes: 0,
         };
         let stop = AtomicBool::new(false);
         let progress = AtomicU64::new(0);
@@ -2262,6 +2614,7 @@ mod tests {
             requests_per_sec: 10_000,
             auto_rps: 0,
             split_percent: None,
+            pipe_transfer_bytes: 0,
         };
         let stop = AtomicBool::new(false);
         let progress = AtomicU64::new(0);
@@ -2307,6 +2660,7 @@ mod tests {
             requests_per_sec: 1, // 1 / 2 message threads = 0 per thread -> default
             auto_rps: 0,
             split_percent: None,
+            pipe_transfer_bytes: 0,
         };
         let stop = AtomicBool::new(false);
         let progress = AtomicU64::new(0);
@@ -2422,6 +2776,7 @@ mod tests {
             requests_per_sec: 10_000,
             auto_rps: 50,
             split_percent: None,
+            pipe_transfer_bytes: 0,
         };
         let stop = AtomicBool::new(false);
         let progress = AtomicU64::new(0);
@@ -2456,6 +2811,7 @@ mod tests {
             requests_per_sec: 0,
             auto_rps: 0,
             split_percent: None,
+            pipe_transfer_bytes: 0,
         };
         let stop = AtomicBool::new(false);
         let progress = AtomicU64::new(0);
@@ -2580,6 +2936,7 @@ mod tests {
             requests_per_sec: 0,
             auto_rps: 0,
             split_percent: None,
+            pipe_transfer_bytes: 0,
         };
         let stop = AtomicBool::new(false);
         let progress = AtomicU64::new(0);
@@ -2632,7 +2989,9 @@ mod tests {
             .skip_locking(true)
             // Exercise the new field's Some(p) serde surface, not just the None
             // default (the API-review roundtrip requirement).
-            .split_percent(Some(33));
+            .split_percent(Some(33))
+            // Exercise the pipe field's non-default serde surface too.
+            .pipe_transfer_bytes(4096);
         let json = serde_json::to_string(&cfg).expect("SchbenchConfig must serialize");
         let back: SchbenchConfig =
             serde_json::from_str(&json).expect("SchbenchConfig must deserialize");

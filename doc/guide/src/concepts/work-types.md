@@ -283,13 +283,16 @@ working set (three square matrices of u64, O(n^3)). Requires
 does matrix work under a per-CPU lock (measuring request latency).
 Carries a `SchbenchConfig` (build it with `SchbenchConfig::default()`
 plus its chainable setters) that maps schbench's
-`-m`/`-t`/`-F`/`-n`/`-s`/`-L`/`-R`/`-A` flags onto config fields; see the
-`SchbenchConfig` rustdoc for the full schbench(8) CLI-parity table —
-which flags map to fields, which are set by ktstr topology, and which
-schbench modes (`-p` pipe, `-C` calibrate) are not ported. The `--split`
-knob (`split_percent`) partitions the cache footprint into a per-thread
+`-m`/`-t`/`-F`/`-n`/`-s`/`-L`/`-R`/`-A`/`-p` flags onto config fields; see
+the `SchbenchConfig` rustdoc for the full schbench(8) CLI-parity table —
+which flags map to fields, which are set by ktstr topology, and which one
+schbench mode (`-C` calibrate) is not ported. The `--split` knob
+(`split_percent`) partitions the cache footprint into a per-thread
 private matrix and one process-global shared matrix all workers contend
-on, reproducing cross-core cache contention.
+on, reproducing cross-core cache contention. The `-p`/`--pipe` knob
+(`pipe_transfer_bytes`) instead swaps the matrix work for schbench's
+memory-transfer simulation: the waker and the woken worker each memset a
+per-thread page over the same handshake, reporting transfer throughput.
 Use a single ktstr worker (`workers(1)`); the message/worker parallelism
 is this variant's internal thread topology, not ktstr worker processes.
 

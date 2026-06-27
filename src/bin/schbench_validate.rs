@@ -9,7 +9,9 @@
 //! the two processes (effects identity). The output mirrors schbench's final
 //! summary (`schbench.c:1985-2004`): the Wakeup, Request, and RPS percentile
 //! tables, then either `average rps` (fixed/default mode) or `final rps goal was`
-//! (auto-RPS), then the `sched delay` line.
+//! (auto-RPS), then the `sched delay` line. Pipe mode (`-p`) instead mirrors
+//! schbench's pipe branch (`schbench.c:1972-1982`): the Wakeup table and the
+//! `avg worker transfer` throughput line only.
 //!
 //! The trailing `sched delay` line diverges, and the engine's value is the
 //! more accurate one: schbench's FINAL summary runs `collect_sched_delay` after
@@ -25,10 +27,12 @@
 
 use clap::Parser;
 
-use ktstr::workload::{SCHBENCH_PERCENTILES, SchbenchConfig, StandaloneReport, run_standalone};
+use ktstr::workload::{
+    SCHBENCH_PERCENTILES, SchbenchConfig, StandaloneReport, pipe_transfer_report, run_standalone,
+};
 
 /// schbench-compatible flags. The short forms match schbench (`-m`/`-t`/`-F`/
-/// `-n`/`-s`/`-L`/`-r`/`-R`) so one invocation drives both programs identically.
+/// `-n`/`-s`/`-L`/`-r`/`-R`/`-p`) so one invocation drives both programs identically.
 #[derive(Parser)]
 #[command(
     name = "ktstr-schbench-validate",
@@ -69,6 +73,11 @@ struct Args {
     /// for no split (the legacy all-private single matrix).
     #[arg(long)]
     split: Option<usize>,
+    /// Pipe-mode memory-transfer size in bytes (schbench `-p`); 0 = off. Non-zero
+    /// runs the message-handshake transfer workload (no matrix work) and reports
+    /// throughput as `avg worker transfer`. schbench clamps to 1 MiB.
+    #[arg(short = 'p', long, default_value_t = 0)]
+    pipe: usize,
 }
 
 fn main() {
@@ -82,16 +91,20 @@ fn main() {
         .skip_locking(args.skip_locking)
         .requests_per_sec(args.rps)
         .auto_rps(args.auto_rps)
-        .split_percent(args.split);
+        .split_percent(args.split)
+        .pipe_transfer_bytes(args.pipe);
 
     let report = run_standalone(&config, args.runtime_secs);
-    print_report(&report, args.runtime_secs, args.auto_rps);
+    print_report(&report, args.runtime_secs, args.auto_rps, args.pipe);
 }
 
 /// schbench's `PLIST_FOR_LAT` masks the 20.0th percentile off latency tables
 /// (`schbench.c:129`), showing 50/90/99/99.9 starred at p99 (`PLIST_99`, index 3
 /// — `schbench.c:126,1801`).
 const LAT_ROW_INDICES: [usize; 4] = [1, 2, 3, 4];
+/// Pipe mode ADDS the 20.0th-percentile row to the Wakeup table — schbench's
+/// `PLIST_20 | PLIST_FOR_LAT` (`schbench.c:1976-1977`), still starred at p99.
+const LAT_ROW_INDICES_PIPE: [usize; 5] = [0, 1, 2, 3, 4];
 const LAT_STAR_INDEX: usize = 3;
 
 /// schbench's `PLIST_FOR_RPS` shows 20/50/90 starred at p50 (`PLIST_50`, index 1
@@ -99,10 +112,18 @@ const LAT_STAR_INDEX: usize = 3;
 const RPS_ROW_INDICES: [usize; 3] = [0, 1, 2];
 const RPS_STAR_INDEX: usize = 1;
 
-/// Print the report in schbench's final-summary shape (`schbench.c:1985-2004`):
-/// the Wakeup, Request, and RPS percentile tables, then the RPS-goal/average
-/// line, then sched delay. `auto_rps` selects the schbench branch for that line.
-fn print_report(r: &StandaloneReport, runtime_secs: u64, auto_rps: usize) {
+/// Print the report in schbench's final-summary shape (`schbench.c:1972-2004`).
+/// Pipe mode (`-p`) prints only the Wakeup table and the `avg worker transfer`
+/// throughput line (`schbench.c:1972-1982`). Otherwise: the Wakeup, Request, and
+/// RPS percentile tables, then the RPS-goal/average line, then sched delay;
+/// `auto_rps` selects the schbench branch for that line.
+fn print_report(r: &StandaloneReport, runtime_secs: u64, auto_rps: usize, pipe_bytes: usize) {
+    // Pipe mode shows an extra 20.0th-percentile Wakeup row (schbench.c:1976-1977).
+    let wakeup_rows: &[usize] = if pipe_bytes > 0 {
+        &LAT_ROW_INDICES_PIPE
+    } else {
+        &LAT_ROW_INDICES
+    };
     print_distribution(
         "Wakeup Latencies",
         "usec",
@@ -112,9 +133,23 @@ fn print_report(r: &StandaloneReport, runtime_secs: u64, auto_rps: usize) {
         &r.wakeup_counts,
         r.wakeup_min_us,
         r.wakeup_max_us,
-        &LAT_ROW_INDICES,
+        wakeup_rows,
         LAT_STAR_INDEX,
     );
+    // Pipe mode: schbench prints only Wakeup + the transfer line and skips the
+    // Request/RPS tables, the average-rps line, and sched delay (`schbench.c:1972-1982`).
+    if pipe_bytes > 0 {
+        // PER-WORKER rate: `pipe_transfer_report` divides the aggregate
+        // achieved_rps by nr_workers and clamps pipe_bytes to the engine cap,
+        // mirroring schbench's loop_count / loop_runtime (Σ worker runtimes)
+        // (`schbench.c:1697,1942-1943,1979`).
+        let t = pipe_transfer_report(r.achieved_rps, pipe_bytes, r.nr_workers);
+        println!(
+            "avg worker transfer: {:.2} ops/sec {:.2}{}/s",
+            t.ops_per_sec, t.scaled, t.unit
+        );
+        return;
+    }
     print_distribution(
         "Request Latencies",
         "usec",

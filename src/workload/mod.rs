@@ -126,10 +126,14 @@ pub(crate) use spawn::build_nodemask;
 pub use types::*;
 // schbench_rs is otherwise a private submodule. Its user-facing config type is
 // re-exported (the WorkType::Schbench variant carries it), as are the standalone
-// host-side validation entry point and its report type / percentile labels (used
-// by the gated `ktstr-schbench-validate` bin for the side-by-side comparison
-// against the reference schbench).
-pub use schbench::{SCHBENCH_PERCENTILES, SchbenchConfig, StandaloneReport, run_standalone};
+// host-side validation entry point and its report type / percentile labels, plus
+// the pipe-mode (`-p`) throughput helper (all used by the gated
+// `ktstr-schbench-validate` bin for the side-by-side comparison against the
+// reference schbench).
+pub use schbench::{
+    PipeTransferReport, SCHBENCH_PERCENTILES, SchbenchConfig, StandaloneReport,
+    pipe_transfer_report, run_standalone,
+};
 
 // `FanOutCompute` stores its u64 generation counter at offset 0 of
 // a 16-byte shared region and relies on the low 4 bytes of that
