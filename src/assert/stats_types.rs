@@ -1102,7 +1102,7 @@ impl PhaseBucket {
     /// typo" (positive sample_count but the key isn't in `metrics`).
     ///
     /// ```ignore
-    /// let bucket = r.stats.step(0).expect("Step[0] phase");
+    /// let bucket = r.stats.phase(Phase::step(0)).expect("Step[0] phase");
     /// let throughput = bucket.expect_metric("throughput");
     /// ```
     pub fn expect_metric(&self, metric_name: &str) -> f64 {

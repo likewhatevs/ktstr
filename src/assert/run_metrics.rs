@@ -72,39 +72,15 @@ pub struct ScenarioStats {
 }
 
 impl ScenarioStats {
-    /// Look up the phase bucket for a phase index.
+    /// Look up the phase bucket for a [`Phase`] — `Phase::BASELINE` for the
+    /// pre-first-Step settle window, `Phase::step(k)` for the test author's
+    /// 0-indexed Step k. The typed `Phase` keeps the 1-indexed encoding (Step 0
+    /// lives at the underlying `step_index = 1`) invisible at the call site.
     ///
-    /// **Heads up:** `step_index = 0` returns the pre-Step BASELINE
-    /// settle window, NOT the first Step. The first Step the
-    /// scenario author wrote lives at `step_index = 1` per the
-    /// 1-indexed Step encoding. To look up the test author's "Step
-    /// N", pass `N + 1` — or use [`Self::step`] for an accessor
-    /// that takes the 0-indexed scenario Step number directly.
-    ///
-    /// Returns `None` when no bucket with that index exists
-    /// (single-phase scenario, scenario didn't reach the step, or
-    /// `step_index` past the last phase).
-    pub fn phase(&self, step_index: u16) -> Option<&PhaseBucket> {
-        self.phases.iter().find(|p| p.step_index == step_index)
-    }
-
-    /// Look up the phase bucket for a 0-indexed scenario Step
-    /// number — the natural index the test author used when
-    /// constructing `vec![step_a, step_b, step_c]` (Step A is
-    /// `scenario_step_idx = 0`, Step B is `1`, etc.).
-    ///
-    /// Internally translates to `step_index = scenario_step_idx + 1`
-    /// per the 1-indexed phase encoding (phase 0 is reserved for
-    /// BASELINE). Use this for the common "I want metrics for the
-    /// N-th Step I wrote" case; use [`Self::phase`] when you need
-    /// to address BASELINE explicitly or work in phase-index space.
-    ///
-    /// Returns `None` when the scenario didn't reach that Step or
-    /// `phases` is empty.
-    pub fn step(&self, scenario_step_idx: u16) -> Option<&PhaseBucket> {
-        scenario_step_idx
-            .checked_add(1)
-            .and_then(|phase_idx| self.phase(phase_idx))
+    /// Returns `None` when no bucket with that phase exists (single-phase
+    /// scenario, the scenario didn't reach that Step, or a phase past the last).
+    pub fn phase(&self, phase: Phase) -> Option<&PhaseBucket> {
+        self.phases.iter().find(|p| p.step_index == phase.as_u16())
     }
 
     /// Shortcut: look up a single metric value in a specific
@@ -135,17 +111,16 @@ impl ScenarioStats {
     /// [`crate::stats::MetricId::def`]`().is_some()` to tell an unregistered
     /// key from absent data (built-in ids always resolve).
     ///
-    /// **Heads up:** same 1-indexed Step encoding as
-    /// [`Self::phase`] — `step_index = 0` is BASELINE, not the
-    /// first Step. Use [`Self::step_metric`] for the 0-indexed
-    /// scenario-Step lookup.
+    /// Pass `Phase::BASELINE` for the settle window or `Phase::step(k)` for the
+    /// test author's 0-indexed Step k — the typed `Phase` hides the 1-indexed
+    /// encoding (see [`Self::phase`]).
     pub fn phase_metric(
         &self,
-        step_index: u16,
+        phase: Phase,
         metric: impl Into<crate::stats::MetricId>,
     ) -> Option<f64> {
         let metric = metric.into();
-        self.phase(step_index).and_then(|p| {
+        self.phase(phase).and_then(|p| {
             p.get(metric.as_str())
                 .or_else(|| p.cgroup_counter_total(metric.as_str()))
         })
@@ -196,58 +171,25 @@ impl ScenarioStats {
         Some(max / min)
     }
 
-    /// Shortcut: look up a single metric value in a 0-indexed
-    /// scenario Step. Sibling of [`Self::step`]. See [`Self::phase_metric`]
-    /// for the None-cause taxonomy (a built-in id is typo-proof; a dynamic
-    /// key's registration is [`crate::stats::MetricId::def`]).
-    pub fn step_metric(
-        &self,
-        scenario_step_idx: u16,
-        metric: impl Into<crate::stats::MetricId>,
-    ) -> Option<f64> {
-        let metric = metric.into();
-        self.step(scenario_step_idx).and_then(|p| {
-            p.get(metric.as_str())
-                .or_else(|| p.cgroup_counter_total(metric.as_str()))
-        })
-    }
-
-    /// Per-cgroup analog of [`Self::phase_metric`] (same 1-indexed Step encoding:
-    /// `step_index = 0` is BASELINE): look up `metric` for a named `cgroup` in a
-    /// phase, via that cgroup's per-phase carrier ([`PhaseCgroupStats::get`]),
-    /// falling back to [`PhaseCgroupStats::cgroup_counter`] for the per-cgroup
-    /// Counters `total_migrations`/`total_iterations`/`total_cpu_time_ns`. `None` when the phase has no bucket, no
-    /// carrier for `cgroup`, the carrier carried no finite value for the metric, OR
-    /// the metric is an unregistered dynamic key (a built-in id is typo-proof;
-    /// an unregistered [`crate::stats::MetricId`] has no
+    /// Per-cgroup analog of [`Self::phase_metric`]: look up `metric` for a named
+    /// `cgroup` in a [`Phase`] (`Phase::BASELINE` / `Phase::step(k)`), via that
+    /// cgroup's per-phase carrier ([`PhaseCgroupStats::get`]), falling back to
+    /// [`PhaseCgroupStats::cgroup_counter`] for the per-cgroup Counters
+    /// `total_migrations`/`total_iterations`/`total_cpu_time_ns`. `None` when the
+    /// phase has no bucket, no carrier for `cgroup`, the carrier carried no finite
+    /// value for the metric, OR the metric is an unregistered dynamic key (a
+    /// built-in id is typo-proof; an unregistered [`crate::stats::MetricId`] has no
     /// [`crate::stats::MetricId::def`], same as [`Self::phase_metric`]). The
     /// N-cgroups-to-N-queryable-sets surface on the AssertResult-holding path (the
     /// in-VM `post_vm` path uses [`crate::vmm::VmResult::phase_cgroup_metric`]).
     pub fn phase_cgroup_metric(
         &self,
-        step_index: u16,
+        phase: Phase,
         cgroup: &str,
         metric: impl Into<crate::stats::MetricId>,
     ) -> Option<f64> {
         let metric = metric.into();
-        self.phase(step_index)
-            .and_then(|p| p.per_cgroup.get(cgroup))
-            .and_then(|pc| {
-                pc.get(metric.as_str())
-                    .or_else(|| pc.cgroup_counter(metric.as_str()))
-            })
-    }
-
-    /// Per-cgroup analog of [`Self::step_metric`] (0-indexed scenario Step). See
-    /// [`Self::phase_cgroup_metric`] for the None-cause taxonomy.
-    pub fn step_cgroup_metric(
-        &self,
-        scenario_step_idx: u16,
-        cgroup: &str,
-        metric: impl Into<crate::stats::MetricId>,
-    ) -> Option<f64> {
-        let metric = metric.into();
-        self.step(scenario_step_idx)
+        self.phase(phase)
             .and_then(|p| p.per_cgroup.get(cgroup))
             .and_then(|pc| {
                 pc.get(metric.as_str())
@@ -261,20 +203,20 @@ impl ScenarioStats {
     /// pre-first-Step settle window).
     ///
     /// Use this to fail a phase-aware assertion BEFORE calling
-    /// [`Self::step`] / [`Self::step_metric`] on a scenario that
+    /// [`Self::phase`] with a `Phase::step(k)` on a scenario that
     /// silently never advanced past BASELINE: a test that declared
     /// no `Step`s, OR a scenario that bailed in setup before any
-    /// `Step` ran, would otherwise see [`Self::step`] return
-    /// `None` for every index and the test would either panic on
+    /// `Step` ran, would otherwise see [`Self::phase`] return
+    /// `None` for every Step and the test would either panic on
     /// `.expect(...)` or pass vacuously.
     ///
     /// ```ignore
     /// anyhow::ensure!(
     ///     r.stats.has_steps(),
     ///     "scenario produced no Step-phase buckets — \
-    ///      declare a Step or use Self::phase(0) for BASELINE",
+    ///      declare a Step or read Phase::BASELINE",
     /// );
-    /// let throughput = r.stats.step_metric(0, "throughput");
+    /// let throughput = r.stats.phase_metric(Phase::step(0), "throughput");
     /// ```
     pub fn has_steps(&self) -> bool {
         self.phases.iter().any(|p| p.step_index >= 1)
@@ -344,8 +286,7 @@ impl ScenarioStats {
     /// - the monitor-sourced run-level metrics (`max_imbalance_ratio`,
     ///   `max_dsq_depth`, `stuck_count`, `total_fallback`,
     ///   `total_keep_last`), which `ScenarioStats` does not hold
-    ///   run-level — read those per-phase via [`Self::phase_metric`] /
-    ///   [`Self::step_metric`].
+    ///   run-level — read those per-phase via [`Self::phase_metric`].
     ///
     /// So this does NOT cover the full registry: iterating
     /// [`crate::stats::BuiltinMetric::ALL`] through it yields `None` for those

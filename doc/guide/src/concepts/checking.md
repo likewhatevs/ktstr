@@ -692,26 +692,28 @@ operator looks.
 ### Looking up phase metrics on `ScenarioStats`
 
 ```rust,ignore
-// Phase-aware accessor by 1-indexed encoded value.
-let baseline = r.stats.phase(0).expect("BASELINE always populated");
+// Phase-aware accessors take a typed `Phase` (from the prelude):
+// `Phase::BASELINE` is the pre-first-Step settle window, and
+// `Phase::step(k)` is the k-th Step the scenario wrote. The typed
+// `Phase` hides the 1-indexed encoding (Step 0 lives at the
+// underlying step_index 1).
+let baseline = r.stats.phase(Phase::BASELINE).expect("BASELINE always populated");
+let step_0 = r.stats.phase(Phase::step(0)).expect("Step 0 ran");
+let step_1 = r.stats.phase(Phase::step(1)).expect("Step 1 ran");
 
-// Scenario-side 0-indexed Step accessor (preferred for the
-// "I want metrics for the k-th Step I wrote" case).
-let step_0 = r.stats.step(0).expect("Step 0 ran");
-let step_1 = r.stats.step(1).expect("Step 1 ran");
-
-// Single-metric shortcut.
-let throughput = r.stats.step_metric(0, "throughput");
+// Single-metric shortcut (a typed `BuiltinMetric` is typo-proof; a
+// scheduler-runtime string also works through the same call).
+let throughput = r.stats.phase_metric(Phase::step(0), "throughput");
 
 // Gate on "scenario advanced past BASELINE" before assuming any
 // Step-phase bucket exists — a scenario that bailed in setup or
-// declared zero Steps returns None from every step()/step_metric()
+// declared zero Steps returns None from every phase(Phase::step(k))
 // lookup and the test either panics on .expect(...) or passes
 // vacuously.
 anyhow::ensure!(
     r.stats.has_steps(),
-    "scenario produced no Step phases — declare a Step or use \
-     stats.phase(0) for BASELINE",
+    "scenario produced no Step phases — declare a Step or read \
+     Phase::BASELINE",
 );
 ```
 
@@ -725,7 +727,7 @@ typo" (positive `sample_count` but the key isn't in `metrics`)
 without re-reading the bucket by hand:
 
 ```rust,ignore
-let bucket = r.stats.step(0).expect("Step 0 phase bucket");
+let bucket = r.stats.phase(Phase::step(0)).expect("Step 0 phase bucket");
 let throughput = bucket.expect_metric("throughput");
 ```
 

@@ -805,14 +805,39 @@ fn build_phase_buckets_integration_with_scenario_stats_phase_accessor() {
         phases,
         ..Default::default()
     };
-    assert_eq!(stats.phase(0).map(|p| p.label.as_str()), Some("BASELINE"));
-    assert_eq!(stats.phase(1).map(|p| p.label.as_str()), Some("Step[0]"));
-    assert_eq!(stats.phase(2).map(|p| p.label.as_str()), Some("Step[1]"));
-    assert_eq!(stats.phase(3), None);
-    // `step(0)` is the scenario-side 0-indexed accessor: maps to
-    // phase index 1 (scenario Step 0 lives at step_index 1).
-    assert_eq!(stats.step(0).map(|p| p.label.as_str()), Some("Step[0]"));
-    assert_eq!(stats.step(1).map(|p| p.label.as_str()), Some("Step[1]"));
+    assert_eq!(
+        stats
+            .phase(crate::assert::Phase::BASELINE)
+            .map(|p| p.label.as_str()),
+        Some("BASELINE")
+    );
+    assert_eq!(
+        stats
+            .phase(crate::assert::Phase::step(0))
+            .map(|p| p.label.as_str()),
+        Some("Step[0]")
+    );
+    assert_eq!(
+        stats
+            .phase(crate::assert::Phase::step(1))
+            .map(|p| p.label.as_str()),
+        Some("Step[1]")
+    );
+    assert_eq!(stats.phase(crate::assert::Phase::step(2)), None);
+    // Phase::step(0) is the scenario's first Step (the typed accessor hides the
+    // 1-indexed encoding: Step 0 lives at the underlying step_index 1).
+    assert_eq!(
+        stats
+            .phase(crate::assert::Phase::step(0))
+            .map(|p| p.label.as_str()),
+        Some("Step[0]")
+    );
+    assert_eq!(
+        stats
+            .phase(crate::assert::Phase::step(1))
+            .map(|p| p.label.as_str()),
+        Some("Step[1]")
+    );
 }
 
 // ---------- Phase newtype ----------

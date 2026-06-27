@@ -901,7 +901,7 @@ impl Timeline {
                 // deltas still yield a throughput. Surface it so a short
                 // interior step's recovered rate is visible in the
                 // rendered timeline, not only via the structured
-                // phase_metric/step_metric API.
+                // phase_metric API.
                 out.push_str(&format!(
                     "  [no samples] | throughput: {ir:.0} iter/s (stimulus-derived)\n"
                 ));

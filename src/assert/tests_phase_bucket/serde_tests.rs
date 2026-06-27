@@ -176,8 +176,11 @@ fn phase_bucket_get_distinguishes_absent_from_zero() {
 fn scenario_stats_default_has_empty_phases() {
     let stats = ScenarioStats::default();
     assert!(stats.phases.is_empty());
-    assert_eq!(stats.phase(0), None);
-    assert_eq!(stats.phase_metric(0, "any"), None);
+    assert_eq!(stats.phase(crate::assert::Phase::BASELINE), None);
+    assert_eq!(
+        stats.phase_metric(crate::assert::Phase::BASELINE, "any"),
+        None
+    );
 }
 
 /// `ScenarioStats::phase` looks up by `step_index` rather than vec
@@ -214,10 +217,20 @@ fn scenario_stats_phase_lookup_by_step_index_not_position() {
         ],
         ..Default::default()
     };
-    assert_eq!(stats.phase(0).map(|p| p.step_index), Some(0));
-    assert_eq!(stats.phase(3).map(|p| p.step_index), Some(3));
-    assert_eq!(stats.phase(1), None);
-    assert_eq!(stats.phase(2), None);
+    assert_eq!(
+        stats
+            .phase(crate::assert::Phase::BASELINE)
+            .map(|p| p.step_index),
+        Some(0)
+    );
+    assert_eq!(
+        stats
+            .phase(crate::assert::Phase::step(2))
+            .map(|p| p.step_index),
+        Some(3)
+    );
+    assert_eq!(stats.phase(crate::assert::Phase::step(0)), None);
+    assert_eq!(stats.phase(crate::assert::Phase::step(1)), None);
 }
 
 /// `ScenarioStats::phase_metric` is the typed shortcut for
@@ -241,23 +254,39 @@ fn scenario_stats_phase_metric_resolves_typed_lookup() {
         }],
         ..Default::default()
     };
-    assert_eq!(stats.phase_metric(1, "worst_spread"), Some(0.42));
+    assert_eq!(
+        stats.phase_metric(crate::assert::Phase::step(0), "worst_spread"),
+        Some(0.42)
+    );
     // A typed BuiltinMetric resolves identically to its &str wire name.
     assert_eq!(
-        stats.phase_metric(1, crate::stats::BuiltinMetric::WorstSpread),
+        stats.phase_metric(
+            crate::assert::Phase::step(0),
+            crate::stats::BuiltinMetric::WorstSpread
+        ),
         Some(0.42),
     );
     // A non-registered key stays a dynamic lookup against the bucket.
-    assert_eq!(stats.phase_metric(1, "dsq_depth_max"), Some(12.0));
-    assert_eq!(stats.phase_metric(1, "absent"), None);
-    assert_eq!(stats.phase_metric(99, "worst_spread"), None);
+    assert_eq!(
+        stats.phase_metric(crate::assert::Phase::step(0), "dsq_depth_max"),
+        Some(12.0)
+    );
+    assert_eq!(
+        stats.phase_metric(crate::assert::Phase::step(0), "absent"),
+        None
+    );
+    assert_eq!(
+        stats.phase_metric(crate::assert::Phase::step(98), "worst_spread"),
+        None
+    );
 }
 
-/// `ScenarioStats::step` translates 0-indexed scenario Step number
-/// to the 1-indexed phase encoding: scenario-Step N lives at
-/// `step_index = N + 1`. The accessor hides the 1-indexing trap.
+/// `ScenarioStats::phase(Phase::step(k))` resolves to the k-th scenario Step's
+/// bucket — the typed `Phase` hides the 1-indexed encoding (Step k lives at the
+/// underlying `step_index = k + 1`). Out-of-range Steps and the `u16::MAX`
+/// saturation both resolve to `None` (no such bucket).
 #[test]
-fn scenario_stats_step_translates_scenario_step_idx_to_phase_index() {
+fn scenario_stats_phase_step_resolves_to_step_bucket() {
     let stats = ScenarioStats {
         phases: vec![
             PhaseBucket {
@@ -278,33 +307,23 @@ fn scenario_stats_step_translates_scenario_step_idx_to_phase_index() {
         ],
         ..Default::default()
     };
-    // step(0) = "Step[0]" (scenario-side first Step, NOT BASELINE)
-    assert_eq!(stats.step(0).map(|p| p.label.as_str()), Some("Step[0]"));
-    assert_eq!(stats.step(1).map(|p| p.label.as_str()), Some("Step[1]"));
-    // Out-of-range scenario Step returns None
-    assert_eq!(stats.step(99), None);
-    // u16::MAX + 1 saturates via checked_add → None
-    assert_eq!(stats.step(u16::MAX), None);
-}
-
-/// `ScenarioStats::step_metric` is the sibling shortcut to
-/// `phase_metric` taking a 0-indexed scenario-Step number.
-#[test]
-fn scenario_stats_step_metric_resolves_scenario_indexed_lookup() {
-    let mut metrics = BTreeMap::new();
-    metrics.insert("worst_spread".to_string(), 0.42);
-    let stats = ScenarioStats {
-        phases: vec![PhaseBucket {
-            step_index: 1, // Scenario Step 0
-            label: "Step[0]".to_string(),
-            metrics,
-            ..Default::default()
-        }],
-        ..Default::default()
-    };
-    assert_eq!(stats.step_metric(0, "worst_spread"), Some(0.42));
-    assert_eq!(stats.step_metric(0, "absent"), None);
-    assert_eq!(stats.step_metric(1, "worst_spread"), None);
+    // Phase::step(0) is the scenario's first Step (Step[0]), NOT BASELINE.
+    assert_eq!(
+        stats
+            .phase(crate::assert::Phase::step(0))
+            .map(|p| p.label.as_str()),
+        Some("Step[0]")
+    );
+    assert_eq!(
+        stats
+            .phase(crate::assert::Phase::step(1))
+            .map(|p| p.label.as_str()),
+        Some("Step[1]")
+    );
+    // Out-of-range Step -> None.
+    assert_eq!(stats.phase(crate::assert::Phase::step(99)), None);
+    // Phase::step(u16::MAX) saturates to step_index u16::MAX -> no bucket -> None.
+    assert_eq!(stats.phase(crate::assert::Phase::step(u16::MAX)), None);
 }
 
 /// `ScenarioStats::run_metric` resolves the run-level ext-sourced

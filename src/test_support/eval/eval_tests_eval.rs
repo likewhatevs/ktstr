@@ -1792,9 +1792,9 @@ fn phase_cgroup_metric_and_better_across_phases_cgroup_end_to_end() {
 }
 
 /// ScenarioStats per-cgroup lookups (the AssertResult-holding path):
-/// phase_cgroup_metric (1-indexed) / step_cgroup_metric (0-indexed) read a named
-/// cgroup's derived metric, fall back to the carrier Counters, and return None for
-/// a missing cgroup / typo metric / missing phase.
+/// phase_cgroup_metric reads a named cgroup's derived metric for a Phase, falls
+/// back to the carrier Counters, and returns None for a missing cgroup / typo
+/// metric / missing phase.
 #[test]
 fn scenario_stats_phase_cgroup_metric_and_counter_fallback() {
     let _lock = lock_env();
@@ -1819,42 +1819,41 @@ fn scenario_stats_phase_cgroup_metric_and_counter_fallback() {
         metrics: std::collections::BTreeMap::new(),
         per_cgroup: pc,
     }];
-    // phase_cgroup_metric: 1-indexed (step_index 1 == Step[0]); reads the derived map.
+    // phase_cgroup_metric via Phase::step(0) (the scenario's first Step); reads the derived map.
     assert_eq!(
         ar.stats
-            .phase_cgroup_metric(1, "cg_a", "schbench_loop_count"),
+            .phase_cgroup_metric(crate::assert::Phase::step(0), "cg_a", "schbench_loop_count"),
         Some(10.0)
     );
     // Counter fallback (carrier field, not derived).
     assert_eq!(
-        ar.stats.phase_cgroup_metric(1, "cg_a", "total_migrations"),
+        ar.stats
+            .phase_cgroup_metric(crate::assert::Phase::step(0), "cg_a", "total_migrations"),
         Some(7.0)
     );
     // None: missing cgroup / typo metric / missing phase.
     assert_eq!(
-        ar.stats
-            .phase_cgroup_metric(1, "missing", "schbench_loop_count"),
+        ar.stats.phase_cgroup_metric(
+            crate::assert::Phase::step(0),
+            "missing",
+            "schbench_loop_count"
+        ),
         None
     );
     assert_eq!(
-        ar.stats.phase_cgroup_metric(1, "cg_a", "not_a_metric"),
+        ar.stats
+            .phase_cgroup_metric(crate::assert::Phase::step(0), "cg_a", "not_a_metric"),
         None
     );
     assert_eq!(
         ar.stats
-            .phase_cgroup_metric(9, "cg_a", "schbench_loop_count"),
+            .phase_cgroup_metric(crate::assert::Phase::step(8), "cg_a", "schbench_loop_count"),
         None
-    );
-    // step_cgroup_metric: 0-indexed Step[0] == step_index 1.
-    assert_eq!(
-        ar.stats
-            .step_cgroup_metric(0, "cg_a", "schbench_loop_count"),
-        Some(10.0)
     );
 }
 
 /// Pooled-path counter symmetry (the AssertResult-holding path): ScenarioStats
-/// phase_metric / step_metric resolve the per-cgroup Counters total_migrations /
+/// phase_metric resolves the per-cgroup Counters total_migrations /
 /// total_iterations as the cross-cgroup SUM via PhaseBucket::cgroup_counter_total,
 /// symmetric with the per-cgroup phase_cgroup_metric (which surfaces each cgroup's
 /// own value) and with VmResult::phase_metric. These two Counters have read_sample
@@ -1892,22 +1891,38 @@ fn scenario_stats_phase_metric_pools_per_cgroup_counters() {
         per_cgroup: pc,
     }];
     // Pooled lookup resolves the carrier-only Counters as the cross-cgroup SUM.
-    assert_eq!(ar.stats.phase_metric(1, "total_migrations"), Some(11.0)); // 7 + 4
-    assert_eq!(ar.stats.phase_metric(1, "total_iterations"), Some(150.0)); // 100 + 50
-    // step_metric: 0-indexed Step[0] == step_index 1, same pooled-counter fallback.
-    assert_eq!(ar.stats.step_metric(0, "total_migrations"), Some(11.0));
+    assert_eq!(
+        ar.stats
+            .phase_metric(crate::assert::Phase::step(0), "total_migrations"),
+        Some(11.0)
+    ); // 7 + 4
+    assert_eq!(
+        ar.stats
+            .phase_metric(crate::assert::Phase::step(0), "total_iterations"),
+        Some(150.0)
+    ); // 100 + 50
     // Per-cgroup sibling surfaces each cgroup's own value (the symmetry the fix restores).
     assert_eq!(
-        ar.stats.phase_cgroup_metric(1, "cg_a", "total_migrations"),
+        ar.stats
+            .phase_cgroup_metric(crate::assert::Phase::step(0), "cg_a", "total_migrations"),
         Some(7.0)
     );
     assert_eq!(
-        ar.stats.phase_cgroup_metric(1, "cg_b", "total_migrations"),
+        ar.stats
+            .phase_cgroup_metric(crate::assert::Phase::step(0), "cg_b", "total_migrations"),
         Some(4.0)
     );
     // typo metric / missing phase -> None (sentinel-free).
-    assert_eq!(ar.stats.phase_metric(1, "not_a_metric"), None);
-    assert_eq!(ar.stats.phase_metric(9, "total_migrations"), None);
+    assert_eq!(
+        ar.stats
+            .phase_metric(crate::assert::Phase::step(0), "not_a_metric"),
+        None
+    );
+    assert_eq!(
+        ar.stats
+            .phase_metric(crate::assert::Phase::step(8), "total_migrations"),
+        None
+    );
 }
 
 /// Eval REORDER wiring: on the GUEST-FAIL path the failure message's
