@@ -340,11 +340,18 @@ memory-transfer throughput, no request/rps tables — higher=better). Throughput
   sample flagged `-p 1 MiB` as −8.7% instead. ktstr's per-worker rate sits inside
   both schbench builds' run-to-run ranges at all three transfer sizes.
 - **`-F 64` (tiny footprint):** ktstr's request latency runs ~5-11% higher and
-  rps ~6% lower. At a 64 KiB footprint the matrix is small (dim ~26) and
-  per-request cost is dominated by fixed per-cycle overhead rather than the matrix
-  work, so small constant-factor differences in the engine show up proportionally;
-  at the default and larger footprints (256-1024 KiB) ktstr is within the
-  envelope.
+  rps ~6% lower — explainable, not a port defect. The matmul (dim ~52, ~480µs of
+  the ~580µs request; the rest is the 100µs think-sleep) is the same scalar `imul`
+  work in all three builds (binary disasm: identical inner loop, no SIMD, work
+  kept live). The difference is the per-operation instrumentation the port carries
+  and the C builds don't — chiefly the Rust per-k bounds-checks in the multiply,
+  plus the per-element `write_volatile` sink, the per-call `black_box`, and the
+  per-request progress/phase atomics (the barriers are mandatory — removing them lets the
+  optimizer delete the multiply → faster-but-wrong). That extra compute is on the
+  critical path only while the matmul is compute-bound: at 64 KiB the matrices are
+  L2-resident so it shows; at 256/1024 KiB the working set goes to memory, the
+  matmul is memory-bound, and the extra compute hides behind memory latency —
+  within the envelope (confirmed by the `-F` sweep).
 - **`-R 1000` (over capacity):** ktstr delivers ~494 rps -- full worker capacity
   -- while schbench delivers ~394 (gcc) / ~418 (clang). ktstr is *above* the
   envelope because it uses the full capacity with a bounded queue (6us wakeup p99),
@@ -365,10 +372,20 @@ Across the full flag surface -- `-m`, `-t`, `-F`, `-n`, `-s`, `-L`, `-R`,
 throughput land **within the envelope that the reference schbench itself spans
 between its gcc and clang builds** on the large majority of axes, which is the
 strongest fidelity statement available: the port behaves like a third compilation
-of the same workload. The out-of-envelope cells are small and explained in
-*Reading the results*: `-F 64`'s tiny-footprint constant-factor regime (the
-largest, ~5-11%), the `--split` edges (<=1.7%, ktstr at the gcc end of the
-contention envelope), and `-n 1` request p99 (-2.5%). Two departures are
+of the same workload. The out-of-envelope cells are small and fall into two kinds. Only `-F 64`'s
+tiny-footprint regime (the largest, ~5-11%) is a SYSTEMATIC, reproducible
+difference — and an explained one: at dim ~52 the port's extra per-operation
+instrumentation (chiefly the Rust per-k bounds-checks, plus the mandatory
+DCE-defense barriers and progress/phase atomics) is on the critical path while
+the matmul is L2-resident/compute-bound, and is masked once it goes memory-bound
+— confirmed by the `-F` sweep (within envelope by 256 KiB) and binary
+disassembly (all three builds emit the identical scalar `imul`, no SIMD, the same
+essential work). The remaining edge cells — the `--split` verdicts (<=1.7%, ktstr
+at the gcc end of the contention envelope) and `-n 1` request p99 (captured at
+-2.5%) — are RUN-TO-RUN NOISE, not systematic divergences: a fresh re-run of each
+lands inside the gcc<->clang envelope (`-n 1` p99 1038us in [993,1058]; `--split
+0` p50/p99/rps all inside). The captured tables above show the as-measured values
+for one run; the re-run confirms the edge cells are within-spread. Two departures are
 qualitatively distinct: (1) the `-R` over-capacity regime, where ktstr is *more*
 faithful to the `-R` contract (delivers the requested rate / full capacity with
 bounded latency) than schbench's burst-and-backlog, and (2) `-A` on this
