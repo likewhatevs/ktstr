@@ -247,3 +247,39 @@ else `NO (±x%)` where x is the signed distance from the nearer gcc/clang avg ed
 > gcc↔clang envelope, confirming the auto-rps engine runs and measures
 > correctly; the controller's settle point is untestable where the busy
 > target is unreachable.
+
+### `--split` 0% (all shared)
+
+`-m 1 -t 2 --split 0 -r 10` (n=3 per impl; lower=better except rps)
+
+| metric | schbench-gcc | schbench-clang | ktstr | ktstr in gcc↔clang envelope |
+|---|---|---|---|---|
+| wakeup p99 (us) | 8.3 [8–9] | 7.7 [7–9] | 7.3 [7–8] | noise [1] |
+| request p50 (us) | 4408.0 [4408–4408] | 3996.0 [3988–4004] | 3977.3 [3972–3980] | NO (-0.5%) |
+| request p99 (us) | 4680.0 [4632–4744] | 4113.3 [4068–4152] | 4044.0 [4036–4052] | NO (-1.7%) |
+| rps p50 | 450.3 [450–451] | 496.7 [495–498] | 499.7 [499–501] | NO (+0.6%) |
+| avg rps | 451.6 [451.4–451.7] | 497.8 [496.4–499.3] | 500.6 [499.9–501.7] | NO (+0.6%) |
+
+### `--split` 50%
+
+`-m 1 -t 2 --split 50 -r 10` (n=3 per impl; lower=better except rps)
+
+| metric | schbench-gcc | schbench-clang | ktstr | ktstr in gcc↔clang envelope |
+|---|---|---|---|---|
+| wakeup p99 (us) | 8.3 [8–9] | 18.0 [18–18] | 11.3 [8–18] | noise [1] |
+| request p50 (us) | 1492.7 [1490–1494] | 1538.0 [1538–1538] | 1486.0 [1482–1490] | NO (-0.4%) |
+| request p99 (us) | 1548.7 [1542–1554] | 1599.3 [1586–1610] | 1584.7 [1538–1650] | yes |
+| rps p50 | 1330.0 [1330–1330] | 1292.7 [1290–1294] | 1332.7 [1330–1334] | NO (+0.2%) |
+| avg rps | 1330.6 [1327.5–1332.6] | 1291.0 [1288.6–1293.4] | 1330.8 [1328.8–1334.4] | NO (+0.0%) |
+
+### `--split` 100% (all private)
+
+`-m 1 -t 2 --split 100 -r 10` (n=3 per impl; lower=better except rps)
+
+| metric | schbench-gcc | schbench-clang | ktstr | ktstr in gcc↔clang envelope |
+|---|---|---|---|---|
+| wakeup p99 (us) | 7.7 [7–8] | 8.0 [7–9] | 8.0 [7–9] | noise [1] |
+| request p50 (us) | 4274.7 [4264–4280] | 4009.3 [3996–4020] | 4130.7 [4120–4136] | yes |
+| request p99 (us) | 4573.3 [4552–4584] | 4226.7 [4200–4264] | 4552.0 [4472–4664] | yes |
+| rps p50 | 466.0 [464–468] | 494.3 [493–496] | 481.3 [481–482] | yes |
+| avg rps | 467.3 [465.8–469.4] | 494.8 [493.1–496.7] | 482.1 [481.0–483.9] | yes |
