@@ -930,8 +930,7 @@ pub mod prelude {
         AffinityIntent, AluWidth, CloneMode, CustomCfg, CustomFn, FutexLockMode, MemPolicy,
         Migration, MpolFlags, ReapMode, ResolvedAffinity, SchbenchConfig, SchedClass, SchedPolicy,
         TaobenchConfig, WakeMechanism, WorkPhase, WorkSpec, WorkType, WorkTypeValidationError,
-        WorkerCtx,
-        WorkerReport, WorkerReportClaim, WorkloadConfig, WorkloadHandle,
+        WorkerCtx, WorkerReport, WorkerReportClaim, WorkloadConfig, WorkloadHandle,
     };
     // Surface `Phase` from the assert module (the scenario-step
     // bucket) so test authors can write `Phase::step(0)` /
@@ -941,6 +940,11 @@ pub mod prelude {
     // unambiguously means the scenario-phase bucket type users
     // reach for in `field.value_at_phase(Phase::step(0))` style.
     pub use crate::assert::Phase;
+    // Typed built-in metric ids (the discoverable, typo-proof catalog) + the
+    // `MetricId` hybrid that ALSO accepts a scheduler-runtime string — both flow
+    // through every metric accessor via `impl Into<MetricId>`. A misspelled
+    // built-in is a compile error, not a silent `None`.
+    pub use crate::stats::{BuiltinMetric, MetricId};
 }
 
 /// # KTSTR_* env-var empty-string contract
@@ -1733,8 +1737,7 @@ pub const KTSTR_SCHEDULER_PROFILE_ENV: &str = "KTSTR_SCHEDULER_PROFILE";
 /// presence-only [`KTSTR_ORCHESTRATED_ENV`], which activates on an empty
 /// value — so a stray `KTSTR_SCHEDULER_ALLOW_STALE_FALLBACK=` cannot
 /// re-enable the hazard.
-pub const KTSTR_SCHEDULER_ALLOW_STALE_FALLBACK_ENV: &str =
-    "KTSTR_SCHEDULER_ALLOW_STALE_FALLBACK";
+pub const KTSTR_SCHEDULER_ALLOW_STALE_FALLBACK_ENV: &str = "KTSTR_SCHEDULER_ALLOW_STALE_FALLBACK";
 
 /// Build a cargo binary package and return its output path.
 ///

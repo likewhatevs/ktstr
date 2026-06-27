@@ -1115,8 +1115,9 @@ impl PhaseBucket {
                  metric (sample_count==0 means no captures landed in the \
                  phase at all; sample_count>0 means captures landed but \
                  the metric extracted no finite values from them); \
-                 (b) metric name typo (verify against \
-                 ScenarioStats::is_known_metric / known_metrics).",
+                 (b) metric name typo — built-ins are typed via \
+                 crate::stats::BuiltinMetric (a typo is a compile \
+                 error); a dynamic key resolves via crate::stats::MetricId::def.",
                 metric_name,
                 self.step_index,
                 self.label,

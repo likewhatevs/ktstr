@@ -821,8 +821,9 @@ impl VmResult {
 
     /// One framework-computed per-phase metric for `phase` — the
     /// metric-name analog of [`Self::step_throughput`] /
-    /// [`Self::throughput_ratio`]. Resolves `metric` (a
-    /// `crate::stats::METRICS` registry name) from the folded
+    /// [`Self::throughput_ratio`]. Resolves `metric` (any `impl Into<MetricId>` —
+    /// a typed `BuiltinMetric`, typo-proof, or a dynamic scheduler-runtime
+    /// string) from the folded
     /// [`Self::phase_buckets`] bucket for `phase`, checking two stores:
     /// 1. [`crate::assert::PhaseBucket::metrics`] (via
     ///    [`crate::assert::PhaseBucket::get`]) — the host-folded
@@ -864,11 +865,26 @@ impl VmResult {
     /// started-but-uncaptured step (a `StepStart` with zero captures) DOES
     /// produce a synthesized bucket, so `phase_metric` returns its
     /// stimulus-derived `iteration_rate` rather than `None`.
-    pub fn phase_metric(&self, phase: crate::assert::Phase, metric: &str) -> Option<f64> {
+    ///
+    /// ```ignore
+    /// // Typed (typo-proof) is the primary form; a dynamic scheduler-runtime
+    /// // string is the escape hatch through the SAME call.
+    /// let p99 = result.phase_metric(Phase::step(0), BuiltinMetric::WakeupP99LatencyUs);
+    /// let custom = result.phase_metric(Phase::step(0), "scx_layered_layer0_util");
+    /// ```
+    pub fn phase_metric(
+        &self,
+        phase: crate::assert::Phase,
+        metric: impl Into<crate::stats::MetricId>,
+    ) -> Option<f64> {
+        let metric = metric.into();
         self.phase_buckets()
             .into_iter()
             .find(|b| b.step_index == phase.as_u16())
-            .and_then(|b| b.get(metric).or_else(|| b.cgroup_counter_total(metric)))
+            .and_then(|b| {
+                b.get(metric.as_str())
+                    .or_else(|| b.cgroup_counter_total(metric.as_str()))
+            })
     }
 
     /// Polarity-aware "is the `candidate` phase better than the `baseline` phase
@@ -880,8 +896,9 @@ impl VmResult {
     /// [`crate::assert::temporal::BetterThanPhase`] builder whose terminal
     /// (`better_than` / `by_at_least`) records the outcome into `verdict`.
     /// "Better" is oriented from the registry polarity, so the SAME call works
-    /// for a LowerBetter latency (`wakeup_p99_latency_us`) and a HigherBetter
-    /// throughput (`schbench_loop_count`) with no caller-specified direction.
+    /// for a LowerBetter latency (`BuiltinMetric::WakeupP99LatencyUs`) and a
+    /// HigherBetter throughput (`BuiltinMetric::SchbenchLoopCount`) with no
+    /// caller-specified direction.
     ///
     /// A post_vm callback collapses the verdict to its `anyhow::Result` via
     /// [`crate::assert::Verdict::into_anyhow_or_log`], which bails on a Fail OR
@@ -893,16 +910,17 @@ impl VmResult {
         verdict: &'v mut crate::assert::Verdict,
         baseline: crate::assert::Phase,
         candidate: crate::assert::Phase,
-        metric: &str,
+        metric: impl Into<crate::stats::MetricId>,
     ) -> crate::assert::temporal::BetterThanPhase<'v> {
+        let metric = metric.into();
         crate::assert::temporal::BetterThanPhase::new(
-            metric.to_string(),
+            metric.as_str().to_string(),
             verdict,
             baseline,
             candidate,
-            self.phase_metric(baseline, metric),
-            self.phase_metric(candidate, metric),
-            crate::stats::metric_def(metric).map(|m| m.polarity),
+            self.phase_metric(baseline, metric.clone()),
+            self.phase_metric(candidate, metric.clone()),
+            metric.def().map(|m| m.polarity),
             None, // pooled producer — no per-cgroup scope label
         )
     }
@@ -910,7 +928,8 @@ impl VmResult {
     /// One per-phase, PER-CGROUP derived metric — the per-cgroup analog of
     /// [`Self::phase_metric`], answering "metric M of cgroup C in phase P" as
     /// readily as the phase aggregate (the N-cgroups-to-N-queryable-sets goal).
-    /// Resolves `metric` (a `crate::stats::METRICS` registry name) from this
+    /// Resolves `metric` (any `impl Into<MetricId>` — a typed `BuiltinMetric` or
+    /// a dynamic scheduler-runtime string) from this
     /// cgroup's per-phase carrier via [`crate::assert::PhaseCgroupStats::get`] (its
     /// derived `metrics` map), falling back to
     /// [`crate::assert::PhaseCgroupStats::cgroup_counter`] for the per-cgroup
@@ -924,10 +943,13 @@ impl VmResult {
         &self,
         phase: crate::assert::Phase,
         cgroup: &str,
-        metric: &str,
+        metric: impl Into<crate::stats::MetricId>,
     ) -> Option<f64> {
-        self.phase_cgroup(phase, cgroup)
-            .and_then(|pc| pc.get(metric).or_else(|| pc.cgroup_counter(metric)))
+        let metric = metric.into();
+        self.phase_cgroup(phase, cgroup).and_then(|pc| {
+            pc.get(metric.as_str())
+                .or_else(|| pc.cgroup_counter(metric.as_str()))
+        })
     }
 
     /// Per-cgroup analog of [`Self::better_across_phases`]: "is `metric` of
@@ -943,16 +965,17 @@ impl VmResult {
         baseline: crate::assert::Phase,
         candidate: crate::assert::Phase,
         cgroup: &str,
-        metric: &str,
+        metric: impl Into<crate::stats::MetricId>,
     ) -> crate::assert::temporal::BetterThanPhase<'v> {
+        let metric = metric.into();
         crate::assert::temporal::BetterThanPhase::new(
-            metric.to_string(),
+            metric.as_str().to_string(),
             verdict,
             baseline,
             candidate,
-            self.phase_cgroup_metric(baseline, cgroup, metric),
-            self.phase_cgroup_metric(candidate, cgroup, metric),
-            crate::stats::metric_def(metric).map(|m| m.polarity),
+            self.phase_cgroup_metric(baseline, cgroup, metric.clone()),
+            self.phase_cgroup_metric(candidate, cgroup, metric.clone()),
+            metric.def().map(|m| m.polarity),
             Some(cgroup.to_string()), // per-cgroup scope label for the diagnostics
         )
     }

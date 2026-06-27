@@ -1015,6 +1015,49 @@ impl MetricCheck {
     pub const fn exit_code_eq(expected: i32) -> MetricCheck {
         MetricCheck::ExitCodeEq(expected)
     }
+
+    /// Typed sibling of [`Self::min`] — a typo-proof `BuiltinMetric` instead of a
+    /// registry-name string. `const` (via `BuiltinMetric::wire_name`) so it
+    /// composes in `const` payload-check tables exactly like [`Self::min`]. Use
+    /// this for a registered built-in metric; keep [`Self::min`] for the dynamic
+    /// keyspace (dotted LLM-extraction paths, scheduler-runtime keys).
+    pub const fn min_builtin(metric: crate::stats::BuiltinMetric, value: f64) -> MetricCheck {
+        MetricCheck::Min {
+            metric: metric.wire_name(),
+            value,
+        }
+    }
+
+    /// Typed sibling of [`Self::max`] — see [`Self::min_builtin`].
+    pub const fn max_builtin(metric: crate::stats::BuiltinMetric, value: f64) -> MetricCheck {
+        MetricCheck::Max {
+            metric: metric.wire_name(),
+            value,
+        }
+    }
+
+    /// Typed sibling of [`Self::range`] — see [`Self::min_builtin`]. Same
+    /// reversed-bounds construction panic as [`Self::range`].
+    pub const fn range_builtin(
+        metric: crate::stats::BuiltinMetric,
+        lo: f64,
+        hi: f64,
+    ) -> MetricCheck {
+        assert!(
+            lo <= hi,
+            "MetricCheck::range_builtin: lo must be <= hi (reversed bounds are an empty interval)"
+        );
+        MetricCheck::Range {
+            metric: metric.wire_name(),
+            lo,
+            hi,
+        }
+    }
+
+    /// Typed sibling of [`Self::exists`] — see [`Self::min_builtin`].
+    pub const fn exists_builtin(metric: crate::stats::BuiltinMetric) -> MetricCheck {
+        MetricCheck::Exists(metric.wire_name())
+    }
 }
 
 /// Provenance of a [`Metric`] — tells downstream tooling whether the
@@ -1257,6 +1300,39 @@ pub(crate) struct RawPayloadOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metric_check_builtin_constructors_carry_the_wire_name() {
+        use crate::stats::BuiltinMetric;
+        // The typed const constructors store the same wire name as the &str
+        // form, so a built-in payload check is typo-proof without changing the
+        // stored key. (MetricCheck is Copy, not PartialEq, so match on the arm.)
+        match MetricCheck::min_builtin(BuiltinMetric::TaobenchTotalQps, 1000.0) {
+            MetricCheck::Min { metric, value } => {
+                assert_eq!(metric, "taobench_total_qps");
+                assert_eq!(value, 1000.0);
+            }
+            other => panic!("min_builtin must produce Min, got {other:?}"),
+        }
+        match MetricCheck::max_builtin(BuiltinMetric::TaobenchSlowQps, 5.0) {
+            MetricCheck::Max { metric, value } => {
+                assert_eq!(metric, "taobench_slow_qps");
+                assert_eq!(value, 5.0);
+            }
+            other => panic!("max_builtin must produce Max, got {other:?}"),
+        }
+        match MetricCheck::range_builtin(BuiltinMetric::WakeupP99LatencyUs, 1.0, 2.0) {
+            MetricCheck::Range { metric, lo, hi } => {
+                assert_eq!(metric, "wakeup_p99_latency_us");
+                assert_eq!((lo, hi), (1.0, 2.0));
+            }
+            other => panic!("range_builtin must produce Range, got {other:?}"),
+        }
+        match MetricCheck::exists_builtin(BuiltinMetric::SchbenchLoopCount) {
+            MetricCheck::Exists(metric) => assert_eq!(metric, "schbench_loop_count"),
+            other => panic!("exists_builtin must produce Exists, got {other:?}"),
+        }
+    }
 
     #[test]
     fn payload_kernel_default_const_is_scheduler_kind() {
@@ -1659,6 +1735,20 @@ mod tests {
     #[should_panic(expected = "lo must be <= hi")]
     fn check_range_reversed_bounds_panics_at_construction() {
         let _ = MetricCheck::range("iops", 100.0, 50.0);
+    }
+
+    /// `MetricCheck::range_builtin` carries the same reversed-bounds construction
+    /// panic as [`MetricCheck::range`] (the typed sibling shares the `lo <= hi`
+    /// assert), so the typed payload-check path fails just as loudly on a
+    /// reversed range as the string form.
+    #[test]
+    #[should_panic(expected = "lo must be <= hi")]
+    fn check_range_builtin_reversed_bounds_panics_at_construction() {
+        let _ = MetricCheck::range_builtin(
+            crate::stats::BuiltinMetric::WakeupP99LatencyUs,
+            100.0,
+            50.0,
+        );
     }
 
     /// Equal bounds (`lo == hi`) describe a single-point interval —

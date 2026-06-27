@@ -242,6 +242,12 @@ fn scenario_stats_phase_metric_resolves_typed_lookup() {
         ..Default::default()
     };
     assert_eq!(stats.phase_metric(1, "worst_spread"), Some(0.42));
+    // A typed BuiltinMetric resolves identically to its &str wire name.
+    assert_eq!(
+        stats.phase_metric(1, crate::stats::BuiltinMetric::WorstSpread),
+        Some(0.42),
+    );
+    // A non-registered key stays a dynamic lookup against the bucket.
     assert_eq!(stats.phase_metric(1, "dsq_depth_max"), Some(12.0));
     assert_eq!(stats.phase_metric(1, "absent"), None);
     assert_eq!(stats.phase_metric(99, "worst_spread"), None);
@@ -347,32 +353,27 @@ fn scenario_stats_run_metric_resolves_ext_family_sentinel_free() {
     assert_eq!(stats.run_metric("max_imbalance_ratio"), None);
 }
 
-/// `ScenarioStats::is_known_metric` lets the test author
-/// distinguish a typo (`"worts_spread"`) from legitimate-absent
-/// data (the metric simply had no finite samples in the phase).
+/// The metric accessors take `impl Into<MetricId>`: a typed
+/// [`crate::stats::BuiltinMetric`], a `&str`, a `String`, and a `&String` all
+/// resolve identically (`From<&str>`/`From<String>` canonicalize a registered
+/// name to the typed `Builtin`), and an unregistered scheduler-runtime key
+/// resolves to `None` rather than a guessed value (the no-guessed-kind
+/// guardrail, reached through an accessor).
 #[test]
-fn scenario_stats_is_known_metric_distinguishes_typo_from_absent_data() {
-    // "worst_spread" is a registered METRICS entry.
-    assert!(ScenarioStats::is_known_metric("worst_spread"));
-    // A typo / unknown metric name is NOT registered.
-    assert!(!ScenarioStats::is_known_metric("worts_spread"));
-    assert!(!ScenarioStats::is_known_metric(""));
-    assert!(!ScenarioStats::is_known_metric("totally_made_up"));
-}
-
-/// `ScenarioStats::known_metrics` yields the same set of names
-/// that `is_known_metric` validates positively. Round-trip
-/// consistency: every yielded name passes is_known_metric, and
-/// the count matches the METRICS registry length.
-#[test]
-fn scenario_stats_known_metrics_iterates_registry() {
-    let names: Vec<&'static str> = ScenarioStats::known_metrics().collect();
-    assert!(!names.is_empty(), "METRICS registry must have entries");
-    assert_eq!(names.len(), crate::stats::METRICS.len());
-    for name in names {
-        assert!(
-            ScenarioStats::is_known_metric(name),
-            "every known_metrics() entry must pass is_known_metric: {name}"
-        );
-    }
+fn scenario_stats_accessors_accept_typed_and_string_metric_ids() {
+    use crate::stats::BuiltinMetric;
+    let mut ext = BTreeMap::new();
+    ext.insert("worst_run_delay_us".to_string(), 48.0);
+    let stats = ScenarioStats {
+        ext_metrics: ext,
+        ..Default::default()
+    };
+    let owned = "worst_run_delay_us".to_string();
+    // Typed, &str, String, and &String ids all resolve to the SAME value.
+    assert_eq!(stats.run_metric(BuiltinMetric::WorstRunDelayUs), Some(48.0));
+    assert_eq!(stats.run_metric("worst_run_delay_us"), Some(48.0));
+    assert_eq!(stats.run_metric(owned.clone()), Some(48.0));
+    assert_eq!(stats.run_metric(&owned), Some(48.0));
+    // An unregistered scheduler-runtime key resolves to None, not a guess.
+    assert_eq!(stats.run_metric("scx_runtime_only_key"), None);
 }

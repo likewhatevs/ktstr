@@ -113,8 +113,10 @@ impl ScenarioStats {
     ///     [`Self::phases`]),
     /// (b) the phase exists but had no finite samples for that
     ///     metric, OR
-    /// (c) `metric` is not a registered metric name (typo case —
-    ///     [`Self::is_known_metric`] surfaces it).
+    /// (c) `metric` is a dynamic [`crate::stats::MetricId`] key (a
+    ///     scheduler-runtime / payload string) not present in this phase's
+    ///     stores. A built-in [`crate::stats::BuiltinMetric`] cannot be a
+    ///     typo — that is a compile error — so this case needs a dynamic key.
     ///
     /// Two stores are checked: [`PhaseBucket::metrics`] (via
     /// [`PhaseBucket::get`]) and, failing that, the cross-cgroup phase
@@ -129,17 +131,24 @@ impl ScenarioStats {
     /// Sentinel-free: `Some(0.0)` means the reducer produced a
     /// real zero from finite samples, NOT "missing data". See
     /// [`PhaseBucket::metrics`] for the registry source. When
-    /// debugging an unexpected `None`, gate the lookup on
-    /// [`Self::is_known_metric`] to distinguish typos from absent
-    /// data.
+    /// debugging an unexpected `None` on a dynamic key, check
+    /// [`crate::stats::MetricId::def`]`().is_some()` to tell an unregistered
+    /// key from absent data (built-in ids always resolve).
     ///
     /// **Heads up:** same 1-indexed Step encoding as
     /// [`Self::phase`] — `step_index = 0` is BASELINE, not the
     /// first Step. Use [`Self::step_metric`] for the 0-indexed
     /// scenario-Step lookup.
-    pub fn phase_metric(&self, step_index: u16, metric: &str) -> Option<f64> {
-        self.phase(step_index)
-            .and_then(|p| p.get(metric).or_else(|| p.cgroup_counter_total(metric)))
+    pub fn phase_metric(
+        &self,
+        step_index: u16,
+        metric: impl Into<crate::stats::MetricId>,
+    ) -> Option<f64> {
+        let metric = metric.into();
+        self.phase(step_index).and_then(|p| {
+            p.get(metric.as_str())
+                .or_else(|| p.cgroup_counter_total(metric.as_str()))
+        })
     }
 
     /// Cross-cgroup balance: the ratio of the busiest cell's per-worker
@@ -189,11 +198,18 @@ impl ScenarioStats {
 
     /// Shortcut: look up a single metric value in a 0-indexed
     /// scenario Step. Sibling of [`Self::step`]. See [`Self::phase_metric`]
-    /// for the None-cause taxonomy and
-    /// [`Self::is_known_metric`] for typo-debugging.
-    pub fn step_metric(&self, scenario_step_idx: u16, metric: &str) -> Option<f64> {
-        self.step(scenario_step_idx)
-            .and_then(|p| p.get(metric).or_else(|| p.cgroup_counter_total(metric)))
+    /// for the None-cause taxonomy (a built-in id is typo-proof; a dynamic
+    /// key's registration is [`crate::stats::MetricId::def`]).
+    pub fn step_metric(
+        &self,
+        scenario_step_idx: u16,
+        metric: impl Into<crate::stats::MetricId>,
+    ) -> Option<f64> {
+        let metric = metric.into();
+        self.step(scenario_step_idx).and_then(|p| {
+            p.get(metric.as_str())
+                .or_else(|| p.cgroup_counter_total(metric.as_str()))
+        })
     }
 
     /// Per-cgroup analog of [`Self::phase_metric`] (same 1-indexed Step encoding:
@@ -202,14 +218,24 @@ impl ScenarioStats {
     /// falling back to [`PhaseCgroupStats::cgroup_counter`] for the per-cgroup
     /// Counters `total_migrations`/`total_iterations`/`total_cpu_time_ns`. `None` when the phase has no bucket, no
     /// carrier for `cgroup`, the carrier carried no finite value for the metric, OR
-    /// the metric name is a typo (an unregistered name yields `None` — disambiguate
-    /// with [`Self::is_known_metric`], same as [`Self::phase_metric`]). The
+    /// the metric is an unregistered dynamic key (a built-in id is typo-proof;
+    /// an unregistered [`crate::stats::MetricId`] has no
+    /// [`crate::stats::MetricId::def`], same as [`Self::phase_metric`]). The
     /// N-cgroups-to-N-queryable-sets surface on the AssertResult-holding path (the
     /// in-VM `post_vm` path uses [`crate::vmm::VmResult::phase_cgroup_metric`]).
-    pub fn phase_cgroup_metric(&self, step_index: u16, cgroup: &str, metric: &str) -> Option<f64> {
+    pub fn phase_cgroup_metric(
+        &self,
+        step_index: u16,
+        cgroup: &str,
+        metric: impl Into<crate::stats::MetricId>,
+    ) -> Option<f64> {
+        let metric = metric.into();
         self.phase(step_index)
             .and_then(|p| p.per_cgroup.get(cgroup))
-            .and_then(|pc| pc.get(metric).or_else(|| pc.cgroup_counter(metric)))
+            .and_then(|pc| {
+                pc.get(metric.as_str())
+                    .or_else(|| pc.cgroup_counter(metric.as_str()))
+            })
     }
 
     /// Per-cgroup analog of [`Self::step_metric`] (0-indexed scenario Step). See
@@ -218,48 +244,15 @@ impl ScenarioStats {
         &self,
         scenario_step_idx: u16,
         cgroup: &str,
-        metric: &str,
+        metric: impl Into<crate::stats::MetricId>,
     ) -> Option<f64> {
+        let metric = metric.into();
         self.step(scenario_step_idx)
             .and_then(|p| p.per_cgroup.get(cgroup))
-            .and_then(|pc| pc.get(metric).or_else(|| pc.cgroup_counter(metric)))
-    }
-
-    /// True when `name` matches a registered metric (see
-    /// [`PhaseBucket::metrics`] for the registry source). Use to
-    /// disambiguate the typo None-cause from [`Self::phase_metric`]
-    /// / [`Self::step_metric`]: if the lookup returns `None` and
-    /// `is_known_metric(name) == false`, the metric name is a typo
-    /// (caller mistake), not missing data (legitimately-absent
-    /// samples).
-    pub fn is_known_metric(name: &str) -> bool {
-        crate::stats::METRICS.iter().any(|m| m.name == name)
-    }
-
-    /// Iterate the canonical metric names a test author may pass
-    /// to [`Self::phase_metric`] / [`Self::step_metric`]. Sourced
-    /// from the registry referenced by [`PhaseBucket::metrics`].
-    ///
-    /// Sample usage for an A/B scheduler-swap assertion that
-    /// compares every registered metric across two scenario Steps:
-    /// ```ignore
-    /// for metric in ScenarioStats::known_metrics() {
-    ///     let baseline = r.stats.step_metric(0, metric);
-    ///     let after_swap = r.stats.step_metric(2, metric);
-    ///     // ... compare per metric ...
-    /// }
-    /// ```
-    ///
-    /// Heads up: not every known name is phase-readable. The
-    /// `MetricKind::Distribution` / `MetricKind::WorstLowest` family
-    /// (`worst_*_wake_latency_*` / `worst_*_run_delay_*` /
-    /// `worst_iterations_per_*`) is RUN-LEVEL only — it never appears
-    /// in [`PhaseBucket::metrics`], so [`Self::phase_metric`] /
-    /// [`Self::step_metric`] return `None` for those names. Read them
-    /// via [`Self::run_metric`] instead. Iterating `known_metrics()`
-    /// through `step_metric` (as above) silently skips that family.
-    pub fn known_metrics() -> impl Iterator<Item = &'static str> {
-        crate::stats::METRICS.iter().map(|m| m.name)
+            .and_then(|pc| {
+                pc.get(metric.as_str())
+                    .or_else(|| pc.cgroup_counter(metric.as_str()))
+            })
     }
 
     /// True iff the scenario produced at least one Step-phase
@@ -326,8 +319,9 @@ impl ScenarioStats {
     /// Sentinel-free, matching [`Self::phase_metric`]: `None` means
     /// the metric is absent from this run (no contributing cgroup or
     /// carrier, or a name not present in the map); `Some(0.0)` is a
-    /// real measured zero. Gate on [`Self::is_known_metric`] to tell a
-    /// typo from genuinely-absent data. (The map also carries any
+    /// real measured zero. Check [`crate::stats::MetricId::def`] on a dynamic
+    /// key to tell an unregistered key from genuinely-absent data (built-in
+    /// ids always resolve). (The map also carries any
     /// user-defined extensible-metric keys, plus the framework-internal
     /// Rate-component Counters — `total_phase_iterations` /
     /// `total_phase_duration_sec` / `total_iterations_pooled` /
@@ -354,13 +348,13 @@ impl ScenarioStats {
     ///   [`Self::step_metric`].
     ///
     /// So this does NOT cover the full registry: iterating
-    /// [`Self::known_metrics`] through it yields `None` for those typed
-    /// and monitor names. There is no single run-level by-name accessor
+    /// [`crate::stats::BuiltinMetric::ALL`] through it yields `None` for those
+    /// typed and monitor names. There is no single run-level by-name accessor
     /// over the whole registry (the typed fields live on `ScenarioStats`
     /// directly, the monitor metrics only per-phase); this resolves the
     /// ext-sourced family, the one with no typed field.
-    pub fn run_metric(&self, name: &str) -> Option<f64> {
-        self.ext_metrics.get(name).copied()
+    pub fn run_metric(&self, name: impl Into<crate::stats::MetricId>) -> Option<f64> {
+        self.ext_metrics.get(name.into().as_str()).copied()
     }
 }
 
@@ -1277,8 +1271,7 @@ fn write_carrier_scalars(pc: &mut PhaseCgroupStats) {
     let off_cpu = pc.off_cpu_summary();
     let migration_ratio = migration_ratio_of(pc.total_migrations, pc.total_iterations);
     let ipw = iterations_per_worker_of(pc.num_workers, pc.total_iterations);
-    let ipcs =
-        iterations_per_cpu_sec_of(pc.num_workers, pc.total_cpu_time_ns, pc.total_iterations);
+    let ipcs = iterations_per_cpu_sec_of(pc.num_workers, pc.total_cpu_time_ns, pc.total_iterations);
     let numa = if pc.numa_pages_total > 0 {
         Some((
             page_locality_of(pc.numa_pages_local, pc.numa_pages_total),
@@ -1441,7 +1434,10 @@ fn write_taobench_scalars(
         out.insert(TAOBENCH_SLOW_QPS.to_string(), p.slow_ops as f64 / secs);
     }
     if total > 0 {
-        out.insert(TAOBENCH_HIT_RATIO.to_string(), p.fast_ops as f64 / total as f64);
+        out.insert(
+            TAOBENCH_HIT_RATIO.to_string(),
+            p.fast_ops as f64 / total as f64,
+        );
     }
     if p.get_cmds > 0 {
         out.insert(
