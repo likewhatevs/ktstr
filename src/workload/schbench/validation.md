@@ -178,3 +178,27 @@ else `NO (±x%)` where x is the signed distance from the nearer gcc/clang avg ed
 | request p99 (us) | 17440.0 [17376–17504] | 16112.0 [16080–16144] | 17269.3 [17056–17632] | yes |
 | rps p50 | 118.7 [118–119] | 126.0 [126–126] | 122.0 [121–123] | yes |
 | avg rps | 119.8 [119.6–120.1] | 127.0 [126.9–127.2] | 123.2 [122.7–123.9] | yes |
+
+### `-s` sleep usec = 0
+
+`-m 1 -t 2 -s 0 -r 10` (n=3 per impl; lower=better except rps)
+
+| metric | schbench-gcc | schbench-clang | ktstr | ktstr in gcc↔clang envelope |
+|---|---|---|---|---|
+| wakeup p99 (us) | 8.3 [8–9] | 7.0 [6–8] | 5.7 [5–6] | noise [1] |
+| request p50 (us) | 4136.0 [4120–4152] | 3894.7 [3876–3908] | 3990.7 [3980–4012] | yes |
+| request p99 (us) | 4434.7 [4424–4440] | 4033.3 [4012–4044] | 4344.0 [4296–4376] | yes |
+| rps p50 | 480.3 [478–483] | 509.7 [508–511] | 498.3 [496–500] | yes |
+| avg rps | 482.1 [480.2–484.4] | 510.6 [509.3–512.2] | 499.4 [497.1–501.0] | yes |
+
+### `-s` sleep usec = 500
+
+`-m 1 -t 2 -s 500 -r 10` (n=3 per impl; lower=better except rps)
+
+| metric | schbench-gcc | schbench-clang | ktstr | ktstr in gcc↔clang envelope |
+|---|---|---|---|---|
+| wakeup p99 (us) | 8.3 [7–9] | 8.3 [7–9] | 7.7 [7–8] | noise [1] |
+| request p50 (us) | 4658.7 [4648–4664] | 4424.0 [4424–4424] | 4536.0 [4520–4568] | yes |
+| request p99 (us) | 4973.3 [4952–5000] | 4600.0 [4600–4600] | 4882.7 [4856–4920] | yes |
+| rps p50 | 427.0 [426–428] | 447.7 [447–448] | 437.3 [436–438] | yes |
+| avg rps | 427.9 [427.1–428.7] | 448.8 [448.4–449.3] | 439.0 [436.4–440.5] | yes |
