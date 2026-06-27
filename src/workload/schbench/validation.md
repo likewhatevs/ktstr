@@ -202,3 +202,15 @@ else `NO (±x%)` where x is the signed distance from the nearer gcc/clang avg ed
 | request p99 (us) | 4973.3 [4952–5000] | 4600.0 [4600–4600] | 4882.7 [4856–4920] | yes |
 | rps p50 | 427.0 [426–428] | 447.7 [447–448] | 437.3 [436–438] | yes |
 | avg rps | 427.9 [427.1–428.7] | 448.8 [448.4–449.3] | 439.0 [436.4–440.5] | yes |
+
+### `-L` no locking
+
+`-m 1 -t 2 -L -r 10` (n=3 per impl; lower=better except rps)
+
+| metric | schbench-gcc | schbench-clang | ktstr | ktstr in gcc↔clang envelope |
+|---|---|---|---|---|
+| wakeup p99 (us) | 8.0 [7–9] | 8.7 [8–9] | 7.0 [6–8] | noise [1] |
+| request p50 (us) | 4280.0 [4280–4280] | 4041.3 [4036–4052] | 4141.3 [4136–4152] | yes |
+| request p99 (us) | 4589.3 [4584–4600] | 4194.7 [4184–4200] | 4504.0 [4488–4520] | yes |
+| rps p50 | 464.7 [464–465] | 490.7 [490–491] | 479.3 [479–480] | yes |
+| avg rps | 466.3 [465.9–466.7] | 492.3 [491.8–492.9] | 481.0 [480.2–481.5] | yes |
