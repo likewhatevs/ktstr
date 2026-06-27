@@ -82,3 +82,27 @@ else `NO (±x%)` where x is the signed distance from the nearer gcc/clang avg ed
 | request p99 (us) | 4584.0 [4584–4584] | 4189.3 [4168–4216] | 4456.0 [4408–4488] | yes |
 | rps p50 | 465.0 [465–465] | 493.3 [492–494] | 477.7 [475–481] | yes |
 | avg rps | 466.6 [466.2–466.9] | 494.3 [493.3–494.8] | 479.3 [475.7–483.3] | yes |
+
+### `-m` message threads = 2
+
+`-m 2 -t 2 -r 10` (n=3 per impl; lower=better except rps)
+
+| metric | schbench-gcc | schbench-clang | ktstr | ktstr in gcc↔clang envelope |
+|---|---|---|---|---|
+| wakeup p99 (us) | 8.3 [8–9] | 8.0 [8–8] | 7.7 [7–8] | noise [1] |
+| request p50 (us) | 4264.0 [4264–4264] | 4028.0 [4012–4036] | 4157.3 [4152–4168] | yes |
+| request p99 (us) | 4589.3 [4584–4600] | 4200.0 [4152–4232] | 4498.7 [4472–4520] | yes |
+| rps p50 | 935.0 [933–937] | 986.3 [983–991] | 959.7 [957–961] | yes |
+| avg rps | 934.9 [933.3–936.6] | 987.1 [984.4–992.1] | 958.9 [957.2–961.1] | yes |
+
+### `-m` message threads = 4
+
+`-m 4 -t 2 -r 10` (n=3 per impl; lower=better except rps)
+
+| metric | schbench-gcc | schbench-clang | ktstr | ktstr in gcc↔clang envelope |
+|---|---|---|---|---|
+| wakeup p99 (us) | 8.3 [7–9] | 7.3 [7–8] | 7.3 [7–8] | noise [1] |
+| request p50 (us) | 4274.7 [4264–4280] | 4014.7 [4012–4020] | 4157.3 [4152–4168] | yes |
+| request p99 (us) | 4610.7 [4600–4616] | 4162.7 [4136–4216] | 4456.0 [4456–4456] | yes |
+| rps p50 | 1867.3 [1866–1870] | 1983.3 [1978–1986] | 1920.7 [1918–1922] | yes |
+| avg rps | 1866.0 [1863.2–1868.8] | 1983.0 [1978.8–1985.2] | 1921.5 [1918.2–1923.4] | yes |
