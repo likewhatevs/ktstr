@@ -616,16 +616,22 @@ fn every_metric_has_kind_consistent_with_naming() {
                 m.polarity,
             );
         }
-        // Rate metrics are derived ratios; name them `*_rate` or
-        // `*_per_*` so the registry reads as a rate at a glance.
+        // Rate metrics are derived ratios; name them `*_rate`, `*_per_*`, or —
+        // for a dimensionless pooled fraction/ratio of two counters — `*_fraction`
+        // / `*_ratio`, so the registry reads as a rate at a glance. (A pooled
+        // fraction like `ttwu_local_fraction` = Σlocal/Σcount IS a Rate: the
+        // cross-run fold must be ratio-of-sums, not mean-of-ratios.)
         if let MetricKind::Rate {
             numerator,
             denominator,
         } = m.kind
         {
             assert!(
-                m.name.ends_with("_rate") || m.name.contains("_per_"),
-                "Rate-kind metric must use *_rate or *_per_* naming, got {:?}",
+                m.name.ends_with("_rate")
+                    || m.name.contains("_per_")
+                    || m.name.ends_with("_fraction")
+                    || m.name.ends_with("_ratio"),
+                "Rate-kind metric must use *_rate / *_per_* / *_fraction / *_ratio naming, got {:?}",
                 m.name,
             );
             // Components must be registered AND not themselves Rate:
@@ -666,7 +672,14 @@ fn every_metric_has_kind_consistent_with_naming() {
         let looks_like_rate = m.name.ends_with("_rate")
             || m.name.contains("_per_sec")
             || m.name.contains("_per_cpu_sec");
-        if looks_like_rate && m.name != "worst_iterations_per_cpu_sec" {
+        // taobench_hit_rate is the reference taobench server's own field name
+        // (1 - misses/cmds, a command-time hit FRACTION, not a per-second rate);
+        // it is MetricKind::PerPhase (skipped at the cross-run ext fold) so the
+        // mean-of-ratios bug this gate guards cannot apply.
+        if looks_like_rate
+            && m.name != "worst_iterations_per_cpu_sec"
+            && m.name != "taobench_hit_rate"
+        {
             assert!(
                 matches!(m.kind, MetricKind::Rate { .. }),
                 "metric {:?} is named like a per-second rate but is not \
