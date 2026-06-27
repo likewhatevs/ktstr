@@ -130,3 +130,27 @@ else `NO (±x%)` where x is the signed distance from the nearer gcc/clang avg ed
 | request p99 (us) | 4568.0 [4552–4584] | 4205.3 [4168–4232] | 4482.7 [4472–4504] | yes |
 | rps p50 | 935.7 [935–937] | 986.3 [983–991] | 964.3 [963–965] | yes |
 | avg rps | 937.2 [936.1–939.1] | 986.7 [983.6–990.9] | 965.4 [964.2–966.7] | yes |
+
+### `-F` cache footprint = 64 KiB
+
+`-m 1 -t 2 -F 64 -r 10` (n=3 per impl; lower=better except rps)
+
+| metric | schbench-gcc | schbench-clang | ktstr | ktstr in gcc↔clang envelope |
+|---|---|---|---|---|
+| wakeup p99 (us) | 8.0 [7–9] | 7.3 [7–8] | 7.3 [7–8] | noise [1] |
+| request p50 (us) | 583.0 [583–583] | 523.0 [521–525] | 611.0 [605–617] | NO (+4.8%) |
+| request p99 (us) | 656.3 [649–661] | 613.7 [559–709] | 727.7 [727–729] | NO (+10.9%) |
+| rps p50 | 3297.3 [3292–3308] | 3745.3 [3692–3820] | 3102.7 [3076–3132] | NO (-5.9%) |
+| avg rps | 3306.4 [3297.1–3315.8] | 3755.4 [3689.5–3808.7] | 3107.7 [3084.4–3147.6] | NO (-6.0%) |
+
+### `-F` cache footprint = 1024 KiB
+
+`-m 1 -t 2 -F 1024 -r 10` (n=3 per impl; lower=better except rps)
+
+| metric | schbench-gcc | schbench-clang | ktstr | ktstr in gcc↔clang envelope |
+|---|---|---|---|---|
+| wakeup p99 (us) | 10.3 [9–13] | 8.7 [7–10] | 8.0 [7–9] | noise [1] |
+| request p50 (us) | 34666.7 [34496–34752] | 35562.7 [35520–35648] | 35178.7 [35136–35264] | yes |
+| request p99 (us) | 36160.0 [35904–36416] | 36800.0 [36416–37184] | 36714.7 [36288–37056] | yes |
+| rps p50 | 56.7 [56–57] | 55.0 [55–55] | 55.3 [55–56] | yes |
+| avg rps | 57.8 [57.6–58.0] | 56.3 [56.2–56.4] | 56.9 [56.7–57.1] | yes |
