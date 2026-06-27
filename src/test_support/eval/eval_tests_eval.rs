@@ -1664,7 +1664,7 @@ fn better_across_phases_orients_by_polarity_end_to_end() {
     );
 }
 
-/// per-cgroup query API end-to-end through the production VmResult path:
+/// Per-cgroup query API end-to-end through the production VmResult path:
 /// VmResult::phase_cgroup_metric reads the NAMED cgroup (distinct per cgroup, not
 /// the pool), the counter fallback exposes total_migrations, the None taxonomy
 /// holds, and better_across_phases_cgroup orients per-cgroup (opposite outcomes for
@@ -1853,7 +1853,7 @@ fn scenario_stats_phase_cgroup_metric_and_counter_fallback() {
     );
 }
 
-/// pooled-path counter symmetry (the AssertResult-holding path): ScenarioStats
+/// Pooled-path counter symmetry (the AssertResult-holding path): ScenarioStats
 /// phase_metric / step_metric resolve the per-cgroup Counters total_migrations /
 /// total_iterations as the cross-cgroup SUM via PhaseBucket::cgroup_counter_total,
 /// symmetric with the per-cgroup phase_cgroup_metric (which surfaces each cgroup's

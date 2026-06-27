@@ -503,7 +503,7 @@ pub(crate) struct ThreadData {
     /// Mean per-schedule run-queue wait (ns), read from `/proc/<tid>/schedstat`
     /// at thread exit (schbench's `read_sched_delay`, `:1118`). Owner-only.
     /// Feeds the WHOLE-RUN `SchbenchResult` (mean-of-means, matching real
-    /// schbench for validation); the per-phase delay comes from
+    /// schbench for the side-by-side validation); the per-phase delay comes from
     /// [`Self::phase_snapshots`] instead.
     sched_delay_ns: UnsafeCell<u64>,
     /// Per-phase snapshots this thread accumulated via drain-on-change against
@@ -565,7 +565,7 @@ struct PhaseSnapshot {
 /// `*_run_delay_ns / *_pcount` is SAMPLE-WEIGHTED (`Σrun_delay / Σpcount`), a
 /// DIFFERENT estimator from the whole-run [`SchbenchResult`]'s `sched_delay_*`,
 /// which keeps schbench's mean-of-per-thread-means (`collect_sched_delay`) for
-/// parity. They measure different things by design — never cross-compare a
+/// schbench parity. They measure different things by design — never cross-compare a
 /// per-phase value against a whole-run threshold (or vice-versa). `pcount == 0`
 /// for a class means that class was never scheduled in the phase → the host
 /// emits the metric as ABSENT, not `0`.
