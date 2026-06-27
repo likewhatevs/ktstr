@@ -96,7 +96,7 @@ pub struct StandaloneReport {
     pub loop_count: u64,
     /// Resolved total worker count (`message_threads * worker_threads`). Divisor
     /// for the PER-WORKER pipe-mode `avg worker transfer` rate — see
-    /// [`pipe_transfer_report`](crate::workload::pipe_transfer_report).
+    /// [`pipe_transfer_report`].
     pub nr_workers: usize,
 }
 
