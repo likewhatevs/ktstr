@@ -226,3 +226,24 @@ else `NO (±x%)` where x is the signed distance from the nearer gcc/clang avg ed
 | request p99 (us) | 4568.0 [4552–4584] | 4237.3 [4200–4280] | 4525.3 [4520–4536] | yes |
 | rps p50 | 380.7 [368–388] | 402.7 [389–411] | 478.7 [478–480] | NO (+18.9%) |
 | avg rps | 393.8 [385.9–401.9] | 418.1 [408.8–429.4] | 493.8 [492.0–496.5] | NO (+18.1%) |
+
+### `-A` auto-rps target = 50%
+
+`-m 1 -t 2 -A 50 -r 15` (n=3 per impl; lower=better except rps)
+
+| metric | schbench-gcc | schbench-clang | ktstr | ktstr in gcc↔clang envelope |
+|---|---|---|---|---|
+| wakeup p99 (us) | 25.3 [20–35] | 20.0 [20–20] | 23.0 [23–23] | noise [1] |
+| request p50 (us) | 4258.7 [4248–4280] | 4038.7 [4020–4068] | 4146.7 [4120–4184] | yes |
+| request p99 (us) | 4568.0 [4552–4600] | 4221.3 [4168–4264] | 4509.3 [4488–4536] | yes |
+
+> `-A` is **degenerate on this many-core host**: 2 workers cannot drive it
+> to 50% busy, so the closed-loop controller raises its rps *goal* without
+> bound in all three implementations (their auto-scale control math is
+> identical band-for-band). That goal is an internal climbing target, not
+> delivered work, and the RPS sample table stays empty (sampling is gated on
+> the busy target being hit, which never happens here) -- both omitted above.
+> The wakeup/request latencies the workers still produce are within the
+> gcc↔clang envelope, confirming the auto-rps engine runs and measures
+> correctly; the controller's settle point is untestable where the busy
+> target is unreachable.
