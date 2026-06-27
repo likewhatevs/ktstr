@@ -2793,17 +2793,17 @@ pub(super) fn worker_main(
                             // Parent: write the child pid to the sibling dest
                             // `cgroup.procs` (lazy-open + invalidate on error,
                             // like CgroupChurn).
-                            if cgroup_attach_storm_file.is_none() {
-                                if let Some(path) = &cgroup_attach_storm_path {
-                                    match std::fs::OpenOptions::new().write(true).open(path) {
-                                        Ok(f) => cgroup_attach_storm_file = Some(f),
-                                        Err(e) => {
-                                            tracing::warn!(
-                                                ?e,
-                                                path = %path.display(),
-                                                "CgroupAttachStorm open failed"
-                                            );
-                                        }
+                            if cgroup_attach_storm_file.is_none()
+                                && let Some(path) = &cgroup_attach_storm_path
+                            {
+                                match std::fs::OpenOptions::new().write(true).open(path) {
+                                    Ok(f) => cgroup_attach_storm_file = Some(f),
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            ?e,
+                                            path = %path.display(),
+                                            "CgroupAttachStorm open failed"
+                                        );
                                     }
                                 }
                             }

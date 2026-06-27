@@ -309,6 +309,9 @@ pub enum MetricKind {
     /// derivation owns the metric-name→computation mapping, so the kind need not
     /// carry a percentile selector (which would leak `plat::Pct` through this
     /// public enum).
+    // doc_lazy_continuation: pre-existing list-item wording surfaced by the clippy
+    // 1.94 bump; renders fine. Suppress rather than reflow the prose.
+    #[allow(clippy::doc_lazy_continuation)]
     PerPhase,
 }
 

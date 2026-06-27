@@ -1182,6 +1182,9 @@ pub fn populate_run_ext_metrics(
 /// in the merge loop), so deriving earlier would DROP the keys. Idempotent
 /// (overwrites the keys), so callers that rebuild buckets per call (e.g.
 /// `VmResult::phase_buckets`) may re-run it freely.
+// doc_lazy_continuation: pre-existing numbered-list wording surfaced by the clippy
+// 1.94 bump; renders fine. Suppress rather than reflow the prose.
+#[allow(clippy::doc_lazy_continuation)]
 pub(crate) fn derive_phase_metrics(phases: &mut [PhaseBucket]) {
     use crate::workload::schbench::run::SchbenchPhaseStats;
 

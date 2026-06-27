@@ -847,6 +847,7 @@ fn ops_split(operations: usize, p: usize) -> (usize, usize) {
 /// legacy all-private single matrix (`:1406-1408`). The guard drops at the end,
 /// holding the lock across all operations exactly as schbench does (`:1387`/
 /// `:1411`).
+#[allow(clippy::too_many_arguments)]
 fn do_work(
     private_buf: &mut [u64],
     private_matrix_size: usize,
@@ -1615,6 +1616,7 @@ struct MessageThreadResult {
 /// AND the per-epoch aggregate. The message thread runs on the calling thread;
 /// workers are scoped so they are joined before their owner-only phase snapshots
 /// are drained.
+#[allow(clippy::too_many_arguments)]
 fn run_one_message_thread(
     worker_threads: usize,
     locks: Option<&PerCpuLocks>,
