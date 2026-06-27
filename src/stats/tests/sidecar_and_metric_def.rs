@@ -89,6 +89,62 @@ fn sidecar_to_row_carries_worst_iterations_per_cpu_sec_via_ext() {
     assert_eq!(def.read(&sidecar_to_row(&absent)), None);
 }
 
+/// The host-side monitor schedstat aggregates flow into
+/// `GauntletRow.ext_metrics` as the seven raw `Polarity::Informational`
+/// counters; each is registered so `MetricDef::read` surfaces it via the
+/// `|_| None` ext fallback and `classify_direction` returns `None` (never
+/// gated). When `schedstat_deltas` is `None` (CONFIG_SCHEDSTATS off) the
+/// keys are ABSENT, not 0 — a 0 would pollute the cross-run Counter sum and
+/// the Rate denominators.
+#[test]
+fn sidecar_to_row_carries_monitor_schedstat_ext_counters() {
+    use crate::monitor;
+    use crate::test_support;
+    let sc = test_support::SidecarResult {
+        monitor: Some(monitor::MonitorSummary {
+            schedstat_deltas: Some(monitor::SchedstatDeltas {
+                total_run_delay: 6000,
+                total_pcount: 3,
+                total_sched_count: 100,
+                total_yld_count: 5,
+                total_sched_goidle: 20,
+                total_ttwu_count: 200,
+                total_ttwu_local: 150,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        ..test_support::SidecarResult::test_fixture()
+    };
+    let row = sidecar_to_row(&sc);
+    for (name, want) in [
+        ("total_run_delay", 6000.0),
+        ("total_pcount", 3.0),
+        ("total_sched_count", 100.0),
+        ("total_yld_count", 5.0),
+        ("total_sched_goidle", 20.0),
+        ("total_ttwu_count", 200.0),
+        ("total_ttwu_local", 150.0),
+    ] {
+        assert_eq!(row.ext_metrics.get(name).copied(), Some(want), "{name} ext key");
+        let def = metric_def(name).unwrap_or_else(|| panic!("{name} registered"));
+        assert_eq!(def.read(&row), Some(want), "{name} surfaced via ext fallback");
+        assert_eq!(def.classify_direction(), None, "{name} is informational (never gates)");
+    }
+
+    // schedstat_deltas == None => keys ABSENT (not 0).
+    let no_sd = test_support::SidecarResult {
+        monitor: Some(monitor::MonitorSummary {
+            schedstat_deltas: None,
+            ..Default::default()
+        }),
+        ..test_support::SidecarResult::test_fixture()
+    };
+    let row2 = sidecar_to_row(&no_sd);
+    assert!(!row2.ext_metrics.contains_key("total_run_delay"));
+    assert!(!row2.ext_metrics.contains_key("total_ttwu_count"));
+}
+
 #[test]
 fn sidecar_to_row_no_monitor() {
     use crate::test_support;
@@ -782,8 +838,15 @@ fn metric_def_polarity_covers_all_entries() {
     // from the bool->Polarity adaptor.
     for m in METRICS.iter() {
         assert!(
-            matches!(m.polarity, Polarity::HigherBetter | Polarity::LowerBetter),
-            "metric {} produced non-binary polarity {:?}",
+            matches!(
+                m.polarity,
+                Polarity::HigherBetter | Polarity::LowerBetter | Polarity::Informational
+            ),
+            "metric {} produced unexpected polarity {:?} — only HigherBetter / \
+             LowerBetter (directional, gated) and Informational (directionless, \
+             never gated) are registered; TargetValue / Unknown are not used by \
+             any METRICS entry (Unknown stays the conservative default for \
+             UNclassified metrics, not a deliberate registry choice)",
             m.name,
             m.polarity
         );

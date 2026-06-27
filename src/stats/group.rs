@@ -1041,6 +1041,52 @@ pub fn sidecar_to_row(sc: &crate::test_support::SidecarResult) -> GauntletRow {
         }
     };
 
+    // Build ext_metrics from the in-guest payload map (dropping the
+    // walk-truncation sentinel + non-finite values), then layer in the
+    // host-side monitor schedstat aggregates below.
+    let mut ext_metrics: BTreeMap<String, f64> = sc
+        .stats
+        .ext_metrics
+        .iter()
+        .filter_map(|(k, &v)| {
+            if crate::test_support::is_truncation_sentinel_name(k) {
+                return None;
+            }
+            if v.is_finite() {
+                Some((k.clone(), v))
+            } else {
+                tracing::warn!(
+                    test = %sc.test_name,
+                    metric = %k,
+                    value = v,
+                    "dropping non-finite ext_metric; serde_json rejects NaN/Infinity",
+                );
+                None
+            }
+        })
+        .collect();
+    // System-wide schedstat aggregates, read host-side from guest memory
+    // at freeze (zero observer effect; `MonitorSummary::schedstat_deltas`,
+    // summed across CPUs over the run). Keys ABSENT when CONFIG_SCHEDSTATS
+    // is off (schedstat_deltas == None): absent != 0 for a no-data run, and
+    // a 0 would pollute the cross-run Counter SUM and the Rate denominators
+    // (`total_run_delay_ns_per_sched`, `ttwu_local_fraction`). All seven
+    // insert under one `if let` so each Rate's numerator/denominator pair is
+    // always co-present (derive_rate_metrics needs both). `u64 -> f64` is
+    // exact below 2^53 and inherently finite, so these skip the finite
+    // filter the payload keys go through. The registry entries are
+    // `Polarity::Informational` (raw counts) + two `MetricKind::Rate`
+    // derivations; see [`crate::stats::METRICS`].
+    if let Some(sd) = sc.monitor.as_ref().and_then(|m| m.schedstat_deltas.as_ref()) {
+        ext_metrics.insert("total_run_delay".to_string(), sd.total_run_delay as f64);
+        ext_metrics.insert("total_pcount".to_string(), sd.total_pcount as f64);
+        ext_metrics.insert("total_sched_count".to_string(), sd.total_sched_count as f64);
+        ext_metrics.insert("total_yld_count".to_string(), sd.total_yld_count as f64);
+        ext_metrics.insert("total_sched_goidle".to_string(), sd.total_sched_goidle as f64);
+        ext_metrics.insert("total_ttwu_count".to_string(), sd.total_ttwu_count as f64);
+        ext_metrics.insert("total_ttwu_local".to_string(), sd.total_ttwu_local as f64);
+    }
+
     GauntletRow {
         scenario: sc.test_name.clone(),
         topology: sc.topology.clone(),
@@ -1095,38 +1141,12 @@ pub fn sidecar_to_row(sc: &crate::test_support::SidecarResult) -> GauntletRow {
             "cross_node_migration_ratio",
             sc.stats.worst_cross_node_migration_ratio,
         ),
-        // Non-finite entries would also break `serde_json::to_string`,
-        // but the map shape makes "substitute 0.0" ambiguous (the entry
-        // might legitimately be 0.0 for a different scenario). Drop the
-        // entry entirely so the non-finite value can't be confused with
-        // a real zero datapoint.
-        //
-        // Also drop the walk-depth truncation sentinel
-        // [`crate::test_support::WALK_TRUNCATION_SENTINEL_NAME`]:
-        // it is diagnostic metadata from the JSON-walker depth cap,
-        // not a scenario metric, and must not participate in A/B
-        // comparison output.
-        ext_metrics: sc
-            .stats
-            .ext_metrics
-            .iter()
-            .filter_map(|(k, &v)| {
-                if crate::test_support::is_truncation_sentinel_name(k) {
-                    return None;
-                }
-                if v.is_finite() {
-                    Some((k.clone(), v))
-                } else {
-                    tracing::warn!(
-                        test = %sc.test_name,
-                        metric = %k,
-                        value = v,
-                        "dropping non-finite ext_metric; serde_json rejects NaN/Infinity",
-                    );
-                    None
-                }
-            })
-            .collect(),
+        // Built above: in-guest payload ext keys (non-finite values and
+        // the walk-truncation sentinel dropped — a dropped non-finite must
+        // not be confused with a real 0.0, and the sentinel is JSON-walker
+        // diagnostic metadata, not a scenario metric) plus the host-side
+        // monitor schedstat aggregates.
+        ext_metrics,
         // Carry per-phase buckets verbatim from the source
         // ScenarioStats. The bucket structure has already been
         // reduced by the host-side phase aggregator (Counter via

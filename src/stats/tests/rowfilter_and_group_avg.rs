@@ -796,6 +796,54 @@ fn group_and_average_multi_pass_kind_aware_fold() {
     );
 }
 
+/// The two monitor schedstat Rates re-derive Σnumerator / Σdenominator
+/// across runs (the `MetricKind::Rate` pooled fold), NOT a mean of per-run
+/// ratios. Two runs with deliberately different per-run ratios make the two
+/// estimators disagree, so this pins the pooled form:
+///   A: run_delay 1000 / pcount 1 = 1000; ttwu 1/1   = 1.0
+///   B: run_delay 1000 / pcount 9 = ~111; ttwu 1/99  = ~0.0101
+///   mean-of-ratios run_delay = 555.5  vs  pooled Σ/Σ = 2000/10 = 200
+///   mean-of-ratios ttwu      = 0.505  vs  pooled Σ/Σ = 2/100  = 0.02
+#[test]
+fn group_and_average_schedstat_rates_pool_sigma_over_sigma() {
+    let mk = |run_delay: f64, pcount: f64, local: f64, count: f64| {
+        let mut r = make_row("t", "tiny-1llc", true, 0.0);
+        r.ext_metrics.insert("total_run_delay".into(), run_delay);
+        r.ext_metrics.insert("total_pcount".into(), pcount);
+        r.ext_metrics.insert("total_ttwu_local".into(), local);
+        r.ext_metrics.insert("total_ttwu_count".into(), count);
+        r
+    };
+    let out = group_and_average_by(
+        &[mk(1000.0, 1.0, 1.0, 1.0), mk(1000.0, 9.0, 1.0, 99.0)],
+        LEGACY_PAIRING_DIMS,
+    );
+    assert_eq!(out.len(), 1);
+    let row = &out[0].row;
+    // Counter ext components SUM-fold across runs.
+    assert_eq!(row.ext_metrics.get("total_run_delay").copied(), Some(2000.0));
+    assert_eq!(row.ext_metrics.get("total_pcount").copied(), Some(10.0));
+    assert_eq!(row.ext_metrics.get("total_ttwu_count").copied(), Some(100.0));
+    assert_eq!(row.ext_metrics.get("total_ttwu_local").copied(), Some(2.0));
+    // Rates re-derive Σ/Σ (the pooled mean), NOT the per-run mean-of-ratios.
+    let per_sched = metric_def("total_run_delay_ns_per_sched")
+        .unwrap()
+        .read(row)
+        .expect("rate derived post-fold");
+    assert!(
+        (per_sched - 200.0).abs() < 1e-6,
+        "Σrun_delay/Σpcount = 200, got {per_sched} (mean-of-ratios would be 555.5)",
+    );
+    let frac = metric_def("ttwu_local_fraction")
+        .unwrap()
+        .read(row)
+        .expect("rate derived post-fold");
+    assert!(
+        (frac - 0.02).abs() < 1e-9,
+        "Σlocal/Σcount = 0.02, got {frac} (mean-of-ratios would be 0.505)",
+    );
+}
+
 /// The cross-RUN unweighted mean of a Distribution/WorstLowest metric
 /// divides by the count of contributors that EMITTED the key
 /// (`finite.len()`), NOT by `passes_observed`: a passing run that omits the
@@ -1532,7 +1580,7 @@ fn group_and_average_then_compare_rows_yields_regression_on_means() {
         .iter()
         .find(|f| f.metric.name == "worst_spread")
         .expect("worst_spread must regress on aggregated means");
-    assert!(spread.is_regression);
+    assert!(spread.kind == FindingKind::Regression);
     assert_eq!(spread.val_a, 12.0, "mean of [10, 12, 14] = 12");
     assert_eq!(spread.val_b, 30.0, "mean of [28, 30, 32] = 30");
     assert_eq!(spread.delta, 18.0);

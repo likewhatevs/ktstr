@@ -741,7 +741,8 @@ fn better_outcome(
     let lower_better = match polarity {
         Some(Polarity::LowerBetter) => true,
         Some(Polarity::HigherBetter) => false,
-        // TargetValue / Unknown / unregistered: no "better" direction.
+        // TargetValue / Unknown / Informational / unregistered: no
+        // "better" direction.
         _ => return BetterOutcome::Undirected,
     };
     let pass = match margin {

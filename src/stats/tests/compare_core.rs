@@ -115,7 +115,7 @@ fn compare_rows_genuine_stuck_count_regression_is_flagged() {
     assert!(
         res.findings
             .iter()
-            .any(|f| f.metric.name == "stuck_count" && f.is_regression),
+            .any(|f| f.metric.name == "stuck_count" && f.kind == FindingKind::Regression),
         "stuck_count must be the flagged regression",
     );
 }
@@ -147,7 +147,10 @@ fn compare_rows_synthetic_regression_and_improvement() {
     assert!(metrics.contains(&"worst_spread"));
     assert!(metrics.contains(&"total_iterations"));
     for d in &res.findings {
-        assert!(d.is_regression, "all reported deltas should be regressions");
+        assert!(
+            d.kind == FindingKind::Regression,
+            "all reported deltas should be regressions"
+        );
         assert_eq!(d.scenario, "test1");
         assert_eq!(d.topology, "tiny-1llc");
     }
@@ -163,7 +166,7 @@ fn compare_rows_synthetic_regression_and_improvement() {
     assert_eq!(res_imp.regressions, 0);
     assert_eq!(res_imp.improvements, 2);
     for d in &res_imp.findings {
-        assert!(!d.is_regression);
+        assert!(d.kind != FindingKind::Regression);
     }
 }
 
@@ -222,7 +225,7 @@ fn compare_rows_higher_is_worse_inversion() {
         .find(|d| d.metric.name == "total_iterations")
         .expect("total_iterations should produce a delta");
     assert!(
-        iters_delta.is_regression,
+        iters_delta.kind == FindingKind::Regression,
         "iterations decrease is a regression"
     );
     assert_eq!(iters_delta.delta, -500.0);
@@ -245,7 +248,10 @@ fn compare_rows_higher_is_worse_inversion() {
         .iter()
         .find(|d| d.metric.name == "worst_spread")
         .expect("worst_spread should produce a delta");
-    assert!(spread_up.is_regression, "spread increase is a regression");
+    assert!(
+        spread_up.kind == FindingKind::Regression,
+        "spread increase is a regression"
+    );
     assert_eq!(spread_up.delta, 20.0);
 
     let res_down = compare_rows_by(
@@ -261,7 +267,7 @@ fn compare_rows_higher_is_worse_inversion() {
         .find(|d| d.metric.name == "worst_spread")
         .expect("worst_spread should produce a delta");
     assert!(
-        !spread_down.is_regression,
+        spread_down.kind != FindingKind::Regression,
         "spread decrease is an improvement"
     );
     assert_eq!(spread_down.delta, -20.0);
@@ -437,7 +443,7 @@ fn compare_rows_threshold_override() {
         .iter()
         .find(|d| d.metric.name == "worst_spread")
         .expect("override 5% must surface 6% spread change");
-    assert!(spread_override.is_regression);
+    assert!(spread_override.kind == FindingKind::Regression);
     assert_eq!(spread_override.delta, 6.0);
 
     // The override does NOT loosen the abs gate. Move 1.0 -> 1.5:
@@ -968,7 +974,10 @@ fn compare_rows_per_metric_policy_resolves_each_metric_independently() {
             .collect::<Vec<_>>(),
     );
     let spread_finding = spread_finding.unwrap();
-    assert!(spread_finding.is_regression, "6% > 5% → regression");
+    assert!(
+        spread_finding.kind == FindingKind::Regression,
+        "6% > 5% → regression"
+    );
 
     // worst_median_wake_latency_us has a 10% delta; under
     // default_percent = 20%, it must be unchanged (not in
@@ -1999,4 +2008,40 @@ fn noise_findings_skips_all_zero_and_omits_unchanged() {
     );
     assert!(rep.findings.is_empty(), "unchanged-clean scenario yields no findings");
     assert_eq!((rep.regressions(), rep.noisy()), (0, 0));
+}
+
+/// A `Polarity::Informational` metric (the monitor `total_ttwu_count`) that
+/// moves significantly is classified `FindingKind::Informational` — it appears
+/// in the findings but is NEVER counted as a regression or improvement, so it
+/// never affects the exit basis (`report.regressions`). The gate-safety
+/// guarantee for the directionless schedstat counters: more wakeups must not
+/// read as a regression just because the workload did more work.
+#[test]
+fn compare_rows_informational_metric_shows_but_never_gates() {
+    let mk = |ttwu: f64| {
+        // spread (10.0) and total_iterations (100) identical both sides => no
+        // directional finding; only the informational ext counter moves.
+        let mut r = cmp_row("t", "tiny-1llc", true, 10.0, 100);
+        r.ext_metrics.insert("total_ttwu_count".into(), ttwu);
+        r
+    };
+    let res = compare_rows_by(
+        &[mk(1000.0)],
+        &[mk(5000.0)],
+        LEGACY_PAIRING_DIMS,
+        None,
+        &ComparisonPolicy::default(),
+    );
+    assert_eq!(res.regressions, 0, "informational metric must not be a regression");
+    assert_eq!(res.improvements, 0, "...nor an improvement");
+    assert_eq!(
+        res.informational, 1,
+        "the 5x total_ttwu_count move is classified informational"
+    );
+    let f = res
+        .findings
+        .iter()
+        .find(|f| f.metric.name == "total_ttwu_count")
+        .expect("total_ttwu_count finding present");
+    assert_eq!(f.kind, FindingKind::Informational);
 }

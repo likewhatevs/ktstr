@@ -759,8 +759,21 @@ pub enum Polarity {
     /// runtime in both debug and release.
     TargetValue(f64),
     /// Direction not declared; the metric is recorded but not
-    /// classified as regression-relevant.
+    /// classified as regression-relevant. This is the CONSERVATIVE
+    /// default for an UNCLASSIFIED metric: the comparison path treats
+    /// it as higher-is-worse (see `MetricDef::higher_is_worse` /
+    /// `classify_direction`) so a real regression in a metric someone
+    /// forgot to classify is still caught rather than silently ignored.
     Unknown,
+    /// Deliberately directionless: the metric is recorded and DISPLAYED
+    /// in comparisons but is NEVER classified as a regression or
+    /// improvement and NEVER affects the exit code. Distinct from
+    /// [`Polarity::Unknown`] (the conservative higher-is-worse default
+    /// for *unclassified* metrics): `Informational` is the explicit
+    /// "this counter has no good/bad direction" choice — e.g. wakeup /
+    /// context-switch / yield counts, where more is neither inherently
+    /// better nor worse. `classify_direction` returns `None` for it.
+    Informational,
 }
 
 impl Polarity {

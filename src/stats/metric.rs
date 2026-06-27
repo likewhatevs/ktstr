@@ -1048,17 +1048,54 @@ impl MetricDef {
         }
     }
 
-    /// Returns `true` for [`crate::test_support::Polarity::LowerBetter`], `false` for
-    /// [`crate::test_support::Polarity::HigherBetter`]. [`crate::test_support::Polarity::TargetValue`] and
-    /// [`crate::test_support::Polarity::Unknown`] branches keep the match total; they
-    /// are unreachable for the current [`METRICS`] entries (guarded
-    /// by the `metric_def_polarity_covers_all_entries` test).
+    /// Returns `true` when a metric INCREASING is the bad direction:
+    /// [`LowerBetter`](crate::test_support::Polarity::LowerBetter),
+    /// [`TargetValue`](crate::test_support::Polarity::TargetValue), and the
+    /// conservative [`Unknown`](crate::test_support::Polarity::Unknown)
+    /// default (an unclassified metric is treated as higher-is-worse so a
+    /// real regression in it is still caught). `false` for
+    /// [`HigherBetter`](crate::test_support::Polarity::HigherBetter) and
+    /// [`Informational`](crate::test_support::Polarity::Informational).
+    ///
+    /// This is the cross-cgroup FOLD direction (max-vs-min when merging
+    /// per-cgroup `ext_metrics`, see [`crate::assert::AssertResult::merge`])
+    /// and the timeline-narrative direction. The PERF-DELTA VERDICT path
+    /// uses [`classify_direction`](Self::classify_direction) instead, which
+    /// returns `None` for `Informational` so it never gates. `Informational`
+    /// folding as `false` (min) here is harmless: the system-wide monitor
+    /// counters that carry it are row-level and never hit the per-cgroup
+    /// merge.
     pub const fn higher_is_worse(&self) -> bool {
         use crate::test_support::Polarity;
         matches!(
             self.polarity,
             Polarity::LowerBetter | Polarity::TargetValue(_) | Polarity::Unknown
         )
+    }
+
+    /// Verdict direction for the perf-delta comparison:
+    /// - `Some(true)`  — an INCREASE is a regression (`LowerBetter` /
+    ///   `TargetValue` / the conservative `Unknown` default),
+    /// - `Some(false)` — a DECREASE is a regression (`HigherBetter`),
+    /// - `None`        — [`Informational`](crate::test_support::Polarity::Informational):
+    ///   directionless; the comparison records and displays it but NEVER
+    ///   classifies it as regression/improvement and it NEVER affects the
+    ///   exit code.
+    ///
+    /// The verdict sites in [`compare_partitions`] branch on the `Option`:
+    /// `None` => informational, `Some(hiw)` => the dual-gated
+    /// regression/improvement split. This matches
+    /// [`higher_is_worse`](Self::higher_is_worse) for every variant EXCEPT
+    /// `Informational` (there `false`/min-fold, here `None`/never-gated) —
+    /// the deliberate split between "fold needs a direction" and "verdict
+    /// must stay neutral".
+    pub const fn classify_direction(&self) -> Option<bool> {
+        use crate::test_support::Polarity;
+        match self.polarity {
+            Polarity::Informational => None,
+            Polarity::HigherBetter => Some(false),
+            Polarity::LowerBetter | Polarity::TargetValue(_) | Polarity::Unknown => Some(true),
+        }
     }
 }
 
@@ -1341,6 +1378,139 @@ pub static METRICS: &[MetricDef] = &[
         // `MonitorSummary::event_deltas.total_dispatch_keep_last`.
         display_unit: "",
         accessor: |r| Some(r.keep_last_count as f64),
+    },
+    // -- System-wide schedstat aggregates. Read host-side from guest memory at
+    // -- freeze (zero observer effect) via `MonitorSummary::schedstat_deltas`
+    // -- (per-rq `struct rq` schedstat fields summed across CPUs over the run);
+    // -- `sidecar_to_row` inserts them into `GauntletRow::ext_metrics` so the
+    // -- `|_| None` accessors surface them through the ext fallback. The seven
+    // -- raw counters are `Polarity::Informational` — directionless (more
+    // -- wakeups / context-switches / yields is neither inherently better nor
+    // -- worse), so they are SHOWN but NEVER gated. They are also
+    // -- WINDOW-DURATION- and LOAD-CONFOUNDED raw sums (a longer monitor window
+    // -- or more offered runnable work inflates them independent of the
+    // -- scheduler) — a second reason they are Informational, not LowerBetter:
+    // -- a large raw delta is not a regression. The duration- and load-robust
+    // -- GATED signals are the per-schedule mean (`total_run_delay_ns_per_sched`)
+    // -- and the locality ratio (`ttwu_local_fraction`) derived below; four of
+    // -- the raw counters double as those Rates' Counter components.
+    MetricDef {
+        // Numerator of `total_run_delay_ns_per_sched`. Cumulative runqueue-wait
+        // delay (ns) across all tasks + all CPUs (`rq.rq_sched_info.run_delay`).
+        // `total_` prefix satisfies the Counter naming gate.
+        name: "total_run_delay",
+        polarity: crate::test_support::Polarity::Informational,
+        kind: MetricKind::Counter,
+        default_abs: 1_000_000.0,
+        default_rel: 0.10,
+        display_unit: "ns",
+        accessor: |_| None,
+    },
+    MetricDef {
+        // Denominator of `total_run_delay_ns_per_sched`. Count of non-idle task
+        // arrivals (`rq.rq_sched_info.pcount`) — the number of schedules the
+        // run-delay accrued over.
+        name: "total_pcount",
+        polarity: crate::test_support::Polarity::Informational,
+        kind: MetricKind::Counter,
+        default_abs: 100.0,
+        default_rel: 0.10,
+        display_unit: "",
+        accessor: |_| None,
+    },
+    MetricDef {
+        // Context-switch count (`rq.sched_count`). Informational: more
+        // context-switches can mean responsiveness OR thrashing — no direction.
+        name: "total_sched_count",
+        polarity: crate::test_support::Polarity::Informational,
+        kind: MetricKind::Counter,
+        default_abs: 100.0,
+        default_rel: 0.10,
+        display_unit: "",
+        accessor: |_| None,
+    },
+    MetricDef {
+        // `sched_yield()` call count (`rq.yld_count`). Informational (workload
+        // behavior, not a scheduler-quality signal).
+        name: "total_yld_count",
+        polarity: crate::test_support::Polarity::Informational,
+        kind: MetricKind::Counter,
+        default_abs: 100.0,
+        default_rel: 0.10,
+        display_unit: "",
+        accessor: |_| None,
+    },
+    MetricDef {
+        // Go-idle count (`rq.sched_goidle`): times a CPU picked the idle task.
+        // Informational (good utilization vs wasted idle — ambiguous).
+        name: "total_sched_goidle",
+        polarity: crate::test_support::Polarity::Informational,
+        kind: MetricKind::Counter,
+        default_abs: 100.0,
+        default_rel: 0.10,
+        display_unit: "",
+        accessor: |_| None,
+    },
+    MetricDef {
+        // Denominator of `ttwu_local_fraction`. Total wakeups (`rq.ttwu_count`)
+        // — workload activity. Informational.
+        name: "total_ttwu_count",
+        polarity: crate::test_support::Polarity::Informational,
+        kind: MetricKind::Counter,
+        default_abs: 100.0,
+        default_rel: 0.10,
+        display_unit: "",
+        accessor: |_| None,
+    },
+    MetricDef {
+        // Numerator of `ttwu_local_fraction`. Wakeups kept on the waking CPU
+        // (`rq.ttwu_local`). Informational on its own; the locality RATIO below
+        // carries the direction.
+        name: "total_ttwu_local",
+        polarity: crate::test_support::Polarity::Informational,
+        kind: MetricKind::Counter,
+        default_abs: 100.0,
+        default_rel: 0.10,
+        display_unit: "",
+        accessor: |_| None,
+    },
+    MetricDef {
+        // GATED. System-wide per-schedule MEAN runqueue-wait delay =
+        // Σrun_delay / Σpcount, re-derived across CPUs/runs by
+        // `derive_rate_metrics` (the `Rate` kind's `MergeKind::Recompute` pools
+        // the components — never a mean-of-ratios). Duration- and load-robust
+        // (per-EVENT, not per-time): the system-wide analog of the
+        // workload-scoped per-task `mean_run_delay_us` (schbench's
+        // `mean_sched_delay = run_delay/pcount`). LowerBetter. Absent when
+        // `total_pcount` is 0 (no schedules) or CONFIG_SCHEDSTATS is off
+        // (components absent).
+        name: "total_run_delay_ns_per_sched",
+        polarity: crate::test_support::Polarity::LowerBetter,
+        kind: MetricKind::Rate {
+            numerator: "total_run_delay",
+            denominator: "total_pcount",
+        },
+        default_abs: 1000.0,
+        default_rel: 0.15,
+        display_unit: "ns",
+        accessor: |_| None,
+    },
+    MetricDef {
+        // GATED. Wakeup LOCALITY = Σttwu_local / Σttwu_count, re-derived by
+        // `derive_rate_metrics`. A fraction in [0, 1]: the share of wakeups kept
+        // on the waking CPU (better cache locality, fewer cross-CPU hops on
+        // wakeup). HigherBetter. Absent when `total_ttwu_count` is 0 or
+        // CONFIG_SCHEDSTATS is off.
+        name: "ttwu_local_fraction",
+        polarity: crate::test_support::Polarity::HigherBetter,
+        kind: MetricKind::Rate {
+            numerator: "total_ttwu_local",
+            denominator: "total_ttwu_count",
+        },
+        default_abs: 0.05,
+        default_rel: 0.10,
+        display_unit: "",
+        accessor: |_| None,
     },
     MetricDef {
         // Wake-latency p99, re-pooled over the COMBINED wake-latency sample
@@ -2391,5 +2561,6 @@ fn polarity_label(p: crate::test_support::Polarity) -> String {
         Polarity::LowerBetter => "lower".to_string(),
         Polarity::TargetValue(t) => format!("target({t})"),
         Polarity::Unknown => "unknown".to_string(),
+        Polarity::Informational => "informational".to_string(),
     }
 }

@@ -383,6 +383,46 @@ fn compare_rows_by_phase_deltas_respect_metric_polarity() {
     );
 }
 
+/// An `Polarity::Informational` metric placed in a `PhaseBucket` is DROPPED
+/// from the per-phase delta table: the per-phase path classifies via
+/// `is_regression: bool` and has no informational state, so it skips
+/// directionless metrics rather than misclassifying them. No phase-bucketed
+/// metric is Informational today (every per-phase metric is directional; the
+/// informational schedstat counters are run-level), so this guards the
+/// invariant the `PhaseDeltaRow`-keeps-`bool` decision rests on — a future
+/// per-phase Informational metric is skipped, never silently flagged a
+/// regression.
+#[test]
+fn compare_rows_by_phase_deltas_skip_informational_metrics() {
+    let mut row_a = make_row("test_inf", "tiny-1llc", true, 0.0);
+    let mut row_b = make_row("test_inf", "tiny-1llc", true, 0.0);
+    // total_ttwu_count is Polarity::Informational; max_dsq_depth is directional.
+    row_a.phases = vec![make_phase_bucket(
+        0,
+        "BASELINE",
+        &[("max_dsq_depth", 10.0), ("total_ttwu_count", 1000.0)],
+    )];
+    row_b.phases = vec![make_phase_bucket(
+        0,
+        "BASELINE",
+        &[("max_dsq_depth", 25.0), ("total_ttwu_count", 5000.0)],
+    )];
+    let report = compare_rows_by(&[row_a], &[row_b], &[], None, &ComparisonPolicy::default());
+    assert_eq!(
+        report.phase_deltas.len(),
+        1,
+        "only the directional metric produces a per-phase delta"
+    );
+    assert_eq!(report.phase_deltas[0].metric.name, "max_dsq_depth");
+    assert!(
+        !report
+            .phase_deltas
+            .iter()
+            .any(|r| r.metric.name == "total_ttwu_count"),
+        "the Informational metric must be skipped from the per-phase table"
+    );
+}
+
 /// per-phase pass honors the dual-gate semantic the
 /// scalar pass uses inside its per-metric loop in
 /// `compare_rows_by` (`|delta| < default_abs ||

@@ -28,7 +28,21 @@ pub(crate) struct Finding {
     pub val_a: f64,
     pub val_b: f64,
     pub delta: f64,
-    pub is_regression: bool,
+    pub kind: FindingKind,
+}
+
+/// How a significant (past-dual-gate) delta is classified. A metric
+/// becomes a [`Finding`] / [`PhaseDeltaRow`] only after clearing the
+/// dual gate; this says which kind. `Informational` is for a
+/// [`Polarity::Informational`](crate::test_support::Polarity::Informational)
+/// metric (`MetricDef::classify_direction` => `None`): the change is
+/// shown but is NEVER a regression or improvement and never affects the
+/// exit code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub(crate) enum FindingKind {
+    Regression,
+    Improvement,
+    Informational,
 }
 
 /// Aggregate result of comparing two row sets via [`compare_rows_by`].
@@ -59,6 +73,10 @@ pub(crate) struct Finding {
 pub(crate) struct CompareReport {
     pub regressions: u32,
     pub improvements: u32,
+    /// Significant changes in `Polarity::Informational` metrics — shown
+    /// but never gated (excluded from `regressions`/`improvements` and
+    /// the exit code).
+    pub informational: u32,
     pub unchanged: u32,
     pub excluded_pairs: u32,
     pub new_in_b: u32,
@@ -126,7 +144,12 @@ pub(crate) struct PhaseDeltaRow {
     /// polarity convention.
     pub delta: f64,
     /// `true` when the delta exceeds the dual-gate threshold in
-    /// the regression direction (per metric polarity).
+    /// the regression direction (per metric polarity). A `bool` —
+    /// not the scalar path's three-way [`FindingKind`] — because
+    /// per-phase metrics are always directional: `Polarity::Informational`
+    /// is carried only by the run-level monitor schedstat counters
+    /// (`total_ttwu_count` etc.), which surface in the scalar
+    /// [`Finding`]s, never in per-phase buckets.
     pub is_regression: bool,
 }
 
@@ -676,16 +699,27 @@ fn push_scalar_findings(
             continue;
         }
 
-        let is_regression = if m.higher_is_worse() {
-            delta > 0.0
-        } else {
-            delta < 0.0
+        // Verdict: dual-gate already passed above (significant). An
+        // Informational metric (classify_direction => None) is recorded
+        // and displayed but NEVER counted as regression/improvement and
+        // NEVER affects the exit code; a directional metric splits on its
+        // polarity.
+        let kind = match m.classify_direction() {
+            None => {
+                report.informational += 1;
+                FindingKind::Informational
+            }
+            Some(higher_is_worse) => {
+                let is_regression = if higher_is_worse { delta > 0.0 } else { delta < 0.0 };
+                if is_regression {
+                    report.regressions += 1;
+                    FindingKind::Regression
+                } else {
+                    report.improvements += 1;
+                    FindingKind::Improvement
+                }
+            }
         };
-        if is_regression {
-            report.regressions += 1;
-        } else {
-            report.improvements += 1;
-        }
         report.findings.push(Finding {
             pairing_key: key_b.clone(),
             scenario: row_b.scenario.clone(),
@@ -695,7 +729,7 @@ fn push_scalar_findings(
             val_a,
             val_b,
             delta,
-            is_regression,
+            kind,
         });
     }
 }
@@ -769,6 +803,21 @@ fn push_phase_deltas(
                         let Some(metric_def) = metric_def(metric_name) else {
                             continue;
                         };
+                        // Informational metrics carry no regression direction, so
+                        // they have no place in the per-phase delta table — which
+                        // classifies via `is_regression: bool` (the run-level
+                        // scalar [`Finding`] carries the 3-way [`FindingKind`]).
+                        // No phase-bucketed metric is Informational today (every
+                        // `read_sample` / `fold_monitor_into_bucket` per-phase
+                        // metric is directional; the Informational schedstat
+                        // counters are run-level only), so this skip changes no
+                        // current behavior — it codifies that invariant so a
+                        // future per-phase Informational metric is dropped from
+                        // the per-phase view rather than silently misclassified as
+                        // a regression/improvement.
+                        if metric_def.classify_direction().is_none() {
+                            continue;
+                        }
                         let delta = val_b - val_a;
                         let rel_thresh =
                             policy.rel_threshold(metric_def.name, metric_def.default_rel);
@@ -1637,6 +1686,9 @@ pub(crate) enum NoiseKind {
     /// Either side's spread exceeds the gate — verdict untrustworthy; flagged but
     /// does NOT fail the gate.
     Noisy,
+    /// Significant change in a directionless (`Polarity::Informational`) metric —
+    /// shown but NEVER fails the gate (no good/bad direction to regress).
+    Informational,
 }
 
 /// One metric's noise-adjusted finding for a paired scenario.
@@ -1716,12 +1768,19 @@ pub(crate) fn noise_findings(
                 // gate can't be trusted to call a regression — flag, don't fail.
                 NoiseKind::Noisy
             } else if verdict.significant {
-                let worsened = if m.higher_is_worse() {
-                    verdict.direction == Direction::Higher
-                } else {
-                    verdict.direction == Direction::Lower
-                };
-                if worsened { NoiseKind::Regression } else { NoiseKind::Improvement }
+                match m.classify_direction() {
+                    // Directionless metric: a significant move with no good/bad
+                    // direction — shown, never fails the gate.
+                    None => NoiseKind::Informational,
+                    Some(higher_is_worse) => {
+                        let worsened = if higher_is_worse {
+                            verdict.direction == Direction::Higher
+                        } else {
+                            verdict.direction == Direction::Lower
+                        };
+                        if worsened { NoiseKind::Regression } else { NoiseKind::Improvement }
+                    }
+                }
             } else {
                 continue; // unchanged + clean: omit
             };
@@ -1769,6 +1828,7 @@ pub fn compare_partitions_noise(
             NoiseKind::Regression => "REGRESSION",
             NoiseKind::Improvement => "improvement",
             NoiseKind::Noisy => "NOISY (spread over gate)",
+            NoiseKind::Informational => "informational",
         };
         let v = &f.verdict;
         println!(
@@ -1809,10 +1869,11 @@ fn print_scalar_findings_table(report: &CompareReport, label_a: &str, label_b: &
     let mut table = crate::cli::new_table();
     table.set_header(vec!["TEST", "METRIC", label_a, label_b, "DELTA", "VERDICT"]);
     for f in &report.findings {
-        let (verdict_text, verdict_color) = if f.is_regression {
-            ("REGRESSION", Color::Red)
-        } else {
-            ("improvement", Color::Green)
+        let (verdict_text, verdict_color) = match f.kind {
+            FindingKind::Regression => ("REGRESSION", Color::Red),
+            FindingKind::Improvement => ("improvement", Color::Green),
+            // Directionless metric: shown, never gated. Neutral color.
+            FindingKind::Informational => ("informational", Color::Blue),
         };
         // PairingKey's first slot is scenario; subsequent slots
         // are the pairing-dim values in canonical order. Joining
@@ -2020,8 +2081,8 @@ fn print_summary_block(
 ) {
     println!();
     println!(
-        "summary: {} regressions, {} improvements, {} unchanged",
-        report.regressions, report.improvements, report.unchanged,
+        "summary: {} regressions, {} improvements, {} informational, {} unchanged",
+        report.regressions, report.improvements, report.informational, report.unchanged,
     );
     if report.excluded_pairs > 0 {
         println!(
