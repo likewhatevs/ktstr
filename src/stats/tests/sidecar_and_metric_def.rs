@@ -145,6 +145,47 @@ fn sidecar_to_row_carries_monitor_schedstat_ext_counters() {
     assert!(!row2.ext_metrics.contains_key("total_ttwu_count"));
 }
 
+/// `avg_nr_running` (whole-run mean runqueue occupancy) flows from
+/// `MonitorSummary::avg_nr_running` into `GauntletRow.ext_metrics` as a
+/// registered `Gauge(Avg)` / LowerBetter metric, surfaced via the `|_| None`
+/// ext fallback. Absent (not 0.0) when the run has no monitor samples — a
+/// 0-sample run carries no occupancy signal.
+#[test]
+fn sidecar_to_row_carries_avg_nr_running_when_sampled() {
+    use crate::monitor;
+    use crate::test_support;
+    let sc = test_support::SidecarResult {
+        monitor: Some(monitor::MonitorSummary {
+            total_samples: 10,
+            avg_nr_running: 2.5,
+            ..Default::default()
+        }),
+        ..test_support::SidecarResult::test_fixture()
+    };
+    let row = sidecar_to_row(&sc);
+    assert_eq!(row.ext_metrics.get("avg_nr_running").copied(), Some(2.5));
+    let def = metric_def("avg_nr_running").expect("avg_nr_running registered");
+    assert_eq!(def.read(&row), Some(2.5));
+    // Directional (LowerBetter), NOT informational: classify_direction Some(true).
+    assert_eq!(def.classify_direction(), Some(true));
+
+    // No samples => ABSENT (MonitorSummary.avg_nr_running defaults to 0.0, but a
+    // 0-sample run has no occupancy signal — absent, not a false 0.0).
+    let no_samples = test_support::SidecarResult {
+        monitor: Some(monitor::MonitorSummary {
+            total_samples: 0,
+            avg_nr_running: 0.0,
+            ..Default::default()
+        }),
+        ..test_support::SidecarResult::test_fixture()
+    };
+    assert!(
+        !sidecar_to_row(&no_samples)
+            .ext_metrics
+            .contains_key("avg_nr_running")
+    );
+}
+
 #[test]
 fn sidecar_to_row_no_monitor() {
     use crate::test_support;

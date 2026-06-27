@@ -1513,6 +1513,30 @@ pub static METRICS: &[MetricDef] = &[
         accessor: |_| None,
     },
     MetricDef {
+        // Whole-run mean per-CPU runqueue depth (`rq.nr_running`, ALL scheduling
+        // classes), read host-side from guest memory via
+        // `MonitorSummary::avg_nr_running`. The occupancy LEVEL — distinct from
+        // `avg_dsq_depth` (scx DSQ only) and `avg_imbalance_ratio` (cross-CPU
+        // SKEW, not level). `MetricKind::Gauge(Avg)`: the cross-run fold is the
+        // sample-weighted pooled mean (Σ avg×samples / Σ samples via
+        // `aggregate_samples_weighted`, weight = `run_sample_count`). The weight
+        // is sample count, not samples×CPUs — EXACT under same-topology pairing
+        // (CPU count is a pairing dim, so cross-folded runs share it; the same
+        // basis `avg_imbalance_ratio` uses). LowerBetter — higher mean depth =
+        // more tasks waiting, but load-confounded (more offered runnable tasks
+        // raises it independent of the scheduler), the same caveat
+        // `avg_dsq_depth` carries; meaningful for same-offered-load A/B.
+        // ext_metrics-only (accessor `|_| None`, surfaced via the ext fallback);
+        // absent when the run has no monitor samples.
+        name: "avg_nr_running",
+        polarity: crate::test_support::Polarity::LowerBetter,
+        kind: MetricKind::Gauge(GaugeAgg::Avg),
+        default_abs: 0.5,
+        default_rel: 0.20,
+        display_unit: "",
+        accessor: |_| None,
+    },
+    MetricDef {
         // Wake-latency p99, re-pooled over the COMBINED wake-latency sample
         // set across every cgroup (and phase), NOT a max of per-cgroup p99s.
         // Distribution kind: derived post-merge by

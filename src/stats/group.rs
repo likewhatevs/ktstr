@@ -1086,6 +1086,18 @@ pub fn sidecar_to_row(sc: &crate::test_support::SidecarResult) -> GauntletRow {
         ext_metrics.insert("total_ttwu_count".to_string(), sd.total_ttwu_count as f64);
         ext_metrics.insert("total_ttwu_local".to_string(), sd.total_ttwu_local as f64);
     }
+    // Whole-run mean per-CPU rq.nr_running occupancy (MonitorSummary, not part
+    // of schedstat_deltas). Inserted only when the run has monitor samples —
+    // a 0-sample run carries no occupancy signal, so absent (not 0.0). It is a
+    // finite mean by construction (guarded /0 in MonitorSummary). Registered
+    // Gauge(Avg): the cross-run fold weights it by run_sample_count for the
+    // sample-weighted pooled mean (exact under same-topology pairing, where CPU
+    // count is constant — see the metric doc).
+    if let Some(m) = sc.monitor.as_ref()
+        && m.total_samples > 0
+    {
+        ext_metrics.insert("avg_nr_running".to_string(), m.avg_nr_running);
+    }
 
     GauntletRow {
         scenario: sc.test_name.clone(),

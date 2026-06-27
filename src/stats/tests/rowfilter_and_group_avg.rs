@@ -844,6 +844,33 @@ fn group_and_average_schedstat_rates_pool_sigma_over_sigma() {
     );
 }
 
+/// `avg_nr_running` (Gauge(Avg) ext key) folds cross-run as the
+/// SAMPLE-WEIGHTED pooled mean — Σ(avg_i × samples_i) / Σ samples_i, weighted by
+/// run_sample_count — NOT the unweighted arithmetic mean a typed field would
+/// give. Two runs with very different sample counts make the two disagree.
+#[test]
+fn group_and_average_avg_nr_running_is_sample_weighted_mean() {
+    // Run A: avg 2.0 over 10 samples; Run B: avg 4.0 over 90 samples.
+    // weighted   = (2*10 + 4*90) / (10+90) = 380/100 = 3.8
+    // unweighted = (2 + 4) / 2 = 3.0  (what a typed mean-fold would give)
+    let mk = |avg: f64, samples: usize| {
+        let mut r = make_row("t", "tiny-1llc", true, 0.0);
+        r.run_sample_count = samples;
+        r.ext_metrics.insert("avg_nr_running".into(), avg);
+        r
+    };
+    let out = group_and_average_by(&[mk(2.0, 10), mk(4.0, 90)], LEGACY_PAIRING_DIMS);
+    assert_eq!(out.len(), 1);
+    let v = metric_def("avg_nr_running")
+        .unwrap()
+        .read(&out[0].row)
+        .expect("avg_nr_running present after fold");
+    assert!(
+        (v - 3.8).abs() < 1e-9,
+        "sample-weighted pooled mean = 3.8, got {v} (unweighted would be 3.0)",
+    );
+}
+
 /// The cross-RUN unweighted mean of a Distribution/WorstLowest metric
 /// divides by the count of contributors that EMITTED the key
 /// (`finite.len()`), NOT by `passes_observed`: a passing run that omits the
