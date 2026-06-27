@@ -913,19 +913,39 @@ fn run_msg_thread(
 }
 
 /// The RPS-injector dispatcher loop, replacing [`run_msg_thread`] when
-/// `requests_per_sec != 0`. Faithful to schbench's `run_rps_thread`
-/// (`schbench.c:1258-1314`): once per second, enqueue `requests_per_sec`
-/// requests round-robin across this group's `workers`, skipping a worker whose
-/// `pending` exceeds the batch cap (backpressure), then sleep to fill the
-/// remainder of the second; on stop, wake every worker and exit. Runs on the
-/// message thread's calling thread, so — like [`run_msg_thread`] — it records
-/// the dispatcher thread's per-phase + whole-run run-queue wait into `msg_td`
-/// (the "message thread delay" in RPS mode, `schbench.c:1664-1670`).
+/// `requests_per_sec != 0`. Each second it enqueues `requests_per_sec` requests
+/// round-robin across this group's `workers`, skipping a worker whose `pending`
+/// exceeds the batch cap (backpressure, `schbench.c:1284-1290`); on stop, it
+/// wakes every worker and exits. Runs on the message thread's calling thread, so
+/// — like [`run_msg_thread`] — it records the dispatcher thread's per-phase +
+/// whole-run run-queue wait into `msg_td` (the "message thread delay" in RPS
+/// mode, `schbench.c:1664-1670`).
 ///
-/// The per-second fill-sleep and the bounded backpressure usleep are schbench's
-/// defined injector behavior (the `-R` "N requests/second" cadence), workload-
-/// defined durations like the per-request think-sleep — not synchronization
-/// waits. Uses `CLOCK_MONOTONIC` (ruling), not schbench's `gettimeofday`.
+/// DIVERGENCE from schbench's `run_rps_thread` (`schbench.c:1258-1314`),
+/// intentional: schbench FRONT-LOADS the second (bursts all N enqueues, then
+/// `usleep`s to fill the rest of the second) and relies on its workers
+/// interleaving with the burst to keep each queue under the cap. That interleave
+/// is scheduling-dependent; ktstr's burst instead front-ran the workers (the
+/// first splice grabbed a large batch the worker drained to completion before
+/// re-splicing), so `pending` stayed pegged and the injector dropped the
+/// remainder every second -- a ~BATCH/worker supply cap that under-delivered the
+/// requested rate (e.g. ~257/s at a 400/s target). ktstr instead PACES the
+/// enqueues evenly across the second (one every `1s/N`), which forces the
+/// injector to interleave with the workers deterministically: `pending` drains
+/// between enqueues and the full rate is delivered up to worker capacity. Above
+/// capacity the pacing collapses to a flat-out loop and the `BATCH` backpressure
+/// bounds the queue, matching schbench's bounded-backlog overload behavior. The
+/// pacing sleep and the bounded backpressure usleep are workload-defined `-R`
+/// cadence (like the per-request think-sleep), not synchronization waits. Uses
+/// `CLOCK_MONOTONIC` (ruling), not schbench's `gettimeofday`.
+///
+/// Verified by `ktstr-schbench-validate` (release, standalone), not a nextest
+/// unit test: the under-delivery signal only appears when worker capacity exceeds
+/// the front-load cap (~2*BATCH/s), which requires a release build (debug matrix
+/// work caps capacity well below that) on dedicated CPU (nextest's parallel
+/// execution starves the workers, collapsing both the paced and a hypothetical
+/// reverted injector to the same capacity-limited rate). The fixed `-R` axis in
+/// the schbench validation comparison is the regression evidence.
 fn run_rps_thread(
     workers: &[ThreadData],
     msg_td: &ThreadData,
@@ -950,9 +970,40 @@ fn run_rps_thread(
         // thread; a fixed `-R` leaves it constant.
         let requests_per_sec = live_rate.load(Ordering::Relaxed);
         let start = monotonic_nanos();
+        // PACE the enqueues evenly across the second rather than front-loading
+        // them. schbench bursts all N then fills the rest of the second
+        // (`schbench.c:1300-1306`), relying on its workers interleaving with the
+        // burst to keep each worker's queue under the `BATCH` cap. ktstr's burst
+        // front-ran the workers: the first splice grabbed a large batch the worker
+        // processed to completion before re-splicing, so `pending` stayed pegged
+        // and the injector dropped the remainder every second (a steady-state
+        // ~BATCH/worker supply cap -> only ~257/s at a 400/s target). Pacing one
+        // enqueue every `1s/N` forces the injector to interleave with the workers,
+        // so `pending` drains between enqueues and the full rate is delivered up
+        // to worker capacity. Above capacity `due` falls behind real time, the
+        // pacing sleep collapses to zero, and the `BATCH` backpressure bounds the
+        // queue -- matching schbench's overload behavior (a bounded backlog).
+        let interval_ns = if requests_per_sec > 0 {
+            ONE_SEC_NS / requests_per_sec as u64
+        } else {
+            ONE_SEC_NS
+        };
+        let mut due = start;
         for _ in 0..requests_per_sec {
             if stop.load(Ordering::Acquire) {
                 break;
+            }
+            // Wait until this enqueue's scheduled time. A no-op once `due` falls
+            // behind real time (rate above what the workers can drain), so the
+            // loop then runs flat-out and the backpressure below bounds the queue.
+            // `due` is re-based to `start` each second and accrues at most
+            // N*(ONE_SEC_NS/N) ~= 1s within a pass, so saturating_add never wraps
+            // (the saturating form documents that the per-pass re-base is the
+            // load-bearing invariant).
+            due = due.saturating_add(interval_ns);
+            let now = monotonic_nanos();
+            if now < due {
+                std::thread::sleep(std::time::Duration::from_nanos(due - now));
             }
             let worker = &workers[cur_tid % worker_count];
             cur_tid += 1;
@@ -975,7 +1026,8 @@ fn run_rps_thread(
             worker.wake_time.store(monotonic_nanos(), Ordering::Release);
             worker.futex.post();
         }
-        // Rate-limit: fill the remainder of the second (`schbench.c:1300-1306`).
+        // The pacing loop already spans ~1 second; top up only if it finished
+        // early (rate 0, or `stop`), preserving schbench's per-second cadence.
         let elapsed = monotonic_nanos().saturating_sub(start);
         if !stop.load(Ordering::Acquire) && elapsed < ONE_SEC_NS {
             std::thread::sleep(std::time::Duration::from_nanos(ONE_SEC_NS - elapsed));
