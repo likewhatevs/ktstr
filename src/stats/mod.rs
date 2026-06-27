@@ -15,12 +15,14 @@ mod analyze;
 mod compare;
 mod group;
 mod metric;
+mod noise;
 mod row;
 
 pub use analyze::*;
 pub use compare::*;
 pub use group::*;
 pub use metric::*;
+pub use noise::*;
 pub use row::*;
 
 #[cfg(test)]

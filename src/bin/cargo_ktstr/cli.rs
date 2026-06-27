@@ -291,6 +291,23 @@ pub(crate) enum KtstrCommand {
         /// CONFIG axis B side — see `--a-scheduler`.
         #[arg(long, requires = "a_scheduler", conflicts_with_all = ["base", "base_ref", "dual_run"])]
         b_scheduler: Option<String>,
+        /// Self-tuning noise mode: run each side N times and decide significance
+        /// from the observed per-side spread — B's mean leaving A's `[min, max]`
+        /// band — instead of a fixed `--threshold`. Flags a metric whose relative
+        /// spread exceeds `--noise-spread-threshold` as too noisy to trust.
+        /// Implies the dual-run production, looped N times; commit axis only
+        /// (needs `--kernel`).
+        #[arg(
+            long,
+            value_name = "N",
+            conflicts_with_all = ["a_scheduler", "b_scheduler", "threshold", "policy", "dual_run"],
+        )]
+        noise_adjust: Option<usize>,
+        /// Per-side relative-spread limit in percent above which `--noise-adjust`
+        /// flags a metric too noisy to trust (default 1.0). Requires
+        /// `--noise-adjust`.
+        #[arg(long, requires = "noise_adjust")]
+        noise_spread_threshold: Option<f64>,
         /// Suppress the per-phase delta tables entirely. Mutually
         /// exclusive with every other phase flag.
         #[arg(

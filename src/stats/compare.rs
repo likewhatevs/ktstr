@@ -1626,6 +1626,179 @@ pub fn compare_partitions(
     Ok(if report.regressions > 0 { 1 } else { 0 })
 }
 
+/// How a metric's noise-adjusted verdict classifies for the gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NoiseKind {
+    /// Significant in the worsening direction (per polarity) and not too noisy —
+    /// the only kind that fails the gate.
+    Regression,
+    /// Significant in the improving direction and not too noisy.
+    Improvement,
+    /// Either side's spread exceeds the gate — verdict untrustworthy; flagged but
+    /// does NOT fail the gate.
+    Noisy,
+}
+
+/// One metric's noise-adjusted finding for a paired scenario.
+pub(crate) struct NoiseFinding {
+    pub scenario: String,
+    pub metric: &'static MetricDef,
+    pub verdict: NoiseVerdict,
+    pub kind: NoiseKind,
+}
+
+/// Result of [`noise_findings`]: the per-(scenario, metric) findings plus the
+/// number of scenarios paired across both sides (for the footer).
+pub(crate) struct NoiseReport {
+    pub findings: Vec<NoiseFinding>,
+    pub paired_scenarios: usize,
+}
+
+impl NoiseReport {
+    /// Confident regressions — the gate's exit basis.
+    pub fn regressions(&self) -> usize {
+        self.findings.iter().filter(|f| f.kind == NoiseKind::Regression).count()
+    }
+    /// Metrics flagged too noisy to trust.
+    pub fn noisy(&self) -> usize {
+        self.findings.iter().filter(|f| f.kind == NoiseKind::Noisy).count()
+    }
+}
+
+/// Row-level noise-adjusted compare — the testable core of
+/// [`compare_partitions_noise`] (which wraps it with sidecar pooling + render),
+/// mirroring how [`compare_rows_by`] underlies [`compare_partitions`]. Groups
+/// each side's per-run rows by pairing key, then per metric summarizes the spread
+/// and classifies via [`noise_verdict`]. Returns one [`NoiseFinding`] per
+/// changed-or-noisy (scenario, metric); unchanged-and-clean metrics, metrics with
+/// no signal on either side (both means under [`ZERO_MEAN_EPS`]), and
+/// render-suppressed rate components are omitted.
+pub(crate) fn noise_findings(
+    rows_a: &[GauntletRow],
+    rows_b: &[GauntletRow],
+    pairing_dims: &[Dimension],
+    spread_threshold_pct: f64,
+) -> NoiseReport {
+    use std::collections::BTreeMap;
+    let group = |rows: &[GauntletRow]| {
+        let mut by_key: BTreeMap<PairingKey, Vec<GauntletRow>> = BTreeMap::new();
+        for r in rows {
+            by_key.entry(PairingKey::from_row(r, pairing_dims)).or_default().push(r.clone());
+        }
+        by_key
+    };
+    let a_by_key = group(rows_a);
+    let b_by_key = group(rows_b);
+
+    let mut findings = Vec::new();
+    let mut paired_scenarios = 0usize;
+    for (key, a_rows) in &a_by_key {
+        let Some(b_rows) = b_by_key.get(key) else { continue };
+        paired_scenarios += 1;
+        let scenario = a_rows[0].scenario.clone();
+        for m in METRICS {
+            if is_render_suppressed_component(m.name) {
+                continue;
+            }
+            let a_vals: Vec<f64> = a_rows.iter().filter_map(|r| m.read(r)).collect();
+            let b_vals: Vec<f64> = b_rows.iter().filter_map(|r| m.read(r)).collect();
+            if a_vals.is_empty() || b_vals.is_empty() {
+                continue;
+            }
+            let verdict = noise_verdict(&a_vals, &b_vals, spread_threshold_pct);
+            // No signal on either side (both ~zero): skip. Uses the same zero
+            // epsilon as the spread ratio for one consistent "is this zero".
+            if verdict.a.mean.abs() < ZERO_MEAN_EPS && verdict.b.mean.abs() < ZERO_MEAN_EPS {
+                continue;
+            }
+            let kind = if verdict.too_noisy {
+                // too_noisy takes precedence: a metric whose spread exceeds the
+                // gate can't be trusted to call a regression — flag, don't fail.
+                NoiseKind::Noisy
+            } else if verdict.significant {
+                let worsened = if m.higher_is_worse() {
+                    verdict.direction == Direction::Higher
+                } else {
+                    verdict.direction == Direction::Lower
+                };
+                if worsened { NoiseKind::Regression } else { NoiseKind::Improvement }
+            } else {
+                continue; // unchanged + clean: omit
+            };
+            findings.push(NoiseFinding { scenario: scenario.clone(), metric: m, verdict, kind });
+        }
+    }
+    NoiseReport { findings, paired_scenarios }
+}
+
+/// Noise-adjusted variant of [`compare_partitions`]: instead of averaging each
+/// side's runs into one mean and gating on a fixed threshold, it keeps every run
+/// (`no_average`), summarizes each side per metric as a `mean` over its
+/// `[min, max]` band, and decides from A's observed spread (see [`noise_findings`]
+/// for the row-level core + [`noise_verdict`] for the per-metric decision). Used
+/// by `perf-delta --noise-adjust N`, which produces N runs per side. A metric is a
+/// CONFIDENT REGRESSION (the non-zero exit basis) when B's mean is outside A's
+/// band in the worsening direction (per polarity) AND neither side is too noisy; a
+/// metric whose relative spread exceeds `spread_threshold_pct` is flagged `NOISY`
+/// and does NOT by itself fail the gate — the point of the mode is to not fail on
+/// noise. Only changed/noisy rows are printed; the footer carries the counts and,
+/// when every changed metric was too noisy, an explicit inconclusive note.
+pub fn compare_partitions_noise(
+    filter_a: &RowFilter,
+    filter_b: &RowFilter,
+    dir: Option<&std::path::Path>,
+    spread_threshold_pct: f64,
+) -> anyhow::Result<i32> {
+    // Keep every per-run row (no_average) so the run-to-run spread is observable.
+    let prepared = prepare_partitioned_comparison(filter_a, filter_b, dir, true)?;
+    let label_a = render_side_label(filter_a, &prepared.slicing_dims, "A");
+    let label_b = render_side_label(filter_b, &prepared.slicing_dims, "B");
+
+    let report = noise_findings(
+        &prepared.rows_a_for_compare,
+        &prepared.rows_b_for_compare,
+        &prepared.pairing_dims,
+        spread_threshold_pct,
+    );
+
+    println!(
+        "perf-delta --noise-adjust: {label_b} vs {label_a} (per-side spread gate {spread_threshold_pct:.2}%)"
+    );
+    for f in &report.findings {
+        let label = match f.kind {
+            NoiseKind::Regression => "REGRESSION",
+            NoiseKind::Improvement => "improvement",
+            NoiseKind::Noisy => "NOISY (spread over gate)",
+        };
+        let v = &f.verdict;
+        println!(
+            "  {scenario} / {name}: {label_a} {amean:.1} [{amin:.1}-{amax:.1}] {asp:.2}%  vs  \
+             {label_b} {bmean:.1} [{bmin:.1}-{bmax:.1}] {bsp:.2}%  -> {label}",
+            scenario = f.scenario, name = f.metric.name,
+            amean = v.a.mean, amin = v.a.min, amax = v.a.max, asp = v.a.spread_pct,
+            bmean = v.b.mean, bmin = v.b.min, bmax = v.b.max, bsp = v.b.spread_pct,
+        );
+    }
+    let regressions = report.regressions();
+    let noisy = report.noisy();
+    println!(
+        "perf-delta --noise-adjust: {} paired scenario(s); {regressions} confident regression(s), \
+         {noisy} too-noisy metric(s)",
+        report.paired_scenarios,
+    );
+    // Inconclusive: every CHANGED metric was too noisy to gate on — no confident
+    // signal either way. Surfaced prominently so a CI log shows it, but per the
+    // user spec ("flag if spread too great") noise FLAGS, not FAILS, so the exit
+    // stays 0 unless a confident regression fired.
+    if !report.findings.is_empty() && report.findings.iter().all(|f| f.kind == NoiseKind::Noisy) {
+        println!(
+            "perf-delta --noise-adjust: NOTE -- every changed metric was too noisy to gate on; \
+             raise --noise-adjust N or --noise-spread-threshold for a trustworthy verdict"
+        );
+    }
+    Ok(if regressions > 0 { 1 } else { 0 })
+}
+
 /// Render the scalar findings table for `stats compare --runs`.
 ///
 /// Extracted from [`compare_partitions`] verbatim; the

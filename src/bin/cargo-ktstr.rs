@@ -205,6 +205,8 @@ fn dispatch_run_command(command: KtstrCommand) -> Result<(), String> {
             policy,
             a_scheduler,
             b_scheduler,
+            noise_adjust,
+            noise_spread_threshold,
             no_phases,
             phases_only,
             steps_only,
@@ -222,6 +224,8 @@ fn dispatch_run_command(command: KtstrCommand) -> Result<(), String> {
                 policy: policy.as_deref(),
                 a_scheduler: a_scheduler.as_deref(),
                 b_scheduler: b_scheduler.as_deref(),
+                noise_adjust,
+                noise_spread_threshold,
                 phase_display: ktstr::cli::PhaseDisplayOptions {
                     no_phases,
                     phases_only,

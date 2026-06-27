@@ -14,7 +14,7 @@ mod dispatch;
 mod explain_sidecar;
 
 pub use dispatch::{
-    compare_partitions, list_metrics, list_runs, list_values, print_stats_report, show_host,
-    show_run_host, show_thresholds,
+    compare_partitions, compare_partitions_noise, list_metrics, list_runs, list_values,
+    print_stats_report, show_host, show_run_host, show_thresholds,
 };
 pub use explain_sidecar::explain_sidecar;

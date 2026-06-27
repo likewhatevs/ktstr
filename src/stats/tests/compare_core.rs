@@ -1900,3 +1900,103 @@ fn check_no_duplicate_pairing_keys_bails_on_collision_and_names_side() {
         "bail must suggest a per-side filter to disambiguate; got: {rendered}",
     );
 }
+
+// -- noise_findings (perf-delta --noise-adjust row-level core) tests --
+
+/// Three identical runs of one scenario carrying `worst_spread` (LowerBetter, via
+/// `spread`) + `total_iterations` (HigherBetter, via `iters`) — the two
+/// metric-bearing fields `cmp_row` sets. All-identical so each side's spread is 0
+/// (clean), isolating the cross-side direction classification.
+fn noise_side(scenario: &str, spread: f64, iters: u64) -> Vec<GauntletRow> {
+    vec![
+        cmp_row(scenario, "tiny-1llc", true, spread, iters),
+        cmp_row(scenario, "tiny-1llc", true, spread, iters),
+        cmp_row(scenario, "tiny-1llc", true, spread, iters),
+    ]
+}
+
+#[test]
+fn noise_findings_classifies_both_polarities() {
+    // Both polarities WORSEN: worst_spread (LowerBetter) rises 10->15;
+    // total_iterations (HigherBetter) drops 2000->1000. Both sides clean (spread
+    // 0), so each is a CONFIDENT regression.
+    let rep = noise_findings(
+        &noise_side("regress", 10.0, 2000),
+        &noise_side("regress", 15.0, 1000),
+        LEGACY_PAIRING_DIMS,
+        1.0,
+    );
+    assert_eq!(rep.paired_scenarios, 1);
+    assert_eq!(
+        rep.regressions(),
+        2,
+        "LowerBetter rose + HigherBetter dropped = 2 regressions: {:?}",
+        rep.findings.iter().map(|f| (f.metric.name, f.kind)).collect::<Vec<_>>(),
+    );
+    assert_eq!(rep.noisy(), 0);
+    assert!(rep.findings.iter().all(|f| f.kind == NoiseKind::Regression));
+
+    // Mirror: both polarities IMPROVE (worst_spread drops, total_iterations rises).
+    let rep = noise_findings(
+        &noise_side("improve", 15.0, 1000),
+        &noise_side("improve", 10.0, 2000),
+        LEGACY_PAIRING_DIMS,
+        1.0,
+    );
+    assert_eq!(rep.regressions(), 0);
+    assert_eq!(
+        rep.findings.iter().filter(|f| f.kind == NoiseKind::Improvement).count(),
+        2,
+        "LowerBetter dropped + HigherBetter rose = 2 improvements",
+    );
+}
+
+#[test]
+fn noise_findings_too_noisy_takes_precedence_over_regression() {
+    // A's worst_spread swings 10..20 (~67% relative spread, over the 1% gate), so
+    // even though B (30) is far higher (a worsening direction for LowerBetter), the
+    // metric is flagged NOISY, NOT counted as a confident regression.
+    let a = vec![
+        cmp_row("noisy", "tiny-1llc", true, 10.0, 2000),
+        cmp_row("noisy", "tiny-1llc", true, 20.0, 2000),
+        cmp_row("noisy", "tiny-1llc", true, 15.0, 2000),
+    ];
+    let rep = noise_findings(&a, &noise_side("noisy", 30.0, 2000), LEGACY_PAIRING_DIMS, 1.0);
+    let ws = rep
+        .findings
+        .iter()
+        .find(|f| f.metric.name == "worst_spread")
+        .expect("worst_spread finding present");
+    assert_eq!(ws.kind, NoiseKind::Noisy, "wide A spread -> NOISY, not REGRESSION");
+    assert_eq!(rep.regressions(), 0, "a too-noisy metric must not fail the gate");
+    // total_iterations is unchanged (2000 both sides) and clean -> omitted.
+    assert!(
+        rep.findings.iter().all(|f| f.metric.name == "worst_spread"),
+        "unchanged-and-clean metrics are omitted: {:?}",
+        rep.findings.iter().map(|f| f.metric.name).collect::<Vec<_>>(),
+    );
+}
+
+#[test]
+fn noise_findings_skips_all_zero_and_omits_unchanged() {
+    // Both sides exactly 0 on every metric -> no signal -> no findings, but the
+    // scenario still counts as paired.
+    let rep = noise_findings(
+        &noise_side("zero", 0.0, 0),
+        &noise_side("zero", 0.0, 0),
+        LEGACY_PAIRING_DIMS,
+        1.0,
+    );
+    assert!(rep.findings.is_empty(), "all-zero scenario yields no findings");
+    assert_eq!(rep.paired_scenarios, 1);
+
+    // Identical non-zero sides -> within-band, clean -> no findings either.
+    let rep = noise_findings(
+        &noise_side("same", 12.0, 1500),
+        &noise_side("same", 12.0, 1500),
+        LEGACY_PAIRING_DIMS,
+        1.0,
+    );
+    assert!(rep.findings.is_empty(), "unchanged-clean scenario yields no findings");
+    assert_eq!((rep.regressions(), rep.noisy()), (0, 0));
+}
