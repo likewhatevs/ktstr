@@ -1403,6 +1403,23 @@ pub(crate) const TAOBENCH_FAST_QPS: &str = "taobench_fast_qps";
 pub(crate) const TAOBENCH_SLOW_QPS: &str = "taobench_slow_qps";
 pub(crate) const TAOBENCH_HIT_RATIO: &str = "taobench_hit_ratio";
 pub(crate) const TAOBENCH_HIT_RATE: &str = "taobench_hit_rate";
+// taobench WHOLE-RUN Rate component + Rate keys (the run-level qps + hit
+// fraction, pooled cross-cgroup by `populate_run_pooled_taobench` and derived by
+// `derive_rate_metrics`). Distinct from the per-phase `taobench_*_qps` above
+// (`MetricKind::PerPhase`, invisible to the whole-run cross-run fold): these are
+// registered `Rate`/`Counter` METRICS so they reach perf-delta `--noise-adjust`
+// spread. The four `total_taobench_*` Counters are the rate components (their
+// `total_` prefix satisfies the Counter naming gate); they are
+// `RENDER_SUPPRESSED_COMPONENTS` so the compare output shows the rates, not the
+// raw counts.
+pub(crate) const TOTAL_TAOBENCH_OPS: &str = "total_taobench_ops";
+pub(crate) const TOTAL_TAOBENCH_FAST_OPS: &str = "total_taobench_fast_ops";
+pub(crate) const TOTAL_TAOBENCH_SLOW_OPS: &str = "total_taobench_slow_ops";
+pub(crate) const TOTAL_TAOBENCH_WALL_SEC: &str = "total_taobench_wall_sec";
+pub(crate) const TAOBENCH_TOTAL_OPS_PER_SEC: &str = "taobench_total_ops_per_sec";
+pub(crate) const TAOBENCH_FAST_OPS_PER_SEC: &str = "taobench_fast_ops_per_sec";
+pub(crate) const TAOBENCH_SLOW_OPS_PER_SEC: &str = "taobench_slow_ops_per_sec";
+pub(crate) const TAOBENCH_HIT_FRACTION: &str = "taobench_hit_fraction";
 // Per-phase latency min/max (schbench's `min=`/`max=` table footer,
 // `schbench.c:579`): the per-phase PlatStats already carries them, so these are
 // emitted from `q.min`/`q.max`. LowerBetter (a higher min/max latency is worse).
@@ -2799,6 +2816,136 @@ pub static METRICS: &[MetricDef] = &[
         display_unit: "",
         accessor: |_| None,
     },
+    // taobench WHOLE-RUN qps + hit Rates and their Counter components, pooled
+    // cross-cgroup by `crate::assert::populate_run_pooled_taobench` and derived
+    // by `derive_rate_metrics`. The four `total_taobench_*` Counters are the rate
+    // components (ext_metrics-only, accessor |_| None; `total_` prefix satisfies
+    // the Counter naming gate) and are `RENDER_SUPPRESSED_COMPONENTS`, so their
+    // default_abs/default_rel are inert at the compare layer — the entries exist
+    // for the re-pool (`name` is the component key, `kind` drives the Counter
+    // SUM-fold). Cross-RUN each component SUMs, so the Rates re-pool as
+    // Σnumerator / Σdenominator (aggregate throughput, not a mean of per-run qps).
+    // HIT exposed whole-run is the RESPONSE-time taobench_hit_fraction
+    // (Σfast/Σcompleted); the COMMAND-time hit (get-based, 1-Σmisses/Σcmds, the
+    // whole-run analog of the per-phase taobench_hit_rate) is intentionally NOT
+    // a run-level key: in the current closed-loop engine every issued lookup
+    // completes, so command-time and response-time hit converge over a whole run
+    // (run.rs module docs) and a second run-level hit would carry no distinct
+    // --noise-adjust spread. They diverge only under open-loop arrival (a future
+    // taobench mode), which is when the command-time whole-run hit becomes
+    // meaningful and should be added (its get_cmds/get_misses components are
+    // already pooled in the carrier).
+    MetricDef {
+        name: TOTAL_TAOBENCH_OPS,
+        polarity: crate::test_support::Polarity::HigherBetter,
+        kind: MetricKind::Counter,
+        default_abs: 1000.0,
+        default_rel: 0.10,
+        display_unit: "",
+        accessor: |_| None,
+    },
+    MetricDef {
+        name: TOTAL_TAOBENCH_FAST_OPS,
+        polarity: crate::test_support::Polarity::HigherBetter,
+        kind: MetricKind::Counter,
+        default_abs: 1000.0,
+        default_rel: 0.10,
+        display_unit: "",
+        accessor: |_| None,
+    },
+    MetricDef {
+        name: TOTAL_TAOBENCH_SLOW_OPS,
+        polarity: crate::test_support::Polarity::Informational,
+        kind: MetricKind::Counter,
+        default_abs: 1000.0,
+        default_rel: 0.10,
+        display_unit: "",
+        accessor: |_| None,
+    },
+    MetricDef {
+        // Whole-run wall window (ns→s applied once at the producer), the qps
+        // DENOMINATOR. Counter — cross-RUN SUM, mirroring `total_cpu_time_sec`,
+        // so Σops/Σwall re-pools the cohort throughput. `total_` prefix satisfies
+        // the Counter naming gate.
+        name: TOTAL_TAOBENCH_WALL_SEC,
+        polarity: crate::test_support::Polarity::HigherBetter,
+        kind: MetricKind::Counter,
+        default_abs: 1.0,
+        default_rel: 0.30,
+        display_unit: "s",
+        accessor: |_| None,
+    },
+    MetricDef {
+        // Whole-run total throughput = Σcompleted ops / Σwall-seconds.
+        // HigherBetter (throughput). Shares the per-phase `taobench_total_qps`
+        // thresholds. Absent when no Taobench cgroup ran or the wall window was
+        // unmeasured (components absent).
+        name: TAOBENCH_TOTAL_OPS_PER_SEC,
+        polarity: crate::test_support::Polarity::HigherBetter,
+        kind: MetricKind::Rate {
+            numerator: TOTAL_TAOBENCH_OPS,
+            denominator: TOTAL_TAOBENCH_WALL_SEC,
+        },
+        default_abs: 1000.0,
+        default_rel: 0.10,
+        display_unit: "ops/s",
+        accessor: |_| None,
+    },
+    MetricDef {
+        // Whole-run hit (fast-path) throughput = Σfast ops / Σwall-seconds.
+        // HigherBetter.
+        name: TAOBENCH_FAST_OPS_PER_SEC,
+        polarity: crate::test_support::Polarity::HigherBetter,
+        kind: MetricKind::Rate {
+            numerator: TOTAL_TAOBENCH_FAST_OPS,
+            denominator: TOTAL_TAOBENCH_WALL_SEC,
+        },
+        default_abs: 1000.0,
+        default_rel: 0.10,
+        display_unit: "ops/s",
+        accessor: |_| None,
+    },
+    MetricDef {
+        // Whole-run slow-path throughput = Σslow ops / Σwall-seconds.
+        // Informational — the slow path is a component of total throughput, not a
+        // standalone regression direction (mirrors the per-phase
+        // `taobench_slow_qps`).
+        name: TAOBENCH_SLOW_OPS_PER_SEC,
+        polarity: crate::test_support::Polarity::Informational,
+        kind: MetricKind::Rate {
+            numerator: TOTAL_TAOBENCH_SLOW_OPS,
+            denominator: TOTAL_TAOBENCH_WALL_SEC,
+        },
+        default_abs: 1000.0,
+        default_rel: 0.10,
+        display_unit: "ops/s",
+        accessor: |_| None,
+    },
+    MetricDef {
+        // Whole-run cache hit FRACTION = Σfast ops / Σcompleted ops — the SAME
+        // response-time hit measurement as the per-phase `taobench_hit_ratio`, at
+        // whole-run scope (its run-level Σ/Σ pool). The name differs only by axis:
+        // per-phase `_ratio` vs whole-run `_fraction` — a distinct registry key is
+        // required because a Rate cannot share a name with the per-phase PerPhase
+        // entry, and `_fraction` reads as the pooled [0, 1] ratio-of-counters (the
+        // qps siblings diverge the same way: per-phase `_qps` vs whole-run
+        // `_ops_per_sec`). DISTINCT from the command-time `taobench_hit_rate`
+        // (1 - misses/cmds), which is request-time, not response-time — see the
+        // block comment above. A fraction in [0, 1]. Informational — a hit-rate
+        // change is a workload-shape signal, not a scheduler regression direction.
+        // Absent when no ops completed (`total_taobench_ops` is 0 →
+        // `derive_rate_metrics` skips the zero denominator).
+        name: TAOBENCH_HIT_FRACTION,
+        polarity: crate::test_support::Polarity::Informational,
+        kind: MetricKind::Rate {
+            numerator: TOTAL_TAOBENCH_FAST_OPS,
+            denominator: TOTAL_TAOBENCH_OPS,
+        },
+        default_abs: 0.02,
+        default_rel: 0.05,
+        display_unit: "",
+        accessor: |_| None,
+    },
     // Per-phase latency min/max. LowerBetter (a higher min/max latency is worse).
     // min is a low-tail value → p50/p90 abs tier (20). max is a PEAK (a single
     // extreme sample, the flakiest latency stat) → the peak rel tolerance (0.50,
@@ -3154,6 +3301,14 @@ const RENDER_SUPPRESSED_COMPONENTS: &[&str] = &[
     "total_phase_duration_sec",
     "total_iterations_pooled",
     "total_cpu_time_sec",
+    // taobench whole-run qps / hit_fraction Rate components (the raw op counts +
+    // wall window). Suppressed so compare shows the four `taobench_*` Rates, not
+    // the redundant raw counts. Remain in the sidecar / row for the cross-RUN
+    // Σnum/Σdenom re-pool, like the iterations components above.
+    TOTAL_TAOBENCH_OPS,
+    TOTAL_TAOBENCH_FAST_OPS,
+    TOTAL_TAOBENCH_SLOW_OPS,
+    TOTAL_TAOBENCH_WALL_SEC,
 ];
 
 /// True when `name` is a Rate component suppressed from compare output (see

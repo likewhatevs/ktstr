@@ -191,6 +191,7 @@ pub(super) fn stub_custom_fn(_ctx: &WorkerCtx) -> WorkerReport {
         group_idx: 0,
         affinity_error: None,
         phase_slices: vec![],
+        taobench_whole: None,
     }
 }
 pub(super) fn custom_spin_fn(ctx: &WorkerCtx) -> WorkerReport {
@@ -233,6 +234,7 @@ pub(super) fn custom_spin_fn(ctx: &WorkerCtx) -> WorkerReport {
         group_idx: 0,
         affinity_error: None,
         phase_slices: vec![],
+        taobench_whole: None,
     }
 }
 /// Ready-file path shared between [`ignores_sigusr1_fn`] and

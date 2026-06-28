@@ -696,6 +696,7 @@ fn claim_against_worker_report_via_derived_accessors() {
         group_idx: 0,
         affinity_error: None,
         phase_slices: vec![],
+        taobench_whole: None,
     };
 
     let mut v = Verdict::new();

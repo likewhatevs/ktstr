@@ -619,6 +619,24 @@ pub struct WorkerReport {
     /// carry their own `#[derive(Claim)]`.
     #[claim(skip)]
     pub phase_slices: Vec<PhaseSlice>,
+    /// Whole-run taobench aggregate — `Some` only for a Taobench worker, `None`
+    /// otherwise. Shipped so the host can derive run-level qps/hit Rate keys
+    /// (`taobench_*_ops_per_sec` / `taobench_hit_fraction`) for `--noise-adjust`
+    /// spread analysis. The per-phase `PhaseSlice::taobench` carriers feed the
+    /// per-phase metrics but cannot reconstruct the whole-run window faithfully
+    /// (per-phase `elapsed_ns` is MAX-merged across concurrent threads, so
+    /// summing phase segments is the wrong qps denominator), so the engine's
+    /// authoritative whole-run aggregate is shipped directly. Appended LAST
+    /// (after `phase_slices`) to keep the positional postcard decode order of
+    /// every prior field unchanged. `pub` (every `WorkerReport` field is `pub`):
+    /// `WorkerReport` is a user-facing type custom workers construct via struct
+    /// literal ([`crate::workload::WorkType::custom`]), so a `pub(crate)` field
+    /// would forbid external struct-literal construction — its element type
+    /// `TaobenchStats` is `pub` for the same reason. `#[claim(skip)]`:
+    /// framework wire plumbing, not a test-author claim surface; assertions run
+    /// against the host-derived run-level `taobench_*` Rate metrics.
+    #[claim(skip)]
+    pub taobench_whole: Option<crate::workload::taobench::run::TaobenchStats>,
 }
 
 /// Per-phase telemetry for one backdrop worker over one scenario
@@ -707,12 +725,12 @@ pub struct PhaseSlice {
     /// `WorkType::Taobench` backdrop worker (`None` for every other work type —
     /// the generic drain leaves it `None`). Carries the phase's request- and
     /// response-time op counters
-    /// ([`crate::workload::taobench::run::TaobenchPhaseStats`]); the host derives
+    /// ([`crate::workload::taobench::run::TaobenchStats`]); the host derives
     /// per-phase qps / hit-ratio into `PhaseBucket.metrics`. `pub(crate)`: an
     /// internal carrier (test authors read `PhaseBucket`, not `PhaseSlice`) whose
     /// element type is `pub(crate)`. Integer-only, so it preserves `PhaseSlice`'s
     /// `Eq`.
-    pub(crate) taobench: Option<crate::workload::taobench::run::TaobenchPhaseStats>,
+    pub(crate) taobench: Option<crate::workload::taobench::run::TaobenchStats>,
 }
 
 /// Reason a sentinel [`WorkerReport`] was synthesized — attached to

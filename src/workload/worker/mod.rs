@@ -769,6 +769,9 @@ pub(super) fn worker_main(
     };
     let mut observed_change = false;
     let mut phase_slices: Vec<PhaseSlice> = Vec::new();
+    // Whole-run taobench aggregate (Some only when this is a Taobench worker),
+    // shipped in the report for the host-side run-level qps/hit Rate keys.
+    let mut taobench_whole: Option<crate::workload::taobench::run::TaobenchStats> = None;
     let mut phase_start = start;
     let mut phase_cpu_start = thread_cpu_time_ns();
     let mut phase_schedstat_start = schedstat_start;
@@ -1622,7 +1625,7 @@ pub(super) fn worker_main(
                 // Mirror the Schbench arm: run() blocks until `stop`, is
                 // phase-aware (watches `phase_epoch`, splitting its per-phase op
                 // counters at each step boundary), and returns one
-                // TaobenchPhaseStats per phase. The generic phase machinery never
+                // TaobenchStats per phase. The generic phase machinery never
                 // fires (this loop runs exactly once); break before the generic
                 // drain so it cannot push a duplicate slice.
                 let progress = AtomicU64::new(0);
@@ -1636,6 +1639,10 @@ pub(super) fn worker_main(
                 };
                 let outcome = crate::workload::taobench::run::run(config, stop, &progress, pe);
                 work_units = work_units.saturating_add(outcome.whole_run.total_ops());
+                // Ship the engine's authoritative whole-run aggregate for the
+                // host-side run-level qps/hit Rate keys (one taobench run per
+                // worker — the arm breaks below, so this is set at most once).
+                taobench_whole = Some(outcome.whole_run);
                 for (epoch, stats) in outcome.phases {
                     phase_slices.push(PhaseSlice {
                         phase_epoch: epoch,
@@ -3973,6 +3980,7 @@ pub(super) fn worker_main(
         group_idx,
         affinity_error,
         phase_slices,
+        taobench_whole,
     }
 }
 

@@ -902,6 +902,67 @@ fn sched_goidle_fraction_derives_and_pools_sigma_over_sigma() {
     );
 }
 
+/// Whole-run taobench qps + hit Rates derive per-run from their Counter ext
+/// components and pool Σ/Σ across runs (the `MetricKind::Rate` cross-run fold),
+/// NOT a mean of per-run qps. Unequal wall windows make the two disagree: run A
+/// 900 fast + 100 slow over 1 s, run B 100 fast + 2900 slow over 99 s. Σfast
+/// 1000, Σslow 3000, Σops 4000, Σwall 100 s → total 40/s, fast 10/s, slow 30/s,
+/// hit 1000/4000 = 0.25; the mean-of-ratios would give ~515 / ~451 / ~65 / 0.47.
+#[test]
+fn taobench_whole_run_rates_derive_and_pool_sigma_over_sigma() {
+    let mk = |fast: f64, slow: f64, wall: f64| {
+        let mut r = make_row("t", "tiny-1llc", true, 0.0);
+        r.ext_metrics.insert("total_taobench_ops".into(), fast + slow);
+        r.ext_metrics.insert("total_taobench_fast_ops".into(), fast);
+        r.ext_metrics.insert("total_taobench_slow_ops".into(), slow);
+        r.ext_metrics.insert("total_taobench_wall_sec".into(), wall);
+        r
+    };
+    let read = |row: &_, name: &str| metric_def(name).unwrap().read(row).expect("rate derived");
+
+    // Single run: 900 fast + 100 slow over 1 s.
+    let one = group_and_average_by(&[mk(900.0, 100.0, 1.0)], LEGACY_PAIRING_DIMS);
+    assert_eq!(read(&one[0].row, "taobench_total_ops_per_sec"), 1000.0);
+    assert_eq!(read(&one[0].row, "taobench_fast_ops_per_sec"), 900.0);
+    assert_eq!(read(&one[0].row, "taobench_slow_ops_per_sec"), 100.0);
+    assert!((read(&one[0].row, "taobench_hit_fraction") - 0.9).abs() < 1e-9);
+
+    // Two runs, unequal walls → pooled Σ/Σ, not mean-of-ratios.
+    let out = group_and_average_by(
+        &[mk(900.0, 100.0, 1.0), mk(100.0, 2900.0, 99.0)],
+        LEGACY_PAIRING_DIMS,
+    );
+    assert_eq!(out.len(), 1);
+    let row = &out[0].row;
+    // Counter components SUM-fold across runs.
+    assert_eq!(row.ext_metrics.get("total_taobench_ops").copied(), Some(4000.0));
+    assert_eq!(
+        row.ext_metrics.get("total_taobench_fast_ops").copied(),
+        Some(1000.0),
+    );
+    assert_eq!(
+        row.ext_metrics.get("total_taobench_slow_ops").copied(),
+        Some(3000.0),
+    );
+    assert_eq!(
+        row.ext_metrics.get("total_taobench_wall_sec").copied(),
+        Some(100.0),
+    );
+    // Rates re-derive Σ/Σ (the pooled cohort throughput), NOT mean-of-ratios.
+    let total = read(row, "taobench_total_ops_per_sec");
+    assert!(
+        (total - 40.0).abs() < 1e-9,
+        "Σops/Σwall = 4000/100 = 40, got {total} (mean-of-ratios ~515)",
+    );
+    assert!((read(row, "taobench_fast_ops_per_sec") - 10.0).abs() < 1e-9);
+    assert!((read(row, "taobench_slow_ops_per_sec") - 30.0).abs() < 1e-9);
+    let hit = read(row, "taobench_hit_fraction");
+    assert!(
+        (hit - 0.25).abs() < 1e-9,
+        "Σfast/Σops = 1000/4000 = 0.25, got {hit} (mean-of-ratios ~0.47)",
+    );
+}
+
 /// `avg_nr_running` (Gauge(Avg) ext key) folds cross-run as the
 /// SAMPLE-WEIGHTED pooled mean — Σ(avg_i × samples_i) / Σ samples_i, weighted by
 /// run_sample_count — NOT the unweighted arithmetic mean a typed field would

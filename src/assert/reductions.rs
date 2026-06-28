@@ -212,6 +212,25 @@ pub fn cgroup_stats(reports: &[WorkerReport]) -> CgroupStats {
         .unwrap_or(0);
     let cross_node_ratio = cross_node_migration_ratio_of(migrated_pages, total_numa_pages);
 
+    // Whole-run taobench engine aggregate, pooled across this cgroup's
+    // `WorkType::Taobench` workers: Σ ops, MAX wall window (shared across the
+    // concurrent workers, per `TaobenchStats::merge`). `None` for a cgroup
+    // with no Taobench worker. The run-level cross-cgroup pool + the qps/hit
+    // Rate derivation happen in `populate_run_pooled_taobench`; this is the
+    // per-cgroup raw carrier, the taobench analogue of `total_iterations`.
+    let taobench_whole = reports.iter().filter_map(|w| w.taobench_whole.as_ref()).fold(
+        None,
+        |acc: Option<crate::workload::taobench::run::TaobenchStats>, t| {
+            Some(match acc {
+                Some(mut a) => {
+                    a.merge(t);
+                    a
+                }
+                None => *t,
+            })
+        },
+    );
+
     CgroupStats {
         // Empty here; collect_handles labels the entry post-hoc (it has
         // the cgroup name in scope, this reports-only builder does not).
@@ -253,6 +272,7 @@ pub fn cgroup_stats(reports: &[WorkerReport]) -> CgroupStats {
         // supplied; left 0.0 here (no NUMA context).
         page_locality: 0.0,
         cross_node_migration_ratio: cross_node_ratio,
+        taobench_whole,
         ext_metrics: BTreeMap::new(),
     }
 }

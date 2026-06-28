@@ -141,7 +141,8 @@ pub use schbench::{
 // ktstr-taobench-validate driver). `run_standalone` is aliased to avoid colliding
 // with schbench's flat `run_standalone` re-export above.
 pub use taobench::{
-    TaobenchConfig, TaobenchStandaloneReport, run_standalone as taobench_run_standalone,
+    TaobenchConfig, TaobenchStandaloneReport, TaobenchStats,
+    run_standalone as taobench_run_standalone,
 };
 
 // `FanOutCompute` stores its u64 generation counter at offset 0 of

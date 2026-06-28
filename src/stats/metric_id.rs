@@ -86,6 +86,7 @@ builtin_metrics! {
     TotalTtwuLocal => "total_ttwu_local",
     TotalRunDelayNsPerSched => "total_run_delay_ns_per_sched",
     TtwuLocalFraction => "ttwu_local_fraction",
+    SchedGoidleFraction => "sched_goidle_fraction",
     AvgNrRunning => "avg_nr_running",
     WorstP99WakeLatencyUs => "worst_p99_wake_latency_us",
     WorstMedianWakeLatencyUs => "worst_median_wake_latency_us",
@@ -101,6 +102,18 @@ builtin_metrics! {
     TotalCpuTimeSec => "total_cpu_time_sec",
     TotalIterationsPooled => "total_iterations_pooled",
     IterationsPerCpuSec => "iterations_per_cpu_sec",
+    // Whole-run taobench qps + hit (run-level pool of the WorkType::Taobench
+    // engine, derived by populate_run_pooled_taobench). 4 Counter components
+    // (RENDER_SUPPRESSED_COMPONENTS) + 4 derived Rates. Distinct from the
+    // per-phase taobench_*_qps below (MetricKind::PerPhase).
+    TotalTaobenchOps => "total_taobench_ops",
+    TotalTaobenchFastOps => "total_taobench_fast_ops",
+    TotalTaobenchSlowOps => "total_taobench_slow_ops",
+    TotalTaobenchWallSec => "total_taobench_wall_sec",
+    TaobenchTotalOpsPerSec => "taobench_total_ops_per_sec",
+    TaobenchFastOpsPerSec => "taobench_fast_ops_per_sec",
+    TaobenchSlowOpsPerSec => "taobench_slow_ops_per_sec",
+    TaobenchHitFraction => "taobench_hit_fraction",
     SystemTimeNs => "system_time_ns",
     UserTimeNs => "user_time_ns",
     WorstMeanRunDelayUs => "worst_mean_run_delay_us",

@@ -48,6 +48,7 @@ fn stub_custom_fn(_ctx: &WorkerCtx) -> WorkerReport {
         group_idx: 0,
         affinity_error: None,
         phase_slices: vec![],
+        taobench_whole: None,
     }
 }
 

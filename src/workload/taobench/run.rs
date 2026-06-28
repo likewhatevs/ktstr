@@ -382,12 +382,17 @@ impl Slot {
 // Stats
 // ---------------------------------------------------------------------------
 
-/// Per-phase taobench counters. Integer-only so the enclosing
-/// `PhaseSlice` keeps `Eq`. `get_cmds` /
-/// `get_misses` are request-time; `fast_ops` / `slow_ops` are response-time (see
-/// the module docs).
+/// Taobench engine counters for one accounting window — a single phase
+/// epoch (the per-phase `crate::workload::PhaseSlice::taobench` carrier) or a
+/// whole worker run (the [`crate::workload::WorkerReport::taobench_whole`] /
+/// [`crate::assert::CgroupStats::taobench_whole`] aggregate). Integer-only so the
+/// enclosing `PhaseSlice` keeps `Eq`. `get_cmds` / `get_misses` are request-time;
+/// `fast_ops` / `slow_ops` are response-time (see the module docs). `Self::merge`
+/// pools two windows (Σ ops, MAX wall) and [`Self::total_ops`] is the throughput
+/// numerator; the host derives the run-level `taobench_*` Rate metrics from the
+/// pooled aggregate.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub(crate) struct TaobenchPhaseStats {
+pub struct TaobenchStats {
     /// Lookups issued (request time).
     pub get_cmds: u64,
     /// Lookups that missed (request time).
@@ -402,8 +407,8 @@ pub(crate) struct TaobenchPhaseStats {
     pub elapsed_ns: u64,
 }
 
-impl TaobenchPhaseStats {
-    pub(crate) fn merge(&mut self, o: &TaobenchPhaseStats) {
+impl TaobenchStats {
+    pub(crate) fn merge(&mut self, o: &TaobenchStats) {
         self.get_cmds += o.get_cmds;
         self.get_misses += o.get_misses;
         self.fast_ops += o.fast_ops;
@@ -420,8 +425,8 @@ impl TaobenchPhaseStats {
 
 /// The engine's return: the whole-run merged stats and per-phase-epoch stats.
 pub(crate) struct TaobenchOutcome {
-    pub whole_run: TaobenchPhaseStats,
-    pub phases: Vec<(u32, TaobenchPhaseStats)>,
+    pub whole_run: TaobenchStats,
+    pub phases: Vec<(u32, TaobenchStats)>,
 }
 
 /// Per-thread accumulation with phase-epoch bucketing: the current epoch's
@@ -431,9 +436,9 @@ pub(crate) struct TaobenchOutcome {
 /// (whole-run).
 struct ThreadAccum {
     cur_epoch: u32,
-    cur: TaobenchPhaseStats,
-    phases: BTreeMap<u32, TaobenchPhaseStats>,
-    whole: TaobenchPhaseStats,
+    cur: TaobenchStats,
+    phases: BTreeMap<u32, TaobenchStats>,
+    whole: TaobenchStats,
     /// When the current phase segment started (ns).
     phase_start_ns: u64,
     /// When this thread started (ns) — the whole-run window start.
@@ -445,9 +450,9 @@ impl ThreadAccum {
         let now = monotonic_nanos();
         ThreadAccum {
             cur_epoch: epoch,
-            cur: TaobenchPhaseStats::default(),
+            cur: TaobenchStats::default(),
             phases: BTreeMap::new(),
-            whole: TaobenchPhaseStats::default(),
+            whole: TaobenchStats::default(),
             phase_start_ns: now,
             thread_start_ns: now,
         }
@@ -594,8 +599,8 @@ pub(crate) fn run(
 
     // Reduce: merge per-epoch and whole-run across clients. Each ThreadAccum
     // stamped its per-phase segment walls + its whole-run window in finalize().
-    let mut all_phases: BTreeMap<u32, TaobenchPhaseStats> = BTreeMap::new();
-    let mut whole = TaobenchPhaseStats::default();
+    let mut all_phases: BTreeMap<u32, TaobenchStats> = BTreeMap::new();
+    let mut whole = TaobenchStats::default();
     for accum in client_accums {
         for (e, s) in accum.phases {
             all_phases.entry(e).or_default().merge(&s);
@@ -775,7 +780,7 @@ pub struct TaobenchStandaloneReport {
 }
 
 impl TaobenchStandaloneReport {
-    fn from_run(w: &TaobenchPhaseStats, nr_client_threads: usize, nr_slow_threads: usize) -> Self {
+    fn from_run(w: &TaobenchStats, nr_client_threads: usize, nr_slow_threads: usize) -> Self {
         let secs = (w.elapsed_ns as f64 / 1e9).max(f64::MIN_POSITIVE);
         let total = w.total_ops();
         TaobenchStandaloneReport {
@@ -903,5 +908,35 @@ mod tests {
         // would fail this compile. Also exercises the Eq derive.
         let cfg: crate::prelude::TaobenchConfig = crate::prelude::TaobenchConfig::default();
         assert_eq!(cfg, TaobenchConfig::default());
+    }
+
+    #[test]
+    fn taobench_stats_serde_roundtrips() {
+        // TaobenchStats is a pub serialized type that rides real wires — a field
+        // on WorkerReport (the worker→host postcard payload) and CgroupStats (the
+        // sidecar JSON) — so a field-rename or serde-attr drift is a silent
+        // data-loss risk this pins. Every field distinct +
+        // non-zero to exercise the full serde surface.
+        let s = TaobenchStats {
+            get_cmds: 1000,
+            get_misses: 150,
+            fast_ops: 850,
+            slow_ops: 150,
+            elapsed_ns: 9_000_000_000,
+        };
+        let json = serde_json::to_string(&s).expect("TaobenchStats must serialize");
+        let back: TaobenchStats =
+            serde_json::from_str(&json).expect("TaobenchStats must deserialize");
+        assert_eq!(s, back, "TaobenchStats roundtrips unchanged");
+    }
+
+    #[test]
+    fn taobench_stats_reachable_via_prelude() {
+        // Regression-pin the prelude placement: TaobenchStats is read off the
+        // preluded WorkerReport/CgroupStats `taobench_whole` fields, so it must be
+        // nameable via `use ktstr::prelude::*`. Dropping it from the prelude would
+        // fail this compile. Also exercises Default + Eq.
+        let s: crate::prelude::TaobenchStats = crate::prelude::TaobenchStats::default();
+        assert_eq!(s, TaobenchStats::default());
     }
 }

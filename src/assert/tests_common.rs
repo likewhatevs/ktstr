@@ -45,6 +45,7 @@ pub fn rpt(
         group_idx: 0,
         affinity_error: None,
         phase_slices: vec![],
+        taobench_whole: None,
     }
 }
 
@@ -84,5 +85,6 @@ pub fn rpt_with_latencies(
         group_idx: 0,
         affinity_error: None,
         phase_slices: vec![],
+        taobench_whole: None,
     }
 }

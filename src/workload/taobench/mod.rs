@@ -26,6 +26,13 @@ pub(crate) mod run;
 /// workload.
 pub use run::TaobenchConfig;
 
+/// Whole-run / per-phase taobench engine counters, the carried aggregate on
+/// [`crate::workload::WorkerReport::taobench_whole`] and
+/// [`crate::assert::CgroupStats::taobench_whole`]. The host derives the run-level
+/// `taobench_*` Rate metrics from it; test authors normally assert those metrics
+/// rather than reading this struct directly.
+pub use run::TaobenchStats;
+
 /// Host-side standalone runner + its report, backing the `ktstr-taobench-validate`
 /// validation driver (the analog of schbench's `run_standalone`).
 pub use run::{TaobenchStandaloneReport, run_standalone};

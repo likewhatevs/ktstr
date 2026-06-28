@@ -681,6 +681,159 @@ fn populate_run_pooled_iterations_per_cpu_sec_tiny_denominator_stays_finite() {
     );
 }
 
+/// Whole-run taobench qps + hit Rates re-pool across the run's Taobench
+/// cgroups via sum-of-ops and max-of-wall (the window is shared by the
+/// concurrent cohorts, so it is taken as MAX, never summed — a summed window
+/// would deflate every qps). With cg1 (fast 800, slow 200, 10 s) and cg2 (fast
+/// 300, slow 700, 8 s), the pool is fast 1100, slow 900, ops 2000, wall
+/// MAX(10,8) = 10 s, giving total 200/s, fast 110/s, slow 90/s, and hit
+/// 1100/2000 = 0.55. A summed-wall denominator (18 s) would give total roughly
+/// 111/s, so the MAX window is observable.
+#[test]
+fn populate_run_pooled_taobench_repools_across_cgroups() {
+    let tb = |fast: u64, slow: u64, secs: u64| {
+        Some(crate::workload::taobench::run::TaobenchStats {
+            get_cmds: fast + slow,
+            get_misses: slow,
+            fast_ops: fast,
+            slow_ops: slow,
+            elapsed_ns: secs * 1_000_000_000,
+        })
+    };
+    let cg1 = CgroupStats {
+        taobench_whole: tb(800, 200, 10),
+        num_workers: 1,
+        ..CgroupStats::default()
+    };
+    let cg2 = CgroupStats {
+        taobench_whole: tb(300, 700, 8),
+        num_workers: 1,
+        ..CgroupStats::default()
+    };
+    let mk = |cg: &CgroupStats| AssertResult {
+        outcomes: vec![],
+        passes: vec![],
+        stats: ScenarioStats {
+            cgroups: vec![cg.clone()],
+            ..ScenarioStats::default()
+        },
+        measurements: std::collections::BTreeMap::new(),
+        info_notes: vec![],
+    };
+    let mut acc = mk(&cg1);
+    acc.merge(mk(&cg2));
+    populate_run_pooled_taobench(&mut acc.stats);
+    let e = &acc.stats.ext_metrics;
+    // Counter components: Σ ops, MAX wall.
+    assert_eq!(e.get("total_taobench_ops").copied(), Some(2000.0));
+    assert_eq!(e.get("total_taobench_fast_ops").copied(), Some(1100.0));
+    assert_eq!(e.get("total_taobench_slow_ops").copied(), Some(900.0));
+    assert_eq!(
+        e.get("total_taobench_wall_sec").copied(),
+        Some(10.0),
+        "wall is MAX(10,8) = 10, not Σ = 18",
+    );
+    // Derived Rates = Σnum / Σden over the cohort.
+    assert_eq!(e.get("taobench_total_ops_per_sec").copied(), Some(200.0));
+    assert_eq!(e.get("taobench_fast_ops_per_sec").copied(), Some(110.0));
+    assert_eq!(e.get("taobench_slow_ops_per_sec").copied(), Some(90.0));
+    let hit = e
+        .get("taobench_hit_fraction")
+        .copied()
+        .expect("hit_fraction derived");
+    assert!(
+        (hit - 0.55).abs() < 1e-9,
+        "Σfast/Σops = 1100/2000 = 0.55, got {hit}",
+    );
+}
+
+/// No Taobench cgroup (every `taobench_whole` is `None`) → no keys written, so a
+/// non-taobench run stays distinct from a measured zero. Also covers the
+/// empty-cgroups case (the same `pooled == None` early return).
+#[test]
+fn populate_run_pooled_taobench_absent_without_taobench_cgroup() {
+    let cg = CgroupStats {
+        num_workers: 1,
+        ..CgroupStats::default()
+    };
+    let mut stats = ScenarioStats {
+        cgroups: vec![cg],
+        ..ScenarioStats::default()
+    };
+    populate_run_pooled_taobench(&mut stats);
+    assert!(
+        stats.ext_metrics.is_empty(),
+        "no taobench keys when no cgroup ran taobench",
+    );
+    // Empty cgroups vec: same early return, no keys.
+    let mut empty = ScenarioStats::default();
+    populate_run_pooled_taobench(&mut empty);
+    assert!(empty.ext_metrics.is_empty(), "no keys for empty cgroups");
+}
+
+/// `taobench_whole` present but `elapsed_ns == 0` (degenerate window): qps is
+/// undefined, so NEITHER components NOR rates are written (both-or-neither gate
+/// on the measured wall window).
+#[test]
+fn populate_run_pooled_taobench_absent_on_zero_wall() {
+    let cg = CgroupStats {
+        taobench_whole: Some(crate::workload::taobench::run::TaobenchStats {
+            get_cmds: 100,
+            get_misses: 10,
+            fast_ops: 90,
+            slow_ops: 10,
+            elapsed_ns: 0,
+        }),
+        num_workers: 1,
+        ..CgroupStats::default()
+    };
+    let mut stats = ScenarioStats {
+        cgroups: vec![cg],
+        ..ScenarioStats::default()
+    };
+    populate_run_pooled_taobench(&mut stats);
+    assert!(
+        stats.ext_metrics.is_empty(),
+        "no keys when the wall window is 0 (qps undefined)",
+    );
+}
+
+/// Wall window measured but ZERO ops completed (a cohort that issued no
+/// completions): the qps components/rates land at 0, but `taobench_hit_fraction`
+/// stays ABSENT — `derive_rate_metrics` skips its zero denominator (total ops
+/// 0), keeping a no-ops run distinct from a real 0.0 hit fraction. This is the
+/// per-metric gate: qps gated on the wall window, hit_fraction gated on
+/// completed ops via the derive's denominator guard.
+#[test]
+fn populate_run_pooled_taobench_hit_fraction_absent_when_no_ops() {
+    let cg = CgroupStats {
+        taobench_whole: Some(crate::workload::taobench::run::TaobenchStats {
+            get_cmds: 0,
+            get_misses: 0,
+            fast_ops: 0,
+            slow_ops: 0,
+            elapsed_ns: 5_000_000_000,
+        }),
+        num_workers: 1,
+        ..CgroupStats::default()
+    };
+    let mut stats = ScenarioStats {
+        cgroups: vec![cg],
+        ..ScenarioStats::default()
+    };
+    populate_run_pooled_taobench(&mut stats);
+    let e = &stats.ext_metrics;
+    // Components present (wall measured); qps = 0.
+    assert_eq!(e.get("total_taobench_ops").copied(), Some(0.0));
+    assert_eq!(e.get("total_taobench_wall_sec").copied(), Some(5.0));
+    assert_eq!(e.get("taobench_total_ops_per_sec").copied(), Some(0.0));
+    // hit_fraction ABSENT (0/0 skipped), not a false 0.0.
+    assert!(
+        !e.contains_key("taobench_hit_fraction"),
+        "hit_fraction absent when no ops completed",
+    );
+}
+
 #[test]
 fn merge_scenario_stats_worst_wins_and_iterations_sum() {
     // Aggregates-across-cgroups contract for the MERGE-FOLDED worst-wins

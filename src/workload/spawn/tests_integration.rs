@@ -101,6 +101,7 @@ fn worker_report_serde_roundtrip() {
             schbench: None,
             taobench: None,
         }],
+        taobench_whole: None,
     };
     let json = serde_json::to_string(&r).unwrap();
     let r2: WorkerReport = serde_json::from_str(&json).unwrap();
@@ -725,6 +726,7 @@ fn worker_report_serde_edge_cases() {
         group_idx: 0,
         affinity_error: None,
         phase_slices: vec![],
+        taobench_whole: None,
     };
     let json = serde_json::to_string(&r).unwrap();
     let r2: WorkerReport = serde_json::from_str(&json).unwrap();
@@ -763,6 +765,7 @@ fn worker_report_serde_edge_cases() {
         group_idx: usize::MAX,
         affinity_error: None,
         phase_slices: vec![],
+        taobench_whole: None,
     };
     let json = serde_json::to_string(&r).unwrap();
     let r2: WorkerReport = serde_json::from_str(&json).unwrap();
@@ -862,6 +865,7 @@ fn worker_report_debug_shows_field_values() {
         group_idx: 0,
         affinity_error: None,
         phase_slices: vec![],
+        taobench_whole: None,
     };
     let s = format!("{:?}", r);
     assert!(s.contains("42"), "must show tid value");
@@ -1405,6 +1409,7 @@ fn fully_populated_report() -> WorkerReport {
             schbench: None,
             taobench: None,
         }],
+        taobench_whole: None,
     }
 }
 
