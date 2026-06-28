@@ -628,6 +628,105 @@ fn fold_per_cpu_spatial_max(
     }
 }
 
+/// Per-phase per-CGROUP spatial axis over the workload-leaf PSI-irq captured at
+/// each freeze (`Snapshot::cgroup_psi`). The per-cgroup analog of
+/// [`fold_per_cpu_spatial_max`], producing three Peak metrics:
+///
+/// - `max_cgroup_psi_irq_avg10`: the worst leaf's IRQ-full pressure GAUGE
+///   (decoded avg10 percent) — per-freeze max across leaves, then max across the
+///   phase's freezes. A gauge, so no delta/baseline (a spatial-max of an
+///   instantaneous reading, the `max_avg_irq_util` shape on the cgroup axis).
+/// - `max_cgroup_irq_pressure`: the busiest leaf's IRQ-full stall DELTA over the
+///   phase (decoded µs) — per-leaf (last - first) `total_ns`, correlated by
+///   `cgroup_kva`, then the spatial max. A monotonic Counter, so delta-FIRST
+///   then spatial-max (the `max_cpu_hardirqs` shape). Informational
+///   (workload-confounded magnitude).
+/// - `max_cgroup_irq_pressure_concentration`: `max_cgroup_irq_pressure` / the
+///   mean per-leaf delta over the SAME leaf set — the busiest cell's share (the
+///   isolation/steering signal). max/MEAN, LowerBetter (the
+///   `max_cpu_hardirq_concentration` shape). Absent when < 2 reporting leaves or
+///   mean == 0.
+///
+/// Endpoints + the leaf intersection + saturating + loud-absent rules mirror
+/// [`fold_per_cpu_spatial_max`] (the `(cgroup_kva, serial_nr)` pair is the
+/// per-CPU `cpu`-field analog — the serial_nr disambiguates a freed slab KVA
+/// reused by a NEW cgroup, which `cgroup_kva` alone cannot; a leaf absent from
+/// either endpoint is skipped — leaf churn / a cgroup created mid-phase). All
+/// three are Peak → they auto-fold max-across-phases to run-level and cross-run
+/// MAX, no extra wiring.
+fn fold_per_cgroup_psi(
+    metrics: &mut std::collections::BTreeMap<String, f64>,
+    samples_in_phase: &[crate::scenario::sample::Sample<'_>],
+    win: impl Fn(&crate::scenario::sample::Sample<'_>) -> Option<u64>,
+) {
+    use crate::monitor::btf_offsets::{decode_avg10_percent, decode_total_us};
+    // avg10 gauge: per-freeze max across leaves, then max across the freezes.
+    let avg10_peak = samples_in_phase
+        .iter()
+        .filter_map(|s| {
+            s.snapshot
+                .cgroup_psi()
+                .iter()
+                .map(|c| decode_avg10_percent(c.avg10_raw))
+                .reduce(f64::max)
+        })
+        .reduce(f64::max);
+    if let Some(v) = avg10_peak {
+        metrics
+            .entry("max_cgroup_psi_irq_avg10".to_string())
+            .or_insert(v);
+    }
+
+    // total-delta spatial-max + concentration. Earliest + latest freeze by `win`
+    // (the bucket-window key; samples_in_phase is not positionally ordered). The
+    // per-leaf delta is correlated by `(cgroup_kva, serial_nr)` over the leaves
+    // present in BOTH endpoints; a leaf absent from either is skipped. The
+    // serial_nr guards KVA REUSE: a leaf rmdir'd mid-phase whose freed slab KVA a
+    // NEW cgroup then reused would alias by KVA alone and yield a bogus
+    // cross-cgroup delta — a different serial_nr at the same KVA is treated as
+    // absent (dropped), not differenced. `saturating_sub` then clamps only a
+    // (rare) genuine same-cgroup counter regress. delta FIRST, spatial max
+    // SECOND — a busiest cell that shifts across the phase is captured as
+    // max(per-leaf deltas), not a delta of spatial maxes.
+    let placed: Vec<(&crate::scenario::sample::Sample<'_>, u64)> = samples_in_phase
+        .iter()
+        .filter(|s| !s.snapshot.cgroup_psi().is_empty())
+        .filter_map(|s| win(s).map(|w| (s, w)))
+        .collect();
+    if let (Some(&(first_s, fw)), Some(&(last_s, lw))) = (
+        placed.iter().min_by_key(|(_, w)| *w),
+        placed.iter().max_by_key(|(_, w)| *w),
+    ) && fw < lw
+    {
+        let deltas: Vec<f64> = first_s
+            .snapshot
+            .cgroup_psi()
+            .iter()
+            .filter_map(|c0| {
+                last_s
+                    .snapshot
+                    .cgroup_psi()
+                    .iter()
+                    .find(|c1| c1.cgroup_kva == c0.cgroup_kva && c1.serial_nr == c0.serial_nr)
+                    .map(|c1| decode_total_us(c1.total_ns.saturating_sub(c0.total_ns)))
+            })
+            .collect();
+        if let Some(max) = deltas.iter().copied().reduce(f64::max) {
+            metrics
+                .entry("max_cgroup_irq_pressure".to_string())
+                .or_insert(max);
+            if deltas.len() >= 2 {
+                let mean = deltas.iter().sum::<f64>() / deltas.len() as f64;
+                if mean > 0.0 {
+                    metrics
+                        .entry("max_cgroup_irq_pressure_concentration".to_string())
+                        .or_insert(max / mean);
+                }
+            }
+        }
+    }
+}
+
 /// Assemble [`PhaseBucket`]s from a pre-grouped phase map. Shared by
 /// [`build_phase_buckets`] (grouping by the bridge-stamped step_index)
 /// and [`build_phase_buckets_with_stimulus`] (grouping by the
@@ -756,6 +855,11 @@ fn buckets_from_grouped(
             "max_cpu_softirq_net_rx",
             "max_cpu_softirq_net_rx_concentration",
         );
+        // Per-cgroup PSI-irq spatial axis: the busiest workload-leaf's IRQ-full
+        // stall delta + avg10 gauge + the cross-leaf concentration, over the
+        // cgroup_psi freezes (the host cgroup-walk capture). All Peak; auto-fold
+        // run-level.
+        fold_per_cgroup_psi(&mut metrics, &samples_in_phase, win);
         let mut bucket = PhaseBucket {
             step_index,
             label,

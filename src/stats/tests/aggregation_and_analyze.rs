@@ -963,6 +963,324 @@ fn max_cpu_softirq_net_rx_run_level_auto_folds_max_across_phases() {
     );
 }
 
+// -- per-cgroup PSI-irq spatial axis (max_cgroup_irq_pressure + concentration +
+// max_cgroup_psi_irq_avg10) — the cgroup sibling of the per-CPU axes above. The
+// two COUNTER metrics (irq_pressure + concentration) mirror the
+// fold_per_cpu_spatial_max gates (win-ordered endpoints, entity intersection,
+// single-freeze/single-entity/no-activity loud-absent) with `cgroup_kva` as the
+// per-CPU `cpu`-field analog and a /1000 ns→µs decode on each delta. The GAUGE
+// metric (avg10) diverges: an instantaneous reading, so it is present on a SINGLE
+// freeze (no delta/≥2 requirement) and folds a per-freeze spatial-max then a
+// cross-freeze temporal-max. --
+
+/// Build one periodic freeze with `cgroup_psi` = the given
+/// (cgroup_kva, total_ns, avg10_raw) leaf rows, stamped to `step`, anchored at
+/// `elapsed_ms`. Each leaf's serial_nr defaults to its cgroup_kva — a unique,
+/// stable-across-freezes identity for the no-KVA-reuse case; the KVA-reuse case
+/// (a distinct serial at the same KVA) uses `cgroup_psi_freeze_with_serial`. The
+/// cgroup analog of `irq_spatial_freeze`.
+fn cgroup_psi_freeze(
+    tag: &str,
+    elapsed_ms: u64,
+    step: u16,
+    leaves: &[(u64, u64, u64)],
+) -> crate::scenario::snapshot::DrainedSnapshotEntry {
+    use crate::monitor::cgroup_walk::CgroupPsiStat;
+    use crate::monitor::dump::FailureDumpReport;
+    use crate::scenario::snapshot::MissingStatsReason;
+    crate::scenario::snapshot::DrainedSnapshotEntry {
+        tag: tag.to_string(),
+        report: FailureDumpReport {
+            cgroup_psi: leaves
+                .iter()
+                .map(|&(cgroup_kva, total_ns, avg10_raw)| CgroupPsiStat {
+                    cgroup_kva,
+                    total_ns,
+                    avg10_raw,
+                    // Default serial = the KVA: a unique identity that is stable
+                    // across freezes for the same leaf (the no-reuse case). The
+                    // reuse case sets a distinct serial via the _with_serial helper.
+                    serial_nr: cgroup_kva,
+                })
+                .collect(),
+            ..Default::default()
+        },
+        stats: Err(MissingStatsReason::NoSchedulerBinary),
+        elapsed_ms: Some(elapsed_ms),
+        boundary_offset_ms: None,
+        step_index: Some(step),
+    }
+}
+
+/// Build a freeze with EXPLICIT per-leaf serial_nr — the KVA-reuse case. Leaf
+/// rows are (cgroup_kva, serial_nr, total_ns, avg10_raw). Used to model a leaf
+/// whose freed slab KVA a new cgroup reused (same kva, different serial across
+/// freezes), which `cgroup_psi_freeze`'s serial==kva default cannot express.
+fn cgroup_psi_freeze_with_serial(
+    tag: &str,
+    elapsed_ms: u64,
+    step: u16,
+    leaves: &[(u64, u64, u64, u64)],
+) -> crate::scenario::snapshot::DrainedSnapshotEntry {
+    use crate::monitor::cgroup_walk::CgroupPsiStat;
+    use crate::monitor::dump::FailureDumpReport;
+    use crate::scenario::snapshot::MissingStatsReason;
+    crate::scenario::snapshot::DrainedSnapshotEntry {
+        tag: tag.to_string(),
+        report: FailureDumpReport {
+            cgroup_psi: leaves
+                .iter()
+                .map(|&(cgroup_kva, serial_nr, total_ns, avg10_raw)| CgroupPsiStat {
+                    cgroup_kva,
+                    total_ns,
+                    avg10_raw,
+                    serial_nr,
+                })
+                .collect(),
+            ..Default::default()
+        },
+        stats: Err(MissingStatsReason::NoSchedulerBinary),
+        elapsed_ms: Some(elapsed_ms),
+        boundary_offset_ms: None,
+        step_index: Some(step),
+    }
+}
+
+/// Build a single (step-1) phase bucket from the freezes and read the per-cgroup
+/// PSI-irq spatial metrics:
+/// (max_cgroup_irq_pressure, max_cgroup_irq_pressure_concentration,
+/// max_cgroup_psi_irq_avg10). The cgroup analog of `irq_spatial_bucket`.
+fn cgroup_psi_bucket(
+    freezes: Vec<crate::scenario::snapshot::DrainedSnapshotEntry>,
+) -> (Option<f64>, Option<f64>, Option<f64>) {
+    let series = crate::scenario::sample::SampleSeries::from_drained_typed(freezes, None);
+    let buckets = crate::assert::build_phase_buckets(&series);
+    let b = buckets
+        .into_iter()
+        .find(|b| b.step_index == 1)
+        .expect("step-1 bucket present");
+    (
+        b.get("max_cgroup_irq_pressure"),
+        b.get("max_cgroup_irq_pressure_concentration"),
+        b.get("max_cgroup_psi_irq_avg10"),
+    )
+}
+
+/// Happy path: two freezes, two leaf cgroups. A total 100_000→200_000 (Δ100_000
+/// ns = 100µs), B 200_000→500_000 (Δ300_000 ns = 300µs). max_cgroup_irq_pressure
+/// = max(100, 300) = 300µs; concentration = 300 / mean(100, 300) = 1.5. avg10 =
+/// max over freezes of max-across-leaves: freeze1 max(1%,2%)=2, freeze2
+/// max(3%,4%)=4 → 4%. Pins the ns→µs decode and the fixed-point avg10 decode.
+#[test]
+fn max_cgroup_irq_pressure_happy_path() {
+    let (max, conc, avg10) = cgroup_psi_bucket(vec![
+        cgroup_psi_freeze("periodic_000", 1_000, 1, &[(0xA00, 100_000, 2048), (0xB00, 200_000, 4096)]),
+        cgroup_psi_freeze("periodic_001", 4_000, 1, &[(0xA00, 200_000, 6144), (0xB00, 500_000, 8192)]),
+    ]);
+    assert_eq!(max, Some(300.0), "busiest leaf's delta decoded to µs (B: (500_000-200_000)/1000)");
+    let conc = conc.expect("concentration present with 2 reporting leaves");
+    assert!((conc - 1.5).abs() < 1e-9, "300 / mean(100,300)=200 = 1.5; got {conc}");
+    let avg10 = avg10.expect("avg10 gauge present");
+    assert!((avg10 - 4.0).abs() < 1e-9, "max-across-freezes of max-across-leaves: max(2%,4%)=4; got {avg10}");
+}
+
+/// Load-bearing: the busiest leaf SHIFTS between freezes — A hot early, B hot
+/// late. first{A:100_000,B:50_000} last{A:150_000,B:400_000} → per-leaf deltas
+/// dA=50µs, dB=350µs → max=350µs. This is NOT max(last)=400_000 −
+/// max(first)=100_000 = 300µs (spatial-max-then-delta the design forbids). Pins
+/// per-leaf-delta-THEN-max on the cgroup axis.
+#[test]
+fn max_cgroup_irq_pressure_uses_per_leaf_delta_when_busiest_shifts() {
+    let (max, conc, _) = cgroup_psi_bucket(vec![
+        cgroup_psi_freeze("periodic_000", 1_000, 1, &[(0xA00, 100_000, 0), (0xB00, 50_000, 0)]),
+        cgroup_psi_freeze("periodic_001", 4_000, 1, &[(0xA00, 150_000, 0), (0xB00, 400_000, 0)]),
+    ]);
+    assert_eq!(max, Some(350.0), "max of per-leaf deltas (dB=350µs), NOT max(totals)=400-100=300µs");
+    let conc = conc.expect("concentration present");
+    assert!((conc - 1.75).abs() < 1e-9, "350 / mean(50,350)=200 = 1.75; got {conc}");
+}
+
+/// Endpoints chosen by win() (boundary_offset/elapsed), NOT positional. The
+/// POSITIONAL-first freeze has a LATER win (4000) than the positional-last
+/// (1000); a naive .first()/.last() would compute win1000 − win4000 per leaf →
+/// saturating_sub clamps to 0 → max=0. The win-ordered fold yields a positive
+/// delta. (Mirrors the per-CPU win-ordering test on the cgroup axis.)
+#[test]
+fn max_cgroup_irq_pressure_uses_win_ordered_endpoints_not_positional() {
+    let (max, _, _) = cgroup_psi_bucket(vec![
+        cgroup_psi_freeze("periodic_000", 4_000, 1, &[(0xA00, 500_000, 0), (0xB00, 300_000, 0)]),
+        cgroup_psi_freeze("periodic_001", 1_000, 1, &[(0xA00, 100_000, 0), (0xB00, 50_000, 0)]),
+    ]);
+    assert_eq!(
+        max,
+        Some(400.0),
+        "win-ordered A (500_000-100_000)/1000=400µs (max); positional would clamp to 0",
+    );
+}
+
+/// Leaf-churn skip: B present in the first freeze but ABSENT from the last
+/// (defensive cgroup_kva intersection) → excluded from max+mean; only A (in
+/// both) contributes Δ=(300_000-100_000)/1000=200µs. With a 1-leaf intersection
+/// the concentration is omitted. A leaf created/destroyed mid-phase.
+#[test]
+fn max_cgroup_irq_pressure_skips_leaf_absent_from_an_endpoint() {
+    let (max, conc, _) = cgroup_psi_bucket(vec![
+        cgroup_psi_freeze("periodic_000", 1_000, 1, &[(0xA00, 100_000, 0), (0xB00, 9_999_000, 0)]),
+        cgroup_psi_freeze("periodic_001", 4_000, 1, &[(0xA00, 300_000, 0)]),
+    ]);
+    assert_eq!(max, Some(200.0), "only A (present in both freezes) contributes");
+    assert_eq!(conc, None, "1-leaf intersection → concentration omitted");
+}
+
+/// The GAUGE/COUNTER divergence: a SINGLE freeze yields no measurable delta, so
+/// max_cgroup_irq_pressure + concentration are absent — but max_cgroup_psi_irq_avg10
+/// is an instantaneous reading, present on one freeze: max(1%,2%)=2%. This is the
+/// per-cgroup gauge's key difference from the per-CPU counter axes (which are all
+/// absent on a single freeze).
+#[test]
+fn max_cgroup_psi_irq_avg10_present_on_single_freeze_while_delta_absent() {
+    let (max, conc, avg10) = cgroup_psi_bucket(vec![cgroup_psi_freeze(
+        "periodic_000",
+        1_000,
+        1,
+        &[(0xA00, 100_000, 2048), (0xB00, 200_000, 4096)],
+    )]);
+    assert_eq!(max, None, "single freeze → no per-leaf delta measurable");
+    assert_eq!(conc, None, "single freeze → no concentration");
+    let avg10 = avg10.expect("avg10 is an instantaneous gauge, present on one freeze");
+    assert!((avg10 - 2.0).abs() < 1e-9, "max-across-leaves of the lone freeze: max(1%,2%)=2; got {avg10}");
+}
+
+/// <2-leaf intersection → concentration omitted, max kept: a single-leaf
+/// intersection makes max/mean == 1 a structural artifact, so the concentration
+/// key is omitted — but a per-leaf peak IS meaningful on one leaf, so
+/// max_cgroup_irq_pressure is kept (A: (700_000-100_000)/1000=600µs).
+#[test]
+fn max_cgroup_irq_pressure_concentration_omitted_for_single_leaf() {
+    let (max, conc, _) = cgroup_psi_bucket(vec![
+        cgroup_psi_freeze("periodic_000", 1_000, 1, &[(0xA00, 100_000, 0)]),
+        cgroup_psi_freeze("periodic_001", 4_000, 1, &[(0xA00, 700_000, 0)]),
+    ]);
+    assert_eq!(max, Some(600.0), "A delta (700_000-100_000)/1000");
+    assert_eq!(conc, None, "1 leaf → concentration omitted (a trivial 1.0)");
+}
+
+/// mean==0 → concentration absent, max a measured zero: two leaves whose counters
+/// did not advance → every per-leaf delta is 0, so max_cgroup_irq_pressure is a
+/// REAL Some(0.0), but the concentration is absent (mean==0 would be a NaN). The
+/// max=measured-zero vs concentration=loud-absent distinction on the cgroup axis.
+#[test]
+fn max_cgroup_irq_pressure_concentration_absent_when_no_pressure() {
+    let (max, conc, _) = cgroup_psi_bucket(vec![
+        cgroup_psi_freeze("periodic_000", 1_000, 1, &[(0xA00, 500_000, 0), (0xB00, 500_000, 0)]),
+        cgroup_psi_freeze("periodic_001", 4_000, 1, &[(0xA00, 500_000, 0), (0xB00, 500_000, 0)]),
+    ]);
+    assert_eq!(max, Some(0.0), "both leaves' counters didn't advance → measured zero");
+    assert_eq!(conc, None, "mean==0 → concentration absent (no div-by-zero/NaN)");
+}
+
+/// No reporting leaf in any freeze (psi_cgroups off / absent workload root → the
+/// walk captured nothing) → all three metrics loud-absent. The cgroup_psi gauge
+/// has no leaf to spatial-max, and there is no delta to fold.
+#[test]
+fn cgroup_psi_metrics_all_absent_when_no_leaf_reported() {
+    let (max, conc, avg10) = cgroup_psi_bucket(vec![
+        cgroup_psi_freeze("periodic_000", 1_000, 1, &[]),
+        cgroup_psi_freeze("periodic_001", 4_000, 1, &[]),
+    ]);
+    assert_eq!(max, None, "no leaf → no pressure delta");
+    assert_eq!(conc, None, "no leaf → no concentration");
+    assert_eq!(avg10, None, "no leaf → no avg10 gauge");
+}
+
+/// Run-level: all three cgroup metrics are Peak with no read_sample arm, so they
+/// auto-fold max-across-phases through populate_run_ext_metrics_from_phases (the
+/// max_cpu_hardirqs path). Two phases: phase1 busiest Δ=300µs / conc 1.5 / avg10
+/// 2%, phase2 busiest Δ=900µs / conc 1.8 / avg10 6% → run-level max(300,900)=900,
+/// max(1.5,1.8)=1.8, max(2,6)=6. Pins the three new MetricDefs' Peak kind driving
+/// the registry auto-fold (the gauge included).
+#[test]
+fn cgroup_psi_metrics_run_level_auto_fold_max_across_phases() {
+    use crate::assert::{
+        build_phase_buckets, populate_run_ext_metrics, populate_run_ext_metrics_from_phases,
+    };
+    use crate::scenario::sample::SampleSeries;
+
+    let series = SampleSeries::from_drained_typed(
+        vec![
+            cgroup_psi_freeze("periodic_000", 1_000, 1, &[(0xA00, 100_000, 2048), (0xB00, 200_000, 4096)]),
+            cgroup_psi_freeze("periodic_001", 4_000, 1, &[(0xA00, 200_000, 2048), (0xB00, 500_000, 4096)]),
+            cgroup_psi_freeze("periodic_002", 6_000, 2, &[(0xA00, 1_000_000, 10240), (0xB00, 1_000_000, 12288)]),
+            cgroup_psi_freeze("periodic_003", 9_000, 2, &[(0xA00, 1_100_000, 10240), (0xB00, 1_900_000, 12288)]),
+        ],
+        None,
+    );
+    let buckets = build_phase_buckets(&series);
+    let mut ext = std::collections::BTreeMap::new();
+    populate_run_ext_metrics(&series, &mut ext);
+    populate_run_ext_metrics_from_phases(&buckets, &mut ext);
+    assert_eq!(
+        ext.get("max_cgroup_irq_pressure").copied(),
+        Some(900.0),
+        "Peak auto-folds max-across-phases: max(phase1 Δ=300µs, phase2 Δ=900µs)",
+    );
+    let conc = ext
+        .get("max_cgroup_irq_pressure_concentration")
+        .copied()
+        .expect("concentration auto-folds run-level too (Peak)");
+    assert!(
+        (conc - 1.8).abs() < 1e-9,
+        "max(phase1 1.5, phase2 900/mean(100,900)=1.8) = 1.8; got {conc}",
+    );
+    let avg10 = ext
+        .get("max_cgroup_psi_irq_avg10")
+        .copied()
+        .expect("avg10 gauge auto-folds run-level too (Peak)");
+    assert!(
+        (avg10 - 6.0).abs() < 1e-9,
+        "max(phase1 2%, phase2 6%) = 6; got {avg10}",
+    );
+}
+
+/// KVA-reuse disambiguation by serial_nr: a leaf rmdir'd mid-phase whose freed
+/// slab KVA a NEW cgroup reused must NOT be correlated across freezes by
+/// cgroup_kva alone. Leaf B (kva 0xB00, serial 2, total 500_000) is replaced in
+/// the last freeze by a new cgroup C at the SAME kva 0xB00 with serial 3 and
+/// total 9_000_000 (cumulative from C's creation, unrelated to B). With
+/// cgroup_kva-only correlation the fold would difference C against B and report a
+/// bogus (9_000_000-500_000)/1000 = 8500µs delta. The (cgroup_kva, serial_nr)
+/// tuple drops the serial-mismatched 0xB00, so only A (kva 0xA00, serial 1 in
+/// both freezes) contributes its (200_000-100_000)/1000 = 100µs delta — max =
+/// 100µs (NOT 8500µs), concentration absent (1-leaf serial-matched intersection).
+/// This pins the cross-phase identity guard against slab-KVA reuse.
+#[test]
+fn max_cgroup_irq_pressure_disambiguates_reused_kva_by_serial() {
+    let (max, conc, _) = cgroup_psi_bucket(vec![
+        cgroup_psi_freeze_with_serial(
+            "periodic_000",
+            1_000,
+            1,
+            &[(0xA00, 1, 100_000, 0), (0xB00, 2, 500_000, 0)],
+        ),
+        cgroup_psi_freeze_with_serial(
+            "periodic_001",
+            4_000,
+            1,
+            &[(0xA00, 1, 200_000, 0), (0xB00, 3, 9_000_000, 0)],
+        ),
+    ]);
+    assert_eq!(
+        max,
+        Some(100.0),
+        "only A (kva+serial match in both freezes) contributes 100µs; the reused-KVA \
+         0xB00 (serial 2→3) is dropped, NOT differenced into a bogus 8500µs",
+    );
+    assert_eq!(
+        conc, None,
+        "1-leaf serial-matched intersection → concentration omitted",
+    );
+}
+
 /// `aggregate_samples_for_phase` dispatches Counter through
 /// `phase_counter_delta` (per-phase delta) and every other
 /// kind through `aggregate_samples` (flat-run semantic). Pins

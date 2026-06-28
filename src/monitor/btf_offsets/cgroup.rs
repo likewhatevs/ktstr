@@ -18,7 +18,10 @@
 //!   psi_group, NULL when `psi_cgroups_enabled` is off → loud-absent).
 //! - `struct cgroup_subsys_state` (`:181`): `struct list_head sibling` (`:213`,
 //!   links this css into its parent's child list), `struct list_head children`
-//!   (`:214`, the anchor of this css's children).
+//!   (`:214`, the anchor of this css's children), `u64 serial_nr` (`:230`, the
+//!   monotonic per-creation serial — a creation identity that survives a
+//!   slab-KVA reuse, so the cross-freeze fold can reject a different cgroup that
+//!   reused a freed KVA).
 //! - `struct cgroup_root` (`:651`): embeds `struct cgroup cgrp` LAST (`:681`,
 //!   after `release_agent_path[PATH_MAX]` + `name[]` char arrays — a large,
 //!   layout-sensitive offset).
@@ -68,6 +71,16 @@ pub struct CgroupWalkOffsets {
     /// anchor of a css's children. A cgroup is a LEAF iff this list is empty
     /// (`children.next` points back at the anchor's own KVA).
     pub css_children: usize,
+    /// `offsetof(struct cgroup_subsys_state, serial_nr)` — the `u64` monotonic
+    /// per-creation serial (`css->serial_nr = css_serial_nr_next++`,
+    /// `kernel/cgroup/cgroup.c`). Read alongside the cgroup KVA so the
+    /// cross-freeze fold can tell a cgroup apart from a DIFFERENT one that later
+    /// reused the same slab KVA: a freed `struct cgroup` is a plain `kzalloc`
+    /// eligible for slab reuse, so KVA alone is NOT a stable cross-lifetime
+    /// identity — a KVA match with a different serial is a different cgroup. The
+    /// serial lives in the embedded `self` css, so its address is
+    /// `cgroup_kva + cgroup_self + css_serial_nr`.
+    pub css_serial_nr: usize,
     /// `offsetof(struct cgroup_root, cgrp)` — the embedded root `struct
     /// cgroup`. `cgrp_dfl_root + this` is the hierarchy root cgroup (the
     /// cgroup2 mount point; its children are the top-level cgroups like the
@@ -94,6 +107,7 @@ impl CgroupWalkOffsets {
         let (css, _) = find_struct(btf, "cgroup_subsys_state")?;
         let css_sibling = member_byte_offset(btf, &css, "sibling")?;
         let css_children = member_byte_offset(btf, &css, "children")?;
+        let css_serial_nr = member_byte_offset(btf, &css, "serial_nr")?;
 
         let (cgroup_root, _) = find_struct(btf, "cgroup_root")?;
         let cgroup_root_cgrp = member_byte_offset(btf, &cgroup_root, "cgrp")?;
@@ -107,6 +121,7 @@ impl CgroupWalkOffsets {
             cgroup_psi,
             css_sibling,
             css_children,
+            css_serial_nr,
             cgroup_root_cgrp,
             kernfs_node_name,
         })

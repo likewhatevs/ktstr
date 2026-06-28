@@ -2206,6 +2206,64 @@ pub static METRICS: &[MetricDef] = &[
         accessor: |_| None,
     },
     MetricDef {
+        // Per-cgroup IRQ-pressure spatial axis: the busiest workload-leaf cgroup's
+        // PSI-irq `full` stall DELTA over the phase (decoded µs) — max over the
+        // workload-root leaf cgroups of each leaf's (last - first freeze)
+        // cgroup->psi total[PSI_AVGS][PSI_IRQ_FULL], correlated across freezes by
+        // (cgroup_kva, serial_nr) — the serial disambiguates a freed slab KVA
+        // reused by a new cgroup. The per-cgroup analog of max_cpu_hardirqs (the
+        // busiest-CELL dimension);
+        // attributes IRQ-servicing stall to the workload cell that induced it,
+        // which the system-wide total_irq_pressure_us cannot. Custom per-cgroup
+        // delta fold (assert::phase_build fold_per_cgroup_psi), NOT a read_sample
+        // arm. Peak = spatial-max of a per-cgroup cumulative-counter delta.
+        // Informational: an absolute per-cell stall is workload-confounded (more
+        // work → more stall) — the concentration ratio below is the isolation
+        // signal, mirroring the max_cpu_hardirqs raw-counts split.
+        name: "max_cgroup_irq_pressure",
+        polarity: crate::test_support::Polarity::Informational,
+        kind: MetricKind::Peak,
+        default_abs: 1000.0,
+        default_rel: 0.50,
+        display_unit: "µs",
+        accessor: |_| None,
+    },
+    MetricDef {
+        // Per-cgroup IRQ-pressure concentration: max_cgroup_irq_pressure / the
+        // mean per-leaf IRQ-full stall delta over the SAME reporting-leaf set —
+        // the busiest cell's share of the average. Range [1, num_leaves]: 1.0 =
+        // evenly spread, higher = IRQ-servicing stall concentrated on one workload
+        // cell (the cgroup-isolation / cell-steering signal). Peak, LowerBetter,
+        // max/MEAN — the per-cgroup sibling of max_cpu_hardirq_concentration (same
+        // NOT-a-Rate, max/MEAN-not-max/MIN, >=2-reporting-leaf + mean>0 discipline;
+        // disjoint leaves — cgroup2's no-internal-process rule — so no
+        // double-count). Absent (None) when < 2 reporting leaves or mean == 0.
+        name: "max_cgroup_irq_pressure_concentration",
+        polarity: crate::test_support::Polarity::LowerBetter,
+        kind: MetricKind::Peak,
+        default_abs: 1.0,
+        default_rel: 0.25,
+        display_unit: "x",
+        accessor: |_| None,
+    },
+    MetricDef {
+        // Per-cgroup IRQ-pressure GAUGE: the worst workload-leaf cgroup's PSI-irq
+        // `full` avg10 (decoded 10s-EWMA percent, 0..=100) — per freeze the max
+        // across the leaves, then the max across the phase's freezes. The
+        // instantaneous-pressure companion to max_cgroup_irq_pressure (a gauge, so
+        // a spatial-max with no delta — the max_avg_irq_util shape on the cgroup
+        // axis). Peak; LowerBetter (less IRQ pressure on the worst cell is better).
+        // Custom fold (fold_per_cgroup_psi), NOT a read_sample arm. Loud-absent
+        // when no leaf reported PSI (psi_cgroups off / absent workload root).
+        name: "max_cgroup_psi_irq_avg10",
+        polarity: crate::test_support::Polarity::LowerBetter,
+        kind: MetricKind::Peak,
+        default_abs: 5.0,
+        default_rel: 0.30,
+        display_unit: "%",
+        accessor: |_| None,
+    },
+    MetricDef {
         // System-wide PSI-irq `full` avg10: the mean over monitor samples of the
         // decoded 10s-EWMA full IRQ pressure (percent, 0..=100), host-walked from
         // the global `psi_system` (NOT a guest /proc read). Gauge(Avg) like

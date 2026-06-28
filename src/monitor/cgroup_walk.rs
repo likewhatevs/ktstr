@@ -74,11 +74,14 @@ const CGROUP2_MOUNT_PREFIX: &str = "/sys/fs/cgroup";
 /// same cgroup across freezes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CgroupPsiStat {
-    /// Kernel virtual address of this leaf's `struct cgroup` — a
-    /// stable-for-lifetime identity key (the cgroup is not reallocated until
-    /// its deferred post-rmdir CSS free). NOT a PA to re-read: the walk
-    /// re-derives PAs each freeze (cross-phase: a cached PA could read a freed
-    /// slab); this is only an identity for cross-freeze correlation.
+    /// Kernel virtual address of this leaf's `struct cgroup`. Stable for a
+    /// single cgroup's lifetime (not reallocated until its deferred post-rmdir
+    /// CSS free), but NOT a sufficient cross-freeze identity ON ITS OWN: a freed
+    /// `struct cgroup` is a plain `kzalloc` whose slab KVA a later cgroup can
+    /// reuse, so the cross-freeze fold pairs this with `serial_nr` to reject a
+    /// same-KVA-different-cgroup match. NOT a PA to re-read: the walk re-derives
+    /// PAs each freeze (a cached PA could read a freed slab); this is only an
+    /// identity for cross-freeze correlation.
     pub cgroup_kva: u64,
     /// Raw `cgroup->psi->total[PSI_AVGS][PSI_IRQ_FULL]` — cumulative IRQ stall
     /// ns (decode `/1000` = µs).
@@ -86,6 +89,13 @@ pub struct CgroupPsiStat {
     /// Raw `cgroup->psi->avg[PSI_IRQ_FULL][0]` — the 10s EWMA in fixed-point
     /// (percent × 2048; decode `/2048`, clamp `[0,100]`).
     pub avg10_raw: u64,
+    /// Raw `cgroup_subsys_state.serial_nr` — the monotonic per-creation serial
+    /// (`css_serial_nr_next++` at `cgroup_create`). Paired with `cgroup_kva` as
+    /// the cross-freeze identity: a freed cgroup's slab KVA can be reused by a
+    /// later cgroup, so a KVA match with a DIFFERENT `serial_nr` is a different
+    /// cgroup — the fold drops it rather than computing a bogus cross-cgroup
+    /// counter delta.
+    pub serial_nr: u64,
 }
 
 /// Split a host-held workload-root path into the cgroup-relative segments to
@@ -209,10 +219,13 @@ fn read_cgroup_psi(
     let total_off = psi_off.total_irq_full_off()?;
     let avg10_off = psi_off.avg10_irq_full_off()?;
     let psi_pa = kva_to_pa(psi_kva, page_offset);
+    // serial_nr lives in the embedded `self` css (at cgroup_self), read from
+    // the cgroup object (not the psi_group): cgroup_pa + cgroup_self + css_serial_nr.
     Some(CgroupPsiStat {
         cgroup_kva,
         total_ns: mem.read_u64(psi_pa, total_off),
         avg10_raw: mem.read_u64(psi_pa, avg10_off),
+        serial_nr: mem.read_u64(cgroup_pa, off.cgroup_self + off.css_serial_nr),
     })
 }
 
@@ -323,12 +336,13 @@ mod tests {
     use crate::monitor::symbols::DEFAULT_PAGE_OFFSET;
 
     // Offsets for a synthetic cgroup layout. `self` at 0 (css embedded first);
-    // within the css, sibling then children list_heads; kn and psi pointers
-    // after the css. cgroup_root.cgrp embeds the root cgroup at a nonzero
-    // offset. kernfs_node.name pointer at a fixed offset.
+    // within the css, sibling then children list_heads then the serial_nr; kn
+    // and psi pointers after the css. cgroup_root.cgrp embeds the root cgroup at
+    // a nonzero offset. kernfs_node.name pointer at a fixed offset.
     const SELF_OFF: usize = 0;
     const CSS_SIBLING: usize = 16;
     const CSS_CHILDREN: usize = 32;
+    const CSS_SERIAL_NR: usize = 48; // serial_nr within the css, after the list_heads
     const CGROUP_KN: usize = 64;
     const CGROUP_PSI: usize = 72;
     const ROOT_CGRP: usize = 256; // cgrp embedded in cgroup_root at +256
@@ -341,6 +355,7 @@ mod tests {
             cgroup_psi: CGROUP_PSI,
             css_sibling: CSS_SIBLING,
             css_children: CSS_CHILDREN,
+            css_serial_nr: CSS_SERIAL_NR,
             cgroup_root_cgrp: ROOT_CGRP,
             kernfs_node_name: KN_NAME,
         }
@@ -455,6 +470,10 @@ mod tests {
         }
         img.init_cgroup(cg0, kn_cg0, Image::kva(psi_cg0));
         img.init_cgroup(cg1, kn_cg1, Image::kva(psi_cg1));
+        // Distinct per-leaf creation serials (read from the embedded css at
+        // SELF_OFF + CSS_SERIAL_NR) — pins the walk reads serial_nr.
+        img.w64(cg0 + SELF_OFF + CSS_SERIAL_NR, 7);
+        img.w64(cg1 + SELF_OFF + CSS_SERIAL_NR, 9);
         img.link_children(root, &[ktstr, sched]);
         img.link_children(ktstr, &[cg0, cg1]);
         // sched has its own leaf the walk must NOT reach.
@@ -485,8 +504,10 @@ mod tests {
         assert_eq!(got[0].total_ns, 111_000);
         assert_eq!(got[0].avg10_raw, 2048);
         assert_eq!(got[0].cgroup_kva, Image::kva(cg0));
+        assert_eq!(got[0].serial_nr, 7, "cg0 serial_nr read from the embedded css");
         assert_eq!(got[1].total_ns, 222_000);
         assert_eq!(got[1].cgroup_kva, Image::kva(cg1));
+        assert_eq!(got[1].serial_nr, 9, "cg1 serial_nr read from the embedded css");
     }
 
     /// A leaf whose cgroup->psi is NULL (psi_cgroups disabled) is skipped, not

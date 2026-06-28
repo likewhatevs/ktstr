@@ -153,6 +153,16 @@ builtin_metrics! {
     MaxCpuSoftirqNetRx => "max_cpu_softirq_net_rx",
     MaxCpuSoftirqNetRxConcentration => "max_cpu_softirq_net_rx_concentration",
 
+    // Per-cgroup PSI-irq spatial axis (host cgroup-walk capture → per-phase fold):
+    // the busiest workload-leaf cgroup dimension. max_cgroup_irq_pressure = the busiest leaf's
+    // IRQ-full stall delta (µs); _concentration = max / mean over the reporting
+    // leaves (the cgroup-isolation signal); max_cgroup_psi_irq_avg10 = the worst
+    // leaf's avg10 gauge (%). All Peak; folded per-phase in assert::phase_build
+    // (fold_per_cgroup_psi) from the freeze cgroup_psi capture.
+    MaxCgroupIrqPressure => "max_cgroup_irq_pressure",
+    MaxCgroupIrqPressureConcentration => "max_cgroup_irq_pressure_concentration",
+    MaxCgroupPsiIrqAvg10 => "max_cgroup_psi_irq_avg10",
+
     // System-wide PSI-irq pressure (host-walked from the global psi_system per
     // monitor sample, folded run-level in MonitorSummary). avg10 = mean
     // 10s-EWMA full-pressure percent (Gauge); total = cumulative full-stall µs

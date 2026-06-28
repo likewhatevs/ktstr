@@ -460,7 +460,8 @@ pub fn populate_run_ext_metrics_from_phases(
 ///    (over every freeze in `samples`), then the whole-run wall + IRQ rates.
 /// 2. [`populate_run_ext_metrics_from_phases`] — the phase-only ext metrics
 ///    whose `read_sample` is `None` (`avg_imbalance_ratio`, `iteration_rate`,
-///    `system_time_ns`, `user_time_ns`, the per-CPU IRQ spatial maxes).
+///    `system_time_ns`, `user_time_ns`, the per-CPU IRQ spatial maxes, and the
+///    per-cgroup PSI-irq spatial maxes).
 /// 3. [`populate_run_pooled_iterations_per_cpu_sec`] — the pooled cross-cgroup
 ///    `iterations_per_cpu_sec` Rate (from `stats.cgroups`).
 /// 4. [`populate_run_distribution_metrics`] — the `Distribution` / `WorstLowest`

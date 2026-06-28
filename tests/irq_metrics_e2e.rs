@@ -54,15 +54,27 @@ const NET_TEST: NetConfig = NetConfig::DEFAULT.mac([0x52, 0x54, 0x00, 0x4e, 0x54
 /// Host-side check that the per-phase IRQ counters/rate resolved from the
 /// freeze-driven phase buckets and rose under the NetTraffic load.
 fn assert_irq_metrics(result: &VmResult) -> Result<()> {
-    // >= 2 periodic freezes must land in the step bucket for the Counter
-    // last-minus-first delta to be measurable. The single Step holds FULL, so
-    // every periodic capture is stamped Phase::step(0).
+    // Coverage guard: the Counter deltas need >= 2 freezes that actually
+    // captured per-CPU time. periodic_fired counts ATTEMPTS — it includes
+    // rendezvous-timeout placeholders and dump-degraded reports, both of which
+    // carry an empty per_cpu_time — so guarding on it would pass on >= 2 empty
+    // fires and then fail at a metric ok_or_else below with a misleading message.
+    // Count the freezes whose per_cpu_time is non-empty (the input the Counter
+    // delta + spatial folds read) so a cold-cache freeze-rendezvous stall
+    // surfaces THIS coverage diagnostic. The single Step holds FULL, so every
+    // periodic capture is stamped Phase::step(0). periodic_series() is
+    // cache-backed and idempotent, so this composes with the metric accessors.
+    let cpu_captures = result
+        .periodic_series()
+        .iter_samples()
+        .filter(|s| !s.snapshot.per_cpu_time().is_empty())
+        .count();
     ensure!(
-        result.periodic_fired >= 2,
-        "only {} of {} periodic captures fired — need >= 2 in the step bucket \
-         so the IRQ Counter delta (last - first) is measurable; a cold-cache \
-         freeze-rendezvous stall can cut the sequence short",
-        result.periodic_fired,
+        cpu_captures >= 2,
+        "only {cpu_captures} of {} periodic captures carried per-CPU time — need \
+         >= 2 with non-empty per_cpu_time so the IRQ Counter delta (last - first) \
+         is measurable; a cold-cache freeze-rendezvous stall (placeholder/degraded \
+         captures carry no per-CPU time) can cut the data-bearing sequence short",
         result.periodic_target,
     );
 
