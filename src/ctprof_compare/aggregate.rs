@@ -47,6 +47,7 @@ use std::fmt;
 /// scalar — so the numeric is optional and rows without one
 /// fall to the bottom of the default sort.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum Aggregated {
     /// Group-wide sum produced by the
     /// [`super::AggRule::SumCount`] / [`super::AggRule::SumNs`] /
