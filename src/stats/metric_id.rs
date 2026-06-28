@@ -65,7 +65,7 @@ macro_rules! builtin_metrics {
 
 builtin_metrics! {
     // Run-level typed / derived metrics (Gauge / Peak / Counter / Rate /
-    // Distribution / WorstLowest / WakeLatencyTailRatio).
+    // Distribution / WorstLowest / WakeLatencyTailRatio / WorstCrossNodeRatio).
     WorstSpread => "worst_spread",
     WorstGapMs => "worst_gap_ms",
     TotalMigrations => "total_migrations",

@@ -1329,12 +1329,15 @@ pub(crate) fn merge_matched_phase_buckets(a: PhaseBucket, b: PhaseBucket) -> Pha
     let mut keys: std::collections::BTreeSet<&String> = a.metrics.keys().collect();
     keys.extend(b.metrics.keys());
     for key in keys {
-        // Derived metrics (Rate / Distribution / WorstLowest) are NOT merged
+        // Derived metrics (every `is_derived()`: Rate / Distribution / WorstLowest /
+        // WakeLatencyTailRatio / WorstCrossNodeRatio / PerPhase) are NOT merged
         // here: a Rate re-derives from the merged components in the post-pass
-        // below, and Distribution / WorstLowest are re-pooled run-level by
+        // below; the distributional kinds (Distribution / WorstLowest /
+        // WakeLatencyTailRatio / WorstCrossNodeRatio) re-pool run-level by
         // `populate_run_distribution_metrics` (they never appear in
         // phase.metrics — `aggregate_samples_for_phase` returns None — so this
-        // skip is also a structural guard). Folding a ready-made derived value
+        // skip is also a structural guard); PerPhase is re-derived by
+        // `derive_phase_metrics`. Folding a ready-made derived value
         // would lose the re-pool.
         if crate::stats::metric_def(key).is_some_and(|m| m.kind.is_derived()) {
             continue;
@@ -1542,7 +1545,8 @@ fn merge_metric_values(
         Some(MetricKind::Gauge(GaugeAgg::Last)) | Some(MetricKind::Timestamp) => {
             if b_end_ms > a_end_ms { b } else { a }
         }
-        // Derived kinds (Rate / Distribution / WorstLowest) are skipped in
+        // Derived kinds (every `is_derived()`: Rate / Distribution / WorstLowest /
+        // WakeLatencyTailRatio / WorstCrossNodeRatio / PerPhase) are skipped in
         // the merge loop (see `merge_matched_phase_buckets`'s `is_derived`
         // continue) and produced post-merge (`derive_rate_metrics` /
         // `populate_run_distribution_metrics`), so a derived value never
@@ -1552,8 +1556,9 @@ fn merge_metric_values(
         | Some(MetricKind::Distribution { .. })
         | Some(MetricKind::WorstLowest { .. })
         | Some(MetricKind::WakeLatencyTailRatio)
+        | Some(MetricKind::WorstCrossNodeRatio)
         | Some(MetricKind::PerPhase) => unreachable!(
-            "derived metrics (Rate/Distribution/WorstLowest/WakeLatencyTailRatio/PerPhase) are produced post-merge, not merged as values"
+            "derived metrics (Rate/Distribution/WorstLowest/WakeLatencyTailRatio/WorstCrossNodeRatio/PerPhase) are produced post-merge, not merged as values"
         ),
         // Unregistered metric: commutative mean fallback. Sum
         // would over-count Gauge values; max would lose Counter

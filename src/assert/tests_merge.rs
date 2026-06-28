@@ -687,27 +687,24 @@ fn merge_scenario_stats_worst_wins_and_iterations_sum() {
     // fields: each takes the larger value (higher-is-worse max) and
     // `total_iterations` sums. The wake-latency / run-delay roll-ups and the
     // wake-latency tail ratio are no longer merge-folded (they are derived
-    // `MetricKind`s re-pooled post-merge — see the `repool_*` tests); this
-    // covers `worst_spread`, `worst_migration_ratio`, and
-    // `worst_cross_node_migration_ratio`.
+    // `MetricKind`s re-pooled post-merge — see the `repool_*` tests, and
+    // `worst_cross_node_migration_ratio` likewise moved to the post-merge re-pool;
+    // this covers `worst_spread` and `worst_migration_ratio`.
     let mut a = AssertResult::pass();
     a.stats.total_iterations = 100;
     a.stats.worst_spread = 5.0;
     a.stats.worst_migration_ratio = 0.1;
-    a.stats.worst_cross_node_migration_ratio = 0.05;
 
     let mut b = AssertResult::pass();
     b.stats.total_iterations = 400;
     b.stats.worst_spread = 15.0;
     b.stats.worst_migration_ratio = 0.4;
-    b.stats.worst_cross_node_migration_ratio = 0.25;
 
     a.merge(b);
 
     assert_eq!(a.stats.total_iterations, 500);
     assert_eq!(a.stats.worst_spread, 15.0);
     assert_eq!(a.stats.worst_migration_ratio, 0.4);
-    assert_eq!(a.stats.worst_cross_node_migration_ratio, 0.25);
 }
 
 #[test]
@@ -715,16 +712,14 @@ fn merge_scenario_stats_worst_wins_when_other_is_smaller() {
     // Symmetric case: when `other` reports smaller values, `self`
     // retains its larger worst. Covers the "self wins" branch of the
     // merge-folded scalar worst-comparisons: worst_spread,
-    // worst_migration_ratio, worst_cross_node_migration_ratio (all `.max()`)
-    // and the coupled worst_gap_ms/cpu guard. (Wake-latency / run-delay
-    // roll-ups and the wake-latency tail ratio moved to the post-merge
-    // re-pool — see the repool_* tests.)
+    // worst_migration_ratio (both `.max()`) and the coupled worst_gap_ms/cpu
+    // guard. (Wake-latency / run-delay roll-ups, the wake-latency tail ratio, and
+    // both NUMA roll-ups moved to the post-merge re-pool — see the repool_* tests.)
     let mut a = AssertResult::pass();
     a.stats.worst_spread = 30.0;
     a.stats.worst_gap_ms = 500;
     a.stats.worst_gap_cpu = 7;
     a.stats.worst_migration_ratio = 0.9;
-    a.stats.worst_cross_node_migration_ratio = 0.35;
     a.stats.total_iterations = 500;
 
     let mut b = AssertResult::pass();
@@ -732,7 +727,6 @@ fn merge_scenario_stats_worst_wins_when_other_is_smaller() {
     b.stats.worst_gap_ms = 100;
     b.stats.worst_gap_cpu = 3;
     b.stats.worst_migration_ratio = 0.1;
-    b.stats.worst_cross_node_migration_ratio = 0.05;
     b.stats.total_iterations = 50;
 
     a.merge(b);
@@ -743,7 +737,6 @@ fn merge_scenario_stats_worst_wins_when_other_is_smaller() {
     // index when `self` wins on `worst_gap_ms`.
     assert_eq!(a.stats.worst_gap_cpu, 7);
     assert_eq!(a.stats.worst_migration_ratio, 0.9);
-    assert_eq!(a.stats.worst_cross_node_migration_ratio, 0.35);
     // Totals always sum, independent of worst-wins direction.
     assert_eq!(a.stats.total_iterations, 550);
 }
@@ -1498,6 +1491,36 @@ fn merge_kind_enum_exhaustively_covers_metric_kind_variants() {
         .merge_kind(),
         MergeKind::Recompute,
     );
+    // The derived kinds are all Recompute (re-derived post-merge, never folded
+    // from two ready-made values): the per-phase merge loop skips them
+    // (is_derived) and `populate_run_distribution_metrics` / `derive_phase_metrics`
+    // re-pool the value. Pin each so a new derived kind that forgets the Recompute
+    // arm fails here, not silently.
+    assert_eq!(
+        MetricKind::Distribution {
+            source: crate::stats::SampleSource::WakeLatencyNs,
+            reduction: crate::stats::SampleReduction::P99,
+        }
+        .merge_kind(),
+        MergeKind::Recompute,
+    );
+    assert_eq!(
+        MetricKind::WorstLowest {
+            numerator: crate::stats::WorstLowestNumerator::NumaLocal,
+            denominator: crate::stats::WorstLowestDenominator::NumaTotal,
+        }
+        .merge_kind(),
+        MergeKind::Recompute,
+    );
+    assert_eq!(
+        MetricKind::WakeLatencyTailRatio.merge_kind(),
+        MergeKind::Recompute,
+    );
+    assert_eq!(
+        MetricKind::WorstCrossNodeRatio.merge_kind(),
+        MergeKind::Recompute,
+    );
+    assert_eq!(MetricKind::PerPhase.merge_kind(), MergeKind::Recompute);
 }
 
 /// merge_matched_phase_buckets must INCLUDE a synthesized

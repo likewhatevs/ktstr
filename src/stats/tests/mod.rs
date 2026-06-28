@@ -28,7 +28,6 @@ fn make_row(scenario: &str, topo: &str, passed: bool, spread: f64) -> GauntletRo
         fallback_count: 0,
         keep_last_count: 0,
         total_iterations: 0,
-        cross_node_migration_ratio: 0.0,
         ext_metrics: BTreeMap::new(),
         phases: Vec::new(),
     }
@@ -73,7 +72,6 @@ fn make_filter_row(
         fallback_count: 0,
         keep_last_count: 0,
         total_iterations: 0,
-        cross_node_migration_ratio: 0.0,
         ext_metrics: BTreeMap::new(),
         phases: Vec::new(),
     }

@@ -1289,7 +1289,8 @@ fn max_cgroup_irq_pressure_disambiguates_reused_kva_by_serial() {
 /// per-phase aggregator was introduced to fix.
 #[test]
 fn aggregate_samples_for_phase_returns_none_for_derived_kinds() {
-    // Derived kinds (Rate / Distribution / WorstLowest) are `is_derived`,
+    // Derived kinds (every `is_derived()`: Rate / Distribution / WorstLowest /
+    // WakeLatencyTailRatio / WorstCrossNodeRatio / PerPhase) are `is_derived`,
     // merge as Recompute, and have NO per-phase value: returning None keeps
     // them off the single-slice reducers within a run (their value is
     // produced post-merge by derive_rate_metrics /
@@ -1316,6 +1317,9 @@ fn aggregate_samples_for_phase_returns_none_for_derived_kinds() {
             numerator: WorstLowestNumerator::Iterations,
             denominator: WorstLowestDenominator::NumWorkers,
         },
+        MetricKind::WakeLatencyTailRatio,
+        MetricKind::WorstCrossNodeRatio,
+        MetricKind::PerPhase,
     ] {
         assert!(kind.is_derived(), "{kind:?} must be is_derived");
         assert_eq!(kind.merge_kind(), MergeKind::Recompute);
@@ -1621,6 +1625,22 @@ fn every_metric_has_kind_consistent_with_naming() {
                 crate::test_support::Polarity::HigherBetter,
                 "WorstLowest-kind metric {:?} must be HigherBetter \
                      (the lowest-wins fold treats lowest as worst); got {:?}",
+                m.name,
+                m.polarity,
+            );
+        }
+        // WorstCrossNodeRatio re-pools by `populate_run_distribution_metrics`'s
+        // MAX-wins fold (`reduce(f64::max)` over the per-phase NUMA carriers'
+        // per-cgroup churn ratio), which treats the HIGHEST per-cgroup value as
+        // the worst — correct ONLY for LowerBetter metrics (the polarity twin of
+        // the WorstLowest gate above). Enforce it so a future HigherBetter
+        // WorstCrossNodeRatio cannot silently invert the regression signal.
+        if matches!(m.kind, MetricKind::WorstCrossNodeRatio) {
+            assert_eq!(
+                m.polarity,
+                crate::test_support::Polarity::LowerBetter,
+                "WorstCrossNodeRatio-kind metric {:?} must be LowerBetter \
+                     (the highest-wins fold treats highest as worst); got {:?}",
                 m.name,
                 m.polarity,
             );

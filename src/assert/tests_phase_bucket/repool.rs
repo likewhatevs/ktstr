@@ -53,6 +53,7 @@ fn repool_distribution_empty_inserts_no_keys() {
         "worst_iterations_per_cpu_sec",
         "worst_wake_latency_tail_ratio",
         "worst_page_locality",
+        "worst_cross_node_migration_ratio",
     ] {
         assert!(
             !stats.ext_metrics.contains_key(name),
@@ -103,6 +104,135 @@ fn repool_worst_page_locality_from_numa_carriers() {
     assert!(
         !unmeasured.ext_metrics.contains_key("worst_page_locality"),
         "an all-unmeasured cohort must write no worst_page_locality key",
+    );
+}
+
+/// `worst_cross_node_migration_ratio` (WorstCrossNodeRatio) re-pools into
+/// `ext_metrics` from the per-phase NUMA carriers — the polarity twin of
+/// worst_page_locality (MAX-wins, LowerBetter). The HIGHEST per-cgroup
+/// `cross_node_migrated / numa_pages_total` over cgroups that measured NUMA wins;
+/// an all-unmeasured (`numa_pages_total == 0`) cohort writes NO key (absence
+/// preserved). A CHURN ratio (cumulative events / residency snapshot) — can
+/// exceed 1.0.
+#[test]
+fn repool_worst_cross_node_migration_ratio_from_numa_carriers() {
+    let pc = |total: u64, migr: u64| PhaseCgroupStats {
+        numa_pages_total: total,
+        cross_node_migrated: migr,
+        ..PhaseCgroupStats::default()
+    };
+    // cg_a 50/1000 = 0.05; cg_b 150/1000 = 0.15 → the worst (highest) wins.
+    let mut measured = repool_stats(vec![("a", pc(1000, 50)), ("b", pc(1000, 150))], vec![]);
+    populate_run_distribution_metrics(&mut measured);
+    let v = measured
+        .ext_metrics
+        .get("worst_cross_node_migration_ratio")
+        .copied()
+        .expect("measured cohort yields a value");
+    assert!(
+        (v - 0.15).abs() < 1e-9,
+        "highest per-cgroup churn (0.15) wins; got {v}",
+    );
+
+    // CHURN ratio can exceed 1.0 (3000 migrations / 1000 pages = 3.0).
+    let mut churn = repool_stats(vec![("a", pc(1000, 3000))], vec![]);
+    populate_run_distribution_metrics(&mut churn);
+    let c = churn
+        .ext_metrics
+        .get("worst_cross_node_migration_ratio")
+        .copied()
+        .expect("measured");
+    assert!(
+        (c - 3.0).abs() < 1e-9,
+        "churn ratio is unbounded (3.0 > 1.0); got {c}",
+    );
+
+    // Measured residency (total > 0) but zero cross-node migrations → ratio 0.0,
+    // a MEASURED zero (Some(0.0)) — distinct from never-measured None. The max
+    // over the sole measured cgroup's [0.0] is a present 0.0.
+    let mut measured_zero = repool_stats(vec![("a", pc(1000, 0))], vec![]);
+    populate_run_distribution_metrics(&mut measured_zero);
+    assert_eq!(
+        measured_zero
+            .ext_metrics
+            .get("worst_cross_node_migration_ratio")
+            .copied(),
+        Some(0.0),
+        "a measured zero (residency present, no migrations) is Some(0.0), not absent",
+    );
+
+    // All cgroups measured no NUMA pages (total == 0) → no key (loud-absent).
+    let mut unmeasured = repool_stats(vec![("a", pc(0, 0)), ("b", pc(0, 0))], vec![]);
+    populate_run_distribution_metrics(&mut unmeasured);
+    assert!(
+        !unmeasured
+            .ext_metrics
+            .contains_key("worst_cross_node_migration_ratio"),
+        "an all-unmeasured cohort must write no worst_cross_node_migration_ratio key",
+    );
+}
+
+/// Cross-PHASE producer pin: the ext re-pool (not just `run_metric`) gets the
+/// ASYMMETRIC fold — a cgroup measured across TWO phases has its
+/// `cross_node_migrated` SUMMED (per-phase deltas) over the LATEST residency
+/// total (a gauge, NOT summed), matching `numa_agg_per_cgroup`. This is the
+/// multi-phase divergence the migration fixes: the deleted typed `Gauge(Last)`
+/// field could not see the per-phase carriers, so its cross-run value diverged
+/// from `run_metric` here.
+#[test]
+fn repool_worst_cross_node_migration_ratio_sums_migrations_over_latest_total() {
+    let pc = |total: u64, migr: u64| PhaseCgroupStats {
+        numa_pages_total: total,
+        cross_node_migrated: migr,
+        ..PhaseCgroupStats::default()
+    };
+    let phase = |step: u16, name: &str, pc: PhaseCgroupStats| {
+        let mut b = PhaseBucket {
+            step_index: step,
+            ..PhaseBucket::default()
+        };
+        b.per_cgroup.insert(name.to_string(), pc);
+        b
+    };
+    // cgroup A across two phases: migrations 30 + 50 = 80 (per-phase deltas SUM);
+    // residency total takes the LATEST measured (2000, NOT summed 3000, NOT
+    // phase-1's 1000) -> 80 / 2000 = 0.04. Every wrong fold lands elsewhere
+    // (30/1000=0.03, 80/1000=0.08, 80/3000≈0.0267, 50/2000=0.025).
+    let mut stats = ScenarioStats {
+        phases: vec![phase(1, "a", pc(1000, 30)), phase(2, "a", pc(2000, 50))],
+        ..ScenarioStats::default()
+    };
+    populate_run_distribution_metrics(&mut stats);
+    let v = stats
+        .ext_metrics
+        .get("worst_cross_node_migration_ratio")
+        .copied()
+        .expect("a multi-phase carrier yields a value");
+    assert!(
+        (v - 0.04).abs() < 1e-9,
+        "summed migrations 80 / LATEST total 2000 = 0.04 (not summed-total, not \
+         phase-1 total); got {v}",
+    );
+
+    // A later phase that measured NO residency (total == 0) but recorded a
+    // nonzero migration delta: the delta STILL sums (e.2 += is unconditional),
+    // while the total==0 phase does NOT overwrite the latest measured total.
+    // phase1 (total 1000, migr 30) + phase2 (total 0, migr 20) → summed 50 /
+    // LATEST measured total 1000 = 0.05.
+    let mut zero_total_mid = ScenarioStats {
+        phases: vec![phase(1, "a", pc(1000, 30)), phase(2, "a", pc(0, 20))],
+        ..ScenarioStats::default()
+    };
+    populate_run_distribution_metrics(&mut zero_total_mid);
+    let z = zero_total_mid
+        .ext_metrics
+        .get("worst_cross_node_migration_ratio")
+        .copied()
+        .expect("the earlier measured phase keeps the cgroup in the pool");
+    assert!(
+        (z - 0.05).abs() < 1e-9,
+        "a total==0 phase's migration delta still SUMs (30+20=50) over the LATEST \
+         measured total (1000, not 0) = 0.05; got {z}",
     );
 }
 

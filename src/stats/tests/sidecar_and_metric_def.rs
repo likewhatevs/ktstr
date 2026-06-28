@@ -499,9 +499,9 @@ fn sidecar_to_row_no_stall() {
 ///
 /// Covers the `finite_or_zero` call sites in `sidecar_to_row`: the
 /// remaining direct [`ScenarioStats`] f64 fields (worst_spread,
-/// worst_migration_ratio, worst_cross_node_migration_ratio) plus
-/// `imbalance_ratio` from [`MonitorSummary`]. (The wake / run-delay and
-/// `worst_page_locality` roll-ups are now ext_metrics-sourced — non-finite
+/// worst_migration_ratio) plus `imbalance_ratio` from [`MonitorSummary`].
+/// (The wake / run-delay and both NUMA roll-ups — `worst_page_locality`,
+/// `worst_cross_node_migration_ratio` — are now ext_metrics-sourced; non-finite
 /// ext entries are DROPPED, covered by
 /// `sidecar_to_row_drops_non_finite_ext_metrics`.) A missed call site would
 /// leave one assert comparing the non-finite input to 0.0 (NaN != 0.0,
@@ -514,7 +514,6 @@ fn assert_all_direct_f64_fields_sanitized(non_finite: f64) {
         stats: ScenarioStats {
             worst_spread: non_finite,
             worst_migration_ratio: non_finite,
-            worst_cross_node_migration_ratio: non_finite,
             ..Default::default()
         },
         monitor: Some(MonitorSummary {
@@ -528,7 +527,6 @@ fn assert_all_direct_f64_fields_sanitized(non_finite: f64) {
         ("spread", row.spread),
         ("migration_ratio", row.migration_ratio),
         ("imbalance_ratio", row.imbalance_ratio),
-        ("cross_node_migration_ratio", row.cross_node_migration_ratio),
     ] {
         assert_eq!(
             val, 0.0,
@@ -588,8 +586,7 @@ fn sidecar_to_row_preserves_subnormal_f64_in_direct_fields() {
     let sc = test_support::SidecarResult {
         stats: ScenarioStats {
             worst_spread: subnormal,
-            worst_cross_node_migration_ratio: -subnormal,
-            worst_migration_ratio: subnormal,
+            worst_migration_ratio: -subnormal,
             ..Default::default()
         },
         ..test_support::SidecarResult::test_fixture()
@@ -600,12 +597,8 @@ fn sidecar_to_row_preserves_subnormal_f64_in_direct_fields() {
         "positive subnormal must pass through finite_or_zero unchanged",
     );
     assert_eq!(
-        row.cross_node_migration_ratio, -subnormal,
-        "negative subnormal must pass through finite_or_zero unchanged",
-    );
-    assert_eq!(
-        row.migration_ratio, subnormal,
-        "subnormal on a second direct-f64 field must also pass through",
+        row.migration_ratio, -subnormal,
+        "negative subnormal on a second direct-f64 field must also pass through unchanged",
     );
     // Motivation check: subnormals serialize (unlike NaN / ±Inf,
     // serde_json emits them as standard decimal literals).
@@ -634,7 +627,6 @@ fn sidecar_to_row_direct_field_nan_does_not_touch_ext_metrics() {
             // Every remaining direct f64 field non-finite.
             worst_spread: f64::NAN,
             worst_migration_ratio: f64::INFINITY,
-            worst_cross_node_migration_ratio: f64::NEG_INFINITY,
             ext_metrics: ext.clone(),
             ..Default::default()
         },
@@ -645,7 +637,6 @@ fn sidecar_to_row_direct_field_nan_does_not_touch_ext_metrics() {
     // Direct-field collapse still works.
     assert_eq!(row.spread, 0.0);
     assert_eq!(row.migration_ratio, 0.0);
-    assert_eq!(row.cross_node_migration_ratio, 0.0);
 
     // ext_metrics survives unchanged — same length, same keys,
     // same values.
@@ -1071,6 +1062,14 @@ fn distribution_worstlowest_kind_json_shape_pinned() {
     for tok in ["\"NumaLocal\"", "\"NumaTotal\""] {
         assert!(numa.contains(tok), "{tok} missing from {numa}");
     }
+    // worst_cross_node_migration_ratio's kind (a unit variant) — pin the variant
+    // string so a rename trips here, not the CLI output.
+    let xnode = serde_json::to_string(&MetricKind::WorstCrossNodeRatio)
+        .expect("MetricKind serializes");
+    assert!(
+        xnode.contains("WorstCrossNodeRatio"),
+        "WorstCrossNodeRatio missing from {xnode}",
+    );
 }
 
 /// Iteration order of [`list_metrics`] matches [`METRICS`]
@@ -1507,10 +1506,10 @@ fn metric_def_read_named_fields() {
     row.fallback_count = 11;
     row.keep_last_count = 4;
     row.total_iterations = 1000;
-    row.cross_node_migration_ratio = 0.1;
-    // Distribution + WorstLowest (worst_page_locality) roll-ups are
-    // ext_metrics-sourced now (accessor |_| None); read_metric resolves them
-    // via MetricDef::read's ext fallback.
+    // Distribution + WorstLowest + WorstCrossNodeRatio (worst_page_locality,
+    // worst_cross_node_migration_ratio) roll-ups are ext_metrics-sourced now
+    // (accessor |_| None); read_metric resolves them via MetricDef::read's ext
+    // fallback.
     for (name, v) in [
         ("worst_p99_wake_latency_us", 99.0),
         ("worst_median_wake_latency_us", 50.0),
@@ -1518,6 +1517,7 @@ fn metric_def_read_named_fields() {
         ("worst_mean_run_delay_us", 25.0),
         ("worst_run_delay_us", 200.0),
         ("worst_page_locality", 0.8),
+        ("worst_cross_node_migration_ratio", 0.1),
     ] {
         row.ext_metrics.insert(name.to_string(), v);
     }

@@ -504,11 +504,12 @@ struct Accumulator<'a> {
     sum_fallback_count: i64,
     sum_keep_last_count: i64,
     sum_total_iterations: u64,
-    // sum_page_locality removed: page_locality is now an ext-sourced WorstLowest
-    // metric (re-pooled from the per-phase carriers), cross-run-MEAN-folded via
-    // the ext fold like the other migrated worst_* selectors — not a typed
-    // GauntletRow column, so no per-row group-average accumulator.
-    sum_cross_node_mig: f64,
+    // sum_page_locality + sum_cross_node_mig removed: both NUMA roll-ups are now
+    // ext-sourced (worst_page_locality = WorstLowest, worst_cross_node_migration_ratio
+    // = WorstCrossNodeRatio), re-pooled from the per-phase carriers and
+    // cross-run-MEAN-folded via the ext fold like the other migrated worst_*
+    // selectors — not typed GauntletRow columns, so no per-row group-average
+    // accumulators.
     // Per-row MAX-fold for Peak-kind fields. Per
     // `MetricKind::Peak` contract, cross-RUN aggregation
     // surfaces the worst-instant observed across the cohort —
@@ -573,7 +574,6 @@ impl<'a> Accumulator<'a> {
             sum_fallback_count: 0,
             sum_keep_last_count: 0,
             sum_total_iterations: 0,
-            sum_cross_node_mig: 0.0,
             max_gap_ms: 0,
             max_imbalance_ratio: 0.0,
             max_max_dsq_depth: 0,
@@ -648,7 +648,6 @@ impl<'a> Accumulator<'a> {
         self.sum_total_iterations = self
             .sum_total_iterations
             .saturating_add(row.total_iterations);
-        self.sum_cross_node_mig += row.cross_node_migration_ratio;
         // Peak-kind typed fields: cross-RUN aggregation surfaces
         // the worst-instant observed across the cohort, NOT the
         // arithmetic mean (which dilutes a single peak across
@@ -716,12 +715,14 @@ impl<'a> Accumulator<'a> {
             &acc.first.kernel_commit,
         );
         // ext_metrics is built BEFORE the struct so Rate keys can be
-        // re-derived from the folded components as a post-pass. ONLY Rate is
-        // skipped here: its components survive cross-RUN as their own ext keys
-        // so it re-derives Σnum/Σdenom (folding two ready-made ratios would
+        // re-derived from the folded components as a post-pass. Rate and PerPhase
+        // are skipped here: Rate's components survive cross-RUN as their own ext
+        // keys so it re-derives Σnum/Σdenom (folding two ready-made ratios would
         // lose the re-pool, and routing a Rate through
-        // aggregate_samples_weighted would hit the aggregate_finite guard).
-        // Distribution / WorstLowest are NOT skipped — their raw components do
+        // aggregate_samples_weighted would hit the aggregate_finite guard);
+        // PerPhase is a per-phase-only scalar with no cross-RUN aggregate.
+        // Distribution / WorstLowest / WakeLatencyTailRatio / WorstCrossNodeRatio
+        // are NOT skipped — their raw components do
         // NOT survive cross-RUN (phases are dropped), so there is no pooled set
         // to re-derive; they fall through to aggregate_samples_weighted and
         // fold by kind (MEAN for the percentile / CV / mean reductions and
@@ -798,7 +799,6 @@ impl<'a> Accumulator<'a> {
             fallback_count: round_i64(acc.sum_fallback_count),
             keep_last_count: round_i64(acc.sum_keep_last_count),
             total_iterations: round_u64(acc.sum_total_iterations),
-            cross_node_migration_ratio: acc.sum_cross_node_mig / denom,
             ext_metrics,
             // Phase buckets do not aggregate cleanly across an
             // averaged group: two contributors might run different
@@ -825,12 +825,14 @@ impl<'a> Accumulator<'a> {
 }
 
 /// Fold one group's accumulated per-ext-metric (value, weight) pairs
-/// into the aggregated row's `ext_metrics` map. ONLY Rate is skipped
-/// in the kind dispatch: its components survive cross-RUN as their own
-/// ext keys so it re-derives Σnum/Σdenom (folding two ready-made
+/// into the aggregated row's `ext_metrics` map. Rate and PerPhase are
+/// skipped in the kind dispatch: Rate's components survive cross-RUN as
+/// their own ext keys so it re-derives Σnum/Σdenom (folding two ready-made
 /// ratios would lose the re-pool, and routing a Rate through
-/// aggregate_samples_weighted would hit the aggregate_finite guard).
-/// Distribution / WorstLowest are NOT skipped — their raw components do
+/// aggregate_samples_weighted would hit the aggregate_finite guard);
+/// PerPhase is a per-phase-only scalar with no cross-RUN aggregate.
+/// Distribution / WorstLowest / WakeLatencyTailRatio / WorstCrossNodeRatio
+/// are NOT skipped — their raw components do
 /// NOT survive cross-RUN (phases are dropped), so there is no pooled set
 /// to re-derive; they fall through to aggregate_samples_weighted and
 /// fold by kind (MEAN for the percentile / CV / mean reductions and
@@ -1150,10 +1152,6 @@ pub fn sidecar_to_row(sc: &crate::test_support::SidecarResult) -> GauntletRow {
             .map(|e| e.total_dispatch_keep_last)
             .unwrap_or(0),
         total_iterations: sc.stats.total_iterations,
-        cross_node_migration_ratio: finite_or_zero(
-            "cross_node_migration_ratio",
-            sc.stats.worst_cross_node_migration_ratio,
-        ),
         // Built above: in-guest payload ext keys (non-finite values and
         // the walk-truncation sentinel dropped — a dropped non-finite must
         // not be confused with a real 0.0, and the sentinel is JSON-walker

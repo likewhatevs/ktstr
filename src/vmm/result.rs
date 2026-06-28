@@ -925,7 +925,8 @@ impl VmResult {
     /// `system_time_ns`, `user_time_ns`, the IRQ counters/rates, the per-CPU
     /// spatial maxes `max_cpu_hardirqs` / `max_cpu_softirq_net_rx` and their
     /// concentrations), the pooled `iterations_per_cpu_sec`, and the run-level
-    /// `Distribution` / `WorstLowest` / `WakeLatencyTailRatio` re-pools — and for
+    /// `Distribution` / `WorstLowest` / `WakeLatencyTailRatio` / `WorstCrossNodeRatio`
+    /// re-pools — and for
     /// those keys the two accessors return identical values (this one
     /// self-computes pre-merge, the other reads the stored post-merge map).
     ///
@@ -944,10 +945,11 @@ impl VmResult {
     /// `worst_cross_node_migration_ratio`. The dispatch re-derives each from the
     /// carriers (the per-cgroup `stats.cgroups` + the per_cgroup-folded
     /// `stats.phases` this method builds) — `None` when no carrier measured it,
-    /// `Some(0.0)` for a measured zero. All but `worst_page_locality` are
-    /// 0.0-sentinel typed struct fields (re-derived because the field cannot
-    /// carry the measured-vs-unmeasured distinction); `worst_page_locality` has
-    /// no struct field and re-pools purely from the per-phase NUMA carriers.
+    /// `Some(0.0)` for a measured zero. The 5 non-NUMA metrics are 0.0-sentinel
+    /// typed struct fields (re-derived because the field cannot carry the
+    /// measured-vs-unmeasured distinction); the two NUMA roll-ups
+    /// (`worst_page_locality`, `worst_cross_node_migration_ratio`) have no struct
+    /// field and re-pool purely from the per-phase NUMA carriers.
     ///
     /// NOT resolved here:
     /// - the typed-backed monitor run-level metrics (`max_imbalance_ratio`,

@@ -561,9 +561,11 @@ impl AssertResult {
         // post-merge from the per-cgroup raw samples by
         // `populate_run_distribution_metrics` (the pooled-distribution
         // percentile, not a max of per-cgroup reductions).
-        s.worst_cross_node_migration_ratio = s
-            .worst_cross_node_migration_ratio
-            .max(o.worst_cross_node_migration_ratio);
+        // worst_cross_node_migration_ratio is no longer folded here: it is
+        // `MetricKind::WorstCrossNodeRatio`, re-pooled post-merge by
+        // `populate_run_distribution_metrics` from the per-phase NUMA carriers
+        // (the MAX per-cgroup churn ratio over the latest residency total), so the
+        // sidecar value agrees with run_metric's re-derivation.
         // worst_wake_latency_tail_ratio is no longer folded here: it is
         // `MetricKind::WakeLatencyTailRatio`, re-selected post-merge by
         // `populate_run_distribution_metrics` (the max over the merged

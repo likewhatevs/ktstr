@@ -31,11 +31,20 @@ pub struct ScenarioStats {
     // `run_metric`. The deleted typed field folded via `fold_lowest_nonzero`,
     // which SKIPPED a measured 0.0 and reported a better-than-worst cross-run
     // value; the ext re-pool fixes both the field and the read surfaces at once.
-    /// Worst cross-node migration ratio across cgroups (highest). A CHURN ratio —
-    /// cumulative cross-node migration EVENTS / final-snapshot resident pages — so
-    /// it can exceed 1.0 under heavy re-migration (a page migrates more than once);
-    /// NOT a bounded `[0,1]` fraction.
-    pub worst_cross_node_migration_ratio: f64,
+    // worst_cross_node_migration_ratio is NO LONGER a typed field: it is
+    // `crate::stats::MetricKind::WorstCrossNodeRatio`, re-pooled post-merge by
+    // `populate_run_distribution_metrics` from the per-phase NUMA carriers (the
+    // MAX per-cgroup cross-node churn ratio over the latest residency total) via
+    // the `worst_cross_node_migration_ratio` method shared with `run_metric`. The
+    // deleted typed `Gauge(Last)` field/GauntletRow column was merge-max-folded
+    // within-run but cross-run averaged each run's value over `passes_observed`
+    // (folding a NUMA-less passing run's 0.0 sentinel into the mean), AND
+    // diverged from `run_metric` (which already re-derived from the per-phase
+    // carriers) — so the sidecar and the in-test read gave different values on
+    // multi-phase runs. The ext re-pool writes no key for a never-measured run,
+    // so the MEAN divides only by runs that measured NUMA. A CHURN ratio
+    // (cumulative migration EVENTS / final-snapshot resident pages), so it can
+    // exceed 1.0; NOT a bounded `[0,1]` fraction.
     // worst_wake_latency_tail_ratio is NO LONGER a typed field: it is
     // `crate::stats::MetricKind::WakeLatencyTailRatio`, re-selected into
     // `ext_metrics` post-merge by `populate_run_distribution_metrics` (max
@@ -287,11 +296,12 @@ impl ScenarioStats {
     /// `worst_cross_node_migration_ratio`. The dispatch RE-DERIVES each from the
     /// per-cgroup (`self.cgroups`) / per-phase (`self.phases[].per_cgroup`, the
     /// NUMA metrics) carriers — `None` when no carrier measured it, `Some(0.0)`
-    /// for a measured zero — preserving the sentinel-free contract. All but
-    /// `worst_page_locality` are 0.0-sentinel typed struct fields (a not-measured
+    /// for a measured zero — preserving the sentinel-free contract. The 5
+    /// non-NUMA metrics are 0.0-sentinel typed struct fields (a not-measured
     /// carrier coerces to 0.0, indistinguishable from a measured zero, so the
-    /// re-derivation recovers the distinction); `worst_page_locality` has no
-    /// struct field and re-pools purely from the per-phase NUMA carriers.
+    /// re-derivation recovers the distinction); the two NUMA roll-ups
+    /// (`worst_page_locality`, `worst_cross_node_migration_ratio`) have no struct
+    /// field and re-pool purely from the per-phase NUMA carriers.
     /// (`worst_wake_latency_tail_ratio` resolves via the ext lookup as the
     /// `WakeLatencyTailRatio` key.)
     ///
@@ -333,14 +343,19 @@ impl ScenarioStats {
     /// sentinel id but no contributing carrier exists (loud-absent). `Some(Some(v))`
     /// for the re-derived value (a measured zero stays `Some(0.0)`).
     ///
-    /// The 5 non-NUMA fields source from `self.cgroups`, whose `Option` / counter
-    /// carriers preserve the measured-vs-unmeasured state. The 2 NUMA fields
-    /// (`worst_page_locality`, `worst_cross_node_migration_ratio`) source from
-    /// `self.phases[].per_cgroup`: `page_locality` is structurally 0.0 on the
-    /// `cgroup_stats` path (no expected-node set), so `self.cgroups` cannot
-    /// source it — the real residency lives in the per-phase `PhaseCgroupStats`
-    /// NUMA counters. On a phase-less direct-assertion `AssertResult` (no NUMA
-    /// capture) both NUMA fields read `None` (correct loud-absent).
+    /// The 5 non-NUMA metrics source from `self.cgroups`, whose `Option` / counter
+    /// carriers preserve the measured-vs-unmeasured state. The 2 NUMA roll-ups
+    /// (`worst_page_locality`, `worst_cross_node_migration_ratio` — neither a
+    /// struct field) source from `self.phases[].per_cgroup`, for different
+    /// reasons: `page_locality` is structurally 0.0 on the `cgroup_stats` path
+    /// (it needs an expected-node set the reports-only builder lacks), so
+    /// `self.cgroups` cannot source it; `cross_node_migration_ratio` IS populated
+    /// on `cgroup_stats`, but only as a single pre-folded scalar that cannot carry
+    /// the cross-phase fold (SUM the per-phase migration-counter deltas over the
+    /// LATEST residency total), so it too re-pools from the per-phase
+    /// `PhaseCgroupStats` NUMA counters — which also single-sources it with the
+    /// ext/sidecar value. On a phase-less direct-assertion `AssertResult` (no NUMA
+    /// capture) both NUMA roll-ups read `None` (correct loud-absent).
     fn typed_sentinel_metric(&self, m: crate::stats::BuiltinMetric) -> Option<Option<f64>> {
         use crate::stats::BuiltinMetric as B;
         Some(match m {
@@ -378,16 +393,11 @@ impl ScenarioStats {
             // the cross-run comparison value agree (the same fix replaces the
             // fold_lowest_nonzero sentinel-skip on BOTH surfaces).
             B::WorstPageLocality => self.worst_page_locality(),
-            // worst_cross_node_migration_ratio: highest cross-node ratio over
-            // cgroups that measured NUMA. Sourced from the per-phase carriers.
-            B::WorstCrossNodeMigrationRatio => self
-                .numa_agg_per_cgroup()
-                .into_iter()
-                .filter(|&(_, total, _)| total > 0)
-                .map(|(_, total, migrated)| {
-                    super::reductions::cross_node_migration_ratio_of(migrated, total)
-                })
-                .reduce(f64::max),
+            // worst_cross_node_migration_ratio: highest cross-node churn ratio over
+            // cgroups that measured NUMA. Shared with the ext/sidecar re-pool via
+            // worst_cross_node_migration_ratio() so the typed read and the cross-run
+            // comparison value agree (the divergence the typed field had).
+            B::WorstCrossNodeMigrationRatio => self.worst_cross_node_migration_ratio(),
             _ => return None,
         })
     }
@@ -446,6 +456,25 @@ impl ScenarioStats {
             .filter(|&(_, total, _)| total > 0)
             .map(|(local, total, _)| super::reductions::page_locality_of(local, total))
             .reduce(f64::min)
+    }
+
+    /// The run-level WORST (highest) per-cgroup cross-node migration-churn ratio,
+    /// re-pooled from the per-phase NUMA carriers: the MAX
+    /// `cross_node_migration_ratio_of(summed_migrated, latest_total)` over cgroups
+    /// that measured NUMA residency (`numa_pages_total > 0`) — an all-unmeasured
+    /// cohort yields `None`. The polarity twin of `worst_page_locality` (LowerBetter
+    /// → highest-wins). Shared by `run_metric`'s `WorstCrossNodeMigrationRatio`
+    /// dispatch AND `populate_run_distribution_metrics`'s ext/sidecar re-pool so the
+    /// typed read and the cross-run comparison value are byte-identical (the typed
+    /// `Gauge(Last)` field diverged from this on multi-phase runs).
+    fn worst_cross_node_migration_ratio(&self) -> Option<f64> {
+        self.numa_agg_per_cgroup()
+            .into_iter()
+            .filter(|&(_, total, _)| total > 0)
+            .map(|(_, total, migrated)| {
+                super::reductions::cross_node_migration_ratio_of(migrated, total)
+            })
+            .reduce(f64::max)
     }
 }
 
@@ -533,12 +562,15 @@ pub fn populate_run_ext_metrics_from_phases(
         let Some(def) = crate::stats::metric_def(key) else {
             continue;
         };
-        // Derived metrics (Rate / Distribution / WorstLowest) are produced
+        // Derived metrics (every `is_derived()`: Rate / Distribution / WorstLowest /
+        // WakeLatencyTailRatio / WorstCrossNodeRatio / PerPhase) are produced
         // from their pooled components, not folded as per-phase values: skip
         // here. A Rate re-derives after the loop (Σnum/Σdenom over the folded
-        // components); Distribution / WorstLowest are re-pooled run-level by
+        // components); the distributional kinds (Distribution / WorstLowest /
+        // WakeLatencyTailRatio / WorstCrossNodeRatio) are re-pooled run-level by
         // `populate_run_distribution_metrics` (and never appear in
-        // phase.metrics anyway). Folding a ready-made derived value would lose
+        // phase.metrics anyway); PerPhase is re-derived by `derive_phase_metrics`.
+        // Folding a ready-made derived value would lose
         // the re-pool, and routing one into aggregate_samples_weighted within
         // a run is not its producer path.
         if def.kind.is_derived() {
@@ -615,8 +647,8 @@ pub fn populate_run_ext_metrics_from_phases(
 /// 3. [`populate_run_pooled_iterations_per_cpu_sec`] — the pooled cross-cgroup
 ///    `iterations_per_cpu_sec` Rate (from `stats.cgroups`).
 /// 4. [`populate_run_distribution_metrics`] — the `Distribution` / `WorstLowest`
-///    / `WakeLatencyTailRatio` re-pools (from `stats.phases[].per_cgroup` raw
-///    samples + `stats.cgroups`).
+///    / `WakeLatencyTailRatio` / `WorstCrossNodeRatio` re-pools (from
+///    `stats.phases[].per_cgroup` raw samples + `stats.cgroups`).
 ///
 /// ORDER IS LOAD-BEARING: step 1 must precede step 2 so the whole-run wall +
 /// whole-run IRQ-counter deltas land before step 2's `contains_key` skip (the
@@ -713,8 +745,9 @@ pub fn populate_run_pooled_iterations_per_cpu_sec(stats: &mut ScenarioStats) {
 }
 
 /// Populate run-level DERIVED distributional metrics into
-/// `stats.ext_metrics`: every registered `MetricKind::Distribution`
-/// and `MetricKind::WorstLowest`. This is the SOLE
+/// `stats.ext_metrics`: every registered `MetricKind::Distribution`,
+/// `MetricKind::WorstLowest`, `MetricKind::WakeLatencyTailRatio`, and
+/// `MetricKind::WorstCrossNodeRatio`. This is the SOLE
 /// within-run producer of those metrics' values — they carry no per-phase
 /// sample slice and no cross-cgroup merge fold, and their registry accessors
 /// are `|_| None`, so `MetricDef::read` reads the value
@@ -927,6 +960,17 @@ pub fn populate_run_distribution_metrics(stats: &mut ScenarioStats) {
         stats
             .ext_metrics
             .insert("worst_page_locality".to_string(), v);
+    }
+    // worst_cross_node_migration_ratio (WorstCrossNodeRatio) re-pools from the same
+    // per-phase NUMA carriers — the MAX per-cgroup churn ratio over the latest
+    // residency total — single-sourced with run_metric's WorstCrossNodeMigrationRatio
+    // via worst_cross_node_migration_ratio(); an all-unmeasured cohort writes no key
+    // (absence preserved). Not handled by the _from helper above (it has only
+    // stats.cgroups, and the metric is excluded from that filter).
+    if let Some(v) = stats.worst_cross_node_migration_ratio() {
+        stats
+            .ext_metrics
+            .insert("worst_cross_node_migration_ratio".to_string(), v);
     }
 }
 

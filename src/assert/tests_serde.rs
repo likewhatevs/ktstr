@@ -315,16 +315,15 @@ fn scenario_stats_missing_required_scalar_rejected_by_deserialize() {
         "worst_gap_cpu",
         "worst_migration_ratio",
         "total_iterations",
-        "worst_cross_node_migration_ratio",
         // The wake / run-delay (worst_p99/median/cv, worst_mean_run_delay_us,
         // worst_run_delay_us), iteration-efficiency
-        // (worst_iterations_per_worker/_per_cpu_sec), page-locality
-        // (worst_page_locality), and wake-latency tail-ratio
-        // (worst_wake_latency_tail_ratio) roll-ups are intentionally
-        // omitted: they are no longer typed ScenarioStats fields — they are
-        // `MetricKind::Distribution` / `WorstLowest` / `WakeLatencyTailRatio`
-        // metrics re-pooled into `ext_metrics` post-merge by
-        // `populate_run_distribution_metrics`.
+        // (worst_iterations_per_worker/_per_cpu_sec), both NUMA roll-ups
+        // (worst_page_locality, worst_cross_node_migration_ratio), and
+        // wake-latency tail-ratio (worst_wake_latency_tail_ratio) roll-ups are
+        // intentionally omitted: they are no longer typed ScenarioStats fields —
+        // they are `MetricKind::Distribution` / `WorstLowest` /
+        // `WorstCrossNodeRatio` / `WakeLatencyTailRatio` metrics re-pooled into
+        // `ext_metrics` post-merge by `populate_run_distribution_metrics`.
         "ext_metrics",
     ];
 

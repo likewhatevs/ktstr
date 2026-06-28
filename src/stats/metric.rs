@@ -290,6 +290,32 @@ pub enum MetricKind {
     /// the deleted typed cross-RUN fold summed every passing run's raw ratio
     /// over `passes_observed`, folding noisy low-N runs in as real values).
     WakeLatencyTailRatio,
+    /// Derived WORST-CGROUP cross-node migration-churn selector — the highest
+    /// per-cgroup `cross_node_migrated / numa_pages_total` ratio across the run.
+    /// LowerBetter (more cross-node migration is worse), so "worst" is the MAX
+    /// over cgroups — the polarity twin of `worst_page_locality`
+    /// ([`MetricKind::WorstLowest`] `NumaLocal`/`NumaTotal`, lowest-wins), sharing
+    /// the same per-phase NUMA carriers and the `numa_agg_per_cgroup` helper.
+    /// Re-pooled post-merge by
+    /// `crate::assert::populate_run_distribution_metrics` from
+    /// `stats.phases[].per_cgroup`: the cross-phase fold SUMs the per-phase
+    /// migration-counter deltas over the LATEST residency total
+    /// (`cross_node_migration_ratio_of(summed_migrated, latest_total)`), then
+    /// MAXes across cgroups that measured NUMA residency (`numa_pages_total > 0`);
+    /// a never-measured cohort yields no key (absence preserved as a missing ext
+    /// entry, never a `0.0`). A CHURN ratio (cumulative migration EVENTS over a
+    /// residency SNAPSHOT) — can legitimately exceed 1.0, NOT a bounded `[0,1]`
+    /// fraction. A dedicated max-selector like [`MetricKind::WakeLatencyTailRatio`]
+    /// (no generic numerator/denominator), since cross_node is the sole max-wins
+    /// phase-carrier ratio. Like the other derived kinds it is
+    /// [`MetricKind::is_derived`] (skipped at the within-run reducers) and
+    /// CROSS-RUN MEAN-folds through [`aggregate_finite`] over the runs that
+    /// EMITTED the key — the cohort's typical worst-cgroup churn. The deleted
+    /// typed `Gauge(Last)` field instead averaged its value over
+    /// `passes_observed`, folding a NUMA-less passing run's `0.0` sentinel into
+    /// the mean (dilution); the ext re-pool writes no key for a never-measured
+    /// run (absence preserved), so it never enters the divisor.
+    WorstCrossNodeRatio,
     /// Per-phase-only scalar derived ONCE per phase from a phase-scoped
     /// carrier, NOT from monitor samples and NOT re-pooled run-level. The sole
     /// producer is [`crate::assert::derive_phase_metrics`], which derives two
@@ -484,13 +510,16 @@ pub enum MergeKind {
     /// bucket has the later `end_ms`; ties keep `self`.
     NonCommutative,
     /// The value is DERIVED post-merge from pooled components, never folded
-    /// from two already-reduced values. Covers all three
-    /// [`MetricKind::is_derived`] kinds:
+    /// from two already-reduced values. Covers every
+    /// [`MetricKind::is_derived`] kind:
     /// - [`MetricKind::Rate`]: re-derived as `Σnumerator / Σdenominator` from
     ///   its component keys by [`derive_rate_metrics`];
-    /// - [`MetricKind::Distribution`] / [`MetricKind::WorstLowest`]: re-pooled
-    ///   from the raw per-cgroup samples / counters by
-    ///   `crate::assert::populate_run_distribution_metrics`.
+    /// - [`MetricKind::Distribution`] / [`MetricKind::WorstLowest`] /
+    ///   [`MetricKind::WakeLatencyTailRatio`] / [`MetricKind::WorstCrossNodeRatio`]:
+    ///   re-pooled post-merge by
+    ///   `crate::assert::populate_run_distribution_metrics`;
+    /// - [`MetricKind::PerPhase`]: re-derived per phase by
+    ///   `crate::assert::derive_phase_metrics`.
     ///
     /// The per-metric merge loop skips these derived keys entirely and the
     /// post-pass produces them, so this variant is classification metadata: no
@@ -535,6 +564,11 @@ impl MetricKind {
             // skips and re-derives it — classification-only, like the other
             // derived kinds.
             MetricKind::WakeLatencyTailRatio => MergeKind::Recompute,
+            // Worst-cgroup cross-node migration churn: derived post-merge by
+            // `populate_run_distribution_metrics` (max over the per-phase NUMA
+            // carriers' per-cgroup churn ratio), so the per-phase merge loop skips
+            // and re-derives it — classification-only, like the other derived kinds.
+            MetricKind::WorstCrossNodeRatio => MergeKind::Recompute,
             // PerPhase is derived post-merge by `derive_phase_metrics` (schbench
             // scalars into PhaseBucket.metrics + PhaseCgroupStats::metrics;
             // non-schbench carrier scalars into PhaseCgroupStats::metrics only);
@@ -548,9 +582,10 @@ impl MetricKind {
     /// reduced from its own per-phase sample slice: [`MetricKind::Rate`]
     /// (from numerator/denominator components), [`MetricKind::Distribution`]
     /// (re-pooled from the per-cgroup raw sample sets), [`MetricKind::WorstLowest`]
-    /// (lowest-wins over per-cgroup counters), and
+    /// (lowest-wins over per-cgroup counters),
     /// [`MetricKind::WakeLatencyTailRatio`] (max over the per-cgroup p99/median
-    /// wake-latency ratios, floor-gated).
+    /// wake-latency ratios, floor-gated), and [`MetricKind::WorstCrossNodeRatio`]
+    /// (max over the per-cgroup cross-node migration-churn ratios).
     ///
     /// Drives the WITHIN-RUN skip-sites that must not reduce a derived kind
     /// from a slice: [`aggregate_samples_for_phase`] returns None, and the
@@ -565,9 +600,10 @@ impl MetricKind {
     /// cross-RUN so it re-derives there, and PerPhase is a per-phase-only
     /// scalar with no meaningful cross-RUN aggregate (its skip also keeps
     /// [`aggregate_finite`]'s `PerPhase => unreachable!` unreachable) — while
-    /// Distribution / WorstLowest / WakeLatencyTailRatio, whose components do
-    /// NOT survive cross-RUN, fall through to be plainly folded (MEAN, or MAX for
-    /// [`SampleReduction::Worst`]) by [`aggregate_finite`]. So callers
+    /// Distribution / WorstLowest / WakeLatencyTailRatio / WorstCrossNodeRatio,
+    /// whose components do NOT survive cross-RUN, fall through to be plainly
+    /// folded (MEAN, or MAX for [`SampleReduction::Worst`]) by
+    /// [`aggregate_finite`]. So callers
     /// gate on `is_derived` for the within-run sites and on
     /// `matches!(.., Rate { .. } | PerPhase)` for the cross-RUN ext fold.
     pub fn is_derived(self) -> bool {
@@ -577,6 +613,7 @@ impl MetricKind {
                 | MetricKind::Distribution { .. }
                 | MetricKind::WorstLowest { .. }
                 | MetricKind::WakeLatencyTailRatio
+                | MetricKind::WorstCrossNodeRatio
                 | MetricKind::PerPhase
         )
     }
@@ -675,7 +712,7 @@ fn aggregate_finite(
         // Distribution Worst (peak run-delay): the cross-RUN fold is MAX
         // so the high-water peak survives, distinct from the MEAN-folded
         // percentile / CV / mean reductions below. (WITHIN-RUN no
-        // Distribution/WorstLowest reaches here — `is_derived` skips them at
+        // derived kind reaches here — `is_derived` skips every one at
         // the per-phase reducers; this arm only fires at the cross-RUN ext
         // fold in `group_and_average_by`.) Matched before the general
         // `Distribution { .. }` mean arm so Worst takes MAX, not MEAN.
@@ -725,7 +762,8 @@ fn aggregate_finite(
         // exactly. See [`MetricKind::Distribution`].
         MetricKind::Distribution { .. }
         | MetricKind::WorstLowest { .. }
-        | MetricKind::WakeLatencyTailRatio => finite.iter().sum::<f64>() / (finite.len() as f64),
+        | MetricKind::WakeLatencyTailRatio
+        | MetricKind::WorstCrossNodeRatio => finite.iter().sum::<f64>() / (finite.len() as f64),
         MetricKind::Gauge(GaugeAgg::Avg) => {
             // Weighted mean: sum(v * w) / sum(w). Uniform-weight
             // callers (aggregate_samples) reduce to arithmetic
@@ -815,7 +853,8 @@ fn aggregate_finite(
 pub fn aggregate_samples_for_phase(metric: &MetricDef, samples: &[f64]) -> Option<f64> {
     match metric.kind {
         MetricKind::Counter => phase_counter_delta(samples),
-        // Derived kinds (Rate / Distribution / WorstLowest) have no samples
+        // Derived kinds (every `is_derived()`: Rate / Distribution / WorstLowest /
+        // WakeLatencyTailRatio / WorstCrossNodeRatio / PerPhase) have no samples
         // of their own: their value is produced by a post-pass
         // (`derive_rate_metrics` / `crate::assert::populate_run_distribution_metrics`)
         // from pooled components, not reduced from a per-phase slice. Return
@@ -1226,7 +1265,7 @@ impl MetricDef {
 /// match each other, but diverge from the registry name where
 /// the domain-level wording adds context (`worst_*`, `total_*`,
 /// `max_*`) that would be noise on an already-qualified field.
-/// Ten divergent triples:
+/// Nine divergent triples:
 ///
 /// | Registry (`MetricDef.name`) | `GauntletRow` field | DataFrame column |
 /// |---|---|---|
@@ -1239,21 +1278,21 @@ impl MetricDef {
 /// | `stuck_count` | `stuck_count` | `stuck` |
 /// | `total_fallback` | `fallback_count` | `fallback` |
 /// | `total_keep_last` | `keep_last_count` | `keep_last` |
-/// | `worst_cross_node_migration_ratio` | `cross_node_migration_ratio` | `cross_node_migration_ratio` |
 ///
 /// One of the remaining metrics in [`METRICS`] has matching
 /// registry / field / DataFrame column names backed by a typed
 /// `GauntletRow` field (`total_iterations`) and is not listed — no
 /// translation to document.
 ///
-/// The nine wake-latency / run-delay / iteration-efficiency / page-locality
-/// roll-ups (`worst_p99_wake_latency_us`, `worst_median_wake_latency_us`,
+/// The ten wake-latency / run-delay / iteration-efficiency / NUMA roll-ups
+/// (`worst_p99_wake_latency_us`, `worst_median_wake_latency_us`,
 /// `worst_wake_latency_cv`, `worst_mean_run_delay_us`,
 /// `worst_run_delay_us`, `worst_iterations_per_worker`,
 /// `worst_iterations_per_cpu_sec`, `worst_wake_latency_tail_ratio`,
-/// `worst_page_locality`) are
+/// `worst_page_locality`, `worst_cross_node_migration_ratio`) are
 /// DERIVED kinds ([`MetricKind::Distribution`] / [`MetricKind::WorstLowest`]
-/// / [`MetricKind::WakeLatencyTailRatio`]) with NO typed `GauntletRow`
+/// / [`MetricKind::WakeLatencyTailRatio`] / [`MetricKind::WorstCrossNodeRatio`])
+/// with NO typed `GauntletRow`
 /// field: their accessors are `|_| None` and
 /// `crate::assert::populate_run_distribution_metrics` re-pools their value
 /// into `ext_metrics` post-merge, so [`MetricDef::read`] reads them through
@@ -1261,8 +1300,9 @@ impl MetricDef {
 ///
 /// `worst_` naming convention: it is the codebase-wide prefix for a
 /// cross-cgroup roll-up, independent of polarity and of HOW the roll-up is
-/// formed. Polarity-directional selectors (`worst_spread` LowerBetter →
-/// max) and [`MetricKind::WorstLowest`] (`worst_page_locality` +
+/// formed. Polarity-directional selectors (`worst_spread`, and the derived
+/// `worst_cross_node_migration_ratio`, both LowerBetter → max) and
+/// [`MetricKind::WorstLowest`] (`worst_page_locality` +
 /// `worst_iterations_per_*`, None-aware lowest-wins where a measured 0.0
 /// wins) both surface the most problematic cgroup; whereas
 /// [`MetricKind::Distribution`] (`worst_p99_wake_latency_us` etc.) is the
@@ -2508,13 +2548,23 @@ pub static METRICS: &[MetricDef] = &[
         accessor: |_| None,
     },
     MetricDef {
+        // The WORST (highest) per-cgroup cross-node migration-churn ratio across
+        // the run. LowerBetter, so highest-wins = worst — a WorstCrossNodeRatio
+        // max-selector re-pooled post-merge from the per-phase NUMA carriers
+        // (assert::populate_run_distribution_metrics, numa_agg_per_cgroup) — NOT a
+        // typed field: the prior typed Gauge(Last) field/GauntletRow column was
+        // merge-max-folded within-run but cross-run averaged each run's value over
+        // passes_observed (folding a NUMA-less run's 0.0 sentinel in), AND diverged
+        // from run_metric (which already re-derived from the per-phase carriers), so
+        // the sidecar and the in-test read gave different values on multi-phase
+        // runs. accessor None: ext-sourced.
         name: "worst_cross_node_migration_ratio",
         polarity: crate::test_support::Polarity::LowerBetter,
-        kind: MetricKind::Gauge(GaugeAgg::Last),
+        kind: MetricKind::WorstCrossNodeRatio,
         default_abs: 0.05,
         default_rel: 0.20,
         display_unit: "",
-        accessor: |r| Some(r.cross_node_migration_ratio),
+        accessor: |_| None,
     },
     // -- schbench per-phase metrics (MetricKind::PerPhase) --
     // Derived ONCE per phase by `crate::assert::derive_phase_metrics`

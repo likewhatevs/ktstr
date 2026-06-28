@@ -661,18 +661,19 @@ pub(crate) fn step_per_cgroup_bucket(
 /// Roll a single cgroup's [`CgroupStats`] up into a one-cgroup
 /// [`ScenarioStats`]. The KEPT typed `worst_*` fields carry this cgroup's
 /// values and fold across cgroups in [`AssertResult::merge`] by max (all are
-/// higher-is-worse): `worst_spread`, `worst_migration_ratio`,
-/// `worst_cross_node_migration_ratio`, and the coupled `worst_gap_ms` /
-/// `worst_gap_cpu`. The `worst_page_locality` roll-up, the wake-latency /
-/// run-delay distributions, the iteration efficiencies, and the
-/// wake-latency tail ratio are NOT carried here — they have no typed field
-/// and re-pool run-level POST-merge in [`populate_run_distribution_metrics`]:
-/// `worst_page_locality` re-pools None-aware from `stats.phases[].per_cgroup`
-/// NUMA carriers (lowest per-cgroup locality, a measured 0.0 winning the
-/// lowest rather than being skipped as a sentinel), the tail ratio is the max
-/// over the per-cgroup `CgroupStats::wake_latency_tail_ratio`, and the
-/// distributions / efficiencies pool from `stats.phases[].per_cgroup` /
-/// `stats.cgroups`.
+/// higher-is-worse): `worst_spread`, `worst_migration_ratio`, and the coupled
+/// `worst_gap_ms` / `worst_gap_cpu`. The two NUMA roll-ups
+/// (`worst_page_locality`, `worst_cross_node_migration_ratio`), the wake-latency
+/// / run-delay distributions, the iteration efficiencies, and the wake-latency
+/// tail ratio are NOT carried here — they have no typed field and re-pool
+/// run-level POST-merge in [`populate_run_distribution_metrics`]:
+/// `worst_page_locality` (WorstLowest) re-pools None-aware from
+/// `stats.phases[].per_cgroup` NUMA carriers (lowest per-cgroup locality, a
+/// measured 0.0 winning the lowest rather than being skipped as a sentinel),
+/// `worst_cross_node_migration_ratio` (WorstCrossNodeRatio) re-pools the MAX
+/// per-cgroup churn ratio from the same carriers, the tail ratio is the max over
+/// the per-cgroup `CgroupStats::wake_latency_tail_ratio`, and the distributions /
+/// efficiencies pool from `stats.phases[].per_cgroup` / `stats.cgroups`.
 /// `cgroups` carries exactly this one entry so merge appends one per
 /// handle without double-counting.
 pub(crate) fn scenario_stats_for_cgroup(cg: &CgroupStats) -> ScenarioStats {
@@ -689,10 +690,13 @@ pub(crate) fn scenario_stats_for_cgroup(cg: &CgroupStats) -> ScenarioStats {
         worst_gap_cpu: cg.max_gap_cpu,
         worst_migration_ratio: cg.migration_ratio,
         total_iterations: cg.total_iterations,
-        // worst_page_locality is no longer a typed field — it re-pools from the
-        // per-phase NUMA carriers in populate_run_distribution_metrics (the
-        // reports-only cg.page_locality is structurally 0.0 here anyway).
-        worst_cross_node_migration_ratio: cg.cross_node_migration_ratio,
+        // worst_page_locality and worst_cross_node_migration_ratio are no longer
+        // typed fields — both re-pool from the per-phase NUMA carriers in
+        // populate_run_distribution_metrics. cg.page_locality is structurally 0.0
+        // here (it needs an expected-node set this reports-only builder lacks);
+        // cg.cross_node_migration_ratio IS populated but is a single pre-folded
+        // scalar that cannot carry the cross-phase SUM-migrated / LATEST-total
+        // fold, so the per-phase carriers own both.
         ext_metrics: cg.ext_metrics.clone(),
         cgroups: vec![cg.clone()],
         phases: Vec::new(),
