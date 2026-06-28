@@ -710,7 +710,11 @@ fn push_scalar_findings(
                 FindingKind::Informational
             }
             Some(higher_is_worse) => {
-                let is_regression = if higher_is_worse { delta > 0.0 } else { delta < 0.0 };
+                let is_regression = if higher_is_worse {
+                    delta > 0.0
+                } else {
+                    delta < 0.0
+                };
                 if is_regression {
                     report.regressions += 1;
                     FindingKind::Regression
@@ -1709,11 +1713,17 @@ pub(crate) struct NoiseReport {
 impl NoiseReport {
     /// Confident regressions — the gate's exit basis.
     pub fn regressions(&self) -> usize {
-        self.findings.iter().filter(|f| f.kind == NoiseKind::Regression).count()
+        self.findings
+            .iter()
+            .filter(|f| f.kind == NoiseKind::Regression)
+            .count()
     }
     /// Metrics flagged too noisy to trust.
     pub fn noisy(&self) -> usize {
-        self.findings.iter().filter(|f| f.kind == NoiseKind::Noisy).count()
+        self.findings
+            .iter()
+            .filter(|f| f.kind == NoiseKind::Noisy)
+            .count()
     }
 }
 
@@ -1735,7 +1745,10 @@ pub(crate) fn noise_findings(
     let group = |rows: &[GauntletRow]| {
         let mut by_key: BTreeMap<PairingKey, Vec<GauntletRow>> = BTreeMap::new();
         for r in rows {
-            by_key.entry(PairingKey::from_row(r, pairing_dims)).or_default().push(r.clone());
+            by_key
+                .entry(PairingKey::from_row(r, pairing_dims))
+                .or_default()
+                .push(r.clone());
         }
         by_key
     };
@@ -1745,7 +1758,9 @@ pub(crate) fn noise_findings(
     let mut findings = Vec::new();
     let mut paired_scenarios = 0usize;
     for (key, a_rows) in &a_by_key {
-        let Some(b_rows) = b_by_key.get(key) else { continue };
+        let Some(b_rows) = b_by_key.get(key) else {
+            continue;
+        };
         paired_scenarios += 1;
         let scenario = a_rows[0].scenario.clone();
         for m in METRICS {
@@ -1778,16 +1793,28 @@ pub(crate) fn noise_findings(
                         } else {
                             verdict.direction == Direction::Lower
                         };
-                        if worsened { NoiseKind::Regression } else { NoiseKind::Improvement }
+                        if worsened {
+                            NoiseKind::Regression
+                        } else {
+                            NoiseKind::Improvement
+                        }
                     }
                 }
             } else {
                 continue; // unchanged + clean: omit
             };
-            findings.push(NoiseFinding { scenario: scenario.clone(), metric: m, verdict, kind });
+            findings.push(NoiseFinding {
+                scenario: scenario.clone(),
+                metric: m,
+                verdict,
+                kind,
+            });
         }
     }
-    NoiseReport { findings, paired_scenarios }
+    NoiseReport {
+        findings,
+        paired_scenarios,
+    }
 }
 
 /// Noise-adjusted variant of [`compare_partitions`]: instead of averaging each
@@ -1834,9 +1861,16 @@ pub fn compare_partitions_noise(
         println!(
             "  {scenario} / {name}: {label_a} {amean:.1} [{amin:.1}-{amax:.1}] {asp:.2}%  vs  \
              {label_b} {bmean:.1} [{bmin:.1}-{bmax:.1}] {bsp:.2}%  -> {label}",
-            scenario = f.scenario, name = f.metric.name,
-            amean = v.a.mean, amin = v.a.min, amax = v.a.max, asp = v.a.spread_pct,
-            bmean = v.b.mean, bmin = v.b.min, bmax = v.b.max, bsp = v.b.spread_pct,
+            scenario = f.scenario,
+            name = f.metric.name,
+            amean = v.a.mean,
+            amin = v.a.min,
+            amax = v.a.max,
+            asp = v.a.spread_pct,
+            bmean = v.b.mean,
+            bmin = v.b.min,
+            bmax = v.b.max,
+            bsp = v.b.spread_pct,
         );
     }
     let regressions = report.regressions();

@@ -191,7 +191,11 @@ fn derive_slicing_dims_resolve_source_only_diff() {
         ..RowFilter::default()
     };
     let f_d = RowFilter {
-        resolve_sources: vec!["path".to_string(), "auto_built".to_string(), "path".to_string()],
+        resolve_sources: vec![
+            "path".to_string(),
+            "auto_built".to_string(),
+            "path".to_string(),
+        ],
         ..RowFilter::default()
     };
     assert!(

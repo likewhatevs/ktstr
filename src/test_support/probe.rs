@@ -774,7 +774,9 @@ pub(crate) fn attempt_auto_repro(
             funcs
         }
     } else {
-        eprintln!("ktstr_test: auto-repro: no scheduler output on the scheduler-log channel, trying COM1");
+        eprintln!(
+            "ktstr_test: auto-repro: no scheduler output on the scheduler-log channel, trying COM1"
+        );
         extract_stack_functions_all(console_output)
     };
     let func_names: Vec<String> = stack_funcs.iter().map(|f| f.raw_name.clone()).collect();

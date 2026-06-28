@@ -1555,8 +1555,11 @@ pub(crate) fn ktstr_test_impl(
                              BOOL_ATTR_NAMES/VALUE_ATTR_NAMES) but reached the \
                              unknown-attribute arm — const-vs-dispatch divergence",
                         );
-                        let mut expected: Vec<&str> =
-                            BOOL_ATTR_NAMES.iter().chain(VALUE_ATTR_NAMES).copied().collect();
+                        let mut expected: Vec<&str> = BOOL_ATTR_NAMES
+                            .iter()
+                            .chain(VALUE_ATTR_NAMES)
+                            .copied()
+                            .collect();
                         expected.sort_unstable();
                         return Err(syn::Error::new_spanned(
                             path,

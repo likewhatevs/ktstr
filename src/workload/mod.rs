@@ -93,8 +93,8 @@
 mod affinity;
 mod config;
 pub(crate) mod schbench;
-pub(crate) mod taobench;
 mod spawn;
+pub(crate) mod taobench;
 mod types;
 mod worker;
 

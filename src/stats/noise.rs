@@ -68,7 +68,13 @@ impl SideSummary {
     pub fn of(samples: &[f64]) -> SideSummary {
         let n = samples.len();
         if n == 0 {
-            return SideSummary { n: 0, mean: 0.0, min: 0.0, max: 0.0, spread_pct: 0.0 };
+            return SideSummary {
+                n: 0,
+                mean: 0.0,
+                min: 0.0,
+                max: 0.0,
+                spread_pct: 0.0,
+            };
         }
         let mean = samples.iter().sum::<f64>() / n as f64;
         let min = samples.iter().copied().fold(f64::INFINITY, f64::min);
@@ -81,7 +87,13 @@ impl SideSummary {
         } else {
             (max - min) / mean.abs() * 100.0
         };
-        SideSummary { n, mean, min, max, spread_pct }
+        SideSummary {
+            n,
+            mean,
+            min,
+            max,
+            spread_pct,
+        }
     }
 }
 
@@ -134,9 +146,14 @@ pub fn noise_verdict(
         Direction::Within
     };
     let significant = direction != Direction::Within;
-    let too_noisy =
-        a.spread_pct > spread_threshold_pct || b.spread_pct > spread_threshold_pct;
-    NoiseVerdict { a, b, direction, significant, too_noisy }
+    let too_noisy = a.spread_pct > spread_threshold_pct || b.spread_pct > spread_threshold_pct;
+    NoiseVerdict {
+        a,
+        b,
+        direction,
+        significant,
+        too_noisy,
+    }
 }
 
 #[cfg(test)]
@@ -150,7 +167,16 @@ mod tests {
     #[test]
     fn side_summary_empty_is_all_zero() {
         let s = SideSummary::of(&[]);
-        assert_eq!(s, SideSummary { n: 0, mean: 0.0, min: 0.0, max: 0.0, spread_pct: 0.0 });
+        assert_eq!(
+            s,
+            SideSummary {
+                n: 0,
+                mean: 0.0,
+                min: 0.0,
+                max: 0.0,
+                spread_pct: 0.0
+            }
+        );
     }
 
     #[test]
@@ -173,7 +199,10 @@ mod tests {
     #[test]
     fn side_summary_identical_runs_have_zero_spread() {
         let s = SideSummary::of(&[7.0, 7.0, 7.0]);
-        assert_eq!(s.spread_pct, 0.0, "identical runs => no spread, never noisy");
+        assert_eq!(
+            s.spread_pct, 0.0,
+            "identical runs => no spread, never noisy"
+        );
     }
 
     #[test]
@@ -238,7 +267,10 @@ mod tests {
         // Both spreads 1% exactly; strict `>` => NOT noisy at a 1% threshold.
         let v = noise_verdict(&[99.5, 100.5], &[99.5, 100.5], 1.0);
         assert!(approx(v.a.spread_pct, 1.0));
-        assert!(!v.too_noisy, "spread == threshold is not over it (strict >)");
+        assert!(
+            !v.too_noisy,
+            "spread == threshold is not over it (strict >)"
+        );
     }
 
     #[test]
@@ -247,7 +279,10 @@ mod tests {
         // This is what a real regression looks like (vs a noise-driven flag).
         let v = noise_verdict(&[100.0, 100.5, 99.5], &[150.0, 150.5, 149.5], 1.0);
         assert!(v.significant);
-        assert!(!v.too_noisy, "a large change with low spread is a confident verdict");
+        assert!(
+            !v.too_noisy,
+            "a large change with low spread is a confident verdict"
+        );
         assert_eq!(v.direction, Direction::Higher);
     }
 
@@ -276,8 +311,14 @@ mod tests {
         let p50 = |cfg: &SchbenchConfig| run_standalone(cfg, RUN_SECS).request_pcts_us[1] as f64;
         let samples = |cfg: &SchbenchConfig| (0..N).map(|_| p50(cfg)).collect::<Vec<f64>>();
 
-        let light = SchbenchConfig::default().worker_threads(2).sleep_usec(0).operations(5);
-        let heavy = SchbenchConfig::default().worker_threads(2).sleep_usec(0).operations(50);
+        let light = SchbenchConfig::default()
+            .worker_threads(2)
+            .sleep_usec(0)
+            .operations(5);
+        let heavy = SchbenchConfig::default()
+            .worker_threads(2)
+            .sleep_usec(0)
+            .operations(50);
 
         let a = samples(&light);
         let b_same = samples(&light); // identical config: the no-regression arm
@@ -291,25 +332,40 @@ mod tests {
              A       = {:.0} [{:.0}-{:.0}] spread {:.2}%\n  \
              A vs A  : B {:.0} [{:.0}-{:.0}] spread {:.2}% -> significant={} too_noisy={} {:?}\n  \
              A vs B' : B {:.0} [{:.0}-{:.0}] spread {:.2}% -> significant={} too_noisy={} {:?}",
-            same.a.mean, same.a.min, same.a.max, same.a.spread_pct,
-            same.b.mean, same.b.min, same.b.max, same.b.spread_pct,
-            same.significant, same.too_noisy, same.direction,
-            diff.b.mean, diff.b.min, diff.b.max, diff.b.spread_pct,
-            diff.significant, diff.too_noisy, diff.direction,
+            same.a.mean,
+            same.a.min,
+            same.a.max,
+            same.a.spread_pct,
+            same.b.mean,
+            same.b.min,
+            same.b.max,
+            same.b.spread_pct,
+            same.significant,
+            same.too_noisy,
+            same.direction,
+            diff.b.mean,
+            diff.b.min,
+            diff.b.max,
+            diff.b.spread_pct,
+            diff.significant,
+            diff.too_noisy,
+            diff.direction,
         );
 
         // True positive: 10x matrix ops is a large real increase in request latency.
         assert!(
             diff.significant && diff.direction == Direction::Higher,
             "10x operations must read as a significant increase: A={:?} B={:?}",
-            diff.a, diff.b,
+            diff.a,
+            diff.b,
         );
         // Real separation dwarfs the noise: the heavy mean clears A's whole
         // observed band (reliable at 10x, not flaky).
         assert!(
             diff.b.mean > a.iter().copied().fold(f64::NEG_INFINITY, f64::max),
             "heavy mean {:.0} should clear A's band max {:.0}",
-            diff.b.mean, same.a.max,
+            diff.b.mean,
+            same.a.max,
         );
         // The A-vs-A arm is REPORTED above for real-data evaluation, not hard
         // asserted: at small N a clean-but-narrow A band can let B's mean drift

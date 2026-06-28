@@ -35,8 +35,8 @@
 //! real reports between its interval hit_rate and its final hit_ratio.
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::collections::{BTreeMap, VecDeque};
 use std::collections::HashMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Condvar, Mutex};
 
 /// Number of independently-locked cache shards (power of two). Sized to keep
@@ -292,7 +292,9 @@ impl Cache {
     /// Build a cache holding ≈ `total_objects` across `SHARDS` shards.
     fn new(total_objects: usize) -> Self {
         let per_shard = (total_objects / SHARDS).max(1);
-        let shards = (0..SHARDS).map(|_| Mutex::new(Shard::with_cap(per_shard))).collect();
+        let shards = (0..SHARDS)
+            .map(|_| Mutex::new(Shard::with_cap(per_shard)))
+            .collect();
         Cache { shards }
     }
     fn shard(&self, k: u64) -> &Mutex<Shard> {
@@ -300,13 +302,19 @@ impl Cache {
     }
     /// Look up + touch `k`; `true` on a hit.
     fn get_touch(&self, k: u64) -> bool {
-        self.shard(k).lock().expect("cache shard poisoned").get_touch(k)
+        self.shard(k)
+            .lock()
+            .expect("cache shard poisoned")
+            .get_touch(k)
     }
     /// Fill `k` with a freshly sized + built value (the value bytes are touched
     /// by `make_value`); FIFO-evicts to keep the shard bounded.
     fn fill(&self, k: u64, size: usize) {
         let v = make_value(size);
-        self.shard(k).lock().expect("cache shard poisoned").insert(k, v);
+        self.shard(k)
+            .lock()
+            .expect("cache shard poisoned")
+            .insert(k, v);
     }
 }
 
@@ -553,7 +561,16 @@ pub(crate) fn run(
                 let slow_q = &slow_q;
                 let slot = &slots[i];
                 s.spawn(move || {
-                    client_loop(i, stop, progress, phase_epoch, cache, slow_q, slot, key_range)
+                    client_loop(
+                        i,
+                        stop,
+                        progress,
+                        phase_epoch,
+                        cache,
+                        slow_q,
+                        slot,
+                        key_range,
+                    )
                 })
             })
             .collect();
@@ -563,8 +580,10 @@ pub(crate) fn run(
         // has been served), NO further misses can be enqueued. Only then signal
         // the dispatchers, so a dispatcher can never exit while a client is still
         // blocked on an unserved miss.
-        let accums: Vec<ThreadAccum> =
-            clients.into_iter().map(|c| c.join().expect("taobench client panicked")).collect();
+        let accums: Vec<ThreadAccum> = clients
+            .into_iter()
+            .map(|c| c.join().expect("taobench client panicked"))
+            .collect();
         disp_stop.store(true, Ordering::Release);
         slow_q.cv.notify_all();
         for d in dispatchers {
@@ -693,11 +712,7 @@ fn resolve_allowed_cpus() -> usize {
         }
     }
     let n = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) };
-    if n > 0 {
-        n as usize
-    } else {
-        1
-    }
+    if n > 0 { n as usize } else { 1 }
 }
 
 // ---------------------------------------------------------------------------
@@ -796,7 +811,10 @@ mod tests {
         // The representative distribution is small-object-heavy (mean well under
         // 1 KiB) with a tail to 64 KiB.
         let m = mean_value_size();
-        assert!((200..=500).contains(&m), "mean value size {m} B is small-object-heavy");
+        assert!(
+            (200..=500).contains(&m),
+            "mean value size {m} B is small-object-heavy"
+        );
         assert_eq!(*VALUE_SIZES.last().unwrap(), 65536, "tail reaches 64 KiB");
     }
 
@@ -832,7 +850,10 @@ mod tests {
                 (0.80..=0.97).contains(&hit),
                 "hit ratio {hit} settles near target 0.90 (eviction equilibrium), not 1.0"
             );
-            assert!(out.whole_run.slow_ops > 0, "the slow/miss path is exercised");
+            assert!(
+                out.whole_run.slow_ops > 0,
+                "the slow/miss path is exercised"
+            );
         });
     }
 
@@ -855,7 +876,11 @@ mod tests {
     #[test]
     fn worktype_taobench_registration_and_serde() {
         use crate::workload::WorkType;
-        let wt = WorkType::taobench(TaobenchConfig::default().client_threads(4).target_hit_pct(95));
+        let wt = WorkType::taobench(
+            TaobenchConfig::default()
+                .client_threads(4)
+                .target_hit_pct(95),
+        );
         assert_eq!(wt.name(), "Taobench");
         // from_name yields the default-config variant.
         assert_eq!(

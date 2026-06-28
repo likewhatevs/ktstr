@@ -605,8 +605,7 @@ fn resolve_scheduler_discover_build_failure_refuses_stale_fallback() {
         result.expect_err("a failed build must refuse, not serve a stale binary")
     );
     assert!(
-        rendered.contains("refusing")
-            && rendered.contains("KTSTR_SCHEDULER_ALLOW_STALE_FALLBACK"),
+        rendered.contains("refusing") && rendered.contains("KTSTR_SCHEDULER_ALLOW_STALE_FALLBACK"),
         "the refusal error must name the hazard + the opt-out; got: {rendered}"
     );
 }
@@ -646,10 +645,7 @@ fn resolve_scheduler_allow_stale_fallback_empty_string_rejected() {
     let _no_cargo_test_mode = EnvVarGuard::remove(crate::KTSTR_CARGO_TEST_MODE_ENV);
     let _empty = EnvVarGuard::set(crate::KTSTR_SCHEDULER_ALLOW_STALE_FALLBACK_ENV, "");
     let result = resolve_scheduler(&SchedulerSpec::Discover("__nonexistent_scheduler_pkg__"));
-    let rendered = format!(
-        "{:#}",
-        result.expect_err("empty opt-out must still refuse")
-    );
+    let rendered = format!("{:#}", result.expect_err("empty opt-out must still refuse"));
     assert!(
         rendered.contains("refusing"),
         "empty-string KTSTR_SCHEDULER_ALLOW_STALE_FALLBACK must NOT enable the \

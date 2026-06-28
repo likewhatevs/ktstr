@@ -251,8 +251,14 @@ fn parse_perf_delta_flags_and_defaults() {
     }
     // --noise-spread-threshold requires --noise-adjust.
     assert!(
-        Cargo::try_parse_from(["cargo", "ktstr", "perf-delta", "--noise-spread-threshold", "1.0"])
-            .is_err(),
+        Cargo::try_parse_from([
+            "cargo",
+            "ktstr",
+            "perf-delta",
+            "--noise-spread-threshold",
+            "1.0"
+        ])
+        .is_err(),
         "--noise-spread-threshold alone must fail (requires --noise-adjust)",
     );
     // Noise axis conflicts with the config axis at parse time.
@@ -276,14 +282,27 @@ fn parse_perf_delta_flags_and_defaults() {
     // being silently ignored.
     assert!(
         Cargo::try_parse_from([
-            "cargo", "ktstr", "perf-delta", "--noise-adjust", "3", "--threshold", "10",
+            "cargo",
+            "ktstr",
+            "perf-delta",
+            "--noise-adjust",
+            "3",
+            "--threshold",
+            "10",
         ])
         .is_err(),
         "--noise-adjust must conflict with --threshold",
     );
     assert!(
-        Cargo::try_parse_from(["cargo", "ktstr", "perf-delta", "--noise-adjust", "3", "--dual-run"])
-            .is_err(),
+        Cargo::try_parse_from([
+            "cargo",
+            "ktstr",
+            "perf-delta",
+            "--noise-adjust",
+            "3",
+            "--dual-run"
+        ])
+        .is_err(),
         "--noise-adjust must conflict with --dual-run",
     );
     // --a-scheduler requires --b-scheduler (both-or-neither at parse time).

@@ -1940,7 +1940,10 @@ fn noise_findings_classifies_both_polarities() {
         rep.regressions(),
         2,
         "LowerBetter rose + HigherBetter dropped = 2 regressions: {:?}",
-        rep.findings.iter().map(|f| (f.metric.name, f.kind)).collect::<Vec<_>>(),
+        rep.findings
+            .iter()
+            .map(|f| (f.metric.name, f.kind))
+            .collect::<Vec<_>>(),
     );
     assert_eq!(rep.noisy(), 0);
     assert!(rep.findings.iter().all(|f| f.kind == NoiseKind::Regression));
@@ -1954,7 +1957,10 @@ fn noise_findings_classifies_both_polarities() {
     );
     assert_eq!(rep.regressions(), 0);
     assert_eq!(
-        rep.findings.iter().filter(|f| f.kind == NoiseKind::Improvement).count(),
+        rep.findings
+            .iter()
+            .filter(|f| f.kind == NoiseKind::Improvement)
+            .count(),
         2,
         "LowerBetter dropped + HigherBetter rose = 2 improvements",
     );
@@ -1970,19 +1976,35 @@ fn noise_findings_too_noisy_takes_precedence_over_regression() {
         cmp_row("noisy", "tiny-1llc", true, 20.0, 2000),
         cmp_row("noisy", "tiny-1llc", true, 15.0, 2000),
     ];
-    let rep = noise_findings(&a, &noise_side("noisy", 30.0, 2000), LEGACY_PAIRING_DIMS, 1.0);
+    let rep = noise_findings(
+        &a,
+        &noise_side("noisy", 30.0, 2000),
+        LEGACY_PAIRING_DIMS,
+        1.0,
+    );
     let ws = rep
         .findings
         .iter()
         .find(|f| f.metric.name == "worst_spread")
         .expect("worst_spread finding present");
-    assert_eq!(ws.kind, NoiseKind::Noisy, "wide A spread -> NOISY, not REGRESSION");
-    assert_eq!(rep.regressions(), 0, "a too-noisy metric must not fail the gate");
+    assert_eq!(
+        ws.kind,
+        NoiseKind::Noisy,
+        "wide A spread -> NOISY, not REGRESSION"
+    );
+    assert_eq!(
+        rep.regressions(),
+        0,
+        "a too-noisy metric must not fail the gate"
+    );
     // total_iterations is unchanged (2000 both sides) and clean -> omitted.
     assert!(
         rep.findings.iter().all(|f| f.metric.name == "worst_spread"),
         "unchanged-and-clean metrics are omitted: {:?}",
-        rep.findings.iter().map(|f| f.metric.name).collect::<Vec<_>>(),
+        rep.findings
+            .iter()
+            .map(|f| f.metric.name)
+            .collect::<Vec<_>>(),
     );
 }
 
@@ -1996,7 +2018,10 @@ fn noise_findings_skips_all_zero_and_omits_unchanged() {
         LEGACY_PAIRING_DIMS,
         1.0,
     );
-    assert!(rep.findings.is_empty(), "all-zero scenario yields no findings");
+    assert!(
+        rep.findings.is_empty(),
+        "all-zero scenario yields no findings"
+    );
     assert_eq!(rep.paired_scenarios, 1);
 
     // Identical non-zero sides -> within-band, clean -> no findings either.
@@ -2006,7 +2031,10 @@ fn noise_findings_skips_all_zero_and_omits_unchanged() {
         LEGACY_PAIRING_DIMS,
         1.0,
     );
-    assert!(rep.findings.is_empty(), "unchanged-clean scenario yields no findings");
+    assert!(
+        rep.findings.is_empty(),
+        "unchanged-clean scenario yields no findings"
+    );
     assert_eq!((rep.regressions(), rep.noisy()), (0, 0));
 }
 
@@ -2032,7 +2060,10 @@ fn compare_rows_informational_metric_shows_but_never_gates() {
         None,
         &ComparisonPolicy::default(),
     );
-    assert_eq!(res.regressions, 0, "informational metric must not be a regression");
+    assert_eq!(
+        res.regressions, 0,
+        "informational metric must not be a regression"
+    );
     assert_eq!(res.improvements, 0, "...nor an improvement");
     assert_eq!(
         res.informational, 1,

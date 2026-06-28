@@ -385,7 +385,11 @@ pub fn pipe_transfer_report(
     let ops_per_sec = achieved_rps / n;
     let bytes_per_sec = achieved_rps * bytes as f64 / n;
     let (scaled, unit) = pretty_size(bytes_per_sec);
-    PipeTransferReport { ops_per_sec, scaled, unit }
+    PipeTransferReport {
+        ops_per_sec,
+        scaled,
+        unit,
+    }
 }
 
 /// schbench's `pretty_size` (`schbench.c:1606-1620`): scale a byte count by 1024
@@ -1631,8 +1635,9 @@ fn run_one_message_thread(
     // schbench clamps -p to PIPE_TRANSFER_BUFFER (schbench.c:291-294). Workers get
     // the per-thread transfer page; the message thread (waker) needs none.
     let pipe_bytes = config.pipe_transfer_bytes.min(PIPE_TRANSFER_BUFFER);
-    let workers: Vec<ThreadData> =
-        (0..worker_threads).map(|_| ThreadData::new(pipe_bytes)).collect();
+    let workers: Vec<ThreadData> = (0..worker_threads)
+        .map(|_| ThreadData::new(pipe_bytes))
+        .collect();
     let msg_td = ThreadData::new(0);
     let wait_list = TreiberStack::new();
     let ctx = WorkerCtx {
@@ -2163,7 +2168,9 @@ mod tests {
     #[test]
     fn resolve_worker_count_divides_cpuset_across_message_threads() {
         // Explicit non-zero worker_threads is honored as-is (per message thread).
-        let c = SchbenchConfig::default().worker_threads(3).message_threads(4);
+        let c = SchbenchConfig::default()
+            .worker_threads(3)
+            .message_threads(4);
         assert_eq!(c.resolve_worker_count(8), 3);
 
         // 0-default mirrors schbench's ceil(cpuset_cpus / message_threads)
@@ -2305,7 +2312,11 @@ mod tests {
         // SAFETY: single-threaded test, exclusive access to this td's page.
         unsafe { td.pipe_fill(2) };
         // SAFETY: same thread; no concurrent access.
-        assert_eq!(unsafe { &*td.pipe_page.get() }.len(), 64, "page sized to pipe_bytes");
+        assert_eq!(
+            unsafe { &*td.pipe_page.get() }.len(),
+            64,
+            "page sized to pipe_bytes"
+        );
         assert!(
             unsafe { &*td.pipe_page.get() }.iter().all(|&b| b == 2),
             "worker fill (2) touches every byte"

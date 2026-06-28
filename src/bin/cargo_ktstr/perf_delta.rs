@@ -391,8 +391,7 @@ fn noise_dual_run(
         // filename, so a single leaf would overwrite all but the last; distinct
         // dirs keep all N. The compare still partitions by project_commit
         // (baseline vs HEAD), not by leaf name.
-        let base_leaf =
-            runs_root_abs.join(format!("perf-delta-noise-base-{baseline_short}-{i}"));
+        let base_leaf = runs_root_abs.join(format!("perf-delta-noise-base-{baseline_short}-{i}"));
         let head_leaf = runs_root_abs.join(format!("perf-delta-noise-head-{head_short}-{i}"));
         println!("perf-delta --noise-adjust: run {}/{runs}", i + 1);
 

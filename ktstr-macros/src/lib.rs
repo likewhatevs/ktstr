@@ -1001,8 +1001,7 @@ mod tests {
                 Ok(ktstr::assert::AssertResult::pass())
             }
         };
-        let err = ktstr_test::ktstr_test_impl(attr, item)
-            .unwrap_err();
+        let err = ktstr_test::ktstr_test_impl(attr, item).unwrap_err();
         assert!(
             err.to_string().contains("survives_storm") && err.to_string().contains("expect_err"),
             "diagnostic must name both survives_storm and expect_err: {err}"
@@ -1019,8 +1018,7 @@ mod tests {
                 Ok(ktstr::assert::AssertResult::pass())
             }
         };
-        let err = ktstr_test::ktstr_test_impl(attr, item)
-            .unwrap_err();
+        let err = ktstr_test::ktstr_test_impl(attr, item).unwrap_err();
         assert!(
             err.to_string().contains("survives_storm") && err.to_string().contains("scheduler"),
             "diagnostic must name survives_storm and the missing scheduler: {err}"
@@ -1045,8 +1043,7 @@ mod tests {
                 Ok(ktstr::assert::AssertResult::pass())
             }
         };
-        let err = ktstr_test::ktstr_test_impl(attr, item)
-            .unwrap_err();
+        let err = ktstr_test::ktstr_test_impl(attr, item).unwrap_err();
         assert!(
             err.to_string().contains("survives_storm")
                 && err.to_string().contains("expect_auto_repro"),

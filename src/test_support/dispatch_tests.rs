@@ -1444,17 +1444,11 @@ fn final_outcome_projects_to_result_to_exit_code() {
             "err_scx_bpf_matcher_mismatch",
         ),
         (
-            || {
-                Err(anyhow::anyhow!("f")
-                    .context(crate::test_support::eval::SchedulerBuildRefused))
-            },
+            || Err(anyhow::anyhow!("f").context(crate::test_support::eval::SchedulerBuildRefused)),
             "err_scheduler_build_refused",
         ),
         (
-            || {
-                Err(anyhow::anyhow!("f")
-                    .context(crate::test_support::eval::SurvivesStormViolated))
-            },
+            || Err(anyhow::anyhow!("f").context(crate::test_support::eval::SurvivesStormViolated)),
             "err_survives_storm_violated",
         ),
     ];
@@ -2177,10 +2171,9 @@ fn result_to_exit_code_matcher_mismatch_through_nested_context_routes_to_fail() 
 /// Err and the expect_err arm would invert it to a false PASS.
 #[test]
 fn result_to_exit_code_expect_err_with_scheduler_build_refused_routes_to_fail() {
-    let err: Result<crate::assert::AssertResult> = Err(anyhow::anyhow!(
-        "cargo build -p scx_x failed"
-    )
-    .context(crate::test_support::eval::SchedulerBuildRefused));
+    let err: Result<crate::assert::AssertResult> =
+        Err(anyhow::anyhow!("cargo build -p scx_x failed")
+            .context(crate::test_support::eval::SchedulerBuildRefused));
     assert_eq!(
         result_to_exit_code(err, true, false),
         EXIT_FAIL,
@@ -2195,12 +2188,11 @@ fn result_to_exit_code_expect_err_with_scheduler_build_refused_routes_to_fail() 
 /// [`EXIT_FAIL`] under expect_err.
 #[test]
 fn result_to_exit_code_scheduler_build_refused_through_nested_context_routes_to_fail() {
-    let err: Result<crate::assert::AssertResult> = Err(anyhow::anyhow!(
-        "cargo build -p scx_x failed"
-    )
-    .context(crate::test_support::eval::SchedulerBuildRefused)
-    .context("ktstr_test: refusing to validate against a stale binary")
-    .context("dispatch wrapper"));
+    let err: Result<crate::assert::AssertResult> =
+        Err(anyhow::anyhow!("cargo build -p scx_x failed")
+            .context(crate::test_support::eval::SchedulerBuildRefused)
+            .context("ktstr_test: refusing to validate against a stale binary")
+            .context("dispatch wrapper"));
     assert_eq!(
         result_to_exit_code(err, true, false),
         EXIT_FAIL,

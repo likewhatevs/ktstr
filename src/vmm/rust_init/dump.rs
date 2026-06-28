@@ -1004,8 +1004,8 @@ pub(crate) fn exec_shell_line(line: &str) -> Result<(), ()> {
 
 #[cfg(test)]
 mod tests {
-    use super::drain_probe_for_shutdown;
     use super::super::scheduler::ProbeDrain;
+    use super::drain_probe_for_shutdown;
     use crate::sync::Latch;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
