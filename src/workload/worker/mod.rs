@@ -3458,14 +3458,14 @@ pub(super) fn worker_main(
                 // EINTR (a signal landed — the stop check above handles
                 // shutdown); an interrupted sleep did not reach the deadline, so
                 // its "latency" is meaningless and must not enter the histogram.
-                if rc == 0 {
-                    if let Some(wake_ns) = clock_gettime_ns(libc::CLOCK_MONOTONIC) {
-                        // Floor at 0: a wake observed at/before the deadline
-                        // (clock granularity) is 0 latency, never a wrapping u64
-                        // subtract — the same delta>=0 discipline the schbench
-                        // engine uses.
-                        timer.push(wake_ns.saturating_sub(timer_next_deadline_ns));
-                    }
+                if rc == 0
+                    && let Some(wake_ns) = clock_gettime_ns(libc::CLOCK_MONOTONIC)
+                {
+                    // Floor at 0: a wake observed at/before the deadline
+                    // (clock granularity) is 0 latency, never a wrapping u64
+                    // subtract — the same delta>=0 discipline the schbench
+                    // engine uses.
+                    timer.push(wake_ns.saturating_sub(timer_next_deadline_ns));
                 }
                 // Accumulate the absolute deadline by exactly one interval (never
                 // re-base on `now`) — the CO-free invariant.

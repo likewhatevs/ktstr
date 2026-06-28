@@ -346,6 +346,11 @@ pub enum GaugeAgg {
 /// nanoseconds; the [`SampleReduction`] applies the ns→µs scale once).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
 #[non_exhaustive]
+// The `Ns` suffix on every variant documents the unit (all sources are RAW
+// nanoseconds) at each use site, not just in the enum doc; clippy's
+// enum_variant_names is a style heuristic that misfires on a meaningful shared
+// unit suffix — renaming would drop the unit, so the suffix is kept.
+#[allow(clippy::enum_variant_names)]
 pub enum SampleSource {
     /// Per-wakeup latency samples in ns
     /// (`crate::assert::PhaseCgroupStats::wake_latencies_ns`). One sample per

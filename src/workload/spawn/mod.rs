@@ -1872,13 +1872,13 @@ pub(super) fn validate_workload_admission(group: &GroupParams) -> Result<()> {
             .into());
         }
     }
-    if let WorkType::TimerLatency { interval_us } = group.work_type {
-        if interval_us == 0 {
-            return Err(WorkTypeValidationError::ZeroTimerInterval {
-                group_idx: group.group_idx,
-            }
-            .into());
+    if let WorkType::TimerLatency { interval_us } = group.work_type
+        && interval_us == 0
+    {
+        return Err(WorkTypeValidationError::ZeroTimerInterval {
+            group_idx: group.group_idx,
         }
+        .into());
     }
     if let WorkType::NetTraffic { frame_bytes, .. } = group.work_type
         && !(60..=1514).contains(&frame_bytes)

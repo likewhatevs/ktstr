@@ -848,6 +848,14 @@ impl WorkType {
         WorkType::AluHot { width }
     }
 
+    /// Construct a [`WorkType::TimerLatency`] with an inter-cycle interval
+    /// (`interval_us`, the `cyclictest` `-i` analogue). `interval_us == 0` is
+    /// rejected at spawn (`validate_workload_admission`); pass a non-zero
+    /// period. See the [`WorkType::TimerLatency`] variant doc.
+    pub const fn timer_latency(interval_us: u64) -> Self {
+        WorkType::TimerLatency { interval_us }
+    }
+
     /// Construct a [`WorkType::NetTraffic`] with an inter-frame interval
     /// (`interval_us`; `0` = continuous burst) and Ethernet `frame_bytes`.
     /// `frame_bytes` is validated to `[60, 1514]` at spawn, not here; see the

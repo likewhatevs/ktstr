@@ -14,7 +14,7 @@
 //! The NIC IRQ is pinned to CPU 0 so the count is read from a single,
 //! stable column; under sustained traffic the bulk of completions land
 //! there after the affinity write takes effect. Arch-agnostic: AF_PACKET TX
-//! + the virtio RX IRQ work the same on x86 (IOAPIC/MSI) and arm64 (GIC) —
+//! and the virtio RX IRQ work the same on x86 (IOAPIC/MSI) and arm64 (GIC) —
 //! only the >255-APIC ext-dest leg in `wide_smp_net_irq_e2e` is x86-gated.
 
 use anyhow::{Result, ensure};
