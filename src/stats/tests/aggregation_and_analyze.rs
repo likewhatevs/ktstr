@@ -606,6 +606,218 @@ fn run_level_irq_rate_survives_sparse_multi_phase() {
     assert!((rate - 50.0).abs() < 1e-9, "400/8s=50; got {rate}");
 }
 
+// -- per-CPU IRQ spatial axis (max_cpu_hardirqs + concentration) --
+
+/// Build one periodic freeze with `per_cpu_time` = the given (cpu, irqs_sum)
+/// rows, stamped to `step`, anchored at `elapsed_ms`.
+fn irq_spatial_freeze(
+    tag: &str,
+    elapsed_ms: u64,
+    step: u16,
+    cpus: &[(u32, u64)],
+) -> crate::scenario::snapshot::DrainedSnapshotEntry {
+    use crate::monitor::dump::{FailureDumpReport, PerCpuTimeStats};
+    use crate::scenario::snapshot::MissingStatsReason;
+    crate::scenario::snapshot::DrainedSnapshotEntry {
+        tag: tag.to_string(),
+        report: FailureDumpReport {
+            per_cpu_time: cpus
+                .iter()
+                .map(|&(cpu, irqs_sum)| PerCpuTimeStats {
+                    cpu,
+                    irqs_sum,
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        },
+        stats: Err(MissingStatsReason::NoSchedulerBinary),
+        elapsed_ms: Some(elapsed_ms),
+        boundary_offset_ms: None,
+        step_index: Some(step),
+    }
+}
+
+/// Build a single (step-1) phase bucket from the freezes and read the per-CPU
+/// IRQ spatial metrics: (max_cpu_hardirqs, max_cpu_hardirq_concentration).
+fn irq_spatial_bucket(
+    freezes: Vec<crate::scenario::snapshot::DrainedSnapshotEntry>,
+) -> (Option<f64>, Option<f64>) {
+    let series = crate::scenario::sample::SampleSeries::from_drained_typed(freezes, None);
+    let buckets = crate::assert::build_phase_buckets(&series);
+    let b = buckets
+        .into_iter()
+        .find(|b| b.step_index == 1)
+        .expect("step-1 bucket present");
+    (
+        b.get("max_cpu_hardirqs"),
+        b.get("max_cpu_hardirq_concentration"),
+    )
+}
+
+/// T1 happy path: two freezes, two CPUs — cpu0 100→200 (Δ100), cpu1 200→500
+/// (Δ300). max_cpu_hardirqs = max(100, 300) = 300; concentration = 300 /
+/// mean(100, 300) = 300/200 = 1.5.
+#[test]
+fn max_cpu_hardirqs_happy_path() {
+    let (max, conc) = irq_spatial_bucket(vec![
+        irq_spatial_freeze("periodic_000", 1_000, 1, &[(0, 100), (1, 200)]),
+        irq_spatial_freeze("periodic_001", 4_000, 1, &[(0, 200), (1, 500)]),
+    ]);
+    assert_eq!(max, Some(300.0), "busiest CPU's delta (cpu1: 500-200)");
+    let conc = conc.expect("concentration present with 2 reporting CPUs");
+    assert!(
+        (conc - 1.5).abs() < 1e-9,
+        "300 / mean(100,300)=200 = 1.5; got {conc}",
+    );
+}
+
+/// T2 (load-bearing): the busiest CPU SHIFTS between freezes — cpu0 hot early,
+/// cpu1 hot late. first{cpu0:100,cpu1:50} last{cpu0:150,cpu1:400} → per-CPU
+/// deltas d0=50, d1=350 → max=350. This is NOT max(last)=400 − max(first)=100 =
+/// 300 (the broken spatial-max-then-delta the design forbids), NOT Σlast−Σfirst.
+/// Pins per-CPU-delta-THEN-max.
+#[test]
+fn max_cpu_hardirqs_uses_per_cpu_delta_not_totals_when_busiest_cpu_shifts() {
+    let (max, conc) = irq_spatial_bucket(vec![
+        irq_spatial_freeze("periodic_000", 1_000, 1, &[(0, 100), (1, 50)]),
+        irq_spatial_freeze("periodic_001", 4_000, 1, &[(0, 150), (1, 400)]),
+    ]);
+    assert_eq!(
+        max,
+        Some(350.0),
+        "max of per-CPU deltas (d1=350), NOT max(totals)=400-100=300",
+    );
+    let conc = conc.expect("concentration present");
+    assert!(
+        (conc - 1.75).abs() < 1e-9,
+        "350 / mean(50,350)=200 = 1.75; got {conc}",
+    );
+}
+
+/// T3: endpoints chosen by win() (boundary_offset/elapsed), NOT positional. The
+/// POSITIONAL-first freeze has a LATER win (4000) than the positional-last
+/// (1000); by_stamped_phase preserves drain order, so samples_in_phase is
+/// [win4000, win1000] (non-win-ordered). The fold must use the win-ordered
+/// endpoints (first=win1000, last=win4000) → positive delta. A naive
+/// .first()/.last() would compute win1000 − win4000 per CPU → saturating_sub
+/// clamps to 0 → max=0.
+#[test]
+fn max_cpu_hardirqs_uses_win_ordered_endpoints_not_positional() {
+    let (max, _) = irq_spatial_bucket(vec![
+        irq_spatial_freeze("periodic_000", 4_000, 1, &[(0, 500), (1, 300)]),
+        irq_spatial_freeze("periodic_001", 1_000, 1, &[(0, 100), (1, 50)]),
+    ]);
+    assert_eq!(
+        max,
+        Some(400.0),
+        "win-ordered cpu0 500-100=400 (max); positional .first()/.last() would clamp to 0",
+    );
+}
+
+/// T4 hotplug-skip: cpu1 present in the first freeze but ABSENT from the last
+/// (defensive intersection) → excluded from max+mean; only cpu0 (in both)
+/// contributes Δ=300-100=200. With a 1-CPU intersection the concentration is
+/// omitted.
+#[test]
+fn max_cpu_hardirqs_skips_cpu_absent_from_an_endpoint() {
+    let (max, conc) = irq_spatial_bucket(vec![
+        irq_spatial_freeze("periodic_000", 1_000, 1, &[(0, 100), (1, 9999)]),
+        irq_spatial_freeze("periodic_001", 4_000, 1, &[(0, 300)]),
+    ]);
+    assert_eq!(max, Some(200.0), "only cpu0 (present in both freezes) contributes");
+    assert_eq!(conc, None, "1-CPU intersection → concentration omitted");
+}
+
+/// T5 <2-freeze → both absent: a single freeze yields no measurable per-CPU
+/// delta.
+#[test]
+fn max_cpu_hardirqs_none_for_single_freeze() {
+    let (max, conc) = irq_spatial_bucket(vec![irq_spatial_freeze(
+        "periodic_000",
+        1_000,
+        1,
+        &[(0, 100), (1, 200)],
+    )]);
+    assert_eq!(max, None, "single freeze → no per-CPU delta measurable");
+    assert_eq!(conc, None, "single freeze → no concentration");
+}
+
+/// T6 <2-CPU → concentration omitted, max kept: a single-CPU intersection makes
+/// max/mean == 1 a structural artifact (not a measurement), so the concentration
+/// key is omitted — but a per-CPU peak IS meaningful on one CPU, so
+/// max_cpu_hardirqs is kept.
+#[test]
+fn max_cpu_hardirq_concentration_omitted_for_single_cpu() {
+    let (max, conc) = irq_spatial_bucket(vec![
+        irq_spatial_freeze("periodic_000", 1_000, 1, &[(0, 100)]),
+        irq_spatial_freeze("periodic_001", 4_000, 1, &[(0, 700)]),
+    ]);
+    assert_eq!(max, Some(600.0), "cpu0 delta 700-100");
+    assert_eq!(conc, None, "1 CPU → concentration omitted (a trivial 1.0)");
+}
+
+/// T7 mean==0 → concentration absent, max a measured zero: two CPUs whose
+/// counters did not advance → every per-CPU delta is 0, so max_cpu_hardirqs is a
+/// REAL Some(0.0), but the concentration is absent (mean==0 would be a NaN). The
+/// max=measured-zero vs concentration=loud-absent distinction.
+#[test]
+fn max_cpu_hardirq_concentration_absent_when_no_irqs() {
+    let (max, conc) = irq_spatial_bucket(vec![
+        irq_spatial_freeze("periodic_000", 1_000, 1, &[(0, 500), (1, 500)]),
+        irq_spatial_freeze("periodic_001", 4_000, 1, &[(0, 500), (1, 500)]),
+    ]);
+    assert_eq!(max, Some(0.0), "both CPUs' counters didn't advance → measured zero");
+    assert_eq!(conc, None, "mean==0 → concentration absent (no div-by-zero/NaN)");
+}
+
+/// Run-level: max_cpu_hardirqs auto-folds across phases as a Peak
+/// (max-across-phases) through populate_run_ext_metrics_from_phases — NO custom
+/// whole-run block (unlike the Counter metrics, a Peak's cross-phase MAX doesn't
+/// undercount the way a Counter SUM does, so the whole-run-direct path isn't
+/// needed). is_derived(Peak)==false so it isn't skipped, and
+/// aggregate_samples_weighted folds Peak by max. Two phases: phase1 busiest-CPU
+/// Δ=300, phase2 busiest-CPU Δ=900 → run-level = max(300, 900) = 900. (The
+/// direct read_sample path can't touch it — no read_sample arm — so there's no
+/// pre-emption.)
+#[test]
+fn max_cpu_hardirqs_run_level_auto_folds_max_across_phases() {
+    use crate::assert::{
+        build_phase_buckets, populate_run_ext_metrics, populate_run_ext_metrics_from_phases,
+    };
+    use crate::scenario::sample::SampleSeries;
+
+    let series = SampleSeries::from_drained_typed(
+        vec![
+            irq_spatial_freeze("periodic_000", 1_000, 1, &[(0, 100), (1, 200)]),
+            irq_spatial_freeze("periodic_001", 4_000, 1, &[(0, 200), (1, 500)]),
+            irq_spatial_freeze("periodic_002", 6_000, 2, &[(0, 1000), (1, 1000)]),
+            irq_spatial_freeze("periodic_003", 9_000, 2, &[(0, 1100), (1, 1900)]),
+        ],
+        None,
+    );
+    let buckets = build_phase_buckets(&series);
+    let mut ext = std::collections::BTreeMap::new();
+    populate_run_ext_metrics(&series, &mut ext);
+    populate_run_ext_metrics_from_phases(&buckets, &mut ext);
+    assert_eq!(
+        ext.get("max_cpu_hardirqs").copied(),
+        Some(900.0),
+        "Peak auto-folds max-across-phases: max(phase1 Δ=300, phase2 Δ=900)",
+    );
+    // max_cpu_hardirq_concentration (also Peak, no read_sample arm) rides the
+    // IDENTICAL auto-fold path: phase1 = 300/mean(100,300) = 1.5, phase2 =
+    // 900/mean(100,900) = 1.8 → run-level max(1.5, 1.8) = 1.8.
+    let conc = ext
+        .get("max_cpu_hardirq_concentration")
+        .copied()
+        .expect("concentration auto-folds to run-level too (also Peak)");
+    assert!(
+        (conc - 1.8).abs() < 1e-9,
+        "concentration auto-folds max-across-phases: max(1.5, 1.8) = 1.8; got {conc}",
+    );
+}
+
 /// `aggregate_samples_for_phase` dispatches Counter through
 /// `phase_counter_delta` (per-phase delta) and every other
 /// kind through `aggregate_samples` (flat-run semantic). Pins

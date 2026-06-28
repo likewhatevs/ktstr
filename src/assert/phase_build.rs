@@ -666,6 +666,60 @@ fn buckets_from_grouped(
         if let Some(v) = phase_group_cpu_delta(&samples_in_phase, |t| t.utime, |t| t.signal_utime) {
             metrics.entry("user_time_ns".to_string()).or_insert(v);
         }
+        // Per-CPU IRQ spatial axis: max_cpu_hardirqs (the BUSIEST CPU's hardirq
+        // delta over the phase) + max_cpu_hardirq_concentration (max / mean over
+        // the reporting CPUs). A custom per-CPU-delta fold — NOT a read_sample
+        // arm (read_sample yields the cross-CPU SUM as one f64, with no per-CPU
+        // vector). Endpoints are the earliest + latest freeze BY `win`() (the
+        // SAME key the bucket window uses; samples_in_phase is NOT positionally
+        // ordered — the stimulus offset-remap can reorder it). The per-CPU delta
+        // is correlated by the per_cpu_time `cpu` FIELD (not vec position) over
+        // the CPUs present in BOTH endpoints; a CPU absent from either is skipped
+        // (hotplug defense — a no-op on ktstr's boot-fixed vCPU set, but
+        // correct-by-construction if a hot-add Op ever lands). saturating_sub
+        // clamps a per-CPU counter regress (kernel-global monotonic; a regress
+        // would signal a reset). Loud-absent: max_cpu_hardirqs needs >= 2
+        // freezes spanning a positive `win` window + >= 1 defined-delta CPU; the
+        // concentration ratio ADDITIONALLY needs >= 2 defined-delta CPUs (a
+        // 1-CPU intersection makes max/mean == 1 a structural artifact) AND
+        // mean > 0 (a NaN would fail the sidecar's is_finite insert-guard).
+        {
+            let placed: Vec<(&crate::scenario::sample::Sample<'_>, u64)> = samples_in_phase
+                .iter()
+                .filter(|s| !s.snapshot.per_cpu_time().is_empty())
+                .filter_map(|s| win(s).map(|w| (s, w)))
+                .collect();
+            if let (Some(&(first_s, fw)), Some(&(last_s, lw))) = (
+                placed.iter().min_by_key(|(_, w)| *w),
+                placed.iter().max_by_key(|(_, w)| *w),
+            ) && fw < lw
+            {
+                // Per-CPU delta over the cpu-field intersection of the two
+                // endpoint freezes; clamp a regress to 0.
+                let deltas: Vec<f64> = first_s
+                    .snapshot
+                    .per_cpu_time()
+                    .iter()
+                    .filter_map(|c0| {
+                        last_s
+                            .snapshot
+                            .per_cpu_time_at(c0.cpu)
+                            .map(|c1| c1.irqs_sum.saturating_sub(c0.irqs_sum) as f64)
+                    })
+                    .collect();
+                if let Some(max) = deltas.iter().copied().reduce(f64::max) {
+                    metrics.entry("max_cpu_hardirqs".to_string()).or_insert(max);
+                    if deltas.len() >= 2 {
+                        let mean = deltas.iter().sum::<f64>() / deltas.len() as f64;
+                        if mean > 0.0 {
+                            metrics
+                                .entry("max_cpu_hardirq_concentration".to_string())
+                                .or_insert(max / mean);
+                        }
+                    }
+                }
+            }
+        }
         let mut bucket = PhaseBucket {
             step_index,
             label,

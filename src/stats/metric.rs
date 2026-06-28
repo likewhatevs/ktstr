@@ -1928,8 +1928,10 @@ pub static METRICS: &[MetricDef] = &[
     // system_time_ns. The time signals require CONFIG_IRQ_TIME_ACCOUNTING;
     // loud-absent (None), never false-zero, when off. Per-phase
     // reduction is the Counter last-minus-first over the bucket's freeze
-    // captures (needs num_snapshots >= 2). max_cpu_hardirqs (spatial-max of a
-    // cumulative counter) is NOT here — it needs a per-CPU axis (follow-up).
+    // captures (needs num_snapshots >= 2). The per-CPU SPATIAL axis
+    // (max_cpu_hardirqs + max_cpu_hardirq_concentration, the busiest-CPU
+    // dimension vs this cross-CPU SUM) is registered below; per-softirq
+    // spatial-max is a follow-up.
     MetricDef {
         // Sum of kernel_stat.irqs_sum across CPUs — total hardirqs fired
         // (per-CPU monotonic count, __kstat_incr_irqs_this_cpu,
@@ -2125,6 +2127,44 @@ pub static METRICS: &[MetricDef] = &[
         default_abs: 1_000_000.0,
         default_rel: 0.30,
         display_unit: "ns",
+        accessor: |_| None,
+    },
+    MetricDef {
+        // Per-CPU IRQ spatial axis: the BUSIEST CPU's hardirq delta over the
+        // phase — max over CPUs of each CPU's (last - first freeze) irqs_sum,
+        // correlated by the per_cpu_time cpu field (NOT the cross-CPU sum, which
+        // is total_hardirqs). Custom per-CPU-delta fold in assert::phase_build,
+        // NOT a read_sample arm (read_sample yields one f64 per freeze, no
+        // per-CPU vector). Peak = spatial-max of a per-CPU cumulative-counter
+        // delta. Informational: a high busiest-CPU count is ambiguous (high
+        // traffic vs concentration) — the concentration ratio below is the
+        // balance signal, mirroring the raw-counts-Informational split.
+        name: "max_cpu_hardirqs",
+        polarity: crate::test_support::Polarity::Informational,
+        kind: MetricKind::Peak,
+        default_abs: 500.0,
+        default_rel: 0.50,
+        display_unit: "",
+        accessor: |_| None,
+    },
+    MetricDef {
+        // IRQ-concentration ratio: max_cpu_hardirqs / mean per-CPU hardirq delta
+        // over the SAME reporting-CPU set — the busiest CPU's share of the
+        // average. Range [1, num_cpus]: 1.0 = perfectly even, higher = IRQs
+        // concentrated on one CPU. Peak (worst per-phase concentration),
+        // LowerBetter. Computed in the same per-CPU-delta fold, NOT a Rate (a
+        // Peak numerator fails every_rate_metric_has_registered_counter_components,
+        // and max/mean is not Σ-poolable). DELIBERATELY max/MEAN, distinct from
+        // the sibling max_imbalance_ratio's max/MIN: max/min explodes when any
+        // CPU takes ~0 IRQs, whereas max/mean measures disproportionate SHARE
+        // (the IRQ-steering question). Absent (None) when < 2 reporting CPUs or
+        // mean == 0.
+        name: "max_cpu_hardirq_concentration",
+        polarity: crate::test_support::Polarity::LowerBetter,
+        kind: MetricKind::Peak,
+        default_abs: 1.0,
+        default_rel: 0.25,
+        display_unit: "x",
         accessor: |_| None,
     },
     MetricDef {

@@ -139,6 +139,14 @@ builtin_metrics! {
     TotalPhaseWallSec => "total_phase_wall_sec",
     TotalPhaseWallNs => "total_phase_wall_ns",
 
+    // Per-CPU IRQ spatial axis (the busiest-CPU dimension; the IRQ counters
+    // above are the cross-CPU SUM). Custom per-CPU-delta bucket-fold, NOT a
+    // read_sample arm (read_sample yields one f64 per freeze, no per-CPU
+    // vector). max_cpu_hardirqs = max over CPUs of each CPU's hardirq delta;
+    // _concentration = max / mean over the reporting CPUs. Both Peak.
+    MaxCpuHardirqs => "max_cpu_hardirqs",
+    MaxCpuHardirqConcentration => "max_cpu_hardirq_concentration",
+
     // Per-phase scalars (MetricKind::PerPhase) — schbench / taobench engine
     // metrics, surfaced via the per-phase PhaseBucket path (const-named).
     WakeupP50LatencyUs => "wakeup_p50_latency_us",
