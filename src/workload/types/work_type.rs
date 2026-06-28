@@ -1717,6 +1717,54 @@ pub enum WorkType {
         /// interval never advances the deadline and busy-spins).
         interval_us: u64,
     },
+    /// AF_PACKET traffic generator that drives the virtio-net NIC's RX
+    /// hardirq and NAPI softirq. Each worker opens an `AF_PACKET` /
+    /// `SOCK_RAW` socket bound to the single non-loopback (virtio-net)
+    /// interface, brings it administratively up, and sends self-addressed
+    /// L2 frames in a loop. Every `sendto` is a virtio TX kick; the v0
+    /// in-VMM-loopback backend echoes the frame straight into RX and raises
+    /// the guest's RX-completion interrupt, so the workload generates real
+    /// per-CPU hardirq + softirq load for the scheduler to absorb.
+    ///
+    /// **Kernel path:** `sendto` → `packet_sendmsg` → `dev_queue_xmit` (an
+    /// L2 inject that bypasses the IP stack) → virtio-net `start_xmit` →
+    /// `virtqueue_notify` (an MMIO QUEUE_NOTIFY that exits to the host). The
+    /// host loopback echoes TX→RX and signals the RX virtqueue; the guest
+    /// virtio-mmio ISR runs `vring_interrupt` → `skb_recv_done` →
+    /// `virtqueue_napi_schedule`, raising `NET_RX_SOFTIRQ` (drained by
+    /// `virtnet_poll` in softirq context). NAPI coalesces, so a tight burst
+    /// yields fewer hardirqs but sustained softirq work.
+    ///
+    /// **Why AF_PACKET, not IP traffic:** a guest sending to its own IP is
+    /// routed to `lo` (`RTN_LOCAL`) and never reaches the NIC, raising zero
+    /// virtio IRQs. Only an `AF_PACKET` raw socket bound to the interface
+    /// drives a real TX kick. Requires `CONFIG_PACKET=y` (`ktstr.kconfig`)
+    /// and `CAP_NET_ADMIN` for the interface-up ioctl — ktstr always runs as
+    /// root, so the capability is present.
+    ///
+    /// **Precondition:** a NIC must be attached via
+    /// `#[ktstr_test(network = ...)]` with a [`crate::prelude::NetConfig`].
+    /// With no non-loopback interface present the worker is a LOUD no-op: it
+    /// warns once and returns `work_units == 0` rather than silently doing
+    /// nothing.
+    ///
+    /// `worker_group_size = None` (any worker count; each worker drives the
+    /// shared NIC independently). Frames sent are reported as `work_units` /
+    /// `iterations`; the IRQ-side signals (`rq->avg_irq`, per-CPU softirq
+    /// time, `/proc/interrupts`) are observed separately, not by this
+    /// variant.
+    NetTraffic {
+        /// Inter-frame pause in microseconds. `0` (the default) sends
+        /// continuously — the maximum TX-kick rate, i.e. maximum softirq
+        /// pressure (NAPI coalesces the hardirqs). A value `> 0` paces the
+        /// loop to approximately `1_000_000 / interval_us` frames per second
+        /// for a steady, controlled IRQ rate.
+        interval_us: u64,
+        /// Ethernet frame size in bytes. Default 60 (`ETH_ZLEN`, the minimum
+        /// L2 frame sans FCS). Validated to `[60, 1514]` (minimum frame ..
+        /// standard MTU + header) at spawn.
+        frame_bytes: u16,
+    },
     /// Sustained high-IPC ALU workload. Each worker runs four
     /// independent multiply chains in parallel, with
     /// [`std::hint::black_box`] wrapping every step to prevent

@@ -93,12 +93,14 @@ pub fn pin_irq_to_cpu(irq: u32, cpu: usize) -> Result<()> {
 }
 
 /// Per-CPU interrupt count for `irq` on Linux processor `cpu`, from
-/// `/proc/interrupts`. x86_64 layout (no Edge/Level column — that field is
-/// gated on CONFIG_GENERIC_IRQ_SHOW_LEVEL, which x86 does not select):
-///   `<IRQ>: <c0> <c1> ... <cN-1>  <chip>  <hwirq>  <action>`
-/// The first N tokens after `:` are the per-online-CPU counts indexed by
-/// processor number; the chip name follows. Callers pin all vCPUs online,
-/// so `tokens[cpu]` is a count, never the chip name.
+/// `/proc/interrupts`. The leading columns after `:` are the per-online-CPU
+/// counts (indexed by processor number) on BOTH x86_64 and arm64:
+///   `<IRQ>: <c0> <c1> ... <cN-1>  <chip>  <hwirq>  [<Edge/Level>]  <action>`
+/// The `Edge/Level` column is gated on CONFIG_GENERIC_IRQ_SHOW_LEVEL — arm64
+/// selects it (arch/arm64/Kconfig), x86 does not — but it (with chip/hwirq)
+/// TRAILS the per-CPU counts, so it never shifts them: `tokens[cpu]` for
+/// `cpu` in `[0, N_online)` is a count on both arches. Callers pin all vCPUs
+/// online, so `tokens[cpu]` is never the chip name.
 #[allow(dead_code)]
 pub fn irq_count(irq: u32, cpu: usize) -> Result<u64> {
     let irqs = fs::read_to_string("/proc/interrupts")?;
@@ -116,4 +118,37 @@ pub fn irq_count(irq: u32, cpu: usize) -> Result<u64> {
         }
     }
     bail!("irq {irq} not found in /proc/interrupts")
+}
+
+/// The single non-loopback network interface (the virtio-net NIC). Skips
+/// `lo`; the NIC is the one interface backed by a device (a `device` symlink
+/// under its sysfs node). Shared by the virtio-net e2es (wide_smp_net_irq +
+/// net_traffic).
+#[allow(dead_code)]
+pub fn virtio_net_iface() -> Result<String> {
+    for ent in fs::read_dir("/sys/class/net")? {
+        let ent = ent?;
+        let name = ent.file_name().to_string_lossy().into_owned();
+        if name == "lo" {
+            continue;
+        }
+        if ent.path().join("device").exists() {
+            return Ok(name);
+        }
+    }
+    bail!("no non-loopback network interface with a device under /sys/class/net")
+}
+
+/// The virtio-net IRQ number + device basename: the NIC's sysfs device
+/// basename (e.g. `virtio1`) is its `/proc/interrupts` action name.
+#[allow(dead_code)]
+pub fn virtio_net_irq(iface: &str) -> Result<(u32, String)> {
+    let dev = fs::canonicalize(format!("/sys/class/net/{iface}/device"))?;
+    let name = dev
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| anyhow::anyhow!("no basename for {dev:?}"))?
+        .to_string();
+    let irq = device_irq_by_action_name(&name)?;
+    Ok((irq, name))
 }

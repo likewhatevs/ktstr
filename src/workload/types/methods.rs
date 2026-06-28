@@ -74,6 +74,7 @@ impl WorkType {
             WorkType::SmtSiblingSpin => "SmtSiblingSpin",
             WorkType::IpcVariance { .. } => "IpcVariance",
             WorkType::TimerLatency { .. } => "TimerLatency",
+            WorkType::NetTraffic { .. } => "NetTraffic",
         }
     }
 
@@ -234,6 +235,10 @@ impl WorkType {
             }),
             "TimerLatency" => Some(WorkType::TimerLatency {
                 interval_us: defaults::TIMER_LATENCY_INTERVAL_US,
+            }),
+            "NetTraffic" => Some(WorkType::NetTraffic {
+                interval_us: defaults::NET_TRAFFIC_INTERVAL_US,
+                frame_bytes: defaults::NET_TRAFFIC_FRAME_BYTES,
             }),
             // Sequence requires explicit phases; no default from_name.
             _ => None,
@@ -841,6 +846,17 @@ impl WorkType {
     /// see [`WorkType::AluHot`] variant doc for preconditions.
     pub const fn alu_hot(width: AluWidth) -> Self {
         WorkType::AluHot { width }
+    }
+
+    /// Construct a [`WorkType::NetTraffic`] with an inter-frame interval
+    /// (`interval_us`; `0` = continuous burst) and Ethernet `frame_bytes`.
+    /// `frame_bytes` is validated to `[60, 1514]` at spawn, not here; see the
+    /// [`WorkType::NetTraffic`] variant doc.
+    pub const fn net_traffic(interval_us: u64, frame_bytes: u16) -> Self {
+        WorkType::NetTraffic {
+            interval_us,
+            frame_bytes,
+        }
     }
 
     /// Construct a [`WorkType::IpcVariance`] with explicit hot,

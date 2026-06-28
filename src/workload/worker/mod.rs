@@ -231,6 +231,10 @@ unsafe fn futex_wait(futex_ptr: *mut u32, expected: u32, ts: &libc::timespec) {
 mod io;
 use io::*;
 
+// AF_PACKET traffic sender for WorkType::NetTraffic, split out to keep this
+// file under the line budget. Items are qualified at the call site.
+mod net_traffic;
+
 /// Derive a worker's off-CPU time from its wall-clock and CPU-time
 /// totals: `off_cpu_ns = wall_time_ns - cpu_time_ns`, saturating at
 /// 0. Saturating (not wrapping) because `cpu_time_ns` and
@@ -486,6 +490,11 @@ pub(super) fn worker_main(
     // (CO-free). CLOCK_MONOTONIC ns-since-boot is never 0, so 0 is a safe
     // unseeded sentinel.
     let mut timer_next_deadline_ns: u64 = 0;
+    // NetTraffic (AF_PACKET) sender — lazily opened on the first NetTraffic
+    // cycle (post-fork) and held across iterations. `None` + !failed = not yet
+    // attempted; `Some` = ready; failed = no NIC / setup error → LOUD no-op.
+    let mut net_sender: Option<net_traffic::NetTrafficSender> = None;
+    let mut net_setup_failed = false;
     // Per-iteration wall-clock compute duration samples
     // (reservoir-sampled at the same cap as wake_latencies_ns).
     // Populated by AluHot, SmtSiblingSpin, IpcVariance; all other
@@ -3461,6 +3470,58 @@ pub(super) fn worker_main(
                 // Accumulate the absolute deadline by exactly one interval (never
                 // re-base on `now`) — the CO-free invariant.
                 timer_next_deadline_ns = timer_next_deadline_ns.saturating_add(interval_ns);
+                last_iter_time = Instant::now();
+                iterations += 1;
+            }
+            WorkType::NetTraffic {
+                interval_us,
+                frame_bytes,
+            } => {
+                // AF_PACKET traffic generator. The fd is opened lazily on the
+                // first cycle (post-fork — a pre-fork fd would be shared across
+                // workers) and held across iterations. No NIC / setup error →
+                // a LOUD no-op (warn once, work_units stays 0), per the variant
+                // contract. The send recipe lives in net_traffic.rs.
+                if net_sender.is_none() && !net_setup_failed {
+                    match net_traffic::NetTrafficSender::setup(frame_bytes) {
+                        Ok(s) => net_sender = Some(s),
+                        Err(e) => {
+                            net_traffic::warn_net_traffic_setup_failed_once(&e);
+                            net_setup_failed = true;
+                        }
+                    }
+                }
+                if let Some(sender) = net_sender.as_ref() {
+                    // Each frame is one virtio TX kick → one RX-completion
+                    // hardirq + NAPI softirq via the in-VMM loopback. Count
+                    // only successful sends (a timed-out full-ring send did no
+                    // work).
+                    if sender.send_one() {
+                        work_units = std::hint::black_box(work_units.wrapping_add(1));
+                    }
+                    // Optional pacing for a steady IRQ rate; interval_us == 0 is
+                    // a continuous burst (max softirq pressure). A workload
+                    // sleep, like IdleChurn — not a control-flow wait.
+                    if interval_us > 0 {
+                        let req = libc::timespec {
+                            tv_sec: (interval_us / 1_000_000) as libc::time_t,
+                            tv_nsec: ((interval_us % 1_000_000) * 1_000) as libc::c_long,
+                        };
+                        // SAFETY: req is a valid timespec; rmtp null (EINTR just
+                        // shortens the pause — the loop's stop check ends it).
+                        unsafe {
+                            libc::nanosleep(&req, std::ptr::null_mut());
+                        }
+                    }
+                } else {
+                    // No NIC: LOUD no-op (work_units stays 0; the warn already
+                    // fired). Yield so the loop still reaches the stop check
+                    // without busy-spinning — mirrors the CgroupAttachStorm
+                    // no-op.
+                    unsafe {
+                        libc::sched_yield();
+                    }
+                }
                 last_iter_time = Instant::now();
                 iterations += 1;
             }

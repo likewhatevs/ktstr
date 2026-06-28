@@ -1880,6 +1880,15 @@ pub(super) fn validate_workload_admission(group: &GroupParams) -> Result<()> {
             .into());
         }
     }
+    if let WorkType::NetTraffic { frame_bytes, .. } = group.work_type
+        && !(60..=1514).contains(&frame_bytes)
+    {
+        return Err(WorkTypeValidationError::NetTrafficFrameBytes {
+            frame_bytes,
+            group_idx: group.group_idx,
+        }
+        .into());
+    }
     Ok(())
 }
 

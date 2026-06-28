@@ -140,6 +140,22 @@ pub enum WorkTypeValidationError {
         /// `WorkloadConfig::composed` (primary group = 0).
         group_idx: usize,
     },
+    /// [`WorkType::NetTraffic`] with `frame_bytes` outside `[60, 1514]`. Below
+    /// 60 (`ETH_ZLEN`) there is no room for the L2 header the loopback echoes;
+    /// above 1514 (standard MTU + header) the frame exceeds the virtio-net MTU.
+    #[error(
+        "NetTraffic frame_bytes must be in [60, 1514] (got {frame_bytes}, group \
+         {group_idx}); below 60 there is no room for the Ethernet header and \
+         above 1514 exceeds the standard MTU (see [`WorkType::NetTraffic`] \
+         variant doc)"
+    )]
+    NetTrafficFrameBytes {
+        /// The offending `frame_bytes` value the caller supplied.
+        frame_bytes: u16,
+        /// Index of the offending group in
+        /// `WorkloadConfig::composed` (primary group = 0).
+        group_idx: usize,
+    },
     /// [`WorkType::WakeChain`] with `depth < 2`. A 1-stage chain has
     /// no successor to wake, and the post-fork close-other-fds
     /// block would close the worker's own write end (deadlock).

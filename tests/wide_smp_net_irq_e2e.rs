@@ -43,29 +43,12 @@ use std::mem;
 
 #[path = "common/wide_smp_irq.rs"]
 mod wide_smp_irq;
-use wide_smp_irq::{device_irq_by_action_name, find_apic_above_255, irq_count, pin_irq_to_cpu};
+use wide_smp_irq::{find_apic_above_255, irq_count, pin_irq_to_cpu, virtio_net_iface, virtio_net_irq};
 
 /// virtio-net with a deterministic locally-administered MAC. Const because
 /// `NetConfig::default` is not const and the `network =` macro arg needs a
 /// const-evaluable path; `NetConfig::DEFAULT.mac(..)` is the const-fn chain.
 const KTSTR_NET: NetConfig = NetConfig::DEFAULT.mac([0x52, 0x54, 0x00, 0x12, 0x34, 0x56]);
-
-/// The single non-loopback network interface (the virtio-net NIC). Skips
-/// `lo`; the NIC is the one interface backed by a device (a `device`
-/// symlink under its sysfs node).
-fn virtio_net_iface() -> Result<String> {
-    for ent in fs::read_dir("/sys/class/net")? {
-        let ent = ent?;
-        let name = ent.file_name().to_string_lossy().into_owned();
-        if name == "lo" {
-            continue;
-        }
-        if ent.path().join("device").exists() {
-            return Ok(name);
-        }
-    }
-    bail!("no non-loopback network interface with a device under /sys/class/net")
-}
 
 /// Read `/sys/class/net/<iface>/ifindex`.
 fn iface_ifindex(iface: &str) -> Result<i32> {
@@ -92,19 +75,6 @@ fn iface_mac(iface: &str) -> Result<[u8; 6]> {
         s.trim()
     );
     Ok(mac)
-}
-
-/// The virtio-net IRQ number: the NIC's sysfs device basename (e.g.
-/// `virtio1`) is its `/proc/interrupts` action name.
-fn virtio_net_irq(iface: &str) -> Result<(u32, String)> {
-    let dev = fs::canonicalize(format!("/sys/class/net/{iface}/device"))?;
-    let name = dev
-        .file_name()
-        .and_then(|n| n.to_str())
-        .ok_or_else(|| anyhow::anyhow!("no basename for {dev:?}"))?
-        .to_string();
-    let irq = device_irq_by_action_name(&name)?;
-    Ok((irq, name))
 }
 
 /// Bring `iface` administratively up via `SIOCSIFFLAGS` (no `ip`/`ifconfig`

@@ -165,6 +165,13 @@ pub mod defaults {
     /// (µs): 1000 = 1kHz, matching `cyclictest`'s default tick rate. The
     /// absolute deadline advances by this each cycle.
     pub const TIMER_LATENCY_INTERVAL_US: u64 = 1000;
+    // NetTraffic
+    /// Default [`crate::workload::WorkType::NetTraffic`] inter-frame interval
+    /// (µs): 0 = continuous (maximum TX-kick / softirq rate).
+    pub const NET_TRAFFIC_INTERVAL_US: u64 = 0;
+    /// Default [`crate::workload::WorkType::NetTraffic`] Ethernet frame size
+    /// (bytes): 60 = `ETH_ZLEN`, the minimum L2 frame sans FCS.
+    pub const NET_TRAFFIC_FRAME_BYTES: u16 = 60;
     // AluHot
     /// Default for `WorkType::AluHot`'s `width` field. `Widest`
     /// resolves to the widest data-path the host supports at

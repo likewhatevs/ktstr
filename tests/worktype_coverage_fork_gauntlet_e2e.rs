@@ -48,6 +48,10 @@
 //!     direct-spawn path does not provide; here it would no-op (the
 //!     dest is unresolvable). Driven by the dedicated
 //!     `tests/cgroup_attach_storm_e2e.rs`.
+//!   - [`WorkType::NetTraffic`] — Fork-compatible, but needs an attached
+//!     NIC (`#[ktstr_test(network = ...)]`) that this direct-spawn path
+//!     does not provide; here it would no-op (no non-loopback interface).
+//!     Driven by the dedicated `tests/net_traffic_e2e.rs`.
 //!   - [`WorkType::Schbench`] — driven by its own schbench engine (a
 //!     message-thread + worker-thread pool, not the generic
 //!     per-iteration worker body); covered by
