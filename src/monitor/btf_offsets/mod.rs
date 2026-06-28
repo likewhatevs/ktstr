@@ -56,6 +56,11 @@ mod psi;
 // re-exports are kept here so the walker wires in without a follow-up `pub use`.
 pub use psi::{PsiGroupOffsets, decode_avg10_percent, decode_total_us};
 
+mod cgroup;
+// Per-cgroup PSI-irq host-walk (Phase A): the cgroup-hierarchy field
+// offsets the cgroup_walk module uses to locate each test cgroup's psi_group.
+pub use cgroup::CgroupWalkOffsets;
+
 mod numa;
 // NUMA event capture is pending: the wire shape and BTF resolver
 // are landed but the live walker that consumes these constants

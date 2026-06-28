@@ -73,6 +73,7 @@ fn synthetic_report() -> FailureDumpReport {
         prog_runtime_stats: Vec::new(),
         prog_runtime_stats_unavailable: None,
         per_cpu_time: Vec::new(),
+        cgroup_psi: Vec::new(),
         per_node_numa: Vec::new(),
         per_node_numa_unavailable: None,
         task_enrichments: Vec::new(),

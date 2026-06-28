@@ -281,6 +281,7 @@ mod tests {
             scx_watchdog_interval: None,
             jiffies_64: None,
             psi_system: None,
+            cgrp_dfl_root: None,
             kernel_cpustat: None,
             kstat: None,
             tick_cpu_sched: None,

@@ -174,6 +174,41 @@ pub struct CpuTimeCapture<'a> {
     pub kaslr_offset: u64,
 }
 
+/// Per-cgroup PSI-irq host-walk inputs (Phase A). Borrowed-only/optional,
+/// mirroring [`CpuTimeCapture`]: the freeze coordinator builds it only when the
+/// cgroup-walk offsets, the `cgrp_dfl_root` symbol, and the `psi_group` offsets
+/// all resolve; otherwise [`DumpContext::cgroup_psi_capture`] is `None` and the
+/// per-cgroup axis reads loud-absent. The walk descends `cgrp_dfl_root` → the
+/// host-held workload-root path → leaf cgroups and reads each leaf's
+/// `cgroup->psi` PSI_IRQ_FULL (see [`super::cgroup_walk`]).
+pub struct CgroupPsiCapture<'a> {
+    /// Guest memory handle used to read the cgroup hierarchy + each psi_group.
+    pub mem: &'a super::reader::GuestMem,
+    /// BTF-resolved cgroup-hierarchy field offsets (`cgroup.{self,kn,psi}`,
+    /// `cgroup_subsys_state.{sibling,children}`, `cgroup_root.cgrp`,
+    /// `kernfs_node.name`).
+    pub cgroup_offsets: &'a super::btf_offsets::CgroupWalkOffsets,
+    /// BTF-resolved `psi_group` offsets (shared with the system-wide walk —
+    /// a per-cgroup psi_group is the same `struct psi_group`).
+    pub psi_offsets: &'a super::btf_offsets::PsiGroupOffsets,
+    /// RUNTIME KVA of the hierarchy root cgroup (`cgrp_dfl_root +
+    /// offsetof(cgroup_root, cgrp)`, with any virtual-KASLR slide applied by
+    /// the caller) — used for the children-list anchor compare at the root
+    /// level. Every descendant is a direct-mapped slab object.
+    pub root_cgroup_kva: u64,
+    /// Guest physical address of the hierarchy root cgroup (the kernel-image
+    /// translation of the link-time root KVA, done by the caller via
+    /// `GuestKernel::text_kva_to_pa`) — the walk's entry read.
+    pub root_cgroup_pa: u64,
+    /// The test's workload-root cgroup path (host-held VM config, default
+    /// `/sys/fs/cgroup/ktstr`). The walk descends ONLY this subtree, so the
+    /// scheduler's separate cgroup does not confound the per-cgroup axis.
+    pub workload_root_path: &'a str,
+    /// Guest `PAGE_OFFSET` for the direct-map (`kva_to_pa`) hops to every
+    /// descendant cgroup / kernfs_node / psi_group.
+    pub page_offset: u64,
+}
+
 /// Borrow-only capture context for per-task enrichment.
 ///
 /// Carries the [`super::guest::GuestKernel`] (guest memory + symbol
@@ -1105,6 +1140,15 @@ pub struct FailureDumpReport {
     /// `rq->nr_iowait` but not the cumulative time accounting).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub per_cpu_time: Vec<PerCpuTimeStats>,
+    /// Per-cgroup PSI-irq samples for the test's workload cgroups, host-walked
+    /// from the cgroup hierarchy at this freeze (Phase A). One entry per
+    /// workload-root leaf cgroup with per-cgroup PSI accounting enabled. Empty
+    /// when the dump caller passed no `CgroupPsiCapture`, the workload root
+    /// isn't present yet, or `psi_cgroups_enabled` is off — loud-absent. RAW
+    /// values; decoded + folded at the metric layer. See
+    /// `super::cgroup_walk::CgroupPsiStat`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cgroup_psi: Vec<super::cgroup_walk::CgroupPsiStat>,
     /// Per-node NUMA event counters captured from
     /// `pglist_data->node_zones[]->vm_numa_event[]`. One row per
     /// NUMA node enumerated by the walker. Empty when the live
@@ -1295,6 +1339,7 @@ impl Default for FailureDumpReport {
             prog_runtime_stats: Vec::new(),
             prog_runtime_stats_unavailable: None,
             per_cpu_time: Vec::new(),
+            cgroup_psi: Vec::new(),
             per_node_numa: Vec::new(),
             per_node_numa_unavailable: None,
             task_enrichments: Vec::new(),
@@ -2197,6 +2242,10 @@ pub struct DumpContext<'a> {
     /// future capture site lands as another optional field without
     /// churning the call sites already plumbed through here.
     pub cpu_time_capture: Option<&'a CpuTimeCapture<'a>>,
+    /// Per-cgroup PSI-irq capture (Phase A). `None` skips the cgroup
+    /// hierarchy walk; the rest of the dump still renders. Same
+    /// borrowed-only/optional shape as [`Self::cpu_time_capture`].
+    pub cgroup_psi_capture: Option<&'a CgroupPsiCapture<'a>>,
     /// Per-task enrichment capture. `None` skips the per-task walk
     /// and `task_enrichments` stays empty; the rest of the dump
     /// still renders.
@@ -2612,6 +2661,7 @@ pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
         arena_offsets,
         prog_capture,
         cpu_time_capture,
+        cgroup_psi_capture,
         task_enrichment_capture,
         event_counter_capture,
         scx_walker_capture,
@@ -2674,6 +2724,13 @@ pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
     };
     let per_cpu_time = match cpu_time_capture {
         Some(cap) => collect_per_cpu_time(cap),
+        None => Vec::new(),
+    };
+    // Per-cgroup PSI-irq for the test's workload leaves (Phase A). Empty
+    // when no capture was supplied, the workload root isn't present, or
+    // psi_cgroups is off — loud-absent.
+    let cgroup_psi = match cgroup_psi_capture {
+        Some(cap) => collect_cgroup_psi(cap),
         None => Vec::new(),
     };
     let task_enrichment_t0 = std::time::Instant::now();
@@ -2991,6 +3048,7 @@ pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
         prog_runtime_stats,
         prog_runtime_stats_unavailable,
         per_cpu_time,
+        cgroup_psi,
         // Per-node NUMA wire fields: empty Vec + the well-defined
         // diagnostic string until the host-side walker lands.
         per_node_numa: Vec::new(),
@@ -3867,6 +3925,23 @@ fn collect_per_cpu_time(cap: &CpuTimeCapture<'_>) -> Vec<PerCpuTimeStats> {
         });
     }
     out
+}
+
+/// Walk the test's workload cgroups and read each leaf's PSI_IRQ_FULL (Phase A).
+/// Thin adapter over
+/// [`super::cgroup_walk::collect_workload_cgroup_psi`] that unpacks the
+/// borrowed [`CgroupPsiCapture`]. Empty when no workload leaf has per-cgroup
+/// PSI accounting (loud-absent).
+fn collect_cgroup_psi(cap: &CgroupPsiCapture<'_>) -> Vec<super::cgroup_walk::CgroupPsiStat> {
+    super::cgroup_walk::collect_workload_cgroup_psi(
+        cap.mem,
+        cap.cgroup_offsets,
+        cap.psi_offsets,
+        cap.root_cgroup_kva,
+        cap.root_cgroup_pa,
+        cap.workload_root_path,
+        cap.page_offset,
+    )
 }
 
 /// Walk a Datasec section by name, yielding `(var_name, byte_offset,

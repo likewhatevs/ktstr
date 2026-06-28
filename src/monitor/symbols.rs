@@ -264,6 +264,16 @@ pub(crate) struct KernelSymbols {
     /// resolved once at monitor-thread setup like `jiffies_64` /
     /// `scx_watchdog_timestamp` — NOT the `kva_to_pa` direct mapping.
     pub psi_system: Option<u64>,
+    /// Kernel virtual address of `cgrp_dfl_root` (the cgroup2 default-hierarchy
+    /// root, `kernel/cgroup/cgroup.c:179`, external linkage, initialized →
+    /// `.data`). The per-cgroup PSI-irq walk starts here: `cgrp_dfl_root +
+    /// offsetof(cgroup_root, cgrp)` is the hierarchy root cgroup, from which the
+    /// walk descends the host-held workload-root path to the test's leaf cgroups
+    /// and reads each leaf's `cgroup->psi`. `None` when the symbol is absent (no
+    /// `CONFIG_CGROUPS`, or a stripped vmlinux) → the per-cgroup axis reads
+    /// loud-absent. A kernel-image `.data` global, so the KVA→PA path is
+    /// `text_kva_to_pa_with_base` (like `psi_system`), NOT the direct map.
+    pub cgrp_dfl_root: Option<u64>,
     /// Link-time KVA of `entry_SYSCALL_64` — the SYSCALL entry handler
     /// symbol (defined `SYM_CODE_START` in `arch/x86/entry/entry_64.S`).
     /// Used with MSR_LSTAR to derive the runtime virtual KASLR offset:
@@ -489,6 +499,11 @@ impl KernelSymbols {
         // PSI-irq metrics read loud-absent.
         let psi_system = sym_addr("psi_system");
 
+        // cgrp_dfl_root: the cgroup2 default-hierarchy root (.data global, like
+        // psi_system). The per-cgroup PSI-irq walk descends from its
+        // embedded `cgrp` cgroup. None when absent → per-cgroup axis loud-absent.
+        let cgrp_dfl_root = sym_addr("cgrp_dfl_root");
+
         Ok(Self {
             runqueues,
             per_cpu_offset,
@@ -510,6 +525,7 @@ impl KernelSymbols {
             tick_cpu_sched,
             node_data,
             psi_system,
+            cgrp_dfl_root,
         })
     }
 }
@@ -1488,6 +1504,7 @@ mod tests {
             scx_watchdog_interval: None,
             jiffies_64: None,
             psi_system: None,
+            cgrp_dfl_root: None,
             kernel_cpustat: None,
             kstat: None,
             tick_cpu_sched: None,
@@ -1525,6 +1542,7 @@ mod tests {
             scx_watchdog_interval: None,
             jiffies_64: None,
             psi_system: None,
+            cgrp_dfl_root: None,
             kernel_cpustat: None,
             kstat: None,
             tick_cpu_sched: None,
@@ -1564,6 +1582,7 @@ mod tests {
             scx_watchdog_interval: None,
             jiffies_64: None,
             psi_system: None,
+            cgrp_dfl_root: None,
             kernel_cpustat: None,
             kstat: None,
             tick_cpu_sched: None,
@@ -1606,6 +1625,7 @@ mod tests {
             scx_watchdog_interval: None,
             jiffies_64: None,
             psi_system: None,
+            cgrp_dfl_root: None,
             kernel_cpustat: None,
             kstat: None,
             tick_cpu_sched: None,
@@ -1651,6 +1671,7 @@ mod tests {
             scx_watchdog_interval: None,
             jiffies_64: None,
             psi_system: None,
+            cgrp_dfl_root: None,
             kernel_cpustat: None,
             kstat: None,
             tick_cpu_sched: None,
@@ -1692,6 +1713,7 @@ mod tests {
             scx_watchdog_interval: None,
             jiffies_64: None,
             psi_system: None,
+            cgrp_dfl_root: None,
             kernel_cpustat: None,
             kstat: None,
             tick_cpu_sched: None,
@@ -1730,6 +1752,7 @@ mod tests {
             scx_watchdog_interval: None,
             jiffies_64: None,
             psi_system: None,
+            cgrp_dfl_root: None,
             kernel_cpustat: None,
             kstat: None,
             tick_cpu_sched: None,
@@ -1764,6 +1787,7 @@ mod tests {
             scx_watchdog_interval: None,
             jiffies_64: None,
             psi_system: None,
+            cgrp_dfl_root: None,
             kernel_cpustat: None,
             kstat: None,
             tick_cpu_sched: None,

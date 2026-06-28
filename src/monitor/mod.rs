@@ -21,6 +21,7 @@ pub mod bpf_syscall;
 pub mod btf_offsets;
 pub mod btf_render;
 pub(crate) mod cast_analysis;
+pub mod cgroup_walk;
 pub mod dmesg_scx;
 pub mod dump;
 pub mod guest;

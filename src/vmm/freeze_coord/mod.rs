@@ -1761,6 +1761,38 @@ impl KtstrVm {
         // [`monitor::dump::DualFailureDumpReport`]. Set by
         // `attempt_auto_repro` for the repro VM only.
         let freeze_coord_dual_snapshot = self.dual_snapshot;
+        // The test's workload-root cgroup path (host-held), for the
+        // per-cgroup PSI-irq walk's subtree filter. Defaults to the guest's
+        // resolve_cgroup_root default (/sys/fs/cgroup/ktstr) when unset, so the
+        // walk targets the same subtree the scenario created its cgroups under.
+        let freeze_coord_workload_root = self
+            .workload_root_cgroup
+            .clone()
+            .unwrap_or_else(|| "/sys/fs/cgroup/ktstr".to_string());
+        // Phase A precondition (loud check): the per-cgroup PSI walk filters
+        // to the workload-root subtree, so a scheduler cgroup nested UNDER the
+        // workload root would be mis-collected as a spurious workload leaf. The
+        // default is safe (no scheduler cgroup_parent → the scheduler inherits
+        // the root cgroup, outside the workload subtree). Warn if a config nests
+        // them — the confound is otherwise silent in the cross-cgroup fold.
+        if let Some(sched_parent) = self.scheduler_cgroup_parent.as_deref() {
+            let cgroup_rel =
+                |p: &str| p.strip_prefix("/sys/fs/cgroup").unwrap_or(p).trim_matches('/').to_string();
+            let sched_rel = cgroup_rel(sched_parent);
+            let wl_rel = cgroup_rel(&freeze_coord_workload_root);
+            if !wl_rel.is_empty()
+                && (sched_rel == wl_rel || sched_rel.starts_with(&format!("{wl_rel}/")))
+            {
+                tracing::warn!(
+                    scheduler_cgroup_parent = %sched_parent,
+                    workload_root = %freeze_coord_workload_root,
+                    "per-cgroup PSI-irq: scheduler cgroup is nested under the \
+                     workload root — its IRQ-servicing pressure will be mis-collected \
+                     as a workload leaf; place the scheduler cgroup outside the \
+                     workload root to keep the per-cgroup axis clean",
+                );
+            }
+        }
         // Half of the configured watchdog timeout, in nanoseconds.
         // Used by the dual-snapshot scanner to compare against each
         // task's runnable-age in jiffies (converted via the guest's
@@ -2711,6 +2743,17 @@ impl KtstrVm {
                 let dump_cpu_time_offsets = dump_btf
                     .as_ref()
                     .and_then(|btf| crate::monitor::btf_offsets::CpuTimeOffsets::from_btf(btf).ok());
+                // Per-cgroup PSI-irq walk offsets (Phase A): the cgroup
+                // hierarchy field offsets + the shared psi_group offsets (a
+                // per-cgroup psi_group is the same struct as the system-wide
+                // psi_system). Either None → the per-cgroup capture is skipped
+                // (loud-absent).
+                let dump_cgroup_offsets = dump_btf.as_ref().and_then(|btf| {
+                    crate::monitor::btf_offsets::CgroupWalkOffsets::from_btf(btf).ok()
+                });
+                let dump_cgroup_psi_offsets = dump_btf.as_ref().and_then(|btf| {
+                    crate::monitor::btf_offsets::PsiGroupOffsets::from_btf(btf).ok()
+                });
                 let dump_cpu_time_symbols = vmlinux_data.as_deref()
                     .and_then(|data| crate::monitor::symbols::KernelSymbols::from_vmlinux_bytes(data).ok());
                 // SCX walker BTF sub-group offsets. Resolved once at
@@ -6172,6 +6215,53 @@ impl KtstrVm {
                                     }
                                     _ => None,
                                 };
+                                // Per-cgroup PSI-irq capture (Phase A).
+                                // Some only when guest memory, the cgroup +
+                                // psi_group offsets, and the cgrp_dfl_root
+                                // symbol all resolve. Pre-translate the
+                                // hierarchy root cgroup (cgrp_dfl_root +
+                                // offsetof(cgroup_root, cgrp)) here: text PA for
+                                // the entry read, KASLR-slid runtime KVA for the
+                                // children-list anchor compare (the scx_walker
+                                // runtime-head discipline). Every descendant is
+                                // direct-mapped, translated inside the walk.
+                                let cgroup_psi_capture = match (
+                                    freeze_coord_mem.as_deref(),
+                                    dump_cgroup_offsets.as_ref(),
+                                    dump_cgroup_psi_offsets.as_ref(),
+                                    dump_cpu_time_symbols.as_ref().and_then(|s| s.cgrp_dfl_root),
+                                ) {
+                                    (
+                                        Some(mem),
+                                        Some(cgroup_offsets),
+                                        Some(psi_offsets),
+                                        Some(cgrp_dfl_root_kva),
+                                    ) => {
+                                        let page_offset = dump_kernel.page_offset();
+                                        let kaslr_offset = kern_virt_kaslr
+                                            .load(std::sync::atomic::Ordering::Acquire)
+                                            .saturating_sub(1);
+                                        let link_root_kva = cgrp_dfl_root_kva
+                                            .wrapping_add(cgroup_offsets.cgroup_root_cgrp as u64);
+                                        let root_cgroup_pa =
+                                            dump_kernel.text_kva_to_pa(link_root_kva);
+                                        let root_cgroup_kva =
+                                            crate::monitor::symbols::slid_kernel_kva(
+                                                link_root_kva,
+                                                kaslr_offset,
+                                            );
+                                        Some(crate::monitor::dump::CgroupPsiCapture {
+                                            mem,
+                                            cgroup_offsets,
+                                            psi_offsets,
+                                            root_cgroup_kva,
+                                            root_cgroup_pa,
+                                            workload_root_path: &freeze_coord_workload_root,
+                                            page_offset,
+                                        })
+                                    }
+                                    _ => None,
+                                };
                                 // Force the lazy cast-analysis on this
                                 // dump's host coordinator thread (NOT a
                                 // vCPU thread — vCPUs are paused at the
@@ -6221,6 +6311,7 @@ impl KtstrVm {
                                         arena_offsets: dump_arena_offsets.as_ref(),
                                         prog_capture: prog_capture.as_ref(),
                                         cpu_time_capture: cpu_time_capture.as_ref(),
+                                        cgroup_psi_capture: cgroup_psi_capture.as_ref(),
                                         task_enrichment_capture: task_enrichment_capture
                                             .as_ref(),
                                         // Per-sample SCX_EV_* event counter
@@ -6336,6 +6427,7 @@ impl KtstrVm {
                                         "dump prerequisites unavailable".to_string(),
                                     ),
                                     per_cpu_time: Vec::new(),
+                                    cgroup_psi: Vec::new(),
                                     task_enrichments: Vec::new(),
                                     task_enrichments_unavailable: Some(
                                         "dump prerequisites unavailable".to_string(),
