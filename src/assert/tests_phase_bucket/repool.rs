@@ -52,12 +52,58 @@ fn repool_distribution_empty_inserts_no_keys() {
         "worst_iterations_per_worker",
         "worst_iterations_per_cpu_sec",
         "worst_wake_latency_tail_ratio",
+        "worst_page_locality",
     ] {
         assert!(
             !stats.ext_metrics.contains_key(name),
             "{name} must be absent for empty input",
         );
     }
+}
+
+/// `worst_page_locality` (WorstLowest{NumaLocal,NumaTotal}) re-pools into
+/// `ext_metrics` from the per-phase NUMA carriers — the producer the cross-run
+/// sidecar comparison relies on (the reports-only `CgroupStats` hardcodes
+/// page_locality 0.0, so it CANNOT source from `stats.cgroups`; it must come
+/// from `stats.phases[].per_cgroup`). The lowest per-cgroup
+/// `numa_pages_local / numa_pages_total` over cgroups that measured NUMA wins; a
+/// measured 0.0 (all off-node) wins rather than being skipped; an all-unmeasured
+/// (`numa_pages_total == 0`) cohort writes NO key (absence preserved, never a
+/// 0.0 sentinel).
+#[test]
+fn repool_worst_page_locality_from_numa_carriers() {
+    let pc = |local: u64, total: u64| PhaseCgroupStats {
+        numa_pages_local: local,
+        numa_pages_total: total,
+        ..PhaseCgroupStats::default()
+    };
+    // Two distinct POSITIVE localities: the lowest (0.5) wins (plain f64::min of
+    // the two — distinct from the measured-0.0-wins case below; the fold filters
+    // on numa_pages_total>0, NOT on a non-zero value).
+    let mut positive = repool_stats(vec![("a", pc(800, 1000)), ("b", pc(500, 1000))], vec![]);
+    populate_run_distribution_metrics(&mut positive);
+    assert_eq!(
+        positive.ext_metrics.get("worst_page_locality").copied(),
+        Some(0.5),
+        "lowest of two positive per-cgroup localities (0.8 vs 0.5) wins",
+    );
+
+    // cg_a 800/1000 = 0.8; cg_b 0/1000 = measured 0.0 (all off-node) → the worst.
+    let mut measured = repool_stats(vec![("a", pc(800, 1000)), ("b", pc(0, 1000))], vec![]);
+    populate_run_distribution_metrics(&mut measured);
+    assert_eq!(
+        measured.ext_metrics.get("worst_page_locality").copied(),
+        Some(0.0),
+        "lowest per-cgroup locality wins; a measured 0.0 is the worst",
+    );
+
+    // All cgroups measured no NUMA pages (total == 0) → no key (loud-absent).
+    let mut unmeasured = repool_stats(vec![("a", pc(0, 0)), ("b", pc(0, 0))], vec![]);
+    populate_run_distribution_metrics(&mut unmeasured);
+    assert!(
+        !unmeasured.ext_metrics.contains_key("worst_page_locality"),
+        "an all-unmeasured cohort must write no worst_page_locality key",
+    );
 }
 
 /// Single-sample boundary: p99 == median == the sole sample (µs), CV == 0

@@ -1606,9 +1606,11 @@ fn every_metric_has_kind_consistent_with_naming() {
             );
         }
         // WorstLowest metrics are re-pooled by
-        // `populate_run_distribution_metrics`'s lowest-wins fold
-        // (`worst.is_none_or(|w| v < w)`), which treats the LOWEST per-cgroup
-        // value as the worst — correct ONLY for HigherBetter metrics.
+        // `populate_run_distribution_metrics`'s lowest-wins fold — the
+        // iterations-efficiency selectors via `worst.is_none_or(|w| v < w)` over
+        // `stats.cgroups`, `worst_page_locality` via `reduce(f64::min)` over the
+        // per-phase NUMA carriers — which treats the LOWEST per-cgroup value as
+        // the worst — correct ONLY for HigherBetter metrics.
         // Enforce the mirror of the Distribution gate so a future
         // LowerBetter WorstLowest cannot silently invert the regression
         // signal (select the least-bad cgroup, mask the starved one); such a

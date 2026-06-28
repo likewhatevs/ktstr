@@ -938,13 +938,16 @@ impl VmResult {
     /// two accessors differ.
     ///
     /// RESOLVED here None-aware (via the delegated `ScenarioStats::run_metric`
-    /// typed dispatch): the typed cross-cgroup fields `worst_spread`,
+    /// typed dispatch): the cross-cgroup metrics `worst_spread`,
     /// `worst_migration_ratio`, `worst_gap_ms`, `total_migrations`,
     /// `total_iterations`, `worst_page_locality`,
-    /// `worst_cross_node_migration_ratio`. Their struct fields are 0.0-sentinel
-    /// f64, so the dispatch re-derives each from the carriers (the per-cgroup
-    /// `stats.cgroups` + the per_cgroup-folded `stats.phases` this method builds)
-    /// — `None` when no carrier measured it, `Some(0.0)` for a measured zero.
+    /// `worst_cross_node_migration_ratio`. The dispatch re-derives each from the
+    /// carriers (the per-cgroup `stats.cgroups` + the per_cgroup-folded
+    /// `stats.phases` this method builds) — `None` when no carrier measured it,
+    /// `Some(0.0)` for a measured zero. All but `worst_page_locality` are
+    /// 0.0-sentinel typed struct fields (re-derived because the field cannot
+    /// carry the measured-vs-unmeasured distinction); `worst_page_locality` has
+    /// no struct field and re-pools purely from the per-phase NUMA carriers.
     ///
     /// NOT resolved here:
     /// - the typed-backed monitor run-level metrics (`max_imbalance_ratio`,

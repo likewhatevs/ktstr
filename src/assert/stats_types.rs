@@ -404,22 +404,34 @@ pub struct PhaseCgroupStats {
     /// `CLOCK_THREAD_CPUTIME_ID` time behind `off_cpu_pcts` (different sample
     /// point; not byte-identical), so do not cross-wire the two in a re-pool.
     pub total_cpu_time_ns: u64,
-    /// Pages on the expected NUMA node(s) — page-locality numerator. A genuine
-    /// per-thread numa_maps count (Counter, SUM across workers/sources).
+    /// Pages on the expected NUMA node(s) — page-locality numerator. A per-task
+    /// `/proc/self/numa_maps` residency GAUGE (current snapshot of the task's mm,
+    /// recomputed each read — the kernel zeroes and re-walks the page tables),
+    /// SPATIALLY summed across the cgroup's workers within a phase: disjoint-mm
+    /// under the `CloneMode::Fork` default (the true cgroup total), but
+    /// `CloneMode::Thread` siblings share one mm and the SUM over-counts shared
+    /// pages once per thread (caveat inherited from `WorkerReport::numa_pages`).
+    /// The CROSS-PHASE fold takes the LATEST measured snapshot (see
+    /// `numa_agg_per_cgroup`), never a sum (summing residency across phases
+    /// over-counts by the phase count).
     pub numa_pages_local: u64,
     /// Total allocated pages — the SHARED denominator for BOTH page_locality
     /// (`numa_pages_local` / this) AND cross_node_migration_ratio
-    /// (`cross_node_migrated` / this). A genuine per-thread numa_maps count
-    /// (Counter, SUM); the kernel computes both ratios over the identical page
-    /// total, so one field serves both — a separate cross_node_total would
-    /// invite a silent desync.
+    /// (`cross_node_migrated` / this). A per-task `/proc/self/numa_maps` residency
+    /// GAUGE (same class/folds as `numa_pages_local`: within-phase SUM across
+    /// workers — disjoint-mm under the `CloneMode::Fork` default, Thread-mode
+    /// over-count caveat inherited from `WorkerReport::numa_pages` — cross-phase
+    /// LATEST snapshot); the kernel computes both ratios over the identical page
+    /// total, so one field serves both — a separate cross_node_total would invite
+    /// a silent desync.
     pub numa_pages_total: u64,
     /// Cross-node migrated pages — cross_node_migration_ratio numerator
     /// (denominator is `numa_pages_total`). A SYSTEM-WIDE
-    /// `/proc/vmstat numa_pages_migrated` delta each worker observes
-    /// redundantly, so this is a PEAK (MAX across workers/sources), NOT a
-    /// Counter — summing would inflate it by the worker count (mirrors
-    /// [`CgroupStats`]'s deliberate max-fold of the same quantity).
+    /// `/proc/vmstat numa_pages_migrated` monotonic-COUNTER delta each worker
+    /// observes redundantly, so the within-phase fold is MAX across
+    /// workers/sources (summing would inflate it by the worker count — mirrors
+    /// [`CgroupStats`]'s deliberate max-fold); the CROSS-PHASE fold SUMs the
+    /// per-phase deltas over disjoint intervals to the run total.
     pub cross_node_migrated: u64,
     /// Longest scheduling gap (ms) across the cgroup's workers in the phase,
     /// coupled with `max_gap_cpu`. A Peak folded as an ARGMAX of the (ms, cpu)
@@ -489,14 +501,19 @@ impl PhaseCgroupStats {
     ///   per-source reductions;
     /// - the CPU set (`cpus_used`) UNIONs;
     /// - genuine Counters (`num_workers`, `wake_sample_total`,
-    ///   `total_migrations`, `total_iterations`, `total_cpu_time_ns`,
-    ///   `numa_pages_local`, `numa_pages_total`) SUM — `num_workers` included,
-    ///   because a multi-`WorkSpec` cgroup emits one carrier per handle covering
-    ///   DISJOINT worker subsets, so summing reproduces the pooled count (see
-    ///   the `num_workers` field doc);
-    /// - the one Peak, `cross_node_migrated`, takes the MAX (a system-wide
-    ///   vmstat delta observed redundantly per worker, so summing would inflate
-    ///   it);
+    ///   `total_migrations`, `total_iterations`, `total_cpu_time_ns`) SUM —
+    ///   `num_workers` included, because a multi-`WorkSpec` cgroup emits one
+    ///   carrier per handle covering DISJOINT worker subsets, so summing
+    ///   reproduces the pooled count (see the `num_workers` field doc);
+    /// - the residency GAUGEs (`numa_pages_local`, `numa_pages_total`) also SUM
+    ///   here — the WITHIN-PHASE spatial sum across the cgroup's workers
+    ///   (disjoint-mm under the `CloneMode::Fork` default; Thread-mode shares one
+    ///   mm and over-counts, the caveat inherited from `WorkerReport::numa_pages`),
+    ///   NOT a cross-phase sum (the cross-phase fold takes the LATEST snapshot in
+    ///   `numa_agg_per_cgroup`);
+    /// - `cross_node_migrated`, a system-wide vmstat monotonic-Counter delta each
+    ///   worker observes redundantly, takes the MAX across workers (summing would
+    ///   inflate it); its cross-phase fold SUMs the per-phase deltas;
     /// - the COUPLED worst gap (`max_gap_ms`, `max_gap_cpu`) folds as an
     ///   ARGMAX — the pair from whichever side has the larger ms (b's on tie,
     ///   matching the builders' `max_by_key` last-wins) so the gap and its CPU

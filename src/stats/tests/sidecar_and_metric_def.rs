@@ -499,13 +499,13 @@ fn sidecar_to_row_no_stall() {
 ///
 /// Covers the `finite_or_zero` call sites in `sidecar_to_row`: the
 /// remaining direct [`ScenarioStats`] f64 fields (worst_spread,
-/// worst_migration_ratio, worst_page_locality,
-/// worst_cross_node_migration_ratio) plus
-/// `imbalance_ratio` from [`MonitorSummary`]. (The wake / run-delay
-/// roll-ups are now ext_metrics-sourced — non-finite ext entries are
-/// DROPPED, covered by `sidecar_to_row_drops_non_finite_ext_metrics`.) A
-/// missed call site would leave one assert comparing the non-finite input
-/// to 0.0 (NaN != 0.0, ±Infinity != 0.0) and fail the test.
+/// worst_migration_ratio, worst_cross_node_migration_ratio) plus
+/// `imbalance_ratio` from [`MonitorSummary`]. (The wake / run-delay and
+/// `worst_page_locality` roll-ups are now ext_metrics-sourced — non-finite
+/// ext entries are DROPPED, covered by
+/// `sidecar_to_row_drops_non_finite_ext_metrics`.) A missed call site would
+/// leave one assert comparing the non-finite input to 0.0 (NaN != 0.0,
+/// ±Infinity != 0.0) and fail the test.
 fn assert_all_direct_f64_fields_sanitized(non_finite: f64) {
     use crate::assert::ScenarioStats;
     use crate::monitor::MonitorSummary;
@@ -514,7 +514,6 @@ fn assert_all_direct_f64_fields_sanitized(non_finite: f64) {
         stats: ScenarioStats {
             worst_spread: non_finite,
             worst_migration_ratio: non_finite,
-            worst_page_locality: non_finite,
             worst_cross_node_migration_ratio: non_finite,
             ..Default::default()
         },
@@ -529,7 +528,6 @@ fn assert_all_direct_f64_fields_sanitized(non_finite: f64) {
         ("spread", row.spread),
         ("migration_ratio", row.migration_ratio),
         ("imbalance_ratio", row.imbalance_ratio),
-        ("page_locality", row.page_locality),
         ("cross_node_migration_ratio", row.cross_node_migration_ratio),
     ] {
         assert_eq!(
@@ -590,7 +588,7 @@ fn sidecar_to_row_preserves_subnormal_f64_in_direct_fields() {
     let sc = test_support::SidecarResult {
         stats: ScenarioStats {
             worst_spread: subnormal,
-            worst_page_locality: -subnormal,
+            worst_cross_node_migration_ratio: -subnormal,
             worst_migration_ratio: subnormal,
             ..Default::default()
         },
@@ -602,7 +600,7 @@ fn sidecar_to_row_preserves_subnormal_f64_in_direct_fields() {
         "positive subnormal must pass through finite_or_zero unchanged",
     );
     assert_eq!(
-        row.page_locality, -subnormal,
+        row.cross_node_migration_ratio, -subnormal,
         "negative subnormal must pass through finite_or_zero unchanged",
     );
     assert_eq!(
@@ -636,7 +634,6 @@ fn sidecar_to_row_direct_field_nan_does_not_touch_ext_metrics() {
             // Every remaining direct f64 field non-finite.
             worst_spread: f64::NAN,
             worst_migration_ratio: f64::INFINITY,
-            worst_page_locality: f64::INFINITY,
             worst_cross_node_migration_ratio: f64::NEG_INFINITY,
             ext_metrics: ext.clone(),
             ..Default::default()
@@ -648,7 +645,7 @@ fn sidecar_to_row_direct_field_nan_does_not_touch_ext_metrics() {
     // Direct-field collapse still works.
     assert_eq!(row.spread, 0.0);
     assert_eq!(row.migration_ratio, 0.0);
-    assert_eq!(row.page_locality, 0.0);
+    assert_eq!(row.cross_node_migration_ratio, 0.0);
 
     // ext_metrics survives unchanged — same length, same keys,
     // same values.
@@ -1063,6 +1060,16 @@ fn distribution_worstlowest_kind_json_shape_pinned() {
         "\"CpuTimeNs\"",
     ] {
         assert!(wl.contains(tok), "{tok} missing from {wl}");
+    }
+    // The NUMA pairing (worst_page_locality's kind) — pins the NumaLocal /
+    // NumaTotal variant strings so a rename trips here, not the CLI output.
+    let numa = serde_json::to_string(&MetricKind::WorstLowest {
+        numerator: WorstLowestNumerator::NumaLocal,
+        denominator: WorstLowestDenominator::NumaTotal,
+    })
+    .expect("MetricKind serializes");
+    for tok in ["\"NumaLocal\"", "\"NumaTotal\""] {
+        assert!(numa.contains(tok), "{tok} missing from {numa}");
     }
 }
 
@@ -1500,16 +1507,17 @@ fn metric_def_read_named_fields() {
     row.fallback_count = 11;
     row.keep_last_count = 4;
     row.total_iterations = 1000;
-    row.page_locality = 0.8;
     row.cross_node_migration_ratio = 0.1;
-    // Distribution roll-ups are ext_metrics-sourced now (accessor |_| None);
-    // read_metric resolves them via MetricDef::read's ext fallback.
+    // Distribution + WorstLowest (worst_page_locality) roll-ups are
+    // ext_metrics-sourced now (accessor |_| None); read_metric resolves them
+    // via MetricDef::read's ext fallback.
     for (name, v) in [
         ("worst_p99_wake_latency_us", 99.0),
         ("worst_median_wake_latency_us", 50.0),
         ("worst_wake_latency_cv", 0.5),
         ("worst_mean_run_delay_us", 25.0),
         ("worst_run_delay_us", 200.0),
+        ("worst_page_locality", 0.8),
     ] {
         row.ext_metrics.insert(name.to_string(), v);
     }

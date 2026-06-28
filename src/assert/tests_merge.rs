@@ -1,7 +1,7 @@
-//! `AssertResult::merge` and the per-field worst-wins / lowest-non-zero
-//! / sum aggregation rules for `ScenarioStats`. Every polarity is
-//! exercised in both directions so a sign-flip regression surfaces
-//! regardless of which side carries the worse value.
+//! `AssertResult::merge` and the per-field worst-wins / sum aggregation
+//! rules for `ScenarioStats`, plus the polarity-aware ext-metric min/max
+//! fold. Every polarity is exercised in both directions so a sign-flip
+//! regression surfaces regardless of which side carries the worse value.
 
 use super::tests_common::rpt;
 use super::*;
@@ -141,10 +141,11 @@ fn merge_accumulates_totals() {
 ///     merge order, preserving cardinality;
 ///   - pick the worst value of every merge-folded higher-is-worse
 ///     `worst_*` field across all merged cgroups;
-///   - pick the lowest-non-zero value of `worst_page_locality`
-///     (0.0 is the unreported sentinel, matching the accumulator-pass
-///     convention in `AssertResult::pass().merge(real)`);
 ///   - SUM `total_iterations` across all cgroups, not max it.
+///
+/// (`worst_page_locality` is NOT merge-folded — it re-pools run-level
+/// post-merge from the per-phase NUMA carriers; see
+/// `merge_repools_worst_page_locality_across_cgroups_measured_zero_wins`.)
 ///
 /// (The wake / run-delay distributions and the iteration efficiencies are
 /// no longer merge-folded — they re-pool post-merge; see the `repool_*`
@@ -172,9 +173,11 @@ fn merge_three_cgroups_worst_wins_and_iterations_sum() {
         };
         // The wake/run-delay and iteration-efficiency roll-ups are no longer
         // ScenarioStats fields (they are Distribution / WorstLowest, re-pooled
-        // post-merge); this test now covers only the merge-folded worst-wins
-        // (`worst_spread`, `worst_migration_ratio`, `worst_page_locality`),
-        // `total_iterations`, and the `cgroups.extend` accumulation.
+        // post-merge); this test now covers the merge-folded worst-wins
+        // (`worst_spread`, `worst_migration_ratio`), `total_iterations`, and the
+        // `cgroups.extend` accumulation (including each cgroup's per-cgroup
+        // `page_locality` surviving the merge — `worst_page_locality` itself
+        // re-pools post-merge from the per-phase carriers, covered elsewhere).
         AssertResult {
             outcomes: vec![],
             passes: vec![],
@@ -182,7 +185,6 @@ fn merge_three_cgroups_worst_wins_and_iterations_sum() {
                 total_iterations: total_iters,
                 worst_spread,
                 worst_migration_ratio: worst_mig,
-                worst_page_locality: page_locality,
                 cgroups: vec![cg],
                 ..ScenarioStats::default()
             },
@@ -210,16 +212,15 @@ fn merge_three_cgroups_worst_wins_and_iterations_sum() {
     assert_eq!(s.cgroups[0].total_iterations, 100);
     assert_eq!(s.cgroups[1].total_iterations, 200);
     assert_eq!(s.cgroups[2].total_iterations, 400);
+    // Each cgroup's per-cgroup `page_locality` telemetry survives the merge into
+    // stats.cgroups (the run-level worst re-pools from these post-merge):
+    assert_eq!(s.cgroups[0].page_locality, 0.8);
+    assert_eq!(s.cgroups[1].page_locality, 0.5);
+    assert_eq!(s.cgroups[2].page_locality, 0.9);
 
     // Worst-wins across 3 cgroups (higher-is-worse):
     assert_eq!(s.worst_spread, 20.0, "third cgroup's 20.0 is worst");
     assert_eq!(s.worst_migration_ratio, 0.3, "second cgroup's 0.3 is worst");
-    // Lower-is-worse rollup (`worst_page_locality`, `fold_lowest_nonzero`):
-    // every value is strictly positive so the 0-sentinel branch never wins.
-    assert_eq!(
-        s.worst_page_locality, 0.5,
-        "second cgroup's 0.5 is the lowest-non-zero — 0 sentinel never wins",
-    );
     // total_iterations SUMS across cgroups, not maxes:
     assert_eq!(
         s.total_iterations,
@@ -747,49 +748,13 @@ fn merge_scenario_stats_worst_wins_when_other_is_smaller() {
     assert_eq!(a.stats.total_iterations, 550);
 }
 
-#[test]
-fn merge_worst_page_locality_lowest_non_zero() {
-    // `worst_page_locality` can't use plain `.min()` because 0.0
-    // is the "unreported" sentinel — a fresh cgroup with no NUMA
-    // readings would otherwise clobber a real reading from a
-    // reporting cgroup. The merge instead takes the lowest
-    // non-zero value.
-
-    // (a) self=0.0 (unreported) + other=0.8 (reported) → 0.8.
-    let mut a = AssertResult::pass();
-    a.stats.worst_page_locality = 0.0;
-    let mut b = AssertResult::pass();
-    b.stats.worst_page_locality = 0.8;
-    a.merge(b);
-    assert_eq!(
-        a.stats.worst_page_locality, 0.8,
-        "unreported self must adopt other's reading"
-    );
-
-    // (b) self=0.6 + other=0.8 → 0.6 (self's lower reading wins).
-    let mut a = AssertResult::pass();
-    a.stats.worst_page_locality = 0.6;
-    let mut b = AssertResult::pass();
-    b.stats.worst_page_locality = 0.8;
-    a.merge(b);
-    assert_eq!(
-        a.stats.worst_page_locality, 0.6,
-        "lower non-zero reading wins across cgroups"
-    );
-
-    // (c) self=0.8 (reported) + other=0.0 (unreported) → 0.8.
-    // Plain `.min()` would select 0.0 here — the guard rejects
-    // other's sentinel instead of overwriting self.
-    let mut a = AssertResult::pass();
-    a.stats.worst_page_locality = 0.8;
-    let mut b = AssertResult::pass();
-    b.stats.worst_page_locality = 0.0;
-    a.merge(b);
-    assert_eq!(
-        a.stats.worst_page_locality, 0.8,
-        "unreported other must not clobber self's reading"
-    );
-}
+// `worst_page_locality` no longer merge-folds as a typed field (the
+// `fold_lowest_nonzero` 0.0-sentinel path is removed). Its None-aware
+// re-pool over the per-phase NUMA carriers — where a MEASURED 0.0 wins the
+// lowest (the bug the sentinel masked) and an unmeasured cgroup is skipped —
+// is pinned by `merge_repools_worst_page_locality_across_cgroups_measured_zero_wins`
+// (in `tests_numa.rs`) and the read-side
+// `run_metric_numa_fields_latest_residency_summed_migrations_none_aware`.
 
 #[test]
 fn merge_ext_metrics_higher_is_worse_takes_max() {

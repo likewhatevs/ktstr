@@ -545,26 +545,6 @@ impl AssertResult {
     /// Skip survives only when both inputs were Skip-only because a
     /// Pass or Inconclusive entry in either side beats Skip.
     pub fn merge(&mut self, mut other: AssertResult) {
-        /// Lowest-non-zero fold: `*self_field` becomes `other_field`
-        /// when `other_field` is strictly positive AND either
-        /// `*self_field` is zero (uninitialized sentinel) or
-        /// `other_field` is strictly smaller than `*self_field`.
-        ///
-        /// This is NOT `f64::min` — a plain min would let an
-        /// unreported cgroup (`0.0` sentinel) clobber a real
-        /// reading from another cgroup, treating "no data yet" as
-        /// "worst possible." The accumulator pattern
-        /// `AssertResult::pass().merge(real)` starts with 0.0 from
-        /// `Default`, and a plain min would destroy any positive
-        /// reading folded in — so every lowest-is-worse rollup
-        /// uses this fold to treat 0.0 as a sentinel rather than a
-        /// real measurement.
-        fn fold_lowest_nonzero(self_field: &mut f64, other_field: f64) {
-            if other_field > 0.0 && (*self_field == 0.0 || other_field < *self_field) {
-                *self_field = other_field;
-            }
-        }
-
         self.outcomes.extend(other.outcomes);
         self.passes.extend(other.passes);
         self.info_notes.extend(other.info_notes);
@@ -599,9 +579,11 @@ impl AssertResult {
             s.worst_gap_ms = o.worst_gap_ms;
             s.worst_gap_cpu = o.worst_gap_cpu;
         }
-        // NUMA page locality: lowest-non-zero fold — see
-        // `fold_lowest_nonzero` above for the sentinel convention.
-        fold_lowest_nonzero(&mut s.worst_page_locality, o.worst_page_locality);
+        // worst_page_locality is no longer folded here: it is
+        // `MetricKind::WorstLowest` (NumaLocal/NumaTotal), re-pooled post-merge
+        // by `populate_run_distribution_metrics` from the per-phase NUMA carriers
+        // (a measured 0.0 — all pages off-node — wins the lowest; the buggy
+        // `fold_lowest_nonzero` that skipped it as a sentinel is removed).
         // Merge extensible metrics: take worst per key according to
         // each metric's polarity in the MetricDef registry. For
         // `higher_is_worse: true` the worst is max; for

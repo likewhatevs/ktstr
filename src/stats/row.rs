@@ -324,11 +324,10 @@ pub struct GauntletRow {
     // the per-cgroup counters); `MetricDef::read` surfaces them via the ext
     // fallback. The `worst_` naming convention is documented on [`METRICS`].
     // NUMA fields.
-    /// Worst-case per-cgroup NUMA page-locality fraction (lowest
-    /// non-zero). Surfaced in [`METRICS`] under registry name
-    /// `worst_page_locality`; see the triples table on
-    /// [`METRICS`] for the registry/field/column rationale.
-    pub page_locality: f64,
+    // page_locality is NO LONGER a typed GauntletRow column: worst_page_locality
+    // is `MetricKind::WorstLowest` (NumaLocal/NumaTotal), ext-sourced (re-pooled
+    // from the per-phase NUMA carriers by populate_run_distribution_metrics);
+    // MetricDef::read surfaces it via the ext fallback, so no typed column.
     /// Worst-case cross-node migration ratio. Surfaced in
     /// [`METRICS`] under registry name
     /// `worst_cross_node_migration_ratio`; see the triples table

@@ -616,14 +616,13 @@ fn paint_metrics(row: &mut GauntletRow, spread: f64, gap_ms: u64, migrations: u6
     row.fallback_count = migrations as i64;
     row.keep_last_count = -(migrations as i64);
     row.total_iterations = iters;
-    row.page_locality = 1.0 - spread / 100.0;
     row.cross_node_migration_ratio = spread / 200.0;
-    // The wake / run-delay / iteration-efficiency roll-ups are now
-    // ext_metrics-sourced (Distribution / WorstLowest); paint them there so
+    // The wake / run-delay / iteration-efficiency / page-locality roll-ups are
+    // now ext_metrics-sourced (Distribution / WorstLowest); paint them there so
     // the cross-RUN ext fold (group_and_average_by → aggregate_finite)
     // exercises them: the percentile / CV / mean reductions and the
-    // WorstLowest selectors MEAN-fold cross-RUN, worst_run_delay_us
-    // (Worst) MAX-folds.
+    // WorstLowest selectors (`worst_page_locality`, `worst_iterations_*`)
+    // MEAN-fold cross-RUN, worst_run_delay_us (Worst) MAX-folds.
     for (name, v) in [
         ("worst_p99_wake_latency_us", spread * 2.0),
         ("worst_median_wake_latency_us", spread),
@@ -632,6 +631,7 @@ fn paint_metrics(row: &mut GauntletRow, spread: f64, gap_ms: u64, migrations: u6
         ("worst_run_delay_us", (gap_ms * 2) as f64),
         ("worst_iterations_per_worker", iters as f64 / 10.0),
         ("worst_iterations_per_cpu_sec", iters as f64 / 5.0),
+        ("worst_page_locality", 1.0 - spread / 100.0),
     ] {
         row.ext_metrics.insert(name.to_string(), v);
     }
@@ -782,6 +782,18 @@ fn group_and_average_multi_pass_kind_aware_fold() {
             .get("worst_iterations_per_worker")
             .copied(),
         Some(100.0),
+    );
+    // WorstLowest worst_page_locality cross-RUN MEAN through the ext fold:
+    // 1.0 - spread/100 = 0.9/0.8/0.7; (0.9 + 0.8 + 0.7)/3 = 0.8 (float-approx).
+    let pl = ar
+        .row
+        .ext_metrics
+        .get("worst_page_locality")
+        .copied()
+        .expect("worst_page_locality present");
+    assert!(
+        (pl - 0.8).abs() < 1e-9,
+        "worst_page_locality cross-RUN MEAN ~0.8, got {pl}",
     );
     // CV mean (spread/50 = 0.2/0.4/0.6 → 0.4) is float-approximate.
     let cv = ar

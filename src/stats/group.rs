@@ -504,7 +504,10 @@ struct Accumulator<'a> {
     sum_fallback_count: i64,
     sum_keep_last_count: i64,
     sum_total_iterations: u64,
-    sum_page_locality: f64,
+    // sum_page_locality removed: page_locality is now an ext-sourced WorstLowest
+    // metric (re-pooled from the per-phase carriers), cross-run-MEAN-folded via
+    // the ext fold like the other migrated worst_* selectors — not a typed
+    // GauntletRow column, so no per-row group-average accumulator.
     sum_cross_node_mig: f64,
     // Per-row MAX-fold for Peak-kind fields. Per
     // `MetricKind::Peak` contract, cross-RUN aggregation
@@ -570,7 +573,6 @@ impl<'a> Accumulator<'a> {
             sum_fallback_count: 0,
             sum_keep_last_count: 0,
             sum_total_iterations: 0,
-            sum_page_locality: 0.0,
             sum_cross_node_mig: 0.0,
             max_gap_ms: 0,
             max_imbalance_ratio: 0.0,
@@ -646,7 +648,6 @@ impl<'a> Accumulator<'a> {
         self.sum_total_iterations = self
             .sum_total_iterations
             .saturating_add(row.total_iterations);
-        self.sum_page_locality += row.page_locality;
         self.sum_cross_node_mig += row.cross_node_migration_ratio;
         // Peak-kind typed fields: cross-RUN aggregation surfaces
         // the worst-instant observed across the cohort, NOT the
@@ -797,7 +798,6 @@ impl<'a> Accumulator<'a> {
             fallback_count: round_i64(acc.sum_fallback_count),
             keep_last_count: round_i64(acc.sum_keep_last_count),
             total_iterations: round_u64(acc.sum_total_iterations),
-            page_locality: acc.sum_page_locality / denom,
             cross_node_migration_ratio: acc.sum_cross_node_mig / denom,
             ext_metrics,
             // Phase buckets do not aggregate cleanly across an
@@ -995,11 +995,10 @@ pub fn group_and_average_by(
 ///
 /// The 0.0 substitution is indistinguishable from a legitimate 0.0
 /// measurement for metrics whose natural zero carries its own signal.
-/// Two direct f64 fields are especially affected — note in-tree producers
-/// already guard the typical divide-by-zero path (`assert.rs` emits
-/// `0.0` for migration_ratio when `total_iters == 0` and `1.0` for
-/// page_locality when `total == 0`), so a NaN reaching this boundary
-/// indicates an upstream producer outside those guards (e.g. an
+/// One direct f64 field is especially affected — note the in-tree producer
+/// already guards the typical divide-by-zero path (`assert.rs` emits
+/// `0.0` for migration_ratio when `total_iters == 0`), so a NaN reaching
+/// this boundary indicates an upstream producer outside that guard (e.g. an
 /// external `ext_metrics` contributor, or a schedstat arithmetic
 /// edge that slipped past a guard):
 ///
@@ -1007,12 +1006,10 @@ pub fn group_and_average_by(
 ///   migrated" (ideal locality). A sanitized NaN collapses to the
 ///   same value and reads as *falsely good* — a downstream regression
 ///   gate sees "perfect locality" where the truth is "no data".
-/// - `page_locality`: higher-better. A real 0.0 means "no local-node
-///   accesses". A sanitized NaN collapses to the same value and
-///   reads as *falsely bad* — a downstream regression gate sees
-///   "everything cross-node" where the truth is "no data". The
-///   polarity is opposite to `migration_ratio`: the two failure
-///   modes push the comparison in opposite directions.
+///   (`page_locality` is NO LONGER a finite_or_zero typed field: it is the
+///   ext-sourced `worst_page_locality` WorstLowest metric, re-pooled from the
+///   per-phase NUMA carriers, so a non-finite value is DROPPED via the ext path —
+///   absence preserved — not coerced to a falsely-bad 0.0 here.)
 ///
 /// The reclassified wake-latency / run-delay distributions (e.g.
 /// `worst_wake_latency_cv`) are NO LONGER direct f64 fields — they flow
@@ -1153,7 +1150,6 @@ pub fn sidecar_to_row(sc: &crate::test_support::SidecarResult) -> GauntletRow {
             .map(|e| e.total_dispatch_keep_last)
             .unwrap_or(0),
         total_iterations: sc.stats.total_iterations,
-        page_locality: finite_or_zero("page_locality", sc.stats.worst_page_locality),
         cross_node_migration_ratio: finite_or_zero(
             "cross_node_migration_ratio",
             sc.stats.worst_cross_node_migration_ratio,

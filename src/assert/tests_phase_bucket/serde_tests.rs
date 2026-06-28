@@ -505,6 +505,24 @@ fn run_metric_numa_fields_latest_residency_summed_migrations_none_aware() {
         Some(0.5),
         "page_locality 500/1000 stays a bounded [0,1] fraction"
     );
+    // Cross-phase None-aware LATEST: a cgroup measured in phase 1 (700/1000)
+    // whose phase-2 carrier measured NO NUMA pages (total == 0) keeps the
+    // phase-1 residency — the not-measured later phase does NOT overwrite it to
+    // 0/0 and drop the cgroup from the worst-pool (the cross-phase analogue of
+    // the measured-vs-unmeasured discipline; LATEST means latest MEASURED).
+    let latest_unmeasured = ScenarioStats {
+        phases: vec![
+            phase(1, &[("A", pcg(700, 1000, 0))]),
+            phase(2, &[("A", pcg(0, 0, 0))]),
+        ],
+        ..Default::default()
+    };
+    assert_eq!(
+        latest_unmeasured.run_metric(B::WorstPageLocality),
+        Some(0.7),
+        "a later not-measured (total == 0) phase must not erase phase 1's measured residency",
+    );
+
     // Phase-less (direct-assertion path): no NUMA carriers -> None (loud-absent).
     let p = ScenarioStats {
         cgroups: vec![CgroupStats::default()],

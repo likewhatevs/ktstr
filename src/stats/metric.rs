@@ -233,27 +233,33 @@ pub enum MetricKind {
         /// Which statistic to recompute over the pooled sample set.
         reduction: SampleReduction,
     },
-    /// Derived LOWEST-WINS per-cgroup efficiency selector — the worst
-    /// (lowest) cgroup's `numerator / denominator` rate across the run,
-    /// re-pooled from per-cgroup counters rather than folded from
-    /// ready-made rates. None-aware lowest-wins (the semantic the deleted
-    /// `fold_lowest_some` carried in [`crate::assert::AssertResult::merge`],
-    /// now in `crate::assert::populate_run_distribution_metrics`): a measured
-    /// `Some(0.0)` (a cgroup that ran zero iterations — real starvation)
-    /// wins the worst bucket, a not-measured `None` (no workers / no
-    /// on-CPU time) is skipped, and an all-`None` cohort produces no key
-    /// (absence preserved as a missing ext entry, never a `0.0`).
+    /// Derived LOWEST-WINS per-cgroup selector — the worst (lowest) cgroup's
+    /// `numerator / denominator` ratio across the run, re-pooled from per-cgroup
+    /// carriers rather than folded from ready-made ratios. None-aware lowest-wins
+    /// (the semantic the deleted `fold_lowest_some` carried in
+    /// [`crate::assert::AssertResult::merge`], now in
+    /// `crate::assert::populate_run_distribution_metrics`): a measured
+    /// `Some(0.0)` — a cgroup that ran zero iterations (real starvation) for the
+    /// efficiency selectors, or one with all pages off-node for
+    /// `worst_page_locality` — wins the worst bucket; a not-measured `None` (no
+    /// workers / no on-CPU time / no NUMA pages) is skipped; and an all-`None`
+    /// cohort produces no key (absence preserved as a missing ext entry, never a
+    /// `0.0`).
     ///
     /// Derived post-merge by
-    /// `crate::assert::populate_run_distribution_metrics` from the
-    /// `stats.cgroups[]` counters (which survive bulk-frame stripping, so
-    /// WorstLowest needs no degraded fallback). Like Distribution it is
-    /// `is_derived` (skipped at the within-run reducers) and CROSS-RUN it
-    /// MEAN-folds the per-run derived values through [`aggregate_finite`].
+    /// `crate::assert::populate_run_distribution_metrics`. The SOURCE depends on
+    /// the numerator: the iteration-efficiency selectors (`Iterations`) re-pool
+    /// from the `stats.cgroups[]` counters (which survive bulk-frame stripping,
+    /// so they need no degraded fallback); `worst_page_locality` (`NumaLocal`)
+    /// re-pools from the per-phase `stats.phases[].per_cgroup` NUMA carriers (the
+    /// reports-only `CgroupStats` hardcodes `page_locality` 0.0, so it cannot
+    /// source from `stats.cgroups[]`). Like Distribution it is `is_derived`
+    /// (skipped at the within-run reducers) and CROSS-RUN it MEAN-folds the
+    /// per-run derived values through [`aggregate_finite`].
     WorstLowest {
-        /// The per-cgroup iteration-count numerator.
+        /// The per-cgroup numerator (`Iterations` or `NumaLocal`).
         numerator: WorstLowestNumerator,
-        /// The per-cgroup denominator the iteration count is divided by.
+        /// The per-cgroup denominator the numerator is divided by.
         denominator: WorstLowestDenominator,
     },
     /// Derived WORST-CGROUP wake-latency tail-amplification selector — the
@@ -402,22 +408,27 @@ pub enum SampleReduction {
     Worst,
 }
 
-/// The per-cgroup iteration-count numerator of a
-/// [`MetricKind::WorstLowest`] efficiency selector. Single variant today
-/// (`Iterations`); the slot mirrors [`MetricKind::Rate`]'s `numerator` and is
-/// `#[non_exhaustive]` so a future numerator (e.g. a work-unit count) can be
-/// added without a breaking change. The producer matches only on the
-/// `denominator`, treating the numerator as always-iterations for now.
+/// The per-cgroup numerator of a [`MetricKind::WorstLowest`] lowest-wins
+/// selector. `#[non_exhaustive]`, mirroring [`MetricKind::Rate`]'s `numerator`.
+/// The producer branches on the numerator to pick the per-cgroup SOURCE:
+/// `Iterations` reads the `crate::assert::CgroupStats` counters; `NumaLocal`
+/// reads the per-phase NUMA carriers (`page_locality` is structurally 0.0 in the
+/// reports-only `CgroupStats`, so it must come from the phase carriers).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
 #[non_exhaustive]
 pub enum WorstLowestNumerator {
     /// Per-cgroup total iteration count
     /// (`crate::assert::CgroupStats::total_iterations`).
     Iterations,
+    /// Per-cgroup pages resident on the expected NUMA node(s) — the
+    /// page-locality numerator, the LATEST per-phase residency snapshot summed
+    /// across the cgroup's workers (`crate::assert::PhaseCgroupStats::numa_pages_local`),
+    /// NOT a `CgroupStats` counter.
+    NumaLocal,
 }
 
-/// The per-cgroup denominator a [`MetricKind::WorstLowest`] iteration
-/// count is divided by to form the efficiency rate.
+/// The per-cgroup denominator a [`MetricKind::WorstLowest`] numerator is divided
+/// by to form the lowest-wins ratio.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
 #[non_exhaustive]
 pub enum WorstLowestDenominator {
@@ -428,6 +439,12 @@ pub enum WorstLowestDenominator {
     /// converted ns→s ONCE on the summed counter — yields the
     /// overcommit-invariant iterations-per-CPU-second efficiency.
     CpuTimeNs,
+    /// Total resident pages — the page-locality denominator, the LATEST
+    /// per-phase residency snapshot (`crate::assert::PhaseCgroupStats::numa_pages_total`),
+    /// shared with the cross-node ratio. Paired with `NumaLocal` to yield the
+    /// page-locality fraction; the per-cgroup ratio is absent (None) when the
+    /// cgroup measured no NUMA pages.
+    NumaTotal,
 }
 
 /// How a per-phase metric reduction merges across two
@@ -1209,7 +1226,7 @@ impl MetricDef {
 /// match each other, but diverge from the registry name where
 /// the domain-level wording adds context (`worst_*`, `total_*`,
 /// `max_*`) that would be noise on an already-qualified field.
-/// Eleven divergent triples:
+/// Ten divergent triples:
 ///
 /// | Registry (`MetricDef.name`) | `GauntletRow` field | DataFrame column |
 /// |---|---|---|
@@ -1222,7 +1239,6 @@ impl MetricDef {
 /// | `stuck_count` | `stuck_count` | `stuck` |
 /// | `total_fallback` | `fallback_count` | `fallback` |
 /// | `total_keep_last` | `keep_last_count` | `keep_last` |
-/// | `worst_page_locality` | `page_locality` | `page_locality` |
 /// | `worst_cross_node_migration_ratio` | `cross_node_migration_ratio` | `cross_node_migration_ratio` |
 ///
 /// One of the remaining metrics in [`METRICS`] has matching
@@ -1230,11 +1246,12 @@ impl MetricDef {
 /// `GauntletRow` field (`total_iterations`) and is not listed — no
 /// translation to document.
 ///
-/// The eight wake-latency / run-delay / iteration-efficiency roll-ups
-/// (`worst_p99_wake_latency_us`, `worst_median_wake_latency_us`,
+/// The nine wake-latency / run-delay / iteration-efficiency / page-locality
+/// roll-ups (`worst_p99_wake_latency_us`, `worst_median_wake_latency_us`,
 /// `worst_wake_latency_cv`, `worst_mean_run_delay_us`,
 /// `worst_run_delay_us`, `worst_iterations_per_worker`,
-/// `worst_iterations_per_cpu_sec`, `worst_wake_latency_tail_ratio`) are
+/// `worst_iterations_per_cpu_sec`, `worst_wake_latency_tail_ratio`,
+/// `worst_page_locality`) are
 /// DERIVED kinds ([`MetricKind::Distribution`] / [`MetricKind::WorstLowest`]
 /// / [`MetricKind::WakeLatencyTailRatio`]) with NO typed `GauntletRow`
 /// field: their accessors are `|_| None` and
@@ -1245,9 +1262,9 @@ impl MetricDef {
 /// `worst_` naming convention: it is the codebase-wide prefix for a
 /// cross-cgroup roll-up, independent of polarity and of HOW the roll-up is
 /// formed. Polarity-directional selectors (`worst_spread` LowerBetter →
-/// max; `worst_page_locality` HigherBetter → lowest-non-zero) and
-/// [`MetricKind::WorstLowest`] (`worst_iterations_per_*`, None-aware
-/// lowest-wins) both surface the most problematic cgroup; whereas
+/// max) and [`MetricKind::WorstLowest`] (`worst_page_locality` +
+/// `worst_iterations_per_*`, None-aware lowest-wins where a measured 0.0
+/// wins) both surface the most problematic cgroup; whereas
 /// [`MetricKind::Distribution`] (`worst_p99_wake_latency_us` etc.) is the
 /// POOLED cross-cgroup distribution over the combined sample set, NOT a
 /// per-cgroup selection — here `worst_` is retained for sidecar /
@@ -2469,13 +2486,26 @@ pub static METRICS: &[MetricDef] = &[
         accessor: |_| None,
     },
     MetricDef {
+        // The WORST (lowest) per-cgroup page-locality fraction across the run.
+        // HigherBetter, so lowest-wins = worst — a WorstLowest selector
+        // (None-aware: a measured 0.0, all pages off-node, WINS the lowest; a
+        // cgroup that measured no NUMA pages is skipped, not a 0.0 sentinel).
+        // Re-pooled post-merge from the per-phase NUMA carriers
+        // (assert::populate_run_distribution_metrics, numa_agg_per_cgroup) — NOT
+        // a typed field: the reports-only CgroupStats hardcodes page_locality 0.0
+        // (no expected-node set), and the prior typed Gauge field folded via
+        // fold_lowest_nonzero, which SKIPPED a measured 0.0 and reported a
+        // better-than-worst cross-run value. accessor None: ext-sourced.
         name: "worst_page_locality",
         polarity: crate::test_support::Polarity::HigherBetter,
-        kind: MetricKind::Gauge(GaugeAgg::Last),
+        kind: MetricKind::WorstLowest {
+            numerator: WorstLowestNumerator::NumaLocal,
+            denominator: WorstLowestDenominator::NumaTotal,
+        },
         default_abs: 0.05,
         default_rel: 0.10,
         display_unit: "",
-        accessor: |r| Some(r.page_locality),
+        accessor: |_| None,
     },
     MetricDef {
         name: "worst_cross_node_migration_ratio",
