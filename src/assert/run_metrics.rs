@@ -1017,22 +1017,21 @@ pub(crate) fn populate_run_distribution_metrics_from<'a>(
                 // (per-worker, never reservoir-capped, so length IS population, via
                 // reduce_sorted_distribution).
                 //
-                // CONTRACT (differs from WorstLowest and WakeLatencyTailRatio
-                // below, by design): a cohort with cgroups present but NO carrier
-                // samples whose per-cgroup reductions are all 0.0 (e.g. phases
-                // empty / no wake samples anywhere) folds to Some(0.0) — a
-                // measured zero, matching the deleted 0.0-sentinel typed field
-                // this replaced. The absent-vs-0.0 boundary is NOT purely
-                // source-type-driven: WorstLowest yields ABSENCE (None) for its
-                // all-None cohort because iterations_per_worker() /
-                // iterations_per_cpu_sec() return Option; and WakeLatencyTailRatio
-                // ALSO yields None when no cgroup has a tail, even though
-                // wake_latency_tail_ratio() is a 0.0-sentinel f64 like the
-                // Distribution reductions here — because a 0.0 ratio means "no
-                // measurable tail" (median <= 0, i.e. NOT measured), not a
-                // measured-zero percentile. So: Distribution emits Some(0.0) for a
-                // no-sample run (a real measured zero of the percentile);
-                // WorstLowest and WakeLatencyTailRatio emit None (no measurement).
+                // CONTRACT (now uniform with WorstLowest and WakeLatencyTailRatio
+                // below): a cohort with NO measurement for this source anywhere
+                // (empty carrier pool AND every non-carrier cgroup not-measured)
+                // yields ABSENCE (None), not Some(0.0). A percentile / mean over
+                // zero samples is undefined, not a measured zero — folding its
+                // 0.0 sentinel into the cross-run mean would, for the LowerBetter
+                // wake/timer/run-delay metrics, falsely drag the mean toward
+                // "perfect". The non-carrier fold below is gated on
+                // `cg.measured_for(source)` so an unmeasured cgroup contributes
+                // nothing; a non-carrier cgroup that DID measure (a genuine
+                // measured zero, e.g. workers that queued for no time) still
+                // contributes its real value. This matches WorstLowest (None when
+                // every iterations_per_*() is None) and WakeLatencyTailRatio (None
+                // when no cgroup has a tail) — every distributional kind now emits
+                // None for a no-measurement run.
                 let (mut v, carriers): (Option<f64>, &std::collections::BTreeSet<&str>) =
                     match source {
                         SampleSource::WakeLatencyNs => (
@@ -1053,7 +1052,7 @@ pub(crate) fn populate_run_distribution_metrics_from<'a>(
                         ),
                     };
                 for cg in cgroups {
-                    if !carriers.contains(cg.cgroup_name.as_str()) {
+                    if !carriers.contains(cg.cgroup_name.as_str()) && cg.measured_for(source) {
                         let r = distribution_cgroup_reduction(cg, source, reduction);
                         v = Some(v.map_or(r, |acc| acc.max(r)));
                     }

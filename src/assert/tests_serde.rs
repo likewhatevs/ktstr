@@ -243,13 +243,29 @@ fn cgroup_stats_missing_required_field_rejected_by_deserialize() {
         "p99_wake_latency_us",
         "median_wake_latency_us",
         "wake_latency_cv",
+        "wake_measured",
+        "median_timer_latency_us",
+        "p99_timer_latency_us",
+        "p999_timer_latency_us",
+        "worst_timer_latency_us",
+        "timer_measured",
         "total_iterations",
         "total_cpu_time_ns",
         "mean_run_delay_us",
         "worst_run_delay_us",
+        "run_delay_measured",
         "page_locality",
         "cross_node_migration_ratio",
         "ext_metrics",
+    ];
+    // The only legitimately-optional wire fields: the off-CPU% `Option<f64>`
+    // family, where a missing key maps to `None` ("not measured"). Every other
+    // emitted field is a required scalar.
+    const OPTIONAL_FIELDS: &[&str] = &[
+        "avg_off_cpu_pct",
+        "min_off_cpu_pct",
+        "max_off_cpu_pct",
+        "spread",
     ];
     // `wake_latency_tail_ratio` and `iterations_per_worker` are
     // method-only on CgroupStats and DO NOT appear in the JSON
@@ -261,6 +277,20 @@ fn cgroup_stats_missing_required_field_rejected_by_deserialize() {
         serde_json::Value::Object(m) => m,
         other => panic!("expected object, got {other:?}"),
     };
+
+    // Completeness guard: every emitted wire field must be classified as either
+    // required or (Option) optional. This catches the inverse drift the
+    // per-field loop below misses — a NEW struct field that nobody added to
+    // REQUIRED_FIELDS would otherwise silently escape the strict-schema check
+    // (exactly how the `*_measured` bools and the timer reductions slipped).
+    for key in full.keys() {
+        assert!(
+            REQUIRED_FIELDS.contains(&key.as_str()) || OPTIONAL_FIELDS.contains(&key.as_str()),
+            "CgroupStats wire field `{key}` is in neither REQUIRED_FIELDS nor \
+             OPTIONAL_FIELDS — a new field escaped the strict-schema test; \
+             classify it (required scalar, or Option → optional)",
+        );
+    }
 
     for field in REQUIRED_FIELDS {
         let mut obj = full.clone();

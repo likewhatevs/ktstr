@@ -230,14 +230,23 @@ pub fn cgroup_stats(reports: &[WorkerReport]) -> CgroupStats {
         p99_wake_latency_us: p99_us,
         median_wake_latency_us: median_us,
         wake_latency_cv: lat_cv,
+        // `0.0` above is a not-measured sentinel iff no worker recorded a
+        // wake/timer sample; the flag distinguishes that from a measured zero
+        // so the run-level re-pool excludes (not folds in) a no-sample cgroup.
+        wake_measured: !all_latencies.is_empty(),
         median_timer_latency_us: median_timer,
         p99_timer_latency_us: p99_timer,
         p999_timer_latency_us: p999_timer,
         worst_timer_latency_us: worst_timer,
+        timer_measured: !all_timer.is_empty(),
         total_iterations: total_iters,
         total_cpu_time_ns: reports.iter().map(|w| w.schedstat_cpu_time_ns).sum(),
         mean_run_delay_us: mean_run_delay,
         worst_run_delay_us: worst_run_delay,
+        // Run-delay is measured whenever a worker exists (a worker with `0.0`
+        // delay is a real measured zero); only a worker-less cohort is
+        // not-measured.
+        run_delay_measured: !run_delays.is_empty(),
         // page_locality requires the expected NUMA node set (the cpuset's
         // nodes), which this reports-only builder does not have. It is
         // populated by `AssertPlan::assert_cgroup` when `numa_nodes` is

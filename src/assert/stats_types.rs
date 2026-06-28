@@ -220,6 +220,17 @@ pub struct CgroupStats {
     /// [`WorkerReport::wake_latencies_ns`] directly if per-worker
     /// CV is needed.
     pub wake_latency_cv: f64,
+    /// Whether any worker in this cgroup recorded a wake-latency sample.
+    /// `false` makes the wake reductions above (`p99_wake_latency_us`,
+    /// `median_wake_latency_us`, `wake_latency_cv`) a not-measured sentinel
+    /// `0.0` rather than a measured zero — a percentile over zero samples is
+    /// undefined, not "instant wakes". The run-level distributional re-pool
+    /// (`populate_run_distribution_metrics`) reads this to EXCLUDE a
+    /// no-wake-sample cgroup from the cross-run mean instead of folding its
+    /// `0.0` in (which, for the LowerBetter wake metrics, would falsely drag
+    /// the mean toward "perfect"). Same not-measured-vs-measured-zero
+    /// discipline the off-CPU% `Option` fields above carry.
+    pub wake_measured: bool,
     /// Median timer-latency across all workers (microseconds) — the
     /// [`crate::workload::WorkType::TimerLatency`] cyclictest probe's per-cgroup
     /// pooled reduction over
@@ -235,6 +246,13 @@ pub struct CgroupStats {
     /// Worst (maximum) timer-latency across all workers (microseconds). See
     /// [`Self::median_timer_latency_us`].
     pub worst_timer_latency_us: f64,
+    /// Whether any worker in this cgroup recorded a timer-latency sample.
+    /// `false` makes the timer reductions above a not-measured sentinel `0.0`
+    /// (no [`crate::workload::WorkType::TimerLatency`] worker ran), distinct
+    /// from a measured zero. Read by the run-level re-pool to EXCLUDE a
+    /// no-timer-sample cgroup from the cross-run mean. Mirrors
+    /// [`Self::wake_measured`] for the timer carrier.
+    pub timer_measured: bool,
     /// Sum of iteration counts across all workers.
     pub total_iterations: u64,
     /// Sum of per-worker on-CPU time (nanoseconds), from each worker's
@@ -251,6 +269,22 @@ pub struct CgroupStats {
     pub mean_run_delay_us: f64,
     /// Worst schedstat run delay across workers (microseconds).
     pub worst_run_delay_us: f64,
+    /// Whether this cgroup had any worker to measure run-delay from
+    /// (`!run_delays.is_empty()`, i.e. `num_workers > 0`) — `false` only for a
+    /// worker-less cgroup, keeping a degenerate empty cohort from folding a
+    /// sentinel `0.0` into the cross-run run-delay mean. Unlike wake/timer
+    /// (per-sample streams a running worker may never emit), run-delay is one
+    /// `sched_info.run_delay` value per worker, always present once a worker
+    /// exists: a worker that never queued reads a real measured `0.0`, not a
+    /// no-measurement sentinel. `sched_info.run_delay` accumulates whenever
+    /// `CONFIG_SCHED_INFO` is built in (compile-time — forced on in ktstr,
+    /// `select`ed by both `CONFIG_SCHEDSTATS` and `CONFIG_TASK_DELAY_ACCT`),
+    /// with no gate on the runtime `kernel.sched_schedstats` key (that key
+    /// gates only the `schedstat_*` rq/se aggregates, never `run_delay`), so
+    /// run-delay is genuinely measured on every ktstr run and worker-presence
+    /// is the correct measured predicate. Mirrors [`Self::wake_measured`] for
+    /// the run-delay carrier.
+    pub run_delay_measured: bool,
     /// Fraction of pages on the expected NUMA node(s) (0.0-1.0).
     /// Derived from `/proc/self/numa_maps` and the worker's
     /// [`MemPolicy`](crate::workload::MemPolicy).
@@ -925,6 +959,20 @@ impl CgroupStats {
             self.p99_wake_latency_us / self.median_wake_latency_us
         } else {
             0.0
+        }
+    }
+
+    /// Whether this cgroup measured the given distribution `source`. Gates the
+    /// run-level carrier-less re-pool in [`populate_run_distribution_metrics`]
+    /// so a cgroup that recorded no samples for `source` contributes ABSENCE
+    /// (leaving the fold `None` when no cgroup measured it), not a sentinel
+    /// `0.0`. See [`Self::wake_measured`] / [`Self::timer_measured`] /
+    /// [`Self::run_delay_measured`].
+    pub fn measured_for(&self, source: crate::stats::SampleSource) -> bool {
+        match source {
+            crate::stats::SampleSource::WakeLatencyNs => self.wake_measured,
+            crate::stats::SampleSource::TimerLatencyNs => self.timer_measured,
+            crate::stats::SampleSource::RunDelayNs => self.run_delay_measured,
         }
     }
 
