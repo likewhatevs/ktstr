@@ -963,6 +963,87 @@ fn taobench_whole_run_rates_derive_and_pool_sigma_over_sigma() {
     );
 }
 
+/// schbench whole-run Class-3 gate-Rates (role-separate run-delay per-schedule
+/// means) + the loop Counter pool Σ/Σ and Σ across runs from their Counter ext
+/// components, NOT a mean of per-run rates, and the two thread ROLES pool
+/// independently. Run A: msg 300 ns / 3 sched, worker 800 ns / 2 sched, 1000
+/// loops; run B: msg 100 ns / 97 sched, worker 200 ns / 8 sched, 3000 loops.
+/// Pooled: msg Σ400/Σ100 = 4 ns/sched, worker Σ1000/Σ10 = 100 ns/sched, loops Σ
+/// = 4000; the mean-of-ratios would give msg ~50.5, worker ~212.5.
+#[test]
+fn schbench_class3_rates_derive_and_pool_sigma_over_sigma() {
+    let mk = |msg_rd: f64, msg_pc: f64, wkr_rd: f64, wkr_pc: f64, loops: f64| {
+        let mut r = make_row("t", "tiny-1llc", true, 0.0);
+        r.ext_metrics
+            .insert("total_schbench_msg_run_delay_ns".into(), msg_rd);
+        r.ext_metrics
+            .insert("total_schbench_msg_pcount".into(), msg_pc);
+        r.ext_metrics
+            .insert("total_schbench_worker_run_delay_ns".into(), wkr_rd);
+        r.ext_metrics
+            .insert("total_schbench_worker_pcount".into(), wkr_pc);
+        r.ext_metrics
+            .insert("total_schbench_loops".into(), loops);
+        r
+    };
+    let read = |row: &_, name: &str| metric_def(name).unwrap().read(row).expect("metric present");
+
+    // Single run: msg 300/3 = 100, worker 800/2 = 400, loops 1000.
+    let one = group_and_average_by(&[mk(300.0, 3.0, 800.0, 2.0, 1000.0)], LEGACY_PAIRING_DIMS);
+    assert!((read(&one[0].row, "schbench_msg_run_delay_ns_per_sched") - 100.0).abs() < 1e-9);
+    assert!((read(&one[0].row, "schbench_worker_run_delay_ns_per_sched") - 400.0).abs() < 1e-9);
+    assert_eq!(read(&one[0].row, "total_schbench_loops"), 1000.0);
+
+    // Two runs → pooled Σ/Σ (role-separate) + Σ loops, NOT mean-of-ratios.
+    let out = group_and_average_by(
+        &[
+            mk(300.0, 3.0, 800.0, 2.0, 1000.0),
+            mk(100.0, 97.0, 200.0, 8.0, 3000.0),
+        ],
+        LEGACY_PAIRING_DIMS,
+    );
+    assert_eq!(out.len(), 1);
+    let row = &out[0].row;
+    // Counter components SUM-fold per role (kept separate).
+    assert_eq!(
+        row.ext_metrics
+            .get("total_schbench_msg_run_delay_ns")
+            .copied(),
+        Some(400.0),
+    );
+    assert_eq!(
+        row.ext_metrics.get("total_schbench_msg_pcount").copied(),
+        Some(100.0),
+    );
+    assert_eq!(
+        row.ext_metrics
+            .get("total_schbench_worker_run_delay_ns")
+            .copied(),
+        Some(1000.0),
+    );
+    assert_eq!(
+        row.ext_metrics
+            .get("total_schbench_worker_pcount")
+            .copied(),
+        Some(10.0),
+    );
+    assert_eq!(
+        row.ext_metrics.get("total_schbench_loops").copied(),
+        Some(4000.0),
+    );
+    // Gate-Rates re-derive Σrun_delay/Σpcount per role (NOT mean-of-per-run-means).
+    let msg = read(row, "schbench_msg_run_delay_ns_per_sched");
+    assert!(
+        (msg - 4.0).abs() < 1e-9,
+        "Σ400/Σ100 = 4 ns/sched, got {msg} (mean-of-ratios ~50.5)",
+    );
+    let wkr = read(row, "schbench_worker_run_delay_ns_per_sched");
+    assert!(
+        (wkr - 100.0).abs() < 1e-9,
+        "Σ1000/Σ10 = 100 ns/sched, got {wkr} (mean-of-ratios ~212.5)",
+    );
+}
+
 /// `avg_nr_running` (Gauge(Avg) ext key) folds cross-run as the
 /// SAMPLE-WEIGHTED pooled mean — Σ(avg_i × samples_i) / Σ samples_i, weighted by
 /// run_sample_count — NOT the unweighted arithmetic mean a typed field would

@@ -1393,6 +1393,26 @@ pub(crate) const SCHBENCH_REQUEST_P999_US: &str = "request_p999_latency_us";
 pub(crate) const SCHBENCH_SCHED_DELAY_MSG_US: &str = "sched_delay_msg_us";
 pub(crate) const SCHBENCH_SCHED_DELAY_WORKER_US: &str = "sched_delay_worker_us";
 pub(crate) const SCHBENCH_LOOP_COUNT: &str = "schbench_loop_count";
+// schbench WHOLE-RUN Class-3 keys (loop count + role-separate run-delay gate
+// Rates) for perf-delta --noise-adjust. Re-pooled run-level by
+// `populate_run_pooled_schbench` from the per-phase per-cgroup
+// `SchbenchPhaseStats` raw pairs (Σ over all phases+cgroups). The four
+// `total_schbench_*` run-delay/pcount Counters are the rate components
+// (RENDER_SUPPRESSED) for the two sample-weighted Σrun_delay/Σpcount gate Rates
+// (workload-scoped siblings of the system-wide `total_run_delay_ns_per_sched`);
+// the message and worker thread ROLES pool separately (different per-schedule
+// wait populations). Distinct from the per-phase `sched_delay_msg/worker_us`
+// (mean-of-means, schbench.c parity) which stay PerPhase display-only — the
+// Rates gate, no double-count. `total_schbench_loops` is the whole-run loop
+// Counter (distinct from the per-phase `schbench_loop_count`).
+pub(crate) const TOTAL_SCHBENCH_MSG_RUN_DELAY_NS: &str = "total_schbench_msg_run_delay_ns";
+pub(crate) const TOTAL_SCHBENCH_MSG_PCOUNT: &str = "total_schbench_msg_pcount";
+pub(crate) const TOTAL_SCHBENCH_WORKER_RUN_DELAY_NS: &str = "total_schbench_worker_run_delay_ns";
+pub(crate) const TOTAL_SCHBENCH_WORKER_PCOUNT: &str = "total_schbench_worker_pcount";
+pub(crate) const TOTAL_SCHBENCH_LOOPS: &str = "total_schbench_loops";
+pub(crate) const SCHBENCH_MSG_RUN_DELAY_NS_PER_SCHED: &str = "schbench_msg_run_delay_ns_per_sched";
+pub(crate) const SCHBENCH_WORKER_RUN_DELAY_NS_PER_SCHED: &str =
+    "schbench_worker_run_delay_ns_per_sched";
 // taobench per-phase metric keys (the WorkType::Taobench engine's qps + hit
 // ratios, derived per-phase by write_taobench_scalars; MetricKind::PerPhase).
 // total/fast qps are HigherBetter; slow_qps + hit_ratio + hit_rate are
@@ -2946,6 +2966,96 @@ pub static METRICS: &[MetricDef] = &[
         display_unit: "",
         accessor: |_| None,
     },
+    // schbench WHOLE-RUN Class-3: role-separate run-delay gate Rates + their
+    // Counter components + the whole-run loop Counter, re-pooled run-level by
+    // `crate::assert::populate_run_pooled_schbench` from the per-phase per-cgroup
+    // SchbenchPhaseStats raw pairs (Σ over phases+cgroups). The four run-delay /
+    // pcount Counters are ext-only rate components (accessor |_| None;
+    // RENDER_SUPPRESSED; `total_` prefix → Counter gate). The two Rates are the
+    // sample-weighted Σrun_delay/Σpcount per-schedule means (the workload-scoped
+    // siblings of the system-wide `total_run_delay_ns_per_sched`); message and
+    // worker roles pool separately. Distinct from the per-phase
+    // `sched_delay_msg/worker_us` (mean-of-means parity, PerPhase display-only) —
+    // the Rates gate, no double-count.
+    MetricDef {
+        name: TOTAL_SCHBENCH_MSG_RUN_DELAY_NS,
+        polarity: crate::test_support::Polarity::LowerBetter,
+        kind: MetricKind::Counter,
+        default_abs: 1000.0,
+        default_rel: 0.10,
+        display_unit: "ns",
+        accessor: |_| None,
+    },
+    MetricDef {
+        name: TOTAL_SCHBENCH_MSG_PCOUNT,
+        polarity: crate::test_support::Polarity::Informational,
+        kind: MetricKind::Counter,
+        default_abs: 100.0,
+        default_rel: 0.10,
+        display_unit: "",
+        accessor: |_| None,
+    },
+    MetricDef {
+        name: TOTAL_SCHBENCH_WORKER_RUN_DELAY_NS,
+        polarity: crate::test_support::Polarity::LowerBetter,
+        kind: MetricKind::Counter,
+        default_abs: 1000.0,
+        default_rel: 0.10,
+        display_unit: "ns",
+        accessor: |_| None,
+    },
+    MetricDef {
+        name: TOTAL_SCHBENCH_WORKER_PCOUNT,
+        polarity: crate::test_support::Polarity::Informational,
+        kind: MetricKind::Counter,
+        default_abs: 100.0,
+        default_rel: 0.10,
+        display_unit: "",
+        accessor: |_| None,
+    },
+    MetricDef {
+        // Whole-run completed work cycles (Σ over phases+cgroups). HigherBetter
+        // (throughput). NOT a rate component, so NOT suppressed. Distinct from the
+        // per-phase `schbench_loop_count` (PerPhase timeline).
+        name: TOTAL_SCHBENCH_LOOPS,
+        polarity: crate::test_support::Polarity::HigherBetter,
+        kind: MetricKind::Counter,
+        default_abs: 100.0,
+        default_rel: 0.10,
+        display_unit: "",
+        accessor: |_| None,
+    },
+    MetricDef {
+        // Message-thread per-schedule run-delay mean = Σrun_delay_ns / Σpcount
+        // (sample-weighted, NOT mean-of-per-run-means). LowerBetter (higher
+        // scheduling wait is worse). Absent when no message thread was scheduled
+        // (Σpcount == 0).
+        name: SCHBENCH_MSG_RUN_DELAY_NS_PER_SCHED,
+        polarity: crate::test_support::Polarity::LowerBetter,
+        kind: MetricKind::Rate {
+            numerator: TOTAL_SCHBENCH_MSG_RUN_DELAY_NS,
+            denominator: TOTAL_SCHBENCH_MSG_PCOUNT,
+        },
+        default_abs: 1000.0,
+        default_rel: 0.10,
+        display_unit: "ns",
+        accessor: |_| None,
+    },
+    MetricDef {
+        // Worker per-schedule run-delay mean = Σrun_delay_ns / Σpcount. LowerBetter.
+        // Pooled SEPARATELY from the message role (different per-schedule wait
+        // populations). Absent when no worker was scheduled (Σpcount == 0).
+        name: SCHBENCH_WORKER_RUN_DELAY_NS_PER_SCHED,
+        polarity: crate::test_support::Polarity::LowerBetter,
+        kind: MetricKind::Rate {
+            numerator: TOTAL_SCHBENCH_WORKER_RUN_DELAY_NS,
+            denominator: TOTAL_SCHBENCH_WORKER_PCOUNT,
+        },
+        default_abs: 1000.0,
+        default_rel: 0.10,
+        display_unit: "ns",
+        accessor: |_| None,
+    },
     // Per-phase latency min/max. LowerBetter (a higher min/max latency is worse).
     // min is a low-tail value → p50/p90 abs tier (20). max is a PEAK (a single
     // extreme sample, the flakiest latency stat) → the peak rel tolerance (0.50,
@@ -3309,6 +3419,15 @@ const RENDER_SUPPRESSED_COMPONENTS: &[&str] = &[
     TOTAL_TAOBENCH_FAST_OPS,
     TOTAL_TAOBENCH_SLOW_OPS,
     TOTAL_TAOBENCH_WALL_SEC,
+    // schbench role-separate run-delay gate-Rate components (raw run_delay_ns +
+    // pcount per role). Suppressed so compare shows the two
+    // `schbench_*_run_delay_ns_per_sched` Rates, not the raw Σ pairs. Remain in
+    // the row for the cross-RUN Σ/Σ re-pool. (total_schbench_loops is NOT here —
+    // it is a standalone throughput Counter, not a rate component.)
+    TOTAL_SCHBENCH_MSG_RUN_DELAY_NS,
+    TOTAL_SCHBENCH_MSG_PCOUNT,
+    TOTAL_SCHBENCH_WORKER_RUN_DELAY_NS,
+    TOTAL_SCHBENCH_WORKER_PCOUNT,
 ];
 
 /// True when `name` is a Rate component suppressed from compare output (see

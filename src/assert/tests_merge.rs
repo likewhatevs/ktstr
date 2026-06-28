@@ -834,6 +834,136 @@ fn populate_run_pooled_taobench_hit_fraction_absent_when_no_ops() {
     );
 }
 
+/// A schbench per-phase per-cgroup carrier with the given Class-3 raw pairs.
+fn schbench_pc(
+    msg_rd: u64,
+    msg_pc: u64,
+    wkr_rd: u64,
+    wkr_pc: u64,
+    loops: u64,
+) -> PhaseCgroupStats {
+    PhaseCgroupStats {
+        schbench: Some(crate::workload::schbench::run::SchbenchPhaseStats {
+            msg_run_delay_ns: msg_rd,
+            msg_pcount: msg_pc,
+            worker_run_delay_ns: wkr_rd,
+            worker_pcount: wkr_pc,
+            loop_count: loops,
+            ..Default::default()
+        }),
+        ..PhaseCgroupStats::default()
+    }
+}
+
+/// A PhaseBucket carrying the given per-cgroup schbench carriers.
+fn schbench_phase(step: u16, cgs: Vec<(&str, PhaseCgroupStats)>) -> PhaseBucket {
+    PhaseBucket {
+        step_index: step,
+        label: String::new(),
+        start_ms: 0,
+        end_ms: 0,
+        sample_count: 0,
+        metrics: std::collections::BTreeMap::new(),
+        per_cgroup: cgs.into_iter().map(|(n, c)| (n.to_string(), c)).collect(),
+    }
+}
+
+/// populate_run_pooled_schbench sums the Class-3 raw pairs across ALL phases AND
+/// ALL cgroups (the message / worker ROLES kept separate) and derives the two
+/// per-schedule run-delay Rates + the loop Counter. phase1: cg_a {msg 300/3,
+/// worker 500/1, 400 loops} + cg_b {worker 300/1, 600 loops}; phase2: cg_a {msg
+/// 100/97, worker 200/8}. Σ: msg 400/100, worker 1000/10, loops 1000 → msg 4
+/// ns/sched, worker 100 ns/sched (mean-of-ratios would give msg ~50.5).
+#[test]
+fn populate_run_pooled_schbench_repools_across_phases_and_cgroups() {
+    let mut stats = ScenarioStats {
+        phases: vec![
+            schbench_phase(
+                1,
+                vec![
+                    ("cg_a", schbench_pc(300, 3, 500, 1, 400)),
+                    ("cg_b", schbench_pc(0, 0, 300, 1, 600)),
+                ],
+            ),
+            schbench_phase(2, vec![("cg_a", schbench_pc(100, 97, 200, 8, 0))]),
+        ],
+        ..ScenarioStats::default()
+    };
+    populate_run_pooled_schbench(&mut stats);
+    let e = &stats.ext_metrics;
+    // Counter components Σ across phases+cgroups, roles separate.
+    assert_eq!(
+        e.get("total_schbench_msg_run_delay_ns").copied(),
+        Some(400.0),
+    );
+    assert_eq!(e.get("total_schbench_msg_pcount").copied(), Some(100.0));
+    assert_eq!(
+        e.get("total_schbench_worker_run_delay_ns").copied(),
+        Some(1000.0),
+    );
+    assert_eq!(e.get("total_schbench_worker_pcount").copied(), Some(10.0));
+    assert_eq!(e.get("total_schbench_loops").copied(), Some(1000.0));
+    // Gate-Rates = Σrun_delay / Σpcount per role.
+    assert_eq!(
+        e.get("schbench_msg_run_delay_ns_per_sched").copied(),
+        Some(4.0),
+        "Σ400/Σ100 = 4 ns/sched",
+    );
+    assert_eq!(
+        e.get("schbench_worker_run_delay_ns_per_sched").copied(),
+        Some(100.0),
+        "Σ1000/Σ10 = 100 ns/sched",
+    );
+}
+
+/// Role gating: a carrier with only the worker role scheduled (msg_pcount == 0)
+/// emits the worker components + Rate and the loop Counter, but the message
+/// components + Rate stay ABSENT (never a 0/0 rate or a false-zero component).
+#[test]
+fn populate_run_pooled_schbench_role_gating_omits_unscheduled_role() {
+    let mut stats = ScenarioStats {
+        phases: vec![schbench_phase(1, vec![("cg", schbench_pc(0, 0, 200, 4, 50))])],
+        ..ScenarioStats::default()
+    };
+    populate_run_pooled_schbench(&mut stats);
+    let e = &stats.ext_metrics;
+    assert_eq!(
+        e.get("schbench_worker_run_delay_ns_per_sched").copied(),
+        Some(50.0),
+        "200/4 = 50 ns/sched",
+    );
+    assert_eq!(e.get("total_schbench_loops").copied(), Some(50.0));
+    assert!(
+        !e.contains_key("total_schbench_msg_pcount"),
+        "message components absent when that role never scheduled",
+    );
+    assert!(
+        !e.contains_key("schbench_msg_run_delay_ns_per_sched"),
+        "message Rate absent (no 0/0)",
+    );
+}
+
+/// No schbench carrier anywhere → no keys (a non-schbench run stays distinct from
+/// a measured zero); empty phases likewise.
+#[test]
+fn populate_run_pooled_schbench_absent_without_schbench() {
+    let mut stats = ScenarioStats {
+        phases: vec![schbench_phase(
+            1,
+            vec![("cg", PhaseCgroupStats::default())],
+        )],
+        ..ScenarioStats::default()
+    };
+    populate_run_pooled_schbench(&mut stats);
+    assert!(
+        stats.ext_metrics.is_empty(),
+        "no schbench keys when no carrier ran",
+    );
+    let mut empty = ScenarioStats::default();
+    populate_run_pooled_schbench(&mut empty);
+    assert!(empty.ext_metrics.is_empty(), "no keys for empty phases");
+}
+
 #[test]
 fn merge_scenario_stats_worst_wins_and_iterations_sum() {
     // Aggregates-across-cgroups contract for the MERGE-FOLDED worst-wins

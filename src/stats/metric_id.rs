@@ -114,6 +114,15 @@ builtin_metrics! {
     TaobenchFastOpsPerSec => "taobench_fast_ops_per_sec",
     TaobenchSlowOpsPerSec => "taobench_slow_ops_per_sec",
     TaobenchHitFraction => "taobench_hit_fraction",
+    // schbench whole-run Class-3 (loop Counter + role-separate run-delay gate
+    // Rates + their Counter components), re-pooled by populate_run_pooled_schbench.
+    TotalSchbenchMsgRunDelayNs => "total_schbench_msg_run_delay_ns",
+    TotalSchbenchMsgPcount => "total_schbench_msg_pcount",
+    TotalSchbenchWorkerRunDelayNs => "total_schbench_worker_run_delay_ns",
+    TotalSchbenchWorkerPcount => "total_schbench_worker_pcount",
+    TotalSchbenchLoops => "total_schbench_loops",
+    SchbenchMsgRunDelayNsPerSched => "schbench_msg_run_delay_ns_per_sched",
+    SchbenchWorkerRunDelayNsPerSched => "schbench_worker_run_delay_ns_per_sched",
     SystemTimeNs => "system_time_ns",
     UserTimeNs => "user_time_ns",
     WorstMeanRunDelayUs => "worst_mean_run_delay_us",

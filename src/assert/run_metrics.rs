@@ -661,7 +661,10 @@ pub fn populate_run_ext_metrics_from_phases(
 ///    `iterations_per_cpu_sec` Rate (from `stats.cgroups`).
 /// 4. [`populate_run_pooled_taobench`] — the whole-run taobench qps + hit Rates
 ///    pooled cross-cgroup (from `stats.cgroups[].taobench_whole`).
-/// 5. [`populate_run_distribution_metrics`] — the `Distribution` / `WorstLowest`
+/// 5. [`populate_run_pooled_schbench`] — the schbench whole-run Class-3 loop
+///    Counter + role-separate run-delay gate-Rates (from
+///    `stats.phases[].per_cgroup[].schbench` raw pairs, summed over phases+cgroups).
+/// 6. [`populate_run_distribution_metrics`] — the `Distribution` / `WorstLowest`
 ///    / `WakeLatencyTailRatio` / `WorstCrossNodeRatio` re-pools (from
 ///    `stats.phases[].per_cgroup` raw samples + `stats.cgroups`).
 ///
@@ -691,6 +694,7 @@ pub fn populate_run_ext_all(
     populate_run_ext_metrics_from_phases(&stats.phases, &mut stats.ext_metrics);
     populate_run_pooled_iterations_per_cpu_sec(stats);
     populate_run_pooled_taobench(stats);
+    populate_run_pooled_schbench(stats);
     populate_run_distribution_metrics(stats);
 }
 
@@ -831,6 +835,81 @@ pub fn populate_run_pooled_taobench(stats: &mut ScenarioStats) {
     stats
         .ext_metrics
         .insert(TOTAL_TAOBENCH_WALL_SEC.to_string(), w.elapsed_ns as f64 / 1e9);
+    crate::stats::derive_rate_metrics(&mut stats.ext_metrics);
+}
+
+/// Inject the schbench whole-run Class-3 metrics — the loop Counter and the
+/// role-separate run-delay gate-Rate components — into `stats.ext_metrics`,
+/// summed across EVERY phase and EVERY cgroup from the per-phase
+/// `SchbenchPhaseStats` raw pairs (`stats.phases[].per_cgroup[].schbench`). The
+/// raw `(run_delay_ns, pcount)` pairs and `loop_count` are integer and
+/// associative, so summing across phases+cgroups gives the run-level totals; the
+/// two `*_run_delay_ns_per_sched` Rates then re-derive Σrun_delay/Σpcount (the
+/// sample-weighted per-schedule mean — NOT a mean of per-run means). The MESSAGE
+/// and WORKER thread roles pool SEPARATELY (different per-schedule wait
+/// populations — never cross-pool).
+///
+/// Runs in [`populate_run_ext_all`] (post-merge, after
+/// [`populate_run_pooled_taobench`]); reads the per-phase carriers (a disjoint
+/// source from the iterations/taobench pools) and writes distinct
+/// `total_schbench_*` / `schbench_*_run_delay_ns_per_sched` keys, so it is
+/// order-independent. A run with no schbench carrier writes nothing (keys stay
+/// absent — a non-schbench run is distinct from a measured zero).
+///
+/// Both-or-neither PER ROLE: each role's two Counter components are inserted only
+/// when that role was scheduled (`pcount > 0`), so `derive_rate_metrics` yields
+/// the role's gate-Rate iff it ran (never a 0/0); the two roles are independent
+/// (a worker-only run emits only the worker Rate). `total_schbench_loops` is
+/// always written when any schbench carrier ran (0 is a measured zero). Distinct
+/// from the per-phase `sched_delay_msg/worker_us` (mean-of-means parity,
+/// PerPhase display-only) — these Rates gate; no double-count. Cross-RUN the
+/// components SUM-fold (Counter), so each Rate re-pools Σrun_delay/Σpcount.
+pub fn populate_run_pooled_schbench(stats: &mut ScenarioStats) {
+    use crate::stats::{
+        TOTAL_SCHBENCH_LOOPS, TOTAL_SCHBENCH_MSG_PCOUNT, TOTAL_SCHBENCH_MSG_RUN_DELAY_NS,
+        TOTAL_SCHBENCH_WORKER_PCOUNT, TOTAL_SCHBENCH_WORKER_RUN_DELAY_NS,
+    };
+    let mut msg_run_delay_ns: u64 = 0;
+    let mut msg_pcount: u64 = 0;
+    let mut worker_run_delay_ns: u64 = 0;
+    let mut worker_pcount: u64 = 0;
+    let mut loops: u64 = 0;
+    let mut any = false;
+    for phase in &stats.phases {
+        for pc in phase.per_cgroup.values() {
+            if let Some(s) = pc.schbench.as_ref() {
+                any = true;
+                msg_run_delay_ns += s.msg_run_delay_ns;
+                msg_pcount += s.msg_pcount;
+                worker_run_delay_ns += s.worker_run_delay_ns;
+                worker_pcount += s.worker_pcount;
+                loops += s.loop_count;
+            }
+        }
+    }
+    if !any {
+        return;
+    }
+    stats
+        .ext_metrics
+        .insert(TOTAL_SCHBENCH_LOOPS.to_string(), loops as f64);
+    if msg_pcount > 0 {
+        stats
+            .ext_metrics
+            .insert(TOTAL_SCHBENCH_MSG_RUN_DELAY_NS.to_string(), msg_run_delay_ns as f64);
+        stats
+            .ext_metrics
+            .insert(TOTAL_SCHBENCH_MSG_PCOUNT.to_string(), msg_pcount as f64);
+    }
+    if worker_pcount > 0 {
+        stats.ext_metrics.insert(
+            TOTAL_SCHBENCH_WORKER_RUN_DELAY_NS.to_string(),
+            worker_run_delay_ns as f64,
+        );
+        stats
+            .ext_metrics
+            .insert(TOTAL_SCHBENCH_WORKER_PCOUNT.to_string(), worker_pcount as f64);
+    }
     crate::stats::derive_rate_metrics(&mut stats.ext_metrics);
 }
 
