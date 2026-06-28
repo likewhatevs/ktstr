@@ -1717,6 +1717,20 @@ fn every_metric_has_kind_consistent_with_naming() {
             }
         }
 
+        // PerRunDistribution metrics are whole-run percentile / min / max values
+        // (union-recomputed within-run, noise-compared per-run); name them
+        // `*_whole` so they read as the whole-run sibling of the per-phase
+        // percentile keys at a glance AND stay registry-distinct from those
+        // PerPhase names (one registry name = one kind). Polarity is per-metric
+        // (latency LowerBetter, rps HigherBetter), so it is NOT coupled here.
+        if matches!(m.kind, MetricKind::PerRunDistribution) {
+            assert!(
+                m.name.ends_with("_whole"),
+                "PerRunDistribution-kind metric must use *_whole naming, got {:?}",
+                m.name,
+            );
+        }
+
         // REVERSE gate: a metric NAMED like a per-second rate MUST be a
         // Rate, so a future per-second metric cannot silently ship as a
         // Gauge that averages ready-made ratios (the (r₁+r₂)/2 bug). Scoped

@@ -832,12 +832,17 @@ impl<'a> Accumulator<'a> {
 }
 
 /// Fold one group's accumulated per-ext-metric (value, weight) pairs
-/// into the aggregated row's `ext_metrics` map. Rate and PerPhase are
-/// skipped in the kind dispatch: Rate's components survive cross-RUN as
-/// their own ext keys so it re-derives Σnum/Σdenom (folding two ready-made
-/// ratios would lose the re-pool, and routing a Rate through
-/// aggregate_samples_weighted would hit the aggregate_finite guard);
-/// PerPhase is a per-phase-only scalar with no cross-RUN aggregate.
+/// into the aggregated row's `ext_metrics` map. Rate, PerPhase, and
+/// PerRunDistribution are skipped in the kind dispatch: Rate's components
+/// survive cross-RUN as their own ext keys so it re-derives Σnum/Σdenom
+/// (folding two ready-made ratios would lose the re-pool, and routing a Rate
+/// through aggregate_samples_weighted would hit the aggregate_finite guard);
+/// PerPhase is a per-phase-only scalar with no cross-RUN aggregate;
+/// PerRunDistribution is a whole-run percentile/min/max that CANNOT be
+/// cross-RUN folded (a percentile of a union is not a mean of per-run
+/// percentiles, and the per-phase histograms are dropped cross-RUN so there is
+/// no pooled set to re-derive) — its only cross-RUN consumer is the per-run
+/// noise-compare (`noise_findings`), so it must never be averaged here.
 /// Distribution / WorstLowest / WakeLatencyTailRatio / WorstCrossNodeRatio
 /// are NOT skipped — their raw components do
 /// NOT survive cross-RUN (phases are dropped), so there is no pooled set
@@ -864,7 +869,12 @@ fn fold_ext_metrics(ext_pairs: BTreeMap<String, Vec<(f64, usize)>>) -> BTreeMap<
                 // unreachable!() arm. (PerPhase keys should never reach here —
                 // populate_run_ext_metrics_from_phases skips is_derived keys —
                 // so this is defensive belt-and-suspenders.)
-                if matches!(def.kind, MetricKind::Rate { .. } | MetricKind::PerPhase) {
+                if matches!(
+                    def.kind,
+                    MetricKind::Rate { .. }
+                        | MetricKind::PerPhase
+                        | MetricKind::PerRunDistribution
+                ) {
                     return None;
                 }
                 aggregate_samples_weighted(&pairs, def.kind).map(|v| (k, v))

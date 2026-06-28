@@ -855,6 +855,25 @@ fn schbench_pc(
     }
 }
 
+/// A schbench per-phase per-cgroup carrier whose wakeup PlatStats holds `lows`
+/// samples at `low_us` µs + `highs` samples at `high_us` µs (other streams empty).
+fn schbench_wakeup_pc(lows: u32, low_us: u32, highs: u32, high_us: u32) -> PhaseCgroupStats {
+    let mut p = crate::workload::schbench::plat::PlatStats::default();
+    for _ in 0..lows {
+        p.add_lat(low_us);
+    }
+    for _ in 0..highs {
+        p.add_lat(high_us);
+    }
+    PhaseCgroupStats {
+        schbench: Some(crate::workload::schbench::run::SchbenchPhaseStats {
+            wakeup: p,
+            ..Default::default()
+        }),
+        ..PhaseCgroupStats::default()
+    }
+}
+
 /// A PhaseBucket carrying the given per-cgroup schbench carriers.
 fn schbench_phase(step: u16, cgs: Vec<(&str, PhaseCgroupStats)>) -> PhaseBucket {
     PhaseBucket {
@@ -962,6 +981,92 @@ fn populate_run_pooled_schbench_absent_without_schbench() {
     let mut empty = ScenarioStats::default();
     populate_run_pooled_schbench(&mut empty);
     assert!(empty.ext_metrics.is_empty(), "no keys for empty phases");
+}
+
+/// populate_run_pooled_schbench_distribution re-pools the whole-run percentile by
+/// UNIONING the per-cgroup PlatStats histograms and re-deriving — the
+/// percentile-OF-the-union, NOT a mean of per-cgroup percentiles. cg_a has 99 low
+/// wakeup samples (10 µs), cg_b has 1 high (10000 µs): the union p99 (rank 99 of
+/// 100 pooled samples) is a LOW bucket (~10 µs), whereas mean-of-per-cgroup-p99
+/// would be ≈ (10 + 10000)/2 = 5005. The union MAX is the high sample
+/// (combine's max-of-max). Pins the cross-cgroup union + the non-linearity.
+#[test]
+fn populate_run_pooled_schbench_distribution_unions_cross_cgroup_percentile() {
+    let mut stats = ScenarioStats {
+        phases: vec![schbench_phase(
+            1,
+            vec![
+                ("cg_a", schbench_wakeup_pc(99, 10, 0, 0)),
+                ("cg_b", schbench_wakeup_pc(0, 0, 1, 10000)),
+            ],
+        )],
+        ..ScenarioStats::default()
+    };
+    populate_run_pooled_schbench_distribution(&mut stats);
+    let e = &stats.ext_metrics;
+    let p99 = e
+        .get("wakeup_p99_latency_us_whole")
+        .copied()
+        .expect("union p99 present");
+    assert!(
+        p99 < 1000.0,
+        "union p99 = percentile-of-pooled (~10 µs bucket), got {p99} \
+         (mean-of-per-cgroup-p99 would be ~5005)",
+    );
+    let max = e
+        .get("wakeup_max_latency_us_whole")
+        .copied()
+        .expect("union max present");
+    assert!(
+        max > 5000.0,
+        "union max = max-of-max (the high sample's ~10000 µs bucket), got {max}",
+    );
+    // request / rps streams had no samples → their keys are ABSENT (per-stream
+    // gate), never a false 0.
+    assert!(
+        !e.contains_key("request_p99_latency_us_whole"),
+        "request_*_whole absent when no request samples",
+    );
+    assert!(
+        !e.contains_key("rps_p50_whole"),
+        "rps_*_whole absent when no rps samples",
+    );
+}
+
+/// The union spans PHASES, not only cgroups: the same cgroup contributes 99 low
+/// wakeup samples in phase 1 and 1 high sample in phase 2. The whole-run p99 (rank
+/// 99 of the 100 pooled samples) is the LOW bucket — proving phase 1's samples are
+/// in the union — while the MAX is phase 2's high sample. Used alone, one phase
+/// would make p99 the high (≥ 1000) OR max the low (≤ 1000); both together pin the
+/// cross-phase union.
+#[test]
+fn populate_run_pooled_schbench_distribution_unions_cross_phase_percentile() {
+    let mut stats = ScenarioStats {
+        phases: vec![
+            schbench_phase(1, vec![("cg", schbench_wakeup_pc(99, 10, 0, 0))]),
+            schbench_phase(2, vec![("cg", schbench_wakeup_pc(0, 0, 1, 10000))]),
+        ],
+        ..ScenarioStats::default()
+    };
+    populate_run_pooled_schbench_distribution(&mut stats);
+    let e = &stats.ext_metrics;
+    let p99 = e
+        .get("wakeup_p99_latency_us_whole")
+        .copied()
+        .expect("union p99 present");
+    assert!(
+        p99 < 1000.0,
+        "cross-phase union p99 = percentile-of-pooled (~10 µs); phase-1 samples \
+         must be in the union, got {p99}",
+    );
+    let max = e
+        .get("wakeup_max_latency_us_whole")
+        .copied()
+        .expect("union max present");
+    assert!(
+        max > 5000.0,
+        "cross-phase union max = phase-2's high sample (~10000 µs), got {max}",
+    );
 }
 
 #[test]

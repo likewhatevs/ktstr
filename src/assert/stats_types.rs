@@ -1623,19 +1623,23 @@ fn merge_metric_values(
             if b_end_ms > a_end_ms { b } else { a }
         }
         // Derived kinds (every `is_derived()`: Rate / Distribution / WorstLowest /
-        // WakeLatencyTailRatio / WorstCrossNodeRatio / PerPhase) are skipped in
-        // the merge loop (see `merge_matched_phase_buckets`'s `is_derived`
-        // continue) and produced post-merge (`derive_rate_metrics` /
-        // `populate_run_distribution_metrics`), so a derived value never
+        // WakeLatencyTailRatio / WorstCrossNodeRatio / PerPhase /
+        // PerRunDistribution) are skipped in the merge loop (see
+        // `merge_matched_phase_buckets`'s `is_derived` continue) and produced
+        // post-merge (`derive_rate_metrics` / `populate_run_distribution_metrics`
+        // / `populate_run_pooled_schbench_distribution`), so a derived value never
         // reaches this per-value merge — folding a ready-made derived value
-        // would lose the re-pool.
+        // would lose the re-pool. (PerRunDistribution is additionally run-level
+        // only: it never appears in a PhaseBucket, so it cannot reach this
+        // per-phase-bucket merge at all.)
         Some(MetricKind::Rate { .. })
         | Some(MetricKind::Distribution { .. })
         | Some(MetricKind::WorstLowest { .. })
         | Some(MetricKind::WakeLatencyTailRatio)
         | Some(MetricKind::WorstCrossNodeRatio)
-        | Some(MetricKind::PerPhase) => unreachable!(
-            "derived metrics (Rate/Distribution/WorstLowest/WakeLatencyTailRatio/WorstCrossNodeRatio/PerPhase) are produced post-merge, not merged as values"
+        | Some(MetricKind::PerPhase)
+        | Some(MetricKind::PerRunDistribution) => unreachable!(
+            "derived metrics (Rate/Distribution/WorstLowest/WakeLatencyTailRatio/WorstCrossNodeRatio/PerPhase/PerRunDistribution) are produced post-merge, not merged as values"
         ),
         // Unregistered metric: commutative mean fallback. Sum
         // would over-count Gauge values; max would lose Counter

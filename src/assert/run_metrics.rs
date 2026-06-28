@@ -664,13 +664,16 @@ pub fn populate_run_ext_metrics_from_phases(
 /// 5. [`populate_run_pooled_schbench`] — the schbench whole-run Class-3 loop
 ///    Counter + role-separate run-delay gate-Rates (from
 ///    `stats.phases[].per_cgroup[].schbench` raw pairs, summed over phases+cgroups).
-/// 6. [`populate_run_distribution_metrics`] — the `Distribution` / `WorstLowest`
+/// 6. [`populate_run_pooled_schbench_distribution`] — the schbench whole-run
+///    latency/rps `*_whole` percentiles (union of the per-phase per-cgroup
+///    `PlatStats` histograms, percentile re-derived over the union).
+/// 7. [`populate_run_distribution_metrics`] — the `Distribution` / `WorstLowest`
 ///    / `WakeLatencyTailRatio` / `WorstCrossNodeRatio` re-pools (from
 ///    `stats.phases[].per_cgroup` raw samples + `stats.cgroups`).
 ///
 /// ORDER IS LOAD-BEARING: step 1 must precede step 2 so the whole-run wall +
 /// whole-run IRQ-counter deltas land before step 2's `contains_key` skip (the
-/// multi-phase-rate fix); steps 3-5 fold the per-cgroup roll-up after the
+/// multi-phase-rate fix); steps 3-7 fold the per-cgroup roll-up after the
 /// per-phase families.
 ///
 /// `stats.phases` SHOULD be the PRE-`derive_phase_metrics` fold (the host buckets
@@ -695,6 +698,7 @@ pub fn populate_run_ext_all(
     populate_run_pooled_iterations_per_cpu_sec(stats);
     populate_run_pooled_taobench(stats);
     populate_run_pooled_schbench(stats);
+    populate_run_pooled_schbench_distribution(stats);
     populate_run_distribution_metrics(stats);
 }
 
@@ -911,6 +915,129 @@ pub fn populate_run_pooled_schbench(stats: &mut ScenarioStats) {
             .insert(TOTAL_SCHBENCH_WORKER_PCOUNT.to_string(), worker_pcount as f64);
     }
     crate::stats::derive_rate_metrics(&mut stats.ext_metrics);
+}
+
+/// Inject the schbench whole-run DISTRIBUTIONAL metrics (the wakeup /
+/// request latency percentiles + min/max and the achieved-rps percentiles) into
+/// `stats.ext_metrics` as the `*_whole` keys, re-pooled run-level by UNIONING the
+/// per-phase per-cgroup `PlatStats` histograms
+/// (`stats.phases[].per_cgroup[].schbench.{wakeup,request,rps}`) across EVERY
+/// phase and EVERY cgroup, then re-deriving each percentile / min / max over the
+/// merged histogram. `PlatStats::combine` is an associative bucket-count add, so
+/// the merged histogram is the FAITHFUL union and the re-derived percentile is
+/// the percentile OF the pooled sample set — NOT a mean of per-phase / per-cgroup
+/// percentiles (the percentile operator is non-linear). This is the schbench
+/// histogram analog of [`populate_run_distribution_metrics`]'s raw-sample union.
+///
+/// Runs in [`populate_run_ext_all`] (post-merge, after
+/// [`populate_run_pooled_schbench`]); reads the per-phase carriers (disjoint from
+/// the iterations / taobench / schbench loop/run-delay pools) and writes distinct
+/// `*_whole` keys, so it is order-independent. Each stream's keys are written
+/// only when its merged histogram has samples (`sample_count() > 0`) — a stream
+/// with no samples (e.g. a sub-1s run with no rps samples) reads ABSENT, never a
+/// false 0 (mirrors the per-phase `write_schbench_scalars` gating and the
+/// carrier-less graceful degradation of [`populate_run_distribution_metrics`]).
+///
+/// The `*_whole` keys are `crate::stats::MetricKind::PerRunDistribution`:
+/// noise-compared per-run by `crate::stats::noise_findings` (each run's own p99),
+/// NEVER cross-RUN folded (a percentile of a union is not a mean of per-run
+/// percentiles, and the per-phase histograms are dropped at the cross-run
+/// boundary), so they are gated out of the cross-RUN ext fold and the within-run
+/// reducers (`is_derived`). Distinct names from the per-phase percentile keys
+/// (one registry name = one kind), produced solely here.
+pub fn populate_run_pooled_schbench_distribution(stats: &mut ScenarioStats) {
+    use crate::stats::{
+        SCHBENCH_REQUEST_MAX_US_WHOLE, SCHBENCH_REQUEST_MIN_US_WHOLE,
+        SCHBENCH_REQUEST_P50_US_WHOLE, SCHBENCH_REQUEST_P90_US_WHOLE,
+        SCHBENCH_REQUEST_P99_US_WHOLE, SCHBENCH_REQUEST_P999_US_WHOLE, SCHBENCH_RPS_MAX_WHOLE,
+        SCHBENCH_RPS_MIN_WHOLE, SCHBENCH_RPS_P20_WHOLE, SCHBENCH_RPS_P50_WHOLE,
+        SCHBENCH_RPS_P90_WHOLE, SCHBENCH_WAKEUP_MAX_US_WHOLE, SCHBENCH_WAKEUP_MIN_US_WHOLE,
+        SCHBENCH_WAKEUP_P50_US_WHOLE, SCHBENCH_WAKEUP_P90_US_WHOLE, SCHBENCH_WAKEUP_P99_US_WHOLE,
+        SCHBENCH_WAKEUP_P999_US_WHOLE,
+    };
+    use crate::workload::schbench::plat::{PlatStats, Pct};
+
+    // Union the per-stream histograms across ALL phases+cgroups (combine =
+    // associative bucket-count add → the faithful pooled histogram).
+    let mut wakeup = PlatStats::default();
+    let mut request = PlatStats::default();
+    let mut rps = PlatStats::default();
+    for phase in &stats.phases {
+        for pc in phase.per_cgroup.values() {
+            if let Some(s) = pc.schbench.as_ref() {
+                wakeup.combine(&s.wakeup);
+                request.combine(&s.request);
+                rps.combine(&s.rps);
+            }
+        }
+    }
+    // Latency streams: 4 percentiles + min/max, re-derived over the union, µs.
+    if wakeup.sample_count() > 0 {
+        let q = wakeup.percentiles();
+        stats
+            .ext_metrics
+            .insert(SCHBENCH_WAKEUP_P50_US_WHOLE.to_string(), q.value_at(Pct::P50) as f64);
+        stats
+            .ext_metrics
+            .insert(SCHBENCH_WAKEUP_P90_US_WHOLE.to_string(), q.value_at(Pct::P90) as f64);
+        stats
+            .ext_metrics
+            .insert(SCHBENCH_WAKEUP_P99_US_WHOLE.to_string(), q.value_at(Pct::P99) as f64);
+        stats.ext_metrics.insert(
+            SCHBENCH_WAKEUP_P999_US_WHOLE.to_string(),
+            q.value_at(Pct::P999) as f64,
+        );
+        stats
+            .ext_metrics
+            .insert(SCHBENCH_WAKEUP_MIN_US_WHOLE.to_string(), q.min as f64);
+        stats
+            .ext_metrics
+            .insert(SCHBENCH_WAKEUP_MAX_US_WHOLE.to_string(), q.max as f64);
+    }
+    if request.sample_count() > 0 {
+        let q = request.percentiles();
+        stats.ext_metrics.insert(
+            SCHBENCH_REQUEST_P50_US_WHOLE.to_string(),
+            q.value_at(Pct::P50) as f64,
+        );
+        stats.ext_metrics.insert(
+            SCHBENCH_REQUEST_P90_US_WHOLE.to_string(),
+            q.value_at(Pct::P90) as f64,
+        );
+        stats.ext_metrics.insert(
+            SCHBENCH_REQUEST_P99_US_WHOLE.to_string(),
+            q.value_at(Pct::P99) as f64,
+        );
+        stats.ext_metrics.insert(
+            SCHBENCH_REQUEST_P999_US_WHOLE.to_string(),
+            q.value_at(Pct::P999) as f64,
+        );
+        stats
+            .ext_metrics
+            .insert(SCHBENCH_REQUEST_MIN_US_WHOLE.to_string(), q.min as f64);
+        stats
+            .ext_metrics
+            .insert(SCHBENCH_REQUEST_MAX_US_WHOLE.to_string(), q.max as f64);
+    }
+    // RPS stream: PLIST_FOR_RPS = 20/50/90 + min/max (the schbench rps table).
+    if rps.sample_count() > 0 {
+        let r = rps.percentiles();
+        stats
+            .ext_metrics
+            .insert(SCHBENCH_RPS_P20_WHOLE.to_string(), r.value_at(Pct::P20) as f64);
+        stats
+            .ext_metrics
+            .insert(SCHBENCH_RPS_P50_WHOLE.to_string(), r.value_at(Pct::P50) as f64);
+        stats
+            .ext_metrics
+            .insert(SCHBENCH_RPS_P90_WHOLE.to_string(), r.value_at(Pct::P90) as f64);
+        stats
+            .ext_metrics
+            .insert(SCHBENCH_RPS_MIN_WHOLE.to_string(), r.min as f64);
+        stats
+            .ext_metrics
+            .insert(SCHBENCH_RPS_MAX_WHOLE.to_string(), r.max as f64);
+    }
 }
 
 /// Populate run-level DERIVED distributional metrics into

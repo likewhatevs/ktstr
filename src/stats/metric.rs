@@ -376,6 +376,29 @@ pub enum MetricKind {
     // 1.94 bump; renders fine. Suppress rather than reflow the prose.
     #[allow(clippy::doc_lazy_continuation)]
     PerPhase,
+    /// A WHOLE-RUN distributional value (a percentile / min / max) re-pooled
+    /// run-level by UNIONING the per-phase per-cgroup raw distribution carriers
+    /// and re-deriving the statistic over the union — the schbench engine's
+    /// `*_whole` wakeup / request / rps keys, written by
+    /// `crate::assert::populate_run_pooled_schbench_distribution` from the
+    /// `PhaseCgroupStats::schbench` `PlatStats` histograms (`PlatStats::combine`
+    /// is an associative bucket-count add, so the merged histogram is the faithful
+    /// union and the re-derived percentile is the percentile OF the pooled sample
+    /// set, NOT a mean of per-source percentiles). UNLIKE
+    /// [`MetricKind::Distribution`] it is NOT cross-RUN folded: a percentile of a
+    /// union is not a mean of per-run percentiles, and the per-phase histograms
+    /// are dropped at the cross-run boundary (no pooled set survives to
+    /// re-derive), so the only honest cross-run treatment is the per-run
+    /// noise-compare — `crate::stats::noise_findings` reads each run's own
+    /// `*_whole` scalar and compares the spread, never averaging them. So it is
+    /// [`MetricKind::is_derived`] (the within-run reducers skip it; the value is
+    /// produced solely by the run-level union populate) AND gated out of the
+    /// cross-RUN ext fold (`fold_ext_metrics`); `noise_findings` is its only
+    /// consumer. ext-only (`accessor |_| None`); the `*_whole` names are distinct
+    /// from the per-phase [`MetricKind::PerPhase`] percentile keys (one registry
+    /// name = one kind) — the established per-phase-vs-whole-run coexistence (as
+    /// the taobench and schbench loop/run-delay whole-run keys also do).
+    PerRunDistribution,
 }
 
 /// Sub-classification for [`MetricKind::Gauge`] picking the
@@ -613,6 +636,13 @@ impl MetricKind {
             // the per-phase merge loop skips it (is_derived) and never re-derives
             // via a kind — classification-only, like the other derived kinds.
             MetricKind::PerPhase => MergeKind::Recompute,
+            // PerRunDistribution is derived run-level by
+            // `populate_run_pooled_schbench_distribution` (union of the per-phase
+            // per-cgroup PlatStats histograms, percentile re-derived over the
+            // union); the per-phase merge loop skips it (is_derived) and never
+            // re-derives via a kind — classification-only, like the other derived
+            // kinds.
+            MetricKind::PerRunDistribution => MergeKind::Recompute,
         }
     }
 
@@ -653,6 +683,7 @@ impl MetricKind {
                 | MetricKind::WakeLatencyTailRatio
                 | MetricKind::WorstCrossNodeRatio
                 | MetricKind::PerPhase
+                | MetricKind::PerRunDistribution
         )
     }
 }
@@ -869,6 +900,17 @@ fn aggregate_finite(
             "MetricKind::PerPhase is derived by derive_phase_metrics, \
              not reduced from a sample slice"
         ),
+        // PerRunDistribution is produced run-level by
+        // populate_run_pooled_schbench_distribution (union of the per-phase
+        // PlatStats histograms) and is gated out of BOTH the within-run reducers
+        // (is_derived) AND the cross-RUN ext fold (fold_ext_metrics skip) — its
+        // only consumer is noise_findings reading the per-run scalar. So it never
+        // reaches a sample-slice reduction; reaching here is a routing bug.
+        MetricKind::PerRunDistribution => unreachable!(
+            "MetricKind::PerRunDistribution is produced by \
+             populate_run_pooled_schbench_distribution and noise-compared per-run, \
+             not reduced from a sample slice"
+        ),
     })
 }
 
@@ -902,7 +944,8 @@ pub fn aggregate_samples_for_phase(metric: &MetricDef, samples: &[f64]) -> Optio
     match metric.kind {
         MetricKind::Counter => phase_counter_delta(samples),
         // Derived kinds (every `is_derived()`: Rate / Distribution / WorstLowest /
-        // WakeLatencyTailRatio / WorstCrossNodeRatio / PerPhase) have no samples
+        // WakeLatencyTailRatio / WorstCrossNodeRatio / PerPhase / PerRunDistribution)
+        // have no samples
         // of their own: their value is produced by a post-pass
         // (`derive_rate_metrics` / `crate::assert::populate_run_distribution_metrics`)
         // from pooled components, not reduced from a per-phase slice. Return
@@ -1413,6 +1456,30 @@ pub(crate) const TOTAL_SCHBENCH_LOOPS: &str = "total_schbench_loops";
 pub(crate) const SCHBENCH_MSG_RUN_DELAY_NS_PER_SCHED: &str = "schbench_msg_run_delay_ns_per_sched";
 pub(crate) const SCHBENCH_WORKER_RUN_DELAY_NS_PER_SCHED: &str =
     "schbench_worker_run_delay_ns_per_sched";
+// schbench WHOLE-RUN distributional keys for perf-delta --noise-adjust:
+// each per-phase percentile/min/max re-pooled run-level by
+// `populate_run_pooled_schbench_distribution` (union of the per-phase per-cgroup
+// PlatStats histograms, percentile re-derived over the union). MetricKind::
+// PerRunDistribution: noise-compared per-run, NEVER cross-run folded. `*_whole`
+// names keep them registry-distinct from the per-phase PerPhase keys above (one
+// name = one kind). Latency LowerBetter; rps HigherBetter.
+pub(crate) const SCHBENCH_WAKEUP_P50_US_WHOLE: &str = "wakeup_p50_latency_us_whole";
+pub(crate) const SCHBENCH_WAKEUP_P90_US_WHOLE: &str = "wakeup_p90_latency_us_whole";
+pub(crate) const SCHBENCH_WAKEUP_P99_US_WHOLE: &str = "wakeup_p99_latency_us_whole";
+pub(crate) const SCHBENCH_WAKEUP_P999_US_WHOLE: &str = "wakeup_p999_latency_us_whole";
+pub(crate) const SCHBENCH_WAKEUP_MIN_US_WHOLE: &str = "wakeup_min_latency_us_whole";
+pub(crate) const SCHBENCH_WAKEUP_MAX_US_WHOLE: &str = "wakeup_max_latency_us_whole";
+pub(crate) const SCHBENCH_REQUEST_P50_US_WHOLE: &str = "request_p50_latency_us_whole";
+pub(crate) const SCHBENCH_REQUEST_P90_US_WHOLE: &str = "request_p90_latency_us_whole";
+pub(crate) const SCHBENCH_REQUEST_P99_US_WHOLE: &str = "request_p99_latency_us_whole";
+pub(crate) const SCHBENCH_REQUEST_P999_US_WHOLE: &str = "request_p999_latency_us_whole";
+pub(crate) const SCHBENCH_REQUEST_MIN_US_WHOLE: &str = "request_min_latency_us_whole";
+pub(crate) const SCHBENCH_REQUEST_MAX_US_WHOLE: &str = "request_max_latency_us_whole";
+pub(crate) const SCHBENCH_RPS_P20_WHOLE: &str = "rps_p20_whole";
+pub(crate) const SCHBENCH_RPS_P50_WHOLE: &str = "rps_p50_whole";
+pub(crate) const SCHBENCH_RPS_P90_WHOLE: &str = "rps_p90_whole";
+pub(crate) const SCHBENCH_RPS_MIN_WHOLE: &str = "rps_min_whole";
+pub(crate) const SCHBENCH_RPS_MAX_WHOLE: &str = "rps_max_whole";
 // taobench per-phase metric keys (the WorkType::Taobench engine's qps + hit
 // ratios, derived per-phase by write_taobench_scalars; MetricKind::PerPhase).
 // total/fast qps are HigherBetter; slow_qps + hit_ratio + hit_rate are
@@ -3165,6 +3232,166 @@ pub static METRICS: &[MetricDef] = &[
         name: SCHBENCH_RPS_MAX,
         polarity: crate::test_support::Polarity::HigherBetter,
         kind: MetricKind::PerPhase,
+        default_abs: 100.0,
+        default_rel: 0.10,
+        display_unit: "req/s",
+        accessor: |_| None,
+    },
+    // schbench WHOLE-RUN distributional metrics (MetricKind::
+    // PerRunDistribution): each per-phase percentile/min/max above, re-pooled
+    // run-level by populate_run_pooled_schbench_distribution (union of the
+    // per-phase per-cgroup PlatStats histograms, percentile re-derived over the
+    // union — the faithful percentile-of-union). Noise-compared per-run (never
+    // cross-run folded). Thresholds + polarity + unit mirror the per-phase
+    // sibling. accessor |_| None (ext-only, written by the union populate).
+    MetricDef {
+        name: SCHBENCH_WAKEUP_P50_US_WHOLE,
+        polarity: crate::test_support::Polarity::LowerBetter,
+        kind: MetricKind::PerRunDistribution,
+        default_abs: 20.0,
+        default_rel: 0.25,
+        display_unit: "\u{00b5}s",
+        accessor: |_| None,
+    },
+    MetricDef {
+        name: SCHBENCH_WAKEUP_P90_US_WHOLE,
+        polarity: crate::test_support::Polarity::LowerBetter,
+        kind: MetricKind::PerRunDistribution,
+        default_abs: 20.0,
+        default_rel: 0.25,
+        display_unit: "\u{00b5}s",
+        accessor: |_| None,
+    },
+    MetricDef {
+        name: SCHBENCH_WAKEUP_P99_US_WHOLE,
+        polarity: crate::test_support::Polarity::LowerBetter,
+        kind: MetricKind::PerRunDistribution,
+        default_abs: 50.0,
+        default_rel: 0.25,
+        display_unit: "\u{00b5}s",
+        accessor: |_| None,
+    },
+    MetricDef {
+        name: SCHBENCH_WAKEUP_P999_US_WHOLE,
+        polarity: crate::test_support::Polarity::LowerBetter,
+        kind: MetricKind::PerRunDistribution,
+        default_abs: 50.0,
+        default_rel: 0.25,
+        display_unit: "\u{00b5}s",
+        accessor: |_| None,
+    },
+    MetricDef {
+        name: SCHBENCH_WAKEUP_MIN_US_WHOLE,
+        polarity: crate::test_support::Polarity::LowerBetter,
+        kind: MetricKind::PerRunDistribution,
+        default_abs: 20.0,
+        default_rel: 0.25,
+        display_unit: "\u{00b5}s",
+        accessor: |_| None,
+    },
+    MetricDef {
+        name: SCHBENCH_WAKEUP_MAX_US_WHOLE,
+        polarity: crate::test_support::Polarity::LowerBetter,
+        kind: MetricKind::PerRunDistribution,
+        default_abs: 50.0,
+        default_rel: 0.50,
+        display_unit: "\u{00b5}s",
+        accessor: |_| None,
+    },
+    MetricDef {
+        name: SCHBENCH_REQUEST_P50_US_WHOLE,
+        polarity: crate::test_support::Polarity::LowerBetter,
+        kind: MetricKind::PerRunDistribution,
+        default_abs: 20.0,
+        default_rel: 0.25,
+        display_unit: "\u{00b5}s",
+        accessor: |_| None,
+    },
+    MetricDef {
+        name: SCHBENCH_REQUEST_P90_US_WHOLE,
+        polarity: crate::test_support::Polarity::LowerBetter,
+        kind: MetricKind::PerRunDistribution,
+        default_abs: 20.0,
+        default_rel: 0.25,
+        display_unit: "\u{00b5}s",
+        accessor: |_| None,
+    },
+    MetricDef {
+        name: SCHBENCH_REQUEST_P99_US_WHOLE,
+        polarity: crate::test_support::Polarity::LowerBetter,
+        kind: MetricKind::PerRunDistribution,
+        default_abs: 50.0,
+        default_rel: 0.25,
+        display_unit: "\u{00b5}s",
+        accessor: |_| None,
+    },
+    MetricDef {
+        name: SCHBENCH_REQUEST_P999_US_WHOLE,
+        polarity: crate::test_support::Polarity::LowerBetter,
+        kind: MetricKind::PerRunDistribution,
+        default_abs: 50.0,
+        default_rel: 0.25,
+        display_unit: "\u{00b5}s",
+        accessor: |_| None,
+    },
+    MetricDef {
+        name: SCHBENCH_REQUEST_MIN_US_WHOLE,
+        polarity: crate::test_support::Polarity::LowerBetter,
+        kind: MetricKind::PerRunDistribution,
+        default_abs: 20.0,
+        default_rel: 0.25,
+        display_unit: "\u{00b5}s",
+        accessor: |_| None,
+    },
+    MetricDef {
+        name: SCHBENCH_REQUEST_MAX_US_WHOLE,
+        polarity: crate::test_support::Polarity::LowerBetter,
+        kind: MetricKind::PerRunDistribution,
+        default_abs: 50.0,
+        default_rel: 0.50,
+        display_unit: "\u{00b5}s",
+        accessor: |_| None,
+    },
+    MetricDef {
+        name: SCHBENCH_RPS_P20_WHOLE,
+        polarity: crate::test_support::Polarity::HigherBetter,
+        kind: MetricKind::PerRunDistribution,
+        default_abs: 100.0,
+        default_rel: 0.10,
+        display_unit: "req/s",
+        accessor: |_| None,
+    },
+    MetricDef {
+        name: SCHBENCH_RPS_P50_WHOLE,
+        polarity: crate::test_support::Polarity::HigherBetter,
+        kind: MetricKind::PerRunDistribution,
+        default_abs: 100.0,
+        default_rel: 0.10,
+        display_unit: "req/s",
+        accessor: |_| None,
+    },
+    MetricDef {
+        name: SCHBENCH_RPS_P90_WHOLE,
+        polarity: crate::test_support::Polarity::HigherBetter,
+        kind: MetricKind::PerRunDistribution,
+        default_abs: 100.0,
+        default_rel: 0.10,
+        display_unit: "req/s",
+        accessor: |_| None,
+    },
+    MetricDef {
+        name: SCHBENCH_RPS_MIN_WHOLE,
+        polarity: crate::test_support::Polarity::HigherBetter,
+        kind: MetricKind::PerRunDistribution,
+        default_abs: 100.0,
+        default_rel: 0.10,
+        display_unit: "req/s",
+        accessor: |_| None,
+    },
+    MetricDef {
+        name: SCHBENCH_RPS_MAX_WHOLE,
+        polarity: crate::test_support::Polarity::HigherBetter,
+        kind: MetricKind::PerRunDistribution,
         default_abs: 100.0,
         default_rel: 0.10,
         display_unit: "req/s",

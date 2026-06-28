@@ -1044,6 +1044,32 @@ fn schbench_class3_rates_derive_and_pool_sigma_over_sigma() {
     );
 }
 
+/// schbench whole-run `*_whole` percentiles (MetricKind::PerRunDistribution) must
+/// NOT be cross-run folded — a mean of per-run p99s ≠ the p99 of the pooled
+/// sample set, and the per-phase histograms are dropped at the cross-run boundary
+/// so there is no pooled set to re-derive. fold_ext_metrics skips them; each
+/// run's own p99 reaches compare ONLY via the per-run noise path. Two runs with
+/// different p99s → the averaged group carries NO wakeup_p99_latency_us_whole key.
+#[test]
+fn schbench_whole_percentile_is_not_cross_run_folded() {
+    let mk = |p99: f64| {
+        let mut r = make_row("t", "tiny-1llc", true, 0.0);
+        r.ext_metrics
+            .insert("wakeup_p99_latency_us_whole".into(), p99);
+        r
+    };
+    let out = group_and_average_by(&[mk(10.0), mk(1000.0)], LEGACY_PAIRING_DIMS);
+    assert_eq!(out.len(), 1);
+    assert!(
+        !out[0]
+            .row
+            .ext_metrics
+            .contains_key("wakeup_p99_latency_us_whole"),
+        "PerRunDistribution must be skipped in the cross-run averaged fold \
+         (mean-of-p99 is not p99-of-pooled); it reaches compare only per-run via noise_findings",
+    );
+}
+
 /// `avg_nr_running` (Gauge(Avg) ext key) folds cross-run as the
 /// SAMPLE-WEIGHTED pooled mean — Σ(avg_i × samples_i) / Σ samples_i, weighted by
 /// run_sample_count — NOT the unweighted arithmetic mean a typed field would
