@@ -15,7 +15,7 @@ pub(crate) type MetricAccessor = fn(&GauntletRow) -> f64;
 /// `metrics` slice the old polars code keyed off DataFrame column
 /// names, so the outlier set surfaces the same metrics under the same
 /// names.
-const OUTLIER_METRICS: &[(&str, MetricAccessor)] = &[
+pub(crate) const OUTLIER_METRICS: &[(&str, MetricAccessor)] = &[
     ("spread", |r| r.spread),
     ("gap_ms", |r| r.gap_ms as f64),
     ("migrations", |r| r.migrations as f64),

@@ -1558,6 +1558,38 @@ fn aggregate_samples_for_phase_returns_none_on_empty_or_all_nan() {
     );
 }
 
+/// `find_outliers` flags values ABOVE mean+2σ — a HIGH value is the anomaly —
+/// and reads ext-sourced `OUTLIER_METRICS` entries' absent values as a 0.0
+/// sentinel (`.unwrap_or(0.0)`). Both are correct ONLY when a high value is
+/// WORSE, i.e. every `OUTLIER_METRICS` entry is `LowerBetter`. The registry's
+/// Distribution⇒LowerBetter gate (`every_metric_has_kind_consistent_with_naming`)
+/// already covers the current ext entries — all Distribution-kind — but this
+/// guard binds the coupling to `OUTLIER_METRICS` membership directly and
+/// KIND-INDEPENDENTLY, so a future non-Distribution (Counter / Gauge)
+/// HigherBetter registry metric added here — read through the same 0.0-sentinel
+/// accessor — fails loudly instead of silently flagging unusually-GOOD scenarios
+/// as outliers and deflating the cohort 2σ baseline with a best-case 0.0.
+#[test]
+fn outlier_metrics_are_lower_better_in_registry() {
+    for (name, _) in OUTLIER_METRICS {
+        // Display names that don't resolve to a registry entry (e.g. the typed
+        // `imbalance`→`imbalance_ratio` rename, or `spread`/`gap_ms` which read
+        // typed GauntletRow fields directly) carry no registry polarity to
+        // check. The guard targets registry-backed entries, which include every
+        // 0.0-sentinel ext entry (all four `worst_*` resolve here).
+        let Some(def) = metric_def(name) else { continue };
+        assert!(
+            matches!(def.polarity, crate::test_support::Polarity::LowerBetter),
+            "OUTLIER_METRICS entry {name:?} resolves to registry polarity {:?}, but \
+             outlier detection flags HIGH values and reads absent ext values as a 0.0 \
+             best-case sentinel — both require LowerBetter. A HigherBetter metric here \
+             silently corrupts outlier detection; make find_outliers polarity-aware \
+             before adding one.",
+            def.polarity,
+        );
+    }
+}
+
 /// Every entry in the `METRICS` registry must have a kind set.
 /// Pinned via the registry walk so a future entry that forgot
 /// to specify `kind` fails to compile (struct-literal
