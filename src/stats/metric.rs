@@ -1205,15 +1205,20 @@ impl MetricDef {
             // (loud-absent, never a false zero). Softirq vectors index against
             // the compile-pinned named consts, never bare literals.
             "total_hardirqs" => {
+                // saturating fold (applies to every IRQ arm below): overflow-safe
+                // cross-CPU spatial sum of the guest per-CPU counter — a corrupt /
+                // hostile per-CPU u64::MAX must clamp, not wrap, this per-freeze
+                // total (the Counter delta reads it). Exact for every in-range value.
                 let cpus = sample.snapshot.per_cpu_time();
-                (!cpus.is_empty()).then(|| cpus.iter().map(|c| c.irqs_sum).sum::<u64>() as f64)
+                (!cpus.is_empty())
+                    .then(|| cpus.iter().map(|c| c.irqs_sum).fold(0u64, u64::saturating_add) as f64)
             }
             "total_softirq_net_rx" => {
                 let cpus = sample.snapshot.per_cpu_time();
                 (!cpus.is_empty()).then(|| {
                     cpus.iter()
                         .map(|c| c.softirqs[crate::monitor::btf_offsets::SOFTIRQ_NET_RX])
-                        .sum::<u64>() as f64
+                        .fold(0u64, u64::saturating_add) as f64
                 })
             }
             "total_softirq_net_tx" => {
@@ -1221,7 +1226,7 @@ impl MetricDef {
                 (!cpus.is_empty()).then(|| {
                     cpus.iter()
                         .map(|c| c.softirqs[crate::monitor::btf_offsets::SOFTIRQ_NET_TX])
-                        .sum::<u64>() as f64
+                        .fold(0u64, u64::saturating_add) as f64
                 })
             }
             "total_softirq_timer" => {
@@ -1229,7 +1234,7 @@ impl MetricDef {
                 (!cpus.is_empty()).then(|| {
                     cpus.iter()
                         .map(|c| c.softirqs[crate::monitor::btf_offsets::SOFTIRQ_TIMER])
-                        .sum::<u64>() as f64
+                        .fold(0u64, u64::saturating_add) as f64
                 })
             }
             "total_softirq_sched" => {
@@ -1237,22 +1242,26 @@ impl MetricDef {
                 (!cpus.is_empty()).then(|| {
                     cpus.iter()
                         .map(|c| c.softirqs[crate::monitor::btf_offsets::SOFTIRQ_SCHED])
-                        .sum::<u64>() as f64
+                        .fold(0u64, u64::saturating_add) as f64
                 })
             }
             "total_irq_time_ns" => {
                 let cpus = sample.snapshot.per_cpu_time();
-                (!cpus.is_empty()).then(|| cpus.iter().map(|c| c.cpustat_irq_ns).sum::<u64>() as f64)
+                (!cpus.is_empty()).then(|| {
+                    cpus.iter()
+                        .map(|c| c.cpustat_irq_ns)
+                        .fold(0u64, u64::saturating_add) as f64
+                })
             }
             "total_softirq_time_ns" => {
                 let cpus = sample.snapshot.per_cpu_time();
                 (!cpus.is_empty())
-                    .then(|| cpus.iter().map(|c| c.cpustat_softirq_ns).sum::<u64>() as f64)
+                    .then(|| cpus.iter().map(|c| c.cpustat_softirq_ns).fold(0u64, u64::saturating_add) as f64)
             }
             "total_steal_time_ns" => {
                 let cpus = sample.snapshot.per_cpu_time();
                 (!cpus.is_empty())
-                    .then(|| cpus.iter().map(|c| c.cpustat_steal_ns).sum::<u64>() as f64)
+                    .then(|| cpus.iter().map(|c| c.cpustat_steal_ns).fold(0u64, u64::saturating_add) as f64)
             }
             // `system_time_ns` / `user_time_ns` are deliberately absent
             // here: they are NOT read per-sample. A per-sample

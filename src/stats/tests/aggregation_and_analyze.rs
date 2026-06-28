@@ -365,6 +365,74 @@ fn irq_read_sample_arms_sum_across_cpus() {
     );
 }
 
+/// Overflow-safety: the IRQ read_sample arms saturate their cross-CPU spatial
+/// sum — a corrupt/hostile per-CPU counter at u64::MAX reads back u64::MAX
+/// (clamped), not a wrapped-small per-freeze total a plain `.sum::<u64>()` would
+/// debug-panic / release-wrap to. Pins the 3 field shapes (count / softirq
+/// vector / cpustat-ns); the other arms fold identically.
+#[test]
+fn irq_read_sample_arms_saturate_on_per_cpu_overflow() {
+    use crate::monitor::btf_offsets::{NR_SOFTIRQS, SOFTIRQ_NET_RX};
+    use crate::monitor::dump::{FailureDumpReport, PerCpuTimeStats};
+    use crate::scenario::sample::SampleSeries;
+    use crate::scenario::snapshot::{DrainedSnapshotEntry, MissingStatsReason};
+
+    let net_rx = |n: u64| {
+        let mut s = [0u64; NR_SOFTIRQS];
+        s[SOFTIRQ_NET_RX] = n;
+        s
+    };
+    let entry = DrainedSnapshotEntry {
+        tag: "periodic_000".to_string(),
+        report: FailureDumpReport {
+            per_cpu_time: vec![
+                PerCpuTimeStats {
+                    cpu: 0,
+                    irqs_sum: u64::MAX,
+                    softirqs: net_rx(u64::MAX),
+                    cpustat_irq_ns: u64::MAX,
+                    ..Default::default()
+                },
+                PerCpuTimeStats {
+                    cpu: 1,
+                    irqs_sum: 5,
+                    softirqs: net_rx(5),
+                    cpustat_irq_ns: 5,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        },
+        stats: Err(MissingStatsReason::NoSchedulerBinary),
+        elapsed_ms: Some(100),
+        boundary_offset_ms: None,
+        step_index: Some(1),
+    };
+    let series = SampleSeries::from_drained_typed(vec![entry], None);
+    let sample = series.iter_samples().next().expect("one sample");
+    let read = |name: &str| {
+        crate::stats::metric_def(name)
+            .expect("registered metric")
+            .read_sample(&sample)
+    };
+    // u64::MAX + 5 saturates to u64::MAX (not wraps to 4); read as f64.
+    assert_eq!(
+        read("total_hardirqs"),
+        Some(u64::MAX as f64),
+        "irqs_sum spatial sum saturates, not wraps",
+    );
+    assert_eq!(
+        read("total_softirq_net_rx"),
+        Some(u64::MAX as f64),
+        "softirq spatial sum saturates",
+    );
+    assert_eq!(
+        read("total_irq_time_ns"),
+        Some(u64::MAX as f64),
+        "cpustat_irq_ns spatial sum saturates",
+    );
+}
+
 /// End-to-end per-phase fold for the IRQ Counter — the CI-runnable pair of
 /// the host-gated `irq_metrics_e2e` (no VM). A two-freeze `SampleSeries` with
 /// RISING per-CPU `irqs_sum` / NET_RX softirqs, both stamped the same step,
