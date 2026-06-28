@@ -1591,12 +1591,13 @@ fn run_metric_loud_absent_distinct_from_measured_zero() {
     assert_eq!(result.run_metric("total_hardirqs"), None);
 }
 
-/// SCOPE BOUNDARY: the typed cross-cgroup `ScenarioStats` fields and the
-/// monitor-sourced run-level metrics are NOT in the ext map — `run_metric`
-/// returns `None` for them (read typed via named fields, monitor via
-/// `phase_metric`), matching `ScenarioStats::run_metric`'s documented boundary.
+/// `run_metric` boundary: the typed cross-cgroup fields now RESOLVE None-aware
+/// (re-derived from the carriers, distinguishing measured from never-measured),
+/// the ext-sourced pooled rate resolves, and the monitor-sourced run-level
+/// metrics remain per-phase-only (`None` here) — matching
+/// `ScenarioStats::run_metric`'s boundary.
 #[test]
-fn run_metric_excludes_typed_and_monitor_metrics() {
+fn run_metric_resolves_typed_excludes_monitor_metrics() {
     let _lock = lock_env();
     let _sd = isolated_sidecar_dir();
     let result = run_metric_fixture(crate::assert::CgroupStats {
@@ -1607,13 +1608,17 @@ fn run_metric_excludes_typed_and_monitor_metrics() {
         total_migrations: 50,
         ..Default::default()
     });
-    // typed cross-cgroup fields (0.0-sentinel) — not in ext_metrics
-    assert_eq!(result.run_metric("total_migrations"), None);
+    // typed cross-cgroup fields now resolve None-aware: total_migrations is a
+    // cross-cgroup SUM (one cgroup, 50) — a measured value, not absent.
+    assert_eq!(result.run_metric("total_migrations"), Some(50.0));
+    // worst_spread is None-aware ABSENT: this fixture's cgroup set no spread
+    // (CgroupStats::spread == None — no worker had measurable wall time), so the
+    // re-derive reports not-measured, distinct from a measured 0.0.
     assert_eq!(result.run_metric("worst_spread"), None);
-    // monitor-sourced run-level — per-phase only
+    // monitor-sourced run-level — per-phase only, not in this accessor.
     assert_eq!(result.run_metric("max_imbalance_ratio"), None);
     assert_eq!(result.run_metric("stuck_count"), None);
-    // but the ext-sourced pooled rate IS resolved (the scope it covers)
+    // the ext-sourced pooled rate IS resolved (1000 iters / 2 s).
     assert_eq!(result.run_metric("iterations_per_cpu_sec"), Some(500.0));
 }
 

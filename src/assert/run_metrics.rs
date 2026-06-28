@@ -23,9 +23,18 @@ pub struct ScenarioStats {
     pub worst_migration_ratio: f64,
     /// Sum of iteration counts across all cgroups.
     pub total_iterations: u64,
-    /// Worst page locality fraction across cgroups (lowest non-zero).
+    /// Worst page locality fraction across cgroups (lowest non-zero). NOTE: this
+    /// field is the `AssertResult::merge` fold value (`fold_lowest_nonzero`, which
+    /// SKIPS a measured 0.0 as a sentinel), so it can DIVERGE from
+    /// `run_metric(BuiltinMetric::WorstPageLocality)` — which re-derives None-aware
+    /// from the per-phase carriers and lets a measured 0.0 (all pages off-node, the
+    /// genuine worst cell) win the lowest. Prefer `run_metric` as authoritative;
+    /// the field-side fold fix is a separate cross-cgroup-merge change.
     pub worst_page_locality: f64,
-    /// Worst cross-node migration ratio across cgroups (highest).
+    /// Worst cross-node migration ratio across cgroups (highest). A CHURN ratio —
+    /// cumulative cross-node migration EVENTS / final-snapshot resident pages — so
+    /// it can exceed 1.0 under heavy re-migration (a page migrates more than once);
+    /// NOT a bounded `[0,1]` fraction.
     pub worst_cross_node_migration_ratio: f64,
     // worst_wake_latency_tail_ratio is NO LONGER a typed field: it is
     // `crate::stats::MetricKind::WakeLatencyTailRatio`, re-selected into
@@ -271,31 +280,144 @@ impl ScenarioStats {
     /// `iteration_rate` / `iterations_per_cpu_sec` — all of which resolve
     /// here too; prefer the derived rate over its raw components.)
     ///
-    /// NOT resolved here (these are not in `ext_metrics`):
-    /// - the typed cross-cgroup fields — read them via their named
-    ///   struct fields ([`Self::worst_spread`],
-    ///   [`Self::worst_migration_ratio`], [`Self::worst_gap_ms`],
-    ///   [`Self::total_migrations`], [`Self::total_iterations`],
-    ///   [`Self::worst_page_locality`],
-    ///   [`Self::worst_cross_node_migration_ratio`]). They are
-    ///   `0.0`-sentinel f64 (no not-measured state), so exposing them
-    ///   here would split this method's sentinel-free contract.
-    ///   (`worst_wake_latency_tail_ratio` is NO LONGER in this group —
-    ///   it is now the `WakeLatencyTailRatio` ext key and IS resolved
-    ///   here via the ext lookup.)
+    /// RESOLVED here None-aware, ahead of the ext lookup, via a typed dispatch
+    /// (`typed_sentinel_metric`): the typed cross-cgroup fields `worst_spread`,
+    /// `worst_migration_ratio`, `worst_gap_ms`, `total_migrations`,
+    /// `total_iterations`, `worst_page_locality`,
+    /// `worst_cross_node_migration_ratio`. Their struct fields are 0.0-sentinel
+    /// f64 (a not-measured carrier coerces to 0.0, indistinguishable from a
+    /// measured zero), so the dispatch RE-DERIVES each from the per-cgroup
+    /// (`self.cgroups`) / per-phase (`self.phases[].per_cgroup`, the two NUMA
+    /// fields) carriers — `None` when no carrier measured it, `Some(0.0)` for a
+    /// measured zero — preserving the sentinel-free contract.
+    /// (`worst_wake_latency_tail_ratio` resolves via the ext lookup as the
+    /// `WakeLatencyTailRatio` key.)
+    ///
+    /// NOT resolved here (not in `ext_metrics`, no typed dispatch):
     /// - the monitor-sourced run-level metrics (`max_imbalance_ratio`,
     ///   `max_dsq_depth`, `stuck_count`, `total_fallback`,
     ///   `total_keep_last`), which `ScenarioStats` does not hold
     ///   run-level — read those per-phase via [`Self::phase_metric`].
     ///
-    /// So this does NOT cover the full registry: iterating
-    /// [`crate::stats::BuiltinMetric::ALL`] through it yields `None` for those
-    /// typed and monitor names. There is no single run-level by-name accessor
-    /// over the whole registry (the typed fields live on `ScenarioStats`
-    /// directly, the monitor metrics only per-phase); this resolves the
-    /// ext-sourced family, the one with no typed field.
+    /// So this resolves the ext-sourced family AND the typed cross-cgroup fields
+    /// (via the dispatch); only the monitor-sourced run-level metrics remain
+    /// unresolved here (`ScenarioStats` holds them only per-phase).
     pub fn run_metric(&self, metric: impl Into<crate::stats::MetricId>) -> Option<f64> {
-        self.ext_metrics.get(metric.into().as_str()).copied()
+        let id = metric.into();
+        // The typed 0.0-sentinel run-level fields re-derive None-aware from the
+        // per-cgroup / per-phase carriers (which preserve the never-measured vs
+        // measured-zero state the struct's 0.0-coerced fields cannot). A
+        // non-sentinel id returns `None` from the dispatch and falls through to
+        // the ext-metrics map.
+        if let crate::stats::MetricId::Builtin(b) = &id
+            && let Some(resolved) = self.typed_sentinel_metric(*b)
+        {
+            return resolved;
+        }
+        self.ext_metrics.get(id.as_str()).copied()
+    }
+
+    /// Re-derive a typed 0.0-sentinel run-level metric None-aware from the
+    /// per-cgroup / per-phase carriers — recovering the never-measured (`None`)
+    /// vs measured-zero (`Some(0.0)`) distinction the bare 0.0-sentinel struct
+    /// fields (`worst_spread`, `worst_page_locality`, ...) cannot carry (their
+    /// `scenario_stats_for_cgroup` population coerces a not-measured carrier to
+    /// 0.0, indistinguishable from a measured zero).
+    ///
+    /// Returns `None` when `m` is NOT one of the typed sentinel ids — the caller
+    /// then falls through to the ext-metrics lookup. `Some(None)` when `m` IS a
+    /// sentinel id but no contributing carrier exists (loud-absent). `Some(Some(v))`
+    /// for the re-derived value (a measured zero stays `Some(0.0)`).
+    ///
+    /// The 5 non-NUMA fields source from `self.cgroups`, whose `Option` / counter
+    /// carriers preserve the measured-vs-unmeasured state. The 2 NUMA fields
+    /// (`worst_page_locality`, `worst_cross_node_migration_ratio`) source from
+    /// `self.phases[].per_cgroup`: `page_locality` is structurally 0.0 on the
+    /// `cgroup_stats` path (no expected-node set), so `self.cgroups` cannot
+    /// source it — the real residency lives in the per-phase `PhaseCgroupStats`
+    /// NUMA counters. On a phase-less direct-assertion `AssertResult` (no NUMA
+    /// capture) both NUMA fields read `None` (correct loud-absent).
+    fn typed_sentinel_metric(&self, m: crate::stats::BuiltinMetric) -> Option<Option<f64>> {
+        use crate::stats::BuiltinMetric as B;
+        Some(match m {
+            // worst_spread: highest spread over cgroups that measured it
+            // (CgroupStats::spread is already Option — None when no worker had
+            // measurable wall time). None iff no cgroup measured spread.
+            B::WorstSpread => self.cgroups.iter().filter_map(|c| c.spread).reduce(f64::max),
+            // worst_migration_ratio: highest migration ratio over cgroups that
+            // ran iterations (a 0.0 with total_iterations>0 is measured; with
+            // ==0 it is the rate-over-zero sentinel — never-measured).
+            B::WorstMigrationRatio => self
+                .cgroups
+                .iter()
+                .filter(|c| c.total_iterations > 0)
+                .map(|c| c.migration_ratio)
+                .reduce(f64::max),
+            // total_migrations / total_iterations: cross-cgroup SUMs. 0 is a real
+            // measured sum (cgroups ran, zero events); never-measured = no cgroups.
+            B::TotalMigrations => (!self.cgroups.is_empty())
+                .then(|| self.cgroups.iter().map(|c| c.total_migrations).sum::<u64>() as f64),
+            B::TotalIterations => (!self.cgroups.is_empty())
+                .then(|| self.cgroups.iter().map(|c| c.total_iterations).sum::<u64>() as f64),
+            // worst_gap_ms: longest gap over cgroups with workers (gap 0 with
+            // workers = measured "no gap observed"; never-measured = no workers).
+            B::WorstGapMs => self
+                .cgroups
+                .iter()
+                .filter(|c| c.num_workers > 0)
+                .map(|c| c.max_gap_ms as f64)
+                .reduce(f64::max),
+            // worst_page_locality: LOWEST per-cgroup locality (the worst cell) over
+            // cgroups that measured NUMA residency. A measured 0.0 (all pages
+            // off-node) is the worst and WINS the lowest fold — the read-side fix
+            // for the fold_lowest_nonzero sentinel-skip bug (cross-run merge fix
+            // tracked separately). Sourced from the per-phase NUMA carriers.
+            B::WorstPageLocality => self
+                .numa_agg_per_cgroup()
+                .into_iter()
+                .filter(|&(_, total, _)| total > 0)
+                .map(|(local, total, _)| super::reductions::page_locality_of(local, total))
+                .reduce(f64::min),
+            // worst_cross_node_migration_ratio: highest cross-node ratio over
+            // cgroups that measured NUMA. Sourced from the per-phase carriers.
+            B::WorstCrossNodeMigrationRatio => self
+                .numa_agg_per_cgroup()
+                .into_iter()
+                .filter(|&(_, total, _)| total > 0)
+                .map(|(_, total, migrated)| {
+                    super::reductions::cross_node_migration_ratio_of(migrated, total)
+                })
+                .reduce(f64::max),
+            _ => return None,
+        })
+    }
+
+    /// Aggregate each cgroup's NUMA carriers across `self.phases` into
+    /// `(latest_local, latest_total, summed_migrated)`. The cross-phase fold is
+    /// ASYMMETRIC by counter class: `numa_pages_local` / `numa_pages_total` are
+    /// cumulative-residency GAUGE snapshots (current `/proc/.../numa_maps`
+    /// residency), so the LATEST phase's value is the run-end placement —
+    /// SUMMING across phases would multiply residency by the phase count (a
+    /// silent over-count); `cross_node_migrated` is a per-phase migration-counter
+    /// DELTA over disjoint intervals, so it SUMS to the run total. The shared
+    /// `latest_total` denominator serves both ratios (page_locality and
+    /// cross_node share one page total), matching `cgroup_stats`, which reads the
+    /// final-snapshot residency. One entry per cgroup that appeared in any phase.
+    fn numa_agg_per_cgroup(&self) -> Vec<(u64, u64, u64)> {
+        let mut by_cg: std::collections::BTreeMap<&str, (u64, u64, u64)> =
+            std::collections::BTreeMap::new();
+        // self.phases is in step (chronological) order, so a later phase's
+        // residency snapshot overwrites the earlier (LATEST wins); the migration
+        // deltas accumulate.
+        for phase in &self.phases {
+            for (name, pc) in &phase.per_cgroup {
+                let e = by_cg.entry(name.as_str()).or_insert((0, 0, 0));
+                e.0 = pc.numa_pages_local;
+                e.1 = pc.numa_pages_total;
+                e.2 += pc.cross_node_migrated;
+            }
+        }
+        by_cg.into_values().collect()
     }
 }
 

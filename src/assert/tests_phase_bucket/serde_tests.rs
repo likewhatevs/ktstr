@@ -333,10 +333,10 @@ fn scenario_stats_phase_step_resolves_to_step_bucket() {
 /// deleted `worst_*` fields, so code holding the run's `AssertResult`
 /// never reaches into the raw `ext_metrics` map by string).
 /// Sentinel-free: an absent name is `None`, a measured `Some(0.0)` is a
-/// real zero. The typed cross-cgroup fields (`worst_spread` etc.) and
-/// the monitor-sourced metrics are NOT in `ext_metrics`, so they
-/// resolve to `None` here — read those via their named fields /
-/// `phase_metric`.
+/// real zero. The monitor-sourced metrics are NOT in `ext_metrics` (read via
+/// `phase_metric`); the typed cross-cgroup fields (`worst_spread` etc.) re-derive
+/// None-aware from the per-cgroup carriers — `None` here since this fixture
+/// carries no cgroups.
 #[test]
 fn scenario_stats_run_metric_resolves_ext_family_sentinel_free() {
     let mut ext = BTreeMap::new();
@@ -350,8 +350,9 @@ fn scenario_stats_run_metric_resolves_ext_family_sentinel_free() {
     ext.insert("my_custom_metric".to_string(), 7.0);
     let stats = ScenarioStats {
         ext_metrics: ext,
-        // Typed cross-cgroup field set, but NOT mirrored into ext_metrics:
-        // run_metric() must NOT resolve it (read via the named field instead).
+        // Typed cross-cgroup struct field set directly, but run_metric re-derives
+        // from the (here empty) cgroups carriers, not this field, so it resolves
+        // None-aware-absent below.
         worst_spread: 0.99,
         ..Default::default()
     };
@@ -366,12 +367,150 @@ fn scenario_stats_run_metric_resolves_ext_family_sentinel_free() {
     // Absent ext key (no contributing cgroup/carrier, or a typo) -> None.
     assert_eq!(stats.run_metric("worst_p99_wake_latency_us"), None);
     assert_eq!(stats.run_metric("totally_made_up"), None);
-    // Typed cross-cgroup field is not in ext_metrics -> None here even
-    // though the run carries it (worst_spread == 0.99): read via the field.
+    // Typed cross-cgroup field re-derives from the per-cgroup carriers
+    // (self.cgroups), NOT from the struct field: this fixture has no cgroups, so
+    // run_metric reports None-aware ABSENT (not-measured), independent of the
+    // struct field worst_spread == 0.99 (which the field read still returns).
     assert_eq!(stats.run_metric("worst_spread"), None);
     assert_eq!(stats.worst_spread, 0.99);
     // Monitor-sourced run-level metric is not held on ScenarioStats -> None.
     assert_eq!(stats.run_metric("max_imbalance_ratio"), None);
+}
+
+/// The typed cross-cgroup fields re-derive None-aware from `self.cgroups`: a
+/// MEASURED zero resolves to `Some(0.0)`, a never-measured carrier to `None` —
+/// the distinction the bare 0.0-sentinel struct fields cannot carry.
+#[test]
+fn run_metric_typed_cgroup_fields_distinguish_measured_zero_from_absent() {
+    use crate::stats::BuiltinMetric as B;
+    let cg = |spread: Option<f64>, iters: u64, migr: u64, gap_ms: u64, workers: usize| CgroupStats {
+        num_workers: workers,
+        spread,
+        total_iterations: iters,
+        total_migrations: migr,
+        migration_ratio: if iters > 0 { migr as f64 / iters as f64 } else { 0.0 },
+        max_gap_ms: gap_ms,
+        ..Default::default()
+    };
+    // MEASURED zeros -> Some(0.0): spread measured 0; 0 migrations over 1000
+    // iters; 0 gap with 4 workers; the totals SUM to a measured 0 / 1000.
+    let m = ScenarioStats {
+        cgroups: vec![cg(Some(0.0), 1000, 0, 0, 4)],
+        ..Default::default()
+    };
+    assert_eq!(m.run_metric(B::WorstSpread), Some(0.0));
+    assert_eq!(m.run_metric(B::WorstMigrationRatio), Some(0.0));
+    assert_eq!(m.run_metric(B::TotalMigrations), Some(0.0));
+    assert_eq!(m.run_metric(B::TotalIterations), Some(1000.0));
+    assert_eq!(m.run_metric(B::WorstGapMs), Some(0.0));
+    // NEVER-MEASURED -> None: no spread; 0 iters (ratio undefined); no workers
+    // (gap unmeasured). The SUM totals stay Some(0.0) — a cgroup contributed.
+    let a = ScenarioStats {
+        cgroups: vec![cg(None, 0, 0, 0, 0)],
+        ..Default::default()
+    };
+    assert_eq!(a.run_metric(B::WorstSpread), None);
+    assert_eq!(a.run_metric(B::WorstMigrationRatio), None);
+    assert_eq!(a.run_metric(B::WorstGapMs), None);
+    assert_eq!(a.run_metric(B::TotalMigrations), Some(0.0));
+    assert_eq!(a.run_metric(B::TotalIterations), Some(0.0));
+    // No cgroups at all -> the SUM totals are None (no contributor).
+    let e = ScenarioStats::default();
+    assert_eq!(e.run_metric(B::TotalMigrations), None);
+    assert_eq!(e.run_metric(B::TotalIterations), None);
+    // Worst-across-cgroups: max spread / max gap over the measured cgroups.
+    let two = ScenarioStats {
+        cgroups: vec![cg(Some(0.1), 100, 5, 3, 2), cg(Some(0.4), 100, 1, 9, 2)],
+        ..Default::default()
+    };
+    assert_eq!(two.run_metric(B::WorstSpread), Some(0.4), "max spread across cgroups");
+    assert_eq!(two.run_metric(B::WorstGapMs), Some(9.0), "max gap across cgroups");
+    assert_eq!(two.run_metric(B::TotalMigrations), Some(6.0), "5 + 1 summed");
+}
+
+/// The two NUMA fields re-derive from the per-phase carriers with the ASYMMETRIC
+/// cross-phase fold — LATEST residency snapshot (a gauge, NOT summed) + SUMmed
+/// cross-node migration deltas — and a measured-0.0 locality (all pages off-node,
+/// the worst cell) WINS the lowest fold rather than being skipped as a sentinel
+/// (the read-side fix). Never-measured (no NUMA pages) and the phase-less path
+/// resolve to None.
+#[test]
+fn run_metric_numa_fields_latest_residency_summed_migrations_none_aware() {
+    use crate::stats::BuiltinMetric as B;
+    let pcg = |local: u64, total: u64, migr: u64| PhaseCgroupStats {
+        numa_pages_local: local,
+        numa_pages_total: total,
+        cross_node_migrated: migr,
+        ..Default::default()
+    };
+    let phase = |step: u16, cgs: &[(&str, PhaseCgroupStats)]| {
+        let mut b = PhaseBucket {
+            step_index: step,
+            ..Default::default()
+        };
+        for (n, pc) in cgs {
+            b.per_cgroup.insert(n.to_string(), pc.clone());
+        }
+        b
+    };
+    // One cgroup A over two phases: residency is a GAUGE -> LATEST (phase 2:
+    // 250/1000 = 0.25), NOT summed ((900+250)/(1000+1000) = 0.575). Migrations
+    // are per-phase DELTAS -> SUM (10 + 20 = 30) over the LATEST total 1000.
+    let g = ScenarioStats {
+        phases: vec![
+            phase(1, &[("A", pcg(900, 1000, 10))]),
+            phase(2, &[("A", pcg(250, 1000, 20))]),
+        ],
+        ..Default::default()
+    };
+    assert_eq!(
+        g.run_metric(B::WorstPageLocality),
+        Some(0.25),
+        "LATEST residency 250/1000, NOT summed (which would give 0.575)"
+    );
+    let cross = g.run_metric(B::WorstCrossNodeMigrationRatio).unwrap();
+    assert!(
+        (cross - 0.03).abs() < 1e-9,
+        "summed migrations 30 / latest total 1000 = 0.03; got {cross}"
+    );
+    // A measured-0.0 locality (all off-node) is the WORST and wins the lowest
+    // fold — NOT skipped as a sentinel (the fold_lowest_nonzero read-side bug).
+    let z = ScenarioStats {
+        phases: vec![phase(1, &[("A", pcg(0, 1000, 0)), ("B", pcg(1000, 1000, 0))])],
+        ..Default::default()
+    };
+    assert_eq!(
+        z.run_metric(B::WorstPageLocality),
+        Some(0.0),
+        "measured 0.0 (all off-node) is the worst — wins the lowest, not skipped"
+    );
+    // Never-measured (no NUMA pages, total == 0) -> None, distinct from Some(0.0).
+    let n = ScenarioStats {
+        phases: vec![phase(1, &[("A", pcg(0, 0, 0))])],
+        ..Default::default()
+    };
+    assert_eq!(n.run_metric(B::WorstPageLocality), None, "no NUMA pages -> not measured");
+    assert_eq!(n.run_metric(B::WorstCrossNodeMigrationRatio), None);
+    // cross_node is a CHURN ratio (cumulative migration EVENTS / snapshot
+    // residency), intentionally UNBOUNDED: more migrations than resident pages
+    // (heavy re-migration) -> ratio > 1.0. page_locality stays bounded [0,1].
+    let churn = ScenarioStats {
+        phases: vec![phase(1, &[("A", pcg(500, 1000, 3000))])],
+        ..Default::default()
+    };
+    let r = churn.run_metric(B::WorstCrossNodeMigrationRatio).unwrap();
+    assert!((r - 3.0).abs() < 1e-9, "3000 migrations / 1000 pages = 3.0 (>1.0 churn); got {r}");
+    assert_eq!(
+        churn.run_metric(B::WorstPageLocality),
+        Some(0.5),
+        "page_locality 500/1000 stays a bounded [0,1] fraction"
+    );
+    // Phase-less (direct-assertion path): no NUMA carriers -> None (loud-absent).
+    let p = ScenarioStats {
+        cgroups: vec![CgroupStats::default()],
+        ..Default::default()
+    };
+    assert_eq!(p.run_metric(B::WorstPageLocality), None, "no phases -> no NUMA carriers");
 }
 
 /// The metric accessors take `impl Into<MetricId>`: a typed

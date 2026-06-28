@@ -937,13 +937,16 @@ impl VmResult {
     /// no `MonitorReport` to fold and returns `None` for them — the one place the
     /// two accessors differ.
     ///
+    /// RESOLVED here None-aware (via the delegated `ScenarioStats::run_metric`
+    /// typed dispatch): the typed cross-cgroup fields `worst_spread`,
+    /// `worst_migration_ratio`, `worst_gap_ms`, `total_migrations`,
+    /// `total_iterations`, `worst_page_locality`,
+    /// `worst_cross_node_migration_ratio`. Their struct fields are 0.0-sentinel
+    /// f64, so the dispatch re-derives each from the carriers (the per-cgroup
+    /// `stats.cgroups` + the per_cgroup-folded `stats.phases` this method builds)
+    /// — `None` when no carrier measured it, `Some(0.0)` for a measured zero.
+    ///
     /// NOT resolved here:
-    /// - the typed cross-cgroup `ScenarioStats` fields (`worst_spread`,
-    ///   `worst_migration_ratio`, `worst_gap_ms`, `total_migrations`,
-    ///   `total_iterations`, `worst_page_locality`,
-    ///   `worst_cross_node_migration_ratio`) — they are `0.0`-sentinel f64, so
-    ///   resolving them here would split this method's sentinel-free contract (an
-    ///   Option-distinguishing accessor is a follow-up).
     /// - the typed-backed monitor run-level metrics (`max_imbalance_ratio`,
     ///   `max_dsq_depth`, `stuck_count`, `total_fallback`, `total_keep_last`) —
     ///   these have typed `GauntletRow` fields (not ext-only); read them
@@ -990,7 +993,13 @@ impl VmResult {
         if let Some(report) = self.monitor.as_ref() {
             report.summary.fold_run_level_ext(&mut stats.ext_metrics);
         }
-        stats.ext_metrics.get(metric.as_str()).copied()
+        // Delegate to ScenarioStats::run_metric: it resolves the typed
+        // 0.0-sentinel cross-cgroup fields None-aware from the carriers
+        // (stats.cgroups + the per_cgroup-folded stats.phases, both populated
+        // above) ahead of the ext lookup — so the typed fields resolve here too,
+        // matching ScenarioStats::run_metric. The monitor metrics folded into
+        // stats.ext_metrics above resolve via that method's ext fallback.
+        stats.run_metric(metric)
     }
 
     /// Polarity-aware "is the `candidate` phase better than the `baseline` phase

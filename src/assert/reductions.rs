@@ -260,8 +260,12 @@ pub(crate) fn migration_ratio_of(total_migrations: u64, total_iterations: u64) -
     }
 }
 
-/// Peak cross-node migrated pages over the cgroup-wide total allocated pages;
-/// `0.0` when no NUMA pages were seen. Single-sourced with [`cgroup_stats`].
+/// Cross-node migrated pages over the cgroup-wide total allocated pages; `0.0`
+/// when no NUMA pages were seen. Single-sourced with [`cgroup_stats`]. A CHURN
+/// ratio, NOT a bounded `[0,1]` fraction: the numerator is cumulative migration
+/// EVENTS (`/proc/vmstat numa_pages_migrated`, which counts each migration, so a
+/// page can be counted more than once) and the denominator is a residency
+/// SNAPSHOT — so the result can legitimately exceed 1.0 under heavy re-migration.
 pub(crate) fn cross_node_migration_ratio_of(migrated_pages: u64, total_numa_pages: u64) -> f64 {
     if total_numa_pages > 0 {
         migrated_pages as f64 / total_numa_pages as f64
