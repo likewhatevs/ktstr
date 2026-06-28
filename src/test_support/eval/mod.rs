@@ -1975,31 +1975,19 @@ fn populate_run_stats_and_folded_timeline(
         host_phase_buckets,
         guest_phase_buckets,
     );
-    crate::assert::populate_run_ext_metrics(
-        early_periodic_series,
-        &mut check_result.stats.ext_metrics,
-    );
-    crate::assert::populate_run_ext_metrics_from_phases(
-        &check_result.stats.phases,
-        &mut check_result.stats.ext_metrics,
-    );
-    // Pooled cross-cgroup CPU-time efficiency (the cross-cgroup re-pool):
-    // sum total_iterations / total_cpu_time over the MEASURED merged
-    // cgroups (those with on-CPU time; mirrors the per-cgroup None-on-zero)
-    // and derive iterations_per_cpu_sec. MUST run here — AFTER the
-    // cgroup-bearing merges (check_result.stats.cgroups is complete) and
-    // BEFORE the sidecar write — so the worst-by-polarity merge fold never
-    // sees its components. The trailing monitor-verdict merge below is
-    // verdict-only (inconclusive with empty stats), so it is safe to follow.
-    crate::assert::populate_run_pooled_iterations_per_cpu_sec(&mut check_result.stats);
-    // Run-level distributional re-pool (Distribution + WorstLowest kinds):
-    // pool the per-cgroup raw sample sets in stats.phases across phases +
-    // cgroups and recompute the wake / run-delay distributions, and select
-    // the lowest-wins iteration efficiencies from stats.cgroups counters.
-    // MUST run here for the same reason as the pooled rate above — AFTER the
-    // per-cgroup carrier fold + cgroup merges, BEFORE the sidecar write — so
-    // these ext_metrics keys are the sole source for the |_| None accessors.
-    crate::assert::populate_run_distribution_metrics(&mut check_result.stats);
+    // Populate the full run-level ext_metrics family (the read_sample registry
+    // metrics, the phase-only fold, the pooled iterations_per_cpu_sec, and the
+    // Distribution / WorstLowest re-pools) in the canonical order — the SAME
+    // sequence VmResult::run_metric self-computes, so an in-test run_metric read
+    // matches what the sidecar records. MUST run here: AFTER the cgroup-bearing
+    // merges (check_result.stats.cgroups is complete) and the per-cgroup carrier
+    // fold above, BEFORE the sidecar write, and BEFORE the derive_phase_metrics
+    // below — it feeds on the PRE-derive phases (the eval-faithful input shape
+    // VmResult::run_metric reuses; post-derive yields the same map today via the
+    // is_derived skip, but pre-derive avoids depending on it). The trailing
+    // monitor-verdict merge below is verdict-only (inconclusive, empty stats),
+    // so it is safe to follow. See populate_run_ext_all for the step order.
+    crate::assert::populate_run_ext_all(&mut check_result.stats, early_periodic_series);
     // Per-phase scalars: derive into each phase bucket from the folded per_cgroup
     // carriers (post-fold, so the merge's is_derived skip can't drop them) — the
     // non-schbench carrier scalars (every cgroup) into each pc.metrics, and the

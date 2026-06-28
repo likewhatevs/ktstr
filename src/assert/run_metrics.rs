@@ -294,8 +294,8 @@ impl ScenarioStats {
     /// over the whole registry (the typed fields live on `ScenarioStats`
     /// directly, the monitor metrics only per-phase); this resolves the
     /// ext-sourced family, the one with no typed field.
-    pub fn run_metric(&self, name: impl Into<crate::stats::MetricId>) -> Option<f64> {
-        self.ext_metrics.get(name.into().as_str()).copied()
+    pub fn run_metric(&self, metric: impl Into<crate::stats::MetricId>) -> Option<f64> {
+        self.ext_metrics.get(metric.into().as_str()).copied()
     }
 }
 
@@ -449,6 +449,50 @@ pub fn populate_run_ext_metrics_from_phases(
     // rate is Σnumerator / Σdenominator (the components folded by their
     // own kinds above — a Counter numerator summed across phases).
     crate::stats::derive_rate_metrics(target);
+}
+
+/// Run the FULL run-level `ext_metrics` population sequence into `stats` — the
+/// single source of truth shared by the eval layer (`evaluate_vm_result`) and
+/// [`crate::vmm::VmResult::run_metric`], so the two produce byte-identical
+/// run-level ext maps for the same run. Reads `samples` + `stats.phases` +
+/// `stats.cgroups`, writes `stats.ext_metrics`, in the canonical order:
+/// 1. [`populate_run_ext_metrics`] — the `read_sample`-wired registry family
+///    (over every freeze in `samples`), then the whole-run wall + IRQ rates.
+/// 2. [`populate_run_ext_metrics_from_phases`] — the phase-only ext metrics
+///    whose `read_sample` is `None` (`avg_imbalance_ratio`, `iteration_rate`,
+///    `system_time_ns`, `user_time_ns`, the per-CPU IRQ spatial maxes).
+/// 3. [`populate_run_pooled_iterations_per_cpu_sec`] — the pooled cross-cgroup
+///    `iterations_per_cpu_sec` Rate (from `stats.cgroups`).
+/// 4. [`populate_run_distribution_metrics`] — the `Distribution` / `WorstLowest`
+///    / `WakeLatencyTailRatio` re-pools (from `stats.phases[].per_cgroup` raw
+///    samples + `stats.cgroups`).
+///
+/// ORDER IS LOAD-BEARING: step 1 must precede step 2 so the whole-run wall +
+/// whole-run IRQ-counter deltas land before step 2's `contains_key` skip (the
+/// multi-phase-rate fix); steps 3-4 fold the per-cgroup roll-up after the
+/// per-phase families.
+///
+/// `stats.phases` SHOULD be the PRE-`derive_phase_metrics` fold (the host buckets
+/// with the guest per-cgroup carriers folded in, before the per-phase scalar
+/// derivation) — the exact phase shape the eval layer feeds to step 2, since the
+/// eval path runs `derive_phase_metrics` AFTER this call. Feeding the pre-derive
+/// fold reproduces the eval sequence by construction (eval-faithful). Post-derive
+/// phases (e.g. [`crate::vmm::VmResult::phase_buckets`]) yield the SAME map today —
+/// step 2 skips `is_derived` keys, and every pooled scalar `derive_phase_metrics`
+/// writes to `bucket.metrics` (the schbench / taobench scalars) is
+/// `MetricKind::PerPhase` (which `is_derived`), so step 2 drops them either way —
+/// but the pre-derive fold avoids DEPENDING on that skip: a pooled key ever
+/// registered as non-derived would be folded run-level under post-derive,
+/// diverging from the eval map, but not under pre-derive. Pass the pre-derive
+/// fold ([`crate::vmm::VmResult::run_metric`] uses `phase_buckets_pre_derive`).
+pub fn populate_run_ext_all(
+    stats: &mut ScenarioStats,
+    samples: &crate::scenario::sample::SampleSeries,
+) {
+    populate_run_ext_metrics(samples, &mut stats.ext_metrics);
+    populate_run_ext_metrics_from_phases(&stats.phases, &mut stats.ext_metrics);
+    populate_run_pooled_iterations_per_cpu_sec(stats);
+    populate_run_distribution_metrics(stats);
 }
 
 /// Inject the run-level POOLED `iterations_per_cpu_sec` Rate's two Counter

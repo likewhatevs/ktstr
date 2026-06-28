@@ -776,16 +776,7 @@ impl VmResult {
     /// no carriers and returns the host-rebuilt buckets alone (the prior
     /// behavior).
     pub fn phase_buckets(&self) -> Vec<crate::assert::PhaseBucket> {
-        let host = crate::assert::build_phase_buckets_with_stimulus(
-            &self.periodic_series(),
-            &self.stimulus_timeline(),
-        );
-        let mut buckets = match self.guest_assert_result() {
-            Ok(guest) => {
-                crate::assert::fold_guest_per_cgroup_into_host_buckets(host, guest.stats.phases)
-            }
-            Err(_) => host,
-        };
+        let mut buckets = self.phase_buckets_pre_derive();
         // Derive the per-phase scalars into the now-final (post-fold) buckets so
         // a per-phase A/B claim reads them via phase_metric / phase_cgroup_metric:
         // the non-schbench carrier scalars (every cgroup) into each pc.metrics,
@@ -795,6 +786,33 @@ impl VmResult {
         // be dropped).
         crate::assert::derive_phase_metrics(&mut buckets);
         buckets
+    }
+
+    /// The pre-`derive_phase_metrics` phase fold: host buckets from
+    /// [`Self::periodic_series`] + [`Self::stimulus_timeline`] with the guest
+    /// per-cgroup carriers folded in, BEFORE the per-phase scalar derivation
+    /// [`Self::phase_buckets`] applies. This is the exact phase state the eval
+    /// layer feeds to the run-level ext-metrics population
+    /// (`populate_run_ext_metrics_from_phases` runs on the pre-derive phases;
+    /// `derive_phase_metrics` runs AFTER, inside `evaluate_vm_result`), so
+    /// [`Self::run_metric`] reuses it to reproduce that sequence by construction
+    /// (eval-faithful): post-derive phases yield the same run-level map today (the
+    /// run-level phase fold skips `is_derived` keys, and the pooled scalars
+    /// `derive_phase_metrics` adds are all `PerPhase`), but the pre-derive fold
+    /// avoids depending on that skip, so a pooled key ever registered as
+    /// non-derived cannot diverge `run_metric` from the eval map. Non-destructive
+    /// on the snapshot bridge, like [`Self::phase_buckets`].
+    fn phase_buckets_pre_derive(&self) -> Vec<crate::assert::PhaseBucket> {
+        let host = crate::assert::build_phase_buckets_with_stimulus(
+            &self.periodic_series(),
+            &self.stimulus_timeline(),
+        );
+        match self.guest_assert_result() {
+            Ok(guest) => {
+                crate::assert::fold_guest_per_cgroup_into_host_buckets(host, guest.stats.phases)
+            }
+            Err(_) => host,
+        }
     }
 
     /// One phase's per-cgroup telemetry for `cgroup` — the per-phase analog
@@ -885,6 +903,75 @@ impl VmResult {
                 b.get(metric.as_str())
                     .or_else(|| b.cgroup_counter_total(metric.as_str()))
             })
+    }
+
+    /// One run-level extensible ("ext") metric by name — the whole-run analog of
+    /// [`Self::phase_metric`], for a `post_vm` callback asserting a run-level
+    /// aggregate (e.g. `avg_irq_util`, `max_cpu_hardirqs`,
+    /// `worst_p99_wake_latency_us`, `iterations_per_cpu_sec`). SELF-COMPUTES the
+    /// run-level `ext_metrics` map exactly as the framework's `evaluate_vm_result`
+    /// does — a [`VmResult`](Self) carries no stored run-level stats (`post_vm`
+    /// runs BEFORE the host populates them) — by replaying the shared
+    /// [`crate::assert::populate_run_ext_all`] sequence over
+    /// [`Self::periodic_series`], the pre-derive phase fold
+    /// (`phase_buckets_pre_derive`), and the guest per-cgroup `stats.cgroups`.
+    /// The result is byte-identical to the run-level `ext_metrics` the sidecar
+    /// records for this run.
+    ///
+    /// Resolves the SAME ext-sourced family as
+    /// [`crate::assert::ScenarioStats::run_metric`] (the post-merge host
+    /// accessor): the `read_sample`-wired registry metrics, the phase-only ext
+    /// metrics (`avg_imbalance_ratio`, `iteration_rate`, `system_time_ns`,
+    /// `user_time_ns`, the IRQ counters/rates, `max_cpu_hardirqs` +
+    /// `max_cpu_hardirq_concentration`), the pooled `iterations_per_cpu_sec`, and
+    /// the run-level `Distribution` / `WorstLowest` / `WakeLatencyTailRatio`
+    /// re-pools. The two `run_metric` accessors return identical values for every
+    /// resolved key — this one self-computes pre-merge, the other reads the
+    /// stored post-merge map.
+    ///
+    /// NOT resolved here (the SAME boundary
+    /// [`crate::assert::ScenarioStats::run_metric`] documents):
+    /// - the typed cross-cgroup `ScenarioStats` fields (`worst_spread`,
+    ///   `worst_migration_ratio`, `worst_gap_ms`, `total_migrations`,
+    ///   `total_iterations`, `worst_page_locality`,
+    ///   `worst_cross_node_migration_ratio`) — they are `0.0`-sentinel f64, so
+    ///   resolving them here would split this method's sentinel-free contract.
+    /// - the monitor-sourced run-level metrics (`max_imbalance_ratio`,
+    ///   `max_dsq_depth`, `stuck_count`, `total_fallback`, `total_keep_last`) —
+    ///   read those per-phase via [`Self::phase_metric`].
+    ///
+    /// Sentinel-free, matching [`Self::phase_metric`]: `None` means the metric is
+    /// absent from this run (no populator produced it, or a name not in the map);
+    /// `Some(0.0)` is a real measured zero. Check [`crate::stats::MetricId::def`]
+    /// on a dynamic key to distinguish an unregistered key from genuinely-absent
+    /// data (built-in ids always resolve).
+    ///
+    /// A host-only run (no guest verdict — [`Self::guest_assert_result`] `Err`)
+    /// resolves the SampleSeries + phase families but no per-cgroup pooled /
+    /// distribution keys (no per-cgroup data exists), the same absence
+    /// [`crate::assert::ScenarioStats::run_metric`] documents.
+    ///
+    /// Non-destructive: reads the memoized snapshot-bridge drain
+    /// ([`Self::periodic_series`] / [`Self::phase_buckets`]) and the
+    /// already-drained `guest_messages`, so it composes with [`Self::phase_metric`]
+    /// in one `post_vm` callback.
+    ///
+    /// ```ignore
+    /// let irq = result.run_metric(BuiltinMetric::AvgIrqUtil);
+    /// let custom = result.run_metric("scx_layered_layer0_util");
+    /// ```
+    pub fn run_metric(&self, metric: impl Into<crate::stats::MetricId>) -> Option<f64> {
+        let metric = metric.into();
+        let mut stats = crate::assert::ScenarioStats {
+            phases: self.phase_buckets_pre_derive(),
+            cgroups: self
+                .guest_assert_result()
+                .map(|g| g.stats.cgroups)
+                .unwrap_or_default(),
+            ..Default::default()
+        };
+        crate::assert::populate_run_ext_all(&mut stats, &self.periodic_series());
+        stats.ext_metrics.get(metric.as_str()).copied()
     }
 
     /// Polarity-aware "is the `candidate` phase better than the `baseline` phase

@@ -1436,6 +1436,217 @@ fn phase_buckets_equals_stats_phases_with_guest_per_cgroup_carriers() {
     );
 }
 
+/// A guest `AssertResult` carrying ONE measured cgroup (counters + wake/run-delay
+/// reductions), TLV-encoded into a [`crate::vmm::VmResult`] with three stamped
+/// periodic captures. The shared fixture for the `run_metric` parity / boundary
+/// tests below: its `stats.cgroups` drives the pooled `iterations_per_cpu_sec`
+/// (family 4) and the `WorstLowest` / Distribution re-pools (family 5) — the
+/// families `VmResult::run_metric` must reconstruct from the guest cgroups.
+#[cfg(test)]
+fn run_metric_fixture(cg: crate::assert::CgroupStats) -> crate::vmm::VmResult {
+    let mut guest_assert = build_assert_result(true, vec![]);
+    guest_assert.stats.cgroups = vec![cg];
+    let result = crate::vmm::VmResult {
+        success: true,
+        guest_messages: Some(crate::vmm::host_comms::BulkDrainResult {
+            entries: vec![crate::test_support::test_helpers::assert_result_tlv_entry(
+                &guest_assert,
+            )],
+        }),
+        periodic_fired: 3,
+        periodic_target: 3,
+        ..crate::vmm::VmResult::test_fixture()
+    };
+    for i in 0..3 {
+        result.snapshot_bridge.store_with_stats_and_step(
+            &format!("periodic_{i}"),
+            crate::monitor::dump::FailureDumpReport::default(),
+            None,
+            Some(i as u64 * 100),
+            None,
+            1,
+        );
+    }
+    result
+}
+
+/// LOAD-BEARING PARITY: `VmResult::run_metric` self-computes the SAME
+/// run-level `ext_metrics` `evaluate_vm_result` writes — for every key the eval
+/// path produces, `run_metric` resolves the identical value. Exercises the
+/// families that need the guest per-cgroup roll-up (pooled
+/// `iterations_per_cpu_sec` + the `WorstLowest` / Distribution re-pools), the
+/// reconstruction that makes `run_metric` possible: `check_result.stats.cgroups`
+/// equals `guest_assert_result().stats.cgroups` (the host adds no cgroups —
+/// `evaluate_verdict_folds` merges only empty-cgroup `fail()`s, and
+/// `populate_run_stats_and_folded_timeline` writes `phases`/`ext_metrics`, never
+/// `cgroups`), so `run_metric` replays the eval sequence over the guest cgroups +
+/// pre-derive phase fold to the byte-identical map.
+#[test]
+fn run_metric_equals_evaluate_run_level_ext() {
+    let _lock = lock_env();
+    let _sd = isolated_sidecar_dir();
+    let result = run_metric_fixture(crate::assert::CgroupStats {
+        cgroup_name: "cellA".to_string(),
+        num_workers: 4,
+        total_iterations: 1000,
+        total_cpu_time_ns: 2_000_000_000,
+        p99_wake_latency_us: 80.0,
+        median_wake_latency_us: 20.0,
+        wake_latency_cv: 0.5,
+        mean_run_delay_us: 10.0,
+        worst_run_delay_us: 40.0,
+        ..Default::default()
+    });
+    let entry = sched_entry("__eval_run_metric_parity__");
+    let stimulus = result.stimulus_timeline();
+    let ar = evaluate_vm_result(
+        &entry,
+        &result,
+        &crate::assert::Assert::NO_OVERRIDES,
+        &stimulus,
+        &[],
+        &[],
+        &EVAL_TOPO,
+        &no_repro,
+        None,
+    )
+    .expect("pass guest verdict on the success arm returns Ok");
+    assert!(
+        !ar.stats.ext_metrics.is_empty(),
+        "the measured-cgroup fixture must produce run-level ext keys",
+    );
+    // Family-4 anchor: the pooled rate is a real ratio in the eval map.
+    assert_eq!(
+        ar.stats.ext_metrics.get("iterations_per_cpu_sec").copied(),
+        Some(500.0),
+        "1000 iters / 2.0 cpu-sec = 500 — the pooled rate must be in the eval map",
+    );
+    // FULL-MAP forward parity: every key evaluate produced resolves via
+    // run_metric to the identical value (self-computed pre-merge == stored
+    // post-merge).
+    for (k, v) in &ar.stats.ext_metrics {
+        assert_eq!(
+            result.run_metric(k.as_str()),
+            Some(*v),
+            "run_metric({k}) must equal the eval-layer ext value",
+        );
+    }
+    // The typed Into<MetricId> path resolves the same value as the &str path.
+    assert_eq!(
+        result.run_metric(crate::stats::BuiltinMetric::IterationsPerCpuSec),
+        Some(500.0),
+    );
+    // A registered ext metric this run did not produce -> None (loud-absent,
+    // not a false 0.0).
+    assert_eq!(result.run_metric("total_hardirqs"), None);
+}
+
+/// NON-DESTRUCTIVE: `run_metric` composes with `phase_metric` /
+/// `phase_buckets` in one `post_vm` — the memoized snapshot-bridge drain means a
+/// `run_metric` read does not starve the others (the latent double-drain class),
+/// and `run_metric` is idempotent across interleaved bridge-draining accessors.
+#[test]
+fn run_metric_is_non_destructive_alongside_phase_reads() {
+    let _lock = lock_env();
+    let _sd = isolated_sidecar_dir();
+    let result = run_metric_fixture(crate::assert::CgroupStats {
+        cgroup_name: "cellA".to_string(),
+        num_workers: 2,
+        total_iterations: 600,
+        total_cpu_time_ns: 3_000_000_000,
+        ..Default::default()
+    });
+    let first = result.run_metric("iterations_per_cpu_sec");
+    // Interleave the other bridge-draining accessors.
+    let _pm = result.phase_metric(crate::assert::Phase::step(0), "system_time_ns");
+    let _buckets = result.phase_buckets();
+    let second = result.run_metric("iterations_per_cpu_sec");
+    assert_eq!(first, Some(200.0), "600 iters / 3.0 cpu-sec = 200");
+    assert_eq!(
+        first, second,
+        "run_metric must be idempotent across interleaved drains (memoized, no starve)",
+    );
+}
+
+/// LOUD-ABSENT: `None` means absent (an unregistered key, or a registered
+/// key this run did not produce); `Some(0.0)` means a real measured zero — never
+/// conflated. A cgroup with zero iterations over positive on-CPU time makes
+/// `iterations_per_cpu_sec` a measured `Some(0.0)`.
+#[test]
+fn run_metric_loud_absent_distinct_from_measured_zero() {
+    let _lock = lock_env();
+    let _sd = isolated_sidecar_dir();
+    let result = run_metric_fixture(crate::assert::CgroupStats {
+        cgroup_name: "idle".to_string(),
+        num_workers: 1,
+        total_iterations: 0,
+        total_cpu_time_ns: 1_000_000_000,
+        ..Default::default()
+    });
+    // measured zero (0 iters over 1.0 cpu-sec) -> Some(0.0)
+    assert_eq!(result.run_metric("iterations_per_cpu_sec"), Some(0.0));
+    // unregistered dynamic key -> None
+    assert_eq!(result.run_metric("scx_totally_made_up_key"), None);
+    // registered ext metric this run did not produce -> None
+    assert_eq!(result.run_metric("total_hardirqs"), None);
+}
+
+/// SCOPE BOUNDARY: the typed cross-cgroup `ScenarioStats` fields and the
+/// monitor-sourced run-level metrics are NOT in the ext map — `run_metric`
+/// returns `None` for them (read typed via named fields, monitor via
+/// `phase_metric`), matching `ScenarioStats::run_metric`'s documented boundary.
+#[test]
+fn run_metric_excludes_typed_and_monitor_metrics() {
+    let _lock = lock_env();
+    let _sd = isolated_sidecar_dir();
+    let result = run_metric_fixture(crate::assert::CgroupStats {
+        cgroup_name: "cellA".to_string(),
+        num_workers: 4,
+        total_iterations: 1000,
+        total_cpu_time_ns: 2_000_000_000,
+        total_migrations: 50,
+        ..Default::default()
+    });
+    // typed cross-cgroup fields (0.0-sentinel) — not in ext_metrics
+    assert_eq!(result.run_metric("total_migrations"), None);
+    assert_eq!(result.run_metric("worst_spread"), None);
+    // monitor-sourced run-level — per-phase only
+    assert_eq!(result.run_metric("max_imbalance_ratio"), None);
+    assert_eq!(result.run_metric("stuck_count"), None);
+    // but the ext-sourced pooled rate IS resolved (the scope it covers)
+    assert_eq!(result.run_metric("iterations_per_cpu_sec"), Some(500.0));
+}
+
+/// HOST-ONLY / EMPTY: a `VmResult` with no guest verdict and no captures
+/// (`guest_assert_result` `Err`, empty series) yields `None` for every metric,
+/// no panic — the degraded path AssertResult::run_metric also documents.
+#[test]
+fn run_metric_host_only_run_yields_none() {
+    let result = crate::vmm::VmResult::test_fixture();
+    assert_eq!(result.run_metric("iterations_per_cpu_sec"), None);
+    assert_eq!(result.run_metric("total_hardirqs"), None);
+    assert_eq!(result.run_metric("worst_p99_wake_latency_us"), None);
+    assert_eq!(result.run_metric("scx_made_up"), None);
+}
+
+/// ABSENT RATE: a pooled rate whose denominator is absent (zero on-CPU time
+/// across cgroups) is NOT produced — `run_metric` returns `None`, never an `inf`
+/// or `NaN` (the summed-zero early return + both-or-neither component insert).
+#[test]
+fn run_metric_absent_rate_is_none_not_inf() {
+    let _lock = lock_env();
+    let _sd = isolated_sidecar_dir();
+    let result = run_metric_fixture(crate::assert::CgroupStats {
+        cgroup_name: "nocpu".to_string(),
+        num_workers: 1,
+        total_iterations: 500,
+        total_cpu_time_ns: 0,
+        ..Default::default()
+    });
+    let v = result.run_metric("iterations_per_cpu_sec");
+    assert_eq!(v, None, "zero-denominator rate must be absent, not inf/NaN");
+}
+
 /// Production-hook pin: `VmResult::phase_buckets()` — the method a per-phase A/B
 /// claim reads via `phase_metric` — must DERIVE the schbench per-phase scalars
 /// into `PhaseBucket.metrics`. A guest carrier with a `SchbenchPhaseStats` at
