@@ -22,7 +22,7 @@
 //! class). Resolve-by-name or fold conservatively — never assume `Counter`.
 //!
 //! The 1:1 correspondence with [`super::METRICS`] is pinned by
-//! [`tests::builtin_metric_is_one_to_one_with_registry`] (both directions), so a
+//! `tests::builtin_metric_is_one_to_one_with_registry` (both directions), so a
 //! registry entry without an enum variant — or an enum variant without a registry
 //! entry — fails the build.
 

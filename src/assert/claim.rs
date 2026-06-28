@@ -881,7 +881,7 @@ impl<'a> ClaimBuilder<'a, f64> {
 /// comparator delegates to the value-bound [`ClaimBuilder`], so a
 /// present metric behaves EXACTLY like [`claim!`](crate::claim). On
 /// `None` the metric is absent — there is nothing to compare, so every
-/// comparator records a LOUD `Fail` ("<name>: metric absent") rather
+/// comparator records a LOUD `Fail` (`<name>: metric absent`) rather
 /// than silently passing. This mirrors the no-guessed-value discipline
 /// of `MetricId::def` returning `None` for an unregistered key: an
 /// absent signal fails the gate, it does not vacuously satisfy it (the
@@ -1440,7 +1440,7 @@ macro_rules! claim {
 /// with a `stringify!`-derived label (the same `&'static str` discipline
 /// as [`claim!`]). The argument is an `Option`-valued expression (e.g. a
 /// `phase_metric` lookup); a `None` records a LOUD `Fail`
-/// ("<expr>: metric absent"), a `Some(v)` behaves exactly like [`claim!`].
+/// (`<expr>: metric absent`), a `Some(v)` behaves exactly like [`claim!`].
 ///
 /// ```
 /// # use ktstr::{assert::Verdict, claim_present};
