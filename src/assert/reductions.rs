@@ -156,6 +156,27 @@ pub fn cgroup_stats(reports: &[WorkerReport]) -> CgroupStats {
         (p99, median, cv)
     };
 
+    // Timer-latency reductions (WorkType::TimerLatency), pooled across the
+    // cgroup's workers exactly like the wake-latency block above but over the
+    // distinct `timer_latencies_ns` reservoir. p999 is the deep RT tail; worst
+    // is the single maximum. All `0.0` when no worker recorded timer samples.
+    let all_timer: Vec<u64> = reports
+        .iter()
+        .flat_map(|w| w.timer_latencies_ns.iter().copied())
+        .collect();
+    let (median_timer, p99_timer, p999_timer, worst_timer) = if all_timer.is_empty() {
+        (0.0, 0.0, 0.0, 0.0)
+    } else {
+        let mut sorted = all_timer.clone();
+        sorted.sort_unstable();
+        (
+            percentile(&sorted, 0.5) as f64 / 1000.0,
+            percentile(&sorted, 0.99) as f64 / 1000.0,
+            percentile(&sorted, 0.999) as f64 / 1000.0,
+            *sorted.last().expect("non-empty: checked above") as f64 / 1000.0,
+        )
+    };
+
     let total_iters: u64 = reports.iter().map(|w| w.iterations).sum();
     let run_delays: Vec<f64> = reports
         .iter()
@@ -209,6 +230,10 @@ pub fn cgroup_stats(reports: &[WorkerReport]) -> CgroupStats {
         p99_wake_latency_us: p99_us,
         median_wake_latency_us: median_us,
         wake_latency_cv: lat_cv,
+        median_timer_latency_us: median_timer,
+        p99_timer_latency_us: p99_timer,
+        p999_timer_latency_us: p999_timer,
+        worst_timer_latency_us: worst_timer,
         total_iterations: total_iters,
         total_cpu_time_ns: reports.iter().map(|w| w.schedstat_cpu_time_ns).sum(),
         mean_run_delay_us: mean_run_delay,
@@ -355,6 +380,21 @@ pub(crate) fn phase_cgroup_stats(
         }
     }
     let wake_sample_total: u64 = reports.iter().map(|w| w.wake_sample_total).sum();
+    // Distinct timer reservoir, pooled across workers exactly like
+    // wake_latencies_ns; timer_sample_total keeps the true pre-cap population.
+    let mut timer_latencies_ns: Vec<u64> = Vec::new();
+    let mut pooled_timer_count: u64 = 0;
+    for w in reports {
+        for &sample in &w.timer_latencies_ns {
+            crate::workload::reservoir_push(
+                &mut timer_latencies_ns,
+                &mut pooled_timer_count,
+                sample,
+                crate::workload::MAX_WAKE_SAMPLES,
+            );
+        }
+    }
+    let timer_sample_total: u64 = reports.iter().map(|w| w.timer_sample_total).sum();
     // RAW ns, one per worker — NOT divided by 1000. cgroup_stats divides at
     // reduction time; the re-pool over the concatenated samples divides once,
     // so pre-dividing here would double-divide (a 1000x error).
@@ -403,6 +443,8 @@ pub(crate) fn phase_cgroup_stats(
         cpus_used,
         wake_latencies_ns,
         wake_sample_total,
+        timer_latencies_ns,
+        timer_sample_total,
         run_delays_ns,
         off_cpu_pcts,
         total_migrations,
@@ -459,6 +501,8 @@ pub(crate) fn phase_slice_to_cgroup_stats(
         cpus_used: slice.cpus_used.clone(),
         wake_latencies_ns: slice.wake_latencies_ns.clone(),
         wake_sample_total: slice.wake_sample_total,
+        timer_latencies_ns: slice.timer_latencies_ns.clone(),
+        timer_sample_total: slice.timer_sample_total,
         // RAW ns, one per worker (NOT divided) — same contract as
         // phase_cgroup_stats::run_delays_ns.
         run_delays_ns: vec![slice.run_delay_ns],
@@ -504,6 +548,8 @@ pub(crate) fn pool_phase_slice_stats(
             cpus_used: BTreeSet::new(),
             wake_latencies_ns: Vec::new(),
             wake_sample_total: 0,
+            timer_latencies_ns: Vec::new(),
+            timer_sample_total: 0,
             run_delays_ns: Vec::new(),
             off_cpu_pcts: Vec::new(),
             total_migrations: 0,

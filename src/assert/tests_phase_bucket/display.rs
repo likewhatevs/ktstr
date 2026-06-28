@@ -217,6 +217,8 @@ fn repool_distribution_cross_source_arm_debug_asserts_in_test_build() {
         &empty_carriers,
         &[],
         &empty_carriers,
+        &[],
+        &empty_carriers,
         &[CgroupStats {
             cgroup_name: "a".to_string(),
             ..CgroupStats::default()

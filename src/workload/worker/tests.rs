@@ -1584,6 +1584,7 @@ fn build_phase_slice_full_delta_math() {
         cpus.clone(),
         numa.clone(),
         (vec![11, 22, 33], 5), // wake (reservoir, total)
+        (vec![44, 55], 7),     // timer (reservoir, total)
     );
     assert_eq!(s.phase_epoch, 7);
     assert_eq!(s.wall_ns, 1_000_000);
@@ -1602,6 +1603,9 @@ fn build_phase_slice_full_delta_math() {
     assert_eq!(s.numa_pages, numa);
     assert_eq!(s.wake_latencies_ns, vec![11, 22, 33]);
     assert_eq!(s.wake_sample_total, 5);
+    // Timer reservoir flows through the distinct carrier exactly like wake.
+    assert_eq!(s.timer_latencies_ns, vec![44, 55]);
+    assert_eq!(s.timer_sample_total, 7);
 }
 
 /// `off_cpu_ns` saturates at 0 when the thread-CPU delta exceeds wall — a
@@ -1624,6 +1628,7 @@ fn build_phase_slice_off_cpu_saturates_at_zero() {
         0,
         BTreeSet::new(),
         BTreeMap::new(),
+        (vec![], 0),
         (vec![], 0),
     );
     assert_eq!(s.off_cpu_ns, 0);
@@ -1650,6 +1655,7 @@ fn build_phase_slice_missing_schedstat_is_zero() {
             0,
             BTreeSet::new(),
             BTreeMap::new(),
+            (vec![], 0),
             (vec![], 0),
         )
     };
@@ -1690,6 +1696,7 @@ fn build_phase_slice_counter_deltas_saturate() {
         0,
         BTreeSet::new(),
         BTreeMap::new(),
+        (vec![], 0),
         (vec![], 0),
     );
     assert_eq!(s.run_delay_ns, 0);

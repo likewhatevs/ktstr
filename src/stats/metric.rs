@@ -359,6 +359,15 @@ pub enum SampleSource {
     /// per-phase delta for the backdrop slice carrier), so the pool size is the
     /// worker count, NOT a per-wakeup stream like `WakeLatencyNs`.
     RunDelayNs,
+    /// Per-timer-cycle latency samples in ns
+    /// (`crate::assert::PhaseCgroupStats::timer_latencies_ns`). One sample per
+    /// `clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME)` wake — the observed
+    /// wake time minus the absolute deadline, floored at 0 — recorded by
+    /// [`crate::workload::WorkType::TimerLatency`] (reservoir-capped per cgroup
+    /// like `WakeLatencyNs`). Distinct from `WakeLatencyNs` so cyclictest-style
+    /// timer latency does not blur with the blocking variants' wake latency in a
+    /// shared sidecar.
+    TimerLatencyNs,
 }
 
 /// The statistic a [`MetricKind::Distribution`] computes over its pooled
@@ -371,6 +380,10 @@ pub enum SampleSource {
 pub enum SampleReduction {
     /// 99th percentile (nearest-rank), ns→µs.
     P99,
+    /// 99.9th percentile (nearest-rank), ns→µs — the deep tail an RT /
+    /// cyclictest-style latency probe turns on (a single max is one sample;
+    /// p99.9 is the robust deep-tail percentile between p99 and max).
+    P999,
     /// Median (50th percentile, nearest-rank), ns→µs.
     Median,
     /// Coefficient of variation (stddev / mean) over the pooled set,
@@ -1599,6 +1612,67 @@ pub static METRICS: &[MetricDef] = &[
         accessor: |_| None,
     },
     MetricDef {
+        // Run-level timer-latency p99 (WorkType::TimerLatency cyclictest probe),
+        // re-pooled over the combined timer-latency sample set across every
+        // cgroup and phase (NOT a max of per-cgroup p99s). Distribution: derived
+        // post-merge by populate_run_distribution_metrics; accessor |_| None
+        // reads the ext_metrics value the re-pool writes.
+        name: "worst_p99_timer_latency_us",
+        polarity: crate::test_support::Polarity::LowerBetter,
+        kind: MetricKind::Distribution {
+            source: SampleSource::TimerLatencyNs,
+            reduction: SampleReduction::P99,
+        },
+        default_abs: 50.0,
+        default_rel: 0.25,
+        display_unit: "\u{00b5}s",
+        accessor: |_| None,
+    },
+    MetricDef {
+        // Run-level timer-latency median — see worst_p99_timer_latency_us.
+        name: "worst_median_timer_latency_us",
+        polarity: crate::test_support::Polarity::LowerBetter,
+        kind: MetricKind::Distribution {
+            source: SampleSource::TimerLatencyNs,
+            reduction: SampleReduction::Median,
+        },
+        default_abs: 20.0,
+        default_rel: 0.25,
+        display_unit: "\u{00b5}s",
+        accessor: |_| None,
+    },
+    MetricDef {
+        // Run-level timer-latency p99.9 (the deep RT tail) — see
+        // worst_p99_timer_latency_us.
+        name: "worst_p999_timer_latency_us",
+        polarity: crate::test_support::Polarity::LowerBetter,
+        kind: MetricKind::Distribution {
+            source: SampleSource::TimerLatencyNs,
+            reduction: SampleReduction::P999,
+        },
+        default_abs: 100.0,
+        default_rel: 0.25,
+        display_unit: "\u{00b5}s",
+        accessor: |_| None,
+    },
+    MetricDef {
+        // Run-level WORST (max) timer-latency — the cyclictest headline.
+        // MAX-folds cross-RUN (SampleReduction::Worst, the peak survives) via
+        // aggregate_finite, distinct from the MEAN-folded percentiles above.
+        // Named worst_* with no pNN exactly like worst_run_delay_us
+        // (Distribution{RunDelayNs, Worst}).
+        name: "worst_timer_latency_us",
+        polarity: crate::test_support::Polarity::LowerBetter,
+        kind: MetricKind::Distribution {
+            source: SampleSource::TimerLatencyNs,
+            reduction: SampleReduction::Worst,
+        },
+        default_abs: 200.0,
+        default_rel: 0.25,
+        display_unit: "\u{00b5}s",
+        accessor: |_| None,
+    },
+    MetricDef {
         // Per-phase worker iterations per second. MetricKind::Rate with
         // Counter components total_phase_iterations / total_phase_duration_sec:
         // build_phase_buckets_with_stimulus emits those two components (the
@@ -2270,6 +2344,37 @@ pub static METRICS: &[MetricDef] = &[
         default_abs: 0.10,
         default_rel: 0.25,
         display_unit: "",
+        accessor: |_| None,
+    },
+    MetricDef {
+        // Per-cgroup per-phase timer-latency (WorkType::TimerLatency). PerPhase,
+        // accessor |_| None: read from PhaseCgroupStats::metrics by name
+        // (written by write_carrier_scalars). Bare name (not worst_*) — a single
+        // cgroup's value, not a worst-across-cgroups.
+        name: "p99_timer_latency_us",
+        polarity: crate::test_support::Polarity::LowerBetter,
+        kind: MetricKind::PerPhase,
+        default_abs: 50.0,
+        default_rel: 0.25,
+        display_unit: "\u{00b5}s",
+        accessor: |_| None,
+    },
+    MetricDef {
+        name: "median_timer_latency_us",
+        polarity: crate::test_support::Polarity::LowerBetter,
+        kind: MetricKind::PerPhase,
+        default_abs: 20.0,
+        default_rel: 0.25,
+        display_unit: "\u{00b5}s",
+        accessor: |_| None,
+    },
+    MetricDef {
+        name: "p999_timer_latency_us",
+        polarity: crate::test_support::Polarity::LowerBetter,
+        kind: MetricKind::PerPhase,
+        default_abs: 100.0,
+        default_rel: 0.25,
+        display_unit: "\u{00b5}s",
         accessor: |_| None,
     },
     MetricDef {

@@ -34,6 +34,8 @@ fn stub_custom_fn(_ctx: &WorkerCtx) -> WorkerReport {
         wake_sample_total: 0,
         iteration_costs_ns: vec![],
         iteration_cost_sample_total: 0,
+        timer_latencies_ns: vec![],
+        timer_sample_total: 0,
         iterations: 0,
         schedstat_run_delay_ns: 0,
         schedstat_run_count: 0,

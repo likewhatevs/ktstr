@@ -17,6 +17,8 @@ fn slice(epoch: u32) -> PhaseSlice {
         cpus_used: [0usize, 1].into_iter().collect(),
         wake_latencies_ns: vec![1000, 2000],
         wake_sample_total: 5,
+        timer_latencies_ns: vec![],
+        timer_sample_total: 0,
         run_delay_ns: 3000,
         off_cpu_ns: 200_000,
         wall_ns: 1_000_000,

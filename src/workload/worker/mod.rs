@@ -129,6 +129,7 @@ fn build_phase_slice(
     cpus_used: std::collections::BTreeSet<usize>,
     numa_pages: std::collections::BTreeMap<usize, u64>,
     wake: (Vec<u64>, u64),
+    timer: (Vec<u64>, u64),
 ) -> PhaseSlice {
     let cpu_delta = cpu_end_ns.saturating_sub(cpu_start_ns);
     let (run_delay_ns, schedstat_cpu_time_ns) = match (schedstat_start, schedstat_end) {
@@ -142,6 +143,8 @@ fn build_phase_slice(
         cpus_used,
         wake_latencies_ns: wake.0,
         wake_sample_total: wake.1,
+        timer_latencies_ns: timer.0,
+        timer_sample_total: timer.1,
         run_delay_ns,
         off_cpu_ns: wall_ns.saturating_sub(cpu_delta),
         wall_ns,
@@ -472,6 +475,17 @@ pub(super) fn worker_main(
     }
     // Benchmarking: per-wakeup latency samples (reservoir-sampled) and iteration counter.
     let mut wake = WakeRec::new();
+    // TimerLatency (cyclictest) reservoir — a distinct WakeRec instance feeding
+    // the distinct timer_latencies_ns carrier, parallel to `wake`. Only the
+    // WorkType::TimerLatency arm pushes into it; every other variant leaves it
+    // empty (like `wake` for non-blocking variants).
+    let mut timer = WakeRec::new();
+    // Absolute monotonic deadline (ns) for the TimerLatency cyclictest loop:
+    // 0 = unseeded (seeded one interval out on the first TimerLatency cycle),
+    // then accumulated `+= interval_ns` so a late wake surfaces as latency
+    // (CO-free). CLOCK_MONOTONIC ns-since-boot is never 0, so 0 is a safe
+    // unseeded sentinel.
+    let mut timer_next_deadline_ns: u64 = 0;
     // Per-iteration wall-clock compute duration samples
     // (reservoir-sampled at the same cap as wake_latencies_ns).
     // Populated by AluHot, SmtSiblingSpin, IpcVariance; all other
@@ -3379,6 +3393,77 @@ pub(super) fn worker_main(
                 last_iter_time = Instant::now();
                 iterations += 1;
             }
+            WorkType::TimerLatency { interval_us } => {
+                // Cyclictest absolute-deadline loop. The deadline accumulates
+                // (`timer_next_deadline_ns += interval_ns`, NOT `now + interval`)
+                // so a late wake surfaces AS latency instead of shifting the next
+                // period out — the coordinated-omission-free measurement
+                // cyclictest makes. `interval_us` is validated > 0 at spawn (a
+                // zero interval would never advance the deadline). One latency
+                // sample per cycle into the DISTINCT `timer` reservoir
+                // (timer_latencies_ns), never the shared `wake`.
+                //
+                // Kernel path: clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME)
+                // → hrtimer_nanosleep(HRTIMER_MODE_ABS) → do_nanosleep
+                // schedule()s the task; on expiry hrtimer_wakeup →
+                // wake_up_process → try_to_wake_up re-runs it. The measured
+                // latency is the scheduler's wake-to-on-CPU delay for a
+                // timer-woken task.
+                let interval_ns = interval_us.saturating_mul(1_000);
+                // Seed the first absolute deadline one interval out. A failed
+                // CLOCK_MONOTONIC read (warned once in clock_gettime_ns) skips
+                // this cycle rather than recording a garbage latency; the outer
+                // loop retries.
+                if timer_next_deadline_ns == 0 {
+                    match clock_gettime_ns(libc::CLOCK_MONOTONIC) {
+                        Some(now_ns) => {
+                            timer_next_deadline_ns = now_ns.saturating_add(interval_ns);
+                        }
+                        None => {
+                            iterations += 1;
+                            continue;
+                        }
+                    }
+                }
+                let deadline = libc::timespec {
+                    tv_sec: (timer_next_deadline_ns / 1_000_000_000) as libc::time_t,
+                    tv_nsec: (timer_next_deadline_ns % 1_000_000_000) as libc::c_long,
+                };
+                // SAFETY: `deadline` is a valid timespec (tv_nsec in [0, 1e9) by
+                // construction); rmtp is null because TIMER_ABSTIME sleeps to the
+                // absolute deadline (no remaining-time bookkeeping on EINTR — the
+                // post-sleep stop check exits the loop).
+                let rc = unsafe {
+                    libc::clock_nanosleep(
+                        libc::CLOCK_MONOTONIC,
+                        libc::TIMER_ABSTIME,
+                        &deadline,
+                        std::ptr::null_mut(),
+                    )
+                };
+                if stop_requested(stop) {
+                    iterations += 1;
+                    continue;
+                }
+                // Record latency only on a clean wake (rc == 0). A non-zero rc is
+                // EINTR (a signal landed — the stop check above handles
+                // shutdown); an interrupted sleep did not reach the deadline, so
+                // its "latency" is meaningless and must not enter the histogram.
+                if rc == 0 {
+                    if let Some(wake_ns) = clock_gettime_ns(libc::CLOCK_MONOTONIC) {
+                        // Floor at 0: a wake observed at/before the deadline
+                        // (clock granularity) is 0 latency, never a wrapping u64
+                        // subtract — the same delta>=0 discipline the schbench
+                        // engine uses.
+                        timer.push(wake_ns.saturating_sub(timer_next_deadline_ns));
+                    }
+                }
+                // Accumulate the absolute deadline by exactly one interval (never
+                // re-base on `now`) — the CO-free invariant.
+                timer_next_deadline_ns = timer_next_deadline_ns.saturating_add(interval_ns);
+                last_iter_time = Instant::now();
+                iterations += 1;
+            }
             WorkType::AluHot { width } => {
                 // Resolve the configured width on first iteration.
                 // `Widest` picks the widest variant the host supports;
@@ -3639,6 +3724,7 @@ pub(super) fn worker_main(
                         std::mem::take(&mut phase_cpus_used),
                         phase_numa,
                         wake.drain_phase(),
+                        timer.drain_phase(),
                     ));
                     cur_epoch = new_epoch;
                     observed_change = true;
@@ -3764,6 +3850,7 @@ pub(super) fn worker_main(
             std::mem::take(&mut phase_cpus_used),
             numa_pages.clone(),
             wake.drain_phase(),
+            timer.drain_phase(),
         ));
     }
 
@@ -3783,6 +3870,8 @@ pub(super) fn worker_main(
         wake_sample_total: wake.run_total,
         iteration_costs_ns,
         iteration_cost_sample_total: iteration_cost_sample_count,
+        timer_latencies_ns: timer.run,
+        timer_sample_total: timer.run_total,
         iterations,
         schedstat_run_delay_ns: ss_delay_delta,
         schedstat_run_count: ss_ts_delta,

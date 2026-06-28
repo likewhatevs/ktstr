@@ -1675,6 +1675,48 @@ pub enum WorkType {
         /// `WorkType::IdleChurn { ..., precise_timing: true }`.
         precise_timing: bool,
     },
+    /// Cyclictest-style timer-latency probe. Each worker sleeps to an ABSOLUTE
+    /// deadline via `clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, next)` and
+    /// records the wake latency = observed wake time − the deadline (floored at
+    /// 0), accumulating `next += interval` (NOT `now + interval`) so a late wake
+    /// shows up AS latency instead of pushing the next period out — the
+    /// coordinated-omission-free measurement `cyclictest(8)` makes.
+    ///
+    /// **Kernel path:** `clock_nanosleep(TIMER_ABSTIME)` →
+    /// `hrtimer_nanosleep(HRTIMER_MODE_ABS)` → `do_nanosleep`
+    /// (`kernel/time/hrtimer.c`): `schedule()` blocks the task; on expiry
+    /// `hrtimer_wakeup` → `wake_up_process` → `try_to_wake_up` re-runs it. The
+    /// latency is the scheduler's wake-to-on-CPU delay for a timer-woken task —
+    /// the canonical real-time-determinism signal.
+    ///
+    /// **vs [`IdleChurn`](Self::IdleChurn):** IdleChurn does a RELATIVE
+    /// `nanosleep(sleep_duration)` after a CPU burst and measures resume
+    /// OVERHEAD against an `Instant` deadline — an idle/run duty cycle that
+    /// frees CPUs for borrowing. TimerLatency does an absolute-deadline sleep
+    /// with no CPU burst and measures the timer wake-LATENCY distribution
+    /// (`timer_latency_p50/p99/p999_us` + worst), the RT-determinism shape. Use
+    /// IdleChurn to free CPUs; use TimerLatency to measure wake-up jitter under
+    /// load. Here the SLEEPING task is the one woken (self-timer-wake).
+    ///
+    /// **Metrics:** the per-cycle latency feeds the distinct `timer_latencies_ns`
+    /// reservoir (NOT the shared `wake_latencies_ns`), so a TimerLatency run's
+    /// `timer_latency_p99_us` never blurs with the blocking variants'
+    /// `p99_wake_latency_us`. Guest-resident (an intrinsic latency probe — the
+    /// documented observer-effect exception).
+    ///
+    /// `worker_group_size = None` (any worker count; each worker runs an
+    /// independent cyclictest loop). Pin workers to dedicated CPUs
+    /// (e.g. [`crate::workload::AffinityIntent`]) to measure per-CPU wake
+    /// jitter. Default 1000µs (1kHz, cyclictest's default) — see
+    /// [`crate::workload::config::defaults::TIMER_LATENCY_INTERVAL_US`].
+    TimerLatency {
+        /// Inter-wake interval in microseconds — the absolute deadline advances
+        /// by this each cycle (`next += interval_us`). 1000 (1kHz) matches
+        /// `cyclictest`'s default; smaller intervals raise the wake frequency
+        /// (and the sample count per second). Validated `> 0` at spawn (a zero
+        /// interval never advances the deadline and busy-spins).
+        interval_us: u64,
+    },
     /// Sustained high-IPC ALU workload. Each worker runs four
     /// independent multiply chains in parallel, with
     /// [`std::hint::black_box`] wrapping every step to prevent

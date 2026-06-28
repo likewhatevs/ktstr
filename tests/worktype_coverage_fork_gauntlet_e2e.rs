@@ -385,6 +385,11 @@ fn worktype_fork_gauntlet_covers_all_arms(_ctx: &Ctx) -> Result<AssertResult> {
         &mut result,
     );
     run_arm(
+        "TimerLatency",
+        cfg(WorkType::TimerLatency { interval_us: 1000 }, 2),
+        &mut result,
+    );
+    run_arm(
         "AluHot",
         cfg(
             WorkType::AluHot {

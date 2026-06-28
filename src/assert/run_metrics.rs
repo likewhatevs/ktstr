@@ -604,6 +604,10 @@ pub fn populate_run_distribution_metrics(stats: &mut ScenarioStats) {
     // samples are per-worker and never reservoir-capped (no `*_sample_total`), so
     // their length IS their population — pooled unweighted.
     let mut wake_pool: Vec<(u64, f64)> = Vec::new();
+    // Distinct timer-latency pool, population-WEIGHTED like
+    // wake_pool (reservoir-capped, so a >cap phase carries weight
+    // timer_sample_total/len for the cross-phase de-skew).
+    let mut timer_pool: Vec<(u64, f64)> = Vec::new();
     let mut run_delay_pool: Vec<u64> = Vec::new();
     // Names of cgroups that contributed NON-EMPTY samples to each pool. A
     // cgroup absent here — a backdrop epoch that fell on BASELINE / the
@@ -638,6 +642,7 @@ pub fn populate_run_distribution_metrics(stats: &mut ScenarioStats) {
     // stats.cgroups entry still contributes via exactly one of {pool,
     // reduction-fold} — no double count.
     let mut wake_carriers: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    let mut timer_carriers: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
     let mut run_delay_carriers: std::collections::BTreeSet<&str> =
         std::collections::BTreeSet::new();
     for phase in &stats.phases {
@@ -670,6 +675,21 @@ pub fn populate_run_distribution_metrics(stats: &mut ScenarioStats) {
                 wake_pool.extend(pcg.wake_latencies_ns.iter().map(|&v| (v, w)));
                 wake_carriers.insert(cgname.as_str());
             }
+            if !pcg.timer_latencies_ns.is_empty() {
+                // Population-weighted exactly like the wake pool: a >cap phase's
+                // capped samples each stand for timer_sample_total/len true
+                // wakes, restoring the cross-phase population proportion.
+                let len = pcg.timer_latencies_ns.len() as u64;
+                debug_assert!(
+                    pcg.timer_sample_total >= len,
+                    "timer_sample_total ({}) < reservoir len ({}): malformed carrier",
+                    pcg.timer_sample_total,
+                    len,
+                );
+                let w = pcg.timer_sample_total.max(len) as f64 / len as f64;
+                timer_pool.extend(pcg.timer_latencies_ns.iter().map(|&v| (v, w)));
+                timer_carriers.insert(cgname.as_str());
+            }
             if !pcg.run_delays_ns.is_empty() {
                 run_delay_pool.extend_from_slice(&pcg.run_delays_ns);
                 run_delay_carriers.insert(cgname.as_str());
@@ -677,6 +697,7 @@ pub fn populate_run_distribution_metrics(stats: &mut ScenarioStats) {
         }
     }
     wake_pool.sort_unstable_by_key(|&(v, _)| v);
+    timer_pool.sort_unstable_by_key(|&(v, _)| v);
     run_delay_pool.sort_unstable();
     populate_run_distribution_metrics_from(
         &mut stats.ext_metrics,
@@ -691,6 +712,8 @@ pub fn populate_run_distribution_metrics(stats: &mut ScenarioStats) {
         }),
         &wake_pool,
         &wake_carriers,
+        &timer_pool,
+        &timer_carriers,
         &run_delay_pool,
         &run_delay_carriers,
         &stats.cgroups,
@@ -712,6 +735,8 @@ pub(crate) fn populate_run_distribution_metrics_from<'a>(
     metrics: impl Iterator<Item = (&'a str, crate::stats::MetricKind)>,
     wake_pool: &[(u64, f64)],
     wake_carriers: &std::collections::BTreeSet<&str>,
+    timer_pool: &[(u64, f64)],
+    timer_carriers: &std::collections::BTreeSet<&str>,
     run_delay_pool: &[u64],
     run_delay_carriers: &std::collections::BTreeSet<&str>,
     cgroups: &[CgroupStats],
@@ -761,6 +786,12 @@ pub(crate) fn populate_run_distribution_metrics_from<'a>(
                             (!wake_pool.is_empty())
                                 .then(|| reduce_weighted_sorted_distribution(wake_pool, reduction)),
                             wake_carriers,
+                        ),
+                        SampleSource::TimerLatencyNs => (
+                            (!timer_pool.is_empty()).then(|| {
+                                reduce_weighted_sorted_distribution(timer_pool, reduction)
+                            }),
+                            timer_carriers,
                         ),
                         SampleSource::RunDelayNs => (
                             (!run_delay_pool.is_empty())
@@ -871,6 +902,7 @@ pub(crate) fn reduce_sorted_distribution(
     use crate::stats::SampleReduction;
     match reduction {
         SampleReduction::P99 => percentile(sorted, 0.99) as f64 / 1000.0,
+        SampleReduction::P999 => percentile(sorted, 0.999) as f64 / 1000.0,
         SampleReduction::Median => percentile(sorted, 0.5) as f64 / 1000.0,
         SampleReduction::Cv => {
             let n = sorted.len() as f64;
@@ -960,6 +992,7 @@ pub(crate) fn reduce_weighted_sorted_distribution(
     use crate::stats::SampleReduction;
     match reduction {
         SampleReduction::P99 => weighted_percentile(sorted, 0.99) as f64 / 1000.0,
+        SampleReduction::P999 => weighted_percentile(sorted, 0.999) as f64 / 1000.0,
         SampleReduction::Median => weighted_percentile(sorted, 0.5) as f64 / 1000.0,
         SampleReduction::Cv => {
             let total_w: f64 = sorted.iter().map(|&(_, w)| w).sum();
@@ -1020,7 +1053,7 @@ fn distribution_cgroup_reduction(
             SampleReduction::P99 => cg.p99_wake_latency_us,
             SampleReduction::Median => cg.median_wake_latency_us,
             SampleReduction::Cv => cg.wake_latency_cv,
-            SampleReduction::Mean | SampleReduction::Worst => {
+            SampleReduction::P999 | SampleReduction::Mean | SampleReduction::Worst => {
                 debug_assert!(false, "no CgroupStats wake reduction for {reduction:?}");
                 f64::NAN
             }
@@ -1028,11 +1061,24 @@ fn distribution_cgroup_reduction(
         SampleSource::RunDelayNs => match reduction {
             SampleReduction::Mean => cg.mean_run_delay_us,
             SampleReduction::Worst => cg.worst_run_delay_us,
-            SampleReduction::P99 | SampleReduction::Median | SampleReduction::Cv => {
+            SampleReduction::P99
+            | SampleReduction::P999
+            | SampleReduction::Median
+            | SampleReduction::Cv => {
                 debug_assert!(
                     false,
                     "no CgroupStats run-delay reduction for {reduction:?}"
                 );
+                f64::NAN
+            }
+        },
+        SampleSource::TimerLatencyNs => match reduction {
+            SampleReduction::Median => cg.median_timer_latency_us,
+            SampleReduction::P99 => cg.p99_timer_latency_us,
+            SampleReduction::P999 => cg.p999_timer_latency_us,
+            SampleReduction::Worst => cg.worst_timer_latency_us,
+            SampleReduction::Cv | SampleReduction::Mean => {
+                debug_assert!(false, "no CgroupStats timer reduction for {reduction:?}");
                 f64::NAN
             }
         },
@@ -1208,6 +1254,7 @@ fn write_carrier_scalars(pc: &mut PhaseCgroupStats) {
     };
     // Read everything from &*pc into locals BEFORE the &mut pc.metrics borrow.
     let wake = pc.wake_summary().zip(pc.wake_cv());
+    let timer = pc.timer_summary();
     let run_delay = pc.run_delay_summary();
     let off_cpu = pc.off_cpu_summary();
     let migration_ratio = migration_ratio_of(pc.total_migrations, pc.total_iterations);
@@ -1228,6 +1275,12 @@ fn write_carrier_scalars(pc: &mut PhaseCgroupStats) {
         m.insert("p99_wake_latency_us".to_string(), p99);
         m.insert("median_wake_latency_us".to_string(), median);
         m.insert("wake_latency_cv".to_string(), cv);
+    }
+    // TIMER — all three or none (timer_summary shares the empty-pool gate).
+    if let Some((median, p99, p999)) = timer {
+        m.insert("median_timer_latency_us".to_string(), median);
+        m.insert("p99_timer_latency_us".to_string(), p99);
+        m.insert("p999_timer_latency_us".to_string(), p999);
     }
     // RUN-DELAY — both or none.
     if let Some((mean, worst)) = run_delay {

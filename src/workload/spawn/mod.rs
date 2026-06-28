@@ -442,6 +442,18 @@ pub struct WorkerReport {
     /// observed" read this field; distribution computations read
     /// `iteration_costs_ns` directly.
     pub iteration_cost_sample_total: u64,
+    /// Per-timer-cycle latency samples (ns) for
+    /// [`crate::workload::WorkType::TimerLatency`]: the observed
+    /// `clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME)` wake time minus the
+    /// absolute deadline, floored at 0. Reservoir-clamped to at most
+    /// `MAX_WAKE_SAMPLES`, distinct from `wake_latencies_ns` so cyclictest-style
+    /// timer latency does not blur with the blocking variants' wake latency.
+    /// `vec![]` for every non-`TimerLatency` variant.
+    pub timer_latencies_ns: Vec<u64>,
+    /// Total timer-cycle observations, INCLUDING any the reservoir dropped —
+    /// the true population for unbiased cross-phase weighting. Mirrors
+    /// [`wake_sample_total`](Self::wake_sample_total) for `timer_latencies_ns`.
+    pub timer_sample_total: u64,
     /// Outer-loop iteration count. What `CgroupStats::total_iterations` sums
     /// and what the derived throughput rates (`iterations_per_worker` /
     /// `iterations_per_cpu_sec`) and `migration_ratio` divide by; NOT read by
@@ -642,6 +654,15 @@ pub struct PhaseSlice {
     /// reservoir dropped — the true population for unbiased
     /// cross-phase weighting.
     pub wake_sample_total: u64,
+    /// Per-timer-cycle latency samples (ns) recorded during this phase by a
+    /// [`crate::workload::WorkType::TimerLatency`] worker, reservoir-clamped to
+    /// `MAX_PHASE_WAKE_SAMPLES` (like `wake_latencies_ns`). Distinct carrier so
+    /// timer latency does not blur with wake latency.
+    pub timer_latencies_ns: Vec<u64>,
+    /// Total timer-cycle observations during this phase, INCLUDING any the
+    /// reservoir dropped — the true population for unbiased cross-phase
+    /// weighting. Mirrors `wake_sample_total` for `timer_latencies_ns`.
+    pub timer_sample_total: u64,
     /// `/proc/self/schedstat` run_delay (field 2) delta over this phase (ns).
     pub run_delay_ns: u64,
     /// Off-CPU time during this phase (ns): `wall_ns − cpu_time` over
@@ -1846,6 +1867,14 @@ pub(super) fn validate_workload_admission(group: &GroupParams) -> Result<()> {
         if period_iters == 0 {
             return Err(WorkTypeValidationError::ZeroIpcVarianceParam {
                 field: "period_iters",
+                group_idx: group.group_idx,
+            }
+            .into());
+        }
+    }
+    if let WorkType::TimerLatency { interval_us } = group.work_type {
+        if interval_us == 0 {
+            return Err(WorkTypeValidationError::ZeroTimerInterval {
                 group_idx: group.group_idx,
             }
             .into());

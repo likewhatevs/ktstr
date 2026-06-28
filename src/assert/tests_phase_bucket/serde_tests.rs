@@ -53,6 +53,8 @@ fn phase_bucket_per_cgroup_round_trips_and_defaults_empty() {
             cpus_used: BTreeSet::from([2, 5, 6]),
             wake_latencies_ns: vec![10, 20, 30],
             wake_sample_total: 3,
+            timer_latencies_ns: vec![],
+            timer_sample_total: 0,
             run_delays_ns: vec![1_500, 2_500],
             off_cpu_pcts: vec![1.5, 11.0, 22.5],
             total_migrations: 7,

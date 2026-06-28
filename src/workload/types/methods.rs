@@ -73,6 +73,7 @@ impl WorkType {
             WorkType::AluHot { .. } => "AluHot",
             WorkType::SmtSiblingSpin => "SmtSiblingSpin",
             WorkType::IpcVariance { .. } => "IpcVariance",
+            WorkType::TimerLatency { .. } => "TimerLatency",
         }
     }
 
@@ -230,6 +231,9 @@ impl WorkType {
                 hot_iters: defaults::IPC_VARIANCE_HOT_ITERS,
                 cold_iters: defaults::IPC_VARIANCE_COLD_ITERS,
                 period_iters: defaults::IPC_VARIANCE_PERIOD_ITERS,
+            }),
+            "TimerLatency" => Some(WorkType::TimerLatency {
+                interval_us: defaults::TIMER_LATENCY_INTERVAL_US,
             }),
             // Sequence requires explicit phases; no default from_name.
             _ => None,

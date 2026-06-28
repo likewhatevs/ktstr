@@ -127,6 +127,19 @@ pub enum WorkTypeValidationError {
         /// `WorkloadConfig::composed` (primary group = 0).
         group_idx: usize,
     },
+    /// [`WorkType::TimerLatency`] with `interval_us == 0`. A zero interval never
+    /// advances the absolute deadline, collapsing the cyclictest loop to a tight
+    /// busy-spin rather than a timer-latency probe.
+    #[error(
+        "TimerLatency interval_us must be > 0 (group {group_idx}); a zero \
+         interval never advances the deadline and collapses the loop to a \
+         busy-spin (see [`WorkType::TimerLatency`] variant doc)"
+    )]
+    ZeroTimerInterval {
+        /// Index of the offending group in
+        /// `WorkloadConfig::composed` (primary group = 0).
+        group_idx: usize,
+    },
     /// [`WorkType::WakeChain`] with `depth < 2`. A 1-stage chain has
     /// no successor to wake, and the post-fork close-other-fds
     /// block would close the worker's own write end (deadlock).

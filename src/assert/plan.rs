@@ -410,14 +410,17 @@ impl AssertResult {
                     })
                     .unwrap_or(0);
                 let had_samples = !pc.wake_latencies_ns.is_empty()
+                    || !pc.timer_latencies_ns.is_empty()
                     || !pc.run_delays_ns.is_empty()
                     || !pc.off_cpu_pcts.is_empty()
                     || schbench_samples > 0;
                 dropped += pc.wake_latencies_ns.len()
+                    + pc.timer_latencies_ns.len()
                     + pc.run_delays_ns.len()
                     + pc.off_cpu_pcts.len()
                     + schbench_samples as usize;
                 pc.wake_latencies_ns = Vec::new();
+                pc.timer_latencies_ns = Vec::new();
                 pc.run_delays_ns = Vec::new();
                 pc.off_cpu_pcts = Vec::new();
                 pc.schbench = None;

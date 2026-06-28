@@ -160,6 +160,11 @@ pub mod defaults {
     /// the variant doc describes; opt-in callers set the field to
     /// `true` directly to call `prctl(PR_SET_TIMERSLACK, 1)`.
     pub const IDLE_CHURN_PRECISE_TIMING: bool = false;
+    // TimerLatency
+    /// Default [`crate::workload::WorkType::TimerLatency`] inter-wake interval
+    /// (µs): 1000 = 1kHz, matching `cyclictest`'s default tick rate. The
+    /// absolute deadline advances by this each cycle.
+    pub const TIMER_LATENCY_INTERVAL_US: u64 = 1000;
     // AluHot
     /// Default for `WorkType::AluHot`'s `width` field. `Widest`
     /// resolves to the widest data-path the host supports at

@@ -146,6 +146,8 @@ fn derive_writes_non_schbench_per_cgroup_value_for_value() {
             schedstat_run_delay_ns: 4000,
             wake_latencies_ns: vec![1000, 2000, 3000, 4000, 5000],
             wake_sample_total: 5,
+            timer_latencies_ns: vec![1500, 2500, 3500, 4500, 5500],
+            timer_sample_total: 5,
             numa_pages: [(0usize, 100u64), (1usize, 50u64)].into_iter().collect(),
             vmstat_numa_pages_migrated: 10,
             ..rpt(1, 1000, 1_000_000, 200_000, &[0], 0) // wall 1ms, off-cpu 0.2ms -> 20%
@@ -157,6 +159,8 @@ fn derive_writes_non_schbench_per_cgroup_value_for_value() {
             schedstat_run_delay_ns: 6000,
             wake_latencies_ns: vec![6000, 7000, 8000, 9000, 10000],
             wake_sample_total: 5,
+            timer_latencies_ns: vec![6500, 7500, 8500, 9500, 10500],
+            timer_sample_total: 5,
             numa_pages: [(0usize, 200u64), (1usize, 50u64)].into_iter().collect(),
             vmstat_numa_pages_migrated: 20,
             ..rpt(2, 1000, 1_000_000, 100_000, &[1], 0) // 10%
@@ -213,6 +217,13 @@ fn derive_writes_non_schbench_per_cgroup_value_for_value() {
     assert!((m("p99_wake_latency_us") - cg_a.p99_wake_latency_us).abs() < 1e-9);
     assert!((m("median_wake_latency_us") - cg_a.median_wake_latency_us).abs() < 1e-9);
     assert!((m("wake_latency_cv") - cg_a.wake_latency_cv).abs() < 1e-9);
+    // Timer-latency per-cgroup derive — the CI-runnable pin for the timer derive
+    // (timer_summary -> p99/median/p999_timer_latency_us in pc.metrics), so a SKIP
+    // of the host-gated timer_latency_e2e cannot mask a derive regression.
+    // Value-for-value with cgroup_stats below the reservoir cap, exactly like wake.
+    assert!((m("p99_timer_latency_us") - cg_a.p99_timer_latency_us).abs() < 1e-9);
+    assert!((m("median_timer_latency_us") - cg_a.median_timer_latency_us).abs() < 1e-9);
+    assert!((m("p999_timer_latency_us") - cg_a.p999_timer_latency_us).abs() < 1e-9);
     assert!((m("mean_run_delay_us") - cg_a.mean_run_delay_us).abs() < 1e-9);
     assert!((m("max_run_delay_us") - cg_a.worst_run_delay_us).abs() < 1e-9);
     assert!((m("avg_off_cpu_pct") - cg_a.avg_off_cpu_pct.unwrap()).abs() < 1e-9);

@@ -220,6 +220,21 @@ pub struct CgroupStats {
     /// [`WorkerReport::wake_latencies_ns`] directly if per-worker
     /// CV is needed.
     pub wake_latency_cv: f64,
+    /// Median timer-latency across all workers (microseconds) — the
+    /// [`crate::workload::WorkType::TimerLatency`] cyclictest probe's per-cgroup
+    /// pooled reduction over
+    /// [`crate::workload::WorkerReport::timer_latencies_ns`]. `0.0` when no
+    /// worker recorded timer samples.
+    pub median_timer_latency_us: f64,
+    /// 99th-percentile timer-latency across all workers (microseconds). See
+    /// [`Self::median_timer_latency_us`].
+    pub p99_timer_latency_us: f64,
+    /// 99.9th-percentile (deep-tail) timer-latency across all workers
+    /// (microseconds). See [`Self::median_timer_latency_us`].
+    pub p999_timer_latency_us: f64,
+    /// Worst (maximum) timer-latency across all workers (microseconds). See
+    /// [`Self::median_timer_latency_us`].
+    pub worst_timer_latency_us: f64,
     /// Sum of iteration counts across all workers.
     pub total_iterations: u64,
     /// Sum of per-worker on-CPU time (nanoseconds), from each worker's
@@ -331,6 +346,18 @@ pub struct PhaseCgroupStats {
     /// the only source of the true wakeup population once `wake_latencies_ns` is
     /// reservoir-clamped, and it is for REPORTING, not the CV denominator.
     pub wake_sample_total: u64,
+    /// Pooled per-timer-cycle latency samples (ns) across the cgroup's
+    /// [`crate::workload::WorkType::TimerLatency`] workers in the phase,
+    /// un-reduced so median / p99 / p999 / worst re-pool over the combined set.
+    /// Reservoir-capped at `MAX_WAKE_SAMPLES` on same-name-carrier merge exactly
+    /// like `wake_latencies_ns` (population-weighted >cap); `timer_sample_total`
+    /// carries the true pre-cap population. Distinct carrier from
+    /// `wake_latencies_ns`.
+    pub timer_latencies_ns: Vec<u64>,
+    /// True timer-cycle count before reservoir clamping (`timer_latencies_ns` is
+    /// capped), so the re-pool reports the real population. Mirrors
+    /// `wake_sample_total` for the timer carrier.
+    pub timer_sample_total: u64,
     /// Pooled per-worker schedstat run-delay samples (RAW ns) for the phase,
     /// un-reduced so mean / worst run-delay re-pool over the combined set; the
     /// re-pool converts ns → µs to match [`CgroupStats`]'s run-delay-µs fields.
@@ -510,6 +537,22 @@ impl PhaseCgroupStats {
                 cap,
             )
         };
+        // Same bounded merge for the distinct timer reservoir:
+        // <=cap concatenation is value-for-value; >cap a population-weighted
+        // reservoir merge keeps it an unbiased sample of the combined population.
+        let timer_latencies_ns = if a.timer_latencies_ns.len() + b.timer_latencies_ns.len() <= cap {
+            let mut v = a.timer_latencies_ns;
+            v.extend(b.timer_latencies_ns);
+            v
+        } else {
+            Self::weighted_merge_reservoirs(
+                &a.timer_latencies_ns,
+                a.timer_sample_total,
+                &b.timer_latencies_ns,
+                b.timer_sample_total,
+                cap,
+            )
+        };
         let mut run_delays_ns = a.run_delays_ns;
         run_delays_ns.extend(b.run_delays_ns);
         let mut off_cpu_pcts = a.off_cpu_pcts;
@@ -558,6 +601,8 @@ impl PhaseCgroupStats {
             cpus_used,
             wake_latencies_ns,
             wake_sample_total: a.wake_sample_total + b.wake_sample_total,
+            timer_latencies_ns,
+            timer_sample_total: a.timer_sample_total + b.timer_sample_total,
             run_delays_ns,
             off_cpu_pcts,
             total_migrations: a.total_migrations + b.total_migrations,
@@ -765,6 +810,27 @@ impl PhaseCgroupStats {
         let p99 = percentile(&sorted, 0.99) as f64 / 1000.0;
         let median = percentile(&sorted, 0.5) as f64 / 1000.0;
         Some((p99, median))
+    }
+
+    /// Timer-latency reduction for the per-phase metric emission:
+    /// `(median_us, p99_us, p999_us)` over the pooled
+    /// [`Self::timer_latencies_ns`] (nearest-rank, ns→µs), or `None` when the
+    /// pool is empty (the not-measured state — `write_carrier_scalars` omits all
+    /// three timer keys together). Reproduces the per-cgroup
+    /// [`crate::assert::cgroup_stats`] timer reductions value-for-value below the
+    /// reservoir cap (distribution-equivalent above it), exactly like
+    /// [`Self::wake_summary`]. The run-level WORST (max) is NOT here — it comes
+    /// from the cross-phase re-pool (`populate_run_distribution_metrics`).
+    pub fn timer_summary(&self) -> Option<(f64, f64, f64)> {
+        if self.timer_latencies_ns.is_empty() {
+            return None;
+        }
+        let mut sorted = self.timer_latencies_ns.clone();
+        sorted.sort_unstable();
+        let median = percentile(&sorted, 0.5) as f64 / 1000.0;
+        let p99 = percentile(&sorted, 0.99) as f64 / 1000.0;
+        let p999 = percentile(&sorted, 0.999) as f64 / 1000.0;
+        Some((median, p99, p999))
     }
 
     /// Wake-latency coefficient of variation (stddev / mean) over the pooled
