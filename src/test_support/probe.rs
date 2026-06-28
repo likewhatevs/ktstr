@@ -514,6 +514,22 @@ fn write_auto_repro_sidecar_artifacts(
     }
 }
 
+/// Extra host-deadline budget the auto-repro VM gets beyond the workload
+/// timeout, covering the post-trigger probe-drain tail: after the fentry
+/// trigger fires, `run_probe_skeleton` reads the `probe_data` map, serializes
+/// the per-function arg payload, and flushes it (framed by `PROBE_OUTPUT_END`)
+/// over the bulk port before `force_reboot`. The base host timeout
+/// ([`vm_timeout_from_entry`](super::runtime::vm_timeout_from_entry)) is sized
+/// for the workload only, so without this grace a slow or large drain can hit
+/// the deadline mid-flush — the host then extracts a truncated, terminator-less
+/// payload, fails to parse it, and drops a fully-captured arg set as
+/// "auto-repro: no probe data". Sized well above the worst-case drain of the
+/// bounded `probe_data` map (so a slow host or a large captured-function set
+/// still flushes the terminator in time); it is a CAP, not a fixed wait — the
+/// guest force-reboots when the drain completes, so over-sizing costs nothing
+/// on the success path and only bounds a genuinely hung guest.
+pub(crate) const PROBE_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Build and configure the auto-repro VM builder: resolve staged
 /// schedulers, construct the base builder, point the failure-dump sink
 /// at the `.repro` sibling path, enable the dual-snapshot freeze
@@ -579,6 +595,14 @@ fn build_repro_vm_builder(
         guest_args,
         no_perf_mode,
     );
+
+    // The repro VM has a post-trigger probe-drain tail the primary's budget does
+    // not cover (probe_data map readout + arg-payload serialize + PROBE_OUTPUT_END
+    // flush over the bulk port + force_reboot). Override the base host deadline to
+    // add a bounded drain grace so the watchdog cannot fire mid-flush and truncate
+    // the captured-arg payload (which the host would then fail to parse and drop
+    // as "auto-repro: no probe data"). See PROBE_DRAIN_GRACE.
+    builder = builder.timeout(super::runtime::vm_timeout_from_entry(entry) + PROBE_DRAIN_GRACE);
 
     // Set the auto-repro failure-dump sink to a `.repro` sibling
     // of the primary's `{name}.failure-dump.json` so the auto-repro

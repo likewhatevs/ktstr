@@ -13,6 +13,37 @@ use super::*;
 /// its stash/take exercises so the ordering is well defined.
 static DEFERRED_PROBE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// The auto-repro VM's host deadline must include PROBE_DRAIN_GRACE beyond the
+/// base workload timeout, so the watchdog cannot fire during the post-trigger
+/// probe-drain tail and truncate the captured-arg payload (the repro
+/// arg-capture race). Pins
+/// the budget = vm_timeout_from_entry(entry) + PROBE_DRAIN_GRACE; a regression
+/// that drops the grace (repro VM reusing the bare base timeout) trips here.
+#[test]
+fn repro_vm_builder_adds_probe_drain_grace_to_deadline() {
+    use std::path::Path;
+    let entry = crate::test_support::test_helpers::eevdf_entry("repro-grace-test");
+    let (builder, _dump_path) = build_repro_vm_builder(
+        &entry,
+        Path::new("/dummy/kernel"),
+        None,
+        Path::new("/dummy/ktstr"),
+        None,
+        &[],
+    )
+    .expect("repro builder builds for a no-wprof EEVDF entry");
+    let base = crate::test_support::runtime::vm_timeout_from_entry(&entry);
+    assert_eq!(
+        builder.timeout,
+        base + PROBE_DRAIN_GRACE,
+        "repro VM deadline must be the base workload timeout plus the probe-drain grace",
+    );
+    assert!(
+        builder.timeout > base,
+        "the grace strictly extends the deadline beyond the workload budget",
+    );
+}
+
 #[test]
 fn extract_probe_output_valid_json() {
     use crate::probe::process::ProbeEvent;
