@@ -165,6 +165,19 @@ CONFIG_VIRTIO_CONSOLE=y
 CONFIG_VIRTIO_BLK=y
 CONFIG_VIRTIO_NET=y
 
+# -- Networking --
+# PACKET: AF_PACKET sockets (net/packet/Kconfig:6 — "communicate directly
+# with network devices ... e.g. tcpdump"), the raw-frame device-level TX/RX
+# path rather than the kernel-internal IP layer. PACKET has no `depends on`
+# of its own (it sits under `if NET`); NET stays on because both arch
+# defconfigs set CONFIG_NET=y. Both defconfigs also already set
+# CONFIG_PACKET=y, so this line is a defense-in-depth pin (like the
+# RANDOMIZE_* pins above), not a first-time enable: it keeps an
+# inherited-defconfig flip from silently dropping the symbol the wide-SMP
+# net-IRQ e2e (tests/wide_smp_net_irq_e2e.rs) relies on (it opens an
+# AF_PACKET raw socket).
+CONFIG_PACKET=y
+
 # -- Filesystems --
 # Btrfs: optional, for DiskConfig::Btrfs when the template-VM
 # lifecycle lands. Requires crypto deps (CRC32, BLAKE2B, SHA256,
@@ -261,6 +274,21 @@ CONFIG_TASK_IO_ACCOUNTING=y
 # /proc/pressure/{io,memory,cpu,irq} via psi_proc_init() and
 # exposes per-cgroup *.pressure files.
 CONFIG_PSI=y
+
+# IRQ_TIME_ACCOUNTING: fine-grained IRQ time accounting. The kernel
+# timestamps each hardirq/softirq transition (irqtime_account_irq,
+# kernel/sched/cputime.c:57) and accounts that time separately instead of
+# charging it to the interrupted task; update_rq_clock_task subtracts the
+# resulting irq_delta (kernel/sched/core.c:817) so rq->clock_task EXCLUDES
+# IRQ time, and update_irq_load_avg feeds rq->avg_irq (core.c:840) — IRQ
+# time becomes a signal distinct from task runtime. Deps (init/Kconfig:614):
+# HAVE_IRQ_TIME_ACCOUNTING — selected by arch/x86/Kconfig:252 and
+# arch/arm64/Kconfig:212 — and !VIRT_CPU_ACCOUNTING_NATIVE, which can never
+# be set on x86_64/arm64 (its prereq HAVE_VIRT_CPU_ACCOUNTING is selected
+# only by s390/powerpc). x86_64_defconfig lacks the symbol so this enables
+# it there; arm64 defconfig already sets it, so on arm64 this is a
+# defense-in-depth pin. =y survives make defconfig + merge + olddefconfig.
+CONFIG_IRQ_TIME_ACCOUNTING=y
 
 # -- Disabled (would alter scheduler behavior) --
 # LOCKDEP: 10-100x lock overhead. Non-representative timing.
