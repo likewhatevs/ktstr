@@ -2031,6 +2031,25 @@ pub(crate) struct MonitorLoopResult {
     pub(crate) boot_wait_outcome: super::BootWaitOutcome,
 }
 
+/// System-wide PSI-irq host-walk inputs: the resolved `struct psi_group`
+/// offsets + the pre-translated guest PA of the global `psi_system`. The
+/// monitor sample loop reads `total[PSI_AVGS][PSI_IRQ_FULL]` (cumulative IRQ
+/// stall ns) + `avg[PSI_IRQ_FULL][0]` (the 10s EWMA) at that PA and decodes
+/// into [`super::PsiIrqSample`]. `MonitorConfig::psi` is `Some` only when BOTH
+/// the offsets (CONFIG_IRQ_TIME_ACCOUNTING → `PSI_IRQ_FULL` in BTF) and the
+/// `psi_system` symbol resolve; otherwise the loop emits no
+/// `MonitorSample::psi_irq` (loud-absent).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PsiCaptureCfg {
+    /// Resolved `psi_group` offsets + the `PSI_IRQ_FULL` index.
+    pub offsets: super::btf_offsets::PsiGroupOffsets,
+    /// Guest PA of the global `psi_system` (`.data`), translated once at
+    /// monitor-thread setup via `text_kva_to_pa_with_base` (a kernel-image
+    /// global, not the direct map). Stable for the run — no per-sample
+    /// re-translation (unlike the per-CPU `runqueues` walk).
+    pub psi_system_pa: u64,
+}
+
 /// Configuration for the monitor sampling loop.
 ///
 /// Bundles the parameters that `monitor_loop` needs beyond the
@@ -2090,6 +2109,10 @@ pub(crate) struct MonitorConfig<'a> {
     /// used unchanged (test path; production callers always populate
     /// this).
     pub rq_refresh: Option<&'a RqRefresh>,
+    /// PSI-irq host-walk inputs (psi_group offsets + the pre-translated
+    /// `psi_system` PA). `Some` only when both resolve; else the loop emits no
+    /// `psi_irq` sample (loud-absent). Owned (`Copy`), no lifetime tie.
+    pub psi: Option<PsiCaptureCfg>,
     /// Optional scheduler-attach watchdog reset. When `Some`, the
     /// loop reads `*scx_root` each iteration via
     /// [`WatchdogReset::scx_root_pa`] and, on the first 0 →
@@ -2175,6 +2198,7 @@ pub(crate) fn monitor_loop(
     let perf_capture = cfg.perf_capture;
     let preemption_threshold_ns = cfg.preemption_threshold_ns;
     let prog_stats_ctx = cfg.prog_stats_ctx;
+    let psi = cfg.psi;
     // Mutable so the per-iteration refresh can update it once
     // `page_offset_base` becomes readable. Initialized from the
     // pre-loop resolved value, which on KASLR-randomized kernels
@@ -2819,10 +2843,32 @@ pub(crate) fn monitor_loop(
             None
         };
 
+        // System-wide PSI-irq host-walk. `psi.psi_system_pa` is the
+        // pre-translated (`text_kva_to_pa_with_base`, once at setup) PA of the
+        // `psi_group psi_system` `.data` global — no per-iteration translation
+        // (unlike the per-CPU rq walk). Gated on `data_valid` so the run-level
+        // fold sees only workload-window pressure, matching the `cpus` /
+        // `prog_stats` samples. `*_off()` is `None` when
+        // `CONFIG_IRQ_TIME_ACCOUNTING` is off (BTF lacks `PSI_IRQ_FULL`) → no
+        // sample, the loud-absent path.
+        let psi_irq = if data_valid {
+            psi.and_then(|p| {
+                let total_off = p.offsets.total_irq_full_off()?;
+                let avg10_off = p.offsets.avg10_irq_full_off()?;
+                Some(super::PsiIrqSample {
+                    avg10_raw: mem.read_u64(p.psi_system_pa, avg10_off),
+                    total_ns: mem.read_u64(p.psi_system_pa, total_off),
+                })
+            })
+        } else {
+            None
+        };
+
         samples.push(MonitorSample {
             elapsed_ms: run_start.elapsed().as_millis() as u64,
             cpus: cpus.clone(),
             prog_stats,
+            psi_irq,
         });
 
         // Block until the next tick or a kill_evt write. -1 timeout
@@ -3028,6 +3074,7 @@ mod tests {
             start_kernel_map: super::super::symbols::START_KERNEL_MAP,
             phys_base: 0,
             rq_refresh: None,
+            psi: None,
             watchdog_reset: None,
         }
     }

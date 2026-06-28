@@ -253,6 +253,17 @@ pub(crate) struct KernelSymbols {
     /// (CONFIG_64BIT=n on a host that emits only the legacy `jiffies`
     /// alias, or a stripped vmlinux that lost the symbol).
     pub jiffies_64: Option<u64>,
+    /// Kernel virtual address of the global `struct psi_group psi_system`
+    /// (`kernel/sched/psi.c:175`, external linkage, initialized → `.data`).
+    /// The PSI-irq host-walk reads `total[PSI_AVGS][PSI_IRQ_FULL]` (cumulative
+    /// stall ns) + `avg[PSI_IRQ_FULL][0]` (the fixed-point 10s EWMA) from it via
+    /// [`super::btf_offsets::PsiGroupOffsets`]. `None` when the symbol is absent
+    /// (kernel built without `CONFIG_PSI`, or a stripped vmlinux) → the PSI-irq
+    /// metrics read loud-absent. A kernel-image `.data` global, so the KVA→PA
+    /// path is `text_kva_to_pa_with_base` (`kva - start_kernel_map + phys_base`),
+    /// resolved once at monitor-thread setup like `jiffies_64` /
+    /// `scx_watchdog_timestamp` — NOT the `kva_to_pa` direct mapping.
+    pub psi_system: Option<u64>,
     /// Link-time KVA of `entry_SYSCALL_64` — the SYSCALL entry handler
     /// symbol (defined `SYM_CODE_START` in `arch/x86/entry/entry_64.S`).
     /// Used with MSR_LSTAR to derive the runtime virtual KASLR offset:
@@ -470,6 +481,14 @@ impl KernelSymbols {
         // CONFIG_NUMA. Walker gates capture on Some.
         let node_data = sym_addr("node_data");
 
+        // psi_system: the global `struct psi_group psi_system`
+        // (kernel/sched/psi.c:175 — external linkage, initialized → `.data`).
+        // The PSI-irq host-walk reads `total[PSI_AVGS][PSI_IRQ_FULL]` (ns) +
+        // `avg[PSI_IRQ_FULL][0]` (fixed-point EWMA) from it. None when absent
+        // (kernel built without CONFIG_PSI, or a stripped vmlinux) → the
+        // PSI-irq metrics read loud-absent.
+        let psi_system = sym_addr("psi_system");
+
         Ok(Self {
             runqueues,
             per_cpu_offset,
@@ -490,6 +509,7 @@ impl KernelSymbols {
             kstat,
             tick_cpu_sched,
             node_data,
+            psi_system,
         })
     }
 }
@@ -1467,6 +1487,7 @@ mod tests {
             scx_watchdog_timestamp: None,
             scx_watchdog_interval: None,
             jiffies_64: None,
+            psi_system: None,
             kernel_cpustat: None,
             kstat: None,
             tick_cpu_sched: None,
@@ -1503,6 +1524,7 @@ mod tests {
             scx_watchdog_timestamp: None,
             scx_watchdog_interval: None,
             jiffies_64: None,
+            psi_system: None,
             kernel_cpustat: None,
             kstat: None,
             tick_cpu_sched: None,
@@ -1541,6 +1563,7 @@ mod tests {
             scx_watchdog_timestamp: None,
             scx_watchdog_interval: None,
             jiffies_64: None,
+            psi_system: None,
             kernel_cpustat: None,
             kstat: None,
             tick_cpu_sched: None,
@@ -1582,6 +1605,7 @@ mod tests {
             scx_watchdog_timestamp: None,
             scx_watchdog_interval: None,
             jiffies_64: None,
+            psi_system: None,
             kernel_cpustat: None,
             kstat: None,
             tick_cpu_sched: None,
@@ -1626,6 +1650,7 @@ mod tests {
             scx_watchdog_timestamp: None,
             scx_watchdog_interval: None,
             jiffies_64: None,
+            psi_system: None,
             kernel_cpustat: None,
             kstat: None,
             tick_cpu_sched: None,
@@ -1666,6 +1691,7 @@ mod tests {
             scx_watchdog_timestamp: None,
             scx_watchdog_interval: None,
             jiffies_64: None,
+            psi_system: None,
             kernel_cpustat: None,
             kstat: None,
             tick_cpu_sched: None,
@@ -1703,6 +1729,7 @@ mod tests {
             scx_watchdog_timestamp: None,
             scx_watchdog_interval: None,
             jiffies_64: None,
+            psi_system: None,
             kernel_cpustat: None,
             kstat: None,
             tick_cpu_sched: None,
@@ -1736,6 +1763,7 @@ mod tests {
             scx_watchdog_timestamp: None,
             scx_watchdog_interval: None,
             jiffies_64: None,
+            psi_system: None,
             kernel_cpustat: None,
             kstat: None,
             tick_cpu_sched: None,

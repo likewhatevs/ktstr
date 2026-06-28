@@ -1113,6 +1113,17 @@ pub fn sidecar_to_row(sc: &crate::test_support::SidecarResult) -> GauntletRow {
         if let Some(v) = m.max_avg_irq_util {
             ext_metrics.insert("max_avg_irq_util".to_string(), v);
         }
+        // System-wide PSI-irq pressure, ext-only like avg_irq_util. The inner
+        // Option checks skip both keys on a kernel without CONFIG_PSI /
+        // CONFIG_IRQ_TIME_ACCOUNTING (loud-absent, never a false 0.0).
+        // psi_irq_full_avg10 is Gauge(Avg) (cross-run sample-weighted mean);
+        // total_irq_pressure_us is a Counter (cross-run Σ).
+        if let Some(v) = m.psi_irq_full_avg10 {
+            ext_metrics.insert("psi_irq_full_avg10".to_string(), v);
+        }
+        if let Some(v) = m.total_irq_pressure_us {
+            ext_metrics.insert("total_irq_pressure_us".to_string(), v);
+        }
     }
 
     GauntletRow {

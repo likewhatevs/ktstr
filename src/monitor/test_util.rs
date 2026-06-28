@@ -37,6 +37,7 @@ pub(crate) fn name_from_str(s: &str) -> ([u8; BPF_OBJ_NAME_LEN], u8) {
 pub(crate) fn balanced_sample(elapsed_ms: u64, clock_base: u64) -> MonitorSample {
     MonitorSample {
         prog_stats: None,
+        psi_irq: None,
         elapsed_ms,
         cpus: vec![
             CpuSnapshot {

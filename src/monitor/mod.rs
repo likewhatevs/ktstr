@@ -444,15 +444,42 @@ pub struct MonitorSample {
     /// None when no struct_ops programs are loaded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prog_stats: Option<Vec<bpf_prog::ProgRuntimeStats>>,
+    /// System-wide PSI-irq pressure at this sample, host-walked from
+    /// the global `psi_system` (the cgroup-hierarchy root — system-wide, the
+    /// `/proc/pressure/irq` framing; per-cgroup IRQ pressure is a separate
+    /// axis). `None` when `psi_system` / `PSI_IRQ_FULL` is absent
+    /// (`CONFIG_IRQ_TIME_ACCOUNTING` off) — loud-absent. Raw kernel values;
+    /// decoded at the [`MonitorSummary`] fold.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub psi_irq: Option<PsiIrqSample>,
+}
+
+/// System-wide PSI-irq pressure read from `psi_system` at one monitor sample.
+/// RAW kernel values, decoded at the [`MonitorSummary`] fold via
+/// [`crate::monitor::btf_offsets::decode_avg10_percent`] /
+/// [`crate::monitor::btf_offsets::decode_total_us`]: the run-level
+/// `psi_irq_full_avg10` is the mean of the decoded `avg10` (Gauge), and
+/// `total_irq_pressure_us` is the end-start delta of the decoded `total`
+/// (Counter).
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+pub struct PsiIrqSample {
+    /// Raw `psi_system.avg[PSI_IRQ_FULL][0]` — the 10s EWMA in fixed-point
+    /// (percent × `FIXED_1`=2048); decode via `decode_avg10_percent`.
+    pub avg10_raw: u64,
+    /// Raw `psi_system.total[PSI_AVGS][PSI_IRQ_FULL]` — cumulative IRQ stall
+    /// ns; the run-level metric is its end-start delta (decode via
+    /// `decode_total_us`).
+    pub total_ns: u64,
 }
 
 impl MonitorSample {
-    /// Create a sample with no prog_stats.
+    /// Create a sample with no prog_stats / psi_irq.
     pub fn new(elapsed_ms: u64, cpus: Vec<CpuSnapshot>) -> Self {
         Self {
             elapsed_ms,
             cpus,
             prog_stats: None,
+            psi_irq: None,
         }
     }
 
@@ -755,6 +782,18 @@ pub struct MonitorSummary {
     /// Peak (max across CPUs and samples) PELT IRQ load. `None` when no sample
     /// reported avg_irq (same gate as `avg_irq_util`).
     pub max_avg_irq_util: Option<f64>,
+    /// Mean system-wide PSI-irq `full` avg10 pressure (percent, 0..=100) across
+    /// the monitor samples that REPORTED it (host-walked from `psi_system`).
+    /// `None` when no sample carried a PSI-irq reading (CONFIG_PSI /
+    /// CONFIG_IRQ_TIME_ACCOUNTING off, or no `psi_system` symbol) — loud-absent,
+    /// never a false 0.0. The run-level `psi_irq_full_avg10` gauge.
+    pub psi_irq_full_avg10: Option<f64>,
+    /// Cumulative system-wide PSI-irq `full` stall over the monitoring window
+    /// (microseconds): the end-start delta of `total[PSI_AVGS][PSI_IRQ_FULL]`
+    /// across the first/last samples that reported PSI-irq. `None` under the
+    /// same gate as `psi_irq_full_avg10`. The run-level `total_irq_pressure_us`
+    /// counter.
+    pub total_irq_pressure_us: Option<f64>,
     /// Aggregate event counter deltas over the monitoring window.
     /// None when event counters are not available.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -962,6 +1001,33 @@ impl MonitorSummary {
             }
         }
 
+        // System-wide PSI-irq pressure (host-walked from `psi_system`, one
+        // reading per sample). `psi_irq_full_avg10` is the MEAN of the decoded
+        // avg10 EWMA (percent) across the samples that reported PSI-irq — a
+        // Gauge. `total_irq_pressure_us` is the end-start delta of the
+        // cumulative `total` ns (decoded to µs) — a Counter; `saturating_sub`
+        // guards a counter reset (the accumulator is monotonic, but a PSI /
+        // scheduler reset would rewind it). Both `None` when no sample reported
+        // PSI-irq (loud-absent), preserving the absent-vs-measured-zero
+        // distinction. Decoupled from the cpu-validity gate above: the reading
+        // is a singleton `.data` global, captured only on `data_valid` samples.
+        let psi_samples: Vec<&PsiIrqSample> =
+            samples.iter().filter_map(|s| s.psi_irq.as_ref()).collect();
+        let psi_irq_full_avg10 = (!psi_samples.is_empty()).then(|| {
+            let sum: f64 = psi_samples
+                .iter()
+                .map(|p| btf_offsets::decode_avg10_percent(p.avg10_raw))
+                .sum();
+            sum / psi_samples.len() as f64
+        });
+        let total_irq_pressure_us =
+            psi_samples
+                .first()
+                .zip(psi_samples.last())
+                .map(|(first, last)| {
+                    btf_offsets::decode_total_us(last.total_ns.saturating_sub(first.total_ns))
+                });
+
         let event_deltas = Self::compute_event_deltas(samples);
         let schedstat_deltas = Self::compute_schedstat_deltas(samples);
         let prog_stats_deltas = Self::compute_prog_stats_deltas(samples);
@@ -976,6 +1042,8 @@ impl MonitorSummary {
             avg_local_dsq_depth,
             avg_irq_util,
             max_avg_irq_util,
+            psi_irq_full_avg10,
+            total_irq_pressure_us,
             event_deltas,
             schedstat_deltas,
             prog_stats_deltas,

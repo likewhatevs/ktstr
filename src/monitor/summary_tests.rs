@@ -23,6 +23,7 @@ fn empty_samples_default_summary() {
 fn single_sample_imbalanced_cpus() {
     let sample = MonitorSample {
         prog_stats: None,
+        psi_irq: None,
         elapsed_ms: 100,
         cpus: vec![
             CpuSnapshot {
@@ -54,6 +55,7 @@ fn single_sample_imbalanced_cpus() {
 fn stuck_count_when_clock_stuck() {
     let s1 = MonitorSample {
         prog_stats: None,
+        psi_irq: None,
         elapsed_ms: 100,
         cpus: vec![
             CpuSnapshot {
@@ -70,6 +72,7 @@ fn stuck_count_when_clock_stuck() {
     };
     let s2 = MonitorSample {
         prog_stats: None,
+        psi_irq: None,
         elapsed_ms: 200,
         cpus: vec![
             CpuSnapshot {
@@ -92,6 +95,7 @@ fn stuck_count_when_clock_stuck() {
 fn balanced_cpus_ratio_one() {
     let sample = MonitorSample {
         prog_stats: None,
+        psi_irq: None,
         elapsed_ms: 50,
         cpus: vec![
             CpuSnapshot {
@@ -118,6 +122,7 @@ fn balanced_cpus_ratio_one() {
 fn single_cpu_no_division_by_zero() {
     let sample = MonitorSample {
         prog_stats: None,
+        psi_irq: None,
         elapsed_ms: 10,
         cpus: vec![CpuSnapshot {
             nr_running: 5,
@@ -138,6 +143,7 @@ fn single_cpu_no_division_by_zero() {
 fn all_zero_snapshots() {
     let sample = MonitorSample {
         prog_stats: None,
+        psi_irq: None,
         elapsed_ms: 0,
         cpus: vec![CpuSnapshot::default(), CpuSnapshot::default()],
     };
@@ -159,6 +165,7 @@ fn all_zero_snapshots() {
 fn empty_cpus_in_sample() {
     let sample = MonitorSample {
         prog_stats: None,
+        psi_irq: None,
         elapsed_ms: 10,
         cpus: vec![],
     };
@@ -178,6 +185,7 @@ fn min_nr_zero_division_guard() {
     // divisor, so ratio = 0/1 = 0.0, which is < initial 1.0.
     let sample = MonitorSample {
         prog_stats: None,
+        psi_irq: None,
         elapsed_ms: 10,
         cpus: vec![
             CpuSnapshot {
@@ -203,6 +211,7 @@ fn min_nr_zero_max_nr_nonzero() {
     // min_nr=0, max_nr=5: ratio = 5/max(0,1) = 5.0
     let sample = MonitorSample {
         prog_stats: None,
+        psi_irq: None,
         elapsed_ms: 10,
         cpus: vec![
             CpuSnapshot {
@@ -225,6 +234,7 @@ fn min_nr_zero_max_nr_nonzero() {
 fn advancing_clocks_no_stuck() {
     let s1 = MonitorSample {
         prog_stats: None,
+        psi_irq: None,
         elapsed_ms: 100,
         cpus: vec![
             CpuSnapshot {
@@ -241,6 +251,7 @@ fn advancing_clocks_no_stuck() {
     };
     let s2 = MonitorSample {
         prog_stats: None,
+        psi_irq: None,
         elapsed_ms: 200,
         cpus: vec![
             CpuSnapshot {
@@ -257,6 +268,7 @@ fn advancing_clocks_no_stuck() {
     };
     let s3 = MonitorSample {
         prog_stats: None,
+        psi_irq: None,
         elapsed_ms: 300,
         cpus: vec![
             CpuSnapshot {
@@ -282,6 +294,7 @@ fn different_length_cpu_vecs() {
     // min(prev.len, curr.len) = 2, so only CPUs 0-1 are compared.
     let s1 = MonitorSample {
         prog_stats: None,
+        psi_irq: None,
         elapsed_ms: 100,
         cpus: vec![
             CpuSnapshot {
@@ -298,6 +311,7 @@ fn different_length_cpu_vecs() {
     };
     let s2 = MonitorSample {
         prog_stats: None,
+        psi_irq: None,
         elapsed_ms: 200,
         cpus: vec![
             CpuSnapshot {
@@ -331,6 +345,7 @@ fn from_samples_fields_sane_values() {
     let samples: Vec<_> = (0..5u64)
         .map(|i| MonitorSample {
             prog_stats: None,
+            psi_irq: None,
             elapsed_ms: i * 100,
             cpus: vec![
                 CpuSnapshot {
@@ -470,6 +485,8 @@ fn from_samples_empty_all_defaults() {
     assert_eq!(summary.avg_imbalance_ratio, 0.0);
     assert_eq!(summary.avg_nr_running, 0.0);
     assert_eq!(summary.avg_local_dsq_depth, 0.0);
+    assert_eq!(summary.psi_irq_full_avg10, None);
+    assert_eq!(summary.total_irq_pressure_us, None);
     assert!(
         summary.event_deltas.is_none(),
         "empty input must not produce event deltas"
@@ -486,6 +503,7 @@ fn avg_irq_util_means_reporting_cpus_and_skips_none() {
     // partial-report kernel is neither diluted nor false-zeroed.
     let s1 = MonitorSample {
         prog_stats: None,
+        psi_irq: None,
         elapsed_ms: 100,
         cpus: vec![
             CpuSnapshot {
@@ -500,6 +518,7 @@ fn avg_irq_util_means_reporting_cpus_and_skips_none() {
     };
     let s2 = MonitorSample {
         prog_stats: None,
+        psi_irq: None,
         elapsed_ms: 200,
         cpus: vec![
             CpuSnapshot {
@@ -535,6 +554,7 @@ fn avg_irq_util_none_when_no_cpu_reports() {
     // mean and the peak are None (loud-absent), never a false 0.0.
     let sample = MonitorSample {
         prog_stats: None,
+        psi_irq: None,
         elapsed_ms: 100,
         cpus: vec![
             CpuSnapshot {
@@ -563,4 +583,207 @@ fn avg_irq_util_none_when_no_cpu_reports() {
     // The sample WAS valid (avg_nr_running computed) — proving the None is
     // the avg_irq gate, not the whole sample being skipped.
     assert!((summary.avg_nr_running - 2.0).abs() < f64::EPSILON);
+}
+
+// -- PSI-irq run-level fold (system-wide psi_system host-walk) --
+
+/// `psi_irq_full_avg10` is the MEAN of the decoded avg10 EWMA (raw/2048 = %)
+/// across the samples that reported PSI-irq (a Gauge), and
+/// `total_irq_pressure_us` is the end-start delta of the cumulative `total` ns
+/// (decoded ns→µs, a Counter). Pins both folds with exactly computable values.
+#[test]
+fn psi_irq_folds_avg10_mean_and_total_delta() {
+    // avg10 decode = raw / 2048 (FIXED_1): 51200 → 25%, 153600 → 75% ⇒ mean 50%.
+    // total decode = ns / 1000: delta (3_500_000 - 1_000_000) ns = 2500 µs.
+    let s1 = MonitorSample {
+        elapsed_ms: 100,
+        cpus: vec![CpuSnapshot {
+            nr_running: 1,
+            rq_clock: 1000,
+            ..Default::default()
+        }],
+        prog_stats: None,
+        psi_irq: Some(PsiIrqSample {
+            avg10_raw: 51_200,
+            total_ns: 1_000_000,
+        }),
+    };
+    let s2 = MonitorSample {
+        elapsed_ms: 200,
+        cpus: vec![CpuSnapshot {
+            nr_running: 1,
+            rq_clock: 2000,
+            ..Default::default()
+        }],
+        prog_stats: None,
+        psi_irq: Some(PsiIrqSample {
+            avg10_raw: 153_600,
+            total_ns: 3_500_000,
+        }),
+    };
+    let summary = MonitorSummary::from_samples(&[s1, s2]);
+    let avg10 = summary
+        .psi_irq_full_avg10
+        .expect("samples reported PSI-irq");
+    assert!(
+        (avg10 - 50.0).abs() < f64::EPSILON,
+        "avg10 mean = (25 + 75) / 2 = 50.0: {avg10}",
+    );
+    let total = summary
+        .total_irq_pressure_us
+        .expect("samples reported PSI-irq");
+    assert!(
+        (total - 2500.0).abs() < f64::EPSILON,
+        "total delta = (3_500_000 - 1_000_000) ns / 1000 = 2500 µs: {total}",
+    );
+}
+
+/// No sample carries PSI-irq (a kernel without CONFIG_PSI /
+/// CONFIG_IRQ_TIME_ACCOUNTING, or no `psi_system` symbol): BOTH run-level PSI
+/// metrics are `None` (loud-absent), never a false 0.0 — the same
+/// absent-vs-measured-zero contract as `avg_irq_util`.
+#[test]
+fn psi_irq_none_when_no_sample_reports() {
+    let sample = MonitorSample {
+        elapsed_ms: 100,
+        cpus: vec![CpuSnapshot {
+            nr_running: 2,
+            rq_clock: 1000,
+            ..Default::default()
+        }],
+        prog_stats: None,
+        psi_irq: None,
+    };
+    let summary = MonitorSummary::from_samples(&[sample]);
+    assert_eq!(
+        summary.psi_irq_full_avg10, None,
+        "no PSI reading -> None, not 0.0",
+    );
+    assert_eq!(
+        summary.total_irq_pressure_us, None,
+        "no PSI reading -> None, not 0.0",
+    );
+    // The sample WAS valid (avg_nr_running computed) — proving the None is the
+    // PSI gate, not the whole sample being skipped.
+    assert!((summary.avg_nr_running - 2.0).abs() < f64::EPSILON);
+}
+
+/// A PSI / scheduler reset rewinds the monotonic cumulative `total[]` between
+/// samples. `total_irq_pressure_us` uses `saturating_sub`, so the delta clamps
+/// to 0 rather than underflowing into a giant bogus pressure — mirroring the
+/// event-delta counter-reset clamp.
+#[test]
+fn psi_irq_total_saturates_on_counter_reset() {
+    let s1 = MonitorSample {
+        elapsed_ms: 100,
+        cpus: vec![CpuSnapshot {
+            nr_running: 1,
+            rq_clock: 1000,
+            ..Default::default()
+        }],
+        prog_stats: None,
+        psi_irq: Some(PsiIrqSample {
+            avg10_raw: 0,
+            total_ns: 5_000_000,
+        }),
+    };
+    let s2 = MonitorSample {
+        elapsed_ms: 200,
+        cpus: vec![CpuSnapshot {
+            nr_running: 1,
+            rq_clock: 2000,
+            ..Default::default()
+        }],
+        prog_stats: None,
+        psi_irq: Some(PsiIrqSample {
+            avg10_raw: 0,
+            total_ns: 1_000_000, // rewound below the first reading
+        }),
+    };
+    let summary = MonitorSummary::from_samples(&[s1, s2]);
+    assert_eq!(
+        summary.total_irq_pressure_us,
+        Some(0.0),
+        "counter reset must clamp the delta to 0, not underflow",
+    );
+}
+
+/// A single PSI-reporting sample: the total end-start delta is 0 (first ==
+/// last) and the avg10 mean is exactly that one sample's decoded value — the
+/// single-sample boundary of both folds.
+#[test]
+fn psi_irq_single_sample_zero_total_delta() {
+    let sample = MonitorSample {
+        elapsed_ms: 100,
+        cpus: vec![CpuSnapshot {
+            nr_running: 1,
+            rq_clock: 1000,
+            ..Default::default()
+        }],
+        prog_stats: None,
+        psi_irq: Some(PsiIrqSample {
+            avg10_raw: 102_400, // 102400 / 2048 = 50.0%
+            total_ns: 7_000_000,
+        }),
+    };
+    let summary = MonitorSummary::from_samples(&[sample]);
+    assert!(
+        (summary.psi_irq_full_avg10.unwrap() - 50.0).abs() < f64::EPSILON,
+        "single-sample avg10 = the lone decoded value",
+    );
+    assert_eq!(
+        summary.total_irq_pressure_us,
+        Some(0.0),
+        "single sample: first == last ⇒ delta 0",
+    );
+}
+
+/// A monitor sample with `psi_irq = None` interleaved between reporting samples
+/// (a sample where the read couldn't resolve, or a gap) is FILTERED from the
+/// fold — NOT treated as a 0% reading that drags the mean down, and NOT breaking
+/// the first→last cumulative delta. Pins `from_samples`'s `filter_map` compaction
+/// so a future refactor to a zero-fill can't silently bias the gauge.
+#[test]
+fn psi_irq_interleaved_none_is_filtered_not_zeroed() {
+    let mk = |elapsed_ms: u64, psi: Option<PsiIrqSample>| MonitorSample {
+        elapsed_ms,
+        cpus: vec![CpuSnapshot {
+            nr_running: 1,
+            rq_clock: elapsed_ms * 10,
+            ..Default::default()
+        }],
+        prog_stats: None,
+        psi_irq: psi,
+    };
+    let samples = vec![
+        mk(
+            100,
+            Some(PsiIrqSample {
+                avg10_raw: 102_400, // 50%
+                total_ns: 1_000_000,
+            }),
+        ),
+        mk(200, None),
+        mk(
+            300,
+            Some(PsiIrqSample {
+                avg10_raw: 102_400, // 50%
+                total_ns: 3_000_000,
+            }),
+        ),
+    ];
+    let summary = MonitorSummary::from_samples(&samples);
+    // Mean over the 2 REPORTING samples = 50.0, NOT (50 + 0 + 50)/3 = 33.3 — the
+    // None is filtered (filter_map compacts it out), never zero-filled.
+    assert!(
+        (summary.psi_irq_full_avg10.unwrap() - 50.0).abs() < f64::EPSILON,
+        "interleaved None must be filtered from the mean, not counted as 0%",
+    );
+    // Delta spans first-reporting (1e6) → last-reporting (3e6) = 2e6 ns = 2000 µs;
+    // the mid-gap None does not break the monotonic cumulative delta.
+    assert_eq!(
+        summary.total_irq_pressure_us,
+        Some(2000.0),
+        "delta spans first→last reporting sample across the None gap",
+    );
 }

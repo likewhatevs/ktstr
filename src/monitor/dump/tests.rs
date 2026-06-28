@@ -123,6 +123,7 @@ fn event_counter_sample_sums_across_cpus() {
         elapsed_ms: 100,
         cpus: vec![cpu_a, cpu_b],
         prog_stats: None,
+        psi_irq: None,
     };
     let folded = EventCounterSample::from_monitor_sample(&sample)
         .expect("at least one CPU has event_counters");
@@ -146,6 +147,7 @@ fn event_counter_sample_returns_none_when_no_cpu_has_counters() {
         elapsed_ms: 200,
         cpus: vec![cpu],
         prog_stats: None,
+        psi_irq: None,
     };
     assert!(EventCounterSample::from_monitor_sample(&sample).is_none());
 }
@@ -9260,6 +9262,7 @@ fn event_counter_sample_saturates_at_i64_max_across_cpus() {
             },
         ],
         prog_stats: None,
+        psi_irq: None,
     };
     let folded = EventCounterSample::from_monitor_sample(&sample)
         .expect("at least one CPU has event_counters");

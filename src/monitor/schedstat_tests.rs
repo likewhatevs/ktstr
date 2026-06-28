@@ -17,6 +17,7 @@ fn sample_with_schedstat(
 ) -> MonitorSample {
     MonitorSample {
         prog_stats: None,
+        psi_irq: None,
         elapsed_ms,
         cpus: vec![
             CpuSnapshot {
@@ -109,6 +110,7 @@ fn schedstat_deltas_rates() {
 fn schedstat_deltas_all_fields() {
     let make = |elapsed_ms, rd, pc, yc, sc, sg, tc, tl| MonitorSample {
         prog_stats: None,
+        psi_irq: None,
         elapsed_ms,
         cpus: vec![CpuSnapshot {
             nr_running: 1,

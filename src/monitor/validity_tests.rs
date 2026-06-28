@@ -27,6 +27,7 @@ fn data_looks_valid_all_same_clocks() {
     let samples = vec![
         MonitorSample {
             prog_stats: None,
+            psi_irq: None,
             elapsed_ms: 100,
             cpus: vec![
                 CpuSnapshot {
@@ -41,6 +42,7 @@ fn data_looks_valid_all_same_clocks() {
         },
         MonitorSample {
             prog_stats: None,
+            psi_irq: None,
             elapsed_ms: 200,
             cpus: vec![
                 CpuSnapshot {
@@ -61,6 +63,7 @@ fn data_looks_valid_all_same_clocks() {
 fn data_looks_valid_dsq_over_ceiling() {
     let samples = vec![MonitorSample {
         prog_stats: None,
+        psi_irq: None,
         elapsed_ms: 100,
         cpus: vec![CpuSnapshot {
             local_dsq_depth: 50000,
@@ -77,6 +80,7 @@ fn data_looks_valid_dsq_over_ceiling() {
 fn imbalance_ratio_empty_cpus() {
     let s = MonitorSample {
         prog_stats: None,
+        psi_irq: None,
         elapsed_ms: 0,
         cpus: vec![],
     };
@@ -87,6 +91,7 @@ fn imbalance_ratio_empty_cpus() {
 fn imbalance_ratio_single_cpu() {
     let s = MonitorSample {
         prog_stats: None,
+        psi_irq: None,
         elapsed_ms: 0,
         cpus: vec![CpuSnapshot {
             nr_running: 5,
@@ -100,6 +105,7 @@ fn imbalance_ratio_single_cpu() {
 fn imbalance_ratio_balanced() {
     let s = MonitorSample {
         prog_stats: None,
+        psi_irq: None,
         elapsed_ms: 0,
         cpus: vec![
             CpuSnapshot {
@@ -119,6 +125,7 @@ fn imbalance_ratio_balanced() {
 fn imbalance_ratio_imbalanced() {
     let s = MonitorSample {
         prog_stats: None,
+        psi_irq: None,
         elapsed_ms: 0,
         cpus: vec![
             CpuSnapshot {
@@ -138,6 +145,7 @@ fn imbalance_ratio_imbalanced() {
 fn imbalance_ratio_zero_min() {
     let s = MonitorSample {
         prog_stats: None,
+        psi_irq: None,
         elapsed_ms: 0,
         cpus: vec![
             CpuSnapshot {
@@ -160,6 +168,7 @@ fn imbalance_ratio_zero_min() {
 fn sum_event_field_none_when_no_counters() {
     let s = MonitorSample {
         prog_stats: None,
+        psi_irq: None,
         elapsed_ms: 0,
         cpus: vec![CpuSnapshot::default(), CpuSnapshot::default()],
     };
@@ -170,6 +179,7 @@ fn sum_event_field_none_when_no_counters() {
 fn sum_event_field_sums_across_cpus() {
     let s = MonitorSample {
         prog_stats: None,
+        psi_irq: None,
         elapsed_ms: 0,
         cpus: vec![
             CpuSnapshot {
@@ -195,6 +205,7 @@ fn sum_event_field_sums_across_cpus() {
 fn sum_event_field_mixed_some_none() {
     let s = MonitorSample {
         prog_stats: None,
+        psi_irq: None,
         elapsed_ms: 0,
         cpus: vec![
             CpuSnapshot {
@@ -216,6 +227,7 @@ fn sum_event_field_mixed_some_none() {
 fn sample_looks_valid_normal() {
     let s = MonitorSample {
         prog_stats: None,
+        psi_irq: None,
         elapsed_ms: 100,
         cpus: vec![CpuSnapshot {
             local_dsq_depth: 5,
@@ -229,6 +241,7 @@ fn sample_looks_valid_normal() {
 fn sample_looks_valid_at_ceiling() {
     let s = MonitorSample {
         prog_stats: None,
+        psi_irq: None,
         elapsed_ms: 100,
         cpus: vec![CpuSnapshot {
             local_dsq_depth: DSQ_PLAUSIBILITY_CEILING,
@@ -242,6 +255,7 @@ fn sample_looks_valid_at_ceiling() {
 fn sample_looks_valid_over_ceiling() {
     let s = MonitorSample {
         prog_stats: None,
+        psi_irq: None,
         elapsed_ms: 100,
         cpus: vec![CpuSnapshot {
             local_dsq_depth: DSQ_PLAUSIBILITY_CEILING + 1,
@@ -255,6 +269,7 @@ fn sample_looks_valid_over_ceiling() {
 fn sample_looks_valid_empty_cpus() {
     let s = MonitorSample {
         prog_stats: None,
+        psi_irq: None,
         elapsed_ms: 100,
         cpus: vec![],
     };
@@ -265,6 +280,7 @@ fn sample_looks_valid_empty_cpus() {
 fn sample_looks_valid_zero_initialized() {
     let s = MonitorSample {
         prog_stats: None,
+        psi_irq: None,
         elapsed_ms: 0,
         cpus: vec![CpuSnapshot::default(), CpuSnapshot::default()],
     };
@@ -276,6 +292,7 @@ fn sample_looks_valid_zero_initialized() {
 fn sample_looks_valid_multiple_cpus_one_over() {
     let s = MonitorSample {
         prog_stats: None,
+        psi_irq: None,
         elapsed_ms: 100,
         cpus: vec![
             CpuSnapshot {

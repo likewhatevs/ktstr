@@ -117,9 +117,10 @@ builtin_metrics! {
     // system_time_ns). Counters / Gauge(Avg) / Peak + 3 derived rates + 2
     // hidden capture-window duration components. Require num_snapshots >= 2
     // (per_cpu_time freeze capture) + CONFIG_IRQ_TIME_ACCOUNTING for the
-    // time signals; loud-absent (None), never false-zero, when off. PSI-irq
-    // (psi_irq_full_avg10 / total_irq_pressure_us) is a follow-up — it is a
-    // guest /proc read not yet captured into VmResult (a follow-up).
+    // time signals; loud-absent (None), never false-zero, when off. System-wide
+    // PSI-irq (psi_irq_full_avg10 / total_irq_pressure_us) is host-walked from
+    // the global psi_system per monitor sample and folded run-level, NOT a guest
+    // /proc read; see its own block below.
     TotalHardirqs => "total_hardirqs",
     TotalSoftirqNetRx => "total_softirq_net_rx",
     TotalSoftirqNetTx => "total_softirq_net_tx",
@@ -146,6 +147,14 @@ builtin_metrics! {
     // _concentration = max / mean over the reporting CPUs. Both Peak.
     MaxCpuHardirqs => "max_cpu_hardirqs",
     MaxCpuHardirqConcentration => "max_cpu_hardirq_concentration",
+
+    // System-wide PSI-irq pressure (host-walked from the global psi_system per
+    // monitor sample, folded run-level in MonitorSummary). avg10 = mean
+    // 10s-EWMA full-pressure percent (Gauge); total = cumulative full-stall µs
+    // over the window (Counter). Gated on CONFIG_PSI + CONFIG_IRQ_TIME_ACCOUNTING
+    // (PSI_IRQ_FULL in BTF); loud-absent (None) when off.
+    PsiIrqFullAvg10 => "psi_irq_full_avg10",
+    TotalIrqPressureUs => "total_irq_pressure_us",
 
     // Per-phase scalars (MetricKind::PerPhase) — schbench / taobench engine
     // metrics, surfaced via the per-phase PhaseBucket path (const-named).

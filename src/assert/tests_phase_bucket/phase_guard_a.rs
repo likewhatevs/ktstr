@@ -1036,11 +1036,13 @@ fn build_phase_buckets_with_stimulus_synthesized_bucket_folds_full_monitor_set()
         samples: vec![
             MonitorSample {
                 prog_stats: None,
+                psi_irq: None,
                 elapsed_ms: 1000,
                 cpus: vec![cpu(4, 3, 100, evc(10, 5)), cpu(2, 1, 100, None)],
             },
             MonitorSample {
                 prog_stats: None,
+                psi_irq: None,
                 elapsed_ms: 1500,
                 cpus: vec![cpu(4, 3, 100, evc(110, 55)), cpu(2, 1, 200, None)],
             },

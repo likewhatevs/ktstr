@@ -20,11 +20,18 @@
 //! step bucket holds >= 2 freezes for the Counter last-minus-first delta
 //! (`phase_counter_delta` is `None` for fewer than two finite samples).
 //!
-//! The run-level gauges (`avg_irq_util` / `max_avg_irq_util`) are NOT asserted
-//! here: like the pre-existing `avg_nr_running`, run-level-ext metrics have no
-//! in-test `VmResult` reader (they are sidecar/perf-delta-compare-only). They
-//! are covered by a `MonitorSummary::from_samples` unit test instead; an
-//! in-test run-level accessor is a separate follow-up.
+//! The PSI-irq run-level metrics (`psi_irq_full_avg10` / `total_irq_pressure_us`)
+//! ARE asserted here via the [`VmResult::monitor`] summary. `psi_irq_full_avg10`
+//! must be PRESENT (proving `psi_system` resolved + the host-walk ran) and a sane
+//! percent; `total_irq_pressure_us` must be > 0 — the sustained softirq load that
+//! drives `total_softirq_net_rx` also accrues IRQ-full stall, so a present-but-
+//! zero cumulative total is the wrong-`psi_system`-PA signature (a wrong PA reads
+//! out-of-bounds 0). Together they prove the `.data`-global PA translation +
+//! `psi_group` offset math read the live accumulator from a real kernel. The fold
+//! math (mean / end-start delta / decode) is pinned separately by
+//! `MonitorSummary::from_samples` unit tests. The PELT IRQ gauges (`avg_irq_util`
+//! / `max_avg_irq_util`) and `avg_nr_running` remain unit-tested only — their
+//! level is gate-/topology-dependent, flaky to pin to a value e2e.
 
 use anyhow::{Result, anyhow, ensure};
 use ktstr::assert::{AssertResult, Phase};
@@ -103,6 +110,52 @@ fn assert_irq_metrics(result: &VmResult) -> Result<()> {
             )
         })?;
     ensure!(rate > 0.0, "hardirq_rate must be > 0, got {rate}");
+
+    // System-wide PSI-irq pressure, host-walked from the global `psi_system`
+    // per monitor sample and folded run-level in MonitorSummary. The unit fold
+    // tests pin the mean / end-start-delta / decode math on synthetic samples;
+    // THIS proves the host-walk against a real kernel: `psi_system` resolves
+    // (CONFIG_PSI=y in ktstr.kconfig) and the `.data`-global PA translation +
+    // `psi_group` offset math read the LIVE accumulator. ABSENT FAILS loudly
+    // (psi_system unresolved / PSI_IRQ_FULL not in BTF), never SKIPs.
+    let summary = &result
+        .monitor
+        .as_ref()
+        .ok_or_else(|| anyhow!("no monitor report — the host monitor did not run"))?
+        .summary;
+    // Present (psi_system resolved + PSI_IRQ_FULL in BTF + >= 1 data_valid
+    // sample) and a sane percent. decode_avg10_percent clamps the upper bound, so
+    // [0,100] is a floor/sanity here; the wrong-PA signal is `total > 0` below.
+    let psi_avg10 = summary.psi_irq_full_avg10.ok_or_else(|| {
+        anyhow!(
+            "psi_irq_full_avg10 absent — psi_system unresolved or PSI_IRQ_FULL \
+             missing from BTF (CONFIG_PSI / CONFIG_IRQ_TIME_ACCOUNTING off)"
+        )
+    })?;
+    ensure!(
+        (0.0..=100.0).contains(&psi_avg10),
+        "psi_irq_full_avg10 must be a percent in [0,100], got {psi_avg10}"
+    );
+    // > 0, not just present. PSI IRQ-full accrues PER-CPU in psi_account_irqtime
+    // (kernel/sched/psi.c:1006-1046): on each tick/schedule it adds the CPU's
+    // irq-time delta to psi_system's PSI_IRQ_FULL bucket whenever a real task
+    // (curr->pid != 0) was running — it is NOT gated on a multi-CPU simultaneous
+    // stall. This test's load is maximal-continuous (2 CPU-bound NetTraffic
+    // workers, interval_us=0 → constant NET_RX softirq), so a real worker runs on
+    // each CPU while it services softirq → PSI_IRQ_FULL accrues every tick and the
+    // cumulative total grows large over 15 s — deterministic, not a transient a
+    // freeze might miss. A wrong psi_system PA reads out-of-bounds -> 0, so a
+    // present-but-zero cumulative total is the wrong-PA signature (caught here
+    // where the clamped avg10 range cannot). NOTE: > 0 relies on this sustained
+    // load; revisit the assertion if the workload is lightened/idled.
+    let psi_total = summary.total_irq_pressure_us.ok_or_else(|| {
+        anyhow!("total_irq_pressure_us absent under the same PSI gate as avg10")
+    })?;
+    ensure!(
+        psi_total > 0.0 && psi_total.is_finite(),
+        "total_irq_pressure_us must RISE under the NetTraffic softirq load \
+         (present-but-zero signals a wrong psi_system PA reading 0), got {psi_total}"
+    );
 
     Ok(())
 }

@@ -107,6 +107,7 @@ fn thresholds_imbalance_below_sustained_passes() {
     for i in 0..4 {
         samples.push(MonitorSample {
             prog_stats: None,
+            psi_irq: None,
             elapsed_ms: i * 100,
             cpus: vec![
                 CpuSnapshot {
@@ -151,6 +152,7 @@ fn thresholds_imbalance_at_sustained_fails() {
     for i in 0..5u64 {
         samples.push(MonitorSample {
             prog_stats: None,
+            psi_irq: None,
             elapsed_ms: i * 100,
             cpus: vec![
                 CpuSnapshot {
@@ -190,6 +192,7 @@ fn thresholds_dsq_depth_sustained_fails() {
     for i in 0..3u64 {
         samples.push(MonitorSample {
             prog_stats: None,
+            psi_irq: None,
             elapsed_ms: i * 100,
             cpus: vec![
                 CpuSnapshot {
@@ -231,6 +234,7 @@ fn thresholds_dsq_depth_below_sustained_passes() {
     for i in 0..2u64 {
         samples.push(MonitorSample {
             prog_stats: None,
+            psi_irq: None,
             elapsed_ms: i * 100,
             cpus: vec![
                 CpuSnapshot {
@@ -273,6 +277,7 @@ fn thresholds_stuck_fails() {
     let samples = vec![
         MonitorSample {
             prog_stats: None,
+            psi_irq: None,
             elapsed_ms: 100,
             cpus: vec![
                 CpuSnapshot {
@@ -289,6 +294,7 @@ fn thresholds_stuck_fails() {
         },
         MonitorSample {
             prog_stats: None,
+            psi_irq: None,
             elapsed_ms: 200,
             cpus: vec![
                 CpuSnapshot {
@@ -334,6 +340,7 @@ fn thresholds_stuck_disabled_passes() {
     let samples = vec![
         MonitorSample {
             prog_stats: None,
+            psi_irq: None,
             elapsed_ms: 100,
             cpus: vec![
                 CpuSnapshot {
@@ -350,6 +357,7 @@ fn thresholds_stuck_disabled_passes() {
         },
         MonitorSample {
             prog_stats: None,
+            psi_irq: None,
             elapsed_ms: 200,
             cpus: vec![
                 CpuSnapshot {
@@ -392,6 +400,7 @@ fn thresholds_imbalance_interrupted_by_balanced_resets() {
     for i in 0..3u64 {
         samples.push(MonitorSample {
             prog_stats: None,
+            psi_irq: None,
             elapsed_ms: i * 100,
             cpus: vec![
                 CpuSnapshot {
@@ -411,6 +420,7 @@ fn thresholds_imbalance_interrupted_by_balanced_resets() {
     for i in 4..7u64 {
         samples.push(MonitorSample {
             prog_stats: None,
+            psi_irq: None,
             elapsed_ms: i * 100,
             cpus: vec![
                 CpuSnapshot {
@@ -456,6 +466,7 @@ fn thresholds_multiple_violations() {
     let samples = vec![
         MonitorSample {
             prog_stats: None,
+            psi_irq: None,
             elapsed_ms: 100,
             cpus: vec![
                 CpuSnapshot {
@@ -472,6 +483,7 @@ fn thresholds_multiple_violations() {
         },
         MonitorSample {
             prog_stats: None,
+            psi_irq: None,
             elapsed_ms: 200,
             cpus: vec![
                 CpuSnapshot {
@@ -488,6 +500,7 @@ fn thresholds_multiple_violations() {
         },
         MonitorSample {
             prog_stats: None,
+            psi_irq: None,
             elapsed_ms: 300,
             cpus: vec![
                 CpuSnapshot {
@@ -548,11 +561,13 @@ fn thresholds_empty_cpus_samples_pass() {
     let samples = vec![
         MonitorSample {
             prog_stats: None,
+            psi_irq: None,
             elapsed_ms: 100,
             cpus: vec![],
         },
         MonitorSample {
             prog_stats: None,
+            psi_irq: None,
             elapsed_ms: 200,
             cpus: vec![],
         },
@@ -581,6 +596,7 @@ fn thresholds_uninitialized_memory_yields_inconclusive() {
     let samples: Vec<_> = (0..10)
         .map(|i| MonitorSample {
             prog_stats: None,
+            psi_irq: None,
             elapsed_ms: i * 100,
             cpus: vec![
                 CpuSnapshot {
@@ -632,6 +648,7 @@ fn thresholds_all_same_clocks_yields_inconclusive() {
     let samples = vec![
         MonitorSample {
             prog_stats: None,
+            psi_irq: None,
             elapsed_ms: 100,
             cpus: vec![
                 CpuSnapshot {
@@ -648,6 +665,7 @@ fn thresholds_all_same_clocks_yields_inconclusive() {
         },
         MonitorSample {
             prog_stats: None,
+            psi_irq: None,
             elapsed_ms: 200,
             cpus: vec![
                 CpuSnapshot {
@@ -688,6 +706,7 @@ fn thresholds_dsq_over_plausibility_ceiling_yields_inconclusive() {
     let t = MonitorThresholds::default();
     let samples = vec![MonitorSample {
         prog_stats: None,
+        psi_irq: None,
         elapsed_ms: 100,
         cpus: vec![
             CpuSnapshot {
@@ -732,6 +751,7 @@ fn thresholds_single_cpu_single_sample_valid() {
     };
     let samples = vec![MonitorSample {
         prog_stats: None,
+        psi_irq: None,
         elapsed_ms: 100,
         cpus: vec![CpuSnapshot {
             nr_running: 1,

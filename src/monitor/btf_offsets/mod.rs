@@ -50,6 +50,12 @@ pub use cpu_time::SOFTIRQ_NAMES;
 // these, never bare literals.
 pub use cpu_time::{SOFTIRQ_NET_RX, SOFTIRQ_NET_TX, SOFTIRQ_SCHED, SOFTIRQ_TIMER};
 
+mod psi;
+// PSI-irq host-walk: offsets + decode for the global psi_system memory
+// walk. Consumers (the monitor sample loop) land alongside the walker; the
+// re-exports are kept here so the walker wires in without a follow-up `pub use`.
+pub use psi::{PsiGroupOffsets, decode_avg10_percent, decode_total_us};
+
 mod numa;
 // NUMA event capture is pending: the wire shape and BTF resolver
 // are landed but the live walker that consumes these constants
@@ -744,6 +750,48 @@ pub(crate) fn find_struct(btf: &Btf, name: &str) -> Result<(btf_rs::Struct, Stri
         Some((s, n, _)) => Ok((s, n)),
         None => bail!("btf: '{name}' exists but is not a struct"),
     }
+}
+
+/// Resolve a named enumerator's integer value from a BTF enum, or `None`
+/// when the enum type or the enumerator is absent from this BTF.
+///
+/// This is the config-gated loud-absent primitive: a `#[ifdef]`-gated
+/// enumerator (e.g. `PSI_IRQ_FULL` in `enum psi_states`, present only
+/// under `CONFIG_IRQ_TIME_ACCOUNTING`) is omitted from BTF when its
+/// config is off, so `None` distinguishes "this kernel doesn't have the
+/// feature" (→ a metric reads loud-absent) from "the field is present and
+/// measured a real value". The caller indexes a kernel array
+/// (`group->avg[PSI_IRQ_FULL]`, `group->total[..][PSI_IRQ_FULL]`) by the
+/// returned value rather than a bare literal, so an enum reorder on a
+/// future kernel is followed, not silently mis-indexed.
+///
+/// Handles both `BTF_KIND_ENUM` (`Type::Enum`, 32-bit values) and
+/// `BTF_KIND_ENUM64` (`Type::Enum64`, 64-bit), returning the value
+/// widened to `i64`. Mirrors [`find_struct`]'s `resolve_types_by_name`
+/// scan; member names resolve via [`Btf::resolve_name`] (both
+/// `EnumMember` and `Enum64Member` implement `BtfType`).
+pub(crate) fn enum_value(btf: &Btf, enum_name: &str, variant: &str) -> Option<i64> {
+    let types = btf.resolve_types_by_name(enum_name).ok()?;
+    for t in &types {
+        match t {
+            Type::Enum(e) => {
+                for m in &e.members {
+                    if btf.resolve_name(m).ok().as_deref() == Some(variant) {
+                        return Some(i64::from(m.val()));
+                    }
+                }
+            }
+            Type::Enum64(e) => {
+                for m in &e.members {
+                    if btf.resolve_name(m).ok().as_deref() == Some(variant) {
+                        return Some(m.val() as i64);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Outcome of [`find_struct_or_fwd`]: either a full struct definition

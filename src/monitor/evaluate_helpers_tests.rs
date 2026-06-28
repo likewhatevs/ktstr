@@ -37,6 +37,7 @@ fn track_imbalance_and_dsq_reports_worst_cpu_not_first() {
     // to cpu1.
     let samples = vec![MonitorSample {
         prog_stats: None,
+        psi_irq: None,
         elapsed_ms: 100,
         cpus: vec![
             CpuSnapshot {
@@ -77,11 +78,13 @@ fn track_imbalance_and_dsq_empty_cpus_records_non_violation() {
     let samples = vec![
         MonitorSample {
             prog_stats: None,
+            psi_irq: None,
             elapsed_ms: 100,
             cpus: vec![],
         },
         MonitorSample {
             prog_stats: None,
+            psi_irq: None,
             elapsed_ms: 200,
             cpus: vec![],
         },
@@ -106,6 +109,7 @@ fn track_stall_sizes_vec_to_max_cpu_count_across_samples() {
     };
     let s1 = MonitorSample {
         prog_stats: None,
+        psi_irq: None,
         elapsed_ms: 100,
         cpus: vec![CpuSnapshot {
             nr_running: 1,
@@ -116,6 +120,7 @@ fn track_stall_sizes_vec_to_max_cpu_count_across_samples() {
     // Second sample has 3 CPUs — the tracker vec must size to 3.
     let s2 = MonitorSample {
         prog_stats: None,
+        psi_irq: None,
         elapsed_ms: 200,
         cpus: vec![
             CpuSnapshot {
@@ -162,6 +167,7 @@ fn track_stall_respects_vcpu_preemption_threshold() {
     };
     let s1 = MonitorSample {
         prog_stats: None,
+        psi_irq: None,
         elapsed_ms: 100,
         cpus: vec![CpuSnapshot {
             nr_running: 1,
@@ -172,6 +178,7 @@ fn track_stall_respects_vcpu_preemption_threshold() {
     };
     let s2 = MonitorSample {
         prog_stats: None,
+        psi_irq: None,
         elapsed_ms: 200,
         cpus: vec![CpuSnapshot {
             nr_running: 1,
@@ -227,6 +234,7 @@ fn track_event_rates_zero_interval_does_not_panic() {
     // Two samples with identical elapsed_ms → 0-second interval.
     let make = |fb| MonitorSample {
         prog_stats: None,
+        psi_irq: None,
         elapsed_ms: 100,
         cpus: vec![CpuSnapshot {
             nr_running: 1,

@@ -18,6 +18,7 @@ fn sample_with_events(
 ) -> MonitorSample {
     MonitorSample {
         prog_stats: None,
+        psi_irq: None,
         elapsed_ms,
         cpus: vec![
             CpuSnapshot {
@@ -310,6 +311,7 @@ fn event_deltas_counter_reset_clamps_to_zero() {
 fn event_deltas_all_counters_computed() {
     let make = |elapsed_ms, fb, kl, dsq_off, exit, migdis| MonitorSample {
         prog_stats: None,
+        psi_irq: None,
         elapsed_ms,
         cpus: vec![CpuSnapshot {
             nr_running: 1,

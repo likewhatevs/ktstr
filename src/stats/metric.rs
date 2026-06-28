@@ -2168,6 +2168,40 @@ pub static METRICS: &[MetricDef] = &[
         accessor: |_| None,
     },
     MetricDef {
+        // System-wide PSI-irq `full` avg10: the mean over monitor samples of the
+        // decoded 10s-EWMA full IRQ pressure (percent, 0..=100), host-walked from
+        // the global `psi_system` (NOT a guest /proc read). Gauge(Avg) like
+        // `avg_irq_util` — an instantaneous smoothed gauge, never deltaed; the
+        // cross-run fold sample-weights it. LowerBetter (less IRQ pressure is
+        // better). ext-only (accessor |_| None), folded from MonitorSummary in
+        // group::sidecar_to_row. Loud-absent (None) when CONFIG_PSI /
+        // CONFIG_IRQ_TIME_ACCOUNTING is off (no PSI_IRQ_FULL in BTF), never 0.0.
+        name: "psi_irq_full_avg10",
+        polarity: crate::test_support::Polarity::LowerBetter,
+        kind: MetricKind::Gauge(GaugeAgg::Avg),
+        default_abs: 5.0,
+        default_rel: 0.30,
+        display_unit: "%",
+        accessor: |_| None,
+    },
+    MetricDef {
+        // Cumulative system-wide PSI-irq `full` stall over the monitoring window
+        // (µs): the end-start delta of `total[PSI_AVGS][PSI_IRQ_FULL]` (decoded
+        // ns→µs), host-walked from `psi_system`. Counter (a monotonic cumulative
+        // total, end-start deltaed; saturating on reset) like `total_irq_time_ns`,
+        // so the cross-run fold Σ-pools it. Informational: an absolute stall time
+        // is workload-confounded (longer run → more stall) — the avg10 gauge is
+        // the magnitude-normalized signal; mirrors the total_irq_time_ns split.
+        // ext-only, same loud-absent gate as `psi_irq_full_avg10`.
+        name: "total_irq_pressure_us",
+        polarity: crate::test_support::Polarity::Informational,
+        kind: MetricKind::Counter,
+        default_abs: 1000.0,
+        default_rel: 0.50,
+        display_unit: "µs",
+        accessor: |_| None,
+    },
+    MetricDef {
         // Mean schedstat run-delay, re-pooled as the mean over the COMBINED
         // run-delay sample set across every cgroup (and phase), RAW ns→µs
         // once — see `worst_p99_wake_latency_us`. Each sample is one per-WORKER

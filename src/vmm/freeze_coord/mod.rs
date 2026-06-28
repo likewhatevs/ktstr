@@ -10510,6 +10510,10 @@ impl KtstrVm {
         };
         let offsets = monitor::btf_offsets::KernelOffsets::from_btf(&btf);
         let prog_offsets = monitor::btf_offsets::BpfProgOffsets::from_btf(&btf).ok();
+        // System-wide PSI-irq host-walk offsets (psi_group total/avg + the
+        // PSI_IRQ_FULL index). `None` when CONFIG_IRQ_TIME_ACCOUNTING is off
+        // (PSI_IRQ_FULL absent from BTF) or psi_group is absent → loud-absent.
+        let psi_offsets = monitor::btf_offsets::PsiGroupOffsets::from_btf(&btf).ok();
         let symbols = monitor::symbols::KernelSymbols::from_elf(&elf);
 
         let (Ok(offsets), Ok(symbols)) = (offsets, symbols) else {
@@ -11244,6 +11248,25 @@ impl KtstrVm {
                     start_kernel_map: start_kernel_map_post_wait,
                     phys_base,
                     rq_refresh: Some(&rq_refresh),
+                    // Enable the system-wide PSI-irq host-walk only when BOTH
+                    // the psi_group offsets (config on) and the psi_system
+                    // symbol resolve; else the loop emits no psi_irq sample.
+                    // `psi_system` is a kernel-image `.data` global, so its PA
+                    // is text-mapped once here (`text_kva_to_pa_with_base`,
+                    // mirroring `jiffies_64_pa` / `scx_root_pa_for_reset`) — not
+                    // per-sample. `start_kernel_map_post_wait` / `phys_base` are
+                    // the same bases `MonitorConfig::start_kernel_map` /
+                    // `phys_base` carry below.
+                    psi: psi_offsets.zip(symbols.psi_system).map(|(offsets, kva)| {
+                        monitor::reader::PsiCaptureCfg {
+                            offsets,
+                            psi_system_pa: monitor::symbols::text_kva_to_pa_with_base(
+                                kva,
+                                start_kernel_map_post_wait,
+                                phys_base,
+                            ),
+                        }
+                    }),
                     watchdog_reset: watchdog_reset_cfg,
                 };
                 // `rq_pas` empty: the loop sources every per-CPU
