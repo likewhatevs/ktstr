@@ -481,6 +481,51 @@ fn compare_rows_by_phase_deltas_dual_gate_suppresses_subthreshold_regressions() 
     );
 }
 
+/// Per-phase mirror of the scalar zero-baseline fix: a phase metric
+/// rising from a ~zero baseline to a value over its absolute gate must
+/// set `is_regression`. Before the fix the per-phase `rel_delta` was
+/// forced to `0.0` on a ~zero baseline, which (AND-gated with the
+/// relative threshold) cleared `is_regression` for every `0 -> large`
+/// phase jump. The fix treats the appearance as an unbounded relative
+/// change (`+inf`), so the absolute gate alone decides; a both-~zero
+/// phase carries no signal and stays non-regression.
+#[test]
+fn compare_rows_by_phase_deltas_zero_baseline_jump_is_a_regression() {
+    let mut row_a = make_row("test_zphase", "tiny-1llc", true, 0.0);
+    let mut row_b = make_row("test_zphase", "tiny-1llc", true, 0.0);
+    // step 0: 0 -> 15 (over abs=10) — must flag. step 1: 0 -> 0 — no signal.
+    row_a.phases = vec![
+        make_phase_bucket(0, "BASELINE", &[("max_dsq_depth", 0.0)]),
+        make_phase_bucket(1, "Step[0]", &[("max_dsq_depth", 0.0)]),
+    ];
+    row_b.phases = vec![
+        make_phase_bucket(0, "BASELINE", &[("max_dsq_depth", 15.0)]),
+        make_phase_bucket(1, "Step[0]", &[("max_dsq_depth", 0.0)]),
+    ];
+    let report = compare_rows_by(&[row_a], &[row_b], &[], None, &ComparisonPolicy::default());
+    let baseline = report
+        .phase_deltas
+        .iter()
+        .find(|r| r.step_index == 0)
+        .expect("BASELINE delta present");
+    assert_eq!(baseline.delta, 15.0);
+    assert!(
+        baseline.is_regression,
+        "0 -> 15 (>= abs gate 10) from a zero baseline must set is_regression, \
+             not be vetoed by the zero-baseline relative gate"
+    );
+    let step1 = report
+        .phase_deltas
+        .iter()
+        .find(|r| r.step_index == 1)
+        .expect("Step[0] delta present");
+    assert_eq!(step1.delta, 0.0);
+    assert!(
+        !step1.is_regression,
+        "0 -> 0 carries no signal (rel_delta=0, |delta|=0 < abs gate) → not a regression"
+    );
+}
+
 // -- PhaseDisplayOptions::rel_threshold --
 
 /// `PhaseDisplayOptions::rel_threshold` returns the
@@ -702,14 +747,13 @@ fn passes_delta_threshold_inclusive_at_boundary() {
     );
 }
 
-/// `--phase-threshold 50` against `a = 0.0` divides by the
-/// `max(|a|, 1.0)` floor (NOT zero), so a delta of 10 yields
-/// rel = 10/1 = 10.0 (1000%) which passes the 0.5 gate. Pins
-/// the NaN-defense in the denominator: a future refactor that
-/// drops the `.max(1.0)` would divide by zero and either
-/// admit all rows (NaN >= X → false) or panic.
+/// `--phase-threshold 50` against a ~zero baseline `a = 0.0` with a
+/// non-negligible delta: the relative spread is treated as `+INFINITY`
+/// (a value from nothing is an unbounded relative change), so the row
+/// passes any finite gate. Pins that a `0 -> nonzero` phase delta is
+/// never suppressed by `--phase-threshold`.
 #[test]
-fn passes_delta_threshold_zero_a_divides_by_unit_floor() {
+fn passes_delta_threshold_zero_a_nonzero_delta_is_unbounded() {
     let opts = PhaseDisplayOptions {
         phase_threshold: Some(50.0),
         ..PhaseDisplayOptions::default()
@@ -730,30 +774,59 @@ fn passes_delta_threshold_zero_a_divides_by_unit_floor() {
     };
     assert!(
         opts.passes_delta_threshold(&zero_a),
-        "zero-a divisor floor (|a|.max(1.0)) must keep rel finite \
-             (rel = |10|/max(0,1) = 10.0); 10.0 ≥ 0.5 → row passes"
+        "zero-baseline nonzero delta → rel = +inf ≥ 0.5 → row passes",
     );
 }
 
-/// Distinguishing pin for the `.max(1.0)` divisor floor: the
-/// a=0/delta=10 case above passes both floored (10/1=10≥0.5) AND
-/// unfloored (10/0=+inf≥0.5), so it does NOT guard the floor. The
-/// floor actually protects a=0 AND delta=0 at --phase-threshold 0:
-/// floored gives 0/1=0, and 0≥0 → the row renders (the documented
-/// "PCT=0 shows every row" contract); unfloored gives 0/0=NaN, and
-/// NaN≥0 is false → the row is silently dropped. Drop `.max(1.0)`
-/// and this assertion flips to false.
+/// Distinguishing pin for the `+INFINITY`-on-zero-baseline treatment
+/// (vs the old `max(|a|, 1.0)` unit floor): a TINY-but-real value
+/// appearing from a ~zero baseline. Under the old floor, rel =
+/// `0.001 / max(0, 1) = 0.001`, below the 0.5 gate → SUPPRESSED. Under
+/// the fix the appearance is unbounded (`+inf ≥ 0.5`) → RENDERED. A
+/// value materializing from nothing is always shown under
+/// `--phase-threshold`; reverting to the unit floor flips this to false.
 #[test]
-fn passes_delta_threshold_zero_a_zero_delta_at_pct_zero_renders() {
+fn passes_delta_threshold_zero_a_tiny_delta_renders_unbounded() {
     let opts = PhaseDisplayOptions {
-        phase_threshold: Some(0.0),
+        phase_threshold: Some(50.0),
         ..PhaseDisplayOptions::default()
     };
     let metric = METRICS
         .iter()
         .find(|m| m.name == "max_dsq_depth")
         .expect("max_dsq_depth in METRICS");
-    let zero_a_zero_delta = PhaseDeltaRow {
+    let zero_a_tiny = PhaseDeltaRow {
+        pairing_key: PairingKey(vec!["t".into()]),
+        step_index: 0,
+        label: "BASELINE".into(),
+        metric,
+        a: 0.0,
+        b: 0.001,
+        delta: 0.001,
+        is_regression: true,
+    };
+    assert!(
+        opts.passes_delta_threshold(&zero_a_tiny),
+        "zero-baseline tiny (but > ZERO_MEAN_EPS) delta is an unbounded \
+             relative change → must render; the old max(1.0) floor wrongly \
+             suppressed it (0.001/1 = 0.001 < 0.5)",
+    );
+}
+
+/// Both sides ~zero (`|a|` AND `|delta|` below `ZERO_MEAN_EPS`) carry no
+/// signal: the relative spread is `0.0`, so any POSITIVE
+/// `--phase-threshold` filters the row. Pins the `else => 0.0` branch.
+#[test]
+fn passes_delta_threshold_both_zero_filtered_by_positive_threshold() {
+    let opts = PhaseDisplayOptions {
+        phase_threshold: Some(50.0),
+        ..PhaseDisplayOptions::default()
+    };
+    let metric = METRICS
+        .iter()
+        .find(|m| m.name == "max_dsq_depth")
+        .expect("max_dsq_depth in METRICS");
+    let both_zero = PhaseDeltaRow {
         pairing_key: PairingKey(vec!["t".into()]),
         step_index: 0,
         label: "BASELINE".into(),
@@ -764,10 +837,38 @@ fn passes_delta_threshold_zero_a_zero_delta_at_pct_zero_renders() {
         is_regression: false,
     };
     assert!(
-        opts.passes_delta_threshold(&zero_a_zero_delta),
-        "zero-a/zero-delta at --phase-threshold 0 must render: floored \
-             0/1=0, 0≥0 true. Dropping the .max(1.0) floor yields 0/0=NaN, \
-             NaN≥0 false, silently dropping the row",
+        !opts.passes_delta_threshold(&both_zero),
+        "both-~zero row has rel = 0.0 < 0.5 → filtered by a positive threshold",
+    );
+}
+
+/// `--phase-threshold 0` (PCT = 0) renders a both-~zero row: rel = 0.0
+/// and `0.0 >= 0.0` is true (the documented "PCT=0 shows every row"
+/// contract). Pins the `else => 0.0` branch against the PCT=0 boundary —
+/// the row is admitted by the inclusive `>=`, not by any divisor floor.
+#[test]
+fn passes_delta_threshold_both_zero_at_pct_zero_renders() {
+    let opts = PhaseDisplayOptions {
+        phase_threshold: Some(0.0),
+        ..PhaseDisplayOptions::default()
+    };
+    let metric = METRICS
+        .iter()
+        .find(|m| m.name == "max_dsq_depth")
+        .expect("max_dsq_depth in METRICS");
+    let both_zero = PhaseDeltaRow {
+        pairing_key: PairingKey(vec!["t".into()]),
+        step_index: 0,
+        label: "BASELINE".into(),
+        metric,
+        a: 0.0,
+        b: 0.0,
+        delta: 0.0,
+        is_regression: false,
+    };
+    assert!(
+        opts.passes_delta_threshold(&both_zero),
+        "both-~zero row at --phase-threshold 0 renders: rel = 0.0, 0.0 >= 0.0",
     );
 }
 

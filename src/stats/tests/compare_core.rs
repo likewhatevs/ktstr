@@ -55,6 +55,118 @@ fn compare_rows_dual_gate_both_must_trigger() {
     assert_eq!(res2.unchanged, 1);
 }
 
+/// A metric jumping from a ~zero baseline to a value ABOVE its absolute
+/// gate must surface as a regression — not be hidden as "unchanged".
+/// Before the fix the relative delta was forced to `0.0` whenever the
+/// baseline was ~zero (a divide-by-zero dodge), which always failed the
+/// AND-gated relative threshold and silently classified every `0 ->
+/// large` jump as unchanged. The fix treats a value appearing from a
+/// ~zero baseline as an unbounded relative change (`rel_delta = +inf`),
+/// so the absolute gate alone decides.
+#[test]
+fn compare_rows_zero_baseline_jump_above_abs_gate_is_a_regression() {
+    // worst_spread: LowerBetter (higher_is_worse), default_abs = 5.0.
+    // 0.0 -> 10.0: delta 10.0 >= 5.0 clears the absolute gate; the
+    // ~zero baseline must NOT let the relative gate veto it.
+    let rows_a = vec![cmp_row("zbase", "tiny-1llc", true, 0.0, 0)];
+    let rows_b = vec![cmp_row("zbase", "tiny-1llc", true, 10.0, 0)];
+    let res = compare_rows_by(
+        &rows_a,
+        &rows_b,
+        LEGACY_PAIRING_DIMS,
+        None,
+        &ComparisonPolicy::default(),
+    );
+    assert_eq!(
+        res.regressions, 1,
+        "0 -> 10 worst_spread (>= abs gate 5.0) must be a regression, not \
+         hidden as unchanged by the zero-baseline relative veto",
+    );
+    assert_eq!(res.improvements, 0);
+    assert_eq!(res.unchanged, 0, "the jump must not be counted unchanged");
+    assert!(
+        res.findings.iter().any(|f| f.metric.name == "worst_spread"
+            && f.kind == FindingKind::Regression),
+        "a worst_spread Regression finding must be emitted; got {:?}",
+        res.findings
+            .iter()
+            .map(|f| (f.metric.name, f.delta))
+            .collect::<Vec<_>>(),
+    );
+}
+
+/// Contrast: a ~zero-baseline jump BELOW the absolute gate stays
+/// unchanged. The absolute gate is the deciding gate from a zero
+/// baseline (the relative gate is satisfied by the `+inf` treatment); a
+/// sub-`default_abs` new value is noise, not a regression. Together with
+/// the sibling above-gate test this pins that the zero-baseline fix
+/// reduces the dual gate to "the absolute gate alone decides" — it does
+/// not flag every nonzero appearance.
+#[test]
+fn compare_rows_zero_baseline_jump_below_abs_gate_is_unchanged() {
+    // worst_spread default_abs = 5.0; 0.0 -> 3.0 is below it.
+    let rows_a = vec![cmp_row("zbase_small", "tiny-1llc", true, 0.0, 0)];
+    let rows_b = vec![cmp_row("zbase_small", "tiny-1llc", true, 3.0, 0)];
+    let res = compare_rows_by(
+        &rows_a,
+        &rows_b,
+        LEGACY_PAIRING_DIMS,
+        None,
+        &ComparisonPolicy::default(),
+    );
+    assert_eq!(
+        res.regressions, 0,
+        "0 -> 3 worst_spread (< abs gate 5.0) must stay unchanged",
+    );
+    assert_eq!(res.improvements, 0);
+    assert!(
+        res.findings.iter().all(|f| f.metric.name != "worst_spread"),
+        "no worst_spread finding for a sub-abs-gate zero-baseline jump; got {:?}",
+        res.findings
+            .iter()
+            .map(|f| (f.metric.name, f.delta))
+            .collect::<Vec<_>>(),
+    );
+}
+
+/// Improvement direction of the zero-baseline fix: a HigherBetter metric
+/// rising from a ~zero baseline to a value above its absolute gate is an
+/// IMPROVEMENT, not "unchanged". The prior bug forced `rel_delta` to 0.0
+/// on a ~zero baseline, hiding zero-baseline jumps in BOTH directions;
+/// the sibling tests pin the regression direction, this pins the
+/// improvement direction so a future change that re-vetoed only the
+/// improvement path would be caught.
+#[test]
+fn compare_rows_zero_baseline_jump_above_abs_gate_is_an_improvement() {
+    // total_iterations: HigherBetter, Counter, default_abs = 100.0 (the only
+    // metric reading r.total_iterations). 0 -> 1000: delta +1000 >= 100
+    // clears the absolute gate; HigherBetter + delta > 0 => improvement.
+    let rows_a = vec![cmp_row("zbase_imp", "tiny-1llc", true, 0.0, 0)];
+    let rows_b = vec![cmp_row("zbase_imp", "tiny-1llc", true, 0.0, 1000)];
+    let res = compare_rows_by(
+        &rows_a,
+        &rows_b,
+        LEGACY_PAIRING_DIMS,
+        None,
+        &ComparisonPolicy::default(),
+    );
+    assert_eq!(
+        res.improvements, 1,
+        "0 -> 1000 total_iterations (>= abs gate 100, HigherBetter) must be \
+         an improvement, not hidden as unchanged",
+    );
+    assert_eq!(res.regressions, 0);
+    assert!(
+        res.findings.iter().any(|f| f.metric.name == "total_iterations"
+            && f.kind == FindingKind::Improvement),
+        "a total_iterations Improvement finding must be emitted; got {:?}",
+        res.findings
+            .iter()
+            .map(|f| (f.metric.name, f.delta))
+            .collect::<Vec<_>>(),
+    );
+}
+
 /// compare must NOT flag a sub-integer `stuck_count` difference as a
 /// regression. A-side cross-run mean 1.4 vs B-side 1.6 (true delta
 /// 0.2, well under `default_abs` = 1.0) classifies UNCHANGED. Before
@@ -537,7 +649,7 @@ fn wake_latency_tail_ratio_compares_via_ext_metrics() {
 
     // Absent ext key (the producer's sub-threshold / no-tail output): both
     // sides read None, both collapse to 0.0 via unwrap_or(0.0), and the
-    // EPSILON guard classifies the delta as unchanged.
+    // both-near-zero ZERO_MEAN_EPS guard skips the delta (no finding).
     let low_a = make_row("tail_low", "tiny-1llc", true, 0.0);
     let low_b = make_row("tail_low", "tiny-1llc", true, 0.0);
     assert!(
@@ -589,7 +701,8 @@ fn wake_latency_tail_ratio_compares_via_ext_metrics() {
 /// Explicit None-branch pin on the `compare_rows` ext-fallback contract.
 ///
 /// `compare_rows` calls `m.read(row)` for every metric and falls through
-/// `unwrap_or(0.0)` to the EPSILON-guard when the read is `None`. Since
+/// `unwrap_or(0.0)` to the both-near-zero `ZERO_MEAN_EPS` skip when the
+/// read is `None`. Since
 /// `worst_wake_latency_tail_ratio` is now ext-sourced with a `|_| None`
 /// accessor, an ABSENT ext key (the producer's sub-threshold output) is the
 /// None condition. The sibling `wake_latency_tail_ratio_compares_via_ext_metrics`
@@ -625,8 +738,9 @@ fn compare_rows_handles_none_from_absent_ext_key_as_zero() {
     // The call must not panic (a regression that dropped the
     // `unwrap_or` would trip here), and the result must
     // classify the pair as unchanged — both sides collapse to
-    // 0.0 via unwrap_or, then the `abs() < EPSILON` guard
-    // short-circuits without producing a finding.
+    // 0.0 via unwrap_or, then the both-near-zero
+    // `abs() < ZERO_MEAN_EPS` guard short-circuits without
+    // producing a finding.
     let report = compare_rows_by(
         std::slice::from_ref(&row_a),
         std::slice::from_ref(&row_b),

@@ -343,9 +343,10 @@ pub(crate) enum KtstrCommand {
         )]
         phase: Option<u16>,
         /// Per-row relative-delta gate for the per-phase tables:
-        /// suppress paired rows whose `|delta| / max(|a|, 1.0) < PCT /
-        /// 100.0`. Independent from `--threshold`. Mutually exclusive
-        /// with `--no-phases`.
+        /// suppress paired rows whose `|delta| / |a| < PCT / 100.0`
+        /// (a value from a ~zero baseline is an unbounded relative
+        /// change and is always shown). Independent from `--threshold`.
+        /// Mutually exclusive with `--no-phases`.
         #[arg(
             long = "phase-threshold",
             help_heading = "Phase rendering",
@@ -1332,8 +1333,9 @@ pub(crate) enum StatsCommand {
         phase: Option<u16>,
 
         /// Per-row relative-delta gate for the per-phase tables.
-        /// Suppresses paired rows whose
-        /// `|delta| / max(|a|, 1.0) < PCT / 100.0`.
+        /// Suppresses paired rows whose `|delta| / |a| < PCT / 100.0`
+        /// (a value from a ~zero baseline is an unbounded relative
+        /// change and is always shown).
         ///
         /// `0` shows every paired row; positive values widen
         /// the gate to suppress small deltas. ABSENCE shows

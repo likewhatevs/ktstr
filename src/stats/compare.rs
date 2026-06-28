@@ -139,9 +139,10 @@ pub(crate) struct PhaseDeltaRow {
     pub a: f64,
     /// B-side phase-aggregated value.
     pub b: f64,
-    /// `b - a` for higher-is-worse metrics, `a - b` for
-    /// lower-is-worse; matches the scalar [`Finding::delta`]
-    /// polarity convention.
+    /// `val_b - val_a` (B minus A) — the same plain difference the
+    /// scalar [`Finding::delta`] carries. Polarity is NOT folded into
+    /// the sign here; it is applied separately when computing
+    /// `is_regression` (below) via the metric's `higher_is_worse()`.
     pub delta: f64,
     /// `true` when the delta exceeds the dual-gate threshold in
     /// the regression direction (per metric polarity). A `bool` —
@@ -280,7 +281,9 @@ pub struct PhaseDisplayOptions {
     pub phase: Option<u16>,
     /// `--phase-threshold <PCT>`: render-side relative-delta
     /// gate for the per-phase pass. Suppresses paired rows
-    /// where `|delta| / max(|a|, 1.0) < PCT / 100.0`. `0.0`
+    /// where `|delta| / |a| < PCT / 100.0`; a value from a
+    /// ~zero baseline (`|a| < ZERO_MEAN_EPS`) is an unbounded
+    /// relative change and clears any finite threshold. `0.0`
     /// shows every paired row; absence falls through to the
     /// registry's per-metric `default_rel`. Independent from
     /// the scalar `--threshold` — the two passes have separate
@@ -333,14 +336,23 @@ impl PhaseDisplayOptions {
 
     /// True when a [`PhaseDeltaRow`] passes the
     /// `--phase-threshold` relative-significance gate. Computes
-    /// `|delta| / max(|a|, 1.0) >= phase_threshold / 100.0` —
-    /// the `max(|a|, 1.0)` denominator floor prevents NaN from
-    /// `a == 0.0` (the row that pairs a zero against any
-    /// non-zero produces a delta of finite magnitude that
-    /// should not divide by zero). Returns `true` when no
-    /// flag is set (default path: every row passes; per the
-    /// `--phase-threshold` clap doc — absence keeps every
-    /// paired row in the rendered output).
+    /// `|delta| / |a| >= phase_threshold / 100.0` when the baseline
+    /// `a` is non-negligible. A value appearing from a ~zero
+    /// baseline (`|a| < ZERO_MEAN_EPS` with `|delta|` above the same
+    /// floor) is an unbounded relative change — its relative spread
+    /// is treated as `+INFINITY`, so it clears any finite threshold
+    /// rather than dividing by zero. A row whose `|a|` AND `|delta|`
+    /// are both below the floor carries no signal and is filtered by
+    /// any positive threshold. Returns `true` when no flag is set
+    /// (default path: every row passes; per the `--phase-threshold`
+    /// clap doc — absence keeps every paired row in the rendered
+    /// output).
+    ///
+    /// `ZERO_MEAN_EPS` is the domain zero epsilon the dual-gate
+    /// (`push_scalar_findings` / `push_phase_deltas`) and the noise
+    /// verdict skip also use, so "is this baseline zero" is one
+    /// consistent test across the comparator — not `f64::EPSILON`,
+    /// the machine ulp near 1.0.
     ///
     /// `pub(crate)` rather than `pub` because [`PhaseDeltaRow`]
     /// is `pub(crate)` — the row type is an internal renderer
@@ -351,8 +363,16 @@ impl PhaseDisplayOptions {
         let Some(pct) = self.phase_threshold else {
             return true;
         };
-        let denom = delta.a.abs().max(1.0);
-        let rel = delta.delta.abs() / denom;
+        let rel = if delta.a.abs() > ZERO_MEAN_EPS {
+            delta.delta.abs() / delta.a.abs()
+        } else if delta.delta.abs() > ZERO_MEAN_EPS {
+            // A value from a ~zero baseline is an unbounded relative
+            // change — above any finite --phase-threshold.
+            f64::INFINITY
+        } else {
+            // No signal on either side: filtered by any positive threshold.
+            0.0
+        };
         rel >= pct / 100.0
     }
 }
@@ -681,17 +701,24 @@ fn push_scalar_findings(
         }
         let val_a = m.read(row_a).unwrap_or(0.0);
         let val_b = m.read(row_b).unwrap_or(0.0);
-        if val_a.abs() < f64::EPSILON && val_b.abs() < f64::EPSILON {
+        // Both sides negligible (under ZERO_MEAN_EPS, the domain zero epsilon —
+        // not f64::EPSILON, the machine ulp near 1.0): no signal, skip without
+        // counting.
+        if val_a.abs() < ZERO_MEAN_EPS && val_b.abs() < ZERO_MEAN_EPS {
             continue;
         }
 
         let rel_thresh = rel_thresholds[i];
 
         let delta = val_b - val_a;
-        let rel_delta = if val_a.abs() > f64::EPSILON {
+        let rel_delta = if val_a.abs() > ZERO_MEAN_EPS {
             (delta / val_a).abs()
         } else {
-            0.0
+            // A non-negligible value (val_b — the both-zero case is skipped
+            // above) appearing from a ~zero baseline is an unbounded relative
+            // change, not "unchanged". INFINITY clears the rel gate so the
+            // absolute gate alone decides whether this delta is significant.
+            f64::INFINITY
         };
 
         if delta.abs() < m.default_abs || rel_delta < rel_thresh {
@@ -825,8 +852,18 @@ fn push_phase_deltas(
                         let delta = val_b - val_a;
                         let rel_thresh =
                             policy.rel_threshold(metric_def.name, metric_def.default_rel);
-                        let rel_delta = if val_a.abs() > f64::EPSILON {
+                        // Same zero discipline as the scalar dual-gate: a value
+                        // from a ~zero baseline is an unbounded relative change
+                        // (INFINITY clears the rel gate, leaving the absolute
+                        // gate to decide); both sides ~zero is no signal (rel 0,
+                        // and |delta| ~0 also fails the absolute gate).
+                        // ZERO_MEAN_EPS is the domain zero epsilon, matching the
+                        // scalar path and the noise verdict skip — not
+                        // f64::EPSILON, the machine ulp near 1.0.
+                        let rel_delta = if val_a.abs() > ZERO_MEAN_EPS {
                             (delta / val_a).abs()
+                        } else if delta.abs() > ZERO_MEAN_EPS {
+                            f64::INFINITY
                         } else {
                             0.0
                         };
@@ -1942,7 +1979,8 @@ fn print_scalar_findings_table(report: &CompareReport, label_a: &str, label_b: &
 /// - `--phase <N>` keeps only the named step_index
 /// - `--steps-only` suppresses BASELINE (step_index == 0)
 /// - `--phase-threshold <PCT>` filters paired rows whose
-///   `|delta| / max(|a|, 1.0)` is below `PCT / 100.0`
+///   `|delta| / |a|` is below `PCT / 100.0` (a value from a
+///   ~zero baseline is an unbounded relative change → shown)
 ///
 /// Filtering is render-time projection — the underlying
 /// CompareReport.phase_deltas / unpaired_phases vecs hold
