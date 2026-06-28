@@ -666,17 +666,22 @@ pub struct SchedDomainStats {
     /// `sd->lb_balanced[CPU_MAX_IDLE_TYPES]`: load balance calls that
     /// found no imbalance.
     pub lb_balanced: [u32; btf_offsets::CPU_MAX_IDLE_TYPES],
-    /// `sd->lb_imbalance_load[CPU_MAX_IDLE_TYPES]`: times imbalance was
-    /// load-based.
+    /// `sd->lb_imbalance_load[CPU_MAX_IDLE_TYPES]`: cumulative LOAD-based
+    /// imbalance MAGNITUDE (capacity-scaled load), summed via
+    /// `schedstat_add(env->imbalance)` over `migrate_load` balance attempts —
+    /// an accumulated magnitude, NOT a count of attempts.
     pub lb_imbalance_load: [u32; btf_offsets::CPU_MAX_IDLE_TYPES],
-    /// `sd->lb_imbalance_util[CPU_MAX_IDLE_TYPES]`: times imbalance was
-    /// utilization-based.
+    /// `sd->lb_imbalance_util[CPU_MAX_IDLE_TYPES]`: cumulative UTILIZATION-based
+    /// imbalance MAGNITUDE (PELT util), summed via `schedstat_add` over
+    /// `migrate_util` attempts — accumulated magnitude, not a count.
     pub lb_imbalance_util: [u32; btf_offsets::CPU_MAX_IDLE_TYPES],
-    /// `sd->lb_imbalance_task[CPU_MAX_IDLE_TYPES]`: times imbalance was
-    /// task-count-based.
+    /// `sd->lb_imbalance_task[CPU_MAX_IDLE_TYPES]`: cumulative TASK-COUNT
+    /// imbalance, summed via `schedstat_add` over `migrate_task` attempts —
+    /// accumulated task-count delta, not a count of attempts.
     pub lb_imbalance_task: [u32; btf_offsets::CPU_MAX_IDLE_TYPES],
-    /// `sd->lb_imbalance_misfit[CPU_MAX_IDLE_TYPES]`: times imbalance was
-    /// due to misfit task.
+    /// `sd->lb_imbalance_misfit[CPU_MAX_IDLE_TYPES]`: cumulative MISFIT
+    /// imbalance, summed via `schedstat_add` over `migrate_misfit` attempts
+    /// (1 per misfit migration) — accumulated magnitude, not a count.
     pub lb_imbalance_misfit: [u32; btf_offsets::CPU_MAX_IDLE_TYPES],
     /// `sd->lb_gained[CPU_MAX_IDLE_TYPES]`: tasks pulled during load balance.
     pub lb_gained: [u32; btf_offsets::CPU_MAX_IDLE_TYPES],
@@ -803,6 +808,12 @@ pub struct MonitorSummary {
     /// None when CONFIG_SCHEDSTATS is not enabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schedstat_deltas: Option<SchedstatDeltas>,
+    /// Per-domain-level CFS load-balance counter deltas over the monitoring
+    /// window, summed across CPUs by domain level name. None when no sample
+    /// carried sched_domains data (CONFIG_SCHEDSTATS off, or a pre-domain-
+    /// capture kernel). See [`SchedDomainLbDelta`] for the scx-marginal caveat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sched_domain_lb: Option<Vec<SchedDomainLbDelta>>,
     /// Per-program BPF callback profile over the monitoring window.
     /// None when no struct_ops programs are loaded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -846,6 +857,56 @@ pub struct SchedstatDeltas {
     pub total_ttwu_count: u64,
     /// Total ttwu_local count increase across all CPUs.
     pub total_ttwu_local: u64,
+}
+
+/// Per-domain-level CFS load-balance counter deltas over the monitoring window.
+///
+/// `struct sched_domain` is per-CPU (the kernel allocates one per CPU per
+/// topology level — kernel/sched/topology.c `__sdt_alloc`), so each counter
+/// here is SUMMED across every CPU's domain at the given level: the total CFS
+/// load-balance activity at that level, analogous to the per-CPU rq schedstat
+/// sum. Levels are keyed by NAME (SMT/CLS/MC/PKG/NUMA), not the CPU-relative
+/// domain index. Each value is the first→last delta over the window; the
+/// per-idle-type arrays (CPU_NOT_IDLE/CPU_IDLE/CPU_NEWLY_IDLE) are summed
+/// across all three.
+///
+/// All fields are monotonic counters. NOTE (scx-marginal): under a switch-all
+/// sched_ext scheduler the fair runqueues are near-empty, so `lb_count` keeps
+/// ticking while the move counters (`lb_gained` / `lb_imbalance_*` / `alb_pushed`)
+/// stay ~0 — these observe CFS-class balancing, not the scx scheduler's own
+/// (BPF) placement. Useful on stock-CFS scenarios and residual fair-class tasks.
+///
+/// The four `lb_imbalance_*` accumulators are kept SEPARATE (not summed into
+/// one) because the kernel routes `env->imbalance` into them by migration type
+/// and each carries a different, incommensurable unit — capacity-scaled load /
+/// PELT utilization / task count / misfit. Summing them would be dimensionally
+/// meaningless (dominated by the load/util magnitudes, with task/misfit lost),
+/// so a delta on a combined value would have no consistent interpretation.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct SchedDomainLbDelta {
+    /// Domain level name (`sd->name`): SMT / CLS / MC / PKG / NUMA.
+    pub level: String,
+    /// `sd->lb_count` summed over idle types + CPUs: load-balance attempts.
+    pub lb_count: u64,
+    /// `sd->lb_failed` summed: attempts that found imbalance but moved no task
+    /// (balance friction; higher is worse).
+    pub lb_failed: u64,
+    /// `sd->lb_gained` summed: tasks pulled during load balance.
+    pub lb_gained: u64,
+    /// `sd->lb_imbalance_load` summed (idle types + CPUs): cumulative
+    /// capacity-scaled LOAD imbalance magnitude. Same-unit accumulator — see
+    /// the struct doc for why the four variants are not summed together.
+    pub lb_imbalance_load: u64,
+    /// `sd->lb_imbalance_util` summed: cumulative PELT-UTILIZATION imbalance.
+    pub lb_imbalance_util: u64,
+    /// `sd->lb_imbalance_task` summed: cumulative TASK-COUNT imbalance.
+    pub lb_imbalance_task: u64,
+    /// `sd->lb_imbalance_misfit` summed: cumulative MISFIT imbalance.
+    pub lb_imbalance_misfit: u64,
+    /// `sd->alb_count` summed: active-load-balance (migration-thread) attempts.
+    pub alb_count: u64,
+    /// `sd->alb_pushed` summed: tasks pushed via active load balancing.
+    pub alb_pushed: u64,
 }
 
 /// Aggregate event counter statistics computed from first/last samples.
@@ -924,6 +985,38 @@ impl MonitorSummary {
         }
         if let Some(v) = self.total_irq_pressure_us {
             ext.entry("total_irq_pressure_us".to_string()).or_insert(v);
+        }
+        // Per-domain-level CFS load-balance counters: one key set per topology
+        // level present in the run, level-suffixed (e.g. lb_failed_mc). These
+        // are Dynamic ext keys — the level set is host-topology-dependent
+        // (SMT/CLS/MC/PKG/NUMA), so a fixed typed-metric enum would be
+        // incomplete; absent levels emit nothing. All Counter-kind. See
+        // [`SchedDomainLbDelta`] for the scx-marginal caveat.
+        if let Some(domains) = &self.sched_domain_lb {
+            for d in domains {
+                let lvl = d.level.to_ascii_lowercase();
+                ext.entry(format!("lb_count_{lvl}"))
+                    .or_insert(d.lb_count as f64);
+                ext.entry(format!("lb_failed_{lvl}"))
+                    .or_insert(d.lb_failed as f64);
+                ext.entry(format!("lb_gained_{lvl}"))
+                    .or_insert(d.lb_gained as f64);
+                // The four imbalance accumulators are exposed separately — each
+                // is a distinct unit (load / util / task / misfit); a summed
+                // value would be dimensionally meaningless.
+                ext.entry(format!("lb_imbalance_load_{lvl}"))
+                    .or_insert(d.lb_imbalance_load as f64);
+                ext.entry(format!("lb_imbalance_util_{lvl}"))
+                    .or_insert(d.lb_imbalance_util as f64);
+                ext.entry(format!("lb_imbalance_task_{lvl}"))
+                    .or_insert(d.lb_imbalance_task as f64);
+                ext.entry(format!("lb_imbalance_misfit_{lvl}"))
+                    .or_insert(d.lb_imbalance_misfit as f64);
+                ext.entry(format!("alb_count_{lvl}"))
+                    .or_insert(d.alb_count as f64);
+                ext.entry(format!("alb_pushed_{lvl}"))
+                    .or_insert(d.alb_pushed as f64);
+            }
         }
     }
 
@@ -1064,6 +1157,7 @@ impl MonitorSummary {
 
         let event_deltas = Self::compute_event_deltas(samples);
         let schedstat_deltas = Self::compute_schedstat_deltas(samples);
+        let sched_domain_lb = Self::compute_sched_domain_deltas(samples);
         let prog_stats_deltas = Self::compute_prog_stats_deltas(samples);
 
         Self {
@@ -1080,6 +1174,7 @@ impl MonitorSummary {
             total_irq_pressure_us,
             event_deltas,
             schedstat_deltas,
+            sched_domain_lb,
             prog_stats_deltas,
         }
     }
@@ -1217,6 +1312,104 @@ impl MonitorSummary {
             total_ttwu_count,
             total_ttwu_local,
         })
+    }
+
+    /// Compute per-domain-level load-balance counter deltas from the sample
+    /// series. Returns None if no sample carries sched_domains data.
+    ///
+    /// `struct sched_domain` is per-CPU, so the counters for a given level
+    /// NAME are summed across every CPU's domain at that level (the total
+    /// balancing activity at the level), keyed by name because the domain
+    /// INDEX is CPU-relative and not stable across CPUs. The per-idle-type
+    /// arrays are summed across all three idle types. Only domains whose
+    /// CONFIG_SCHEDSTATS `stats` block is present contribute.
+    fn compute_sched_domain_deltas(samples: &[MonitorSample]) -> Option<Vec<SchedDomainLbDelta>> {
+        let has_domains = |s: &MonitorSample| {
+            s.cpus.iter().any(|c| {
+                c.sched_domains
+                    .as_ref()
+                    .is_some_and(|ds| ds.iter().any(|d| d.stats.is_some()))
+            })
+        };
+        let first = samples.iter().find(|s| has_domains(s))?;
+        let last = samples.iter().rev().find(|s| has_domains(s))?;
+
+        // Sum the curated counters per level NAME across all CPUs' domains in
+        // one sample.
+        fn per_level(
+            sample: &MonitorSample,
+        ) -> std::collections::BTreeMap<String, SchedDomainLbDelta> {
+            let sum3 = |a: &[u32; btf_offsets::CPU_MAX_IDLE_TYPES]| -> u64 {
+                a.iter().map(|&v| v as u64).sum()
+            };
+            let mut acc: std::collections::BTreeMap<String, SchedDomainLbDelta> =
+                std::collections::BTreeMap::new();
+            for cpu in &sample.cpus {
+                let Some(domains) = cpu.sched_domains.as_ref() else {
+                    continue;
+                };
+                for d in domains {
+                    let Some(st) = d.stats.as_ref() else {
+                        continue;
+                    };
+                    let e = acc.entry(d.name.clone()).or_insert_with(|| SchedDomainLbDelta {
+                        level: d.name.clone(),
+                        ..SchedDomainLbDelta::default()
+                    });
+                    e.lb_count += sum3(&st.lb_count);
+                    e.lb_failed += sum3(&st.lb_failed);
+                    e.lb_gained += sum3(&st.lb_gained);
+                    // The four imbalance accumulators stay separate — each is a
+                    // different unit (load / util / task / misfit); summing them
+                    // would be dimensionally meaningless.
+                    e.lb_imbalance_load += sum3(&st.lb_imbalance_load);
+                    e.lb_imbalance_util += sum3(&st.lb_imbalance_util);
+                    e.lb_imbalance_task += sum3(&st.lb_imbalance_task);
+                    e.lb_imbalance_misfit += sum3(&st.lb_imbalance_misfit);
+                    e.alb_count += st.alb_count as u64;
+                    e.alb_pushed += st.alb_pushed as u64;
+                }
+            }
+            acc
+        }
+
+        let first_lv = per_level(first);
+        let last_lv = per_level(last);
+        if last_lv.is_empty() {
+            return None;
+        }
+
+        // first→last delta per level. Topology is static so a level in `last`
+        // is normally in `first` too; a missing baseline is treated as 0.
+        // saturating_sub guards a counter reset / first-absent.
+        let out: Vec<SchedDomainLbDelta> = last_lv
+            .into_iter()
+            .map(|(name, last_v)| {
+                let f = first_lv.get(&name);
+                let base = |sel: fn(&SchedDomainLbDelta) -> u64| f.map(sel).unwrap_or(0);
+                SchedDomainLbDelta {
+                    lb_count: last_v.lb_count.saturating_sub(base(|d| d.lb_count)),
+                    lb_failed: last_v.lb_failed.saturating_sub(base(|d| d.lb_failed)),
+                    lb_gained: last_v.lb_gained.saturating_sub(base(|d| d.lb_gained)),
+                    lb_imbalance_load: last_v
+                        .lb_imbalance_load
+                        .saturating_sub(base(|d| d.lb_imbalance_load)),
+                    lb_imbalance_util: last_v
+                        .lb_imbalance_util
+                        .saturating_sub(base(|d| d.lb_imbalance_util)),
+                    lb_imbalance_task: last_v
+                        .lb_imbalance_task
+                        .saturating_sub(base(|d| d.lb_imbalance_task)),
+                    lb_imbalance_misfit: last_v
+                        .lb_imbalance_misfit
+                        .saturating_sub(base(|d| d.lb_imbalance_misfit)),
+                    alb_count: last_v.alb_count.saturating_sub(base(|d| d.alb_count)),
+                    alb_pushed: last_v.alb_pushed.saturating_sub(base(|d| d.alb_pushed)),
+                    level: name,
+                }
+            })
+            .collect();
+        Some(out)
     }
 
     /// Compute per-program callback profile from first/last samples

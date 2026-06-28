@@ -847,3 +847,55 @@ fn fold_run_level_ext_folds_the_five_monitor_metrics() {
     s.fold_run_level_ext(&mut ext4);
     assert_eq!(ext4.get("avg_nr_running"), Some(&1.0), "pre-set value wins");
 }
+
+#[test]
+fn fold_run_level_ext_folds_per_domain_lb_keys() {
+    use std::collections::BTreeMap;
+    let s = MonitorSummary {
+        total_samples: 3,
+        sched_domain_lb: Some(vec![SchedDomainLbDelta {
+            level: "MC".into(),
+            lb_count: 20,
+            lb_failed: 6,
+            lb_gained: 12,
+            lb_imbalance_load: 100,
+            lb_imbalance_util: 200,
+            lb_imbalance_task: 3,
+            lb_imbalance_misfit: 0,
+            alb_count: 1,
+            alb_pushed: 2,
+        }]),
+        ..Default::default()
+    };
+    let mut ext = BTreeMap::new();
+    s.fold_run_level_ext(&mut ext);
+    // Level-suffixed (lowercased), one key per curated counter. The four
+    // imbalance accumulators are emitted as separate same-unit keys.
+    assert_eq!(ext.get("lb_count_mc"), Some(&20.0));
+    assert_eq!(ext.get("lb_failed_mc"), Some(&6.0));
+    assert_eq!(ext.get("lb_gained_mc"), Some(&12.0));
+    assert_eq!(ext.get("lb_imbalance_load_mc"), Some(&100.0));
+    assert_eq!(ext.get("lb_imbalance_util_mc"), Some(&200.0));
+    assert_eq!(ext.get("lb_imbalance_task_mc"), Some(&3.0));
+    assert_eq!(
+        ext.get("lb_imbalance_misfit_mc"),
+        Some(&0.0),
+        "a present level's zero counter is a measured 0, emitted (not absent)"
+    );
+    assert_eq!(ext.get("alb_count_mc"), Some(&1.0));
+    assert_eq!(ext.get("alb_pushed_mc"), Some(&2.0));
+
+    // None sched_domain_lb → NO per-domain keys (level-granularity absence:
+    // a level not in the run's topology emits nothing, distinct from a
+    // present level's measured zero above).
+    let empty = MonitorSummary {
+        total_samples: 3,
+        ..Default::default()
+    };
+    let mut ext2 = BTreeMap::new();
+    empty.fold_run_level_ext(&mut ext2);
+    assert!(
+        !ext2.keys().any(|k| k.starts_with("lb_") || k.starts_with("alb_")),
+        "no per-domain keys when sched_domain_lb is None"
+    );
+}
