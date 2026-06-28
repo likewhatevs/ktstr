@@ -869,6 +869,39 @@ fn group_and_average_schedstat_rates_pool_sigma_over_sigma() {
     );
 }
 
+/// `sched_goidle_fraction` = Σsched_goidle / Σsched_count — the load-normalized
+/// go-idle rate added for --noise-adjust spread. Derives per-run from the raw
+/// counter ext keys, and pools Σ/Σ across runs (the `MetricKind::Rate` fold),
+/// NOT a mean of per-run ratios.
+#[test]
+fn sched_goidle_fraction_derives_and_pools_sigma_over_sigma() {
+    let mk = |goidle: f64, count: f64| {
+        let mut r = make_row("t", "tiny-1llc", true, 0.0);
+        r.ext_metrics.insert("total_sched_goidle".into(), goidle);
+        r.ext_metrics.insert("total_sched_count".into(), count);
+        r
+    };
+    // Single run: 30 goidle / 100 schedules = 0.30.
+    let one = group_and_average_by(&[mk(30.0, 100.0)], LEGACY_PAIRING_DIMS);
+    let frac = metric_def("sched_goidle_fraction")
+        .unwrap()
+        .read(&one[0].row)
+        .expect("rate derived");
+    assert!((frac - 0.30).abs() < 1e-9, "30/100 = 0.30, got {frac}");
+
+    // Two runs with different per-run ratios → pooled Σ/Σ, not mean-of-ratios.
+    // A: 1/1 = 1.0; B: 1/99 ≈ 0.0101; mean-of-ratios ≈ 0.505; pooled = 2/100 = 0.02.
+    let out = group_and_average_by(&[mk(1.0, 1.0), mk(1.0, 99.0)], LEGACY_PAIRING_DIMS);
+    let pooled = metric_def("sched_goidle_fraction")
+        .unwrap()
+        .read(&out[0].row)
+        .expect("rate derived post-fold");
+    assert!(
+        (pooled - 0.02).abs() < 1e-9,
+        "Σgoidle/Σcount = 0.02, got {pooled} (mean-of-ratios would be 0.505)",
+    );
+}
+
 /// `avg_nr_running` (Gauge(Avg) ext key) folds cross-run as the
 /// SAMPLE-WEIGHTED pooled mean — Σ(avg_i × samples_i) / Σ samples_i, weighted by
 /// run_sample_count — NOT the unweighted arithmetic mean a typed field would

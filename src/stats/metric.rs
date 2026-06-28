@@ -1712,6 +1712,30 @@ pub static METRICS: &[MetricDef] = &[
         accessor: |_| None,
     },
     MetricDef {
+        // GATED. Go-idle FRACTION = Σsched_goidle / Σsched_count, re-derived by
+        // `derive_rate_metrics`. A fraction in [0, 1]: the share of `schedule()`
+        // calls that picked the idle task (the CPU found nothing runnable).
+        // Load-normalized (per-schedule, not per-time), so it is duration- AND
+        // arrival-rate-stable — the genuinely-useful-for-spread schedstat rate
+        // (a bare per-second rate carries the same spread as the raw total when
+        // cohort runs share a duration, so it adds nothing at equal duration).
+        // Informational: a high idle fraction is ambiguous — efficient when no
+        // runnable work exists, but a starvation symptom when runnable work is
+        // not dispatched — so it surfaces in `--noise-adjust` spread but does
+        // not gate a regression verdict. Absent when `total_sched_count` is 0
+        // (no schedules) or CONFIG_SCHEDSTATS is off (components absent).
+        name: "sched_goidle_fraction",
+        polarity: crate::test_support::Polarity::Informational,
+        kind: MetricKind::Rate {
+            numerator: "total_sched_goidle",
+            denominator: "total_sched_count",
+        },
+        default_abs: 0.05,
+        default_rel: 0.10,
+        display_unit: "",
+        accessor: |_| None,
+    },
+    MetricDef {
         // Whole-run mean per-CPU runqueue depth (`rq.nr_running`, ALL scheduling
         // classes), read host-side from guest memory via
         // `MonitorSummary::avg_nr_running`. The occupancy LEVEL — distinct from
