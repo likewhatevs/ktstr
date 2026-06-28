@@ -787,3 +787,63 @@ fn psi_irq_interleaved_none_is_filtered_not_zeroed() {
         "delta spans first→last reporting sample across the None gap",
     );
 }
+
+// -- fold_run_level_ext (the shared monitor-summary → ext fold, used by both
+// group::sidecar_to_row and VmResult::run_metric) --
+
+/// fold_run_level_ext folds the 5 ext-only run-level monitor metrics
+/// (avg_nr_running + the PELT IRQ load pair + the PSI-irq pair) into the ext
+/// map. Pins: all 5 inserted with a sampled summary; the Option IRQ fields are
+/// loud-absent (key omitted, never a false 0.0) when None; a 0-sample summary is
+/// a no-op. This is the shared path the sidecar row and the in-test run_metric
+/// accessor both use, so the key list + guard can't drift between them.
+#[test]
+fn fold_run_level_ext_folds_the_five_monitor_metrics() {
+    use std::collections::BTreeMap;
+    let mut s = MonitorSummary {
+        total_samples: 5,
+        avg_nr_running: 2.5,
+        avg_irq_util: Some(40.0),
+        max_avg_irq_util: Some(80.0),
+        psi_irq_full_avg10: Some(12.5),
+        total_irq_pressure_us: Some(3000.0),
+        ..Default::default()
+    };
+    let mut ext = BTreeMap::new();
+    s.fold_run_level_ext(&mut ext);
+    assert_eq!(ext.get("avg_nr_running"), Some(&2.5));
+    assert_eq!(ext.get("avg_irq_util"), Some(&40.0));
+    assert_eq!(ext.get("max_avg_irq_util"), Some(&80.0));
+    assert_eq!(ext.get("psi_irq_full_avg10"), Some(&12.5));
+    assert_eq!(ext.get("total_irq_pressure_us"), Some(&3000.0));
+
+    // Loud-absent: None Option fields → keys omitted (never a false 0.0);
+    // avg_nr_running (plain f64) is still inserted.
+    s.avg_irq_util = None;
+    s.psi_irq_full_avg10 = None;
+    let mut ext2 = BTreeMap::new();
+    s.fold_run_level_ext(&mut ext2);
+    assert_eq!(ext2.get("avg_nr_running"), Some(&2.5));
+    assert_eq!(ext2.get("avg_irq_util"), None, "None → absent, not 0.0");
+    assert_eq!(ext2.get("psi_irq_full_avg10"), None, "None → absent, not 0.0");
+    assert_eq!(ext2.get("max_avg_irq_util"), Some(&80.0));
+    assert_eq!(ext2.get("total_irq_pressure_us"), Some(&3000.0));
+
+    // total_samples == 0 → no-op (a 0-sample run carries no occupancy/IRQ signal).
+    let empty = MonitorSummary {
+        total_samples: 0,
+        avg_nr_running: 9.9,
+        avg_irq_util: Some(50.0),
+        ..Default::default()
+    };
+    let mut ext3 = BTreeMap::new();
+    empty.fold_run_level_ext(&mut ext3);
+    assert!(ext3.is_empty(), "0-sample summary folds nothing");
+
+    // entry().or_insert(): a value already present is NOT overwritten (an earlier
+    // populator wins; no key overlaps in production, but the guard is defensive).
+    let mut ext4 = BTreeMap::new();
+    ext4.insert("avg_nr_running".to_string(), 1.0);
+    s.fold_run_level_ext(&mut ext4);
+    assert_eq!(ext4.get("avg_nr_running"), Some(&1.0), "pre-set value wins");
+}

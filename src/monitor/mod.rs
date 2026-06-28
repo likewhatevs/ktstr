@@ -893,6 +893,39 @@ impl MonitorSummary {
         Self::from_samples_with_threshold(samples, 0)
     }
 
+    /// Fold this summary's run-level ext-only monitor metrics into `ext`:
+    /// `avg_nr_running`, the PELT IRQ load pair (`avg_irq_util` /
+    /// `max_avg_irq_util`), and the PSI-irq pair (`psi_irq_full_avg10` /
+    /// `total_irq_pressure_us`). A no-op when `total_samples == 0` (a 0-sample
+    /// run carries no occupancy / IRQ signal — absent, never a false 0.0). The
+    /// `Option` fields insert only on `Some` (loud-absent on a kernel without the
+    /// source: non-HAVE_SCHED_AVG_IRQ, or no CONFIG_PSI / CONFIG_IRQ_TIME_ACCOUNTING).
+    /// `entry().or_insert()` so a value already placed by an earlier populator
+    /// wins (no key overlaps today — these are ext-only, disjoint from the
+    /// read_sample- and phase-folded keys). Shared by `stats::sidecar_to_row`
+    /// (the perf-delta sidecar row) and `VmResult::run_metric` (the in-test
+    /// accessor) so the key list + loud-absent guard cannot drift between the two
+    /// surfaces.
+    pub(crate) fn fold_run_level_ext(&self, ext: &mut std::collections::BTreeMap<String, f64>) {
+        if self.total_samples == 0 {
+            return;
+        }
+        ext.entry("avg_nr_running".to_string())
+            .or_insert(self.avg_nr_running);
+        if let Some(v) = self.avg_irq_util {
+            ext.entry("avg_irq_util".to_string()).or_insert(v);
+        }
+        if let Some(v) = self.max_avg_irq_util {
+            ext.entry("max_avg_irq_util".to_string()).or_insert(v);
+        }
+        if let Some(v) = self.psi_irq_full_avg10 {
+            ext.entry("psi_irq_full_avg10".to_string()).or_insert(v);
+        }
+        if let Some(v) = self.total_irq_pressure_us {
+            ext.entry("total_irq_pressure_us".to_string()).or_insert(v);
+        }
+    }
+
     /// Like [`from_samples`](Self::from_samples) but uses an explicit
     /// preemption threshold (ns) for stall detection. Pass 0 to derive
     /// the threshold from the guest kernel's `CONFIG_HZ` by calling

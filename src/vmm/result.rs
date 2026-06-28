@@ -918,27 +918,36 @@ impl VmResult {
     /// The result is byte-identical to the run-level `ext_metrics` the sidecar
     /// records for this run.
     ///
-    /// Resolves the SAME ext-sourced family as
+    /// Resolves the ext-sourced family that
     /// [`crate::assert::ScenarioStats::run_metric`] (the post-merge host
-    /// accessor): the `read_sample`-wired registry metrics, the phase-only ext
-    /// metrics (`avg_imbalance_ratio`, `iteration_rate`, `system_time_ns`,
-    /// `user_time_ns`, the IRQ counters/rates, `max_cpu_hardirqs` +
-    /// `max_cpu_hardirq_concentration`), the pooled `iterations_per_cpu_sec`, and
-    /// the run-level `Distribution` / `WorstLowest` / `WakeLatencyTailRatio`
-    /// re-pools. The two `run_metric` accessors return identical values for every
-    /// resolved key — this one self-computes pre-merge, the other reads the
-    /// stored post-merge map.
+    /// accessor) resolves — the `read_sample`-wired registry metrics, the
+    /// phase-only ext metrics (`avg_imbalance_ratio`, `iteration_rate`,
+    /// `system_time_ns`, `user_time_ns`, the IRQ counters/rates, the per-CPU
+    /// spatial maxes `max_cpu_hardirqs` / `max_cpu_softirq_net_rx` and their
+    /// concentrations), the pooled `iterations_per_cpu_sec`, and the run-level
+    /// `Distribution` / `WorstLowest` / `WakeLatencyTailRatio` re-pools — and for
+    /// those keys the two accessors return identical values (this one
+    /// self-computes pre-merge, the other reads the stored post-merge map).
     ///
-    /// NOT resolved here (the SAME boundary
-    /// [`crate::assert::ScenarioStats::run_metric`] documents):
+    /// ADDITIONALLY resolves the 5 ext-only run-level MONITOR metrics from
+    /// [`Self::monitor`]'s summary: `avg_nr_running`, `avg_irq_util`,
+    /// `max_avg_irq_util`, `psi_irq_full_avg10`, `total_irq_pressure_us` (folded
+    /// via `MonitorSummary::fold_run_level_ext`, shared with the sidecar row).
+    /// These DIVERGE from [`crate::assert::ScenarioStats::run_metric`], which has
+    /// no `MonitorReport` to fold and returns `None` for them — the one place the
+    /// two accessors differ.
+    ///
+    /// NOT resolved here:
     /// - the typed cross-cgroup `ScenarioStats` fields (`worst_spread`,
     ///   `worst_migration_ratio`, `worst_gap_ms`, `total_migrations`,
     ///   `total_iterations`, `worst_page_locality`,
     ///   `worst_cross_node_migration_ratio`) — they are `0.0`-sentinel f64, so
-    ///   resolving them here would split this method's sentinel-free contract.
-    /// - the monitor-sourced run-level metrics (`max_imbalance_ratio`,
+    ///   resolving them here would split this method's sentinel-free contract (an
+    ///   Option-distinguishing accessor is a follow-up).
+    /// - the typed-backed monitor run-level metrics (`max_imbalance_ratio`,
     ///   `max_dsq_depth`, `stuck_count`, `total_fallback`, `total_keep_last`) —
-    ///   read those per-phase via [`Self::phase_metric`].
+    ///   these have typed `GauntletRow` fields (not ext-only); read them
+    ///   per-phase via [`Self::phase_metric`].
     ///
     /// Sentinel-free, matching [`Self::phase_metric`]: `None` means the metric is
     /// absent from this run (no populator produced it, or a name not in the map);
@@ -971,6 +980,16 @@ impl VmResult {
             ..Default::default()
         };
         crate::assert::populate_run_ext_all(&mut stats, &self.periodic_series());
+        // Fold the run-level ext-only monitor metrics (avg_nr_running + the PELT
+        // IRQ load pair + the PSI-irq pair) from the stored MonitorReport
+        // summary. populate_run_ext_all can't produce them — they're
+        // MonitorSummary-sourced, not phase/series-folded — but VmResult holds
+        // self.monitor, so (unlike ScenarioStats::run_metric, which has no
+        // monitor) this accessor CAN resolve them. Shared with
+        // group::sidecar_to_row via fold_run_level_ext.
+        if let Some(report) = self.monitor.as_ref() {
+            report.summary.fold_run_level_ext(&mut stats.ext_metrics);
+        }
         stats.ext_metrics.get(metric.as_str()).copied()
     }
 

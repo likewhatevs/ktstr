@@ -21,7 +21,8 @@
 //! (`phase_counter_delta` is `None` for fewer than two finite samples).
 //!
 //! The PSI-irq run-level metrics (`psi_irq_full_avg10` / `total_irq_pressure_us`)
-//! ARE asserted here via the [`VmResult::monitor`] summary. `psi_irq_full_avg10`
+//! ARE asserted here via `result.run_metric` (which also pins that the run_metric
+//! boundary folds the monitor-summary metrics into its ext map). `psi_irq_full_avg10`
 //! must be PRESENT (proving `psi_system` resolved + the host-walk ran) and a sane
 //! percent; `total_irq_pressure_us` must be > 0 — the sustained softirq load that
 //! drives `total_softirq_net_rx` also accrues IRQ-full stall, so a present-but-
@@ -112,21 +113,20 @@ fn assert_irq_metrics(result: &VmResult) -> Result<()> {
     ensure!(rate > 0.0, "hardirq_rate must be > 0, got {rate}");
 
     // System-wide PSI-irq pressure, host-walked from the global `psi_system`
-    // per monitor sample and folded run-level in MonitorSummary. The unit fold
-    // tests pin the mean / end-start-delta / decode math on synthetic samples;
-    // THIS proves the host-walk against a real kernel: `psi_system` resolves
-    // (CONFIG_PSI=y in ktstr.kconfig) and the `.data`-global PA translation +
-    // `psi_group` offset math read the LIVE accumulator. ABSENT FAILS loudly
+    // per monitor sample, folded run-level in MonitorSummary, and surfaced via
+    // the run-level metric accessor (result.run_metric). The unit fold tests pin
+    // the mean / end-start-delta / decode math on synthetic samples; THIS proves
+    // the host-walk against a real kernel: `psi_system` resolves (CONFIG_PSI=y in
+    // ktstr.kconfig) and the `.data`-global PA translation + `psi_group` offset
+    // math read the LIVE accumulator. Reading via run_metric (not
+    // result.monitor.summary directly) ALSO pins that the run_metric boundary
+    // folds the monitor-summary metrics into its ext map. ABSENT FAILS loudly
     // (psi_system unresolved / PSI_IRQ_FULL not in BTF), never SKIPs.
-    let summary = &result
-        .monitor
-        .as_ref()
-        .ok_or_else(|| anyhow!("no monitor report — the host monitor did not run"))?
-        .summary;
+    //
     // Present (psi_system resolved + PSI_IRQ_FULL in BTF + >= 1 data_valid
     // sample) and a sane percent. decode_avg10_percent clamps the upper bound, so
     // [0,100] is a floor/sanity here; the wrong-PA signal is `total > 0` below.
-    let psi_avg10 = summary.psi_irq_full_avg10.ok_or_else(|| {
+    let psi_avg10 = result.run_metric(BuiltinMetric::PsiIrqFullAvg10).ok_or_else(|| {
         anyhow!(
             "psi_irq_full_avg10 absent — psi_system unresolved or PSI_IRQ_FULL \
              missing from BTF (CONFIG_PSI / CONFIG_IRQ_TIME_ACCOUNTING off)"
@@ -148,7 +148,7 @@ fn assert_irq_metrics(result: &VmResult) -> Result<()> {
     // present-but-zero cumulative total is the wrong-PA signature (caught here
     // where the clamped avg10 range cannot). NOTE: > 0 relies on this sustained
     // load; revisit the assertion if the workload is lightened/idled.
-    let psi_total = summary.total_irq_pressure_us.ok_or_else(|| {
+    let psi_total = result.run_metric(BuiltinMetric::TotalIrqPressureUs).ok_or_else(|| {
         anyhow!("total_irq_pressure_us absent under the same PSI gate as avg10")
     })?;
     ensure!(
