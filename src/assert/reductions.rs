@@ -836,8 +836,24 @@ pub fn assert_throughput_parity(
         })
         .collect();
 
-    let n = rates.len() as f64;
-    let mean = rates.iter().sum::<f64>() / n;
+    // CV is computed over MEASURED workers only (cpu_time_ns > 0). A zero-cpu
+    // worker's rate is unknowable — it is forced to 0.0 above so the min_rate
+    // gate below can index `reports[i]`, but that 0.0 is NOT a measured rate.
+    // Folding it into the mean/variance inflates the spread and FAILs a uniform
+    // workload that merely had one worker record no CPU time — the same exclusion
+    // the min_rate gate applies (it skips zero-cpu workers as "rate unknowable,
+    // not failing").
+    let measured: Vec<f64> = reports
+        .iter()
+        .zip(&rates)
+        .filter(|(w, _)| w.cpu_time_ns > 0)
+        .map(|(_, &rate)| rate)
+        .collect();
+    let mean = if measured.is_empty() {
+        0.0
+    } else {
+        measured.iter().sum::<f64>() / measured.len() as f64
+    };
 
     // Detect the all-zero-cpu condition once so a call with both
     // `max_cv` and `min_rate` set surfaces a single Inconclusive
@@ -869,9 +885,10 @@ pub fn assert_throughput_parity(
 
     if let Some(cv_limit) = max_cv
         && mean > 0.0
-        && rates.len() >= 2
+        && measured.len() >= 2
     {
-        let variance = rates.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / n;
+        let n_measured = measured.len() as f64;
+        let variance = measured.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / n_measured;
         let stddev = variance.sqrt();
         let cv = stddev / mean;
         if cv > cv_limit {

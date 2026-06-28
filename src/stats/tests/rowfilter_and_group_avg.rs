@@ -1008,6 +1008,37 @@ fn group_and_average_ext_metrics_gauge_avg_weighted_by_run_sample_count() {
     );
 }
 
+/// A passing run that emitted a Gauge(Avg) ext key but recorded zero monitor
+/// samples (run_sample_count == 0) must still contribute ONE observation to the
+/// cross-RUN weighted mean — never be silently zero-weighted out of a mixed
+/// cohort. Pins the .max(1) weight floor in `Accumulator::observe` (matching the
+/// floors in run_metrics.rs `populate_run_ext_metrics_from_phases` and
+/// stats_types.rs `merge_metric_values`). row a (weight 0 -> floored to 1,
+/// value 10) + row b (weight 10, value 30): (10*1 + 30*10) / (1 + 10) = 28.18.
+/// Without the floor, a is dropped (weight 0) and the mean collapses to b's 30.0.
+#[test]
+fn group_and_average_gauge_avg_floors_zero_sample_count_weight() {
+    let mut a = make_row("t", "tiny-1llc", true, 0.0);
+    a.run_sample_count = 0;
+    a.ext_metrics.insert("avg_dsq_depth".to_string(), 10.0);
+    let mut b = make_row("t", "tiny-1llc", true, 0.0);
+    b.run_sample_count = 10;
+    b.ext_metrics.insert("avg_dsq_depth".to_string(), 30.0);
+    let out = group_and_average_by(&[a, b], LEGACY_PAIRING_DIMS);
+    assert_eq!(out.len(), 1);
+    let mean = out[0]
+        .row
+        .ext_metrics
+        .get("avg_dsq_depth")
+        .copied()
+        .expect("ext_metrics propagates avg_dsq_depth aggregate");
+    assert!(
+        (mean - (310.0 / 11.0)).abs() < 1e-9,
+        "weight-0 run must be floored to weight 1, not dropped: \
+         expected (10*1 + 30*10)/11 = 28.18, got {mean}",
+    );
+}
+
 /// Cross-RUN re-pool of the pooled `iterations_per_cpu_sec` Rate:
 /// `group_and_average_by` SKIPS folding the Rate itself and re-derives it
 /// from the folded Counter components (`total_iterations_pooled`,

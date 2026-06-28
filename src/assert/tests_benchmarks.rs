@@ -726,6 +726,31 @@ fn assert_throughput_parity_mixed_zero_and_nonzero_cpu_does_not_short_circuit() 
 }
 
 #[test]
+fn assert_throughput_parity_cv_excludes_zero_cpu_workers() {
+    // A zero-cpu worker's rate is unknowable, NOT 0.0. The CV must be computed
+    // over MEASURED workers only — matching the min_rate gate's documented
+    // zero-cpu exclusion. Two uniform real workers (rate 1000 each) plus one
+    // zero-cpu worker: CV over the measured pair is 0.0 -> PASS. Folding the
+    // zero-cpu worker's forced 0.0 would give mean 666.7, cv 0.707 > 0.5 and
+    // FAIL a genuinely uniform workload.
+    let mut a = rpt(1, 0, 0, 1_000_000_000, &[0], 0);
+    let mut b = rpt(2, 0, 0, 1_000_000_000, &[0], 0);
+    let mut c = rpt(3, 0, 0, 1_000_000_000, &[0], 0);
+    a.work_units = 1000;
+    a.cpu_time_ns = 1_000_000_000; // rate 1000 work/cpu_s
+    b.work_units = 1000;
+    b.cpu_time_ns = 1_000_000_000; // rate 1000 work/cpu_s
+    c.cpu_time_ns = 0; // zero-cpu -> excluded from the CV
+    let r = assert_throughput_parity(&[a, b, c], Some(0.5), None);
+    assert!(
+        r.is_pass(),
+        "uniform measured workers (cv 0.0) must PASS; a zero-cpu worker's \
+         unknowable rate must not inflate the CV: {:?}",
+        r.outcomes,
+    );
+}
+
+#[test]
 fn assert_throughput_parity_all_zero_cpu_time_passes_without_cv() {
     // No CV check requested → no failure. The min_rate floor is
     // also unset, so the function has nothing to evaluate and

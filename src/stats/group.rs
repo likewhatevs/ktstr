@@ -660,11 +660,18 @@ impl<'a> Accumulator<'a> {
         self.sum_run_sample_count = self
             .sum_run_sample_count
             .saturating_add(row.run_sample_count);
+        // Floor the cross-RUN weight at 1: a passing run that emitted this ext
+        // key contributes one observation to a Gauge(Avg) weighted mean, never
+        // zero-weighted out of a mixed cohort. A run with run_sample_count==0
+        // (e.g. snapshot-bridge-sourced metrics with no monitor samples) would
+        // otherwise be silently dropped from the mean. Matches the .max(1) floors
+        // at run_metrics.rs (populate_run_ext_metrics_from_phases) and
+        // stats_types.rs (merge_metric_values).
         for (k, v) in &row.ext_metrics {
             self.ext_pairs
                 .entry(k.clone())
                 .or_default()
-                .push((*v, row.run_sample_count));
+                .push((*v, row.run_sample_count.max(1)));
         }
     }
 
