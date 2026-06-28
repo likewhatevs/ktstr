@@ -177,7 +177,17 @@ pub fn cgroup_stats(reports: &[WorkerReport]) -> CgroupStats {
         )
     };
 
-    let total_iters: u64 = reports.iter().map(|w| w.iterations).sum();
+    // saturating folds throughout this builder: pool the per-worker guest-runtime
+    // counters (iterations, migrations, cpu-time-ns, sample totals, numa pages)
+    // overflow-safely. This worker->cgroup fold is the FIRST cross-source sum and
+    // the one most exposed to a corrupt/hostile WorkerReport; a u64::MAX component
+    // clamps to u64::MAX instead of debug-panicking / release-wrapping a per-cgroup
+    // total (and the derived migration-ratio / page-locality) to a silently-wrong
+    // value. saturating_add is exact for every in-range value.
+    let total_iters: u64 = reports
+        .iter()
+        .map(|w| w.iterations)
+        .fold(0u64, u64::saturating_add);
     let run_delays: Vec<f64> = reports
         .iter()
         .map(|w| w.schedstat_run_delay_ns as f64 / 1000.0)
@@ -189,7 +199,10 @@ pub fn cgroup_stats(reports: &[WorkerReport]) -> CgroupStats {
     };
     let worst_run_delay = run_delays.iter().cloned().reduce(f64::max).unwrap_or(0.0);
 
-    let total_mig: u64 = reports.iter().map(|w| w.migration_count).sum();
+    let total_mig: u64 = reports
+        .iter()
+        .map(|w| w.migration_count)
+        .fold(0u64, u64::saturating_add);
     let mig_ratio = migration_ratio_of(total_mig, total_iters);
 
     // Cross-node page-migration ratio: pages migrated cross-node over the
@@ -203,8 +216,8 @@ pub fn cgroup_stats(reports: &[WorkerReport]) -> CgroupStats {
     // for its diagnostic; this is the always-on telemetry.)
     let total_numa_pages: u64 = reports
         .iter()
-        .map(|w| w.numa_pages.values().sum::<u64>())
-        .sum();
+        .map(|w| w.numa_pages.values().copied().fold(0u64, u64::saturating_add))
+        .fold(0u64, u64::saturating_add);
     let migrated_pages: u64 = reports
         .iter()
         .map(|w| w.vmstat_numa_pages_migrated)
@@ -259,7 +272,10 @@ pub fn cgroup_stats(reports: &[WorkerReport]) -> CgroupStats {
         worst_timer_latency_us: worst_timer,
         timer_measured: !all_timer.is_empty(),
         total_iterations: total_iters,
-        total_cpu_time_ns: reports.iter().map(|w| w.schedstat_cpu_time_ns).sum(),
+        total_cpu_time_ns: reports
+            .iter()
+            .map(|w| w.schedstat_cpu_time_ns)
+            .fold(0u64, u64::saturating_add),
         mean_run_delay_us: mean_run_delay,
         worst_run_delay_us: worst_run_delay,
         // Run-delay is measured whenever a worker exists (a worker with `0.0`
@@ -412,7 +428,12 @@ pub(crate) fn phase_cgroup_stats(
             );
         }
     }
-    let wake_sample_total: u64 = reports.iter().map(|w| w.wake_sample_total).sum();
+    // saturating folds (per cgroup_stats's rationale): overflow-safe pool of the
+    // per-worker guest-runtime counters into this per-phase carrier.
+    let wake_sample_total: u64 = reports
+        .iter()
+        .map(|w| w.wake_sample_total)
+        .fold(0u64, u64::saturating_add);
     // Distinct timer reservoir, pooled across workers exactly like
     // wake_latencies_ns; timer_sample_total keeps the true pre-cap population.
     let mut timer_latencies_ns: Vec<u64> = Vec::new();
@@ -427,7 +448,10 @@ pub(crate) fn phase_cgroup_stats(
             );
         }
     }
-    let timer_sample_total: u64 = reports.iter().map(|w| w.timer_sample_total).sum();
+    let timer_sample_total: u64 = reports
+        .iter()
+        .map(|w| w.timer_sample_total)
+        .fold(0u64, u64::saturating_add);
     // RAW ns, one per worker — NOT divided by 1000. cgroup_stats divides at
     // reduction time; the re-pool over the concatenated samples divides once,
     // so pre-dividing here would double-divide (a 1000x error).
@@ -439,15 +463,24 @@ pub(crate) fn phase_cgroup_stats(
         .max_by_key(|w| w.max_gap_ms)
         .map(|w| (w.max_gap_ms, w.max_gap_cpu))
         .unwrap_or((0, 0));
-    let total_migrations: u64 = reports.iter().map(|w| w.migration_count).sum();
-    let total_iterations: u64 = reports.iter().map(|w| w.iterations).sum();
+    let total_migrations: u64 = reports
+        .iter()
+        .map(|w| w.migration_count)
+        .fold(0u64, u64::saturating_add);
+    let total_iterations: u64 = reports
+        .iter()
+        .map(|w| w.iterations)
+        .fold(0u64, u64::saturating_add);
     // schedstat_cpu_time_ns (task->se.sum_exec_runtime), NOT cpu_time_ns
     // (CLOCK_THREAD_CPUTIME_ID) — matches cgroup_stats's total_cpu_time_ns.
-    let total_cpu_time_ns: u64 = reports.iter().map(|w| w.schedstat_cpu_time_ns).sum();
+    let total_cpu_time_ns: u64 = reports
+        .iter()
+        .map(|w| w.schedstat_cpu_time_ns)
+        .fold(0u64, u64::saturating_add);
     let numa_pages_total: u64 = reports
         .iter()
-        .map(|w| w.numa_pages.values().sum::<u64>())
-        .sum();
+        .map(|w| w.numa_pages.values().copied().fold(0u64, u64::saturating_add))
+        .fold(0u64, u64::saturating_add);
     // System-wide /proc/vmstat numa_pages_migrated delta each worker observes
     // redundantly -> MAX, not SUM (summing inflates by the worker count).
     let cross_node_migrated: u64 = reports
@@ -464,7 +497,7 @@ pub(crate) fn phase_cgroup_stats(
             for w in reports {
                 for (&node, &count) in &w.numa_pages {
                     if nodes.contains(&node) {
-                        local += count;
+                        local = local.saturating_add(count);
                     }
                 }
             }
@@ -518,7 +551,12 @@ pub(crate) fn phase_slice_to_cgroup_stats(
     } else {
         Vec::new()
     };
-    let numa_pages_total: u64 = slice.numa_pages.values().copied().sum();
+    // saturating folds: overflow-safe pool of this slice's per-node page counts.
+    let numa_pages_total: u64 = slice
+        .numa_pages
+        .values()
+        .copied()
+        .fold(0u64, u64::saturating_add);
     let numa_pages_local: u64 = expected_nodes
         .map(|nodes| {
             slice
@@ -526,7 +564,7 @@ pub(crate) fn phase_slice_to_cgroup_stats(
                 .iter()
                 .filter(|(node, _)| nodes.contains(node))
                 .map(|(_, &count)| count)
-                .sum()
+                .fold(0u64, u64::saturating_add)
         })
         .unwrap_or(0);
     PhaseCgroupStats {
@@ -1385,7 +1423,13 @@ pub fn assert_thresholds(
     // Total migrations across all workers: absolute-count gate
     // (distinct from migration_ratio which is a per-iteration rate).
     if let Some(max_mig) = thresholds.max_migrations {
-        let total_mig: u64 = reports.iter().map(|w| w.migration_count).sum();
+        // saturating: a corrupt/hostile per-worker migration_count must clamp,
+        // not wrap, this absolute-count gate — a wrapped small total would
+        // silently PASS a max_migrations limit it should fail.
+        let total_mig: u64 = reports
+            .iter()
+            .map(|w| w.migration_count)
+            .fold(0u64, u64::saturating_add);
         if total_mig > max_mig {
             r.record_fail(AssertDetail::new(
                 DetailKind::Migration,

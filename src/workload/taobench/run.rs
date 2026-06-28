@@ -409,17 +409,22 @@ pub struct TaobenchStats {
 
 impl TaobenchStats {
     pub(crate) fn merge(&mut self, o: &TaobenchStats) {
-        self.get_cmds += o.get_cmds;
-        self.get_misses += o.get_misses;
-        self.fast_ops += o.fast_ops;
-        self.slow_ops += o.slow_ops;
+        // saturating_add: these are guest-runtime monotonic op counters pooled
+        // across concurrent workers/cgroups. Overflow is unreachable for honest
+        // data (real counts ~1e7..1e14 << u64::MAX), but a corrupt/hostile guest
+        // value would otherwise debug-panic or release-wrap to a silently-wrong
+        // qps/hit Rate; saturating is exact for every in-range value.
+        self.get_cmds = self.get_cmds.saturating_add(o.get_cmds);
+        self.get_misses = self.get_misses.saturating_add(o.get_misses);
+        self.fast_ops = self.fast_ops.saturating_add(o.fast_ops);
+        self.slow_ops = self.slow_ops.saturating_add(o.slow_ops);
         // The wall window is shared across the pooled concurrent threads/workers
         // (they run the same phase at the same time), so MAX, not sum.
         self.elapsed_ns = self.elapsed_ns.max(o.elapsed_ns);
     }
     /// Completed ops (fast + slow) — the throughput numerator.
     pub fn total_ops(&self) -> u64 {
-        self.fast_ops + self.slow_ops
+        self.fast_ops.saturating_add(self.slow_ops)
     }
 }
 
@@ -821,6 +826,35 @@ mod tests {
             "mean value size {m} B is small-object-heavy"
         );
         assert_eq!(*VALUE_SIZES.last().unwrap(), 65536, "tail reaches 64 KiB");
+    }
+
+    #[test]
+    fn taobench_stats_merge_and_total_ops_saturate_on_overflow() {
+        // Pooling guest-runtime op counters must saturate, not wrap: a corrupt
+        // u64::MAX component must never produce a silently-wrong (wrapped-small)
+        // qps/hit Rate. Saturating is exact for all in-range data.
+        let mut a = TaobenchStats {
+            get_cmds: u64::MAX,
+            get_misses: u64::MAX,
+            fast_ops: u64::MAX,
+            slow_ops: 1,
+            elapsed_ns: 1000,
+        };
+        let b = TaobenchStats {
+            get_cmds: 5,
+            get_misses: 5,
+            fast_ops: 5,
+            slow_ops: 5,
+            elapsed_ns: 9000,
+        };
+        a.merge(&b);
+        assert_eq!(a.get_cmds, u64::MAX, "saturates, not wraps to 4");
+        assert_eq!(a.get_misses, u64::MAX);
+        assert_eq!(a.fast_ops, u64::MAX);
+        assert_eq!(a.slow_ops, 6);
+        assert_eq!(a.elapsed_ns, 9000, "wall window is MAX, not summed");
+        // total_ops = fast_ops + slow_ops saturates (u64::MAX + 6 -> u64::MAX).
+        assert_eq!(a.total_ops(), u64::MAX, "total_ops saturates");
     }
 
     #[test]

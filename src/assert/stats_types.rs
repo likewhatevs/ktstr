@@ -670,20 +670,30 @@ impl PhaseCgroupStats {
             (Some(x), None) | (None, Some(x)) => Some(x),
             (None, None) => None,
         };
+        // saturating_add: pool the guest-runtime monotonic counters/times (the
+        // sample totals, migrations, iterations, cpu-time-ns, numa pages) across
+        // cgroups. Overflow is physically unreachable for honest data (real
+        // counts << u64::MAX), but a corrupt/hostile guest value would otherwise
+        // debug-panic or release-wrap to a silently-wrong derived metric;
+        // saturating is exact for every in-range value. num_workers is a
+        // ktstr-configured TOPOLOGY count (bounded by the guest CPU count, not a
+        // runtime accumulator), so it cannot overflow and keeps plain `+`.
+        // cross_node_migrated pools as MAX (a system-wide vmstat snapshot shared
+        // by the concurrent cgroups), not a sum.
         PhaseCgroupStats {
             num_workers: a.num_workers + b.num_workers,
             cpus_used,
             wake_latencies_ns,
-            wake_sample_total: a.wake_sample_total + b.wake_sample_total,
+            wake_sample_total: a.wake_sample_total.saturating_add(b.wake_sample_total),
             timer_latencies_ns,
-            timer_sample_total: a.timer_sample_total + b.timer_sample_total,
+            timer_sample_total: a.timer_sample_total.saturating_add(b.timer_sample_total),
             run_delays_ns,
             off_cpu_pcts,
-            total_migrations: a.total_migrations + b.total_migrations,
-            total_iterations: a.total_iterations + b.total_iterations,
-            total_cpu_time_ns: a.total_cpu_time_ns + b.total_cpu_time_ns,
-            numa_pages_local: a.numa_pages_local + b.numa_pages_local,
-            numa_pages_total: a.numa_pages_total + b.numa_pages_total,
+            total_migrations: a.total_migrations.saturating_add(b.total_migrations),
+            total_iterations: a.total_iterations.saturating_add(b.total_iterations),
+            total_cpu_time_ns: a.total_cpu_time_ns.saturating_add(b.total_cpu_time_ns),
+            numa_pages_local: a.numa_pages_local.saturating_add(b.numa_pages_local),
+            numa_pages_total: a.numa_pages_total.saturating_add(b.numa_pages_total),
             cross_node_migrated: a.cross_node_migrated.max(b.cross_node_migrated),
             max_gap_ms,
             max_gap_cpu,
@@ -1324,7 +1334,14 @@ impl PhaseBucket {
         if self.per_cgroup.is_empty() {
             return None;
         }
-        Some(self.per_cgroup.values().map(field).sum::<u64>() as f64)
+        // saturating: overflow-safe cross-cgroup pool of the guest counter for
+        // the post_vm by-name read (a wrapped sum would read silently-small).
+        Some(
+            self.per_cgroup
+                .values()
+                .map(field)
+                .fold(0u64, u64::saturating_add) as f64,
+        )
     }
 }
 
@@ -1459,7 +1476,7 @@ pub(crate) fn merge_matched_phase_buckets(a: PhaseBucket, b: PhaseBucket) -> Pha
         label: a.label,
         start_ms: a.start_ms.min(b.start_ms),
         end_ms: a.end_ms.max(b.end_ms),
-        sample_count: a.sample_count + b.sample_count,
+        sample_count: a.sample_count.saturating_add(b.sample_count),
         metrics,
         per_cgroup,
     }

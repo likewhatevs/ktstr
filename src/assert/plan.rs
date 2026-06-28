@@ -550,10 +550,15 @@ impl AssertResult {
         self.info_notes.extend(other.info_notes);
         let s = &mut self.stats;
         let o = &other.stats;
+        // total_workers / total_cpus are ktstr-configured TOPOLOGY counts
+        // (bounded by the guest CPU count), so plain `+=`. total_migrations /
+        // total_iterations are guest-runtime monotonic counters pooled across VM
+        // results: saturating_add so a corrupt/hostile value can't wrap to a
+        // silently-wrong run-level total (exact for every in-range value).
         s.total_workers += o.total_workers;
         s.total_cpus += o.total_cpus;
-        s.total_migrations += o.total_migrations;
-        s.total_iterations += o.total_iterations;
+        s.total_migrations = s.total_migrations.saturating_add(o.total_migrations);
+        s.total_iterations = s.total_iterations.saturating_add(o.total_iterations);
         s.worst_spread = s.worst_spread.max(o.worst_spread);
         s.worst_migration_ratio = s.worst_migration_ratio.max(o.worst_migration_ratio);
         // worst_p99/median/cv wake-latency + mean/worst run-delay are no
@@ -1045,13 +1050,15 @@ impl AssertPlan {
         // telemetry. The (locality, total, local) triple is reused by that
         // check below so the value is computed once.
         let page_locality = numa_nodes.map(|nodes| {
+            // saturating: overflow-safe pool of per-worker per-node page counts
+            // (a corrupt component must not wrap the page-locality numerator/denom).
             let mut total: u64 = 0;
             let mut local: u64 = 0;
             for w in reports {
                 for (&node, &count) in &w.numa_pages {
-                    total += count;
+                    total = total.saturating_add(count);
                     if nodes.contains(&node) {
-                        local += count;
+                        local = local.saturating_add(count);
                     }
                 }
             }
@@ -1191,8 +1198,16 @@ impl AssertPlan {
         page_locality: Option<(f64, u64, u64)>,
     ) {
         if let Some(max_ratio) = self.max_migration_ratio {
-            let total_mig: u64 = reports.iter().map(|w| w.migration_count).sum();
-            let total_iters: u64 = reports.iter().map(|w| w.iterations).sum();
+            // saturating: overflow-safe pool of the per-worker migration / iteration
+            // counters that feed the migration-ratio verdict.
+            let total_mig: u64 = reports
+                .iter()
+                .map(|w| w.migration_count)
+                .fold(0u64, u64::saturating_add);
+            let total_iters: u64 = reports
+                .iter()
+                .map(|w| w.iterations)
+                .fold(0u64, u64::saturating_add);
             if total_iters == 0 {
                 r.record_inconclusive(AssertDetail::new(
                     DetailKind::Migration,
@@ -1269,8 +1284,8 @@ impl AssertPlan {
             // cgroup-wide total of allocated pages.
             let total_pages: u64 = reports
                 .iter()
-                .map(|w| w.numa_pages.values().sum::<u64>())
-                .sum();
+                .map(|w| w.numa_pages.values().copied().fold(0u64, u64::saturating_add))
+                .fold(0u64, u64::saturating_add);
             let migrated_pages: u64 = reports
                 .iter()
                 .map(|w| w.vmstat_numa_pages_migrated)
@@ -1296,7 +1311,7 @@ impl AssertPlan {
                 if w.numa_pages.is_empty() {
                     continue;
                 }
-                let total: u64 = w.numa_pages.values().sum();
+                let total: u64 = w.numa_pages.values().copied().fold(0u64, u64::saturating_add);
                 if total > 0 {
                     evaluated += 1;
                     r.merge(assert_slow_tier_ratio(
@@ -1340,8 +1355,8 @@ pub(crate) fn assert_slow_tier_ratio(
     let slow_pages: u64 = numa_pages
         .iter()
         .filter(|(node, _)| !cpu_nodes.contains(node))
-        .map(|(_, count)| count)
-        .sum();
+        .map(|(_, &count)| count)
+        .fold(0u64, u64::saturating_add);
     let ratio = slow_pages as f64 / total_pages as f64;
     if ratio > max_ratio {
         r.record_fail(AssertDetail::new(

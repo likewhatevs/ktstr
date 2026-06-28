@@ -1069,6 +1069,249 @@ fn populate_run_pooled_schbench_distribution_unions_cross_phase_percentile() {
     );
 }
 
+/// Overflow-safety: the cross-cgroup PhaseCgroupStats::merge pools the
+/// guest-runtime monotonic counters with saturating arithmetic — a corrupt
+/// u64::MAX component saturates (an absurd-but-finite value) instead of
+/// debug-panicking / release-wrapping a derived metric to a small wrong number.
+#[test]
+fn phase_cgroup_merge_saturates_counter_overflow() {
+    let a = PhaseCgroupStats {
+        total_iterations: u64::MAX,
+        total_cpu_time_ns: u64::MAX,
+        total_migrations: u64::MAX,
+        numa_pages_local: u64::MAX,
+        numa_pages_total: u64::MAX,
+        wake_sample_total: u64::MAX,
+        timer_sample_total: u64::MAX,
+        ..PhaseCgroupStats::default()
+    };
+    let b = PhaseCgroupStats {
+        total_iterations: 5,
+        total_cpu_time_ns: 5,
+        total_migrations: 5,
+        numa_pages_local: 5,
+        numa_pages_total: 5,
+        wake_sample_total: 5,
+        timer_sample_total: 5,
+        ..PhaseCgroupStats::default()
+    };
+    let m = PhaseCgroupStats::merge(a, b);
+    assert_eq!(m.total_iterations, u64::MAX, "saturates, not wraps to 4");
+    assert_eq!(m.total_cpu_time_ns, u64::MAX);
+    assert_eq!(m.total_migrations, u64::MAX);
+    assert_eq!(m.numa_pages_local, u64::MAX);
+    assert_eq!(m.numa_pages_total, u64::MAX);
+    assert_eq!(m.wake_sample_total, u64::MAX);
+    assert_eq!(m.timer_sample_total, u64::MAX);
+}
+
+/// AssertResult::merge saturates the pooled run-level guest counters
+/// (total_migrations / total_iterations) rather than wrapping on a corrupt
+/// u64::MAX component. (total_workers / total_cpus are bounded topology counts,
+/// kept as plain `+=`.)
+#[test]
+fn assert_result_merge_saturates_run_level_counters() {
+    let mut a = AssertResult::pass();
+    a.stats.total_iterations = u64::MAX;
+    a.stats.total_migrations = u64::MAX;
+    let mut b = AssertResult::pass();
+    b.stats.total_iterations = 7;
+    b.stats.total_migrations = 7;
+    a.merge(b);
+    assert_eq!(a.stats.total_iterations, u64::MAX, "saturates, not wraps");
+    assert_eq!(a.stats.total_migrations, u64::MAX);
+}
+
+/// populate_run_pooled_schbench saturates its run-delay / pcount / loop pools on
+/// a corrupt u64::MAX component (matching the already-saturating
+/// SchbenchPhaseStats::merge); a wrapped sum would corrupt the gate-Rates and the
+/// loop Counter.
+#[test]
+fn populate_run_pooled_schbench_saturates_counter_overflow() {
+    let mut stats = ScenarioStats {
+        phases: vec![
+            schbench_phase(
+                1,
+                vec![(
+                    "cg",
+                    schbench_pc(u64::MAX, u64::MAX, u64::MAX, u64::MAX, u64::MAX),
+                )],
+            ),
+            schbench_phase(2, vec![("cg", schbench_pc(5, 5, 5, 5, 5))]),
+        ],
+        ..ScenarioStats::default()
+    };
+    populate_run_pooled_schbench(&mut stats);
+    let e = &stats.ext_metrics;
+    assert_eq!(
+        e.get("total_schbench_msg_run_delay_ns").copied(),
+        Some(u64::MAX as f64),
+        "msg run-delay pool saturates, not wraps",
+    );
+    assert_eq!(
+        e.get("total_schbench_loops").copied(),
+        Some(u64::MAX as f64),
+        "loop Counter pool saturates",
+    );
+}
+
+/// populate_run_pooled_iterations_per_cpu_sec folds with saturating arithmetic:
+/// two cgroups whose total_cpu_time_ns / total_iterations each approach u64::MAX
+/// sum to a saturated u64::MAX (a huge-but-finite total) rather than wrapping.
+#[test]
+fn populate_run_pooled_iterations_per_cpu_sec_saturates_counter_overflow() {
+    let mut stats = ScenarioStats {
+        cgroups: vec![
+            CgroupStats {
+                total_cpu_time_ns: u64::MAX,
+                total_iterations: u64::MAX,
+                ..CgroupStats::default()
+            },
+            CgroupStats {
+                total_cpu_time_ns: u64::MAX,
+                total_iterations: 10,
+                ..CgroupStats::default()
+            },
+        ],
+        ..ScenarioStats::default()
+    };
+    super::run_metrics::populate_run_pooled_iterations_per_cpu_sec(&mut stats);
+    let e = &stats.ext_metrics;
+    assert_eq!(
+        e.get("total_iterations_pooled").copied(),
+        Some(u64::MAX as f64),
+        "summed_iters saturates, not wraps to 9",
+    );
+    assert_eq!(
+        e.get("total_cpu_time_sec").copied(),
+        Some(u64::MAX as f64 / 1e9),
+        "summed_ns saturates to a finite huge cpu-time-sec",
+    );
+}
+
+/// Build-path overflow-safety: cgroup_stats pools the per-worker WorkerReport
+/// counters — the FIRST cross-source fold, the one most exposed to a corrupt
+/// guest report — with saturating arithmetic. A u64::MAX component saturates
+/// instead of wrapping the per-cgroup total / migration-ratio to a small wrong
+/// number.
+#[test]
+fn cgroup_stats_saturates_per_worker_counter_overflow() {
+    let report = |iters: u64, mig: u64, cpu_ns: u64| crate::workload::WorkerReport {
+        iterations: iters,
+        migration_count: mig,
+        schedstat_cpu_time_ns: cpu_ns,
+        ..crate::workload::WorkerReport::default()
+    };
+    let reports = vec![report(u64::MAX, u64::MAX, u64::MAX), report(5, 5, 5)];
+    let cg = super::reductions::cgroup_stats(&reports);
+    assert_eq!(
+        cg.total_iterations, u64::MAX,
+        "iterations pool saturates, not wraps to 4",
+    );
+    assert_eq!(cg.total_migrations, u64::MAX, "migration pool saturates");
+    assert_eq!(cg.total_cpu_time_ns, u64::MAX, "cpu-time pool saturates");
+}
+
+/// numa_agg_per_cgroup's cross-PHASE cross_node_migrated pool saturates: a
+/// corrupt u64::MAX migration count summed across phases clamps to u64::MAX (→ a
+/// huge-but-finite worst_cross_node_migration_ratio) rather than wrapping
+/// (u64::MAX + 5 → 4) to a tiny, silently-"good" ratio.
+#[test]
+fn numa_agg_cross_node_migrated_pool_saturates_counter_overflow() {
+    let pc = |migrated: u64| PhaseCgroupStats {
+        numa_pages_local: 50,
+        numa_pages_total: 100,
+        cross_node_migrated: migrated,
+        ..PhaseCgroupStats::default()
+    };
+    let mut stats = ScenarioStats {
+        phases: vec![
+            schbench_phase(1, vec![("cg", pc(u64::MAX))]),
+            schbench_phase(2, vec![("cg", pc(5))]),
+        ],
+        ..ScenarioStats::default()
+    };
+    populate_run_distribution_metrics(&mut stats);
+    let ratio = stats
+        .ext_metrics
+        .get("worst_cross_node_migration_ratio")
+        .copied()
+        .expect("worst_cross_node_migration_ratio present");
+    // saturated migrated (u64::MAX) / latest total (100) ≈ 1.8e17; a wrapped sum
+    // (u64::MAX + 5 → 4) would give 4/100 = 0.04.
+    assert!(
+        ratio > 1e10,
+        "cross-phase migrated pool saturates (huge ratio), got {ratio} \
+         (a wrapped sum would read ~0.04)",
+    );
+}
+
+/// assert_thresholds' max_migrations absolute-count gate saturates: a corrupt
+/// per-worker migration_count summing past u64::MAX clamps to u64::MAX so the
+/// gate FIRES, instead of wrapping to a small value that would silently PASS a
+/// limit it should fail.
+#[test]
+fn assert_thresholds_max_migrations_gate_saturates_not_wraps() {
+    let report = |mig: u64| crate::workload::WorkerReport {
+        migration_count: mig,
+        iterations: 1,
+        ..crate::workload::WorkerReport::default()
+    };
+    let reports = vec![report(u64::MAX), report(5)];
+    let thresholds = super::reductions::AbsoluteThresholds {
+        max_migrations: Some(1000),
+        ..Default::default()
+    };
+    let r = super::reductions::assert_thresholds(&reports, &thresholds);
+    assert!(
+        r.is_fail(),
+        "saturated total_mig (u64::MAX) > 1000 must FAIL the gate; a wrapped sum \
+         (u64::MAX + 5 → 4) would falsely pass",
+    );
+}
+
+/// run_metric(TotalMigrations / TotalIterations) saturates its cross-cgroup sum:
+/// two cgroups at u64::MAX read back u64::MAX, not a wrapped-small typed value.
+#[test]
+fn run_metric_total_counters_saturate_cross_cgroup() {
+    let cg = |mig: u64, iters: u64| CgroupStats {
+        total_migrations: mig,
+        total_iterations: iters,
+        ..CgroupStats::default()
+    };
+    let stats = ScenarioStats {
+        cgroups: vec![cg(u64::MAX, u64::MAX), cg(5, 5)],
+        ..ScenarioStats::default()
+    };
+    assert_eq!(
+        stats.run_metric(crate::stats::BuiltinMetric::TotalMigrations),
+        Some(u64::MAX as f64),
+        "total_migrations cross-cgroup typed read saturates",
+    );
+    assert_eq!(
+        stats.run_metric(crate::stats::BuiltinMetric::TotalIterations),
+        Some(u64::MAX as f64),
+        "total_iterations cross-cgroup typed read saturates",
+    );
+}
+
+/// PhaseBucket::cgroup_counter_total (the post_vm by-name read) saturates its
+/// cross-cgroup counter pool: two per-cgroup carriers at u64::MAX read back
+/// u64::MAX, not a wrapped-small value.
+#[test]
+fn cgroup_counter_total_saturates_cross_cgroup() {
+    let pc = |mig: u64| PhaseCgroupStats {
+        total_migrations: mig,
+        ..PhaseCgroupStats::default()
+    };
+    let bucket = schbench_phase(1, vec![("a", pc(u64::MAX)), ("b", pc(5))]);
+    assert_eq!(
+        bucket.cgroup_counter_total("total_migrations"),
+        Some(u64::MAX as f64),
+        "cross-cgroup counter pool saturates, not wraps",
+    );
+}
+
 #[test]
 fn merge_scenario_stats_worst_wins_and_iterations_sum() {
     // Aggregates-across-cgroups contract for the MERGE-FOLDED worst-wins

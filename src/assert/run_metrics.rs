@@ -374,10 +374,18 @@ impl ScenarioStats {
                 .reduce(f64::max),
             // total_migrations / total_iterations: cross-cgroup SUMs. 0 is a real
             // measured sum (cgroups ran, zero events); never-measured = no cgroups.
-            B::TotalMigrations => (!self.cgroups.is_empty())
-                .then(|| self.cgroups.iter().map(|c| c.total_migrations).sum::<u64>() as f64),
-            B::TotalIterations => (!self.cgroups.is_empty())
-                .then(|| self.cgroups.iter().map(|c| c.total_iterations).sum::<u64>() as f64),
+            B::TotalMigrations => (!self.cgroups.is_empty()).then(|| {
+                self.cgroups
+                    .iter()
+                    .map(|c| c.total_migrations)
+                    .fold(0u64, u64::saturating_add) as f64
+            }),
+            B::TotalIterations => (!self.cgroups.is_empty()).then(|| {
+                self.cgroups
+                    .iter()
+                    .map(|c| c.total_iterations)
+                    .fold(0u64, u64::saturating_add) as f64
+            }),
             // worst_gap_ms: longest gap over cgroups with workers (gap 0 with
             // workers = measured "no gap observed"; never-measured = no workers).
             B::WorstGapMs => self
@@ -436,7 +444,9 @@ impl ScenarioStats {
                     e.0 = pc.numa_pages_local;
                     e.1 = pc.numa_pages_total;
                 }
-                e.2 += pc.cross_node_migrated;
+                // saturating: guest-runtime migration counter pooled across
+                // phases; never wrap the derived cross-node-migration ratio.
+                e.2 = e.2.saturating_add(pc.cross_node_migrated);
             }
         }
         by_cg.into_values().collect()
@@ -744,12 +754,15 @@ pub fn populate_run_pooled_iterations_per_cpu_sec(stats: &mut ScenarioStats) {
     // Exclude cgroups with no measured on-CPU time from BOTH sums (mirrors the
     // per-cgroup None-on-zero): crediting an unmeasured cgroup's iterations
     // against the measured cgroups' CPU-seconds would overstate efficiency.
+    // saturating fold: pool the guest-runtime cpu-time-ns / iteration counters
+    // across cgroups; a plain `.sum()` would debug-panic / release-wrap on a
+    // corrupt/hostile component, silently corrupting iterations_per_cpu_sec.
     let summed_ns: u64 = stats
         .cgroups
         .iter()
         .filter(|c| c.total_cpu_time_ns > 0)
         .map(|c| c.total_cpu_time_ns)
-        .sum();
+        .fold(0u64, u64::saturating_add);
     if summed_ns == 0 {
         return;
     }
@@ -758,7 +771,7 @@ pub fn populate_run_pooled_iterations_per_cpu_sec(stats: &mut ScenarioStats) {
         .iter()
         .filter(|c| c.total_cpu_time_ns > 0)
         .map(|c| c.total_iterations)
-        .sum();
+        .fold(0u64, u64::saturating_add);
     stats
         .ext_metrics
         .insert("total_iterations_pooled".to_string(), summed_iters as f64);
@@ -883,11 +896,14 @@ pub fn populate_run_pooled_schbench(stats: &mut ScenarioStats) {
         for pc in phase.per_cgroup.values() {
             if let Some(s) = pc.schbench.as_ref() {
                 any = true;
-                msg_run_delay_ns += s.msg_run_delay_ns;
-                msg_pcount += s.msg_pcount;
-                worker_run_delay_ns += s.worker_run_delay_ns;
-                worker_pcount += s.worker_pcount;
-                loops += s.loop_count;
+                // saturating: guest-runtime run-delay-ns / pcount / loop
+                // counters pooled across phases+cgroups (matches the already-
+                // saturating SchbenchPhaseStats::merge); never wrap a gate-Rate.
+                msg_run_delay_ns = msg_run_delay_ns.saturating_add(s.msg_run_delay_ns);
+                msg_pcount = msg_pcount.saturating_add(s.msg_pcount);
+                worker_run_delay_ns = worker_run_delay_ns.saturating_add(s.worker_run_delay_ns);
+                worker_pcount = worker_pcount.saturating_add(s.worker_pcount);
+                loops = loops.saturating_add(s.loop_count);
             }
         }
     }
