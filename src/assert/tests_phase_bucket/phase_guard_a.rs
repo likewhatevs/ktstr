@@ -1018,6 +1018,7 @@ fn build_phase_buckets_with_stimulus_synthesized_bucket_folds_full_monitor_set()
         schedstat: None,
         vcpu_cpu_time_ns: None,
         vcpu_perf: None,
+        avg_irq_util: None,
         sched_domains: None,
     };
     let evc = |fb: i64, kl: i64| {

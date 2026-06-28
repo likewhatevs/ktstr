@@ -112,6 +112,33 @@ builtin_metrics! {
     WorstCrossNodeMigrationRatio => "worst_cross_node_migration_ratio",
     TotalCpuTimeNs => "total_cpu_time_ns",
 
+    // IRQ observability — host-side observer-free signals, run-level
+    // ext-only (accessor |_| None; populated via the read_sample fold like
+    // system_time_ns). Counters / Gauge(Avg) / Peak + 3 derived rates + 2
+    // hidden capture-window duration components. Require num_snapshots >= 2
+    // (per_cpu_time freeze capture) + CONFIG_IRQ_TIME_ACCOUNTING for the
+    // time signals; loud-absent (None), never false-zero, when off. PSI-irq
+    // (psi_irq_full_avg10 / total_irq_pressure_us) is a follow-up — it is a
+    // guest /proc read not yet captured into VmResult (a follow-up).
+    TotalHardirqs => "total_hardirqs",
+    TotalSoftirqNetRx => "total_softirq_net_rx",
+    TotalSoftirqNetTx => "total_softirq_net_tx",
+    TotalSoftirqTimer => "total_softirq_timer",
+    TotalSoftirqSched => "total_softirq_sched",
+    TotalIrqTimeNs => "total_irq_time_ns",
+    TotalSoftirqTimeNs => "total_softirq_time_ns",
+    TotalStealTimeNs => "total_steal_time_ns",
+    AvgIrqUtil => "avg_irq_util",
+    MaxAvgIrqUtil => "max_avg_irq_util",
+    HardirqRate => "hardirq_rate",
+    NetRxSoftirqRate => "net_rx_softirq_rate",
+    IrqTimeFraction => "irq_time_fraction",
+    // Hidden rate-denominator components (accessor |_| None, bucket-derived):
+    // the capture-WINDOW duration (first→last freeze span), NOT the full
+    // phase wall-time. _sec backs the count-rates, _ns backs irq_time_fraction.
+    TotalPhaseWallSec => "total_phase_wall_sec",
+    TotalPhaseWallNs => "total_phase_wall_ns",
+
     // Per-phase scalars (MetricKind::PerPhase) — schbench / taobench engine
     // metrics, surfaced via the per-phase PhaseBucket path (const-named).
     WakeupP50LatencyUs => "wakeup_p50_latency_us",

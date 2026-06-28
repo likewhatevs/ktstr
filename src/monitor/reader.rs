@@ -1346,6 +1346,9 @@ pub(crate) fn read_rq_stats(mem: &GuestMem, rq_pa: u64, offsets: &KernelOffsets)
         ),
         rq_clock: mem.read_u64(rq_pa, offsets.rq_clock),
         scx_flags: mem.read_u32(rq_pa, offsets.rq_scx + offsets.scx_rq_flags),
+        // PELT IRQ load: one u64 read at the resolved nested offset, or
+        // None when CONFIG_HAVE_SCHED_AVG_IRQ is off (offset unresolved).
+        avg_irq_util: offsets.rq_avg_irq_util_avg.map(|off| mem.read_u64(rq_pa, off)),
         event_counters: None,
         schedstat: None,
         vcpu_cpu_time_ns: None,
@@ -3039,6 +3042,7 @@ mod tests {
             scx_rq_local_dsq: 20,
             scx_rq_flags: 8,
             dsq_nr: 0,
+            rq_avg_irq_util_avg: None,
             event_offsets: None,
             schedstat_offsets: None,
             sched_domain_offsets: None,

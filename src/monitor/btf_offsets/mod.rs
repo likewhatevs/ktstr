@@ -45,6 +45,10 @@ pub use cpu_time::{
 // the qualified path; the renderer that materializes it is pending.
 #[allow(unused_imports)]
 pub use cpu_time::SOFTIRQ_NAMES;
+// Named softirq vector indices (compile-pinned to SOFTIRQ_NAMES in cpu_time.rs)
+// — the IRQ read_sample arms index `PerCpuTimeStats.softirqs[]` against
+// these, never bare literals.
+pub use cpu_time::{SOFTIRQ_NET_RX, SOFTIRQ_NET_TX, SOFTIRQ_SCHED, SOFTIRQ_TIMER};
 
 mod numa;
 // NUMA event capture is pending: the wire shape and BTF resolver
@@ -438,6 +442,12 @@ pub struct KernelOffsets {
     pub scx_rq_flags: usize,
     /// Offset of `nr` within `struct scx_dispatch_q`.
     pub dsq_nr: usize,
+    /// Offset of `avg_irq.util_avg` (the PELT IRQ load) within `struct rq` —
+    /// the SUM of the `avg_irq` (sched_avg) member offset and the `util_avg`
+    /// sub-offset. `None` when CONFIG_HAVE_SCHED_AVG_IRQ is off (the field is
+    /// absent from BTF); the per-CPU read then yields `avg_irq_util = None`
+    /// (loud-absent).
+    pub rq_avg_irq_util_avg: Option<usize>,
     /// Offsets for scx event counters. Resolved via `scx_sched.pcpu`
     /// (6.18+) or `scx_sched.event_stats_cpu` (6.16-6.17) fallback.
     /// None if BTF lacks both paths.
@@ -554,6 +564,18 @@ impl KernelOffsets {
             .context("btf: resolve type of scx_rq.local_dsq")?;
         let dsq_nr = member_byte_offset(btf, &dsq_struct, "nr")?;
 
+        // PELT IRQ load offset: struct rq -> avg_irq (sched_avg) ->
+        // util_avg. Optional — the closure returns None when avg_irq is absent
+        // (CONFIG_HAVE_SCHED_AVG_IRQ off), unlike the REQUIRED rq.scx above, so
+        // a kernel without IRQ-time PELT still resolves the rest of the offsets.
+        let rq_avg_irq_util_avg = (|| {
+            let (avg_irq_off, avg_irq_member) =
+                member_byte_offset_with_member(btf, &rq_struct, "avg_irq").ok()?;
+            let sched_avg_struct = resolve_member_struct(btf, &avg_irq_member).ok()?;
+            let util_avg_off = member_byte_offset(btf, &sched_avg_struct, "util_avg").ok()?;
+            Some(avg_irq_off + util_avg_off)
+        })();
+
         let event_offsets = resolve_event_offsets(btf).ok();
         let schedstat_offsets = resolve_schedstat_offsets(btf).ok();
         let sched_domain_offsets = resolve_sched_domain_offsets(btf, &rq_struct).ok();
@@ -568,6 +590,7 @@ impl KernelOffsets {
             scx_rq_local_dsq,
             scx_rq_flags,
             dsq_nr,
+            rq_avg_irq_util_avg,
             event_offsets,
             schedstat_offsets,
             sched_domain_offsets,

@@ -1077,12 +1077,19 @@ pub fn sidecar_to_row(sc: &crate::test_support::SidecarResult) -> GauntletRow {
     // filter the payload keys go through. The registry entries are
     // `Polarity::Informational` (raw counts) + two `MetricKind::Rate`
     // derivations; see [`crate::stats::METRICS`].
-    if let Some(sd) = sc.monitor.as_ref().and_then(|m| m.schedstat_deltas.as_ref()) {
+    if let Some(sd) = sc
+        .monitor
+        .as_ref()
+        .and_then(|m| m.schedstat_deltas.as_ref())
+    {
         ext_metrics.insert("total_run_delay".to_string(), sd.total_run_delay as f64);
         ext_metrics.insert("total_pcount".to_string(), sd.total_pcount as f64);
         ext_metrics.insert("total_sched_count".to_string(), sd.total_sched_count as f64);
         ext_metrics.insert("total_yld_count".to_string(), sd.total_yld_count as f64);
-        ext_metrics.insert("total_sched_goidle".to_string(), sd.total_sched_goidle as f64);
+        ext_metrics.insert(
+            "total_sched_goidle".to_string(),
+            sd.total_sched_goidle as f64,
+        );
         ext_metrics.insert("total_ttwu_count".to_string(), sd.total_ttwu_count as f64);
         ext_metrics.insert("total_ttwu_local".to_string(), sd.total_ttwu_local as f64);
     }
@@ -1097,6 +1104,15 @@ pub fn sidecar_to_row(sc: &crate::test_support::SidecarResult) -> GauntletRow {
         && m.total_samples > 0
     {
         ext_metrics.insert("avg_nr_running".to_string(), m.avg_nr_running);
+        // PELT IRQ load, ext-only like avg_nr_running. The inner Option
+        // checks skip both keys on a non-HAVE_SCHED_AVG_IRQ kernel (loud-absent,
+        // never a false 0.0). avg_irq_util is Gauge(Avg); max_avg_irq_util Peak.
+        if let Some(v) = m.avg_irq_util {
+            ext_metrics.insert("avg_irq_util".to_string(), v);
+        }
+        if let Some(v) = m.max_avg_irq_util {
+            ext_metrics.insert("max_avg_irq_util".to_string(), v);
+        }
     }
 
     GauntletRow {

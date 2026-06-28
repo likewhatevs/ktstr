@@ -78,6 +78,41 @@ pub const SOFTIRQ_NAMES: [&str; NR_SOFTIRQS] = [
     "HI", "TIMER", "NET_TX", "NET_RX", "BLOCK", "IRQ_POLL", "TASKLET", "SCHED", "HRTIMER", "RCU",
 ];
 
+/// Named softirq vector indices into [`SOFTIRQ_NAMES`] /
+/// `super::super::dump::PerCpuTimeStats::softirqs`. The `const` block below
+/// pins each to its named slot at COMPILE time, so a future kernel
+/// softirq-enum reorder (reflected in [`SOFTIRQ_NAMES`]) breaks the build at
+/// the read site rather than silently mis-mapping a vector (IRQ metrics
+/// index against these, never bare literals).
+pub const SOFTIRQ_TIMER: usize = 1;
+pub const SOFTIRQ_NET_TX: usize = 2;
+pub const SOFTIRQ_NET_RX: usize = 3;
+pub const SOFTIRQ_SCHED: usize = 7;
+
+/// Compile-time `&str` equality for the index-pin assert below (no `==` in
+/// const context for `&str`).
+const fn softirq_name_is(idx: usize, name: &str) -> bool {
+    let (a, b) = (SOFTIRQ_NAMES[idx].as_bytes(), name.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+const _: () = {
+    assert!(softirq_name_is(SOFTIRQ_TIMER, "TIMER"));
+    assert!(softirq_name_is(SOFTIRQ_NET_TX, "NET_TX"));
+    assert!(softirq_name_is(SOFTIRQ_NET_RX, "NET_RX"));
+    assert!(softirq_name_is(SOFTIRQ_SCHED, "SCHED"));
+};
+
 /// Byte offsets used to read per-CPU CPU-time and softirq/IRQ
 /// counters from guest memory.
 ///

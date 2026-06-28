@@ -245,16 +245,20 @@ fn phase_counter_delta_returns_last_minus_first() {
     );
 }
 
-/// `phase_counter_delta` returns `Some(0.0)` for a phase with
-/// exactly one finite sample (self-delta — the metric was
-/// observed but no per-phase change can be computed), and
-/// `None` only when zero samples are finite. The distinction
-/// matters for the bucket renderer: `Some(0.0)` paints "phase
-/// has data, delta is 0"; `None` paints "no data".
+/// `phase_counter_delta` returns `None` for a phase with FEWER THAN TWO
+/// finite samples — a delta is unmeasurable from 0 or 1 points. It returns
+/// `Some(0.0)` only for 2+ finite samples that are equal (a REAL measured
+/// zero: the counter did not advance). This is the sentinel-free
+/// absent-vs-measured-zero contract: a 1-sample phase is "delta
+/// unmeasurable" (absent), NOT a phantom 0 that would make a per-phase
+/// Counter claim read 0. The renderer's has-data distinction is carried by
+/// `PhaseBucket::sample_count` (see `expect_metric`), not by this value.
 #[test]
-fn phase_counter_delta_one_finite_sample_is_self_delta() {
-    assert_eq!(phase_counter_delta(&[42.0]), Some(0.0));
-    assert_eq!(phase_counter_delta(&[f64::NAN, 42.0, f64::NAN]), Some(0.0));
+fn phase_counter_delta_under_two_finite_samples_is_unmeasurable() {
+    // 1 finite sample (incl. surrounded by NaN) => None: no second point.
+    assert_eq!(phase_counter_delta(&[42.0]), None);
+    assert_eq!(phase_counter_delta(&[f64::NAN, 42.0, f64::NAN]), None);
+    // 0 finite => None (unchanged).
     assert_eq!(phase_counter_delta(&[]), None);
     assert_eq!(phase_counter_delta(&[f64::NAN, f64::INFINITY]), None);
 }
@@ -272,6 +276,334 @@ fn phase_counter_delta_clamps_negative_to_zero_on_counter_reset() {
         Some(0.0),
         "last < first clamps to 0 (counter reset detected)",
     );
+}
+
+/// The IRQ-counter `read_sample` arms fold the per-CPU `PerCpuTimeStats`
+/// into a cross-CPU SUM at each freeze. One Sample carrying a two-CPU
+/// `per_cpu_time` slice: `total_hardirqs` = 100+200, `total_softirq_net_rx`
+/// = 10+20 (the `SOFTIRQ_NET_RX` vector index), `total_irq_time_ns` =
+/// 5_000+7_000. Empty `per_cpu_time` -> `None` (loud-absent, distinct from a
+/// measured 0). Pins the fold + the softirq index + the empty-slice guard
+/// directly, without the bucket machinery.
+#[test]
+fn irq_read_sample_arms_sum_across_cpus() {
+    use crate::monitor::btf_offsets::{NR_SOFTIRQS, SOFTIRQ_NET_RX};
+    use crate::monitor::dump::{FailureDumpReport, PerCpuTimeStats};
+    use crate::scenario::sample::SampleSeries;
+    use crate::scenario::snapshot::{DrainedSnapshotEntry, MissingStatsReason};
+
+    let net_rx = |n: u64| {
+        let mut s = [0u64; NR_SOFTIRQS];
+        s[SOFTIRQ_NET_RX] = n;
+        s
+    };
+    let entry = DrainedSnapshotEntry {
+        tag: "periodic_000".to_string(),
+        report: FailureDumpReport {
+            per_cpu_time: vec![
+                PerCpuTimeStats {
+                    cpu: 0,
+                    irqs_sum: 100,
+                    softirqs: net_rx(10),
+                    cpustat_irq_ns: 5_000,
+                    ..Default::default()
+                },
+                PerCpuTimeStats {
+                    cpu: 1,
+                    irqs_sum: 200,
+                    softirqs: net_rx(20),
+                    cpustat_irq_ns: 7_000,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        },
+        stats: Err(MissingStatsReason::NoSchedulerBinary),
+        elapsed_ms: Some(100),
+        boundary_offset_ms: None,
+        step_index: Some(1),
+    };
+    let series = SampleSeries::from_drained_typed(vec![entry], None);
+    let sample = series.iter_samples().next().expect("one sample");
+    let read = |name: &str| {
+        crate::stats::metric_def(name)
+            .expect("registered metric")
+            .read_sample(&sample)
+    };
+    assert_eq!(
+        read("total_hardirqs"),
+        Some(300.0),
+        "cross-CPU sum of irqs_sum",
+    );
+    assert_eq!(
+        read("total_softirq_net_rx"),
+        Some(30.0),
+        "cross-CPU sum of softirqs[SOFTIRQ_NET_RX]",
+    );
+    assert_eq!(
+        read("total_irq_time_ns"),
+        Some(12_000.0),
+        "cross-CPU sum of cpustat_irq_ns",
+    );
+
+    let empty = DrainedSnapshotEntry {
+        tag: "periodic_001".to_string(),
+        report: FailureDumpReport::default(),
+        stats: Err(MissingStatsReason::NoSchedulerBinary),
+        elapsed_ms: Some(200),
+        boundary_offset_ms: None,
+        step_index: Some(1),
+    };
+    let empty_series = SampleSeries::from_drained_typed(vec![empty], None);
+    let empty_sample = empty_series.iter_samples().next().expect("one sample");
+    assert_eq!(
+        crate::stats::metric_def("total_hardirqs")
+            .expect("registered metric")
+            .read_sample(&empty_sample),
+        None,
+        "empty per_cpu_time -> None (loud-absent)",
+    );
+}
+
+/// End-to-end per-phase fold for the IRQ Counter — the CI-runnable pair of
+/// the host-gated `irq_metrics_e2e` (no VM). A two-freeze `SampleSeries` with
+/// RISING per-CPU `irqs_sum` / NET_RX softirqs, both stamped the same step,
+/// builds one bucket carrying the cross-CPU last-minus-first DELTA
+/// (`total_hardirqs` = (400+500)-(100+200) = 600; `total_softirq_net_rx` =
+/// (40+60)-(10+20) = 70) plus the derived `hardirq_rate` = 600 / 3.0 s = 200
+/// (the wall-window co-insertion + `derive_rate_metrics`). The window is
+/// [1000, 4000] ms from `elapsed_ms` (no `boundary_offset_ms`), so
+/// `total_phase_wall_sec` = 3.0. A SINGLE-freeze phase yields `None` for the
+/// counter (a delta is unmeasurable from one point) and therefore no rate —
+/// proving the absent-vs-zero contract through the whole `read_sample` ->
+/// aggregate -> bucket pipeline.
+#[test]
+fn irq_counter_folds_per_phase_delta_and_rate() {
+    use crate::assert::build_phase_buckets;
+    use crate::monitor::btf_offsets::{NR_SOFTIRQS, SOFTIRQ_NET_RX};
+    use crate::monitor::dump::{FailureDumpReport, PerCpuTimeStats};
+    use crate::scenario::sample::SampleSeries;
+    use crate::scenario::snapshot::{DrainedSnapshotEntry, MissingStatsReason};
+
+    let cpu = |cpu: u32, irqs_sum: u64, net_rx: u64| {
+        let mut softirqs = [0u64; NR_SOFTIRQS];
+        softirqs[SOFTIRQ_NET_RX] = net_rx;
+        PerCpuTimeStats {
+            cpu,
+            irqs_sum,
+            softirqs,
+            ..Default::default()
+        }
+    };
+    let freeze =
+        |tag: &str, elapsed_ms: u64, c0: PerCpuTimeStats, c1: PerCpuTimeStats| DrainedSnapshotEntry {
+            tag: tag.to_string(),
+            report: FailureDumpReport {
+                per_cpu_time: vec![c0, c1],
+                ..Default::default()
+            },
+            stats: Err(MissingStatsReason::NoSchedulerBinary),
+            elapsed_ms: Some(elapsed_ms),
+            boundary_offset_ms: None,
+            step_index: Some(1),
+        };
+
+    // Two freezes 3_000 ms apart in the SAME stamped step -> one bucket.
+    let two = SampleSeries::from_drained_typed(
+        vec![
+            freeze("periodic_000", 1_000, cpu(0, 100, 10), cpu(1, 200, 20)),
+            freeze("periodic_001", 4_000, cpu(0, 400, 40), cpu(1, 500, 60)),
+        ],
+        None,
+    );
+    let buckets = build_phase_buckets(&two);
+    let bucket = buckets
+        .iter()
+        .find(|b| b.step_index == 1)
+        .expect("step-1 bucket present");
+    assert_eq!(
+        bucket.get("total_hardirqs"),
+        Some(600.0),
+        "cross-CPU last-minus-first: (400+500)-(100+200)",
+    );
+    assert_eq!(
+        bucket.get("total_softirq_net_rx"),
+        Some(70.0),
+        "cross-CPU NET_RX delta: (40+60)-(10+20)",
+    );
+    assert_eq!(
+        bucket.get("hardirq_rate"),
+        Some(200.0),
+        "600 hardirqs / 3.0 s capture window",
+    );
+
+    // A single freeze in the phase: the Counter delta is unmeasurable from
+    // one point -> None (NOT a phantom 0), so no rate is co-derived either.
+    let one = SampleSeries::from_drained_typed(
+        vec![freeze("periodic_000", 1_000, cpu(0, 100, 10), cpu(1, 200, 20))],
+        None,
+    );
+    let buckets = build_phase_buckets(&one);
+    let bucket = buckets
+        .iter()
+        .find(|b| b.step_index == 1)
+        .expect("step-1 bucket present");
+    assert_eq!(
+        bucket.get("total_hardirqs"),
+        None,
+        "single-freeze phase: counter delta unmeasurable -> None",
+    );
+    assert_eq!(
+        bucket.get("hardirq_rate"),
+        None,
+        "no counter component -> no rate co-insertion",
+    );
+}
+
+/// Run-level IRQ rate must NOT inflate on a MULTI-phase run (regression guard
+/// for the num/den time-base mismatch). The run-level numerator total_hardirqs
+/// is the DIRECT whole-run delta (populate_run_ext_metrics: read_sample over
+/// ALL freezes); the matching denominator total_phase_wall_sec must be the
+/// WHOLE-RUN freeze span (inserted by that same direct path), NOT the
+/// Σ-per-phase-capture span (which excludes the cross-capture gap the numerator
+/// counts). Two phases capturing [1s,4s] and [6s,9s] with the gap [4s,6s]
+/// carrying real (counted) IRQ activity: whole-run Δ = 900-100 = 800; whole-run
+/// span = 9-1 = 8 s → hardirq_rate = 100/s. The buggy Σ-phase denominator would
+/// be (4-1)+(9-6) = 6 s → 133.3/s (inflated 8/6). Calls BOTH run-level populate
+/// fns in eval order to pin the real production path.
+#[test]
+fn run_level_irq_rate_uses_whole_run_span_not_phase_sum() {
+    use crate::assert::{
+        build_phase_buckets, populate_run_ext_metrics, populate_run_ext_metrics_from_phases,
+    };
+    use crate::monitor::dump::{FailureDumpReport, PerCpuTimeStats};
+    use crate::scenario::sample::SampleSeries;
+    use crate::scenario::snapshot::{DrainedSnapshotEntry, MissingStatsReason};
+
+    let freeze = |tag: &str, elapsed_ms: u64, step: u16, irqs_sum: u64| DrainedSnapshotEntry {
+        tag: tag.to_string(),
+        report: FailureDumpReport {
+            per_cpu_time: vec![PerCpuTimeStats {
+                cpu: 0,
+                irqs_sum,
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+        stats: Err(MissingStatsReason::NoSchedulerBinary),
+        elapsed_ms: Some(elapsed_ms),
+        boundary_offset_ms: None,
+        step_index: Some(step),
+    };
+    // Phase 1 captures at 1s,4s; gap 4s..6s (irqs_sum keeps rising — counted in
+    // the whole-run delta but in NO phase's within-window delta); phase 2 at
+    // 6s,9s. Monotonic irqs_sum across the whole run.
+    let series = SampleSeries::from_drained_typed(
+        vec![
+            freeze("periodic_000", 1_000, 1, 100),
+            freeze("periodic_001", 4_000, 1, 400),
+            freeze("periodic_002", 6_000, 2, 600),
+            freeze("periodic_003", 9_000, 2, 900),
+        ],
+        None,
+    );
+    let buckets = build_phase_buckets(&series);
+    let mut ext = std::collections::BTreeMap::new();
+    // Eval order: direct (whole-run) THEN phase-sum (the latter's wall/count
+    // inserts no-op via contains_key once the direct path has filled them).
+    populate_run_ext_metrics(&series, &mut ext);
+    populate_run_ext_metrics_from_phases(&buckets, &mut ext);
+
+    // Count = whole-run delta (direct), spanning the cross-capture gap.
+    assert_eq!(
+        ext.get("total_hardirqs").copied(),
+        Some(800.0),
+        "whole-run delta 900-100, not the Σ-per-phase 300+300=600",
+    );
+    // Denominator = whole-run freeze span (9-1=8 s), NOT Σ-per-phase (3+3=6 s).
+    assert_eq!(
+        ext.get("total_phase_wall_sec").copied(),
+        Some(8.0),
+        "whole-run span 8 s, not the Σ-per-phase 6 s",
+    );
+    // Rate = 800/8 = 100, NOT the inflated 800/6 = 133.3.
+    let rate = ext
+        .get("hardirq_rate")
+        .copied()
+        .expect("hardirq_rate derived at run level");
+    assert!(
+        (rate - 100.0).abs() < 1e-9,
+        "whole-run rate 800/8s=100, not the mismatched 800/6s=133.3; got {rate}",
+    );
+}
+
+/// The whole-run path SURVIVES the sparse multi-phase case where a
+/// Σ-per-phase numerator would VANISH. Two phases with ONE freeze each (2 total,
+/// at 1s and 9s): each phase's within-window delta is `None` (a delta needs >=2
+/// freezes), so a per-phase-summed numerator would be absent → no run-level
+/// rate. The direct whole-run path still measures Δ = 500-100 = 400 over the
+/// [1s,9s] = 8 s span → hardirq_rate = 50/s. The rate's floor is >=2 TOTAL
+/// freezes (== the count's floor), NOT >=2 per phase.
+#[test]
+fn run_level_irq_rate_survives_sparse_multi_phase() {
+    use crate::assert::{
+        build_phase_buckets, populate_run_ext_metrics, populate_run_ext_metrics_from_phases,
+    };
+    use crate::monitor::dump::{FailureDumpReport, PerCpuTimeStats};
+    use crate::scenario::sample::SampleSeries;
+    use crate::scenario::snapshot::{DrainedSnapshotEntry, MissingStatsReason};
+
+    let freeze = |tag: &str, elapsed_ms: u64, step: u16, irqs_sum: u64| DrainedSnapshotEntry {
+        tag: tag.to_string(),
+        report: FailureDumpReport {
+            per_cpu_time: vec![PerCpuTimeStats {
+                cpu: 0,
+                irqs_sum,
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+        stats: Err(MissingStatsReason::NoSchedulerBinary),
+        elapsed_ms: Some(elapsed_ms),
+        boundary_offset_ms: None,
+        step_index: Some(step),
+    };
+    // One freeze per phase → each per-phase delta is unmeasurable.
+    let series = SampleSeries::from_drained_typed(
+        vec![
+            freeze("periodic_000", 1_000, 1, 100),
+            freeze("periodic_001", 9_000, 2, 500),
+        ],
+        None,
+    );
+    let buckets = build_phase_buckets(&series);
+    for b in &buckets {
+        assert_eq!(
+            b.get("total_hardirqs"),
+            None,
+            "single-freeze phase has no measurable per-phase counter delta",
+        );
+    }
+    let mut ext = std::collections::BTreeMap::new();
+    populate_run_ext_metrics(&series, &mut ext);
+    populate_run_ext_metrics_from_phases(&buckets, &mut ext);
+    // The whole-run path still measures Δ=400 over 8 s → 50/s. (A Σ-per-phase
+    // numerator would be absent here → no rate at all.)
+    assert_eq!(
+        ext.get("total_hardirqs").copied(),
+        Some(400.0),
+        "whole-run delta survives where per-phase deltas vanish",
+    );
+    assert_eq!(
+        ext.get("total_phase_wall_sec").copied(),
+        Some(8.0),
+        "whole-run span 9-1=8 s",
+    );
+    let rate = ext
+        .get("hardirq_rate")
+        .copied()
+        .expect("rate derives where a phase-summed numerator would vanish");
+    assert!((rate - 50.0).abs() < 1e-9, "400/8s=50; got {rate}");
 }
 
 /// `aggregate_samples_for_phase` dispatches Counter through

@@ -688,6 +688,31 @@ fn buckets_from_grouped(
             monitor_to_window_offset_ms,
             preemption_threshold_ns,
         );
+        // Phase-wall denominators for the IRQ rates, co-inserted
+        // both-or-neither with the read_sample-folded IRQ numerators above so
+        // derive_rate_metrics pairs num/den from THIS bucket (never cross-paired
+        // with a stimulus event's total_phase_duration_sec — a distinct
+        // metric). The window is the CAPTURE span (start_ms/end_ms = first->last
+        // freeze offset), the same span the Counter numerators accrue over:
+        // self-consistent for the ns/ns fraction, and a capture-window rate for
+        // the per-second rates (the d/span factor cancels in an A/B compare with
+        // matched cadence). Gate on total_hardirqs (present iff per_cpu_time was
+        // captured; irqtime-independent, unlike total_irq_time_ns) + a positive
+        // window. ms->ns and ms->s scaling lives HERE (derive_rate_metrics does
+        // bare num/den). One insertion covers both derive sites:
+        // build_phase_buckets_with_stimulus folds over buckets_from_grouped's
+        // output, so its later re-derive sees these denominators too.
+        if bucket.metrics.contains_key("total_hardirqs") && bucket.end_ms > bucket.start_ms {
+            let wall_ms = (bucket.end_ms - bucket.start_ms) as f64;
+            bucket
+                .metrics
+                .entry("total_phase_wall_ns".to_string())
+                .or_insert(wall_ms * 1_000_000.0);
+            bucket
+                .metrics
+                .entry("total_phase_wall_sec".to_string())
+                .or_insert(wall_ms / 1000.0);
+        }
         // Derive Rate metrics AFTER every component source is folded in:
         // the METRICS reductions + system/user_time_ns above AND the
         // monitor-injected components (e.g. avg_imbalance_ratio, whose ONLY

@@ -817,19 +817,26 @@ pub fn aggregate_samples_for_phase(metric: &MetricDef, samples: &[f64]) -> Optio
 /// when reducing cumulative kernel counters across boundaries
 /// for the same reset-detection reason.
 ///
-/// Edge cases:
-///   - 0 finite samples -> `None`.
-///   - 1 finite sample -> `Some(0.0)` (self-delta; the metric
-///     was observed but no per-phase change can be computed).
-///   - 2+ finite samples -> `Some(max(0.0, last - first))`.
+/// Edge cases (sentinel-free absent-vs-measured-zero):
+///   - 0 or 1 finite samples -> `None`. A delta is UNMEASURABLE from
+///     fewer than two points; absence here is distinct from a measured
+///     zero. The renderer's has-data signal is `PhaseBucket::sample_count`
+///     (see `expect_metric`), NOT this value, so absence loses no
+///     diagnostic. (Previously a 1-sample phase returned a phantom
+///     `Some(0.0)` that made a per-phase Counter claim read 0 even when
+///     the phase fired plenty — only one freeze landed.)
+///   - 2+ finite samples -> `Some(max(0.0, last - first))` (equal
+///     endpoints give a REAL `Some(0.0)`: the counter did not advance).
 ///
 /// Live caller: [`aggregate_samples_for_phase`] dispatches the
 /// Counter variant through this entry point.
 pub fn phase_counter_delta(samples: &[f64]) -> Option<f64> {
     let finite: Vec<f64> = samples.iter().copied().filter(|x| x.is_finite()).collect();
     match finite.as_slice() {
-        [] => None,
-        [_only] => Some(0.0),
+        // 0 or 1 finite samples: a delta is unmeasurable from fewer than two
+        // points -> None (sentinel-free contract). The 2+-equal case below
+        // still yields a real Some(0.0).
+        [] | [_] => None,
         [first, .., last] => {
             let delta = *last - *first;
             if delta < 0.0 {
@@ -1041,6 +1048,65 @@ impl MetricDef {
                 .event_counter_timeline()
                 .last()
                 .map(|e| e.dispatch_keep_last as f64),
+            // IRQ observability: cross-CPU SUM of the cumulative per-CPU
+            // counter at this freeze. Counter kind takes the per-phase
+            // last-minus-first (phase_counter_delta) over these per-freeze
+            // totals. The per-CPU set is fixed across freezes (every CPU is
+            // present every freeze), so the cross-CPU sum has NO task-set-change
+            // inflation — the exact reason system_time_ns below is NOT a
+            // read_sample arm but these are. Empty per_cpu_time -> None
+            // (loud-absent, never a false zero). Softirq vectors index against
+            // the compile-pinned named consts, never bare literals.
+            "total_hardirqs" => {
+                let cpus = sample.snapshot.per_cpu_time();
+                (!cpus.is_empty()).then(|| cpus.iter().map(|c| c.irqs_sum).sum::<u64>() as f64)
+            }
+            "total_softirq_net_rx" => {
+                let cpus = sample.snapshot.per_cpu_time();
+                (!cpus.is_empty()).then(|| {
+                    cpus.iter()
+                        .map(|c| c.softirqs[crate::monitor::btf_offsets::SOFTIRQ_NET_RX])
+                        .sum::<u64>() as f64
+                })
+            }
+            "total_softirq_net_tx" => {
+                let cpus = sample.snapshot.per_cpu_time();
+                (!cpus.is_empty()).then(|| {
+                    cpus.iter()
+                        .map(|c| c.softirqs[crate::monitor::btf_offsets::SOFTIRQ_NET_TX])
+                        .sum::<u64>() as f64
+                })
+            }
+            "total_softirq_timer" => {
+                let cpus = sample.snapshot.per_cpu_time();
+                (!cpus.is_empty()).then(|| {
+                    cpus.iter()
+                        .map(|c| c.softirqs[crate::monitor::btf_offsets::SOFTIRQ_TIMER])
+                        .sum::<u64>() as f64
+                })
+            }
+            "total_softirq_sched" => {
+                let cpus = sample.snapshot.per_cpu_time();
+                (!cpus.is_empty()).then(|| {
+                    cpus.iter()
+                        .map(|c| c.softirqs[crate::monitor::btf_offsets::SOFTIRQ_SCHED])
+                        .sum::<u64>() as f64
+                })
+            }
+            "total_irq_time_ns" => {
+                let cpus = sample.snapshot.per_cpu_time();
+                (!cpus.is_empty()).then(|| cpus.iter().map(|c| c.cpustat_irq_ns).sum::<u64>() as f64)
+            }
+            "total_softirq_time_ns" => {
+                let cpus = sample.snapshot.per_cpu_time();
+                (!cpus.is_empty())
+                    .then(|| cpus.iter().map(|c| c.cpustat_softirq_ns).sum::<u64>() as f64)
+            }
+            "total_steal_time_ns" => {
+                let cpus = sample.snapshot.per_cpu_time();
+                (!cpus.is_empty())
+                    .then(|| cpus.iter().map(|c| c.cpustat_steal_ns).sum::<u64>() as f64)
+            }
             // `system_time_ns` / `user_time_ns` are deliberately absent
             // here: they are NOT read per-sample. A per-sample
             // cross-thread SUM followed by a Counter `last - first`
@@ -1850,6 +1916,212 @@ pub static METRICS: &[MetricDef] = &[
         name: "user_time_ns",
         polarity: crate::test_support::Polarity::LowerBetter,
         kind: MetricKind::Gauge(GaugeAgg::Avg),
+        default_abs: 1_000_000.0,
+        default_rel: 0.30,
+        display_unit: "ns",
+        accessor: |_| None,
+    },
+    // ---- IRQ observability ----
+    // Host-side observer-free IRQ signals from PerCpuTimeStats (freeze
+    // Snapshot, src/monitor/dump/mod.rs), cross-CPU folded at
+    // read_sample and carried through ext_metrics (accessor |_| None) like
+    // system_time_ns. The time signals require CONFIG_IRQ_TIME_ACCOUNTING;
+    // loud-absent (None), never false-zero, when off. Per-phase
+    // reduction is the Counter last-minus-first over the bucket's freeze
+    // captures (needs num_snapshots >= 2). max_cpu_hardirqs (spatial-max of a
+    // cumulative counter) is NOT here — it needs a per-CPU axis (follow-up).
+    MetricDef {
+        // Sum of kernel_stat.irqs_sum across CPUs — total hardirqs fired
+        // (per-CPU monotonic count, __kstat_incr_irqs_this_cpu,
+        // kernel/irq/internals.h). NOT gated on irqtime (always populates).
+        name: "total_hardirqs",
+        polarity: crate::test_support::Polarity::Informational,
+        kind: MetricKind::Counter,
+        default_abs: 1000.0,
+        default_rel: 0.50,
+        display_unit: "",
+        accessor: |_| None,
+    },
+    MetricDef {
+        // Sum of kernel_stat.softirqs[NET_RX] across CPUs (index via
+        // SOFTIRQ_NAMES; kstat_incr_softirqs_this_cpu, kernel/softirq.c). The
+        // load-bearing softirq for NetTraffic RX.
+        name: "total_softirq_net_rx",
+        polarity: crate::test_support::Polarity::Informational,
+        kind: MetricKind::Counter,
+        default_abs: 500.0,
+        default_rel: 0.50,
+        display_unit: "",
+        accessor: |_| None,
+    },
+    MetricDef {
+        // Sum of kernel_stat.softirqs[NET_TX] across CPUs.
+        name: "total_softirq_net_tx",
+        polarity: crate::test_support::Polarity::Informational,
+        kind: MetricKind::Counter,
+        default_abs: 500.0,
+        default_rel: 0.50,
+        display_unit: "",
+        accessor: |_| None,
+    },
+    MetricDef {
+        // Sum of kernel_stat.softirqs[TIMER] across CPUs.
+        name: "total_softirq_timer",
+        polarity: crate::test_support::Polarity::Informational,
+        kind: MetricKind::Counter,
+        default_abs: 1000.0,
+        default_rel: 0.50,
+        display_unit: "",
+        accessor: |_| None,
+    },
+    MetricDef {
+        // Sum of kernel_stat.softirqs[SCHED] across CPUs.
+        name: "total_softirq_sched",
+        polarity: crate::test_support::Polarity::Informational,
+        kind: MetricKind::Counter,
+        default_abs: 1000.0,
+        default_rel: 0.50,
+        display_unit: "",
+        accessor: |_| None,
+    },
+    MetricDef {
+        // Sum of kernel_cpustat.cpustat[CPUTIME_IRQ] across CPUs — raw ns in
+        // hardirq (irqtime_account_delta, kernel/sched/cputime.c). Read from
+        // guest memory as ns (NOT /proc/stat jiffies — no nsec_to_clock_t).
+        // Requires CONFIG_IRQ_TIME_ACCOUNTING; Counter/ns like system_time_ns.
+        name: "total_irq_time_ns",
+        polarity: crate::test_support::Polarity::Informational,
+        kind: MetricKind::Counter,
+        default_abs: 1_000_000.0,
+        default_rel: 0.50,
+        display_unit: "ns",
+        accessor: |_| None,
+    },
+    MetricDef {
+        // Sum of kernel_cpustat.cpustat[CPUTIME_SOFTIRQ] across CPUs — raw ns
+        // in softirq. Requires CONFIG_IRQ_TIME_ACCOUNTING.
+        name: "total_softirq_time_ns",
+        polarity: crate::test_support::Polarity::Informational,
+        kind: MetricKind::Counter,
+        default_abs: 1_000_000.0,
+        default_rel: 0.50,
+        display_unit: "ns",
+        accessor: |_| None,
+    },
+    MetricDef {
+        // Sum of kernel_cpustat.cpustat[CPUTIME_STEAL] across CPUs — raw ns the
+        // hypervisor stole (account_steal_time; needs CONFIG_PARAVIRT_TIME_
+        // ACCOUNTING + kvm-clock steal-time). CPUTIME_STEAL is an unconditional
+        // enum member (enum cpu_usage_stat, include/linux/kernel_stat.h), so
+        // steal-accounting-off reads a constant 0 — a measured Some(0.0), NOT
+        // loud-absent like the BTF-gated avg_irq gauge.
+        name: "total_steal_time_ns",
+        polarity: crate::test_support::Polarity::Informational,
+        kind: MetricKind::Counter,
+        default_abs: 1_000_000.0,
+        default_rel: 0.50,
+        display_unit: "ns",
+        accessor: |_| None,
+    },
+    MetricDef {
+        // Mean across CPUs of rq->avg_irq.util_avg — the PELT IRQ load average
+        // (struct sched_avg, kernel/sched/sched.h; range [0, 1024] =
+        // SCHED_CAPACITY_SCALE). INSTANTANEOUS gauge (decaying PELT), NEVER
+        // deltaed. Requires CONFIG_HAVE_SCHED_AVG_IRQ (def_bool y when
+        // (IRQ_TIME_ACCOUNTING || PARAVIRT_TIME_ACCOUNTING) && SMP — init/Kconfig).
+        // Distinct from taskstats avg_irq_delay_ns (irq-DELAY accounting); this
+        // is PELT util.
+        name: "avg_irq_util",
+        polarity: crate::test_support::Polarity::LowerBetter,
+        kind: MetricKind::Gauge(GaugeAgg::Avg),
+        default_abs: 20.0,
+        default_rel: 0.30,
+        display_unit: "",
+        accessor: |_| None,
+    },
+    MetricDef {
+        // Host spatial-max ACROSS CPUs of the INSTANTANEOUS rq->avg_irq.util_avg
+        // gauge (worst-CPU IRQ load at the freeze) — NOT a kernel max-of-window.
+        // Peak because both the spatial and temporal reduces are max over
+        // instantaneous values (no cumulative-delta hazard, unlike a counter's
+        // spatial-max; per-CPU axis is a follow-up). Range [0, 1024].
+        name: "max_avg_irq_util",
+        polarity: crate::test_support::Polarity::LowerBetter,
+        kind: MetricKind::Peak,
+        default_abs: 50.0,
+        default_rel: 0.30,
+        display_unit: "",
+        accessor: |_| None,
+    },
+    MetricDef {
+        // DERIVED rate: total_hardirqs / total_phase_wall_sec — hardirqs per
+        // second over the CAPTURE WINDOW (first->last freeze span, NOT the full
+        // phase; see total_phase_wall_sec). For A/B compare the cadence cancels.
+        name: "hardirq_rate",
+        polarity: crate::test_support::Polarity::Informational,
+        kind: MetricKind::Rate {
+            numerator: "total_hardirqs",
+            denominator: "total_phase_wall_sec",
+        },
+        default_abs: 10.0,
+        default_rel: 0.30,
+        display_unit: "irq/s",
+        accessor: |_| None,
+    },
+    MetricDef {
+        // DERIVED rate: total_softirq_net_rx / total_phase_wall_sec — NET_RX
+        // softirqs per second over the capture window. The NetTraffic
+        // softirq-pressure signal.
+        name: "net_rx_softirq_rate",
+        polarity: crate::test_support::Polarity::Informational,
+        kind: MetricKind::Rate {
+            numerator: "total_softirq_net_rx",
+            denominator: "total_phase_wall_sec",
+        },
+        default_abs: 10.0,
+        default_rel: 0.30,
+        display_unit: "softirq/s",
+        accessor: |_| None,
+    },
+    MetricDef {
+        // DERIVED rate: total_irq_time_ns / total_phase_wall_ns — the
+        // dimensionless [0,1] fraction of the capture window spent in hardirq.
+        // ns/ns (both over the SAME first->last freeze span) so the span-vs-
+        // phase gap cancels. The exact-integral companion to avg_irq_util's
+        // smoothed PELT gauge.
+        name: "irq_time_fraction",
+        polarity: crate::test_support::Polarity::LowerBetter,
+        kind: MetricKind::Rate {
+            numerator: "total_irq_time_ns",
+            denominator: "total_phase_wall_ns",
+        },
+        default_abs: 0.02,
+        default_rel: 0.30,
+        display_unit: "",
+        accessor: |_| None,
+    },
+    MetricDef {
+        // Hidden rate-denominator component (NOT user-facing): the CAPTURE-
+        // WINDOW duration in seconds = (bucket end_ms - start_ms)/1000, co-
+        // inserted in buckets_from_grouped both-or-neither with the IRQ
+        // counters (the /1000 lives at the insertion site; derive_rate_metrics
+        // does bare num/den). Backs hardirq_rate / net_rx_softirq_rate. Counter
+        // so it survives the cross-RUN Sum-fold (Sum count / Sum sec re-derives).
+        name: "total_phase_wall_sec",
+        polarity: crate::test_support::Polarity::Informational,
+        kind: MetricKind::Counter,
+        default_abs: 0.1,
+        default_rel: 0.30,
+        display_unit: "s",
+        accessor: |_| None,
+    },
+    MetricDef {
+        // Hidden rate-denominator component (NOT user-facing): the capture-
+        // window duration in NANOSECONDS = (bucket end_ms - start_ms) * 1e6,
+        // co-inserted with the IRQ counters. Backs irq_time_fraction (ns/ns).
+        name: "total_phase_wall_ns",
+        polarity: crate::test_support::Polarity::Informational,
+        kind: MetricKind::Counter,
         default_abs: 1_000_000.0,
         default_rel: 0.30,
         display_unit: "ns",

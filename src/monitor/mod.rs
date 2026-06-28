@@ -514,6 +514,14 @@ pub struct CpuSnapshot {
     pub rq_clock: u64,
     /// sched_ext flags for this CPU (`scx_rq.flags`).
     pub scx_flags: u32,
+    /// PELT IRQ load average (`rq.avg_irq.util_avg`), an INSTANTANEOUS gauge in
+    /// `[0, SCHED_CAPACITY_SCALE=1024]`. `None` when CONFIG_HAVE_SCHED_AVG_IRQ
+    /// is off (the field is absent from BTF, so the offset resolves to None).
+    /// Sampled per periodic monitor tick (the dense gauge axis), NOT a freeze
+    /// counter; the run-level `avg_irq_util` / `max_avg_irq_util` metrics are
+    /// folded from this in `MonitorSummary`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avg_irq_util: Option<u64>,
     /// scx event counters (cumulative). None when event counter
     /// offsets are unavailable or scx_root is not set.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -738,6 +746,15 @@ pub struct MonitorSummary {
     pub avg_nr_running: f64,
     /// Average local DSQ depth per CPU across valid samples.
     pub avg_local_dsq_depth: f64,
+    /// Mean PELT IRQ load (`rq.avg_irq.util_avg`, 0..=1024) across the CPUs
+    /// and valid samples that REPORTED it. `None` when no sample carried an
+    /// avg_irq reading (CONFIG_HAVE_SCHED_AVG_IRQ off) — loud-absent, never a
+    /// false 0.0. The divisor is the reporting-CPU-reading count, NOT
+    /// all CPU readings.
+    pub avg_irq_util: Option<f64>,
+    /// Peak (max across CPUs and samples) PELT IRQ load. `None` when no sample
+    /// reported avg_irq (same gate as `avg_irq_util`).
+    pub max_avg_irq_util: Option<f64>,
     /// Aggregate event counter deltas over the monitoring window.
     /// None when event counters are not available.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -859,6 +876,13 @@ impl MonitorSummary {
         let mut sum_local_dsq_depth: f64 = 0.0;
         let mut valid_sample_count: usize = 0;
         let mut total_cpu_readings: usize = 0;
+        // PELT IRQ load: mean + peak over the CPUs/samples that REPORTED
+        // avg_irq_util (a gate-aware Option — absent on non-HAVE_SCHED_AVG_IRQ
+        // kernels). Divisor is `avg_irq_readings`, NOT total_cpu_readings, so a
+        // kernel where only some/no CPUs report it is not diluted/false-zeroed.
+        let mut sum_avg_irq: f64 = 0.0;
+        let mut max_avg_irq: f64 = 0.0;
+        let mut avg_irq_readings: usize = 0;
 
         for sample in samples {
             if sample.cpus.is_empty() || !sample_looks_valid(sample) {
@@ -870,6 +894,14 @@ impl MonitorSummary {
                 sum_nr_running += cpu.nr_running as f64;
                 sum_local_dsq_depth += cpu.local_dsq_depth as f64;
                 total_cpu_readings += 1;
+                if let Some(u) = cpu.avg_irq_util {
+                    let u = u as f64;
+                    sum_avg_irq += u;
+                    if u > max_avg_irq {
+                        max_avg_irq = u;
+                    }
+                    avg_irq_readings += 1;
+                }
             }
             let ratio = sample.imbalance_ratio();
             sum_imbalance_ratio += ratio;
@@ -893,6 +925,10 @@ impl MonitorSummary {
         } else {
             0.0
         };
+        // Loud-absent: None (not 0.0) when no CPU reported avg_irq, preserving
+        // the absent-vs-measured-zero distinction.
+        let avg_irq_util = (avg_irq_readings > 0).then(|| sum_avg_irq / avg_irq_readings as f64);
+        let max_avg_irq_util = (avg_irq_readings > 0).then_some(max_avg_irq);
 
         // Stuck count: number of (CPU, consecutive-sample-pair)
         // observations whose rq_clock did not advance. Skip invalid samples.
@@ -938,6 +974,8 @@ impl MonitorSummary {
             avg_imbalance_ratio,
             avg_nr_running,
             avg_local_dsq_depth,
+            avg_irq_util,
+            max_avg_irq_util,
             event_deltas,
             schedstat_deltas,
             prog_stats_deltas,

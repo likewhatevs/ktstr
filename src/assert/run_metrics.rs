@@ -1130,6 +1130,43 @@ pub fn populate_run_ext_metrics(
             target.insert(metric_def.name.to_string(), reduced);
         }
     }
+    // Run-level capture-window wall for the IRQ rates: the elapsed span of the
+    // per_cpu_time-bearing freezes — the SAME freezes the IRQ-counter numerators
+    // above were read_sampled from (whole-run last-minus-first via
+    // phase_counter_delta). Inserting it HERE (the direct/whole-run path) makes
+    // the run-level rate's numerator AND denominator share the whole-run span.
+    // Without it, derive_rate_metrics below finds the numerator but no
+    // denominator (total_phase_wall_sec has no read_sample arm), and the rate
+    // would instead be derived by populate_run_ext_metrics_from_phases over a
+    // Σ-per-phase-capture denominator — a NARROWER time base than this whole-run
+    // numerator (it excludes the inter-phase / cross-capture gaps the numerator
+    // counts), inflating the rate on MULTI-phase runs. Run-level analog of the
+    // per-phase assert::phase_build. Gated on total_hardirqs
+    // (irqtime-independent), so the count-rates derive even when
+    // CONFIG_IRQ_TIME_ACCOUNTING is off and total_irq_time_ns is absent. Min/max
+    // over the elapsed-bearing freezes: chronological periodic samples put the
+    // numerator's first/last reading at min/max elapsed, so num and den span the
+    // identical interval.
+    if target.contains_key("total_hardirqs") {
+        let irq_elapsed_ms: Vec<u64> = samples
+            .iter_samples()
+            .filter(|s| !s.snapshot.per_cpu_time().is_empty())
+            .filter_map(|s| s.elapsed_ms)
+            .collect();
+        if let (Some(first), Some(last)) = (
+            irq_elapsed_ms.iter().min().copied(),
+            irq_elapsed_ms.iter().max().copied(),
+        ) && last > first
+        {
+            let wall_ms = (last - first) as f64;
+            target
+                .entry("total_phase_wall_ns".to_string())
+                .or_insert(wall_ms * 1_000_000.0);
+            target
+                .entry("total_phase_wall_sec".to_string())
+                .or_insert(wall_ms / 1000.0);
+        }
+    }
     // Re-derive Rate metrics from the read_sample components just folded
     // in. populate_run_ext_metrics is pub and called standalone (tests,
     // and not only ahead of populate_run_ext_metrics_from_phases), so it

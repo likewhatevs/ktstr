@@ -1420,6 +1420,7 @@ mod tests {
                     schedstat: None,
                     vcpu_cpu_time_ns: None,
                     vcpu_perf: None,
+                    avg_irq_util: None,
                     sched_domains: None,
                 })
                 .collect(),
@@ -2345,6 +2346,7 @@ mod tests {
                 schedstat: None,
                 vcpu_cpu_time_ns: None,
                 vcpu_perf: None,
+                avg_irq_util: None,
                 sched_domains: None,
             }],
         };
@@ -2365,6 +2367,7 @@ mod tests {
                 schedstat: None,
                 vcpu_cpu_time_ns: None,
                 vcpu_perf: None,
+                avg_irq_util: None,
                 sched_domains: None,
             }],
         };
@@ -2412,6 +2415,7 @@ mod tests {
                 schedstat: None,
                 vcpu_cpu_time_ns: None,
                 vcpu_perf: None,
+                avg_irq_util: None,
                 sched_domains: None,
             }],
         };
@@ -2432,6 +2436,7 @@ mod tests {
                 schedstat: None,
                 vcpu_cpu_time_ns: None,
                 vcpu_perf: None,
+                avg_irq_util: None,
                 sched_domains: None,
             }],
         };
@@ -2511,6 +2516,7 @@ mod tests {
                     schedstat: None,
                     vcpu_cpu_time_ns: None,
                     vcpu_perf: None,
+                    avg_irq_util: None,
                     sched_domains: None,
                 }],
             });
@@ -2536,6 +2542,7 @@ mod tests {
                     schedstat: None,
                     vcpu_cpu_time_ns: None,
                     vcpu_perf: None,
+                    avg_irq_util: None,
                     sched_domains: None,
                 }],
             });

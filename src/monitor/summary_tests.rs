@@ -347,6 +347,7 @@ fn from_samples_fields_sane_values() {
                     schedstat: None,
                     vcpu_cpu_time_ns: None,
                     vcpu_perf: None,
+                    avg_irq_util: None,
                     sched_domains: None,
                 },
                 CpuSnapshot {
@@ -363,6 +364,7 @@ fn from_samples_fields_sane_values() {
                     schedstat: None,
                     vcpu_cpu_time_ns: None,
                     vcpu_perf: None,
+                    avg_irq_util: None,
                     sched_domains: None,
                 },
             ],
@@ -472,4 +474,93 @@ fn from_samples_empty_all_defaults() {
         summary.event_deltas.is_none(),
         "empty input must not produce event deltas"
     );
+}
+
+// -- avg_irq_util (PELT IRQ load) fold --
+
+#[test]
+fn avg_irq_util_means_reporting_cpus_and_skips_none() {
+    // CPUs that report avg_irq_util feed the mean + peak; a CPU with None
+    // (CONFIG_HAVE_SCHED_AVG_IRQ off / unresolved offset) is SKIPPED, not
+    // counted as 0 — the divisor is the reporting-reading count, so a
+    // partial-report kernel is neither diluted nor false-zeroed.
+    let s1 = MonitorSample {
+        prog_stats: None,
+        elapsed_ms: 100,
+        cpus: vec![
+            CpuSnapshot {
+                avg_irq_util: Some(40),
+                ..Default::default()
+            },
+            CpuSnapshot {
+                avg_irq_util: Some(60),
+                ..Default::default()
+            },
+        ],
+    };
+    let s2 = MonitorSample {
+        prog_stats: None,
+        elapsed_ms: 200,
+        cpus: vec![
+            CpuSnapshot {
+                avg_irq_util: Some(80),
+                ..Default::default()
+            },
+            CpuSnapshot {
+                avg_irq_util: None,
+                ..Default::default()
+            },
+        ],
+    };
+    let summary = MonitorSummary::from_samples(&[s1, s2]);
+    // 3 reporting readings (40, 60, 80); the None is skipped from BOTH the
+    // numerator and the divisor: mean = 180 / 3 = 60.0.
+    let avg = summary
+        .avg_irq_util
+        .expect("some CPU reported avg_irq_util");
+    assert!(
+        (avg - 60.0).abs() < f64::EPSILON,
+        "mean over reporting CPUs only (None skipped): {avg}",
+    );
+    assert_eq!(
+        summary.max_avg_irq_util,
+        Some(80.0),
+        "peak across reporting CPUs/samples",
+    );
+}
+
+#[test]
+fn avg_irq_util_none_when_no_cpu_reports() {
+    // No CPU reports avg_irq_util (a non-HAVE_SCHED_AVG_IRQ kernel): both the
+    // mean and the peak are None (loud-absent), never a false 0.0.
+    let sample = MonitorSample {
+        prog_stats: None,
+        elapsed_ms: 100,
+        cpus: vec![
+            CpuSnapshot {
+                nr_running: 2,
+                rq_clock: 1000,
+                avg_irq_util: None,
+                ..Default::default()
+            },
+            CpuSnapshot {
+                nr_running: 2,
+                rq_clock: 2000,
+                avg_irq_util: None,
+                ..Default::default()
+            },
+        ],
+    };
+    let summary = MonitorSummary::from_samples(&[sample]);
+    assert_eq!(
+        summary.avg_irq_util, None,
+        "no reporting CPU -> None, not 0.0",
+    );
+    assert_eq!(
+        summary.max_avg_irq_util, None,
+        "no reporting CPU -> None, not 0.0",
+    );
+    // The sample WAS valid (avg_nr_running computed) — proving the None is
+    // the avg_irq gate, not the whole sample being skipped.
+    assert!((summary.avg_nr_running - 2.0).abs() < f64::EPSILON);
 }
