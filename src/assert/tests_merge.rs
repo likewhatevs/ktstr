@@ -1483,6 +1483,13 @@ fn merge_kind_enum_exhaustively_covers_metric_kind_variants() {
         MergeKind::NonCommutative,
     );
     assert_eq!(MetricKind::DeltaSum.merge_kind(), MergeKind::Commutative);
+    // PerPhaseDeltaSum's cross-cgroup same-step merge sums the per-cgroup
+    // CPU-time deltas (Commutative, like Counter); the SUM-cross-phase /
+    // MEAN-cross-run split lives at the fold sites, not in merge_kind.
+    assert_eq!(
+        MetricKind::PerPhaseDeltaSum.merge_kind(),
+        MergeKind::Commutative,
+    );
     assert_eq!(
         MetricKind::Rate {
             numerator: "n",

@@ -145,6 +145,37 @@ pub enum MetricKind {
     /// read lands in — a slight left-edge over-attribution, the
     /// deliberate semantic since a per-read delta cannot be split.
     DeltaSum,
+    /// An INJECTED per-phase delta that SUMS across phases within a run but
+    /// folds by UNWEIGHTED MEAN across runs. Each per-phase value is a
+    /// thread-group CPU-time delta (`system_time_ns` / `user_time_ns`,
+    /// written directly into `PhaseBucket.metrics` by `phase_group_cpu_delta`
+    /// — there is no `read_sample` arm). The cross-PHASE fold is the SUM of the
+    /// disjoint per-phase deltas (like `Counter`), NOT a sample-count-weighted
+    /// mean: a per-phase delta is already proportional to the phase's
+    /// wall-clock duration, and the freeze `sample_count` is too, so a weighted
+    /// mean would double-count duration and collapse the run to a meaningless
+    /// duration-weighted average per-phase delta. The sum is the run's total
+    /// OBSERVED CPU time — first-to-last freeze WITHIN each phase — a lower
+    /// bound that excludes pre-first-freeze, post-last-freeze, and
+    /// inter-phase-gap windows (and single-freeze phases, which contribute
+    /// nothing), per `phase_group_cpu_delta`'s observed-window semantic; that
+    /// is sufficient for an A/B regression signal, where the same
+    /// observed-window sum is compared on both sides. Across RUNS each run
+    /// contributes exactly one total, folded by the UNWEIGHTED arithmetic mean
+    /// (`Σ / contributors`) over the runs that emitted the key — NOT weighted
+    /// by `run_sample_count` (the monitor capture count, an unrelated
+    /// population that would also silently zero-weight a monitor-off run). This
+    /// SUM-cross-phase / MEAN-cross-run pair is exactly why these deltas are
+    /// NOT `Gauge(Avg)` (weighted mean at BOTH levels — the bug this kind
+    /// fixes) and NOT `DeltaSum` (sum at both levels, which would inflate the
+    /// cross-run value by the run count). The value is run-wide POOLED (one
+    /// scalar per phase across all tgids), NOT per-cgroup; the cross-cgroup
+    /// same-step merge is `Commutative` (`a + b`, like `Counter`) but is the
+    /// defensive same-step-index path only — dead for these keys, which are
+    /// injected exactly once into the pooled host `PhaseBucket`. NOT
+    /// [`Self::is_derived`] — it carries a real per-phase value, unlike Rate /
+    /// Distribution.
+    PerPhaseDeltaSum,
     /// Derived ratio of two component metrics — a RATE that must be
     /// recomputed from its components at every in-map aggregation level, never
     /// averaged as a ready-made ratio. The variant carries the registry
@@ -548,6 +579,13 @@ impl MetricKind {
             // associative, commutative fold, so cross-AssertResult merge
             // sums the two reduced values (same as Counter).
             MetricKind::DeltaSum => MergeKind::Commutative,
+            // PerPhaseDeltaSum: the cross-cgroup same-step merge is a
+            // commutative sum (`a + b`, like Counter), but for these run-wide
+            // POOLED keys (one scalar per phase, injected once into the host
+            // bucket) it is the defensive same-step-index path only — two real
+            // values are never summed. (The SUM-cross-phase / MEAN-cross-run
+            // split is handled at the fold sites, not in this merge.)
+            MetricKind::PerPhaseDeltaSum => MergeKind::Commutative,
             // A Rate is re-derived from its pooled components, never
             // folded from two ready-made ratios.
             MetricKind::Rate { .. } => MergeKind::Recompute,
@@ -709,6 +747,16 @@ fn aggregate_finite(
         // the PER-PHASE path (Counter last-minus-first vs DeltaSum sum —
         // see aggregate_samples_for_phase).
         MetricKind::Counter | MetricKind::DeltaSum => finite.iter().sum(),
+        // PerPhaseDeltaSum at the CROSS-RUN fold: each contributor is one run's
+        // already-summed per-phase total, so runs fold by the UNWEIGHTED
+        // arithmetic mean over the runs that emitted the key — `Σ / len`, the
+        // same shape as the Distribution / WorstLowest cross-run mean below and
+        // deliberately NOT weighted by `run_sample_count`. The CROSS-PHASE sum
+        // that builds each run's total is done directly in
+        // `crate::assert::populate_run_ext_metrics_from_phases`, which does NOT
+        // route this kind through `aggregate_finite`, so this arm only ever runs
+        // at the cross-RUN ext fold.
+        MetricKind::PerPhaseDeltaSum => finite.iter().sum::<f64>() / (finite.len() as f64),
         // Distribution Worst (peak run-delay): the cross-RUN fold is MAX
         // so the high-water peak survives, distinct from the MEAN-folded
         // percentile / CV / mean reductions below. (WITHIN-RUN no
@@ -1946,15 +1994,18 @@ pub static METRICS: &[MetricDef] = &[
         // sums each tgid's `thread_group_cputime` (signal + live-thread
         // stime) at its first and last appearance among the phase's
         // freeze samples and takes `last - first` = system CPU time the
-        // group spent during the phase. Gauge(Avg): the per-phase value
-        // is already a delta (one per phase; cross-RUN folds by mean,
-        // like user_time_ns). LowerBetter — the DSQ-spinlock
+        // group spent during the phase. PerPhaseDeltaSum: the per-phase value
+        // is already a delta, so the disjoint per-phase deltas SUM across the
+        // run (the run's total OBSERVED system CPU time — a lower bound
+        // excluding head / tail / inter-phase-gap windows; see the kind doc),
+        // and the per-run totals fold by UNWEIGHTED MEAN cross-RUN (NOT
+        // sample-count-weighted), like user_time_ns. LowerBetter — the DSQ-spinlock
         // regression surfaces as rising system time (CPUs spinning in
         // the kernel). No typed GauntletRow field; the ext_metrics
         // fallback carries it through cargo ktstr stats compare.
         name: "system_time_ns",
         polarity: crate::test_support::Polarity::LowerBetter,
-        kind: MetricKind::Gauge(GaugeAgg::Avg),
+        kind: MetricKind::PerPhaseDeltaSum,
         default_abs: 1_000_000.0,
         default_rel: 0.30,
         display_unit: "ns",
@@ -1962,9 +2013,10 @@ pub static METRICS: &[MetricDef] = &[
     },
     MetricDef {
         // Per-phase USER-mode CPU time in nanoseconds. Same host-side /
-        // injected / Gauge(Avg) shape as `system_time_ns` (task_struct
+        // injected / PerPhaseDeltaSum shape as `system_time_ns` (task_struct
         // .utime + the thread-group signal_struct.utime accumulator,
-        // per-tgid delta via `crate::assert::phase_group_cpu_delta`).
+        // per-tgid delta via `crate::assert::phase_group_cpu_delta`; SUM
+        // cross-phase, unweighted MEAN cross-run).
         // Pairs with it so a test can distinguish "system time rose,
         // user work flat" (the lock-contention signature) from "both
         // rose" (genuine extra work). LowerBetter — less CPU consumed
@@ -1972,7 +2024,7 @@ pub static METRICS: &[MetricDef] = &[
         // includes gtime so the two are never summed.
         name: "user_time_ns",
         polarity: crate::test_support::Polarity::LowerBetter,
-        kind: MetricKind::Gauge(GaugeAgg::Avg),
+        kind: MetricKind::PerPhaseDeltaSum,
         default_abs: 1_000_000.0,
         default_rel: 0.30,
         display_unit: "ns",

@@ -958,6 +958,31 @@ fn group_and_average_tail_ratio_excludes_omitting_run_and_is_unweighted() {
     );
 }
 
+/// PerPhaseDeltaSum (`system_time_ns` / `user_time_ns`) folds cross-RUN by the
+/// UNWEIGHTED mean over the runs that emitted the key: each run contributes one
+/// per-phase-summed total, NOT weighted by `run_sample_count` (the monitor
+/// capture count, an unrelated population). With run_sample_counts of 1000 and
+/// 1 the unweighted mean (6000) and a sample-weighted mean (~7996) are
+/// numerically distinct, pinning the unweighted fold specifically.
+#[test]
+fn group_and_average_per_phase_delta_sum_is_unweighted_mean_cross_run() {
+    let key = "system_time_ns";
+    let mut a = make_row("t", "tiny-1llc", true, 0.0);
+    a.run_sample_count = 1000;
+    a.ext_metrics.insert(key.to_string(), 8000.0);
+    let mut b = make_row("t", "tiny-1llc", true, 0.0);
+    b.run_sample_count = 1;
+    b.ext_metrics.insert(key.to_string(), 4000.0);
+    let out = group_and_average_by(&[a, b], LEGACY_PAIRING_DIMS);
+    assert_eq!(out.len(), 1);
+    assert_eq!(
+        out[0].row.ext_metrics.get(key).copied(),
+        Some(6000.0),
+        "unweighted mean over the 2 runs (8000+4000)/2=6000 — NOT a \
+             run_sample_count-weighted mean (1000 vs 1 → ~7996)",
+    );
+}
+
 /// `group_and_average_by` propagates `run_sample_count` to the
 /// aggregated row's `run_sample_count` as the SUM of
 /// contributor weights so a downstream consumer that further

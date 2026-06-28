@@ -1566,10 +1566,16 @@ fn merge_metric_values(
 ) -> f64 {
     use crate::stats::{GaugeAgg, MetricKind};
     match kind {
-        // Counter (cumulative) and DeltaSum (sum of per-read deltas)
-        // both merge across AssertResults by summing the reduced values
-        // (commutative — see MetricKind::merge_kind).
-        Some(MetricKind::Counter) | Some(MetricKind::DeltaSum) => a + b,
+        // Counter (cumulative) and DeltaSum (sum of per-read deltas) merge
+        // across AssertResults by summing the reduced values (commutative — see
+        // MetricKind::merge_kind). PerPhaseDeltaSum shares the `a + b` arm, but
+        // it is a run-wide POOLED per-phase scalar (injected once into the host
+        // bucket, never per-cgroup), so this same-step-index merge is the
+        // defensive path only — two real PerPhaseDeltaSum values are never
+        // summed here.
+        Some(MetricKind::Counter)
+        | Some(MetricKind::DeltaSum)
+        | Some(MetricKind::PerPhaseDeltaSum) => a + b,
         Some(MetricKind::Peak) | Some(MetricKind::Gauge(GaugeAgg::Max)) => a.max(b),
         Some(MetricKind::Gauge(GaugeAgg::Avg)) => {
             // Weight by sample_count, floored at 1: a sample_count==0

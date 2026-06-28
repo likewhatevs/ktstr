@@ -623,6 +623,19 @@ pub fn populate_run_ext_metrics_from_phases(
         if pairs.is_empty() {
             continue;
         }
+        // PerPhaseDeltaSum folds cross-PHASE by SUM: the run-level value is the
+        // sum of the disjoint per-phase OBSERVED CPU-time deltas (a lower bound
+        // on total run CPU time — excludes head / tail / inter-phase-gap
+        // windows; see the MetricKind::PerPhaseDeltaSum doc). It is NOT routed
+        // through aggregate_samples_weighted, whose PerPhaseDeltaSum arm
+        // implements the CROSS-RUN unweighted mean — mean-folding the phases
+        // here would double-count duration (the bug this kind fixes). Weights
+        // (phase sample_count) are irrelevant to a sum.
+        if def.kind == crate::stats::MetricKind::PerPhaseDeltaSum {
+            let sum: f64 = pairs.iter().map(|(v, _)| v).sum();
+            target.insert(key.clone(), sum);
+            continue;
+        }
         if let Some(reduced) = crate::stats::aggregate_samples_weighted(&pairs, def.kind) {
             target.insert(key.clone(), reduced);
         }
