@@ -30,14 +30,14 @@ use super::super::config::SchedPolicy;
 ///   2.6+; ktstr's 6.16 kernel floor guarantees it.
 ///
 /// Returns `None` when the file cannot be opened (kernel built
-/// without `CONFIG_SCHEDSTATS`, or `/proc` unavailable) or when any
+/// without `CONFIG_SCHED_INFO`, or `/proc` unavailable) or when any
 /// of the first three whitespace-separated fields is missing or not
 /// parseable as `u64`. Callers must distinguish "unavailable" from
 /// "zero observed" — the previous `(0, 0, 0)`-on-failure return was
-/// silently ambiguous across "schedstats disabled", "I/O error",
+/// silently ambiguous across "CONFIG_SCHED_INFO off", "I/O error",
 /// and "worker genuinely did no work yet", which caused
 /// `assert_not_starved`-style checks to ratify the wrong invariant
-/// on kernels without schedstats.
+/// on kernels without `CONFIG_SCHED_INFO`.
 ///
 /// Emits a process-wide one-shot warning to stderr the first time
 /// the file cannot be opened so the test log records the cause
@@ -82,12 +82,12 @@ pub(super) fn parse_schedstat_line(data: &str) -> Option<(u64, u64, u64)> {
 /// of the process. The workload spawns `N_WORKERS` threads, each of
 /// which calls `read_schedstat` twice; without a gate this would
 /// emit up to `2N` duplicate lines on a kernel without
-/// `CONFIG_SCHEDSTATS`.
+/// `CONFIG_SCHED_INFO`.
 pub(super) fn warn_schedstat_unavailable_once() {
     static WARNED: std::sync::Once = std::sync::Once::new();
     if claim_warn_slot(&WARNED) {
         eprintln!(
-            "workload: /proc/self/schedstat unavailable (CONFIG_SCHEDSTATS off?); \
+            "workload: /proc/self/schedstat unavailable (CONFIG_SCHED_INFO off?); \
              schedstat_* fields in WorkerReport will be zero"
         );
     }
