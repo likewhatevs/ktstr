@@ -258,14 +258,18 @@ fn cgroup_stats_missing_required_field_rejected_by_deserialize() {
         "cross_node_migration_ratio",
         "ext_metrics",
     ];
-    // The only legitimately-optional wire fields: the off-CPU% `Option<f64>`
-    // family, where a missing key maps to `None` ("not measured"). Every other
-    // emitted field is a required scalar.
+    // The legitimately-optional wire fields, where a missing key maps to `None`:
+    // the off-CPU% `Option<f64>` family ("not measured"), and `taobench_whole`
+    // (`Option<TaobenchStats>`, `None` for a non-Taobench cgroup). serde maps a
+    // missing key on an `Option` field to `None`, the correct absent semantic, so
+    // these are legitimately optional on the wire. Every other emitted field is a
+    // required scalar.
     const OPTIONAL_FIELDS: &[&str] = &[
         "avg_off_cpu_pct",
         "min_off_cpu_pct",
         "max_off_cpu_pct",
         "spread",
+        "taobench_whole",
     ];
     // `wake_latency_tail_ratio` and `iterations_per_worker` are
     // method-only on CgroupStats and DO NOT appear in the JSON
