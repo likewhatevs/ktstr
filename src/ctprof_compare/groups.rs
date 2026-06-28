@@ -44,7 +44,7 @@ use crate::ctprof::{CtprofSnapshot, ThreadState};
 
 use super::{
     AffinitySummary, AggRule, Aggregated, CTPROF_METRICS, CtprofMetricDef, DiffRow, GroupBy,
-    ThreadGroup,
+    Section, ThreadGroup,
     pattern::{cgroup_normalize_skeleton, pattern_key, tighten_group},
 };
 
@@ -386,7 +386,19 @@ pub fn build_groups(
     for (key, threads) in buckets {
         let mut metrics = BTreeMap::new();
         for m in CTPROF_METRICS {
-            metrics.insert(m.name.to_string(), aggregate(m.rule, &threads));
+            let agg = aggregate(m.rule, &threads);
+            // Capture-gated families: a non-empty bucket whose threads ALL went
+            // uncaptured for the family folds to Absent, not a sentinel Sum(0),
+            // so a derived metric short-circuits to "-" and the raw row renders
+            // "-" rather than a measured-looking 0. A measured zero (>=1 thread
+            // captured it) stays its real aggregate.
+            let agg = match measured_predicate(m) {
+                Some(pred) if !threads.is_empty() && !threads.iter().copied().any(pred) => {
+                    Aggregated::Absent
+                }
+                _ => agg,
+            };
+            metrics.insert(m.name.to_string(), agg);
         }
         let cgroup_stats = if group_by == GroupBy::Cgroup {
             // Pick the first sampled thread's (flattened) cgroup
@@ -517,6 +529,26 @@ fn mode_aggregate(
         *tallies.entry(item.0).or_insert(0) += 1;
     }
     Aggregated::Mode { tallies, total }
+}
+
+/// The per-thread "was this family captured" predicate for a capture-gated
+/// metric, or `None` for an always-measured metric. Delay-accounting is the
+/// whole [`Section::TaskstatsDelay`] family (taskstats genetlink — absent when
+/// CONFIG_TASK_DELAY_ACCT is off / the delayacct sysctl is off / no
+/// CAP_NET_ADMIN / the query raced exit); jemalloc is the two byte counters,
+/// which live in the shared [`Section::Primary`] and so are name-matched.
+/// `build_groups` folds a non-empty bucket where the predicate holds but NO
+/// thread captured the family to [`Aggregated::Absent`], distinguishing a
+/// never-captured family from a measured zero (the bug: a derived metric
+/// otherwise computes from a sentinel `0` and renders "0" instead of "-").
+fn measured_predicate(m: &CtprofMetricDef) -> Option<fn(&ThreadState) -> bool> {
+    if m.section == Section::TaskstatsDelay {
+        Some(|t| t.taskstats_measured)
+    } else if m.name == "allocated_bytes" || m.name == "deallocated_bytes" {
+        Some(|t| t.jemalloc_measured)
+    } else {
+        None
+    }
 }
 
 pub fn aggregate(rule: AggRule, threads: &[&ThreadState]) -> Aggregated {

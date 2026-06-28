@@ -1537,6 +1537,38 @@ pub struct ThreadState {
     /// inherits the same kernel-thread zero and same sibling-tid
     /// shared-mm caveats; see [`Self::hiwater_rss_bytes`].
     pub hiwater_vm_bytes: crate::metric_types::PeakBytes,
+    /// Whether this thread's taskstats genetlink query succeeded and populated
+    /// the payload — `true` iff `apply_delay_stats` ran on an `Ok` query. This
+    /// is the capture-mechanism flag for the WHOLE taskstats payload: one query
+    /// (`fill_stats`) fills BOTH the delay-accounting family (cpu/blkio/... delay
+    /// counters) AND the xacct memory watermarks (`hiwater_rss_bytes` /
+    /// `hiwater_vm_bytes`) together, so they share this one flag. `false` when
+    /// the query could not capture (CONFIG_TASKSTATS off, no CAP_NET_ADMIN, or
+    /// the query raced task exit), leaving the absent-counter zero defaults. The
+    /// group aggregation reads this to distinguish a captured (measured) zero
+    /// from a never-captured payload — without it both read as a sentinel `0`
+    /// and a derived metric like `total_offcpu_delay_ns` renders "0" instead of
+    /// "-". A whole group with no captured thread aggregates to
+    /// [`crate::ctprof_compare::Aggregated::Absent`].
+    ///
+    /// LIMITATION: this is QUERY-level capture, not per-sub-family. It does NOT
+    /// distinguish a sub-family being disabled while the query still succeeds —
+    /// `CONFIG_TASK_DELAY_ACCT` off (or the `kernel.task_delayacct` sysctl off)
+    /// with `CONFIG_TASK_XACCT` on, or vice-versa — in which the disabled
+    /// family's genuine-zero fields still render "0", not "-". Per-sub-family
+    /// detection needs host kconfig/sysctl reads (a follow-up). Not reachable on
+    /// ktstr's own kernel (both configs `=y`); the gap is the host-facing
+    /// `ctprof capture` against arbitrary single-family kernels.
+    pub taskstats_measured: bool,
+    /// Whether this thread's jemalloc `allocated_bytes` / `deallocated_bytes`
+    /// were captured from a successful per-thread TSD probe read, versus left at
+    /// the absent-as-`0` default (process not jemalloc-linked, the probe could
+    /// not attach, or the per-thread read failed). Set from the per-thread read
+    /// outcome — NOT the per-tgid attach — mirroring `taskstats_measured`'s
+    /// per-thread Ok-gating: a failed read is not a measurement. Same
+    /// measured-vs-zero discipline as [`Self::taskstats_measured`], for the
+    /// `live_heap_estimate` derived metric.
+    pub jemalloc_measured: bool,
 }
 
 impl Default for ThreadState {
@@ -1651,6 +1683,11 @@ impl Default for ThreadState {
             irq_delay_min_ns: Default::default(),
             hiwater_rss_bytes: Default::default(),
             hiwater_vm_bytes: Default::default(),
+            // Absent until a successful capture sets them (apply_delay_stats /
+            // the jemalloc probe assignment); a default ThreadState is the
+            // not-yet-captured placeholder.
+            taskstats_measured: false,
+            jemalloc_measured: false,
         }
     }
 }
@@ -1698,6 +1735,15 @@ impl ThreadState {
         self.irq_delay_min_ns = PeakNs(ds.irq_delay_min_ns);
         self.hiwater_rss_bytes = PeakBytes(ds.hiwater_rss_bytes);
         self.hiwater_vm_bytes = PeakBytes(ds.hiwater_vm_bytes);
+        // The only site that overwrites the absent-counter zero defaults from a
+        // real taskstats payload: mark the payload measured so the group
+        // aggregation (`ctprof_compare::groups::measured_predicate`) can
+        // distinguish a measured zero from a never-captured payload
+        // (CONFIG_TASKSTATS off / no CAP_NET_ADMIN / query raced exit), which
+        // otherwise both read as 0. This is QUERY-level: a sub-family disabled
+        // while the query still succeeds is NOT distinguished here (see the
+        // `taskstats_measured` field doc).
+        self.taskstats_measured = true;
     }
 
     /// Iterate over [`Self::smaps_rollup_kib`] with values
@@ -2309,6 +2355,13 @@ fn capture_thread_at_with_tally(
         irq_delay_min_ns: PeakNs(0),
         hiwater_rss_bytes: crate::metric_types::PeakBytes(0),
         hiwater_vm_bytes: crate::metric_types::PeakBytes(0),
+        // Not-yet-captured here: the delay family's zero defaults above are
+        // overwritten (and this flag set true) by apply_delay_stats on a
+        // successful taskstats query; jemalloc_measured is set true where the
+        // probe assigns allocated_bytes/deallocated_bytes. Both stay false when
+        // the respective capture did not run.
+        taskstats_measured: false,
+        jemalloc_measured: false,
     }
 }
 
@@ -2711,6 +2764,12 @@ fn try_attach_probe_for_tgid_at(
 /// emitting a `tracing::warn!` once per failed tgid (the engine
 /// shares the same `AttachError`/`ProbeError` taxonomy across every
 /// tid of a tgid, so logging each tid would spam the operator).
+///
+/// Returns `Some((allocated, deallocated))` on a successful per-thread
+/// read, `None` on a read failure. The caller uses `None` to leave
+/// `jemalloc_measured` false — a failed read is not a measurement, so
+/// the absent-as-0 default must fold to `Aggregated::Absent`, not a
+/// sentinel `Sum(0)`. Mirrors the taskstats path's per-thread Ok-gating.
 fn probe_thread_recording(
     probe: &crate::host_thread_probe::JemallocProbe,
     tid: i32,
@@ -2719,11 +2778,11 @@ fn probe_thread_recording(
     comm: &str,
     summary: &mut ProbeSummary,
     failed_tgids_logged: &mut std::collections::BTreeSet<i32>,
-) -> (u64, u64) {
+) -> Option<(u64, u64)> {
     match crate::host_thread_probe::probe_thread(probe, tid) {
         Ok(c) => {
             summary.probed_ok += 1;
-            (c.allocated_bytes, c.deallocated_bytes)
+            Some((c.allocated_bytes, c.deallocated_bytes))
         }
         Err(err) => {
             let tag = err.tag();
@@ -2740,7 +2799,7 @@ fn probe_thread_recording(
                     "ctprof probe: probe_thread failed",
                 );
             }
-            (0, 0)
+            None
         }
     }
 }
@@ -3211,19 +3270,18 @@ fn capture_with(
                 t.tids_walked += 1;
             }
             let comm = read_thread_comm_at(proc_root, tgid, tid).unwrap_or_default();
-            let (allocated_bytes, deallocated_bytes) = probe
-                .map(|p| {
-                    probe_thread_recording(
-                        p,
-                        tid,
-                        tgid,
-                        &pcomm,
-                        &comm,
-                        &mut summary,
-                        &mut failed_tgids_logged,
-                    )
-                })
-                .unwrap_or((0, 0));
+            let probe_read = probe.and_then(|p| {
+                probe_thread_recording(
+                    p,
+                    tid,
+                    tgid,
+                    &pcomm,
+                    &comm,
+                    &mut summary,
+                    &mut failed_tgids_logged,
+                )
+            });
+            let (allocated_bytes, deallocated_bytes) = probe_read.unwrap_or((0, 0));
             let mut t = capture_thread_at_with_tally(
                 proc_root,
                 tgid,
@@ -3235,6 +3293,13 @@ fn capture_with(
             );
             t.allocated_bytes = crate::metric_types::Bytes(allocated_bytes);
             t.deallocated_bytes = crate::metric_types::Bytes(deallocated_bytes);
+            // jemalloc is MEASURED iff the per-thread probe READ succeeded
+            // (`probe_read.is_some()`): a non-jemalloc tgid has `probe == None`,
+            // and an attached tgid whose per-thread read failed yields `None`
+            // too — both leave the absent-as-0 defaults and `jemalloc_measured`
+            // false so the group folds to Absent, not a sentinel Sum(0). Mirrors
+            // the taskstats Ok-gating below (a failed read is not a measurement).
+            t.jemalloc_measured = probe_read.is_some();
             // Best-effort taskstats query for delay-accounting +
             // hiwater memory watermarks. tid > 0 invariant is
             // guaranteed by `iter_task_ids_at`'s `> 0` filter; the
@@ -3463,20 +3528,18 @@ fn capture_pid_with(
             t.tids_walked += 1;
         }
         let comm = read_thread_comm_at(proc_root, pid, tid).unwrap_or_default();
-        let (allocated_bytes, deallocated_bytes) = probe
-            .as_ref()
-            .map(|p| {
-                probe_thread_recording(
-                    p,
-                    tid,
-                    pid,
-                    &pcomm,
-                    &comm,
-                    &mut summary,
-                    &mut failed_tgids_logged,
-                )
-            })
-            .unwrap_or((0, 0));
+        let probe_read = probe.as_ref().and_then(|p| {
+            probe_thread_recording(
+                p,
+                tid,
+                pid,
+                &pcomm,
+                &comm,
+                &mut summary,
+                &mut failed_tgids_logged,
+            )
+        });
+        let (allocated_bytes, deallocated_bytes) = probe_read.unwrap_or((0, 0));
         let mut t = capture_thread_at_with_tally(
             proc_root,
             pid,
@@ -3488,6 +3551,12 @@ fn capture_pid_with(
         );
         t.allocated_bytes = crate::metric_types::Bytes(allocated_bytes);
         t.deallocated_bytes = crate::metric_types::Bytes(deallocated_bytes);
+        // jemalloc measured iff the per-thread probe READ succeeded
+        // (`probe_read.is_some()`); see the capture_with twin. A non-jemalloc
+        // tgid (probe None) or an attached tgid whose per-thread read failed both
+        // leave jemalloc_measured false so the group folds to Absent instead of a
+        // sentinel Sum(0).
+        t.jemalloc_measured = probe_read.is_some();
         if let Some(client) = taskstats_client.as_ref() {
             let result = client.query_tid(tid as u32);
             if let Some(tally) = taskstats_tally.as_mut() {

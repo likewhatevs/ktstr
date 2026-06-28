@@ -444,6 +444,46 @@ fn derived_division_by_zero_returns_none() {
     );
 }
 
+/// Capture-gated-absence fix: when a thread's delay-accounting / jemalloc family
+/// was NOT captured (the absent-as-0 defaults stand, `*_measured == false`), the
+/// run-level aggregate of that family is `Aggregated::Absent`, NOT a sentinel
+/// `Sum(0)`. So the derived sums (`total_offcpu_delay_ns`, `live_heap_estimate`)
+/// short-circuit to None (rendered "-") instead of computing "0" from the
+/// sentinel — which on a one-sided-unmeasured compare would read as a huge false
+/// delta. This is the sibling of `derived_division_by_zero_returns_none`, where
+/// a MEASURED all-zero thread (`make_thread` sets `*_measured == true`) keeps
+/// `total_offcpu_delay_ns == Some(0.0)`: measured-zero vs not-measured.
+#[test]
+fn derived_sums_absent_when_family_unmeasured() {
+    let mut t = make_thread("p", "w");
+    // Same all-zero values as make_thread's defaults, but the families are
+    // explicitly NOT captured — the bug's trigger.
+    t.taskstats_measured = false;
+    t.jemalloc_measured = false;
+    let diff = compare(
+        &snap_with(vec![t.clone()]),
+        &snap_with(vec![t]),
+        &CompareOptions::default(),
+    );
+    for name in ["total_offcpu_delay_ns", "live_heap_estimate"] {
+        let row = diff
+            .derived_rows
+            .iter()
+            .find(|r| r.metric_name == name)
+            .unwrap_or_else(|| panic!("{name} row present"));
+        assert!(
+            row.baseline.is_none(),
+            "{name} must be None (absent) when its family was not captured — \
+             not a sentinel 0 that reads as a measured zero; got {:?}",
+            row.baseline,
+        );
+        assert!(
+            row.delta.is_none(),
+            "{name} delta must be None when the family is unmeasured on both sides",
+        );
+    }
+}
+
 /// Mode rule with a deterministic tie-break: when two
 /// values share the top count, the lexicographically
 /// smaller one wins. Pin the rule so the rendered output

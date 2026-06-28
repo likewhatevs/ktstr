@@ -1412,7 +1412,7 @@ pub static CTPROF_DERIVED_METRICS: &[DerivedMetricDef] = &[
     DerivedMetricDef {
         name: "live_heap_estimate",
         ladder: ScaleLadder::Bytes,
-        description: "jemalloc live-heap estimate: allocated_bytes - deallocated_bytes. Signed: negative when deallocations dominate (freelist drains memory allocated before capture, or sampled mid-update on a thread that just released a large arena). Renders with explicit `-` and the IEC binary suffix (e.g. `-1.907MiB`).",
+        description: "jemalloc live-heap estimate: allocated_bytes - deallocated_bytes. Signed: negative when deallocations dominate (freelist drains memory allocated before capture, or sampled mid-update on a thread that just released a large arena). Renders a negative value with an explicit minus and the IEC binary suffix (e.g. `-1.907MiB`). Absent (rendered `-`, no value) when the jemalloc family was not captured for the group — a non-jemalloc process, or the TSD probe could not attach — distinct from a measured zero.",
         inputs: &["allocated_bytes", "deallocated_bytes"],
         is_ratio: false,
         compute: |m| {

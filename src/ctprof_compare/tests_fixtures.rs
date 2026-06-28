@@ -24,6 +24,12 @@ pub(super) fn make_thread(pcomm: &str, comm: &str) -> ThreadState {
         policy: CategoricalString("SCHED_OTHER".into()),
         nice: OrdinalI32(0),
         cpu_affinity: CpuSet(vec![0, 1, 2, 3]),
+        // A normally-captured fixture thread: both capture-gated families are
+        // measured, so the delay / jemalloc aggregates are real (a zero stays a
+        // measured Sum(0), not Absent). Tests that exercise the UNMEASURED path
+        // override these to false explicitly.
+        taskstats_measured: true,
+        jemalloc_measured: true,
         ..ThreadState::default()
     }
 }

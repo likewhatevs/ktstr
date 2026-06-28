@@ -276,3 +276,36 @@ fn fudge_n_to_one_merge_unions_ordinal_range() {
         other => panic!("expected OrdinalRange for nice; got {other:?}"),
     }
 }
+
+/// `merge_aggregated_into` Absent arms — measured wins in both directions, and
+/// both-Absent stays Absent. This is the N:1 fudge-merge primitive: when buckets
+/// fold across cgroups (`compare.rs` ckey loop), a never-captured family must not
+/// erase a measured peer's value, and a measured value must not be clobbered by
+/// an unmeasured peer.
+#[test]
+fn merge_aggregated_into_absent_arms_measured_wins() {
+    // Absent existing, measured val → existing becomes the measured value.
+    let mut existing = Aggregated::Absent;
+    merge_aggregated_into(&mut existing, &Aggregated::Sum(42));
+    assert!(
+        matches!(existing, Aggregated::Sum(42)),
+        "Absent existing must adopt a measured val; got {existing:?}",
+    );
+
+    // Measured existing, Absent val → existing is untouched (Absent contributes
+    // nothing to a measured slot).
+    let mut existing = Aggregated::Sum(7);
+    merge_aggregated_into(&mut existing, &Aggregated::Absent);
+    assert!(
+        matches!(existing, Aggregated::Sum(7)),
+        "measured existing must survive an Absent val; got {existing:?}",
+    );
+
+    // Both Absent → stays Absent (no contributor measured the family).
+    let mut existing = Aggregated::Absent;
+    merge_aggregated_into(&mut existing, &Aggregated::Absent);
+    assert!(
+        matches!(existing, Aggregated::Absent),
+        "both-Absent merge must stay Absent; got {existing:?}",
+    );
+}

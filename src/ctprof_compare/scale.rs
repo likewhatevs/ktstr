@@ -199,6 +199,9 @@ pub fn format_value_cell(agg: &Aggregated, ladder: ScaleLadder) -> String {
     match agg {
         Aggregated::Sum(v) => format_scaled_u64(*v, ladder),
         Aggregated::Max(v) => format_scaled_u64(*v, ladder),
+        // Not-measured: a bare "-" with no unit-ladder suffix — the family was
+        // never captured, so "0ns" / "0 B" would misread as a measured zero.
+        Aggregated::Absent => "-".to_string(),
         _ => format!("{agg}{}", ladder.base_unit()),
     }
 }

@@ -271,6 +271,21 @@ fn capture_populates_jemalloc_counters_for_alloc_worker() {
          ({KNOWN_BYTES}); worker should not free its planted Vec \
          before kill",
     );
+    // Capture-layer gate: the worker thread whose per-thread probe READ
+    // succeeded — it carries the planted allocation — must be marked
+    // jemalloc_measured. Pins read-ok => true. The aggregation-layer tests
+    // set this flag on fixtures directly, so without this assertion a
+    // regression reverting the gate to the per-tgid `probe.is_some()` would
+    // pass the entire suite, silently reintroducing the never-measured-reads-
+    // as-0 class at the capture layer.
+    assert!(
+        worker_threads
+            .iter()
+            .any(|t| t.allocated_bytes.0 >= KNOWN_BYTES && t.jemalloc_measured),
+        "the worker thread carrying the planted allocation must have \
+         jemalloc_measured=true (capture-layer per-thread-read gate); \
+         worker_pid={worker_pid}",
+    );
 }
 
 #[test]
@@ -321,6 +336,15 @@ fn capture_pid_skips_self_attach_and_keeps_counters_zero() {
             "self-pid threads must carry deallocated_bytes=0; \
              got {} on tid {}",
             t.deallocated_bytes,
+            t.tid,
+        );
+        // Capture-layer gate: self is never attached (the pid==self_pid skip),
+        // so probe_read is None and the thread must be UNmeasured — its 0
+        // counters fold to Absent, not a measured Sum(0).
+        assert!(
+            !t.jemalloc_measured,
+            "self-pid threads must carry jemalloc_measured=false (probe never \
+             attached against self → probe_read None); got true on tid {}",
             t.tid,
         );
     }
@@ -390,6 +414,15 @@ fn capture_pid_against_non_jemalloc_target_keeps_counters_zero_but_populates_pro
             "non-jemalloc target must carry deallocated_bytes=0; \
              got {} on tid {}",
             t.deallocated_bytes,
+            t.tid,
+        );
+        // Capture-layer gate: attach returned JemallocNotFound (probe None),
+        // so probe_read is None and the thread must be UNmeasured — its 0
+        // counters fold to Absent, distinct from a measured zero.
+        assert!(
+            !t.jemalloc_measured,
+            "non-jemalloc target must carry jemalloc_measured=false (attach \
+             JemallocNotFound → probe None); got true on tid {}",
             t.tid,
         );
         // Procfs identity + counters populate normally — the attach
