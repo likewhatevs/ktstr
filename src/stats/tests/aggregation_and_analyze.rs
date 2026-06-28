@@ -818,6 +818,151 @@ fn max_cpu_hardirqs_run_level_auto_folds_max_across_phases() {
     );
 }
 
+// -- per-CPU NET_RX softirq spatial axis (max_cpu_softirq_net_rx +
+// concentration) — the softirq sibling of the hardirq axis above. Both run
+// through the SAME fold_per_cpu_spatial_max helper, so the shared gates
+// (win-ordered endpoints, cpu-field intersection, single-freeze/single-CPU/
+// no-activity loud-absent) are pinned by the hardirq tests above; these
+// softirq tests pin the softirqs[NET_RX] field accessor + the per-CPU-delta-
+// then-max ordering + the run-level Peak auto-fold for the new metric. --
+
+/// Build one periodic freeze with `per_cpu_time` = the given (cpu, net_rx) rows
+/// — each CPU's `softirqs[NET_RX]` set to net_rx — stamped to `step`, anchored at
+/// `elapsed_ms`. The softirq analog of `irq_spatial_freeze`.
+fn softirq_net_rx_freeze(
+    tag: &str,
+    elapsed_ms: u64,
+    step: u16,
+    cpus: &[(u32, u64)],
+) -> crate::scenario::snapshot::DrainedSnapshotEntry {
+    use crate::monitor::btf_offsets::SOFTIRQ_NET_RX;
+    use crate::monitor::dump::{FailureDumpReport, PerCpuTimeStats};
+    use crate::scenario::snapshot::MissingStatsReason;
+    crate::scenario::snapshot::DrainedSnapshotEntry {
+        tag: tag.to_string(),
+        report: FailureDumpReport {
+            per_cpu_time: cpus
+                .iter()
+                .map(|&(cpu, net_rx)| {
+                    let mut c = PerCpuTimeStats {
+                        cpu,
+                        ..Default::default()
+                    };
+                    c.softirqs[SOFTIRQ_NET_RX] = net_rx;
+                    c
+                })
+                .collect(),
+            ..Default::default()
+        },
+        stats: Err(MissingStatsReason::NoSchedulerBinary),
+        elapsed_ms: Some(elapsed_ms),
+        boundary_offset_ms: None,
+        step_index: Some(step),
+    }
+}
+
+/// Build a single (step-1) phase bucket from the freezes and read the per-CPU
+/// NET_RX softirq spatial metrics. The softirq analog of `irq_spatial_bucket`.
+fn softirq_net_rx_bucket(
+    freezes: Vec<crate::scenario::snapshot::DrainedSnapshotEntry>,
+) -> (Option<f64>, Option<f64>) {
+    let series = crate::scenario::sample::SampleSeries::from_drained_typed(freezes, None);
+    let buckets = crate::assert::build_phase_buckets(&series);
+    let b = buckets
+        .into_iter()
+        .find(|b| b.step_index == 1)
+        .expect("step-1 bucket present");
+    (
+        b.get("max_cpu_softirq_net_rx"),
+        b.get("max_cpu_softirq_net_rx_concentration"),
+    )
+}
+
+/// Softirq happy path (mirrors `max_cpu_hardirqs_happy_path` with the NET_RX
+/// field): two freezes, two CPUs — cpu0 100→200 (Δ100), cpu1 200→500 (Δ300).
+/// max_cpu_softirq_net_rx = max(100, 300) = 300; concentration = 300 /
+/// mean(100, 300) = 1.5. Pins the `softirqs[NET_RX]` field accessor.
+#[test]
+fn max_cpu_softirq_net_rx_happy_path() {
+    let (max, conc) = softirq_net_rx_bucket(vec![
+        softirq_net_rx_freeze("periodic_000", 1_000, 1, &[(0, 100), (1, 200)]),
+        softirq_net_rx_freeze("periodic_001", 4_000, 1, &[(0, 200), (1, 500)]),
+    ]);
+    assert_eq!(
+        max,
+        Some(300.0),
+        "busiest CPU's NET_RX softirq delta (cpu1: 500-200)",
+    );
+    let conc = conc.expect("concentration present with 2 reporting CPUs");
+    assert!(
+        (conc - 1.5).abs() < 1e-9,
+        "300 / mean(100,300)=200 = 1.5; got {conc}",
+    );
+}
+
+/// The busiest CPU SHIFTS between freezes (the load-bearing per-CPU-delta-then-
+/// max case): cpu0 hot early, cpu1 hot late. first{cpu0:100,cpu1:50}
+/// last{cpu0:150,cpu1:400} → per-CPU deltas d0=50, d1=350 → max=350, NOT
+/// max(last)=400 − max(first)=100 = 300. Pins per-CPU-delta-THEN-max through the
+/// softirqs[NET_RX] accessor (the helper the hardirq tests pin).
+#[test]
+fn max_cpu_softirq_net_rx_uses_per_cpu_delta_when_busiest_cpu_shifts() {
+    let (max, conc) = softirq_net_rx_bucket(vec![
+        softirq_net_rx_freeze("periodic_000", 1_000, 1, &[(0, 100), (1, 50)]),
+        softirq_net_rx_freeze("periodic_001", 4_000, 1, &[(0, 150), (1, 400)]),
+    ]);
+    assert_eq!(
+        max,
+        Some(350.0),
+        "max of per-CPU NET_RX deltas (d1=350), NOT max(totals)=400-100=300",
+    );
+    let conc = conc.expect("concentration present");
+    assert!(
+        (conc - 1.75).abs() < 1e-9,
+        "350 / mean(50,350)=200 = 1.75; got {conc}",
+    );
+}
+
+/// Run-level: max_cpu_softirq_net_rx auto-folds across phases as a Peak
+/// (max-across-phases) via populate_run_ext_metrics_from_phases — same path as
+/// max_cpu_hardirqs (Peak, no read_sample arm). phase1 busiest Δ=300, phase2
+/// busiest Δ=900 → run-level max(300, 900) = 900. Pins the new MetricDef's Peak
+/// kind driving the auto-fold (the registry wiring).
+#[test]
+fn max_cpu_softirq_net_rx_run_level_auto_folds_max_across_phases() {
+    use crate::assert::{
+        build_phase_buckets, populate_run_ext_metrics, populate_run_ext_metrics_from_phases,
+    };
+    use crate::scenario::sample::SampleSeries;
+
+    let series = SampleSeries::from_drained_typed(
+        vec![
+            softirq_net_rx_freeze("periodic_000", 1_000, 1, &[(0, 100), (1, 200)]),
+            softirq_net_rx_freeze("periodic_001", 4_000, 1, &[(0, 200), (1, 500)]),
+            softirq_net_rx_freeze("periodic_002", 6_000, 2, &[(0, 1000), (1, 1000)]),
+            softirq_net_rx_freeze("periodic_003", 9_000, 2, &[(0, 1100), (1, 1900)]),
+        ],
+        None,
+    );
+    let buckets = build_phase_buckets(&series);
+    let mut ext = std::collections::BTreeMap::new();
+    populate_run_ext_metrics(&series, &mut ext);
+    populate_run_ext_metrics_from_phases(&buckets, &mut ext);
+    assert_eq!(
+        ext.get("max_cpu_softirq_net_rx").copied(),
+        Some(900.0),
+        "Peak auto-folds max-across-phases: max(phase1 Δ=300, phase2 Δ=900)",
+    );
+    let conc = ext
+        .get("max_cpu_softirq_net_rx_concentration")
+        .copied()
+        .expect("concentration auto-folds to run-level too (also Peak)");
+    assert!(
+        (conc - 1.8).abs() < 1e-9,
+        "concentration auto-folds max-across-phases: max(1.5, 1.8) = 1.8; got {conc}",
+    );
+}
+
 /// `aggregate_samples_for_phase` dispatches Counter through
 /// `phase_counter_delta` (per-phase delta) and every other
 /// kind through `aggregate_samples` (flat-run semantic). Pins

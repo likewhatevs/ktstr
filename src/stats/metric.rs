@@ -2168,6 +2168,44 @@ pub static METRICS: &[MetricDef] = &[
         accessor: |_| None,
     },
     MetricDef {
+        // Per-CPU NET_RX softirq spatial axis: the BUSIEST CPU's NET_RX softirq
+        // delta over the phase — max over CPUs of each CPU's (last - first freeze)
+        // kstat.softirqs[NET_RX] delta, correlated by the per_cpu_time cpu field
+        // (NOT the cross-CPU sum, which is total_softirq_net_rx). Counts softirq
+        // RUNS/invocations (handle_softirqs increments once per pending NET_RX bit
+        // per dispatch via kstat_incr_softirqs_this_cpu), NOT packets — a
+        // softirq-frequency / affinity-concentration signal. Custom per-CPU-delta
+        // fold in assert::phase_build (fold_per_cpu_spatial_max), NOT a read_sample
+        // arm. Peak = spatial-max of a per-CPU cumulative-counter delta. The
+        // softirq sibling of max_cpu_hardirqs; Informational for the same reason —
+        // a high busiest-CPU count is ambiguous (high RX traffic vs concentration),
+        // the concentration ratio below is the balance signal.
+        name: "max_cpu_softirq_net_rx",
+        polarity: crate::test_support::Polarity::Informational,
+        kind: MetricKind::Peak,
+        default_abs: 500.0,
+        default_rel: 0.50,
+        display_unit: "",
+        accessor: |_| None,
+    },
+    MetricDef {
+        // NET_RX-softirq-concentration ratio: max_cpu_softirq_net_rx / mean
+        // per-CPU NET_RX softirq delta over the SAME reporting-CPU set — the
+        // busiest CPU's share of the average. Range [1, num_cpus]: 1.0 = even,
+        // higher = NET_RX softirqs concentrated on one CPU (the single-queue-NIC
+        // vs RPS/RSS-spread signal). Peak, LowerBetter, max/mean — the softirq
+        // sibling of max_cpu_hardirq_concentration (same NOT-a-Rate, max/MEAN-not-
+        // max/MIN, >=2-reporting-CPU + mean>0 discipline). Absent (None) when
+        // < 2 reporting CPUs or mean == 0.
+        name: "max_cpu_softirq_net_rx_concentration",
+        polarity: crate::test_support::Polarity::LowerBetter,
+        kind: MetricKind::Peak,
+        default_abs: 1.0,
+        default_rel: 0.25,
+        display_unit: "x",
+        accessor: |_| None,
+    },
+    MetricDef {
         // System-wide PSI-irq `full` avg10: the mean over monitor samples of the
         // decoded 10s-EWMA full IRQ pressure (percent, 0..=100), host-walked from
         // the global `psi_system` (NOT a guest /proc read). Gauge(Avg) like

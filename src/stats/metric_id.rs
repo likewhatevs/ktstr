@@ -147,6 +147,11 @@ builtin_metrics! {
     // _concentration = max / mean over the reporting CPUs. Both Peak.
     MaxCpuHardirqs => "max_cpu_hardirqs",
     MaxCpuHardirqConcentration => "max_cpu_hardirq_concentration",
+    // Per-CPU NET_RX softirq spatial axis (the softirq sibling of the hardirq
+    // axis above): max_cpu_softirq_net_rx = busiest CPU's NET_RX softirq-run
+    // delta; _concentration = max / mean over reporting CPUs. Both Peak.
+    MaxCpuSoftirqNetRx => "max_cpu_softirq_net_rx",
+    MaxCpuSoftirqNetRxConcentration => "max_cpu_softirq_net_rx_concentration",
 
     // System-wide PSI-irq pressure (host-walked from the global psi_system per
     // monitor sample, folded run-level in MonitorSummary). avg10 = mean
