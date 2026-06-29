@@ -328,6 +328,14 @@ pub struct PhaseMetrics {
     /// Mean local-DSQ depth over the phase's valid samples. `None` on the
     /// same no-data conditions as [`Self::avg_imbalance`].
     pub avg_dsq_depth: Option<f64>,
+    /// Mean runqueue occupancy (full-class `rq.nr_running`) over the phase's
+    /// valid samples — per-sample mean of the per-CPU `nr_running`, averaged
+    /// over samples (the `avg_dsq_depth` shape). `None` on the same no-data
+    /// conditions as [`Self::avg_imbalance`]. The run-level value stays
+    /// `MonitorSummary::avg_nr_running` (folded by `fold_run_level_ext`); this
+    /// per-phase field feeds rendering + boundary change-detection only and is
+    /// kept out of the run-level ext re-pool (see `populate_run_ext_metrics_from_phases`).
+    pub avg_nr_running: Option<f64>,
     pub max_dsq_depth: u32,
     pub stall_count: usize,
     /// select_cpu_fallback events per second. None when event counters unavailable.
@@ -407,6 +415,9 @@ pub struct Timeline {
 const IMBALANCE_THRESHOLD: f64 = 0.5;
 /// Minimum delta in DSQ depth to flag a change.
 const DSQ_THRESHOLD: f64 = 3.0;
+/// Minimum delta in mean runqueue depth (avg_nr_running) to flag a change:
+/// one additional runnable task per CPU on average between phases.
+const NR_RUNNING_THRESHOLD: f64 = 1.0;
 /// Minimum delta in fallback rate (events/s) to flag a change.
 const FALLBACK_RATE_THRESHOLD: f64 = 10.0;
 /// Minimum delta in keep_last rate (events/s) to flag a change.
@@ -495,6 +506,15 @@ fn detect_boundary_changes(before: &PhaseMetrics, after: &PhaseMetrics) -> Vec<P
         }
         if let (Some(bd), Some(ad)) = (before.avg_dsq_depth, after.avg_dsq_depth) {
             changes.extend(detect_change(bd, ad, DSQ_THRESHOLD, "dsq_depth", true));
+        }
+        if let (Some(bn), Some(an)) = (before.avg_nr_running, after.avg_nr_running) {
+            changes.extend(detect_change(
+                bn,
+                an,
+                NR_RUNNING_THRESHOLD,
+                "nr_running",
+                true,
+            ));
         }
         if let (Some(bf), Some(af)) = (before.fallback_rate, after.fallback_rate) {
             changes.extend(detect_change(
@@ -858,13 +878,14 @@ impl Timeline {
             let has_monitor_metrics = m.avg_imbalance.is_some()
                 || m.max_imbalance.is_some()
                 || m.avg_dsq_depth.is_some()
+                || m.avg_nr_running.is_some()
                 || m.max_dsq_depth > 0
                 || m.fallback_rate.is_some()
                 || m.keep_last_rate.is_some()
                 || m.stall_count > 0;
             if m.sample_count > 0 || has_monitor_metrics {
                 out.push_str(&format!(
-                    "  imbalance: avg={} max={} | dsq: avg={} max={}",
+                    "  imbalance: avg={} max={} | dsq: avg={} max={} | nr_run: avg={}",
                     m.avg_imbalance
                         .map_or_else(|| "n/a".to_string(), |v| format!("{v:.1}")),
                     m.max_imbalance
@@ -872,6 +893,8 @@ impl Timeline {
                     m.avg_dsq_depth
                         .map_or_else(|| "n/a".to_string(), |v| format!("{v:.0}")),
                     m.max_dsq_depth,
+                    m.avg_nr_running
+                        .map_or_else(|| "n/a".to_string(), |v| format!("{v:.1}")),
                 ));
                 if let Some(fb) = m.fallback_rate {
                     out.push_str(&format!(" | fallback: {:.0}/s", fb));
@@ -949,6 +972,7 @@ impl Timeline {
     /// | `avg_imbalance_ratio`   | `avg_imbalance`         |
     /// | `max_dsq_depth`         | `max_dsq_depth`         |
     /// | `avg_dsq_depth`         | `avg_dsq_depth`         |
+    /// | `avg_nr_running`        | `avg_nr_running`        |
     /// | `stuck_count`           | `stall_count`           |
     /// | `total_fallback`        | `fallback_rate` (rate)  |
     /// | `total_keep_last`       | `keep_last_rate` (rate) |
@@ -1080,6 +1104,7 @@ fn phase_from_bucket(b: &crate::assert::PhaseBucket, sorted_events: &[&StimulusE
         avg_imbalance: b.metrics.get("avg_imbalance_ratio").copied(),
         max_imbalance: b.metrics.get("max_imbalance_ratio").copied(),
         avg_dsq_depth: b.metrics.get("avg_dsq_depth").copied(),
+        avg_nr_running: b.metrics.get("avg_nr_running").copied(),
         max_dsq_depth: b
             .metrics
             .get("max_dsq_depth")
@@ -1273,6 +1298,7 @@ pub(crate) fn compute_metrics(
     let mut total_imbalance = 0.0f64;
     let mut max_imbalance = 0.0f64;
     let mut total_dsq = 0.0f64;
+    let mut total_nr_running = 0.0f64;
     let mut max_dsq = 0u32;
     let mut stall_count = 0usize;
 
@@ -1293,6 +1319,13 @@ pub(crate) fn compute_metrics(
             .sum::<f64>()
             / sample.cpus.len() as f64;
         total_dsq += avg_dsq_this;
+
+        // Per-sample mean of per-CPU nr_running (full-class runqueue depth),
+        // averaged over samples below — the avg_dsq_depth shape. `valid`
+        // guarantees `!cpus.is_empty()`, so the divisor is nonzero.
+        let avg_nr_this: f64 = sample.cpus.iter().map(|c| c.nr_running as f64).sum::<f64>()
+            / sample.cpus.len() as f64;
+        total_nr_running += avg_nr_this;
     }
 
     // Stall detection between consecutive valid samples in this phase.
@@ -1363,6 +1396,7 @@ pub(crate) fn compute_metrics(
         avg_imbalance: (valid_count > 0).then(|| total_imbalance / n),
         max_imbalance: (valid_count > 0).then_some(max_imbalance),
         avg_dsq_depth: (valid_count > 0).then(|| total_dsq / n),
+        avg_nr_running: (valid_count > 0).then(|| total_nr_running / n),
         max_dsq_depth: max_dsq,
         stall_count,
         fallback_rate,
@@ -1406,6 +1440,7 @@ mod tests {
 
     fn sample(elapsed_ms: u64, cpus: Vec<(u32, u32, u64)>) -> MonitorSample {
         MonitorSample {
+            bpf_map_fields: Vec::new(),
             prog_stats: None,
             psi_irq: None,
             elapsed_ms,
@@ -2267,6 +2302,7 @@ mod tests {
         assert_eq!(m.avg_imbalance, None);
         assert_eq!(m.max_imbalance, None);
         assert_eq!(m.avg_dsq_depth, None);
+        assert_eq!(m.avg_nr_running, None);
         assert_eq!(m.max_dsq_depth, 0);
     }
 
@@ -2312,6 +2348,9 @@ mod tests {
         let m = compute_metrics(&refs, 0);
         assert_eq!(m.sample_count, 2);
         assert!((m.avg_imbalance.unwrap() - 2.5).abs() < 0.01); // (4+1)/2
+        // nr_running per CPU: s1=(1,4)->per-sample mean 2.5, s2=(2,2)->mean 2.0;
+        // averaged over the 2 samples = (2.5+2.0)/2 = 2.25.
+        assert!((m.avg_nr_running.unwrap() - 2.25).abs() < 0.01);
         assert!((m.max_imbalance.unwrap() - 4.0).abs() < 0.01);
         assert_eq!(m.max_dsq_depth, 7);
     }
@@ -2331,6 +2370,7 @@ mod tests {
         use crate::monitor::ScxEventCounters;
 
         let s1 = MonitorSample {
+            bpf_map_fields: Vec::new(),
             prog_stats: None,
             psi_irq: None,
             elapsed_ms: 600,
@@ -2353,6 +2393,7 @@ mod tests {
             }],
         };
         let s2 = MonitorSample {
+            bpf_map_fields: Vec::new(),
             prog_stats: None,
             psi_irq: None,
             elapsed_ms: 1600,
@@ -2402,6 +2443,7 @@ mod tests {
         use crate::monitor::ScxEventCounters;
 
         let s1 = MonitorSample {
+            bpf_map_fields: Vec::new(),
             prog_stats: None,
             psi_irq: None,
             elapsed_ms: 0,
@@ -2424,6 +2466,7 @@ mod tests {
             }],
         };
         let s2 = MonitorSample {
+            bpf_map_fields: Vec::new(),
             prog_stats: None,
             psi_irq: None,
             elapsed_ms: 1000,
@@ -2505,8 +2548,9 @@ mod tests {
         // Phase 0: zero fallback rate (counter stays constant).
         for i in 5..15 {
             samples.push(MonitorSample {
+                bpf_map_fields: Vec::new(),
                 prog_stats: None,
-            psi_irq: None,
+                psi_irq: None,
                 elapsed_ms: i * 100,
                 cpus: vec![CpuSnapshot {
                     nr_running: 2,
@@ -2532,8 +2576,9 @@ mod tests {
         // Rate = 500/1.0 = 500/s, well above threshold 10.0.
         for i in 15..25 {
             samples.push(MonitorSample {
+                bpf_map_fields: Vec::new(),
                 prog_stats: None,
-            psi_irq: None,
+                psi_irq: None,
                 elapsed_ms: i * 100,
                 cpus: vec![CpuSnapshot {
                     nr_running: 2,
@@ -2645,8 +2690,9 @@ mod tests {
         let samples = vec![
             // Garbage sample (DSQ above ceiling).
             MonitorSample {
+                bpf_map_fields: Vec::new(),
                 prog_stats: None,
-            psi_irq: None,
+                psi_irq: None,
                 elapsed_ms: 600,
                 cpus: vec![CpuSnapshot {
                     nr_running: 1,
@@ -2669,6 +2715,7 @@ mod tests {
     fn all_garbage_samples_yield_no_metrics() {
         let events = vec![stimulus(0, "ScenarioStart")];
         let samples = vec![MonitorSample {
+            bpf_map_fields: Vec::new(),
             prog_stats: None,
             psi_irq: None,
             elapsed_ms: 600,
@@ -2962,6 +3009,61 @@ mod tests {
         assert!(
             !changes.iter().any(|c| c.metric == "throughput"),
             "unchanged throughput must not be flagged: {changes:?}",
+        );
+    }
+
+    /// A per-phase avg_nr_running (mean runqueue depth) rise above
+    /// NR_RUNNING_THRESHOLD between two sampled phases is flagged as a
+    /// degradation (higher runqueue depth = more contention). Gated on both
+    /// phases having real samples, like the other monitor-derived gauges.
+    #[test]
+    fn detect_boundary_changes_flags_nr_running_jump() {
+        let before = PhaseMetrics {
+            sample_count: 30,
+            avg_nr_running: Some(1.0),
+            ..Default::default()
+        };
+        let after = PhaseMetrics {
+            sample_count: 30,
+            avg_nr_running: Some(3.0), // +2.0 > NR_RUNNING_THRESHOLD (1.0)
+            ..Default::default()
+        };
+        let changes = detect_boundary_changes(&before, &after);
+        let nr: Vec<_> = changes.iter().filter(|c| c.metric == "nr_running").collect();
+        assert_eq!(nr.len(), 1, "avg_nr_running jump must be flagged: {changes:?}");
+        assert_eq!(
+            nr[0].direction,
+            ChangeDirection::Degraded,
+            "rising runqueue depth is a degradation",
+        );
+        // A zero-sample side suppresses it (same gate as the sibling gauges).
+        let after_synth = PhaseMetrics {
+            sample_count: 0,
+            avg_nr_running: Some(3.0),
+            ..Default::default()
+        };
+        assert!(
+            !detect_boundary_changes(&before, &after_synth)
+                .iter()
+                .any(|c| c.metric == "nr_running"),
+            "nr_running must stay gated when a side has 0 samples",
+        );
+    }
+
+    /// The per-phase timeline narrative renders avg_nr_running (`nr_run: avg=`)
+    /// alongside imbalance + dsq for a sampled phase.
+    #[test]
+    fn format_phases_renders_avg_nr_running() {
+        // Two CPUs with nr_running 2 and 4 -> per-sample mean 3.0.
+        let samples: Vec<MonitorSample> = (5..25)
+            .map(|i| sample(i * 100, vec![(2, 1, i * 1000), (4, 1, i * 1000 + 100)]))
+            .collect();
+        let events = vec![stimulus(0, "ScenarioStart")];
+        let t = Timeline::build(&events, &samples, 0);
+        let formatted = t.format_with_context(&TimelineContext::default());
+        assert!(
+            formatted.contains("nr_run: avg="),
+            "per-phase narrative must render avg_nr_running: {formatted}",
         );
     }
 
@@ -3531,6 +3633,7 @@ mod tests {
         s0_metrics.insert("avg_dsq_depth".to_string(), 2.5);
         s0_metrics.insert("max_imbalance_ratio".to_string(), 3.5);
         s0_metrics.insert("avg_imbalance_ratio".to_string(), 1.8);
+        s0_metrics.insert("avg_nr_running".to_string(), 3.0);
         s0_metrics.insert("total_fallback".to_string(), 200.0);
         let buckets = vec![
             PhaseBucket {
@@ -3567,12 +3670,16 @@ mod tests {
         assert!((t.phases[1].metrics.avg_dsq_depth.unwrap() - 2.5).abs() < f64::EPSILON);
         assert!((t.phases[1].metrics.max_imbalance.unwrap() - 3.5).abs() < f64::EPSILON);
         assert!((t.phases[1].metrics.avg_imbalance.unwrap() - 1.8).abs() < f64::EPSILON);
+        // Snapshot-path read (phase_from_bucket): bucket.metrics["avg_nr_running"]
+        // projects to PhaseMetrics.avg_nr_running; phase 0's empty map -> None.
+        assert!((t.phases[1].metrics.avg_nr_running.unwrap() - 3.0).abs() < f64::EPSILON);
+        assert_eq!(t.phases[0].metrics.avg_nr_running, None);
         // fallback_rate = 200 / (5000 / 1000) = 40.0 events/s
         assert_eq!(t.phases[1].metrics.fallback_rate, Some(40.0));
         // keep_last_rate absent → None (no total_keep_last in metrics map)
         assert_eq!(t.phases[1].metrics.keep_last_rate, None);
-        // avg_dsq_depth + avg_imbalance are now both wired
-        // (per the doc table). iteration_rate is the only field
+        // avg_dsq_depth + avg_imbalance + avg_nr_running are now
+        // all wired (per the doc table). iteration_rate is the only field
         // PhaseBucket cannot supply directly (depends on stimulus
         // event totals, not a per-Sample reading).
         assert_eq!(t.phases[1].metrics.iteration_rate, None);

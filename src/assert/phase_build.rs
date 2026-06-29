@@ -1036,6 +1036,17 @@ fn fold_monitor_into_bucket(
     if let Some(v) = pm.avg_imbalance {
         put("avg_imbalance_ratio", v);
     }
+    // avg_nr_running (Gauge(Avg)) is a monitor-axis signal (full-class
+    // rq.nr_running, no read_sample dispatch arm), so like avg_imbalance_ratio
+    // it is folded for EVERY monitor-bearing bucket (not gated on synthesized)
+    // — captured buckets have no other source for it. It feeds per-phase
+    // rendering + boundary change-detection only; the run-level value stays
+    // MonitorSummary::avg_nr_running (fold_run_level_ext), so the run-level ext
+    // re-pool (populate_run_ext_metrics_from_phases) SKIPS this key to avoid a
+    // double-source.
+    if let Some(v) = pm.avg_nr_running {
+        put("avg_nr_running", v);
+    }
     // max_imbalance_ratio (Peak) and stuck_count (Counter) have NO read_sample
     // dispatch arm (both fall to `_ => None` in crate::stats read_sample), so
     // the per-sample capture path never produces them and a CAPTURED bucket

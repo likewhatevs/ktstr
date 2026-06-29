@@ -972,6 +972,44 @@ fn populate_run_ext_metrics_from_phases_skips_typed_backed_keys() {
     );
 }
 
+/// Run-level double-source guard: populate_run_ext_metrics_from_phases
+/// must SKIP avg_nr_running. Its authoritative run-level value is
+/// MonitorSummary::avg_nr_running (fold_run_level_ext); fold_monitor_into_bucket
+/// also writes it per-phase for rendering, so without the skip the per-phase
+/// re-pool would claim the run-level key — and in VmResult::run_metric the
+/// re-pool runs BEFORE fold_run_level_ext, whose `or_insert` would then no-op,
+/// silently replacing the whole-run value with the per-phase mean. The ext-only
+/// avg_imbalance_ratio must still fold (control).
+#[test]
+fn populate_run_ext_metrics_from_phases_skips_avg_nr_running() {
+    use crate::assert::PhaseBucket;
+    use std::collections::BTreeMap;
+    let mut m = BTreeMap::new();
+    m.insert("avg_imbalance_ratio".to_string(), 2.0); // ext-only -> folded
+    m.insert("avg_nr_running".to_string(), 5.0); // MonitorSummary-fold authority -> skipped
+    let phases = vec![PhaseBucket {
+        per_cgroup: Default::default(),
+        step_index: 1,
+        label: "Step[0]".to_string(),
+        start_ms: 0,
+        end_ms: 100,
+        sample_count: 5,
+        metrics: m,
+    }];
+    let mut target = BTreeMap::new();
+    crate::assert::populate_run_ext_metrics_from_phases(&phases, &mut target);
+    assert!(
+        target.contains_key("avg_imbalance_ratio"),
+        "avg_imbalance_ratio is ext-only and must be folded into ext_metrics",
+    );
+    assert!(
+        !target.contains_key("avg_nr_running"),
+        "avg_nr_running run-level value comes from fold_run_level_ext; the per-phase \
+         re-pool must NOT claim it (the fold's or_insert would no-op in \
+         VmResult::run_metric, replacing the whole-run value with the per-phase mean)",
+    );
+}
+
 /// A synthesized zero-capture phase (sample_count==0) still folds into
 /// the run aggregate — its capture-independent iteration_rate is
 /// INCLUDED, not dropped. iteration_rate is now a MetricKind::Rate, so

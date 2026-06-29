@@ -1035,12 +1035,14 @@ fn build_phase_buckets_with_stimulus_synthesized_bucket_folds_full_monitor_set()
     let mon = MonitorReport {
         samples: vec![
             MonitorSample {
+                bpf_map_fields: Vec::new(),
                 prog_stats: None,
                 psi_irq: None,
                 elapsed_ms: 1000,
                 cpus: vec![cpu(4, 3, 100, evc(10, 5)), cpu(2, 1, 100, None)],
             },
             MonitorSample {
+                bpf_map_fields: Vec::new(),
                 prog_stats: None,
                 psi_irq: None,
                 elapsed_ms: 1500,
@@ -1086,4 +1088,7 @@ fn build_phase_buckets_with_stimulus_synthesized_bucket_folds_full_monitor_set()
     );
     // avg_imbalance_ratio was folded pre-fix too; still present.
     assert_eq!(g("avg_imbalance_ratio"), Some(2.0), "avg imbalance");
+    // avg_nr_running is folded for every monitor-bearing bucket (the write side
+    // of the snapshot path): per-sample mean of per-CPU nr_running [4,2] -> 3.0.
+    assert_eq!(g("avg_nr_running"), Some(3.0), "avg nr_running");
 }

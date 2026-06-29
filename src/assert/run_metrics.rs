@@ -362,7 +362,11 @@ impl ScenarioStats {
             // worst_spread: highest spread over cgroups that measured it
             // (CgroupStats::spread is already Option — None when no worker had
             // measurable wall time). None iff no cgroup measured spread.
-            B::WorstSpread => self.cgroups.iter().filter_map(|c| c.spread).reduce(f64::max),
+            B::WorstSpread => self
+                .cgroups
+                .iter()
+                .filter_map(|c| c.spread)
+                .reduce(f64::max),
             // worst_migration_ratio: highest migration ratio over cgroups that
             // ran iterations (a 0.0 with total_iterations>0 is measured; with
             // ==0 it is the rate-over-zero sentinel — never-measured).
@@ -602,6 +606,20 @@ pub fn populate_run_ext_metrics_from_phases(
         if TYPED_FIELD_NAMES.contains(&key.as_str()) {
             continue;
         }
+        // avg_nr_running is NOT typed-backed (no GauntletRow accessor), but its
+        // authoritative run-level value is MonitorSummary::avg_nr_running, folded
+        // by fold_run_level_ext. It is the one monitor-summary-fold key that ALSO
+        // appears in per-phase bucket.metrics (fold_monitor_into_bucket writes it
+        // for rendering). Skip it here so the per-phase re-pool never claims the
+        // run-level key: VmResult::run_metric runs this re-pool BEFORE
+        // fold_run_level_ext, and the fold's `or_insert` would then no-op,
+        // silently replacing the whole-run value with the per-phase weighted
+        // mean. Its per-phase PhaseBucket value still feeds rendering +
+        // change-detection. (TYPED_FIELD_NAMES is the typed-accessor analogue of
+        // this same skip rationale.)
+        if key == "avg_nr_running" {
+            continue;
+        }
         // Per-phase (value, sample_count) for the kind-aware fold.
         // A phase that doesn't carry the key contributes nothing.
         // Lock-step shape enforced by the (f64, usize) pair type.
@@ -830,18 +848,22 @@ pub fn populate_run_pooled_taobench(stats: &mut ScenarioStats) {
     // Pool the per-cgroup whole-run aggregates across the run's Taobench cgroups:
     // Σ ops, MAX wall window (shared by the concurrent cohorts). `None` when no
     // cgroup ran a Taobench worker.
-    let pooled = stats.cgroups.iter().filter_map(|c| c.taobench_whole.as_ref()).fold(
-        None,
-        |acc: Option<crate::workload::taobench::run::TaobenchStats>, t| {
-            Some(match acc {
-                Some(mut a) => {
-                    a.merge(t);
-                    a
-                }
-                None => *t,
-            })
-        },
-    );
+    let pooled = stats
+        .cgroups
+        .iter()
+        .filter_map(|c| c.taobench_whole.as_ref())
+        .fold(
+            None,
+            |acc: Option<crate::workload::taobench::run::TaobenchStats>, t| {
+                Some(match acc {
+                    Some(mut a) => {
+                        a.merge(t);
+                        a
+                    }
+                    None => *t,
+                })
+            },
+        );
     let Some(w) = pooled else {
         return;
     };
@@ -860,9 +882,10 @@ pub fn populate_run_pooled_taobench(stats: &mut ScenarioStats) {
     stats
         .ext_metrics
         .insert(TOTAL_TAOBENCH_SLOW_OPS.to_string(), c.slow_ops as f64);
-    stats
-        .ext_metrics
-        .insert(TOTAL_TAOBENCH_WALL_SEC.to_string(), c.elapsed_ns as f64 / 1e9);
+    stats.ext_metrics.insert(
+        TOTAL_TAOBENCH_WALL_SEC.to_string(),
+        c.elapsed_ns as f64 / 1e9,
+    );
     // Command-time hit components: hits = cmds − misses (request-time). The Rate
     // taobench_command_hit_rate = Σhits / Σcmds re-derives via derive_rate_metrics
     // (skipped, hence absent, when no lookups issued). Diverges from the
@@ -920,15 +943,18 @@ pub fn populate_run_pooled_taobench_distribution(stats: &mut ScenarioStats) {
         return;
     }
     let q = serve.percentiles();
-    stats
-        .ext_metrics
-        .insert(TAOBENCH_SERVE_P50_US_WHOLE.to_string(), q.value_at(Pct::P50) as f64);
-    stats
-        .ext_metrics
-        .insert(TAOBENCH_SERVE_P90_US_WHOLE.to_string(), q.value_at(Pct::P90) as f64);
-    stats
-        .ext_metrics
-        .insert(TAOBENCH_SERVE_P99_US_WHOLE.to_string(), q.value_at(Pct::P99) as f64);
+    stats.ext_metrics.insert(
+        TAOBENCH_SERVE_P50_US_WHOLE.to_string(),
+        q.value_at(Pct::P50) as f64,
+    );
+    stats.ext_metrics.insert(
+        TAOBENCH_SERVE_P90_US_WHOLE.to_string(),
+        q.value_at(Pct::P90) as f64,
+    );
+    stats.ext_metrics.insert(
+        TAOBENCH_SERVE_P99_US_WHOLE.to_string(),
+        q.value_at(Pct::P99) as f64,
+    );
     stats.ext_metrics.insert(
         TAOBENCH_SERVE_P999_US_WHOLE.to_string(),
         q.value_at(Pct::P999) as f64,
@@ -1000,9 +1026,10 @@ pub fn populate_run_pooled_schbench(stats: &mut ScenarioStats) {
         .ext_metrics
         .insert(TOTAL_SCHBENCH_LOOPS.to_string(), loops as f64);
     if msg_pcount > 0 {
-        stats
-            .ext_metrics
-            .insert(TOTAL_SCHBENCH_MSG_RUN_DELAY_NS.to_string(), msg_run_delay_ns as f64);
+        stats.ext_metrics.insert(
+            TOTAL_SCHBENCH_MSG_RUN_DELAY_NS.to_string(),
+            msg_run_delay_ns as f64,
+        );
         stats
             .ext_metrics
             .insert(TOTAL_SCHBENCH_MSG_PCOUNT.to_string(), msg_pcount as f64);
@@ -1012,9 +1039,10 @@ pub fn populate_run_pooled_schbench(stats: &mut ScenarioStats) {
             TOTAL_SCHBENCH_WORKER_RUN_DELAY_NS.to_string(),
             worker_run_delay_ns as f64,
         );
-        stats
-            .ext_metrics
-            .insert(TOTAL_SCHBENCH_WORKER_PCOUNT.to_string(), worker_pcount as f64);
+        stats.ext_metrics.insert(
+            TOTAL_SCHBENCH_WORKER_PCOUNT.to_string(),
+            worker_pcount as f64,
+        );
     }
     crate::stats::derive_rate_metrics(&mut stats.ext_metrics);
 }
@@ -1057,7 +1085,7 @@ pub fn populate_run_pooled_schbench_distribution(stats: &mut ScenarioStats) {
         SCHBENCH_WAKEUP_P50_US_WHOLE, SCHBENCH_WAKEUP_P90_US_WHOLE, SCHBENCH_WAKEUP_P99_US_WHOLE,
         SCHBENCH_WAKEUP_P999_US_WHOLE,
     };
-    use crate::workload::schbench::plat::{PlatStats, Pct};
+    use crate::workload::schbench::plat::{Pct, PlatStats};
 
     // Union the per-stream histograms across ALL phases+cgroups (combine =
     // associative bucket-count add → the faithful pooled histogram).
@@ -1076,15 +1104,18 @@ pub fn populate_run_pooled_schbench_distribution(stats: &mut ScenarioStats) {
     // Latency streams: 4 percentiles + min/max, re-derived over the union, µs.
     if wakeup.sample_count() > 0 {
         let q = wakeup.percentiles();
-        stats
-            .ext_metrics
-            .insert(SCHBENCH_WAKEUP_P50_US_WHOLE.to_string(), q.value_at(Pct::P50) as f64);
-        stats
-            .ext_metrics
-            .insert(SCHBENCH_WAKEUP_P90_US_WHOLE.to_string(), q.value_at(Pct::P90) as f64);
-        stats
-            .ext_metrics
-            .insert(SCHBENCH_WAKEUP_P99_US_WHOLE.to_string(), q.value_at(Pct::P99) as f64);
+        stats.ext_metrics.insert(
+            SCHBENCH_WAKEUP_P50_US_WHOLE.to_string(),
+            q.value_at(Pct::P50) as f64,
+        );
+        stats.ext_metrics.insert(
+            SCHBENCH_WAKEUP_P90_US_WHOLE.to_string(),
+            q.value_at(Pct::P90) as f64,
+        );
+        stats.ext_metrics.insert(
+            SCHBENCH_WAKEUP_P99_US_WHOLE.to_string(),
+            q.value_at(Pct::P99) as f64,
+        );
         stats.ext_metrics.insert(
             SCHBENCH_WAKEUP_P999_US_WHOLE.to_string(),
             q.value_at(Pct::P999) as f64,
@@ -1124,15 +1155,18 @@ pub fn populate_run_pooled_schbench_distribution(stats: &mut ScenarioStats) {
     // RPS stream: PLIST_FOR_RPS = 20/50/90 + min/max (the schbench rps table).
     if rps.sample_count() > 0 {
         let r = rps.percentiles();
-        stats
-            .ext_metrics
-            .insert(SCHBENCH_RPS_P20_WHOLE.to_string(), r.value_at(Pct::P20) as f64);
-        stats
-            .ext_metrics
-            .insert(SCHBENCH_RPS_P50_WHOLE.to_string(), r.value_at(Pct::P50) as f64);
-        stats
-            .ext_metrics
-            .insert(SCHBENCH_RPS_P90_WHOLE.to_string(), r.value_at(Pct::P90) as f64);
+        stats.ext_metrics.insert(
+            SCHBENCH_RPS_P20_WHOLE.to_string(),
+            r.value_at(Pct::P20) as f64,
+        );
+        stats.ext_metrics.insert(
+            SCHBENCH_RPS_P50_WHOLE.to_string(),
+            r.value_at(Pct::P50) as f64,
+        );
+        stats.ext_metrics.insert(
+            SCHBENCH_RPS_P90_WHOLE.to_string(),
+            r.value_at(Pct::P90) as f64,
+        );
         stats
             .ext_metrics
             .insert(SCHBENCH_RPS_MIN_WHOLE.to_string(), r.min as f64);
@@ -1883,8 +1917,7 @@ pub(crate) fn derive_phase_metrics(phases: &mut [PhaseBucket]) {
         // percentile re-derives from the pooled histogram via PlatStats::combine =
         // bucket-count add, never averaged), and pooled == cross-cgroup re-pool.
         let mut pooled: Option<SchbenchPhaseStats> = None;
-        let mut pooled_taobench: Option<crate::workload::taobench::run::TaobenchPhaseStats> =
-            None;
+        let mut pooled_taobench: Option<crate::workload::taobench::run::TaobenchPhaseStats> = None;
         for pc in bucket.per_cgroup.values_mut() {
             // Non-schbench carrier-derived metrics (wake/run-delay/off-cpu
             // distributions + the migration/iterations/locality ratios + the
@@ -2160,17 +2193,26 @@ fn write_taobench_serve_scalars(
     out: &mut std::collections::BTreeMap<String, f64>,
 ) {
     use crate::stats::{
-        TAOBENCH_SERVE_MAX_US, TAOBENCH_SERVE_MIN_US, TAOBENCH_SERVE_P50_US,
-        TAOBENCH_SERVE_P90_US, TAOBENCH_SERVE_P99_US, TAOBENCH_SERVE_P999_US,
+        TAOBENCH_SERVE_MAX_US, TAOBENCH_SERVE_MIN_US, TAOBENCH_SERVE_P50_US, TAOBENCH_SERVE_P90_US,
+        TAOBENCH_SERVE_P99_US, TAOBENCH_SERVE_P999_US,
     };
     use crate::workload::schbench::plat::Pct;
     if serve.sample_count() == 0 {
         return;
     }
     let q = serve.percentiles();
-    out.insert(TAOBENCH_SERVE_P50_US.to_string(), q.value_at(Pct::P50) as f64);
-    out.insert(TAOBENCH_SERVE_P90_US.to_string(), q.value_at(Pct::P90) as f64);
-    out.insert(TAOBENCH_SERVE_P99_US.to_string(), q.value_at(Pct::P99) as f64);
+    out.insert(
+        TAOBENCH_SERVE_P50_US.to_string(),
+        q.value_at(Pct::P50) as f64,
+    );
+    out.insert(
+        TAOBENCH_SERVE_P90_US.to_string(),
+        q.value_at(Pct::P90) as f64,
+    );
+    out.insert(
+        TAOBENCH_SERVE_P99_US.to_string(),
+        q.value_at(Pct::P99) as f64,
+    );
     out.insert(
         TAOBENCH_SERVE_P999_US.to_string(),
         q.value_at(Pct::P999) as f64,
