@@ -231,7 +231,10 @@ fn build_groups_unmeasured_family_aggregates_to_absent() {
     let groups_m = build_groups(&measured, GroupBy::Comm, &[], None, None, false);
     let gm = groups_m.values().next().expect("one group");
     assert!(
-        matches!(gm.metrics.get("cpu_delay_total_ns"), Some(Aggregated::Sum(0))),
+        matches!(
+            gm.metrics.get("cpu_delay_total_ns"),
+            Some(Aggregated::Sum(0))
+        ),
         "measured all-zero delay must be Sum(0), not Absent; got {:?}",
         gm.metrics.get("cpu_delay_total_ns"),
     );
@@ -257,7 +260,10 @@ fn build_groups_mixed_measured_group_folds_to_real_aggregate() {
     assert_eq!(g.thread_count, 2, "both threads share the group");
     // The gate holds (>=1 measured) → real Sum of the contributions (5_000 + 0).
     assert!(
-        matches!(g.metrics.get("cpu_delay_total_ns"), Some(Aggregated::Sum(5_000))),
+        matches!(
+            g.metrics.get("cpu_delay_total_ns"),
+            Some(Aggregated::Sum(5_000))
+        ),
         "a mixed group with one measured thread must fold to a real Sum, not Absent; got {:?}",
         g.metrics.get("cpu_delay_total_ns"),
     );

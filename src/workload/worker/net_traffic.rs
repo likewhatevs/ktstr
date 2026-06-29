@@ -315,16 +315,23 @@ fn virtio_net_iface_in(root: &std::path::Path) -> io::Result<String> {
 /// Read `/sys/class/net/<iface>/ifindex`.
 fn iface_ifindex(iface: &str) -> io::Result<i32> {
     let s = fs::read_to_string(format!("/sys/class/net/{iface}/ifindex"))?;
-    s.trim()
-        .parse::<i32>()
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("ifindex for {iface}: {e}")))
+    s.trim().parse::<i32>().map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("ifindex for {iface}: {e}"),
+        )
+    })
 }
 
 /// Read `/sys/class/net/<iface>/address` into a 6-byte MAC.
 fn iface_mac(iface: &str) -> io::Result<[u8; 6]> {
     let s = fs::read_to_string(format!("/sys/class/net/{iface}/address"))?;
-    parse_mac(s.trim())
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, format!("bad MAC for {iface}: {s:?}")))
+    parse_mac(s.trim()).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("bad MAC for {iface}: {s:?}"),
+        )
+    })
 }
 
 /// Parse a colon-separated 6-octet MAC (e.g. `52:54:00:12:34:56`).
@@ -411,7 +418,11 @@ mod tests {
         let mac = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
         let f = build_frame(mac, 60);
         assert_eq!(f.len(), 60, "frame is the requested size");
-        assert_eq!(&f[0..6], &mac, "dst MAC = our MAC (loopback echoes verbatim)");
+        assert_eq!(
+            &f[0..6],
+            &mac,
+            "dst MAC = our MAC (loopback echoes verbatim)"
+        );
         assert_eq!(&f[6..12], &mac, "src MAC = our MAC");
         assert_eq!(
             &f[12..14],
@@ -428,7 +439,10 @@ mod tests {
         let f = build_frame(mac, 1514);
         assert_eq!(f.len(), 1514);
         assert_eq!(&f[14..18], b"KTST");
-        assert!(f[18..].iter().all(|&b| b == 0), "the tail past the marker stays zero");
+        assert!(
+            f[18..].iter().all(|&b| b == 0),
+            "the tail past the marker stays zero"
+        );
     }
 
     #[test]
@@ -438,7 +452,11 @@ mod tests {
             Some([0x52, 0x54, 0x00, 0x12, 0x34, 0x56])
         );
         assert_eq!(parse_mac("01:02:03:04:05"), None, "5 octets rejected");
-        assert_eq!(parse_mac("01:02:03:04:05:06:07"), None, ">6 octets rejected");
+        assert_eq!(
+            parse_mac("01:02:03:04:05:06:07"),
+            None,
+            ">6 octets rejected"
+        );
         assert_eq!(parse_mac("zz:02:03:04:05:06"), None, "non-hex rejected");
     }
 

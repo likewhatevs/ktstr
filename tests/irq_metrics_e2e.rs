@@ -138,12 +138,14 @@ fn assert_irq_metrics(result: &VmResult) -> Result<()> {
     // Present (psi_system resolved + PSI_IRQ_FULL in BTF + >= 1 data_valid
     // sample) and a sane percent. decode_avg10_percent clamps the upper bound, so
     // [0,100] is a floor/sanity here; the wrong-PA signal is `total > 0` below.
-    let psi_avg10 = result.run_metric(BuiltinMetric::PsiIrqFullAvg10).ok_or_else(|| {
-        anyhow!(
-            "psi_irq_full_avg10 absent — psi_system unresolved or PSI_IRQ_FULL \
+    let psi_avg10 = result
+        .run_metric(BuiltinMetric::PsiIrqFullAvg10)
+        .ok_or_else(|| {
+            anyhow!(
+                "psi_irq_full_avg10 absent — psi_system unresolved or PSI_IRQ_FULL \
              missing from BTF (CONFIG_PSI / CONFIG_IRQ_TIME_ACCOUNTING off)"
-        )
-    })?;
+            )
+        })?;
     ensure!(
         (0.0..=100.0).contains(&psi_avg10),
         "psi_irq_full_avg10 must be a percent in [0,100], got {psi_avg10}"
@@ -160,9 +162,9 @@ fn assert_irq_metrics(result: &VmResult) -> Result<()> {
     // present-but-zero cumulative total is the wrong-PA signature (caught here
     // where the clamped avg10 range cannot). NOTE: > 0 relies on this sustained
     // load; revisit the assertion if the workload is lightened/idled.
-    let psi_total = result.run_metric(BuiltinMetric::TotalIrqPressureUs).ok_or_else(|| {
-        anyhow!("total_irq_pressure_us absent under the same PSI gate as avg10")
-    })?;
+    let psi_total = result
+        .run_metric(BuiltinMetric::TotalIrqPressureUs)
+        .ok_or_else(|| anyhow!("total_irq_pressure_us absent under the same PSI gate as avg10"))?;
     ensure!(
         psi_total > 0.0 && psi_total.is_finite(),
         "total_irq_pressure_us must RISE under the NetTraffic softirq load \

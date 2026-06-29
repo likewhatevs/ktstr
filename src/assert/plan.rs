@@ -1284,7 +1284,12 @@ impl AssertPlan {
             // cgroup-wide total of allocated pages.
             let total_pages: u64 = reports
                 .iter()
-                .map(|w| w.numa_pages.values().copied().fold(0u64, u64::saturating_add))
+                .map(|w| {
+                    w.numa_pages
+                        .values()
+                        .copied()
+                        .fold(0u64, u64::saturating_add)
+                })
                 .fold(0u64, u64::saturating_add);
             let migrated_pages: u64 = reports
                 .iter()
@@ -1311,7 +1316,11 @@ impl AssertPlan {
                 if w.numa_pages.is_empty() {
                     continue;
                 }
-                let total: u64 = w.numa_pages.values().copied().fold(0u64, u64::saturating_add);
+                let total: u64 = w
+                    .numa_pages
+                    .values()
+                    .copied()
+                    .fold(0u64, u64::saturating_add);
                 if total > 0 {
                     evaluated += 1;
                     r.merge(assert_slow_tier_ratio(

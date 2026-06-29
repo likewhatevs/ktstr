@@ -1204,10 +1204,7 @@ mod tests {
 
             let total = out.whole_run.total_ops();
             assert!(total > 0, "engine served ops");
-            assert!(
-                out.whole_run.elapsed_ns > 0,
-                "the run window was measured"
-            );
+            assert!(out.whole_run.elapsed_ns > 0, "the run window was measured");
 
             let hit = out.whole_run.fast_ops as f64 / total as f64;
             assert!(
@@ -1576,15 +1573,24 @@ mod tests {
         // the fixed path (None).
         let base = TaobenchConfig::default().slow_path_sleep_us(100);
         assert!(
-            base.clone().slow_path_p99_us(0).resolve_service_pareto().is_none(),
+            base.clone()
+                .slow_path_p99_us(0)
+                .resolve_service_pareto()
+                .is_none(),
             "p99 == 0 is fixed",
         );
         assert!(
-            base.clone().slow_path_p99_us(50).resolve_service_pareto().is_none(),
+            base.clone()
+                .slow_path_p99_us(50)
+                .resolve_service_pareto()
+                .is_none(),
             "p99 < p50 is fixed",
         );
         assert!(
-            base.clone().slow_path_p99_us(100).resolve_service_pareto().is_none(),
+            base.clone()
+                .slow_path_p99_us(100)
+                .resolve_service_pareto()
+                .is_none(),
             "p99 == p50 is fixed",
         );
         assert!(
@@ -1664,7 +1670,10 @@ mod tests {
         let mut rng = Rng::new(0xF00D_BEEF);
         for _ in 0..1_000_000 {
             let u = rng.f64_open01();
-            assert!(u > 0.0 && u <= 1.0, "f64_open01 yielded {u}, outside (0, 1]");
+            assert!(
+                u > 0.0 && u <= 1.0,
+                "f64_open01 yielded {u}, outside (0, 1]"
+            );
         }
     }
 

@@ -288,8 +288,7 @@ impl<'a> WorkerCtx<'a> {
         // `.`/`..`/absolute/NUL component (which would escape the parent via
         // `Path::join`) before any fs access. The write-mode open below IS the
         // precheck.
-        let path =
-            crate::workload::worker::resolve_sibling_cgroup_procs(self.cgroup_dir(), name)?;
+        let path = crate::workload::worker::resolve_sibling_cgroup_procs(self.cgroup_dir(), name)?;
         std::fs::OpenOptions::new()
             .write(true)
             .open(&path)

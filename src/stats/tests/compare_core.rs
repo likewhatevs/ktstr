@@ -85,8 +85,9 @@ fn compare_rows_zero_baseline_jump_above_abs_gate_is_a_regression() {
     assert_eq!(res.improvements, 0);
     assert_eq!(res.unchanged, 0, "the jump must not be counted unchanged");
     assert!(
-        res.findings.iter().any(|f| f.metric.name == "worst_spread"
-            && f.kind == FindingKind::Regression),
+        res.findings
+            .iter()
+            .any(|f| f.metric.name == "worst_spread" && f.kind == FindingKind::Regression),
         "a worst_spread Regression finding must be emitted; got {:?}",
         res.findings
             .iter()
@@ -157,8 +158,9 @@ fn compare_rows_zero_baseline_jump_above_abs_gate_is_an_improvement() {
     );
     assert_eq!(res.regressions, 0);
     assert!(
-        res.findings.iter().any(|f| f.metric.name == "total_iterations"
-            && f.kind == FindingKind::Improvement),
+        res.findings
+            .iter()
+            .any(|f| f.metric.name == "total_iterations" && f.kind == FindingKind::Improvement),
         "a total_iterations Improvement finding must be emitted; got {:?}",
         res.findings
             .iter()

@@ -303,10 +303,9 @@ pub fn collect_workload_cgroup_psi(
                 out.push(stat);
             }
         } else {
-            for (child_kva, child_pa) in
-                children_of(&mut budget, mem, off, page_offset, kva, pa)
-                    .into_iter()
-                    .map(|c| (c, kva_to_pa(c, page_offset)))
+            for (child_kva, child_pa) in children_of(&mut budget, mem, off, page_offset, kva, pa)
+                .into_iter()
+                .map(|c| (c, kva_to_pa(c, page_offset)))
             {
                 stack.push((child_kva, child_pa));
             }
@@ -384,7 +383,9 @@ mod tests {
     }
     impl Image {
         fn new(size: usize) -> Self {
-            Self { buf: vec![0u8; size] }
+            Self {
+                buf: vec![0u8; size],
+            }
         }
         fn kva(pa: usize) -> u64 {
             DEFAULT_PAGE_OFFSET + pa as u64
@@ -488,8 +489,7 @@ mod tests {
         img.link_children(sched, &[sched_leaf]);
 
         // SAFETY: buf outlives the GuestMem use.
-        let mem =
-            unsafe { GuestMem::new(img.buf.as_mut_ptr(), img.buf.len() as u64) };
+        let mem = unsafe { GuestMem::new(img.buf.as_mut_ptr(), img.buf.len() as u64) };
         let mut got = collect_workload_cgroup_psi(
             &mem,
             &offs(),
@@ -500,14 +500,24 @@ mod tests {
             DEFAULT_PAGE_OFFSET,
         );
         got.sort_by_key(|s| s.total_ns);
-        assert_eq!(got.len(), 2, "exactly the two workload leaves (sched excluded)");
+        assert_eq!(
+            got.len(),
+            2,
+            "exactly the two workload leaves (sched excluded)"
+        );
         assert_eq!(got[0].total_ns, 111_000);
         assert_eq!(got[0].avg10_raw, 2048);
         assert_eq!(got[0].cgroup_kva, Image::kva(cg0));
-        assert_eq!(got[0].serial_nr, 7, "cg0 serial_nr read from the embedded css");
+        assert_eq!(
+            got[0].serial_nr, 7,
+            "cg0 serial_nr read from the embedded css"
+        );
         assert_eq!(got[1].total_ns, 222_000);
         assert_eq!(got[1].cgroup_kva, Image::kva(cg1));
-        assert_eq!(got[1].serial_nr, 9, "cg1 serial_nr read from the embedded css");
+        assert_eq!(
+            got[1].serial_nr, 9,
+            "cg1 serial_nr read from the embedded css"
+        );
     }
 
     /// A leaf whose cgroup->psi is NULL (psi_cgroups disabled) is skipped, not
@@ -534,8 +544,7 @@ mod tests {
         img.link_children(root, &[ktstr]);
         img.link_children(ktstr, &[cg0]);
         // SAFETY: buf outlives the GuestMem use.
-        let mem =
-            unsafe { GuestMem::new(img.buf.as_mut_ptr(), img.buf.len() as u64) };
+        let mem = unsafe { GuestMem::new(img.buf.as_mut_ptr(), img.buf.len() as u64) };
         let got = collect_workload_cgroup_psi(
             &mem,
             &offs(),
@@ -545,7 +554,10 @@ mod tests {
             "/sys/fs/cgroup/ktstr",
             DEFAULT_PAGE_OFFSET,
         );
-        assert!(got.is_empty(), "NULL-psi leaf is skipped (loud-absent), not a 0");
+        assert!(
+            got.is_empty(),
+            "NULL-psi leaf is skipped (loud-absent), not a 0"
+        );
     }
 
     /// Workload root absent (not yet created) → empty, no fault.
@@ -559,8 +571,7 @@ mod tests {
         let root = cgrp_dfl_root + ROOT_CGRP;
         img.init_cgroup(root, kn_root, 0); // root with no children
         // SAFETY: buf outlives the GuestMem use.
-        let mem =
-            unsafe { GuestMem::new(img.buf.as_mut_ptr(), img.buf.len() as u64) };
+        let mem = unsafe { GuestMem::new(img.buf.as_mut_ptr(), img.buf.len() as u64) };
         let got = collect_workload_cgroup_psi(
             &mem,
             &offs(),
@@ -592,11 +603,13 @@ mod tests {
         // Corrupt ktstr's children list into a self-cycle that never reaches
         // the anchor: children.next points at a node whose next points back.
         let bogus = 0x2800usize;
-        img.w64(ktstr + SELF_OFF + CSS_CHILDREN, Image::kva(bogus + CSS_SIBLING));
+        img.w64(
+            ktstr + SELF_OFF + CSS_CHILDREN,
+            Image::kva(bogus + CSS_SIBLING),
+        );
         img.w64(bogus + CSS_SIBLING, Image::kva(bogus + CSS_SIBLING)); // self-loop
         // SAFETY: buf outlives the GuestMem use.
-        let mem =
-            unsafe { GuestMem::new(img.buf.as_mut_ptr(), img.buf.len() as u64) };
+        let mem = unsafe { GuestMem::new(img.buf.as_mut_ptr(), img.buf.len() as u64) };
         // Must terminate (the test would hang on an unbounded walk).
         let got = collect_workload_cgroup_psi(
             &mem,
@@ -655,7 +668,11 @@ mod tests {
             "/sys/fs/cgroup/ktstr",
             DEFAULT_PAGE_OFFSET,
         );
-        assert_eq!(got.len(), 1, "the single deep leaf under ktstr/mid is captured");
+        assert_eq!(
+            got.len(),
+            1,
+            "the single deep leaf under ktstr/mid is captured"
+        );
         assert_eq!(got[0].total_ns, 333_000);
         assert_eq!(got[0].cgroup_kva, Image::kva(leaf));
     }
@@ -685,7 +702,11 @@ mod tests {
             Image::kva(parent),
             parent as u64,
         );
-        assert_eq!(children.len(), 3, "budget caps the per-list walk numerically");
+        assert_eq!(
+            children.len(),
+            3,
+            "budget caps the per-list walk numerically"
+        );
         assert_eq!(budget, 0, "budget fully consumed");
     }
 
@@ -732,17 +753,21 @@ mod tests {
             "/sys/fs/cgroup/a/b",
             DEFAULT_PAGE_OFFSET,
         );
-        assert_eq!(got.len(), 1, "leaf under the a/b multi-segment root is captured");
+        assert_eq!(
+            got.len(),
+            1,
+            "leaf under the a/b multi-segment root is captured"
+        );
         assert_eq!(got[0].total_ns, 444_000);
     }
 
     #[test]
     fn segments_strip_mount_prefix() {
-        assert_eq!(workload_root_segments("/sys/fs/cgroup/ktstr"), vec!["ktstr"]);
         assert_eq!(
-            workload_root_segments("/sys/fs/cgroup/a/b"),
-            vec!["a", "b"]
+            workload_root_segments("/sys/fs/cgroup/ktstr"),
+            vec!["ktstr"]
         );
+        assert_eq!(workload_root_segments("/sys/fs/cgroup/a/b"), vec!["a", "b"]);
         assert_eq!(workload_root_segments("ktstr"), vec!["ktstr"]);
         assert_eq!(workload_root_segments("/sys/fs/cgroup"), Vec::<&str>::new());
     }

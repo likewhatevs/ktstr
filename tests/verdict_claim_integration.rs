@@ -334,7 +334,8 @@ fn claim_better_orients_by_polarity_and_quarantines_unregistered_metrics() {
 
     // LowerBetter (latency): candidate WORSE than baseline -> Fail.
     let mut v = Verdict::new();
-    v.claim_better(BuiltinMetric::WakeupP99LatencyUs, 60.0).than(50.0);
+    v.claim_better(BuiltinMetric::WakeupP99LatencyUs, 60.0)
+        .than(50.0);
     assert!(
         v.into_result().is_fail(),
         "LowerBetter: candidate 60 > baseline 50 is worse -> Fail",
@@ -342,7 +343,8 @@ fn claim_better_orients_by_polarity_and_quarantines_unregistered_metrics() {
 
     // HigherBetter (loop_count): candidate better -> Pass.
     let mut v = Verdict::new();
-    v.claim_better(BuiltinMetric::SchbenchLoopCount, 200.0).than(100.0);
+    v.claim_better(BuiltinMetric::SchbenchLoopCount, 200.0)
+        .than(100.0);
     assert!(
         v.into_result().is_pass(),
         "HigherBetter: candidate 200 > baseline 100 is better -> Pass",

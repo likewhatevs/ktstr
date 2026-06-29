@@ -291,9 +291,7 @@ fn repool_distribution_no_measurement_cohort_is_absent_not_zero() {
     let mut stats = repool_stats(vec![("x", PhaseCgroupStats::default())], vec![cg]);
     populate_run_distribution_metrics(&mut stats);
     assert!(
-        !stats
-            .ext_metrics
-            .contains_key("worst_p99_wake_latency_us"),
+        !stats.ext_metrics.contains_key("worst_p99_wake_latency_us"),
         "no-wake-measurement cohort must be ABSENT, not a false Some(0.0)",
     );
     assert!(

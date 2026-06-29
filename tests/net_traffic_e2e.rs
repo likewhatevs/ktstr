@@ -120,7 +120,10 @@ fn net_traffic_no_nic_is_loud_noop(_ctx: &Ctx) -> Result<AssertResult> {
     handle.start();
     std::thread::sleep(Duration::from_secs(2));
     let reports = handle.stop_and_collect();
-    ensure!(!reports.is_empty(), "no NetTraffic worker reports came back");
+    ensure!(
+        !reports.is_empty(),
+        "no NetTraffic worker reports came back"
+    );
     let work: u64 = reports.iter().map(|r| r.work_units).sum();
     let iters: u64 = reports.iter().map(|r| r.iterations).sum();
     eprintln!(

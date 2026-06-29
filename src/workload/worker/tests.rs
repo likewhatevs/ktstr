@@ -1367,8 +1367,7 @@ fn parse_cgroup_rel_and_self_dir_discipline() {
     // Hybrid host: v1 controller lines interleaved with the unified
     // `0::` line — the `0::` line is found regardless of its position.
     assert_eq!(
-        parse_cgroup_rel("3:cpu,cpuacct:/foo\n0::/ktstr/cgA\n1:name=systemd:/bar\n")
-            .as_deref(),
+        parse_cgroup_rel("3:cpu,cpuacct:/foo\n0::/ktstr/cgA\n1:name=systemd:/bar\n").as_deref(),
         Some("/ktstr/cgA")
     );
     // The rel->dir mapping pinned deterministically on literals (the
@@ -1388,8 +1387,7 @@ fn parse_cgroup_rel_and_self_dir_discipline() {
     // the bare "/sys/fs/cgroup" root sentinel.
     if let Some(dir) = read_self_cgroup_dir() {
         assert!(
-            dir.starts_with("/sys/fs/cgroup")
-                && dir != std::path::Path::new("/sys/fs/cgroup"),
+            dir.starts_with("/sys/fs/cgroup") && dir != std::path::Path::new("/sys/fs/cgroup"),
             "read_self_cgroup_dir must be a dedicated cgroup dir, got {dir:?}"
         );
     }
@@ -1441,7 +1439,10 @@ fn open_sibling_cgroup_procs_resolves_opens_and_validates() {
     // No cgroup_dir (root / non-v2 worker) -> NotFound, never a fabricated path.
     let ctx_root = WorkerCtx::new(&stop, &[], &[], None, CustomCfg::default());
     assert_eq!(
-        ctx_root.open_sibling_cgroup_procs("dest").unwrap_err().kind(),
+        ctx_root
+            .open_sibling_cgroup_procs("dest")
+            .unwrap_err()
+            .kind(),
         ErrorKind::NotFound
     );
 
@@ -1455,7 +1456,10 @@ fn open_sibling_cgroup_procs_resolves_opens_and_validates() {
         CustomCfg::default(),
     );
     assert_eq!(
-        ctx_slash.open_sibling_cgroup_procs("dest").unwrap_err().kind(),
+        ctx_slash
+            .open_sibling_cgroup_procs("dest")
+            .unwrap_err()
+            .kind(),
         ErrorKind::NotFound
     );
 }

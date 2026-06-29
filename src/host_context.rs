@@ -1475,7 +1475,10 @@ fn read_config_task_xacct_from(path: &std::path::Path) -> XacctState {
 fn parse_kconfig_xacct(text: &str) -> XacctState {
     if text.lines().any(|l| l.trim() == "CONFIG_TASK_XACCT=y") {
         XacctState::On
-    } else if text.lines().any(|l| l.trim() == "# CONFIG_TASK_XACCT is not set") {
+    } else if text
+        .lines()
+        .any(|l| l.trim() == "# CONFIG_TASK_XACCT is not set")
+    {
         XacctState::Off
     } else {
         XacctState::Unknown

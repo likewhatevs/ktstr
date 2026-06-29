@@ -383,15 +383,20 @@ fn scenario_stats_run_metric_resolves_ext_family_sentinel_free() {
 #[test]
 fn run_metric_typed_cgroup_fields_distinguish_measured_zero_from_absent() {
     use crate::stats::BuiltinMetric as B;
-    let cg = |spread: Option<f64>, iters: u64, migr: u64, gap_ms: u64, workers: usize| CgroupStats {
-        num_workers: workers,
-        spread,
-        total_iterations: iters,
-        total_migrations: migr,
-        migration_ratio: if iters > 0 { migr as f64 / iters as f64 } else { 0.0 },
-        max_gap_ms: gap_ms,
-        ..Default::default()
-    };
+    let cg =
+        |spread: Option<f64>, iters: u64, migr: u64, gap_ms: u64, workers: usize| CgroupStats {
+            num_workers: workers,
+            spread,
+            total_iterations: iters,
+            total_migrations: migr,
+            migration_ratio: if iters > 0 {
+                migr as f64 / iters as f64
+            } else {
+                0.0
+            },
+            max_gap_ms: gap_ms,
+            ..Default::default()
+        };
     // MEASURED zeros -> Some(0.0): spread measured 0; 0 migrations over 1000
     // iters; 0 gap with 4 workers; the totals SUM to a measured 0 / 1000.
     let m = ScenarioStats {
@@ -423,9 +428,21 @@ fn run_metric_typed_cgroup_fields_distinguish_measured_zero_from_absent() {
         cgroups: vec![cg(Some(0.1), 100, 5, 3, 2), cg(Some(0.4), 100, 1, 9, 2)],
         ..Default::default()
     };
-    assert_eq!(two.run_metric(B::WorstSpread), Some(0.4), "max spread across cgroups");
-    assert_eq!(two.run_metric(B::WorstGapMs), Some(9.0), "max gap across cgroups");
-    assert_eq!(two.run_metric(B::TotalMigrations), Some(6.0), "5 + 1 summed");
+    assert_eq!(
+        two.run_metric(B::WorstSpread),
+        Some(0.4),
+        "max spread across cgroups"
+    );
+    assert_eq!(
+        two.run_metric(B::WorstGapMs),
+        Some(9.0),
+        "max gap across cgroups"
+    );
+    assert_eq!(
+        two.run_metric(B::TotalMigrations),
+        Some(6.0),
+        "5 + 1 summed"
+    );
 }
 
 /// The two NUMA fields re-derive from the per-phase carriers with the ASYMMETRIC
@@ -476,7 +493,10 @@ fn run_metric_numa_fields_latest_residency_summed_migrations_none_aware() {
     // A measured-0.0 locality (all off-node) is the WORST and wins the lowest
     // fold — NOT skipped as a sentinel (the fold_lowest_nonzero read-side bug).
     let z = ScenarioStats {
-        phases: vec![phase(1, &[("A", pcg(0, 1000, 0)), ("B", pcg(1000, 1000, 0))])],
+        phases: vec![phase(
+            1,
+            &[("A", pcg(0, 1000, 0)), ("B", pcg(1000, 1000, 0))],
+        )],
         ..Default::default()
     };
     assert_eq!(
@@ -489,7 +509,11 @@ fn run_metric_numa_fields_latest_residency_summed_migrations_none_aware() {
         phases: vec![phase(1, &[("A", pcg(0, 0, 0))])],
         ..Default::default()
     };
-    assert_eq!(n.run_metric(B::WorstPageLocality), None, "no NUMA pages -> not measured");
+    assert_eq!(
+        n.run_metric(B::WorstPageLocality),
+        None,
+        "no NUMA pages -> not measured"
+    );
     assert_eq!(n.run_metric(B::WorstCrossNodeMigrationRatio), None);
     // cross_node is a CHURN ratio (cumulative migration EVENTS / snapshot
     // residency), intentionally UNBOUNDED: more migrations than resident pages
@@ -499,7 +523,10 @@ fn run_metric_numa_fields_latest_residency_summed_migrations_none_aware() {
         ..Default::default()
     };
     let r = churn.run_metric(B::WorstCrossNodeMigrationRatio).unwrap();
-    assert!((r - 3.0).abs() < 1e-9, "3000 migrations / 1000 pages = 3.0 (>1.0 churn); got {r}");
+    assert!(
+        (r - 3.0).abs() < 1e-9,
+        "3000 migrations / 1000 pages = 3.0 (>1.0 churn); got {r}"
+    );
     assert_eq!(
         churn.run_metric(B::WorstPageLocality),
         Some(0.5),
@@ -528,7 +555,11 @@ fn run_metric_numa_fields_latest_residency_summed_migrations_none_aware() {
         cgroups: vec![CgroupStats::default()],
         ..Default::default()
     };
-    assert_eq!(p.run_metric(B::WorstPageLocality), None, "no phases -> no NUMA carriers");
+    assert_eq!(
+        p.run_metric(B::WorstPageLocality),
+        None,
+        "no phases -> no NUMA carriers"
+    );
 }
 
 /// The metric accessors take `impl Into<MetricId>`: a typed

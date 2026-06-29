@@ -216,7 +216,12 @@ pub fn cgroup_stats(reports: &[WorkerReport]) -> CgroupStats {
     // for its diagnostic; this is the always-on telemetry.)
     let total_numa_pages: u64 = reports
         .iter()
-        .map(|w| w.numa_pages.values().copied().fold(0u64, u64::saturating_add))
+        .map(|w| {
+            w.numa_pages
+                .values()
+                .copied()
+                .fold(0u64, u64::saturating_add)
+        })
         .fold(0u64, u64::saturating_add);
     let migrated_pages: u64 = reports
         .iter()
@@ -233,18 +238,21 @@ pub fn cgroup_stats(reports: &[WorkerReport]) -> CgroupStats {
     // raw carrier, the taobench analogue of `total_iterations`. Counters only —
     // serve latency is per-phase data (the `taobench_serve_*_us_whole` keys union
     // the `PhaseCgroupStats::taobench` histograms).
-    let taobench_whole = reports.iter().filter_map(|w| w.taobench_whole.as_ref()).fold(
-        None,
-        |acc: Option<crate::workload::taobench::run::TaobenchStats>, t| {
-            Some(match acc {
-                Some(mut a) => {
-                    a.merge(t);
-                    a
-                }
-                None => *t,
-            })
-        },
-    );
+    let taobench_whole = reports
+        .iter()
+        .filter_map(|w| w.taobench_whole.as_ref())
+        .fold(
+            None,
+            |acc: Option<crate::workload::taobench::run::TaobenchStats>, t| {
+                Some(match acc {
+                    Some(mut a) => {
+                        a.merge(t);
+                        a
+                    }
+                    None => *t,
+                })
+            },
+        );
 
     CgroupStats {
         // Empty here; collect_handles labels the entry post-hoc (it has
@@ -481,7 +489,12 @@ pub(crate) fn phase_cgroup_stats(
         .fold(0u64, u64::saturating_add);
     let numa_pages_total: u64 = reports
         .iter()
-        .map(|w| w.numa_pages.values().copied().fold(0u64, u64::saturating_add))
+        .map(|w| {
+            w.numa_pages
+                .values()
+                .copied()
+                .fold(0u64, u64::saturating_add)
+        })
         .fold(0u64, u64::saturating_add);
     // System-wide /proc/vmstat numa_pages_migrated delta each worker observes
     // redundantly -> MAX, not SUM (summing inflates by the worker count).

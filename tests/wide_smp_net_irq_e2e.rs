@@ -43,7 +43,9 @@ use std::mem;
 
 #[path = "common/wide_smp_irq.rs"]
 mod wide_smp_irq;
-use wide_smp_irq::{find_apic_above_255, irq_count, pin_irq_to_cpu, virtio_net_iface, virtio_net_irq};
+use wide_smp_irq::{
+    find_apic_above_255, irq_count, pin_irq_to_cpu, virtio_net_iface, virtio_net_irq,
+};
 
 /// virtio-net with a deterministic locally-administered MAC. Const because
 /// `NetConfig::default` is not const and the `network =` macro arg needs a

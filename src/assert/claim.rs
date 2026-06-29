@@ -949,7 +949,13 @@ impl<'a> PresentClaim<'a> {
     /// Present and `>= floor`; absent → `Fail`. See
     /// [`ClaimBuilder::at_least`].
     pub fn at_least(self, floor: f64) -> &'a mut Verdict {
-        let PresentClaim { verdict, name, value, kind, reason } = self;
+        let PresentClaim {
+            verdict,
+            name,
+            value,
+            kind,
+            reason,
+        } = self;
         match value {
             None => Self::record_absent(verdict, name, kind, reason),
             Some(v) => Self::present(verdict, name, v, kind, reason).at_least(floor),
@@ -959,7 +965,13 @@ impl<'a> PresentClaim<'a> {
     /// Present and `<= ceiling`; absent → `Fail`. See
     /// [`ClaimBuilder::at_most`].
     pub fn at_most(self, ceiling: f64) -> &'a mut Verdict {
-        let PresentClaim { verdict, name, value, kind, reason } = self;
+        let PresentClaim {
+            verdict,
+            name,
+            value,
+            kind,
+            reason,
+        } = self;
         match value {
             None => Self::record_absent(verdict, name, kind, reason),
             Some(v) => Self::present(verdict, name, v, kind, reason).at_most(ceiling),
@@ -968,7 +980,13 @@ impl<'a> PresentClaim<'a> {
 
     /// Present and `< ceiling`; absent → `Fail`. See [`ClaimBuilder::lt`].
     pub fn lt(self, ceiling: f64) -> &'a mut Verdict {
-        let PresentClaim { verdict, name, value, kind, reason } = self;
+        let PresentClaim {
+            verdict,
+            name,
+            value,
+            kind,
+            reason,
+        } = self;
         match value {
             None => Self::record_absent(verdict, name, kind, reason),
             Some(v) => Self::present(verdict, name, v, kind, reason).lt(ceiling),
@@ -977,7 +995,13 @@ impl<'a> PresentClaim<'a> {
 
     /// Present and `> floor`; absent → `Fail`. See [`ClaimBuilder::gt`].
     pub fn gt(self, floor: f64) -> &'a mut Verdict {
-        let PresentClaim { verdict, name, value, kind, reason } = self;
+        let PresentClaim {
+            verdict,
+            name,
+            value,
+            kind,
+            reason,
+        } = self;
         match value {
             None => Self::record_absent(verdict, name, kind, reason),
             Some(v) => Self::present(verdict, name, v, kind, reason).gt(floor),
@@ -987,7 +1011,13 @@ impl<'a> PresentClaim<'a> {
     /// Present and within `[lo, hi]` (inclusive); absent → `Fail`. See
     /// [`ClaimBuilder::between`].
     pub fn between(self, lo: f64, hi: f64) -> &'a mut Verdict {
-        let PresentClaim { verdict, name, value, kind, reason } = self;
+        let PresentClaim {
+            verdict,
+            name,
+            value,
+            kind,
+            reason,
+        } = self;
         match value {
             None => Self::record_absent(verdict, name, kind, reason),
             Some(v) => Self::present(verdict, name, v, kind, reason).between(lo, hi),
@@ -997,7 +1027,13 @@ impl<'a> PresentClaim<'a> {
     /// Present and within `tolerance` of `target`; absent → `Fail`. See
     /// [`ClaimBuilder::near`].
     pub fn near(self, target: f64, tolerance: f64) -> &'a mut Verdict {
-        let PresentClaim { verdict, name, value, kind, reason } = self;
+        let PresentClaim {
+            verdict,
+            name,
+            value,
+            kind,
+            reason,
+        } = self;
         match value {
             None => Self::record_absent(verdict, name, kind, reason),
             Some(v) => Self::present(verdict, name, v, kind, reason).near(target, tolerance),
@@ -1007,7 +1043,13 @@ impl<'a> PresentClaim<'a> {
     /// Present and finite (neither NaN nor ±∞); absent → `Fail`. See
     /// [`ClaimBuilder::is_finite`].
     pub fn is_finite(self) -> &'a mut Verdict {
-        let PresentClaim { verdict, name, value, kind, reason } = self;
+        let PresentClaim {
+            verdict,
+            name,
+            value,
+            kind,
+            reason,
+        } = self;
         match value {
             None => Self::record_absent(verdict, name, kind, reason),
             Some(v) => Self::present(verdict, name, v, kind, reason).is_finite(),

@@ -1382,7 +1382,10 @@ mod tests {
                 ..
             }
         ));
-        assert!(matches!(CHECKS[3], MetricCheck::Exists("schbench_loop_count")));
+        assert!(matches!(
+            CHECKS[3],
+            MetricCheck::Exists("schbench_loop_count")
+        ));
 
         // The typed table is a `&'static [MetricCheck]` (the const's lifetime is
         // elided) — it drops straight into a Payload's default_checks slot (the

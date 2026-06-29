@@ -1008,33 +1008,36 @@ fn populate_run_pooled_taobench_distribution_absent_without_serve_samples() {
     let mut empty = ScenarioStats::default();
     populate_run_pooled_taobench_distribution(&mut empty);
     assert!(
-        !empty.ext_metrics.contains_key("taobench_serve_p99_us_whole"),
+        !empty
+            .ext_metrics
+            .contains_key("taobench_serve_p99_us_whole"),
         "no serve keys for an empty run",
     );
     // A taobench carrier present but with an empty serve histogram (closed loop).
     let mut stats = ScenarioStats {
-        phases: vec![schbench_phase(1, vec![("cg", taobench_serve_pc(0, 0, 0, 0))])],
+        phases: vec![schbench_phase(
+            1,
+            vec![("cg", taobench_serve_pc(0, 0, 0, 0))],
+        )],
         ..ScenarioStats::default()
     };
     populate_run_pooled_taobench_distribution(&mut stats);
     assert!(
-        !stats.ext_metrics.contains_key("taobench_serve_p99_us_whole"),
+        !stats
+            .ext_metrics
+            .contains_key("taobench_serve_p99_us_whole"),
         "no serve keys when the histogram is empty (closed loop)",
     );
     assert!(
-        !stats.ext_metrics.contains_key("taobench_serve_max_us_whole"),
+        !stats
+            .ext_metrics
+            .contains_key("taobench_serve_max_us_whole"),
         "no serve max key when the histogram is empty",
     );
 }
 
 /// A schbench per-phase per-cgroup carrier with the given Class-3 raw pairs.
-fn schbench_pc(
-    msg_rd: u64,
-    msg_pc: u64,
-    wkr_rd: u64,
-    wkr_pc: u64,
-    loops: u64,
-) -> PhaseCgroupStats {
+fn schbench_pc(msg_rd: u64, msg_pc: u64, wkr_rd: u64, wkr_pc: u64, loops: u64) -> PhaseCgroupStats {
     PhaseCgroupStats {
         schbench: Some(crate::workload::schbench::run::SchbenchPhaseStats {
             msg_run_delay_ns: msg_rd,
@@ -1134,7 +1137,10 @@ fn populate_run_pooled_schbench_repools_across_phases_and_cgroups() {
 #[test]
 fn populate_run_pooled_schbench_role_gating_omits_unscheduled_role() {
     let mut stats = ScenarioStats {
-        phases: vec![schbench_phase(1, vec![("cg", schbench_pc(0, 0, 200, 4, 50))])],
+        phases: vec![schbench_phase(
+            1,
+            vec![("cg", schbench_pc(0, 0, 200, 4, 50))],
+        )],
         ..ScenarioStats::default()
     };
     populate_run_pooled_schbench(&mut stats);
@@ -1160,10 +1166,7 @@ fn populate_run_pooled_schbench_role_gating_omits_unscheduled_role() {
 #[test]
 fn populate_run_pooled_schbench_absent_without_schbench() {
     let mut stats = ScenarioStats {
-        phases: vec![schbench_phase(
-            1,
-            vec![("cg", PhaseCgroupStats::default())],
-        )],
+        phases: vec![schbench_phase(1, vec![("cg", PhaseCgroupStats::default())])],
         ..ScenarioStats::default()
     };
     populate_run_pooled_schbench(&mut stats);
@@ -1398,7 +1401,8 @@ fn cgroup_stats_saturates_per_worker_counter_overflow() {
     let reports = vec![report(u64::MAX, u64::MAX, u64::MAX), report(5, 5, 5)];
     let cg = super::reductions::cgroup_stats(&reports);
     assert_eq!(
-        cg.total_iterations, u64::MAX,
+        cg.total_iterations,
+        u64::MAX,
         "iterations pool saturates, not wraps to 4",
     );
     assert_eq!(cg.total_migrations, u64::MAX, "migration pool saturates");

@@ -433,7 +433,10 @@ fn scenario_stats_numa_defaults() {
     let s = ScenarioStats::default();
     // Neither NUMA roll-up is a typed field — a default (phase-less)
     // ScenarioStats has no NUMA carriers, so both re-pool to None.
-    assert_eq!(s.run_metric(crate::stats::BuiltinMetric::WorstPageLocality), None);
+    assert_eq!(
+        s.run_metric(crate::stats::BuiltinMetric::WorstPageLocality),
+        None
+    );
     assert_eq!(
         s.run_metric(crate::stats::BuiltinMetric::WorstCrossNodeMigrationRatio),
         None
@@ -866,7 +869,8 @@ fn cgroup_numa_telemetry_populates_without_a_check() {
     // is None here — the per-cgroup `cg.page_locality` / `cg.cross_node_migration_ratio`
     // above are the telemetry this path surfaces.
     assert_eq!(
-        r.stats.run_metric(crate::stats::BuiltinMetric::WorstPageLocality),
+        r.stats
+            .run_metric(crate::stats::BuiltinMetric::WorstPageLocality),
         None,
     );
     assert_eq!(
