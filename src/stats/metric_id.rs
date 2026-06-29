@@ -114,6 +114,18 @@ builtin_metrics! {
     TaobenchFastOpsPerSec => "taobench_fast_ops_per_sec",
     TaobenchSlowOpsPerSec => "taobench_slow_ops_per_sec",
     TaobenchHitFraction => "taobench_hit_fraction",
+    // taobench whole-run open-loop serve-latency percentiles (PerRunDistribution).
+    TaobenchServeP50UsWhole => "taobench_serve_p50_us_whole",
+    TaobenchServeP90UsWhole => "taobench_serve_p90_us_whole",
+    TaobenchServeP99UsWhole => "taobench_serve_p99_us_whole",
+    TaobenchServeP999UsWhole => "taobench_serve_p999_us_whole",
+    TaobenchServeMinUsWhole => "taobench_serve_min_us_whole",
+    TaobenchServeMaxUsWhole => "taobench_serve_max_us_whole",
+    // taobench whole-run command-time hit: get_cmds + get_hits Counter components
+    // → taobench_command_hit_rate (Σhits/Σcmds) Rate.
+    TotalTaobenchGetCmds => "total_taobench_get_cmds",
+    TotalTaobenchGetHits => "total_taobench_get_hits",
+    TaobenchCommandHitRate => "taobench_command_hit_rate",
     // schbench whole-run Class-3 (loop Counter + role-separate run-delay gate
     // Rates + their Counter components), re-pooled by populate_run_pooled_schbench.
     TotalSchbenchMsgRunDelayNs => "total_schbench_msg_run_delay_ns",
@@ -231,6 +243,13 @@ builtin_metrics! {
     TaobenchSlowQps => "taobench_slow_qps",
     TaobenchHitRatio => "taobench_hit_ratio",
     TaobenchHitRate => "taobench_hit_rate",
+    // taobench per-phase open-loop serve-latency percentiles (PerPhase, µs).
+    TaobenchServeP50Us => "taobench_serve_p50_us",
+    TaobenchServeP90Us => "taobench_serve_p90_us",
+    TaobenchServeP99Us => "taobench_serve_p99_us",
+    TaobenchServeP999Us => "taobench_serve_p999_us",
+    TaobenchServeMinUs => "taobench_serve_min_us",
+    TaobenchServeMaxUs => "taobench_serve_max_us",
     WakeupMinLatencyUs => "wakeup_min_latency_us",
     WakeupMaxLatencyUs => "wakeup_max_latency_us",
     RequestMinLatencyUs => "request_min_latency_us",

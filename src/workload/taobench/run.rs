@@ -1,6 +1,7 @@
 //! The taobench engine: a bounded, sharded, evicting key-value cache served by a
-//! closed-loop client population, with a fast in-cache path (hit) and a slow
-//! backing-store-miss path (a worker-defined sleep on a dispatcher thread). It is
+//! client population (closed-loop by default, or open-loop fixed-rate arrival),
+//! with a fast in-cache path (hit) and a slow backing-store-miss path (a
+//! worker-defined sleep on a dispatcher thread). It is
 //! entirely in-process — no sockets, no TLS, no subprocess — and re-expresses the
 //! taobench ACCESS PATTERN in ktstr primitives so its qps / hit-ratio flow
 //! through the metric API. See `validation.md` for the per-aspect real-vs-port
@@ -15,10 +16,20 @@
 //!   ≈ `target_hit` at equilibrium. Eviction is the load-bearing mechanism: with
 //!   no eviction a self-healing cache drifts to a 1.0 hit ratio; a bounded cache
 //!   whose key range exceeds its capacity holds a steady-state miss stream.
-//! - `client_threads` CLIENT threads run a closed loop: pick a key, look it up,
-//!   and on a HIT touch the stored value bytes (the cache read-bandwidth cost) and
-//!   count a fast op; on a MISS hand the key to a slow dispatcher and block until
-//!   it is filled, then count a slow op.
+//! - `client_threads` CLIENT threads pick a key, look it up, and on a HIT touch
+//!   the stored value bytes (the cache read-bandwidth cost) and count a fast op;
+//!   on a MISS hand the key to a slow dispatcher and block until it is filled,
+//!   then count a slow op.
+//! - Arrival: `arrival_rate == 0` (default) is CLOSED loop — each client issues
+//!   its next request as soon as the prior completes. `arrival_rate > 0` is OPEN
+//!   loop — each client has a fixed intended-arrival SCHEDULE
+//!   (`arrival_rate / client_threads` per client) independent of completion, and
+//!   serve latency is measured from that intended time. A client still holds at
+//!   most one outstanding request (it blocks on a miss before issuing the next),
+//!   so a slow completion delays the next issue; that backlog is folded into the
+//!   late requests' serve latency (coordinated-omission correction) instead of
+//!   being omitted. The serve-latency histogram is per-phase data (empty in
+//!   closed loop).
 //! - `slow_threads` DISPATCHER threads serve misses: sleep `slow_path_sleep_us`
 //!   (the simulated backing-store fetch — a worker-defined cost, the same model
 //!   schbench's think-sleep uses, not a synchronization wait), insert a freshly
@@ -34,6 +45,7 @@
 //! response-time hit_ratio (`fast_ops/(fast_ops+slow_ops)`) — the same skew the
 //! real reports between its interval hit_rate and its final hit_ratio.
 
+use crate::workload::schbench::plat::PlatStats;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::collections::HashMap;
 use std::collections::{BTreeMap, VecDeque};
@@ -50,6 +62,16 @@ const SHARDS: usize = 256;
 /// own approximation, not a copy of any external size table.
 const VALUE_SIZES: [usize; 8] = [64, 128, 256, 512, 1024, 4096, 16384, 65536];
 const VALUE_WEIGHTS: [u32; 8] = [450, 300, 130, 70, 30, 12, 3, 1];
+
+/// Cap on a single open-loop pacing sleep (ns). A client waiting for its next
+/// scheduled arrival re-checks `stop` at least this often, so a shutdown is
+/// observed within this bound rather than after a full inter-arrival interval —
+/// which at a degenerate low `arrival_rate` (`interval_ns = 1e9 * n_clients /
+/// arrival_rate`) can exceed the scenario cleanup budget and risk a watchdog kill.
+/// At realistic open-loop rates the per-arrival interval is well under this, so the
+/// pacing sleep is a single uncapped wait — the cap only engages at pathological
+/// low rates.
+const STOP_POLL_QUANTUM_NS: u64 = 50_000_000;
 
 /// Read `CLOCK_MONOTONIC` as nanoseconds (monotonic, not wall-clock), matching
 /// the schbench engine's clock source.
@@ -142,7 +164,7 @@ fn make_value(size: usize) -> Box<[u8]> {
 #[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct TaobenchConfig {
-    /// Closed-loop CLIENT threads that issue lookups and serve hits. `0` resolves
+    /// CLIENT threads that issue lookups and serve hits. `0` resolves
     /// to the allocated guest cpuset CPU count (one client per CPU).
     pub client_threads: usize,
     /// SLOW dispatcher threads that serve misses (sleep + fill + wake). `0`
@@ -161,6 +183,20 @@ pub struct TaobenchConfig {
     /// dispatcher sleeps this long before filling). `0` keeps the slow path as a
     /// pure thread hop with no sleep.
     pub slow_path_sleep_us: u64,
+    /// Open-loop arrival rate, AGGREGATE ops/sec across all client threads (the
+    /// taobench analog of schbench's `-R`). `0` (default) = CLOSED loop: each
+    /// client blocks until its request completes before issuing the next (the
+    /// legacy behavior, byte-identical). Non-zero = OPEN loop: each client has a
+    /// fixed intended-arrival SCHEDULE (`arrival_rate / client_threads` per client)
+    /// independent of completion, and serve latency is measured from that intended
+    /// time. A client still holds at most one outstanding request, so a slow
+    /// completion delays the next issue; that backlog is folded into the late
+    /// requests' serve latency (coordinated-omission correction) rather than
+    /// omitted. Divided evenly across resolved clients. (Named for the standard
+    /// queueing-theory term; the schbench analog is `requests_per_sec`, which is a
+    /// verbatim mirror of schbench's own `-R` CLI flag — a constraint this
+    /// ktstr-added field, with no reference `-R` to mirror, does not share.)
+    pub arrival_rate: usize,
 }
 
 impl Default for TaobenchConfig {
@@ -171,12 +207,13 @@ impl Default for TaobenchConfig {
             cache_capacity_mib: 64,
             target_hit_pct: 90,
             slow_path_sleep_us: 100,
+            arrival_rate: 0,
         }
     }
 }
 
 impl TaobenchConfig {
-    /// Set the closed-loop client thread count (`0` = one per allocated CPU).
+    /// Set the client thread count (`0` = one per allocated CPU).
     #[must_use = "builder methods consume self; bind the result"]
     pub fn client_threads(mut self, n: usize) -> Self {
         self.client_threads = n;
@@ -204,6 +241,14 @@ impl TaobenchConfig {
     #[must_use = "builder methods consume self; bind the result"]
     pub fn slow_path_sleep_us(mut self, us: u64) -> Self {
         self.slow_path_sleep_us = us;
+        self
+    }
+    /// Set the open-loop AGGREGATE arrival rate in ops/sec across all clients
+    /// (`0` = closed loop). Divided evenly across resolved client threads; serve
+    /// latency is then measured from the intended arrival (coordinated-omission).
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn arrival_rate(mut self, ops_per_sec: usize) -> Self {
+        self.arrival_rate = ops_per_sec;
         self
     }
 
@@ -322,7 +367,9 @@ impl Cache {
 // Slow-path handoff
 // ---------------------------------------------------------------------------
 
-/// A miss handed from a client to a slow dispatcher.
+/// A miss handed from a client to a slow dispatcher. The client measures serve
+/// latency from its own local intended-arrival timestamp after `wait_filled`, so
+/// the request itself carries no timing — only the key + the client to wake.
 struct SlowReq {
     key: u64,
     client: usize,
@@ -349,8 +396,13 @@ impl SlowQueue {
 }
 
 /// A per-client response slot: the dispatcher sets `done` + notifies after the
-/// fill; the client blocks here until its outstanding miss is served. One
-/// outstanding request per client (closed loop), so the slot is reused.
+/// fill; the client blocks here until its outstanding miss is served. At most one
+/// outstanding request per client in BOTH arrival modes (a client blocks on
+/// `wait_filled` for a miss before issuing its next request), so the slot is
+/// reused. This single-outstanding-request serialization is exactly why open-loop
+/// serve latency must be measured from the intended arrival (coordinated-omission):
+/// a slow completion delays the next issue, and that backlog is folded into the
+/// late requests' latency instead of omitted.
 struct Slot {
     done: Mutex<bool>,
     cv: Condvar,
@@ -428,10 +480,46 @@ impl TaobenchStats {
     }
 }
 
-/// The engine's return: the whole-run merged stats and per-phase-epoch stats.
+/// One PER-PHASE accounting window's taobench carrier: the integer counters
+/// ([`TaobenchStats`]) plus the open-loop serve-latency histogram. Internal
+/// (`pub(crate)`) — the taobench analog of
+/// [`crate::workload::schbench::run::SchbenchPhaseStats`] (counters + `PlatStats`
+/// histograms together), and like it, never on a public field. It rides only the
+/// per-phase carriers (`PhaseSlice::taobench` / `PhaseCgroupStats::taobench`); the
+/// WHOLE-RUN carrier is the counters-only [`TaobenchStats`] (the serve histogram
+/// is per-phase data — the whole-run serve distribution is the union of these
+/// per-phase histograms, computed where needed). `serve_lat` is EMPTY in closed
+/// loop: serve latency is measured only under open-loop arrival, so its
+/// percentiles read absent there.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct TaobenchPhaseStats {
+    /// Throughput / hit counters (request- and response-time).
+    pub(crate) counters: TaobenchStats,
+    /// Coordinated-omission serve latency (µs), measured from intended arrival.
+    /// Exposed to test authors only via the derived `taobench_serve_*_us` metric
+    /// keys (the schbench-histogram model), never as a direct field.
+    pub(crate) serve_lat: PlatStats,
+}
+
+impl TaobenchPhaseStats {
+    /// Pool another window: Σ counters ([`TaobenchStats::merge`]) and union the
+    /// serve histograms ([`PlatStats::combine`]) — the per-cgroup / cross-thread
+    /// fold, mirroring the schbench carrier merge.
+    pub(crate) fn merge(&mut self, other: &TaobenchPhaseStats) {
+        self.counters.merge(&other.counters);
+        self.serve_lat.combine(&other.serve_lat);
+    }
+}
+
+/// The engine's return: the whole-run merged COUNTERS ([`TaobenchStats`], the
+/// qps/hit aggregate) and the per-phase-epoch carriers (each counters + the
+/// serve-latency histogram). The whole-run carrier is counters-only — mirroring
+/// the wire carriers (`WorkerReport::taobench_whole` / `CgroupStats::taobench_whole`);
+/// a whole-run serve distribution, when needed (the standalone driver), is the
+/// union of the per-phase `serve_lat` histograms.
 pub(crate) struct TaobenchOutcome {
     pub whole_run: TaobenchStats,
-    pub phases: Vec<(u32, TaobenchStats)>,
+    pub phases: Vec<(u32, TaobenchPhaseStats)>,
 }
 
 /// Per-thread accumulation with phase-epoch bucketing: the current epoch's
@@ -441,8 +529,11 @@ pub(crate) struct TaobenchOutcome {
 /// (whole-run).
 struct ThreadAccum {
     cur_epoch: u32,
-    cur: TaobenchStats,
-    phases: BTreeMap<u32, TaobenchStats>,
+    cur: TaobenchPhaseStats,
+    phases: BTreeMap<u32, TaobenchPhaseStats>,
+    /// Whole-run counters only (the qps/hit aggregate). The serve histogram is
+    /// per-phase data (in `cur`/`phases`); the whole-run serve distribution, when
+    /// needed, is the union of the per-phase histograms.
     whole: TaobenchStats,
     /// When the current phase segment started (ns).
     phase_start_ns: u64,
@@ -455,7 +546,7 @@ impl ThreadAccum {
         let now = monotonic_nanos();
         ThreadAccum {
             cur_epoch: epoch,
-            cur: TaobenchStats::default(),
+            cur: TaobenchPhaseStats::default(),
             phases: BTreeMap::new(),
             whole: TaobenchStats::default(),
             phase_start_ns: now,
@@ -468,7 +559,7 @@ impl ThreadAccum {
         if epoch != self.cur_epoch {
             let now = monotonic_nanos();
             let mut cur = std::mem::take(&mut self.cur);
-            cur.elapsed_ns = now.saturating_sub(self.phase_start_ns);
+            cur.counters.elapsed_ns = now.saturating_sub(self.phase_start_ns);
             self.phases.entry(self.cur_epoch).or_default().merge(&cur);
             self.cur_epoch = epoch;
             self.phase_start_ns = now;
@@ -477,10 +568,10 @@ impl ThreadAccum {
     /// Record a lookup at request time in `epoch`.
     fn record_cmd(&mut self, epoch: u32, hit: bool) {
         self.roll_to(epoch);
-        self.cur.get_cmds += 1;
+        self.cur.counters.get_cmds += 1;
         self.whole.get_cmds += 1;
         if !hit {
-            self.cur.get_misses += 1;
+            self.cur.counters.get_misses += 1;
             self.whole.get_misses += 1;
         }
     }
@@ -488,19 +579,29 @@ impl ThreadAccum {
     fn record_complete(&mut self, epoch: u32, hit: bool) {
         self.roll_to(epoch);
         if hit {
-            self.cur.fast_ops += 1;
+            self.cur.counters.fast_ops += 1;
             self.whole.fast_ops += 1;
         } else {
-            self.cur.slow_ops += 1;
+            self.cur.counters.slow_ops += 1;
             self.whole.slow_ops += 1;
         }
+    }
+    /// Record an open-loop serve latency (`ns` from the intended arrival) in
+    /// `epoch`, into the current phase segment's histogram (µs buckets). Closed
+    /// loop never calls this, so the histograms stay empty and the serve-latency
+    /// keys read absent. The whole-run serve distribution is the union of the
+    /// per-phase histograms, so only the per-phase bucket is recorded here.
+    fn record_serve_lat(&mut self, epoch: u32, ns: u64) {
+        self.roll_to(epoch);
+        let us = (ns / 1000).min(u32::MAX as u64) as u32;
+        self.cur.serve_lat.add_lat(us);
     }
     /// Flush the last open bucket (stamping its segment wall) and stamp the
     /// whole-run window.
     fn finalize(mut self) -> Self {
         let now = monotonic_nanos();
         let mut cur = std::mem::take(&mut self.cur);
-        cur.elapsed_ns = now.saturating_sub(self.phase_start_ns);
+        cur.counters.elapsed_ns = now.saturating_sub(self.phase_start_ns);
         self.phases.entry(self.cur_epoch).or_default().merge(&cur);
         self.whole.elapsed_ns = now.saturating_sub(self.thread_start_ns);
         self
@@ -527,6 +628,19 @@ pub(crate) fn run(
     let allowed_cpus = resolve_allowed_cpus();
     let n_clients = config.resolve_client_threads(allowed_cpus);
     let n_slow = config.resolve_slow_threads(n_clients);
+    // Open-loop per-client inter-arrival = 1s / (arrival_rate / n_clients) =
+    // 1e9 * n_clients / arrival_rate. `0` arrival_rate ⇒ `0` interval ⇒ closed
+    // loop (issue as fast as completions allow — the legacy behavior). `.max(1)`
+    // keeps a non-zero rate strictly open-loop even at an absurd rate (so the
+    // `interval_ns != 0` mode gate in client_loop never misfires to closed loop).
+    // saturating_mul: an absurd client count (physically unreachable — it would
+    // OOM on thread spawn first) cannot wrap the numerator to a tiny interval, the
+    // same overflow-safe discipline as `TaobenchStats::merge`.
+    let interval_ns: u64 = if config.arrival_rate == 0 {
+        0
+    } else {
+        (1_000_000_000u64.saturating_mul(n_clients as u64) / config.arrival_rate as u64).max(1)
+    };
 
     // Size the resident object count and the key range. Mean value size pins the
     // object count for a byte budget; key_range = capacity / target_hit makes a
@@ -580,6 +694,7 @@ pub(crate) fn run(
                         slow_q,
                         slot,
                         key_range,
+                        interval_ns,
                     )
                 })
             })
@@ -604,7 +719,7 @@ pub(crate) fn run(
 
     // Reduce: merge per-epoch and whole-run across clients. Each ThreadAccum
     // stamped its per-phase segment walls + its whole-run window in finalize().
-    let mut all_phases: BTreeMap<u32, TaobenchStats> = BTreeMap::new();
+    let mut all_phases: BTreeMap<u32, TaobenchPhaseStats> = BTreeMap::new();
     let mut whole = TaobenchStats::default();
     for accum in client_accums {
         for (e, s) in accum.phases {
@@ -619,8 +734,14 @@ pub(crate) fn run(
     }
 }
 
-/// One closed-loop client: pick a key, look it up, serve a hit inline (touch +
-/// fast op) or hand a miss to a dispatcher and block until filled (slow op).
+/// One client: pick a key, look it up, serve a hit inline (touch + fast op) or
+/// hand a miss to a dispatcher and block until filled (slow op). `interval_ns ==
+/// 0` is CLOSED loop (issue the next request as soon as the prior completes — the
+/// legacy behavior). `interval_ns > 0` is OPEN loop: requests are due on a fixed
+/// `interval_ns` cadence independent of completion (the first one interval after
+/// the loop start `t0`), and serve latency is measured from the INTENDED arrival
+/// (coordinated-omission) so a backlog from slow service is folded into the late
+/// requests' latency instead of omitted.
 #[allow(clippy::too_many_arguments)]
 fn client_loop(
     id: usize,
@@ -631,19 +752,48 @@ fn client_loop(
     slow_q: &SlowQueue,
     slot: &Slot,
     key_range: u64,
+    interval_ns: u64,
 ) -> ThreadAccum {
     let mut rng = Rng::new(0x5EED_0000 ^ (id as u64).wrapping_mul(0x9E37_79B1));
     let mut accum = ThreadAccum::new(read_epoch(phase_epoch));
+    let open_loop = interval_ns != 0;
+    // Open-loop schedule cursor, advanced one `interval` before each request: the
+    // first request is due at `t0 + interval`, then every `interval` thereafter.
+    let mut intended = monotonic_nanos();
 
-    while !stop.load(Ordering::Acquire) {
+    'client: while !stop.load(Ordering::Acquire) {
+        if open_loop {
+            // Pace to the next scheduled arrival; if behind (overload), the wait
+            // collapses to zero and the gap is captured as serve latency below.
+            // Each sleep is capped at STOP_POLL_QUANTUM_NS so a shutdown set during
+            // a long inter-arrival gap is observed within the quantum (not after a
+            // full interval) — exiting promptly via `break 'client` to `finalize`,
+            // bounding client-join teardown regardless of `arrival_rate`.
+            intended = intended.saturating_add(interval_ns);
+            loop {
+                if stop.load(Ordering::Acquire) {
+                    break 'client;
+                }
+                let now = monotonic_nanos();
+                if now >= intended {
+                    break;
+                }
+                let nap = (intended - now).min(STOP_POLL_QUANTUM_NS);
+                std::thread::sleep(std::time::Duration::from_nanos(nap));
+            }
+        }
         let epoch_cmd = read_epoch(phase_epoch);
         let key = rng.below(key_range);
         let hit = cache.get_touch(key);
         accum.record_cmd(epoch_cmd, hit);
 
         if hit {
-            // Hit completes instantly; response epoch == request epoch.
+            // Hit completes inline; response epoch == request epoch.
             accum.record_complete(epoch_cmd, true);
+            if open_loop {
+                let lat = monotonic_nanos().saturating_sub(intended);
+                accum.record_serve_lat(epoch_cmd, lat);
+            }
         } else {
             // Miss: hand to a dispatcher and block until it fills + wakes us.
             // The dispatcher always serves us before `disp_stop` is set (which
@@ -651,7 +801,15 @@ fn client_loop(
             // past shutdown.
             slow_q.push(SlowReq { key, client: id });
             slot.wait_filled();
-            accum.record_complete(read_epoch(phase_epoch), false);
+            let resp_epoch = read_epoch(phase_epoch);
+            accum.record_complete(resp_epoch, false);
+            if open_loop {
+                // Completion timestamp taken by the CLIENT after wait_filled, so
+                // serve latency covers the full slow_q queueing + dispatcher
+                // service + wakeup, all measured from the intended arrival.
+                let lat = monotonic_nanos().saturating_sub(intended);
+                accum.record_serve_lat(resp_epoch, lat);
+            }
         }
         progress.fetch_add(1, Ordering::Relaxed);
     }
@@ -751,13 +909,27 @@ pub fn run_standalone(config: &TaobenchConfig, run_secs: u64) -> TaobenchStandal
         stop.store(true, Ordering::Release);
         h.join().expect("taobench standalone run panicked")
     });
-    TaobenchStandaloneReport::from_run(&outcome.whole_run, nr_client_threads, nr_slow_threads)
+    // Whole-run serve-latency distribution = union of the per-phase histograms
+    // (the whole-run carrier is counters-only). Empty in closed loop, so the
+    // report's serve percentiles read absent there.
+    let mut serve = PlatStats::default();
+    for (_epoch, p) in &outcome.phases {
+        serve.combine(&p.serve_lat);
+    }
+    TaobenchStandaloneReport::from_run(
+        &outcome.whole_run,
+        &serve,
+        nr_client_threads,
+        nr_slow_threads,
+    )
 }
 
 /// Summary of a [`run_standalone`] run — the headline taobench metrics in the
 /// shape the reference taobench server reports (`fast_qps` / `hit_rate` /
 /// `slow_qps`) plus the derived `total_qps` (= fast + slow) and `hit_ratio`
-/// (= fast / total).
+/// (= fast / total). Under open-loop arrival (`arrival_rate > 0`) it also carries
+/// the coordinated-omission serve-latency percentiles; these are `None` in closed
+/// loop (no intended-arrival schedule, so no serve latency is measured).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TaobenchStandaloneReport {
     /// (fast + slow) ops per second over the measured window.
@@ -782,12 +954,34 @@ pub struct TaobenchStandaloneReport {
     pub nr_client_threads: usize,
     /// Resolved slow dispatcher count.
     pub nr_slow_threads: usize,
+    /// Open-loop coordinated-omission serve-latency percentiles (µs), measured
+    /// from intended arrival. `None` in closed loop / when no serve samples were
+    /// recorded (matching the metric-key ABSENT discipline).
+    pub serve_p50_us: Option<u32>,
+    /// Open-loop serve-latency p99 (µs) — the headline coordinated-omission tail.
+    pub serve_p99_us: Option<u32>,
+    /// Open-loop serve-latency p99.9 (µs).
+    pub serve_p999_us: Option<u32>,
+    /// Open-loop serve-latency minimum sample (µs).
+    pub serve_min_us: Option<u32>,
+    /// Open-loop serve-latency maximum sample (µs).
+    pub serve_max_us: Option<u32>,
 }
 
 impl TaobenchStandaloneReport {
-    fn from_run(w: &TaobenchStats, nr_client_threads: usize, nr_slow_threads: usize) -> Self {
+    fn from_run(
+        w: &TaobenchStats,
+        serve: &PlatStats,
+        nr_client_threads: usize,
+        nr_slow_threads: usize,
+    ) -> Self {
+        use crate::workload::schbench::plat::Pct;
         let secs = (w.elapsed_ns as f64 / 1e9).max(f64::MIN_POSITIVE);
         let total = w.total_ops();
+        // Serve-latency percentiles are present iff open-loop arrival recorded
+        // samples; closed loop leaves the histogram empty, so all fields read
+        // None (the metric-key ABSENT discipline).
+        let serve_q = (serve.sample_count() > 0).then(|| serve.percentiles());
         TaobenchStandaloneReport {
             total_qps: total as f64 / secs,
             fast_qps: w.fast_ops as f64 / secs,
@@ -808,6 +1002,11 @@ impl TaobenchStandaloneReport {
             elapsed_secs: secs,
             nr_client_threads,
             nr_slow_threads,
+            serve_p50_us: serve_q.as_ref().map(|q| q.value_at(Pct::P50)),
+            serve_p99_us: serve_q.as_ref().map(|q| q.value_at(Pct::P99)),
+            serve_p999_us: serve_q.as_ref().map(|q| q.value_at(Pct::P999)),
+            serve_min_us: serve_q.as_ref().map(|q| q.min),
+            serve_max_us: serve_q.as_ref().map(|q| q.max),
         }
     }
 }
@@ -882,7 +1081,10 @@ mod tests {
 
             let total = out.whole_run.total_ops();
             assert!(total > 0, "engine served ops");
-            assert!(out.whole_run.elapsed_ns > 0, "the run window was measured");
+            assert!(
+                out.whole_run.elapsed_ns > 0,
+                "the run window was measured"
+            );
 
             let hit = out.whole_run.fast_ops as f64 / total as f64;
             assert!(
@@ -905,7 +1107,8 @@ mod tests {
             .slow_threads(3)
             .cache_capacity_mib(128)
             .target_hit_pct(85)
-            .slow_path_sleep_us(250);
+            .slow_path_sleep_us(250)
+            .arrival_rate(50_000);
         let json = serde_json::to_string(&cfg).expect("TaobenchConfig must serialize");
         let back: TaobenchConfig =
             serde_json::from_str(&json).expect("TaobenchConfig must deserialize");
@@ -972,5 +1175,233 @@ mod tests {
         // fail this compile. Also exercises Default + Eq.
         let s: crate::prelude::TaobenchStats = crate::prelude::TaobenchStats::default();
         assert_eq!(s, TaobenchStats::default());
+    }
+
+    #[test]
+    fn taobench_config_arrival_rate_default_and_setter() {
+        // Default is closed loop (no open-loop schedule); the setter sets the
+        // aggregate ops/sec field.
+        assert_eq!(
+            TaobenchConfig::default().arrival_rate,
+            0,
+            "default arrival_rate is 0 (closed loop)"
+        );
+        let cfg = TaobenchConfig::default().arrival_rate(100_000);
+        assert_eq!(cfg.arrival_rate, 100_000, "setter sets arrival_rate");
+    }
+
+    #[test]
+    fn taobench_phase_stats_merge_sums_counters_and_unions_serve_lat() {
+        // The carrier merge pools counters (Σ ops, MAX wall — TaobenchStats::merge)
+        // AND unions the serve histograms (PlatStats::combine) — the per-cgroup /
+        // cross-thread fold.
+        let mut a = TaobenchPhaseStats {
+            counters: TaobenchStats {
+                get_cmds: 10,
+                get_misses: 2,
+                fast_ops: 8,
+                slow_ops: 2,
+                elapsed_ns: 1000,
+            },
+            ..Default::default()
+        };
+        a.serve_lat.add_lat(5);
+        a.serve_lat.add_lat(50);
+        let mut b = TaobenchPhaseStats {
+            counters: TaobenchStats {
+                get_cmds: 6,
+                get_misses: 1,
+                fast_ops: 5,
+                slow_ops: 1,
+                elapsed_ns: 4000,
+            },
+            ..Default::default()
+        };
+        b.serve_lat.add_lat(500);
+        a.merge(&b);
+        assert_eq!(a.counters.get_cmds, 16, "Σ get_cmds");
+        assert_eq!(a.counters.fast_ops, 13, "Σ fast_ops");
+        assert_eq!(a.counters.slow_ops, 3, "Σ slow_ops");
+        assert_eq!(a.counters.elapsed_ns, 4000, "wall is MAX, not summed");
+        assert_eq!(
+            a.serve_lat.sample_count(),
+            3,
+            "serve histograms union (2 + 1 samples)"
+        );
+    }
+
+    #[test]
+    fn taobench_phase_stats_serde_roundtrips() {
+        // TaobenchPhaseStats rides the WorkerReport postcard + CgroupStats sidecar
+        // JSON wires; both the counters and the serve histogram must roundtrip.
+        let mut s = TaobenchPhaseStats {
+            counters: TaobenchStats {
+                get_cmds: 1000,
+                get_misses: 150,
+                fast_ops: 850,
+                slow_ops: 150,
+                elapsed_ns: 9_000_000_000,
+            },
+            ..Default::default()
+        };
+        s.serve_lat.add_lat(12);
+        s.serve_lat.add_lat(340);
+        s.serve_lat.add_lat(99_999);
+        let json = serde_json::to_string(&s).expect("TaobenchPhaseStats must serialize");
+        let back: TaobenchPhaseStats =
+            serde_json::from_str(&json).expect("TaobenchPhaseStats must deserialize");
+        assert_eq!(
+            s, back,
+            "TaobenchPhaseStats roundtrips unchanged (counters + serve_lat)"
+        );
+    }
+
+    #[test]
+    fn open_loop_stamps_serve_latency_on_every_completion() {
+        // Open loop (non-zero arrival_rate) measures coordinated-omission serve
+        // latency: every completion — a hit (served inline) AND a miss (served via
+        // the slow path) — records exactly one sample from its intended arrival, so
+        // the histogram count equals total_ops. An absurdly high rate keeps the
+        // pacing in permanent overload (the per-arrival sleep collapses to zero), so
+        // the test runs at full speed while still exercising stamping on both arms.
+        let cfg = TaobenchConfig::default()
+            .client_threads(4)
+            .slow_threads(2)
+            .cache_capacity_mib(8)
+            .target_hit_pct(90)
+            .slow_path_sleep_us(10)
+            .arrival_rate(1_000_000_000);
+        let stop = AtomicBool::new(false);
+        let progress = AtomicU64::new(0);
+        let out = std::thread::scope(|s| {
+            let h = s.spawn(|| run(&cfg, &stop, &progress, None));
+            while progress.load(Ordering::Relaxed) < 50_000 {
+                std::hint::spin_loop();
+            }
+            stop.store(true, Ordering::Release);
+            h.join().expect("engine panicked")
+        });
+        let total = out.whole_run.total_ops();
+        assert!(total > 0, "engine served ops");
+        assert!(out.whole_run.slow_ops > 0, "the miss arm is exercised");
+        // The whole-run serve distribution is the union of the per-phase
+        // histograms (the whole-run carrier is counters-only). Its count equals
+        // total_ops: every completion (hit inline + miss after wait_filled)
+        // records exactly one serve-latency sample.
+        let mut serve = PlatStats::default();
+        for (_epoch, p) in &out.phases {
+            serve.combine(&p.serve_lat);
+        }
+        assert_eq!(
+            serve.sample_count(),
+            total,
+            "every completion (hit + miss) records one serve-latency sample"
+        );
+    }
+
+    #[test]
+    fn closed_loop_records_no_serve_latency() {
+        // arrival_rate == 0 is closed loop: there is no intended-arrival schedule,
+        // so serve latency is undefined and the histogram stays EMPTY (the
+        // taobench_serve_*_us keys then read absent, distinct from a measured 0).
+        let cfg = TaobenchConfig::default()
+            .client_threads(4)
+            .slow_threads(2)
+            .cache_capacity_mib(8)
+            .target_hit_pct(90)
+            .slow_path_sleep_us(10); // arrival_rate defaults to 0 (closed loop)
+        let stop = AtomicBool::new(false);
+        let progress = AtomicU64::new(0);
+        let out = std::thread::scope(|s| {
+            let h = s.spawn(|| run(&cfg, &stop, &progress, None));
+            while progress.load(Ordering::Relaxed) < 20_000 {
+                std::hint::spin_loop();
+            }
+            stop.store(true, Ordering::Release);
+            h.join().expect("engine panicked")
+        });
+        assert!(out.whole_run.total_ops() > 0, "ops completed");
+        for (epoch, p) in &out.phases {
+            assert_eq!(
+                p.serve_lat.sample_count(),
+                0,
+                "closed loop records no per-phase serve latency (epoch {epoch})"
+            );
+        }
+    }
+
+    #[test]
+    fn open_loop_per_phase_carrier_holds_serve_latency() {
+        // The per-phase carrier (PhaseSlice.taobench) carries the serve histogram
+        // (the whole-run carrier is counters-only). With a single static epoch
+        // every completion's sample lands in that epoch's bucket, so the per-phase
+        // serve count equals the whole-run completion count (total_ops).
+        let cfg = TaobenchConfig::default()
+            .client_threads(4)
+            .slow_threads(2)
+            .cache_capacity_mib(8)
+            .target_hit_pct(90)
+            .slow_path_sleep_us(10)
+            .arrival_rate(1_000_000_000);
+        let stop = AtomicBool::new(false);
+        let progress = AtomicU64::new(0);
+        let epoch = AtomicU32::new(7);
+        let out = std::thread::scope(|s| {
+            let h = s.spawn(|| run(&cfg, &stop, &progress, Some(&epoch)));
+            while progress.load(Ordering::Relaxed) < 30_000 {
+                std::hint::spin_loop();
+            }
+            stop.store(true, Ordering::Release);
+            h.join().expect("engine panicked")
+        });
+        let phase7 = out
+            .phases
+            .iter()
+            .find(|(e, _)| *e == 7)
+            .map(|(_, p)| p)
+            .expect("epoch-7 phase carrier present");
+        assert!(
+            phase7.serve_lat.sample_count() > 0,
+            "per-phase serve latency recorded"
+        );
+        assert_eq!(
+            phase7.serve_lat.sample_count(),
+            out.whole_run.total_ops(),
+            "single-epoch run: every completion stamps one per-phase serve sample"
+        );
+    }
+
+    #[test]
+    fn open_loop_pacing_sleep_is_bounded_for_prompt_shutdown() {
+        // A degenerate low arrival_rate makes the inter-arrival interval ~1s, but a
+        // client waiting for its next scheduled arrival must observe `stop` within
+        // STOP_POLL_QUANTUM_NS (50 ms) and exit, so the join completes well under
+        // one interval. An unbounded pacing sleep would block the join for the full
+        // ~1s. The 500 ms bound is 10x the quantum (robust to scheduling jitter)
+        // and half the interval (so it cleanly distinguishes bounded from
+        // unbounded).
+        let cfg = TaobenchConfig::default()
+            .client_threads(1)
+            .slow_threads(1)
+            .cache_capacity_mib(4)
+            .target_hit_pct(90)
+            .slow_path_sleep_us(0)
+            .arrival_rate(1); // interval_ns = 1e9 * 1 / 1 = 1s
+        let stop = AtomicBool::new(false);
+        let progress = AtomicU64::new(0);
+        let start = std::time::Instant::now();
+        std::thread::scope(|s| {
+            let h = s.spawn(|| run(&cfg, &stop, &progress, None));
+            // Let the client reach its first (long) pacing sleep, then shut down.
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            stop.store(true, Ordering::Release);
+            let _ = h.join().expect("engine panicked");
+        });
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "open-loop client joined in {elapsed:?}; the pacing sleep must be \
+             bounded (interval is ~1s — an unbounded sleep would block the join)"
+        );
     }
 }

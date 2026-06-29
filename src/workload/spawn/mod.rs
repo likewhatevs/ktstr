@@ -619,22 +619,23 @@ pub struct WorkerReport {
     /// carry their own `#[derive(Claim)]`.
     #[claim(skip)]
     pub phase_slices: Vec<PhaseSlice>,
-    /// Whole-run taobench aggregate — `Some` only for a Taobench worker, `None`
-    /// otherwise. Shipped so the host can derive run-level qps/hit Rate keys
-    /// (`taobench_*_ops_per_sec` / `taobench_hit_fraction`) for `--noise-adjust`
-    /// spread analysis. The per-phase `PhaseSlice::taobench` carriers feed the
-    /// per-phase metrics but cannot reconstruct the whole-run window faithfully
-    /// (per-phase `elapsed_ns` is MAX-merged across concurrent threads, so
-    /// summing phase segments is the wrong qps denominator), so the engine's
-    /// authoritative whole-run aggregate is shipped directly. Appended LAST
-    /// (after `phase_slices`) to keep the positional postcard decode order of
-    /// every prior field unchanged. `pub` (every `WorkerReport` field is `pub`):
-    /// `WorkerReport` is a user-facing type custom workers construct via struct
-    /// literal ([`crate::workload::WorkType::custom`]), so a `pub(crate)` field
-    /// would forbid external struct-literal construction — its element type
-    /// `TaobenchStats` is `pub` for the same reason. `#[claim(skip)]`:
-    /// framework wire plumbing, not a test-author claim surface; assertions run
-    /// against the host-derived run-level `taobench_*` Rate metrics.
+    /// Whole-run taobench COUNTER aggregate — `Some` only for a Taobench worker,
+    /// `None` otherwise. Shipped so the host can derive run-level qps/hit Rate keys
+    /// (`taobench_*_ops_per_sec` / `taobench_hit_fraction` /
+    /// `taobench_command_hit_rate`) for `--noise-adjust` spread analysis. The
+    /// per-phase `PhaseSlice::taobench` carriers feed the per-phase metrics + the
+    /// serve-latency distribution; this whole-run carrier holds COUNTERS only
+    /// ([`TaobenchStats`](crate::workload::taobench::run::TaobenchStats)) — the
+    /// serve histogram is per-phase data, and the per-phase `elapsed_ns` is
+    /// MAX-merged across concurrent threads so summing phase windows is the wrong
+    /// qps denominator, hence the engine's authoritative whole-run counter
+    /// aggregate is shipped directly. Appended LAST (after `phase_slices`) to keep
+    /// the positional postcard decode order of every prior field unchanged. `pub`
+    /// (every `WorkerReport` field is `pub`, so external custom workers can
+    /// struct-literal construct it via [`crate::workload::WorkType::custom`]; a
+    /// non-taobench worker sets `None`). `#[claim(skip)]`: framework wire plumbing,
+    /// not a test-author claim surface; assertions run against the host-derived
+    /// run-level `taobench_*` Rate metrics.
     #[claim(skip)]
     pub taobench_whole: Option<crate::workload::taobench::run::TaobenchStats>,
 }
@@ -724,13 +725,14 @@ pub struct PhaseSlice {
     /// Per-phase taobench engine metrics, present ONLY for a
     /// `WorkType::Taobench` backdrop worker (`None` for every other work type —
     /// the generic drain leaves it `None`). Carries the phase's request- and
-    /// response-time op counters
-    /// ([`crate::workload::taobench::run::TaobenchStats`]); the host derives
-    /// per-phase qps / hit-ratio into `PhaseBucket.metrics`. `pub(crate)`: an
-    /// internal carrier (test authors read `PhaseBucket`, not `PhaseSlice`) whose
-    /// element type is `pub(crate)`. Integer-only, so it preserves `PhaseSlice`'s
-    /// `Eq`.
-    pub(crate) taobench: Option<crate::workload::taobench::run::TaobenchStats>,
+    /// response-time op counters plus the open-loop serve-latency histogram
+    /// ([`crate::workload::taobench::run::TaobenchPhaseStats`]); the host derives
+    /// per-phase qps / hit-ratio / serve-latency percentiles into
+    /// `PhaseBucket.metrics`. `pub(crate)`: an internal carrier (test authors read
+    /// `PhaseBucket`, not `PhaseSlice`). `PhaseSlice`'s `Eq` is preserved because
+    /// `PlatStats` is `Eq` (the schbench carrier above already holds histograms),
+    /// not because the field is integer-only.
+    pub(crate) taobench: Option<crate::workload::taobench::run::TaobenchPhaseStats>,
 }
 
 /// Reason a sentinel [`WorkerReport`] was synthesized — attached to

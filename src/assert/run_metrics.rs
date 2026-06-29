@@ -671,19 +671,22 @@ pub fn populate_run_ext_metrics_from_phases(
 ///    `iterations_per_cpu_sec` Rate (from `stats.cgroups`).
 /// 4. [`populate_run_pooled_taobench`] — the whole-run taobench qps + hit Rates
 ///    pooled cross-cgroup (from `stats.cgroups[].taobench_whole`).
-/// 5. [`populate_run_pooled_schbench`] — the schbench whole-run Class-3 loop
-///    Counter + role-separate run-delay gate-Rates (from
+/// 5. [`populate_run_pooled_taobench_distribution`] — the taobench whole-run
+///    open-loop serve-latency `*_whole` percentiles (union of the per-phase
+///    per-cgroup serve `PlatStats` histograms, percentile re-derived over the union).
+/// 6. [`populate_run_pooled_schbench`] — the schbench whole-run loop Counter +
+///    role-separate run-delay gate-Rates (from
 ///    `stats.phases[].per_cgroup[].schbench` raw pairs, summed over phases+cgroups).
-/// 6. [`populate_run_pooled_schbench_distribution`] — the schbench whole-run
+/// 7. [`populate_run_pooled_schbench_distribution`] — the schbench whole-run
 ///    latency/rps `*_whole` percentiles (union of the per-phase per-cgroup
 ///    `PlatStats` histograms, percentile re-derived over the union).
-/// 7. [`populate_run_distribution_metrics`] — the `Distribution` / `WorstLowest`
+/// 8. [`populate_run_distribution_metrics`] — the `Distribution` / `WorstLowest`
 ///    / `WakeLatencyTailRatio` / `WorstCrossNodeRatio` re-pools (from
 ///    `stats.phases[].per_cgroup` raw samples + `stats.cgroups`).
 ///
 /// ORDER IS LOAD-BEARING: step 1 must precede step 2 so the whole-run wall +
 /// whole-run IRQ-counter deltas land before step 2's `contains_key` skip (the
-/// multi-phase-rate fix); steps 3-7 fold the per-cgroup roll-up after the
+/// multi-phase-rate fix); steps 3-8 fold the per-cgroup roll-up after the
 /// per-phase families.
 ///
 /// `stats.phases` SHOULD be the PRE-`derive_phase_metrics` fold (the host buckets
@@ -707,6 +710,7 @@ pub fn populate_run_ext_all(
     populate_run_ext_metrics_from_phases(&stats.phases, &mut stats.ext_metrics);
     populate_run_pooled_iterations_per_cpu_sec(stats);
     populate_run_pooled_taobench(stats);
+    populate_run_pooled_taobench_distribution(stats);
     populate_run_pooled_schbench(stats);
     populate_run_pooled_schbench_distribution(stats);
     populate_run_distribution_metrics(stats);
@@ -786,14 +790,18 @@ pub fn populate_run_pooled_iterations_per_cpu_sec(stats: &mut ScenarioStats) {
 /// Each cgroup carries its workers' merged whole-run aggregate
 /// ([`crate::assert::CgroupStats::taobench_whole`]); this folds those across
 /// cgroups (Σ ops, MAX wall window — the window is shared by the concurrent
-/// cohorts, per `TaobenchStats::merge`) and writes the four
-/// `total_taobench_*` Counter components, from which
+/// cohorts, per `TaobenchStats::merge`) and writes the six `total_taobench_*`
+/// Counter components (`ops`, `fast_ops`, `slow_ops`, `wall_sec`, plus the
+/// command-time `get_cmds` / `get_hits`), from which
 /// `crate::stats::derive_rate_metrics` derives `taobench_total_ops_per_sec`,
-/// `taobench_fast_ops_per_sec`, `taobench_slow_ops_per_sec`, and
-/// `taobench_hit_fraction`. The whole-run Rate keys are registered METRICS, so —
-/// unlike the per-phase `taobench_*_qps` (`MetricKind::PerPhase`, invisible to
-/// the whole-run cross-run fold) — they reach the perf-delta `--noise-adjust`
-/// spread analysis.
+/// `taobench_fast_ops_per_sec`, `taobench_slow_ops_per_sec`, the response-time
+/// `taobench_hit_fraction` (Σfast/Σcompleted), and the command-time
+/// `taobench_command_hit_rate` (Σhits/Σcmds). The whole-run Rate keys are
+/// registered METRICS, so — unlike the per-phase `taobench_*_qps`
+/// (`MetricKind::PerPhase`, invisible to the whole-run cross-run fold) — they
+/// reach the perf-delta `--noise-adjust` spread analysis. The open-loop
+/// serve-latency distribution is a SEPARATE pool
+/// ([`populate_run_pooled_taobench_distribution`], the `*_us_whole` keys).
 ///
 /// MUST run post-`merge` (after every cgroup-bearing merge has populated
 /// `stats.cgroups`), exactly like [`populate_run_pooled_iterations_per_cpu_sec`]:
@@ -801,21 +809,23 @@ pub fn populate_run_pooled_iterations_per_cpu_sec(stats: &mut ScenarioStats) {
 /// Taobench cgroup writes nothing (the pool is `None`) — the keys stay absent,
 /// keeping a non-taobench run distinct from a measured zero.
 ///
-/// Both-or-neither (the `derive_rate_metrics` co-location invariant): the four
+/// Both-or-neither (the `derive_rate_metrics` co-location invariant): all six
 /// components are inserted together, gated on a measured wall window
-/// (`elapsed_ns > 0`) — the qps denominator. `taobench_hit_fraction` =
-/// `total_taobench_fast_ops` / `total_taobench_ops` then derives iff ops
-/// completed (`total_taobench_ops > 0`); `derive_rate_metrics` skips a
-/// zero-denominator rate, so a window-but-no-ops run gets qps=0 keys but no
-/// false hit fraction. The ns→s `/1e9` is applied ONCE here (not in
-/// `derive_rate_metrics`, a bare num/den), mirroring `total_cpu_time_sec`.
-/// Cross-RUN the components SUM-fold (Counter), so each Rate re-pools as
-/// Σnumerator / Σdenominator over the cohort — the aggregate throughput, not a
-/// mean of per-run qps.
+/// (`elapsed_ns > 0`) — the qps denominator. The three per-second Rates then
+/// derive unconditionally (wall_sec > 0); `taobench_hit_fraction` =
+/// `total_taobench_fast_ops` / `total_taobench_ops` derives iff ops completed
+/// (`total_taobench_ops > 0`) and `taobench_command_hit_rate` =
+/// `total_taobench_get_hits` / `total_taobench_get_cmds` iff lookups issued
+/// (`get_cmds > 0`); `derive_rate_metrics` skips a zero-denominator rate, so a
+/// window-but-no-ops run gets qps=0 keys but no false hit fraction / hit rate.
+/// The ns→s `/1e9` is applied ONCE here (not in `derive_rate_metrics`, a bare
+/// num/den), mirroring `total_cpu_time_sec`. Cross-RUN the components SUM-fold
+/// (Counter), so each Rate re-pools as Σnumerator / Σdenominator over the cohort
+/// — the aggregate throughput / hit rate, not a mean of per-run values.
 pub fn populate_run_pooled_taobench(stats: &mut ScenarioStats) {
     use crate::stats::{
-        TOTAL_TAOBENCH_FAST_OPS, TOTAL_TAOBENCH_OPS, TOTAL_TAOBENCH_SLOW_OPS,
-        TOTAL_TAOBENCH_WALL_SEC,
+        TOTAL_TAOBENCH_FAST_OPS, TOTAL_TAOBENCH_GET_CMDS, TOTAL_TAOBENCH_GET_HITS,
+        TOTAL_TAOBENCH_OPS, TOTAL_TAOBENCH_SLOW_OPS, TOTAL_TAOBENCH_WALL_SEC,
     };
     // Pool the per-cgroup whole-run aggregates across the run's Taobench cgroups:
     // Σ ops, MAX wall window (shared by the concurrent cohorts). `None` when no
@@ -835,24 +845,100 @@ pub fn populate_run_pooled_taobench(stats: &mut ScenarioStats) {
     let Some(w) = pooled else {
         return;
     };
+    let c = &w;
     // qps is undefined without a measured wall window; write no components (so
     // hit_fraction stays absent too) rather than a 0/0 rate.
-    if w.elapsed_ns == 0 {
+    if c.elapsed_ns == 0 {
         return;
     }
     stats
         .ext_metrics
-        .insert(TOTAL_TAOBENCH_OPS.to_string(), w.total_ops() as f64);
+        .insert(TOTAL_TAOBENCH_OPS.to_string(), c.total_ops() as f64);
     stats
         .ext_metrics
-        .insert(TOTAL_TAOBENCH_FAST_OPS.to_string(), w.fast_ops as f64);
+        .insert(TOTAL_TAOBENCH_FAST_OPS.to_string(), c.fast_ops as f64);
     stats
         .ext_metrics
-        .insert(TOTAL_TAOBENCH_SLOW_OPS.to_string(), w.slow_ops as f64);
+        .insert(TOTAL_TAOBENCH_SLOW_OPS.to_string(), c.slow_ops as f64);
     stats
         .ext_metrics
-        .insert(TOTAL_TAOBENCH_WALL_SEC.to_string(), w.elapsed_ns as f64 / 1e9);
+        .insert(TOTAL_TAOBENCH_WALL_SEC.to_string(), c.elapsed_ns as f64 / 1e9);
+    // Command-time hit components: hits = cmds − misses (request-time). The Rate
+    // taobench_command_hit_rate = Σhits / Σcmds re-derives via derive_rate_metrics
+    // (skipped, hence absent, when no lookups issued). Diverges from the
+    // response-time taobench_hit_fraction under open-loop arrival.
+    stats
+        .ext_metrics
+        .insert(TOTAL_TAOBENCH_GET_CMDS.to_string(), c.get_cmds as f64);
+    stats.ext_metrics.insert(
+        TOTAL_TAOBENCH_GET_HITS.to_string(),
+        c.get_cmds.saturating_sub(c.get_misses) as f64,
+    );
     crate::stats::derive_rate_metrics(&mut stats.ext_metrics);
+}
+
+/// Inject the taobench WHOLE-RUN open-loop serve-latency percentiles into
+/// `stats.ext_metrics` as the `taobench_serve_*_us_whole` keys, re-pooled
+/// run-level by UNIONING the per-phase per-cgroup serve `PlatStats` histograms
+/// (`stats.phases[].per_cgroup[].taobench.serve_lat`) across every step-attributed
+/// phase and every cgroup, then re-deriving each percentile / min / max over the
+/// merged histogram (`PlatStats::combine` is an associative bucket-count add, so
+/// the merged histogram is the faithful pooled sample set and the re-derived
+/// percentile is the percentile OF the union — NOT a mean of per-source
+/// percentiles). The taobench analog of
+/// [`populate_run_pooled_schbench_distribution`], with the same source: the
+/// BASELINE (epoch 0) and inter-step-gap (`u32::MAX`) epochs are excluded (they
+/// are dropped from `stats.phases` by `expand_backdrop_phase_buckets`), so this is
+/// the steady-state serve distribution over the measured steps — a faithful
+/// PerRunDistribution, distinct from the standalone driver's full-run histogram.
+///
+/// Runs in [`populate_run_ext_all`] (post-merge); reads the per-phase carriers
+/// (disjoint from the taobench counter pool) and writes distinct `*_whole` keys,
+/// so it is order-independent. Keys are written only when the merged histogram
+/// has samples (`sample_count() > 0`) — a closed-loop run (no serve samples)
+/// reads ABSENT, never a false 0. The keys are `MetricKind::PerRunDistribution`:
+/// noise-compared per-run by `crate::stats::noise_findings`, NEVER cross-run
+/// folded (a percentile of a union is not a mean of per-run percentiles, and the
+/// per-phase histograms are dropped at the cross-run boundary).
+pub fn populate_run_pooled_taobench_distribution(stats: &mut ScenarioStats) {
+    use crate::stats::{
+        TAOBENCH_SERVE_MAX_US_WHOLE, TAOBENCH_SERVE_MIN_US_WHOLE, TAOBENCH_SERVE_P50_US_WHOLE,
+        TAOBENCH_SERVE_P90_US_WHOLE, TAOBENCH_SERVE_P99_US_WHOLE, TAOBENCH_SERVE_P999_US_WHOLE,
+    };
+    use crate::workload::schbench::plat::{Pct, PlatStats};
+
+    // Union the per-phase per-cgroup serve histograms across the whole run.
+    let mut serve = PlatStats::default();
+    for phase in &stats.phases {
+        for pc in phase.per_cgroup.values() {
+            if let Some(t) = pc.taobench.as_ref() {
+                serve.combine(&t.serve_lat);
+            }
+        }
+    }
+    if serve.sample_count() == 0 {
+        return;
+    }
+    let q = serve.percentiles();
+    stats
+        .ext_metrics
+        .insert(TAOBENCH_SERVE_P50_US_WHOLE.to_string(), q.value_at(Pct::P50) as f64);
+    stats
+        .ext_metrics
+        .insert(TAOBENCH_SERVE_P90_US_WHOLE.to_string(), q.value_at(Pct::P90) as f64);
+    stats
+        .ext_metrics
+        .insert(TAOBENCH_SERVE_P99_US_WHOLE.to_string(), q.value_at(Pct::P99) as f64);
+    stats.ext_metrics.insert(
+        TAOBENCH_SERVE_P999_US_WHOLE.to_string(),
+        q.value_at(Pct::P999) as f64,
+    );
+    stats
+        .ext_metrics
+        .insert(TAOBENCH_SERVE_MIN_US_WHOLE.to_string(), q.min as f64);
+    stats
+        .ext_metrics
+        .insert(TAOBENCH_SERVE_MAX_US_WHOLE.to_string(), q.max as f64);
 }
 
 /// Inject the schbench whole-run Class-3 metrics — the loop Counter and the
@@ -1797,7 +1883,8 @@ pub(crate) fn derive_phase_metrics(phases: &mut [PhaseBucket]) {
         // percentile re-derives from the pooled histogram via PlatStats::combine =
         // bucket-count add, never averaged), and pooled == cross-cgroup re-pool.
         let mut pooled: Option<SchbenchPhaseStats> = None;
-        let mut pooled_taobench: Option<crate::workload::taobench::run::TaobenchStats> = None;
+        let mut pooled_taobench: Option<crate::workload::taobench::run::TaobenchPhaseStats> =
+            None;
         for pc in bucket.per_cgroup.values_mut() {
             // Non-schbench carrier-derived metrics (wake/run-delay/off-cpu
             // distributions + the migration/iterations/locality ratios + the
@@ -1830,7 +1917,7 @@ pub(crate) fn derive_phase_metrics(phases: &mut [PhaseBucket]) {
                         acc.merge(t);
                         pooled_taobench = Some(acc);
                     }
-                    None => pooled_taobench = Some(*t),
+                    None => pooled_taobench = Some(t.clone()),
                 }
             }
         }
@@ -2032,30 +2119,62 @@ fn write_schbench_scalars(
 /// ops completed (`total > 0`); hit_rate only when lookups were issued
 /// (`get_cmds > 0`) — a not-measured value reads as missing, never a false 0.
 fn write_taobench_scalars(
-    p: &crate::workload::taobench::run::TaobenchStats,
+    p: &crate::workload::taobench::run::TaobenchPhaseStats,
     out: &mut std::collections::BTreeMap<String, f64>,
 ) {
     use crate::stats::{
         TAOBENCH_FAST_QPS, TAOBENCH_HIT_RATE, TAOBENCH_HIT_RATIO, TAOBENCH_SLOW_QPS,
         TAOBENCH_TOTAL_QPS,
     };
-    let total = p.total_ops();
-    if p.elapsed_ns > 0 {
-        let secs = p.elapsed_ns as f64 / 1e9;
+    let c = &p.counters;
+    let total = c.total_ops();
+    if c.elapsed_ns > 0 {
+        let secs = c.elapsed_ns as f64 / 1e9;
         out.insert(TAOBENCH_TOTAL_QPS.to_string(), total as f64 / secs);
-        out.insert(TAOBENCH_FAST_QPS.to_string(), p.fast_ops as f64 / secs);
-        out.insert(TAOBENCH_SLOW_QPS.to_string(), p.slow_ops as f64 / secs);
+        out.insert(TAOBENCH_FAST_QPS.to_string(), c.fast_ops as f64 / secs);
+        out.insert(TAOBENCH_SLOW_QPS.to_string(), c.slow_ops as f64 / secs);
     }
     if total > 0 {
         out.insert(
             TAOBENCH_HIT_RATIO.to_string(),
-            p.fast_ops as f64 / total as f64,
+            c.fast_ops as f64 / total as f64,
         );
     }
-    if p.get_cmds > 0 {
+    if c.get_cmds > 0 {
         out.insert(
             TAOBENCH_HIT_RATE.to_string(),
-            1.0 - (p.get_misses as f64 / p.get_cmds as f64),
+            1.0 - (c.get_misses as f64 / c.get_cmds as f64),
         );
     }
+    // Per-phase serve-latency percentiles (open-loop only): the µs distribution
+    // pooled across this phase's cgroups, re-derived over the union histogram.
+    // Absent when no serve samples (closed loop, or a stream with no completions).
+    write_taobench_serve_scalars(&p.serve_lat, out);
+}
+
+/// Write the per-phase taobench serve-latency percentile scalars from a pooled
+/// `PlatStats` into `out` (registry keys), gated on `sample_count() > 0` so a
+/// closed-loop / no-sample carrier emits nothing (absent, never a false 0).
+fn write_taobench_serve_scalars(
+    serve: &crate::workload::schbench::plat::PlatStats,
+    out: &mut std::collections::BTreeMap<String, f64>,
+) {
+    use crate::stats::{
+        TAOBENCH_SERVE_MAX_US, TAOBENCH_SERVE_MIN_US, TAOBENCH_SERVE_P50_US,
+        TAOBENCH_SERVE_P90_US, TAOBENCH_SERVE_P99_US, TAOBENCH_SERVE_P999_US,
+    };
+    use crate::workload::schbench::plat::Pct;
+    if serve.sample_count() == 0 {
+        return;
+    }
+    let q = serve.percentiles();
+    out.insert(TAOBENCH_SERVE_P50_US.to_string(), q.value_at(Pct::P50) as f64);
+    out.insert(TAOBENCH_SERVE_P90_US.to_string(), q.value_at(Pct::P90) as f64);
+    out.insert(TAOBENCH_SERVE_P99_US.to_string(), q.value_at(Pct::P99) as f64);
+    out.insert(
+        TAOBENCH_SERVE_P999_US.to_string(),
+        q.value_at(Pct::P999) as f64,
+    );
+    out.insert(TAOBENCH_SERVE_MIN_US.to_string(), q.min as f64);
+    out.insert(TAOBENCH_SERVE_MAX_US.to_string(), q.max as f64);
 }

@@ -292,7 +292,7 @@ pub struct CgroupStats {
     /// Cross-node page migration ratio from `/proc/vmstat`
     /// `numa_pages_migrated` delta divided by total allocated pages.
     pub cross_node_migration_ratio: f64,
-    /// Whole-run taobench engine aggregate pooled across this cgroup's
+    /// Whole-run taobench engine COUNTER aggregate pooled across this cgroup's
     /// [`crate::workload::WorkType::Taobench`] workers (Σ ops, MAX wall window —
     /// the window is shared by concurrent workers, per
     /// [`crate::workload::WorkerReport::taobench_whole`]). `None` for every
@@ -300,18 +300,22 @@ pub struct CgroupStats {
     /// [`Self::total_cpu_time_ns`] — not a reduced ratio: the run-level
     /// cross-cgroup pool [`crate::assert::populate_run_pooled_taobench`] folds it
     /// into the `total_taobench_*` Counter components and the derived
-    /// `taobench_*_per_sec` / `taobench_hit_fraction` Rates in
-    /// [`Self::ext_metrics`] (whole-run keys visible to `--noise-adjust` spread,
-    /// unlike the per-phase `taobench_*_qps` which are `MetricKind::PerPhase`).
-    /// Whole-run, NOT summable from the per-phase
+    /// `taobench_*_per_sec` / `taobench_hit_fraction` / `taobench_command_hit_rate`
+    /// Rates in [`Self::ext_metrics`] (whole-run keys visible to `--noise-adjust`
+    /// spread, unlike the per-phase `taobench_*_qps` which are
+    /// `MetricKind::PerPhase`). Whole-run, NOT summable from the per-phase
     /// `PhaseCgroupStats::taobench` carriers (per-phase `elapsed_ns` is
     /// MAX-merged across concurrent threads, so summing phase windows is the
     /// wrong qps denominator), so the engine's authoritative whole-run aggregate
-    /// is shipped from the worker. `pub` (every `CgroupStats` field is `pub` and
-    /// the struct is preluded): its element type `TaobenchStats` is `pub` for
-    /// the same reason. `#[claim(skip)]`: a raw aggregate carrier, not a
-    /// test-author claim surface — assertions run against the host-derived
-    /// run-level `taobench_*` Rate metrics, mirroring
+    /// is shipped from the worker. Holds COUNTERS only
+    /// ([`TaobenchStats`](crate::workload::taobench::run::TaobenchStats)) — the
+    /// serve-latency histogram is per-phase data on `PhaseCgroupStats::taobench`,
+    /// and the whole-run serve distribution (`taobench_serve_*_us_whole`) is the
+    /// union of those per-phase histograms. `pub` (every `CgroupStats` field is
+    /// `pub` and the struct is preluded, so a test author can read the counters).
+    /// `#[claim(skip)]`: a raw aggregate carrier, not a test-author claim
+    /// surface — assertions run against the host-derived run-level `taobench_*`
+    /// Rate / serve-latency metrics, mirroring
     /// [`crate::workload::WorkerReport::taobench_whole`].
     #[claim(skip)]
     pub taobench_whole: Option<crate::workload::taobench::run::TaobenchStats>,
@@ -543,11 +547,11 @@ pub struct PhaseCgroupStats {
     pub(crate) schbench: Option<crate::workload::schbench::run::SchbenchPhaseStats>,
     /// Per-phase taobench engine metrics for a `WorkType::Taobench` backdrop
     /// cgroup (`None` for every non-taobench carrier). Pooled across the cgroup's
-    /// workers by [`PhaseCgroupStats::merge`] (counter-add, wall-window MAX). The
-    /// taobench per-phase derivation reads it, pools across cgroups, and derives
-    /// the per-phase qps / hit-ratio scalars into [`PhaseBucket::metrics`].
-    /// `pub(crate)`: an internal carrier whose element type is `pub(crate)`.
-    pub(crate) taobench: Option<crate::workload::taobench::run::TaobenchStats>,
+    /// workers by [`PhaseCgroupStats::merge`] (counter-add, wall-window MAX, serve
+    /// histograms unioned). The taobench per-phase derivation reads it, pools
+    /// across cgroups, and derives the per-phase qps / hit-ratio / serve-latency
+    /// scalars into [`PhaseBucket::metrics`]. `pub(crate)`: an internal carrier.
+    pub(crate) taobench: Option<crate::workload::taobench::run::TaobenchPhaseStats>,
 }
 
 impl PhaseCgroupStats {
@@ -660,8 +664,9 @@ impl PhaseCgroupStats {
             (None, None) => None,
         };
         // Per-phase taobench: OR-with-merge — both Some → counter-add + wall-window
-        // MAX (TaobenchStats::merge, the SAME op the guest engine pools with);
-        // one Some → carry; both None (non-taobench cgroup) → None.
+        // MAX + serve-latency histogram union (TaobenchPhaseStats::merge, the SAME
+        // op the guest engine pools with); one Some → carry; both None
+        // (non-taobench cgroup) → None.
         let taobench = match (a.taobench, b.taobench) {
             (Some(mut x), Some(y)) => {
                 x.merge(&y);

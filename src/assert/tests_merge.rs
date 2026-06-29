@@ -832,6 +832,199 @@ fn populate_run_pooled_taobench_hit_fraction_absent_when_no_ops() {
         !e.contains_key("taobench_hit_fraction"),
         "hit_fraction absent when no ops completed",
     );
+    // command_hit_rate likewise ABSENT — Σget_cmds == 0, so derive_rate_metrics
+    // skips its zero denominator (a no-lookups run is distinct from a real 0.0 hit
+    // rate). The components are present as measured zeros.
+    assert_eq!(e.get("total_taobench_get_cmds").copied(), Some(0.0));
+    assert_eq!(e.get("total_taobench_get_hits").copied(), Some(0.0));
+    assert!(
+        !e.contains_key("taobench_command_hit_rate"),
+        "command_hit_rate absent when no lookups issued",
+    );
+}
+
+/// The whole-run COMMAND-time hit (`taobench_command_hit_rate` = Σhits/Σcmds,
+/// hits = cmds − misses) is a DISTINCT axis from the RESPONSE-time
+/// `taobench_hit_fraction` (Σfast/Σcompleted): a request is counted at lookup
+/// (cmd/miss) and again at completion (fast/slow), and under open-loop arrival a
+/// lookup can be in flight (counted) before it completes, so `get_misses` need not
+/// equal `slow_ops`. Two cgroups whose two hit measurements diverge pin the new
+/// command-time components (Σ pool) and the derived rate, plus the divergence the
+/// feature exists to expose.
+#[test]
+fn populate_run_pooled_taobench_command_hit_diverges_from_response() {
+    let mk = |cmds: u64, misses: u64, fast: u64, slow: u64, secs: u64| {
+        Some(crate::workload::taobench::run::TaobenchStats {
+            get_cmds: cmds,
+            get_misses: misses,
+            fast_ops: fast,
+            slow_ops: slow,
+            elapsed_ns: secs * 1_000_000_000,
+        })
+    };
+    let cg1 = CgroupStats {
+        taobench_whole: mk(1000, 100, 850, 50, 10),
+        num_workers: 1,
+        ..CgroupStats::default()
+    };
+    let cg2 = CgroupStats {
+        taobench_whole: mk(2000, 400, 1500, 100, 10),
+        num_workers: 1,
+        ..CgroupStats::default()
+    };
+    let mut stats = ScenarioStats {
+        cgroups: vec![cg1, cg2],
+        ..ScenarioStats::default()
+    };
+    populate_run_pooled_taobench(&mut stats);
+    let e = &stats.ext_metrics;
+    // Command-time components pool by Σ; hits = Σcmds − Σmisses = 3000 − 500 = 2500.
+    assert_eq!(e.get("total_taobench_get_cmds").copied(), Some(3000.0));
+    assert_eq!(e.get("total_taobench_get_hits").copied(), Some(2500.0));
+    let cmd_hit = e
+        .get("taobench_command_hit_rate")
+        .copied()
+        .expect("command_hit_rate derived");
+    assert!(
+        (cmd_hit - 2500.0 / 3000.0).abs() < 1e-9,
+        "Σhits/Σcmds = 2500/3000 = 0.8333, got {cmd_hit}",
+    );
+    let resp_hit = e
+        .get("taobench_hit_fraction")
+        .copied()
+        .expect("hit_fraction derived");
+    assert!(
+        (resp_hit - 2350.0 / 2500.0).abs() < 1e-9,
+        "Σfast/Σcompleted = 2350/2500 = 0.94, got {resp_hit}",
+    );
+    assert!(
+        (cmd_hit - resp_hit).abs() > 0.05,
+        "command-time ({cmd_hit}) and response-time ({resp_hit}) hit DIVERGE — \
+         the reason both are registered whole-run keys",
+    );
+}
+
+/// A taobench per-phase per-cgroup carrier whose serve-latency `PlatStats` holds
+/// `lows` samples at `low_us` µs + `highs` samples at `high_us` µs (counters left
+/// zero). The taobench analog of [`schbench_wakeup_pc`].
+fn taobench_serve_pc(lows: u32, low_us: u32, highs: u32, high_us: u32) -> PhaseCgroupStats {
+    let mut serve = crate::workload::schbench::plat::PlatStats::default();
+    for _ in 0..lows {
+        serve.add_lat(low_us);
+    }
+    for _ in 0..highs {
+        serve.add_lat(high_us);
+    }
+    PhaseCgroupStats {
+        taobench: Some(crate::workload::taobench::run::TaobenchPhaseStats {
+            serve_lat: serve,
+            ..Default::default()
+        }),
+        ..PhaseCgroupStats::default()
+    }
+}
+
+/// populate_run_pooled_taobench_distribution re-pools the whole-run serve-latency
+/// percentile by UNIONING the per-cgroup serve `PlatStats` histograms and
+/// re-deriving — the percentile-OF-the-union, NOT a mean of per-cgroup
+/// percentiles. cg_a has 99 low serve samples (10 µs), cg_b has 1 high (10000 µs):
+/// the union p99 (rank 99 of 100 pooled) is a LOW bucket (~10 µs), whereas
+/// mean-of-per-cgroup-p99 would be ≈ (10 + 10000)/2 = 5005. The union MAX is the
+/// high sample (combine's max-of-max). Pins the cross-cgroup union + non-linearity
+/// (`schbench_phase` is a generic `PhaseBucket` builder, used here for taobench).
+#[test]
+fn populate_run_pooled_taobench_distribution_unions_cross_cgroup_percentile() {
+    let mut stats = ScenarioStats {
+        phases: vec![schbench_phase(
+            1,
+            vec![
+                ("cg_a", taobench_serve_pc(99, 10, 0, 0)),
+                ("cg_b", taobench_serve_pc(0, 0, 1, 10000)),
+            ],
+        )],
+        ..ScenarioStats::default()
+    };
+    populate_run_pooled_taobench_distribution(&mut stats);
+    let e = &stats.ext_metrics;
+    let p99 = e
+        .get("taobench_serve_p99_us_whole")
+        .copied()
+        .expect("union p99 present");
+    assert!(
+        p99 < 1000.0,
+        "union p99 = percentile-of-pooled (~10 µs bucket), got {p99} \
+         (mean-of-per-cgroup-p99 would be ~5005)",
+    );
+    let max = e
+        .get("taobench_serve_max_us_whole")
+        .copied()
+        .expect("union max present");
+    assert!(
+        max > 5000.0,
+        "union max = max-of-max (the high sample's ~10000 µs bucket), got {max}",
+    );
+}
+
+/// The serve union spans PHASES, not only cgroups: the same cgroup contributes 99
+/// low serve samples in phase 1 and 1 high in phase 2. The whole-run p99 (rank 99
+/// of 100 pooled) is the LOW bucket — proving phase-1 samples are in the union —
+/// while the MAX is phase-2's high sample.
+#[test]
+fn populate_run_pooled_taobench_distribution_unions_cross_phase_percentile() {
+    let mut stats = ScenarioStats {
+        phases: vec![
+            schbench_phase(1, vec![("cg", taobench_serve_pc(99, 10, 0, 0))]),
+            schbench_phase(2, vec![("cg", taobench_serve_pc(0, 0, 1, 10000))]),
+        ],
+        ..ScenarioStats::default()
+    };
+    populate_run_pooled_taobench_distribution(&mut stats);
+    let e = &stats.ext_metrics;
+    let p99 = e
+        .get("taobench_serve_p99_us_whole")
+        .copied()
+        .expect("union p99 present");
+    assert!(
+        p99 < 1000.0,
+        "cross-phase union p99 = percentile-of-pooled (~10 µs); phase-1 samples \
+         must be in the union, got {p99}",
+    );
+    let max = e
+        .get("taobench_serve_max_us_whole")
+        .copied()
+        .expect("union max present");
+    assert!(
+        max > 5000.0,
+        "cross-phase union max = phase-2's high sample (~10000 µs), got {max}",
+    );
+}
+
+/// Closed loop (or any run with no serve samples) writes NO serve `*_us_whole`
+/// keys — they read ABSENT, never a false 0. Covers both an empty-phases run and a
+/// phase whose taobench carrier has an empty serve histogram.
+#[test]
+fn populate_run_pooled_taobench_distribution_absent_without_serve_samples() {
+    // Empty phases: no carriers at all.
+    let mut empty = ScenarioStats::default();
+    populate_run_pooled_taobench_distribution(&mut empty);
+    assert!(
+        !empty.ext_metrics.contains_key("taobench_serve_p99_us_whole"),
+        "no serve keys for an empty run",
+    );
+    // A taobench carrier present but with an empty serve histogram (closed loop).
+    let mut stats = ScenarioStats {
+        phases: vec![schbench_phase(1, vec![("cg", taobench_serve_pc(0, 0, 0, 0))])],
+        ..ScenarioStats::default()
+    };
+    populate_run_pooled_taobench_distribution(&mut stats);
+    assert!(
+        !stats.ext_metrics.contains_key("taobench_serve_p99_us_whole"),
+        "no serve keys when the histogram is empty (closed loop)",
+    );
+    assert!(
+        !stats.ext_metrics.contains_key("taobench_serve_max_us_whole"),
+        "no serve max key when the histogram is empty",
+    );
 }
 
 /// A schbench per-phase per-cgroup carrier with the given Class-3 raw pairs.

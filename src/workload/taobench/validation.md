@@ -45,6 +45,8 @@ port matches, approximates, or intentionally diverges.
 | value sizes | the reference's empirical value-size histogram (mean ≈ 341 B, long tail to ~205 KB); bytes are stored + served | representative small-heavy long-tail distribution (mean ≈ 332 B, tail to 64 KiB); bytes are allocated per the distribution and TOUCHED on serve (the cache memory-bandwidth cost) | approximate (own distribution, same shape + same touch) |
 | fast / slow tiers | fast worker thread serves a hit (`fast_qps`); a miss is enqueued to a slow dispatcher pool that simulates a backing-store fetch (sleep) then SET-fills (`slow_qps`) | a client thread serves its own hit inline (fast path); a miss is handed to a slow dispatcher thread that sleeps `slow_path_sleep_us` then fills + wakes the client | match (slow tier present; client+fast merged — see divergences) |
 | headline metrics | `fast_qps`, `slow_qps`, `total_qps = fast+slow`, `hit_ratio = fast/total`; per-interval `hit_rate = 1 - get_misses/get_cmds` | same five, same formulas (`write_taobench_scalars`); request-time `get_cmds`/`get_misses` vs response-time `fast_ops`/`slow_ops` split preserved | match |
+| arrival model | open-loop load generator: the client issues at a target rate and reports a coordinated-omission-exposed request-latency tail (the p50/p99/p99.9 below) | closed-loop by default (`arrival_rate == 0`); `arrival_rate > 0` switches to OPEN-loop fixed-rate arrival and measures serve latency from the intended arrival (coordinated-omission) | match (open-loop CO available) |
+| serve latency | per-request client-side latency p50/p99/p99.9 | open-loop coordinated-omission serve latency, per-phase `taobench_serve_{p50,p90,p99,p999,min,max}_us` + whole-run `taobench_serve_*_us_whole`, measured from intended arrival via schbench's `PlatStats` histogram | approximate (CO serve latency, not client-wire latency; open-loop only) |
 
 ## Measured
 
@@ -116,9 +118,15 @@ characteristic, not the wire protocol. Deliberate divergences from the reference
 - **Value-size distribution is an approximation,** not a copy of the reference's
   value-size table — the port uses its own small-heavy long-tail histogram of the
   same shape (mean ≈ 332 B vs ≈ 341 B), so no external data table is carried.
-- **Serve-path latency not measured.** The reference reports per-request p99; the
-  port reports qps + hit ratio only (per-request latency on the serve path is a
-  follow-up — schbench's histogram machinery exists to feed it).
+- **Serve-path latency is coordinated-omission-corrected, open-loop only.** Under
+  open-loop arrival (`arrival_rate > 0`) the port measures serve latency from the
+  INTENDED arrival time (so a backlog from slow service inflates the late requests'
+  latency instead of being omitted) into schbench's `PlatStats` histogram, exposed
+  as the per-phase `taobench_serve_*_us` and whole-run `taobench_serve_*_us_whole`
+  percentiles. This differs from the reference's client-wire request latency in two
+  ways: it is CO-corrected (measured from intended arrival, not issue time), and it
+  is only recorded in open loop — the default closed loop has no intended-arrival
+  schedule, so the serve-latency keys read absent there.
 - **Per-phase metric surface.** The port's qps/hit_ratio are `MetricKind::PerPhase`
   (surfaced via the per-phase `PhaseBucket` / `VmResult::phase_metric` path, like
   schbench's latency metrics), not the run-level cross-run scalar fold.

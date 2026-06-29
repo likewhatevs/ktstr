@@ -225,12 +225,14 @@ pub fn cgroup_stats(reports: &[WorkerReport]) -> CgroupStats {
         .unwrap_or(0);
     let cross_node_ratio = cross_node_migration_ratio_of(migrated_pages, total_numa_pages);
 
-    // Whole-run taobench engine aggregate, pooled across this cgroup's
+    // Whole-run taobench engine COUNTER aggregate, pooled across this cgroup's
     // `WorkType::Taobench` workers: Σ ops, MAX wall window (shared across the
-    // concurrent workers, per `TaobenchStats::merge`). `None` for a cgroup
-    // with no Taobench worker. The run-level cross-cgroup pool + the qps/hit
-    // Rate derivation happen in `populate_run_pooled_taobench`; this is the
-    // per-cgroup raw carrier, the taobench analogue of `total_iterations`.
+    // concurrent workers), per `TaobenchStats::merge`. `None` for a cgroup with no
+    // Taobench worker. The run-level cross-cgroup pool + the qps/hit Rate
+    // derivation happen in `populate_run_pooled_taobench`; this is the per-cgroup
+    // raw carrier, the taobench analogue of `total_iterations`. Counters only —
+    // serve latency is per-phase data (the `taobench_serve_*_us_whole` keys union
+    // the `PhaseCgroupStats::taobench` histograms).
     let taobench_whole = reports.iter().filter_map(|w| w.taobench_whole.as_ref()).fold(
         None,
         |acc: Option<crate::workload::taobench::run::TaobenchStats>, t| {
@@ -594,7 +596,7 @@ pub(crate) fn phase_slice_to_cgroup_stats(
         schbench: slice.schbench.clone(),
         // Carry the per-phase taobench engine metrics through (None for every
         // non-taobench backdrop slice); PhaseCgroupStats::merge pools them.
-        taobench: slice.taobench,
+        taobench: slice.taobench.clone(),
     }
 }
 

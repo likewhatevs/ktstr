@@ -29,7 +29,7 @@ use ktstr::workload::{TaobenchConfig, TaobenchStandaloneReport, taobench_run_sta
     about = "Run the native taobench_rs engine host-side and print a taobench-comparable qps/hit-ratio report"
 )]
 struct Args {
-    /// Closed-loop client threads (0 = one per allocated CPU).
+    /// Client threads (0 = one per allocated CPU).
     #[arg(short = 'c', long, default_value_t = 0)]
     client_threads: usize,
     /// Slow dispatcher threads (0 = max(1, client_threads / 3)).
@@ -47,6 +47,10 @@ struct Args {
     /// Benchmark runtime in seconds.
     #[arg(short = 'r', long, default_value_t = 30)]
     runtime_secs: u64,
+    /// Open-loop AGGREGATE arrival rate in ops/sec across all clients (0 = closed
+    /// loop). Non-zero enables coordinated-omission serve-latency measurement.
+    #[arg(short = 'R', long, default_value_t = 0)]
+    arrival_rate: usize,
 }
 
 fn main() {
@@ -56,7 +60,8 @@ fn main() {
         .slow_threads(args.slow_threads)
         .cache_capacity_mib(args.cache_capacity_mib)
         .target_hit_pct(args.target_hit_pct)
-        .slow_path_sleep_us(args.slow_path_sleep_us);
+        .slow_path_sleep_us(args.slow_path_sleep_us)
+        .arrival_rate(args.arrival_rate);
 
     let report = taobench_run_standalone(&config, args.runtime_secs);
     print_report(&report, args.runtime_secs);
@@ -82,4 +87,16 @@ fn print_report(r: &TaobenchStandaloneReport, runtime_secs: u64) {
         "ops: total={} fast={} slow={}",
         r.total_ops, r.fast_ops, r.slow_ops
     );
+    // Open-loop coordinated-omission serve latency (absent in closed loop).
+    if let (Some(p50), Some(p99), Some(p999), Some(min), Some(max)) = (
+        r.serve_p50_us,
+        r.serve_p99_us,
+        r.serve_p999_us,
+        r.serve_min_us,
+        r.serve_max_us,
+    ) {
+        println!(
+            "serve_us (coordinated-omission, from intended arrival): min={min} p50={p50} p99={p99} p99.9={p999} max={max}"
+        );
+    }
 }

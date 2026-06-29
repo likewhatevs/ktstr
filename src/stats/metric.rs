@@ -663,17 +663,20 @@ impl MetricKind {
     /// key then re-derive.
     ///
     /// NOT a uniform cross-RUN skip: at the cross-RUN ext fold
-    /// ([`group_and_average_by`]) [`MetricKind::Rate`] AND
-    /// [`MetricKind::PerPhase`] are skipped — Rate's components survive
-    /// cross-RUN so it re-derives there, and PerPhase is a per-phase-only
-    /// scalar with no meaningful cross-RUN aggregate (its skip also keeps
-    /// [`aggregate_finite`]'s `PerPhase => unreachable!` unreachable) — while
-    /// Distribution / WorstLowest / WakeLatencyTailRatio / WorstCrossNodeRatio,
-    /// whose components do NOT survive cross-RUN, fall through to be plainly
-    /// folded (MEAN, or MAX for [`SampleReduction::Worst`]) by
-    /// [`aggregate_finite`]. So callers
-    /// gate on `is_derived` for the within-run sites and on
-    /// `matches!(.., Rate { .. } | PerPhase)` for the cross-RUN ext fold.
+    /// ([`group_and_average_by`], via `fold_ext_metrics`) [`MetricKind::Rate`],
+    /// [`MetricKind::PerPhase`], AND [`MetricKind::PerRunDistribution`] are
+    /// skipped — Rate's components survive cross-RUN so it re-derives there;
+    /// PerPhase is a per-phase-only scalar with no meaningful cross-RUN aggregate
+    /// (its skip also keeps [`aggregate_finite`]'s `PerPhase => unreachable!`
+    /// unreachable); and PerRunDistribution is a percentile-of-union whose
+    /// per-phase histograms are not shipped cross-RUN (a percentile of a union is
+    /// not a mean of per-run percentiles), so it is noise-compared per-run, never
+    /// folded — while Distribution / WorstLowest / WakeLatencyTailRatio /
+    /// WorstCrossNodeRatio, whose components do NOT survive cross-RUN, fall through
+    /// to be plainly folded (MEAN, or MAX for [`SampleReduction::Worst`]) by
+    /// [`aggregate_finite`]. So callers gate on `is_derived` for the within-run
+    /// sites and on `matches!(.., Rate { .. } | PerPhase | PerRunDistribution)`
+    /// for the cross-RUN ext fold.
     pub fn is_derived(self) -> bool {
         matches!(
             self,
@@ -901,15 +904,16 @@ fn aggregate_finite(
              not reduced from a sample slice"
         ),
         // PerRunDistribution is produced run-level by
-        // populate_run_pooled_schbench_distribution (union of the per-phase
-        // PlatStats histograms) and is gated out of BOTH the within-run reducers
-        // (is_derived) AND the cross-RUN ext fold (fold_ext_metrics skip) — its
-        // only consumer is noise_findings reading the per-run scalar. So it never
-        // reaches a sample-slice reduction; reaching here is a routing bug.
+        // populate_run_pooled_schbench_distribution / populate_run_pooled_taobench_distribution
+        // (union of the per-phase PlatStats histograms) and is gated out of BOTH
+        // the within-run reducers (is_derived) AND the cross-RUN ext fold
+        // (fold_ext_metrics skip) — its only consumer is noise_findings reading the
+        // per-run scalar. So it never reaches a sample-slice reduction; reaching
+        // here is a routing bug.
         MetricKind::PerRunDistribution => unreachable!(
             "MetricKind::PerRunDistribution is produced by \
-             populate_run_pooled_schbench_distribution and noise-compared per-run, \
-             not reduced from a sample slice"
+             populate_run_pooled_schbench_distribution / populate_run_pooled_taobench_distribution \
+             and noise-compared per-run, not reduced from a sample slice"
         ),
     })
 }
@@ -1493,12 +1497,29 @@ pub(crate) const SCHBENCH_RPS_MAX_WHOLE: &str = "rps_max_whole";
 // ratios, derived per-phase by write_taobench_scalars; MetricKind::PerPhase).
 // total/fast qps are HigherBetter; slow_qps + hit_ratio + hit_rate are
 // Informational (slow_qps is a component, not a direction; the hit numbers are
-// run-validity signals, not regression directions).
+// run-validity signals, not regression directions). The two hit keys are distinct
+// axes: `taobench_hit_ratio` is RESPONSE-time (fast_ops / (fast_ops + slow_ops),
+// the whole-run analog is `taobench_hit_fraction`) and `taobench_hit_rate` is
+// COMMAND-time (1 - get_misses / get_cmds, the whole-run analog is
+// `taobench_command_hit_rate`). Under open-loop arrival the two diverge
+// (request-time vs response-time).
 pub(crate) const TAOBENCH_TOTAL_QPS: &str = "taobench_total_qps";
 pub(crate) const TAOBENCH_FAST_QPS: &str = "taobench_fast_qps";
 pub(crate) const TAOBENCH_SLOW_QPS: &str = "taobench_slow_qps";
+/// Response-time per-phase hit ratio: fast_ops / (fast_ops + slow_ops).
 pub(crate) const TAOBENCH_HIT_RATIO: &str = "taobench_hit_ratio";
+/// Command-time per-phase hit rate: 1 - get_misses / get_cmds.
 pub(crate) const TAOBENCH_HIT_RATE: &str = "taobench_hit_rate";
+// taobench per-phase open-loop SERVE-LATENCY percentiles (µs): the
+// coordinated-omission serve latency distribution per phase (PerPhase,
+// LowerBetter), pooled cross-cgroup + re-derived by `write_taobench_scalars`.
+// Absent in closed loop (no serve samples).
+pub(crate) const TAOBENCH_SERVE_P50_US: &str = "taobench_serve_p50_us";
+pub(crate) const TAOBENCH_SERVE_P90_US: &str = "taobench_serve_p90_us";
+pub(crate) const TAOBENCH_SERVE_P99_US: &str = "taobench_serve_p99_us";
+pub(crate) const TAOBENCH_SERVE_P999_US: &str = "taobench_serve_p999_us";
+pub(crate) const TAOBENCH_SERVE_MIN_US: &str = "taobench_serve_min_us";
+pub(crate) const TAOBENCH_SERVE_MAX_US: &str = "taobench_serve_max_us";
 // taobench WHOLE-RUN Rate component + Rate keys (the run-level qps + hit
 // fraction, pooled cross-cgroup by `populate_run_pooled_taobench` and derived by
 // `derive_rate_metrics`). Distinct from the per-phase `taobench_*_qps` above
@@ -1516,6 +1537,27 @@ pub(crate) const TAOBENCH_TOTAL_OPS_PER_SEC: &str = "taobench_total_ops_per_sec"
 pub(crate) const TAOBENCH_FAST_OPS_PER_SEC: &str = "taobench_fast_ops_per_sec";
 pub(crate) const TAOBENCH_SLOW_OPS_PER_SEC: &str = "taobench_slow_ops_per_sec";
 pub(crate) const TAOBENCH_HIT_FRACTION: &str = "taobench_hit_fraction";
+// taobench WHOLE-RUN open-loop serve-latency percentiles (µs): the union of the
+// per-phase per-cgroup serve histograms re-derived run-level
+// (`MetricKind::PerRunDistribution` — noise-compared per-run, never cross-run
+// folded), pooled by `populate_run_pooled_taobench_distribution`. `*_whole`
+// names, distinct from the per-phase `taobench_serve_*_us` keys above.
+pub(crate) const TAOBENCH_SERVE_P50_US_WHOLE: &str = "taobench_serve_p50_us_whole";
+pub(crate) const TAOBENCH_SERVE_P90_US_WHOLE: &str = "taobench_serve_p90_us_whole";
+pub(crate) const TAOBENCH_SERVE_P99_US_WHOLE: &str = "taobench_serve_p99_us_whole";
+pub(crate) const TAOBENCH_SERVE_P999_US_WHOLE: &str = "taobench_serve_p999_us_whole";
+pub(crate) const TAOBENCH_SERVE_MIN_US_WHOLE: &str = "taobench_serve_min_us_whole";
+pub(crate) const TAOBENCH_SERVE_MAX_US_WHOLE: &str = "taobench_serve_max_us_whole";
+// taobench WHOLE-RUN command-time hit: the request-time hit rate (distinct from
+// the response-time `taobench_hit_fraction`; the two diverge under open-loop
+// arrival). hits = cmds − misses, pooled cross-cgroup by
+// `populate_run_pooled_taobench`; `taobench_command_hit_rate` = Σhits/Σcmds
+// (`total_` Counter components satisfy the naming gate; the Rate ends in `_rate`).
+// Whole-run Rates use their rate-form name, never the `_whole` suffix (which is
+// the PerRunDistribution marker) — the same convention as `taobench_*_per_sec`.
+pub(crate) const TOTAL_TAOBENCH_GET_CMDS: &str = "total_taobench_get_cmds";
+pub(crate) const TOTAL_TAOBENCH_GET_HITS: &str = "total_taobench_get_hits";
+pub(crate) const TAOBENCH_COMMAND_HIT_RATE: &str = "taobench_command_hit_rate";
 // Per-phase latency min/max (schbench's `min=`/`max=` table footer,
 // `schbench.c:579`): the per-phase PlatStats already carries them, so these are
 // emitted from `q.min`/`q.max`. LowerBetter (a higher min/max latency is worse).
@@ -2912,6 +2954,64 @@ pub static METRICS: &[MetricDef] = &[
         display_unit: "",
         accessor: |_| None,
     },
+    // taobench per-phase open-loop SERVE-LATENCY percentiles (µs, LowerBetter,
+    // PerPhase): the coordinated-omission serve distribution per phase. Thresholds
+    // mirror the schbench per-phase latency siblings (p50/p90/min abs 20; p99/p999
+    // abs 50; max abs 50 / rel 0.50 for the noisier tail). Absent in closed loop.
+    MetricDef {
+        name: TAOBENCH_SERVE_P50_US,
+        polarity: crate::test_support::Polarity::LowerBetter,
+        kind: MetricKind::PerPhase,
+        default_abs: 20.0,
+        default_rel: 0.25,
+        display_unit: "\u{00b5}s",
+        accessor: |_| None,
+    },
+    MetricDef {
+        name: TAOBENCH_SERVE_P90_US,
+        polarity: crate::test_support::Polarity::LowerBetter,
+        kind: MetricKind::PerPhase,
+        default_abs: 20.0,
+        default_rel: 0.25,
+        display_unit: "\u{00b5}s",
+        accessor: |_| None,
+    },
+    MetricDef {
+        name: TAOBENCH_SERVE_P99_US,
+        polarity: crate::test_support::Polarity::LowerBetter,
+        kind: MetricKind::PerPhase,
+        default_abs: 50.0,
+        default_rel: 0.25,
+        display_unit: "\u{00b5}s",
+        accessor: |_| None,
+    },
+    MetricDef {
+        name: TAOBENCH_SERVE_P999_US,
+        polarity: crate::test_support::Polarity::LowerBetter,
+        kind: MetricKind::PerPhase,
+        default_abs: 50.0,
+        default_rel: 0.25,
+        display_unit: "\u{00b5}s",
+        accessor: |_| None,
+    },
+    MetricDef {
+        name: TAOBENCH_SERVE_MIN_US,
+        polarity: crate::test_support::Polarity::LowerBetter,
+        kind: MetricKind::PerPhase,
+        default_abs: 20.0,
+        default_rel: 0.25,
+        display_unit: "\u{00b5}s",
+        accessor: |_| None,
+    },
+    MetricDef {
+        name: TAOBENCH_SERVE_MAX_US,
+        polarity: crate::test_support::Polarity::LowerBetter,
+        kind: MetricKind::PerPhase,
+        default_abs: 50.0,
+        default_rel: 0.50,
+        display_unit: "\u{00b5}s",
+        accessor: |_| None,
+    },
     // taobench WHOLE-RUN qps + hit Rates and their Counter components, pooled
     // cross-cgroup by `crate::assert::populate_run_pooled_taobench` and derived
     // by `derive_rate_metrics`. The four `total_taobench_*` Counters are the rate
@@ -2921,16 +3021,13 @@ pub static METRICS: &[MetricDef] = &[
     // for the re-pool (`name` is the component key, `kind` drives the Counter
     // SUM-fold). Cross-RUN each component SUMs, so the Rates re-pool as
     // Σnumerator / Σdenominator (aggregate throughput, not a mean of per-run qps).
-    // HIT exposed whole-run is the RESPONSE-time taobench_hit_fraction
-    // (Σfast/Σcompleted); the COMMAND-time hit (get-based, 1-Σmisses/Σcmds, the
-    // whole-run analog of the per-phase taobench_hit_rate) is intentionally NOT
-    // a run-level key: in the current closed-loop engine every issued lookup
-    // completes, so command-time and response-time hit converge over a whole run
-    // (run.rs module docs) and a second run-level hit would carry no distinct
-    // --noise-adjust spread. They diverge only under open-loop arrival (a future
-    // taobench mode), which is when the command-time whole-run hit becomes
-    // meaningful and should be added (its get_cmds/get_misses components are
-    // already pooled in the carrier).
+    // HIT is exposed whole-run BOTH ways: the RESPONSE-time taobench_hit_fraction
+    // (Σfast/Σcompleted) AND the COMMAND-time taobench_command_hit_rate (Σhits/Σcmds,
+    // hits = cmds − misses — the whole-run analog of the per-phase
+    // taobench_hit_rate). Under closed-loop every issued lookup completes so the
+    // two converge; under OPEN-LOOP arrival they diverge (a slow/overloaded run
+    // issues lookups that have not yet completed), which is why both carry distinct
+    // --noise-adjust spread and both are registered.
     MetricDef {
         name: TOTAL_TAOBENCH_OPS,
         polarity: crate::test_support::Polarity::HigherBetter,
@@ -3036,6 +3133,101 @@ pub static METRICS: &[MetricDef] = &[
         kind: MetricKind::Rate {
             numerator: TOTAL_TAOBENCH_FAST_OPS,
             denominator: TOTAL_TAOBENCH_OPS,
+        },
+        default_abs: 0.02,
+        default_rel: 0.05,
+        display_unit: "",
+        accessor: |_| None,
+    },
+    // taobench WHOLE-RUN open-loop serve-latency percentiles (µs, LowerBetter,
+    // PerRunDistribution): the union of the per-phase per-cgroup serve histograms,
+    // percentile re-derived over the union by
+    // `crate::assert::populate_run_pooled_taobench_distribution`. Noise-compared
+    // per-run, never cross-run folded (is_derived). Thresholds mirror the
+    // per-phase serve siblings. Absent in closed loop (no serve samples).
+    MetricDef {
+        name: TAOBENCH_SERVE_P50_US_WHOLE,
+        polarity: crate::test_support::Polarity::LowerBetter,
+        kind: MetricKind::PerRunDistribution,
+        default_abs: 20.0,
+        default_rel: 0.25,
+        display_unit: "\u{00b5}s",
+        accessor: |_| None,
+    },
+    MetricDef {
+        name: TAOBENCH_SERVE_P90_US_WHOLE,
+        polarity: crate::test_support::Polarity::LowerBetter,
+        kind: MetricKind::PerRunDistribution,
+        default_abs: 20.0,
+        default_rel: 0.25,
+        display_unit: "\u{00b5}s",
+        accessor: |_| None,
+    },
+    MetricDef {
+        name: TAOBENCH_SERVE_P99_US_WHOLE,
+        polarity: crate::test_support::Polarity::LowerBetter,
+        kind: MetricKind::PerRunDistribution,
+        default_abs: 50.0,
+        default_rel: 0.25,
+        display_unit: "\u{00b5}s",
+        accessor: |_| None,
+    },
+    MetricDef {
+        name: TAOBENCH_SERVE_P999_US_WHOLE,
+        polarity: crate::test_support::Polarity::LowerBetter,
+        kind: MetricKind::PerRunDistribution,
+        default_abs: 50.0,
+        default_rel: 0.25,
+        display_unit: "\u{00b5}s",
+        accessor: |_| None,
+    },
+    MetricDef {
+        name: TAOBENCH_SERVE_MIN_US_WHOLE,
+        polarity: crate::test_support::Polarity::LowerBetter,
+        kind: MetricKind::PerRunDistribution,
+        default_abs: 20.0,
+        default_rel: 0.25,
+        display_unit: "\u{00b5}s",
+        accessor: |_| None,
+    },
+    MetricDef {
+        name: TAOBENCH_SERVE_MAX_US_WHOLE,
+        polarity: crate::test_support::Polarity::LowerBetter,
+        kind: MetricKind::PerRunDistribution,
+        default_abs: 50.0,
+        default_rel: 0.50,
+        display_unit: "\u{00b5}s",
+        accessor: |_| None,
+    },
+    // taobench WHOLE-RUN command-time hit: get_cmds + get_hits (= cmds − misses)
+    // Counter components (ext-only, RENDER_SUPPRESSED, `total_` gate) →
+    // taobench_command_hit_rate = Σhits/Σcmds (the request-time hit, which diverges
+    // from the response-time taobench_hit_fraction under open-loop). Pooled by
+    // `crate::assert::populate_run_pooled_taobench`.
+    MetricDef {
+        name: TOTAL_TAOBENCH_GET_CMDS,
+        polarity: crate::test_support::Polarity::HigherBetter,
+        kind: MetricKind::Counter,
+        default_abs: 1000.0,
+        default_rel: 0.10,
+        display_unit: "",
+        accessor: |_| None,
+    },
+    MetricDef {
+        name: TOTAL_TAOBENCH_GET_HITS,
+        polarity: crate::test_support::Polarity::HigherBetter,
+        kind: MetricKind::Counter,
+        default_abs: 1000.0,
+        default_rel: 0.10,
+        display_unit: "",
+        accessor: |_| None,
+    },
+    MetricDef {
+        name: TAOBENCH_COMMAND_HIT_RATE,
+        polarity: crate::test_support::Polarity::Informational,
+        kind: MetricKind::Rate {
+            numerator: TOTAL_TAOBENCH_GET_HITS,
+            denominator: TOTAL_TAOBENCH_GET_CMDS,
         },
         default_abs: 0.02,
         default_rel: 0.05,
@@ -3655,6 +3847,11 @@ const RENDER_SUPPRESSED_COMPONENTS: &[&str] = &[
     TOTAL_TAOBENCH_FAST_OPS,
     TOTAL_TAOBENCH_SLOW_OPS,
     TOTAL_TAOBENCH_WALL_SEC,
+    // taobench command-time hit Rate components (get_cmds + get_hits): suppressed
+    // so compare shows `taobench_command_hit_rate`, not the raw get counts; remain
+    // in the row for the cross-RUN Σhits/Σcmds re-pool.
+    TOTAL_TAOBENCH_GET_CMDS,
+    TOTAL_TAOBENCH_GET_HITS,
     // schbench role-separate run-delay gate-Rate components (raw run_delay_ns +
     // pcount per role). Suppressed so compare shows the two
     // `schbench_*_run_delay_ns_per_sched` Rates, not the raw Σ pairs. Remain in
