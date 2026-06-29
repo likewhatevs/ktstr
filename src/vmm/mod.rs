@@ -1033,11 +1033,11 @@ impl KtstrVm {
         let com1 = Arc::new(PiMutex::new(console::Serial::new(console::COM1_BASE)));
         let com2 = Arc::new(PiMutex::new(console::Serial::new(console::COM2_BASE)));
 
-        // Userspace IOAPIC handle for the split-irqchip path (>254 vCPUs),
+        // Userspace IOAPIC handle for the split-irqchip path (>254 max APIC ID),
         // mirroring run_vm: the device + the raw VM fd, threaded into
         // spawn_ap_threads + run_bsp_loop so the interactive shell's serial /
         // virtio-console IRQs route via the userspace IOAPIC. `None` for
-        // <=254 vCPUs (in-kernel IOAPIC).
+        // <=254 max APIC ID (in-kernel IOAPIC).
         // x86-only (mirrors run_vm): aarch64 has no userspace IOAPIC — the
         // GIC routes device IRQs and `IoapicHandle` is the uninhabited
         // placeholder — so the handle is always `None` there.
@@ -1105,8 +1105,34 @@ impl KtstrVm {
         // has no disks attached.
         let virtio_blk = self.init_virtio_blk(&vm)?;
 
-        // Optional virtio-net for shell mode. `None` when the builder
-        // has no `NetConfig` attached.
+        // Optional virtio-net for shell mode. Transport is arch-split
+        // (mirrors `run_vm`): x86_64 installs a virtio-pci function on
+        // `pci_bus_handle` (slot 1) and keeps the INTx resample eventfd
+        // alive for the run (KVM holds its raw fd); the MMIO handle is
+        // `None`, so the dispatch loops' MMIO net arm goes inert and
+        // guest BAR accesses route through the PCI bus. aarch64 keeps the
+        // MMIO handle that drives the dispatch loops (aarch64 PCI is a
+        // later increment). Shell mode discards the counters Arc (no
+        // `VmResult`). `None` when the builder has no `NetConfig`.
+        #[cfg(target_arch = "x86_64")]
+        let virtio_net: Option<Arc<PiMutex<virtio_net::VirtioNet>>> = None;
+        #[cfg(target_arch = "x86_64")]
+        let _net_resample_evt = match pci_bus_handle.as_ref() {
+            Some(bus) => self.init_virtio_net_pci(&vm, bus)?.and_then(|h| h.resample_evt),
+            // No PCI bus => no NIC. The builder forces pci_enabled=true whenever
+            // a NetConfig is attached on x86_64, so this arm is only reached with
+            // no network; assert that loudly so a future refactor decoupling
+            // network from pci_enabled cannot silently drop the NIC (no eth0).
+            None => {
+                debug_assert!(
+                    self.network.is_none(),
+                    "x86_64 NetConfig attached but no PCI bus — NIC would be \
+                     silently dropped; pci_enabled must follow network()"
+                );
+                None
+            }
+        };
+        #[cfg(not(target_arch = "x86_64"))]
         let virtio_net = self.init_virtio_net(&vm)?;
 
         // Non-interactive exec mode (--exec) does not need a TTY.

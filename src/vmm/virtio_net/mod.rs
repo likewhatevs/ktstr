@@ -88,6 +88,12 @@ mod device;
 // never the private fields.
 mod mmio;
 
+// virtio-pci-modern transport facade: presents the device as a PCI function
+// (config space + vendor caps + BAR regions) driving the same core API. The
+// generic PCI primitives live in `crate::vmm::pci`; this is the virtio-net
+// glue that maps the BAR sub-regions to the core ops.
+mod pci;
+
 mod counters;
 
 #[cfg(test)]
@@ -118,3 +124,5 @@ pub(crate) use device::*;
 // path for upstream re-exports (vmm/mod.rs, lib.rs).
 pub use counters::{VirtioNetCounters, VirtioNetCountersSnapshot};
 pub use device::{VIRTIO_MMIO_SIZE, VirtioNet};
+// The virtio-pci function wrapper — setup installs it into the PciBus.
+pub(crate) use pci::VirtioNetPci;

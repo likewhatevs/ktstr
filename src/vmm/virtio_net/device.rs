@@ -442,10 +442,26 @@ impl VirtioNet {
         }
     }
 
-    /// Max ring size of the selected queue (0 if the selector is out of range).
+    /// Immutable max ring size of the selected queue (0 if the selector is out
+    /// of range). This is the advertised ceiling, NOT the guest-configured size
+    /// — the PCI common-cfg `queue_size` register serves [`Self::queue_size`]
+    /// (the configured value), not this. Used only to seed the reset value.
     pub(crate) fn queue_max_size(&self) -> u32 {
         self.selected_queue()
             .map(|i| self.queues[i].max_size() as u32)
+            .unwrap_or(0)
+    }
+
+    /// Actual ring size the guest configured for the selected queue (0 if the
+    /// selector is out of range). The virtio-pci common-cfg `queue_size`
+    /// register is read-write (virtio-v1.2 §4.1.4.3): `virtio_queue::Queue`
+    /// initializes and resets it to `max_size` (queue.rs:288/353) and
+    /// `set_size` stores the guest's value, so a read-back returns the
+    /// currently-configured size — what the PCI facade must serve, not the
+    /// immutable max.
+    pub(crate) fn queue_size(&self) -> u32 {
+        self.selected_queue()
+            .map(|i| self.queues[i].size() as u32)
             .unwrap_or(0)
     }
 
@@ -454,6 +470,60 @@ impl VirtioNet {
         self.selected_queue()
             .map(|i| self.queues[i].ready() as u32)
             .unwrap_or(0)
+    }
+
+    /// `queue_notify_off` for the selected queue: notify offsets map in queue
+    /// order, so it equals the (in-range) selector index, and 0 for an
+    /// out-of-range selector. Clamped — unlike the raw `queue_select`
+    /// read-back — so a guest that latched a bogus selector cannot read back a
+    /// notify offset outside the advertised range and compute a wild notify
+    /// address. The out-of-range clamp value (0) aliases queue 0's (RXQ) real
+    /// offset; this is harmless because safety rests on `notify_write` acting
+    /// only on the TX index, not on this read-back value — a guest reading
+    /// back 0 cannot drive a stray drain. The returned index pairs with
+    /// `pci::NOTIFY_OFF_MULTIPLIER` (wire address = index × multiplier).
+    pub(crate) fn queue_notify_off(&self) -> u32 {
+        self.selected_queue().map(|i| i as u32).unwrap_or(0)
+    }
+
+    /// Selected queue's assembled 64-bit (desc, avail, used) ring addresses,
+    /// or `None` if the selector is out of range. The PCI common-cfg programs
+    /// each as two 32-bit halves (LO then HI via the kernel's
+    /// `vp_iowrite64_twopart`); this reads back the merged values so a test
+    /// can pin that the high dword lands in the high 32 bits (not dropped or
+    /// swapped with the low half). Test-only: the production transports never
+    /// read the ring addresses back (the guest owns them), so this would be
+    /// dead code outside `cfg(test)`.
+    #[cfg(test)]
+    pub(crate) fn selected_queue_ring_addrs(&self) -> Option<(u64, u64, u64)> {
+        self.selected_queue().map(|i| {
+            (
+                self.queues[i].desc_table(),
+                self.queues[i].avail_ring(),
+                self.queues[i].used_ring(),
+            )
+        })
+    }
+
+    /// Latched device-feature-select window — read back by the PCI
+    /// common-cfg `device_feature_select` register (the MMIO transport
+    /// never reads it back, but the PCI facade serves a register read).
+    pub(crate) fn device_features_sel(&self) -> u32 {
+        self.device_features_sel
+    }
+
+    /// Latched driver-feature-select window — read back by the PCI
+    /// common-cfg `driver_feature_select` register.
+    pub(crate) fn driver_features_sel(&self) -> u32 {
+        self.driver_features_sel
+    }
+
+    /// Latched queue selector. The PCI common-cfg `queue_select`
+    /// read-back returns it, and `queue_notify_off` equals it (notify
+    /// offsets map in queue order, so the selected queue's notify
+    /// offset is its index).
+    pub(crate) fn queue_select(&self) -> u32 {
+        self.queue_select
     }
 
     /// Copy `data.len()` bytes of device config space starting at byte
@@ -695,14 +765,15 @@ impl VirtioNet {
     fn signal_queue_poisoned(&mut self) {
         self.device_status |= VIRTIO_CONFIG_S_NEEDS_RESET;
         self.interrupt_status |= VIRTIO_MMIO_INT_CONFIG;
-        // SAFETY: EAGAIN requires counter saturation at u64::MAX-1
+        // Recoverability: EAGAIN requires counter saturation at u64::MAX-1
         // (~1.8e19 unobserved kicks) — implausible. EBADF means
         // the fd closed during shutdown. The NEEDS_RESET +
         // INT_CONFIG bits above are the enduring guest-visible
         // signals: even if this write fails, the operator's
         // `mmio_read(STATUS)` still surfaces NEEDS_RESET. We log
         // any errno so a failed write surfaces in tracing rather
-        // than silently disappearing.
+        // than silently disappearing. (Not a `SAFETY:` note — the write
+        // is a safe call; SAFETY is reserved for unsafe blocks/impls.)
         if let Err(e) = self.irq_evt.write(1) {
             tracing::warn!(%e, "virtio-net irq_evt.write failed (poison signal)");
         }

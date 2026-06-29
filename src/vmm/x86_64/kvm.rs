@@ -101,15 +101,61 @@ const _: () = {
 /// IOAPIC translates the guest's RTE for it into an MSI route.
 pub(crate) const VIRTIO_CONSOLE_IRQ: u32 = 5;
 
-/// GSI for virtio-block. Routed via the in-kernel IOAPIC (<=254) or the
-/// userspace IOAPIC (split-irqchip, >254). The IOAPIC's 24-line cap leaves
-/// ample free slots after COM1=4, COM2=3, virtio-console=5, virtio-blk=6.
+/// GSI for virtio-block. Routed via the in-kernel IOAPIC (<=254 max APIC ID)
+/// or the userspace IOAPIC (split-irqchip, >254 max APIC ID). The IOAPIC's
+/// 24-line cap leaves ample free slots after COM1=4, COM2=3, virtio-console=5,
+/// virtio-blk=6.
 pub(crate) const VIRTIO_BLK_IRQ: u32 = 6;
 
-/// GSI for virtio-net. Routed via the in-kernel IOAPIC (<=254) or the
-/// userspace IOAPIC (split-irqchip, >254); well within the IOAPIC's
-/// 24-line cap.
+/// GSI for virtio-net. Routed via the in-kernel IOAPIC (<=254 max APIC ID) or
+/// the userspace IOAPIC (split-irqchip, >254 max APIC ID); well within the
+/// IOAPIC's 24-line cap. On x86 the NIC is a virtio-pci function delivering
+/// legacy INTx on this GSI (level, active-low); the DSDT `_PRT` routes
+/// `(VIRTIO_NET_PCI_SLOT, INTA#)` here. The PCI device GSIs (console=5/blk=6/
+/// net=7) deliberately get NO MADT Interrupt Source Override: an ISO overrides
+/// only the ISA-bus IRQ->GSI identity/polarity defaults, and these are PCI
+/// lines whose level/active-low polarity the guest programs from `_PRT` via
+/// acpi_pci_irq_enable (the lone MADT ISO is IRQ0->GSI2 for the PIT).
 pub(crate) const VIRTIO_NET_IRQ: u32 = 7;
+
+/// PCI device slot (bus 0) for the single v0 virtio-net function: slot 0
+/// is the host bridge, the NIC takes slot 1. One source of truth shared by
+/// the install site (`PciBus::add_function`) and the DSDT `_PRT` route, so
+/// the routed slot always matches the installed slot.
+pub(crate) const VIRTIO_NET_PCI_SLOT: usize = 1;
+
+/// GSI the FADT advertises as the ACPI SCI (system control interrupt). The
+/// non-hardware-reduced FADT must name one; ktstr never arms a fixed event or
+/// a GPE block, so the SCI never fires — this GSI is reserved (inert) and has
+/// no MADT Interrupt Source Override (an ISO declaring it level/active-low
+/// would only matter if the SCI could fire). Inert does NOT mean untouched:
+/// the guest still PROGRAMS the GSI-9 IOAPIC RTE (level/active-low) during
+/// `acpi_enable` (acpi_os_install_interrupt_handler / acpi_sci_ioapic_setup),
+/// and on the split-irqchip path that triggers a KVM_SET_GSI_ROUTING rebuild
+/// for GSI 9 — but the line maps to no device irqfd, so the programmed route
+/// delivers nothing. Named here so its disjointness from the device GSIs is
+/// checkable in one place: serial COM1=4/COM2=3, virtio-MMIO console=5,
+/// virtio-blk [`VIRTIO_BLK_IRQ`]=6, virtio-net [`VIRTIO_NET_IRQ`]=7 — 9
+/// collides with none. If a fixed event or GPE is ever armed, add a MADT ISO
+/// declaring this GSI level/active-low.
+pub(crate) const ACPI_SCI_IRQ: u16 = 9;
+
+/// ACPI PM register-block I/O ports (non-hardware-reduced FADT). The guest's
+/// ACPICA writes/reads these during `acpi_enable` + fixed-event init; ktstr
+/// emulates them as stateless stubs (no real power management). Advertising
+/// them is what lets ACPI FULLY enable — required so the guest routes PCI
+/// INTx via the DSDT `_PRT` (`acpi_pci_irq_enable`); a partially-enabled
+/// ACPI (zeroed PM blocks → `AE_BAD_ADDRESS`) aborts and falls back to
+/// legacy MP-table PCI IRQ routing, which has no NIC entry. Layout (qemu
+/// i440fx/q35 model — full ACPI + PM blocks + legacy IRQs, NOT the
+/// firecracker/cloud-hypervisor hardware-reduced microvm path which drops
+/// the legacy 8259 IRQs ktstr's cmdline virtio-MMIO devices depend on):
+///   PM1 event block  (4 bytes: status u16 @ +0, enable u16 @ +2)
+///   PM1 control block (2 bytes: SCI_EN bit0)
+///   PM timer block    (4 bytes: 24-bit free-running counter)
+pub(crate) const ACPI_PM1_EVT_PORT: u16 = 0x600;
+pub(crate) const ACPI_PM1_CNT_PORT: u16 = 0x604;
+pub(crate) const ACPI_PM_TMR_PORT: u16 = 0x608;
 
 /// E820 memory type: usable RAM.
 pub(crate) const E820_RAM: u32 = 1;
@@ -172,7 +218,7 @@ pub struct KtstrKvm {
     pub(crate) split_irqchip: bool,
     /// Userspace IOAPIC device, present only on the split-irqchip path.
     /// The run loops wrap it in an [`IoapicHandle`] (device + raw VM fd) to
-    /// service IOAPIC MMIO and reprogram MSI routes; `None` for <=254-vCPU
+    /// service IOAPIC MMIO and reprogram MSI routes; `None` for <=254-max-APIC-ID
     /// guests, which use the in-kernel IOAPIC.
     pub(crate) ioapic: Option<Arc<PiMutex<Ioapic>>>,
     /// Whether hugepages were requested at construction time.
@@ -415,7 +461,7 @@ impl KtstrKvm {
         }
 
         // Userspace IOAPIC device for the split-irqchip path (no in-kernel
-        // IOAPIC there). `None` for <=254-vCPU guests. The run loops build an
+        // IOAPIC there). `None` for <=254-max-APIC-ID guests. The run loops build an
         // IoapicHandle around this to translate guest RTE writes into MSI
         // routes; see `super::ioapic` and `IoapicHandle`.
         Ok(split_irqchip.then(|| Arc::new(PiMutex::new(Ioapic::new()))))
@@ -859,7 +905,7 @@ fn build_device_msi_routing(routes: &[(u32, MsiRoute)]) -> Result<KvmIrqRouting>
 /// Owns the userspace IOAPIC device plus the cached raw VM fd needed to
 /// reprogram KVM's MSI routing table. Cloned (via `Arc`) into each AP run
 /// loop on the split-irqchip path; `None` on the in-kernel-irqchip path
-/// (<=254 vCPUs), where the kernel IOAPIC delivers device IRQs directly.
+/// (<=254 max APIC ID), where the kernel IOAPIC delivers device IRQs directly.
 pub(crate) struct IoapicHandle {
     ioapic: Arc<PiMutex<Ioapic>>,
     vm_fd_raw: i32,

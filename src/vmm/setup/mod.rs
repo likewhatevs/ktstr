@@ -23,7 +23,8 @@ use super::memory_budget::{
     read_kernel_version, read_kernel_version_from_metadata_sidecar,
 };
 use super::pi_mutex::PiMutex;
-use super::{disk_config, disk_template, host_topology, initramfs, virtio_blk, virtio_net};
+use super::{disk_config, disk_template, host_topology, initramfs, pci, virtio_blk, virtio_net};
+use vmm_sys_util::eventfd::EventFd;
 
 #[cfg(target_arch = "aarch64")]
 use super::aarch64;
@@ -35,6 +36,29 @@ use super::aarch64::kvm;
 use super::virtio_console;
 #[cfg(target_arch = "x86_64")]
 use super::x86_64::{acpi, boot, kvm, mptable};
+
+/// Host-side handles for the x86_64 virtio-net PCI device. The device
+/// core lives inside the [`pci::PciBus`] function; these are the pieces
+/// the run loop keeps alive and exposes.
+#[cfg(target_arch = "x86_64")]
+pub(crate) struct NetDeviceHandles {
+    /// Cumulative device counters — threaded to the failure-dump run
+    /// state and snapshotted into `VmResult::virtio_net_counters`
+    /// (the PCI path's replacement for the MMIO handle's `counters()`).
+    pub(crate) counters: Arc<virtio_net::VirtioNetCounters>,
+    /// The INTx resample eventfd — `Some` only on the full in-kernel
+    /// irqchip path (`<=254` max APIC ID), where `register_irqfd_with_resample`
+    /// makes KVM track the level GSI and de-assert it on guest EOI,
+    /// notifying this fd. KVM holds the raw fd, so when `Some` it MUST
+    /// outlive the run (a dropped fd silently stops resampling). `None`
+    /// on split-irqchip (`>254` max APIC ID): the kernel's `kvm_arch_irqfd_
+    /// allowed` rejects a resample irqfd there (it requires `irqchip_
+    /// full`), so a plain edge irqfd is used and there is nothing to bind.
+    /// The gate is max APIC ID (`max_apic_id > MAX_XAPIC_ID`), not vCPU count —
+    /// APIC IDs are sparse, so a wide-core sub-254-vCPU guest can take the
+    /// split path.
+    pub(crate) resample_evt: Option<EventFd>,
+}
 
 /// Address where initramfs is loaded in guest memory.
 #[cfg(target_arch = "x86_64")]
@@ -519,21 +543,17 @@ impl KtstrVm {
         Ok(Some(blk_arc))
     }
 
-    /// Construct the optional virtio-net device for the configured
-    /// network in `self.network`. Returns `Ok(None)` when no network
-    /// is attached.
-    ///
-    /// On `Ok(Some(_))`, the returned `Arc<PiMutex<VirtioNet>>` has:
-    ///   - the configured MAC baked into config space,
-    ///   - guest memory set so subsequent `process_tx_loopback` calls
-    ///     can read TX descriptor data and write into RX descriptors,
-    ///   - the irqfd registered with the VM (delivered via the userspace
-    ///     IOAPIC on x86 split-irqchip, the in-kernel IOAPIC/GIC otherwise).
-    ///
-    /// The framework reserves a single MMIO base + IRQ pair
-    /// (`VIRTIO_NET_MMIO_BASE` / `VIRTIO_NET_IRQ`); the builder's
-    /// `.network()` enforces the single-device constraint by
-    /// overwriting any previous network on each call.
+    /// Construct the aarch64 virtio-MMIO net device for the configured
+    /// network. (x86_64 routes the NIC over virtio-pci — see
+    /// `init_virtio_net_pci`, which is x86-gated so an intra-doc link would
+    /// not resolve on this aarch64-only build; aarch64 PCI is a later
+    /// increment, so the NIC stays on MMIO here.) Returns `Ok(None)` when no
+    /// network is
+    /// attached. On `Ok(Some(_))` the MAC is in config space, guest
+    /// memory is set, and the edge irqfd is registered at
+    /// `VIRTIO_NET_IRQ` (the in-kernel GIC routes the GSI). The builder's
+    /// `.network()` overwrites any previous network (single device, v0).
+    #[cfg(not(target_arch = "x86_64"))]
     pub(super) fn init_virtio_net(
         &self,
         vm: &kvm::KtstrKvm,
@@ -544,16 +564,104 @@ impl KtstrVm {
         let mut dev = virtio_net::VirtioNet::new(cfg);
         dev.set_mem((*vm.guest_mem).clone());
         let net_arc = Arc::new(PiMutex::new(dev));
-
-        // irqfd registration. On x86's split-irqchip path (>254 APIC IDs) the
-        // device IRQ routes through the userspace IOAPIC (the guest's RTE write
-        // installs the MSI route); on the in-kernel-irqchip (x86 <=254) and
-        // aarch64 (GIC) paths the kernel routes the GSI. Identical on both.
         vm.vm_fd
             .register_irqfd(net_arc.lock().irq_evt(), kvm::VIRTIO_NET_IRQ)
             .context("register virtio-net irqfd")?;
-
         Ok(Some(net_arc))
+    }
+
+    /// Construct the x86_64 virtio-net PCI function and install it on
+    /// `pci_bus` at `kvm::VIRTIO_NET_PCI_SLOT`. Returns `Ok(None)` when no
+    /// network is attached. On `Ok(Some(_))` the MAC is in the device
+    /// config region, guest memory is set, and INTx is registered by
+    /// irqchip mode (gated on max APIC ID, not vCPU count): full in-kernel
+    /// irqchip (`<=254` max APIC ID) →
+    /// `register_irqfd_with_resample` (KVM tracks the level GSI and
+    /// de-asserts on guest EOI via the resample eventfd; the guest's
+    /// read-to-clear ISR lowers the device's pending bits); split irqchip
+    /// (`>254` max APIC ID) → a plain edge `register_irqfd` (the userspace IOAPIC
+    /// delivers edge MSI routes, one per `irq_evt` assert — a resample
+    /// irqfd is rejected there). The serialized in-VMM loopback needs no
+    /// active resample drain (each interrupt is consumed before the next;
+    /// an async RX backend would need one). The returned
+    /// [`NetDeviceHandles`] carries the counters Arc (for the failure-dump
+    /// run state + `VmResult`) and, on the full-irqchip path, the resample
+    /// eventfd the caller MUST keep alive.
+    #[cfg(target_arch = "x86_64")]
+    pub(super) fn init_virtio_net_pci(
+        &self,
+        vm: &kvm::KtstrKvm,
+        pci_bus: &Arc<PiMutex<pci::PciBus>>,
+    ) -> Result<Option<NetDeviceHandles>> {
+        let Some(cfg) = self.network else {
+            return Ok(None);
+        };
+        let mut dev = virtio_net::VirtioNet::new(cfg);
+        dev.set_mem((*vm.guest_mem).clone());
+        let counters = dev.counters();
+        // INTx delivery differs by irqchip mode (the kernel's
+        // kvm_arch_irqfd_allowed, arch/x86/kvm/irq.c: a RESAMPLE irqfd
+        // requires irqchip_full). The mode is gated on max APIC ID
+        // (split_irqchip = max_apic_id > MAX_XAPIC_ID), NOT vCPU count — APIC
+        // IDs are sparse, so a wide-core sub-254-vCPU guest can be split:
+        // - Full in-kernel irqchip (<=254 max APIC ID): register the GSI as a
+        //   LEVEL line via register_irqfd_with_resample. KVM's in-kernel
+        //   IOAPIC tracks the level and de-asserts on guest EOI, notifying
+        //   the resample eventfd; the guest's read-to-clear ISR lowers the
+        //   device's pending bits.
+        // - Split irqchip (>254 max APIC ID): no in-kernel IOAPIC — the userspace
+        //   IOAPIC delivers device IRQs as edge MSI routes, so each irq_evt
+        //   assert is exactly one MSI (one interrupt). A plain edge irqfd is
+        //   correct (as the virtio-MMIO path used); a RESAMPLE irqfd would be
+        //   rejected here with -EINVAL. Note the guest still programs this
+        //   GSI's RTE level/active-low (acpi_pci_irq_enable hardcodes
+        //   ACPI_LEVEL_SENSITIVE for x86 PCI INTx), but the userspace IOAPIC
+        //   translates it to a one-shot edge MSI with NO remote-IRR / level
+        //   re-injection. That is correct ONLY because v0's in-VMM loopback
+        //   serializes interrupts (one assert fully consumed before the next);
+        //   a level line that needs re-assertion after EOI is a follow-up
+        //   (the userspace-IOAPIC level re-injection + the active resample
+        //   handler), required before a >254-max-APIC-ID async-RX or
+        //   multiqueue NIC.
+        let resample_evt = if vm.split_irqchip {
+            vm.vm_fd
+                .register_irqfd(dev.irq_evt(), kvm::VIRTIO_NET_IRQ)
+                .context("register virtio-net-PCI INTx irqfd (split-irqchip edge MSI)")?;
+            None
+        } else {
+            let evt =
+                EventFd::new(libc::EFD_NONBLOCK).context("create virtio-net resample eventfd")?;
+            vm.vm_fd
+                .register_irqfd_with_resample(dev.irq_evt(), &evt, kvm::VIRTIO_NET_IRQ)
+                .context("register virtio-net-PCI INTx resample irqfd (full irqchip)")?;
+            // The resample eventfd is HELD ALIVE (returned in NetDeviceHandles)
+            // but never drained in v0: KVM's in-kernel IOAPIC performs the EOI
+            // deassert itself, and the only requirement on the VMM side is that
+            // the fd stays open so the resample registration remains valid.
+            // Storing it satisfies that; an active drain handler that re-asserts
+            // the line when the device still has work after EOI is the follow-up
+            // (needed before async-RX/multiqueue, where back-to-back unconsumed
+            // asserts can race).
+            Some(evt)
+        };
+        // Move the device core into the PCI function and install it at
+        // slot 1 (slot 0 is the host bridge). The PciBus lock serializes
+        // the vCPU-thread BAR accesses that drive it. The BAR aperture is the
+        // host-bridge _CRS MMIO grant (same window the DSDT advertises to the
+        // guest); bar_window rejects a base outside it so a non-conformant
+        // guest BAR cannot shadow the ECAM window.
+        let bar_aperture = (
+            kvm::PCI_MMIO_BAR_BASE,
+            kvm::PCI_MMIO_BAR_BASE + kvm::PCI_MMIO_BAR_SIZE,
+        );
+        let func = virtio_net::VirtioNetPci::new(dev, bar_aperture);
+        pci_bus
+            .lock()
+            .add_function(kvm::VIRTIO_NET_PCI_SLOT, Box::new(func));
+        Ok(Some(NetDeviceHandles {
+            counters,
+            resample_evt,
+        }))
     }
 
     /// Create the KVM VM and optionally load the kernel.
@@ -1467,20 +1575,11 @@ impl KtstrVm {
             let disk = &self.disks[0];
             cmdline.push_str(&disk_auto_mount_cmdline_tokens(disk));
         }
-        // Virtio-net MMIO device — appended only when the builder
-        // attached a `NetConfig`. The kernel's virtio_mmio_cmdline
-        // parser registers a MMIO transport per `virtio_mmio.device=`
-        // token; placing this after virtio-blk does not affect device
-        // ordering on the guest's network stack (ifindex is assigned
-        // independently of cmdline order).
-        if self.network.is_some() {
-            cmdline.push_str(&format!(
-                " virtio_mmio.device={:#x}@{:#x}:{}",
-                virtio_net::VIRTIO_MMIO_SIZE,
-                kvm::VIRTIO_NET_MMIO_BASE,
-                kvm::VIRTIO_NET_IRQ,
-            ));
-        }
+        // No virtio-net cmdline token on x86_64: the NIC is a virtio-pci
+        // function (builder `.network()` sets `pci_enabled`), enumerated
+        // by the guest over ECAM and bound by the virtio-pci driver — it
+        // needs no `virtio_mmio.device=` token. (aarch64 keeps its NIC on
+        // virtio-MMIO and emits the token in `finish_aarch64_setup`.)
         cmdline.push_str(numa_balancing_cmdline_token(&self.topology));
         #[cfg(feature = "wprof")]
         if let Some(wprof) = self.wprof.as_ref() {

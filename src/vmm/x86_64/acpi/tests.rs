@@ -335,6 +335,108 @@ fn rsdt_table_pointers() {
     assert_eq!(u32::from_le_bytes(entry), l.slit_addr as u32);
 }
 
+/// `setup_acpi` with the PCI transport enabled (MCFG + the `_SB.PCI0` /
+/// `_PRT` DSDT body), the integration path the booted-guest NIC e2es exercise
+/// but no unit test covered (every other `test_setup` runs `pci_enabled=false`).
+fn test_setup_pci(mem: &GuestMemoryMmap, topo: &Topology, mib: u32) -> AcpiLayout {
+    let layout = test_layout(topo, mib);
+    setup_acpi(mem, topo, &layout, true).unwrap()
+}
+
+#[test]
+fn pci_enabled_emits_mcfg_and_prt_dsdt() {
+    let topo = Topology {
+        llcs: 1,
+        cores_per_llc: 1,
+        threads_per_core: 1,
+        numa_nodes: 1,
+        nodes: None,
+        distances: None,
+    };
+    // Non-PCI baseline: header-only DSDT, no MCFG, 4-entry RSDT.
+    let mem_base = test_mem(16);
+    let base = test_setup(&mem_base, &topo, 256);
+    assert_eq!(base.dsdt_size, 36, "non-PCI DSDT is header-only");
+    assert_eq!(base.mcfg_size, 0, "non-PCI emits no MCFG");
+    let base_rsdt = read_table(&mem_base, base.rsdt_addr);
+    assert_eq!(
+        (base_rsdt.len() - 36) / 4,
+        4,
+        "non-PCI RSDT: FADT/MADT/SRAT/SLIT only",
+    );
+
+    // PCI-enabled: the DSDT carries the host-bridge AML (with _PRT), and the
+    // MCFG (ECAM base) is emitted and linked into RSDT/XSDT.
+    let mem = test_mem(16);
+    let l = test_setup_pci(&mem, &topo, 256);
+    assert!(l.dsdt_size > 36, "PCI DSDT carries the host-bridge AML body");
+    let dsdt = read_table(&mem, l.dsdt_addr);
+    let dsdt_has = |needle: &[u8]| dsdt.windows(needle.len()).any(|w| w == needle);
+    assert!(dsdt_has(b"_PRT"), "PCI DSDT contains the _PRT routing object");
+    assert!(
+        dsdt_has(&[0x0C, 0x41, 0xD0, 0x0A, 0x08]),
+        "PCI DSDT contains the PNP0A08 host-bridge _HID",
+    );
+
+    // MCFG: signature, zero checksum, ECAM base at offset 44.
+    assert!(l.mcfg_size > 0, "MCFG emitted when PCI enabled");
+    let mcfg = read_table(&mem, l.mcfg_addr);
+    assert_eq!(&mcfg[..4], b"MCFG");
+    let sum: u8 = mcfg.iter().fold(0u8, |a, &b| a.wrapping_add(b));
+    assert_eq!(sum, 0, "MCFG checksum must be zero");
+    assert_eq!(
+        u64::from_le_bytes(mcfg[44..52].try_into().unwrap()),
+        PCI_ECAM_BASE,
+        "MCFG allocation base must be the ECAM window base",
+    );
+
+    // RSDT/XSDT gain the MCFG entry (5 = FADT/MADT/SRAT/SLIT/MCFG); MCFG is
+    // last (rsdt_entries appends it after the optional HMAT).
+    let rsdt = read_table(&mem, l.rsdt_addr);
+    let n = (rsdt.len() - 36) / 4;
+    assert_eq!(n, 5, "PCI RSDT adds MCFG to the 4 base tables");
+    let last = u32::from_le_bytes(rsdt[36 + (n - 1) * 4..36 + n * 4].try_into().unwrap());
+    assert_eq!(last as u64, l.mcfg_addr, "MCFG is the last RSDT entry");
+    let xsdt = read_table(&mem, l.xsdt_addr);
+    assert_eq!((xsdt.len() - 36) / 8, 5, "PCI XSDT adds MCFG (8-byte entries)");
+
+    // The full contiguous pack still ends within the ISA hole.
+    assert!(
+        l.xsdt_addr + l.xsdt_size <= HIMEM_START,
+        "ACPI tables must pack within the ISA hole",
+    );
+}
+
+#[test]
+fn pci_with_hmat_table_count() {
+    // pci + hmat (multi-NUMA) guards the table_count = 4 + hmat + pci
+    // arithmetic and the rsdt_entries append order (MCFG after HMAT).
+    let mem = test_mem(16);
+    let topo = Topology {
+        llcs: 4,
+        cores_per_llc: 2,
+        threads_per_core: 1,
+        numa_nodes: 2,
+        nodes: None,
+        distances: None,
+    };
+    let l = test_setup_pci(&mem, &topo, 256);
+    assert!(l.hmat_size > 0, "HMAT emitted for multi-NUMA");
+    assert!(l.mcfg_size > 0, "MCFG emitted for PCI");
+    let rsdt = read_table(&mem, l.rsdt_addr);
+    let n = (rsdt.len() - 36) / 4;
+    assert_eq!(n, 6, "FADT/MADT/SRAT/SLIT/HMAT/MCFG");
+    let last = u32::from_le_bytes(rsdt[36 + (n - 1) * 4..36 + n * 4].try_into().unwrap());
+    assert_eq!(
+        last as u64, l.mcfg_addr,
+        "MCFG is the last RSDT entry, appended after HMAT",
+    );
+    assert!(
+        l.xsdt_addr + l.xsdt_size <= HIMEM_START,
+        "ACPI tables must pack within the ISA hole",
+    );
+}
+
 #[test]
 fn madt_has_iso_irq0_gsi2() {
     let mem = test_mem(16);
@@ -740,6 +842,98 @@ fn fadt_hw_reduced_flags() {
     assert_eq!(flags & (1 << 20), 0, "HW_REDUCED_ACPI must not be set");
     assert_ne!(flags & FADT_F_PWR_BUTTON, 0);
     assert_ne!(flags & FADT_F_SLP_BUTTON, 0);
+}
+
+#[test]
+fn fadt_pm_register_blocks() {
+    // Non-hardware-reduced full ACPI needs populated PM register blocks.
+    // With them zero, ACPICA faults (AE_BAD_ADDRESS) initializing fixed
+    // events, ACPI never enables, and PCI INTx falls back to legacy MP-table
+    // routing that can't route the virtio-net PCI function. Pin every PM-block
+    // field so a regression that zeroes them is caught at unit time, not by a
+    // booted-guest e2e.
+    let mem = test_mem(16);
+    let topo = Topology {
+        llcs: 1,
+        cores_per_llc: 1,
+        threads_per_core: 1,
+        numa_nodes: 1,
+        nodes: None,
+        distances: None,
+    };
+    let l = test_setup(&mem, &topo, 256);
+    let mut fadt = [0u8; 276];
+    mem.read_slice(&mut fadt, GuestAddress(l.fadt_addr))
+        .unwrap();
+    // SCI_INT (offset 46): GSI 9, the conventional SCI line.
+    assert_eq!(u16::from_le_bytes(fadt[46..48].try_into().unwrap()), 9);
+    // PM1a_EVT_BLK / PM1a_CNT_BLK / PM_TMR_BLK (offsets 56/64/76): 32-bit
+    // legacy I/O port addresses. Must be non-zero or ACPICA faults.
+    assert_eq!(
+        u32::from_le_bytes(fadt[56..60].try_into().unwrap()),
+        u32::from(ACPI_PM1_EVT_PORT)
+    );
+    assert_eq!(
+        u32::from_le_bytes(fadt[64..68].try_into().unwrap()),
+        u32::from(ACPI_PM1_CNT_PORT)
+    );
+    assert_eq!(
+        u32::from_le_bytes(fadt[76..80].try_into().unwrap()),
+        u32::from(ACPI_PM_TMR_PORT)
+    );
+    // PM1_EVT_LEN / PM1_CNT_LEN / PM_TMR_LEN (offsets 88/89/91).
+    assert_eq!(fadt[88], 4);
+    assert_eq!(fadt[89], 2);
+    assert_eq!(fadt[91], 4);
+    // The optional SEPARATE_LENGTH blocks are deliberately left fully zero
+    // (acpi_tb_convert_fadt silently accepts a fully-zero optional block; ktstr
+    // emulates no PM2 control or GPE block). Pin them so a regression that
+    // populated one — which acpi_tb_convert_fadt would then validate and could
+    // fault on a malformed pair — is caught: PM2_CNT_BLK@72 / GPE0_BLK@80 (u32),
+    // PM2_CNT_LEN@90 / GPE0_BLK_LEN@92 (u8).
+    assert_eq!(u32::from_le_bytes(fadt[72..76].try_into().unwrap()), 0, "PM2_CNT_BLK");
+    assert_eq!(u32::from_le_bytes(fadt[80..84].try_into().unwrap()), 0, "GPE0_BLK");
+    assert_eq!(fadt[90], 0, "PM2_CNT_LEN");
+    assert_eq!(fadt[92], 0, "GPE0_BLK_LEN");
+    // IA-PC Boot Architecture Flags (offset 109): bit1 = i8042 present,
+    // bit2 = VGA not present.
+    assert_eq!(
+        u16::from_le_bytes(fadt[109..111].try_into().unwrap()),
+        0x0006
+    );
+}
+
+#[test]
+fn fadt_extended_gas_blocks_are_zero() {
+    // We populate ONLY the legacy 32-bit I/O-port PM blocks (offsets 56/64/76)
+    // and leave every 64-bit extended GAS field zero. ACPICA's
+    // acpi_tb_convert_fadt (drivers/acpi/acpica/tbfadt.c) synthesizes the X_*
+    // GAS from the legacy block whenever the X_ address is zero and the legacy
+    // block is non-zero. Populating BOTH risks an inconsistent pair that
+    // acpi_tb_convert_fadt warns on (legacy-vs-X mismatch); zeroing the X_
+    // blocks is the spec-clean way to let ACPICA derive them. Pin that the
+    // X_PM*/X_GPE*/SLEEP_*/HypervisorVendorId region (offset 148 to the end of
+    // the 276-byte ACPI-6 FADT) stays all-zero so a regression that starts
+    // writing a partial GAS is caught here.
+    let mem = test_mem(16);
+    let topo = Topology {
+        llcs: 1,
+        cores_per_llc: 1,
+        threads_per_core: 1,
+        numa_nodes: 1,
+        nodes: None,
+        distances: None,
+    };
+    let l = test_setup(&mem, &topo, 256);
+    let mut fadt = [0u8; 276];
+    mem.read_slice(&mut fadt, GuestAddress(l.fadt_addr))
+        .unwrap();
+    assert!(
+        fadt[148..].iter().all(|&b| b == 0),
+        "extended GAS region (offset 148..) must be zero so ACPICA synthesizes \
+         X_* blocks from the legacy ports; found {:?}",
+        &fadt[148..]
+    );
 }
 
 #[test]

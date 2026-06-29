@@ -1477,12 +1477,12 @@ pub(crate) struct VmRunState {
     /// loads the final cumulative state into a plain-u64 snapshot
     /// before storing on the public `VmResult`.
     pub(crate) virtio_blk_counters: Option<Arc<VirtioBlkCounters>>,
-    /// Cloned counter handle from [`super::KtstrVm::init_virtio_net`]
-    /// when a network was attached, captured before the device-arc
-    /// is dropped so [`super::KtstrVm::collect_results`] can
-    /// snapshot it into [`VmResult::virtio_net_counters`]. Same
-    /// Arc-handoff + snapshot-at-assignment pattern as
-    /// `virtio_blk_counters` above.
+    /// Cloned counter handle from the net device init (`init_virtio_net` on
+    /// aarch64 / `init_virtio_net_pci` on x86_64, both arch-gated) when a
+    /// network was attached, captured before the device-arc is dropped so
+    /// [`super::KtstrVm::collect_results`] can snapshot it into
+    /// [`VmResult::virtio_net_counters`]. Same Arc-handoff +
+    /// snapshot-at-assignment pattern as `virtio_blk_counters` above.
     pub(crate) virtio_net_counters: Option<Arc<VirtioNetCounters>>,
     /// Snapshot bridge owning every report captured during the run.
     /// The freeze coordinator clones this bridge into its closure

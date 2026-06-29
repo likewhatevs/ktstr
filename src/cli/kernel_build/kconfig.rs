@@ -427,6 +427,16 @@ const VALIDATE_CONFIG_CRITICAL: &[(&str, &str)] = &[
          would fail with a confusing 'no /dev/vda' inside the guest instead of a clear build error",
     ),
     (
+        "CONFIG_ACPI",
+        "the linchpin of the x86 PCI transport — the guest parses the MCFG (ECAM base), the \
+         _SB.PCI0 DSDT _PRT (PCI INTx -> GSI routing), and the FADT PM register blocks only when \
+         ACPI is enabled. x86_64 defconfig sets it, but an --extra-kconfig that strips it would \
+         drop PCI_MMCONFIG too (default-y only on PCI + ACPI) and PCI INTx would fall back to \
+         legacy MP-table routing with no NIC entry — the exact silent failure the FADT PM blocks \
+         + _PRT exist to fix. Validated here (not only via PCI_MMCONFIG) because it is the most \
+         catastrophic to lose",
+    ),
+    (
         "CONFIG_PCI",
         "required for the virtio-PCI transport — the host bridge at 00:00.0 and any PCI device \
          (NICs) enumerate only with PCI compiled in. x86_64 defconfig sets it, but an \
@@ -441,6 +451,14 @@ const VALIDATE_CONFIG_CRITICAL: &[(&str, &str)] = &[
          PCI + ACPI are set, but an --extra-kconfig that strips it would silently drop ECAM — \
          base config still works over CAM, so the loss is invisible until an extended-config \
          access (the e2e, or a future MSI-X device) fails",
+    ),
+    (
+        "CONFIG_VIRTIO_PCI",
+        "the guest virtio-PCI DRIVER that binds the virtio-net NIC (a PCI function). Without it \
+         the guest enumerates the PCI device but no driver attaches, so eth* never appears and \
+         every NIC WorkType/e2e fails with a confusing 'no eth0' inside the guest instead of a \
+         clear build error. Distinct from CONFIG_PCI (the bus) and CONFIG_VIRTIO_NET (the \
+         transport-agnostic net driver)",
     ),
 ];
 

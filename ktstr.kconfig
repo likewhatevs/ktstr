@@ -181,8 +181,30 @@ CONFIG_VIRTIO_NET=y
 # the same defense-in-depth reason (base config still works CAM-only if
 # it is dropped). Both are x86 symbols; arm64 PCI uses
 # PCI_HOST_GENERIC, a later increment when arm64 virtio-PCI lands.
+#
+# ACPI is the linchpin of the x86 PCI transport: the guest parses the MCFG
+# (ECAM base), the _SB.PCI0 DSDT _PRT (PCI INTx -> GSI routing), and the
+# FADT PM register blocks only when ACPI is enabled. x86_64_defconfig sets
+# CONFIG_ACPI=y; pin it here for the same defense-in-depth reason — if an
+# inherited-defconfig flip or --extra-kconfig drops it, PCI_MMCONFIG
+# (default y only on PCI && ACPI) silently drops too (ECAM gone) and PCI
+# INTx falls back to legacy MP-table routing with no NIC entry
+# (pci_dev->irq==0 -> vp_find_vqs_intx request_irq fails -> virtnet_probe
+# -EINVAL) — the exact failure the FADT PM blocks + _PRT exist to fix, but
+# now silent. arm64 discovers devices via DT, so a compiled-in ACPI is
+# harmless there (its defconfig also sets =y); this pin is x86's foundation.
+CONFIG_ACPI=y
 CONFIG_PCI=y
 CONFIG_PCI_MMCONFIG=y
+# VIRTIO_PCI is the guest DRIVER that binds virtio devices on the PCI
+# transport: the virtio-net NIC enumerates as a PCI function, and only
+# this driver attaches to it (CONFIG_PCI is the bus; CONFIG_VIRTIO_NET
+# is the transport-agnostic net driver). Without it the guest sees the
+# PCI device but nothing binds, so the NIC's eth* interface never
+# appears. Pinned so an inherited-defconfig flip or an --extra-kconfig
+# strip surfaces as a build error rather than a silent in-guest bind
+# failure.
+CONFIG_VIRTIO_PCI=y
 
 # -- Networking --
 # PACKET: AF_PACKET sockets (net/packet/Kconfig:6 — "communicate directly

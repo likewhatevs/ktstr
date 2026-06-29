@@ -16,7 +16,9 @@ use zerocopy::IntoBytes;
 
 use super::topology::apic_id;
 use crate::vmm::kvm::{
-    HIMEM_START, PCI_ECAM_BASE, PCI_ECAM_SIZE, PCI_MMIO_BAR_BASE, PCI_MMIO_BAR_SIZE,
+    ACPI_PM1_CNT_PORT, ACPI_PM1_EVT_PORT, ACPI_PM_TMR_PORT, ACPI_SCI_IRQ, HIMEM_START,
+    PCI_ECAM_BASE, PCI_ECAM_SIZE, PCI_MMIO_BAR_BASE, PCI_MMIO_BAR_SIZE, VIRTIO_NET_IRQ,
+    VIRTIO_NET_PCI_SLOT,
 };
 use crate::vmm::numa_mem::NumaMemoryLayout;
 use crate::vmm::topology::Topology;
@@ -319,6 +321,12 @@ pub fn setup_acpi(
             PCI_ECAM_SIZE as u32,
             PCI_MMIO_BAR_BASE as u32,
             (PCI_MMIO_BAR_BASE + PCI_MMIO_BAR_SIZE - 1) as u32,
+            // v0 single virtio-net function at VIRTIO_NET_PCI_SLOT, routing
+            // INTA# -> VIRTIO_NET_IRQ (constant-driven; no literal here so a
+            // retune of the constant can't drift this comment). Harmless when
+            // PCI is enabled without a NIC (the entry is dormant — no device at
+            // the slot to consult).
+            &[(VIRTIO_NET_PCI_SLOT as u32, VIRTIO_NET_IRQ)],
         )
     } else {
         Vec::new()
@@ -559,9 +567,87 @@ fn write_fadt(mem: &GuestMemoryMmap, layout: &AcpiLayout) -> Result<()> {
     buf[40..44].copy_from_slice(&(layout.dsdt_addr as u32).to_le_bytes());
     // X_DSDT at offset 140 (64-bit)
     buf[140..148].copy_from_slice(&layout.dsdt_addr.to_le_bytes());
+    // FADT fixed-feature flags. PWR_BUTTON|SLP_BUTTON mark the power/sleep
+    // buttons as ABSENT-as-fixed-features (ktstr has no buttons; ACPI 6.x
+    // FADT bit4/bit5: set => not a fixed-hardware button). This intentionally
+    // diverges from qemu's i440fx/q35 model the PM blocks otherwise follow:
+    // qemu sets USE_PLATFORM_CLOCK (bit15, for a real ACPI PM timer) and leaves
+    // the button bits clear. ktstr clears USE_PLATFORM_CLOCK because its PM
+    // timer is a liveness-only stub (`acpi_pm_timer_value`, ~0.13% fast).
+    // init_acpi_pm_clocksource (drivers/clocksource/acpi_pm.c:208) never reads
+    // the FADT platform-clock flag — it gates on `pmtmr_ioport != 0` (set from
+    // the PM_TMR block we advertise), runs a monotonicity check + verify_pmtmr_
+    // rate, then clocksource_register_hz. But whether acpi_pm actually REGISTERS
+    // depends on the irqchip mode: verify_pmtmr_rate (acpi_pm.c:178) calibrates
+    // the PM timer against PIT channel 2 (mach_prepare_counter/mach_countup,
+    // I/O ports 0x61/0x42). On the full-irqchip path KVM's in-kernel PIT
+    // services those ports, so verify passes and acpi_pm registers; on the
+    // split-irqchip path there is no KVM PIT (kvm.rs setup_irqchip skips
+    // create_pit2), 0x61/0x42 fall through to 0xFF in exit_dispatch, the count
+    // loop terminates instantly, verify_pmtmr_rate returns -1, and
+    // init_acpi_pm_clocksource returns -ENODEV WITHOUT registering. Either way
+    // acpi_pm is never SELECTED for timekeeping (on full-irqchip it is
+    // rating-outranked by kvm-clock; on split-irqchip it is not registered), and
+    // ACPI-enable / PCI-INTx routing do not depend on it — the PM_TMR is
+    // advertised so ACPICA's PM-block/fixed-event init does not fault, not so
+    // acpi_pm registers. HW_REDUCED (bit20) stays clear so the legacy
+    // 8259/IOAPIC IRQs survive.
     let flags = FADT_F_PWR_BUTTON | FADT_F_SLP_BUTTON;
     buf[112..116].copy_from_slice(&flags.to_le_bytes());
-    buf[131] = 5;
+    buf[131] = 5; // FADT minor revision (header major revision 6 => ACPI 6.5)
+
+    // ACPI PM register blocks (non-hardware-reduced full ACPI; qemu
+    // i440fx/q35 model). Emitted for EVERY x86 guest, NOT gated on pci_enabled
+    // (unlike the DSDT `_PRT` + MCFG, which are PCI-specific): the AE_BAD_ADDRESS
+    // fault below is a fixed-event-init fault that hits ANY guest enabling ACPI
+    // (CONFIG_ACPI=y), independent of PCI — so the PM blocks must always be
+    // present, while PCI INTx routing only needs the `_PRT` when a NIC exists.
+    // Without these the guest's ACPICA faults
+    // (AE_BAD_ADDRESS) initializing fixed events, ACPI never enables, and
+    // PCI INTx falls back to legacy MP-table routing — which can't route the
+    // virtio-net PCI function. With them ACPI enables and routes PCI INTx via
+    // the DSDT `_PRT`, while the legacy 8259/IOAPIC IRQs (cmdline virtio-MMIO
+    // console + serial) are preserved (hardware-reduced ACPI would drop
+    // them). The ports are stub-emulated in exit_dispatch (no real power
+    // management). The X_* 64-bit GAS variants are left zero — ACPICA
+    // synthesizes them from these 32-bit legacy blocks: acpi_tb_convert_fadt
+    // (drivers/acpi/acpica/tbfadt.c) calls acpi_tb_init_generic_address for
+    // each X_ field and, when the X_ GAS address is zero and the legacy 32-bit
+    // block is non-zero, builds the GAS from the legacy block (space_id
+    // SYSTEM_IO). A zero legacy block is what acpi_hw_validate_register then
+    // rejects with AE_BAD_ADDRESS — which is exactly the fault this fix avoids.
+    // GPE0_BLK (offset 80) + GPE0_BLK_LEN (offset 92), and PM2_CNT
+    // (PM2_CNT_BLK @72 / PM2_CNT_LEN @90 — offset 91 is PM_TMR_LEN, written
+    // below), are intentionally left zero — ktstr emulates no GPE block or PM2
+    // control (it arms no general-purpose events), diverging from qemu's
+    // i440fx/q35 model, which populates GPE0_BLK for its PM device (qemu's
+    // microvm/no-GPE model leaves it zero, like ktstr). acpi_tb_convert_fadt
+    // (tbfadt.c) flags these
+    // SEPARATE_LENGTH/optional: a FULLY-zero optional block is silently
+    // accepted (the BIOS_WARNING fires only on a half-set address/length pair),
+    // and only the REQUIRED PM1a EVT/CNT blocks raise BIOS_ERROR when zero —
+    // both of those are populated above.
+    // SCI_INT: the inert SCI GSI (no fixed event / GPE is ever armed, so it
+    // never fires; no MADT ISO needed — see ACPI_SCI_IRQ).
+    buf[46..48].copy_from_slice(&ACPI_SCI_IRQ.to_le_bytes());
+    buf[56..60].copy_from_slice(&u32::from(ACPI_PM1_EVT_PORT).to_le_bytes()); // PM1a_EVT_BLK
+    buf[64..68].copy_from_slice(&u32::from(ACPI_PM1_CNT_PORT).to_le_bytes()); // PM1a_CNT_BLK
+    buf[76..80].copy_from_slice(&u32::from(ACPI_PM_TMR_PORT).to_le_bytes()); // PM_TMR_BLK
+    // PM1_EVT_LEN=4: a 4-byte PM1a event block. ACPICA splits it as two
+    // separate 16-bit registers — PM1_STATUS @ PM1a_EVT_BLK (0x600) and
+    // PM1_ENABLE @ PM1a_EVT_BLK + PM1_EVT_LEN/2 (0x602) — both served by the
+    // exit_dispatch PM stub's 0x600..0x606 range.
+    buf[88] = 4; // PM1_EVT_LEN (status u16 @ +0, enable u16 @ +2)
+    buf[89] = 2; // PM1_CNT_LEN (control u16)
+    buf[91] = 4; // PM_TMR_LEN (32-bit register; 24-bit counter)
+    // IA-PC Boot Architecture Flags (offset 109): bit1 = 8042 present (ktstr
+    // emulates the i8042 for reboot=k, so the guest probes it) | bit2 =
+    // VGA_NOT_PRESENT (ktstr emulates no VGA, so the guest must not probe the
+    // VGA I/O ports / legacy framebuffer). Only bit2 matches firecracker's
+    // microvm FADT, which sets 0x0004 (VGA_NOT_PRESENT alone); bit1 (8042) is
+    // ktstr-specific — firecracker has no i8042 so it leaves that bit clear.
+    buf[109..111].copy_from_slice(&0x0006u16.to_le_bytes());
+
     set_sdt_checksum(&mut buf);
     mem.write_slice(&buf, GuestAddress(layout.fadt_addr))
         .context("write FADT")?;

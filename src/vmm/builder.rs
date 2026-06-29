@@ -769,12 +769,23 @@ impl KtstrVmBuilder {
     /// virtio device.
     ///
     /// v0 supports a single device; calling this method twice
-    /// overwrites the prior `NetConfig`. Reached via the
-    /// `#[ktstr_test(network = ...)]` attribute
+    /// overwrites the prior `NetConfig`. On x86_64 the NIC attaches as a
+    /// virtio-pci function, so this enables the PCI host bridge
+    /// automatically — the transport is an implementation detail the test
+    /// author does not select. aarch64 keeps the virtio-MMIO NIC
+    /// transport (aarch64 PCI is a later increment), so PCI stays off
+    /// there. Reached via the `#[ktstr_test(network = ...)]` attribute
     /// (`test_support::runtime::build_vm_builder_base` calls this when the
     /// entry sets `network`), or directly by raw-library callers.
     pub fn network(mut self, network: net_config::NetConfig) -> Self {
         self.network = Some(network);
+        // On x86_64 a NIC is a virtio-pci function and needs the host
+        // bridge + ECAM; aarch64 routes the NIC over virtio-MMIO (no PCI
+        // yet), so leave pci_enabled untouched there.
+        #[cfg(target_arch = "x86_64")]
+        {
+            self.pci_enabled = true;
+        }
         self
     }
 
@@ -1029,7 +1040,14 @@ impl KtstrVmBuilder {
             bpf_map_writes: self.bpf_map_writes,
             watch_bpf_maps: self.watch_bpf_maps,
             performance_mode: self.performance_mode,
-            pci_enabled: self.pci_enabled,
+            // A NIC is a virtio-pci function on x86_64, so an attached
+            // network implies the PCI transport — enforce the invariant at
+            // the sole KtstrVm construction point so no assembly path (or a
+            // stray `.pci(false)`) can yield network=Some with
+            // pci_enabled=false, which would emit `pci=off` and skip
+            // installing the NIC. aarch64 keeps the NIC on virtio-MMIO.
+            pci_enabled: self.pci_enabled
+                || (cfg!(target_arch = "x86_64") && self.network.is_some()),
             no_perf_mode,
             pinning_plan,
             mbind_node_map,

@@ -1089,10 +1089,36 @@ impl KtstrVm {
             blk.lock().set_parked_evt(parked_evt.clone());
         }
 
-        // Optional virtio-net: `None` when the builder has no
-        // `NetConfig` attached, `Some` when configured. Same
-        // construction-before-vcpu-takedown rule as virtio-blk.
+        // Optional virtio-net. The transport is arch-split:
+        //
+        // - x86_64: the NIC is a virtio-pci function installed on
+        //   `pci_bus_handle` (slot 1). There is no MMIO handle for the
+        //   dispatch loops to drive — guest BAR accesses route through
+        //   the PCI bus — so `virtio_net` stays `None` here (the MMIO
+        //   net arm in the dispatch loops goes inert), and the counters
+        //   Arc + INTx resample eventfd come back in `NetDeviceHandles`.
+        //   The resample fd MUST outlive the run (KVM holds its raw fd
+        //   to de-assert the level GSI on guest EOI); `_net_resample_evt`
+        //   keeps it alive through `run_bsp_loop`.
+        // - aarch64: the NIC stays on virtio-MMIO (aarch64 PCI is a
+        //   later increment); the handle drives the dispatch loops and
+        //   supplies the counters Arc.
+        //
+        // Same construction-before-vcpu-takedown rule as virtio-blk.
+        #[cfg(target_arch = "x86_64")]
+        let virtio_net: Option<Arc<PiMutex<virtio_net::VirtioNet>>> = None;
+        #[cfg(target_arch = "x86_64")]
+        let (virtio_net_counters, _net_resample_evt) = match pci_bus_handle.as_ref() {
+            Some(bus) => match self.init_virtio_net_pci(&vm, bus)? {
+                Some(h) => (Some(h.counters), h.resample_evt),
+                None => (None, None),
+            },
+            None => (None, None),
+        };
+        #[cfg(not(target_arch = "x86_64"))]
         let virtio_net = self.init_virtio_net(&vm)?;
+        #[cfg(not(target_arch = "x86_64"))]
+        let virtio_net_counters = virtio_net.as_ref().map(|d| d.lock().counters());
 
         // Virtio-console for host→guest wake delivery. The setup_memory
         // path always emits the device's MMIO node on the kernel
@@ -10270,7 +10296,10 @@ impl KtstrVm {
         // it to `VmResult` without holding the device alive past
         // its current ownership.
         let virtio_blk_counters = virtio_blk.as_ref().map(|d| d.lock().counters());
-        let virtio_net_counters = virtio_net.as_ref().map(|d| d.lock().counters());
+        // `virtio_net_counters` was captured at device construction (the
+        // transport-split init above): on x86_64 from `NetDeviceHandles`
+        // (the PCI function owns the device core, so the `virtio_net`
+        // MMIO handle is `None` here), on aarch64 from the MMIO handle.
 
         // Best-effort final TCR_EL1 read from the post-exit BSP.
         // The BSP loop's lazy CAS already populates `tcr_el1_cache`

@@ -32,8 +32,9 @@
 //! The ECAM window base/size, the ACPI MCFG/DSDT emission (x86_64) and the FDT
 //! `pci` node (aarch64) are arch-specific and live under `x86_64`/`aarch64`;
 //! this module takes the ECAM base as a constructor parameter so it stays
-//! arch-neutral. A bus currently holds only the host bridge; virtio-net
-//! functions (with BARs and, later, MSI-X) attach in subsequent increments.
+//! arch-neutral. The host bridge occupies slot 0; a virtio-net function
+//! (with a memory BAR, INTx) attaches at slot 1. Per-queue MSI-X and
+//! additional NIC functions are subsequent increments.
 //!
 //! Hostile-guest defense: every config access is bounds-checked. An access to
 //! an absent bus/device/function, or one that would read past the 4 KiB
@@ -80,33 +81,90 @@ const CLASS_BRIDGE: u8 = 0x06;
 const SUBCLASS_HOST: u8 = 0x00;
 
 // Standard configuration-space register offsets (include/uapi/linux/pci_regs.h).
-const REG_VENDOR_ID: u16 = 0x00;
-const REG_DEVICE_ID: u16 = 0x02;
-const REG_COMMAND: u16 = 0x04;
-const REG_REVISION_ID: u16 = 0x08;
-const REG_PROG_IF: u16 = 0x09;
-const REG_SUBCLASS: u16 = 0x0A;
-const REG_CLASS: u16 = 0x0B;
-const REG_HEADER_TYPE: u16 = 0x0E;
+// `pub(crate)` so device-function modules (e.g. virtio-net) building their own
+// config space reuse the canonical offsets rather than redefining them.
+pub(crate) const REG_VENDOR_ID: u16 = 0x00;
+pub(crate) const REG_DEVICE_ID: u16 = 0x02;
+pub(crate) const REG_COMMAND: u16 = 0x04;
+pub(crate) const REG_STATUS: u16 = 0x06;
+pub(crate) const REG_REVISION_ID: u16 = 0x08;
+pub(crate) const REG_PROG_IF: u16 = 0x09;
+pub(crate) const REG_SUBCLASS: u16 = 0x0A;
+pub(crate) const REG_CLASS: u16 = 0x0B;
+pub(crate) const REG_HEADER_TYPE: u16 = 0x0E;
+/// First memory BAR (BAR0), a 32-bit memory BAR
+/// (`include/uapi/linux/pci_regs.h` PCI_BASE_ADDRESS_0). Register 0x14 is
+/// BAR1 (unimplemented for the virtio-net function — a 32-bit BAR0 occupies
+/// only 0x10).
+pub(crate) const REG_BAR0: u16 = 0x10;
+/// Capabilities-list pointer (PCI_CAPABILITY_LIST) — the config offset of the
+/// first capability; valid only when `PCI_STATUS_CAP_LIST` is set in STATUS.
+pub(crate) const REG_CAP_PTR: u16 = 0x34;
+pub(crate) const REG_INTERRUPT_LINE: u16 = 0x3C;
+pub(crate) const REG_INTERRUPT_PIN: u16 = 0x3D;
+
+/// `PCI_STATUS` capabilities-list bit (PCI_STATUS_CAP_LIST): tells the guest a
+/// capability chain is present at `REG_CAP_PTR`.
+pub(crate) const PCI_STATUS_CAP_LIST: u16 = 0x0010;
+/// `PCI_COMMAND` memory-space-enable bit (PCI_COMMAND_MEMORY): the guest sets
+/// it to enable a function's memory BAR decode.
+pub(crate) const PCI_COMMAND_MEMORY: u16 = 0x0002;
 
 /// COMMAND register writable bits: I/O space, memory space, bus master, SERR
-/// enable, INTx disable (`PCI_COMMAND_*`). Matches qemu's `pci_init_wmask`
-/// command mask for the bits a guest meaningfully toggles. The host bridge has
-/// no BARs, so these are inert here, but a writable COMMAND is what the guest's
+/// enable, INTx disable (`PCI_COMMAND_*`) — the bits a guest meaningfully
+/// toggles. This is NARROWER than cloud-hypervisor, which makes the whole low 16
+/// bits writable; restricting to the guest-meaningful bits is a safe subset (it
+/// can only reject bits the guest has no reason to set). The host bridge has no
+/// BARs, so these are inert there, but a writable COMMAND is what the guest's
 /// PCI core expects.
-const PCI_COMMAND_WMASK: u16 = 0x0001 | 0x0002 | 0x0004 | 0x0100 | 0x0400;
+pub(crate) const PCI_COMMAND_WMASK: u16 = 0x0001 | 0x0002 | 0x0004 | 0x0100 | 0x0400;
 
-/// A single PCI function's view: its configuration space.
+/// A single PCI function's view: its configuration space plus, for
+/// functions with a memory BAR, the MMIO behind it.
 ///
 /// The bus dispatches decoded config accesses (read/write at a byte register
 /// within \[0, 4096)) to the function. Implementors back this with a
-/// [`ConfigSpace`]. virtio-net functions (later increments) also handle BAR
-/// MMIO; that surface is added when those functions land.
+/// [`ConfigSpace`]. A function that exposes a memory BAR (e.g. virtio-net,
+/// whose modern transport regions live behind BAR0) overrides
+/// [`Self::bar_window`] to publish the programmed window and
+/// [`Self::bar_read`]/[`Self::bar_write`] to serve MMIO within it; the
+/// host bridge has no BAR and uses the no-op defaults.
 pub(crate) trait PciFunction: Send {
     /// Read `data.len()` bytes of configuration space starting at byte `reg`.
     fn config_read(&self, reg: u16, data: &mut [u8]);
     /// Write `data.len()` bytes of configuration space starting at byte `reg`.
     fn config_write(&mut self, reg: u16, data: &[u8]);
+
+    /// The function's memory-BAR window `[base, base + len)` once the
+    /// guest has programmed the BAR and enabled memory-space decode
+    /// (PCI_COMMAND memory-space bit). `None` for a function with no BAR
+    /// (the host bridge), or while the BAR is unprogrammed / memory
+    /// decode is disabled — the bus then routes no BAR MMIO here. The
+    /// bus uses this to decide which function (if any) owns a given
+    /// guest-physical MMIO address.
+    fn bar_window(&self) -> Option<(u64, u64)> {
+        None
+    }
+
+    /// Read `data.len()` bytes at byte `offset` within this function's
+    /// BAR window. `&mut self` because a BAR region can be read-to-clear
+    /// (the virtio-pci ISR register: the read returns the pending bits
+    /// AND clears them — there is no separate ACK register). Only invoked
+    /// when [`Self::bar_window`] is `Some` and contains the access; the
+    /// default (all-ones) is never reached for a no-BAR function because
+    /// [`Self::bar_window`] returns `None`.
+    fn bar_read(&mut self, offset: u64, data: &mut [u8]) {
+        let _ = offset;
+        data.fill(0xFF);
+    }
+
+    /// Write `data.len()` bytes at byte `offset` within this function's
+    /// BAR window. Only invoked when [`Self::bar_window`] is `Some` and
+    /// contains the access. The default (drop) is never reached for a
+    /// no-BAR function because [`Self::bar_window`] returns `None`.
+    fn bar_write(&mut self, offset: u64, data: &[u8]) {
+        let _ = (offset, data);
+    }
 }
 
 /// A 4 KiB PCI configuration space with a per-byte write mask.
@@ -122,7 +180,7 @@ pub(crate) struct ConfigSpace {
 }
 
 impl ConfigSpace {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             space: Box::new([0u8; CONFIG_SPACE_SIZE]),
             wmask: Box::new([0u8; CONFIG_SPACE_SIZE]),
@@ -130,9 +188,15 @@ impl ConfigSpace {
     }
 
     /// Read into `data` from byte `reg`. An access that would read past the
-    /// 4 KiB space returns all-ones (qemu `pci_host_config_read_common`
-    /// over-limit behavior) rather than panicking.
-    fn read(&self, reg: u16, data: &mut [u8]) {
+    /// 4 KiB space returns all-ones for the ENTIRE access rather than panicking.
+    /// For an access wholly past the end this matches qemu
+    /// `pci_host_config_read_common` (`limit <= addr` → `~0`); for a STRADDLING
+    /// access (start in-range, end past) it diverges from qemu, which serves the
+    /// in-range bytes (`MIN(len, limit - addr)`). The divergence is unobservable
+    /// and safe: no conformant guest issues a config access crossing the 4 KiB
+    /// boundary (config accesses are naturally aligned, ≤4 bytes), and the
+    /// all-ones fill is non-OOB (the `checked_add` + range guard below).
+    pub(crate) fn read(&self, reg: u16, data: &mut [u8]) {
         let start = reg as usize;
         match start.checked_add(data.len()) {
             Some(end) if end <= CONFIG_SPACE_SIZE => data.copy_from_slice(&self.space[start..end]),
@@ -142,7 +206,7 @@ impl ConfigSpace {
 
     /// Write `data` at byte `reg`, honoring the per-byte write mask. An access
     /// that would write past the 4 KiB space is dropped.
-    fn write(&mut self, reg: u16, data: &[u8]) {
+    pub(crate) fn write(&mut self, reg: u16, data: &[u8]) {
         let start = reg as usize;
         let end = match start.checked_add(data.len()) {
             Some(end) if end <= CONFIG_SPACE_SIZE => end,
@@ -154,19 +218,42 @@ impl ConfigSpace {
         }
     }
 
-    fn set_u8(&mut self, reg: u16, val: u8) {
+    // Init-time setters (bypass the write mask). All callers use compile-time
+    // constant offsets within the 4 KiB space, so an out-of-range `reg` is a
+    // caller bug; each asserts `reg + width <= CONFIG_SPACE_SIZE` so it surfaces
+    // as a clear debug-build assertion rather than an opaque slice-index panic.
+    pub(crate) fn set_u8(&mut self, reg: u16, val: u8) {
+        debug_assert!((reg as usize) < CONFIG_SPACE_SIZE, "config-space set_u8 out of range");
         self.space[reg as usize] = val;
     }
 
-    fn set_u16(&mut self, reg: u16, val: u16) {
+    pub(crate) fn set_u16(&mut self, reg: u16, val: u16) {
         let reg = reg as usize;
+        debug_assert!(reg + 2 <= CONFIG_SPACE_SIZE, "config-space set_u16 out of range");
         self.space[reg..reg + 2].copy_from_slice(&val.to_le_bytes());
     }
 
-    /// Make the 16-bit register at `reg` writable with the given mask.
-    fn set_wmask_u16(&mut self, reg: u16, mask: u16) {
+    pub(crate) fn set_u32(&mut self, reg: u16, val: u32) {
         let reg = reg as usize;
+        debug_assert!(reg + 4 <= CONFIG_SPACE_SIZE, "config-space set_u32 out of range");
+        self.space[reg..reg + 4].copy_from_slice(&val.to_le_bytes());
+    }
+
+    /// Make the 16-bit register at `reg` writable with the given mask.
+    pub(crate) fn set_wmask_u16(&mut self, reg: u16, mask: u16) {
+        let reg = reg as usize;
+        debug_assert!(reg + 2 <= CONFIG_SPACE_SIZE, "config-space set_wmask_u16 out of range");
         self.wmask[reg..reg + 2].copy_from_slice(&mask.to_le_bytes());
+    }
+
+    /// Make the 32-bit register at `reg` writable with the given mask —
+    /// used for a memory BAR: the base-address bits are writable, the
+    /// low type/prefetch bits stay read-only so the guest's BAR-size
+    /// probe (write all-ones, read back) recovers the region size.
+    pub(crate) fn set_wmask_u32(&mut self, reg: u16, mask: u32) {
+        let reg = reg as usize;
+        debug_assert!(reg + 4 <= CONFIG_SPACE_SIZE, "config-space set_wmask_u32 out of range");
+        self.wmask[reg..reg + 4].copy_from_slice(&mask.to_le_bytes());
     }
 }
 
@@ -235,6 +322,31 @@ impl PciBus {
         }
     }
 
+    /// Install `func` at device `slot` (1..[`MAX_DEVICES`); slot 0 is the
+    /// [`HostBridge`]). Setup uses this to attach virtio-net PCI functions.
+    /// A slot-0 or out-of-range install is dropped — a debug assertion catches
+    /// the caller bug in tests, and a `tracing::error!` makes the drop loud in
+    /// release so a NIC silently failing to enumerate (no eth0) is diagnosable
+    /// rather than a mystery. The sole caller passes a compile-time-constant
+    /// slot today; this guards the multi-NIC increment where the slot
+    /// becomes dynamic.
+    pub(crate) fn add_function(&mut self, slot: usize, func: Box<dyn PciFunction>) {
+        debug_assert!(
+            slot != 0 && slot < MAX_DEVICES,
+            "slot 0 is the host bridge; slot must be in 1..{MAX_DEVICES}"
+        );
+        if slot != 0 && slot < MAX_DEVICES {
+            self.funcs[slot] = Some(func);
+        } else {
+            tracing::error!(
+                slot,
+                max = MAX_DEVICES,
+                "PCI function install dropped: slot 0 is the host bridge and \
+                 slot must be in 1..MAX_DEVICES — the device will not enumerate"
+            );
+        }
+    }
+
     /// True when `gpa` falls within this segment's ECAM window — the guard the
     /// MMIO dispatch uses to route an access here.
     pub(crate) fn ecam_contains(&self, gpa: u64) -> bool {
@@ -265,6 +377,50 @@ impl PciBus {
         self.write_config(bus, devfn, reg, data);
     }
 
+    /// True when `gpa` falls within some present function's programmed
+    /// BAR window — the guard the MMIO dispatch uses to route a BAR
+    /// access here (the BAR analog of [`Self::ecam_contains`]). A
+    /// function publishes its window via [`PciFunction::bar_window`],
+    /// which returns `None` until the guest programs the BAR and enables
+    /// memory decode, so an unprogrammed device claims no MMIO.
+    pub(crate) fn bar_mmio_contains(&self, gpa: u64) -> bool {
+        self.bar_owner(gpa).is_some()
+    }
+
+    /// Service a BAR MMIO read: dispatch to the function whose BAR
+    /// window contains `gpa`, at the window-relative offset. `&mut self`
+    /// because a BAR read can be read-to-clear (the virtio-pci ISR). An
+    /// address in no function's window yields all-ones (the PCI
+    /// unmapped-MMIO convention), never a panic.
+    pub(crate) fn bar_mmio_read(&mut self, gpa: u64, data: &mut [u8]) {
+        match self.bar_owner(gpa) {
+            Some((slot, base)) => {
+                self.funcs[slot].as_mut().unwrap().bar_read(gpa - base, data);
+            }
+            None => data.fill(0xFF),
+        }
+    }
+
+    /// Service a BAR MMIO write: dispatch to the owning function at the
+    /// window-relative offset. An address in no function's window is
+    /// dropped.
+    pub(crate) fn bar_mmio_write(&mut self, gpa: u64, data: &[u8]) {
+        if let Some((slot, base)) = self.bar_owner(gpa) {
+            self.funcs[slot].as_mut().unwrap().bar_write(gpa - base, data);
+        }
+    }
+
+    /// Resolve `gpa` to the `(slot, bar_base)` of the present function
+    /// whose programmed BAR window contains it, or `None`. Windows are
+    /// disjoint (each function is assigned a distinct BAR range), so the
+    /// first match is unique.
+    fn bar_owner(&self, gpa: u64) -> Option<(usize, u64)> {
+        self.funcs.iter().enumerate().find_map(|(slot, f)| {
+            let (base, len) = f.as_ref()?.bar_window()?;
+            (gpa >= base && gpa < base + len).then_some((slot, base))
+        })
+    }
+
     /// Latch a type-1 CAM CONFIG_ADDRESS (an I/O write to port 0xCF8).
     pub(crate) fn cam_set_address(&mut self, val: u32) {
         self.config_address = val;
@@ -282,7 +438,9 @@ impl PciBus {
     /// all-ones.
     pub(crate) fn cam_data_read(&self, byte_off: u8, data: &mut [u8]) {
         match self.cam_decode(byte_off) {
-            Some((bus, devfn, reg)) => self.read_config(bus, devfn, reg, data),
+            Some((bus, devfn, reg)) => {
+                self.read_config(bus, devfn, reg, data);
+            }
             None => data.fill(0xFF),
         }
     }
@@ -530,10 +688,16 @@ mod tests {
         // offset 3 — a misaligned multi-byte CONFIG_DATA access the kernel
         // never issues (reg = 0xFC + 3 = 0xFF, len 4 -> spans 0xFF..0x103).
         // Must not panic; ConfigSpace::read bounds-checks within the 4 KiB
-        // backing and returns adjacent in-bounds bytes.
+        // backing and returns adjacent in-bounds bytes (NOT all-ones — this
+        // access stays inside the 4 KiB space, unlike the straddle-past-end
+        // case pinned by overread_past_config_space_is_all_ones_not_panic).
         bus.cam_set_address(cam_addr(0, 0, 0xFC));
         let mut data = [0u8; 4];
         bus.cam_data_read(3, &mut data);
+        // Bytes 0xFF..0x103 of the host bridge config are unpopulated, so the
+        // misaligned in-bounds read serves the real (zero) bytes, pinning that
+        // the behavior is in-bounds-serve, not all-ones and not garbage.
+        assert_eq!(u32::from_le_bytes(data), 0);
     }
 
     #[test]
