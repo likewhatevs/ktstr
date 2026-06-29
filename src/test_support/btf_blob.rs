@@ -52,6 +52,13 @@ const CAST_BTF_KIND_ENUM64: u32 = 19;
 /// `render_float` byte-decode arms run against a real BTF float
 /// instead of a hand-constructed `RenderedValue::Float`.
 const CAST_BTF_KIND_FLOAT: u32 = 16;
+/// `BTF_KIND_VAR` per the BTF spec — kind 14 maps to `Type::Var`. A
+/// named global variable referenced by a `Datasec` var-secinfo. Used by
+/// the watch-bpf-map resolver test to model a `.bss` global.
+const CAST_BTF_KIND_VAR: u32 = 14;
+/// `BTF_KIND_DATASEC` per the BTF spec — kind 15 maps to
+/// `Type::Datasec`. A section (e.g. `.bss`) listing its variables.
+const CAST_BTF_KIND_DATASEC: u32 = 15;
 
 /// Build a minimal BTF blob containing `types` (id=1..) and a
 /// string-section payload `strings` (must start with `\0`). The
@@ -226,6 +233,38 @@ pub(crate) fn cast_build_btf(types: &[CastSynType], strings: &[u8]) -> Vec<u8> {
                 type_section.extend_from_slice(&info.to_le_bytes());
                 type_section.extend_from_slice(&size.to_le_bytes());
             }
+            CastSynType::Var {
+                name_off,
+                type_id,
+                linkage,
+            } => {
+                // BTF_KIND_VAR wire layout: name_off (4) + info (4) +
+                // type (4, the var's type id) + btf_var{ linkage (4) }.
+                type_section.extend_from_slice(&name_off.to_le_bytes());
+                let info = (CAST_BTF_KIND_VAR << 24) & 0x1f00_0000;
+                type_section.extend_from_slice(&info.to_le_bytes());
+                type_section.extend_from_slice(&type_id.to_le_bytes());
+                type_section.extend_from_slice(&linkage.to_le_bytes());
+            }
+            CastSynType::Datasec {
+                name_off,
+                size,
+                vars,
+            } => {
+                // BTF_KIND_DATASEC wire layout: name_off (4) + info (4,
+                // kind|vlen) + size (4, section size) + vlen *
+                // btf_var_secinfo{ type (4), offset (4), size (4) }.
+                type_section.extend_from_slice(&name_off.to_le_bytes());
+                let vlen = vars.len() as u32;
+                let info = ((CAST_BTF_KIND_DATASEC << 24) & 0x1f00_0000) | (vlen & 0xffff);
+                type_section.extend_from_slice(&info.to_le_bytes());
+                type_section.extend_from_slice(&size.to_le_bytes());
+                for (type_id, offset, vsize) in vars {
+                    type_section.extend_from_slice(&type_id.to_le_bytes());
+                    type_section.extend_from_slice(&offset.to_le_bytes());
+                    type_section.extend_from_slice(&vsize.to_le_bytes());
+                }
+            }
         }
     }
 
@@ -354,4 +393,22 @@ pub(crate) enum CastSynType {
     /// float-decode tests so the byte-decode path runs through a real
     /// BTF float rather than a hand-built `RenderedValue::Float`.
     Float { name_off: u32, size: u32 },
+    /// `BTF_KIND_VAR` (kind=14). A named global variable of `type_id`
+    /// with `linkage` (0=static, 1=global-alloc), referenced by a
+    /// [`Datasec`](Self::Datasec) var-secinfo. Models a `.bss` global
+    /// like a scheduler's `sys_stat` for the watch-bpf-map resolver test.
+    Var {
+        name_off: u32,
+        type_id: u32,
+        linkage: u32,
+    },
+    /// `BTF_KIND_DATASEC` (kind=15). A section (e.g. `.bss`) of `size`
+    /// bytes whose `vars` are `(type_id, offset, size)` var-secinfo
+    /// records pointing at [`Var`](Self::Var)s. Models the `.bss`
+    /// section the watch-bpf-map resolver walks for a leading section var.
+    Datasec {
+        name_off: u32,
+        size: u32,
+        vars: Vec<(u32, u32, u32)>,
+    },
 }

@@ -131,7 +131,7 @@ pub(crate) fn load_btf_from_path(path: &Path) -> Result<Btf> {
 /// crashes through this path 2N times. Memoising on first read drops
 /// every subsequent call to a hash lookup + `Arc::clone`.
 ///
-/// `Arc<Btf>` is the storage form because `Btf` (`btf-rs` 1.1.1) does
+/// `Arc<Btf>` is the storage form because `Btf` (`btf-rs` 2.0.0) does
 /// not implement `Clone`; cloning the inner `Arc<BtfObj>` requires
 /// going through the constructor again. `Arc::clone` on the outer
 /// pointer is the cheap shared-handle path.
@@ -1046,6 +1046,120 @@ pub(crate) fn nested_member_byte_offset(
     }
     // Unreachable: the is_last branch returns from inside the loop.
     bail!("btf: nested path '{path}' walk exited unexpectedly")
+}
+
+/// Byte width of an integer-typed BTF value, peeling modifier chains
+/// (`Const`/`Volatile`/`Typedef`/`Restrict`/`TypeTag`). `None` for a
+/// non-integer leaf — a watched scheduler map field is read as a little-endian
+/// integer, so a struct/pointer/float leaf is unsupported.
+fn int_byte_width(btf: &Btf, ty: btf_rs::Type) -> Option<usize> {
+    let mut t = ty;
+    for _ in 0..20 {
+        match t {
+            Type::Int(i) => return Some(i.size()),
+            Type::Const(_)
+            | Type::Volatile(_)
+            | Type::Typedef(_)
+            | Type::Restrict(_)
+            | Type::TypeTag(_) => {
+                t = btf.resolve_chained_type(t.as_btf_type()?).ok()?;
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// Resolve a dot-path within `root` to `(byte_offset_from_root,
+/// leaf_int_width)`. Mirrors [`nested_member_byte_offset`]'s descent but also
+/// returns the leaf integer's BTF-declared byte size (so reads never hardcode
+/// a width). `None` on any resolve failure or a non-integer leaf.
+fn nested_member_offset_and_width(
+    btf: &Btf,
+    root: &btf_rs::Struct,
+    path: &str,
+) -> Option<(usize, usize)> {
+    let parts: Vec<&str> = path.split('.').collect();
+    if parts.is_empty() || parts.iter().any(|p| p.is_empty()) {
+        return None;
+    }
+    let mut current = root.clone();
+    let mut total: usize = 0;
+    for (i, part) in parts.iter().enumerate() {
+        let is_last = i == parts.len() - 1;
+        let (off, member) = member_byte_offset_with_member(btf, &current, part).ok()?;
+        total = total.checked_add(off)?;
+        if is_last {
+            // A bitfield leaf (sub-byte width, kind_flag==1) cannot be read as
+            // a whole little-endian integer without capturing neighbouring
+            // bits, so reject it rather than return a wrong value.
+            // (`member_byte_offset_with_member` already rejects a non-byte-
+            // aligned offset; this additionally rejects a byte-aligned offset
+            // with a sub-byte size.)
+            if member.bitfield_size().is_some() {
+                return None;
+            }
+            let leaf_ty = btf.resolve_chained_type(&member).ok()?;
+            return int_byte_width(btf, leaf_ty).map(|w| (total, w));
+        }
+        current = resolve_member_struct(btf, &member).ok()?;
+    }
+    None
+}
+
+/// Resolve a watched BPF-map field to its `(byte_offset, byte_width)` within
+/// the map's value type. `value_type_id` is `BpfMapInfo.btf_value_type_id`:
+/// either a `.bss`/`.data` DATASEC (the first path segment is a section
+/// variable) or a struct (a named-map value type, e.g. `struct cpu_ctx`).
+/// `path` is the dot-path (`sys_stat.avg_lat_cri`, or a bare member like
+/// `lat_headroom`). Width is the leaf integer's BTF-declared byte size
+/// (u16 -> 2, u32 -> 4). `None` on any resolve failure (zero type id, unknown
+/// section var / member, non-composite non-leaf segment, non-integer leaf, a
+/// bitfield leaf, or a non-byte-aligned member).
+pub(crate) fn resolve_map_field_offset_width(
+    btf: &Btf,
+    value_type_id: u32,
+    path: &str,
+) -> Option<(usize, usize)> {
+    if value_type_id == 0 || path.is_empty() {
+        return None;
+    }
+    match btf.resolve_type_by_id(value_type_id).ok()? {
+        Type::Datasec(ds) => {
+            // The first path segment names a variable in the section; any
+            // remaining segments index into that variable's struct.
+            let (first, rest) = match path.split_once('.') {
+                Some((a, b)) => (a, Some(b)),
+                None => (path, None),
+            };
+            for var_info in &ds.variables {
+                let Ok(Type::Var(var)) = btf.resolve_chained_type(var_info) else {
+                    continue;
+                };
+                if btf.resolve_name(&var).ok().as_deref() != Some(first) {
+                    continue;
+                }
+                let var_off = var_info.offset() as usize;
+                let var_ty = btf.resolve_chained_type(&var).ok()?;
+                return match rest {
+                    // The leaf IS the section variable (a scalar global).
+                    None => Some((var_off, int_byte_width(btf, var_ty)?)),
+                    // Descend into the variable's struct for the rest.
+                    Some(rest) => {
+                        let root = match var_ty {
+                            Type::Struct(s) | Type::Union(s) => s,
+                            _ => return None,
+                        };
+                        let (inner, w) = nested_member_offset_and_width(btf, &root, rest)?;
+                        Some((var_off.checked_add(inner)?, w))
+                    }
+                };
+            }
+            None
+        }
+        Type::Struct(s) | Type::Union(s) => nested_member_offset_and_width(btf, &s, path),
+        _ => None,
+    }
 }
 
 /// Byte offsets for reading struct rq schedstat fields from guest memory.

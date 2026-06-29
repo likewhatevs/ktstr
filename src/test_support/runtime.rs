@@ -1004,6 +1004,15 @@ pub(crate) fn build_vm_builder_base(
         );
     }
 
+    for watch in entry.watch_bpf_maps {
+        builder = builder.watch_bpf_map(
+            watch.map_name_suffix(),
+            watch.field(),
+            watch.agg(),
+            watch.label(),
+        );
+    }
+
     if let Some(disk_cfg) = entry.disk.clone() {
         builder = builder.disk(disk_cfg);
     }

@@ -480,6 +480,198 @@ impl BpfMapWrite {
     }
 }
 
+/// Aggregation for a [`WatchBpfMap`] target.
+///
+/// Picks how a watched field's per-tick reads collapse into run-level
+/// metric key(s). Choose by the field's semantic class: a GAUGE (a current
+/// level — fold as the mean) vs a monotonic COUNTER (an accumulating total —
+/// fold as the final value).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BpfMapAgg {
+    /// A single scalar GAUGE field (e.g. a `.bss` global struct member like
+    /// `sys_stat.avg_lat_cri` — a current level such as latency-criticality
+    /// or headroom). Emits ONE metric key (`<prefix>_<label>`), folded as the
+    /// mean over the run's reporting samples. For a monotonic counter use
+    /// [`BpfMapAgg::ScalarCounter`] instead — a rising counter mean-folded
+    /// here reports a window-average below its final total.
+    Scalar,
+    /// A single scalar monotonic COUNTER field (e.g. a `.bss` global like
+    /// `ktstr_alloc_count` bumped via `__sync_fetch_and_add`). Emits ONE
+    /// metric key (`<prefix>_<label>`), folded as the value at the LAST
+    /// reporting sample — the accumulated total at the end of the monitoring
+    /// window, which is the meaningful count (not the mean of a rising
+    /// series).
+    ScalarCounter,
+    /// A per-CPU array field (a `BPF_MAP_TYPE_PERCPU_ARRAY` value member,
+    /// e.g. `cpu_ctx_stor.lat_headroom`). Emits TWO metric keys: the
+    /// cross-CPU mean (`<prefix>_<label>_avg`) and the cross-CPU spatial
+    /// max (`<prefix>_<label>_max`), each folded over the run's reporting
+    /// samples. The divisor is the count of CPUs that reported a value,
+    /// never the topology CPU count.
+    PerCpu,
+}
+
+/// Host-side, observer-effect-free read of a NAMED scheduler BPF-map field,
+/// surfaced as an assertable run-level metric.
+///
+/// The free-running host monitor resolves the field once (lazily, after the
+/// scheduler attaches and its maps appear) via BTF, then reads it each
+/// monitor tick WITHOUT freezing the guest — turning "the scheduler computed
+/// X" into an assertable metric. Read via
+/// [`crate::vmm::result::VmResult::run_metric`] under the key
+/// `<scheduler-obj>_<label>` (scalar) or `<scheduler-obj>_<label>_{avg,max}`
+/// (per-CPU), e.g. `scx_lavd_avg_lat_cri`, `scx_lavd_lat_headroom_avg`.
+/// `<scheduler-obj>` is libbpf's object name for the active scheduler, which
+/// can differ from its source / ops name (e.g. scx-ktstr's object is
+/// `bpf_bpf`). Each target's `label` must be unique within a test: duplicate
+/// labels resolve to one metric key and are rejected at VM build time.
+///
+/// Construct with [`WatchBpfMap::new`], which const-asserts the field
+/// formats at compile time. Direct struct-literal construction is rejected
+/// (fields are crate-private) so every constructed value passes the gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct WatchBpfMap {
+    map_name_suffix: &'static str,
+    field: &'static str,
+    agg: BpfMapAgg,
+    label: &'static str,
+}
+
+impl WatchBpfMap {
+    /// Const constructor for use in `static`/`const` context.
+    ///
+    /// `map_name_suffix` matches a loaded BPF map by `ends_with` (kernel map
+    /// names truncate to 15 bytes). Unlike [`BpfMapWrite::new`] it does NOT
+    /// require a leading `.`: a watched map may be a section map (`.bss`)
+    /// OR a named map (`cpu_ctx_stor`). `field` is a dot-path into the map's
+    /// value type (`sys_stat.avg_lat_cri`, or a bare `lat_headroom`).
+    /// `label` is the metric-key leaf appended to the scheduler-obj prefix.
+    ///
+    /// # Panics
+    ///
+    /// Panics at compile time when any of `map_name_suffix` / `field` /
+    /// `label` is empty or carries whitespace, a path separator (`/`, `\`),
+    /// or a non-printable / control / high-bit byte. Additionally `field`
+    /// may not have a leading/trailing `.` or a doubled `..` (an empty path
+    /// segment the resolver could never match), and `label` may not contain
+    /// `.` at all (it is a single metric-key leaf, not a path).
+    pub const fn new(
+        map_name_suffix: &'static str,
+        field: &'static str,
+        agg: BpfMapAgg,
+        label: &'static str,
+    ) -> Self {
+        // map_name_suffix: non-empty, printable, no whitespace / separators.
+        // No leading-`.` requirement (matches both `.bss` and `cpu_ctx_stor`).
+        let s = map_name_suffix.as_bytes();
+        assert!(
+            !s.is_empty(),
+            "WatchBpfMap map_name_suffix must not be empty"
+        );
+        let mut i = 0;
+        while i < s.len() {
+            let b = s[i];
+            assert!(
+                b != b' ' && b != b'\t' && b != b'\n' && b != b'\r',
+                "WatchBpfMap map_name_suffix must not contain whitespace",
+            );
+            assert!(
+                b != b'/' && b != b'\\',
+                "WatchBpfMap map_name_suffix must not contain path separators",
+            );
+            assert!(
+                b >= 0x20 && b < 0x7f,
+                "WatchBpfMap map_name_suffix must be printable ASCII only",
+            );
+            i += 1;
+        }
+        // field: non-empty, printable, no whitespace / separators. `.` IS
+        // allowed (dot-path into the value struct) but must separate non-empty
+        // segments — a leading / trailing / doubled `.` is an empty segment
+        // the resolver could never match, so reject it at compile time.
+        let f = field.as_bytes();
+        assert!(!f.is_empty(), "WatchBpfMap field must not be empty");
+        assert!(
+            f[0] != b'.' && f[f.len() - 1] != b'.',
+            "WatchBpfMap field must not start or end with `.` (empty path segment)",
+        );
+        let mut i = 0;
+        while i < f.len() {
+            let b = f[i];
+            assert!(
+                b != b' ' && b != b'\t' && b != b'\n' && b != b'\r',
+                "WatchBpfMap field must not contain whitespace",
+            );
+            assert!(
+                b != b'/' && b != b'\\',
+                "WatchBpfMap field must not contain path separators",
+            );
+            assert!(
+                !(b == b'.' && i > 0 && f[i - 1] == b'.'),
+                "WatchBpfMap field must not contain `..` (empty path segment)",
+            );
+            assert!(
+                b >= 0x20 && b < 0x7f,
+                "WatchBpfMap field must be printable ASCII only",
+            );
+            i += 1;
+        }
+        // label: non-empty, printable, no whitespace / separators / dots
+        // (it is a single metric-key leaf).
+        let l = label.as_bytes();
+        assert!(!l.is_empty(), "WatchBpfMap label must not be empty");
+        let mut i = 0;
+        while i < l.len() {
+            let b = l[i];
+            assert!(
+                b != b' ' && b != b'\t' && b != b'\n' && b != b'\r',
+                "WatchBpfMap label must not contain whitespace",
+            );
+            assert!(
+                b != b'/' && b != b'\\',
+                "WatchBpfMap label must not contain path separators",
+            );
+            assert!(
+                b != b'.',
+                "WatchBpfMap label is a single metric-key leaf and must not contain `.`",
+            );
+            assert!(
+                b >= 0x20 && b < 0x7f,
+                "WatchBpfMap label must be printable ASCII only",
+            );
+            i += 1;
+        }
+        Self {
+            map_name_suffix,
+            field,
+            agg,
+            label,
+        }
+    }
+
+    /// The validated map-name suffix to match (via `ends_with`) against
+    /// loaded BPF maps (e.g. `".bss"`, `"cpu_ctx_stor"`).
+    pub const fn map_name_suffix(&self) -> &'static str {
+        self.map_name_suffix
+    }
+
+    /// The dot-path into the map's value type
+    /// (e.g. `"sys_stat.avg_lat_cri"` or `"lat_headroom"`).
+    pub const fn field(&self) -> &'static str {
+        self.field
+    }
+
+    /// How the per-tick reads aggregate into run-level metric key(s).
+    pub const fn agg(&self) -> BpfMapAgg {
+        self.agg
+    }
+
+    /// The metric-key leaf appended to the scheduler-obj prefix.
+    pub const fn label(&self) -> &'static str {
+        self.label
+    }
+}
+
 /// Gauntlet topology filtering constraints.
 ///
 /// Controls which gauntlet presets are eligible for a test entry.
@@ -1300,6 +1492,14 @@ pub struct KtstrTestEntry {
     /// final signal to the guest so it times out rather than observing
     /// half-applied state.
     pub bpf_map_write: &'static [&'static BpfMapWrite],
+    /// Named scheduler BPF-map fields to read observer-effect-free into
+    /// assertable run-level metrics. The free-running host monitor resolves
+    /// each [`WatchBpfMap`] lazily (after the scheduler attaches and its maps
+    /// appear) and reads it each tick without freezing the guest; the value
+    /// is folded run-level and exposed via
+    /// [`crate::vmm::result::VmResult::run_metric`] under
+    /// `<scheduler-obj>_<label>` (scalar) or `_<label>_{avg,max}` (per-CPU).
+    pub watch_bpf_maps: &'static [&'static WatchBpfMap],
     /// Pin vCPU threads to host cores matching the virtual topology's LLC
     /// structure, use 2MB hugepages for guest memory, NUMA mbind guest
     /// memory to pinned vCPU nodes, and promote vCPU threads to
@@ -1758,6 +1958,7 @@ impl KtstrTestEntry {
         extra_sched_args: &[],
         watchdog_timeout: Duration::from_secs(5),
         bpf_map_write: &[],
+        watch_bpf_maps: &[],
         performance_mode: false,
         no_perf_mode: false,
         duration: Duration::from_secs(12),
@@ -1972,6 +2173,13 @@ impl KtstrTestEntry {
     #[must_use = "builder methods consume self; bind the result"]
     pub fn with_bpf_map_write(mut self, bpf_map_write: &'static [&'static BpfMapWrite]) -> Self {
         self.bpf_map_write = bpf_map_write;
+        self
+    }
+
+    /// Override `watch_bpf_maps`.
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn with_watch_bpf_maps(mut self, watch_bpf_maps: &'static [&'static WatchBpfMap]) -> Self {
+        self.watch_bpf_maps = watch_bpf_maps;
         self
     }
 
@@ -2587,6 +2795,7 @@ mod tests {
         assert!(d.extra_sched_args.is_empty());
         assert_eq!(d.watchdog_timeout, Duration::from_secs(5));
         assert!(d.bpf_map_write.is_empty());
+        assert!(d.watch_bpf_maps.is_empty());
         assert!(!d.performance_mode);
         assert!(!d.no_perf_mode);
         assert_eq!(d.duration, Duration::from_secs(12));
@@ -5160,6 +5369,22 @@ mod tests {
             assert!(
                 std::ptr::eq(*a, *b),
                 "bpf_map_write[{i}] pointer identity drift"
+            );
+        }
+        assert_eq!(
+            from_trait.watch_bpf_maps.len(),
+            from_const.watch_bpf_maps.len(),
+            "watch_bpf_maps count drift"
+        );
+        for (i, (a, b)) in from_trait
+            .watch_bpf_maps
+            .iter()
+            .zip(from_const.watch_bpf_maps.iter())
+            .enumerate()
+        {
+            assert!(
+                std::ptr::eq(*a, *b),
+                "watch_bpf_maps[{i}] pointer identity drift"
             );
         }
         assert_eq!(from_trait.performance_mode, from_const.performance_mode);

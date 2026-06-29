@@ -50,6 +50,7 @@ pub(super) fn emit_entry_static(input: ItemFn, attrs: AttrValues) -> proc_macro2
         workloads,
         staged_schedulers,
         bpf_map_write,
+        watch_bpf_maps,
         post_vm,
         post_vm_unconditional,
         disk,
@@ -219,6 +220,14 @@ pub(super) fn emit_entry_static(input: ItemFn, attrs: AttrValues) -> proc_macro2
         None => quote! { &[] },
     };
 
+    // `watch_bpf_maps = LAVD_LAT` where the const is already a
+    // `&[&WatchBpfMap]` slice — pass it through verbatim (unlike
+    // `bpf_map_write`, which wraps a single const into a one-element slice).
+    let watch_bpf_maps_tokens = match &watch_bpf_maps {
+        Some(p) => quote! { #p },
+        None => quote! { &[] },
+    };
+
     // Emit `Option<&'static Payload>` for the primary payload. The
     // user supplies a path (`&FIO` equivalent in source), so we
     // wrap it in `Some(&#p)` at emission time to preserve the
@@ -368,6 +377,11 @@ pub(super) fn emit_entry_static(input: ItemFn, attrs: AttrValues) -> proc_macro2
         bpf_map_write.is_some(),
         quote! { bpf_map_write },
         quote! { #bpf_map_write_tokens },
+    );
+    let watch_bpf_maps_field = entry_field(
+        watch_bpf_maps.is_some(),
+        quote! { watch_bpf_maps },
+        quote! { #watch_bpf_maps_tokens },
     );
     let performance_mode_field = entry_field(
         performance_mode_set,
@@ -664,6 +678,7 @@ pub(super) fn emit_entry_static(input: ItemFn, attrs: AttrValues) -> proc_macro2
             #extra_sched_args_field
             #watchdog_timeout_field
             #bpf_map_write_field
+            #watch_bpf_maps_field
             #performance_mode_field
             #no_perf_mode_field
             #duration_field

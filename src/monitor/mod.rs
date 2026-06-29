@@ -453,6 +453,13 @@ pub struct MonitorSample {
     /// decoded at the [`MonitorSummary`] fold.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub psi_irq: Option<PsiIrqSample>,
+    /// Watched scheduler BPF-map fields read at this sample (one entry per
+    /// declared [`crate::test_support::WatchBpfMap`] target that has resolved).
+    /// Empty until the scheduler attaches and its maps appear (lazy
+    /// resolution) and when no targets are declared. Folded run-level at
+    /// [`MonitorSummary`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bpf_map_fields: Vec<BpfMapFieldSample>,
 }
 
 /// System-wide PSI-irq pressure read from `psi_system` at one monitor sample.
@@ -473,6 +480,39 @@ pub struct PsiIrqSample {
     pub total_ns: u64,
 }
 
+/// One watched scheduler BPF-map field ([`crate::test_support::WatchBpfMap`])
+/// captured at a single monitor sample, read observer-effect-free (the live
+/// host reads the running guest's map memory; no VM freeze). Values are
+/// decoded to `f64` at read time (the field's BTF width — u16/u32 — is
+/// resolved once when the map first appears). Exactly one of `scalar` /
+/// `per_cpu` is `Some`, matching the target's [`crate::test_support::BpfMapAgg`].
+/// Folded run-level at [`MonitorSummary`]: a gauge `scalar` -> mean across
+/// reporting samples; a counter `scalar` (`scalar_counter`) -> the value at
+/// the last reporting sample; `per_cpu` -> cross-(CPU, sample) mean (`_avg`) +
+/// spatial max (`_max`).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct BpfMapFieldSample {
+    /// Final metric-key base `<scheduler-obj>_<label>` (e.g.
+    /// `scx_lavd_lat_headroom`). The fold appends `_avg`/`_max` for per-CPU;
+    /// scalar uses the base verbatim.
+    pub key_base: String,
+    /// Scalar field value (a `.bss` global struct member) at this sample.
+    /// Mutually exclusive with `per_cpu`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scalar: Option<f64>,
+    /// Per-CPU field values (a `PERCPU_ARRAY` value member), reporting CPUs
+    /// only. Mutually exclusive with `scalar`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub per_cpu: Option<Vec<f64>>,
+    /// True when `scalar` is a monotonic counter
+    /// ([`crate::test_support::BpfMapAgg::ScalarCounter`]): the run-level fold
+    /// takes the value at the last reporting sample (the accumulated total)
+    /// instead of the mean. `false` (the serde default) folds `scalar` as the
+    /// mean (a gauge). Ignored when `per_cpu` is `Some`.
+    #[serde(default)]
+    pub scalar_counter: bool,
+}
+
 impl MonitorSample {
     /// Create a sample with no prog_stats / psi_irq.
     pub fn new(elapsed_ms: u64, cpus: Vec<CpuSnapshot>) -> Self {
@@ -481,6 +521,7 @@ impl MonitorSample {
             cpus,
             prog_stats: None,
             psi_irq: None,
+            bpf_map_fields: Vec::new(),
         }
     }
 
@@ -818,6 +859,15 @@ pub struct MonitorSummary {
     /// None when no struct_ops programs are loaded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prog_stats_deltas: Option<Vec<ProgStatsDelta>>,
+    /// Folded watched-scheduler-BPF-map-field metrics over the monitoring
+    /// window: one entry per Dynamic run-level metric key (a scalar target
+    /// emits one key; a per-CPU target emits `_avg` + `_max`). None when no
+    /// [`crate::test_support::WatchBpfMap`] target was declared OR none
+    /// resolved (the scheduler never attached / the map never appeared) —
+    /// loud-absent, so `run_metric` returns None and an assertion fails
+    /// rather than reading a false 0.0. See [`BpfMapFieldValue`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bpf_map_fields: Option<Vec<BpfMapFieldValue>>,
 }
 
 /// Per-program BPF callback profile computed from first/last monitor samples.
@@ -831,6 +881,24 @@ pub struct ProgStatsDelta {
     pub nsecs: u64,
     /// Average nanoseconds per call (nsecs / cnt). 0 when cnt is 0.
     pub nsecs_per_call: f64,
+}
+
+/// A folded watched-scheduler-BPF-map-field metric: a Dynamic run-level metric
+/// key and its value, ready to insert into the run-level ext map. Built by
+/// [`MonitorSummary::from_samples`] from the per-sample [`BpfMapFieldSample`]s
+/// and surfaced via [`MonitorSummary::fold_run_level_ext`] (and thus
+/// [`crate::vmm::result::VmResult::run_metric`]). A scalar gauge target yields
+/// one value (`<prefix>_<label>`, the mean over reporting samples); a scalar
+/// counter target yields one value (`<prefix>_<label>`, the last reporting
+/// sample's value); a per-CPU target yields two (`_avg` = cross-(CPU, sample)
+/// mean, `_max` = spatial max).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct BpfMapFieldValue {
+    /// The Dynamic run-level metric key (e.g. `scx_lavd_avg_lat_cri`,
+    /// `scx_lavd_lat_headroom_avg`).
+    pub key: String,
+    /// The folded value.
+    pub value: f64,
 }
 
 /// Aggregate schedstat deltas computed from first/last monitor samples.
@@ -1018,6 +1086,16 @@ impl MonitorSummary {
                     .or_insert(d.alb_pushed as f64);
             }
         }
+        // Watched scheduler BPF-map fields: Dynamic, scheduler-obj-prefixed
+        // keys built at fold time (the target/scheduler set is runtime, so a
+        // fixed typed-metric enum cannot enumerate them — same rationale as
+        // the level-suffixed sched_domain_lb keys above). Absent targets emit
+        // nothing (loud-absent).
+        if let Some(fields) = &self.bpf_map_fields {
+            for f in fields {
+                ext.entry(f.key.clone()).or_insert(f.value);
+            }
+        }
     }
 
     /// Like [`from_samples`](Self::from_samples) but uses an explicit
@@ -1159,6 +1237,7 @@ impl MonitorSummary {
         let schedstat_deltas = Self::compute_schedstat_deltas(samples);
         let sched_domain_lb = Self::compute_sched_domain_deltas(samples);
         let prog_stats_deltas = Self::compute_prog_stats_deltas(samples);
+        let bpf_map_fields = Self::compute_bpf_map_field_deltas(samples);
 
         Self {
             total_samples: samples.len(),
@@ -1176,6 +1255,7 @@ impl MonitorSummary {
             schedstat_deltas,
             sched_domain_lb,
             prog_stats_deltas,
+            bpf_map_fields,
         }
     }
 
@@ -1352,10 +1432,12 @@ impl MonitorSummary {
                     let Some(st) = d.stats.as_ref() else {
                         continue;
                     };
-                    let e = acc.entry(d.name.clone()).or_insert_with(|| SchedDomainLbDelta {
-                        level: d.name.clone(),
-                        ..SchedDomainLbDelta::default()
-                    });
+                    let e = acc
+                        .entry(d.name.clone())
+                        .or_insert_with(|| SchedDomainLbDelta {
+                            level: d.name.clone(),
+                            ..SchedDomainLbDelta::default()
+                        });
                     e.lb_count += sum3(&st.lb_count);
                     e.lb_failed += sum3(&st.lb_failed);
                     e.lb_gained += sum3(&st.lb_gained);
@@ -1449,6 +1531,88 @@ impl MonitorSummary {
         } else {
             Some(deltas)
         }
+    }
+
+    /// Fold the per-sample watched BPF-map field reads
+    /// ([`MonitorSample::bpf_map_fields`]) into run-level Dynamic metrics.
+    /// Grouped by `key_base`: a scalar GAUGE target yields one value (mean
+    /// over the reporting samples, key `key_base`); a scalar COUNTER target
+    /// (`scalar_counter`) yields one value (the LAST reporting sample's value,
+    /// key `key_base` — the accumulated total at end-of-window); a per-CPU
+    /// target yields two (`<key_base>_avg` = mean over all reporting (CPU,
+    /// sample) readings, `<key_base>_max` = spatial max across them). The
+    /// gauge/per-CPU divisor is the count of reporting readings, never the
+    /// topology CPU/sample count, so a kernel/scheduler that never reported a
+    /// target is loud-absent (no key) rather than a false 0.0. `None` when no
+    /// target reported in any sample. `BTreeMap` keys give a deterministic
+    /// metric ordering.
+    fn compute_bpf_map_field_deltas(samples: &[MonitorSample]) -> Option<Vec<BpfMapFieldValue>> {
+        use std::collections::BTreeMap;
+        struct Acc {
+            scalar_sum: f64,
+            scalar_n: usize,
+            scalar_last: f64,
+            scalar_counter: bool,
+            pc_sum: f64,
+            pc_n: usize,
+            pc_max: f64,
+        }
+        let mut accs: BTreeMap<&str, Acc> = BTreeMap::new();
+        for s in samples {
+            for f in &s.bpf_map_fields {
+                let a = accs.entry(f.key_base.as_str()).or_insert(Acc {
+                    scalar_sum: 0.0,
+                    scalar_n: 0,
+                    scalar_last: 0.0,
+                    scalar_counter: false,
+                    pc_sum: 0.0,
+                    pc_n: 0,
+                    pc_max: f64::NEG_INFINITY,
+                });
+                if let Some(v) = f.scalar {
+                    a.scalar_sum += v;
+                    a.scalar_n += 1;
+                    a.scalar_last = v;
+                    a.scalar_counter = f.scalar_counter;
+                }
+                if let Some(vs) = &f.per_cpu {
+                    for &v in vs {
+                        a.pc_sum += v;
+                        a.pc_n += 1;
+                        if v > a.pc_max {
+                            a.pc_max = v;
+                        }
+                    }
+                }
+            }
+        }
+        let mut out: Vec<BpfMapFieldValue> = Vec::new();
+        for (key_base, a) in accs {
+            if a.scalar_n > 0 {
+                // Counter -> last reporting sample's value (accumulated total);
+                // gauge -> mean over the reporting samples.
+                let value = if a.scalar_counter {
+                    a.scalar_last
+                } else {
+                    a.scalar_sum / a.scalar_n as f64
+                };
+                out.push(BpfMapFieldValue {
+                    key: key_base.to_string(),
+                    value,
+                });
+            }
+            if a.pc_n > 0 {
+                out.push(BpfMapFieldValue {
+                    key: format!("{key_base}_avg"),
+                    value: a.pc_sum / a.pc_n as f64,
+                });
+                out.push(BpfMapFieldValue {
+                    key: format!("{key_base}_max"),
+                    value: a.pc_max,
+                });
+            }
+        }
+        if out.is_empty() { None } else { Some(out) }
     }
 }
 

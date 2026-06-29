@@ -10612,6 +10612,26 @@ impl KtstrVm {
             return Ok(None);
         };
 
+        // `watch_bpf_maps` prep: the vmlinux BTF is the split-base for per-map
+        // program-BTF loads; `prog_offsets` is cloned because the
+        // `prog_stats_ctx` builder below consumes the original; the test
+        // entry's `WatchBpfMap` list is lowered to the monitor-local target
+        // form. All are moved into the monitor closure and consumed there
+        // only when the test declared watch targets.
+        let btf = Arc::new(btf);
+        let watch_prog_offsets = prog_offsets.clone();
+        let watch_targets: Vec<monitor::reader::WatchBpfMapTarget> = self
+            .watch_bpf_maps
+            .iter()
+            .map(|p| monitor::reader::WatchBpfMapTarget {
+                map_suffix: p.map_name_suffix.clone(),
+                field: p.field.clone(),
+                per_cpu: matches!(p.agg, crate::test_support::BpfMapAgg::PerCpu),
+                counter: matches!(p.agg, crate::test_support::BpfMapAgg::ScalarCounter),
+                label: p.label.clone(),
+            })
+            .collect();
+
         let mem = match vm.numa_layout.as_ref() {
             Some(layout) => monitor::reader::GuestMem::from_layout(layout, &vm.guest_mem),
             None => {
@@ -10636,6 +10656,10 @@ impl KtstrVm {
                 unsafe { monitor::reader::GuestMem::new(host_base, mem_size) }
             }
         };
+        // Share guest DRAM between the sampling loop (which borrows `&*mem`)
+        // and the `watch_bpf_maps` watcher's owned map accessor (which holds
+        // an `Arc::clone`) — both read-only over the same backing.
+        let mem = Arc::new(mem);
         let num_cpus = self.topology.total_cpus();
         let kill_clone = kill.clone();
         let kill_evt_clone = kill_evt.clone();
@@ -11318,6 +11342,33 @@ impl KtstrVm {
                         reset_ns: watchdog_reset_ns.as_ref(),
                     },
                 );
+                // Named-BPF-map watch config: present only when the test
+                // declared targets AND the BPF-prog offsets + `prog_idr`
+                // resolved (both required for the active-scheduler obj-prefix
+                // walk that keys the metrics). The watcher lazily builds a
+                // guest-memory accessor + reads each target per tick.
+                let watch_cfg = if watch_targets.is_empty() {
+                    None
+                } else {
+                    match (watch_prog_offsets, symbols.prog_idr) {
+                        (Some(prog_offsets), Some(prog_idr_kva)) => {
+                            Some(monitor::reader::WatchBpfMapsCfg {
+                                targets: watch_targets,
+                                mem: Arc::clone(&mem),
+                                vmlinux: vmlinux.clone(),
+                                vmlinux_data: Arc::clone(&vmlinux_data_arc),
+                                base_btf: Arc::clone(&btf),
+                                cr3_pa,
+                                tcr_el1: tcr_el1_val,
+                                l5,
+                                prog_idr_kva,
+                                prog_offsets,
+                                num_cpus,
+                            })
+                        }
+                        _ => None,
+                    }
+                };
                 let mon_cfg = monitor::reader::MonitorConfig {
                     // `event_pcpu_pas` left `None` here: the loop
                     // recomputes it each iteration via
@@ -11360,6 +11411,7 @@ impl KtstrVm {
                         }
                     }),
                     watchdog_reset: watchdog_reset_cfg,
+                    watch_bpf_maps: watch_cfg.as_ref(),
                 };
                 // `rq_pas` empty: the loop sources every per-CPU
                 // PA from `rq_refresh` per iteration so the static

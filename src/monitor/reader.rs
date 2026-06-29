@@ -12,17 +12,21 @@
 //! The monitor loop (`monitor_loop`) periodically reads per-CPU
 //! runqueue state from guest memory and collects `MonitorSample`s.
 
+use super::bpf_map::{BpfMapAccessor, BpfMapInfo, GuestMemMapAccessorOwned};
+use super::bpf_prog::find_active_struct_ops_obj_no_target;
 use super::btf_offsets::{
-    CPU_MAX_IDLE_TYPES, KernelOffsets, SchedDomainOffsets, SchedDomainStatsOffsets,
-    SchedstatOffsets, ScxEventOffsets,
+    BpfProgOffsets, CPU_MAX_IDLE_TYPES, KernelOffsets, SchedDomainOffsets, SchedDomainStatsOffsets,
+    SchedstatOffsets, ScxEventOffsets, resolve_map_field_offset_width,
 };
 use super::{
-    CpuSnapshot, Kva, MonitorSample, RqSchedstat, SchedDomainSnapshot, SchedDomainStats,
-    ScxEventCounters,
+    BpfMapFieldSample, CpuSnapshot, Kva, MonitorSample, RqSchedstat, SchedDomainSnapshot,
+    SchedDomainStats, ScxEventCounters,
 };
 use crate::sync::MutexExt;
 
 use std::os::unix::io::AsRawFd;
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use vmm_sys_util::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
@@ -1348,7 +1352,9 @@ pub(crate) fn read_rq_stats(mem: &GuestMem, rq_pa: u64, offsets: &KernelOffsets)
         scx_flags: mem.read_u32(rq_pa, offsets.rq_scx + offsets.scx_rq_flags),
         // PELT IRQ load: one u64 read at the resolved nested offset, or
         // None when CONFIG_HAVE_SCHED_AVG_IRQ is off (offset unresolved).
-        avg_irq_util: offsets.rq_avg_irq_util_avg.map(|off| mem.read_u64(rq_pa, off)),
+        avg_irq_util: offsets
+            .rq_avg_irq_util_avg
+            .map(|off| mem.read_u64(rq_pa, off)),
         event_counters: None,
         schedstat: None,
         vcpu_cpu_time_ns: None,
@@ -2131,6 +2137,12 @@ pub(crate) struct MonitorConfig<'a> {
     /// `None` (test path or kernels with no `scx_root` symbol)
     /// disables attach detection.
     pub watchdog_reset: Option<WatchdogReset<'a>>,
+    /// Named scheduler BPF-map fields to read observer-effect-free into
+    /// run-level metrics. `Some` only when the test declared
+    /// `watch_bpf_maps`; the loop lazily builds a guest-memory accessor from
+    /// it (post-attach) and reads each target per tick into
+    /// [`MonitorSample::bpf_map_fields`].
+    pub watch_bpf_maps: Option<&'a WatchBpfMapsCfg>,
 }
 
 /// Inputs the monitor needs to push a watchdog-reset deadline when
@@ -2159,6 +2171,226 @@ pub(crate) struct WatchdogReset<'a> {
     /// Duration::from_nanos(value)` as its hard deadline (capped
     /// at the original `timeout`-derived deadline).
     pub reset_ns: &'a AtomicU64,
+}
+
+/// One watched scheduler BPF-map field, in monitor-local form. Lowered from
+/// the test entry's `WatchBpfMap` at the coordinator boundary so the monitor
+/// layer does not depend on the test-support / vmm types.
+#[derive(Clone)]
+pub(crate) struct WatchBpfMapTarget {
+    /// Map-name suffix matched via `ends_with` (`.bss`, `cpu_ctx_stor`).
+    pub map_suffix: String,
+    /// Dot-path into the map value type (`sys_stat.avg_lat_cri` / `lat_headroom`).
+    pub field: String,
+    /// True for a per-CPU array field (emits `_avg` + `_max`); false for scalar.
+    pub per_cpu: bool,
+    /// True for a scalar monotonic counter (folded as the final reporting
+    /// sample's value); false for a scalar gauge (mean-folded). Ignored when
+    /// `per_cpu` is true.
+    pub counter: bool,
+    /// Metric-key leaf appended to the resolved scheduler-obj prefix.
+    pub label: String,
+}
+
+/// Inputs the free-running monitor needs to read named scheduler BPF-map
+/// fields observer-effect-free. Built once in `start_monitor` and borrowed by
+/// [`monitor_loop`]; the loop lazily builds a guest-memory map accessor from
+/// these (after the scheduler attaches) and reads each target per tick.
+pub(crate) struct WatchBpfMapsCfg {
+    /// The declared targets.
+    pub targets: Vec<WatchBpfMapTarget>,
+    /// Guest DRAM, Arc-shared with the loop's `&GuestMem`; the owned accessor
+    /// clones this Arc (same backing, no borrow conflict).
+    pub mem: Arc<GuestMem>,
+    /// vmlinux path (BTF sidecar cache key).
+    pub vmlinux: PathBuf,
+    /// Raw vmlinux bytes (re-parsed into a goblin ELF in-loop + BTF fallback).
+    pub vmlinux_data: Arc<Vec<u8>>,
+    /// Vmlinux BTF — the split-base for per-map program-BTF loads.
+    pub base_btf: Arc<btf_rs::Btf>,
+    /// Top-level page-table PA (CR3 / TTBR1), run-stable; captured once.
+    pub cr3_pa: u64,
+    /// aarch64 TCR_EL1 (0 on x86_64), run-stable.
+    pub tcr_el1: u64,
+    /// x86 5-level paging flag.
+    pub l5: bool,
+    /// `prog_idr` head KVA (for the active-scheduler obj-prefix walk).
+    pub prog_idr_kva: u64,
+    /// Resolved BPF-prog struct offsets (for the obj-prefix walk).
+    pub prog_offsets: BpfProgOffsets,
+    /// Online CPU count (for per-CPU array reads).
+    pub num_cpus: u32,
+}
+
+/// A resolved watched target: the located map + leaf (offset, width) + the
+/// final metric-key base. Cached on first successful resolve.
+struct ResolvedWatch {
+    map: BpfMapInfo,
+    offset: usize,
+    width: usize,
+    per_cpu: bool,
+    counter: bool,
+    key_base: String,
+}
+
+/// Lazily resolves + reads the [`WatchBpfMapsCfg`] targets from the
+/// free-running monitor. The accessor and the scheduler-obj prefix are built
+/// once after the scheduler attaches (tolerating not-yet-present without
+/// error); each target's (map, offset, width) is cached on first resolve;
+/// subsequent ticks re-read only the leaf bytes.
+///
+/// v0 limitation: the obj prefix + per-target resolution are latched
+/// permanently. A mid-run `Op::ReplaceScheduler` frees the outgoing
+/// scheduler's maps and attaches a new instance at a new map KVA, but the
+/// watcher keeps reading the stale (freed) KVA — re-resolving on the
+/// scheduler-attach edge is a follow-up. The scenarios this targets attach a
+/// single scheduler at boot and do not replace it mid-run.
+struct BpfMapWatcher<'a> {
+    cfg: &'a WatchBpfMapsCfg,
+    accessor: Option<GuestMemMapAccessorOwned>,
+    obj_prefix: Option<String>,
+    resolved: Vec<Option<ResolvedWatch>>,
+}
+
+/// Decode the first `width` bytes of `bytes` as a little-endian unsigned
+/// integer (width 1/2/4/8). `None` if `bytes` is shorter than `width` or the
+/// width is unsupported. The guest is little-endian (x86_64 / aarch64).
+fn le_uint(bytes: &[u8], width: usize) -> Option<u64> {
+    if !matches!(width, 1 | 2 | 4 | 8) || bytes.len() < width {
+        return None;
+    }
+    let mut v: u64 = 0;
+    for (i, &b) in bytes[..width].iter().enumerate() {
+        v |= (b as u64) << (8 * i);
+    }
+    Some(v)
+}
+
+impl<'a> BpfMapWatcher<'a> {
+    fn new(cfg: &'a WatchBpfMapsCfg) -> Self {
+        let mut resolved = Vec::with_capacity(cfg.targets.len());
+        resolved.resize_with(cfg.targets.len(), || None);
+        Self {
+            cfg,
+            accessor: None,
+            obj_prefix: None,
+            resolved,
+        }
+    }
+
+    /// Read all resolvable targets this tick. Lazily builds the accessor +
+    /// obj-prefix + per-target resolution; returns the per-sample readings
+    /// (empty until the scheduler attaches and at least one target resolves).
+    /// The monitor produces `key_base` only; the `MonitorSummary` fold appends
+    /// `_avg`/`_max` for per-CPU targets.
+    fn sample(
+        &mut self,
+        page_offset: u64,
+        phys_base: u64,
+        start_kernel_map: u64,
+    ) -> Vec<BpfMapFieldSample> {
+        let cfg = self.cfg;
+        // Lazily build the owned accessor once the guest has booted far enough
+        // for phys_base/page tables to be valid. Tolerate failure (retry next
+        // tick) — pre-attach the maps simply do not exist yet.
+        if self.accessor.is_none() {
+            self.accessor = goblin::elf::Elf::parse(&cfg.vmlinux_data).ok().and_then(|elf| {
+                GuestMemMapAccessorOwned::from_elf_with_hint(
+                    Arc::clone(&cfg.mem),
+                    &elf,
+                    &cfg.vmlinux_data,
+                    &cfg.vmlinux,
+                    cfg.tcr_el1,
+                    cfg.cr3_pa,
+                    phys_base,
+                )
+                .ok()
+            });
+        }
+        let Some(owned) = self.accessor.as_ref() else {
+            return Vec::new();
+        };
+        let accessor = owned.as_accessor();
+        // Lazily resolve the active scheduler's obj prefix (e.g. `scx_lavd`),
+        // which keys the metrics. `None` until a STRUCT_OPS scheduler attaches.
+        if self.obj_prefix.is_none() {
+            let walk = WalkContext {
+                cr3_pa: cfg.cr3_pa,
+                page_offset,
+                l5: cfg.l5,
+                tcr_el1: cfg.tcr_el1,
+            };
+            self.obj_prefix = find_active_struct_ops_obj_no_target(
+                &cfg.mem,
+                walk,
+                cfg.prog_idr_kva,
+                &cfg.prog_offsets,
+                accessor.offsets(),
+                start_kernel_map,
+                phys_base,
+            )
+            .map(|m| m.obj_name);
+        }
+        let Some(prefix) = self.obj_prefix.clone() else {
+            return Vec::new();
+        };
+        let mut out: Vec<BpfMapFieldSample> = Vec::new();
+        for (i, t) in cfg.targets.iter().enumerate() {
+            if self.resolved[i].is_none()
+                && let Some(map) = accessor.find_map(&t.map_suffix)
+            {
+                // Resolve the dot-path against the map's PROGRAM BTF (the
+                // scheduler's own types), falling back to vmlinux BTF.
+                let prog_btf = accessor.load_program_btf(&map, &cfg.base_btf);
+                let btf = prog_btf.as_ref().unwrap_or(&cfg.base_btf);
+                if let Some((offset, width)) =
+                    resolve_map_field_offset_width(btf, map.btf_value_type_id, &t.field)
+                {
+                    self.resolved[i] = Some(ResolvedWatch {
+                        map,
+                        offset,
+                        width,
+                        per_cpu: t.per_cpu,
+                        counter: t.counter,
+                        key_base: format!("{prefix}_{}", t.label),
+                    });
+                }
+            }
+            let Some(r) = self.resolved[i].as_ref() else {
+                continue;
+            };
+            if r.per_cpu {
+                let per_cpu_bytes = accessor.read_percpu_array(&r.map, 0, cfg.num_cpus);
+                let vals: Vec<f64> = per_cpu_bytes
+                    .iter()
+                    .filter_map(|opt| {
+                        opt.as_ref()
+                            .and_then(|b| b.get(r.offset..r.offset + r.width))
+                            .and_then(|s| le_uint(s, r.width))
+                            .map(|u| u as f64)
+                    })
+                    .collect();
+                if !vals.is_empty() {
+                    out.push(BpfMapFieldSample {
+                        key_base: r.key_base.clone(),
+                        scalar: None,
+                        per_cpu: Some(vals),
+                        scalar_counter: false,
+                    });
+                }
+            } else if let Some(bytes) = accessor.read_value(&r.map, r.offset, r.width)
+                && let Some(u) = le_uint(&bytes, r.width)
+            {
+                out.push(BpfMapFieldSample {
+                    key_base: r.key_base.clone(),
+                    scalar: Some(u as f64),
+                    per_cpu: None,
+                    scalar_counter: r.counter,
+                });
+            }
+        }
+        out
+    }
 }
 
 /// Run the monitor loop, sampling all CPUs at the given interval
@@ -2421,6 +2653,12 @@ pub(crate) fn monitor_loop(
         };
     }
     let mut epoll_buf = [EpollEvent::default(); 2];
+
+    // Watcher for named scheduler BPF-map fields (#[ktstr_test(watch_bpf_maps)]).
+    // `None` when no targets were declared; otherwise it lazily builds a
+    // guest-memory accessor + resolves each target after the scheduler attaches
+    // and reads them per tick into `MonitorSample::bpf_map_fields`.
+    let mut bpf_watcher = cfg.watch_bpf_maps.map(BpfMapWatcher::new);
 
     loop {
         if kill.load(Ordering::Acquire) {
@@ -2864,7 +3102,21 @@ pub(crate) fn monitor_loop(
             None
         };
 
+        // Named scheduler BPF-map field reads. Gated on `data_valid` (same as
+        // prog_stats / psi_irq) so only post-boot, post-attach readings fold
+        // into the run-level metrics; lazily resolves the maps the first time
+        // the scheduler is present.
+        let bpf_map_fields = if data_valid {
+            bpf_watcher
+                .as_mut()
+                .map(|w| w.sample(page_offset, phys_base, start_kernel_map))
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
         samples.push(MonitorSample {
+            bpf_map_fields,
             elapsed_ms: run_start.elapsed().as_millis() as u64,
             cpus: cpus.clone(),
             prog_stats,
@@ -2978,6 +3230,27 @@ mod tests {
 
     const THRESHOLD_NS: u64 = 10_000_000;
 
+    /// `le_uint` decodes 1/2/4/8-byte little-endian unsigned integers and
+    /// rejects a short slice or an unsupported width (the watched-map reader
+    /// decodes leaf bytes by their BTF width).
+    #[test]
+    fn le_uint_decodes_supported_widths() {
+        assert_eq!(le_uint(&[0x34, 0x12], 2), Some(0x1234));
+        assert_eq!(le_uint(&[0x78, 0x56, 0x34, 0x12], 4), Some(0x1234_5678));
+        assert_eq!(le_uint(&[0xff], 1), Some(0xff));
+        assert_eq!(
+            le_uint(&[1, 0, 0, 0, 0, 0, 0, 0], 8),
+            Some(1),
+            "8-byte LE",
+        );
+        // Reads only `width` bytes even when more are present.
+        assert_eq!(le_uint(&[0x34, 0x12, 0xff, 0xff], 2), Some(0x1234));
+        // Short slice / unsupported width -> None.
+        assert_eq!(le_uint(&[0x12], 2), None);
+        assert_eq!(le_uint(&[1, 2, 3], 3), None);
+        assert_eq!(le_uint(&[], 0), None);
+    }
+
     #[test]
     fn evaluate_preempted_both_none_is_not_preempted() {
         assert!(!evaluate_preempted(None, None, THRESHOLD_NS));
@@ -3076,6 +3349,7 @@ mod tests {
             rq_refresh: None,
             psi: None,
             watchdog_reset: None,
+            watch_bpf_maps: None,
         }
     }
 

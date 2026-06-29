@@ -149,8 +149,8 @@ pub(crate) use contention::{
 pub(crate) use pi_mutex::PiMutex;
 pub(crate) use terminal::TerminalRawGuard;
 pub(crate) use vcpu::{
-    BpfMapWriteParams, ImmediateExitHandle, register_vcpu_signal_handler, set_thread_cpumask,
-    vcpu_signal,
+    BpfMapWriteParams, ImmediateExitHandle, WatchBpfMapParams, register_vcpu_signal_handler,
+    set_thread_cpumask, vcpu_signal,
 };
 pub(crate) use vmlinux::find_vmlinux;
 
@@ -345,6 +345,13 @@ pub struct KtstrVm {
     /// before the guest is signaled via SHM slot 0, so the guest
     /// sees a single unblock regardless of how many writes ran.
     pub(crate) bpf_map_writes: Vec<BpfMapWriteParams>,
+    /// Named scheduler BPF-map fields to read observer-effect-free from the
+    /// free-running monitor into run-level metrics (lowered from the test
+    /// entry's `watch_bpf_maps`). The monitor resolves + reads each lazily
+    /// after the scheduler attaches; values surface via
+    /// [`crate::vmm::result::VmResult::run_metric`] under
+    /// `<scheduler-obj>_<label>` / `_<label>_{avg,max}`.
+    pub(crate) watch_bpf_maps: Vec<WatchBpfMapParams>,
     /// Performance mode: vCPU pinning to host LLCs, hugepage-backed
     /// guest memory, NUMA mbind, and RT scheduling on both
     /// architectures. On x86_64, additionally: KVM_HINTS_REALTIME

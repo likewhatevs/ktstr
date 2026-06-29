@@ -21,8 +21,9 @@ pub(crate) fn option_tokens<T: ToTokens>(opt: &Option<T>) -> proc_macro2::TokenS
 /// Extract a [`syn::Path`] from an attribute value, returning a focused
 /// error spanned to the offending expression when the user supplied
 /// something other than a path (an int, a string, an array, …).
-/// Collapses the six `"scheduler" | "payload" | "bpf_map_write" | "post_vm" |
-/// "post_vm_unconditional" | "disk"` parse arms onto a single shape.
+/// Collapses the seven `"scheduler" | "payload" | "bpf_map_write" |
+/// "watch_bpf_maps" | "post_vm" | "post_vm_unconditional" | "disk"` parse
+/// arms onto a single shape.
 fn expect_path_value(value: &syn::Expr, error_hint: &str) -> Result<syn::Path, syn::Error> {
     match value {
         syn::Expr::Path(ep) => Ok(ep.path.clone()),
@@ -335,6 +336,7 @@ pub(crate) const VALUE_ATTR_NAMES: &[&str] = &[
     "workloads",
     "staged_schedulers",
     "bpf_map_write",
+    "watch_bpf_maps",
     "post_vm",
     "post_vm_unconditional",
     "disk",
@@ -424,6 +426,7 @@ pub(crate) struct AttrValues {
     pub(crate) workloads: Option<Vec<syn::Path>>,
     pub(crate) staged_schedulers: Option<Vec<syn::Path>>,
     pub(crate) bpf_map_write: Option<syn::Path>,
+    pub(crate) watch_bpf_maps: Option<syn::Path>,
     pub(crate) post_vm: Option<syn::Path>,
     pub(crate) post_vm_unconditional: Option<syn::Path>,
     pub(crate) disk: Option<syn::Path>,
@@ -526,6 +529,7 @@ impl Default for AttrValues {
             workloads: None,
             staged_schedulers: None,
             bpf_map_write: None,
+            watch_bpf_maps: None,
             post_vm: None,
             post_vm_unconditional: None,
             disk: None,
@@ -1221,6 +1225,12 @@ pub(crate) fn ktstr_test_impl(
                         attrs.bpf_map_write = Some(expect_path_value(
                             value,
                             "expected path for bpf_map_write (e.g. BPF_CRASH)",
+                        )?);
+                    }
+                    "watch_bpf_maps" => {
+                        attrs.watch_bpf_maps = Some(expect_path_value(
+                            value,
+                            "expected path to a &[&WatchBpfMap] for watch_bpf_maps",
                         )?);
                     }
                     "post_vm" => {

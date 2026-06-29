@@ -1447,6 +1447,24 @@ pub(crate) struct BpfMapWriteParams {
     pub(crate) value: u32,
 }
 
+/// Owned runtime form of a [`crate::test_support::WatchBpfMap`] target —
+/// the coordinator/monitor's copy of a named scheduler BPF-map field to read
+/// observer-effect-free into a run-level metric. Lowered from the
+/// `&'static [&'static WatchBpfMap]` test-entry list (mirrors how
+/// [`BpfMapWriteParams`] lowers `BpfMapWrite`).
+#[derive(Clone)]
+pub(crate) struct WatchBpfMapParams {
+    /// Map-name suffix matched via `ends_with` (`.bss`, `cpu_ctx_stor`).
+    pub(crate) map_name_suffix: String,
+    /// Dot-path into the map's value type (`sys_stat.avg_lat_cri`, or a bare
+    /// member like `lat_headroom`).
+    pub(crate) field: String,
+    /// Scalar vs per-CPU aggregation.
+    pub(crate) agg: crate::test_support::BpfMapAgg,
+    /// Metric-key leaf appended to the scheduler-obj prefix.
+    pub(crate) label: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

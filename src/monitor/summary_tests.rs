@@ -22,6 +22,7 @@ fn empty_samples_default_summary() {
 #[test]
 fn single_sample_imbalanced_cpus() {
     let sample = MonitorSample {
+        bpf_map_fields: Vec::new(),
         prog_stats: None,
         psi_irq: None,
         elapsed_ms: 100,
@@ -54,6 +55,7 @@ fn single_sample_imbalanced_cpus() {
 #[test]
 fn stuck_count_when_clock_stuck() {
     let s1 = MonitorSample {
+        bpf_map_fields: Vec::new(),
         prog_stats: None,
         psi_irq: None,
         elapsed_ms: 100,
@@ -71,6 +73,7 @@ fn stuck_count_when_clock_stuck() {
         ],
     };
     let s2 = MonitorSample {
+        bpf_map_fields: Vec::new(),
         prog_stats: None,
         psi_irq: None,
         elapsed_ms: 200,
@@ -94,6 +97,7 @@ fn stuck_count_when_clock_stuck() {
 #[test]
 fn balanced_cpus_ratio_one() {
     let sample = MonitorSample {
+        bpf_map_fields: Vec::new(),
         prog_stats: None,
         psi_irq: None,
         elapsed_ms: 50,
@@ -121,6 +125,7 @@ fn balanced_cpus_ratio_one() {
 #[test]
 fn single_cpu_no_division_by_zero() {
     let sample = MonitorSample {
+        bpf_map_fields: Vec::new(),
         prog_stats: None,
         psi_irq: None,
         elapsed_ms: 10,
@@ -142,6 +147,7 @@ fn single_cpu_no_division_by_zero() {
 #[test]
 fn all_zero_snapshots() {
     let sample = MonitorSample {
+        bpf_map_fields: Vec::new(),
         prog_stats: None,
         psi_irq: None,
         elapsed_ms: 0,
@@ -164,6 +170,7 @@ fn all_zero_snapshots() {
 #[test]
 fn empty_cpus_in_sample() {
     let sample = MonitorSample {
+        bpf_map_fields: Vec::new(),
         prog_stats: None,
         psi_irq: None,
         elapsed_ms: 10,
@@ -184,6 +191,7 @@ fn min_nr_zero_division_guard() {
     // All CPUs have nr_running=0. The code uses min_nr.max(1) as
     // divisor, so ratio = 0/1 = 0.0, which is < initial 1.0.
     let sample = MonitorSample {
+        bpf_map_fields: Vec::new(),
         prog_stats: None,
         psi_irq: None,
         elapsed_ms: 10,
@@ -210,6 +218,7 @@ fn min_nr_zero_division_guard() {
 fn min_nr_zero_max_nr_nonzero() {
     // min_nr=0, max_nr=5: ratio = 5/max(0,1) = 5.0
     let sample = MonitorSample {
+        bpf_map_fields: Vec::new(),
         prog_stats: None,
         psi_irq: None,
         elapsed_ms: 10,
@@ -233,6 +242,7 @@ fn min_nr_zero_max_nr_nonzero() {
 #[test]
 fn advancing_clocks_no_stuck() {
     let s1 = MonitorSample {
+        bpf_map_fields: Vec::new(),
         prog_stats: None,
         psi_irq: None,
         elapsed_ms: 100,
@@ -250,6 +260,7 @@ fn advancing_clocks_no_stuck() {
         ],
     };
     let s2 = MonitorSample {
+        bpf_map_fields: Vec::new(),
         prog_stats: None,
         psi_irq: None,
         elapsed_ms: 200,
@@ -267,6 +278,7 @@ fn advancing_clocks_no_stuck() {
         ],
     };
     let s3 = MonitorSample {
+        bpf_map_fields: Vec::new(),
         prog_stats: None,
         psi_irq: None,
         elapsed_ms: 300,
@@ -293,6 +305,7 @@ fn different_length_cpu_vecs() {
     // First sample has 2 CPUs, second has 3. Stall detection uses
     // min(prev.len, curr.len) = 2, so only CPUs 0-1 are compared.
     let s1 = MonitorSample {
+        bpf_map_fields: Vec::new(),
         prog_stats: None,
         psi_irq: None,
         elapsed_ms: 100,
@@ -310,6 +323,7 @@ fn different_length_cpu_vecs() {
         ],
     };
     let s2 = MonitorSample {
+        bpf_map_fields: Vec::new(),
         prog_stats: None,
         psi_irq: None,
         elapsed_ms: 200,
@@ -344,6 +358,7 @@ fn different_length_cpu_vecs() {
 fn from_samples_fields_sane_values() {
     let samples: Vec<_> = (0..5u64)
         .map(|i| MonitorSample {
+            bpf_map_fields: Vec::new(),
             prog_stats: None,
             psi_irq: None,
             elapsed_ms: i * 100,
@@ -502,6 +517,7 @@ fn avg_irq_util_means_reporting_cpus_and_skips_none() {
     // counted as 0 — the divisor is the reporting-reading count, so a
     // partial-report kernel is neither diluted nor false-zeroed.
     let s1 = MonitorSample {
+        bpf_map_fields: Vec::new(),
         prog_stats: None,
         psi_irq: None,
         elapsed_ms: 100,
@@ -517,6 +533,7 @@ fn avg_irq_util_means_reporting_cpus_and_skips_none() {
         ],
     };
     let s2 = MonitorSample {
+        bpf_map_fields: Vec::new(),
         prog_stats: None,
         psi_irq: None,
         elapsed_ms: 200,
@@ -553,6 +570,7 @@ fn avg_irq_util_none_when_no_cpu_reports() {
     // No CPU reports avg_irq_util (a non-HAVE_SCHED_AVG_IRQ kernel): both the
     // mean and the peak are None (loud-absent), never a false 0.0.
     let sample = MonitorSample {
+        bpf_map_fields: Vec::new(),
         prog_stats: None,
         psi_irq: None,
         elapsed_ms: 100,
@@ -596,6 +614,7 @@ fn psi_irq_folds_avg10_mean_and_total_delta() {
     // avg10 decode = raw / 2048 (FIXED_1): 51200 → 25%, 153600 → 75% ⇒ mean 50%.
     // total decode = ns / 1000: delta (3_500_000 - 1_000_000) ns = 2500 µs.
     let s1 = MonitorSample {
+        bpf_map_fields: Vec::new(),
         elapsed_ms: 100,
         cpus: vec![CpuSnapshot {
             nr_running: 1,
@@ -609,6 +628,7 @@ fn psi_irq_folds_avg10_mean_and_total_delta() {
         }),
     };
     let s2 = MonitorSample {
+        bpf_map_fields: Vec::new(),
         elapsed_ms: 200,
         cpus: vec![CpuSnapshot {
             nr_running: 1,
@@ -645,6 +665,7 @@ fn psi_irq_folds_avg10_mean_and_total_delta() {
 #[test]
 fn psi_irq_none_when_no_sample_reports() {
     let sample = MonitorSample {
+        bpf_map_fields: Vec::new(),
         elapsed_ms: 100,
         cpus: vec![CpuSnapshot {
             nr_running: 2,
@@ -675,6 +696,7 @@ fn psi_irq_none_when_no_sample_reports() {
 #[test]
 fn psi_irq_total_saturates_on_counter_reset() {
     let s1 = MonitorSample {
+        bpf_map_fields: Vec::new(),
         elapsed_ms: 100,
         cpus: vec![CpuSnapshot {
             nr_running: 1,
@@ -688,6 +710,7 @@ fn psi_irq_total_saturates_on_counter_reset() {
         }),
     };
     let s2 = MonitorSample {
+        bpf_map_fields: Vec::new(),
         elapsed_ms: 200,
         cpus: vec![CpuSnapshot {
             nr_running: 1,
@@ -714,6 +737,7 @@ fn psi_irq_total_saturates_on_counter_reset() {
 #[test]
 fn psi_irq_single_sample_zero_total_delta() {
     let sample = MonitorSample {
+        bpf_map_fields: Vec::new(),
         elapsed_ms: 100,
         cpus: vec![CpuSnapshot {
             nr_running: 1,
@@ -746,6 +770,7 @@ fn psi_irq_single_sample_zero_total_delta() {
 #[test]
 fn psi_irq_interleaved_none_is_filtered_not_zeroed() {
     let mk = |elapsed_ms: u64, psi: Option<PsiIrqSample>| MonitorSample {
+        bpf_map_fields: Vec::new(),
         elapsed_ms,
         cpus: vec![CpuSnapshot {
             nr_running: 1,
@@ -825,7 +850,11 @@ fn fold_run_level_ext_folds_the_five_monitor_metrics() {
     s.fold_run_level_ext(&mut ext2);
     assert_eq!(ext2.get("avg_nr_running"), Some(&2.5));
     assert_eq!(ext2.get("avg_irq_util"), None, "None → absent, not 0.0");
-    assert_eq!(ext2.get("psi_irq_full_avg10"), None, "None → absent, not 0.0");
+    assert_eq!(
+        ext2.get("psi_irq_full_avg10"),
+        None,
+        "None → absent, not 0.0"
+    );
     assert_eq!(ext2.get("max_avg_irq_util"), Some(&80.0));
     assert_eq!(ext2.get("total_irq_pressure_us"), Some(&3000.0));
 
@@ -895,7 +924,240 @@ fn fold_run_level_ext_folds_per_domain_lb_keys() {
     let mut ext2 = BTreeMap::new();
     empty.fold_run_level_ext(&mut ext2);
     assert!(
-        !ext2.keys().any(|k| k.starts_with("lb_") || k.starts_with("alb_")),
+        !ext2
+            .keys()
+            .any(|k| k.starts_with("lb_") || k.starts_with("alb_")),
         "no per-domain keys when sched_domain_lb is None"
     );
+}
+
+// -- watched scheduler BPF-map field fold (compute_bpf_map_field_deltas) --
+
+/// A scalar target folds to its cross-sample mean (key = `key_base`); a
+/// per-CPU target folds to the cross-(CPU, sample) mean (`_avg`) + the spatial
+/// max (`_max`). `fold_run_level_ext` surfaces all three under the same keys.
+#[test]
+fn bpf_map_fields_fold_scalar_and_per_cpu() {
+    use super::BpfMapFieldSample;
+    let mk = |scalar: f64, pc: Vec<f64>| MonitorSample {
+        bpf_map_fields: vec![
+            BpfMapFieldSample {
+                key_base: "scx_lavd_avg_lat_cri".into(),
+                scalar: Some(scalar),
+                per_cpu: None,
+                scalar_counter: false,
+            },
+            BpfMapFieldSample {
+                key_base: "scx_lavd_lat_headroom".into(),
+                scalar: None,
+                per_cpu: Some(pc),
+                scalar_counter: false,
+            },
+        ],
+        prog_stats: None,
+        psi_irq: None,
+        elapsed_ms: 0,
+        cpus: vec![CpuSnapshot {
+            nr_running: 1,
+            rq_clock: 1,
+            ..Default::default()
+        }],
+    };
+    let summary = MonitorSummary::from_samples(&[mk(10.0, vec![2.0, 6.0]), mk(20.0, vec![4.0, 8.0])]);
+    let folded = summary
+        .bpf_map_fields
+        .as_ref()
+        .expect("watched fields folded");
+    let by: std::collections::BTreeMap<&str, f64> =
+        folded.iter().map(|f| (f.key.as_str(), f.value)).collect();
+    // Scalar mean(10,20) = 15; per-CPU avg over (2,6,4,8) = 5; spatial max = 8.
+    assert_eq!(by.get("scx_lavd_avg_lat_cri"), Some(&15.0));
+    assert_eq!(by.get("scx_lavd_lat_headroom_avg"), Some(&5.0));
+    assert_eq!(by.get("scx_lavd_lat_headroom_max"), Some(&8.0));
+
+    let mut ext = std::collections::BTreeMap::new();
+    summary.fold_run_level_ext(&mut ext);
+    assert_eq!(ext.get("scx_lavd_avg_lat_cri"), Some(&15.0));
+    assert_eq!(ext.get("scx_lavd_lat_headroom_avg"), Some(&5.0));
+    assert_eq!(ext.get("scx_lavd_lat_headroom_max"), Some(&8.0));
+}
+
+/// A scalar COUNTER target (`scalar_counter`) folds to the value at the LAST
+/// reporting sample (the accumulated total), not the mean of the rising series
+/// — distinguishing it from a gauge in the same summary, which still means.
+#[test]
+fn bpf_map_fields_fold_scalar_counter_takes_last() {
+    use super::BpfMapFieldSample;
+    let mk = |gauge: f64, counter: f64| MonitorSample {
+        bpf_map_fields: vec![
+            BpfMapFieldSample {
+                key_base: "bpf_lat".into(),
+                scalar: Some(gauge),
+                per_cpu: None,
+                scalar_counter: false,
+            },
+            BpfMapFieldSample {
+                key_base: "bpf_alloc_count".into(),
+                scalar: Some(counter),
+                per_cpu: None,
+                scalar_counter: true,
+            },
+        ],
+        prog_stats: None,
+        psi_irq: None,
+        elapsed_ms: 0,
+        cpus: vec![CpuSnapshot {
+            nr_running: 1,
+            rq_clock: 1,
+            ..Default::default()
+        }],
+    };
+    // Counter rises 10 -> 30 -> 100; gauge moves 4 -> 8 -> 3 (mean 5 != last 3,
+    // so the gauge assertion independently pins mean-fold, not last).
+    let summary = MonitorSummary::from_samples(&[mk(4.0, 10.0), mk(8.0, 30.0), mk(3.0, 100.0)]);
+    let by: std::collections::BTreeMap<&str, f64> = summary
+        .bpf_map_fields
+        .as_ref()
+        .expect("watched fields folded")
+        .iter()
+        .map(|f| (f.key.as_str(), f.value))
+        .collect();
+    // Counter -> last (100), NOT mean (46.67). Gauge -> mean(4,8,3) = 5, NOT last (3).
+    assert_eq!(by.get("bpf_alloc_count"), Some(&100.0));
+    assert_eq!(by.get("bpf_lat"), Some(&5.0));
+}
+
+/// A counter folds to the last *reporting* sample even when the FINAL sample
+/// did not report the field (the read failed that tick) — it holds the last
+/// successful read, never dropping to 0 or a mean over the reported reads.
+#[test]
+fn bpf_map_fields_counter_holds_last_successful_when_tail_unreported() {
+    use super::BpfMapFieldSample;
+    let counter = |v: f64| MonitorSample {
+        bpf_map_fields: vec![BpfMapFieldSample {
+            key_base: "bpf_alloc_count".into(),
+            scalar: Some(v),
+            per_cpu: None,
+            scalar_counter: true,
+        }],
+        prog_stats: None,
+        psi_irq: None,
+        elapsed_ms: 0,
+        cpus: vec![CpuSnapshot {
+            nr_running: 1,
+            rq_clock: 1,
+            ..Default::default()
+        }],
+    };
+    // Final sample reports nothing for the counter (read failed that tick).
+    let tail_unreported = MonitorSample {
+        bpf_map_fields: Vec::new(),
+        prog_stats: None,
+        psi_irq: None,
+        elapsed_ms: 0,
+        cpus: vec![CpuSnapshot {
+            nr_running: 1,
+            rq_clock: 1,
+            ..Default::default()
+        }],
+    };
+    let summary = MonitorSummary::from_samples(&[counter(10.0), counter(50.0), tail_unreported]);
+    let v = summary
+        .bpf_map_fields
+        .as_ref()
+        .and_then(|f| f.iter().find(|x| x.key == "bpf_alloc_count"))
+        .map(|x| x.value);
+    // Last SUCCESSFUL read (50), not 0, not a mean over the 2 reads.
+    assert_eq!(v, Some(50.0));
+}
+
+/// A single-sample counter folds to that sample's value (last == only).
+#[test]
+fn bpf_map_fields_single_sample_counter_folds_to_value() {
+    use super::BpfMapFieldSample;
+    let summary = MonitorSummary::from_samples(&[MonitorSample {
+        bpf_map_fields: vec![BpfMapFieldSample {
+            key_base: "bpf_alloc_count".into(),
+            scalar: Some(42.0),
+            per_cpu: None,
+            scalar_counter: true,
+        }],
+        prog_stats: None,
+        psi_irq: None,
+        elapsed_ms: 0,
+        cpus: vec![CpuSnapshot {
+            nr_running: 1,
+            rq_clock: 1,
+            ..Default::default()
+        }],
+    }]);
+    let v = summary
+        .bpf_map_fields
+        .as_ref()
+        .and_then(|f| f.iter().find(|x| x.key == "bpf_alloc_count"))
+        .map(|x| x.value);
+    assert_eq!(v, Some(42.0));
+}
+
+/// A `ScalarCounter` scalar and a `PerCpu` target coexist in one summary: the
+/// counter folds to its last value while the per-CPU target folds to avg+max,
+/// independently — `scalar_counter` is ignored on the per-CPU branch.
+#[test]
+fn bpf_map_fields_counter_and_per_cpu_coexist() {
+    use super::BpfMapFieldSample;
+    let mk = |counter: f64, pc: Vec<f64>| MonitorSample {
+        bpf_map_fields: vec![
+            BpfMapFieldSample {
+                key_base: "bpf_alloc_count".into(),
+                scalar: Some(counter),
+                per_cpu: None,
+                scalar_counter: true,
+            },
+            BpfMapFieldSample {
+                key_base: "bpf_headroom".into(),
+                scalar: None,
+                per_cpu: Some(pc),
+                scalar_counter: false,
+            },
+        ],
+        prog_stats: None,
+        psi_irq: None,
+        elapsed_ms: 0,
+        cpus: vec![CpuSnapshot {
+            nr_running: 1,
+            rq_clock: 1,
+            ..Default::default()
+        }],
+    };
+    let summary =
+        MonitorSummary::from_samples(&[mk(10.0, vec![2.0, 6.0]), mk(40.0, vec![4.0, 8.0])]);
+    let by: std::collections::BTreeMap<&str, f64> = summary
+        .bpf_map_fields
+        .as_ref()
+        .expect("watched fields folded")
+        .iter()
+        .map(|f| (f.key.as_str(), f.value))
+        .collect();
+    // Counter -> last (40), NOT mean (25). Per-CPU -> avg(2,6,4,8) = 5, max = 8.
+    assert_eq!(by.get("bpf_alloc_count"), Some(&40.0));
+    assert_eq!(by.get("bpf_headroom_avg"), Some(&5.0));
+    assert_eq!(by.get("bpf_headroom_max"), Some(&8.0));
+}
+
+/// No watched field reported in any sample -> `None` (loud-absent), so
+/// `run_metric` returns `None` rather than a false 0.0.
+#[test]
+fn bpf_map_fields_absent_when_unreported() {
+    let summary = MonitorSummary::from_samples(&[MonitorSample {
+        bpf_map_fields: Vec::new(),
+        prog_stats: None,
+        psi_irq: None,
+        elapsed_ms: 0,
+        cpus: vec![CpuSnapshot {
+            nr_running: 1,
+            rq_clock: 1,
+            ..Default::default()
+        }],
+    }]);
+    assert!(summary.bpf_map_fields.is_none());
 }

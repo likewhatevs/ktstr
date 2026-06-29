@@ -21,7 +21,7 @@ use std::time::Duration;
 use super::host_topology;
 use super::net_config;
 use super::topology::{self, Topology};
-use super::vcpu::BpfMapWriteParams;
+use super::vcpu::{BpfMapWriteParams, WatchBpfMapParams};
 use super::{KtstrVm, disk_config};
 
 /// Builder for [`super::KtstrVm`].
@@ -71,6 +71,7 @@ pub struct KtstrVmBuilder {
     pub(crate) watchdog_timeout: Option<Duration>,
     pub(crate) rendezvous_timeout: Option<Duration>,
     bpf_map_writes: Vec<BpfMapWriteParams>,
+    watch_bpf_maps: Vec<WatchBpfMapParams>,
     pub(crate) performance_mode: bool,
     no_perf_mode: bool,
     sched_enable_cmds: Vec<String>,
@@ -241,6 +242,7 @@ impl Default for KtstrVmBuilder {
             watchdog_timeout: Some(Duration::from_secs(5)),
             rendezvous_timeout: None,
             bpf_map_writes: Vec::new(),
+            watch_bpf_maps: Vec::new(),
             performance_mode: false,
             no_perf_mode: false,
             sched_enable_cmds: Vec::new(),
@@ -607,6 +609,36 @@ impl KtstrVmBuilder {
             map_name_suffix: map_name_suffix.to_string(),
             offset,
             value,
+        });
+        self
+    }
+
+    /// Register a named scheduler BPF-map field to read observer-effect-free
+    /// from the free-running monitor into a run-level metric. Mirrors
+    /// [`Self::bpf_map_write`]; the monitor resolves + reads each target
+    /// lazily after the scheduler attaches.
+    pub fn watch_bpf_map(
+        mut self,
+        map_name_suffix: &str,
+        field: &str,
+        agg: crate::test_support::BpfMapAgg,
+        label: &str,
+    ) -> Self {
+        // A target's run-level metric key is `<scheduler-obj>_<label>`; the obj
+        // prefix is uniform per run, so two targets with the same label resolve
+        // to one key and collide in the fold — silently averaging (same agg) or
+        // flipping the fold class (gauge vs counter). Reject duplicate labels
+        // loudly at build time rather than emit a wrong metric.
+        assert!(
+            !self.watch_bpf_maps.iter().any(|p| p.label == label),
+            "duplicate watch_bpf_maps label {label:?}: two targets resolve to the \
+             same run-level metric key — declare distinct labels",
+        );
+        self.watch_bpf_maps.push(WatchBpfMapParams {
+            map_name_suffix: map_name_suffix.to_string(),
+            field: field.to_string(),
+            agg,
+            label: label.to_string(),
         });
         self
     }
@@ -981,6 +1013,7 @@ impl KtstrVmBuilder {
             watchdog_timeout: self.watchdog_timeout,
             rendezvous_timeout: self.rendezvous_timeout,
             bpf_map_writes: self.bpf_map_writes,
+            watch_bpf_maps: self.watch_bpf_maps,
             performance_mode: self.performance_mode,
             no_perf_mode,
             pinning_plan,

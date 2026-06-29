@@ -193,6 +193,7 @@ example.
 | `survives_storm` | `false` | Assert the scx scheduler SURVIVES the run (does not die or get ejected during any hold) — the positive inverse of `expect_err`. Requires an active scheduler; mutually exclusive with `expect_err` and `expect_auto_repro` (rejected at compile time and by `KtstrTestEntry::validate`). Enforced on scenarios driven through `execute_defs` / `execute_steps` / `execute_scenario` (which run the liveness probe); a survival violation surfaces as EXIT_FAIL with a survival-specific explainer. |
 | `allow_inconclusive` | `false` | Permit an Inconclusive verdict to pass instead of failing the test (routes the per-test exit code from `2` to `0`). `expect_err` still dominates. |
 | `bpf_map_write = CONST` | empty | Rust const path to a `BpfMapWrite`; host writes this value to a BPF map after the scheduler loads. The entry field is a slice; the macro wraps the single path in a one-element slice. |
+| `watch_bpf_maps = CONST` | empty | Rust const path to a `&[&WatchBpfMap]` slice (passed verbatim — not single-wrapped). The free-running host monitor reads each named scheduler BPF-map field observer-effect-free into a run-level metric. Read it back with `result.run_metric("<scheduler-obj>_<label>")` (scalar) or `"<scheduler-obj>_<label>_{avg,max}"` (per-CPU). See [Watching scheduler BPF-map fields](#watching-scheduler-bpf-map-fields). |
 | `host_only` | `false` | Run the test function directly on the host instead of inside a VM. Use for tests that need host tools (e.g. cargo, nested VMs) unavailable in the guest initramfs. |
 | `disk = CONST` | `None` | Rust const path to a `const DiskConfig`; attaches a virtio-blk device whose backing the framework owns (a tempfile for `Raw`, a FICLONE-cloned template for `Btrfs`). Construct via `DiskConfig::DEFAULT` chained setters (e.g. `.with_name("data")`). Mutually exclusive with `host_only = true`. |
 | `network = CONST` | `None` | Rust const path to a `const NetConfig`; attaches a virtio-net device. Construct via `NetConfig::DEFAULT` chained setters. |
@@ -339,3 +340,64 @@ for the full macro grammar.
 For the manual builder pattern (no distributed-slice
 registration), see
 [Scheduler Definitions: Manual definition](scheduler-definitions.md#manual-definition).
+
+## Watching scheduler BPF-map fields
+
+`watch_bpf_maps = CONST` reads NAMED scheduler BPF-map fields
+*observer-effect-free* — the free-running host monitor reads the running
+guest's BPF-map memory via BTF, without freezing vCPUs — and surfaces each as
+an assertable run-level metric. This turns "the scheduler computed X" into a
+post-VM assertion.
+
+The const is a `&[&WatchBpfMap]` slice (passed verbatim, not single-wrapped).
+Each `WatchBpfMap::new(map_suffix, field, agg, label)` declares one target:
+
+- `map_suffix` — matched against a loaded BPF map by `ends_with` (e.g. `".bss"`
+  for a section global, or a named map like `"cpu_ctx_stor"`).
+- `field` — a dot-path into the map's value type (`"sys_stat.avg_lat_cri"`, or
+  a bare global like `"lat_headroom"`).
+- `agg` — pick by the field's semantic class:
+  - `BpfMapAgg::Scalar` — a single gauge value (a current level), folded as
+    the mean over the run's reporting samples.
+  - `BpfMapAgg::ScalarCounter` — a single monotonic-counter value (an
+    accumulating total like `ktstr_alloc_count`), folded as the value at the
+    last reporting sample (the final total — not the mean of a rising series).
+  - `BpfMapAgg::PerCpu` — a per-CPU array, folded into a cross-CPU mean and
+    spatial max.
+- `label` — the metric-key leaf.
+
+The metric key is the active scheduler's object prefix plus the label:
+`<scheduler-obj>_<label>` for a scalar, and `<scheduler-obj>_<label>_avg` /
+`_max` for per-CPU. The object prefix comes from the scheduler's
+global-section map name — this is libbpf's object name, which can differ from
+the scheduler's source / ops name (e.g. an object named `scx_lavd` → prefix
+`scx_lavd`, but scx-ktstr's object is `bpf_bpf`, so its prefix is `bpf_bpf`).
+Each target's `label` must be unique within a test (duplicate labels resolve to
+one metric key and are rejected at VM build time). Read it back with
+[`VmResult::run_metric`] in a `post_vm` hook; an absent metric returns `None`
+(loud-absent — the field never resolved), never a false `0.0`.
+
+```rust,ignore
+const WATCH: &[&WatchBpfMap] = &[
+    &WatchBpfMap::new(".bss", "sys_stat.avg_lat_cri", BpfMapAgg::Scalar, "avg_lat_cri"),
+    &WatchBpfMap::new("cpu_ctx_stor", "lat_headroom", BpfMapAgg::PerCpu, "lat_headroom"),
+];
+
+fn check(result: &VmResult) -> anyhow::Result<()> {
+    let avg_lat_cri = result.run_metric("scx_lavd_avg_lat_cri")
+        .ok_or_else(|| anyhow::anyhow!("avg_lat_cri absent"))?;
+    let headroom_max = result.run_metric("scx_lavd_lat_headroom_max")
+        .ok_or_else(|| anyhow::anyhow!("lat_headroom_max absent"))?;
+    anyhow::ensure!(avg_lat_cri.is_finite() && headroom_max.is_finite());
+    Ok(())
+}
+
+#[ktstr_test(scheduler = SCX_LAVD, watch_bpf_maps = WATCH, post_vm = check)]
+fn lat_metrics_surface(ctx: &Ctx) -> anyhow::Result<AssertResult> { /* workload */ }
+```
+
+Resolution is lazy: the maps appear only after the scheduler attaches, so the
+monitor retries until the named map is present, then caches the resolved
+offset/width and re-reads only the leaf bytes each tick.
+
+[`VmResult::run_metric`]: https://docs.rs/ktstr/latest/ktstr/vmm/result/struct.VmResult.html#method.run_metric
