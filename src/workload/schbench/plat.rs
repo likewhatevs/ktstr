@@ -176,9 +176,12 @@ impl PlatStats {
     /// `delta > 0` (a non-positive delta is dropped, `schbench.c:1035-1037,
     /// 1481-1483`); schbench_rs mirrors that in `msg_and_wait` / `rps_wait`.
     /// schbench's RPS caller instead substitutes 0 for a non-finite rate
-    /// (`schbench.c:1782`); schbench_rs's RPS caller (`control_loop`) DROPS the
-    /// tick via its `dt > 0` guard — unreachable on the monotonic clock and a
-    /// cleaner estimator (no synthetic 0 in bucket 0).
+    /// (`schbench.c:1782`); schbench_rs's RPS caller (`control_loop`) instead
+    /// DROPS a sub-quantum window (`dt < STOP_POLL_QUANTUM_NS`) via
+    /// `control_loop_rps_sample` — the bounded teardown sleep can return on stop
+    /// with a tiny dt, where a count/dt rate is unbounded as dt -> 0, so dropping
+    /// avoids both schbench's synthetic bucket-0 sample and an unbounded boundary
+    /// spike.
     ///
     /// The `u32` bucket increments with `+= 1`: in a debug build this
     /// panics if a single bucket exceeds 2^32 samples; in release it wraps,

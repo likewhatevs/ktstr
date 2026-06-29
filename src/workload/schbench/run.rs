@@ -343,6 +343,18 @@ pub struct SchbenchConfig {
 /// warns, `schbench.c:291-294`).
 pub(crate) const PIPE_TRANSFER_BUFFER: usize = 1024 * 1024;
 
+/// Cap on a single RPS-injector pacing sleep (ns). `run_rps_thread` runs
+/// synchronously on the message thread that `run` joins on shutdown, so an
+/// uncapped paced sleep would delay teardown by up to a full inter-arrival
+/// interval — at a degenerate low `requests_per_sec` (interval = 1s / rps) that
+/// can exceed the scenario cleanup/watchdog budget. Capping each sleep at this
+/// quantum re-checks `stop` at least this often, bounding shutdown latency. At
+/// realistic rates the interval is well under this, so a single uncapped wait
+/// results — the cap only engages at pathological low rates. (Schbench-local; the
+/// sibling taobench engine has its own equivalent, both with self-contained
+/// `monotonic_nanos`.)
+const STOP_POLL_QUANTUM_NS: u64 = 50_000_000;
+
 /// schbench's pipe-mode (`-p`) throughput summary — the `avg worker transfer`
 /// line (`schbench.c:1979-1982`): the per-worker transfer rate as ops/sec plus
 /// the pretty-scaled bytes/sec. Built by [`pipe_transfer_report`].
@@ -1194,9 +1206,28 @@ fn run_rps_thread(
             // (the saturating form documents that the per-pass re-base is the
             // load-bearing invariant).
             due = due.saturating_add(interval_ns);
-            let now = monotonic_nanos();
-            if now < due {
-                std::thread::sleep(std::time::Duration::from_nanos(due - now));
+            // Pace to this enqueue's scheduled time, but cap each sleep at
+            // STOP_POLL_QUANTUM_NS and re-check `stop`, so a shutdown during a long
+            // inter-arrival gap (a degenerate low rate, where the interval can
+            // exceed the cleanup/watchdog budget) is observed within the quantum
+            // instead of after a full interval — mirroring the taobench open-loop
+            // pacing. A stop observed here breaks the enqueue loop BEFORE issuing
+            // this slot's request.
+            let mut stop_during_pace = false;
+            loop {
+                if stop.load(Ordering::Acquire) {
+                    stop_during_pace = true;
+                    break;
+                }
+                let now = monotonic_nanos();
+                if now >= due {
+                    break;
+                }
+                let nap = (due - now).min(STOP_POLL_QUANTUM_NS);
+                std::thread::sleep(std::time::Duration::from_nanos(nap));
+            }
+            if stop_during_pace {
+                break;
             }
             let worker = &workers[cur_tid % worker_count];
             cur_tid += 1;
@@ -1220,10 +1251,20 @@ fn run_rps_thread(
             worker.futex.post();
         }
         // The pacing loop already spans ~1 second; top up only if it finished
-        // early (rate 0, or `stop`), preserving schbench's per-second cadence.
-        let elapsed = monotonic_nanos().saturating_sub(start);
-        if !stop.load(Ordering::Acquire) && elapsed < ONE_SEC_NS {
-            std::thread::sleep(std::time::Duration::from_nanos(ONE_SEC_NS - elapsed));
+        // early (rate 0, or `stop`), preserving schbench's per-second cadence. Cap
+        // each sleep at STOP_POLL_QUANTUM_NS and re-check `stop` so a shutdown
+        // during the top-up is observed within the quantum, not after a full
+        // remaining second (the same teardown bound as the pacing sleep above).
+        loop {
+            if stop.load(Ordering::Acquire) {
+                break;
+            }
+            let elapsed = monotonic_nanos().saturating_sub(start);
+            if elapsed >= ONE_SEC_NS {
+                break;
+            }
+            let nap = (ONE_SEC_NS - elapsed).min(STOP_POLL_QUANTUM_NS);
+            std::thread::sleep(std::time::Duration::from_nanos(nap));
         }
         // Dispatcher per-phase run-delay drain (mirrors run_msg_thread): on epoch
         // change, finalize this thread's run-delay for the ended phase. Empty
@@ -1930,33 +1971,55 @@ fn control_loop(
     let mut last_t = monotonic_nanos();
     let mut busy_state = ReadBusyState::default();
     while !stop.load(Ordering::Acquire) {
-        std::thread::sleep(std::time::Duration::from_secs(1));
-        // Sample the just-elapsed interval BEFORE re-checking stop at the loop
-        // top: it is a complete second of data even if stop fired during the
-        // sleep (the common integer-window case), so an early break here would
-        // silently drop a full valid sample. schbench likewise samples the
-        // boundary interval in which its run expires (`schbench.c:1756,1781`).
-        // The interval that races stop is understated (workers halt partway) --
-        // the same property schbench's final boundary sample has.
+        // Sleep ~1s between samples, but in STOP_POLL_QUANTUM_NS chunks that
+        // re-check `stop`, so a shutdown is observed within a quantum instead of
+        // blocking run()'s teardown for a full second (the control thread is joined
+        // by run(), so an uncapped sleep here is the dominant teardown latency —
+        // worse than, and unconditional unlike, the RPS injector's pacing sleep).
+        let sleep_target = monotonic_nanos().saturating_add(1_000_000_000);
+        loop {
+            if stop.load(Ordering::Acquire) {
+                break;
+            }
+            let now = monotonic_nanos();
+            if now >= sleep_target {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_nanos(
+                (sleep_target - now).min(STOP_POLL_QUANTUM_NS),
+            ));
+        }
+        // Sample the just-elapsed window BEFORE re-checking stop at the loop top,
+        // so the in-progress second is recorded rather than dropped. `dt` is the
+        // ACTUAL elapsed time (now - last_t).
+        //
+        // schbench samples-first then sleeps the full second (`sleep(1)` only
+        // `if (!done)`, schbench.c:1827), so every schbench sample -- including the
+        // boundary one taken when `done` is detected -- spans a real ~1s window
+        // (rps over a real `delta = tvdelta(..)`, schbench.c:1774,1777). ktstr
+        // sleeps-first/samples-last with a BOUNDED sleep, which diverges two ways:
+        //   - On early `stop` this boundary sample spans a true PARTIAL window: for
+        //     a substantial window (>= one quantum) the real rate over the
+        //     sub-window the workers were active (more granular than schbench, which
+        //     would have waited the full second); a degenerate sub-quantum window is
+        //     dropped by `control_loop_rps_sample` (a count/dt rate is unbounded as
+        //     dt->0). The bounded sleep is a ktstr scenario-teardown requirement
+        //     schbench does not face.
+        //   - The sleep-first shape omits schbench's tiny FIRST-window sample
+        //     (schbench reads `now` at loop start before any work, schbench.c:1757,
+        //     so its first `delta` is ~us); ktstr's first sample follows a full ~1s
+        //     sleep.
         let now = monotonic_nanos();
         let lc = progress.load(Ordering::Relaxed);
         let dt = now.saturating_sub(last_t);
-        // The `dt > 0` guard drops a zero-Δt tick rather than recording
-        // schbench's `isfinite(rps) ? rps : 0` substitution (`schbench.c:1782`);
-        // combined with the sleep-FIRST loop shape, it also omits schbench's
-        // first ~µs-window sample (schbench reads `now` immediately at loop start,
-        // `schbench.c:1757`, before any work). Both are unreachable on the
-        // monotonic clock (dt is ~1e9 ns/tick, never 0) -- a deliberate, cleaner
-        // divergence like read_busy's dt==0 NaN-skip. A short fixed-`-R` rps
-        // side-by-side can still differ by schbench's one garbage first sample.
-        if dt > 0 {
-            // Achieved per-second rate = Δcompleted-cycles / Δt (schbench
-            // `combine_message_thread_rps` over the shared loop count, `:1777`).
-            let rps = lc.saturating_sub(last_loop) as f64 * 1e9 / dt as f64;
+        // Achieved per-second rate = Δcompleted-cycles / Δt (schbench
+        // `combine_message_thread_rps` over the shared loop count, schbench.c:1777),
+        // floored at one quantum by `control_loop_rps_sample` (a ktstr teardown
+        // guard, not in schbench — see its doc).
+        if let Some(sample) = control_loop_rps_sample(lc.saturating_sub(last_loop), dt) {
             // Gate: for auto-RPS, sample only once the target is hit
             // (`schbench.c:1781`); fixed/default mode samples every second.
             if config.auto_rps == 0 || target_hit.load(Ordering::Relaxed) {
-                let sample = (rps as u64).min(u32::MAX as u64) as u32;
                 rps_stats.add_lat(sample);
                 // Per-phase parity: also bucket the sample by the epoch observed
                 // NOW (the sample-time epoch; a straddling 1s sample lands wholly
@@ -1982,6 +2045,31 @@ fn control_loop(
         }
     }
     (rps_stats, per_epoch_rps)
+}
+
+/// Achieved per-second rate sample for one control-loop window:
+/// Δcompleted-cycles over `dt_ns`, in cycles/sec, clamped to `u32`. `None` when
+/// the window is shorter than one `STOP_POLL_QUANTUM_NS` quantum.
+///
+/// The floor is a correctness guard, not a nicety. The bounded teardown sleep in
+/// `control_loop` can return on `stop` with a sub-millisecond `dt` (the window
+/// between a sample's `last_t = now` and the next iteration's first stop check),
+/// and a count/dt RATE is unbounded as `dt -> 0` (a single completion in a 1us
+/// window reads as ~1e6 cycles/sec), so an unfloored sub-quantum sample would
+/// spike `rps_max` and the top rps percentiles -- assertable metrics. A real
+/// partial window is always >= one quantum (the sleep loop only observes `stop`
+/// at a quantum boundary), so the floor drops only the degenerate race window; an
+/// admitted window bounds the sample to `<= delta_loops * 1e9 /
+/// STOP_POLL_QUANTUM_NS` (~ the real rate, no inflation). This diverges from
+/// schbench's `isfinite(rps)` guard (schbench.c:1782), which catches only an
+/// exact-zero delta -- a finite-but-huge rate from a tiny window slips past it,
+/// but schbench's full-second cadence (schbench.c:1827) never produces one.
+fn control_loop_rps_sample(delta_loops: u64, dt_ns: u64) -> Option<u32> {
+    if dt_ns < STOP_POLL_QUANTUM_NS {
+        return None;
+    }
+    let rps = delta_loops as f64 * 1e9 / dt_ns as f64;
+    Some((rps as u64).min(u32::MAX as u64) as u32)
 }
 
 /// Run the schbench workload until `stop` is set, returning the whole-run
@@ -2655,6 +2743,45 @@ mod tests {
     }
 
     #[test]
+    fn rps_injector_pacing_sleep_is_bounded_for_prompt_shutdown() {
+        // requests_per_sec=1, message_threads=1 => per-thread inter-arrival
+        // interval ~1s. A stop set while the injector is in that paced sleep must be
+        // observed within STOP_POLL_QUANTUM_NS (50 ms), so run()'s message-thread
+        // join completes well under one interval. An unbounded pacing sleep would
+        // block the join ~1s. 500 ms is 10x the quantum (robust to scheduling
+        // jitter) and half the interval (cleanly distinguishes bounded from
+        // unbounded). The 20 ms warmup reaches the long paced sleep before stop (at
+        // 1 req/s a progress-spin could outlast the test).
+        let config = SchbenchConfig {
+            message_threads: 1,
+            worker_threads: 1,
+            cache_footprint_kib: 16,
+            operations: 1,
+            sleep_usec: 0,
+            skip_locking: false,
+            requests_per_sec: 1, // interval = 1s / 1 = 1s
+            auto_rps: 0,
+            split_percent: None,
+            pipe_transfer_bytes: 0,
+        };
+        let stop = AtomicBool::new(false);
+        let progress = AtomicU64::new(0);
+        let start = std::time::Instant::now();
+        std::thread::scope(|s| {
+            let runner = s.spawn(|| run(&config, &stop, &progress, None));
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            stop.store(true, Ordering::Release);
+            let _ = runner.join().expect("run panicked");
+        });
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "RPS injector joined in {elapsed:?}; the paced sleep must be bounded \
+             (interval ~1s — an unbounded sleep would block the join that long)",
+        );
+    }
+
+    #[test]
     fn engine_rps_below_message_threads_falls_to_default() {
         // Regression: when the -R total is below the message-thread count,
         // the per-thread rate (rps_per_message_thread) rounds to 0, and the
@@ -2767,6 +2894,32 @@ mod tests {
         reset_rps_accumulators(&mut whole, &mut per_epoch);
         assert_eq!(whole.sample_count(), 0, "whole-run rps reset");
         assert!(per_epoch.is_empty(), "per-epoch rps reset in lockstep");
+    }
+
+    #[test]
+    fn control_loop_rps_sample_floors_sub_quantum_window() {
+        // The bounded teardown sleep can return on `stop` with a tiny dt; a
+        // count/dt rate is unbounded as dt->0, so a sub-quantum window is dropped
+        // rather than spiking rps_max / the top rps percentiles (assertable
+        // metrics). Pins the floor deterministically -- the race that produces the
+        // tiny dt is timing-dependent, but the math + floor it feeds is pure.
+        // dt==0 is dropped, not a divide-by-zero:
+        assert_eq!(control_loop_rps_sample(3, 0), None);
+        // A 1us / one-completion window would read as ~1e6 cycles/sec -- dropped:
+        assert_eq!(control_loop_rps_sample(1, 1_000), None);
+        // Just under one quantum is still dropped:
+        assert_eq!(control_loop_rps_sample(5, STOP_POLL_QUANTUM_NS - 1), None);
+        // Exactly one quantum is admitted; the rate is bounded to
+        // delta_loops * 1e9 / quantum, no inflation: 1 cycle / 50ms = 20/s.
+        assert_eq!(control_loop_rps_sample(1, STOP_POLL_QUANTUM_NS), Some(20));
+        // Even a burst of 1000 completions in one quantum caps at 1000*20 =
+        // 20_000/s -- not the millions an unfloored 1us window would yield.
+        assert_eq!(
+            control_loop_rps_sample(1_000, STOP_POLL_QUANTUM_NS),
+            Some(20_000)
+        );
+        // The common case -- a full ~1s window -- is unchanged: 5000/s.
+        assert_eq!(control_loop_rps_sample(5_000, 1_000_000_000), Some(5_000));
     }
 
     #[test]
