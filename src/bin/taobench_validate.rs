@@ -41,9 +41,16 @@ struct Args {
     /// Target steady-state hit ratio, percent (1..=99).
     #[arg(short = 'H', long, default_value_t = 90)]
     target_hit_pct: usize,
-    /// Simulated backing-store fetch latency on a miss, microseconds.
+    /// Simulated backing-store fetch latency on a miss, microseconds (the MEDIAN
+    /// when --slow-path-p99-us enables the heavy tail).
     #[arg(short = 'u', long, default_value_t = 100)]
     slow_path_sleep_us: u64,
+    /// Heavy-tailed slow-path service-time p99 in microseconds (0 or <=
+    /// slow_path_sleep_us = fixed latency). When larger, each fetch is a Pareto
+    /// draw with median slow_path_sleep_us and this p99 — under -R the serve-latency
+    /// line below then exhibits the tail.
+    #[arg(short = 'p', long, default_value_t = 0)]
+    slow_path_p99_us: u64,
     /// Benchmark runtime in seconds.
     #[arg(short = 'r', long, default_value_t = 30)]
     runtime_secs: u64,
@@ -61,6 +68,7 @@ fn main() {
         .cache_capacity_mib(args.cache_capacity_mib)
         .target_hit_pct(args.target_hit_pct)
         .slow_path_sleep_us(args.slow_path_sleep_us)
+        .slow_path_p99_us(args.slow_path_p99_us)
         .arrival_rate(args.arrival_rate);
 
     let report = taobench_run_standalone(&config, args.runtime_secs);

@@ -30,10 +30,15 @@
 //!   late requests' serve latency (coordinated-omission correction) instead of
 //!   being omitted. The serve-latency histogram is per-phase data (empty in
 //!   closed loop).
-//! - `slow_threads` DISPATCHER threads serve misses: sleep `slow_path_sleep_us`
-//!   (the simulated backing-store fetch — a worker-defined cost, the same model
-//!   schbench's think-sleep uses, not a synchronization wait), insert a freshly
-//!   sized+touched value, and wake the waiting client.
+//! - `slow_threads` DISPATCHER threads serve misses: sleep the simulated
+//!   backing-store fetch (a worker-defined cost, the same model schbench's
+//!   think-sleep uses, not a synchronization wait), insert a freshly sized+touched
+//!   value, and wake the waiting client. The fetch latency is a fixed
+//!   `slow_path_sleep_us` by default, or — when `slow_path_p99_us` is set above it
+//!   — a per-fetch heavy-tailed Pareto draw with median `slow_path_sleep_us` and
+//!   99th percentile `slow_path_p99_us` (most fetches near the median, a rare slow
+//!   tail), so the open-loop serve-latency tail reflects realistic backing-store
+//!   variance.
 //!
 //! ## Counters (request-time vs response-time)
 //!
@@ -87,11 +92,41 @@ fn monotonic_nanos() -> u64 {
 /// The simulated backing-store fetch on the slow path. Worker-defined cost (like
 /// schbench's think-sleep), not a synchronization wait: `std::thread::sleep` maps
 /// to `clock_nanosleep` on Linux. `0` is a no-op (the dispatcher still does the
-/// fill + wakeup, so the slow path remains a distinct thread hop).
+/// fill + wakeup, so the slow path remains a distinct thread hop). The caller
+/// passes either the fixed `slow_path_sleep_us` or, when the heavy tail is enabled,
+/// a per-fetch [`sample_service_us`] Pareto draw — this function just sleeps `usec`.
 fn backing_store_fetch(usec: u64) {
     if usec > 0 {
         std::thread::sleep(std::time::Duration::from_micros(usec));
     }
+}
+
+/// Upper bound on a single heavy-tailed slow-path fetch (µs). Pareto is unbounded;
+/// a pathological tail draw must not park a dispatcher off-CPU for an unbounded
+/// time — the dispatcher must complete the fetch + fill + wake for the blocked
+/// client (it cannot be interrupted on shutdown without breaking that contract), so
+/// this caps each fetch at 2 s (far above any realistic backing-store p99.9). The
+/// worst-case client-join/teardown is NOT a single fetch: at shutdown up to
+/// `n_clients` misses are outstanding and each dispatcher drains its queue share
+/// SERIALLY, so the last client can wait up to `ceil(n_clients / n_slow)` fetches —
+/// with the default staffing (`n_slow ≈ n_clients/3`) ~3·MAX_SERVICE_US. Size the
+/// scenario watchdog / cleanup budget accordingly when configuring a deep tail with
+/// many clients per dispatcher. This caps only the per-FETCH off-CPU time, not a
+/// whole serve-latency sample (fetch + open-loop queueing/coordinated-omission
+/// backlog, which can exceed it); the serve sample is kept inside the `PlatStats`
+/// u32 range by `record_serve_lat`'s own `(ns/1000).min(u32::MAX)` clamp,
+/// independent of this cap. Only the fixed legacy path is uncapped (the user sets
+/// that latency directly).
+const MAX_SERVICE_US: u64 = 2_000_000;
+
+/// Draw one heavy-tailed slow-path service time (µs) from the Pareto resolved by
+/// [`TaobenchConfig::resolve_service_pareto`]: `scale · U^(−1/α)` with `U ∈ (0, 1]`
+/// ([`Rng::f64_open01`]). `U = 1` yields the scale (the floor, below the median);
+/// smaller `U` yields the tail. Clamped to [`MAX_SERVICE_US`]. `inv_neg_alpha`
+/// is the precomputed `−1/α` exponent.
+fn sample_service_us(rng: &mut Rng, scale: f64, inv_neg_alpha: f64) -> u64 {
+    let us = scale * rng.f64_open01().powf(inv_neg_alpha);
+    (us as u64).min(MAX_SERVICE_US)
 }
 
 /// Touch every byte of a served/filled value so the read cannot be elided — the
@@ -128,6 +163,15 @@ impl Rng {
     /// irrelevant for a workload key stream.
     fn below(&mut self, n: u64) -> u64 {
         self.next_u64() % n
+    }
+    /// Uniform `f64` in `(0, 1]` (open at 0, closed at 1) from the top 53 bits —
+    /// the `OpenClosed01` form the Pareto inverse-CDF needs ([`sample_service_us`]):
+    /// `U = 0` would make `U^(−1/α)` infinite, so 0 is excluded. Workload sampling
+    /// only, not cryptographic.
+    fn f64_open01(&mut self) -> f64 {
+        // Top 53 bits + 1 -> integer in 1..=2^53; / 2^53 -> (0, 1].
+        let bits = (self.next_u64() >> 11) + 1;
+        bits as f64 * (1.0 / ((1u64 << 53) as f64))
     }
 }
 
@@ -181,8 +225,30 @@ pub struct TaobenchConfig {
     pub target_hit_pct: usize,
     /// Simulated backing-store fetch latency on a miss, in microseconds (the slow
     /// dispatcher sleeps this long before filling). `0` keeps the slow path as a
-    /// pure thread hop with no sleep.
+    /// pure thread hop with no sleep (and disables the heavy tail — a zero median
+    /// has no Pareto scale, so the fetch stays a no-op regardless of
+    /// `slow_path_p99_us`). When `slow_path_sleep_us > 0` and `slow_path_p99_us >
+    /// slow_path_sleep_us` this is the MEDIAN (p50) of a heavy-tailed service-time
+    /// distribution rather than a fixed latency (see `slow_path_p99_us`).
     pub slow_path_sleep_us: u64,
+    /// Heavy-tailed slow-path service time: the p99 of the simulated backing-store
+    /// fetch, in microseconds. When `> slow_path_sleep_us`, each miss's fetch sleep
+    /// is drawn from a Pareto distribution whose median is `slow_path_sleep_us` and
+    /// whose 99th percentile is this value — most fetches near the median, a heavy
+    /// tail of rare slow fetches (GC pauses, cold cache, disk seeks), the realistic
+    /// power-law shape a backing store exhibits. `0` (default), any value
+    /// `<= slow_path_sleep_us`, OR `slow_path_sleep_us == 0` (a zero median has no
+    /// Pareto scale) keeps the fixed-latency behavior (every fetch sleeps exactly
+    /// `slow_path_sleep_us` — the legacy path, byte-identical). The tail is
+    /// clamped at a fixed maximum so a pathological draw cannot park a dispatcher
+    /// off-CPU unboundedly. A ktstr enhancement beyond the reference, whose
+    /// per-request slow-path service time is a FIXED sleep with no tail (the
+    /// reference's `[target/2, 2×target]` uniform jitter + idle-poll backoff is a
+    /// separate poll/idle-wait knob, not the per-request fetch), so the open-loop
+    /// serve-latency tail ([`crate::workload::TaobenchConfig::arrival_rate`])
+    /// reflects realistic
+    /// backing-store variance.
+    pub slow_path_p99_us: u64,
     /// Open-loop arrival rate, AGGREGATE ops/sec across all client threads (the
     /// taobench analog of schbench's `-R`). `0` (default) = CLOSED loop: each
     /// client blocks until its request completes before issuing the next (the
@@ -207,6 +273,7 @@ impl Default for TaobenchConfig {
             cache_capacity_mib: 64,
             target_hit_pct: 90,
             slow_path_sleep_us: 100,
+            slow_path_p99_us: 0,
             arrival_rate: 0,
         }
     }
@@ -237,10 +304,22 @@ impl TaobenchConfig {
         self.target_hit_pct = pct;
         self
     }
-    /// Set the simulated backing-store fetch latency on a miss, microseconds.
+    /// Set the simulated backing-store fetch latency on a miss, microseconds (the
+    /// MEDIAN when `slow_path_p99_us` enables the heavy tail; `0` keeps the fetch a
+    /// no-op and also disables the tail — a zero median has no Pareto scale).
     #[must_use = "builder methods consume self; bind the result"]
     pub fn slow_path_sleep_us(mut self, us: u64) -> Self {
         self.slow_path_sleep_us = us;
+        self
+    }
+    /// Set the heavy-tailed slow-path service-time p99 in microseconds (`0` or
+    /// `<= slow_path_sleep_us` = fixed latency, the legacy behavior; also fixed when
+    /// `slow_path_sleep_us == 0`, a zero median having no Pareto scale). When larger
+    /// than a non-zero `slow_path_sleep_us`, each miss's fetch is drawn from a Pareto
+    /// with median `slow_path_sleep_us` and this p99.
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn slow_path_p99_us(mut self, us: u64) -> Self {
+        self.slow_path_p99_us = us;
         self
     }
     /// Set the open-loop AGGREGATE arrival rate in ops/sec across all clients
@@ -276,6 +355,34 @@ impl TaobenchConfig {
     /// has no finite key range / no miss stream).
     fn target_hit_fraction(&self) -> f64 {
         (self.target_hit_pct.clamp(1, 99) as f64) / 100.0
+    }
+
+    /// Resolve the heavy-tailed slow-path service-time model from the `(p50, p99)`
+    /// knob: `None` = fixed `slow_path_sleep_us` (the legacy path); `Some((scale,
+    /// inv_neg_alpha))` = a Pareto whose median is `slow_path_sleep_us` and whose
+    /// p99 is `slow_path_p99_us`, sampled by [`sample_service_us`].
+    ///
+    /// `slow_path_p99_us <= slow_path_sleep_us` (incl. `0`) resolves to `None` — a
+    /// p99 at or below the median is not a tail. `slow_path_sleep_us == 0` also
+    /// resolves to `None`: a zero median has no Pareto scale, and the legacy no-op
+    /// fetch is preserved.
+    ///
+    /// Mapping: the Pareto q-quantile is `scale·(1−q)^(−1/α)`, so from the two
+    /// quantiles `p99/p50 = (0.01/0.5)^(−1/α) = 50^(1/α)`, giving
+    /// `α = ln(50) / ln(p99/p50)` and `scale = p50·0.5^(1/α)`. `p99 > p50`
+    /// guarantees `ln(p99/p50) > 0 ⇒ α > 0`, and `α ≥ ln(50)/ln(spread)` keeps the
+    /// mean finite (`α > 1`) for any spread below 50x. The stored `inv_neg_alpha =
+    /// −1/α` is the exponent [`sample_service_us`] raises `U` to.
+    fn resolve_service_pareto(&self) -> Option<(f64, f64)> {
+        let p50 = self.slow_path_sleep_us;
+        let p99 = self.slow_path_p99_us;
+        if p50 == 0 || p99 <= p50 {
+            return None;
+        }
+        let (p50f, p99f) = (p50 as f64, p99 as f64);
+        let alpha = 50.0_f64.ln() / (p99f / p50f).ln();
+        let scale = p50f * 0.5_f64.powf(1.0 / alpha);
+        Some((scale, -1.0 / alpha))
     }
 }
 
@@ -641,6 +748,10 @@ pub(crate) fn run(
     } else {
         (1_000_000_000u64.saturating_mul(n_clients as u64) / config.arrival_rate as u64).max(1)
     };
+    // Resolve the slow-path service-time model once (None = fixed legacy latency;
+    // Some = a per-fetch Pareto draw). Cheap, but kept out of the dispatcher hot
+    // path.
+    let service_pareto = config.resolve_service_pareto();
 
     // Size the resident object count and the key range. Mean value size pins the
     // object count for a byte budget; key_range = capacity / target_hit makes a
@@ -675,7 +786,9 @@ pub(crate) fn run(
                 let slow_q = &slow_q;
                 let slots = &slots;
                 let disp_stop = &disp_stop;
-                s.spawn(move || dispatcher_loop(i, config, cache, slow_q, slots, disp_stop))
+                s.spawn(move || {
+                    dispatcher_loop(i, config, service_pareto, cache, slow_q, slots, disp_stop)
+                })
             })
             .collect();
 
@@ -818,10 +931,13 @@ fn client_loop(
 
 /// One slow dispatcher: pull a miss, perform the simulated backing-store fetch,
 /// fill the cache, and wake the waiting client. Drains any queued misses before
-/// exiting on `disp_stop`.
+/// exiting on `disp_stop`. `service_pareto` is the resolved heavy-tail model
+/// (`None` = fixed `slow_path_sleep_us`); the per-fetch draw is deterministic from
+/// this dispatcher's seeded `rng` (the same one that picks the fill value size).
 fn dispatcher_loop(
     id: usize,
     config: &TaobenchConfig,
+    service_pareto: Option<(f64, f64)>,
     cache: &Cache,
     slow_q: &SlowQueue,
     slots: &[Slot],
@@ -843,7 +959,14 @@ fn dispatcher_loop(
         };
         let Some(req) = req else { break };
 
-        backing_store_fetch(config.slow_path_sleep_us);
+        // Heavy-tailed Pareto draw when configured, else the fixed latency. The
+        // draw precedes the value-size draw, so both come off this dispatcher's
+        // deterministic seeded stream.
+        let usec = match service_pareto {
+            Some((scale, inv_neg_alpha)) => sample_service_us(&mut rng, scale, inv_neg_alpha),
+            None => config.slow_path_sleep_us,
+        };
+        backing_store_fetch(usec);
         cache.fill(req.key, sample_value_size(&mut rng));
         slots[req.client].signal();
     }
@@ -1108,6 +1231,7 @@ mod tests {
             .cache_capacity_mib(128)
             .target_hit_pct(85)
             .slow_path_sleep_us(250)
+            .slow_path_p99_us(2500)
             .arrival_rate(50_000);
         let json = serde_json::to_string(&cfg).expect("TaobenchConfig must serialize");
         let back: TaobenchConfig =
@@ -1304,12 +1428,17 @@ mod tests {
         // arrival_rate == 0 is closed loop: there is no intended-arrival schedule,
         // so serve latency is undefined and the histogram stays EMPTY (the
         // taobench_serve_*_us keys then read absent, distinct from a measured 0).
+        // The heavy tail is ALSO enabled (slow_path_p99_us > slow_path_sleep_us) to
+        // pin that enabling the tail never leaks a serve sample without an open-loop
+        // schedule — the tail only affects fetch latency, not whether serve latency
+        // is measured.
         let cfg = TaobenchConfig::default()
             .client_threads(4)
             .slow_threads(2)
             .cache_capacity_mib(8)
             .target_hit_pct(90)
-            .slow_path_sleep_us(10); // arrival_rate defaults to 0 (closed loop)
+            .slow_path_sleep_us(10)
+            .slow_path_p99_us(1000); // tail enabled; arrival_rate defaults to 0 (closed loop)
         let stop = AtomicBool::new(false);
         let progress = AtomicU64::new(0);
         let out = std::thread::scope(|s| {
@@ -1402,6 +1531,187 @@ mod tests {
             elapsed < std::time::Duration::from_millis(500),
             "open-loop client joined in {elapsed:?}; the pacing sleep must be \
              bounded (interval is ~1s — an unbounded sleep would block the join)"
+        );
+    }
+
+    #[test]
+    fn taobench_config_slow_path_p99_default_and_setter() {
+        // Default keeps the legacy fixed-latency path (no tail); the setter sets the
+        // p99 tail target.
+        assert_eq!(
+            TaobenchConfig::default().slow_path_p99_us,
+            0,
+            "default slow_path_p99_us is 0 (fixed latency)"
+        );
+        let cfg = TaobenchConfig::default().slow_path_p99_us(5000);
+        assert_eq!(cfg.slow_path_p99_us, 5000, "setter sets slow_path_p99_us");
+    }
+
+    #[test]
+    fn taobench_service_pareto_mapping_and_legacy_gate() {
+        // The (p50, p99) knob maps to a Pareto whose analytic quantiles round-trip:
+        // alpha = ln(50)/ln(p99/p50); scale = p50 * 0.5^(1/alpha).
+        let cfg = TaobenchConfig::default()
+            .slow_path_sleep_us(100)
+            .slow_path_p99_us(1000);
+        let (scale, inv_neg_alpha) = cfg.resolve_service_pareto().expect("tail enabled");
+        let alpha = -1.0 / inv_neg_alpha;
+        assert!(
+            (alpha - 50.0_f64.ln() / 10.0_f64.ln()).abs() < 1e-9,
+            "alpha = ln(50)/ln(10), got {alpha}",
+        );
+        // The Pareto q-quantile scale*(1-q)^(-1/alpha) round-trips the config: the
+        // median quantile is p50, the 99th percentile is p99.
+        let median = scale * 0.5_f64.powf(-1.0 / alpha);
+        let p99 = scale * 0.01_f64.powf(-1.0 / alpha);
+        assert!(
+            (median - 100.0).abs() < 1e-6,
+            "median quantile = p50 (100), got {median}",
+        );
+        assert!(
+            (p99 - 1000.0).abs() < 1e-6,
+            "p99 quantile = configured (1000), got {p99}",
+        );
+        // Legacy gate: p99 == 0, p99 < p50, p99 == p50, and p50 == 0 all resolve to
+        // the fixed path (None).
+        let base = TaobenchConfig::default().slow_path_sleep_us(100);
+        assert!(
+            base.clone().slow_path_p99_us(0).resolve_service_pareto().is_none(),
+            "p99 == 0 is fixed",
+        );
+        assert!(
+            base.clone().slow_path_p99_us(50).resolve_service_pareto().is_none(),
+            "p99 < p50 is fixed",
+        );
+        assert!(
+            base.clone().slow_path_p99_us(100).resolve_service_pareto().is_none(),
+            "p99 == p50 is fixed",
+        );
+        assert!(
+            TaobenchConfig::default()
+                .slow_path_sleep_us(0)
+                .slow_path_p99_us(1000)
+                .resolve_service_pareto()
+                .is_none(),
+            "p50 == 0 has no Pareto scale",
+        );
+    }
+
+    #[test]
+    fn taobench_service_sampler_matches_configured_quantiles() {
+        // Drawing many samples from the resolved Pareto through the actual
+        // measurement path (PlatStats) yields a histogram whose p50/p99 land near
+        // the configured (100, 1000) µs. Deterministic (fixed seed); the bands
+        // absorb PlatStats log-bucketing + sampling variance.
+        use crate::workload::schbench::plat::Pct;
+        let cfg = TaobenchConfig::default()
+            .slow_path_sleep_us(100)
+            .slow_path_p99_us(1000);
+        let (scale, inv_neg_alpha) = cfg.resolve_service_pareto().unwrap();
+        let mut rng = Rng::new(0x5A3C_1234);
+        let mut plat = PlatStats::default();
+        for _ in 0..200_000 {
+            let us = sample_service_us(&mut rng, scale, inv_neg_alpha);
+            plat.add_lat(us.min(u32::MAX as u64) as u32);
+        }
+        let q = plat.percentiles();
+        let p50 = q.value_at(Pct::P50);
+        let p99 = q.value_at(Pct::P99);
+        assert!(
+            (90..=115).contains(&p50),
+            "empirical p50 {p50} ≈ configured 100µs (tight band: rejects a sampler \
+             bit-shift / lost-scale bug, absorbs only log-bucketing + seed noise)",
+        );
+        assert!(
+            (850..=1200).contains(&p99),
+            "empirical p99 {p99} ≈ configured 1000µs (tight band: rejects a ~±50% \
+             sampler error, absorbs only log-bucketing + seed noise)",
+        );
+    }
+
+    #[test]
+    fn taobench_service_sampler_clamps_pathological_tail() {
+        // A pathological draw (huge scale, so any U gives a value far above the cap)
+        // is clamped to MAX_SERVICE_US rather than parking a dispatcher unboundedly.
+        let mut rng = Rng::new(7);
+        let v = sample_service_us(&mut rng, 1e12, -0.5);
+        assert_eq!(v, MAX_SERVICE_US, "huge draw clamps to MAX_SERVICE_US");
+    }
+
+    #[test]
+    fn taobench_service_sampler_is_deterministic_from_seed() {
+        // Same seed -> same service-time draw sequence (the determinism the engine
+        // relies on for reproducible runs).
+        let cfg = TaobenchConfig::default()
+            .slow_path_sleep_us(100)
+            .slow_path_p99_us(1000);
+        let (scale, inv_neg_alpha) = cfg.resolve_service_pareto().unwrap();
+        let mut a = Rng::new(42);
+        let mut b = Rng::new(42);
+        for _ in 0..1000 {
+            assert_eq!(
+                sample_service_us(&mut a, scale, inv_neg_alpha),
+                sample_service_us(&mut b, scale, inv_neg_alpha),
+            );
+        }
+    }
+
+    #[test]
+    fn rng_f64_open01_is_in_open_closed_unit_interval() {
+        // f64_open01 must yield U in (0, 1]: 0 is excluded (U^(−1/α) would be
+        // infinite in the Pareto inverse-CDF), 1 is included (the distribution
+        // floor). Pin the boundary contract directly over many fixed-seed draws.
+        let mut rng = Rng::new(0xF00D_BEEF);
+        for _ in 0..1_000_000 {
+            let u = rng.f64_open01();
+            assert!(u > 0.0 && u <= 1.0, "f64_open01 yielded {u}, outside (0, 1]");
+        }
+    }
+
+    #[test]
+    fn open_loop_heavy_tail_inflates_serve_latency() {
+        // Composition with the open-loop serve-latency measurement, ISOLATING the
+        // heavy tail from open-loop queueing/coordinated-omission backlog: run a
+        // FIXED control and a HEAVY-tail variant at the SAME arrival_rate / thread
+        // counts / hit ratio (so any backlog component is shared/cancels), and
+        // assert the heavy-tail serve MAX exceeds the fixed one by a margin queueing
+        // cannot explain — i.e. only the per-fetch Pareto tail accounts for it.
+        let run_serve_max = |p99_us: u64| -> u32 {
+            let cfg = TaobenchConfig::default()
+                .client_threads(4)
+                .slow_threads(4)
+                .cache_capacity_mib(8)
+                .target_hit_pct(90)
+                .slow_path_sleep_us(100)
+                .slow_path_p99_us(p99_us)
+                .arrival_rate(20_000);
+            let stop = AtomicBool::new(false);
+            let progress = AtomicU64::new(0);
+            let out = std::thread::scope(|s| {
+                let h = s.spawn(|| run(&cfg, &stop, &progress, None));
+                while progress.load(Ordering::Relaxed) < 10_000 {
+                    std::hint::spin_loop();
+                }
+                stop.store(true, Ordering::Release);
+                h.join().expect("engine panicked")
+            });
+            let mut serve = PlatStats::default();
+            for (_epoch, p) in &out.phases {
+                serve.combine(&p.serve_lat);
+            }
+            assert!(serve.sample_count() > 0, "open loop recorded serve latency");
+            serve.percentiles().max
+        };
+        let fixed_max = run_serve_max(0); // p99 == 0 -> fixed 100µs fetch
+        let heavy_max = run_serve_max(2000); // p99 2ms -> Pareto tail
+        // The heavy-tail tail draws (p99 2ms, max far higher) dwarf the fixed run's
+        // ~100µs fetch + shared backlog. Require a clear multiplicative margin so a
+        // backlog spike in the fixed run cannot make this pass spuriously.
+        assert!(
+            heavy_max > fixed_max.saturating_mul(3) && heavy_max > 1000,
+            "heavy-tail serve max {heavy_max}µs must exceed the fixed-latency control \
+             {fixed_max}µs by >3x (same arrival_rate/threads, so the gap is the \
+             per-fetch Pareto tail, not shared queueing backlog)",
         );
     }
 }
