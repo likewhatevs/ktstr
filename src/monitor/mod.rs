@@ -899,6 +899,17 @@ pub struct BpfMapFieldValue {
     pub key: String,
     /// The folded value.
     pub value: f64,
+    /// True when this key is a monotonic counter (a `ScalarCounter` scalar
+    /// target). Counter keys SUM-fold ACROSS runs (matching registered
+    /// counters); gauge / per-CPU keys mean-fold. Carried into
+    /// [`MonitorSummary::fold_run_level_ext`]'s counter-key set so the
+    /// cross-run aggregator (`stats::group::fold_ext_metrics`) sums them
+    /// instead of averaging. `#[serde(default)]` matches the module's other
+    /// evolving serialized fields (`scalar_counter`, `page_offset`, …): a stale
+    /// sidecar lacking the field degrades to `false` (mean-fold, the pre-
+    /// counter-fold behavior) rather than hard-failing the whole deserialize.
+    #[serde(default)]
+    pub is_counter: bool,
 }
 
 /// Aggregate schedstat deltas computed from first/last monitor samples.
@@ -1031,12 +1042,36 @@ impl MonitorSummary {
     /// `Option` fields insert only on `Some` (loud-absent on a kernel without the
     /// source: non-HAVE_SCHED_AVG_IRQ, or no CONFIG_PSI / CONFIG_IRQ_TIME_ACCOUNTING).
     /// `entry().or_insert()` so a value already placed by an earlier populator
-    /// wins (no key overlaps today — these are ext-only, disjoint from the
-    /// read_sample- and phase-folded keys). Shared by `stats::sidecar_to_row`
+    /// wins. The fixed ext keys (avg_nr_running, the IRQ/PSI pair) are disjoint
+    /// from the read_sample- and phase-folded keys; the Dynamic keys are
+    /// scheduler-obj-prefixed (`<obj>_<label>`) or level-suffixed (`lb_*_<lvl>`)
+    /// so collisions with the fixed set are not constructed. Shared by
+    /// `stats::sidecar_to_row`
     /// (the perf-delta sidecar row) and `VmResult::run_metric` (the in-test
     /// accessor) so the key list + loud-absent guard cannot drift between the two
     /// surfaces.
+    ///
+    /// Value-only convenience for callers that don't need the cross-run
+    /// counter-key set (`VmResult::run_metric`, unit tests). Delegates to
+    /// [`Self::fold_run_level_ext_with_counter_keys`].
     pub(crate) fn fold_run_level_ext(&self, ext: &mut std::collections::BTreeMap<String, f64>) {
+        let mut counter_keys = std::collections::BTreeSet::new();
+        self.fold_run_level_ext_with_counter_keys(ext, &mut counter_keys);
+    }
+
+    /// Like [`Self::fold_run_level_ext`] but also collects the emitted Dynamic
+    /// monotonic-counter keys into `counter_keys` (the level-suffixed
+    /// `lb_*`/`alb_*` schedstat deltas + any `ScalarCounter` bpf field); gauge
+    /// keys (`avg_nr_running`, the IRQ / PSI pair, per-CPU `_avg`/`_max`) are
+    /// omitted. The cross-run aggregator (`stats::group::fold_ext_metrics`)
+    /// SUM-folds the counter keys instead of averaging them, matching the
+    /// registered-Counter cross-run convention. Used by `stats::sidecar_to_row`
+    /// to populate `GauntletRow::ext_counter_keys`.
+    pub(crate) fn fold_run_level_ext_with_counter_keys(
+        &self,
+        ext: &mut std::collections::BTreeMap<String, f64>,
+        counter_keys: &mut std::collections::BTreeSet<String>,
+    ) {
         if self.total_samples == 0 {
             return;
         }
@@ -1063,27 +1098,28 @@ impl MonitorSummary {
         if let Some(domains) = &self.sched_domain_lb {
             for d in domains {
                 let lvl = d.level.to_ascii_lowercase();
-                ext.entry(format!("lb_count_{lvl}"))
-                    .or_insert(d.lb_count as f64);
-                ext.entry(format!("lb_failed_{lvl}"))
-                    .or_insert(d.lb_failed as f64);
-                ext.entry(format!("lb_gained_{lvl}"))
-                    .or_insert(d.lb_gained as f64);
-                // The four imbalance accumulators are exposed separately — each
-                // is a distinct unit (load / util / task / misfit); a summed
-                // value would be dimensionally meaningless.
-                ext.entry(format!("lb_imbalance_load_{lvl}"))
-                    .or_insert(d.lb_imbalance_load as f64);
-                ext.entry(format!("lb_imbalance_util_{lvl}"))
-                    .or_insert(d.lb_imbalance_util as f64);
-                ext.entry(format!("lb_imbalance_task_{lvl}"))
-                    .or_insert(d.lb_imbalance_task as f64);
-                ext.entry(format!("lb_imbalance_misfit_{lvl}"))
-                    .or_insert(d.lb_imbalance_misfit as f64);
-                ext.entry(format!("alb_count_{lvl}"))
-                    .or_insert(d.alb_count as f64);
-                ext.entry(format!("alb_pushed_{lvl}"))
-                    .or_insert(d.alb_pushed as f64);
+                // All sched_domain load-balance fields are deltas of kernel
+                // monotonic counters (see [`SchedDomainLbDelta`]) -> Dynamic
+                // Counter keys that SUM-fold across runs. The four imbalance
+                // accumulators stay SEPARATE keys — each a distinct,
+                // incommensurable unit (load / util / task / misfit), never
+                // summed INTO one key — but each individually SUM-folds across
+                // runs like the other counters.
+                for (suffix, val) in [
+                    ("lb_count", d.lb_count),
+                    ("lb_failed", d.lb_failed),
+                    ("lb_gained", d.lb_gained),
+                    ("lb_imbalance_load", d.lb_imbalance_load),
+                    ("lb_imbalance_util", d.lb_imbalance_util),
+                    ("lb_imbalance_task", d.lb_imbalance_task),
+                    ("lb_imbalance_misfit", d.lb_imbalance_misfit),
+                    ("alb_count", d.alb_count),
+                    ("alb_pushed", d.alb_pushed),
+                ] {
+                    let k = format!("{suffix}_{lvl}");
+                    counter_keys.insert(k.clone());
+                    ext.entry(k).or_insert(val as f64);
+                }
             }
         }
         // Watched scheduler BPF-map fields: Dynamic, scheduler-obj-prefixed
@@ -1093,6 +1129,9 @@ impl MonitorSummary {
         // nothing (loud-absent).
         if let Some(fields) = &self.bpf_map_fields {
             for f in fields {
+                if f.is_counter {
+                    counter_keys.insert(f.key.clone());
+                }
                 ext.entry(f.key.clone()).or_insert(f.value);
             }
         }
@@ -1599,16 +1638,21 @@ impl MonitorSummary {
                 out.push(BpfMapFieldValue {
                     key: key_base.to_string(),
                     value,
+                    is_counter: a.scalar_counter,
                 });
             }
             if a.pc_n > 0 {
+                // Per-CPU keys are a gauge mean (`_avg`) and a spatial peak
+                // (`_max`), not counters — they mean-fold across runs.
                 out.push(BpfMapFieldValue {
                     key: format!("{key_base}_avg"),
                     value: a.pc_sum / a.pc_n as f64,
+                    is_counter: false,
                 });
                 out.push(BpfMapFieldValue {
                     key: format!("{key_base}_max"),
                     value: a.pc_max,
+                    is_counter: false,
                 });
             }
         }

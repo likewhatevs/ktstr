@@ -877,6 +877,94 @@ fn fold_run_level_ext_folds_the_five_monitor_metrics() {
     assert_eq!(ext4.get("avg_nr_running"), Some(&1.0), "pre-set value wins");
 }
 
+/// `fold_run_level_ext_with_counter_keys` tags the Dynamic monotonic-counter
+/// keys (the lb_*/alb_* schedstat deltas + any `ScalarCounter` bpf field) into
+/// `counter_keys` so the cross-run fold SUM-folds them; gauge keys
+/// (`avg_nr_running`, a non-counter bpf field) are NOT tagged. The value-only
+/// `fold_run_level_ext` wrapper produces the identical `ext` map.
+#[test]
+fn fold_run_level_ext_tags_dynamic_counter_keys() {
+    use super::BpfMapFieldValue;
+    use std::collections::{BTreeMap, BTreeSet};
+    let s = MonitorSummary {
+        total_samples: 3,
+        avg_nr_running: 1.5,
+        sched_domain_lb: Some(vec![SchedDomainLbDelta {
+            level: "MC".into(),
+            lb_count: 20,
+            lb_failed: 6,
+            lb_gained: 12,
+            lb_imbalance_load: 100,
+            lb_imbalance_util: 200,
+            lb_imbalance_task: 3,
+            lb_imbalance_misfit: 0,
+            alb_count: 1,
+            alb_pushed: 2,
+        }]),
+        bpf_map_fields: Some(vec![
+            BpfMapFieldValue {
+                key: "bpf_x_allocs".into(),
+                value: 42.0,
+                is_counter: true,
+            },
+            BpfMapFieldValue {
+                key: "bpf_x_lat".into(),
+                value: 7.0,
+                is_counter: false,
+            },
+        ]),
+        ..Default::default()
+    };
+    let mut ext = BTreeMap::new();
+    let mut counter_keys = BTreeSet::new();
+    s.fold_run_level_ext_with_counter_keys(&mut ext, &mut counter_keys);
+    // All 9 lb_*/alb_* keys + the ScalarCounter bpf key are tagged as counters.
+    for k in [
+        "lb_count_mc",
+        "lb_failed_mc",
+        "lb_gained_mc",
+        "lb_imbalance_load_mc",
+        "lb_imbalance_util_mc",
+        "lb_imbalance_task_mc",
+        "lb_imbalance_misfit_mc",
+        "alb_count_mc",
+        "alb_pushed_mc",
+        "bpf_x_allocs",
+    ] {
+        assert!(counter_keys.contains(k), "{k} should be tagged as a counter");
+    }
+    // Gauges are NOT tagged (they mean-fold cross-run).
+    assert!(!counter_keys.contains("avg_nr_running"));
+    assert!(!counter_keys.contains("bpf_x_lat"));
+    // The value-only wrapper produces the identical ext map (delegation).
+    let mut ext_via_wrapper = BTreeMap::new();
+    s.fold_run_level_ext(&mut ext_via_wrapper);
+    assert_eq!(ext, ext_via_wrapper);
+}
+
+/// `BpfMapFieldValue` serde: `is_counter` roundtrips, AND a stale sidecar form
+/// lacking `is_counter` deserializes to the `false` default (the
+/// `#[serde(default)]` back-compat contract) — degrading to mean-fold rather
+/// than hard-failing the whole sidecar deserialize.
+#[test]
+fn bpf_map_field_value_is_counter_serde_default() {
+    use super::BpfMapFieldValue;
+    let v = BpfMapFieldValue {
+        key: "k".into(),
+        value: 9.0,
+        is_counter: true,
+    };
+    let json = serde_json::to_string(&v).unwrap();
+    let back: BpfMapFieldValue = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.key, "k");
+    assert_eq!(back.value, 9.0);
+    assert!(back.is_counter, "is_counter roundtrips");
+    // Stale form (no is_counter key) -> defaults to false (mean-fold).
+    let stale: BpfMapFieldValue =
+        serde_json::from_str(r#"{"key":"k","value":9.0}"#).unwrap();
+    assert!(!stale.is_counter, "missing is_counter defaults to false");
+}
+
 #[test]
 fn fold_run_level_ext_folds_per_domain_lb_keys() {
     use std::collections::BTreeMap;

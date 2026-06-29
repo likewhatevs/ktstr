@@ -529,6 +529,12 @@ struct Accumulator<'a> {
     // fall back to arithmetic mean — same legacy semantic the
     // previous (sum, u32) shape produced.
     ext_pairs: BTreeMap<String, Vec<(f64, usize)>>,
+    // Union of the Dynamic monotonic-counter ext keys across contributors
+    // (`GauntletRow::ext_counter_keys`). `fold_ext_metrics` SUM-folds these
+    // instead of averaging — they are not in the static `METRICS` registry, so
+    // `metric_def` can't classify them. Carried onto the aggregated row so a
+    // second-level cross-RUN fold keeps SUM-folding them.
+    ext_counter_keys: BTreeSet<String>,
     // Sum of `run_sample_count` across contributors. Carries
     // through to the aggregated row's `run_sample_count` so a
     // downstream cross-RUN consumer that further folds these
@@ -578,6 +584,7 @@ impl<'a> Accumulator<'a> {
             max_imbalance_ratio: 0.0,
             max_max_dsq_depth: 0,
             ext_pairs: BTreeMap::new(),
+            ext_counter_keys: BTreeSet::new(),
             sum_run_sample_count: 0,
         }
     }
@@ -673,6 +680,13 @@ impl<'a> Accumulator<'a> {
                 .or_default()
                 .push((*v, row.run_sample_count.max(1)));
         }
+        // Union the Dynamic monotonic-counter key tags across contributors.
+        // Load-bearing, NOT merely defensive: per-run bpf-field resolution (and
+        // which topology levels are present) can vary within a pairing group, so
+        // a key tagged in only some rows must still be recognized as a counter
+        // for the whole group. fold_ext_metrics SUM-folds the union, not means.
+        self.ext_counter_keys
+            .extend(row.ext_counter_keys.iter().cloned());
     }
 
     /// Emit the folded [`AveragedGroup`] for this group. Identity
@@ -740,7 +754,7 @@ impl<'a> Accumulator<'a> {
         // arithmetic mean, the legacy (sum, count) semantic. Skip a key whose
         // reduction is None (every value NaN — defensive post sidecar_to_row
         // sanitize).
-        let ext_metrics = fold_ext_metrics(acc.ext_pairs);
+        let ext_metrics = fold_ext_metrics(acc.ext_pairs, &acc.ext_counter_keys);
         let aggregated = GauntletRow {
             scenario: acc.first.scenario.clone(),
             topology: acc.first.topology.clone(),
@@ -807,6 +821,10 @@ impl<'a> Accumulator<'a> {
             keep_last_count: round_i64(acc.sum_keep_last_count),
             total_iterations: round_u64(acc.sum_total_iterations),
             ext_metrics,
+            // Carry the Dynamic counter-key tags forward so a second-level
+            // cross-RUN fold of these already-aggregated rows keeps SUM-folding
+            // them (the SUM-of-SUMs stays a SUM).
+            ext_counter_keys: acc.ext_counter_keys,
             // Phase buckets do not aggregate cleanly across an
             // averaged group: two contributors might run different
             // scenarios with different phase counts, and per-phase
@@ -851,12 +869,18 @@ impl<'a> Accumulator<'a> {
 /// every WorstLowest, MAX for SampleReduction::Worst — the
 /// aggregate_finite arms). Dispatch by registered MetricKind so
 /// Gauge(Avg) gets the weighted-mean fold (matches the per-phase merge
-/// contract); unregistered names (no metric_def) fall back to
-/// arithmetic mean, the legacy (sum, count) semantic. Skip a key whose
+/// contract); an unregistered name (no metric_def) folds by `counter_keys`: a
+/// Dynamic monotonic-counter key (lb_*/alb_* schedstat delta, ScalarCounter bpf
+/// field) SUM-folds (matching the registered-Counter convention), every other
+/// unregistered name falls back to arithmetic mean, the legacy (sum, count)
+/// semantic. Skip a key whose
 /// reduction is None (every value NaN — defensive post sidecar_to_row
 /// sanitize). Rate metrics are then re-derived from the folded
 /// components (Σnum/Σdenom) as a post-pass.
-fn fold_ext_metrics(ext_pairs: BTreeMap<String, Vec<(f64, usize)>>) -> BTreeMap<String, f64> {
+fn fold_ext_metrics(
+    ext_pairs: BTreeMap<String, Vec<(f64, usize)>>,
+    counter_keys: &BTreeSet<String>,
+) -> BTreeMap<String, f64> {
     let mut ext_metrics: std::collections::BTreeMap<String, f64> = ext_pairs
         .into_iter()
         .filter_map(|(k, pairs)| {
@@ -871,9 +895,7 @@ fn fold_ext_metrics(ext_pairs: BTreeMap<String, Vec<(f64, usize)>>) -> BTreeMap<
                 // so this is defensive belt-and-suspenders.)
                 if matches!(
                     def.kind,
-                    MetricKind::Rate { .. }
-                        | MetricKind::PerPhase
-                        | MetricKind::PerRunDistribution
+                    MetricKind::Rate { .. } | MetricKind::PerPhase | MetricKind::PerRunDistribution
                 ) {
                     return None;
                 }
@@ -884,7 +906,17 @@ fn fold_ext_metrics(ext_pairs: BTreeMap<String, Vec<(f64, usize)>>) -> BTreeMap<
                     None
                 } else {
                     let sum: f64 = pairs.iter().map(|(v, _)| *v).sum();
-                    Some((k, sum / n as f64))
+                    // A Dynamic monotonic-counter key (lb_*/alb_* schedstat delta
+                    // or a ScalarCounter bpf field) SUM-folds across runs,
+                    // matching the registered-Counter convention (aggregate_finite's
+                    // Counter arm). Untagged keys (gauges, per-CPU _avg/_max) keep
+                    // the legacy arithmetic-mean fold.
+                    let v = if counter_keys.contains(&k) {
+                        sum
+                    } else {
+                        sum / n as f64
+                    };
+                    Some((k, v))
                 }
             }
         })
@@ -1116,8 +1148,13 @@ pub fn sidecar_to_row(sc: &crate::test_support::SidecarResult) -> GauntletRow {
     // only on Some (loud-absent on a kernel without the source). Shared with
     // VmResult::run_metric via fold_run_level_ext so the key list + loud-absent
     // guard can't drift between the sidecar row and the in-test accessor.
+    // Dynamic monotonic-counter ext keys (lb_*/alb_* schedstat deltas + any
+    // ScalarCounter bpf field) collected alongside the values so the cross-run
+    // fold SUM-folds them (they are not in the static METRICS registry, so
+    // metric_def can't classify them — see fold_ext_metrics).
+    let mut ext_counter_keys = BTreeSet::new();
     if let Some(m) = sc.monitor.as_ref() {
-        m.fold_run_level_ext(&mut ext_metrics);
+        m.fold_run_level_ext_with_counter_keys(&mut ext_metrics, &mut ext_counter_keys);
     }
 
     GauntletRow {
@@ -1175,6 +1212,9 @@ pub fn sidecar_to_row(sc: &crate::test_support::SidecarResult) -> GauntletRow {
         // diagnostic metadata, not a scenario metric) plus the host-side
         // monitor schedstat aggregates.
         ext_metrics,
+        // Which of the Dynamic ext keys are monotonic counters (SUM-fold
+        // cross-run); empty when there is no monitor / no counter keys.
+        ext_counter_keys,
         // Carry per-phase buckets verbatim from the source
         // ScenarioStats. The bucket structure has already been
         // reduced by the host-side phase aggregator (Counter via

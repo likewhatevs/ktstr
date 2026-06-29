@@ -335,6 +335,15 @@ pub struct GauntletRow {
     /// [`metric_def`] when a matching entry exists in [`METRICS`].
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub ext_metrics: BTreeMap<String, f64>,
+    /// The subset of [`Self::ext_metrics`] keys that are Dynamic monotonic
+    /// counters (the level-suffixed `lb_*`/`alb_*` schedstat deltas + any
+    /// `ScalarCounter` watched bpf field). These keys are not in the static
+    /// `METRICS` registry, so the cross-run aggregator (`fold_ext_metrics`)
+    /// consults this set to SUM-fold them instead of averaging — matching the
+    /// registered-Counter cross-run convention. Empty when the run has no
+    /// monitor or no Dynamic counter keys.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub ext_counter_keys: BTreeSet<String>,
     /// Per-phase metric buckets carried verbatim from the source
     /// sidecar's [`crate::assert::ScenarioStats::phases`]. Each
     /// [`crate::assert::PhaseBucket`] surfaces the metric values

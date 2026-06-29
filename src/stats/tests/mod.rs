@@ -29,6 +29,7 @@ fn make_row(scenario: &str, topo: &str, passed: bool, spread: f64) -> GauntletRo
         keep_last_count: 0,
         total_iterations: 0,
         ext_metrics: BTreeMap::new(),
+        ext_counter_keys: BTreeSet::new(),
         phases: Vec::new(),
     }
 }
@@ -73,6 +74,7 @@ fn make_filter_row(
         keep_last_count: 0,
         total_iterations: 0,
         ext_metrics: BTreeMap::new(),
+        ext_counter_keys: BTreeSet::new(),
         phases: Vec::new(),
     }
 }
@@ -81,5 +83,6 @@ mod aggregation_and_analyze;
 mod compare_core;
 mod compare_phase;
 mod dims_pairing_runs;
+mod dynamic_counter_fold;
 mod rowfilter_and_group_avg;
 mod sidecar_and_metric_def;
