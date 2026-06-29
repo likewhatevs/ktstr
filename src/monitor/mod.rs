@@ -915,19 +915,17 @@ pub struct BpfMapFieldValue {
 /// Aggregate schedstat deltas computed from first/last monitor samples.
 ///
 /// All values are summed across CPUs and represent the delta over the
-/// monitoring window. Rates are per second.
+/// monitoring window. `total_schedstat_wall_sec` carries that window's span in
+/// seconds — the denominator for the per-second schedstat Rate metrics
+/// (`*_per_sec`, derived in the metric registry).
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct SchedstatDeltas {
     /// Total scheduling delay increase (ns) across all CPUs.
     pub total_run_delay: u64,
-    /// Run delay per second (ns/s) across all CPUs.
-    pub run_delay_rate: f64,
     /// Total pcount increase across all CPUs.
     pub total_pcount: u64,
-    /// Total context switch increase across all CPUs.
+    /// Total schedule() invocation increase (`rq.sched_count`) across all CPUs.
     pub total_sched_count: u64,
-    /// Context switches per second across all CPUs.
-    pub sched_count_rate: f64,
     /// Total yield count increase across all CPUs.
     pub total_yld_count: u64,
     /// Total go-idle count increase across all CPUs.
@@ -936,6 +934,10 @@ pub struct SchedstatDeltas {
     pub total_ttwu_count: u64,
     /// Total ttwu_local count increase across all CPUs.
     pub total_ttwu_local: u64,
+    /// Monitor-window span in seconds (last-first schedstat-bearing sample) —
+    /// the denominator for the per-second schedstat Rate metrics; 0.0 on a
+    /// degenerate single-sample window.
+    pub total_schedstat_wall_sec: f64,
 }
 
 /// Per-domain-level CFS load-balance counter deltas over the monitoring window.
@@ -1407,29 +1409,24 @@ impl MonitorSummary {
         let total_ttwu_local = sum_field_u32(last, |ss| ss.ttwu_local)
             .saturating_sub(sum_field_u32(first, |ss| ss.ttwu_local));
 
+        // Window span over the SAME first/last schedstat-bearing samples the
+        // total_* deltas span — the provenance-correct per-second denominator
+        // (a different window than the IRQ total_phase_wall_sec, so this carries
+        // its own). The registry per-second Rates divide the total_* numerators
+        // by this; 0.0 on a single-sample window disables the rate (Rate
+        // derivation skips a zero/non-finite denominator).
         let duration_ms = last.elapsed_ms.saturating_sub(first.elapsed_ms);
         let duration_secs = duration_ms as f64 / 1000.0;
-        let run_delay_rate = if duration_secs > 0.0 {
-            total_run_delay as f64 / duration_secs
-        } else {
-            0.0
-        };
-        let sched_count_rate = if duration_secs > 0.0 {
-            total_sched_count as f64 / duration_secs
-        } else {
-            0.0
-        };
 
         Some(SchedstatDeltas {
             total_run_delay,
-            run_delay_rate,
             total_pcount,
             total_sched_count,
-            sched_count_rate,
             total_yld_count,
             total_sched_goidle,
             total_ttwu_count,
             total_ttwu_local,
+            total_schedstat_wall_sec: duration_secs,
         })
     }
 

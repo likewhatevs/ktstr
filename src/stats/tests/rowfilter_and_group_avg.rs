@@ -846,9 +846,15 @@ fn group_and_average_schedstat_rates_pool_sigma_over_sigma() {
     assert_eq!(out.len(), 1);
     let row = &out[0].row;
     // Counter ext components SUM-fold across runs.
-    assert_eq!(row.ext_metrics.get("total_run_delay").copied(), Some(2000.0));
+    assert_eq!(
+        row.ext_metrics.get("total_run_delay").copied(),
+        Some(2000.0)
+    );
     assert_eq!(row.ext_metrics.get("total_pcount").copied(), Some(10.0));
-    assert_eq!(row.ext_metrics.get("total_ttwu_count").copied(), Some(100.0));
+    assert_eq!(
+        row.ext_metrics.get("total_ttwu_count").copied(),
+        Some(100.0)
+    );
     assert_eq!(row.ext_metrics.get("total_ttwu_local").copied(), Some(2.0));
     // Rates re-derive Σ/Σ (the pooled mean), NOT the per-run mean-of-ratios.
     let per_sched = metric_def("total_run_delay_ns_per_sched")
@@ -912,7 +918,8 @@ fn sched_goidle_fraction_derives_and_pools_sigma_over_sigma() {
 fn taobench_whole_run_rates_derive_and_pool_sigma_over_sigma() {
     let mk = |fast: f64, slow: f64, wall: f64| {
         let mut r = make_row("t", "tiny-1llc", true, 0.0);
-        r.ext_metrics.insert("total_taobench_ops".into(), fast + slow);
+        r.ext_metrics
+            .insert("total_taobench_ops".into(), fast + slow);
         r.ext_metrics.insert("total_taobench_fast_ops".into(), fast);
         r.ext_metrics.insert("total_taobench_slow_ops".into(), slow);
         r.ext_metrics.insert("total_taobench_wall_sec".into(), wall);
@@ -935,7 +942,10 @@ fn taobench_whole_run_rates_derive_and_pool_sigma_over_sigma() {
     assert_eq!(out.len(), 1);
     let row = &out[0].row;
     // Counter components SUM-fold across runs.
-    assert_eq!(row.ext_metrics.get("total_taobench_ops").copied(), Some(4000.0));
+    assert_eq!(
+        row.ext_metrics.get("total_taobench_ops").copied(),
+        Some(4000.0)
+    );
     assert_eq!(
         row.ext_metrics.get("total_taobench_fast_ops").copied(),
         Some(1000.0),
@@ -963,6 +973,54 @@ fn taobench_whole_run_rates_derive_and_pool_sigma_over_sigma() {
     );
 }
 
+/// Per-second schedstat rates (pcount_per_sec + run_delay_per_sec et al.) derive
+/// total_X / total_schedstat_wall_sec and pool Σ/Σ across runs (the Rate
+/// cross-run fold), NOT a mean of per-run rates. Unequal windows make the two
+/// disagree: run A pcount 1000 over 1 s (1000/s), run B pcount 1000 over 99 s
+/// (~10/s). Σpcount 2000, Σwall 100 s → 20/s; the mean-of-rates would give
+/// ~505/s. This duration-weighting is exactly why the rate exists — to compare a
+/// differing-duration cohort raw counts cannot.
+#[test]
+fn schedstat_per_second_rates_derive_and_pool_sigma_over_sigma() {
+    let mk = |pcount: f64, run_delay: f64, wall: f64| {
+        let mut r = make_row("t", "tiny-1llc", true, 0.0);
+        r.ext_metrics.insert("total_pcount".into(), pcount);
+        r.ext_metrics.insert("total_run_delay".into(), run_delay);
+        r.ext_metrics
+            .insert("total_schedstat_wall_sec".into(), wall);
+        r
+    };
+    let read = |row: &_, name: &str| metric_def(name).unwrap().read(row).expect("rate derived");
+
+    // Single run: 1000 pcount + 6000 ns run_delay over 2 s.
+    let one = group_and_average_by(&[mk(1000.0, 6000.0, 2.0)], LEGACY_PAIRING_DIMS);
+    assert!((read(&one[0].row, "pcount_per_sec") - 500.0).abs() < 1e-9); // 1000/2
+    assert!((read(&one[0].row, "run_delay_per_sec") - 3000.0).abs() < 1e-9); // 6000/2
+
+    // Two runs, unequal windows → pooled Σ/Σ, not mean-of-rates.
+    let out = group_and_average_by(
+        &[mk(1000.0, 1000.0, 1.0), mk(1000.0, 1000.0, 99.0)],
+        LEGACY_PAIRING_DIMS,
+    );
+    assert_eq!(out.len(), 1);
+    let row = &out[0].row;
+    // Numerators + the wall-sec denominator are Counters → SUM-fold.
+    assert_eq!(row.ext_metrics.get("total_pcount").copied(), Some(2000.0));
+    assert_eq!(
+        row.ext_metrics.get("total_schedstat_wall_sec").copied(),
+        Some(100.0),
+    );
+    // Σpcount/Σwall = 2000/100 = 20/s (duration-weighted), NOT the mean-of-rates
+    // ((1000 + ~10.1)/2 ≈ 505).
+    let rate = read(row, "pcount_per_sec");
+    assert!(
+        (rate - 20.0).abs() < 1e-9,
+        "Σpcount/Σwall = 2000/100 = 20, got {rate} (mean-of-rates ~505)",
+    );
+    // run_delay_per_sec likewise: Σ2000 / Σ100 = 20 ns/s.
+    assert!((read(row, "run_delay_per_sec") - 20.0).abs() < 1e-9);
+}
+
 /// schbench whole-run Class-3 gate-Rates (role-separate run-delay per-schedule
 /// means) + the loop Counter pool Σ/Σ and Σ across runs from their Counter ext
 /// components, NOT a mean of per-run rates, and the two thread ROLES pool
@@ -982,8 +1040,7 @@ fn schbench_class3_rates_derive_and_pool_sigma_over_sigma() {
             .insert("total_schbench_worker_run_delay_ns".into(), wkr_rd);
         r.ext_metrics
             .insert("total_schbench_worker_pcount".into(), wkr_pc);
-        r.ext_metrics
-            .insert("total_schbench_loops".into(), loops);
+        r.ext_metrics.insert("total_schbench_loops".into(), loops);
         r
     };
     let read = |row: &_, name: &str| metric_def(name).unwrap().read(row).expect("metric present");
@@ -1022,9 +1079,7 @@ fn schbench_class3_rates_derive_and_pool_sigma_over_sigma() {
         Some(1000.0),
     );
     assert_eq!(
-        row.ext_metrics
-            .get("total_schbench_worker_pcount")
-            .copied(),
+        row.ext_metrics.get("total_schbench_worker_pcount").copied(),
         Some(10.0),
     );
     assert_eq!(

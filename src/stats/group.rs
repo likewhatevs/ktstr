@@ -1140,6 +1140,15 @@ pub fn sidecar_to_row(sc: &crate::test_support::SidecarResult) -> GauntletRow {
         );
         ext_metrics.insert("total_ttwu_count".to_string(), sd.total_ttwu_count as f64);
         ext_metrics.insert("total_ttwu_local".to_string(), sd.total_ttwu_local as f64);
+        // Per-second Rate denominator: the schedstat-window span, co-inserted
+        // both-or-neither with the total_* numerators above so every *_per_sec
+        // schedstat Rate has its matching-window denominator present (the
+        // derive_rate_metrics num+den co-presence invariant; the same window the
+        // total_* deltas span, so num/den share a time base).
+        ext_metrics.insert(
+            "total_schedstat_wall_sec".to_string(),
+            sd.total_schedstat_wall_sec,
+        );
     }
     // Run-level ext-only monitor metrics (avg_nr_running + the PELT IRQ load
     // pair + the PSI-irq pair), folded from the run's MonitorSummary. Inserted

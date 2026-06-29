@@ -1214,8 +1214,11 @@ impl MetricDef {
                 // hostile per-CPU u64::MAX must clamp, not wrap, this per-freeze
                 // total (the Counter delta reads it). Exact for every in-range value.
                 let cpus = sample.snapshot.per_cpu_time();
-                (!cpus.is_empty())
-                    .then(|| cpus.iter().map(|c| c.irqs_sum).fold(0u64, u64::saturating_add) as f64)
+                (!cpus.is_empty()).then(|| {
+                    cpus.iter()
+                        .map(|c| c.irqs_sum)
+                        .fold(0u64, u64::saturating_add) as f64
+                })
             }
             "total_softirq_net_rx" => {
                 let cpus = sample.snapshot.per_cpu_time();
@@ -1259,13 +1262,19 @@ impl MetricDef {
             }
             "total_softirq_time_ns" => {
                 let cpus = sample.snapshot.per_cpu_time();
-                (!cpus.is_empty())
-                    .then(|| cpus.iter().map(|c| c.cpustat_softirq_ns).fold(0u64, u64::saturating_add) as f64)
+                (!cpus.is_empty()).then(|| {
+                    cpus.iter()
+                        .map(|c| c.cpustat_softirq_ns)
+                        .fold(0u64, u64::saturating_add) as f64
+                })
             }
             "total_steal_time_ns" => {
                 let cpus = sample.snapshot.per_cpu_time();
-                (!cpus.is_empty())
-                    .then(|| cpus.iter().map(|c| c.cpustat_steal_ns).fold(0u64, u64::saturating_add) as f64)
+                (!cpus.is_empty()).then(|| {
+                    cpus.iter()
+                        .map(|c| c.cpustat_steal_ns)
+                        .fold(0u64, u64::saturating_add) as f64
+                })
             }
             // `system_time_ns` / `user_time_ns` are deliberately absent
             // here: they are NOT read per-sample. A per-sample
@@ -1773,8 +1782,10 @@ pub static METRICS: &[MetricDef] = &[
         accessor: |_| None,
     },
     MetricDef {
-        // Context-switch count (`rq.sched_count`). Informational: more
-        // context-switches can mean responsiveness OR thrashing — no direction.
+        // schedule() invocation count (`rq.sched_count` — incremented once per
+        // __schedule() call, a superset of context switches since re-picking the
+        // same task still counts). Informational: more scheduler entries can
+        // mean responsiveness OR thrashing — no direction.
         name: "total_sched_count",
         polarity: crate::test_support::Polarity::Informational,
         kind: MetricKind::Counter,
@@ -1888,6 +1899,127 @@ pub static METRICS: &[MetricDef] = &[
         default_abs: 0.05,
         default_rel: 0.10,
         display_unit: "",
+        accessor: |_| None,
+    },
+    // Per-second schedstat rates: each total_* schedstat Counter divided by
+    // total_schedstat_wall_sec (the monitor-window span). Unlike the
+    // per-schedule ratios above (total_run_delay_ns_per_sched / *_fraction,
+    // load-normalized per-EVENT), these are per-TIME — duration-normalized so
+    // --noise-adjust can compare cohorts whose runs differ in wall duration
+    // (raw counts are not comparable across differing durations; per-second
+    // rates are). At EQUAL duration a per-second rate ranks identically to the
+    // raw count, so it adds nothing then — its value is the differing-duration
+    // case. Rate kind => cross-run Σnumerator/Σdenominator (duration-weighted),
+    // NOT a mean of per-run rates. All Informational (raw activity rates carry
+    // no universal better-direction) except run_delay_per_sec (latency,
+    // LowerBetter). Absent when CONFIG_SCHEDSTATS is off or the window is
+    // degenerate (denominator absent/0).
+    MetricDef {
+        // Hidden rate-denominator component (NOT user-facing): the schedstat
+        // monitor-window span in seconds, co-inserted both-or-neither with the
+        // total_* schedstat counters in sidecar_to_row. Counter so it survives
+        // the cross-RUN Sum-fold (Σcount / Σsec re-derives). Distinct from
+        // total_phase_wall_sec (the per-phase IRQ-capture window) — schedstat's
+        // window is the monitor-sample span, a different measurement.
+        name: "total_schedstat_wall_sec",
+        polarity: crate::test_support::Polarity::Informational,
+        kind: MetricKind::Counter,
+        default_abs: 0.1,
+        default_rel: 0.30,
+        display_unit: "s",
+        accessor: |_| None,
+    },
+    MetricDef {
+        // Σrun_delay / Σwindow-seconds — total scheduling-wait delay accrued per
+        // second (ns/s). LowerBetter (less accrued wait = better). Distinct from
+        // total_run_delay_ns_per_sched (ns PER SCHEDULE): _per_sec is per-time,
+        // _ns_per_sched is per-event.
+        name: "run_delay_per_sec",
+        polarity: crate::test_support::Polarity::LowerBetter,
+        kind: MetricKind::Rate {
+            numerator: "total_run_delay",
+            denominator: "total_schedstat_wall_sec",
+        },
+        default_abs: 1_000_000.0,
+        default_rel: 0.30,
+        display_unit: "ns/s",
+        accessor: |_| None,
+    },
+    MetricDef {
+        // Σpcount / Σwindow-seconds — task-arrival (non-idle schedule) rate per
+        // second. Informational (scheduling-activity throughput tracks offered
+        // load + scheduler behavior together, no universal direction).
+        name: "pcount_per_sec",
+        polarity: crate::test_support::Polarity::Informational,
+        kind: MetricKind::Rate {
+            numerator: "total_pcount",
+            denominator: "total_schedstat_wall_sec",
+        },
+        default_abs: 100.0,
+        default_rel: 0.30,
+        display_unit: "/s",
+        accessor: |_| None,
+    },
+    MetricDef {
+        // Σsched_count / Σwindow-seconds — schedule() invocations per second
+        // (rq.sched_count increments once per __schedule() call, a superset of
+        // context switches since re-picking the same task still counts).
+        // Informational. The per-second sibling of the precomputed struct rate
+        // that was retired; cross-run-foldable here (Σnum/Σden), the struct
+        // field was not.
+        name: "sched_count_per_sec",
+        polarity: crate::test_support::Polarity::Informational,
+        kind: MetricKind::Rate {
+            numerator: "total_sched_count",
+            denominator: "total_schedstat_wall_sec",
+        },
+        default_abs: 100.0,
+        default_rel: 0.30,
+        display_unit: "/s",
+        accessor: |_| None,
+    },
+    MetricDef {
+        // Σyld_count / Σwindow-seconds — sched_yield() calls per second.
+        // Informational; high-signal only under a yield-storm pathology.
+        name: "yld_count_per_sec",
+        polarity: crate::test_support::Polarity::Informational,
+        kind: MetricKind::Rate {
+            numerator: "total_yld_count",
+            denominator: "total_schedstat_wall_sec",
+        },
+        default_abs: 10.0,
+        default_rel: 0.30,
+        display_unit: "/s",
+        accessor: |_| None,
+    },
+    MetricDef {
+        // Σttwu_count / Σwindow-seconds — wakeups per second. Informational
+        // (wakeup volume; the locality DIRECTION is ttwu_local_fraction, not a
+        // per-second magnitude — so ttwu_local has no _per_sec rate).
+        name: "ttwu_count_per_sec",
+        polarity: crate::test_support::Polarity::Informational,
+        kind: MetricKind::Rate {
+            numerator: "total_ttwu_count",
+            denominator: "total_schedstat_wall_sec",
+        },
+        default_abs: 100.0,
+        default_rel: 0.30,
+        display_unit: "/s",
+        accessor: |_| None,
+    },
+    MetricDef {
+        // Σsched_goidle / Σwindow-seconds — go-idle transitions per second.
+        // Informational; the per-TIME companion to sched_goidle_fraction (the
+        // per-schedule share) — a high goidle/sec can signal wakeup-thrash.
+        name: "sched_goidle_per_sec",
+        polarity: crate::test_support::Polarity::Informational,
+        kind: MetricKind::Rate {
+            numerator: "total_sched_goidle",
+            denominator: "total_schedstat_wall_sec",
+        },
+        default_abs: 100.0,
+        default_rel: 0.30,
+        display_unit: "/s",
         accessor: |_| None,
     },
     MetricDef {

@@ -110,7 +110,7 @@ fn sidecar_to_row_carries_monitor_schedstat_ext_counters() {
                 total_sched_goidle: 20,
                 total_ttwu_count: 200,
                 total_ttwu_local: 150,
-                ..Default::default()
+                total_schedstat_wall_sec: 2.0,
             }),
             ..Default::default()
         }),
@@ -125,11 +125,26 @@ fn sidecar_to_row_carries_monitor_schedstat_ext_counters() {
         ("total_sched_goidle", 20.0),
         ("total_ttwu_count", 200.0),
         ("total_ttwu_local", 150.0),
+        // The per-second Rate denominator, co-inserted with the counters (the
+        // *_per_sec rates derive total_X / this in the cross-run fold).
+        ("total_schedstat_wall_sec", 2.0),
     ] {
-        assert_eq!(row.ext_metrics.get(name).copied(), Some(want), "{name} ext key");
+        assert_eq!(
+            row.ext_metrics.get(name).copied(),
+            Some(want),
+            "{name} ext key"
+        );
         let def = metric_def(name).unwrap_or_else(|| panic!("{name} registered"));
-        assert_eq!(def.read(&row), Some(want), "{name} surfaced via ext fallback");
-        assert_eq!(def.classify_direction(), None, "{name} is informational (never gates)");
+        assert_eq!(
+            def.read(&row),
+            Some(want),
+            "{name} surfaced via ext fallback"
+        );
+        assert_eq!(
+            def.classify_direction(),
+            None,
+            "{name} is informational (never gates)"
+        );
     }
 
     // schedstat_deltas == None => keys ABSENT (not 0).
@@ -1064,8 +1079,8 @@ fn distribution_worstlowest_kind_json_shape_pinned() {
     }
     // worst_cross_node_migration_ratio's kind (a unit variant) — pin the variant
     // string so a rename trips here, not the CLI output.
-    let xnode = serde_json::to_string(&MetricKind::WorstCrossNodeRatio)
-        .expect("MetricKind serializes");
+    let xnode =
+        serde_json::to_string(&MetricKind::WorstCrossNodeRatio).expect("MetricKind serializes");
     assert!(
         xnode.contains("WorstCrossNodeRatio"),
         "WorstCrossNodeRatio missing from {xnode}",
@@ -1099,7 +1114,10 @@ fn list_metrics_text_preserves_registry_order() {
             })
             .map(|(i, _)| i)
             .unwrap_or_else(|| {
-                panic!("metric {} must appear as a whole name in text output", m.name)
+                panic!(
+                    "metric {} must appear as a whole name in text output",
+                    m.name
+                )
             });
         assert!(
             pos >= last_pos,

@@ -16,6 +16,7 @@ fn sample_with_schedstat(
     ttwu_count: u32,
 ) -> MonitorSample {
     MonitorSample {
+        bpf_map_fields: Vec::new(),
         prog_stats: None,
         psi_irq: None,
         elapsed_ms,
@@ -62,9 +63,10 @@ fn schedstat_deltas_computed_from_samples() {
     assert_eq!(d.total_pcount, 20);
     assert_eq!(d.total_sched_count, 100);
     assert_eq!(d.total_ttwu_count, 60);
-    // Rate: 8000 ns / 1.0 s = 8000.0 ns/s.
-    assert!((d.run_delay_rate - 8000.0).abs() < f64::EPSILON);
-    assert!((d.sched_count_rate - 100.0).abs() < f64::EPSILON);
+    // Window = elapsed 0->1000ms = 1.0s; the per-second rates derive in the
+    // registry as total_X / total_schedstat_wall_sec (8000/1 = 8000 ns/s,
+    // 100/1 = 100 csw/s).
+    assert!((d.total_schedstat_wall_sec - 1.0).abs() < f64::EPSILON);
 }
 
 #[test]
@@ -76,39 +78,37 @@ fn schedstat_deltas_none_without_schedstat() {
 
 #[test]
 fn schedstat_deltas_single_sample() {
-    // Single sample -> first == last, duration=0, rates=0.
+    // Single sample -> first == last, duration=0 -> window 0.0 (the registry
+    // Rate derivation skips a zero denominator, so no per-second rate emits).
     let samples = vec![sample_with_schedstat(100, 1000, 5000, 10, 50, 30)];
     let summary = MonitorSummary::from_samples(&samples);
     let d = summary.schedstat_deltas.unwrap();
-    assert_eq!(d.run_delay_rate, 0.0);
-    assert_eq!(d.sched_count_rate, 0.0);
+    assert_eq!(d.total_schedstat_wall_sec, 0.0);
     assert_eq!(d.total_run_delay, 0);
 }
 
 #[test]
 fn schedstat_deltas_rates() {
-    // 1 CPU, 500ms window. run_delay increases by 2000, sched_count by 40.
-    // run_delay_rate = 2000 / 0.5 = 4000.0 ns/s.
-    // sched_count_rate = 40 / 0.5 = 80.0 /s.
+    // 500ms window; per-CPU run_delay +2000, sched_count +40. The per-second
+    // rates re-derive in the registry as total_X / total_schedstat_wall_sec.
     let samples = vec![
         sample_with_schedstat(0, 1000, 1000, 5, 10, 20),
         sample_with_schedstat(500, 2000, 3000, 15, 50, 40),
     ];
     let summary = MonitorSummary::from_samples(&samples);
     let d = summary.schedstat_deltas.unwrap();
-    // 2 CPUs, each delta = 2000, total = 4000.
+    // Window = 0->500ms = 0.5s.
+    assert!((d.total_schedstat_wall_sec - 0.5).abs() < f64::EPSILON);
+    // 2 CPUs, each delta = 2000, total = 4000 (registry rate 4000/0.5 = 8000 ns/s).
     assert_eq!(d.total_run_delay, 4000);
-    // rate = 4000 / 0.5s = 8000.0
-    assert!((d.run_delay_rate - 8000.0).abs() < f64::EPSILON);
-    // 2 CPUs, each sched_count delta = 40, total = 80.
+    // 2 CPUs, each sched_count delta = 40, total = 80 (registry rate 80/0.5 = 160 csw/s).
     assert_eq!(d.total_sched_count, 80);
-    // rate = 80 / 0.5s = 160.0
-    assert!((d.sched_count_rate - 160.0).abs() < f64::EPSILON);
 }
 
 #[test]
 fn schedstat_deltas_all_fields() {
     let make = |elapsed_ms, rd, pc, yc, sc, sg, tc, tl| MonitorSample {
+        bpf_map_fields: Vec::new(),
         prog_stats: None,
         psi_irq: None,
         elapsed_ms,
@@ -166,6 +166,7 @@ fn sample_with_domain(
     n_cpus: usize,
 ) -> MonitorSample {
     MonitorSample {
+        bpf_map_fields: Vec::new(),
         prog_stats: None,
         psi_irq: None,
         elapsed_ms,
@@ -248,6 +249,7 @@ fn sched_domain_deltas_keyed_by_level_name_not_index() {
     // One CPU with two domains SMT (index 0) + MC (index 1). Each level is a
     // distinct keyed entry — the per-CPU-relative index is not used as the key.
     let mk = |elapsed_ms: u64, smt: SchedDomainStats, mc: SchedDomainStats| MonitorSample {
+        bpf_map_fields: Vec::new(),
         prog_stats: None,
         psi_irq: None,
         elapsed_ms,
@@ -277,8 +279,10 @@ fn sched_domain_deltas_keyed_by_level_name_not_index() {
     let domains = MonitorSummary::from_samples(&samples)
         .sched_domain_lb
         .unwrap();
-    let by: std::collections::BTreeMap<&str, u64> =
-        domains.iter().map(|d| (d.level.as_str(), d.lb_count)).collect();
+    let by: std::collections::BTreeMap<&str, u64> = domains
+        .iter()
+        .map(|d| (d.level.as_str(), d.lb_count))
+        .collect();
     assert_eq!(by.get("SMT"), Some(&3), "SMT delta 4-1");
     assert_eq!(by.get("MC"), Some(&30), "MC delta 40-10");
 }
@@ -337,8 +341,14 @@ fn sched_domain_deltas_level_absent_from_first_baselines_to_zero() {
         d.iter().all(|x| x.level != "SMT"),
         "output is keyed off the last sample; a first-only level is not emitted",
     );
-    let mc = d.iter().find(|x| x.level == "MC").expect("MC present in last");
-    assert_eq!(mc.lb_count, 40, "absent-in-first baseline 0 → full last value");
+    let mc = d
+        .iter()
+        .find(|x| x.level == "MC")
+        .expect("MC present in last");
+    assert_eq!(
+        mc.lb_count, 40,
+        "absent-in-first baseline 0 → full last value"
+    );
     assert_eq!(mc.lb_failed, 9);
     assert_eq!(mc.lb_gained, 8);
 }

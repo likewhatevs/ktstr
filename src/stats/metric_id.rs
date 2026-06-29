@@ -87,6 +87,15 @@ builtin_metrics! {
     TotalRunDelayNsPerSched => "total_run_delay_ns_per_sched",
     TtwuLocalFraction => "ttwu_local_fraction",
     SchedGoidleFraction => "sched_goidle_fraction",
+    // Per-second schedstat rates (total_X / total_schedstat_wall_sec) + the
+    // shared window-seconds denominator.
+    TotalSchedstatWallSec => "total_schedstat_wall_sec",
+    RunDelayPerSec => "run_delay_per_sec",
+    PcountPerSec => "pcount_per_sec",
+    SchedCountPerSec => "sched_count_per_sec",
+    YldCountPerSec => "yld_count_per_sec",
+    TtwuCountPerSec => "ttwu_count_per_sec",
+    SchedGoidlePerSec => "sched_goidle_per_sec",
     AvgNrRunning => "avg_nr_running",
     WorstP99WakeLatencyUs => "worst_p99_wake_latency_us",
     WorstMedianWakeLatencyUs => "worst_median_wake_latency_us",
