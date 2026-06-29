@@ -156,10 +156,10 @@ a "cap exceeded" error:
 let steps = vec![
     Step::with_defs(vec![CgroupDef::named("cg").workers(2)], HoldSpec::FULL)
         .set_ops(vec![
-            Op::watch_snapshot("kernel.a"),
-            Op::watch_snapshot("kernel.b"),
-            Op::watch_snapshot("kernel.c"),
-            Op::watch_snapshot("kernel.d"),  // <-- cap exceeded
+            Op::watch_snapshot("sym_a"),
+            Op::watch_snapshot("sym_b"),
+            Op::watch_snapshot("sym_c"),
+            Op::watch_snapshot("sym_d"),  // <-- cap exceeded
         ]),
 ];
 let result = execute_steps(ctx, steps)?;

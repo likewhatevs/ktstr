@@ -6520,7 +6520,7 @@ fn op_constructor_coverage_is_exhaustive() {
         Op::freeze_cgroup("a"),
         Op::unfreeze_cgroup("a"),
         Op::capture_snapshot("constructor-test"),
-        Op::watch_snapshot("kernel.constructor_test"),
+        Op::watch_snapshot("constructor_test_symbol"),
         Op::write_kernel_hot(
             KernelTarget::symbol("constructor_test_symbol"),
             KernelValue::u64(0),
