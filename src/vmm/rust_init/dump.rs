@@ -548,10 +548,12 @@ fn hvc0_poll_loop(
 /// self-reboots on this path, so the host's teardown port-drain is the catch.
 ///
 /// Bounded because this runs on the watchdog's soft-shutdown path: the watchdog
-/// hard deadline is the outer safety net, so this must NOT be the unbounded
-/// `output_done.wait()` that `drain_probe_pipeline` uses on the pre-dispatch
-/// early-bail paths (where the VM wall-clock is the only net) — here that net is
-/// the very thing that triggered this drain.
+/// hard deadline is the outer safety net, so this uses a tight bound (2500ms)
+/// fitting that 3s window. `drain_probe_pipeline` ALSO bounds its wait, but at
+/// the larger `PROBE_DRAIN_GRACE` (30s) — the pre-dispatch early-bail paths have
+/// no watchdog window, so they ride the host's VM-deadline grace instead. Here
+/// the watchdog net is the very thing that triggered this drain, so the tighter
+/// bound is required.
 fn drain_probe_for_shutdown(
     probe_drain: Option<&super::scheduler::ProbeDrain>,
     timeout: std::time::Duration,

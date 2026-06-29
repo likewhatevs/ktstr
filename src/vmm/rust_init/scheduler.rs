@@ -297,26 +297,50 @@ pub(crate) struct ProbeDrain {
     pub(crate) stop: Arc<AtomicBool>,
     /// One-shot signal: set by the probe thread after `println!`ing
     /// `PROBE_OUTPUT_END` (the payload goes to stdout → the bulk-port
-    /// forwarder, not COM2). Waited on event-driven on the early-bail
-    /// paths, where the outer VM wall-clock timeout is the only safety
-    /// net for a hung probe; the hvc0 shutdown drain wraps it in a
-    /// bounded wait instead (the watchdog is the net there).
+    /// forwarder, not COM2). Waited on with a BOUNDED cap on both drain
+    /// paths: the early-bail paths cap at `PROBE_DRAIN_GRACE` (30s, the
+    /// host's VM-deadline grace — they have no watchdog window of their own);
+    /// the hvc0 shutdown drain uses a tighter bound fitting the 3s watchdog
+    /// window. On the cap the host recovers the partial payload
+    /// (`extract_probe_output`).
     pub(crate) output_done: Arc<crate::sync::Latch>,
 }
 
-/// Drain the probe pipeline: signal stop, then block on
-/// `output_done`. Called from each early-bail path in
-/// [`start_scheduler`] before `force_reboot()` so the probe
-/// payload (or the diagnostic-only payload the probe thread emits
-/// on a forced stop) reaches the host — emitted over the virtio bulk
-/// port by the stdout forwarder, recovered when the host drains it.
+/// Drain the probe pipeline: signal stop, then wait (bounded by `timeout`) for
+/// `output_done`. Called from each early-bail path in [`start_scheduler`] before
+/// `force_reboot()` so the probe payload (or the diagnostic-only payload the
+/// probe thread emits on a forced stop) reaches the host — emitted over the
+/// virtio bulk port by the stdout forwarder, recovered when the host drains it.
+/// Returns `true` if `output_done` was observed within `timeout` (or no probe
+/// stack was supplied — a no-op), `false` on the cap. Bounded so a hung probe
+/// thread cannot wedge the bail until the coarse outer VM wall-clock — the prior
+/// unbounded `output_done.wait()` relied on that wall-clock as its only net.
 ///
-/// `drain` is `None` when no probe stack was supplied — every
-/// caller is a no-op in that case.
-fn drain_probe_pipeline(drain: Option<&ProbeDrain>) {
-    let Some(d) = drain else { return };
+/// The early-bail callers pass the auto-repro probe-drain budget
+/// ([`crate::test_support::PROBE_DRAIN_GRACE`], 30s) — the same grace the
+/// host already adds to the VM deadline for the probe drain, so the guest cap
+/// stays within the host's window (over-sized on success: the guest force-reboots
+/// the moment the drain completes). The hvc0 soft-shutdown drain
+/// (`dump::drain_probe_for_shutdown`) uses its own tighter bound that
+/// fits the 3 s watchdog window — a different outer budget, so NOT shared. On the
+/// cap the payload may be truncated, but it is loudly absent: the host's
+/// `extract_probe_output` recovers the complete events captured before the
+/// terminator and persists the partial.
+///
+/// `drain` is `None` when no probe stack was supplied — every caller is a
+/// no-op in that case.
+fn drain_probe_pipeline(drain: Option<&ProbeDrain>, timeout: std::time::Duration) -> bool {
+    let Some(d) = drain else { return true };
     d.stop.store(true, Ordering::Release);
-    d.output_done.wait();
+    let drained = d.output_done.wait_timeout(timeout);
+    if !drained {
+        tracing::warn!(
+            ?timeout,
+            "probe drain hit the cap before PROBE_OUTPUT_END; the probe payload may be \
+             truncated (the host recovers the partial)"
+        );
+    }
+    drained
 }
 
 /// Wait up to `timeout` for `child` to exit (evented via `pidfd_open` +
@@ -671,7 +695,10 @@ pub(crate) fn spawn_scheduler_from_paths(
             // Drain the probe pipeline before reboot so PROBE_OUTPUT_END
             // is emitted over the bulk port ahead of force_reboot.
             // No-op when no probe stack was supplied.
-            drain_probe_pipeline(probe_drain.as_ref());
+            drain_probe_pipeline(
+                probe_drain.as_ref(),
+                crate::test_support::PROBE_DRAIN_GRACE,
+            );
             force_reboot();
         }
         Err(SpawnSchedulerError::StartupDied { log_path }) => {
@@ -687,7 +714,10 @@ pub(crate) fn spawn_scheduler_from_paths(
                 "",
             );
             crate::vmm::guest_comms::send_exit(1);
-            drain_probe_pipeline(probe_drain.as_ref());
+            drain_probe_pipeline(
+                probe_drain.as_ref(),
+                crate::test_support::PROBE_DRAIN_GRACE,
+            );
             force_reboot();
         }
         Err(SpawnSchedulerError::NotAttached { reason, log_path }) => {
@@ -697,8 +727,67 @@ pub(crate) fn spawn_scheduler_from_paths(
                 reason,
             );
             crate::vmm::guest_comms::send_exit(1);
-            drain_probe_pipeline(probe_drain.as_ref());
+            drain_probe_pipeline(
+                probe_drain.as_ref(),
+                crate::test_support::PROBE_DRAIN_GRACE,
+            );
             force_reboot();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn probe_drain() -> ProbeDrain {
+        ProbeDrain {
+            stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            output_done: std::sync::Arc::new(crate::sync::Latch::new()),
+        }
+    }
+
+    /// The early-bail drain is BOUNDED: an unset `output_done` (a hung probe
+    /// thread) returns `false` at the cap instead of blocking forever (the prior
+    /// `output_done.wait()` was unbounded). Asserts `stop` was
+    /// signaled and the call returned well inside the cap (a short test cap so
+    /// the test is fast).
+    #[test]
+    fn drain_probe_pipeline_caps_on_unset_output_done() {
+        let pd = probe_drain();
+        let t0 = std::time::Instant::now();
+        let drained = drain_probe_pipeline(Some(&pd), std::time::Duration::from_millis(20));
+        assert!(!drained, "unset output_done -> cap-hit -> false (not a hang)");
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(2),
+            "returned at the cap, did not wait unbounded"
+        );
+        assert!(
+            pd.stop.load(std::sync::atomic::Ordering::Acquire),
+            "stop signaled to wake the probe thread"
+        );
+    }
+
+    /// `output_done` already set (PROBE_OUTPUT_END emitted) -> returns `true`
+    /// immediately, well inside the cap: the drain-until-marker (early-return)
+    /// half is preserved. A 60s cap we never approach pins "returns on the
+    /// marker, not the cap".
+    #[test]
+    fn drain_probe_pipeline_returns_early_on_output_done() {
+        let pd = probe_drain();
+        pd.output_done.set();
+        let t0 = std::time::Instant::now();
+        let drained = drain_probe_pipeline(Some(&pd), std::time::Duration::from_secs(60));
+        assert!(drained, "set output_done -> true");
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(1),
+            "returned on the marker, not after the 60s cap"
+        );
+    }
+
+    /// No probe stack -> no-op, returns `true` (every caller is a no-op).
+    #[test]
+    fn drain_probe_pipeline_none_is_noop() {
+        assert!(drain_probe_pipeline(None, std::time::Duration::from_millis(1)));
     }
 }
