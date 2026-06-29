@@ -14,7 +14,7 @@
 //! - per-function 4 KiB configuration space with a per-byte write mask,
 //! - type-1 CAM (I/O ports 0xCF8/0xCFC) and ECAM (Enhanced Configuration
 //!   Access Mechanism) decode — BOTH cover the full 4 KiB configuration
-//!   space (CAM reaches extended config via the type-1 address bits [27:24],
+//!   space (CAM reaches extended config via the type-1 address bits \[27:24\],
 //!   matching the kernel's `PCI_CONF1_ADDRESS`),
 //! - the host bridge function at 00:00.0.
 //!

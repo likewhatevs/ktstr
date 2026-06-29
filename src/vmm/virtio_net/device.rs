@@ -12,17 +12,10 @@ use virtio_bindings::virtio_config::{
     VIRTIO_CONFIG_S_FAILED, VIRTIO_CONFIG_S_FEATURES_OK, VIRTIO_CONFIG_S_NEEDS_RESET,
     VIRTIO_F_VERSION_1,
 };
-use virtio_bindings::virtio_ids::VIRTIO_ID_NET;
-use virtio_bindings::virtio_mmio::{
-    VIRTIO_MMIO_CONFIG_GENERATION, VIRTIO_MMIO_DEVICE_FEATURES, VIRTIO_MMIO_DEVICE_FEATURES_SEL,
-    VIRTIO_MMIO_DEVICE_ID, VIRTIO_MMIO_DRIVER_FEATURES, VIRTIO_MMIO_DRIVER_FEATURES_SEL,
-    VIRTIO_MMIO_INT_CONFIG, VIRTIO_MMIO_INT_VRING, VIRTIO_MMIO_INTERRUPT_ACK,
-    VIRTIO_MMIO_INTERRUPT_STATUS, VIRTIO_MMIO_MAGIC_VALUE, VIRTIO_MMIO_QUEUE_AVAIL_HIGH,
-    VIRTIO_MMIO_QUEUE_AVAIL_LOW, VIRTIO_MMIO_QUEUE_DESC_HIGH, VIRTIO_MMIO_QUEUE_DESC_LOW,
-    VIRTIO_MMIO_QUEUE_NOTIFY, VIRTIO_MMIO_QUEUE_NUM, VIRTIO_MMIO_QUEUE_NUM_MAX,
-    VIRTIO_MMIO_QUEUE_READY, VIRTIO_MMIO_QUEUE_SEL, VIRTIO_MMIO_QUEUE_USED_HIGH,
-    VIRTIO_MMIO_QUEUE_USED_LOW, VIRTIO_MMIO_STATUS, VIRTIO_MMIO_VENDOR_ID, VIRTIO_MMIO_VERSION,
-};
+// Only the two interrupt-status bits the core sets (`signal_used` /
+// `signal_queue_poisoned`) remain here; the MMIO register-offset
+// constants moved to the `mmio` facade with `mmio_read`/`mmio_write`.
+use virtio_bindings::virtio_mmio::{VIRTIO_MMIO_INT_CONFIG, VIRTIO_MMIO_INT_VRING};
 use virtio_bindings::virtio_net::VIRTIO_NET_F_MAC;
 use virtio_queue::{DescriptorChain, Error as VirtioQueueError, Queue, QueueOwnedT, QueueT};
 use vm_memory::{Address, ByteValued, Bytes, GuestAddress, GuestMemoryMmap};
@@ -406,6 +399,189 @@ impl VirtioNet {
     pub fn counters(&self) -> Arc<VirtioNetCounters> {
         Arc::clone(&self.counters)
     }
+
+    // ===================== transport-neutral core API =====================
+    //
+    // Semantic register/queue operations shared by every transport
+    // facade (virtio-MMIO in `mmio.rs`, virtio-pci-modern in `pci.rs`).
+    // Each method is ONE logical operation with its spec gate
+    // (`queue_config_allowed` / `features_write_allowed`) applied
+    // INSIDE the method, so a facade can never bypass a gate by poking
+    // a field — the fields stay private to this module and the facades
+    // (sibling submodules) reach them only through these `pub(crate)`
+    // ops. Facades own only the transport-specific decode (which
+    // offset / cap field maps to which op, and the access width); ALL
+    // device behaviour (the status FSM, feature negotiation, queue ring
+    // assembly, notify, interrupt bookkeeping) lives here exactly once,
+    // so the two transports cannot drift.
+
+    /// Current device-status FSM bits (virtio-v1.2 §2.1).
+    pub(crate) fn device_status(&self) -> u32 {
+        self.device_status
+    }
+
+    /// Pending interrupt-status bits (cleared by [`Self::ack_interrupt`]).
+    pub(crate) fn interrupt_status(&self) -> u32 {
+        self.interrupt_status
+    }
+
+    /// Config-space generation counter (v0 holds zero — see the field).
+    pub(crate) fn config_generation(&self) -> u32 {
+        self.config_generation
+    }
+
+    /// Offered device features for the latched select window
+    /// (`device_features_sel`): window 0 = bits 0..31, window 1 = bits
+    /// 32..63, any other window = 0. The guest writes the select
+    /// register then reads this window.
+    pub(crate) fn device_features_window(&self) -> u32 {
+        match self.device_features_sel {
+            0 => self.device_features() as u32,
+            1 => (self.device_features() >> 32) as u32,
+            _ => 0,
+        }
+    }
+
+    /// Max ring size of the selected queue (0 if the selector is out of range).
+    pub(crate) fn queue_max_size(&self) -> u32 {
+        self.selected_queue()
+            .map(|i| self.queues[i].max_size() as u32)
+            .unwrap_or(0)
+    }
+
+    /// Ready flag of the selected queue (0 if the selector is out of range).
+    pub(crate) fn queue_ready(&self) -> u32 {
+        self.selected_queue()
+            .map(|i| self.queues[i].ready() as u32)
+            .unwrap_or(0)
+    }
+
+    /// Copy `data.len()` bytes of device config space starting at byte
+    /// `offset` (offset 0 = `mac[0]`). Reads past the populated layout
+    /// return zero (virtio-v1.2 §4.2.2.2).
+    pub(crate) fn config_bytes(&self, offset: usize, data: &mut [u8]) {
+        // SAFETY: `VirtioNetConfig` is `ByteValued` — every bit pattern
+        // of the underlying bytes is a valid value, so viewing it as a
+        // byte slice is sound.
+        let config_bytes = self.config.as_slice();
+        for (i, byte) in data.iter_mut().enumerate() {
+            *byte = config_bytes.get(offset + i).copied().unwrap_or(0);
+        }
+    }
+
+    /// Latch the device-feature-select window index (ungated).
+    pub(crate) fn set_device_features_sel(&mut self, sel: u32) {
+        self.device_features_sel = sel;
+    }
+
+    /// Latch the driver-feature-select window index (ungated).
+    pub(crate) fn set_driver_features_sel(&mut self, sel: u32) {
+        self.driver_features_sel = sel;
+    }
+
+    /// Latch the queue selector (ungated).
+    pub(crate) fn set_queue_select(&mut self, sel: u32) {
+        self.queue_select = sel;
+    }
+
+    /// Merge `val` into the negotiated driver features at the latched
+    /// driver-feature-select window. No-op once features are locked
+    /// (`features_write_allowed` false), per virtio-v1.2 §3.1.1.
+    pub(crate) fn set_driver_features_window(&mut self, val: u32) {
+        if !self.features_write_allowed() {
+            return;
+        }
+        match self.driver_features_sel {
+            0 => self.driver_features = (self.driver_features & 0xFFFF_FFFF_0000_0000) | val as u64,
+            1 => {
+                self.driver_features =
+                    (self.driver_features & 0x0000_0000_FFFF_FFFF) | ((val as u64) << 32)
+            }
+            _ => {}
+        }
+    }
+
+    /// Set the selected queue's ring size. Gated on
+    /// `queue_config_allowed` (pre-DRIVER_OK only); ignored otherwise.
+    pub(crate) fn set_queue_size(&mut self, size: u16) {
+        if !self.queue_config_allowed() {
+            return;
+        }
+        if let Some(i) = self.selected_queue() {
+            self.queues[i].set_size(size);
+        }
+    }
+
+    /// Set the selected queue's ready flag. Gated on
+    /// `queue_config_allowed`; ignored otherwise.
+    pub(crate) fn set_queue_ready(&mut self, ready: bool) {
+        if !self.queue_config_allowed() {
+            return;
+        }
+        if let Some(i) = self.selected_queue() {
+            self.queues[i].set_ready(ready);
+        }
+    }
+
+    /// Set the selected queue's descriptor-table address (low and/or
+    /// high 32 bits; `None` leaves that half unchanged). Gated on
+    /// `queue_config_allowed`; ignored otherwise.
+    pub(crate) fn set_queue_desc_addr(&mut self, lo: Option<u32>, hi: Option<u32>) {
+        if !self.queue_config_allowed() {
+            return;
+        }
+        if let Some(i) = self.selected_queue() {
+            self.queues[i].set_desc_table_address(lo, hi);
+        }
+    }
+
+    /// Set the selected queue's avail-ring (driver-area) address.
+    /// Gated on `queue_config_allowed`; ignored otherwise.
+    pub(crate) fn set_queue_avail_addr(&mut self, lo: Option<u32>, hi: Option<u32>) {
+        if !self.queue_config_allowed() {
+            return;
+        }
+        if let Some(i) = self.selected_queue() {
+            self.queues[i].set_avail_ring_address(lo, hi);
+        }
+    }
+
+    /// Set the selected queue's used-ring (device-area) address. Gated
+    /// on `queue_config_allowed`; ignored otherwise.
+    pub(crate) fn set_queue_used_addr(&mut self, lo: Option<u32>, hi: Option<u32>) {
+        if !self.queue_config_allowed() {
+            return;
+        }
+        if let Some(i) = self.selected_queue() {
+            self.queues[i].set_used_ring_address(lo, hi);
+        }
+    }
+
+    /// Notify the device that the guest kicked queue `queue_idx`. Only
+    /// the TX queue has work to drain (loopback TX→RX); an RX kick is a
+    /// no-op (the next TX picks up newly posted RX buffers).
+    pub(crate) fn notify_queue(&mut self, queue_idx: u32) {
+        if queue_idx as usize == TXQ {
+            self.process_tx_loopback();
+        }
+    }
+
+    /// Clear the interrupt-status bits the guest acknowledged.
+    pub(crate) fn ack_interrupt(&mut self, val: u32) {
+        self.interrupt_status &= !val;
+    }
+
+    /// Apply a device-status write: `0` resets the device, any other
+    /// value drives the status FSM via [`Self::set_status`].
+    pub(crate) fn write_status(&mut self, val: u32) {
+        if val == 0 {
+            self.reset();
+        } else {
+            self.set_status(val);
+        }
+    }
+
+    // =================== end transport-neutral core API ===================
 
     /// Feature bits advertised to the guest.
     ///
@@ -1769,195 +1945,15 @@ struct TxChainOutcome {
 }
 
 // ---------------------------------------------------------------------------
-// MMIO register dispatch
+// Device-status FSM + reset
 // ---------------------------------------------------------------------------
+//
+// The MMIO transport facade (`mmio_read` / `mmio_write`) lives in the
+// sibling `mmio.rs` submodule; it decodes the MMIO register layout onto
+// the transport-neutral core API above. `set_status` / `reset` are the
+// shared FSM core it drives via `write_status`.
 
 impl VirtioNet {
-    /// Handle MMIO read at `offset` within the device's MMIO region.
-    pub fn mmio_read(&self, offset: u64, data: &mut [u8]) {
-        // Config-space reads (offsets 0x100..) may be 1, 2, 4, or 8
-        // bytes wide depending on the field's type per virtio-v1.2
-        // §4.2.2.2; serve them from the static config struct's bytes
-        // first so a 1-byte MAC read or 2-byte STATUS read returns
-        // the right value rather than the 0xff "non-4-byte" sentinel.
-        if offset >= 0x100 {
-            self.read_config_space(offset - 0x100, data);
-            return;
-        }
-
-        // Register-space reads are 4 bytes wide. Anything else is a
-        // protocol violation — return 0xff bytes (matches virtio-blk
-        // and virtio-console).
-        if data.len() != 4 {
-            for b in data.iter_mut() {
-                *b = 0xff;
-            }
-            return;
-        }
-        let val: u32 = match offset as u32 {
-            VIRTIO_MMIO_MAGIC_VALUE => MMIO_MAGIC,
-            VIRTIO_MMIO_VERSION => MMIO_VERSION,
-            VIRTIO_MMIO_DEVICE_ID => VIRTIO_ID_NET,
-            VIRTIO_MMIO_VENDOR_ID => VENDOR_ID,
-            VIRTIO_MMIO_DEVICE_FEATURES => {
-                let page = self.device_features_sel;
-                if page == 0 {
-                    self.device_features() as u32
-                } else if page == 1 {
-                    (self.device_features() >> 32) as u32
-                } else {
-                    0
-                }
-            }
-            VIRTIO_MMIO_QUEUE_NUM_MAX => self
-                .selected_queue()
-                .map(|i| self.queues[i].max_size() as u32)
-                .unwrap_or(0),
-            VIRTIO_MMIO_QUEUE_READY => self
-                .selected_queue()
-                .map(|i| self.queues[i].ready() as u32)
-                .unwrap_or(0),
-            VIRTIO_MMIO_INTERRUPT_STATUS => self.interrupt_status,
-            VIRTIO_MMIO_STATUS => self.device_status,
-            VIRTIO_MMIO_CONFIG_GENERATION => self.config_generation,
-            _ => 0,
-        };
-        tracing::debug!(offset, val, "virtio-net mmio_read");
-        data.copy_from_slice(&val.to_le_bytes());
-    }
-
-    /// Serve `data.len()` bytes from config space at `offset` within
-    /// the config region (offset 0 = `mac[0]`, offset 6 = `status`
-    /// low byte, etc.). Reads past the populated layout return zero
-    /// per virtio-v1.2 §4.2.2.2.
-    fn read_config_space(&self, offset: u64, data: &mut [u8]) {
-        // SAFETY: `VirtioNetConfig` is `ByteValued` — every bit
-        // pattern of the underlying bytes is a valid value, so
-        // viewing it as a byte slice is sound.
-        let config_bytes = self.config.as_slice();
-        let start = offset as usize;
-        for (i, byte) in data.iter_mut().enumerate() {
-            let cfg_idx = start + i;
-            *byte = config_bytes.get(cfg_idx).copied().unwrap_or(0);
-        }
-    }
-
-    /// Handle MMIO write at `offset` within the device's MMIO region.
-    pub fn mmio_write(&mut self, offset: u64, data: &[u8]) {
-        // Config-space writes are silently ignored (this device is
-        // not driver-configurable; STATUS/MQ/MTU are read-only).
-        // Matches virtio-console; virtio-v1.2 §4.2.2.2 ("the device
-        // MAY ignore writes to config space").
-        if offset >= 0x100 {
-            tracing::debug!(
-                offset,
-                len = data.len(),
-                "virtio-net config-space write ignored"
-            );
-            return;
-        }
-
-        if data.len() != 4 {
-            return;
-        }
-        let val = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-        tracing::debug!(offset, val, "virtio-net mmio_write");
-        match offset as u32 {
-            VIRTIO_MMIO_DEVICE_FEATURES_SEL => self.device_features_sel = val,
-            VIRTIO_MMIO_DRIVER_FEATURES_SEL => self.driver_features_sel = val,
-            VIRTIO_MMIO_DRIVER_FEATURES => {
-                if !self.features_write_allowed() {
-                    return;
-                }
-                let page = self.driver_features_sel;
-                if page == 0 {
-                    self.driver_features =
-                        (self.driver_features & 0xFFFF_FFFF_0000_0000) | val as u64;
-                } else if page == 1 {
-                    self.driver_features =
-                        (self.driver_features & 0x0000_0000_FFFF_FFFF) | ((val as u64) << 32);
-                }
-            }
-            VIRTIO_MMIO_QUEUE_SEL => self.queue_select = val,
-            VIRTIO_MMIO_QUEUE_NUM if self.queue_config_allowed() => {
-                if let Some(i) = self.selected_queue() {
-                    self.queues[i].set_size(val as u16);
-                }
-            }
-            VIRTIO_MMIO_QUEUE_READY if self.queue_config_allowed() => {
-                if let Some(i) = self.selected_queue() {
-                    self.queues[i].set_ready(val == 1);
-                }
-            }
-            VIRTIO_MMIO_QUEUE_NOTIFY => {
-                let idx = val as usize;
-                if idx == TXQ {
-                    self.process_tx_loopback();
-                }
-                // RXQ notify (guest posted new RX buffers): no
-                // immediate work — the next TX will pick up any new
-                // buffer. virtio-blk and virtio-console drain their
-                // pending data on the matching queue notify, but
-                // here there is no pending RX to deliver outside a
-                // TX-induced loopback. A future TAP/AF_PACKET
-                // backend would drain pending host->guest frames on
-                // RXQ notify.
-            }
-            VIRTIO_MMIO_INTERRUPT_ACK => {
-                // Clear the bits the guest ACKed in `interrupt_status`.
-                // No `virtio_update_irq` equivalent is needed: the
-                // irqfd is edge-triggered (each `irq_evt.write(1)`
-                // raises one GSI delivery; KVM's `kvm_irqfd_resampler`
-                // is not wired here because we never claim shared
-                // legacy IRQs). The kernel's
-                // `vm_interrupt`+`vp_modern_get_status` handshake
-                // (drivers/virtio/virtio_mmio.c) does NOT need a
-                // device-side notification on ACK — it just clears
-                // its own view of the bits and moves on. virtio-blk
-                // and virtio-console use the same shape.
-                self.interrupt_status &= !val;
-            }
-            VIRTIO_MMIO_STATUS => {
-                if val == 0 {
-                    self.reset();
-                } else {
-                    self.set_status(val);
-                }
-            }
-            VIRTIO_MMIO_QUEUE_DESC_LOW if self.queue_config_allowed() => {
-                if let Some(i) = self.selected_queue() {
-                    self.queues[i].set_desc_table_address(Some(val), None);
-                }
-            }
-            VIRTIO_MMIO_QUEUE_DESC_HIGH if self.queue_config_allowed() => {
-                if let Some(i) = self.selected_queue() {
-                    self.queues[i].set_desc_table_address(None, Some(val));
-                }
-            }
-            VIRTIO_MMIO_QUEUE_AVAIL_LOW if self.queue_config_allowed() => {
-                if let Some(i) = self.selected_queue() {
-                    self.queues[i].set_avail_ring_address(Some(val), None);
-                }
-            }
-            VIRTIO_MMIO_QUEUE_AVAIL_HIGH if self.queue_config_allowed() => {
-                if let Some(i) = self.selected_queue() {
-                    self.queues[i].set_avail_ring_address(None, Some(val));
-                }
-            }
-            VIRTIO_MMIO_QUEUE_USED_LOW if self.queue_config_allowed() => {
-                if let Some(i) = self.selected_queue() {
-                    self.queues[i].set_used_ring_address(Some(val), None);
-                }
-            }
-            VIRTIO_MMIO_QUEUE_USED_HIGH if self.queue_config_allowed() => {
-                if let Some(i) = self.selected_queue() {
-                    self.queues[i].set_used_ring_address(None, Some(val));
-                }
-            }
-            _ => {}
-        }
-    }
-
     /// Validate and apply a status transition per virtio-v1.2 §3.1.1.
     /// The driver must not clear bits. Each phase requires the
     /// previous phase's bits to be set. Invalid transitions are

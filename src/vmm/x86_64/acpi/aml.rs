@@ -140,7 +140,7 @@ fn root_scope(name: &str, body: &[u8]) -> Vec<u8> {
 }
 
 /// Wrap resource descriptors in a `ResourceTemplate() { ... }` buffer:
-/// BufferOp(0x11) PkgLength <bufsize int> <descriptors> EndTag(0x79) 0x00.
+/// BufferOp(0x11) PkgLength `<bufsize int>` `<descriptors>` EndTag(0x79) 0x00.
 /// The trailing 0x00 is the EndTag checksum byte (a zero checksum is accepted
 /// per ACPI 6.4 §6.4.2.9); omitting it shifts every following byte and the
 /// guest's _CRS parse fails silently.

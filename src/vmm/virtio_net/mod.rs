@@ -82,6 +82,12 @@
 
 mod device;
 
+// virtio-MMIO transport facade for `VirtioNet` (decode-only; drives the
+// transport-neutral core API in `device`). A sibling submodule so it
+// reaches device state ONLY through the `pub(crate)` semantic methods,
+// never the private fields.
+mod mmio;
+
 mod counters;
 
 #[cfg(test)]
