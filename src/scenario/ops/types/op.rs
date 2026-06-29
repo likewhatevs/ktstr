@@ -682,7 +682,7 @@ pub enum Op {
     /// **Already-attached behavior.** No framework-level idempotency
     /// guard: if a scheduler is already running, the kernel rejects
     /// the new attach at the `scx_enable_state() != SCX_DISABLED`
-    /// gate (`kernel/sched/ext.c:6621`, returns `-EBUSY`); the
+    /// gate (`kernel/sched/ext.c:6837`, returns `-EBUSY`); the
     /// spawned binary exits, no fresh publish lands, and the dispatch
     /// bails on the 30s publish-wait timeout. Use
     /// [`Op::DetachScheduler`] (then `AttachScheduler`) or
@@ -707,9 +707,11 @@ pub enum Op {
     /// isn't promoted into a test-fatal scheduler-died signal,
     /// writes `'S'` to `/proc/sysrq-trigger` to start the kernel-
     /// side `scx_disable` cascade asynchronously (avoiding the
-    /// D-state stall inside `bpf_scx_unreg`'s
+    /// D-state stall inside `scx_flush_disable_work`'s
     /// `kthread_flush_work(&sch->disable_work)` at
-    /// `kernel/sched/ext.c:7372-7381`), sends `SIGTERM` to the
+    /// `kernel/sched/ext.c:6145`, reached on the struct_ops detach
+    /// path via `bpf_scx_unreg` at `kernel/sched/ext.c:7666`), sends
+    /// `SIGTERM` to the
     /// scheduler pid, waits up to `SCHED_LIFECYCLE_KILL_GRACE` (10s)
     /// for the kernel BPF state to reach `SCX_DISABLED`, then
     /// clears the `SCHED_PID` atomic (defined in
