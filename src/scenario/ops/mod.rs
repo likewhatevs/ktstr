@@ -76,11 +76,15 @@ use dispatch::{
     wait_for_worker_state_not_trying_or_bail, write_entries_from_writes,
 };
 use dispatch::{apply_ops, render_cgroup_key};
-// Re-export the scx-state test seam so the guest-side survives_storm probe's
-// host unit test (`test_support::probe_tests`) can drive scheduler liveness on
-// the host without a VM. `dispatch` is otherwise private to `ops`.
+// Re-export the scx-state reader + enum. The guest-init scheduler
+// attach-readiness predicate (rust_init::scheduler::scx_attach_ready) reads
+// scx_state() to confirm SCX_ENABLED before the workload dispatches, and the
+// survives_storm probe's host unit test (`test_support::probe_tests`) drives
+// scheduler liveness on the host (no VM) via the set_test_scx_state seam.
+// `dispatch` is otherwise private to `ops`.
+pub(crate) use dispatch::{ScxState, scx_state};
 #[cfg(test)]
-pub(crate) use dispatch::{ScxState, set_test_scx_state};
+pub(crate) use dispatch::set_test_scx_state;
 
 use std::collections::BTreeSet;
 use std::thread;

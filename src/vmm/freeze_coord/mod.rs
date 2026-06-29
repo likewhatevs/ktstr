@@ -11222,7 +11222,13 @@ impl KtstrVm {
                 // pre-wait `cr3_value` / `phys_base` directly.
                 let cr3_latest = cr3.load(std::sync::atomic::Ordering::Acquire);
                 let cr3_pa = if cr3_latest != 0 {
-                    cr3_latest & !0x1FFFu64
+                    // Strip only the CR3 control bits [11:0] (CR3_ADDR_MASK):
+                    // the guest boots mitigations=off (KPTI/PTI disabled) so
+                    // bit 12 is a real pgd-PA bit, NOT the PTI user-pgd
+                    // selector — clearing it corrupts pgd PAs that are odd
+                    // 4 KiB multiples. Mirrors guest.rs walk_cr3 +
+                    // resolve_phys_base's first (`& !0xFFF`) attempt.
+                    cr3_latest & !0xFFFu64
                 } else {
                     monitor::symbols::text_kva_to_pa_with_base(
                         symbols.init_top_pgt.unwrap_or(0),
@@ -11367,6 +11373,7 @@ impl KtstrVm {
                                 vmlinux_data: Arc::clone(&vmlinux_data_arc),
                                 base_btf: Arc::clone(&btf),
                                 cr3_pa,
+                                cr3: cr3.clone(),
                                 tcr_el1: tcr_el1_val,
                                 l5,
                                 prog_idr_kva,

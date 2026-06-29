@@ -2,6 +2,7 @@
 //!
 //! Split from rust_init.rs; the shared consts/statics/imports live in the
 //! parent module (`super`), reached via the glob below.
+use crate::scenario::ops::{ScxState, scx_state};
 use super::*;
 
 /// Outcome of [`poll_startup`].
@@ -16,15 +17,20 @@ pub(crate) enum StartupStatus {
 /// Outcome of [`poll_scx_attached`].
 #[derive(Debug, PartialEq, Eq)]
 enum ScxAttachStatus {
-    /// sched_ext root kobject exposes a non-empty `ops` attribute —
-    /// scheduler registered and its ops name is populated.
+    /// sched_ext is registered AND fully enabled: `root/ops` is non-empty
+    /// AND `/sys/kernel/sched_ext/state` reads `enabled` — the scheduler
+    /// finished `scx_enable` (ops.init ran, every task was initialized, the
+    /// kernel set `SCX_ENABLED`), not merely registered. See
+    /// `scx_attach_ready`.
     Attached,
     /// Poll window closed. At least one read of `root/ops` succeeded
     /// (the kernel supports sched_ext and the kset exists), but the
-    /// file never became non-empty before the timeout. Typically
-    /// means the scheduler process is alive but has not finished
-    /// `scx_alloc_and_add_sched` — often a BPF verifier reject, an
-    /// ops-mismatch, or a slow userspace init path.
+    /// attach never completed before the timeout: either `root/ops`
+    /// stayed empty (scheduler never registered) or it registered but
+    /// `/sys/kernel/sched_ext/state` never reached `enabled` — stuck in
+    /// `enabling`, or the enable FAILED and the state moved on to
+    /// `disabling`/`disabled`. Typically a BPF verifier reject, an
+    /// ops-mismatch, a slow init, or an ops.init/enable failure.
     Timeout,
     /// Every read of `root/ops` returned `Err`. Either the kernel
     /// lacks sched_ext support entirely or the sysfs tree has not
@@ -35,23 +41,45 @@ enum ScxAttachStatus {
 }
 
 impl ScxAttachStatus {
-    /// True when the scheduler registered successfully. Equivalent to
-    /// the pre-enum `bool` return value.
+    /// True when the scheduler is registered AND fully enabled (see
+    /// `ScxAttachStatus::Attached`).
     fn is_attached(&self) -> bool {
         matches!(self, ScxAttachStatus::Attached)
     }
 }
 
+/// True when sched_ext is both REGISTERED (`root/ops` content non-empty) and
+/// fully ENABLED (`/sys/kernel/sched_ext/state` reads "enabled", i.e. `state`
+/// is `Some(ScxState::Enabled)`).
+///
+/// The kernel adds the `root` kobject — making `root/ops` non-empty — EARLY in
+/// `scx_root_enable_workfn` (kernel/sched/ext.c), BEFORE it runs `ops.init`,
+/// initializes every task, and performs the final `SCX_ENABLING` ->
+/// `SCX_ENABLED` transition (`scx_tryset_enable_state`). Gating attach on
+/// `root/ops` alone therefore reports "attached" while the scheduler is still
+/// ENABLING, letting the workload (and the host monitor's first reads) run
+/// against a half-up scheduler — a silent wrong result. Requiring
+/// `state == Some(ScxState::Enabled)` closes that race; it also rejects a
+/// registered-but-FAILED enable, where the state goes `ENABLING` ->
+/// `DISABLING` -> `DISABLED` and the ops-only check would mis-report attached.
+///
+/// Pure over its inputs so the predicate is unit-testable without a live scx
+/// scheduler; `poll_scx_attached` supplies the live `root/ops` contents and the
+/// `scx_state` reading.
+pub(crate) fn scx_attach_ready(root_ops_contents: &str, state: Option<ScxState>) -> bool {
+    !root_ops_contents.trim().is_empty() && state == Some(ScxState::Enabled)
+}
+
 /// Poll `/sys/kernel/sched_ext/root/ops` at `interval` cadence for up
 /// to `timeout`.
 ///
-/// Returns [`ScxAttachStatus::Attached`] as soon as the file is
-/// non-empty (a scheduler is registered and its ops struct has a
-/// populated name). When the window closes without a successful
-/// attachment, distinguishes [`Timeout`](ScxAttachStatus::Timeout)
-/// (reads succeeded but the file never became non-empty — the
-/// scheduler did not finish registering) from
-/// [`SysfsAbsent`](ScxAttachStatus::SysfsAbsent) (every read
+/// Returns [`ScxAttachStatus::Attached`] once `root/ops` is non-empty
+/// AND `/sys/kernel/sched_ext/state` reads `enabled` — registered AND
+/// fully enabled (see `scx_attach_ready`). When the window closes
+/// without that, distinguishes [`Timeout`](ScxAttachStatus::Timeout)
+/// (`root/ops` reads succeeded but attach never completed — never
+/// registered, or registered but never reached `enabled`) from
+/// [`SysfsAbsent`](ScxAttachStatus::SysfsAbsent) (every `root/ops` read
 /// errored — the kernel lacks sched_ext sysfs entirely).
 ///
 /// The sysfs path is built in two steps by the kernel:
@@ -65,16 +93,17 @@ impl ScxAttachStatus {
 ///   attribute is registered on `scx_ktype` via `scx_sched_groups`;
 ///   `scx_attr_ops_show` emits `sch->ops.name` through `sysfs_emit`.
 ///
-/// Semantics we can claim based on the kernel flow above: a non-empty
-/// `root/ops` proves the scheduler completed `scx_alloc_and_add_sched`
-/// — the scx_sched struct is allocated, `sch->ops = *ops` has copied
-/// the userspace-provided ops (including `name`), and the kobject is
-/// registered with the kset. The kobject add happens BEFORE any BPF
-/// callback (`ops.init`, `ops.enable`, `ops.runnable`, etc.) runs, so
-/// a non-empty read does NOT prove those callbacks validated. Use
-/// this poll only to confirm "scheduler registered and name
-/// populated"; verify BPF callback success via monitor telemetry or
-/// the scheduler's own exit kind.
+/// Semantics: a non-empty `root/ops` proves the scheduler completed
+/// `scx_alloc_and_add_sched` (scx_sched allocated, `sch->ops = *ops`
+/// copied the ops including `name`, kobject registered with the kset),
+/// but the kobject add happens BEFORE `ops.init`, per-task init, and the
+/// `SCX_ENABLED` transition — so a non-empty `root/ops` does NOT prove
+/// the scheduler is live. This poll therefore ALSO requires
+/// `/sys/kernel/sched_ext/state` == `enabled` (via `scx_state`), so a
+/// returned `Attached` means the BPF enable completed and the workload
+/// can run against a fully-up scheduler. (Crash/exit detection AFTER
+/// enable is still the caller's job — monitor telemetry or the
+/// scheduler's own exit kind.)
 ///
 /// Separate from [`poll_startup`] (which watches the child process
 /// state): a scheduler can be `Alive` from the process-waitpid
@@ -102,7 +131,14 @@ fn poll_scx_attached(
         });
         if read_outcome.is_ok() {
             ever_read_ok = true;
-            if !buf.trim().is_empty() {
+            // Attached only when REGISTERED (non-empty root/ops) AND fully
+            // ENABLED (state == "enabled"): the kernel adds root/ops early in
+            // scx_root_enable_workfn, before ops.init / per-task init / the
+            // SCX_ENABLED transition, so root/ops alone races a still-ENABLING
+            // scheduler. scx_state() re-reads /sys/kernel/sched_ext/state each
+            // call (cheap; the cadence below drives the ENABLING->ENABLED
+            // re-check on kernels that do not sysfs_notify the transition).
+            if scx_attach_ready(&buf, scx_state()) {
                 return Some(());
             }
         }
@@ -117,13 +153,16 @@ fn poll_scx_attached(
     //     kobject_init_and_add(..., "root"))
     //
     // BELT-AND-BRACES CADENCE: the helper's `cadence` parameter caps
-    // each poll(2) at `interval`. Verified at kernel/sched/ext.c:6380
-    // scx_alloc_and_add_sched — `sch->ops = *ops` runs BEFORE
-    // `kobject_init_and_add(..., "root")`, so by IN_CREATE wake time
-    // the attribute reads non-empty. The cadence is defense-in-depth
-    // against (a) future kernel reordering, (b) inotify event loss
-    // under pressure, (c) out-of-band kobject creation without
-    // ops.name pre-population.
+    // each poll(2) at `interval`. In scx_alloc_and_add_sched
+    // `sch->ops = *ops` runs BEFORE `kobject_init_and_add(..., "root")`,
+    // so by IN_CREATE wake time `root/ops` reads non-empty. The cadence
+    // is ALSO load-bearing for the state==`enabled` half of the
+    // predicate: the `enabling`->`enabled` transition (later in
+    // scx_root_enable_workfn) is not `sysfs_notify`'d and fires no
+    // inotify event on this dir, so the periodic cadence re-check is what
+    // observes it. Plus defense-in-depth against (a) future kernel
+    // reordering, (b) inotify event loss under pressure, (c) out-of-band
+    // kobject creation without ops.name pre-population.
     let outcome = kernfs_evented_wait(
         "/sys/kernel/sched_ext/",
         AddWatchFlags::IN_CREATE | AddWatchFlags::IN_MOVED_TO,
@@ -739,6 +778,31 @@ pub(crate) fn spawn_scheduler_from_paths(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `scx_attach_ready` (the attach predicate) is true ONLY when the
+    /// scheduler is both registered (non-empty `root/ops`) AND fully enabled
+    /// (`state == Enabled`). A registered-but-still-ENABLING scheduler — the
+    /// race window where the kernel added `root/ops` but has not yet set
+    /// `SCX_ENABLED` — is NOT reported attached; nor is a failed enable
+    /// (`Disabling`/`Disabled`) or a missing state read. Exhaustive over the
+    /// state axis and the empty/non-empty `root/ops` axis.
+    #[test]
+    fn scx_attach_ready_requires_registered_and_enabled() {
+        // Registered + enabled -> the one true case.
+        assert!(scx_attach_ready("ktstr_ops\n", Some(ScxState::Enabled)));
+        // Registered but mid-enable / failed-enable / absent state -> NOT ready
+        // (the race + failed-enable cases the old ops-only predicate mis-reported
+        // as attached).
+        assert!(!scx_attach_ready("ktstr_ops\n", Some(ScxState::Enabling)));
+        assert!(!scx_attach_ready("ktstr_ops\n", Some(ScxState::Disabling)));
+        assert!(!scx_attach_ready("ktstr_ops\n", Some(ScxState::Disabled)));
+        assert!(!scx_attach_ready("ktstr_ops\n", None));
+        // Not registered (empty / whitespace-only root/ops) -> NOT ready even
+        // when state reads enabled (a stale/foreign enable without our ops).
+        assert!(!scx_attach_ready("", Some(ScxState::Enabled)));
+        assert!(!scx_attach_ready("   \n", Some(ScxState::Enabled)));
+        assert!(!scx_attach_ready("", None));
+    }
 
     fn probe_drain() -> ProbeDrain {
         ProbeDrain {

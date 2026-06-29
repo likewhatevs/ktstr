@@ -2208,8 +2208,28 @@ pub(crate) struct WatchBpfMapsCfg {
     pub vmlinux_data: Arc<Vec<u8>>,
     /// Vmlinux BTF — the split-base for per-map program-BTF loads.
     pub base_btf: Arc<btf_rs::Btf>,
-    /// Top-level page-table PA (CR3 / TTBR1), run-stable; captured once.
+    /// Top-level page-table PA (CR3 / TTBR1) fallback, captured once at
+    /// construction. Used only when [`WatchBpfMapsCfg::cr3`] reads 0
+    /// (the `cr3_cache` is still unpublished).
     pub cr3_pa: u64,
+    /// Live kernel page-table root (`cr3_cache`), re-read every
+    /// `sample()` tick and masked `& !0xFFF` via `select_cr3` (strip the
+    /// CR3 control bits \[11:0\]; the guest boots `mitigations=off` so bit
+    /// 12 is a real pgd-PA bit, preserved — NOT the KPTI user-pgd
+    /// selector). `cr3_cache` is a per-BSP-iteration refresh of whatever
+    /// task's CR3 the BSP last read; any task's pgd maps the kernel
+    /// upper-half (shared), so the masked value walks the vmalloc
+    /// `struct bpf_prog` / `.bss` correctly once published. It can land
+    /// AFTER `cr3_pa` was snapshotted at construction; on those (cold)
+    /// boots the snapshot is the KASLR-fragile `init_top_pgt` fallback
+    /// that fails every vmalloc page-table walk for the whole run, so the
+    /// active-struct_ops walk finds 0 progs and the watched `.bss` never
+    /// resolves. `sample()` therefore DEFERS the accessor build until this
+    /// is published (`!= 0`) — so BOTH the prog-discovery walk and the
+    /// `.bss` leaf read use the live root — and re-reads it for the
+    /// discovery `WalkContext` each tick. Mirrors the per-iteration
+    /// [`RqRefresh::kaslr_offset`] refresh (same boot-race class).
+    pub cr3: std::sync::Arc<AtomicU64>,
     /// aarch64 TCR_EL1 (0 on x86_64), run-stable.
     pub tcr_el1: u64,
     /// x86 5-level paging flag.
@@ -2316,6 +2336,19 @@ fn active_set_changed(
     cur != cached_sorted_kvas
 }
 
+/// Select the kernel page-table root PA for the per-tick vmalloc walk:
+/// the live `cr3_cache` value (masked) when published, else the
+/// once-captured `snapshot` fallback. Masks `& !0xFFF` to strip the CR3
+/// control bits \[11:0\] (PCID under CR4.PCIDE, else PWT/PCD) — matching
+/// the kernel's `CR3_ADDR_MASK` and the `guest.rs` `walk_cr3` derivation.
+/// The ktstr guest boots `mitigations=off` (KPTI/PTI disabled), so bit 12
+/// is a genuine pgd-PA address bit and MUST be preserved: clearing it (the
+/// KPTI-only `& !0x1FFF`) corrupts pgd PAs that are odd 4 KiB multiples.
+/// `live == 0` means `cr3_cache` is unpublished -> keep the snapshot.
+fn select_cr3(live: u64, snapshot: u64) -> u64 {
+    if live != 0 { live & !0xFFFu64 } else { snapshot }
+}
+
 impl<'a> BpfMapWatcher<'a> {
     fn new(cfg: &'a WatchBpfMapsCfg) -> Self {
         let mut resolved = Vec::with_capacity(cfg.targets.len());
@@ -2341,10 +2374,26 @@ impl<'a> BpfMapWatcher<'a> {
         start_kernel_map: u64,
     ) -> Vec<BpfMapFieldSample> {
         let cfg = self.cfg;
-        // Lazily build the owned accessor once the guest has booted far enough
-        // for phys_base/page tables to be valid. Tolerate failure (retry next
-        // tick) — pre-attach the maps simply do not exist yet.
-        if self.accessor.is_none() {
+        // Live kernel pgd PA from `cr3_cache`, refreshed every BSP
+        // iteration (freeze_coord). `0` = not yet published. BOTH walks
+        // below — struct-bpf_prog discovery AND the `.bss` leaf read (via
+        // the accessor) — translate vmalloc KVAs, which needs a CURRENT
+        // kernel pgd; the once-captured `cfg.cr3_pa` snapshot is the
+        // KASLR-fragile `init_top_pgt` fallback on a cold boot (cr3_cache
+        // still 0 at construction).
+        let live_cr3 = cfg.cr3.load(std::sync::atomic::Ordering::Acquire);
+        // Lazily build the owned accessor once phys_base/page tables are
+        // valid AND cr3_cache has published a live root. Building with the
+        // snapshot fallback would pin a bad cr3 for the accessor's whole
+        // life: `from_elf_with_hint` with a non-zero `phys_base` hint
+        // skips `resolve_phys_base` and builds successfully even on a bad
+        // cr3, so the `.bss` leaf read (vmalloc -> page-table walk via the
+        // accessor's stored cr3) would fail the entire run even after the
+        // discovery walk self-corrects. Defer until `live_cr3 != 0`; it
+        // lands in-window (scheduling = kernel mode). Pass the raw live
+        // cr3 — `from_elf_with_hint` masks it `& !0xFFF` (walk_cr3)
+        // internally. Tolerate failure (retry next tick).
+        if self.accessor.is_none() && live_cr3 != 0 {
             self.accessor = goblin::elf::Elf::parse(&cfg.vmlinux_data).ok().and_then(|elf| {
                 GuestMemMapAccessorOwned::from_elf_with_hint(
                     Arc::clone(&cfg.mem),
@@ -2352,7 +2401,7 @@ impl<'a> BpfMapWatcher<'a> {
                     &cfg.vmlinux_data,
                     &cfg.vmlinux,
                     cfg.tcr_el1,
-                    cfg.cr3_pa,
+                    live_cr3,
                     phys_base,
                 )
                 .ok()
@@ -2366,8 +2415,12 @@ impl<'a> BpfMapWatcher<'a> {
         // that yields both the metric-key prefix and the live used-map-KVA set.
         // `None` until a STRUCT_OPS scheduler attaches (or transiently mid-swap)
         // -> emit nothing that tick.
+        // The struct-bpf_prog discovery walk needs the live kernel pgd
+        // (masked `& !0xFFF`); `select_cr3` falls back to the snapshot when
+        // cr3_cache is unpublished — in which case the accessor above is
+        // also still deferred, so this tick returns empty regardless.
         let walk = WalkContext {
-            cr3_pa: cfg.cr3_pa,
+            cr3_pa: select_cr3(live_cr3, cfg.cr3_pa),
             page_offset,
             l5: cfg.l5,
             tcr_el1: cfg.tcr_el1,
@@ -3306,6 +3359,23 @@ mod tests {
     use std::os::unix::thread::JoinHandleExt;
 
     const THRESHOLD_NS: u64 = 10_000_000;
+
+    /// `select_cr3` prefers the live `cr3_cache` value (masked `& !0xFFF`,
+    /// preserving bit 12 — the guest is mitigations=off so bit 12 is a real
+    /// pgd-PA bit) and falls back to the snapshot when unpublished (0). A
+    /// regression to the mask / live-precedence / fallback fails here in CI
+    /// without a booted VM (the watch e2e regression guard is host-gated).
+    #[test]
+    fn select_cr3_live_masked_else_snapshot() {
+        // Unpublished cr3_cache (0) -> snapshot fallback verbatim.
+        assert_eq!(select_cr3(0, 0xdead_b000), 0xdead_b000);
+        // Live cr3 wins over a non-zero snapshot.
+        assert_eq!(select_cr3(0x7_0000_0000, 0xdead_b000), 0x7_0000_0000);
+        // CR3 control bits \[11:0\] stripped; bit 12 PRESERVED (mitigations=off:
+        // bit 12 is a real pgd-PA bit, not the KPTI user-pgd selector — a
+        // `& !0x1FFF` mask would wrongly zero it and corrupt the pgd PA).
+        assert_eq!(select_cr3(0x7_0000_1abc, 0), 0x7_0000_1000);
+    }
 
     /// `le_uint` decodes 1/2/4/8-byte little-endian unsigned integers and
     /// rejects a short slice or an unsupported width (the watched-map reader
