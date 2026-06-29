@@ -3353,6 +3353,12 @@ impl KtstrVm {
                 // time is ~uniform across the deferred burst and useless
                 // for per-phase attribution).
                 let mut periodic_anchor_ns: u64 = 0;
+                // run_start-relative ns at which ALL periodic-capture prereqs
+                // (kaslr publish + map accessor + prog accessor) first held.
+                // The periodic boundary window anchors here on a cold boot so
+                // the cold-boot page-table walk + scx attach transient cannot
+                // push the 10-90% window past workload end. 0 = not yet ready.
+                let mut periodic_prereqs_ready_ns: u64 = 0;
                 let mut next_periodic_idx: u32 = 0;
                 // Consecutive parked-vCPU rendezvous failures during
                 // periodic capture. Reset to 0 on every successful
@@ -7768,8 +7774,25 @@ impl KtstrVm {
                     // 10% / 10% pre/post buffers in the boundary
                     // formula are the budget that absorbs this
                     // deferral lag.
+                    // Stamp the prereq-ready moment once (run_start-relative):
+                    // the moment all periodic-capture prereqs first hold, which
+                    // the boundary window anchors at on a cold boot so boundaries
+                    // fire in the capturable window instead of being stranded in
+                    // the already-past pre-ready region. Same three predicates the
+                    // fire-loop defers on. `.max(1)` keeps a (boot-unreachable)
+                    // elapsed==0 from colliding with the not-ready 0 sentinel.
+                    if periodic_prereqs_ready_ns == 0
+                        && kern_virt_kaslr_published()
+                        && owned_accessor.is_some()
+                        && owned_prog_accessor.is_some()
+                    {
+                        periodic_prereqs_ready_ns = u64::try_from(run_start.elapsed().as_nanos())
+                            .unwrap_or(u64::MAX)
+                            .max(1);
+                    }
                     if freeze_coord_num_snapshots > 0 && !periodic_abandoned {
                         if periodic_boundaries_ns.is_none()
+                            && periodic_prereqs_ready_ns != 0
                             && let Some(workload_d) = workload_duration_for_coord
                         {
                             // Anchor selection — preferring guest-stamped
@@ -7827,9 +7850,23 @@ impl KtstrVm {
                                     );
                                 }
                             }
-                            if scenario_anchor != 0 {
+                            // Boundaries anchor at the LATER of scenario-start
+                            // and the prereq-ready moment (window_anchor) so
+                            // cold-boot accessor/attach latency cannot strand
+                            // them in the already-past pre-ready region (the
+                            // 0-sample flake). Warm boots: prereqs_ready <=
+                            // scenario_anchor so window_anchor == scenario_anchor
+                            // (no-op). periodic_anchor_ns (below) is
+                            // scenario_anchor, NOT window_anchor, so
+                            // boundary_offset_ms = boundary - scenario_anchor is
+                            // SCENARIO-relative, the frame remap_offset_to_step
+                            // buckets against; a window-relative anchor would
+                            // mis-attribute cold-boot captures by the prereq lag.
+                            let window_anchor =
+                                scenario_anchor.max(periodic_prereqs_ready_ns);
+                            if window_anchor != 0 {
                                 let boundaries = compute_periodic_boundaries_ns(
-                                    scenario_anchor,
+                                    window_anchor,
                                     workload_d,
                                     freeze_coord_num_snapshots,
                                 );
@@ -7837,6 +7874,8 @@ impl KtstrVm {
                                     target: "ktstr::failure_dump",
                                     num_snapshots = freeze_coord_num_snapshots,
                                     scenario_anchor_ns = scenario_anchor,
+                                    window_anchor_ns = window_anchor,
+                                    prereqs_ready_ns = periodic_prereqs_ready_ns,
                                     workload_duration_ns = workload_d.as_nanos() as u64,
                                     "freeze-coord: periodic snapshot boundaries computed"
                                 );

@@ -177,11 +177,11 @@ pub(super) fn periodic_tag(idx: u32) -> String {
 /// * `num_snapshots == 0` → empty `Vec` (the disabled case; the
 ///   run-loop's check skips the entire branch when the boundary
 ///   list is empty / unset).
-/// * `num_snapshots == 1` → single boundary at the workload
-///   midpoint (`anchor + 0.5 · d`).
-/// * `num_snapshots == N` for `N ≥ 2` → `N` boundaries at
-///   `anchor + 0.1 · d + (i + 1) · 0.8 · d / (N + 1)` for
-///   `i ∈ 0..N`.
+/// * `num_snapshots == N` for `N ≥ 1` → ONE formula, `N` boundaries
+///   at `anchor + 0.1 · d + (i + 1) · 0.8 · d / (N + 1)` for
+///   `i ∈ 0..N`. `N == 1` lands at the workload midpoint
+///   (`anchor + 0.5 · d`) as a consequence of that single formula,
+///   not a special-cased branch.
 ///
 /// Boundaries are strictly monotonically increasing — a property
 /// the run-loop relies on (linear scan via `next_periodic_idx`).

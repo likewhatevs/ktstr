@@ -684,6 +684,14 @@ pub(crate) fn cpu_util_comp_scale(
 /// no CPU pairs or the window is degenerate, `fw == lw`) mirror
 /// [`fold_per_cpu_spatial_max`]. `Gauge(Avg)`, so it auto-folds to run-level
 /// (weighted mean across phases) and cross-run with no extra wiring.
+///
+/// Cross-boot caveat: `samples_in_phase` are the periodic freezes, whose
+/// window starts at `max(scenario-start, prereqs-ready)` — on a cold boot
+/// (accessor/attach lag) it starts later, so this key reflects a later
+/// workload sub-window. Across a cold/warm boot mix its cross-run magnitude
+/// shifts; use `--noise-adjust` (spread analysis absorbs the boot-timing
+/// jitter) for cross-run compares — a plain `--dual-run` single-pair compare
+/// of this key is advisory.
 fn fold_util_comp_scale(
     metrics: &mut std::collections::BTreeMap<String, f64>,
     samples_in_phase: &[crate::scenario::sample::Sample<'_>],
@@ -740,6 +748,12 @@ fn fold_util_comp_scale(
 /// returns `None` and the entry is skipped; if no entry yields the field, no key
 /// is inserted (the "no key when absent" discipline the sibling folds use). The
 /// member name is the only gate (lavd-unique) — no scheduler-name hardcoding.
+///
+/// Cross-boot caveat: like `fold_util_comp_scale`, these are the periodic
+/// freezes, whose window starts later on a cold boot (the prereq-ready
+/// anchor), so `avg_task_lat_cri`'s cross-run magnitude shifts across a
+/// cold/warm boot mix; use `--noise-adjust` for cross-run compares —
+/// `--dual-run` single-pair is advisory.
 fn fold_lat_cri(
     metrics: &mut std::collections::BTreeMap<String, f64>,
     samples_in_phase: &[crate::scenario::sample::Sample<'_>],
