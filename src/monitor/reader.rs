@@ -2000,6 +2000,16 @@ pub(crate) struct ProgStatsCtx {
     /// `start_kernel_map` so the IDR head's PA resolves correctly
     /// on KASLR kernels.
     pub phys_base: u64,
+    /// Live kernel page-table root (`cr3_cache`), re-read each sample
+    /// (masked `& !0xFFF` via `select_cr3`) to override the once-captured
+    /// `walk.cr3_pa` snapshot. Same cold-boot staleness as
+    /// `WatchBpfMapsCfg::cr3`: the snapshot can be the KASLR-fragile
+    /// `init_top_pgt` fallback when `cr3_cache` is unpublished at
+    /// construction, so the per-tick walk of the vmalloc-backed
+    /// `struct bpf_prog` would fail the whole run and `prog_stats` would
+    /// silently stay empty. The IDR walk re-runs every tick (no cached
+    /// accessor), so a live read each call suffices — no deferral needed.
+    pub cr3: std::sync::Arc<AtomicU64>,
 }
 
 /// Samples and optional watchdog observation returned by
@@ -3197,9 +3207,21 @@ pub(crate) fn monitor_loop(
         // a degenerate entry without minutes of phantom traversal.
         let prog_stats = if data_valid {
             prog_stats_ctx.map(|ctx| {
+                // Override the once-captured walk.cr3_pa snapshot with the
+                // live cr3 (masked `& !0xFFF`), falling back to the snapshot
+                // when cr3_cache is unpublished — same cold-boot staleness
+                // fix as the watch path. The IDR walk re-runs each tick, so
+                // no accessor-defer is needed (unlike the watcher).
+                let live_walk = WalkContext {
+                    cr3_pa: select_cr3(
+                        ctx.cr3.load(std::sync::atomic::Ordering::Acquire),
+                        ctx.walk.cr3_pa,
+                    ),
+                    ..ctx.walk
+                };
                 super::bpf_prog::walk_struct_ops_runtime_stats(
                     mem,
-                    ctx.walk,
+                    live_walk,
                     ctx.prog_idr_kva,
                     &ctx.offsets,
                     &per_cpu_offsets_buf,

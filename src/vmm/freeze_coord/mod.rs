@@ -11316,6 +11316,7 @@ impl KtstrVm {
                         offsets: prog_offsets,
                         start_kernel_map: start_kernel_map_post_wait,
                         phys_base,
+                        cr3: cr3.clone(),
                     })
                 });
 
