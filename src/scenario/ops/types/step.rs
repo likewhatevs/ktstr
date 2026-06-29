@@ -19,7 +19,8 @@ use crate::scenario::Ctx;
 use crate::workload::{AffinityIntent, WorkSpec, WorkType};
 
 use super::{
-    CgroupDef, CpusetSpec, KernelTarget, KernelValue, KernelValueWidth, Op, OpKind, SpawnPlacement,
+    CgroupDef, CpusetSpec, IrqSelector, KernelTarget, KernelValue, KernelValueWidth, Op, OpKind,
+    SpawnPlacement,
 };
 
 // ---------------------------------------------------------------------------
@@ -404,6 +405,7 @@ impl OpKind {
             OpKind::ReplaceScheduler => 24,
             OpKind::PinBpfMap => 25,
             OpKind::CaptureCgroupProcs => 26,
+            OpKind::SteerIrq => 27,
         }
     }
 }
@@ -775,6 +777,17 @@ impl Op {
             tag: tag.into(),
             cgroup: cgroup.into(),
         }
+    }
+
+    /// Re-steer the IRQ named by `irq` to Linux processor `cpu` by
+    /// writing `/proc/irq/<N>/smp_affinity_list` in the guest. See
+    /// [`Op::SteerIrq`] for the full contract: the in-guest-write vs
+    /// kernel-poke distinction, the online-CPU pre-check, and the
+    /// system-wide (not cpuset-scoped) affinity semantics. Construct
+    /// the selector with [`IrqSelector::by_number`] or
+    /// [`IrqSelector::by_label`].
+    pub fn steer_irq(irq: IrqSelector, cpu: usize) -> Self {
+        Op::SteerIrq { irq, cpu }
     }
 
     /// Live-vCPU write of a single (target, value) pair. Singleton

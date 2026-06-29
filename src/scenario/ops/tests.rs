@@ -454,6 +454,10 @@ fn op_discriminant_unique() {
             tag: "snap".into(),
             cgroup: "a".into(),
         },
+        Op::SteerIrq {
+            irq: IrqSelector::ByNumber(0),
+            cpu: 0,
+        },
     ];
     let mut seen = std::collections::BTreeSet::new();
     for op in &ops {
@@ -687,6 +691,14 @@ fn op_discriminant_scheduler_ops() {
         },
         26,
         "CaptureCgroupProcs",
+    );
+    assert_discriminant(
+        Op::SteerIrq {
+            irq: IrqSelector::ByNumber(0),
+            cpu: 0,
+        },
+        27,
+        "SteerIrq",
     );
 }
 
@@ -6534,6 +6546,7 @@ fn op_constructor_coverage_is_exhaustive() {
         Op::pin_bpf_map("constructor_test.bss"),
         Op::spawn(SpawnPlacement::cgroup("a"), w.clone()),
         Op::capture_cgroup_procs("constructor-test", "a"),
+        Op::steer_irq(IrqSelector::by_number(0), 0),
     ];
 
     // Track which variants we observed. Adding a variant to `Op`
@@ -6543,7 +6556,7 @@ fn op_constructor_coverage_is_exhaustive() {
     // the bit_index high-water-mark in `OpKind::bit_index`
     // changes** — the runtime index check at `seen[idx] = true`
     // will panic if the new variant's index >= the array length.
-    let mut seen = [false; 27];
+    let mut seen = [false; 28];
     for op in &constructed {
         let idx = match op {
             Op::AddCgroup { .. } => 0,
@@ -6573,6 +6586,7 @@ fn op_constructor_coverage_is_exhaustive() {
             Op::ReplaceScheduler { .. } => 24,
             Op::PinBpfMap { .. } => 25,
             Op::CaptureCgroupProcs { .. } => 26,
+            Op::SteerIrq { .. } => 27,
         };
         seen[idx] = true;
     }
@@ -9489,5 +9503,134 @@ fn op_capture_cgroup_procs_same_tag_same_cgroup_appends_not_overwrites() {
     );
     assert_eq!(snaps[0].tag, "snap");
     assert_eq!(snaps[1].tag, "snap");
+    cleanup_state(&mut state);
+}
+
+// -- Op::SteerIrq label-resolution + dispatch tests --
+
+/// A representative `/proc/interrupts` body: a header line with no
+/// `:` (must be skipped), classic per-CPU count columns, and
+/// virtio-net IRQ lines whose action name (the last whitespace
+/// token) is the device basename `virtio1` AND a per-vq form
+/// `virtio1-input.0`. Exercises both action-name shapes: the bare
+/// basename is the virtio-MMIO single-shared-IRQ form the booted
+/// guest actually emits; the per-vq form is the virtio-PCI MSI-X
+/// shape. The last-token match is transport-agnostic, so both
+/// resolve.
+const PROC_INTERRUPTS_FIXTURE: &str = "\
+           CPU0       CPU1
+  0:         10          0   IO-APIC   2-edge      timer
+  9:          0          0   IO-APIC   9-fasteoi   acpi
+ 25:        500        300   PCI-MSI   524288-edge virtio1-input.0
+ 26:          7          3   PCI-MSI   524289-edge virtio1";
+
+/// `resolve_irq_label` matches the `/proc/interrupts` action name
+/// (last whitespace token) and returns that line's leading IRQ
+/// number — both the device basename and the per-vq form resolve.
+#[test]
+fn resolve_irq_label_matches_action_name() {
+    assert_eq!(
+        super::dispatch::resolve_irq_label(PROC_INTERRUPTS_FIXTURE, "virtio1").unwrap(),
+        26,
+    );
+    assert_eq!(
+        super::dispatch::resolve_irq_label(PROC_INTERRUPTS_FIXTURE, "virtio1-input.0").unwrap(),
+        25,
+    );
+    // A non-action token (a count column, the chip name, the
+    // header) must NOT match — only the trailing action name does.
+    assert!(super::dispatch::resolve_irq_label(PROC_INTERRUPTS_FIXTURE, "PCI-MSI").is_err());
+    assert!(super::dispatch::resolve_irq_label(PROC_INTERRUPTS_FIXTURE, "CPU0").is_err());
+}
+
+/// An action name absent from `/proc/interrupts` bails with a
+/// diagnostic naming the label (no silent zero / first-line
+/// fallback).
+#[test]
+fn resolve_irq_label_unknown_label_bails() {
+    let err = super::dispatch::resolve_irq_label(PROC_INTERRUPTS_FIXTURE, "virtio7")
+        .expect_err("an unknown action name must bail");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("virtio7") && msg.contains("no /proc/interrupts line"),
+        "diagnostic must name the missing label; got: {msg}",
+    );
+}
+
+/// An empty label bails before scanning (a `split_whitespace`
+/// action name is never empty, so an empty label could never match
+/// — fail loud with construction guidance instead).
+#[test]
+fn resolve_irq_label_empty_label_bails() {
+    let err = super::dispatch::resolve_irq_label(PROC_INTERRUPTS_FIXTURE, "")
+        .expect_err("an empty label must bail");
+    assert!(
+        format!("{err:#}").contains("label is empty"),
+        "diagnostic must cite the empty-label bail",
+    );
+}
+
+/// A line whose leading IRQ column is non-numeric bails rather than
+/// returning a bogus number — guards the `lhs.trim().parse::<u32>()`
+/// error arm.
+#[test]
+fn resolve_irq_label_non_numeric_irq_column_bails() {
+    let text = "weird:   1   2   PCI-MSI   bogusdev";
+    let err = super::dispatch::resolve_irq_label(text, "bogusdev")
+        .expect_err("a non-numeric IRQ column must bail");
+    assert!(
+        format!("{err:#}").contains("non-numeric"),
+        "diagnostic must cite the non-numeric IRQ column",
+    );
+}
+
+/// `Op::SteerIrq` to an out-of-range / offline CPU must bail at the
+/// online pre-check BEFORE the `smp_affinity_list` write — so this
+/// unit test never mutates the host's real IRQ affinity. Exercises
+/// the `IrqSelector::ByNumber` passthrough + the online guard.
+#[test]
+fn op_steer_irq_offline_cpu_bails_before_write() {
+    mock_setup_state!(mock, topo, ctx, state);
+    let err = apply_ops_test(
+        &ctx,
+        &mut state,
+        &[Op::steer_irq(IrqSelector::by_number(0), 1_000_000)],
+    )
+    .expect_err("an offline/out-of-range CPU must bail before the write");
+    let msg = format!("{err:#}");
+    // "not online" is the GUARD's distinctive diagnostic; the write's
+    // failure path says "writing ... failed" instead. Asserting on
+    // "not online" therefore pins that the online pre-check produced
+    // the bail BEFORE any smp_affinity_list write — a refactor that
+    // moved the write ahead of the guard would surface the write's
+    // message here and fail this assertion.
+    assert!(
+        msg.contains("not online"),
+        "diagnostic must cite the offline-CPU guard bail (not a write error); got: {msg}",
+    );
+    cleanup_state(&mut state);
+}
+
+/// `Op::SteerIrq` with a `ByLabel` selector that matches no
+/// `/proc/interrupts` line bails at resolution BEFORE any write —
+/// also never mutating host IRQ affinity. The label is one no real
+/// device emits as an action name.
+#[test]
+fn op_steer_irq_unresolvable_label_bails_before_write() {
+    mock_setup_state!(mock, topo, ctx, state);
+    let err = apply_ops_test(
+        &ctx,
+        &mut state,
+        &[Op::steer_irq(
+            IrqSelector::by_label("ktstr_no_such_irq_label_zzz"),
+            0,
+        )],
+    )
+    .expect_err("an unresolvable IRQ label must bail before the write");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("ktstr_no_such_irq_label_zzz"),
+        "diagnostic must name the unresolvable label; got: {msg}",
+    );
     cleanup_state(&mut state);
 }
