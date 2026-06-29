@@ -2239,16 +2239,28 @@ struct ResolvedWatch {
 /// error); each target's (map, offset, width) is cached on first resolve;
 /// subsequent ticks re-read only the leaf bytes.
 ///
-/// v0 limitation: the obj prefix + per-target resolution are latched
-/// permanently. A mid-run `Op::ReplaceScheduler` frees the outgoing
-/// scheduler's maps and attaches a new instance at a new map KVA, but the
-/// watcher keeps reading the stale (freed) KVA — re-resolving on the
-/// scheduler-attach edge is a follow-up. The scenarios this targets attach a
-/// single scheduler at boot and do not replace it mid-run.
+/// Replace-safe: a mid-run `Op::ReplaceScheduler` frees the outgoing
+/// scheduler and attaches a new instance whose maps live at new KVAs. Each
+/// tick the watcher re-walks the active struct_ops once (one `prog_idr` walk
+/// feeding BOTH the metric-key prefix and the live used-map-KVA set); when
+/// that identity changes — the obj prefix or the used-map-KVA set — it drops
+/// all cached resolutions and rebinds each target to the suffix-matching map
+/// whose `map_kva` is in the live set. Binding by the live `used_map_kvas`
+/// (not just the name suffix) disambiguates the same-binary swap even when the
+/// outgoing `.bss` is pinned alive across the swap: both copies share the map
+/// name, but only the incoming instance's map is in the live struct_ops prog's
+/// `used_maps`. This mirrors the snapshot path's per-capture
+/// `identify_active_obj_from_struct_ops` walk + KVA filter.
 struct BpfMapWatcher<'a> {
     cfg: &'a WatchBpfMapsCfg,
     accessor: Option<GuestMemMapAccessorOwned>,
     obj_prefix: Option<String>,
+    /// The live struct_ops prog's `used_maps` KVAs (each a `struct bpf_map`
+    /// KVA, matching [`BpfMapInfo::map_kva`]), SORTED for set comparison.
+    /// Re-read from the active-struct_ops walk each tick; a change signals an
+    /// `Op::ReplaceScheduler` swap and forces re-resolution. Targets bind only
+    /// to a map whose `map_kva` is in this set (the live instance).
+    live_map_kvas: Vec<u64>,
     resolved: Vec<Option<ResolvedWatch>>,
 }
 
@@ -2266,6 +2278,44 @@ fn le_uint(bytes: &[u8], width: usize) -> Option<u64> {
     Some(v)
 }
 
+/// Among `maps` whose name ends with `suffix`, return the one whose `map_kva`
+/// is in `live_kvas` (the active struct_ops prog's `used_maps` set). This
+/// uniquely selects the LIVE scheduler instance when a same-binary
+/// `Op::ReplaceScheduler` leaves two identically-named maps coexisting (e.g. a
+/// pinned outgoing `.bss`): only the incoming instance's map is in the live
+/// set. Returns `None` when no live-set map matches the suffix.
+fn pick_live_map<'m>(
+    maps: &'m [BpfMapInfo],
+    suffix: &str,
+    live_kvas: &[u64],
+) -> Option<&'m BpfMapInfo> {
+    maps.iter()
+        .find(|m| m.name().ends_with(suffix) && live_kvas.contains(&m.map_kva))
+}
+
+/// True when the live struct_ops identity differs from the cached one -- the
+/// obj prefix changed OR the used-map-KVA SET changed (set comparison, so a
+/// reordering of `used_maps` entries does not false-trigger). A same-binary
+/// `Op::ReplaceScheduler` keeps the prefix but changes the KVA set, so the set
+/// is the load-bearing discriminator. `cached_sorted_kvas` is assumed sorted
+/// (the watcher keeps it so); `active_kvas` is sorted here for the compare.
+fn active_set_changed(
+    cached_prefix: Option<&str>,
+    cached_sorted_kvas: &[u64],
+    active_prefix: &str,
+    active_kvas: &[u64],
+) -> bool {
+    if cached_prefix != Some(active_prefix) {
+        return true;
+    }
+    if cached_sorted_kvas.len() != active_kvas.len() {
+        return true;
+    }
+    let mut cur = active_kvas.to_vec();
+    cur.sort_unstable();
+    cur != cached_sorted_kvas
+}
+
 impl<'a> BpfMapWatcher<'a> {
     fn new(cfg: &'a WatchBpfMapsCfg) -> Self {
         let mut resolved = Vec::with_capacity(cfg.targets.len());
@@ -2274,6 +2324,7 @@ impl<'a> BpfMapWatcher<'a> {
             cfg,
             accessor: None,
             obj_prefix: None,
+            live_map_kvas: Vec::new(),
             resolved,
         }
     }
@@ -2311,43 +2362,67 @@ impl<'a> BpfMapWatcher<'a> {
             return Vec::new();
         };
         let accessor = owned.as_accessor();
-        // Lazily resolve the active scheduler's obj prefix (e.g. `scx_lavd`),
-        // which keys the metrics. `None` until a STRUCT_OPS scheduler attaches.
-        if self.obj_prefix.is_none() {
-            let walk = WalkContext {
-                cr3_pa: cfg.cr3_pa,
-                page_offset,
-                l5: cfg.l5,
-                tcr_el1: cfg.tcr_el1,
-            };
-            self.obj_prefix = find_active_struct_ops_obj_no_target(
-                &cfg.mem,
-                walk,
-                cfg.prog_idr_kva,
-                &cfg.prog_offsets,
-                accessor.offsets(),
-                start_kernel_map,
-                phys_base,
-            )
-            .map(|m| m.obj_name);
-        }
-        let Some(prefix) = self.obj_prefix.clone() else {
+        // Re-resolve the active scheduler EACH tick from a single prog_idr walk
+        // that yields both the metric-key prefix and the live used-map-KVA set.
+        // `None` until a STRUCT_OPS scheduler attaches (or transiently mid-swap)
+        // -> emit nothing that tick.
+        let walk = WalkContext {
+            cr3_pa: cfg.cr3_pa,
+            page_offset,
+            l5: cfg.l5,
+            tcr_el1: cfg.tcr_el1,
+        };
+        let Some(active) = find_active_struct_ops_obj_no_target(
+            &cfg.mem,
+            walk,
+            cfg.prog_idr_kva,
+            &cfg.prog_offsets,
+            accessor.offsets(),
+            start_kernel_map,
+            phys_base,
+        ) else {
             return Vec::new();
         };
+        // An Op::ReplaceScheduler swap changes the live identity (obj prefix
+        // and/or the used-map-KVA set; same-binary swaps share the prefix, so
+        // the KVA set is the discriminator). On change, adopt the incoming
+        // identity and drop every cached resolution so targets rebind below via
+        // `pick_live_map` to a map whose `map_kva` is in the LIVE prog's
+        // used_maps. That used-maps membership filter -- not prog_idr eviction
+        // timing -- is what excludes a pinned outgoing `.bss`: the pin holds the
+        // outgoing MAP in map_idr, but that map is absent from the incoming
+        // prog's used_maps. (The outgoing struct_ops PROG also leaves prog_idr
+        // on process death, so the per-tick walk returns the incoming prog's
+        // set.)
+        if active_set_changed(
+            self.obj_prefix.as_deref(),
+            &self.live_map_kvas,
+            &active.obj_name,
+            &active.used_map_kvas,
+        ) {
+            self.obj_prefix = Some(active.obj_name.clone());
+            self.live_map_kvas = active.used_map_kvas.clone();
+            self.live_map_kvas.sort_unstable();
+            for slot in self.resolved.iter_mut() {
+                *slot = None;
+            }
+        }
+        let prefix = active.obj_name;
+        let maps = accessor.maps();
         let mut out: Vec<BpfMapFieldSample> = Vec::new();
         for (i, t) in cfg.targets.iter().enumerate() {
             if self.resolved[i].is_none()
-                && let Some(map) = accessor.find_map(&t.map_suffix)
+                && let Some(map) = pick_live_map(&maps, &t.map_suffix, &self.live_map_kvas)
             {
                 // Resolve the dot-path against the map's PROGRAM BTF (the
                 // scheduler's own types), falling back to vmlinux BTF.
-                let prog_btf = accessor.load_program_btf(&map, &cfg.base_btf);
+                let prog_btf = accessor.load_program_btf(map, &cfg.base_btf);
                 let btf = prog_btf.as_ref().unwrap_or(&cfg.base_btf);
                 if let Some((offset, width)) =
                     resolve_map_field_offset_width(btf, map.btf_value_type_id, &t.field)
                 {
                     self.resolved[i] = Some(ResolvedWatch {
-                        map,
+                        map: map.clone(),
                         offset,
                         width,
                         per_cpu: t.per_cpu,
@@ -3249,6 +3324,80 @@ mod tests {
         assert_eq!(le_uint(&[0x12], 2), None);
         assert_eq!(le_uint(&[1, 2, 3], 3), None);
         assert_eq!(le_uint(&[], 0), None);
+    }
+
+    /// Build a minimal `BpfMapInfo` with a name + map_kva for the watcher
+    /// live-instance disambiguation tests.
+    fn map_for(name: &str, map_kva: u64) -> BpfMapInfo {
+        let (name_bytes, name_len) = crate::monitor::test_util::name_from_str(name);
+        BpfMapInfo {
+            name_bytes,
+            name_len,
+            map_kva,
+            ..Default::default()
+        }
+    }
+
+    /// `pick_live_map` binds a watch target to the LIVE instance's map when a
+    /// same-binary `Op::ReplaceScheduler` leaves two identically-named maps
+    /// coexisting (the pinned-outgoing case): only the incoming map's `map_kva`
+    /// is in the live used-map set, so it is chosen over the lower-address
+    /// outgoing copy a name-only scan would return first.
+    #[test]
+    fn pick_live_map_selects_the_live_copy_among_duplicates() {
+        let maps = vec![
+            map_for("bpf_bpf.bss", 0x1000), // outgoing (pinned, lower addr)
+            map_for("bpf_bpf.bss", 0x2000), // incoming (live)
+            map_for("bpf_bpf.data", 0x3000),
+        ];
+        let live = [0x2000u64, 0x3000];
+        let got = pick_live_map(&maps, ".bss", &live).expect("a live .bss");
+        assert_eq!(got.map_kva, 0x2000, "binds the incoming (live) .bss copy");
+    }
+
+    /// `pick_live_map` returns None when the suffix matches but no candidate is
+    /// in the live set, and when no name matches; Some for a single live match.
+    #[test]
+    fn pick_live_map_none_when_no_live_match() {
+        let maps = vec![map_for("bpf_bpf.bss", 0x1000)];
+        assert!(pick_live_map(&maps, ".bss", &[0x9999]).is_none());
+        assert!(pick_live_map(&maps, ".rodata", &[0x1000]).is_none());
+        assert_eq!(
+            pick_live_map(&maps, ".bss", &[0x1000]).map(|m| m.map_kva),
+            Some(0x1000),
+        );
+    }
+
+    /// `active_set_changed` detects an `Op::ReplaceScheduler` swap by the obj
+    /// prefix OR the used-map-KVA set, and is set-based (order-insensitive) so a
+    /// stable reordering of `used_maps` entries does not churn the cache.
+    #[test]
+    fn active_set_changed_detects_swap_set_based() {
+        // First resolve: no cached prefix -> changed.
+        assert!(active_set_changed(None, &[], "bpf_bpf", &[0x10, 0x20]));
+        // Same-binary swap: prefix unchanged, KVA set differs -> changed.
+        assert!(active_set_changed(
+            Some("bpf_bpf"),
+            &[0x10, 0x20],
+            "bpf_bpf",
+            &[0x30, 0x40],
+        ));
+        // Different obj prefix -> changed.
+        assert!(active_set_changed(Some("bpf_bpf"), &[0x10], "scx_lavd", &[0x10]));
+        // Identical set, active reordered (cached is sorted) -> NOT changed.
+        assert!(!active_set_changed(
+            Some("bpf_bpf"),
+            &[0x10, 0x20, 0x30],
+            "bpf_bpf",
+            &[0x30, 0x10, 0x20],
+        ));
+        // Different length -> changed.
+        assert!(active_set_changed(
+            Some("bpf_bpf"),
+            &[0x10, 0x20],
+            "bpf_bpf",
+            &[0x10],
+        ));
     }
 
     #[test]
