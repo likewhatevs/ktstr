@@ -109,10 +109,11 @@ pub enum Aggregated {
     /// off / no CAP_NET_ADMIN / query raced exit), or — for the jemalloc byte
     /// counters — no thread's per-thread probe READ succeeded (non-jemalloc
     /// process, probe could not attach, or the read failed) — distinct from a
-    /// measured zero. (A sub-family disabled
-    /// while the query still succeeds — e.g. CONFIG_TASK_DELAY_ACCT off but the
-    /// query returns Ok — is NOT Absent here; its genuine-zero fields render "0".
-    /// See the `taskstats_measured` field doc.) Produced by [fn@super::aggregate]'s
+    /// measured zero. (A sub-family disabled while the query still succeeds — e.g.
+    /// CONFIG_TASK_XACCT off, or the `kernel.task_delayacct` sysctl off, with the
+    /// other family on — now IS Absent: the measured predicate ANDs the per-thread
+    /// query-Ok with the per-sub-family active flag baked from host probes. See the
+    /// `taskstats_measured` field doc.) Produced by [fn@super::aggregate]'s
     /// caller when the family has a
     /// measured predicate, the bucket is non-empty, and no contributing thread
     /// captured it. `numeric()` returns `None`, so a derived metric consuming it

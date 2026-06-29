@@ -232,6 +232,18 @@ pub struct HostContext {
     /// systems.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kernel_cmdline: Option<String>,
+    /// Kernel delay-accounting state probed from
+    /// `/proc/sys/kernel/task_delayacct`. `None` only in synthetic
+    /// contexts that did not probe; [`collect_host_context`] always
+    /// populates it. Gates which taskstats delay-family fields are
+    /// genuinely measured — see [`DelayacctState`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_delayacct: Option<DelayacctState>,
+    /// CONFIG_TASK_XACCT build state probed from `/proc/config.gz`.
+    /// Gates the taskstats memory-watermark fields — see
+    /// [`XacctState`]. `None` only in synthetic contexts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_task_xacct: Option<XacctState>,
     /// Running process's jemalloc heap state — active / allocated /
     /// resident / mapped bytes and arena count. Populated on
     /// jemalloc-linked builds (every ktstr binary), `None` on
@@ -472,6 +484,8 @@ impl HostContext {
             kernel_release: Some("6.16.0-test".to_string()),
             arch: Some("x86_64".to_string()),
             kernel_cmdline: Some("BOOT_IMAGE=/boot/vmlinuz-test root=/dev/sda1".to_string()),
+            task_delayacct: Some(DelayacctState::On),
+            config_task_xacct: Some(XacctState::On),
             heap_state: Some(crate::host_heap::HostHeapState::test_fixture()),
         }
     }
@@ -526,6 +540,8 @@ impl HostContext {
             kernel_release,
             arch,
             kernel_cmdline,
+            task_delayacct,
+            config_task_xacct,
             heap_state,
         } = self;
         fn row<T: std::fmt::Display>(out: &mut String, key: &str, value: Option<&T>) {
@@ -553,6 +569,8 @@ impl HostContext {
         row(&mut out, "thp_enabled", thp_enabled.as_ref());
         row(&mut out, "thp_defrag", thp_defrag.as_ref());
         row(&mut out, "kernel_cmdline", kernel_cmdline.as_ref());
+        row(&mut out, "task_delayacct", task_delayacct.as_ref());
+        row(&mut out, "config_task_xacct", config_task_xacct.as_ref());
         if cpufreq_governor.is_empty() {
             out.push_str("cpufreq_governor: (empty)\n");
         } else {
@@ -644,6 +662,8 @@ impl HostContext {
             kernel_release: a_kernel_release,
             arch: a_arch,
             kernel_cmdline: a_kernel_cmdline,
+            task_delayacct: a_task_delayacct,
+            config_task_xacct: a_config_task_xacct,
             heap_state: a_heap_state,
         } = self;
         let HostContext {
@@ -663,6 +683,8 @@ impl HostContext {
             kernel_release: b_kernel_release,
             arch: b_arch,
             kernel_cmdline: b_kernel_cmdline,
+            task_delayacct: b_task_delayacct,
+            config_task_xacct: b_config_task_xacct,
             heap_state: b_heap_state,
         } = other;
         let mut out = String::new();
@@ -744,6 +766,18 @@ impl HostContext {
             "kernel_cmdline",
             a_kernel_cmdline.as_ref(),
             b_kernel_cmdline.as_ref(),
+        );
+        diff_row(
+            &mut out,
+            "task_delayacct",
+            a_task_delayacct.as_ref(),
+            b_task_delayacct.as_ref(),
+        );
+        diff_row(
+            &mut out,
+            "config_task_xacct",
+            a_config_task_xacct.as_ref(),
+            b_config_task_xacct.as_ref(),
         );
         diff_cpufreq_governor(&mut out, a_cpufreq_governor, b_cpufreq_governor);
         diff_sched_tunables(
@@ -912,6 +946,8 @@ pub fn collect_host_context() -> HostContext {
         kernel_release: static_info.kernel_release,
         arch: static_info.arch,
         kernel_cmdline: read_trimmed_sysfs("/proc/cmdline"),
+        task_delayacct: Some(read_task_delayacct()),
+        config_task_xacct: Some(read_config_task_xacct()),
         // `heap_state` is a post-run snapshot of the running ktstr
         // process's jemalloc footprint. Captured here alongside the
         // other dynamic fields so sidecar consumers can correlate
@@ -1309,6 +1345,180 @@ fn read_sched_tunables_from(dir: &std::path::Path) -> Option<BTreeMap<String, St
         }
     }
     Some(out)
+}
+
+/// Build + runtime state of kernel delay accounting, probed from
+/// `/proc/sys/kernel/task_delayacct`. Determines which taskstats
+/// delay-family fields are actually being populated:
+/// - `cpu_delay_*` come from `tsk->sched_info` and are filled
+///   UNCONDITIONALLY by `delayacct_add_tsk` (kernel/delayacct.c)
+///   whenever CONFIG_TASK_DELAY_ACCT is built in — they survive the
+///   runtime toggle, so they read real values in both [`Self::On`]
+///   and [`Self::RuntimeOff`].
+/// - the per-resource lock categories (`blkio`, `swapin`,
+///   `freepages`, `thrashing`, `compact`, `wpcopy`, `irq`) are gated
+///   by `tsk->delays`, allocated at fork only when `delayacct_on`, so
+///   they read genuine values only in [`Self::On`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum DelayacctState {
+    /// `/proc/sys/kernel/task_delayacct` absent. The sysctl is
+    /// registered only under CONFIG_TASK_DELAY_ACCT
+    /// (kernel/delayacct.c), so an absent file means the option is not
+    /// built in and NO delay-family field is populated. (Under ktstr's
+    /// root execution a present file is always readable, so absent is
+    /// the only not-`On`/not-`RuntimeOff` outcome.)
+    ConfigOff,
+    /// File present, reads `0` — built in but the runtime toggle is
+    /// off. `cpu_delay_*` still populate; the lock categories read zero
+    /// for tasks forked while off.
+    RuntimeOff,
+    /// File present, reads `1` — delay accounting fully active.
+    On,
+}
+
+impl std::fmt::Display for DelayacctState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            DelayacctState::ConfigOff => "config-off",
+            DelayacctState::RuntimeOff => "runtime-off",
+            DelayacctState::On => "on",
+        };
+        f.write_str(s)
+    }
+}
+
+/// Build state of extended task accounting (CONFIG_TASK_XACCT),
+/// probed from `/proc/config.gz`. Gates the taskstats memory
+/// watermark fields (`hiwater_rss_bytes`, `hiwater_vm_bytes`), which
+/// `xacct_add_tsk` (kernel/tsacct.c) fills whenever CONFIG_TASK_XACCT
+/// is built in — there is NO runtime toggle, unlike delay accounting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum XacctState {
+    /// `/proc/config.gz` shows `CONFIG_TASK_XACCT=y` — watermarks
+    /// populate (for tasks with an address space; a kernel thread
+    /// reads zero).
+    On,
+    /// `/proc/config.gz` shows `# CONFIG_TASK_XACCT is not set` — not
+    /// built in, watermarks read zero.
+    Off,
+    /// `/proc/config.gz` is unreadable (no CONFIG_IKCONFIG_PROC, or the
+    /// gz read/parse failed) or the symbol line is absent. Treated as
+    /// measured (like [`Self::On`]) for gating so a host that does not
+    /// expose its config never produces a false "absent" verdict.
+    Unknown,
+}
+
+impl std::fmt::Display for XacctState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            XacctState::On => "on",
+            XacctState::Off => "off",
+            XacctState::Unknown => "unknown",
+        };
+        f.write_str(s)
+    }
+}
+
+/// Probe the delay-accounting state from `/proc/sys/kernel/task_delayacct`.
+fn read_task_delayacct() -> DelayacctState {
+    read_task_delayacct_from(std::path::Path::new("/proc/sys/kernel/task_delayacct"))
+}
+
+/// Path-parameterized seam for [`read_task_delayacct`] — unit tests
+/// drive it with a tempdir holding a `task_delayacct` fixture (or no
+/// such file, for the [`DelayacctState::ConfigOff`] case). A
+/// present-but-empty or unreadable file also maps to `ConfigOff`
+/// (`read_trimmed_sysfs` returns `None`); the real `proc_dointvec_minmax`
+/// sysctl always emits "0"/"1", so that conflation is unreachable under
+/// ktstr's root execution where a present file is readable.
+fn read_task_delayacct_from(path: &std::path::Path) -> DelayacctState {
+    match read_trimmed_sysfs(path) {
+        None => DelayacctState::ConfigOff,
+        Some(s) if s == "1" => DelayacctState::On,
+        // Any present-but-not-"1" value (canonically "0") is runtime-off.
+        Some(_) => DelayacctState::RuntimeOff,
+    }
+}
+
+/// Probe CONFIG_TASK_XACCT from `/proc/config.gz`.
+fn read_config_task_xacct() -> XacctState {
+    read_config_task_xacct_from(std::path::Path::new("/proc/config.gz"))
+}
+
+/// Gz-decode `path` and classify CONFIG_TASK_XACCT. Unreadable file or
+/// decode failure → [`XacctState::Unknown`]. The decompressed-text
+/// classification lives in [`parse_kconfig_xacct`] so it is unit-testable
+/// without writing a gz fixture.
+fn read_config_task_xacct_from(path: &std::path::Path) -> XacctState {
+    let Ok(bytes) = std::fs::read(path) else {
+        return XacctState::Unknown;
+    };
+    use std::io::Read as _;
+    let mut gz = flate2::read::GzDecoder::new(&bytes[..]);
+    let mut text = String::new();
+    if gz.read_to_string(&mut text).is_err() {
+        return XacctState::Unknown;
+    }
+    parse_kconfig_xacct(&text)
+}
+
+/// Classify CONFIG_TASK_XACCT from decompressed kconfig text. `=y` →
+/// [`XacctState::On`]; `# CONFIG_TASK_XACCT is not set` →
+/// [`XacctState::Off`]; the symbol absent entirely →
+/// [`XacctState::Unknown`] (a partial/foreign config, treated as
+/// measured downstream). Matches the whole trimmed line so a substring
+/// in an unrelated symbol cannot false-match.
+fn parse_kconfig_xacct(text: &str) -> XacctState {
+    if text.lines().any(|l| l.trim() == "CONFIG_TASK_XACCT=y") {
+        XacctState::On
+    } else if text.lines().any(|l| l.trim() == "# CONFIG_TASK_XACCT is not set") {
+        XacctState::Off
+    } else {
+        XacctState::Unknown
+    }
+}
+
+/// Per-sub-family "is this taskstats family genuinely populated host-wide"
+/// state, reduced from the two kernel-accounting probes. Computed once per
+/// ctprof snapshot and baked into each captured thread (AND-ed with the
+/// per-thread query-Ok), so the group aggregation gates each sub-family
+/// independently rather than treating the whole taskstats payload as one flag.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TaskstatsActive {
+    /// `cpu_delay_*` survive the runtime toggle (sched_info-sourced, filled
+    /// unconditionally) — active unless CONFIG_TASK_DELAY_ACCT is off entirely.
+    pub cpu_delay: bool,
+    /// The delayacct resource-wait categories need delayacct runtime-on
+    /// (`tsk->delays` is allocated at fork only when `delayacct_on`).
+    pub delay_block: bool,
+    /// The xacct watermarks need CONFIG_TASK_XACCT; [`XacctState::Unknown`]
+    /// (config not exposed) is treated as active to avoid a false absent.
+    pub xacct: bool,
+}
+
+/// Probe both kernel-accounting states and reduce to the per-sub-family active
+/// flags. Two small `/proc` reads; called once per ctprof snapshot.
+pub(crate) fn probe_taskstats_active() -> TaskstatsActive {
+    taskstats_active_from(read_task_delayacct(), read_config_task_xacct())
+}
+
+/// Pure reduction of the two probe enums to the per-sub-family active flags —
+/// the counter-semantics crux, split out so it is unit-testable without `/proc`.
+/// `cpu_delay` survives `RuntimeOff` (gate is `!= ConfigOff`, NOT `== On`,
+/// because `delayacct_add_tsk` fills the sched_info CPU block BEFORE the
+/// `if (!tsk->delays)` gate); the resource-wait categories need `== On`
+/// (`tsk->delays` is allocated at fork only when delayacct is on); xacct keys off
+/// CONFIG only, with `Unknown` treated active to avoid a false absent.
+fn taskstats_active_from(delayacct: DelayacctState, xacct: XacctState) -> TaskstatsActive {
+    TaskstatsActive {
+        cpu_delay: delayacct != DelayacctState::ConfigOff,
+        delay_block: delayacct == DelayacctState::On,
+        xacct: xacct != XacctState::Off,
+    }
 }
 
 /// Pure-function seam used by [`probe_host_topology_counts`]

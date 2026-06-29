@@ -44,7 +44,7 @@ use crate::ctprof::{CtprofSnapshot, ThreadState};
 
 use super::{
     AffinitySummary, AggRule, Aggregated, CTPROF_METRICS, CtprofMetricDef, DiffRow, GroupBy,
-    Section, ThreadGroup,
+    ThreadGroup,
     pattern::{cgroup_normalize_skeleton, pattern_key, tighten_group},
 };
 
@@ -531,24 +531,79 @@ fn mode_aggregate(
     Aggregated::Mode { tallies, total }
 }
 
-/// The per-thread "was this family captured" predicate for a capture-gated
-/// metric, or `None` for an always-measured metric. Delay-accounting is the
-/// whole [`Section::TaskstatsDelay`] family (taskstats genetlink — absent when
-/// CONFIG_TASK_DELAY_ACCT is off / the delayacct sysctl is off / no
-/// CAP_NET_ADMIN / the query raced exit); jemalloc is the two byte counters,
-/// which live in the shared [`Section::Primary`] and so are name-matched.
-/// `build_groups` folds a non-empty bucket where the predicate holds but NO
-/// thread captured the family to [`Aggregated::Absent`], distinguishing a
-/// never-captured family from a measured zero (the bug: a derived metric
+/// Taskstats sub-family of a raw metric, classified by name — the gating
+/// granularity kernel delay/xacct accounting actually has. The three sub-families
+/// have DIFFERENT enablement conditions (see [`measured_predicate`]): `cpu_delay_*`
+/// survive the runtime delayacct toggle, the resource-wait categories do not, and the
+/// xacct watermarks key off a separate CONFIG with no runtime toggle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaskstatsFamily {
+    /// `cpu_delay_*` — sched_info-sourced, filled unconditionally by
+    /// `delayacct_add_tsk`; active unless CONFIG_TASK_DELAY_ACCT is off entirely.
+    CpuDelay,
+    /// The 7 delayacct resource-wait categories (`blkio`/`swapin`/`freepages`/`thrashing`/
+    /// `compact`/`wpcopy`/`irq`) — gated by the runtime `task_delayacct` toggle
+    /// (`tsk->delays` is allocated at fork only when on).
+    DelayBlock,
+    /// The xacct memory watermarks (`hiwater_*`) — gated by CONFIG_TASK_XACCT, no
+    /// runtime toggle.
+    Xacct,
+}
+
+/// Classify a RAW taskstats metric by name. `None` for non-taskstats metrics.
+/// Derived taskstats metrics (`avg_*_delay_ns`, `total_offcpu_delay_ns`) are NOT
+/// classified here — they inherit [`Aggregated::Absent`] from their raw inputs
+/// ([`Aggregated::numeric`] returns `None`, so the derived `compute` closure
+/// short-circuits). The
+/// `build_groups_all_subfamilies_inactive_makes_every_taskstats_metric_absent`
+/// test pins that every `Section::TaskstatsDelay` raw metric maps to `Some`.
+fn taskstats_family(name: &str) -> Option<TaskstatsFamily> {
+    if name.starts_with("cpu_delay_") {
+        return Some(TaskstatsFamily::CpuDelay);
+    }
+    if name.starts_with("hiwater_") {
+        return Some(TaskstatsFamily::Xacct);
+    }
+    const LOCK_DELAY_PREFIXES: [&str; 7] = [
+        "blkio_delay_",
+        "swapin_delay_",
+        "freepages_delay_",
+        "thrashing_delay_",
+        "compact_delay_",
+        "wpcopy_delay_",
+        "irq_delay_",
+    ];
+    if LOCK_DELAY_PREFIXES.iter().any(|p| name.starts_with(p)) {
+        return Some(TaskstatsFamily::DelayBlock);
+    }
+    None
+}
+
+/// The per-thread "was this metric's family genuinely measured" predicate for a
+/// capture-gated metric, or `None` for an always-measured metric. A taskstats
+/// metric is measured iff this thread's genetlink query succeeded
+/// (`taskstats_measured`) AND its sub-family is enabled host-wide — per
+/// [`TaskstatsFamily`], `cpu_delay_*` need CONFIG_TASK_DELAY_ACCT built in, the
+/// resource-wait categories additionally need the runtime delayacct toggle on, and
+/// the `hiwater_*` watermarks need CONFIG_TASK_XACCT (the active flags are baked
+/// per-thread at capture). jemalloc is the two byte counters, which live in the
+/// shared `Section::Primary` and so are name-matched. `build_groups` folds a
+/// non-empty bucket where the predicate holds but NO thread measured the family
+/// to [`Aggregated::Absent`], distinguishing a never-captured (or
+/// sub-family-disabled) family from a measured zero (the bug: a derived metric
 /// otherwise computes from a sentinel `0` and renders "0" instead of "-").
 fn measured_predicate(m: &CtprofMetricDef) -> Option<fn(&ThreadState) -> bool> {
-    if m.section == Section::TaskstatsDelay {
-        Some(|t| t.taskstats_measured)
-    } else if m.name == "allocated_bytes" || m.name == "deallocated_bytes" {
-        Some(|t| t.jemalloc_measured)
-    } else {
-        None
+    if let Some(fam) = taskstats_family(m.name) {
+        return Some(match fam {
+            TaskstatsFamily::CpuDelay => |t| t.taskstats_measured && t.cpu_delay_active,
+            TaskstatsFamily::DelayBlock => |t| t.taskstats_measured && t.delay_block_active,
+            TaskstatsFamily::Xacct => |t| t.taskstats_measured && t.xacct_active,
+        });
     }
+    if m.name == "allocated_bytes" || m.name == "deallocated_bytes" {
+        return Some(|t| t.jemalloc_measured);
+    }
+    None
 }
 
 pub fn aggregate(rule: AggRule, threads: &[&ThreadState]) -> Aggregated {

@@ -699,6 +699,8 @@ fn sidecar_variant_hash_excludes_host_context() {
         kernel_release: Some("6.11.0".to_string()),
         arch: Some("x86_64".to_string()),
         kernel_cmdline: Some("preempt=lazy".to_string()),
+        task_delayacct: Some(crate::host_context::DelayacctState::On),
+        config_task_xacct: Some(crate::host_context::XacctState::On),
         heap_state: None,
     };
     let without_host = SidecarResult {
@@ -1140,6 +1142,8 @@ fn sidecar_result_roundtrip_with_populated_host_context() {
         kernel_release: Some("6.11.0".to_string()),
         arch: Some("x86_64".to_string()),
         kernel_cmdline: Some("preempt=lazy isolcpus=1-3".to_string()),
+        task_delayacct: Some(crate::host_context::DelayacctState::On),
+        config_task_xacct: Some(crate::host_context::XacctState::On),
         heap_state: Some(crate::host_heap::HostHeapState::test_fixture()),
     };
     let sc = SidecarResult {
@@ -1285,6 +1289,16 @@ fn sidecars_in_a_run_carry_identical_host_context() {
             s.sched_tunables.is_some(),
             first.sched_tunables.is_some(),
             "sidecar {i}: sched_tunables presence flipped across sidecars",
+        );
+        assert_eq!(
+            s.task_delayacct.is_some(),
+            first.task_delayacct.is_some(),
+            "sidecar {i}: task_delayacct presence flipped across sidecars",
+        );
+        assert_eq!(
+            s.config_task_xacct.is_some(),
+            first.config_task_xacct.is_some(),
+            "sidecar {i}: config_task_xacct presence flipped across sidecars",
         );
     }
 }

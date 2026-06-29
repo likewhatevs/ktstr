@@ -263,6 +263,100 @@ fn build_groups_mixed_measured_group_folds_to_real_aggregate() {
     );
 }
 
+/// Per-sub-family coverage gate: with the query measured (`taskstats_measured`
+/// true) but EVERY sub-family inactive (all three `*_active` false — the
+/// degenerate "kernel built without delay/xacct accounting" shape), every raw
+/// metric tagged `Section::TaskstatsDelay` must fold to `Absent`. An unclassified
+/// taskstats metric would slip the gate and render a sentinel `Sum(0)` — this
+/// catches a future taskstats field added without a `taskstats_family` arm.
+#[test]
+fn build_groups_all_subfamilies_inactive_makes_every_taskstats_metric_absent() {
+    let mut t = make_thread("svc", "svc");
+    // The query succeeded; only the per-sub-family enablement is off.
+    t.cpu_delay_active = false;
+    t.delay_block_active = false;
+    t.xacct_active = false;
+    let snap = snap_with(vec![t]);
+    let groups = build_groups(&snap, GroupBy::Comm, &[], None, None, false);
+    let g = groups.values().next().expect("one group");
+    let mut checked = 0;
+    for m in super::CTPROF_METRICS {
+        if m.section != super::Section::TaskstatsDelay {
+            continue;
+        }
+        checked += 1;
+        assert!(
+            matches!(g.metrics.get(m.name), Some(Aggregated::Absent)),
+            "taskstats metric {} must be Absent when its sub-family is inactive \
+             (unclassified metric? extend taskstats_family); got {:?}",
+            m.name,
+            g.metrics.get(m.name),
+        );
+    }
+    assert!(
+        checked >= 34,
+        "expected >=34 Section::TaskstatsDelay metrics, only checked {checked} \
+         — registry/section drift",
+    );
+}
+
+/// xacct gating is independent of delay: with delay sub-families active but
+/// `xacct_active` false (CONFIG_TASK_XACCT off on a delay-enabled host), the
+/// hiwater watermarks fold to `Absent` while the delay families stay measured.
+#[test]
+fn build_groups_xacct_inactive_makes_hiwater_absent_keeps_delay_measured() {
+    let mut t = make_thread("svc", "svc");
+    t.xacct_active = false; // cpu_delay_active + delay_block_active stay true
+    let snap = snap_with(vec![t]);
+    let groups = build_groups(&snap, GroupBy::Comm, &[], None, None, false);
+    let g = groups.values().next().expect("one group");
+    for name in ["hiwater_rss_bytes", "hiwater_vm_bytes"] {
+        assert!(
+            matches!(g.metrics.get(name), Some(Aggregated::Absent)),
+            "{name} must be Absent when xacct is inactive, got {:?}",
+            g.metrics.get(name),
+        );
+    }
+    for name in ["cpu_delay_total_ns", "blkio_delay_total_ns"] {
+        assert!(
+            g.metrics.get(name).and_then(|a| a.numeric()).is_some(),
+            "{name} must stay measured (numeric, not Absent) when only xacct is off, got {:?}",
+            g.metrics.get(name),
+        );
+    }
+}
+
+/// delayacct runtime-off (the `task_delayacct` sysctl is 0): the lock-delay
+/// categories go `Absent` (they need `tsk->delays`, allocated only when on) while
+/// `cpu_delay_*` (sched_info-sourced, filled unconditionally) stay measured — and
+/// the xacct watermarks are independent.
+#[test]
+fn build_groups_delay_block_inactive_keeps_cpu_delay_and_xacct_measured() {
+    let mut t = make_thread("svc", "svc");
+    t.delay_block_active = false; // cpu_delay_active + xacct_active stay true
+    let snap = snap_with(vec![t]);
+    let groups = build_groups(&snap, GroupBy::Comm, &[], None, None, false);
+    let g = groups.values().next().expect("one group");
+    for name in [
+        "blkio_delay_total_ns",
+        "swapin_delay_total_ns",
+        "irq_delay_total_ns",
+    ] {
+        assert!(
+            matches!(g.metrics.get(name), Some(Aggregated::Absent)),
+            "{name} must be Absent when delayacct runtime is off, got {:?}",
+            g.metrics.get(name),
+        );
+    }
+    for name in ["cpu_delay_total_ns", "hiwater_rss_bytes"] {
+        assert!(
+            g.metrics.get(name).and_then(|a| a.numeric()).is_some(),
+            "{name} must stay measured (numeric, not Absent) when only lock-delays are off, got {:?}",
+            g.metrics.get(name),
+        );
+    }
+}
+
 /// Different prefixes do not merge: `worker-0`, `worker-1`,
 /// `worker-large-0`, `worker-large-1` produce two distinct
 /// pattern buckets (`worker-{N}` and `worker-large-{N}`).
