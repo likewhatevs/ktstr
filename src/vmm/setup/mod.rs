@@ -571,7 +571,7 @@ impl KtstrVm {
                 host_topology::hugepages_free() >= host_topology::hugepages_needed(mib)
             });
 
-        let vm = match self.memory_mib {
+        let mut vm = match self.memory_mib {
             Some(mib) => {
                 if use_hugepages {
                     kvm::KtstrKvm::new_with_hugepages(self.topology, mib, self.performance_mode)
@@ -587,6 +587,10 @@ impl KtstrVm {
             }
         };
         tracing::debug!(elapsed_us = t0.elapsed().as_micros(), "kvm_create");
+
+        // Propagate the builder's PCI-enable flag to the VM so the run loops
+        // construct the PCI host bridge and the ACPI/cmdline gate on it.
+        vm.pci_enabled = self.pci_enabled;
 
         // When memory is already allocated (non-deferred path), do mbind
         // and load kernel now. Deferred path does this in setup_memory.
@@ -1334,6 +1338,7 @@ impl KtstrVm {
                  in this function and set numa_layout via \
                  allocate_and_register_memory in src/vmm/x86_64/kvm.rs",
             ),
+            vm.pci_enabled,
         )?;
         tracing::debug!(elapsed_us = t0.elapsed().as_micros(), "mptable_acpi");
 
@@ -1352,7 +1357,7 @@ impl KtstrVm {
         //   random.trust_cpu=on  — seed RNG from RDRAND so userspace doesn't block on entropy.
         //   swiotlb=noforce      — skip the IOMMU bounce buffer — no passthrough devices.
         //   i8042.*=noaux/nomux/nopnp/dumbkbd — skip legacy PS/2 probing; no keyboard/mouse in VM.
-        //   pci=off              — no PCI devices emulated; shave boot time by skipping the scan.
+        //   pci=off              — (virtio-MMIO-only guests) skip the PCI scan; dropped when the virtio-PCI transport is enabled.
         //   reboot=k             — use keyboard-controller reset method.
         //   panic=-1             — reboot immediately on panic; host detects via exit.
         //   lockdown=none        — permit /dev/mem and unrestricted BPF needed by the test runtime.
@@ -1388,10 +1393,13 @@ impl KtstrVm {
         //                                              zero on every kernel built with
         //                                              CONFIG_TASK_DELAY_ACCT=y but boot-time
         //                                              off (the upstream default since v5.14).
-        let mut cmdline = base_guest_cmdline(
+        // `pci=off` is dropped when the virtio-PCI transport is enabled so the
+        // guest enumerates the PCI host bridge; otherwise it skips the scan.
+        let pci_flag = if self.pci_enabled { "" } else { "pci=off " };
+        let mut cmdline = base_guest_cmdline(&format!(
             "no_timer_check clocksource=kvm-clock i8042.noaux i8042.nomux \
-             i8042.nopnp i8042.dumbkbd pci=off reboot=k",
-        );
+             i8042.nopnp i8042.dumbkbd {pci_flag}reboot=k"
+        ));
         let verbose = std::env::var(crate::KTSTR_VERBOSE_ENV)
             .map(|v| v == "1")
             .unwrap_or(false)

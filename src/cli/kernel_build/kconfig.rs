@@ -426,6 +426,22 @@ const VALIDATE_CONFIG_CRITICAL: &[(&str, &str)] = &[
          a user --extra-kconfig that strips BLOCK would silently disable this and disk-IO WorkTypes \
          would fail with a confusing 'no /dev/vda' inside the guest instead of a clear build error",
     ),
+    (
+        "CONFIG_PCI",
+        "required for the virtio-PCI transport — the host bridge at 00:00.0 and any PCI device \
+         (NICs) enumerate only with PCI compiled in. x86_64 defconfig sets it, but an \
+         --extra-kconfig that strips it would silently leave the guest with no /sys/bus/pci and \
+         every PCI device invisible instead of a clear build error",
+    ),
+    (
+        "CONFIG_PCI_MMCONFIG",
+        "backs ECAM (extended config space, reg >= 256) which the MCFG table and _SB.PCI0 DSDT \
+         window describe and the PCI enumeration e2e exercises (a host-bridge-class device is \
+         sized to 4096-byte config and read at reg 0x100 via ECAM). default-y on x86_64 when \
+         PCI + ACPI are set, but an --extra-kconfig that strips it would silently drop ECAM — \
+         base config still works over CAM, so the loss is invisible until an extended-config \
+         access (the e2e, or a future MSI-X device) fails",
+    ),
 ];
 
 /// Validate the output .config for critical options that the kconfig

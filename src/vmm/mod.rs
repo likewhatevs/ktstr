@@ -74,6 +74,7 @@ pub(crate) mod freeze_coord;
 pub(crate) mod initramfs_cache;
 pub(crate) mod net_config;
 pub(crate) mod numa_mem;
+pub(crate) mod pci;
 pub(crate) mod result;
 pub(crate) mod rust_init;
 pub(crate) mod sched_stats;
@@ -242,6 +243,11 @@ const DRAM_BASE: u64 = kvm::DRAM_START;
 /// start_bpf_map_write, run_bsp_loop, collect_results).
 pub struct KtstrVm {
     pub(crate) kernel: PathBuf,
+    /// Whether the guest exposes the virtio-PCI transport (PCI host bridge +
+    /// ECAM/CAM config access + the PCI ACPI tables). Off by default;
+    /// propagated to `KtstrKvm::pci_enabled` and gates the `pci=off` cmdline
+    /// token.
+    pub(crate) pci_enabled: bool,
     pub(crate) init_binary: Option<PathBuf>,
     pub(crate) scheduler_binary: Option<PathBuf>,
     /// Additional schedulers packed into the initramfs alongside
@@ -1045,6 +1051,21 @@ impl KtstrVm {
         #[cfg(not(target_arch = "x86_64"))]
         let ioapic_handle: Option<Arc<crate::vmm::IoapicHandle>> = None;
 
+        // PCI host bridge handle (virtio-PCI transport), constructed only when
+        // this VM enables PCI; `None` keeps non-PCI shells byte-identical.
+        // Mirrors the run_vm construction. x86-only for now.
+        #[cfg(target_arch = "x86_64")]
+        let pci_bus_handle: Option<Arc<PiMutex<pci::PciBus>>> = if vm.pci_enabled {
+            Some(Arc::new(PiMutex::new(pci::PciBus::new(
+                kvm::PCI_ECAM_BASE,
+                kvm::PCI_ECAM_SIZE,
+            ))))
+        } else {
+            None
+        };
+        #[cfg(not(target_arch = "x86_64"))]
+        let pci_bus_handle: Option<Arc<PiMutex<pci::PciBus>>> = None;
+
         // Virtio-console for shell I/O via /dev/hvc0.
         let mut vc = virtio_console::VirtioConsole::new();
         vc.set_mem((*vm.guest_mem).clone());
@@ -1189,6 +1210,7 @@ impl KtstrVm {
             virtio_blk.as_ref(),
             virtio_net.as_ref(),
             ioapic_handle.as_ref(),
+            pci_bus_handle.as_ref(),
             &kill,
             &kill_evt,
             &freeze,
@@ -1641,6 +1663,7 @@ impl KtstrVm {
             virtio_blk.as_ref(),
             virtio_net.as_ref(),
             ioapic_handle.as_ref(),
+            pci_bus_handle.as_ref(),
             &kill,
             &freeze,
             &watchpoint,

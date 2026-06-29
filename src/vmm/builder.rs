@@ -73,6 +73,9 @@ pub struct KtstrVmBuilder {
     bpf_map_writes: Vec<BpfMapWriteParams>,
     watch_bpf_maps: Vec<WatchBpfMapParams>,
     pub(crate) performance_mode: bool,
+    /// Whether to expose the virtio-PCI transport in the guest. See the
+    /// `pci` setter.
+    pub(crate) pci_enabled: bool,
     no_perf_mode: bool,
     sched_enable_cmds: Vec<String>,
     sched_disable_cmds: Vec<String>,
@@ -244,6 +247,7 @@ impl Default for KtstrVmBuilder {
             bpf_map_writes: Vec::new(),
             watch_bpf_maps: Vec::new(),
             performance_mode: false,
+            pci_enabled: false,
             no_perf_mode: false,
             sched_enable_cmds: Vec::new(),
             sched_disable_cmds: Vec::new(),
@@ -665,6 +669,16 @@ impl KtstrVmBuilder {
         self
     }
 
+    /// Expose the virtio-PCI transport in the guest: a PCI host bridge with
+    /// ECAM + legacy CAM config access and the PCI ACPI tables (MCFG + a
+    /// `_SB.PCI0` host bridge in the DSDT). Off by default — the guest boots
+    /// with `pci=off` and only the virtio-MMIO devices (console/block).
+    #[allow(dead_code)]
+    pub fn pci(mut self, enabled: bool) -> Self {
+        self.pci_enabled = enabled;
+        self
+    }
+
     /// Skip flock topology reservation and force `performance_mode=false`
     /// (disables pinning, RT scheduling, hugepages, NUMA mbind, KVM exit
     /// suppression). For shared runners or unprivileged containers.
@@ -1015,6 +1029,7 @@ impl KtstrVmBuilder {
             bpf_map_writes: self.bpf_map_writes,
             watch_bpf_maps: self.watch_bpf_maps,
             performance_mode: self.performance_mode,
+            pci_enabled: self.pci_enabled,
             no_perf_mode,
             pinning_plan,
             mbind_node_map,

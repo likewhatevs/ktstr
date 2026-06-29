@@ -1532,6 +1532,11 @@ pub struct KtstrTestEntry {
     /// available. The four host-side optimizations (vCPU pinning,
     /// hugepages, NUMA mbind, RT scheduling) apply.
     pub performance_mode: bool,
+    /// Enable the virtio-PCI transport: a host bridge at `00:00.0`
+    /// plus the PCI0 ECAM/CAM config-access windows. When `false`, no
+    /// PCI host bridge is exposed and the guest cmdline carries
+    /// `pci=off`.
+    pub pci_enabled: bool,
     /// Decouple virtual topology from host hardware. When set:
     ///
     /// - The VM's virtual topology (`numa_nodes`, `llcs`, `cores`,
@@ -1974,6 +1979,7 @@ impl KtstrTestEntry {
         bpf_map_write: &[],
         watch_bpf_maps: &[],
         performance_mode: false,
+        pci_enabled: false,
         no_perf_mode: false,
         duration: Duration::from_secs(12),
         expect_err: false,

@@ -165,6 +165,25 @@ CONFIG_VIRTIO_CONSOLE=y
 CONFIG_VIRTIO_BLK=y
 CONFIG_VIRTIO_NET=y
 
+# -- PCI bus (virtio-PCI transport) --
+# The virtio-PCI transport exposes NICs (and future PCI devices) via a
+# host bridge at 00:00.0 plus an ECAM/CAM config space. PCI must be
+# compiled in for the guest to enumerate ANY of it; the per-VM
+# `pci=off` cmdline (appended when a test does not request PCI) gates
+# scanning at runtime, so a PCI-capable kernel is harmless for non-PCI
+# tests. x86_64_defconfig sets CONFIG_PCI=y, but pin it here so an
+# inherited-defconfig flip or an --extra-kconfig that strips it cannot
+# silently disable the transport — the failure mode would be a guest
+# with no /sys/bus/pci and every PCI device invisible. PCI_MMCONFIG
+# backs ECAM (extended config space, reg >= 256) which the VMM's MCFG
+# table and _SB.PCI0 DSDT window describe; it is `default y` on x86_64
+# when PCI + ACPI are set (arch/x86/Kconfig:2918) and pinned here for
+# the same defense-in-depth reason (base config still works CAM-only if
+# it is dropped). Both are x86 symbols; arm64 PCI uses
+# PCI_HOST_GENERIC, a later increment when arm64 virtio-PCI lands.
+CONFIG_PCI=y
+CONFIG_PCI_MMCONFIG=y
+
 # -- Networking --
 # PACKET: AF_PACKET sockets (net/packet/Kconfig:6 — "communicate directly
 # with network devices ... e.g. tcpdump"), the raw-frame device-level TX/RX

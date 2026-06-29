@@ -10,7 +10,7 @@ fn classify_exit_hlt_returns_none() {
     let com1 = PiMutex::new(console::Serial::new(console::COM1_BASE));
     let com2 = PiMutex::new(console::Serial::new(console::COM2_BASE));
     let mut exit = VcpuExit::Hlt;
-    let action = classify_exit(&com1, &com2, None, None, None, None, &mut exit);
+    let action = classify_exit(&com1, &com2, None, None, None, None, None, &mut exit);
     assert!(action.is_none(), "Hlt must classify as None");
 }
 
@@ -19,7 +19,7 @@ fn classify_exit_shutdown_variant_is_shutdown() {
     let com1 = PiMutex::new(console::Serial::new(console::COM1_BASE));
     let com2 = PiMutex::new(console::Serial::new(console::COM2_BASE));
     let mut exit = VcpuExit::Shutdown;
-    let action = classify_exit(&com1, &com2, None, None, None, None, &mut exit);
+    let action = classify_exit(&com1, &com2, None, None, None, None, None, &mut exit);
     assert!(
         matches!(action, Some(ExitAction::Shutdown)),
         "Shutdown variant must classify as ExitAction::Shutdown"
@@ -35,7 +35,7 @@ fn classify_exit_system_event_shutdown_is_shutdown() {
     let com2 = PiMutex::new(console::Serial::new(console::COM2_BASE));
     let data: [u64; 0] = [];
     let mut exit = VcpuExit::SystemEvent(KVM_SYSTEM_EVENT_SHUTDOWN, &data);
-    let action = classify_exit(&com1, &com2, None, None, None, None, &mut exit);
+    let action = classify_exit(&com1, &com2, None, None, None, None, None, &mut exit);
     assert!(
         matches!(action, Some(ExitAction::Shutdown)),
         "SystemEvent(SHUTDOWN=1) must classify as Shutdown"
@@ -51,7 +51,7 @@ fn classify_exit_system_event_reset_is_shutdown() {
     let com2 = PiMutex::new(console::Serial::new(console::COM2_BASE));
     let data: [u64; 0] = [];
     let mut exit = VcpuExit::SystemEvent(KVM_SYSTEM_EVENT_RESET, &data);
-    let action = classify_exit(&com1, &com2, None, None, None, None, &mut exit);
+    let action = classify_exit(&com1, &com2, None, None, None, None, None, &mut exit);
     assert!(
         matches!(action, Some(ExitAction::Shutdown)),
         "SystemEvent(RESET=2) must classify as Shutdown"
@@ -72,7 +72,7 @@ fn classify_exit_system_event_unknown_type_is_continue() {
     // WAKEUP, S2IDLE, SUSPEND} — picked to defend against future
     // expansion of the legitimate set without flipping this test.
     let mut exit = VcpuExit::SystemEvent(99, &data);
-    let action = classify_exit(&com1, &com2, None, None, None, None, &mut exit);
+    let action = classify_exit(&com1, &com2, None, None, None, None, None, &mut exit);
     assert!(
         matches!(action, Some(ExitAction::Continue)),
         "SystemEvent with unknown type must classify as Continue, \
@@ -90,7 +90,7 @@ fn classify_exit_fail_entry_is_fatal_with_reason() {
     let com1 = PiMutex::new(console::Serial::new(console::COM1_BASE));
     let com2 = PiMutex::new(console::Serial::new(console::COM2_BASE));
     let mut exit = VcpuExit::FailEntry(0xdead_beef, 7);
-    let action = classify_exit(&com1, &com2, None, None, None, None, &mut exit);
+    let action = classify_exit(&com1, &com2, None, None, None, None, None, &mut exit);
     match action {
         Some(ExitAction::Fatal(Some(reason))) => assert_eq!(
             reason, 0xdead_beef,
@@ -111,7 +111,7 @@ fn classify_exit_internal_error_is_fatal_none() {
     let com1 = PiMutex::new(console::Serial::new(console::COM1_BASE));
     let com2 = PiMutex::new(console::Serial::new(console::COM2_BASE));
     let mut exit = VcpuExit::InternalError;
-    let action = classify_exit(&com1, &com2, None, None, None, None, &mut exit);
+    let action = classify_exit(&com1, &com2, None, None, None, None, None, &mut exit);
     assert!(
         matches!(action, Some(ExitAction::Fatal(None))),
         "InternalError must classify as Fatal(None)"

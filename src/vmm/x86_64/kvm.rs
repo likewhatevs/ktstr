@@ -55,6 +55,47 @@ pub(crate) const VIRTIO_BLK_MMIO_BASE: u64 = MMIO_GAP_START + 0x1000;
 /// Each virtio-mmio device occupies `VIRTIO_MMIO_SIZE = 0x1000`.
 pub(crate) const VIRTIO_NET_MMIO_BASE: u64 = MMIO_GAP_START + 0x2000;
 
+/// IOAPIC MMIO base. Lives inside the MMIO gap; the PCI windows below must
+/// avoid it. Mirrors the canonical definitions (ioapic.rs `IOAPIC_BASE`, acpi
+/// MADT `IOAPIC_ADDR`) for the compile-time disjointness checks.
+const IOAPIC_MMIO_BASE: u64 = 0xFEC0_0000;
+
+/// Local APIC / MSI MMIO base. Also inside the gap; the PCI windows avoid it.
+/// Mirrors acpi `LAPIC_ADDR`.
+const LAPIC_MMIO_BASE: u64 = 0xFEE0_0000;
+
+/// PCI ECAM (Enhanced Configuration Access Mechanism) window base. Holds one
+/// PCI bus (256 functions × 4 KiB = 1 MiB), carved from the MMIO gap above the
+/// three virtio-mmio device pages and below the IOAPIC. The ACPI MCFG table
+/// publishes this base to the guest, which maps it for extended config access.
+pub(crate) const PCI_ECAM_BASE: u64 = 0xE000_0000;
+
+/// PCI ECAM window size: one bus.
+pub(crate) const PCI_ECAM_SIZE: u64 = crate::vmm::pci::ECAM_BYTES_PER_BUS;
+
+/// PCI 32-bit MMIO BAR window base. Device BARs are placed here; sits above
+/// the ECAM window and below the IOAPIC. Advertised to the guest via the DSDT
+/// `_SB.PCI0` `_CRS` so Linux assigns BARs within it.
+pub(crate) const PCI_MMIO_BAR_BASE: u64 = PCI_ECAM_BASE + PCI_ECAM_SIZE;
+
+/// PCI 32-bit MMIO BAR window size: from the BAR base up to the IOAPIC.
+pub(crate) const PCI_MMIO_BAR_SIZE: u64 = IOAPIC_MMIO_BASE - PCI_MMIO_BAR_BASE;
+
+// Compile-time PCI address-space disjointness. x86_64 had no equivalent
+// (only struct-size asserts), so this block is new: the ECAM and BAR windows
+// must lie within the MMIO gap, above the three virtio-mmio device pages
+// [MMIO_GAP_START, MMIO_GAP_START + 0x3000), not overlap each other, and end
+// before both the IOAPIC and the LAPIC/MSI region (both inside the gap).
+const _: () = {
+    assert!(PCI_ECAM_BASE >= MMIO_GAP_START + 0x3000);
+    assert!(PCI_ECAM_BASE + PCI_ECAM_SIZE <= PCI_MMIO_BAR_BASE);
+    assert!(PCI_MMIO_BAR_BASE + PCI_MMIO_BAR_SIZE <= IOAPIC_MMIO_BASE);
+    assert!(PCI_ECAM_BASE + PCI_ECAM_SIZE <= LAPIC_MMIO_BASE);
+    assert!(PCI_MMIO_BAR_BASE + PCI_MMIO_BAR_SIZE <= LAPIC_MMIO_BASE);
+    assert!(IOAPIC_MMIO_BASE < MMIO_GAP_END);
+    assert!(LAPIC_MMIO_BASE < MMIO_GAP_END);
+};
+
 /// GSI for virtio-console. On the in-kernel-irqchip path the in-kernel
 /// IOAPIC routes this GSI; on split-irqchip (>254 APIC IDs) the userspace
 /// IOAPIC translates the guest's RTE for it into an MSI route.
@@ -152,6 +193,11 @@ pub struct KtstrKvm {
     /// take `LOCK_EX` and truncate the segment while the guest still
     /// holds pages that fault through the backing file.
     pub(crate) cow_overlay_guards: Vec<crate::vmm::initramfs::CowOverlayGuard>,
+    /// Whether this VM exposes the virtio-PCI transport (a PCI host bridge with
+    /// ECAM/CAM config access). `false` keeps the guest on virtio-MMIO only —
+    /// no PCI ACPI tables, `pci=off` retained — byte-identical to a non-PCI
+    /// boot. Set when a NIC is placed on PCI (or by a transport test).
+    pub(crate) pci_enabled: bool,
 }
 
 impl Drop for KtstrKvm {
@@ -317,6 +363,7 @@ impl KtstrKvm {
             performance_mode,
             _reservation: reservation,
             cow_overlay_guards: Vec::new(),
+            pci_enabled: false,
         })
     }
 

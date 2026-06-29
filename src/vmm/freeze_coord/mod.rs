@@ -926,6 +926,24 @@ impl KtstrVm {
         #[cfg(not(target_arch = "x86_64"))]
         let ioapic_handle: Option<Arc<crate::vmm::IoapicHandle>> = None;
 
+        // PCI host bridge handle for the virtio-PCI transport: the single-bus
+        // PCIe segment with ECAM/CAM config access, constructed only when this
+        // VM enables PCI. `None` keeps non-PCI guests byte-identical (no
+        // ECAM/CAM dispatch). Created here in the same scope as the other
+        // device handles so it threads into both the BSP loop and the per-AP
+        // spawn. x86-only for now (aarch64 PCI is design-only).
+        #[cfg(target_arch = "x86_64")]
+        let pci_bus_handle: Option<Arc<PiMutex<crate::vmm::pci::PciBus>>> = if vm.pci_enabled {
+            Some(Arc::new(PiMutex::new(crate::vmm::pci::PciBus::new(
+                kvm::PCI_ECAM_BASE,
+                kvm::PCI_ECAM_SIZE,
+            ))))
+        } else {
+            None
+        };
+        #[cfg(not(target_arch = "x86_64"))]
+        let pci_bus_handle: Option<Arc<PiMutex<crate::vmm::pci::PciBus>>> = None;
+
         // Register serial EventFds with KVM's irqfd for interrupt-driven TX.
         // On x86 split-irqchip (>254 APIC IDs) the serial IRQ routes through
         // the userspace IOAPIC (ioapic_handle above is threaded into the run
@@ -1273,6 +1291,7 @@ impl KtstrVm {
             virtio_blk.as_ref(),
             virtio_net.as_ref(),
             ioapic_handle.as_ref(),
+            pci_bus_handle.as_ref(),
             &kill,
             &kill_evt,
             &freeze,
@@ -10095,6 +10114,7 @@ impl KtstrVm {
                     virtio_blk.as_ref(),
                     virtio_net.as_ref(),
                     ioapic_handle.as_ref(),
+                    pci_bus_handle.as_ref(),
                     &kill,
                     &freeze,
                     &watchpoint,
@@ -10345,6 +10365,7 @@ impl KtstrVm {
         virtio_blk: Option<&Arc<PiMutex<virtio_blk::VirtioBlk>>>,
         virtio_net: Option<&Arc<PiMutex<virtio_net::VirtioNet>>>,
         ioapic: Option<&Arc<crate::vmm::IoapicHandle>>,
+        pci_bus: Option<&Arc<PiMutex<crate::vmm::pci::PciBus>>>,
         kill: &Arc<AtomicBool>,
         kill_evt: &Arc<EventFd>,
         freeze: &Arc<AtomicBool>,
@@ -10381,6 +10402,7 @@ impl KtstrVm {
             let vblk_clone = virtio_blk.cloned();
             let vnet_clone = virtio_net.cloned();
             let ioapic_clone = ioapic.cloned();
+            let pci_bus_clone = pci_bus.cloned();
             let exited = Arc::new(AtomicBool::new(false));
             let exited_clone = exited.clone();
             let parked = Arc::new(AtomicBool::new(false));
@@ -10495,6 +10517,7 @@ impl KtstrVm {
                             vblk_clone.as_ref(),
                             vnet_clone.as_ref(),
                             ioapic_clone.as_ref(),
+                            pci_bus_clone.as_ref(),
                             &kill_clone,
                             &kill_evt_clone,
                             &freeze_clone,
@@ -11747,6 +11770,7 @@ impl KtstrVm {
         virtio_blk: Option<&Arc<PiMutex<virtio_blk::VirtioBlk>>>,
         virtio_net: Option<&Arc<PiMutex<virtio_net::VirtioNet>>>,
         ioapic: Option<&Arc<crate::vmm::IoapicHandle>>,
+        pci_bus: Option<&Arc<PiMutex<crate::vmm::pci::PciBus>>>,
         kill: &Arc<AtomicBool>,
         freeze: &Arc<AtomicBool>,
         watchpoint: &Arc<WatchpointArm>,
@@ -12037,6 +12061,7 @@ impl KtstrVm {
                         virtio_blk.map(|a| a.as_ref()),
                         virtio_net.map(|a| a.as_ref()),
                         ioapic.map(|a| a.as_ref()),
+                        pci_bus.map(|a| a.as_ref()),
                         &mut exit,
                     ) {
                         Some(ExitAction::Continue) | None => {}

@@ -95,6 +95,8 @@ pub(super) fn emit_entry_static(input: ItemFn, attrs: AttrValues) -> proc_macro2
         expect_auto_repro_set,
         performance_mode,
         performance_mode_set,
+        pci,
+        pci_set,
         no_perf_mode,
         no_perf_mode_set,
         expect_err,
@@ -388,6 +390,7 @@ pub(super) fn emit_entry_static(input: ItemFn, attrs: AttrValues) -> proc_macro2
         quote! { performance_mode },
         quote! { #performance_mode },
     );
+    let pci_field = entry_field(pci_set, quote! { pci_enabled }, quote! { #pci });
     let no_perf_mode_field = entry_field(
         no_perf_mode_set,
         quote! { no_perf_mode },
@@ -680,6 +683,7 @@ pub(super) fn emit_entry_static(input: ItemFn, attrs: AttrValues) -> proc_macro2
             #bpf_map_write_field
             #watch_bpf_maps_field
             #performance_mode_field
+            #pci_field
             #no_perf_mode_field
             #duration_field
             #num_snapshots_field

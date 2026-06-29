@@ -10,7 +10,7 @@ fn test_layout(topo: &Topology, mib: u32) -> NumaMemoryLayout {
 
 fn test_setup(mem: &GuestMemoryMmap, topo: &Topology, mib: u32) -> AcpiLayout {
     let layout = test_layout(topo, mib);
-    setup_acpi(mem, topo, &layout).unwrap()
+    setup_acpi(mem, topo, &layout, false).unwrap()
 }
 
 fn read_table(mem: &GuestMemoryMmap, addr: u64) -> Vec<u8> {
@@ -73,7 +73,7 @@ fn acpi_rejects_slit_dominated_overflow_at_extreme_numa() {
     };
     let layout = test_layout(&topo, 512);
     let err =
-        setup_acpi(&mem, &topo, &layout).expect_err("512-NUMA SLIT must overflow the ISA hole");
+        setup_acpi(&mem, &topo, &layout, false).expect_err("512-NUMA SLIT must overflow the ISA hole");
     let msg = format!("{err:#}");
     assert!(
         msg.contains("SLIT alone") && msg.contains("ISA hole"),
@@ -98,7 +98,7 @@ fn acpi_rejects_cpu_table_overflow_at_extreme_vcpu_count() {
         distances: None,
     };
     let layout = test_layout(&topo, 256);
-    let err = setup_acpi(&mem, &topo, &layout)
+    let err = setup_acpi(&mem, &topo, &layout, false)
         .expect_err("4096-vCPU ACPI CPU tables must overflow the ISA hole");
     let msg = format!("{err:#}");
     assert!(
@@ -122,7 +122,7 @@ fn acpi_rejects_total_overflow_when_slit_alone_fits() {
         distances: None,
     };
     let layout = test_layout(&topo, 361);
-    let err = setup_acpi(&mem, &topo, &layout)
+    let err = setup_acpi(&mem, &topo, &layout, false)
         .expect_err("361-NUMA total tables must overflow the ISA hole");
     let msg = format!("{err:#}");
     assert!(
@@ -1115,7 +1115,7 @@ fn hmat_emitted_with_cxl() {
     let topo = Topology::with_nodes(4, 1, &CXL_NODES);
     let mem = test_mem(16);
     let layout = NumaMemoryLayout::compute(&topo, 640, 0, None).unwrap();
-    let l = setup_acpi(&mem, &topo, &layout).unwrap();
+    let l = setup_acpi(&mem, &topo, &layout, false).unwrap();
     assert!(l.hmat_size > 0, "HMAT must be emitted with CXL nodes");
 }
 
@@ -1124,7 +1124,7 @@ fn hmat_checksum() {
     let topo = Topology::with_nodes(4, 1, &CXL_NODES);
     let mem = test_mem(16);
     let layout = NumaMemoryLayout::compute(&topo, 640, 0, None).unwrap();
-    let l = setup_acpi(&mem, &topo, &layout).unwrap();
+    let l = setup_acpi(&mem, &topo, &layout, false).unwrap();
     let hmat = read_table(&mem, l.hmat_addr);
     let sum: u8 = hmat.iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
     assert_eq!(sum, 0, "HMAT checksum must be zero");
@@ -1135,7 +1135,7 @@ fn hmat_header_fields() {
     let topo = Topology::with_nodes(4, 1, &CXL_NODES);
     let mem = test_mem(16);
     let layout = NumaMemoryLayout::compute(&topo, 640, 0, None).unwrap();
-    let l = setup_acpi(&mem, &topo, &layout).unwrap();
+    let l = setup_acpi(&mem, &topo, &layout, false).unwrap();
     let hmat = read_table(&mem, l.hmat_addr);
     assert_eq!(&hmat[..4], b"HMAT");
     assert_eq!(hmat[8], 2, "HMAT revision must be 2");
@@ -1151,7 +1151,7 @@ fn hmat_mpda_count_and_flags() {
     let topo = Topology::with_nodes(4, 1, &CXL_NODES);
     let mem = test_mem(16);
     let layout = NumaMemoryLayout::compute(&topo, 640, 0, None).unwrap();
-    let l = setup_acpi(&mem, &topo, &layout).unwrap();
+    let l = setup_acpi(&mem, &topo, &layout, false).unwrap();
     let hmat = read_table(&mem, l.hmat_addr);
 
     let num_targets = layout.regions().len();
@@ -1183,7 +1183,7 @@ fn hmat_mpda_cxl_initiator() {
     let topo = Topology::with_nodes(4, 1, &CXL_NODES);
     let mem = test_mem(16);
     let layout = NumaMemoryLayout::compute(&topo, 640, 0, None).unwrap();
-    let l = setup_acpi(&mem, &topo, &layout).unwrap();
+    let l = setup_acpi(&mem, &topo, &layout, false).unwrap();
     let hmat = read_table(&mem, l.hmat_addr);
 
     let mut offset = 40;
@@ -1217,7 +1217,7 @@ fn hmat_sllbi_latency_and_bandwidth() {
     let topo = Topology::with_nodes(4, 1, &CXL_NODES);
     let mem = test_mem(16);
     let layout = NumaMemoryLayout::compute(&topo, 640, 0, None).unwrap();
-    let l = setup_acpi(&mem, &topo, &layout).unwrap();
+    let l = setup_acpi(&mem, &topo, &layout, false).unwrap();
     let hmat = read_table(&mem, l.hmat_addr);
 
     let num_targets = layout.regions().len();
@@ -1248,7 +1248,7 @@ fn hmat_sllbi_cxl_entries_differ() {
     let topo = Topology::with_nodes(4, 1, &CXL_NODES);
     let mem = test_mem(16);
     let layout = NumaMemoryLayout::compute(&topo, 640, 0, None).unwrap();
-    let l = setup_acpi(&mem, &topo, &layout).unwrap();
+    let l = setup_acpi(&mem, &topo, &layout, false).unwrap();
     let hmat = read_table(&mem, l.hmat_addr);
 
     let num_targets = layout.regions().len();
@@ -1281,7 +1281,7 @@ fn hmat_rsdt_xsdt_include_pointer() {
     let topo = Topology::with_nodes(4, 1, &CXL_NODES);
     let mem = test_mem(16);
     let layout = NumaMemoryLayout::compute(&topo, 640, 0, None).unwrap();
-    let l = setup_acpi(&mem, &topo, &layout).unwrap();
+    let l = setup_acpi(&mem, &topo, &layout, false).unwrap();
 
     // RSDT should have 5 entries (FADT, MADT, SRAT, SLIT, HMAT).
     let rsdt = read_table(&mem, l.rsdt_addr);

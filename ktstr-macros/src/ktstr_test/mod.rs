@@ -304,6 +304,7 @@ pub(crate) const BOOL_ATTR_NAMES: &[&str] = &[
     "not_starved",
     "isolation",
     "performance_mode",
+    "pci",
     "no_perf_mode",
     "requires_smt",
     "expect_err",
@@ -475,6 +476,8 @@ pub(crate) struct AttrValues {
     pub(crate) expect_auto_repro_set: bool,
     pub(crate) performance_mode: bool,
     pub(crate) performance_mode_set: bool,
+    pub(crate) pci: bool,
+    pub(crate) pci_set: bool,
     pub(crate) no_perf_mode: bool,
     pub(crate) no_perf_mode_set: bool,
     pub(crate) expect_err: bool,
@@ -577,6 +580,8 @@ impl Default for AttrValues {
             expect_auto_repro_set: false,
             performance_mode: false,
             performance_mode_set: false,
+            pci: false,
+            pci_set: false,
             no_perf_mode: false,
             no_perf_mode_set: false,
             expect_err: false,
@@ -629,6 +634,10 @@ impl AttrValues {
             "performance_mode" => {
                 self.performance_mode = value;
                 self.performance_mode_set = true;
+            }
+            "pci" => {
+                self.pci = value;
+                self.pci_set = true;
             }
             "no_perf_mode" => {
                 self.no_perf_mode = value;

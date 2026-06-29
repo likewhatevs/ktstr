@@ -15,13 +15,21 @@ use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
 use zerocopy::IntoBytes;
 
 use super::topology::apic_id;
-use crate::vmm::kvm::HIMEM_START;
+use crate::vmm::kvm::{
+    HIMEM_START, PCI_ECAM_BASE, PCI_ECAM_SIZE, PCI_MMIO_BAR_BASE, PCI_MMIO_BAR_SIZE,
+};
 use crate::vmm::numa_mem::NumaMemoryLayout;
 use crate::vmm::topology::Topology;
+
+mod aml;
 
 // RSDP at fixed address in BIOS ROM area — firmware scans for it here.
 const RSDP_ADDR: u64 = 0x000E_0000;
 const RSDP_SIZE: u64 = 36;
+
+/// MCFG table size: 36-byte SDT header + 8 reserved + one 16-byte ECAM
+/// allocation (base u64, segment u16, start_bus u8, end_bus u8, reserved u32).
+const MCFG_SIZE: u64 = 36 + 8 + 16;
 
 /// Addresses and sizes of all ACPI tables after dynamic placement.
 #[derive(Debug, Clone, Copy)]
@@ -39,6 +47,8 @@ pub struct AcpiLayout {
     pub slit_size: u64,
     pub hmat_addr: u64,
     pub hmat_size: u64,
+    pub mcfg_addr: u64,
+    pub mcfg_size: u64,
     pub rsdt_addr: u64,
     pub rsdt_size: u64,
     pub xsdt_addr: u64,
@@ -258,6 +268,7 @@ pub fn setup_acpi(
     mem: &GuestMemoryMmap,
     topo: &Topology,
     numa_layout: &NumaMemoryLayout,
+    pci_enabled: bool,
 ) -> Result<AcpiLayout> {
     let num_cpus = topo.total_cpus();
 
@@ -297,7 +308,22 @@ pub fn setup_acpi(
     );
 
     // Compute table sizes.
-    let dsdt_size: u64 = 36;
+    //
+    // DSDT body: when PCI is enabled it carries the _SB.PCI0 host-bridge AML;
+    // otherwise it is empty (a header-only DSDT, byte-identical to the
+    // pre-PCI table). dsdt_size is derived from the actual body length so the
+    // contiguous table placement and the FADT X_DSDT pointer stay correct.
+    let dsdt_body: Vec<u8> = if pci_enabled {
+        aml::pci_host_bridge_dsdt_body(
+            PCI_ECAM_BASE as u32,
+            PCI_ECAM_SIZE as u32,
+            PCI_MMIO_BAR_BASE as u32,
+            (PCI_MMIO_BAR_BASE + PCI_MMIO_BAR_SIZE - 1) as u32,
+        )
+    } else {
+        Vec::new()
+    };
+    let dsdt_size: u64 = 36 + dsdt_body.len() as u64;
 
     let madt_size = compute_madt_size(topo) as u64;
 
@@ -333,8 +359,11 @@ pub fn setup_acpi(
         0
     };
 
-    // Table count: FADT + MADT + SRAT + SLIT + optional HMAT.
-    let table_count: u64 = if emit_hmat { 5 } else { 4 };
+    // MCFG (PCI ECAM base description) is emitted only when PCI is enabled.
+    let mcfg_size: u64 = if pci_enabled { MCFG_SIZE } else { 0 };
+
+    // Table count: FADT + MADT + SRAT + SLIT + optional HMAT + optional MCFG.
+    let table_count: u64 = 4 + u64::from(emit_hmat) + u64::from(pci_enabled);
     let rsdt_size: u64 = 36 + table_count * 4;
     let xsdt_size: u64 = 36 + table_count * 8;
 
@@ -358,6 +387,9 @@ pub fn setup_acpi(
 
     let hmat_addr = cursor;
     cursor += hmat_size;
+
+    let mcfg_addr = cursor;
+    cursor += mcfg_size;
 
     let rsdt_addr = cursor;
     cursor += rsdt_size;
@@ -392,6 +424,8 @@ pub fn setup_acpi(
         slit_size,
         hmat_addr,
         hmat_size,
+        mcfg_addr,
+        mcfg_size,
         rsdt_addr,
         rsdt_size,
         xsdt_addr,
@@ -400,13 +434,16 @@ pub fn setup_acpi(
         rsdp_size: RSDP_SIZE,
     };
 
-    write_dsdt(mem, dsdt_addr)?;
+    write_dsdt(mem, dsdt_addr, &dsdt_body)?;
     write_madt(mem, topo, madt_addr)?;
     write_fadt(mem, &layout)?;
     write_srat(mem, topo, numa_layout, srat_addr)?;
     write_slit(mem, topo, slit_addr)?;
     if emit_hmat {
         write_hmat(mem, topo, numa_layout, hmat_addr)?;
+    }
+    if pci_enabled {
+        write_mcfg(mem, &layout)?;
     }
     write_rsdt(mem, &layout)?;
     write_xsdt(mem, &layout)?;
@@ -473,13 +510,41 @@ fn rsdt_entries(layout: &AcpiLayout) -> Vec<u64> {
     if layout.hmat_size > 0 {
         entries.push(layout.hmat_addr);
     }
+    if layout.mcfg_size > 0 {
+        entries.push(layout.mcfg_addr);
+    }
     entries
 }
 
-fn write_dsdt(mem: &GuestMemoryMmap, addr: u64) -> Result<()> {
-    let mut buf = vec![0u8; 36];
-    let hdr = SdtHeader::new(b"DSDT", 36, 2);
+/// MCFG — PCI Express memory-mapped configuration space base address
+/// description table (one ECAM allocation: base = `PCI_ECAM_BASE`, segment 0,
+/// buses [0, 0]). The guest's `pci_mcfg_lookup` reads this to map the ECAM
+/// window for extended config access (drivers/acpi/pci_mcfg.c).
+fn write_mcfg(mem: &GuestMemoryMmap, layout: &AcpiLayout) -> Result<()> {
+    let len = layout.mcfg_size as usize;
+    let mut buf = vec![0u8; len];
+    let hdr = SdtHeader::new(b"MCFG", len as u32, 1);
     buf[..36].copy_from_slice(hdr.as_bytes());
+    // bytes 36..44: reserved (zero). Allocation entry at offset 44:
+    buf[44..52].copy_from_slice(&PCI_ECAM_BASE.to_le_bytes()); // base address
+    buf[52..54].copy_from_slice(&0u16.to_le_bytes()); // PCI segment group 0
+    buf[54] = 0; // start bus number
+    // End bus: single bus, since PCI_ECAM_SIZE = ECAM_BYTES_PER_BUS (1 bus).
+    // If ECAM ever widens to N buses, derive end_bus = (PCI_ECAM_SIZE >> 20) - 1.
+    buf[55] = 0;
+    // bytes 56..60: reserved (zero).
+    set_sdt_checksum(&mut buf);
+    mem.write_slice(&buf, GuestAddress(layout.mcfg_addr))
+        .context("write MCFG")?;
+    Ok(())
+}
+
+fn write_dsdt(mem: &GuestMemoryMmap, addr: u64, body: &[u8]) -> Result<()> {
+    let len = 36 + body.len();
+    let mut buf = vec![0u8; len];
+    let hdr = SdtHeader::new(b"DSDT", len as u32, 2);
+    buf[..36].copy_from_slice(hdr.as_bytes());
+    buf[36..].copy_from_slice(body);
     set_sdt_checksum(&mut buf);
     mem.write_slice(&buf, GuestAddress(addr))
         .context("write DSDT")?;
