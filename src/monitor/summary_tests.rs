@@ -965,6 +965,32 @@ fn bpf_map_field_value_is_counter_serde_default() {
     assert!(!stale.is_counter, "missing is_counter defaults to false");
 }
 
+/// `BpfMapFieldSample` serde: `per_cpu_counter` roundtrips, AND a stale sidecar
+/// form lacking it deserializes to the `false` default (`#[serde(default)]`),
+/// degrading a per-CPU target to gauge avg/max-fold rather than hard-failing.
+#[test]
+fn bpf_map_field_sample_per_cpu_counter_serde_default() {
+    use super::BpfMapFieldSample;
+    let s = BpfMapFieldSample {
+        key_base: "k".into(),
+        scalar: None,
+        per_cpu: Some(vec![1.0, 2.0]),
+        scalar_counter: false,
+        per_cpu_counter: true,
+    };
+    let json = serde_json::to_string(&s).unwrap();
+    let back: BpfMapFieldSample = serde_json::from_str(&json).unwrap();
+    assert!(back.per_cpu_counter, "per_cpu_counter roundtrips");
+    assert_eq!(back.per_cpu, Some(vec![1.0, 2.0]));
+    // Stale form (no per_cpu_counter key) -> defaults to false (gauge fold).
+    let stale: BpfMapFieldSample =
+        serde_json::from_str(r#"{"key_base":"k","per_cpu":[1.0,2.0]}"#).unwrap();
+    assert!(
+        !stale.per_cpu_counter,
+        "missing per_cpu_counter defaults to false",
+    );
+}
+
 #[test]
 fn fold_run_level_ext_folds_per_domain_lb_keys() {
     use std::collections::BTreeMap;
@@ -1034,12 +1060,14 @@ fn bpf_map_fields_fold_scalar_and_per_cpu() {
                 scalar: Some(scalar),
                 per_cpu: None,
                 scalar_counter: false,
+                per_cpu_counter: false,
             },
             BpfMapFieldSample {
                 key_base: "scx_lavd_lat_headroom".into(),
                 scalar: None,
                 per_cpu: Some(pc),
                 scalar_counter: false,
+                per_cpu_counter: false,
             },
         ],
         prog_stats: None,
@@ -1083,12 +1111,14 @@ fn bpf_map_fields_fold_scalar_counter_takes_last() {
                 scalar: Some(gauge),
                 per_cpu: None,
                 scalar_counter: false,
+                per_cpu_counter: false,
             },
             BpfMapFieldSample {
                 key_base: "bpf_alloc_count".into(),
                 scalar: Some(counter),
                 per_cpu: None,
                 scalar_counter: true,
+                per_cpu_counter: false,
             },
         ],
         prog_stats: None,
@@ -1127,6 +1157,7 @@ fn bpf_map_fields_counter_holds_last_successful_when_tail_unreported() {
             scalar: Some(v),
             per_cpu: None,
             scalar_counter: true,
+            per_cpu_counter: false,
         }],
         prog_stats: None,
         psi_irq: None,
@@ -1169,6 +1200,7 @@ fn bpf_map_fields_single_sample_counter_folds_to_value() {
             scalar: Some(42.0),
             per_cpu: None,
             scalar_counter: true,
+            per_cpu_counter: false,
         }],
         prog_stats: None,
         psi_irq: None,
@@ -1200,12 +1232,14 @@ fn bpf_map_fields_counter_and_per_cpu_coexist() {
                 scalar: Some(counter),
                 per_cpu: None,
                 scalar_counter: true,
+                per_cpu_counter: false,
             },
             BpfMapFieldSample {
                 key_base: "bpf_headroom".into(),
                 scalar: None,
                 per_cpu: Some(pc),
                 scalar_counter: false,
+                per_cpu_counter: false,
             },
         ],
         prog_stats: None,
@@ -1230,6 +1264,151 @@ fn bpf_map_fields_counter_and_per_cpu_coexist() {
     assert_eq!(by.get("bpf_alloc_count"), Some(&40.0));
     assert_eq!(by.get("bpf_headroom_avg"), Some(&5.0));
     assert_eq!(by.get("bpf_headroom_max"), Some(&8.0));
+}
+
+/// A `PerCpuCounter` target folds to the CROSS-CPU SUM at the LAST reporting
+/// sample (the accumulated total across CPUs), is_counter=true (so it SUM-folds
+/// across runs), and emits exactly ONE key — NOT the mean, NOT the all-sample
+/// sum, and NOT the gauge `_avg`/`_max` pair.
+#[test]
+fn bpf_map_fields_fold_per_cpu_counter_sums_cross_cpu_last() {
+    use super::BpfMapFieldSample;
+    let mk = |pc: Vec<f64>| MonitorSample {
+        bpf_map_fields: vec![BpfMapFieldSample {
+            key_base: "bpf_evt_count".into(),
+            scalar: None,
+            per_cpu: Some(pc),
+            scalar_counter: false,
+            per_cpu_counter: true,
+        }],
+        prog_stats: None,
+        psi_irq: None,
+        elapsed_ms: 0,
+        cpus: vec![CpuSnapshot {
+            nr_running: 1,
+            rq_clock: 1,
+            ..Default::default()
+        }],
+    };
+    // Per-CPU counters rise: cross-CPU sums 30 -> 120 -> 300. Fold = the sum at
+    // the LAST sample = 300 (NOT the mean of sums 150, NOT all-sample sum 450).
+    let summary = MonitorSummary::from_samples(&[
+        mk(vec![10.0, 20.0]),
+        mk(vec![40.0, 80.0]),
+        mk(vec![100.0, 200.0]),
+    ]);
+    let folded = summary
+        .bpf_map_fields
+        .as_ref()
+        .expect("watched fields folded");
+    let f = folded
+        .iter()
+        .find(|x| x.key == "bpf_evt_count")
+        .expect("per-cpu-counter total key");
+    assert_eq!(f.value, 300.0, "cross-CPU sum at the LAST sample");
+    assert!(f.is_counter, "is_counter so it SUM-folds across runs");
+    assert_eq!(
+        folded
+            .iter()
+            .filter(|x| x.key.starts_with("bpf_evt_count"))
+            .count(),
+        1,
+        "PerCpuCounter emits ONE key (the total), not _avg/_max",
+    );
+}
+
+/// PerCpuCounter sums only the CPUs that reported in the LAST sample (a CPU
+/// dropping out of the final read is excluded — no phantom stale add), and a
+/// single-sample counter folds to that sample's cross-CPU sum.
+#[test]
+fn bpf_map_fields_per_cpu_counter_last_sample_reporting_cpus() {
+    use super::BpfMapFieldSample;
+    let mk = |pc: Vec<f64>| MonitorSample {
+        bpf_map_fields: vec![BpfMapFieldSample {
+            key_base: "bpf_evt_count".into(),
+            scalar: None,
+            per_cpu: Some(pc),
+            scalar_counter: false,
+            per_cpu_counter: true,
+        }],
+        prog_stats: None,
+        psi_irq: None,
+        elapsed_ms: 0,
+        cpus: vec![CpuSnapshot {
+            nr_running: 1,
+            rq_clock: 1,
+            ..Default::default()
+        }],
+    };
+    // Final sample reports only 1 CPU (the other's per-CPU page was unreadable):
+    // total = 70, not 70 + a stale prior CPU value.
+    let summary = MonitorSummary::from_samples(&[mk(vec![10.0, 20.0]), mk(vec![70.0])]);
+    assert_eq!(
+        summary
+            .bpf_map_fields
+            .as_ref()
+            .and_then(|f| f.iter().find(|x| x.key == "bpf_evt_count"))
+            .map(|x| x.value),
+        Some(70.0),
+        "sum over the CPUs that reported in the last sample",
+    );
+    // Single sample -> that sample's cross-CPU sum.
+    let one = MonitorSummary::from_samples(&[mk(vec![5.0, 6.0, 7.0])]);
+    assert_eq!(
+        one.bpf_map_fields
+            .as_ref()
+            .and_then(|f| f.iter().find(|x| x.key == "bpf_evt_count"))
+            .map(|x| x.value),
+        Some(18.0),
+        "single-sample cross-CPU sum",
+    );
+}
+
+/// A PerCpuCounter sample with an EMPTY per-CPU vec (a deserialized sidecar
+/// could carry one; the live reader never does) emits NO key — loud-absent, no
+/// phantom 0.0 — and an empty LAST sample falls back to the prior non-empty
+/// cross-CPU sum (the last successful read), not 0.
+#[test]
+fn bpf_map_fields_per_cpu_counter_empty_sample_loud_absent() {
+    use super::BpfMapFieldSample;
+    let mk = |pc: Vec<f64>| MonitorSample {
+        bpf_map_fields: vec![BpfMapFieldSample {
+            key_base: "bpf_evt_count".into(),
+            scalar: None,
+            per_cpu: Some(pc),
+            scalar_counter: false,
+            per_cpu_counter: true,
+        }],
+        prog_stats: None,
+        psi_irq: None,
+        elapsed_ms: 0,
+        cpus: vec![CpuSnapshot {
+            nr_running: 1,
+            rq_clock: 1,
+            ..Default::default()
+        }],
+    };
+    // All-empty -> NO key (loud-absent, not a phantom 0.0).
+    let empty = MonitorSummary::from_samples(&[mk(vec![])]);
+    assert!(
+        empty
+            .bpf_map_fields
+            .as_ref()
+            .map(|f| f.iter().all(|x| x.key != "bpf_evt_count"))
+            .unwrap_or(true),
+        "empty per-CPU counter sample emits no key (no phantom 0.0)",
+    );
+    // Empty LAST sample -> the prior non-empty cross-CPU sum (30), not 0.
+    let tail_empty = MonitorSummary::from_samples(&[mk(vec![10.0, 20.0]), mk(vec![])]);
+    assert_eq!(
+        tail_empty
+            .bpf_map_fields
+            .as_ref()
+            .and_then(|f| f.iter().find(|x| x.key == "bpf_evt_count"))
+            .map(|x| x.value),
+        Some(30.0),
+        "empty last sample falls back to the prior non-empty cross-CPU sum",
+    );
 }
 
 /// No watched field reported in any sample -> `None` (loud-absent), so

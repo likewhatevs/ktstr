@@ -488,8 +488,9 @@ pub struct PsiIrqSample {
 /// `per_cpu` is `Some`, matching the target's [`crate::test_support::BpfMapAgg`].
 /// Folded run-level at [`MonitorSummary`]: a gauge `scalar` -> mean across
 /// reporting samples; a counter `scalar` (`scalar_counter`) -> the value at
-/// the last reporting sample; `per_cpu` -> cross-(CPU, sample) mean (`_avg`) +
-/// spatial max (`_max`).
+/// the last reporting sample; a gauge `per_cpu` -> cross-(CPU, sample) mean
+/// (`_avg`) + spatial max (`_max`); a counter `per_cpu` (`per_cpu_counter`)
+/// -> the cross-CPU SUM at the last reporting sample (one key, the total).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BpfMapFieldSample {
     /// Final metric-key base `<scheduler-obj>_<label>` (e.g.
@@ -508,9 +509,18 @@ pub struct BpfMapFieldSample {
     /// ([`crate::test_support::BpfMapAgg::ScalarCounter`]): the run-level fold
     /// takes the value at the last reporting sample (the accumulated total)
     /// instead of the mean. `false` (the serde default) folds `scalar` as the
-    /// mean (a gauge). Ignored when `per_cpu` is `Some`.
+    /// mean (a gauge). Applies only to `scalar`; for a per-CPU counter use
+    /// `per_cpu_counter`.
     #[serde(default)]
     pub scalar_counter: bool,
+    /// True when `per_cpu` is a monotonic counter
+    /// ([`crate::test_support::BpfMapAgg::PerCpuCounter`]): the run-level fold
+    /// takes the CROSS-CPU SUM at the last reporting sample (the accumulated
+    /// total across reporting CPUs) and emits ONE key. `false` (the serde
+    /// default) folds `per_cpu` as the gauge mean (`_avg`) + spatial max
+    /// (`_max`). Ignored when `scalar` is `Some`.
+    #[serde(default)]
+    pub per_cpu_counter: bool,
 }
 
 impl MonitorSample {
@@ -1592,6 +1602,8 @@ impl MonitorSummary {
             pc_sum: f64,
             pc_n: usize,
             pc_max: f64,
+            pc_counter: bool,
+            pc_last_sum: f64,
         }
         let mut accs: BTreeMap<&str, Acc> = BTreeMap::new();
         for s in samples {
@@ -1604,6 +1616,8 @@ impl MonitorSummary {
                     pc_sum: 0.0,
                     pc_n: 0,
                     pc_max: f64::NEG_INFINITY,
+                    pc_counter: false,
+                    pc_last_sum: 0.0,
                 });
                 if let Some(v) = f.scalar {
                     a.scalar_sum += v;
@@ -1612,11 +1626,25 @@ impl MonitorSummary {
                     a.scalar_counter = f.scalar_counter;
                 }
                 if let Some(vs) = &f.per_cpu {
-                    for &v in vs {
-                        a.pc_sum += v;
-                        a.pc_n += 1;
-                        if v > a.pc_max {
-                            a.pc_max = v;
+                    if f.per_cpu_counter {
+                        // Per-CPU monotonic counter: this sample's cross-CPU
+                        // total; the last NON-EMPTY sample wins. Guard the empty
+                        // case (the live reader never emits an empty per-CPU
+                        // sample, but a deserialized sidecar could): an all-empty
+                        // target emits no key (loud-absent, no phantom 0.0), and
+                        // an empty last sample falls back to the prior non-empty
+                        // sum (the last successful read, like the scalar path).
+                        if !vs.is_empty() {
+                            a.pc_counter = true;
+                            a.pc_last_sum = vs.iter().copied().sum();
+                        }
+                    } else {
+                        for &v in vs {
+                            a.pc_sum += v;
+                            a.pc_n += 1;
+                            if v > a.pc_max {
+                                a.pc_max = v;
+                            }
                         }
                     }
                 }
@@ -1638,8 +1666,19 @@ impl MonitorSummary {
                     is_counter: a.scalar_counter,
                 });
             }
-            if a.pc_n > 0 {
-                // Per-CPU keys are a gauge mean (`_avg`) and a spatial peak
+            if a.pc_counter {
+                // Per-CPU counter: the accumulated cross-CPU total at the last
+                // non-empty reporting sample (ONE key, is_counter -> SUM-folds
+                // across runs). pc_counter is set only by a non-empty per-CPU
+                // sample (guarded above), so this is loud-absent — no key when
+                // nothing reported.
+                out.push(BpfMapFieldValue {
+                    key: key_base.to_string(),
+                    value: a.pc_last_sum,
+                    is_counter: true,
+                });
+            } else if a.pc_n > 0 {
+                // Per-CPU gauge keys are a mean (`_avg`) and a spatial peak
                 // (`_max`), not counters — they mean-fold across runs.
                 out.push(BpfMapFieldValue {
                     key: format!("{key_base}_avg"),

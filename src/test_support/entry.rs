@@ -509,6 +509,18 @@ pub enum BpfMapAgg {
     /// samples. The divisor is the count of CPUs that reported a value,
     /// never the topology CPU count.
     PerCpu,
+    /// A per-CPU array field that is a monotonic COUNTER (each CPU's slot
+    /// rises independently, e.g. a `BPF_MAP_TYPE_PERCPU_ARRAY` per-CPU event
+    /// tally). Emits ONE metric key (`<prefix>_<label>`), folded as the
+    /// CROSS-CPU SUM at the LAST reporting sample — the accumulated total
+    /// across all (reporting) CPUs at the end of the monitoring window, and
+    /// SUM-folded across runs like [`BpfMapAgg::ScalarCounter`]. Watch at u64
+    /// width: a too-narrow width truncates each per-CPU slot before the sum.
+    /// An offline CPU's accumulated count is excluded (only CPUs whose per-CPU
+    /// page is readable contribute). Use this for a rising per-CPU counter;
+    /// [`BpfMapAgg::PerCpu`] mean/max-folds (a gauge) and
+    /// [`BpfMapAgg::ScalarCounter`] is for a single scalar, not a per-CPU array.
+    PerCpuCounter,
 }
 
 /// Host-side, observer-effect-free read of a NAMED scheduler BPF-map field,
@@ -519,8 +531,9 @@ pub enum BpfMapAgg {
 /// monitor tick WITHOUT freezing the guest — turning "the scheduler computed
 /// X" into an assertable metric. Read via
 /// [`crate::vmm::result::VmResult::run_metric`] under the key
-/// `<scheduler-obj>_<label>` (scalar) or `<scheduler-obj>_<label>_{avg,max}`
-/// (per-CPU), e.g. `scx_lavd_avg_lat_cri`, `scx_lavd_lat_headroom_avg`.
+/// `<scheduler-obj>_<label>` (scalar, scalar-counter, or per-CPU-counter) or
+/// `<scheduler-obj>_<label>_{avg,max}` (per-CPU gauge), e.g.
+/// `scx_lavd_avg_lat_cri`, `scx_lavd_lat_headroom_avg`.
 /// `<scheduler-obj>` is libbpf's object name for the active scheduler, which
 /// can differ from its source / ops name (e.g. scx-ktstr's object is
 /// `bpf_bpf`). Each target's `label` must be unique within a test: duplicate
@@ -1498,7 +1511,8 @@ pub struct KtstrTestEntry {
     /// appear) and reads it each tick without freezing the guest; the value
     /// is folded run-level and exposed via
     /// [`crate::vmm::result::VmResult::run_metric`] under
-    /// `<scheduler-obj>_<label>` (scalar) or `_<label>_{avg,max}` (per-CPU).
+    /// `<scheduler-obj>_<label>` (scalar/scalar-counter/per-CPU-counter) or
+    /// `_<label>_{avg,max}` (per-CPU gauge).
     pub watch_bpf_maps: &'static [&'static WatchBpfMap],
     /// Pin vCPU threads to host cores matching the virtual topology's LLC
     /// structure, use 2MB hugepages for guest memory, NUMA mbind guest
@@ -2770,6 +2784,20 @@ mod tests {
             distances: None,
         });
         (cgroups, topo)
+    }
+
+    /// `WatchBpfMap::new` accepts the `PerCpuCounter` agg (pub-API surface); the
+    /// const-fn validates map/field/label format, not the agg, so the variant
+    /// is stored verbatim.
+    #[test]
+    fn watch_bpf_map_new_accepts_per_cpu_counter() {
+        let w = WatchBpfMap::new(
+            "cpu_ctx_stor",
+            "evt_count",
+            BpfMapAgg::PerCpuCounter,
+            "evt_count",
+        );
+        assert_eq!(w.agg, BpfMapAgg::PerCpuCounter);
     }
 
     #[test]

@@ -10626,8 +10626,16 @@ impl KtstrVm {
             .map(|p| monitor::reader::WatchBpfMapTarget {
                 map_suffix: p.map_name_suffix.clone(),
                 field: p.field.clone(),
-                per_cpu: matches!(p.agg, crate::test_support::BpfMapAgg::PerCpu),
-                counter: matches!(p.agg, crate::test_support::BpfMapAgg::ScalarCounter),
+                per_cpu: matches!(
+                    p.agg,
+                    crate::test_support::BpfMapAgg::PerCpu
+                        | crate::test_support::BpfMapAgg::PerCpuCounter
+                ),
+                counter: matches!(
+                    p.agg,
+                    crate::test_support::BpfMapAgg::ScalarCounter
+                        | crate::test_support::BpfMapAgg::PerCpuCounter
+                ),
                 label: p.label.clone(),
             })
             .collect();

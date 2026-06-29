@@ -2451,6 +2451,7 @@ impl<'a> BpfMapWatcher<'a> {
                         scalar: None,
                         per_cpu: Some(vals),
                         scalar_counter: false,
+                        per_cpu_counter: r.counter,
                     });
                 }
             } else if let Some(bytes) = accessor.read_value(&r.map, r.offset, r.width)
@@ -2461,6 +2462,7 @@ impl<'a> BpfMapWatcher<'a> {
                     scalar: Some(u as f64),
                     per_cpu: None,
                     scalar_counter: r.counter,
+                    per_cpu_counter: false,
                 });
             }
         }
