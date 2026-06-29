@@ -75,6 +75,7 @@ impl WorkType {
             WorkType::IpcVariance { .. } => "IpcVariance",
             WorkType::TimerLatency { .. } => "TimerLatency",
             WorkType::NetTraffic { .. } => "NetTraffic",
+            WorkType::IrqWake { .. } => "IrqWake",
         }
     }
 
@@ -240,6 +241,10 @@ impl WorkType {
                 interval_us: defaults::NET_TRAFFIC_INTERVAL_US,
                 frame_bytes: defaults::NET_TRAFFIC_FRAME_BYTES,
             }),
+            "IrqWake" => Some(WorkType::IrqWake {
+                interval_us: defaults::IRQ_WAKE_INTERVAL_US,
+                frame_bytes: defaults::IRQ_WAKE_FRAME_BYTES,
+            }),
             // Sequence requires explicit phases; no default from_name.
             _ => None,
         }
@@ -356,6 +361,10 @@ impl WorkType {
             // from host topology) or [`AffinityIntent::Exact`]
             // (caller-supplied CPU IDs).
             WorkType::SmtSiblingSpin => Some(2),
+            // IrqWake: paired sender / receiver (group of 2, even count). pos==0
+            // sends self-addressed frames, pos==1 blocks in recvfrom and records a
+            // liveness sample (block-to-return duration) per delivered frame.
+            WorkType::IrqWake { .. } => Some(2),
             _ => None,
         }
     }
@@ -369,7 +378,9 @@ impl WorkType {
     /// classify itself as RT or CFS. Allocating a single 4-byte
     /// MAP_SHARED region per group is the cheapest way to get
     /// `pos` plumbed through worker_main without a wider dispatch
-    /// contract change.
+    /// contract change. `IrqWake` opts in for the same reason:
+    /// `pos == 0` is the frame sender, `pos == 1` the receiver that
+    /// blocks in `recvfrom` — neither touches the futex word.
     pub fn needs_shared_mem(&self) -> bool {
         matches!(
             self,
@@ -386,6 +397,7 @@ impl WorkType {
                 | WorkType::SignalStorm { .. }
                 | WorkType::PreemptStorm { .. }
                 | WorkType::EpollStorm { .. }
+                | WorkType::IrqWake { .. }
         )
     }
 
@@ -862,6 +874,20 @@ impl WorkType {
     /// [`WorkType::NetTraffic`] variant doc.
     pub const fn net_traffic(interval_us: u64, frame_bytes: u16) -> Self {
         WorkType::NetTraffic {
+            interval_us,
+            frame_bytes,
+        }
+    }
+
+    /// Construct a [`WorkType::IrqWake`] — a paired sender/receiver where the
+    /// receiver blocks in `recvfrom` and is woken from NET_RX softirq context.
+    /// `interval_us` paces the sender (default 1000 µs gives the receiver a clean
+    /// empty-queue block per frame; `0` maximizes softirq load into `ksoftirqd`
+    /// but degenerates the wake reservoir); `frame_bytes` is validated to
+    /// `[60, 1514]` at spawn. Spawn an even worker count (group size 2). See the
+    /// [`WorkType::IrqWake`] variant doc.
+    pub const fn irq_wake(interval_us: u64, frame_bytes: u16) -> Self {
+        WorkType::IrqWake {
             interval_us,
             frame_bytes,
         }

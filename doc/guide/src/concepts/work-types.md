@@ -54,6 +54,7 @@ pub enum WorkType {
         sleep_usec: u64,
     },
     Schbench { config: SchbenchConfig },                // schbench's message/worker wakeup + request-latency benchmark, re-expressed natively.
+    Taobench { config: TaobenchConfig },                // taobench's GET-dominated KV object-cache (fast-hit / slow-miss tiers), re-expressed natively.
     AsymmetricWaker {                                   // Paired workers in mismatched scheduling classes share one futex word.
         waker_class: SchedClass,
         wakee_class: SchedClass,
@@ -74,6 +75,11 @@ pub enum WorkType {
         batches: u64,
         inter_batch_ms: u64,
     },
+
+    // Timer + NIC/IRQ wakeups (the AF_PACKET variants need #[ktstr_test(network = ...)])
+    TimerLatency { interval_us: u64 },                  // cyclictest-style: absolute-deadline hrtimer (hardirq) wake; measures timer wake-to-run latency.
+    NetTraffic { interval_us: u64, frame_bytes: u16 },  // AF_PACKET self-traffic generator -> virtio-net RX hardirq + NAPI softirq (no wakee).
+    IrqWake { interval_us: u64, frame_bytes: u16 },     // Paired sender/receiver; receiver blocked in recvfrom is woken from NET_RX softirq context.
 
     // Compound / sequence
     Sequence { first: WorkPhase, rest: Vec<WorkPhase> }, // Loop through ordered phases (Spin / Sleep / Yield / Io / AluHot).

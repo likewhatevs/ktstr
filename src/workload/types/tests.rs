@@ -720,12 +720,12 @@ fn suggest_rejects_whitespace_padded_inputs() {
 #[test]
 fn work_type_all_names_count() {
     // `ALL_NAMES` is derived by `strum::VariantNames` from the `WorkType`
-    // enum, so its length is exactly the variant count (currently 41,
+    // enum, so its length is exactly the variant count (currently 45,
     // including the serde-skipped `Custom`, which strum still names).
     // Pinning it catches a variant added or removed without the parallel
     // `name()` / `from_name()` / dispatch maintenance; bump it when the
     // variant set changes intentionally.
-    assert_eq!(WorkType::ALL_NAMES.len(), 41);
+    assert_eq!(WorkType::ALL_NAMES.len(), 45);
 }
 
 #[test]

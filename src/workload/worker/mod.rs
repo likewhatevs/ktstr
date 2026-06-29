@@ -495,6 +495,11 @@ pub(super) fn worker_main(
     // attempted; `Some` = ready; failed = no NIC / setup error → LOUD no-op.
     let mut net_sender: Option<net_traffic::NetTrafficSender> = None;
     let mut net_setup_failed = false;
+    // IrqWake receiver — lazily opened on the first IrqWake cycle (post-fork) by
+    // the pos==1 worker; the pos==0 worker reuses `net_sender` above. Same
+    // None/!failed/Some/failed lifecycle as `net_sender`.
+    let mut irq_receiver: Option<net_traffic::IrqWakeReceiver> = None;
+    let mut irq_recv_setup_failed = false;
     // Per-iteration wall-clock compute duration samples
     // (reservoir-sampled at the same cap as wake_latencies_ns).
     // Populated by AluHot, SmtSiblingSpin, IpcVariance; all other
@@ -3527,6 +3532,94 @@ pub(super) fn worker_main(
                     // no-op.
                     unsafe {
                         libc::sched_yield();
+                    }
+                }
+                last_iter_time = Instant::now();
+                iterations += 1;
+            }
+            WorkType::IrqWake {
+                interval_us,
+                frame_bytes,
+            } => {
+                // Paired sender / receiver, split by `pos` (the shared-mem tuple;
+                // needs_shared_mem opts in solely to receive it). pos==0 reuses the
+                // NetTraffic AF_PACKET sender; pos==1 blocks in recvfrom and is
+                // woken from NET_RX softirq, recording the recvfrom block-to-return
+                // duration (a liveness proxy, not a precise wake-to-run latency —
+                // see below).
+                let pos = match futex {
+                    Some((_, pos)) => pos,
+                    None => break,
+                };
+                if pos == 0 {
+                    // Sender side: reuse the NetTraffic sender (lazy post-fork
+                    // setup; no NIC -> LOUD no-op). Each frame is a virtio TX kick
+                    // the in-VMM loopback echoes into the receiver's RX.
+                    if net_sender.is_none() && !net_setup_failed {
+                        match net_traffic::NetTrafficSender::setup(frame_bytes) {
+                            Ok(s) => net_sender = Some(s),
+                            Err(e) => {
+                                net_traffic::warn_irq_wake_setup_failed_once(&e);
+                                net_setup_failed = true;
+                            }
+                        }
+                    }
+                    if let Some(sender) = net_sender.as_ref() {
+                        if sender.send_one() {
+                            work_units = std::hint::black_box(work_units.wrapping_add(1));
+                        }
+                        // Optional pacing: interval_us == 0 saturates the softirq
+                        // budget (wake serviced by ksoftirqd); > 0 paces so the
+                        // wake runs inline in softirq. A workload sleep, not a
+                        // control-flow wait.
+                        if interval_us > 0 {
+                            let req = libc::timespec {
+                                tv_sec: (interval_us / 1_000_000) as libc::time_t,
+                                tv_nsec: ((interval_us % 1_000_000) * 1_000) as libc::c_long,
+                            };
+                            // SAFETY: req is a valid timespec; rmtp null (EINTR
+                            // just shortens the pause — the loop's stop check ends
+                            // it).
+                            unsafe {
+                                libc::nanosleep(&req, std::ptr::null_mut());
+                            }
+                        }
+                    } else {
+                        unsafe {
+                            libc::sched_yield();
+                        }
+                    }
+                } else {
+                    // Receiver side: block in recvfrom; the sender's frame arrives
+                    // via NET_RX softirq, whose sock_def_readable -> ttwu wakes us.
+                    // before_block -> recv -> wake.push records the block-to-return
+                    // duration: a LIVENESS proxy (a non-empty reservoir means
+                    // softirq-delivered frames scheduled the receiver), NOT a
+                    // precise wake-to-run latency — the magnitude includes the
+                    // inter-frame pacing wait, and at interval_us==0 a recv may
+                    // return an already-queued frame without blocking. The rising
+                    // softirq IRQ count is the authoritative "softirq fired" proof.
+                    if irq_receiver.is_none() && !irq_recv_setup_failed {
+                        match net_traffic::IrqWakeReceiver::setup() {
+                            Ok(r) => irq_receiver = Some(r),
+                            Err(e) => {
+                                net_traffic::warn_irq_wake_setup_failed_once(&e);
+                                irq_recv_setup_failed = true;
+                            }
+                        }
+                    }
+                    if let Some(receiver) = irq_receiver.as_mut() {
+                        let before_block = Instant::now();
+                        if receiver.recv_one() {
+                            wake.push(before_block.elapsed().as_nanos() as u64);
+                            work_units = std::hint::black_box(work_units.wrapping_add(1));
+                        }
+                        // A timed-out recv (no frame within SO_RCVTIMEO) records
+                        // nothing; the loop re-checks stop and re-blocks.
+                    } else {
+                        unsafe {
+                            libc::sched_yield();
+                        }
                     }
                 }
                 last_iter_time = Instant::now();

@@ -1765,6 +1765,56 @@ pub enum WorkType {
         /// standard MTU + header) at spawn.
         frame_bytes: u16,
     },
+    /// Paired sender/receiver that wakes a blocked task from NET_RX **softirq**
+    /// (or ksoftirqd) context — the genuine "woken from softirq" wake that
+    /// [`Self::TimerLatency`] (a hardirq hrtimer wake) and [`Self::NetTraffic`] (a
+    /// wakee-less sender) do not exercise. Each pair: one worker reuses the
+    /// [`Self::NetTraffic`] sender (self-addressed `AF_PACKET` / `SOCK_RAW` frames
+    /// on the virtio-net NIC), the other BLOCKS in `recvfrom` on the same socket
+    /// and records a wake-presence sample per delivered frame.
+    ///
+    /// **Kernel path (the wake):** the sender's frame arrives via the virtio RX
+    /// IRQ, which only schedules NAPI (`vring_interrupt` → `skb_recv_done` →
+    /// `__napi_schedule`); delivery + wake run in the `NET_RX_SOFTIRQ` handler
+    /// `net_rx_action` → `virtnet_poll` → `packet_rcv` → `sk_data_ready` =
+    /// `sock_def_readable` → `wake_up_interruptible_sync_poll`, which `ttwu`s the
+    /// receiver blocked in `__skb_wait_for_more_packets`. At a low rate the softirq
+    /// runs inline (on the receiving CPU at `irq_exit`); at saturation
+    /// (`interval_us == 0`) the softirq budget is exceeded and the work — and the
+    /// wake — defers to `ksoftirqd`. The regime is kernel-decided by rate, not a
+    /// flag. The wake is NEVER in hardirq context (the virtio ISR only schedules
+    /// NAPI).
+    ///
+    /// **Precondition + no-NIC behavior:** like [`Self::NetTraffic`] — needs a NIC
+    /// via `#[ktstr_test(network = ...)]`; with no non-loopback interface the pair
+    /// is a LOUD no-op (warn once, `work_units == 0`).
+    ///
+    /// **What the wake reservoir means:** `worker_group_size = Some(2)` — workers
+    /// spawn in sender/receiver pairs (even count enforced at spawn). The receiver
+    /// pushes each `recvfrom` block-to-return duration into the wake reservoir
+    /// (`wake_latencies_ns`). A NON-EMPTY reservoir is a LIVENESS signal — softirq-
+    /// delivered frames scheduled the receiver to run — NOT a precise wake-to-run
+    /// latency: the magnitude is a block-duration proxy dominated by the
+    /// inter-frame pacing wait, and when the queue never empties (`interval_us ==
+    /// 0`) a `recvfrom` may return an already-queued frame WITHOUT blocking, so a
+    /// sample need not correspond to a softirq wake at all. The authoritative
+    /// "softirq fired" proof is the rising IRQ-observability count
+    /// (`total_softirq_net_rx`, `rq->avg_irq`, PSI-irq), not the reservoir.
+    IrqWake {
+        /// Inter-frame pause (µs) on the sender. Default **1000** (1 kHz): paces
+        /// the sender so the receiver drains its queue and genuinely blocks
+        /// between frames — each frame is then a real empty-queue block woken by
+        /// the next NET_RX softirq, giving a usable (non-degenerate) wake
+        /// reservoir. `0` sends continuously (maximum softirq load, serviced by
+        /// `ksoftirqd`) but the receive queue rarely empties, so `recvfrom` mostly
+        /// returns an already-queued frame without blocking and the wake reservoir
+        /// degenerates to near-zero block durations. A larger `> 0` value lowers
+        /// the rate. Paces the sender side only; the receiver always blocks.
+        interval_us: u64,
+        /// Ethernet frame size in bytes. Default 60 (`ETH_ZLEN`). Validated to
+        /// `[60, 1514]` at spawn.
+        frame_bytes: u16,
+    },
     /// Sustained high-IPC ALU workload. Each worker runs four
     /// independent multiply chains in parallel, with
     /// [`std::hint::black_box`] wrapping every step to prevent

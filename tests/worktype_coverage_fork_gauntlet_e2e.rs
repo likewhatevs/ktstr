@@ -52,6 +52,10 @@
 //!     NIC (`#[ktstr_test(network = ...)]`) that this direct-spawn path
 //!     does not provide; here it would no-op (no non-loopback interface).
 //!     Driven by the dedicated `tests/net_traffic_e2e.rs`.
+//!   - [`WorkType::IrqWake`] — like `NetTraffic`, needs an attached NIC the
+//!     direct-spawn path does not provide (here it would no-op); also a
+//!     paired sender/receiver (group of 2). Driven by the dedicated
+//!     `tests/irq_wake_e2e.rs`.
 //!   - [`WorkType::Schbench`] — driven by its own schbench engine (a
 //!     message-thread + worker-thread pool, not the generic
 //!     per-iteration worker body); covered by

@@ -172,6 +172,16 @@ pub mod defaults {
     /// Default [`crate::workload::WorkType::NetTraffic`] Ethernet frame size
     /// (bytes): 60 = `ETH_ZLEN`, the minimum L2 frame sans FCS.
     pub const NET_TRAFFIC_FRAME_BYTES: u16 = 60;
+    // IrqWake
+    /// Default [`crate::workload::WorkType::IrqWake`] inter-frame interval (µs):
+    /// 1000 (1 kHz) paces the sender so the receiver drains its queue and
+    /// genuinely blocks between frames — giving a usable (non-degenerate) wake
+    /// reservoir. `interval_us == 0` maximizes softirq load (serviced by
+    /// `ksoftirqd`) but degenerates the wake reservoir — see the variant doc.
+    pub const IRQ_WAKE_INTERVAL_US: u64 = 1000;
+    /// Default [`crate::workload::WorkType::IrqWake`] Ethernet frame size (bytes):
+    /// 60 = `ETH_ZLEN`, the minimum L2 frame sans FCS.
+    pub const IRQ_WAKE_FRAME_BYTES: u16 = 60;
     // AluHot
     /// Default for `WorkType::AluHot`'s `width` field. `Widest`
     /// resolves to the widest data-path the host supports at

@@ -1,5 +1,10 @@
-//! AF_PACKET traffic sender for
-//! [`WorkType::NetTraffic`](crate::workload::WorkType::NetTraffic).
+//! AF_PACKET workload sockets for
+//! [`WorkType::NetTraffic`](crate::workload::WorkType::NetTraffic) (the
+//! [`NetTrafficSender`]) and
+//! [`WorkType::IrqWake`](crate::workload::WorkType::IrqWake) (the same sender
+//! plus the blocking [`IrqWakeReceiver`]). The socket recipe — NIC discovery,
+//! bind, interface-up, timeout — is shared by both via the module-level
+//! `set_iface_up` / `bind_socket_to_ifindex` / `set_socket_timeout` helpers.
 //!
 //! Replicates the proven send recipe from the wide-SMP net-IRQ e2e
 //! (`tests/wide_smp_net_irq_e2e.rs`): an `AF_PACKET` / `SOCK_RAW` socket
@@ -93,66 +98,19 @@ impl NetTrafficSender {
     /// device with `-ENETDOWN` (`!(dev->flags & IFF_UP)`), and
     /// `dev_queue_xmit`'s `netif_running` check is the deeper gate.
     fn bring_up(&self, iface: &str) -> io::Result<()> {
-        let mut ifr: libc::ifreq = unsafe { mem::zeroed() };
-        copy_ifname(&mut ifr.ifr_name, iface)?;
-        // SAFETY: ifr_name is set; SIOCGIFFLAGS reads current flags, then
-        // SIOCSIFFLAGS writes them back with the up bits set.
-        let rc = unsafe { libc::ioctl(self.fd, libc::SIOCGIFFLAGS, &mut ifr) };
-        if rc != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        unsafe {
-            ifr.ifr_ifru.ifru_flags |= (libc::IFF_UP | libc::IFF_RUNNING) as libc::c_short;
-        }
-        let rc = unsafe { libc::ioctl(self.fd, libc::SIOCSIFFLAGS, &ifr) };
-        if rc != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
+        set_iface_up(self.fd, iface)
     }
 
     /// Bind the socket to the NIC by ifindex (associates TX/RX with the
     /// device).
     fn bind_to(&self, ifindex: i32) -> io::Result<()> {
-        let mut sll: libc::sockaddr_ll = unsafe { mem::zeroed() };
-        sll.sll_family = libc::AF_PACKET as u16;
-        sll.sll_protocol = (libc::ETH_P_ALL as u16).to_be();
-        sll.sll_ifindex = ifindex;
-        // SAFETY: sll is a fully-initialized sockaddr_ll; len matches.
-        let rc = unsafe {
-            libc::bind(
-                self.fd,
-                &sll as *const _ as *const libc::sockaddr,
-                mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t,
-            )
-        };
-        if rc != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
+        bind_socket_to_ifindex(self.fd, ifindex)
     }
 
     /// Set `SO_SNDTIMEO` so a full-ring `sendto` is bounded (see
     /// [`SEND_TIMEOUT_US`]).
     fn set_send_timeout(&self) -> io::Result<()> {
-        let tv = libc::timeval {
-            tv_sec: SEND_TIMEOUT_US / 1_000_000,
-            tv_usec: (SEND_TIMEOUT_US % 1_000_000) as libc::suseconds_t,
-        };
-        // SAFETY: fd is valid; tv is a valid timeval for SO_SNDTIMEO.
-        let rc = unsafe {
-            libc::setsockopt(
-                self.fd,
-                libc::SOL_SOCKET,
-                libc::SO_SNDTIMEO,
-                &tv as *const _ as *const libc::c_void,
-                mem::size_of::<libc::timeval>() as libc::socklen_t,
-            )
-        };
-        if rc != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
+        set_socket_timeout(self.fd, libc::SO_SNDTIMEO, SEND_TIMEOUT_US)
     }
 }
 
@@ -163,6 +121,166 @@ impl Drop for NetTrafficSender {
             libc::close(self.fd);
         }
     }
+}
+
+/// Receive timeout (µs) so the receiver's blocking `recvfrom` re-checks the stop
+/// flag rather than blocking unboundedly when no frame arrives (sender paused,
+/// NIC quiet). 100 ms — same bound as the sender's `SO_SNDTIMEO`.
+const RECV_TIMEOUT_US: i64 = 100_000;
+
+/// Bring interface `iface` administratively up (`IFF_UP | IFF_RUNNING` via
+/// `SIOCSIFFLAGS`) on socket `fd`. Mandatory before TX/RX: a down device is
+/// rejected with `-ENETDOWN`. Shared by [`NetTrafficSender`] and
+/// [`IrqWakeReceiver`].
+fn set_iface_up(fd: i32, iface: &str) -> io::Result<()> {
+    let mut ifr: libc::ifreq = unsafe { mem::zeroed() };
+    copy_ifname(&mut ifr.ifr_name, iface)?;
+    // SAFETY: ifr_name is set; SIOCGIFFLAGS reads current flags, then
+    // SIOCSIFFLAGS writes them back with the up bits set.
+    let rc = unsafe { libc::ioctl(fd, libc::SIOCGIFFLAGS, &mut ifr) };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    unsafe {
+        ifr.ifr_ifru.ifru_flags |= (libc::IFF_UP | libc::IFF_RUNNING) as libc::c_short;
+    }
+    let rc = unsafe { libc::ioctl(fd, libc::SIOCSIFFLAGS, &ifr) };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Bind socket `fd` to the NIC by `ifindex` (associates TX/RX with the device).
+/// Shared by the sender and receiver.
+fn bind_socket_to_ifindex(fd: i32, ifindex: i32) -> io::Result<()> {
+    let mut sll: libc::sockaddr_ll = unsafe { mem::zeroed() };
+    sll.sll_family = libc::AF_PACKET as u16;
+    sll.sll_protocol = (libc::ETH_P_ALL as u16).to_be();
+    sll.sll_ifindex = ifindex;
+    // SAFETY: sll is a fully-initialized sockaddr_ll; len matches.
+    let rc = unsafe {
+        libc::bind(
+            fd,
+            &sll as *const _ as *const libc::sockaddr,
+            mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Set a socket send/receive timeout (`optname` = `SO_SNDTIMEO` or
+/// `SO_RCVTIMEO`) of `timeout_us` µs on `fd`, so a blocking send/recv is bounded
+/// and the worker re-checks the stop flag. Shared by the sender (`SO_SNDTIMEO`)
+/// and receiver (`SO_RCVTIMEO`).
+fn set_socket_timeout(fd: i32, optname: libc::c_int, timeout_us: i64) -> io::Result<()> {
+    let tv = libc::timeval {
+        tv_sec: timeout_us / 1_000_000,
+        tv_usec: (timeout_us % 1_000_000) as libc::suseconds_t,
+    };
+    // SAFETY: fd is valid; tv is a valid timeval for SO_SNDTIMEO / SO_RCVTIMEO.
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            optname,
+            &tv as *const _ as *const libc::c_void,
+            mem::size_of::<libc::timeval>() as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// A configured AF_PACKET receiver bound to the virtio-net NIC: it BLOCKS in
+/// `recvfrom` and is woken from NET_RX **softirq** (or `ksoftirqd`) context when
+/// a frame the [`NetTrafficSender`] sent arrives via the in-VMM loopback. Used by
+/// [`WorkType::IrqWake`](crate::workload::WorkType::IrqWake). Owns the raw fd
+/// (closed on [`Drop`]).
+pub(super) struct IrqWakeReceiver {
+    fd: i32,
+    buf: Vec<u8>,
+}
+
+impl IrqWakeReceiver {
+    /// Discover the NIC, open + bind an `AF_PACKET` / `SOCK_RAW` socket, bring the
+    /// interface up, and set `SO_RCVTIMEO`. Shares the socket recipe with
+    /// [`NetTrafficSender::setup`]. Returns `Err` (no NIC / setup syscall failure)
+    /// → the caller's LOUD no-op. The receive buffer is a fixed 1514-byte MTU
+    /// buffer (the sender's `frame_bytes` is validated `<= 1514`, so any echoed
+    /// frame fits).
+    pub(super) fn setup() -> io::Result<Self> {
+        let iface = virtio_net_iface()?;
+        let ifindex = iface_ifindex(&iface)?;
+        let proto = (libc::ETH_P_ALL as u16).to_be() as libc::c_int;
+        // SAFETY: standard AF_PACKET raw socket; fd checked + owned by Self.
+        let fd = unsafe { libc::socket(libc::AF_PACKET, libc::SOCK_RAW, proto) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // A SOCK_RAW recv yields the whole L2 frame; the sender's frame_bytes is
+        // validated <= 1514 (standard MTU + header), so a fixed 1514-byte buffer
+        // fits any echoed frame.
+        let receiver = IrqWakeReceiver {
+            fd,
+            buf: vec![0u8; 1514],
+        };
+        set_iface_up(receiver.fd, &iface)?;
+        bind_socket_to_ifindex(receiver.fd, ifindex)?;
+        set_socket_timeout(receiver.fd, libc::SO_RCVTIMEO, RECV_TIMEOUT_US)?;
+        Ok(receiver)
+    }
+
+    /// Block in `recvfrom` until a frame arrives (woken from NET_RX softirq) or
+    /// the receive timeout elapses. `true` on a received frame — the softirq wake
+    /// scheduled this task to run; `false` on timeout, where the worker re-checks
+    /// the stop flag and re-blocks.
+    pub(super) fn recv_one(&mut self) -> bool {
+        // SAFETY: fd is a bound AF_PACKET socket; buf is valid for its length;
+        // the src-addr out-params are null (the sender address is not needed).
+        let n = unsafe {
+            libc::recvfrom(
+                self.fd,
+                self.buf.as_mut_ptr() as *mut libc::c_void,
+                self.buf.len(),
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        n > 0
+    }
+}
+
+impl Drop for IrqWakeReceiver {
+    fn drop(&mut self) {
+        // SAFETY: `fd` is owned by this struct and not closed elsewhere.
+        unsafe {
+            libc::close(self.fd);
+        }
+    }
+}
+
+/// Warn ONCE per process that a
+/// [`WorkType::IrqWake`](crate::workload::WorkType::IrqWake) sender or receiver
+/// could not open its AF_PACKET socket (no NIC or a setup syscall error), so the
+/// pair is a LOUD no-op rather than silently doing nothing. Mirrors
+/// [`warn_net_traffic_setup_failed_once`].
+pub(super) fn warn_irq_wake_setup_failed_once(err: &io::Error) {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        eprintln!(
+            "workload: WorkType::IrqWake could not open an AF_PACKET socket \
+             ({err}); the sender/receiver pair is a no-op (work_units=0). Attach \
+             a NIC with #[ktstr_test(network = ...)]. See the WorkType::IrqWake \
+             variant doc."
+        );
+    });
 }
 
 /// The single non-loopback network interface (the virtio-net NIC). Skips
