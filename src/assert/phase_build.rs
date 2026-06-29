@@ -628,6 +628,99 @@ fn fold_per_cpu_spatial_max(
     }
 }
 
+/// Per-CPU scx_layered util-compensation SCALE over a freeze span: the factor by
+/// which a CPU's useful-work (non-overhead) capacity is scaled up to compensate
+/// for IRQ / softirq / stolen time. Over the `first`->`last` cpustat delta,
+/// `scale = delta_total / available` where `delta_total` is the sum of ALL 8
+/// `kernel_cpustat[]` ns slots (user+nice+system+idle+iowait+irq+softirq+steal)
+/// and `available = delta_total - (irq + softirq + steal)`. Clamped to
+/// `[1.0, 20.0]`; `available == 0` (overhead consumed the whole window, or no
+/// forward progress) returns the floor `1.0` (no compensation) — scx_layered's
+/// `available > 0` guard, expressed over `u64` saturating deltas where `> 0`
+/// is `!= 0`.
+///
+/// Byte-faithful to scx_layered's `util_compensation` per-CPU compute. The
+/// ns-vs-µs unit is immaterial: the ratio cancels it (scx_layered reads /proc
+/// microseconds; here the host reads `kernel_cpustat` ns, the same slots
+/// `/proc/stat` formats from). Hostile-guest hardening: every per-slot delta is
+/// `saturating_sub` (a cpustat counter that regresses across the span — a
+/// CPU-hotplug reset, or a corrupt read — clamps to 0, never wraps to
+/// ~`u64::MAX`), exactly as scx_layered does. The one divergence from
+/// scx_layered: the 8-slot `delta_total` and 3-slot `overhead` sums use
+/// `saturating_add` (a hostile per-slot `u64::MAX` clamps the total, mirroring
+/// the per-CPU IRQ spatial sums in [`crate::stats::MetricDef::read_sample`]),
+/// where scx_layered combines its per-slot saturating-subs with plain `+` — its
+/// /proc inputs are trusted, ours are guest-controlled. With `overhead >= 0` the
+/// ratio is always `>= 1.0`, so the clamp's floor is belt-and-suspenders and the
+/// cap at 20.0 is the only active bound.
+pub(crate) fn cpu_util_comp_scale(
+    first: &crate::monitor::dump::PerCpuTimeStats,
+    last: &crate::monitor::dump::PerCpuTimeStats,
+) -> f64 {
+    let user = last.cpustat_user_ns.saturating_sub(first.cpustat_user_ns);
+    let nice = last.cpustat_nice_ns.saturating_sub(first.cpustat_nice_ns);
+    let system = last.cpustat_system_ns.saturating_sub(first.cpustat_system_ns);
+    let idle = last.cpustat_idle_ns.saturating_sub(first.cpustat_idle_ns);
+    let iowait = last.cpustat_iowait_ns.saturating_sub(first.cpustat_iowait_ns);
+    let irq = last.cpustat_irq_ns.saturating_sub(first.cpustat_irq_ns);
+    let softirq = last.cpustat_softirq_ns.saturating_sub(first.cpustat_softirq_ns);
+    let steal = last.cpustat_steal_ns.saturating_sub(first.cpustat_steal_ns);
+    let delta_total = [user, nice, system, idle, iowait, irq, softirq, steal]
+        .into_iter()
+        .fold(0u64, u64::saturating_add);
+    let overhead = irq.saturating_add(softirq).saturating_add(steal);
+    let available = delta_total.saturating_sub(overhead);
+    if available == 0 {
+        return 1.0;
+    }
+    (delta_total as f64 / available as f64).clamp(1.0, 20.0)
+}
+
+/// Per-phase mean ACROSS CPUs of the [`cpu_util_comp_scale`] over the
+/// `per_cpu_time` freeze span, inserted as `avg_cpu_util_comp_scale`. Endpoint
+/// selection (first/last by `win`), the cpu-field intersection (per-CPU paired
+/// by the `cpu` field; a CPU absent from either endpoint is skipped — hotplug
+/// churn), the saturating deltas, and the loud-absent discipline (no key when
+/// no CPU pairs or the window is degenerate, `fw == lw`) mirror
+/// [`fold_per_cpu_spatial_max`]. `Gauge(Avg)`, so it auto-folds to run-level
+/// (weighted mean across phases) and cross-run with no extra wiring.
+fn fold_util_comp_scale(
+    metrics: &mut std::collections::BTreeMap<String, f64>,
+    samples_in_phase: &[crate::scenario::sample::Sample<'_>],
+    win: impl Fn(&crate::scenario::sample::Sample<'_>) -> Option<u64>,
+) {
+    let placed: Vec<(&crate::scenario::sample::Sample<'_>, u64)> = samples_in_phase
+        .iter()
+        .filter(|s| !s.snapshot.per_cpu_time().is_empty())
+        .filter_map(|s| win(s).map(|w| (s, w)))
+        .collect();
+    if let (Some(&(first_s, fw)), Some(&(last_s, lw))) = (
+        placed.iter().min_by_key(|(_, w)| *w),
+        placed.iter().max_by_key(|(_, w)| *w),
+    ) && fw < lw
+    {
+        // Per-CPU clamped scale over the cpu-field intersection of the two
+        // endpoint freezes, then the arithmetic mean across the reporting CPUs.
+        let scales: Vec<f64> = first_s
+            .snapshot
+            .per_cpu_time()
+            .iter()
+            .filter_map(|c0| {
+                last_s
+                    .snapshot
+                    .per_cpu_time_at(c0.cpu)
+                    .map(|c1| cpu_util_comp_scale(c0, c1))
+            })
+            .collect();
+        if !scales.is_empty() {
+            let mean = scales.iter().sum::<f64>() / scales.len() as f64;
+            metrics
+                .entry("avg_cpu_util_comp_scale".to_string())
+                .or_insert(mean);
+        }
+    }
+}
+
 /// Per-phase per-CGROUP spatial axis over the workload-leaf PSI-irq captured at
 /// each freeze (`Snapshot::cgroup_psi`). The per-cgroup analog of
 /// [`fold_per_cpu_spatial_max`], producing three Peak metrics:
@@ -855,6 +948,11 @@ fn buckets_from_grouped(
             "max_cpu_softirq_net_rx",
             "max_cpu_softirq_net_rx_concentration",
         );
+        // scx_layered util-compensation scale: per-CPU first->last cpustat delta
+        // -> clamped scale -> mean across CPUs (avg_cpu_util_comp_scale). Over
+        // the same per_cpu_time freezes as the spatial axes above, but a Gauge
+        // (per-CPU clamp-then-mean), not a spatial-max counter delta.
+        fold_util_comp_scale(&mut metrics, &samples_in_phase, win);
         // Per-cgroup PSI-irq spatial axis: the busiest workload-leaf's IRQ-full
         // stall delta + avg10 gauge + the cross-leaf concentration, over the
         // cgroup_psi freezes (the host cgroup-walk capture). All Peak; auto-fold

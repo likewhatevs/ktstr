@@ -215,6 +215,11 @@ builtin_metrics! {
     // delta; _concentration = max / mean over reporting CPUs. Both Peak.
     MaxCpuSoftirqNetRx => "max_cpu_softirq_net_rx",
     MaxCpuSoftirqNetRxConcentration => "max_cpu_softirq_net_rx_concentration",
+    // scx_layered util-compensation scale: per-CPU first→last cpustat-delta
+    // clamped scale, then mean across CPUs. Gauge(Avg)/LowerBetter; same
+    // per-CPU-delta bucket-fold family as the per-CPU IRQ axis above
+    // (assert::phase_build::fold_util_comp_scale), NOT a read_sample arm.
+    AvgCpuUtilCompScale => "avg_cpu_util_comp_scale",
 
     // Per-cgroup PSI-irq spatial axis (host cgroup-walk capture → per-phase fold):
     // the busiest workload-leaf cgroup dimension. max_cgroup_irq_pressure = the busiest leaf's

@@ -2626,6 +2626,40 @@ pub static METRICS: &[MetricDef] = &[
         accessor: |_| None,
     },
     MetricDef {
+        // Mean ACROSS CPUs of the scx_layered util-compensation SCALE over the
+        // capture window — the factor by which a CPU's useful-work capacity is
+        // scaled up to compensate for IRQ / softirq / stolen time. Per CPU over
+        // the first->last per_cpu_time freeze: scale = delta_total / available,
+        // where delta_total = Σ of ALL 8 kernel_cpustat[] ns deltas
+        // (user+nice+system+idle+iowait+irq+softirq+steal) and available =
+        // delta_total - (irq+softirq+steal); clamped to [1.0, 20.0], and
+        // available == 0 yields the 1.0 floor. Byte-faithful to scx_layered's
+        // util_compensation compute — the ns-vs-µs unit cancels in the ratio
+        // (scx_layered reads /proc microseconds; we read kernel_cpustat ns, the
+        // same slots /proc/stat formats from). 1.0 = no IRQ/steal interference;
+        // higher = more capacity stolen, so LowerBetter. An idle ktstr VM reads
+        // exactly 1.0 — the MEASURED clamp floor (a real Some), NOT loud-absent;
+        // a compensation > 1.0 requires an IRQ/steal-generating workload.
+        // Gauge(Avg): cross-phase folds weighted-mean to run-level, cross-run
+        // means — the typical compensation magnitude. Custom per-CPU-delta fold
+        // in assert::phase_build (fold_util_comp_scale), NOT a read_sample arm: a
+        // per-CPU clamp-then-mean is not expressible as a scalar Counter/Rate.
+        // System-axis mean: scx_layered clamps per-CPU then applies per-LAYER;
+        // ktstr has no layers, so the run-level signal is the mean of the
+        // per-CPU scale distribution. cpustat[CPUTIME_SOFTIRQ] excludes
+        // softirq deferred to ksoftirqd (irqtime_account_irq's
+        // curr != this_cpu_ksoftirqd() guard, kernel/sched/cputime.c) — the same
+        // undercount scx_layered inherits from /proc, so faithful to it; the
+        // scale is a lower bound on true IRQ+softirq pressure.
+        name: "avg_cpu_util_comp_scale",
+        polarity: crate::test_support::Polarity::LowerBetter,
+        kind: MetricKind::Gauge(GaugeAgg::Avg),
+        default_abs: 0.5,
+        default_rel: 0.30,
+        display_unit: "x",
+        accessor: |_| None,
+    },
+    MetricDef {
         // Per-cgroup IRQ-pressure spatial axis: the busiest workload-leaf cgroup's
         // PSI-irq `full` stall DELTA over the phase (decoded µs) — max over the
         // workload-root leaf cgroups of each leaf's (last - first freeze)
