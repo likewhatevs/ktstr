@@ -2021,6 +2021,26 @@ fn spawn_scheduler_for_op(
 pub(super) fn dispatch_attach_scheduler(
     scheduler: &'static crate::test_support::Scheduler,
 ) -> Result<()> {
+    // Precondition: Op::AttachScheduler attaches a sched_ext scheduler,
+    // and the kernel permits only one enabled at a time — `scx_enable`
+    // returns -EBUSY unless `scx_enable_state() == SCX_DISABLED`
+    // (kernel/sched/ext.c). This Op does NOT detach the current scheduler
+    // (see the doc above: callers Detach first to swap), so if one is
+    // already up the spawned child's enable would -EBUSY and
+    // `poll_scx_attached` could read the OLD scheduler's `state ==
+    // enabled` as a false Attached. Mirror the kernel guard and fail fast
+    // + clearly. `None` (no sched_ext sysfs state — boot had a
+    // kernel-builtin scheduler) and `Disabled` (first attach / post-Detach
+    // quiesced) both proceed; `Enabling`/`Enabled`/`Disabling` bail.
+    if let Some(state) = scx_state()
+        && state != ScxState::Disabled
+    {
+        anyhow::bail!(
+            "Op::AttachScheduler requires no sched_ext scheduler currently \
+             enabled (sched_ext state is {state:?}); issue Op::DetachScheduler \
+             first, or use Op::ReplaceScheduler to swap atomically"
+        );
+    }
     // Serialize against any in-flight worker publish BEFORE the
     // dispatcher captures `seqno_before`. The accessor-init worker
     // has a 60 s boot budget for its first publish; if the user's
