@@ -1760,9 +1760,9 @@ mod tests {
         fx.write_u64(FIX_USED_MAPS_PA + 8, map1_kva);
 
         // map0: struct_ops map name (no suffix -> no match).
-        fx.write_name(FIX_MAP0_PA + map_offsets.map_name as u64, b"scx_ktstr_ops");
-        // map1: global-section .bss map (matches -> obj "scx_ktstr").
-        fx.write_name(FIX_MAP1_PA + map_offsets.map_name as u64, b"scx_ktstr.bss");
+        fx.write_name(FIX_MAP0_PA + map_offsets.map_name as u64, b"ktstr_ops");
+        // map1: global-section .bss map (matches -> obj "bpf_bpf").
+        fx.write_name(FIX_MAP1_PA + map_offsets.map_name as u64, b"bpf_bpf.bss");
 
         let result = find_active_struct_ops_obj_no_target(
             &fx.mem(),
@@ -1774,7 +1774,7 @@ mod tests {
             0,
         );
         let m = result.unwrap();
-        assert_eq!(m.obj_name, "scx_ktstr");
+        assert_eq!(m.obj_name, "bpf_bpf");
         assert_eq!(m.used_map_kvas, vec![map0_kva, map1_kva]);
     }
 
@@ -1800,7 +1800,7 @@ mod tests {
         fx.write_u64(FIX_USED_MAPS_PA + 8, fx.pa_to_kva(FIX_MAP1_PA));
 
         // Both maps lack any .bss/.data/.rodata suffix.
-        fx.write_name(FIX_MAP0_PA + map_offsets.map_name as u64, b"scx_ktstr_ops");
+        fx.write_name(FIX_MAP0_PA + map_offsets.map_name as u64, b"ktstr_ops");
         fx.write_name(FIX_MAP1_PA + map_offsets.map_name as u64, b"bpf_runq");
 
         let result = find_active_struct_ops_obj_no_target(
@@ -1882,8 +1882,8 @@ mod tests {
         }
 
         // map0: struct_ops name (no match). map1: .bss (match).
-        fx.write_name(FIX_MAP0_PA + map_offsets.map_name as u64, b"scx_ktstr_ops");
-        fx.write_name(FIX_MAP1_PA + map_offsets.map_name as u64, b"scx_ktstr.bss");
+        fx.write_name(FIX_MAP0_PA + map_offsets.map_name as u64, b"ktstr_ops");
+        fx.write_name(FIX_MAP1_PA + map_offsets.map_name as u64, b"bpf_bpf.bss");
 
         let result = find_active_struct_ops_obj_no_target(
             &fx.mem(),
@@ -1895,7 +1895,7 @@ mod tests {
             0,
         );
         let m = result.unwrap();
-        assert_eq!(m.obj_name, "scx_ktstr");
+        assert_eq!(m.obj_name, "bpf_bpf");
         assert!(m.used_map_kvas.len() <= MAX_USED_MAPS as usize);
         assert_eq!(m.used_map_kvas.len(), 64);
     }
