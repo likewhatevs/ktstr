@@ -463,8 +463,8 @@ fn irq_counter_folds_per_phase_delta_and_rate() {
             ..Default::default()
         }
     };
-    let freeze =
-        |tag: &str, elapsed_ms: u64, c0: PerCpuTimeStats, c1: PerCpuTimeStats| DrainedSnapshotEntry {
+    let freeze = |tag: &str, elapsed_ms: u64, c0: PerCpuTimeStats, c1: PerCpuTimeStats| {
+        DrainedSnapshotEntry {
             tag: tag.to_string(),
             report: FailureDumpReport {
                 per_cpu_time: vec![c0, c1],
@@ -474,7 +474,8 @@ fn irq_counter_folds_per_phase_delta_and_rate() {
             elapsed_ms: Some(elapsed_ms),
             boundary_offset_ms: None,
             step_index: Some(1),
-        };
+        }
+    };
 
     // Two freezes 3_000 ms apart in the SAME stamped step -> one bucket.
     let two = SampleSeries::from_drained_typed(
@@ -508,7 +509,12 @@ fn irq_counter_folds_per_phase_delta_and_rate() {
     // A single freeze in the phase: the Counter delta is unmeasurable from
     // one point -> None (NOT a phantom 0), so no rate is co-derived either.
     let one = SampleSeries::from_drained_typed(
-        vec![freeze("periodic_000", 1_000, cpu(0, 100, 10), cpu(1, 200, 20))],
+        vec![freeze(
+            "periodic_000",
+            1_000,
+            cpu(0, 100, 10),
+            cpu(1, 200, 20),
+        )],
         None,
     );
     let buckets = build_phase_buckets(&one);
@@ -793,7 +799,11 @@ fn max_cpu_hardirqs_skips_cpu_absent_from_an_endpoint() {
         irq_spatial_freeze("periodic_000", 1_000, 1, &[(0, 100), (1, 9999)]),
         irq_spatial_freeze("periodic_001", 4_000, 1, &[(0, 300)]),
     ]);
-    assert_eq!(max, Some(200.0), "only cpu0 (present in both freezes) contributes");
+    assert_eq!(
+        max,
+        Some(200.0),
+        "only cpu0 (present in both freezes) contributes"
+    );
     assert_eq!(conc, None, "1-CPU intersection → concentration omitted");
 }
 
@@ -835,8 +845,15 @@ fn max_cpu_hardirq_concentration_absent_when_no_irqs() {
         irq_spatial_freeze("periodic_000", 1_000, 1, &[(0, 500), (1, 500)]),
         irq_spatial_freeze("periodic_001", 4_000, 1, &[(0, 500), (1, 500)]),
     ]);
-    assert_eq!(max, Some(0.0), "both CPUs' counters didn't advance → measured zero");
-    assert_eq!(conc, None, "mean==0 → concentration absent (no div-by-zero/NaN)");
+    assert_eq!(
+        max,
+        Some(0.0),
+        "both CPUs' counters didn't advance → measured zero"
+    );
+    assert_eq!(
+        conc, None,
+        "mean==0 → concentration absent (no div-by-zero/NaN)"
+    );
 }
 
 /// Run-level: max_cpu_hardirqs auto-folds across phases as a Peak
@@ -1098,12 +1115,14 @@ fn cgroup_psi_freeze_with_serial(
         report: FailureDumpReport {
             cgroup_psi: leaves
                 .iter()
-                .map(|&(cgroup_kva, serial_nr, total_ns, avg10_raw)| CgroupPsiStat {
-                    cgroup_kva,
-                    total_ns,
-                    avg10_raw,
-                    serial_nr,
-                })
+                .map(
+                    |&(cgroup_kva, serial_nr, total_ns, avg10_raw)| CgroupPsiStat {
+                        cgroup_kva,
+                        total_ns,
+                        avg10_raw,
+                        serial_nr,
+                    },
+                )
                 .collect(),
             ..Default::default()
         },
@@ -1142,14 +1161,34 @@ fn cgroup_psi_bucket(
 #[test]
 fn max_cgroup_irq_pressure_happy_path() {
     let (max, conc, avg10) = cgroup_psi_bucket(vec![
-        cgroup_psi_freeze("periodic_000", 1_000, 1, &[(0xA00, 100_000, 2048), (0xB00, 200_000, 4096)]),
-        cgroup_psi_freeze("periodic_001", 4_000, 1, &[(0xA00, 200_000, 6144), (0xB00, 500_000, 8192)]),
+        cgroup_psi_freeze(
+            "periodic_000",
+            1_000,
+            1,
+            &[(0xA00, 100_000, 2048), (0xB00, 200_000, 4096)],
+        ),
+        cgroup_psi_freeze(
+            "periodic_001",
+            4_000,
+            1,
+            &[(0xA00, 200_000, 6144), (0xB00, 500_000, 8192)],
+        ),
     ]);
-    assert_eq!(max, Some(300.0), "busiest leaf's delta decoded to µs (B: (500_000-200_000)/1000)");
+    assert_eq!(
+        max,
+        Some(300.0),
+        "busiest leaf's delta decoded to µs (B: (500_000-200_000)/1000)"
+    );
     let conc = conc.expect("concentration present with 2 reporting leaves");
-    assert!((conc - 1.5).abs() < 1e-9, "300 / mean(100,300)=200 = 1.5; got {conc}");
+    assert!(
+        (conc - 1.5).abs() < 1e-9,
+        "300 / mean(100,300)=200 = 1.5; got {conc}"
+    );
     let avg10 = avg10.expect("avg10 gauge present");
-    assert!((avg10 - 4.0).abs() < 1e-9, "max-across-freezes of max-across-leaves: max(2%,4%)=4; got {avg10}");
+    assert!(
+        (avg10 - 4.0).abs() < 1e-9,
+        "max-across-freezes of max-across-leaves: max(2%,4%)=4; got {avg10}"
+    );
 }
 
 /// Load-bearing: the busiest leaf SHIFTS between freezes — A hot early, B hot
@@ -1160,12 +1199,29 @@ fn max_cgroup_irq_pressure_happy_path() {
 #[test]
 fn max_cgroup_irq_pressure_uses_per_leaf_delta_when_busiest_shifts() {
     let (max, conc, _) = cgroup_psi_bucket(vec![
-        cgroup_psi_freeze("periodic_000", 1_000, 1, &[(0xA00, 100_000, 0), (0xB00, 50_000, 0)]),
-        cgroup_psi_freeze("periodic_001", 4_000, 1, &[(0xA00, 150_000, 0), (0xB00, 400_000, 0)]),
+        cgroup_psi_freeze(
+            "periodic_000",
+            1_000,
+            1,
+            &[(0xA00, 100_000, 0), (0xB00, 50_000, 0)],
+        ),
+        cgroup_psi_freeze(
+            "periodic_001",
+            4_000,
+            1,
+            &[(0xA00, 150_000, 0), (0xB00, 400_000, 0)],
+        ),
     ]);
-    assert_eq!(max, Some(350.0), "max of per-leaf deltas (dB=350µs), NOT max(totals)=400-100=300µs");
+    assert_eq!(
+        max,
+        Some(350.0),
+        "max of per-leaf deltas (dB=350µs), NOT max(totals)=400-100=300µs"
+    );
     let conc = conc.expect("concentration present");
-    assert!((conc - 1.75).abs() < 1e-9, "350 / mean(50,350)=200 = 1.75; got {conc}");
+    assert!(
+        (conc - 1.75).abs() < 1e-9,
+        "350 / mean(50,350)=200 = 1.75; got {conc}"
+    );
 }
 
 /// Endpoints chosen by win() (boundary_offset/elapsed), NOT positional. The
@@ -1176,8 +1232,18 @@ fn max_cgroup_irq_pressure_uses_per_leaf_delta_when_busiest_shifts() {
 #[test]
 fn max_cgroup_irq_pressure_uses_win_ordered_endpoints_not_positional() {
     let (max, _, _) = cgroup_psi_bucket(vec![
-        cgroup_psi_freeze("periodic_000", 4_000, 1, &[(0xA00, 500_000, 0), (0xB00, 300_000, 0)]),
-        cgroup_psi_freeze("periodic_001", 1_000, 1, &[(0xA00, 100_000, 0), (0xB00, 50_000, 0)]),
+        cgroup_psi_freeze(
+            "periodic_000",
+            4_000,
+            1,
+            &[(0xA00, 500_000, 0), (0xB00, 300_000, 0)],
+        ),
+        cgroup_psi_freeze(
+            "periodic_001",
+            1_000,
+            1,
+            &[(0xA00, 100_000, 0), (0xB00, 50_000, 0)],
+        ),
     ]);
     assert_eq!(
         max,
@@ -1193,10 +1259,19 @@ fn max_cgroup_irq_pressure_uses_win_ordered_endpoints_not_positional() {
 #[test]
 fn max_cgroup_irq_pressure_skips_leaf_absent_from_an_endpoint() {
     let (max, conc, _) = cgroup_psi_bucket(vec![
-        cgroup_psi_freeze("periodic_000", 1_000, 1, &[(0xA00, 100_000, 0), (0xB00, 9_999_000, 0)]),
+        cgroup_psi_freeze(
+            "periodic_000",
+            1_000,
+            1,
+            &[(0xA00, 100_000, 0), (0xB00, 9_999_000, 0)],
+        ),
         cgroup_psi_freeze("periodic_001", 4_000, 1, &[(0xA00, 300_000, 0)]),
     ]);
-    assert_eq!(max, Some(200.0), "only A (present in both freezes) contributes");
+    assert_eq!(
+        max,
+        Some(200.0),
+        "only A (present in both freezes) contributes"
+    );
     assert_eq!(conc, None, "1-leaf intersection → concentration omitted");
 }
 
@@ -1216,7 +1291,10 @@ fn max_cgroup_psi_irq_avg10_present_on_single_freeze_while_delta_absent() {
     assert_eq!(max, None, "single freeze → no per-leaf delta measurable");
     assert_eq!(conc, None, "single freeze → no concentration");
     let avg10 = avg10.expect("avg10 is an instantaneous gauge, present on one freeze");
-    assert!((avg10 - 2.0).abs() < 1e-9, "max-across-leaves of the lone freeze: max(1%,2%)=2; got {avg10}");
+    assert!(
+        (avg10 - 2.0).abs() < 1e-9,
+        "max-across-leaves of the lone freeze: max(1%,2%)=2; got {avg10}"
+    );
 }
 
 /// <2-leaf intersection → concentration omitted, max kept: a single-leaf
@@ -1240,11 +1318,28 @@ fn max_cgroup_irq_pressure_concentration_omitted_for_single_leaf() {
 #[test]
 fn max_cgroup_irq_pressure_concentration_absent_when_no_pressure() {
     let (max, conc, _) = cgroup_psi_bucket(vec![
-        cgroup_psi_freeze("periodic_000", 1_000, 1, &[(0xA00, 500_000, 0), (0xB00, 500_000, 0)]),
-        cgroup_psi_freeze("periodic_001", 4_000, 1, &[(0xA00, 500_000, 0), (0xB00, 500_000, 0)]),
+        cgroup_psi_freeze(
+            "periodic_000",
+            1_000,
+            1,
+            &[(0xA00, 500_000, 0), (0xB00, 500_000, 0)],
+        ),
+        cgroup_psi_freeze(
+            "periodic_001",
+            4_000,
+            1,
+            &[(0xA00, 500_000, 0), (0xB00, 500_000, 0)],
+        ),
     ]);
-    assert_eq!(max, Some(0.0), "both leaves' counters didn't advance → measured zero");
-    assert_eq!(conc, None, "mean==0 → concentration absent (no div-by-zero/NaN)");
+    assert_eq!(
+        max,
+        Some(0.0),
+        "both leaves' counters didn't advance → measured zero"
+    );
+    assert_eq!(
+        conc, None,
+        "mean==0 → concentration absent (no div-by-zero/NaN)"
+    );
 }
 
 /// No reporting leaf in any freeze (psi_cgroups off / absent workload root → the
@@ -1276,10 +1371,30 @@ fn cgroup_psi_metrics_run_level_auto_fold_max_across_phases() {
 
     let series = SampleSeries::from_drained_typed(
         vec![
-            cgroup_psi_freeze("periodic_000", 1_000, 1, &[(0xA00, 100_000, 2048), (0xB00, 200_000, 4096)]),
-            cgroup_psi_freeze("periodic_001", 4_000, 1, &[(0xA00, 200_000, 2048), (0xB00, 500_000, 4096)]),
-            cgroup_psi_freeze("periodic_002", 6_000, 2, &[(0xA00, 1_000_000, 10240), (0xB00, 1_000_000, 12288)]),
-            cgroup_psi_freeze("periodic_003", 9_000, 2, &[(0xA00, 1_100_000, 10240), (0xB00, 1_900_000, 12288)]),
+            cgroup_psi_freeze(
+                "periodic_000",
+                1_000,
+                1,
+                &[(0xA00, 100_000, 2048), (0xB00, 200_000, 4096)],
+            ),
+            cgroup_psi_freeze(
+                "periodic_001",
+                4_000,
+                1,
+                &[(0xA00, 200_000, 2048), (0xB00, 500_000, 4096)],
+            ),
+            cgroup_psi_freeze(
+                "periodic_002",
+                6_000,
+                2,
+                &[(0xA00, 1_000_000, 10240), (0xB00, 1_000_000, 12288)],
+            ),
+            cgroup_psi_freeze(
+                "periodic_003",
+                9_000,
+                2,
+                &[(0xA00, 1_100_000, 10240), (0xB00, 1_900_000, 12288)],
+            ),
         ],
         None,
     );
@@ -1637,22 +1752,39 @@ fn aggregate_samples_for_phase_returns_none_on_empty_or_all_nan() {
 /// HigherBetter registry metric added here — read through the same 0.0-sentinel
 /// accessor — fails loudly instead of silently flagging unusually-GOOD scenarios
 /// as outliers and deflating the cohort 2σ baseline with a best-case 0.0.
+///
+/// Each entry carries an explicit `registry_key` (distinct from its display
+/// label — `spread`→`worst_spread`, `migrations`→`total_migrations`, …), so the
+/// guard resolves and polarity-checks all 13 entries, including the 9 typed ones
+/// whose short labels a display-name lookup could not resolve (so they went
+/// unchecked before). Those typed entries read GauntletRow fields directly
+/// (sidecar-zeroed, not the ext 0.0-sentinel), but `find_outliers` flags their
+/// HIGH tail identically, so they too must be LowerBetter.
 #[test]
 fn outlier_metrics_are_lower_better_in_registry() {
-    for (name, _) in OUTLIER_METRICS {
-        // Display names that don't resolve to a registry entry (e.g. the typed
-        // `imbalance`→`imbalance_ratio` rename, or `spread`/`gap_ms` which read
-        // typed GauntletRow fields directly) carry no registry polarity to
-        // check. The guard targets registry-backed entries, which include every
-        // 0.0-sentinel ext entry (all four `worst_*` resolve here).
-        let Some(def) = metric_def(name) else { continue };
+    for (display, registry_key, _) in OUTLIER_METRICS {
+        // Every entry now names its registry key explicitly, so all 13 resolve —
+        // the typed entries via their cross-run `worst_*`/`total_*`/`max_*` names
+        // (which differ from the short display labels `spread`/`migrations`/…)
+        // and the ext entries via their self-named keys. None is skipped, so the
+        // 8 typed entries the display-name lookup previously could not resolve
+        // are now polarity-checked too. A `registry_key` absent from METRICS is
+        // itself a defect (a typo, or a dropped/renamed registry entry), so
+        // resolve-or-panic rather than silently continue.
+        let def = metric_def(registry_key).unwrap_or_else(|| {
+            panic!(
+                "OUTLIER_METRICS entry {display:?} names registry_key {registry_key:?}, \
+                 which is not in the METRICS registry — every outlier metric must map to a \
+                 registry entry whose polarity the guard can verify."
+            )
+        });
         assert!(
             matches!(def.polarity, crate::test_support::Polarity::LowerBetter),
-            "OUTLIER_METRICS entry {name:?} resolves to registry polarity {:?}, but \
-             outlier detection flags HIGH values and reads absent ext values as a 0.0 \
-             best-case sentinel — both require LowerBetter. A HigherBetter metric here \
-             silently corrupts outlier detection; make find_outliers polarity-aware \
-             before adding one.",
+            "OUTLIER_METRICS entry {display:?} (registry_key {registry_key:?}) resolves to \
+             registry polarity {:?}, but outlier detection flags HIGH values and reads \
+             absent ext values as a 0.0 best-case sentinel — both require LowerBetter. A \
+             HigherBetter metric here silently corrupts outlier detection; make \
+             find_outliers polarity-aware before adding one.",
             def.polarity,
         );
     }

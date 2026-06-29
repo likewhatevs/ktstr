@@ -8,23 +8,35 @@ use super::*;
 /// via the `df!` column name.
 pub(crate) type MetricAccessor = fn(&GauntletRow) -> f64;
 
-/// Pinned list of `(display_name, accessor)` for every metric that
-/// outlier detection considers. The display name appears in
+/// Pinned list of `(display_name, registry_key, accessor)` for every
+/// metric that outlier detection considers. `display_name` appears in
 /// [`Outlier`] output verbatim ("scenario: imbalance 4.5 ..."); the
-/// accessor pulls the f64 value off a `GauntletRow`. Mirrors the
-/// `metrics` slice the old polars code keyed off DataFrame column
-/// names, so the outlier set surfaces the same metrics under the same
-/// names.
-pub(crate) const OUTLIER_METRICS: &[(&str, MetricAccessor)] = &[
-    ("spread", |r| r.spread),
-    ("gap_ms", |r| r.gap_ms as f64),
-    ("migrations", |r| r.migrations as f64),
-    ("migration_ratio", |r| r.migration_ratio),
-    ("imbalance", |r| r.imbalance_ratio),
-    ("dsq_depth", |r| r.max_dsq_depth as f64),
-    ("stuck", |r| r.stuck_count),
-    ("fallback", |r| r.fallback_count as f64),
-    ("keep_last", |r| r.keep_last_count as f64),
+/// accessor pulls the f64 value off a `GauntletRow`. `registry_key` is
+/// the `METRICS`-registry entry whose polarity governs this metric — the
+/// `outlier_metrics_are_lower_better_in_registry` guard reads it to
+/// prove every entry is `LowerBetter` (outlier detection flags the HIGH
+/// tail and reads absent ext values as a 0.0 best-case sentinel, so a
+/// `HigherBetter` entry would silently corrupt detection). `registry_key`
+/// is distinct from `display_name` because the typed entries carry short
+/// labels (`spread`, `migrations`, `imbalance`) that do NOT match their
+/// cross-run registry names (`worst_spread`, `total_migrations`,
+/// `max_imbalance_ratio`); each ext entry's label already IS its registry
+/// key. `migration_ratio` resolves to `worst_migration_ratio` (the
+/// cross-run Gauge entry reading `r.migration_ratio`), NOT the PerPhase
+/// `migration_ratio` entry — the typed-field accessor and the cross-run
+/// registry entry must name the same measurement. Mirrors the `metrics`
+/// slice the old polars code keyed off DataFrame column names, so the
+/// outlier set surfaces the same metrics under the same names.
+pub(crate) const OUTLIER_METRICS: &[(&str, &str, MetricAccessor)] = &[
+    ("spread", "worst_spread", |r| r.spread),
+    ("gap_ms", "worst_gap_ms", |r| r.gap_ms as f64),
+    ("migrations", "total_migrations", |r| r.migrations as f64),
+    ("migration_ratio", "worst_migration_ratio", |r| r.migration_ratio),
+    ("imbalance", "max_imbalance_ratio", |r| r.imbalance_ratio),
+    ("dsq_depth", "max_dsq_depth", |r| r.max_dsq_depth as f64),
+    ("stuck", "stuck_count", |r| r.stuck_count),
+    ("fallback", "total_fallback", |r| r.fallback_count as f64),
+    ("keep_last", "total_keep_last", |r| r.keep_last_count as f64),
     // Distribution-kind roll-ups are ext_metrics-sourced (no typed field):
     // read them through the ext map, 0.0 when absent (the prior typed-field
     // default), mirroring the deleted `worst_*` accessors. The 0.0-on-absent
@@ -44,25 +56,25 @@ pub(crate) const OUTLIER_METRICS: &[(&str, MetricAccessor)] = &[
     // metric added here would NOT be benign (a 0.0 would depress the baseline
     // AND could itself read as a low outlier). So the two consumers diverge by
     // design, not by accident.
-    ("worst_p99_wake_latency_us", |r| {
+    ("worst_p99_wake_latency_us", "worst_p99_wake_latency_us", |r| {
         r.ext_metrics
             .get("worst_p99_wake_latency_us")
             .copied()
             .unwrap_or(0.0)
     }),
-    ("worst_wake_latency_cv", |r| {
+    ("worst_wake_latency_cv", "worst_wake_latency_cv", |r| {
         r.ext_metrics
             .get("worst_wake_latency_cv")
             .copied()
             .unwrap_or(0.0)
     }),
-    ("worst_mean_run_delay_us", |r| {
+    ("worst_mean_run_delay_us", "worst_mean_run_delay_us", |r| {
         r.ext_metrics
             .get("worst_mean_run_delay_us")
             .copied()
             .unwrap_or(0.0)
     }),
-    ("worst_run_delay_us", |r| {
+    ("worst_run_delay_us", "worst_run_delay_us", |r| {
         r.ext_metrics
             .get("worst_run_delay_us")
             .copied()
@@ -193,7 +205,10 @@ pub(crate) fn find_outliers(rows: &[GauntletRow]) -> Vec<Outlier> {
     }
 
     let mut outliers = Vec::new();
-    for &(name, accessor) in OUTLIER_METRICS {
+    // `registry_key` governs only the polarity guard
+    // (`outlier_metrics_are_lower_better_in_registry`); detection itself
+    // uses `name` (the display label) and `accessor`.
+    for &(name, _registry_key, accessor) in OUTLIER_METRICS {
         let overall_mean = mean(pass_rows.iter().map(|r| accessor(r)));
         let overall_std = std_dev(pass_rows.iter().map(|r| accessor(r)));
         // Drop metrics with std below epsilon. The cohort produced no
