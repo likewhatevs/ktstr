@@ -188,7 +188,7 @@ fn watch_snapshot_op_drives_register_callback() {
     let steps = vec![Step {
         setup: Vec::<ktstr::scenario::ops::CgroupDef>::new().into(),
         ops: vec![
-            Op::watch_snapshot("bss.scx_ktstr.alloc_count"),
+            Op::watch_snapshot("bss.bpf_bpf.ktstr_alloc_count"),
             Op::watch_snapshot("kernel.jiffies"),
         ],
         hold: HoldSpec::fixed(std::time::Duration::from_millis(1)),
@@ -201,7 +201,7 @@ fn watch_snapshot_op_drives_register_callback() {
     );
     let recorded = attempts.lock().unwrap().clone();
     assert_eq!(recorded.len(), 2);
-    assert_eq!(recorded[0], "bss.scx_ktstr.alloc_count");
+    assert_eq!(recorded[0], "bss.bpf_bpf.ktstr_alloc_count");
     assert_eq!(recorded[1], "kernel.jiffies");
     assert_eq!(bridge_handle.watch_count(), 2);
 }
