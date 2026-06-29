@@ -120,6 +120,7 @@ fn event_counter_sample_sums_across_cpus() {
         ..Default::default()
     };
     let sample = MonitorSample {
+        bpf_map_fields: Vec::new(),
         elapsed_ms: 100,
         cpus: vec![cpu_a, cpu_b],
         prog_stats: None,
@@ -144,6 +145,7 @@ fn event_counter_sample_returns_none_when_no_cpu_has_counters() {
         ..Default::default()
     };
     let sample = MonitorSample {
+        bpf_map_fields: Vec::new(),
         elapsed_ms: 200,
         cpus: vec![cpu],
         prog_stats: None,
@@ -9264,6 +9266,7 @@ fn event_counter_sample_saturates_at_i64_max_across_cpus() {
         ..Default::default()
     };
     let sample = MonitorSample {
+        bpf_map_fields: Vec::new(),
         elapsed_ms: 7,
         cpus: vec![
             CpuSnapshot {

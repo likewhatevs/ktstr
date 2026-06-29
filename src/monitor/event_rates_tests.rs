@@ -17,6 +17,7 @@ fn sample_with_events(
     keep_last: i64,
 ) -> MonitorSample {
     MonitorSample {
+        bpf_map_fields: Vec::new(),
         prog_stats: None,
         psi_irq: None,
         elapsed_ms,
@@ -310,6 +311,7 @@ fn event_deltas_counter_reset_clamps_to_zero() {
 #[test]
 fn event_deltas_all_counters_computed() {
     let make = |elapsed_ms, fb, kl, dsq_off, exit, migdis| MonitorSample {
+        bpf_map_fields: Vec::new(),
         prog_stats: None,
         psi_irq: None,
         elapsed_ms,

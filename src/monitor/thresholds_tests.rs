@@ -106,6 +106,7 @@ fn thresholds_imbalance_below_sustained_passes() {
     let mut samples = Vec::new();
     for i in 0..4 {
         samples.push(MonitorSample {
+            bpf_map_fields: Vec::new(),
             prog_stats: None,
             psi_irq: None,
             elapsed_ms: i * 100,
@@ -151,6 +152,7 @@ fn thresholds_imbalance_at_sustained_fails() {
     let mut samples = Vec::new();
     for i in 0..5u64 {
         samples.push(MonitorSample {
+            bpf_map_fields: Vec::new(),
             prog_stats: None,
             psi_irq: None,
             elapsed_ms: i * 100,
@@ -191,6 +193,7 @@ fn thresholds_dsq_depth_sustained_fails() {
     let mut samples = Vec::new();
     for i in 0..3u64 {
         samples.push(MonitorSample {
+            bpf_map_fields: Vec::new(),
             prog_stats: None,
             psi_irq: None,
             elapsed_ms: i * 100,
@@ -233,6 +236,7 @@ fn thresholds_dsq_depth_below_sustained_passes() {
     let mut samples = Vec::new();
     for i in 0..2u64 {
         samples.push(MonitorSample {
+            bpf_map_fields: Vec::new(),
             prog_stats: None,
             psi_irq: None,
             elapsed_ms: i * 100,
@@ -276,6 +280,7 @@ fn thresholds_stuck_fails() {
     };
     let samples = vec![
         MonitorSample {
+            bpf_map_fields: Vec::new(),
             prog_stats: None,
             psi_irq: None,
             elapsed_ms: 100,
@@ -293,6 +298,7 @@ fn thresholds_stuck_fails() {
             ],
         },
         MonitorSample {
+            bpf_map_fields: Vec::new(),
             prog_stats: None,
             psi_irq: None,
             elapsed_ms: 200,
@@ -339,6 +345,7 @@ fn thresholds_stuck_disabled_passes() {
     };
     let samples = vec![
         MonitorSample {
+            bpf_map_fields: Vec::new(),
             prog_stats: None,
             psi_irq: None,
             elapsed_ms: 100,
@@ -356,6 +363,7 @@ fn thresholds_stuck_disabled_passes() {
             ],
         },
         MonitorSample {
+            bpf_map_fields: Vec::new(),
             prog_stats: None,
             psi_irq: None,
             elapsed_ms: 200,
@@ -399,6 +407,7 @@ fn thresholds_imbalance_interrupted_by_balanced_resets() {
     let mut samples = Vec::new();
     for i in 0..3u64 {
         samples.push(MonitorSample {
+            bpf_map_fields: Vec::new(),
             prog_stats: None,
             psi_irq: None,
             elapsed_ms: i * 100,
@@ -419,6 +428,7 @@ fn thresholds_imbalance_interrupted_by_balanced_resets() {
     samples.push(balanced_sample(300, 2500));
     for i in 4..7u64 {
         samples.push(MonitorSample {
+            bpf_map_fields: Vec::new(),
             prog_stats: None,
             psi_irq: None,
             elapsed_ms: i * 100,
@@ -465,6 +475,7 @@ fn thresholds_multiple_violations() {
     };
     let samples = vec![
         MonitorSample {
+            bpf_map_fields: Vec::new(),
             prog_stats: None,
             psi_irq: None,
             elapsed_ms: 100,
@@ -482,6 +493,7 @@ fn thresholds_multiple_violations() {
             ],
         },
         MonitorSample {
+            bpf_map_fields: Vec::new(),
             prog_stats: None,
             psi_irq: None,
             elapsed_ms: 200,
@@ -499,6 +511,7 @@ fn thresholds_multiple_violations() {
             ],
         },
         MonitorSample {
+            bpf_map_fields: Vec::new(),
             prog_stats: None,
             psi_irq: None,
             elapsed_ms: 300,
@@ -560,12 +573,14 @@ fn thresholds_empty_cpus_samples_pass() {
     let t = MonitorThresholds::default();
     let samples = vec![
         MonitorSample {
+            bpf_map_fields: Vec::new(),
             prog_stats: None,
             psi_irq: None,
             elapsed_ms: 100,
             cpus: vec![],
         },
         MonitorSample {
+            bpf_map_fields: Vec::new(),
             prog_stats: None,
             psi_irq: None,
             elapsed_ms: 200,
@@ -595,6 +610,7 @@ fn thresholds_uninitialized_memory_yields_inconclusive() {
     let garbage_clock = 10314579376562252011u64;
     let samples: Vec<_> = (0..10)
         .map(|i| MonitorSample {
+            bpf_map_fields: Vec::new(),
             prog_stats: None,
             psi_irq: None,
             elapsed_ms: i * 100,
@@ -647,6 +663,7 @@ fn thresholds_all_same_clocks_yields_inconclusive() {
     };
     let samples = vec![
         MonitorSample {
+            bpf_map_fields: Vec::new(),
             prog_stats: None,
             psi_irq: None,
             elapsed_ms: 100,
@@ -664,6 +681,7 @@ fn thresholds_all_same_clocks_yields_inconclusive() {
             ],
         },
         MonitorSample {
+            bpf_map_fields: Vec::new(),
             prog_stats: None,
             psi_irq: None,
             elapsed_ms: 200,
@@ -705,6 +723,7 @@ fn thresholds_dsq_over_plausibility_ceiling_yields_inconclusive() {
     // a silent green light on garbage data.
     let t = MonitorThresholds::default();
     let samples = vec![MonitorSample {
+        bpf_map_fields: Vec::new(),
         prog_stats: None,
         psi_irq: None,
         elapsed_ms: 100,
@@ -750,6 +769,7 @@ fn thresholds_single_cpu_single_sample_valid() {
         ..Default::default()
     };
     let samples = vec![MonitorSample {
+        bpf_map_fields: Vec::new(),
         prog_stats: None,
         psi_irq: None,
         elapsed_ms: 100,
