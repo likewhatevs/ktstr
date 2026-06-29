@@ -221,6 +221,15 @@ builtin_metrics! {
     // (assert::phase_build::fold_util_comp_scale), NOT a read_sample arm.
     AvgCpuUtilCompScale => "avg_cpu_util_comp_scale",
 
+    // scx_lavd per-task latency-criticality (normalized_lat_cri, [0,1024])
+    // host-read from the sdt_alloc arena each freeze, folded over (freeze, task):
+    // mean -> avg_task_lat_cri (Gauge(Avg)), max -> max_task_lat_cri (Peak). Both
+    // Informational; computed in assert::phase_build::fold_lat_cri, NOT a
+    // read_sample arm. lavd-only (loud-absent for schedulers whose arena payload
+    // has no normalized_lat_cri member).
+    AvgTaskLatCri => "avg_task_lat_cri",
+    MaxTaskLatCri => "max_task_lat_cri",
+
     // Per-cgroup PSI-irq spatial axis (host cgroup-walk capture → per-phase fold):
     // the busiest workload-leaf cgroup dimension. max_cgroup_irq_pressure = the busiest leaf's
     // IRQ-full stall delta (µs); _concentration = max / mean over the reporting

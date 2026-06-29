@@ -721,6 +721,60 @@ fn fold_util_comp_scale(
     }
 }
 
+/// Per-phase per-task latency-criticality aggregate from the scheduler's
+/// `sdt_alloc` arena (scx_lavd's `task_ctx.normalized_lat_cri`, `[0, 1024]`).
+/// Over every freeze's `sdt_allocations` walk, pulls each live task_ctx's
+/// `normalized_lat_cri` — a host-rendered arena field (BPF_MAP_TYPE_ARENA), NOT
+/// a kernel counter and NOT a BPF `.bss` field — and folds across (freeze,
+/// task): mean -> `avg_task_lat_cri`, max -> `max_task_lat_cri`.
+///
+/// A GAUGE: `normalized_lat_cri` is an instantaneous per-task value lavd
+/// recomputes each schedule (scx_lavd `lat_cri.bpf.c`), so the fold is over ALL
+/// samples (mean / max over every (freeze, task) observation), NOT a first/last
+/// delta like the cpustat folds. `normalized` (not raw `lat_cri`) for cross-run
+/// comparability — raw `lat_cri` is squared + waker/wakee-propagated +
+/// load-dependent, so its magnitude is not comparable across runs.
+///
+/// Loud-absent + scheduler-agnostic by construction: a non-lavd payload has no
+/// `normalized_lat_cri` member, so [`crate::monitor::btf_render::RenderedValue::get`]
+/// returns `None` and the entry is skipped; if no entry yields the field, no key
+/// is inserted (the "no key when absent" discipline the sibling folds use). The
+/// member name is the only gate (lavd-unique) — no scheduler-name hardcoding.
+fn fold_lat_cri(
+    metrics: &mut std::collections::BTreeMap<String, f64>,
+    samples_in_phase: &[crate::scenario::sample::Sample<'_>],
+) {
+    let mut sum = 0.0f64;
+    let mut count = 0usize;
+    let mut max = f64::MIN;
+    for s in samples_in_phase {
+        for alloc in &s.snapshot.report().sdt_allocations {
+            for entry in &alloc.entries {
+                if let Some(v) = entry
+                    .payload
+                    .get("normalized_lat_cri")
+                    .and_then(|r| r.as_u64())
+                {
+                    let v = v as f64;
+                    sum += v;
+                    count += 1;
+                    if v > max {
+                        max = v;
+                    }
+                }
+            }
+        }
+    }
+    if count > 0 {
+        metrics
+            .entry("avg_task_lat_cri".to_string())
+            .or_insert(sum / count as f64);
+        metrics
+            .entry("max_task_lat_cri".to_string())
+            .or_insert(max);
+    }
+}
+
 /// Per-phase per-CGROUP spatial axis over the workload-leaf PSI-irq captured at
 /// each freeze (`Snapshot::cgroup_psi`). The per-cgroup analog of
 /// [`fold_per_cpu_spatial_max`], producing three Peak metrics:
@@ -953,6 +1007,11 @@ fn buckets_from_grouped(
         // the same per_cpu_time freezes as the spatial axes above, but a Gauge
         // (per-CPU clamp-then-mean), not a spatial-max counter delta.
         fold_util_comp_scale(&mut metrics, &samples_in_phase, win);
+        // scx_lavd per-task latency-criticality: mean/max of each live task_ctx's
+        // normalized_lat_cri ([0,1024]) over the sdt_alloc arena walk at every
+        // freeze (avg_task_lat_cri / max_task_lat_cri). A gauge folded over all
+        // (freeze, task) observations; loud-absent for non-lavd schedulers.
+        fold_lat_cri(&mut metrics, &samples_in_phase);
         // Per-cgroup PSI-irq spatial axis: the busiest workload-leaf's IRQ-full
         // stall delta + avg10 gauge + the cross-leaf concentration, over the
         // cgroup_psi freezes (the host cgroup-walk capture). All Peak; auto-fold

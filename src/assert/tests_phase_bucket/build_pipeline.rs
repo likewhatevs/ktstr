@@ -1146,3 +1146,127 @@ fn build_phase_buckets_injects_avg_cpu_util_comp_scale_mean_across_cpus() {
         "mean of per-CPU scales (2.0, 4.0) = 3.0, got {got:?}"
     );
 }
+
+// ---------- avg_task_lat_cri / max_task_lat_cri (scx_lavd per-task lat_cri) ----
+
+/// Build an sdt_alloc snapshot entry whose BTF-rendered payload carries a
+/// `normalized_lat_cri` u16 member (the scx_lavd task_ctx field), so the
+/// `fold_lat_cri` arena walk extracts it via `RenderedValue::get`.
+fn lat_cri_entry(value: u64) -> crate::monitor::sdt_alloc::SdtAllocEntry {
+    use crate::monitor::btf_render::{RenderedMember, RenderedValue};
+    crate::monitor::sdt_alloc::SdtAllocEntry {
+        idx: 0,
+        genn: 0,
+        user_addr: 0,
+        payload: RenderedValue::Struct {
+            type_name: Some("task_ctx".to_string()),
+            members: vec![RenderedMember {
+                name: "normalized_lat_cri".to_string(),
+                value: RenderedValue::Uint { bits: 16, value },
+            }],
+        },
+    }
+}
+
+/// End-to-end through `build_phase_buckets`: two per-phase freezes each carrying
+/// an sdt_alloc snapshot with per-task `normalized_lat_cri` values, asserts
+/// `fold_lat_cri` injects `avg_task_lat_cri` (mean over (freeze, task)) +
+/// `max_task_lat_cri` (max). Freeze 1: [100, 200]; freeze 2: [300, 400] ->
+/// mean (100+200+300+400)/4 = 250, max 400. Pins the gauge fold across ALL
+/// samples (not first/last) and the cross-(freeze, task) mean+max.
+#[test]
+fn build_phase_buckets_injects_task_lat_cri_mean_and_max() {
+    use crate::monitor::dump::{FailureDumpReport, SCHEMA_SINGLE};
+    use crate::monitor::sdt_alloc::SdtAllocatorSnapshot;
+
+    fn entry(tag: &str, elapsed_ms: u64, lat_cris: &[u64]) -> DrainedSnapshotEntry {
+        let alloc = SdtAllocatorSnapshot {
+            allocator_name: "scx_task_allocator".to_string(),
+            entries: lat_cris.iter().map(|&v| lat_cri_entry(v)).collect(),
+            ..Default::default()
+        };
+        DrainedSnapshotEntry {
+            tag: tag.to_string(),
+            report: FailureDumpReport {
+                schema: SCHEMA_SINGLE.to_string(),
+                sdt_allocations: vec![alloc],
+                ..Default::default()
+            },
+            stats: Err(MissingStatsReason::NoSchedulerBinary),
+            elapsed_ms: Some(elapsed_ms),
+            boundary_offset_ms: None,
+            step_index: Some(1),
+        }
+    }
+    let drained = vec![
+        entry("periodic_000", 100, &[100, 200]),
+        entry("periodic_001", 200, &[300, 400]),
+    ];
+    let samples = SampleSeries::from_drained_typed(drained, None);
+    let phases = crate::assert::build_phase_buckets(&samples);
+    let step0 = phases
+        .iter()
+        .find(|p| p.step_index == 1)
+        .expect("Step[0] bucket present");
+    assert_eq!(
+        step0.metrics.get("avg_task_lat_cri").copied(),
+        Some(250.0),
+        "mean of (100,200,300,400) over (freeze, task) = 250"
+    );
+    assert_eq!(
+        step0.metrics.get("max_task_lat_cri").copied(),
+        Some(400.0),
+        "max over (freeze, task) = 400"
+    );
+}
+
+/// Loud-absent: an arena payload WITHOUT a `normalized_lat_cri` member (a
+/// non-lavd scheduler's task_ctx) yields NO lat_cri key — `RenderedValue::get`
+/// returns None, the fold inserts nothing. Pins the member-name-only gate (no
+/// scheduler-name hardcoding) and the absent-vs-zero distinction.
+#[test]
+fn build_phase_buckets_lat_cri_absent_for_non_lavd_payload() {
+    use crate::monitor::btf_render::{RenderedMember, RenderedValue};
+    use crate::monitor::dump::{FailureDumpReport, SCHEMA_SINGLE};
+    use crate::monitor::sdt_alloc::{SdtAllocEntry, SdtAllocatorSnapshot};
+
+    let alloc = SdtAllocatorSnapshot {
+        allocator_name: "scx_task_allocator".to_string(),
+        entries: vec![SdtAllocEntry {
+            idx: 0,
+            genn: 0,
+            user_addr: 0,
+            payload: RenderedValue::Struct {
+                type_name: Some("other_taskc".to_string()),
+                members: vec![RenderedMember {
+                    name: "some_other_field".to_string(),
+                    value: RenderedValue::Uint { bits: 32, value: 7 },
+                }],
+            },
+        }],
+        ..Default::default()
+    };
+    let drained = vec![DrainedSnapshotEntry {
+        tag: "periodic_000".to_string(),
+        report: FailureDumpReport {
+            schema: SCHEMA_SINGLE.to_string(),
+            sdt_allocations: vec![alloc],
+            ..Default::default()
+        },
+        stats: Err(MissingStatsReason::NoSchedulerBinary),
+        elapsed_ms: Some(100),
+        boundary_offset_ms: None,
+        step_index: Some(1),
+    }];
+    let samples = SampleSeries::from_drained_typed(drained, None);
+    let phases = crate::assert::build_phase_buckets(&samples);
+    let step0 = phases
+        .iter()
+        .find(|p| p.step_index == 1)
+        .expect("Step[0] bucket present");
+    assert!(
+        !step0.metrics.contains_key("avg_task_lat_cri"),
+        "non-lavd payload (no normalized_lat_cri member) must not emit the key"
+    );
+    assert!(!step0.metrics.contains_key("max_task_lat_cri"));
+}

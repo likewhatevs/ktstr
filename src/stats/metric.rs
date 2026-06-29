@@ -2660,6 +2660,48 @@ pub static METRICS: &[MetricDef] = &[
         accessor: |_| None,
     },
     MetricDef {
+        // Mean across (freeze, live task) of scx_lavd's per-task
+        // normalized_lat_cri (task_ctx.normalized_lat_cri, [0,1024]) — the
+        // scheduler's latency-criticality score, host-read from the sdt_alloc
+        // arena (BPF_MAP_TYPE_ARENA) each freeze and BTF-rendered, NOT a kernel
+        // counter and NOT a BPF .bss field. A GAUGE (an instantaneous per-task
+        // value lavd recomputes each schedule, scx_lavd lat_cri.bpf.c: lat_cri is
+        // squared then waker/wakee-propagated, normalized to [0,1024]), so folded
+        // as a mean over every (freeze, task) observation. Informational: a
+        // scheduler-internal decision signal with no good/bad direction.
+        // normalized (not raw lat_cri) for cross-run comparability — raw lat_cri
+        // is squared + propagated + load-dependent. Custom per-task fold in
+        // assert::phase_build (fold_lat_cri), NOT a read_sample arm. Distinct from
+        // lavd's own .bss sys_stat.avg_lat_cri EWMA over SCHEDULED tasks (surfaced
+        // via watch_bpf_map as the scx_lavd_avg_lat_cri key) — this is an
+        // instantaneous host walk over ALL live task_ctx, INCLUDING not-yet-scored
+        // slots that render 0, so the mean is population-sensitive to task-alloc
+        // churn. Loud-absent for non-lavd schedulers (the rendered payload has no
+        // such member).
+        name: "avg_task_lat_cri",
+        polarity: crate::test_support::Polarity::Informational,
+        kind: MetricKind::Gauge(GaugeAgg::Avg),
+        default_abs: 50.0,
+        default_rel: 0.30,
+        display_unit: "",
+        accessor: |_| None,
+    },
+    MetricDef {
+        // Max across (freeze, live task) of scx_lavd's per-task
+        // normalized_lat_cri ([0,1024]) — the worst-case latency-criticality
+        // observed over the phase. Peak (spatial+temporal max of an instantaneous
+        // gauge, no delta). Informational. Same host sdt_alloc-arena source +
+        // per-task fold (fold_lat_cri) + normalized rationale + loud-absent as
+        // avg_task_lat_cri.
+        name: "max_task_lat_cri",
+        polarity: crate::test_support::Polarity::Informational,
+        kind: MetricKind::Peak,
+        default_abs: 100.0,
+        default_rel: 0.30,
+        display_unit: "",
+        accessor: |_| None,
+    },
+    MetricDef {
         // Per-cgroup IRQ-pressure spatial axis: the busiest workload-leaf cgroup's
         // PSI-irq `full` stall DELTA over the phase (decoded µs) — max over the
         // workload-root leaf cgroups of each leaf's (last - first freeze)
