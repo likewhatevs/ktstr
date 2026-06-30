@@ -156,10 +156,13 @@ mod scheduler;
 ///     `host_only` skips the VM boot that owns the device lifecycle,
 ///     so a `disk` attached under `host_only` would never bind;
 ///     `KtstrTestEntry::validate` rejects the pairing at runtime.
-///   - `network = PATH` — path to a `const NetConfig` attaching a
-///     virtio-net device (in-VMM loopback backend). Construct via
-///     `NetConfig::DEFAULT.mac(...)` or `NetConfig::DEFAULT` (const-fn
-///     chain). Maps onto `KtstrTestEntry::network`. Default: `None`
+///   - `networks = [PATH, ...]` — array of `const NetConfig` paths, one
+///     virtio-net device per element (in-VMM loopback backend). On x86_64
+///     each lands on its own virtio-pci function (PCI slots 1..=N, one INTx
+///     GSI apiece); aarch64 takes a single virtio-MMIO NIC (build() errors
+///     on more than one). Construct
+///     each via `NetConfig::DEFAULT.mac(...)` or `NetConfig::DEFAULT`
+///     (const-fn chain). Maps onto `KtstrTestEntry::networks`. Default: `[]`
 ///     (no NIC). Like `disk`, mutually exclusive with `host_only`.
 ///   - `config = EXPR` — inline scheduler config content, written
 ///     into the guest at the path declared by the scheduler's
@@ -553,9 +556,9 @@ mod tests {
             overlap.is_empty(),
             "BOOL_ATTR_NAMES and VALUE_ATTR_NAMES overlap: {overlap:?}",
         );
-        // Cardinality pin: 15 bool + 48 value = 63 accepted attributes.
-        assert_eq!(bool_names.len(), 15, "bool attribute count changed");
-        assert_eq!(value_names.len(), 48, "value attribute count changed");
+        // Cardinality pin: 16 bool + 49 value = 65 accepted attributes.
+        assert_eq!(bool_names.len(), 16, "bool attribute count changed");
+        assert_eq!(value_names.len(), 49, "value attribute count changed");
     }
 
     /// Contract pin: `ktstr_test::AttrValues::default()` is the single source of
@@ -599,7 +602,7 @@ mod tests {
         assert!(d.post_vm.is_none());
         assert!(d.post_vm_unconditional.is_none());
         assert!(d.disk.is_none());
-        assert!(d.network.is_none());
+        assert!(d.networks.is_none());
 
         // -- Assert overrides --
         assert_eq!(d.not_starved, None);

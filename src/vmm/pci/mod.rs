@@ -32,9 +32,9 @@
 //! The ECAM window base/size, the ACPI MCFG/DSDT emission (x86_64) and the FDT
 //! `pci` node (aarch64) are arch-specific and live under `x86_64`/`aarch64`;
 //! this module takes the ECAM base as a constructor parameter so it stays
-//! arch-neutral. The host bridge occupies slot 0; a virtio-net function
-//! (with a memory BAR, INTx) attaches at slot 1. Per-queue MSI-X and
-//! additional NIC functions are subsequent increments.
+//! arch-neutral. The host bridge occupies slot 0; one virtio-net function
+//! (each with a memory BAR, INTx) attaches per configured NIC at slots
+//! 1..N. Per-queue MSI-X is a subsequent increment.
 //!
 //! Hostile-guest defense: every config access is bounds-checked. An access to
 //! an absent bus/device/function, or one that would read past the 4 KiB
@@ -327,9 +327,9 @@ impl PciBus {
     /// A slot-0 or out-of-range install is dropped — a debug assertion catches
     /// the caller bug in tests, and a `tracing::error!` makes the drop loud in
     /// release so a NIC silently failing to enumerate (no eth0) is diagnosable
-    /// rather than a mystery. The sole caller passes a compile-time-constant
-    /// slot today; this guards the multi-NIC increment where the slot
-    /// becomes dynamic.
+    /// rather than a mystery. Setup installs one function per configured NIC
+    /// at a per-NIC slot from `kvm::virtio_net_pci_slot(index)`, so the slot
+    /// is dynamic (one call per NIC, slots 1..N).
     pub(crate) fn add_function(&mut self, slot: usize, func: Box<dyn PciFunction>) {
         debug_assert!(
             slot != 0 && slot < MAX_DEVICES,

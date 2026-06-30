@@ -492,6 +492,56 @@ mod tests {
     }
 
     #[test]
+    fn prt_emits_one_entry_per_route() {
+        // Multi-NIC: N (slot, gsi) routes encode N distinct 4-element routing
+        // packages. The pairs mirror the real per-NIC allocation in kvm.rs —
+        // slot 1+i, GSI 7+i skipping the SCI (9) — to prove the encoder lays
+        // each NIC's slot/GSI down verbatim rather than reusing one route.
+        let routes = [(1u32, 7u32), (2, 8), (3, 10)];
+        let body = pci_host_bridge_dsdt_body(
+            0xE000_0000,
+            0x10_0000,
+            0xE010_0000,
+            0xFEBF_FFFF,
+            &routes,
+        );
+        let contains = |needle: &[u8]| body.windows(needle.len()).any(|w| w == needle);
+        for &(slot, gsi) in &routes {
+            let entry = [
+                0x12, // PackageOp (inner routing package)
+                0x0B, // PkgLength (content 10 bytes)
+                0x04, // NumElements = 4
+                0x0C, // Address: DWord prefix
+                0xFF,
+                0xFF,
+                slot as u8, // high word low byte = slot
+                0x00,       // high word high byte
+                0x00,       // Pin = INTA#
+                0x00,       // Source = static GSI routing
+                0x0A,       // SourceIndex: Byte prefix
+                gsi as u8,  // GSI
+            ];
+            assert!(contains(&entry), "_PRT entry for slot {slot} GSI {gsi}");
+        }
+        // The outer _PRT package declares exactly NumElements = 3: the byte
+        // immediately after the _PRT NameSeg + PackageOp + PkgLength is 0x03.
+        let prt_pos = body
+            .windows(4)
+            .position(|w| w == b"_PRT")
+            .expect("_PRT present");
+        assert_eq!(
+            body[prt_pos + 4],
+            0x12,
+            "_PRT value is a Package (PackageOp follows the NameSeg)"
+        );
+        assert_eq!(
+            body[prt_pos + 6],
+            0x03,
+            "_PRT package holds one entry per NIC (NumElements = 3)"
+        );
+    }
+
+    #[test]
     fn package_num_elements_and_pkglen() {
         // Package of two Ones: PackageOp, PkgLength, NumElements=2, 0x01,
         // 0x01. Content after PkgLength = 1 (numelem) + 2 (two OneOps) = 3.

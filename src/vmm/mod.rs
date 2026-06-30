@@ -446,11 +446,13 @@ pub struct KtstrVm {
     /// [`Self::template_staging_image`] so it can format a
     /// host-staged image without re-entering its own cache.
     pub(crate) disks: Vec<disk_config::DiskConfig>,
-    /// Optional network device. `None` skips virtio-net entirely:
-    /// no FDT node, no MMIO range, no IRQ. `Some(_)` attaches one
-    /// virtio-net device whose backend is the in-VMM loopback (TX
-    /// bytes echoed back into RX). v0 supports a single device.
-    pub(crate) network: Option<net_config::NetConfig>,
+    /// Network devices. Empty skips virtio-net entirely (no NIC function /
+    /// FDT node, no IRQ). Each entry attaches one virtio-net device whose
+    /// backend is the in-VMM loopback (TX bytes echoed back into RX). On
+    /// x86_64 each is a virtio-pci function on its own slot/GSI
+    /// (`kvm::virtio_net_pci_slot` / `kvm::virtio_net_gsi`, bounded by
+    /// `kvm::MAX_VIRTIO_NICS`); aarch64 supports a single virtio-MMIO NIC.
+    pub(crate) networks: Vec<net_config::NetConfig>,
     /// Internal-only override for `init_virtio_blk`'s per-test
     /// backing-file allocation. `Some(path)` makes the device open
     /// `path` directly instead of allocating a fresh `tempfile()`
@@ -1117,19 +1119,26 @@ impl KtstrVm {
         #[cfg(target_arch = "x86_64")]
         let virtio_net: Option<Arc<PiMutex<virtio_net::VirtioNet>>> = None;
         #[cfg(target_arch = "x86_64")]
-        let _net_resample_evt = match pci_bus_handle.as_ref() {
-            Some(bus) => self.init_virtio_net_pci(&vm, bus)?.and_then(|h| h.resample_evt),
+        let _net_resample_evts: Vec<_> = match pci_bus_handle.as_ref() {
+            // One resample eventfd per NIC (Some only on the full-irqchip path);
+            // all are held alive for the shell run so KVM can de-assert each
+            // level GSI on guest EOI. Shell mode discards the counters.
+            Some(bus) => self
+                .init_virtio_net_pci(&vm, bus)?
+                .into_iter()
+                .map(|h| h.resample_evt)
+                .collect(),
             // No PCI bus => no NIC. The builder forces pci_enabled=true whenever
             // a NetConfig is attached on x86_64, so this arm is only reached with
-            // no network; assert that loudly so a future refactor decoupling
-            // network from pci_enabled cannot silently drop the NIC (no eth0).
+            // no networks; assert that loudly so a future refactor decoupling
+            // networks from pci_enabled cannot silently drop NICs (no eth0).
             None => {
                 debug_assert!(
-                    self.network.is_none(),
-                    "x86_64 NetConfig attached but no PCI bus — NIC would be \
+                    self.networks.is_empty(),
+                    "x86_64 NetConfig(s) attached but no PCI bus — NICs would be \
                      silently dropped; pci_enabled must follow network()"
                 );
-                None
+                Vec::new()
             }
         };
         #[cfg(not(target_arch = "x86_64"))]

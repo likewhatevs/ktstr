@@ -107,22 +107,41 @@ pub(crate) const VIRTIO_CONSOLE_IRQ: u32 = 5;
 /// virtio-blk=6.
 pub(crate) const VIRTIO_BLK_IRQ: u32 = 6;
 
-/// GSI for virtio-net. Routed via the in-kernel IOAPIC (<=254 max APIC ID) or
-/// the userspace IOAPIC (split-irqchip, >254 max APIC ID); well within the
-/// IOAPIC's 24-line cap. On x86 the NIC is a virtio-pci function delivering
-/// legacy INTx on this GSI (level, active-low); the DSDT `_PRT` routes
-/// `(VIRTIO_NET_PCI_SLOT, INTA#)` here. The PCI device GSIs (console=5/blk=6/
-/// net=7) deliberately get NO MADT Interrupt Source Override: an ISO overrides
-/// only the ISA-bus IRQ->GSI identity/polarity defaults, and these are PCI
-/// lines whose level/active-low polarity the guest programs from `_PRT` via
-/// acpi_pci_irq_enable (the lone MADT ISO is IRQ0->GSI2 for the PIT).
-pub(crate) const VIRTIO_NET_IRQ: u32 = 7;
+/// Maximum number of virtio-net NICs on the PCI bus (x86_64). Bounded by the
+/// IOAPIC's 24-line budget: each NIC needs one INTx GSI disjoint from the
+/// reserved lines (PIT GSI2, COM2=3, COM1=4, virtio-console=5, virtio-blk=6,
+/// SCI=9), leaving 7,8,10..=23 = 16 usable. Per-queue MSI-X lifts this
+/// cap later. The builder rejects more than this many `.network()` calls.
+pub(crate) const MAX_VIRTIO_NICS: usize = 16;
 
-/// PCI device slot (bus 0) for the single v0 virtio-net function: slot 0
-/// is the host bridge, the NIC takes slot 1. One source of truth shared by
-/// the install site (`PciBus::add_function`) and the DSDT `_PRT` route, so
-/// the routed slot always matches the installed slot.
-pub(crate) const VIRTIO_NET_PCI_SLOT: usize = 1;
+/// PCI slot (bus 0) for virtio-net NIC `index` (0-based): slot 0 is the host
+/// bridge, NICs take slots 1..=MAX_VIRTIO_NICS. One source of truth shared by
+/// the install site (`PciBus::add_function`) and the DSDT `_PRT` route, so the
+/// routed slot always matches the installed slot.
+pub(crate) const fn virtio_net_pci_slot(index: usize) -> usize {
+    1 + index
+}
+
+/// INTx GSI for virtio-net NIC `index` (0-based). Routed via the in-kernel
+/// IOAPIC (<=254 max APIC ID) or the userspace IOAPIC (split-irqchip, >254 max
+/// APIC ID). Allocated from 7 upward, SKIPPING the SCI GSI ([`ACPI_SCI_IRQ`]=9,
+/// which the guest programs at acpi_enable), so the NIC lines stay disjoint from
+/// COM2=3/COM1=4/console=5/blk=6/SCI=9: index 0->7, 1->8, 2->10, ... 15->23 (the
+/// IOAPIC's last line). The NIC delivers legacy INTx on this GSI (level,
+/// active-low); the DSDT `_PRT` routes `(virtio_net_pci_slot(index), INTA#)`
+/// here. PCI device GSIs deliberately get NO MADT Interrupt Source Override: an
+/// ISO overrides only the ISA-bus IRQ->GSI identity/polarity defaults, and these
+/// are PCI lines whose level/active-low polarity the guest programs from `_PRT`
+/// via acpi_pci_irq_enable (the lone MADT ISO is IRQ0->GSI2 for the PIT).
+pub(crate) const fn virtio_net_gsi(index: usize) -> u32 {
+    let raw = 7 + index as u32;
+    // Skip the SCI line: every GSI at or above it shifts up by one.
+    if raw >= ACPI_SCI_IRQ as u32 {
+        raw + 1
+    } else {
+        raw
+    }
+}
 
 /// GSI the FADT advertises as the ACPI SCI (system control interrupt). The
 /// non-hardware-reduced FADT must name one; ktstr never arms a fixed event or
@@ -135,8 +154,8 @@ pub(crate) const VIRTIO_NET_PCI_SLOT: usize = 1;
 /// for GSI 9 — but the line maps to no device irqfd, so the programmed route
 /// delivers nothing. Named here so its disjointness from the device GSIs is
 /// checkable in one place: serial COM1=4/COM2=3, virtio-MMIO console=5,
-/// virtio-blk [`VIRTIO_BLK_IRQ`]=6, virtio-net [`VIRTIO_NET_IRQ`]=7 — 9
-/// collides with none. If a fixed event or GPE is ever armed, add a MADT ISO
+/// virtio-blk [`VIRTIO_BLK_IRQ`]=6, virtio-net base GSI 7 (`virtio_net_gsi(0)`)
+/// — 9 collides with none. If a fixed event or GPE is ever armed, add a MADT ISO
 /// declaring this GSI level/active-low.
 pub(crate) const ACPI_SCI_IRQ: u16 = 9;
 
@@ -1080,6 +1099,58 @@ impl IoapicHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The per-NIC GSI/slot allocators are the single source of truth the
+    /// whole multi-NIC stack routes through (the install loop in setup, the
+    /// DSDT `_PRT` routes in acpi). Pin their invariants directly so a
+    /// regression — dropping the SCI skip, an off-by-one past the IOAPIC line
+    /// budget, or changing the base — fails here at compile-test time rather
+    /// than silently mis-routing INTx in a booted guest.
+    #[test]
+    fn virtio_net_gsi_slot_allocation_invariants() {
+        let gsis: Vec<u32> = (0..MAX_VIRTIO_NICS).map(virtio_net_gsi).collect();
+
+        // (a) every GSI within the IOAPIC line budget.
+        for (i, &g) in gsis.iter().enumerate() {
+            assert!(
+                u64::from(g) < NUM_IOAPIC_PINS,
+                "virtio_net_gsi({i}) = {g} exceeds the IOAPIC budget ({NUM_IOAPIC_PINS})",
+            );
+        }
+
+        // (b) disjoint from every reserved line: PIT=2, COM2=3, COM1=4,
+        //     virtio-MMIO console=5, virtio-blk=6, ACPI SCI=9.
+        let reserved = [
+            2u32,
+            3,
+            4,
+            VIRTIO_CONSOLE_IRQ,
+            VIRTIO_BLK_IRQ,
+            ACPI_SCI_IRQ as u32,
+        ];
+        for &g in &gsis {
+            assert!(
+                !reserved.contains(&g),
+                "virtio_net_gsi produced {g}, colliding with a reserved line {reserved:?}",
+            );
+        }
+
+        // (c) all distinct and (d) the exact set {7,8,10..=23} = (7..24) minus
+        //     the skipped SCI line.
+        let set: std::collections::BTreeSet<u32> = gsis.iter().copied().collect();
+        assert_eq!(set.len(), gsis.len(), "GSIs must be distinct: {gsis:?}");
+        let mut want: std::collections::BTreeSet<u32> = (7..NUM_IOAPIC_PINS as u32).collect();
+        want.remove(&(ACPI_SCI_IRQ as u32));
+        assert_eq!(set, want, "GSI set must be (7..24) minus the SCI line");
+
+        // (e) slots 0..MAX map to 1..=MAX (slot 0 reserved for the host bridge).
+        let slots: Vec<usize> = (0..MAX_VIRTIO_NICS).map(virtio_net_pci_slot).collect();
+        let want_slots: Vec<usize> = (1..=MAX_VIRTIO_NICS).collect();
+        assert_eq!(
+            slots, want_slots,
+            "slots must be 1..=MAX_VIRTIO_NICS (slot 0 = host bridge)",
+        );
+    }
 
     /// `IoapicHandle` dedups a redundant GSI-routing install (skips the
     /// ioctl when the route set is byte-identical to the last successful

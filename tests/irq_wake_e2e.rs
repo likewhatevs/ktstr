@@ -1,7 +1,7 @@
 //! End-to-end proof that [`WorkType::IrqWake`] wakes a blocked task from
 //! NET_RX **softirq** context inside a VM.
 //!
-//! Boots a small VM with a NIC attached (`network = ...`), direct-spawns a
+//! Boots a small VM with a NIC attached (`networks = [...]`), direct-spawns a
 //! paired `IrqWake` workload through the production [`WorkloadHandle`] pipeline,
 //! and asserts across the run: the receiver was woken + scheduled (its
 //! `wake_latencies_ns` reservoir is non-empty), and the NIC's
@@ -34,7 +34,7 @@ const NET_TEST_IRQ: NetConfig = NetConfig::DEFAULT.mac([0x52, 0x54, 0x00, 0x4e, 
     llcs = 1,
     cores = 2,
     threads = 1,
-    network = NET_TEST_IRQ,
+    networks = [NET_TEST_IRQ],
     no_perf_mode,
     duration_s = 15,
     watchdog_timeout_s = 45
@@ -92,7 +92,7 @@ fn irq_wake_records_softirq_wakes(_ctx: &Ctx) -> Result<AssertResult> {
     Ok(AssertResult::pass())
 }
 
-/// With NO NIC attached (no `network = ...`), the guest has only `lo`, so both
+/// With NO NIC attached (no `networks = ...`), the guest has only `lo`, so both
 /// sides of `IrqWake` are a LOUD no-op: the sender finds no interface and the
 /// receiver cannot open its socket — both warn once and report
 /// `work_units == 0` while the dispatch loop still iterates. CI-runnable

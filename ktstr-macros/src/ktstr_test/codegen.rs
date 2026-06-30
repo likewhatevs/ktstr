@@ -54,7 +54,7 @@ pub(super) fn emit_entry_static(input: ItemFn, attrs: AttrValues) -> proc_macro2
         post_vm,
         post_vm_unconditional,
         disk,
-        network,
+        networks,
         not_starved,
         isolation,
         max_gap_ms,
@@ -245,6 +245,15 @@ pub(super) fn emit_entry_static(input: ItemFn, attrs: AttrValues) -> proc_macro2
     let workload_refs: Vec<proc_macro2::TokenStream> =
         workloads_slice.iter().map(|p| quote! { &#p }).collect();
     let workloads_tokens = quote! { &[#(#workload_refs),*] };
+
+    // Emit `&'static [NetConfig]` for networks. Unlike workloads (a slice
+    // of `&Payload`), the entry field stores NetConfig BY VALUE (mirroring
+    // `sysctls: &[Sysctl]`); each user-supplied path is a `const NetConfig`
+    // embedded directly. Empty slice when the attribute is absent.
+    let networks_slice: &[syn::Path] = networks.as_deref().unwrap_or(&[]);
+    let network_vals: Vec<proc_macro2::TokenStream> =
+        networks_slice.iter().map(|p| quote! { #p }).collect();
+    let networks_tokens = quote! { &[#(#network_vals),*] };
 
     // Emit `&'static [&'static Scheduler]` for staged_schedulers.
     // Each user-supplied path is a `const Scheduler`; take `&` on
@@ -469,7 +478,14 @@ pub(super) fn emit_entry_static(input: ItemFn, attrs: AttrValues) -> proc_macro2
     // at emission. The struct is `Clone` so spreading a const ref
     // into a `static` initializer works.
     let disk_field = some_wrapped_entry_field(&disk, quote! { disk });
-    let network_field = some_wrapped_entry_field(&network, quote! { network });
+    // `networks = [PATH, ...]` lands in `KtstrTestEntry::networks`
+    // (`&'static [NetConfig]`). Emit the slice only when the attribute is
+    // present; otherwise DEFAULT's empty slice stands.
+    let networks_field = entry_field(
+        networks.is_some(),
+        quote! { networks },
+        quote! { #networks_tokens },
+    );
 
     // `workload_root_cgroup = "/path"` lands in
     // `KtstrTestEntry::workload_root_cgroup` as
@@ -697,7 +713,7 @@ pub(super) fn emit_entry_static(input: ItemFn, attrs: AttrValues) -> proc_macro2
             #post_vm_unconditional_field
             #config_content_field
             #disk_field
-            #network_field
+            #networks_field
             #workload_root_cgroup_field
             ..::ktstr::test_support::KtstrTestEntry::DEFAULT
         };

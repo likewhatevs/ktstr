@@ -257,17 +257,20 @@ pub struct VmResult {
     #[allow(dead_code)]
     pub virtio_blk_counters: Option<VirtioBlkCountersSnapshot>,
     /// Host-side virtio-net device counters, snapshotted after the
-    /// guest has exited. `Some(_)` when the builder attached a
-    /// network via `super::KtstrVmBuilder::network`; `None` when
-    /// no network was configured and
-    /// `super::KtstrVm::init_virtio_net` returned `None`. The
-    /// device increments its internal `AtomicU64` counters on the
+    /// guest has exited — the cross-NIC AGGREGATE (field-wise
+    /// saturating sum via `VirtioNetCountersSnapshot::aggregate`) over
+    /// every attached NIC. `Some(_)` when the builder attached one or
+    /// more networks via `super::KtstrVmBuilder::network`; `None` when
+    /// no network was configured (the aggregate over an empty NIC set).
+    /// Each NIC's device increments its own `AtomicU64` counters on the
     /// vCPU thread inside `process_tx_loopback`; by the time
     /// `collect_results` constructs the [`VmResult`] every vCPU has
-    /// joined and no further mutation can occur. The snapshot is
-    /// taken at that point — readers see plain `u64` fields holding
-    /// the final cumulative totals; no atomic load is needed on the
-    /// consumer side.
+    /// joined and no further mutation can occur. The per-NIC snapshots
+    /// are summed at that point — readers see plain `u64` fields holding
+    /// the final cumulative totals across all NICs; no atomic load is
+    /// needed on the consumer side. Per-NIC IRQ-delivery observability
+    /// comes from the per-CPU / per-IRQ metrics axis, not these
+    /// device-internal loopback counters.
     ///
     /// The counter struct exposes thirteen `AtomicU64` fields, each
     /// bumped across the TX-drain path rooted at `process_tx_loopback`
@@ -1477,13 +1480,13 @@ pub(crate) struct VmRunState {
     /// loads the final cumulative state into a plain-u64 snapshot
     /// before storing on the public `VmResult`.
     pub(crate) virtio_blk_counters: Option<Arc<VirtioBlkCounters>>,
-    /// Cloned counter handle from the net device init (`init_virtio_net` on
-    /// aarch64 / `init_virtio_net_pci` on x86_64, both arch-gated) when a
-    /// network was attached, captured before the device-arc is dropped so
-    /// [`super::KtstrVm::collect_results`] can snapshot it into
-    /// [`VmResult::virtio_net_counters`]. Same Arc-handoff +
-    /// snapshot-at-assignment pattern as `virtio_blk_counters` above.
-    pub(crate) virtio_net_counters: Option<Arc<VirtioNetCounters>>,
+    /// Cloned per-NIC counter handles from the net device init
+    /// (`init_virtio_net` on aarch64 / `init_virtio_net_pci` on x86_64, both
+    /// arch-gated), one per attached NIC, captured before the device arcs are
+    /// dropped so [`super::KtstrVm::collect_results`] can snapshot and aggregate
+    /// them into [`VmResult::virtio_net_counters`] via
+    /// [`VirtioNetCountersSnapshot::aggregate`]. Empty when no NIC is attached.
+    pub(crate) virtio_net_counters: Vec<Arc<VirtioNetCounters>>,
     /// Snapshot bridge owning every report captured during the run.
     /// The freeze coordinator clones this bridge into its closure
     /// state; on every guest-side

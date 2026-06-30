@@ -1017,8 +1017,8 @@ pub(crate) fn build_vm_builder_base(
         builder = builder.disk(disk_cfg);
     }
 
-    if let Some(net_cfg) = entry.network {
-        builder = builder.network(net_cfg);
+    for net_cfg in entry.networks {
+        builder = builder.network(*net_cfg);
     }
 
     builder = builder.num_snapshots(entry.num_snapshots);

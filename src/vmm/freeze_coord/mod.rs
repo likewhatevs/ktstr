@@ -1107,18 +1107,28 @@ impl KtstrVm {
         // Same construction-before-vcpu-takedown rule as virtio-blk.
         #[cfg(target_arch = "x86_64")]
         let virtio_net: Option<Arc<PiMutex<virtio_net::VirtioNet>>> = None;
+        // One (counters, resample_evt) pair per installed NIC. The resample fds
+        // (Some only on the full-irqchip path) are held alive in `_net_resample_evts`
+        // for the run (KVM holds each raw fd to de-assert its level GSI on EOI);
+        // the counters are snapshotted+aggregated into VmResult at collect time.
         #[cfg(target_arch = "x86_64")]
-        let (virtio_net_counters, _net_resample_evt) = match pci_bus_handle.as_ref() {
-            Some(bus) => match self.init_virtio_net_pci(&vm, bus)? {
-                Some(h) => (Some(h.counters), h.resample_evt),
-                None => (None, None),
-            },
-            None => (None, None),
-        };
+        let (virtio_net_counters, _net_resample_evts): (Vec<_>, Vec<_>) =
+            match pci_bus_handle.as_ref() {
+                Some(bus) => self
+                    .init_virtio_net_pci(&vm, bus)?
+                    .into_iter()
+                    .map(|h| (h.counters, h.resample_evt))
+                    .unzip(),
+                None => (Vec::new(), Vec::new()),
+            };
         #[cfg(not(target_arch = "x86_64"))]
         let virtio_net = self.init_virtio_net(&vm)?;
         #[cfg(not(target_arch = "x86_64"))]
-        let virtio_net_counters = virtio_net.as_ref().map(|d| d.lock().counters());
+        let virtio_net_counters: Vec<_> = virtio_net
+            .as_ref()
+            .map(|d| d.lock().counters())
+            .into_iter()
+            .collect();
 
         // Virtio-console for host→guest wake delivery. The setup_memory
         // path always emits the device's MMIO node on the kernel
@@ -12697,7 +12707,9 @@ impl KtstrVm {
             // dumps, watchdog timeouts, and the normal exit path
             // all see fully-up-to-date counters.
             virtio_blk_counters: run.virtio_blk_counters.as_deref().map(|c| c.snapshot()),
-            virtio_net_counters: run.virtio_net_counters.as_deref().map(|c| c.snapshot()),
+            virtio_net_counters: virtio_net::VirtioNetCountersSnapshot::aggregate(
+                run.virtio_net_counters.iter().map(|c| c.snapshot()),
+            ),
             snapshot_bridge: run.snapshot_bridge,
             stats_client,
             periodic_fired: run.periodic_fired,

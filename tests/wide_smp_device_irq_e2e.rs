@@ -24,7 +24,7 @@
 //! virtio-blk proves the routing; the > 255 ext-dest path is device-agnostic
 //! (the same userspace-IOAPIC + KVM_SET_GSI_ROUTING for every virtio device).
 //! The sibling `wide_smp_net_irq_e2e.rs` adds the virtio-net device-type leg
-//! (the `network =` attr + an AF_PACKET payload); the APIC-ID/IRQ-count
+//! (the `networks =` attr + an AF_PACKET payload); the APIC-ID/IRQ-count
 //! scaffolding both share lives in `common/wide_smp_irq.rs`.
 //!
 //! Run: cargo run --bin cargo-ktstr -- ktstr test --kernel ../linux \

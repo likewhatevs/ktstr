@@ -1,7 +1,7 @@
 //! End-to-end proof that [`WorkType::NetTraffic`] drives real virtio-net
 //! interrupts inside a VM.
 //!
-//! Boots a small VM with a NIC attached (`network = ...`), direct-spawns a
+//! Boots a small VM with a NIC attached (`networks = [...]`), direct-spawns a
 //! `NetTraffic` workload through the production [`WorkloadHandle`] pipeline,
 //! and asserts two things across the run: the workers actually sent frames
 //! (`work_units > 0`), and the NIC's `/proc/interrupts` count rose. The
@@ -29,8 +29,8 @@ use std::time::Duration;
 mod wide_smp_irq;
 use wide_smp_irq::{irq_count, pin_irq_to_cpu, virtio_net_iface, virtio_net_irq};
 
-/// virtio-net with a deterministic locally-administered MAC (the `network =`
-/// macro arg needs a const-evaluable path; `NetConfig::DEFAULT.mac(..)` is
+/// virtio-net with a deterministic locally-administered MAC (the `networks =`
+/// macro arg needs const-evaluable paths; `NetConfig::DEFAULT.mac(..)` is
 /// the const-fn chain).
 const NET_TEST: NetConfig = NetConfig::DEFAULT.mac([0x52, 0x54, 0x00, 0x4e, 0x54, 0x01]);
 
@@ -38,7 +38,7 @@ const NET_TEST: NetConfig = NetConfig::DEFAULT.mac([0x52, 0x54, 0x00, 0x4e, 0x54
     llcs = 1,
     cores = 2,
     threads = 1,
-    network = NET_TEST,
+    networks = [NET_TEST],
     no_perf_mode,
     duration_s = 15,
     watchdog_timeout_s = 45
@@ -93,7 +93,7 @@ fn net_traffic_raises_nic_irq_count(_ctx: &Ctx) -> Result<AssertResult> {
     Ok(AssertResult::pass())
 }
 
-/// With NO NIC attached (no `network = ...`), the guest has only `lo`, so
+/// With NO NIC attached (no `networks = ...`), the guest has only `lo`, so
 /// NetTraffic must be a LOUD no-op: the workers find no interface, warn once,
 /// and report `work_units == 0` (the contract the send-path e2e's `sent > 0`
 /// guard and the starvation gate rely on) while the dispatch loop still

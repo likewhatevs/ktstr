@@ -85,12 +85,12 @@ impl crate::test_support::KtstrTestEntry {
                 self.name,
             );
         }
-        if self.host_only && self.network.is_some() {
+        if self.host_only && !self.networks.is_empty() {
             anyhow::bail!(
-                "KtstrTestEntry '{}'.host_only=true with network=Some(..) — \
+                "KtstrTestEntry '{}'.host_only=true with networks=[..] — \
                  host_only skips the VM boot that owns the virtio-net \
-                 device lifecycle, so the NIC would never be attached. \
-                 Drop one of host_only or network.",
+                 device lifecycle, so the NICs would never be attached. \
+                 Drop one of host_only or networks.",
                 self.name,
             );
         }

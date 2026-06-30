@@ -16,9 +16,8 @@ use zerocopy::IntoBytes;
 
 use super::topology::apic_id;
 use crate::vmm::kvm::{
-    ACPI_PM1_CNT_PORT, ACPI_PM1_EVT_PORT, ACPI_PM_TMR_PORT, ACPI_SCI_IRQ, HIMEM_START,
-    PCI_ECAM_BASE, PCI_ECAM_SIZE, PCI_MMIO_BAR_BASE, PCI_MMIO_BAR_SIZE, VIRTIO_NET_IRQ,
-    VIRTIO_NET_PCI_SLOT,
+    virtio_net_gsi, virtio_net_pci_slot, ACPI_PM1_CNT_PORT, ACPI_PM1_EVT_PORT, ACPI_PM_TMR_PORT,
+    ACPI_SCI_IRQ, HIMEM_START, PCI_ECAM_BASE, PCI_ECAM_SIZE, PCI_MMIO_BAR_BASE, PCI_MMIO_BAR_SIZE,
 };
 use crate::vmm::numa_mem::NumaMemoryLayout;
 use crate::vmm::topology::Topology;
@@ -271,6 +270,7 @@ pub fn setup_acpi(
     topo: &Topology,
     numa_layout: &NumaMemoryLayout,
     pci_enabled: bool,
+    nic_count: usize,
 ) -> Result<AcpiLayout> {
     let num_cpus = topo.total_cpus();
 
@@ -309,6 +309,18 @@ pub fn setup_acpi(
          would clobber guest RAM",
     );
 
+    // NIC axis: each virtio-net function takes one INTx GSI from the IOAPIC
+    // line budget (virtio_net_gsi maps 0..MAX_VIRTIO_NICS into {7,8,10..=23}).
+    // setup_acpi is a pub fn, so reject an out-of-range count here (the VM
+    // builder caps it too) rather than emit _PRT routes whose slot/GSI fall
+    // past virtio_net_pci_slot/virtio_net_gsi's valid range.
+    ensure!(
+        nic_count <= crate::vmm::kvm::MAX_VIRTIO_NICS,
+        "nic_count {nic_count} exceeds MAX_VIRTIO_NICS ({}) — the virtio-pci \
+         INTx GSI budget; each NIC needs a distinct IOAPIC line",
+        crate::vmm::kvm::MAX_VIRTIO_NICS,
+    );
+
     // Compute table sizes.
     //
     // DSDT body: when PCI is enabled it carries the _SB.PCI0 host-bridge AML;
@@ -316,17 +328,22 @@ pub fn setup_acpi(
     // pre-PCI table). dsdt_size is derived from the actual body length so the
     // contiguous table placement and the FADT X_DSDT pointer stay correct.
     let dsdt_body: Vec<u8> = if pci_enabled {
+        // One _PRT entry per virtio-net function: NIC i sits at PCI slot
+        // virtio_net_pci_slot(i) and routes INTA# -> virtio_net_gsi(i). Both
+        // are constant-driven (no literals here) so a retune of the slot/GSI
+        // allocator can't drift these routes. nic_count == 0 yields an empty
+        // route list (PCI enabled without a NIC): the DSDT carries the PCI0
+        // host bridge with no _PRT entries, which is correct — there is no
+        // device at any slot to consult.
+        let irq_routes: Vec<(u32, u32)> = (0..nic_count)
+            .map(|i| (virtio_net_pci_slot(i) as u32, virtio_net_gsi(i)))
+            .collect();
         aml::pci_host_bridge_dsdt_body(
             PCI_ECAM_BASE as u32,
             PCI_ECAM_SIZE as u32,
             PCI_MMIO_BAR_BASE as u32,
             (PCI_MMIO_BAR_BASE + PCI_MMIO_BAR_SIZE - 1) as u32,
-            // v0 single virtio-net function at VIRTIO_NET_PCI_SLOT, routing
-            // INTA# -> VIRTIO_NET_IRQ (constant-driven; no literal here so a
-            // retune of the constant can't drift this comment). Harmless when
-            // PCI is enabled without a NIC (the entry is dormant — no device at
-            // the slot to consult).
-            &[(VIRTIO_NET_PCI_SLOT as u32, VIRTIO_NET_IRQ)],
+            &irq_routes,
         )
     } else {
         Vec::new()

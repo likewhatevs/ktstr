@@ -10,7 +10,7 @@ fn test_layout(topo: &Topology, mib: u32) -> NumaMemoryLayout {
 
 fn test_setup(mem: &GuestMemoryMmap, topo: &Topology, mib: u32) -> AcpiLayout {
     let layout = test_layout(topo, mib);
-    setup_acpi(mem, topo, &layout, false).unwrap()
+    setup_acpi(mem, topo, &layout, false, 0).unwrap()
 }
 
 fn read_table(mem: &GuestMemoryMmap, addr: u64) -> Vec<u8> {
@@ -73,7 +73,7 @@ fn acpi_rejects_slit_dominated_overflow_at_extreme_numa() {
     };
     let layout = test_layout(&topo, 512);
     let err =
-        setup_acpi(&mem, &topo, &layout, false).expect_err("512-NUMA SLIT must overflow the ISA hole");
+        setup_acpi(&mem, &topo, &layout, false, 0).expect_err("512-NUMA SLIT must overflow the ISA hole");
     let msg = format!("{err:#}");
     assert!(
         msg.contains("SLIT alone") && msg.contains("ISA hole"),
@@ -98,7 +98,7 @@ fn acpi_rejects_cpu_table_overflow_at_extreme_vcpu_count() {
         distances: None,
     };
     let layout = test_layout(&topo, 256);
-    let err = setup_acpi(&mem, &topo, &layout, false)
+    let err = setup_acpi(&mem, &topo, &layout, false, 0)
         .expect_err("4096-vCPU ACPI CPU tables must overflow the ISA hole");
     let msg = format!("{err:#}");
     assert!(
@@ -122,7 +122,7 @@ fn acpi_rejects_total_overflow_when_slit_alone_fits() {
         distances: None,
     };
     let layout = test_layout(&topo, 361);
-    let err = setup_acpi(&mem, &topo, &layout, false)
+    let err = setup_acpi(&mem, &topo, &layout, false, 0)
         .expect_err("361-NUMA total tables must overflow the ISA hole");
     let msg = format!("{err:#}");
     assert!(
@@ -338,9 +338,14 @@ fn rsdt_table_pointers() {
 /// `setup_acpi` with the PCI transport enabled (MCFG + the `_SB.PCI0` /
 /// `_PRT` DSDT body), the integration path the booted-guest NIC e2es exercise
 /// but no unit test covered (every other `test_setup` runs `pci_enabled=false`).
-fn test_setup_pci(mem: &GuestMemoryMmap, topo: &Topology, mib: u32) -> AcpiLayout {
+fn test_setup_pci(
+    mem: &GuestMemoryMmap,
+    topo: &Topology,
+    mib: u32,
+    nic_count: usize,
+) -> AcpiLayout {
     let layout = test_layout(topo, mib);
-    setup_acpi(mem, topo, &layout, true).unwrap()
+    setup_acpi(mem, topo, &layout, true, nic_count).unwrap()
 }
 
 #[test]
@@ -368,7 +373,7 @@ fn pci_enabled_emits_mcfg_and_prt_dsdt() {
     // PCI-enabled: the DSDT carries the host-bridge AML (with _PRT), and the
     // MCFG (ECAM base) is emitted and linked into RSDT/XSDT.
     let mem = test_mem(16);
-    let l = test_setup_pci(&mem, &topo, 256);
+    let l = test_setup_pci(&mem, &topo, 256, 1);
     assert!(l.dsdt_size > 36, "PCI DSDT carries the host-bridge AML body");
     let dsdt = read_table(&mem, l.dsdt_addr);
     let dsdt_has = |needle: &[u8]| dsdt.windows(needle.len()).any(|w| w == needle);
@@ -420,7 +425,7 @@ fn pci_with_hmat_table_count() {
         nodes: None,
         distances: None,
     };
-    let l = test_setup_pci(&mem, &topo, 256);
+    let l = test_setup_pci(&mem, &topo, 256, 1);
     assert!(l.hmat_size > 0, "HMAT emitted for multi-NUMA");
     assert!(l.mcfg_size > 0, "MCFG emitted for PCI");
     let rsdt = read_table(&mem, l.rsdt_addr);
@@ -435,6 +440,47 @@ fn pci_with_hmat_table_count() {
         l.xsdt_addr + l.xsdt_size <= HIMEM_START,
         "ACPI tables must pack within the ISA hole",
     );
+}
+
+/// setup_acpi with N NICs emits one DSDT `_PRT` routing package per NIC, each
+/// at `(virtio_net_pci_slot(i), virtio_net_gsi(i))`. Decodes the real DSDT
+/// (not the aml encoder in isolation) with the expected (slot, GSI) DERIVED
+/// from the allocator, so the SCI-skip at i>=2 (NIC 2 -> GSI 10, not 9) is
+/// proven to flow allocator -> setup_acpi -> DSDT. nic_count=3 exercises the
+/// skip; the aml `prt_emits_one_entry_per_route` test covers the encoder.
+#[test]
+fn setup_acpi_emits_one_prt_route_per_nic() {
+    use crate::vmm::kvm::{virtio_net_gsi, virtio_net_pci_slot};
+    let topo = Topology {
+        llcs: 1,
+        cores_per_llc: 1,
+        threads_per_core: 1,
+        numa_nodes: 1,
+        nodes: None,
+        distances: None,
+    };
+    let mem = test_mem(16);
+    let l = test_setup_pci(&mem, &topo, 256, 3);
+    let dsdt = read_table(&mem, l.dsdt_addr);
+    let contains = |needle: &[u8]| dsdt.windows(needle.len()).any(|w| w == needle);
+    for i in 0..3usize {
+        let slot = virtio_net_pci_slot(i) as u32;
+        let gsi = virtio_net_gsi(i);
+        // Inner routing package (mirror prt_entry_encoding): Package(4) of
+        // Address DWord (slot<<16)|0xFFFF, Pin Zero, Source Zero, SourceIndex
+        // GSI byte. GSI 7..23 always encodes as a Byte (0x0A prefix).
+        let entry = [
+            0x12, 0x0B, 0x04, // PackageOp, PkgLength, NumElements=4
+            0x0C, 0xFF, 0xFF, slot as u8, 0x00, // Address DWord (slot)
+            0x00, // Pin = INTA#
+            0x00, // Source = static GSI routing
+            0x0A, gsi as u8, // SourceIndex = GSI (Byte)
+        ];
+        assert!(
+            contains(&entry),
+            "DSDT _PRT must route NIC {i} at slot {slot} -> GSI {gsi}",
+        );
+    }
 }
 
 #[test]
@@ -1309,7 +1355,7 @@ fn hmat_emitted_with_cxl() {
     let topo = Topology::with_nodes(4, 1, &CXL_NODES);
     let mem = test_mem(16);
     let layout = NumaMemoryLayout::compute(&topo, 640, 0, None).unwrap();
-    let l = setup_acpi(&mem, &topo, &layout, false).unwrap();
+    let l = setup_acpi(&mem, &topo, &layout, false, 0).unwrap();
     assert!(l.hmat_size > 0, "HMAT must be emitted with CXL nodes");
 }
 
@@ -1318,7 +1364,7 @@ fn hmat_checksum() {
     let topo = Topology::with_nodes(4, 1, &CXL_NODES);
     let mem = test_mem(16);
     let layout = NumaMemoryLayout::compute(&topo, 640, 0, None).unwrap();
-    let l = setup_acpi(&mem, &topo, &layout, false).unwrap();
+    let l = setup_acpi(&mem, &topo, &layout, false, 0).unwrap();
     let hmat = read_table(&mem, l.hmat_addr);
     let sum: u8 = hmat.iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
     assert_eq!(sum, 0, "HMAT checksum must be zero");
@@ -1329,7 +1375,7 @@ fn hmat_header_fields() {
     let topo = Topology::with_nodes(4, 1, &CXL_NODES);
     let mem = test_mem(16);
     let layout = NumaMemoryLayout::compute(&topo, 640, 0, None).unwrap();
-    let l = setup_acpi(&mem, &topo, &layout, false).unwrap();
+    let l = setup_acpi(&mem, &topo, &layout, false, 0).unwrap();
     let hmat = read_table(&mem, l.hmat_addr);
     assert_eq!(&hmat[..4], b"HMAT");
     assert_eq!(hmat[8], 2, "HMAT revision must be 2");
@@ -1345,7 +1391,7 @@ fn hmat_mpda_count_and_flags() {
     let topo = Topology::with_nodes(4, 1, &CXL_NODES);
     let mem = test_mem(16);
     let layout = NumaMemoryLayout::compute(&topo, 640, 0, None).unwrap();
-    let l = setup_acpi(&mem, &topo, &layout, false).unwrap();
+    let l = setup_acpi(&mem, &topo, &layout, false, 0).unwrap();
     let hmat = read_table(&mem, l.hmat_addr);
 
     let num_targets = layout.regions().len();
@@ -1377,7 +1423,7 @@ fn hmat_mpda_cxl_initiator() {
     let topo = Topology::with_nodes(4, 1, &CXL_NODES);
     let mem = test_mem(16);
     let layout = NumaMemoryLayout::compute(&topo, 640, 0, None).unwrap();
-    let l = setup_acpi(&mem, &topo, &layout, false).unwrap();
+    let l = setup_acpi(&mem, &topo, &layout, false, 0).unwrap();
     let hmat = read_table(&mem, l.hmat_addr);
 
     let mut offset = 40;
@@ -1411,7 +1457,7 @@ fn hmat_sllbi_latency_and_bandwidth() {
     let topo = Topology::with_nodes(4, 1, &CXL_NODES);
     let mem = test_mem(16);
     let layout = NumaMemoryLayout::compute(&topo, 640, 0, None).unwrap();
-    let l = setup_acpi(&mem, &topo, &layout, false).unwrap();
+    let l = setup_acpi(&mem, &topo, &layout, false, 0).unwrap();
     let hmat = read_table(&mem, l.hmat_addr);
 
     let num_targets = layout.regions().len();
@@ -1442,7 +1488,7 @@ fn hmat_sllbi_cxl_entries_differ() {
     let topo = Topology::with_nodes(4, 1, &CXL_NODES);
     let mem = test_mem(16);
     let layout = NumaMemoryLayout::compute(&topo, 640, 0, None).unwrap();
-    let l = setup_acpi(&mem, &topo, &layout, false).unwrap();
+    let l = setup_acpi(&mem, &topo, &layout, false, 0).unwrap();
     let hmat = read_table(&mem, l.hmat_addr);
 
     let num_targets = layout.regions().len();
@@ -1475,7 +1521,7 @@ fn hmat_rsdt_xsdt_include_pointer() {
     let topo = Topology::with_nodes(4, 1, &CXL_NODES);
     let mem = test_mem(16);
     let layout = NumaMemoryLayout::compute(&topo, 640, 0, None).unwrap();
-    let l = setup_acpi(&mem, &topo, &layout, false).unwrap();
+    let l = setup_acpi(&mem, &topo, &layout, false, 0).unwrap();
 
     // RSDT should have 5 entries (FADT, MADT, SRAT, SLIT, HMAT).
     let rsdt = read_table(&mem, l.rsdt_addr);

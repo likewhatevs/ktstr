@@ -9,8 +9,9 @@
 //!
 //! v0 backend is in-VMM loopback: TX descriptor bytes are written
 //! directly into RX descriptors and the irqfd fires. There is no host
-//! networking, no `/dev/net/tun`, no AF_PACKET fd. The guest sees a
-//! single virtio-net interface that loops its own TX back to its RX
+//! networking, no `/dev/net/tun`, no AF_PACKET fd. Each attached
+//! virtio-net interface (one per `networks = [..]` element on x86_64,
+//! a single MMIO NIC on aarch64) loops its own TX back to its RX
 //! verbatim — no MAC swap, no ARP synthesis, no IP routing. The byte
 //! flow lives in [`super::virtio_net`] (see `process_tx_loopback` in
 //! the device module). AF_PACKET raw sockets bound to the interface
@@ -39,9 +40,10 @@ impl NetConfig {
     /// Const default — MAC `02:00:00:00:00:01`. The leading `0x02` sets
     /// the locally-administered bit per IEEE 802 (bit 1 of the first
     /// octet), keeping the address out of the IEEE OUI namespace; the
-    /// trailing `0x01` is informational (v0 runs a single device).
-    /// `const` so it can seed a `const NetConfig` for the
-    /// `#[ktstr_test(network = ...)]` attribute, matching
+    /// trailing `0x01` is the conventional first-NIC suffix — multi-NIC
+    /// tests give each element a distinct MAC via [`Self::mac`]. `const`
+    /// so it can seed a `const NetConfig` for the
+    /// `#[ktstr_test(networks = [...])]` attribute, matching
     /// [`super::disk_config::DiskConfig`]'s `DEFAULT`.
     pub const DEFAULT: NetConfig = NetConfig {
         mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],

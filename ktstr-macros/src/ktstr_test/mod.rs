@@ -35,7 +35,7 @@ fn expect_path_value(value: &syn::Expr, error_hint: &str) -> Result<syn::Path, s
 /// `[A, B, C]`. The two diagnostic hints distinguish the array-shape
 /// failure (the whole value is not an array) from the per-element
 /// failure (one entry is not a path). Collapses the `"workloads" |
-/// "staged_schedulers"` parse arms.
+/// "staged_schedulers" | "networks"` parse arms.
 fn expect_array_of_paths(
     value: &syn::Expr,
     array_error_hint: &str,
@@ -341,7 +341,7 @@ pub(crate) const VALUE_ATTR_NAMES: &[&str] = &[
     "post_vm",
     "post_vm_unconditional",
     "disk",
-    "network",
+    "networks",
     "config",
     "expect_scx_bpf_error_contains",
     "expect_scx_bpf_error_matches",
@@ -431,7 +431,7 @@ pub(crate) struct AttrValues {
     pub(crate) post_vm: Option<syn::Path>,
     pub(crate) post_vm_unconditional: Option<syn::Path>,
     pub(crate) disk: Option<syn::Path>,
-    pub(crate) network: Option<syn::Path>,
+    pub(crate) networks: Option<Vec<syn::Path>>,
     // -- Assert overrides (Option<T>) --
     pub(crate) not_starved: Option<bool>,
     pub(crate) isolation: Option<bool>,
@@ -536,7 +536,7 @@ impl Default for AttrValues {
             post_vm: None,
             post_vm_unconditional: None,
             disk: None,
-            network: None,
+            networks: None,
             // Assert overrides
             not_starved: None,
             isolation: None,
@@ -958,8 +958,12 @@ fn validate_cross_attr(attrs: &AttrValues) -> syn::Result<()> {
     // Defense-in-depth coverage matrix (compile-time here +
     // programmatic-construction runtime check in
     // `src/test_support/entry.rs::validate`):
-    //   - host_only + disk         : runtime-only (macro doesn't
-    //                                 expose `disk` attribute)
+    //   - host_only + disk         : runtime-only (validate_host_only_mutex
+    //                                 below gates only scheduler/num_snapshots/
+    //                                 auto_repro, not disk; the conflict is
+    //                                 caught in `entry::validate`)
+    //   - host_only + networks     : runtime-only (same as disk — caught in
+    //                                 `entry::validate`, not compile-time)
     //   - host_only + scheduler    : BOTH (runtime matches against
     //                                 `SchedulerSpec::Eevdf` variant —
     //                                 spec-safe value comparison vs
@@ -1264,13 +1268,14 @@ pub(crate) fn ktstr_test_impl(
                              or similar const-fn chain",
                         )?);
                     }
-                    "network" => {
-                        attrs.network = Some(expect_path_value(
+                    "networks" => {
+                        attrs.networks = Some(expect_array_of_paths(
                             value,
-                            "expected path for network (e.g. MY_NET \
-                             where MY_NET is a `const NetConfig`); \
-                             construct via `NetConfig::DEFAULT.mac(...)` \
-                             or similar const-fn chain",
+                            "expected array of NetConfig paths for networks \
+                             (e.g. [NET_A, NET_B]); each is a `const NetConfig` \
+                             constructed via `NetConfig::DEFAULT.mac(...)` or a \
+                             similar const-fn chain",
+                            "expected NetConfig path in networks array",
                         )?);
                     }
                     "config" => {

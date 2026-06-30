@@ -456,10 +456,9 @@ impl PciFunction for VirtioNetPci {
         // Recomputed from config space on every call (the MMIO dispatch calls
         // this per BAR exit via PciBus::bar_owner). The window is immutable
         // between COMMAND/BAR0 writes, so a per-function cache invalidated on
-        // those writes is the obvious optimization — deliberately deferred to
-        // the multi-NIC increment, where the 32-slot bar_owner scan it sits
-        // behind actually scales; for a single NIC the two reads here are
-        // negligible.
+        // those writes is the obvious optimization, left as a follow-up: even
+        // with multiple NICs installed the per-call recompute is two cheap
+        // config-space reads, dwarfed by the MMIO-exit cost it sits behind.
         // The BAR is live only once the guest enables memory-space decode.
         // Only PCI_COMMAND_MEMORY is consulted, NOT bus-master (bit 2): on real
         // hardware the device cannot DMA until BM is set, but the in-VMM loopback

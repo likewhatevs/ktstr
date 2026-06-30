@@ -84,12 +84,14 @@ pub struct KtstrVmBuilder {
     /// Vec retained for future multi-disk expansion. See
     /// [`super::KtstrVm::disks`].
     disks: Vec<disk_config::DiskConfig>,
-    /// Optional network device. `None` skips virtio-net entirely
-    /// (no FDT node, no MMIO range, no IRQ). `Some(_)` attaches one
-    /// virtio-net device with the given config; the in-VMM loopback
-    /// backend echoes TX bytes back to RX. v0 supports a single
-    /// device. See [`super::KtstrVm::network`].
-    network: Option<net_config::NetConfig>,
+    /// Network devices (appended by `.network()`). Empty skips virtio-net
+    /// entirely (no PCI NIC function / FDT node, no IRQ). Each entry attaches
+    /// one virtio-net device; the in-VMM loopback backend echoes TX bytes back
+    /// to RX. On x86_64 each NIC is a virtio-pci function on its own slot/GSI
+    /// (`kvm::virtio_net_pci_slot` / `kvm::virtio_net_gsi`), bounded by
+    /// `kvm::MAX_VIRTIO_NICS`; aarch64 supports a single MMIO NIC. See
+    /// [`super::KtstrVm::networks`].
+    networks: Vec<net_config::NetConfig>,
     /// Busybox bytes to pack at `bin/busybox`. `None` skips packing
     /// (test-mode VMs do not need shell utilities). `Some(bytes)`
     /// embeds the provided bytes — the library never owns busybox
@@ -253,7 +255,7 @@ impl Default for KtstrVmBuilder {
             sched_disable_cmds: Vec::new(),
             include_files: Vec::new(),
             disks: Vec::new(),
-            network: None,
+            networks: Vec::new(),
             busybox_bytes: None,
             #[cfg(feature = "wprof")]
             wprof: None,
@@ -768,17 +770,19 @@ impl KtstrVmBuilder {
     /// sockets bound by `ifindex` are the path that exercises the
     /// virtio device.
     ///
-    /// v0 supports a single device; calling this method twice
-    /// overwrites the prior `NetConfig`. On x86_64 the NIC attaches as a
-    /// virtio-pci function, so this enables the PCI host bridge
-    /// automatically — the transport is an implementation detail the test
-    /// author does not select. aarch64 keeps the virtio-MMIO NIC
-    /// transport (aarch64 PCI is a later increment), so PCI stays off
-    /// there. Reached via the `#[ktstr_test(network = ...)]` attribute
-    /// (`test_support::runtime::build_vm_builder_base` calls this when the
-    /// entry sets `network`), or directly by raw-library callers.
+    /// APPENDS a NIC; call it once per device. On x86_64 each NIC is a
+    /// virtio-pci function on its own slot/GSI, so the count is bounded by
+    /// `kvm::MAX_VIRTIO_NICS` (enforced at [`Self::build`], which errors on
+    /// overflow rather than silently dropping); aarch64 supports a single MMIO
+    /// NIC (build errors on >1). On x86_64 attaching a NIC enables the PCI host
+    /// bridge automatically — the transport is an implementation detail the
+    /// test author does not select. aarch64 keeps the virtio-MMIO NIC transport
+    /// (aarch64 PCI is a later increment), so PCI stays off there. Reached via
+    /// the `#[ktstr_test(networks = [...])]` attribute
+    /// (`test_support::runtime::build_vm_builder_base` calls this per entry
+    /// NIC), or directly by raw-library callers.
     pub fn network(mut self, network: net_config::NetConfig) -> Self {
-        self.network = Some(network);
+        self.networks.push(network);
         // On x86_64 a NIC is a virtio-pci function and needs the host
         // bridge + ECAM; aarch64 routes the NIC over virtio-MMIO (no PCI
         // yet), so leave pci_enabled untouched there.
@@ -952,6 +956,25 @@ impl KtstrVmBuilder {
         anyhow::ensure!(t.cores_per_llc > 0, "cores_per_llc must be > 0");
         anyhow::ensure!(t.threads_per_core > 0, "threads_per_core must be > 0");
         anyhow::ensure!(t.numa_nodes > 0, "numa_nodes must be > 0");
+        // NIC count is bounded by the transport: x86_64 routes each NIC over a
+        // virtio-pci function on its own INTx GSI, capped by the IOAPIC line
+        // budget ([`kvm::MAX_VIRTIO_NICS`]); aarch64's single virtio-MMIO slot
+        // takes one. Error loudly rather than silently dropping NICs past the
+        // limit (the .network() setter appends unconditionally).
+        #[cfg(target_arch = "x86_64")]
+        anyhow::ensure!(
+            self.networks.len() <= super::kvm::MAX_VIRTIO_NICS,
+            "too many NICs: {} attached, max {} (virtio-pci INTx GSI budget)",
+            self.networks.len(),
+            super::kvm::MAX_VIRTIO_NICS,
+        );
+        #[cfg(not(target_arch = "x86_64"))]
+        anyhow::ensure!(
+            self.networks.len() <= 1,
+            "aarch64 supports a single virtio-MMIO NIC ({} attached); \
+             multi-NIC needs the PCI transport (x86_64)",
+            self.networks.len(),
+        );
         // `memory_mib == Some(0)` would forward a literal `-m 0` to the
         // VMM backend (KVM rejects it at ioctl time with an opaque
         // error). Catch it here with a clear message so the caller
@@ -1040,14 +1063,14 @@ impl KtstrVmBuilder {
             bpf_map_writes: self.bpf_map_writes,
             watch_bpf_maps: self.watch_bpf_maps,
             performance_mode: self.performance_mode,
-            // A NIC is a virtio-pci function on x86_64, so an attached
+            // A NIC is a virtio-pci function on x86_64, so any attached
             // network implies the PCI transport — enforce the invariant at
             // the sole KtstrVm construction point so no assembly path (or a
-            // stray `.pci(false)`) can yield network=Some with
+            // stray `.pci(false)`) can yield a non-empty `networks` with
             // pci_enabled=false, which would emit `pci=off` and skip
-            // installing the NIC. aarch64 keeps the NIC on virtio-MMIO.
+            // installing the NICs. aarch64 keeps the NIC on virtio-MMIO.
             pci_enabled: self.pci_enabled
-                || (cfg!(target_arch = "x86_64") && self.network.is_some()),
+                || (cfg!(target_arch = "x86_64") && !self.networks.is_empty()),
             no_perf_mode,
             pinning_plan,
             mbind_node_map,
@@ -1057,7 +1080,7 @@ impl KtstrVmBuilder {
             sched_disable_cmds: self.sched_disable_cmds,
             include_files: self.include_files,
             disks: self.disks,
-            network: self.network,
+            networks: self.networks,
             busybox_bytes: self.busybox_bytes,
             #[cfg(feature = "wprof")]
             wprof: self.wprof,
@@ -1717,6 +1740,71 @@ mod tests {
             .scheduler_binary("/nonexistent/scheduler")
             .build();
         assert!(result.is_err());
+    }
+
+    /// x86_64: build() rejects more than `MAX_VIRTIO_NICS` NICs (the virtio-pci
+    /// INTx GSI budget) BEFORE any VM spawn, and exactly `MAX_VIRTIO_NICS` does
+    /// NOT trip the cap. Pins the advertised limit — `.network()` appends
+    /// unconditionally, so the cap is the only guard against routing a NIC to a
+    /// GSI past the IOAPIC line budget.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn builder_rejects_more_than_max_virtio_nics() {
+        let exe = crate::resolve_current_exe().unwrap();
+        let net = crate::vmm::net_config::NetConfig::DEFAULT;
+
+        // MAX + 1 NICs: rejected, naming the cap.
+        let mut over = KtstrVmBuilder::default().kernel(&exe);
+        for _ in 0..=crate::vmm::kvm::MAX_VIRTIO_NICS {
+            over = over.network(net);
+        }
+        // KtstrVm has no Debug, so match rather than expect_err.
+        let msg = match over.build() {
+            Ok(_) => panic!("MAX+1 NICs must be rejected"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(
+            msg.contains("too many NICs") && msg.contains("max"),
+            "expected NIC-cap diagnostic, got: {msg}"
+        );
+
+        // Exactly MAX NICs must NOT trip the cap (this minimal fixture may fail
+        // later for other reasons, but never on the NIC budget).
+        let mut at_cap = KtstrVmBuilder::default().kernel(&exe);
+        for _ in 0..crate::vmm::kvm::MAX_VIRTIO_NICS {
+            at_cap = at_cap.network(net);
+        }
+        if let Err(e) = at_cap.build() {
+            let m = format!("{e:#}");
+            assert!(
+                !m.contains("too many NICs"),
+                "MAX NICs must not trip the cap, got: {m}"
+            );
+        }
+    }
+
+    /// aarch64: build() rejects more than one NIC — the virtio-MMIO transport
+    /// installs a single NIC; multi-NIC needs the x86_64 PCI transport. Pins
+    /// the arch-specific advertised limit.
+    #[test]
+    #[cfg(not(target_arch = "x86_64"))]
+    fn builder_rejects_multiple_nics_on_aarch64() {
+        let exe = crate::resolve_current_exe().unwrap();
+        let net = crate::vmm::net_config::NetConfig::DEFAULT;
+        // KtstrVm has no Debug, so match rather than expect_err.
+        let msg = match KtstrVmBuilder::default()
+            .kernel(&exe)
+            .network(net)
+            .network(net)
+            .build()
+        {
+            Ok(_) => panic!("2 NICs on aarch64 must be rejected"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(
+            msg.contains("single virtio-MMIO NIC"),
+            "expected aarch64 single-NIC diagnostic, got: {msg}"
+        );
     }
 
     #[test]

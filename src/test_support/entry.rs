@@ -1675,15 +1675,17 @@ pub struct KtstrTestEntry {
     /// with `host_only`: `validate` rejects the combination because
     /// `host_only` skips the VM boot that owns the disk lifecycle.
     pub disk: Option<crate::vmm::disk_config::DiskConfig>,
-    /// Optional virtio-net device attached to the VM (in-VMM loopback
-    /// backend). `None` (the default) boots without a NIC; `Some(cfg)`
-    /// calls `crate::vmm::KtstrVmBuilder::network` in
-    /// `crate::test_support::runtime::build_vm_builder_base`. Surfaced by
-    /// `#[ktstr_test(network = PATH)]`, `with_network`, or direct
-    /// construction. Mutually exclusive with `host_only`: `validate`
-    /// rejects the combination because `host_only` skips the VM boot that
-    /// owns the virtio-net device.
-    pub network: Option<crate::vmm::net_config::NetConfig>,
+    /// virtio-net devices attached to the VM (in-VMM loopback backend),
+    /// one per element. Empty (the default) boots without a NIC; each
+    /// element calls `crate::vmm::KtstrVmBuilder::network` in
+    /// `crate::test_support::runtime::build_vm_builder_base`. On x86_64
+    /// every element gets its own virtio-pci function (PCI slots 1..=N,
+    /// one INTx GSI apiece); aarch64 takes a single virtio-MMIO NIC (build()
+    /// errors on more than one). Surfaced by `#[ktstr_test(networks = [PATH, ...])]`,
+    /// `with_networks`, or direct construction. Mutually exclusive with
+    /// `host_only`: `validate` rejects a non-empty list because `host_only`
+    /// skips the VM boot that owns the virtio-net devices.
+    pub networks: &'static [crate::vmm::net_config::NetConfig],
     /// Host-side callback invoked after `vm.run()` returns, with
     /// access to the full `VmResult`. Runs on the HOST, not inside
     /// the guest. Use for assertions that need host-side state
@@ -1990,7 +1992,7 @@ impl KtstrTestEntry {
         cleanup_budget: None,
         config_content: None,
         disk: None,
-        network: None,
+        networks: &[],
         post_vm: None,
         post_vm_unconditional: None,
         num_snapshots: 0,
@@ -2305,22 +2307,25 @@ impl KtstrTestEntry {
         self
     }
 
-    /// Override `network`.
+    /// Override `networks` (one virtio-net device per element).
     ///
     /// Pairs with the `host_only = false` requirement enforced by
-    /// [`Self::validate`] — `host_only = true` with a `Some(..)` network
+    /// [`Self::validate`] — `host_only = true` with a non-empty list
     /// is rejected because host-only skips the VM boot that owns the
-    /// virtio-net device.
+    /// virtio-net devices.
     #[must_use = "builder methods consume self; bind the result"]
-    pub fn with_network(mut self, network: crate::vmm::net_config::NetConfig) -> Self {
-        self.network = Some(network);
+    pub fn with_networks(
+        mut self,
+        networks: &'static [crate::vmm::net_config::NetConfig],
+    ) -> Self {
+        self.networks = networks;
         self
     }
 
-    /// Clear `network` (boot without a virtio-net device).
+    /// Clear `networks` (boot without a virtio-net device).
     #[must_use = "builder methods consume self; bind the result"]
-    pub fn without_network(mut self) -> Self {
-        self.network = None;
+    pub fn without_networks(mut self) -> Self {
+        self.networks = &[];
         self
     }
 
@@ -3345,10 +3350,10 @@ mod tests {
             .expect("host_only=false + disk=Some must validate");
     }
 
-    /// `host_only=true` with `network=Some(..)` is rejected for the same
+    /// `host_only=true` with a non-empty `networks` is rejected for the same
     /// reason as disk: host_only skips the VM boot that owns the virtio-net
-    /// device lifecycle, so the NIC would never attach. Mirrors the disk
-    /// gate so the macro-surfaced `network =` attribute can't silently
+    /// device lifecycle, so the NICs would never attach. Mirrors the disk
+    /// gate so the macro-surfaced `networks =` attribute can't silently
     /// pair with `host_only`.
     #[test]
     fn validate_rejects_host_only_with_network() {
@@ -3359,16 +3364,16 @@ mod tests {
             name: "host_only_with_network",
             func: good_test_func,
             host_only: true,
-            network: Some(crate::vmm::net_config::NetConfig::default()),
+            networks: &[crate::vmm::net_config::NetConfig::DEFAULT],
             ..KtstrTestEntry::DEFAULT
         };
         let err = entry
             .validate()
-            .expect_err("host_only=true + network=Some must be rejected");
+            .expect_err("host_only=true + non-empty networks must be rejected");
         let msg = format!("{err}");
         assert!(
-            msg.contains("host_only=true") && msg.contains("network"),
-            "expected host_only+network diagnostic, got: {msg}",
+            msg.contains("host_only=true") && msg.contains("networks"),
+            "expected host_only+networks diagnostic, got: {msg}",
         );
         assert!(
             msg.contains("host_only_with_network"),
@@ -3376,7 +3381,7 @@ mod tests {
         );
     }
 
-    /// `host_only=true` with `network=None` is the legitimate host-side
+    /// `host_only=true` with an empty `networks` is the legitimate host-side
     /// shape (no NIC). Pins the happy path so a future edit to the gate
     /// doesn't flip polarity and reject legitimate host-only tests.
     #[test]
@@ -3388,17 +3393,17 @@ mod tests {
             name: "host_only_no_network",
             func: good_test_func,
             host_only: true,
-            network: None,
+            networks: &[],
             ..KtstrTestEntry::DEFAULT
         };
         entry
             .validate()
-            .expect("host_only=true + network=None must validate");
+            .expect("host_only=true + empty networks must validate");
     }
 
-    /// `host_only=false` (the default) with `network=Some(..)` is the
+    /// `host_only=false` (the default) with a non-empty `networks` is the
     /// canonical NIC-attached VM test. Pins that the gate fires only on
-    /// the host_only conflict, not on every `network=Some(..)` entry.
+    /// the host_only conflict, not on every NIC-bearing entry.
     #[test]
     fn validate_accepts_vm_with_network() {
         fn good_test_func(_: &Ctx) -> Result<AssertResult> {
@@ -3408,12 +3413,12 @@ mod tests {
             name: "vm_with_network",
             func: good_test_func,
             host_only: false,
-            network: Some(crate::vmm::net_config::NetConfig::default()),
+            networks: &[crate::vmm::net_config::NetConfig::DEFAULT],
             ..KtstrTestEntry::DEFAULT
         };
         entry
             .validate()
-            .expect("host_only=false + network=Some must validate");
+            .expect("host_only=false + non-empty networks must validate");
     }
 
     /// `validate()` rejects `cpu_budget = Some(0)` — a zero host-CPU
@@ -5729,65 +5734,69 @@ mod tests {
         );
     }
 
-    // -- with_network / without_network builder methods --
+    // -- with_networks / without_networks builder methods --
 
     #[test]
-    fn with_network_sets_some_and_carries_config() {
-        // Distinguishing MAC (!= DEFAULT 02:00:00:00:00:01) proves
-        // the setter stores the SUPPLIED config.
-        const MAC: [u8; 6] = [0x52, 0x54, 0x00, 0xab, 0xcd, 0xef];
-        let cfg = crate::vmm::net_config::NetConfig::DEFAULT.mac(MAC);
-        let entry = KtstrTestEntry::DEFAULT
-            .with_name("net_setter")
-            .with_network(cfg);
-        let got = entry.network.expect("with_network must populate Some");
-        assert_eq!(
-            got.mac, MAC,
-            "with_network must carry the supplied NetConfig's MAC"
-        );
+    fn with_networks_carries_config_and_order() {
+        // Distinguishing MACs (!= DEFAULT 02:00:00:00:00:01) prove the
+        // setter stores the SUPPLIED list, in order. Two NICs pin the
+        // multi-element path.
+        const MAC0: [u8; 6] = [0x52, 0x54, 0x00, 0xab, 0xcd, 0xef];
+        const MAC1: [u8; 6] = [0x52, 0x54, 0x00, 0x11, 0x22, 0x33];
+        // A `const` slice binding promotes its borrow to `'static` (the
+        // `.mac()` const-fn call blocks ad-hoc promotion of an inline `&[..]`).
+        const NETS: &[crate::vmm::net_config::NetConfig] = &[
+            crate::vmm::net_config::NetConfig::DEFAULT.mac(MAC0),
+            crate::vmm::net_config::NetConfig::DEFAULT.mac(MAC1),
+        ];
+        let entry = KtstrTestEntry::DEFAULT.with_name("net_setter").with_networks(NETS);
+        assert_eq!(entry.networks.len(), 2, "with_networks must store every NIC");
+        assert_eq!(entry.networks[0].mac, MAC0, "first NIC carries MAC0 in order");
+        assert_eq!(entry.networks[1].mac, MAC1, "second NIC carries MAC1 in order");
         assert!(
-            KtstrTestEntry::DEFAULT.network.is_none(),
-            "DEFAULT must boot without a NIC; with_network is the only mutator here"
+            KtstrTestEntry::DEFAULT.networks.is_empty(),
+            "DEFAULT must boot without a NIC; with_networks is the only mutator here"
         );
     }
 
     #[test]
-    fn without_network_clears_to_none() {
-        let cfg = crate::vmm::net_config::NetConfig::DEFAULT;
+    fn without_networks_clears_to_empty() {
         let entry = KtstrTestEntry::DEFAULT
             .with_name("net_clear")
-            .with_network(cfg)
-            .without_network();
+            .with_networks(&[crate::vmm::net_config::NetConfig::DEFAULT])
+            .without_networks();
         assert!(
-            entry.network.is_none(),
-            "without_network must return the network field to None"
+            entry.networks.is_empty(),
+            "without_networks must return the networks field to empty"
         );
     }
 
-    /// `without_disk` does not touch `network` and vice versa — the
+    /// `without_disk` does not touch `networks` and vice versa — the
     /// two clearers are independent. Pins against a copy-paste
     /// regression where one clearer nulls the wrong field.
     #[test]
     fn disk_and_network_clearers_are_independent() {
-        // DiskConfig is Clone (not Copy), so build a fresh one per
-        // entry; NetConfig is Copy and can be reused.
-        let net = crate::vmm::net_config::NetConfig::DEFAULT.mac([0x52, 0x54, 0, 0, 0, 9]);
-        // Clear disk only: network must survive.
+        // DiskConfig is Clone (not Copy), so build a fresh one per entry;
+        // the NIC list is a `const` slice binding ('static-promoted — the
+        // `.mac()` const-fn call blocks ad-hoc promotion of an inline `&[..]`).
+        const NET: &[crate::vmm::net_config::NetConfig] =
+            &[crate::vmm::net_config::NetConfig::DEFAULT.mac([0x52, 0x54, 0, 0, 0, 9])];
+        // Clear disk only: networks must survive.
         let e1 = KtstrTestEntry::DEFAULT
             .with_name("indep_disk")
             .with_disk(crate::vmm::disk_config::DiskConfig::DEFAULT.capacity_mib(512))
-            .with_network(net)
+            .with_networks(NET)
             .without_disk();
         assert!(e1.disk.is_none(), "without_disk must clear disk");
-        assert!(e1.network.is_some(), "without_disk must NOT clear network");
-        // Clear network only: disk must survive.
+        assert!(!e1.networks.is_empty(), "without_disk must NOT clear networks");
+        // Clear networks only: disk must survive.
         let e2 = KtstrTestEntry::DEFAULT
             .with_name("indep_net")
             .with_disk(crate::vmm::disk_config::DiskConfig::DEFAULT.capacity_mib(512))
-            .with_network(net)
-            .without_network();
-        assert!(e2.network.is_none(), "without_network must clear network");
-        assert!(e2.disk.is_some(), "without_network must NOT clear disk");
+            .with_networks(NET)
+            .without_networks();
+        assert!(e2.networks.is_empty(), "without_networks must clear networks");
+        assert!(e2.disk.is_some(), "without_networks must NOT clear disk");
     }
 
     // -- with_num_snapshots builder method --

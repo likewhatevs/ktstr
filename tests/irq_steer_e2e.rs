@@ -52,7 +52,7 @@ const NET_TEST_STEER: NetConfig = NetConfig::DEFAULT.mac([0x52, 0x54, 0x00, 0x4e
     llcs = 1,
     cores = 2,
     threads = 1,
-    network = NET_TEST_STEER,
+    networks = [NET_TEST_STEER],
     no_perf_mode,
     duration_s = 15,
     watchdog_timeout_s = 45

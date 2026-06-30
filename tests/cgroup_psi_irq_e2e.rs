@@ -163,7 +163,7 @@ fn assert_cgroup_psi_metrics(result: &VmResult) -> Result<()> {
     llcs = 1,
     cores = 2,
     threads = 1,
-    network = NET_TEST,
+    networks = [NET_TEST],
     duration_s = 15,
     watchdog_timeout_s = 45,
     num_snapshots = 6,

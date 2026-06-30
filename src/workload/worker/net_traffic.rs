@@ -277,7 +277,7 @@ pub(super) fn warn_irq_wake_setup_failed_once(err: &io::Error) {
         eprintln!(
             "workload: WorkType::IrqWake could not open an AF_PACKET socket \
              ({err}); the sender/receiver pair is a no-op (work_units=0). Attach \
-             a NIC with #[ktstr_test(network = ...)]. See the WorkType::IrqWake \
+             a NIC with #[ktstr_test(networks = [...])]. See the WorkType::IrqWake \
              variant doc."
         );
     });
@@ -308,7 +308,7 @@ fn virtio_net_iface_in(root: &std::path::Path) -> io::Result<String> {
     Err(io::Error::new(
         io::ErrorKind::NotFound,
         "no non-loopback network interface with a device under /sys/class/net \
-         (attach a NIC with #[ktstr_test(network = ...)])",
+         (attach a NIC with #[ktstr_test(networks = [...])])",
     ))
 }
 
@@ -404,7 +404,7 @@ pub(super) fn warn_net_traffic_setup_failed_once(err: &io::Error) {
         eprintln!(
             "workload: WorkType::NetTraffic could not open an AF_PACKET sender \
              ({err}); the worker is a no-op (work_units=0). Attach a NIC with \
-             #[ktstr_test(network = ...)]. See the WorkType::NetTraffic variant doc."
+             #[ktstr_test(networks = [...])]. See the WorkType::NetTraffic variant doc."
         );
     });
 }

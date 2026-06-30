@@ -1742,7 +1742,7 @@ pub enum WorkType {
     /// root, so the capability is present.
     ///
     /// **Precondition:** a NIC must be attached via
-    /// `#[ktstr_test(network = ...)]` with a [`crate::prelude::NetConfig`].
+    /// `#[ktstr_test(networks = [...])]` with a [`crate::prelude::NetConfig`].
     /// With no non-loopback interface present the worker is a LOUD no-op: it
     /// warns once and returns `work_units == 0` rather than silently doing
     /// nothing.
@@ -1785,7 +1785,7 @@ pub enum WorkType {
     /// NAPI).
     ///
     /// **Precondition + no-NIC behavior:** like [`Self::NetTraffic`] — needs a NIC
-    /// via `#[ktstr_test(network = ...)]`; with no non-loopback interface the pair
+    /// via `#[ktstr_test(networks = [...])]`; with no non-loopback interface the pair
     /// is a LOUD no-op (warn once, `work_units == 0`).
     ///
     /// **What the wake reservoir means:** `worker_group_size = Some(2)` — workers
