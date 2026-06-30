@@ -319,6 +319,14 @@ fn phase_block_lines_render_a_coverage_only_report() {
         !joined.contains("VERDICT"),
         "no phase-delta table renders when phase_deltas is empty: {joined}"
     );
+    // The default-options footer hint reports the coverage-diff count, so a
+    // coverage-only report no longer reads "0 ... shown" with a populated
+    // coverage table above it.
+    assert!(
+        joined.contains("0 delta row(s)")
+            && joined.contains("2 one-sided-metric coverage diff(s)"),
+        "footer hint must report the coverage-diff count, not only deltas: {joined}"
+    );
 }
 
 /// `format_phase_block_lines` returns no lines when there is no phase data at

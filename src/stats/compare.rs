@@ -2202,11 +2202,14 @@ pub(crate) fn format_phase_block_lines(
             .iter()
             .filter(|c| phase_opts.matches_phase(c.step_index))
             .collect();
-        // Capture filtered counts BEFORE moving `filtered_deltas`
-        // into `sorted_deltas` below — the footer hint reads them
-        // after the table rendering consumes the Vec.
+        // Capture filtered counts BEFORE the per-table renders move
+        // `filtered_deltas` / `filtered_unpaired` / `filtered_phase_coverage`
+        // into their sorted Vecs below — the footer hint reads all three
+        // after the table rendering consumes them.
         let filtered_delta_total = filtered_deltas.len();
         let filtered_delta_regressions = filtered_deltas.iter().filter(|d| d.is_regression).count();
+        let filtered_coverage_total = filtered_phase_coverage.len();
+        let filtered_unpaired_total = filtered_unpaired.len();
         if !filtered_deltas.is_empty()
             || !filtered_unpaired.is_empty()
             || !filtered_phase_coverage.is_empty()
@@ -2358,8 +2361,10 @@ pub(crate) fn format_phase_block_lines(
                     "s"
                 };
                 lines.push(format!(
-                    "  phases: {filtered_delta_total} delta row(s) shown \
-                     ({filtered_delta_regressions} regression{plural}). \
+                    "  phases: {filtered_delta_total} delta row(s) \
+                     ({filtered_delta_regressions} regression{plural}), \
+                     {filtered_coverage_total} one-sided-metric coverage diff(s), \
+                     {filtered_unpaired_total} one-sided phase(s) shown. \
                      Filter with --phase N / --phases-only / --steps-only / \
                      --phase-threshold P / --no-phases.",
                 ));
