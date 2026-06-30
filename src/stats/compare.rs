@@ -91,12 +91,15 @@ pub(crate) struct CoverageDiff {
 /// converse is `removed_from_a`. The filter (when set) applies to
 /// every counter, so excluded rows do not contribute.
 ///
-/// `phase_deltas` and `unpaired_phases` carry the per-phase
-/// comparison shape derived from
-/// [`crate::assert::ScenarioStats::phases`] on each row pair. The
-/// phase pass runs after the scalar-row pass via the same pairing
-/// key; rows whose `phases` slice is empty on either side
-/// contribute nothing here (single-phase scenarios skip the
+/// `phase_deltas`, `phase_coverage_diffs`, and `unpaired_phases`
+/// carry the per-phase comparison shape derived from
+/// [`crate::assert::ScenarioStats::phases`] on each row pair:
+/// `phase_deltas` for a metric on both sides of a matched phase,
+/// `phase_coverage_diffs` for a metric on exactly one side of a
+/// matched phase, and `unpaired_phases` for a whole phase present on
+/// only one side. The phase pass runs after the scalar-row pass via
+/// the same pairing key; rows whose `phases` slice is empty on either
+/// side contribute nothing here (single-phase scenarios skip the
 /// per-phase view, falling back to the scalar findings already in
 /// `findings`).
 #[derive(Debug, Clone, Default, serde::Serialize)]
@@ -121,6 +124,13 @@ pub(crate) struct CompareReport {
     /// visible rather than silently dropped or mis-flagged as a
     /// regression from a zero baseline. See [`CoverageDiff`].
     pub coverage_diffs: Vec<CoverageDiff>,
+    /// Metrics present on exactly one side of a MATCHED phase (the
+    /// per-phase analog of `coverage_diffs`; distinct from
+    /// `unpaired_phases`, which is a whole one-sided phase). Never gated;
+    /// surfaced so a metric appearing/disappearing within a matched phase
+    /// between runs is visible rather than silently dropped. See
+    /// [`PhaseCoverageDiff`].
+    pub phase_coverage_diffs: Vec<PhaseCoverageDiff>,
 }
 
 /// Which side of an A/B comparison a row belongs to. Typed surface
@@ -214,6 +224,32 @@ pub(crate) struct UnpairedPhaseRow {
     pub metrics: std::collections::BTreeMap<String, f64>,
 }
 
+/// A metric present on exactly ONE side of a MATCHED (same `step_index`)
+/// phase — the per-phase analog of [`CoverageDiff`].
+///
+/// Distinct from [`UnpairedPhaseRow`], which is a WHOLE phase
+/// (`step_index`) present on only one side; this is a single metric name
+/// present in one matched bucket and absent in the other. A phase bucket
+/// OMITS a metric whose samples yield no per-sample reading
+/// (`read_sample`-driven), so two runs' buckets can carry different
+/// metric-name sets at the same `step_index`. Recording it here (never
+/// gated, no regression/improvement verdict) surfaces the
+/// appear/disappear-within-a-matched-phase case instead of silently
+/// dropping it — the per-phase counterpart of the scalar one-sided-absent
+/// fix.
+#[derive(Clone, Debug, serde::Serialize)]
+pub(crate) struct PhaseCoverageDiff {
+    /// Same pairing key the matched [`PhaseDeltaRow`]s use.
+    pub pairing_key: PairingKey,
+    pub step_index: u16,
+    pub label: String,
+    pub metric: &'static MetricDef,
+    /// The side whose matched bucket HAS the metric; the other is absent.
+    pub present_side: ComparePartition,
+    /// The present side's value (the absent side has none).
+    pub value: f64,
+}
+
 /// Per-metric threshold policy driving `compare_rows` /
 /// `compare_partitions`.
 ///
@@ -286,13 +322,15 @@ pub struct ComparisonPolicy {
 ///
 /// The 5 flags trigger renderer behaviour ONLY — the data
 /// layer in `compare_rows_by` always emits the full set of
-/// matched `PhaseDeltaRow`s and `UnpairedPhaseRow`s so
-/// programmatic consumers of `CompareReport` see the
-/// unfiltered surface. Filtering is render-time projection.
+/// matched `PhaseDeltaRow`s, `PhaseCoverageDiff`s, and
+/// `UnpairedPhaseRow`s so programmatic consumers of
+/// `CompareReport` see the unfiltered surface. Filtering is
+/// render-time projection.
 #[derive(Debug, Default, Clone)]
 pub struct PhaseDisplayOptions {
-    /// `--no-phases`: suppress the per-phase delta + unpaired
-    /// tables entirely. The scalar findings table and footer
+    /// `--no-phases`: suppress the per-phase block (delta,
+    /// coverage, and unpaired tables) entirely. The scalar
+    /// findings table and footer
     /// render unchanged; the only effect is hiding the phase
     /// block (and the phase footer hint). Mutually exclusive
     /// with every other phase flag at CLI parse time.
@@ -356,7 +394,8 @@ impl PhaseDisplayOptions {
     /// step-axis predicates (`--phase <N>` filter and
     /// `--steps-only` BASELINE-suppressor) into a single
     /// row-level decision the renderer can apply uniformly
-    /// across `PhaseDeltaRow` and `UnpairedPhaseRow` vecs.
+    /// across the `PhaseDeltaRow`, `PhaseCoverageDiff`, and
+    /// `UnpairedPhaseRow` vecs.
     /// Returns `true` when no relevant flag is set (default
     /// path: every step renders).
     pub fn matches_phase(&self, step_index: u16) -> bool {
@@ -844,8 +883,10 @@ fn push_scalar_findings(
 /// scalar findings (see [`push_scalar_findings`]). Walks the union of
 /// step_index keys from `row_a.phases` and `row_b.phases` and emits
 /// one [`PhaseDeltaRow`] per matched (step_index, metric_name) pair
-/// where both sides carry a value, or one [`UnpairedPhaseRow`] per
-/// side-only step_index. Rows whose `phases` slice is empty on
+/// where both sides carry a value, one [`PhaseCoverageDiff`] per
+/// metric present on exactly one side within a matched step_index, or
+/// one [`UnpairedPhaseRow`] per side-only step_index. Rows whose
+/// `phases` slice is empty on
 /// either side contribute nothing here — single-phase scenarios skip
 /// the per-phase view entirely without emitting orphan
 /// UnpairedPhaseRows (an empty A-side against a populated B-side
@@ -871,11 +912,11 @@ fn push_phase_deltas(
                 (Some(pa), Some(pb)) => {
                     // Matched phase on both sides — emit a
                     // PhaseDeltaRow per metric_name present on
-                    // BOTH sides. A name on only one side
-                    // surfaces as an absent entry via the
-                    // sentinel-free `PhaseBucket::get` contract;
-                    // the renderer does not invent a synthetic
-                    // delta for it.
+                    // BOTH sides. A name present on only one side
+                    // is not a delta; it becomes a
+                    // PhaseCoverageDiff via the (Some, None) /
+                    // (None, Some) arms below, never a synthetic
+                    // delta against an absent value.
                     //
                     // `is_regression` honors the same dual-gate
                     // the scalar pass applies inside its
@@ -895,73 +936,125 @@ fn push_phase_deltas(
                     // of `CompareReport.phase_deltas` see every
                     // paired comparison; the filter is on the
                     // classification only.
-                    for (metric_name, &val_a) in &pa.metrics {
-                        // Suppress Rate components from the per-phase view
-                        // too (they stay in PhaseBucket.metrics for the
-                        // re-pool; only the rendered delta is dropped).
+                    // Iterate the UNION of metric names across both matched
+                    // buckets (PhaseBucket.metrics is a BTreeMap, so the union
+                    // is deterministically ordered). A metric present in only
+                    // ONE bucket at this matched step_index is a per-phase
+                    // coverage difference (PhaseCoverageDiff), not a delta — the
+                    // per-phase analog of the scalar one-sided-absent handling.
+                    // Iterating only `pa.metrics` would silently drop a B-only
+                    // metric; the prior `pb.metrics.get(name) else continue`
+                    // silently dropped an A-only one.
+                    let metric_names: std::collections::BTreeSet<&str> = pa
+                        .metrics
+                        .keys()
+                        .chain(pb.metrics.keys())
+                        .map(String::as_str)
+                        .collect();
+                    for metric_name in metric_names {
+                        // Suppress Rate components from the per-phase view (delta
+                        // AND coverage), as in the scalar path; they stay in
+                        // PhaseBucket.metrics for the re-pool.
                         if is_render_suppressed_component(metric_name) {
                             continue;
                         }
-                        let Some(&val_b) = pb.metrics.get(metric_name) else {
-                            continue;
-                        };
                         let Some(metric_def) = metric_def(metric_name) else {
                             continue;
                         };
-                        // Informational metrics carry no regression direction, so
-                        // they have no place in the per-phase delta table — which
-                        // classifies via `is_regression: bool` (the run-level
-                        // scalar [`Finding`] carries the 3-way [`FindingKind`]).
-                        // No phase-bucketed metric is Informational today (every
-                        // `read_sample` / `fold_monitor_into_bucket` per-phase
-                        // metric is directional; the Informational schedstat
-                        // counters are run-level only), so this skip never fires
-                        // for a production phase metric today — it is a tested
-                        // defense-in-depth guard (a unit test manually
-                        // phase-buckets an Informational metric to confirm it is
-                        // dropped) so a future per-phase Informational metric is
-                        // dropped from the per-phase view rather than silently
-                        // misclassified as a regression/improvement.
-                        if metric_def.classify_direction().is_none() {
-                            continue;
+                        match (pa.metrics.get(metric_name), pb.metrics.get(metric_name)) {
+                            (Some(&val_a), Some(&val_b)) => {
+                                // Informational metrics carry no regression
+                                // direction, so they have no place in the
+                                // per-phase delta table — which classifies via
+                                // `is_regression: bool` (the run-level scalar
+                                // [`Finding`] carries the 3-way [`FindingKind`]).
+                                // No phase-bucketed metric is Informational today
+                                // (every `read_sample` / `fold_monitor_into_bucket`
+                                // per-phase metric is directional; the
+                                // Informational schedstat counters are run-level
+                                // only), so this skip never fires for a production
+                                // phase metric today — it is a tested
+                                // defense-in-depth guard (a unit test manually
+                                // phase-buckets an Informational metric to confirm
+                                // it is dropped) so a future per-phase
+                                // Informational metric is dropped from the
+                                // per-phase delta view rather than silently
+                                // misclassified as a regression/improvement. (A
+                                // ONE-sided Informational metric still surfaces as
+                                // a PhaseCoverageDiff below — a coverage diff is
+                                // never a verdict, so polarity is irrelevant
+                                // there.)
+                                if metric_def.classify_direction().is_none() {
+                                    continue;
+                                }
+                                let delta = val_b - val_a;
+                                let rel_thresh = policy
+                                    .rel_threshold(metric_def.name, metric_def.default_rel);
+                                // Same zero discipline as the scalar dual-gate: a
+                                // value from a ~zero baseline is an unbounded
+                                // relative change (INFINITY clears the rel gate,
+                                // leaving the absolute gate to decide); both sides
+                                // ~zero is no signal (rel 0, and |delta| ~0 also
+                                // fails the absolute gate). ZERO_MEAN_EPS is the
+                                // domain zero epsilon, matching the scalar path
+                                // and the noise verdict skip — not f64::EPSILON,
+                                // the machine ulp near 1.0.
+                                let rel_delta = if val_a.abs() > ZERO_MEAN_EPS {
+                                    (delta / val_a).abs()
+                                } else if delta.abs() > ZERO_MEAN_EPS {
+                                    f64::INFINITY
+                                } else {
+                                    0.0
+                                };
+                                let below_dual_gate = delta.abs() < metric_def.default_abs
+                                    || rel_delta < rel_thresh;
+                                let is_regression = if below_dual_gate {
+                                    false
+                                } else if metric_def.higher_is_worse() {
+                                    delta > 0.0
+                                } else {
+                                    delta < 0.0
+                                };
+                                report.phase_deltas.push(PhaseDeltaRow {
+                                    pairing_key: key_b.clone(),
+                                    step_index,
+                                    label: pa.label.clone(),
+                                    metric: metric_def,
+                                    a: val_a,
+                                    b: val_b,
+                                    delta,
+                                    is_regression,
+                                });
+                            }
+                            (Some(&value), None) => {
+                                // A-only within this matched phase: a coverage
+                                // diff, never a verdict (no comparable baseline).
+                                report.phase_coverage_diffs.push(PhaseCoverageDiff {
+                                    pairing_key: key_b.clone(),
+                                    step_index,
+                                    label: pa.label.clone(),
+                                    metric: metric_def,
+                                    present_side: ComparePartition::A,
+                                    value,
+                                });
+                            }
+                            (None, Some(&value)) => {
+                                // B-only within this matched phase: the mirror of
+                                // the above — previously never iterated, hence
+                                // silently dropped.
+                                report.phase_coverage_diffs.push(PhaseCoverageDiff {
+                                    pairing_key: key_b.clone(),
+                                    step_index,
+                                    label: pb.label.clone(),
+                                    metric: metric_def,
+                                    present_side: ComparePartition::B,
+                                    value,
+                                });
+                            }
+                            (None, None) => {
+                                unreachable!("metric_name came from the union of both key sets")
+                            }
                         }
-                        let delta = val_b - val_a;
-                        let rel_thresh =
-                            policy.rel_threshold(metric_def.name, metric_def.default_rel);
-                        // Same zero discipline as the scalar dual-gate: a value
-                        // from a ~zero baseline is an unbounded relative change
-                        // (INFINITY clears the rel gate, leaving the absolute
-                        // gate to decide); both sides ~zero is no signal (rel 0,
-                        // and |delta| ~0 also fails the absolute gate).
-                        // ZERO_MEAN_EPS is the domain zero epsilon, matching the
-                        // scalar path and the noise verdict skip — not
-                        // f64::EPSILON, the machine ulp near 1.0.
-                        let rel_delta = if val_a.abs() > ZERO_MEAN_EPS {
-                            (delta / val_a).abs()
-                        } else if delta.abs() > ZERO_MEAN_EPS {
-                            f64::INFINITY
-                        } else {
-                            0.0
-                        };
-                        let below_dual_gate =
-                            delta.abs() < metric_def.default_abs || rel_delta < rel_thresh;
-                        let is_regression = if below_dual_gate {
-                            false
-                        } else if metric_def.higher_is_worse() {
-                            delta > 0.0
-                        } else {
-                            delta < 0.0
-                        };
-                        report.phase_deltas.push(PhaseDeltaRow {
-                            pairing_key: key_b.clone(),
-                            step_index,
-                            label: pa.label.clone(),
-                            metric: metric_def,
-                            a: val_a,
-                            b: val_b,
-                            delta,
-                            is_regression,
-                        });
                     }
                 }
                 (Some(orphan), None) => {
@@ -2045,11 +2138,11 @@ fn print_scalar_findings_table(report: &CompareReport, label_a: &str, label_b: &
 }
 
 /// Render the per-phase delta block for `stats compare --runs`.
-/// Activated when the parallel pass
-/// populated either phase_deltas or unpaired_phases for the
-/// current row-pair set AND `--no-phases` was not passed.
-/// Single-phase scenarios (no periodic captures) leave both
-/// vecs empty and the phase block is suppressed entirely.
+/// Activated when the parallel pass populated any of phase_deltas,
+/// phase_coverage_diffs, or unpaired_phases for the current row-pair
+/// set AND `--no-phases` was not passed. Single-phase scenarios (no
+/// periodic captures) leave all three vecs empty and the phase block
+/// is suppressed entirely.
 ///
 /// CLI filters compose by AND on independent axes:
 /// - `--phase <N>` keeps only the named step_index
@@ -2059,18 +2152,39 @@ fn print_scalar_findings_table(report: &CompareReport, label_a: &str, label_b: &
 ///   ~zero baseline is an unbounded relative change → shown)
 ///
 /// Filtering is render-time projection — the underlying
-/// CompareReport.phase_deltas / unpaired_phases vecs hold
-/// the unfiltered data so programmatic consumers see every
-/// paired row regardless of CLI flags.
+/// CompareReport.phase_deltas / phase_coverage_diffs /
+/// unpaired_phases vecs hold the unfiltered data so programmatic
+/// consumers see every paired row regardless of CLI flags.
 fn print_phase_block(
     report: &CompareReport,
     phase_opts: &PhaseDisplayOptions,
     label_a: &str,
     label_b: &str,
 ) {
+    for line in format_phase_block_lines(report, phase_opts, label_a, label_b) {
+        println!("{line}");
+    }
+}
+
+/// Build the per-phase block's rendered lines for [`print_phase_block`].
+/// Pure (returns the lines; empty when the block is suppressed —
+/// `--no-phases`, no phase data, or every row filtered out) so the
+/// render gate, the per-phase delta/unpaired tables, and the
+/// one-sided-metric coverage table are unit-testable without capturing
+/// stdout. Each rendered table is one multi-line element; an empty
+/// element is a blank separator line the caller prints verbatim.
+pub(crate) fn format_phase_block_lines(
+    report: &CompareReport,
+    phase_opts: &PhaseDisplayOptions,
+    label_a: &str,
+    label_b: &str,
+) -> Vec<String> {
     use comfy_table::{Cell, Color};
+    let mut lines = Vec::new();
     let render_phase_block = !phase_opts.no_phases
-        && (!report.phase_deltas.is_empty() || !report.unpaired_phases.is_empty());
+        && (!report.phase_deltas.is_empty()
+            || !report.unpaired_phases.is_empty()
+            || !report.phase_coverage_diffs.is_empty());
     if render_phase_block {
         let filtered_deltas: Vec<&PhaseDeltaRow> = report
             .phase_deltas
@@ -2083,14 +2197,22 @@ fn print_phase_block(
             .iter()
             .filter(|u| phase_opts.matches_phase(u.step_index))
             .collect();
+        let filtered_phase_coverage: Vec<&PhaseCoverageDiff> = report
+            .phase_coverage_diffs
+            .iter()
+            .filter(|c| phase_opts.matches_phase(c.step_index))
+            .collect();
         // Capture filtered counts BEFORE moving `filtered_deltas`
         // into `sorted_deltas` below — the footer hint reads them
         // after the table rendering consumes the Vec.
         let filtered_delta_total = filtered_deltas.len();
         let filtered_delta_regressions = filtered_deltas.iter().filter(|d| d.is_regression).count();
-        if !filtered_deltas.is_empty() || !filtered_unpaired.is_empty() {
-            println!();
-            println!("phase coverage:");
+        if !filtered_deltas.is_empty()
+            || !filtered_unpaired.is_empty()
+            || !filtered_phase_coverage.is_empty()
+        {
+            lines.push(String::new());
+            lines.push("phase coverage:".to_string());
             if !filtered_deltas.is_empty() {
                 let mut phase_table = crate::cli::new_table();
                 phase_table.set_header(vec![
@@ -2128,11 +2250,11 @@ fn print_phase_block(
                         Cell::new(verdict_text).fg(verdict_color),
                     ]);
                 }
-                println!("{phase_table}");
+                lines.push(phase_table.to_string());
             }
             if !filtered_unpaired.is_empty() {
-                println!();
-                println!("phase coverage asymmetry (one-sided phases):");
+                lines.push(String::new());
+                lines.push("phase coverage asymmetry (one-sided phases):".to_string());
                 let mut unpaired_table = crate::cli::new_table();
                 unpaired_table.set_header(vec!["SIDE", "TEST", "PHASE", "METRIC", "VALUE"]);
                 // Sort by step_index then side then pairing key then
@@ -2184,7 +2306,39 @@ fn print_phase_block(
                         }
                     }
                 }
-                println!("{unpaired_table}");
+                lines.push(unpaired_table.to_string());
+            }
+            if !filtered_phase_coverage.is_empty() {
+                lines.push(String::new());
+                lines.push(
+                    "phase coverage asymmetry (one-sided metrics within a matched phase):"
+                        .to_string(),
+                );
+                let mut coverage_table = crate::cli::new_table();
+                coverage_table.set_header(vec!["SIDE", "TEST", "PHASE", "METRIC", "VALUE"]);
+                // Same time-order sort as the unpaired table: step_index,
+                // then side, then pairing key, then metric name — so the
+                // reader scans missing data in scenario time order.
+                let mut sorted_coverage = filtered_phase_coverage;
+                sorted_coverage.sort_by(|a, b| {
+                    a.step_index
+                        .cmp(&b.step_index)
+                        .then_with(|| a.present_side.as_str().cmp(b.present_side.as_str()))
+                        .then_with(|| a.pairing_key.0.cmp(&b.pairing_key.0))
+                        .then_with(|| a.metric.name.cmp(b.metric.name))
+                });
+                for c in sorted_coverage {
+                    let test_label = c.pairing_key.0.join("/");
+                    let phase_cell = format!("{}: {}", c.step_index, c.label);
+                    coverage_table.add_row(vec![
+                        Cell::new(c.present_side.as_str()),
+                        Cell::new(test_label),
+                        Cell::new(phase_cell),
+                        Cell::new(c.metric.name),
+                        Cell::new(format!("{:.2}", c.value)),
+                    ]);
+                }
+                lines.push(coverage_table.to_string());
             }
             // Operator hint surfaces only when the default-on
             // path is producing rows AND no filter flag was set —
@@ -2198,20 +2352,21 @@ fn print_phase_block(
                 || phase_opts.phase.is_some()
                 || phase_opts.phase_threshold.is_some();
             if !any_flag_set {
-                println!(
+                let plural = if filtered_delta_regressions == 1 {
+                    ""
+                } else {
+                    "s"
+                };
+                lines.push(format!(
                     "  phases: {filtered_delta_total} delta row(s) shown \
                      ({filtered_delta_regressions} regression{plural}). \
                      Filter with --phase N / --phases-only / --steps-only / \
                      --phase-threshold P / --no-phases.",
-                    plural = if filtered_delta_regressions == 1 {
-                        ""
-                    } else {
-                        "s"
-                    },
-                );
+                ));
             }
         }
     }
+    lines
 }
 
 /// Render the scalar summary block for `stats compare --runs` —

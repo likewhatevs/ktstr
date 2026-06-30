@@ -3,7 +3,8 @@ use super::*;
 // -- compare_rows_by per-phase pass tests --------------------------
 //
 // These tests exercise the per-row-pair phase intersection that
-// populates CompareReport.phase_deltas + unpaired_phases. They go
+// populates CompareReport.phase_deltas, phase_coverage_diffs, and
+// unpaired_phases. They go
 // through compare_rows_by directly (rather than the full
 // compare_partitions which also does filtering/averaging) because
 // the parallel pass lives inside compare_rows_by's row-pair
@@ -213,6 +214,154 @@ fn compare_rows_by_emits_unpaired_phases_when_phase_coverage_differs() {
     assert_eq!(b_orphan.label, "Step[1]");
 }
 
+/// A metric present in only ONE bucket of a MATCHED phase (same step_index) is
+/// a PhaseCoverageDiff — the per-phase analog of the scalar CoverageDiff — not
+/// silently dropped. Pre-fix, push_phase_deltas iterated only the A-side
+/// bucket, so an A-only metric was `continue`d and a B-only one was never
+/// iterated; both vanished from the per-phase view (UnpairedPhaseRow covers
+/// only WHOLE one-sided phases, not a one-sided metric within a matched phase).
+#[test]
+fn compare_rows_by_phase_one_sided_metric_in_matched_phase_is_coverage_diff() {
+    // BASELINE matches on both sides; max_dsq_depth is present in both (a
+    // normal delta), avg_nr_running in only one bucket (the coverage diff).
+    let mut row_a = make_row("test_pc", "tiny-1llc", true, 0.0);
+    let mut row_b = make_row("test_pc", "tiny-1llc", true, 0.0);
+    row_a.phases = vec![make_phase_bucket(
+        0,
+        "BASELINE",
+        &[("max_dsq_depth", 4.0), ("avg_nr_running", 5.0)],
+    )];
+    row_b.phases = vec![make_phase_bucket(0, "BASELINE", &[("max_dsq_depth", 6.0)])];
+    let report = compare_rows_by(&[row_a], &[row_b], &[], None, &ComparisonPolicy::default());
+
+    assert_eq!(
+        report.phase_deltas.len(),
+        1,
+        "only the both-present metric (max_dsq_depth) yields a delta"
+    );
+    assert_eq!(report.phase_deltas[0].metric.name, "max_dsq_depth");
+    assert!(
+        report.unpaired_phases.is_empty(),
+        "the phase itself matched on both sides — not a whole one-sided phase"
+    );
+    assert_eq!(
+        report.phase_coverage_diffs.len(),
+        1,
+        "avg_nr_running is one-sided WITHIN the matched phase"
+    );
+    let cd = &report.phase_coverage_diffs[0];
+    assert_eq!(cd.metric.name, "avg_nr_running");
+    assert_eq!(cd.step_index, 0);
+    assert_eq!(cd.present_side, ComparePartition::A);
+    assert_eq!(cd.value, 5.0);
+
+    // Mirror: avg_nr_running present in B's matched bucket only -> present_side B
+    // (the case the pre-fix loop never iterated at all).
+    let mut row_a2 = make_row("test_pc", "tiny-1llc", true, 0.0);
+    let mut row_b2 = make_row("test_pc", "tiny-1llc", true, 0.0);
+    row_a2.phases = vec![make_phase_bucket(0, "BASELINE", &[("max_dsq_depth", 4.0)])];
+    row_b2.phases = vec![make_phase_bucket(
+        0,
+        "BASELINE",
+        &[("max_dsq_depth", 6.0), ("avg_nr_running", 7.0)],
+    )];
+    let report2 = compare_rows_by(&[row_a2], &[row_b2], &[], None, &ComparisonPolicy::default());
+    assert_eq!(report2.phase_coverage_diffs.len(), 1);
+    assert_eq!(report2.phase_coverage_diffs[0].metric.name, "avg_nr_running");
+    assert_eq!(
+        report2.phase_coverage_diffs[0].present_side,
+        ComparePartition::B
+    );
+    assert_eq!(report2.phase_coverage_diffs[0].value, 7.0);
+}
+
+/// `format_phase_block_lines` (the pure renderer behind `print_phase_block`)
+/// renders the one-sided-metric coverage table for a report whose ONLY
+/// phase data is `phase_coverage_diffs` — no deltas, no unpaired phases. This
+/// pins the render gate's `phase_coverage_diffs` disjunct (a coverage-only
+/// report still renders) AND the coverage-table content (SIDE/METRIC/VALUE),
+/// the exact branch the data-layer `compare_rows_by` test stops short of.
+/// A matched BASELINE whose only metrics are one-sided (A: avg_nr_running,
+/// B: max_dsq_depth) yields no both-present delta and no whole-phase orphan,
+/// so the report carries coverage diffs alone.
+#[test]
+fn phase_block_lines_render_a_coverage_only_report() {
+    let mut row_a = make_row("test_pc", "tiny-1llc", true, 0.0);
+    let mut row_b = make_row("test_pc", "tiny-1llc", true, 0.0);
+    row_a.phases = vec![make_phase_bucket(0, "BASELINE", &[("avg_nr_running", 5.0)])];
+    row_b.phases = vec![make_phase_bucket(0, "BASELINE", &[("max_dsq_depth", 6.0)])];
+    let report = compare_rows_by(&[row_a], &[row_b], &[], None, &ComparisonPolicy::default());
+    assert!(
+        report.phase_deltas.is_empty(),
+        "no both-present metric -> no phase delta"
+    );
+    assert!(
+        report.unpaired_phases.is_empty(),
+        "BASELINE matched on both sides -> no whole-phase orphan"
+    );
+    assert_eq!(
+        report.phase_coverage_diffs.len(),
+        2,
+        "avg_nr_running (A-only) + max_dsq_depth (B-only) within the matched phase"
+    );
+
+    let lines = format_phase_block_lines(&report, &PhaseDisplayOptions::default(), "A", "B");
+    let joined = lines.join("\n");
+    assert!(
+        joined.contains("phase coverage asymmetry (one-sided metrics within a matched phase)"),
+        "the render gate fired on coverage diffs alone and built the table: {joined}"
+    );
+    assert!(
+        joined.contains("avg_nr_running") && joined.contains("max_dsq_depth"),
+        "both one-sided metric rows render: {joined}"
+    );
+    assert!(
+        !joined.contains("VERDICT"),
+        "no phase-delta table renders when phase_deltas is empty: {joined}"
+    );
+}
+
+/// `format_phase_block_lines` returns no lines when there is no phase data at
+/// all — the render gate's false path. Pins that a report with empty
+/// phase_deltas/unpaired_phases/phase_coverage_diffs prints nothing.
+#[test]
+fn phase_block_lines_empty_report_renders_nothing() {
+    let report = compare_rows_by(
+        &[make_row("t", "tiny-1llc", true, 0.0)],
+        &[make_row("t", "tiny-1llc", true, 0.0)],
+        &[],
+        None,
+        &ComparisonPolicy::default(),
+    );
+    assert!(report.phase_deltas.is_empty());
+    assert!(report.unpaired_phases.is_empty());
+    assert!(report.phase_coverage_diffs.is_empty());
+    assert!(
+        format_phase_block_lines(&report, &PhaseDisplayOptions::default(), "A", "B").is_empty(),
+        "an all-empty phase report must render no lines"
+    );
+}
+
+/// `--no-phases` suppresses the whole block even when coverage diffs are
+/// present — pins the render gate's `!no_phases` conjunct.
+#[test]
+fn phase_block_lines_no_phases_flag_suppresses_coverage_only_report() {
+    let mut row_a = make_row("test_pc", "tiny-1llc", true, 0.0);
+    let mut row_b = make_row("test_pc", "tiny-1llc", true, 0.0);
+    row_a.phases = vec![make_phase_bucket(0, "BASELINE", &[("avg_nr_running", 5.0)])];
+    row_b.phases = vec![make_phase_bucket(0, "BASELINE", &[("max_dsq_depth", 6.0)])];
+    let report = compare_rows_by(&[row_a], &[row_b], &[], None, &ComparisonPolicy::default());
+    assert!(!report.phase_coverage_diffs.is_empty());
+    let opts = PhaseDisplayOptions {
+        no_phases: true,
+        ..PhaseDisplayOptions::default()
+    };
+    assert!(
+        format_phase_block_lines(&report, &opts, "A", "B").is_empty(),
+        "--no-phases must suppress even a coverage-only report"
+    );
+}
+
 /// The per-phase AND unpaired-phase compare surfaces suppress Rate
 /// components too (not just the scalar findings pass). A and B share step 0
 /// (matched); A has a step-1 phase B lacks (side=A orphan) and B has a
@@ -300,6 +449,85 @@ fn compare_rows_per_phase_and_unpaired_suppress_rate_components() {
     assert!(
         orphan_b.metrics.contains_key("max_dsq_depth"),
         "non-suppressed metric must survive in the side-B UnpairedPhaseRow.metrics",
+    );
+}
+
+/// A render-suppressed Rate component present on exactly ONE side of a
+/// MATCHED phase is dropped, NOT emitted as a PhaseCoverageDiff — the
+/// one-sided sibling of the suppression the test above pins for the
+/// (Some, Some) delta path and the unpaired arms. push_phase_deltas runs
+/// `is_render_suppressed_component` BEFORE the (Some, None) / (None, Some)
+/// match, so a one-sided suppressed component is `continue`d ahead of either
+/// coverage arm. Pins that ordering: a future refactor moving the suppression
+/// check inside only the (Some, Some) arm would leak the component into
+/// `phase_coverage_diffs` and the coverage table, and nothing else would catch
+/// it.
+#[test]
+fn compare_rows_by_phase_one_sided_suppressed_component_is_dropped_not_coverage_diff() {
+    // Matched BASELINE: A carries only the suppressed component
+    // (total_phase_iterations); B carries only a non-suppressed metric
+    // (max_dsq_depth). Both are one-sided within the matched phase.
+    let mut row_a = make_row("test_sc", "tiny-1llc", true, 0.0);
+    let mut row_b = make_row("test_sc", "tiny-1llc", true, 0.0);
+    row_a.phases = vec![make_phase_bucket(0, "BASELINE", &[("total_phase_iterations", 1000.0)])];
+    row_b.phases = vec![make_phase_bucket(0, "BASELINE", &[("max_dsq_depth", 6.0)])];
+    let report = compare_rows_by(&[row_a], &[row_b], &[], None, &ComparisonPolicy::default());
+
+    let cov_names: Vec<&str> = report
+        .phase_coverage_diffs
+        .iter()
+        .map(|c| c.metric.name)
+        .collect();
+    assert!(
+        !cov_names.contains(&"total_phase_iterations"),
+        "a one-sided render-suppressed component must NOT become a PhaseCoverageDiff; got {cov_names:?}",
+    );
+    assert_eq!(
+        cov_names,
+        vec!["max_dsq_depth"],
+        "only the non-suppressed one-sided metric surfaces as a coverage diff",
+    );
+    assert_eq!(report.phase_coverage_diffs[0].present_side, ComparePartition::B);
+    assert_eq!(report.phase_coverage_diffs[0].value, 6.0);
+    assert!(
+        report.phase_deltas.is_empty(),
+        "no metric is present on both sides -> no delta",
+    );
+    assert!(
+        report.unpaired_phases.is_empty(),
+        "the phase matched on both sides -> no whole-phase orphan",
+    );
+}
+
+/// A one-sided Informational metric within a MATCHED phase DOES surface as a
+/// PhaseCoverageDiff: the (Some, None) / (None, Some) arms carry no
+/// classify_direction / polarity gate (a coverage diff is never a verdict),
+/// unlike the (Some, Some) delta arm which skips Informational metrics. Pins
+/// the documented intent that a one-sided Informational metric is reported,
+/// not dropped.
+#[test]
+fn compare_rows_by_phase_one_sided_informational_metric_is_coverage_diff() {
+    // total_ttwu_count is Polarity::Informational; present only on A's matched
+    // BASELINE, with a non-suppressed directional metric only on B.
+    let mut row_a = make_row("test_inf_os", "tiny-1llc", true, 0.0);
+    let mut row_b = make_row("test_inf_os", "tiny-1llc", true, 0.0);
+    row_a.phases = vec![make_phase_bucket(0, "BASELINE", &[("total_ttwu_count", 42.0)])];
+    row_b.phases = vec![make_phase_bucket(0, "BASELINE", &[("max_dsq_depth", 6.0)])];
+    let report = compare_rows_by(&[row_a], &[row_b], &[], None, &ComparisonPolicy::default());
+
+    let inf = report
+        .phase_coverage_diffs
+        .iter()
+        .find(|c| c.metric.name == "total_ttwu_count")
+        .expect("a one-sided Informational metric surfaces as a coverage diff");
+    assert_eq!(inf.present_side, ComparePartition::A);
+    assert_eq!(inf.value, 42.0);
+    assert!(
+        report
+            .phase_deltas
+            .iter()
+            .all(|d| d.metric.name != "total_ttwu_count"),
+        "an Informational metric is never a phase delta",
     );
 }
 
@@ -1099,23 +1327,33 @@ fn compare_partition_as_str_maps_each_variant_to_its_letter() {
 // -- compare_partitions render-phase + summary block (e2e through
 //    the on-disk sidecar pool) --
 
+/// One phase-bucket spec for [`phase_sidecar`]:
+/// `(step_index, label, worst_spread, extra per-bucket metrics)`. The
+/// extras let a bucket carry a metric its matched-pair bucket lacks,
+/// exercising the one-sided-metric-within-a-matched-phase coverage path.
+type PhaseSpec<'a> = (u16, &'a str, f64, &'a [(&'a str, f64)]);
+
 /// Build a sidecar carrying scalar `worst_spread` and the given
-/// `(step_index, label, worst_spread)` phase buckets, so a row pair
-/// produces both a scalar finding and per-phase deltas when the
-/// metric moves across sides. `phases` flows verbatim into
-/// `GauntletRow.phases` via `sidecar_to_row`, which the per-phase
-/// pass in `compare_rows_by` reads. Phase-coverage asymmetry (a step
-/// present on one side only) drives the unpaired-phase render path.
+/// phase buckets, so a row pair produces both a scalar finding and
+/// per-phase deltas when the metric moves across sides. `phases`
+/// flows verbatim into `GauntletRow.phases` via `sidecar_to_row`,
+/// which the per-phase pass in `compare_rows_by` reads. Phase-coverage
+/// asymmetry (a step present on one side only) drives the
+/// unpaired-phase render path.
 fn phase_sidecar(
     test_name: &str,
     scheduler: &str,
     passed: bool,
     spread: f64,
-    phases: &[(u16, &str, f64)],
+    phases: &[PhaseSpec],
 ) -> crate::test_support::SidecarResult {
     let phase_buckets = phases
         .iter()
-        .map(|(idx, label, ps)| make_phase_bucket(*idx, label, &[("worst_spread", *ps)]))
+        .map(|&(idx, label, ps, extras)| {
+            let mut metrics: Vec<(&str, f64)> = vec![("worst_spread", ps)];
+            metrics.extend_from_slice(extras);
+            make_phase_bucket(idx, label, &metrics)
+        })
         .collect();
     crate::test_support::SidecarResult {
         test_name: test_name.to_string(),
@@ -1133,19 +1371,32 @@ fn phase_sidecar(
 
 /// End-to-end pin on the `compare_partitions` render path that the
 /// unit-level helper tests can't reach: the phase-delta table, the
-/// phase-coverage-asymmetry table, the discovery footer hint, and
-/// the summary block (excluded_pairs + per-group + new_in_b +
-/// removed_from_a) all render inside `compare_partitions`, which
-/// pools sidecars off disk. The fixture writes a tempdir pool whose
-/// per-side filters slice on `scheduler`, so the comparison joins on
-/// the remaining pairing dims and exercises every summary counter:
+/// one-sided-phase asymmetry table, the one-sided-metric coverage
+/// table, the discovery footer hint, and the scalar summary block
+/// (excluded_pairs + new_in_b + removed_from_a) all render inside
+/// `compare_partitions`, which pools sidecars off disk. The fixture
+/// writes a tempdir pool whose per-side filters slice on `scheduler`,
+/// so the comparison joins on the remaining pairing dims.
+///
+/// Runs with `no_average = true`: per-phase buckets only survive the
+/// pool -> row path under `--no-average` — the averaging fold drops
+/// them (`into_averaged_group` sets `phases: Vec::new()` because
+/// buckets do not aggregate cleanly across an averaged group), so
+/// `--no-average` is the only mode that feeds the phase block any
+/// data. Each side carries exactly one sidecar per pairing key, so
+/// `check_no_duplicate_pairing_keys` does not bail. Per-group pass
+/// counts are an averaging-only summary line and therefore do not
+/// render here; they have their own `format_per_group_pass_counts`
+/// unit tests.
 ///
 /// - `paired_scn` exists on both sides with a `worst_spread`
 ///   10 -> 30 move (scalar regression -> exit 1). Its BASELINE
-///   phase matches on both sides (10 -> 30) -> a per-phase
-///   regression row; the B side additionally carries a Step[0]
-///   bucket the A side lacks -> a one-sided UnpairedPhaseRow that
-///   drives the phase-coverage-asymmetry table render path.
+///   phase matches on both sides (worst_spread 10 -> 30) -> a
+///   per-phase regression row; A's BASELINE additionally carries an
+///   `avg_nr_running` metric B's BASELINE lacks -> a one-sided-metric
+///   PhaseCoverageDiff (the coverage table); B additionally carries a
+///   Step[0] bucket A lacks -> a one-sided UnpairedPhaseRow (the
+///   asymmetry table).
 /// - `excl_scn` exists on both sides but the B side failed
 ///   (`passed=false`) -> `excluded_pairs` line.
 /// - `new_only_b` exists only on the B side -> `new_in_b` line.
@@ -1153,10 +1404,12 @@ fn phase_sidecar(
 ///   line.
 ///
 /// Asserts exit 1 (the scalar regression drives the return value)
-/// and, by running the full render under several
-/// `PhaseDisplayOptions`, that the render-phase block + its
-/// render-time `matches_phase` / `passes_delta_threshold` filters
-/// execute without panicking.
+/// and, by running the full render under several `PhaseDisplayOptions`,
+/// that the render-phase block + its render-time `matches_phase` /
+/// `passes_delta_threshold` projections execute without panicking. The
+/// rendered table CONTENT is asserted by the `format_phase_block_lines`
+/// unit tests above; this e2e pins the full pool -> `sidecar_to_row`
+/// -> `compare_rows_by` -> render chain reaches the phase block.
 #[test]
 fn compare_partitions_renders_phase_and_summary_blocks_via_pool() {
     let alt_root = tempfile::TempDir::new().expect("create alt-root tempdir");
@@ -1165,12 +1418,28 @@ fn compare_partitions_renders_phase_and_summary_blocks_via_pool() {
     // scheduler is the slicing dim. The B side of paired_scn carries
     // an extra Step[0] bucket so the matched pair has phase-coverage
     // asymmetry (covers the unpaired-phase render path).
-    let baseline = |s: f64| vec![(0u16, "BASELINE", s)];
-    let baseline_plus_step = |s: f64| vec![(0u16, "BASELINE", s), (1u16, "Step[0]", s)];
+    // `const` (not a `let` binding) so the extra-metrics slices are
+    // `'static` and outlive the `sidecars` array that borrows them.
+    const NO_EXTRA: &[(&str, f64)] = &[];
+    const PAIRED_A_EXTRA: &[(&str, f64)] = &[("avg_nr_running", 5.0)];
+    let baseline = |s: f64| vec![(0u16, "BASELINE", s, NO_EXTRA)];
+    let baseline_plus_step =
+        |s: f64| vec![(0u16, "BASELINE", s, NO_EXTRA), (1u16, "Step[0]", s, NO_EXTRA)];
     let sidecars = [
         // paired on both sides: 10 -> 30 scalar + BASELINE phase
         // regression; B's extra Step[0] -> unpaired (side B) phase.
-        ("paired_scn", "scx_alpha", true, 10.0, baseline(10.0)),
+        // A's BASELINE additionally carries an avg_nr_running metric that
+        // B's BASELINE lacks -> a one-sided-metric-within-a-matched-phase
+        // PhaseCoverageDiff, which drives the new per-phase coverage-diff
+        // render branch (no-panic; coverage diffs do not gate, so exit is
+        // still 1 from the scalar worst_spread regression).
+        (
+            "paired_scn",
+            "scx_alpha",
+            true,
+            10.0,
+            vec![(0u16, "BASELINE", 10.0, PAIRED_A_EXTRA)],
+        ),
         (
             "paired_scn",
             "scx_beta",
@@ -1204,15 +1473,16 @@ fn compare_partitions_renders_phase_and_summary_blocks_via_pool() {
         ..RowFilter::default()
     };
 
-    // Default phase options: render-everything path (phase table +
-    // asymmetry table + footer hint + full summary block).
+    // Default phase options: render-everything path (phase-delta table +
+    // one-sided-phase asymmetry table + one-sided-metric coverage table +
+    // footer hint + scalar summary block).
     let exit = compare_partitions(
         &filter_a,
         &filter_b,
         None,
         &ComparisonPolicy::default(),
         Some(alt_root.path()),
-        false,
+        true, // no_average: phase buckets only survive the pool -> row path under --no-average
         &PhaseDisplayOptions::default(),
     )
     .expect("compare_partitions must pool the fixtures and run");
@@ -1225,8 +1495,9 @@ fn compare_partitions_renders_phase_and_summary_blocks_via_pool() {
     // --phase-threshold + --steps-only exercise the render-time
     // `passes_delta_threshold` and `matches_phase` projections inside
     // the phase block. --steps-only suppresses the BASELINE bucket
-    // (every fixture's only phase) so the phase table collapses while
-    // the scalar regression — and thus the exit code — is unchanged.
+    // (step 0) so paired_scn's BASELINE delta + coverage rows drop,
+    // leaving its Step[0] (step 1) unpaired row; the scalar regression
+    // — and thus the exit code — is unchanged.
     let opts_filtered = PhaseDisplayOptions {
         steps_only: true,
         phase_threshold: Some(5.0),
@@ -1238,7 +1509,7 @@ fn compare_partitions_renders_phase_and_summary_blocks_via_pool() {
         None,
         &ComparisonPolicy::default(),
         Some(alt_root.path()),
-        false,
+        true, // no_average: keep phases for the render-filter projections
         &opts_filtered,
     )
     .expect("compare_partitions must run under render-filter flags");
@@ -1261,7 +1532,7 @@ fn compare_partitions_renders_phase_and_summary_blocks_via_pool() {
         None,
         &ComparisonPolicy::default(),
         Some(alt_root.path()),
-        false,
+        true, // no_average: keep phases so --phases-only has a block to project
         &opts_phases_only,
     )
     .expect("compare_partitions must run under --phases-only");
@@ -1293,7 +1564,8 @@ fn compare_partitions_no_average_bails_on_duplicate_pairing_keys() {
     for (i, (name, sched)) in triples.iter().enumerate() {
         let run_dir = alt_root.path().join(format!("__dup_{i}__"));
         std::fs::create_dir_all(&run_dir).expect("create run dir");
-        let sc = phase_sidecar(name, sched, true, 10.0, &[(0, "BASELINE", 10.0)]);
+        let sc =
+            phase_sidecar(name, sched, true, 10.0, &[(0, "BASELINE", 10.0, &[] as &[(&str, f64)])]);
         let json = serde_json::to_string(&sc).expect("serialize sidecar");
         std::fs::write(run_dir.join(format!("{name}_{i}.ktstr.json")), json)
             .expect("write sidecar");
