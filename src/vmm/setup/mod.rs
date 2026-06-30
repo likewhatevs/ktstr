@@ -700,7 +700,7 @@ impl KtstrVm {
             // x86 PCI guest, and None otherwise (no PCI), in which case the facade
             // omits the MSI-X cap and the NIC stays on INTx (no undeliverable MSI-X
             // is advertised).
-            let msix = Arc::new(PiMutex::new(virtio_net::MsixState::new()));
+            let msix = Arc::new(PiMutex::new(virtio_net::MsixState::new(dev.num_queues())));
             let mut msix_gsis = [0u32; virtio_net::MSIX_VECTORS];
             let route_sink: Option<Arc<dyn virtio_net::MsixRouteSink>> = match &msix_sink {
                 Some(sink) => {

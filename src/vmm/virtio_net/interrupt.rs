@@ -25,25 +25,33 @@
 //! The mutex is uncontended in practice: every access — facade config writes and
 //! core signals alike — is on the vCPU thread under the `PciBus` lock.
 //!
-//! # Single-vector SHARED mode (v0)
+//! # Single shared queue vector (SHARED mode)
 //!
-//! v0 advertises [`MSIX_VECTORS`] = 2 table entries. Linux's `virtio_pci_modern`
-//! driver's `vp_find_vqs` tries three vector policies in order
-//! (drivers/virtio/virtio_pci_common.c): `VP_VQ_VECTOR_POLICY_EACH` (one vector
-//! per virtqueue + one for config = 3 for net's config + RX + TX) and
-//! `VP_VQ_VECTOR_POLICY_SHARED_SLOW` (per-vq for the data vqs, shared only for a
-//! slow-path/admin vq — net has none, so this degenerates to per-vq and also
-//! needs 3) BOTH request 3 vectors and so fail against a 2-entry table; it then
-//! falls through to `VP_VQ_VECTOR_POLICY_SHARED` (`nvectors = 2`): config →
-//! `VP_MSIX_CONFIG_VECTOR` (0), ALL virtqueues → `VP_MSIX_VQ_VECTOR` (1)
-//! (virtio_pci_common.h). So both queues map to one shared queue vector, and a
-//! coalesced VRING signal resolves to that single vector — there is no need to
-//! distinguish RX from TX. Per-virtqueue vectors (Table Size ≥ 3, faithful
-//! per-node IRQ steering) are a follow-up that also raises `NUM_QUEUES`; the
-//! `NUM_QUEUES == 2` static guard in the PCI facade gates that work.
+//! The device advertises [`MSIX_VECTORS`] = 2 table entries. Linux's
+//! `virtio_pci_modern` driver's `vp_find_vqs` tries three vector policies in
+//! order (drivers/virtio/virtio_pci_common.c): `VP_VQ_VECTOR_POLICY_EACH` (one
+//! vector per virtqueue + one for config — `2N + 2` for `N` queue-pairs plus
+//! the control vq) and `VP_VQ_VECTOR_POLICY_SHARED_SLOW` (per-vq for the data
+//! vqs, shared only for a slow-path/admin vq — net has none, so it degenerates
+//! to per-vq) both request more than 2 vectors and so fail against the 2-entry
+//! table; the driver then falls through to `VP_VQ_VECTOR_POLICY_SHARED`
+//! (`nvectors = 2`): config → `VP_MSIX_CONFIG_VECTOR` (0), ALL virtqueues →
+//! `VP_MSIX_VQ_VECTOR` (1) (virtio_pci_common.h). So every data queue (and the
+//! control vq) maps to the one shared queue vector, and a coalesced VRING
+//! signal resolves to that single vector — no need to distinguish RX from TX,
+//! or one data queue from another. This stays correct under multiqueue because
+//! the guest's shared-vector handler polls every vq mapped to the vector.
+//! Per-virtqueue vectors (faithful per-node IRQ steering) are a follow-up that
+//! raises `MSIX_VECTORS` so each data vq gets its own vector + GSI; multiqueue
+//! is offered only on this MSI-X transport (`VirtioNet::device_features` gates
+//! `VIRTIO_NET_F_MQ` on `msix`), so it always rides the edge-MSI path.
 
 use vmm_sys_util::eventfd::EventFd;
 
+// `NUM_QUEUES` (the single-pair baseline) is referenced only by the unit tests
+// below — the production state sizes `queue_vectors` from the per-device queue
+// count passed to `new`.
+#[cfg(test)]
 use super::device::NUM_QUEUES;
 
 /// MSI-X table entries the device advertises (Table Size = `MSIX_VECTORS`,
@@ -128,15 +136,22 @@ pub(crate) struct MsixState {
     /// the guest programs it.
     config_vector: u16,
     /// Guest-assigned per-queue vectors (`CC_QUEUE_MSIX_VECTOR` per queue),
-    /// `NO_VECTOR` until programmed. In SHARED mode every entry is the same
-    /// vector (see the module doc).
-    queue_vectors: [u16; NUM_QUEUES],
+    /// `NO_VECTOR` until programmed. Length is the device's virtqueue count
+    /// (`2 * queue_pairs`, plus the control vq when multiqueue is offered),
+    /// fixed at construction. In SHARED mode every entry resolves to the same
+    /// vector (see the module doc); the vector VALUES stay within
+    /// `MSIX_VECTORS`, so the table / PBA / eventfd arrays remain
+    /// `MSIX_VECTORS`-sized — only this per-queue map scales with the queue
+    /// count.
+    queue_vectors: Vec<u16>,
 }
 
 impl MsixState {
     /// New state with every vector unprogrammed, every table entry masked (the
-    /// PCI reset value), MSI-X disabled.
-    pub(crate) fn new() -> Self {
+    /// PCI reset value), MSI-X disabled. `num_queues` is the device's
+    /// virtqueue count — the length of the per-queue vector map
+    /// ([`Self::queue_vectors`]).
+    pub(crate) fn new(num_queues: usize) -> Self {
         let mut table = [[0u32; MSIX_ENTRY_DWORDS]; MSIX_VECTORS];
         for entry in &mut table {
             entry[VECTOR_CTRL_DWORD] = VECTOR_CTRL_MASK_BIT;
@@ -148,7 +163,7 @@ impl MsixState {
             enabled: false,
             function_mask: false,
             config_vector: NO_VECTOR,
-            queue_vectors: [NO_VECTOR; NUM_QUEUES],
+            queue_vectors: vec![NO_VECTOR; num_queues],
         }
     }
 
@@ -283,7 +298,9 @@ impl MsixState {
     /// eventfds) — those reset only on PCI/FLR reset, not a virtio status reset.
     pub(crate) fn reset_virtio_assignments(&mut self) {
         self.config_vector = NO_VECTOR;
-        self.queue_vectors = [NO_VECTOR; NUM_QUEUES];
+        // Keep the per-queue map's length (the device's queue count is fixed
+        // at construction); reset every entry to unassigned.
+        self.queue_vectors.fill(NO_VECTOR);
     }
 
     /// Read a table dword `(entry, dword)`; 0 for out-of-range (a conformant
@@ -361,7 +378,7 @@ mod tests {
     /// A state with two registered eventfds, MSI-X enabled, config→0, queues→1
     /// (the SHARED-mode assignment), both vectors unmasked.
     fn enabled_state() -> (MsixState, EventFd, EventFd) {
-        let mut s = MsixState::new();
+        let mut s = MsixState::new(NUM_QUEUES);
         let v0 = EventFd::new(libc::EFD_NONBLOCK).unwrap();
         let v1 = EventFd::new(libc::EFD_NONBLOCK).unwrap();
         // Hand the state a dup of each fd so the test keeps its own readable end.
@@ -383,7 +400,7 @@ mod tests {
 
     #[test]
     fn reset_state_is_masked_and_disabled() {
-        let s = MsixState::new();
+        let s = MsixState::new(NUM_QUEUES);
         assert!(!s.enabled());
         assert_eq!(s.config_vector(), NO_VECTOR);
         assert_eq!(s.queue_vector(0), NO_VECTOR);
@@ -468,7 +485,7 @@ mod tests {
 
     #[test]
     fn out_of_range_vector_is_inert() {
-        let mut s = MsixState::new();
+        let mut s = MsixState::new(NUM_QUEUES);
         s.set_message_control(0x8000);
         s.set_config_vector(99); // would be clamped by the facade; defensive here
         s.signal(IrqSource::Config);
@@ -477,7 +494,7 @@ mod tests {
 
     #[test]
     fn eventfd_replace_returns_prior() {
-        let mut s = MsixState::new();
+        let mut s = MsixState::new(NUM_QUEUES);
         let a = EventFd::new(libc::EFD_NONBLOCK).unwrap();
         let b = EventFd::new(libc::EFD_NONBLOCK).unwrap();
         let a_raw = a.as_raw_fd();

@@ -41,22 +41,25 @@
 //!    translates the guest's level/active-low RTE to one-shot edge MSIs, one per
 //!    assert.
 //!
-//! v0 needs no active resample handler (and the edge path no level
-//! re-injection), but that rests on a specific invariant: the device has ONE TX
-//! queue, and the guest serializes all TX submission on that queue's lock, so
-//! the core's two `irq_evt` assert sites — `signal_used` (VRING) and
-//! `signal_queue_poisoned` (CONFIG/NEEDS_RESET) — are both reached only
-//! synchronously from `process_tx_loopback` on the vCPU thread and are thereby
-//! serialized — a kick's interrupt is consumed before the next
-//! `irq_evt.write(1)`, so no assert is lost to the level being already-high (an
-//! idempotent `kvm_set_irq(...,1)`). This is NOT
-//! a property of the transport: multiqueue (per-queue kicks from different
-//! vCPUs) or an async RX backend (the device asserting independently of a vCPU
-//! kick) would let a second assert coalesce into a still-high level and strand
-//! a completion until the next unrelated kick. Both need the active resample
-//! handler (drain the resample eventfd, re-assert `irq_evt` if
-//! `interrupt_status` is still nonzero after EOI) before they land — see the
-//! `NUM_QUEUES == 2` static guard below.
+//! The legacy INTx path needs no active resample handler (and the
+//! split-irqchip edge path no level re-injection), which rests on a specific
+//! invariant: every `irq_evt` assert is reached synchronously from
+//! `process_tx_loopback` on the vCPU thread and consumed before the next. The
+//! core's two assert sites — `signal_used` (VRING) and `signal_queue_poisoned`
+//! (CONFIG/NEEDS_RESET) — run only there, so a kick's interrupt is consumed
+//! before the next `irq_evt.write(1)` and no assert is lost to an already-high
+//! level (an idempotent `kvm_set_irq(...,1)`). Multiqueue (per-queue kicks from
+//! different vCPUs) or an async RX backend (the device asserting independently
+//! of a vCPU kick) would break this — a second assert could coalesce into a
+//! still-high level and strand a completion until the next unrelated kick — and
+//! would need the active resample handler (drain the resample eventfd,
+//! re-assert `irq_evt` if `interrupt_status` is still nonzero after EOI) plus
+//! split-irqchip level re-injection, both follow-ups. The device keeps the
+//! legacy path single-asserter by gating multiqueue (`VIRTIO_NET_F_MQ`) on the
+//! MSI-X transport (`VirtioNet::device_features`): MSI-X delivers each used-ring
+//! publish as a one-shot edge MSI with no shared level, so multiqueue never
+//! rides the legacy path — see the `NUM_QUEUES` baseline invariant comment
+//! below.
 
 use std::sync::Arc;
 
@@ -120,31 +123,34 @@ const MSIX_ENTRY_SIZE: u64 = 16;
 /// `off / NOTIFY_OFF_MULTIPLIER`) — the multiqueue increment edits both.
 const NOTIFY_OFF_MULTIPLIER: u32 = 4;
 
-// The v0 INTx model (no active resample drain on the full-irqchip path; no
-// userspace-IOAPIC level re-injection on the split-irqchip edge path) is
-// correct ONLY because every `irq_evt` assert is reached SYNCHRONOUSLY from
-// `process_tx_loopback` on the vCPU thread. There are two assert sites in the
-// core — `signal_used` (VRING) and `signal_queue_poisoned` (CONFIG/NEEDS_RESET)
-// — and BOTH are invoked only from within process_tx_loopback, which runs on
-// the vCPU thread under the single TX queue's serialization; so each interrupt
-// is consumed before the next assert (see the module doc). Guest-side kick
-// serialization alone is not enough — the device-side asserts must also be
-// serialized, which holds precisely because the loopback is the only path that
-// reaches either assert site.
+// Multiqueue safety invariant. The legacy interrupt path (full-irqchip INTx
+// with no active resample drain; split-irqchip / virtio-MMIO with no level
+// re-injection) is correct ONLY when every `irq_evt` assert is reached
+// SYNCHRONOUSLY from `process_tx_loopback` on the vCPU thread and consumed
+// before the next assert — `signal_used` (VRING) and `signal_queue_poisoned`
+// (CONFIG/NEEDS_RESET) are the only assert sites and both run there. Two
+// independently-kicked TX queues would break that: their asserts could
+// coalesce on a still-high shared level and strand a completion until the next
+// unrelated kick (the hazard an active resample handler / split-irqchip level
+// re-injection — both follow-ups, see the module doc — would close).
 //
-// This guard catches ONLY the multiqueue half of the hazard: raising
-// NUM_QUEUES turns into a compile error pointing at the active-resample-handler
-// + level-re-injection requirement. It does NOT (and cannot here) catch the
-// other half — adding an async / off-thread RX backend that asserts `irq_evt`
-// independently of a vCPU kick — because v0 has no off-thread assert site to
-// gate on. That half is a PROCESS gate: must land the active resample
-// drain BEFORE any async RX backend (the module doc spells this out).
+// Multiqueue therefore rides MSI-X, never the legacy level path:
+// `VirtioNet::device_features` offers VIRTIO_NET_F_MQ only when the
+// MSI-X-carrying PCI transport is wired (`msix.is_some()`). MSI-X delivery is
+// one-shot edge — each used-ring publish fires an MSI with no shared level —
+// so independently kicked queues never coalesce on either irqchip path; a
+// guest that declines MSI-X gets no F_MQ and `virtnet_probe` clamps it to one
+// queue-pair, preserving the single-synchronous-asserter invariant. The live
+// per-device queue count is dynamic (`VirtioNet::num_queues`); `NUM_QUEUES`
+// below is the single-pair baseline — the default single-queue device and the
+// SHARED-mode 2-entry MSI-X vector table assume it. The assert pins that
+// baseline (the live count never reads this const).
 const _: () = assert!(
     NUM_QUEUES == 2,
-    "virtio-net-PCI INTx assumes all irq_evt asserts originate on the vCPU \
-     thread in process_tx_loopback (1 RX + 1 TX queue, no off-thread source); \
-     raising NUM_QUEUES requires the active resample handler + split-irqchip \
-     level re-injection first (see module doc)"
+    "NUM_QUEUES is the single-pair baseline (1 RX + 1 TX); the default \
+     single-queue device and the SHARED-mode MSI-X vector table assume it. The \
+     live per-device queue count is dynamic (VirtioNet::num_queues); \
+     multiqueue is gated on the MSI-X transport in device_features (see above)."
 );
 
 /// BAR0 low-dword type bits: bit0=0 (memory), bits\[2:1\]=00 (32-bit), bit3=0
@@ -380,10 +386,11 @@ impl VirtioNetPci {
         // VIRTIO_QUEUE_MAX = 4 * 1024 = 0x1000 (hw/virtio/virtio-pci.c), and
         // cloud-hypervisor likewise grants a page-sized notify region — both
         // identical to REGION_SIZE here, not a divergence. It covers queue i's
-        // notify address (i * NOTIFY_OFF_MULTIPLIER) for NUM_QUEUES up to
-        // 0x1000 / NOTIFY_OFF_MULTIPLIER = 1024 slots — far above the current
-        // NUM_QUEUES=2 (offsets 0 and 4). The multiqueue increment must revisit
-        // this bound if it ever raises NUM_QUEUES past 1024.
+        // notify address (i * NOTIFY_OFF_MULTIPLIER) for up to
+        // 0x1000 / NOTIFY_OFF_MULTIPLIER = 1024 virtqueues. `MAX_QUEUE_PAIRS`
+        // caps the per-device count, so the highest index (the control vq at
+        // 2 * queue_pairs) stays well within that bound; a device exposing more
+        // than 1024 virtqueues would need a larger notify region.
         //
         // NOTIFY chains to the MSI-X cap ONLY when MSI-X is offered (a route sink
         // is wired, on either irqchip path); otherwise it terminates the chain
@@ -496,7 +503,7 @@ impl VirtioNetPci {
             CC_DEVICE_FEATURE => self.net.device_features_window() as u64,
             CC_DRIVER_FEATURE_SELECT => self.net.driver_features_sel() as u64,
             CC_MSIX_CONFIG => self.msix.lock().config_vector() as u64,
-            CC_NUM_QUEUES => NUM_QUEUES as u64,
+            CC_NUM_QUEUES => self.net.num_queues() as u64,
             CC_DEVICE_STATUS => self.net.device_status() as u64,
             CC_CONFIG_GENERATION => self.net.config_generation() as u64,
             // queue_select reads back the RAW latched selector per virtio-v1.2
@@ -602,10 +609,13 @@ impl VirtioNetPci {
     /// Decode a notify-region write to a queue index and kick it. The index is
     /// `off / NOTIFY_OFF_MULTIPLIER` (floor division — a conformant guest writes
     /// `queue_index * NOTIFY_OFF_MULTIPLIER`, but a misaligned `off` is decoded
-    /// by the same floor). `notify_queue` kicks ONLY when the quotient is the TX
-    /// index; every other quotient — RX, or an out-of-range value from a hostile
-    /// write — is a no-op. So any `off` in `[TXQ*mult, (TXQ+1)*mult)` kicks TX
-    /// and every other range is inert (it does not validate the raw offset).
+    /// by the same floor). The decoded index is handed to `notify_queue`, which
+    /// dispatches it: the control vq (index `2 * queue_pairs`, present only when
+    /// multiqueue is offered) drives `process_ctrl_queue`; an active pair's TX
+    /// queue (odd index, `pair < curr_queue_pairs`) drives the loopback; RX
+    /// queues, inactive pairs, and out-of-range indices (including a hostile
+    /// write) are no-ops. `notify_write` does not validate the raw offset —
+    /// `notify_queue` bounds the decoded index.
     fn notify_write(&mut self, off: u64) {
         let idx = off / NOTIFY_OFF_MULTIPLIER as u64;
         self.net.notify_queue(idx as u32);
@@ -957,7 +967,7 @@ mod tests {
     /// MSI-X, no route is actually installed. The MSI-X delivery tests build
     /// their own state + eventfds + a retained mock sink.
     fn new_pci(net: VirtioNet) -> VirtioNetPci {
-        let msix = Arc::new(PiMutex::new(MsixState::new()));
+        let msix = Arc::new(PiMutex::new(MsixState::new(NUM_QUEUES)));
         let sink: Arc<dyn MsixRouteSink> = Arc::new(MockRouteSink::default());
         VirtioNetPci::new(net, TEST_BAR_APERTURE, msix, Some(sink), test_gsis())
     }
@@ -1200,7 +1210,7 @@ mod tests {
         let mut net = VirtioNet::new(NetConfig::default());
         net.set_mem(mem.clone());
         let counters = net.counters();
-        let msix = Arc::new(PiMutex::new(MsixState::new()));
+        let msix = Arc::new(PiMutex::new(MsixState::new(NUM_QUEUES)));
         // Hand the state a clone of each eventfd; keep the originals to drain.
         let evts: [EventFd; MSIX_VECTORS] =
             std::array::from_fn(|_| EventFd::new(libc::EFD_NONBLOCK).unwrap());
@@ -1349,7 +1359,7 @@ mod tests {
         let mem = test_mem();
         let mut net = VirtioNet::new(NetConfig::default());
         net.set_mem(mem.clone());
-        let msix = Arc::new(PiMutex::new(MsixState::new()));
+        let msix = Arc::new(PiMutex::new(MsixState::new(NUM_QUEUES)));
         let pci = VirtioNetPci::new(net, TEST_BAR_APERTURE, msix, None, [0; MSIX_VECTORS]);
         // NOTIFY is the last cap (cap_next = 0) — the MSI-X cap is not chained.
         assert_eq!(

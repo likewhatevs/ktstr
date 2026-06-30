@@ -384,6 +384,131 @@ fn assert_counter_monotonicity(
 }
 
 // ----------------------------------------------------------------------------
+// Control-virtqueue fuzz fixture + counters
+//
+// The cvq (VIRTIO_NET_CTRL_MQ / VQ_PAIRS_SET) is a second hostile-input
+// chain-parser distinct from the TX/RX loopback path: `eval_ctrl_chain`
+// walks a descriptor chain to collect leading readable command bytes and
+// locate the first device-writable status descriptor. It needs its own
+// chain-mutation proptest (the firecracker pattern again — corrupt every
+// chain element) because its parse rules differ (a writable status
+// descriptor is mandatory; the command bytes are validated, not echoed).
+// ----------------------------------------------------------------------------
+
+// cvq guest-memory layout — placed above the data-queue regions
+// (0x1000..0xC000) so the cvq rings/buffers never alias them.
+const CVQ_DESC_BASE: u64 = 0xC000;
+const CVQ_AVAIL_BASE: u64 = 0xD000;
+const CVQ_USED_BASE: u64 = 0xE000;
+const CVQ_CMD_BASE: u64 = 0xF000; // readable [class u8, cmd u8, pairs u16 LE]
+const CVQ_STATUS_BASE: u64 = 0xF800; // device-writable status u8
+
+// cvq wire constants (mirror virtio_bindings::virtio_net so the chain bytes
+// read as the on-the-wire format; kept local to this module like the rest of
+// the proptest helpers).
+const CVQ_CTRL_MQ_CLASS: u8 = 4; // VIRTIO_NET_CTRL_MQ
+const CVQ_VQ_PAIRS_SET: u8 = 0; // VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET
+const CVQ_NET_OK: u8 = 0; // VIRTIO_NET_OK
+const CVQ_NET_ERR: u8 = 1; // VIRTIO_NET_ERR
+
+// Offered queue-pair count for the cvq proptests. A small value keeps the
+// valid VQ_PAIRS_SET window ([1, 4]) a tiny slice of the fuzzed u16 range so
+// the out-of-range NAK path dominates, while still exercising the in-range
+// ACK path on the random hits inside the window.
+const CVQ_FUZZ_QUEUE_PAIRS: u16 = 4;
+
+/// Build a multiqueue `VirtioNet` (`queue_pairs` pairs) with MSI-X wired so
+/// the device offers F_MQ + F_CTRL_VQ (the gate is `msix.is_some()`),
+/// negotiate VERSION_1 + MAC + F_MQ + F_CTRL_VQ, program ONLY the control vq
+/// (the data queues are irrelevant to `process_ctrl_queue`), and reach
+/// DRIVER_OK. Returns the device, the shared guest memory, and the control-vq
+/// index (`2 * queue_pairs`). Mirrors `tests::multiqueue_dev_with_cvq`, kept
+/// local because the proptest module cannot reach the sibling test module's
+/// private helpers.
+fn build_cvq_fuzz_fixture(queue_pairs: u16) -> (VirtioNet, GuestMemoryMmap, usize) {
+    use super::interrupt::MsixState;
+    use crate::vmm::PiMutex;
+    use std::sync::Arc;
+    use virtio_bindings::virtio_net::{VIRTIO_NET_F_CTRL_VQ, VIRTIO_NET_F_MQ};
+
+    let mem = GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), GUEST_MEM_SIZE)])
+        .expect("create cvq proptest guest mem");
+    let mut dev = VirtioNet::new(NetConfig::default().queue_pairs(queue_pairs));
+    dev.set_mem(mem.clone());
+    let nq = dev.num_queues();
+    dev.set_msix_state(Arc::new(PiMutex::new(MsixState::new(nq))));
+
+    write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_ACK);
+    write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_DRV);
+    write_reg(&mut dev, VIRTIO_MMIO_DRIVER_FEATURES_SEL, 0);
+    write_reg(
+        &mut dev,
+        VIRTIO_MMIO_DRIVER_FEATURES,
+        (1u32 << VIRTIO_NET_F_MAC) | (1u32 << VIRTIO_NET_F_MQ) | (1u32 << VIRTIO_NET_F_CTRL_VQ),
+    );
+    write_reg(&mut dev, VIRTIO_MMIO_DRIVER_FEATURES_SEL, 1);
+    write_reg(
+        &mut dev,
+        VIRTIO_MMIO_DRIVER_FEATURES,
+        1u32 << (VIRTIO_F_VERSION_1 - 32),
+    );
+    write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_FEAT);
+
+    let cvq = nq - 1; // control vq is the trailing index = 2 * queue_pairs
+    write_reg(&mut dev, VIRTIO_MMIO_QUEUE_SEL, cvq as u32);
+    write_reg(&mut dev, VIRTIO_MMIO_QUEUE_NUM, PROPTEST_QUEUE_SIZE as u32);
+    write_reg(&mut dev, VIRTIO_MMIO_QUEUE_DESC_LOW, CVQ_DESC_BASE as u32);
+    write_reg(&mut dev, VIRTIO_MMIO_QUEUE_AVAIL_LOW, CVQ_AVAIL_BASE as u32);
+    write_reg(&mut dev, VIRTIO_MMIO_QUEUE_USED_LOW, CVQ_USED_BASE as u32);
+    write_reg(&mut dev, VIRTIO_MMIO_QUEUE_READY, 1);
+    write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_OK);
+    (dev, mem, cvq)
+}
+
+/// Snapshot of the counters `process_ctrl_queue` mutates. The cvq drives a
+/// disjoint counter set from the data path: every notify with a published
+/// chain bumps exactly one of these (or advances the used ring on a
+/// well-formed command), so their sum is the cvq forward-progress signal.
+#[derive(Default, Clone, Copy, Debug)]
+struct CvqCounterSnapshot {
+    ctrl_mq_set: u64,
+    ctrl_chain_invalid: u64,
+    ctrl_add_used_failures: u64,
+    invalid_avail_idx_count: u64,
+}
+
+fn snapshot_cvq_counters(dev: &VirtioNet) -> CvqCounterSnapshot {
+    let c = dev.counters();
+    CvqCounterSnapshot {
+        ctrl_mq_set: c.ctrl_mq_set(),
+        ctrl_chain_invalid: c.ctrl_chain_invalid(),
+        ctrl_add_used_failures: c.ctrl_add_used_failures(),
+        invalid_avail_idx_count: c.invalid_avail_idx_count(),
+    }
+}
+
+/// Total observable cvq progress across the event counters. A regression
+/// that added a silent cvq drop (no counter, no used.idx) would leave this
+/// at zero, failing the forward-progress invariant.
+fn cvq_counter_delta(before: &CvqCounterSnapshot, after: &CvqCounterSnapshot) -> u64 {
+    (after.ctrl_mq_set - before.ctrl_mq_set)
+        + (after.ctrl_chain_invalid - before.ctrl_chain_invalid)
+        + (after.ctrl_add_used_failures - before.ctrl_add_used_failures)
+        + (after.invalid_avail_idx_count - before.invalid_avail_idx_count)
+}
+
+fn assert_cvq_counter_monotonicity(
+    before: &CvqCounterSnapshot,
+    after: &CvqCounterSnapshot,
+) -> Result<(), TestCaseError> {
+    prop_assert!(after.ctrl_mq_set >= before.ctrl_mq_set);
+    prop_assert!(after.ctrl_chain_invalid >= before.ctrl_chain_invalid);
+    prop_assert!(after.ctrl_add_used_failures >= before.ctrl_add_used_failures);
+    prop_assert!(after.invalid_avail_idx_count >= before.invalid_avail_idx_count);
+    Ok(())
+}
+
+// ----------------------------------------------------------------------------
 // proptest cases
 // ----------------------------------------------------------------------------
 
@@ -832,5 +957,148 @@ proptest! {
             tx_pkt_delta,
             tx_inv_delta,
         );
+    }
+
+    /// Random descriptor chains fed to the CONTROL virtqueue MUST be parsed
+    /// safely: `process_ctrl_queue` / `eval_ctrl_chain` walk an arbitrary
+    /// chain (random addr/len/flags/next per descriptor) and must
+    ///
+    ///   1. never panic, OOB-index, or unwrap-on-None — a panic on the vCPU
+    ///      thread that called `mmio_write(QUEUE_NOTIFY)` tears down the VM;
+    ///   2. NEVER push `curr_queue_pairs` outside `[1, queue_pairs]` — this
+    ///      is the cvq safety invariant. `notify_queue` routes a TX kick to
+    ///      `process_tx_loopback(pair)` only when `pair < curr_queue_pairs`,
+    ///      so a hostile chain that corrupted `curr_queue_pairs` past the
+    ///      allocated queue count would steer a kick at a non-existent
+    ///      queue. `eval_ctrl_chain` only returns `Some(pairs)` for
+    ///      `pairs ∈ [VQ_PAIRS_MIN, queue_pairs]` (the sole write site), so
+    ///      no fuzzed input can break this — the proptest pins it;
+    ///   3. show forward progress — every published chain head bumps exactly
+    ///      one cvq counter (`ctrl_mq_set` on a valid command,
+    ///      `ctrl_chain_invalid` on a malformed/NAK'd one, or
+    ///      `ctrl_add_used_failures` on an unmapped status/used GPA) or, on a
+    ///      structural iter() error, `invalid_avail_idx_count`. A silent cvq
+    ///      drop (no counter, no used.idx) would let a hostile guest pin the
+    ///      control queue;
+    ///   4. keep every counter monotonic.
+    ///
+    /// Mirrors `tx_chain_progress_under_random_descriptors` for the cvq path.
+    #[test]
+    fn cvq_chain_progress_under_random_descriptors(
+        descs in fuzz_chain_strategy(),
+    ) {
+        let (mut dev, mem, cvq) = build_cvq_fuzz_fixture(CVQ_FUZZ_QUEUE_PAIRS);
+
+        // Plant the fuzzed chain at the cvq descriptor table, head at idx 0.
+        for (i, d) in descs.iter().enumerate() {
+            write_desc(&mem, CVQ_DESC_BASE, i as u16, d.addr, d.len, d.flags, d.next);
+        }
+        publish_avail(&mem, CVQ_AVAIL_BASE, 0, 0);
+
+        let before_used = read_used_idx(&mem, CVQ_USED_BASE);
+        let before = snapshot_cvq_counters(&dev);
+
+        // SUT: a control-vq kick. A panic propagates and proptest shrinks to
+        // the minimal offending chain; a hang surfaces as the runner timeout.
+        write_reg(&mut dev, VIRTIO_MMIO_QUEUE_NOTIFY, cvq as u32);
+
+        let after_used = read_used_idx(&mem, CVQ_USED_BASE);
+        let after = snapshot_cvq_counters(&dev);
+
+        assert_cvq_counter_monotonicity(&before, &after)?;
+
+        // (2) The cvq safety invariant: curr_queue_pairs stays in range no
+        // matter what the chain contained.
+        let cqp = dev.curr_queue_pairs();
+        prop_assert!(
+            (1..=CVQ_FUZZ_QUEUE_PAIRS).contains(&cqp),
+            "curr_queue_pairs escaped [1,{}]: got {} (chain len={}, \
+             first_desc=({:#x},{},{:#x},{}))",
+            CVQ_FUZZ_QUEUE_PAIRS,
+            cqp,
+            descs.len(),
+            descs[0].addr,
+            descs[0].len,
+            descs[0].flags,
+            descs[0].next,
+        );
+
+        // (3) Forward progress: a published chain head always produces
+        // movement.
+        let used_delta = (after_used - before_used) as u64;
+        let cdelta = cvq_counter_delta(&before, &after);
+        prop_assert!(
+            used_delta + cdelta >= 1,
+            "no cvq progress: used_delta={} counter_delta={} (chain len={}, \
+             first_desc=({:#x},{},{:#x},{}))",
+            used_delta,
+            cdelta,
+            descs.len(),
+            descs[0].addr,
+            descs[0].len,
+            descs[0].flags,
+            descs[0].next,
+        );
+    }
+
+    /// Well-formed cvq VQ_PAIRS_SET chain with an arbitrary `virtqueue_pairs`
+    /// value — fuzz the validation boundary directly. The chain shape is
+    /// fixed (readable hdr → readable payload → writable status); only the
+    /// requested pair count varies across the full u16 range. The device
+    /// MUST ACK `VIRTIO_NET_OK` and set `curr_queue_pairs` exactly when the
+    /// request is in `[1, queue_pairs]`, and NAK `VIRTIO_NET_ERR` while
+    /// leaving `curr_queue_pairs` untouched otherwise. This pins the
+    /// accept/reject decision that the chain-shape fuzzer above only
+    /// incidentally reaches.
+    #[test]
+    fn cvq_pairs_set_validates_arbitrary_pairs_value(
+        pairs in any::<u16>(),
+    ) {
+        let (mut dev, mem, cvq) = build_cvq_fuzz_fixture(CVQ_FUZZ_QUEUE_PAIRS);
+
+        // Readable hdr (class, cmd) | readable payload (pairs LE) | writable
+        // status pre-set to 0xFF so an un-acked chain is distinguishable.
+        mem.write_slice(&[CVQ_CTRL_MQ_CLASS, CVQ_VQ_PAIRS_SET], GuestAddress(CVQ_CMD_BASE))
+            .expect("plant cvq hdr");
+        mem.write_slice(&pairs.to_le_bytes(), GuestAddress(CVQ_CMD_BASE + 2))
+            .expect("plant cvq payload");
+        mem.write_slice(&[0xFFu8], GuestAddress(CVQ_STATUS_BASE))
+            .expect("plant cvq status");
+        write_desc(&mem, CVQ_DESC_BASE, 0, CVQ_CMD_BASE, 2, VRING_DESC_F_NEXT, 1);
+        write_desc(&mem, CVQ_DESC_BASE, 1, CVQ_CMD_BASE + 2, 2, VRING_DESC_F_NEXT, 2);
+        write_desc(&mem, CVQ_DESC_BASE, 2, CVQ_STATUS_BASE, 1, VRING_DESC_F_WRITE, 0);
+        publish_avail(&mem, CVQ_AVAIL_BASE, 0, 0);
+
+        let before = snapshot_cvq_counters(&dev);
+        write_reg(&mut dev, VIRTIO_MMIO_QUEUE_NOTIFY, cvq as u32);
+        let after = snapshot_cvq_counters(&dev);
+        assert_cvq_counter_monotonicity(&before, &after)?;
+
+        let mut status = [0u8; 1];
+        mem.read_slice(&mut status, GuestAddress(CVQ_STATUS_BASE))
+            .expect("read cvq status");
+        let cqp = dev.curr_queue_pairs();
+
+        // eval_ctrl_chain accepts pairs ∈ [VQ_PAIRS_MIN(1), queue_pairs].
+        let valid = (1..=CVQ_FUZZ_QUEUE_PAIRS).contains(&pairs);
+        if valid {
+            prop_assert_eq!(status[0], CVQ_NET_OK, "in-range pairs={} must ACK OK", pairs);
+            prop_assert_eq!(cqp, pairs, "OK must set curr_queue_pairs to the request");
+            prop_assert_eq!(
+                after.ctrl_mq_set - before.ctrl_mq_set,
+                1,
+                "a successful VQ_PAIRS_SET bumps ctrl_mq_set",
+            );
+            prop_assert_eq!(after.ctrl_chain_invalid - before.ctrl_chain_invalid, 0);
+        } else {
+            prop_assert_eq!(status[0], CVQ_NET_ERR, "out-of-range pairs={} must NAK ERR", pairs);
+            prop_assert_eq!(cqp, 1, "a NAK leaves curr_queue_pairs at its initial 1");
+            prop_assert_eq!(
+                after.ctrl_chain_invalid - before.ctrl_chain_invalid,
+                1,
+                "a NAK'd VQ_PAIRS_SET bumps ctrl_chain_invalid",
+            );
+            prop_assert_eq!(after.ctrl_mq_set - before.ctrl_mq_set, 0);
+        }
     }
 }
