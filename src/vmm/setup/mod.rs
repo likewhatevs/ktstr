@@ -495,7 +495,7 @@ impl KtstrVm {
     }
 
     /// Construct the aarch64 virtio-MMIO block device for the configured
-    /// disk in `self.disks`. (x86_64 routes the disk over virtio-pci — see
+    /// disk in `self.disk`. (x86_64 routes the disk over virtio-pci — see
     /// `init_virtio_blk_pci`, which is x86-gated so an intra-doc link would not
     /// resolve on this aarch64-only build; aarch64 PCI is a later increment, so
     /// the disk stays on MMIO here.) Returns `Ok(None)` when no disk is
@@ -521,10 +521,9 @@ impl KtstrVm {
         &self,
         vm: &kvm::KtstrKvm,
     ) -> Result<Option<Arc<PiMutex<virtio_blk::VirtioBlk>>>> {
-        if self.disks.is_empty() {
+        let Some(disk) = self.disk.as_ref() else {
             return Ok(None);
-        }
-        let disk = &self.disks[0];
+        };
         let capacity = disk.capacity_bytes();
 
         // Throttle sanity gate. `DiskThrottle::validate` rejects
@@ -856,10 +855,9 @@ impl KtstrVm {
         pci_bus: &Arc<PiMutex<pci::PciBus>>,
         msix_sink: Option<Arc<dyn virtio_msix::MsixRouteSink>>,
     ) -> Result<Option<BlkDeviceHandles>> {
-        if self.disks.is_empty() {
+        let Some(disk) = self.disk.as_ref() else {
             return Ok(None);
-        }
-        let disk = &self.disks[0];
+        };
         let capacity = disk.capacity_bytes();
 
         // Throttle sanity gate — identical to the MMIO path in
@@ -1757,7 +1755,7 @@ impl KtstrVm {
             ),
             vm.pci_enabled,
             self.networks.len(),
-            !self.disks.is_empty(),
+            self.disk.is_some(),
         )?;
         tracing::debug!(elapsed_us = t0.elapsed().as_micros(), "mptable_acpi");
 
@@ -1847,7 +1845,7 @@ impl KtstrVm {
         // emits the token in `finish_aarch64_setup`). The single PCI block
         // function becomes `/dev/vda`. The auto-mount handshake tokens below are
         // transport-independent and still emitted whenever a disk is attached.
-        if !self.disks.is_empty() {
+        if let Some(disk) = self.disk.as_ref() {
             // Auto-mount handshake. Emit a `KTSTR_DISK0_FS=<tag>`
             // token whenever the first disk has been pre-formatted so
             // the guest init at
@@ -1877,7 +1875,6 @@ impl KtstrVm {
             // future `Filesystem` variant rename only has to update
             // one place (the `cache_tag` match in disk_config.rs)
             // and the cmdline / mount automatically follow.
-            let disk = &self.disks[0];
             cmdline.push_str(&disk_auto_mount_cmdline_tokens(disk));
         }
         // No virtio-net cmdline token on x86_64: the NIC is a virtio-pci
@@ -2201,15 +2198,14 @@ impl KtstrVm {
         }
         // Auto-mount tokens for the configured disk. aarch64 advertises
         // the virtio-blk MMIO transport via FDT (see
-        // `create_fdt(..., !self.disks.is_empty(), ...)` below), so the
+        // `create_fdt(..., self.disk.is_some(), ...)` below), so the
         // `virtio_mmio.device=` cmdline form used on x86_64 is omitted.
         // The `KTSTR_DISK0_*` tokens, however, are env-style markers
         // consumed by the guest init at
         // `crate::vmm::rust_init::auto_mount_data_disks` — they are
         // arch-neutral and required on aarch64 for the same auto-mount
         // contract as x86_64.
-        if !self.disks.is_empty() {
-            let disk = &self.disks[0];
+        if let Some(disk) = self.disk.as_ref() {
             cmdline.push_str(&disk_auto_mount_cmdline_tokens(disk));
         }
         cmdline.push_str(numa_balancing_cmdline_token(&self.topology));
@@ -2262,7 +2258,7 @@ impl KtstrVm {
                  in this function and set numa_layout via \
                  allocate_and_register_memory in src/vmm/aarch64/kvm.rs",
             ),
-            !self.disks.is_empty(),
+            self.disk.is_some(),
             !self.networks.is_empty(),
             vm.has_pmu,
         )

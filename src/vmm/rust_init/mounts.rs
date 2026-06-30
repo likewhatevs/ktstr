@@ -80,7 +80,7 @@ pub(crate) fn mount_filesystems() {
 ///
 /// Skips entirely when `KTSTR_DISK0_FS` is absent. The cmdline
 /// emission on the host side is gated on
-/// `disks[0].filesystem != Filesystem::Raw`, so this branch
+/// `disk.filesystem != Filesystem::Raw`, so this branch
 /// matches the host-side opt-in: every config that requests an
 /// on-disk filesystem gets the auto-mount, and every config that
 /// doesn't is unaffected.

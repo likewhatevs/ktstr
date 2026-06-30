@@ -444,18 +444,17 @@ pub struct KtstrVm {
     /// Files to include in the guest initramfs at their archive paths.
     /// Each entry is (archive_path, host_path).
     pub(crate) include_files: Vec<(String, PathBuf)>,
-    /// v0 holds at most one DiskConfig; rendered as `/dev/vda`.
-    /// Vec retained for future multi-disk expansion. The backing
-    /// file is produced by the template-VM lifecycle (one-time
-    /// guest-side `mkfs.<fstype>` against a sparse image, cached
-    /// alongside the kernel; per-test reflink-copy at fan-out).
-    /// Per-test boots populate the backing via the `Raw` tempfile
-    /// or `Btrfs` cache-clone branches in
-    /// [`KtstrVm::init_virtio_blk`]; the disk-template-build VM
-    /// driver overrides both branches via
-    /// [`Self::template_staging_image`] so it can format a
-    /// host-staged image without re-entering its own cache.
-    pub(crate) disks: Vec<disk_config::DiskConfig>,
+    /// The optional single virtio-blk disk, rendered as `/dev/vda`. ktstr
+    /// wires one blk device; multi-disk would be N PCI functions (re-addable
+    /// pre-1.0). The backing file is produced by the template-VM lifecycle
+    /// (one-time guest-side `mkfs.<fstype>` against a sparse image, cached
+    /// alongside the kernel; per-test reflink-copy at fan-out). Per-test
+    /// boots populate the backing via the `Raw` tempfile or `Btrfs`
+    /// cache-clone branches in [`KtstrVm::open_blk_backing`]; the
+    /// disk-template-build VM driver overrides both branches via
+    /// [`Self::template_staging_image`] so it can format a host-staged
+    /// image without re-entering its own cache.
+    pub(crate) disk: Option<disk_config::DiskConfig>,
     /// Network devices. Empty skips virtio-net entirely (no NIC function /
     /// FDT node, no IRQ). Each entry attaches one virtio-net device whose
     /// backend is the in-VMM loopback (TX bytes echoed back into RX). On

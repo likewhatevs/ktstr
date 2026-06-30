@@ -81,9 +81,12 @@ pub struct KtstrVmBuilder {
     sched_disable_cmds: Vec<String>,
     include_files: Vec<(String, PathBuf)>,
     /// v0 holds at most one DiskConfig; rendered as `/dev/vda`.
-    /// Vec retained for future multi-disk expansion. See
-    /// [`super::KtstrVm::disks`].
-    disks: Vec<disk_config::DiskConfig>,
+    /// The optional single virtio-blk disk (set by `.disk()`). ktstr wires one
+    /// blk device; a single backing disk suffices for scheduler tests.
+    /// Multi-disk would mean N virtio-blk PCI functions (mirroring multi-NIC)
+    /// and can be re-introduced pre-1.0 if a real consumer appears. See
+    /// [`super::KtstrVm::disk`].
+    disk: Option<disk_config::DiskConfig>,
     /// Network devices (appended by `.network()`). Empty skips virtio-net
     /// entirely (no PCI NIC function / FDT node, no IRQ). Each entry attaches
     /// one virtio-net device; the in-VMM loopback backend echoes TX bytes back
@@ -254,7 +257,7 @@ impl Default for KtstrVmBuilder {
             sched_enable_cmds: Vec::new(),
             sched_disable_cmds: Vec::new(),
             include_files: Vec::new(),
-            disks: Vec::new(),
+            disk: None,
             networks: Vec::new(),
             busybox_bytes: None,
             #[cfg(feature = "wprof")]
@@ -756,7 +759,7 @@ impl KtstrVmBuilder {
     /// operators see the constraint at first use rather than
     /// debugging a cryptic ioctl errno.
     pub fn disk(mut self, disk: disk_config::DiskConfig) -> Self {
-        self.disks = vec![disk];
+        self.disk = Some(disk);
         // On x86_64 the disk is a virtio-pci function (see `init_virtio_blk_pci`)
         // and needs the host bridge + ECAM; aarch64 routes it over virtio-MMIO
         // (no PCI yet), so leave pci_enabled untouched there. Mirrors `network()`.
@@ -1073,13 +1076,14 @@ impl KtstrVmBuilder {
             // A NIC or disk is a virtio-pci function on x86_64, so any attached
             // network OR disk implies the PCI transport — enforce the invariant
             // at the sole KtstrVm construction point so no assembly path (or a
-            // stray `.pci(false)`) can yield a non-empty `networks`/`disks` with
+            // stray `.pci(false)`) can yield a non-empty `networks` or an
+            // attached `disk` with
             // pci_enabled=false, which would emit `pci=off` and skip installing
             // the NICs / disk (the guest would see no eth0 / no `/dev/vda`).
             // aarch64 keeps both on virtio-MMIO.
             pci_enabled: self.pci_enabled
                 || (cfg!(target_arch = "x86_64")
-                    && (!self.networks.is_empty() || !self.disks.is_empty())),
+                    && (!self.networks.is_empty() || self.disk.is_some())),
             no_perf_mode,
             pinning_plan,
             mbind_node_map,
@@ -1088,7 +1092,7 @@ impl KtstrVmBuilder {
             sched_enable_cmds: self.sched_enable_cmds,
             sched_disable_cmds: self.sched_disable_cmds,
             include_files: self.include_files,
-            disks: self.disks,
+            disk: self.disk,
             networks: self.networks,
             busybox_bytes: self.busybox_bytes,
             #[cfg(feature = "wprof")]
