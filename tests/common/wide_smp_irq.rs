@@ -143,15 +143,18 @@ pub fn virtio_net_iface() -> Result<String> {
 /// The virtio-net NIC's data-bearing IRQ number + its `/proc/interrupts` action
 /// name. The action depends on the interrupt transport. Under INTx
 /// (split-irqchip) it is a single line whose action is exactly the device
-/// basename (e.g. `virtio1`). Under MSI-X (full-irqchip) the kernel splits the
-/// NIC's IRQs into a config vector `{name}-config` and the SHARED-mode queue
-/// vector `{name}-virtqueues` (drivers/virtio/virtio_pci_common.c request_irq),
-/// and net traffic raises the queue line, never config. So the data IRQ is the
-/// line whose action is `{name}` OR begins `{name}-` but is not `{name}-config`.
-/// Matching by prefix (rather than the exact MSI-X suffix) keeps this robust to
-/// per-virtqueue naming (`{name}-input.0`, a multiqueue follow-up) without a
-/// transport assumption; the trailing `-` in the prefix prevents a false match
-/// across `virtio1` vs `virtio10`.
+/// basename (e.g. `virtio1`). Under MSI-X the kernel splits the NIC's IRQs into
+/// a config vector `{name}-config` and per-virtqueue data vectors
+/// (drivers/virtio/virtio_pci_common.c request_irq): with per-queue MSI-X each
+/// data vq gets its own line (`{name}-input.0`, `{name}-output.0`, ...), and a
+/// guest that falls back to the SHARED policy (a queue count beyond the per-NIC
+/// vector budget) gets a single shared queue line instead. Net traffic raises a
+/// data line, never config. So the data IRQ is the FIRST line whose action is
+/// `{name}` OR begins `{name}-` but is not `{name}-config` — under per-queue
+/// MSI-X that is the RX queue (`input.0`, allocated before TX). Matching by
+/// prefix (rather than an exact MSI-X suffix) is transport- and policy-agnostic;
+/// the trailing `-` in the prefix prevents a false match across `virtio1` vs
+/// `virtio10`.
 #[allow(dead_code)]
 pub fn virtio_net_irq(iface: &str) -> Result<(u32, String)> {
     let dev = fs::canonicalize(format!("/sys/class/net/{iface}/device"))?;
@@ -180,7 +183,7 @@ pub fn virtio_net_irq(iface: &str) -> Result<(u32, String)> {
     }
     bail!(
         "no virtio-net data IRQ in /proc/interrupts for device {name} \
-         (looked for INTx '{name}' or MSI-X '{name}-virtqueues')"
+         (looked for INTx '{name}' or an MSI-X '{name}-' data vector)"
     )
 }
 

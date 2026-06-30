@@ -700,8 +700,18 @@ impl KtstrVm {
             // x86 PCI guest, and None otherwise (no PCI), in which case the facade
             // omits the MSI-X cap and the NIC stays on INTx (no undeliverable MSI-X
             // is advertised).
-            let msix = Arc::new(PiMutex::new(virtio_net::MsixState::new(dev.num_queues())));
-            let mut msix_gsis = [0u32; virtio_net::MSIX_VECTORS];
+            // The shared MSI-X state sizes its table to one vector per virtqueue
+            // plus config (`num_queues + 1`), capped at the host's per-NIC GSI
+            // budget (`kvm::MSIX_VECTORS_PER_NIC` — itself <= the device's table
+            // page capacity). The GSI/eventfd allocation below matches that count
+            // (`num_vectors`), so the facade's advertised table size, the
+            // registered irqfds, and the device's table stay in lockstep.
+            let msix = Arc::new(PiMutex::new(virtio_net::MsixState::new(
+                dev.num_queues(),
+                kvm::MSIX_VECTORS_PER_NIC,
+            )));
+            let num_vectors = msix.lock().num_vectors();
+            let mut msix_gsis: Vec<u32> = vec![0u32; num_vectors];
             let route_sink: Option<Arc<dyn virtio_net::MsixRouteSink>> = match &msix_sink {
                 Some(sink) => {
                     for (v, gsi_slot) in msix_gsis.iter_mut().enumerate() {

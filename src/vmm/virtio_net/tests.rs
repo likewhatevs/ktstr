@@ -177,7 +177,7 @@ fn device_features_gates_mq_on_queue_pairs_and_msix() {
     // MSI-X transport.
     let mut mq_msix = VirtioNet::new(NetConfig::default().queue_pairs(4));
     let nq = mq_msix.num_queues();
-    mq_msix.set_msix_state(Arc::new(PiMutex::new(MsixState::new(nq))));
+    mq_msix.set_msix_state(Arc::new(PiMutex::new(MsixState::new(nq, super::interrupt::MSIX_TABLE_MAX))));
     assert_eq!(
         read_device_features(&mut mq_msix) & mq,
         mq,
@@ -221,7 +221,7 @@ fn multiqueue_dev_with_cvq(queue_pairs: u16) -> (VirtioNet, GuestMemoryMmap, usi
     let mut dev = VirtioNet::new(NetConfig::default().queue_pairs(queue_pairs));
     dev.set_mem(mem.clone());
     let nq = dev.num_queues();
-    dev.set_msix_state(Arc::new(PiMutex::new(MsixState::new(nq))));
+    dev.set_msix_state(Arc::new(PiMutex::new(MsixState::new(nq, super::interrupt::MSIX_TABLE_MAX))));
 
     write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_ACK);
     write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_DRV);
@@ -469,7 +469,7 @@ fn config_space_reports_max_virtqueue_pairs() {
     // feature).
     let mut mq = VirtioNet::new(NetConfig::default().queue_pairs(4));
     let nq = mq.num_queues();
-    mq.set_msix_state(Arc::new(PiMutex::new(MsixState::new(nq))));
+    mq.set_msix_state(Arc::new(PiMutex::new(MsixState::new(nq, super::interrupt::MSIX_TABLE_MAX))));
     let mut buf = [0u8; 2];
     mq.mmio_read(0x100 + 0x08, &mut buf);
     assert_eq!(
@@ -500,7 +500,7 @@ fn multiqueue_loopback_routes_tx_to_its_own_pair_rx() {
     let mut dev = VirtioNet::new(NetConfig::default().queue_pairs(2));
     dev.set_mem(mem.clone());
     let nq = dev.num_queues(); // 5: rx0, tx0, rx1, tx1, cvq@4
-    dev.set_msix_state(Arc::new(PiMutex::new(MsixState::new(nq))));
+    dev.set_msix_state(Arc::new(PiMutex::new(MsixState::new(nq, super::interrupt::MSIX_TABLE_MAX))));
 
     // Negotiate VERSION_1 + MAC + F_MQ + F_CTRL_VQ.
     write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_ACK);
@@ -776,7 +776,7 @@ fn queue_select_out_of_range_is_bounded_on_multiqueue() {
     // static NUM_QUEUES=2 bound no longer applies).
     let mut dev = VirtioNet::new(NetConfig::default().queue_pairs(4));
     let nq = dev.num_queues(); // 9 = 2*4 data + 1 control vq
-    dev.set_msix_state(Arc::new(PiMutex::new(MsixState::new(nq))));
+    dev.set_msix_state(Arc::new(PiMutex::new(MsixState::new(nq, super::interrupt::MSIX_TABLE_MAX))));
     // The last valid index (the control vq at nq-1) reports the real max size.
     write_reg(&mut dev, VIRTIO_MMIO_QUEUE_SEL, (nq - 1) as u32);
     assert_eq!(

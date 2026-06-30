@@ -43,9 +43,9 @@ pub const VIRTIO_MMIO_SIZE: u64 = 0x1000;
 /// at even index `2i` and TX at odd index `2i+1`; multiqueue
 /// (`NetConfig::queue_pairs > 1`) adds a trailing control vq at index
 /// `2 * queue_pairs`. `NUM_QUEUES` is the single-pair baseline (RX 0 +
-/// TX 1, no control vq) — the device default and the SHARED-MSI-X
-/// vector-table sizing reference; the live per-device queue count is
-/// `VirtioNet::queues.len()`.
+/// TX 1, no control vq) — the device default; the live per-device queue
+/// count is `VirtioNet::queues.len()`, and the MSI-X table is sized from it
+/// (`num_queues + 1`: one vector per virtqueue plus config).
 pub(crate) const NUM_QUEUES: usize = 2;
 pub(crate) const QUEUE_MAX_SIZE: u16 = 256;
 /// Maximum queue-pairs a NIC may offer; `NetConfig::queue_pairs` is clamped to
@@ -800,6 +800,7 @@ impl VirtioNet {
     ///   - dead RING (`iter()` structural error) → poison + NEEDS_RESET (the
     ///     device-death class, matching the data path and qemu's structural
     ///     `virtio_error`).
+    ///
     /// Never an out-of-bounds read or write. Matches cloud-hypervisor's
     /// validate-then-ACK control-queue model.
     fn process_ctrl_queue(&mut self) {
@@ -957,7 +958,7 @@ impl VirtioNet {
         // Ordered BEFORE the poison signal so the guest observes any prior
         // completions before the device-death notice.
         if had_used_ring_publish {
-            self.signal_used();
+            self.signal_used(cvq_idx);
         }
         // Structural-poison device-death signal: set NEEDS_RESET, STATUS-BIT
         // ONLY, once per false->true transition. Status-only (not the data
@@ -1094,9 +1095,10 @@ impl VirtioNet {
         //   1. Per-queue IRQ steering is the POINT of multiqueue here and needs
         //      a distinct interrupt vector per queue — only MSI-X supplies
         //      that. On a shared INTx/MMIO level line every queue lands on one
-        //      IRQ, so multiqueue buys nothing for steering. (v0 still shares a
-        //      single MSI-X vector across the queues; per-vector steering is the
-        //      per-queue MSI-X follow-up — this gate is what makes that wiring reachable.)
+        //      IRQ, so multiqueue buys nothing for steering. With MSI-X each data
+        //      vq gets its OWN vector + GSI (the guest's EACH policy); SHARED is
+        //      the guest's fallback when its queue count exceeds the per-NIC
+        //      vector budget, served transparently by the per-queue signal path.
         //   2. The future async-RX backend (TAP/AF_PACKET/threaded-NAPI) will
         //      move RX completion off the vCPU thread and break the legacy-INTx
         //      single-asserter invariant, needing the active resample handler
@@ -1169,16 +1171,19 @@ impl VirtioNet {
     // delivery. The guest does NOT poll this register. We log any
     // errno so a failed write surfaces in tracing rather than
     // silently disappearing.
-    fn signal_used(&mut self) {
+    fn signal_used(&mut self, queue: usize) {
         // MSI-X path (PCI, once the guest enabled it): deliver the VRING source
-        // to its guest-assigned vector. MSI-X does not use the INTx ISR
-        // (`interrupt_status`) — the kernel's per-vector handlers never read it
-        // (drivers/virtio/virtio_pci_common.c: the ISR read is INTx-only) — so
-        // the bit-set + line write below are skipped.
+        // to virtqueue `queue`'s guest-assigned vector (per-queue IRQ steering).
+        // MSI-X does not use the INTx ISR (`interrupt_status`) — the kernel's
+        // per-vector handlers never read it (drivers/virtio/virtio_pci_common.c:
+        // the ISR read is INTx-only) — so the bit-set + line write below are
+        // skipped. On INTx every queue collapses to the one shared line
+        // (`queue` ignored); the guest's shared handler vp_vring_interrupt
+        // drains all virtqueues per kick.
         if let Some(msix) = &self.msix {
             let mut m = msix.lock();
             if m.enabled() {
-                m.signal(IrqSource::Vring);
+                m.signal(IrqSource::Vring { queue });
                 return;
             }
         }
@@ -1359,15 +1364,16 @@ impl VirtioNet {
         // just breaks naturally — no need for a special outer
         // gate.
         //
-        // `had_used_ring_publish` tracks whether ANY queue's
-        // used-ring index advanced during this drain (TX add_used
-        // OR RX add_used succeeded somewhere). The irqfd kick at
-        // the end is gated on this flag rather than on RX delivery
-        // alone: a malformed RX chain whose `add_used(head, 0)`
-        // succeeded ALSO needs a kick, otherwise the guest's NAPI
-        // never observes the empty completion and the descriptor
-        // sits unrecycled in the used ring until a virtio reset.
-        let mut had_used_ring_publish = false;
+        // Per-queue used-ring advance tracking for the per-queue MSI-X
+        // signal: `tx_advanced` ⇔ this pair's TX queue (tx_idx) advanced its
+        // used ring (a TX completion — including a malformed-chain recycle whose
+        // `add_used(head, 0)` succeeded, which the guest's NAPI must still see);
+        // `rx_advanced` ⇔ the RX queue (rx_idx) advanced (a delivery or an empty
+        // completion). Each fires its OWN queue's vector post-loop so a per-queue
+        // IRQ lands on that queue's affined CPU. On INTx both collapse to the one
+        // shared line (signal_used ignores the index there).
+        let mut tx_advanced = false;
+        let mut rx_advanced = false;
         // `tx_just_poisoned` / `rx_just_poisoned`: the false→true
         // transition observed during THIS drain. The signal +
         // counter bump are gated on the transition, not on the
@@ -1421,7 +1427,7 @@ impl VirtioNet {
                 let outcome = self.try_loopback_to_rx(mem, len, rx_idx);
                 self.handle_rx_loopback_outcome(
                     outcome,
-                    &mut had_used_ring_publish,
+                    &mut rx_advanced,
                     &mut rx_just_poisoned,
                 );
             }
@@ -1430,7 +1436,7 @@ impl VirtioNet {
             // `tx_packets` nor `rx_packets` advances on this path.
             // Still mark used so the guest doesn't hang.
 
-            self.tx_add_used(mem, head, frame_len, &mut had_used_ring_publish, tx_idx);
+            self.tx_add_used(mem, head, frame_len, &mut tx_advanced, tx_idx);
 
             // Partial-RX-poison handling: if the RX-side `iter()`
             // just transitioned false→true this iteration (set by
@@ -1455,26 +1461,39 @@ impl VirtioNet {
         }
 
         // Post-loop ordered signal sequence:
-        //   1. signal_used() if any used-ring advance happened, so
-        //      the guest's NAPI wakes to observe TX completions and
-        //      RX deliveries from THIS drain. Must come BEFORE the
-        //      poison signal — a missed signal_used would strand
-        //      whatever completions the guest could still consume
-        //      (TX completions are still actionable even if RX is
-        //      poisoned).
-        //   2. signal_queue_poisoned() exactly once if either side
-        //      transitioned false→true during this drain. Sets
-        //      NEEDS_RESET in device_status + INT_CONFIG in
-        //      interrupt_status (both idempotent under bitwise-OR
-        //      — single call is correct whether one or both
-        //      queues just poisoned), and writes the irqfd.
-        //      Spec-compliant per virtio-v1.2 (config interrupt
-        //      paired with NEEDS_RESET) and matches
-        //      cloud-hypervisor. counter-mode irqfd coalesces
-        //      signal_used + signal_queue_poisoned into a single
-        //      guest-visible IRQ when they both fire.
-        if had_used_ring_publish {
-            self.signal_used();
+        //   1. Per-queue used-ring signal — fire EACH advanced queue's OWN
+        //      vector (rx_idx, tx_idx) so the guest's per-queue NAPI wakes on
+        //      that queue's affined CPU (the point of per-queue MSI-X). Must
+        //      come BEFORE the poison signal — a missed used signal would strand
+        //      completions the guest can still consume (TX completions are
+        //      actionable even if RX is poisoned). On INTx both collapse to the
+        //      one shared line; the guest's vp_vring_interrupt drains all vqs, so
+        //      the (at most two) kicks are harmless.
+        //   2. signal_queue_poisoned() exactly once if either side transitioned
+        //      false→true during this drain. Sets NEEDS_RESET in device_status +
+        //      INT_CONFIG in interrupt_status (idempotent under bitwise-OR — one
+        //      call is correct whether one or both queues just poisoned) + writes
+        //      the irqfd. Spec-compliant per virtio-v1.2 (config interrupt paired
+        //      with NEEDS_RESET) and matches cloud-hypervisor. Counter-mode irqfd
+        //      coalesces the used + poison signals into one guest-visible IRQ
+        //      when they both fire on the same vector.
+        // MSI-X: fire EACH advanced queue's OWN vector (per-node steering) so a
+        // per-queue IRQ lands on that queue's affined CPU. INTx: every queue
+        // shares one line, so a single assert per drain is correct and
+        // sufficient — the guest's vp_vring_interrupt drains ALL vqs per IRQ —
+        // and coalescing avoids a redundant second eventfd write, preserving the
+        // one-kick-per-drain invariant the legacy level path relies on (multiqueue
+        // is gated on MSI-X in device_features, so the INTx branch only ever sees
+        // the single pair; the queue index is ignored there).
+        if self.msix.as_ref().is_some_and(|m| m.lock().enabled()) {
+            if rx_advanced {
+                self.signal_used(rx_idx);
+            }
+            if tx_advanced {
+                self.signal_used(tx_idx);
+            }
+        } else if rx_advanced || tx_advanced {
+            self.signal_used(rx_idx);
         }
         if tx_just_poisoned || rx_just_poisoned {
             self.signal_queue_poisoned();

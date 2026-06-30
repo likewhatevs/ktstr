@@ -133,6 +133,8 @@ pub use device::{VIRTIO_MMIO_SIZE, VirtioNet};
 // The virtio-pci function wrapper — setup installs it into the PciBus.
 pub(crate) use pci::VirtioNetPci;
 // MSI-X delivery items needed outside this module: the setup wiring builds the
-// shared `MsixState` (creating + KVM-registering one eventfd per vector,
-// `MSIX_VECTORS` of them) and the x86 route owner implements `MsixRouteSink`.
-pub(crate) use interrupt::{MSIX_VECTORS, MsixRouteSink, MsixState};
+// shared `MsixState` (creating + KVM-registering one eventfd per advertised
+// vector — `MsixState::num_vectors` of them) and the x86 route owner implements
+// `MsixRouteSink`. `MSIX_TABLE_MAX` (the table-page vector capacity) is the cap
+// the kvm module const-asserts its per-NIC GSI budget against.
+pub(crate) use interrupt::{MSIX_TABLE_MAX, MsixRouteSink, MsixState};

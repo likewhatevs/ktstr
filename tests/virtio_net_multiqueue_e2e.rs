@@ -24,9 +24,14 @@
 //! Exactly 4 is the only outcome consistent with the offered-max contract.
 //!
 //! The in-VMM loopback backend drives no traffic here — this checks the
-//! queue-pair *setup* (config-space offer + control-vq negotiation), which
-//! is what `queue_pairs` configures. Per-queue MSI-X/GSI steering (so each
-//! pair raises a distinct interrupt vector) is the per-queue MSI-X follow-up.
+//! queue-pair *setup* (config-space offer + control-vq negotiation), which is
+//! what `queue_pairs` configures, AND the per-queue MSI-X layout: with
+//! per-queue MSI-X each data virtqueue gets its OWN interrupt vector, so the
+//! guest's EACH policy requests `config + 2*pairs` vectors and `/proc/interrupts`
+//! shows one `{dev}-input.N` + one `{dev}-output.N` line per active pair (plus a
+//! single `{dev}-config`). Distinct per-queue lines ARE the per-node IRQ
+//! steering payload — a SHARED single queue vector would show just one data line
+//! for every queue.
 //!
 //! x86_64-only: the multiqueue offer rides MSI-X (`msix.is_some()`), which
 //! the PCI facade wires only on x86_64. On aarch64 the NIC uses the MMIO
@@ -100,6 +105,60 @@ fn multiqueue_activates_offered_pairs(_ctx: &Ctx) -> Result<AssertResult> {
     ensure!(
         tx == OFFERED_PAIRS,
         "expected {OFFERED_PAIRS} TX queues, got {tx}"
+    );
+
+    // Per-queue MSI-X: each data virtqueue gets its OWN interrupt vector under
+    // the guest's EACH policy, so /proc/interrupts shows one `{dev}-input.N` +
+    // one `{dev}-output.N` line per active pair, plus a single `{dev}-config`.
+    // The control vq has no callback and so gets NO_VECTOR (no line). These
+    // distinct per-queue lines ARE the per-node IRQ steering payload: a SHARED
+    // single queue vector would show just one data line for every queue.
+    let dev = std::fs::canonicalize(format!("/sys/class/net/{iface}/device"))?;
+    let dev = dev
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| anyhow::anyhow!("no device basename for {iface}"))?
+        .to_string();
+    let interrupts = std::fs::read_to_string("/proc/interrupts")?;
+    let input_prefix = format!("{dev}-input.");
+    let output_prefix = format!("{dev}-output.");
+    let config_action = format!("{dev}-config");
+    let (mut inputs, mut outputs, mut configs) = (0usize, 0usize, 0usize);
+    for line in interrupts.lines() {
+        let Some((_, rhs)) = line.split_once(':') else {
+            continue;
+        };
+        let Some(action) = rhs.split_whitespace().last() else {
+            continue;
+        };
+        if action.starts_with(&input_prefix) {
+            inputs += 1;
+        } else if action.starts_with(&output_prefix) {
+            outputs += 1;
+        } else if action == config_action {
+            configs += 1;
+        }
+    }
+
+    eprintln!(
+        "MQ per-vq MSI-X dev={dev} input_irqs={inputs} output_irqs={outputs} \
+         config_irqs={configs}"
+    );
+
+    ensure!(
+        inputs == OFFERED_PAIRS,
+        "expected {OFFERED_PAIRS} per-queue RX MSI-X lines ({dev}-input.N), got \
+         {inputs}; per-queue MSI-X must give each RX virtqueue its own vector \
+         (a SHARED single vector would show one data line for all queues)"
+    );
+    ensure!(
+        outputs == OFFERED_PAIRS,
+        "expected {OFFERED_PAIRS} per-queue TX MSI-X lines ({dev}-output.N), got \
+         {outputs}"
+    );
+    ensure!(
+        configs == 1,
+        "expected exactly one {dev}-config MSI-X line, got {configs}"
     );
 
     Ok(AssertResult::pass())

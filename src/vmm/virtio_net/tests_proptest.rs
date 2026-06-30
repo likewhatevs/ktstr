@@ -436,7 +436,10 @@ fn build_cvq_fuzz_fixture(queue_pairs: u16) -> (VirtioNet, GuestMemoryMmap, usiz
     let mut dev = VirtioNet::new(NetConfig::default().queue_pairs(queue_pairs));
     dev.set_mem(mem.clone());
     let nq = dev.num_queues();
-    dev.set_msix_state(Arc::new(PiMutex::new(MsixState::new(nq))));
+    dev.set_msix_state(Arc::new(PiMutex::new(MsixState::new(
+        nq,
+        super::interrupt::MSIX_TABLE_MAX,
+    ))));
 
     write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_ACK);
     write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_DRV);

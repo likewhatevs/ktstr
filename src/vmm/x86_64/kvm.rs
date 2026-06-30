@@ -110,10 +110,12 @@ pub(crate) const VIRTIO_CONSOLE_IRQ: u32 = 5;
 pub(crate) const VIRTIO_BLK_IRQ: u32 = 6;
 
 /// Maximum number of virtio-net NICs on the PCI bus (x86_64). Bounded by the
-/// IOAPIC's 24-line budget: each NIC needs one INTx GSI disjoint from the
-/// reserved lines (PIT GSI2, COM2=3, COM1=4, virtio-console=5, virtio-blk=6,
-/// SCI=9), leaving 7,8,10..=23 = 16 usable. Per-queue MSI-X lifts this
-/// cap later. The builder rejects more than this many `.network()` calls.
+/// IOAPIC's 24-line budget for INTx: each NIC needs one INTx GSI disjoint from
+/// the reserved lines (PIT GSI2, COM2=3, COM1=4, virtio-console=5,
+/// virtio-blk=6, SCI=9), leaving 7,8,10..=23 = 16 usable. (Per-queue MSI-X
+/// routes do not consume IOAPIC pins, so MSI-X does not lift this cap; it also
+/// bounds the per-NIC MSI-X GSI budget — see [`MSIX_VECTORS_PER_NIC`].) The
+/// builder rejects more than this many `.network()` calls.
 pub(crate) const MAX_VIRTIO_NICS: usize = 16;
 
 /// PCI slot (bus 0) for virtio-net NIC `index` (0-based): slot 0 is the host
@@ -145,20 +147,61 @@ pub(crate) const fn virtio_net_gsi(index: usize) -> u32 {
     }
 }
 
-/// MSI-X vector GSI for virtio-net NIC `nic` (0-based), table vector `vector`.
-/// MSI-X vectors deliver as `KVM_IRQ_ROUTING_MSI` routes, which — unlike INTx
-/// IOAPIC routes — are NOT bounded by the 24-pin IOAPIC budget, only by
-/// `KVM_MAX_IRQ_ROUTES` (4096; virt/kvm/irqchip.c `kvm_set_irq_routing`). So the
+/// KVM's hard cap on GSI routing-table entries and the exclusive upper bound on
+/// any routed GSI: `kvm_set_irq_routing` rejects `gsi >= KVM_MAX_IRQ_ROUTES`
+/// (virt/kvm/irqchip.c) and the `KVM_SET_GSI_ROUTING` ioctl rejects a table with
+/// more than this many entries (virt/kvm/kvm_main.c). 4096 per
+/// include/linux/kvm_host.h. Hardcoded — the value is not in the uapi headers
+/// (the host also surfaces it via the `KVM_CAP_IRQ_ROUTING` extension) — and
+/// guarded by the const-asserts below.
+pub(crate) const KVM_MAX_IRQ_ROUTES: usize = 4096;
+
+/// Per-NIC MSI-X GSI budget: the stride between NICs' vector ranges and the
+/// per-NIC cap on advertised MSI-X vectors. Each NIC's table vectors occupy
+/// `[NUM_IOAPIC_PINS + nic*MSIX_VECTORS_PER_NIC, +MSIX_VECTORS_PER_NIC)`,
+/// disjoint across NICs. Sized as the largest stride for which even
+/// `MAX_VIRTIO_NICS` fully-populated NICs fit KVM's route table
+/// (`NUM_IOAPIC_PINS + MAX_VIRTIO_NICS * stride <= KVM_MAX_IRQ_ROUTES`), so the
+/// host never overflows the table and no config needs a runtime bail. With the
+/// 24-pin IOAPIC base and 16 NICs this is `(4096 - 24) / 16 = 254`. The device
+/// caps its advertised vector count at this (and at the MSI-X table-page
+/// capacity [`crate::vmm::virtio_net::MSIX_TABLE_MAX`]); a NIC wanting more
+/// queue-pairs than `254` vectors allow (> 126 pairs) falls back to the guest's
+/// SHARED vector policy, which the per-queue signal path serves transparently.
+pub(crate) const MSIX_VECTORS_PER_NIC: usize =
+    (KVM_MAX_IRQ_ROUTES - NUM_IOAPIC_PINS as usize) / MAX_VIRTIO_NICS;
+
+// The per-NIC GSI budget must not exceed the device's MSI-X table-page capacity
+// (the device cannot advertise more vectors than its one-page table holds, so
+// MsixState::new caps num_vectors at this stride knowing it is the binding one).
+const _: () = assert!(
+    MSIX_VECTORS_PER_NIC <= crate::vmm::virtio_net::MSIX_TABLE_MAX,
+    "per-NIC MSI-X GSI budget exceeds the device MSI-X table-page capacity"
+);
+// All NICs' vector ranges plus the IOAPIC pin range must fit KVM's routing
+// table (every routed GSI < KVM_MAX_IRQ_ROUTES); the floor division above makes
+// this hold, and the assert pins it against a future MAX_VIRTIO_NICS bump.
+const _: () = assert!(
+    NUM_IOAPIC_PINS as usize + MAX_VIRTIO_NICS * MSIX_VECTORS_PER_NIC <= KVM_MAX_IRQ_ROUTES,
+    "virtio-net MSI-X GSIs overflow the KVM routing table"
+);
+
+/// MSI-X vector GSI for virtio-net NIC `nic` (0-based), table vector `vector`
+/// (`vector < MSIX_VECTORS_PER_NIC`). MSI-X vectors deliver as
+/// `KVM_IRQ_ROUTING_MSI` routes, which — unlike INTx IOAPIC routes — are NOT
+/// bounded by the 24-pin IOAPIC budget, only by [`KVM_MAX_IRQ_ROUTES`]. So the
 /// MSI-X GSIs live ABOVE the IOAPIC pin range, disjoint from every INTx GSI
-/// ([`virtio_net_gsi`] ∈ [7, 24)): `NUM_IOAPIC_PINS + nic*MSIX_VECTORS + vector`.
-/// `MAX_VIRTIO_NICS`=16 × `MSIX_VECTORS`=2 → GSIs 24..56, far below the budget.
-/// The host registers one irqfd per (NIC, vector) at this GSI at VM bring-up
-/// (an irqfd may be assigned to a GSI with no route yet — virt/kvm/eventfd.c
-/// `irqfd_update` leaves the cache inactive); the MSI route is installed on the
-/// guest's vector-unmask edge by the full-irqchip route owner, which refreshes
-/// the irqfd's cached entry via `kvm_irq_routing_update`.
+/// ([`virtio_net_gsi`] ∈ [7, 24)): `NUM_IOAPIC_PINS + nic*MSIX_VECTORS_PER_NIC +
+/// vector`. Each NIC's range is `MSIX_VECTORS_PER_NIC` wide, so the ranges are
+/// disjoint and the highest GSI (`NUM_IOAPIC_PINS + MAX_VIRTIO_NICS *
+/// MSIX_VECTORS_PER_NIC - 1`) stays below the budget. The host registers one
+/// irqfd per (NIC, vector) at this GSI at VM bring-up (an irqfd may be assigned
+/// to a GSI with no route yet — virt/kvm/eventfd.c `irqfd_update` leaves the
+/// cache inactive); the MSI route is installed on the guest's vector-unmask edge
+/// by the route owner, which refreshes the irqfd's cached entry via
+/// `kvm_irq_routing_update`.
 pub(crate) const fn virtio_net_msix_gsi(nic: usize, vector: usize) -> u32 {
-    NUM_IOAPIC_PINS as u32 + (nic * crate::vmm::virtio_net::MSIX_VECTORS + vector) as u32
+    NUM_IOAPIC_PINS as u32 + (nic * MSIX_VECTORS_PER_NIC + vector) as u32
 }
 
 /// GSI the FADT advertises as the ACPI SCI (system control interrupt). The
@@ -1508,9 +1551,6 @@ mod tests {
     /// a non-unique mapping — would silently misroute an MSI-X vector.
     #[test]
     fn virtio_net_msix_gsi_invariants() {
-        use crate::vmm::virtio_net::MSIX_VECTORS;
-        const KVM_MAX_IRQ_ROUTES: u32 = 4096; // virt/kvm/irqchip.c
-
         let intx: std::collections::BTreeSet<u32> =
             (0..MAX_VIRTIO_NICS).map(virtio_net_gsi).collect();
         let reserved = [
@@ -1522,9 +1562,12 @@ mod tests {
             ACPI_SCI_IRQ as u32,
         ];
 
+        // Walk the FULL per-NIC vector budget (not just a single-pair count): the
+        // disjointness/uniqueness/budget invariants must hold for every vector a
+        // NIC could ever advertise.
         let mut seen = std::collections::BTreeSet::new();
         for nic in 0..MAX_VIRTIO_NICS {
-            for v in 0..MSIX_VECTORS {
+            for v in 0..MSIX_VECTORS_PER_NIC {
                 let g = virtio_net_msix_gsi(nic, v);
                 // (a) above the IOAPIC pin range.
                 assert!(
@@ -1539,18 +1582,25 @@ mod tests {
                 );
                 // (c) globally unique across (NIC, vector).
                 assert!(seen.insert(g), "msix_gsi {g} duplicated at (nic={nic}, v={v})");
-                // (d) within the KVM routing budget.
+                // (d) within the KVM routing budget (every routed GSI < the cap).
                 assert!(
-                    g < KVM_MAX_IRQ_ROUTES,
+                    (g as usize) < KVM_MAX_IRQ_ROUTES,
                     "msix_gsi {g} exceeds KVM_MAX_IRQ_ROUTES"
                 );
             }
         }
-        // Contiguous block [NUM_IOAPIC_PINS, NUM_IOAPIC_PINS + N*V).
+        // Contiguous block [NUM_IOAPIC_PINS, NUM_IOAPIC_PINS + N*stride).
         assert_eq!(*seen.iter().next().unwrap(), NUM_IOAPIC_PINS as u32);
         assert_eq!(
             *seen.iter().next_back().unwrap(),
-            NUM_IOAPIC_PINS as u32 + (MAX_VIRTIO_NICS * MSIX_VECTORS) as u32 - 1
+            NUM_IOAPIC_PINS as u32 + (MAX_VIRTIO_NICS * MSIX_VECTORS_PER_NIC) as u32 - 1
+        );
+        // The whole budget — IOAPIC pins plus every NIC's full vector range —
+        // fits below the KVM routing-table cap, so no config overflows it.
+        assert!(
+            NUM_IOAPIC_PINS as usize + MAX_VIRTIO_NICS * MSIX_VECTORS_PER_NIC
+                <= KVM_MAX_IRQ_ROUTES,
+            "per-NIC MSI-X GSI budget overflows the KVM routing table"
         );
     }
 
