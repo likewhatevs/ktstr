@@ -18,7 +18,8 @@
 //! `Arc<PiMutex<MsixState>>` SHARED between the core (which holds a clone and
 //! calls [`MsixState::signal`] at the trigger site) and the PCI facade (which
 //! holds a clone, mutates it from config-space decode, and owns the KVM
-//! GSI-route side: the per-vector GSIs and the `FullIrqchipRouteOwner`). The
+//! GSI-route side: the per-vector GSIs and the route owner —
+//! `FullIrqchipRouteOwner` on full-irqchip, `IoapicHandle` on split). The
 //! gate stays at the trigger site (not a post-hoc drain), matching both
 //! cloud-hypervisor (`VirtioInterruptMsix::trigger`) and qemu (`msix_notify`).
 //! The mutex is uncontended in practice: every access — facade config writes and
@@ -80,10 +81,11 @@ pub(crate) enum IrqSource {
 }
 
 /// Abstraction over the host's KVM GSI-route programming. Implemented x86-only
-/// by `FullIrqchipRouteOwner` (the full-irqchip shared route owner); kept a
-/// trait so the (arch-neutral) PCI facade holds `Option<Arc<dyn MsixRouteSink>>`
-/// without referencing the x86-only KVM route types. The facade calls this on a
-/// vector mask/unmask edge to (re)install or remove the MSI route for a GSI.
+/// by `FullIrqchipRouteOwner` (full-irqchip) and `IoapicHandle` (split-irqchip);
+/// kept a trait so the (arch-neutral) PCI facade holds
+/// `Option<Arc<dyn MsixRouteSink>>` without referencing the x86-only KVM route
+/// types. The facade calls this on a vector mask/unmask edge to (re)install or
+/// remove the MSI route for a GSI.
 pub(crate) trait MsixRouteSink: Send + Sync {
     /// Install (`Some((address_lo, address_hi, data))`) or remove (`None`) the
     /// MSI route for `gsi`, rebuilding the full GSI routing table. Errors are

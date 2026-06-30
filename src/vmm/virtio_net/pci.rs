@@ -10,13 +10,14 @@
 //! lives in the transport-neutral core on [`VirtioNet`] and is shared verbatim
 //! with the MMIO facade.
 //!
-//! Interrupts: MSI-X when offered (the cap is advertised on the full-irqchip
-//! path, where a KVM route owner is wired — the per-vector delivery state + the
-//! fire-or-pend gate live in the `interrupt` submodule's `MsixState`, and the
-//! cap / table / route-install decode is in this file), and INTx otherwise
-//! (split-irqchip / no route owner, where the cap is omitted so the guest stays
-//! on INTx), delivered via the device's existing
-//! `irq_evt`. The INTx KVM wiring (in `setup::init_virtio_net_pci`) branches on the
+//! Interrupts: MSI-X when offered (the cap is advertised whenever a KVM route
+//! owner is wired — on BOTH irqchip paths for an x86 PCI guest: the full-irqchip
+//! `FullIrqchipRouteOwner` or the split-irqchip `IoapicHandle`, both
+//! `MsixRouteSink`s — the per-vector delivery state + the fire-or-pend gate live
+//! in the `interrupt` submodule's `MsixState`, and the cap / table /
+//! route-install decode is in this file), and INTx as the fallback (no route
+//! owner — non-PCI; or a guest that declines MSI-X), delivered via the device's
+//! existing `irq_evt`. The INTx KVM wiring (in `setup::init_virtio_net_pci`) branches on the
 //! host-side `vm.split_irqchip` bool; the kernel's `kvm_arch_irqfd_allowed` is
 //! the rejector that would -EINVAL a resample irqfd on the split path, which is
 //! why we pre-select the edge path there rather than reading that predicate.
@@ -247,11 +248,11 @@ pub(crate) struct VirtioNetPci {
     /// guest-visible MSI-X register read/write delegates here, and the device
     /// core holds the other `Arc` clone and signals through it.
     msix: Arc<PiMutex<MsixState>>,
-    /// Host KVM route programmer (`FullIrqchipRouteOwner` on x86 full-irqchip);
-    /// `None` when MSI-X routing is unavailable (split-irqchip / no owner), in
-    /// which case the facade never installs a route so the guest's MSI-X stays
-    /// undelivered and it falls back to INTx. Called on a vector mask/unmask edge
-    /// to (re)install or remove the GSI's MSI route.
+    /// Host KVM route programmer — the active route owner as a `MsixRouteSink`
+    /// (`FullIrqchipRouteOwner` on full-irqchip, `IoapicHandle` on split-irqchip);
+    /// `None` only without an owner (non-PCI), in which case the facade never
+    /// installs a route and the guest stays on INTx. Called on a vector
+    /// mask/unmask edge to (re)install or remove the GSI's MSI route.
     route_sink: Option<Arc<dyn MsixRouteSink>>,
     /// The KVM GSI assigned to each MSI-X table vector (`virtio_net_msix_gsi`).
     /// The host registered one irqfd per (vector → eventfd) at this GSI at VM
@@ -273,11 +274,11 @@ impl VirtioNetPci {
         gsis: [u32; MSIX_VECTORS],
     ) -> Self {
         // Hand the device core its clone of the shared MSI-X state ONLY when
-        // MSI-X is actually offered (a route sink is present → full-irqchip). With
-        // no sink (split-irqchip / no owner) the cap is omitted below and the
-        // guest stays on INTx, so the core keeps `msix = None`: its signal paths
-        // take the INTx branch with no per-signal lock, keeping INTx
-        // byte-identical on the split path too (not just MMIO/aarch64).
+        // MSI-X is actually offered (a route sink is present — on either irqchip
+        // path). With no sink (non-PCI) the cap is omitted below and the guest
+        // stays on INTx, so the core keeps `msix = None`: its signal paths take
+        // the INTx branch with no per-signal lock, keeping INTx byte-identical on
+        // the no-MSI-X path (MMIO/aarch64).
         let mut net = net;
         if route_sink.is_some() {
             net.set_msix_state(Arc::clone(&msix));
@@ -332,8 +333,8 @@ impl VirtioNetPci {
         cfg.set_u32(REG_BAR0, BAR0_TYPE_BITS);
         cfg.set_wmask_u32(REG_BAR0, BAR0_LOW_WMASK);
 
-        // MSI-X is advertised iff a route sink is wired (full-irqchip with an
-        // owner). On split-irqchip / no owner the cap is omitted so the guest
+        // MSI-X is advertised iff a route sink is wired (either irqchip path's
+        // route owner). With no owner (non-PCI) the cap is omitted so the guest
         // stays on INTx rather than enabling an undeliverable MSI-X.
         Self::write_caps(&mut cfg, route_sink.is_some());
         Self {
@@ -364,12 +365,12 @@ impl VirtioNetPci {
         // NUM_QUEUES=2 (offsets 0 and 4). The multiqueue increment must revisit
         // this bound if it ever raises NUM_QUEUES past 1024.
         //
-        // NOTIFY chains to the MSI-X cap ONLY when MSI-X is offered (full-irqchip
-        // with a route sink present); otherwise it terminates the chain
+        // NOTIFY chains to the MSI-X cap ONLY when MSI-X is offered (a route sink
+        // is wired, on either irqchip path); otherwise it terminates the chain
         // (cap_next = 0). MSI-X is advertised iff the host can install its KVM
-        // routes — a guest on a transport without MSI-X routing (split-irqchip,
-        // no owner) never sees the cap and stays on INTx, so the device never
-        // advertises a delivery path it cannot honor.
+        // routes — a guest with no route owner (non-PCI) never sees the cap and
+        // stays on INTx, so the device never advertises a delivery path it cannot
+        // honor.
         let notify_next: u16 = if msix { CAP_MSIX } else { 0 };
         Self::write_cap(cfg, CAP_NOTIFY, notify_next, CFG_TYPE_NOTIFY, NOTIFY_OFFSET);
         cfg.set_u32(CAP_NOTIFY + CAP_OFF_NOTIFY_MULT, NOTIFY_OFF_MULTIPLIER);
@@ -650,9 +651,9 @@ impl VirtioNetPci {
 
     /// (Re)install the KVM MSI route for table vector `idx` from its current
     /// table dwords, then replay any pending bit. No-op when no route sink is
-    /// wired (split-irqchip / no owner) — the guest's MSI-X then never delivers
-    /// and it falls back to INTx. The msix lock is released before the
-    /// (SRCU-grace) route ioctl so the slow ioctl never holds it.
+    /// wired (non-PCI) — the guest's MSI-X then never delivers and it falls back
+    /// to INTx. The msix lock is released before the (SRCU-grace) route ioctl so
+    /// the slow ioctl never holds it.
     fn install_route(&mut self, idx: usize) {
         let Some(sink) = self.route_sink.as_ref() else {
             return;
@@ -1303,7 +1304,7 @@ mod tests {
         );
     }
 
-    /// Without a route sink (split-irqchip / no owner) the MSI-X cap is NOT
+    /// Without a route sink (no route owner — e.g. non-PCI) the MSI-X cap is NOT
     /// advertised — the guest never sees it and stays on INTx, so the device
     /// never offers a delivery path it cannot honor.
     #[test]

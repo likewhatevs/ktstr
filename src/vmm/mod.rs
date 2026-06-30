@@ -1147,13 +1147,28 @@ impl KtstrVm {
         // `VmResult`). `None` when the builder has no `NetConfig`.
         #[cfg(target_arch = "x86_64")]
         let virtio_net: Option<Arc<PiMutex<virtio_net::VirtioNet>>> = None;
+        // The active GSI-route owner as the MSI-X route sink: `IoapicHandle` on
+        // split-irqchip, `FullIrqchipRouteOwner` on full (both impl
+        // `MsixRouteSink`). Threaded into `init_virtio_net_pci` so MSI-X is
+        // offered on both irqchip paths; cloned (Arc) so each owner stays
+        // available for the run loops + teardown routing diagnostics.
+        #[cfg(target_arch = "x86_64")]
+        let msix_sink: Option<Arc<dyn virtio_net::MsixRouteSink>> = if vm.split_irqchip {
+            ioapic_handle
+                .clone()
+                .map(|h| h as Arc<dyn virtio_net::MsixRouteSink>)
+        } else {
+            full_route_owner
+                .clone()
+                .map(|o| o as Arc<dyn virtio_net::MsixRouteSink>)
+        };
         #[cfg(target_arch = "x86_64")]
         let _net_resample_evts: Vec<_> = match pci_bus_handle.as_ref() {
             // One resample eventfd per NIC (Some only on the full-irqchip path);
             // all are held alive for the shell run so KVM can de-assert each
             // level GSI on guest EOI. Shell mode discards the counters.
             Some(bus) => self
-                .init_virtio_net_pci(&vm, bus, full_route_owner.as_ref())?
+                .init_virtio_net_pci(&vm, bus, msix_sink)?
                 .into_iter()
                 .map(|h| h.resample_evt)
                 .collect(),

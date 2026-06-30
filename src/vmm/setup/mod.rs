@@ -593,18 +593,22 @@ impl KtstrVm {
     /// run state + `VmResult`) and, on the full-irqchip path, the resample
     /// eventfd the caller MUST keep alive.
     ///
-    /// `route_owner` is the full-irqchip shared GSI route owner, `Some` only on
-    /// the full-irqchip path. When `Some`, each NIC additionally gets MSI-X: one
-    /// eventfd per vector registered as an irqfd at `virtio_net_msix_gsi(index,
-    /// v)`, and the owner threaded into the facade (as a `MsixRouteSink`) to
-    /// install the MSI routes on the guest's vector-unmask edges. When `None`
-    /// (split-irqchip), the facade omits the MSI-X cap so the NIC stays on INTx.
+    /// `msix_sink` is the active GSI-route owner as a
+    /// [`virtio_net::MsixRouteSink`]: the [`kvm::FullIrqchipRouteOwner`] on the
+    /// full-irqchip path, the [`kvm::IoapicHandle`] on the split-irqchip path
+    /// (both impl the trait) — `Some` whenever this is an x86 PCI guest, `None`
+    /// otherwise. When `Some`, each NIC additionally gets MSI-X: one eventfd per
+    /// vector registered as an irqfd at `virtio_net_msix_gsi(index, v)`, and the
+    /// sink threaded into the facade to install the MSI routes on the guest's
+    /// vector-unmask edges. When `None`, the facade omits the MSI-X cap so the
+    /// NIC stays on INTx. INTx is registered on BOTH irqchip paths regardless —
+    /// the guest's fallback if it declines MSI-X (an older driver, `pci=nomsi`).
     #[cfg(target_arch = "x86_64")]
     pub(super) fn init_virtio_net_pci(
         &self,
         vm: &kvm::KtstrKvm,
         pci_bus: &Arc<PiMutex<pci::PciBus>>,
-        route_owner: Option<&Arc<kvm::FullIrqchipRouteOwner>>,
+        msix_sink: Option<Arc<dyn virtio_net::MsixRouteSink>>,
     ) -> Result<Vec<NetDeviceHandles>> {
         // The BAR aperture is the host-bridge _CRS MMIO grant (same window the
         // DSDT advertises to the guest); bar_window rejects a base outside it so
@@ -628,9 +632,12 @@ impl KtstrVm {
             let mut dev = virtio_net::VirtioNet::new(*cfg);
             dev.set_mem((*vm.guest_mem).clone());
             let counters = dev.counters();
-            // INTx delivery differs by irqchip mode (the kernel's
-            // kvm_arch_irqfd_allowed, arch/x86/kvm/irq.c: a RESAMPLE irqfd
-            // requires irqchip_full). The mode is gated on max APIC ID
+            // INTx — the guest's interrupt FALLBACK now that the MSI-X cap is
+            // advertised on both irqchip paths (the MSI-X block below). Registered
+            // unconditionally so a guest that declines MSI-X (older driver,
+            // `pci=nomsi`) still gets IRQs. Its delivery differs by irqchip mode
+            // (the kernel's kvm_arch_irqfd_allowed, arch/x86/kvm/irq.c: a RESAMPLE
+            // irqfd requires irqchip_full). The mode is gated on max APIC ID
             // (split_irqchip = max_apic_id > MAX_XAPIC_ID), NOT vCPU count — APIC
             // IDs are sparse, so a wide-core sub-254-vCPU guest can be split:
             // - Full in-kernel irqchip (<=254 max APIC ID): register the GSI as a
@@ -680,21 +687,23 @@ impl KtstrVm {
                 // race).
                 Some(evt)
             };
-            // MSI-X (full-irqchip only): build the shared delivery state, create
+            // MSI-X (both irqchip paths): build the shared delivery state, create
             // one eventfd per vector and register it as an irqfd at its GSI. The
             // MSI route is installed LATER, on the guest's vector-unmask edge (an
             // irqfd may be assigned to a GSI with no route yet — KVM leaves its
             // cached entry inactive until the route is added, virt/kvm/eventfd.c;
-            // the unmask-edge route install refreshes it). The eventfds live in
-            // the shared state (held alive for the run) so the device core fires
-            // them; the route owner (as a `MsixRouteSink`) + the GSIs go to the
-            // facade. `route_owner` is Some only on the full-irqchip path; on
-            // split-irqchip it is None, so the facade omits the MSI-X cap and the
-            // NIC stays on INTx (no undeliverable MSI-X is advertised).
+            // the unmask-edge route install refreshes it — irqchip-mode-independent).
+            // The eventfds live in the shared state (held alive for the run) so the
+            // device core fires them; the route owner (as a `MsixRouteSink`) + the
+            // GSIs go to the facade. `msix_sink` is Some on BOTH the full-irqchip
+            // (FullIrqchipRouteOwner) and split-irqchip (IoapicHandle) paths for an
+            // x86 PCI guest, and None otherwise (no PCI), in which case the facade
+            // omits the MSI-X cap and the NIC stays on INTx (no undeliverable MSI-X
+            // is advertised).
             let msix = Arc::new(PiMutex::new(virtio_net::MsixState::new()));
             let mut msix_gsis = [0u32; virtio_net::MSIX_VECTORS];
-            let route_sink: Option<Arc<dyn virtio_net::MsixRouteSink>> = match route_owner {
-                Some(owner) => {
+            let route_sink: Option<Arc<dyn virtio_net::MsixRouteSink>> = match &msix_sink {
+                Some(sink) => {
                     for (v, gsi_slot) in msix_gsis.iter_mut().enumerate() {
                         let mgsi = kvm::virtio_net_msix_gsi(index, v);
                         *gsi_slot = mgsi;
@@ -708,7 +717,7 @@ impl KtstrVm {
                         })?;
                         msix.lock().set_eventfd(v, evt);
                     }
-                    Some(Arc::clone(owner) as Arc<dyn virtio_net::MsixRouteSink>)
+                    Some(Arc::clone(sink))
                 }
                 None => None,
             };
