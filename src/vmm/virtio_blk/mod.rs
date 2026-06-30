@@ -123,9 +123,19 @@
 //   and `pub fn` readers. The counter taxonomy doc (events vs
 //   requests vs gauges) and the per-helper invariants live next
 //   to the type they describe.
-// - `device`: MMIO read/write, the FSM, the request-state structs,
-//   the `VirtioBlk` device, the engine plumbing
-//   (handle/reset/respawn), and `Drop`.
+// - `device`: the `VirtioBlk` struct and its `pub(crate)` fields, the
+//   MMIO/feature constants, construction (`with_options`), `set_mem`,
+//   the feature/gate predicates (`device_features`,
+//   `queue_config_allowed`, `features_write_allowed`), and the
+//   vectored-IO request handlers.
+// - `mmio`: the thin virtio-MMIO transport facade
+//   (`mmio_read`/`mmio_write`) — decodes the VIRTIO_MMIO_* register
+//   offsets onto the core ops, owning only the address/width decode.
+// - `control`: the transport-neutral core register/FSM ops the
+//   transport facades decode onto, the device-status FSM (`set_status`),
+//   the device-config read (`read_blk_config`), and the reset /
+//   worker-respawn / pause lifecycle dispatch.
+// - `lifecycle`: the worker stop/join free helpers and `impl Drop`.
 // - `handlers`: an `impl VirtioBlk` block with the four
 //   `handle_*_impl` per-request-type handlers (T_IN / T_OUT /
 //   T_FLUSH / T_GET_ID) and their `cfg(test)` `&self` wrappers.
@@ -198,10 +208,20 @@ mod handlers;
 // extends the type that lives in `device.rs`. `mod handlers;`
 // alone wires the file into the build.
 
+mod mmio;
+// `mmio.rs` adds an `impl VirtioBlk` block: the thin virtio-MMIO
+// transport facade (`mmio_read`/`mmio_write`) that decodes the
+// VIRTIO_MMIO_* register offsets onto the transport-neutral core ops in
+// `control.rs`. No symbols to re-export — the `impl` block extends the
+// type that lives in `device.rs`; `mod mmio;` alone wires it into the
+// build. Split from `control.rs` so a future PCI facade is a sibling
+// peer of the MMIO facade over the same core, not a fork of it.
+
 mod control;
 mod lifecycle;
-// `control.rs` adds an `impl VirtioBlk` block (MMIO/FSM dispatch +
-// reset/respawn/pause); `lifecycle.rs` holds the worker stop/join free
+// `control.rs` adds an `impl VirtioBlk` block (the transport-neutral
+// core register/FSM ops + reset/respawn/pause); `lifecycle.rs` holds the
+// worker stop/join free
 // helpers (join_worker_with_timeout, the timeout consts,
 // JoinWithTimeoutOutcome, panic_payload_str) + `impl Drop for VirtioBlk`.
 // Both were split out of device.rs for the 2000-line ceiling. The impl
