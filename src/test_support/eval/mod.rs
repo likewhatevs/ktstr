@@ -669,7 +669,7 @@ fn run_ktstr_test_inner_impl(
     )
     .failure_dump_path(primary_dump_path.clone())
     .performance_mode(entry.performance_mode)
-    .pci(entry.pci_enabled);
+    .pci(entry.pci);
 
     // Merge order: default_checks -> scheduler.assert -> per-test assert.
     let merged_assert = crate::assert::Assert::default_checks()

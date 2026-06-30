@@ -23,16 +23,16 @@ mod scheduler;
 ///    inside it.
 ///
 /// Every attribute is optional. Most take a `key = value` form; the
-/// fifteen boolean attributes (`auto_repro`, `expect_auto_repro`,
-/// `not_starved`, `isolation`, `performance_mode`, `no_perf_mode`,
+/// sixteen boolean attributes (`auto_repro`, `expect_auto_repro`,
+/// `not_starved`, `isolation`, `performance_mode`, `pci`, `no_perf_mode`,
 /// `requires_smt`, `expect_err`, `survives_storm`, `allow_inconclusive`,
 /// `fail_on_stall`, `host_only`, `ignore`, `kaslr`, `wprof`) also accept a
 /// bare form as shorthand for `= true` — e.g.
 /// `#[ktstr_test(host_only)]` is equivalent to
-/// `#[ktstr_test(host_only = true)]`. Of the fifteen, `auto_repro`
+/// `#[ktstr_test(host_only = true)]`. Of the sixteen, `auto_repro`
 /// and `kaslr` are the two whose default is `true`, so the bare form
 /// is a no-op; `auto_repro = false` / `kaslr = false` are the only
-/// way to disable each. The other thirteen default to `false`, so the
+/// way to disable each. The other fourteen default to `false`, so the
 /// bare form is the meaningful shorthand.
 ///
 /// The accepted attributes and their defaults are the fields of

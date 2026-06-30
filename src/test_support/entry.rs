@@ -1535,8 +1535,10 @@ pub struct KtstrTestEntry {
     /// Enable the virtio-PCI transport: a host bridge at `00:00.0`
     /// plus the PCI0 ECAM/CAM config-access windows. When `false`, no
     /// PCI host bridge is exposed and the guest cmdline carries
-    /// `pci=off`.
-    pub pci_enabled: bool,
+    /// `pci=off`. Surfaced by `#[ktstr_test(pci)]`; named to match the
+    /// attribute and the bare-bool-field convention (`host_only`,
+    /// `auto_repro`).
+    pub pci: bool,
     /// Decouple virtual topology from host hardware. When set:
     ///
     /// - The VM's virtual topology (`numa_nodes`, `llcs`, `cores`,
@@ -1981,7 +1983,7 @@ impl KtstrTestEntry {
         bpf_map_write: &[],
         watch_bpf_maps: &[],
         performance_mode: false,
-        pci_enabled: false,
+        pci: false,
         no_perf_mode: false,
         duration: Duration::from_secs(12),
         expect_err: false,
