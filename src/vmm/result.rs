@@ -1467,7 +1467,7 @@ pub(crate) struct VmRunState {
     /// finally the BPF verifier-stat read inside
     /// [`super::KtstrVm::collect_results`].
     pub(crate) cleanup_start: Instant,
-    /// Cloned counter handle from [`super::KtstrVm::init_virtio_blk`]
+    /// Cloned counter handle from `KtstrVm::init_virtio_blk`
     /// when a disk was attached, captured before the device-arc is
     /// dropped so [`super::KtstrVm::collect_results`] can snapshot
     /// it into [`VmResult::virtio_blk_counters`]. The device worker

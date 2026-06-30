@@ -371,10 +371,10 @@ impl KtstrVm {
     /// with one override for the template-build VM driver:
     ///
     ///  - **`template_staging_image` set** (internal-only — see
-    ///    [`KtstrVmBuilder::template_staging_image`]): open the
+    ///    [`crate::vmm::KtstrVmBuilder::template_staging_image`]): open the
     ///    caller-supplied path RW and hand it to the device. This
     ///    branch exists exclusively for
-    ///    [`disk_template::build_template_via_vm`]: the driver
+    ///    `disk_template::build_template_via_vm`: the driver
     ///    materialises a sparse staging image, points the
     ///    template-build guest at it via this field, and recovers
     ///    the now-formatted file after VM exit for
@@ -549,10 +549,10 @@ impl KtstrVm {
         // template-build VM driver:
         //
         //  - **`template_staging_image` set** (internal-only — see
-        //    [`KtstrVmBuilder::template_staging_image`]): open the
+        //    [`crate::vmm::KtstrVmBuilder::template_staging_image`]): open the
         //    caller-supplied path RW and hand it to the device. This
         //    branch exists exclusively for
-        //    [`disk_template::build_template_via_vm`]: the driver
+        //    `disk_template::build_template_via_vm`: the driver
         //    materialises a sparse staging image, points the
         //    template-build guest at it via this field, and recovers
         //    the now-formatted file after VM exit for
@@ -822,7 +822,7 @@ impl KtstrVm {
     /// The disk-template lifecycle (throttle gate, backing-file open) is shared
     /// verbatim with the aarch64 MMIO path via [`Self::open_blk_backing`]; only
     /// the transport wiring differs. The device core is a SHARED
-    /// `Arc<PiMutex<VirtioBlk>>`: one clone is moved into the [`VirtioBlkPci`]
+    /// `Arc<PiMutex<VirtioBlk>>`: one clone is moved into the [`crate::vmm::virtio_blk::VirtioBlkPci`]
     /// function on `pci_bus` (the vCPU thread drives it through BAR MMIO exits),
     /// the other is returned in `BlkDeviceHandles::device` so the run loop can
     /// pause/resume the request worker across the freeze rendezvous, read
@@ -839,7 +839,7 @@ impl KtstrVm {
     /// plain edge `register_irqfd` (the kernel's `kvm_arch_irqfd_allowed` rejects
     /// a resample irqfd there). The single-asserter worker (one drain per kick,
     /// consumed before the next) needs no active resample drain — see
-    /// [`VirtioBlkPci`] for the full rationale, which mirrors the NIC's INTx.
+    /// [`crate::vmm::virtio_blk::VirtioBlkPci`] for the full rationale, which mirrors the NIC's INTx.
     ///
     /// `msix_sink` is the active GSI-route owner ([`kvm::FullIrqchipRouteOwner`]
     /// on full-irqchip, [`kvm::IoapicHandle`] on split — both

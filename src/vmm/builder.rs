@@ -133,7 +133,7 @@ pub struct KtstrVmBuilder {
     /// the full contract; the builder field flows through `build`
     /// unchanged.
     dual_snapshot: bool,
-    /// When set, [`super::KtstrVm::init_virtio_blk`] opens this path
+    /// When set, `KtstrVm::init_virtio_blk` opens this path
     /// directly as the virtio-blk backing file instead of allocating
     /// a fresh `tempfile()` (Raw branch) or invoking
     /// [`super::disk_template::ensure_template`] (Btrfs branch). The
@@ -733,7 +733,7 @@ impl KtstrVmBuilder {
     /// at `/dev/vda`.
     ///
     /// Per-test backing is allocated by
-    /// [`super::KtstrVm::init_virtio_blk`]:
+    /// `KtstrVm::init_virtio_blk`:
     /// - `Filesystem::Raw` (the default): a fresh sparse
     ///   `tempfile()` per test, the kernel reclaims storage on
     ///   device drop.
@@ -815,7 +815,7 @@ impl KtstrVmBuilder {
         self
     }
 
-    /// Override [`super::KtstrVm::init_virtio_blk`]'s per-test
+    /// Override `KtstrVm::init_virtio_blk`'s per-test
     /// backing-file allocation with `path`. Internal-only: this is
     /// the seam the disk-template-build VM driver
     /// (`super::disk_template::build_template_via_vm`) uses to

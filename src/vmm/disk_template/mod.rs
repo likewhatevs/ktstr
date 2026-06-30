@@ -24,7 +24,7 @@
 //! # Lifecycle
 //!
 //! 1. **Cache lookup.** [`ensure_template`] is called by
-//!    [`crate::vmm::KtstrVm::init_virtio_blk`] (or callers that
+//!    `KtstrVm::init_virtio_blk` (or callers that
 //!    pre-warm the cache). The lookup keys off
 //!    `(Filesystem::cache_tag, capacity_mib, mkfs_version_fingerprint)`.
 //!    Hit → return the template path. The mkfs-version fingerprint
@@ -48,7 +48,7 @@
 //!    [`crate::vmm::KtstrVmBuilder::template_staging_image`], which
 //!    bypasses both the per-test `Raw` tempfile branch AND the
 //!    `Btrfs` ensure_template branch in
-//!    [`crate::vmm::KtstrVm::init_virtio_blk`] — the template-build
+//!    `KtstrVm::init_virtio_blk` — the template-build
 //!    VM cannot recursively re-enter the cache it is itself
 //!    populating. Guest dispatch
 //!    (`crate::vmm::rust_init::run_disk_template_mode`) execs
@@ -1124,7 +1124,7 @@ fn locate_host_binary(name: &str, package_hint: &str) -> Result<PathBuf> {
 /// sentinel. There is no PATH dependency at all for `Raw`. (In
 /// practice the production path never reaches `ensure_template`
 /// for `Raw` — the gate at
-/// [`crate::vmm::KtstrVm::init_virtio_blk`] short-circuits first —
+/// `KtstrVm::init_virtio_blk` short-circuits first —
 /// but the fallback exists for defensive/test invocations.)
 ///
 /// Operators hitting the formatter-removed bail on a
@@ -1137,7 +1137,7 @@ fn locate_host_binary(name: &str, package_hint: &str) -> Result<PathBuf> {
 /// lookup when the formatter is missing — the cache key would be
 /// ambiguous, so refusal is the correct disposition.
 ///
-/// Callers (typically [`crate::vmm::KtstrVm::init_virtio_blk`])
+/// Callers (typically `KtstrVm::init_virtio_blk`)
 /// then pass the returned path to [`clone_to_per_test`] for the
 /// per-test reflink clone.
 pub(crate) fn ensure_template(fs: Filesystem, capacity_bytes: u64) -> Result<PathBuf> {
@@ -1152,7 +1152,7 @@ pub(crate) fn ensure_template(fs: Filesystem, capacity_bytes: u64) -> Result<Pat
     // [`Filesystem::Raw`]) skip the fingerprint and use the
     // `noversion` sentinel; the production path never builds a
     // template for `Raw` (the gate at
-    // [`crate::vmm::KtstrVm::init_virtio_blk`] short-circuits
+    // `KtstrVm::init_virtio_blk` short-circuits
     // first), so this branch is defensive.
     let version_fp = match locate_host_mkfs(fs)? {
         Some((mkfs_path, _name)) => mkfs_version_fingerprint(&mkfs_path)?,
@@ -1293,7 +1293,7 @@ fn create_and_size_staging_image(staging_path: &Path, capacity_bytes: u64) -> Re
 /// 3. Boot a [`crate::vmm::KtstrVm`] with the sparse image attached
 ///    via [`crate::vmm::KtstrVmBuilder::template_staging_image`],
 ///    which short-circuits the per-test backing-file branches in
-///    [`crate::vmm::KtstrVm::init_virtio_blk`] so the template-build
+///    `KtstrVm::init_virtio_blk` so the template-build
 ///    VM cannot recursively re-enter [`ensure_template`] for its
 ///    own `(fs, capacity_bytes)` key. Cmdline carries
 ///    `KTSTR_MODE=disk_template`; the guest dispatch at
@@ -1309,7 +1309,7 @@ fn create_and_size_staging_image(staging_path: &Path, capacity_bytes: u64) -> Re
 /// Filesystem variants whose [`Filesystem::mkfs_binary_name`]
 /// returns `None` (currently `Filesystem::Raw`) are unreachable on
 /// this path: [`ensure_template`] only invokes this driver from the
-/// gated formatting arm in [`crate::vmm::KtstrVm::init_virtio_blk`].
+/// gated formatting arm in `KtstrVm::init_virtio_blk`.
 /// Such an argument means a caller bypassed that gate; bail with an
 /// actionable error rather than build an unformatted template
 /// (which would be a no-op).
@@ -1344,7 +1344,7 @@ fn build_template_via_vm(
     // on this path because [`ensure_template`] gates on
     // [`Filesystem::mkfs_binary_name`] before calling here. A
     // `None` result means a caller bypassed the gate in
-    // [`crate::vmm::KtstrVm::init_virtio_blk`]; reject with an
+    // `KtstrVm::init_virtio_blk`; reject with an
     // actionable diagnostic.
     //
     // The returned tuple carries both the canonicalized path AND

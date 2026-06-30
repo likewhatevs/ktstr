@@ -22,7 +22,7 @@ use super::*;
 ///    src→staging_image rename or the staging→final_dir rename
 ///    leaves the populated tmpdir on disk.
 /// 3. **`.per-test-<pid>-<ns>-<rnd>.img`** — per-test FICLONE
-///    backing files created by [`crate::vmm::KtstrVm::init_virtio_blk`]
+///    backing files created by `KtstrVm::init_virtio_blk`
 ///    for the `Filesystem::Btrfs` branch. The setter unlinks the
 ///    path immediately after FICLONE (the open `File` keeps the
 ///    inode alive for the device's lifetime), but a SIGKILL
@@ -154,7 +154,7 @@ pub fn clean_orphaned_tmp_dirs(cache_root: &Path) -> Result<usize> {
         //     [`store_atomic`]).
         //   - `.per-test-<pid>-<ns>-<rnd>.img` — per-test FICLONE
         //     backing file (see
-        //     [`crate::vmm::KtstrVm::init_virtio_blk`]'s `Btrfs`
+        //     `KtstrVm::init_virtio_blk`'s `Btrfs`
         //     branch). Pid is the FIRST `-`-separated token after
         //     the `.per-test-` prefix; subsequent tokens encode
         //     timestamp + randomness for collision-freedom across
