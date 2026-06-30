@@ -1,4 +1,4 @@
-error: unexpected parenthesised arguments on `host_only`; use `host_only = value` for value attributes or bare `host_only` for bool attributes (auto_repro, expect_auto_repro, not_starved, isolation, performance_mode, no_perf_mode, requires_smt, expect_err, survives_storm, allow_inconclusive, fail_on_stall, host_only, ignore, kaslr, wprof)
+error: unexpected parenthesised arguments on `host_only`; use `host_only = value` for value attributes or bare `host_only` for bool attributes (auto_repro, expect_auto_repro, not_starved, isolation, performance_mode, pci, no_perf_mode, requires_smt, expect_err, survives_storm, allow_inconclusive, fail_on_stall, host_only, ignore, kaslr, wprof)
  --> tests/compile_fail/ktstr_test_meta_list.rs:3:14
   |
 3 | #[ktstr_test(host_only(false))]

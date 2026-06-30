@@ -9,7 +9,7 @@ note: if you're trying to build a new `MetricCheck` consider using one of the fo
       MetricCheck::max
       MetricCheck::range
       MetricCheck::exists
-      MetricCheck::exit_code_eq
+      and $N others
   --> src/test_support/payload.rs
    |
    |     pub const fn min(metric: &'static str, value: f64) -> MetricCheck {
@@ -23,6 +23,3 @@ note: if you're trying to build a new `MetricCheck` consider using one of the fo
 ...
    |     pub const fn exists(metric: &'static str) -> MetricCheck {
    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-...
-   |     pub const fn exit_code_eq(expected: i32) -> MetricCheck {
-   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
