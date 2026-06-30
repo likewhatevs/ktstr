@@ -82,6 +82,9 @@ pub(crate) mod setup;
 pub(crate) mod vcpu;
 pub(crate) mod virtio_blk;
 pub(crate) mod virtio_console;
+// Shared MSI-X interrupt-delivery state (`MsixState`/`IrqSource`/`MsixRouteSink`)
+// for the virtio PCI facades (net + blk).
+pub(crate) mod virtio_msix;
 pub(crate) mod virtio_net;
 
 // Bulk transport modules. The wire format (`wire`), the host-side
@@ -1153,14 +1156,14 @@ impl KtstrVm {
         // offered on both irqchip paths; cloned (Arc) so each owner stays
         // available for the run loops + teardown routing diagnostics.
         #[cfg(target_arch = "x86_64")]
-        let msix_sink: Option<Arc<dyn virtio_net::MsixRouteSink>> = if vm.split_irqchip {
+        let msix_sink: Option<Arc<dyn virtio_msix::MsixRouteSink>> = if vm.split_irqchip {
             ioapic_handle
                 .clone()
-                .map(|h| h as Arc<dyn virtio_net::MsixRouteSink>)
+                .map(|h| h as Arc<dyn virtio_msix::MsixRouteSink>)
         } else {
             full_route_owner
                 .clone()
-                .map(|o| o as Arc<dyn virtio_net::MsixRouteSink>)
+                .map(|o| o as Arc<dyn virtio_msix::MsixRouteSink>)
         };
         #[cfg(target_arch = "x86_64")]
         let _net_resample_evts: Vec<_> = match pci_bus_handle.as_ref() {

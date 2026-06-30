@@ -25,7 +25,7 @@ use vm_memory::{Address, ByteValued, Bytes, GuestAddress, GuestMemoryMmap};
 use vmm_sys_util::eventfd::EventFd;
 
 use super::counters::VirtioNetCounters;
-use super::interrupt::{IrqSource, MsixState};
+use crate::vmm::virtio_msix::{IrqSource, MsixState};
 use crate::vmm::PiMutex;
 use crate::vmm::net_config::NetConfig;
 

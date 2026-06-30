@@ -165,7 +165,7 @@ pub(crate) const KVM_MAX_IRQ_ROUTES: usize = 4096;
 /// host never overflows the table and no config needs a runtime bail. With the
 /// 24-pin IOAPIC base and 16 NICs this is `(4096 - 24) / 16 = 254`. The device
 /// caps its advertised vector count at this (and at the MSI-X table-page
-/// capacity [`crate::vmm::virtio_net::MSIX_TABLE_MAX`]); a NIC wanting more
+/// capacity [`crate::vmm::virtio_msix::MSIX_TABLE_MAX`]); a NIC wanting more
 /// queue-pairs than `254` vectors allow (> 126 pairs) falls back to the guest's
 /// SHARED vector policy, which the per-queue signal path serves transparently.
 pub(crate) const MSIX_VECTORS_PER_NIC: usize =
@@ -175,7 +175,7 @@ pub(crate) const MSIX_VECTORS_PER_NIC: usize =
 // (the device cannot advertise more vectors than its one-page table holds, so
 // MsixState::new caps num_vectors at this stride knowing it is the binding one).
 const _: () = assert!(
-    MSIX_VECTORS_PER_NIC <= crate::vmm::virtio_net::MSIX_TABLE_MAX,
+    MSIX_VECTORS_PER_NIC <= crate::vmm::virtio_msix::MSIX_TABLE_MAX,
     "per-NIC MSI-X GSI budget exceeds the device MSI-X table-page capacity"
 );
 // All NICs' vector ranges plus the IOAPIC pin range must fit KVM's routing
@@ -1184,7 +1184,7 @@ fn translate_msi_ext_dest_id(address_lo: u32, address_hi: u32) -> (u32, u32) {
 /// Build an [`MsiRoute`] from a guest-composed MSI-X message tuple, applying the
 /// `virt_ext_dest_id` → KVM swizzle ([`translate_msi_ext_dest_id`]) so the
 /// route's destination survives KVM decode for APIC IDs > 255. Shared by both
-/// [`MsixRouteSink`](crate::vmm::virtio_net::MsixRouteSink) impls (the two
+/// [`MsixRouteSink`](crate::vmm::virtio_msix::MsixRouteSink) impls (the two
 /// per-irqchip-mode route owners) so the guest-message → KVM-route conversion is
 /// identical on both paths.
 fn msi_route_from_guest_msg(address_lo: u32, address_hi: u32, data: u32) -> MsiRoute {
@@ -1197,13 +1197,13 @@ fn msi_route_from_guest_msg(address_lo: u32, address_hi: u32, data: u32) -> MsiR
 }
 
 /// Bridge the full-irqchip route owner to the transport-neutral
-/// [`crate::vmm::virtio_net::MsixRouteSink`] the virtio-net PCI facade calls on a
+/// [`crate::vmm::virtio_msix::MsixRouteSink`] the virtio-net PCI facade calls on a
 /// vector mask/unmask edge: map the guest's MSI message dwords into an
 /// [`MsiRoute`] (applying the ext-dest swizzle, [`msi_route_from_guest_msg`]) and
 /// (un)install it via the inherent [`Self::set_route`]. Errors are counted in
 /// `routing_failures` (read at teardown), not propagated — a config-space MMIO
 /// write has no error channel back to the guest.
-impl crate::vmm::virtio_net::MsixRouteSink for FullIrqchipRouteOwner {
+impl crate::vmm::virtio_msix::MsixRouteSink for FullIrqchipRouteOwner {
     fn set_route(&self, gsi: u32, msg: Option<(u32, u32, u32)>) {
         let route = msg.map(|(lo, hi, data)| msi_route_from_guest_msg(lo, hi, data));
         let _ = FullIrqchipRouteOwner::set_route(self, gsi, route);
@@ -1219,7 +1219,7 @@ impl crate::vmm::virtio_net::MsixRouteSink for FullIrqchipRouteOwner {
 /// table (`KVM_SET_GSI_ROUTING` is a whole-table replace), holding BOTH halves:
 /// the userspace IOAPIC's RTE→MSI translations ([`Ioapic::gsi_routes`], GSIs
 /// `0..NUM_IOAPIC_PINS`) AND the device MSI-X routes (`msix_routes`, GSIs
-/// `>= NUM_IOAPIC_PINS`) installed via [`crate::vmm::virtio_net::MsixRouteSink`]
+/// `>= NUM_IOAPIC_PINS`) installed via [`crate::vmm::virtio_msix::MsixRouteSink`]
 /// on a vector mask/unmask edge. Both halves are `KVM_IRQ_ROUTING_MSI` entries
 /// built by [`build_device_msi_routing`] — split-irqchip has no in-kernel
 /// IOAPIC/PIC, so (unlike [`FullIrqchipRouteOwner`]) it never emits the explicit
@@ -1411,7 +1411,7 @@ impl IoapicHandle {
     /// half separately — neither lock is held across the other or across the
     /// ioctl. The seam exists only so a host-side test injects a counting/failing
     /// installer; production reaches this via the
-    /// [`crate::vmm::virtio_net::MsixRouteSink`] impl with the real
+    /// [`crate::vmm::virtio_msix::MsixRouteSink`] impl with the real
     /// `KVM_SET_GSI_ROUTING` installer. `install` runs at most once → `FnOnce`.
     fn set_route_with(
         &self,
@@ -1469,7 +1469,7 @@ impl IoapicHandle {
 }
 
 /// Bridge the split-irqchip route owner to the transport-neutral
-/// [`crate::vmm::virtio_net::MsixRouteSink`] the virtio-net PCI facade calls on a
+/// [`crate::vmm::virtio_msix::MsixRouteSink`] the virtio-net PCI facade calls on a
 /// vector mask/unmask edge: map the guest's MSI message dwords into an
 /// [`MsiRoute`] and (un)install it via the inherent [`Self::set_route_with`],
 /// which rebuilds the COMBINED IOAPIC + MSI-X table. Errors are counted in
@@ -1477,7 +1477,7 @@ impl IoapicHandle {
 /// write has no error channel back to the guest. Mirrors the identical bridge on
 /// [`FullIrqchipRouteOwner`]; the two are the per-irqchip-mode route owners
 /// (split → `IoapicHandle`, full → `FullIrqchipRouteOwner`).
-impl crate::vmm::virtio_net::MsixRouteSink for IoapicHandle {
+impl crate::vmm::virtio_msix::MsixRouteSink for IoapicHandle {
     fn set_route(&self, gsi: u32, msg: Option<(u32, u32, u32)>) {
         let route = msg.map(|(lo, hi, data)| msi_route_from_guest_msg(lo, hi, data));
         let fd = self.vm_fd_raw;

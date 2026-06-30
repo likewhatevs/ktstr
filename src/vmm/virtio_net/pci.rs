@@ -14,7 +14,7 @@
 //! owner is wired — on BOTH irqchip paths for an x86 PCI guest: the full-irqchip
 //! `FullIrqchipRouteOwner` or the split-irqchip `IoapicHandle`, both
 //! `MsixRouteSink`s — the per-vector delivery state + the fire-or-pend gate live
-//! in the `interrupt` submodule's `MsixState`, and the cap / table /
+//! in the shared `virtio_msix` module's `MsixState`, and the cap / table /
 //! route-install decode is in this file), and INTx as the fallback (no route
 //! owner — non-PCI; or a guest that declines MSI-X), delivered via the device's
 //! existing `irq_evt`. The INTx KVM wiring (in `setup::init_virtio_net_pci`) branches on the
@@ -66,7 +66,7 @@ use std::sync::Arc;
 use virtio_bindings::virtio_mmio::{VIRTIO_MMIO_INT_CONFIG, VIRTIO_MMIO_INT_VRING};
 
 use super::device::{NUM_QUEUES, VirtioNet};
-use super::interrupt::{MSIX_TABLE_MAX, MsixRouteSink, MsixState, NO_VECTOR};
+use crate::vmm::virtio_msix::{MSIX_TABLE_MAX, MsixRouteSink, MsixState, NO_VECTOR};
 use crate::vmm::PiMutex;
 use crate::vmm::pci::{
     ConfigSpace, PCI_COMMAND_MEMORY, PCI_COMMAND_WMASK, PCI_STATUS_CAP_LIST, PciFunction,
@@ -673,7 +673,7 @@ impl VirtioNetPci {
         let entry = (rel / MSIX_ENTRY_SIZE) as usize;
         let dword = ((rel % MSIX_ENTRY_SIZE) / 4) as usize;
         let val = Self::get_u32(data);
-        // The unmask-edge return is informational (unit-tested in `interrupt`);
+        // The unmask-edge return is informational (unit-tested in `virtio_msix`);
         // the facade reconciles the entry's route to its current deliverability,
         // which subsumes the unmask edge (install), the mask edge (remove), and a
         // non-spec addr/data rewrite while unmasked (re-install). That last case

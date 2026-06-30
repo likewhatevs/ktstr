@@ -23,7 +23,9 @@ use super::memory_budget::{
     read_kernel_version, read_kernel_version_from_metadata_sidecar,
 };
 use super::pi_mutex::PiMutex;
-use super::{disk_config, disk_template, host_topology, initramfs, pci, virtio_blk, virtio_net};
+use super::{
+    disk_config, disk_template, host_topology, initramfs, pci, virtio_blk, virtio_msix, virtio_net,
+};
 use vmm_sys_util::eventfd::EventFd;
 
 #[cfg(target_arch = "aarch64")]
@@ -594,7 +596,7 @@ impl KtstrVm {
     /// eventfd the caller MUST keep alive.
     ///
     /// `msix_sink` is the active GSI-route owner as a
-    /// [`virtio_net::MsixRouteSink`]: the [`kvm::FullIrqchipRouteOwner`] on the
+    /// [`virtio_msix::MsixRouteSink`]: the [`kvm::FullIrqchipRouteOwner`] on the
     /// full-irqchip path, the [`kvm::IoapicHandle`] on the split-irqchip path
     /// (both impl the trait) — `Some` whenever this is an x86 PCI guest, `None`
     /// otherwise. When `Some`, each NIC additionally gets MSI-X: one eventfd per
@@ -608,7 +610,7 @@ impl KtstrVm {
         &self,
         vm: &kvm::KtstrKvm,
         pci_bus: &Arc<PiMutex<pci::PciBus>>,
-        msix_sink: Option<Arc<dyn virtio_net::MsixRouteSink>>,
+        msix_sink: Option<Arc<dyn virtio_msix::MsixRouteSink>>,
     ) -> Result<Vec<NetDeviceHandles>> {
         // The BAR aperture is the host-bridge _CRS MMIO grant (same window the
         // DSDT advertises to the guest); bar_window rejects a base outside it so
@@ -706,13 +708,13 @@ impl KtstrVm {
             // page capacity). The GSI/eventfd allocation below matches that count
             // (`num_vectors`), so the facade's advertised table size, the
             // registered irqfds, and the device's table stay in lockstep.
-            let msix = Arc::new(PiMutex::new(virtio_net::MsixState::new(
+            let msix = Arc::new(PiMutex::new(virtio_msix::MsixState::new(
                 dev.num_queues(),
                 kvm::MSIX_VECTORS_PER_NIC,
             )));
             let num_vectors = msix.lock().num_vectors();
             let mut msix_gsis: Vec<u32> = vec![0u32; num_vectors];
-            let route_sink: Option<Arc<dyn virtio_net::MsixRouteSink>> = match &msix_sink {
+            let route_sink: Option<Arc<dyn virtio_msix::MsixRouteSink>> = match &msix_sink {
                 Some(sink) => {
                     for (v, gsi_slot) in msix_gsis.iter_mut().enumerate() {
                         let mgsi = kvm::virtio_net_msix_gsi(index, v);

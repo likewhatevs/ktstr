@@ -40,7 +40,8 @@ use super::vcpu::{
 };
 use super::vmlinux::{cached_vmlinux_bytes, find_vmlinux};
 use super::{
-    KtstrVm, console, host_comms, vcpu_panic, virtio_blk, virtio_console, virtio_net, wire,
+    KtstrVm, console, host_comms, vcpu_panic, virtio_blk, virtio_console, virtio_msix, virtio_net,
+    wire,
 };
 
 #[cfg(target_arch = "aarch64")]
@@ -1132,14 +1133,14 @@ impl KtstrVm {
         // offered on both irqchip paths; cloned (Arc) so each owner stays
         // available for the run loops + teardown routing diagnostics.
         #[cfg(target_arch = "x86_64")]
-        let msix_sink: Option<Arc<dyn virtio_net::MsixRouteSink>> = if vm.split_irqchip {
+        let msix_sink: Option<Arc<dyn virtio_msix::MsixRouteSink>> = if vm.split_irqchip {
             ioapic_handle
                 .clone()
-                .map(|h| h as Arc<dyn virtio_net::MsixRouteSink>)
+                .map(|h| h as Arc<dyn virtio_msix::MsixRouteSink>)
         } else {
             full_route_owner
                 .clone()
-                .map(|o| o as Arc<dyn virtio_net::MsixRouteSink>)
+                .map(|o| o as Arc<dyn virtio_msix::MsixRouteSink>)
         };
         // One (counters, resample_evt) pair per installed NIC. The resample fds
         // (Some only on the full-irqchip path) are held alive in `_net_resample_evts`

@@ -1,14 +1,19 @@
-//! MSI-X interrupt delivery for the virtio-net device.
+//! MSI-X interrupt delivery for virtio PCI devices.
 //!
-//! The transport-neutral core ([`super::device::VirtioNet`]) signals interrupts
-//! by emitting an abstract [`IrqSource`] (a virtqueue used-ring publish or a
-//! config-change). On the INTx path the core writes its single `irq_evt` line
-//! directly (unchanged for virtio-MMIO and aarch64). When the guest enables
-//! MSI-X on the PCI transport, the core instead routes the signal through this
-//! module's [`MsixState`], which resolves the source to a guest-assigned vector,
-//! gates on the per-vector + function masks, and either fires that vector's
-//! irqfd-registered eventfd or records a Pending-Bit-Array bit for replay on
-//! unmask.
+//! Shared by the virtio-net and virtio-blk PCI facades. The worked examples
+//! below use virtio-net's virtqueue layout (RX/TX data queues plus an optional
+//! control vq); virtio-blk has a single request queue, so its core emits
+//! `IrqSource::Vring { queue: 0 }` for a used-ring publish and
+//! `IrqSource::Config` for a NEEDS_RESET / config-change.
+//!
+//! A device's transport-neutral core signals interrupts by emitting an abstract
+//! [`IrqSource`] (a virtqueue used-ring publish or a config-change). On the INTx
+//! path the core writes its single `irq_evt` line directly (unchanged for
+//! virtio-MMIO and aarch64). When the guest enables MSI-X on the PCI transport,
+//! the core instead routes the signal through this module's [`MsixState`], which
+//! resolves the source to a guest-assigned vector, gates on the per-vector +
+//! function masks, and either fires that vector's irqfd-registered eventfd or
+//! records a Pending-Bit-Array bit for replay on unmask.
 //!
 //! Ownership mirrors cloud-hypervisor's device→`Arc<dyn VirtioInterrupt>`
 //! boundary (the device core never sees a vector number, eventfd, or GSI) but
@@ -29,7 +34,7 @@
 //!
 //! The device advertises one MSI-X table entry per virtqueue plus one for
 //! config (`num_queues + 1`, sized per device — see [`MsixState::new`] — and
-//! capped at the host's per-NIC GSI budget). Linux's `virtio_pci_modern` driver
+//! capped at the host's per-device GSI budget). Linux's `virtio_pci_modern` driver
 //! tries three vector policies in order (drivers/virtio/virtio_pci_common.c
 //! `vp_find_vqs`): `VP_VQ_VECTOR_POLICY_EACH`, then
 //! `VP_VQ_VECTOR_POLICY_SHARED_SLOW`, then `VP_VQ_VECTOR_POLICY_SHARED`.
@@ -51,7 +56,7 @@
 //!
 //! [`MsixState::signal`] resolves an [`IrqSource::Vring`] to that vq's
 //! `queue_vectors[queue]` entry, so RX, TX, and distinct queue-pairs deliver
-//! independently. When a queue count exceeds the per-NIC vector budget, EACH
+//! independently. When a queue count exceeds the per-device vector budget, EACH
 //! (and SHARED_SLOW) request more vectors than the table holds and fail; the
 //! driver falls through to SHARED (`nvectors = 2`: config → vector 0, ALL
 //! virtqueues → vector 1, virtio_pci_common.h). The per-queue signal path serves
@@ -64,19 +69,13 @@
 
 use vmm_sys_util::eventfd::EventFd;
 
-// `NUM_QUEUES` (the single-pair baseline) is referenced only by the unit tests
-// below — the production state sizes `queue_vectors` from the per-device queue
-// count passed to `new`.
-#[cfg(test)]
-use super::device::NUM_QUEUES;
-
 /// MSI-X table-page vector capacity: the BAR0 MSI-X-table page (one 4 KiB page
 /// in the PCI facade) holds `4096 / 16 = 256` 16-byte entries, so the device
 /// can advertise at most this many vectors before the table would overflow its
 /// page into the PBA page. The PCI facade static-asserts its table-page byte
 /// span matches this. This is the page-capacity ceiling; the BINDING runtime
 /// cap on a device's advertised vectors is `max_vectors` passed to
-/// [`MsixState::new`] (the host's per-NIC MSI-X GSI budget,
+/// [`MsixState::new`] (the host's per-device MSI-X GSI budget,
 /// `kvm::MSIX_VECTORS_PER_NIC`), which the kvm module const-asserts is `<=` this
 /// ceiling. A queue count beyond the cap makes the guest fall back from per-vq
 /// (EACH) to SHARED.
@@ -126,7 +125,7 @@ pub(crate) trait MsixRouteSink: Send + Sync {
     fn set_route(&self, gsi: u32, msg: Option<(u32, u32, u32)>);
 }
 
-/// MSI-X delivery state for one virtio-net device: the guest-visible table
+/// MSI-X delivery state for one virtio device: the guest-visible table
 /// entries + vector assignments + Pending Bit Array, the device-level enable /
 /// function-mask, and the per-vector irqfd-registered eventfds. Shared via
 /// `Arc<PiMutex<…>>` between the device core (signals) and the PCI facade
@@ -177,14 +176,14 @@ impl MsixState {
     /// PCI reset value), MSI-X disabled. `num_queues` is the device's virtqueue
     /// count — the length of the per-queue vector map ([`Self::queue_vectors`]).
     /// `max_vectors` caps the advertised vector count (the table / PBA / eventfd
-    /// array length): the host's per-NIC MSI-X GSI budget
+    /// array length): the host's per-device MSI-X GSI budget
     /// (`kvm::MSIX_VECTORS_PER_NIC`), itself bounded by the table-page capacity
     /// [`MSIX_TABLE_MAX`].
     pub(crate) fn new(num_queues: usize, max_vectors: usize) -> Self {
         // One MSI-X vector per virtqueue plus one for config/NEEDS_RESET — the
         // table size the guest's EACH policy (vp_find_one_vq_msix) requests for
         // per-queue IRQ steering: config → vector 0, each vq → 1..=num_queues.
-        // Capped at `max_vectors` (the host's per-NIC MSI-X GSI budget, ≤ the
+        // Capped at `max_vectors` (the host's per-device MSI-X GSI budget, ≤ the
         // BAR0 MSI-X-table page capacity): for a queue count within budget the
         // full per-vq table fits and the guest assigns each vq its own vector;
         // for a larger count the table is too small for EACH, so the guest falls
@@ -265,7 +264,7 @@ impl MsixState {
         if let Some(evt) = &self.eventfds[idx]
             && let Err(e) = evt.write(1)
         {
-            tracing::warn!(%e, vector = idx, "virtio-net MSI-X eventfd write failed");
+            tracing::warn!(%e, vector = idx, "virtio MSI-X eventfd write failed");
         }
     }
 
@@ -289,7 +288,7 @@ impl MsixState {
         // write can fail.)
         if let Some(evt) = &self.eventfds[idx] {
             if let Err(e) = evt.write(1) {
-                tracing::warn!(%e, vector = idx, "virtio-net MSI-X pending replay write failed");
+                tracing::warn!(%e, vector = idx, "virtio MSI-X pending replay write failed");
                 return false;
             }
             self.pba[idx / 8] &= !(1 << (idx % 8));
@@ -418,6 +417,12 @@ impl MsixState {
 mod tests {
     use super::*;
     use std::os::fd::AsRawFd;
+
+    /// The virtio-net single-pair baseline (1 RX + 1 TX, no control vq) — the
+    /// example queue layout these shared-MSI-X tests use. Production sizes
+    /// `queue_vectors` from the per-device queue count passed to
+    /// [`MsixState::new`], not this constant.
+    const NUM_QUEUES: usize = 2;
 
     /// Single-pair MSI-X vector count under the EACH policy: config + one per
     /// virtqueue (RX vq0 + TX vq1), no control vq. `MsixState::new(NUM_QUEUES,

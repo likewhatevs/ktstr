@@ -426,7 +426,7 @@ const CVQ_FUZZ_QUEUE_PAIRS: u16 = 4;
 /// local because the proptest module cannot reach the sibling test module's
 /// private helpers.
 fn build_cvq_fuzz_fixture(queue_pairs: u16) -> (VirtioNet, GuestMemoryMmap, usize) {
-    use super::interrupt::MsixState;
+    use crate::vmm::virtio_msix::MsixState;
     use crate::vmm::PiMutex;
     use std::sync::Arc;
     use virtio_bindings::virtio_net::{VIRTIO_NET_F_CTRL_VQ, VIRTIO_NET_F_MQ};
@@ -438,7 +438,7 @@ fn build_cvq_fuzz_fixture(queue_pairs: u16) -> (VirtioNet, GuestMemoryMmap, usiz
     let nq = dev.num_queues();
     dev.set_msix_state(Arc::new(PiMutex::new(MsixState::new(
         nq,
-        super::interrupt::MSIX_TABLE_MAX,
+        crate::vmm::virtio_msix::MSIX_TABLE_MAX,
     ))));
 
     write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_ACK);
