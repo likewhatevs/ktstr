@@ -607,8 +607,12 @@ fn write_fadt(mem: &GuestMemoryMmap, layout: &AcpiLayout) -> Result<()> {
     // rating-outranked by kvm-clock; on split-irqchip it is not registered), and
     // ACPI-enable / PCI-INTx routing do not depend on it — the PM_TMR is
     // advertised so ACPICA's PM-block/fixed-event init does not fault, not so
-    // acpi_pm registers. HW_REDUCED (bit20) stays clear so the legacy
-    // 8259/IOAPIC IRQs survive.
+    // acpi_pm registers. HW_REDUCED (bit20) stays clear — this is a
+    // full-ACPI FADT with the PM register blocks emitted below. Were it
+    // set, acpi_generic_reduced_hw_init (arch/x86/kernel/acpi/boot.c)
+    // would bypass only the legacy 8259 PIC + legacy timer
+    // (legacy_pic = &null_legacy_pic), NOT the MADT IOAPIC, so the
+    // IOAPIC-routed IRQs would survive regardless.
     let flags = FADT_F_PWR_BUTTON | FADT_F_SLP_BUTTON;
     buf[112..116].copy_from_slice(&flags.to_le_bytes());
     buf[131] = 5; // FADT minor revision (header major revision 6 => ACPI 6.5)
@@ -623,9 +627,11 @@ fn write_fadt(mem: &GuestMemoryMmap, layout: &AcpiLayout) -> Result<()> {
     // (AE_BAD_ADDRESS) initializing fixed events, ACPI never enables, and
     // PCI INTx falls back to legacy MP-table routing — which can't route the
     // virtio-net PCI function. With them ACPI enables and routes PCI INTx via
-    // the DSDT `_PRT`, while the legacy 8259/IOAPIC IRQs (cmdline virtio-MMIO
-    // console + serial) are preserved (hardware-reduced ACPI would drop
-    // them). The ports are stub-emulated in exit_dispatch (no real power
+    // the DSDT `_PRT`. The cmdline virtio-MMIO console + serial IRQs route
+    // via the MADT IOAPIC, independent of the FADT HW_REDUCED bit (which
+    // would bypass only the 8259 PIC, not the IOAPIC; acpi_pci_irq_enable
+    // in drivers/acpi/pci_irq.c is itself reduced_hardware-independent).
+    // The ports are stub-emulated in exit_dispatch (no real power
     // management). The X_* 64-bit GAS variants are left zero — ACPICA
     // synthesizes them from these 32-bit legacy blocks: acpi_tb_convert_fadt
     // (drivers/acpi/acpica/tbfadt.c) calls acpi_tb_init_generic_address for
