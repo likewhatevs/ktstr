@@ -926,6 +926,25 @@ impl KtstrVm {
         #[cfg(not(target_arch = "x86_64"))]
         let ioapic_handle: Option<Arc<crate::vmm::IoapicHandle>> = None;
 
+        // Full-irqchip shared GSI route owner — the inverse of `ioapic_handle`:
+        // `Some` only on the full in-kernel irqchip path (`!split_irqchip`) with
+        // PCI enabled, where it owns the device MSI(-X) routes. `install_defaults`
+        // installs an EXPLICIT default routing table (IOAPIC pins 0..24 + PIC)
+        // route-identical to KVM's implicit default, so the legacy INTx routes
+        // survive the first MSI-X `KVM_SET_GSI_ROUTING` (a whole-table replace
+        // that would otherwise wipe them). `None` on split-irqchip (routes go via
+        // the userspace IOAPIC / `ioapic_handle`) and on non-PCI guests.
+        #[cfg(target_arch = "x86_64")]
+        let full_route_owner: Option<Arc<kvm::FullIrqchipRouteOwner>> = (!vm.split_irqchip
+            && vm.pci_enabled)
+            .then(|| Arc::new(kvm::FullIrqchipRouteOwner::new(vm.vm_fd.as_raw_fd())));
+        #[cfg(target_arch = "x86_64")]
+        if let Some(owner) = full_route_owner.as_ref() {
+            owner
+                .install_defaults()
+                .context("install full-irqchip default GSI routing")?;
+        }
+
         // PCI host bridge handle for the virtio-PCI transport: the single-bus
         // PCIe segment with ECAM/CAM config access, constructed only when this
         // VM enables PCI. `None` keeps non-PCI guests byte-identical (no
@@ -1115,7 +1134,7 @@ impl KtstrVm {
         let (virtio_net_counters, _net_resample_evts): (Vec<_>, Vec<_>) =
             match pci_bus_handle.as_ref() {
                 Some(bus) => self
-                    .init_virtio_net_pci(&vm, bus)?
+                    .init_virtio_net_pci(&vm, bus, full_route_owner.as_ref())?
                     .into_iter()
                     .map(|h| (h.counters, h.resample_evt))
                     .unzip(),
@@ -10261,6 +10280,21 @@ impl KtstrVm {
                     count = n,
                     "ioapic: {n} KVM_SET_GSI_ROUTING install(s) failed this run — \
                      device IRQs for those pins did not deliver"
+                );
+            }
+        }
+
+        // Same surfacing for the full-irqchip MSI-X route owner: a nonzero count
+        // means a guest-unmasked MSI-X vector never got its KVM route, so that
+        // vector did not deliver (the NIC would hang on first use of it).
+        #[cfg(target_arch = "x86_64")]
+        if let Some(owner) = full_route_owner.as_ref() {
+            let n = owner.routing_failures();
+            if n > 0 {
+                tracing::error!(
+                    count = n,
+                    "full-irqchip: {n} KVM_SET_GSI_ROUTING install(s) failed this \
+                     run — MSI-X vectors for those routes did not deliver"
                 );
             }
         }

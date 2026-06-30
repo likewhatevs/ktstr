@@ -207,6 +207,13 @@ pub(crate) use x86_64::kvm::IoapicHandle;
 #[cfg(not(target_arch = "x86_64"))]
 pub(crate) enum IoapicHandle {}
 
+/// Full-irqchip shared GSI route owner ([`x86_64::kvm::FullIrqchipRouteOwner`]).
+/// x86-only: it owns the device MSI-X routes on the in-kernel-irqchip path and is
+/// referenced solely from x86-gated run/setup code, so there is no aarch64
+/// placeholder (the GIC routes device IRQs there).
+#[cfg(target_arch = "x86_64")]
+pub(crate) use x86_64::kvm::FullIrqchipRouteOwner;
+
 pub use topology::Topology;
 
 use anyhow::{Context, Result};
@@ -611,17 +618,18 @@ struct RunLocks {
     pinning_plan: Option<host_topology::PinningPlan>,
 }
 
-/// Human-readable summary of the userspace IOAPIC's device-IRQ routing
-/// failures, for `run_interactive`'s teardown. `None` when there were none.
-/// `n` is `IoapicHandle::routing_failures()` — the count of
-/// `KVM_SET_GSI_ROUTING` installs that errored, each leaving a
-/// guest-programmed device IRQ unrouted (the device hangs on first use).
-/// Surfaced in interactive mode because the operator's terminal shows the
-/// guest console, not the host's per-failure tracing, so an unrouted IRQ
-/// would otherwise be a silent device hang. x86-only: the userspace IOAPIC
-/// (and `IoapicHandle::routing_failures`) is split-irqchip-specific; on
-/// aarch64 `IoapicHandle` is an empty-enum placeholder (the GIC routes
-/// device IRQs directly), so there is nothing to summarize.
+/// Human-readable summary of device-IRQ routing-install failures, for
+/// `run_interactive`'s teardown. `None` when there were none. `n` is a count of
+/// `KVM_SET_GSI_ROUTING` installs that errored, each leaving a device IRQ
+/// unrouted (the device hangs on first use). Called for BOTH x86 route owners:
+/// the split-irqchip userspace IOAPIC (`IoapicHandle::routing_failures`) and the
+/// full-irqchip MSI-X route owner (`FullIrqchipRouteOwner::routing_failures`);
+/// the body is transport-neutral and summarizes either. Surfaced in interactive
+/// mode because the operator's terminal shows the guest console, not the host's
+/// per-failure tracing, so an unrouted IRQ would otherwise be a silent device
+/// hang. x86-only: both route owners are x86 (on aarch64 the GIC routes device
+/// IRQs directly and `IoapicHandle` is an empty-enum placeholder), so there is
+/// nothing to summarize.
 #[cfg(target_arch = "x86_64")]
 fn routing_failure_summary(n: u64) -> Option<String> {
     (n > 0).then(|| {
@@ -1053,6 +1061,27 @@ impl KtstrVm {
         #[cfg(not(target_arch = "x86_64"))]
         let ioapic_handle: Option<Arc<crate::vmm::IoapicHandle>> = None;
 
+        // Full-irqchip shared GSI route owner (inverse of `ioapic_handle`):
+        // `Some` only on the full in-kernel irqchip path with PCI enabled, where
+        // it owns the device MSI-X routes. `install_defaults` installs an explicit
+        // default routing table route-identical to KVM's implicit one, so the
+        // legacy INTx routes survive the first MSI-X `KVM_SET_GSI_ROUTING`
+        // (whole-table replace). `None` on split-irqchip / non-PCI shells.
+        #[cfg(target_arch = "x86_64")]
+        let full_route_owner: Option<Arc<crate::vmm::FullIrqchipRouteOwner>> = (!vm.split_irqchip
+            && vm.pci_enabled)
+            .then(|| {
+                Arc::new(crate::vmm::FullIrqchipRouteOwner::new(
+                    std::os::unix::io::AsRawFd::as_raw_fd(&*vm.vm_fd),
+                ))
+            });
+        #[cfg(target_arch = "x86_64")]
+        if let Some(owner) = full_route_owner.as_ref() {
+            owner
+                .install_defaults()
+                .context("install full-irqchip default GSI routing")?;
+        }
+
         // PCI host bridge handle (virtio-PCI transport), constructed only when
         // this VM enables PCI; `None` keeps non-PCI shells byte-identical.
         // Mirrors the run_vm construction. x86-only for now.
@@ -1124,7 +1153,7 @@ impl KtstrVm {
             // all are held alive for the shell run so KVM can de-assert each
             // level GSI on guest EOI. Shell mode discards the counters.
             Some(bus) => self
-                .init_virtio_net_pci(&vm, bus)?
+                .init_virtio_net_pci(&vm, bus, full_route_owner.as_ref())?
                 .into_iter()
                 .map(|h| h.resample_evt)
                 .collect(),
@@ -1788,6 +1817,18 @@ impl KtstrVm {
         #[cfg(target_arch = "x86_64")]
         if let Some(io) = &ioapic_handle
             && let Some(msg) = routing_failure_summary(io.routing_failures())
+        {
+            eprintln!("{msg}");
+        }
+
+        // Same surfacing for the full-irqchip MSI-X route owner (the inverse of
+        // ioapic_handle: Some only on the in-kernel-irqchip path). A failed
+        // KVM_SET_GSI_ROUTING for an MSI-X vector leaves that vector unrouted —
+        // the NIC hangs on first use — so an unrouted MSI-X install must not be
+        // silent on the operator's terminal in shell mode either.
+        #[cfg(target_arch = "x86_64")]
+        if let Some(owner) = &full_route_owner
+            && let Some(msg) = routing_failure_summary(owner.routing_failures())
         {
             eprintln!("{msg}");
         }

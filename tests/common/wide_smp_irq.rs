@@ -140,8 +140,18 @@ pub fn virtio_net_iface() -> Result<String> {
     bail!("no non-loopback network interface with a device under /sys/class/net")
 }
 
-/// The virtio-net IRQ number + device basename: the NIC's sysfs device
-/// basename (e.g. `virtio1`) is its `/proc/interrupts` action name.
+/// The virtio-net NIC's data-bearing IRQ number + its `/proc/interrupts` action
+/// name. The action depends on the interrupt transport. Under INTx
+/// (split-irqchip) it is a single line whose action is exactly the device
+/// basename (e.g. `virtio1`). Under MSI-X (full-irqchip) the kernel splits the
+/// NIC's IRQs into a config vector `{name}-config` and the SHARED-mode queue
+/// vector `{name}-virtqueues` (drivers/virtio/virtio_pci_common.c request_irq),
+/// and net traffic raises the queue line, never config. So the data IRQ is the
+/// line whose action is `{name}` OR begins `{name}-` but is not `{name}-config`.
+/// Matching by prefix (rather than the exact MSI-X suffix) keeps this robust to
+/// per-virtqueue naming (`{name}-input.0`, a multiqueue follow-up) without a
+/// transport assumption; the trailing `-` in the prefix prevents a false match
+/// across `virtio1` vs `virtio10`.
 #[allow(dead_code)]
 pub fn virtio_net_irq(iface: &str) -> Result<(u32, String)> {
     let dev = fs::canonicalize(format!("/sys/class/net/{iface}/device"))?;
@@ -150,8 +160,28 @@ pub fn virtio_net_irq(iface: &str) -> Result<(u32, String)> {
         .and_then(|n| n.to_str())
         .ok_or_else(|| anyhow::anyhow!("no basename for {dev:?}"))?
         .to_string();
-    let irq = device_irq_by_action_name(&name)?;
-    Ok((irq, name))
+    let prefix = format!("{name}-");
+    let config = format!("{name}-config");
+    let irqs = fs::read_to_string("/proc/interrupts")?;
+    for line in irqs.lines() {
+        let Some((lhs, rhs)) = line.split_once(':') else {
+            continue;
+        };
+        let Some(action) = rhs.split_whitespace().last() else {
+            continue;
+        };
+        let is_data = action == name || (action.starts_with(&prefix) && action != config);
+        if is_data {
+            let irq = lhs.trim().parse::<u32>().map_err(|e| {
+                anyhow::anyhow!("non-numeric IRQ '{}' for {action}: {e}", lhs.trim())
+            })?;
+            return Ok((irq, action.to_string()));
+        }
+    }
+    bail!(
+        "no virtio-net data IRQ in /proc/interrupts for device {name} \
+         (looked for INTx '{name}' or MSI-X '{name}-virtqueues')"
+    )
 }
 
 /// Every non-loopback, device-backed network interface, sorted by name (a

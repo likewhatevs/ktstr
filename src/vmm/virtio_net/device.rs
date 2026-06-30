@@ -22,6 +22,8 @@ use vm_memory::{Address, ByteValued, Bytes, GuestAddress, GuestMemoryMmap};
 use vmm_sys_util::eventfd::EventFd;
 
 use super::counters::VirtioNetCounters;
+use super::interrupt::{IrqSource, MsixState};
+use crate::vmm::PiMutex;
 use crate::vmm::net_config::NetConfig;
 
 pub(crate) const MMIO_MAGIC: u32 = 0x7472_6976; // "virt" in LE
@@ -231,8 +233,17 @@ pub struct VirtioNet {
     /// if `VIRTIO_NET_F_STATUS` is later advertised) requires
     /// generation tracking off the vCPU thread.
     config_generation: u32,
-    /// Eventfd for KVM irqfd — signals guest interrupt.
+    /// Eventfd for KVM irqfd — signals guest interrupt on the INTx path.
     irq_evt: EventFd,
+    /// Shared MSI-X delivery state, `Some` only on the PCI transport once the
+    /// facade installs it via [`Self::set_msix_state`]; `None` for virtio-MMIO
+    /// and aarch64 (INTx-only). When `Some` AND [`MsixState::enabled`], the
+    /// signal paths route the interrupt through the guest-assigned MSI-X vector
+    /// instead of `irq_evt`. Shared (`Arc<PiMutex<…>>`) with the PCI facade,
+    /// which mutates it from config-space decode and owns the KVM GSI-route side;
+    /// the lock is uncontended in practice — every access (facade config writes
+    /// and these core signals) is on the vCPU thread under the `PciBus` lock.
+    msix: Option<Arc<PiMutex<MsixState>>>,
     /// Guest memory reference. Set once at VM init by `set_mem` before
     /// any vCPU runs (and therefore before any QUEUE_NOTIFY can fire).
     /// Wrapped in `Arc<OnceLock<…>>` to mirror virtio-blk's pattern:
@@ -356,6 +367,7 @@ impl VirtioNet {
             interrupt_status: 0,
             config_generation: 0,
             irq_evt,
+            msix: None,
             mem: Arc::new(OnceLock::new()),
             mem_unset_warned: Arc::new(AtomicBool::new(false)),
             config: VirtioNetConfig {
@@ -373,6 +385,14 @@ impl VirtioNet {
     /// Eventfd for KVM irqfd registration.
     pub fn irq_evt(&self) -> &EventFd {
         &self.irq_evt
+    }
+
+    /// Install the shared MSI-X delivery state (PCI transport only). The facade
+    /// holds the other `Arc` clone and configures it from config-space writes;
+    /// the core reaches it from the signal paths when MSI-X is enabled. INTx
+    /// transports (virtio-MMIO, aarch64) never call this and stay `None`.
+    pub(crate) fn set_msix_state(&mut self, msix: Arc<PiMutex<MsixState>>) {
+        self.msix = Some(msix);
     }
 
     /// Set guest memory reference. Must be called before starting
@@ -713,6 +733,18 @@ impl VirtioNet {
     // errno so a failed write surfaces in tracing rather than
     // silently disappearing.
     fn signal_used(&mut self) {
+        // MSI-X path (PCI, once the guest enabled it): deliver the VRING source
+        // to its guest-assigned vector. MSI-X does not use the INTx ISR
+        // (`interrupt_status`) — the kernel's per-vector handlers never read it
+        // (drivers/virtio/virtio_pci_common.c: the ISR read is INTx-only) — so
+        // the bit-set + line write below are skipped.
+        if let Some(msix) = &self.msix {
+            let mut m = msix.lock();
+            if m.enabled() {
+                m.signal(IrqSource::Vring);
+                return;
+            }
+        }
         self.interrupt_status |= VIRTIO_MMIO_INT_VRING;
         if let Err(e) = self.irq_evt.write(1) {
             tracing::warn!(%e, "virtio-net irq_evt.write failed");
@@ -763,7 +795,21 @@ impl VirtioNet {
     /// drained by the guest's prior IRQ handler). The counter and
     /// signal must be event-once per false→true transition.
     fn signal_queue_poisoned(&mut self) {
+        // NEEDS_RESET is guest-visible device state, set regardless of the
+        // interrupt transport (the operator's `mmio_read(STATUS)` surfaces it
+        // even if no interrupt is delivered).
         self.device_status |= VIRTIO_CONFIG_S_NEEDS_RESET;
+        // MSI-X path (PCI, once enabled): deliver the CONFIG source to its
+        // guest-assigned vector. As in `signal_used`, MSI-X skips the INTx ISR
+        // (`interrupt_status`) — the kernel's config-change handler is its own
+        // MSI-X vector and never reads the ISR byte.
+        if let Some(msix) = &self.msix {
+            let mut m = msix.lock();
+            if m.enabled() {
+                m.signal(IrqSource::Config);
+                return;
+            }
+        }
         self.interrupt_status |= VIRTIO_MMIO_INT_CONFIG;
         // Recoverability: EAGAIN requires counter saturation at u64::MAX-1
         // (~1.8e19 unobserved kicks) — implausible. EBADF means
@@ -2158,6 +2204,13 @@ impl VirtioNet {
         self.driver_features = 0;
         self.tx_frame_scratch.clear();
         self.queue_poisoned = [false; NUM_QUEUES];
+        // Virtio reset returns the MSI-X vector assignments to NO_VECTOR
+        // (virtio-v1.2 §4.1.4.3); the PCI-level MSI-X cap (enable, table, PBA,
+        // registered eventfds) persists — only PCI/FLR reset clears it. INTx
+        // transports have no MSI-X state (None) and skip this.
+        if let Some(msix) = &self.msix {
+            msix.lock().reset_virtio_assignments();
+        }
         for q in &mut self.queues {
             q.reset();
         }

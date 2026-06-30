@@ -82,6 +82,12 @@
 
 mod device;
 
+// MSI-X interrupt delivery (per-vector eventfds + table/PBA/vector-map + the
+// fire-or-pend gate), shared via `Arc<PiMutex<…>>` between the device core
+// (signals) and the PCI facade (configures + owns the KVM route side). Inert on
+// the INTx path: the core leaves it `None` for virtio-MMIO and aarch64.
+mod interrupt;
+
 // virtio-MMIO transport facade for `VirtioNet` (decode-only; drives the
 // transport-neutral core API in `device`). A sibling submodule so it
 // reaches device state ONLY through the `pub(crate)` semantic methods,
@@ -126,3 +132,7 @@ pub use counters::{VirtioNetCounters, VirtioNetCountersSnapshot};
 pub use device::{VIRTIO_MMIO_SIZE, VirtioNet};
 // The virtio-pci function wrapper — setup installs it into the PciBus.
 pub(crate) use pci::VirtioNetPci;
+// MSI-X delivery items needed outside this module: the setup wiring builds the
+// shared `MsixState` (creating + KVM-registering one eventfd per vector,
+// `MSIX_VECTORS` of them) and the x86 route owner implements `MsixRouteSink`.
+pub(crate) use interrupt::{MSIX_VECTORS, MsixRouteSink, MsixState};

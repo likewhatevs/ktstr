@@ -10,8 +10,13 @@
 //! lives in the transport-neutral core on [`VirtioNet`] and is shared verbatim
 //! with the MMIO facade.
 //!
-//! Interrupts: INTx (no MSI-X in v0), delivered via the device's existing
-//! `irq_evt`. The KVM wiring (in `setup::init_virtio_net_pci`) branches on the
+//! Interrupts: MSI-X when offered (the cap is advertised on the full-irqchip
+//! path, where a KVM route owner is wired — the per-vector delivery state + the
+//! fire-or-pend gate live in the `interrupt` submodule's `MsixState`, and the
+//! cap / table / route-install decode is in this file), and INTx otherwise
+//! (split-irqchip / no route owner, where the cap is omitted so the guest stays
+//! on INTx), delivered via the device's existing
+//! `irq_evt`. The INTx KVM wiring (in `setup::init_virtio_net_pci`) branches on the
 //! host-side `vm.split_irqchip` bool; the kernel's `kvm_arch_irqfd_allowed` is
 //! the rejector that would -EINVAL a resample irqfd on the split path, which is
 //! why we pre-select the edge path there rather than reading that predicate.
@@ -52,9 +57,13 @@
 //! `interrupt_status` is still nonzero after EOI) before they land — see the
 //! `NUM_QUEUES == 2` static guard below.
 
+use std::sync::Arc;
+
 use virtio_bindings::virtio_mmio::{VIRTIO_MMIO_INT_CONFIG, VIRTIO_MMIO_INT_VRING};
 
 use super::device::{NUM_QUEUES, VirtioNet};
+use super::interrupt::{MSIX_VECTORS, MsixRouteSink, MsixState, NO_VECTOR};
+use crate::vmm::PiMutex;
 use crate::vmm::pci::{
     ConfigSpace, PCI_COMMAND_MEMORY, PCI_COMMAND_WMASK, PCI_STATUS_CAP_LIST, PciFunction,
     REG_BAR0, REG_CAP_PTR, REG_CLASS, REG_COMMAND, REG_DEVICE_ID, REG_INTERRUPT_LINE,
@@ -80,8 +89,30 @@ const COMMON_OFFSET: u64 = 0x0000;
 const ISR_OFFSET: u64 = 0x1000;
 const DEVICE_OFFSET: u64 = 0x2000;
 const NOTIFY_OFFSET: u64 = 0x3000;
-/// Total BAR0 size: 4 regions × 4 KiB.
-const BAR0_SIZE: u64 = 0x4000;
+/// MSI-X table (one 4 KiB page, page-isolated from the other structures so the
+/// guest's `ioremap` of the table page — `pci_alloc_irq_vectors` → `msix_setup`,
+/// kernel `drivers/pci/msi/msi.c` — maps only the table). Holds
+/// `MSIX_TABLE_SIZE` 16-byte entries.
+const MSIX_TABLE_OFFSET: u64 = 0x4000;
+/// MSI-X Pending Bit Array (one 4 KiB page; one bit per vector, so a single byte
+/// covers `MSIX_TABLE_SIZE`≤8 vectors — the whole page is reserved for it per the
+/// spec's page-isolation recommendation).
+const MSIX_PBA_OFFSET: u64 = 0x5000;
+/// Total BAR0 size: rounded UP to a power of two (PCI BAR decode + the
+/// size-probe require it — `BAR0_LOW_WMASK = !(BAR0_SIZE-1)` only recovers a
+/// power-of-two). Six 4 KiB structures (common / ISR / device / notify /
+/// MSI-X-table / MSI-X-PBA) span 0x6000; the next power of two is 0x8000, so
+/// `[0x6000, 0x8000)` is unused padding the guest never accesses.
+const BAR0_SIZE: u64 = 0x8000;
+/// MSI-X table entries as a `u16` for the Message Control Table-Size field
+/// (encoded N-1) and the vector-range clamp. Derived from the delivery module's
+/// [`MSIX_VECTORS`] (the single source of truth — its array sizes + SHARED-mode
+/// fire logic key off it). Two entries: one shared virtqueue vector + one config
+/// vector (virtio-v1.2 §4.1.5.1.2); per-vq MSI-X raises `MSIX_VECTORS`.
+const MSIX_TABLE_SIZE: u16 = MSIX_VECTORS as u16;
+/// Per-entry size in the MSI-X table: msg addr lo/hi, msg data, vector control
+/// (4 × u32 = 16 bytes, PCI spec).
+const MSIX_ENTRY_SIZE: u64 = 16;
 /// `queue_notify_off(i) == i`, so the notify address for queue `i` is
 /// `NOTIFY_OFFSET + i * NOTIFY_OFF_MULTIPLIER`. The returned index lives in
 /// `device::queue_notify_off`; these two MUST stay in lockstep (decode is
@@ -151,6 +182,25 @@ const CAP_ISR: u16 = 0x50;
 const CAP_DEVICE: u16 = 0x60;
 const CAP_NOTIFY: u16 = 0x70;
 
+// ---- MSI-X capability (PCI_CAP_ID_MSIX, PCI spec §6.8.2) ----
+const PCI_CAP_ID_MSIX: u8 = 0x11;
+/// MSI-X cap config-space offset: immediately after NOTIFY. NOTIFY is at 0x70
+/// with `CAP_LEN_NOTIFY`=20 (0x14), occupying 0x70..0x84, so 0x84 is the next
+/// free DWORD-aligned slot. The 12-byte MSI-X cap spans 0x84..0x90, inside the
+/// 256-byte config space.
+const CAP_MSIX: u16 = 0x84;
+/// MSI-X cap field offsets within the capability (PCI spec): Message Control
+/// (u16) @+2, Table offset|BIR (u32) @+4, PBA offset|BIR (u32) @+8.
+const MSIX_OFF_MSG_CTRL: u16 = 2;
+const MSIX_OFF_TABLE: u16 = 4;
+const MSIX_OFF_PBA: u16 = 8;
+/// Message Control writable bits: bit15 = MSI-X Enable, bit14 = Function Mask
+/// (both guest-set/RW); the Table Size field `[10:0]` is read-only.
+const MSIX_MSG_CTRL_WMASK: u16 = 0xC000;
+/// BIR 0: every MSI-X structure lives in BAR0. The Table/PBA offsets are 8-byte
+/// aligned, so the low 3 bits of the offset|BIR dword carry the BIR (here 0).
+const MSIX_BIR0: u32 = 0;
+
 // ---- common-cfg register offsets (struct virtio_pci_common_cfg) ----
 const CC_DEVICE_FEATURE_SELECT: u64 = 0x00;
 const CC_DEVICE_FEATURE: u64 = 0x04;
@@ -172,9 +222,6 @@ const CC_QUEUE_AVAIL_HI: u64 = 0x2C;
 const CC_QUEUE_USED_LO: u64 = 0x30;
 const CC_QUEUE_USED_HI: u64 = 0x34;
 
-/// `VIRTIO_MSI_NO_VECTOR` — INTx-only, so the MSI-X vector registers read this.
-const NO_VECTOR: u16 = 0xFFFF;
-
 /// The virtio-net device exposed as a PCI function. Owns the device core
 /// directly; the [`super::super::pci::PciBus`] lock serializes access (the
 /// vCPU thread drives it through BAR MMIO exits). The host-side `irq_evt`
@@ -192,6 +239,24 @@ pub(crate) struct VirtioNetPci {
     /// reference VMMs (cloud-hypervisor/firecracker) bound their VMM-assigned
     /// BARs.
     bar_aperture: (u64, u64),
+    /// Shared MSI-X delivery state: the guest-visible table dwords, vector
+    /// assignments (`CC_MSIX_CONFIG` / `CC_QUEUE_MSIX_VECTOR`, echoed verbatim —
+    /// the kernel's `vp_modern` aborts `-EBUSY` on a read-back mismatch), the
+    /// Pending Bit Array, the device-level enable / function-mask, and the
+    /// per-vector eventfds + fire-or-pend gate. Single source of truth: every
+    /// guest-visible MSI-X register read/write delegates here, and the device
+    /// core holds the other `Arc` clone and signals through it.
+    msix: Arc<PiMutex<MsixState>>,
+    /// Host KVM route programmer (`FullIrqchipRouteOwner` on x86 full-irqchip);
+    /// `None` when MSI-X routing is unavailable (split-irqchip / no owner), in
+    /// which case the facade never installs a route so the guest's MSI-X stays
+    /// undelivered and it falls back to INTx. Called on a vector mask/unmask edge
+    /// to (re)install or remove the GSI's MSI route.
+    route_sink: Option<Arc<dyn MsixRouteSink>>,
+    /// The KVM GSI assigned to each MSI-X table vector (`virtio_net_msix_gsi`).
+    /// The host registered one irqfd per (vector → eventfd) at this GSI at VM
+    /// bring-up; the MSI route is installed here on the vector's unmask edge.
+    gsis: [u32; MSIX_VECTORS],
 }
 
 impl VirtioNetPci {
@@ -200,7 +265,23 @@ impl VirtioNetPci {
     /// `set_mem`). Lays out the standard header, the four virtio vendor
     /// capabilities, and BAR0. `bar_aperture` is the host-bridge `_CRS` MMIO
     /// grant `[start, end)` BAR0 must stay within (enforced by `bar_window`).
-    pub(crate) fn new(net: VirtioNet, bar_aperture: (u64, u64)) -> Self {
+    pub(crate) fn new(
+        net: VirtioNet,
+        bar_aperture: (u64, u64),
+        msix: Arc<PiMutex<MsixState>>,
+        route_sink: Option<Arc<dyn MsixRouteSink>>,
+        gsis: [u32; MSIX_VECTORS],
+    ) -> Self {
+        // Hand the device core its clone of the shared MSI-X state ONLY when
+        // MSI-X is actually offered (a route sink is present → full-irqchip). With
+        // no sink (split-irqchip / no owner) the cap is omitted below and the
+        // guest stays on INTx, so the core keeps `msix = None`: its signal paths
+        // take the INTx branch with no per-signal lock, keeping INTx
+        // byte-identical on the split path too (not just MMIO/aarch64).
+        let mut net = net;
+        if route_sink.is_some() {
+            net.set_msix_state(Arc::clone(&msix));
+        }
         let mut cfg = ConfigSpace::new();
 
         // Standard header.
@@ -228,13 +309,16 @@ impl VirtioNetPci {
         cfg.set_wmask_u16(REG_INTERRUPT_LINE, 0x00FF);
         // COMMAND: writable so the guest can enable memory-space decode +
         // bus-master; STATUS advertises the capability list. PCI_COMMAND_WMASK
-        // also makes INTX_DISABLE (bit 10) writable for read-back, but the
-        // device does NOT consult it — signal_used asserts INTx regardless.
-        // This diverges from qemu (pci_irq_disabled suppresses INTx while
-        // INTX_DISABLE is set) and is inert in practice: the Linux
-        // virtio_pci_modern driver only sets INTX_DISABLE when switching to
-        // MSI-X, which this INTx-only device does not offer, so the guest never
-        // exercises the suppressed path. Honoring it lands with MSI-X support.
+        // also makes INTX_DISABLE (bit 10) writable for read-back, but the device
+        // does NOT consult it. INTx is suppressed under MSI-X not via this bit but
+        // by the device's signal gate: signal_used / signal_queue_poisoned take
+        // the MSI-X path (never asserting irq_evt) once `MsixState::enabled`. The
+        // guest's virtio_pci_modern driver sets INTX_DISABLE when it enables MSI-X
+        // (pci_intx_for_msi), but the MSI-X-enable gate already achieves the same
+        // suppression, so consulting the bit would be redundant. This diverges
+        // from qemu (pci_irq_disabled keys off the bit itself) and is inert: in
+        // INTx mode the guest leaves INTX_DISABLE clear, and in MSI-X mode the
+        // signal gate suppresses INTx regardless of the bit.
         cfg.set_wmask_u16(REG_COMMAND, PCI_COMMAND_WMASK);
         cfg.set_u16(REG_STATUS, PCI_STATUS_CAP_LIST);
         cfg.set_u8(REG_CAP_PTR, CAP_COMMON as u8);
@@ -248,11 +332,17 @@ impl VirtioNetPci {
         cfg.set_u32(REG_BAR0, BAR0_TYPE_BITS);
         cfg.set_wmask_u32(REG_BAR0, BAR0_LOW_WMASK);
 
-        Self::write_caps(&mut cfg);
+        // MSI-X is advertised iff a route sink is wired (full-irqchip with an
+        // owner). On split-irqchip / no owner the cap is omitted so the guest
+        // stays on INTx rather than enabling an undeliverable MSI-X.
+        Self::write_caps(&mut cfg, route_sink.is_some());
         Self {
             cfg,
             net,
             bar_aperture,
+            msix,
+            route_sink,
+            gsis,
         }
     }
 
@@ -260,11 +350,10 @@ impl VirtioNetPci {
     /// chained via `cap_next`. The PCI_CFG capability (cfg_type 5) is
     /// intentionally omitted: `vp_modern_probe` never looks it up (it reads
     /// config only through ECAM/BAR), so a guest binds without it.
-    fn write_caps(cfg: &mut ConfigSpace) {
+    fn write_caps(cfg: &mut ConfigSpace, msix: bool) {
         Self::write_cap(cfg, CAP_COMMON, CAP_ISR, CFG_TYPE_COMMON, COMMON_OFFSET);
         Self::write_cap(cfg, CAP_ISR, CAP_DEVICE, CFG_TYPE_ISR, ISR_OFFSET);
         Self::write_cap(cfg, CAP_DEVICE, CAP_NOTIFY, CFG_TYPE_DEVICE, DEVICE_OFFSET);
-        // NOTIFY is the last cap (cap_next = 0) and carries the multiplier.
         // The uniform REGION_SIZE (4 KiB) notify cap MATCHES the references:
         // qemu sizes its notify region to notify_off_multiplier *
         // VIRTIO_QUEUE_MAX = 4 * 1024 = 0x1000 (hw/virtio/virtio-pci.c), and
@@ -274,8 +363,35 @@ impl VirtioNetPci {
         // 0x1000 / NOTIFY_OFF_MULTIPLIER = 1024 slots — far above the current
         // NUM_QUEUES=2 (offsets 0 and 4). The multiqueue increment must revisit
         // this bound if it ever raises NUM_QUEUES past 1024.
-        Self::write_cap(cfg, CAP_NOTIFY, 0, CFG_TYPE_NOTIFY, NOTIFY_OFFSET);
+        //
+        // NOTIFY chains to the MSI-X cap ONLY when MSI-X is offered (full-irqchip
+        // with a route sink present); otherwise it terminates the chain
+        // (cap_next = 0). MSI-X is advertised iff the host can install its KVM
+        // routes — a guest on a transport without MSI-X routing (split-irqchip,
+        // no owner) never sees the cap and stays on INTx, so the device never
+        // advertises a delivery path it cannot honor.
+        let notify_next: u16 = if msix { CAP_MSIX } else { 0 };
+        Self::write_cap(cfg, CAP_NOTIFY, notify_next, CFG_TYPE_NOTIFY, NOTIFY_OFFSET);
         cfg.set_u32(CAP_NOTIFY + CAP_OFF_NOTIFY_MULT, NOTIFY_OFF_MULTIPLIER);
+        if msix {
+            // MSI-X is the last cap (cap_next = 0), chained after NOTIFY.
+            Self::write_msix_cap(cfg);
+        }
+    }
+
+    /// Write the standard MSI-X capability at `CAP_MSIX`: cap id, next = 0 (last
+    /// cap), Message Control (Table Size encoded as N-1 per the PCI spec, with
+    /// Enable/Function-Mask left guest-writable via `MSIX_MSG_CTRL_WMASK`), and
+    /// the Table / PBA `offset|BIR` dwords pointing into BAR0. The
+    /// guest's `pci_alloc_irq_vectors` reads Table Size from here and maps the
+    /// Table/PBA pages from the advertised BAR0 offsets.
+    fn write_msix_cap(cfg: &mut ConfigSpace) {
+        cfg.set_u8(CAP_MSIX, PCI_CAP_ID_MSIX);
+        cfg.set_u8(CAP_MSIX + 1, 0);
+        cfg.set_u16(CAP_MSIX + MSIX_OFF_MSG_CTRL, MSIX_TABLE_SIZE - 1);
+        cfg.set_wmask_u16(CAP_MSIX + MSIX_OFF_MSG_CTRL, MSIX_MSG_CTRL_WMASK);
+        cfg.set_u32(CAP_MSIX + MSIX_OFF_TABLE, MSIX_TABLE_OFFSET as u32 | MSIX_BIR0);
+        cfg.set_u32(CAP_MSIX + MSIX_OFF_PBA, MSIX_PBA_OFFSET as u32 | MSIX_BIR0);
     }
 
     /// Write one `struct virtio_pci_cap` at config offset `at`, pointing to
@@ -318,6 +434,27 @@ impl VirtioNetPci {
         u32::from_le_bytes(buf)
     }
 
+    /// Clamp a guest-written MSI-X vector number: a valid index
+    /// `[0, MSIX_TABLE_SIZE)` or `NO_VECTOR` (disable) is kept verbatim; any
+    /// other value is out of range and stored as `NO_VECTOR`, so the read-back
+    /// signals rejection rather than letting a hostile vector index the table
+    /// out of bounds.
+    fn clamp_vector(v: u16) -> u16 {
+        if v == NO_VECTOR || v < MSIX_TABLE_SIZE {
+            v
+        } else {
+            NO_VECTOR
+        }
+    }
+
+    /// MSI-X vector assigned to the currently-selected virtqueue, read from the
+    /// shared state; `NO_VECTOR` for an out-of-range selector (mirrors the
+    /// queue_size / queue_ready clamp on a hostile `queue_select`).
+    fn selected_queue_msix_vector(&self) -> u16 {
+        let sel = self.net.queue_select() as usize;
+        self.msix.lock().queue_vector(sel)
+    }
+
     /// Serve a common-cfg register read at BAR-region offset `off`. The select
     /// registers read back their latched value; the feature/queue data
     /// registers serve the core's current view; device-read registers
@@ -337,7 +474,7 @@ impl VirtioNetPci {
             CC_DEVICE_FEATURE_SELECT => self.net.device_features_sel() as u64,
             CC_DEVICE_FEATURE => self.net.device_features_window() as u64,
             CC_DRIVER_FEATURE_SELECT => self.net.driver_features_sel() as u64,
-            CC_MSIX_CONFIG => NO_VECTOR as u64,
+            CC_MSIX_CONFIG => self.msix.lock().config_vector() as u64,
             CC_NUM_QUEUES => NUM_QUEUES as u64,
             CC_DEVICE_STATUS => self.net.device_status() as u64,
             CC_CONFIG_GENERATION => self.net.config_generation() as u64,
@@ -351,7 +488,7 @@ impl VirtioNetPci {
             // queue_size is R/W (virtio-v1.2 §4.1.4.3): read back the
             // guest-configured size (resets to max_size), not the immutable max.
             CC_QUEUE_SIZE => self.net.queue_size() as u64,
-            CC_QUEUE_MSIX_VECTOR => NO_VECTOR as u64,
+            CC_QUEUE_MSIX_VECTOR => self.selected_queue_msix_vector() as u64,
             CC_QUEUE_ENABLE => self.net.queue_ready() as u64,
             // notify offsets map in queue order (queue i's offset is its
             // index); clamped to 0 for an out-of-range selector.
@@ -395,7 +532,18 @@ impl VirtioNetPci {
             CC_QUEUE_AVAIL_HI => self.net.set_queue_avail_addr(None, Some(val)),
             CC_QUEUE_USED_LO => self.net.set_queue_used_addr(Some(val), None),
             CC_QUEUE_USED_HI => self.net.set_queue_used_addr(None, Some(val)),
-            // msix_config / queue_msix_vector: INTx, no vectors to latch.
+            // MSI-X vector latches: store the guest-assigned vector (clamped to a
+            // valid index or NO_VECTOR) in the shared state so the readback
+            // echoes it — the kernel's vp_modern aborts -EBUSY on a read-back
+            // mismatch. An out-of-range selector drops the queue write
+            // (set_queue_vector bounds-checks the queue index).
+            CC_MSIX_CONFIG => self.msix.lock().set_config_vector(Self::clamp_vector(val as u16)),
+            CC_QUEUE_MSIX_VECTOR => {
+                let sel = self.net.queue_select() as usize;
+                self.msix
+                    .lock()
+                    .set_queue_vector(sel, Self::clamp_vector(val as u16));
+            }
             _ => {}
         }
     }
@@ -441,6 +589,124 @@ impl VirtioNetPci {
         let idx = off / NOTIFY_OFF_MULTIPLIER as u64;
         self.net.notify_queue(idx as u32);
     }
+
+    /// Serve an MSI-X table read at table-relative offset `rel`: decode
+    /// `(entry, dword)` and return the stored register; zero for an
+    /// out-of-range entry (a conformant guest never reads past the advertised
+    /// table size; the bound keeps a hostile read in-bounds).
+    fn msix_table_read(&self, rel: u64, data: &mut [u8]) {
+        let entry = (rel / MSIX_ENTRY_SIZE) as usize;
+        let dword = ((rel % MSIX_ENTRY_SIZE) / 4) as usize;
+        let val = self.msix.lock().table_dword(entry, dword);
+        Self::put_le(val as u64, data);
+    }
+
+    /// Apply an MSI-X table write at table-relative offset `rel`: decode
+    /// `(entry, dword)` and store the register in the shared state; out-of-range
+    /// entries are dropped (the bound keeps a hostile write in-bounds). Dword 3
+    /// is the Vector Control register (bit0 = the per-vector mask). After the
+    /// write, reconcile the entry's GSI route to its current deliverability:
+    /// INSTALL on the mask→unmask edge (the kernel's `irq_startup` clears bit0
+    /// after writing addr/data, drivers/pci/msi/) and on a non-spec addr/data
+    /// rewrite while unmasked; REMOVE on the unmask→mask edge so a masked vector
+    /// has no live KVM route (masking enforced at the KVM layer, not only the
+    /// device-side PBA gate). On install, `install_route` replays any pending bit.
+    fn msix_table_write(&mut self, rel: u64, data: &[u8]) {
+        let entry = (rel / MSIX_ENTRY_SIZE) as usize;
+        let dword = ((rel % MSIX_ENTRY_SIZE) / 4) as usize;
+        let val = Self::get_u32(data);
+        // The unmask-edge return is informational (unit-tested in `interrupt`);
+        // the facade reconciles the entry's route to its current deliverability,
+        // which subsumes the unmask edge (install), the mask edge (remove), and a
+        // non-spec addr/data rewrite while unmasked (re-install).
+        let _ = self.msix.lock().write_table_dword(entry, dword, val);
+        self.reconcile_route(entry);
+    }
+
+    /// Reconcile vector `idx`'s KVM MSI route to its current deliverability
+    /// (enabled && per-vector-unmasked && !function_mask): install it when
+    /// deliverable, remove it otherwise. Used on every table-write and Message
+    /// Control edge so masking/disable is enforced at the KVM route layer, not
+    /// only device-side.
+    fn reconcile_route(&mut self, idx: usize) {
+        let deliverable = {
+            let m = self.msix.lock();
+            m.enabled() && m.vector_unmasked(idx)
+        };
+        if deliverable {
+            self.install_route(idx);
+        } else {
+            self.remove_route(idx);
+        }
+    }
+
+    /// Reconcile every vector (device-level Message Control edge: enable /
+    /// disable / function-mask toggle).
+    fn reconcile_routes(&mut self) {
+        for idx in 0..MSIX_VECTORS {
+            self.reconcile_route(idx);
+        }
+    }
+
+    /// (Re)install the KVM MSI route for table vector `idx` from its current
+    /// table dwords, then replay any pending bit. No-op when no route sink is
+    /// wired (split-irqchip / no owner) — the guest's MSI-X then never delivers
+    /// and it falls back to INTx. The msix lock is released before the
+    /// (SRCU-grace) route ioctl so the slow ioctl never holds it.
+    fn install_route(&mut self, idx: usize) {
+        let Some(sink) = self.route_sink.as_ref() else {
+            return;
+        };
+        let Some(&gsi) = self.gsis.get(idx) else {
+            return;
+        };
+        let msg = self.msix.lock().msi_message(idx);
+        if let Some(msg) = msg {
+            sink.set_route(gsi, Some(msg));
+            // Now that the route is live, replay a pending bit recorded while the
+            // vector was masked (the eventfd write delivers through the route).
+            self.msix.lock().replay_pending(idx);
+        }
+    }
+
+    /// Remove the KVM MSI route for vector `idx` on a mask / disable /
+    /// function-mask edge. The device-side `fire()` gate already suppresses a
+    /// masked vector (records a PBA bit instead of writing the eventfd), so this
+    /// is belt-and-suspenders that ALSO enforces masking at the KVM layer —
+    /// matching firecracker (which drops a masked vector's route from the table)
+    /// and removing the latent risk that an off-thread eventfd writer (a
+    /// multiqueue / async-RX follow-up) could deliver through a still-live route.
+    /// No-op without a route sink. Deduped by the owner's `last_installed`, so
+    /// removing an already-absent route costs no ioctl.
+    fn remove_route(&mut self, idx: usize) {
+        let Some(sink) = self.route_sink.as_ref() else {
+            return;
+        };
+        let Some(&gsi) = self.gsis.get(idx) else {
+            return;
+        };
+        sink.set_route(gsi, None);
+    }
+
+    /// Whether a config-space write at `[reg, reg+len)` overlaps the register at
+    /// `[target, target+target_len)`.
+    fn write_touches(reg: u16, len: usize, target: u16, target_len: u16) -> bool {
+        let (r, r_end) = (reg as u32, reg as u32 + len as u32);
+        let (t, t_end) = (target as u32, target as u32 + target_len as u32);
+        r < t_end && t < r_end
+    }
+
+    /// Serve an MSI-X PBA read: the pending-bits byte at `rel` 0, zero
+    /// elsewhere (the PBA occupies a page but only `MSIX_VECTORS` ≤ 8 bits
+    /// are defined). Read-only — `bar_write` drops PBA writes.
+    fn msix_pba_read(&self, rel: u64, data: &mut [u8]) {
+        let val = if rel == 0 {
+            self.msix.lock().pba_byte() as u64
+        } else {
+            0
+        };
+        Self::put_le(val, data);
+    }
 }
 
 impl PciFunction for VirtioNetPci {
@@ -450,6 +716,28 @@ impl PciFunction for VirtioNetPci {
 
     fn config_write(&mut self, reg: u16, data: &[u8]) {
         self.cfg.write(reg, data);
+        // If the write touched the MSI-X cap Message Control (Enable bit15 /
+        // Function Mask bit14), sync the parsed state into the shared delivery
+        // state, then reconcile every vector's KVM route. The kernel's setup
+        // sequence (Enable+MASKALL, program vectors, clear MASKALL) and teardown
+        // (clear Enable) all land here; reconcile_routes installs each now-
+        // deliverable vector and removes each now-masked/disabled one in one
+        // pass, so the route table tracks the enable/function-mask state without
+        // per-edge bookkeeping. (Per-vector unmask edges land in
+        // msix_table_write, which reconciles that one entry.)
+        let mc_reg = CAP_MSIX + MSIX_OFF_MSG_CTRL;
+        if Self::write_touches(reg, data.len(), mc_reg, 2) {
+            let mut mc = [0u8; 2];
+            self.cfg.read(mc_reg, &mut mc);
+            let msg_ctrl = u16::from_le_bytes(mc);
+            self.msix.lock().set_message_control(msg_ctrl);
+            // Reconcile every vector's KVM route to the new enable / function-mask
+            // state: enable or function-unmask installs the unmasked vectors (and
+            // install_route replays their pending bits); disable or function-mask
+            // removes them so masking is enforced at the KVM layer too. Deduped by
+            // the owner, so unchanged vectors cost no ioctl.
+            self.reconcile_routes();
+        }
     }
 
     fn bar_window(&self) -> Option<(u64, u64)> {
@@ -527,6 +815,12 @@ impl PciFunction for VirtioNetPci {
             o if (DEVICE_OFFSET..DEVICE_OFFSET + REGION_SIZE).contains(&o) => {
                 self.net.config_bytes((o - DEVICE_OFFSET) as usize, data);
             }
+            o if (MSIX_TABLE_OFFSET..MSIX_TABLE_OFFSET + REGION_SIZE).contains(&o) => {
+                self.msix_table_read(o - MSIX_TABLE_OFFSET, data);
+            }
+            o if (MSIX_PBA_OFFSET..MSIX_PBA_OFFSET + REGION_SIZE).contains(&o) => {
+                self.msix_pba_read(o - MSIX_PBA_OFFSET, data);
+            }
             // notify region is write-only; reads return 0.
             _ => data.fill(0),
         }
@@ -540,8 +834,11 @@ impl PciFunction for VirtioNetPci {
             o if (NOTIFY_OFFSET..NOTIFY_OFFSET + REGION_SIZE).contains(&o) => {
                 self.notify_write(o - NOTIFY_OFFSET);
             }
-            // ISR is read-only; device-config writes are ignored (virtio-v1.2
-            // §4.2.2.2 — the device may ignore config-space writes).
+            o if (MSIX_TABLE_OFFSET..MSIX_TABLE_OFFSET + REGION_SIZE).contains(&o) => {
+                self.msix_table_write(o - MSIX_TABLE_OFFSET, data);
+            }
+            // MSI-X PBA + ISR are read-only; device-config writes are ignored
+            // (virtio-v1.2 §4.2.2.2 — the device may ignore config-space writes).
             _ => {}
         }
     }
@@ -564,9 +861,10 @@ mod tests {
     };
     use proptest::prelude::*;
     use std::sync::atomic::Ordering;
-    use virtio_bindings::virtio_config::VIRTIO_F_VERSION_1;
+    use virtio_bindings::virtio_config::{VIRTIO_CONFIG_S_NEEDS_RESET, VIRTIO_F_VERSION_1};
     use virtio_bindings::virtio_net::VIRTIO_NET_F_MAC;
     use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
+    use vmm_sys_util::eventfd::EventFd;
 
     // Compact guest-memory ring layout (the full-fidelity helpers live in
     // super::super::tests; this isolated harness only needs one TX + one RX
@@ -593,14 +891,44 @@ mod tests {
         GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), GUEST_MEM_SIZE)]).unwrap()
     }
 
-    /// Build a PCI function over `mem`; returns the counters handle (cloned
-    /// before the core moves into the facade) so a loopback's effect is
-    /// observable.
+    /// A counting MSI-X route sink for the facade tests: records every
+    /// `set_route(gsi, msg)` so a test can assert which routes the unmask /
+    /// enable edges installed, without a live KVM fd. `Send + Sync` (the trait
+    /// requires it) via the inner mutex.
+    #[derive(Default)]
+    #[allow(clippy::type_complexity)] // (gsi, Option<msi-message>) log, test-only
+    struct MockRouteSink {
+        installs: std::sync::Mutex<Vec<(u32, Option<(u32, u32, u32)>)>>,
+    }
+    impl MsixRouteSink for MockRouteSink {
+        fn set_route(&self, gsi: u32, msg: Option<(u32, u32, u32)>) {
+            self.installs.lock().unwrap().push((gsi, msg));
+        }
+    }
+
+    /// Default MSI-X GSIs for the tests (`virtio_net_msix_gsi(0, v)` = 24 + v,
+    /// kept literal here to keep this all-arch test module off the x86-only kvm
+    /// constants).
+    fn test_gsis() -> [u32; MSIX_VECTORS] {
+        std::array::from_fn(|v| 24 + v as u32)
+    }
+
+    /// Wrap `net` in a PCI function with a fresh (disabled) MSI-X state and a
+    /// no-asserted mock route sink — so the MSI-X cap IS advertised (the
+    /// decode-path tests assert the cap chain) but, since they don't enable
+    /// MSI-X, no route is actually installed. The MSI-X delivery tests build
+    /// their own state + eventfds + a retained mock sink.
+    fn new_pci(net: VirtioNet) -> VirtioNetPci {
+        let msix = Arc::new(PiMutex::new(MsixState::new()));
+        let sink: Arc<dyn MsixRouteSink> = Arc::new(MockRouteSink::default());
+        VirtioNetPci::new(net, TEST_BAR_APERTURE, msix, Some(sink), test_gsis())
+    }
+
     fn build(mem: &GuestMemoryMmap) -> (VirtioNetPci, std::sync::Arc<super::super::VirtioNetCounters>) {
         let mut net = VirtioNet::new(NetConfig::default());
         net.set_mem(mem.clone());
         let counters = net.counters();
-        (VirtioNetPci::new(net, TEST_BAR_APERTURE), counters)
+        (new_pci(net), counters)
     }
 
     fn cfg8(pci: &VirtioNetPci, reg: u16) -> u8 {
@@ -691,12 +1019,14 @@ mod tests {
         assert_ne!(cfg16(&pci, REG_STATUS) & PCI_STATUS_CAP_LIST, 0);
         assert_eq!(cfg8(&pci, REG_CAP_PTR), CAP_COMMON as u8);
 
-        // The four virtio vendor caps, chained COMMON->ISR->DEVICE->NOTIFY->0.
+        // The four virtio vendor caps chained COMMON->ISR->DEVICE->NOTIFY, then
+        // NOTIFY->MSIX->0 (MSI-X is the new last cap; its layout is checked below
+        // — it is not a virtio vendor cap so it is not in this loop).
         let chain = [
             (CAP_COMMON, CAP_ISR as u8, CFG_TYPE_COMMON, CAP_LEN_STD, COMMON_OFFSET),
             (CAP_ISR, CAP_DEVICE as u8, CFG_TYPE_ISR, CAP_LEN_STD, ISR_OFFSET),
             (CAP_DEVICE, CAP_NOTIFY as u8, CFG_TYPE_DEVICE, CAP_LEN_STD, DEVICE_OFFSET),
-            (CAP_NOTIFY, 0u8, CFG_TYPE_NOTIFY, CAP_LEN_NOTIFY, NOTIFY_OFFSET),
+            (CAP_NOTIFY, CAP_MSIX as u8, CFG_TYPE_NOTIFY, CAP_LEN_NOTIFY, NOTIFY_OFFSET),
         ];
         for (at, next, cfg_type, len, region_off) in chain {
             assert_eq!(cfg8(&pci, at + CAP_OFF_VNDR), CAP_VNDR, "cap@{at:#x} vndr");
@@ -720,6 +1050,418 @@ mod tests {
         assert_eq!(
             cfg32(&pci, CAP_NOTIFY + CAP_OFF_NOTIFY_MULT),
             NOTIFY_OFF_MULTIPLIER
+        );
+        // MSI-X cap (last in the chain): id, cap_next=0, Table Size (N-1
+        // encoding in bits[10:0]), and Table/PBA offset|BIR pointing into BAR0.
+        assert_eq!(cfg8(&pci, CAP_MSIX), PCI_CAP_ID_MSIX, "msix cap id");
+        assert_eq!(cfg8(&pci, CAP_MSIX + 1), 0, "msix cap_next (last cap)");
+        assert_eq!(
+            cfg16(&pci, CAP_MSIX + MSIX_OFF_MSG_CTRL) & 0x07FF,
+            MSIX_TABLE_SIZE - 1,
+            "msix table size (N-1)"
+        );
+        assert_eq!(
+            cfg32(&pci, CAP_MSIX + MSIX_OFF_TABLE),
+            MSIX_TABLE_OFFSET as u32 | MSIX_BIR0,
+            "msix table offset|BIR"
+        );
+        assert_eq!(
+            cfg32(&pci, CAP_MSIX + MSIX_OFF_PBA),
+            MSIX_PBA_OFFSET as u32 | MSIX_BIR0,
+            "msix PBA offset|BIR"
+        );
+    }
+
+    /// MSI-X vector latches echo the guest-written vector verbatim (the -EBUSY
+    /// gate: the kernel's vp_modern writes a vector, reads it back, and aborts
+    /// if they differ). Config + per-queue vectors are independent latches.
+    #[test]
+    fn msix_vector_echo_readback() {
+        let mem = test_mem();
+        let (mut pci, _c) = build(&mem);
+        assert_eq!(cc_r(&mut pci, CC_MSIX_CONFIG) as u16, NO_VECTOR);
+        cc_w(&mut pci, CC_MSIX_CONFIG, 0);
+        assert_eq!(cc_r(&mut pci, CC_MSIX_CONFIG) as u16, 0);
+        // Per-queue vector latches against the selected queue.
+        cc_w(&mut pci, CC_QUEUE_SELECT, TXQ as u32);
+        cc_w(&mut pci, CC_QUEUE_MSIX_VECTOR, 1);
+        assert_eq!(cc_r(&mut pci, CC_QUEUE_MSIX_VECTOR) as u16, 1);
+        cc_w(&mut pci, CC_QUEUE_SELECT, RXQ as u32);
+        assert_eq!(cc_r(&mut pci, CC_QUEUE_MSIX_VECTOR) as u16, NO_VECTOR);
+        cc_w(&mut pci, CC_QUEUE_MSIX_VECTOR, 0);
+        assert_eq!(cc_r(&mut pci, CC_QUEUE_MSIX_VECTOR) as u16, 0);
+        // The TX queue's vector is unaffected by the RX write.
+        cc_w(&mut pci, CC_QUEUE_SELECT, TXQ as u32);
+        assert_eq!(cc_r(&mut pci, CC_QUEUE_MSIX_VECTOR) as u16, 1);
+    }
+
+    /// An out-of-range vector (>= table size, not NO_VECTOR) is rejected — stored
+    /// as NO_VECTOR so the read-back signals rejection rather than letting a
+    /// hostile vector index the table out of bounds.
+    #[test]
+    fn msix_vector_out_of_range_rejected() {
+        let mem = test_mem();
+        let (mut pci, _c) = build(&mem);
+        cc_w(&mut pci, CC_MSIX_CONFIG, MSIX_TABLE_SIZE as u32);
+        assert_eq!(cc_r(&mut pci, CC_MSIX_CONFIG) as u16, NO_VECTOR);
+        cc_w(&mut pci, CC_QUEUE_SELECT, TXQ as u32);
+        cc_w(&mut pci, CC_QUEUE_MSIX_VECTOR, 0xABCD);
+        assert_eq!(cc_r(&mut pci, CC_QUEUE_MSIX_VECTOR) as u16, NO_VECTOR);
+    }
+
+    /// MSI-X table reads/writes round-trip through the BAR0 table region: each
+    /// 16-byte entry's four dwords (addr lo/hi, msg data, vector control) echo;
+    /// an out-of-range entry reads 0 and drops writes (no OOB).
+    #[test]
+    fn msix_table_roundtrip_and_bounds() {
+        let mem = test_mem();
+        let (mut pci, _c) = build(&mem);
+        let entry1 = MSIX_TABLE_OFFSET + MSIX_ENTRY_SIZE; // table entry index 1
+        let words = [0x1111_0000u32, 0x0000_2222, 0x3333_3333, 0x0000_0001];
+        for (i, w) in words.iter().enumerate() {
+            pci.bar_write(entry1 + (i as u64) * 4, &w.to_le_bytes());
+        }
+        for (i, w) in words.iter().enumerate() {
+            let mut b = [0u8; 4];
+            pci.bar_read(entry1 + (i as u64) * 4, &mut b);
+            assert_eq!(u32::from_le_bytes(b), *w, "table entry1 dword{i}");
+        }
+        let oob = MSIX_TABLE_OFFSET + MSIX_TABLE_SIZE as u64 * MSIX_ENTRY_SIZE;
+        pci.bar_write(oob, &0xDEAD_BEEFu32.to_le_bytes());
+        let mut b = [0u8; 4];
+        pci.bar_read(oob, &mut b);
+        assert_eq!(u32::from_le_bytes(b), 0, "out-of-range table entry reads 0");
+    }
+
+    /// The MSI-X PBA reads 0 (no pending vectors) and drops writes (read-only).
+    #[test]
+    fn msix_pba_reads_zero_and_read_only() {
+        let mem = test_mem();
+        let (mut pci, _c) = build(&mem);
+        pci.bar_write(MSIX_PBA_OFFSET, &0xFFu32.to_le_bytes());
+        let mut b = [0u8; 4];
+        pci.bar_read(MSIX_PBA_OFFSET, &mut b);
+        assert_eq!(u32::from_le_bytes(b), 0, "PBA reads 0 (no pending); write ignored");
+    }
+
+    // ---- MSI-X delivery (route install + fire/pend/replay through the facade) ----
+
+    /// Build a PCI function with MSI-X wired: retained per-vector eventfds (so a
+    /// test can drain them) + a retained mock route sink. MSI-X is NOT yet
+    /// enabled. Returns (pci, counters, shared msix, [eventfds], mock sink).
+    #[allow(clippy::type_complexity)]
+    fn build_msix(
+        mem: &GuestMemoryMmap,
+    ) -> (
+        VirtioNetPci,
+        Arc<super::super::VirtioNetCounters>,
+        Arc<PiMutex<MsixState>>,
+        [EventFd; MSIX_VECTORS],
+        Arc<MockRouteSink>,
+    ) {
+        let mut net = VirtioNet::new(NetConfig::default());
+        net.set_mem(mem.clone());
+        let counters = net.counters();
+        let msix = Arc::new(PiMutex::new(MsixState::new()));
+        // Hand the state a clone of each eventfd; keep the originals to drain.
+        let evts: [EventFd; MSIX_VECTORS] =
+            std::array::from_fn(|_| EventFd::new(libc::EFD_NONBLOCK).unwrap());
+        for (v, e) in evts.iter().enumerate() {
+            msix.lock().set_eventfd(v, e.try_clone().unwrap());
+        }
+        let sink = Arc::new(MockRouteSink::default());
+        let pci = VirtioNetPci::new(
+            net,
+            TEST_BAR_APERTURE,
+            Arc::clone(&msix),
+            Some(Arc::clone(&sink) as Arc<dyn MsixRouteSink>),
+            test_gsis(),
+        );
+        (pci, counters, msix, evts, sink)
+    }
+
+    /// Message Control values: Enable (bit15), Function Mask / MASKALL (bit14).
+    const MC_ENABLE: u16 = 0x8000;
+    const MC_ENABLE_MASKALL: u16 = 0x8000 | 0x4000;
+
+    /// Enable MSI-X in SHARED mode the way Linux's `msix_capability_init` does:
+    /// assign config→vector 0 and all queues→vector 1, write Message Control
+    /// Enable+MASKALL FIRST, program each entry's addr/data and clear its
+    /// per-vector mask bit (all while function-masked, so no route installs yet),
+    /// then clear MASKALL — the function-unmask edge that installs every unmasked
+    /// vector. Exercising the real MASKALL sequence means the facade's
+    /// function-unmask reconcile edge (not just the cold-enable edge) is covered.
+    fn enable_msix_shared(pci: &mut VirtioNetPci) {
+        cc_w(pci, CC_MSIX_CONFIG, 0);
+        for q in [RXQ, TXQ] {
+            cc_w(pci, CC_QUEUE_SELECT, q as u32);
+            cc_w(pci, CC_QUEUE_MSIX_VECTOR, 1);
+        }
+        pci.config_write(CAP_MSIX + MSIX_OFF_MSG_CTRL, &MC_ENABLE_MASKALL.to_le_bytes());
+        for v in 0..MSIX_VECTORS {
+            let base = MSIX_TABLE_OFFSET + (v as u64) * MSIX_ENTRY_SIZE;
+            pci.bar_write(base, &0xFEE0_0000u32.to_le_bytes()); // addr_lo
+            pci.bar_write(base + 8, &(0x4000u32 + v as u32).to_le_bytes()); // msg data
+            pci.bar_write(base + 12, &0u32.to_le_bytes()); // per-vector unmask (still fn-masked)
+        }
+        // Clear MASKALL → function-unmask edge installs every unmasked vector.
+        pci.config_write(CAP_MSIX + MSIX_OFF_MSG_CTRL, &MC_ENABLE.to_le_bytes());
+    }
+
+    /// Lay out one TX chain (12-byte zero header + `payload`) at ring slot 0 plus
+    /// an RX buffer, then kick TX through the notify region.
+    fn kick_tx_loopback(pci: &mut VirtioNetPci, mem: &GuestMemoryMmap, payload: &[u8]) {
+        let zero_hdr = [0u8; VIRTIO_NET_HDR_LEN];
+        mem.write_slice(&zero_hdr, GuestAddress(TX_BUF)).unwrap();
+        mem.write_slice(payload, GuestAddress(TX_BUF + VIRTIO_NET_HDR_LEN as u64))
+            .unwrap();
+        write_desc(
+            mem,
+            TX_DESC,
+            0,
+            TX_BUF,
+            (VIRTIO_NET_HDR_LEN + payload.len()) as u32,
+            0,
+            0,
+        );
+        publish_avail(mem, TX_AVAIL, 0);
+        write_desc(mem, RX_DESC, 0, RX_BUF, 256, 2, 0); // F_WRITE
+        publish_avail(mem, RX_AVAIL, 0);
+        pci.bar_write(
+            NOTIFY_OFFSET + (TXQ as u64) * NOTIFY_OFF_MULTIPLIER as u64,
+            &[0u8; 2],
+        );
+    }
+
+    /// With MSI-X enabled + both vectors unmasked, a TX loopback delivers the
+    /// VRING interrupt to the shared queue vector (1) via its eventfd — NOT the
+    /// config vector (0), NOT the INTx ISR — and the routes were installed.
+    #[test]
+    fn msix_enabled_delivers_vring_to_queue_vector() {
+        let mem = test_mem();
+        let (mut pci, counters, msix, evts, sink) = build_msix(&mem);
+        drive_to_features_ok(&mut pci);
+        program_queue(&mut pci, RXQ as u32, RX_DESC, RX_AVAIL, RX_USED);
+        program_queue(&mut pci, TXQ as u32, TX_DESC, TX_AVAIL, TX_USED);
+        enable_msix_shared(&mut pci);
+        cc_w(&mut pci, CC_DEVICE_STATUS, S_OK);
+
+        kick_tx_loopback(&mut pci, &mem, &(0..42u8).collect::<Vec<_>>());
+
+        assert_eq!(counters.tx_packets(), 1, "TX drained");
+        assert_eq!(counters.rx_packets(), 1, "RX loopback delivered");
+        // VRING delivered to the shared queue vector (1), config vector (0) quiet.
+        assert_eq!(evts[1].read().unwrap(), 1, "queue vector 1 fired once");
+        assert!(evts[0].read().is_err(), "config vector 0 untouched (EAGAIN)");
+        // MSI-X mode does NOT touch the INTx ISR (the kernel's per-vector handlers
+        // never read it).
+        let mut isr = [0xFFu8; 1];
+        pci.bar_read(ISR_OFFSET, &mut isr);
+        assert_eq!(isr[0], 0, "MSI-X mode leaves the INTx ISR clear");
+        // Both unmasked vectors had their routes installed at their GSIs (24/25).
+        let installs = sink.installs.lock().unwrap();
+        assert!(
+            installs.iter().any(|(g, m)| *g == 24 && m.is_some()),
+            "vector 0 route installed at GSI 24"
+        );
+        assert!(
+            installs.iter().any(|(g, m)| *g == 25 && m.is_some()),
+            "vector 1 route installed at GSI 25"
+        );
+        assert_eq!(msix.lock().pba_byte(), 0, "delivered live, nothing pending");
+    }
+
+    /// A VRING interrupt to a MASKED vector records a PBA bit (no eventfd write);
+    /// unmasking the vector replays the pending interrupt exactly once.
+    #[test]
+    fn msix_masked_vector_pends_then_replays_on_unmask() {
+        let mem = test_mem();
+        let (mut pci, _counters, msix, evts, _sink) = build_msix(&mem);
+        drive_to_features_ok(&mut pci);
+        program_queue(&mut pci, RXQ as u32, RX_DESC, RX_AVAIL, RX_USED);
+        program_queue(&mut pci, TXQ as u32, TX_DESC, TX_AVAIL, TX_USED);
+        enable_msix_shared(&mut pci);
+        cc_w(&mut pci, CC_DEVICE_STATUS, S_OK);
+        // Re-mask the queue vector (entry 1, vector control bit0 = 1).
+        pci.bar_write(MSIX_TABLE_OFFSET + MSIX_ENTRY_SIZE + 12, &1u32.to_le_bytes());
+
+        kick_tx_loopback(&mut pci, &mem, &[0x5Au8; 20]);
+
+        assert!(evts[1].read().is_err(), "masked vector did not fire (EAGAIN)");
+        assert_eq!(
+            msix.lock().pba_byte() & (1 << 1),
+            1 << 1,
+            "pending bit set for the masked queue vector"
+        );
+        // Unmask → the facade replays the pending interrupt once.
+        pci.bar_write(MSIX_TABLE_OFFSET + MSIX_ENTRY_SIZE + 12, &0u32.to_le_bytes());
+        assert_eq!(evts[1].read().unwrap(), 1, "unmask replays the pending interrupt");
+        assert_eq!(
+            msix.lock().pba_byte() & (1 << 1),
+            0,
+            "pending cleared after replay"
+        );
+    }
+
+    /// Without a route sink (split-irqchip / no owner) the MSI-X cap is NOT
+    /// advertised — the guest never sees it and stays on INTx, so the device
+    /// never offers a delivery path it cannot honor.
+    #[test]
+    fn msix_cap_absent_without_route_sink() {
+        let mem = test_mem();
+        let mut net = VirtioNet::new(NetConfig::default());
+        net.set_mem(mem.clone());
+        let msix = Arc::new(PiMutex::new(MsixState::new()));
+        let pci = VirtioNetPci::new(net, TEST_BAR_APERTURE, msix, None, [0; MSIX_VECTORS]);
+        // NOTIFY is the last cap (cap_next = 0) — the MSI-X cap is not chained.
+        assert_eq!(
+            cfg8(&pci, CAP_NOTIFY + CAP_OFF_NEXT),
+            0,
+            "NOTIFY terminates the chain when MSI-X is not offered"
+        );
+        // The MSI-X cap slot is unpopulated (id byte stays 0, not PCI_CAP_ID_MSIX).
+        assert_eq!(
+            cfg8(&pci, CAP_MSIX),
+            0,
+            "no MSI-X cap written without a route sink"
+        );
+        // STATUS still advertises a capability list (the virtio vendor caps).
+        assert_ne!(cfg16(&pci, REG_STATUS) & PCI_STATUS_CAP_LIST, 0);
+    }
+
+    /// A queue poison (hostile avail.idx) under MSI-X delivers to the CONFIG
+    /// vector (0), not the queue vector (1), and still sets NEEDS_RESET — the
+    /// MSI-X twin of the INTx tests_poison path (signal_queue_poisoned →
+    /// IrqSource::Config). Pins the config-vector branch of the MSI-X signal path
+    /// (only the VRING branch is covered by msix_enabled_delivers_…).
+    #[test]
+    fn msix_config_vector_delivers_on_queue_poison() {
+        let mem = test_mem();
+        let (mut pci, _counters, _msix, evts, _sink) = build_msix(&mem);
+        drive_to_features_ok(&mut pci);
+        program_queue(&mut pci, RXQ as u32, RX_DESC, RX_AVAIL, RX_USED);
+        program_queue(&mut pci, TXQ as u32, TX_DESC, TX_AVAIL, TX_USED);
+        enable_msix_shared(&mut pci);
+        cc_w(&mut pci, CC_DEVICE_STATUS, S_OK);
+
+        // Plant a bogus TX avail.idx far beyond the (size-4) ring → the loopback
+        // poisons the queue → signal_queue_poisoned → MSI-X config vector (0).
+        mem.write_slice(&1000u16.to_le_bytes(), GuestAddress(TX_AVAIL + 2))
+            .unwrap();
+        pci.bar_write(
+            NOTIFY_OFFSET + (TXQ as u64) * NOTIFY_OFF_MULTIPLIER as u64,
+            &[0u8; 2],
+        );
+
+        assert_eq!(evts[0].read().unwrap(), 1, "poison delivered to config vector 0");
+        assert!(
+            evts[1].read().is_err(),
+            "queue vector 1 not fired by a config-change/poison"
+        );
+        // NEEDS_RESET is set (guest-visible), and MSI-X mode leaves the INTx ISR
+        // clear (the bit-set path is skipped on the MSI-X branch).
+        let mut sb = [0u8; 1];
+        pci.bar_read(COMMON_OFFSET + CC_DEVICE_STATUS, &mut sb);
+        assert_ne!(
+            sb[0] as u32 & VIRTIO_CONFIG_S_NEEDS_RESET,
+            0,
+            "poison sets NEEDS_RESET"
+        );
+        let mut isr = [0xFFu8; 1];
+        pci.bar_read(ISR_OFFSET, &mut isr);
+        assert_eq!(isr[0], 0, "MSI-X mode leaves the INTx ISR clear on poison");
+    }
+
+    /// A virtio reset (device_status = 0) restores the MSI-X vector assignments
+    /// to NO_VECTOR (virtio-v1.2 §4.1.4.3) while the PCI-level cap (enable/table)
+    /// persists — `reset_virtio_assignments` via the shared state.
+    #[test]
+    fn reset_clears_msix_vector_assignments() {
+        let mem = test_mem();
+        let (mut pci, _counters, msix, _evts, _sink) = build_msix(&mem);
+        drive_to_features_ok(&mut pci);
+        enable_msix_shared(&mut pci);
+        assert_eq!(msix.lock().config_vector(), 0, "config vector assigned");
+        assert_eq!(msix.lock().queue_vector(TXQ), 1, "queue vector assigned");
+
+        cc_w(&mut pci, CC_DEVICE_STATUS, 0); // virtio reset
+
+        assert_eq!(
+            msix.lock().config_vector(),
+            NO_VECTOR,
+            "reset restores config vector to NO_VECTOR"
+        );
+        assert_eq!(msix.lock().queue_vector(RXQ), NO_VECTOR, "reset restores RX vector");
+        assert_eq!(msix.lock().queue_vector(TXQ), NO_VECTOR, "reset restores TX vector");
+    }
+
+    /// Routes install on the FUNCTION-unmask (MASKALL-clear) edge: enable with
+    /// MASKALL + program + per-vector-unmask installs NOTHING (function-masked),
+    /// and clearing MASKALL then installs every unmasked vector. Pins the
+    /// function-unmask half of the facade reconcile (the per-vector-unmask edge
+    /// is covered elsewhere; this is the edge the real kernel MASKALL sequence
+    /// hits).
+    #[test]
+    fn msix_routes_install_on_function_unmask_edge() {
+        let mem = test_mem();
+        let (mut pci, _counters, _msix, _evts, sink) = build_msix(&mem);
+        drive_to_features_ok(&mut pci);
+        program_queue(&mut pci, RXQ as u32, RX_DESC, RX_AVAIL, RX_USED);
+        program_queue(&mut pci, TXQ as u32, TX_DESC, TX_AVAIL, TX_USED);
+        cc_w(&mut pci, CC_MSIX_CONFIG, 0);
+        for q in [RXQ, TXQ] {
+            cc_w(&mut pci, CC_QUEUE_SELECT, q as u32);
+            cc_w(&mut pci, CC_QUEUE_MSIX_VECTOR, 1);
+        }
+        // Enable + MASKALL, then program + per-vector unmask — all function-masked.
+        pci.config_write(CAP_MSIX + MSIX_OFF_MSG_CTRL, &MC_ENABLE_MASKALL.to_le_bytes());
+        for v in 0..MSIX_VECTORS {
+            let base = MSIX_TABLE_OFFSET + (v as u64) * MSIX_ENTRY_SIZE;
+            pci.bar_write(base, &0xFEE0_0000u32.to_le_bytes());
+            pci.bar_write(base + 8, &(0x4000u32 + v as u32).to_le_bytes());
+            pci.bar_write(base + 12, &0u32.to_le_bytes());
+        }
+        assert!(
+            !sink.installs.lock().unwrap().iter().any(|(_, m)| m.is_some()),
+            "no route installed while function-masked (MASKALL set)"
+        );
+        // Clear MASKALL → function-unmask edge installs both unmasked vectors.
+        pci.config_write(CAP_MSIX + MSIX_OFF_MSG_CTRL, &MC_ENABLE.to_le_bytes());
+        let installs = sink.installs.lock().unwrap();
+        assert!(
+            installs.iter().any(|(g, m)| *g == 24 && m.is_some()),
+            "vector 0 route installed on MASKALL-clear"
+        );
+        assert!(
+            installs.iter().any(|(g, m)| *g == 25 && m.is_some()),
+            "vector 1 route installed on MASKALL-clear"
+        );
+    }
+
+    /// The route REMOVAL contract: after a vector's route is installed,
+    /// re-masking it (Vector Control bit0 = 1) must emit a `set_route(gsi, None)`
+    /// removal so the masked vector has no live KVM route — masking enforced at
+    /// the KVM layer (matching firecracker), not only the device-side PBA gate.
+    /// Direct regression pin for the remove branch of `reconcile_route`.
+    #[test]
+    fn msix_mask_edge_removes_route() {
+        let mem = test_mem();
+        let (mut pci, _counters, _msix, _evts, sink) = build_msix(&mem);
+        drive_to_features_ok(&mut pci);
+        program_queue(&mut pci, RXQ as u32, RX_DESC, RX_AVAIL, RX_USED);
+        program_queue(&mut pci, TXQ as u32, TX_DESC, TX_AVAIL, TX_USED);
+        enable_msix_shared(&mut pci);
+        // The shared queue vector (1) is installed at GSI 25 after enable.
+        assert!(
+            sink.installs.lock().unwrap().iter().any(|(g, m)| *g == 25 && m.is_some()),
+            "queue vector route installed after enable"
+        );
+        // Re-mask the queue vector (entry 1, Vector Control bit0 = 1) → its KVM
+        // route must be removed.
+        pci.bar_write(MSIX_TABLE_OFFSET + MSIX_ENTRY_SIZE + 12, &1u32.to_le_bytes());
+        assert!(
+            sink.installs.lock().unwrap().iter().any(|(g, m)| *g == 25 && m.is_none()),
+            "mask edge removes the queue vector's route via set_route(gsi, None)"
         );
     }
 
@@ -780,7 +1522,8 @@ mod tests {
         let mem = test_mem();
         let (mut pci, _c) = build(&mem);
         assert_eq!(cc_r(&mut pci, CC_NUM_QUEUES), NUM_QUEUES as u32);
-        // MSI-X is not implemented: config + per-queue vector read NO_VECTOR.
+        // MSI-X vectors are unassigned at reset → read NO_VECTOR (the echo /
+        // latch behaviour is covered by msix_vector_echo_readback).
         assert_eq!(cc_r(&mut pci, CC_MSIX_CONFIG) as u16, NO_VECTOR);
         assert_eq!(cc_r(&mut pci, CC_QUEUE_MSIX_VECTOR) as u16, NO_VECTOR);
         // device_feature select+window: VERSION_1 in the high word, MAC in low.
@@ -866,7 +1609,7 @@ mod tests {
         let mem = test_mem();
         let mut net = VirtioNet::new(NetConfig::default());
         net.set_mem(mem.clone());
-        let mut pci = VirtioNetPci::new(net, TEST_BAR_APERTURE);
+        let mut pci = new_pci(net);
         drive_to_features_ok(&mut pci); // FEATURES_OK window: queue config allowed
         cc_w(&mut pci, CC_QUEUE_SELECT, TXQ as u32);
         cc_w(&mut pci, CC_QUEUE_DESC_LO, 0x0000_1000);
@@ -926,7 +1669,7 @@ mod tests {
         let mem = test_mem();
         let mut net = VirtioNet::new(NetConfig::default().mac(mac));
         net.set_mem(mem.clone());
-        let mut pci = VirtioNetPci::new(net, TEST_BAR_APERTURE);
+        let mut pci = new_pci(net);
         let mut got = [0u8; 6];
         pci.bar_read(DEVICE_OFFSET, &mut got);
         assert_eq!(got, mac, "device-config region serves the MAC at offset 0");
@@ -1146,7 +1889,7 @@ mod tests {
             let mut net = VirtioNet::new(NetConfig::default());
             net.set_mem(mem.clone());
             let counters = net.counters();
-            let mut pci = VirtioNetPci::new(net, TEST_BAR_APERTURE);
+            let mut pci = new_pci(net);
             drive_to_features_ok(&mut pci);
             program_queue(&mut pci, RXQ as u32, RX_DESC, RX_AVAIL, RX_USED);
             program_queue(&mut pci, TXQ as u32, TX_DESC, TX_AVAIL, TX_USED);
@@ -1185,6 +1928,60 @@ mod tests {
                 after_tx.wrapping_sub(before_tx),
                 after_rx.wrapping_sub(before_rx),
                 after - before,
+                descs.len(),
+            );
+        }
+
+        /// MSI-X variant of the chain-mutation fuzz: identical random TX chains,
+        /// but MSI-X enabled so each used-ring publish drives `MsixState::fire`
+        /// (vector resolve + mask/PBA gate + eventfd write) instead of the INTx
+        /// line. Proves the MSI-X signal path survives hostile chains (no panic /
+        /// OOB) and the same forward-progress invariant holds — chain parsing is
+        /// transport-neutral, so progress must match the INTx arm regardless of
+        /// the interrupt transport. Each case is a fresh `build_msix` (fresh
+        /// eventfds), so vector firings never overflow across cases.
+        #[test]
+        fn facade_msix_tx_chain_progress_under_random_descriptors(
+            descs in prop::collection::vec(
+                (0u64..(1u64 << 24), 0u32..(8 * 1024 * 1024), 0u16..8, any::<u16>()),
+                1..=8usize,
+            ),
+        ) {
+            let mem = test_mem();
+            let (mut pci, counters, _msix, _evts, _sink) = build_msix(&mem);
+            drive_to_features_ok(&mut pci);
+            program_queue(&mut pci, RXQ as u32, RX_DESC, RX_AVAIL, RX_USED);
+            program_queue(&mut pci, TXQ as u32, TX_DESC, TX_AVAIL, TX_USED);
+            enable_msix_shared(&mut pci);
+            cc_w(&mut pci, CC_DEVICE_STATUS, S_OK);
+
+            for (i, (addr, len, flags, next)) in descs.iter().enumerate() {
+                write_desc(&mem, TX_DESC, i as u16, *addr, *len, *flags, *next);
+            }
+            publish_avail(&mem, TX_AVAIL, 0);
+            write_desc(&mem, RX_DESC, 0, RX_BUF, 2048, 2, 0); // F_WRITE, well-formed
+            publish_avail(&mem, RX_AVAIL, 0);
+
+            let before_tx = read_used_idx(&mem, TX_USED);
+            let before_rx = read_used_idx(&mem, RX_USED);
+            let before = progress_sum(&counters);
+
+            pci.bar_write(
+                NOTIFY_OFFSET + (TXQ as u64) * NOTIFY_OFF_MULTIPLIER as u64,
+                &[0u8; 2],
+            );
+
+            let after_tx = read_used_idx(&mem, TX_USED);
+            let after_rx = read_used_idx(&mem, RX_USED);
+            let after = progress_sum(&counters);
+
+            prop_assert!(after >= before, "event counters must be monotonic");
+            let progress = (after - before)
+                + after_tx.wrapping_sub(before_tx) as u64
+                + after_rx.wrapping_sub(before_rx) as u64;
+            prop_assert!(
+                progress >= 1,
+                "no visible progress through the MSI-X PCI decode (chain len={})",
                 descs.len(),
             );
         }

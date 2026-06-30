@@ -592,11 +592,19 @@ impl KtstrVm {
     /// [`NetDeviceHandles`] carries the counters Arc (for the failure-dump
     /// run state + `VmResult`) and, on the full-irqchip path, the resample
     /// eventfd the caller MUST keep alive.
+    ///
+    /// `route_owner` is the full-irqchip shared GSI route owner, `Some` only on
+    /// the full-irqchip path. When `Some`, each NIC additionally gets MSI-X: one
+    /// eventfd per vector registered as an irqfd at `virtio_net_msix_gsi(index,
+    /// v)`, and the owner threaded into the facade (as a `MsixRouteSink`) to
+    /// install the MSI routes on the guest's vector-unmask edges. When `None`
+    /// (split-irqchip), the facade omits the MSI-X cap so the NIC stays on INTx.
     #[cfg(target_arch = "x86_64")]
     pub(super) fn init_virtio_net_pci(
         &self,
         vm: &kvm::KtstrKvm,
         pci_bus: &Arc<PiMutex<pci::PciBus>>,
+        route_owner: Option<&Arc<kvm::FullIrqchipRouteOwner>>,
     ) -> Result<Vec<NetDeviceHandles>> {
         // The BAR aperture is the host-bridge _CRS MMIO grant (same window the
         // DSDT advertises to the guest); bar_window rejects a base outside it so
@@ -672,10 +680,44 @@ impl KtstrVm {
                 // race).
                 Some(evt)
             };
+            // MSI-X (full-irqchip only): build the shared delivery state, create
+            // one eventfd per vector and register it as an irqfd at its GSI. The
+            // MSI route is installed LATER, on the guest's vector-unmask edge (an
+            // irqfd may be assigned to a GSI with no route yet — KVM leaves its
+            // cached entry inactive until the route is added, virt/kvm/eventfd.c;
+            // the unmask-edge route install refreshes it). The eventfds live in
+            // the shared state (held alive for the run) so the device core fires
+            // them; the route owner (as a `MsixRouteSink`) + the GSIs go to the
+            // facade. `route_owner` is Some only on the full-irqchip path; on
+            // split-irqchip it is None, so the facade omits the MSI-X cap and the
+            // NIC stays on INTx (no undeliverable MSI-X is advertised).
+            let msix = Arc::new(PiMutex::new(virtio_net::MsixState::new()));
+            let mut msix_gsis = [0u32; virtio_net::MSIX_VECTORS];
+            let route_sink: Option<Arc<dyn virtio_net::MsixRouteSink>> = match route_owner {
+                Some(owner) => {
+                    for (v, gsi_slot) in msix_gsis.iter_mut().enumerate() {
+                        let mgsi = kvm::virtio_net_msix_gsi(index, v);
+                        *gsi_slot = mgsi;
+                        let evt = EventFd::new(libc::EFD_NONBLOCK)
+                            .context("create virtio-net MSI-X vector eventfd")?;
+                        vm.vm_fd.register_irqfd(&evt, mgsi).with_context(|| {
+                            format!(
+                                "register virtio-net-PCI MSI-X irqfd, NIC {index} \
+                                 vector {v} GSI {mgsi}"
+                            )
+                        })?;
+                        msix.lock().set_eventfd(v, evt);
+                    }
+                    Some(Arc::clone(owner) as Arc<dyn virtio_net::MsixRouteSink>)
+                }
+                None => None,
+            };
             // Move the device core into the PCI function and install it at its
             // slot. The PciBus lock serializes the vCPU-thread BAR accesses that
-            // drive it.
-            let func = virtio_net::VirtioNetPci::new(dev, bar_aperture);
+            // drive it. The shared MSI-X state is cloned into the device core
+            // inside `new`.
+            let func =
+                virtio_net::VirtioNetPci::new(dev, bar_aperture, msix, route_sink, msix_gsis);
             pci_bus.lock().add_function(slot, Box::new(func));
             handles.push(NetDeviceHandles {
                 counters,
