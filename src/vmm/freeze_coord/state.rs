@@ -206,9 +206,58 @@ pub(super) fn compute_periodic_boundaries_ns(
     boundaries
 }
 
+/// True when the periodic-capture accessor is still current for the live
+/// scheduler. `last_sched_kva` is the `scx_root` value the scx_root watchpoint
+/// poll last republished the owned BPF accessor against (0 = detached);
+/// `live_sched_kva` is a fresh `*scx_root` read taken AT the periodic boundary.
+/// They match only when no scheduler swap has occurred since the last republish.
+///
+/// When false, the periodic boundary MUST defer: `owned_accessor` is bound to
+/// the prior scheduler's BPF object, whose `.bss` the kernel RCU-frees on
+/// `scx_root_disable` (kernel/sched/ext.c) — a capture through it reads a
+/// recycled/zeroed page, surfacing a silent `nr_dispatched=0`. The watchpoint
+/// poll (≤ `SCAN_INTERVAL`) re-resolves the accessor for the live scheduler and
+/// the next boundary passes. A zero `live_sched_kva` (detached) also defers —
+/// there is no scheduler to capture. Pure helper so the
+/// `(last_sched_kva, live_sched_kva)` transition matrix is unit-testable without
+/// booting a VM, mirroring `republish_watchpoint_on_rebind`'s pure-helper shape.
+pub(super) fn periodic_accessor_current(last_sched_kva: u64, live_sched_kva: u64) -> bool {
+    live_sched_kva != 0 && live_sched_kva == last_sched_kva
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// No scheduler swap since the last watchpoint republish → the accessor is
+    /// current, the periodic boundary captures.
+    #[test]
+    fn periodic_accessor_current_when_root_unchanged() {
+        assert!(periodic_accessor_current(
+            0xffff_8000_1234_5678,
+            0xffff_8000_1234_5678
+        ));
+    }
+
+    /// scx_root moved (A→B) before the ≤SCAN_INTERVAL watchpoint poll re-resolved
+    /// the accessor → stale → defer (the Window-B race).
+    #[test]
+    fn periodic_accessor_stale_after_swap() {
+        assert!(!periodic_accessor_current(
+            0xffff_8000_1111_1111,
+            0xffff_8000_2222_2222
+        ));
+    }
+
+    /// A zero live scx_root (scheduler detached) defers regardless of the last
+    /// republished value — there is no scheduler to capture; and a fresh attach
+    /// (last still 0, live = B) also defers until the accessor re-resolves.
+    #[test]
+    fn periodic_accessor_detached_or_unresolved_defers() {
+        assert!(!periodic_accessor_current(0xffff_8000_1111_1111, 0));
+        assert!(!periodic_accessor_current(0, 0));
+        assert!(!periodic_accessor_current(0, 0xffff_8000_2222_2222));
+    }
 
     /// Dispatched into the periodic-capture loop's tag-formatting
     /// step. The tag wire format is documented in

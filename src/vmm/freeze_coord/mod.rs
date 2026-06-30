@@ -78,7 +78,7 @@ use self::snapshot::{
 };
 use self::state::{
     BspExitReason, FREEZE_RENDEZVOUS_TIMEOUT, FreezeState, SnapshotRequest,
-    compute_periodic_boundaries_ns, periodic_tag,
+    compute_periodic_boundaries_ns, periodic_accessor_current, periodic_tag,
 };
 use self::watchpoint::{WatchpointPublishResult, republish_watchpoint_on_rebind};
 
@@ -8072,6 +8072,54 @@ impl KtstrVm {
                                          retrying next iteration"
                                     );
                                     break;
+                                }
+                                // Window-B guard: the gate above ensures
+                                // the accessor EXISTS, but a scheduler swap
+                                // (Op::ReplaceScheduler / a same-binary rebind)
+                                // the <= SCAN_INTERVAL scx_root watchpoint poll
+                                // has not yet processed leaves owned_accessor
+                                // bound to the PRIOR scheduler while *scx_root
+                                // already points at the new obj. The prior obj's
+                                // .bss is RCU-freed (kernel/sched/ext.c
+                                // scx_root_disable), so a capture through the
+                                // stale accessor reads a recycled/zeroed page —
+                                // a silent nr_dispatched=0. Read *scx_root NOW
+                                // and defer if it moved since the last watchpoint
+                                // republish (last_sched_kva); the next iteration
+                                // retries once the poll re-resolves the accessor
+                                // for the live scheduler. Mirrors the watchpoint
+                                // rebind detection but at the periodic boundary
+                                // so a sub-SCAN_INTERVAL swap cannot emit a stale
+                                // sample. Gated on scx_root being resolvable:
+                                // when the symbol/offsets/mem are absent the dump
+                                // degrades to a loud NoActiveScheduler, not a
+                                // silent 0, so no guard is needed there.
+                                if let Some(ref syms) = dump_cpu_time_symbols
+                                    && let Some(scx_root_kva) = syms.scx_root
+                                    && let Some(ref mem) = freeze_coord_mem
+                                    && let Some(ref acc) = owned_accessor
+                                {
+                                    let root_pa =
+                                        acc.guest_kernel().text_kva_to_pa(scx_root_kva);
+                                    let live_sched_kva = mem.read_u64(root_pa, 0);
+                                    if !periodic_accessor_current(last_sched_kva, live_sched_kva)
+                                    {
+                                        tracing::info!(
+                                            target: "ktstr::failure_dump",
+                                            idx = next_periodic_idx,
+                                            tag = %periodic_tag(next_periodic_idx),
+                                            last_sched_kva =
+                                                format_args!("{last_sched_kva:#x}"),
+                                            live_sched_kva =
+                                                format_args!("{live_sched_kva:#x}"),
+                                            "freeze-coord: periodic snapshot deferred \
+                                             (scheduler swap not yet re-resolved by the \
+                                             scx_root watchpoint poll; owned_accessor is \
+                                             stale for the live scx_root); retrying next \
+                                             iteration"
+                                        );
+                                        break;
+                                    }
                                 }
                                 let _gate_guard = match gate::OnDemandGateGuard::try_acquire(
                                     &freeze_coord_on_demand_in_flight,
