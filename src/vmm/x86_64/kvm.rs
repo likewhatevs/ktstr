@@ -873,7 +873,7 @@ impl KtstrKvm {
 /// Companion to the safe-wrapper boot-time probe above — used by
 /// the freeze coordinator (see [`crate::vmm::freeze_coord`]) for
 /// the freeze rendezvous save/restore where the coordinator's
-/// `freeze_and_capture` + `thaw_and_barrier` sibling closures
+/// `freeze_and_dispatch` + `thaw_and_barrier` sibling closures
 /// can't borrow `&vm.vm_fd` (vm is consumed by a downstream closure
 /// in the same scope) and therefore use the raw fd (Copy) cached
 /// at coord-thread spawn time.

@@ -64,7 +64,7 @@ mod scheduler;
 ///     teardown wall time; maps onto `KtstrTestEntry::cleanup_budget`
 ///     as `Duration::from_millis(N)`. Default: `None` (unenforced).
 ///   - `num_snapshots = N` — fire `N` periodic
-///     `freeze_and_capture(false)` boundaries inside the workload's
+///     `freeze_and_dispatch(FreezeMode::Capture { gate_on_exit_kind: false })` boundaries inside the workload's
 ///     10 %–90 % window, stored on the host
 ///     `SnapshotBridge` under `periodic_NNN`. `0` (default)
 ///     disables periodic capture entirely. Maps onto

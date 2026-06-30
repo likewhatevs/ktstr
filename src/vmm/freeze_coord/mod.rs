@@ -8230,13 +8230,17 @@ impl KtstrVm {
                                 // the <= SCAN_INTERVAL scx_root watchpoint poll
                                 // has not yet processed leaves owned_accessor
                                 // bound to the PRIOR scheduler while *scx_root
-                                // already points at the new obj. The prior obj's
-                                // .bss page is RCU-freed via the BPF object
-                                // teardown that scheduler disable
-                                // (scx_root_disable, kernel/sched/ext.c)
-                                // drives, so a capture through the
-                                // stale accessor reads a recycled/zeroed page —
-                                // a silent nr_dispatched=0. Read *scx_root NOW
+                                // already points at the new obj. Reading the
+                                // prior obj's .bss through the stale accessor
+                                // returns the PRIOR scheduler's counters, not
+                                // the live one's; and once the prior BPF
+                                // object's maps are released (map refcount -> 0
+                                // on scheduler-process exit / fd close — NOT
+                                // synchronously by scx_root_disable
+                                // (kernel/sched/ext.c), which only unlinks the
+                                // scx_sched and NULLs *scx_root), that .bss page
+                                // is recycled/zeroed, a silent nr_dispatched=0.
+                                // Read *scx_root NOW
                                 // and defer if it moved since the last watchpoint
                                 // republish (last_sched_kva); the next iteration
                                 // retries once the poll re-resolves the accessor
@@ -9987,47 +9991,98 @@ impl KtstrVm {
                 // `num_snapshots > 0`, log the fired/total ratio so
                 // an operator reading the test's tracing output can
                 // tell at a glance whether the periodic-sampling
-                // path delivered. Three distinct shapes surface:
-                //   * `0/N` with no scenario_start_ns stamp — the
-                //     guest never published a CRC-valid
-                //     `MSG_TYPE_SCENARIO_START`, so boundaries were
-                //     never computed. Most commonly a guest that
-                //     crashed mid-boot or a workload that never
-                //     reached the host-comms phase.
-                //   * `0/N` with scenario_start_ns stamped — the
-                //     boundaries were computed but no boundary was
-                //     reached (very-short run, kill before first
-                //     boundary). The doc on
-                //     `KtstrTestEntry::num_snapshots` warns the
-                //     test author to assert `>= some_lower_bound`
-                //     rather than `== num_snapshots` exactly for
-                //     this case.
-                //   * `K/N` with `K < N` — the run terminated mid-
-                //     sequence. Same best-effort contract; tests
-                //     should assert `>= K` not `== N`.
+                // path delivered. The pipeline anchors on
+                // `scenario_start_ns` when a CRC-valid
+                // `MSG_TYPE_SCENARIO_START` was observed, else on the
+                // `watchdog_reset`-derived fallback (the observed
+                // scheduler-attach time); the summary keys on the
+                // fired count plus which anchor source was available.
+                // Three distinct shapes surface:
+                //   * `K/N` fired (`K >= 1`) — boundaries were
+                //     reached, so an anchor existed. When the primary
+                //     `scenario_start_ns` was never stamped the
+                //     `watchdog_reset` fallback supplied it and the
+                //     message says so. `K < N` means the run
+                //     terminated mid-sequence; the doc on
+                //     `KtstrTestEntry::num_snapshots` warns the test
+                //     author to assert `>= some_lower_bound` rather
+                //     than `== num_snapshots` for exactly this case.
+                //   * `0/N` with NEITHER anchor available (no
+                //     `scenario_start_ns` AND a zero `watchdog_reset`)
+                //     — periodic sampling never had a reference point.
+                //     Most commonly a guest that crashed mid-boot or a
+                //     workload that never reached the host-comms phase.
+                //     This is the lone `warn`.
+                //   * `0/N` with an anchor available (primary OR the
+                //     `watchdog_reset` fallback) but no boundary
+                //     reached — a very-short run or a kill before the
+                //     first boundary. Same best-effort contract.
                 if freeze_coord_num_snapshots > 0 {
                     let scenario_anchor =
                         scenario_start_ns_for_coord.load(Ordering::Acquire);
-                    if scenario_anchor == 0 {
-                        tracing::warn!(
-                            target: "ktstr::failure_dump",
-                            num_snapshots = freeze_coord_num_snapshots,
-                            fired = next_periodic_idx,
-                            "freeze-coord: 0/{} periodic snapshots fired — \
-                             scenario_start_ns never stamped (no CRC-valid \
-                             MSG_TYPE_SCENARIO_START observed). The guest most \
-                             likely crashed mid-boot or never reached the \
-                             host-comms phase; periodic sampling has no anchor",
-                            freeze_coord_num_snapshots,
-                        );
-                    } else {
+                    // The periodic pipeline anchors on `scenario_start_ns`
+                    // when a CRC-valid MSG_TYPE_SCENARIO_START was observed,
+                    // else on the `watchdog_reset`-derived fallback (the
+                    // observed scheduler-attach time). A non-zero
+                    // `watchdog_reset` means that fallback anchor was
+                    // derivable, so the summary must NOT report
+                    // "scenario_start_ns never stamped → no anchor" for a run
+                    // that actually anchored (and fired) via the fallback.
+                    let fallback_anchor =
+                        watchdog_reset_for_coord.load(Ordering::Acquire);
+                    if next_periodic_idx > 0 {
+                        // Snapshots demonstrably fired, so an anchor existed.
+                        // When the primary anchor was never stamped the
+                        // fallback (the only other source) supplied it — say
+                        // so rather than implying the primary path.
                         tracing::info!(
                             target: "ktstr::failure_dump",
                             num_snapshots = freeze_coord_num_snapshots,
                             fired = next_periodic_idx,
                             scenario_anchor_ns = scenario_anchor,
-                            "freeze-coord: {}/{} periodic snapshots fired",
+                            fallback_anchor_ns = fallback_anchor,
+                            "freeze-coord: {}/{} periodic snapshots fired{}",
                             next_periodic_idx,
+                            freeze_coord_num_snapshots,
+                            if scenario_anchor == 0 {
+                                " (anchored via the watchdog_reset fallback; \
+                                 scenario_start_ns was never stamped)"
+                            } else {
+                                ""
+                            },
+                        );
+                    } else if scenario_anchor == 0 && fallback_anchor == 0 {
+                        // No anchor from EITHER source: periodic sampling
+                        // never had a reference point. The guest most likely
+                        // crashed mid-boot or never reached the host-comms
+                        // phase.
+                        tracing::warn!(
+                            target: "ktstr::failure_dump",
+                            num_snapshots = freeze_coord_num_snapshots,
+                            fired = next_periodic_idx,
+                            "freeze-coord: 0/{} periodic snapshots fired — \
+                             neither scenario_start_ns (no CRC-valid \
+                             MSG_TYPE_SCENARIO_START observed) nor the \
+                             watchdog_reset fallback supplied an anchor; the \
+                             guest most likely crashed mid-boot or never \
+                             reached the host-comms phase",
+                            freeze_coord_num_snapshots,
+                        );
+                    } else {
+                        // An anchor was available (primary or fallback) but no
+                        // boundary was reached — a very short run or a kill
+                        // before the first boundary. Best-effort contract:
+                        // tests assert `>=` a lower bound, not
+                        // `== num_snapshots`.
+                        tracing::info!(
+                            target: "ktstr::failure_dump",
+                            num_snapshots = freeze_coord_num_snapshots,
+                            fired = next_periodic_idx,
+                            scenario_anchor_ns = scenario_anchor,
+                            fallback_anchor_ns = fallback_anchor,
+                            "freeze-coord: 0/{} periodic snapshots fired — an \
+                             anchor was available but no boundary was reached \
+                             (short run or kill before the first boundary)",
                             freeze_coord_num_snapshots,
                         );
                     }

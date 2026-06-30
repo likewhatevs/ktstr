@@ -329,7 +329,7 @@ cumulative worker iteration counts.
 <summary><b>Periodic capture + temporal assertions</b> — cadenced sampling across the workload window with monotonicity, rate, steady-state, convergence, and ratio patterns</summary>
 
 `#[ktstr_test(num_snapshots = N)]` fires `N` host-side
-`freeze_and_capture` boundaries inside the workload's 10 %–90 %
+`freeze_and_dispatch` boundaries inside the workload's 10 %–90 %
 window, anchored at the first `MSG_TYPE_SCENARIO_START`. Each
 capture is stored on the `SnapshotBridge` under `periodic_NNN`
 along with the parallel scx_stats JSON observed pre-freeze and a

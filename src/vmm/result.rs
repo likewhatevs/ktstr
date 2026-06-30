@@ -1493,7 +1493,7 @@ pub(crate) struct VmRunState {
     /// [`crate::vmm::wire::MSG_TYPE_SNAPSHOT_REQUEST`] frame the
     /// coordinator's TOKEN_TX handler decoded with kind
     /// [`crate::vmm::wire::SNAPSHOT_KIND_CAPTURE`], the dispatch runs
-    /// `freeze_and_capture(false)` and stores the resulting
+    /// `freeze_and_dispatch(FreezeMode::Capture { gate_on_exit_kind: false })` and stores the resulting
     /// `FailureDumpReport` here keyed by the snapshot name. After
     /// VM exit, [`super::KtstrVm::collect_results`] forwards the
     /// bridge onto [`VmResult::snapshot_bridge`] so the test code

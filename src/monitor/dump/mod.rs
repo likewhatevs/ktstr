@@ -674,7 +674,7 @@ pub const REASON_DEGRADED_KILL_DURING_RENDEZVOUS: &str =
     "vCPU rendezvous aborted by external kill before parked acknowledgement";
 
 /// Snapshot tag used when the early-snapshot trigger fires but
-/// `freeze_and_capture(false)` returns `Degraded` (early-half
+/// `freeze_and_dispatch(FreezeMode::Capture { gate_on_exit_kind: false })` returns `Degraded` (early-half
 /// rendezvous timeout). The freeze coordinator writes the degraded
 /// JSON to a sibling path named via
 /// `super::super::vmm::freeze_coord::snapshot_tagged_path` using

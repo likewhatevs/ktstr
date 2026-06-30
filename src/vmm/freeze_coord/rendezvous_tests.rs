@@ -41,7 +41,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Mirror of the production `expected_parks` arithmetic at the
-/// top of the rendezvous wait (in `freeze_and_capture`). Pure
+/// top of the rendezvous wait (in `freeze_and_dispatch`). Pure
 /// function of the three inputs; the production line is:
 ///
 /// ```ignore

@@ -64,7 +64,7 @@
 //!    raises the eventfd; the vCPU thread does NOT exit to
 //!    userspace for the doorbell write itself.
 //! 3. The freeze coordinator wakes on `eventfd_signal`, reads the
-//!    tag from the slot, runs `freeze_and_capture`, builds the
+//!    tag from the slot, runs `freeze_and_dispatch`, builds the
 //!    `crate::monitor::dump::FailureDumpReport`, and stores it on the bridge keyed by
 //!    that tag. Reply to the guest is implicit — the
 //!    [`SnapshotBridge::capture`] callback installed in the

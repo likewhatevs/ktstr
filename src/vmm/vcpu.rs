@@ -73,7 +73,7 @@ use crate::sync::Latch;
 ///
 /// Without these gates, an AP-thread panic-unwind during the
 /// coordinator's lifetime can produce a UAF when the coordinator's
-/// `freeze_and_capture` pass-1 loop or `arm_user_watchpoint` writes
+/// `freeze_and_dispatch` pass-1 loop or `arm_user_watchpoint` writes
 /// through a freed `kvm_run` page.
 #[derive(Clone, Copy)]
 pub(crate) struct ImmediateExitHandle {
@@ -770,7 +770,7 @@ pub(crate) struct WatchpointSlot {
     /// wvr_base + 4)` of an armed slot on aarch64). The freeze
     /// coordinator's epoll loop polls all three `hit` flags with
     /// Acquire on each `WATCHPOINT` token wake, runs
-    /// `freeze_and_capture(false)` on any trip, and stores the
+    /// `freeze_and_dispatch(FreezeMode::Capture { gate_on_exit_kind: false })` on any trip, and stores the
     /// report under the registered tag in the bridge.
     pub(crate) hit: AtomicBool,
     /// Snapshot tag the bridge stores the captured report under.

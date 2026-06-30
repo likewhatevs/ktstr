@@ -28,7 +28,7 @@ The full pipeline is implemented and tested end-to-end:
    via `KVM_SET_GUEST_DEBUG`.
 3. When the guest writes to the watched address, the corresponding
    debug exit fires and the host identifies which slot tripped.
-4. The coordinator captures via `freeze_and_capture` and stores
+4. The coordinator captures via `freeze_and_dispatch` and stores
    the report in the `SnapshotBridge` under the symbol tag.
 5. The report is also mirrored to a sidecar JSON file for
    post-hoc inspection.

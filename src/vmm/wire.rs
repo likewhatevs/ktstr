@@ -219,7 +219,7 @@ pub enum MsgType {
     /// promotes a CRC-valid SYS_RDY frame into the monitor's
     /// boot-complete eventfd, so the monitor's pre-sample
     /// `epoll_wait` returns within microseconds rather than
-    /// waiting for the 30 s fallback timeout. Replaces an earlier
+    /// waiting for the 5 s fallback timeout. Replaces an earlier
     /// trigger that fired on the first port-0 TX byte (kernel
     /// printk via `/dev/hvc0`), which depended on incidental
     /// console traffic rather than an explicit readiness signal.
@@ -913,7 +913,7 @@ pub const SNAPSHOT_REASON_MAX: usize = 512;
 pub const SNAPSHOT_KIND_NONE: u32 = 0;
 
 /// Snapshot request kind: capture-now. The host runs
-/// `freeze_and_capture(false)` and stores the resulting
+/// `freeze_and_dispatch(FreezeMode::Capture { gate_on_exit_kind: false })` and stores the resulting
 /// `FailureDumpReport` on the bridge keyed by the request tag.
 pub const SNAPSHOT_KIND_CAPTURE: u32 = 1;
 

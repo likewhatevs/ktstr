@@ -364,10 +364,12 @@ pub(super) fn resolve_periodic_window(
 /// They match only when no scheduler swap has occurred since the last republish.
 ///
 /// When false, the periodic boundary MUST defer: `owned_accessor` is bound to
-/// the prior scheduler's BPF object, whose `.bss` page the kernel RCU-frees
-/// via the BPF object teardown that scheduler disable (`scx_root_disable`,
-/// kernel/sched/ext.c) drives — a capture through it reads a
-/// recycled/zeroed page, surfacing a silent `nr_dispatched=0`. The watchpoint
+/// the prior scheduler's BPF object, so a capture reads the PRIOR scheduler's
+/// `.bss` (its counters), not the live one's; and once the prior BPF object's
+/// maps are released (map refcount -> 0 on scheduler-process exit / fd close —
+/// NOT synchronously by `scx_root_disable`, which only unlinks the `scx_sched`
+/// and NULLs `*scx_root`), that `.bss` page is recycled/zeroed, surfacing a
+/// silent `nr_dispatched=0`. The watchpoint
 /// poll (≤ `SCAN_INTERVAL`) re-resolves the accessor for the live scheduler and
 /// the next boundary passes. A zero `live_sched_kva` (detached) also defers —
 /// there is no scheduler to capture. Pure helper so the

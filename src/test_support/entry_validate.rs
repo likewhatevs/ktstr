@@ -283,7 +283,7 @@ impl crate::test_support::KtstrTestEntry {
             // host_only skips the VM boot that owns the freeze
             // coordinator's run-loop. Without that loop there is no
             // thread to stamp `scenario_start_ns`, no thread to fire
-            // `freeze_and_capture(false)` at each boundary, and no
+            // `freeze_and_dispatch(FreezeMode::Capture { gate_on_exit_kind: false })` at each boundary, and no
             // `SnapshotBridge` plumbed onto a `VmResult` for the
             // test author to drain post-run. The combination is
             // unsatisfiable; reject at validate time so a

@@ -1076,7 +1076,7 @@ fn apply_watch_snapshot(symbol: &str) -> Result<()> {
         //      exit; the vCPU dispatcher identifies the
         //      slot and latches `WatchpointSlot::hit`. The
         //      coordinator then runs
-        //      `freeze_and_capture(false)` and stores the
+        //      `freeze_and_dispatch(FreezeMode::Capture { gate_on_exit_kind: false })` and stores the
         //      report on the bridge keyed by the symbol.
         let registered =
             crate::scenario::snapshot::with_active_bridge(|b| b.register_watch(symbol));

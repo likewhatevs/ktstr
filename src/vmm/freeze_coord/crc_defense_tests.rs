@@ -12,7 +12,7 @@
 //!   * `MSG_TYPE_SNAPSHOT_REQUEST && crc_ok &&
 //!     decode_snapshot_request(payload).is_some()` — pushes the
 //!     decoded request onto the per-iteration pending list for
-//!     dispatch to `freeze_and_capture` / `arm_user_watchpoint`.
+//!     dispatch to `freeze_and_dispatch` / `arm_user_watchpoint`.
 //!     CRC failures must NOT decode — a torn snapshot request would
 //!     otherwise let a hostile guest force a spurious capture or
 //!     watchpoint arm.
@@ -319,7 +319,7 @@ fn sched_exit_torn_crc_does_not_promote_when_other_valid_frames_present() {
 /// CRC-failed SNAPSHOT_REQUEST MUST be dropped before
 /// `decode_snapshot_request` runs. A torn or hostile-guest snapshot
 /// request would otherwise let an attacker force a spurious
-/// `freeze_and_capture` (host-side stall, dump allocation) or
+/// `freeze_and_dispatch` (host-side stall, dump allocation) or
 /// `arm_user_watchpoint` (DR slot consumption, `KVM_SET_GUEST_DEBUG`
 /// reprogram) without ever generating a matching CRC.
 #[test]
