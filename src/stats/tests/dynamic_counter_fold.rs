@@ -90,7 +90,10 @@ fn gauntlet_row_ext_counter_keys_serde() {
     let mut r = make_row("t", "tiny-1llc", true, 0.0);
     r.ext_counter_keys.insert("lb_count_mc".into());
     let json = serde_json::to_string(&r).unwrap();
-    assert!(json.contains("ext_counter_keys"), "populated set is serialized");
+    assert!(
+        json.contains("ext_counter_keys"),
+        "populated set is serialized"
+    );
     let back: GauntletRow = serde_json::from_str(&json).unwrap();
     assert!(back.ext_counter_keys.contains("lb_count_mc"));
     // Empty set: omitted on serialize, defaults to empty on deserialize.
@@ -101,5 +104,8 @@ fn gauntlet_row_ext_counter_keys_serde() {
         "empty set is omitted (skip_serializing_if)"
     );
     let back_empty: GauntletRow = serde_json::from_str(&json_empty).unwrap();
-    assert!(back_empty.ext_counter_keys.is_empty(), "absent field -> empty set");
+    assert!(
+        back_empty.ext_counter_keys.is_empty(),
+        "absent field -> empty set"
+    );
 }

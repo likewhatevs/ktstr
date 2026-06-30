@@ -1568,7 +1568,8 @@ fn dispatch_io_out(
             return false;
         }
         if (PCI_CONFIG_DATA..PCI_CONFIG_DATA + 4).contains(&port) {
-            bus.lock().cam_data_write((port - PCI_CONFIG_DATA) as u8, data);
+            bus.lock()
+                .cam_data_write((port - PCI_CONFIG_DATA) as u8, data);
             return false;
         }
     }
@@ -1607,7 +1608,8 @@ fn dispatch_io_in(
             return;
         }
         if (PCI_CONFIG_DATA..PCI_CONFIG_DATA + 4).contains(&port) {
-            bus.lock().cam_data_read((port - PCI_CONFIG_DATA) as u8, data);
+            bus.lock()
+                .cam_data_read((port - PCI_CONFIG_DATA) as u8, data);
             return;
         }
     }

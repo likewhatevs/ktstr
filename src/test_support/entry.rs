@@ -2329,10 +2329,7 @@ impl KtstrTestEntry {
     /// is rejected because host-only skips the VM boot that owns the
     /// virtio-net devices.
     #[must_use = "builder methods consume self; bind the result"]
-    pub fn with_networks(
-        mut self,
-        networks: &'static [crate::vmm::net_config::NetConfig],
-    ) -> Self {
+    pub fn with_networks(mut self, networks: &'static [crate::vmm::net_config::NetConfig]) -> Self {
         self.networks = networks;
         self
     }
@@ -5764,10 +5761,22 @@ mod tests {
             crate::vmm::net_config::NetConfig::DEFAULT.mac(MAC0),
             crate::vmm::net_config::NetConfig::DEFAULT.mac(MAC1),
         ];
-        let entry = KtstrTestEntry::DEFAULT.with_name("net_setter").with_networks(NETS);
-        assert_eq!(entry.networks.len(), 2, "with_networks must store every NIC");
-        assert_eq!(entry.networks[0].mac, MAC0, "first NIC carries MAC0 in order");
-        assert_eq!(entry.networks[1].mac, MAC1, "second NIC carries MAC1 in order");
+        let entry = KtstrTestEntry::DEFAULT
+            .with_name("net_setter")
+            .with_networks(NETS);
+        assert_eq!(
+            entry.networks.len(),
+            2,
+            "with_networks must store every NIC"
+        );
+        assert_eq!(
+            entry.networks[0].mac, MAC0,
+            "first NIC carries MAC0 in order"
+        );
+        assert_eq!(
+            entry.networks[1].mac, MAC1,
+            "second NIC carries MAC1 in order"
+        );
         assert!(
             KtstrTestEntry::DEFAULT.networks.is_empty(),
             "DEFAULT must boot without a NIC; with_networks is the only mutator here"
@@ -5803,14 +5812,20 @@ mod tests {
             .with_networks(NET)
             .without_disk();
         assert!(e1.disk.is_none(), "without_disk must clear disk");
-        assert!(!e1.networks.is_empty(), "without_disk must NOT clear networks");
+        assert!(
+            !e1.networks.is_empty(),
+            "without_disk must NOT clear networks"
+        );
         // Clear networks only: disk must survive.
         let e2 = KtstrTestEntry::DEFAULT
             .with_name("indep_net")
             .with_disk(crate::vmm::disk_config::DiskConfig::DEFAULT.capacity_mib(512))
             .with_networks(NET)
             .without_networks();
-        assert!(e2.networks.is_empty(), "without_networks must clear networks");
+        assert!(
+            e2.networks.is_empty(),
+            "without_networks must clear networks"
+        );
         assert!(e2.disk.is_some(), "without_networks must NOT clear disk");
     }
 

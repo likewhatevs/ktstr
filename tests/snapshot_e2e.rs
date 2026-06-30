@@ -248,9 +248,8 @@ fn watch_snapshot_op_max_3_per_scenario_errors_fourth() {
 #[test]
 fn watch_snapshot_op_unresolvable_symbol_bails_immediately() {
     let cb: CaptureCallback = Arc::new(|_| Some(FailureDumpReport::default()));
-    let reg: WatchRegisterCallback = Arc::new(|symbol: &str| {
-        Err(format!("symbol '{symbol}' not found in vmlinux ELF symtab"))
-    });
+    let reg: WatchRegisterCallback =
+        Arc::new(|symbol: &str| Err(format!("symbol '{symbol}' not found in vmlinux ELF symtab")));
     let bridge = SnapshotBridge::new(cb).with_watch_register(reg);
     let _g = bridge.set_thread_local();
 

@@ -909,8 +909,8 @@ impl KtstrVm {
                 })?;
             None
         } else {
-            let evt = EventFd::new(libc::EFD_NONBLOCK)
-                .context("create virtio-blk resample eventfd")?;
+            let evt =
+                EventFd::new(libc::EFD_NONBLOCK).context("create virtio-blk resample eventfd")?;
             vm.vm_fd
                 .register_irqfd_with_resample(blk_arc.lock().irq_evt(), &evt, gsi)
                 .with_context(|| {

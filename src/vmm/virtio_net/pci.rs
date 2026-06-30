@@ -66,13 +66,13 @@ use std::sync::Arc;
 use virtio_bindings::virtio_mmio::{VIRTIO_MMIO_INT_CONFIG, VIRTIO_MMIO_INT_VRING};
 
 use super::device::{NUM_QUEUES, VirtioNet};
-use crate::vmm::virtio_msix::{MSIX_TABLE_MAX, MsixRouteSink, MsixState, NO_VECTOR};
 use crate::vmm::PiMutex;
 use crate::vmm::pci::{
-    ConfigSpace, PCI_COMMAND_MEMORY, PCI_COMMAND_WMASK, PCI_STATUS_CAP_LIST, PciFunction,
-    REG_BAR0, REG_CAP_PTR, REG_CLASS, REG_COMMAND, REG_DEVICE_ID, REG_INTERRUPT_LINE,
-    REG_INTERRUPT_PIN, REG_REVISION_ID, REG_STATUS, REG_SUBCLASS, REG_VENDOR_ID,
+    ConfigSpace, PCI_COMMAND_MEMORY, PCI_COMMAND_WMASK, PCI_STATUS_CAP_LIST, PciFunction, REG_BAR0,
+    REG_CAP_PTR, REG_CLASS, REG_COMMAND, REG_DEVICE_ID, REG_INTERRUPT_LINE, REG_INTERRUPT_PIN,
+    REG_REVISION_ID, REG_STATUS, REG_SUBCLASS, REG_VENDOR_ID,
 };
+use crate::vmm::virtio_msix::{MSIX_TABLE_MAX, MsixRouteSink, MsixState, NO_VECTOR};
 
 // ---- PCI identity (virtio-pci modern, virtio-v1.2 §4.1.2) ----
 /// Red Hat / virtio vendor id.
@@ -441,7 +441,10 @@ impl VirtioNetPci {
         cfg.set_u8(CAP_MSIX + 1, 0);
         cfg.set_u16(CAP_MSIX + MSIX_OFF_MSG_CTRL, table_size - 1);
         cfg.set_wmask_u16(CAP_MSIX + MSIX_OFF_MSG_CTRL, MSIX_MSG_CTRL_WMASK);
-        cfg.set_u32(CAP_MSIX + MSIX_OFF_TABLE, MSIX_TABLE_OFFSET as u32 | MSIX_BIR0);
+        cfg.set_u32(
+            CAP_MSIX + MSIX_OFF_TABLE,
+            MSIX_TABLE_OFFSET as u32 | MSIX_BIR0,
+        );
         cfg.set_u32(CAP_MSIX + MSIX_OFF_PBA, MSIX_PBA_OFFSET as u32 | MSIX_BIR0);
     }
 
@@ -626,7 +629,8 @@ impl VirtioNetPci {
         if isr & VIRTIO_MMIO_INT_CONFIG != 0 {
             byte |= 0x2;
         }
-        self.net.ack_interrupt(VIRTIO_MMIO_INT_VRING | VIRTIO_MMIO_INT_CONFIG);
+        self.net
+            .ack_interrupt(VIRTIO_MMIO_INT_VRING | VIRTIO_MMIO_INT_CONFIG);
         data.fill(0);
         if let Some(b) = data.first_mut() {
             *b = byte;
@@ -1014,7 +1018,12 @@ mod tests {
         VirtioNetPci::new(net, TEST_BAR_APERTURE, msix, Some(sink), test_gsis())
     }
 
-    fn build(mem: &GuestMemoryMmap) -> (VirtioNetPci, std::sync::Arc<super::super::VirtioNetCounters>) {
+    fn build(
+        mem: &GuestMemoryMmap,
+    ) -> (
+        VirtioNetPci,
+        std::sync::Arc<super::super::VirtioNetCounters>,
+    ) {
         let mut net = VirtioNet::new(NetConfig::default());
         net.set_mem(mem.clone());
         let counters = net.counters();
@@ -1113,16 +1122,44 @@ mod tests {
         // NOTIFY->MSIX->0 (MSI-X is the new last cap; its layout is checked below
         // — it is not a virtio vendor cap so it is not in this loop).
         let chain = [
-            (CAP_COMMON, CAP_ISR as u8, CFG_TYPE_COMMON, CAP_LEN_STD, COMMON_OFFSET),
-            (CAP_ISR, CAP_DEVICE as u8, CFG_TYPE_ISR, CAP_LEN_STD, ISR_OFFSET),
-            (CAP_DEVICE, CAP_NOTIFY as u8, CFG_TYPE_DEVICE, CAP_LEN_STD, DEVICE_OFFSET),
-            (CAP_NOTIFY, CAP_MSIX as u8, CFG_TYPE_NOTIFY, CAP_LEN_NOTIFY, NOTIFY_OFFSET),
+            (
+                CAP_COMMON,
+                CAP_ISR as u8,
+                CFG_TYPE_COMMON,
+                CAP_LEN_STD,
+                COMMON_OFFSET,
+            ),
+            (
+                CAP_ISR,
+                CAP_DEVICE as u8,
+                CFG_TYPE_ISR,
+                CAP_LEN_STD,
+                ISR_OFFSET,
+            ),
+            (
+                CAP_DEVICE,
+                CAP_NOTIFY as u8,
+                CFG_TYPE_DEVICE,
+                CAP_LEN_STD,
+                DEVICE_OFFSET,
+            ),
+            (
+                CAP_NOTIFY,
+                CAP_MSIX as u8,
+                CFG_TYPE_NOTIFY,
+                CAP_LEN_NOTIFY,
+                NOTIFY_OFFSET,
+            ),
         ];
         for (at, next, cfg_type, len, region_off) in chain {
             assert_eq!(cfg8(&pci, at + CAP_OFF_VNDR), CAP_VNDR, "cap@{at:#x} vndr");
             assert_eq!(cfg8(&pci, at + CAP_OFF_NEXT), next, "cap@{at:#x} next");
             assert_eq!(cfg8(&pci, at + CAP_OFF_LEN), len, "cap@{at:#x} len");
-            assert_eq!(cfg8(&pci, at + CAP_OFF_CFG_TYPE), cfg_type, "cap@{at:#x} cfg_type");
+            assert_eq!(
+                cfg8(&pci, at + CAP_OFF_CFG_TYPE),
+                cfg_type,
+                "cap@{at:#x} cfg_type"
+            );
             assert_eq!(cfg8(&pci, at + CAP_OFF_BAR), 0, "cap@{at:#x} bar");
             assert_eq!(
                 cfg32(&pci, at + CAP_OFF_OFFSET),
@@ -1231,7 +1268,11 @@ mod tests {
         pci.bar_write(MSIX_PBA_OFFSET, &0xFFu32.to_le_bytes());
         let mut b = [0u8; 4];
         pci.bar_read(MSIX_PBA_OFFSET, &mut b);
-        assert_eq!(u32::from_le_bytes(b), 0, "PBA reads 0 (no pending); write ignored");
+        assert_eq!(
+            u32::from_le_bytes(b),
+            0,
+            "PBA reads 0 (no pending); write ignored"
+        );
     }
 
     // ---- MSI-X delivery (route install + fire/pend/replay through the facade) ----
@@ -1299,7 +1340,10 @@ mod tests {
         cc_w(pci, CC_QUEUE_MSIX_VECTOR, 1);
         cc_w(pci, CC_QUEUE_SELECT, TXQ as u32);
         cc_w(pci, CC_QUEUE_MSIX_VECTOR, 2);
-        pci.config_write(CAP_MSIX + MSIX_OFF_MSG_CTRL, &MC_ENABLE_MASKALL.to_le_bytes());
+        pci.config_write(
+            CAP_MSIX + MSIX_OFF_MSG_CTRL,
+            &MC_ENABLE_MASKALL.to_le_bytes(),
+        );
         program_msix_entries(pci, SINGLE_PAIR_VECTORS);
         // Clear MASKALL → function-unmask edge installs every unmasked vector.
         pci.config_write(CAP_MSIX + MSIX_OFF_MSG_CTRL, &MC_ENABLE.to_le_bytes());
@@ -1315,7 +1359,10 @@ mod tests {
             cc_w(pci, CC_QUEUE_SELECT, q as u32);
             cc_w(pci, CC_QUEUE_MSIX_VECTOR, 1);
         }
-        pci.config_write(CAP_MSIX + MSIX_OFF_MSG_CTRL, &MC_ENABLE_MASKALL.to_le_bytes());
+        pci.config_write(
+            CAP_MSIX + MSIX_OFF_MSG_CTRL,
+            &MC_ENABLE_MASKALL.to_le_bytes(),
+        );
         program_msix_entries(pci, 2);
         pci.config_write(CAP_MSIX + MSIX_OFF_MSG_CTRL, &MC_ENABLE.to_le_bytes());
     }
@@ -1367,7 +1414,10 @@ mod tests {
         // RX vq → its OWN vector 1; TX vq → its OWN DISTINCT vector 2.
         assert_eq!(evts[1].read().unwrap(), 1, "RX queue vector 1 fired once");
         assert_eq!(evts[2].read().unwrap(), 1, "TX queue vector 2 fired once");
-        assert!(evts[0].read().is_err(), "config vector 0 untouched (EAGAIN)");
+        assert!(
+            evts[0].read().is_err(),
+            "config vector 0 untouched (EAGAIN)"
+        );
         // MSI-X mode does NOT touch the INTx ISR (the kernel's per-vector handlers
         // never read it).
         let mut isr = [0xFFu8; 1];
@@ -1381,7 +1431,11 @@ mod tests {
                 "vector route installed at GSI {gsi}"
             );
         }
-        assert_eq!(msix.lock().pba_byte(0), 0, "delivered live, nothing pending");
+        assert_eq!(
+            msix.lock().pba_byte(0),
+            0,
+            "delivered live, nothing pending"
+        );
     }
 
     /// SHARED fallback: when the guest maps every queue to one vector, a TX
@@ -1403,9 +1457,20 @@ mod tests {
         assert_eq!(counters.tx_packets(), 1, "TX drained");
         assert_eq!(counters.rx_packets(), 1, "RX loopback delivered");
         // Both queues map to vector 1 → it fires twice (RX-used + TX-used).
-        assert_eq!(evts[1].read().unwrap(), 2, "shared queue vector fired per queue");
-        assert!(evts[0].read().is_err(), "config vector 0 untouched (EAGAIN)");
-        assert_eq!(msix.lock().pba_byte(0), 0, "delivered live, nothing pending");
+        assert_eq!(
+            evts[1].read().unwrap(),
+            2,
+            "shared queue vector fired per queue"
+        );
+        assert!(
+            evts[0].read().is_err(),
+            "config vector 0 untouched (EAGAIN)"
+        );
+        assert_eq!(
+            msix.lock().pba_byte(0),
+            0,
+            "delivered live, nothing pending"
+        );
     }
 
     /// A VRING interrupt to a MASKED vector records a PBA bit (no eventfd write);
@@ -1420,11 +1485,17 @@ mod tests {
         enable_msix_each(&mut pci);
         cc_w(&mut pci, CC_DEVICE_STATUS, S_OK);
         // Re-mask the RX queue vector (table entry 1, vector control bit0 = 1).
-        pci.bar_write(MSIX_TABLE_OFFSET + MSIX_ENTRY_SIZE + 12, &1u32.to_le_bytes());
+        pci.bar_write(
+            MSIX_TABLE_OFFSET + MSIX_ENTRY_SIZE + 12,
+            &1u32.to_le_bytes(),
+        );
 
         kick_tx_loopback(&mut pci, &mem, &[0x5Au8; 20]);
 
-        assert!(evts[1].read().is_err(), "masked RX vector did not fire (EAGAIN)");
+        assert!(
+            evts[1].read().is_err(),
+            "masked RX vector did not fire (EAGAIN)"
+        );
         assert_eq!(
             msix.lock().pba_byte(0) & (1 << 1),
             1 << 1,
@@ -1433,8 +1504,15 @@ mod tests {
         // The TX vector (entry 2, unmasked) still delivered live.
         assert_eq!(evts[2].read().unwrap(), 1, "TX vector delivered live");
         // Unmask → the facade replays the pending interrupt once.
-        pci.bar_write(MSIX_TABLE_OFFSET + MSIX_ENTRY_SIZE + 12, &0u32.to_le_bytes());
-        assert_eq!(evts[1].read().unwrap(), 1, "unmask replays the pending interrupt");
+        pci.bar_write(
+            MSIX_TABLE_OFFSET + MSIX_ENTRY_SIZE + 12,
+            &0u32.to_le_bytes(),
+        );
+        assert_eq!(
+            evts[1].read().unwrap(),
+            1,
+            "unmask replays the pending interrupt"
+        );
         assert_eq!(
             msix.lock().pba_byte(0) & (1 << 1),
             0,
@@ -1459,13 +1537,22 @@ mod tests {
         enable_msix_each(&mut pci);
         cc_w(&mut pci, CC_DEVICE_STATUS, S_OK);
         // Set MASKALL (Function Mask) — every vector now masked at the device.
-        pci.config_write(CAP_MSIX + MSIX_OFF_MSG_CTRL, &MC_ENABLE_MASKALL.to_le_bytes());
+        pci.config_write(
+            CAP_MSIX + MSIX_OFF_MSG_CTRL,
+            &MC_ENABLE_MASKALL.to_le_bytes(),
+        );
 
         kick_tx_loopback(&mut pci, &mem, &[0x33u8; 24]);
 
         // Both queue vectors (RX→1, TX→2) recorded a PBA bit; neither fired.
-        assert!(evts[1].read().is_err(), "RX vector masked by MASKALL (EAGAIN)");
-        assert!(evts[2].read().is_err(), "TX vector masked by MASKALL (EAGAIN)");
+        assert!(
+            evts[1].read().is_err(),
+            "RX vector masked by MASKALL (EAGAIN)"
+        );
+        assert!(
+            evts[2].read().is_err(),
+            "TX vector masked by MASKALL (EAGAIN)"
+        );
         assert_eq!(
             msix.lock().pba_byte(0) & ((1 << 1) | (1 << 2)),
             (1 << 1) | (1 << 2),
@@ -1473,8 +1560,16 @@ mod tests {
         );
         // Clear MASKALL → function-unmask edge replays every pending vector once.
         pci.config_write(CAP_MSIX + MSIX_OFF_MSG_CTRL, &MC_ENABLE.to_le_bytes());
-        assert_eq!(evts[1].read().unwrap(), 1, "RX vector replayed on MASKALL clear");
-        assert_eq!(evts[2].read().unwrap(), 1, "TX vector replayed on MASKALL clear");
+        assert_eq!(
+            evts[1].read().unwrap(),
+            1,
+            "RX vector replayed on MASKALL clear"
+        );
+        assert_eq!(
+            evts[2].read().unwrap(),
+            1,
+            "TX vector replayed on MASKALL clear"
+        );
         assert_eq!(
             msix.lock().pba_byte(0) & ((1 << 1) | (1 << 2)),
             0,
@@ -1538,7 +1633,11 @@ mod tests {
             &[0u8; 2],
         );
 
-        assert_eq!(evts[0].read().unwrap(), 1, "poison delivered to config vector 0");
+        assert_eq!(
+            evts[0].read().unwrap(),
+            1,
+            "poison delivered to config vector 0"
+        );
         assert!(
             evts[1].read().is_err(),
             "RX queue vector 1 not fired by a config-change/poison"
@@ -1581,8 +1680,16 @@ mod tests {
             NO_VECTOR,
             "reset restores config vector to NO_VECTOR"
         );
-        assert_eq!(msix.lock().queue_vector(RXQ), NO_VECTOR, "reset restores RX vector");
-        assert_eq!(msix.lock().queue_vector(TXQ), NO_VECTOR, "reset restores TX vector");
+        assert_eq!(
+            msix.lock().queue_vector(RXQ),
+            NO_VECTOR,
+            "reset restores RX vector"
+        );
+        assert_eq!(
+            msix.lock().queue_vector(TXQ),
+            NO_VECTOR,
+            "reset restores TX vector"
+        );
     }
 
     /// Routes install on the FUNCTION-unmask (MASKALL-clear) edge: enable with
@@ -1605,10 +1712,18 @@ mod tests {
         cc_w(&mut pci, CC_QUEUE_SELECT, TXQ as u32);
         cc_w(&mut pci, CC_QUEUE_MSIX_VECTOR, 2);
         // Enable + MASKALL, then program + per-vector unmask — all function-masked.
-        pci.config_write(CAP_MSIX + MSIX_OFF_MSG_CTRL, &MC_ENABLE_MASKALL.to_le_bytes());
+        pci.config_write(
+            CAP_MSIX + MSIX_OFF_MSG_CTRL,
+            &MC_ENABLE_MASKALL.to_le_bytes(),
+        );
         program_msix_entries(&mut pci, SINGLE_PAIR_VECTORS);
         assert!(
-            !sink.installs.lock().unwrap().iter().any(|(_, m)| m.is_some()),
+            !sink
+                .installs
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, m)| m.is_some()),
             "no route installed while function-masked (MASKALL set)"
         );
         // Clear MASKALL → function-unmask edge installs every unmasked vector.
@@ -1637,14 +1752,25 @@ mod tests {
         enable_msix_each(&mut pci);
         // The RX queue vector (table entry 1) is installed at GSI 25 after enable.
         assert!(
-            sink.installs.lock().unwrap().iter().any(|(g, m)| *g == 25 && m.is_some()),
+            sink.installs
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(g, m)| *g == 25 && m.is_some()),
             "RX queue vector route installed after enable"
         );
         // Re-mask the RX queue vector (entry 1, Vector Control bit0 = 1) → its KVM
         // route must be removed.
-        pci.bar_write(MSIX_TABLE_OFFSET + MSIX_ENTRY_SIZE + 12, &1u32.to_le_bytes());
+        pci.bar_write(
+            MSIX_TABLE_OFFSET + MSIX_ENTRY_SIZE + 12,
+            &1u32.to_le_bytes(),
+        );
         assert!(
-            sink.installs.lock().unwrap().iter().any(|(g, m)| *g == 25 && m.is_none()),
+            sink.installs
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(g, m)| *g == 25 && m.is_none()),
             "mask edge removes the queue vector's route via set_route(gsi, None)"
         );
     }
@@ -1657,7 +1783,11 @@ mod tests {
         assert_eq!(pci.bar_window(), None, "no window before BAR program");
         // BAR base set but COMMAND.MEMORY clear: still no window.
         pci.config_write(REG_BAR0, &0xe010_0000u32.to_le_bytes());
-        assert_eq!(pci.bar_window(), None, "no window until memory-space enabled");
+        assert_eq!(
+            pci.bar_window(),
+            None,
+            "no window until memory-space enabled"
+        );
         // COMMAND.MEMORY set but base zero: no window.
         let mut pci0 = build(&mem).0;
         pci0.config_write(REG_COMMAND, &PCI_COMMAND_MEMORY.to_le_bytes());
@@ -1762,7 +1892,10 @@ mod tests {
         // device_feature select+window: VERSION_1 in the high word, MAC in low.
         cc_w(&mut pci, CC_DEVICE_FEATURE_SELECT, 0);
         assert_eq!(cc_r(&mut pci, CC_DEVICE_FEATURE_SELECT), 0);
-        assert_ne!(cc_r(&mut pci, CC_DEVICE_FEATURE) & (1 << VIRTIO_NET_F_MAC), 0);
+        assert_ne!(
+            cc_r(&mut pci, CC_DEVICE_FEATURE) & (1 << VIRTIO_NET_F_MAC),
+            0
+        );
         cc_w(&mut pci, CC_DEVICE_FEATURE_SELECT, 1);
         assert_ne!(
             cc_r(&mut pci, CC_DEVICE_FEATURE) & (1 << (VIRTIO_F_VERSION_1 - 32)),
@@ -1791,7 +1924,11 @@ mod tests {
         // arm): driver_feature is write-only, and the guest owns the ring
         // addresses so the device never reflects them. Locks the read-0 contract
         // against a future match-arm edit that accidentally serves a stale value.
-        assert_eq!(cc_r(&mut pci, CC_DRIVER_FEATURE), 0, "driver_feature reads 0");
+        assert_eq!(
+            cc_r(&mut pci, CC_DRIVER_FEATURE),
+            0,
+            "driver_feature reads 0"
+        );
         assert_eq!(cc_r(&mut pci, CC_QUEUE_DESC_LO), 0, "queue_desc_lo reads 0");
         assert_eq!(cc_r(&mut pci, CC_QUEUE_DESC_HI), 0, "queue_desc_hi reads 0");
         // queue_select read-back, and queue_notify_off == queue_select.
@@ -1803,9 +1940,21 @@ mod tests {
         // bounds-checks before any indexed op), so a hostile latch reads defined
         // values and drives no op.
         cc_w(&mut pci, CC_QUEUE_SELECT, NUM_QUEUES as u32);
-        assert_eq!(cc_r(&mut pci, CC_QUEUE_SIZE), 0, "OOR selector: queue_size 0");
-        assert_eq!(cc_r(&mut pci, CC_QUEUE_ENABLE), 0, "OOR selector: queue_enable 0");
-        assert_eq!(cc_r(&mut pci, CC_QUEUE_NOTIFY_OFF), 0, "OOR selector: notify_off 0");
+        assert_eq!(
+            cc_r(&mut pci, CC_QUEUE_SIZE),
+            0,
+            "OOR selector: queue_size 0"
+        );
+        assert_eq!(
+            cc_r(&mut pci, CC_QUEUE_ENABLE),
+            0,
+            "OOR selector: queue_enable 0"
+        );
+        assert_eq!(
+            cc_r(&mut pci, CC_QUEUE_NOTIFY_OFF),
+            0,
+            "OOR selector: notify_off 0"
+        );
     }
 
     #[test]
@@ -1852,9 +2001,18 @@ mod tests {
         cc_w(&mut pci, CC_QUEUE_USED_LO, 0x0000_3000);
         cc_w(&mut pci, CC_QUEUE_USED_HI, 0x0000_0002);
         let (desc, avail, used) = pci.net.selected_queue_ring_addrs().unwrap();
-        assert_eq!(desc, 0x0000_ABCD_0000_1000, "DESC high dword in high 32 bits");
-        assert_eq!(avail, 0x0000_0001_0000_2000, "AVAIL high dword in high 32 bits");
-        assert_eq!(used, 0x0000_0002_0000_3000, "USED high dword in high 32 bits");
+        assert_eq!(
+            desc, 0x0000_ABCD_0000_1000,
+            "DESC high dword in high 32 bits"
+        );
+        assert_eq!(
+            avail, 0x0000_0001_0000_2000,
+            "AVAIL high dword in high 32 bits"
+        );
+        assert_eq!(
+            used, 0x0000_0002_0000_3000,
+            "USED high dword in high 32 bits"
+        );
     }
 
     #[test]
@@ -1870,7 +2028,10 @@ mod tests {
         assert_eq!(sb[0] as u32, S_FEAT & 0xFF);
         let mut generation = [0u8; 1];
         pci.bar_read(COMMON_OFFSET + CC_CONFIG_GENERATION, &mut generation);
-        assert_eq!(generation[0], 0, "config_generation reads 0 (no config change)");
+        assert_eq!(
+            generation[0], 0,
+            "config_generation reads 0 (no config change)"
+        );
     }
 
     #[test]
@@ -1956,7 +2117,8 @@ mod tests {
         assert_eq!(counters.rx_packets(), 1, "RX loopback delivered");
         // RX buffer holds the 12-byte header + echoed payload.
         let mut delivered = vec![0u8; VIRTIO_NET_HDR_LEN + payload.len()];
-        mem.read_slice(&mut delivered, GuestAddress(RX_BUF)).unwrap();
+        mem.read_slice(&mut delivered, GuestAddress(RX_BUF))
+            .unwrap();
         assert_eq!(&delivered[VIRTIO_NET_HDR_LEN..], payload.as_slice());
 
         // ISR reflects the queue interrupt (bit0) and is read-to-clear.
@@ -1991,7 +2153,10 @@ mod tests {
             NOTIFY_OFFSET + (TXQ as u64) * NOTIFY_OFF_MULTIPLIER as u64,
             &[0u8; 2],
         );
-        assert!(counters.tx_packets() >= 1, "TX drained, ISR should be pending");
+        assert!(
+            counters.tx_packets() >= 1,
+            "TX drained, ISR should be pending"
+        );
         // A non-base in-region read returns 0 and does NOT clear.
         let mut stray = [0xFFu8; 1];
         pci.bar_read(ISR_OFFSET + 4, &mut stray);
@@ -2037,8 +2202,11 @@ mod tests {
             write_desc(&mem, TX_DESC, round, tx_buf, total, 0, 0);
             write_desc(&mem, RX_DESC, round, rx_buf, 256, 2, 0);
             for avail in [TX_AVAIL, RX_AVAIL] {
-                mem.write_slice(&round.to_le_bytes(), GuestAddress(avail + 4 + (round as u64) * 2))
-                    .unwrap();
+                mem.write_slice(
+                    &round.to_le_bytes(),
+                    GuestAddress(avail + 4 + (round as u64) * 2),
+                )
+                .unwrap();
                 mem.write_slice(&(round + 1).to_le_bytes(), GuestAddress(avail + 2))
                     .unwrap();
             }
@@ -2050,13 +2218,25 @@ mod tests {
 
             let mut isr = [0u8; 1];
             pci.bar_read(ISR_OFFSET, &mut isr);
-            assert_eq!(isr[0] & 0x1, 0x1, "round {round}: VRING ISR bit set after kick");
+            assert_eq!(
+                isr[0] & 0x1,
+                0x1,
+                "round {round}: VRING ISR bit set after kick"
+            );
             let mut isr_again = [0xFFu8; 1];
             pci.bar_read(ISR_OFFSET, &mut isr_again);
             assert_eq!(isr_again[0], 0, "round {round}: ISR read-to-clear");
         }
-        assert_eq!(counters.tx_packets(), 2, "both kicks each drained a TX packet");
-        assert_eq!(counters.rx_packets(), 2, "both loopbacks each delivered to RX");
+        assert_eq!(
+            counters.tx_packets(),
+            2,
+            "both kicks each drained a TX packet"
+        );
+        assert_eq!(
+            counters.rx_packets(),
+            2,
+            "both loopbacks each delivered to RX"
+        );
     }
 
     #[test]
@@ -2070,7 +2250,11 @@ mod tests {
         // A notify to a wildly out-of-range queue index (top of the 4 KiB
         // notify region) must be a no-op, not a panic and not a TX drain.
         pci.bar_write(NOTIFY_OFFSET + REGION_SIZE - 4, &[0u8; 2]);
-        assert_eq!(counters.tx_packets(), 0, "out-of-range notify drains nothing");
+        assert_eq!(
+            counters.tx_packets(),
+            0,
+            "out-of-range notify drains nothing"
+        );
     }
 
     fn read_used_idx(mem: &GuestMemoryMmap, used_base: u64) -> u16 {

@@ -265,9 +265,18 @@ fn compare_rows_by_phase_one_sided_metric_in_matched_phase_is_coverage_diff() {
         "BASELINE",
         &[("max_dsq_depth", 6.0), ("avg_nr_running", 7.0)],
     )];
-    let report2 = compare_rows_by(&[row_a2], &[row_b2], &[], None, &ComparisonPolicy::default());
+    let report2 = compare_rows_by(
+        &[row_a2],
+        &[row_b2],
+        &[],
+        None,
+        &ComparisonPolicy::default(),
+    );
     assert_eq!(report2.phase_coverage_diffs.len(), 1);
-    assert_eq!(report2.phase_coverage_diffs[0].metric.name, "avg_nr_running");
+    assert_eq!(
+        report2.phase_coverage_diffs[0].metric.name,
+        "avg_nr_running"
+    );
     assert_eq!(
         report2.phase_coverage_diffs[0].present_side,
         ComparePartition::B
@@ -323,8 +332,7 @@ fn phase_block_lines_render_a_coverage_only_report() {
     // coverage-only report no longer reads "0 ... shown" with a populated
     // coverage table above it.
     assert!(
-        joined.contains("0 delta row(s)")
-            && joined.contains("2 one-sided-metric coverage diff(s)"),
+        joined.contains("0 delta row(s)") && joined.contains("2 one-sided-metric coverage diff(s)"),
         "footer hint must report the coverage-diff count, not only deltas: {joined}"
     );
 }
@@ -477,7 +485,11 @@ fn compare_rows_by_phase_one_sided_suppressed_component_is_dropped_not_coverage_
     // (max_dsq_depth). Both are one-sided within the matched phase.
     let mut row_a = make_row("test_sc", "tiny-1llc", true, 0.0);
     let mut row_b = make_row("test_sc", "tiny-1llc", true, 0.0);
-    row_a.phases = vec![make_phase_bucket(0, "BASELINE", &[("total_phase_iterations", 1000.0)])];
+    row_a.phases = vec![make_phase_bucket(
+        0,
+        "BASELINE",
+        &[("total_phase_iterations", 1000.0)],
+    )];
     row_b.phases = vec![make_phase_bucket(0, "BASELINE", &[("max_dsq_depth", 6.0)])];
     let report = compare_rows_by(&[row_a], &[row_b], &[], None, &ComparisonPolicy::default());
 
@@ -495,7 +507,10 @@ fn compare_rows_by_phase_one_sided_suppressed_component_is_dropped_not_coverage_
         vec!["max_dsq_depth"],
         "only the non-suppressed one-sided metric surfaces as a coverage diff",
     );
-    assert_eq!(report.phase_coverage_diffs[0].present_side, ComparePartition::B);
+    assert_eq!(
+        report.phase_coverage_diffs[0].present_side,
+        ComparePartition::B
+    );
     assert_eq!(report.phase_coverage_diffs[0].value, 6.0);
     assert!(
         report.phase_deltas.is_empty(),
@@ -519,7 +534,11 @@ fn compare_rows_by_phase_one_sided_informational_metric_is_coverage_diff() {
     // BASELINE, with a non-suppressed directional metric only on B.
     let mut row_a = make_row("test_inf_os", "tiny-1llc", true, 0.0);
     let mut row_b = make_row("test_inf_os", "tiny-1llc", true, 0.0);
-    row_a.phases = vec![make_phase_bucket(0, "BASELINE", &[("total_ttwu_count", 42.0)])];
+    row_a.phases = vec![make_phase_bucket(
+        0,
+        "BASELINE",
+        &[("total_ttwu_count", 42.0)],
+    )];
     row_b.phases = vec![make_phase_bucket(0, "BASELINE", &[("max_dsq_depth", 6.0)])];
     let report = compare_rows_by(&[row_a], &[row_b], &[], None, &ComparisonPolicy::default());
 
@@ -1431,8 +1450,12 @@ fn compare_partitions_renders_phase_and_summary_blocks_via_pool() {
     const NO_EXTRA: &[(&str, f64)] = &[];
     const PAIRED_A_EXTRA: &[(&str, f64)] = &[("avg_nr_running", 5.0)];
     let baseline = |s: f64| vec![(0u16, "BASELINE", s, NO_EXTRA)];
-    let baseline_plus_step =
-        |s: f64| vec![(0u16, "BASELINE", s, NO_EXTRA), (1u16, "Step[0]", s, NO_EXTRA)];
+    let baseline_plus_step = |s: f64| {
+        vec![
+            (0u16, "BASELINE", s, NO_EXTRA),
+            (1u16, "Step[0]", s, NO_EXTRA),
+        ]
+    };
     let sidecars = [
         // paired on both sides: 10 -> 30 scalar + BASELINE phase
         // regression; B's extra Step[0] -> unpaired (side B) phase.
@@ -1572,8 +1595,13 @@ fn compare_partitions_no_average_bails_on_duplicate_pairing_keys() {
     for (i, (name, sched)) in triples.iter().enumerate() {
         let run_dir = alt_root.path().join(format!("__dup_{i}__"));
         std::fs::create_dir_all(&run_dir).expect("create run dir");
-        let sc =
-            phase_sidecar(name, sched, true, 10.0, &[(0, "BASELINE", 10.0, &[] as &[(&str, f64)])]);
+        let sc = phase_sidecar(
+            name,
+            sched,
+            true,
+            10.0,
+            &[(0, "BASELINE", 10.0, &[] as &[(&str, f64)])],
+        );
         let json = serde_json::to_string(&sc).expect("serialize sidecar");
         std::fs::write(run_dir.join(format!("{name}_{i}.ktstr.json")), json)
             .expect("write sidecar");

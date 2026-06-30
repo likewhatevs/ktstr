@@ -1323,8 +1323,8 @@ pub(crate) fn compute_metrics(
         // Per-sample mean of per-CPU nr_running (full-class runqueue depth),
         // averaged over samples below — the avg_dsq_depth shape. `valid`
         // guarantees `!cpus.is_empty()`, so the divisor is nonzero.
-        let avg_nr_this: f64 = sample.cpus.iter().map(|c| c.nr_running as f64).sum::<f64>()
-            / sample.cpus.len() as f64;
+        let avg_nr_this: f64 =
+            sample.cpus.iter().map(|c| c.nr_running as f64).sum::<f64>() / sample.cpus.len() as f64;
         total_nr_running += avg_nr_this;
     }
 
@@ -3029,8 +3029,15 @@ mod tests {
             ..Default::default()
         };
         let changes = detect_boundary_changes(&before, &after);
-        let nr: Vec<_> = changes.iter().filter(|c| c.metric == "nr_running").collect();
-        assert_eq!(nr.len(), 1, "avg_nr_running jump must be flagged: {changes:?}");
+        let nr: Vec<_> = changes
+            .iter()
+            .filter(|c| c.metric == "nr_running")
+            .collect();
+        assert_eq!(
+            nr.len(),
+            1,
+            "avg_nr_running jump must be flagged: {changes:?}"
+        );
         assert_eq!(
             nr[0].direction,
             ChangeDirection::Degraded,

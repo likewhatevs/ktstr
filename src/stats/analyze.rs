@@ -31,7 +31,9 @@ pub(crate) const OUTLIER_METRICS: &[(&str, &str, MetricAccessor)] = &[
     ("spread", "worst_spread", |r| r.spread),
     ("gap_ms", "worst_gap_ms", |r| r.gap_ms as f64),
     ("migrations", "total_migrations", |r| r.migrations as f64),
-    ("migration_ratio", "worst_migration_ratio", |r| r.migration_ratio),
+    ("migration_ratio", "worst_migration_ratio", |r| {
+        r.migration_ratio
+    }),
     ("imbalance", "max_imbalance_ratio", |r| r.imbalance_ratio),
     ("dsq_depth", "max_dsq_depth", |r| r.max_dsq_depth as f64),
     ("stuck", "stuck_count", |r| r.stuck_count),
@@ -56,12 +58,16 @@ pub(crate) const OUTLIER_METRICS: &[(&str, &str, MetricAccessor)] = &[
     // metric added here would NOT be benign (a 0.0 would depress the baseline
     // AND could itself read as a low outlier). So the two consumers diverge by
     // design, not by accident.
-    ("worst_p99_wake_latency_us", "worst_p99_wake_latency_us", |r| {
-        r.ext_metrics
-            .get("worst_p99_wake_latency_us")
-            .copied()
-            .unwrap_or(0.0)
-    }),
+    (
+        "worst_p99_wake_latency_us",
+        "worst_p99_wake_latency_us",
+        |r| {
+            r.ext_metrics
+                .get("worst_p99_wake_latency_us")
+                .copied()
+                .unwrap_or(0.0)
+        },
+    ),
     ("worst_wake_latency_cv", "worst_wake_latency_cv", |r| {
         r.ext_metrics
             .get("worst_wake_latency_cv")

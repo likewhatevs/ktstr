@@ -320,7 +320,10 @@ impl VirtioBlkPci {
         cfg.set_u8(CAP_MSIX + 1, 0);
         cfg.set_u16(CAP_MSIX + MSIX_OFF_MSG_CTRL, table_size - 1);
         cfg.set_wmask_u16(CAP_MSIX + MSIX_OFF_MSG_CTRL, MSIX_MSG_CTRL_WMASK);
-        cfg.set_u32(CAP_MSIX + MSIX_OFF_TABLE, MSIX_TABLE_OFFSET as u32 | MSIX_BIR0);
+        cfg.set_u32(
+            CAP_MSIX + MSIX_OFF_TABLE,
+            MSIX_TABLE_OFFSET as u32 | MSIX_BIR0,
+        );
         cfg.set_u32(CAP_MSIX + MSIX_OFF_PBA, MSIX_PBA_OFFSET as u32 | MSIX_BIR0);
     }
 
@@ -744,9 +747,9 @@ mod tests {
     //! core (FSM, drain, request handling) is covered by the sibling
     //! `tests_fsm` / `tests_drain_*` suites through the MMIO facade; here the
     //! decode path is driven through the PCI facade.
-    use super::*;
     use super::super::testing::{make_device, make_guest_mem};
     use super::super::{DiskThrottle, S_ACK, S_DRV, S_FEAT, VIRTIO_BLK_SECTOR_SIZE};
+    use super::*;
     use crate::vmm::virtio_msix::IrqSource;
     use virtio_bindings::virtio_config::VIRTIO_F_VERSION_1;
     use vmm_sys_util::eventfd::EventFd;
@@ -787,7 +790,13 @@ mod tests {
     fn new_pci() -> VirtioBlkPci {
         let msix = Arc::new(PiMutex::new(MsixState::new(1, MSIX_TABLE_MAX)));
         let sink: Arc<dyn MsixRouteSink> = Arc::new(MockRouteSink::default());
-        VirtioBlkPci::new(build_blk(), TEST_BAR_APERTURE, msix, Some(sink), test_gsis())
+        VirtioBlkPci::new(
+            build_blk(),
+            TEST_BAR_APERTURE,
+            msix,
+            Some(sink),
+            test_gsis(),
+        )
     }
 
     fn cfg8(pci: &VirtioBlkPci, reg: u16) -> u8 {
@@ -856,7 +865,11 @@ mod tests {
         cc_w(&mut pci, CC_DEVICE_STATUS, S_ACK);
         cc_w(&mut pci, CC_DEVICE_STATUS, S_DRV);
         cc_w(&mut pci, CC_DRIVER_FEATURE_SELECT, 1);
-        cc_w(&mut pci, CC_DRIVER_FEATURE, 1u32 << (VIRTIO_F_VERSION_1 - 32));
+        cc_w(
+            &mut pci,
+            CC_DRIVER_FEATURE,
+            1u32 << (VIRTIO_F_VERSION_1 - 32),
+        );
         cc_w(&mut pci, CC_DEVICE_STATUS, S_FEAT);
         assert_eq!(cc_r(&mut pci, CC_DEVICE_STATUS) & 0xFF, S_FEAT);
         assert_eq!(cc_r(&mut pci, CC_NUM_QUEUES) & 0xFFFF, 1); // single request queue
@@ -882,8 +895,13 @@ mod tests {
         let msix = Arc::new(PiMutex::new(MsixState::new(1, MSIX_TABLE_MAX)));
         let sink = Arc::new(MockRouteSink::default());
         let sink_dyn: Arc<dyn MsixRouteSink> = sink.clone();
-        let mut pci =
-            VirtioBlkPci::new(build_blk(), TEST_BAR_APERTURE, msix, Some(sink_dyn), test_gsis());
+        let mut pci = VirtioBlkPci::new(
+            build_blk(),
+            TEST_BAR_APERTURE,
+            msix,
+            Some(sink_dyn),
+            test_gsis(),
+        );
         // Program vector 0's table entry (addr lo / data) then clear its mask bit.
         pci.bar_write(MSIX_TABLE_OFFSET, &0xFEE0_0000u32.to_le_bytes()); // addr lo
         pci.bar_write(MSIX_TABLE_OFFSET + 8, &0x4000u32.to_le_bytes()); // data
@@ -892,7 +910,9 @@ mod tests {
         pci.config_write(CAP_MSIX + MSIX_OFF_MSG_CTRL, &0x8000u16.to_le_bytes());
         let installs = sink.installs.lock().unwrap();
         assert!(
-            installs.iter().any(|(gsi, msg)| *gsi == 40 && msg.is_some()),
+            installs
+                .iter()
+                .any(|(gsi, msg)| *gsi == 40 && msg.is_some()),
             "enable+unmask installs vector 0's route at GSI 40: {installs:?}"
         );
     }
@@ -973,7 +993,11 @@ mod tests {
         pci.bar_write(MSIX_PBA_OFFSET, &0xFFu32.to_le_bytes());
         let mut b = [0u8; 4];
         pci.bar_read(MSIX_PBA_OFFSET, &mut b);
-        assert_eq!(u32::from_le_bytes(b), 0, "PBA reads 0 (no pending); write ignored");
+        assert_eq!(
+            u32::from_le_bytes(b),
+            0,
+            "PBA reads 0 (no pending); write ignored"
+        );
     }
 
     // ---- MSI-X delivery (enable → route install → fire/pend/replay) ----
@@ -1022,7 +1046,10 @@ mod tests {
         cc_w(pci, CC_MSIX_CONFIG, 0);
         cc_w(pci, CC_QUEUE_SELECT, 0);
         cc_w(pci, CC_QUEUE_MSIX_VECTOR, 1);
-        pci.config_write(CAP_MSIX + MSIX_OFF_MSG_CTRL, &MC_ENABLE_MASKALL.to_le_bytes());
+        pci.config_write(
+            CAP_MSIX + MSIX_OFF_MSG_CTRL,
+            &MC_ENABLE_MASKALL.to_le_bytes(),
+        );
         for v in 0..N_VECTORS {
             let base = MSIX_TABLE_OFFSET + (v as u64) * MSIX_ENTRY_SIZE;
             pci.bar_write(base, &0xFEE0_0000u32.to_le_bytes()); // addr lo
@@ -1064,20 +1091,40 @@ mod tests {
         // Live delivery: the request-queue vector (1) fires; config (0) quiet.
         msix.lock().signal(IrqSource::Vring { queue: 0 });
         assert_eq!(evts[1].read().unwrap(), 1, "req-queue vector 1 fired");
-        assert!(evts[0].read().is_err(), "config vector 0 untouched (EAGAIN)");
-        assert_eq!(msix.lock().pba_byte(0), 0, "delivered live, nothing pending");
+        assert!(
+            evts[0].read().is_err(),
+            "config vector 0 untouched (EAGAIN)"
+        );
+        assert_eq!(
+            msix.lock().pba_byte(0),
+            0,
+            "delivered live, nothing pending"
+        );
         // Mask vector 1 (table entry 1, vector-control bit0 = 1) → next signal pends.
-        pci.bar_write(MSIX_TABLE_OFFSET + MSIX_ENTRY_SIZE + 12, &1u32.to_le_bytes());
+        pci.bar_write(
+            MSIX_TABLE_OFFSET + MSIX_ENTRY_SIZE + 12,
+            &1u32.to_le_bytes(),
+        );
         msix.lock().signal(IrqSource::Vring { queue: 0 });
-        assert!(evts[1].read().is_err(), "masked vector did not fire (EAGAIN)");
+        assert!(
+            evts[1].read().is_err(),
+            "masked vector did not fire (EAGAIN)"
+        );
         assert_eq!(
             msix.lock().pba_byte(0) & (1 << 1),
             1 << 1,
             "pending bit set for the masked request-queue vector"
         );
         // Unmask → the facade replays the pending interrupt once.
-        pci.bar_write(MSIX_TABLE_OFFSET + MSIX_ENTRY_SIZE + 12, &0u32.to_le_bytes());
-        assert_eq!(evts[1].read().unwrap(), 1, "unmask replays the pending interrupt");
+        pci.bar_write(
+            MSIX_TABLE_OFFSET + MSIX_ENTRY_SIZE + 12,
+            &0u32.to_le_bytes(),
+        );
+        assert_eq!(
+            evts[1].read().unwrap(),
+            1,
+            "unmask replays the pending interrupt"
+        );
         assert_eq!(
             msix.lock().pba_byte(0) & (1 << 1),
             0,
@@ -1093,6 +1140,9 @@ mod tests {
         enable_msix(&mut pci);
         msix.lock().signal(IrqSource::Config);
         assert_eq!(evts[0].read().unwrap(), 1, "config vector 0 fired");
-        assert!(evts[1].read().is_err(), "req-queue vector 1 untouched (EAGAIN)");
+        assert!(
+            evts[1].read().is_err(),
+            "req-queue vector 1 untouched (EAGAIN)"
+        );
     }
 }

@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use kvm_bindings::{
     KVM_CAP_HALT_POLL, KVM_CAP_SPLIT_IRQCHIP, KVM_CAP_X2APIC_API, KVM_CAP_X86_DISABLE_EXITS,
-    KVM_CLOCK_TSC_STABLE, KVM_IRQCHIP_IOAPIC, KVM_IRQCHIP_PIC_MASTER, KVM_IRQCHIP_PIC_SLAVE,
-    KVM_IRQ_ROUTING_IRQCHIP, KVM_IRQ_ROUTING_MSI, KVM_PIT_SPEAKER_DUMMY,
+    KVM_CLOCK_TSC_STABLE, KVM_IRQ_ROUTING_IRQCHIP, KVM_IRQ_ROUTING_MSI, KVM_IRQCHIP_IOAPIC,
+    KVM_IRQCHIP_PIC_MASTER, KVM_IRQCHIP_PIC_SLAVE, KVM_PIT_SPEAKER_DUMMY,
     KVM_X2APIC_API_DISABLE_BROADCAST_QUIRK, KVM_X2APIC_API_USE_32BIT_IDS,
     KVM_X86_DISABLE_EXITS_HLT, KVM_X86_DISABLE_EXITS_PAUSE, KvmIrqRouting, kvm_enable_cap,
     kvm_irq_routing, kvm_irq_routing_entry, kvm_irq_routing_entry__bindgen_ty_1,
@@ -1628,7 +1628,10 @@ mod tests {
                     "msix_gsi {g} collides with a reserved line"
                 );
                 // (c) globally unique across (NIC, vector).
-                assert!(seen.insert(g), "msix_gsi {g} duplicated at (nic={nic}, v={v})");
+                assert!(
+                    seen.insert(g),
+                    "msix_gsi {g} duplicated at (nic={nic}, v={v})"
+                );
                 // (d) within the KVM routing budget (every routed GSI < the cap).
                 assert!(
                     (g as usize) < KVM_MAX_IRQ_ROUTES,
@@ -1645,8 +1648,7 @@ mod tests {
         // The whole budget — IOAPIC pins plus every NIC's full vector range —
         // fits below the KVM routing-table cap, so no config overflows it.
         assert!(
-            NUM_IOAPIC_PINS as usize + MAX_VIRTIO_NICS * MSIX_VECTORS_PER_NIC
-                <= KVM_MAX_IRQ_ROUTES,
+            NUM_IOAPIC_PINS as usize + MAX_VIRTIO_NICS * MSIX_VECTORS_PER_NIC <= KVM_MAX_IRQ_ROUTES,
             "per-NIC MSI-X GSI budget overflows the KVM routing table"
         );
     }
@@ -1859,7 +1861,11 @@ mod tests {
                 .is_err(),
             "an injected install failure propagates as an error"
         );
-        assert_eq!(installs.get(), 2, "the changed MSI-X route attempts an install");
+        assert_eq!(
+            installs.get(),
+            2,
+            "the changed MSI-X route attempts an install"
+        );
         assert_eq!(
             handle.routing_failures(),
             1,
@@ -1981,7 +1987,11 @@ mod tests {
                 .is_err(),
             "an injected install failure propagates as an error"
         );
-        assert_eq!(installs.get(), 2, "the changed route set attempts an install");
+        assert_eq!(
+            installs.get(),
+            2,
+            "the changed route set attempts an install"
+        );
         assert_eq!(owner.routing_failures(), 1, "the failed install is counted");
 
         // Retry the SAME route_b with a succeeding installer: because the failed
@@ -2067,15 +2077,25 @@ mod tests {
         // dest 256: guest packs dest>>8 = 1 into virt_destid (addr_lo [11:5] =
         // 1<<5 = 0x20), destid_0_7 = 256 & 0xff = 0, addr_hi = 0.
         let (lo, hi) = translate_msi_ext_dest_id(0xFEE0_0000 | 0x20, 0);
-        assert_eq!(hi, 0x100, "dest>>8 lands at addr_hi[31:8] (destid_8_31 LSB)");
+        assert_eq!(
+            hi, 0x100,
+            "dest>>8 lands at addr_hi[31:8] (destid_8_31 LSB)"
+        );
         assert_eq!(lo & 0xfe0, 0, "virt-destid bits cleared from addr_lo");
         // == redtbl_to_msi's (dest>>8)<<8 for dest 256 → INTx and MSI-X agree.
-        assert_eq!(hi, (256u32 >> 8) << 8, "matches the host-composed INTx addr_hi");
+        assert_eq!(
+            hi,
+            (256u32 >> 8) << 8,
+            "matches the host-composed INTx addr_hi"
+        );
 
         // Max virt_ext_dest_id dest (0x7FFF, the <0x8000 cap): dest>>8 = 0x7F →
         // virt_destid = 0x7F << 5 = 0xFE0 → addr_hi = 0x7F << 8 = 0x7F00.
         let (_lo, hi) = translate_msi_ext_dest_id(0xFEE0_0000 | 0xFE0, 0);
-        assert_eq!(hi, 0x7F00, "full 7-bit virt-destid range swizzles correctly");
+        assert_eq!(
+            hi, 0x7F00,
+            "full 7-bit virt-destid range swizzles correctly"
+        );
 
         // dest <= 255: no virt-destid bits set → no-op.
         let lo_in = 0xFEE0_0000 | (200u32 << 12); // destid_0_7 = 200, no [11:5]

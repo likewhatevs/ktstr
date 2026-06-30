@@ -72,8 +72,8 @@ fn acpi_rejects_slit_dominated_overflow_at_extreme_numa() {
         distances: None,
     };
     let layout = test_layout(&topo, 512);
-    let err =
-        setup_acpi(&mem, &topo, &layout, false, 0, false).expect_err("512-NUMA SLIT must overflow the ISA hole");
+    let err = setup_acpi(&mem, &topo, &layout, false, 0, false)
+        .expect_err("512-NUMA SLIT must overflow the ISA hole");
     let msg = format!("{err:#}");
     assert!(
         msg.contains("SLIT alone") && msg.contains("ISA hole"),
@@ -374,10 +374,16 @@ fn pci_enabled_emits_mcfg_and_prt_dsdt() {
     // MCFG (ECAM base) is emitted and linked into RSDT/XSDT.
     let mem = test_mem(16);
     let l = test_setup_pci(&mem, &topo, 256, 1);
-    assert!(l.dsdt_size > 36, "PCI DSDT carries the host-bridge AML body");
+    assert!(
+        l.dsdt_size > 36,
+        "PCI DSDT carries the host-bridge AML body"
+    );
     let dsdt = read_table(&mem, l.dsdt_addr);
     let dsdt_has = |needle: &[u8]| dsdt.windows(needle.len()).any(|w| w == needle);
-    assert!(dsdt_has(b"_PRT"), "PCI DSDT contains the _PRT routing object");
+    assert!(
+        dsdt_has(b"_PRT"),
+        "PCI DSDT contains the _PRT routing object"
+    );
     assert!(
         dsdt_has(&[0x0C, 0x41, 0xD0, 0x0A, 0x08]),
         "PCI DSDT contains the PNP0A08 host-bridge _HID",
@@ -403,7 +409,11 @@ fn pci_enabled_emits_mcfg_and_prt_dsdt() {
     let last = u32::from_le_bytes(rsdt[36 + (n - 1) * 4..36 + n * 4].try_into().unwrap());
     assert_eq!(last as u64, l.mcfg_addr, "MCFG is the last RSDT entry");
     let xsdt = read_table(&mem, l.xsdt_addr);
-    assert_eq!((xsdt.len() - 36) / 8, 5, "PCI XSDT adds MCFG (8-byte entries)");
+    assert_eq!(
+        (xsdt.len() - 36) / 8,
+        5,
+        "PCI XSDT adds MCFG (8-byte entries)"
+    );
 
     // The full contiguous pack still ends within the ISA hole.
     assert!(
@@ -1004,8 +1014,16 @@ fn fadt_pm_register_blocks() {
     // populated one — which acpi_tb_convert_fadt would then validate and could
     // fault on a malformed pair — is caught: PM2_CNT_BLK@72 / GPE0_BLK@80 (u32),
     // PM2_CNT_LEN@90 / GPE0_BLK_LEN@92 (u8).
-    assert_eq!(u32::from_le_bytes(fadt[72..76].try_into().unwrap()), 0, "PM2_CNT_BLK");
-    assert_eq!(u32::from_le_bytes(fadt[80..84].try_into().unwrap()), 0, "GPE0_BLK");
+    assert_eq!(
+        u32::from_le_bytes(fadt[72..76].try_into().unwrap()),
+        0,
+        "PM2_CNT_BLK"
+    );
+    assert_eq!(
+        u32::from_le_bytes(fadt[80..84].try_into().unwrap()),
+        0,
+        "GPE0_BLK"
+    );
     assert_eq!(fadt[90], 0, "PM2_CNT_LEN");
     assert_eq!(fadt[92], 0, "GPE0_BLK_LEN");
     // IA-PC Boot Architecture Flags (offset 109): bit1 = i8042 present,

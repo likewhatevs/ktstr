@@ -129,7 +129,14 @@ fn read_config_dword_on_cpu(cpu: usize, offset: u64) -> Result<u32, String> {
 /// non-boot CPU and is online after SMP bringup. Duration is short:
 /// the assertions read post-boot enumeration state, not behavior
 /// over time.
-#[ktstr_test(pci = true, llcs = 1, cores = 2, threads = 1, duration_s = 5, watchdog_timeout_s = 60)]
+#[ktstr_test(
+    pci = true,
+    llcs = 1,
+    cores = 2,
+    threads = 1,
+    duration_s = 5,
+    watchdog_timeout_s = 60
+)]
 fn pci_host_bridge_enumerates_and_dispatches_from_ap_cpu(_ctx: &Ctx) -> Result<AssertResult> {
     // 1. The host bridge must be present. If it isn't, the guest
     //    either rejected MCFG/DSDT or the CAM dispatch never served

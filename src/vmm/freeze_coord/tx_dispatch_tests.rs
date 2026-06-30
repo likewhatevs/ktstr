@@ -299,7 +299,11 @@ fn sched_swap_notify_latches_only_on_valid_crc() {
     let mut two = frame_with_crc(swap_tag, &[]);
     two.extend_from_slice(&frame_with_crc(swap_tag, &[]));
     let drained4 = a4.feed(&two);
-    assert_eq!(drained4.messages.len(), 2, "two frames decoded from one batch");
+    assert_eq!(
+        drained4.messages.len(),
+        2,
+        "two frames decoded from one batch"
+    );
     let out4 = run_dispatch(&drained4.messages);
     assert!(
         out4.sched_swap_notify,

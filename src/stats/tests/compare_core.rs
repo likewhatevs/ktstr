@@ -2221,10 +2221,15 @@ fn compare_rows_one_sided_absent_is_coverage_diff_not_verdict() {
         None,
         &ComparisonPolicy::default(),
     );
-    assert_eq!(res.regressions, 0, "one-sided-absent must not be a regression");
+    assert_eq!(
+        res.regressions, 0,
+        "one-sided-absent must not be a regression"
+    );
     assert_eq!(res.improvements, 0, "...nor an improvement");
     assert!(
-        !res.findings.iter().any(|f| f.metric.name == "avg_nr_running"),
+        !res.findings
+            .iter()
+            .any(|f| f.metric.name == "avg_nr_running"),
         "no phantom avg_nr_running finding for a one-sided-absent metric"
     );
     assert_eq!(res.coverage_diffs.len(), 1, "recorded as a coverage diff");
@@ -2324,7 +2329,10 @@ fn coverage_diff_lines_map_present_absent_labels_by_side() {
         &ComparisonPolicy::default(),
     );
     let joined = format_coverage_diff_lines(&report, "runA", "runB").join("\n");
-    assert!(joined.contains("avg_nr_running"), "names the metric: {joined}");
+    assert!(
+        joined.contains("avg_nr_running"),
+        "names the metric: {joined}"
+    );
     assert!(
         joined.contains("= 5.00 in 'runA'"),
         "present value + side-A label (runA): {joined}"

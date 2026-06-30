@@ -988,8 +988,8 @@ fn push_phase_deltas(
                                     continue;
                                 }
                                 let delta = val_b - val_a;
-                                let rel_thresh = policy
-                                    .rel_threshold(metric_def.name, metric_def.default_rel);
+                                let rel_thresh =
+                                    policy.rel_threshold(metric_def.name, metric_def.default_rel);
                                 // Same zero discipline as the scalar dual-gate: a
                                 // value from a ~zero baseline is an unbounded
                                 // relative change (INFINITY clears the rel gate,
@@ -1006,8 +1006,8 @@ fn push_phase_deltas(
                                 } else {
                                     0.0
                                 };
-                                let below_dual_gate = delta.abs() < metric_def.default_abs
-                                    || rel_delta < rel_thresh;
+                                let below_dual_gate =
+                                    delta.abs() < metric_def.default_abs || rel_delta < rel_thresh;
                                 let is_regression = if below_dual_gate {
                                     false
                                 } else if metric_def.higher_is_worse() {

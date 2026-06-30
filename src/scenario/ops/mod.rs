@@ -82,9 +82,9 @@ use dispatch::{apply_ops, render_cgroup_key};
 // survives_storm probe's host unit test (`test_support::probe_tests`) drives
 // scheduler liveness on the host (no VM) via the set_test_scx_state seam.
 // `dispatch` is otherwise private to `ops`.
-pub(crate) use dispatch::{ScxState, scx_state};
 #[cfg(test)]
 pub(crate) use dispatch::set_test_scx_state;
+pub(crate) use dispatch::{ScxState, scx_state};
 
 use std::collections::BTreeSet;
 use std::thread;

@@ -931,7 +931,10 @@ fn fold_run_level_ext_tags_dynamic_counter_keys() {
         "alb_pushed_mc",
         "bpf_x_allocs",
     ] {
-        assert!(counter_keys.contains(k), "{k} should be tagged as a counter");
+        assert!(
+            counter_keys.contains(k),
+            "{k} should be tagged as a counter"
+        );
     }
     // Gauges are NOT tagged (they mean-fold cross-run).
     assert!(!counter_keys.contains("avg_nr_running"));
@@ -960,8 +963,7 @@ fn bpf_map_field_value_is_counter_serde_default() {
     assert_eq!(back.value, 9.0);
     assert!(back.is_counter, "is_counter roundtrips");
     // Stale form (no is_counter key) -> defaults to false (mean-fold).
-    let stale: BpfMapFieldValue =
-        serde_json::from_str(r#"{"key":"k","value":9.0}"#).unwrap();
+    let stale: BpfMapFieldValue = serde_json::from_str(r#"{"key":"k","value":9.0}"#).unwrap();
     assert!(!stale.is_counter, "missing is_counter defaults to false");
 }
 
@@ -1079,7 +1081,8 @@ fn bpf_map_fields_fold_scalar_and_per_cpu() {
             ..Default::default()
         }],
     };
-    let summary = MonitorSummary::from_samples(&[mk(10.0, vec![2.0, 6.0]), mk(20.0, vec![4.0, 8.0])]);
+    let summary =
+        MonitorSummary::from_samples(&[mk(10.0, vec![2.0, 6.0]), mk(20.0, vec![4.0, 8.0])]);
     let folded = summary
         .bpf_map_fields
         .as_ref()

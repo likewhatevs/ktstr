@@ -1920,8 +1920,12 @@ impl KtstrVm {
         // the root cgroup, outside the workload subtree). Warn if a config nests
         // them — the confound is otherwise silent in the cross-cgroup fold.
         if let Some(sched_parent) = self.scheduler_cgroup_parent.as_deref() {
-            let cgroup_rel =
-                |p: &str| p.strip_prefix("/sys/fs/cgroup").unwrap_or(p).trim_matches('/').to_string();
+            let cgroup_rel = |p: &str| {
+                p.strip_prefix("/sys/fs/cgroup")
+                    .unwrap_or(p)
+                    .trim_matches('/')
+                    .to_string()
+            };
             let sched_rel = cgroup_rel(sched_parent);
             let wl_rel = cgroup_rel(&freeze_coord_workload_root);
             if !wl_rel.is_empty()

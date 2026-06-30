@@ -145,8 +145,8 @@ fn device_features_does_not_advertise_unsupported_bits() {
 
 #[test]
 fn device_features_gates_mq_on_queue_pairs_and_msix() {
-    use crate::vmm::virtio_msix::MsixState;
     use crate::vmm::PiMutex;
+    use crate::vmm::virtio_msix::MsixState;
     use std::sync::Arc;
     use virtio_bindings::virtio_net::{VIRTIO_NET_F_CTRL_VQ, VIRTIO_NET_F_MQ};
 
@@ -177,7 +177,10 @@ fn device_features_gates_mq_on_queue_pairs_and_msix() {
     // MSI-X transport.
     let mut mq_msix = VirtioNet::new(NetConfig::default().queue_pairs(4));
     let nq = mq_msix.num_queues();
-    mq_msix.set_msix_state(Arc::new(PiMutex::new(MsixState::new(nq, crate::vmm::virtio_msix::MSIX_TABLE_MAX))));
+    mq_msix.set_msix_state(Arc::new(PiMutex::new(MsixState::new(
+        nq,
+        crate::vmm::virtio_msix::MSIX_TABLE_MAX,
+    ))));
     assert_eq!(
         read_device_features(&mut mq_msix) & mq,
         mq,
@@ -212,8 +215,8 @@ const CVQ_STATUS: u64 = 0xD020; // device-writable status u8
 /// reach DRIVER_OK. Returns the device, the shared guest memory, and the
 /// control-vq index (`2 * queue_pairs`).
 fn multiqueue_dev_with_cvq(queue_pairs: u16) -> (VirtioNet, GuestMemoryMmap, usize) {
-    use crate::vmm::virtio_msix::MsixState;
     use crate::vmm::PiMutex;
+    use crate::vmm::virtio_msix::MsixState;
     use std::sync::Arc;
     use virtio_bindings::virtio_net::{VIRTIO_NET_F_CTRL_VQ, VIRTIO_NET_F_MQ};
 
@@ -221,7 +224,10 @@ fn multiqueue_dev_with_cvq(queue_pairs: u16) -> (VirtioNet, GuestMemoryMmap, usi
     let mut dev = VirtioNet::new(NetConfig::default().queue_pairs(queue_pairs));
     dev.set_mem(mem.clone());
     let nq = dev.num_queues();
-    dev.set_msix_state(Arc::new(PiMutex::new(MsixState::new(nq, crate::vmm::virtio_msix::MSIX_TABLE_MAX))));
+    dev.set_msix_state(Arc::new(PiMutex::new(MsixState::new(
+        nq,
+        crate::vmm::virtio_msix::MSIX_TABLE_MAX,
+    ))));
 
     write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_ACK);
     write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_DRV);
@@ -255,9 +261,11 @@ fn multiqueue_dev_with_cvq(queue_pairs: u16) -> (VirtioNet, GuestMemoryMmap, usi
 /// → readable payload → device-writable status (pre-set to 0xFF so the test
 /// can tell whether the device overwrote it) — and publish its head.
 fn place_ctrl_chain(mem: &GuestMemoryMmap, class: u8, cmd: u8, payload: &[u8]) {
-    mem.write_slice(&[class, cmd], GuestAddress(CVQ_HDR)).unwrap();
+    mem.write_slice(&[class, cmd], GuestAddress(CVQ_HDR))
+        .unwrap();
     mem.write_slice(payload, GuestAddress(CVQ_PAYLOAD)).unwrap();
-    mem.write_slice(&[0xFFu8], GuestAddress(CVQ_STATUS)).unwrap();
+    mem.write_slice(&[0xFFu8], GuestAddress(CVQ_STATUS))
+        .unwrap();
     write_desc(mem, CVQ_DESC, 0, CVQ_HDR, 2, DESC_F_NEXT, 1);
     write_desc(
         mem,
@@ -289,7 +297,12 @@ fn cvq_used_idx(mem: &GuestMemoryMmap) -> u16 {
 fn ctrl_vq_vq_pairs_set_acks_ok_and_publishes() {
     let (mut dev, mem, cvq) = multiqueue_dev_with_cvq(2);
     let counters = dev.counters();
-    place_ctrl_chain(&mem, CTRL_MQ_CLASS, CTRL_MQ_VQ_PAIRS_SET, &2u16.to_le_bytes());
+    place_ctrl_chain(
+        &mem,
+        CTRL_MQ_CLASS,
+        CTRL_MQ_VQ_PAIRS_SET,
+        &2u16.to_le_bytes(),
+    );
     write_reg(&mut dev, VIRTIO_MMIO_QUEUE_NOTIFY, cvq as u32);
     assert_eq!(
         read_status(&mem),
@@ -298,7 +311,11 @@ fn ctrl_vq_vq_pairs_set_acks_ok_and_publishes() {
     );
     assert_eq!(counters.ctrl_mq_set(), 1, "success bumps ctrl_mq_set");
     assert_eq!(counters.ctrl_chain_invalid(), 0);
-    assert_eq!(cvq_used_idx(&mem), 1, "the acked chain is published to the used ring");
+    assert_eq!(
+        cvq_used_idx(&mem),
+        1,
+        "the acked chain is published to the used ring"
+    );
 }
 
 #[test]
@@ -314,7 +331,11 @@ fn ctrl_vq_unknown_class_acks_err() {
     assert_eq!(read_status(&mem), NET_ERR, "unknown ctrl class must NAK");
     assert_eq!(counters.ctrl_mq_set(), 0, "a NAK must not bump ctrl_mq_set");
     assert_eq!(counters.ctrl_chain_invalid(), 1);
-    assert_eq!(cvq_used_idx(&mem), 1, "a NAK'd chain is still published (status written)");
+    assert_eq!(
+        cvq_used_idx(&mem),
+        1,
+        "a NAK'd chain is still published (status written)"
+    );
     assert_eq!(
         read_reg(&dev, VIRTIO_MMIO_STATUS) & VIRTIO_CONFIG_S_NEEDS_RESET,
         0,
@@ -327,7 +348,12 @@ fn ctrl_vq_pairs_above_offered_acks_err() {
     // queue_pairs=2 → requesting 3 exceeds the offered max → NAK, no change.
     let (mut dev, mem, cvq) = multiqueue_dev_with_cvq(2);
     let counters = dev.counters();
-    place_ctrl_chain(&mem, CTRL_MQ_CLASS, CTRL_MQ_VQ_PAIRS_SET, &3u16.to_le_bytes());
+    place_ctrl_chain(
+        &mem,
+        CTRL_MQ_CLASS,
+        CTRL_MQ_VQ_PAIRS_SET,
+        &3u16.to_le_bytes(),
+    );
     write_reg(&mut dev, VIRTIO_MMIO_QUEUE_NOTIFY, cvq as u32);
     assert_eq!(read_status(&mem), NET_ERR, "pairs > queue_pairs must NAK");
     assert_eq!(counters.ctrl_mq_set(), 0);
@@ -338,7 +364,12 @@ fn ctrl_vq_pairs_above_offered_acks_err() {
 fn ctrl_vq_pairs_zero_acks_err() {
     // pairs=0 < VQ_PAIRS_MIN(1) → NAK.
     let (mut dev, mem, cvq) = multiqueue_dev_with_cvq(2);
-    place_ctrl_chain(&mem, CTRL_MQ_CLASS, CTRL_MQ_VQ_PAIRS_SET, &0u16.to_le_bytes());
+    place_ctrl_chain(
+        &mem,
+        CTRL_MQ_CLASS,
+        CTRL_MQ_VQ_PAIRS_SET,
+        &0u16.to_le_bytes(),
+    );
     write_reg(&mut dev, VIRTIO_MMIO_QUEUE_NOTIFY, cvq as u32);
     assert_eq!(read_status(&mem), NET_ERR, "pairs=0 (< MIN) must NAK");
 }
@@ -352,8 +383,11 @@ fn ctrl_vq_no_writable_status_drops_without_publish() {
     let counters = dev.counters();
     // hdr (readable) + payload (readable), both with NEXT but the chain ends
     // at desc 1 — no writable status descriptor.
-    mem.write_slice(&[CTRL_MQ_CLASS, CTRL_MQ_VQ_PAIRS_SET], GuestAddress(CVQ_HDR))
-        .unwrap();
+    mem.write_slice(
+        &[CTRL_MQ_CLASS, CTRL_MQ_VQ_PAIRS_SET],
+        GuestAddress(CVQ_HDR),
+    )
+    .unwrap();
     mem.write_slice(&2u16.to_le_bytes(), GuestAddress(CVQ_PAYLOAD))
         .unwrap();
     write_desc(&mem, CVQ_DESC, 0, CVQ_HDR, 2, DESC_F_NEXT, 1);
@@ -365,7 +399,11 @@ fn ctrl_vq_no_writable_status_drops_without_publish() {
         0,
         "a chain with no writable status must NOT be published (F15 rule)",
     );
-    assert_eq!(counters.ctrl_chain_invalid(), 1, "the dropped chain is counted");
+    assert_eq!(
+        counters.ctrl_chain_invalid(),
+        1,
+        "the dropped chain is counted"
+    );
     assert_eq!(counters.ctrl_mq_set(), 0);
 }
 
@@ -382,8 +420,11 @@ fn ctrl_vq_unmapped_status_drops_without_state_change() {
     let (mut dev, mem, cvq) = multiqueue_dev_with_cvq(2);
     let counters = dev.counters();
     const UNMAPPED_STATUS: u64 = 0x20_0000; // beyond GUEST_MEM_SIZE (1 MiB)
-    mem.write_slice(&[CTRL_MQ_CLASS, CTRL_MQ_VQ_PAIRS_SET], GuestAddress(CVQ_HDR))
-        .unwrap();
+    mem.write_slice(
+        &[CTRL_MQ_CLASS, CTRL_MQ_VQ_PAIRS_SET],
+        GuestAddress(CVQ_HDR),
+    )
+    .unwrap();
     mem.write_slice(&2u16.to_le_bytes(), GuestAddress(CVQ_PAYLOAD))
         .unwrap();
     write_desc(&mem, CVQ_DESC, 0, CVQ_HDR, 2, DESC_F_NEXT, 1);
@@ -396,9 +437,21 @@ fn ctrl_vq_unmapped_status_drops_without_state_change() {
         1,
         "an unmapped status write bumps ctrl_add_used_failures",
     );
-    assert_eq!(counters.ctrl_mq_set(), 0, "no successful set when the status write fails");
-    assert_eq!(cvq_used_idx(&mem), 0, "no add_used when the status write fails (F15)");
-    assert_eq!(dev.curr_queue_pairs(), 1, "curr_queue_pairs unchanged on a publish failure");
+    assert_eq!(
+        counters.ctrl_mq_set(),
+        0,
+        "no successful set when the status write fails"
+    );
+    assert_eq!(
+        cvq_used_idx(&mem),
+        0,
+        "no add_used when the status write fails (F15)"
+    );
+    assert_eq!(
+        dev.curr_queue_pairs(),
+        1,
+        "curr_queue_pairs unchanged on a publish failure"
+    );
     assert_eq!(
         read_reg(&dev, VIRTIO_MMIO_STATUS) & VIRTIO_CONFIG_S_NEEDS_RESET,
         0,
@@ -419,7 +472,8 @@ fn ctrl_vq_structural_ring_fault_poisons_and_sets_needs_reset() {
     let counters = dev.counters();
     // cvq queue size is 4 (multiqueue_dev_with_cvq); set avail.idx far beyond
     // it so `avail_idx - next_avail` exceeds the ring size → iter() error.
-    mem.write_slice(&0u16.to_le_bytes(), GuestAddress(CVQ_AVAIL)).unwrap(); // flags
+    mem.write_slice(&0u16.to_le_bytes(), GuestAddress(CVQ_AVAIL))
+        .unwrap(); // flags
     mem.write_slice(&9999u16.to_le_bytes(), GuestAddress(CVQ_AVAIL + 2))
         .unwrap(); // idx >> size
     assert_eq!(
@@ -433,9 +487,21 @@ fn ctrl_vq_structural_ring_fault_poisons_and_sets_needs_reset() {
         0,
         "a structural cvq ring fault must set NEEDS_RESET (data-path + qemu parity)",
     );
-    assert_eq!(counters.invalid_avail_idx_count(), 1, "the structural poison is counted");
-    assert_eq!(counters.ctrl_mq_set(), 0, "no pair-count change on a poisoned cvq");
-    assert_eq!(dev.curr_queue_pairs(), 1, "curr_queue_pairs unchanged on a poisoned cvq");
+    assert_eq!(
+        counters.invalid_avail_idx_count(),
+        1,
+        "the structural poison is counted"
+    );
+    assert_eq!(
+        counters.ctrl_mq_set(),
+        0,
+        "no pair-count change on a poisoned cvq"
+    );
+    assert_eq!(
+        dev.curr_queue_pairs(),
+        1,
+        "curr_queue_pairs unchanged on a poisoned cvq"
+    );
 }
 
 #[test]
@@ -459,8 +525,8 @@ fn new_clamps_queue_pairs() {
 
 #[test]
 fn config_space_reports_max_virtqueue_pairs() {
-    use crate::vmm::virtio_msix::MsixState;
     use crate::vmm::PiMutex;
+    use crate::vmm::virtio_msix::MsixState;
     use std::sync::Arc;
     // `max_virtqueue_pairs` lives at config-space offset 0x08 (LE u16,
     // virtio_net_config). A multiqueue device (MSI-X wired) reports the offered
@@ -469,7 +535,10 @@ fn config_space_reports_max_virtqueue_pairs() {
     // feature).
     let mut mq = VirtioNet::new(NetConfig::default().queue_pairs(4));
     let nq = mq.num_queues();
-    mq.set_msix_state(Arc::new(PiMutex::new(MsixState::new(nq, crate::vmm::virtio_msix::MSIX_TABLE_MAX))));
+    mq.set_msix_state(Arc::new(PiMutex::new(MsixState::new(
+        nq,
+        crate::vmm::virtio_msix::MSIX_TABLE_MAX,
+    ))));
     let mut buf = [0u8; 2];
     mq.mmio_read(0x100 + 0x08, &mut buf);
     assert_eq!(
@@ -491,8 +560,8 @@ fn config_space_reports_max_virtqueue_pairs() {
 fn multiqueue_loopback_routes_tx_to_its_own_pair_rx() {
     // 2-pair device: a TX kick on pair 1 must loop to PAIR 1's RX, never to
     // pair 0's RX — the per-pair routing TX vq 2i+1 → RX vq 2i.
-    use crate::vmm::virtio_msix::MsixState;
     use crate::vmm::PiMutex;
+    use crate::vmm::virtio_msix::MsixState;
     use std::sync::Arc;
     use virtio_bindings::virtio_net::{VIRTIO_NET_F_CTRL_VQ, VIRTIO_NET_F_MQ};
 
@@ -500,7 +569,10 @@ fn multiqueue_loopback_routes_tx_to_its_own_pair_rx() {
     let mut dev = VirtioNet::new(NetConfig::default().queue_pairs(2));
     dev.set_mem(mem.clone());
     let nq = dev.num_queues(); // 5: rx0, tx0, rx1, tx1, cvq@4
-    dev.set_msix_state(Arc::new(PiMutex::new(MsixState::new(nq, crate::vmm::virtio_msix::MSIX_TABLE_MAX))));
+    dev.set_msix_state(Arc::new(PiMutex::new(MsixState::new(
+        nq,
+        crate::vmm::virtio_msix::MSIX_TABLE_MAX,
+    ))));
 
     // Negotiate VERSION_1 + MAC + F_MQ + F_CTRL_VQ.
     write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_ACK);
@@ -530,14 +602,34 @@ fn multiqueue_loopback_routes_tx_to_its_own_pair_rx() {
         write_reg(&mut dev, VIRTIO_MMIO_QUEUE_SEL, (pair * 2) as u32); // RX
         write_reg(&mut dev, VIRTIO_MMIO_QUEUE_NUM, 4);
         write_reg(&mut dev, VIRTIO_MMIO_QUEUE_DESC_LOW, base(pair, 0x0) as u32);
-        write_reg(&mut dev, VIRTIO_MMIO_QUEUE_AVAIL_LOW, base(pair, 0x1000) as u32);
-        write_reg(&mut dev, VIRTIO_MMIO_QUEUE_USED_LOW, base(pair, 0x2000) as u32);
+        write_reg(
+            &mut dev,
+            VIRTIO_MMIO_QUEUE_AVAIL_LOW,
+            base(pair, 0x1000) as u32,
+        );
+        write_reg(
+            &mut dev,
+            VIRTIO_MMIO_QUEUE_USED_LOW,
+            base(pair, 0x2000) as u32,
+        );
         write_reg(&mut dev, VIRTIO_MMIO_QUEUE_READY, 1);
         write_reg(&mut dev, VIRTIO_MMIO_QUEUE_SEL, (pair * 2 + 1) as u32); // TX
         write_reg(&mut dev, VIRTIO_MMIO_QUEUE_NUM, 4);
-        write_reg(&mut dev, VIRTIO_MMIO_QUEUE_DESC_LOW, base(pair, 0x4000) as u32);
-        write_reg(&mut dev, VIRTIO_MMIO_QUEUE_AVAIL_LOW, base(pair, 0x5000) as u32);
-        write_reg(&mut dev, VIRTIO_MMIO_QUEUE_USED_LOW, base(pair, 0x6000) as u32);
+        write_reg(
+            &mut dev,
+            VIRTIO_MMIO_QUEUE_DESC_LOW,
+            base(pair, 0x4000) as u32,
+        );
+        write_reg(
+            &mut dev,
+            VIRTIO_MMIO_QUEUE_AVAIL_LOW,
+            base(pair, 0x5000) as u32,
+        );
+        write_reg(
+            &mut dev,
+            VIRTIO_MMIO_QUEUE_USED_LOW,
+            base(pair, 0x6000) as u32,
+        );
         write_reg(&mut dev, VIRTIO_MMIO_QUEUE_READY, 1);
     }
     write_reg(&mut dev, VIRTIO_MMIO_QUEUE_SEL, (nq - 1) as u32); // cvq
@@ -549,22 +641,41 @@ fn multiqueue_loopback_routes_tx_to_its_own_pair_rx() {
     write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_OK);
 
     // Activate both pairs (curr_queue_pairs = 2) via the control vq.
-    place_ctrl_chain(&mem, CTRL_MQ_CLASS, CTRL_MQ_VQ_PAIRS_SET, &2u16.to_le_bytes());
+    place_ctrl_chain(
+        &mem,
+        CTRL_MQ_CLASS,
+        CTRL_MQ_VQ_PAIRS_SET,
+        &2u16.to_le_bytes(),
+    );
     write_reg(&mut dev, VIRTIO_MMIO_QUEUE_NOTIFY, (nq - 1) as u32);
-    assert_eq!(read_status(&mem), NET_OK, "VQ_PAIRS_SET(2) must activate both pairs");
+    assert_eq!(
+        read_status(&mem),
+        NET_OK,
+        "VQ_PAIRS_SET(2) must activate both pairs"
+    );
 
     // Post a writable RX buffer on BOTH pairs; pre-zero them so the absence of
     // cross-pair delivery is detectable.
     for pair in 0..2usize {
-        mem.write_slice(&[0u8; 64], GuestAddress(base(pair, 0x3000))).unwrap();
-        write_desc(&mem, base(pair, 0x0), 0, base(pair, 0x3000), 64, DESC_F_WRITE, 0);
+        mem.write_slice(&[0u8; 64], GuestAddress(base(pair, 0x3000)))
+            .unwrap();
+        write_desc(
+            &mem,
+            base(pair, 0x0),
+            0,
+            base(pair, 0x3000),
+            64,
+            DESC_F_WRITE,
+            0,
+        );
         publish_avail(&mem, base(pair, 0x1000), 0, 0);
     }
 
     // A TX chain on PAIR 1 with a distinctive payload.
     let payload: Vec<u8> = (0..40u8).map(|b| b ^ 0xA5).collect();
     let zero_hdr = [0u8; VIRTIO_NET_HDR_LEN];
-    mem.write_slice(&zero_hdr, GuestAddress(base(1, 0x7000))).unwrap();
+    mem.write_slice(&zero_hdr, GuestAddress(base(1, 0x7000)))
+        .unwrap();
     mem.write_slice(
         &payload,
         GuestAddress(base(1, 0x7000) + VIRTIO_NET_HDR_LEN as u64),
@@ -589,7 +700,8 @@ fn multiqueue_loopback_routes_tx_to_its_own_pair_rx() {
     // (LE u16 at offset 10) — we don't negotiate VIRTIO_NET_F_MRG_RXBUF, so
     // num_buffers is always 1. Mirrors loopback_delivers_tx_payload_to_rx_with_zero_header.
     let mut p1_rx = vec![0u8; VIRTIO_NET_HDR_LEN + payload.len()];
-    mem.read_slice(&mut p1_rx, GuestAddress(base(1, 0x3000))).unwrap();
+    mem.read_slice(&mut p1_rx, GuestAddress(base(1, 0x3000)))
+        .unwrap();
     let mut expected_rx_hdr = [0u8; VIRTIO_NET_HDR_LEN];
     expected_rx_hdr[10] = 1;
     assert_eq!(
@@ -604,7 +716,8 @@ fn multiqueue_loopback_routes_tx_to_its_own_pair_rx() {
     );
     // Pair 0's RX is UNTOUCHED — no cross-pair delivery.
     let mut p0_rx = [0u8; 64];
-    mem.read_slice(&mut p0_rx, GuestAddress(base(0, 0x3000))).unwrap();
+    mem.read_slice(&mut p0_rx, GuestAddress(base(0, 0x3000)))
+        .unwrap();
     assert_eq!(
         p0_rx, [0u8; 64],
         "pair 1 TX must NOT loop to pair 0 RX (per-pair routing)",
@@ -766,8 +879,8 @@ fn queue_num_max_is_256_for_both_queues() {
 
 #[test]
 fn queue_select_out_of_range_is_bounded_on_multiqueue() {
-    use crate::vmm::virtio_msix::MsixState;
     use crate::vmm::PiMutex;
+    use crate::vmm::virtio_msix::MsixState;
     use std::sync::Arc;
     // A hostile queue_select beyond the DYNAMIC device queue count must be
     // inert — `selected_queue` bounds on `queues.len()` (2*queue_pairs + cvq),
@@ -776,7 +889,10 @@ fn queue_select_out_of_range_is_bounded_on_multiqueue() {
     // static NUM_QUEUES=2 bound no longer applies).
     let mut dev = VirtioNet::new(NetConfig::default().queue_pairs(4));
     let nq = dev.num_queues(); // 9 = 2*4 data + 1 control vq
-    dev.set_msix_state(Arc::new(PiMutex::new(MsixState::new(nq, crate::vmm::virtio_msix::MSIX_TABLE_MAX))));
+    dev.set_msix_state(Arc::new(PiMutex::new(MsixState::new(
+        nq,
+        crate::vmm::virtio_msix::MSIX_TABLE_MAX,
+    ))));
     // The last valid index (the control vq at nq-1) reports the real max size.
     write_reg(&mut dev, VIRTIO_MMIO_QUEUE_SEL, (nq - 1) as u32);
     assert_eq!(

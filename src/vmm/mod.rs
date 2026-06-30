@@ -1078,9 +1078,8 @@ impl KtstrVm {
         // legacy INTx routes survive the first MSI-X `KVM_SET_GSI_ROUTING`
         // (whole-table replace). `None` on split-irqchip / non-PCI shells.
         #[cfg(target_arch = "x86_64")]
-        let full_route_owner: Option<Arc<crate::vmm::FullIrqchipRouteOwner>> = (!vm.split_irqchip
-            && vm.pci_enabled)
-            .then(|| {
+        let full_route_owner: Option<Arc<crate::vmm::FullIrqchipRouteOwner>> =
+            (!vm.split_irqchip && vm.pci_enabled).then(|| {
                 Arc::new(crate::vmm::FullIrqchipRouteOwner::new(
                     std::os::unix::io::AsRawFd::as_raw_fd(&*vm.vm_fd),
                 ))

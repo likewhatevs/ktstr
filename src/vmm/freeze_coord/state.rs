@@ -506,8 +506,7 @@ mod tests {
         // N=1 → boundary at the window midpoint = 7 s.
         let window_start_ns: u64 = 2_000_000_000;
         let window_end_ns: u64 = 12_000_000_000;
-        let boundaries =
-            compute_periodic_boundaries_ns(window_start_ns, window_end_ns, 1);
+        let boundaries = compute_periodic_boundaries_ns(window_start_ns, window_end_ns, 1);
         assert_eq!(boundaries.len(), 1);
         assert_eq!(
             boundaries[0], 7_000_000_000,
@@ -659,8 +658,7 @@ mod tests {
         //   window_start = 12_345, window_end = 12_345 + 1_000_000_001
         //   (Case 1's span), so avail = 1_000_000_001; each boundary
         //   should be Case 1's boundary + 12_345.
-        let boundaries4 =
-            compute_periodic_boundaries_ns(12_345, 1_000_012_346, 3);
+        let boundaries4 = compute_periodic_boundaries_ns(12_345, 1_000_012_346, 3);
         assert_eq!(
             boundaries4,
             vec![300_012_345, 500_012_345, 700_012_345],
@@ -705,8 +703,7 @@ mod tests {
         let window_start_ns: u64 = 3_000_000_000;
         let window_end_ns: u64 = 10_000_000_000;
         for &n in &[1u32, 3, 6, 12] {
-            let boundaries =
-                compute_periodic_boundaries_ns(window_start_ns, window_end_ns, n);
+            let boundaries = compute_periodic_boundaries_ns(window_start_ns, window_end_ns, n);
             assert_eq!(boundaries.len(), n as usize, "N={n} boundary count");
             for (i, &b) in boundaries.iter().enumerate() {
                 assert!(
@@ -751,7 +748,11 @@ mod tests {
         // window; every step is exactly floor(65/65)==1, so the 64
         // boundaries are strictly monotonic at zero slack ([8..=71]).
         let edge = compute_periodic_boundaries_ns(0, 79, 64);
-        assert_eq!(edge.len(), 64, "window == N+1 (65) is the smallest non-empty");
+        assert_eq!(
+            edge.len(),
+            64,
+            "window == N+1 (65) is the smallest non-empty"
+        );
         assert_eq!(edge[0], 8, "first boundary = pre(7) + 1");
         assert_eq!(edge[63], 71, "last boundary = pre(7) + 64");
         for w in edge.windows(2) {
@@ -786,7 +787,11 @@ mod tests {
         // inner window ≈ 1.47e19, so window·64 ≈ 9.4e20 overflows u64 —
         // the u128 path is what makes this correct.
         let wide = compute_periodic_boundaries_ns(0, u64::MAX, 64);
-        assert_eq!(wide.len(), 64, "max-span window must produce all 64 boundaries");
+        assert_eq!(
+            wide.len(),
+            64,
+            "max-span window must produce all 64 boundaries"
+        );
         for (i, &b) in wide.iter().enumerate() {
             assert!(
                 b < u64::MAX,
@@ -809,8 +814,16 @@ mod tests {
         let start = u64::MAX - 79;
         let high = compute_periodic_boundaries_ns(start, u64::MAX, 64);
         assert_eq!(high.len(), 64, "window==N+1 at high window_start yields 64");
-        assert_eq!(high[0], start + 8, "first boundary = window_start + pre(7) + 1");
-        assert_eq!(high[63], start + 71, "last boundary = window_start + pre(7) + 64");
+        assert_eq!(
+            high[0],
+            start + 8,
+            "first boundary = window_start + pre(7) + 1"
+        );
+        assert_eq!(
+            high[63],
+            start + 71,
+            "last boundary = window_start + pre(7) + 64"
+        );
         for (i, &b) in high.iter().enumerate() {
             assert!(
                 b < u64::MAX && b > start,
@@ -827,7 +840,10 @@ mod tests {
     fn resolve_periodic_window_warm_boot_starts_at_anchor() {
         let w = resolve_periodic_window(5_000, 3_000, 10_000)
             .expect("non-zero anchor must build a window");
-        assert_eq!(w.window_start_ns, 5_000, "warm boot: window_start == anchor");
+        assert_eq!(
+            w.window_start_ns, 5_000,
+            "warm boot: window_start == anchor"
+        );
         assert_eq!(w.window_end_ns, 15_000, "window_end == anchor + duration");
         assert_eq!(w.anchor_ns, 5_000, "anchor_ns == scenario_anchor");
     }
@@ -926,8 +942,7 @@ mod tests {
         assert_eq!(w.anchor_ns, 5_000);
         // The slicer empties an inverted window: no periodic samples fire.
         assert!(
-            compute_periodic_boundaries_ns(w.window_start_ns, w.window_end_ns, 3)
-                .is_empty(),
+            compute_periodic_boundaries_ns(w.window_start_ns, w.window_end_ns, 3).is_empty(),
             "an inverted window must yield no boundaries (slicer 0-fires)",
         );
     }

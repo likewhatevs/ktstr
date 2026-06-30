@@ -2356,7 +2356,11 @@ fn active_set_changed(
 /// KPTI-only `& !0x1FFF`) corrupts pgd PAs that are odd 4 KiB multiples.
 /// `live == 0` means `cr3_cache` is unpublished -> keep the snapshot.
 fn select_cr3(live: u64, snapshot: u64) -> u64 {
-    if live != 0 { live & !0xFFFu64 } else { snapshot }
+    if live != 0 {
+        live & !0xFFFu64
+    } else {
+        snapshot
+    }
 }
 
 impl<'a> BpfMapWatcher<'a> {
@@ -2404,18 +2408,20 @@ impl<'a> BpfMapWatcher<'a> {
         // cr3 — `from_elf_with_hint` masks it `& !0xFFF` (walk_cr3)
         // internally. Tolerate failure (retry next tick).
         if self.accessor.is_none() && live_cr3 != 0 {
-            self.accessor = goblin::elf::Elf::parse(&cfg.vmlinux_data).ok().and_then(|elf| {
-                GuestMemMapAccessorOwned::from_elf_with_hint(
-                    Arc::clone(&cfg.mem),
-                    &elf,
-                    &cfg.vmlinux_data,
-                    &cfg.vmlinux,
-                    cfg.tcr_el1,
-                    live_cr3,
-                    phys_base,
-                )
+            self.accessor = goblin::elf::Elf::parse(&cfg.vmlinux_data)
                 .ok()
-            });
+                .and_then(|elf| {
+                    GuestMemMapAccessorOwned::from_elf_with_hint(
+                        Arc::clone(&cfg.mem),
+                        &elf,
+                        &cfg.vmlinux_data,
+                        &cfg.vmlinux,
+                        cfg.tcr_el1,
+                        live_cr3,
+                        phys_base,
+                    )
+                    .ok()
+                });
         }
         let Some(owned) = self.accessor.as_ref() else {
             return Vec::new();
@@ -3407,11 +3413,7 @@ mod tests {
         assert_eq!(le_uint(&[0x34, 0x12], 2), Some(0x1234));
         assert_eq!(le_uint(&[0x78, 0x56, 0x34, 0x12], 4), Some(0x1234_5678));
         assert_eq!(le_uint(&[0xff], 1), Some(0xff));
-        assert_eq!(
-            le_uint(&[1, 0, 0, 0, 0, 0, 0, 0], 8),
-            Some(1),
-            "8-byte LE",
-        );
+        assert_eq!(le_uint(&[1, 0, 0, 0, 0, 0, 0, 0], 8), Some(1), "8-byte LE",);
         // Reads only `width` bytes even when more are present.
         assert_eq!(le_uint(&[0x34, 0x12, 0xff, 0xff], 2), Some(0x1234));
         // Short slice / unsupported width -> None.
@@ -3477,7 +3479,12 @@ mod tests {
             &[0x30, 0x40],
         ));
         // Different obj prefix -> changed.
-        assert!(active_set_changed(Some("bpf_bpf"), &[0x10], "scx_lavd", &[0x10]));
+        assert!(active_set_changed(
+            Some("bpf_bpf"),
+            &[0x10],
+            "scx_lavd",
+            &[0x10]
+        ));
         // Identical set, active reordered (cached is sorted) -> NOT changed.
         assert!(!active_set_changed(
             Some("bpf_bpf"),

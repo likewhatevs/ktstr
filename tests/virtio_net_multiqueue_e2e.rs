@@ -56,8 +56,9 @@ use wide_smp_irq::virtio_net_iface;
 /// virtio-net offering 4 queue-pairs with a deterministic locally-administered
 /// MAC. Const because the `networks = [...]` macro arg needs a const-evaluable
 /// path; `NetConfig::DEFAULT.mac(..).queue_pairs(..)` is the const-fn chain.
-const KTSTR_NET: NetConfig =
-    NetConfig::DEFAULT.mac([0x52, 0x54, 0x00, 0x12, 0x34, 0x58]).queue_pairs(4);
+const KTSTR_NET: NetConfig = NetConfig::DEFAULT
+    .mac([0x52, 0x54, 0x00, 0x12, 0x34, 0x58])
+    .queue_pairs(4);
 
 /// The NIC's offered queue-pair maximum (matches `KTSTR_NET.queue_pairs`).
 const OFFERED_PAIRS: usize = 4;

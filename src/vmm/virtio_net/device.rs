@@ -25,9 +25,9 @@ use vm_memory::{Address, ByteValued, Bytes, GuestAddress, GuestMemoryMmap};
 use vmm_sys_util::eventfd::EventFd;
 
 use super::counters::VirtioNetCounters;
-use crate::vmm::virtio_msix::{IrqSource, MsixState};
 use crate::vmm::PiMutex;
 use crate::vmm::net_config::NetConfig;
+use crate::vmm::virtio_msix::{IrqSource, MsixState};
 
 pub(crate) const MMIO_MAGIC: u32 = 0x7472_6976; // "virt" in LE
 pub(crate) const MMIO_VERSION: u32 = 2; // virtio 1.x MMIO
@@ -1127,7 +1127,11 @@ impl VirtioNet {
 
     fn selected_queue(&self) -> Option<usize> {
         let idx = self.queue_select as usize;
-        if idx < self.queues.len() { Some(idx) } else { None }
+        if idx < self.queues.len() {
+            Some(idx)
+        } else {
+            None
+        }
     }
 
     // Net does not negotiate VIRTIO_RING_F_EVENT_IDX so the combined
@@ -1425,11 +1429,7 @@ impl VirtioNet {
                 // and the TX add_used at the end of this iteration
                 // determines whether tx_packets bumps at all.
                 let outcome = self.try_loopback_to_rx(mem, len, rx_idx);
-                self.handle_rx_loopback_outcome(
-                    outcome,
-                    &mut rx_advanced,
-                    &mut rx_just_poisoned,
-                );
+                self.handle_rx_loopback_outcome(outcome, &mut rx_advanced, &mut rx_just_poisoned);
             }
             // else: chain was malformed and tx_chain_invalid was
             // already bumped inside `pop_and_capture_tx`. Neither

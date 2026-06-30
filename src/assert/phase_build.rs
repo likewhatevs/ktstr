@@ -659,11 +659,17 @@ pub(crate) fn cpu_util_comp_scale(
 ) -> f64 {
     let user = last.cpustat_user_ns.saturating_sub(first.cpustat_user_ns);
     let nice = last.cpustat_nice_ns.saturating_sub(first.cpustat_nice_ns);
-    let system = last.cpustat_system_ns.saturating_sub(first.cpustat_system_ns);
+    let system = last
+        .cpustat_system_ns
+        .saturating_sub(first.cpustat_system_ns);
     let idle = last.cpustat_idle_ns.saturating_sub(first.cpustat_idle_ns);
-    let iowait = last.cpustat_iowait_ns.saturating_sub(first.cpustat_iowait_ns);
+    let iowait = last
+        .cpustat_iowait_ns
+        .saturating_sub(first.cpustat_iowait_ns);
     let irq = last.cpustat_irq_ns.saturating_sub(first.cpustat_irq_ns);
-    let softirq = last.cpustat_softirq_ns.saturating_sub(first.cpustat_softirq_ns);
+    let softirq = last
+        .cpustat_softirq_ns
+        .saturating_sub(first.cpustat_softirq_ns);
     let steal = last.cpustat_steal_ns.saturating_sub(first.cpustat_steal_ns);
     let delta_total = [user, nice, system, idle, iowait, irq, softirq, steal]
         .into_iter()
@@ -783,9 +789,7 @@ fn fold_lat_cri(
         metrics
             .entry("avg_task_lat_cri".to_string())
             .or_insert(sum / count as f64);
-        metrics
-            .entry("max_task_lat_cri".to_string())
-            .or_insert(max);
+        metrics.entry("max_task_lat_cri".to_string()).or_insert(max);
     }
 }
 

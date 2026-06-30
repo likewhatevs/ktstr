@@ -223,26 +223,38 @@ impl ConfigSpace {
     // caller bug; each asserts `reg + width <= CONFIG_SPACE_SIZE` so it surfaces
     // as a clear debug-build assertion rather than an opaque slice-index panic.
     pub(crate) fn set_u8(&mut self, reg: u16, val: u8) {
-        debug_assert!((reg as usize) < CONFIG_SPACE_SIZE, "config-space set_u8 out of range");
+        debug_assert!(
+            (reg as usize) < CONFIG_SPACE_SIZE,
+            "config-space set_u8 out of range"
+        );
         self.space[reg as usize] = val;
     }
 
     pub(crate) fn set_u16(&mut self, reg: u16, val: u16) {
         let reg = reg as usize;
-        debug_assert!(reg + 2 <= CONFIG_SPACE_SIZE, "config-space set_u16 out of range");
+        debug_assert!(
+            reg + 2 <= CONFIG_SPACE_SIZE,
+            "config-space set_u16 out of range"
+        );
         self.space[reg..reg + 2].copy_from_slice(&val.to_le_bytes());
     }
 
     pub(crate) fn set_u32(&mut self, reg: u16, val: u32) {
         let reg = reg as usize;
-        debug_assert!(reg + 4 <= CONFIG_SPACE_SIZE, "config-space set_u32 out of range");
+        debug_assert!(
+            reg + 4 <= CONFIG_SPACE_SIZE,
+            "config-space set_u32 out of range"
+        );
         self.space[reg..reg + 4].copy_from_slice(&val.to_le_bytes());
     }
 
     /// Make the 16-bit register at `reg` writable with the given mask.
     pub(crate) fn set_wmask_u16(&mut self, reg: u16, mask: u16) {
         let reg = reg as usize;
-        debug_assert!(reg + 2 <= CONFIG_SPACE_SIZE, "config-space set_wmask_u16 out of range");
+        debug_assert!(
+            reg + 2 <= CONFIG_SPACE_SIZE,
+            "config-space set_wmask_u16 out of range"
+        );
         self.wmask[reg..reg + 2].copy_from_slice(&mask.to_le_bytes());
     }
 
@@ -252,7 +264,10 @@ impl ConfigSpace {
     /// probe (write all-ones, read back) recovers the region size.
     pub(crate) fn set_wmask_u32(&mut self, reg: u16, mask: u32) {
         let reg = reg as usize;
-        debug_assert!(reg + 4 <= CONFIG_SPACE_SIZE, "config-space set_wmask_u32 out of range");
+        debug_assert!(
+            reg + 4 <= CONFIG_SPACE_SIZE,
+            "config-space set_wmask_u32 out of range"
+        );
         self.wmask[reg..reg + 4].copy_from_slice(&mask.to_le_bytes());
     }
 }
@@ -395,7 +410,10 @@ impl PciBus {
     pub(crate) fn bar_mmio_read(&mut self, gpa: u64, data: &mut [u8]) {
         match self.bar_owner(gpa) {
             Some((slot, base)) => {
-                self.funcs[slot].as_mut().unwrap().bar_read(gpa - base, data);
+                self.funcs[slot]
+                    .as_mut()
+                    .unwrap()
+                    .bar_read(gpa - base, data);
             }
             None => data.fill(0xFF),
         }
@@ -406,7 +424,10 @@ impl PciBus {
     /// dropped.
     pub(crate) fn bar_mmio_write(&mut self, gpa: u64, data: &[u8]) {
         if let Some((slot, base)) = self.bar_owner(gpa) {
-            self.funcs[slot].as_mut().unwrap().bar_write(gpa - base, data);
+            self.funcs[slot]
+                .as_mut()
+                .unwrap()
+                .bar_write(gpa - base, data);
         }
     }
 
@@ -520,9 +541,7 @@ mod tests {
     const SIZE: u64 = ECAM_BYTES_PER_BUS;
 
     fn read_u32(bus: &PciBus, devfn: u8, reg: u16) -> u32 {
-        let gpa = BASE
-            + ((devfn as u64) << ECAM_DEVFN_SHIFT)
-            + reg as u64;
+        let gpa = BASE + ((devfn as u64) << ECAM_DEVFN_SHIFT) + reg as u64;
         let mut data = [0u8; 4];
         bus.ecam_read(gpa, &mut data);
         u32::from_le_bytes(data)

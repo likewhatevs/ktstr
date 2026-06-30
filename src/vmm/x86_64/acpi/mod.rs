@@ -16,9 +16,9 @@ use zerocopy::IntoBytes;
 
 use super::topology::apic_id;
 use crate::vmm::kvm::{
-    virtio_blk_pci_gsi, virtio_blk_pci_slot, virtio_net_gsi, virtio_net_pci_slot,
-    ACPI_PM1_CNT_PORT, ACPI_PM1_EVT_PORT, ACPI_PM_TMR_PORT, ACPI_SCI_IRQ, HIMEM_START,
-    PCI_ECAM_BASE, PCI_ECAM_SIZE, PCI_MMIO_BAR_BASE, PCI_MMIO_BAR_SIZE,
+    ACPI_PM_TMR_PORT, ACPI_PM1_CNT_PORT, ACPI_PM1_EVT_PORT, ACPI_SCI_IRQ, HIMEM_START,
+    PCI_ECAM_BASE, PCI_ECAM_SIZE, PCI_MMIO_BAR_BASE, PCI_MMIO_BAR_SIZE, virtio_blk_pci_gsi,
+    virtio_blk_pci_slot, virtio_net_gsi, virtio_net_pci_slot,
 };
 use crate::vmm::numa_mem::NumaMemoryLayout;
 use crate::vmm::topology::Topology;

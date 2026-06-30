@@ -120,7 +120,13 @@ fn eisaid(id: &str) -> Vec<u8> {
     // is a caller bug that should fail loudly rather than silently encode only
     // the first 7. All callers pass 7-char string literals, so this never fires.
     assert!(b.len() == 7, "EISA id must be exactly 7 chars, got {id:?}");
-    let hex = |c: u8| if c.is_ascii_digit() { c - b'0' } else { c - b'A' + 10 };
+    let hex = |c: u8| {
+        if c.is_ascii_digit() {
+            c - b'0'
+        } else {
+            c - b'A' + 10
+        }
+    };
     let packed: u32 = ((b[0] - 0x40) as u32) << 26
         | ((b[1] - 0x40) as u32) << 21
         | ((b[2] - 0x40) as u32) << 16
@@ -211,7 +217,10 @@ fn dword_memory(min: u32, max: u32) -> Vec<u8> {
     // Today's sole caller bounds max below the IOAPIC, but the math must be
     // correct independent of that.
     let length = max as u64 - min as u64 + 1;
-    debug_assert!(length <= u32::MAX as u64, "DWordMemory window exceeds 32-bit length");
+    debug_assert!(
+        length <= u32::MAX as u64,
+        "DWordMemory window exceeds 32-bit length"
+    );
     let mut o = vec![0x87]; // DWord Address Space Descriptor
     o.extend_from_slice(&0x0017u16.to_le_bytes()); // descriptor length = 23
     o.push(0x00); // resource type: memory range
@@ -447,11 +456,17 @@ mod tests {
         let contains = |needle: &[u8]| body.windows(needle.len()).any(|w| w == needle);
         assert!(contains(&[0x0C, 0x41, 0xD0, 0x0A, 0x08]), "PNP0A08 _HID");
         assert!(contains(&[0x0C, 0x41, 0xD0, 0x0A, 0x03]), "PNP0A03 _CID");
-        assert!(contains(&[0x0C, 0x41, 0xD0, 0x0C, 0x02]), "PNP0C02 reservation");
+        assert!(
+            contains(&[0x0C, 0x41, 0xD0, 0x0C, 0x02]),
+            "PNP0C02 reservation"
+        );
         assert!(contains(&[0x88, 0x0D, 0x00]), "WordBusNumber descriptor");
         assert!(contains(&[0x87, 0x17, 0x00]), "DWordMemory descriptor");
         assert!(contains(&[0x86, 0x09, 0x00]), "Memory32Fixed descriptor");
-        assert!(contains(&[0x79, 0x00]), "ResourceTemplate EndTag + checksum");
+        assert!(
+            contains(&[0x79, 0x00]),
+            "ResourceTemplate EndTag + checksum"
+        );
         // Device opcode (0x5B 0x82) appears for PCI0 and PCIR.
         assert!(contains(&[0x5B, 0x82]), "Device opcode");
         // _PRT NameSeg present.
@@ -498,13 +513,8 @@ mod tests {
         // slot 1+i, GSI 7+i skipping the SCI (9) — to prove the encoder lays
         // each NIC's slot/GSI down verbatim rather than reusing one route.
         let routes = [(1u32, 7u32), (2, 8), (3, 10)];
-        let body = pci_host_bridge_dsdt_body(
-            0xE000_0000,
-            0x10_0000,
-            0xE010_0000,
-            0xFEBF_FFFF,
-            &routes,
-        );
+        let body =
+            pci_host_bridge_dsdt_body(0xE000_0000, 0x10_0000, 0xE010_0000, 0xFEBF_FFFF, &routes);
         let contains = |needle: &[u8]| body.windows(needle.len()).any(|w| w == needle);
         for &(slot, gsi) in &routes {
             let entry = [
@@ -512,9 +522,7 @@ mod tests {
                 0x0B, // PkgLength (content 10 bytes)
                 0x04, // NumElements = 4
                 0x0C, // Address: DWord prefix
-                0xFF,
-                0xFF,
-                slot as u8, // high word low byte = slot
+                0xFF, 0xFF, slot as u8, // high word low byte = slot
                 0x00,       // high word high byte
                 0x00,       // Pin = INTA#
                 0x00,       // Source = static GSI routing

@@ -2,8 +2,8 @@
 //!
 //! Split from rust_init.rs; the shared consts/statics/imports live in the
 //! parent module (`super`), reached via the glob below.
-use crate::scenario::ops::{ScxState, scx_state};
 use super::*;
+use crate::scenario::ops::{ScxState, scx_state};
 
 /// Outcome of [`poll_startup`].
 #[derive(Debug)]
@@ -734,10 +734,7 @@ pub(crate) fn spawn_scheduler_from_paths(
             // Drain the probe pipeline before reboot so PROBE_OUTPUT_END
             // is emitted over the bulk port ahead of force_reboot.
             // No-op when no probe stack was supplied.
-            drain_probe_pipeline(
-                probe_drain.as_ref(),
-                crate::test_support::PROBE_DRAIN_GRACE,
-            );
+            drain_probe_pipeline(probe_drain.as_ref(), crate::test_support::PROBE_DRAIN_GRACE);
             force_reboot();
         }
         Err(SpawnSchedulerError::StartupDied { log_path }) => {
@@ -753,10 +750,7 @@ pub(crate) fn spawn_scheduler_from_paths(
                 "",
             );
             crate::vmm::guest_comms::send_exit(1);
-            drain_probe_pipeline(
-                probe_drain.as_ref(),
-                crate::test_support::PROBE_DRAIN_GRACE,
-            );
+            drain_probe_pipeline(probe_drain.as_ref(), crate::test_support::PROBE_DRAIN_GRACE);
             force_reboot();
         }
         Err(SpawnSchedulerError::NotAttached { reason, log_path }) => {
@@ -766,10 +760,7 @@ pub(crate) fn spawn_scheduler_from_paths(
                 reason,
             );
             crate::vmm::guest_comms::send_exit(1);
-            drain_probe_pipeline(
-                probe_drain.as_ref(),
-                crate::test_support::PROBE_DRAIN_GRACE,
-            );
+            drain_probe_pipeline(probe_drain.as_ref(), crate::test_support::PROBE_DRAIN_GRACE);
             force_reboot();
         }
     }
@@ -821,7 +812,10 @@ mod tests {
         let pd = probe_drain();
         let t0 = std::time::Instant::now();
         let drained = drain_probe_pipeline(Some(&pd), std::time::Duration::from_millis(20));
-        assert!(!drained, "unset output_done -> cap-hit -> false (not a hang)");
+        assert!(
+            !drained,
+            "unset output_done -> cap-hit -> false (not a hang)"
+        );
         assert!(
             t0.elapsed() < std::time::Duration::from_secs(2),
             "returned at the cap, did not wait unbounded"
@@ -852,6 +846,9 @@ mod tests {
     /// No probe stack -> no-op, returns `true` (every caller is a no-op).
     #[test]
     fn drain_probe_pipeline_none_is_noop() {
-        assert!(drain_probe_pipeline(None, std::time::Duration::from_millis(1)));
+        assert!(drain_probe_pipeline(
+            None,
+            std::time::Duration::from_millis(1)
+        ));
     }
 }

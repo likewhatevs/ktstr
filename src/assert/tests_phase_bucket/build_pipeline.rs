@@ -1022,7 +1022,10 @@ fn cpu_util_comp_scale_matches_scx_layered_reference_cases() {
     };
     assert!((case(1000, 0) - 1.0).abs() < 1e-9, "no overhead -> 1.0");
     assert!((case(1000, 500) - 2.0).abs() < 1e-9, "50% overhead -> 2.0");
-    assert!((case(1000, 900) - 10.0).abs() < 1e-9, "90% overhead -> 10.0");
+    assert!(
+        (case(1000, 900) - 10.0).abs() < 1e-9,
+        "90% overhead -> 10.0"
+    );
     assert!(
         (case(1000, 950) - 20.0).abs() < 1e-9,
         "95% overhead -> 20.0 (cap)"
@@ -1131,7 +1134,11 @@ fn build_phase_buckets_injects_avg_cpu_util_comp_scale_mean_across_cpus() {
     };
     let drained = vec![
         entry("periodic_000", 100, vec![row(0, 0, 0), row(1, 0, 0)]),
-        entry("periodic_001", 200, vec![row(0, 500, 500), row(1, 250, 750)]),
+        entry(
+            "periodic_001",
+            200,
+            vec![row(0, 500, 500), row(1, 250, 750)],
+        ),
     ];
     let samples = SampleSeries::from_drained_typed(drained, None);
     let phases = crate::assert::build_phase_buckets(&samples);

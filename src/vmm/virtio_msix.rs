@@ -496,7 +496,11 @@ mod tests {
         // to the cap (the guest then falls back to SHARED across the queues),
         // while the per-queue map still tracks every queue.
         let s = MsixState::new(1000, 8);
-        assert_eq!(s.num_vectors(), 8, "advertised vectors capped at max_vectors");
+        assert_eq!(
+            s.num_vectors(),
+            8,
+            "advertised vectors capped at max_vectors"
+        );
         assert_eq!(s.queue_vector(999), NO_VECTOR, "every queue still tracked");
     }
 
@@ -527,10 +531,13 @@ mod tests {
         // vectors 3,4) that the single-pair tests never exercise — the path an
         // off-by-one in per-pair indexing would slip through.
         let mut s = MsixState::new(5, MSIX_TABLE_MAX);
-        assert_eq!(s.num_vectors(), 6, "config + one vector per vq (cvq slot spare)");
+        assert_eq!(
+            s.num_vectors(),
+            6,
+            "config + one vector per vq (cvq slot spare)"
+        );
         // One eventfd per data vector (0..=4); vector 5 (the cvq spare) is unused.
-        let evts: [EventFd; 5] =
-            std::array::from_fn(|_| EventFd::new(libc::EFD_NONBLOCK).unwrap());
+        let evts: [EventFd; 5] = std::array::from_fn(|_| EventFd::new(libc::EFD_NONBLOCK).unwrap());
         for (v, evt) in evts.iter().enumerate() {
             s.set_eventfd(v, evt.try_clone().unwrap());
         }
@@ -582,7 +589,11 @@ mod tests {
         assert!(!s.write_table_dword(1, VECTOR_CTRL_DWORD, VECTOR_CTRL_MASK_BIT));
         s.signal(IrqSource::Vring { queue: 0 });
         assert_eq!(drain(&evts[1]), 0, "masked vector does not fire");
-        assert_eq!(s.pba_byte(0) & (1 << 1), 1 << 1, "pending bit set for vector 1");
+        assert_eq!(
+            s.pba_byte(0) & (1 << 1),
+            1 << 1,
+            "pending bit set for vector 1"
+        );
         // Unmask → replay fires once, pending clears.
         let unmasked = s.write_table_dword(1, VECTOR_CTRL_DWORD, 0);
         assert!(unmasked, "clearing mask bit is an unmask edge");
@@ -648,7 +659,11 @@ mod tests {
         s.set_message_control(0x8000);
         s.set_config_vector(99); // would be clamped by the facade; defensive here
         s.signal(IrqSource::Config);
-        assert_eq!(s.pba_byte(0), 0, "out-of-range vector neither fires nor pends");
+        assert_eq!(
+            s.pba_byte(0),
+            0,
+            "out-of-range vector neither fires nor pends"
+        );
     }
 
     #[test]
