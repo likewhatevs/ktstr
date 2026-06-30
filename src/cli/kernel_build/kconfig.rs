@@ -539,17 +539,14 @@ mod tests {
     #[test]
     fn validate_kernel_config_all_present() {
         let dir = tempfile::TempDir::new().unwrap();
-        std::fs::write(
-            dir.path().join(".config"),
-            "CONFIG_SCHED_CLASS_EXT=y\n\
-             CONFIG_DEBUG_INFO_BTF=y\n\
-             CONFIG_BPF_SYSCALL=y\n\
-             CONFIG_FTRACE=y\n\
-             CONFIG_KPROBE_EVENTS=y\n\
-             CONFIG_BPF_EVENTS=y\n\
-             CONFIG_VIRTIO_BLK=y\n",
-        )
-        .unwrap();
+        // Every critical option present => validation passes. Generated from
+        // VALIDATE_CONFIG_CRITICAL (not a hand-picked subset) so the test stays
+        // complete as the critical list grows.
+        let content: String = VALIDATE_CONFIG_CRITICAL
+            .iter()
+            .map(|(option, _)| format!("{option}=y\n"))
+            .collect();
+        std::fs::write(dir.path().join(".config"), content).unwrap();
         assert!(validate_kernel_config(dir.path()).is_ok());
     }
 
@@ -595,17 +592,20 @@ mod tests {
     #[test]
     fn validate_kernel_config_trim_handles_crlf_and_trailing_whitespace() {
         let dir = tempfile::TempDir::new().unwrap();
-        std::fs::write(
-            dir.path().join(".config"),
-            "CONFIG_SCHED_CLASS_EXT=y\r\n\
-             CONFIG_DEBUG_INFO_BTF=y \n\
-             CONFIG_BPF_SYSCALL=y\r\n\
-             CONFIG_FTRACE=y \n\
-             CONFIG_KPROBE_EVENTS=y\r\n\
-             CONFIG_BPF_EVENTS=y \n\
-             CONFIG_VIRTIO_BLK=y\r\n",
-        )
-        .unwrap();
+        // Write EVERY critical option as `=y`, alternating dirty line endings
+        // (`\r\n`) and trailing spaces so each required line needs trimming to
+        // be recognized. Generated from VALIDATE_CONFIG_CRITICAL (not a
+        // hand-picked subset) so the test stays complete — and keeps testing
+        // trim on the whole set — as the critical list grows.
+        let mut content = String::new();
+        for (i, (option, _)) in VALIDATE_CONFIG_CRITICAL.iter().enumerate() {
+            if i % 2 == 0 {
+                content.push_str(&format!("{option}=y\r\n")); // CRLF
+            } else {
+                content.push_str(&format!("{option}=y \n")); // trailing space
+            }
+        }
+        std::fs::write(dir.path().join(".config"), content).unwrap();
         let result = validate_kernel_config(dir.path());
         assert!(
             result.is_ok(),
