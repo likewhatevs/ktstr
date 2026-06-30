@@ -830,6 +830,34 @@ impl WatchpointArm {
         self.any_armed.store(1, Ordering::Relaxed);
     }
 
+    /// Disarm slot 0 (the freeze coordinator's
+    /// `*scx_root->exit_kind` watchpoint): clear `request_kva`, null
+    /// `kind_host_ptr`, then clear the sticky `hit`. Used whenever the
+    /// `scx_sched` the slot watches is being torn down — the scheduler
+    /// detach / rebind the scan-tick poll detects, AND the explicit
+    /// guest swap-notify the freeze coordinator processes synchronously
+    /// — so a stale DR0 can no longer fire into the now-RCU-freed (and
+    /// possibly slab-recycled) page.
+    ///
+    /// Store order is load-bearing: `request_kva` FIRST (Release), then
+    /// `kind_host_ptr` (Release), then `hit` (Release). Clearing
+    /// `request_kva` first makes a racing vCPU's Acquire load return 0
+    /// so its next `self_arm_watchpoint` reissues
+    /// `KVM_SET_GUEST_DEBUG` without slot 0's enable bits (clearing
+    /// DR0 / DR7 L0/G0) BEFORE the host pointer is nulled; an in-flight
+    /// `read_volatile` on the previously-observed pointer stays safe
+    /// because the host mapping (`vm.guest_mem`) outlives every vCPU
+    /// thread. Clearing `hit` prevents the late-trigger arm from
+    /// re-observing a stale fire from the scheduler whose teardown this
+    /// disarm closes out; real errors still latch via the BPF `.bss`
+    /// `err_triggered` path, which is independent of `hit`.
+    pub(crate) fn disarm(&self) {
+        self.request_kva.store(0, Ordering::Release);
+        self.kind_host_ptr
+            .store(std::ptr::null_mut(), Ordering::Release);
+        self.hit.store(false, Ordering::Release);
+    }
+
     /// Latch `hit=true` AND wake the freeze coordinator's epoll loop
     /// — but only on the false→true transition. Used on every
     /// `KVM_EXIT_DEBUG` site that confirms an error-class write to

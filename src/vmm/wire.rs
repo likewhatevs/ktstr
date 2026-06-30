@@ -224,6 +224,23 @@ pub enum MsgType {
     /// printk via `/dev/hvc0`), which depended on incidental
     /// console traffic rather than an explicit readiness signal.
     SysRdy,
+    /// Guest→host scheduler-swap notification (payload: empty).
+    ///
+    /// Emitted by the guest's `kill_current_scheduler`
+    /// (`Op::DetachScheduler` / `RestartScheduler` / `ReplaceScheduler`)
+    /// AFTER `wait_for_scx_disabled` returns, so by the time the host
+    /// observes the frame the kernel has already NULLed `*scx_root`
+    /// (`RCU_INIT_POINTER(scx_root, NULL)` precedes
+    /// `scx_set_enable_state(SCX_DISABLED)` in kernel/sched/ext.c) and
+    /// the prior scx_sched object is unlinked (`*scx_root` NULLed) and
+    /// its slab is subject to RCU-grace-period reuse. The freeze
+    /// coordinator decodes a CRC-valid frame and SYNCHRONOUSLY
+    /// invalidates the periodic-capture accessor (mirroring the
+    /// watchpoint poll's Detached teardown) rather than waiting up to
+    /// one SCAN_INTERVAL for the poll to notice the rebind — collapsing
+    /// the post-swap periodic-capture defer window. Coordinator-internal:
+    /// carries no test verdict.
+    SchedSwapNotify,
 }
 
 impl MsgType {
@@ -250,6 +267,7 @@ impl MsgType {
             MsgType::KernelOpRequest => MSG_TYPE_KERNEL_OP_REQUEST,
             MsgType::KernelOpReply => MSG_TYPE_KERNEL_OP_REPLY,
             MsgType::SysRdy => MSG_TYPE_SYS_RDY,
+            MsgType::SchedSwapNotify => MSG_TYPE_SCHED_SWAP_NOTIFY,
             MsgType::Stdout => MSG_TYPE_STDOUT,
             MsgType::Stderr => MSG_TYPE_STDERR,
             MsgType::SchedLog => MSG_TYPE_SCHED_LOG,
@@ -284,6 +302,7 @@ impl MsgType {
             MSG_TYPE_KERNEL_OP_REQUEST => Some(MsgType::KernelOpRequest),
             MSG_TYPE_KERNEL_OP_REPLY => Some(MsgType::KernelOpReply),
             MSG_TYPE_SYS_RDY => Some(MsgType::SysRdy),
+            MSG_TYPE_SCHED_SWAP_NOTIFY => Some(MsgType::SchedSwapNotify),
             MSG_TYPE_STDOUT => Some(MsgType::Stdout),
             MSG_TYPE_STDERR => Some(MsgType::Stderr),
             MSG_TYPE_SCHED_LOG => Some(MsgType::SchedLog),
@@ -322,6 +341,10 @@ impl MsgType {
     ///   - [`MsgType::SysRdy`] — its only semantic is the eventfd
     ///     promotion that releases the monitor's pre-sample
     ///     `epoll_wait`.
+    ///   - [`MsgType::SchedSwapNotify`] — its only semantic is the
+    ///     synchronous periodic-capture accessor teardown the freeze
+    ///     coordinator performs on a CRC-valid frame; carries no test
+    ///     verdict.
     pub const fn is_coordinator_internal(self) -> bool {
         matches!(
             self,
@@ -330,6 +353,7 @@ impl MsgType {
                 | MsgType::KernelOpRequest
                 | MsgType::KernelOpReply
                 | MsgType::SysRdy
+                | MsgType::SchedSwapNotify
         )
     }
 }
@@ -465,6 +489,17 @@ pub const MSG_TYPE_SNAPSHOT_REPLY: u32 = 0x534e_5250; // "SNRP"
 /// `MSG_TYPE_SYS_RDY` frame into the monitor's boot-complete
 /// eventfd. See [`MsgType::SysRdy`] for the protocol contract.
 pub const MSG_TYPE_SYS_RDY: u32 = 0x5352_4459; // "SRDY"
+
+/// Guest→host scheduler-swap notification (payload: empty).
+///
+/// Tag spelled `"SCSW"` (SCheduler SWap) in hex digits; on-wire bytes
+/// (LE) are `0x57 0x53 0x43 0x53` (`"WSCS"` byte-by-byte). Emitted by
+/// the guest's `kill_current_scheduler` after `wait_for_scx_disabled`
+/// returns (so `*scx_root` is already NULL); the freeze coordinator
+/// synchronously invalidates the periodic-capture accessor on a
+/// CRC-valid frame. See [`MsgType::SchedSwapNotify`] for the protocol
+/// contract.
+pub const MSG_TYPE_SCHED_SWAP_NOTIFY: u32 = 0x5343_5357; // "SCSW"
 
 /// Guest→host stdout chunk (payload: opaque UTF-8 bytes).
 ///
@@ -1477,6 +1512,7 @@ mod tests {
             MSG_TYPE_KERNEL_OP_REQUEST,
             MSG_TYPE_KERNEL_OP_REPLY,
             MSG_TYPE_SYS_RDY,
+            MSG_TYPE_SCHED_SWAP_NOTIFY,
             MSG_TYPE_STDOUT,
             MSG_TYPE_STDERR,
             MSG_TYPE_SCHED_LOG,
@@ -1550,6 +1586,7 @@ mod tests {
             MsgType::KernelOpRequest,
             MsgType::KernelOpReply,
             MsgType::SysRdy,
+            MsgType::SchedSwapNotify,
             MsgType::Stdout,
             MsgType::Stderr,
             MsgType::SchedLog,
@@ -1622,11 +1659,16 @@ mod tests {
         assert_eq!(MsgType::ExecExit.wire_value(), MSG_TYPE_EXEC_EXIT);
         assert_eq!(MsgType::Dmesg.wire_value(), MSG_TYPE_DMESG);
         assert_eq!(MsgType::ProbeOutput.wire_value(), MSG_TYPE_PROBE_OUTPUT);
+        assert_eq!(
+            MsgType::SchedSwapNotify.wire_value(),
+            MSG_TYPE_SCHED_SWAP_NOTIFY
+        );
     }
 
     /// `is_coordinator_internal` flips on for SnapshotRequest,
-    /// SnapshotReply, KernelOpRequest, KernelOpReply, and SysRdy
-    /// and stays off for every test-verdict-bearing variant. The
+    /// SnapshotReply, KernelOpRequest, KernelOpReply, SysRdy, and
+    /// SchedSwapNotify and stays off for every test-verdict-bearing
+    /// variant. The
     /// Reply variants are host→guest only on port-1 RX; a guest TX
     /// frame stamped with one of those tags is illegitimate and
     /// must be dropped rather than bucketed as a phantom verdict
@@ -1645,6 +1687,7 @@ mod tests {
             MsgType::KernelOpRequest,
             MsgType::KernelOpReply,
             MsgType::SysRdy,
+            MsgType::SchedSwapNotify,
         ];
         let verdict = [
             MsgType::Stimulus,
@@ -1681,6 +1724,21 @@ mod tests {
                 "{v:?} carries test verdict data and must NOT be filtered out"
             );
         }
+    }
+
+    /// `MsgType::SchedSwapNotify` round-trips `wire_value` →
+    /// `from_wire`, carries the stable `"SCSW"` (0x5343_5357)
+    /// discriminant, and is classified coordinator-internal so the
+    /// freeze coord's mid-run filter and `collect_results`'s post-run
+    /// drain both drop it rather than bucketing a phantom verdict.
+    #[test]
+    fn sched_swap_notify_round_trips() {
+        assert_eq!(
+            MsgType::from_wire(MsgType::SchedSwapNotify.wire_value()),
+            Some(MsgType::SchedSwapNotify)
+        );
+        assert_eq!(MsgType::SchedSwapNotify.wire_value(), 0x5343_5357);
+        assert!(MsgType::SchedSwapNotify.is_coordinator_internal());
     }
 
     /// `LifecyclePhase` round-trips through `wire_value` →

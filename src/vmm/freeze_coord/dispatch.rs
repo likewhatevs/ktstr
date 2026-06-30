@@ -3,11 +3,23 @@
 //! The freeze coordinator's TOKEN_TX epoll branch drives this module:
 //! after `bulk_assembler.feed(...)` returns a `BulkMessages` vec, the
 //! coordinator iterates each `BulkMessage` through
-//! [`dispatch_bulk_message`] and either pushes a verdict-bearing
-//! [`crate::vmm::wire::ShmEntry`] into the run-wide bucket OR triggers
-//! one of three coordinator-internal side effects (kill flag + eventfd
-//! flip on `SchedExit`, sys-rdy eventfd fire-once on `SysRdy`, decode
-//! and stash for later dispatch on `SnapshotRequest`).
+//! [`dispatch_bulk_message`], which returns a verdict-bearing
+//! [`crate::vmm::wire::ShmEntry`] for the run-wide bucket or `None`
+//! for a frame whose only dispatch effect is on `sinks`. The
+//! `None`-returning arms (no bucket entry) are `SysRdy` (fire-once
+//! sys-rdy eventfd), `SchedSwapNotify` (periodic-capture +
+//! watchpoint-invalidation latch), `KERN_ADDRS` (phys-base / KASLR
+//! stores + eventfds), and `SnapshotRequest` / `KernelOpRequest`
+//! (decode-and-stash of a request payload). Several arms return
+//! `Some` AND stamp `sinks`: `SchedExit` (`kill` flag + eventfd,
+//! bucketed only when `crc_ok`), `ScenarioStart` (scenario anchor +
+//! watchdog reset), `ScenarioPause` / `ScenarioResume` (watchdog
+//! pause / cumulative-pause), `ScenarioEnd` (watchdog reset), and
+//! `Stimulus` (host-side step-index mirror). For a variant without
+//! an explicit arm the catch-all consults
+//! [`crate::vmm::wire::MsgType::is_coordinator_internal`] — verbatim
+//! bucket push when it is false, silent drop when true. See the
+//! per-arm bodies for each arm's exact return and side effect.
 //!
 //! Splitting the dispatch out of the run-loop closure body lets test
 //! code drive arbitrary CRC-mangled frame sequences against a pure
@@ -60,6 +72,16 @@ pub(super) struct BulkDispatchSinks<'a> {
     /// hostile guest could in principle resend) skip the eventfd
     /// write.
     pub sys_rdy_evt: &'a mut Option<Arc<EventFd>>,
+    /// Scheduler-swap notification latch. Set `true` on a CRC-valid
+    /// `MSG_TYPE_SCHED_SWAP_NOTIFY` frame; the freeze coordinator's
+    /// run-loop reads-and-clears it each iteration and synchronously
+    /// invalidates the stale periodic-capture accessor (waking the
+    /// accessor-init worker to rebuild against the next scheduler)
+    /// rather than waiting up to one SCAN_INTERVAL for the scx_root
+    /// watchpoint poll to notice the rebind. A torn frame does NOT set
+    /// it (the CRC gate in the dispatch arm) so a garbled or hostile
+    /// frame cannot force a spurious mid-capture accessor rebuild.
+    pub sched_swap_notify: &'a std::sync::atomic::AtomicBool,
     /// Per-iteration accumulator for decoded
     /// `MSG_TYPE_SNAPSHOT_REQUEST` frames. Drained later in the run-
     /// loop body where `freeze_and_dispatch` /
@@ -204,6 +226,15 @@ pub(super) struct BulkDispatchSinks<'a> {
 ///   net against a hostile guest tacking smuggle bytes onto a SysRdy
 ///   frame past the [`crate::vmm::wire::MsgType::is_coordinator_internal`]
 ///   filter. Promotion is fire-once via [`Option::take`].
+/// * `MSG_TYPE_SCHED_SWAP_NOTIFY` latches the run-loop's synchronous
+///   periodic-capture + watchpoint-invalidation step ONLY when
+///   `msg.crc_ok && msg.payload.is_empty()` — the same empty-payload
+///   safety net as `SysRdy`, so a hostile guest cannot smuggle bytes
+///   past the [`crate::vmm::wire::MsgType::is_coordinator_internal`]
+///   filter under this tag. A torn frame must NOT latch: it would
+///   otherwise force a spurious accessor rebuild mid-capture. Unlike
+///   `SysRdy` the store is not fire-once — the coordinator run-loop
+///   reads-and-clears the latch (`swap(false)`) each iteration.
 /// * `MSG_TYPE_SNAPSHOT_REQUEST` decodes via [`decode_snapshot_request`]
 ///   ONLY when `msg.crc_ok`. The decoder additionally rejects
 ///   `request_id == 0`, `kind == SNAPSHOT_KIND_NONE`, and any
@@ -295,6 +326,24 @@ pub(super) fn dispatch_bulk_message(
                 );
             }
             // SysRdy is coordinator-internal — do NOT bucket.
+            None
+        }
+        Some(crate::vmm::wire::MsgType::SchedSwapNotify) => {
+            // CRC-valid, EMPTY-payload swap-notify: latch the
+            // synchronous periodic-capture + watchpoint invalidation the
+            // coordinator's run-loop performs at the top of its next
+            // iteration. A torn frame must NOT latch — a garbled or
+            // hostile frame would otherwise force a spurious accessor
+            // rebuild mid-capture. The empty-payload gate mirrors the
+            // SysRdy safety net: the latch ignores payload bytes, so a
+            // hostile guest must not be able to smuggle bytes past the
+            // is_coordinator_internal filter under this tag.
+            // Coordinator-internal — do NOT bucket (mirrors SysRdy).
+            if msg.crc_ok && msg.payload.is_empty() {
+                sinks
+                    .sched_swap_notify
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
             None
         }
         _ if msg.msg_type == crate::vmm::wire::MSG_TYPE_KERN_ADDRS => {

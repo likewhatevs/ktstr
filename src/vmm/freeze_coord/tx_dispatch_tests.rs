@@ -61,6 +61,7 @@ struct SinkState {
     kern_virt_kaslr_evt: EventFd,
     watchdog_pause_ns: AtomicU64,
     scenario_start_ns: AtomicU64,
+    sched_swap_notify: AtomicBool,
     scenario_pause_cumulative_ns: AtomicU64,
     run_start: Instant,
     current_step: Arc<AtomicU16>,
@@ -82,6 +83,7 @@ impl SinkState {
             kern_virt_kaslr_evt: EventFd::new(EFD_NONBLOCK).expect("virt_kaslr eventfd"),
             watchdog_pause_ns: AtomicU64::new(0),
             scenario_start_ns: AtomicU64::new(0),
+            sched_swap_notify: AtomicBool::new(false),
             scenario_pause_cumulative_ns: AtomicU64::new(0),
             run_start: Instant::now(),
             current_step: Arc::new(AtomicU16::new(0)),
@@ -103,6 +105,7 @@ impl SinkState {
             watchdog_reset: None,
             watchdog_pause_ns: &self.watchdog_pause_ns,
             scenario_start_ns: &self.scenario_start_ns,
+            sched_swap_notify: &self.sched_swap_notify,
             scenario_pause_cumulative_ns: &self.scenario_pause_cumulative_ns,
             run_start: self.run_start,
             current_step: &self.current_step,
@@ -122,6 +125,7 @@ struct DispatchOutcome {
     sys_rdy_counter: u64,
     sys_rdy_remaining: bool,
     snapshot_pending: usize,
+    sched_swap_notify: bool,
     bucket: Vec<ShmEntry>,
 }
 
@@ -147,6 +151,7 @@ fn run_dispatch(messages: &[crate::vmm::bulk::BulkMessage]) -> DispatchOutcome {
         sys_rdy_counter: state.sys_rdy_evt_clone.read().unwrap_or(0),
         sys_rdy_remaining: state.sys_rdy_evt.is_some(),
         snapshot_pending: state.snapshot_requests_pending.len(),
+        sched_swap_notify: state.sched_swap_notify.load(Ordering::Acquire),
         bucket,
     }
 }
@@ -224,6 +229,85 @@ fn unknown_msg_type_drops_without_bucketing() {
     assert!(
         out.sys_rdy_remaining,
         "unknown msg_type must leave the SYS_RDY handle intact"
+    );
+}
+
+/// A CRC-valid SCHED_SWAP_NOTIFY latches `sched_swap_notify` — the flag
+/// the coordinator run-loop reads-and-clears to synchronously tear down
+/// the stale periodic-capture accessor on a swap Op — and is
+/// coordinator-internal, so it does NOT surface as a verdict bucket
+/// entry. A CRC-torn frame must NOT latch: a garbled or hostile frame
+/// cannot force a spurious mid-capture accessor rebuild.
+#[test]
+fn sched_swap_notify_latches_only_on_valid_crc() {
+    let swap_tag = MsgType::SchedSwapNotify.wire_value();
+
+    // CRC-valid, empty payload → latches, does not bucket.
+    let mut a = HostAssembler::new();
+    let valid = frame_with_crc(swap_tag, &[]);
+    let drained = a.feed(&valid);
+    assert_eq!(drained.messages.len(), 1);
+    let out = run_dispatch(&drained.messages);
+    assert!(
+        out.sched_swap_notify,
+        "CRC-valid SCHED_SWAP_NOTIFY must latch the accessor-invalidation flag"
+    );
+    assert!(
+        out.bucket.is_empty(),
+        "SCHED_SWAP_NOTIFY is coordinator-internal — must NOT bucket a verdict entry"
+    );
+
+    // CRC-torn → must NOT latch.
+    let mut a2 = HostAssembler::new();
+    let torn = frame_with_torn_crc(swap_tag, &[]);
+    let drained2 = a2.feed(&torn);
+    assert_eq!(drained2.messages.len(), 1);
+    let out2 = run_dispatch(&drained2.messages);
+    assert!(
+        !out2.sched_swap_notify,
+        "CRC-torn SCHED_SWAP_NOTIFY must NOT latch (no spurious accessor rebuild)"
+    );
+    assert!(
+        out2.bucket.is_empty(),
+        "a torn coordinator-internal frame must not bucket either"
+    );
+
+    // CRC-valid but NON-EMPTY payload → must NOT latch. The empty-
+    // payload shape gate mirrors SysRdy: the latch ignores payload
+    // bytes, so a hostile guest cannot smuggle bytes past the
+    // is_coordinator_internal filter under this tag.
+    let mut a3 = HostAssembler::new();
+    let nonempty = frame_with_crc(swap_tag, b"smuggle");
+    let drained3 = a3.feed(&nonempty);
+    assert_eq!(drained3.messages.len(), 1);
+    let out3 = run_dispatch(&drained3.messages);
+    assert!(
+        !out3.sched_swap_notify,
+        "CRC-valid but non-empty SCHED_SWAP_NOTIFY must NOT latch (empty-payload gate)"
+    );
+    assert!(
+        out3.bucket.is_empty(),
+        "a non-empty coordinator-internal frame must not bucket either"
+    );
+
+    // Back-to-back: two CRC-valid empty frames in ONE batch collapse to
+    // a single latched `true`. The run-loop reads-and-clears the latch
+    // once per iteration and the teardown is idempotent, so multiple
+    // swaps in a drain window yield one Detached teardown. Pins the
+    // AtomicBool store(true)/swap(false) collapse contract.
+    let mut a4 = HostAssembler::new();
+    let mut two = frame_with_crc(swap_tag, &[]);
+    two.extend_from_slice(&frame_with_crc(swap_tag, &[]));
+    let drained4 = a4.feed(&two);
+    assert_eq!(drained4.messages.len(), 2, "two frames decoded from one batch");
+    let out4 = run_dispatch(&drained4.messages);
+    assert!(
+        out4.sched_swap_notify,
+        "two back-to-back valid SCHED_SWAP_NOTIFY frames collapse to one latched true"
+    );
+    assert!(
+        out4.bucket.is_empty(),
+        "neither coordinator-internal frame buckets a verdict entry"
     );
 }
 

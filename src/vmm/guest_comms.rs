@@ -533,6 +533,41 @@ pub fn send_sched_exit(code: i32) {
     write_msg(MsgType::SchedExit.wire_value(), &code.to_le_bytes());
 }
 
+/// Send a scheduler-swap notification to the host. Payload: empty.
+///
+/// Emitted by `kill_current_scheduler` (Op::DetachScheduler /
+/// RestartScheduler / ReplaceScheduler) AFTER `wait_for_scx_disabled`
+/// returns — so the kernel has already NULLed `*scx_root`
+/// (`RCU_INIT_POINTER(scx_root, NULL)` precedes
+/// `scx_set_enable_state(SCX_DISABLED)` in kernel/sched/ext.c) and the
+/// prior scx_sched object is unlinked (`*scx_root` NULLed) and its
+/// slab is subject to RCU-grace-period reuse. The host's freeze
+/// coordinator decodes a CRC-valid frame and synchronously invalidates
+/// the periodic-capture accessor (so the accessor-init worker rebuilds
+/// against the next scheduler) rather than waiting up to one
+/// SCAN_INTERVAL for its scx_root watchpoint poll to notice the rebind.
+///
+/// A lost frame is non-fatal: the watchpoint poll still tears the stale
+/// accessor down within one SCAN_INTERVAL — the notify only collapses
+/// that defer window. Retries up to 5×100 ms to ride out a transient
+/// bulk-port hiccup, matching [`send_scenario_start`]; the port is
+/// long-open by Op-dispatch time so a retry rarely fires.
+pub fn send_sched_swap_notify() {
+    for attempt in 0..5 {
+        if write_msg(MsgType::SchedSwapNotify.wire_value(), &[]) {
+            return;
+        }
+        if attempt + 1 < 5 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+    tracing::warn!(
+        "send_sched_swap_notify: 5 retries failed — bulk port write never \
+         succeeded; the host watchpoint poll will tear the stale \
+         periodic-capture accessor down within one SCAN_INTERVAL instead"
+    );
+}
+
 /// Send a scenario-start marker.
 ///
 /// `MSG_TYPE_SCENARIO_START` is load-bearing: the host's freeze
@@ -1558,6 +1593,17 @@ mod tests {
     fn send_scenario_start_from_host_context_is_noop() {
         let _g = IsGuestOverrideGuard::new(false);
         assert_no_bulk_write("send_scenario_start", send_scenario_start);
+    }
+
+    /// `send_sched_swap_notify` from host context suppresses the write.
+    /// Like `send_scenario_start` it retries the write up to 5 times
+    /// (4 × 100 ms sleeps) on a not-yet-open port; the host-context
+    /// gate must short-circuit EVERY attempt, so the write-path counter
+    /// stays put despite the retry loop.
+    #[test]
+    fn send_sched_swap_notify_from_host_context_is_noop() {
+        let _g = IsGuestOverrideGuard::new(false);
+        assert_no_bulk_write("send_sched_swap_notify", send_sched_swap_notify);
     }
 
     /// `send_scenario_end` from host context suppresses the write.

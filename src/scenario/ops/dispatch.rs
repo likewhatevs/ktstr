@@ -1817,15 +1817,14 @@ fn wait_for_scx_disabled(timeout: std::time::Duration) -> Result<std::time::Dura
 
     // Evented wake sources managed by kernfs_evented_wait:
     //   - inotify on /sys/kernel/sched_ext/ for IN_DELETE (fires
-    //     when scx_root_disable's kobject_del at
-    //     kernel/sched/ext.c:5859 removes the "root" entry)
+    //     when scx_root_disable's kobject_del (kernel/sched/ext.c)
+    //     removes the "root" entry)
     //   - POLLPRI on /sys/kernel/sched_ext/state (future-proofed
     //     for kernels that add `sysfs_notify` on the attribute)
     //
-    // REQUIRED CADENCE. Verified at kernel/sched/ext.c:5735
-    // scx_root_disable: between kobject_del (L5859, fires
-    // IN_DELETE) and the state flip (L5865,
-    // scx_set_enable_state(SCX_DISABLED)) the kernel does
+    // REQUIRED CADENCE. Verified in kernel/sched/ext.c
+    // scx_root_disable: between kobject_del (fires IN_DELETE) and
+    // the state flip (scx_set_enable_state(SCX_DISABLED)) the kernel does
     // free_kick_syncs() + mutex_unlock(&scx_enable_mutex) + the
     // atomic_xchg. Sub-microsecond gap in the common case but
     // theoretically present, AND scx emits NO further event for
@@ -1974,6 +1973,18 @@ fn kill_current_scheduler(op_label: &str) -> Result<libc::pid_t> {
         "scx state reached 'disabled' after SIGTERM",
     );
     crate::vmm::rust_init::set_sched_pid(0);
+    // Notify the host that the scheduler has been swapped out. By here
+    // `wait_for_scx_disabled` has returned, so the kernel NULLed
+    // `*scx_root` (`RCU_INIT_POINTER(scx_root, NULL)` precedes
+    // `scx_set_enable_state(SCX_DISABLED)` in kernel/sched/ext.c) and
+    // the prior scx_sched object is unlinked (`*scx_root` NULLed) and
+    // its slab is subject to RCU-grace-period reuse — the host's
+    // owned periodic-capture accessor is now stale. The frame lets the
+    // freeze coordinator invalidate that accessor synchronously rather
+    // than waiting up to one SCAN_INTERVAL for its scx_root watchpoint
+    // poll to notice the rebind. Best-effort: a lost frame falls back
+    // to the poll-driven teardown (see `send_sched_swap_notify`).
+    crate::vmm::guest_comms::send_sched_swap_notify();
     Ok(pid)
 }
 

@@ -1416,7 +1416,8 @@ fn run_ktstr_test_inner_impl(
                 Some(crate::vmm::wire::MsgType::SnapshotRequest)
                 | Some(crate::vmm::wire::MsgType::KernelOpRequest)
                 | Some(crate::vmm::wire::MsgType::KernelOpReply)
-                | Some(crate::vmm::wire::MsgType::SysRdy) => {}
+                | Some(crate::vmm::wire::MsgType::SysRdy)
+                | Some(crate::vmm::wire::MsgType::SchedSwapNotify) => {}
                 None => {
                     tracing::warn!(
                         msg_type = bulk_entry.msg_type,

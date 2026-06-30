@@ -1607,6 +1607,14 @@ impl KtstrVm {
         let scenario_start_ns: Arc<std::sync::atomic::AtomicU64> =
             Arc::new(std::sync::atomic::AtomicU64::new(0));
         let scenario_start_ns_for_coord = scenario_start_ns.clone();
+        // Scheduler-swap notification latch. The dispatch.rs
+        // SchedSwapNotify arm sets it on a CRC-valid frame; the coord
+        // run-loop reads-and-clears it each iteration to synchronously
+        // invalidate the stale periodic-capture accessor on a swap Op.
+        // Same coord thread as the dispatch sinks, so Relaxed suffices
+        // — uniform with `scenario_start_ns`.
+        let sched_swap_notify_for_coord: Arc<std::sync::atomic::AtomicBool> =
+            Arc::new(std::sync::atomic::AtomicBool::new(false));
         // Cumulative wall-clock pause time observed between
         // matched `MSG_TYPE_SCENARIO_PAUSE` / `MSG_TYPE_SCENARIO_RESUME`
         // pairs (nanoseconds). Periodic-snapshot boundaries are
@@ -2468,8 +2476,13 @@ impl KtstrVm {
                 //      so the monitor thread observes the value
                 //      regardless of whether the guest's port-2
                 //      publish landed first.
-                //   3. Publishes the pair via `OnceLock::set`.
-                //   4. Exits — the OnceLock is read-only thereafter.
+                //   3. Publishes the pair by storing `Some(pair)` into
+                //      the `accessors_slot` `Mutex<Option<AccessorPair>>`.
+                //   4. Exits. The coordinator adopts via
+                //      `accessors_slot.lock().take()`; the slot is
+                //      re-populatable — the swap-notify teardown and the
+                //      watchpoint Detached / RebindDisarmed arms reset it
+                //      to `None` to force a fresh worker rebuild on a swap.
                 //
                 // The worker honors `freeze_coord_kill` between
                 // retries and bails immediately on shutdown so a
@@ -2484,8 +2497,9 @@ impl KtstrVm {
                 // `poll(kill_evt | accessor_reinit_evt, -1)` and
                 // re-enters the init-retry phase whenever the
                 // coordinator pulses `accessor_reinit_evt` (see the
-                // `WatchpointPublishResult::Detached` and
-                // `RebindDisarmed` arms in the coord-loop body).
+                // synchronous sched-swap-notify teardown and the
+                // `WatchpointPublishResult::Detached` / `RebindDisarmed`
+                // arms in the coord-loop body).
                 // Re-init drops the per-iteration 60 s budget — by
                 // the time the first re-init fires the guest has
                 // already booted to the point of having a live
@@ -3785,6 +3799,8 @@ impl KtstrVm {
                                         }),
                                         watchdog_pause_ns: watchdog_pause_for_coord.as_ref(),
                                         scenario_start_ns: scenario_start_ns_for_coord.as_ref(),
+                                        sched_swap_notify:
+                                            sched_swap_notify_for_coord.as_ref(),
                                         scenario_pause_cumulative_ns:
                                             scenario_pause_cumulative_for_coord.as_ref(),
                                         run_start,
@@ -3832,11 +3848,76 @@ impl KtstrVm {
                         // condition + inner bsp_done check handle
                         // loop exit after the body completes.
                     }
+                    // Synchronous periodic-capture + watchpoint
+                    // invalidation on an explicit guest swap-notify
+                    // (Op::Detach / Restart / ReplaceScheduler). The
+                    // guest's `kill_current_scheduler` sends
+                    // `MSG_TYPE_SCHED_SWAP_NOTIFY` once `*scx_root` is NULL
+                    // (after `wait_for_scx_disabled`;
+                    // `RCU_INIT_POINTER(scx_root, NULL)` precedes
+                    // `scx_set_enable_state(SCX_DISABLED)` in
+                    // kernel/sched/ext.c scx_root_disable), so the prior
+                    // `scx_sched` object is unlinked (`*scx_root` NULLed)
+                    // and its slab is subject to RCU-grace-period reuse —
+                    // BOTH the owned accessor AND the slot-0 DR0 watchpoint
+                    // (armed on that object's `exit_kind` KVA) are stale.
+                    // Perform the FULL watchpoint-Detached teardown
+                    // synchronously, not just the accessor half:
+                    //   * disarm DR0 (`WatchpointArm::disarm`) + reset
+                    //     `last_sched_kva = 0`, so a stale DR0 cannot fire
+                    //     into the recycled slab (a `>= SCX_EXIT_ERROR`
+                    //     read would latch a phantom failure dump on a
+                    //     deliberate swap), and the next
+                    //     owned-accessor-present scan tick republishes as a
+                    //     fresh `0 -> B` attach;
+                    //   * clear `cached_exit_kind_pa`, so the scan-tick
+                    //     err-trigger probe and a rendezvous-timeout
+                    //     Degraded dump never read `exit_kind` from the
+                    //     recycled page;
+                    //   * drop the owned accessor + pulse
+                    //     `accessor_reinit_evt` so the accessor-init worker
+                    //     rebuilds against the next scheduler NOW (its
+                    //     `accessor_ready_evt` -> TOKEN_ACCESSOR_READY ->
+                    //     adopt path re-publishes it).
+                    // Doing only the accessor half is UNSOUND: this
+                    // teardown sets `owned_accessor = None`, which gates
+                    // OFF the watchpoint tick (the only other code that
+                    // disarms DR0 / clears `cached_exit_kind_pa`), so the
+                    // post-notify state MUST already be the Detached state.
+                    // Net effect: collapses the up-to-one-SCAN_INTERVAL
+                    // watchpoint-poll detection window to ~0. Read-and-
+                    // clear so it fires once per notify; ungated by
+                    // `scan_tick` (skipping the scan cadence is the point)
+                    // and idempotent against the poll's own later Detached
+                    // arm. A notify that lands after the poll already
+                    // detached (owned_accessor already None) re-runs this
+                    // body harmlessly; the only cost is an extra
+                    // accessor_reinit_evt pulse — the worker coalesces
+                    // pulses that arrive while it is parked into one
+                    // redundant rebuild, while a pulse landing mid-rebuild
+                    // costs one extra idempotent (live-state) rebuild.
+                    if sched_swap_notify_for_coord.swap(false, Ordering::Relaxed) {
+                        freeze_coord_watchpoint.disarm();
+                        last_sched_kva = 0;
+                        cached_exit_kind_pa = None;
+                        owned_accessor = None;
+                        owned_prog_accessor = None;
+                        *accessors_slot.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                        let _ = accessor_reinit_evt.write(1);
+                        tracing::info!(
+                            target: "ktstr::failure_dump",
+                            "freeze-coord: sched-swap notify — synchronous \
+                             periodic-capture + watchpoint invalidation \
+                             (full Detached teardown; skipping the \
+                             watchpoint-poll detection window)"
+                        );
+                    }
                     // Adopt the worker-published accessor pair as
-                    // soon as it lands. Both halves of the pair land
-                    // atomically via `OnceLock::set` so a single
-                    // `get()` returns either both or neither — no
-                    // partial-Some shape to handle. The worker logs
+                    // soon as it lands. The worker stores `Some(pair)`
+                    // into the `accessors_slot` mutex in one shot, so a
+                    // single `lock().take()` returns either both halves
+                    // or neither — no partial-Some shape to handle. The
+                    // worker logs
                     // its own warn/eprintln on a permanent failure
                     // (60 s deadline exceeded), so the coordinator
                     // doesn't track separate retry counters here:
@@ -4355,11 +4436,9 @@ impl KtstrVm {
                                 // from silently caching across swaps.
                                 owned_accessor = None;
                                 owned_prog_accessor = None;
-                                if let Ok(mut g) = accessors_slot
+                                *accessors_slot
                                     .lock()
-                                {
-                                    *g = None;
-                                }
+                                    .unwrap_or_else(|e| e.into_inner()) = None;
                                 let _ = accessor_reinit_evt.write(1);
                             }
                             WatchpointPublishResult::RebindDisarmed {
@@ -4376,10 +4455,10 @@ impl KtstrVm {
                                 );
                                 last_sched_kva = 0;
                                 // Same rationale as the Detached arm:
-                                // the prior scx_sched is RCU-pending-
-                                // free and the cached PA can begin
-                                // reading recycled slab data. The
-                                // next iteration's Published arm
+                                // the prior scx_sched object is detached
+                                // and pending RCU free, and the cached PA
+                                // can begin reading recycled slab data.
+                                // The next iteration's Published arm
                                 // republishes for the new scheduler.
                                 cached_exit_kind_pa = None;
                                 // Refresh the owned BPF accessors for
@@ -4388,11 +4467,9 @@ impl KtstrVm {
                                 // rationale).
                                 owned_accessor = None;
                                 owned_prog_accessor = None;
-                                if let Ok(mut g) = accessors_slot
+                                *accessors_slot
                                     .lock()
-                                {
-                                    *g = None;
-                                }
+                                    .unwrap_or_else(|e| e.into_inner()) = None;
                                 let _ = accessor_reinit_evt.write(1);
                             }
                             WatchpointPublishResult::Published {
