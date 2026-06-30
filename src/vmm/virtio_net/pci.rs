@@ -258,6 +258,20 @@ pub(crate) struct VirtioNetPci {
     /// The host registered one irqfd per (vector → eventfd) at this GSI at VM
     /// bring-up; the MSI route is installed here on the vector's unmask edge.
     gsis: [u32; MSIX_VECTORS],
+    /// Cached BAR0 MMIO window `[base, base + BAR0_SIZE)` — the value
+    /// [`Self::bar_window`] returns; `None` when BAR0 is unprogrammed, memory
+    /// decode is disabled, or the base falls outside the `_CRS` grant. Recomputed
+    /// ([`Self::recompute_bar_window`]) ONLY on a `REG_COMMAND` / `REG_BAR0` write
+    /// — the sole inputs to the window — instead of on every MMIO exit: the
+    /// run-loop BAR dispatch calls `bar_window` twice per matching exit (the
+    /// `bar_mmio_contains` guard + the `bar_owner` dispatch), each iterating every
+    /// populated slot, so a per-exit recompute (two config-space reads × slots ×
+    /// 2) scales with NIC count. Coherent under the single `PciBus` mutex: a guest
+    /// BAR reprogram (an ECAM `config_write`) and a BAR MMIO access are serialized
+    /// on the vCPU thread, so the refresh always precedes the next access (no
+    /// atomics needed). Mirrors qemu's `pci_update_mappings` (recompute on config
+    /// write, read the cached address per access).
+    bar_window_cache: Option<(u64, u64)>,
 }
 
 impl VirtioNetPci {
@@ -337,14 +351,20 @@ impl VirtioNetPci {
         // route owner). With no owner (non-PCI) the cap is omitted so the guest
         // stays on INTx rather than enabling an undeliverable MSI-X.
         Self::write_caps(&mut cfg, route_sink.is_some());
-        Self {
+        let mut this = Self {
             cfg,
             net,
             bar_aperture,
             msix,
             route_sink,
             gsis,
-        }
+            bar_window_cache: None,
+        };
+        // Seed the cache from the freshly built config space (BAR0 unprogrammed +
+        // memory decode disabled at reset → None). Subsequent REG_COMMAND /
+        // REG_BAR0 writes refresh it in `config_write`.
+        this.bar_window_cache = this.recompute_bar_window();
+        this
     }
 
     /// Lay out the four virtio vendor capabilities (COMMON/ISR/DEVICE/NOTIFY),
@@ -708,6 +728,53 @@ impl VirtioNetPci {
         };
         Self::put_le(val, data);
     }
+
+    /// Recompute the BAR0 MMIO window from config space — the value cached in
+    /// `bar_window_cache` and returned by [`Self::bar_window`]. Called at
+    /// construction and on each `REG_COMMAND` / `REG_BAR0` write (`config_write`),
+    /// NOT per MMIO exit.
+    ///
+    /// The BAR is live only once the guest enables memory-space decode. Only
+    /// `PCI_COMMAND_MEMORY` is consulted, NOT bus-master (bit 2): on real hardware
+    /// the device cannot DMA until BM is set, but the in-VMM loopback reads/writes
+    /// guest memory unconditionally. Benign — Linux's `virtio_pci_modern_probe`
+    /// sets bus-master before DRIVER_OK, and the loopback only touches memory on a
+    /// post-DRIVER_OK notify — so BM is always set before first use; honoring it
+    /// would land with MSI-X (like INTX_DISABLE above).
+    fn recompute_bar_window(&self) -> Option<(u64, u64)> {
+        let mut cmd = [0u8; 2];
+        self.cfg.read(REG_COMMAND, &mut cmd);
+        if u16::from_le_bytes(cmd) & PCI_COMMAND_MEMORY == 0 {
+            return None;
+        }
+        // The 32-bit base from BAR0, masking the read-only type bits.
+        let mut lo = [0u8; 4];
+        self.cfg.read(REG_BAR0, &mut lo);
+        let base = (u32::from_le_bytes(lo) & !(BAR0_SIZE as u32 - 1)) as u64;
+        if base == 0 {
+            // Fast-path for the common reset value (BAR unprogrammed). Redundant
+            // with the grant check below — base 0 is far below grant_start
+            // (PCI_MMIO_BAR_BASE) so that check also returns None — but the
+            // explicit branch documents the reset case; benign (a guest can only
+            // break its own NIC, never host memory).
+            return None;
+        }
+        // Enforce the host-bridge _CRS MMIO grant: the window is only honored when
+        // [base, base + BAR0_SIZE) lies fully within the aperture the guest's PCI0
+        // _CRS advertises. The MMIO dispatch checks bar_mmio_contains BEFORE
+        // ecam_contains, so without this bound a guest that (non-conformantly)
+        // programmed BAR0 over the ECAM window would shadow config space; rejecting
+        // an out-of-grant base (return None) makes that guest-only breakage
+        // impossible. Linux always assigns BARs inside the granted window, so a
+        // conformant guest is unaffected. Matches the reference VMMs, which
+        // assign/bound BARs from a VMM-owned allocator rather than trusting the
+        // guest base.
+        let (grant_start, grant_end) = self.bar_aperture;
+        if base < grant_start || base.saturating_add(BAR0_SIZE) > grant_end {
+            return None;
+        }
+        Some((base, BAR0_SIZE))
+    }
 }
 
 impl PciFunction for VirtioNetPci {
@@ -717,6 +784,17 @@ impl PciFunction for VirtioNetPci {
 
     fn config_write(&mut self, reg: u16, data: &[u8]) {
         self.cfg.write(reg, data);
+        // Refresh the cached BAR0 window when the write touched its only inputs —
+        // REG_COMMAND (memory-decode enable bit) or REG_BAR0 (base). Uses
+        // write_touches (not `reg ==`) so a wide/odd access spanning either
+        // register still refreshes (e.g. a 4-byte write at REG_COMMAND spans
+        // COMMAND+STATUS; Linux writes BAR0 as the full dword). Recompute AFTER
+        // cfg.write so it reads the just-written bytes. See `bar_window_cache`.
+        if Self::write_touches(reg, data.len(), REG_COMMAND, 2)
+            || Self::write_touches(reg, data.len(), REG_BAR0, 4)
+        {
+            self.bar_window_cache = self.recompute_bar_window();
+        }
         // If the write touched the MSI-X cap Message Control (Enable bit15 /
         // Function Mask bit14), sync the parsed state into the shared delivery
         // state, then reconcile every vector's KVM route. The kernel's setup
@@ -742,53 +820,12 @@ impl PciFunction for VirtioNetPci {
     }
 
     fn bar_window(&self) -> Option<(u64, u64)> {
-        // Recomputed from config space on every call (the MMIO dispatch calls
-        // this per BAR exit via PciBus::bar_owner). The window is immutable
-        // between COMMAND/BAR0 writes, so a per-function cache invalidated on
-        // those writes is the obvious optimization, left as a follow-up: even
-        // with multiple NICs installed the per-call recompute is two cheap
-        // config-space reads, dwarfed by the MMIO-exit cost it sits behind.
-        // The BAR is live only once the guest enables memory-space decode.
-        // Only PCI_COMMAND_MEMORY is consulted, NOT bus-master (bit 2): on real
-        // hardware the device cannot DMA until BM is set, but the in-VMM loopback
-        // reads/writes guest memory unconditionally. Benign — Linux's
-        // virtio_pci_modern_probe sets bus-master before DRIVER_OK, and the
-        // loopback only touches memory on a post-DRIVER_OK notify — so BM is
-        // always set before first use; honoring it would land with MSI-X (like
-        // INTX_DISABLE above).
-        let mut cmd = [0u8; 2];
-        self.cfg.read(REG_COMMAND, &mut cmd);
-        if u16::from_le_bytes(cmd) & PCI_COMMAND_MEMORY == 0 {
-            return None;
-        }
-        // The 32-bit base from BAR0, masking the read-only type bits.
-        let mut lo = [0u8; 4];
-        self.cfg.read(REG_BAR0, &mut lo);
-        let base = (u32::from_le_bytes(lo) & !(BAR0_SIZE as u32 - 1)) as u64;
-        if base == 0 {
-            // Fast-path for the common reset value (BAR unprogrammed). This is
-            // redundant with the grant check below — base 0 is far below
-            // grant_start (PCI_MMIO_BAR_BASE) so that check also returns None —
-            // but the explicit branch documents the reset case, which yields no
-            // window; benign (a guest can only break its own NIC, never host
-            // memory).
-            return None;
-        }
-        // Enforce the host-bridge _CRS MMIO grant: the published window is only
-        // honored when [base, base + BAR0_SIZE) lies fully within the aperture
-        // the guest's PCI0 _CRS advertises. The MMIO dispatch checks
-        // bar_mmio_contains BEFORE ecam_contains, so without this bound a guest
-        // that (non-conformantly) programmed BAR0 over the ECAM window would
-        // shadow config space; rejecting an out-of-grant base (return None,
-        // claiming no MMIO) makes that guest-only breakage impossible. Linux
-        // always assigns BARs inside the granted window, so a conformant guest
-        // is unaffected. This matches the reference VMMs, which assign/bound
-        // BARs from a VMM-owned allocator rather than trusting the guest base.
-        let (grant_start, grant_end) = self.bar_aperture;
-        if base < grant_start || base.saturating_add(BAR0_SIZE) > grant_end {
-            return None;
-        }
-        Some((base, BAR0_SIZE))
+        // The cached window (`bar_window_cache`), recomputed only on REG_COMMAND /
+        // REG_BAR0 writes (see `recompute_bar_window` + `config_write`). This MUST
+        // be a field read, not a per-exit recompute: the run-loop BAR dispatch
+        // calls it twice per matching MMIO exit (the `bar_mmio_contains` guard +
+        // the `bar_owner` dispatch), each over every populated slot.
+        self.bar_window_cache
     }
 
     fn bar_read(&mut self, offset: u64, data: &mut [u8]) {
@@ -1516,6 +1553,55 @@ mod tests {
         // The in-grant base is still honored (regression guard for the bound).
         pci.config_write(REG_BAR0, &TEST_BAR_BASE.to_le_bytes());
         assert_eq!(pci.bar_window(), Some((TEST_BAR_BASE as u64, BAR0_SIZE)));
+    }
+
+    /// The cached BAR window refreshes on every REG_COMMAND / REG_BAR0
+    /// write — a guest memory-enable toggle or BAR reprogram is reflected
+    /// immediately, never stale. The load-bearing assertion is the reprogram:
+    /// after a window is established, a BAR0 rewrite must refresh the cache (a
+    /// missed refresh would return the prior window).
+    #[test]
+    fn bar_window_cache_refreshes_on_command_and_bar0_writes() {
+        let mem = test_mem();
+        let (mut pci, _c) = build(&mem);
+        assert_eq!(pci.bar_window(), None, "reset: no cached window");
+        // BAR0 base alone (memory decode still off) → cache refreshed, still None.
+        pci.config_write(REG_BAR0, &TEST_BAR_BASE.to_le_bytes());
+        assert_eq!(
+            pci.bar_window(),
+            None,
+            "BAR0 write refreshes the cache; memory decode off → still None"
+        );
+        // Memory-enable write refreshes the cache → window appears.
+        pci.config_write(REG_COMMAND, &PCI_COMMAND_MEMORY.to_le_bytes());
+        assert_eq!(
+            pci.bar_window(),
+            Some((TEST_BAR_BASE as u64, BAR0_SIZE)),
+            "COMMAND.MEMORY write refreshes the cache → window appears"
+        );
+        // Reprogram BAR0 out-of-grant → cache refreshes to None, NOT the stale
+        // in-grant window. This is the regression a missed refresh would fail
+        // (it would return the prior Some(TEST_BAR_BASE)).
+        pci.config_write(REG_BAR0, &TEST_ECAM_BASE.to_le_bytes());
+        assert_eq!(
+            pci.bar_window(),
+            None,
+            "BAR0 reprogram (out-of-grant) refreshes the cache → None, not stale"
+        );
+        // Reprogram back in-grant → cache refreshes to the restored window.
+        pci.config_write(REG_BAR0, &TEST_BAR_BASE.to_le_bytes());
+        assert_eq!(
+            pci.bar_window(),
+            Some((TEST_BAR_BASE as u64, BAR0_SIZE)),
+            "BAR0 reprogram (in-grant) refreshes the cache → window restored"
+        );
+        // Clear COMMAND.MEMORY → cache refreshes to None.
+        pci.config_write(REG_COMMAND, &0u16.to_le_bytes());
+        assert_eq!(
+            pci.bar_window(),
+            None,
+            "clearing COMMAND.MEMORY refreshes the cache → no window"
+        );
     }
 
     #[test]
