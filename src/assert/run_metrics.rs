@@ -1800,8 +1800,8 @@ fn distribution_cgroup_reduction(
 /// time) wins on the read path, and this fn fills the gap for
 /// registered metrics that have a `read_sample` wire but no typed
 /// GauntletRow field. Without this fill, `cargo ktstr stats compare`
-/// silently skips the metric (read returns None on both sides;
-/// the EPSILON guard drops the row).
+/// silently skips the metric (read returns None on both sides, so the
+/// `(None, None)` arm drops the pair).
 ///
 /// Per-phase reduction dispatch is described on [`PhaseBucket`];
 /// the cross-RUN fold here uses `crate::stats::aggregate_samples_for_phase`

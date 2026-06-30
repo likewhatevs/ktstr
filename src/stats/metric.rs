@@ -2867,8 +2867,9 @@ pub static METRICS: &[MetricDef] = &[
         // ratio is dominated by a single outlier, not a distributional signal),
         // and none when no cgroup carried a measurable tail. An absent key is
         // EXCLUDED from the cross-RUN mean (no sub-threshold run dilutes the
-        // cohort) and read as `None` by `compare_rows`, which `unwrap_or(0.0)`s
-        // both sides into the `abs() < EPSILON` skip. This REPLACES the deleted
+        // cohort) and read as `None` by `compare_rows`, where the `(None,
+        // None)` arm skips the pair entirely (no verdict, no coverage diff).
+        // This REPLACES the deleted
         // typed field's accessor gate, which (a) summed every passing run's raw
         // ratio over `passes_observed` cross-RUN — folding noisy low-N runs in
         // as real values — and (b) re-gated the AGGREGATED row against a MEANED
@@ -4015,8 +4016,8 @@ pub static METRICS: &[MetricDef] = &[
 /// `worst_wake_latency_tail_ratio` ext key for a run with
 /// `total_iterations < WAKE_LATENCY_TAIL_RATIO_MIN_ITERATIONS`. The absent key
 /// is excluded from the cross-RUN mean and read as `None` by `compare_rows`,
-/// which `unwrap_or(0.0)`s both A- and B-side rows into the
-/// `abs() < EPSILON` "unchanged" guard, emitting no finding.
+/// where the `(None, None)` arm skips the pair entirely (no verdict, no
+/// coverage diff) when the key is absent on both sides.
 pub const WAKE_LATENCY_TAIL_RATIO_MIN_ITERATIONS: u64 = 100;
 
 /// Look up a metric definition by name.

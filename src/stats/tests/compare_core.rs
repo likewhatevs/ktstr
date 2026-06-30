@@ -650,8 +650,8 @@ fn wake_latency_tail_ratio_compares_via_ext_metrics() {
     let key = "worst_wake_latency_tail_ratio";
 
     // Absent ext key (the producer's sub-threshold / no-tail output): both
-    // sides read None, both collapse to 0.0 via unwrap_or(0.0), and the
-    // both-near-zero ZERO_MEAN_EPS guard skips the delta (no finding).
+    // sides read None, so the `(None, None)` arm skips the pair (no finding,
+    // no coverage diff).
     let low_a = make_row("tail_low", "tiny-1llc", true, 0.0);
     let low_b = make_row("tail_low", "tiny-1llc", true, 0.0);
     assert!(
@@ -700,24 +700,27 @@ fn wake_latency_tail_ratio_compares_via_ext_metrics() {
     );
 }
 
-/// Explicit None-branch pin on the `compare_rows` ext-fallback contract.
+/// Read-contract pin: a metric absent on BOTH sides reads `None` and the
+/// pair is skipped entirely (no verdict, no coverage diff).
 ///
-/// `compare_rows` calls `m.read(row)` for every metric and falls through
-/// `unwrap_or(0.0)` to the both-near-zero `ZERO_MEAN_EPS` skip when the
-/// read is `None`. Since
-/// `worst_wake_latency_tail_ratio` is now ext-sourced with a `|_| None`
-/// accessor, an ABSENT ext key (the producer's sub-threshold output) is the
-/// None condition. The sibling `wake_latency_tail_ratio_compares_via_ext_metrics`
-/// exercises this embedded in the suppression semantic; this test pins the
-/// raw mechanism — a regression that dropped `unwrap_or(0.0)` and panicked
-/// on None, or that synthesized a value for an absent key, would fail here.
+/// `compare_rows` calls `m.read(row)` for every metric; `read` returns `None`
+/// for an absent metric. `worst_wake_latency_tail_ratio` is ext-sourced with a
+/// `|_| None` accessor, so an absent ext key (the producer's sub-threshold
+/// output) is the `None` condition. When BOTH sides read `None`, the
+/// `(None, None) => continue` arm skips the pair before any verdict or
+/// coverage-diff bookkeeping. This pins the `read()==None`-on-absent
+/// precondition the absent-vs-genuine-zero handling rests on: a regression
+/// that synthesized a value for an absent key (the old `unwrap_or(0.0)`) or
+/// panicked on `None` would fail here.
 ///
-/// Asserts the three observable consequences:
+/// Asserts:
 /// 1. `metric.read(&row)` returns `None` on both sides (no ext key).
 /// 2. `compare_rows` does NOT panic.
-/// 3. The resulting `CompareReport` classifies the pair as `unchanged`.
+/// 3. No finding AND no coverage diff — both-absent is skipped, distinct from
+///    one-sided-absent which IS a coverage diff (see
+///    `compare_rows_one_sided_absent_is_coverage_diff_not_verdict`).
 #[test]
-fn compare_rows_handles_none_from_absent_ext_key_as_zero() {
+fn compare_rows_both_absent_ext_key_reads_none_and_is_skipped() {
     let metric =
         metric_def("worst_wake_latency_tail_ratio").expect("tail ratio metric must be registered");
 
@@ -737,12 +740,9 @@ fn compare_rows_handles_none_from_absent_ext_key_as_zero() {
         "absent ext key must read None on B",
     );
 
-    // The call must not panic (a regression that dropped the
-    // `unwrap_or` would trip here), and the result must
-    // classify the pair as unchanged — both sides collapse to
-    // 0.0 via unwrap_or, then the both-near-zero
-    // `abs() < ZERO_MEAN_EPS` guard short-circuits without
-    // producing a finding.
+    // Both sides read None: the `(None, None) => continue` arm skips the pair
+    // before any verdict or coverage-diff bookkeeping — no panic, no finding,
+    // and (unlike one-sided-absent) no coverage diff.
     let report = compare_rows_by(
         std::slice::from_ref(&row_a),
         std::slice::from_ref(&row_b),
@@ -752,17 +752,20 @@ fn compare_rows_handles_none_from_absent_ext_key_as_zero() {
     );
     assert_eq!(
         report.regressions, 0,
-        "None accessor result must land as unchanged, not a regression",
+        "both-absent must not be a regression",
     );
     assert_eq!(
         report.improvements, 0,
-        "None accessor result must land as unchanged, not an improvement",
+        "both-absent must not be an improvement",
     );
     assert!(
         report.findings.is_empty(),
-        "no findings must be emitted when the accessor returns None; \
-             got: {:?}",
+        "no findings when the metric is absent on both sides; got: {:?}",
         report.findings,
+    );
+    assert!(
+        report.coverage_diffs.is_empty(),
+        "both-absent is skipped, NOT a coverage diff (that is one-sided-absent)",
     );
 }
 
@@ -2191,4 +2194,161 @@ fn compare_rows_informational_metric_shows_but_never_gates() {
         .find(|f| f.metric.name == "total_ttwu_count")
         .expect("total_ttwu_count finding present");
     assert_eq!(f.kind, FindingKind::Informational);
+}
+
+/// A metric present on exactly ONE side of a paired row is a coverage
+/// difference, NOT a regression/improvement: recorded in `coverage_diffs`,
+/// never gated. Pre-fix, `read().unwrap_or(0.0)` coerced the absent side to
+/// 0.0 and the rel-gate read it as an unbounded change from a zero baseline —
+/// a phantom verdict for a directional metric (avg_nr_running is LowerBetter)
+/// that was simply not captured on one side.
+#[test]
+fn compare_rows_one_sided_absent_is_coverage_diff_not_verdict() {
+    // avg_nr_running is LowerBetter + ext-only; present on exactly one side.
+    let present = {
+        let mut r = cmp_row("t", "tiny-1llc", true, 10.0, 100);
+        r.ext_metrics.insert("avg_nr_running".into(), 5.0);
+        r
+    };
+    let absent = cmp_row("t", "tiny-1llc", true, 10.0, 100);
+
+    // A present (5.0), B absent: pre-fix a phantom LowerBetter improvement
+    // (5 -> 0); post-fix a coverage diff on side A.
+    let res = compare_rows_by(
+        std::slice::from_ref(&present),
+        std::slice::from_ref(&absent),
+        LEGACY_PAIRING_DIMS,
+        None,
+        &ComparisonPolicy::default(),
+    );
+    assert_eq!(res.regressions, 0, "one-sided-absent must not be a regression");
+    assert_eq!(res.improvements, 0, "...nor an improvement");
+    assert!(
+        !res.findings.iter().any(|f| f.metric.name == "avg_nr_running"),
+        "no phantom avg_nr_running finding for a one-sided-absent metric"
+    );
+    assert_eq!(res.coverage_diffs.len(), 1, "recorded as a coverage diff");
+    assert_eq!(res.coverage_diffs[0].metric.name, "avg_nr_running");
+    assert_eq!(res.coverage_diffs[0].present_side, ComparePartition::A);
+    assert_eq!(res.coverage_diffs[0].value, 5.0);
+
+    // Mirror: A absent, B present (5.0) — pre-fix a phantom regression
+    // (0 -> 5, LowerBetter); post-fix a coverage diff on side B.
+    let res2 = compare_rows_by(
+        &[absent],
+        &[present],
+        LEGACY_PAIRING_DIMS,
+        None,
+        &ComparisonPolicy::default(),
+    );
+    assert_eq!(res2.regressions, 0, "mirror: not a regression");
+    assert_eq!(res2.improvements, 0);
+    assert_eq!(res2.coverage_diffs.len(), 1);
+    assert_eq!(res2.coverage_diffs[0].present_side, ComparePartition::B);
+}
+
+/// A metric absent on BOTH sides contributes nothing (no coverage diff, no
+/// finding). A metric present on both sides with a genuine zero on one side is
+/// NOT absent — it still goes through the dual-gate verdict (the
+/// present-0.0-vs-absent distinction the fix rests on).
+#[test]
+fn compare_rows_both_absent_skipped_present_zero_still_compared() {
+    let res_absent = compare_rows_by(
+        &[cmp_row("t", "tiny-1llc", true, 10.0, 100)],
+        &[cmp_row("t", "tiny-1llc", true, 10.0, 100)],
+        LEGACY_PAIRING_DIMS,
+        None,
+        &ComparisonPolicy::default(),
+    );
+    assert!(
+        res_absent.coverage_diffs.is_empty(),
+        "metric absent on both sides is not a coverage diff"
+    );
+    assert!(
+        !res_absent
+            .findings
+            .iter()
+            .any(|f| f.metric.name == "avg_nr_running"),
+        "metric absent on both sides produces no finding"
+    );
+
+    // Present-zero on A, present-nonzero on B: BOTH present (Some(0.0) vs
+    // Some(5.0)), a real comparison, not a coverage diff. 0 -> 5 on a
+    // LowerBetter metric is a regression.
+    let zero_a = {
+        let mut r = cmp_row("t", "tiny-1llc", true, 10.0, 100);
+        r.ext_metrics.insert("avg_nr_running".into(), 0.0);
+        r
+    };
+    let nonzero_b = {
+        let mut r = cmp_row("t", "tiny-1llc", true, 10.0, 100);
+        r.ext_metrics.insert("avg_nr_running".into(), 5.0);
+        r
+    };
+    let res_zero = compare_rows_by(
+        &[zero_a],
+        &[nonzero_b],
+        LEGACY_PAIRING_DIMS,
+        None,
+        &ComparisonPolicy::default(),
+    );
+    assert!(
+        res_zero.coverage_diffs.is_empty(),
+        "present-0.0 is NOT absent — no coverage diff"
+    );
+    assert_eq!(
+        res_zero.regressions, 1,
+        "0 -> 5 on a LowerBetter metric (both present) is a regression"
+    );
+}
+
+/// The coverage-diff SURFACING maps `present_side` to the right A/B label — a
+/// swapped match arm would mis-report which run has the metric. Tests the
+/// extracted `format_coverage_diff_lines` directly (print_summary_block's
+/// `println!` is not capturable) for both `ComparePartition::A` and `::B`.
+#[test]
+fn coverage_diff_lines_map_present_absent_labels_by_side() {
+    let present = {
+        let mut r = cmp_row("t", "tiny-1llc", true, 10.0, 100);
+        r.ext_metrics.insert("avg_nr_running".into(), 5.0);
+        r
+    };
+    let absent = cmp_row("t", "tiny-1llc", true, 10.0, 100);
+
+    // A present, B absent -> present_side A -> "in runA, absent in runB".
+    let report = compare_rows_by(
+        std::slice::from_ref(&present),
+        std::slice::from_ref(&absent),
+        LEGACY_PAIRING_DIMS,
+        None,
+        &ComparisonPolicy::default(),
+    );
+    let joined = format_coverage_diff_lines(&report, "runA", "runB").join("\n");
+    assert!(joined.contains("avg_nr_running"), "names the metric: {joined}");
+    assert!(
+        joined.contains("= 5.00 in 'runA'"),
+        "present value + side-A label (runA): {joined}"
+    );
+    assert!(
+        joined.contains("absent in 'runB'"),
+        "absent side is the OTHER label (runB): {joined}"
+    );
+
+    // Mirror: A absent, B present -> present_side B -> "in runB, absent in runA".
+    let report2 = compare_rows_by(
+        std::slice::from_ref(&absent),
+        std::slice::from_ref(&present),
+        LEGACY_PAIRING_DIMS,
+        None,
+        &ComparisonPolicy::default(),
+    );
+    let joined2 = format_coverage_diff_lines(&report2, "runA", "runB").join("\n");
+    assert!(
+        joined2.contains("= 5.00 in 'runB'"),
+        "present on side B maps to runB: {joined2}"
+    );
+    assert!(
+        joined2.contains("absent in 'runA'"),
+        "absent maps to runA: {joined2}"
+    );
 }

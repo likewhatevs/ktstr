@@ -45,6 +45,36 @@ pub(crate) enum FindingKind {
     Informational,
 }
 
+/// A metric present on exactly ONE side of a paired (scenario,
+/// topology, work_type) row — a coverage difference, not a perf delta.
+///
+/// `MetricDef::read` returns `None` for a metric absent on a row and
+/// `Some(v)` (including `Some(0.0)`) when present, so an absent metric
+/// is distinguishable from a genuine zero. A metric present on one side
+/// and absent on the other is NOT a regression/improvement: it never
+/// had a comparable baseline. Recording it here (never gated, never
+/// counted in `regressions`/`improvements`/`informational`) surfaces
+/// the appear/disappear-between-runs case instead of either silently
+/// dropping it or — as the pre-fix `read().unwrap_or(0.0)` did —
+/// mis-flagging it as a directional verdict against a coerced-zero
+/// side: an unbounded relative change when the absent side is the
+/// baseline (rel-gate INFINITY), a bounded one otherwise (e.g. 5 -> 0
+/// gives rel ~1.0) — either clears the gate and yields a phantom
+/// regression or improvement (the direction follows the metric's
+/// polarity, so it inverts between LowerBetter and HigherBetter).
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct CoverageDiff {
+    pub pairing_key: PairingKey,
+    pub scenario: String,
+    pub topology: String,
+    pub work_type: String,
+    pub metric: &'static MetricDef,
+    /// The side that HAS the metric; the other side is absent.
+    pub present_side: ComparePartition,
+    /// The present side's value (the absent side has none).
+    pub value: f64,
+}
+
 /// Aggregate result of comparing two row sets via [`compare_rows_by`].
 ///
 /// `regressions` and `improvements` count significant entries in
@@ -84,6 +114,13 @@ pub(crate) struct CompareReport {
     pub findings: Vec<Finding>,
     pub phase_deltas: Vec<PhaseDeltaRow>,
     pub unpaired_phases: Vec<UnpairedPhaseRow>,
+    /// Metrics present on exactly one side of a paired row (a metric
+    /// appeared or disappeared between runs A and B). Never gated — not
+    /// counted in `regressions`/`improvements`/`informational` and no
+    /// effect on the exit code; surfaced so a coverage change is
+    /// visible rather than silently dropped or mis-flagged as a
+    /// regression from a zero baseline. See [`CoverageDiff`].
+    pub coverage_diffs: Vec<CoverageDiff>,
 }
 
 /// Which side of an A/B comparison a row belongs to. Typed surface
@@ -699,8 +736,45 @@ fn push_scalar_findings(
         if suppressed[i] {
             continue;
         }
-        let val_a = m.read(row_a).unwrap_or(0.0);
-        let val_b = m.read(row_b).unwrap_or(0.0);
+        // `read` returns `None` for a metric absent on a row and `Some(v)`
+        // (including `Some(0.0)`) when present, so absent is distinguishable
+        // from a genuine zero. A metric present on exactly one side is a
+        // coverage difference, NOT a delta: record it (never gated) and skip
+        // the directional verdict. The pre-fix `unwrap_or(0.0)` coerced an
+        // absent side to 0.0, producing a phantom directional verdict: when
+        // the absent side was the baseline (val_a==0) the rel-gate's INFINITY
+        // branch fired (unbounded), and otherwise rel_delta was bounded (e.g.
+        // 5 -> 0 gives |(-5)/5|=1.0); either cleared both gates and yielded a
+        // phantom regression or improvement (direction per the metric's
+        // polarity) for a metric simply not captured on one side.
+        let (val_a, val_b) = match (m.read(row_a), m.read(row_b)) {
+            (Some(a), Some(b)) => (a, b),
+            (None, None) => continue,
+            (Some(a), None) => {
+                report.coverage_diffs.push(CoverageDiff {
+                    pairing_key: key_b.clone(),
+                    scenario: row_b.scenario.clone(),
+                    topology: row_b.topology.clone(),
+                    work_type: row_b.work_type.clone(),
+                    metric: m,
+                    present_side: ComparePartition::A,
+                    value: a,
+                });
+                continue;
+            }
+            (None, Some(b)) => {
+                report.coverage_diffs.push(CoverageDiff {
+                    pairing_key: key_b.clone(),
+                    scenario: row_b.scenario.clone(),
+                    topology: row_b.topology.clone(),
+                    work_type: row_b.work_type.clone(),
+                    metric: m,
+                    present_side: ComparePartition::B,
+                    value: b,
+                });
+                continue;
+            }
+        };
         // Both sides negligible (under ZERO_MEAN_EPS, the domain zero epsilon —
         // not f64::EPSILON, the machine ulp near 1.0): no signal, skip without
         // counting.
@@ -841,11 +915,13 @@ fn push_phase_deltas(
                         // No phase-bucketed metric is Informational today (every
                         // `read_sample` / `fold_monitor_into_bucket` per-phase
                         // metric is directional; the Informational schedstat
-                        // counters are run-level only), so this skip changes no
-                        // current behavior — it codifies that invariant so a
-                        // future per-phase Informational metric is dropped from
-                        // the per-phase view rather than silently misclassified as
-                        // a regression/improvement.
+                        // counters are run-level only), so this skip never fires
+                        // for a production phase metric today — it is a tested
+                        // defense-in-depth guard (a unit test manually
+                        // phase-buckets an Informational metric to confirm it is
+                        // dropped) so a future per-phase Informational metric is
+                        // dropped from the per-phase view rather than silently
+                        // misclassified as a regression/improvement.
                         if metric_def.classify_direction().is_none() {
                             continue;
                         }
@@ -2181,6 +2257,44 @@ fn print_summary_block(
             report.removed_from_a, label_a, label_b,
         );
     }
+    for line in format_coverage_diff_lines(report, label_a, label_b) {
+        println!("{line}");
+    }
+}
+
+/// Render the coverage-diff lines (metrics present on exactly one side of a
+/// paired row) for [`print_summary_block`]. Pure (returns the lines, empty
+/// when there are no coverage diffs) so the present/absent label mapping by
+/// [`ComparePartition`] is unit-testable without capturing stdout.
+pub(crate) fn format_coverage_diff_lines(
+    report: &CompareReport,
+    label_a: &str,
+    label_b: &str,
+) -> Vec<String> {
+    if report.coverage_diffs.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec![format!(
+        "  {} metric(s) present on only one side (coverage difference, \
+         not a regression):",
+        report.coverage_diffs.len(),
+    )];
+    for cd in &report.coverage_diffs {
+        // present_side names the side that HAS the metric; the other is absent.
+        let (present, absent) = match cd.present_side {
+            ComparePartition::A => (label_a, label_b),
+            ComparePartition::B => (label_b, label_a),
+        };
+        lines.push(format!(
+            "    {} / {} = {:.2} in '{}', absent in '{}'",
+            cd.pairing_key.0.join("/"),
+            cd.metric.name,
+            cd.value,
+            present,
+            absent,
+        ));
+    }
+    lines
 }
 
 /// Print the host-context delta for `stats compare --runs`. Same
