@@ -866,6 +866,7 @@ fn currently_throttled_gauge_inline_redrain_succeeds_decrements_once() {
             &dev.irq_evt,
             &dev.interrupt_status,
             &dev.device_status,
+            None,
         )
     };
     // Pin the exact wait_nanos value the bucket math produces:
@@ -924,6 +925,7 @@ fn currently_throttled_gauge_inline_redrain_succeeds_decrements_once() {
             &dev.irq_evt,
             &dev.interrupt_status,
             &dev.device_status,
+            None,
         )
     };
     assert_eq!(
@@ -1016,6 +1018,7 @@ fn currently_throttled_gauge_inline_redrain_restalls_no_double_count() {
             &dev.irq_evt,
             &dev.interrupt_status,
             &dev.device_status,
+            None,
         )
     };
     assert!(matches!(
@@ -1042,6 +1045,7 @@ fn currently_throttled_gauge_inline_redrain_restalls_no_double_count() {
             &dev.irq_evt,
             &dev.interrupt_status,
             &dev.device_status,
+            None,
         )
     };
     // Same pinned wait_nanos as outcome1 — re-stall on an
@@ -1464,6 +1468,7 @@ fn currently_throttled_gauge_bytes_only_stall_and_retry() {
             &dev.irq_evt,
             &dev.interrupt_status,
             &dev.device_status,
+            None,
         )
     };
     // bytes bucket: capacity=512, rate=512, available=0,
@@ -1522,6 +1527,7 @@ fn currently_throttled_gauge_bytes_only_stall_and_retry() {
             &dev.irq_evt,
             &dev.interrupt_status,
             &dev.device_status,
+            None,
         )
     };
     assert_eq!(

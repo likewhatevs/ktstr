@@ -135,6 +135,49 @@ impl VirtioBlk {
         self.config_generation.load(Ordering::Acquire)
     }
 
+    /// Latched device-feature-select window — read back by the PCI common-cfg
+    /// `device_feature_select` register (the MMIO transport never reads it
+    /// back, but the PCI facade serves a register read).
+    pub(crate) fn device_features_sel(&self) -> u32 {
+        self.device_features_sel
+    }
+
+    /// Latched driver-feature-select window — read back by the PCI common-cfg
+    /// `driver_feature_select` register.
+    pub(crate) fn driver_features_sel(&self) -> u32 {
+        self.driver_features_sel
+    }
+
+    /// Latched queue selector — the PCI common-cfg `queue_select` read-back.
+    pub(crate) fn queue_select(&self) -> u32 {
+        self.queue_select
+    }
+
+    /// Actual ring size the guest configured for the selected queue (0 if the
+    /// selector is out of range). The PCI common-cfg `queue_size` register is
+    /// read-write (virtio-v1.2 §4.1.4.3): `set_queue_size` stores the guest's
+    /// value, so the read-back returns the currently-configured size — what the
+    /// PCI facade serves, NOT the immutable max ([`Self::queue_max_size`]).
+    pub(crate) fn queue_size(&self) -> u32 {
+        self.selected_queue()
+            .map(|i| self.worker.queues[i].size() as u32)
+            .unwrap_or(0)
+    }
+
+    /// `queue_notify_off` for the selected queue: notify offsets map in queue
+    /// order, so it equals the (in-range) selector index, and 0 for an
+    /// out-of-range selector. Pairs with the facade's notify-off multiplier
+    /// (wire address = index × multiplier).
+    pub(crate) fn queue_notify_off(&self) -> u32 {
+        self.selected_queue().map(|i| i as u32).unwrap_or(0)
+    }
+
+    /// Number of virtqueues the device exposes — the PCI common-cfg
+    /// `num_queues` register. virtio-blk v0 has a single request queue.
+    pub(crate) fn num_queues(&self) -> u32 {
+        NUM_QUEUES as u32
+    }
+
     /// Latch the device-feature-select window index (ungated).
     pub(crate) fn set_device_features_sel(&mut self, sel: u32) {
         self.device_features_sel = sel;
@@ -556,6 +599,14 @@ impl VirtioBlk {
             let valid = match new_bits {
                 VIRTIO_CONFIG_S_ACKNOWLEDGE => current_status == 0,
                 VIRTIO_CONFIG_S_DRIVER => current_status == S_ACK,
+                // FEATURES_OK requires the prior DRIVER state, VERSION_1
+                // negotiated (modern-only device), AND the driver-acked feature
+                // set to be a SUBSET of what we advertise (virtio-v1.2 §3.1.1
+                // step 5). Reference-impl divergence: firecracker does NO
+                // subset check at FEATURES_OK — it masks the acked bits to its
+                // avail_features in `ack_features_by_page` instead. We reject
+                // FEATURES_OK outright when the driver acked an unadvertised
+                // bit, which is spec-compliant and stricter.
                 VIRTIO_CONFIG_S_FEATURES_OK => {
                     current_status == S_DRV
                         && self.driver_features & (1u64 << VIRTIO_F_VERSION_1) != 0
@@ -1379,6 +1430,11 @@ impl VirtioBlk {
         let worker_warned = Arc::clone(&self.mem_unset_warned);
         let worker_paused = Arc::clone(&self.paused);
         let worker_parked_evt_slot = Arc::clone(&self.parked_evt);
+        // The shared MSI-X delivery state (`None` on INTx; `Some` once the PCI
+        // facade installed it via `set_msix_state`). Cloned so the worker's
+        // signal sites resolve the guest-assigned vector when MSI-X is enabled,
+        // exactly as `irq_evt` / `interrupt_status` are cloned for INTx.
+        let worker_msix = self.msix.clone();
         // Snapshot the placement at spawn time. A subsequent
         // `set_worker_placement` call only takes effect on the
         // NEXT respawn; the running worker observes the placement
@@ -1403,6 +1459,7 @@ impl VirtioBlk {
                     worker_stop,
                     pause_fd,
                     worker_parked_evt_slot,
+                    worker_msix,
                 )
             }) {
             Ok(h) => h,

@@ -1098,16 +1098,12 @@ impl KtstrVm {
         // semantics as parked_evt.
         let thaw_evt = Arc::new(EventFd::new(EFD_NONBLOCK).context("create thaw EventFd")?);
 
-        // Optional virtio-blk: `None` when no disks are attached,
-        // `Some` when the builder has at least one `DiskConfig`.
-        // Constructed BEFORE we tear down vm.vcpus so the helper
-        // can still read `vm.guest_mem` and the irqchip state.
-        let virtio_blk = self.init_virtio_blk(&vm)?;
-        // Plumb the shared parked_evt into the device so its worker
-        // wakes the freeze coordinator's rendezvous on park.
-        if let Some(ref blk) = virtio_blk {
-            blk.lock().set_parked_evt(parked_evt.clone());
-        }
+        // virtio-blk is set up AFTER the PCI bus + MSI-X route sink (below),
+        // because its x86_64 transport is a virtio-pci function that needs both.
+        // See the arch-split block following the virtio-net setup. (Like
+        // virtio-net, it is constructed before vm.vcpus is torn down so the
+        // helper can still read `vm.guest_mem` and register irqfds on
+        // `vm.vm_fd`.)
 
         // Optional virtio-net. The transport is arch-split:
         //
@@ -1150,7 +1146,7 @@ impl KtstrVm {
         let (virtio_net_counters, _net_resample_evts): (Vec<_>, Vec<_>) =
             match pci_bus_handle.as_ref() {
                 Some(bus) => self
-                    .init_virtio_net_pci(&vm, bus, msix_sink)?
+                    .init_virtio_net_pci(&vm, bus, msix_sink.clone())?
                     .into_iter()
                     .map(|h| (h.counters, h.resample_evt))
                     .unzip(),
@@ -1164,6 +1160,48 @@ impl KtstrVm {
             .map(|d| d.lock().counters())
             .into_iter()
             .collect();
+
+        // Optional virtio-blk. Transport is arch-split (same pattern as
+        // virtio-net above), but virtio-blk runs a request worker the freeze
+        // coordinator pauses, so the run loop needs the device itself — not just
+        // counters. Two handles result:
+        //  - `virtio_blk`: the MMIO-dispatch routing handle. `None` on x86 (the
+        //    device is a PCI function; guest BAR accesses route through the PCI
+        //    bus, so the dispatch loops' MMIO blk arm goes inert), `Some` on
+        //    aarch64 (the MMIO transport).
+        //  - `blk_device`: the canonical device Arc for the freeze
+        //    pause/resume, counters, paused-handle, and parked-eventfd — set on
+        //    BOTH arches (on x86 it is the `BlkDeviceHandles::device` clone whose
+        //    sibling backs the PciBus function; on aarch64 it is the same Arc as
+        //    `virtio_blk`).
+        // On x86 the INTx resample eventfd is held alive for the run (KVM holds
+        // its raw fd to de-assert the level GSI on guest EOI).
+        // (mmio_routing_handle, canonical_device, intx_resample_evt). The inner
+        // types are `Option<Arc<PiMutex<VirtioBlk>>>` / `Option<EventFd>`,
+        // inferred from the arms + later use (a written-out tuple trips
+        // clippy::type_complexity, matching the `(Vec<_>, Vec<_>)` style the NIC
+        // counters use above).
+        #[cfg(target_arch = "x86_64")]
+        let (virtio_blk, blk_device, _blk_resample_evt): (Option<_>, Option<_>, Option<_>) =
+            match pci_bus_handle.as_ref() {
+                Some(bus) => match self.init_virtio_blk_pci(&vm, bus, msix_sink)? {
+                    Some(h) => (None, Some(h.device), h.resample_evt),
+                    None => (None, None, None),
+                },
+                None => (None, None, None),
+            };
+        #[cfg(not(target_arch = "x86_64"))]
+        let (virtio_blk, blk_device): (Option<_>, Option<_>) = {
+            let dev = self.init_virtio_blk(&vm)?;
+            (dev.clone(), dev)
+        };
+        // Plumb the shared parked_evt into the device (both transports) so its
+        // worker wakes the freeze coordinator's rendezvous on park. Lands before
+        // the deferred initial worker spawn (DRIVER_OK, after vCPUs start), so
+        // the first worker observes it.
+        if let Some(ref blk) = blk_device {
+            blk.lock().set_parked_evt(parked_evt.clone());
+        }
 
         // Virtio-console for host→guest wake delivery. The setup_memory
         // path always emits the device's MMIO node on the kernel
@@ -1746,7 +1784,10 @@ impl KtstrVm {
         // are automatically frozen when the vCPU rendezvous
         // completes (their `mmio_write` handlers must have already
         // returned for the vCPU to reach the parked state).
-        let freeze_coord_virtio_blk = virtio_blk.clone();
+        // Use `blk_device` (set on both transports), NOT `virtio_blk` (the
+        // MMIO-routing handle, `None` on x86): the coordinator must pause/resume
+        // the request worker regardless of how the guest reaches the device.
+        let freeze_coord_virtio_blk = blk_device.clone();
         // Lock-free `paused` flag handle. The freeze coordinator
         // polls the worker's parked-state in two paths (the
         // rendezvous timeout-diagnostic snapshot and the post-thaw
@@ -1762,7 +1803,7 @@ impl KtstrVm {
         // with the worker's parked-state stores that
         // `is_paused()` does.
         let freeze_coord_virtio_blk_paused: Option<Arc<AtomicBool>> =
-            virtio_blk.as_ref().map(|d| d.lock().paused_handle());
+            blk_device.as_ref().map(|d| d.lock().paused_handle());
         // Clone the virtio-console Arc into the coordinator so it
         // can drain port-1 bulk TLV bytes as the guest writes them
         // (event-driven via the tx_evt eventfd registered into the
@@ -10403,7 +10444,10 @@ impl KtstrVm {
         // handle onto `VmRunState` so `collect_results` can attach
         // it to `VmResult` without holding the device alive past
         // its current ownership.
-        let virtio_blk_counters = virtio_blk.as_ref().map(|d| d.lock().counters());
+        // Read via `blk_device` (set on both transports), NOT `virtio_blk`
+        // (`None` on x86): the counters live in the shared device regardless of
+        // whether it is reached through MMIO (aarch64) or the PCI bus (x86).
+        let virtio_blk_counters = blk_device.as_ref().map(|d| d.lock().counters());
         // `virtio_net_counters` was captured at device construction (the
         // transport-split init above): on x86_64 from `NetDeviceHandles`
         // (the PCI function owns the device core, so the `virtio_net`

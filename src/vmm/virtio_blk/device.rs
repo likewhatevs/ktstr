@@ -77,6 +77,8 @@ pub(crate) use vm_memory::{ByteValued, Bytes, GuestAddress, GuestMemory, GuestMe
 // (sourced from `mod.rs`'s `pub(crate) use counters::*;`).
 use super::VirtioBlkCounters;
 use super::{Backing, advance_iovecs};
+use crate::vmm::PiMutex;
+use crate::vmm::virtio_msix::MsixState;
 // `EpollEvent` / `EventSet` are re-exported because tests for the
 // always-compiled `worker_dispatch_event` helper construct EventSet
 // values directly via `super::*`, and the helper itself accepts an
@@ -144,19 +146,24 @@ pub const VIRTIO_BLK_DEFAULT_CAPACITY_BYTES: u64 = 256 * 1024 * 1024;
 /// virtio-v1.2 §5.2.4: `seg_max` is the max scatter-gather buffer
 /// count, exclusive of the header and status descriptors. Without
 /// `F_SEG_MAX` the guest defaults `max_segments` to 1, which forces
-/// `bio_split` and serializes large requests; advertising 128 is the
-/// firecracker default and ample for the small files this device
-/// targets.
+/// `bio_split` and serializes large requests. 128 is our defensive
+/// cap — ample for the small files this device targets, and bounding a
+/// hostile guest's per-request segment count (enforced at request time in
+/// `drain_bracket_impl`). firecracker advertises NO `F_SEG_MAX` (its block
+/// config is just `{ capacity }` and its request parse takes exactly one
+/// data descriptor), so 128 is a ktstr choice, not a firecracker default.
 pub(crate) const VIRTIO_BLK_SEG_MAX: u32 = 128;
 
 /// Maximum size in bytes of a single descriptor's data buffer.
 /// virtio-v1.2 §5.2.4 (`size_max`): caps per-descriptor length so a
 /// guest can't submit a single 4 GB descriptor and force the device
-/// to allocate a matching `Vec<u8>` for `read_at`/`write_at`. 1 MiB
-/// matches firecracker's default and is far above what the guest's
-/// blk-mq layer typically generates (max_sectors_kb defaults to
-/// 512 KiB). Without `F_SIZE_MAX` the guest treats per-descriptor
-/// length as unbounded — host OOM hazard on a hostile guest.
+/// to allocate a matching `Vec<u8>` for `read_at`/`write_at`. 1 MiB is
+/// our defensive cap, far above what the guest's blk-mq layer typically
+/// generates (max_sectors_kb defaults to 512 KiB). Without `F_SIZE_MAX`
+/// the guest treats per-descriptor length as unbounded — host OOM hazard
+/// on a hostile guest. firecracker advertises NO `F_SIZE_MAX` (its
+/// single-data-descriptor request parse needs no per-descriptor bound),
+/// so this 1 MiB cap is a ktstr choice, not a firecracker default.
 pub(crate) const VIRTIO_BLK_SIZE_MAX: u32 = 1 << 20;
 
 /// Linux's maximum iovec count (`UIO_MAXIOV`) for a single
@@ -776,6 +783,16 @@ pub struct VirtioBlk {
     /// taking ownership away from the device. Tests run inline so
     /// the same Arc is read directly via `dev.irq_evt.read()`.
     pub(crate) irq_evt: Arc<EventFd>,
+    /// Shared MSI-X delivery state (PCI transport only). `Some` once the
+    /// facade calls [`Self::set_msix_state`]; the facade holds the other
+    /// `Arc` clone and configures it from config-space writes, while the
+    /// device's signal sites (the worker thread's `drain_bracket_impl`)
+    /// reach it when MSI-X is enabled. `None` on INTx (virtio-MMIO /
+    /// aarch64) — the signal sites then write `irq_evt` directly. The
+    /// worker thread clones this `Arc` at spawn (alongside `irq_evt` /
+    /// `interrupt_status`), so the delivery state is shared across the
+    /// vCPU thread (facade configures) and the worker thread (signals).
+    pub(crate) msix: Option<Arc<PiMutex<MsixState>>>,
     /// Guest memory reference. Set before starting vCPUs via
     /// `set_mem`. Wrapped in `Arc<OnceLock<…>>` so the worker
     /// thread (production) can pick up `mem` post-construction
@@ -1058,6 +1075,7 @@ impl VirtioBlk {
             interrupt_status,
             config_generation: AtomicU32::new(0),
             irq_evt,
+            msix: None,
             mem,
             capacity_sectors,
             worker,
@@ -1116,6 +1134,15 @@ impl VirtioBlk {
     /// Eventfd for KVM irqfd registration.
     pub fn irq_evt(&self) -> &EventFd {
         &self.irq_evt
+    }
+
+    /// Install the shared MSI-X delivery state (PCI transport only). The
+    /// facade holds the other `Arc` clone and configures it from
+    /// config-space writes; the device's signal sites reach it (via the
+    /// worker thread's clone) when MSI-X is enabled. INTx transports
+    /// (virtio-MMIO, aarch64) never call this and stay `None`.
+    pub(crate) fn set_msix_state(&mut self, msix: Arc<PiMutex<MsixState>>) {
+        self.msix = Some(msix);
     }
 
     /// Set guest memory reference. Must be called before starting vCPUs.
@@ -1954,6 +1981,7 @@ impl VirtioBlk {
             &self.irq_evt,
             &self.interrupt_status,
             &self.device_status,
+            self.msix.as_ref(),
         );
     }
 }

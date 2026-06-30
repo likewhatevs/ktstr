@@ -214,8 +214,16 @@ mod mmio;
 // VIRTIO_MMIO_* register offsets onto the transport-neutral core ops in
 // `control.rs`. No symbols to re-export — the `impl` block extends the
 // type that lives in `device.rs`; `mod mmio;` alone wires it into the
-// build. Split from `control.rs` so a future PCI facade is a sibling
+// build. Split from `control.rs` so the PCI facade is a sibling
 // peer of the MMIO facade over the same core, not a fork of it.
+
+mod pci;
+// `pci.rs` is the virtio-pci-modern transport facade: `VirtioBlkPci` wraps the
+// `VirtioBlk` core and decodes the PCI config space + BAR0
+// common/ISR/device/notify/MSI-X regions onto the same core ops the MMIO facade
+// uses. `setup` installs it into the `PciBus`; re-exported `pub(crate)` for that
+// wiring (mirrors virtio_net::VirtioNetPci).
+pub(crate) use pci::VirtioBlkPci;
 
 mod control;
 mod lifecycle;

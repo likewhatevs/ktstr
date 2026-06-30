@@ -62,6 +62,30 @@ pub(crate) struct NetDeviceHandles {
     pub(crate) resample_evt: Option<EventFd>,
 }
 
+/// Host-side handles for the x86_64 virtio-blk PCI device. Unlike
+/// [`NetDeviceHandles`] (which moves its device into the facade and keeps only
+/// the counters), virtio-blk shares its device core as an `Arc<PiMutex<_>>`: the
+/// run loop keeps `device` to pause/resume the request worker across the freeze
+/// rendezvous, snapshot counters (`device.lock().counters()`), and set the
+/// parked-eventfd — operations the facade's other Arc clone never serves. The
+/// MMIO-dispatch `virtio_blk` handle stays `None` on x86 (guest BAR accesses
+/// route through the PCI bus), so `device` is the run loop's sole reach into the
+/// device on this transport.
+#[cfg(target_arch = "x86_64")]
+pub(crate) struct BlkDeviceHandles {
+    /// The shared device core — the same `Arc<PiMutex<VirtioBlk>>` whose other
+    /// clone backs the installed [`pci::PciBus`] function. The run loop pauses /
+    /// resumes the worker, reads counters, and sets the parked-eventfd through
+    /// it.
+    pub(crate) device: Arc<PiMutex<virtio_blk::VirtioBlk>>,
+    /// The INTx resample eventfd — `Some` only on the full in-kernel irqchip
+    /// path (`<=254` max APIC ID); KVM holds its raw fd to de-assert the level
+    /// GSI on guest EOI, so it MUST outlive the run. `None` on split-irqchip
+    /// (`>254`), where a plain edge irqfd is used. Same semantics as
+    /// [`NetDeviceHandles::resample_evt`].
+    pub(crate) resample_evt: Option<EventFd>,
+}
+
 /// Address where initramfs is loaded in guest memory.
 #[cfg(target_arch = "x86_64")]
 const INITRD_ADDR: u64 = 0x800_0000; // 128 MiB
@@ -339,8 +363,142 @@ pub(crate) fn assemble_extras_and_key<'a>(
 }
 
 impl KtstrVm {
-    /// Construct the optional virtio-blk device for the configured
-    /// disk in `self.disks`. Returns `Ok(None)` when no disk is
+    /// Open the per-test backing file for `disk`, sized to `capacity`.
+    /// Shared by both transports — `init_virtio_blk` (aarch64 MMIO) and
+    /// `init_virtio_blk_pci` (x86 PCI) — so the disk-template lifecycle
+    /// is identical regardless of how the device is presented to the
+    /// guest. The fork is on the configured [`disk_config::Filesystem`],
+    /// with one override for the template-build VM driver:
+    ///
+    ///  - **`template_staging_image` set** (internal-only — see
+    ///    [`KtstrVmBuilder::template_staging_image`]): open the
+    ///    caller-supplied path RW and hand it to the device. This
+    ///    branch exists exclusively for
+    ///    [`disk_template::build_template_via_vm`]: the driver
+    ///    materialises a sparse staging image, points the
+    ///    template-build guest at it via this field, and recovers
+    ///    the now-formatted file after VM exit for
+    ///    [`disk_template::store_atomic`]. Bypasses both the
+    ///    `Raw` tempfile and `Btrfs` ensure_template branches so
+    ///    the template-build VM cannot recursively re-enter the
+    ///    cache it is itself populating.
+    ///
+    ///  - `Raw`: anonymous sparse `tempfile()`. The kernel
+    ///    reclaims storage when the device drops the File. No
+    ///    cache, no FICLONE.
+    ///
+    ///  - `Btrfs`: FICLONE-clones the host-cached, guest-formatted
+    ///    template into a per-test tempfile under the cache root
+    ///    (so FICLONE source and dest share a filesystem), unlinks
+    ///    the dest immediately after open so the device sees the
+    ///    same anonymous-file semantics as the `Raw` path, and
+    ///    hands the open `File` to the `VirtioBlk` device. See
+    ///    [`crate::vmm::disk_template`] module docs.
+    fn open_blk_backing(
+        &self,
+        disk: &disk_config::DiskConfig,
+        capacity: u64,
+    ) -> Result<std::fs::File> {
+        if let Some(staging) = self.template_staging_image.as_ref() {
+            let f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(staging)
+                .with_context(|| {
+                    format!(
+                        "open template staging image {} for virtio-blk",
+                        staging.display(),
+                    )
+                })?;
+            // Enforce the file-size = advertised-capacity invariant.
+            // The in-tree caller (`disk_template::build_template_via_vm`)
+            // sizes the staging file via
+            // `create_and_size_staging_image` before invoking the
+            // builder, so this is normally a no-op. Calling `set_len`
+            // here makes the contract local to the device-init path
+            // — a caller-supplied staging image that is too small or
+            // too large is normalised to `capacity` instead of
+            // letting virtio-blk advertise a size that disagrees with
+            // the backing file. Sparse-file semantics match the Raw
+            // branch below: holes don't consume disk space until
+            // written.
+            f.set_len(capacity)
+                .context("set template staging image length to capacity")?;
+            Ok(f)
+        } else {
+            match disk.filesystem {
+                disk_config::Filesystem::Raw => {
+                    let f = tempfile::tempfile()
+                        .context("create virtio-blk sparse temp backing file")?;
+                    // Make sure the file covers the advertised capacity.
+                    // set_len creates a sparse file: holes don't consume
+                    // disk space until written.
+                    f.set_len(capacity)
+                        .context("set virtio-blk backing file length")?;
+                    Ok(f)
+                }
+                disk_config::Filesystem::Btrfs => {
+                    let template =
+                        disk_template::ensure_template(disk_config::Filesystem::Btrfs, capacity)
+                            .context("ensure btrfs disk template")?;
+                    let cache_root = disk_template::cache_root()
+                        .context("resolve disk-template cache root for per-test clone")?;
+                    std::fs::create_dir_all(&cache_root)
+                        .with_context(|| format!("create cache root {cache_root:?}"))?;
+                    // Generate a unique per-test path under the cache
+                    // root. Use pid + timestamp_ns + random_u64 so
+                    // concurrent tests in the same process and across
+                    // processes never collide.
+                    let dest = cache_root.join(format!(
+                        ".per-test-{pid}-{ns:x}-{rnd:x}.img",
+                        pid = std::process::id(),
+                        ns = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_nanos())
+                            .unwrap_or(0),
+                        rnd = rand::random::<u64>(),
+                    ));
+                    let f = disk_template::clone_to_per_test(&template, &dest)
+                        .context("FICLONE template into per-test backing")?;
+                    // Unlink the dest path immediately. The open File
+                    // keeps the inode alive for the device's lifetime;
+                    // the kernel reclaims storage on drop, matching the
+                    // `tempfile()` semantics of the Raw branch.
+                    //
+                    // If the unlink fails (very rare — ENOENT means a
+                    // peer beat us to it, EACCES means the operator's
+                    // cache permissions are broken, EBUSY can come from
+                    // some FUSE backings), we keep the open File and
+                    // warn — the device still works on the open fd, the
+                    // only consequence is a stale path on disk that the
+                    // next cache GC sweeps. Do NOT propagate the error,
+                    // because the device's per-test backing is already
+                    // valid and aborting VM init would be a regression
+                    // versus the Raw branch where `tempfile::tempfile()`
+                    // returns an already-unlinked file with no failure
+                    // mode.
+                    if let Err(e) = std::fs::remove_file(&dest) {
+                        tracing::warn!(
+                            path = %dest.display(),
+                            error = %e,
+                            "failed to unlink per-test btrfs backing after \
+                             FICLONE; the open File still backs the device, \
+                             but the leftover path will accumulate in the \
+                             cache directory until manual cleanup or the \
+                             next disk-template cache GC pass."
+                        );
+                    }
+                    Ok(f)
+                }
+            }
+        }
+    }
+
+    /// Construct the aarch64 virtio-MMIO block device for the configured
+    /// disk in `self.disks`. (x86_64 routes the disk over virtio-pci — see
+    /// `init_virtio_blk_pci`, which is x86-gated so an intra-doc link would not
+    /// resolve on this aarch64-only build; aarch64 PCI is a later increment, so
+    /// the disk stays on MMIO here.) Returns `Ok(None)` when no disk is
     /// attached.
     ///
     /// On `Ok(Some(_))`, the returned `Arc<PiMutex<VirtioBlk>>` has:
@@ -358,6 +516,7 @@ impl KtstrVm {
     /// (`VIRTIO_BLK_MMIO_BASE` / `VIRTIO_BLK_IRQ`); the builder's
     /// `.disk()` enforces the single-disk constraint by overwriting
     /// any previous disk on each call.
+    #[cfg(not(target_arch = "x86_64"))]
     pub(super) fn init_virtio_blk(
         &self,
         vm: &kvm::KtstrKvm,
@@ -414,99 +573,7 @@ impl KtstrVm {
         //    same anonymous-file semantics as the `Raw` path, and
         //    hands the open `File` to the `VirtioBlk` device. See
         //    [`crate::vmm::disk_template`] module docs.
-        let backing = if let Some(staging) = self.template_staging_image.as_ref() {
-            let f = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(staging)
-                .with_context(|| {
-                    format!(
-                        "open template staging image {} for virtio-blk",
-                        staging.display(),
-                    )
-                })?;
-            // Enforce the file-size = advertised-capacity invariant.
-            // The in-tree caller (`disk_template::build_template_via_vm`)
-            // sizes the staging file via
-            // `create_and_size_staging_image` before invoking the
-            // builder, so this is normally a no-op. Calling `set_len`
-            // here makes the contract local to the device-init path
-            // — a caller-supplied staging image that is too small or
-            // too large is normalised to `capacity` instead of
-            // letting virtio-blk advertise a size that disagrees with
-            // the backing file. Sparse-file semantics match the Raw
-            // branch above: holes don't consume disk space until
-            // written.
-            f.set_len(capacity)
-                .context("set template staging image length to capacity")?;
-            f
-        } else {
-            match disk.filesystem {
-                disk_config::Filesystem::Raw => {
-                    let f = tempfile::tempfile()
-                        .context("create virtio-blk sparse temp backing file")?;
-                    // Make sure the file covers the advertised capacity.
-                    // set_len creates a sparse file: holes don't consume
-                    // disk space until written.
-                    f.set_len(capacity)
-                        .context("set virtio-blk backing file length")?;
-                    f
-                }
-                disk_config::Filesystem::Btrfs => {
-                    let template =
-                        disk_template::ensure_template(disk_config::Filesystem::Btrfs, capacity)
-                            .context("ensure btrfs disk template")?;
-                    let cache_root = disk_template::cache_root()
-                        .context("resolve disk-template cache root for per-test clone")?;
-                    std::fs::create_dir_all(&cache_root)
-                        .with_context(|| format!("create cache root {cache_root:?}"))?;
-                    // Generate a unique per-test path under the cache
-                    // root. Use pid + timestamp_ns + random_u64 so
-                    // concurrent tests in the same process and across
-                    // processes never collide.
-                    let dest = cache_root.join(format!(
-                        ".per-test-{pid}-{ns:x}-{rnd:x}.img",
-                        pid = std::process::id(),
-                        ns = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_nanos())
-                            .unwrap_or(0),
-                        rnd = rand::random::<u64>(),
-                    ));
-                    let f = disk_template::clone_to_per_test(&template, &dest)
-                        .context("FICLONE template into per-test backing")?;
-                    // Unlink the dest path immediately. The open File
-                    // keeps the inode alive for the device's lifetime;
-                    // the kernel reclaims storage on drop, matching the
-                    // `tempfile()` semantics of the Raw branch.
-                    //
-                    // If the unlink fails (very rare — ENOENT means a
-                    // peer beat us to it, EACCES means the operator's
-                    // cache permissions are broken, EBUSY can come from
-                    // some FUSE backings), we keep the open File and
-                    // warn — the device still works on the open fd, the
-                    // only consequence is a stale path on disk that the
-                    // next cache GC sweeps. Do NOT propagate the error,
-                    // because the device's per-test backing is already
-                    // valid and aborting VM init would be a regression
-                    // versus the Raw branch where `tempfile::tempfile()`
-                    // returns an already-unlinked file with no failure
-                    // mode.
-                    if let Err(e) = std::fs::remove_file(&dest) {
-                        tracing::warn!(
-                            path = %dest.display(),
-                            error = %e,
-                            "failed to unlink per-test btrfs backing after \
-                             FICLONE; the open File still backs the device, \
-                             but the leftover path will accumulate in the \
-                             cache directory until manual cleanup or the \
-                             next disk-template cache GC pass."
-                        );
-                    }
-                    f
-                }
-            }
-        };
+        let backing = self.open_blk_backing(disk, capacity)?;
 
         let mut blk =
             virtio_blk::VirtioBlk::with_options(backing, capacity, disk.throttle, disk.read_only);
@@ -746,6 +813,164 @@ impl KtstrVm {
             });
         }
         Ok(handles)
+    }
+
+    /// Construct the x86_64 virtio-blk PCI function (when a disk is configured)
+    /// and install it on `pci_bus` at `virtio_blk_pci_slot()`. Returns
+    /// [`BlkDeviceHandles`] (the shared device Arc + the INTx resample eventfd),
+    /// or `Ok(None)` when no disk is attached.
+    ///
+    /// The disk-template lifecycle (throttle gate, backing-file open) is shared
+    /// verbatim with the aarch64 MMIO path via [`Self::open_blk_backing`]; only
+    /// the transport wiring differs. The device core is a SHARED
+    /// `Arc<PiMutex<VirtioBlk>>`: one clone is moved into the [`VirtioBlkPci`]
+    /// function on `pci_bus` (the vCPU thread drives it through BAR MMIO exits),
+    /// the other is returned in `BlkDeviceHandles::device` so the run loop can
+    /// pause/resume the request worker across the freeze rendezvous, read
+    /// counters, and set the parked-eventfd. The MMIO-dispatch `virtio_blk`
+    /// handle stays `None` on x86 (guest BAR accesses route through the PCI bus),
+    /// exactly as the NIC does.
+    ///
+    /// INTx is the guest's interrupt FALLBACK (the MSI-X cap is advertised below
+    /// whenever `msix_sink` is `Some`). It is registered unconditionally so a
+    /// guest that declines MSI-X (older driver, `pci=nomsi`) still gets IRQs;
+    /// delivery differs by irqchip mode (gated on max APIC ID, not vCPU count) —
+    /// full in-kernel irqchip (`<=254`) → `register_irqfd_with_resample` (KVM
+    /// tracks the level GSI and de-asserts on guest EOI); split (`>254`) → a
+    /// plain edge `register_irqfd` (the kernel's `kvm_arch_irqfd_allowed` rejects
+    /// a resample irqfd there). The single-asserter worker (one drain per kick,
+    /// consumed before the next) needs no active resample drain — see
+    /// [`VirtioBlkPci`] for the full rationale, which mirrors the NIC's INTx.
+    ///
+    /// `msix_sink` is the active GSI-route owner ([`kvm::FullIrqchipRouteOwner`]
+    /// on full-irqchip, [`kvm::IoapicHandle`] on split — both
+    /// [`virtio_msix::MsixRouteSink`]s): `Some` for an x86 PCI guest, `None`
+    /// otherwise. When `Some`, MSI-X is offered: one eventfd per vector
+    /// registered as an irqfd at `virtio_blk_pci_msix_gsi(v)`, the sink threaded
+    /// into the facade to install routes on the guest's vector-unmask edges. When
+    /// `None`, the facade omits the MSI-X cap and the device stays on INTx.
+    #[cfg(target_arch = "x86_64")]
+    pub(super) fn init_virtio_blk_pci(
+        &self,
+        vm: &kvm::KtstrKvm,
+        pci_bus: &Arc<PiMutex<pci::PciBus>>,
+        msix_sink: Option<Arc<dyn virtio_msix::MsixRouteSink>>,
+    ) -> Result<Option<BlkDeviceHandles>> {
+        if self.disks.is_empty() {
+            return Ok(None);
+        }
+        let disk = &self.disks[0];
+        let capacity = disk.capacity_bytes();
+
+        // Throttle sanity gate — identical to the MMIO path in
+        // `init_virtio_blk`. Run BEFORE `open_blk_backing` so a misconfigured
+        // throttle bails before any backing-file host commitment.
+        disk.throttle
+            .validate()
+            .map_err(|e| anyhow::anyhow!(e).context("invalid disk throttle"))?;
+
+        let backing = self.open_blk_backing(disk, capacity)?;
+        let mut blk =
+            virtio_blk::VirtioBlk::with_options(backing, capacity, disk.throttle, disk.read_only);
+        // Worker placement + guest memory — same as `init_virtio_blk`. Both land
+        // before the deferred initial worker spawn (DRIVER_OK), so the first
+        // worker observes the placement and guest memory.
+        let placement = virtio_blk::WorkerPlacement {
+            service_cpu: self.pinning_plan.as_ref().and_then(|p| p.service_cpu),
+            no_perf_cpus: self.no_perf_plan.as_ref().map(|p| p.cpus.clone()),
+        };
+        blk.set_worker_placement(placement);
+        blk.set_mem((*vm.guest_mem).clone());
+        // Wrap once; one Arc clone backs the PciBus function, the other is
+        // returned to the run loop. `set_parked_evt` is called by the caller
+        // (after this returns), matching the MMIO path's post-init call site.
+        let blk_arc = Arc::new(PiMutex::new(blk));
+
+        let slot = kvm::virtio_blk_pci_slot();
+        let gsi = kvm::virtio_blk_pci_gsi();
+        // The BAR aperture is the host-bridge _CRS MMIO grant (same window the
+        // DSDT advertises); `bar_window` rejects an out-of-grant base so a
+        // non-conformant guest BAR cannot shadow the ECAM window.
+        let bar_aperture = (
+            kvm::PCI_MMIO_BAR_BASE,
+            kvm::PCI_MMIO_BAR_BASE + kvm::PCI_MMIO_BAR_SIZE,
+        );
+
+        // INTx — registered on BOTH irqchip paths (the guest's fallback if it
+        // declines MSI-X). The device's `irq_evt` lives behind the device lock;
+        // borrow it for the registration call only. Delivery branches on
+        // `vm.split_irqchip` exactly as `init_virtio_net_pci` documents.
+        let resample_evt = if vm.split_irqchip {
+            vm.vm_fd
+                .register_irqfd(blk_arc.lock().irq_evt(), gsi)
+                .with_context(|| {
+                    format!(
+                        "register virtio-blk-PCI INTx irqfd (split-irqchip edge \
+                         MSI), slot {slot} GSI {gsi}"
+                    )
+                })?;
+            None
+        } else {
+            let evt = EventFd::new(libc::EFD_NONBLOCK)
+                .context("create virtio-blk resample eventfd")?;
+            vm.vm_fd
+                .register_irqfd_with_resample(blk_arc.lock().irq_evt(), &evt, gsi)
+                .with_context(|| {
+                    format!(
+                        "register virtio-blk-PCI INTx resample irqfd (full \
+                         irqchip), slot {slot} GSI {gsi}"
+                    )
+                })?;
+            // Held alive in `BlkDeviceHandles::resample_evt` for the run (KVM
+            // performs the EOI deassert; the only VMM requirement is the fd stays
+            // open). No active drain in v0 — the single-asserter worker never
+            // races back-to-back unconsumed asserts.
+            Some(evt)
+        };
+
+        // MSI-X (both irqchip paths when a sink is wired): the shared delivery
+        // state sizes its table to `num_queues + 1` (one request-queue vector +
+        // config), capped at the host's per-blk GSI budget
+        // (`kvm::MSIX_VECTORS_PER_BLK`). The GSI/eventfd allocation below matches
+        // that count, so the facade's advertised table size, the registered
+        // irqfds, and the device's table stay in lockstep.
+        let msix = Arc::new(PiMutex::new(virtio_msix::MsixState::new(
+            blk_arc.lock().num_queues() as usize,
+            kvm::MSIX_VECTORS_PER_BLK,
+        )));
+        let num_vectors = msix.lock().num_vectors();
+        let mut msix_gsis: Vec<u32> = vec![0u32; num_vectors];
+        let route_sink: Option<Arc<dyn virtio_msix::MsixRouteSink>> = match &msix_sink {
+            Some(sink) => {
+                for (v, gsi_slot) in msix_gsis.iter_mut().enumerate() {
+                    let mgsi = kvm::virtio_blk_pci_msix_gsi(v);
+                    *gsi_slot = mgsi;
+                    let evt = EventFd::new(libc::EFD_NONBLOCK)
+                        .context("create virtio-blk MSI-X vector eventfd")?;
+                    vm.vm_fd.register_irqfd(&evt, mgsi).with_context(|| {
+                        format!("register virtio-blk-PCI MSI-X irqfd, vector {v} GSI {mgsi}")
+                    })?;
+                    msix.lock().set_eventfd(v, evt);
+                }
+                Some(Arc::clone(sink))
+            }
+            None => None,
+        };
+        // Move one device Arc clone into the PCI function; install at its slot.
+        // The PciBus lock serializes the vCPU-thread BAR accesses that drive it.
+        // The shared MSI-X state is cloned into the device core inside `new`.
+        let func = virtio_blk::VirtioBlkPci::new(
+            Arc::clone(&blk_arc),
+            bar_aperture,
+            msix,
+            route_sink,
+            msix_gsis,
+        );
+        pci_bus.lock().add_function(slot, Box::new(func));
+        Ok(Some(BlkDeviceHandles {
+            device: blk_arc,
+            resample_evt,
+        }))
     }
 
     /// Create the KVM VM and optionally load the kernel.
@@ -1532,6 +1757,7 @@ impl KtstrVm {
             ),
             vm.pci_enabled,
             self.networks.len(),
+            !self.disks.is_empty(),
         )?;
         tracing::debug!(elapsed_us = t0.elapsed().as_micros(), "mptable_acpi");
 
@@ -1614,20 +1840,14 @@ impl KtstrVm {
             kvm::VIRTIO_CONSOLE_MMIO_BASE,
             kvm::VIRTIO_CONSOLE_IRQ,
         ));
-        // Virtio-block MMIO device — appended only when the builder
-        // attached at least one disk. The kernel's virtio_mmio_cmdline
-        // parser registers a MMIO transport per `virtio_mmio.device=`
-        // token; the order on the cmdline determines the device-probe
-        // order, which in turn determines the `/dev/vd{a,b,...}`
-        // assignment. Console-first then blk matches the expected
-        // `/dev/vda = first disk` mapping.
+        // Virtio-block on x86_64 is a virtio-pci function (see
+        // `init_virtio_blk_pci`), enumerated by the guest over ECAM and bound by
+        // the virtio-pci driver — it needs NO `virtio_mmio.device=` token (the
+        // same reason the NIC emits none; aarch64 keeps blk on virtio-MMIO and
+        // emits the token in `finish_aarch64_setup`). The single PCI block
+        // function becomes `/dev/vda`. The auto-mount handshake tokens below are
+        // transport-independent and still emitted whenever a disk is attached.
         if !self.disks.is_empty() {
-            cmdline.push_str(&format!(
-                " virtio_mmio.device={:#x}@{:#x}:{}",
-                virtio_blk::VIRTIO_MMIO_SIZE,
-                kvm::VIRTIO_BLK_MMIO_BASE,
-                kvm::VIRTIO_BLK_IRQ,
-            ));
             // Auto-mount handshake. Emit a `KTSTR_DISK0_FS=<tag>`
             // token whenever the first disk has been pre-formatted so
             // the guest init at

@@ -62,6 +62,14 @@ use vmm_sys_util::eventfd::EventFd;
 use super::DrainOutcome;
 #[cfg(not(test))]
 use super::{BlkQueue, BlkWorkerState, NUM_QUEUES, WorkerPlacement, drain_bracket_impl};
+// Used only by `worker_thread_main` (itself `#[cfg(not(test))]` — the
+// syscall-bearing production worker), so gate the imports to match; the
+// `cfg(test)` inline drain path reaches `MsixState` via `drain_bracket_impl`'s
+// param, not these.
+#[cfg(not(test))]
+use crate::vmm::PiMutex;
+#[cfg(not(test))]
+use crate::vmm::virtio_msix::MsixState;
 
 /// Cap the throttle retry timer so a pathological refill rate (e.g.
 /// tens of millions of bytes per second backing a single very large
@@ -391,6 +399,7 @@ pub(crate) fn worker_thread_main(
     stop_fd: EventFd,
     pause_fd: EventFd,
     parked_evt_slot: Arc<std::sync::Mutex<Option<Arc<EventFd>>>>,
+    msix: Option<Arc<PiMutex<MsixState>>>,
 ) -> BlkWorkerState {
     // Apply the configured CPU placement before any other syscall.
     // perf-mode pins to a single CPU (cache locality + isolation
@@ -818,6 +827,7 @@ pub(crate) fn worker_thread_main(
             &irq_evt,
             &interrupt_status,
             &device_status,
+            msix.as_ref(),
         );
         // Inline re-drain on wait_nanos == 0. When
         // `nanos_until_n_tokens` returns 0 — bucket already
@@ -848,6 +858,7 @@ pub(crate) fn worker_thread_main(
                 &irq_evt,
                 &interrupt_status,
                 &device_status,
+                msix.as_ref(),
             )
         });
         // Apply the decided action. The `Sleep` arm arms the retry

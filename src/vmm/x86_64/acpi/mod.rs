@@ -16,8 +16,9 @@ use zerocopy::IntoBytes;
 
 use super::topology::apic_id;
 use crate::vmm::kvm::{
-    virtio_net_gsi, virtio_net_pci_slot, ACPI_PM1_CNT_PORT, ACPI_PM1_EVT_PORT, ACPI_PM_TMR_PORT,
-    ACPI_SCI_IRQ, HIMEM_START, PCI_ECAM_BASE, PCI_ECAM_SIZE, PCI_MMIO_BAR_BASE, PCI_MMIO_BAR_SIZE,
+    virtio_blk_pci_gsi, virtio_blk_pci_slot, virtio_net_gsi, virtio_net_pci_slot,
+    ACPI_PM1_CNT_PORT, ACPI_PM1_EVT_PORT, ACPI_PM_TMR_PORT, ACPI_SCI_IRQ, HIMEM_START,
+    PCI_ECAM_BASE, PCI_ECAM_SIZE, PCI_MMIO_BAR_BASE, PCI_MMIO_BAR_SIZE,
 };
 use crate::vmm::numa_mem::NumaMemoryLayout;
 use crate::vmm::topology::Topology;
@@ -271,6 +272,7 @@ pub fn setup_acpi(
     numa_layout: &NumaMemoryLayout,
     pci_enabled: bool,
     nic_count: usize,
+    blk_attached: bool,
 ) -> Result<AcpiLayout> {
     let num_cpus = topo.total_cpus();
 
@@ -335,9 +337,18 @@ pub fn setup_acpi(
         // route list (PCI enabled without a NIC): the DSDT carries the PCI0
         // host bridge with no _PRT entries, which is correct — there is no
         // device at any slot to consult.
-        let irq_routes: Vec<(u32, u32)> = (0..nic_count)
+        let mut irq_routes: Vec<(u32, u32)> = (0..nic_count)
             .map(|i| (virtio_net_pci_slot(i) as u32, virtio_net_gsi(i)))
             .collect();
+        // virtio-blk INTx route (when a disk is attached): the block function
+        // sits at PCI slot virtio_blk_pci_slot() and routes INTA# ->
+        // virtio_blk_pci_gsi(). Constant-driven like the NIC routes. INTx is the
+        // guest's fallback if it declines MSI-X (the facade also advertises an
+        // MSI-X cap); the _PRT entry must exist so acpi_pci_irq_enable can set
+        // the device's pci_dev->irq either way.
+        if blk_attached {
+            irq_routes.push((virtio_blk_pci_slot() as u32, virtio_blk_pci_gsi()));
+        }
         aml::pci_host_bridge_dsdt_body(
             PCI_ECAM_BASE as u32,
             PCI_ECAM_SIZE as u32,

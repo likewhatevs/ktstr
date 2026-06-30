@@ -10,7 +10,7 @@ fn test_layout(topo: &Topology, mib: u32) -> NumaMemoryLayout {
 
 fn test_setup(mem: &GuestMemoryMmap, topo: &Topology, mib: u32) -> AcpiLayout {
     let layout = test_layout(topo, mib);
-    setup_acpi(mem, topo, &layout, false, 0).unwrap()
+    setup_acpi(mem, topo, &layout, false, 0, false).unwrap()
 }
 
 fn read_table(mem: &GuestMemoryMmap, addr: u64) -> Vec<u8> {
@@ -73,7 +73,7 @@ fn acpi_rejects_slit_dominated_overflow_at_extreme_numa() {
     };
     let layout = test_layout(&topo, 512);
     let err =
-        setup_acpi(&mem, &topo, &layout, false, 0).expect_err("512-NUMA SLIT must overflow the ISA hole");
+        setup_acpi(&mem, &topo, &layout, false, 0, false).expect_err("512-NUMA SLIT must overflow the ISA hole");
     let msg = format!("{err:#}");
     assert!(
         msg.contains("SLIT alone") && msg.contains("ISA hole"),
@@ -98,7 +98,7 @@ fn acpi_rejects_cpu_table_overflow_at_extreme_vcpu_count() {
         distances: None,
     };
     let layout = test_layout(&topo, 256);
-    let err = setup_acpi(&mem, &topo, &layout, false, 0)
+    let err = setup_acpi(&mem, &topo, &layout, false, 0, false)
         .expect_err("4096-vCPU ACPI CPU tables must overflow the ISA hole");
     let msg = format!("{err:#}");
     assert!(
@@ -122,7 +122,7 @@ fn acpi_rejects_total_overflow_when_slit_alone_fits() {
         distances: None,
     };
     let layout = test_layout(&topo, 361);
-    let err = setup_acpi(&mem, &topo, &layout, false, 0)
+    let err = setup_acpi(&mem, &topo, &layout, false, 0, false)
         .expect_err("361-NUMA total tables must overflow the ISA hole");
     let msg = format!("{err:#}");
     assert!(
@@ -345,7 +345,7 @@ fn test_setup_pci(
     nic_count: usize,
 ) -> AcpiLayout {
     let layout = test_layout(topo, mib);
-    setup_acpi(mem, topo, &layout, true, nic_count).unwrap()
+    setup_acpi(mem, topo, &layout, true, nic_count, false).unwrap()
 }
 
 #[test]
@@ -481,6 +481,73 @@ fn setup_acpi_emits_one_prt_route_per_nic() {
             "DSDT _PRT must route NIC {i} at slot {slot} -> GSI {gsi}",
         );
     }
+}
+
+#[test]
+fn setup_acpi_emits_blk_prt_route_when_disk_attached() {
+    use crate::vmm::kvm::{virtio_blk_pci_gsi, virtio_blk_pci_slot};
+    let topo = Topology {
+        llcs: 1,
+        cores_per_llc: 1,
+        threads_per_core: 1,
+        numa_nodes: 1,
+        nodes: None,
+        distances: None,
+    };
+    let mem = test_mem(16);
+    let layout = test_layout(&topo, 256);
+    // PCI enabled, no NICs, one disk attached: the only _PRT entry is the
+    // virtio-blk function's INTx route.
+    let l = setup_acpi(&mem, &topo, &layout, true, 0, true).unwrap();
+    let dsdt = read_table(&mem, l.dsdt_addr);
+    let contains = |needle: &[u8]| dsdt.windows(needle.len()).any(|w| w == needle);
+    let slot = virtio_blk_pci_slot() as u32;
+    let gsi = virtio_blk_pci_gsi();
+    // GSI 6 (VIRTIO_BLK_IRQ) encodes as an ACPI Byte (0x0A prefix), like the
+    // NIC GSIs 7..23 in `setup_acpi_emits_one_prt_route_per_nic`.
+    let entry = [
+        0x12, 0x0B, 0x04, // PackageOp, PkgLength, NumElements=4
+        0x0C, 0xFF, 0xFF, slot as u8, 0x00, // Address DWord (slot << 16 | 0xFFFF)
+        0x00, // Pin = INTA#
+        0x00, // Source = static GSI routing
+        0x0A, gsi as u8, // SourceIndex = GSI (Byte)
+    ];
+    assert!(
+        contains(&entry),
+        "DSDT _PRT must route the virtio-blk function at slot {slot} -> GSI {gsi}",
+    );
+    // The _PRT package declares exactly one entry (no NICs).
+    let prt_pos = dsdt
+        .windows(4)
+        .position(|w| w == b"_PRT")
+        .expect("_PRT present when a disk is attached");
+    assert_eq!(
+        dsdt[prt_pos + 6],
+        0x01,
+        "_PRT holds exactly one entry (the blk route) with nic_count=0",
+    );
+}
+
+#[test]
+fn setup_acpi_emits_no_blk_prt_route_without_disk() {
+    let topo = Topology {
+        llcs: 1,
+        cores_per_llc: 1,
+        threads_per_core: 1,
+        numa_nodes: 1,
+        nodes: None,
+        distances: None,
+    };
+    let mem = test_mem(16);
+    let layout = test_layout(&topo, 256);
+    // PCI enabled, no NICs, no disk: the host bridge carries no _PRT (no INTx
+    // device at any slot).
+    let l = setup_acpi(&mem, &topo, &layout, true, 0, false).unwrap();
+    let dsdt = read_table(&mem, l.dsdt_addr);
+    assert!(
+        !dsdt.windows(4).any(|w| w == b"_PRT"),
+        "no NIC and no disk => no _PRT entries",
+    );
 }
 
 #[test]
@@ -1355,7 +1422,7 @@ fn hmat_emitted_with_cxl() {
     let topo = Topology::with_nodes(4, 1, &CXL_NODES);
     let mem = test_mem(16);
     let layout = NumaMemoryLayout::compute(&topo, 640, 0, None).unwrap();
-    let l = setup_acpi(&mem, &topo, &layout, false, 0).unwrap();
+    let l = setup_acpi(&mem, &topo, &layout, false, 0, false).unwrap();
     assert!(l.hmat_size > 0, "HMAT must be emitted with CXL nodes");
 }
 
@@ -1364,7 +1431,7 @@ fn hmat_checksum() {
     let topo = Topology::with_nodes(4, 1, &CXL_NODES);
     let mem = test_mem(16);
     let layout = NumaMemoryLayout::compute(&topo, 640, 0, None).unwrap();
-    let l = setup_acpi(&mem, &topo, &layout, false, 0).unwrap();
+    let l = setup_acpi(&mem, &topo, &layout, false, 0, false).unwrap();
     let hmat = read_table(&mem, l.hmat_addr);
     let sum: u8 = hmat.iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
     assert_eq!(sum, 0, "HMAT checksum must be zero");
@@ -1375,7 +1442,7 @@ fn hmat_header_fields() {
     let topo = Topology::with_nodes(4, 1, &CXL_NODES);
     let mem = test_mem(16);
     let layout = NumaMemoryLayout::compute(&topo, 640, 0, None).unwrap();
-    let l = setup_acpi(&mem, &topo, &layout, false, 0).unwrap();
+    let l = setup_acpi(&mem, &topo, &layout, false, 0, false).unwrap();
     let hmat = read_table(&mem, l.hmat_addr);
     assert_eq!(&hmat[..4], b"HMAT");
     assert_eq!(hmat[8], 2, "HMAT revision must be 2");
@@ -1391,7 +1458,7 @@ fn hmat_mpda_count_and_flags() {
     let topo = Topology::with_nodes(4, 1, &CXL_NODES);
     let mem = test_mem(16);
     let layout = NumaMemoryLayout::compute(&topo, 640, 0, None).unwrap();
-    let l = setup_acpi(&mem, &topo, &layout, false, 0).unwrap();
+    let l = setup_acpi(&mem, &topo, &layout, false, 0, false).unwrap();
     let hmat = read_table(&mem, l.hmat_addr);
 
     let num_targets = layout.regions().len();
@@ -1423,7 +1490,7 @@ fn hmat_mpda_cxl_initiator() {
     let topo = Topology::with_nodes(4, 1, &CXL_NODES);
     let mem = test_mem(16);
     let layout = NumaMemoryLayout::compute(&topo, 640, 0, None).unwrap();
-    let l = setup_acpi(&mem, &topo, &layout, false, 0).unwrap();
+    let l = setup_acpi(&mem, &topo, &layout, false, 0, false).unwrap();
     let hmat = read_table(&mem, l.hmat_addr);
 
     let mut offset = 40;
@@ -1457,7 +1524,7 @@ fn hmat_sllbi_latency_and_bandwidth() {
     let topo = Topology::with_nodes(4, 1, &CXL_NODES);
     let mem = test_mem(16);
     let layout = NumaMemoryLayout::compute(&topo, 640, 0, None).unwrap();
-    let l = setup_acpi(&mem, &topo, &layout, false, 0).unwrap();
+    let l = setup_acpi(&mem, &topo, &layout, false, 0, false).unwrap();
     let hmat = read_table(&mem, l.hmat_addr);
 
     let num_targets = layout.regions().len();
@@ -1488,7 +1555,7 @@ fn hmat_sllbi_cxl_entries_differ() {
     let topo = Topology::with_nodes(4, 1, &CXL_NODES);
     let mem = test_mem(16);
     let layout = NumaMemoryLayout::compute(&topo, 640, 0, None).unwrap();
-    let l = setup_acpi(&mem, &topo, &layout, false, 0).unwrap();
+    let l = setup_acpi(&mem, &topo, &layout, false, 0, false).unwrap();
     let hmat = read_table(&mem, l.hmat_addr);
 
     let num_targets = layout.regions().len();
@@ -1521,7 +1588,7 @@ fn hmat_rsdt_xsdt_include_pointer() {
     let topo = Topology::with_nodes(4, 1, &CXL_NODES);
     let mem = test_mem(16);
     let layout = NumaMemoryLayout::compute(&topo, 640, 0, None).unwrap();
-    let l = setup_acpi(&mem, &topo, &layout, false, 0).unwrap();
+    let l = setup_acpi(&mem, &topo, &layout, false, 0, false).unwrap();
 
     // RSDT should have 5 entries (FADT, MADT, SRAT, SLIT, HMAT).
     let rsdt = read_table(&mem, l.rsdt_addr);

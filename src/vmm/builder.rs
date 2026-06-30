@@ -757,6 +757,13 @@ impl KtstrVmBuilder {
     /// debugging a cryptic ioctl errno.
     pub fn disk(mut self, disk: disk_config::DiskConfig) -> Self {
         self.disks = vec![disk];
+        // On x86_64 the disk is a virtio-pci function (see `init_virtio_blk_pci`)
+        // and needs the host bridge + ECAM; aarch64 routes it over virtio-MMIO
+        // (no PCI yet), so leave pci_enabled untouched there. Mirrors `network()`.
+        #[cfg(target_arch = "x86_64")]
+        {
+            self.pci_enabled = true;
+        }
         self
     }
 
@@ -1063,14 +1070,16 @@ impl KtstrVmBuilder {
             bpf_map_writes: self.bpf_map_writes,
             watch_bpf_maps: self.watch_bpf_maps,
             performance_mode: self.performance_mode,
-            // A NIC is a virtio-pci function on x86_64, so any attached
-            // network implies the PCI transport — enforce the invariant at
-            // the sole KtstrVm construction point so no assembly path (or a
-            // stray `.pci(false)`) can yield a non-empty `networks` with
-            // pci_enabled=false, which would emit `pci=off` and skip
-            // installing the NICs. aarch64 keeps the NIC on virtio-MMIO.
+            // A NIC or disk is a virtio-pci function on x86_64, so any attached
+            // network OR disk implies the PCI transport — enforce the invariant
+            // at the sole KtstrVm construction point so no assembly path (or a
+            // stray `.pci(false)`) can yield a non-empty `networks`/`disks` with
+            // pci_enabled=false, which would emit `pci=off` and skip installing
+            // the NICs / disk (the guest would see no eth0 / no `/dev/vda`).
+            // aarch64 keeps both on virtio-MMIO.
             pci_enabled: self.pci_enabled
-                || (cfg!(target_arch = "x86_64") && !self.networks.is_empty()),
+                || (cfg!(target_arch = "x86_64")
+                    && (!self.networks.is_empty() || !self.disks.is_empty())),
             no_perf_mode,
             pinning_plan,
             mbind_node_map,

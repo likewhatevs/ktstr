@@ -140,29 +140,24 @@ pub fn virtio_net_iface() -> Result<String> {
     bail!("no non-loopback network interface with a device under /sys/class/net")
 }
 
-/// The virtio-net NIC's data-bearing IRQ number + its `/proc/interrupts` action
-/// name. The action depends on the interrupt transport. Under INTx
-/// (split-irqchip) it is a single line whose action is exactly the device
-/// basename (e.g. `virtio1`). Under MSI-X the kernel splits the NIC's IRQs into
-/// a config vector `{name}-config` and per-virtqueue data vectors
-/// (drivers/virtio/virtio_pci_common.c request_irq): with per-queue MSI-X each
-/// data vq gets its own line (`{name}-input.0`, `{name}-output.0`, ...), and a
-/// guest that falls back to the SHARED policy (a queue count beyond the per-NIC
-/// vector budget) gets a single shared queue line instead. Net traffic raises a
-/// data line, never config. So the data IRQ is the FIRST line whose action is
-/// `{name}` OR begins `{name}-` but is not `{name}-config` — under per-queue
-/// MSI-X that is the RX queue (`input.0`, allocated before TX). Matching by
-/// prefix (rather than an exact MSI-X suffix) is transport- and policy-agnostic;
-/// the trailing `-` in the prefix prevents a false match across `virtio1` vs
-/// `virtio10`.
+/// The data-bearing IRQ number + its `/proc/interrupts` action name for the
+/// virtio device basename `name` (e.g. `virtio1`). The action depends on the
+/// interrupt transport. Under INTx (split-irqchip / virtio-MMIO) it is a single
+/// line whose action is exactly the device basename. Under MSI-X the kernel
+/// splits the device's IRQs into a config vector `{name}-config` and
+/// per-virtqueue data vectors (drivers/virtio/virtio_pci_common.c request_irq):
+/// each data vq gets its own line — virtio-net per-queue MSI-X yields
+/// `{name}-input.0` / `{name}-output.0` (a SHARED-policy fallback collapses to
+/// one queue line), single-queue virtio-blk yields `{name}-req.0`. Device
+/// activity raises a data line, never config. So the data IRQ is the FIRST line
+/// whose action is `{name}` OR begins `{name}-` but is not `{name}-config`.
+/// Matching by prefix (rather than an exact MSI-X suffix) is transport-,
+/// device-, and policy-agnostic; the trailing `-` in the prefix prevents a false
+/// match across `virtio1` vs `virtio10`. Shared by the virtio-net and virtio-blk
+/// wide-SMP IRQ e2es — both present the same INTx-vs-MSI-X action-name shapes,
+/// only their sysfs basename source differs.
 #[allow(dead_code)]
-pub fn virtio_net_irq(iface: &str) -> Result<(u32, String)> {
-    let dev = fs::canonicalize(format!("/sys/class/net/{iface}/device"))?;
-    let name = dev
-        .file_name()
-        .and_then(|n| n.to_str())
-        .ok_or_else(|| anyhow::anyhow!("no basename for {dev:?}"))?
-        .to_string();
+pub fn device_data_irq(name: &str) -> Result<(u32, String)> {
     let prefix = format!("{name}-");
     let config = format!("{name}-config");
     let irqs = fs::read_to_string("/proc/interrupts")?;
@@ -182,9 +177,22 @@ pub fn virtio_net_irq(iface: &str) -> Result<(u32, String)> {
         }
     }
     bail!(
-        "no virtio-net data IRQ in /proc/interrupts for device {name} \
+        "no data IRQ in /proc/interrupts for virtio device {name} \
          (looked for INTx '{name}' or an MSI-X '{name}-' data vector)"
     )
+}
+
+/// The virtio-net NIC's data-bearing IRQ number + its `/proc/interrupts` action
+/// name, resolved from the NIC's sysfs device basename via [`device_data_irq`].
+#[allow(dead_code)]
+pub fn virtio_net_irq(iface: &str) -> Result<(u32, String)> {
+    let dev = fs::canonicalize(format!("/sys/class/net/{iface}/device"))?;
+    let name = dev
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| anyhow::anyhow!("no basename for {dev:?}"))?
+        .to_string();
+    device_data_irq(&name)
 }
 
 /// Every non-loopback, device-backed network interface, sorted by name (a

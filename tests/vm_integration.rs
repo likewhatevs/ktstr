@@ -503,9 +503,12 @@ fn check_failure_dump_trigger(result: &VmResult) -> Result<()> {
 //   1. `KtstrTestEntry.disk` carries a [`DiskConfig`].
 //   2. [`crate::test_support::runtime::build_vm_builder_base`] forwards
 //      it to [`crate::vmm::KtstrVmBuilder::disk`].
-//   3. [`crate::vmm::KtstrVm::init_virtio_blk`] opens a sparse temp
-//      backing file, attaches the MMIO + irqfd, and surfaces the device
-//      to the guest at `/dev/vda`.
+//   3. The host opens a sparse temp backing file and surfaces the device
+//      to the guest at `/dev/vda`. The transport is arch-split: x86_64
+//      installs a virtio-pci function (`init_virtio_blk_pci`, INTx +
+//      MSI-X over a 32-bit BAR), aarch64 a virtio-MMIO device
+//      (`init_virtio_blk`). Either way the guest's virtio-block driver
+//      probes `/dev/vda`.
 //
 // Each scenario runs as guest-side Rust under PID 1 and uses
 // `std::fs` against `/dev/vda` directly — no busybox, no shelling
@@ -551,8 +554,9 @@ const KTSTR_DISK_READ_ONLY: ktstr::prelude::DiskConfig = ktstr::prelude::DiskCon
 /// Pins the end-to-end wiring:
 ///   1. `KtstrTestEntry.disk = Some(..)` reaches
 ///      [`crate::test_support::runtime::build_vm_builder_base`].
-///   2. The host attaches the virtio-blk MMIO + irqfd via
-///      [`crate::vmm::KtstrVm::init_virtio_blk`].
+///   2. The host attaches the virtio-blk device — a virtio-pci function
+///      on x86_64 (`init_virtio_blk_pci`) or virtio-MMIO on aarch64
+///      (`init_virtio_blk`).
 ///   3. The guest kernel's CONFIG_VIRTIO_BLK driver probes the
 ///      device, which surfaces as `/dev/vda` in the guest devtmpfs.
 ///

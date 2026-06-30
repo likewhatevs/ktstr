@@ -1135,8 +1135,19 @@ impl KtstrVm {
                 .context("register virtio-console irqfd")?;
         }
 
-        // Optional virtio-blk for shell mode. `None` when the builder
-        // has no disks attached.
+        // Optional virtio-blk for shell mode. Transport is arch-split
+        // (mirrors virtio-net): x86_64 installs a virtio-pci function on
+        // `pci_bus_handle` (`virtio_blk_pci_slot()`, below); the MMIO handle is
+        // `None`, so the dispatch loops' MMIO blk arm goes inert and guest BAR
+        // accesses route through the PCI bus. The installed PciBus function owns
+        // the device Arc — shell mode needs neither counters (no `VmResult`) nor
+        // worker pause (no freeze coordinator); the INTx resample eventfd is kept
+        // alive below. aarch64 keeps the MMIO handle that drives the dispatch
+        // loops (aarch64 PCI is a later increment). `None` when no disk is
+        // attached.
+        #[cfg(target_arch = "x86_64")]
+        let virtio_blk: Option<Arc<PiMutex<virtio_blk::VirtioBlk>>> = None;
+        #[cfg(not(target_arch = "x86_64"))]
         let virtio_blk = self.init_virtio_blk(&vm)?;
 
         // Optional virtio-net for shell mode. Transport is arch-split
@@ -1171,7 +1182,7 @@ impl KtstrVm {
             // all are held alive for the shell run so KVM can de-assert each
             // level GSI on guest EOI. Shell mode discards the counters.
             Some(bus) => self
-                .init_virtio_net_pci(&vm, bus, msix_sink)?
+                .init_virtio_net_pci(&vm, bus, msix_sink.clone())?
                 .into_iter()
                 .map(|h| h.resample_evt)
                 .collect(),
@@ -1187,6 +1198,17 @@ impl KtstrVm {
                 );
                 Vec::new()
             }
+        };
+        // virtio-blk PCI install (x86_64). The device Arc is owned by the
+        // installed PciBus function; only the INTx resample eventfd is retained
+        // (held alive so KVM can de-assert the level GSI on guest EOI). `None`
+        // on split-irqchip or when no disk is attached.
+        #[cfg(target_arch = "x86_64")]
+        let _blk_resample_evt = match pci_bus_handle.as_ref() {
+            Some(bus) => self
+                .init_virtio_blk_pci(&vm, bus, msix_sink)?
+                .and_then(|h| h.resample_evt),
+            None => None,
         };
         #[cfg(not(target_arch = "x86_64"))]
         let virtio_net = self.init_virtio_net(&vm)?;

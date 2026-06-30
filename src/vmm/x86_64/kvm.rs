@@ -204,6 +204,53 @@ pub(crate) const fn virtio_net_msix_gsi(nic: usize, vector: usize) -> u32 {
     NUM_IOAPIC_PINS as u32 + (nic * MSIX_VECTORS_PER_NIC + vector) as u32
 }
 
+/// PCI slot (bus 0) for the single virtio-block PCI function: after the NIC
+/// slots (1..=MAX_VIRTIO_NICS), so blk takes slot `MAX_VIRTIO_NICS + 1`. One
+/// source of truth shared by `PciBus::add_function` and the DSDT `_PRT`.
+pub(crate) const fn virtio_blk_pci_slot() -> usize {
+    1 + MAX_VIRTIO_NICS
+}
+
+/// INTx GSI for the virtio-block PCI function: reuses [`VIRTIO_BLK_IRQ`] (=6) —
+/// the IOAPIC pin the MMIO blk transport uses. On the x86 PCI path blk is on PCI
+/// (not MMIO), so that pin is free; the DSDT `_PRT` routes
+/// `(virtio_blk_pci_slot(), INTA#)` here (level, active-low, programmed by the
+/// guest via acpi_pci_irq_enable, like the NIC INTx lines).
+pub(crate) const fn virtio_blk_pci_gsi() -> u32 {
+    VIRTIO_BLK_IRQ
+}
+
+/// Per-device MSI-X GSI budget for the virtio-block PCI function — the cap on its
+/// advertised vectors. blk is single-queue (advertises `num_queues + 1` = 2),
+/// so the budget is the GSIs left after the IOAPIC pins and all NIC MSI-X ranges
+/// (`[24 + 16*254, 4096)` = 8 GSIs); ample for 2 vectors. Caps `MsixState::new`.
+pub(crate) const MSIX_VECTORS_PER_BLK: usize =
+    KVM_MAX_IRQ_ROUTES - NUM_IOAPIC_PINS as usize - MAX_VIRTIO_NICS * MSIX_VECTORS_PER_NIC;
+
+/// MSI-X vector GSI for the virtio-block PCI function, table vector `vector`
+/// (`vector < MSIX_VECTORS_PER_BLK`). Lives ABOVE the IOAPIC pins AND every NIC
+/// MSI-X range, disjoint from both: `NUM_IOAPIC_PINS + MAX_VIRTIO_NICS *
+/// MSIX_VECTORS_PER_NIC + vector`. A single blk device, so no per-device stride.
+pub(crate) const fn virtio_blk_pci_msix_gsi(vector: usize) -> u32 {
+    (NUM_IOAPIC_PINS as usize + MAX_VIRTIO_NICS * MSIX_VECTORS_PER_NIC + vector) as u32
+}
+
+// The blk MSI-X range plus the IOAPIC pins and all NIC MSI-X ranges must fit
+// KVM's routing table. By construction MSIX_VECTORS_PER_BLK is exactly the
+// remainder, so the total equals KVM_MAX_IRQ_ROUTES; pinned against a future
+// MAX_VIRTIO_NICS / MSIX_VECTORS_PER_NIC change.
+const _: () = assert!(
+    NUM_IOAPIC_PINS as usize + MAX_VIRTIO_NICS * MSIX_VECTORS_PER_NIC + MSIX_VECTORS_PER_BLK
+        <= KVM_MAX_IRQ_ROUTES,
+    "virtio-blk MSI-X GSIs overflow the KVM routing table"
+);
+// blk advertises num_queues + 1 = 2 vectors; the budget must hold them and not
+// exceed the MSI-X table-page capacity.
+const _: () = assert!(
+    MSIX_VECTORS_PER_BLK >= 2 && MSIX_VECTORS_PER_BLK <= crate::vmm::virtio_msix::MSIX_TABLE_MAX,
+    "virtio-blk MSI-X GSI budget must hold >=2 vectors and fit the table page"
+);
+
 /// GSI the FADT advertises as the ACPI SCI (system control interrupt). The
 /// non-hardware-reduced FADT must name one; ktstr never arms a fixed event or
 /// a GPE block, so the SCI never fires — this GSI is reserved (inert) and has

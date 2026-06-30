@@ -24,6 +24,7 @@
 //! pre-throttle terminal classifier (`classify_pre_throttle`) lives
 //! on `VirtioBlk` itself in `device.rs`.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
@@ -43,6 +44,8 @@ use super::{
     VIRTIO_BLK_OUTHDR_SIZE, VIRTIO_BLK_SECTOR_SIZE, VIRTIO_BLK_SEG_MAX, VIRTIO_BLK_SIZE_MAX,
     VirtioBlk, VirtioBlkOutHdr, publish_completion,
 };
+use crate::vmm::PiMutex;
+use crate::vmm::virtio_msix::{IrqSource, MsixState};
 
 /// Outcome of a single `drain_bracket_impl` invocation.
 ///
@@ -114,6 +117,7 @@ pub(crate) fn drain_bracket_impl(
     irq_evt: &EventFd,
     interrupt_status: &AtomicU32,
     device_status: &AtomicU32,
+    msix: Option<&Arc<PiMutex<MsixState>>>,
 ) -> DrainOutcome {
     // Pre-rebind / post-reset gate. After `q.reset()` clears the
     // queue (zeroing desc/avail/used GPAs and `ready`), there is
@@ -390,31 +394,17 @@ pub(crate) fn drain_bracket_impl(
                     );
                     device_status.fetch_or(VIRTIO_CONFIG_S_NEEDS_RESET, Ordering::SeqCst);
                     interrupt_status.fetch_or(VIRTIO_MMIO_INT_CONFIG, Ordering::Release);
-                    // SAFETY: EAGAIN requires counter saturation at
-                    // u64::MAX-1 (~1.8e19 unobserved kicks) —
-                    // implausible. EBADF means the fd closed during
-                    // shutdown. The simultaneously-set INT_CONFIG
-                    // bit above is the enduring guest-visible
-                    // signal: `vm_interrupt`
-                    // (drivers/virtio/virtio_mmio.c) reads
-                    // INTERRUPT_STATUS on the next IRQ delivery and
-                    // dispatches via the bit set — but on the
-                    // poison path NO subsequent device IRQ fires.
-                    // The queue_poisoned gate makes every later
-                    // drain short-circuit to `Done` without ever
-                    // calling `add_used` or triggering another
-                    // signal, so a missed irqfd write here means
-                    // the operator's only path to seeing the
-                    // NEEDS_RESET state is `mmio_read(STATUS)` —
-                    // which still works because the bit is on
-                    // device_status. The guest's actual recovery
-                    // path is a STATUS=0 reset, driven by the
-                    // hung-task watchdog or operator action. We log
-                    // any errno so a failed write surfaces in
-                    // tracing rather than silently disappearing.
-                    if let Err(e) = irq_evt.write(1) {
-                        tracing::warn!(%e, "virtio-blk irq_evt.write failed");
-                    }
+                    // Deliver the config-change (MSI-X config vector when the
+                    // guest enabled it, else the INTx irqfd). The NEEDS_RESET +
+                    // INT_CONFIG bits set above are the enduring guest-visible
+                    // signal: on the poison path NO subsequent device IRQ fires
+                    // (the queue_poisoned gate short-circuits every later drain
+                    // to `Done` without add_used or another signal), so even a
+                    // missed irqfd write leaves `mmio_read(STATUS)` surfacing
+                    // NEEDS_RESET. The guest's recovery is a STATUS=0 reset
+                    // (hung-task watchdog or operator). signal_or_intx logs any
+                    // write errno.
+                    signal_or_intx(IrqSource::Config, msix, irq_evt);
                     break 'outer;
                 }
                 Err(e) => {
@@ -479,9 +469,7 @@ pub(crate) fn drain_bracket_impl(
                     );
                     device_status.fetch_or(VIRTIO_CONFIG_S_NEEDS_RESET, Ordering::SeqCst);
                     interrupt_status.fetch_or(VIRTIO_MMIO_INT_CONFIG, Ordering::Release);
-                    if let Err(we) = irq_evt.write(1) {
-                        tracing::warn!(%we, "virtio-blk irq_evt.write failed");
-                    }
+                    signal_or_intx(IrqSource::Config, msix, irq_evt);
                     break 'outer;
                 }
             };
@@ -686,6 +674,14 @@ pub(crate) fn drain_bracket_impl(
             // `false` return path (no add_used, no signal).
             // `io_errors` is bumped so the host operator sees the
             // malformed request.
+            //
+            // Reference-impl divergence: firecracker `add_used`s a
+            // parse-failed chain with len=0 and NO status write
+            // (its block device pushes `num_bytes_to_mem: 0` on a
+            // parse Err) — the F15 stale-status hazard, where the
+            // guest's `virtblk_done` reads a stale/zeroed
+            // `in_hdr.status` as `BLK_STS_OK`. We never publish a
+            // chain to the used ring without a written status byte.
             let Some(header_addr) = header_addr else {
                 tracing::warn!(head, "virtio-blk request without valid header descriptor");
                 state.counters.record_io_error();
@@ -1298,13 +1294,40 @@ pub(crate) fn drain_bracket_impl(
             // kernel timer (virtio_mmio has no periodic wake
             // mechanism). We log any errno so a failed write
             // surfaces in tracing rather than silently disappearing.
-            if let Err(e) = irq_evt.write(1) {
-                tracing::warn!(%e, "virtio-blk irq_evt.write failed");
-            }
+            signal_or_intx(IrqSource::Vring { queue: REQ_QUEUE }, msix, irq_evt);
         }
     }
     match stall_outcome {
         Some(wait_nanos) => DrainOutcome::ThrottleStalled { wait_nanos },
         None => DrainOutcome::Done,
+    }
+}
+
+/// Deliver an interrupt `source` to the guest: via MSI-X (the guest-assigned
+/// vector) when the PCI transport has MSI-X enabled, else via the shared INTx
+/// irqfd. The caller has already set the guest-visible ISR / NEEDS_RESET bits
+/// (`interrupt_status` / `device_status`); those are inert under MSI-X — the
+/// kernel's per-vector handlers never read the modern ISR cap — but remain the
+/// INTx IRQ-handler handshake and the enduring `mmio_read(STATUS)` signal. A
+/// failed INTx write is logged, not propagated: the already-set bits are the
+/// recovery signal a STATUS read surfaces, and the guest's next
+/// add_used/needs_notification cycle (or a STATUS=0 reset) recovers delivery.
+///
+/// Runs on the worker thread; reaches the shared [`MsixState`] through the
+/// `Arc` the worker cloned at spawn (the vCPU-thread facade holds the other
+/// clone and configures it). `msix` is `None` on INTx transports
+/// (virtio-MMIO / aarch64). Mirrors virtio-net's `signal_used` /
+/// `signal_queue_poisoned` transport branch, adapted to the worker-thread
+/// context where the signal state arrives by `Arc` rather than `&self`.
+fn signal_or_intx(source: IrqSource, msix: Option<&Arc<PiMutex<MsixState>>>, irq_evt: &EventFd) {
+    if let Some(m) = msix {
+        let mut g = m.lock();
+        if g.enabled() {
+            g.signal(source);
+            return;
+        }
+    }
+    if let Err(e) = irq_evt.write(1) {
+        tracing::warn!(%e, "virtio-blk irq_evt.write failed");
     }
 }

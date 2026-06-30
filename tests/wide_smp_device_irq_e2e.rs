@@ -1,34 +1,36 @@
-//! End-to-end: a virtio-blk device IRQ delivered to a vCPU whose APIC ID
-//! exceeds 255, over the MSI ext-dest-id (`address_hi.destid_8_31`) path.
+//! End-to-end: the virtio-blk request-queue completion IRQ is delivered over
+//! its PCI + MSI-X transport on a wide / sparse-APIC topology.
 //!
-//! `wide_smp_boot_e2e` tops out at APIC ID 255, so the ext-dest-id encoding
-//! for IDs > 255 is never driven by a real device IRQ there. This boots a
-//! sparse topology whose APIC IDs reach 433, pins the virtio-blk IRQ to a
-//! vCPU with APIC ID >= 256 via `smp_affinity`, drives disk I/O, and asserts
-//! that vCPU's interrupt count rose -- proving the completion IRQ was routed
-//! using the > 255 destination encoding (KVM decodes the high bits from
-//! `address_hi.destid_8_31` under `x2apic_format`).
-//!
-//! Why pinning to one CPU proves the > 255 path: under x2APIC physical mode
-//! a single-CPU `smp_affinity` programs the IOAPIC RTE with that CPU's exact
-//! APIC ID in physical dest_mode (no lowest-priority redistribution). With
-//! APIC ID >= 256 the high bits land in `address_hi.destid_8_31`, and KVM
-//! delivers to exactly that one vCPU. So the count rising on the target CPU
-//! means the ext-dest route resolved a > 255 destination correctly.
+//! On x86_64 (post the virtio-blk-PCI migration) virtio-blk's request queue is
+//! a blk-mq MANAGED MSI-X interrupt — virtio-blk passes a non-NULL
+//! `irq_affinity` descriptor (drivers/block/virtio_blk.c `init_vq`) and the
+//! per-vq EACH policy succeeds for its two vectors, so the request-queue vector
+//! is affinity-managed; virtio-net passes a NULL descriptor
+//! (drivers/net/virtio_net.c `virtnet_find_vqs`), so its vectors are never
+//! managed (hence userspace-pinnable). The kernel owns a managed IRQ's
+//! affinity, so userspace cannot pin it via `smp_affinity`
+//! (`/proc/irq/N/smp_affinity*` writes return `-EPERM` — kernel/irq/proc.c
+//! `write_irq_affinity` gates on `irq_can_set_affinity_usr`, which is false for
+//! `irqd_affinity_is_managed` IRQs, kernel/irq/manage.c). The >255 APIC MSI ext-dest-id
+//! (`address_hi.destid_8_31`) route is device-agnostic — the same
+//! userspace-IOAPIC + `KVM_SET_GSI_ROUTING` path for every virtio device — and
+//! is proven DETERMINISTICALLY by the sibling `wide_smp_net_irq_e2e.rs`, which
+//! pins virtio-net's REGULAR (non-managed) MSI-X IRQ to a vCPU whose APIC ID is
+//! 256 or higher. virtio-blk cannot drive that pin under managed MSI-X, so this
+//! test
+//! proves the complementary leg: that the virtio-blk-PCI request-queue MSI-X
+//! completion IRQ actually fires. It boots the same sparse topology (so the MSI
+//! route table carries >255-destination routes), drives disk I/O, and asserts
+//! the request-queue data vector's `/proc/interrupts` count rose — across all
+//! CPUs, since the managed IRQ's delivery CPU is kernel-chosen, not pinnable.
 //!
 //! Topology: 14 LLCs x 9 cores x 2 threads = 252 vCPUs. The sparse APIC-ID
 //! encoding (core_shift = bits(9) + bits(2) = 5) gives a max APIC ID of
-//! (13 << 5) | (8 << 1) | 1 = 433, so vCPUs in the upper LLCs (llc >= 8)
-//! have APIC ID >= 256 without needing a > 256-vCPU host.
-//!
-//! virtio-blk proves the routing; the > 255 ext-dest path is device-agnostic
-//! (the same userspace-IOAPIC + KVM_SET_GSI_ROUTING for every virtio device).
-//! The sibling `wide_smp_net_irq_e2e.rs` adds the virtio-net device-type leg
-//! (the `networks =` attr + an AF_PACKET payload); the APIC-ID/IRQ-count
-//! scaffolding both share lives in `common/wide_smp_irq.rs`.
+//! (13 << 5) | (8 << 1) | 1 = 433. The APIC-ID/IRQ scaffolding shared with the
+//! net sibling lives in `common/wide_smp_irq.rs`.
 //!
 //! Run: cargo run --bin cargo-ktstr -- ktstr test --kernel ../linux \
-//!        -- -E 'test(device_irq_delivers_to_apic_id_above_255)' \
+//!        -- -E 'test(blk_pci_msix_completion_irq_delivered)' \
 //!        --success-output immediate
 
 // The >255-APIC-ID MSI ext-dest-id path is x86-only: aarch64 uses the GIC
@@ -47,7 +49,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 
 #[path = "common/wide_smp_irq.rs"]
 mod wide_smp_irq;
-use wide_smp_irq::{device_irq_by_action_name, find_apic_above_255, irq_count, pin_irq_to_cpu};
+use wide_smp_irq::{device_data_irq, irq_count_total};
 
 /// Raw 256 MiB virtio-blk disk. Raw (no filesystem) so the guest writes
 /// directly to /dev/vda to drive request completions. Struct-literal because
@@ -67,8 +69,15 @@ const KTSTR_DISK_EXTDEST: DiskConfig = DiskConfig {
     no_auto_mount: false,
 };
 
-/// The virtio-blk IRQ number: /dev/vda's sysfs parent is the virtio device,
-/// whose basename ("virtioN") is the `/proc/interrupts` action name.
+/// The virtio-blk data IRQ number + its `/proc/interrupts` action name.
+/// /dev/vda's sysfs parent is the virtio device, whose basename ("virtioN")
+/// drives the action name. The transport is arch-split: x86_64 is virtio-pci +
+/// MSI-X, so the request-queue completion IRQ is the data vector `{name}-req.0`
+/// (the config vector `{name}-config` never fires on disk I/O); aarch64 is
+/// virtio-MMIO + INTx, a single line whose action is the bare `{name}`.
+/// [`device_data_irq`] resolves whichever is present (INTx bare name OR the
+/// non-config MSI-X data vector) — the same discovery the virtio-net sibling
+/// uses.
 fn virtio_blk_irq() -> Result<(u32, String)> {
     let dev = fs::canonicalize("/sys/block/vda/device")?;
     let name = dev
@@ -76,18 +85,17 @@ fn virtio_blk_irq() -> Result<(u32, String)> {
         .and_then(|n| n.to_str())
         .ok_or_else(|| anyhow::anyhow!("no basename for {dev:?}"))?
         .to_string();
-    let irq = device_irq_by_action_name(&name)?;
-    Ok((irq, name))
+    device_data_irq(&name)
 }
 
 /// Drive virtio-blk request completions by writing + fsync'ing + reading raw
 /// `/dev/vda`. `sync_all` blocks until the flush completes (the device
-/// processed the request and raised its IRQ), so no sleep is needed.
+/// processed the request and raised its completion IRQ), so no sleep is needed.
 ///
-/// 64 iterations give margin for x86's lazy IRQ-affinity migration: a fresh
-/// `smp_affinity` write takes effect only at the next IRQ on the old vector
-/// (irq_complete_move), so the first completion or two may still land on the
-/// old CPU. The remaining ~62 land on the pinned CPU, so its count rises.
+/// 64 iterations accrue a clear count delta on the request-queue IRQ. That IRQ
+/// is a blk-mq MANAGED interrupt whose delivery CPU is kernel-chosen (not
+/// pinnable — see the module doc), so the caller asserts the IRQ's TOTAL
+/// `/proc/interrupts` count (summed across CPUs) rose, not a per-CPU count.
 fn drive_disk_io() -> Result<()> {
     let mut f = OpenOptions::new().read(true).write(true).open("/dev/vda")?;
     let buf = [0xA5u8; 4096];
@@ -111,42 +119,28 @@ fn drive_disk_io() -> Result<()> {
     no_perf_mode,
     duration_s = 4
 )]
-fn device_irq_delivers_to_apic_id_above_255(_ctx: &Ctx) -> Result<AssertResult> {
-    // No vCPU-count gate: the sparse APIC-ID encoding mints IDs up to 433
-    // from this 252-vCPU topology (see the module doc), so the requirement
-    // is "an APIC ID > 255 exists", not "> 254 vCPUs". find_apic_above_255
-    // reads the guest's actual /proc/cpuinfo and errors if none reach 256 --
-    // the correct runtime gate. (A > 254-vCPU count is the right invariant
-    // for the dense sibling tests -- 16*16*1 = 256, max APIC ID 255 -- but
-    // wrong for this sparse topology: 14*9*2 = 252 < 254, so it failed every
-    // run that was not host-skipped.)
-
-    // Pick a vCPU whose APIC ID exceeds 255 (the ext-dest threshold). cpu# !=
-    // apic_id under the sparse encoding, so select by APIC ID.
-    let (target_cpu, target_apic) = find_apic_above_255()?;
-
-    // Discover the virtio-blk IRQ by device name (no hardcoded GSI).
+fn blk_pci_msix_completion_irq_delivered(_ctx: &Ctx) -> Result<AssertResult> {
+    // Discover the virtio-blk request-queue DATA IRQ by device name (no
+    // hardcoded GSI). On x86 (PCI + MSI-X) that is the non-config data vector
+    // (`{name}-req.0`); the request-queue IRQ is a blk-mq MANAGED interrupt, so
+    // its delivery CPU is kernel-chosen and userspace cannot pin it (see the
+    // module doc) — the count is therefore summed across all CPUs rather than
+    // pinned to one. The >255 ext-dest leg is covered by the net sibling.
     let (irq, dev_name) = virtio_blk_irq()?;
 
-    // Pin that IRQ to the target CPU. Under x2APIC physical mode this writes
-    // the target CPU's exact APIC ID (>= 256) into the RTE destination.
-    pin_irq_to_cpu(irq, target_cpu)?;
-
-    // Baseline after pinning, drive I/O, then re-read the target CPU's count.
-    let before = irq_count(irq, target_cpu)?;
+    // Baseline total count, drive request completions, then re-read. Each
+    // `sync_all` blocks until the device processed the request and raised its
+    // completion IRQ, so no sleep is needed.
+    let before = irq_count_total(irq)?;
     drive_disk_io()?;
-    let after = irq_count(irq, target_cpu)?;
+    let after = irq_count_total(irq)?;
 
-    eprintln!(
-        "DEVICE_IRQ cpu={target_cpu} apic_id={target_apic} (>255) irq={irq} \
-         ({dev_name}) count {before}->{after}"
-    );
+    eprintln!("BLK_MSIX_IRQ irq={irq} ({dev_name}) total count {before}->{after}");
     ensure!(
         after > before,
-        "virtio-blk IRQ {irq} ({dev_name}) count on cpu {target_cpu} \
-         (APIC ID {target_apic} > 255) did not rise after disk I/O \
-         (before={before} after={after}); the ext-dest route did not deliver \
-         the completion IRQ to the >255 APIC ID"
+        "virtio-blk request-queue MSI-X IRQ {irq} ({dev_name}) total count did \
+         not rise after disk I/O (before={before} after={after}); the \
+         virtio-blk-PCI MSI-X completion IRQ was not delivered"
     );
     Ok(AssertResult::pass())
 }
