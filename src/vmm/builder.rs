@@ -530,11 +530,23 @@ impl KtstrVmBuilder {
     }
 
     /// Number of equally-spaced periodic snapshots to fire inside
-    /// the workload's 10%–90% window. `0` (the default) disables
-    /// periodic capture entirely. The freeze coordinator anchors
-    /// the window at the first `MSG_TYPE_SCENARIO_START` it sees,
-    /// so boot + verifier time do not eat the budget. Each fire
-    /// runs the same `freeze_and_capture(false)` path the
+    /// the capturable window's 10%–90% slice. `0` (the default)
+    /// disables periodic capture entirely. The window is
+    /// `[max(scenario_start, prereqs_ready), scenario_start +
+    /// workload_duration]`: the start floats to the prereq-ready
+    /// moment (kaslr + BPF-accessor attach) so cold-boot latency
+    /// cannot strand boundaries pre-ready, and the end is CLAMPED
+    /// to the workload end so captures never spill into
+    /// post-workload idle. On a warm boot the start equals
+    /// `scenario_start`, so the window is the full
+    /// `[scenario_start, scenario_start + workload_duration]` and
+    /// boot + verifier time do not eat the budget; on a cold boot
+    /// the window starts later and is shorter, so cross-run compares
+    /// of the window-averaged keys `avg_cpu_util_comp_scale` /
+    /// `avg_task_lat_cri` should use `--noise-adjust`. Each fire
+    /// runs the same
+    /// `freeze_and_dispatch(FreezeMode::Capture { gate_on_exit_kind: false })`
+    /// path the
     /// on-demand `Op::CaptureSnapshot` handler uses and stores under
     /// `"periodic_NNN"` on the host's
     /// [`crate::scenario::snapshot::SnapshotBridge`]. Bounded above

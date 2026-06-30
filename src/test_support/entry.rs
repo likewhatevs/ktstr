@@ -1787,21 +1787,32 @@ pub struct KtstrTestEntry {
     /// one slot.
     pub post_vm_unconditional: Option<super::PostVmCallback>,
     /// Periodic snapshot count: when non-zero, the freeze
-    /// coordinator divides the 10%–90% slice of the workload
-    /// duration (anchored at the FIRST `MSG_TYPE_SCENARIO_START`
-    /// the coordinator observes) into `num_snapshots + 1` equal
-    /// intervals and fires a host-side `freeze_and_capture(false)`
-    /// at each of the `num_snapshots` interior boundaries —
-    /// e.g. `N = 1` lands a single capture at the workload's
-    /// midpoint (`start + 0.5·d`); `N = 3` lands captures at
-    /// `start + 0.3·d`, `start + 0.5·d`, `start + 0.7·d`. No
-    /// boundary lands at exactly `start + 0.1·d` or
-    /// `start + 0.9·d` — the buffers reserve those edges for
-    /// workload ramp-up / ramp-down. Each boundary is stored
-    /// under `"periodic_NNN"` (zero-padded 3-digit index) on the
-    /// host's [`crate::scenario::snapshot::SnapshotBridge`].
-    /// Anchoring at ScenarioStart means boot + verifier time do
-    /// not eat the budget. Pauses observed via
+    /// coordinator divides the 10 %–90 % slice of the capturable
+    /// window into `num_snapshots + 1` equal intervals and fires a
+    /// host-side
+    /// `freeze_and_dispatch(FreezeMode::Capture { gate_on_exit_kind: false })`
+    /// at each of the
+    /// `num_snapshots` interior boundaries — e.g. `N = 1` lands a
+    /// single capture at the window midpoint; `N = 3` lands at
+    /// 0.3 / 0.5 / 0.7 of the window. No boundary lands at exactly
+    /// the 0.1 / 0.9 edges — the buffers reserve those for workload
+    /// ramp-up / ramp-down. Each boundary is stored under
+    /// `"periodic_NNN"` (zero-padded 3-digit index) on the host's
+    /// [`crate::scenario::snapshot::SnapshotBridge`]. The window is
+    /// `[max(scenario_start, prereqs_ready), scenario_start +
+    /// duration]`: the start floats to the prereq-ready moment
+    /// (kaslr + BPF-accessor attach) so cold-boot latency cannot
+    /// strand boundaries pre-ready, and the end is CLAMPED to the
+    /// workload end so captures never spill into post-workload
+    /// idle. On a WARM boot the start equals `scenario_start`, so
+    /// the window is the full `[start, start + d]` and the fractions
+    /// above apply as documented (`start + 0.3·d` etc., modulo
+    /// integer-ns truncation); on a COLD boot the
+    /// window starts later and is shorter, so the landings shift —
+    /// cross-run compares of the window-averaged keys
+    /// `avg_cpu_util_comp_scale` / `avg_task_lat_cri` should use
+    /// `--noise-adjust`. Boot + verifier time before ScenarioStart
+    /// does not eat the budget. Pauses observed via
     /// `MSG_TYPE_SCENARIO_PAUSE` / `MSG_TYPE_SCENARIO_RESUME` shift
     /// every un-fired boundary by the cumulative pause duration —
     /// the boundary clock is workload-time, not wall-clock, so a
@@ -1811,7 +1822,9 @@ pub struct KtstrTestEntry {
     /// boundary timestamps.
     ///
     /// **Capture cost.** Each periodic boundary fires the same
-    /// host-side `freeze_and_capture(false)` path that
+    /// host-side
+    /// `freeze_and_dispatch(FreezeMode::Capture { gate_on_exit_kind: false })`
+    /// path that
     /// [`crate::scenario::ops::Op::CaptureSnapshot`] dispatches: every
     /// vCPU is parked under `FREEZE_RENDEZVOUS_TIMEOUT` (30 s
     /// hard ceiling), BPF maps are walked, the dump is serialised

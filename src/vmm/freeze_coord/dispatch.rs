@@ -62,7 +62,7 @@ pub(super) struct BulkDispatchSinks<'a> {
     pub sys_rdy_evt: &'a mut Option<Arc<EventFd>>,
     /// Per-iteration accumulator for decoded
     /// `MSG_TYPE_SNAPSHOT_REQUEST` frames. Drained later in the run-
-    /// loop body where `freeze_and_capture` /
+    /// loop body where `freeze_and_dispatch` /
     /// `arm_user_watchpoint` are in scope. CRC-bad frames and
     /// malformed payloads (size mismatch, KIND_NONE, request_id == 0)
     /// never reach this Vec — [`decode_snapshot_request`] returns
@@ -70,7 +70,7 @@ pub(super) struct BulkDispatchSinks<'a> {
     pub snapshot_requests_pending: &'a mut Vec<SnapshotRequest>,
     /// Per-iteration accumulator for decoded
     /// `MSG_TYPE_KERNEL_OP_REQUEST` frames. Drained later in the run-
-    /// loop body where `freeze_and_capture` is in scope — each
+    /// loop body where `freeze_and_dispatch` is in scope — each
     /// pending kernel-op request triggers its own freeze rendezvous,
     /// runs `gmem.write_obj` / `gmem.read_obj` while every vCPU is
     /// parked, and ships the
@@ -134,16 +134,21 @@ pub(super) struct BulkDispatchSinks<'a> {
     /// it and extends the deadline by the pause duration.
     pub watchdog_pause_ns: &'a std::sync::atomic::AtomicU64,
     /// First-`ScenarioStart` timestamp (nanos since `run_start`),
-    /// biased by `+1` so `0` means "not yet observed". The first
+    /// clamped to a `1` floor so `0` means "not yet observed" (a
+    /// boot-unreachable elapsed==0 maps to 1; every real stamp is
+    /// exact, not a `+1` shift). The first
     /// CRC-valid `MSG_TYPE_SCENARIO_START` frame stamps
-    /// `(run_start.elapsed().as_nanos() as u64).max(1)` here via
+    /// `u64::try_from(run_start.elapsed().as_nanos()).unwrap_or(u64::MAX).max(1)`
+    /// here via
     /// a one-shot `compare_exchange(0, ..)`; subsequent ScenarioStart
     /// frames (the guest may publish multiple if the workload
     /// re-runs) leave the prior stamp untouched. Consumed by the
-    /// freeze coordinator's periodic-capture loop to anchor the
-    /// 10%–90% workload-duration window for `KtstrTestEntry::num_snapshots`
-    /// boundaries — boot + verifier time before the first
-    /// ScenarioStart does not eat the budget.
+    /// freeze coordinator's periodic-capture loop as the window's END
+    /// anchor (`scenario_start + workload_duration`, clamped) and the
+    /// scenario-relative offset frame for `KtstrTestEntry::num_snapshots`
+    /// boundaries; the window START floats to the later of this stamp
+    /// and the prereq-ready moment. Boot + verifier time before the
+    /// first ScenarioStart does not eat the budget.
     pub scenario_start_ns: &'a std::sync::atomic::AtomicU64,
     /// Cumulative wall-clock pause time observed between matched
     /// `MSG_TYPE_SCENARIO_PAUSE` / `MSG_TYPE_SCENARIO_RESUME` pairs
@@ -471,7 +476,7 @@ pub(super) fn dispatch_bulk_message(
         Some(crate::vmm::wire::MsgType::SnapshotRequest) => {
             // Decode and stash a CRC-valid SnapshotRequest for
             // dispatch later in this iteration's body.
-            // `freeze_and_capture` / `thaw_and_barrier` /
+            // `freeze_and_dispatch` / `thaw_and_barrier` /
             // `arm_user_watchpoint` are not in scope here. CRC-bad
             // frames are ignored (a torn frame would otherwise let a
             // hostile guest force a capture). Malformed payloads
@@ -489,7 +494,7 @@ pub(super) fn dispatch_bulk_message(
         Some(crate::vmm::wire::MsgType::KernelOpRequest) => {
             // Decode and stash a CRC-valid KernelOpRequest for
             // dispatch later in this iteration's body where
-            // `freeze_and_capture` + `gmem.write_obj` are in scope.
+            // `freeze_and_dispatch` + `gmem.write_obj` are in scope.
             //
             // CRC-bad frames drop without a reply: a CRC-failed
             // frame is BY DEFINITION corrupted — the embedded
@@ -556,10 +561,12 @@ pub(super) fn dispatch_bulk_message(
                 // One-shot stamp of scenario_start_ns at the FIRST
                 // observation, hoisted OUTSIDE the watchdog_reset
                 // gate so it fires even when the caller did not
-                // wire a workload-duration budget. Bias `+1` keeps
-                // 0 as the "unset" sentinel so the periodic-capture
-                // loop can distinguish "no scenario started yet"
-                // from "scenario started exactly at run_start".
+                // wire a workload-duration budget. The `.max(1)`
+                // clamps a (boot-unreachable) elapsed==0 to 1 so 0
+                // stays the "unset" sentinel — letting the periodic-
+                // capture loop distinguish "no scenario started yet"
+                // from "scenario started exactly at run_start"; every
+                // real stamp passes through unchanged (not a `+1` shift).
                 // `compare_exchange` (rather than `store`) makes
                 // the stamp idempotent — a guest that publishes
                 // ScenarioStart more than once (workload re-runs,

@@ -542,17 +542,25 @@ pub struct KtstrVm {
     #[allow(dead_code)]
     pub(crate) workload_duration: Option<Duration>,
     /// Periodic snapshot count: when non-zero, the freeze
-    /// coordinator divides the 10%–90% slice of
-    /// [`Self::workload_duration`] into `num_snapshots`
-    /// equally-spaced boundaries (anchored at the first
-    /// `MSG_TYPE_SCENARIO_START` the coordinator observes) and
-    /// fires a host-side `freeze_and_capture(false)` at each one,
-    /// tagged `"periodic_NNN"` and stored on the host's
-    /// [`crate::scenario::snapshot::SnapshotBridge`]. `0` (the
-    /// default) disables the periodic-capture loop entirely.
-    /// Plumbed through [`KtstrVmBuilder::num_snapshots`]; the
-    /// test-entry plumbing comes from
-    /// [`crate::test_support::KtstrTestEntry::num_snapshots`].
+    /// coordinator slices the capturable window into `num_snapshots`
+    /// equally-spaced boundaries (a 10 % pre / 10 % post buffer
+    /// reserves the ramp edges) and fires a host-side
+    /// `freeze_and_dispatch(FreezeMode::Capture { gate_on_exit_kind: false })`
+    /// at each one, tagged
+    /// `"periodic_NNN"` and stored on the host's
+    /// [`crate::scenario::snapshot::SnapshotBridge`]. The window is
+    /// `[max(scenario_start, prereqs_ready), scenario_start +
+    /// workload_duration]`: the start floats to the prereq-ready
+    /// moment so cold-boot accessor/attach latency cannot strand
+    /// boundaries in the already-past pre-ready region, and the end
+    /// is CLAMPED to the workload end so a cold-boot-late start
+    /// cannot push captures into post-workload idle. On a warm boot
+    /// the start equals `scenario_start`, so the window is the full
+    /// `[scenario_start, scenario_start + workload_duration]`. `0`
+    /// (the default) disables the periodic-capture loop entirely.
+    /// Plumbed through
+    /// [`KtstrVmBuilder::num_snapshots`]; the test-entry plumbing
+    /// comes from [`crate::test_support::KtstrTestEntry::num_snapshots`].
     pub(crate) num_snapshots: u32,
     /// Lazy on-demand BPF cast-analysis handle for the scheduler
     /// binary's embedded BPF object(s). Populated by

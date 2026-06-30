@@ -80,6 +80,7 @@ use self::snapshot::{
 use self::state::{
     BspExitReason, FREEZE_RENDEZVOUS_TIMEOUT, FreezeState, SnapshotRequest,
     compute_periodic_boundaries_ns, periodic_accessor_current, periodic_tag,
+    resolve_periodic_window,
 };
 use self::watchpoint::{WatchpointPublishResult, republish_watchpoint_on_rebind};
 
@@ -1588,12 +1589,16 @@ impl KtstrVm {
         let watchdog_pause_for_coord = watchdog_pause_ns.clone();
         let workload_duration_for_coord = self.workload_duration;
         // First-ScenarioStart timestamp (nanos since `run_start`),
-        // biased by `+1` so `0` means "no ScenarioStart frame
-        // observed yet". The dispatch.rs ScenarioStart arm
-        // CAS-stamps this on the first frame so the periodic-
-        // snapshot loop in the coord run-loop can anchor the
-        // 10%–90% workload-duration window at the moment the guest
-        // workload actually starts (not at boot or at `run_start`).
+        // clamped to a `1` floor (via `.max(1)`) so `0` stays the
+        // "no ScenarioStart frame observed yet" sentinel — a
+        // boot-unreachable elapsed==0 maps to 1, every real stamp is
+        // exact (not a `+1` shift). The dispatch.rs ScenarioStart arm
+        // CAS-stamps this on the first frame; the periodic-snapshot
+        // loop in the coord run-loop uses it as the window END anchor
+        // (`scenario_start + workload_duration`, clamped) and the
+        // scenario-relative offset frame, while the window START
+        // floats to the later of this stamp and the prereq-ready
+        // moment — so neither boot nor `run_start` eats the budget.
         // `Arc<AtomicU64>` gives the coord thread shared ownership
         // with the dispatch sinks; both run in the same thread so
         // Relaxed ordering suffices, but the AtomicU64 keeps the
@@ -3430,23 +3435,35 @@ impl KtstrVm {
                 // is the precomputed list of `Instant` deadlines
                 // (encoded as nanos-since-`run_start`) at which the
                 // run-loop fires `freeze_and_dispatch(FreezeMode::Capture { gate_on_exit_kind: false })`. Lazily
-                // built on the first iteration AFTER BOTH:
+                // built on the first iteration AFTER ALL:
                 //   1. `KtstrVm::num_snapshots > 0` (periodic capture
                 //      is requested), AND
                 //   2. `workload_duration_for_coord` is `Some(d)`
                 //      (the workload has a duration to slice), AND
-                //   3. `scenario_start_ns_for_coord` reads non-zero
-                //      (the first ScenarioStart frame has been
-                //      observed and stamped by the dispatch arm).
+                //   3. `periodic_prereqs_ready_ns != 0` (kaslr publish +
+                //      map accessor + prog accessor all first held,
+                //      stamped `.max(1)`), AND
+                //   4. a non-zero anchor is resolvable — `scenario_start_ns`
+                //      (the ScenarioStart frame stamped by the dispatch
+                //      arm) OR, if that is still 0, the `watchdog_reset`
+                //      fallback (the observed scheduler-attach time). While
+                //      the anchor reads 0 the build DEFERS (a 0 anchor
+                //      would invert the clamped window and 0-fire),
+                //      retrying until one source latches.
                 //
-                // Boundaries divide the 10%–90% workload window into
-                // `N + 1` equal intervals, producing `N` interior
-                // boundaries — `N == 1` lands a single sample at
-                // `start + 0.5 d` (midpoint); `N == 3` lands at
-                // 0.3 d, 0.5 d, 0.7 d. The 10% pre-boundary buffer
-                // and 10% post-boundary buffer give the workload
-                // ramp-up / ramp-down room without periodic samples
-                // landing on transient state.
+                // Boundaries divide the 10%–90% slice of the
+                // capturable window into `N + 1` equal intervals,
+                // producing `N` interior boundaries — `N == 1` lands
+                // a single sample at the span midpoint; `N == 3`
+                // lands at 0.3 / 0.5 / 0.7 of the span. On a warm
+                // boot window_start == anchor, so the span equals the
+                // workload duration `d` and the landings are
+                // `0.3 d / 0.5 d / 0.7 d`; on a cold boot window_start
+                // floats later and the fractions are of the shorter
+                // clamped span. The 10% pre-boundary buffer and 10%
+                // post-boundary buffer give the workload ramp-up /
+                // ramp-down room without periodic samples landing on
+                // transient state.
                 //
                 // `next_periodic_idx` tracks how many boundaries
                 // have already fired. When the gate
@@ -3467,9 +3484,12 @@ impl KtstrVm {
                 let mut periodic_anchor_ns: u64 = 0;
                 // run_start-relative ns at which ALL periodic-capture prereqs
                 // (kaslr publish + map accessor + prog accessor) first held.
-                // The periodic boundary window anchors here on a cold boot so
-                // the cold-boot page-table walk + scx attach transient cannot
-                // push the 10-90% window past workload end. 0 = not yet ready.
+                // On a cold boot resolve_periodic_window floats window_start to
+                // this moment so no boundary lands in the already-elapsed
+                // pre-ready span (the cold-boot page-table walk + scx attach
+                // transient); the separate end-clamp (window_end =
+                // scenario_anchor + duration) is what keeps the window off
+                // post-workload idle. 0 = not yet ready.
                 let mut periodic_prereqs_ready_ns: u64 = 0;
                 let mut next_periodic_idx: u32 = 0;
                 // Consecutive parked-vCPU rendezvous failures during
@@ -7934,7 +7954,9 @@ impl KtstrVm {
                             // attach elapsed time (encoded in
                             // `watchdog_reset_ns` as
                             // `attach_elapsed_ns + workload_duration_ns`
-                            // — see `src/monitor/reader.rs::2515-2525`).
+                            // — see the `reset_ns.store` on the first non-NULL
+                            // `*scx_root` transition in `src/monitor/reader.rs`
+                            // (~2865)).
                             // The derived anchor is the moment the
                             // host saw `*scx_root` transition to
                             // non-NULL; that's the earliest meaningful
@@ -7962,36 +7984,46 @@ impl KtstrVm {
                                     );
                                 }
                             }
-                            // Boundaries anchor at the LATER of scenario-start
-                            // and the prereq-ready moment (window_anchor) so
-                            // cold-boot accessor/attach latency cannot strand
-                            // them in the already-past pre-ready region (the
-                            // 0-sample flake). Warm boots: prereqs_ready <=
-                            // scenario_anchor so window_anchor == scenario_anchor
-                            // (no-op). periodic_anchor_ns (below) is
-                            // scenario_anchor, NOT window_anchor, so
-                            // boundary_offset_ms = boundary - scenario_anchor is
-                            // SCENARIO-relative, the frame remap_offset_to_step
-                            // buckets against; a window-relative anchor would
-                            // mis-attribute cold-boot captures by the prereq lag.
-                            let window_anchor =
-                                scenario_anchor.max(periodic_prereqs_ready_ns);
-                            if window_anchor != 0 {
+                            // resolve_periodic_window floats window_start to
+                            // max(scenario_anchor, prereqs_ready), CLAMPS
+                            // window_end to scenario_anchor + duration, and
+                            // returns None to DEFER while scenario_anchor is
+                            // still 0 — the inverted-window 0-fire guard (a 0
+                            // anchor would make window_end = 0 + d <
+                            // window_start, re-introducing the cold-boot
+                            // 0-sample flake, and stamp anchor_ns = 0,
+                            // mis-bucketing offsets). See the helper doc for
+                            // the full rationale. On defer we leave
+                            // periodic_boundaries_ns None and retry next
+                            // iteration once scenario_start_ns or the
+                            // watchdog_reset fallback supplies a non-zero
+                            // anchor; prereqs_ready stays stamped so no rework
+                            // is lost. anchor_ns is scenario_anchor (NOT
+                            // window_start) so boundary offsets stay
+                            // scenario-relative for build_phase_buckets. The
+                            // slicer self-guards the degenerate/tiny window
+                            // (returns empty).
+                            if let Some(window) = resolve_periodic_window(
+                                scenario_anchor,
+                                periodic_prereqs_ready_ns,
+                                workload_d.as_nanos() as u64,
+                            ) {
                                 let boundaries = compute_periodic_boundaries_ns(
-                                    window_anchor,
-                                    workload_d,
+                                    window.window_start_ns,
+                                    window.window_end_ns,
                                     freeze_coord_num_snapshots,
                                 );
                                 tracing::info!(
                                     target: "ktstr::failure_dump",
                                     num_snapshots = freeze_coord_num_snapshots,
                                     scenario_anchor_ns = scenario_anchor,
-                                    window_anchor_ns = window_anchor,
+                                    window_start_ns = window.window_start_ns,
+                                    window_end_ns = window.window_end_ns,
                                     prereqs_ready_ns = periodic_prereqs_ready_ns,
                                     workload_duration_ns = workload_d.as_nanos() as u64,
                                     "freeze-coord: periodic snapshot boundaries computed"
                                 );
-                                periodic_anchor_ns = scenario_anchor;
+                                periodic_anchor_ns = window.anchor_ns;
                                 periodic_boundaries_ns = Some(boundaries);
                             }
                         }
@@ -8122,8 +8154,10 @@ impl KtstrVm {
                                 // has not yet processed leaves owned_accessor
                                 // bound to the PRIOR scheduler while *scx_root
                                 // already points at the new obj. The prior obj's
-                                // .bss is RCU-freed (kernel/sched/ext.c
-                                // scx_root_disable), so a capture through the
+                                // .bss page is RCU-freed via the BPF object
+                                // teardown that scheduler disable
+                                // (scx_root_disable, kernel/sched/ext.c)
+                                // drives, so a capture through the
                                 // stale accessor reads a recycled/zeroed page —
                                 // a silent nr_dispatched=0. Read *scx_root NOW
                                 // and defer if it moved since the last watchpoint
