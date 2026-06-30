@@ -414,6 +414,44 @@ fn hvc0_poll_loop(
             return;
         }
     };
+    // /dev/hvc0 is an hvc tty whose kernel-default termios has ICANON
+    // set. N_TTY canonical mode only makes input visible to
+    // poll(POLLIN)/read() on a line boundary: __receive_buf returns
+    // before the EPOLLIN wake when `icanon && !L_EXTPROC`, and
+    // input_available_p reports readable only once canon_head advances
+    // (on a `\n`/EOL). The host's wake bytes (SIGNAL_VC_DUMP,
+    // SIGNAL_BPF_WRITE_DONE, SIGNAL_ACCESSOR_READY, SIGNAL_VC_SHUTDOWN)
+    // are single non-newline bytes, so in canonical mode they sit in the
+    // canon buffer and never wake this loop. hvc registers
+    // TTY_DRIVER_REAL_RAW, but n_tty_set_termios forces real_raw=0 while
+    // ICANON is set, so the driver flag is inert until userspace clears
+    // ICANON. Put the fd in raw mode (clearing ICANON) so every byte is
+    // immediately poll-visible — mirrors the COM2 raw-mode setup in
+    // `modes.rs`. The host-side virtio-console delivery is already
+    // correct (RX descriptors are posted at probe, the byte is written
+    // and the guest IRQ is raised); this gate is purely the guest
+    // reader's line discipline, so the fix belongs here, not host-side.
+    // A tcgetattr/tcsetattr failure is logged rather than swallowed:
+    // without raw mode the loop reverts to canonical gating and silently
+    // misses single-byte wakes — the exact silent hang this exists to
+    // kill — so the failure must be diagnosable.
+    match nix::sys::termios::tcgetattr(&hvc0) {
+        Ok(mut tio) => {
+            nix::sys::termios::cfmakeraw(&mut tio);
+            if let Err(e) =
+                nix::sys::termios::tcsetattr(&hvc0, nix::sys::termios::SetArg::TCSANOW, &tio)
+            {
+                write_com2(&format!(
+                    "ktstr-init: hvc0 raw-mode tcsetattr failed: {e}; poll loop \
+                     stays canonical and may miss single-byte wake signals"
+                ));
+            }
+        }
+        Err(e) => write_com2(&format!(
+            "ktstr-init: hvc0 raw-mode tcgetattr failed: {e}; poll loop stays \
+             canonical and may miss single-byte wake signals"
+        )),
+    }
     let poll_timeout_ms: PollTimeout = 1000u16.into();
 
     while !stop.load(Ordering::Acquire) {
