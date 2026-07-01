@@ -68,7 +68,7 @@ Add ktstr as a dev-dependency:
 
 ```toml
 [dev-dependencies]
-ktstr = "0.19.0"
+ktstr = "0.20.0"
 ```
 
 The library is the test-author surface. The `anyhow::Result`
@@ -101,7 +101,7 @@ This installs:
 `cargo install --locked --bin cargo-ktstr ktstr@X.Y.Z`. ktstr is
 pre-1.0 — minor-version bumps may break the test-facing API, and
 patch bumps may break unstable internal surfaces (the CI matrix
-runs against the locked patch). Examples below assume 0.19.0; an
+runs against the locked patch). Examples below assume 0.20.0; an
 example from a different release may not compile against the crate
 this README documents.
 

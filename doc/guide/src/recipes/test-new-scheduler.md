@@ -217,7 +217,7 @@ In the scheduler crate's `Cargo.toml`:
 # be an optional [dependencies] entry, not a dev-dependency, because
 # `dep:ktstr` in [features] only resolves an optional normal dep
 # (Cargo has no optional dev-dependencies).
-ktstr = { version = "=0.19.0", optional = true }
+ktstr = { version = "=0.20.0", optional = true }
 
 [features]
 # Enabling the feature pulls ktstr in; without it the crate builds
