@@ -1677,55 +1677,65 @@ mod tests {
         }
     }
 
-    // Gated off under `wprof` (the coverage job runs `wprof` too): this is a
-    // host-thread timing test (fixed vs heavy-tail p99 serve latency); under CI
-    // host load, wprof/coverage slowdown perturbs the host-thread scheduling the
-    // assertion depends on. Runs in the non-wprof jobs.
-    #[cfg(not(feature = "wprof"))]
+    // The heavy-tail slow-path service model — the Pareto that
+    // `resolve_service_pareto` derives from the `slow_path_sleep_us` median +
+    // `slow_path_p99_us` 99th-percentile knobs, sampled by `sample_service_us` —
+    // reproduces those quantiles and a heavy tail the fixed path lacks.
+    //
+    // Deterministic: a fixed-seed PRNG driving the pure sampler, no threads and
+    // no wall-clock timing, so it pins the heavy-tail LOGIC without the
+    // host-scheduling jitter a real-timing run carries (a prior version compared
+    // wall-clock serve MAX across host threads and flaked on loaded CI runners,
+    // where the control's jitter spike collapsed the ratio). The end-to-end
+    // engine path — the slow path drawing from this sampler under a live
+    // open-loop arrival process — is covered by the coordinated in-VM
+    // `taobench_open_loop_runs_in_vm` e2e (pinned vCPUs, no host jitter).
     #[test]
-    fn open_loop_heavy_tail_inflates_serve_latency() {
-        // Composition with the open-loop serve-latency measurement, ISOLATING the
-        // heavy tail from open-loop queueing/coordinated-omission backlog: run a
-        // FIXED control and a HEAVY-tail variant at the SAME arrival_rate / thread
-        // counts / hit ratio (so any backlog component is shared/cancels), and
-        // assert the heavy-tail serve MAX exceeds the fixed one by a margin queueing
-        // cannot explain — i.e. only the per-fetch Pareto tail accounts for it.
-        let run_serve_max = |p99_us: u64| -> u32 {
-            let cfg = TaobenchConfig::default()
-                .client_threads(4)
-                .slow_threads(4)
-                .cache_capacity_mib(8)
-                .target_hit_pct(90)
-                .slow_path_sleep_us(100)
-                .slow_path_p99_us(p99_us)
-                .arrival_rate(20_000);
-            let stop = AtomicBool::new(false);
-            let progress = AtomicU64::new(0);
-            let out = std::thread::scope(|s| {
-                let h = s.spawn(|| run(&cfg, &stop, &progress, None));
-                while progress.load(Ordering::Relaxed) < 10_000 {
-                    std::hint::spin_loop();
-                }
-                stop.store(true, Ordering::Release);
-                h.join().expect("engine panicked")
-            });
-            let mut serve = PlatStats::default();
-            for (_epoch, p) in &out.phases {
-                serve.combine(&p.serve_lat);
-            }
-            assert!(serve.sample_count() > 0, "open loop recorded serve latency");
-            serve.percentiles().max
-        };
-        let fixed_max = run_serve_max(0); // p99 == 0 -> fixed 100µs fetch
-        let heavy_max = run_serve_max(2000); // p99 2ms -> Pareto tail
-        // The heavy-tail tail draws (p99 2ms, max far higher) dwarf the fixed run's
-        // ~100µs fetch + shared backlog. Require a clear multiplicative margin so a
-        // backlog spike in the fixed run cannot make this pass spuriously.
+    fn heavy_tail_service_model_reproduces_configured_quantiles() {
+        // A p99 above the median resolves to a Pareto; at/below it (or a zero
+        // median) stays on the fixed-latency path.
+        let heavy = TaobenchConfig::default()
+            .slow_path_sleep_us(100)
+            .slow_path_p99_us(2000);
+        let (scale, inv_neg_alpha) = heavy
+            .resolve_service_pareto()
+            .expect("p99 2000µs above median 100µs resolves to a Pareto tail");
+        for (p50, p99, why) in [
+            (100u64, 0u64, "p99 == 0 keeps the fixed path"),
+            (100, 100, "p99 == median is not a tail"),
+            (0, 2000, "zero median has no Pareto scale"),
+        ] {
+            assert!(
+                TaobenchConfig::default()
+                    .slow_path_sleep_us(p50)
+                    .slow_path_p99_us(p99)
+                    .resolve_service_pareto()
+                    .is_none(),
+                "{why}",
+            );
+        }
+
+        // Fixed-seed draws reproduce the configured quantiles + a heavy tail.
+        let mut rng = Rng::new(0x00C0_FFEE);
+        let mut samples: Vec<u64> = (0..200_000)
+            .map(|_| sample_service_us(&mut rng, scale, inv_neg_alpha))
+            .collect();
+        samples.sort_unstable();
+        let q = |p: f64| samples[((samples.len() as f64 * p) as usize).min(samples.len() - 1)];
+        let (p50, p99, max) = (q(0.50), q(0.99), *samples.last().unwrap());
+        // Median ~100µs and p99 ~2000µs (the configured knobs), within a
+        // generous band only a broken Pareto mapping would miss.
         assert!(
-            heavy_max > fixed_max.saturating_mul(3) && heavy_max > 1000,
-            "heavy-tail serve max {heavy_max}µs must exceed the fixed-latency control \
-             {fixed_max}µs by >3x (same arrival_rate/threads, so the gap is the \
-             per-fetch Pareto tail, not shared queueing backlog)",
+            (50..=200).contains(&p50),
+            "empirical median {p50}µs should track the configured 100µs",
+        );
+        assert!(
+            (1000..=4000).contains(&p99),
+            "empirical p99 {p99}µs should track the configured 2000µs",
+        );
+        assert!(
+            max > p99.saturating_mul(2),
+            "max {max}µs must dwarf p99 {p99}µs — the Pareto tail the fixed path lacks",
         );
     }
 }
