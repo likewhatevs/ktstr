@@ -2419,6 +2419,11 @@ fn primary_reached_workload_distinguishes_payload_starting_from_scheduler_not_at
 /// Build a minimal `VmResult` whose `guest_messages` is `Some(...)`
 /// with the supplied entries. All other fields take fixture
 /// defaults via [`crate::vmm::result::VmResult::test_fixture`].
+///
+/// Gated on `wprof` with the sidecar-writer tests it feeds:
+/// [`write_auto_repro_sidecar_artifacts`] exists only under `wprof`, so
+/// its callers here (and this shared fixture) are dead code otherwise.
+#[cfg(feature = "wprof")]
 fn vm_result_with_drain(entries: Vec<crate::vmm::wire::ShmEntry>) -> crate::vmm::result::VmResult {
     crate::vmm::result::VmResult {
         guest_messages: Some(crate::vmm::host_comms::BulkDrainResult { entries }),
@@ -2431,6 +2436,7 @@ fn vm_result_with_drain(entries: Vec<crate::vmm::wire::ShmEntry>) -> crate::vmm:
 /// followed by "hi"). The bytes don't need to be a real Perfetto
 /// proto for the helper's write-to-disk contract — the helper is
 /// payload-opaque.
+#[cfg(feature = "wprof")]
 fn wprof_frame(payload: &[u8], crc_ok: bool) -> crate::vmm::wire::ShmEntry {
     crate::vmm::wire::ShmEntry {
         msg_type: crate::vmm::wire::MsgType::WprofTrace.wire_value(),
@@ -2443,6 +2449,7 @@ fn wprof_frame(payload: &[u8], crc_ok: bool) -> crate::vmm::wire::ShmEntry {
 /// `${entry.name}-${variant_hash:016x}.repro.wprof.pb` to sidecar_dir
 /// with the exact payload bytes. Pins the no-silent-drop contract on
 /// the wprof bulk-drain dispatch arm.
+#[cfg(feature = "wprof")]
 #[test]
 fn write_auto_repro_sidecar_artifacts_writes_wprof_pb() {
     let _env_lock = crate::test_support::test_helpers::lock_env();
@@ -2469,6 +2476,7 @@ fn write_auto_repro_sidecar_artifacts_writes_wprof_pb() {
 /// CRC-bad WprofTrace frames are skipped — a corrupted payload
 /// would mask the corruption if written. Pins the CRC gate at
 /// [`write_auto_repro_sidecar_artifacts`].
+#[cfg(feature = "wprof")]
 #[test]
 fn write_auto_repro_sidecar_artifacts_skips_crc_bad_wprof() {
     let _env_lock = crate::test_support::test_helpers::lock_env();
