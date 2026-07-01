@@ -1210,9 +1210,13 @@ fn vm_integration_perf_counters_capture() {
 
 /// Event-counter timeline (per-tick sched-event capture).
 ///
-/// Asserts `event_counter_timeline` non-empty after a 15s run
-/// window. Pins the per-monitor-tick capture loop + SCX_EV_*
-/// offset resolution + `EventCounterCapture` attach path.
+/// Asserts that monitor samples carried `SCX_EV_*` event counters
+/// (`CpuSnapshot.event_counters` in `VmResult.monitor.samples`) after
+/// a 15s run window. The dump's `event_counter_timeline` field is
+/// always empty (the freeze coordinator passes
+/// `event_counter_capture: None`), so the check reads the monitor
+/// samples, not that field. Pins the per-monitor-tick capture loop +
+/// SCX_EV_* offset resolution + `EventCounterCapture` attach path.
 #[test]
 #[ignore = "requires KVM, ../linux, scx-ktstr"]
 fn vm_integration_event_counter_timeline() {
@@ -1348,10 +1352,12 @@ fn vm_integration_disk_write_read_roundtrip() {
 
 /// Disk #3 — read-only disk rejects write.
 ///
-/// Boots with a `read_only(true)` DiskConfig and asserts that
-/// `open(/dev/vda, O_WRONLY)` from the guest fails with `EROFS`.
-/// Pins the VIRTIO_BLK_F_RO advertisement and the guest kernel's
-/// `disk->part0.policy = 1` gate at `open(2)` time.
+/// Boots with a `read_only(true)` DiskConfig and asserts the
+/// read-only chain end-to-end: `VIRTIO_BLK_F_RO` marks the gendisk
+/// read-only (`/sys/block/vda/ro == 1`), `open(/dev/vda, O_WRONLY)`
+/// SUCCEEDS (the bdev open path does not gate on read-only), and the
+/// first `write()` returns `EPERM` — the kernel rejects writes to a
+/// read-only bdev at write time, not `EROFS` at `open(2)` time.
 #[test]
 #[ignore = "requires KVM, ../linux, CONFIG_VIRTIO_BLK in guest"]
 fn vm_integration_disk_read_only_rejects_write() {
