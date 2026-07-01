@@ -80,7 +80,7 @@ Pin a specific kernel version via the matrix strategy:
 strategy:
   fail-fast: false
   matrix:
-    kernel-version: ['6.14', '7.0']
+    kernel-version: ['6.14', '7.1']
 steps:
   # ...
   - name: Install ktstr
