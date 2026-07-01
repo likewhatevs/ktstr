@@ -40,9 +40,12 @@ use super::vcpu::{
 };
 use super::vmlinux::{cached_vmlinux_bytes, find_vmlinux};
 use super::{
-    KtstrVm, console, host_comms, vcpu_panic, virtio_blk, virtio_console, virtio_msix, virtio_net,
-    wire,
+    KtstrVm, console, host_comms, vcpu_panic, virtio_blk, virtio_console, virtio_net, wire,
 };
+// MSI-X routing is x86_64-only (aarch64 uses GICv3 with no PCI MSI-X); its only
+// users are the `#[cfg(target_arch = "x86_64")]` PCI run-loop paths below.
+#[cfg(target_arch = "x86_64")]
+use super::virtio_msix;
 
 #[cfg(target_arch = "aarch64")]
 use super::aarch64::kvm;

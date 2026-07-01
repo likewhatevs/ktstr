@@ -217,12 +217,21 @@ mod mmio;
 // build. Split from `control.rs` so the PCI facade is a sibling
 // peer of the MMIO facade over the same core, not a fork of it.
 
+// The facade is x86_64-only functionality: it compiles on all arches (it needs
+// only the arch-neutral PciBus + virtio_msix, and its compilation keeps the
+// shared PCI config-space helpers live) but is wired into a PciBus only on
+// x86_64, so on aarch64 the whole module is unused — allow that there. x86_64
+// still lints it fully (the allow is gated to non-x86).
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 mod pci;
 // `pci.rs` is the virtio-pci-modern transport facade: `VirtioBlkPci` wraps the
 // `VirtioBlk` core and decodes the PCI config space + BAR0
 // common/ISR/device/notify/MSI-X regions onto the same core ops the MMIO facade
 // uses. `setup` installs it into the `PciBus`; re-exported `pub(crate)` for that
 // wiring (mirrors virtio_net::VirtioNetPci).
+// The facade compiles on all arches but nothing installs it on aarch64 (no PCI),
+// so the re-export is unused there.
+#[cfg_attr(not(target_arch = "x86_64"), allow(unused_imports))]
 pub(crate) use pci::VirtioBlkPci;
 
 mod control;

@@ -256,7 +256,9 @@ pub struct KtstrVm {
     /// Whether the guest exposes the virtio-PCI transport (PCI host bridge +
     /// ECAM/CAM config access + the PCI ACPI tables). Off by default;
     /// propagated to `KtstrKvm::pci_enabled` and gates the `pci=off` cmdline
-    /// token.
+    /// token. x86_64-only in effect: aarch64 has no PCI transport, so the flag
+    /// is never propagated or read there — it stays for a uniform builder API.
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     pub(crate) pci_enabled: bool,
     pub(crate) init_binary: Option<PathBuf>,
     pub(crate) scheduler_binary: Option<PathBuf>,

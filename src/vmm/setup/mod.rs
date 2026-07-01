@@ -23,9 +23,13 @@ use super::memory_budget::{
     read_kernel_version, read_kernel_version_from_metadata_sidecar,
 };
 use super::pi_mutex::PiMutex;
-use super::{
-    disk_config, disk_template, host_topology, initramfs, pci, virtio_blk, virtio_msix, virtio_net,
-};
+use super::{disk_config, disk_template, host_topology, initramfs, virtio_blk, virtio_net};
+// The virtio-PCI transport, its MSI-X state, and the INTx resample eventfd are
+// x86_64-only (aarch64 is virtio-MMIO + GICv3 with no PCI); their only users are
+// the `#[cfg(target_arch = "x86_64")]` PCI setup paths below.
+#[cfg(target_arch = "x86_64")]
+use super::{pci, virtio_msix};
+#[cfg(target_arch = "x86_64")]
 use vmm_sys_util::eventfd::EventFd;
 
 #[cfg(target_arch = "aarch64")]
@@ -1005,7 +1009,12 @@ impl KtstrVm {
 
         // Propagate the builder's PCI-enable flag to the VM so the run loops
         // construct the PCI host bridge and the ACPI/cmdline gate on it.
-        vm.pci_enabled = self.pci_enabled;
+        // x86_64-only: aarch64 `KtstrKvm` has no `pci_enabled` field (the guest
+        // is virtio-MMIO + GICv3 with no PCI transport).
+        #[cfg(target_arch = "x86_64")]
+        {
+            vm.pci_enabled = self.pci_enabled;
+        }
 
         // When memory is already allocated (non-deferred path), do mbind
         // and load kernel now. Deferred path does this in setup_memory.
