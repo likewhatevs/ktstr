@@ -265,6 +265,7 @@ fn check_perf_counters_capture(result: &VmResult) -> Result<()> {
 /// per-tick capture surface is alive on a real kernel run. Sparkline
 /// rendering on top of this vec is unit-tested elsewhere; this test
 /// pins the integration boundary where unit tests cannot reach.
+#[cfg(not(feature = "wprof"))]
 fn scenario_event_counter_timeline(ctx: &ktstr::scenario::Ctx) -> Result<AssertResult> {
     run_stalled_workload(ctx)
 }
@@ -278,6 +279,7 @@ fn scenario_event_counter_timeline(ctx: &ktstr::scenario::Ctx) -> Result<AssertR
 /// sample stream carries the real per-tick capture, so the assertion
 /// runs against it here. The callback's Err is a hard FAIL
 /// (`PostVmAssertionFailure`) that `expect_err` does not invert.
+#[cfg(not(feature = "wprof"))]
 fn check_event_counter_timeline(result: &VmResult) -> Result<()> {
     let monitor = result.monitor.as_ref().ok_or_else(|| {
         anyhow::anyhow!("VmResult.monitor is None — the monitor sampler produced no report")
@@ -1018,6 +1020,14 @@ static __KTSTR_ENTRY_PERF_COUNTERS: ktstr::test_support::KtstrTestEntry =
         ..ktstr::test_support::KtstrTestEntry::DEFAULT
     };
 
+// Gated off under `wprof` (the coverage job runs `wprof` too): the per-tick
+// SCX_EV_* capture needs the guest scheduler to make real-time progress over
+// the 15s window; wprof/coverage slowdown under CI host load starves the vCPUs
+// so no event-counter samples land. Gated at the KTSTR_TESTS entry (what the
+// cargo-ktstr runner discovers and executes) — the nextest shim below and the
+// scenario/post-vm fns are gated to match, so nothing dangles or goes dead
+// under wprof. Runs in the non-wprof jobs.
+#[cfg(not(feature = "wprof"))]
 #[ktstr::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
 #[linkme(crate = ktstr::linkme)]
 static __KTSTR_ENTRY_EVENT_TIMELINE: ktstr::test_support::KtstrTestEntry =
