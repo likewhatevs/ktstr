@@ -364,15 +364,20 @@ declares one target:
   - `BpfMapAgg::ScalarCounter` — a single monotonic-counter value (an
     accumulating total like `ktstr_alloc_count`), folded as the value at the
     last reporting sample (the final total — not the mean of a rising series).
-  - `BpfMapAgg::PerCpu` — a per-CPU array, folded into a cross-CPU mean and
-    spatial max.
+  - `BpfMapAgg::PerCpu` — a per-CPU array GAUGE, folded into a cross-CPU mean
+    and spatial max.
+  - `BpfMapAgg::PerCpuCounter` — a per-CPU array that is a monotonic counter,
+    folded as the cross-CPU sum at the last reporting sample (the accumulated
+    total across all reporting CPUs). Watch at u64 width so no per-CPU slot
+    truncates before the sum.
 - `label` — the metric-key leaf.
 
 The metric key is the active scheduler's object prefix plus the label:
-`<scheduler-obj>_<label>` for a scalar, and `<scheduler-obj>_<label>_avg` /
-`_max` for per-CPU. The object prefix comes from the scheduler's
-global-section map name — this is libbpf's object name, which can differ from
-the scheduler's source / ops name (e.g. an object named `scx_lavd` → prefix
+`<scheduler-obj>_<label>` for a scalar, scalar-counter, or per-CPU-counter,
+and `<scheduler-obj>_<label>_avg` / `_max` for a per-CPU gauge. The object
+prefix comes from the scheduler's global-section map name — this is libbpf's
+object name, which can differ from the scheduler's source / ops name (e.g. an
+object named `scx_lavd` → prefix
 `scx_lavd`, but scx-ktstr's object is `bpf_bpf`, so its prefix is `bpf_bpf`).
 Each target's `label` must be unique within a test (duplicate labels resolve to
 one metric key and are rejected at VM build time). Read it back with
