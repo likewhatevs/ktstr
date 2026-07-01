@@ -42,6 +42,13 @@
 //! No scheduler is attached: the in-kernel default (EEVDF) is
 //! sufficient — PCI enumeration does not depend on a sched_ext
 //! scheduler, and skipping the attach keeps the boot short.
+//!
+//! x86_64-only: the virtio-PCI transport (host bridge + ECAM/CAM config space +
+//! PCI ACPI tables) is built only on x86_64. aarch64 is virtio-MMIO + GICv3 with
+//! no PCI, so there is no `/sys/bus/pci` host bridge to enumerate — the whole
+//! test is gated below (mirrors virtio_net_multiqueue_e2e / multi_nic /
+//! wide_smp_*_irq).
+#![cfg(target_arch = "x86_64")]
 
 use anyhow::Result;
 use ktstr::assert::{AssertDetail, AssertResult, DetailKind};
