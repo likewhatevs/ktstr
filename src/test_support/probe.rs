@@ -612,7 +612,7 @@ fn build_repro_vm_builder(
     builder = builder.timeout(super::runtime::vm_timeout_from_entry(entry) + PROBE_DRAIN_GRACE);
 
     // Set the auto-repro failure-dump sink to a `.repro` sibling
-    // of the primary's `{name}.failure-dump.json` so the auto-repro
+    // of the primary's `{name}-{variant_hash}.failure-dump.json` so the auto-repro
     // VM's dump (if it fires again) lands alongside, not on top of,
     // the just-failed primary's dump. Both files survive in the
     // sidecar dir for primary-vs-repro comparison. The setter is
@@ -948,7 +948,7 @@ fn format_repro_output(
     // trace + profraw coverage) BEFORE classify_repro_vm_status
     // consumes the drain for lifecycle signalling. Mirrors the
     // primary VM's crate::test_support::eval per-frame dispatch but writes wprof under
-    // `${entry.name}.repro.wprof.pb` so primary + repro artifacts
+    // `${entry.name}-${variant_hash}.repro.wprof.pb` so primary + repro artifacts
     // coexist on disk (matches the `.repro.` infix every other
     // repro-VM sidecar already uses). Without this hop the
     // auto-repro VM's wprof bytes would be silently dropped — the

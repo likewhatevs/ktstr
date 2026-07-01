@@ -1580,8 +1580,9 @@ fn count_global_sections_for_prefix(
 /// single call site flipping the builder's `dual_snapshot` flag,
 /// and there is no public ktstr surface for asking for it from a
 /// primary VM. Test authors don't need to know about it — when an
-/// auto-repro fires, the file at `<test>.repro.failure-dump.json`
-/// changes shape from [`FailureDumpReport`] to this wrapper.
+/// auto-repro fires, the file at
+/// `<test>-<variant_hash>.repro.failure-dump.json` changes shape from
+/// [`FailureDumpReport`] to this wrapper.
 ///
 /// Note: there is no `Default` impl. The `late` field is required
 /// by the doc invariant ("the freeze coordinator only writes a

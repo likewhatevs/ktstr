@@ -1354,7 +1354,7 @@ fn classify_repro_vm_status_malformed_not_attached_falls_through() {
 
 // -- render_failure_dump_file -----------------------------------
 //
-// The auto-repro path reads its `{name}.repro.failure-dump.json`
+// The auto-repro path reads its `{name}-{variant_hash}.repro.failure-dump.json`
 // sidecar back, sniffs the `schema` discriminant to choose
 // between [`FailureDumpReport`] and [`DualFailureDumpReport`],
 // and emits the Display rendering as a tail block. These tests

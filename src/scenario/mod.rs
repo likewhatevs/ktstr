@@ -690,8 +690,8 @@ impl Ctx<'_> {
     }
 
     /// Per-test failure-dump sidecar path. Derives
-    /// `{sidecar_dir()}/{entry_name}.failure-dump.json` from the
-    /// macro-stamped [`Self::entry_name`] — the drift-safe
+    /// `{sidecar_dir()}/{entry_name}-{variant_hash:016x}.failure-dump.json`
+    /// from the macro-stamped [`Self::entry_name`] — the drift-safe
     /// replacement for the legacy pattern of hardcoding the test
     /// fn name as a string literal at the callsite.
     ///
@@ -725,7 +725,7 @@ impl Ctx<'_> {
                  .entry_name(...). Call ctx_builder.entry_name(name) \
                  explicitly, OR if this is a scenario unit-test fixture \
                  that has no test-entry context, derive the path inline \
-                 (sidecar_dir().join(format!(\"{{name}}.failure-dump.json\"))) \
+                 (sidecar_dir().join(format!(\"{{name}}-{{variant_hash:016x}}.failure-dump.json\"))) \
                  — the method form is for tests dispatched via \
                  #[ktstr_test], not for builder-driven fixtures."
             )

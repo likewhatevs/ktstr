@@ -309,14 +309,44 @@ pub(crate) fn run_ktstr_test_inner(
     final_result
 }
 
+/// Per-test primary failure-dump sidecar path — the variant-hashed
+/// name the freeze-coord writer sink (`primary_dump_path`) and the
+/// exit-kind reader (`read_primary_exit_kind`) both key. Shared so the
+/// writer and reader cannot drift to different names (the drift that
+/// silently killed exit-kind detection).
+fn primary_failure_dump_path(entry_name: &str, variant_hash: u64) -> std::path::PathBuf {
+    crate::test_support::sidecar::sidecar_dir().join(format!(
+        "{entry_name}-{variant_hash:016x}.failure-dump.json"
+    ))
+}
+
+/// Read the primary VM's `scx_sched_state.exit_kind` from its
+/// failure-dump JSON. `None` when the dump is absent/unparseable or
+/// lacks the field — the caller treats `None` as "not a stall" and
+/// takes the conservative probe-attach path. Reads the SAME
+/// `primary_failure_dump_path` the dump is written under, so a stall
+/// exit is actually detectable (pre-fix an un-hashed read name never
+/// matched the written dump, leaving this permanently `None`).
+fn read_primary_exit_kind(entry_name: &str, variant_hash: u64) -> Option<u64> {
+    let dump_path = primary_failure_dump_path(entry_name, variant_hash);
+    std::fs::read_to_string(&dump_path)
+        .ok()
+        .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok())
+        .and_then(|v| {
+            v.get("scx_sched_state")
+                .and_then(|s| s.get("exit_kind"))
+                .and_then(|k| k.as_u64())
+        })
+}
+
 /// Write a placeholder `failure-dump.json` at `path` when the file
 /// does not already exist. Called from the primary VM dispatch on
 /// failure paths where the freeze coordinator did NOT produce a
 /// real BPF-state dump (pre-attach failures: send_sys_rdy timeout,
 /// VM boot failure, scheduler binary load failure, post_vm callback
 /// failure) so the spec promise ("every failed test writes
-/// `<test_name>.failure-dump.json` to the sidecar dir") survives
-/// those code paths too.
+/// `<test_name>-<variant_hash>.failure-dump.json` to the sidecar dir")
+/// survives those code paths too.
 ///
 /// The placeholder's `is_placeholder: true` field lets downstream
 /// tooling (stats compare, sidecar walkers) distinguish a stub
@@ -615,8 +645,9 @@ fn run_ktstr_test_inner_impl(
     // not be masked by the prior failure's leftovers — the E2E
     // test (`tests/failure_dump_e2e.rs`) reads from the primary
     // path and an operator inspecting the sidecar dir looks at
-    // both. Both files are scoped per-test (`{name}.failure-
-    // dump.json` and `{name}.repro.failure-dump.json`), so we can
+    // both. Both files are variant-keyed per test
+    // (`{name}-{variant_hash}.failure-dump.json` and
+    // `{name}-{variant_hash}.repro.failure-dump.json`), so we can
     // safely unlink both from this single primary-dispatch
     // entry — auto-repro fires only after a primary failure
     // emits a dump, so any repro file present here is stale by
@@ -625,10 +656,7 @@ fn run_ktstr_test_inner_impl(
     // coord's own write would overwrite a stale file in
     // practice; the warn flags permission / fs anomalies for the
     // operator).
-    let primary_dump_path = super::sidecar::sidecar_dir().join(format!(
-        "{}-{variant_hash:016x}.failure-dump.json",
-        entry.name
-    ));
+    let primary_dump_path = primary_failure_dump_path(entry.name, variant_hash);
     let repro_dump_path = super::sidecar::sidecar_dir().join(format!(
         "{}-{variant_hash:016x}.repro.failure-dump.json",
         entry.name
@@ -1122,8 +1150,9 @@ fn run_ktstr_test_inner_impl(
     // emit a placeholder dump at the documented path so operators
     // querying `find target/ktstr -name '*.failure-dump.json'` always
     // see SOMETHING when a test failed. Spec-promise parity: the
-    // sidecar dir guarantees one `<test_name>.failure-dump.json`
-    // per failed run regardless of whether real BPF state could be
+    // sidecar dir guarantees one
+    // `<test_name>-<variant_hash>.failure-dump.json` per failed run
+    // regardless of whether real BPF state could be
     // captured. The `is_placeholder: true` field on
     // [`crate::monitor::dump::FailureDumpReport`] lets downstream
     // tooling (stats compare, sidecar walkers) distinguish a stub
@@ -1538,18 +1567,12 @@ fn run_ktstr_test_inner_impl(
     // through to running the probe (the conservative choice — probe
     // attachment on a true stall is a slowdown, not a correctness
     // hazard).
-    let primary_exit_kind = {
-        let dump_path =
-            super::sidecar::sidecar_dir().join(format!("{}.failure-dump.json", entry.name));
-        std::fs::read_to_string(&dump_path)
-            .ok()
-            .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok())
-            .and_then(|v| {
-                v.get("scx_sched_state")
-                    .and_then(|s| s.get("exit_kind"))
-                    .and_then(|k| k.as_u64())
-            })
-    };
+    // Reads the primary dump's exit_kind from the SAME variant-hashed
+    // path the writer keys (see `read_primary_exit_kind`). Pre-fix this
+    // read used an un-hashed name that never matched the written dump,
+    // so primary_exit_kind was always None and the is_stall detection
+    // below was dead. None => not a stall => conservative probe-attach.
+    let primary_exit_kind = read_primary_exit_kind(entry.name, variant_hash);
     // Did the primary VM emit its `PayloadStarting` lifecycle frame?
     // Computed before constructing repro_fn so the closure can capture
     // it. The flag gates the "PRIMARY DID NOT REACH WORKLOAD" label

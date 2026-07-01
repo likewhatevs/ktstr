@@ -11,6 +11,53 @@ use super::super::test_helpers::{EnvVarGuard, lock_env, sched_entry};
 use super::*;
 use tempfile::TempDir;
 
+// -- read_primary_exit_kind (failure-dump exit-kind reader) --
+
+/// Regression pin for the auto-repro stall detector's failure-dump
+/// read. The writer sink and this reader share
+/// `primary_failure_dump_path`, so a dump written at that hashed path
+/// is found, and `scx_sched_state.exit_kind` (a `u32`) serializes as a
+/// JSON number the `.as_u64()` extraction reads back. A non-zero
+/// variant hash proves the hash keys the name; a different hash
+/// resolves nothing. Pre-fix the reader used an un-hashed name that
+/// never matched the written dump, so exit-kind detection was dead.
+#[test]
+fn read_primary_exit_kind_reads_stall_from_writer_path() {
+    let _env_lock = crate::test_support::test_helpers::lock_env();
+    let tmp = TempDir::new().expect("tempdir");
+    let _sidecar = crate::test_support::test_helpers::EnvVarGuard::set(
+        crate::KTSTR_SIDECAR_DIR_ENV,
+        tmp.path(),
+    );
+    let name = "exit_kind_reader_fixture";
+    let hash = 0xab_u64;
+    let scx = crate::monitor::scx_walker::ScxSchedState {
+        exit_kind: crate::probe::scx_defs::EXIT_ERROR_STALL as u32,
+        ..Default::default()
+    };
+    let dump = serde_json::json!({
+        "scx_sched_state": serde_json::to_value(&scx).expect("serialize ScxSchedState"),
+    });
+    std::fs::write(
+        primary_failure_dump_path(name, hash),
+        serde_json::to_string(&dump).expect("serialize dump"),
+    )
+    .expect("write failure-dump fixture");
+    // Writer and reader share primary_failure_dump_path → the hashed
+    // dump is found and exit_kind (u32 -> JSON number) extracts as u64.
+    assert_eq!(
+        read_primary_exit_kind(name, hash),
+        Some(crate::probe::scx_defs::EXIT_ERROR_STALL),
+        "reader must find the stall exit_kind at the writer's hashed path",
+    );
+    // A different variant hash keys a different name -> nothing resolves.
+    assert_eq!(
+        read_primary_exit_kind(name, 0xcd),
+        None,
+        "a different variant hash must not resolve this dump",
+    );
+}
+
 // -- write_placeholder_failure_dump_if_missing --
 //
 // Pins the spec-promise that every failed test leaves a JSON

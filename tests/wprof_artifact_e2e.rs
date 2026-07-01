@@ -13,7 +13,7 @@
 //!   5. guest init's `spawn_wprof_if_configured` spawns wprof
 //!   6. on workload exit, guest sends `MsgType::WprofTrace`
 //!      with the Perfetto `.pb` bytes
-//!   7. host dispatch arm writes `{sidecar_dir}/{test_name}.wprof.pb`
+//!   7. host dispatch arm writes `{sidecar_dir}/{test_name}-{variant_hash}.wprof.pb`
 //!
 //! Any break in the chain surfaces as the `post_vm` assertion
 //! failing.

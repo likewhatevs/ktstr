@@ -1348,11 +1348,13 @@ pub(crate) struct FailedTest {
     /// multiple failing variants this is a representative one; the
     /// full per-variant set is in `stats_sidecars`.
     pub(crate) topology: Option<String>,
-    /// `{test}.failure-dump.json`. Shared per test name (not
-    /// per-variant), so for a gauntlet test it reflects whichever
-    /// variant ran last — the fail signal does not rely on it.
+    /// `{test}-{variant_hash}.failure-dump.json` for whichever variant
+    /// the run-dir scan classified last (unsorted read_dir order);
+    /// single-slot. The fail signal keys off the per-variant
+    /// `dump_hashes` set, not this path.
     pub(crate) failure_dump: Option<PathBuf>,
-    /// `{test}.repro.failure-dump.json` (auto-repro retry).
+    /// `{test}-{variant_hash}.repro.failure-dump.json` for whichever
+    /// variant the scan classified last (auto-repro retry).
     pub(crate) repro_failure_dump: Option<PathBuf>,
     /// Every `{test}-{variant_hash}.ktstr.json` stats sidecar for
     /// this test, sorted — one per gauntlet variant (distinct
@@ -1432,10 +1434,10 @@ fn split_variant_stem(stem: &str) -> (&str, u64) {
 /// malformed and is dropped (`None`).
 ///
 /// Suffix order is load-bearing: the `.repro.` shapes are checked
-/// BEFORE their bare counterparts so `{test}.repro.failure-dump.json`
+/// BEFORE their bare counterparts so `{test}-{hash}.repro.failure-dump.json`
 /// classifies as [`RunArtifactKind::ReproFailureDump`] with
 /// `test_name = {test}` rather than the bare-`.failure-dump.json`
-/// branch stripping less and yielding `{test}.repro`.
+/// branch stripping less and yielding `{test}-{hash}.repro`.
 fn classify_run_artifact(name: &str) -> Option<(&str, u64, RunArtifactKind)> {
     if let Some(stem) = name.strip_suffix(".repro.failure-dump.json") {
         let (test, hash) = split_variant_stem(stem);
@@ -1491,10 +1493,11 @@ fn summarize_one_run_dir(
     use std::collections::{BTreeMap, BTreeSet};
     #[derive(Default)]
     struct Acc {
-        // Shared per test name (the writer names these `{test}.…`,
-        // not per-variant); for a gauntlet test these reflect
-        // whichever variant ran last. The fail signal below does NOT
-        // rely on them.
+        // The writer names these per-variant (hashed, `{test}-{hash}.…`);
+        // each is a single Option collapsed to whichever variant the
+        // read_dir scan classified last (unsorted order). The fail
+        // signal below does NOT rely on them — it keys off the
+        // per-variant `dump_hashes` set.
         failure_dump: Option<PathBuf>,
         repro_failure_dump: Option<PathBuf>,
         wprof: Option<PathBuf>,
@@ -2963,9 +2966,10 @@ pub(crate) fn finalize_sidecar_verdict(
     }
 }
 
-/// Remove the failure-dump artifacts (`{test}.failure-dump.json` and
-/// `{test}.repro.failure-dump.json`) for `test_name` in the current
-/// sidecar dir.
+/// Remove the failure-dump artifacts
+/// (`{test}-{variant_hash}.failure-dump.json` and
+/// `{test}-{variant_hash}.repro.failure-dump.json`) for `test_name` in
+/// the current sidecar dir.
 ///
 /// Called when a run's FINAL outcome is a pass/skip but it wrote NO
 /// sidecar — the run crashed before the guest produced a parseable

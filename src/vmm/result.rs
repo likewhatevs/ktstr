@@ -1196,8 +1196,8 @@ impl VmResult {
     }
 
     /// Per-test failure-dump sidecar path. Derives
-    /// `{sidecar_dir()}/{entry_name}.failure-dump.json` from
-    /// the macro-stamped [`Self::entry_name`].
+    /// `{sidecar_dir()}/{entry_name}-{variant_hash:016x}.failure-dump.json`
+    /// from the macro-stamped [`Self::entry_name`].
     ///
     /// # Sibling to
     /// [`crate::scenario::Ctx::failure_dump_path`]
