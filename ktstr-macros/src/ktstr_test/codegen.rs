@@ -217,14 +217,17 @@ pub(super) fn emit_entry_static(input: ItemFn, attrs: AttrValues) -> proc_macro2
         None => quote! { ::core::option::Option::None },
     };
 
+    // `bpf_map_write = A` (one const) or `bpf_map_write = [A, B]` (several):
+    // each path is borrowed into a `&[&BpfMapWrite]` slice literal, so the
+    // one-element case reproduces the former single-const `&[&A]` output.
     let bpf_map_write_tokens = match &bpf_map_write {
-        Some(p) => quote! { &[&#p] },
-        None => quote! { &[] },
+        Some(paths) if !paths.is_empty() => quote! { &[ #(&#paths),* ] },
+        _ => quote! { &[] },
     };
 
     // `watch_bpf_maps = LAVD_LAT` where the const is already a
     // `&[&WatchBpfMap]` slice — pass it through verbatim (unlike
-    // `bpf_map_write`, which wraps a single const into a one-element slice).
+    // `bpf_map_write`, which borrows each declared const into a slice).
     let watch_bpf_maps_tokens = match &watch_bpf_maps {
         Some(p) => quote! { #p },
         None => quote! { &[] },

@@ -55,6 +55,33 @@ fn expect_array_of_paths(
     Ok(entries)
 }
 
+/// Accept EITHER a single path (`A`) OR a `[A, B, ...]` array of paths,
+/// returning `Vec<syn::Path>` — a single path yields a one-element vec.
+/// Used by `bpf_map_write`, which may declare one const
+/// (`bpf_map_write = A`) or several (`bpf_map_write = [A, B]`); codegen
+/// wraps each entry in `&[&…]`, so the one-element vec reproduces the
+/// former single-const behaviour exactly. `error_hint` covers both the
+/// wrong top-level shape and a non-path array element.
+fn expect_path_or_array_of_paths(
+    value: &syn::Expr,
+    error_hint: &str,
+) -> Result<Vec<syn::Path>, syn::Error> {
+    match value {
+        syn::Expr::Path(ep) => Ok(vec![ep.path.clone()]),
+        syn::Expr::Array(ea) => {
+            let mut entries = Vec::with_capacity(ea.elems.len());
+            for elem in &ea.elems {
+                match elem {
+                    syn::Expr::Path(ep) => entries.push(ep.path.clone()),
+                    _ => return Err(syn::Error::new_spanned(elem, error_hint)),
+                }
+            }
+            Ok(entries)
+        }
+        _ => Err(syn::Error::new_spanned(value, error_hint)),
+    }
+}
+
 /// Extract the [`String`] value of a `Lit::Str` attribute and
 /// return a spanned diagnostic for any other expression shape.
 /// Used by attributes whose target is `Option<String>` rather than
@@ -426,7 +453,7 @@ pub(crate) struct AttrValues {
     pub(crate) payload: Option<syn::Path>,
     pub(crate) workloads: Option<Vec<syn::Path>>,
     pub(crate) staged_schedulers: Option<Vec<syn::Path>>,
-    pub(crate) bpf_map_write: Option<syn::Path>,
+    pub(crate) bpf_map_write: Option<Vec<syn::Path>>,
     pub(crate) watch_bpf_maps: Option<syn::Path>,
     pub(crate) post_vm: Option<syn::Path>,
     pub(crate) post_vm_unconditional: Option<syn::Path>,
@@ -1235,9 +1262,10 @@ pub(crate) fn ktstr_test_impl(
                         )?);
                     }
                     "bpf_map_write" => {
-                        attrs.bpf_map_write = Some(expect_path_value(
+                        attrs.bpf_map_write = Some(expect_path_or_array_of_paths(
                             value,
-                            "expected path for bpf_map_write (e.g. BPF_CRASH)",
+                            "expected a BpfMapWrite path or [A, B] array for \
+                             bpf_map_write (e.g. BPF_CRASH or [WRITE_A, WRITE_B])",
                         )?);
                     }
                     "watch_bpf_maps" => {
