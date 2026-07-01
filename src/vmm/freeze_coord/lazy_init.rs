@@ -172,8 +172,8 @@ pub(super) fn try_init_prog_per_cpu_offsets(
     // on both supported architectures (kernel-half direct-map KVA on
     // x86_64; high-half delta `pcpu_base_addr - __per_cpu_start +
     // pcpu_unit_offsets[cpu]` whose subtraction inherits bit 63 on
-    // aarch64). Sibling gate in monitor/reader.rs:2637-2640 uses the
-    // same check on the DATA_VALID latch — keeping them in lockstep
+    // aarch64). The sibling bit-63 gate on the DATA_VALID latch in
+    // monitor/reader.rs uses the same check — keeping them in lockstep
     // avoids a class of bugs where one gate accepts a value the
     // other rejects.
     //
@@ -190,7 +190,7 @@ pub(super) fn try_init_prog_per_cpu_offsets(
         // OR (c) cached `phys_base` is stale so `pco_pa` resolves
         // to an unrelated DRAM page reading all-zeros. Emitted at
         // `tracing::warn` with target `ktstr::failure_dump` so it
-        // lands in CI logs alongside the FINAL DIAG block; bounded
+        // lands in the CI failure-dump log; bounded
         // to once per `try_init_prog_per_cpu_offsets` invocation —
         // the caller already gates the retry on a 250 ms
         // scan_tick, so volume is naturally rate-limited.

@@ -2621,16 +2621,6 @@ pub(crate) fn monitor_loop(
     let mut per_cpu_offsets_buf: Vec<u64> = prog_stats_ctx
         .map(|c| c.per_cpu_offsets.clone())
         .unwrap_or_default();
-    // Diagnostic counter for the refresh path. Emits per_cpu_offset[],
-    // rq_pas[], page_offset, runqueues_kva, mem.size, plus a direct
-    // rq_clock read, a phys_base probe, and a 16-byte hex dump for
-    // both the FIRST 5 iterations (catches initial state) AND the
-    // last 5 iterations of an assumed ~300-sample run (catches the
-    // post-guest-boot state). The early window distinguishes wrong
-    // pco_pa / wrong page_offset / wrong BTF rq_clock; the late
-    // window distinguishes "guest never wrote the BSS" from "writes
-    // are invisible to host monitor". Removed once probe-reload lands.
-    let mut diag_iter: u32 = 0;
     // Previous `page_offset_base` read, used by the stability gate
     // below. The bit-63 + canonical-half check alone is too loose:
     // mid-decompression garbage in the bzImage region can satisfy
@@ -3017,13 +3007,6 @@ pub(crate) fn monitor_loop(
             {
                 data_valid = true;
                 latched_page_offset = page_offset;
-                eprintln!(
-                    "DATA_VALID latched at iter={} page_offset={:#x} pco0={:#x} kaslr={:#x}",
-                    diag_iter,
-                    page_offset,
-                    fresh.first().copied().unwrap_or(0),
-                    kaslr_live,
-                );
             }
             rq_pas_buf = super::symbols::compute_rq_pas(
                 refresh.runqueues_kva,
@@ -3040,15 +3023,6 @@ pub(crate) fn monitor_loop(
                 resolve_event_pcpu_pas(mem, ev.scx_root_pa, &ev.event_offsets, &fresh, page_offset)
             });
             per_cpu_offsets_buf = fresh;
-
-            // Iteration counter — used by the DATA_VALID latch
-            // eprintln and the FINAL diagnostic after the loop. We
-            // dropped the per-iteration MONITOR/PHYS_BASE/HEX dumps
-            // because nextest's stderr capture made the 15
-            // eprintlns slower than the timerfd cadence and starved
-            // the loop down to a handful of samples per run.
-            // Saturating to avoid overflow on long runs.
-            diag_iter = diag_iter.saturating_add(1);
         }
 
         // Pre-validity short circuit: skip every guest-memory walk
@@ -3322,62 +3296,6 @@ pub(crate) fn monitor_loop(
                     break;
                 }
             }
-        }
-    }
-    // Final post-loop diagnostic — captures post-boot state once,
-    // after the kill flag flips. Distinguishes "guest never wrote
-    // __per_cpu_offset[]" from "writes invisible to host monitor"
-    // by re-reading the same PAs the early-window diag covered.
-    if let Some(refresh) = rq_refresh {
-        let fresh = super::symbols::read_per_cpu_offsets(mem, refresh.pco_pa, refresh.num_cpus);
-        let valid_samples = samples
-            .iter()
-            .filter(|s| s.cpus.iter().any(|c| c.rq_clock > 0))
-            .count();
-        let pob_pa_live = refresh.page_offset_base_pa.unwrap_or(0);
-        let pob_val = if pob_pa_live != 0 {
-            mem.read_u64(pob_pa_live, 0)
-        } else {
-            0
-        };
-        eprintln!(
-            "FINAL DIAG iters={iters} samples={samples} valid={valid} data_valid={dv} \
-             page_offset={po:#x} phys_base={pb:#x} start_kernel_map={skm:#x} \
-             pco_pa={pco_pa:#x} pob_pa={pob_pa:#x} pob_val={pob_val:#x} \
-             pco0={pco0:#x} pco1={pco1:#x} runqueues_kva={rq:#x} \
-             mem_size={ms:#x} rq_pa0={rq0:#x} kaslr_off={ko:#x}",
-            iters = diag_iter,
-            samples = samples.len(),
-            valid = valid_samples,
-            dv = data_valid,
-            po = page_offset,
-            pb = phys_base,
-            skm = cfg.start_kernel_map,
-            pco_pa = refresh.pco_pa,
-            pob_pa = pob_pa_live,
-            pob_val = pob_val,
-            pco0 = fresh.first().copied().unwrap_or(0),
-            pco1 = fresh.get(1).copied().unwrap_or(0),
-            rq = refresh.runqueues_kva,
-            ms = mem.size(),
-            ko = refresh
-                .kaslr_offset
-                .load(Ordering::Acquire)
-                .saturating_sub(1),
-            rq0 = rq_pas_buf.first().copied().unwrap_or(0),
-        );
-        if let Some(&rq0_pa) = rq_pas_buf.first() {
-            let raw_clock = mem.read_u64(rq0_pa, offsets.rq_clock);
-            let raw_nr_running = mem.read_u32(rq0_pa, offsets.rq_nr_running);
-            // Sanity: read first 8 bytes at rq0_pa (should be nr_running if offset 0 is correct)
-            let raw_first_8 = mem.read_u64(rq0_pa, 0);
-            // Read pco_pa itself to verify __per_cpu_offset[0] value
-            let pco0_verify = mem.read_u64(refresh.pco_pa, 0);
-            eprintln!(
-                "FINAL DIAG rq0: clock_off={} nr_off={} raw_clock={raw_clock} raw_nr={raw_nr_running} \
-                 raw_first_8={raw_first_8:#x} pco0_verify={pco0_verify:#x} rq0_pa={rq0_pa:#x} pco_pa={:#x}",
-                offsets.rq_clock, offsets.rq_nr_running, refresh.pco_pa,
-            );
         }
     }
     let shm_result = crate::vmm::host_comms::BulkDrainResult {
