@@ -990,6 +990,9 @@ impl KtstrVm {
                 host_topology::hugepages_free() >= host_topology::hugepages_needed(mib)
             });
 
+        // `mut` is used only on x86_64, where `vm.pci_enabled` is assigned below;
+        // on aarch64 (no PCI field) `vm` is never mutated after construction.
+        #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut))]
         let mut vm = match self.memory_mib {
             Some(mib) => {
                 if use_hugepages {

@@ -74,6 +74,12 @@ pub(crate) mod freeze_coord;
 pub(crate) mod initramfs_cache;
 pub(crate) mod net_config;
 pub(crate) mod numa_mem;
+// The virtio-PCI transport (host bridge, ECAM/CAM decode, config space) is
+// x86_64-only. aarch64 references only the `PciBus` TYPE — as an always-`None`
+// `Option` in the arch-neutral run loop — so the module compiles there but its
+// host-bridge/ECAM machinery is never called; allow that dead code on non-x86
+// (x86_64 lints the module fully — the allow is gated off there).
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 pub(crate) mod pci;
 pub(crate) mod result;
 pub(crate) mod rust_init;
@@ -83,7 +89,10 @@ pub(crate) mod vcpu;
 pub(crate) mod virtio_blk;
 pub(crate) mod virtio_console;
 // Shared MSI-X interrupt-delivery state (`MsixState`/`IrqSource`/`MsixRouteSink`)
-// for the virtio PCI facades (net + blk).
+// for the virtio PCI facades (net + blk). The device cores use `MsixState` on all
+// arches, but its PCI-only constructors (`new`/`set_eventfd`) are wired only on
+// x86_64, so allow their dead code on non-x86 (x86_64 lints the module fully).
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 pub(crate) mod virtio_msix;
 pub(crate) mod virtio_net;
 
