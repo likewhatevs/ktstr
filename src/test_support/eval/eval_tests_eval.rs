@@ -738,6 +738,7 @@ fn eval_monitor_fail_has_fingerprint() {
             watchdog_observation: None,
             page_offset: 0,
             boot_wait_outcome: crate::monitor::BootWaitOutcome::NotConfigured,
+            scx_event_counters_supported: false,
         }),
         guest_messages: Some(crate::vmm::host_comms::BulkDrainResult {
             entries: vec![crate::test_support::test_helpers::assert_result_tlv_entry(
@@ -1104,6 +1105,7 @@ fn eval_sched_exit_includes_monitor() {
             watchdog_observation: None,
             page_offset: 0,
             boot_wait_outcome: crate::monitor::BootWaitOutcome::NotConfigured,
+            scx_event_counters_supported: false,
         }),
         guest_messages: Some(crate::vmm::host_comms::BulkDrainResult {
             entries: vec![crate::test_support::test_helpers::assert_result_tlv_entry(
@@ -1213,6 +1215,7 @@ fn eval_monitor_fail_includes_sched_log() {
             watchdog_observation: None,
             page_offset: 0,
             boot_wait_outcome: crate::monitor::BootWaitOutcome::NotConfigured,
+            scx_event_counters_supported: false,
         }),
         guest_messages: Some(crate::vmm::host_comms::BulkDrainResult {
             entries: vec![crate::test_support::test_helpers::assert_result_tlv_entry(
@@ -3149,6 +3152,7 @@ fn eval_monitor_inconclusive_folds_into_verdict() {
             watchdog_observation: None,
             page_offset: 0,
             boot_wait_outcome: crate::monitor::BootWaitOutcome::NotConfigured,
+            scx_event_counters_supported: false,
         }),
         guest_messages: Some(crate::vmm::host_comms::BulkDrainResult {
             entries: vec![crate::test_support::test_helpers::assert_result_tlv_entry(

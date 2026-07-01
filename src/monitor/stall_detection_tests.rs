@@ -795,6 +795,7 @@ fn evaluate_suppresses_stuck_when_vcpu_preempted() {
         watchdog_observation: None,
         page_offset: 0,
         boot_wait_outcome: BootWaitOutcome::NotConfigured,
+        scx_event_counters_supported: false,
     };
     let v = t.evaluate(&report);
     assert!(
@@ -870,6 +871,7 @@ fn evaluate_catches_stuck_when_vcpu_running() {
         watchdog_observation: None,
         page_offset: 0,
         boot_wait_outcome: BootWaitOutcome::NotConfigured,
+        scx_event_counters_supported: false,
     };
     let v = t.evaluate(&report);
     assert!(!v.passed, "running vCPU stall must fail: {:?}", v.details);

@@ -378,6 +378,22 @@ pub struct MonitorReport {
     #[doc(hidden)]
     #[serde(default)]
     pub boot_wait_outcome: BootWaitOutcome,
+    /// Whether the running guest kernel structurally supports the
+    /// `SCX_EV_*` sched_ext event counters, decided by whether the
+    /// monitor resolved their BTF offsets (`event_offsets.is_some()`).
+    /// The counters — and the `struct scx_sched` / `scx_root` machinery
+    /// the monitor walks to reach them — are a 6.16-cycle addition, so a
+    /// kernel older than 6.16 (e.g. 6.14) resolves no offsets and this
+    /// is `false`. A BTF-capability probe rather than a version compare,
+    /// so it stays correct across backports. `false` means "no event
+    /// counters exist to capture"; `true` means the kernel exposes them,
+    /// so an empty `event_counters` across the whole run is a capture
+    /// regression rather than an absent feature. Event-counter
+    /// regression tests skip when this is `false` and assert only when
+    /// it is `true`.
+    #[doc(hidden)]
+    #[serde(default)]
+    pub scx_event_counters_supported: bool,
 }
 
 /// Observation of the `scx_sched.watchdog_timeout` override,

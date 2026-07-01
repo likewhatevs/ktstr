@@ -4,8 +4,7 @@
 //! workload under scx-ktstr with `--stall-after=1`, lets the freeze
 //! coordinator capture a `FailureDumpReport`, and asserts the
 //! captured JSON carries the field the test is responsible for
-//! pinning. Five tests cover the capture-pipeline gaps (the
-//! event-counter timeline is gated out under `wprof`, so four run there):
+//! pinning. Five tests cover the capture-pipeline gaps:
 //!
 //! - **DSQ + rq->scx walker**: `dsq_states` and `rq_scx_states`
 //!   in the dump JSON populated from real frozen-VM walk.
@@ -17,10 +16,15 @@
 //!   load-bearing surface for the sched-event capture path. (The
 //!   discrete tracepoint timeline is wired via `TimelineCapture` but
 //!   not yet attached to FailureDumpReport; the event-counter
-//!   timeline is the visible per-tick timeline today.) This test is
-//!   gated out under `wprof`/coverage — its per-tick capture needs the
-//!   guest scheduler to make real-time progress, which CI-host-load
-//!   slowdown starves; it runs in the non-wprof jobs.
+//!   timeline is the visible per-tick timeline today.) Runs on every
+//!   job; it `post_vm_skip`s when (a) the guest kernel lacks the
+//!   SCX_EV_* counters (pre-6.16, e.g. the 6.14 leg — no
+//!   `scx_sched`/`scx_root` in BTF, so `scx_event_counters_supported`
+//!   is false), (b) the per-tick loop captured no samples at all, or
+//!   (c) — on `wprof`/coverage builds only — samples were captured but
+//!   none carried counters (a host-load-starved leg). It asserts on the
+//!   non-`wprof` legs, where a zero capture on a counter-supporting
+//!   kernel is the real regression it guards.
 //! - **SchedPolicy::Deadline**: worker spawned under
 //!   `SchedPolicy::Deadline` reaches `worker_main` without bailing —
 //!   proves the `sched_setattr(2)` syscall path runs end-to-end on
@@ -265,7 +269,6 @@ fn check_perf_counters_capture(result: &VmResult) -> Result<()> {
 /// per-tick capture surface is alive on a real kernel run. Sparkline
 /// rendering on top of this vec is unit-tested elsewhere; this test
 /// pins the integration boundary where unit tests cannot reach.
-#[cfg(not(feature = "wprof"))]
 fn scenario_event_counter_timeline(ctx: &ktstr::scenario::Ctx) -> Result<AssertResult> {
     run_stalled_workload(ctx)
 }
@@ -279,11 +282,27 @@ fn scenario_event_counter_timeline(ctx: &ktstr::scenario::Ctx) -> Result<AssertR
 /// sample stream carries the real per-tick capture, so the assertion
 /// runs against it here. The callback's Err is a hard FAIL
 /// (`PostVmAssertionFailure`) that `expect_err` does not invert.
-#[cfg(not(feature = "wprof"))]
 fn check_event_counter_timeline(result: &VmResult) -> Result<()> {
     let monitor = result.monitor.as_ref().ok_or_else(|| {
         anyhow::anyhow!("VmResult.monitor is None — the monitor sampler produced no report")
     })?;
+    if !monitor.scx_event_counters_supported {
+        // The running guest kernel does not expose the SCX_EV_* event
+        // counters: the monitor resolved no `event_offsets` from BTF
+        // because `struct scx_sched` / `scx_root` — the machinery the
+        // counters live behind — is a 6.16-cycle addition. On such a
+        // kernel (e.g. the 6.14 CI leg) there is nothing to capture, so
+        // the assertion is inapplicable rather than failed. It still
+        // hard-fails on 6.16+/7.1, where the kernel structurally
+        // supports the counters but capture produced none — the real
+        // regression this test guards. A BTF-capability probe, not a
+        // version compare, so it stays correct across backports.
+        return Err(post_vm_skip(
+            "guest kernel lacks the SCX_EV_* event counters (pre-6.16: no \
+             scx_sched/scx_root in BTF); the counter-timeline capture is \
+             inapplicable on this kernel version",
+        ));
+    }
     if monitor.samples.is_empty() {
         // The per-tick loop recorded no sample before the stall fired
         // (load-starved); inconclusive for this assertion.
@@ -303,6 +322,25 @@ fn check_event_counter_timeline(result: &VmResult) -> Result<()> {
         .iter()
         .filter(|s| s.cpus.iter().any(|c| c.event_counters.is_some()))
         .count();
+    if with_events == 0 && cfg!(feature = "wprof") {
+        // wprof/coverage builds run on the host-load-starved CI legs. There
+        // the guest scheduler can fail to attach — or the monitor's
+        // `data_valid` latch can fail to fire — within the sample window, so
+        // no sample carries event counters even though the kernel supports
+        // them. Treat that as inconclusive rather than a failure: a zero
+        // capture under wprof cannot be distinguished from starvation, and
+        // the assertion below is enforced on the non-wprof legs, where a
+        // zero capture on an unstarved host IS the regression this test
+        // guards. (Empirically the fix makes 7.1×wprof assert and pass when
+        // capture is not starved; this only skips the extreme-starvation
+        // tail.)
+        return Err(post_vm_skip(
+            "no monitor sample carried SCX_EV_* counters under a wprof/coverage \
+             build — the host-load-starved vCPUs left the scheduler unattached \
+             for the sample window; inconclusive (the assertion is enforced on \
+             the non-wprof legs)",
+        ));
+    }
     anyhow::ensure!(
         with_events > 0,
         "no monitor sample carried SCX_EV_* event counters across {} samples — \
@@ -1020,14 +1058,6 @@ static __KTSTR_ENTRY_PERF_COUNTERS: ktstr::test_support::KtstrTestEntry =
         ..ktstr::test_support::KtstrTestEntry::DEFAULT
     };
 
-// Gated off under `wprof` (the coverage job runs `wprof` too): the per-tick
-// SCX_EV_* capture needs the guest scheduler to make real-time progress over
-// the 15s window; wprof/coverage slowdown under CI host load starves the vCPUs
-// so no event-counter samples land. Gated at the KTSTR_TESTS entry (what the
-// cargo-ktstr runner discovers and executes) — the nextest shim below and the
-// scenario/post-vm fns are gated to match, so nothing dangles or goes dead
-// under wprof. Runs in the non-wprof jobs.
-#[cfg(not(feature = "wprof"))]
 #[ktstr::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
 #[linkme(crate = ktstr::linkme)]
 static __KTSTR_ENTRY_EVENT_TIMELINE: ktstr::test_support::KtstrTestEntry =
@@ -1183,11 +1213,6 @@ fn vm_integration_perf_counters_capture() {
 /// Asserts `event_counter_timeline` non-empty after a 15s run
 /// window. Pins the per-monitor-tick capture loop + SCX_EV_*
 /// offset resolution + `EventCounterCapture` attach path.
-// Gated off under `wprof` (the coverage job runs `wprof` too): per-tick
-// SCX_EV_* capture needs the guest scheduler to make real-time progress over
-// the 15s window; wprof/coverage slowdown under CI host load starves the vCPUs
-// so no event-counter samples land. Runs in the non-wprof jobs.
-#[cfg(not(feature = "wprof"))]
 #[test]
 #[ignore = "requires KVM, ../linux, scx-ktstr"]
 fn vm_integration_event_counter_timeline() {

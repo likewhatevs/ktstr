@@ -2045,6 +2045,13 @@ pub(crate) struct MonitorLoopResult {
     /// the in-`monitor_loop` test path leaves it `NotConfigured`.
     /// Forwarded to [`super::MonitorReport::boot_wait_outcome`].
     pub(crate) boot_wait_outcome: super::BootWaitOutcome,
+    /// Whether the guest kernel structurally supports the `SCX_EV_*`
+    /// event counters (`KernelOffsets::event_offsets.is_some()`). Like
+    /// `boot_wait_outcome`, this is set by `start_monitor`'s closure —
+    /// which owns the resolved `KernelOffsets` — on the production path;
+    /// the in-`monitor_loop` returns leave it `false`. Forwarded to
+    /// [`super::MonitorReport::scx_event_counters_supported`].
+    pub(crate) scx_event_counters_supported: bool,
 }
 
 /// System-wide PSI-irq host-walk inputs: the resolved `struct psi_group`
@@ -2729,6 +2736,7 @@ pub(crate) fn monitor_loop(
                 page_offset: latched_page_offset,
                 preemption_threshold_ns,
                 boot_wait_outcome: super::BootWaitOutcome::NotConfigured,
+                scx_event_counters_supported: false,
             };
         }
     };
@@ -2744,6 +2752,7 @@ pub(crate) fn monitor_loop(
             page_offset: latched_page_offset,
             preemption_threshold_ns,
             boot_wait_outcome: super::BootWaitOutcome::NotConfigured,
+            scx_event_counters_supported: false,
         };
     }
     let epoll = match Epoll::new() {
@@ -2759,6 +2768,7 @@ pub(crate) fn monitor_loop(
                 page_offset: latched_page_offset,
                 preemption_threshold_ns,
                 boot_wait_outcome: super::BootWaitOutcome::NotConfigured,
+                scx_event_counters_supported: false,
             };
         }
     };
@@ -2779,6 +2789,7 @@ pub(crate) fn monitor_loop(
             page_offset: latched_page_offset,
             preemption_threshold_ns,
             boot_wait_outcome: super::BootWaitOutcome::NotConfigured,
+            scx_event_counters_supported: false,
         };
     }
     if let Err(e) = epoll.ctl(
@@ -2796,6 +2807,7 @@ pub(crate) fn monitor_loop(
             page_offset: latched_page_offset,
             preemption_threshold_ns,
             boot_wait_outcome: super::BootWaitOutcome::NotConfigured,
+            scx_event_counters_supported: false,
         };
     }
     let mut epoll_buf = [EpollEvent::default(); 2];
@@ -3378,6 +3390,7 @@ pub(crate) fn monitor_loop(
         page_offset: latched_page_offset,
         preemption_threshold_ns,
         boot_wait_outcome: super::BootWaitOutcome::NotConfigured,
+        scx_event_counters_supported: false,
     }
 }
 

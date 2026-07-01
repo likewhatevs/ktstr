@@ -11027,6 +11027,16 @@ impl KtstrVm {
         let (Ok(offsets), Ok(symbols)) = (offsets, symbols) else {
             return Ok(None);
         };
+        // BTF-capability probe for the `SCX_EV_*` event counters:
+        // `event_offsets` resolves only on kernels that expose the
+        // `struct scx_sched` / `scx_root` machinery the monitor walks to
+        // reach them (a 6.16-cycle addition); on older kernels (e.g.
+        // 6.14) it is `None`. Captured here where the resolved
+        // `KernelOffsets` is owned, then forwarded onto every
+        // `MonitorLoopResult` this closure produces so `MonitorReport`
+        // consumers can distinguish "counters absent because the kernel
+        // lacks them" from "counters empty because capture regressed".
+        let scx_event_counters_supported = offsets.event_offsets.is_some();
 
         // `watch_bpf_maps` prep: the vmlinux BTF is the split-base for per-map
         // program-BTF loads; `prog_offsets` is cloned because the
@@ -11213,6 +11223,7 @@ impl KtstrVm {
                             page_offset: 0,
                             preemption_threshold_ns,
                             boot_wait_outcome: monitor::BootWaitOutcome::NotConfigured,
+                            scx_event_counters_supported,
                         };
                     }
                     let kill_fd = kill_evt_clone.as_raw_fd();
@@ -11269,6 +11280,7 @@ impl KtstrVm {
                             page_offset: 0,
                             preemption_threshold_ns,
                             boot_wait_outcome: monitor::BootWaitOutcome::NotConfigured,
+                            scx_event_counters_supported,
                         };
                     }
                 }
@@ -11289,54 +11301,13 @@ impl KtstrVm {
                     monitor::symbols::start_kernel_map_for_tcr(tcr_el1_value)
                         .unwrap_or(monitor::symbols::START_KERNEL_MAP);
 
-                // Resolve `phys_base` via a page-table walk through
-                // the live BSP CR3. After the sys_rdy wait above the
-                // BSP has populated `cr3_cache` via its lazy CAS —
-                // `__startup_64` / `__cpu_setup` runs strictly before
-                // userspace init emits SYS_RDY, and the BSP run loop
-                // has executed thousands of iterations by then so
-                // every iteration's CAS attempt has had a chance to
-                // observe a non-zero CR3.
-                //
-                // Race window: in cold-cache or coverage-instrumented
-                // builds the BSP can lag the kernel's userspace-init
-                // emission of SYS_RDY by tens of ms — the freeze
-                // coordinator promotes the SYS_RDY frame to the
-                // monitor's eventfd from its TLV dispatch, which
-                // runs on the freeze coord thread independent of
-                // BSP run-loop progress. If the monitor reads
-                // cr3_cache before the BSP has executed its first
-                // run-loop iteration's lazy CAS, cr3_value is 0
-                // and `phys_base` falls back to 0 for the entire
-                // run. On KASLR builds that turns every text-mapped
-                // PA derivation (pco_pa, scx_root_pa,
-                // page_offset_base_pa) into an out-of-DRAM address;
-                // every subsequent monitor read returns 0 and
-                // `data_valid` never latches. The guest-reported-
-                // phys_base wait below closes the window: by the time
-                // SYS_RDY fires the BSP has been in the run loop for
-                // hundreds of ms in steady state, so the vast
-                // majority of paths resolve on the first poll. Its
-                // bounded budget (30 iterations x 100 ms = 3 s) handles
-                // the pathological case where neither the guest-
-                // reported value nor the cr3-derived resolve ever
-                // returns (early-boot crash, kill before first
-                // iteration); in that case `phys_base` falls back to 0
-                // and the downstream `data_valid` gate keeps every
-                // walk safe.
-                // Wait for guest-reported phys_base. The guest
-                // reads it from /proc/iomem and writes
-                // `phys_base + 1` (biased +1 so the AtomicU64's
-                // initial 0 means "not yet received") to
-                // `/dev/vport0p2`; the host's virtio-console MMIO
-                // handler captures the value inline on the vCPU
-                // thread, independently of the TLV bulk port and the
-                // freeze coordinator's iter1 vmlinux load. The 3 s
-                // budget gives the kernel virtio_console driver time
-                // to complete its multiport handshake under cold-
-                // cache boots; on the fast path the value is already
-                // visible by the time SYS_RDY fires. No KASLR/PTI
-                // page-table walking is needed.
+                // Resolve the guest kernel's `phys_base` (the physical
+                // KASLR load displacement; 0 on non-KASLR boots), used to
+                // derive every kernel-text PA the monitor reads. Sourced
+                // from the guest's authoritative KERN_ADDRS publish, with
+                // a plausibility-gated CR3 page-table walk only as a last
+                // resort — see the inner comments for why the walk is not
+                // the primary path.
                 let phys_base = {
                     let mut pb = 0u64;
                     let pb_fd = {
@@ -11347,7 +11318,24 @@ impl KtstrVm {
                         use std::os::unix::io::AsRawFd;
                         kill_evt_clone.as_raw_fd()
                     };
-                    for _ in 0..30 {
+                    // Wait, event-driven, for the guest's AUTHORITATIVE phys_base.
+                    // rust_init (PID 1) reads it from /proc/iomem and publishes it
+                    // over KERN_ADDRS very early and ALWAYS (0 for a non-KASLR
+                    // kernel, the physical KASLR displacement otherwise), biased
+                    // by +1 into `kern_phys_base_shared` with a `kern_phys_base_evt`
+                    // signal. Block on that eventfd (waking the instant it lands,
+                    // kill-escapable) rather than racing an unreliable CR3
+                    // page-table walk: on a slow/cold boot the walk hits an
+                    // early/stale CR3 or an unpopulated page and reads GARBAGE
+                    // which, latched once into every text-mapped PA, leaves
+                    // data_valid unlatched so NO event_counters / schedstat / scx
+                    // state is captured for the whole run. The ~10s bound is only a
+                    // safety net for the guest-never-published case; warm boots
+                    // wake on the first iteration, and scx_root stays set for the
+                    // full stall-watchdog window (~20s+) so even a slow publish
+                    // leaves ample sampling overlap.
+                    let mut guest_published = false;
+                    for _ in 0..100 {
                         if kill_clone.load(std::sync::atomic::Ordering::Acquire) {
                             break;
                         }
@@ -11356,8 +11344,24 @@ impl KtstrVm {
                         );
                         if biased != 0 {
                             pb = biased.wrapping_sub(1);
+                            guest_published = true;
                             break;
                         }
+                        let mut pfds = [
+                            libc::pollfd { fd: pb_fd, events: libc::POLLIN, revents: 0 },
+                            libc::pollfd { fd: kill_fd, events: libc::POLLIN, revents: 0 },
+                        ];
+                        unsafe { libc::poll(pfds.as_mut_ptr(), 2, 100) };
+                    }
+                    // Last resort: the guest never published (channel failure /
+                    // early crash). Fall back to the CR3 page-table walk, but
+                    // accept its result ONLY if it is a plausible x86_64 KASLR
+                    // phys_base — non-zero, inside guest DRAM, and
+                    // CONFIG_PHYSICAL_ALIGN (2 MiB) aligned — never the high-half /
+                    // unaligned garbage a stale-CR3 walk can return.
+                    if !guest_published
+                        && !kill_clone.load(std::sync::atomic::Ordering::Acquire)
+                    {
                         let cr3_val = cr3.load(std::sync::atomic::Ordering::Acquire);
                         if cr3_val != 0 {
                             let l5 = monitor::symbols::resolve_pgtable_l5(
@@ -11366,16 +11370,11 @@ impl KtstrVm {
                             if let Some(v) = monitor::symbols::resolve_phys_base(
                                 &mem, &symbols, cr3_val, l5, tcr_el1_value,
                             )
-                                && v != 0 {
-                                    pb = v;
-                                    break;
-                                }
+                                && monitor::symbols::plausible_cr3_phys_base(v, mem.size())
+                            {
+                                pb = v;
+                            }
                         }
-                        let mut pfds = [
-                            libc::pollfd { fd: pb_fd, events: libc::POLLIN, revents: 0 },
-                            libc::pollfd { fd: kill_fd, events: libc::POLLIN, revents: 0 },
-                        ];
-                        unsafe { libc::poll(pfds.as_mut_ptr(), 2, 100) };
                     }
                     pb
                 };
@@ -11424,6 +11423,7 @@ impl KtstrVm {
                         page_offset: 0,
                         preemption_threshold_ns,
                         boot_wait_outcome: monitor::BootWaitOutcome::NotConfigured,
+                        scx_event_counters_supported,
                     };
                 }
 
@@ -11524,6 +11524,7 @@ impl KtstrVm {
                         page_offset: 0,
                         preemption_threshold_ns,
                         boot_wait_outcome: monitor::BootWaitOutcome::NotConfigured,
+                        scx_event_counters_supported,
                     };
                 }
 
@@ -11624,18 +11625,14 @@ impl KtstrVm {
                         .unwrap_or(0),
                 )
                 .unwrap_or(start_kernel_map_for_thread);
-                // Use the live BSP CR3 directly (it's already a PA;
-                // no `phys_base`-dependent translation needed). When
-                // the retry above timed out without observing a
-                // non-zero CR3, fall back to the text-symbol
-                // translation of `init_top_pgt` — historical
-                // behaviour, correct on non-KASLR boots. The earlier
-                // post-sys_rdy retry has already waited up to 500 ms
-                // for `cr3_cache` to land (warning if it didn't), so
-                // a second `cr3.load` here would observe the same
-                // value and the post-wait `resolve_phys_base` /
-                // `cr3_pa` derivations are folded back onto the
-                // pre-wait `cr3_value` / `phys_base` directly.
+                // Use the live BSP CR3 directly (it's already a PA; no
+                // `phys_base`-dependent translation needed): re-read
+                // `cr3_cache` here and strip its control bits. When the BSP
+                // never published a non-zero CR3, fall back to
+                // text-translating `init_top_pgt` — historical behaviour,
+                // correct on non-KASLR boots — using the `phys_base` the
+                // evented guest-publish loop above already resolved (with a
+                // plausibility-gated CR3 walk as its last resort).
                 let cr3_latest = cr3.load(std::sync::atomic::Ordering::Acquire);
                 let cr3_pa = if cr3_latest != 0 {
                     // Strip only the CR3 control bits [11:0] (CR3_ADDR_MASK):
@@ -11674,6 +11671,7 @@ impl KtstrVm {
                         page_offset: 0,
                         preemption_threshold_ns,
                         boot_wait_outcome: monitor::BootWaitOutcome::NotConfigured,
+                        scx_event_counters_supported,
                     };
                 }
                 // aarch64 TCR_EL1 (granule + T1SZ) for the
@@ -11753,6 +11751,7 @@ impl KtstrVm {
                         page_offset: 0,
                         preemption_threshold_ns,
                         boot_wait_outcome: monitor::BootWaitOutcome::NotConfigured,
+                        scx_event_counters_supported,
                     };
                 }
 
@@ -11862,6 +11861,11 @@ impl KtstrVm {
                 // not inside monitor_loop (cfg.sys_rdy is None), so stamp
                 // the captured outcome onto the result here.
                 __mlr.boot_wait_outcome = boot_wait_outcome;
+                // Likewise the event-counter capability was decided from
+                // the `KernelOffsets` this closure owns, not inside
+                // monitor_loop; stamp it onto the result here so it
+                // survives to `MonitorReport`.
+                __mlr.scx_event_counters_supported = scx_event_counters_supported;
                 __mlr
             })
             .context("spawn monitor thread")?;
@@ -12714,6 +12718,7 @@ impl KtstrVm {
                     page_offset,
                     preemption_threshold_ns,
                     boot_wait_outcome,
+                    scx_event_counters_supported,
                 }) => {
                     // `preemption_threshold_ns` was resolved once
                     // inside `start_monitor` (and threaded through
@@ -12736,6 +12741,7 @@ impl KtstrVm {
                         watchdog_observation,
                         page_offset,
                         boot_wait_outcome,
+                        scx_event_counters_supported,
                     };
                     (Some(report), drain)
                 }

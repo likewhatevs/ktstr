@@ -201,6 +201,7 @@ fn track_stall_respects_vcpu_preemption_threshold() {
         watchdog_observation: None,
         page_offset: 0,
         boot_wait_outcome: BootWaitOutcome::NotConfigured,
+        scx_event_counters_supported: false,
     };
     let stall = t.track_stall(&report);
     assert_eq!(stall.len(), 1);

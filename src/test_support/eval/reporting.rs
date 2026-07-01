@@ -157,6 +157,7 @@ pub(crate) fn trim_settle_samples(
         watchdog_observation: report.watchdog_observation,
         page_offset: report.page_offset,
         boot_wait_outcome: report.boot_wait_outcome,
+        scx_event_counters_supported: report.scx_event_counters_supported,
     }
 }
 

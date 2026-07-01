@@ -655,6 +655,40 @@ pub(crate) fn resolve_phys_base(
     Some(mem.read_u64(pa, 0))
 }
 
+/// Whether `v` is a plausible x86_64 `phys_base` (physical KASLR load
+/// displacement) resolved from a CR3 page-table walk.
+///
+/// [`resolve_phys_base`] reads whatever `u64` the walk lands on with no
+/// sanity check. On a cold/slow boot the BSP's CR3 can be early, stale,
+/// or point at an unpopulated page, so the walk can return garbage — a
+/// high-half kernel pointer, an unaligned value, or an address past the
+/// end of guest DRAM. Latched once into every text-mapped PA, such
+/// garbage keeps the monitor's `data_valid` gate from ever firing, so
+/// the whole run captures no schedstat / scx / event-counter state.
+/// This gate accepts the walk's result only when it could genuinely be
+/// a `phys_base`:
+/// - non-zero — `0` is the "KASLR disabled" value, which the guest
+///   publishes authoritatively over KERN_ADDRS; the walk fallback is
+///   consulted only for a genuine non-zero displacement;
+/// - less than the guest DRAM offset extent — `mem_size` is the caller's
+///   `GuestMem::size()` (the max DRAM offset+len, `>=` RAM total, may
+///   span an MMIO hole on the NUMA path). `phys_base` is a load offset
+///   *into* DRAM, so a valid value is always below the extent; the bound
+///   is looser only in the safe direction — it never false-rejects a
+///   low-DRAM value and still rejects the high-half-pointer garbage
+///   class;
+/// - 2 MiB aligned (`trailing_zeros() >= 21`) — the kernel loads at a
+///   `CONFIG_PHYSICAL_ALIGN` boundary, whose x86_64 minimum is 2 MiB
+///   (`arch/x86/Kconfig` range `0x200000..0x1000000`), and `__startup_64`
+///   hangs if the load delta is not PMD-aligned, so every real value
+///   clears this bar.
+///
+/// aarch64 never reaches this gate: [`resolve_phys_base`] returns `None`
+/// there (no `phys_base_kva` symbol).
+pub(crate) fn plausible_cr3_phys_base(v: u64, mem_size: u64) -> bool {
+    v != 0 && v < mem_size && v.trailing_zeros() >= 21
+}
+
 /// Read the runtime value of `__pgtable_l5_enabled` from guest memory.
 ///
 /// Returns `true` when the guest kernel uses 5-level paging (LA57),
@@ -1017,6 +1051,39 @@ pub(crate) fn compute_rq_pas(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plausible_cr3_phys_base_accepts_valid_rejects_garbage() {
+        // A representative guest DRAM span; the bound just needs to be a
+        // realistic physical-memory size for the accept/reject cases.
+        let mem_size: u64 = 256 * 1024 * 1024; // 0x1000_0000
+
+        // Accept: real x86_64 KASLR phys_base values are non-zero,
+        // inside DRAM, and 2 MiB (PMD) aligned.
+        assert!(plausible_cr3_phys_base(0x20_0000, mem_size)); // 2 MiB
+        assert!(plausible_cr3_phys_base(0x40_0000, mem_size)); // 4 MiB
+        // The largest 2 MiB-aligned value strictly inside DRAM.
+        assert!(plausible_cr3_phys_base(mem_size - 0x20_0000, mem_size));
+
+        // Reject 0: the "KASLR disabled" value the guest publishes
+        // authoritatively — never accepted from the CR3-walk fallback.
+        assert!(!plausible_cr3_phys_base(0, mem_size));
+
+        // Reject the high-half garbage class a stale-CR3 walk returns:
+        // a kernel-VA-shaped value (2 MiB-aligned, so it clears the
+        // alignment bar) far past the end of DRAM, caught by the size
+        // bound. The observed real-world garbage was of this shape.
+        assert!(!plausible_cr3_phys_base(0xffff_8880_0000_0000, mem_size));
+        // Reject a value exactly at the DRAM span end — a load offset
+        // into DRAM cannot reach the end of the span.
+        assert!(!plausible_cr3_phys_base(mem_size, mem_size));
+
+        // Reject in-range but not 2 MiB aligned: __startup_64 requires
+        // PMD alignment, so an unaligned value cannot be a real
+        // phys_base.
+        assert!(!plausible_cr3_phys_base(0x10_0000, mem_size)); // 1 MiB (2^20)
+        assert!(!plausible_cr3_phys_base(0x20_1000, mem_size)); // 2 MiB + 4 KiB
+    }
 
     #[test]
     fn find_runqueues_symbol() {
