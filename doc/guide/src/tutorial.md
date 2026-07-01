@@ -955,7 +955,7 @@ struct fields appear inline, with `→` between fentry-captured
 entry values and fexit-captured exit values:
 
 ```text
-ktstr_test 'demo_host_crash_auto_repro' [sched=scx-ktstr] [topo=1n1l4c1t] failed:
+ktstr_test 'bpf_crash_auto_repro_e2e' [sched=scx-ktstr] [topo=1n1l4c1t] failed:
   scheduler died
 
 --- auto-repro ---
@@ -988,8 +988,8 @@ ktstr_test 'demo_host_crash_auto_repro' [sched=scx-ktstr] [topo=1n1l4c1t] failed
 ```
 
 For the probe pipeline architecture, the BTF resolution path,
-event-stitching rules, and the `demo_host_crash_auto_repro`
-fixture, see [Auto-Repro](running-tests/auto-repro.md).
+event-stitching rules, and the `bpf_crash_auto_repro_e2e`
+test, see [Auto-Repro](running-tests/auto-repro.md).
 
 ### Failure dumps with cast-recovered pointers
 

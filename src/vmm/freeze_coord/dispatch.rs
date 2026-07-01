@@ -65,6 +65,21 @@ pub(super) struct BulkDispatchSinks<'a> {
     /// `epoll_wait` returns within microseconds rather than waiting
     /// up to one full poll interval.
     pub kill_evt: &'a Arc<EventFd>,
+    /// True when THIS run is a wprof run (`freeze_coord_wprof`). While
+    /// set, the SchedExit arm SKIPS the kill promotion: on a self-crash
+    /// the still-live guest sched-exit monitor sends SCHED_EXIT during
+    /// Phase 5 (before Phase 6 stops it), and an unconditional kill here
+    /// would tear the coordinator down before the guest's Phase-5 wprof
+    /// ship. Gating on the RUN being wprof (not on the grace deadline
+    /// already being armed) closes an arming-order race: the SchedExit
+    /// can be dispatched in the SAME coord iteration as — or before — the
+    /// error-exit arm sets `wprof_ship_deadline`, so a deadline snapshot
+    /// would be stale and promote the kill anyway. Instead the coord arms
+    /// the grace on the drained SchedExit (or the error-exit dump), and
+    /// terminates on the WprofTrace frame or the `WPROF_SHIP_GRACE`
+    /// backstop. The SchedExit verdict entry is still bucketed; only the
+    /// kill promotion holds off.
+    pub run_is_wprof: bool,
     /// Boot-complete signal. Promoted exactly once on the first
     /// CRC-valid empty-payload `MSG_TYPE_SYS_RDY` frame; the
     /// `Option::take` retains the host-side handle until that point
@@ -266,20 +281,39 @@ pub(super) fn dispatch_bulk_message(
             // instead of running until the watchdog deadline. CRC
             // failures DO NOT promote — a torn frame would otherwise
             // let a hostile guest force a false early exit.
+            // Skip the kill promotion on a wprof run (run_is_wprof): on a
+            // self-crash the still-live guest sched-exit monitor sends
+            // SCHED_EXIT during Phase 5. This frame can arrive in the SAME
+            // coord iteration as — or before — the error-exit arm sets the
+            // grace deadline, so gating on "grace already armed" would race
+            // and promote the kill anyway. Gate on the RUN being wprof
+            // instead; the coord arms the grace on this drained SchedExit
+            // (see the coord loop) or the error-exit dump, and terminates
+            // on the WprofTrace frame or the WPROF_SHIP_GRACE backstop.
+            // Promoting the kill here would tear the coordinator down
+            // before the Phase-5 wprof ship. The verdict entry is still
+            // bucketed below.
             if msg.crc_ok {
-                sinks.kill.store(true, Ordering::Release);
-                // EFD_NONBLOCK on a freshly-created eventfd never
-                // legitimately fails; log unconditionally so a future
-                // regression (e.g. the eventfd was closed by another
-                // owner) surfaces in the host log instead of silently
-                // swallowing the kill edge.
-                if let Err(e) = sinks.kill_evt.write(1) {
-                    tracing::warn!(
-                        err = %e,
-                        "freeze_coord: kill_evt write on SCHED_EXIT \
-                         promotion failed; the kill AtomicBool above is \
-                         still authoritative"
+                if sinks.run_is_wprof {
+                    eprintln!(
+                        "freeze_coord: SchedExit received; kill SKIPPED (wprof run; grace armed on drain)"
                     );
+                } else {
+                    eprintln!("freeze_coord: SchedExit received; kill PROMOTED");
+                    sinks.kill.store(true, Ordering::Release);
+                    // EFD_NONBLOCK on a freshly-created eventfd never
+                    // legitimately fails; log unconditionally so a future
+                    // regression (e.g. the eventfd was closed by another
+                    // owner) surfaces in the host log instead of silently
+                    // swallowing the kill edge.
+                    if let Err(e) = sinks.kill_evt.write(1) {
+                        tracing::warn!(
+                            err = %e,
+                            "freeze_coord: kill_evt write on SCHED_EXIT \
+                             promotion failed; the kill AtomicBool above is \
+                             still authoritative"
+                        );
+                    }
                 }
             }
             // SchedExit is verdict data — bucket only on CRC-valid
@@ -762,9 +796,9 @@ pub(super) fn dispatch_bulk_message(
         Some(other) if !other.is_coordinator_internal() => {
             // Every other typed verdict-bearing variant
             // (StepEnd, Exit, TestResult, Crash, PayloadMetrics,
-            // RawPayloadOutput, Profraw, Stdout, Stderr, SchedLog,
-            // Lifecycle, ExecExit, Dmesg, ProbeOutput) accumulates
-            // into the bucket verbatim. (ExecExit is listed for
+            // RawPayloadOutput, Profraw, WprofTrace, WprofTraceChunk,
+            // Stdout, Stderr, SchedLog, Lifecycle, ExecExit, Dmesg,
+            // ProbeOutput) accumulates into the bucket verbatim. (ExecExit is listed for
             // completeness but is shell-mode-only -- sent only by
             // `cargo ktstr shell --exec` and consumed host-side by
             // `KtstrVm::run_interactive`, not the freeze coordinator;

@@ -820,7 +820,10 @@ pub(crate) fn overcommit_skip_reason(
 /// slack absorbs the small extra host wall-clock a short workload
 /// accrues under time-slicing. [`COLD_BTF_PHASE1_BUDGET`] is added when
 /// the entry declares a `bpf_map_write` (the guest blocks on the host's
-/// cold-BTF accessor build before the workload starts).
+/// cold-BTF accessor build before the workload starts), and
+/// [`crate::vmm::freeze_coord::WPROF_SHIP_GRACE`] when it declares
+/// `wprof` (a crashing scheduler's late Phase-5 trace ship is held for
+/// that window before teardown).
 pub(crate) fn vm_timeout_from_entry(entry: &super::entry::KtstrTestEntry) -> Duration {
     let mut base = entry
         .watchdog_timeout
@@ -828,6 +831,14 @@ pub(crate) fn vm_timeout_from_entry(entry: &super::entry::KtstrTestEntry) -> Dur
         .max(Duration::from_secs(1));
     if !entry.bpf_map_write.is_empty() {
         base += COLD_BTF_PHASE1_BUDGET;
+    }
+    // A wprof entry's scheduler may crash; on an error-class exit the
+    // freeze coordinator holds the VM open up to `WPROF_SHIP_GRACE` for
+    // the guest's late Phase-5 wprof trace ship before killing. Add that
+    // window to the host budget so a late crash's full ship grace fits
+    // inside the watchdog deadline (mirrors COLD_BTF_PHASE1_BUDGET).
+    if entry.wprof {
+        base += crate::vmm::freeze_coord::WPROF_SHIP_GRACE;
     }
     let vcpus = entry.topology.total_cpus();
     let oversub = overcommit_ratio(
@@ -999,7 +1010,7 @@ pub(crate) fn build_vm_builder_base(
     for bpf_write in entry.bpf_map_write {
         builder = builder.bpf_map_write(
             bpf_write.map_name_suffix(),
-            bpf_write.offset(),
+            bpf_write.field(),
             bpf_write.value(),
         );
     }
@@ -1061,7 +1072,7 @@ mod tests {
     #[test]
     fn vm_timeout_from_entry_adds_cold_btf_budget_for_bpf_map_write() {
         use super::super::entry::{BpfMapWrite, KtstrTestEntry};
-        static W: BpfMapWrite = BpfMapWrite::new(".bss", 0, 0);
+        static W: BpfMapWrite = BpfMapWrite::new(".bss", "crash", 0);
         static WS: &[&BpfMapWrite] = &[&W];
         let no_write = KtstrTestEntry {
             name: "no_write",

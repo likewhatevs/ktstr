@@ -459,10 +459,12 @@ fn extract_not_attached_reason(
 /// here too would write the same payload twice and make
 /// `llvm-profdata merge` double-count the counters.
 ///
-/// Mirrors the primary VM's per-frame dispatch in
-/// `crate::test_support::eval::run_ktstr_test_inner_impl`. Only
-/// the persistable-to-disk variants unique to this path are
-/// replicated here — Stimulus, PayloadMetrics, and RawPayloadOutput
+/// Mirrors the primary VM's wprof reassembly in
+/// `crate::test_support::eval::run_ktstr_test_inner_impl` — both call
+/// [`crate::test_support::wprof::reassemble_wprof_trace`] over the full
+/// bulk drain so a chunked trace is concatenated, not truncated to its
+/// terminal frame. Only the wprof trace unique to this path is
+/// persisted here — Stimulus, PayloadMetrics, and RawPayloadOutput
 /// frames from the auto-repro run are intentionally NOT extracted
 /// because they're a duplicate of the primary's and the verdict
 /// context only applies to the primary's drain.
@@ -483,6 +485,11 @@ fn extract_not_attached_reason(
 /// `sidecar_dir()`'s by binary lineage. Within a single binary,
 /// `KtstrTestEntry::name` is unique per test fn (the
 /// `#[ktstr_test]` macro derives it from the fn's module-path).
+///
+/// Gated on `wprof`: the only artifact written here is the wprof trace, and
+/// the reassembly helper lives in the wprof-gated `test_support::wprof`
+/// module. A non-wprof build skips both the fn and its call site.
+#[cfg(feature = "wprof")]
 fn write_auto_repro_sidecar_artifacts(
     entry: &KtstrTestEntry,
     repro_result: &crate::vmm::result::VmResult,
@@ -490,33 +497,32 @@ fn write_auto_repro_sidecar_artifacts(
     let Some(drain) = repro_result.guest_messages.as_ref() else {
         return;
     };
-    for bulk_entry in &drain.entries {
-        let kind = crate::vmm::wire::MsgType::from_wire(bulk_entry.msg_type);
-        if let Some(crate::vmm::wire::MsgType::WprofTrace) = kind
-            && bulk_entry.crc_ok
-            && !bulk_entry.payload.is_empty()
-        {
-            // Variant-keyed name matching VmResult::repro_wprof_pb_path
-            // (the reader the expect_auto_repro inversion resolves).
-            // repro_result.variant_hash is stamped by attempt_auto_repro
-            // to the primary's host-authoritative hash; the
-            // writer==reader invariant is pinned by a regression test.
-            let wprof_path = crate::test_support::sidecar::sidecar_dir().join(format!(
-                "{}-{:016x}.repro.wprof.pb",
-                entry.name, repro_result.variant_hash
-            ));
-            if let Err(e) = std::fs::create_dir_all(
-                wprof_path
-                    .parent()
-                    .expect("sidecar_dir join always has parent"),
-            ) {
-                eprintln!("ktstr_test: auto-repro: create sidecar dir for wprof trace: {e}",);
-            } else if let Err(e) = std::fs::write(&wprof_path, &bulk_entry.payload) {
-                eprintln!(
-                    "ktstr_test: auto-repro: write wprof trace to {}: {e}",
-                    wprof_path.display(),
-                );
-            }
+    // Reassemble the (possibly chunked) wprof trace: the guest ships a trace
+    // larger than one bulk frame as N-1 WprofTraceChunk slices followed by a
+    // terminal WprofTrace; `reassemble_wprof_trace` concatenates them in
+    // arrival order and returns `None` when no terminal frame arrived or the
+    // trace is empty (skip-on-absent, matching the pre-chunking behavior).
+    if let Some(pb) = crate::test_support::wprof::reassemble_wprof_trace(&drain.entries) {
+        // Variant-keyed name matching VmResult::repro_wprof_pb_path
+        // (the reader the expect_auto_repro inversion resolves).
+        // repro_result.variant_hash is stamped by attempt_auto_repro
+        // to the primary's host-authoritative hash; the
+        // writer==reader invariant is pinned by a regression test.
+        let wprof_path = crate::test_support::sidecar::sidecar_dir().join(format!(
+            "{}-{:016x}.repro.wprof.pb",
+            entry.name, repro_result.variant_hash
+        ));
+        if let Err(e) = std::fs::create_dir_all(
+            wprof_path
+                .parent()
+                .expect("sidecar_dir join always has parent"),
+        ) {
+            eprintln!("ktstr_test: auto-repro: create sidecar dir for wprof trace: {e}",);
+        } else if let Err(e) = std::fs::write(&wprof_path, &pb) {
+            eprintln!(
+                "ktstr_test: auto-repro: write wprof trace to {}: {e}",
+                wprof_path.display(),
+            );
         }
     }
 }
@@ -944,17 +950,19 @@ fn format_repro_output(
     auto_repro_start: Instant,
     repro_dump_path: &Path,
 ) -> Option<String> {
-    // Write the auto-repro VM's sidecar artifacts (wprof Perfetto
-    // trace + profraw coverage) BEFORE classify_repro_vm_status
-    // consumes the drain for lifecycle signalling. Mirrors the
-    // primary VM's crate::test_support::eval per-frame dispatch but writes wprof under
-    // `${entry.name}-${variant_hash}.repro.wprof.pb` so primary + repro artifacts
-    // coexist on disk (matches the `.repro.` infix every other
-    // repro-VM sidecar already uses). Without this hop the
-    // auto-repro VM's wprof bytes would be silently dropped — the
-    // host already paid the capture cost in the guest, throwing the
-    // data away would mask exactly the bug the auto-repro VM was
-    // booted to reproduce.
+    // Write the auto-repro VM's wprof Perfetto trace BEFORE
+    // classify_repro_vm_status consumes the drain for lifecycle
+    // signalling. Reassembles the (possibly chunked) trace like the
+    // primary VM's `crate::test_support::eval` wprof handler but writes it
+    // under `${entry.name}-${variant_hash}.repro.wprof.pb` so primary +
+    // repro artifacts coexist on disk (matches the `.repro.` infix every
+    // other repro-VM sidecar already uses). Without this hop the auto-repro
+    // VM's wprof bytes would be silently dropped — the host already paid the
+    // capture cost in the guest, throwing the data away would mask exactly
+    // the bug the auto-repro VM was booted to reproduce. wprof-gated: the
+    // only sidecar written here is the wprof trace (profraw from the repro
+    // run is persisted centrally by `crate::vmm::KtstrVm::run`, not here).
+    #[cfg(feature = "wprof")]
     write_auto_repro_sidecar_artifacts(entry, repro_result);
 
     // Forward guest stderr (COM1) and bulk-port stdout probe lines when verbose.

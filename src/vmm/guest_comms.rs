@@ -225,7 +225,13 @@ fn write_msg(msg_type: u32, payload: &[u8]) -> bool {
 /// `writev(2)` with two `iovec` slices, avoiding a per-call concat
 /// allocation. The host's [`super::bulk::HostAssembler`] tolerates
 /// partial frames in the byte stream, so any per-iovec virtqueue
-/// submissions reassemble correctly.
+/// submissions reassemble correctly. The kernel virtio_console driver
+/// caps each write at 32 KiB (`port_fops_write` does `count = min(32*1024,
+/// count)` and returns the capped byte count), so a frame larger than
+/// 32 KiB — e.g. a [`MsgType::WprofTraceChunk`] up to
+/// [`super::bulk::MAX_BULK_FRAME_PAYLOAD`] — ALWAYS spans multiple `writev`
+/// iterations; the `advance_slices` loop below is REQUIRED for correctness,
+/// not merely a partial-writev nicety.
 fn write_to_bulk_port(msg_type: u32, payload: &[u8]) -> bool {
     // Test-only: record that the guest-only write path was entered.
     // Reached only after `write_msg`'s `is_guest()` gate passes, so a
@@ -483,10 +489,65 @@ pub fn send_profraw(buf: &[u8]) {
     write_msg(MsgType::Profraw.wire_value(), buf);
 }
 
+/// Plan the bulk frames for a wprof trace of `buf`, splitting at `cap`
+/// bytes per frame: all but the last slice are tagged
+/// [`MsgType::WprofTraceChunk`], the last is the terminal
+/// [`MsgType::WprofTrace`]. An empty `buf` yields exactly one empty terminal
+/// `WprofTrace` frame (matching the pre-chunking single-frame behavior). A
+/// `buf` that fits in one `cap`-byte frame yields a lone terminal
+/// `WprofTrace` (no chunks), so the host reassembly
+/// ([`crate::test_support::wprof::reassemble_wprof_trace`]) is a no-op for it.
+///
+/// Split out from [`send_wprof_trace`] with `cap` as a parameter so the
+/// chunk→reassemble roundtrip is tested against the exact production split —
+/// production passes [`crate::vmm::bulk::MAX_BULK_FRAME_PAYLOAD`]; the
+/// roundtrip test passes a small cap for cheap multi-frame coverage plus the
+/// real cap at its boundary.
+///
+/// `cap` MUST be > 0 (`slice::chunks(0)` panics). Not reachable from any
+/// caller — production passes the non-zero `MAX_BULK_FRAME_PAYLOAD` const and
+/// tests pass fixed non-zero caps — so this is a `debug_assert`, not a guest-
+/// reachable check (`cap` is host-chosen, never guest input).
+#[cfg(feature = "wprof")]
+pub(crate) fn wprof_trace_frames(buf: &[u8], cap: usize) -> Vec<(u32, &[u8])> {
+    debug_assert!(cap > 0, "wprof_trace_frames: cap must be > 0 (chunks(0) panics)");
+    let mut it = buf.chunks(cap).peekable();
+    if it.peek().is_none() {
+        // Empty trace: one empty terminal frame.
+        return vec![(MsgType::WprofTrace.wire_value(), &buf[..0])];
+    }
+    let mut frames = Vec::new();
+    while let Some(chunk) = it.next() {
+        let msg_type = if it.peek().is_none() {
+            MsgType::WprofTrace.wire_value()
+        } else {
+            MsgType::WprofTraceChunk.wire_value()
+        };
+        frames.push((msg_type, chunk));
+    }
+    frames
+}
+
 /// Send a wprof Perfetto-format trace blob to the host.
+///
+/// A wprof `.pb` larger than the single-frame bulk-port ceiling
+/// ([`crate::vmm::bulk::MAX_BULK_FRAME_PAYLOAD`], 16 MiB) is split by
+/// [`wprof_trace_frames`] into `WprofTraceChunk` slices + a terminal
+/// `WprofTrace`; the host concatenates them to reconstruct the `.pb`. CHUNK,
+/// never cap — no trace bytes are dropped (an oversized single frame would
+/// otherwise be silently dropped by the host `HostAssembler`).
 #[cfg(feature = "wprof")]
 pub fn send_wprof_trace(buf: &[u8]) {
-    write_msg(MsgType::WprofTrace.wire_value(), buf);
+    let cap = crate::vmm::bulk::MAX_BULK_FRAME_PAYLOAD as usize;
+    for (msg_type, chunk) in wprof_trace_frames(buf, cap) {
+        if !write_msg(msg_type, chunk) {
+            eprintln!(
+                "ktstr: send_wprof_trace: bulk-port write failed at a {}-byte frame — wprof trace truncated",
+                chunk.len()
+            );
+            return;
+        }
+    }
 }
 
 /// Send a stimulus event from the guest step executor.

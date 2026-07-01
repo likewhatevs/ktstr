@@ -1777,6 +1777,50 @@ fn resolve_map_field_offset_width_bss_datasec_dotpath() {
     );
 }
 
+/// A `.bss` DATASEC value type whose section variable is a BARE SCALAR
+/// (`int crash`, not a struct) queried with NO dot-path: the resolver
+/// returns the var's section offset and the scalar's own width. This is the
+/// exact arm the host BPF-map write path resolves through for the
+/// scheduler's `crash`/`stall` `.bss` globals
+/// (`BpfMapWrite::new(".bss", "crash", …)`); the sibling dotpath test above
+/// only covers the struct-descend arm, and the struct-value test only the
+/// named-struct arm.
+#[test]
+fn resolve_map_field_offset_width_bss_datasec_bare_scalar() {
+    let (strings, off) = build_strtab(&["int", "crash", ".bss"]);
+    let (intn, crash_var, bss) = (off[0], off[1], off[2]);
+    let types = vec![
+        CastSynType::Int {
+            name_off: intn,
+            size: 4,
+            encoding: 1, // BTF_INT_SIGNED, like a C `int`
+            offset: 0,
+            bits: 32,
+        }, // id 1: int
+        CastSynType::Var {
+            name_off: crash_var,
+            type_id: 1,
+            linkage: 1,
+        }, // id 2: global `crash`
+        CastSynType::Datasec {
+            name_off: bss,
+            size: 256,
+            vars: vec![(2, 216, 4)],
+        }, // id 3: .bss
+    ];
+    let btf = Btf::from_bytes(&cast_build_btf(&types, &strings)).expect("synthetic btf");
+    // The .bss DATASEC value type id is 3; `crash` sits at section offset
+    // 216 and is a 4-byte scalar -> Some((216, 4)).
+    assert_eq!(
+        resolve_map_field_offset_width(&btf, 3, "crash"),
+        Some((216, 4))
+    );
+    // An unknown bare var bails.
+    assert_eq!(resolve_map_field_offset_width(&btf, 3, "nope"), None);
+    // A dot-path into a scalar (no struct to descend) bails.
+    assert_eq!(resolve_map_field_offset_width(&btf, 3, "crash.x"), None);
+}
+
 /// The resolver rejects a non-integer leaf (a struct member) and a bitfield
 /// leaf — both documented `None` outcomes — but still descends THROUGH a
 /// struct member to an integer leaf.

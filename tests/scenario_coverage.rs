@@ -364,10 +364,6 @@ fn cover_watchdog_long_timeout_survives(ctx: &Ctx) -> Result<AssertResult> {
 
 // -- watchdog forced stall (expects scheduler death) --
 
-fn scenario_sched_mixed(ctx: &Ctx) -> Result<AssertResult> {
-    ktstr::scenario::basic::custom_sched_mixed(ctx)
-}
-
 fn scenario_forced_failure(ctx: &Ctx) -> Result<AssertResult> {
     let mut r = ktstr::scenario::basic::custom_sched_mixed(ctx)?;
 
@@ -392,7 +388,7 @@ fn scenario_yield_heavy(ctx: &Ctx) -> Result<AssertResult> {
     execute_steps(ctx, steps)
 }
 
-static BPF_CRASH: BpfMapWrite = BpfMapWrite::new(".bss", 4, 1);
+static BPF_CRASH: BpfMapWrite = BpfMapWrite::new(".bss", "crash", 1);
 
 /// scx-error matcher for the two plain-`expect_err` BPF_CRASH negative
 /// tests (`neg_crash_after_auto_repro`, `neg_host_crash_auto_repro`).
@@ -409,11 +405,6 @@ static BPF_CRASH: BpfMapWrite = BpfMapWrite::new(".bss", 4, 1);
 /// dmesg-backed scx-error matcher is the reliable surface — the same
 /// one `neg_expect_scx_bpf_error_contains_e2e` uses. `expect_err: true`
 /// is required alongside it (validated in `KtstrTestEntry`).
-///
-/// Gated off under `wprof` alongside its only users below
-/// (`neg_crash_after_auto_repro` / `neg_host_crash_auto_repro`), so it does
-/// not become dead code there.
-#[cfg(not(feature = "wprof"))]
 const CRASH_ASSERT: ktstr::assert::Assert = ktstr::assert::Assert {
     expect_scx_bpf_error_contains: Some("ktstr: host-triggered crash"),
     ..ktstr::assert::Assert::NO_OVERRIDES
@@ -423,7 +414,7 @@ const CRASH_ASSERT: ktstr::assert::Assert = ktstr::assert::Assert {
 #[linkme(crate = ktstr::linkme)]
 static __KTSTR_ENTRY_FORCED_STALL: KtstrTestEntry = KtstrTestEntry {
     name: "cover_watchdog_forced_stall",
-    func: scenario_sched_mixed,
+    func: ktstr::scenario::basic::custom_crash_light,
     topology: TOPO_1L_4C_1T,
     scheduler: &KTSTR_SCHED,
     extra_sched_args: &["--stall-after", "1"],
@@ -437,7 +428,7 @@ static __KTSTR_ENTRY_FORCED_STALL: KtstrTestEntry = KtstrTestEntry {
 #[linkme(crate = ktstr::linkme)]
 static __KTSTR_ENTRY_STALL_DETECT: KtstrTestEntry = KtstrTestEntry {
     name: "neg_stall_detection_scx_exit",
-    func: scenario_sched_mixed,
+    func: ktstr::scenario::basic::custom_crash_light,
     topology: TOPO_1L_4C_1T,
     scheduler: &KTSTR_SCHED,
     auto_repro: false,
@@ -451,7 +442,7 @@ static __KTSTR_ENTRY_STALL_DETECT: KtstrTestEntry = KtstrTestEntry {
 #[linkme(crate = ktstr::linkme)]
 static __KTSTR_ENTRY_SCHED_DEATH: KtstrTestEntry = KtstrTestEntry {
     name: "neg_sched_death_no_check_result",
-    func: scenario_sched_mixed,
+    func: ktstr::scenario::basic::custom_crash_light,
     topology: TOPO_1L_4C_1T,
     scheduler: &KTSTR_SCHED,
     extra_sched_args: &["--stall-after", "1"],
@@ -472,19 +463,11 @@ static __KTSTR_ENTRY_AUTO_REPRO_CHECK: KtstrTestEntry = KtstrTestEntry {
     ..KtstrTestEntry::DEFAULT
 };
 
-// Gated off under `wprof` (the coverage job runs `wprof` too): the injected
-// crash and its `scx_bpf_error` match are timing-sensitive — under CI host
-// load, wprof/coverage slowdown lets the VM watchdog fire before the crash
-// propagates to the error corpus, so the negative assertion flakes. The
-// crash-injection path stays covered by `demo_bpf_crash_auto_repro` (same
-// func + `BPF_CRASH`, no assert) plus the `evaluate_scx_bpf_error_match_*`
-// host unit tests; the full negative assertion runs in the non-wprof jobs.
-#[cfg(not(feature = "wprof"))]
 #[ktstr::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
 #[linkme(crate = ktstr::linkme)]
 static __KTSTR_ENTRY_CRASH_AFTER: KtstrTestEntry = KtstrTestEntry {
     name: "neg_crash_after_auto_repro",
-    func: scenario_sched_mixed,
+    func: ktstr::scenario::basic::custom_crash_light,
     topology: TOPO_1L_4C_1T,
     scheduler: &KTSTR_SCHED,
     bpf_map_write: &[&BPF_CRASH],
@@ -493,22 +476,6 @@ static __KTSTR_ENTRY_CRASH_AFTER: KtstrTestEntry = KtstrTestEntry {
     ..KtstrTestEntry::DEFAULT
 };
 
-#[ktstr::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
-#[linkme(crate = ktstr::linkme)]
-static __KTSTR_ENTRY_DEMO_BPF_CRASH: KtstrTestEntry = KtstrTestEntry {
-    name: "demo_bpf_crash_auto_repro",
-    func: scenario_sched_mixed,
-    topology: TOPO_1L_4C_1T,
-    scheduler: &KTSTR_SCHED,
-    bpf_map_write: &[&BPF_CRASH],
-    ..KtstrTestEntry::DEFAULT
-};
-
-// Gated off under `wprof` for the same timing reason as the crash entries
-// above (injected `BPF_CRASH` + `scx_bpf_error` match); runs in the non-wprof
-// jobs, with the matcher itself covered by the `evaluate_scx_bpf_error_match_*`
-// unit tests.
-#[cfg(not(feature = "wprof"))]
 #[ktstr_test(
     scheduler = KTSTR_SCHED,
     llcs = 1,
@@ -520,12 +487,9 @@ static __KTSTR_ENTRY_DEMO_BPF_CRASH: KtstrTestEntry = KtstrTestEntry {
     expect_scx_bpf_error_matches = r"ktstr:\s+host-triggered\s+crash",
 )]
 fn neg_expect_scx_bpf_error_matches_e2e(ctx: &Ctx) -> Result<AssertResult> {
-    ktstr::scenario::basic::custom_sched_mixed(ctx)
+    ktstr::scenario::basic::custom_crash_light(ctx)
 }
 
-// Gated off under `wprof` for the same timing reason as
-// `neg_expect_scx_bpf_error_matches_e2e` above; runs in the non-wprof jobs.
-#[cfg(not(feature = "wprof"))]
 #[ktstr_test(
     scheduler = KTSTR_SCHED,
     llcs = 1,
@@ -537,13 +501,9 @@ fn neg_expect_scx_bpf_error_matches_e2e(ctx: &Ctx) -> Result<AssertResult> {
     expect_scx_bpf_error_contains = "ktstr: host-triggered crash",
 )]
 fn neg_expect_scx_bpf_error_contains_e2e(ctx: &Ctx) -> Result<AssertResult> {
-    ktstr::scenario::basic::custom_sched_mixed(ctx)
+    ktstr::scenario::basic::custom_crash_light(ctx)
 }
 
-// Gated off under `wprof` for the same timing reason as
-// `neg_crash_after_auto_repro` above; covered by `demo_host_crash_auto_repro`
-// + the matcher unit tests + the non-wprof jobs.
-#[cfg(not(feature = "wprof"))]
 #[ktstr::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
 #[linkme(crate = ktstr::linkme)]
 static __KTSTR_ENTRY_HOST_CRASH: KtstrTestEntry = KtstrTestEntry {
@@ -557,16 +517,34 @@ static __KTSTR_ENTRY_HOST_CRASH: KtstrTestEntry = KtstrTestEntry {
     ..KtstrTestEntry::DEFAULT
 };
 
-#[ktstr::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
-#[linkme(crate = ktstr::linkme)]
-static __KTSTR_ENTRY_DEMO_HOST_CRASH: KtstrTestEntry = KtstrTestEntry {
-    name: "demo_host_crash_auto_repro",
-    func: scenario_yield_heavy,
-    topology: TOPO_1L_4C_1T,
-    scheduler: &KTSTR_SCHED,
-    bpf_map_write: &[&BPF_CRASH],
-    ..KtstrTestEntry::DEFAULT
-};
+// A real host-injected crash drives the auto-repro chain end to end: the
+// host write sets `crash=1`, the scheduler's dispatcher calls
+// `scx_bpf_error`, the scheduler tears down (scx_disable), and the
+// auto-repro VM boots, replays, and lands a shape-valid `.repro.wprof.pb`
+// — inverting the verdict to PASS via `expect_auto_repro`. Unlike the
+// `pos_expect_auto_repro_*` tests (which force a body `record_fail` while
+// the scheduler stays LIVE), this exercises the auto-repro path from an
+// actual `scx_bpf_error` scheduler teardown — the chain the deleted phantom
+// `demo_*_crash_auto_repro` fixtures never reached (they were `is_ignored`
+// and hit `.bss` padding, so their crash never fired). Requires `wprof`:
+// the `.repro.wprof.pb` artifact whose presence satisfies `expect_auto_repro`
+// is written by the wprof binary in the auto-repro VM.
+#[cfg(feature = "wprof")]
+#[ktstr_test(
+    scheduler = KTSTR_SCHED,
+    llcs = 1,
+    cores = 4,
+    threads = 1,
+    duration_s = 3,
+    watchdog_timeout_s = 60,
+    wprof,
+    auto_repro = true,
+    expect_auto_repro,
+    bpf_map_write = BPF_CRASH,
+)]
+fn bpf_crash_auto_repro_e2e(ctx: &Ctx) -> Result<AssertResult> {
+    ktstr::scenario::basic::custom_crash_light(ctx)
+}
 
 // -- monitor evaluation path with default thresholds --
 

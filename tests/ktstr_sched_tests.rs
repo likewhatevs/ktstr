@@ -147,10 +147,11 @@ fn scenario_bpf_api_link(ctx: &ktstr::scenario::Ctx) -> Result<ktstr::assert::As
     bpf_api_scenario(ctx, HoldSpec::fixed(std::time::Duration::from_secs(2)))
 }
 
-/// Write stall=0 to the .bss map after scenario starts.
-/// stall is at offset 0, already 0 — this is a no-op write
-/// that exercises the full BPF map API pipeline.
-static BPF_NOOP: BpfMapWrite = BpfMapWrite::new(".bss", 0, 0);
+/// Write stall=0 to the .bss map after scenario starts — a no-op (the
+/// `stall` global is already 0) that exercises the full BPF map API
+/// pipeline. The byte offset is resolved from the map's BTF by the
+/// `stall` VAR name at write time.
+static BPF_NOOP: BpfMapWrite = BpfMapWrite::new(".bss", "stall", 0);
 
 #[ktstr::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
 #[linkme(crate = ktstr::linkme)]
@@ -177,7 +178,7 @@ static __KTSTR_ENTRY_BPF_API: ktstr::test_support::KtstrTestEntry =
 // Exercises the full loop:
 //   1. HOST writes into the guest's BPF `.bss` map via the KVM
 //      memslot path (`BpfMapAccessor::write_value_u32` dispatched
-//      from `vmm::bpf_map_write_thread`).
+//      from `freeze_coord::start_bpf_map_write`).
 //   2. GUEST scheduler's BPF dispatcher reads the new `stall` value
 //      from its `.bss` section on the next dispatch entry
 //      (`if (stall) return;` in main.bpf.c).
@@ -203,8 +204,9 @@ static __KTSTR_ENTRY_BPF_API: ktstr::test_support::KtstrTestEntry =
 // fires quickly; `duration` is longer so the watchdog has room
 // to fire inside the scenario window rather than racing the
 // natural scenario end.
-// offset 0 = stall flag in main.bpf.c .bss
-static BPF_STALL_HOST_WRITE: BpfMapWrite = BpfMapWrite::new(".bss", 0, 1);
+// Writes the `stall` global (main.bpf.c) — resolved to its `.bss` byte
+// offset from the map's BTF by VAR name at write time.
+static BPF_STALL_HOST_WRITE: BpfMapWrite = BpfMapWrite::new(".bss", "stall", 1);
 
 #[ktstr::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
 #[linkme(crate = ktstr::linkme)]

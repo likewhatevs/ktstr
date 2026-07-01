@@ -84,7 +84,7 @@ use dispatch::{apply_ops, render_cgroup_key};
 // `dispatch` is otherwise private to `ops`.
 #[cfg(test)]
 pub(crate) use dispatch::set_test_scx_state;
-pub(crate) use dispatch::{ScxState, scx_state};
+pub(crate) use dispatch::{ScxState, scx_down, scx_state};
 
 use std::collections::BTreeSet;
 use std::thread;

@@ -53,6 +53,7 @@ use zerocopy::IntoBytes;
 struct SinkState {
     kill: Arc<AtomicBool>,
     kill_evt: Arc<EventFd>,
+    run_is_wprof: bool,
     sys_rdy_evt: Option<Arc<EventFd>>,
     snapshot_requests_pending: Vec<SnapshotRequest>,
     kernel_op_requests_pending: Vec<crate::vmm::wire::KernelOpRequestPayload>,
@@ -73,6 +74,7 @@ impl SinkState {
         Self {
             kill: Arc::new(AtomicBool::new(false)),
             kill_evt: Arc::new(EventFd::new(EFD_NONBLOCK).expect("kill eventfd")),
+            run_is_wprof: false,
             sys_rdy_evt: Some(Arc::new(
                 EventFd::new(EFD_NONBLOCK).expect("sys_rdy eventfd"),
             )),
@@ -95,6 +97,7 @@ impl SinkState {
         BulkDispatchSinks {
             kill: &self.kill,
             kill_evt: &self.kill_evt,
+            run_is_wprof: self.run_is_wprof,
             sys_rdy_evt: &mut self.sys_rdy_evt,
             snapshot_requests_pending: &mut self.snapshot_requests_pending,
             kernel_op_requests_pending: &mut self.kernel_op_requests_pending,
@@ -269,6 +272,55 @@ fn sched_exit_with_valid_crc_does_promote_kill() {
     assert_eq!(bucket[0].msg_type, MSG_TYPE_SCHED_EXIT);
     assert_eq!(bucket[0].payload, b"exit-payload"[..]);
     assert!(bucket[0].crc_ok);
+}
+
+/// On a wprof run (`run_is_wprof=true`) a CRC-valid SCHED_EXIT must NOT
+/// promote the run-wide kill flag or write the kill eventfd — on a
+/// self-crash the still-live guest sched-exit monitor sends SCHED_EXIT
+/// during Phase 5, and promoting the kill here would tear the coordinator
+/// down before the guest ships its Phase-5 wprof trace. Gating on the RUN
+/// being wprof (not on a grace-deadline snapshot) closes the arming-order
+/// race. The verdict entry is still bucketed; the coord arms the ship
+/// grace on this SCHED_EXIT and terminates on the WprofTrace frame or the
+/// `WPROF_SHIP_GRACE` deadline backstop.
+#[test]
+fn sched_exit_on_wprof_run_defers_kill_but_still_buckets() {
+    let mut a = HostAssembler::new();
+    let bytes = frame_with_crc(MSG_TYPE_SCHED_EXIT, b"exit-payload");
+    let drained = a.feed(&bytes);
+    assert_eq!(drained.messages.len(), 1);
+    assert!(drained.messages[0].crc_ok);
+
+    // Drive dispatch on a wprof run (run_is_wprof=true).
+    let mut state = SinkState::new();
+    state.run_is_wprof = true;
+    let mut bucket = Vec::new();
+    {
+        let mut sinks = state.sinks();
+        for msg in &drained.messages {
+            if let Some(entry) = dispatch_bulk_message(msg, &mut sinks) {
+                bucket.push(entry);
+            }
+        }
+    }
+
+    assert!(
+        !state.kill.load(std::sync::atomic::Ordering::Acquire),
+        "kill flag must NOT flip on SCHED_EXIT on a wprof run — the \
+         coordinator holds the VM open for the guest's Phase-5 wprof ship \
+         instead of killing"
+    );
+    assert_eq!(
+        read_counter(&state.kill_evt),
+        0,
+        "kill eventfd must NOT be written on SCHED_EXIT on a wprof run"
+    );
+    assert_eq!(
+        bucket.len(),
+        1,
+        "SCHED_EXIT is still verdict data — bucket it on a wprof run"
+    );
+    assert_eq!(bucket[0].msg_type, MSG_TYPE_SCHED_EXIT);
 }
 
 /// Mixed batch: a CRC-failed SCHED_EXIT alongside other CRC-valid
@@ -594,5 +646,87 @@ fn run_dispatch_sys_rdy(messages: &[crate::vmm::bulk::BulkMessage]) -> SysRdyOut
         handle_remaining: state.sys_rdy_evt.is_some(),
         kill: state.kill.load(std::sync::atomic::Ordering::Acquire),
         kill_evt_counter: read_counter(&state.kill_evt),
+    }
+}
+
+/// Chain-level roundtrip for the wprof chunk transport, through the REAL
+/// [`crate::vmm::bulk::HostAssembler`] — closes the gap the reassemble-only
+/// unit tests (which build `ShmEntry` by hand) leave open. Systematically
+/// mutates each frame's CRC (firecracker `parse_random_requests` pattern) and
+/// splits the byte stream across two feeds, exercising the full path: guest
+/// split (`wprof_trace_frames`) → real TLV bytes → `HostAssembler::feed`
+/// (partial-frame residual reassembly) → `BulkMessage` → `ShmEntry` →
+/// `reassemble_wprof_trace`.
+#[cfg(feature = "wprof")]
+mod wprof_chunk_chain_proptest {
+    use super::{frame_with_crc, frame_with_torn_crc};
+    use crate::vmm::bulk::HostAssembler;
+    use crate::vmm::guest_comms::wprof_trace_frames;
+    use crate::vmm::wire::{MsgType, ShmEntry};
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        #[test]
+        fn wprof_reassembly_survives_transport_and_mutation(
+            buf in proptest::collection::vec(any::<u8>(), 0..64usize),
+            cap in 1usize..=8,
+            torn_flags in proptest::collection::vec(any::<bool>(), 0..70usize),
+            split_frac in 0.0f64..=1.0,
+            interleave_frac in 0.0f64..=1.0,
+        ) {
+            // Guest side: split the trace into (msg_type, chunk) frames exactly
+            // as production does. wprof_trace_frames always puts the terminal
+            // LAST, so any torn wprof frame is reached by reassembly before it
+            // breaks at the terminal.
+            let frames = wprof_trace_frames(&buf, cap);
+            let interleave_at = (interleave_frac * frames.len() as f64) as usize;
+            let mut any_wprof_torn = false;
+            let mut stream: Vec<u8> = Vec::new();
+            for (i, (msg_type, chunk)) in frames.iter().enumerate() {
+                // A crc-GOOD unrelated frame injected BETWEEN wprof frames must
+                // be skipped by reassembly without breaking chunk order.
+                if i == interleave_at {
+                    stream.extend_from_slice(&frame_with_crc(
+                        MsgType::Stdout.wire_value(),
+                        b"noise",
+                    ));
+                }
+                if torn_flags.get(i).copied().unwrap_or(false) {
+                    any_wprof_torn = true;
+                    stream.extend_from_slice(&frame_with_torn_crc(*msg_type, chunk));
+                } else {
+                    stream.extend_from_slice(&frame_with_crc(*msg_type, chunk));
+                }
+            }
+            // Host side: feed the byte stream through the real assembler, split
+            // across two feeds so the split can land mid-header or mid-payload
+            // (exercises HostAssembler's partial-frame residual retention).
+            let split = (split_frac * stream.len() as f64) as usize;
+            let mut a = HostAssembler::new();
+            let mut entries: Vec<ShmEntry> = Vec::new();
+            for part in [&stream[..split], &stream[split..]] {
+                for m in a.feed(part).messages {
+                    entries.push(ShmEntry {
+                        msg_type: m.msg_type,
+                        payload: m.payload.to_vec(),
+                        crc_ok: m.crc_ok,
+                    });
+                }
+            }
+            let got = crate::test_support::wprof::reassemble_wprof_trace(&entries);
+            // Expected: None when any wprof frame is torn (reassembly bails to
+            // None on the first torn wprof frame) OR the trace is empty (empty
+            // terminal → skip-on-empty); otherwise the reassembled bytes equal
+            // the original trace exactly, proving guest-split → transport →
+            // host-reassemble is lossless and order-preserving.
+            let expected = if any_wprof_torn || buf.is_empty() {
+                None
+            } else {
+                Some(buf.clone())
+            };
+            prop_assert_eq!(got, expected);
+        }
     }
 }

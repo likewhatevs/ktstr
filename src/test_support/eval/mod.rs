@@ -1208,37 +1208,30 @@ fn run_ktstr_test_inner_impl(
     // debugging operator sees both regressions on the first pass.
     #[cfg(feature = "wprof")]
     if let Some(ref bulk) = result.guest_messages {
-        for bulk_entry in &bulk.entries {
-            if crate::vmm::wire::MsgType::from_wire(bulk_entry.msg_type)
-                == Some(crate::vmm::wire::MsgType::WprofTrace)
-                && bulk_entry.crc_ok
-                && !bulk_entry.payload.is_empty()
-            {
-                // Resolve via the reader's path fn (VmResult::wprof_pb_path,
-                // which the primary .wprof.pb shape-check in result.rs also
-                // uses) so this authoritative pre-pass writer matches the
-                // reader by construction — no format! literal to drift. The
-                // eval layer stamped result.variant_hash above, so this
-                // resolves to the same `-{hash}` name variant_hash carries.
-                let wprof_path = match result.wprof_pb_path() {
-                    Ok(p) => p,
-                    Err(e) => {
-                        eprintln!("ktstr_test: wprof pre-pass path unresolved: {e}");
-                        break;
+        // Reassemble the trace (any WprofTraceChunk frames + the terminal
+        // WprofTrace) and write it once; a single-frame trace reassembles to
+        // that one frame's payload. Resolve the path via the reader's fn
+        // (VmResult::wprof_pb_path) so this authoritative pre-pass writer
+        // matches the reader by construction — no format! literal to drift.
+        // The eval layer stamped result.variant_hash above, so this resolves
+        // to the same `-{hash}` name variant_hash carries.
+        if let Some(pb) = crate::test_support::wprof::reassemble_wprof_trace(&bulk.entries) {
+            match result.wprof_pb_path() {
+                Ok(wprof_path) => {
+                    if let Err(e) = std::fs::create_dir_all(
+                        wprof_path
+                            .parent()
+                            .expect("sidecar_dir join always has parent"),
+                    ) {
+                        eprintln!("ktstr_test: create sidecar dir for wprof trace: {e}");
+                    } else if let Err(e) = std::fs::write(&wprof_path, &pb) {
+                        eprintln!(
+                            "ktstr_test: write wprof trace to {}: {e}",
+                            wprof_path.display()
+                        );
                     }
-                };
-                if let Err(e) = std::fs::create_dir_all(
-                    wprof_path
-                        .parent()
-                        .expect("sidecar_dir join always has parent"),
-                ) {
-                    eprintln!("ktstr_test: create sidecar dir for wprof trace: {e}");
-                } else if let Err(e) = std::fs::write(&wprof_path, &bulk_entry.payload) {
-                    eprintln!(
-                        "ktstr_test: write wprof trace to {}: {e}",
-                        wprof_path.display()
-                    );
                 }
+                Err(e) => eprintln!("ktstr_test: wprof pre-pass path unresolved: {e}"),
             }
         }
     }
@@ -1336,10 +1329,12 @@ fn run_ktstr_test_inner_impl(
     // scenario-end terminal boundary) via the single shared accessor —
     // the SAME timeline a post_vm callback gets, so the production eval
     // and any out-of-tree re-derivation can never disagree on the last
-    // step's iteration_rate boundary. The bulk loop below handles only
-    // the remaining message kinds (Profraw / WprofTrace / PayloadMetrics
-    // / RawPayloadOutput); Stimulus + ScenarioEnd are consumed by
-    // stimulus_timeline().
+    // step's iteration_rate boundary. The bulk loop below per-entry
+    // handles PayloadMetrics + RawPayloadOutput (and streams Stderr);
+    // Profraw and WprofTrace/WprofTraceChunk are no-ops there (Profraw is
+    // persisted centrally in `crate::vmm::KtstrVm::run`; the wprof `.pb` is
+    // written by the #[cfg(feature="wprof")] pre-pass above). Stimulus +
+    // ScenarioEnd are consumed by stimulus_timeline().
     let stimulus_events = result.stimulus_timeline();
     let mut payload_metrics: Vec<crate::test_support::PayloadMetrics> = Vec::new();
     let mut raw_outputs: Vec<crate::test_support::RawPayloadOutput> = Vec::new();
@@ -1354,43 +1349,6 @@ fn run_ktstr_test_inner_impl(
         for bulk_entry in &bulk.entries {
             let kind = crate::vmm::wire::MsgType::from_wire(bulk_entry.msg_type);
             match kind {
-                Some(crate::vmm::wire::MsgType::WprofTrace) => {
-                    // wprof Perfetto trace captured during the
-                    // guest's auto-repro window. Write next to the
-                    // failure-dump JSON so the operator finds both
-                    // in the same per-test directory. NOTE: the
-                    // pre-pass above already wrote this file before
-                    // post_vm fired; this arm rewrites the same
-                    // bytes to the same path (idempotent) so that
-                    // a future bulk-drain consumer added here keeps
-                    // the WprofTrace handling colocated with the
-                    // rest of MsgType dispatch.
-                    if bulk_entry.crc_ok && !bulk_entry.payload.is_empty() {
-                        // Keep this literal in sync with
-                        // VmResult::wprof_pb_path (the reader). This arm
-                        // shares the general bulk-drain dispatch and is NOT
-                        // #[cfg(wprof)]-gated, so it cannot call the
-                        // wprof-gated resolver like the pre-pass above does;
-                        // it is also a redundant idempotent rewrite of the
-                        // pre-pass file, so a drift here would only produce a
-                        // stray file — the reader resolves the pre-pass
-                        // writer's resolver-built name.
-                        let wprof_path = crate::test_support::sidecar_dir()
-                            .join(format!("{}-{:016x}.wprof.pb", entry.name, variant_hash));
-                        if let Err(e) = std::fs::create_dir_all(
-                            wprof_path
-                                .parent()
-                                .expect("sidecar_dir join always has parent"),
-                        ) {
-                            eprintln!("ktstr_test: create sidecar dir for wprof trace: {e}");
-                        } else if let Err(e) = std::fs::write(&wprof_path, &bulk_entry.payload) {
-                            eprintln!(
-                                "ktstr_test: write wprof trace to {}: {e}",
-                                wprof_path.display()
-                            );
-                        }
-                    }
-                }
                 Some(crate::vmm::wire::MsgType::PayloadMetrics) => {
                     if bulk_entry.crc_ok {
                         match postcard::from_bytes::<crate::test_support::PayloadMetrics>(
@@ -1434,7 +1392,15 @@ fn run_ktstr_test_inner_impl(
                 // lookup in collect_results, lifecycle classifier,
                 // sched_log concatenator, etc.). No per-entry side effect
                 // here. (Stderr is NOT in this arm — it has its own arm
-                // below that streams to host stderr.)
+                // below that streams to host stderr.) WprofTrace +
+                // WprofTraceChunk are no-ops here: the #[cfg(feature="wprof")]
+                // pre-pass above (the `result.guest_messages` block) is the
+                // SOLE writer of the `.wprof.pb` — it reassembles the full
+                // trace once via `reassemble_wprof_trace(&bulk.entries)` and
+                // resolves the path through `VmResult::wprof_pb_path`, the same
+                // resolver the reader uses, so writer and reader cannot drift.
+                // A per-entry write here would be a redundant full-file
+                // rewrite, so both wprof variants fall through to this no-op.
                 Some(
                     crate::vmm::wire::MsgType::Stimulus
                     | crate::vmm::wire::MsgType::StepEnd
@@ -1453,6 +1419,8 @@ fn run_ktstr_test_inner_impl(
                     | crate::vmm::wire::MsgType::Dmesg
                     | crate::vmm::wire::MsgType::ProbeOutput
                     | crate::vmm::wire::MsgType::SnapshotReply
+                    | crate::vmm::wire::MsgType::WprofTrace
+                    | crate::vmm::wire::MsgType::WprofTraceChunk
                     | crate::vmm::wire::MsgType::Crash,
                 ) => {}
                 Some(crate::vmm::wire::MsgType::Stderr) => {

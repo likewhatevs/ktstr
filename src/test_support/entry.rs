@@ -389,9 +389,12 @@ impl std::fmt::Display for CgroupPath {
 
 /// Host-side BPF map write performed during VM execution.
 ///
-/// The write is event-driven: the host polls for BPF map discoverability
-/// (scheduler loaded), then polls the SHM ring for scenario start, then
-/// writes.
+/// Applied by the host thread `freeze_coord::start_bpf_map_write` in three
+/// phases: build the guest-memory BPF-map accessor, resolve the `field`
+/// NAME to a byte offset via the target map's program BTF, then write.
+/// After the writes the host pushes `SIGNAL_BPF_WRITE_DONE` through
+/// virtio-console (`host_comms::request_bpf_map_write_done`) so a guest
+/// scenario gated on `Ctx::wait_for_map_write` unblocks.
 ///
 /// Construct with [`BpfMapWrite::new`], which const-asserts the
 /// `map_name_suffix` format at compile time. Direct struct-literal
@@ -400,7 +403,7 @@ impl std::fmt::Display for CgroupPath {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BpfMapWrite {
     map_name_suffix: &'static str,
-    offset: usize,
+    field: &'static str,
     value: u32,
 }
 
@@ -421,7 +424,15 @@ impl BpfMapWrite {
     ///   non-printable / control byte (no real BPF map name carries
     ///   those characters; NULL would truncate libbpf C-string
     ///   comparison)
-    pub const fn new(map_name_suffix: &'static str, offset: usize, value: u32) -> Self {
+    /// - `field` is empty (it names the VAR to write — a bare `.bss`/`.data`
+    ///   global like `"crash"`, or a dot-path into the value struct; the
+    ///   byte offset is resolved from the map's BTF value type at write
+    ///   time, so a raw offset can never land in struct padding)
+    /// - `field` starts or ends with `.`, or contains `..` (an empty
+    ///   path segment the BTF resolver could never match)
+    /// - `field` contains whitespace, `/`, `\`, or any non-printable /
+    ///   control byte (no real BTF VAR name carries those characters)
+    pub const fn new(map_name_suffix: &'static str, field: &'static str, value: u32) -> Self {
         let bytes = map_name_suffix.as_bytes();
         assert!(
             !bytes.is_empty(),
@@ -456,9 +467,45 @@ impl BpfMapWrite {
             );
             i += 1;
         }
+        // `field` names a VAR in the map's BTF value type — a bare global
+        // like `crash`, or a dot-path into the value struct
+        // (`sys_stat.avg_lat_cri`); the write-time resolver
+        // (`resolve_map_field_offset_width`) maps it to a byte offset. Mirror
+        // the WatchBpfMap::field gate (both feed the same resolver): non-empty,
+        // printable ASCII, no whitespace, no path separators. `.` IS allowed
+        // but must separate non-empty segments, so reject a leading / trailing
+        // / doubled `.` — an empty segment the resolver could never match. No
+        // leading-`.` section rule here (a VAR path is not a section name).
+        let fb = field.as_bytes();
+        assert!(!fb.is_empty(), "BpfMapWrite field must not be empty");
+        assert!(
+            fb[0] != b'.' && fb[fb.len() - 1] != b'.',
+            "BpfMapWrite field must not start or end with `.` (empty path segment)",
+        );
+        let mut j = 0;
+        while j < fb.len() {
+            let b = fb[j];
+            assert!(
+                b != b' ' && b != b'\t' && b != b'\n' && b != b'\r',
+                "BpfMapWrite field must not contain whitespace",
+            );
+            assert!(
+                b != b'/' && b != b'\\',
+                "BpfMapWrite field must not contain path separators",
+            );
+            assert!(
+                !(b == b'.' && j > 0 && fb[j - 1] == b'.'),
+                "BpfMapWrite field must not contain `..` (empty path segment)",
+            );
+            assert!(
+                b >= 0x20 && b < 0x7f,
+                "BpfMapWrite field must be printable ASCII only (no control bytes / NULL / high-bit chars)",
+            );
+            j += 1;
+        }
         Self {
             map_name_suffix,
-            offset,
+            field,
             value,
         }
     }
@@ -469,12 +516,15 @@ impl BpfMapWrite {
         self.map_name_suffix
     }
 
-    /// Byte offset within the map's value region.
-    pub const fn offset(&self) -> usize {
-        self.offset
+    /// The field to write within the matched map's value region: a bare
+    /// BTF VAR name (e.g. `"crash"`) or a dot-path into the value struct
+    /// (e.g. `"sys_stat.avg_lat_cri"`). The byte offset is resolved from
+    /// the map's BTF value type at write time.
+    pub const fn field(&self) -> &'static str {
+        self.field
     }
 
-    /// u32 value to write at `offset` inside the matched map.
+    /// u32 value to write into `field` inside the matched map.
     pub const fn value(&self) -> u32 {
         self.value
     }
@@ -1497,13 +1547,19 @@ pub struct KtstrTestEntry {
     pub watchdog_timeout: Duration,
     /// Host-side BPF map writes to perform during VM execution.
     ///
-    /// Empty slice (the default) means "no writes." Setup failures
-    /// (accessor init, map resolution, probes-ready wait) abort before
-    /// any writes are attempted. Within the write phase itself, every
-    /// entry is attempted; individual write failures are logged but do
-    /// not abort remaining writes — partial success suppresses the
-    /// final signal to the guest so it times out rather than observing
-    /// half-applied state.
+    /// Empty slice (the default) means "no writes." The host thread
+    /// (`freeze_coord::start_bpf_map_write`) runs three phases: (1) build
+    /// the guest-memory BPF-map accessor once the kernel page tables are
+    /// up; (2) resolve every entry's `field` NAME to a byte offset + width
+    /// from the target map's program BTF; (3) write each resolved entry.
+    /// A phase-1/2 failure (accessor init, or a field that never resolves
+    /// within the deadline) aborts before phase 3 without signalling the
+    /// guest, which self-unblocks on its own `wait_for_map_write` timeout.
+    /// In phase 3 every resolved entry is attempted — a field whose width
+    /// is not the 4 bytes the `u32` value stores is skipped (logged), and
+    /// a failed write is logged — then `SIGNAL_BPF_WRITE_DONE` is pushed
+    /// to the guest UNCONDITIONALLY after the loop, so a skipped or failed
+    /// entry still unblocks the guest rather than leaving it to time out.
     pub bpf_map_write: &'static [&'static BpfMapWrite],
     /// Named scheduler BPF-map fields to read observer-effect-free into
     /// assertable run-level metrics. The free-running host monitor resolves
@@ -5147,9 +5203,9 @@ mod tests {
     #[test]
     fn bpf_map_write_hashset_roundtrip() {
         use std::collections::HashSet;
-        let w1 = BpfMapWrite::new(".data", 0, 1);
-        let w2 = BpfMapWrite::new(".data", 4, 2);
-        let w3 = BpfMapWrite::new(".other", 0, 1);
+        let w1 = BpfMapWrite::new(".data", "crash", 1);
+        let w2 = BpfMapWrite::new(".data", "stall", 2);
+        let w3 = BpfMapWrite::new(".other", "crash", 1);
         let mut set: HashSet<BpfMapWrite> = HashSet::new();
         set.insert(w1);
         set.insert(w2);
@@ -5177,7 +5233,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "map_name_suffix must not be empty")]
     fn bpf_map_write_new_rejects_empty_suffix() {
-        let _ = BpfMapWrite::new("", 0, 0);
+        let _ = BpfMapWrite::new("", "crash", 0);
     }
 
     /// BPF section names start with `.` (`.bss`, `.data`, `.rodata`);
@@ -5185,19 +5241,19 @@ mod tests {
     #[test]
     #[should_panic(expected = "must start with `.`")]
     fn bpf_map_write_new_rejects_missing_dot_prefix() {
-        let _ = BpfMapWrite::new("bss", 0, 0);
+        let _ = BpfMapWrite::new("bss", "crash", 0);
     }
 
     #[test]
     #[should_panic(expected = "must not contain whitespace")]
     fn bpf_map_write_new_rejects_whitespace_in_suffix() {
-        let _ = BpfMapWrite::new(".b s", 0, 0);
+        let _ = BpfMapWrite::new(".b s", "crash", 0);
     }
 
     #[test]
     #[should_panic(expected = "must not contain path separators")]
     fn bpf_map_write_new_rejects_path_separator_in_suffix() {
-        let _ = BpfMapWrite::new(".bss/data", 0, 0);
+        let _ = BpfMapWrite::new(".bss/data", "crash", 0);
     }
 
     /// Valid construction round-trips through the getters. Pinned to
@@ -5205,10 +5261,71 @@ mod tests {
     /// caches a transformed value but forgets to update the getter).
     #[test]
     fn bpf_map_write_new_valid_round_trips() {
-        let w = BpfMapWrite::new(".bss", 16, 42);
+        let w = BpfMapWrite::new(".bss", "crash", 42);
         assert_eq!(w.map_name_suffix(), ".bss");
-        assert_eq!(w.offset(), 16);
+        assert_eq!(w.field(), "crash");
         assert_eq!(w.value(), 42);
+    }
+
+    /// Empty `field` names no VAR; the write-time BTF resolver would find
+    /// nothing. const-assert catches it at construction.
+    #[test]
+    #[should_panic(expected = "field must not be empty")]
+    fn bpf_map_write_new_rejects_empty_field() {
+        let _ = BpfMapWrite::new(".bss", "", 0);
+    }
+
+    /// A BTF VAR name carries no whitespace; a spaced `field` is a typo
+    /// that would never resolve.
+    #[test]
+    #[should_panic(expected = "field must not contain whitespace")]
+    fn bpf_map_write_new_rejects_whitespace_in_field() {
+        let _ = BpfMapWrite::new(".bss", "cr ash", 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "field must not contain path separators")]
+    fn bpf_map_write_new_rejects_path_separator_in_field() {
+        let _ = BpfMapWrite::new(".bss", "a/b", 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "field must be printable ASCII only")]
+    fn bpf_map_write_new_rejects_control_byte_in_field() {
+        let _ = BpfMapWrite::new(".bss", "cr\x01ash", 0);
+    }
+
+    /// `.` is a dot-path separator; a leading/trailing `.` is an empty
+    /// segment the BTF resolver could never match.
+    #[test]
+    #[should_panic(expected = "must not start or end with `.`")]
+    fn bpf_map_write_new_rejects_trailing_dot_in_field() {
+        let _ = BpfMapWrite::new(".bss", "crash.", 0);
+    }
+
+    /// The leading half of the same start/end-dot guard (sibling
+    /// `Sysctl::new` splits leading and trailing into separate pins; a
+    /// regression dropping only the leading check must not slip past).
+    #[test]
+    #[should_panic(expected = "must not start or end with `.`")]
+    fn bpf_map_write_new_rejects_leading_dot_in_field() {
+        let _ = BpfMapWrite::new(".bss", ".crash", 0);
+    }
+
+    /// A doubled `..` is an empty dot-path segment.
+    #[test]
+    #[should_panic(expected = "field must not contain `..`")]
+    fn bpf_map_write_new_rejects_doubled_dot_in_field() {
+        let _ = BpfMapWrite::new(".bss", "a..b", 0);
+    }
+
+    /// An interior `.` separates non-empty dot-path segments and IS
+    /// accepted — the field doc promises dot-paths (e.g.
+    /// `sys_stat.avg_lat_cri`); pins that a future validator over-tightening
+    /// to reject all `.` would break this.
+    #[test]
+    fn bpf_map_write_new_accepts_interior_dot_in_field() {
+        assert_eq!(BpfMapWrite::new(".bss", "a.b", 1).field(), "a.b");
     }
 
     #[test]
@@ -5322,25 +5439,25 @@ mod tests {
     #[test]
     #[should_panic(expected = "must be longer than a bare `.`")]
     fn bpf_map_write_new_rejects_bare_dot() {
-        let _ = BpfMapWrite::new(".", 0, 0);
+        let _ = BpfMapWrite::new(".", "crash", 0);
     }
 
     #[test]
     #[should_panic(expected = "must not start with `..`")]
     fn bpf_map_write_new_rejects_leading_double_dot() {
-        let _ = BpfMapWrite::new("..bss", 0, 0);
+        let _ = BpfMapWrite::new("..bss", "crash", 0);
     }
 
     #[test]
     #[should_panic(expected = "must be printable ASCII")]
     fn bpf_map_write_new_rejects_null_byte_in_suffix() {
-        let _ = BpfMapWrite::new(".bss\0", 0, 0);
+        let _ = BpfMapWrite::new(".bss\0", "crash", 0);
     }
 
     #[test]
     #[should_panic(expected = "must be printable ASCII")]
     fn bpf_map_write_new_rejects_control_byte_in_suffix() {
-        let _ = BpfMapWrite::new(".b\x01ss", 0, 0);
+        let _ = BpfMapWrite::new(".b\x01ss", "crash", 0);
     }
 
     /// Lock-step pin: `KtstrTestEntry::default()` must agree with

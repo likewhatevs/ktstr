@@ -1471,7 +1471,12 @@ impl VcpuThread {
 #[derive(Clone)]
 pub(crate) struct BpfMapWriteParams {
     pub(crate) map_name_suffix: String,
-    pub(crate) offset: usize,
+    /// Name of the global to write, resolved to a byte offset against the
+    /// map's program BTF at write time (see
+    /// `freeze_coord::start_bpf_map_write` phase 2). Mirrors
+    /// `WatchBpfMapParams::field`; replaces a padding-fragile hardcoded
+    /// byte offset.
+    pub(crate) field: String,
     pub(crate) value: u32,
 }
 

@@ -162,10 +162,11 @@ when it sees the host-written value:
 use ktstr::prelude::*;
 
 // User-defined trigger: ".bss" suffix matches the libbpf-named
-// .bss map; offset and value name the slot + payload the host
-// writes after the scheduler loads. The scheduler reads this slot
-// in its error path and calls scx_bpf_error(...).
-static BPF_CRASH: BpfMapWrite = BpfMapWrite::new(".bss", 4, 1);
+// .bss map; field name and value name the global + payload the host
+// writes after the scheduler loads. The scheduler reads this global
+// in its error path and calls scx_bpf_error(...). The field's offset
+// is resolved from the map's program BTF at write time.
+static BPF_CRASH: BpfMapWrite = BpfMapWrite::new(".bss", "crash", 1);
 
 #[ktstr_test(
     scheduler = MY_SCHED,

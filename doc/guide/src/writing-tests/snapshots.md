@@ -405,10 +405,12 @@ which targets a `BpfMapWrite` constant:
 ```rust,ignore
 use ktstr::prelude::*;
 
-const TRIGGER_FAULT: BpfMapWrite = BpfMapWrite::new(".bss", 42, 1);
-// args: (map_name_suffix, byte offset within the map's value, u32 value to write).
-// `BpfMapWrite`'s fields are private; `BpfMapWrite::new` is the const
-// constructor (validates inputs at compile time).
+const TRIGGER_FAULT: BpfMapWrite = BpfMapWrite::new(".bss", "crash", 1);
+// args: (map_name_suffix, BPF global variable name within the section,
+// u32 value to write). The field's byte offset is resolved from the
+// map's program BTF at write time. `BpfMapWrite`'s fields are private;
+// `BpfMapWrite::new` is the const constructor (validates inputs at
+// compile time).
 
 #[ktstr_test(bpf_map_write = TRIGGER_FAULT, expect_err = true)]
 fn fault_then_inspect(ctx: &Ctx) -> Result<AssertResult> {

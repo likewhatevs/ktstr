@@ -123,8 +123,9 @@ pub fn parse_tlv_stream(buf: &[u8]) -> BulkDrainResult {
             );
         }
         // Hostile-input guard: a `length` above the per-frame cap
-        // cannot come from any legitimate producer (every real
-        // payload sits well below 256 KiB) and would trigger an
+        // (16 MiB, MAX_BULK_FRAME_PAYLOAD) cannot come from any
+        // legitimate producer — the largest, a wprof trace chunk,
+        // lands AT the cap and never above — and would trigger an
         // oversized `Vec<u8>` allocation. Reject before the
         // payload-length sanity check below so a malformed
         // `u32::MAX` length does not even reach the

@@ -87,14 +87,14 @@ fn my_test(ctx: &Ctx) -> Result<AssertResult> { ... }
 
 ## Example output
 
-The `demo_host_crash_auto_repro` test triggers a host-initiated crash
+The `bpf_crash_auto_repro_e2e` test triggers a host-initiated crash
 via BPF map write and captures the scheduling path. Probe output shows
 each function with decoded struct fields and source locations. When
 fexit captures post-mutation state, changed fields show an arrow
 (`→`) between entry and exit values:
 
 ```text
-ktstr_test 'demo_host_crash_auto_repro' [sched=scx-ktstr] [topo=1n1l4c1t] failed:
+ktstr_test 'bpf_crash_auto_repro_e2e' [sched=scx-ktstr] [topo=1n1l4c1t] failed:
   scheduler process died unexpectedly during workload (2.0s into test)
 
 --- auto-repro ---
@@ -162,33 +162,37 @@ Inspect `--- diagnostics ---` for the VM exit kind and the last
 ~20 lines of guest console output, and `--- timeline ---` for the
 init-stage progression — the primary-side failure cause lives there.
 
-## Demo test
+## Example test
 
-A demo test in this shape (reduced from
-`demo_host_crash_auto_repro` in `tests/scenario_coverage.rs`):
+`bpf_crash_auto_repro_e2e` in `tests/scenario_coverage.rs` drives this
+path end to end: a host BPF-map write sets the scheduler's `crash`
+global, the scheduler calls `scx_bpf_error` and tears down, and the
+auto-repro VM replays it and lands a `.repro.wprof.pb` — inverting the
+verdict to PASS via `expect_auto_repro`. Its shape:
 
 ```rust,ignore
-use ktstr::prelude::*;
-use std::time::Duration;
-
-fn scenario_yield_heavy(ctx: &Ctx) -> Result<AssertResult> {
-    let steps = vec![Step::with_defs(
-        vec![
-            CgroupDef::named("demo_workers")
-                .work_type(WorkType::YieldHeavy)
-                .workers(4),
-        ],
-        HoldSpec::fixed(Duration::from_secs(8)),
-    )];
-    execute_steps(ctx, steps)
+#[cfg(feature = "wprof")]
+#[ktstr_test(
+    scheduler = KTSTR_SCHED,
+    llcs = 1,
+    cores = 4,
+    threads = 1,
+    duration_s = 3,
+    watchdog_timeout_s = 60,
+    wprof,
+    auto_repro = true,
+    expect_auto_repro,
+    bpf_map_write = BPF_CRASH,
+)]
+fn bpf_crash_auto_repro_e2e(ctx: &Ctx) -> Result<AssertResult> {
+    ktstr::scenario::basic::custom_sched_mixed(ctx)
 }
 ```
 
-Run manually to see full output. The `demo_` prefix auto-ignores via
-the `is_ignored` filter in `src/test_support/dispatch.rs`, so a bare
-invocation will filter the test out — `--run-ignored ignored-only` is
-required:
+It requires the `wprof` feature — the `.repro.wprof.pb` artifact that
+satisfies `expect_auto_repro` is written by the wprof binary in the
+auto-repro VM — so run it with that feature enabled:
 
 ```sh
-cargo ktstr test --kernel ../linux -- --run-ignored ignored-only -E 'test(demo_host_crash_auto_repro)'
+cargo run --bin cargo-ktstr --features wprof -- ktstr test --kernel ../linux -E 'test(bpf_crash_auto_repro_e2e)'
 ```

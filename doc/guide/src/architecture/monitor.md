@@ -242,16 +242,17 @@ becomes discoverable), writes the value, then signals the guest via
 the virtio-console RX queue (`SIGNAL_BPF_WRITE_DONE`) to start the
 scenario.
 
-`BpfMapWrite::new(map_name_suffix, offset, value)` takes a validated
-map-name suffix (e.g. `".bss"`), a byte offset within the map value
-region, and the `u32` to write. Its fields are crate-private, so it is
-constructed only through this const constructor (which const-asserts
-the suffix format) — direct struct-literal construction is rejected.
+`BpfMapWrite::new(map_name_suffix, field, value)` takes a validated
+map-name suffix (e.g. `".bss"`), the BPF global variable NAME within
+that section (e.g. `"crash"`), and the `u32` to write. Its fields are
+crate-private, so it is constructed only through this const constructor
+(which const-asserts the suffix format) — direct struct-literal
+construction is rejected.
 
 Use with `#[ktstr_test]` via the `bpf_map_write` attribute:
 
 ```rust,ignore
-const BPF_CRASH: BpfMapWrite = BpfMapWrite::new(".bss", 42, 1);
+const BPF_CRASH: BpfMapWrite = BpfMapWrite::new(".bss", "crash", 1);
 
 #[ktstr_test(bpf_map_write = BPF_CRASH, expect_err = true)]
 fn crash_test(ctx: &Ctx) -> Result<AssertResult> {
@@ -259,9 +260,12 @@ fn crash_test(ctx: &Ctx) -> Result<AssertResult> {
 }
 ```
 
-The map is discovered by name suffix via `GuestMemMapAccessor::find_array_map`.
-Only `BPF_MAP_TYPE_ARRAY` maps are supported. The write targets a
-u32 at the specified byte offset within the map's value region.
+The map is discovered by name suffix, and the field's byte offset and
+width are resolved from the map's program BTF at write time (which
+disambiguates same-suffix maps by picking the one whose BTF names the
+field). Only `BPF_MAP_TYPE_ARRAY` maps are supported, and only 4-byte
+scalar fields are written; the u32 lands at the field's resolved offset
+within the map's value region.
 
 ### Prerequisites
 

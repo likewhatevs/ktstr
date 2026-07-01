@@ -209,6 +209,28 @@ pub enum MsgType {
     /// failure-dump JSON so the operator picks it up alongside the
     /// rest of the per-test debugging artefacts.
     WprofTrace,
+    /// Guest→host wprof trace CHUNK (payload: a ≤`MAX_BULK_FRAME_PAYLOAD`
+    /// slice of the `.pb`). A wprof trace larger than the single-frame
+    /// bulk-port ceiling is split into ordered `WprofTraceChunk` frames
+    /// terminated by a final [`Self::WprofTrace`] frame (the last slice);
+    /// the host concatenates the chunk payloads in arrival order and
+    /// appends the terminal `WprofTrace` payload to reconstruct the `.pb`.
+    /// A trace that fits in one frame ships as a lone `WprofTrace` (no
+    /// chunks) — the reassembly is a no-op for that fast path.
+    ///
+    /// Like the `Stdout`/`Stderr`/`SchedLog` transports, a large blob is
+    /// split across frames and concatenated on the host. It DIVERGES from
+    /// them in using a distinct terminal frame type rather than uniform
+    /// same-type frames: a Perfetto `.pb` is useless if truncated (a partial
+    /// protobuf still passes the leading-tag/size shape check but decodes to
+    /// garbage), whereas partial stdout is still useful. The terminal frame
+    /// lets the host distinguish a complete trace (terminal present → write
+    /// the `.pb`) from a transport that tore mid-ship (chunks but no terminal
+    /// → write nothing, so the post_vm `.pb`-landed assert fails loudly
+    /// instead of shipping a plausible-but-corrupt artifact). Stdout/SchedLog
+    /// need no such marker — their in-band `SCHED_OUTPUT_START/END` content
+    /// delimiters, not the framing, bound their payloads.
+    WprofTraceChunk,
     /// Guest→host system-ready signal (payload: empty).
     ///
     /// Emitted by the guest's `ktstr_guest_init` after
@@ -262,6 +284,7 @@ impl MsgType {
             MsgType::RawPayloadOutput => MSG_TYPE_RAW_PAYLOAD_OUTPUT,
             MsgType::Profraw => MSG_TYPE_PROFRAW,
             MsgType::WprofTrace => MSG_TYPE_WPROF_TRACE,
+            MsgType::WprofTraceChunk => MSG_TYPE_WPROF_TRACE_CHUNK,
             MsgType::SnapshotRequest => MSG_TYPE_SNAPSHOT_REQUEST,
             MsgType::SnapshotReply => MSG_TYPE_SNAPSHOT_REPLY,
             MsgType::KernelOpRequest => MSG_TYPE_KERNEL_OP_REQUEST,
@@ -297,6 +320,7 @@ impl MsgType {
             MSG_TYPE_RAW_PAYLOAD_OUTPUT => Some(MsgType::RawPayloadOutput),
             MSG_TYPE_PROFRAW => Some(MsgType::Profraw),
             MSG_TYPE_WPROF_TRACE => Some(MsgType::WprofTrace),
+            MSG_TYPE_WPROF_TRACE_CHUNK => Some(MsgType::WprofTraceChunk),
             MSG_TYPE_SNAPSHOT_REQUEST => Some(MsgType::SnapshotRequest),
             MSG_TYPE_SNAPSHOT_REPLY => Some(MsgType::SnapshotReply),
             MSG_TYPE_KERNEL_OP_REQUEST => Some(MsgType::KernelOpRequest),
@@ -472,6 +496,12 @@ pub const MSG_TYPE_PROFRAW: u32 = 0x5052_4157; // "PRAW"
 /// the failure-dump file so the operator finds it under
 /// [`crate::test_support::sidecar_dir`] alongside the JSON dump.
 pub const MSG_TYPE_WPROF_TRACE: u32 = 0x5750_5246; // "WPRF"
+
+/// Guest→host wprof trace CHUNK (one ordered slice of a `.pb` too large
+/// for a single bulk frame; the stream is terminated by a
+/// [`MSG_TYPE_WPROF_TRACE`] frame carrying the final slice). See
+/// [`MsgType::WprofTraceChunk`].
+pub const MSG_TYPE_WPROF_TRACE_CHUNK: u32 = 0x5750_5243; // "WPRC"
 
 /// Guest→host on-demand snapshot request
 /// (payload: [`SnapshotRequestPayload`]).
@@ -1507,6 +1537,7 @@ mod tests {
             MSG_TYPE_RAW_PAYLOAD_OUTPUT,
             MSG_TYPE_PROFRAW,
             MSG_TYPE_WPROF_TRACE,
+            MSG_TYPE_WPROF_TRACE_CHUNK,
             MSG_TYPE_SNAPSHOT_REQUEST,
             MSG_TYPE_SNAPSHOT_REPLY,
             MSG_TYPE_KERNEL_OP_REQUEST,
@@ -1581,6 +1612,7 @@ mod tests {
             MsgType::RawPayloadOutput,
             MsgType::Profraw,
             MsgType::WprofTrace,
+            MsgType::WprofTraceChunk,
             MsgType::SnapshotRequest,
             MsgType::SnapshotReply,
             MsgType::KernelOpRequest,
@@ -1638,6 +1670,10 @@ mod tests {
         );
         assert_eq!(MsgType::Profraw.wire_value(), MSG_TYPE_PROFRAW);
         assert_eq!(MsgType::WprofTrace.wire_value(), MSG_TYPE_WPROF_TRACE);
+        assert_eq!(
+            MsgType::WprofTraceChunk.wire_value(),
+            MSG_TYPE_WPROF_TRACE_CHUNK
+        );
         assert_eq!(
             MsgType::SnapshotRequest.wire_value(),
             MSG_TYPE_SNAPSHOT_REQUEST
@@ -1704,6 +1740,7 @@ mod tests {
             MsgType::RawPayloadOutput,
             MsgType::Profraw,
             MsgType::WprofTrace,
+            MsgType::WprofTraceChunk,
             MsgType::Stdout,
             MsgType::Stderr,
             MsgType::SchedLog,

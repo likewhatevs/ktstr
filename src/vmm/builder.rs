@@ -616,19 +616,23 @@ impl KtstrVmBuilder {
 
     /// Schedule a host-side write into a named BPF map after the
     /// scheduler is loaded. `map_name_suffix` is matched against
-    /// `bpf_map.name` (kernel truncates to 15 chars); `offset` is
-    /// the byte offset within the array-map value region; `value`
-    /// is a `u32` written in native byte order.
+    /// `bpf_map.name` (kernel truncates to 15 chars); `field` names a
+    /// global in the map's section (e.g. `"crash"`, `"stall"`), resolved
+    /// to a byte offset against the map's program BTF at write time so
+    /// the offset tracks the compiler's `.bss` layout instead of a
+    /// fragile hardcoded constant; `value` is a `u32` written
+    /// little-endian (via `to_ne_bytes`, which is LE on the x86_64 /
+    /// aarch64 hosts ktstr targets — the guest reads the `.bss` global as
+    /// a plain LE int).
     ///
     /// Repeated calls queue additional writes; all queued writes run
     /// sequentially on the same `BpfMapAccessor` after the scheduler
     /// attaches, with a single guest-side unblock once every write
     /// completes. Order of calls is preserved.
-    #[allow(dead_code)]
-    pub fn bpf_map_write(mut self, map_name_suffix: &str, offset: usize, value: u32) -> Self {
+    pub fn bpf_map_write(mut self, map_name_suffix: &str, field: &str, value: u32) -> Self {
         self.bpf_map_writes.push(BpfMapWriteParams {
             map_name_suffix: map_name_suffix.to_string(),
-            offset,
+            field: field.to_string(),
             value,
         });
         self

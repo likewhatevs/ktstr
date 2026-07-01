@@ -380,9 +380,11 @@ pub struct Ctx<'a> {
     /// scenarios and by `execute_steps` as the default when no explicit
     /// checks are passed to `execute_steps_with`.
     pub assert: crate::assert::Assert,
-    /// **Runtime coordination.** When true, `execute_steps` polls SHM
-    /// signal slot 0 after writing the scenario start marker, blocking
-    /// until the host confirms its BPF map write is complete. Set
+    /// **Runtime coordination.** When true, `execute_steps` blocks after
+    /// writing the scenario start marker until the host confirms its BPF
+    /// map write is complete — waiting on the `bpf_map_write_done` latch
+    /// that `hvc0_poll_loop` sets when the host pushes
+    /// `SIGNAL_BPF_WRITE_DONE` over the virtio-console RX queue. Set
     /// automatically by the framework when a `KtstrTestEntry` declares
     /// `bpf_map_write`; custom scenarios typically do not flip this
     /// manually.
@@ -875,9 +877,10 @@ impl<'a> CtxBuilder<'a> {
         self
     }
 
-    /// When true, `execute_steps` polls the SHM signal slot after
-    /// writing the scenario start marker. See the field doc on
-    /// [`Ctx::wait_for_map_write`].
+    /// When true, `execute_steps` blocks on the `bpf_map_write_done`
+    /// latch (set on the host's `SIGNAL_BPF_WRITE_DONE` over
+    /// virtio-console RX) after writing the scenario start marker. See
+    /// the field doc on [`Ctx::wait_for_map_write`].
     #[must_use = "builder methods consume self; bind the result"]
     pub fn wait_for_map_write(mut self, v: bool) -> Self {
         self.wait_for_map_write = v;

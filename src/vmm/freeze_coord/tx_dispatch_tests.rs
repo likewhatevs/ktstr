@@ -51,6 +51,7 @@ use zerocopy::IntoBytes;
 struct SinkState {
     kill: Arc<AtomicBool>,
     kill_evt: Arc<EventFd>,
+    run_is_wprof: bool,
     sys_rdy_evt: Option<Arc<EventFd>>,
     sys_rdy_evt_clone: Arc<EventFd>,
     snapshot_requests_pending: Vec<SnapshotRequest>,
@@ -73,6 +74,7 @@ impl SinkState {
         Self {
             kill: Arc::new(AtomicBool::new(false)),
             kill_evt: Arc::new(EventFd::new(EFD_NONBLOCK).expect("kill eventfd")),
+            run_is_wprof: false,
             sys_rdy_evt_clone: sys_rdy.clone(),
             sys_rdy_evt: Some(sys_rdy),
             snapshot_requests_pending: Vec::new(),
@@ -94,6 +96,7 @@ impl SinkState {
         BulkDispatchSinks {
             kill: &self.kill,
             kill_evt: &self.kill_evt,
+            run_is_wprof: self.run_is_wprof,
             sys_rdy_evt: &mut self.sys_rdy_evt,
             snapshot_requests_pending: &mut self.snapshot_requests_pending,
             kernel_op_requests_pending: &mut self.kernel_op_requests_pending,
