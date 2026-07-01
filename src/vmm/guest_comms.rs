@@ -613,6 +613,16 @@ pub fn send_sched_exit(code: i32) {
 /// that defer window. Retries up to 5×100 ms to ride out a transient
 /// bulk-port hiccup, matching [`send_scenario_start`]; the port is
 /// long-open by Op-dispatch time so a retry rarely fires.
+///
+/// The 100 ms backoff is a bounded poll-retry, not an evented wait, and
+/// that is deliberate: the normal TX path blocks in the kernel's
+/// `wait_port_writable` (evented) and succeeds on the first attempt, so
+/// the loop only spins when `write_msg` returns false — i.e. the bulk-port
+/// node is not yet openable/connected or its cached fd was invalidated.
+/// Neither is a condition the guest can epoll on (device-node + multiport
+/// connection state), so a bounded re-open-and-retry is the only recovery
+/// — the same poll shape [`super::rust_init::send_sys_rdy_with_retry`]
+/// uses for the initial handshake.
 pub fn send_sched_swap_notify() {
     for attempt in 0..5 {
         if write_msg(MsgType::SchedSwapNotify.wire_value(), &[]) {
@@ -649,6 +659,14 @@ pub fn send_sched_swap_notify() {
 /// total budget, an order of magnitude under the periodic
 /// capture's typical inter-boundary spacing so retries don't
 /// shift downstream timing measurably.
+///
+/// The 100 ms backoff is a bounded poll-retry, not an evented wait —
+/// deliberate, for the same reason as [`send_sched_swap_notify`]: the
+/// normal TX blocks in the kernel's `wait_port_writable` (evented) and
+/// succeeds first try, so this loop only spins when `write_msg` returns
+/// false, i.e. the port is not yet openable/connected or its cached fd
+/// was invalidated — neither a state the guest can epoll on, so a bounded
+/// re-open-and-retry is the only recovery.
 pub fn send_scenario_start() {
     for attempt in 0..5 {
         if write_msg(MsgType::ScenarioStart.wire_value(), &[]) {
