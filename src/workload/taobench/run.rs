@@ -1677,6 +1677,11 @@ mod tests {
         }
     }
 
+    // Gated off under `wprof` (the coverage job runs `wprof` too): this is a
+    // host-thread timing test (fixed vs heavy-tail p99 serve latency); under CI
+    // host load, wprof/coverage slowdown perturbs the host-thread scheduling the
+    // assertion depends on. Runs in the non-wprof jobs.
+    #[cfg(not(feature = "wprof"))]
     #[test]
     fn open_loop_heavy_tail_inflates_serve_latency() {
         // Composition with the open-loop serve-latency measurement, ISOLATING the

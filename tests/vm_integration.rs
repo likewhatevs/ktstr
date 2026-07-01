@@ -4,7 +4,8 @@
 //! workload under scx-ktstr with `--stall-after=1`, lets the freeze
 //! coordinator capture a `FailureDumpReport`, and asserts the
 //! captured JSON carries the field the test is responsible for
-//! pinning. Five tests cover the capture-pipeline gaps:
+//! pinning. Five tests cover the capture-pipeline gaps (the
+//! event-counter timeline is gated out under `wprof`, so four run there):
 //!
 //! - **DSQ + rq->scx walker**: `dsq_states` and `rq_scx_states`
 //!   in the dump JSON populated from real frozen-VM walk.
@@ -16,7 +17,10 @@
 //!   load-bearing surface for the sched-event capture path. (The
 //!   discrete tracepoint timeline is wired via `TimelineCapture` but
 //!   not yet attached to FailureDumpReport; the event-counter
-//!   timeline is the visible per-tick timeline today.)
+//!   timeline is the visible per-tick timeline today.) This test is
+//!   gated out under `wprof`/coverage — its per-tick capture needs the
+//!   guest scheduler to make real-time progress, which CI-host-load
+//!   slowdown starves; it runs in the non-wprof jobs.
 //! - **SchedPolicy::Deadline**: worker spawned under
 //!   `SchedPolicy::Deadline` reaches `worker_main` without bailing —
 //!   proves the `sched_setattr(2)` syscall path runs end-to-end on
@@ -1169,6 +1173,11 @@ fn vm_integration_perf_counters_capture() {
 /// Asserts `event_counter_timeline` non-empty after a 15s run
 /// window. Pins the per-monitor-tick capture loop + SCX_EV_*
 /// offset resolution + `EventCounterCapture` attach path.
+// Gated off under `wprof` (the coverage job runs `wprof` too): per-tick
+// SCX_EV_* capture needs the guest scheduler to make real-time progress over
+// the 15s window; wprof/coverage slowdown under CI host load starves the vCPUs
+// so no event-counter samples land. Runs in the non-wprof jobs.
+#[cfg(not(feature = "wprof"))]
 #[test]
 #[ignore = "requires KVM, ../linux, scx-ktstr"]
 fn vm_integration_event_counter_timeline() {
