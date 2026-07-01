@@ -351,10 +351,10 @@ post-VM assertion.
 
 Each declared const is a single `WatchBpfMap`; pass one (`watch_bpf_maps = W`) or
 an array (`watch_bpf_maps = [A, B]`) and the macro borrows each into the entry's
-`&[&WatchBpfMap]` slice. Each `WatchBpfMap::new(map_suffix, field, agg, label)`
+`&[&WatchBpfMap]` slice. Each `WatchBpfMap::new(map_name_suffix, field, agg, label)`
 declares one target:
 
-- `map_suffix` — matched against a loaded BPF map by `ends_with` (e.g. `".bss"`
+- `map_name_suffix` — matched against a loaded BPF map by `ends_with` (e.g. `".bss"`
   for a section global, or a named map like `"cpu_ctx_stor"`).
 - `field` — a dot-path into the map's value type (`"sys_stat.avg_lat_cri"`, or
   a bare global like `"lat_headroom"`).
