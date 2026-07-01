@@ -304,7 +304,10 @@ mod tests {
                 crc_ok: true,
             },
         ];
-        assert_eq!(reassemble_wprof_trace(&entries).as_deref(), Some(&[4u8, 5][..]));
+        assert_eq!(
+            reassemble_wprof_trace(&entries).as_deref(),
+            Some(&[4u8, 5][..])
+        );
     }
 
     fn chunk(payload: &[u8], crc_ok: bool) -> ShmEntry {
@@ -364,8 +367,15 @@ mod tests {
         // and its bytes are ignored. A well-formed guest sends exactly one
         // terminal (the last frame), so a duplicate is malformed/hostile —
         // pinning break-at-first (not append-second) is the defensive choice.
-        let entries = vec![chunk(&[1], true), terminal(&[2], true), terminal(&[3], true)];
-        assert_eq!(reassemble_wprof_trace(&entries).as_deref(), Some(&[1u8, 2][..]));
+        let entries = vec![
+            chunk(&[1], true),
+            terminal(&[2], true),
+            terminal(&[3], true),
+        ];
+        assert_eq!(
+            reassemble_wprof_trace(&entries).as_deref(),
+            Some(&[1u8, 2][..])
+        );
     }
 
     #[test]
@@ -373,6 +383,9 @@ mod tests {
         // A WprofTraceChunk AFTER the terminal is swallowed by the
         // break-at-first-terminal path (a well-formed guest never emits one).
         let entries = vec![chunk(&[1], true), terminal(&[2], true), chunk(&[3], true)];
-        assert_eq!(reassemble_wprof_trace(&entries).as_deref(), Some(&[1u8, 2][..]));
+        assert_eq!(
+            reassemble_wprof_trace(&entries).as_deref(),
+            Some(&[1u8, 2][..])
+        );
     }
 }

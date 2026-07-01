@@ -510,7 +510,10 @@ pub fn send_profraw(buf: &[u8]) {
 /// reachable check (`cap` is host-chosen, never guest input).
 #[cfg(feature = "wprof")]
 pub(crate) fn wprof_trace_frames(buf: &[u8], cap: usize) -> Vec<(u32, &[u8])> {
-    debug_assert!(cap > 0, "wprof_trace_frames: cap must be > 0 (chunks(0) panics)");
+    debug_assert!(
+        cap > 0,
+        "wprof_trace_frames: cap must be > 0 (chunks(0) panics)"
+    );
     let mut it = buf.chunks(cap).peekable();
     if it.peek().is_none() {
         // Empty trace: one empty terminal frame.

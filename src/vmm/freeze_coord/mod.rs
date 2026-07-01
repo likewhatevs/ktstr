@@ -150,9 +150,7 @@ fn trigger_freeze_coord_kill(kill: &AtomicBool, kill_evt: &EventFd) {
 /// see the `run_is_wprof` sink field — and which instead arms the grace
 /// via `is_sched_exit_frame` in the coord loop).
 fn is_wprof_ship_frame(msg: &crate::vmm::bulk::BulkMessage) -> bool {
-    msg.crc_ok
-        && !msg.payload.is_empty()
-        && msg.msg_type == crate::vmm::wire::MSG_TYPE_WPROF_TRACE
+    msg.crc_ok && !msg.payload.is_empty() && msg.msg_type == crate::vmm::wire::MSG_TYPE_WPROF_TRACE
 }
 
 /// True iff an armed wprof-ship grace deadline has expired at `now`. The

@@ -83,7 +83,9 @@ pub fn custom_crash_light(ctx: &Ctx) -> Result<AssertResult> {
         Op::add_cgroup("cg_0"),
         Op::spawn_workers(
             "cg_0",
-            WorkSpec::default().workers(4).work_type(WorkType::YieldHeavy),
+            WorkSpec::default()
+                .workers(4)
+                .work_type(WorkType::YieldHeavy),
         ),
     ];
     execute_steps(ctx, vec![Step::new(ops, ctx.settled_hold(1.0))])

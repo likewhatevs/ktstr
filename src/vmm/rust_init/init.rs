@@ -668,8 +668,8 @@ pub(crate) fn ktstr_guest_init() -> ! {
         // holds); the grace returns early the moment the scheduler exits,
         // and is bounded (`SCHED_KILL_GRACE`) so a userspace hang can't
         // wedge teardown.
-        let sched_crashed = crate::vmm::rust_init::sched_pid().is_some()
-            && crate::scenario::ops::scx_down();
+        let sched_crashed =
+            crate::vmm::rust_init::sched_pid().is_some() && crate::scenario::ops::scx_down();
         let exited_in_grace = (scx_dump_started_latch().is_set() || sched_crashed)
             && reap_child_bounded(child, SCHED_KILL_GRACE);
         if !exited_in_grace {
