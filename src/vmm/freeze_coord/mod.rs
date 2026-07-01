@@ -1147,33 +1147,16 @@ impl KtstrVm {
             )
         };
 
-        // Probes-ready EventFd. Cloned to the monitor thread and the
-        // bpf-map-write thread. The intent was a broadcast early-wake
-        // shared across both — replacing independent 100-200 ms sleeps
-        // (while polling guest kernel state via .bss latch reads) with
-        // `poll(POLLIN)`, where any waiter that detects its readiness
-        // writes 1 to wake the others. In practice only the
-        // bpf-map-write thread's phase 1 polls it (as a 200 ms backoff),
-        // and both phases write it on success; the monitor's clone is
-        // unused and phase 2 polls `kill_evt` instead (the fd goes
+        // Probes-ready EventFd. Used solely by the bpf-map-write thread's
+        // phase 1 as a 200 ms `poll(POLLIN)` backoff while it polls guest
+        // kernel state (.bss latch reads); both bpf phases write it on
+        // success (phase 2 polls `kill_evt` instead — the fd goes
         // level-high after the first write, so re-polling it would spin).
-        // `EFD_NONBLOCK` keeps `write()` from stalling at saturation;
-        // readers use `poll`, never `read`, so the level stays high once
-        // any writer fires. `try_clone()` uses `dup(2)`, so all clones
-        // share the same kernel counter.
+        // `EFD_NONBLOCK` keeps `write()` from stalling at saturation, and
+        // readers `poll` (never `read`) so the level stays high once any
+        // writer fires. Moved directly into `start_bpf_map_write` (its only
+        // consumer), so no clone is needed.
         let probes_ready_evt = EventFd::new(EFD_NONBLOCK).context("create probes-ready EventFd")?;
-        let probes_ready_evt_for_monitor = probes_ready_evt
-            .try_clone()
-            .context("clone probes-ready EventFd for monitor")?;
-        let probes_ready_evt_for_bpf = probes_ready_evt
-            .try_clone()
-            .context("clone probes-ready EventFd for bpf-map-write")?;
-        // The original is unused once both consumers hold their own
-        // dup'd fds. Drop it eagerly so its file descriptor is freed
-        // immediately rather than at the end of the run; the clones
-        // share the same kernel counter via dup(2) and remain
-        // independent.
-        drop(probes_ready_evt);
 
         // Shared parked_evt: every vCPU thread + the virtio-blk
         // worker writes 1 to this counter-mode EventFd immediately
@@ -1672,7 +1655,6 @@ impl KtstrVm {
             run_start,
             vcpu_pthreads,
             perf_capture.clone(),
-            probes_ready_evt_for_monitor,
             Some(virtio_con.clone()),
             sys_rdy_evt.clone(),
             tcr_el1_cache.clone(),
@@ -1751,7 +1733,7 @@ impl KtstrVm {
             &vm,
             &kill,
             &kill_evt,
-            probes_ready_evt_for_bpf,
+            probes_ready_evt,
             tcr_el1_cache.clone(),
             cr3_cache.clone(),
             virtio_con.clone(),
@@ -11204,13 +11186,6 @@ impl KtstrVm {
     }
 
     /// Start the monitor thread if vmlinux is available.
-    ///
-    /// `_probes_ready_evt` is a clone of the EventFd created in `run_vm`
-    /// (the bpf-map-write thread holds the other clone). It is currently
-    /// UNUSED by the monitor — the intended shared early-wake was never
-    /// wired into the monitor's slot-1 wait, so the parameter is bound
-    /// with a leading underscore. Only the bpf-map-write thread's phase 1
-    /// polls the fd today.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn start_monitor(
         &self,
@@ -11220,7 +11195,6 @@ impl KtstrVm {
         run_start: Instant,
         vcpu_pthreads: Vec<libc::pthread_t>,
         perf_capture: Arc<Option<monitor::perf_counters::PerfCountersCapture>>,
-        _probes_ready_evt: EventFd,
         virtio_con: Option<Arc<PiMutex<virtio_console::VirtioConsole>>>,
         sys_rdy_evt: Option<Arc<EventFd>>,
         tcr_el1: Option<Arc<std::sync::atomic::AtomicU64>>,
@@ -12133,12 +12107,12 @@ impl KtstrVm {
     ///    `wait_for_map_write` gate (`Ctx::wait_for_map_write=true`)
     ///    blocks on that latch until this thread fires.
     ///
-    /// `probes_ready_evt` is a clone of the EventFd created in `run_vm`
-    /// (the monitor holds the other clone, currently unused). Phase 1
+    /// `probes_ready_evt` is the EventFd created in `run_vm` and moved in
+    /// here — this thread is its sole consumer, so it is not cloned. Phase 1
     /// polls it as a 200 ms backoff and both phases write it on success;
     /// phase 2's retry backoff polls `kill_evt` instead, because the fd
     /// stays level-high once written and re-polling it would spin. The
-    /// success-writes wake no other consumer today.
+    /// success-writes wake no other consumer.
     ///
     /// `virtio_con` is the shared virtio-console device used to push
     /// the host→guest wake byte after the writes land. Replaces the

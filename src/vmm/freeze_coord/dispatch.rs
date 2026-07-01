@@ -414,7 +414,19 @@ pub(super) fn dispatch_bulk_message(
                     sinks
                         .kern_phys_base
                         .store(biased_phys, std::sync::atomic::Ordering::Release);
-                    let _ = sinks.kern_phys_base_evt.write(1);
+                    // Mirror the SchedExit promotion's wake-failure logging:
+                    // the store above is authoritative, and the monitor also
+                    // polls, so a missed wake self-heals within a poll
+                    // interval — but surface the failure rather than dropping
+                    // the Result silently.
+                    if let Err(e) = sinks.kern_phys_base_evt.write(1) {
+                        tracing::warn!(
+                            err = %e,
+                            "freeze_coord: kern_phys_base_evt wake write failed; \
+                             the kern_phys_base store above is authoritative and \
+                             the monitor poll self-heals within a poll interval"
+                        );
+                    }
                 }
                 // Derive virt-KASLR from the guest-reported runtime
                 // `_text` KVA + the host's link-time KVA. Skip if
@@ -529,7 +541,18 @@ pub(super) fn dispatch_bulk_message(
                             std::sync::atomic::Ordering::Acquire,
                         ) {
                             Ok(_) => {
-                                let _ = sinks.kern_virt_kaslr_evt.write(1);
+                                // Same wake-failure discipline as the phys_base
+                                // arm above: the CAS is authoritative and the
+                                // monitor poll self-heals a missed wake.
+                                if let Err(e) = sinks.kern_virt_kaslr_evt.write(1) {
+                                    tracing::warn!(
+                                        err = %e,
+                                        "freeze_coord: kern_virt_kaslr_evt wake write \
+                                         failed; the kern_virt_kaslr CAS above is \
+                                         authoritative and the monitor poll self-heals \
+                                         within a poll interval"
+                                    );
+                                }
                             }
                             Err(existing) if existing != biased_offset => {
                                 let lstar_derived = existing.saturating_sub(1);
